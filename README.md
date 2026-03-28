@@ -2,8 +2,6 @@
 
 **A personal AI you talk to in real time — shares your screen, joins your meetings, makes phone calls, and builds itself.**
 
-You talk. It talks back. It acts. Sutando is a personal AI agent you converse with by voice in real time. It sees your screen, dials into your Google Meet, makes phone calls on your behalf, and shares its screen over Zoom so you can see what it sees and direct it from your phone. When idle, it runs an autonomous loop that builds its own capabilities — most of Sutando's code was written by Sutando.
-
 It belongs entirely to you.
 
 > *Named after [Stands](https://jojo.fandom.com/wiki/Stand) from JoJo's Bizarre Adventure — a personal spirit that fights on your behalf. Like a Stand, Sutando starts unnamed. As it learns your style and earns real capabilities, it names itself and generates its own avatar — your Stand, unique to you.*
