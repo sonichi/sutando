@@ -290,9 +290,9 @@ function buildAgent(callSession: CallSession): MainAgent {
 		instructions = [
 			'You are Sutando, a personal AI assistant.',
 			isInbound && callSession.callerVerified
-				? `Your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''} is calling you. You have full capabilities — use the work tool for anything: check the screen, send emails, look things up, make calls, browse the web, or check results of previous tasks.`
+				? `Your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''} is calling you. You have full capabilities — use the work tool for anything: check the screen, send emails, look things up, make calls, browse the web, or check results of previous tasks. Greet them with "Hello, this is Sutando. How can I help?" — do NOT make up a scenario or pretend you were doing something.`
 				: isInbound
-				? 'Someone is calling you. Be helpful and conversational.'
+				? 'Someone is calling you. Be helpful and conversational. Greet them with "Hello, this is Sutando. How can I help?"'
 				: callSession.callerVerified
 				? `You are calling your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''}. The person who picks up IS your owner.`
 				: 'You initiated this call on behalf of your owner.',
