@@ -248,6 +248,10 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
   </div>
 </div>
 
+<div id="proactive-status" style="text-align:center;padding:8px 16px;font-size:13px;color:#8899a6;display:none">
+  <span id="proactive-text"></span>
+</div>
+
 <div class="main" id="main-area">
 
 <div id="transcript">
@@ -1097,6 +1101,26 @@ function sendText() {
       });
   }
 }
+
+// ─── Proactive status polling ─────────────────────────────
+(function pollProactiveStatus() {
+  setInterval(() => {
+    fetch('http://localhost:7843/tasks/active')
+      .then(r => r.json())
+      .then(data => {
+        const working = (data.tasks || []).filter(t => t.status === 'working');
+        const el = document.getElementById('proactive-status');
+        const txt = document.getElementById('proactive-text');
+        if (working.length > 0) {
+          txt.textContent = 'Working on: ' + working.map(t => t.text).join(', ');
+          el.style.display = 'block';
+        } else {
+          el.style.display = 'none';
+        }
+      })
+      .catch(() => {});
+  }, 5000);
+})();
 
 </script>
 </body>
