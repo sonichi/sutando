@@ -139,7 +139,7 @@ const CONTEXT_DROP_FILE = join(REPO_DIR, 'context-drop.txt');
 
 /**
  * Watch for context-drop.txt and inject into Gemini conversation.
- * Called once at startup. When user drops context via Ctrl+K hotkey,
+ * Called once at startup. When user drops context via keyboard shortcut,
  * it gets sent to Gemini so it knows about it.
  */
 export function startContextDropWatcher(onContextDrop: (content: string) => void): void {
@@ -154,7 +154,7 @@ export function startContextDropWatcher(onContextDrop: (content: string) => void
 					mkdirSync(TASK_DIR, { recursive: true });
 					const taskId = `task-${Date.now()}`;
 					writeFileSync(join(TASK_DIR, `${taskId}.txt`),
-						`id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ntask: User dropped context via Ctrl+K. Process this:\n${content}\n`);
+						`id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ntask: User dropped context via hotkey. Process this:\n${content}\n`);
 					unlinkSync(CONTEXT_DROP_FILE);
 					// Also inject into Gemini if available
 					onContextDrop(content);

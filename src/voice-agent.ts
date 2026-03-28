@@ -286,7 +286,7 @@ async function main() {
 
 	// Watch for results from the Claude Code session and deliver to user
 	// Only delivers when a client is connected — otherwise keeps files queued
-	// Watch for context drops (Ctrl+K hotkey)
+	// Watch for context drops (keyboard shortcut)
 	// task-bridge always writes to tasks/ for sutando-core; also inject into Gemini if active
 	startContextDropWatcher((content) => {
 		if (session.sessionManager.isActive && session.clientConnected) {
