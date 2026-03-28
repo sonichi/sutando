@@ -305,6 +305,8 @@ let audioCtx = null;
 let micStream = null;
 let processor = null;
 let connected = false;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 5;
 let nextPlayTime = 0;
 let activeSources = [];
 let playbackRate = 1.0;
@@ -733,6 +735,7 @@ async function startMic() {
   silence.connect(audioCtx.destination);
 
   dbg('Mic capture started');
+  reconnectAttempts = 0;
   addSystem('Microphone active — speak now.');
 
   // Start Chrome STT for real-time interim display (server final replaces)
@@ -931,16 +934,25 @@ function connectWs() {
     if (wasCleanDisconnect) {
       addSystem('Disconnected.');
     } else {
-      // Unexpected drop (Gemini timeout) — auto-reconnect
-      addSystem('Connection lost — reconnecting in 3s...');
-      setStatus('Reconnecting...', 'error');
-      setTimeout(() => {
-        if (!connected) {
-          dbg('Auto-reconnecting...');
-          addSystem('Reconnecting...');
-          toggle();
-        }
-      }, 3000);
+      // Unexpected drop (Gemini timeout) — auto-reconnect with limit
+      reconnectAttempts++;
+      if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+        addSystem('Could not connect to the voice agent after ' + MAX_RECONNECT_ATTEMPTS + ' attempts.');
+        addSystem('Make sure the voice agent is running: bash src/startup.sh');
+        addSystem('Then open a Claude Code terminal in the sutando directory to start the core agent.');
+        setStatus('Disconnected', 'error');
+        connected = false;
+        reconnectAttempts = 0;
+      } else {
+        addSystem('Connection lost — reconnecting (' + reconnectAttempts + '/' + MAX_RECONNECT_ATTEMPTS + ')...');
+        setStatus('Reconnecting...', 'error');
+        setTimeout(() => {
+          if (!connected) {
+            dbg('Auto-reconnecting (attempt ' + reconnectAttempts + ')...');
+            toggle();
+          }
+        }, 3000);
+      }
     }
   };
 
