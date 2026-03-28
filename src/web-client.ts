@@ -238,12 +238,12 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
   <p class="or-text">or type below</p>
   <p class="suggestions-label">Try saying or typing</p>
   <div class="suggestions">
+    <span class="suggestion" onclick="trySuggestion(this)">"Summon — share my screen on Zoom"</span>
+    <span class="suggestion" onclick="trySuggestion(this)">"Join my next meeting"</span>
     <span class="suggestion" onclick="trySuggestion(this)">"What's on my screen?"</span>
     <span class="suggestion" onclick="trySuggestion(this)">"What's on my calendar today?"</span>
-    <span class="suggestion" onclick="trySuggestion(this)">"Introduce yourself"</span>
     <span class="suggestion" onclick="trySuggestion(this)">"Take a note: my first Sutando note"</span>
-    <span class="suggestion" onclick="trySuggestion(this)">"Read my latest emails"</span>
-    <span class="suggestion" onclick="trySuggestion(this)">"Open github.com"</span>
+    <span class="suggestion" onclick="trySuggestion(this)">"Say tutorial"</span>
   </div>
 </div>
 
