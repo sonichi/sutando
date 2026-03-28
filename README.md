@@ -111,6 +111,7 @@ These unlock more capabilities. Add to `.env` when ready:
 | Telegram | Message Sutando from your phone | [Create bot via @BotFather](https://t.me/BotFather), then `/telegram:configure <token>` |
 | Discord | Message Sutando from Discord (DM + channel @mentions) | [Developer portal](https://discord.com/developers), then `/discord:configure <token>` |
 | Claude for Chrome | Browser automation — navigate, read pages, fill forms, interact with web apps | [Install extension](https://claude.ai/chrome), log in with the same account as Claude Code |
+| Context drop | Send selected text to Sutando from any app via hotkey | See [setup below](#context-drop-setup) |
 
 ---
 
@@ -163,6 +164,21 @@ On first run, grant these in System Settings → Privacy & Security:
 - **Screen Recording** → add `claude` and `node`
 - **Accessibility** → add Shortcuts.app (for context drop)
 - **Microphone** → Chrome will ask on first voice connect
+
+---
+
+## Context drop setup
+
+Send any selected text to Sutando with a keyboard shortcut.
+
+1. Open **Automator** → New → **Quick Action**
+2. Set "Workflow receives" → **no input** in **any application**
+3. Add action: **Run Shell Script** → paste: `bash /path/to/sutando/src/context-drop.sh`
+4. Save as "Sutando: Drop Context"
+5. Go to **System Settings → Keyboard → Keyboard Shortcuts → Services** → assign a shortcut to "Sutando: Drop Context"
+6. Grant **Accessibility** permission to Shortcuts.app in System Settings → Privacy & Security
+
+Now select any text and press your shortcut — Sutando reads it and acts on it.
 
 ---
 
