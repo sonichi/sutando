@@ -205,6 +205,7 @@ It consumes API quota proportional to how much work it finds to do.
 
 This is alpha software. The biggest need is **testing** — try a capability, report what breaks.
 
+- [Join the Discord](https://discord.gg/uZHWXXmrCS) for help, discussion, and updates
 - [Open an issue](https://github.com/sonichi/sutando/issues) for bugs
 
 ---
