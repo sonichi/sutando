@@ -939,7 +939,7 @@ function connectWs() {
       reconnectAttempts++;
       if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
         addSystem('Could not connect to the voice agent after ' + MAX_RECONNECT_ATTEMPTS + ' attempts.');
-        addSystem('Check the terminal where you ran startup.sh — that is Sutando\'s core CLI. You can type commands there directly.');
+        addSystem('Check the terminal where you ran startup.sh — that is the Sutando core CLI. You can type commands there directly.');
         addSystem('To restart all services: bash src/restart.sh');
         setStatus('Disconnected', 'error');
         connected = false;
@@ -1033,8 +1033,10 @@ function toggle() {
 // ─── Suggestion chips ─────────────────────────────────────
 function trySuggestion(el) {
   // Extract only the quoted command (e.g. "summon" from '"summon" — description')
-  const match = el.textContent.match(/"([^"]+)"/);
-  const text = match ? match[1] : el.textContent.replace(/^"|"$/g, '');
+  const raw = el.textContent;
+  const dashIdx = raw.indexOf(' — ');
+  const cmd = dashIdx > 0 ? raw.slice(0, dashIdx) : raw;
+  const text = cmd.replace(/[\u201C\u201D"]/g, '').trim();
   $('textInput').value = text;
   // If voice is connected, start voice first then it'll go through voice
   if (!connected) {
