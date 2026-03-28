@@ -938,8 +938,8 @@ function connectWs() {
       reconnectAttempts++;
       if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
         addSystem('Could not connect to the voice agent after ' + MAX_RECONNECT_ATTEMPTS + ' attempts.');
-        addSystem('Make sure the voice agent is running: bash src/startup.sh');
-        addSystem('Then open a Claude Code terminal in the sutando directory to start the core agent.');
+        addSystem('Run: bash src/startup.sh — this restarts all services.');
+        addSystem('Then run claude in the sutando directory to start the core agent.');
         setStatus('Disconnected', 'error');
         connected = false;
         reconnectAttempts = 0;
