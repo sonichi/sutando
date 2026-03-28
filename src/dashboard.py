@@ -233,10 +233,10 @@ def render_dashboard() -> str:
 </div></div>""")
 
     # Services (ports + daemons only)
-    services = [c for c in health if "port" in c.get("detail", "") or c.get("name", "").startswith("com.sutando.")]
+    services = [c for c in health if "port" in c.get("detail", "") or "running" in c.get("detail", "") or c.get("name", "").startswith("com.sutando.")]
     services_html = ""
     for c in services:
-        icon = '<span class="ok">✓</span>' if c.get("status") == "ok" else '<span class="bad">✗</span>'
+        icon = '<span class="ok">✓</span>' if c.get("status") == "ok" else ('<span style="color:#f0ad4e">~</span>' if c.get("status") == "warn" else '<span class="bad">✗</span>')
         services_html += f'<div class="check">{icon} {c.get("name", "?")} <span style="color:#333;margin-left:auto">{c.get("detail", "")}</span></div>\n'
     cards.append(f'<div class="card"><h2>Services</h2>{services_html}</div>')
 

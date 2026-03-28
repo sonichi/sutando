@@ -154,6 +154,18 @@ def run_all_checks() -> list[dict]:
     # Notes
     checks.append(check_directory(REPO_DIR / "notes", "notes-dir"))
 
+    # Phone conversation server (optional — only check if Twilio configured)
+    env_path = REPO_DIR / ".env"
+    if env_path.exists():
+        env_content = env_path.read_text()
+        has_twilio = "TWILIO_ACCOUNT_SID=" in env_content and not env_content.split("TWILIO_ACCOUNT_SID=")[1].startswith("\n")
+        if has_twilio:
+            c = check_port(3100, "conversation-server")
+            if c["status"] != "ok":
+                c["status"] = "warn"
+                c["detail"] = "not running (starts on demand)"
+            checks.append(c)
+
     # Messaging bridges (optional — only check if configured)
     channels_dir = Path.home() / ".claude" / "channels"
     for name, proc_name in [("telegram-bridge", "telegram-bridge"), ("discord-bridge", "discord-bridge")]:
