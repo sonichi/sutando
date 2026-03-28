@@ -238,12 +238,13 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
   <p class="or-text">or type below</p>
   <p class="suggestions-label">Try saying or typing</p>
   <div class="suggestions">
-    <span class="suggestion" onclick="trySuggestion(this)">"Summon — share my screen on Zoom"</span>
+    <span class="suggestion" onclick="trySuggestion(this)">"Summon" — share screen on Zoom, join on your phone</span>
     <span class="suggestion" onclick="trySuggestion(this)">"Join my next meeting"</span>
     <span class="suggestion" onclick="trySuggestion(this)">"What's on my screen?"</span>
     <span class="suggestion" onclick="trySuggestion(this)">"What's on my calendar today?"</span>
     <span class="suggestion" onclick="trySuggestion(this)">"Take a note: my first Sutando note"</span>
-    <span class="suggestion" onclick="trySuggestion(this)">"Say tutorial"</span>
+    <span class="suggestion" onclick="trySuggestion(this)">"Tutorial" — walk me through what you can do</span>
+    <span class="suggestion" onclick="trySuggestion(this)">"Bye" — disconnect voice</span>
   </div>
 </div>
 
@@ -1031,7 +1032,9 @@ function toggle() {
 
 // ─── Suggestion chips ─────────────────────────────────────
 function trySuggestion(el) {
-  const text = el.textContent.replace(/^"|"$/g, '');
+  // Extract only the quoted command (e.g. "summon" from '"summon" — description')
+  const match = el.textContent.match(/"([^"]+)"/);
+  const text = match ? match[1] : el.textContent.replace(/^"|"$/g, '');
   $('textInput').value = text;
   // If voice is connected, start voice first then it'll go through voice
   if (!connected) {
