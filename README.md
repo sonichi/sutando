@@ -6,9 +6,9 @@ It belongs entirely to you.
 
 > *Named after [Stands](https://jojo.fandom.com/wiki/Stand) from JoJo's Bizarre Adventure — a personal spirit that fights on your behalf. Like a Stand, Sutando starts unnamed. As it learns your style and earns real capabilities, it names itself and generates its own avatar — your Stand, unique to you.*
 
-https://github.com/user-attachments/assets/a3f19d83-634b-4b15-a9c4-d3073ef556a4
+https://github.com/user-attachments/assets/a3f1f9a8-9fe2-4775-bc09-50c7d6713a11
 
-Unmute to hear the real-time conversation. [Watch on YouTube →](https://youtu.be/PXUErLkgGc8)
+Unmute to hear the real-time conversation. [Watch on YouTube →](https://youtu.be/BgRUXEzZRN4)
 
 ---
 
