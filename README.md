@@ -8,6 +8,8 @@ It belongs entirely to you.
 
 https://github.com/user-attachments/assets/b85aba29-5751-463a-ab44-5fb9b870290e
 
+Unmute to hear the real-time conversation. [Watch on YouTube →](https://youtu.be/xp_2oQ7rUAI)
+
 ---
 
 ## What can you do with it?
