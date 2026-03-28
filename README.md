@@ -97,8 +97,11 @@ bash src/verify-setup.sh
 **Troubleshooting:**
 - Browser shows blank page? Services may still be starting — wait 5 seconds and refresh
 - Microphone not working? Chrome will ask for permission on first connect — click Allow
-- Voice agent not responding? Check `src/voice-agent.log` for errors
+- Voice agent not responding? Check `src/voice-agent.log` for errors. Common causes:
+  - `GEMINI_API_KEY` not set or invalid in `.env` — get one at [ai.google.dev](https://ai.google.dev)
+  - Port 9900 already in use — run `lsof -i :9900` to check
 - `npm install` failed? Make sure Node.js 22+ is installed: `node --version`
+- Something broke? Run `bash src/restart.sh` — this kills all services and restarts fresh
 
 ---
 
