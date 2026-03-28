@@ -938,8 +938,8 @@ function connectWs() {
       reconnectAttempts++;
       if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
         addSystem('Could not connect to the voice agent after ' + MAX_RECONNECT_ATTEMPTS + ' attempts.');
-        addSystem('Check the terminal where you ran startup.sh for errors.');
-        addSystem('To restart: bash src/restart.sh');
+        addSystem('Check the terminal where you ran startup.sh — that is Sutando\'s core CLI. You can type commands there directly.');
+        addSystem('To restart all services: bash src/restart.sh');
         setStatus('Disconnected', 'error');
         connected = false;
         reconnectAttempts = 0;
