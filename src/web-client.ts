@@ -938,7 +938,7 @@ function connectWs() {
       reconnectAttempts++;
       if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
         addSystem('Could not connect to the voice agent after ' + MAX_RECONNECT_ATTEMPTS + ' attempts.');
-        addSystem('Run: bash src/startup.sh — this restarts all services including Claude Code.');
+        addSystem('Run: bash src/restart.sh — this restarts all services including Claude Code.');
         setStatus('Disconnected', 'error');
         connected = false;
         reconnectAttempts = 0;
