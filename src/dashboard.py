@@ -208,8 +208,8 @@ def render_dashboard() -> str:
     score = get_score()
     stats = get_system_stats()
 
-    services_only = [c for c in health if "port" in c.get("detail", "") or c.get("name", "").startswith("com.sutando.")]
-    ok_count = sum(1 for c in services_only if c.get("status") == "ok")
+    services_only = [c for c in health if "port" in c.get("detail", "") or "running" in c.get("detail", "") or c.get("name", "").startswith("com.sutando.")]
+    ok_count = sum(1 for c in services_only if c.get("status") in ("ok", "warn"))
     total_count = len(services_only)
 
     # Score card
@@ -258,6 +258,10 @@ def render_dashboard() -> str:
 <a href="http://localhost:8080" style="color:#4a8aaa;text-decoration:none">Voice UI :8080</a>
 <a href="http://localhost:7843" style="color:#4a8aaa;text-decoration:none">Task API :7843</a>
 <a href="http://localhost:7844" style="color:#4a8aaa;text-decoration:none">Dashboard :7844</a>
+<a href="http://localhost:7845" style="color:#4a8aaa;text-decoration:none">Screen Capture :7845</a>
+<a href="https://github.com/sonichi/sutando" style="color:#4a8aaa;text-decoration:none">GitHub</a>
+<a href="https://sutando.ai" style="color:#4a8aaa;text-decoration:none">Website</a>
+<a href="https://discord.gg/uZHWXXmrCS" style="color:#4a8aaa;text-decoration:none">Discord</a>
 </div></div>""")
 
     return HTML.replace("__CONTENT__", "\n".join(cards))
