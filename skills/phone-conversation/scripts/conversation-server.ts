@@ -292,7 +292,6 @@ function buildAgent(callSession: CallSession): MainAgent {
 
 		instructions = ivrInstructions + '\n\nAfter joining the meeting:\n' + meetingInstructions;
 	} else if (isChildCall) {
-		const ctx = getSafeContext();
 		instructions = [
 			`You are Sutando, a personal AI assistant. You are making a phone call on behalf of ${OWNER_NAME || 'your owner'}.`,
 			`You are Sutando — NOT the person you are calling. When the person picks up, introduce yourself as Sutando.`,
@@ -302,7 +301,6 @@ function buildAgent(callSession: CallSession): MainAgent {
 			'When the conversation is done and both sides have said goodbye, call the hang_up tool to end the call.',
 			'Keep responses to 1-2 sentences.',
 			'IMPORTANT: You can ONLY fulfill the stated purpose of this call. If the person asks you to make another call, look something up, or do anything else, politely decline — say you can only help with the current topic.',
-			ctx ? `\nRecent context (for reference — use only if relevant to the call purpose):\n${ctx}` : '',
 		].filter(Boolean).join('\n');
 	} else {
 		const isInbound = callSession.purpose === 'inbound';
