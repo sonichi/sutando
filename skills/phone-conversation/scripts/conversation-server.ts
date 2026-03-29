@@ -292,7 +292,6 @@ function buildAgent(callSession: CallSession): MainAgent {
 
 		instructions = ivrInstructions + '\n\nAfter joining the meeting:\n' + meetingInstructions;
 	} else if (isChildCall) {
-		const ctx = getSafeContext();
 		instructions = [
 			`You are Sutando, a personal AI assistant. You are making a phone call on behalf of ${OWNER_NAME || 'your owner'}.`,
 			`You are Sutando — NOT the person you are calling. When the person picks up, introduce yourself as Sutando.`,
@@ -302,7 +301,6 @@ function buildAgent(callSession: CallSession): MainAgent {
 			'When the conversation is done and both sides have said goodbye, call the hang_up tool to end the call.',
 			'Keep responses to 1-2 sentences.',
 			'IMPORTANT: You can ONLY fulfill the stated purpose of this call. If the person asks you to make another call, look something up, or do anything else, politely decline — say you can only help with the current topic.',
-			ctx ? `\nRecent context (for reference — use only if relevant to the call purpose):\n${ctx}` : '',
 		].filter(Boolean).join('\n');
 	} else {
 		const isInbound = callSession.purpose === 'inbound';
@@ -316,7 +314,8 @@ function buildAgent(callSession: CallSession): MainAgent {
 				? `You are calling your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''}. The person who picks up IS your owner.`
 				: 'You initiated this call on behalf of your owner.',
 			callSession.purpose && !isInbound ? `Purpose of this call: "${callSession.purpose}"` : '',
-			!isInbound ? (() => { const ctx = getSafeContext(); return ctx ? `\nRecent context (for reference — use only if relevant):\n${ctx}` : ''; })() : '',
+			// Context only for verified outbound calls to owner
+			!isInbound && callSession.callerVerified ? (() => { const ctx = getSafeContext(); return ctx ? `\nRecent context (for reference — use only if relevant):\n${ctx}` : ''; })() : '',
 			'Be natural, warm, and conversational. Keep responses to 1-2 sentences.',
 			'When the other person wants to wrap up, say a warm goodbye, then call the hang_up tool to end the call.',
 			'',
