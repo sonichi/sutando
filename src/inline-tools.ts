@@ -1066,3 +1066,21 @@ export const inlineTools = [
 	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, summonTool,
 	joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool,
 ];
+
+/** Tools available to any caller (including unverified) */
+export const anyCallerTools = [
+	volumeTool, brightnessTool, toggleTasksTool, getCurrentTimeTool,
+];
+
+/** Owner-only tools (require isOwner) */
+export const ownerOnlyTools = [
+	scrollTool, switchTabTool, openUrlTool,
+	switchAppTool, captureScreenTool, typeTextTool,
+	clipboardTool, cancelTaskTool, summonTool,
+	joinZoomTool, joinGmeetTool, callContactTool,
+];
+
+/** Configurable tools — default to owner-only, can be opened to verified callers */
+export const configurableTools = [
+	lookupMeetingIdTool,
+];

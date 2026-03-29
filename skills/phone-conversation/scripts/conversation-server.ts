@@ -52,7 +52,7 @@ import { VoiceSession, type ToolDefinition, type MainAgent } from 'bodhi-realtim
 import { WebSocketServer, WebSocket } from 'ws';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
-import { inlineTools } from '../../../src/inline-tools.js';
+import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '../../../src/inline-tools.js';
 
 // --- Config ---
 
@@ -68,6 +68,7 @@ const TASKS_DIR = join(WORKSPACE_DIR, 'tasks');
 const TASK_POLL_INTERVAL_MS = 500;
 const TASK_TIMEOUT_MS = 120_000;
 const OWNER_NAME = process.env.owner ?? '';
+const OWNER_NUMBER = process.env.OWNER_NUMBER ?? '';
 
 /** Read recent conversation context, relabeled to avoid identity confusion */
 function getSafeContext(lines = 5): string {
@@ -184,6 +185,7 @@ interface CallSession {
 	bodhiPort: number;  // port for VoiceSession's ClientTransport (required but audio bypasses it)
 	callerNumber: string;
 	callerVerified: boolean;
+	isOwner: boolean;
 	isMeeting: boolean;
 	meetingId?: string;
 	passcode?: string;
@@ -306,39 +308,52 @@ function buildAgent(callSession: CallSession): MainAgent {
 		const isInbound = callSession.purpose === 'inbound';
 		instructions = [
 			'You are Sutando, a personal AI assistant.',
-			isInbound && callSession.callerVerified
+			// Identity & greeting — based on owner vs verified vs unverified
+			isInbound && callSession.isOwner
 				? `Your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''} is calling you. YOU are Sutando — the AI assistant. The person on the phone is your OWNER, a human. Do NOT confuse yourself with the caller. You have full capabilities — use the work tool for anything: check the screen, send emails, look things up, make calls, browse the web, or check results of previous tasks. Say exactly: "Hi, this is Sutando. How can I help?" then WAIT for them to speak. Do NOT say anything else before they talk. Do NOT make up tasks, scenarios, or pretend you were doing something.${(() => { const ctx = getSafeContext(); return ctx ? `\n\nRecent voice conversation (for context — do NOT repeat or bring up unless asked):\n${ctx}` : ''; })()}`
+				: isInbound && callSession.callerVerified
+				? 'A verified caller is calling you. Be helpful and conversational. You have limited tools — you can look up meeting IDs, check the time, and adjust volume/brightness. You cannot delegate tasks, access files, or make calls on their behalf. Say "Hello, this is Sutando. How can I help?"'
 				: isInbound
 				? 'Someone is calling you. Be helpful and conversational. Greet them with "Hello, this is Sutando. How can I help?"'
-				: callSession.callerVerified
+				: callSession.isOwner
 				? `You are calling your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''}. The person who picks up IS your owner.`
 				: 'You initiated this call on behalf of your owner.',
 			callSession.purpose && !isInbound ? `Purpose of this call: "${callSession.purpose}"` : '',
-			// Context only for verified outbound calls to owner
-			!isInbound && callSession.callerVerified ? (() => { const ctx = getSafeContext(); return ctx ? `\nRecent context (for reference — use only if relevant):\n${ctx}` : ''; })() : '',
+			// Context only for outbound calls to owner
+			!isInbound && callSession.isOwner ? (() => { const ctx = getSafeContext(); return ctx ? `\nRecent context (for reference — use only if relevant):\n${ctx}` : ''; })() : '',
 			'Be natural, warm, and conversational. Keep responses to 1-2 sentences.',
 			'When the other person wants to wrap up, say a warm goodbye, then call the hang_up tool to end the call.',
-			'',
-			'## How to think',
-			'Before acting, gather what you need. Before delegating, give them what they need.',
-			'call_contact makes a phone call — the message you pass is ALL the other person knows. If you pass no message or a vague one, they will be confused.',
-			'If you need info from multiple tools, call them in sequence — get the results first, then act.',
-			'',
-			'## Tools',
-			callSession.callerVerified ? `These tools are instant (use them directly, NOT through work): ${inlineTools.map(t => t.name).join(', ')}. Use work for everything else.` : '',
-			'You can make concurrent calls — stay on the line while calling someone else.',
-			'',
-			'## Known info',
-			(() => { try { const url = execSync('git remote get-url origin', { timeout: 2_000 }).toString().trim().replace(/\.git$/, ''); return `Sutando GitHub repo: ${url}`; } catch { return ''; } })(),
-			'',
-			'## Style',
-			'Be natural, warm, and conversational. Keep responses to 1-2 sentences.',
-			'When the conversation is done and both sides have said goodbye, call the hang_up tool.',
-		].filter(Boolean).join('\n');
+		];
+
+		// Owner-only sections
+		if (callSession.isOwner) {
+			instructions.push(
+				'',
+				'## How to think',
+				'Before acting, gather what you need. Before delegating, give them what they need.',
+				'call_contact makes a phone call — the message you pass is ALL the other person knows. If you pass no message or a vague one, they will be confused.',
+				'If you need info from multiple tools, call them in sequence — get the results first, then act.',
+				'',
+				'## Tools',
+				`These tools are instant (use them directly, NOT through work): ${inlineTools.map(t => t.name).join(', ')}. Use work for everything else.`,
+				'You can make concurrent calls — stay on the line while calling someone else.',
+				'',
+				'## Known info',
+				(() => { try { const url = execSync('git remote get-url origin', { timeout: 2_000 }).toString().trim().replace(/\.git$/, ''); return `Sutando GitHub repo: ${url}`; } catch { return ''; } })(),
+				'',
+				'## Style',
+				'Be natural, warm, and conversational. Keep responses to 1-2 sentences.',
+				'When the conversation is done and both sides have said goodbye, call the hang_up tool.',
+			);
+		}
+
+		instructions = instructions.filter(Boolean).join('\n');
 	}
 
-	// Grounding: never fabricate facts — look them up instead.
-	instructions += '\n\nNEVER fabricate specific details. If you don\'t know it, use the work tool to look it up.';
+	// Grounding
+	if (callSession.isOwner) {
+		instructions += '\n\nNEVER fabricate specific details. If you don\'t know it, use the work tool to look it up.';
+	}
 
 	const tools: ToolDefinition[] = [];
 
@@ -436,9 +451,14 @@ function buildAgent(callSession: CallSession): MainAgent {
 		});
 	}
 
-	// Child calls don't get the work tool — they have a specific purpose and should not
-	// accept new task requests from the person they're calling.
-	if (callSession.callerVerified && !isChildCall) {
+	// --- 3-tier access control ---
+	// Owner (isOwner): work tool + all inline tools + get_task_status
+	// Verified (!isOwner + callerVerified): any-caller tools + configurable tools
+	// Unverified: hang_up only (already added above)
+	// Access is determined entirely by the caller/callee phone number, not call type.
+
+	if (callSession.isOwner) {
+		// Owner: full access
 		tools.push({
 			name: 'work',
 			description:
@@ -456,12 +476,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 				return delegateTask(callSession, task);
 			},
 		});
-	}
-
-	// Inline tools (scroll, switch_app, etc.) — only for verified callers (OS-level access)
-	if (callSession.callerVerified && !isChildCall) {
 		tools.push(...inlineTools);
-
 		tools.push({
 			name: 'get_task_status',
 			description: 'Check whether a delegated task is still in progress. Use when someone asks "are you still working on that?"',
@@ -482,6 +497,10 @@ function buildAgent(callSession: CallSession): MainAgent {
 				} catch { return { inProgress: false, pendingCount: 0 }; }
 			},
 		});
+	} else if (callSession.callerVerified) {
+		// Verified caller: limited tools — no work, no owner-only tools
+		tools.push(...anyCallerTools);
+		tools.push(...configurableTools);
 	}
 
 	return {
@@ -509,6 +528,7 @@ async function createCallSession(params: {
 	twilioWs: WebSocket;
 	callerNumber: string;
 	callerVerified: boolean;
+	isOwner: boolean;
 	isMeeting: boolean;
 	meetingId?: string;
 	passcode?: string;
@@ -1098,11 +1118,8 @@ wss.on('connection', (ws: WebSocket) => {
 					// Child calls inherit parent's verification (the parent authorized this call).
 					// For meetings: check meeting ID against VERIFIED_MEETINGS.
 					// Accepts original ID (e.g. "gbn-otgn-dex"), numeric PIN, or Zoom meeting ID.
-					const parentCallSid = cp.parentCallSid ?? '';
 					let callerVerified: boolean;
-					if (parentCallSid && activeCalls.has(parentCallSid)) {
-						callerVerified = activeCalls.get(parentCallSid)!.callerVerified;
-					} else if (isMeeting) {
+					if (isMeeting) {
 						// Meetings must be explicitly verified — no permissive default.
 						// Unverified meetings get notes-only mode (no work tool / task delegation).
 						const numericId = meetingId.replace(/\D/g, '');
@@ -1111,7 +1128,10 @@ wss.on('connection', (ws: WebSocket) => {
 						callerVerified = VERIFIED_CALLERS.size === 0 || VERIFIED_CALLERS.has(personOnLine);
 					}
 
-					console.log(`${ts()} [WS] stream started: ${callSid}, meeting: ${isMeeting}, verified: ${callerVerified}`);
+					// Owner detection: based on phone number of the person on the line
+					const isOwner = OWNER_NUMBER ? personOnLine === OWNER_NUMBER : callerVerified;
+
+					console.log(`${ts()} [WS] stream started: ${callSid}, meeting: ${isMeeting}, verified: ${callerVerified}, owner: ${isOwner}`);
 
 					try {
 						callSession = await createCallSession({
@@ -1121,6 +1141,7 @@ wss.on('connection', (ws: WebSocket) => {
 							twilioWs: ws,
 							callerNumber: recipientNumber || callerNumber,
 							callerVerified,
+							isOwner,
 							isMeeting,
 							meetingId: meetingId ? meetingId.replace(/\D/g, '') : undefined,
 							passcode: cp.passcode || undefined,
