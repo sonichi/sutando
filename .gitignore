@@ -35,5 +35,5 @@ stand-identity.json
 docs/stand-avatar.png
 docs/youtube/
 core-status.json
-tests/manual/*.md
-!tests/manual/*.md.example
+tests/security/*.md
+!tests/security/*.md.example
