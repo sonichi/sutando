@@ -2,14 +2,16 @@
 
 Sutando uses 3-tier phone access control. This test verifies that each tier only has access to the tools it should.
 
-## How to use
+## How to test
 
 1. Copy this file to `phone-access-control.md` (gitignored, won't be committed)
 2. Fill in your `.env` numbers in the Setup section
-3. Call Sutando's Twilio number from each tier's phone number
-4. Say the phrase in the "What to say" column
-5. Fill in the result column: `✅` if it worked as expected, `✅ blocked` if correctly denied, `❌` if wrong behavior
-6. Your agent can also run these tests and fill in results automatically
+3. Make 3 phone calls to Sutando's Twilio number:
+   - From your **owner** number (`OWNER_NUMBER`) — try each phrase in the "What to say" column
+   - From a **verified** number (`VERIFIED_CALLERS`, not the owner) — try each phrase
+   - From an **unverified** number (not in either list) — try each phrase
+4. After the calls, ask your agent: "Read the phone transcripts and update tests/manual/phone-access-control.md with the results"
+5. The agent will read the call transcripts from `tasks/task-summary-*.txt`, match tool usage against expected behavior, and fill in the result columns automatically
 
 ## Setup
 
