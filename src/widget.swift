@@ -140,6 +140,7 @@ class WidgetState: ObservableObject {
     @Published var voiceOnline = false
     @Published var voiceClientConnected = false
     @Published var narration = ""
+    @Published var coreStatus = ""
     @Published var inputText = ""
     @Published var messages: [Message] = []
     @Published var expandedMessageId: String? = nil
@@ -185,6 +186,22 @@ class WidgetState: ObservableObject {
                 self?.tasks = resp.tasks ?? []
             }
         }.resume()
+
+        // Poll core status
+        if let coreUrl = URL(string: "http://localhost:7843/core-status") {
+            URLSession.shared.dataTask(with: coreUrl) { [weak self] data, _, _ in
+                guard let self, let data,
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    DispatchQueue.main.async { self?.coreStatus = "" }
+                    return
+                }
+                let status = json["status"] as? String ?? "idle"
+                let step = json["step"] as? String ?? ""
+                DispatchQueue.main.async {
+                    self.coreStatus = status == "running" ? step : ""
+                }
+            }.resume()
+        }
 
         // Check voice agent
         var req = URLRequest(url: URL(string: "http://localhost:9900")!)
@@ -600,13 +617,23 @@ struct WidgetView: View {
                 }
             }
 
-            // Narration
+            // Status line (narration or core status)
             if !state.narration.isEmpty {
                 HStack(spacing: 4) {
                     Text("\u{2591}")
                         .font(.system(size: 9))
                         .foregroundColor(.green.opacity(0.5))
                     Text(String(state.narration.prefix(45)) + (state.narration.count > 45 ? "..." : ""))
+                        .font(.system(size: 10))
+                        .foregroundColor(.white.opacity(0.5))
+                        .lineLimit(1)
+                }
+            } else if !state.coreStatus.isEmpty {
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(Color.blue.opacity(0.6))
+                        .frame(width: 6, height: 6)
+                    Text(String(state.coreStatus.prefix(45)) + (state.coreStatus.count > 45 ? "..." : ""))
                         .font(.system(size: 10))
                         .foregroundColor(.white.opacity(0.5))
                         .lineLimit(1)
@@ -705,13 +732,23 @@ struct WidgetView: View {
                 }
             }
 
-            // Narration
+            // Status line (narration or core status)
             if !state.narration.isEmpty {
                 HStack(spacing: 4) {
                     Text("\u{2591}")
                         .font(.system(size: 9))
                         .foregroundColor(.green.opacity(0.5))
                     Text(state.narration)
+                        .font(.system(size: 10))
+                        .foregroundColor(.white.opacity(0.5))
+                        .lineLimit(2)
+                }
+            } else if !state.coreStatus.isEmpty {
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(Color.blue.opacity(0.6))
+                        .frame(width: 6, height: 6)
+                    Text(state.coreStatus)
                         .font(.system(size: 10))
                         .foregroundColor(.white.opacity(0.5))
                         .lineLimit(2)

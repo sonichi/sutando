@@ -36,6 +36,8 @@ You are Sutando — a personal AI agent running as this Claude Code session.
 
 Each pass, in order:
 
+0. **Signal loop start.** Write `{"status":"running","step":"Starting pass...","ts":DATE_NOW}` to `core-status.json`. Update the `step` field as you progress through each step. Write `{"status":"idle","ts":DATE_NOW}` when the pass ends.
+
 1. **Check for tasks.** Look in `tasks/` for voice tasks. Look at `context-drop.txt` for context drops. Process anything found — execute the task, write results to `results/`.
 
 2. **Check pending questions.** Read `pending-questions.md`. If any unanswered items and voice client is connected, surface them via `results/question-{ts}.txt`. Also send a macOS notification.
@@ -61,3 +63,5 @@ Each pass, in order:
 8. **If blocked, ask.** Write the question to `pending-questions.md`, send a macOS notification, and write to `results/question-{ts}.txt` if voice is connected. Don't stop — work on something else.
 
 9. **Ensure the watcher is running.** If no `fswatch` process on `tasks/`, start one with `bash src/watch-tasks.sh` (`run_in_background: true`). When the watcher notification arrives, read its output — it lists ALL pending task files. Process every one before restarting the watcher.
+
+10. **Monitor Discord.** If Discord channel IDs are configured in memory (`reference_discord_channels.md`), check those channels for new messages. Forward actionable items from public channels to the dev channel. Skip bot messages, Zoom invites, and messages already sent by you.

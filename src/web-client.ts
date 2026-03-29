@@ -1355,21 +1355,25 @@ document.addEventListener('keydown', (e) => {
 // ─── Proactive status polling ─────────────────────────────
 (function pollProactiveStatus() {
   setInterval(() => {
-    fetch('http://localhost:7843/tasks/active')
-      .then(r => r.json())
-      .then(data => {
-        const working = (data.tasks || []).filter(t => t.status === 'working');
-        const el = document.getElementById('proactive-status');
-        const txt = document.getElementById('proactive-text');
-        if (working.length > 0) {
-          txt.textContent = 'Working on: ' + working.map(t => t.text).join(', ');
-          el.style.display = 'block';
-        } else {
-          el.style.display = 'none';
-        }
-      })
-      .catch(() => {});
-  }, 5000);
+    Promise.all([
+      fetch('http://localhost:7843/tasks/active').then(r => r.json()).catch(() => ({tasks:[]})),
+      fetch('http://localhost:7843/core-status').then(r => r.json()).catch(() => ({status:'idle'}))
+    ]).then(([taskData, loopData]) => {
+      const tasks = taskData.tasks || [];
+      const working = tasks.filter(t => t.status === 'working');
+      const el = document.getElementById('proactive-status');
+      const txt = document.getElementById('proactive-text');
+      if (working.length > 0) {
+        txt.textContent = 'Working on: ' + working.map(t => t.text).join(', ');
+        el.style.display = 'block';
+      } else if (loopData.status === 'running') {
+        txt.textContent = loopData.step || 'Proactive loop running...';
+        el.style.display = 'block';
+      } else {
+        el.style.display = 'none';
+      }
+    });
+  }, 3000);
 })();
 
 </script>

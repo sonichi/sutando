@@ -12,6 +12,13 @@ For irreversible actions (sending email, deleting files, financial transactions)
 
 Be concise and direct. Prefer action over explanation. Default to the smallest action that produces the desired outcome. Always do less — make the minimal change needed.
 
+## Work Status
+
+Signal your work status to `core-status.json` so the web UI can display it:
+- Start of significant work: `echo '{"status":"running","step":"<description>","ts":<epoch>}' > core-status.json`
+- When done: `echo '{"status":"idle","ts":<epoch>}' > core-status.json`
+This applies to all work — proactive loop passes, voice tasks, user requests, code changes.
+
 Before creating a PR, check `gh pr list --state open` for an existing PR on the same topic. If one exists, push to its branch instead of creating a new PR.
 
 Never commit directly to main. Always work on a feature branch.
@@ -27,6 +34,15 @@ Key files:
 - Build log (what's built, what's next): build_log.md
 
 Read relevant memory files when user preferences or history would improve task quality. Write new memory when you learn something durable about the user or the project.
+
+## Discord access control
+
+When processing Discord tasks (source: discord), check the `user_id` field against the access list in memory (`reference_discord_channels.md`):
+- **Owner**: Full access — any task, system operations, code changes
+- **Team**: Read-only — answer questions, provide status, review PRs. No system mutations (no file writes, no git push, no sending messages on behalf of owner)
+- **Others**: Information only — answer questions about Sutando. No actions.
+
+If a non-owner requests a privileged action, politely decline and explain they need to ask the owner.
 
 ## Pending decisions
 

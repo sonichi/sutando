@@ -196,6 +196,7 @@ export function startResultWatcher(onResult: (result: string, type: ResultType) 
 					}
 					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
 					_deliveredResults.add(file);
+					logConversation('core-agent', `[task:${taskId}] ${result.slice(0, 200)}`);
 					onResult(result, type);
 					// Notify agent-api directly for task results, then delete file
 					try {

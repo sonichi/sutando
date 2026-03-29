@@ -148,6 +148,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/ping":
             self.send_json(200, {"pong": True})
+        elif path == "/core-status":
+            # Read loop status file for web UI
+            status_file = REPO_DIR / "core-status.json"
+            if status_file.exists():
+                import json as _json
+                try:
+                    data = _json.loads(status_file.read_text())
+                    self.send_json(200, data)
+                except:
+                    self.send_json(200, {"status": "idle"})
+            else:
+                self.send_json(200, {"status": "idle"})
         elif path == "/status":
             self.send_json(200, get_status())
         elif path == "/tasks/active":

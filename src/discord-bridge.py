@@ -51,16 +51,26 @@ def load_policy():
     except:
         return "pairing"
 
-def load_channel_allowed(channel_id):
-    """Load channel-specific allowlist. Returns None if channel not configured (open to all)."""
+def load_channel_config(channel_id):
+    """Load channel config. Returns (requireMention, allowFrom set) or None if not configured."""
     try:
         data = json.loads(ACCESS_FILE.read_text())
         groups = data.get("groups", {})
         if channel_id in groups:
-            return set(groups[channel_id].get("allowFrom", []))
-        return None  # not configured = open
+            cfg = groups[channel_id]
+            if cfg is True:
+                return (False, None)  # no mention required, all allowed
+            return (cfg.get("requireMention", True), set(cfg.get("allowFrom", [])))
+        return None  # not configured
     except:
         return None
+
+def load_channel_allowed(channel_id):
+    """Load channel-specific allowlist. Returns None if channel not configured (open to all)."""
+    cfg = load_channel_config(channel_id)
+    if cfg is None:
+        return None
+    return cfg[1]
 
 # Track pending replies: task_id -> channel
 pending_replies = {}
@@ -90,13 +100,26 @@ async def on_message(message):
 
     print(f"  [msg] #{channel_name} @{username}: {text[:80]} (mentions: {[str(m) for m in message.mentions]}, is_dm: {is_dm})", flush=True)
 
-    # In channels, only respond when mentioned (user mention or role mention)
+    # In channels, check if mention is required
     if not is_dm:
+        channel_cfg = load_channel_config(str(message.channel.id))
+        require_mention = True  # default
+        if channel_cfg is not None:
+            require_mention = channel_cfg[0]
+
         bot_mentioned = client.user in message.mentions
-        role_mentioned = any(role.name.lower() == "sutando" for role in message.role_mentions)
-        if not bot_mentioned and not role_mentioned:
-            print(f"  [skip] not mentioned", flush=True)
+        role_mentioned = any(role.name.lower() in ("sutando", "sutando bot") or str(client.user.id) in str(role.id) for role in message.role_mentions)
+        # Also check if any role mention exists and the bot has that role
+        if not role_mentioned and message.role_mentions and message.guild:
+            bot_member = message.guild.get_member(client.user.id)
+            if bot_member:
+                bot_role_ids = {r.id for r in bot_member.roles}
+                role_mentioned = any(r.id in bot_role_ids for r in message.role_mentions)
+
+        if require_mention and not bot_mentioned and not role_mentioned:
+            print(f"  [skip] not mentioned (requireMention=true)", flush=True)
             return
+
         # Strip mentions from the text
         text = text.replace(f"<@{client.user.id}>", "")
         for role in message.role_mentions:
@@ -156,6 +179,7 @@ async def on_message(message):
         f"task: [Discord @{username}] {text}{attachment_note}\n"
         f"source: discord\n"
         f"channel_id: {message.channel.id}\n"
+        f"user_id: {message.author.id}\n"
     )
     pending_replies[task_id] = message.channel
 

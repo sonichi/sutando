@@ -69,6 +69,23 @@ const TASK_POLL_INTERVAL_MS = 500;
 const TASK_TIMEOUT_MS = 120_000;
 const OWNER_NAME = process.env.owner ?? '';
 
+/** Read recent conversation context, relabeled to avoid identity confusion */
+function getSafeContext(lines = 5): string {
+	try {
+		const logPath = join(WORKSPACE_DIR, 'conversation.log');
+		if (!existsSync(logPath)) return '';
+		const entries = readFileSync(logPath, 'utf-8').trim().split('\n').slice(-lines);
+		return entries.map(line => {
+			const [, role, text] = line.split('|', 3);
+			if (!role || !text) return '';
+			if (role === 'user') return `Owner said: ${text}`;
+			if (role === 'assistant') return `You (Sutando) replied: ${text}`;
+			return '';
+		}).filter(Boolean).join('\n');
+	} catch { return ''; }
+}
+
+
 const VERIFIED_CALLERS = new Set(
 	(process.env.VERIFIED_CALLERS ?? '').split(',').map(s => s.trim()).filter(Boolean)
 );
@@ -290,13 +307,15 @@ function buildAgent(callSession: CallSession): MainAgent {
 		instructions = [
 			'You are Sutando, a personal AI assistant.',
 			isInbound && callSession.callerVerified
-				? `Your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''} is calling you. You have full capabilities — use the work tool for anything: check the screen, send emails, look things up, make calls, browse the web, or check results of previous tasks. Greet them with "Hello, this is Sutando. How can I help?" — do NOT make up a scenario or pretend you were doing something.`
+				? `Your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''} is calling you. YOU are Sutando — the AI assistant. The person on the phone is your OWNER, a human. Do NOT confuse yourself with the caller. You have full capabilities — use the work tool for anything: check the screen, send emails, look things up, make calls, browse the web, or check results of previous tasks. Say exactly: "Hi, this is Sutando. How can I help?" then WAIT for them to speak. Do NOT say anything else before they talk. Do NOT make up tasks, scenarios, or pretend you were doing something.${(() => { const ctx = getSafeContext(); return ctx ? `\n\nRecent voice conversation (for context — do NOT repeat or bring up unless asked):\n${ctx}` : ''; })()}`
 				: isInbound
 				? 'Someone is calling you. Be helpful and conversational. Greet them with "Hello, this is Sutando. How can I help?"'
 				: callSession.callerVerified
 				? `You are calling your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''}. The person who picks up IS your owner.`
 				: 'You initiated this call on behalf of your owner.',
 			callSession.purpose && !isInbound ? `Purpose of this call: "${callSession.purpose}"` : '',
+			// Context only for verified outbound calls to owner
+			!isInbound && callSession.callerVerified ? (() => { const ctx = getSafeContext(); return ctx ? `\nRecent context (for reference — use only if relevant):\n${ctx}` : ''; })() : '',
 			'Be natural, warm, and conversational. Keep responses to 1-2 sentences.',
 			'When the other person wants to wrap up, say a warm goodbye, then call the hang_up tool to end the call.',
 			'',
@@ -457,8 +476,8 @@ function buildAgent(callSession: CallSession): MainAgent {
 		greeting: callSession.isMeeting
 			? ''  // No greeting for meetings — listen to IVR first
 			: callSession.purpose === 'inbound'
-			? 'Hello, this is Sutando. How can I help?'
-			: 'Hello, this is Sutando calling.',
+			? 'Hi, this is Sutando. How can I help?'
+			: 'Hi, this is Sutando calling.',
 	};
 }
 
@@ -616,6 +635,16 @@ function cleanupCall(callSid: string): void {
 		const data = JSON.stringify({ callSid, transcript: formatted, timestamp: new Date().toISOString() });
 		writeFileSync(join(CALLS_DIR, 'latest-result.json'), data);
 		appendFileSync(join(CALLS_DIR, 'calls.jsonl'), data + '\n');
+	}
+	// Append to shared conversation.log for cross-agent context
+	if (session.transcript.length > 0) {
+		const logPath = join(WORKSPACE_DIR, 'conversation.log');
+		const callType = session.meetingId ? `meeting-${session.meetingId}` : `call-${session.callerNumber || 'unknown'}`;
+		for (const t of session.transcript) {
+			const role = t.role === 'sutando' ? 'phone-agent' : 'phone-caller';
+			const line = `${new Date().toISOString()}|${role}|[${callType}] ${t.text.replace(/\n/g, ' ').slice(0, 200)}\n`;
+			try { appendFileSync(logPath, line); } catch { /* best effort */ }
+		}
 	}
 	console.log(`${ts()} [Phone] call finalized: ${callSid}`);
 
