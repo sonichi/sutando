@@ -89,6 +89,20 @@ bash src/startup.sh
 
 This starts all services (voice agent, web client, dashboard, API) and opens http://localhost:8080 in your browser. The autonomous loop starts automatically — click **Connect** and start talking.
 
+> **Note:** `startup.sh` runs Claude Code with `--dangerously-skip-permissions`, giving Sutando full system access (file operations, terminal commands, browser control). This is required for autonomous operation but means you should review what it does. All actions are logged.
+
+**macOS permissions** — grant these on first run (System Settings → Privacy & Security):
+- **Screen Recording** → add `claude` and `node`
+- **Accessibility** → add Shortcuts.app (for context drop)
+- **Microphone** → Chrome will ask on first voice connect
+
+**Try saying:**
+- "What's on my screen?" — takes a screenshot and describes it
+- "Summon" — opens Zoom with screen sharing, join from your phone
+- "Join my next meeting" — checks your calendar and joins
+- "Take a note: my first idea" — saves a searchable note
+- "Tutorial" — walks you through all capabilities step by step
+
 **Verify your setup** (optional):
 ```bash
 bash src/verify-setup.sh
@@ -162,13 +176,6 @@ When running, Sutando exposes these local ports:
 | 9900 | Voice agent WebSocket |
 
 ---
-
-## macOS permissions
-
-On first run, grant these in System Settings → Privacy & Security:
-- **Screen Recording** → add `claude` and `node`
-- **Accessibility** → add Shortcuts.app (for context drop)
-- **Microphone** → Chrome will ask on first voice connect
 
 ---
 
