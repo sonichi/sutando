@@ -8,7 +8,7 @@ Usage:
   python3 src/health-check.py --fix      # attempt to fix issues
 
 Checks:
-  - Voice agent (port 9900), web client, agent API, dashboard
+  - Voice agent (port 9900), web client, agent API, dashboard, voice control server (port 9901)
   - Critical files (CLAUDE.md, build_log.md, ACTIVITY.md)
   - Memory system (MEMORY.md index, key memory files)
   - Notes directory
@@ -129,7 +129,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_port(8080, "web-client"))
 
     # Optional services (downgrade missing to warning, not failure)
-    for port, name in [(7843, "agent-api"), (7844, "dashboard"), (7845, "screen-capture")]:
+    for port, name in [(7843, "agent-api"), (7844, "dashboard"), (7845, "screen-capture"), (9901, "voice-control")]:
         c = check_port(port, name)
         if c["status"] != "ok":
             c["status"] = "warn"
