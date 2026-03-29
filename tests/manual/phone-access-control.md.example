@@ -6,72 +6,31 @@
 - `VERIFIED_CALLERS` in `.env` — comma-separated verified numbers
 - Unverified: any number not in either list
 
-## Owner (calls from OWNER_NUMBER)
+## Test Matrix
 
-| Tool | What to say | Expected | Result | Notes |
-|------|-------------|----------|--------|-------|
-| Conversation | "Hi, how are you?" | works | | |
-| hang_up | "Goodbye" | works | | |
-| volume | "Set volume to 50%" | works | | |
-| brightness | "Set brightness to 80%" | works | | |
-| get_current_time | "What time is it?" | works | | |
-| lookup_meeting_id | "What's the Zoom meeting ID?" | works | | |
-| work | "Check my email" | works | | |
-| get_task_status | "Are you still working on that?" | works | | |
-| scroll | "Scroll down" | works | | |
-| switch_tab | "Switch to the GitHub tab" | works | | |
-| open_url | "Open google.com" | works | | |
-| switch_app | "Switch to Slack" | works | | |
-| capture_screen | "What's on my screen?" | works | | |
-| type_text | "Type hello world" | works | | |
-| clipboard | "What's in my clipboard?" | works | | |
-| cancel_task | "Cancel that task" | works | | |
-| toggle_tasks | "Show the task list" | works | | |
-| summon | "Summon to Zoom" | works | | |
-| join_zoom | "Join the Zoom meeting" | works | | |
-| join_gmeet | "Join the Google Meet" | works | | |
-| call_contact | "Call Bob" | works | | |
-
-## Verified caller (calls from VERIFIED_CALLERS, not owner)
-
-| Tool | What to say | Expected | Result | Notes |
-|------|-------------|----------|--------|-------|
-| Conversation | "Hi, how are you?" | works | | |
-| hang_up | "Goodbye" | works | | |
-| volume | "Set volume to 50%" | works | | |
-| brightness | "Set brightness to 80%" | works | | |
-| get_current_time | "What time is it?" | works | | |
-| lookup_meeting_id | "What's the Zoom meeting ID?" | works | | |
-| work | "Check my email" | blocked | | |
-| get_task_status | "Are you still working on that?" | blocked | | |
-| scroll | "Scroll down" | blocked | | |
-| switch_tab | "Switch to the GitHub tab" | blocked | | |
-| open_url | "Open google.com" | blocked | | |
-| switch_app | "Switch to Slack" | blocked | | |
-| capture_screen | "What's on my screen?" | blocked | | |
-| type_text | "Type hello world" | blocked | | |
-| clipboard | "What's in my clipboard?" | blocked | | |
-| cancel_task | "Cancel that task" | blocked | | |
-| toggle_tasks | "Show the task list" | blocked | | |
-| summon | "Summon to Zoom" | blocked | | |
-| join_zoom | "Join the Zoom meeting" | blocked | | |
-| join_gmeet | "Join the Google Meet" | blocked | | |
-| call_contact | "Call Bob" | blocked | | |
-
-## Unverified caller (any other number)
-
-| Tool | What to say | Expected | Result | Notes |
-|------|-------------|----------|--------|-------|
-| Conversation | "Hi, how are you?" | works | | |
-| hang_up | "Goodbye" | works | | |
-| volume | "Set volume to 50%" | works | | |
-| brightness | "Set brightness to 80%" | works | | |
-| get_current_time | "What time is it?" | works | | |
-| lookup_meeting_id | "What's the Zoom meeting ID?" | blocked | | |
-| work | "Check my email" | blocked | | |
-| scroll | "Scroll down" | blocked | | |
-| summon | "Summon to Zoom" | blocked | | |
-| call_contact | "Call Bob" | blocked | | |
+| Tool | What to say | Owner expected | Owner result | Verified expected | Verified result | Unverified expected | Unverified result |
+|------|-------------|:-:|:-:|:-:|:-:|:-:|:-:|
+| Conversation | "Hi, how are you?" | works | | works | | works | |
+| hang_up | "Goodbye" | works | | works | | works | |
+| volume | "Set volume to 50%" | works | | works | | works | |
+| brightness | "Set brightness to 80%" | works | | works | | works | |
+| get_current_time | "What time is it?" | works | | works | | works | |
+| lookup_meeting_id | "What's the Zoom meeting ID?" | works | | works | | blocked | |
+| work | "Check my email" | works | | blocked | | blocked | |
+| get_task_status | "Are you still working on that?" | works | | blocked | | blocked | |
+| scroll | "Scroll down" | works | | blocked | | blocked | |
+| switch_tab | "Switch to the GitHub tab" | works | | blocked | | blocked | |
+| open_url | "Open google.com" | works | | blocked | | blocked | |
+| switch_app | "Switch to Slack" | works | | blocked | | blocked | |
+| capture_screen | "What's on my screen?" | works | | blocked | | blocked | |
+| type_text | "Type hello world" | works | | blocked | | blocked | |
+| clipboard | "What's in my clipboard?" | works | | blocked | | blocked | |
+| cancel_task | "Cancel that task" | works | | blocked | | blocked | |
+| toggle_tasks | "Show the task list" | works | | blocked | | blocked | |
+| summon | "Summon to Zoom" | works | | blocked | | blocked | |
+| join_zoom | "Join the Zoom meeting" | works | | blocked | | blocked | |
+| join_gmeet | "Join the Google Meet" | works | | blocked | | blocked | |
+| call_contact | "Call Bob" | works | | blocked | | blocked | |
 
 ## Tested by
 
