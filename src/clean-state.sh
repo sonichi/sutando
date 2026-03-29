@@ -8,7 +8,7 @@ echo "Cleaning Sutando state..."
 # Remove old task files
 rm -f "$REPO/tasks/"*.txt 2>/dev/null
 
-# Remove old result files (but keep voice-conversation.json)
+# Remove old result files and voice conversation state
 find "$REPO/results" -name "task-*.txt" -mmin +5 -delete 2>/dev/null
 find "$REPO/results" -name "status-*.txt" -delete 2>/dev/null
 find "$REPO/results" -name "proactive-*.txt" -delete 2>/dev/null

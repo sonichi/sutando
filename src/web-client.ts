@@ -1248,10 +1248,11 @@ function submitTextTask(text, options = {}) {
         fetch(apiBase + '/result/' + d.task_id)
           .then(r => r.json())
           .then(r => {
-            if (r.status === 'completed') {
+            if (r.status === 'completed' || r.status === 'error' || r.status === 'cancelled') {
               clearInterval(poll);
-              updateTask(d.task_id, 'done', text, r.result || '');
-              if (appendResultToTranscript) {
+              const finalStatus = r.status === 'completed' ? 'done' : r.status;
+              updateTask(d.task_id, finalStatus, text, r.result || '');
+              if (r.status === 'completed' && appendResultToTranscript) {
                 const re = document.createElement('div');
                 re.className = 't-entry t-assistant';
                 re.textContent = r.result;

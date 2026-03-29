@@ -332,16 +332,25 @@ class WidgetState: ObservableObject {
 
     private func pollForResult(taskId: String) {
         guard let url = URL(string: "http://localhost:7843/result/\(taskId)") else { return }
+        var attempts = 0
         let timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] t in
+            attempts += 1
+            if attempts > 150 { // ~5 min timeout
+                t.invalidate()
+                DispatchQueue.main.async { self?.pendingPolls.removeValue(forKey: taskId) }
+                return
+            }
             URLSession.shared.dataTask(with: url) { data, _, _ in
                 guard let data = data,
-                      let resp = try? JSONDecoder().decode(TaskResultResponse.self, from: data),
-                      resp.status == "completed",
-                      let result = resp.result else { return }
+                      let resp = try? JSONDecoder().decode(TaskResultResponse.self, from: data) else { return }
+                let done = resp.status == "completed" || resp.status == "error" || resp.status == "cancelled"
+                guard done else { return }
                 t.invalidate()
                 DispatchQueue.main.async {
                     self?.pendingPolls.removeValue(forKey: taskId)
-                    self?.messages.append(Message(role: "assistant", text: result, time: Date()))
+                    if let result = resp.result, resp.status == "completed" {
+                        self?.messages.append(Message(role: "assistant", text: result, time: Date()))
+                    }
                 }
             }.resume()
         }
@@ -1112,7 +1121,7 @@ class GlobalPTT {
                 guard status == noErr,
                       eventHotKeyID.signature == ptt.hotKeyID.signature,
                       eventHotKeyID.id == ptt.hotKeyID.id else {
-                    return noErr
+                    return OSStatus(eventNotHandledErr)
                 }
 
                 switch GetEventKind(event) {
