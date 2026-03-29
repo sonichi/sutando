@@ -70,6 +70,13 @@ const TASK_TIMEOUT_MS = 120_000;
 const OWNER_NAME = process.env.owner ?? '';
 const OWNER_NUMBER = process.env.OWNER_NUMBER ?? '';
 
+/** Normalize phone number to digits only for comparison (strips +, -, spaces, parens) */
+function normalizePhone(num: string): string {
+	const digits = num.replace(/\D/g, '');
+	// If 10 digits (US without country code), prepend 1
+	return digits.length === 10 ? '1' + digits : digits;
+}
+
 /** Read recent conversation context, relabeled to avoid identity confusion */
 function getSafeContext(lines = 5): string {
 	try {
@@ -87,9 +94,8 @@ function getSafeContext(lines = 5): string {
 }
 
 
-const VERIFIED_CALLERS = new Set(
-	(process.env.VERIFIED_CALLERS ?? '').split(',').map(s => s.trim()).filter(Boolean)
-);
+const VERIFIED_CALLERS_RAW = (process.env.VERIFIED_CALLERS ?? '').split(',').map(s => s.trim()).filter(Boolean);
+const VERIFIED_CALLERS = new Set(VERIFIED_CALLERS_RAW.map(normalizePhone));
 // Meeting IDs that grant the agent OS access (task delegation).
 // Accepts Zoom meeting IDs, Google Meet PINs, or Meet codes (e.g. "gbn-otgn-dex").
 // Unverified meetings: agent joins and takes notes only (no work tool).
@@ -1127,11 +1133,12 @@ wss.on('connection', (ws: WebSocket) => {
 						const numericId = meetingId.replace(/\D/g, '');
 						callerVerified = VERIFIED_MEETINGS.has(meetingId) || (numericId !== meetingId && VERIFIED_MEETINGS.has(numericId));
 					} else {
-						callerVerified = VERIFIED_CALLERS.size === 0 || VERIFIED_CALLERS.has(personOnLine);
+						const normalizedPerson = normalizePhone(personOnLine);
+						callerVerified = VERIFIED_CALLERS.size === 0 || VERIFIED_CALLERS.has(normalizedPerson);
 					}
 
 					// Owner detection: based on phone number of the person on the line
-					const isOwner = OWNER_NUMBER ? personOnLine === OWNER_NUMBER : callerVerified;
+					const isOwner = OWNER_NUMBER ? normalizePhone(personOnLine) === normalizePhone(OWNER_NUMBER) : callerVerified;
 
 					console.log(`${ts()} [WS] stream started: ${callSid}, meeting: ${isMeeting}, verified: ${callerVerified}, owner: ${isOwner}`);
 
