@@ -480,6 +480,37 @@ async function main() {
 				return;
 			}
 
+			if (req.url === '/text-input') {
+				const text = typeof data.text === 'string' ? data.text.trim() : '';
+				if (!text) {
+					sendJson(400, { error: 'text required' });
+					return;
+				}
+				if (!session.clientConnected) {
+					sendJson(409, { error: 'no client' });
+					return;
+				}
+				if (!(session as any).sessionManager?.isActive) {
+					sendJson(409, { error: 'session not active' });
+					return;
+				}
+				try {
+					const handleTextInput = (session as any).handleTextInput;
+					if (typeof handleTextInput === 'function') {
+						handleTextInput.call(session, text);
+					} else {
+						(session as any).transport?.sendContent?.([{ role: 'user', text }], true);
+						(session as any).conversationContext?.addUserMessage?.(text);
+					}
+					sendJson(200, { ok: true, mode: 'live' });
+					console.log(`${ts()} [Control] Typed text relayed to live session`);
+				} catch (error) {
+					console.error(`${ts()} [Control] Failed to relay typed text:`, error);
+					sendJson(500, { error: 'failed to relay text' });
+				}
+				return;
+			}
+
 			if (req.url === '/client-state') {
 				updateControlState({
 					clientConnected: data.connected === true,

@@ -48,6 +48,12 @@ struct VoiceControlStateResponse: Decodable {
     let updatedAt: Double?
 }
 
+struct LiveTextSubmitResponse: Decodable {
+    let ok: Bool?
+    let mode: String?
+    let error: String?
+}
+
 private func stableMessageID(role: String, text: String, time: Date) -> String {
     let payload = "\(role)|\(Int(time.timeIntervalSince1970 * 1000))|\(text)"
     var hash: UInt64 = 1469598103934665603
@@ -125,8 +131,14 @@ struct SutandoPaths {
 }
 
 class WidgetState: ObservableObject {
+    struct PendingLiveEcho {
+        let text: String
+        let time: Date
+    }
+
     @Published var tasks: [TaskInfo] = []
     @Published var voiceOnline = false
+    @Published var voiceClientConnected = false
     @Published var narration = ""
     @Published var inputText = ""
     @Published var messages: [Message] = []
@@ -138,6 +150,7 @@ class WidgetState: ObservableObject {
     @Published var liveUserFinal = false
     var pttLabel = PTTConfig.defaultConfig.label
     private let paths = SutandoPaths.shared
+    private var pendingLiveEchoes: [PendingLiveEcho] = []
     private var timer: Timer?
     private var liveTimer: Timer?
     private var pendingPolls: [String: Timer] = [:]
@@ -182,6 +195,7 @@ class WidgetState: ObservableObject {
             DispatchQueue.main.async {
                 self?.voiceOnline = online
                 if online == false {
+                    self?.voiceClientConnected = false
                     self?.liveUserText = ""
                     self?.liveUserFinal = false
                 }
@@ -222,8 +236,13 @@ class WidgetState: ObservableObject {
                     return Message(role: role, text: text, time: time)
                 }
                 DispatchQueue.main.async {
+                    self.prunePendingLiveEchoes()
                     var existingIds = Set(self.messages.map { $0.id })
-                    for vm in voiceMsgs where existingIds.insert(vm.id).inserted {
+                    for vm in voiceMsgs {
+                        if self.consumePendingLiveEcho(for: vm) {
+                            continue
+                        }
+                        guard existingIds.insert(vm.id).inserted else { continue }
                         self.messages.append(vm)
                     }
                     self.messages.sort { $0.time < $1.time }
@@ -234,9 +253,20 @@ class WidgetState: ObservableObject {
 
     func submitTask(_ text: String) {
         guard !text.isEmpty else { return }
-        let msg = Message(role: "user", text: text, time: Date())
+        let localTime = Date()
+        let msg = Message(role: "user", text: text, time: localTime)
         DispatchQueue.main.async { self.messages.append(msg) }
 
+        if voiceClientConnected {
+            pendingLiveEchoes.append(PendingLiveEcho(text: text, time: localTime))
+            submitLiveText(text, localTime: localTime)
+            return
+        }
+
+        submitTaskBridge(text)
+    }
+
+    private func submitTaskBridge(_ text: String) {
         guard let url = URL(string: "http://localhost:7843/task") else { return }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
@@ -254,6 +284,32 @@ class WidgetState: ObservableObject {
                 return
             }
             self?.pollForResult(taskId: taskId)
+        }.resume()
+    }
+
+    private func submitLiveText(_ text: String, localTime: Date) {
+        guard let url = URL(string: "http://localhost:9901/text-input") else {
+            removePendingLiveEcho(text: text, time: localTime)
+            submitTaskBridge(text)
+            return
+        }
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.addValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.timeoutInterval = 2
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["text": text])
+
+        URLSession.shared.dataTask(with: req) { [weak self] data, response, _ in
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let ok = data.flatMap { try? JSONDecoder().decode(LiveTextSubmitResponse.self, from: $0) }?.ok == true
+            guard statusCode == 200, ok else {
+                DispatchQueue.main.async {
+                    self?.removePendingLiveEcho(text: text, time: localTime)
+                    self?.submitTaskBridge(text)
+                }
+                return
+            }
         }.resume()
     }
 
@@ -323,10 +379,34 @@ class WidgetState: ObservableObject {
                 return
             }
             DispatchQueue.main.async {
+                self.voiceClientConnected = resp.clientConnected ?? false
                 self.liveUserText = resp.liveUserText ?? ""
                 self.liveUserFinal = resp.liveUserFinal ?? false
             }
         }.resume()
+    }
+
+    private func prunePendingLiveEchoes(reference: Date = Date()) {
+        pendingLiveEchoes.removeAll { reference.timeIntervalSince($0.time) > 20 }
+    }
+
+    private func consumePendingLiveEcho(for message: Message) -> Bool {
+        guard message.role == "user" else { return false }
+        if let idx = pendingLiveEchoes.firstIndex(where: { pending in
+            pending.text == message.text && abs(pending.time.timeIntervalSince(message.time)) < 15
+        }) {
+            pendingLiveEchoes.remove(at: idx)
+            return true
+        }
+        return false
+    }
+
+    private func removePendingLiveEcho(text: String, time: Date) {
+        if let idx = pendingLiveEchoes.firstIndex(where: { pending in
+            pending.text == text && abs(pending.time.timeIntervalSince(time)) < 1
+        }) {
+            pendingLiveEchoes.remove(at: idx)
+        }
     }
 }
 

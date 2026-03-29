@@ -419,7 +419,7 @@ async function describeMicError(err) {
     return 'Microphone permission is blocked in Chrome for this page. Use the mic icon in the address bar and set it to Allow, then retry.';
   }
   if (name === 'NotReadableError' || name === 'TrackStartError') {
-    return 'Chrome could not start the microphone. It is usually still in use by another tab/app or wasn\'t released cleanly yet. Close other mic users and retry.';
+    return 'Chrome could not start the microphone. It is usually still in use by another tab/app or was not released cleanly yet. Close other mic users and retry.';
   }
   if (name === 'AbortError') {
     return 'Chrome aborted microphone startup. Retry once; if it repeats, reload the page and try again.';
@@ -1279,14 +1279,21 @@ function sendText() {
   $('transcript').scrollTop = $('transcript').scrollHeight;
   input.value = '';
 
-  submitTextTask(text, { appendResultToTranscript: !connected })
-    .catch(() => {
-      const err = document.createElement('div');
-      err.className = 't-entry t-assistant';
-      err.textContent = '(Failed to send — agent API not reachable)';
-      $('transcript').appendChild(err);
-      $('transcript').scrollTop = $('transcript').scrollHeight;
-    });
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    // Voice connected — send through voice agent
+    ws.send(JSON.stringify({ type: 'text_input', text }));
+    dbg('Sent text via voice: "' + text.slice(0, 50) + '"', 'event');
+  } else {
+    // Voice disconnected — route through task bridge
+    submitTextTask(text, { appendResultToTranscript: true })
+      .catch(() => {
+        const err = document.createElement('div');
+        err.className = 't-entry t-assistant';
+        err.textContent = '(Failed to send — agent API not reachable)';
+        $('transcript').appendChild(err);
+        $('transcript').scrollTop = $('transcript').scrollHeight;
+      });
+  }
 }
 
 // ─── Push-to-talk ────────────────────────────────────────
