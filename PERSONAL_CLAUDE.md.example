@@ -1,7 +1,0 @@
-# Personal Rules
-
-Before creating a PR, check `gh pr list --state open` for an existing PR on the same topic. If one exists, push to its branch instead of creating a new PR.
-
-Never commit directly to main. Always work on a feature branch.
-
-Never modify `src/startup.sh` or `src/restart.sh`. These are owner-maintained scripts.
