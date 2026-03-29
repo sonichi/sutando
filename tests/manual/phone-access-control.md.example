@@ -1,0 +1,80 @@
+# Phone Access Control — Test Results
+
+## Setup
+
+- `OWNER_NUMBER` in `.env` — the owner's phone number
+- `VERIFIED_CALLERS` in `.env` — comma-separated verified numbers
+- Unverified: any number not in either list
+
+## Owner (calls from OWNER_NUMBER)
+
+| Tool | What to say | Expected | Result | Notes |
+|------|-------------|----------|--------|-------|
+| Conversation | "Hi, how are you?" | works | | |
+| hang_up | "Goodbye" | works | | |
+| volume | "Set volume to 50%" | works | | |
+| brightness | "Set brightness to 80%" | works | | |
+| get_current_time | "What time is it?" | works | | |
+| lookup_meeting_id | "What's the Zoom meeting ID?" | works | | |
+| work | "Check my email" | works | | |
+| get_task_status | "Are you still working on that?" | works | | |
+| scroll | "Scroll down" | works | | |
+| switch_tab | "Switch to the GitHub tab" | works | | |
+| open_url | "Open google.com" | works | | |
+| switch_app | "Switch to Slack" | works | | |
+| capture_screen | "What's on my screen?" | works | | |
+| type_text | "Type hello world" | works | | |
+| clipboard | "What's in my clipboard?" | works | | |
+| cancel_task | "Cancel that task" | works | | |
+| toggle_tasks | "Show the task list" | works | | |
+| summon | "Summon to Zoom" | works | | |
+| join_zoom | "Join the Zoom meeting" | works | | |
+| join_gmeet | "Join the Google Meet" | works | | |
+| call_contact | "Call Bob" | works | | |
+
+## Verified caller (calls from VERIFIED_CALLERS, not owner)
+
+| Tool | What to say | Expected | Result | Notes |
+|------|-------------|----------|--------|-------|
+| Conversation | "Hi, how are you?" | works | | |
+| hang_up | "Goodbye" | works | | |
+| volume | "Set volume to 50%" | works | | |
+| brightness | "Set brightness to 80%" | works | | |
+| get_current_time | "What time is it?" | works | | |
+| lookup_meeting_id | "What's the Zoom meeting ID?" | works | | |
+| work | "Check my email" | blocked | | |
+| get_task_status | "Are you still working on that?" | blocked | | |
+| scroll | "Scroll down" | blocked | | |
+| switch_tab | "Switch to the GitHub tab" | blocked | | |
+| open_url | "Open google.com" | blocked | | |
+| switch_app | "Switch to Slack" | blocked | | |
+| capture_screen | "What's on my screen?" | blocked | | |
+| type_text | "Type hello world" | blocked | | |
+| clipboard | "What's in my clipboard?" | blocked | | |
+| cancel_task | "Cancel that task" | blocked | | |
+| toggle_tasks | "Show the task list" | blocked | | |
+| summon | "Summon to Zoom" | blocked | | |
+| join_zoom | "Join the Zoom meeting" | blocked | | |
+| join_gmeet | "Join the Google Meet" | blocked | | |
+| call_contact | "Call Bob" | blocked | | |
+
+## Unverified caller (any other number)
+
+| Tool | What to say | Expected | Result | Notes |
+|------|-------------|----------|--------|-------|
+| Conversation | "Hi, how are you?" | works | | |
+| hang_up | "Goodbye" | works | | |
+| volume | "Set volume to 50%" | works | | |
+| brightness | "Set brightness to 80%" | works | | |
+| get_current_time | "What time is it?" | works | | |
+| lookup_meeting_id | "What's the Zoom meeting ID?" | blocked | | |
+| work | "Check my email" | blocked | | |
+| scroll | "Scroll down" | blocked | | |
+| summon | "Summon to Zoom" | blocked | | |
+| call_contact | "Call Bob" | blocked | | |
+
+## Tested by
+
+| Tester | Date | Notes |
+|--------|------|-------|
+| | | |
