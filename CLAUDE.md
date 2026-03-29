@@ -14,9 +14,9 @@ Be concise and direct. Prefer action over explanation. Default to the smallest a
 
 ## Work Status
 
-Signal your work status to `loop-status.json` so the web UI can display it:
-- Start of significant work: `echo '{"status":"running","step":"<description>","ts":<epoch>}' > loop-status.json`
-- When done: `echo '{"status":"idle","ts":<epoch>}' > loop-status.json`
+Signal your work status to `core-status.json` so the web UI can display it:
+- Start of significant work: `echo '{"status":"running","step":"<description>","ts":<epoch>}' > core-status.json`
+- When done: `echo '{"status":"idle","ts":<epoch>}' > core-status.json`
 This applies to all work — proactive loop passes, voice tasks, user requests, code changes.
 
 Before creating a PR, check `gh pr list --state open` for an existing PR on the same topic. If one exists, push to its branch instead of creating a new PR.

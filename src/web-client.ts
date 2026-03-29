@@ -1107,7 +1107,7 @@ function sendText() {
   setInterval(() => {
     Promise.all([
       fetch('http://localhost:7843/tasks/active').then(r => r.json()).catch(() => ({tasks:[]})),
-      fetch('http://localhost:7843/loop-status').then(r => r.json()).catch(() => ({status:'idle'}))
+      fetch('http://localhost:7843/core-status').then(r => r.json()).catch(() => ({status:'idle'}))
     ]).then(([taskData, loopData]) => {
       const tasks = taskData.tasks || [];
       const working = tasks.filter(t => t.status === 'working');
