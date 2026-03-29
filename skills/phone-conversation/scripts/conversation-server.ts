@@ -42,7 +42,8 @@
  *   - Transcript persistence
  */
 
-import 'dotenv/config';
+import dotenv from 'dotenv';
+dotenv.config({ override: true });
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { mkdirSync, writeFileSync, appendFileSync, unlinkSync, existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -1140,7 +1141,7 @@ wss.on('connection', (ws: WebSocket) => {
 					// Owner detection: based on phone number of the person on the line
 					const isOwner = OWNER_NUMBER ? normalizePhone(personOnLine) === normalizePhone(OWNER_NUMBER) : callerVerified;
 
-					console.log(`${ts()} [WS] stream started: ${callSid}, meeting: ${isMeeting}, verified: ${callerVerified}, owner: ${isOwner}`);
+					console.log(`${ts()} [WS] stream started: ${callSid}, meeting: ${isMeeting}, verified: ${callerVerified}, owner: ${isOwner}, personOnLine: ${personOnLine}, normalized: ${normalizePhone(personOnLine)}, verifiedSet: ${[...VERIFIED_CALLERS].join(',')}`);
 
 					try {
 						callSession = await createCallSession({
