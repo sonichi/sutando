@@ -8,7 +8,7 @@ It belongs entirely to you.
 
 https://github.com/user-attachments/assets/a3f1f9a8-9fe2-4775-bc09-50c7d6713a11
 
-Unmute to hear the real-time conversation. [Watch on YouTube →](https://youtu.be/BgRUXEzZRN4)
+Unmute to hear the real-time conversation. In this demo, the user controls their Mac entirely from a phone call — no need to be at the computer. [Watch on YouTube →](https://youtu.be/BgRUXEzZRN4)
 
 ---
 
