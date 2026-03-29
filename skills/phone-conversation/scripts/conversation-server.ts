@@ -69,6 +69,16 @@ const TASK_POLL_INTERVAL_MS = 500;
 const TASK_TIMEOUT_MS = 120_000;
 const OWNER_NAME = process.env.owner ?? '';
 
+/** Get recent conversation context from the voice agent log */
+function getRecentContext(lines = 5): string {
+	try {
+		const logPath = join(WORKSPACE_DIR, 'conversation.log');
+		if (!existsSync(logPath)) return '';
+		const content = readFileSync(logPath, 'utf-8').trim().split('\n');
+		return content.slice(-lines).join('\n');
+	} catch { return ''; }
+}
+
 const VERIFIED_CALLERS = new Set(
 	(process.env.VERIFIED_CALLERS ?? '').split(',').map(s => s.trim()).filter(Boolean)
 );
@@ -290,7 +300,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 		instructions = [
 			'You are Sutando, a personal AI assistant.',
 			isInbound && callSession.callerVerified
-				? `Your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''} is calling you. You have full capabilities — use the work tool for anything: check the screen, send emails, look things up, make calls, browse the web, or check results of previous tasks. Say exactly: "Hi, this is Sutando. How can I help?" then WAIT for them to speak. Do NOT say anything else before they talk. Do NOT make up tasks, scenarios, or pretend you were doing something.`
+				? `Your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''} is calling you. You have full capabilities — use the work tool for anything: check the screen, send emails, look things up, make calls, browse the web, or check results of previous tasks. Say exactly: "Hi, this is Sutando. How can I help?" then WAIT for them to speak. Do NOT say anything else before they talk. Do NOT make up tasks, scenarios, or pretend you were doing something.${(() => { const ctx = getRecentContext(); return ctx ? `\n\nRecent conversation context (for reference only — do NOT bring this up unless asked):\n${ctx}` : ''; })()}`
 				: isInbound
 				? 'Someone is calling you. Be helpful and conversational. Greet them with "Hello, this is Sutando. How can I help?"'
 				: callSession.callerVerified
