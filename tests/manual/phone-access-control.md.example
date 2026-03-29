@@ -1,5 +1,16 @@
 # Phone Access Control — Test Results
 
+Sutando uses 3-tier phone access control. This test verifies that each tier only has access to the tools it should.
+
+## How to use
+
+1. Copy this file to `phone-access-control.md` (gitignored, won't be committed)
+2. Fill in your `.env` numbers in the Setup section
+3. Call Sutando's Twilio number from each tier's phone number
+4. Say the phrase in the "What to say" column
+5. Fill in the result column: `✅` if it worked as expected, `✅ blocked` if correctly denied, `❌` if wrong behavior
+6. Your agent can also run these tests and fill in results automatically
+
 ## Setup
 
 - `OWNER_NUMBER` in `.env` — the owner's phone number
