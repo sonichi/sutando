@@ -326,16 +326,13 @@ async function main() {
 		}
 	});
 
-	startResultWatcher((result, type) => {
-		const prompt = type === 'narration'
-			? `[System: Progress update from the agent working on the user's task. Share it naturally:]`
-			: `[System: Task completed. Briefly tell the user this result in one sentence:]`;
-		console.log(`${ts()} [TaskBridge] Delivering ${type} result to user`);
+	startResultWatcher((result) => {
+		console.log(`${ts()} [TaskBridge] Delivering result to user`);
 		setTimeout(() => {
 			(session as any).transport.sendContent([
-				{ role: 'user', text: `${prompt} ${result}` },
+				{ role: 'user', text: `[System: Task completed. Briefly tell the user this result in one sentence:] ${result}` },
 			], true);
-		}, type === 'narration' ? 500 : 1500);
+		}, 1500);
 	}, () => session.clientConnected);
 
 	let lastLoggedIndex = 0;

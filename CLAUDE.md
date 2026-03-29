@@ -69,30 +69,6 @@ When the user says "tutorial", "walk me through", or "show me what you can do" (
 
 Keep each step conversational and brief — this is spoken, not read. Focus on what to say/try, skip setup details unless asked.
 
-## Progress narration
-
-When `.narration-enabled` exists and voice is connected, write brief progress updates to keep the user informed:
-
-```bash
-echo "your message" > results/narration-$(date +%s%3N).txt
-```
-
-Write at natural milestones — starting a task, completing a step, hitting a blocker. Keep it conversational and brief (one sentence). Examples:
-- "Looking into the widget resize issue now."
-- "Found the bug — the animation was stacking. Fixing it."
-- "Rebuilt the widget, testing now."
-
-Don't narrate every tool call. Narrate the story.
-
-A PostToolUse hook also writes per-tool status updates to `results/status-{ts}.txt` — these are widget-only (not spoken).
-
-**Toggle:**
-- On: `touch .narration-enabled` (voice: "turn on narration" / "start narrating")
-- Off: `rm .narration-enabled` (voice: "turn off narration" / "stop narrating")
-- Debug: `touch .narration-debug` → inspect `/tmp/sutando-narration-debug.log`
-
-Hook config: `.claude/settings.json`, script: `.claude/hooks/narration-log.sh`
-
 ## Built-in capabilities
 
 **Calendar** — read Google Calendar events (preferred) or macOS Calendar:
