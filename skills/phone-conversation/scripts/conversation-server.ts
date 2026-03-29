@@ -634,6 +634,16 @@ function cleanupCall(callSid: string): void {
 		writeFileSync(join(CALLS_DIR, 'latest-result.json'), data);
 		appendFileSync(join(CALLS_DIR, 'calls.jsonl'), data + '\n');
 	}
+	// Append to shared conversation.log for cross-agent context
+	if (session.transcript.length > 0) {
+		const logPath = join(WORKSPACE_DIR, 'conversation.log');
+		const callType = session.meetingId ? `meeting-${session.meetingId}` : `call-${session.callerNumber || 'unknown'}`;
+		for (const t of session.transcript) {
+			const role = t.role === 'sutando' ? 'phone-agent' : 'phone-caller';
+			const line = `${new Date().toISOString()}|${role}|[${callType}] ${t.text.replace(/\n/g, ' ').slice(0, 200)}\n`;
+			try { appendFileSync(logPath, line); } catch { /* best effort */ }
+		}
+	}
 	console.log(`${ts()} [Phone] call finalized: ${callSid}`);
 
 	// If top-level call (no parent) with a transcript, write a summary task for Claude to pick up
