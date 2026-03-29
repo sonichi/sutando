@@ -21,12 +21,13 @@
 import 'dotenv/config';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
-import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, readdirSync, unlinkSync, mkdirSync, renameSync } from 'node:fs';
+import { createServer as createHttpServer } from 'node:http';
 import { inlineTools } from './inline-tools.js';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
 	VoiceSession,
-	GeminiBatchSTTProvider,
 } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
@@ -42,18 +43,46 @@ if (!GEMINI_API_KEY) { console.error('Error: GEMINI_API_KEY is required'); proce
 
 const PORT = Number(process.env.PORT) || 9900;
 const HOST = process.env.HOST || '0.0.0.0';
+const REPO_DIR = process.env.SUTANDO_REPO_DIR || fileURLToPath(new URL('..', import.meta.url));
+const RESULTS_DIR = join(REPO_DIR, 'results');
 // Default to sutando/ so Claude Code subprocess picks up CLAUDE.md automatically
-const WORKSPACE_DIR = process.env.WORKSPACE_DIR || new URL('..', import.meta.url).pathname;
+const WORKSPACE_DIR = process.env.WORKSPACE_DIR || REPO_DIR;
 const DEFAULT_THREAD_KEY = 'sutando_main';
 const SESSION_ID = `session_${Date.now()}`;
 const PHONE_PORT = Number(process.env.PHONE_PORT) || 3100;
 const PHONE_SERVER_URL = `http://localhost:${PHONE_PORT}`;
-const CALL_RESULTS_DIR = join(new URL('.', import.meta.url).pathname, '..', 'results', 'calls');
+const CALL_RESULTS_DIR = join(RESULTS_DIR, 'calls');
+
+mkdirSync(RESULTS_DIR, { recursive: true });
 
 const google = createGoogleGenerativeAI({ apiKey: GEMINI_API_KEY });
 let sessionRef: VoiceSession | null = null;
 
 function ts(): string { return new Date().toISOString().slice(11, 23); }
+
+type ControlState = {
+	clientConnected: boolean;
+	muted: boolean | null;
+	pttMode: boolean;
+	pttHeld: boolean;
+	liveUserText: string;
+	liveUserFinal: boolean;
+	updatedAt: number;
+};
+
+const controlState: ControlState = {
+	clientConnected: false,
+	muted: null,
+	pttMode: false,
+	pttHeld: false,
+	liveUserText: '',
+	liveUserFinal: false,
+	updatedAt: Date.now() / 1000,
+};
+
+function updateControlState(patch: Partial<ControlState>): void {
+	Object.assign(controlState, patch, { updatedAt: Date.now() / 1000 });
+}
 
 // =============================================================================
 // Pending tool call tracker
@@ -270,7 +299,7 @@ async function main() {
 		host: HOST,
 		model: google('gemini-2.5-flash'),
 		geminiModel: 'gemini-2.5-flash-native-audio-preview-12-2025',
-		sttProvider: new GeminiBatchSTTProvider({ apiKey: GEMINI_API_KEY, model: 'gemini-3-flash-preview' }),
+		inputAudioTranscription: true,
 		speechConfig: { voiceName: 'Puck' },
 		hooks: {
 			onSessionStart: (e) => console.log(`${ts()} [Session] Started: ${e.sessionId}`),
@@ -297,13 +326,16 @@ async function main() {
 		}
 	});
 
-	startResultWatcher((result) => {
-		console.log(`${ts()} [TaskBridge] Delivering result to user`);
+	startResultWatcher((result, type) => {
+		const prompt = type === 'narration'
+			? `[System: Progress update from the agent working on the user's task. Share it naturally:]`
+			: `[System: Task completed. Briefly tell the user this result in one sentence:]`;
+		console.log(`${ts()} [TaskBridge] Delivering ${type} result to user`);
 		setTimeout(() => {
 			(session as any).transport.sendContent([
-				{ role: 'user', text: `[System: Task completed. Briefly tell the user this result in one sentence:] ${result}` },
+				{ role: 'user', text: `${prompt} ${result}` },
 			], true);
-		}, 1500);
+		}, type === 'narration' ? 500 : 1500);
 	}, () => session.clientConnected);
 
 	let lastLoggedIndex = 0;
@@ -316,6 +348,19 @@ async function main() {
 			}
 		}
 		lastLoggedIndex = items.length;
+		// Write recent conversation for widget pickup
+		try {
+			const recent = items.filter(i => i.role === 'user' || i.role === 'assistant').slice(-10);
+			const json = recent.map(i => ({
+				role: i.role === 'user' ? 'user' : 'assistant',
+				text: (i.content || '').slice(0, 300),
+				time: i.timestamp ? i.timestamp / 1000 : Date.now() / 1000,
+			}));
+			const targetPath = join(RESULTS_DIR, 'voice-conversation.json');
+			const tmpPath = `${targetPath}.tmp`;
+			writeFileSync(tmpPath, JSON.stringify(json));
+			renameSync(tmpPath, targetPath);
+		} catch {}
 	});
 
 	const shutdown = async () => {
@@ -362,11 +407,112 @@ async function main() {
 
 	await session.start();
 
+	// Small HTTP server for widget PTT toggle (runs alongside the WebSocket server)
+	const CONTROL_PORT = Number(process.env.CONTROL_PORT) || 9901;
+	createHttpServer((req, res) => {
+		res.setHeader('Access-Control-Allow-Origin', '*');
+		res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+		res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+		if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+		const sendJson = (statusCode: number, payload: Record<string, unknown>) => {
+			res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify(payload));
+		};
+
+		if (req.method === 'GET' && req.url === '/state') {
+			updateControlState({ clientConnected: session.clientConnected });
+			sendJson(200, controlState);
+			return;
+		}
+
+		if (req.method !== 'POST') {
+			sendJson(404, { error: 'not found' });
+			return;
+		}
+
+		let rawBody = '';
+		req.on('data', (chunk) => { rawBody += chunk.toString(); });
+		req.on('end', () => {
+			let data: Record<string, unknown> = {};
+			if (rawBody.trim()) {
+				try {
+					data = JSON.parse(rawBody) as Record<string, unknown>;
+				} catch {
+					sendJson(400, { error: 'invalid json' });
+					return;
+				}
+			}
+
+			if (req.url === '/toggle-mute') {
+				if (!session.clientConnected || !(session as any).clientTransport?.sendJsonToClient) {
+					sendJson(500, { error: 'no client' });
+					return;
+				}
+				try {
+					(session as any).clientTransport?.sendJsonToClient?.({ type: 'toggle_mute' });
+					sendJson(200, { ok: true });
+					console.log(`${ts()} [PTT] Legacy mute toggle relayed to client`);
+				} catch {
+					sendJson(500, { error: 'no client' });
+				}
+				return;
+			}
+
+			if (req.url === '/mute') {
+				const nextMuted = Boolean(data.muted);
+				if (!session.clientConnected || !(session as any).clientTransport?.sendJsonToClient) {
+					sendJson(500, { error: 'no client' });
+					return;
+				}
+				try {
+					(session as any).clientTransport?.sendJsonToClient?.({
+						type: 'set_mute',
+						muted: nextMuted,
+						announce: false,
+						source: 'widget',
+					});
+					updateControlState({ muted: nextMuted, clientConnected: session.clientConnected });
+					sendJson(200, { ok: true, muted: nextMuted });
+					console.log(`${ts()} [PTT] Explicit mute relayed to client: ${nextMuted ? 'muted' : 'live'}`);
+				} catch {
+					sendJson(500, { error: 'no client' });
+				}
+				return;
+			}
+
+			if (req.url === '/client-state') {
+				updateControlState({
+					clientConnected: data.connected === true,
+					muted: typeof data.muted === 'boolean' ? data.muted : controlState.muted,
+					pttMode: data.pttMode === true,
+					pttHeld: data.pttHeld === true,
+				});
+				sendJson(200, { ok: true });
+				return;
+			}
+
+			if (req.url === '/live-transcript') {
+				updateControlState({
+					liveUserText: typeof data.text === 'string' ? data.text.slice(0, 300) : '',
+					liveUserFinal: data.final === true,
+					clientConnected: session.clientConnected,
+				});
+				sendJson(200, { ok: true });
+				return;
+			}
+
+			sendJson(404, { error: 'not found' });
+		});
+	}).listen(CONTROL_PORT, HOST, () => {
+		console.log(`${ts()} [Control] HTTP control server on port ${CONTROL_PORT}`);
+	});
+
 	// Keep process alive, log health, and auto-recover dead sessions.
 	setInterval(() => {
 		const mgr = (session as any).sessionManager;
 		const state = mgr?.state ?? 'unknown';
 		const clientConnected = session.clientConnected;
+		updateControlState({ clientConnected });
 		console.log(`${ts()} [Health] state=${state} client=${clientConnected}`);
 		// Auto-recover: if session is CLOSED but client is connected, trigger reconnect
 		if (state === 'CLOSED' && clientConnected) {

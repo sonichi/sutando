@@ -153,7 +153,26 @@ for port_name in "9900:voice-agent" "8080:web-client" "7844:dashboard" "7843:age
   fi
 done
 echo ""
-open "http://localhost:8080"
+
+# 8. Desktop widget (native macOS overlay)
+if ! pgrep -f "sutando-widget" > /dev/null 2>&1; then
+  if [ -f "$REPO/sutando-widget" ]; then
+    echo "  ✓ desktop widget"
+    SUTANDO_AUTOOPEN_WEBUI=0 "$REPO/sutando-widget" &
+  elif [ -f "$REPO/src/widget.swift" ]; then
+    echo "  Building desktop widget..."
+    if swiftc -module-cache-path /tmp/sutando-swift-module-cache -o "$REPO/sutando-widget" "$REPO/src/widget.swift" -framework Cocoa -framework SwiftUI -framework CoreGraphics -O 2>/dev/null; then
+      echo "  ✓ desktop widget (built + launched)"
+      SUTANDO_AUTOOPEN_WEBUI=0 "$REPO/sutando-widget" &
+    else
+      echo "  ~ desktop widget (build failed — needs Xcode CLT)"
+    fi
+  fi
+else
+  echo "  ✓ desktop widget (already running)"
+fi
+echo ""
+open "http://localhost:8080?autoconnect=1"
 
 # Check if a sutando-core session is already running
 if pgrep -f "claude.*--name.*sutando-core" > /dev/null 2>&1; then

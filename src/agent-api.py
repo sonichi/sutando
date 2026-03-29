@@ -57,6 +57,17 @@ RESULT_DIR.mkdir(exist_ok=True)
 task_history = {}
 
 
+def extract_task_text(task_file: Path) -> str:
+    try:
+        content = task_file.read_text()
+    except Exception:
+        return task_file.stem
+    for line in content.splitlines():
+        if line.startswith("task:"):
+            return line[5:].strip() or task_file.stem
+    return task_file.stem
+
+
 
 def get_status() -> dict:
     try:
@@ -349,6 +360,53 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "invalid"})
             return
 
+        if path == "/task/cancel":
+            if not self.check_auth():
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError:
+                self.send_json(400, {"ok": False, "error": "invalid JSON"})
+                return
+
+            task_id = str(data.get("task_id", "")).strip()
+            if not task_id:
+                self.send_json(400, {"ok": False, "error": "task_id is required"})
+                return
+
+            task_file = TASK_DIR / f"{task_id}.txt"
+            result_file = RESULT_DIR / f"{task_id}.txt"
+            if result_file.exists():
+                self.send_json(409, {"ok": False, "error": "Task already completed"})
+                return
+
+            if not task_file.exists():
+                self.send_json(409, {"ok": False, "error": "Task already picked up and can't be cancelled reliably"})
+                return
+
+            task_text = extract_task_text(task_file)
+            try:
+                task_file.unlink()
+            except Exception:
+                self.send_json(500, {"ok": False, "error": "Failed to remove task file"})
+                return
+
+            task_history[task_id] = {
+                "status": "cancelled",
+                "text": task_text,
+                "time": datetime.now().timestamp(),
+                "result": "Cancelled by user",
+            }
+            self.send_json(200, {
+                "ok": True,
+                "task_id": task_id,
+                "status": "cancelled",
+                "result": "Cancelled by user",
+            })
+            return
+
         if path != "/task":
             self.send_json(404, {"error": "not found"})
             return
@@ -378,6 +436,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         task_id = f"task-{int(datetime.now().timestamp() * 1000)}"
         task_content = f"id: {task_id}\ntimestamp: {datetime.now().isoformat()}\ntask: {task}\nsource: api\nfrom: {from_agent}\n"
         (TASK_DIR / f"{task_id}.txt").write_text(task_content)
+        task_history[task_id] = {"status": "working", "text": task, "time": datetime.now().timestamp(), "result": ""}
 
         # Register webhook callback if provided
         if callback_url:
@@ -439,8 +498,6 @@ async function send(){
 if __name__ == "__main__":
     bind = os.environ.get("AGENT_API_BIND", "0.0.0.0")
     server = http.server.HTTPServer((bind, PORT), Handler)
-    import socket
-    local_ip = socket.gethostbyname(socket.gethostname())
     print(f"Sutando Agent API → http://localhost:{PORT}")
     print(f"  POST /task  — submit a task")
     print(f"  GET  /status — health + capabilities")

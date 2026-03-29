@@ -164,7 +164,9 @@ export function startContextDropWatcher(onContextDrop: (content: string) => void
 	}, 2000);
 }
 
-export function startResultWatcher(onResult: (result: string) => void, isClientConnected: () => boolean): void {
+export type ResultType = 'narration' | 'task' | 'status' | 'other';
+
+export function startResultWatcher(onResult: (result: string, type: ResultType) => void, isClientConnected: () => boolean): void {
 	console.log(`${ts()} [TaskBridge] Watching for results in ${RESULT_DIR}`);
 
 	// Check every 2 seconds for new result files
@@ -184,18 +186,28 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 				const result = readFileSync(path, 'utf-8').trim();
 				if (result) {
 					const taskId = file.replace('.txt', '');
-					console.log(`${ts()} [TaskBridge] Result ${file}: ${result.slice(0, 100)}`);
-					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
+					const type: ResultType = file.startsWith('status-') ? 'status' : file.startsWith('narration-') ? 'narration' : file.startsWith('task-') ? 'task' : 'other';
+					console.log(`${ts()} [TaskBridge] Result ${file} (${type}): ${result.slice(0, 100)}`);
+					// Status files are widget-only — don't deliver to voice or task system
+					if (type === 'status') {
+						_deliveredResults.add(file);
+						continue;
+					}
+					if (type !== 'narration') {
+						_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
+					}
 					_deliveredResults.add(file);
-					onResult(result);
-					// Notify agent-api directly, then delete file
-					try {
-						fetch('http://localhost:7843/task-done', {
-							method: 'POST',
-							headers: { 'Content-Type': 'application/json' },
-							body: JSON.stringify({ taskId, result }),
-						}).catch(() => {});
-					} catch {}
+					onResult(result, type);
+					// Notify agent-api directly for task results, then delete file
+					if (type !== 'narration') {
+						try {
+							fetch('http://localhost:7843/task-done', {
+								method: 'POST',
+								headers: { 'Content-Type': 'application/json' },
+								body: JSON.stringify({ taskId, result }),
+							}).catch(() => {});
+						} catch {}
+					}
 					setTimeout(() => { try { unlinkSync(path); } catch {} }, 10_000);
 				}
 			}

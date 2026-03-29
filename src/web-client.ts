@@ -125,9 +125,17 @@ const HTML = /* html */ `<!DOCTYPE html>
   }
   .task-status.working { background: #1e3a5f; color: #60a5fa; animation: pulse 1.5s infinite; }
   .task-status.done { background: #1e4028; color: #4ecca3; }
+  .task-status.cancelled { background: #3a1f1f; color: #f28b82; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
   .task-text { color: #888; flex: 1; word-break: break-word; }
   .task-time { color: #444; font-size: 10px; }
+  .task-cancel {
+    width: 20px; height: 20px; border-radius: 50%;
+    border: 1px solid #3a2a2a; background: #16111a; color: #b88;
+    padding: 0; font-size: 12px; line-height: 18px;
+    display: inline-flex; align-items: center; justify-content: center;
+  }
+  .task-cancel:hover { background: #24161a; color: #f28b82; border-color: #5a2a2a; }
 
   /* Questions */
   #questions {
@@ -158,6 +166,24 @@ const HTML = /* html */ `<!DOCTYPE html>
     color: #555; font-size: 11px; cursor: pointer; text-decoration: none;
   }
   .btn-download:hover { background: #1a1a2e; color: #aaa; }
+
+  /* Push-to-talk indicator */
+  .ptt-bar {
+    position: fixed; bottom: 0; left: 0; right: 0;
+    background: #1e5128; color: #fff; text-align: center;
+    padding: 6px; font-size: 12px; font-weight: 500;
+    display: none; z-index: 100;
+    animation: ptt-pulse 0.8s infinite;
+  }
+  @keyframes ptt-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.7; } }
+  .btn-ptt { background: #2a2a3e; color: #888; font-size: 11px; }
+  .btn-ptt:hover { background: #3a3a4e; color: #fff; }
+  .btn-ptt.active { background: #1e4028; color: #4ecca3; border: 1px solid #2a7a3a; }
+  .btn-end-all {
+    background: #3a1a1a; color: #e94560; border: 1px solid #5a2a2a;
+    font-size: 11px;
+  }
+  .btn-end-all:hover { background: #5a2222; color: #fff; }
 
   /* Hidden URL input */
   #wsUrl { display: none; }
@@ -213,6 +239,8 @@ const HTML = /* html */ `<!DOCTYPE html>
   <div class="controls">
     <button id="btn" class="btn-voice" onclick="toggle()" style="display:none">End Voice</button>
     <button id="btn-mute" class="btn-mute" onclick="toggleMute()" style="display:none">Mute</button>
+    <button id="btn-ptt" class="btn-ptt" onclick="togglePtt()" style="display:none">PTT</button>
+    <button id="btn-end-all" class="btn-end-all" onclick="endAll()">End All</button>
     <button class="btn-subtle" onclick="saveDebug()">Debug</button>
   </div>
 </div>
@@ -300,8 +328,23 @@ window.addEventListener('DOMContentLoaded', () => {
     wsUrlInput.value = getDefaultWsUrl();
   }
   initChromeStt();
-  // Auto-reconnect voice if it was connected before refresh
-  try { if (sessionStorage.getItem('sutando-voice')) { setTimeout(() => toggle(), 500); } } catch {}
+  // Auto-connect: URL param or sessionStorage reconnect
+  // Both need a user gesture for AudioContext+mic, so show click overlay
+  const params = new URLSearchParams(window.location.search);
+  const wantsAutoconnect = params.get('autoconnect') === '1' || sessionStorage.getItem('sutando-voice');
+  if (wantsAutoconnect && !connected) {
+    const enablePtt = params.get('ptt') === '1';
+    const overlay = document.createElement('div');
+    overlay.id = 'autoconnect-overlay';
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.85);cursor:pointer';
+    overlay.innerHTML = '<div style="text-align:center;color:#fff"><div style="font-size:48px;margin-bottom:16px">\u{1F3A4}</div><div style="font-size:18px;font-weight:600">Click to activate voice</div><div style="font-size:13px;color:#888;margin-top:8px">' + (enablePtt ? 'Push-to-Talk mode' : 'Always-on mode') + '</div></div>';
+    document.body.appendChild(overlay);
+    overlay.addEventListener('click', () => {
+      overlay.remove();
+      toggle();
+      if (enablePtt) setTimeout(() => { if (connected && !pttMode) togglePtt(); }, 500);
+    }, { once: true });
+  }
 });
 
 // ─── State ────────────────────────────────────────────────
@@ -327,12 +370,75 @@ let recognition = null;
 
 const debugLog = [];
 const $ = (id) => document.getElementById(id);
+const controlBaseUrl = () => 'http://' + window.location.hostname + ':9901';
+let lastPublishedLiveText = null;
+let lastPublishedLiveFinal = false;
+
+function postControl(path, payload) {
+  return fetch(controlBaseUrl() + path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  }).catch(() => {});
+}
+
+function publishClientState() {
+  return postControl('/client-state', {
+    connected,
+    muted,
+    pttMode,
+    pttHeld,
+  });
+}
+
+function publishLiveUserText(text, final) {
+  const normalized = (text || '').trim();
+  if (normalized === lastPublishedLiveText && final === lastPublishedLiveFinal) return;
+  lastPublishedLiveText = normalized;
+  lastPublishedLiveFinal = final;
+  postControl('/live-transcript', { text: normalized, final });
+}
+
+function clearLiveUserText() {
+  publishLiveUserText('', true);
+}
+
+async function describeMicError(err) {
+  const name = err && typeof err === 'object' && 'name' in err ? err.name : '';
+  const message = err && typeof err === 'object' && 'message' in err ? err.message : String(err || '');
+  let permissionState = '';
+
+  try {
+    if (navigator.permissions && navigator.permissions.query) {
+      const status = await navigator.permissions.query({ name: 'microphone' });
+      permissionState = status.state;
+    }
+  } catch {}
+
+  if (name === 'NotAllowedError' || permissionState === 'denied') {
+    return 'Microphone permission is blocked in Chrome for this page. Use the mic icon in the address bar and set it to Allow, then retry.';
+  }
+  if (name === 'NotReadableError' || name === 'TrackStartError') {
+    return 'Chrome could not start the microphone. It is usually still in use by another tab/app or wasn\'t released cleanly yet. Close other mic users and retry.';
+  }
+  if (name === 'AbortError') {
+    return 'Chrome aborted microphone startup. Retry once; if it repeats, reload the page and try again.';
+  }
+  if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+    return 'No microphone was found. Check your input device selection in Chrome and macOS Sound settings.';
+  }
+  if (message) {
+    return 'Microphone startup failed: ' + message;
+  }
+  return 'Microphone startup failed. This is not always a permission issue; retry once and check the mic icon in Chrome.';
+}
 
 // ─── Chrome STT (real-time interim display) ───────────────
 function initChromeStt() {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR) {
     dbg('Browser does not support SpeechRecognition — no interim transcripts available', 'warn');
+    addSystem('This browser does not support instant live transcript. Spoken text will appear after server transcription. Chrome gives the fastest live word-by-word display.');
     return;
   }
   recognition = new SR();
@@ -367,6 +473,7 @@ function showChromeSttInterim(text) {
     $('transcript').appendChild(currentUserEl);
   }
   currentUserEl.textContent = text;
+  publishLiveUserText(text, false);
   $('transcript').scrollTop = $('transcript').scrollHeight;
 }
 
@@ -395,6 +502,7 @@ function handleTranscript(role, text, partial) {
         $('transcript').appendChild(currentUserEl);
       }
       currentUserEl.textContent = text;
+      publishLiveUserText(text, false);
     } else {
       // Final transcript — update in-place for correct ordering
       if (!currentUserEl) {
@@ -403,6 +511,7 @@ function handleTranscript(role, text, partial) {
       }
       currentUserEl.className = 't-entry t-user';
       currentUserEl.textContent = text;
+      publishLiveUserText(text, true);
       currentUserEl = null;
     }
   } else {
@@ -480,7 +589,33 @@ function toggleAllTasks() {
   const link = document.querySelector('#tasks-header span:last-child');
   if (link) link.textContent = hasExpanded ? 'expand all' : 'collapse all';
 }
+async function cancelTask(taskId) {
+  const existing = taskMap[taskId];
+  if (!existing || (existing.status !== 'working' && existing.status !== 'pending')) return;
+  try {
+    const resp = await fetch('http://' + window.location.hostname + ':7843/task/cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ task_id: taskId }),
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) {
+      addSystem(data.error || 'Could not cancel that task.');
+      return;
+    }
+    updateTask(taskId, 'cancelled', existing.text, data.result || 'Cancelled by user.');
+  } catch {
+    addSystem('Could not cancel that task.');
+  }
+}
 document.addEventListener('click', function(e) {
+  const cancelBtn = e.target.closest && e.target.closest('.task-cancel[data-taskid]');
+  if (cancelBtn) {
+    e.preventDefault();
+    e.stopPropagation();
+    cancelTask(cancelBtn.dataset.taskid);
+    return;
+  }
   const item = e.target.closest && e.target.closest('.task-item[data-taskid]');
   if (item) toggleResult(item.dataset.taskid);
 });
@@ -492,18 +627,21 @@ function renderTasks() {
   if (hdr) hdr.style.display = 'flex';
   const sorted = entries.sort((a, b) => b[1].time - a[1].time).slice(0, 8);
   container.innerHTML = sorted.map(([id, t]) => {
-    const icons = { pending: '&#8987;', working: '&#9881;', done: '&#10003;', error: '&#10007;' };
+    const icons = { pending: '&#8987;', working: '&#9881;', done: '&#10003;', cancelled: '&#10005;', error: '&#10007;' };
     const ago = Math.round((Date.now() - t.time) / 1000);
     const timeStr = ago < 60 ? ago + 's ago' : Math.round(ago / 60) + 'm ago';
-    const hasResult = t.result && t.status === 'done';
+    const hasResult = t.result && (t.status === 'done' || t.status === 'cancelled' || t.status === 'error');
     const clickAttr = hasResult ? ' data-taskid="' + id + '" style="cursor:pointer"' : '';
     const isExpanded = expandedTasks.has(id);
     const resultDisplay = isExpanded ? 'block' : 'none';
     const resultHtml = hasResult ? '<div id="result-' + id + '" style="display:' + resultDisplay + ';padding:6px 26px;color:#8ab4c8;font-size:11px;white-space:pre-wrap;word-break:break-word;background:#0d1520;border-radius:6px;margin:4px 0 4px 26px">' + t.result.replace(/</g,'&lt;') + '</div>' : '';
+    const canCancel = t.status === 'working' || t.status === 'pending';
+    const cancelHtml = canCancel ? '<button class="task-cancel" data-taskid="' + id + '" title="Cancel task">\u00d7</button>' : '';
     return '<div class="task-item"' + clickAttr + '>' +
       '<div class="task-status ' + t.status + '">' + (icons[t.status] || '?') + '</div>' +
       '<span class="task-text">' + (t.text || id) + (hasResult ? (isExpanded ? ' ▾' : ' ▸') : '') + '</span>' +
       '<span class="task-time">' + timeStr + '</span>' +
+      cancelHtml +
       '</div>' + resultHtml;
   }).join('');
 }
@@ -530,10 +668,13 @@ function startTaskPolling() {
         }
         taskMap[t.id] = { status: t.status, text: t.text, time: new Date(t.time * 1000), result: t.result || existing.result || '' };
       }
-      // Remove tasks no longer in API (stale)
-      for (const id of Object.keys(taskMap)) {
-        if (!apiTasks.has(id) && taskMap[id].status === 'working') {
-          delete taskMap[id];
+      // Remove tasks no longer in API (stale) — but only if API returned tasks
+      // (prevents flicker when agent-api restarts with empty state)
+      if (apiTasks.size > 0) {
+        for (const id of Object.keys(taskMap)) {
+          if (!apiTasks.has(id) && taskMap[id].status === 'working') {
+            delete taskMap[id];
+          }
         }
       }
       renderTasks();
@@ -742,6 +883,7 @@ async function startMic() {
   dbg('Mic capture started');
   reconnectAttempts = 0;
   addSystem('Microphone active — speak now.');
+  publishClientState();
 
   // Start Chrome STT for real-time interim display (server final replaces)
   startChromeStt();
@@ -773,9 +915,10 @@ function connectWs() {
       setStatus('Live — speak now', 'live');
       statsTimer = setInterval(updateStats, 500);
     } catch (err) {
-      dbg('Mic error: ' + err.message, 'err');
+      const detail = await describeMicError(err);
+      dbg('Mic error: ' + ((err && err.name) || 'Error') + ' ' + ((err && err.message) || String(err)), 'err');
       setStatus('Mic error', 'error');
-      addSystem('Microphone access denied. Please allow and retry.');
+      addSystem(detail);
       ws.close();
     }
   };
@@ -820,6 +963,7 @@ function connectWs() {
           currentUserEl = null;
           currentAssistantEl = null;
           serverUserTextReceived = false;
+          clearLiveUserText();
         } else if (msg.type === 'gui.update') {
           const guiData = msg.payload?.data;
           if (guiData?.type === 'subprocess_log' && guiData.line) {
@@ -915,6 +1059,12 @@ function connectWs() {
           connected = false; // prevent auto-reconnect
           if (ws) { ws.close(); ws = null; }
           doCleanup();
+        } else if (msg.type === 'toggle_mute') {
+          setMuteState(!muted, { syncPttBar: pttMode });
+          dbg('Mute toggled via PTT relay', 'event');
+        } else if (msg.type === 'set_mute') {
+          setMuteState(msg.muted === true, { announce: msg.announce === true, syncPttBar: pttMode });
+          dbg('Mute set via control relay: ' + (msg.muted ? 'muted' : 'live'), 'event');
         } else if (msg.type === 'task.status') {
           updateTask(msg.taskId, msg.status, msg.text, msg.result);
         } else if (msg.type === 'grounding') {
@@ -982,21 +1132,44 @@ function doCleanup() {
   $('hero').style.display = '';
   $('btn').style.display = 'none';
   $('btn-mute').style.display = 'none';
+  $('btn-ptt').style.display = 'none';
+  pttMode = false; pttHeld = false;
+  document.getElementById('ptt-bar').style.display = 'none';
+  $('btn-ptt').className = 'btn-ptt';
+  $('btn-ptt').textContent = 'PTT';
   $('voice-status').className = 'status-pill voice-off';
+  clearLiveUserText();
+  publishClientState();
   try { sessionStorage.removeItem('sutando-voice'); } catch {}
   if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
   updateStats();
 }
 
 // ─── Mute toggle ──────────────────────────────────────────
-function toggleMute() {
-  if (!micStream) return;
-  muted = !muted;
-  micStream.getAudioTracks().forEach(t => { t.enabled = !muted; });
+function setMuteState(nextMuted, options = {}) {
+  const announce = options.announce === true;
+  const syncPttBar = options.syncPttBar === true;
+  const changed = muted !== nextMuted;
+  muted = nextMuted;
+  if (micStream) {
+    micStream.getAudioTracks().forEach(t => { t.enabled = !muted; });
+  }
   const btn = document.getElementById('btn-mute');
-  btn.textContent = muted ? 'Unmute' : 'Mute';
-  btn.className = muted ? 'btn-mute muted' : 'btn-mute';
-  addSystem(muted ? 'Microphone muted.' : 'Microphone unmuted.');
+  if (btn) {
+    btn.textContent = muted ? 'Unmute' : 'Mute';
+    btn.className = muted ? 'btn-mute muted' : 'btn-mute';
+  }
+  if (syncPttBar) {
+    document.getElementById('ptt-bar').style.display = muted ? 'none' : 'block';
+  }
+  if (announce && changed) {
+    addSystem(muted ? 'Microphone muted.' : 'Microphone unmuted.');
+  }
+  publishClientState();
+}
+
+function toggleMute() {
+  setMuteState(!muted, { announce: true });
 }
 
 // ─── UI toggle (user gesture context!) ────────────────────
@@ -1027,6 +1200,7 @@ function toggle() {
     $('btn-mute').style.display = '';
     $('btn-mute').textContent = 'Mute';
     $('btn-mute').className = 'btn-mute';
+    $('btn-ptt').style.display = '';
     $('voice-status').className = 'status-pill voice-on';
     $('status').textContent = 'Voice active';
     try { sessionStorage.setItem('sutando-voice', '1'); } catch {}
@@ -1052,6 +1226,45 @@ function trySuggestion(el) {
 }
 
 // ─── Text input ──────────────────────────────────────────
+function submitTextTask(text, options = {}) {
+  const apiBase = 'http://' + location.hostname + ':7843';
+  const appendResultToTranscript = options.appendResultToTranscript !== false;
+
+  return fetch(apiBase + '/task', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from: 'web', task: text }),
+  })
+    .then(r => r.json())
+    .then(d => {
+      if (!d.ok || !d.task_id) {
+        throw new Error(d.error || 'Failed to queue task');
+      }
+
+      updateTask(d.task_id, 'working', text, '');
+      dbg('Sent text via task bridge: ' + d.task_id, 'event');
+
+      const poll = setInterval(() => {
+        fetch(apiBase + '/result/' + d.task_id)
+          .then(r => r.json())
+          .then(r => {
+            if (r.status === 'completed') {
+              clearInterval(poll);
+              updateTask(d.task_id, 'done', text, r.result || '');
+              if (appendResultToTranscript) {
+                const re = document.createElement('div');
+                re.className = 't-entry t-assistant';
+                re.textContent = r.result;
+                $('transcript').appendChild(re);
+                $('transcript').scrollTop = $('transcript').scrollHeight;
+              }
+            }
+          })
+          .catch(() => {});
+      }, 2000);
+    });
+}
+
 function sendText() {
   const input = $('textInput');
   const text = input.value.trim();
@@ -1066,41 +1279,71 @@ function sendText() {
   $('transcript').scrollTop = $('transcript').scrollHeight;
   input.value = '';
 
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    // Voice connected — send through voice agent
-    ws.send(JSON.stringify({ type: 'text_input', text }));
-    dbg('Sent text via voice: "' + text.slice(0, 50) + '"', 'event');
-  } else {
-    // Voice disconnected — route through task bridge (same as Telegram/Discord)
-    const apiBase = 'http://' + location.hostname + ':7843';
-    fetch(apiBase + '/task', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from: 'web', task: text }) })
-      .then(r => r.json())
-      .then(d => {
-        if (d.ok) {
-          dbg('Sent text via task bridge: ' + d.task_id, 'event');
-          // Poll for result
-          const poll = setInterval(() => {
-            fetch(apiBase + '/result/' + d.task_id).then(r => r.json()).then(r => {
-              if (r.status === 'completed') {
-                clearInterval(poll);
-                const re = document.createElement('div');
-                re.className = 't-entry t-assistant';
-                re.textContent = r.result;
-                $('transcript').appendChild(re);
-                $('transcript').scrollTop = $('transcript').scrollHeight;
-              }
-            }).catch(() => {});
-          }, 2000);
-        }
-      })
-      .catch(() => {
-        const err = document.createElement('div');
-        err.className = 't-entry t-assistant';
-        err.textContent = '(Failed to send — agent API not reachable)';
-        $('transcript').appendChild(err);
-      });
-  }
+  submitTextTask(text, { appendResultToTranscript: !connected })
+    .catch(() => {
+      const err = document.createElement('div');
+      err.className = 't-entry t-assistant';
+      err.textContent = '(Failed to send — agent API not reachable)';
+      $('transcript').appendChild(err);
+      $('transcript').scrollTop = $('transcript').scrollHeight;
+    });
 }
+
+// ─── Push-to-talk ────────────────────────────────────────
+let pttMode = false;
+let pttHeld = false;
+
+function togglePtt() {
+  pttMode = !pttMode;
+  const btn = $('btn-ptt');
+  btn.className = pttMode ? 'btn-ptt active' : 'btn-ptt';
+  btn.textContent = pttMode ? 'PTT On' : 'PTT';
+  if (pttMode && connected && micStream) {
+    // Mute mic by default in PTT mode
+    setMuteState(true);
+    addSystem('Push-to-talk enabled — hold Space to speak.');
+  } else if (!pttMode && connected && micStream) {
+    // Restore always-on mic
+    setMuteState(false);
+    addSystem('Push-to-talk disabled — mic always on.');
+  }
+  publishClientState();
+}
+
+document.addEventListener('keydown', (e) => {
+  if (e.code !== 'Space' || !pttMode || !connected || pttHeld) return;
+  if (document.activeElement === $('textInput')) return;
+  e.preventDefault();
+  pttHeld = true;
+  setMuteState(false, { syncPttBar: true });
+});
+
+document.addEventListener('keyup', (e) => {
+  if (e.code !== 'Space' || !pttMode || !pttHeld) return;
+  e.preventDefault();
+  pttHeld = false;
+  setMuteState(true, { syncPttBar: true });
+});
+
+// ─── End All ─────────────────────────────────────────────
+function endAll() {
+  if (connected) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'text_input', text: 'goodbye' }));
+    }
+    setTimeout(() => {
+      if (ws) { ws.close(); ws = null; }
+      doCleanup();
+    }, 500);
+  }
+  addSystem('Disconnected.');
+}
+
+document.addEventListener('keydown', (e) => {
+  if (e.code === 'Escape' && document.activeElement !== $('textInput') && connected) {
+    endAll();
+  }
+});
 
 // ─── Proactive status polling ─────────────────────────────
 (function pollProactiveStatus() {
@@ -1123,6 +1366,7 @@ function sendText() {
 })();
 
 </script>
+<div id="ptt-bar" class="ptt-bar">Speaking...</div>
 </body>
 </html>`;
 

@@ -21,7 +21,9 @@ src/cloudflare-worker.js
 AGENT_LOOP.md
 PENDING.md
 pending-questions.md
-.claude/
+.claude/*
+!.claude/hooks/
+!.claude/settings.json
 ACTIVITY.md
 build_log.md
 notes/*.md
@@ -33,3 +35,4 @@ archive/
 assets/
 stand-identity.json
 docs/stand-avatar.png
+sutando-widget
