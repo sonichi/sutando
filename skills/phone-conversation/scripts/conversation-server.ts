@@ -454,8 +454,11 @@ function buildAgent(callSession: CallSession): MainAgent {
 	// --- 3-tier access control ---
 	// Owner (isOwner): work tool + all inline tools + get_task_status
 	// Verified (!isOwner + callerVerified): any-caller tools + configurable tools
-	// Unverified: hang_up only (already added above)
+	// Unverified: any-caller tools only (volume, brightness, time, toggle_tasks)
 	// Access is determined entirely by the caller/callee phone number, not call type.
+
+	// Any-caller tools available to everyone (including unverified)
+	tools.push(...anyCallerTools);
 
 	if (callSession.isOwner) {
 		// Owner: full access
@@ -498,8 +501,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 			},
 		});
 	} else if (callSession.callerVerified) {
-		// Verified caller: limited tools — no work, no owner-only tools
-		tools.push(...anyCallerTools);
+		// Verified caller: configurable tools (in addition to any-caller tools above)
 		tools.push(...configurableTools);
 	}
 
