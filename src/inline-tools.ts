@@ -208,10 +208,11 @@ export const volumeTool: ToolDefinition = {
 				return { status: 'unmuted' };
 			}
 			if (level !== undefined) {
-				const osxLevel = Math.round(level / 100 * 7); // macOS volume is 0-7
-				execSync(`osascript -e 'set volume output volume ${level}'`, { timeout: 5_000 });
-				console.log(`${ts()} [Volume] set to ${level}%`);
-				return { status: 'set', level };
+				// Gemini sometimes passes 0-1 instead of 0-100 — normalize
+				const normalizedLevel = level <= 1 && level > 0 ? Math.round(level * 100) : Math.round(level);
+				execSync(`osascript -e 'set volume output volume ${normalizedLevel}'`, { timeout: 5_000 });
+				console.log(`${ts()} [Volume] set to ${normalizedLevel}%`);
+				return { status: 'set', level: normalizedLevel };
 			}
 			return { error: 'Specify level (0-100) or mute (true/false)' };
 		} catch (err) {
@@ -229,7 +230,9 @@ export const brightnessTool: ToolDefinition = {
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { level } = args as { level: number };
+		let { level } = args as { level: number };
+		// Gemini sometimes passes 0-1 instead of 0-100 — normalize
+		if (level <= 1 && level > 0) level = Math.round(level * 100);
 		const bLevel = (level / 100).toFixed(2);
 		try {
 			execSync(`osascript -e 'tell application "System Events" to tell appearance preferences to set dark mode to false'`, { timeout: 1_000 }).toString();
