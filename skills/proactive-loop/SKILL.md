@@ -61,3 +61,11 @@ Each pass, in order:
 8. **If blocked, ask.** Write the question to `pending-questions.md`, send a macOS notification, and write to `results/question-{ts}.txt` if voice is connected. Don't stop — work on something else.
 
 9. **Ensure the watcher is running.** If no `fswatch` process on `tasks/`, start one with `bash src/watch-tasks.sh` (`run_in_background: true`). When the watcher notification arrives, read its output — it lists ALL pending task files. Process every one before restarting the watcher.
+
+10. **Monitor Discord.** Check Sutando Discord server channels for new messages:
+    - #dev: 1485653767402553457
+    - #general: 1487549592089137317
+    - #setup-help: 1485653767402553458
+    - #showcase: 1485653767402553459
+    - #bugs: 1487546886092230788
+    Fetch recent messages from each. If there are actionable messages from non-bot users (questions, bugs, requests, feedback), forward a summary to DM channel 1485370959870431433. Skip bot messages, Zoom invites, and messages already sent by you.
