@@ -1,4 +1,5 @@
 .env
+PERSONAL_CLAUDE.md
 node_modules/
 dist/
 *.log

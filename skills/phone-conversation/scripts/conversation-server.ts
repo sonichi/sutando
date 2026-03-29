@@ -292,6 +292,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 
 		instructions = ivrInstructions + '\n\nAfter joining the meeting:\n' + meetingInstructions;
 	} else if (isChildCall) {
+		const ctx = getSafeContext();
 		instructions = [
 			`You are Sutando, a personal AI assistant. You are making a phone call on behalf of ${OWNER_NAME || 'your owner'}.`,
 			`You are Sutando — NOT the person you are calling. When the person picks up, introduce yourself as Sutando.`,
@@ -301,6 +302,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 			'When the conversation is done and both sides have said goodbye, call the hang_up tool to end the call.',
 			'Keep responses to 1-2 sentences.',
 			'IMPORTANT: You can ONLY fulfill the stated purpose of this call. If the person asks you to make another call, look something up, or do anything else, politely decline — say you can only help with the current topic.',
+			ctx ? `\nRecent context (for reference — use only if relevant to the call purpose):\n${ctx}` : '',
 		].filter(Boolean).join('\n');
 	} else {
 		const isInbound = callSession.purpose === 'inbound';
@@ -319,8 +321,21 @@ function buildAgent(callSession: CallSession): MainAgent {
 			'Be natural, warm, and conversational. Keep responses to 1-2 sentences.',
 			'When the other person wants to wrap up, say a warm goodbye, then call the hang_up tool to end the call.',
 			'',
-			'You can make concurrent calls — call another person while staying on this call. Use the work tool.',
-			'You do NOT need to hang up this call to make another call. Stay on the line with the caller.',
+			'## How to think',
+			'Before acting, gather what you need. Before delegating, give them what they need.',
+			'call_contact makes a phone call — the message you pass is ALL the other person knows. If you pass no message or a vague one, they will be confused.',
+			'If you need info from multiple tools, call them in sequence — get the results first, then act.',
+			'',
+			'## Tools',
+			callSession.callerVerified ? `These tools are instant (use them directly, NOT through work): ${inlineTools.map(t => t.name).join(', ')}. Use work for everything else.` : '',
+			'You can make concurrent calls — stay on the line while calling someone else.',
+			'',
+			'## Known info',
+			(() => { try { const url = execSync('git remote get-url origin', { timeout: 2_000 }).toString().trim().replace(/\.git$/, ''); return `Sutando GitHub repo: ${url}`; } catch { return ''; } })(),
+			'',
+			'## Style',
+			'Be natural, warm, and conversational. Keep responses to 1-2 sentences.',
+			'When the conversation is done and both sides have said goodbye, call the hang_up tool.',
 		].filter(Boolean).join('\n');
 	}
 
@@ -334,9 +349,12 @@ function buildAgent(callSession: CallSession): MainAgent {
 	tools.push({
 		name: 'hang_up',
 		description:
-			'End this phone call. Call this ONLY when both sides have explicitly said goodbye ' +
-			'(bye, talk to you later, have a good one, etc). Do NOT call if only one side said goodbye ' +
-			'or if the conversation is still going.',
+			'End this phone call. Call this ONLY when the CALLER has clearly and explicitly said goodbye ' +
+			'(bye, talk to you later, have a good one, etc). Do NOT hang up if: ' +
+			'(1) only you said goodbye but the caller did not, ' +
+			'(2) the caller\'s speech is unclear or garbled, ' +
+			'(3) you just completed an action — always report the result first and wait for the caller to respond, ' +
+			'(4) the conversation is still going. When in doubt, do NOT hang up — ask if they need anything else.',
 		parameters: z.object({}),
 		execution: 'inline',
 		async execute() {
