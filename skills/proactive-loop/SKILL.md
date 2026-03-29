@@ -68,4 +68,4 @@ Each pass, in order:
     - #setup-help: 1485653767402553458
     - #showcase: 1485653767402553459
     - #bugs: 1487546886092230788
-    Fetch recent messages from each. If there are actionable messages from non-bot users (questions, bugs, requests, feedback), forward a summary to DM channel 1485370959870431433. Skip bot messages, Zoom invites, and messages already sent by you.
+    Fetch recent messages from each. If there are actionable messages from non-bot users (questions, bugs, requests, feedback), forward a summary to #dev channel (1485653767402553457). Skip bot messages, Zoom invites, and messages already sent by you.
