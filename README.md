@@ -78,10 +78,9 @@ They communicate through files: voice agent writes tasks, the core agent execute
 - [Google AI Studio API key](https://ai.google.dev) (free — click "Get API key")
 
 ```bash
-# Clone and install
+# Clone
 git clone https://github.com/sonichi/sutando.git
 cd sutando
-npm install
 
 # Configure (minimum: GEMINI_API_KEY is required)
 cp .env.example .env
