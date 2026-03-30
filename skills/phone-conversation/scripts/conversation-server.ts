@@ -324,9 +324,9 @@ function buildAgent(callSession: CallSession): MainAgent {
 			isInbound && callSession.isOwner
 				? `Your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''} is calling you. YOU are Sutando — the AI assistant. The person on the phone is your OWNER, a human. Do NOT confuse yourself with the caller. You have full capabilities — use the work tool for anything: check the screen, send emails, look things up, make calls, browse the web, or check results of previous tasks. Say exactly: "Hi, this is Sutando. How can I help?" then WAIT for them to speak. Do NOT say anything else before they talk. Do NOT make up tasks, scenarios, or pretend you were doing something.${(() => { const ctx = getSafeContext(); return ctx ? `\n\nRecent voice conversation (for context — do NOT repeat or bring up unless asked):\n${ctx}` : ''; })()}`
 				: isInbound && callSession.callerVerified
-				? 'A verified caller is calling you. Be helpful and conversational. You have limited tools — you can look up meeting IDs, check the time, and adjust volume/brightness. You cannot delegate tasks, access files, or make calls on their behalf. Say "Hello, this is Sutando. How can I help?"'
+				? 'A verified caller is calling you. Be helpful and conversational. You can look up meeting IDs and check the time. You CAN answer general knowledge questions, do translations, and have conversations. You cannot access files, control the screen, or delegate tasks. Say "Hello, this is Sutando. How can I help?"'
 				: isInbound
-				? 'Someone is calling you. Be helpful and conversational. Greet them with "Hello, this is Sutando. How can I help?"'
+				? 'Someone is calling you. Be helpful and conversational. You CAN answer general knowledge questions, do translations, and have conversations — but you cannot access files, control the screen, or delegate tasks. Greet them with "Hello, this is Sutando. How can I help?"'
 				: callSession.isOwner
 				? `You are calling your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''}. The person who picks up IS your owner.`
 				: 'You initiated this call on behalf of your owner.',
@@ -1149,7 +1149,8 @@ wss.on('connection', (ws: WebSocket) => {
 					// Owner detection: number match + STIR/SHAKEN verification.
 					// A spoofed caller ID will fail STIR/SHAKEN (StirVerstat != TN-Validation-Passed-A).
 					// If StirVerstat is present and NOT A-level, downgrade owner to verified-only.
-					const numberMatchesOwner = OWNER_NUMBER ? normalizePhone(personOnLine) === normalizePhone(OWNER_NUMBER) : false;
+					const ownerNumbers = OWNER_NUMBER ? OWNER_NUMBER.split(',').map(n => normalizePhone(n.trim())) : [];
+					const numberMatchesOwner = ownerNumbers.length > 0 && ownerNumbers.includes(normalizePhone(personOnLine));
 					let isOwner: boolean;
 					if (numberMatchesOwner && stirVerstat && stirVerstat !== 'TN-Validation-Passed-A') {
 						// Number matches but caller ID not cryptographically verified — possible spoof

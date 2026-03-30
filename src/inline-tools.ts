@@ -1072,11 +1072,12 @@ export const inlineTools = [
 
 /** Tools available to any caller (including unverified) */
 export const anyCallerTools = [
-	volumeTool, brightnessTool, getCurrentTimeTool,
+	getCurrentTimeTool,
 ];
 
 /** Owner-only tools (require isOwner) */
 export const ownerOnlyTools = [
+	volumeTool, brightnessTool,
 	scrollTool, switchTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
 	clipboardTool, cancelTaskTool, toggleTasksTool, summonTool,
