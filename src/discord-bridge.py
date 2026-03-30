@@ -35,6 +35,10 @@ TASKS_DIR.mkdir(exist_ok=True)
 RESULTS_DIR.mkdir(exist_ok=True)
 INBOX_DIR.mkdir(exist_ok=True)
 
+# Dedup: skip duplicate messages (Discord gateway can replay events on reconnect)
+seen_message_ids = set()  # Discord message IDs already processed
+
+
 # Load access config
 ACCESS_FILE = Path.home() / ".claude" / "channels" / "discord" / "access.json"
 def load_allowed():
@@ -193,6 +197,15 @@ async def on_message(message):
         except:
             pass
 
+    # Dedup: skip if we've already processed this Discord message ID
+    if message.id in seen_message_ids:
+        print(f"  [dedup] skipping already-processed message {message.id} from @{username}")
+        return
+    seen_message_ids.add(message.id)
+    # Cap set size to prevent unbounded growth
+    if len(seen_message_ids) > 10000:
+        seen_message_ids.clear()
+
     # Write as task
     ts = int(time.time() * 1000)
     task_id = f"task-{ts}"
@@ -200,7 +213,7 @@ async def on_message(message):
     task_file.write_text(
         f"id: {task_id}\n"
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S')}Z\n"
-        f"task: [Discord @{username}] {text}{attachment_note}\n"
+        f"task: [Discord @{username}] {msg_text}\n"
         f"source: discord\n"
         f"channel_id: {message.channel.id}\n"
         f"user_id: {message.author.id}\n"
