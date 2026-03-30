@@ -108,9 +108,34 @@ else
   echo "  ✓ screen capture (already running)"
 fi
 
+# 6. Phone/conversation server (port 3100) + ngrok tunnel
+if ! lsof -i :3100 > /dev/null 2>&1; then
+  if [ -f skills/phone-conversation/scripts/conversation-server.ts ]; then
+    echo "  Starting phone server (port 3100)..."
+    npx tsx skills/phone-conversation/scripts/conversation-server.ts > src/phone-server.log 2>&1 &
+    echo "  ✓ phone server"
+  else
+    echo "  ~ phone server (skill not installed)"
+  fi
+else
+  echo "  ✓ phone server (already running)"
+fi
+
+# ngrok tunnel for Twilio webhooks
+if [ -n "$TWILIO_WEBHOOK_URL" ]; then
+  NGROK_DOMAIN=$(echo "$TWILIO_WEBHOOK_URL" | sed -E 's|https://([^/]+)/.*|\1|')
+  if ! pgrep -f "ngrok.*http" > /dev/null 2>&1; then
+    echo "  Starting ngrok tunnel..."
+    ngrok http 3100 --domain="$NGROK_DOMAIN" > src/ngrok.log 2>&1 &
+    echo "  ✓ ngrok ($NGROK_DOMAIN)"
+  else
+    echo "  ✓ ngrok (already running)"
+  fi
+fi
+
 echo ""
 
-# 6. Telegram bridge (optional — needs TELEGRAM_BOT_TOKEN)
+# 8. Telegram bridge (optional — needs TELEGRAM_BOT_TOKEN)
 if [ -f "$HOME/.claude/channels/telegram/.env" ] && grep -q "TELEGRAM_BOT_TOKEN=" "$HOME/.claude/channels/telegram/.env" 2>/dev/null; then
   if ! pgrep -f "telegram-bridge" > /dev/null 2>&1; then
     echo "  Starting Telegram bridge..."
@@ -123,7 +148,7 @@ else
   echo "  ~ telegram bridge (no token — optional)"
 fi
 
-# 7. Discord bridge (optional — needs DISCORD_BOT_TOKEN)
+# 9. Discord bridge (optional — needs DISCORD_BOT_TOKEN)
 if [ -f "$HOME/.claude/channels/discord/.env" ] && grep -q "DISCORD_BOT_TOKEN=" "$HOME/.claude/channels/discord/.env" 2>/dev/null; then
   if ! python3 -c "import discord" 2>/dev/null; then
     echo "  ~ discord bridge (needs: pip3 install discord.py)"
@@ -143,7 +168,7 @@ echo ""
 # Verify services actually started (wait a moment, then check ports)
 sleep 3
 echo "Verifying services..."
-for port_name in "9900:voice-agent" "8080:web-client" "7844:dashboard" "7843:agent-api" "7845:screen-capture"; do
+for port_name in "9900:voice-agent" "8080:web-client" "7844:dashboard" "7843:agent-api" "7845:screen-capture" "3100:phone-server"; do
   port="${port_name%%:*}"
   name="${port_name##*:}"
   if lsof -i :"$port" > /dev/null 2>&1; then
