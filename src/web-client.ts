@@ -1217,6 +1217,9 @@ function renderDynamicContent(c) {
 function updateDynamicRegion() {
   const dr = document.getElementById('dynamic-region');
   if (!dr) return;
+  // Skip re-render if user is typing in a question input
+  var activeInput = document.activeElement;
+  if (activeInput && activeInput.classList && activeInput.classList.contains('q-input')) return;
   const content = window._drContent;
   const questions = window._drQuestions || [];
   const proactive = window._drProactive;
