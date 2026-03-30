@@ -232,7 +232,7 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 	const fullTranscript = callSession.transcript.slice(-20)
 		.map(t => `${t.role === 'sutando' ? 'Sutando' : 'Caller'}: ${t.text}`)
 		.join('\n');
-	const content = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ncallSid: ${callSession.callSid}\ntask: ${taskDescription}\ntranscript:\n${fullTranscript}\n`;
+	const content = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ncallSid: ${callSession.callSid}\ncaller: ${callSession.callerNumber || 'unknown'}\ntask: ${taskDescription}\ntranscript:\n${fullTranscript}\n`;
 	writeFileSync(taskPath, content);
 
 	// Poll for result in background, inject when ready — don't block Gemini
@@ -573,6 +573,7 @@ async function createCallSession(params: {
 		host: '127.0.0.1',
 		model: google('gemini-2.5-flash'),
 		geminiModel: 'gemini-2.5-flash-native-audio-preview-12-2025',
+		googleSearch: true,
 		speechConfig: { voiceName: 'Aoede' },
 		hooks: {
 			onToolCall: (e) => console.log(`${ts()} [Tool] ${e.toolName} (${e.execution})`),
@@ -706,7 +707,7 @@ function cleanupCall(callSid: string): void {
 			return `${label}: ${t.text}`;
 		}).join('\n');
 		const isMeeting = session.meetingId != null;
-		const summaryContent = `id: ${summaryTaskId}\ntimestamp: ${new Date().toISOString()}\ncallSid: ${callSid}\ntask: summarize this ${isMeeting ? 'meeting (ID: ' + session.meetingId + ')' : 'phone call'} that just ended\ntranscript:\n${formatted}\n`;
+		const summaryContent = `id: ${summaryTaskId}\ntimestamp: ${new Date().toISOString()}\ncallSid: ${callSid}\ncaller: ${session.callerNumber || 'unknown'}\ntask: summarize this ${isMeeting ? 'meeting (ID: ' + session.meetingId + ')' : 'phone call'} that just ended\ntranscript:\n${formatted}\n`;
 		writeFileSync(join(TASKS_DIR, `${summaryTaskId}.txt`), summaryContent);
 		console.log(`${ts()} [Summary] wrote summary task: ${summaryTaskId}`);
 	}
