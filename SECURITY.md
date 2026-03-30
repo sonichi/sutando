@@ -101,12 +101,15 @@ The web client connects to the voice agent on `localhost:8080`. It is local-only
 
 ## Reporting Vulnerabilities
 
-If you discover a security vulnerability, please report it privately:
+**Please do not report security vulnerabilities through public GitHub issues.**
 
-1. **Email**: Open a GitHub issue marked `[SECURITY]` with a brief description (no exploit details)
-2. **Discord**: DM a maintainer directly
+Instead, use GitHub's private vulnerability reporting:
 
-Do not post exploit details publicly.
+1. Go to [**Security → Report a vulnerability**](https://github.com/sonichi/sutando/security/advisories/new)
+2. Provide a description, steps to reproduce, and your assessment of impact
+3. We will respond and work with you to address the issue before any public disclosure
+
+You can also reach maintainers via [Discord DM](https://discord.gg/uZHWXXmrCS) for initial coordination.
 
 ## Recommendations
 
