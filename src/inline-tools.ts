@@ -1072,7 +1072,7 @@ export const inlineTools = [
 
 /** Tools available to any caller (including unverified) */
 export const anyCallerTools = [
-	volumeTool, brightnessTool, getCurrentTimeTool,
+	getCurrentTimeTool,
 ];
 
 /** Owner-only tools (require isOwner) */
@@ -1085,5 +1085,5 @@ export const ownerOnlyTools = [
 
 /** Configurable tools — default to owner-only, can be opened to verified callers */
 export const configurableTools = [
-	lookupMeetingIdTool,
+	lookupMeetingIdTool, volumeTool, brightnessTool,
 ];

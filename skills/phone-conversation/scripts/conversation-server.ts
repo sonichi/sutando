@@ -465,8 +465,8 @@ function buildAgent(callSession: CallSession): MainAgent {
 
 	// --- 3-tier access control ---
 	// Owner (isOwner): work tool + all inline tools + get_task_status
-	// Verified (!isOwner + callerVerified): any-caller tools + configurable tools
-	// Unverified: any-caller tools only (volume, brightness, time, toggle_tasks)
+	// Verified (!isOwner + callerVerified): any-caller tools + configurable tools (volume, brightness, meeting ID)
+	// Unverified: any-caller tools only (time) + google search
 	// Access is determined entirely by the caller/callee phone number, not call type.
 
 	// Any-caller tools available to everyone (including unverified)
