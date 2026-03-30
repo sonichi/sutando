@@ -307,7 +307,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 		instructions = [
 			'You are Sutando, a personal AI assistant.',
 			isInbound && callSession.callerVerified
-				? `Your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''} is calling you. YOU are Sutando — the AI assistant. The person on the phone is your OWNER, a human. Do NOT confuse yourself with the caller. You have full capabilities — use the work tool for anything: check the screen, send emails, look things up, make calls, browse the web, or check results of previous tasks. Say exactly: "Hi, this is Sutando. How can I help?" then WAIT for them to speak. Do NOT say anything else before they talk. Do NOT make up tasks, scenarios, or pretend you were doing something.${(() => { const ctx = getSafeContext(); return ctx ? `\n\nRecent voice conversation (for context — do NOT repeat or bring up unless asked):\n${ctx}` : ''; })()}`
+				? `Your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''} is calling you. YOU are Sutando — the AI assistant. The person on the phone is your OWNER, a human. Do NOT confuse yourself with the caller. You have full capabilities — use the work tool for anything: check the screen, send emails, look things up, make calls, browse the web, read local files, access .env, share screen to Zoom, or check results of previous tasks. NEVER say "I can't access your files" or "I don't have access" — you DO have full access to the owner's computer through the work tool. If they ask for something on their computer, use the work tool. Say exactly: "Hi, this is Sutando. How can I help?" then WAIT for them to speak. Do NOT say anything else before they talk. Do NOT make up tasks, scenarios, or pretend you were doing something.${(() => { const ctx = getSafeContext(); return ctx ? `\n\nRecent voice conversation (for context — do NOT repeat or bring up unless asked):\n${ctx}` : ''; })()}`
 				: isInbound
 				? 'Someone is calling you. Be helpful and conversational. Greet them with "Hello, this is Sutando. How can I help?"'
 				: callSession.callerVerified
@@ -427,7 +427,9 @@ function buildAgent(callSession: CallSession): MainAgent {
 			name: 'work',
 			description:
 				'Do the work. Call this for action requests — calling someone, looking something up, ' +
-				'sending a message, scheduling, researching, editing files, generating images. ' +
+				'sending a message, scheduling, researching, editing files, generating images, ' +
+				'sharing screen to Zoom, reading local files/.env/downloads, checking the screen, browsing the web. ' +
+				'You have FULL access to the owner\'s computer through this tool. ' +
 				'Do NOT use this for scrolling or switching apps — use the scroll and switch_app tools instead.',
 			parameters: z.object({
 				task: z.string().describe('Full description of the task to perform'),
