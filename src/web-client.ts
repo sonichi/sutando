@@ -287,7 +287,7 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
 <div class="hero" id="hero">
   <img class="avatar-hero" id="hero-avatar" src="http://localhost:7844/avatar">
   <h2 id="hero-name">Sutando</h2>
-  <p class="tagline">Your personal AI — talk, and it acts</p>
+  <p class="tagline">Summon your AI superpower</p>
   <button class="btn-hero" onclick="toggle()">Start Voice</button>
 </div>
 
@@ -1217,6 +1217,9 @@ function renderDynamicContent(c) {
 function updateDynamicRegion() {
   const dr = document.getElementById('dynamic-region');
   if (!dr) return;
+  // Skip re-render if user is typing in a question input
+  var activeInput = document.activeElement;
+  if (activeInput && activeInput.classList && activeInput.classList.contains('q-input')) return;
   const content = window._drContent;
   const questions = window._drQuestions || [];
   const proactive = window._drProactive;
