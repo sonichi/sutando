@@ -109,7 +109,7 @@ Instead, use GitHub's private vulnerability reporting:
 2. Provide a description, steps to reproduce, and your assessment of impact
 3. We will respond and work with you to address the issue before any public disclosure
 
-You can also reach maintainers via [Discord DM](https://discord.gg/uZHWXXmrCS) for initial coordination.
+You can also email **aisutando@gmail.com** or reach maintainers via [Discord DM](https://discord.gg/uZHWXXmrCS) for initial coordination.
 
 ## Recommendations
 
