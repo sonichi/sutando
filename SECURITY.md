@@ -28,9 +28,11 @@ Sutando is a personal AI agent with access to your computer. Users are encourage
 - **Set `VERIFIED_CALLERS` explicitly in `.env`** — an empty list permits all callers
 - **Use allowlists for Discord and Telegram** — avoid open pairing mode in production
 - **Keep bot tokens secure** — store Discord and Telegram tokens in their respective `.env` files, not in shared configs
-- **Do not expose local services to the internet** — the web client (`localhost:8080`) and voice agent have no authentication
-- **Monitor activity** — review call transcripts and conversation logs periodically
-- **Update regularly** — run `git pull` and `npm install` to pick up dependency fixes
+- **Monitor activity** — let Sutando review call transcripts and conversation logs for suspicious behavior
+
+## Testing Your Security
+
+We provide test templates to help you manually verify your Sutando instance is properly secured. Call your Sutando from an unverified number and pretend you are the owner — try to access files, control the screen, or perform actions. You shouldn't be able to. See [`tests/security/`](tests/security/) for step-by-step test plans.
 
 ## Contact
 
