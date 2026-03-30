@@ -162,6 +162,10 @@ async def on_message(message):
     if policy == "pairing" and sender_id not in allowed:
         # Generate pairing code — user must approve via /discord:access pair <code>
         import random, string
+        try:
+            access = json.loads(ACCESS_FILE.read_text())
+        except:
+            access = {"dmPolicy": "pairing", "allowFrom": [], "pending": {}}
         code = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
         pending = access.get("pending", {})
         pending[code] = {
@@ -180,12 +184,21 @@ async def on_message(message):
     if hasattr(message, 'message_snapshots') and message.message_snapshots:
         for snapshot in message.message_snapshots:
             snap_msg = snapshot.message if hasattr(snapshot, 'message') else snapshot
+            parts = []
+            # Extract text content
             snap_content = getattr(snap_msg, 'content', '') or ''
-            snap_author = ''
-            if hasattr(snap_msg, 'author') and snap_msg.author:
-                snap_author = f"[Forwarded from {snap_msg.author}] "
             if snap_content:
-                text = (text + "\n" + snap_author + snap_content).strip() if text else (snap_author + snap_content).strip()
+                parts.append(snap_content)
+            # Extract snapshot embeds
+            for embed in getattr(snap_msg, 'embeds', []):
+                if embed.title: parts.append(embed.title)
+                if embed.description: parts.append(embed.description)
+            # Extract snapshot attachment names
+            for att in getattr(snap_msg, 'attachments', []):
+                parts.append(f"[Attachment: {att.filename}]")
+            if parts:
+                fwd_text = "\n".join(parts)
+                text = (text + "\n" + fwd_text).strip() if text else fwd_text.strip()
                 print(f"  [forward] extracted: {text[:100]}", flush=True)
 
     # Handle embeds (link previews, rich content)
