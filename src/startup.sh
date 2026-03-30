@@ -10,6 +10,9 @@ cd "$REPO"
 echo "Sutando startup..."
 echo ""
 
+# Install dependencies if needed
+[ -d node_modules ] || npm install
+
 # Check prerequisites
 missing=0
 if ! command -v node > /dev/null 2>&1; then echo "  ✗ node not found — brew install node"; missing=1; fi
