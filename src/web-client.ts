@@ -287,7 +287,7 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
 <div class="hero" id="hero">
   <img class="avatar-hero" id="hero-avatar" src="http://localhost:7844/avatar">
   <h2 id="hero-name">Sutando</h2>
-  <p class="tagline">Your personal AI — talk, and it acts</p>
+  <p class="tagline">Summon your AI superpower</p>
   <button class="btn-hero" onclick="toggle()">Start Voice</button>
 </div>
 
