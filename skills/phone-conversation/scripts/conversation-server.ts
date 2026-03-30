@@ -1056,10 +1056,12 @@ const server = createServer(async (req, res) => {
 			const parentCallSid = url.searchParams.get('parentCallSid') ?? '';
 			const toParam = url.searchParams.get('to') ?? '';
 			const callerNumber = form.get('From') ?? '';
-			console.log(`${ts()} [Connect] purpose=${purpose} from=${callerNumber} callSid=${form.get('CallSid') ?? '?'}`);
+			const stirVerstat = form.get('StirVerstat') ?? '';
+			console.log(`${ts()} [Connect] purpose=${purpose} from=${callerNumber} stirVerstat=${stirVerstat} callSid=${form.get('CallSid') ?? '?'}`);
 
 			const params = [`<Parameter name="purpose" value="${esc(purpose)}" />`];
 			if (callerNumber) params.push(`<Parameter name="callerNumber" value="${esc(callerNumber)}" />`);
+			if (stirVerstat) params.push(`<Parameter name="stirVerstat" value="${esc(stirVerstat)}" />`);
 			const passcodeParam = url.searchParams.get('passcode') ?? '';
 			if (isMeeting) {
 				params.push(`<Parameter name="isMeeting" value="true" />`);
@@ -1132,6 +1134,7 @@ wss.on('connection', (ws: WebSocket) => {
 					// Child calls inherit parent's verification (the parent authorized this call).
 					// For meetings: check meeting ID against VERIFIED_MEETINGS.
 					// Accepts original ID (e.g. "gbn-otgn-dex"), numeric PIN, or Zoom meeting ID.
+					const stirVerstat = cp.stirVerstat ?? '';
 					let callerVerified: boolean;
 					if (isMeeting) {
 						// Meetings must be explicitly verified — no permissive default.
@@ -1143,10 +1146,20 @@ wss.on('connection', (ws: WebSocket) => {
 						callerVerified = VERIFIED_CALLERS.size === 0 || VERIFIED_CALLERS.has(normalizedPerson);
 					}
 
-					// Owner detection: based on phone number of the person on the line
-					const isOwner = OWNER_NUMBER ? normalizePhone(personOnLine) === normalizePhone(OWNER_NUMBER) : callerVerified;
+					// Owner detection: number match + STIR/SHAKEN verification.
+					// A spoofed caller ID will fail STIR/SHAKEN (StirVerstat != TN-Validation-Passed-A).
+					// If StirVerstat is present and NOT A-level, downgrade owner to verified-only.
+					const numberMatchesOwner = OWNER_NUMBER ? normalizePhone(personOnLine) === normalizePhone(OWNER_NUMBER) : false;
+					let isOwner: boolean;
+					if (numberMatchesOwner && stirVerstat && stirVerstat !== 'TN-Validation-Passed-A') {
+						// Number matches but caller ID not cryptographically verified — possible spoof
+						isOwner = false;
+						console.log(`${ts()} [Security] Owner number matched but StirVerstat=${stirVerstat} (not A-level) — downgrading to verified`);
+					} else {
+						isOwner = numberMatchesOwner || (!OWNER_NUMBER && callerVerified);
+					}
 
-					console.log(`${ts()} [WS] stream started: ${callSid}, meeting: ${isMeeting}, verified: ${callerVerified}, owner: ${isOwner}, personOnLine: ${personOnLine}, normalized: ${normalizePhone(personOnLine)}, verifiedSet: ${[...VERIFIED_CALLERS].join(',')}`);
+					console.log(`${ts()} [WS] stream started: ${callSid}, meeting: ${isMeeting}, verified: ${callerVerified}, owner: ${isOwner}, stirVerstat: ${stirVerstat}, personOnLine: ${personOnLine}, normalized: ${normalizePhone(personOnLine)}, verifiedSet: ${[...VERIFIED_CALLERS].join(',')}`);
 
 					try {
 						callSession = await createCallSession({
