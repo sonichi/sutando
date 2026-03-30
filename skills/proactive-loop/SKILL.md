@@ -94,3 +94,5 @@ Each pass, in order:
 9. **Ensure the watcher is running.** If no `fswatch` process on `tasks/`, start one with `bash src/watch-tasks.sh` (`run_in_background: true`). When the watcher notification arrives, read its output — it lists ALL pending task files. Process every one before restarting the watcher.
 
 10. **Monitor Discord.** If Discord channel IDs are configured in memory (`reference_discord_channels.md`), check those channels for new messages. Forward actionable items from public channels to the dev channel. Skip bot messages, Zoom invites, and messages already sent by you.
+
+11. **Meeting prep.** Check calendar for meetings starting in the next 30-45 minutes. If one is found and no `notes/meeting-prep-*` file exists for it yet, run `/meeting-prep` to auto-prepare attendee info + talking points.
