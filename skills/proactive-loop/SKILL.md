@@ -96,3 +96,7 @@ Each pass, in order:
 10. **Monitor Discord.** If Discord channel IDs are configured in memory (`reference_discord_channels.md`), check those channels for new messages. Forward actionable items from public channels to the dev channel. Skip bot messages, Zoom invites, and messages already sent by you.
 
 11. **Meeting prep.** Check calendar for meetings starting in the next 30-45 minutes. If one is found and no `notes/meeting-prep-*` file exists for it yet, run `/meeting-prep` to auto-prepare attendee info + talking points.
+
+12. **Information radar.** Once daily (check `data/radar-topics.json` last_scan), run `/info-radar` to scan arXiv, GitHub trending, HN, and news for monitored topics. Include highlights in morning briefing.
+
+13. **Follow-up tracking.** Check `data/follow-ups.json` for overdue commitments. Nudge the owner via voice (results/) or Discord DM for items past due. Also scan recent conversation.log entries for new commitments (patterns: "I'll", "I will", "remind me", "by tomorrow", deadlines). Add new ones to follow-ups.json. Auto-resolve items when completion signals are detected. See `notes/proactive-followups-design.md` for full design.

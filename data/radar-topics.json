@@ -1,0 +1,12 @@
+{
+  "topics": [
+    {"name": "agentic AI", "keywords": ["agentic", "AI agent", "autonomous agent", "tool use"]},
+    {"name": "personal AI", "keywords": ["personal AI", "personal assistant", "AI companion"]},
+    {"name": "voice AI", "keywords": ["voice agent", "realtime voice", "speech-to-speech", "Gemini Live"]},
+    {"name": "multi-agent", "keywords": ["multi-agent", "agent coordination", "AutoGen", "AG2", "CrewAI"]},
+    {"name": "OpenClaw", "keywords": ["OpenClaw", "NemoClaw", "open agent skills"]},
+    {"name": "Claude Code", "keywords": ["Claude Code", "claude-code", "Anthropic CLI"]},
+    {"name": "computer use", "keywords": ["computer use", "desktop agent", "screen control", "GUI agent"]}
+  ],
+  "last_scan": null
+}
