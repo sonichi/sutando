@@ -4,8 +4,16 @@
 #
 # When fswatch detects a change, outputs a reminder message that
 # the cron loop will read, ensuring ALL task files get processed.
+# Dedup: kills any existing fswatch watcher before starting a new one.
 
 TASKS_DIR="${1:-$(dirname "$0")/../tasks}"
+
+# Kill any existing fswatch watchers on tasks/ to prevent duplicates
+existing=$(pgrep -f "fswatch.*tasks" 2>/dev/null)
+if [ -n "$existing" ]; then
+  echo "$existing" | xargs kill 2>/dev/null
+  sleep 0.5
+fi
 
 fswatch -1 "$TASKS_DIR" >/dev/null 2>&1
 

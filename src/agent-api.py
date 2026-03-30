@@ -205,7 +205,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 content = pq_file.read_text()
                 for m in re.finditer(r'## (Q\d+) — (.+?)\n\n(.+?)\n\n\*\*Status:\*\* (\w+)', content, re.DOTALL):
                     if m.group(4) == "Waiting":
-                        questions.append({"id": m.group(1), "text": m.group(2), "detail": m.group(3).strip()[:120]})
+                        questions.append({"id": m.group(1), "text": m.group(2), "detail": m.group(3).strip()})
             self.send_json(200, {"tasks": tasks, "watcher": watcher_ok, "claude": claude_ok, "questions": questions})
         elif path.startswith("/result/"):
             task_id = path[len("/result/"):]
@@ -229,6 +229,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
             si_file = REPO_DIR / "stand-identity.json"
             data = json.loads(si_file.read_text()) if si_file.exists() else {}
             self.send_json(200, data)
+        elif path == "/dynamic-content":
+            dc_file = REPO_DIR / "dynamic-content.json"
+            if dc_file.exists():
+                try:
+                    data = json.loads(dc_file.read_text())
+                    self.send_json(200, data)
+                except Exception:
+                    self.send_json(200, {})
+            else:
+                self.send_json(200, {})
+        elif path.startswith("/media/"):
+            # Serve local files for dynamic region (images, audio, video, docs)
+            import mimetypes
+            rel = path[len("/media/"):]
+            # Only allow files under repo dir for security
+            media_path = (REPO_DIR / rel).resolve()
+            if not str(media_path).startswith(str(REPO_DIR)) or not media_path.exists():
+                self.send_json(404, {"error": "not found"})
+                return
+            mime = mimetypes.guess_type(str(media_path))[0] or "application/octet-stream"
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "public, max-age=300")
+            self.end_headers()
+            self.wfile.write(media_path.read_bytes())
         elif path == "/":
             # Serve task submission form (works from phone on same Wi-Fi)
             self.send_response(200)
@@ -359,6 +385,39 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(200, {"ok": True})
             except:
                 self.send_json(400, {"error": "invalid"})
+            return
+
+        if path == "/answer":
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            try:
+                data = json.loads(body)
+                qid = data.get("id", "")
+                answer = data.get("answer", "")
+                if not qid or not answer:
+                    self.send_json(400, {"error": "id and answer required"})
+                    return
+                pq_file = REPO_DIR / "pending-questions.md"
+                if pq_file.exists():
+                    content = pq_file.read_text()
+                    # Update status from Waiting to answered
+                    import re
+                    pattern = rf'(## {re.escape(qid)} — .+?\n\n)(.*?)(\n\n\*\*Status:\*\* )Waiting'
+                    replacement = rf'\1\2\3Answered: {answer}'
+                    new_content = re.sub(pattern, replacement, content, flags=re.DOTALL)
+                    if new_content != content:
+                        pq_file.write_text(new_content)
+                        # Also write as a task so the agent picks it up
+                        ts = int(datetime.now().timestamp() * 1000)
+                        task_file = REPO_DIR / f"tasks/answer-{qid}-{ts}.txt"
+                        task_file.write_text(f"User answered {qid}: {answer}")
+                        self.send_json(200, {"ok": True, "id": qid, "answer": answer})
+                    else:
+                        self.send_json(404, {"error": f"question {qid} not found or already answered"})
+                else:
+                    self.send_json(404, {"error": "no pending questions"})
+            except Exception as e:
+                self.send_json(400, {"error": str(e)})
             return
 
         if path != "/task":

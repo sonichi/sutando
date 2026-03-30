@@ -129,11 +129,50 @@ const HTML = /* html */ `<!DOCTYPE html>
   .task-text { color: #888; flex: 1; word-break: break-word; }
   .task-time { color: #444; font-size: 10px; }
 
-  /* Questions */
-  #questions {
-    background: #1e1a12; border: 1px solid #2e2818; border-radius: 10px;
-    padding: 10px 14px; margin-bottom: 10px; font-size: 12px; display: none;
+  /* Dynamic region */
+  #dynamic-region { padding: 0 16px 8px; }
+  #dynamic-region:empty { display: none; }
+  #dynamic-region .dr-questions {
+    background: linear-gradient(135deg, #1e1a12, #2a2218); border: 1px solid #f0ad4e44;
+    border-radius: 10px; padding: 12px 16px; font-size: 13px; box-shadow: 0 0 12px #f0ad4e22;
   }
+  #dynamic-region .dr-questions .q-title { color: #f0ad4e; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+  #dynamic-region .dr-questions .q-item { color: #ddd; padding: 8px 0; border-bottom: 1px solid #2e281844; }
+  #dynamic-region .dr-questions .q-item:last-child { border-bottom: none; }
+  #dynamic-region .q-actions { margin-top: 8px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  #dynamic-region .q-btn {
+    padding: 4px 14px; border-radius: 14px; font-size: 11px; cursor: pointer;
+    border: 1px solid #2e2818; background: #1e1a12; color: #ccc; transition: all 0.15s;
+  }
+  #dynamic-region .q-btn:hover { background: #2e2818; border-color: #f0ad4e66; }
+  #dynamic-region .q-btn.q-yes { border-color: #4ecca366; color: #4ecca3; }
+  #dynamic-region .q-btn.q-yes:hover { background: #1e4028; }
+  #dynamic-region .q-btn.q-no { border-color: #e9456066; color: #e94560; }
+  #dynamic-region .q-btn.q-no:hover { background: #3a1520; }
+  #dynamic-region .q-input {
+    flex: 1; min-width: 120px; padding: 4px 10px; border-radius: 14px; font-size: 11px;
+    border: 1px solid #2e2818; background: #12100a; color: #ccc; outline: none;
+  }
+  #dynamic-region .q-input:focus { border-color: #f0ad4e66; }
+  #dynamic-region .dr-proactive { text-align: center; padding: 8px; font-size: 13px; color: #8899a6; }
+  #dynamic-region .dr-chips { text-align: center; }
+  #dynamic-region .dr-chips .suggestions-label { margin-bottom: 6px; }
+  #dynamic-region .dr-chips .suggestion {
+    display: inline-block; background: #1a1a2e; border: 1px solid #2a2a4e;
+    border-radius: 16px; padding: 6px 14px; margin: 3px; font-size: 11px;
+    color: #8899a6; cursor: pointer; transition: all 0.2s;
+  }
+  #dynamic-region .dr-chips .suggestion:hover { background: #2a2a4e; color: #ccc; border-color: #4a4a6e; }
+  #dynamic-region .dr-media {
+    background: #12121e; border: 1px solid #1e1e30; border-radius: 10px;
+    padding: 12px 16px; text-align: center;
+  }
+  #dynamic-region .dr-media-title { color: #ccc; font-size: 14px; font-weight: 600; margin-bottom: 8px; }
+  #dynamic-region .dr-media-caption { color: #666; font-size: 11px; margin-top: 6px; }
+  #dynamic-region .dr-document {
+    background: #12121e; border: 1px solid #1e1e30; border-radius: 10px; padding: 12px 16px;
+  }
+  #dynamic-region .dr-doc-body { color: #bbb; font-size: 13px; line-height: 1.5; white-space: pre-wrap; }
 
   /* Section labels */
   .section-label {
@@ -193,18 +232,6 @@ const HTML = /* html */ `<!DOCTYPE html>
     cursor: pointer; transition: all 0.2s;
   }
   .btn-hero:hover { background: #277334; box-shadow: 0 0 28px rgba(78, 204, 163, 0.35); transform: scale(1.02); }
-  .hero .or-text { color: #444; font-size: 12px; margin: 16px 0 8px; }
-
-  /* Suggestion chips */
-  .suggestions { display: flex; flex-wrap: wrap; gap: 8px; max-width: 480px; justify-content: center; margin-top: 20px; }
-  .suggestion {
-    padding: 8px 16px; border-radius: 20px; font-size: 12px;
-    background: #12121e; border: 1px solid #1e1e30; color: #888;
-    cursor: pointer; transition: all 0.15s;
-  }
-  .suggestion:hover { background: #1a1a2e; border-color: #4ecca3; color: #c0c0d0; }
-  .suggestions-label { color: #333; font-size: 11px; margin-top: 24px; margin-bottom: 4px; }
-
   /* When voice is active, hide hero */
   body.voice-active .hero { display: none; }
   body.voice-active .main { display: flex; }
@@ -262,22 +289,9 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
   <h2 id="hero-name">Sutando</h2>
   <p class="tagline">Your personal AI — talk, and it acts</p>
   <button class="btn-hero" onclick="toggle()">Start Voice</button>
-  <p class="or-text">or type below</p>
-  <p class="suggestions-label">Try saying or typing</p>
-  <div class="suggestions">
-    <span class="suggestion" onclick="trySuggestion(this)">"Summon" — share screen on Zoom, join on your phone</span>
-    <span class="suggestion" onclick="trySuggestion(this)">"Join my next meeting"</span>
-    <span class="suggestion" onclick="trySuggestion(this)">"What's on my screen?"</span>
-    <span class="suggestion" onclick="trySuggestion(this)">"What's on my calendar today?"</span>
-    <span class="suggestion" onclick="trySuggestion(this)">"Take a note: my first Sutando note"</span>
-    <span class="suggestion" onclick="trySuggestion(this)">"Tutorial" — walk me through what you can do</span>
-    <span class="suggestion" onclick="trySuggestion(this)">"Bye" — disconnect voice</span>
-  </div>
 </div>
 
-<div id="proactive-status" style="text-align:center;padding:8px 16px;font-size:13px;color:#8899a6;display:none">
-  <span id="proactive-text"></span>
-</div>
+<div id="dynamic-region"></div>
 
 <div class="main" id="main-area">
 
@@ -290,7 +304,6 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
   <button class="btn-send" onclick="sendText()">Send</button>
 </div>
 
-<div id="questions"></div>
 <div id="tasks-header" style="display:none;margin:8px 0 2px;font-size:11px;color:#555;display:flex;justify-content:space-between;align-items:center">
   <span>Tasks</span>
   <span style="cursor:pointer;color:#4a6a7a" onclick="toggleAllTasks()">collapse all</span>
@@ -570,17 +583,9 @@ function startTaskPolling() {
       if (data.watcher === false) statusParts.push('<span style="color:#f0ad4e">watcher offline</span>');
       const sysEl = document.getElementById('sys-status');
       if (sysEl) sysEl.innerHTML = statusParts.length ? statusParts.join(' · ') : '';
-      // Show pending questions
-      const qEl = document.getElementById('questions');
-      if (qEl && data.questions?.length) {
-        qEl.innerHTML = data.questions.map(q =>
-          '<div style="padding:8px 0;border-bottom:1px solid #1a1a2e;display:flex;align-items:center;gap:8px">' +
-          '<span style="color:#f0ad4e;font-size:14px">?</span>' +
-          '<span style="color:#ccc;font-size:12px"><b>' + q.id + '</b>: ' + q.text + '</span>' +
-          '</div>'
-        ).join('');
-        qEl.style.display = '';
-      } else if (qEl) { qEl.style.display = 'none'; }
+      // Update dynamic region with latest data
+      window._drQuestions = data.questions || [];
+      updateDynamicRegion();
     } catch {}
   }, 3000);
 }
@@ -1062,6 +1067,29 @@ function toggle() {
 }
 
 // ─── Suggestion chips ─────────────────────────────────────
+function answerQuestion(qid, answer) {
+  if (!answer || !answer.trim()) return;
+  const apiBase = 'http://' + location.hostname + ':7843';
+  fetch(apiBase + '/answer', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({id: qid, answer: answer.trim()})
+  }).then(r => r.json()).then(d => {
+    if (d.ok) {
+      // Remove from local state immediately
+      window._drQuestions = (window._drQuestions || []).filter(q => q.id !== qid);
+      updateDynamicRegion();
+      // Show confirmation in transcript
+      const el = document.createElement('div');
+      el.className = 't-entry t-system';
+      el.textContent = 'Answered ' + qid + ': ' + answer.trim();
+      document.getElementById('transcript').appendChild(el);
+    } else {
+      alert('Failed: ' + (d.error || 'unknown error'));
+    }
+  }).catch(() => { alert('Could not reach agent API'); });
+}
+
 function trySuggestion(el) {
   // Extract only the quoted command (e.g. "summon" from '"summon" — description')
   const raw = el.textContent;
@@ -1129,29 +1157,134 @@ function sendText() {
   }
 }
 
-// ─── Proactive status polling ─────────────────────────────
-(function pollProactiveStatus() {
+// ─── Dynamic region: contextual generative UI ────────────
+// Priority: dynamic-content.json > pending questions > proactive status > chips
+// Supports: audio, image, video, document, html, and fallback chips
+window._drQuestions = [];
+window._drProactive = null;
+window._drContent = null;
+const API_BASE = 'http://' + window.location.hostname + ':7843';
+const SUGGESTION_CHIPS = [
+  {label: 'Summon', desc: 'share screen on Zoom, join on your phone'},
+  {label: 'Join my next meeting'},
+  {label: 'What is on my screen?'},
+  {label: 'What is on my calendar today?'},
+  {label: 'Take a note: my first Sutando note'},
+  {label: 'Tutorial', desc: 'walk me through what you can do'},
+  {label: 'Bye', desc: 'disconnect voice'},
+];
+
+function renderDynamicContent(c) {
+  const media = API_BASE + '/media/';
+  const src = c.src || '';
+  const fullSrc = src.startsWith('http') ? src : media + src;
+  const title = c.title ? '<div class="dr-media-title">' + c.title + '</div>' : '';
+  const caption = c.caption ? '<div class="dr-media-caption">' + c.caption + '</div>' : '';
+
+  switch (c.type) {
+    case 'audio':
+      return '<div class="dr-media">' + title +
+        '<audio controls autoplay style="width:100%"><source src="' + fullSrc + '"></audio>' +
+        caption + '</div>';
+    case 'image':
+      return '<div class="dr-media">' + title +
+        '<img src="' + fullSrc + '" style="max-width:100%;border-radius:8px">' +
+        caption + '</div>';
+    case 'video':
+      if (src.includes('youtu')) {
+        var vid = src.match(/(?:v=|youtu\\.be\\/)([\\w-]+)/);
+        if (vid) return '<div class="dr-media">' + title +
+          '<iframe width="100%" height="280" src="https://www.youtube.com/embed/' + vid[1] +
+          '" frameborder="0" allowfullscreen style="border-radius:8px"></iframe>' +
+          caption + '</div>';
+      }
+      return '<div class="dr-media">' + title +
+        '<video controls autoplay style="max-width:100%;border-radius:8px"><source src="' + fullSrc + '"></video>' +
+        caption + '</div>';
+    case 'document':
+      return '<div class="dr-document">' + title +
+        '<div class="dr-doc-body">' + (c.content || '') + '</div>' +
+        caption + '</div>';
+    case 'html':
+      return '<div class="dr-media">' + (c.content || '') + '</div>';
+    default:
+      return '<div class="dr-media">' + title + '<p>' + (c.content || JSON.stringify(c)) + '</p></div>';
+  }
+}
+
+function updateDynamicRegion() {
+  const dr = document.getElementById('dynamic-region');
+  if (!dr) return;
+  const content = window._drContent;
+  const questions = window._drQuestions || [];
+  const proactive = window._drProactive;
+
+  if (content && content.type) {
+    dr.innerHTML = renderDynamicContent(content);
+  } else if (questions.length > 0) {
+    dr.innerHTML = '<div class="dr-questions">' +
+      '<div class="q-title">Pending Questions</div>' +
+      questions.map(q =>
+        '<div class="q-item"><b>' + q.id + '</b>: ' + q.text +
+        (q.detail ? '<div style="color:#999;font-size:11px;margin-top:2px;white-space:pre-wrap">' + q.detail + '</div>' : '') +
+        '<div class="q-actions">' +
+        '<button class="q-btn q-yes" data-qid="' + q.id + '" data-ans="Yes">Yes</button>' +
+        '<button class="q-btn q-no" data-qid="' + q.id + '" data-ans="No">No</button>' +
+        '<input class="q-input" data-qid="' + q.id + '" placeholder="Or type a response...">' +
+        '<button class="q-btn q-send" data-qid="' + q.id + '">Send</button>' +
+        '</div></div>'
+      ).join('') + '</div>';
+  } else if (proactive) {
+    dr.innerHTML = '<div class="dr-proactive">' + proactive + '</div>';
+  } else {
+    dr.innerHTML = '<div class="dr-chips">' +
+      '<div class="suggestions-label">Try saying or typing</div>' +
+      SUGGESTION_CHIPS.map(c =>
+        '<span class="suggestion" onclick="trySuggestion(this)">' +
+        c.label + (c.desc ? ' — ' + c.desc : '') + '</span>'
+      ).join('') + '</div>';
+  }
+}
+
+// Event delegation for question actions
+document.addEventListener('click', function(e) {
+  var btn = e.target.closest && e.target.closest('[data-qid]');
+  if (!btn) return;
+  var qid = btn.dataset.qid;
+  if (btn.dataset.ans) {
+    answerQuestion(qid, btn.dataset.ans);
+  } else if (btn.classList.contains('q-send')) {
+    var inp = document.querySelector('.q-input[data-qid="' + qid + '"]');
+    if (inp && inp.value.trim()) answerQuestion(qid, inp.value.trim());
+  }
+});
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Enter' && e.target.classList && e.target.classList.contains('q-input')) {
+    var qid = e.target.dataset.qid;
+    if (e.target.value.trim()) answerQuestion(qid, e.target.value.trim());
+  }
+});
+
+// Poll dynamic-content + core-status
+(function pollDynamicContent() {
   setInterval(() => {
     Promise.all([
-      fetch('http://localhost:7843/tasks/active').then(r => r.json()).catch(() => ({tasks:[]})),
-      fetch('http://localhost:7843/core-status').then(r => r.json()).catch(() => ({status:'idle'}))
-    ]).then(([taskData, loopData]) => {
-      const tasks = taskData.tasks || [];
-      const working = tasks.filter(t => t.status === 'working');
-      const el = document.getElementById('proactive-status');
-      const txt = document.getElementById('proactive-text');
-      if (working.length > 0) {
-        txt.textContent = 'Working on: ' + working.map(t => t.text).join(', ');
-        el.style.display = 'block';
-      } else if (loopData.status === 'running') {
-        txt.textContent = loopData.step || 'Proactive loop running...';
-        el.style.display = 'block';
+      fetch(API_BASE + '/dynamic-content').then(r => r.json()).catch(() => ({})),
+      fetch(API_BASE + '/core-status').then(r => r.json()).catch(() => ({status:'idle'}))
+    ]).then(([dc, loopData]) => {
+      window._drContent = (dc && dc.type) ? dc : null;
+      if (loopData.status === 'running') {
+        window._drProactive = loopData.step || 'Working...';
       } else {
-        el.style.display = 'none';
+        window._drProactive = null;
       }
+      updateDynamicRegion();
     });
   }, 3000);
 })();
+
+// Initial render
+updateDynamicRegion();
 
 </script>
 </body>
