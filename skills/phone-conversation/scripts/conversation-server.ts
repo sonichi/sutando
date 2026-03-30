@@ -201,6 +201,7 @@ interface CallSession {
 	pendingTasks: number;
 	transcript: { role: string; text: string }[];
 	resultQueue: { text: string }[];
+	taskResultCache?: Map<string, string>;
 }
 
 const activeCalls = new Map<string, CallSession>();
@@ -222,6 +223,16 @@ let nextBodhiPort = 9910; // Dynamic ports for per-call VoiceSessions
 // The tool resolves instantly so Gemini stays conversational while Claude works.
 // When the result arrives, it's injected via sendContent.
 function delegateTask(callSession: CallSession, taskDescription: string): Promise<unknown> {
+	// Dedup: if same task was already completed this call, return cached result
+	const cached = callSession.taskResultCache?.get(taskDescription);
+	if (cached) {
+		console.log(`${ts()} [Task] cache hit for "${taskDescription}" — replaying result`);
+		callSession.resultQueue.push({
+			text: `[Task result for "${taskDescription}"]\n${cached}\n\nReport this result to the caller now.`,
+		});
+		return Promise.resolve({ status: 'cached', message: 'This was already completed — result is being replayed.' });
+	}
+
 	const taskId = `task-phone-${Date.now()}`;
 	const taskPath = join(TASKS_DIR, `${taskId}.txt`);
 	const resultPath = join(RESULTS_DIR, `${taskId}.txt`);
@@ -251,6 +262,9 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 			const result = readFileSync(resultPath, 'utf-8').trim();
 			console.log(`${ts()} [Task] result for ${taskId} (${Date.now() - startTime}ms): ${result.slice(0, 200)}`);
 			try { unlinkSync(resultPath); } catch {}
+			// Cache result so duplicate requests get instant replay
+			if (!callSession.taskResultCache) callSession.taskResultCache = new Map();
+			callSession.taskResultCache.set(taskDescription, result);
 			// Queue result — will be injected on next turn.end to avoid interrupting speech
 			callSession.resultQueue.push({
 				text: `[Task result for "${taskDescription}"]\n${result}\n\nReport this result to the caller now.`,
