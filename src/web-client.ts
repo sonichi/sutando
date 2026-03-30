@@ -974,22 +974,24 @@ function connectWs() {
       // Unexpected drop (Gemini timeout) — auto-reconnect with limit
       reconnectAttempts++;
       if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
-        addSystem('Could not connect to the voice agent after ' + MAX_RECONNECT_ATTEMPTS + ' attempts.');
-        addSystem('Check the terminal where you ran startup.sh — that is the Sutando core CLI. You can type commands there directly.');
-        addSystem('To restart all services: bash src/restart.sh');
-        setStatus('Disconnected', 'error');
-        connected = false;
-        reconnectAttempts = 0;
+        addSystem('Still trying to connect. Common causes:');
+        addSystem('1. GEMINI_API_KEY not set — edit .env and add your key from ai.google.dev');
+        addSystem('2. Voice agent not running — run: bash src/startup.sh');
+        addSystem('3. Port 9900 blocked — check: lsof -i :9900');
+        addSystem('You can type commands below while reconnecting.');
+        setStatus('Reconnecting...', 'error');
+        reconnectAttempts = 0;  // reset counter and keep retrying
       } else {
         addSystem('Connection lost — reconnecting (' + reconnectAttempts + '/' + MAX_RECONNECT_ATTEMPTS + ')...');
         setStatus('Reconnecting...', 'error');
-        setTimeout(() => {
-          if (!connected) {
-            dbg('Auto-reconnecting (attempt ' + reconnectAttempts + ')...');
-            toggle();
-          }
-        }, 3000);
       }
+      // Always retry
+      setTimeout(() => {
+        if (!connected) {
+          dbg('Auto-reconnecting (attempt ' + reconnectAttempts + ')...');
+          toggle();
+        }
+      }, 3000);
     }
   };
 

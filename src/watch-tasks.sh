@@ -7,16 +7,17 @@
 
 TASKS_DIR="${1:-$(dirname "$0")/../tasks}"
 
-# Exit if another fswatch process is already watching tasks/
-# Use pgrep -x to match only the fswatch binary, not this script
-if pgrep -x fswatch >/dev/null 2>&1; then
-  exit 0
-fi
-
 # Wait for a new .txt file — loop until one actually appears
 while true; do
+  # Check for existing files BEFORE waiting (catches files written during restarts)
+  if ls "$TASKS_DIR"/*.txt >/dev/null 2>&1; then
+    echo "TASK_DETECTED: Process ALL .txt files in tasks/."
+    ls "$TASKS_DIR"/*.txt
+    break
+  fi
+  # Wait for next filesystem event
   fswatch -1 -l 1 "$TASKS_DIR" >/dev/null 2>&1
-  # Only exit if .txt files actually exist
+  # Check again after event
   if ls "$TASKS_DIR"/*.txt >/dev/null 2>&1; then
     echo "TASK_DETECTED: Process ALL .txt files in tasks/."
     ls "$TASKS_DIR"/*.txt
