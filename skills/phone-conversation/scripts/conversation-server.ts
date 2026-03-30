@@ -608,15 +608,24 @@ async function createCallSession(params: {
 	};
 
 	// Track transcripts via event bus + run goodbye detection
+	// Use a processed count per-session that resets on reconnect to avoid duplicates.
+	let lastProcessedIdx = 0;
 	session.eventBus.subscribe('turn.end', () => {
 		const items = session.conversationContext.items;
-		for (const item of items.slice(callSession.transcript.length)) {
+		// Guard: if items shrunk (reconnect reset context), re-scan from start but skip already-seen text
+		if (items.length < lastProcessedIdx) lastProcessedIdx = 0;
+		const lastTranscriptText = callSession.transcript.length > 0
+			? callSession.transcript[callSession.transcript.length - 1].text : null;
+		for (const item of items.slice(lastProcessedIdx)) {
+			// Skip if this exact text was the last thing we recorded (dedup across reconnects)
+			if (item.content === lastTranscriptText) continue;
 			if (item.role === 'user') {
 				callSession.transcript.push({ role: 'caller', text: item.content });
 			} else if (item.role === 'assistant') {
 				callSession.transcript.push({ role: 'sutando', text: item.content });
 			}
 		}
+		lastProcessedIdx = items.length;
 
 		// Goodbye detection is handled by the model's hang_up tool — no classifier needed.
 
