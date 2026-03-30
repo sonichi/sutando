@@ -98,7 +98,12 @@ async def on_message(message):
     is_dm = isinstance(message.channel, discord.DMChannel)
     channel_name = getattr(message.channel, 'name', 'DM')
 
-    print(f"  [msg] #{channel_name} @{username}: {text[:80]} (mentions: {[str(m) for m in message.mentions]}, is_dm: {is_dm})", flush=True)
+    print(f"  [msg] #{channel_name} @{username}: {text[:80]} (mentions: {[str(m) for m in message.mentions]}, is_dm: {is_dm}, embeds: {len(message.embeds)}, type: {message.type}, ref: {message.reference is not None})", flush=True)
+    # Debug: log message snapshots for forwarded messages
+    if hasattr(message, 'message_snapshots') and message.message_snapshots:
+        print(f"  [debug] message_snapshots: {message.message_snapshots}", flush=True)
+    if message.type != discord.MessageType.default and message.type != discord.MessageType.reply:
+        print(f"  [debug] non-default message type: {message.type}", flush=True)
 
     # In channels, check if mention is required
     if not is_dm:
@@ -155,11 +160,50 @@ async def on_message(message):
                 return
 
     if policy == "pairing" and sender_id not in allowed:
-        # Auto-pair: save their ID and notify
-        save_to_allowlist(sender_id)
-        await message.channel.send(f"Paired! Your ID `{sender_id}` has been added. Say hi to Sutando.")
-        print(f"  Auto-paired @{username} ({sender_id})")
+        # Generate pairing code — user must approve via /discord:access pair <code>
+        import random, string
+        code = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+        pending = access.get("pending", {})
+        pending[code] = {
+            "senderId": sender_id,
+            "chatId": str(message.channel.id),
+            "createdAt": int(time.time() * 1000),
+            "expiresAt": int(time.time() * 1000) + 3600000,  # 1 hour
+        }
+        access["pending"] = pending
+        ACCESS_FILE.write_text(json.dumps(access, indent=2))
+        await message.channel.send(f"Pairing required. Ask the owner to run:\n`/discord:access pair {code}`")
+        print(f"  Pairing requested: @{username} ({sender_id}) code={code}")
         return
+
+    # Handle forwarded messages (message_snapshots) — Discord's forwarding feature
+    if hasattr(message, 'message_snapshots') and message.message_snapshots:
+        for snapshot in message.message_snapshots:
+            snap_msg = snapshot.message if hasattr(snapshot, 'message') else snapshot
+            snap_content = getattr(snap_msg, 'content', '') or ''
+            snap_author = ''
+            if hasattr(snap_msg, 'author') and snap_msg.author:
+                snap_author = f"[Forwarded from {snap_msg.author}] "
+            if snap_content:
+                text = (text + "\n" + snap_author + snap_content).strip() if text else (snap_author + snap_content).strip()
+                print(f"  [forward] extracted: {text[:100]}", flush=True)
+
+    # Handle embeds (link previews, rich content)
+    embed_text = ""
+    for embed in message.embeds:
+        parts = []
+        if embed.author and embed.author.name:
+            parts.append(f"[From {embed.author.name}]")
+        if embed.title:
+            parts.append(embed.title)
+        if embed.description:
+            parts.append(embed.description)
+        for field in embed.fields:
+            parts.append(f"{field.name}: {field.value}")
+        if parts:
+            embed_text += "\n".join(parts) + "\n"
+    if embed_text:
+        text = (text + "\n" + embed_text).strip() if text else embed_text.strip()
 
     # Handle attachments
     attachment_note = ""
