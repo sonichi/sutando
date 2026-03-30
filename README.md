@@ -211,6 +211,22 @@ It consumes API quota proportional to how much work it finds to do.
 
 ---
 
+## Security
+
+🚨 Sutando has deep access to your computer — file system, screen, keyboard, browser, email, and phone. Understand the risks before deploying.
+
+**Built-in protections:**
+- **STIR/SHAKEN verification** — inbound calls are checked for carrier-level caller ID attestation. Spoofed numbers are automatically downgraded and denied owner access.
+- **3-tier access control** — owner, verified, and unverified callers get different levels of access on phone, Discord, and Telegram.
+
+**Recommended setup:**
+- Keep your Twilio phone number private
+- Set `VERIFIED_CALLERS` explicitly in `.env` (don't leave it empty)
+
+See **[SECURITY.md](SECURITY.md)** for full details, best practices, and how to test your setup.
+
+---
+
 ## Contributing
 
 This is alpha software. The biggest need is **testing** — try a capability, report what breaks.
