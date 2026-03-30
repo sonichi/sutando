@@ -1,22 +1,24 @@
 #!/bin/bash
-# Watch for new tasks and output a reminder to process ALL files.
+# Watch for new task files in tasks/ directory.
 # Usage: bash src/watch-tasks.sh (run_in_background: true)
 #
-# When fswatch detects a change, outputs a reminder message that
-# the cron loop will read, ensuring ALL task files get processed.
-# Dedup: kills any existing fswatch watcher before starting a new one.
+# Uses fswatch -1 (one-shot) to detect new files, then exits with a message.
+# The caller restarts this after processing tasks.
+# Dedup: kills any existing fswatch watcher before starting.
 
 TASKS_DIR="${1:-$(dirname "$0")/../tasks}"
 
-# Kill any existing fswatch watchers on tasks/ to prevent duplicates
-existing=$(pgrep -f "fswatch.*tasks" 2>/dev/null)
-if [ -n "$existing" ]; then
-  echo "$existing" | xargs kill 2>/dev/null
-  sleep 0.5
-fi
+# Kill any existing fswatch watchers to prevent duplicates
+# Use grep -v $$ to avoid killing ourselves
+for pid in $(pgrep -f "fswatch.*tasks" 2>/dev/null); do
+  if [ "$pid" != "$$" ] && [ "$pid" != "$PPID" ]; then
+    kill "$pid" 2>/dev/null
+  fi
+done
 
-fswatch -1 "$TASKS_DIR" >/dev/null 2>&1
+# Watch for new files (blocks until a change is detected)
+fswatch -1 --event Created --event Updated "$TASKS_DIR" >/dev/null 2>&1
 
-# Output reminder — this is what the cron loop reads
-echo "TASK_DETECTED: Process ALL .txt files in tasks/ before restarting the watcher. Do not process only one."
+# Output what was found
+echo "TASK_DETECTED: Process ALL .txt files in tasks/ before restarting the watcher."
 ls "$TASKS_DIR"/*.txt 2>/dev/null || true
