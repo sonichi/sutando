@@ -623,10 +623,12 @@ function cleanupCall(callSid: string): void {
 	activeCalls.delete(callSid);
 	if (session.meetingId) pendingMeetingJoins.delete(session.meetingId);
 
-	// Close VoiceSession
-	session.voiceSession.close('call_ended').catch(e =>
-		console.error(`${ts()} [Bodhi] close error:`, e)
-	);
+	// Close VoiceSession (guard against double-close when already CLOSED from GoAway)
+	try {
+		session.voiceSession.close('call_ended').catch(() => {});
+	} catch {
+		// Already closed — ignore
+	}
 
 	// Save transcript
 	if (session.transcript.length > 0) {
