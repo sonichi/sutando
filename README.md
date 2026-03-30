@@ -213,18 +213,17 @@ It consumes API quota proportional to how much work it finds to do.
 
 ## Security
 
-Sutando has deep access to your computer — file system, screen, keyboard, browser, email, and phone. Understand the risks before deploying.
+🚨 Sutando has deep access to your computer — file system, screen, keyboard, browser, email, and phone. Understand the risks before deploying.
 
-**Primary risk:** Anyone who calls your Twilio number interacts with Sutando. Caller ID can be spoofed. An attacker who spoofs the owner's number gets full computer access.
+**Built-in protections:**
+- **STIR/SHAKEN verification** — inbound calls are checked for carrier-level caller ID attestation. Spoofed numbers are automatically downgraded and denied owner access.
+- **3-tier access control** — owner, verified, and unverified callers get different levels of access on phone, Discord, and Telegram.
 
-**Key mitigations:**
-- Keep your Twilio number private
-- Explicitly set `VERIFIED_CALLERS` in `.env` (don't leave it empty)
-- Use allowlists for Discord/Telegram (not open pairing mode)
-- Don't expose `localhost:8080` (web client) to the internet
-- Monitor call transcripts in `results/calls/calls.jsonl`
+**Recommended setup:**
+- Keep your Twilio phone number private
+- Set `VERIFIED_CALLERS` explicitly in `.env` (don't leave it empty)
 
-See **[SECURITY.md](SECURITY.md)** for the full threat model, access tiers, and recommendations.
+See **[SECURITY.md](SECURITY.md)** for full details, best practices, and how to test your setup.
 
 ---
 
