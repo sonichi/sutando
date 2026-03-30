@@ -34,4 +34,4 @@ Sutando is a personal AI agent with access to your computer. Users are encourage
 
 ## Contact
 
-For any other questions or concerns related to security, please contact us at aisutando@gmail.com or join the [Discord](https://discord.gg/uZHWXXmrCS).
+For any other questions or concerns related to security, please contact us at aisutando@gmail.com.
