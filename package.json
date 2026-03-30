@@ -16,7 +16,7 @@
     "bodhi-realtime-agent": "github:sonichi/bodhi_realtime_agent",
     "dotenv": "^17.3.1",
     "playwright": "^1.58.2",
-    "ws": "^8.19.0",
+    "ws": "^8.20.0",
     "zod": "^3.24.0"
   },
   "devDependencies": {
