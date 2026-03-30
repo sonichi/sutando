@@ -1174,12 +1174,14 @@ const SUGGESTION_CHIPS = [
   {label: 'Bye', desc: 'disconnect voice'},
 ];
 
+function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
 function renderDynamicContent(c) {
   const media = API_BASE + '/media/';
   const src = c.src || '';
   const fullSrc = src.startsWith('http') ? src : media + src;
-  const title = c.title ? '<div class="dr-media-title">' + c.title + '</div>' : '';
-  const caption = c.caption ? '<div class="dr-media-caption">' + c.caption + '</div>' : '';
+  const title = c.title ? '<div class="dr-media-title">' + esc(c.title) + '</div>' : '';
+  const caption = c.caption ? '<div class="dr-media-caption">' + esc(c.caption) + '</div>' : '';
 
   switch (c.type) {
     case 'audio':
@@ -1225,8 +1227,8 @@ function updateDynamicRegion() {
     dr.innerHTML = '<div class="dr-questions">' +
       '<div class="q-title">Pending Questions</div>' +
       questions.map(q =>
-        '<div class="q-item"><b>' + q.id + '</b>: ' + q.text +
-        (q.detail ? '<div style="color:#999;font-size:11px;margin-top:2px;white-space:pre-wrap">' + q.detail + '</div>' : '') +
+        '<div class="q-item"><b>' + esc(q.id) + '</b>: ' + esc(q.text) +
+        (q.detail ? '<div style="color:#999;font-size:11px;margin-top:2px;white-space:pre-wrap">' + esc(q.detail) + '</div>' : '') +
         '<div class="q-actions">' +
         '<button class="q-btn q-yes" data-qid="' + q.id + '" data-ans="Yes">Yes</button>' +
         '<button class="q-btn q-no" data-qid="' + q.id + '" data-ans="No">No</button>' +
@@ -1235,7 +1237,7 @@ function updateDynamicRegion() {
         '</div></div>'
       ).join('') + '</div>';
   } else if (proactive) {
-    dr.innerHTML = '<div class="dr-proactive">' + proactive + '</div>';
+    dr.innerHTML = '<div class="dr-proactive">' + esc(proactive) + '</div>';
   } else {
     dr.innerHTML = '<div class="dr-chips">' +
       '<div class="suggestions-label">Try saying or typing</div>' +

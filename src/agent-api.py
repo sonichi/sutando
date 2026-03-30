@@ -245,7 +245,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             rel = path[len("/media/"):]
             # Only allow files under repo dir for security
             media_path = (REPO_DIR / rel).resolve()
-            if not str(media_path).startswith(str(REPO_DIR)) or not media_path.exists():
+            if not media_path.is_relative_to(REPO_DIR.resolve()) or not media_path.is_file():
                 self.send_json(404, {"error": "not found"})
                 return
             mime = mimetypes.guess_type(str(media_path))[0] or "application/octet-stream"
@@ -388,6 +388,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         if path == "/answer":
+            if not self.check_auth():
+                return
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
             try:
@@ -403,8 +405,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # Update status from Waiting to answered
                     import re
                     pattern = rf'(## {re.escape(qid)} — .+?\n\n)(.*?)(\n\n\*\*Status:\*\* )Waiting'
-                    replacement = rf'\1\2\3Answered: {answer}'
-                    new_content = re.sub(pattern, replacement, content, flags=re.DOTALL)
+                    safe_answer = answer.replace('\n', ' ')
+                    new_content = re.sub(pattern, lambda m: m.group(1) + m.group(2) + m.group(3) + 'Answered: ' + safe_answer, content, flags=re.DOTALL)
                     if new_content != content:
                         pq_file.write_text(new_content)
                         # Also write as a task so the agent picks it up
