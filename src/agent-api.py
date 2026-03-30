@@ -86,7 +86,7 @@ def get_status() -> dict:
     }
 
 
-def get_task_result(task_id: str) -> dict | None:
+def get_task_result(task_id: str):
     """Check if a task result exists."""
     result_file = RESULT_DIR / f"{task_id}.txt"
     if result_file.exists():
