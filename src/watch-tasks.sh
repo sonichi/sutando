@@ -12,15 +12,16 @@ while true; do
   # Check for existing files BEFORE waiting (catches files written during restarts)
   if ls "$TASKS_DIR"/*.txt >/dev/null 2>&1; then
     echo "TASK_DETECTED: Process ALL .txt files in tasks/."
-    ls "$TASKS_DIR"/*.txt
+    for f in "$TASKS_DIR"/*.txt; do echo "--- $(basename "$f") ---"; cat "$f"; done
     break
   fi
   # Wait for next filesystem event
-  fswatch -1 -l 1 "$TASKS_DIR" >/dev/null 2>&1
+  CHANGED=$(fswatch -1 -l 1 "$TASKS_DIR" 2>/dev/null)
+  echo "fswatch triggered: $CHANGED"
   # Check again after event
   if ls "$TASKS_DIR"/*.txt >/dev/null 2>&1; then
     echo "TASK_DETECTED: Process ALL .txt files in tasks/."
-    ls "$TASKS_DIR"/*.txt
+    for f in "$TASKS_DIR"/*.txt; do echo "--- $(basename "$f") ---"; cat "$f"; done
     break
   fi
   # False trigger — keep watching

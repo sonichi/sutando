@@ -255,6 +255,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "public, max-age=300")
             self.end_headers()
             self.wfile.write(media_path.read_bytes())
+        elif path == "/logs/voice":
+            # Return last 30 lines of voice-agent.log for debugging
+            log_file = REPO_DIR / "src" / "voice-agent.log"
+            if log_file.exists():
+                lines = log_file.read_text().splitlines()[-30:]
+                self.send_json(200, {"lines": lines})
+            else:
+                self.send_json(404, {"error": "voice-agent.log not found"})
         elif path == "/":
             # Serve task submission form (works from phone on same Wi-Fi)
             self.send_response(200)
