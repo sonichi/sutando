@@ -92,17 +92,25 @@ def get_status() -> dict:
     }
 
 
+def _safe_path(base_dir: Path, filename: str) -> Path:
+    """Resolve a path safely under base_dir. Returns None if path escapes."""
+    safe_name = _safe_id(filename)
+    if not safe_name:
+        return None
+    resolved = (base_dir / f"{safe_name}.txt").resolve()
+    if not resolved.is_relative_to(base_dir.resolve()):
+        return None
+    return resolved
+
+
 def get_task_result(task_id: str):
     """Check if a task result exists."""
-    task_id = _safe_id(task_id)
-    if not task_id:
-        return None
-    result_file = RESULT_DIR / f"{task_id}.txt"
-    if result_file.exists():
-        return {"task_id": task_id, "status": "completed", "result": result_file.read_text()}
-    task_file = TASK_DIR / f"{task_id}.txt"
-    if task_file.exists():
-        return {"task_id": task_id, "status": "pending"}
+    result_file = _safe_path(RESULT_DIR, task_id)
+    if result_file and result_file.exists():
+        return {"task_id": _safe_id(task_id), "status": "completed", "result": result_file.read_text()}
+    task_file = _safe_path(TASK_DIR, task_id)
+    if task_file and task_file.exists():
+        return {"task_id": _safe_id(task_id), "status": "pending"}
     return None
 
 
@@ -252,18 +260,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Serve local files for dynamic region (images, audio, video, docs)
             import mimetypes
             rel = path[len("/media/"):]
-            # Reject path traversal attempts before resolving
-            if '..' in rel or rel.startswith('/'):
+            # Reject path traversal attempts
+            if '..' in rel or rel.startswith('/') or '\x00' in rel:
                 self.send_json(400, {"error": "invalid path"})
                 return
-            # Only allow files under repo dir for security
-            media_path = (REPO_DIR / rel).resolve()
-            if not media_path.is_relative_to(REPO_DIR.resolve()) or not media_path.is_file():
+            # Sanitize: only allow safe filename characters
+            safe_rel = re.sub(r'[^a-zA-Z0-9_./-]', '', rel)
+            if not safe_rel or safe_rel != rel:
+                self.send_json(400, {"error": "invalid path"})
+                return
+            repo_resolved = REPO_DIR.resolve()
+            media_path = (repo_resolved / safe_rel).resolve()
+            if not media_path.is_relative_to(repo_resolved) or not media_path.is_file():
                 self.send_json(404, {"error": "not found"})
                 return
-            mime = mimetypes.guess_type(str(media_path))[0] or "application/octet-stream"
-            # Sanitize mime to prevent header injection
-            mime = mime.split('\n')[0].split('\r')[0]
+            # Use a fixed allowlist of safe content types
+            SAFE_TYPES = {
+                '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+                '.gif': 'image/gif', '.svg': 'image/svg+xml', '.webp': 'image/webp',
+                '.mp4': 'video/mp4', '.webm': 'video/webm', '.mp3': 'audio/mpeg',
+                '.wav': 'audio/wav', '.pdf': 'application/pdf', '.json': 'application/json',
+                '.txt': 'text/plain', '.html': 'text/html', '.css': 'text/css',
+                '.js': 'application/javascript',
+            }
+            ext = media_path.suffix.lower()
+            mime = SAFE_TYPES.get(ext, 'application/octet-stream')
             self.send_response(200)
             self.send_header("Content-Type", mime)
             self.send_header("Access-Control-Allow-Origin", "*")
@@ -435,8 +456,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         # Also write as a task so the agent picks it up
                         ts = int(datetime.now().timestamp() * 1000)
                         safe_qid = _safe_id(qid)
-                        task_file = REPO_DIR / f"tasks/answer-{safe_qid}-{ts}.txt"
-                        task_file.write_text(f"User answered {safe_qid}: {answer}")
+                        if safe_qid:
+                            task_dir = (REPO_DIR / "tasks").resolve()
+                            task_file = (task_dir / f"answer-{safe_qid}-{ts}.txt").resolve()
+                            if task_file.is_relative_to(task_dir):
+                                task_file.write_text(f"User answered {safe_qid}: {answer}")
                         self.send_json(200, {"ok": True, "id": qid, "answer": answer})
                     else:
                         self.send_json(404, {"error": f"question {qid} not found or already answered"})
