@@ -95,6 +95,7 @@ export const openUrlTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { url } = args as { url: string };
+		// Escape backslashes first, then quotes — prevents shell injection via osascript
 		const safeUrl = url.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
 		try {
 			execSync(`osascript -e 'tell application "Google Chrome" to tell front window to make new tab with properties {URL:"${safeUrl}"}'`, { timeout: 5_000 });
@@ -131,6 +132,7 @@ export const switchAppTool: ToolDefinition = {
 	async execute(args) {
 		let { app } = args as { app: string };
 		app = APP_ALIASES[app.toLowerCase()] ?? app;
+		// Escape backslashes first, then quotes — prevents shell injection via osascript
 		const safeApp = app.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
 		const processName = (PROCESS_NAMES[app] ?? app).replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
 		try {
