@@ -132,6 +132,10 @@ const HTML = /* html */ `<!DOCTYPE html>
   /* Dynamic region */
   #dynamic-region { padding: 0 16px 8px; }
   #dynamic-region:empty { display: none; }
+  #core-status-bar { text-align: center; font-size: 11px; color: #555; padding: 2px 16px; }
+  #core-status-bar:empty { display: none; }
+  #core-status-bar .core-running { color: #4ecca3; }
+  #core-status-bar .core-idle { color: #444; }
   #dynamic-region .dr-questions {
     background: linear-gradient(135deg, #1e1a12, #2a2218); border: 1px solid #f0ad4e44;
     border-radius: 10px; padding: 12px 16px; font-size: 13px; box-shadow: 0 0 12px #f0ad4e22;
@@ -292,6 +296,7 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
 </div>
 
 <div id="dynamic-region"></div>
+<div id="core-status-bar"></div>
 
 <div class="main" id="main-area">
 
@@ -1089,11 +1094,20 @@ function answerQuestion(qid, answer) {
     body: JSON.stringify({id: qid, answer: answer.trim()})
   }).then(r => r.json()).then(d => {
     if (d.ok) {
-      // Remove from local state immediately
-      window._drQuestions = (window._drQuestions || []).filter(q => q.id !== qid);
-      updateDynamicRegion();
-      // Show confirmation in transcript
-      const el = document.createElement('div');
+      // Show answered state on the question briefly before removing
+      var qItem = document.querySelector('[data-qid="' + qid + '"]');
+      var qParent = qItem ? qItem.closest('.q-item') : null;
+      if (qParent) {
+        var actions = qParent.querySelector('.q-actions');
+        if (actions) actions.innerHTML = '<span style="color:#4ecca3;font-size:12px">Answered: ' + esc(answer.trim().substring(0, 60)) + '</span>';
+      }
+      // Remove after brief delay so user sees confirmation
+      setTimeout(function() {
+        window._drQuestions = (window._drQuestions || []).filter(function(q) { return q.id !== qid; });
+        updateDynamicRegion();
+      }, 1500);
+      // Show in transcript too
+      var el = document.createElement('div');
       el.className = 't-entry t-system';
       el.textContent = 'Answered ' + qid + ': ' + answer.trim();
       document.getElementById('transcript').appendChild(el);
@@ -1297,6 +1311,15 @@ document.addEventListener('keydown', function(e) {
         window._drProactive = null;
       }
       updateDynamicRegion();
+      // Update persistent core status bar
+      var csBar = document.getElementById('core-status-bar');
+      if (csBar) {
+        if (loopData.status === 'running') {
+          csBar.innerHTML = '<span class="core-running">Core: ' + esc(loopData.step || 'working') + '</span>';
+        } else {
+          csBar.innerHTML = '<span class="core-idle">Core: idle</span>';
+        }
+      }
     });
   }, 3000);
 })();
