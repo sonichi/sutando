@@ -1266,9 +1266,8 @@ function updateDynamicRegion() {
         '<button class="q-btn q-send" data-qid="' + q.id + '">Send</button>' +
         '</div></div>'
       ).join('') + '</div>';
-  } else if (proactive) {
-    dr.innerHTML = '<div class="dr-proactive">' + esc(proactive) + '</div>';
   } else {
+    // Proactive status now shown in #core-status-bar instead
     dr.innerHTML = '<div class="dr-chips">' +
       '<div class="suggestions-label">Try saying or typing</div>' +
       SUGGESTION_CHIPS.map(c =>
