@@ -605,8 +605,10 @@ async function createCallSession(params: {
 	// [Outbound audio chain] Override to send Gemini audio directly to Twilio
 	// Bypasses ClientTransport's internal WebSocket for lower latency
 	const sessionAny = session as any;
+	let isReplaying = false; // suppress audio during reconnect replay
 	sessionAny.handleAudioOutput = (data: string) => {
 		sessionAny.notificationQueue?.markAudioReceived?.();
+		if (isReplaying) return; // skip replayed audio from reconnect
 		if (params.twilioWs.readyState === WebSocket.OPEN) {
 			const pcmBuf = Buffer.from(data, 'base64');
 			const mulawBuf = pcm24kToMulaw8k(pcmBuf);
@@ -676,7 +678,9 @@ async function createCallSession(params: {
 			setTimeout(() => {
 				if (!callSession.hangingUp && activeCalls.has(callSession.callSid)) {
 					console.log(`${ts()} [Phone] reconnecting Gemini for ${callSession.callSid}`);
+					isReplaying = true; // mute audio while Gemini replays history
 					sessionAny.handleClientConnected();
+					setTimeout(() => { isReplaying = false; }, 3000); // unmute after replay
 				}
 			}, 1500);
 		}
