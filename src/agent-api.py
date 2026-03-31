@@ -34,12 +34,18 @@ For remote access: use ngrok or SSH tunnel.
 import http.server
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
+
+
+def _safe_id(raw: str) -> str:
+    """Sanitize an ID to prevent path traversal. Only allow alphanumeric, dash, underscore, dot."""
+    return re.sub(r'[^a-zA-Z0-9_\-.]', '', raw)
 
 REPO_DIR = Path(__file__).parent.parent
 TASK_DIR = REPO_DIR / "tasks"
@@ -88,6 +94,9 @@ def get_status() -> dict:
 
 def get_task_result(task_id: str):
     """Check if a task result exists."""
+    task_id = _safe_id(task_id)
+    if not task_id:
+        return None
     result_file = RESULT_DIR / f"{task_id}.txt"
     if result_file.exists():
         return {"task_id": task_id, "status": "completed", "result": result_file.read_text()}
@@ -243,12 +252,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Serve local files for dynamic region (images, audio, video, docs)
             import mimetypes
             rel = path[len("/media/"):]
+            # Reject path traversal attempts before resolving
+            if '..' in rel or rel.startswith('/'):
+                self.send_json(400, {"error": "invalid path"})
+                return
             # Only allow files under repo dir for security
             media_path = (REPO_DIR / rel).resolve()
             if not media_path.is_relative_to(REPO_DIR.resolve()) or not media_path.is_file():
                 self.send_json(404, {"error": "not found"})
                 return
             mime = mimetypes.guess_type(str(media_path))[0] or "application/octet-stream"
+            # Sanitize mime to prevent header injection
+            mime = mime.split('\n')[0].split('\r')[0]
             self.send_response(200)
             self.send_header("Content-Type", mime)
             self.send_header("Access-Control-Allow-Origin", "*")
@@ -419,8 +434,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         pq_file.write_text(new_content)
                         # Also write as a task so the agent picks it up
                         ts = int(datetime.now().timestamp() * 1000)
-                        task_file = REPO_DIR / f"tasks/answer-{qid}-{ts}.txt"
-                        task_file.write_text(f"User answered {qid}: {answer}")
+                        safe_qid = _safe_id(qid)
+                        task_file = REPO_DIR / f"tasks/answer-{safe_qid}-{ts}.txt"
+                        task_file.write_text(f"User answered {safe_qid}: {answer}")
                         self.send_json(200, {"ok": True, "id": qid, "answer": answer})
                     else:
                         self.send_json(404, {"error": f"question {qid} not found or already answered"})

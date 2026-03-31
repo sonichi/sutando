@@ -1062,7 +1062,7 @@ const server = createServer(async (req, res) => {
 				twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Pause length="5"/>
-  <Play digits="${passcode || meetingId}#"/>
+  <Play digits="${esc(passcode || meetingId)}#"/>
   <Pause length="3"/>
   <Redirect method="POST">${esc(connectUrl)}</Redirect>
 </Response>`;
@@ -1271,7 +1271,7 @@ async function start(): Promise<void> {
 		console.log(`╠════════════════════════════════════════════════════╣`);
 		console.log(`║  Local:    http://localhost:${String(PORT).padEnd(27)}║`);
 		console.log(`║  Tunnel:   ${WEBHOOK_BASE_URL.slice(0, 40).padEnd(40)}║`);
-		console.log(`║  Phone:    ${TWILIO_PHONE_NUMBER.padEnd(40)}║`);
+		console.log(`║  Phone:    ${TWILIO_PHONE_NUMBER.replace(/\d(?=\d{4})/g, '*').padEnd(40)}║`);
 		console.log(`╠════════════════════════════════════════════════════╣`);
 		console.log(`║  POST /call              — outbound call           ║`);
 		console.log(`║  POST /concurrent-call   — child call (for Claude) ║`);
