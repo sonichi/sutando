@@ -270,7 +270,7 @@ async def on_message(message):
     task_file.write_text(
         f"id: {task_id}\n"
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S')}Z\n"
-        f"task: [Discord @{username}] {text}\n"
+        f"task: [Discord @{username}] {text}{attachment_note}\n"
         f"source: discord\n"
         f"channel_id: {message.channel.id}\n"
         f"user_id: {message.author.id}\n"
