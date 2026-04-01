@@ -18,7 +18,8 @@ If an interval is provided in ARGUMENTS (e.g. "5m", "10m", "30m"), use it. Other
 
 ## On activation
 
-Before starting the loop, immediately start the task watcher:
+1. Run `/schedule-crons` to set up all recurring cron jobs (reactive, proactive, morning briefing, Zacks)
+2. Start the task watcher if not running:
 ```
 bash src/watch-tasks.sh
 ```

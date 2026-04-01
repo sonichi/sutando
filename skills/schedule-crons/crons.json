@@ -1,0 +1,22 @@
+[
+  {
+    "name": "reactive-check",
+    "cron": "*/5 * * * *",
+    "prompt": "REACTIVE CHECK — fast, no heavy work.\n1. Check tasks/ for files. Process any found, write results, delete task files.\n2. Check context-drop.txt. Process if present.\n3. Ensure fswatch watcher is running (1 process). If dead, restart with run_in_background: true.\n4. Check Discord channels (reference_discord_channels.md) for new actionable messages. Forward to #dev.\n5. GUARDRAIL: Read core-status.json. If the last proactive pass was more than 45 minutes ago (check ts field) and status is idle, the proactive loop may have stalled. Do one proactive action: pick an item from notes/todo.md and work on it.\n6. Signal core-status.json throughout."
+  },
+  {
+    "name": "proactive-loop",
+    "cron": "*/10 * * * *",
+    "prompt_skill": "proactive-loop"
+  },
+  {
+    "name": "morning-briefing",
+    "cron": "57 6 * * *",
+    "prompt_skill": "morning-briefing"
+  },
+  {
+    "name": "zacks-check",
+    "cron": "3 6 * * 1-5",
+    "prompt": "Run the Zacks stock ranking check: python3 ~/scripts/sutando-personal/zacks-check.py"
+  }
+]

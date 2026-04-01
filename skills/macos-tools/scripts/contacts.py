@@ -3,9 +3,12 @@
 Sutando contacts reader — search macOS Contacts via AppleScript.
 
 Usage:
-  python3 src/contacts.py search "Bob"         # search by name
-  python3 src/contacts.py search "bob@x.com"   # search by email
-  python3 src/contacts.py all                   # list all (first 50)
+  python3 contacts.py search "Bob"                          # search by name
+  python3 contacts.py search "bob@x.com"                    # search by email
+  python3 contacts.py add "Bob Smith" --phone 123 --email a@b.com  # add
+  python3 contacts.py update "Bob" --phone 456              # update phone
+  python3 contacts.py update "Bob" --email new@x.com        # update email
+  python3 contacts.py all                                   # list all (first 50)
 
 Output: name, email, phone for matching contacts.
 """
@@ -122,6 +125,48 @@ def main():
             print(f"Error: {result.stderr.strip()}")
             sys.exit(1)
         print(f"Added {name}" + (f" phone:{phone}" if phone else "") + (f" email:{email}" if email else ""))
+    elif cmd == "update" and len(sys.argv) >= 3:
+        name = sys.argv[2]
+        phone = None
+        email = None
+        i = 3
+        while i < len(sys.argv):
+            if sys.argv[i] == "--phone" and i + 1 < len(sys.argv):
+                phone = sys.argv[i + 1]; i += 2
+            elif sys.argv[i] == "--email" and i + 1 < len(sys.argv):
+                email = sys.argv[i + 1]; i += 2
+            else:
+                i += 1
+        if not phone and not email:
+            print("Error: provide --phone and/or --email to update")
+            sys.exit(1)
+        import time
+        subprocess.run(["open", "-ga", "Contacts"], capture_output=True, timeout=5)
+        time.sleep(1)
+        lines = [f'set results to (every person whose name contains "{name}")']
+        lines.append('if (count of results) = 0 then')
+        lines.append(f'    return "NOT_FOUND: no contact matching {name}"')
+        lines.append('end if')
+        lines.append('set p to item 1 of results')
+        if phone:
+            lines.append('-- Remove existing phones and add new one')
+            lines.append(f'repeat while (count of phones of p) > 0')
+            lines.append(f'    delete (item 1 of phones of p)')
+            lines.append(f'end repeat')
+            lines.append(f'make new phone at end of phones of p with properties {{label:"mobile", value:"{phone}"}}')
+        if email:
+            lines.append('repeat while (count of emails of p) > 0')
+            lines.append('    delete (item 1 of emails of p)')
+            lines.append('end repeat')
+            lines.append(f'make new email at end of emails of p with properties {{label:"home", value:"{email}"}}')
+        lines.append("save")
+        lines.append('return "OK: updated " & (name of p)')
+        script = 'tell application "Contacts"\n' + "\n".join(lines) + '\nend tell'
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=15)
+        if result.returncode != 0:
+            print(f"Error: {result.stderr.strip()}")
+            sys.exit(1)
+        print(result.stdout.strip())
     elif cmd == "all":
         results = search_contacts("")
         if not results:
@@ -129,8 +174,9 @@ def main():
             return
         print(json.dumps(results, indent=2))
     else:
-        print("Usage: python3 src/contacts.py search 'name'")
-        print("       python3 src/contacts.py add 'Name' --phone 123 --email a@b.com")
+        print("Usage: python3 contacts.py search 'name'")
+        print("       python3 contacts.py add 'Name' --phone 123 --email a@b.com")
+        print("       python3 contacts.py update 'Name' --phone 456 --email new@x.com")
         sys.exit(1)
 
 
