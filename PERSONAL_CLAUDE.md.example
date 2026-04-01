@@ -1,0 +1,8 @@
+# Personal Rules
+
+# Add your personal rules, preferences, and overrides here.
+# This file is gitignored — it stays local to your machine.
+# Examples:
+
+# Never modify `src/startup.sh` or `src/restart.sh`. These are owner-maintained scripts.
+# Never push without my explicit approval.

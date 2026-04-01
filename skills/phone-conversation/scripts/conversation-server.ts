@@ -605,8 +605,10 @@ async function createCallSession(params: {
 	// [Outbound audio chain] Override to send Gemini audio directly to Twilio
 	// Bypasses ClientTransport's internal WebSocket for lower latency
 	const sessionAny = session as any;
+	let isReplaying = false; // suppress audio during reconnect replay
 	sessionAny.handleAudioOutput = (data: string) => {
 		sessionAny.notificationQueue?.markAudioReceived?.();
+		if (isReplaying) return; // skip replayed audio from reconnect
 		if (params.twilioWs.readyState === WebSocket.OPEN) {
 			const pcmBuf = Buffer.from(data, 'base64');
 			const mulawBuf = pcm24kToMulaw8k(pcmBuf);
@@ -676,7 +678,9 @@ async function createCallSession(params: {
 			setTimeout(() => {
 				if (!callSession.hangingUp && activeCalls.has(callSession.callSid)) {
 					console.log(`${ts()} [Phone] reconnecting Gemini for ${callSession.callSid}`);
+					isReplaying = true; // mute audio while Gemini replays history
 					sessionAny.handleClientConnected();
+					setTimeout(() => { isReplaying = false; }, 3000); // unmute after replay
 				}
 			}, 1500);
 		}
@@ -1062,7 +1066,7 @@ const server = createServer(async (req, res) => {
 				twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Pause length="5"/>
-  <Play digits="${passcode || meetingId}#"/>
+  <Play digits="${esc(passcode || meetingId)}#"/>
   <Pause length="3"/>
   <Redirect method="POST">${esc(connectUrl)}</Redirect>
 </Response>`;
@@ -1271,7 +1275,7 @@ async function start(): Promise<void> {
 		console.log(`╠════════════════════════════════════════════════════╣`);
 		console.log(`║  Local:    http://localhost:${String(PORT).padEnd(27)}║`);
 		console.log(`║  Tunnel:   ${WEBHOOK_BASE_URL.slice(0, 40).padEnd(40)}║`);
-		console.log(`║  Phone:    ${TWILIO_PHONE_NUMBER.padEnd(40)}║`);
+		console.log(`║  Phone:    ${TWILIO_PHONE_NUMBER.replace(/\d(?=\d{4})/g, '*').padEnd(40)}║`);
 		console.log(`╠════════════════════════════════════════════════════╣`);
 		console.log(`║  POST /call              — outbound call           ║`);
 		console.log(`║  POST /concurrent-call   — child call (for Claude) ║`);

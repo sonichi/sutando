@@ -1,4 +1,5 @@
 .env
+PERSONAL_CLAUDE.md
 node_modules/
 dist/
 *.log
@@ -36,5 +37,6 @@ docs/stand-avatar.png
 docs/youtube/
 core-status.json
 tests/
+skills/personal-*/
 tests/security/*.md
 !tests/security/*.md.example

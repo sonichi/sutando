@@ -100,3 +100,5 @@ Each pass, in order:
 12. **Information radar.** Once daily (check `data/radar-topics.json` last_scan), run `/info-radar` to scan arXiv, GitHub trending, HN, and news for monitored topics. Include highlights in morning briefing.
 
 13. **Follow-up tracking.** Check `data/follow-ups.json` for overdue commitments. Nudge the owner via voice (results/) or Discord DM for items past due. Also scan recent conversation.log entries for new commitments (patterns: "I'll", "I will", "remind me", "by tomorrow", deadlines). Add new ones to follow-ups.json. Auto-resolve items when completion signals are detected. See `notes/proactive-followups-design.md` for full design.
+
+14. **Personal additions.** If `skills/personal-proactive-loop/SKILL.md` exists, read and follow its additional steps on each pass.

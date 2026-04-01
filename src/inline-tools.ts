@@ -95,7 +95,8 @@ export const openUrlTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { url } = args as { url: string };
-		const safeUrl = url.replace(/'/g, "'\\''").replace(/"/g, '\\"');
+		// Escape backslashes first, then quotes — prevents shell injection via osascript
+		const safeUrl = url.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
 		try {
 			execSync(`osascript -e 'tell application "Google Chrome" to tell front window to make new tab with properties {URL:"${safeUrl}"}'`, { timeout: 5_000 });
 			console.log(`${ts()} [OpenURL] opened: ${url}`);
@@ -131,8 +132,9 @@ export const switchAppTool: ToolDefinition = {
 	async execute(args) {
 		let { app } = args as { app: string };
 		app = APP_ALIASES[app.toLowerCase()] ?? app;
-		const safeApp = app.replace(/'/g, "'\\''").replace(/"/g, '\\"');
-		const processName = (PROCESS_NAMES[app] ?? app).replace(/'/g, "'\\''").replace(/"/g, '\\"');
+		// Escape backslashes first, then quotes — prevents shell injection via osascript
+		const safeApp = app.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
+		const processName = (PROCESS_NAMES[app] ?? app).replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
 		try {
 			execSync(`osascript -e 'tell application "${safeApp}" to activate' -e 'tell application "System Events" to set frontmost of process "${processName}" to true'`, { timeout: 10_000 });
 			console.log(`${ts()} [SwitchApp] activated: ${app}`);
