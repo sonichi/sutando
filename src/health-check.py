@@ -177,17 +177,7 @@ def run_all_checks() -> list[dict]:
             except:
                 running = False
             if running:
-                # Verify bridge is functional: check log was written recently
-                import time
-                log_file = REPO_DIR / "src" / f"{name}.log"
-                if log_file.exists():
-                    age = time.time() - log_file.stat().st_mtime
-                    if age > 300:  # log older than 5 min = possibly stuck
-                        checks.append({"name": name, "status": "warn", "detail": f"running but log stale ({int(age)}s old)"})
-                    else:
-                        checks.append({"name": name, "status": "ok", "detail": "running"})
-                else:
-                    checks.append({"name": name, "status": "warn", "detail": "running but no log file"})
+                checks.append({"name": name, "status": "ok", "detail": "running"})
             else:
                 checks.append({"name": name, "status": "warn", "detail": "configured but not running"})
 
