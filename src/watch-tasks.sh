@@ -2,24 +2,31 @@
 # Watch for new task files in tasks/ directory.
 # Usage: bash src/watch-tasks.sh (run_in_background: true)
 #
-# Runs a persistent polling loop (2s interval) instead of fswatch.
-# Never exits — survives fswatch crashes, catches tasks immediately.
-# The caller reads the output file for TASK_DETECTED lines.
+# Uses fswatch -1 to detect one new file, then exits.
+# The caller processes tasks and restarts.
 
 TASKS_DIR="${1:-$(dirname "$0")/../tasks}"
 
-echo "[watcher] Started persistent task watcher on $TASKS_DIR"
+# Ensure required directories exist
+mkdir -p "$TASKS_DIR"
+mkdir -p "$(dirname "$0")/../results/calls"
 
+# Wait for a new .txt file — loop until one actually appears
 while true; do
-  # Check for .txt files
+  # Check for existing files BEFORE waiting (catches files written during restarts)
   if ls "$TASKS_DIR"/*.txt >/dev/null 2>&1; then
     echo "TASK_DETECTED: Process ALL .txt files in tasks/."
     for f in "$TASKS_DIR"/*.txt; do echo "--- $(basename "$f") ---"; cat "$f"; done
-    echo "TASK_DETECTED_END"
-    # Wait for files to be consumed before checking again
-    while ls "$TASKS_DIR"/*.txt >/dev/null 2>&1; do
-      sleep 2
-    done
+    break
   fi
-  sleep 2
+  # Wait for next filesystem event
+  CHANGED=$(fswatch -1 -l 1 "$TASKS_DIR" 2>/dev/null)
+  echo "fswatch triggered: $CHANGED"
+  # Check again after event
+  if ls "$TASKS_DIR"/*.txt >/dev/null 2>&1; then
+    echo "TASK_DETECTED: Process ALL .txt files in tasks/."
+    for f in "$TASKS_DIR"/*.txt; do echo "--- $(basename "$f") ---"; cat "$f"; done
+    break
+  fi
+  # False trigger — keep watching
 done
