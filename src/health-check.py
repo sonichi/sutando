@@ -169,17 +169,48 @@ def run_all_checks() -> list[dict]:
     # Messaging bridges (optional — only check if configured)
     channels_dir = Path.home() / ".claude" / "channels"
     for name, proc_name in [("telegram-bridge", "telegram-bridge"), ("discord-bridge", "discord-bridge")]:
-        env_file = channels_dir / name.replace("-bridge", "") / ".env"
-        if env_file.exists():
-            try:
-                result = subprocess.run(["pgrep", "-f", proc_name], capture_output=True)
-                running = result.returncode == 0
-            except:
-                running = False
-            if running:
-                checks.append({"name": name, "status": "ok", "detail": "running"})
-            else:
-                checks.append({"name": name, "status": "warn", "detail": "configured but not running"})
+        channel_name = name.replace("-bridge", "")
+        env_file = channels_dir / channel_name / ".env"
+        access_file = channels_dir / channel_name / "access.json"
+        # Check if configured via either .env or access.json
+        if not env_file.exists() and not access_file.exists():
+            continue
+        try:
+            result = subprocess.run(["pgrep", "-f", proc_name], capture_output=True, text=True)
+            pids = result.stdout.strip().split("\n") if result.returncode == 0 else []
+            pids = [p for p in pids if p]
+        except:
+            pids = []
+
+        if not pids:
+            checks.append({"name": name, "status": "warn", "detail": "configured but not running"})
+            continue
+
+        # Check 1: Multiple processes (zombie/duplicate)
+        if len(pids) > 1:
+            checks.append({"name": name, "status": "warn", "detail": f"multiple processes ({len(pids)} PIDs: {','.join(pids)})"})
+            continue
+
+        # Check 2: Log file freshness
+        import time
+        log_file = REPO_DIR / "src" / f"{name}.log"
+        detail = "running"
+        status = "ok"
+        if log_file.exists():
+            age_sec = time.time() - log_file.stat().st_mtime
+            if age_sec > 300:  # 5 minutes
+                status = "warn"
+                detail = f"running but log stale ({int(age_sec)}s old)"
+
+        # Check 3: Heartbeat file freshness
+        heartbeat_file = REPO_DIR / "src" / f"{name}.heartbeat"
+        if heartbeat_file.exists():
+            hb_age = time.time() - heartbeat_file.stat().st_mtime
+            if hb_age > 120:  # 2 minutes
+                status = "warn"
+                detail = f"running but heartbeat stale ({int(hb_age)}s old)"
+
+        checks.append({"name": name, "status": status, "detail": detail})
 
     return checks
 

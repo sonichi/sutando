@@ -146,7 +146,14 @@ def main():
     allowed = load_allowed()
     pending_replies = {}  # task_id -> chat_id
 
+    heartbeat_file = REPO / "src" / "telegram-bridge.heartbeat"
+    heartbeat_counter = 0
     while True:
+        # Write heartbeat every 6 iterations (~60s with 10s timeout)
+        heartbeat_counter += 1
+        if heartbeat_counter >= 6:
+            heartbeat_file.write_text(str(int(time.time())))
+            heartbeat_counter = 0
         # Poll for new messages
         params = {"timeout": 10, "limit": 10}
         if offset:

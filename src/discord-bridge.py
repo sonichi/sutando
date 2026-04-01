@@ -298,7 +298,14 @@ def save_to_allowlist(sender_id):
 
 async def poll_results():
     """Poll results/ for replies to send back to Discord."""
+    heartbeat_file = REPO / "src" / "discord-bridge.heartbeat"
+    heartbeat_counter = 0
     while True:
+        # Write heartbeat every 60 iterations (~60s)
+        heartbeat_counter += 1
+        if heartbeat_counter >= 60:
+            heartbeat_file.write_text(str(int(time.time())))
+            heartbeat_counter = 0
         for task_id in list(pending_replies.keys()):
             result_file = RESULTS_DIR / f"{task_id}.txt"
             if result_file.exists():
