@@ -89,6 +89,39 @@ def main():
                 print(f"    email: {e}")
             for p in c["phones"]:
                 print(f"    phone: {p}")
+    elif cmd == "add" and len(sys.argv) >= 3:
+        name = sys.argv[2]
+        phone = None
+        email = None
+        i = 3
+        while i < len(sys.argv):
+            if sys.argv[i] == "--phone" and i + 1 < len(sys.argv):
+                phone = sys.argv[i + 1]; i += 2
+            elif sys.argv[i] == "--email" and i + 1 < len(sys.argv):
+                email = sys.argv[i + 1]; i += 2
+            else:
+                i += 1
+        parts = name.split(" ", 1)
+        first = parts[0]
+        last = parts[1] if len(parts) > 1 else ""
+        import time
+        subprocess.run(["open", "-ga", "Contacts"], capture_output=True, timeout=5)
+        time.sleep(1)
+        props = f'first name:"{first}"'
+        if last:
+            props += f', last name:"{last}"'
+        lines = [f'set newPerson to make new person with properties {{{props}}}']
+        if phone:
+            lines.append(f'make new phone at end of phones of newPerson with properties {{label:"mobile", value:"{phone}"}}')
+        if email:
+            lines.append(f'make new email at end of emails of newPerson with properties {{label:"home", value:"{email}"}}')
+        lines.append("save")
+        script = 'tell application "Contacts"\n' + "\n".join(lines) + '\nend tell'
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=15)
+        if result.returncode != 0:
+            print(f"Error: {result.stderr.strip()}")
+            sys.exit(1)
+        print(f"Added {name}" + (f" phone:{phone}" if phone else "") + (f" email:{email}" if email else ""))
     elif cmd == "all":
         results = search_contacts("")
         if not results:
@@ -97,6 +130,7 @@ def main():
         print(json.dumps(results, indent=2))
     else:
         print("Usage: python3 src/contacts.py search 'name'")
+        print("       python3 src/contacts.py add 'Name' --phone 123 --email a@b.com")
         sys.exit(1)
 
 

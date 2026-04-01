@@ -34,12 +34,18 @@ For remote access: use ngrok or SSH tunnel.
 import http.server
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
+
+
+def _safe_id(raw: str) -> str:
+    """Sanitize an ID to prevent path traversal. Only allow alphanumeric, dash, underscore, dot."""
+    return re.sub(r'[^a-zA-Z0-9_\-.]', '', raw)
 
 REPO_DIR = Path(__file__).parent.parent
 TASK_DIR = REPO_DIR / "tasks"
@@ -86,8 +92,11 @@ def get_status() -> dict:
     }
 
 
-def get_task_result(task_id: str) -> dict | None:
+def get_task_result(task_id: str):
     """Check if a task result exists."""
+    task_id = _safe_id(task_id)
+    if not task_id:
+        return None
     result_file = RESULT_DIR / f"{task_id}.txt"
     if result_file.exists():
         return {"task_id": task_id, "status": "completed", "result": result_file.read_text()}
@@ -205,7 +214,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 content = pq_file.read_text()
                 for m in re.finditer(r'## (Q\d+) — (.+?)\n\n(.+?)\n\n\*\*Status:\*\* (\w+)', content, re.DOTALL):
                     if m.group(4) == "Waiting":
-                        questions.append({"id": m.group(1), "text": m.group(2), "detail": m.group(3).strip()[:120]})
+                        questions.append({"id": m.group(1), "text": m.group(2), "detail": m.group(3).strip()})
             self.send_json(200, {"tasks": tasks, "watcher": watcher_ok, "claude": claude_ok, "questions": questions})
         elif path.startswith("/result/"):
             task_id = path[len("/result/"):]
@@ -229,6 +238,46 @@ class Handler(http.server.BaseHTTPRequestHandler):
             si_file = REPO_DIR / "stand-identity.json"
             data = json.loads(si_file.read_text()) if si_file.exists() else {}
             self.send_json(200, data)
+        elif path == "/dynamic-content":
+            dc_file = REPO_DIR / "dynamic-content.json"
+            if dc_file.exists():
+                try:
+                    data = json.loads(dc_file.read_text())
+                    self.send_json(200, data)
+                except Exception:
+                    self.send_json(200, {})
+            else:
+                self.send_json(200, {})
+        elif path.startswith("/media/"):
+            # Serve local files for dynamic region (images, audio, video, docs)
+            import mimetypes
+            rel = path[len("/media/"):]
+            # Reject path traversal attempts before resolving
+            if '..' in rel or rel.startswith('/'):
+                self.send_json(400, {"error": "invalid path"})
+                return
+            # Only allow files under repo dir for security
+            media_path = (REPO_DIR / rel).resolve()
+            if not media_path.is_relative_to(REPO_DIR.resolve()) or not media_path.is_file():
+                self.send_json(404, {"error": "not found"})
+                return
+            mime = mimetypes.guess_type(str(media_path))[0] or "application/octet-stream"
+            # Sanitize mime to prevent header injection
+            mime = mime.split('\n')[0].split('\r')[0]
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "public, max-age=300")
+            self.end_headers()
+            self.wfile.write(media_path.read_bytes())
+        elif path == "/logs/voice":
+            # Return last 30 lines of voice-agent.log for debugging
+            log_file = REPO_DIR / "src" / "voice-agent.log"
+            if log_file.exists():
+                lines = log_file.read_text().splitlines()[-30:]
+                self.send_json(200, {"lines": lines})
+            else:
+                self.send_json(404, {"error": "voice-agent.log not found"})
         elif path == "/":
             # Serve task submission form (works from phone on same Wi-Fi)
             self.send_response(200)
@@ -359,6 +408,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(200, {"ok": True})
             except:
                 self.send_json(400, {"error": "invalid"})
+            return
+
+        if path == "/answer":
+            if not self.check_auth():
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            try:
+                data = json.loads(body)
+                qid = data.get("id", "")
+                answer = data.get("answer", "")
+                if not qid or not answer:
+                    self.send_json(400, {"error": "id and answer required"})
+                    return
+                pq_file = REPO_DIR / "pending-questions.md"
+                if pq_file.exists():
+                    content = pq_file.read_text()
+                    # Update status from Waiting to answered
+                    import re
+                    pattern = rf'(## {re.escape(qid)} — .+?\n\n)(.*?)(\n\n\*\*Status:\*\* )Waiting'
+                    safe_answer = answer.replace('\n', ' ')
+                    new_content = re.sub(pattern, lambda m: m.group(1) + m.group(2) + m.group(3) + 'Answered: ' + safe_answer, content, flags=re.DOTALL)
+                    if new_content != content:
+                        pq_file.write_text(new_content)
+                        # Also write as a task so the agent picks it up
+                        ts = int(datetime.now().timestamp() * 1000)
+                        safe_qid = _safe_id(qid)
+                        task_file = REPO_DIR / f"tasks/answer-{safe_qid}-{ts}.txt"
+                        task_file.write_text(f"User answered {safe_qid}: {answer}")
+                        self.send_json(200, {"ok": True, "id": qid, "answer": answer})
+                    else:
+                        self.send_json(404, {"error": f"question {qid} not found or already answered"})
+                else:
+                    self.send_json(404, {"error": "no pending questions"})
+            except Exception as e:
+                self.send_json(400, {"error": str(e)})
             return
 
         if path != "/task":

@@ -43,12 +43,13 @@ Read relevant memory files when user preferences or history would improve task q
 
 ## Discord access control
 
-When processing Discord tasks (source: discord), check the `user_id` field against the access list in memory (`reference_discord_channels.md`):
-- **Owner**: Full access — any task, system operations, code changes
-- **Team**: Read-only — answer questions, provide status, review PRs. No system mutations (no file writes, no git push, no sending messages on behalf of owner)
-- **Others**: Information only — answer questions about Sutando. No actions.
+Discord tasks include an `access_tier` field set by the bridge:
+- **owner**: Full access — process normally with all capabilities
+- **team**: Delegate to sandboxed agent (`codex exec --sandbox read-only`). No system mutations.
+- **other**: Delegate to sandboxed agent. Information only — answer questions about Sutando.
 
-If a non-owner requests a privileged action, politely decline and explain they need to ask the owner.
+Owner is determined by `allowFrom` in `~/.claude/channels/discord/access.json` (set via `/discord:access`).
+Non-owner tasks MUST be processed via the sandboxed path — never with full core agent capabilities.
 
 ## Pending decisions
 

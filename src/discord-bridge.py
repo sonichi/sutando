@@ -35,6 +35,10 @@ TASKS_DIR.mkdir(exist_ok=True)
 RESULTS_DIR.mkdir(exist_ok=True)
 INBOX_DIR.mkdir(exist_ok=True)
 
+# Dedup: skip duplicate messages (Discord gateway can replay events on reconnect)
+seen_message_ids = set()  # Discord message IDs already processed
+
+
 # Load access config
 ACCESS_FILE = Path.home() / ".claude" / "channels" / "discord" / "access.json"
 def load_allowed():
@@ -98,7 +102,12 @@ async def on_message(message):
     is_dm = isinstance(message.channel, discord.DMChannel)
     channel_name = getattr(message.channel, 'name', 'DM')
 
-    print(f"  [msg] #{channel_name} @{username}: {text[:80]} (mentions: {[str(m) for m in message.mentions]}, is_dm: {is_dm})", flush=True)
+    print(f"  [msg] #{channel_name} @{username}: {text[:80]} (mentions: {[str(m) for m in message.mentions]}, is_dm: {is_dm}, embeds: {len(message.embeds)}, type: {message.type}, ref: {message.reference is not None})", flush=True)
+    # Debug: log message snapshots for forwarded messages
+    if hasattr(message, 'message_snapshots') and message.message_snapshots:
+        print(f"  [debug] message_snapshots: {message.message_snapshots}", flush=True)
+    if message.type != discord.MessageType.default and message.type != discord.MessageType.reply:
+        print(f"  [debug] non-default message type: {message.type}", flush=True)
 
     # In channels, check if mention is required
     if not is_dm:
@@ -138,21 +147,80 @@ async def on_message(message):
         if policy == "allowlist" and sender_id not in allowed:
             return
     else:
-        # Channel access: check channel-specific allowlist, fall back to global
-        if channel_allowed is not None:
-            if sender_id not in channel_allowed:
+        # Channel access control
+        channel_cfg = load_channel_config(str(message.channel.id))
+        if channel_cfg is not None:
+            _, ch_allowed = channel_cfg
+            if ch_allowed is None:
+                pass  # channel set to true — open to all, skip access check
+            elif len(ch_allowed) > 0 and sender_id not in ch_allowed:
                 print(f"  [skip] @{username} not in channel allowlist", flush=True)
                 return
-        elif allowed and sender_id not in allowed:
-            print(f"  [skip] @{username} not in global allowlist", flush=True)
-            return
+            # empty allowFrom with requireMention = anyone who mentions can use
+        else:
+            # Channel not configured — fall back to global allowlist
+            if allowed and sender_id not in allowed:
+                print(f"  [skip] @{username} not in global allowlist", flush=True)
+                return
 
     if policy == "pairing" and sender_id not in allowed:
-        # Auto-pair: save their ID and notify
-        save_to_allowlist(sender_id)
-        await message.channel.send(f"Paired! Your ID `{sender_id}` has been added. Say hi to Sutando.")
-        print(f"  Auto-paired @{username} ({sender_id})")
+        # Generate pairing code — user must approve via /discord:access pair <code>
+        import random, string
+        try:
+            access = json.loads(ACCESS_FILE.read_text())
+        except:
+            access = {"dmPolicy": "pairing", "allowFrom": [], "pending": {}}
+        code = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+        pending = access.get("pending", {})
+        pending[code] = {
+            "senderId": sender_id,
+            "chatId": str(message.channel.id),
+            "createdAt": int(time.time() * 1000),
+            "expiresAt": int(time.time() * 1000) + 3600000,  # 1 hour
+        }
+        access["pending"] = pending
+        ACCESS_FILE.write_text(json.dumps(access, indent=2))
+        await message.channel.send(f"Pairing required. Ask the owner to run:\n`/discord:access pair {code}`")
+        print(f"  Pairing requested: @{username} ({sender_id}) code={code}")
         return
+
+    # Handle forwarded messages (message_snapshots) — Discord's forwarding feature
+    if hasattr(message, 'message_snapshots') and message.message_snapshots:
+        for snapshot in message.message_snapshots:
+            snap_msg = snapshot.message if hasattr(snapshot, 'message') else snapshot
+            parts = []
+            # Extract text content
+            snap_content = getattr(snap_msg, 'content', '') or ''
+            if snap_content:
+                parts.append(snap_content)
+            # Extract snapshot embeds
+            for embed in getattr(snap_msg, 'embeds', []):
+                if embed.title: parts.append(embed.title)
+                if embed.description: parts.append(embed.description)
+            # Extract snapshot attachment names
+            for att in getattr(snap_msg, 'attachments', []):
+                parts.append(f"[Attachment: {att.filename}]")
+            if parts:
+                fwd_text = "\n".join(parts)
+                text = (text + "\n" + fwd_text).strip() if text else fwd_text.strip()
+                print(f"  [forward] extracted: {text[:100]}", flush=True)
+
+    # Handle embeds (link previews, rich content)
+    embed_text = ""
+    for embed in message.embeds:
+        parts = []
+        if embed.author and embed.author.name:
+            parts.append(f"[From {embed.author.name}]")
+        if embed.title:
+            parts.append(embed.title)
+        if embed.description:
+            parts.append(embed.description)
+        for field in embed.fields:
+            parts.append(f"{field.name}: {field.value}")
+        if parts:
+            embed_text += "\n".join(parts) + "\n"
+    if embed_text:
+        text = (text + "\n" + embed_text).strip() if text else embed_text.strip()
 
     # Handle attachments
     attachment_note = ""
@@ -169,6 +237,32 @@ async def on_message(message):
 
     print(f"  @{username}: {text}{attachment_note}")
 
+    # Determine access tier
+    access_tier = "other"
+    if sender_id in allowed:
+        access_tier = "owner"
+    else:
+        # Check if team member (from channel allowlists)
+        try:
+            data = json.loads(ACCESS_FILE.read_text())
+            team_ids = set()
+            for ch_cfg in data.get("groups", {}).values():
+                if isinstance(ch_cfg, dict):
+                    team_ids.update(ch_cfg.get("allowFrom", []))
+            if sender_id in team_ids:
+                access_tier = "team"
+        except:
+            pass
+
+    # Dedup: skip if we've already processed this Discord message ID
+    if message.id in seen_message_ids:
+        print(f"  [dedup] skipping already-processed message {message.id} from @{username}")
+        return
+    seen_message_ids.add(message.id)
+    # Cap set size to prevent unbounded growth
+    if len(seen_message_ids) > 10000:
+        seen_message_ids.clear()
+
     # Write as task
     ts = int(time.time() * 1000)
     task_id = f"task-{ts}"
@@ -176,10 +270,11 @@ async def on_message(message):
     task_file.write_text(
         f"id: {task_id}\n"
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S')}Z\n"
-        f"task: [Discord @{username}] {text}{attachment_note}\n"
+        f"task: [Discord @{username}] {msg_text}\n"
         f"source: discord\n"
         f"channel_id: {message.channel.id}\n"
         f"user_id: {message.author.id}\n"
+        f"access_tier: {access_tier}\n"
     )
     pending_replies[task_id] = message.channel
 

@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
 """
-Image generation and editing using Gemini's native image generation.
+Media generation using Gemini APIs.
 
 Supports:
-- Text-to-image: generate from a text prompt
+- Text-to-image: generate from a text prompt (Gemini Flash Image)
 - Image editing: modify an existing image with a text prompt
-- Multiple input images for compositing/reference
+- Text-to-video: generate video from a text prompt (Veo)
+- Image-to-video: generate video from reference image + prompt
 
 Usage:
   python3 generate.py --prompt "A sunset over mountains"
-  python3 generate.py --input photo.jpg --prompt "Replace the background with a beach"
-  python3 generate.py --input bg.jpg --prompt "Add title 'Hello' in large white text" --output hero.png
+  python3 generate.py --input photo.jpg --prompt "Replace the background"
+  python3 generate.py --video --prompt "A timelapse of a city" --output city.mp4
+  python3 generate.py --video --input ref.jpg --prompt "Animate this scene"
 """
 
 import argparse
-import base64
 import os
 import sys
 import time
 from pathlib import Path
+
 
 def load_env():
     """Load GEMINI_API_KEY from .env files."""
@@ -33,41 +35,13 @@ def load_env():
                     key, val = line.split("=", 1)
                     os.environ.setdefault(key.strip(), val.strip())
 
-def main():
-    parser = argparse.ArgumentParser(description="Generate or edit images using Gemini")
-    parser.add_argument("--prompt", "-p", required=True, help="Text prompt")
-    parser.add_argument("--input", "-i", action="append", default=[], help="Input image path(s) for editing (can specify multiple)")
-    parser.add_argument("--output", "-o", default=None, help="Output file path (default: generated-{timestamp}.png)")
-    parser.add_argument("--model", "-m", default="gemini-2.5-flash-image",
-                        help="Gemini model (default: gemini-2.5-flash-image)")
-    parser.add_argument("--quality", "-q", type=int, default=90, help="JPEG quality 1-100 (default: 90)")
-    args = parser.parse_args()
 
-    load_env()
+def generate_image(client, args):
+    """Generate or edit an image."""
+    from google.genai import types
+    from PIL import Image
+    import io
 
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        print("Error: GEMINI_API_KEY not set. Add it to .env or export it.", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        from google import genai
-        from google.genai import types
-    except ImportError:
-        print("Error: google-genai not installed. Run: pip3 install google-genai", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        from PIL import Image
-        import io
-    except ImportError:
-        print("Error: Pillow not installed. Run: pip3 install Pillow", file=sys.stderr)
-        sys.exit(1)
-
-    # Initialize client
-    client = genai.Client(api_key=api_key)
-
-    # Build contents: images first, then prompt
     contents = []
 
     for img_path in args.input:
@@ -77,8 +51,6 @@ def main():
             sys.exit(1)
 
         img = Image.open(img_path)
-
-        # Resize if too large (Gemini has limits)
         max_dim = 4096
         if max(img.size) > max_dim:
             ratio = max_dim / max(img.size)
@@ -91,7 +63,6 @@ def main():
 
     contents.append(args.prompt)
 
-    # Determine output path
     if args.output:
         out_path = Path(args.output)
     else:
@@ -100,7 +71,6 @@ def main():
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Determine output format
     ext = out_path.suffix.lower()
     if ext in (".jpg", ".jpeg"):
         out_format = "JPEG"
@@ -109,13 +79,14 @@ def main():
     else:
         out_format = "PNG"
 
-    print(f"  Model: {args.model}", file=sys.stderr)
+    model = args.model or "gemini-2.5-flash-image"
+    print(f"  Model: {model}", file=sys.stderr)
     print(f"  Prompt: {args.prompt[:100]}{'...' if len(args.prompt) > 100 else ''}", file=sys.stderr)
-    print(f"  Generating...", file=sys.stderr)
+    print(f"  Generating image...", file=sys.stderr)
 
     try:
         response = client.models.generate_content(
-            model=args.model,
+            model=model,
             contents=contents,
             config=types.GenerateContentConfig(
                 response_modalities=["IMAGE", "TEXT"],
@@ -125,14 +96,12 @@ def main():
         print(f"Error: Gemini API call failed: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Extract image from response
     image_saved = False
     text_response = ""
 
     if response.candidates:
         for part in response.candidates[0].content.parts:
             if part.inline_data and part.inline_data.mime_type.startswith("image/"):
-                # Decode and save
                 img_data = part.inline_data.data
                 img = Image.open(io.BytesIO(img_data))
 
@@ -158,8 +127,131 @@ def main():
     if text_response:
         print(f"  Note: {text_response.strip()}", file=sys.stderr)
 
-    # Print the output path to stdout (for piping)
     print(str(out_path.resolve()))
+
+
+def generate_video(client, args):
+    """Generate a video using Veo."""
+    from google.genai import types
+    from PIL import Image
+    import io
+
+    if args.output:
+        out_path = Path(args.output)
+    else:
+        ts = int(time.time() * 1000)
+        out_path = Path(f"generated-{ts}.mp4")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    model = args.model or "veo-3.1-generate-preview"
+    aspect = args.aspect or "16:9"
+
+    print(f"  Model: {model}", file=sys.stderr)
+    print(f"  Prompt: {args.prompt[:100]}{'...' if len(args.prompt) > 100 else ''}", file=sys.stderr)
+    print(f"  Aspect: {aspect}", file=sys.stderr)
+
+    # Build config
+    config = types.GenerateVideosConfig(
+        aspect_ratio=aspect,
+    )
+
+    # If input image provided, use as reference
+    image = None
+    if args.input:
+        img_path = os.path.expanduser(args.input[0])
+        if not os.path.isfile(img_path):
+            print(f"Error: Input image not found: {img_path}", file=sys.stderr)
+            sys.exit(1)
+        img = Image.open(img_path)
+        print(f"  Reference image: {img_path} ({img.size[0]}x{img.size[1]})", file=sys.stderr)
+        # Convert to bytes for the API
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        image = types.Image(image_bytes=buf.getvalue(), mime_type="image/png")
+
+    print(f"  Generating video (this may take 1-3 minutes)...", file=sys.stderr)
+
+    try:
+        if image:
+            operation = client.models.generate_videos(
+                model=model,
+                prompt=args.prompt,
+                image=image,
+                config=config,
+            )
+        else:
+            operation = client.models.generate_videos(
+                model=model,
+                prompt=args.prompt,
+                config=config,
+            )
+    except Exception as e:
+        print(f"Error: Veo API call failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Poll for completion
+    elapsed = 0
+    while not operation.done:
+        time.sleep(10)
+        elapsed += 10
+        print(f"  Waiting... ({elapsed}s)", file=sys.stderr)
+        try:
+            operation = client.operations.get(operation)
+        except Exception as e:
+            print(f"Error polling: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    # Download result
+    try:
+        generated_video = operation.response.generated_videos[0]
+        client.files.download(file=generated_video.video)
+        generated_video.video.save(str(out_path))
+        print(f"  Saved: {out_path}", file=sys.stderr)
+    except Exception as e:
+        print(f"Error downloading video: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(str(out_path.resolve()))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate images or videos using Gemini")
+    parser.add_argument("--prompt", "-p", required=True, help="Text prompt")
+    parser.add_argument("--input", "-i", action="append", default=[], help="Input image path(s)")
+    parser.add_argument("--output", "-o", default=None, help="Output file path")
+    parser.add_argument("--model", "-m", default=None,
+                        help="Model (default: gemini-2.5-flash-image for images, veo-3.1-generate-preview for video)")
+    parser.add_argument("--quality", "-q", type=int, default=90, help="JPEG quality 1-100 (default: 90)")
+    parser.add_argument("--video", "-v", action="store_true", help="Generate video instead of image")
+    parser.add_argument("--aspect", default=None, help="Video aspect ratio: 16:9 (default) or 9:16")
+
+    args = parser.parse_args()
+
+    load_env()
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        print("Error: GEMINI_API_KEY not set. Add it to .env or export it.", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        from google import genai
+    except ImportError:
+        print("Error: google-genai not installed. Run: pip3 install google-genai", file=sys.stderr)
+        sys.exit(1)
+
+    client = genai.Client(api_key=api_key)
+
+    if args.video:
+        generate_video(client, args)
+    else:
+        try:
+            from PIL import Image
+        except ImportError:
+            print("Error: Pillow not installed. Run: pip3 install Pillow", file=sys.stderr)
+            sys.exit(1)
+        generate_image(client, args)
 
 
 if __name__ == "__main__":

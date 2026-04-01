@@ -2,7 +2,9 @@
 
 [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/uZHWXXmrCS) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Website](https://img.shields.io/badge/Web-sutando.ai-blue)](https://sutando.ai)
 
-**A personal AI you talk to in real time — shares your screen, joins your meetings, makes phone calls, and builds itself.**
+**Summon your AI superpower — voice, vision, and autonomous action.**
+
+It shares your screen, joins your meetings, makes phone calls, and builds itself.
 
 It belongs entirely to you.
 
@@ -76,10 +78,9 @@ They communicate through files: voice agent writes tasks, the core agent execute
 - [Google AI Studio API key](https://ai.google.dev) (free — click "Get API key")
 
 ```bash
-# Clone and install
+# Clone
 git clone https://github.com/sonichi/sutando.git
 cd sutando
-npm install
 
 # Configure (minimum: GEMINI_API_KEY is required)
 cp .env.example .env
@@ -207,6 +208,22 @@ Now select any text and press your shortcut — Sutando reads it and acts on it.
 - Notifies you on Discord and voice when it completes autonomous work
 
 It consumes API quota proportional to how much work it finds to do.
+
+---
+
+## Security
+
+🚨 Sutando has deep access to your computer — file system, screen, keyboard, browser, email, and phone. Understand the risks before deploying.
+
+**Built-in protections:**
+- **STIR/SHAKEN verification** — inbound calls are checked for carrier-level caller ID attestation. Spoofed numbers are automatically downgraded and denied owner access.
+- **3-tier access control** — owner, verified, and unverified callers get different levels of access on phone, Discord, and Telegram.
+
+**Recommended setup:**
+- Keep your Twilio phone number private
+- Set `VERIFIED_CALLERS` explicitly in `.env` (don't leave it empty)
+
+See **[SECURITY.md](SECURITY.md)** for full details, best practices, and how to test your setup.
 
 ---
 

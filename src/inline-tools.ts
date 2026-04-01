@@ -95,7 +95,8 @@ export const openUrlTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { url } = args as { url: string };
-		const safeUrl = url.replace(/'/g, "'\\''").replace(/"/g, '\\"');
+		// Escape backslashes first, then quotes — prevents shell injection via osascript
+		const safeUrl = url.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
 		try {
 			execSync(`osascript -e 'tell application "Google Chrome" to tell front window to make new tab with properties {URL:"${safeUrl}"}'`, { timeout: 5_000 });
 			console.log(`${ts()} [OpenURL] opened: ${url}`);
@@ -131,8 +132,9 @@ export const switchAppTool: ToolDefinition = {
 	async execute(args) {
 		let { app } = args as { app: string };
 		app = APP_ALIASES[app.toLowerCase()] ?? app;
-		const safeApp = app.replace(/'/g, "'\\''").replace(/"/g, '\\"');
-		const processName = (PROCESS_NAMES[app] ?? app).replace(/'/g, "'\\''").replace(/"/g, '\\"');
+		// Escape backslashes first, then quotes — prevents shell injection via osascript
+		const safeApp = app.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
+		const processName = (PROCESS_NAMES[app] ?? app).replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
 		try {
 			execSync(`osascript -e 'tell application "${safeApp}" to activate' -e 'tell application "System Events" to set frontmost of process "${processName}" to true'`, { timeout: 10_000 });
 			console.log(`${ts()} [SwitchApp] activated: ${app}`);
@@ -208,10 +210,11 @@ export const volumeTool: ToolDefinition = {
 				return { status: 'unmuted' };
 			}
 			if (level !== undefined) {
-				const osxLevel = Math.round(level / 100 * 7); // macOS volume is 0-7
-				execSync(`osascript -e 'set volume output volume ${level}'`, { timeout: 5_000 });
-				console.log(`${ts()} [Volume] set to ${level}%`);
-				return { status: 'set', level };
+				// Gemini sometimes passes 0-1 instead of 0-100 — normalize
+				const normalizedLevel = level <= 1 && level > 0 ? Math.round(level * 100) : Math.round(level);
+				execSync(`osascript -e 'set volume output volume ${normalizedLevel}'`, { timeout: 5_000 });
+				console.log(`${ts()} [Volume] set to ${normalizedLevel}%`);
+				return { status: 'set', level: normalizedLevel };
 			}
 			return { error: 'Specify level (0-100) or mute (true/false)' };
 		} catch (err) {
@@ -229,7 +232,9 @@ export const brightnessTool: ToolDefinition = {
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { level } = args as { level: number };
+		let { level } = args as { level: number };
+		// Gemini sometimes passes 0-1 instead of 0-100 — normalize
+		if (level <= 1 && level > 0) level = Math.round(level * 100);
 		const bLevel = (level / 100).toFixed(2);
 		try {
 			execSync(`osascript -e 'tell application "System Events" to tell appearance preferences to set dark mode to false'`, { timeout: 1_000 }).toString();
@@ -948,11 +953,140 @@ if result.stdout.strip():
 	},
 };
 
+// --- Meeting ID lookup (inline, bypasses task bridge) ---
+
+export const lookupMeetingIdTool: ToolDefinition = {
+	name: 'lookup_meeting_id',
+	description:
+		'Look up the Zoom personal meeting ID from the environment. Instant — does NOT go through the task bridge. ' +
+		'Use for: "what\'s the Zoom meeting ID", "find the meeting ID", "get the Zoom ID".',
+	parameters: z.object({}),
+	execution: 'inline',
+	async execute() {
+		const meetingId = process.env.ZOOM_PERSONAL_MEETING_ID;
+		if (!meetingId) {
+			return { error: 'No ZOOM_PERSONAL_MEETING_ID found in environment.' };
+		}
+		const passcode = process.env.ZOOM_PERSONAL_PASSCODE || process.env.ZOOM_PASSCODE || null;
+		console.log(`${ts()} [LookupMeetingId] found: ${meetingId}${passcode ? ' (with passcode)' : ''}`);
+		return { meetingId, passcode, source: 'ZOOM_PERSONAL_MEETING_ID from .env', instruction: passcode ? `Meeting ID: ${meetingId}, Passcode: ${passcode}. Include BOTH when telling someone to join.` : `Meeting ID: ${meetingId}. No passcode needed.` };
+	},
+};
+
+// --- Contact lookup + phone call (inline, bypasses task bridge) ---
+
+export const callContactTool: ToolDefinition = {
+	name: 'call_contact',
+	description:
+		'Look up a phone number and call a contact. Searches macOS Contacts by name. Instant. ' +
+		'Use for ANY contact lookup or phone call — "find Bob\'s number", "call Mary", "look up Susan\'s phone".',
+	parameters: z.object({
+		name: z.string().describe('Contact name to search for (e.g. "Bob", "Mary Smith")'),
+		message: z.string().optional().describe('What to tell the person. They have no tools — include all details they might need.'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { name, message } = args as { name: string; message?: string };
+		try {
+			// Ensure Contacts.app is running
+			execSync('open -ga Contacts', { timeout: 5_000 });
+
+			// Search contacts via AppleScript — use first name for fuzzy matching
+			// (voice transcription often garbles last names, e.g. "Gmeets" vs "GMeet")
+			const firstName = name.split(/\s+/)[0];
+			const safeName = firstName.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+			const script = `tell application "Contacts"
+	set output to ""
+	set results to (every person whose name contains "${safeName}")
+	if (count of results) > 10 then set results to items 1 thru 10 of results
+	repeat with p in results
+		set pName to name of p
+		set pPhones to ""
+		repeat with ph in phones of p
+			set pPhones to pPhones & (value of ph) & ","
+		end repeat
+		set output to output & pName & "|||" & pPhones & "\\n"
+	end repeat
+	return output
+end tell`;
+			const raw = execSync(`osascript -e '${script.replace(/'/g, "'\\''")}'`, { timeout: 15_000 }).toString().trim();
+
+			// Parse results
+			const contacts: { name: string; phones: string[] }[] = [];
+			for (const line of raw.split('\n')) {
+				const trimmed = line.trim();
+				if (!trimmed) continue;
+				const parts = trimmed.split('|||');
+				if (parts.length < 2) continue;
+				const cName = parts[0].trim();
+				const phones = parts[1].split(',').map(p => p.trim()).filter(Boolean);
+				if (phones.length > 0) contacts.push({ name: cName, phones });
+			}
+
+			if (contacts.length === 0) {
+				console.log(`${ts()} [CallContact] no contacts with phone found for "${name}"`);
+				return { error: `No contacts with a phone number found for "${name}". Ask the user for the number or a different name.` };
+			}
+
+			if (contacts.length > 1) {
+				console.log(`${ts()} [CallContact] multiple matches for "${name}": ${contacts.map(c => c.name).join(', ')}`);
+				return {
+					status: 'multiple_matches',
+					matches: contacts.map(c => ({ name: c.name, phones: c.phones })),
+					instruction: 'Multiple contacts found. Ask the user which one to call.',
+				};
+			}
+
+			// Single match — look up and call
+			const contact = contacts[0];
+			const phone = contact.phones[0];
+
+			const purpose = message || `Calling ${contact.name}`;
+
+			console.log(`${ts()} [CallContact] calling ${contact.name}`);
+			const res = await fetch(`http://localhost:${PHONE_PORT}/call`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ to: phone, message: purpose }),
+			});
+			const data = await res.json() as { callSid?: string; status?: string; error?: string };
+
+			if (!res.ok) {
+				return { error: `Phone server error: ${data.error || res.statusText}` };
+			}
+
+			console.log(`${ts()} [CallContact] call started: ${data.callSid}, purpose: ${purpose}`);
+			return { status: 'calling', contact: contact.name, callSid: data.callSid, messageSent: purpose };
+		} catch (err) {
+			return { error: `call_contact failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
 /** All inline tools — import and spread into your tools list */
 export const inlineTools = [
 	scrollTool, switchTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
 	volumeTool, brightnessTool, clipboardTool,
 	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, summonTool,
-	joinZoomTool, joinGmeetTool,
+	joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool,
+];
+
+/** Tools available to any caller (including unverified) */
+export const anyCallerTools = [
+	getCurrentTimeTool,
+];
+
+/** Owner-only tools (require isOwner) */
+export const ownerOnlyTools = [
+	volumeTool, brightnessTool,
+	scrollTool, switchTabTool, openUrlTool,
+	switchAppTool, captureScreenTool, typeTextTool,
+	clipboardTool, cancelTaskTool, toggleTasksTool, summonTool,
+	joinZoomTool, joinGmeetTool, callContactTool,
+];
+
+/** Configurable tools — default to owner-only, can be opened to verified callers */
+export const configurableTools = [
+	lookupMeetingIdTool,
 ];

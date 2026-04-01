@@ -1,14 +1,28 @@
 #!/bin/bash
-# Watch for new tasks and output a reminder to process ALL files.
+# Watch for new task files in tasks/ directory.
 # Usage: bash src/watch-tasks.sh (run_in_background: true)
 #
-# When fswatch detects a change, outputs a reminder message that
-# the cron loop will read, ensuring ALL task files get processed.
+# Uses fswatch -1 to detect one new file, then exits.
+# The caller processes tasks and restarts.
 
 TASKS_DIR="${1:-$(dirname "$0")/../tasks}"
 
-fswatch -1 "$TASKS_DIR" >/dev/null 2>&1
-
-# Output reminder — this is what the cron loop reads
-echo "TASK_DETECTED: Process ALL .txt files in tasks/ before restarting the watcher. Do not process only one."
-ls "$TASKS_DIR"/*.txt 2>/dev/null || true
+# Wait for a new .txt file — loop until one actually appears
+while true; do
+  # Check for existing files BEFORE waiting (catches files written during restarts)
+  if ls "$TASKS_DIR"/*.txt >/dev/null 2>&1; then
+    echo "TASK_DETECTED: Process ALL .txt files in tasks/."
+    for f in "$TASKS_DIR"/*.txt; do echo "--- $(basename "$f") ---"; cat "$f"; done
+    break
+  fi
+  # Wait for next filesystem event
+  CHANGED=$(fswatch -1 -l 1 "$TASKS_DIR" 2>/dev/null)
+  echo "fswatch triggered: $CHANGED"
+  # Check again after event
+  if ls "$TASKS_DIR"/*.txt >/dev/null 2>&1; then
+    echo "TASK_DETECTED: Process ALL .txt files in tasks/."
+    for f in "$TASKS_DIR"/*.txt; do echo "--- $(basename "$f") ---"; cat "$f"; done
+    break
+  fi
+  # False trigger — keep watching
+done
