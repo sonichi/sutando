@@ -308,15 +308,36 @@ export const scrollAndDescribeTool: ToolDefinition = {
 	},
 };
 
-// --- Recording narration controller ---
-// Called by conversation-server when scroll_and_describe starts.
-// Pushes screen descriptions to Gemini at viewport-synced intervals.
+// --- Recording state + narration controller ---
 
-export function startRecordingNarration(
-	session: any,
-	onMute: () => void,
-	onUnmute: () => void,
-): void {
+/** Shared mute state — conversation-server checks this in audio output handler */
+export const recordingState = { muted: false };
+
+/** Stop any active screen recording */
+export function stopActiveRecording(): void {
+	try { execSync('python3 skills/screen-record/scripts/record.py stop', { timeout: 5_000 }); } catch {}
+}
+
+/** Check if a recording is currently active */
+export function isRecordingActive(): boolean {
+	return existsSync('/tmp/sutando-screen-record.pid');
+}
+
+/** Nudge Gemini to continue narrating after a reconnect */
+export function nudgeReconnect(session: any): void {
+	try {
+		session.transport.sendContent([
+			{ role: 'user', text: '[System: You were narrating a screen demo. Continue where you left off — call describe_screen and keep narrating. Do NOT greet or say "I\'m back".]' },
+		], true);
+	} catch {}
+}
+
+/**
+ * Start narration controller for an active recording.
+ * Called by conversation-server when scroll_and_describe starts.
+ * Handles: description pushing, stop detection, mute/unmute, reconnect narration.
+ */
+export function startRecordingNarration(session: any): void {
 	// Read scroll info for description interval
 	let descIntervalMs = 8000;
 	try {
@@ -359,7 +380,7 @@ export function startRecordingNarration(
 		if (!existsSync('/tmp/sutando-screen-record.pid')) {
 			clearInterval(stopPoll);
 			clearInterval(descTimer);
-			onMute();
+			recordingState.muted = true;
 			console.log(`${ts()} [Recording] ended — muted`);
 			try {
 				session.transport.sendContent([
@@ -367,7 +388,7 @@ export function startRecordingNarration(
 				], true);
 			} catch {}
 			setTimeout(() => {
-				onUnmute();
+				recordingState.muted = false;
 				console.log(`${ts()} [Recording] unmuted after 3s`);
 			}, 3000);
 		}

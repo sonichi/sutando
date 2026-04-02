@@ -609,10 +609,10 @@ async function createCallSession(params: {
 	// Bypasses ClientTransport's internal WebSocket for lower latency
 	const sessionAny = session as any;
 	let isReplaying = false; // suppress audio during reconnect replay
-	let isDemoMuted = false; // suppress buffered narration after recording stops
 	sessionAny.handleAudioOutput = (data: string) => {
 		sessionAny.notificationQueue?.markAudioReceived?.();
-		if (isReplaying || isDemoMuted) return;
+		const { recordingState } = require('../../../src/browser-tools.js');
+		if (isReplaying || recordingState?.muted) return;
 		if (params.twilioWs.readyState === WebSocket.OPEN) {
 			const pcmBuf = Buffer.from(data, 'base64');
 			const mulawBuf = pcm24kToMulaw8k(pcmBuf);
@@ -632,14 +632,8 @@ async function createCallSession(params: {
 	session.eventBus?.subscribe?.('tool.call', (e: any) => {
 		if (e?.toolName === 'scroll_and_describe') {
 			setTimeout(async () => {
-				if (existsSync('/tmp/sutando-screen-record.pid')) {
-					const { startRecordingNarration } = await import('../../../src/browser-tools.js');
-					startRecordingNarration(
-						session,
-						() => { isDemoMuted = true; },
-						() => { isDemoMuted = false; },
-					);
-				}
+				const bt = await import('../../../src/browser-tools.js');
+				if (bt.isRecordingActive()) bt.startRecordingNarration(session);
 			}, 4000);
 		}
 	});
@@ -715,14 +709,11 @@ async function createCallSession(params: {
 					sessionAny.handleClientConnected();
 					setTimeout(() => {
 						isReplaying = false;
-						// If recording is active, tell Gemini to continue narrating (not greet)
-						if (existsSync('/tmp/sutando-screen-record.pid')) {
-							try {
-								(session as any).transport.sendContent([
-									{ role: 'user', text: '[System: You were narrating a screen demo. Continue where you left off — call describe_screen and keep narrating. Do NOT greet or say "I\'m back".]' },
-								], true);
-							} catch {}
-						}
+						// If recording is active, nudge Gemini to continue narrating
+						try {
+							const { isRecordingActive, nudgeReconnect } = require('../../../src/browser-tools.js');
+							if (isRecordingActive()) nudgeReconnect(session);
+						} catch {}
 					}, 6000);
 				}
 			}, 1500);
@@ -743,7 +734,7 @@ function cleanupCall(callSid: string): void {
 	if (session.meetingId) pendingMeetingJoins.delete(session.meetingId);
 
 	// Stop any active screen recording when call ends
-	try { execSync('python3 skills/screen-record/scripts/record.py stop', { timeout: 5_000 }); } catch {}
+	try { require('../../../src/browser-tools.js').stopActiveRecording(); } catch {}
 
 	// Close VoiceSession
 	session.voiceSession.close('call_ended').catch(e =>
