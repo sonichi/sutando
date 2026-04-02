@@ -1123,19 +1123,14 @@ export const slideControlTool: ToolDefinition = {
 			const dispatch = `execute javascript "document.dispatchEvent(new KeyboardEvent(\\"keydown\\",{key:\\"${key}\\"}))"`;
 			let script: string;
 			if (action === 'goto' && slideNumber) {
-				// Go left 10 times (to slide 1), then right (slideNumber-1) times, with delays
-				const leftPresses = Array(10).fill(`tell theTab to execute javascript "document.dispatchEvent(new KeyboardEvent(\\"keydown\\",{key:\\"ArrowLeft\\"}))"
-						delay 0.15`).join('\n						');
-				const rightPresses = Array(Math.max(0, slideNumber - 1)).fill(`tell theTab to execute javascript "document.dispatchEvent(new KeyboardEvent(\\"keydown\\",{key:\\"ArrowRight\\"}))"
-						delay 0.15`).join('\n						');
+				// Direct DOM manipulation — instant, no wrapping issues
+				const js = `document.querySelectorAll(\\".slide\\").forEach(s=>s.classList.remove(\\"active\\")); document.getElementById(\\"s${slideNumber}\\").classList.add(\\"active\\"); document.getElementById(\\"cur\\").textContent=\\"${slideNumber}\\"`;
 				script = `tell application "Google Chrome"
 	repeat with w in windows
 		set tabList to tabs of w
 		repeat with i from 1 to count of tabList
 			if URL of item i of tabList contains "index-sutando" or URL of item i of tabList contains "localhost:8888" then
-				set theTab to item i of tabList
-				${leftPresses}
-				${rightPresses}
+				tell item i of tabList to execute javascript "${js}"
 				return "done"
 			end if
 		end repeat
@@ -1163,6 +1158,41 @@ end tell`;
 	},
 };
 
+// Toggle fullscreen on the presentation slides
+export const fullscreenTool: ToolDefinition = {
+	name: 'fullscreen',
+	description:
+		'Toggle fullscreen mode on the presentation slides. Use when user says "fullscreen", "enter fullscreen", "exit fullscreen", "make it full screen".',
+	parameters: z.object({}),
+	execution: 'inline',
+	async execute() {
+		try {
+			execSync(`osascript -e '
+tell application "Google Chrome"
+	activate
+	repeat with w in windows
+		set tabList to tabs of w
+		repeat with i from 1 to count of tabList
+			if URL of item i of tabList contains "index-sutando" or URL of item i of tabList contains "index-bodhi" or URL of item i of tabList contains "localhost:8888" then
+				set active tab index of w to i
+				set index of w to 1
+				exit repeat
+			end if
+		end repeat
+	end repeat
+end tell
+delay 0.3
+tell application "System Events"
+	keystroke "f"
+end tell'`, { timeout: 5_000 });
+			console.log(`${ts()} [Fullscreen] Toggled`);
+			return { status: 'toggled' };
+		} catch (err) {
+			return { error: `Fullscreen toggle failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
 /** All inline tools — import and spread into your tools list */
 export const inlineTools = [
 	scrollTool, switchTabTool, openUrlTool,
@@ -1170,7 +1200,7 @@ export const inlineTools = [
 	volumeTool, brightnessTool, clipboardTool,
 	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, summonTool, dismissTool,
 	joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool,
-	slideControlTool, ];
+	slideControlTool, fullscreenTool, ];
 
 /** Tools available to any caller (including unverified) */
 export const anyCallerTools = [
@@ -1183,7 +1213,7 @@ export const ownerOnlyTools = [
 	scrollTool, switchTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
 	clipboardTool, cancelTaskTool, toggleTasksTool, summonTool, dismissTool,
-	joinZoomTool, joinGmeetTool, callContactTool, slideControlTool,
+	joinZoomTool, joinGmeetTool, callContactTool, slideControlTool, fullscreenTool,
 ];
 
 /** Configurable tools — default to owner-only, can be opened to verified callers */
