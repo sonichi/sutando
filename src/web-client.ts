@@ -351,7 +351,7 @@ window.addEventListener('DOMContentLoaded', () => {
   setInterval(async () => {
     try {
       const apiPort = 7843;
-      const res = await fetch(`http://${location.hostname}:${apiPort}/voice/state`);
+      const res = await fetch('http://' + location.hostname + ':' + apiPort + '/voice/state');
       if (res.ok) {
         const { state } = await res.json();
         const shouldBeConnected = state === 'connected';
