@@ -90,7 +90,7 @@ cp .env.example .env
 bash src/startup.sh
 ```
 
-This starts all services (voice agent, web client, dashboard, API, Sutando menu bar app) and opens http://localhost:8080 in your browser. The autonomous loop starts automatically — click **Connect** and start talking. Look for the Sutando avatar in your menu bar for shortcuts (⌃C context drop, ⌃V voice toggle, ⌃M mute).
+This starts all services (voice agent, web client, dashboard, API, Sutando menu bar app) and opens http://localhost:8080 in your browser. The autonomous loop starts automatically — click **Connect** and start talking. Look for **S** in your menu bar for shortcuts (⌃C context drop, ⌃V voice toggle, ⌃M mute).
 
 > **Note:** `startup.sh` runs Claude Code with `--dangerously-skip-permissions`, giving Sutando full system access (file operations, terminal commands, browser control). This is required for autonomous operation but means you should review what it does. All actions are logged. Keep the terminal window accessible — you may need to respond there when Claude Code runs out of quota or prompts for input (e.g., CLI commands, permission confirmations).
 
