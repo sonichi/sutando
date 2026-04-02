@@ -43,3 +43,4 @@ tests/security/*.md
 skills/schedule-crons/crons.json
 src/Sutando/Sutando
 voice-context.txt
+tab-aliases.json

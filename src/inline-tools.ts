@@ -88,15 +88,17 @@ end tell'`, { timeout: 5_000 });
 };
 
 // Tab keyword aliases — map common names to URL patterns
-const TAB_ALIASES: Record<string, string> = {
-	'github': 'github.com', 'repo': 'github.com', 'github repo': 'github.com',
-	'gmail': 'mail.google.com', 'email': 'mail.google.com', 'inbox': 'mail.google.com',
-	'calendar': 'calendar.google.com', 'gcal': 'calendar.google.com',
-	'twitter': 'x.com', 'x': 'x.com',
-	'dashboard': 'localhost:7844', 'sutando': 'localhost:8080', 'web client': 'localhost:8080', 'voice': 'localhost:8080',
-	'slides': 'localhost:8888', 'presentation': 'localhost:8888', 'deck': 'localhost:8888',
-	'gemini': 'gemini.google.com',
-};
+// Load tab aliases from config file (falls back to minimal defaults)
+const TAB_ALIASES: Record<string, string> = (() => {
+	const defaults: Record<string, string> = {
+		'github': 'github.com', 'gmail': 'mail.google.com', 'email': 'mail.google.com',
+		'calendar': 'calendar.google.com', 'dashboard': 'localhost:7844',
+		'sutando': 'localhost:8080', 'twitter': 'x.com', 'x': 'x.com',
+	};
+	try {
+		return { ...defaults, ...JSON.parse(readFileSync('tab-aliases.json', 'utf-8')) };
+	} catch { return defaults; }
+})();
 
 export const switchTabTool: ToolDefinition = {
 	name: 'switch_tab',
