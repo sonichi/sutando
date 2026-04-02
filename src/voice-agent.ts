@@ -18,7 +18,8 @@
  *   HOST                — Bind address (default: 0.0.0.0)
  */
 
-import 'dotenv/config';
+import { config } from 'dotenv';
+config({ override: true });
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync } from 'node:fs';
