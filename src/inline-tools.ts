@@ -13,6 +13,53 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
+// Re-export recording/screen tools from browser-tools (tools unique to that module)
+export { describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool } from './browser-tools.js';
+import { describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool } from './browser-tools.js';
+
+// --- Keyboard tool ---
+
+export const pressKeyTool: ToolDefinition = {
+	name: 'press_key',
+	description:
+		'Press a keyboard key or shortcut in the frontmost app. Use for: "press enter", "press escape", ' +
+		'"press tab", "send the message" (Enter), "close the dialog" (Escape), "select all" (Cmd+A), ' +
+		'"clear the input" (Cmd+A then Delete). Instant — do NOT use work for simple keystrokes.',
+	parameters: z.object({
+		key: z.string().describe('Key to press: enter, escape, tab, delete, space, up, down, left, right, or a letter'),
+		modifiers: z.array(z.enum(['command', 'shift', 'control', 'option'])).optional().describe('Modifier keys'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { key, modifiers = [] } = args as { key: string; modifiers?: string[] };
+		const keyMap: Record<string, number> = {
+			'enter': 36, 'return': 36, 'escape': 53, 'esc': 53, 'tab': 48,
+			'delete': 51, 'backspace': 51, 'space': 49,
+			'up': 126, 'down': 125, 'left': 123, 'right': 124,
+			'a': 0, 'c': 8, 'v': 9, 'x': 7, 'z': 6, 'f': 3, 's': 1, 'w': 13, 'q': 12,
+		};
+		const keyCode = keyMap[key.toLowerCase()];
+		if (keyCode === undefined) {
+			// Use keystroke for unknown keys
+			const modStr = modifiers.length ? ` using {${modifiers.map(m => m + ' down').join(', ')}}` : '';
+			try {
+				execSync(`osascript -e 'tell application "System Events" to keystroke "${key}"${modStr}'`, { timeout: 3_000 });
+			} catch (err) {
+				return { error: `press_key failed: ${err instanceof Error ? err.message : err}` };
+			}
+		} else {
+			const modStr = modifiers.length ? ` using {${modifiers.map(m => m + ' down').join(', ')}}` : '';
+			try {
+				execSync(`osascript -e 'tell application "System Events" to key code ${keyCode}${modStr}'`, { timeout: 3_000 });
+			} catch (err) {
+				return { error: `press_key failed: ${err instanceof Error ? err.message : err}` };
+			}
+		}
+		console.log(`${ts()} [PressKey] ${modifiers.length ? modifiers.join('+') + '+' : ''}${key}`);
+		return { status: 'pressed', key, modifiers };
+	},
+};
+
 // --- Browser tools ---
 
 export const scrollTool: ToolDefinition = {
@@ -41,14 +88,17 @@ end tell'`, { timeout: 5_000 });
 };
 
 // Tab keyword aliases — map common names to URL patterns
-const TAB_ALIASES: Record<string, string> = {
-	'github': 'github.com', 'repo': 'github.com', 'github repo': 'github.com',
-	'gmail': 'mail.google.com', 'email': 'mail.google.com', 'inbox': 'mail.google.com',
-	'calendar': 'calendar.google.com', 'gcal': 'calendar.google.com',
-	'twitter': 'x.com', 'x': 'x.com',
-	'dashboard': 'localhost:7844', 'sutando': 'localhost:8080', 'web client': 'localhost:8080',
-	'gemini': 'gemini.google.com',
-};
+// Load tab aliases from config file (falls back to minimal defaults)
+const TAB_ALIASES: Record<string, string> = (() => {
+	const defaults: Record<string, string> = {
+		'github': 'github.com', 'gmail': 'mail.google.com', 'email': 'mail.google.com',
+		'calendar': 'calendar.google.com', 'dashboard': 'localhost:7844',
+		'sutando': 'localhost:8080', 'twitter': 'x.com', 'x': 'x.com',
+	};
+	try {
+		return { ...defaults, ...JSON.parse(readFileSync('tab-aliases.json', 'utf-8')) };
+	} catch { return defaults; }
+})();
 
 export const switchTabTool: ToolDefinition = {
 	name: 'switch_tab',
@@ -678,6 +728,48 @@ else:
 	},
 };
 
+// Dismiss — leave the current Zoom meeting
+export const dismissTool: ToolDefinition = {
+	name: 'dismiss',
+	description:
+		'Leave the current Zoom meeting. The opposite of summon/join_zoom. ' +
+		'Use when user says "dismiss", "leave zoom", "end meeting", "leave the call", "hang up zoom".',
+	parameters: z.object({}),
+	execution: 'inline',
+	async execute() {
+		try {
+			// 1. Stop screen share (Cmd+Shift+S), 2. Cmd+W leave dialog, 3. Enter confirm
+			execSync(`osascript -e '
+tell application "zoom.us"
+	activate
+end tell
+delay 0.5
+tell application "System Events"
+	-- Stop screen share first
+	keystroke "s" using {command down, shift down}
+	delay 1
+	-- Open leave dialog
+	keystroke "w" using command down
+	delay 1.5
+	-- Confirm (Enter hits default "End meeting for all")
+	key code 36
+end tell'`, { timeout: 15_000 });
+			// Verify — if Zoom still has meeting windows, force kill
+			try {
+				const check = execSync(`osascript -e 'tell application "System Events" to tell process "zoom.us" to return count of windows'`, { timeout: 3_000 }).toString().trim();
+				if (parseInt(check) > 2) {
+					execSync('killall "zoom.us" 2>/dev/null; sleep 1', { timeout: 5_000 });
+					console.log(`${ts()} [Dismiss] Force killed Zoom (${check} windows remaining)`);
+				}
+			} catch {}
+			console.log(`${ts()} [Dismiss] Left Zoom meeting`);
+			return { status: 'left_meeting' };
+		} catch (err) {
+			return { error: `Dismiss failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
 // Join Zoom via desktop app + computer audio (no screen share)
 export const joinZoomTool: ToolDefinition = {
 	name: 'join_zoom',
@@ -1063,14 +1155,102 @@ end tell`;
 	},
 };
 
+// Slide control — navigate presentation slides
+export const slideControlTool: ToolDefinition = {
+	name: 'slide_control',
+	description:
+		'Control presentation slides. Use when user says "next slide", "previous slide", "go back", "go to slide 3". ' +
+		'Sends arrow keys to the frontmost browser window.',
+	parameters: z.object({
+		action: z.enum(['next', 'previous', 'goto']).describe('Navigation action'),
+		slideNumber: z.number().optional().describe('Slide number for goto action'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { action, slideNumber } = args as { action: 'next' | 'previous' | 'goto'; slideNumber?: number };
+		try {
+			const key = action === 'next' ? 'ArrowRight' : 'ArrowLeft';
+			const dispatch = `execute javascript "document.dispatchEvent(new KeyboardEvent(\\"keydown\\",{key:\\"${key}\\"}))"`;
+			let script: string;
+			if (action === 'goto' && slideNumber) {
+				// Direct DOM manipulation — instant, no wrapping issues
+				const js = `var ss=document.querySelectorAll(\\".slide\\");for(var j=0;j<ss.length;j++){ss[j].classList.remove(\\"active\\")};document.getElementById(\\"s${slideNumber}\\").classList.add(\\"active\\");document.getElementById(\\"cur\\").textContent=\\"${slideNumber}\\"`;
+				script = `tell application "Google Chrome"
+	repeat with w in windows
+		set tabList to tabs of w
+		repeat with i from 1 to count of tabList
+			if URL of item i of tabList contains "index-sutando" or URL of item i of tabList contains "localhost:8888" then
+				tell item i of tabList to execute javascript "${js}"
+				return "done"
+			end if
+		end repeat
+	end repeat
+end tell`;
+			} else {
+				script = `tell application "Google Chrome"
+	repeat with w in windows
+		set tabList to tabs of w
+		repeat with i from 1 to count of tabList
+			if URL of item i of tabList contains "index-sutando" or URL of item i of tabList contains "localhost:8888" then
+				tell item i of tabList to ${dispatch}
+				return "done"
+			end if
+		end repeat
+	end repeat
+end tell`;
+			}
+			execSync(`osascript -e '${script}'`, { timeout: 15_000 });
+			console.log(`${ts()} [Slides] ${action}${slideNumber ? ` → slide ${slideNumber}` : ''}`);
+			return { status: 'done', action, slideNumber };
+		} catch (err) {
+			return { error: `Slide control failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
+// Toggle fullscreen on the presentation slides
+export const fullscreenTool: ToolDefinition = {
+	name: 'fullscreen',
+	description:
+		'Toggle fullscreen mode on the presentation slides. Use when user says "fullscreen", "enter fullscreen", "exit fullscreen", "make it full screen".',
+	parameters: z.object({}),
+	execution: 'inline',
+	async execute() {
+		try {
+			execSync(`osascript -e '
+tell application "Google Chrome"
+	activate
+	repeat with w in windows
+		set tabList to tabs of w
+		repeat with i from 1 to count of tabList
+			if URL of item i of tabList contains "index-sutando" or URL of item i of tabList contains "index-bodhi" or URL of item i of tabList contains "localhost:8888" then
+				set active tab index of w to i
+				set index of w to 1
+				exit repeat
+			end if
+		end repeat
+	end repeat
+end tell
+delay 0.3
+tell application "System Events"
+	keystroke "f"
+end tell'`, { timeout: 5_000 });
+			console.log(`${ts()} [Fullscreen] Toggled`);
+			return { status: 'toggled' };
+		} catch (err) {
+			return { error: `Fullscreen toggle failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
 /** All inline tools — import and spread into your tools list */
 export const inlineTools = [
-	scrollTool, switchTabTool, openUrlTool,
+	pressKeyTool, scrollTool, switchTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
 	volumeTool, brightnessTool, clipboardTool,
-	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, summonTool,
+	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, summonTool, dismissTool,
 	joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool,
-];
+	describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool, slideControlTool, fullscreenTool, ];
 
 /** Tools available to any caller (including unverified) */
 export const anyCallerTools = [
@@ -1080,10 +1260,10 @@ export const anyCallerTools = [
 /** Owner-only tools (require isOwner) */
 export const ownerOnlyTools = [
 	volumeTool, brightnessTool,
-	scrollTool, switchTabTool, openUrlTool,
+	pressKeyTool, scrollTool, switchTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
-	clipboardTool, cancelTaskTool, toggleTasksTool, summonTool,
-	joinZoomTool, joinGmeetTool, callContactTool,
+	clipboardTool, cancelTaskTool, toggleTasksTool, summonTool, dismissTool,
+	joinZoomTool, joinGmeetTool, callContactTool, slideControlTool, fullscreenTool,
 ];
 
 /** Configurable tools — default to owner-only, can be opened to verified callers */

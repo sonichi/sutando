@@ -140,7 +140,6 @@ def run_all_checks() -> list[dict]:
     for name, path in [
         ("CLAUDE.md", REPO_DIR / "CLAUDE.md"),
         ("build_log.md", REPO_DIR / "build_log.md"),
-        ("ACTIVITY.md", REPO_DIR / "ACTIVITY.md"),
         (".env", REPO_DIR / ".env"),
     ]:
         checks.append(check_file(path, name))

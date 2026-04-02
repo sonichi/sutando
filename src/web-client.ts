@@ -293,6 +293,13 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
   <h2 id="hero-name">Sutando</h2>
   <p class="tagline">Summon your AI superpower</p>
   <button class="btn-hero" onclick="toggle()">Start Voice</button>
+  <div style="margin-top:16px;font-size:11px;color:#556;letter-spacing:0.5px">
+    <kbd style="background:#1a1a2e;padding:2px 6px;border-radius:3px;border:1px solid #333;font-family:monospace;color:#8af">⌃C</kbd> drop context
+    <span style="margin:0 6px;color:#333">|</span>
+    <kbd style="background:#1a1a2e;padding:2px 6px;border-radius:3px;border:1px solid #333;font-family:monospace;color:#8af">⌃V</kbd> voice
+    <span style="margin:0 6px;color:#333">|</span>
+    <kbd style="background:#1a1a2e;padding:2px 6px;border-radius:3px;border:1px solid #333;font-family:monospace;color:#8af">⌃M</kbd> mute
+  </div>
 </div>
 
 <div id="dynamic-region"></div>
@@ -1045,10 +1052,13 @@ function toggle() {
     if (ws) { ws.close(); ws = null; }
     doCleanup();
   } else {
-    // Create AudioContext HERE in the click handler so browsers allow playback
-    // Use system default sample rate — it handles resampling from OUTPUT_RATE internally
-    audioCtx = new AudioContext();
-    dbg('AudioContext created on click: state=' + audioCtx.state + ' sampleRate=' + audioCtx.sampleRate);
+    // Create AudioContext if not already created (may exist from page load or prior toggle)
+    if (!audioCtx || audioCtx.state === 'closed') {
+      audioCtx = new AudioContext();
+    } else if (audioCtx.state === 'suspended') {
+      audioCtx.resume();
+    }
+    dbg('AudioContext: state=' + audioCtx.state + ' sampleRate=' + audioCtx.sampleRate);
 
     // Reset counters
     nextPlayTime = 0;
@@ -1073,6 +1083,7 @@ function toggle() {
     connectWs();
   }
 }
+window.toggle = toggle;
 
 // ─── Suggestion chips ─────────────────────────────────────
 function copyLogs() {

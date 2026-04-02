@@ -53,6 +53,12 @@ export const workTool: ToolDefinition = {
 	async execute(args) {
 		const { task } = args as { task: string };
 
+		// Reject screen-related tasks — these should use inline tools directly
+		const screenKeywords = /\b(describe|screen|scroll|capture|screenshot|narrat|introduc.*page|what.s on.*screen|look at.*screen)\b/i;
+		if (screenKeywords.test(task)) {
+			return { status: 'rejected', message: 'Use inline tools directly: describe_screen, scroll. Do NOT use work for this.' };
+		}
+
 		// Check if the watcher (Claude Code brain) is running
 		let watcherOnline = false;
 		try {
