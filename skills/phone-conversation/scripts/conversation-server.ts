@@ -42,8 +42,7 @@
  *   - Transcript persistence
  */
 
-import { config } from 'dotenv';
-config({ override: true });
+import 'dotenv/config';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { mkdirSync, writeFileSync, appendFileSync, unlinkSync, existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
