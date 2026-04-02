@@ -111,17 +111,17 @@ else
   echo "  ✓ screen capture (already running)"
 fi
 
-# 5b. SutandoDrop context drop app (global hotkey ⌃C)
-if ! pgrep -f "SutandoDrop" > /dev/null 2>&1; then
-  if [ -f "$REPO/src/SutandoDrop/SutandoDrop" ]; then
-    echo "  Starting SutandoDrop..."
-    open "$REPO/src/SutandoDrop/SutandoDrop"
-    echo "  ✓ SutandoDrop (⌃C to drop context)"
+# 5b. Sutando context drop app (global hotkey ⌃C)
+if ! pgrep -f "Sutando" > /dev/null 2>&1; then
+  if [ -f "$REPO/src/Sutando/Sutando" ]; then
+    echo "  Starting Sutando..."
+    open "$REPO/src/Sutando/Sutando"
+    echo "  ✓ Sutando (⌃C to drop context)"
   else
-    echo "  ⚠ SutandoDrop not compiled — run: cd src/SutandoDrop && swiftc -o SutandoDrop main.swift -framework Cocoa -framework Carbon -framework ApplicationServices"
+    echo "  ⚠ Sutando not compiled — run: cd src/Sutando && swiftc -o Sutando main.swift -framework Cocoa -framework Carbon -framework ApplicationServices"
   fi
 else
-  echo "  ✓ SutandoDrop (already running)"
+  echo "  ✓ Sutando (already running)"
 fi
 
 echo ""
