@@ -242,7 +242,10 @@ let demoState: 'idle' | 'recording' | 'done' = 'idle';
 export const scrollAndDescribeTool: ToolDefinition = {
 	name: 'scroll_and_describe',
 	description:
-		'Record a demo video with narration. Starts recording, captures the page, generates AI narration, speaks it via TTS while scrolling, then auto-stops. Fully self-contained — just call once and tell the caller to wait.',
+		'Record a demo video with narration. Call ONCE with duration_seconds. It starts recording, auto-scrolls, and returns a first description. ' +
+		'Do NOT announce "starting recording" — SPEAK the returned description as your first words. ' +
+		'New descriptions will be pushed as the page scrolls — speak each one. NEVER repeat earlier narration. ' +
+		'Recording auto-stops. Do NOT call this more than once per recording.',
 	parameters: z.object({
 		duration_seconds: z.number().optional().describe('Target duration in seconds (default 15). ALWAYS seconds, never minutes.'),
 	}),

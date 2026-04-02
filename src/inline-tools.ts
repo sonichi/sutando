@@ -2,7 +2,6 @@
  * Inline tools — lightweight macOS actions that execute instantly without going through the core agent.
  * Shared between voice-agent.ts and phone conversation-server.ts.
  *
- * Browser/screen tools are in browser-tools.ts.
  * Add new tools here and they auto-appear in both voice and phone agents.
  */
 
@@ -12,12 +11,105 @@ import { join } from 'node:path';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 
-// Re-export browser tools so existing imports work unchanged
+const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
+
+// Re-export browser tools
 export { scrollTool, switchTabTool, openUrlTool, captureScreenTool, typeTextTool, describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool } from './browser-tools.js';
 import { scrollTool, switchTabTool, openUrlTool, captureScreenTool, typeTextTool, describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool } from './browser-tools.js';
 
-const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
+// --- Browser tools ---
 
+export const scrollTool: ToolDefinition = {
+	name: 'scroll',
+	description:
+		'Scroll the Chrome browser page. Use for: "scroll down", "scroll up".',
+	parameters: z.object({
+		direction: z.enum(['down', 'up']).describe('Scroll direction'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { direction } = args as { direction: 'down' | 'up' };
+		const keyCode = direction === 'down' ? 125 : 126;
+		const presses = 10; // fixed: ~10cm on a 13" screen
+		try {
+			const keyPresses = Array(presses).fill(`key code ${keyCode}`).join('\n');
+			execSync(`osascript -e 'tell application "Google Chrome" to activate' -e 'delay 0.2' -e 'tell application "System Events"
+${keyPresses}
+end tell'`, { timeout: 5_000 });
+			console.log(`${ts()} [Scroll] ${direction} (${presses} keys)`);
+			return { status: 'scrolled', direction };
+		} catch (err) {
+			return { error: `Scroll failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
+// Tab keyword aliases — map common names to URL patterns
+const TAB_ALIASES: Record<string, string> = {
+	'github': 'github.com', 'repo': 'github.com', 'github repo': 'github.com',
+	'gmail': 'mail.google.com', 'email': 'mail.google.com', 'inbox': 'mail.google.com',
+	'calendar': 'calendar.google.com', 'gcal': 'calendar.google.com',
+	'twitter': 'x.com', 'x': 'x.com',
+	'dashboard': 'localhost:7844', 'sutando': 'localhost:8080', 'web client': 'localhost:8080',
+	'gemini': 'gemini.google.com',
+};
+
+export const switchTabTool: ToolDefinition = {
+	name: 'switch_tab',
+	description:
+		'Switch to a Chrome tab by keyword. Searches both tab titles and URLs. Use for: "switch to GitHub", "go to Gmail", "open the calendar tab".',
+	parameters: z.object({
+		keyword: z.string().describe('Keyword to match in tab title or URL (e.g., "GitHub", "Gmail", "calendar")'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { keyword } = args as { keyword: string };
+		// Resolve aliases to URL patterns
+		const alias = TAB_ALIASES[keyword.toLowerCase()];
+		const searchTerms = alias ? [keyword, alias] : [keyword];
+		const conditions = searchTerms.map(t => {
+			const safe = t.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+			return `title of t contains "${safe}" or URL of t contains "${safe}"`;
+		}).join(' or ');
+		try {
+			const script = `tell application "Google Chrome"\nset tabIndex to 0\nrepeat with w in windows\nset tabIndex to 0\nrepeat with t in tabs of w\nset tabIndex to tabIndex + 1\nignoring case\nif ${conditions} then\nset active tab index of w to tabIndex\nset index of w to 1\nactivate\nreturn title of t\nend if\nend ignoring\nend repeat\nend repeat\nreturn "not found"\nend tell`;
+			const tmpFile = `/tmp/sutando-switchtab-${Date.now()}.scpt`;
+			writeFileSync(tmpFile, script);
+			const result = execSync(`osascript ${tmpFile}`, { timeout: 5_000 }).toString().trim();
+			try { unlinkSync(tmpFile); } catch {}
+			if (result === 'not found') {
+				console.log(`${ts()} [SwitchTab] no tab matching "${keyword}"`);
+				return { error: `No Chrome tab found matching "${keyword}"` };
+			}
+			console.log(`${ts()} [SwitchTab] switched to: ${result}`);
+			return { status: 'switched', tab: result };
+		} catch (err) {
+			return { error: `Failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
+export const openUrlTool: ToolDefinition = {
+	name: 'open_url',
+	description:
+		'Open a URL in a new Chrome tab. Use for: "open github.com", "go to that link".',
+	parameters: z.object({
+		url: z.string().describe('The URL to open'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { url } = args as { url: string };
+		// Escape backslashes first, then quotes — prevents shell injection via osascript
+		const safeUrl = url.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
+		try {
+			execSync(`osascript -e 'tell application "Google Chrome" to tell front window to make new tab with properties {URL:"${safeUrl}"}'`, { timeout: 5_000 });
+			console.log(`${ts()} [OpenURL] opened: ${url}`);
+			return { status: 'opened', url };
+		} catch (err) {
+			return { error: `Failed to open ${url}: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
 
 // --- macOS system tools ---
 
@@ -57,6 +149,47 @@ export const switchAppTool: ToolDefinition = {
 	},
 };
 
+export const captureScreenTool: ToolDefinition = {
+	name: 'capture_screen',
+	description:
+		'Capture a screenshot of the screen. Use for: "take a screenshot", "what\'s on my screen", "look at this". Instant.',
+	parameters: z.object({}),
+	execution: 'inline',
+	async execute() {
+		try {
+			const res = await fetch('http://localhost:7845/capture');
+			const data = await res.json() as { status: string; path?: string; error?: string };
+			if (data.status === 'ok' && data.path) {
+				console.log(`${ts()} [Screen] Captured: ${data.path}`);
+				return { status: 'captured', path: data.path };
+			}
+			return { status: 'failed', error: data.error || 'unknown error' };
+		} catch {
+			return { status: 'failed', error: 'Screen capture server not running' };
+		}
+	},
+};
+
+export const typeTextTool: ToolDefinition = {
+	name: 'type_text',
+	description:
+		'Type text into the currently focused field. Use for: "type hello", "enter my email". Instant.',
+	parameters: z.object({
+		text: z.string().describe('The text to type'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { text } = args as { text: string };
+		const safeText = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+		try {
+			execSync(`osascript -e 'tell application "System Events" to keystroke "${safeText}"'`, { timeout: 5_000 });
+			console.log(`${ts()} [TypeText] typed: ${text.slice(0, 40)}`);
+			return { status: 'typed', text };
+		} catch (err) {
+			return { error: `Type failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
 
 export const volumeTool: ToolDefinition = {
 	name: 'volume',
@@ -549,6 +682,7 @@ else:
 	},
 };
 
+// Dismiss — leave the current Zoom meeting
 export const dismissTool: ToolDefinition = {
 	name: 'dismiss',
 	description:
@@ -590,10 +724,6 @@ end tell'`, { timeout: 15_000 });
 	},
 };
 
-// Join Zoom via desktop app + computer audio (no screen share)
-export const joinZoomTool: ToolDefinition = {
-	name: 'join_zoom',
-	description: 'Join a Zoom meeting via the desktop app with computer audio. No screen sharing. Use when user says "join the zoom", "join meeting", or provides a Zoom meeting ID.',
 // Join Zoom via desktop app + computer audio (no screen share)
 export const joinZoomTool: ToolDefinition = {
 	name: 'join_zoom',
@@ -979,7 +1109,7 @@ end tell`;
 	},
 };
 
-
+// Slide control — navigate presentation slides
 export const slideControlTool: ToolDefinition = {
 	name: 'slide_control',
 	description:
@@ -997,19 +1127,14 @@ export const slideControlTool: ToolDefinition = {
 			const dispatch = `execute javascript "document.dispatchEvent(new KeyboardEvent(\\"keydown\\",{key:\\"${key}\\"}))"`;
 			let script: string;
 			if (action === 'goto' && slideNumber) {
-				// Go left 10 times (to slide 1), then right (slideNumber-1) times, with delays
-				const leftPresses = Array(10).fill(`tell theTab to execute javascript "document.dispatchEvent(new KeyboardEvent(\\"keydown\\",{key:\\"ArrowLeft\\"}))"
-						delay 0.15`).join('\n						');
-				const rightPresses = Array(Math.max(0, slideNumber - 1)).fill(`tell theTab to execute javascript "document.dispatchEvent(new KeyboardEvent(\\"keydown\\",{key:\\"ArrowRight\\"}))"
-						delay 0.15`).join('\n						');
+				// Direct DOM manipulation — instant, no wrapping issues
+				const js = `var ss=document.querySelectorAll(\\".slide\\");for(var j=0;j<ss.length;j++){ss[j].classList.remove(\\"active\\")};document.getElementById(\\"s${slideNumber}\\").classList.add(\\"active\\");document.getElementById(\\"cur\\").textContent=\\"${slideNumber}\\"`;
 				script = `tell application "Google Chrome"
 	repeat with w in windows
 		set tabList to tabs of w
 		repeat with i from 1 to count of tabList
 			if URL of item i of tabList contains "index-sutando" or URL of item i of tabList contains "localhost:8888" then
-				set theTab to item i of tabList
-				${leftPresses}
-				${rightPresses}
+				tell item i of tabList to execute javascript "${js}"
 				return "done"
 			end if
 		end repeat
@@ -1024,6 +1149,54 @@ end tell`;
 				tell item i of tabList to ${dispatch}
 				return "done"
 			end if
+		end repeat
+	end repeat
+end tell`;
+			}
+			execSync(`osascript -e '${script}'`, { timeout: 15_000 });
+			console.log(`${ts()} [Slides] ${action}${slideNumber ? ` → slide ${slideNumber}` : ''}`);
+			return { status: 'done', action, slideNumber };
+		} catch (err) {
+			return { error: `Slide control failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
+// Toggle fullscreen on the presentation slides
+export const fullscreenTool: ToolDefinition = {
+	name: 'fullscreen',
+	description:
+		'Toggle fullscreen mode on the presentation slides. Use when user says "fullscreen", "enter fullscreen", "exit fullscreen", "make it full screen".',
+	parameters: z.object({}),
+	execution: 'inline',
+	async execute() {
+		try {
+			execSync(`osascript -e '
+tell application "Google Chrome"
+	activate
+	repeat with w in windows
+		set tabList to tabs of w
+		repeat with i from 1 to count of tabList
+			if URL of item i of tabList contains "index-sutando" or URL of item i of tabList contains "index-bodhi" or URL of item i of tabList contains "localhost:8888" then
+				set active tab index of w to i
+				set index of w to 1
+				exit repeat
+			end if
+		end repeat
+	end repeat
+end tell
+delay 0.3
+tell application "System Events"
+	keystroke "f"
+end tell'`, { timeout: 5_000 });
+			console.log(`${ts()} [Fullscreen] Toggled`);
+			return { status: 'toggled' };
+		} catch (err) {
+			return { error: `Fullscreen toggle failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
 /** All inline tools — import and spread into your tools list */
 export const inlineTools = [
 	scrollTool, switchTabTool, openUrlTool,
@@ -1031,8 +1204,7 @@ export const inlineTools = [
 	volumeTool, brightnessTool, clipboardTool,
 	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, summonTool, dismissTool,
 	joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool,
-	describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool, slideControlTool,
-];
+	describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool, slideControlTool, fullscreenTool, ];
 
 /** Tools available to any caller (including unverified) */
 export const anyCallerTools = [
@@ -1045,8 +1217,7 @@ export const ownerOnlyTools = [
 	scrollTool, switchTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
 	clipboardTool, cancelTaskTool, toggleTasksTool, summonTool, dismissTool,
-	joinZoomTool, joinGmeetTool, callContactTool,
-	describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool, slideControlTool,
+	joinZoomTool, joinGmeetTool, callContactTool, slideControlTool, fullscreenTool,
 ];
 
 /** Configurable tools — default to owner-only, can be opened to verified callers */
