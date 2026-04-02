@@ -369,8 +369,8 @@ function buildAgent(callSession: CallSession): MainAgent {
 				'## Screen demo recording with narration',
 				'When asked to record a demo video, call scroll_and_describe ONCE with duration_seconds. It starts recording, scrolls, and returns a first description.',
 				'Do NOT announce "starting recording". SPEAK the returned description as your first words.',
-				'Then KEEP NARRATING: call describe_screen, SPEAK the result, repeat. Scrolling is automatic — just keep describing what you see.',
-				'SPEAK after EVERY describe_screen — 1-2 sentences each. Keep going until describe_screen returns "done".',
+				'New descriptions will be pushed to you as the page scrolls — speak each one when it arrives.',
+				'NEVER repeat content you already narrated. Each pushed description shows NEW content on screen.',
 				'The recording auto-stops. Do NOT call scroll_and_describe more than once.',
 				'',
 				'## Known info',
@@ -649,13 +649,14 @@ async function createCallSession(params: {
 				console.log(`${ts()} [Phone] description interval: ${DESC_INTERVAL_MS}ms (${info.msPerViewport}ms/viewport)`);
 			}
 		} catch {}
-		const descPush = setInterval(async () => {
+		let lastDesc = '';
+		// Push first description early (after ~5s) so there's no gap after initial narration
+		const pushDescription = async () => {
 			if (!existsSync('/tmp/sutando-screen-record.pid')) return;
 			try {
 				const capRes = await fetch('http://localhost:7845/capture');
 				const capData = await capRes.json() as { status: string; path?: string };
 				if (capData.status !== 'ok' || !capData.path) return;
-				// Resize
 				const resized = capData.path.replace('.png', '-sm.jpg');
 				try { execSync(`sips -Z 800 -s format jpeg "${capData.path}" --out "${resized}" 2>/dev/null`, { timeout: 2_000 }); } catch {}
 				const actualPath = existsSync(resized) ? resized : capData.path;
@@ -679,15 +680,22 @@ async function createCallSession(params: {
 				const data = await res.json() as any;
 				const desc = data?.candidates?.[0]?.content?.parts?.[0]?.text;
 				if (desc && existsSync('/tmp/sutando-screen-record.pid')) {
+					if (desc === lastDesc) {
+						console.log(`${ts()} [Phone] skipped duplicate description`);
+						return;
+					}
+					lastDesc = desc;
 					(session as any).transport.sendContent([
-						{ role: 'user', text: `[System: The page has scrolled. Narrate this: "${desc}"]` },
+						{ role: 'user', text: `[System: The page has scrolled to new content. Narrate this NEW section (do NOT repeat earlier narration): "${desc}"]` },
 					], true);
 					console.log(`${ts()} [Phone] pushed description: ${desc.slice(0, 60)}...`);
 				}
 			} catch (err) {
 				console.log(`${ts()} [Phone] desc push error: ${err}`);
 			}
-		}, DESC_INTERVAL_MS);
+		};
+		setTimeout(pushDescription, 5000); // first push after 5s
+		const descPush = setInterval(pushDescription, DESC_INTERVAL_MS);
 
 		// Stop watcher
 		const poll = setInterval(() => {

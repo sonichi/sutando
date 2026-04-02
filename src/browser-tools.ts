@@ -278,7 +278,12 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			const msPerViewport = Math.round((viewportHeight / pxPerStep) * SCROLL_INTERVAL_MS);
 			writeFileSync('/tmp/sutando-scroll-info.json', JSON.stringify({ pageHeight, pxPerStep, msPerViewport, duration_seconds }));
 			console.log(`${ts()} [ScrollAndDescribe] page=${pageHeight}px, ${totalScrollSteps} steps, ${pxPerStep}px/step, ${msPerViewport}ms/viewport`);
-			const scrollInterval = setInterval(() => { try { scrollDown(pxPerStep); } catch {} }, SCROLL_INTERVAL_MS);
+			let scrolledTotal = 0;
+			const scrollInterval = setInterval(() => {
+				if (scrolledTotal >= pageHeight) return; // stop at bottom
+				try { scrollDown(pxPerStep); } catch {}
+				scrolledTotal += pxPerStep;
+			}, SCROLL_INTERVAL_MS);
 
 			// Auto-stop after duration
 			setTimeout(() => {
