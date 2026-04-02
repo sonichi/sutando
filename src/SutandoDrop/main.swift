@@ -237,10 +237,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func notify(_ title: String, _ message: String) {
-        // Use AppleScript via NSAppleScript (in-process, no external dependency)
+        // Spawn osascript subprocess — in-process NSAppleScript doesn't show banners
         let escaped = message.replacingOccurrences(of: "\"", with: "\\\"")
-        let script = NSAppleScript(source: "display notification \"\(escaped)\" with title \"\(title)\"")
-        script?.executeAndReturnError(nil)
+        let script = "display notification \"\(escaped)\" with title \"\(title)\" sound name \"Ping\""
+        // Audio beep as immediate confirmation
+        NSSound.beep()
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", script]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try? process.run()
     }
 
     @objc func quit() {
