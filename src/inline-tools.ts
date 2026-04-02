@@ -1124,7 +1124,7 @@ export const slideControlTool: ToolDefinition = {
 			let script: string;
 			if (action === 'goto' && slideNumber) {
 				// Direct DOM manipulation — instant, no wrapping issues
-				const js = `document.querySelectorAll(\\".slide\\").forEach(s=>s.classList.remove(\\"active\\")); document.getElementById(\\"s${slideNumber}\\").classList.add(\\"active\\"); document.getElementById(\\"cur\\").textContent=\\"${slideNumber}\\"`;
+				const js = `var ss=document.querySelectorAll(\\".slide\\");for(var j=0;j<ss.length;j++){ss[j].classList.remove(\\"active\\")};document.getElementById(\\"s${slideNumber}\\").classList.add(\\"active\\");document.getElementById(\\"cur\\").textContent=\\"${slideNumber}\\"`;
 				script = `tell application "Google Chrome"
 	repeat with w in windows
 		set tabList to tabs of w
