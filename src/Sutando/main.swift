@@ -39,7 +39,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Toggle Voice (⌃V)", action: #selector(toggleVoice), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Toggle Mute (⌃M)", action: #selector(toggleMute), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Open Core", action: #selector(openCore), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Open Web UI", action: #selector(openWebUI), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Open Core CLI", action: #selector(openCore), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Open Dashboard", action: #selector(openDashboard), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
         statusItem.menu = menu
@@ -254,6 +255,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSSound.beep()
     }
 
+    @objc func openWebUI() {
+        // Switch to existing localhost:8080 tab or open new one
+        let script = NSAppleScript(source: """
+        tell application "Google Chrome"
+            activate
+            set found to false
+            repeat with w in windows
+                set tabList to tabs of w
+                repeat with i from 1 to count of tabList
+                    if URL of item i of tabList contains "localhost:8080" then
+                        set active tab index of w to i
+                        set index of w to 1
+                        set found to true
+                        exit repeat
+                    end if
+                end repeat
+                if found then exit repeat
+            end repeat
+            if not found then
+                open location "http://localhost:8080"
+            end if
+        end tell
+        """)
+        script?.executeAndReturnError(nil)
+    }
+
     @objc func openCore() {
         // Activate Terminal running Claude Code
         let script = NSAppleScript(source: """
@@ -272,7 +299,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func openDashboard() {
-        NSWorkspace.shared.open(URL(string: "http://localhost:7844")!)
+        let script = NSAppleScript(source: """
+        tell application "Google Chrome"
+            activate
+            set found to false
+            repeat with w in windows
+                set tabList to tabs of w
+                repeat with i from 1 to count of tabList
+                    if URL of item i of tabList contains "localhost:7844" then
+                        set active tab index of w to i
+                        set index of w to 1
+                        set found to true
+                        exit repeat
+                    end if
+                end repeat
+                if found then exit repeat
+            end repeat
+            if not found then
+                open location "http://localhost:7844"
+            end if
+        end tell
+        """)
+        script?.executeAndReturnError(nil)
     }
 
     // MARK: - Helpers
