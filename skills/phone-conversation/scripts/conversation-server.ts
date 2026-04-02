@@ -645,7 +645,7 @@ async function createCallSession(params: {
 		try {
 			if (existsSync('/tmp/sutando-scroll-info.json')) {
 				const info = JSON.parse(readFileSync('/tmp/sutando-scroll-info.json', 'utf8'));
-				DESC_INTERVAL_MS = Math.max(info.msPerViewport || 8000, 5000); // min 5s between descriptions
+				DESC_INTERVAL_MS = Math.max(Math.round((info.msPerViewport || 8000) * 0.7), 5000); // 70% of viewport time — slight overlap beats silence
 				console.log(`${ts()} [Phone] description interval: ${DESC_INTERVAL_MS}ms (${info.msPerViewport}ms/viewport)`);
 			}
 		} catch {}
@@ -718,12 +718,12 @@ async function createCallSession(params: {
 		}, 500);
 		setTimeout(() => { clearInterval(poll); clearInterval(descPush); recordingWatchActive = false; }, 90_000);
 	};
-	// Start watching when scroll_and_describe starts recording
+	// Start watching when scroll_and_describe starts recording — delay 4s so scroll-info.json is written first
 	session.eventBus?.subscribe?.('tool.call', (e: any) => {
 		if (e?.toolName === 'scroll_and_describe') {
 			setTimeout(() => {
 				if (existsSync('/tmp/sutando-screen-record.pid')) startRecordingWatch();
-			}, 1000);
+			}, 4000);
 		}
 	});
 
