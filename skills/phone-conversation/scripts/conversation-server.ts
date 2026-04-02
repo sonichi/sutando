@@ -348,6 +348,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 			// Context only for outbound calls to owner
 			!isInbound && callSession.isOwner ? (() => { const ctx = getSafeContext(); return ctx ? `\nRecent context (for reference — use only if relevant):\n${ctx}` : ''; })() : '',
 			'Be natural, warm, and conversational. Keep responses to 1-2 sentences.',
+			'NEVER say "I\'m back", "Welcome back", "Working on it", or "task is queued". If the conversation resumes after a pause, just continue naturally from where you left off.',
 			'When the other person wants to wrap up, say a warm goodbye, then call the hang_up tool to end the call.',
 		];
 
@@ -362,7 +363,16 @@ function buildAgent(callSession: CallSession): MainAgent {
 				'',
 				'## Tools',
 				`These tools are instant (use them directly, NOT through work): ${inlineTools.map(t => t.name).join(', ')}. Use work for everything else.`,
+				'TOOL EXCLUSIVITY: If an inline tool can handle the request, use ONLY the inline tool. NEVER also call work. They are mutually exclusive — calling both causes duplicate responses. Only use work when no inline tool fits.',
+				'SCREEN RECORDING: Call screen_record start ONCE, confirm to the user, then wait. Only call screen_record stop when the user explicitly asks to stop. Never call stop immediately after start. Never call the same tool action twice in a row.',
 				'You can make concurrent calls — stay on the line while calling someone else.',
+				'',
+				'## Screen demo recording with narration',
+				'When asked to record a demo video:',
+				'1. Call screen_record start with duration_seconds (e.g. 20). It auto-stops after that time.',
+				'2. IMMEDIATELY call describe_screen. SPEAK the result. Call scroll. Call describe_screen. SPEAK. Scroll. Repeat.',
+				'3. SPEAK after EVERY describe_screen — never call two tools without speaking.',
+				'4. Recording auto-stops. Do NOT call screen_record stop unless the user asks.',
 				'',
 				'## Known info',
 				(() => { try { const url = execSync('git remote get-url origin', { timeout: 2_000 }).toString().trim().replace(/\.git$/, ''); return `Sutando GitHub repo: ${url}`; } catch { return ''; } })(),
@@ -663,6 +673,19 @@ async function createCallSession(params: {
 
 	// Trigger client connected (so VoiceSession sends greeting and starts Gemini)
 	sessionAny.handleClientConnected();
+	// Suppress greeting on reconnect — mute the first few seconds of audio after reconnect
+	let firstGreetingSent = false;
+	const origSendGreeting = sessionAny.sendGreeting?.bind(sessionAny);
+	if (origSendGreeting) {
+		sessionAny.sendGreeting = (...args: any[]) => {
+			if (firstGreetingSent) {
+				console.log(`${ts()} [Phone] suppressed reconnect greeting`);
+				return;
+			}
+			firstGreetingSent = true;
+			return origSendGreeting(...args);
+		};
+	}
 
 	// Auto-reconnect when Gemini transport closes (e.g. 1008 crash).
 	// We bypass ClientTransport, so VoiceSession's built-in reconnect won't trigger.
@@ -680,7 +703,17 @@ async function createCallSession(params: {
 					console.log(`${ts()} [Phone] reconnecting Gemini for ${callSession.callSid}`);
 					isReplaying = true; // mute audio while Gemini replays history
 					sessionAny.handleClientConnected();
-					setTimeout(() => { isReplaying = false; }, 3000); // unmute after replay
+					setTimeout(() => {
+						isReplaying = false;
+						// If recording is active, tell Gemini to continue narrating (not greet)
+						if (existsSync('/tmp/sutando-screen-record.pid')) {
+							try {
+								(session as any).transport.sendContent([
+									{ role: 'user', text: '[System: You were narrating a screen demo. Continue where you left off — call describe_screen and keep narrating. Do NOT greet or say "I\'m back".]' },
+								], true);
+							} catch {}
+						}
+					}, 6000);
 				}
 			}, 1500);
 		}
@@ -698,6 +731,9 @@ function cleanupCall(callSid: string): void {
 	if (!session) return;
 	activeCalls.delete(callSid);
 	if (session.meetingId) pendingMeetingJoins.delete(session.meetingId);
+
+	// Stop any active screen recording when call ends
+	try { execSync('python3 skills/screen-record/scripts/record.py stop', { timeout: 5_000 }); } catch {}
 
 	// Close VoiceSession
 	session.voiceSession.close('call_ended').catch(e =>
@@ -1275,8 +1311,7 @@ async function start(): Promise<void> {
 		console.log(`╠════════════════════════════════════════════════════╣`);
 		console.log(`║  Local:    http://localhost:${String(PORT).padEnd(27)}║`);
 		console.log(`║  Tunnel:   ${WEBHOOK_BASE_URL.slice(0, 40).padEnd(40)}║`);
-		const maskedPhone = TWILIO_PHONE_NUMBER ? `***${TWILIO_PHONE_NUMBER.slice(-4)}` : 'not set';
-		console.log(`║  Phone:    ${maskedPhone.padEnd(40)}║`);
+		console.log(`║  Phone:    ${TWILIO_PHONE_NUMBER.replace(/\d(?=\d{4})/g, '*').padEnd(40)}║`);
 		console.log(`╠════════════════════════════════════════════════════╣`);
 		console.log(`║  POST /call              — outbound call           ║`);
 		console.log(`║  POST /concurrent-call   — child call (for Claude) ║`);

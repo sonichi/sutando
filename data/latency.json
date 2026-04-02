@@ -1,0 +1,54 @@
+{
+  "measurements": [
+    {
+      "task_id": "task-1775011926538",
+      "task_time": 1775011926.538,
+      "result_time": 1775014354.4289906,
+      "latency_s": 2427.9
+    },
+    {
+      "task_id": "task-1775012063363",
+      "task_time": 1775012063.363,
+      "result_time": 1775014354.42964,
+      "latency_s": 2291.1
+    },
+    {
+      "task_id": "task-1775012027327",
+      "task_time": 1775012027.327,
+      "result_time": 1775014354.4295213,
+      "latency_s": 2327.1
+    },
+    {
+      "task_id": "task-1775011986029",
+      "task_time": 1775011986.029,
+      "result_time": 1775014354.429157,
+      "latency_s": 2368.4
+    },
+    {
+      "task_id": "task-1775012199398",
+      "task_time": 1775012199.398,
+      "result_time": 1775014354.4292715,
+      "latency_s": 2155.0
+    },
+    {
+      "task_id": "task-1775012392460",
+      "task_time": 1775012392.46,
+      "result_time": 1775014354.4294043,
+      "latency_s": 1962.0
+    },
+    {
+      "task_id": "task-1775012434458",
+      "task_time": 1775012434.458,
+      "result_time": 1775014354.4297547,
+      "latency_s": 1920.0
+    }
+  ],
+  "stats": {
+    "count": 7,
+    "mean_s": 2207.4,
+    "median_s": 2291.1,
+    "max_s": 2427.9,
+    "min_s": 1920.0,
+    "last_updated": "2026-04-01T00:11:10.162695"
+  }
+}

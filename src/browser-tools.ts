@@ -1,0 +1,426 @@
+/**
+ * Browser & screen tools — Chrome tab control, scrolling, screenshots, and vision descriptions.
+ * Split from inline-tools.ts for readability.
+ */
+
+import { execSync } from 'node:child_process';
+import { writeFileSync, unlinkSync, readFileSync, existsSync, statSync } from 'node:fs';
+import { z } from 'zod';
+import type { ToolDefinition } from 'bodhi-realtime-agent';
+
+const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
+
+// --- Scroll ---
+
+export const scrollTool: ToolDefinition = {
+	name: 'scroll',
+	description:
+		'Scroll the Chrome browser page. Use for: "scroll down", "scroll up", "scroll to top", "scroll to bottom".',
+	parameters: z.object({
+		direction: z.enum(['down', 'up', 'top', 'bottom']).describe('Scroll direction. Use "top" or "bottom" to jump to start/end of page.'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { direction } = args as { direction: 'down' | 'up' | 'top' | 'bottom' };
+		try {
+			// Use Chrome's JavaScript scrollBy to avoid focus issues (Zoom steals keystrokes)
+			if (direction === 'top') {
+				execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "window.scrollTo(0, 0)"'`, { timeout: 5_000 });
+			} else if (direction === 'bottom') {
+				execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "window.scrollTo(0, document.body.scrollHeight)"'`, { timeout: 5_000 });
+			} else {
+				const amount = direction === 'down' ? 600 : -600;
+				execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "window.scrollBy(0, ${amount})"'`, { timeout: 5_000 });
+			}
+			console.log(`${ts()} [Scroll] ${direction}`);
+			return { status: 'scrolled', direction };
+		} catch (err) {
+			return { error: `Scroll failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
+// --- Tab switching ---
+
+const TAB_ALIASES: Record<string, string> = {
+	'github': 'github.com', 'repo': 'github.com', 'github repo': 'github.com',
+	'gmail': 'mail.google.com', 'email': 'mail.google.com', 'inbox': 'mail.google.com',
+	'calendar': 'calendar.google.com', 'gcal': 'calendar.google.com',
+	'twitter': 'x.com', 'x': 'x.com',
+	'dashboard': 'localhost:7844', 'sutando': 'localhost:8080', 'web client': 'localhost:8080',
+	'gemini': 'gemini.google.com',
+};
+
+export const switchTabTool: ToolDefinition = {
+	name: 'switch_tab',
+	description:
+		'Switch to a Chrome tab by keyword. Searches both tab titles and URLs. Use for: "switch to GitHub", "go to Gmail", "open the calendar tab".',
+	parameters: z.object({
+		keyword: z.string().describe('Keyword to match in tab title or URL (e.g., "GitHub", "Gmail", "calendar")'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { keyword } = args as { keyword: string };
+		// Resolve aliases to URL patterns
+		const alias = TAB_ALIASES[keyword.toLowerCase()];
+		const searchTerms = alias ? [keyword, alias] : [keyword];
+		// Split into individual words for fuzzy matching (speech-to-text often garbles multi-word names)
+		const allTerms = [...searchTerms];
+		for (const term of searchTerms) {
+			const words = term.split(/\s+/).filter(w => w.length >= 4); // only words 4+ chars
+			allTerms.push(...words);
+		}
+		const uniqueTerms = [...new Set(allTerms)];
+		const conditions = uniqueTerms.map(t => {
+			const safe = t.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+			return `title of t contains "${safe}" or URL of t contains "${safe}"`;
+		}).join(' or ');
+		try {
+			const script = `tell application "Google Chrome"\nset tabIndex to 0\nrepeat with w in windows\nset tabIndex to 0\nrepeat with t in tabs of w\nset tabIndex to tabIndex + 1\nignoring case\nif ${conditions} then\nset active tab index of w to tabIndex\nset index of w to 1\nactivate\nreturn title of t\nend if\nend ignoring\nend repeat\nend repeat\nreturn "not found"\nend tell`;
+			const tmpFile = `/tmp/sutando-switchtab-${Date.now()}.scpt`;
+			writeFileSync(tmpFile, script);
+			const result = execSync(`osascript ${tmpFile}`, { timeout: 5_000 }).toString().trim();
+			try { unlinkSync(tmpFile); } catch {}
+			if (result === 'not found') {
+				console.log(`${ts()} [SwitchTab] no tab matching "${keyword}"`);
+				return { error: `No Chrome tab found matching "${keyword}"` };
+			}
+			console.log(`${ts()} [SwitchTab] switched to: ${result}`);
+			return { status: 'switched', tab: result };
+		} catch (err) {
+			return { error: `Failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
+// --- Open URL ---
+
+export const openUrlTool: ToolDefinition = {
+	name: 'open_url',
+	description:
+		'Open a URL in a new Chrome tab. Use for: "open github.com", "go to that link".',
+	parameters: z.object({
+		url: z.string().describe('The URL to open'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { url } = args as { url: string };
+		// Escape backslashes first, then quotes — prevents shell injection via osascript
+		const safeUrl = url.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
+		try {
+			execSync(`osascript -e 'tell application "Google Chrome" to tell front window to make new tab with properties {URL:"${safeUrl}"}'`, { timeout: 5_000 });
+			console.log(`${ts()} [OpenURL] opened: ${url}`);
+			return { status: 'opened', url };
+		} catch (err) {
+			return { error: `Failed to open ${url}: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
+// --- Screen capture ---
+
+export const captureScreenTool: ToolDefinition = {
+	name: 'capture_screen',
+	description:
+		'Capture a screenshot of the screen. Use for: "take a screenshot", "what\'s on my screen", "look at this". Instant.',
+	parameters: z.object({}),
+	execution: 'inline',
+	async execute() {
+		try {
+			const res = await fetch('http://localhost:7845/capture');
+			const data = await res.json() as { status: string; path?: string; error?: string };
+			if (data.status === 'ok' && data.path) {
+				console.log(`${ts()} [Screen] Captured: ${data.path}`);
+				return { status: 'captured', path: data.path };
+			}
+			return { status: 'failed', error: data.error || 'unknown error' };
+		} catch {
+			return { status: 'failed', error: 'Screen capture server not running' };
+		}
+	},
+};
+
+// --- Type text ---
+
+export const typeTextTool: ToolDefinition = {
+	name: 'type_text',
+	description:
+		'Type text into the currently focused field. Use for: "type hello", "enter my email". Instant.',
+	parameters: z.object({
+		text: z.string().describe('The text to type'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { text } = args as { text: string };
+		const safeText = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+		try {
+			execSync(`osascript -e 'tell application "System Events" to keystroke "${safeText}"'`, { timeout: 5_000 });
+			console.log(`${ts()} [TypeText] typed: ${text.slice(0, 40)}`);
+			return { status: 'typed', text };
+		} catch (err) {
+			return { error: `Type failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
+// --- Describe screen (vision) ---
+
+async function describeScreenshot(imagePath: string): Promise<string> {
+	const apiKey = process.env.GEMINI_API_KEY;
+	if (!apiKey) return 'Vision description unavailable (no GEMINI_API_KEY)';
+	try {
+		// Resize to 800px for faster API calls
+		const resized = imagePath.replace('.png', '-sm.jpg');
+		try {
+			execSync(`sips -Z 800 -s format jpeg "${imagePath}" --out "${resized}" 2>/dev/null`, { timeout: 2_000 });
+		} catch { /* use original if resize fails */ }
+		const actualPath = existsSync(resized) ? resized : imagePath;
+		const mimeType = actualPath.endsWith('.jpg') ? 'image/jpeg' : 'image/png';
+		const imageData = readFileSync(actualPath).toString('base64');
+		const res = await fetch(
+			`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+			{
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					contents: [{
+						parts: [
+							{ text: 'Describe what is on screen in exactly 1 sentence. Read the main heading and key content. Be specific — quote exact text. This will be spoken aloud.' },
+							{ inlineData: { mimeType, data: imageData } },
+						],
+					}],
+				}),
+			},
+		);
+		const data = await res.json() as any;
+		return data?.candidates?.[0]?.content?.parts?.[0]?.text ?? 'Could not describe the screen.';
+	} catch (err) {
+		return `Vision error: ${err instanceof Error ? err.message : err}`;
+	}
+}
+
+export const describeScreenTool: ToolDefinition = {
+	name: 'describe_screen',
+	description:
+		'Describe what is currently visible on screen WITHOUT scrolling. Use this to introduce/narrate the current view to the caller. Call this FIRST, then scroll separately when the caller is ready.',
+	parameters: z.object({}),
+	execution: 'inline',
+	async execute() {
+		if (demoState === 'done') return { status: 'done', description: 'Demo complete. Stop narrating. Tell the caller.' };
+		try {
+			const captureRes = await fetch('http://localhost:7845/capture');
+			const captureData = await captureRes.json() as { status: string; path?: string; error?: string };
+			if (captureData.status !== 'ok' || !captureData.path) {
+				return { error: `Could not capture screen: ${captureData.error || 'unknown'}` };
+			}
+			const description = await describeScreenshot(captureData.path);
+			if (demoState === 'done') return { status: 'done', description: 'Demo complete. Stop narrating.' };
+			console.log(`${ts()} [DescribeScreen] ${description.slice(0, 80)}...`);
+			return { status: 'ok', description, instruction: 'YOU MUST speak this description OUT LOUD to the caller NOW before calling any other tool.' };
+		} catch (err) {
+			return { error: `describe_screen failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
+// --- Scroll and Describe (concurrent) ---
+
+async function captureScreen(): Promise<string | null> {
+	try {
+		const res = await fetch('http://localhost:7845/capture');
+		const data = await res.json() as { status: string; path?: string };
+		return data.status === 'ok' && data.path ? data.path : null;
+	} catch { return null; }
+}
+
+function scrollDown(pixels: number = 600) {
+	execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "window.scrollBy(0, ${pixels})"'`, { timeout: 5_000 });
+}
+
+let demoState: 'idle' | 'recording' | 'done' = 'idle';
+
+export const scrollAndDescribeTool: ToolDefinition = {
+	name: 'scroll_and_describe',
+	description:
+		'Record a demo video with narration. Starts recording, captures the page, generates AI narration, speaks it via TTS while scrolling, then auto-stops. Fully self-contained — just call once and tell the caller to wait.',
+	parameters: z.object({
+		duration_seconds: z.number().optional().describe('Target duration in seconds (default 15). ALWAYS seconds, never minutes.'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { duration_seconds = 15 } = args as { duration_seconds?: number };
+		try {
+			// Prevent duplicate recordings
+			if (demoState === 'recording') return { status: 'already_recording', message: 'Already recording. Use describe_screen to narrate.' };
+			if (demoState === 'done') return { status: 'done', message: 'Demo complete. Offer to play with play_recording.' };
+			demoState = 'recording';
+
+			// Scroll to top
+			execSync(`osascript -e 'tell application "System Events" to key code 126 using command down'`, { timeout: 5_000 });
+
+			// Start recording + first describe_screen in parallel
+			execSync('python3 skills/screen-record/scripts/record.py start', { timeout: 10_000 });
+			const captureRes = await fetch('http://localhost:7845/capture');
+			const captureData = await captureRes.json() as { status: string; path?: string };
+			const firstDesc = captureData.path ? await describeScreenshot(captureData.path) : '';
+
+			// Continuous background scroll
+			const scrollInterval = setInterval(() => { try { scrollDown(400); } catch {} }, 1500);
+
+			// Auto-stop after duration
+			setTimeout(() => {
+				clearInterval(scrollInterval);
+				try { execSync('python3 skills/screen-record/scripts/record.py stop', { timeout: 10_000 }); } catch {}
+				demoState = 'done';
+				console.log(`${ts()} [ScrollAndDescribe] auto-stop`);
+			}, duration_seconds * 1000);
+
+			console.log(`${ts()} [ScrollAndDescribe] recording started with first desc`);
+			return {
+				status: 'recording',
+				first_description: firstDesc,
+				message: `SPEAK THIS NOW: "${firstDesc}" Then call describe_screen, SPEAK, scroll, repeat. Auto-stops in ${duration_seconds}s.`,
+			};
+		} catch (err) {
+			return { error: `scroll_and_describe failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
+// --- Play recording ---
+
+export const playRecordingTool: ToolDefinition = {
+	name: 'play_recording',
+	description:
+		'Open and play the most recent screen recording in QuickTime Player.',
+	parameters: z.object({}),
+	execution: 'inline',
+	async execute() {
+		demoState = 'idle';
+		try {
+			const pidFile = '/tmp/sutando-screen-record.pid';
+			let recPath: string | null = null;
+
+			// Check if there's a known last recording path
+			if (existsSync(pidFile)) {
+				const info = JSON.parse(readFileSync(pidFile, 'utf8'));
+				if (info.path && existsSync(info.path)) recPath = info.path;
+			}
+
+			// Otherwise find the most recent .mov in /tmp
+			if (!recPath) {
+				const result = execSync('ls -t /tmp/sutando-recording-*.mov 2>/dev/null | head -1', { timeout: 3_000 }).toString().trim();
+				if (result && existsSync(result)) recPath = result;
+			}
+
+			if (!recPath) return { error: 'No screen recording found' };
+
+			execSync(`open "${recPath}"`, { timeout: 5_000 });
+			const size = statSync(recPath).size;
+			console.log(`${ts()} [PlayRecording] ${recPath} (${(size / 1024 / 1024).toFixed(1)}MB)`);
+			return { status: 'playing', path: recPath, size_mb: +(size / 1024 / 1024).toFixed(1) };
+		} catch (err) {
+			return { error: `play_recording failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
+// --- Screen recording ---
+
+let lastScreenRecordCall = 0;
+const SCREEN_RECORD_COOLDOWN_MS = 5_000;
+
+export const screenRecordTool: ToolDefinition = {
+	name: 'screen_record',
+	description:
+		'Start or stop screen recording. Uses macOS screencapture -v for reliable .mov output.',
+	parameters: z.object({
+		action: z.enum(['start', 'stop']).describe('"start" begins recording, "stop" stops and saves the file'),
+		duration_seconds: z.number().optional().describe('If provided with start, auto-stops after this many seconds.'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { action, duration_seconds } = args as { action: 'start' | 'stop'; duration_seconds?: number };
+		// Hard block: if already recording, refuse to start again
+		if (action === 'start' && demoState === 'recording') {
+			console.log(`${ts()} [ScreenRecord] BLOCKED duplicate start (already recording)`);
+			return { status: 'already_recording', message: 'Recording is already in progress. Do NOT call screen_record start again.' };
+		}
+		const now = Date.now();
+		if (now - lastScreenRecordCall < SCREEN_RECORD_COOLDOWN_MS) {
+			return { status: 'cooldown', message: 'Wait a few seconds.' };
+		}
+		lastScreenRecordCall = now;
+		try {
+			const result = execSync(`python3 skills/screen-record/scripts/record.py ${action}`, { timeout: 10_000 }).toString().trim();
+			// Auto-stop timer — cap at 60s regardless of what Gemini requests
+			if (action === 'start') {
+				demoState = 'recording';
+				const capped = Math.min(duration_seconds || 20, 60);
+				setTimeout(() => {
+					try { execSync('python3 skills/screen-record/scripts/record.py stop', { timeout: 10_000 }); } catch {}
+					demoState = 'done';
+					console.log(`${ts()} [ScreenRecord] auto-stop after ${capped}s (requested ${duration_seconds}s)`);
+				}, capped * 1000);
+			}
+			if (action === 'stop') demoState = 'done';
+			const parsed = JSON.parse(result);
+			console.log(`${ts()} [ScreenRecord] ${action}: ${result}`);
+			return parsed;
+		} catch (err) {
+			return { error: `screen_record failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
+// --- Click ---
+
+export const clickTool: ToolDefinition = {
+	name: 'click',
+	description:
+		'Click at a specific screen coordinate. Use with describe_screen to identify where to click. Also supports keyboard shortcuts like "cmd+shift+5".',
+	parameters: z.object({
+		x: z.number().optional().describe('X coordinate on screen'),
+		y: z.number().optional().describe('Y coordinate on screen'),
+		shortcut: z.string().optional().describe('Keyboard shortcut to press instead of clicking (e.g. "cmd+shift+5")'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { x, y, shortcut } = args as { x?: number; y?: number; shortcut?: string };
+		try {
+			if (shortcut) {
+				// Parse shortcut like "cmd+shift+5"
+				const parts = shortcut.toLowerCase().split('+');
+				const key = parts.pop()!;
+				const modifiers = parts.map(m => {
+					if (m === 'cmd' || m === 'command') return 'command down';
+					if (m === 'shift') return 'shift down';
+					if (m === 'ctrl' || m === 'control') return 'control down';
+					if (m === 'alt' || m === 'option') return 'option down';
+					return '';
+				}).filter(Boolean).join(', ');
+				const keyCode = key.length === 1 ? `"${key}"` : `${key}`;
+				const cmd = modifiers
+					? `tell application "System Events" to keystroke ${keyCode} using {${modifiers}}`
+					: `tell application "System Events" to keystroke ${keyCode}`;
+				execSync(`osascript -e '${cmd}'`, { timeout: 5_000 });
+				console.log(`${ts()} [Click] shortcut: ${shortcut}`);
+				return { status: 'pressed', shortcut };
+			}
+			if (x != null && y != null) {
+				execSync(`osascript -e '
+					tell application "System Events"
+						click at {${Math.round(x)}, ${Math.round(y)}}
+					end tell'`, { timeout: 5_000 });
+				console.log(`${ts()} [Click] at (${x}, ${y})`);
+				return { status: 'clicked', x, y };
+			}
+			return { error: 'Provide either x,y coordinates or a shortcut' };
+		} catch (err) {
+			return { error: `click failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
+// --- Screen recording ---
+
