@@ -380,6 +380,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_json(200, {"ok": True})
 
     def do_POST(self):
+        global voice_desired_state
         path = urlparse(self.path).path
 
         # Twilio webhook endpoints (no auth — Twilio signs requests)
@@ -400,7 +401,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         if path == "/voice/toggle":
-            global voice_desired_state
             voice_desired_state = "connected" if voice_desired_state == "disconnected" else "disconnected"
             self.send_json(200, {"state": voice_desired_state})
             return
@@ -409,7 +409,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
             try:
-                global voice_desired_state
                 data = json.loads(body)
                 voice_desired_state = data.get("state", "disconnected")
                 self.send_json(200, {"state": voice_desired_state})
