@@ -23,8 +23,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem.button {
-            button.title = "S"
-            button.font = NSFont.systemFont(ofSize: 14, weight: .bold)
+            let avatarPath = workspace + "/docs/stand-avatar.png"
+            if let image = NSImage(contentsOfFile: avatarPath) {
+                image.size = NSSize(width: 18, height: 18)
+                image.isTemplate = false
+                button.image = image
+            } else {
+                button.title = "S"
+                button.font = NSFont.systemFont(ofSize: 14, weight: .bold)
+            }
         }
 
         let menu = NSMenu()
@@ -248,7 +255,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func openCore() {
-        NSWorkspace.shared.open(URL(string: "http://localhost:8080")!)
+        // Activate Terminal running Claude Code
+        let script = NSAppleScript(source: """
+        tell application "Terminal"
+            activate
+            -- Find the window running claude
+            repeat with w in windows
+                if name of w contains "claude" or name of w contains "sutando" then
+                    set index of w to 1
+                    exit repeat
+                end if
+            end repeat
+        end tell
+        """)
+        script?.executeAndReturnError(nil)
     }
 
     @objc func openDashboard() {

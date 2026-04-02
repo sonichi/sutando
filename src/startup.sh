@@ -115,7 +115,7 @@ fi
 if ! pgrep -f "Sutando" > /dev/null 2>&1; then
   if [ -f "$REPO/src/Sutando/Sutando" ]; then
     echo "  Starting Sutando..."
-    open "$REPO/src/Sutando/Sutando"
+    "$REPO/src/Sutando/Sutando" > /dev/null 2>&1 &
     echo "  ✓ Sutando (⌃C to drop context)"
   else
     echo "  ⚠ Sutando not compiled — run: cd src/Sutando && swiftc -o Sutando main.swift -framework Cocoa -framework Carbon -framework ApplicationServices"
