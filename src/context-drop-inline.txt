@@ -1,0 +1,88 @@
+WORKSPACE="$HOME/Desktop/sutando"
+DROP_FILE="$WORKSPACE/context-drop.txt"
+DROP_IMAGE="$WORKSPACE/context-drop-image.png"
+LOG_FILE="$WORKSPACE/src/context-drop.log"
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+
+# Check for Finder file selection ONLY if Finder is frontmost
+FRONT_APP=$(osascript -e 'tell application "System Events" to get name of first application process whose frontmost is true' 2>/dev/null)
+FINDER_FILE=""
+if [ "$FRONT_APP" = "Finder" ]; then
+  FINDER_FILE=$(osascript -e '
+  tell application "Finder"
+    try
+      set sel to selection
+      if (count of sel) > 0 then
+        return POSIX path of (item 1 of sel as alias)
+      end if
+    on error
+      return ""
+    end try
+  end tell
+  ' 2>/dev/null)
+fi
+
+if [ -n "$FINDER_FILE" ] && [ -e "$FINDER_FILE" ]; then
+  cat > "$DROP_FILE" << EOF
+timestamp: $TIMESTAMP
+type: file
+path: $FINDER_FILE
+---
+[File selected in Finder: $FINDER_FILE]
+EOF
+  echo "[$TIMESTAMP] Dropped: file ($FINDER_FILE)" >> "$LOG_FILE"
+  osascript -e "display notification \"File dropped: $(basename "$FINDER_FILE")\" with title \"Sutando\""
+  exit 0
+fi
+
+# Check for image in clipboard
+HAS_IMAGE=$(osascript -e '
+try
+  the clipboard as «class PNGf»
+  return "yes"
+on error
+  return "no"
+end try
+' 2>/dev/null)
+
+if [ "$HAS_IMAGE" = "yes" ]; then
+  osascript -e '
+  set theFile to POSIX file "'"$DROP_IMAGE"'"
+  set theData to the clipboard as «class PNGf»
+  set fileRef to open for access theFile with write permission
+  set eof fileRef to 0
+  write theData to fileRef
+  close access fileRef
+  ' 2>/dev/null
+  if [ -f "$DROP_IMAGE" ]; then
+    cat > "$DROP_FILE" << EOF
+timestamp: $TIMESTAMP
+type: image
+path: $DROP_IMAGE
+---
+[Image dropped from clipboard]
+EOF
+    echo "[$TIMESTAMP] Dropped: image ($(wc -c < "$DROP_IMAGE") bytes)" >> "$LOG_FILE"
+    osascript -e 'display notification "Image dropped" with title "Sutando"'
+    exit 0
+  fi
+fi
+
+# Fall back to text selection
+OLD_CLIPBOARD=$(pbpaste 2>/dev/null)
+osascript -e 'tell application "System Events" to keystroke "c" using command down' 2>/dev/null
+sleep 0.3
+SELECTED=$(pbpaste 2>/dev/null)
+if [ "$SELECTED" = "$OLD_CLIPBOARD" ] || [ -z "$SELECTED" ]; then
+  osascript -e 'display notification "Nothing selected" with title "Sutando"' 2>/dev/null
+  exit 0
+fi
+
+cat > "$DROP_FILE" << EOF
+timestamp: $TIMESTAMP
+type: text
+---
+$SELECTED
+EOF
+echo "[$TIMESTAMP] Dropped: ${#SELECTED} chars" >> "$LOG_FILE"
+osascript -e "display notification \"${#SELECTED} chars dropped\" with title \"Sutando\"" 2>/dev/null

@@ -62,6 +62,10 @@ RESULT_DIR.mkdir(exist_ok=True)
 # {task_id: {status, text, time, result}}
 task_history = {}
 
+# Voice state: "connected" or "disconnected". Toggled via /voice/toggle.
+# Web client polls /voice/state and connects/disconnects accordingly.
+voice_desired_state = "disconnected"
+
 
 
 def get_status() -> dict:
@@ -166,6 +170,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.send_json(200, {"status": "idle"})
             else:
                 self.send_json(200, {"status": "idle"})
+        elif path == "/voice/state":
+            self.send_json(200, {"state": voice_desired_state})
         elif path == "/status":
             self.send_json(200, get_status())
         elif path == "/tasks/active":
@@ -395,6 +401,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_json(200, {"ok": True})
 
     def do_POST(self):
+        global voice_desired_state
         path = urlparse(self.path).path
 
         # Twilio webhook endpoints (no auth — Twilio signs requests)
@@ -412,6 +419,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.handle_twilio_transcription(form_data)
             else:
                 self.send_json(404, {"error": "not found"})
+            return
+
+        if path == "/voice/toggle":
+            voice_desired_state = "connected" if voice_desired_state == "disconnected" else "disconnected"
+            self.send_json(200, {"state": voice_desired_state})
+            return
+
+        if path == "/voice/set":
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            try:
+                data = json.loads(body)
+                voice_desired_state = data.get("state", "disconnected")
+                self.send_json(200, {"state": voice_desired_state})
+            except:
+                self.send_json(400, {"error": "invalid"})
             return
 
         if path == "/task-done":

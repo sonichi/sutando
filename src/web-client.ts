@@ -1045,10 +1045,13 @@ function toggle() {
     if (ws) { ws.close(); ws = null; }
     doCleanup();
   } else {
-    // Create AudioContext HERE in the click handler so browsers allow playback
-    // Use system default sample rate — it handles resampling from OUTPUT_RATE internally
-    audioCtx = new AudioContext();
-    dbg('AudioContext created on click: state=' + audioCtx.state + ' sampleRate=' + audioCtx.sampleRate);
+    // Create AudioContext if not already created (may exist from page load or prior toggle)
+    if (!audioCtx || audioCtx.state === 'closed') {
+      audioCtx = new AudioContext();
+    } else if (audioCtx.state === 'suspended') {
+      audioCtx.resume();
+    }
+    dbg('AudioContext: state=' + audioCtx.state + ' sampleRate=' + audioCtx.sampleRate);
 
     // Reset counters
     nextPlayTime = 0;
@@ -1073,6 +1076,7 @@ function toggle() {
     connectWs();
   }
 }
+window.toggle = toggle;
 
 // ─── Suggestion chips ─────────────────────────────────────
 function copyLogs() {

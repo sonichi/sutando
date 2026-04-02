@@ -214,6 +214,7 @@ const mainAgent: MainAgent = {
 		'- GOODBYE RULE: When the user says "goodbye", "bye", "see you later", "disconnect", "stop", or clearly ends the conversation, you MUST call the end_session tool IMMEDIATELY. Say a brief farewell and call end_session in the same turn. If you do not call end_session, the session stays open. This is mandatory — never just say goodbye without calling the tool. BUT in meeting mode, only respond to goodbyes directed at you specifically.',
 		'- NEVER pretend you called a tool. NEVER say "done" without actually calling work.',
 		'- NEVER answer technical/system questions yourself — delegate to work.',
+		'- MISSING CONTEXT: When the user references something you don\'t have context for ("the draft", "what we discussed", "type that", "send what I asked for"), ALWAYS delegate to work. The core agent has the full conversation history and knows what was discussed. Never guess or ask the user to repeat — just call work.',
 		'- When in doubt, call work.',
 		'',
 		'VOICE RULES:',

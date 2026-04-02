@@ -111,6 +111,19 @@ else
   echo "  ✓ screen capture (already running)"
 fi
 
+# 5b. Sutando context drop app (global hotkey ⌃C)
+if ! pgrep -f "Sutando" > /dev/null 2>&1; then
+  if [ -f "$REPO/src/Sutando/Sutando" ]; then
+    echo "  Starting Sutando..."
+    open "$REPO/src/Sutando/Sutando"
+    echo "  ✓ Sutando (⌃C to drop context)"
+  else
+    echo "  ⚠ Sutando not compiled — run: cd src/Sutando && swiftc -o Sutando main.swift -framework Cocoa -framework Carbon -framework ApplicationServices"
+  fi
+else
+  echo "  ✓ Sutando (already running)"
+fi
+
 echo ""
 
 # 6. Telegram bridge (optional — needs TELEGRAM_BOT_TOKEN)

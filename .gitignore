@@ -41,3 +41,4 @@ skills/personal-*/
 tests/security/*.md
 !tests/security/*.md.example
 skills/schedule-crons/crons.json
+src/Sutando/Sutando
