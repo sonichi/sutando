@@ -609,10 +609,11 @@ async function createCallSession(params: {
 	// Bypasses ClientTransport's internal WebSocket for lower latency
 	const sessionAny = session as any;
 	let isReplaying = false; // suppress audio during reconnect replay
+	let _isRecordingMuted: (() => boolean) | null = null;
+	import('../../../src/browser-tools.js').then(bt => { _isRecordingMuted = bt.isRecordingMuted; }).catch(() => {});
 	sessionAny.handleAudioOutput = (data: string) => {
 		sessionAny.notificationQueue?.markAudioReceived?.();
-		const { isRecordingMuted } = require('../../../src/browser-tools.js');
-		if (isReplaying || isRecordingMuted()) return;
+		if (isReplaying || _isRecordingMuted?.()) return;
 		if (params.twilioWs.readyState === WebSocket.OPEN) {
 			const pcmBuf = Buffer.from(data, 'base64');
 			const mulawBuf = pcm24kToMulaw8k(pcmBuf);
@@ -629,7 +630,7 @@ async function createCallSession(params: {
 	};
 
 	// Set up recording hooks (tool trigger, narration push, etc)
-	try { require('../../../src/browser-tools.js').setupRecordingHooks(session); } catch {}
+	import('../../../src/browser-tools.js').then(bt => bt.setupRecordingHooks(session)).catch(() => {});
 
 	// Track transcripts via event bus + run goodbye detection
 	// Use a processed count per-session that resets on reconnect to avoid duplicates.
@@ -702,7 +703,7 @@ async function createCallSession(params: {
 					sessionAny.handleClientConnected();
 					setTimeout(() => {
 						isReplaying = false;
-						try { require('../../../src/browser-tools.js').onReconnect(session); } catch {}
+						import('../../../src/browser-tools.js').then(bt => bt.onReconnect(session)).catch(() => {});
 					}, 6000);
 				}
 			}, 1500);
@@ -722,7 +723,7 @@ function cleanupCall(callSid: string): void {
 	activeCalls.delete(callSid);
 	if (session.meetingId) pendingMeetingJoins.delete(session.meetingId);
 
-	try { require('../../../src/browser-tools.js').onCallEnd(); } catch {}
+	import('../../../src/browser-tools.js').then(bt => bt.onCallEnd()).catch(() => {});
 
 	// Close VoiceSession
 	session.voiceSession.close('call_ended').catch(e =>

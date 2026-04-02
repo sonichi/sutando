@@ -185,10 +185,11 @@ async function describeScreenshot(imagePath: string): Promise<string> {
 				body: JSON.stringify({
 					contents: [{
 						parts: [
-							{ text: 'Describe what is on screen in exactly 1 sentence. Read the main heading and key content. Be specific — quote exact text. This will be spoken aloud.' },
+							{ text: 'Describe what is on screen in exactly 1 short sentence (max 20 words). Quote the main heading. This will be spoken aloud.' },
 							{ inlineData: { mimeType, data: imageData } },
 						],
 					}],
+					generationConfig: { maxOutputTokens: 40 },
 				}),
 			},
 		);
@@ -363,21 +364,43 @@ export function onCallEnd(): void {
  * Called by conversation-server when scroll_and_describe starts.
  * Handles: description pushing, stop detection, mute/unmute, reconnect narration.
  */
+let narrationActive = false;
+
 export function startRecordingNarration(session: any): void {
-	// Read scroll info for description interval
+	if (narrationActive) return; // prevent duplicate controllers
+	narrationActive = true;
+
+	// Read scroll info for description interval + duration
 	let descIntervalMs = 8000;
+	let durationMs = 30000;
 	try {
 		if (existsSync('/tmp/sutando-scroll-info.json')) {
 			const info = JSON.parse(readFileSync('/tmp/sutando-scroll-info.json', 'utf8'));
 			descIntervalMs = Math.max(Math.round((info.msPerViewport || 8000) * 0.7), 5000);
-			console.log(`${ts()} [Recording] description interval: ${descIntervalMs}ms`);
+			durationMs = (info.duration_seconds || 30) * 1000;
+			console.log(`${ts()} [Recording] interval: ${descIntervalMs}ms, duration: ${durationMs}ms`);
 		}
 	} catch {}
 
 	let lastDesc = '';
+	const previousDescs: string[] = []; // track all narrated descriptions
+	const startTime = Date.now();
+	const STOP_PUSHING_BEFORE_END_MS = 8000; // stop pushing 8s before recording ends
 
 	const pushDescription = async () => {
 		if (!existsSync('/tmp/sutando-screen-record.pid')) return;
+		// Stop pushing near the end so Gemini finishes naturally
+		const elapsed = Date.now() - startTime;
+		if (elapsed > durationMs - STOP_PUSHING_BEFORE_END_MS) {
+			console.log(`${ts()} [Recording] near end — stopped pushing`);
+			clearInterval(descTimer);
+			try {
+				session.transport.sendContent([
+					{ role: 'user', text: '[System: Recording ending soon. Finish your current sentence and stop.]' },
+				], true);
+			} catch {}
+			return;
+		}
 		try {
 			const path = await captureScreen();
 			if (!path) return;
@@ -387,9 +410,12 @@ export function startRecordingNarration(session: any): void {
 				return;
 			}
 			lastDesc = desc;
+			previousDescs.push(desc);
 			if (!existsSync('/tmp/sutando-screen-record.pid')) return;
+			const remaining = Math.round((durationMs - (Date.now() - startTime)) / 1000);
+			const alreadySaid = previousDescs.slice(0, -1).map((d, i) => `${i + 1}. ${d.slice(0, 40)}`).join('; ');
 			session.transport.sendContent([
-				{ role: 'user', text: `[System: The page has scrolled to new content. Narrate this NEW section (do NOT repeat earlier narration): "${desc}"]` },
+				{ role: 'user', text: `[System: ${remaining}s left. Already narrated: ${alreadySaid || 'nothing yet'}. Now narrate this NEW content only (1 short sentence, no repeats): "${desc}"]` },
 			], true);
 			console.log(`${ts()} [Recording] pushed: ${desc.slice(0, 60)}...`);
 		} catch (err) {
@@ -401,27 +427,19 @@ export function startRecordingNarration(session: any): void {
 	setTimeout(pushDescription, 5000);
 	const descTimer = setInterval(pushDescription, descIntervalMs);
 
-	// Stop watcher — poll for PID file removal
-	const stopPoll = setInterval(() => {
-		if (!existsSync('/tmp/sutando-screen-record.pid')) {
-			clearInterval(stopPoll);
-			clearInterval(descTimer);
-			recordingState.muted = true;
-			console.log(`${ts()} [Recording] ended — muted`);
-			try {
-				session.transport.sendContent([
-					{ role: 'user', text: '[System: Recording complete. Say "The recording is complete." and nothing else.]' },
-				], true);
-			} catch {}
-			setTimeout(() => {
-				recordingState.muted = false;
-				console.log(`${ts()} [Recording] unmuted after 3s`);
-			}, 3000);
-		}
-	}, 500);
-
-	// Safety timeout
-	setTimeout(() => { clearInterval(stopPoll); clearInterval(descTimer); }, 90_000);
+	// Timer-based stop — uses known duration, no polling
+	// Stop pushing 8s before end (already handled in pushDescription)
+	// At exactly durationMs: clear timers, send "recording complete"
+	setTimeout(() => {
+		clearInterval(descTimer);
+		narrationActive = false;
+		console.log(`${ts()} [Recording] timer fired — sending stop`);
+		try {
+			session.transport.sendContent([
+				{ role: 'user', text: '[System: Recording just ended. Say "The recording is complete." immediately.]' },
+			], true);
+		} catch {}
+	}, durationMs + 1000); // +1s buffer for auto-stop to finish
 }
 
 // --- Play recording ---
