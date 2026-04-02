@@ -1,21 +1,21 @@
 #!/bin/bash
-# Hook script: checks for unprocessed task files in tasks/.
-# Used as a Stop hook to prevent Claude from finishing a response
-# while tasks remain unprocessed.
-# Output: JSON with additionalContext if tasks found.
+# Stop hook: blocks Claude from finishing when unprocessed tasks exist.
+# Skips tasks that already have a corresponding result file.
 
 TASKS_DIR="$(cd "$(dirname "$0")/.." && pwd)/tasks"
+RESULTS_DIR="$(cd "$(dirname "$0")/.." && pwd)/results"
 
-# Check for .txt task files
-if ls "$TASKS_DIR"/*.txt >/dev/null 2>&1; then
-  CONTENT="UNPROCESSED TASKS FOUND — you MUST process these before stopping:\n"
-  for f in "$TASKS_DIR"/*.txt; do
-    CONTENT+="\n--- $(basename "$f") ---\n"
-    CONTENT+="$(cat "$f")\n"
-  done
-  # Block stopping and inject task content
-  printf '{"decision":"block","reason":"Unprocessed tasks in tasks/ directory","additionalContext":"%s"}' "$(echo -e "$CONTENT" | sed 's/"/\\"/g' | tr '\n' ' ')"
+UNPROCESSED=""
+shopt -s nullglob 2>/dev/null
+for f in "$TASKS_DIR"/*.txt; do
+  BASENAME=$(basename "$f")
+  # Skip if result already exists
+  [ -f "$RESULTS_DIR/$BASENAME" ] && continue
+  UNPROCESSED+="--- $BASENAME ---\n$(cat "$f")\n\n"
+done
+
+if [ -n "$UNPROCESSED" ]; then
+  printf '{"decision":"block","reason":"Unprocessed tasks in tasks/","additionalContext":"UNPROCESSED TASKS — process these NOW:\n%s"}' "$(echo -e "$UNPROCESSED" | sed 's/"/\\"/g' | tr '\n' ' ')"
 else
-  # No tasks — allow stop
   echo '{}'
 fi
