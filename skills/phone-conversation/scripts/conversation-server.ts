@@ -332,11 +332,13 @@ function buildAgent(callSession: CallSession): MainAgent {
 		].filter(Boolean).join('\n');
 	} else {
 		const isInbound = callSession.purpose === 'inbound';
-		// Load Stand identity (no voice-context.txt — that's web-only, can confuse phone identity)
+		// Load Stand identity + optional context
 		const standId = (() => { try { const si = JSON.parse(readFileSync('stand-identity.json', 'utf-8')); return si.name ? `Your Stand name is ${si.name}. When asked your name, say "I'm Sutando — ${si.name}."` : ''; } catch { return ''; } })();
+		const voiceCtx = (() => { try { return readFileSync('voice-context.txt', 'utf-8'); } catch { return ''; } })();
 		instructions = [
 			'You are Sutando, a personal AI assistant.',
 			standId,
+			voiceCtx,
 			// Identity & greeting — based on owner vs verified vs unverified
 			isInbound && callSession.isOwner
 				? `Your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''} is calling you. YOU are Sutando — the AI assistant. The person on the phone is your OWNER, a human. Do NOT confuse yourself with the caller. You have full capabilities — use the work tool for anything: check the screen, send emails, look things up, make calls, browse the web, or check results of previous tasks. Say exactly: "Hi, this is Sutando. How can I help?" then WAIT for them to speak. Do NOT say anything else before they talk. Do NOT make up tasks, scenarios, or pretend you were doing something.${(() => { const ctx = getSafeContext(); return ctx ? `\n\nRecent voice conversation (for context — do NOT repeat or bring up unless asked):\n${ctx}` : ''; })()}`
