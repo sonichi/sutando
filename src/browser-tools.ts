@@ -170,9 +170,10 @@ async function describeScreenshot(imagePath: string): Promise<string> {
 	if (!apiKey) return 'Vision description unavailable (no GEMINI_API_KEY)';
 	try {
 		// Resize to 800px for faster API calls
-		const resized = imagePath.replace('.png', '-sm.jpg');
+		const safePath = imagePath.replace(/[^a-zA-Z0-9_\-./]/g, '');
+		const resized = safePath.replace('.png', '-sm.jpg');
 		try {
-			execSync(`sips -Z 800 -s format jpeg "${imagePath}" --out "${resized}" 2>/dev/null`, { timeout: 2_000 });
+			execSync(`sips -Z 800 -s format jpeg "${safePath}" --out "${resized}" 2>/dev/null`, { timeout: 2_000 });
 		} catch { /* use original if resize fails */ }
 		const actualPath = existsSync(resized) ? resized : imagePath;
 		const mimeType = actualPath.endsWith('.jpg') ? 'image/jpeg' : 'image/png';
