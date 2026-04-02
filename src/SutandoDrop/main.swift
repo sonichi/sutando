@@ -8,6 +8,7 @@ import Carbon
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var hotKeyRef: EventHotKeyRef?
+    var voiceHotKeyRef: EventHotKeyRef?
     let workspace = NSHomeDirectory() + "/Desktop/sutando"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -27,6 +28,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Drop Context (⌃C)", action: #selector(dropContext), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Toggle Voice (⌃V)", action: #selector(toggleVoice), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
         statusItem.menu = menu
@@ -54,11 +56,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // Install handler
+        // Register ⌃V for voice toggle (hotkey ID 2)
+        var voiceHotKeyID = EventHotKeyID()
+        voiceHotKeyID.signature = OSType(0x5355_5444) // "SUTD"
+        voiceHotKeyID.id = 2
+        RegisterEventHotKey(
+            UInt32(kVK_ANSI_V),
+            UInt32(controlKey),
+            voiceHotKeyID,
+            GetApplicationEventTarget(),
+            0,
+            &voiceHotKeyRef
+        )
+
+        // Install handler — dispatch by hotkey ID
         var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         InstallEventHandler(GetApplicationEventTarget(), { (_, event, _) -> OSStatus in
+            var hotKeyID = EventHotKeyID()
+            GetEventParameter(event!, EventParamName(kEventParamDirectObject),
+                              EventParamType(typeEventHotKeyID), nil,
+                              MemoryLayout<EventHotKeyID>.size, nil, &hotKeyID)
             let appDelegate = NSApplication.shared.delegate as! AppDelegate
-            appDelegate.dropContext()
+            switch hotKeyID.id {
+            case 1: appDelegate.dropContext()
+            case 2: appDelegate.toggleVoice()
+            default: break
+            }
             return noErr
         }, 1, &eventType, nil, nil)
     }
@@ -160,6 +183,31 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 appendLog(logFile, "[\(timestamp)] Nothing selected")
             }
         }
+    }
+
+    // MARK: - Voice Toggle
+
+    @objc func toggleVoice() {
+        let url = URL(string: "http://localhost:7843/voice/toggle")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = "{}".data(using: .utf8)
+        let task = URLSession.shared.dataTask(with: request) { [self] data, response, error in
+            if let data = data,
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let state = json["state"] as? String {
+                DispatchQueue.main.async {
+                    self.notify("Sutando", "Voice: \(state)")
+                }
+            } else {
+                DispatchQueue.main.async {
+                    self.notify("Sutando", "Voice toggle failed — is agent-api running?")
+                }
+            }
+        }
+        task.resume()
+        NSSound.beep()
     }
 
     // MARK: - Helpers

@@ -347,6 +347,18 @@ window.addEventListener('DOMContentLoaded', () => {
   initChromeStt();
   // Auto-reconnect voice if it was connected before refresh
   try { if (sessionStorage.getItem('sutando-voice')) { setTimeout(() => toggle(), 500); } } catch {}
+  // Poll voice state from agent-api for remote toggle (⌃V from SutandoDrop)
+  setInterval(async () => {
+    try {
+      const apiPort = 7843;
+      const res = await fetch(`http://${location.hostname}:${apiPort}/voice/state`);
+      if (res.ok) {
+        const { state } = await res.json();
+        const shouldBeConnected = state === 'connected';
+        if (shouldBeConnected !== connected) { toggle(); }
+      }
+    } catch {}
+  }, 1000);
 });
 
 // ─── State ────────────────────────────────────────────────
