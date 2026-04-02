@@ -688,17 +688,30 @@ export const dismissTool: ToolDefinition = {
 	execution: 'inline',
 	async execute() {
 		try {
-			// Cmd+W opens leave dialog, Enter confirms (End/Leave)
+			// 1. Stop screen share (Cmd+Shift+S), 2. Cmd+W leave dialog, 3. Enter confirm
 			execSync(`osascript -e '
 tell application "zoom.us"
 	activate
 end tell
 delay 0.5
 tell application "System Events"
-	keystroke "w" using command down
+	-- Stop screen share first
+	keystroke "s" using {command down, shift down}
 	delay 1
+	-- Open leave dialog
+	keystroke "w" using command down
+	delay 1.5
+	-- Confirm (Enter hits default "End meeting for all")
 	key code 36
-end tell'`, { timeout: 10_000 });
+end tell'`, { timeout: 15_000 });
+			// Verify — if Zoom still has meeting windows, force kill
+			try {
+				const check = execSync(`osascript -e 'tell application "System Events" to tell process "zoom.us" to return count of windows'`, { timeout: 3_000 }).toString().trim();
+				if (parseInt(check) > 2) {
+					execSync('killall "zoom.us" 2>/dev/null; sleep 1', { timeout: 5_000 });
+					console.log(`${ts()} [Dismiss] Force killed Zoom (${check} windows remaining)`);
+				}
+			} catch {}
 			console.log(`${ts()} [Dismiss] Left Zoom meeting`);
 			return { status: 'left_meeting' };
 		} catch (err) {
