@@ -185,8 +185,11 @@ open -a "Slack"
 open "https://github.com"           # open URL in default browser
 ```
 
-**Context drop** — user can drop selected text into workspace via a keyboard shortcut (configured in macOS Shortcuts.app).
-Check `context-drop.txt` in the workspace root for dropped context.
+**Context drop + shortcuts** — the Sutando menu bar app (`src/Sutando/`) provides global hotkeys:
+- ⌃C — drop selected text, clipboard image, or Finder file to `tasks/`
+- ⌃V — toggle voice connection in the browser
+- ⌃M — toggle mute during voice
+Launches automatically via `startup.sh`. Check `tasks/` for dropped context.
 
 **Learn from demonstration** — when the user says "learn this", "remember my preference", "I always do it this way", or demonstrates a pattern:
 

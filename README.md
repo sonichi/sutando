@@ -96,7 +96,7 @@ This starts all services (voice agent, web client, dashboard, API) and opens htt
 
 **macOS permissions** — grant these on first run (System Settings → Privacy & Security):
 - **Screen Recording** → add `claude` and `node`
-- **Accessibility** → add Shortcuts.app (for context drop)
+- **Accessibility** → add Sutando app (for context drop + voice toggle)
 - **Microphone** → Chrome will ask on first voice connect
 
 **Try saying:**
@@ -133,7 +133,7 @@ These unlock more capabilities. Add to `.env` when ready:
 | Telegram | Message Sutando from your phone | [Create bot via @BotFather](https://t.me/BotFather), then `/telegram:configure <token>` |
 | Discord | Message Sutando from Discord (DM + channel @mentions) | [Developer portal](https://discord.com/developers), then `/discord:configure <token>` |
 | Claude for Chrome | Browser automation — navigate, read pages, fill forms, interact with web apps | [Install extension](https://claude.ai/chrome), log in with the same account as Claude Code |
-| Context drop | Send selected text to Sutando from any app via hotkey | See [setup below](#context-drop-setup) |
+| Sutando app (menu bar) | Global shortcuts: ⌃C context drop, ⌃V voice toggle, ⌃M mute | Auto-launches via `startup.sh` |
 
 ---
 
@@ -145,7 +145,7 @@ These unlock more capabilities. Add to `.env` when ready:
 | Task delegation (voice → Claude) | `task-bridge.ts` | Verified |
 | Screen capture + analysis | `macos-tools` skill | Verified |
 | Notes / second brain | via CLAUDE.md | Verified |
-| Context drop (hotkey → agent) | `context-drop.sh` | Verified |
+| Context drop + shortcuts | `src/Sutando/` menu bar app | Verified |
 | Gmail read/send/search | `gws-gmail` skill | Verified |
 | Calendar reading | `google-calendar` skill | Verified |
 | Reminders management | `macos-tools` skill | Verified |
@@ -182,18 +182,19 @@ When running, Sutando exposes these local ports:
 
 ---
 
-## Context drop setup
+## Keyboard shortcuts
 
-Send any selected text to Sutando with a keyboard shortcut.
+The Sutando menu bar app (`src/Sutando/`) provides global keyboard shortcuts. It launches automatically via `startup.sh`.
 
-1. Open **Automator** → New → **Quick Action**
-2. Set "Workflow receives" → **no input** in **any application**
-3. Add action: **Run Shell Script** → paste: `bash /path/to/sutando/src/context-drop.sh`
-4. Save as "Sutando: Drop Context"
-5. Go to **System Settings → Keyboard → Keyboard Shortcuts → Services** → assign a shortcut to "Sutando: Drop Context"
-6. Grant **Accessibility** permission to Shortcuts.app in System Settings → Privacy & Security
+| Shortcut | Action |
+|----------|--------|
+| ⌃C | **Context drop** — sends selected text, clipboard image, or Finder file to Sutando |
+| ⌃V | **Voice toggle** — connects/disconnects voice in the browser |
+| ⌃M | **Mute toggle** — mutes/unmutes microphone during voice |
 
-Now select any text and press your shortcut — Sutando reads it and acts on it.
+On first run, grant **Accessibility** permission to the Sutando app in System Settings → Privacy & Security.
+
+To compile manually: `cd src/Sutando && swiftc -o Sutando main.swift -framework Cocoa -framework Carbon -framework ApplicationServices`
 
 ---
 
