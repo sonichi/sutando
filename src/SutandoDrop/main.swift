@@ -188,25 +188,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Voice Toggle
 
     @objc func toggleVoice() {
-        let url = URL(string: "http://localhost:7843/voice/toggle")!
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = "{}".data(using: .utf8)
-        let task = URLSession.shared.dataTask(with: request) { [self] data, response, error in
-            if let data = data,
-               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let state = json["state"] as? String {
-                DispatchQueue.main.async {
-                    self.notify("Sutando", "Voice: \(state)")
-                }
-            } else {
-                DispatchQueue.main.async {
-                    self.notify("Sutando", "Voice toggle failed — is agent-api running?")
-                }
-            }
-        }
-        task.resume()
+        // Click the voice button in Chrome via AppleScript
+        let script = NSAppleScript(source: """
+        tell application "Google Chrome"
+            set found to false
+            repeat with w in windows
+                repeat with t in tabs of w
+                    if URL of t contains "localhost:8080" then
+                        tell t to execute javascript "document.querySelector('.btn-hero, .btn-voice').click()"
+                        set found to true
+                        exit repeat
+                    end if
+                end repeat
+                if found then exit repeat
+            end repeat
+            if not found then
+                open location "http://localhost:8080"
+            end if
+        end tell
+        """)
+        script?.executeAndReturnError(nil)
         NSSound.beep()
     }
 
