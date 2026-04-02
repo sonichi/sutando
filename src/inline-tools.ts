@@ -688,7 +688,7 @@ export const dismissTool: ToolDefinition = {
 	execution: 'inline',
 	async execute() {
 		try {
-			// Click "Leave Meeting" in Zoom via AppleScript
+			// Stop screen sharing first (if active), then leave via menu bar
 			execSync(`osascript -e '
 tell application "zoom.us"
 	activate
@@ -696,17 +696,26 @@ end tell
 delay 0.5
 tell application "System Events"
 	tell process "zoom.us"
-		-- Try the Leave button in the meeting toolbar
+		-- Stop screen sharing first if active
 		try
-			click button "Leave" of window 1
+			click menu item "Stop Share" of menu "Meeting" of menu bar 1
 			delay 0.5
-			-- Click "Leave Meeting" in the confirmation dialog
+		end try
+		-- Leave via menu bar (reliable regardless of toolbar state)
+		try
+			click menu item "Leave Meeting" of menu "Meeting" of menu bar 1
+			delay 0.5
+			-- Confirm leave
 			try
 				click button "Leave Meeting" of window 1
 			end try
 		on error
-			-- Fallback: use menu bar
-			click menu item "Leave Meeting" of menu "Meeting" of menu bar 1
+			-- Fallback: try button approach
+			try
+				click button "Leave" of window 1
+				delay 0.5
+				click button "Leave Meeting" of window 1
+			end try
 		end try
 	end tell
 end tell'`, { timeout: 10_000 });
@@ -1117,10 +1126,12 @@ export const slideControlTool: ToolDefinition = {
 	async execute(args) {
 		const { action, slideNumber } = args as { action: 'next' | 'previous' | 'goto'; slideNumber?: number };
 		try {
-			const jsCall = action === 'goto' && slideNumber
-				? `goTo(${slideNumber - 1})`
-				: action === 'next' ? 'next()' : 'prev()';
-			// Find the slides tab and execute JS directly
+			const key = action === 'next' ? 'ArrowRight' : 'ArrowLeft';
+			const js = action === 'goto' && slideNumber
+				? `document.dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowLeft"}));`.repeat(10) + `document.dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowRight"}));`.repeat(slideNumber - 1)
+				: `document.dispatchEvent(new KeyboardEvent("keydown",{key:"${key}"}))`;
+			// Find the slides tab and dispatch keyboard event
+			const escaped = js.replace(/"/g, '\\"');
 			execSync(`osascript -e '
 tell application "Google Chrome"
 	repeat with w in windows
@@ -1128,8 +1139,7 @@ tell application "Google Chrome"
 		repeat with i from 1 to count of tabList
 			set tabUrl to URL of item i of tabList
 			if tabUrl contains "index-sutando" or tabUrl contains "index-bodhi" or tabUrl contains "localhost:8888" then
-				set active tab index of w to i
-				tell item i of tabList to execute javascript "${jsCall}"
+				tell item i of tabList to execute javascript "${escaped}"
 				return "done"
 			end if
 		end repeat
