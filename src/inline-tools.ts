@@ -1120,25 +1120,41 @@ export const slideControlTool: ToolDefinition = {
 		const { action, slideNumber } = args as { action: 'next' | 'previous' | 'goto'; slideNumber?: number };
 		try {
 			const key = action === 'next' ? 'ArrowRight' : 'ArrowLeft';
-			const js = action === 'goto' && slideNumber
-				? `document.dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowLeft"}));`.repeat(10) + `document.dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowRight"}));`.repeat(slideNumber - 1)
-				: `document.dispatchEvent(new KeyboardEvent("keydown",{key:"${key}"}))`;
-			// Find the slides tab and dispatch keyboard event
-			const escaped = js.replace(/"/g, '\\"');
-			execSync(`osascript -e '
-tell application "Google Chrome"
+			const dispatch = `execute javascript "document.dispatchEvent(new KeyboardEvent(\\"keydown\\",{key:\\"${key}\\"}))"`;
+			let script: string;
+			if (action === 'goto' && slideNumber) {
+				// Go left 10 times (to slide 1), then right (slideNumber-1) times, with delays
+				const leftPresses = Array(10).fill(`tell theTab to execute javascript "document.dispatchEvent(new KeyboardEvent(\\"keydown\\",{key:\\"ArrowLeft\\"}))"
+						delay 0.15`).join('\n						');
+				const rightPresses = Array(Math.max(0, slideNumber - 1)).fill(`tell theTab to execute javascript "document.dispatchEvent(new KeyboardEvent(\\"keydown\\",{key:\\"ArrowRight\\"}))"
+						delay 0.15`).join('\n						');
+				script = `tell application "Google Chrome"
 	repeat with w in windows
 		set tabList to tabs of w
 		repeat with i from 1 to count of tabList
-			set tabUrl to URL of item i of tabList
-			if tabUrl contains "index-sutando" or tabUrl contains "index-bodhi" or tabUrl contains "localhost:8888" then
-				tell item i of tabList to execute javascript "${escaped}"
+			if URL of item i of tabList contains "index-sutando" or URL of item i of tabList contains "localhost:8888" then
+				set theTab to item i of tabList
+				${leftPresses}
+				${rightPresses}
 				return "done"
 			end if
 		end repeat
 	end repeat
-	return "no slides tab"
-end tell'`, { timeout: 5_000 });
+end tell`;
+			} else {
+				script = `tell application "Google Chrome"
+	repeat with w in windows
+		set tabList to tabs of w
+		repeat with i from 1 to count of tabList
+			if URL of item i of tabList contains "index-sutando" or URL of item i of tabList contains "localhost:8888" then
+				tell item i of tabList to ${dispatch}
+				return "done"
+			end if
+		end repeat
+	end repeat
+end tell`;
+			}
+			execSync(`osascript -e '${script}'`, { timeout: 15_000 });
 			console.log(`${ts()} [Slides] ${action}${slideNumber ? ` → slide ${slideNumber}` : ''}`);
 			return { status: 'done', action, slideNumber };
 		} catch (err) {
