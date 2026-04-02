@@ -1264,6 +1264,7 @@ export const ownerOnlyTools = [
 	switchAppTool, captureScreenTool, typeTextTool,
 	clipboardTool, cancelTaskTool, toggleTasksTool, summonTool, dismissTool,
 	joinZoomTool, joinGmeetTool, callContactTool, slideControlTool, fullscreenTool,
+	describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool,
 ];
 
 /** Configurable tools — default to owner-only, can be opened to verified callers */
