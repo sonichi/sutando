@@ -549,6 +549,51 @@ else:
 	},
 };
 
+export const dismissTool: ToolDefinition = {
+	name: 'dismiss',
+	description:
+		'Leave the current Zoom meeting. The opposite of summon/join_zoom. ' +
+		'Use when user says "dismiss", "leave zoom", "end meeting", "leave the call", "hang up zoom".',
+	parameters: z.object({}),
+	execution: 'inline',
+	async execute() {
+		try {
+			// 1. Stop screen share (Cmd+Shift+S), 2. Cmd+W leave dialog, 3. Enter confirm
+			execSync(`osascript -e '
+tell application "zoom.us"
+	activate
+end tell
+delay 0.5
+tell application "System Events"
+	-- Stop screen share first
+	keystroke "s" using {command down, shift down}
+	delay 1
+	-- Open leave dialog
+	keystroke "w" using command down
+	delay 1.5
+	-- Confirm (Enter hits default "End meeting for all")
+	key code 36
+end tell'`, { timeout: 15_000 });
+			// Verify — if Zoom still has meeting windows, force kill
+			try {
+				const check = execSync(`osascript -e 'tell application "System Events" to tell process "zoom.us" to return count of windows'`, { timeout: 3_000 }).toString().trim();
+				if (parseInt(check) > 2) {
+					execSync('killall "zoom.us" 2>/dev/null; sleep 1', { timeout: 5_000 });
+					console.log(`${ts()} [Dismiss] Force killed Zoom (${check} windows remaining)`);
+				}
+			} catch {}
+			console.log(`${ts()} [Dismiss] Left Zoom meeting`);
+			return { status: 'left_meeting' };
+		} catch (err) {
+			return { error: `Dismiss failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
+// Join Zoom via desktop app + computer audio (no screen share)
+export const joinZoomTool: ToolDefinition = {
+	name: 'join_zoom',
+	description: 'Join a Zoom meeting via the desktop app with computer audio. No screen sharing. Use when user says "join the zoom", "join meeting", or provides a Zoom meeting ID.',
 // Join Zoom via desktop app + computer audio (no screen share)
 export const joinZoomTool: ToolDefinition = {
 	name: 'join_zoom',
@@ -935,14 +980,58 @@ end tell`;
 };
 
 
+export const slideControlTool: ToolDefinition = {
+	name: 'slide_control',
+	description:
+		'Control presentation slides. Use when user says "next slide", "previous slide", "go back", "go to slide 3". ' +
+		'Sends arrow keys to the frontmost browser window.',
+	parameters: z.object({
+		action: z.enum(['next', 'previous', 'goto']).describe('Navigation action'),
+		slideNumber: z.number().optional().describe('Slide number for goto action'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { action, slideNumber } = args as { action: 'next' | 'previous' | 'goto'; slideNumber?: number };
+		try {
+			const key = action === 'next' ? 'ArrowRight' : 'ArrowLeft';
+			const dispatch = `execute javascript "document.dispatchEvent(new KeyboardEvent(\\"keydown\\",{key:\\"${key}\\"}))"`;
+			let script: string;
+			if (action === 'goto' && slideNumber) {
+				// Go left 10 times (to slide 1), then right (slideNumber-1) times, with delays
+				const leftPresses = Array(10).fill(`tell theTab to execute javascript "document.dispatchEvent(new KeyboardEvent(\\"keydown\\",{key:\\"ArrowLeft\\"}))"
+						delay 0.15`).join('\n						');
+				const rightPresses = Array(Math.max(0, slideNumber - 1)).fill(`tell theTab to execute javascript "document.dispatchEvent(new KeyboardEvent(\\"keydown\\",{key:\\"ArrowRight\\"}))"
+						delay 0.15`).join('\n						');
+				script = `tell application "Google Chrome"
+	repeat with w in windows
+		set tabList to tabs of w
+		repeat with i from 1 to count of tabList
+			if URL of item i of tabList contains "index-sutando" or URL of item i of tabList contains "localhost:8888" then
+				set theTab to item i of tabList
+				${leftPresses}
+				${rightPresses}
+				return "done"
+			end if
+		end repeat
+	end repeat
+end tell`;
+			} else {
+				script = `tell application "Google Chrome"
+	repeat with w in windows
+		set tabList to tabs of w
+		repeat with i from 1 to count of tabList
+			if URL of item i of tabList contains "index-sutando" or URL of item i of tabList contains "localhost:8888" then
+				tell item i of tabList to ${dispatch}
+				return "done"
+			end if
 /** All inline tools — import and spread into your tools list */
 export const inlineTools = [
 	scrollTool, switchTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
 	volumeTool, brightnessTool, clipboardTool,
-	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, summonTool,
+	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, summonTool, dismissTool,
 	joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool,
-	describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool,
+	describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool, slideControlTool,
 ];
 
 /** Tools available to any caller (including unverified) */
@@ -955,9 +1044,9 @@ export const ownerOnlyTools = [
 	volumeTool, brightnessTool,
 	scrollTool, switchTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
-	clipboardTool, cancelTaskTool, toggleTasksTool, summonTool,
+	clipboardTool, cancelTaskTool, toggleTasksTool, summonTool, dismissTool,
 	joinZoomTool, joinGmeetTool, callContactTool,
-	describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool,
+	describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool, slideControlTool,
 ];
 
 /** Configurable tools — default to owner-only, can be opened to verified callers */
