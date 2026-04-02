@@ -13,6 +13,7 @@ pkill -f "screen-capture-server" 2>/dev/null
 pkill -f "telegram-bridge" 2>/dev/null
 pkill -f "discord-bridge" 2>/dev/null
 pkill -f "watch-tasks" 2>/dev/null
+pkill -f "src/Sutando/Sutando" 2>/dev/null
 
 # Clear stale results to prevent flood on restart
 rm -f "$REPO"/results/*.txt 2>/dev/null
