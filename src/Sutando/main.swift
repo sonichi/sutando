@@ -9,6 +9,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var hotKeyRef: EventHotKeyRef?
     var voiceHotKeyRef: EventHotKeyRef?
+    var muteHotKeyRef: EventHotKeyRef?
     let workspace = NSHomeDirectory() + "/Desktop/sutando"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -29,6 +30,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Drop Context (⌃C)", action: #selector(dropContext), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Toggle Voice (⌃V)", action: #selector(toggleVoice), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Toggle Mute (⌃M)", action: #selector(toggleMute), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
         statusItem.menu = menu
@@ -69,6 +71,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             &voiceHotKeyRef
         )
 
+        // Register ⌃M for mute toggle (hotkey ID 3)
+        var muteHotKeyID = EventHotKeyID()
+        muteHotKeyID.signature = OSType(0x5355_5444) // "SUTD"
+        muteHotKeyID.id = 3
+        RegisterEventHotKey(
+            UInt32(kVK_ANSI_M),
+            UInt32(controlKey),
+            muteHotKeyID,
+            GetApplicationEventTarget(),
+            0,
+            &muteHotKeyRef
+        )
+
         // Install handler — dispatch by hotkey ID
         var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         InstallEventHandler(GetApplicationEventTarget(), { (_, event, _) -> OSStatus in
@@ -80,6 +95,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             switch hotKeyID.id {
             case 1: appDelegate.dropContext()
             case 2: appDelegate.toggleVoice()
+            case 3: appDelegate.toggleMute()
             default: break
             }
             return noErr
@@ -205,6 +221,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if not found then
                 open location "http://localhost:8080"
             end if
+        end tell
+        """)
+        script?.executeAndReturnError(nil)
+        NSSound.beep()
+    }
+
+    @objc func toggleMute() {
+        // Click the mute button in Chrome via AppleScript
+        let script = NSAppleScript(source: """
+        tell application "Google Chrome"
+            repeat with w in windows
+                repeat with t in tabs of w
+                    if URL of t contains "localhost:8080" then
+                        tell t to execute javascript "document.querySelector('.btn-mute').click()"
+                        exit repeat
+                    end if
+                end repeat
+            end repeat
         end tell
         """)
         script?.executeAndReturnError(nil)
