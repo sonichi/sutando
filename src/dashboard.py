@@ -261,6 +261,18 @@ def render_dashboard() -> str:
     if matrix_html:
         cards.append(f'<div class="card full"><h2>Capabilities Matrix</h2>{matrix_html}</div>')
 
+    # Keyboard shortcuts
+    sutando_running = subprocess.run(["pgrep", "-f", "src/Sutando/Sutando"], capture_output=True).returncode == 0
+    shortcut_status = '<span class="ok">✓</span> Sutando app running' if sutando_running else '<span class="bad">✗</span> Sutando app not running'
+    cards.append(f"""<div class="card">
+<h2>Keyboard Shortcuts</h2>
+<div class="check">{shortcut_status}</div>
+<div style="margin-top:8px;font-size:12px;color:#555">
+<div style="margin:4px 0"><kbd style="background:#222;color:#aaa;padding:2px 6px;border-radius:3px;font-family:monospace">⌃C</kbd> Context drop (text/image/file)</div>
+<div style="margin:4px 0"><kbd style="background:#222;color:#aaa;padding:2px 6px;border-radius:3px;font-family:monospace">⌃V</kbd> Toggle voice</div>
+<div style="margin:4px 0"><kbd style="background:#222;color:#aaa;padding:2px 6px;border-radius:3px;font-family:monospace">⌃M</kbd> Toggle mute</div>
+</div></div>""")
+
     # Quick links
     cards.append(f"""<div class="card full">
 <h2>Quick Links</h2>

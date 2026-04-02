@@ -33,6 +33,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Toggle Mute (⌃M)", action: #selector(toggleMute), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Open Core", action: #selector(openCore), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Open Dashboard", action: #selector(openDashboard), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
         statusItem.menu = menu
     }
@@ -248,6 +249,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func openCore() {
         NSWorkspace.shared.open(URL(string: "http://localhost:8080")!)
+    }
+
+    @objc func openDashboard() {
+        NSWorkspace.shared.open(URL(string: "http://localhost:7844")!)
     }
 
     // MARK: - Helpers
