@@ -1103,6 +1103,48 @@ end tell`;
 	},
 };
 
+// Slide control — navigate presentation slides
+export const slideControlTool: ToolDefinition = {
+	name: 'slide_control',
+	description:
+		'Control presentation slides. Use when user says "next slide", "previous slide", "go back", "go to slide 3". ' +
+		'Sends arrow keys to the frontmost browser window.',
+	parameters: z.object({
+		action: z.enum(['next', 'previous', 'goto']).describe('Navigation action'),
+		slideNumber: z.number().optional().describe('Slide number for goto action'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { action, slideNumber } = args as { action: 'next' | 'previous' | 'goto'; slideNumber?: number };
+		try {
+			if (action === 'goto' && slideNumber) {
+				// Press Home to go to slide 1, then press right (slideNumber-1) times
+				const presses = Array(slideNumber - 1).fill('key code 124').join('\ndelay 0.2\n'); // 124 = right arrow
+				execSync(`osascript -e '
+tell application "Google Chrome" to activate
+delay 0.3
+tell application "System Events"
+	key code 115
+	delay 0.3
+	${presses}
+end tell'`, { timeout: 5_000 });
+			} else {
+				const keyCode = action === 'next' ? 124 : 123; // right : left arrow
+				execSync(`osascript -e '
+tell application "Google Chrome" to activate
+delay 0.2
+tell application "System Events"
+	key code ${keyCode}
+end tell'`, { timeout: 5_000 });
+			}
+			console.log(`${ts()} [Slides] ${action}${slideNumber ? ` → slide ${slideNumber}` : ''}`);
+			return { status: 'done', action, slideNumber };
+		} catch (err) {
+			return { error: `Slide control failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
 /** All inline tools — import and spread into your tools list */
 export const inlineTools = [
 	scrollTool, switchTabTool, openUrlTool,
@@ -1110,7 +1152,7 @@ export const inlineTools = [
 	volumeTool, brightnessTool, clipboardTool,
 	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, summonTool, dismissTool,
 	joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool,
-];
+	slideControlTool, ];
 
 /** Tools available to any caller (including unverified) */
 export const anyCallerTools = [
@@ -1123,7 +1165,7 @@ export const ownerOnlyTools = [
 	scrollTool, switchTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
 	clipboardTool, cancelTaskTool, toggleTasksTool, summonTool, dismissTool,
-	joinZoomTool, joinGmeetTool, callContactTool,
+	joinZoomTool, joinGmeetTool, callContactTool, slideControlTool,
 ];
 
 /** Configurable tools — default to owner-only, can be opened to verified callers */
