@@ -323,13 +323,39 @@ export function isRecordingActive(): boolean {
 	return existsSync('/tmp/sutando-screen-record.pid');
 }
 
-/** Nudge Gemini to continue narrating after a reconnect */
-export function nudgeReconnect(session: any): void {
+/** Check if recording audio should be muted */
+export function isRecordingMuted(): boolean {
+	return recordingState.muted;
+}
+
+/**
+ * Set up all recording hooks on a voice session.
+ * Call once per session — handles tool triggers, reconnect, and cleanup automatically.
+ */
+export function setupRecordingHooks(session: any): void {
+	// Start narration when scroll_and_describe is called
+	session.eventBus?.subscribe?.('tool.call', (e: any) => {
+		if (e?.toolName === 'scroll_and_describe') {
+			setTimeout(() => {
+				if (isRecordingActive()) startRecordingNarration(session);
+			}, 4000);
+		}
+	});
+}
+
+/** Called on Gemini reconnect — nudge to continue narrating if recording active */
+export function onReconnect(session: any): void {
+	if (!isRecordingActive()) return;
 	try {
 		session.transport.sendContent([
 			{ role: 'user', text: '[System: You were narrating a screen demo. Continue where you left off — call describe_screen and keep narrating. Do NOT greet or say "I\'m back".]' },
 		], true);
 	} catch {}
+}
+
+/** Called on call end — stop any active recording */
+export function onCallEnd(): void {
+	stopActiveRecording();
 }
 
 /**

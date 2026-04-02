@@ -611,8 +611,8 @@ async function createCallSession(params: {
 	let isReplaying = false; // suppress audio during reconnect replay
 	sessionAny.handleAudioOutput = (data: string) => {
 		sessionAny.notificationQueue?.markAudioReceived?.();
-		const { recordingState } = require('../../../src/browser-tools.js');
-		if (isReplaying || recordingState?.muted) return;
+		const { isRecordingMuted } = require('../../../src/browser-tools.js');
+		if (isReplaying || isRecordingMuted()) return;
 		if (params.twilioWs.readyState === WebSocket.OPEN) {
 			const pcmBuf = Buffer.from(data, 'base64');
 			const mulawBuf = pcm24kToMulaw8k(pcmBuf);
@@ -628,15 +628,8 @@ async function createCallSession(params: {
 		}
 	};
 
-	// Start recording narration when scroll_and_describe is called
-	session.eventBus?.subscribe?.('tool.call', (e: any) => {
-		if (e?.toolName === 'scroll_and_describe') {
-			setTimeout(async () => {
-				const bt = await import('../../../src/browser-tools.js');
-				if (bt.isRecordingActive()) bt.startRecordingNarration(session);
-			}, 4000);
-		}
-	});
+	// Set up recording hooks (tool trigger, narration push, etc)
+	try { require('../../../src/browser-tools.js').setupRecordingHooks(session); } catch {}
 
 	// Track transcripts via event bus + run goodbye detection
 	// Use a processed count per-session that resets on reconnect to avoid duplicates.
@@ -709,11 +702,7 @@ async function createCallSession(params: {
 					sessionAny.handleClientConnected();
 					setTimeout(() => {
 						isReplaying = false;
-						// If recording is active, nudge Gemini to continue narrating
-						try {
-							const { isRecordingActive, nudgeReconnect } = require('../../../src/browser-tools.js');
-							if (isRecordingActive()) nudgeReconnect(session);
-						} catch {}
+						try { require('../../../src/browser-tools.js').onReconnect(session); } catch {}
 					}, 6000);
 				}
 			}, 1500);
@@ -733,8 +722,7 @@ function cleanupCall(callSid: string): void {
 	activeCalls.delete(callSid);
 	if (session.meetingId) pendingMeetingJoins.delete(session.meetingId);
 
-	// Stop any active screen recording when call ends
-	try { require('../../../src/browser-tools.js').stopActiveRecording(); } catch {}
+	try { require('../../../src/browser-tools.js').onCallEnd(); } catch {}
 
 	// Close VoiceSession
 	session.voiceSession.close('call_ended').catch(e =>
