@@ -1117,26 +1117,25 @@ export const slideControlTool: ToolDefinition = {
 	async execute(args) {
 		const { action, slideNumber } = args as { action: 'next' | 'previous' | 'goto'; slideNumber?: number };
 		try {
-			if (action === 'goto' && slideNumber) {
-				// Press Home to go to slide 1, then press right (slideNumber-1) times
-				const presses = Array(slideNumber - 1).fill('key code 124').join('\ndelay 0.2\n'); // 124 = right arrow
-				execSync(`osascript -e '
-tell application "Google Chrome" to activate
-delay 0.3
-tell application "System Events"
-	key code 115
-	delay 0.3
-	${presses}
+			const jsCall = action === 'goto' && slideNumber
+				? `goTo(${slideNumber - 1})`
+				: action === 'next' ? 'next()' : 'prev()';
+			// Find the slides tab and execute JS directly
+			execSync(`osascript -e '
+tell application "Google Chrome"
+	repeat with w in windows
+		set tabList to tabs of w
+		repeat with i from 1 to count of tabList
+			set tabUrl to URL of item i of tabList
+			if tabUrl contains "index-sutando" or tabUrl contains "index-bodhi" or tabUrl contains "localhost:8888" then
+				set active tab index of w to i
+				tell item i of tabList to execute javascript "${jsCall}"
+				return "done"
+			end if
+		end repeat
+	end repeat
+	return "no slides tab"
 end tell'`, { timeout: 5_000 });
-			} else {
-				const keyCode = action === 'next' ? 124 : 123; // right : left arrow
-				execSync(`osascript -e '
-tell application "Google Chrome" to activate
-delay 0.2
-tell application "System Events"
-	key code ${keyCode}
-end tell'`, { timeout: 5_000 });
-			}
 			console.log(`${ts()} [Slides] ${action}${slideNumber ? ` → slide ${slideNumber}` : ''}`);
 			return { status: 'done', action, slideNumber };
 		} catch (err) {
