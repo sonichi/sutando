@@ -364,15 +364,12 @@ function buildAgent(callSession: CallSession): MainAgent {
 				'## Tools',
 				`These tools are instant (use them directly, NOT through work): ${inlineTools.map(t => t.name).join(', ')}. Use work for everything else.`,
 				'TOOL EXCLUSIVITY: If an inline tool can handle the request, use ONLY the inline tool. NEVER also call work. They are mutually exclusive — calling both causes duplicate responses. Only use work when no inline tool fits.',
-				'SCREEN RECORDING: Call screen_record start ONCE, confirm to the user, then wait. Only call screen_record stop when the user explicitly asks to stop. Never call stop immediately after start. Never call the same tool action twice in a row.',
 				'You can make concurrent calls — stay on the line while calling someone else.',
 				'',
 				'## Screen demo recording with narration',
-				'When asked to record a demo video:',
-				'1. Call screen_record start with duration_seconds (e.g. 20). It auto-stops after that time.',
-				'2. IMMEDIATELY call describe_screen. SPEAK the result. Call scroll. Call describe_screen. SPEAK. Scroll. Repeat.',
-				'3. SPEAK after EVERY describe_screen — never call two tools without speaking.',
-				'4. Recording auto-stops. Do NOT call screen_record stop unless the user asks.',
+				'When asked to record a demo video, call scroll_and_describe ONCE with duration_seconds (e.g. 20). It handles everything: starts recording, scrolls, and returns a description.',
+				'Do NOT announce "starting recording". SPEAK the returned description as your first words — that IS the narration.',
+				'The recording auto-stops. Do NOT call scroll_and_describe more than once.',
 				'',
 				'## Known info',
 				(() => { try { const url = execSync('git remote get-url origin', { timeout: 2_000 }).toString().trim().replace(/\.git$/, ''); return `Sutando GitHub repo: ${url}`; } catch { return ''; } })(),
@@ -616,9 +613,10 @@ async function createCallSession(params: {
 	// Bypasses ClientTransport's internal WebSocket for lower latency
 	const sessionAny = session as any;
 	let isReplaying = false; // suppress audio during reconnect replay
+	let isDemoMuted = false; // suppress buffered narration after recording stops
 	sessionAny.handleAudioOutput = (data: string) => {
 		sessionAny.notificationQueue?.markAudioReceived?.();
-		if (isReplaying) return; // skip replayed audio from reconnect
+		if (isReplaying || isDemoMuted) return;
 		if (params.twilioWs.readyState === WebSocket.OPEN) {
 			const pcmBuf = Buffer.from(data, 'base64');
 			const mulawBuf = pcm24kToMulaw8k(pcmBuf);
@@ -633,6 +631,41 @@ async function createCallSession(params: {
 			}
 		}
 	};
+
+	// Watch for recording end — mute buffered narration, tell Gemini to stop
+	let recordingWatchActive = false;
+	const startRecordingWatch = () => {
+		if (recordingWatchActive) return;
+		recordingWatchActive = true;
+		const poll = setInterval(() => {
+			if (!existsSync('/tmp/sutando-screen-record.pid')) {
+				clearInterval(poll);
+				recordingWatchActive = false;
+				// Mute buffered narration, send stop message, unmute after 3s
+				isDemoMuted = true;
+				console.log(`${ts()} [Phone] recording ended — muting buffered narration`);
+				try {
+					(session as any).transport.sendContent([
+						{ role: 'user', text: '[System: Recording complete. Say "The recording is complete." and nothing else.]' },
+					], true);
+				} catch {}
+				// Unmute after 3s — old buffer should be flushed, new response starting
+				setTimeout(() => {
+					isDemoMuted = false;
+					console.log(`${ts()} [Phone] unmuted after 3s`);
+				}, 3000);
+			}
+		}, 500);
+		setTimeout(() => { clearInterval(poll); recordingWatchActive = false; }, 90_000);
+	};
+	// Start watching when scroll_and_describe starts recording
+	session.eventBus?.subscribe?.('tool.call', (e: any) => {
+		if (e?.toolName === 'scroll_and_describe') {
+			setTimeout(() => {
+				if (existsSync('/tmp/sutando-screen-record.pid')) startRecordingWatch();
+			}, 1000);
+		}
+	});
 
 	// Track transcripts via event bus + run goodbye detection
 	// Use a processed count per-session that resets on reconnect to avoid duplicates.

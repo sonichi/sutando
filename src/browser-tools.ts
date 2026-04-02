@@ -251,7 +251,7 @@ export const scrollAndDescribeTool: ToolDefinition = {
 		const { duration_seconds = 15 } = args as { duration_seconds?: number };
 		try {
 			// Prevent duplicate recordings
-			if (demoState === 'recording') return { status: 'already_recording', message: 'Already recording. Use describe_screen to narrate.' };
+			if (demoState === 'recording') return { status: 'already_recording', message: 'Already recording.' };
 			if (demoState === 'done') return { status: 'done', message: 'Demo complete. Offer to play with play_recording.' };
 			demoState = 'recording';
 
@@ -265,7 +265,7 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			const firstDesc = captureData.path ? await describeScreenshot(captureData.path) : '';
 
 			// Continuous background scroll
-			const scrollInterval = setInterval(() => { try { scrollDown(400); } catch {} }, 1500);
+			const scrollInterval = setInterval(() => { try { scrollDown(250); } catch {} }, 2500);
 
 			// Auto-stop after duration
 			setTimeout(() => {
@@ -279,7 +279,7 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			return {
 				status: 'recording',
 				first_description: firstDesc,
-				message: `SPEAK THIS NOW: "${firstDesc}" Then call describe_screen, SPEAK, scroll, repeat. Auto-stops in ${duration_seconds}s.`,
+				message: `SPEAK THIS NOW: "${firstDesc}" — this is your narration. Auto-stops in ${duration_seconds}s.`,
 			};
 		} catch (err) {
 			return { error: `scroll_and_describe failed: ${err instanceof Error ? err.message : err}` };
