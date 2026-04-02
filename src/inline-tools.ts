@@ -17,6 +17,49 @@ const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 export { describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool } from './browser-tools.js';
 import { describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool } from './browser-tools.js';
 
+// --- Keyboard tool ---
+
+export const pressKeyTool: ToolDefinition = {
+	name: 'press_key',
+	description:
+		'Press a keyboard key or shortcut in the frontmost app. Use for: "press enter", "press escape", ' +
+		'"press tab", "send the message" (Enter), "close the dialog" (Escape), "select all" (Cmd+A), ' +
+		'"clear the input" (Cmd+A then Delete). Instant — do NOT use work for simple keystrokes.',
+	parameters: z.object({
+		key: z.string().describe('Key to press: enter, escape, tab, delete, space, up, down, left, right, or a letter'),
+		modifiers: z.array(z.enum(['command', 'shift', 'control', 'option'])).optional().describe('Modifier keys'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { key, modifiers = [] } = args as { key: string; modifiers?: string[] };
+		const keyMap: Record<string, number> = {
+			'enter': 36, 'return': 36, 'escape': 53, 'esc': 53, 'tab': 48,
+			'delete': 51, 'backspace': 51, 'space': 49,
+			'up': 126, 'down': 125, 'left': 123, 'right': 124,
+			'a': 0, 'c': 8, 'v': 9, 'x': 7, 'z': 6, 'f': 3, 's': 1, 'w': 13, 'q': 12,
+		};
+		const keyCode = keyMap[key.toLowerCase()];
+		if (keyCode === undefined) {
+			// Use keystroke for unknown keys
+			const modStr = modifiers.length ? ` using {${modifiers.map(m => m + ' down').join(', ')}}` : '';
+			try {
+				execSync(`osascript -e 'tell application "System Events" to keystroke "${key}"${modStr}'`, { timeout: 3_000 });
+			} catch (err) {
+				return { error: `press_key failed: ${err instanceof Error ? err.message : err}` };
+			}
+		} else {
+			const modStr = modifiers.length ? ` using {${modifiers.map(m => m + ' down').join(', ')}}` : '';
+			try {
+				execSync(`osascript -e 'tell application "System Events" to key code ${keyCode}${modStr}'`, { timeout: 3_000 });
+			} catch (err) {
+				return { error: `press_key failed: ${err instanceof Error ? err.message : err}` };
+			}
+		}
+		console.log(`${ts()} [PressKey] ${modifiers.length ? modifiers.join('+') + '+' : ''}${key}`);
+		return { status: 'pressed', key, modifiers };
+	},
+};
+
 // --- Browser tools ---
 
 export const scrollTool: ToolDefinition = {
@@ -50,7 +93,8 @@ const TAB_ALIASES: Record<string, string> = {
 	'gmail': 'mail.google.com', 'email': 'mail.google.com', 'inbox': 'mail.google.com',
 	'calendar': 'calendar.google.com', 'gcal': 'calendar.google.com',
 	'twitter': 'x.com', 'x': 'x.com',
-	'dashboard': 'localhost:7844', 'sutando': 'localhost:8080', 'web client': 'localhost:8080',
+	'dashboard': 'localhost:7844', 'sutando': 'localhost:8080', 'web client': 'localhost:8080', 'voice': 'localhost:8080',
+	'slides': 'localhost:8888', 'presentation': 'localhost:8888', 'deck': 'localhost:8888',
 	'gemini': 'gemini.google.com',
 };
 
@@ -1199,7 +1243,7 @@ end tell'`, { timeout: 5_000 });
 
 /** All inline tools — import and spread into your tools list */
 export const inlineTools = [
-	scrollTool, switchTabTool, openUrlTool,
+	pressKeyTool, scrollTool, switchTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
 	volumeTool, brightnessTool, clipboardTool,
 	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, summonTool, dismissTool,
@@ -1214,7 +1258,7 @@ export const anyCallerTools = [
 /** Owner-only tools (require isOwner) */
 export const ownerOnlyTools = [
 	volumeTool, brightnessTool,
-	scrollTool, switchTabTool, openUrlTool,
+	pressKeyTool, scrollTool, switchTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
 	clipboardTool, cancelTaskTool, toggleTasksTool, summonTool, dismissTool,
 	joinZoomTool, joinGmeetTool, callContactTool, slideControlTool, fullscreenTool,
