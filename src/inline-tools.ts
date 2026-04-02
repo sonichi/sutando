@@ -13,8 +13,8 @@ import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 
 // Re-export browser tools so existing imports work unchanged
-export { scrollTool, switchTabTool, openUrlTool, captureScreenTool, typeTextTool, clickTool, scrollAndDescribeTool, playRecordingTool } from './browser-tools.js';
-import { scrollTool, switchTabTool, openUrlTool, captureScreenTool, typeTextTool, clickTool, scrollAndDescribeTool, playRecordingTool } from './browser-tools.js';
+export { scrollTool, switchTabTool, openUrlTool, captureScreenTool, typeTextTool, describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool } from './browser-tools.js';
+import { scrollTool, switchTabTool, openUrlTool, captureScreenTool, typeTextTool, describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool } from './browser-tools.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -942,7 +942,7 @@ export const inlineTools = [
 	volumeTool, brightnessTool, clipboardTool,
 	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, summonTool,
 	joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool,
-	clickTool, scrollAndDescribeTool, playRecordingTool,
+	describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool,
 ];
 
 /** Tools available to any caller (including unverified) */
@@ -957,7 +957,7 @@ export const ownerOnlyTools = [
 	switchAppTool, captureScreenTool, typeTextTool,
 	clipboardTool, cancelTaskTool, toggleTasksTool, summonTool,
 	joinZoomTool, joinGmeetTool, callContactTool,
-	clickTool, scrollAndDescribeTool, playRecordingTool,
+	describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool,
 ];
 
 /** Configurable tools — default to owner-only, can be opened to verified callers */

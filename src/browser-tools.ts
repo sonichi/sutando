@@ -252,7 +252,8 @@ export const scrollAndDescribeTool: ToolDefinition = {
 		try {
 			// Prevent duplicate recordings
 			if (demoState === 'recording') return { status: 'already_recording', message: 'Already recording.' };
-			if (demoState === 'done') return { status: 'done', message: 'Demo complete. Offer to play with play_recording.' };
+			// Reset from previous recording — allow new one
+			if (demoState === 'done') demoState = 'idle';
 			demoState = 'recording';
 
 			// Scroll to top
@@ -264,8 +265,20 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			const captureData = await captureRes.json() as { status: string; path?: string };
 			const firstDesc = captureData.path ? await describeScreenshot(captureData.path) : '';
 
-			// Continuous background scroll
-			const scrollInterval = setInterval(() => { try { scrollDown(250); } catch {} }, 2500);
+			// Adaptive scroll speed: one pass top-to-bottom over the full duration
+			let pageHeight = 5000; // fallback
+			try {
+				pageHeight = parseInt(execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "document.body.scrollHeight - window.innerHeight"'`, { timeout: 3_000 }).toString().trim()) || 5000;
+			} catch {}
+			const SCROLL_INTERVAL_MS = 2500;
+			const totalScrollSteps = (duration_seconds * 1000) / SCROLL_INTERVAL_MS;
+			const pxPerStep = Math.ceil(pageHeight / totalScrollSteps);
+			// Write scroll info for conversation-server to calculate description timing
+			const viewportHeight = 900; // approximate
+			const msPerViewport = Math.round((viewportHeight / pxPerStep) * SCROLL_INTERVAL_MS);
+			writeFileSync('/tmp/sutando-scroll-info.json', JSON.stringify({ pageHeight, pxPerStep, msPerViewport, duration_seconds }));
+			console.log(`${ts()} [ScrollAndDescribe] page=${pageHeight}px, ${totalScrollSteps} steps, ${pxPerStep}px/step, ${msPerViewport}ms/viewport`);
+			const scrollInterval = setInterval(() => { try { scrollDown(pxPerStep); } catch {} }, SCROLL_INTERVAL_MS);
 
 			// Auto-stop after duration
 			setTimeout(() => {

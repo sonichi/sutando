@@ -367,8 +367,10 @@ function buildAgent(callSession: CallSession): MainAgent {
 				'You can make concurrent calls — stay on the line while calling someone else.',
 				'',
 				'## Screen demo recording with narration',
-				'When asked to record a demo video, call scroll_and_describe ONCE with duration_seconds (e.g. 20). It handles everything: starts recording, scrolls, and returns a description.',
-				'Do NOT announce "starting recording". SPEAK the returned description as your first words — that IS the narration.',
+				'When asked to record a demo video, call scroll_and_describe ONCE with duration_seconds. It starts recording, scrolls, and returns a first description.',
+				'Do NOT announce "starting recording". SPEAK the returned description as your first words.',
+				'Then KEEP NARRATING: call describe_screen, SPEAK the result, repeat. Scrolling is automatic — just keep describing what you see.',
+				'SPEAK after EVERY describe_screen — 1-2 sentences each. Keep going until describe_screen returns "done".',
 				'The recording auto-stops. Do NOT call scroll_and_describe more than once.',
 				'',
 				'## Known info',
@@ -637,11 +639,62 @@ async function createCallSession(params: {
 	const startRecordingWatch = () => {
 		if (recordingWatchActive) return;
 		recordingWatchActive = true;
+
+		// Calculate description interval from scroll info so each screenshot shows new content
+		let DESC_INTERVAL_MS = 8000;
+		try {
+			if (existsSync('/tmp/sutando-scroll-info.json')) {
+				const info = JSON.parse(readFileSync('/tmp/sutando-scroll-info.json', 'utf8'));
+				DESC_INTERVAL_MS = Math.max(info.msPerViewport || 8000, 5000); // min 5s between descriptions
+				console.log(`${ts()} [Phone] description interval: ${DESC_INTERVAL_MS}ms (${info.msPerViewport}ms/viewport)`);
+			}
+		} catch {}
+		const descPush = setInterval(async () => {
+			if (!existsSync('/tmp/sutando-screen-record.pid')) return;
+			try {
+				const capRes = await fetch('http://localhost:7845/capture');
+				const capData = await capRes.json() as { status: string; path?: string };
+				if (capData.status !== 'ok' || !capData.path) return;
+				// Resize
+				const resized = capData.path.replace('.png', '-sm.jpg');
+				try { execSync(`sips -Z 800 -s format jpeg "${capData.path}" --out "${resized}" 2>/dev/null`, { timeout: 2_000 }); } catch {}
+				const actualPath = existsSync(resized) ? resized : capData.path;
+				const mimeType = actualPath.endsWith('.jpg') ? 'image/jpeg' : 'image/png';
+				const imageData = readFileSync(actualPath).toString('base64');
+				const apiKey = process.env.GEMINI_API_KEY;
+				if (!apiKey) return;
+				const res = await fetch(
+					`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+					{
+						method: 'POST',
+						headers: { 'Content-Type': 'application/json' },
+						body: JSON.stringify({
+							contents: [{ parts: [
+								{ text: 'Describe what is on screen in exactly 1 sentence. Read the main heading and key content. Be specific — quote exact text. This will be spoken aloud.' },
+								{ inlineData: { mimeType, data: imageData } },
+							] }],
+						}),
+					},
+				);
+				const data = await res.json() as any;
+				const desc = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+				if (desc && existsSync('/tmp/sutando-screen-record.pid')) {
+					(session as any).transport.sendContent([
+						{ role: 'user', text: `[System: The page has scrolled. Narrate this: "${desc}"]` },
+					], true);
+					console.log(`${ts()} [Phone] pushed description: ${desc.slice(0, 60)}...`);
+				}
+			} catch (err) {
+				console.log(`${ts()} [Phone] desc push error: ${err}`);
+			}
+		}, DESC_INTERVAL_MS);
+
+		// Stop watcher
 		const poll = setInterval(() => {
 			if (!existsSync('/tmp/sutando-screen-record.pid')) {
 				clearInterval(poll);
+				clearInterval(descPush);
 				recordingWatchActive = false;
-				// Mute buffered narration, send stop message, unmute after 3s
 				isDemoMuted = true;
 				console.log(`${ts()} [Phone] recording ended — muting buffered narration`);
 				try {
@@ -649,14 +702,13 @@ async function createCallSession(params: {
 						{ role: 'user', text: '[System: Recording complete. Say "The recording is complete." and nothing else.]' },
 					], true);
 				} catch {}
-				// Unmute after 3s — old buffer should be flushed, new response starting
 				setTimeout(() => {
 					isDemoMuted = false;
 					console.log(`${ts()} [Phone] unmuted after 3s`);
 				}, 3000);
 			}
 		}, 500);
-		setTimeout(() => { clearInterval(poll); recordingWatchActive = false; }, 90_000);
+		setTimeout(() => { clearInterval(poll); clearInterval(descPush); recordingWatchActive = false; }, 90_000);
 	};
 	// Start watching when scroll_and_describe starts recording
 	session.eventBus?.subscribe?.('tool.call', (e: any) => {
