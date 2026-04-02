@@ -249,11 +249,14 @@ export const scrollAndDescribeTool: ToolDefinition = {
 		'New descriptions will be pushed as the page scrolls — speak each one. NEVER repeat earlier narration. ' +
 		'Recording auto-stops. Do NOT call this more than once per recording.',
 	parameters: z.object({
-		duration_seconds: z.number().optional().describe('Target duration in seconds (default 15). ALWAYS seconds, never minutes.'),
+		duration_seconds: z.number().optional().describe('Target duration in seconds (default 15, max 60). ALWAYS seconds, never minutes.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { duration_seconds = 15 } = args as { duration_seconds?: number };
+		const MAX_DURATION = 60;
+		const rawDuration = (args as { duration_seconds?: number }).duration_seconds ?? 15;
+		const duration_seconds = Math.min(rawDuration, MAX_DURATION);
+		if (rawDuration > MAX_DURATION) console.log(`${ts()} [ScrollAndDescribe] capped duration from ${rawDuration}s to ${MAX_DURATION}s`);
 		try {
 			// Prevent duplicate recordings
 			if (demoState === 'recording') return { status: 'already_recording', message: 'Already recording.' };
