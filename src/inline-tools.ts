@@ -688,36 +688,16 @@ export const dismissTool: ToolDefinition = {
 	execution: 'inline',
 	async execute() {
 		try {
-			// Stop screen sharing first (if active), then leave via menu bar
+			// Cmd+W opens leave dialog, Enter confirms (End/Leave)
 			execSync(`osascript -e '
 tell application "zoom.us"
 	activate
 end tell
 delay 0.5
 tell application "System Events"
-	tell process "zoom.us"
-		-- Stop screen sharing first if active
-		try
-			click menu item "Stop Share" of menu "Meeting" of menu bar 1
-			delay 0.5
-		end try
-		-- Leave via menu bar (reliable regardless of toolbar state)
-		try
-			click menu item "Leave Meeting" of menu "Meeting" of menu bar 1
-			delay 0.5
-			-- Confirm leave
-			try
-				click button "Leave Meeting" of window 1
-			end try
-		on error
-			-- Fallback: try button approach
-			try
-				click button "Leave" of window 1
-				delay 0.5
-				click button "Leave Meeting" of window 1
-			end try
-		end try
-	end tell
+	keystroke "w" using command down
+	delay 1
+	key code 36
 end tell'`, { timeout: 10_000 });
 			console.log(`${ts()} [Dismiss] Left Zoom meeting`);
 			return { status: 'left_meeting' };
