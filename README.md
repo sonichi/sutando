@@ -192,6 +192,8 @@ The Sutando menu bar app (`src/Sutando/`) provides global keyboard shortcuts. It
 | ⌃V | **Voice toggle** — connects/disconnects voice in the browser |
 | ⌃M | **Mute toggle** — mutes/unmutes microphone during voice |
 
+The menu bar also has **Open Core** (brings up the Claude Code terminal) and **Open Dashboard** (opens the status dashboard at localhost:7844).
+
 On first run, grant **Accessibility** permission to the Sutando app in System Settings → Privacy & Security.
 
 To compile manually: `cd src/Sutando && swiftc -o Sutando main.swift -framework Cocoa -framework Carbon -framework ApplicationServices`
