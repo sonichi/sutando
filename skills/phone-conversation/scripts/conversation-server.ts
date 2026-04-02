@@ -628,95 +628,18 @@ async function createCallSession(params: {
 		}
 	};
 
-	// Watch for recording end — mute buffered narration, tell Gemini to stop
-	let recordingWatchActive = false;
-	const startRecordingWatch = () => {
-		if (recordingWatchActive) return;
-		recordingWatchActive = true;
-
-		// Calculate description interval from scroll info so each screenshot shows new content
-		let DESC_INTERVAL_MS = 8000;
-		try {
-			if (existsSync('/tmp/sutando-scroll-info.json')) {
-				const info = JSON.parse(readFileSync('/tmp/sutando-scroll-info.json', 'utf8'));
-				DESC_INTERVAL_MS = Math.max(Math.round((info.msPerViewport || 8000) * 0.7), 5000); // 70% of viewport time — slight overlap beats silence
-				console.log(`${ts()} [Phone] description interval: ${DESC_INTERVAL_MS}ms (${info.msPerViewport}ms/viewport)`);
-			}
-		} catch {}
-		let lastDesc = '';
-		// Push first description early (after ~5s) so there's no gap after initial narration
-		const pushDescription = async () => {
-			if (!existsSync('/tmp/sutando-screen-record.pid')) return;
-			try {
-				const capRes = await fetch('http://localhost:7845/capture');
-				const capData = await capRes.json() as { status: string; path?: string };
-				if (capData.status !== 'ok' || !capData.path) return;
-				const resized = capData.path.replace('.png', '-sm.jpg');
-				try { execSync(`sips -Z 800 -s format jpeg "${capData.path}" --out "${resized}" 2>/dev/null`, { timeout: 2_000 }); } catch {}
-				const actualPath = existsSync(resized) ? resized : capData.path;
-				const mimeType = actualPath.endsWith('.jpg') ? 'image/jpeg' : 'image/png';
-				const imageData = readFileSync(actualPath).toString('base64');
-				const apiKey = process.env.GEMINI_API_KEY;
-				if (!apiKey) return;
-				const res = await fetch(
-					`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
-					{
-						method: 'POST',
-						headers: { 'Content-Type': 'application/json' },
-						body: JSON.stringify({
-							contents: [{ parts: [
-								{ text: 'Describe what is on screen in exactly 1 sentence. Read the main heading and key content. Be specific — quote exact text. This will be spoken aloud.' },
-								{ inlineData: { mimeType, data: imageData } },
-							] }],
-						}),
-					},
-				);
-				const data = await res.json() as any;
-				const desc = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-				if (desc && existsSync('/tmp/sutando-screen-record.pid')) {
-					if (desc === lastDesc) {
-						console.log(`${ts()} [Phone] skipped duplicate description`);
-						return;
-					}
-					lastDesc = desc;
-					(session as any).transport.sendContent([
-						{ role: 'user', text: `[System: The page has scrolled to new content. Narrate this NEW section (do NOT repeat earlier narration): "${desc}"]` },
-					], true);
-					console.log(`${ts()} [Phone] pushed description: ${desc.slice(0, 60)}...`);
-				}
-			} catch (err) {
-				console.log(`${ts()} [Phone] desc push error: ${err}`);
-			}
-		};
-		setTimeout(pushDescription, 5000); // first push after 5s
-		const descPush = setInterval(pushDescription, DESC_INTERVAL_MS);
-
-		// Stop watcher
-		const poll = setInterval(() => {
-			if (!existsSync('/tmp/sutando-screen-record.pid')) {
-				clearInterval(poll);
-				clearInterval(descPush);
-				recordingWatchActive = false;
-				isDemoMuted = true;
-				console.log(`${ts()} [Phone] recording ended — muting buffered narration`);
-				try {
-					(session as any).transport.sendContent([
-						{ role: 'user', text: '[System: Recording complete. Say "The recording is complete." and nothing else.]' },
-					], true);
-				} catch {}
-				setTimeout(() => {
-					isDemoMuted = false;
-					console.log(`${ts()} [Phone] unmuted after 3s`);
-				}, 3000);
-			}
-		}, 500);
-		setTimeout(() => { clearInterval(poll); clearInterval(descPush); recordingWatchActive = false; }, 90_000);
-	};
-	// Start watching when scroll_and_describe starts recording — delay 4s so scroll-info.json is written first
+	// Start recording narration when scroll_and_describe is called
 	session.eventBus?.subscribe?.('tool.call', (e: any) => {
 		if (e?.toolName === 'scroll_and_describe') {
-			setTimeout(() => {
-				if (existsSync('/tmp/sutando-screen-record.pid')) startRecordingWatch();
+			setTimeout(async () => {
+				if (existsSync('/tmp/sutando-screen-record.pid')) {
+					const { startRecordingNarration } = await import('../../../src/browser-tools.js');
+					startRecordingNarration(
+						session,
+						() => { isDemoMuted = true; },
+						() => { isDemoMuted = false; },
+					);
+				}
 			}, 4000);
 		}
 	});

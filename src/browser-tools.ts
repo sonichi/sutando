@@ -308,6 +308,75 @@ export const scrollAndDescribeTool: ToolDefinition = {
 	},
 };
 
+// --- Recording narration controller ---
+// Called by conversation-server when scroll_and_describe starts.
+// Pushes screen descriptions to Gemini at viewport-synced intervals.
+
+export function startRecordingNarration(
+	session: any,
+	onMute: () => void,
+	onUnmute: () => void,
+): void {
+	// Read scroll info for description interval
+	let descIntervalMs = 8000;
+	try {
+		if (existsSync('/tmp/sutando-scroll-info.json')) {
+			const info = JSON.parse(readFileSync('/tmp/sutando-scroll-info.json', 'utf8'));
+			descIntervalMs = Math.max(Math.round((info.msPerViewport || 8000) * 0.7), 5000);
+			console.log(`${ts()} [Recording] description interval: ${descIntervalMs}ms`);
+		}
+	} catch {}
+
+	let lastDesc = '';
+
+	const pushDescription = async () => {
+		if (!existsSync('/tmp/sutando-screen-record.pid')) return;
+		try {
+			const path = await captureScreen();
+			if (!path) return;
+			const desc = await describeScreenshot(path);
+			if (!desc || desc === lastDesc) {
+				if (desc === lastDesc) console.log(`${ts()} [Recording] skipped duplicate`);
+				return;
+			}
+			lastDesc = desc;
+			if (!existsSync('/tmp/sutando-screen-record.pid')) return;
+			session.transport.sendContent([
+				{ role: 'user', text: `[System: The page has scrolled to new content. Narrate this NEW section (do NOT repeat earlier narration): "${desc}"]` },
+			], true);
+			console.log(`${ts()} [Recording] pushed: ${desc.slice(0, 60)}...`);
+		} catch (err) {
+			console.log(`${ts()} [Recording] push error: ${err}`);
+		}
+	};
+
+	// Early first push + interval
+	setTimeout(pushDescription, 5000);
+	const descTimer = setInterval(pushDescription, descIntervalMs);
+
+	// Stop watcher — poll for PID file removal
+	const stopPoll = setInterval(() => {
+		if (!existsSync('/tmp/sutando-screen-record.pid')) {
+			clearInterval(stopPoll);
+			clearInterval(descTimer);
+			onMute();
+			console.log(`${ts()} [Recording] ended — muted`);
+			try {
+				session.transport.sendContent([
+					{ role: 'user', text: '[System: Recording complete. Say "The recording is complete." and nothing else.]' },
+				], true);
+			} catch {}
+			setTimeout(() => {
+				onUnmute();
+				console.log(`${ts()} [Recording] unmuted after 3s`);
+			}, 3000);
+		}
+	}, 500);
+
+	// Safety timeout
+	setTimeout(() => { clearInterval(stopPoll); clearInterval(descTimer); }, 90_000);
+}
+
 // --- Play recording ---
 
 export const playRecordingTool: ToolDefinition = {

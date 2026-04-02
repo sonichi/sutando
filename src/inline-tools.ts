@@ -13,9 +13,9 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
-// Re-export browser tools
-export { scrollTool, switchTabTool, openUrlTool, captureScreenTool, typeTextTool, describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool } from './browser-tools.js';
-import { scrollTool, switchTabTool, openUrlTool, captureScreenTool, typeTextTool, describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool } from './browser-tools.js';
+// Re-export recording/screen tools from browser-tools (tools unique to that module)
+export { describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool } from './browser-tools.js';
+import { describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool } from './browser-tools.js';
 
 // --- Browser tools ---
 
