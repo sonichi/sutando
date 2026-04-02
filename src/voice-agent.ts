@@ -206,6 +206,7 @@ const mainAgent: MainAgent = {
 		'- join_zoom: Join a Zoom meeting with computer audio (no screen sharing). Use when user says "join the zoom" or gives a Zoom ID.',
 		'- join_gmeet: Join a Google Meet via browser with computer audio. Use when user says "join the meet" or gives a Meet code.',
 		'- summon: Share screen via Zoom (desktop app). Use when user says "summon", "share my screen".',
+		'- dismiss: Leave the current Zoom meeting. Use when user says "dismiss", "leave zoom", "end meeting", "leave the call".',
 		'- For phone calls, meeting dial-in, or anything needing contacts/calendar context → use work (core handles it).',
 		...inlineTools.map(t => `- ${t.name}: ${(t.description as string).split('.')[0]}. Instant.`),
 		'',

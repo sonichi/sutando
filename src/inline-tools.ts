@@ -678,6 +678,46 @@ else:
 	},
 };
 
+// Dismiss — leave the current Zoom meeting
+export const dismissTool: ToolDefinition = {
+	name: 'dismiss',
+	description:
+		'Leave the current Zoom meeting. The opposite of summon/join_zoom. ' +
+		'Use when user says "dismiss", "leave zoom", "end meeting", "leave the call", "hang up zoom".',
+	parameters: z.object({}),
+	execution: 'inline',
+	async execute() {
+		try {
+			// Click "Leave Meeting" in Zoom via AppleScript
+			execSync(`osascript -e '
+tell application "zoom.us"
+	activate
+end tell
+delay 0.5
+tell application "System Events"
+	tell process "zoom.us"
+		-- Try the Leave button in the meeting toolbar
+		try
+			click button "Leave" of window 1
+			delay 0.5
+			-- Click "Leave Meeting" in the confirmation dialog
+			try
+				click button "Leave Meeting" of window 1
+			end try
+		on error
+			-- Fallback: use menu bar
+			click menu item "Leave Meeting" of menu "Meeting" of menu bar 1
+		end try
+	end tell
+end tell'`, { timeout: 10_000 });
+			console.log(`${ts()} [Dismiss] Left Zoom meeting`);
+			return { status: 'left_meeting' };
+		} catch (err) {
+			return { error: `Dismiss failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
 // Join Zoom via desktop app + computer audio (no screen share)
 export const joinZoomTool: ToolDefinition = {
 	name: 'join_zoom',
@@ -1068,7 +1108,7 @@ export const inlineTools = [
 	scrollTool, switchTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
 	volumeTool, brightnessTool, clipboardTool,
-	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, summonTool,
+	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, summonTool, dismissTool,
 	joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool,
 ];
 
@@ -1082,7 +1122,7 @@ export const ownerOnlyTools = [
 	volumeTool, brightnessTool,
 	scrollTool, switchTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
-	clipboardTool, cancelTaskTool, toggleTasksTool, summonTool,
+	clipboardTool, cancelTaskTool, toggleTasksTool, summonTool, dismissTool,
 	joinZoomTool, joinGmeetTool, callContactTool,
 ];
 
