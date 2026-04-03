@@ -12,10 +12,64 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var muteHotKeyRef: EventHotKeyRef?
     let workspace = NSHomeDirectory() + "/Desktop/sutando"
 
+    var resultWatchSource: DispatchSourceFileSystemObject?
+    var lastResultCount = 0
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMenuBar()
         registerHotKey()
+        watchResults()
         notify("Sutando Drop", "Ready — press ⌃C to drop context")
+    }
+
+    // MARK: - Result notifications (when voice is not connected)
+    func watchResults() {
+        let resultsPath = workspace + "/results"
+        let fd = open(resultsPath, O_EVTONLY)
+        guard fd >= 0 else { return }
+        let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: .write, queue: .main)
+        source.setEventHandler { [weak self] in self?.checkNewResults() }
+        source.setCancelHandler { close(fd) }
+        source.resume()
+        resultWatchSource = source
+        lastResultCount = countResults()
+    }
+
+    func countResults() -> Int {
+        let files = (try? FileManager.default.contentsOfDirectory(atPath: workspace + "/results")
+            .filter { $0.hasPrefix("task-") && $0.hasSuffix(".txt") }) ?? []
+        return files.count
+    }
+
+    func checkNewResults() {
+        let newCount = countResults()
+        guard newCount > lastResultCount else { lastResultCount = newCount; return }
+        lastResultCount = newCount
+        // Only notify if voice is NOT connected
+        if !isVoiceConnected() {
+            let resultsPath = workspace + "/results"
+            if let files = try? FileManager.default.contentsOfDirectory(atPath: resultsPath)
+                .filter({ $0.hasPrefix("task-") && $0.hasSuffix(".txt") })
+                .sorted(by: >),
+               let latest = files.first,
+               let content = try? String(contentsOfFile: resultsPath + "/" + latest, encoding: .utf8) {
+                let preview = String(content.prefix(120)).replacingOccurrences(of: "\n", with: " ")
+                notify("Sutando", preview)
+            }
+        }
+    }
+
+    func isVoiceConnected() -> Bool {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/lsof")
+        proc.arguments = ["-i", ":9900", "-sTCP:ESTABLISHED"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+        try? proc.run()
+        proc.waitUntilExit()
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        return out.contains("ESTABLISHED")
     }
 
     // MARK: - Menu Bar
