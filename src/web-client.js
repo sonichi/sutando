@@ -1,21 +1,12 @@
-/**
- * Web Audio Client for Sutando
- *
- * Usage:
- *   1. Start the voice agent:  pnpm tsx examples/hello_world/agent.ts
- *   2. Start this client:      pnpm tsx examples/web-client.ts
- *   3. Open http://localhost:8080 in your browser
- *   4. Click "Connect" and allow microphone access
- */
-
-import { createServer } from 'node:http';
-
-const HTTP_PORT = Number(process.env.CLIENT_PORT) || 8080;
-const HTTP_HOST = process.env.CLIENT_HOST || '0.0.0.0'; // '0.0.0.0' binds to all interfaces for EC2
-const WS_PORT = Number(process.env.PORT) || 9900;
-const DEFAULT_WS_URL = `ws://localhost:${WS_PORT}`;
-
-const HTML = /* html */ `<!DOCTYPE html>
+// src/web-client.ts
+import { createServer } from "node:http";
+var HTTP_PORT = Number(process.env.CLIENT_PORT) || 8080;
+var HTTP_HOST = process.env.CLIENT_HOST || "0.0.0.0";
+var WS_PORT = Number(process.env.PORT) || 9900;
+var DEFAULT_WS_URL = `ws://localhost:${WS_PORT}`;
+var HTML = (
+  /* html */
+  `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -206,7 +197,7 @@ const HTML = /* html */ `<!DOCTYPE html>
   #wsUrl { display: none; }
   .stats { font-size: 10px; color: #444; }
 
-  /* Hero connect screen — shown when voice is disconnected */
+  /* Hero connect screen \u2014 shown when voice is disconnected */
   .hero {
     display: flex; flex-direction: column; align-items: center; justify-content: center;
     padding: 48px 20px 24px;
@@ -263,12 +254,12 @@ const HTML = /* html */ `<!DOCTYPE html>
 <script>
 fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
   if(s.name){
-    document.getElementById('stand-name').textContent='Sutando — '+s.name;
-    document.getElementById('hero-name').textContent='Sutando — '+s.name;
+    document.getElementById('stand-name').textContent='Sutando \u2014 '+s.name;
+    document.getElementById('hero-name').textContent='Sutando \u2014 '+s.name;
   }
   if(s.nameOrigin){
     var t=document.querySelector('.tagline');
-    if(t) t.textContent=s.nameOrigin.split(' — ')[1]||s.nameOrigin;
+    if(t) t.textContent=s.nameOrigin.split(' \u2014 ')[1]||s.nameOrigin;
   }
   if(s.avatarGenerated){
     document.getElementById('stand-avatar').style.display='block';
@@ -286,7 +277,7 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
     }
   }
 }).catch(()=>{});
-</script>
+<\/script>
 
 <div class="hero" id="hero">
   <img class="avatar-hero" id="hero-avatar" src="http://localhost:7844/avatar">
@@ -294,11 +285,11 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
   <p class="tagline">Summon your AI superpower</p>
   <button class="btn-hero" onclick="toggle()">Start Voice</button>
   <div style="margin-top:16px;font-size:11px;color:#556;letter-spacing:0.5px">
-    <kbd style="background:#1a1a2e;padding:2px 6px;border-radius:3px;border:1px solid #333;font-family:monospace;color:#8af">⌃C</kbd> drop context
+    <kbd style="background:#1a1a2e;padding:2px 6px;border-radius:3px;border:1px solid #333;font-family:monospace;color:#8af">\u2303C</kbd> drop context
     <span style="margin:0 6px;color:#333">|</span>
-    <kbd style="background:#1a1a2e;padding:2px 6px;border-radius:3px;border:1px solid #333;font-family:monospace;color:#8af">⌃V</kbd> voice
+    <kbd style="background:#1a1a2e;padding:2px 6px;border-radius:3px;border:1px solid #333;font-family:monospace;color:#8af">\u2303V</kbd> voice
     <span style="margin:0 6px;color:#333">|</span>
-    <kbd style="background:#1a1a2e;padding:2px 6px;border-radius:3px;border:1px solid #333;font-family:monospace;color:#8af">⌃M</kbd> mute
+    <kbd style="background:#1a1a2e;padding:2px 6px;border-radius:3px;border:1px solid #333;font-family:monospace;color:#8af">\u2303M</kbd> mute
   </div>
 </div>
 
@@ -328,7 +319,7 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
 </div>
 
 <script>
-// ─── Config ───────────────────────────────────────────────
+// \u2500\u2500\u2500 Config \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 let INPUT_RATE  = 16000;
 let OUTPUT_RATE = 24000;
 const CAPTURE_BUF = 2048;
@@ -356,7 +347,7 @@ window.addEventListener('DOMContentLoaded', () => {
   try { if (sessionStorage.getItem('sutando-voice')) { setTimeout(() => toggle(), 500); } } catch {}
 });
 
-// ─── State ────────────────────────────────────────────────
+// \u2500\u2500\u2500 State \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 let ws = null;
 let audioCtx = null;
 let micStream = null;
@@ -374,17 +365,17 @@ let playChunkCount = 0;
 let statsTimer = null;
 let muted = false;
 
-// Chrome STT state — provides real-time interim display; server STT replaces with final
+// Chrome STT state \u2014 provides real-time interim display; server STT replaces with final
 let recognition = null;
 
 const debugLog = [];
 const $ = (id) => document.getElementById(id);
 
-// ─── Chrome STT (real-time interim display) ───────────────
+// \u2500\u2500\u2500 Chrome STT (real-time interim display) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 function initChromeStt() {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR) {
-    dbg('Browser does not support SpeechRecognition — no interim transcripts available', 'warn');
+    dbg('Browser does not support SpeechRecognition \u2014 no interim transcripts available', 'warn');
     return;
   }
   recognition = new SR();
@@ -412,7 +403,7 @@ function initChromeStt() {
 }
 
 function showChromeSttInterim(text) {
-  if (serverUserTextReceived) return;  // server text is authoritative — don't overwrite
+  if (serverUserTextReceived) return;  // server text is authoritative \u2014 don't overwrite
   if (!currentUserEl) {
     currentUserEl = document.createElement('div');
     currentUserEl.className = 't-entry t-interim';
@@ -431,7 +422,7 @@ function stopChromeStt() {
   if (recognition) { try { recognition.stop(); } catch {} }
 }
 
-// ─── Transcript ───────────────────────────────────────────
+// \u2500\u2500\u2500 Transcript \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 let currentUserEl = null;
 let currentAssistantEl = null;
 let serverUserTextReceived = false;  // blocks Chrome STT overwrites after server sends
@@ -448,7 +439,7 @@ function handleTranscript(role, text, partial) {
       }
       currentUserEl.textContent = text;
     } else {
-      // Final transcript — update in-place for correct ordering
+      // Final transcript \u2014 update in-place for correct ordering
       if (!currentUserEl) {
         currentUserEl = document.createElement('div');
         $('transcript').appendChild(currentUserEl);
@@ -477,7 +468,7 @@ function addSystem(text, isHtml) {
   $('transcript').scrollTop = $('transcript').scrollHeight;
 }
 
-// ─── Debug log ────────────────────────────────────────────
+// \u2500\u2500\u2500 Debug log \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 function dbg(text, cls = '') {
   const ts = new Date().toISOString().slice(11, 23);
   const line = ts + '  ' + text;
@@ -495,7 +486,7 @@ function setStatus(text, state) {
   $('dot').className = 'dot' + (state === 'live' ? ' live' : state === 'error' ? ' error' : '');
 }
 
-// ─── Task list ────────────────────────────────────────────
+// \u2500\u2500\u2500 Task list \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 // Expose on window so inline tools can access via Chrome AppleScript JS injection
 const taskMap = window.taskMap = {};
 function updateTask(taskId, status, text, result) {
@@ -512,7 +503,7 @@ function updateTask(taskId, status, text, result) {
   renderTasks();
 }
 const expandedTasks = window.expandedTasks = new Set();
-let userCollapsed = false; // user manually collapsed — suppress auto-expand
+let userCollapsed = false; // user manually collapsed \u2014 suppress auto-expand
 // Listen for external collapse/expand commands (from inline tools via AppleScript)
 new MutationObserver(() => {
   if (document.body.dataset.taskAction === 'collapse') { expandedTasks.clear(); userCollapsed = true; renderTasks(); document.body.dataset.taskAction = ''; }
@@ -554,13 +545,13 @@ function renderTasks() {
     const resultHtml = hasResult ? '<div id="result-' + id + '" style="display:' + resultDisplay + ';padding:6px 26px;color:#8ab4c8;font-size:11px;white-space:pre-wrap;word-break:break-word;background:#0d1520;border-radius:6px;margin:4px 0 4px 26px">' + t.result.replace(/</g,'&lt;') + '</div>' : '';
     return '<div class="task-item"' + clickAttr + '>' +
       '<div class="task-status ' + t.status + '">' + (icons[t.status] || '?') + '</div>' +
-      '<span class="task-text">' + (t.text || id) + (hasResult ? (isExpanded ? ' ▾' : ' ▸') : '') + '</span>' +
+      '<span class="task-text">' + (t.text || id) + (hasResult ? (isExpanded ? ' \u25BE' : ' \u25B8') : '') + '</span>' +
       '<span class="task-time">' + timeStr + '</span>' +
       '</div>' + resultHtml;
   }).join('');
 }
 
-// ─── Poll agent API for task status ───────────────────────
+// \u2500\u2500\u2500 Poll agent API for task status \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 let taskPollTimer = null;
 function startTaskPolling() {
   if (taskPollTimer) return;
@@ -594,7 +585,7 @@ function startTaskPolling() {
       if (data.claude === false) statusParts.push('<span style="color:#e94560">brain offline</span>');
       if (data.watcher === false) statusParts.push('<span style="color:#f0ad4e">watcher offline</span>');
       const sysEl = document.getElementById('sys-status');
-      if (sysEl) sysEl.innerHTML = statusParts.length ? statusParts.join(' · ') : '';
+      if (sysEl) sysEl.innerHTML = statusParts.length ? statusParts.join(' \xB7 ') : '';
       // Update dynamic region with latest data
       window._drQuestions = data.questions || [];
       updateDynamicRegion();
@@ -638,7 +629,7 @@ function saveDebug() {
   dbg('Debug data saved');
 }
 
-// ─── PCM helpers ──────────────────────────────────────────
+// \u2500\u2500\u2500 PCM helpers \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 function downsample(input, fromRate, toRate) {
   if (fromRate === toRate) return input;
   const ratio = fromRate / toRate;
@@ -672,7 +663,7 @@ function int16ToFloat32(buf) {
   return out;
 }
 
-// ─── Audio playback (gapless scheduling) ──────────────────
+// \u2500\u2500\u2500 Audio playback (gapless scheduling) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 function playChunk(arrayBuf) {
   if (!audioCtx || audioCtx.state === 'closed') {
     try {
@@ -721,7 +712,7 @@ function playChunk(arrayBuf) {
   }
 }
 
-// ─── Microphone capture ───────────────────────────────────
+// \u2500\u2500\u2500 Microphone capture \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 async function startMic() {
   // Check if getUserMedia is available (requires HTTPS or localhost)
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -785,7 +776,7 @@ async function startMic() {
 
   dbg('Mic capture started');
   reconnectAttempts = 0;
-  addSystem('Microphone active — speak now.');
+  addSystem('Microphone active \u2014 speak now.');
 
   // Start Chrome STT for real-time interim display (server final replaces)
   startChromeStt();
@@ -795,10 +786,10 @@ function stopMic() {
   stopChromeStt();
   if (processor) { processor.disconnect(); processor = null; }
   if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
-  // Don't close audioCtx here — playback may still be draining
+  // Don't close audioCtx here \u2014 playback may still be draining
 }
 
-// ─── WebSocket ────────────────────────────────────────────
+// \u2500\u2500\u2500 WebSocket \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 function connectWs() {
   const url = $('wsUrl').value.trim();
   if (!url) return;
@@ -814,7 +805,7 @@ function connectWs() {
     setStatus('Starting mic...', 'live');
     try {
       await startMic();
-      setStatus('Live — speak now', 'live');
+      setStatus('Live \u2014 speak now', 'live');
       statsTimer = setInterval(updateStats, 500);
     } catch (err) {
       dbg('Mic error: ' + err.message, 'err');
@@ -844,7 +835,7 @@ function connectWs() {
         } else if (msg.type === 'transcript') {
           handleTranscript(msg.role, msg.text, msg.partial !== false);
         } else if (msg.type === 'turn.end') {
-          // Remove orphaned Chrome STT interim — if server never finalized it,
+          // Remove orphaned Chrome STT interim \u2014 if server never finalized it,
           // it's echo from the assistant's voice picked up by mic.
           if (currentUserEl && currentUserEl.classList.contains('t-interim')) {
             currentUserEl.remove();
@@ -955,7 +946,7 @@ function connectWs() {
           addSystem('[speed] Speech speed set to ' + msg.speed + ' (' + playbackRate + 'x)');
         } else if (msg.type === 'session_end') {
           addSystem('Session ended by voice command.');
-          dbg('session_end received — disconnecting', 'event');
+          dbg('session_end received \u2014 disconnecting', 'event');
           connected = false; // prevent auto-reconnect
           if (ws) { ws.close(); ws = null; }
           doCleanup();
@@ -983,19 +974,19 @@ function connectWs() {
     if (wasCleanDisconnect) {
       addSystem('Disconnected.');
     } else {
-      // Unexpected drop (Gemini timeout) — auto-reconnect with limit
+      // Unexpected drop (Gemini timeout) \u2014 auto-reconnect with limit
       reconnectAttempts++;
       if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
         addSystem('Still trying to connect. Common causes:');
-        addSystem('1. GEMINI_API_KEY not set — edit .env and add your key from ai.google.dev');
-        addSystem('2. Voice agent not running — run: bash src/startup.sh');
-        addSystem('3. Port 9900 blocked — check: lsof -i :9900');
+        addSystem('1. GEMINI_API_KEY not set \u2014 edit .env and add your key from ai.google.dev');
+        addSystem('2. Voice agent not running \u2014 run: bash src/startup.sh');
+        addSystem('3. Port 9900 blocked \u2014 check: lsof -i :9900');
         addSystem('You can type commands below while reconnecting.');
-        addSystem('<a href="https://discord.gg/uZHWXXmrCS" target="_blank" style="color:#5865F2">Ask for help on Discord</a> · <a href="https://github.com/sonichi/sutando/issues" target="_blank" style="color:#4ecca3">Report an issue</a> · <span style="color:#8899a6;cursor:pointer;text-decoration:underline" onclick="copyLogs()">Copy logs</span>', true);
+        addSystem('<a href="https://discord.gg/uZHWXXmrCS" target="_blank" style="color:#5865F2">Ask for help on Discord</a> \xB7 <a href="https://github.com/sonichi/sutando/issues" target="_blank" style="color:#4ecca3">Report an issue</a> \xB7 <span style="color:#8899a6;cursor:pointer;text-decoration:underline" onclick="copyLogs()">Copy logs</span>', true);
         setStatus('Reconnecting...', 'error');
         reconnectAttempts = 0;  // reset counter and keep retrying
       } else {
-        addSystem('Connection lost — reconnecting (' + reconnectAttempts + '/' + MAX_RECONNECT_ATTEMPTS + ')...');
+        addSystem('Connection lost \u2014 reconnecting (' + reconnectAttempts + '/' + MAX_RECONNECT_ATTEMPTS + ')...');
         setStatus('Reconnecting...', 'error');
       }
       // Always retry
@@ -1011,14 +1002,14 @@ function connectWs() {
   ws.onerror = () => {
     dbg('WS error', 'err');
     setStatus('Connection failed', 'error');
-    addSystem('Connection error — is the agent server running?');
+    addSystem('Connection error \u2014 is the agent server running?');
   };
 }
 
 function doCleanup() {
   stopMic();
   if (audioCtx && audioCtx.state !== 'closed') {
-    // Close audio context immediately — don't use a delayed timeout
+    // Close audio context immediately \u2014 don't use a delayed timeout
     // (a delayed null can race with reconnect and kill the new AudioContext)
     if (audioCtx) { try { audioCtx.close(); } catch {} audioCtx = null; }
   }
@@ -1035,7 +1026,7 @@ function doCleanup() {
   updateStats();
 }
 
-// ─── Mute toggle ──────────────────────────────────────────
+// \u2500\u2500\u2500 Mute toggle \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 function toggleMute() {
   if (!micStream) return;
   muted = !muted;
@@ -1046,7 +1037,7 @@ function toggleMute() {
   addSystem(muted ? 'Microphone muted.' : 'Microphone unmuted.');
 }
 
-// ─── UI toggle (user gesture context!) ────────────────────
+// \u2500\u2500\u2500 UI toggle (user gesture context!) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 function toggle() {
   if (connected) {
     if (ws) { ws.close(); ws = null; }
@@ -1085,7 +1076,7 @@ function toggle() {
 }
 window.toggle = toggle;
 
-// ─── Suggestion chips ─────────────────────────────────────
+// \u2500\u2500\u2500 Suggestion chips \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 function copyLogs() {
   var apiBase = 'http://' + location.hostname + ':7843';
   fetch(apiBase + '/logs/voice').then(function(r) { return r.json(); }).then(function(d) {
@@ -1093,7 +1084,7 @@ function copyLogs() {
     navigator.clipboard.writeText(text).then(function() {
       addSystem('Logs copied to clipboard (last 30 lines). Paste in Discord or GitHub issue.');
     });
-  }).catch(function() { addSystem('Could not fetch logs — is the agent API running?'); });
+  }).catch(function() { addSystem('Could not fetch logs \u2014 is the agent API running?'); });
 }
 
 function answerQuestion(qid, answer) {
@@ -1129,9 +1120,9 @@ function answerQuestion(qid, answer) {
 }
 
 function trySuggestion(el) {
-  // Extract only the quoted command (e.g. "summon" from '"summon" — description')
+  // Extract only the quoted command (e.g. "summon" from '"summon" \u2014 description')
   const raw = el.textContent;
-  const dashIdx = raw.indexOf(' — ');
+  const dashIdx = raw.indexOf(' \u2014 ');
   const cmd = dashIdx > 0 ? raw.slice(0, dashIdx) : raw;
   const text = cmd.replace(/[\u201C\u201D"]/g, '').trim();
   // Handle special actions
@@ -1154,7 +1145,7 @@ function showNotesInDR() {
       '<b style="font-size:14px">Notes</b>' +
       '<span class="suggestion" onclick="window._drContent=null;updateDynamicRegion()" style="font-size:11px;cursor:pointer">Close</span></div>';
     html += notes.map(function(n){
-      return '<div style="padding:6px 0;border-bottom:1px solid #2a2a3e;cursor:pointer" onclick="showNoteInDR(\'' + n.slug + '\')">' +
+      return '<div style="padding:6px 0;border-bottom:1px solid #2a2a3e;cursor:pointer" onclick="showNoteInDR('' + n.slug + '')">' +
         '<span style="color:#7c83ff">' + n.title + '</span>' +
         '<span style="color:#666;font-size:11px;float:right">' + new Date(n.modified*1000).toLocaleDateString() + '</span></div>';
     }).join('');
@@ -1168,7 +1159,8 @@ function showNoteInDR(slug) {
   var DASH = 'http://' + window.location.hostname + ':7844';
   fetch(DASH + '/notes/' + slug).then(function(r){return r.text()}).then(function(text) {
     // Strip frontmatter
-    text = text.replace(/^---[^]*?---\n/, '');
+    text = text.replace(/^---[^]*?---
+/, '');
     // Simple markdown
     text = text.replace(/^### (.+)$/gm, '<h3>$1</h3>');
     text = text.replace(/^## (.+)$/gm, '<h2>$1</h2>');
@@ -1179,7 +1171,9 @@ function showNoteInDR(slug) {
     text = text.replace(inlineCodeRe, '<code style="background:#1a1a2e;padding:1px 4px;border-radius:2px">$1</code>');
     text = text.replace(/[*][*](.+?)[*][*]/g, '<strong>$1</strong>');
     text = text.replace(/^- (.+)$/gm, '<li>$1</li>');
-    text = text.replace(/\n\n/g, '<br><br>');
+    text = text.replace(/
+
+/g, '<br><br>');
     var html = '<div style="max-height:400px;overflow-y:auto">' +
       '<span class="suggestion" onclick="showNotesInDR()" style="font-size:11px;cursor:pointer;margin-bottom:8px;display:inline-block">&larr; Back</span>' +
       '<div style="font-size:13px;line-height:1.5">' + text + '</div></div>';
@@ -1188,7 +1182,7 @@ function showNoteInDR(slug) {
   });
 }
 
-// ─── Text input ──────────────────────────────────────────
+// \u2500\u2500\u2500 Text input \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 function sendText() {
   const input = $('textInput');
   const text = input.value.trim();
@@ -1204,11 +1198,11 @@ function sendText() {
   input.value = '';
 
   if (ws && ws.readyState === WebSocket.OPEN) {
-    // Voice connected — send through voice agent
+    // Voice connected \u2014 send through voice agent
     ws.send(JSON.stringify({ type: 'text_input', text }));
     dbg('Sent text via voice: "' + text.slice(0, 50) + '"', 'event');
   } else {
-    // Voice disconnected — route through task bridge (same as Telegram/Discord)
+    // Voice disconnected \u2014 route through task bridge (same as Telegram/Discord)
     const apiBase = 'http://' + location.hostname + ':7843';
     fetch(apiBase + '/task', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from: 'web', task: text }) })
       .then(r => r.json())
@@ -1233,13 +1227,13 @@ function sendText() {
       .catch(() => {
         const err = document.createElement('div');
         err.className = 't-entry t-assistant';
-        err.textContent = '(Failed to send — agent API not reachable)';
+        err.textContent = '(Failed to send \u2014 agent API not reachable)';
         $('transcript').appendChild(err);
       });
   }
 }
 
-// ─── Dynamic region: contextual generative UI ────────────
+// \u2500\u2500\u2500 Dynamic region: contextual generative UI \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 // Priority: dynamic-content.json > pending questions > proactive status > chips
 // Supports: audio, image, video, document, html, and fallback chips
 window._drQuestions = [];
@@ -1328,7 +1322,7 @@ function updateDynamicRegion() {
       '<div class="suggestions-label">Try saying or typing</div>' +
       SUGGESTION_CHIPS.map(c =>
         '<span class="suggestion" onclick="trySuggestion(this)">' +
-        c.label + (c.desc ? ' — ' + c.desc : '') + '</span>'
+        c.label + (c.desc ? ' \u2014 ' + c.desc : '') + '</span>'
       ).join('') + '</div>';
   }
 }
@@ -1382,23 +1376,23 @@ document.addEventListener('keydown', function(e) {
 // Initial render
 updateDynamicRegion();
 
-</script>
+<\/script>
 </body>
-</html>`;
-
-const server = createServer((_req, res) => {
-	res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-	res.end(HTML);
+</html>`
+);
+var server = createServer((_req, res) => {
+  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+  res.end(HTML);
 });
-
 server.listen(HTTP_PORT, HTTP_HOST, () => {
-	const serverUrl = HTTP_HOST === '0.0.0.0' 
-		? `http://localhost:${HTTP_PORT} (or use your server's IP/DNS)`
-		: `http://${HTTP_HOST}:${HTTP_PORT}`;
-	console.log(`\n  Sutando — Web Client`);
-	console.log(`  ────────────────────────────────`);
-	console.log(`  Open in browser:  ${serverUrl}`);
-	console.log(`  WebSocket URL:    Auto-detected from browser hostname`);
-	console.log(`  WebSocket port:  ${WS_PORT}`);
-	console.log(`\n  Press Ctrl+C to stop.\n`);
+  const serverUrl = HTTP_HOST === "0.0.0.0" ? `http://localhost:${HTTP_PORT} (or use your server's IP/DNS)` : `http://${HTTP_HOST}:${HTTP_PORT}`;
+  console.log(`
+  Sutando \u2014 Web Client`);
+  console.log(`  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500`);
+  console.log(`  Open in browser:  ${serverUrl}`);
+  console.log(`  WebSocket URL:    Auto-detected from browser hostname`);
+  console.log(`  WebSocket port:  ${WS_PORT}`);
+  console.log(`
+  Press Ctrl+C to stop.
+`);
 });
