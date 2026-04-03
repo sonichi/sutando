@@ -243,7 +243,7 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 	const fullTranscript = callSession.transcript.slice(-20)
 		.map(t => `${t.role === 'sutando' ? 'Sutando' : 'Caller'}: ${t.text}`)
 		.join('\n');
-	const content = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ncallSid: ${callSession.callSid}\ncaller: ${callSession.callerNumber || 'unknown'}\ntask: ${taskDescription}\ntranscript:\n${fullTranscript}\n`;
+	const content = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ncallSid: ${callSession.callSid}\ncaller: ${callSession.callerNumber || 'unknown'}\naccess_tier: ${callSession.isOwner ? 'owner' : 'other'}\ntask: ${taskDescription}\ntranscript:\n${fullTranscript}\n`;
 	writeFileSync(taskPath, content);
 
 	// Poll for result in background, inject when ready — don't block Gemini
@@ -789,6 +789,7 @@ function cleanupCall(callSid: string): void {
 			`timestamp: ${new Date().toISOString()}`,
 			`callSid: ${callSid}`,
 			`caller: ${session.callerNumber || 'unknown'}`,
+			`access_tier: ${session.isOwner ? 'owner' : 'other'}`,
 			`task: Summarize this ${isMeeting ? 'meeting (ID: ' + session.meetingId + ')' : 'phone call'}.`,
 			`instructions:`,
 			`  1. Write a structured summary: ## Key Topics, ## Decisions, ## Action Items, ## Notable Quotes`,
