@@ -1281,6 +1281,28 @@ export const readNoteTool: ToolDefinition = {
 	},
 };
 
+export const saveNoteTool: ToolDefinition = {
+	name: 'save_note',
+	description: 'Save a note. Use for "take a note", "remember this", "save this".',
+	parameters: z.object({
+		title: z.string().describe('Short title for the note'),
+		content: z.string().describe('The note content'),
+		tags: z.string().optional().describe('Comma-separated tags'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { title, content, tags } = args as { title: string; content: string; tags?: string };
+		const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+		const date = new Date().toISOString().slice(0, 10);
+		const tagList = tags ? tags.split(',').map(t => t.trim()) : ['personal'];
+		const md = `---\ntitle: ${title}\ndate: ${date}\ntags: [${tagList.join(', ')}]\n---\n\n${content}\n`;
+		try {
+			writeFileSync(join(NOTES_DIR, `${slug}.md`), md);
+			return { status: 'saved', title, slug, path: `notes/${slug}.md` };
+		} catch (e) { return { error: String(e) }; }
+	},
+};
+
 export const inlineTools = [
 	pressKeyTool, scrollTool, switchTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
@@ -1288,7 +1310,7 @@ export const inlineTools = [
 	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, summonTool, dismissTool,
 	joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool,
 	describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool, slideControlTool, fullscreenTool,
-	listNotesTool, readNoteTool, ];
+	listNotesTool, readNoteTool, saveNoteTool, ];
 
 /** Tools available to any caller (including unverified) */
 export const anyCallerTools = [
