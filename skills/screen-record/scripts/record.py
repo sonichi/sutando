@@ -58,8 +58,10 @@ def start():
 
     path = f"/tmp/sutando-recording-{int(time.time())}.mov"
 
+    # Use ffmpeg instead of screencapture -v (which requires TTY)
     proc = subprocess.Popen(
-        ["screencapture", "-v", "-k", "-g", path],
+        ["ffmpeg", "-f", "avfoundation", "-i", "Capture screen 0:none",
+         "-r", "15", "-pix_fmt", "yuv420p", "-y", path],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
