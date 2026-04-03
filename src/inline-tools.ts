@@ -1174,13 +1174,16 @@ export const slideControlTool: ToolDefinition = {
 	async execute(args) {
 		const { action, slideNumber } = args as { action: 'next' | 'previous' | 'goto'; slideNumber?: number };
 		try {
-			const key = action === 'next' ? 'ArrowRight' : 'ArrowLeft';
-			const dispatch = `execute javascript "document.dispatchEvent(new KeyboardEvent(\\"keydown\\",{key:\\"${key}\\"}))"`;
-			let script: string;
+			// All slide navigation uses DOM manipulation for reliability
+			let js: string;
 			if (action === 'goto' && slideNumber) {
-				// Direct DOM manipulation — instant, no wrapping issues
-				const js = `var ss=document.querySelectorAll(\\".slide\\");for(var j=0;j<ss.length;j++){ss[j].classList.remove(\\"active\\")};document.getElementById(\\"s${slideNumber}\\").classList.add(\\"active\\");document.getElementById(\\"cur\\").textContent=\\"${slideNumber}\\"`;
-				script = `tell application "Google Chrome"
+				js = `var ss=document.querySelectorAll(\\".slide\\");for(var j=0;j<ss.length;j++){ss[j].classList.remove(\\"active\\")};document.getElementById(\\"s${slideNumber}\\").classList.add(\\"active\\");document.getElementById(\\"cur\\").textContent=\\"${slideNumber}\\"`;
+			} else {
+				// next/previous: read current slide number, compute target, set it
+				const dir = action === 'next' ? 1 : -1;
+				js = `var cur=parseInt(document.getElementById(\\"cur\\").textContent)||1;var total=document.querySelectorAll(\\".slide\\").length;var next=((cur-1+${dir}+total)%total)+1;var ss=document.querySelectorAll(\\".slide\\");for(var j=0;j<ss.length;j++){ss[j].classList.remove(\\"active\\")};document.getElementById(\\"s\\"+next).classList.add(\\"active\\");document.getElementById(\\"cur\\").textContent=String(next)`;
+			}
+			const script = `tell application "Google Chrome"
 	repeat with w in windows
 		set tabList to tabs of w
 		repeat with i from 1 to count of tabList
@@ -1191,19 +1194,6 @@ export const slideControlTool: ToolDefinition = {
 		end repeat
 	end repeat
 end tell`;
-			} else {
-				script = `tell application "Google Chrome"
-	repeat with w in windows
-		set tabList to tabs of w
-		repeat with i from 1 to count of tabList
-			if URL of item i of tabList contains "index-sutando" or URL of item i of tabList contains "localhost:8888" then
-				tell item i of tabList to ${dispatch}
-				return "done"
-			end if
-		end repeat
-	end repeat
-end tell`;
-			}
 			execSync(`osascript -e '${script}'`, { timeout: 15_000 });
 			console.log(`${ts()} [Slides] ${action}${slideNumber ? ` → slide ${slideNumber}` : ''}`);
 			return { status: 'done', action, slideNumber };
