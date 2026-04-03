@@ -333,6 +333,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps(data).encode())
+        elif urlparse(self.path).path == "/notes-ui":
+            html = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Sutando Notes</title>
+<style>
+body{font-family:-apple-system,sans-serif;background:#1a1a2e;color:#e0e0e0;margin:0;padding:20px;max-width:900px;margin:0 auto}
+a{color:#7c83ff;text-decoration:none}a:hover{text-decoration:underline}
+h1{color:#fff;border-bottom:1px solid #333;padding-bottom:10px}
+.note-list{list-style:none;padding:0}.note-list li{padding:8px 12px;border-bottom:1px solid #2a2a3e}
+.note-list li:hover{background:#2a2a3e;border-radius:4px}
+.note-content{background:#2a2a3e;padding:20px;border-radius:8px;white-space:pre-wrap;font-size:14px;line-height:1.6}
+.back{display:inline-block;margin-bottom:15px;padding:5px 12px;background:#333;border-radius:4px}
+.date{color:#888;font-size:12px;float:right}
+</style></head><body>
+<h1>Sutando Notes</h1>
+<div id="app"><ul class="note-list" id="list"></ul></div>
+<div id="viewer" style="display:none"><a href="#" class="back" onclick="showList();return false">&larr; Back</a><div class="note-content" id="content"></div></div>
+<script>
+async function load(){const r=await fetch('/notes');const notes=await r.json();const ul=document.getElementById('list');
+ul.innerHTML=notes.map(n=>`<li><a href="#" onclick="showNote('${n.slug}');return false">${n.title}</a><span class="date">${new Date(n.modified*1000).toLocaleDateString()}</span></li>`).join('')}
+async function showNote(slug){const r=await fetch('/notes/'+slug);const text=await r.text();document.getElementById('content').textContent=text;
+document.getElementById('app').style.display='none';document.getElementById('viewer').style.display='block'}
+function showList(){document.getElementById('app').style.display='block';document.getElementById('viewer').style.display='none'}
+load()
+</script></body></html>"""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(html.encode())
         elif urlparse(self.path).path == "/notes":
             notes_dir = REPO_DIR / "notes"
             notes = []
