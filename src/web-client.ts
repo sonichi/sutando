@@ -1191,28 +1191,31 @@ function showNoteInDR(slug) {
 }
 
 function toggleActivity() {
-  var panel = document.getElementById('activity-panel');
-  if (panel && panel.style.display !== 'none') {
-    panel.style.display = 'none';
+  // If already showing activity, close it
+  if (window._drLocalContent && window._drContent && window._drContent._isActivity) {
+    window._drContent = null;
+    window._drLocalContent = false;
+    updateDynamicRegion();
     return;
   }
   fetch(API_BASE + '/activity').then(function(r){return r.json()}).then(function(data) {
     var items = data.activity || [];
     if (items.length === 0) { return; }
-    var html = '<div id="activity-panel" style="background:#1a1a2e;border:1px solid #2a2a3e;border-radius:8px;padding:10px;margin:8px 16px;font-size:12px;max-height:200px;overflow-y:auto">';
-    html += '<div style="display:flex;justify-content:space-between;margin-bottom:6px"><b style="color:#888">Recent Activity</b><span style="cursor:pointer;color:#666" onclick="document.getElementById(&quot;activity-panel&quot;).style.display=&quot;none&quot;">close</span></div>';
+    var html = '<div style="max-height:300px;overflow-y:auto">' +
+      '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">' +
+      '<b style="font-size:14px">Recent Activity</b>' +
+      '<span class="suggestion" onclick="window._drContent=null;window._drLocalContent=false;updateDynamicRegion()" style="font-size:11px;cursor:pointer">Close</span></div>';
     items.forEach(function(item) {
       if (item.type === 'commit') {
-        html += '<div style="padding:2px 0;color:#7c83ff"><span style="color:#555;font-family:monospace">' + item.hash + '</span> ' + esc(item.message) + '</div>';
+        html += '<div style="padding:3px 0;font-size:12px"><span style="color:#555;font-family:monospace">' + item.hash + '</span> <span style="color:#7c83ff">' + esc(item.message) + '</span></div>';
       } else if (item.type === 'task') {
-        html += '<div style="padding:2px 0;color:#4ecca3">' + esc(item.preview) + '</div>';
+        html += '<div style="padding:3px 0;font-size:12px;color:#4ecca3">' + esc(item.preview) + '</div>';
       }
     });
     html += '</div>';
-    var existing = document.getElementById('activity-panel');
-    if (existing) existing.remove();
-    var csBar = document.getElementById('core-status-bar');
-    if (csBar) csBar.insertAdjacentHTML('afterend', html);
+    window._drContent = {type:'html', content:html, _isActivity:true};
+    window._drLocalContent = true;
+    updateDynamicRegion();
   });
 }
 window.toggleActivity = toggleActivity;
@@ -1412,7 +1415,7 @@ document.addEventListener('keydown', function(e) {
         var statusText = loopData.status === 'running'
           ? '<span class="core-running">Core: ' + esc(loopData.step || 'working') + '</span>'
           : '<span class="core-idle">Core: idle</span>';
-        var expandBtn = ' <span style="cursor:pointer;opacity:0.5" onclick="toggleActivity()">[ activity ]</span>';
+        var expandBtn = ' <span style="cursor:pointer;opacity:0.5;font-size:10px" onclick="toggleActivity()">activity</span>';
         csBar.innerHTML = statusText + expandBtn;
       }
     });
