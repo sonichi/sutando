@@ -333,6 +333,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps(data).encode())
+        elif urlparse(self.path).path == "/notes":
+            notes_dir = REPO_DIR / "notes"
+            notes = []
+            for f in sorted(notes_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True):
+                title = f.stem.replace("-", " ").title()
+                # Try to extract title from frontmatter
+                try:
+                    content = f.read_text()
+                    for line in content.splitlines():
+                        if line.startswith("title:"):
+                            title = line.split(":", 1)[1].strip()
+                            break
+                except Exception:
+                    pass
+                notes.append({"slug": f.stem, "title": title, "modified": f.stat().st_mtime})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(notes).encode())
+        elif urlparse(self.path).path.startswith("/notes/"):
+            slug = urlparse(self.path).path.split("/notes/", 1)[1]
+            # Sanitize slug — only allow alphanumeric, hyphens, underscores
+            import re
+            if not re.match(r'^[\w-]+$', slug):
+                self.send_response(400)
+                self.end_headers()
+                return
+            note_file = REPO_DIR / "notes" / f"{slug}.md"
+            if note_file.exists():
+                self.send_response(200)
+                self.send_header("Content-Type", "text/markdown; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(note_file.read_text().encode())
+            else:
+                self.send_response(404)
+                self.end_headers()
         else:
             self.send_response(404)
             self.end_headers()
