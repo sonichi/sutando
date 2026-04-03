@@ -118,6 +118,8 @@ bash src/verify-setup.sh
   - `GEMINI_API_KEY` not set or invalid in `.env` — get one at [ai.google.dev](https://ai.google.dev)
   - Port 9900 already in use — run `lsof -i :9900` to check
 - `npm install` failed? Make sure Node.js 22+ is installed: `node --version`
+- Gemini 429 errors? Your shell may have a stale `GEMINI_API_KEY` overriding `.env` — run `unset GEMINI_API_KEY` then restart
+- Screen recording produces 0-second files? `screencapture -v` needs a TTY. Sutando uses `ffmpeg` instead — make sure it's installed: `brew install ffmpeg`
 - Something broke? Run `bash src/restart.sh` — this kills all services and restarts fresh
 
 ---
