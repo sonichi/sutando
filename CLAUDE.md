@@ -134,6 +134,21 @@ python3 ~/.claude/skills/macos-tools/scripts/contacts.py search "Bob"   # find b
 ```
 Use before sending email to resolve "email Bob" → actual email address. Returns name, emails, phones.
 
+**iMessage** — send and read iMessages:
+```bash
+imsg send --to "+14155551234" --text "Hello!"    # send message
+imsg chats                                        # list recent chats
+imsg messages --chat "+14155551234" --limit 10    # read messages
+```
+Always confirm message content with user before sending.
+
+**WhatsApp** — send messages via WhatsApp (requires `wacli auth` first):
+```bash
+wacli send text --to "+14155551234" --message "Hello!"
+wacli chats list --limit 20
+wacli messages search "keyword" --limit 10
+```
+
 **Reminders** — read/write macOS Reminders (to-do list):
 ```bash
 python3 ~/.claude/skills/macos-tools/scripts/reminders.py list             # incomplete reminders
