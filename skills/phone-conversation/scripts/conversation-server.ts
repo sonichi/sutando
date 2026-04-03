@@ -612,6 +612,7 @@ async function createCallSession(params: {
 	// Bypasses ClientTransport's internal WebSocket for lower latency
 	const sessionAny = session as any;
 	let isReplaying = false; // suppress audio during reconnect replay
+	let turnCountBeforeDisconnect = 0; // track turns to know when replay is done
 	let _isRecordingMuted: (() => boolean) | null = null;
 	import('../../../src/browser-tools.js').then(bt => { _isRecordingMuted = bt.isRecordingMuted; }).catch(() => {});
 	sessionAny.handleAudioOutput = (data: string) => {
@@ -640,6 +641,12 @@ async function createCallSession(params: {
 	let lastProcessedIdx = 0;
 	session.eventBus.subscribe('turn.end', () => {
 		const items = session.conversationContext.items;
+		// Detect end of reconnect replay: when items catch up to pre-disconnect count
+		if (isReplaying && items.length >= turnCountBeforeDisconnect) {
+			console.log(`${ts()} [Phone] replay complete (${items.length}/${turnCountBeforeDisconnect} turns) — unmuting`);
+			isReplaying = false;
+			import('../../../src/browser-tools.js').then(bt => bt.onReconnect(session)).catch(() => {});
+		}
 		// Guard: if items shrunk (reconnect reset context), re-scan from start but skip already-seen text
 		if (items.length < lastProcessedIdx) lastProcessedIdx = 0;
 		const lastTranscriptText = callSession.transcript.length > 0
@@ -703,11 +710,18 @@ async function createCallSession(params: {
 				if (!callSession.hangingUp && activeCalls.has(callSession.callSid)) {
 					console.log(`${ts()} [Phone] reconnecting Gemini for ${callSession.callSid}`);
 					isReplaying = true; // mute audio while Gemini replays history
+					turnCountBeforeDisconnect = session.conversationContext.items.length;
+					console.log(`${ts()} [Phone] replay suppression: ${turnCountBeforeDisconnect} turns to replay`);
 					sessionAny.handleClientConnected();
-					setTimeout(() => {
-						isReplaying = false;
-						import('../../../src/browser-tools.js').then(bt => bt.onReconnect(session)).catch(() => {});
-					}, 6000);
+					// Fallback: unmute after max(10s, 2s per turn) in case turn detection fails
+					const fallbackMs = Math.max(10000, turnCountBeforeDisconnect * 2000);
+					const fallbackTimer = setTimeout(() => {
+						if (isReplaying) {
+							console.log(`${ts()} [Phone] replay suppression fallback (${fallbackMs}ms)`);
+							isReplaying = false;
+							import('../../../src/browser-tools.js').then(bt => bt.onReconnect(session)).catch(() => {});
+						}
+					}, fallbackMs);
 				}
 			}, 1500);
 		}
