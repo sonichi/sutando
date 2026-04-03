@@ -252,6 +252,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
             si_file = REPO_DIR / "stand-identity.json"
             data = json.loads(si_file.read_text()) if si_file.exists() else {}
             self.send_json(200, data)
+        elif path == "/activity":
+            # Recent activity: git commits + processed tasks
+            activity = []
+            try:
+                import subprocess
+                git_log = subprocess.run(
+                    ["git", "-C", str(REPO_DIR), "log", "--oneline", "--since=24 hours ago", "-10"],
+                    capture_output=True, text=True, timeout=5
+                ).stdout.strip()
+                for line in git_log.split("\n"):
+                    if line.strip():
+                        parts = line.split(" ", 1)
+                        activity.append({"type": "commit", "hash": parts[0], "message": parts[1] if len(parts) > 1 else ""})
+            except Exception:
+                pass
+            # Recent results
+            try:
+                results_dir = REPO_DIR / "results"
+                result_files = sorted(results_dir.glob("task-*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)[:5]
+                for f in result_files:
+                    content = f.read_text()[:200]
+                    activity.append({"type": "task", "id": f.stem, "preview": content.split("\n")[0]})
+            except Exception:
+                pass
+            self.send_json(200, {"activity": activity})
         elif path == "/dynamic-content":
             dc_file = REPO_DIR / "dynamic-content.json"
             if dc_file.exists():

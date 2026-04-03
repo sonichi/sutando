@@ -1190,6 +1190,33 @@ function showNoteInDR(slug) {
   });
 }
 
+function toggleActivity() {
+  var panel = document.getElementById('activity-panel');
+  if (panel && panel.style.display !== 'none') {
+    panel.style.display = 'none';
+    return;
+  }
+  fetch(API_BASE + '/activity').then(function(r){return r.json()}).then(function(data) {
+    var items = data.activity || [];
+    if (items.length === 0) { return; }
+    var html = '<div id="activity-panel" style="background:#1a1a2e;border:1px solid #2a2a3e;border-radius:8px;padding:10px;margin:8px 16px;font-size:12px;max-height:200px;overflow-y:auto">';
+    html += '<div style="display:flex;justify-content:space-between;margin-bottom:6px"><b style="color:#888">Recent Activity</b><span style="cursor:pointer;color:#666" onclick="document.getElementById(&quot;activity-panel&quot;).style.display=&quot;none&quot;">close</span></div>';
+    items.forEach(function(item) {
+      if (item.type === 'commit') {
+        html += '<div style="padding:2px 0;color:#7c83ff"><span style="color:#555;font-family:monospace">' + item.hash + '</span> ' + esc(item.message) + '</div>';
+      } else if (item.type === 'task') {
+        html += '<div style="padding:2px 0;color:#4ecca3">' + esc(item.preview) + '</div>';
+      }
+    });
+    html += '</div>';
+    var existing = document.getElementById('activity-panel');
+    if (existing) existing.remove();
+    var csBar = document.getElementById('core-status-bar');
+    if (csBar) csBar.insertAdjacentHTML('afterend', html);
+  });
+}
+window.toggleActivity = toggleActivity;
+
 // Expose notes functions to global scope for onclick handlers
 window.showNotesInDR = showNotesInDR;
 window.showNoteInDR = showNoteInDR;
@@ -1379,14 +1406,14 @@ document.addEventListener('keydown', function(e) {
         window._drProactive = null;
       }
       updateDynamicRegion();
-      // Update persistent core status bar
+      // Update persistent core status bar (clickable to expand activity)
       var csBar = document.getElementById('core-status-bar');
       if (csBar) {
-        if (loopData.status === 'running') {
-          csBar.innerHTML = '<span class="core-running">Core: ' + esc(loopData.step || 'working') + '</span>';
-        } else {
-          csBar.innerHTML = '<span class="core-idle">Core: idle</span>';
-        }
+        var statusText = loopData.status === 'running'
+          ? '<span class="core-running">Core: ' + esc(loopData.step || 'working') + '</span>'
+          : '<span class="core-idle">Core: idle</span>';
+        var expandBtn = ' <span style="cursor:pointer;opacity:0.5" onclick="toggleActivity()">[ activity ]</span>';
+        csBar.innerHTML = statusText + expandBtn;
       }
     });
   }, 3000);
