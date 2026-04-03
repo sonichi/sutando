@@ -171,7 +171,7 @@ ALL_DETECTORS = [
 ]
 
 
-def scan_entry(entry: dict) -> dict | None:
+def scan_entry(entry: dict):
     """Scan a single call log entry. Returns issues dict or None if clean."""
     transcript = entry.get("transcript", "")
     if not transcript or len(transcript) < 20:
