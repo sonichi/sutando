@@ -120,6 +120,10 @@ bash src/verify-setup.sh
 - `npm install` failed? Make sure Node.js 22+ is installed: `node --version`
 - Gemini 429 errors? Your shell may have a stale `GEMINI_API_KEY` overriding `.env` — run `unset GEMINI_API_KEY` then restart
 - Screen recording produces 0-second files? `screencapture -v` needs a TTY. Sutando uses `ffmpeg` instead — make sure it's installed: `brew install ffmpeg`
+- Context disappearing during long sessions? Recent versions of Claude Code aggressively fold previous output, hiding what the agent has done ([anthropics/claude-code#41907](https://github.com/anthropics/claude-code/issues/41907)). Use the stable release instead:
+  ```bash
+  npm install -g @anthropic-ai/claude-code@stable
+  ```
 - Something broke? Run `bash src/restart.sh` — this kills all services and restarts fresh
 
 ---
