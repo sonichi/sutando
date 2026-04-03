@@ -784,7 +784,7 @@ function cleanupCall(callSid: string): void {
 			return `${label}: ${t.text}`;
 		}).join('\n');
 		const isMeeting = session.meetingId != null;
-		const summaryContent = `id: ${summaryTaskId}\ntimestamp: ${new Date().toISOString()}\ncallSid: ${callSid}\ncaller: ${session.callerNumber || 'unknown'}\ntask: summarize this ${isMeeting ? 'meeting (ID: ' + session.meetingId + ')' : 'phone call'} that just ended\ntranscript:\n${formatted}\n`;
+		const summaryContent = `id: ${summaryTaskId}\ntimestamp: ${new Date().toISOString()}\ncallSid: ${callSid}\ncaller: ${session.callerNumber || 'unknown'}\ntask: summarize this ${isMeeting ? 'meeting (ID: ' + session.meetingId + ')' : 'phone call'} that just ended. Write a structured summary with: key topics discussed, decisions made, action items, and notable quotes. Save to notes/meetings/${summaryTaskId}.md with YAML frontmatter (title, date, tags: [meeting]). Also send the summary to Discord DM and Telegram.\ntranscript:\n${formatted}\n`;
 		writeFileSync(join(TASKS_DIR, `${summaryTaskId}.txt`), summaryContent);
 		console.log(`${ts()} [Summary] wrote summary task: ${summaryTaskId}`);
 	}
