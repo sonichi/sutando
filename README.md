@@ -122,6 +122,20 @@ bash src/verify-setup.sh
 - Screen recording produces 0-second files? `screencapture -v` needs a TTY. Sutando uses `ffmpeg` instead — make sure it's installed: `brew install ffmpeg`
 - Something broke? Run `bash src/restart.sh` — this kills all services and restarts fresh
 
+**Shutting down:**
+```bash
+bash src/restart.sh    # stops all services (voice agent, web client, API, bridges, etc.)
+pkill -f "src/Sutando" # stop the menu bar app
+```
+Exiting `startup.sh` alone does NOT stop background services. Always use `restart.sh` (or `kill-all.sh` if available) to cleanly shut everything down.
+
+**Uninstalling:**
+1. Stop all services: `bash src/restart.sh && pkill -f "src/Sutando"`
+2. Remove the repo: `rm -rf ~/Desktop/sutando` (or wherever you cloned it)
+3. Remove config: `rm -rf ~/.claude/projects/*sutando*`
+4. Remove npm packages (optional): the repo uses local `node_modules/` — deleted with the repo
+5. Uninstall brew dependencies (optional): `brew uninstall imsg wacli` if installed
+
 ---
 
 ## Optional integrations
