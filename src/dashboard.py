@@ -342,7 +342,14 @@ a{color:#7c83ff;text-decoration:none}a:hover{text-decoration:underline}
 h1{color:#fff;border-bottom:1px solid #333;padding-bottom:10px}
 .note-list{list-style:none;padding:0}.note-list li{padding:8px 12px;border-bottom:1px solid #2a2a3e}
 .note-list li:hover{background:#2a2a3e;border-radius:4px}
-.note-content{background:#2a2a3e;padding:20px;border-radius:8px;white-space:pre-wrap;font-size:14px;line-height:1.6}
+.note-content{background:#2a2a3e;padding:20px;border-radius:8px;font-size:14px;line-height:1.6}
+.note-content h1,.note-content h2,.note-content h3{color:#fff;margin-top:20px}
+.note-content code{background:#1a1a2e;padding:2px 6px;border-radius:3px;font-size:13px}
+.note-content pre{background:#1a1a2e;padding:12px;border-radius:6px;overflow-x:auto}
+.note-content ul,.note-content ol{padding-left:20px}
+.note-content li{margin:4px 0}
+.note-content a{color:#7c83ff}
+.note-content blockquote{border-left:3px solid #555;padding-left:12px;color:#aaa;margin:10px 0}
 .back{display:inline-block;margin-bottom:15px;padding:5px 12px;background:#333;border-radius:4px}
 .date{color:#888;font-size:12px;float:right}
 </style></head><body>
@@ -352,7 +359,22 @@ h1{color:#fff;border-bottom:1px solid #333;padding-bottom:10px}
 <script>
 async function load(){const r=await fetch('/notes');const notes=await r.json();const ul=document.getElementById('list');
 ul.innerHTML=notes.map(n=>`<li><a href="#" onclick="showNote('${n.slug}');return false">${n.title}</a><span class="date">${new Date(n.modified*1000).toLocaleDateString()}</span></li>`).join('')}
-async function showNote(slug){const r=await fetch('/notes/'+slug);const text=await r.text();document.getElementById('content').textContent=text;
+function md(t){
+t=t.replace(/^---[\\s\\S]*?---\\n/,'');
+t=t.replace(/^### (.+)$/gm,'<h3>$1</h3>');
+t=t.replace(/^## (.+)$/gm,'<h2>$1</h2>');
+t=t.replace(/^# (.+)$/gm,'<h1>$1</h1>');
+t=t.replace(/```([\\s\\S]*?)```/g,'<pre><code>$1</code></pre>');
+t=t.replace(/`([^`]+)`/g,'<code>$1</code>');
+t=t.replace(/\\*\\*(.+?)\\*\\*/g,'<strong>$1</strong>');
+t=t.replace(/\\*(.+?)\\*/g,'<em>$1</em>');
+t=t.replace(/^[\\-\\*] (.+)$/gm,'<li>$1</li>');
+t=t.replace(/(<li>.*<\\/li>\\n?)+/g,'<ul>$&</ul>');
+t=t.replace(/^> (.+)$/gm,'<blockquote>$1</blockquote>');
+t=t.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g,'<a href="$2">$1</a>');
+t=t.replace(/\\n\\n/g,'<br><br>');
+return t}
+async function showNote(slug){const r=await fetch('/notes/'+slug);const text=await r.text();document.getElementById('content').innerHTML=md(text);
 document.getElementById('app').style.display='none';document.getElementById('viewer').style.display='block'}
 function showList(){document.getElementById('app').style.display='block';document.getElementById('viewer').style.display='none'}
 load()
