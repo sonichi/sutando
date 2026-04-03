@@ -141,19 +141,22 @@ def send_reply(chat_id, text):
             api("sendMessage", chat_id=chat_id, text=f"(file not found: {fpath})")
 
 def main():
-    print(f"Telegram bridge started. Polling for messages...")
+    print(f"Telegram bridge started. Polling for messages...", flush=True)
     offset = None
     allowed = load_allowed()
     pending_replies = {}  # task_id -> chat_id
 
     heartbeat_file = REPO / "src" / "telegram-bridge.heartbeat"
-    heartbeat_counter = 0
+    last_heartbeat = 0
     while True:
-        # Write heartbeat every 6 iterations (~60s with 10s timeout)
-        heartbeat_counter += 1
-        if heartbeat_counter >= 6:
-            heartbeat_file.write_text(str(int(time.time())))
-            heartbeat_counter = 0
+        # Write heartbeat at most once per 60 seconds
+        now = time.time()
+        if now - last_heartbeat >= 60:
+            try:
+                heartbeat_file.write_text(str(int(now)))
+                last_heartbeat = now
+            except Exception:
+                pass
         # Poll for new messages
         params = {"timeout": 10, "limit": 10}
         if offset:
@@ -161,7 +164,7 @@ def main():
         try:
             result = api("getUpdates", **params)
         except Exception as e:
-            print(f"[Telegram] Poll error: {e}")
+            print(f"[Telegram] Poll error: {e}", flush=True)
             time.sleep(5)
             continue
 
