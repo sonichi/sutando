@@ -206,6 +206,10 @@ Examples:
 - "When you draft emails, always start with the ask, not the context" → create feedback_email_style.md
 - "Here's how I deploy: git push, then run make deploy, then check /status" → note with [workflow, learned]
 
+## Session Continuity
+
+On each context compaction, `src/session-handoff.sh` saves a snapshot to `session-state.md` (system status, recent commits, open PRs, quota, tasks). Read this file at session start to understand what the previous session was doing. The file is gitignored.
+
 ## Startup
 
 To start everything:
