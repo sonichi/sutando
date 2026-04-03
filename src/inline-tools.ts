@@ -65,21 +65,26 @@ export const pressKeyTool: ToolDefinition = {
 export const scrollTool: ToolDefinition = {
 	name: 'scroll',
 	description:
-		'Scroll the Chrome browser page. Use for: "scroll down", "scroll up".',
+		'Scroll the Chrome browser page. Use for: "scroll down", "scroll up", "scroll to the top", "scroll to the bottom".',
 	parameters: z.object({
-		direction: z.enum(['down', 'up']).describe('Scroll direction'),
+		direction: z.enum(['down', 'up', 'top', 'bottom']).describe('Scroll direction. Use "top" for "scroll to the very top" and "bottom" for "scroll to the very bottom".'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { direction } = args as { direction: 'down' | 'up' };
-		const keyCode = direction === 'down' ? 125 : 126;
-		const presses = 10; // fixed: ~10cm on a 13" screen
+		const { direction } = args as { direction: 'down' | 'up' | 'top' | 'bottom' };
 		try {
-			const keyPresses = Array(presses).fill(`key code ${keyCode}`).join('\n');
-			execSync(`osascript -e 'tell application "Google Chrome" to activate' -e 'delay 0.2' -e 'tell application "System Events"
+			if (direction === 'top' || direction === 'bottom') {
+				const key = direction === 'top' ? 'Home' : 'End';
+				execSync(`osascript -e 'tell application "Google Chrome" to activate' -e 'delay 0.2' -e 'tell application "System Events" to key code ${direction === "top" ? 115 : 119}'`, { timeout: 3_000 });
+			} else {
+				const keyCode = direction === 'down' ? 125 : 126;
+				const presses = 10;
+				const keyPresses = Array(presses).fill(`key code ${keyCode}`).join('\n');
+				execSync(`osascript -e 'tell application "Google Chrome" to activate' -e 'delay 0.2' -e 'tell application "System Events"
 ${keyPresses}
 end tell'`, { timeout: 5_000 });
-			console.log(`${ts()} [Scroll] ${direction} (${presses} keys)`);
+			}
+			console.log(`${ts()} [Scroll] ${direction}`);
 			return { status: 'scrolled', direction };
 		} catch (err) {
 			return { error: `Scroll failed: ${err instanceof Error ? err.message : err}` };
