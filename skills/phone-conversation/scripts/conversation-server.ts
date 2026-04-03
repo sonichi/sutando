@@ -769,6 +769,13 @@ function cleanupCall(callSid: string): void {
 	}
 	console.log(`${ts()} [Phone] call finalized: ${callSid}`);
 
+	// Auto-scan the latest call for issues (async, best effort)
+	try {
+		const scanScript = join(WORKSPACE_DIR, 'src', 'scan-call-logs.py');
+		spawn('python3', [scanScript, '--last', '1', '--json'], { stdio: 'pipe', detached: true })
+			.on('close', (code) => { if (code === 0) console.log(`${ts()} [Phone] call scan complete`); });
+	} catch { /* best effort */ }
+
 	// If top-level call (no parent) with a transcript, write a summary task for Claude to pick up
 	if (!session.parentCallSid && session.transcript.length > 0) {
 		const summaryTaskId = `task-summary-${Date.now()}`;
