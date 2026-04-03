@@ -201,11 +201,14 @@ def run_all_checks() -> list[dict]:
                 status = "warn"
                 detail = f"running but log stale ({int(age_sec)}s old)"
 
-        # Check 3: Heartbeat file freshness
+        # Check 3: Heartbeat file freshness (overrides log staleness if fresh)
         heartbeat_file = REPO_DIR / "src" / f"{name}.heartbeat"
         if heartbeat_file.exists():
             hb_age = time.time() - heartbeat_file.stat().st_mtime
-            if hb_age > 120:  # 2 minutes
+            if hb_age <= 120:  # heartbeat is fresh — bridge is alive
+                status = "ok"
+                detail = "running"
+            else:
                 status = "warn"
                 detail = f"running but heartbeat stale ({int(hb_age)}s old)"
 
