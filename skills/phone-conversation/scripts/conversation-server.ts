@@ -347,11 +347,9 @@ function buildAgent(callSession: CallSession): MainAgent {
 				: isInbound
 				? 'Someone is calling you. Be helpful and conversational. You CAN answer general knowledge questions, do translations, and have conversations — but you cannot access files, control the screen, or delegate tasks. Greet them with "Hello, this is Sutando. How can I help?"'
 				: callSession.isOwner
-				? `You are calling your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''}. The person who picks up IS your owner.`
+				? `You are calling your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''}. The person who picks up IS your owner. You have full capabilities — use the work tool for anything: check the screen, send emails, look things up, make calls, browse the web, or check results of previous tasks. After delivering your message, ask if there is anything else you can help with.${(() => { const ctx = getSafeContext(); return ctx ? `\n\nRecent voice conversation (for context — do NOT repeat or bring up unless asked):\n${ctx}` : ''; })()}`
 				: 'You initiated this call on behalf of your owner.',
 			callSession.purpose && !isInbound ? `Purpose of this call: "${callSession.purpose}"` : '',
-			// Context only for outbound calls to owner
-			!isInbound && callSession.isOwner ? (() => { const ctx = getSafeContext(); return ctx ? `\nRecent context (for reference — use only if relevant):\n${ctx}` : ''; })() : '',
 			'Be natural, warm, and conversational. Keep responses to 1-2 sentences.',
 			'NEVER say "I\'m back", "Welcome back", "Working on it", or "task is queued". If the conversation resumes after a pause, just continue naturally from where you left off.',
 			'When the other person wants to wrap up, say a warm goodbye, then call the hang_up tool to end the call.',
@@ -1336,13 +1334,15 @@ wss.on('connection', (ws: WebSocket) => {
 					}
 
 					// Owner detection: number match + STIR/SHAKEN verification.
-					// A spoofed caller ID will fail STIR/SHAKEN (StirVerstat != TN-Validation-Passed-A).
-					// If StirVerstat is present and NOT A-level, downgrade owner to verified-only.
 					const ownerNumbers = OWNER_NUMBER ? OWNER_NUMBER.split(',').map(n => normalizePhone(n.trim())) : [];
 					const numberMatchesOwner = ownerNumbers.length > 0 && ownerNumbers.includes(normalizePhone(personOnLine));
+					const isOutbound = !!recipientNumber; // we initiated the call — trust the recipient number
 					let isOwner: boolean;
-					if (numberMatchesOwner && stirVerstat && stirVerstat !== 'TN-Validation-Passed-A') {
-						// Number matches but caller ID not cryptographically verified — possible spoof
+					if (isOutbound && numberMatchesOwner) {
+						// Outbound call to owner — we initiated it, skip STIR/SHAKEN check
+						isOwner = true;
+					} else if (numberMatchesOwner && stirVerstat && stirVerstat !== 'TN-Validation-Passed-A') {
+						// Inbound: number matches but caller ID not cryptographically verified — possible spoof
 						isOwner = false;
 						console.log(`${ts()} [Security] Owner number matched but StirVerstat=${stirVerstat} (not A-level) — downgrading to verified`);
 					} else {
