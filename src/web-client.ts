@@ -1222,12 +1222,17 @@ window._drProactive = null;
 window._drContent = null;
 const API_BASE = 'http://' + window.location.hostname + ':7843';
 const SUGGESTION_CHIPS = [
-  {label: 'Summon', desc: 'share screen on Zoom, join on your phone'},
+  {label: 'Summon', desc: 'share screen on Zoom'},
   {label: 'Join my next meeting'},
   {label: 'What is on my screen?'},
   {label: 'What is on my calendar today?'},
-  {label: 'Take a note: my first Sutando note'},
-  {label: 'Tutorial', desc: 'walk me through what you can do'},
+  {label: 'Morning briefing'},
+  {label: 'Check my email'},
+  {label: 'Take a note'},
+  {label: 'Read my reminders'},
+  {label: 'Show tasks'},
+  {label: 'Show notes'},
+  {label: 'Tutorial'},
   {label: 'Bye', desc: 'disconnect voice'},
 ];
 
@@ -1299,10 +1304,11 @@ function updateTabHighlights() {
   var active = window._drActiveTab;
   var questions = window._drQuestions || [];
   var taskCount = window._drTaskCount || 0;
+  var noteCount = window._drNoteCount || 0;
   var tabs = [
     {id:'starter', label:'Starter'},
     {id:'tasks', label:'Tasks' + (taskCount > 0 ? ' (' + taskCount + ')' : '')},
-    {id:'notes', label:'Notes'},
+    {id:'notes', label:'Notes' + (noteCount > 0 ? ' (' + noteCount + ')' : '')},
     {id:'questions', label:'Questions' + (questions.length > 0 ? ' (' + questions.length + ')' : '')},
     {id:'activity', label:'Activity'},
   ];
@@ -1495,8 +1501,10 @@ document.addEventListener('keydown', function(e) {
   setInterval(() => {
     Promise.all([
       fetch(API_BASE + '/dynamic-content').then(r => r.json()).catch(() => ({})),
-      fetch(API_BASE + '/core-status').then(r => r.json()).catch(() => ({status:'idle'}))
-    ]).then(([dc, loopData]) => {
+      fetch(API_BASE + '/core-status').then(r => r.json()).catch(() => ({status:'idle'})),
+      fetch('http://' + window.location.hostname + ':7844/notes').then(r => r.json()).catch(() => [])
+    ]).then(([dc, loopData, notes]) => {
+      window._drNoteCount = Array.isArray(notes) ? notes.length : 0;
       // Only overwrite content if API has real content; preserve local content (e.g. notes browser)
       if (dc && dc.type) {
         window._drContent = dc;
