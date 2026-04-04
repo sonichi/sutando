@@ -173,7 +173,7 @@ async function describeScreenshot(imagePath: string): Promise<string> {
 		const safePath = imagePath.replace(/[^a-zA-Z0-9_\-./]/g, '');
 		const resized = safePath.replace('.png', '-sm.jpg');
 		try {
-			execSync(`sips -Z 800 -s format jpeg "${safePath}" --out "${resized}" 2>/dev/null`, { timeout: 2_000 });
+			execSync('sips -Z 800 -s format jpeg -- ' + JSON.stringify(safePath) + ' --out ' + JSON.stringify(resized) + ' 2>/dev/null', { timeout: 2_000 });
 		} catch { /* use original if resize fails */ }
 		const actualPath = existsSync(resized) ? resized : imagePath;
 		const mimeType = actualPath.endsWith('.jpg') ? 'image/jpeg' : 'image/png';
