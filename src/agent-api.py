@@ -68,8 +68,7 @@ def validate_twilio_signature(handler, body: str) -> bool:
     params = parse_qs(body, keep_blank_values=True)
     param_string = url
     for key, values in sorted(params.items()):
-        for value in sorted(values):
-            param_string += key + value
+        param_string += key + values[0]
 
     mac = hmac.new(auth_token.encode(), param_string.encode(), hashlib.sha1)
     expected = base64.b64encode(mac.digest()).decode()
