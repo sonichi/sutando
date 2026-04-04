@@ -156,13 +156,40 @@ describe('CartesiaSTTProvider', () => {
 	});
 
 	describe('stop', () => {
-		it('clears all state', async () => {
+		it('clears all state including wasInterrupted', async () => {
 			provider.feedAudio(makeChunk(500));
 			provider.handleInterrupted();
+			assert.equal((provider as any).wasInterrupted, true);
+
 			await provider.stop();
 
 			assert.equal((provider as any).audioChunks.length, 0);
 			assert.equal((provider as any).bufferBytes, 0);
+			assert.equal((provider as any).wasInterrupted, false);
+		});
+
+		it('handleTurnComplete after stop does not preserve stale interrupt', async () => {
+			provider.feedAudio(makeChunk(500));
+			provider.handleInterrupted();
+			await provider.stop();
+
+			provider.feedAudio(makeChunk(500));
+			provider.handleTurnComplete();
+
+			assert.equal((provider as any).audioChunks.length, 0);
+		});
+	});
+
+	describe('commit after stop', () => {
+		it('stopped flag is set after stop', async () => {
+			await provider.stop();
+			assert.equal((provider as any).stopped, true);
+		});
+
+		it('start resets the stopped flag', async () => {
+			await provider.stop();
+			await provider.start();
+			assert.equal((provider as any).stopped, false);
 		});
 	});
 });

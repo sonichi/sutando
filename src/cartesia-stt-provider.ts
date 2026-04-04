@@ -29,6 +29,7 @@ export class CartesiaSTTProvider implements STTProvider {
 	private audioChunks: string[] = [];
 	private bufferBytes = 0;
 	private wasInterrupted = false;
+	private stopped = false;
 
 	onTranscript?: (text: string, turnId: number | undefined) => void;
 	onPartialTranscript?: (text: string) => void;
@@ -50,12 +51,15 @@ export class CartesiaSTTProvider implements STTProvider {
 	}
 
 	async start(): Promise<void> {
+		this.stopped = false;
 		console.log(`${ts()} [CartesiaSTT] Started (model: ${this.model}, sampleRate: ${this.sampleRate})`);
 	}
 
 	async stop(): Promise<void> {
+		this.stopped = true;
 		this.audioChunks = [];
 		this.bufferBytes = 0;
+		this.wasInterrupted = false;
 		console.log(`${ts()} [CartesiaSTT] Stopped`);
 	}
 
@@ -91,6 +95,7 @@ export class CartesiaSTTProvider implements STTProvider {
 				'Sample-Rate': String(this.sampleRate),
 				'Encoding': 'pcm_s16le',
 				'Language': 'en',
+				'Model-Id': this.model,
 			},
 			body: allAudio,
 		})
@@ -102,6 +107,7 @@ export class CartesiaSTTProvider implements STTProvider {
 				return res.json();
 			})
 			.then((data: any) => {
+				if (this.stopped) return;
 				const text = data?.text?.trim();
 				if (text && this.onTranscript) {
 					console.log(`${ts()} [CartesiaSTT] Transcript (turn ${turnId}): "${text.slice(0, 80)}${text.length > 80 ? '...' : ''}"`);
