@@ -315,6 +315,10 @@ async def poll_results():
                 import re
                 reply_text = result_file.read_text().strip()
                 channel = pending_replies.pop(task_id)
+                # Skip sending if already replied directly (core agent used MCP)
+                if reply_text.startswith('[no-send]') or reply_text.startswith('[REPLIED]'):
+                    print(f"  Skipped (already replied): {task_id}")
+                    continue
                 try:
                     # Extract file paths: [file: /path] or [send: /path]
                     file_pattern = re.compile(r'\[(?:file|send|attach):\s*([^\]]+)\]')

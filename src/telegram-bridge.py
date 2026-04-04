@@ -232,6 +232,10 @@ def main():
             if result_file.exists():
                 reply_text = result_file.read_text().strip()
                 chat_id = pending_replies.pop(task_id)
+                # Skip sending if already replied directly
+                if reply_text.startswith('[no-send]') or reply_text.startswith('[REPLIED]'):
+                    print(f"  Skipped (already replied): {task_id}")
+                    continue
                 try:
                     send_reply(chat_id, reply_text)
                     print(f"  Replied to {chat_id}: {reply_text[:80]}...")
