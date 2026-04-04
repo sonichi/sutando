@@ -1298,16 +1298,15 @@ function updateTabHighlights() {
     {id:'questions', label:'Questions' + (questions.length > 0 ? ' (' + questions.length + ')' : '')},
     {id:'activity', label:'Activity'},
   ];
+  tabsEl.style.display = 'flex';
+  tabsEl.style.gap = '2px';
   tabsEl.innerHTML = tabs.map(function(t) {
     var isActive = t.id === active;
     var bg = isActive ? '#2a2a4e' : 'transparent';
     var fg = isActive ? '#ccc' : '#666';
     var border = isActive ? '#4a4a6e' : '#2a2a3e';
     if (t.id === 'questions' && questions.length > 0 && !isActive) fg = '#f0ad4e';
-    // Fixed width per tab to prevent layout shift from badges
-    var widths = {starter:'58px',tasks:'62px',notes:'50px',questions:'82px',activity:'62px'};
-    var w = widths[t.id] || 'auto';
-    return '<span onclick="switchDRTab(&quot;' + t.id + '&quot;)" style="cursor:pointer;padding:4px 0;border-radius:12px;font-size:11px;border:1px solid ' + border + ';background:' + bg + ';color:' + fg + ';display:inline-block;width:' + w + ';text-align:center">' + t.label + '</span>';
+    return '<span onclick="switchDRTab(&quot;' + t.id + '&quot;)" style="cursor:pointer;padding:4px 0;border-radius:12px;font-size:11px;border:1px solid ' + border + ';background:' + bg + ';color:' + fg + ';flex:1;text-align:center">' + t.label + '</span>';
   }).join('');
 }
 
