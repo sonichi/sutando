@@ -68,3 +68,5 @@ Each pass, in order:
 9. **Ensure the watcher is running.** If no `fswatch` process on `tasks/`, start one with `bash src/watch-tasks.sh` (`run_in_background: true`). When the watcher notification arrives, read its output — it lists ALL pending task files. Process every one before restarting the watcher.
 
 10. **Monitor Discord.** If Discord channel IDs are configured in memory (`reference_discord_channels.md`), check those channels for new messages. Forward actionable items from public channels to the dev channel. Skip bot messages, Zoom invites, and messages already sent by you.
+
+11. **Update contextual chips.** Write `contextual-chips.json` with actionable chips based on current context. Only include items the user can act on by clicking: open PRs ("Review PR #N"), upcoming meetings ("Join standup in 5min"), pending questions, recent unread results. Format: `{"chips": [{"label": "...", "desc": "..."}], "ts": EPOCH}`. The web UI polls this file and pins chips at the top of the starter tab.
