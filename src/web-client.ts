@@ -27,7 +27,7 @@ const HTML = /* html */ `<!DOCTYPE html>
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     background: #0a0a12; color: #c0c0d0;
     display: flex; flex-direction: column; align-items: center;
-    min-height: 100vh; padding: 0;
+    min-height: 100vh; padding: 0 0 60px 0;
   }
   /* Header */
   .header {
@@ -96,7 +96,8 @@ const HTML = /* html */ `<!DOCTYPE html>
   /* Input bar */
   .input-bar {
     display: flex; gap: 8px; padding: 8px 16px 12px;
-    position: sticky; bottom: 0; background: #12121e; z-index: 10;
+    position: fixed; bottom: 0; left: 0; right: 0; max-width: 480px; margin: 0 auto;
+    background: #12121e; z-index: 10;
     border-top: 1px solid #1e1e30;
   }
   .input-bar input {
