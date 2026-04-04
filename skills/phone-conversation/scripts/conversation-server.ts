@@ -44,7 +44,7 @@
 
 import 'dotenv/config';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { mkdirSync, writeFileSync, appendFileSync, unlinkSync, existsSync, readFileSync, readdirSync } from 'node:fs';
+import { mkdirSync, writeFileSync, appendFileSync, unlinkSync, existsSync, readFileSync, readdirSync, createWriteStream, type WriteStream } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execSync, spawn, type ChildProcess } from 'node:child_process';
@@ -202,9 +202,11 @@ interface CallSession {
 	transcript: { role: string; text: string }[];
 	resultQueue: { text: string }[];
 	taskResultCache?: Map<string, string>;
+	cleanupNarration?: () => void;
 }
 
 const activeCalls = new Map<string, CallSession>();
+let activePlaybackProc: ChildProcess | null = null; // ffmpeg process for /play-audio streaming
 const pendingMeetingJoins = new Set<string>(); // prevents duplicate near-simultaneous joins
 let nextBodhiPort = 9910; // Dynamic ports for per-call VoiceSessions
 
@@ -367,6 +369,14 @@ function buildAgent(callSession: CallSession): MainAgent {
 				'## Tools',
 				`These tools are instant (use them directly, NOT through work): ${inlineTools.map(t => t.name).join(', ')}. Use work for everything else.`,
 				'TOOL EXCLUSIVITY: If an inline tool can handle the request, use ONLY the inline tool. NEVER also call work. They are mutually exclusive — calling both causes duplicate responses. Only use work when no inline tool fits.',
+				'SUMMON: Before calling summon, ALWAYS say "Summoning your screen now" FIRST — the user is on the phone and cannot see what is happening. The tool takes several seconds.',
+				'PLAYBACK RULES (CRITICAL):',
+				'0. To open/play ANY video or media file, ALWAYS use play_recording({action:"play", path:"..."}) — NEVER use work. This includes .mov, .mp4, .avi files in any folder (Downloads, tmp, etc). The path parameter accepts full paths or ~/relative paths.',
+				'1. After calling play_recording, say NOTHING. No "playing now", no "recording started", no commentary. The audio streams to the phone — any speech from you will overlap and desync.',
+				'2. "pause", "stop", "hold" → call play_recording({action:"pause"}). Say only "Paused."',
+				'3. "play", "continue", "continue to play", "resume", "go", "start over", "play again" → IMMEDIATELY call play_recording({action:"play"}). Say NOTHING. Do NOT narrate, describe the screen, or say "let me check". Just call the tool.',
+				'4. Do NOT use describe_screen, scroll, or work while a recording is playing.',
+				'5. Do NOT guess or hallucinate about the video (duration, content, etc). You cannot see or hear it.',
 				'You can make concurrent calls — stay on the line while calling someone else.',
 				'',
 				'',
@@ -597,7 +607,25 @@ async function createCallSession(params: {
 		speechConfig: { voiceName: 'Aoede' },
 		hooks: {
 			onToolCall: (e) => console.log(`${ts()} [Tool] ${e.toolName} (${e.execution})`),
-			onToolResult: (e) => console.log(`${ts()} [Tool] result: ${e.toolCallId} (${e.status}, ${e.durationMs}ms)`),
+			onToolResult: (e) => {
+				console.log(`${ts()} [Tool] result: ${e.toolCallId} (${e.status}, ${e.durationMs}ms)`);
+				// After play_recording pause/play, inject context reminder
+				if (e.toolName === 'play_recording') {
+					setTimeout(() => {
+						try {
+							if (existsSync('/tmp/sutando-playback-pause')) {
+								(session as any).transport.sendContent([
+									{ role: 'user', text: '[System: Video PAUSED. When user says play/continue/resume, call play_recording({action:"play"}) immediately. Do NOT use work or describe_screen.]' },
+								], true);
+							} else {
+								(session as any).transport.sendContent([
+									{ role: 'user', text: '[System: Video PLAYING. Be silent. When user says pause/stop, call play_recording({action:"pause"}).]' },
+								], true);
+							}
+						} catch {}
+					}, 300);
+				}
+			},
 			onError: (e) => console.error(`${ts()} [Error] ${e.component}: ${e.error.message} (${e.severity})`),
 		},
 	});
@@ -615,11 +643,54 @@ async function createCallSession(params: {
 	let turnCountBeforeDisconnect = 0; // track turns to know when replay is done
 	let _isRecordingMuted: (() => boolean) | null = null;
 	import('../../../src/browser-tools.js').then(bt => { _isRecordingMuted = bt.isRecordingMuted; }).catch(() => {});
+
+	// [Narration audio tee] Write Gemini's PCM output to a file during screen recordings
+	// so the recording can be muxed with narration audio afterward.
+	let narrationStream: WriteStream | null = null;
+	let narrationPath: string | null = null;
+	let narrationVideoPath: string | null = null;
+	const SCREEN_REC_PID = '/tmp/sutando-screen-record.pid';
+
 	sessionAny.handleAudioOutput = (data: string) => {
 		sessionAny.notificationQueue?.markAudioReceived?.();
 		if (isReplaying || _isRecordingMuted?.()) return;
+
+		const pcmBuf = Buffer.from(data, 'base64');
+
+		// Tee narration audio: start/stop based on screen recording PID file
+		const recordingActive = existsSync(SCREEN_REC_PID);
+		if (recordingActive && !narrationStream) {
+			// Capture video path now (PID file will be gone when recording stops)
+			try {
+				const pidInfo = JSON.parse(readFileSync(SCREEN_REC_PID, 'utf8'));
+				narrationVideoPath = pidInfo.path || null;
+			} catch { narrationVideoPath = null; }
+			narrationPath = `/tmp/sutando-narration-${Date.now()}.raw`;
+			narrationStream = createWriteStream(narrationPath);
+			console.log(`${ts()} [NarrationTee] started → ${narrationPath} (video: ${narrationVideoPath})`);
+		} else if (!recordingActive && narrationStream) {
+			const audioFile = narrationPath!;
+			const videoFile = narrationVideoPath;
+			narrationStream.end(() => {
+				// Mux narration + video after stream flushes
+				if (videoFile && existsSync(videoFile)) {
+					const outPath = videoFile.replace('.mov', '-narrated.mov');
+					try {
+						execSync(`ffmpeg -y -f s16le -ar 24000 -ac 1 -i "${audioFile}" -i "${videoFile}" -c:v copy -c:a aac -shortest "${outPath}"`, { timeout: 60_000 });
+						console.log(`${ts()} [NarrationTee] muxed → ${outPath}`);
+					} catch (e) {
+						console.log(`${ts()} [NarrationTee] mux failed: ${e instanceof Error ? e.message : e}`);
+					}
+				}
+			});
+			console.log(`${ts()} [NarrationTee] stopped → ${audioFile}`);
+			narrationStream = null;
+			narrationPath = null;
+			narrationVideoPath = null;
+		}
+		if (narrationStream) narrationStream.write(pcmBuf);
+
 		if (params.twilioWs.readyState === WebSocket.OPEN) {
-			const pcmBuf = Buffer.from(data, 'base64');
 			const mulawBuf = pcm24kToMulaw8k(pcmBuf);
 			const CHUNK = 160;
 			for (let offset = 0; offset < mulawBuf.length; offset += CHUNK) {
@@ -727,6 +798,28 @@ async function createCallSession(params: {
 		}
 	};
 
+	// Expose narration cleanup so cleanupCall can flush + mux on hang-up
+	callSession.cleanupNarration = () => {
+		if (narrationStream) {
+			const audioFile = narrationPath!;
+			const videoFile = narrationVideoPath;
+			narrationStream.end(() => {
+				if (videoFile && existsSync(videoFile)) {
+					const outPath = videoFile.replace('.mov', '-narrated.mov');
+					try {
+						execSync(`ffmpeg -y -f s16le -ar 24000 -ac 1 -i "${audioFile}" -i "${videoFile}" -c:v copy -c:a aac -shortest "${outPath}"`, { timeout: 60_000 });
+						console.log(`${ts()} [NarrationTee] muxed on cleanup → ${outPath}`);
+					} catch (e) {
+						console.log(`${ts()} [NarrationTee] mux on cleanup failed: ${e instanceof Error ? e.message : e}`);
+					}
+				}
+			});
+			narrationStream = null;
+			narrationPath = null;
+			narrationVideoPath = null;
+		}
+	};
+
 	return callSession;
 }
 
@@ -741,6 +834,7 @@ function cleanupCall(callSid: string): void {
 	if (session.meetingId) pendingMeetingJoins.delete(session.meetingId);
 
 	import('../../../src/browser-tools.js').then(bt => bt.onCallEnd()).catch(() => {});
+	session.cleanupNarration?.();
 
 	// Close VoiceSession
 	session.voiceSession.close('call_ended').catch(e =>
@@ -1049,6 +1143,60 @@ const server = createServer(async (req, res) => {
 			await twilioHangup(body.callSid);
 			json(res, 200, { callSid: body.callSid, status: 'hanging_up' });
 
+		} else if (path === '/play-audio' && req.method === 'POST') {
+			// Stream an audio/video file's audio track through Twilio to the caller's phone
+			const body = JSON.parse(await readBody(req)) as { path: string; callSid?: string; seekSec?: number };
+			if (!body.path) { json(res, 400, { error: 'path required' }); return; }
+			if (!existsSync(body.path)) { json(res, 404, { error: 'file not found' }); return; }
+			let session: CallSession | undefined;
+			if (body.callSid) {
+				session = activeCalls.get(body.callSid);
+			} else {
+				for (const [, s] of activeCalls) { if (s.isOwner) { session = s; break; } }
+			}
+			if (!session) { json(res, 404, { error: 'no active call' }); return; }
+			// Kill any existing playback ffmpeg before starting a new one
+			if (activePlaybackProc) { activePlaybackProc.kill('SIGTERM'); activePlaybackProc = null; }
+			// Seek to position for synced resume after pause
+			const seekArgs = body.seekSec ? ['-ss', String(body.seekSec)] : [];
+			const ffmpegProc = spawn('ffmpeg', [...seekArgs, '-re', '-i', body.path, '-f', 's16le', '-ar', '24000', '-ac', '1', '-v', 'quiet', 'pipe:1']);
+			activePlaybackProc = ffmpegProc;
+			const ws = session.twilioWs;
+			const sid = session.streamSid;
+			let bytesSent = 0;
+			ffmpegProc.stdout.on('data', (pcmBuf: Buffer) => {
+				if (ws.readyState !== WebSocket.OPEN) return;
+				// Check pause flag — stop streaming if pause requested
+				if (existsSync('/tmp/sutando-playback-pause')) {
+					ffmpegProc.kill('SIGTERM');
+					activePlaybackProc = null;
+					console.log(`${ts()} [PlayAudio] paused via flag`);
+					return;
+				}
+				const mulawBuf = pcm24kToMulaw8k(pcmBuf);
+				const CHUNK = 160;
+				for (let offset = 0; offset < mulawBuf.length; offset += CHUNK) {
+					const chunk = mulawBuf.subarray(offset, Math.min(offset + CHUNK, mulawBuf.length));
+					ws.send(JSON.stringify({ event: 'media', streamSid: sid, media: { payload: chunk.toString('base64') } }));
+				}
+				bytesSent += pcmBuf.length;
+			});
+			ffmpegProc.on('close', () => { activePlaybackProc = null; console.log(`${ts()} [PlayAudio] done — ${(bytesSent / 1024).toFixed(0)}KB sent`); });
+			console.log(`${ts()} [PlayAudio] streaming ${body.path} to ${session.callSid}`);
+
+		} else if (path === '/stop-audio' && req.method === 'POST') {
+			// Stop the active audio playback stream
+			if (activePlaybackProc) {
+				activePlaybackProc.kill('SIGTERM');
+				activePlaybackProc = null;
+				console.log(`${ts()} [PlayAudio] stopped by /stop-audio`);
+				json(res, 200, { status: 'stopped' });
+			} else {
+				json(res, 200, { status: 'not_playing' });
+			}
+			return;
+			json(res, 200, { status: 'streaming', path: body.path, callSid: session.callSid });
+
 		} else if (path === '/meeting' && req.method === 'POST') {
 			await waitForWebhook();
 			const body = JSON.parse(await readBody(req)) as { meetingId: string; dialIn?: string; passcode?: string; platform?: string };
@@ -1167,7 +1315,7 @@ const server = createServer(async (req, res) => {
 			twimlResponse(res, `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="wss://${new URL(WEBHOOK_BASE_URL).host}/media-stream">
+    <Stream url="wss://${new URL(WEBHOOK_BASE_URL).host}/media-stream" dtmfDetection="inband">
       ${params.join('\n      ')}
     </Stream>
   </Connect>
@@ -1299,11 +1447,59 @@ wss.on('connection', (ws: WebSocket) => {
 					// mu-law 8kHz → PCM 16kHz → feed directly to VoiceSession (bypass internal WebSocket)
 					const audioData = Buffer.from(msg.media.payload, 'base64');
 					const pcm16k = mulawTopcm16k(audioData);
+
+
 					try {
 						(callSession.voiceSession as any).handleAudioFromClient(pcm16k);
 					} catch (e) {
 						if (mediaEventCount % 100 === 0) {
 							console.error(`${ts()} [WS] handleAudioFromClient error:`, e);
+						}
+					}
+					break;
+				}
+
+				case 'dtmf': {
+					const digit = msg.dtmf?.digit || msg.digit;
+					console.log(`${ts()} [DTMF] received: ${digit}`);
+					if (digit === '#' && callSession) {
+						// Toggle playback pause/resume
+						if (activePlaybackProc) {
+							// Currently playing → pause
+							writeFileSync('/tmp/sutando-playback-pause', '1');
+							try { execSync(`osascript -e 'tell application "QuickTime Player"' -e 'if (count of documents) > 0 then' -e 'pause document 1' -e 'end if' -e 'end tell'`, { timeout: 5_000 }); } catch {}
+							console.log(`${ts()} [DTMF] # → paused playback`);
+						} else if (existsSync('/tmp/sutando-playback-pause')) {
+							// Currently paused → resume
+							unlinkSync('/tmp/sutando-playback-pause');
+							// Re-stream audio from current QuickTime position
+							const recPath = (() => { try { const files = execSync('ls -t /tmp/sutando-recording-*.mov 2>/dev/null | grep -v narrated | head -1', { timeout: 3_000 }).toString().trim(); if (files) { const n = files.replace('.mov', '-narrated.mov'); return existsSync(n) ? n : files; } } catch {} return null; })();
+							if (recPath) {
+								// Get QuickTime current position for sync
+								let seekSec = 0;
+								try {
+									const pos = execSync(`osascript -e 'tell application "QuickTime Player"' -e 'if (count of documents) > 0 then' -e 'return current time of document 1' -e 'end if' -e 'end tell'`, { timeout: 3_000 }).toString().trim();
+									seekSec = parseFloat(pos) || 0;
+								} catch {}
+								// Start ffmpeg from that position
+								if (activePlaybackProc) activePlaybackProc.kill('SIGTERM');
+								const ffmpegProc = spawn('ffmpeg', ['-re', '-ss', String(seekSec), '-i', recPath, '-f', 's16le', '-ar', '24000', '-ac', '1', '-v', 'quiet', 'pipe:1']);
+								activePlaybackProc = ffmpegProc;
+								const ws2 = callSession.twilioWs;
+								const sid2 = callSession.streamSid;
+								ffmpegProc.stdout.on('data', (pcmBuf: Buffer) => {
+									if (ws2.readyState !== WebSocket.OPEN || existsSync('/tmp/sutando-playback-pause')) { ffmpegProc.kill('SIGTERM'); activePlaybackProc = null; return; }
+									const mulawBuf = pcm24kToMulaw8k(pcmBuf);
+									const CHUNK = 160;
+									for (let off = 0; off < mulawBuf.length; off += CHUNK) {
+										ws2.send(JSON.stringify({ event: 'media', streamSid: sid2, media: { payload: mulawBuf.subarray(off, Math.min(off + CHUNK, mulawBuf.length)).toString('base64') } }));
+									}
+								});
+								ffmpegProc.on('close', () => { activePlaybackProc = null; });
+								// Resume QuickTime video
+								try { execSync(`osascript -e 'tell application "QuickTime Player" to play document 1'`, { timeout: 3_000 }); } catch {}
+								console.log(`${ts()} [DTMF] # → resumed from ${seekSec}s`);
+							}
 						}
 					}
 					break;
