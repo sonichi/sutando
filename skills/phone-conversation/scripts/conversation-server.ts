@@ -781,6 +781,8 @@ function cleanupCall(callSid: string): void {
 
 	import('../../../src/browser-tools.js').then(bt => bt.onCallEnd()).catch(() => {});
 	session.cleanupNarration?.();
+	try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
+	try { unlinkSync('/tmp/sutando-playback-path'); } catch {}
 
 	// Close VoiceSession
 	session.voiceSession.close('call_ended').catch(e =>
