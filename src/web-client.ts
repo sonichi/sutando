@@ -75,7 +75,7 @@ const HTML = /* html */ `<!DOCTYPE html>
   .btn-subtle:hover { color: #888; }
 
   /* Main content */
-  .main { width: 100%; max-width: 960px; flex: 1; display: flex; flex-direction: column; padding: 12px 24px; margin: 0 auto; }
+  .main { width: 100%; max-width: 960px; flex: 1; display: flex; flex-direction: column; padding: 12px 24px 80px; margin: 0 auto; }
 
   /* Conversation */
   #transcript {
@@ -138,7 +138,7 @@ const HTML = /* html */ `<!DOCTYPE html>
   /* Dynamic region */
   #dynamic-region { padding: 0 16px 8px; width: 100%; box-sizing: border-box; }
   #dynamic-region:empty { display: none; }
-  #core-status-bar { text-align: center; font-size: 11px; color: #555; padding: 2px 16px; }
+  #core-status-bar { font-size: 11px; color: #555; }
   #core-status-bar:empty { display: none; }
   #core-status-bar .core-running { color: #4ecca3; }
   #core-status-bar .core-idle { color: #444; }
@@ -193,10 +193,21 @@ const HTML = /* html */ `<!DOCTYPE html>
   /* Debug */
   #debug {
     background: #08080f; border-radius: 10px; padding: 10px 12px;
-    max-height: 20vh; overflow-y: auto; font-size: 10px; line-height: 1.5;
+    max-height: 30vh; overflow-y: auto; font-size: 10px; line-height: 1.6;
     font-family: 'SF Mono', 'Fira Code', monospace;
+    margin-bottom: 10px;
   }
-  .d-entry { color: #444; }
+  #debug-header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 6px;
+  }
+  #debug-header .debug-actions { display: flex; gap: 8px; }
+  #debug-header .debug-actions button {
+    background: none; border: 1px solid #222; color: #555; font-size: 10px;
+    padding: 2px 8px; border-radius: 4px; cursor: pointer;
+  }
+  #debug-header .debug-actions button:hover { color: #aaa; border-color: #444; }
+  .d-entry { color: #555; padding: 1px 0; }
   .d-entry.warn { color: #f0ad4e; }
   .d-entry.err { color: #ef5350; }
   .d-entry.event { color: #9575cd; }
@@ -262,7 +273,6 @@ const HTML = /* html */ `<!DOCTYPE html>
   <div class="controls">
     <button id="btn" class="btn-voice" onclick="toggle()" style="display:none">End Voice</button>
     <button id="btn-mute" class="btn-mute" onclick="toggleMute()" style="display:none">Mute</button>
-    <button class="btn-subtle" onclick="saveDebug()">Debug</button>
   </div>
 </div>
 <input type="text" id="wsUrl" value="${DEFAULT_WS_URL}" />
@@ -299,17 +309,19 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
   <h2 id="hero-name">Sutando</h2>
   <p class="tagline">Summon your AI superpower</p>
   <button class="btn-hero" onclick="toggle()">Start Voice</button>
-  <div style="margin-top:16px;font-size:11px;color:#556;letter-spacing:0.5px">
-    <kbd style="background:#1a1a2e;padding:2px 6px;border-radius:3px;border:1px solid #333;font-family:monospace;color:#8af">⌃C</kbd> drop context
-    <span style="margin:0 6px;color:#333">|</span>
-    <kbd style="background:#1a1a2e;padding:2px 6px;border-radius:3px;border:1px solid #333;font-family:monospace;color:#8af">⌃V</kbd> voice
-    <span style="margin:0 6px;color:#333">|</span>
-    <kbd style="background:#1a1a2e;padding:2px 6px;border-radius:3px;border:1px solid #333;font-family:monospace;color:#8af">⌃M</kbd> mute
-  </div>
+</div>
+
+<div id="status-bar" style="text-align:center;font-size:11px;color:#556;letter-spacing:0.5px;padding:12px 16px">
+  <kbd style="background:#1a1a2e;padding:2px 6px;border-radius:3px;border:1px solid #333;font-family:monospace;color:#8af">⌃C</kbd> drop context
+  <span style="margin:0 6px;color:#333">|</span>
+  <kbd style="background:#1a1a2e;padding:2px 6px;border-radius:3px;border:1px solid #333;font-family:monospace;color:#8af">⌃V</kbd> voice
+  <span style="margin:0 6px;color:#333">|</span>
+  <kbd style="background:#1a1a2e;padding:2px 6px;border-radius:3px;border:1px solid #333;font-family:monospace;color:#8af">⌃M</kbd> mute
+  <span style="margin:0 6px;color:#333">|</span>
+  <span id="core-status-bar" style="display:inline"></span>
 </div>
 
 <div id="dynamic-region"></div>
-<div id="core-status-bar"></div>
 
 <div class="main" id="main-area">
 
@@ -328,8 +340,17 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
 <div id="tasks" style="display:none"></div>
 
 <div class="section-label" style="cursor:pointer" onclick="$('debug').style.display=$('debug').style.display==='none'?'':'none'">Debug</div>
-<div id="debug" style="display:none"></div>
+<div id="debug" style="display:none">
+  <div id="debug-header">
+    <span style="color:#666;font-size:10px">Voice session log</span>
+    <div class="debug-actions">
+      <button onclick="$('debug').querySelectorAll('.d-entry').forEach(function(e){e.remove()});debugLog.length=0">Clear</button>
+      <button onclick="saveDebug()">Export</button>
+    </div>
+  </div>
+</div>
 
+<div style="height:80px"></div>
 </div>
 
 <script>
@@ -1221,20 +1242,30 @@ window._drQuestions = [];
 window._drProactive = null;
 window._drContent = null;
 const API_BASE = 'http://' + window.location.hostname + ':7843';
-const SUGGESTION_CHIPS = [
-  {label: 'Summon', desc: 'share screen on Zoom'},
-  {label: 'Join my next meeting'},
-  {label: 'What is on my screen?'},
-  {label: 'What is on my calendar today?'},
-  {label: 'Morning briefing'},
-  {label: 'Check my email'},
-  {label: 'Take a note'},
-  {label: 'Read my reminders'},
-  {label: 'Show tasks'},
-  {label: 'Show notes'},
-  {label: 'Tutorial'},
-  {label: 'Bye', desc: 'disconnect voice'},
-];
+function getSuggestionChips() {
+  var h = new Date().getHours();
+  var chips = [];
+  // Time-based
+  if (h < 12) chips.push({label: 'Morning briefing'});
+  else chips.push({label: 'What is on my calendar today?'});
+  // Always useful
+  chips.push({label: 'Check my email'});
+  chips.push({label: 'What is on my screen?'});
+  // Actions (work via text or voice)
+  chips.push({label: 'Summon', desc: 'share screen on Zoom'});
+  chips.push({label: 'Join my next meeting'});
+  // Productivity
+  chips.push({label: 'Take a note'});
+  chips.push({label: 'Read my reminders'});
+  chips.push({label: 'Show tasks'});
+  chips.push({label: 'Show notes'});
+  // Evening wind-down
+  if (h >= 17) chips.push({label: 'What did I accomplish today?'});
+  // Voice disconnect
+  if (connected) chips.push({label: 'Bye', desc: 'disconnect voice'});
+  else chips.push({label: 'Tutorial'});
+  return chips;
+}
 
 function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
@@ -1332,7 +1363,7 @@ function renderTabContent() {
   if (tab === 'starter') {
     container.innerHTML = '<div class="dr-chips">' +
       '<div class="suggestions-label" style="font-size:11px;color:#666;margin-bottom:4px">Try saying or typing</div>' +
-      SUGGESTION_CHIPS.map(function(c) {
+      getSuggestionChips().map(function(c) {
         return '<span class="suggestion" onclick="trySuggestion(this)">' +
           c.label + (c.desc ? ' — ' + c.desc : '') + '</span>';
       }).join('') + '</div>';

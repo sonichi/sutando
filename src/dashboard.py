@@ -297,6 +297,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         super().end_headers()
 
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Methods", "GET, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
     def do_GET(self):
         if urlparse(self.path).path == "/":
             html = render_dashboard()
@@ -416,6 +422,31 @@ load()
                 self.send_header("Content-Type", "text/markdown; charset=utf-8")
                 self.end_headers()
                 self.wfile.write(note_file.read_text().encode())
+            else:
+                self.send_response(404)
+                self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+
+    def do_DELETE(self):
+        """Handle DELETE requests."""
+        path = urlparse(self.path).path
+        if path.startswith("/notes/"):
+            slug = path.split("/notes/", 1)[1]
+            import re
+            if not re.match(r'^[\w-]+$', slug):
+                self.send_response(400)
+                self.end_headers()
+                return
+            note_file = REPO_DIR / "notes" / f"{slug}.md"
+            if note_file.exists():
+                note_file.unlink()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"deleted": slug}).encode())
             else:
                 self.send_response(404)
                 self.end_headers()
