@@ -95,7 +95,9 @@ const HTML = /* html */ `<!DOCTYPE html>
 
   /* Input bar */
   .input-bar {
-    display: flex; gap: 8px; margin-bottom: 12px;
+    display: flex; gap: 8px; padding: 8px 16px 12px;
+    position: sticky; bottom: 0; background: #12121e; z-index: 10;
+    border-top: 1px solid #1e1e30;
   }
   .input-bar input {
     flex: 1; padding: 10px 14px; border-radius: 10px;

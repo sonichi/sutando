@@ -195,7 +195,12 @@ async function describeScreenshot(imagePath: string): Promise<string> {
 			},
 		);
 		const data = await res.json() as any;
-		return data?.candidates?.[0]?.content?.parts?.[0]?.text ?? 'Could not describe the screen.';
+		if (!data?.candidates?.[0]) {
+			const reason = data?.promptFeedback?.blockReason || data?.error?.message || JSON.stringify(data).slice(0, 200);
+			console.log(`${new Date().toLocaleTimeString()} [DescribeScreen] API response: ${reason}`);
+			return `Could not describe the screen. (${reason})`;
+		}
+		return data.candidates[0].content?.parts?.[0]?.text ?? 'Could not describe the screen.';
 	} catch (err) {
 		return `Vision error: ${err instanceof Error ? err.message : err}`;
 	}
