@@ -27,7 +27,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let resultsPath = workspace + "/results"
         let fd = open(resultsPath, O_EVTONLY)
         guard fd >= 0 else { return }
-        let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: .write, queue: .main)
+        let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: .write, queue: DispatchQueue.global(qos: .utility))
         source.setEventHandler { [weak self] in self?.checkNewResults() }
         source.setCancelHandler { close(fd) }
         source.resume()
@@ -54,7 +54,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                let latest = files.first,
                let content = try? String(contentsOfFile: resultsPath + "/" + latest, encoding: .utf8) {
                 let preview = String(content.prefix(120)).replacingOccurrences(of: "\n", with: " ")
-                notify("Sutando", preview)
+                DispatchQueue.main.async { [weak self] in self?.notify("Sutando", preview) }
             }
         }
     }
