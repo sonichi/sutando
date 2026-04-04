@@ -1277,11 +1277,15 @@ function getSuggestionChips() {
   // Contextual: pending questions badge
   var qCount = (window._drQuestions || []).length;
   if (qCount > 0) chips.unshift({label: 'Show questions', desc: qCount + ' pending'});
-  // Sort by usage frequency (most-used first), preserve time-based chip at top
-  var first = chips[0];
-  var rest = chips.slice(1);
+  // Contextual chips from core agent (written each loop pass)
+  var ctxChips = (window._contextualChips || []).slice().reverse();
+  ctxChips.forEach(function(c) { chips.unshift(c); });
+  // Sort static chips by usage frequency, keep contextual + time-based at top
+  var contextCount = ctxChips.length + 1; // +1 for time-based chip
+  var pinned = chips.slice(0, contextCount);
+  var rest = chips.slice(contextCount);
   rest.sort(function(a, b) { return (usage[b.label] || 0) - (usage[a.label] || 0); });
-  return [first].concat(rest);
+  return pinned.concat(rest);
 }
 
 function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
@@ -1559,8 +1563,10 @@ document.addEventListener('keydown', function(e) {
     Promise.all([
       fetch(API_BASE + '/dynamic-content').then(r => r.json()).catch(() => ({})),
       fetch(API_BASE + '/core-status').then(r => r.json()).catch(() => ({status:'idle'})),
-      fetch('http://' + window.location.hostname + ':7844/notes').then(r => r.json()).catch(() => [])
-    ]).then(([dc, loopData, notes]) => {
+      fetch('http://' + window.location.hostname + ':7844/notes').then(r => r.json()).catch(() => []),
+      fetch(API_BASE + '/contextual-chips').then(r => r.json()).catch(() => ({chips:[]}))
+    ]).then(([dc, loopData, notes, ctx]) => {
+      window._contextualChips = (ctx && ctx.chips) || [];
       window._drNoteCount = Array.isArray(notes) ? notes.length : 0;
       // Only overwrite content if API has real content; preserve local content (e.g. notes browser)
       if (dc && dc.type) {

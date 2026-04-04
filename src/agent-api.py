@@ -276,6 +276,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 pass
             self.send_json(200, {"activity": activity})
+        elif path == "/contextual-chips":
+            chips_file = REPO_DIR / "contextual-chips.json"
+            if chips_file.exists():
+                try:
+                    data = json.loads(chips_file.read_text())
+                    self.send_json(200, data)
+                except Exception:
+                    self.send_json(200, {"chips": []})
+            else:
+                self.send_json(200, {"chips": []})
         elif path == "/dynamic-content":
             dc_file = REPO_DIR / "dynamic-content.json"
             if dc_file.exists():
