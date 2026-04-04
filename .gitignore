@@ -48,3 +48,6 @@ session-state.md
 src/web-client.js
 context-drop-image.png
 contextual-chips.json
+*.heartbeat
+.agent/
+.massgen/
