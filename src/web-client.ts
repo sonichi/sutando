@@ -1155,22 +1155,31 @@ function answerQuestion(qid, answer) {
   }).catch(() => { alert('Could not reach agent API'); });
 }
 
+function trackChipUsage(label) {
+  try {
+    var usage = JSON.parse(localStorage.getItem('sutando_chip_usage') || '{}');
+    usage[label] = (usage[label] || 0) + 1;
+    localStorage.setItem('sutando_chip_usage', JSON.stringify(usage));
+  } catch(e) {}
+}
+
+function getChipUsage() {
+  try { return JSON.parse(localStorage.getItem('sutando_chip_usage') || '{}'); } catch(e) { return {}; }
+}
+
 function trySuggestion(el) {
   // Extract only the quoted command (e.g. "summon" from '"summon" — description')
   const raw = el.textContent;
   const dashIdx = raw.indexOf(' — ');
   const cmd = dashIdx > 0 ? raw.slice(0, dashIdx) : raw;
   const text = cmd.replace(/[\u201C\u201D"]/g, '').trim();
+  // Track usage
+  trackChipUsage(text);
   // Handle special actions
+  if (text === 'Show questions') { switchDRTab('questions'); return; }
   if (text === 'Notes') { showNotesInDR(); return; }
   $('textInput').value = text;
-  // If voice is connected, start voice first then it'll go through voice
-  if (!connected) {
-    // Send as text task
-    sendText();
-  } else {
-    sendText();
-  }
+  sendText();
 }
 
 function showNotesInDR() { switchDRTab('notes'); }
@@ -1244,6 +1253,7 @@ window._drContent = null;
 const API_BASE = 'http://' + window.location.hostname + ':7843';
 function getSuggestionChips() {
   var h = new Date().getHours();
+  var usage = getChipUsage();
   var chips = [];
   // Time-based
   if (h < 12) chips.push({label: 'Morning briefing'});
@@ -1264,7 +1274,14 @@ function getSuggestionChips() {
   // Voice disconnect
   if (connected) chips.push({label: 'Bye', desc: 'disconnect voice'});
   else chips.push({label: 'Tutorial'});
-  return chips;
+  // Contextual: pending questions badge
+  var qCount = (window._drQuestions || []).length;
+  if (qCount > 0) chips.unshift({label: 'Show questions', desc: qCount + ' pending'});
+  // Sort by usage frequency (most-used first), preserve time-based chip at top
+  var first = chips[0];
+  var rest = chips.slice(1);
+  rest.sort(function(a, b) { return (usage[b.label] || 0) - (usage[a.label] || 0); });
+  return [first].concat(rest);
 }
 
 function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
