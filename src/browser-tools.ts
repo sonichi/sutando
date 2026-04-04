@@ -221,7 +221,7 @@ export const describeScreenTool: ToolDefinition = {
 				return { error: `Could not capture screen: ${captureData.error || 'unknown'}` };
 			}
 			const description = await describeScreenshot(captureData.path);
-			if (demoState === 'done') return { status: 'done', description: 'Demo complete. Stop narrating.' };
+			if ((demoState as string) === 'done') return { status: 'done', description: 'Demo complete. Stop narrating.' };
 			console.log(`${ts()} [DescribeScreen] ${description.slice(0, 80)}...`);
 			return { status: 'ok', description, instruction: 'YOU MUST speak this description OUT LOUD to the caller NOW before calling any other tool.' };
 		} catch (err) {
