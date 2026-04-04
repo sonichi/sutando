@@ -51,14 +51,14 @@ export function buildVoiceAgentContext(): string {
 		} catch { /* best effort */ }
 	}
 
-	// Read recent activity
-	const activityFile = join(REPO_DIR, 'ACTIVITY.md');
-	if (existsSync(activityFile)) {
+	// Read recent build log activity (first date header + items)
+	if (existsSync(buildLog)) {
 		try {
-			const content = readFileSync(activityFile, 'utf-8');
-			const entries = content.match(/## \d{4}-\d{2}-\d{2} \d{2}:\d{2} — .+/g);
-			if (entries && entries.length > 0) {
-				lines.push('RECENT ACTIVITY:', ...entries.slice(0, 5).map(e => e.replace('## ', '  ')), '');
+			const content = readFileSync(buildLog, 'utf-8');
+			const dateMatch = content.match(/## \d{4}-\d{2}-\d{2} — .+/);
+			const items = content.match(/^- \*\*.+?\*\*.*/gm);
+			if (dateMatch && items) {
+				lines.push('RECENT ACTIVITY:', dateMatch[0].replace('## ', '  '), ...items.slice(0, 5).map(i => '  ' + i), '');
 			}
 		} catch { /* best effort */ }
 	}
