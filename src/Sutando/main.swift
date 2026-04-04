@@ -173,9 +173,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func dropContext() {
         let timestamp = ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withFullDate, .withTime, .withSpaceBetweenDateAndTime, .withColonSeparatorInTime])
         let dropFile = workspace + "/context-drop.txt"
-        let dropImage = workspace + "/context-drop-image.png"
         let logFile = workspace + "/src/context-drop.log"
         let tasksDir = workspace + "/tasks"
+        let epoch = Int(Date().timeIntervalSince1970 * 1000)
+        let dropImage = tasksDir + "/image-\(epoch).png"
 
         // 1. Check Finder selection (only if Finder is frontmost)
         if let frontApp = NSWorkspace.shared.frontmostApplication,

@@ -17,7 +17,7 @@
 
 WORKSPACE="$(cd "$(dirname "$0")/.." && pwd)"
 DROP_FILE="$WORKSPACE/context-drop.txt"
-DROP_IMAGE="$WORKSPACE/context-drop-image.png"
+DROP_IMAGE="$WORKSPACE/tasks/image-$(date +%s%3N).png"
 LOG_FILE="$WORKSPACE/src/context-drop.log"
 
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
