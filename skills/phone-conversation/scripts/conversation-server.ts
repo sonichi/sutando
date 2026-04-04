@@ -764,7 +764,6 @@ async function createCallSession(params: {
 	// Narration cleanup placeholder — delegates to skill module if loaded
 	callSession.cleanupNarration = () => {
 		import('../../../skills/screen-record/scripts/narration-tee.js').then(m => m.cleanup()).catch(() => {});
-		}
 	};
 
 	return callSession;
