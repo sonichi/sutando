@@ -658,6 +658,16 @@ else:
 							end tell
 						end try
 						delay 3
+						-- Enable "Share sound" checkbox so computer audio goes through Zoom
+						tell application "System Events"
+							tell process "zoom.us"
+								try
+									set soundCB to checkbox "Share sound" of window 1
+									if value of soundCB is 0 then click soundCB
+								end try
+							end tell
+						end tell
+						delay 0.5
 						-- If share dialog appeared, click Share button or press Enter
 						tell application "System Events"
 							tell process "zoom.us"
