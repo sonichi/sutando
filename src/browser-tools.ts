@@ -165,8 +165,6 @@ export const typeTextTool: ToolDefinition = {
 
 // --- Describe screen (vision) ---
 
-let lastScreenDescription = '';
-
 async function describeScreenshot(imagePath: string): Promise<string> {
 	const apiKey = process.env.GEMINI_API_KEY;
 	if (!apiKey) return 'Vision description unavailable (no GEMINI_API_KEY)';
@@ -188,9 +186,7 @@ async function describeScreenshot(imagePath: string): Promise<string> {
 				body: JSON.stringify({
 					contents: [{
 						parts: [
-							{ text: lastScreenDescription
-							? `Previous description: "${lastScreenDescription}". Now describe what is on screen in 1 sentence (max 20 words). Continue naturally — do NOT start with "The screen displays" or repeat the previous description. This will be spoken aloud.`
-							: 'Describe what is on screen in exactly 1 short sentence (max 20 words). Quote the main heading. This will be spoken aloud.' },
+							{ text: 'Describe what is on screen in exactly 1 short sentence (max 20 words). Quote the main heading. This will be spoken aloud.' },
 							{ inlineData: { mimeType, data: imageData } },
 						],
 					}],
@@ -204,9 +200,7 @@ async function describeScreenshot(imagePath: string): Promise<string> {
 			console.log(`${new Date().toLocaleTimeString()} [DescribeScreen] API response: ${reason}`);
 			return `Could not describe the screen. (${reason})`;
 		}
-		const description = data.candidates[0].content?.parts?.[0]?.text ?? 'Could not describe the screen.';
-		lastScreenDescription = description;
-		return description;
+		return data.candidates[0].content?.parts?.[0]?.text ?? 'Could not describe the screen.';
 	} catch (err) {
 		return `Vision error: ${err instanceof Error ? err.message : err}`;
 	}
