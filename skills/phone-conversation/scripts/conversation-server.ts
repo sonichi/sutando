@@ -44,7 +44,7 @@
 
 import 'dotenv/config';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { mkdirSync, writeFileSync, appendFileSync, unlinkSync, existsSync, readFileSync, readdirSync, createWriteStream, type WriteStream } from 'node:fs';
+import { mkdirSync, writeFileSync, appendFileSync, unlinkSync, existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execSync, spawn, type ChildProcess } from 'node:child_process';
@@ -644,52 +644,15 @@ async function createCallSession(params: {
 	let _isRecordingMuted: (() => boolean) | null = null;
 	import('../../../src/browser-tools.js').then(bt => { _isRecordingMuted = bt.isRecordingMuted; }).catch(() => {});
 
-	// [Narration audio tee] Write Gemini's PCM output to a file during screen recordings
-	// so the recording can be muxed with narration audio afterward.
-	let narrationStream: WriteStream | null = null;
-	let narrationPath: string | null = null;
-	let narrationVideoPath: string | null = null;
-	const SCREEN_REC_PID = '/tmp/sutando-screen-record.pid';
+	// Optional narration tee from screen-record skill
+	let _teeAudio: ((buf: Buffer) => void) | null = null;
+	import('../../../skills/screen-record/scripts/narration-tee.js').then(m => { _teeAudio = m.teeAudio; }).catch(() => {});
 
 	sessionAny.handleAudioOutput = (data: string) => {
 		sessionAny.notificationQueue?.markAudioReceived?.();
 		if (isReplaying || _isRecordingMuted?.()) return;
-
 		const pcmBuf = Buffer.from(data, 'base64');
-
-		// Tee narration audio: start/stop based on screen recording PID file
-		const recordingActive = existsSync(SCREEN_REC_PID);
-		if (recordingActive && !narrationStream) {
-			// Capture video path now (PID file will be gone when recording stops)
-			try {
-				const pidInfo = JSON.parse(readFileSync(SCREEN_REC_PID, 'utf8'));
-				narrationVideoPath = pidInfo.path || null;
-			} catch { narrationVideoPath = null; }
-			narrationPath = `/tmp/sutando-narration-${Date.now()}.raw`;
-			narrationStream = createWriteStream(narrationPath);
-			console.log(`${ts()} [NarrationTee] started → ${narrationPath} (video: ${narrationVideoPath})`);
-		} else if (!recordingActive && narrationStream) {
-			const audioFile = narrationPath!;
-			const videoFile = narrationVideoPath;
-			narrationStream.end(() => {
-				// Mux narration + video after stream flushes
-				if (videoFile && existsSync(videoFile)) {
-					const outPath = videoFile.replace('.mov', '-narrated.mov');
-					try {
-						execSync(`ffmpeg -y -f s16le -ar 24000 -ac 1 -i "${audioFile}" -i "${videoFile}" -c:v copy -c:a aac -shortest "${outPath}"`, { timeout: 60_000 });
-						console.log(`${ts()} [NarrationTee] muxed → ${outPath}`);
-					} catch (e) {
-						console.log(`${ts()} [NarrationTee] mux failed: ${e instanceof Error ? e.message : e}`);
-					}
-				}
-			});
-			console.log(`${ts()} [NarrationTee] stopped → ${audioFile}`);
-			narrationStream = null;
-			narrationPath = null;
-			narrationVideoPath = null;
-		}
-		if (narrationStream) narrationStream.write(pcmBuf);
-
+		_teeAudio?.(pcmBuf);
 		if (params.twilioWs.readyState === WebSocket.OPEN) {
 			const mulawBuf = pcm24kToMulaw8k(pcmBuf);
 			const CHUNK = 160;
@@ -798,25 +761,9 @@ async function createCallSession(params: {
 		}
 	};
 
-	// Expose narration cleanup so cleanupCall can flush + mux on hang-up
+	// Narration cleanup placeholder — delegates to skill module if loaded
 	callSession.cleanupNarration = () => {
-		if (narrationStream) {
-			const audioFile = narrationPath!;
-			const videoFile = narrationVideoPath;
-			narrationStream.end(() => {
-				if (videoFile && existsSync(videoFile)) {
-					const outPath = videoFile.replace('.mov', '-narrated.mov');
-					try {
-						execSync(`ffmpeg -y -f s16le -ar 24000 -ac 1 -i "${audioFile}" -i "${videoFile}" -c:v copy -c:a aac -shortest "${outPath}"`, { timeout: 60_000 });
-						console.log(`${ts()} [NarrationTee] muxed on cleanup → ${outPath}`);
-					} catch (e) {
-						console.log(`${ts()} [NarrationTee] mux on cleanup failed: ${e instanceof Error ? e.message : e}`);
-					}
-				}
-			});
-			narrationStream = null;
-			narrationPath = null;
-			narrationVideoPath = null;
+		import('../../../skills/screen-record/scripts/narration-tee.js').then(m => m.cleanup()).catch(() => {});
 		}
 	};
 
