@@ -95,7 +95,7 @@ const HTML = /* html */ `<!DOCTYPE html>
 
   /* Input bar */
   #bottom-panel {
-    position: fixed; bottom: 0; left: 0; right: 0; max-width: 480px; margin: 0 auto;
+    position: fixed; bottom: 0; left: 0; right: 0; max-width: 960px; margin: 0 auto;
     background: #12121e; z-index: 10;
     border-top: 1px solid #1e1e30;
     padding: 8px 16px 12px;
