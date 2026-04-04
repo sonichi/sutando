@@ -14,10 +14,10 @@ Be concise and direct. Prefer action over explanation. Default to the smallest a
 
 ## Architecture rules
 
-- **conversation-server.ts** is general-purpose. It handles Twilio audio, VoiceSession, and generic endpoints (e.g., `/stream-audio`). It must NOT contain feature-specific code (screen recording, narration, etc.).
-- **Skills** (`skills/`) contain feature-specific logic. Screen recording, narration tee, subtitles — all go in `skills/screen-record/`. The phone agent optionally imports skill modules; it works without them.
-- **Inline tools** (`src/browser-tools.ts`, `src/inline-tools.ts`) are for phone agent tools that need instant response from Gemini. Only add code here if the response time would be too slow through the task bridge. Prefer skill scripts called via `execSync` for complex logic.
-- When refactoring, move feature code to skills but do NOT change prompts or tool behavior. Prompts are tuned through testing and must be preserved exactly.
+- **Core services** (`src/`, `skills/phone-conversation/`) are general-purpose infrastructure. They provide generic capabilities (audio streaming, task bridge, tool execution) but must NOT contain feature-specific logic.
+- **Skills** (`skills/`) contain feature-specific logic. Each skill is self-contained and optional — core services work without any skill installed. When implementing new capabilities, start as a skill.
+- **Inline tools** are only for tools that need instant response from Gemini. Prefer skill scripts for complex logic. Only promote to inline if the user says the skill approach is too slow.
+- When refactoring, do NOT change prompts or tool behavior. Prompts are tuned through testing and must be preserved exactly.
 
 ## Repo rules
 
