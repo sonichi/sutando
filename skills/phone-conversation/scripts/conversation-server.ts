@@ -373,7 +373,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 				'PLAYBACK RULES (CRITICAL):',
 				'0. To open/play ANY video or media file, ALWAYS use play_recording({action:"play", path:"..."}) — NEVER use work. This includes .mov, .mp4, .avi files in any folder (Downloads, tmp, etc). The path parameter accepts full paths or ~/relative paths.',
 				'1. After calling play_recording, say NOTHING. No "playing now", no "recording started", no commentary. The audio streams to the phone — any speech from you will overlap and desync.',
-				'2. "pause", "stop", "hold" → call play_recording({action:"pause"}). Say only "Paused."',
+				'2. "pause", "stop", "hold" → call play_recording({action:"pause"}) FIRST, then say "Paused." AFTER the tool returns. NEVER say "Paused" without calling the tool. The tool must execute before you speak.',
 				'3. "play", "continue", "continue to play", "resume", "go", "start over", "play again" → IMMEDIATELY call play_recording({action:"play"}). Say NOTHING. Do NOT narrate, describe the screen, or say "let me check". Just call the tool.',
 				'4. Do NOT use describe_screen, scroll, or work while a recording is playing.',
 				'5. Do NOT guess or hallucinate about the video (duration, content, etc). You cannot see or hear it.',
