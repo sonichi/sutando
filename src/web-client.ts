@@ -526,8 +526,11 @@ function setStatus(text, state) {
 const taskMap = window.taskMap = {};
 function updateTask(taskId, status, text, result) {
   const existing = taskMap[taskId] || {};
+  const isNew = !existing.status;
   const wasDone = existing.status === 'done';
   taskMap[taskId] = { status, text: text || existing.text, time: new Date(), result: result || existing.result || '' };
+  // Auto-switch to tasks tab if new task arrives and user is on starter
+  if (isNew && window._drActiveTab === 'starter') { switchDRTab('tasks'); }
   // Auto-expand the latest completed task (collapse others if user had collapsed)
   if (status === 'done' && !wasDone && (result || existing.result)) {
     if (userCollapsed) expandedTasks.clear(); // keep old ones collapsed
@@ -1350,6 +1353,8 @@ function ensureTabStructure() {
   updateTabHighlights();
 }
 
+// Track last-seen counts per tab to detect new items
+window._lastSeenCounts = window._lastSeenCounts || {};
 function updateTabHighlights() {
   var tabsEl = document.getElementById('dr-tabs');
   if (!tabsEl) return;
@@ -1357,11 +1362,19 @@ function updateTabHighlights() {
   var questions = window._drQuestions || [];
   var taskCount = window._drTaskCount || 0;
   var noteCount = window._drNoteCount || 0;
+  var seen = window._lastSeenCounts;
+  // Mark current tab as seen
+  if (active === 'tasks') seen.tasks = taskCount;
+  if (active === 'questions') seen.questions = questions.length;
+  if (active === 'notes') seen.notes = noteCount;
+  var hasNewTasks = taskCount > (seen.tasks || 0);
+  var hasNewQuestions = questions.length > (seen.questions || 0);
+  var dot = '<span style="color:#4ecca3;font-size:8px;margin-left:2px">●</span>';
   var tabs = [
     {id:'starter', label:'Starter'},
-    {id:'tasks', label:'Tasks' + (taskCount > 0 ? ' (' + taskCount + ')' : '')},
+    {id:'tasks', label:'Tasks' + (taskCount > 0 ? ' (' + taskCount + ')' : '') + (hasNewTasks ? dot : '')},
     {id:'notes', label:'Notes' + (noteCount > 0 ? ' (' + noteCount + ')' : '')},
-    {id:'questions', label:'Questions' + (questions.length > 0 ? ' (' + questions.length + ')' : '')},
+    {id:'questions', label:'Questions' + (questions.length > 0 ? ' (' + questions.length + ')' : '') + (hasNewQuestions ? dot : '')},
     {id:'activity', label:'Activity'},
   ];
   tabsEl.style.display = 'flex';
@@ -1372,6 +1385,7 @@ function updateTabHighlights() {
     var fg = isActive ? '#ccc' : '#666';
     var border = isActive ? '#4a4a6e' : '#2a2a3e';
     if (t.id === 'questions' && questions.length > 0 && !isActive) fg = '#f0ad4e';
+    if (t.id === 'tasks' && hasNewTasks && !isActive) fg = '#4ecca3';
     return '<span onclick="switchDRTab(&quot;' + t.id + '&quot;)" style="cursor:pointer;padding:4px 0;border-radius:12px;font-size:11px;border:1px solid ' + border + ';background:' + bg + ';color:' + fg + ';flex:1;text-align:center">' + t.label + '</span>';
   }).join('');
 }
