@@ -451,38 +451,115 @@ export function startRecordingNarration(session: any): void {
 	}, durationMs + 1000); // +1s buffer for auto-stop to finish
 }
 
-// --- Play recording ---
+function findRecording(): string | null {
+	try {
+		const files = execSync('ls -t /tmp/sutando-recording-*.mov 2>/dev/null | grep -v narrated | head -1', { timeout: 3_000 }).toString().trim();
+		if (files && existsSync(files)) {
+			const narrated = files.replace('.mov', '-narrated.mov');
+			return existsSync(narrated) ? narrated : files;
+		}
+	} catch {}
+	return null;
+}
 
 export const playRecordingTool: ToolDefinition = {
 	name: 'play_recording',
 	description:
-		'Open and play the most recent screen recording in QuickTime Player.',
-	parameters: z.object({}),
+		'Control video playback. Use for ANY request about videos, recordings, or media files. ' +
+		'Actions: "open" (just open, no playback), "play" (play + stream audio), "pause", "stop", "status". ' +
+		'IMPORTANT: "open" and "play" are DIFFERENT. "open the video" → action:"open". "play the video" → action:"play". Default is open.',
+	parameters: z.object({
+		action: z.enum(['open', 'play', 'pause', 'stop', 'status']).default('open'),
+		path: z.string().optional().describe('File path. Omit for latest screen recording.'),
+	}),
 	execution: 'inline',
-	async execute() {
+	async execute(args) {
+		let { action, path: filePath } = args as { action: 'open' | 'play' | 'pause' | 'stop' | 'status'; path?: string };
+		if (action === 'stop') action = 'pause';
 		demoState = 'idle';
 		try {
-			const pidFile = '/tmp/sutando-screen-record.pid';
-			let recPath: string | null = null;
-
-			// Check if there's a known last recording path
-			if (existsSync(pidFile)) {
-				const info = JSON.parse(readFileSync(pidFile, 'utf8'));
-				if (info.path && existsSync(info.path)) recPath = info.path;
+			if (action === 'pause') {
+				try { writeFileSync('/tmp/sutando-playback-pause', '1'); } catch {}
+				try { execSync(`osascript -e 'tell application "QuickTime Player"' -e 'if (count of documents) > 0 then' -e 'pause document 1' -e 'end if' -e 'end tell'`, { timeout: 5_000 }); } catch {}
+				console.log(`${ts()} [PlayRecording] paused`);
+				return { status: 'paused', instruction: 'Video paused. When user says continue/play/resume, call play_recording({action:"play"}) to resume. Say only "Paused." now.' };
 			}
 
-			// Otherwise find the most recent .mov in /tmp
+			if (action === 'status') {
+				try {
+					const out = execSync(`osascript -e 'tell application "QuickTime Player"' -e 'if (count of documents) > 0 then' -e 'set d to document 1' -e 'set p to playing of d' -e 'set c to current time of d' -e 'set dur to duration of d' -e 'return (p as text) & "|" & (c as text) & "|" & (dur as text)' -e 'else' -e 'return "none"' -e 'end if' -e 'end tell'`, { timeout: 5_000 }).toString().trim();
+					if (out === 'none') return { status: 'no_video_open' };
+					const [playing, current, duration] = out.split('|');
+					return { status: playing === 'true' ? 'playing' : 'paused', current_seconds: +current, duration_seconds: +duration };
+				} catch { return { status: 'no_video_open' }; }
+			}
+
+			let recPath = filePath ? filePath.replace(/^~/, process.env.HOME || '') : null;
 			if (!recPath) {
-				const result = execSync('ls -t /tmp/sutando-recording-*.mov 2>/dev/null | head -1', { timeout: 3_000 }).toString().trim();
-				if (result && existsSync(result)) recPath = result;
+				try { recPath = readFileSync('/tmp/sutando-playback-path', 'utf8').trim() || null; } catch {}
+			}
+			if (!recPath) recPath = findRecording();
+			if (recPath && !existsSync(recPath)) recPath = null;
+			if (!recPath) return { error: filePath ? `File not found: ${filePath}` : 'No screen recording found' };
+
+			writeFileSync('/tmp/sutando-playback-path', recPath);
+
+			if (action === 'open') {
+				execSync(`open "${recPath}"`, { timeout: 5_000 });
+				const size = statSync(recPath).size;
+				console.log(`${ts()} [PlayRecording] opened ${recPath} (${(size / 1024 / 1024).toFixed(1)}MB)`);
+				return { status: 'opened', path: recPath, size_mb: +(size / 1024 / 1024).toFixed(1), instruction: 'File opened in QuickTime (not playing). When user says play/start, call play_recording({action:"play"}).' };
 			}
 
-			if (!recPath) return { error: 'No screen recording found' };
+			let seekSec = 0;
+			let alreadyOpen = false;
+			try {
+				const c = execSync(`osascript -e 'tell application "QuickTime Player" to count of documents'`, { timeout: 2_000 }).toString().trim();
+				if (parseInt(c) > 0) {
+					alreadyOpen = true;
+					const pos = execSync(`osascript -e 'tell application "QuickTime Player"' -e 'set d to document 1' -e 'return current time of d' -e 'end tell'`, { timeout: 3_000 }).toString().trim();
+					const dur = execSync(`osascript -e 'tell application "QuickTime Player"' -e 'set d to document 1' -e 'return duration of d' -e 'end tell'`, { timeout: 3_000 }).toString().trim();
+					const posNum = parseFloat(pos) || 0;
+					const durNum = parseFloat(dur) || 1;
+					seekSec = (posNum / durNum > 0.9 || posNum < 0.5) ? 0 : posNum;
+					if (seekSec === 0) {
+						try { execSync(`osascript -e 'tell application "QuickTime Player"' -e 'set d to document 1' -e 'set current time of d to 0' -e 'end tell'`, { timeout: 3_000 }); } catch {}
+					}
+				}
+			} catch {}
 
-			execSync(`open "${recPath}"`, { timeout: 5_000 });
+			if (!alreadyOpen) {
+				execSync(`open "${recPath}"`, { timeout: 5_000 });
+				for (let i = 0; i < 10; i++) {
+					try {
+						const c = execSync(`osascript -e 'tell application "QuickTime Player" to count of documents'`, { timeout: 2_000 }).toString().trim();
+						if (parseInt(c) > 0) break;
+					} catch {}
+					await new Promise(r => setTimeout(r, 300));
+				}
+			}
+
+			try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
+			fetch(`http://localhost:${process.env.PHONE_PORT || '3100'}/play-audio`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ path: recPath, seekSec }),
+			}).catch(() => {});
+			await new Promise(r => setTimeout(r, 300));
+			try {
+				execSync(`osascript -e '
+					tell application "QuickTime Player"
+						launch
+						play document 1
+					end tell
+					tell application "zoom.us" to activate
+				'`, { timeout: 5_000 });
+			} catch {}
+			console.log(`${ts()} [PlayRecording] play from ${seekSec}s`);
+
 			const size = statSync(recPath).size;
 			console.log(`${ts()} [PlayRecording] ${recPath} (${(size / 1024 / 1024).toFixed(1)}MB)`);
-			return { status: 'playing', path: recPath, size_mb: +(size / 1024 / 1024).toFixed(1) };
+			return { status: 'playing', path: recPath, size_mb: +(size / 1024 / 1024).toFixed(1), narrated: recPath.includes('-narrated'), instruction: 'Video is playing. Say NOTHING. When user says pause/stop, call play_recording({action:"pause"}). When user says continue/play, call play_recording({action:"play"}).' };
 		} catch (err) {
 			return { error: `play_recording failed: ${err instanceof Error ? err.message : err}` };
 		}
