@@ -12,6 +12,13 @@ For irreversible actions (sending email, deleting files, financial transactions)
 
 Be concise and direct. Prefer action over explanation. Default to the smallest action that produces the desired outcome. Always do less — make the minimal change needed.
 
+## Architecture rules
+
+- **conversation-server.ts** is general-purpose. It handles Twilio audio, VoiceSession, and generic endpoints (e.g., `/stream-audio`). It must NOT contain feature-specific code (screen recording, narration, etc.).
+- **Skills** (`skills/`) contain feature-specific logic. Screen recording, narration tee, subtitles — all go in `skills/screen-record/`. The phone agent optionally imports skill modules; it works without them.
+- **Inline tools** (`src/browser-tools.ts`, `src/inline-tools.ts`) are for phone agent tools that need instant response from Gemini. Only add code here if the response time would be too slow through the task bridge. Prefer skill scripts called via `execSync` for complex logic.
+- When refactoring, move feature code to skills but do NOT change prompts or tool behavior. Prompts are tuned through testing and must be preserved exactly.
+
 ## Repo rules
 
 Before creating a PR, check `gh pr list --state open` for an existing PR on the same topic. If one exists, push to its branch instead of creating a new PR.
