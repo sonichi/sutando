@@ -23,6 +23,7 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync, appendFileSync, writeFileSync } from 'node:fs';
 import { inlineTools } from './inline-tools.js';
+import { injectText } from './browser-tools.js';
 import { join } from 'node:path';
 import {
 	VoiceSession,
@@ -309,21 +310,6 @@ async function main() {
 
 	sessionRef = session;
 
-	/** Send text to Gemini via sendRealtimeInput (3.1+) or sendContent (2.5).
-	 *  See also: browser-tools.ts:injectText */
-	function injectText(text: string) {
-		try {
-			const transport = (session as any).transport;
-			if (VOICE_NATIVE_AUDIO_MODEL.includes('3.1')) {
-				transport.session.sendRealtimeInput({ text });
-			} else {
-				transport.sendContent([{ role: 'user', text }], true);
-			}
-		} catch (err) {
-			console.error(`${ts()} [InjectText] Error:`, err);
-		}
-	}
-
 	// Watch for results from the Claude Code session and deliver to user
 	// Only delivers when a client is connected — otherwise keeps files queued
 	// Watch for context drops (keyboard shortcut)
@@ -331,7 +317,7 @@ async function main() {
 	startContextDropWatcher((content) => {
 		if (session.sessionManager.isActive && session.clientConnected) {
 			console.log(`${ts()} [ContextDrop] Injecting into Gemini conversation`);
-			injectText(`[System: The user just dropped context via keyboard shortcut. Acknowledge briefly that you received it, then call work if it requires action.]\n\n${content}`);
+			injectText(session, `[System: The user just dropped context via keyboard shortcut. Acknowledge briefly that you received it, then call work if it requires action.]\n\n${content}`);
 		}
 	});
 
@@ -340,7 +326,7 @@ async function main() {
 		if (session.sessionManager.isActive && session.clientConnected) {
 			// Voice is live — let Gemini speak the result conversationally
 			setTimeout(() => {
-				injectText(`[System: Task completed. Briefly tell the user this result in one sentence:] ${result}`);
+				injectText(session, `[System: Task completed. Briefly tell the user this result in one sentence:] ${result}`);
 			}, 1500);
 		} else if (CARTESIA_API_KEY) {
 			// Voice not connected — generate Cartesia TTS for async playback
@@ -408,7 +394,7 @@ async function main() {
 			unlinkSync(callResultFile);
 			const transcript = data.transcript ?? 'No transcript available.';
 			console.log(`${ts()} [CallResult] Injecting call result into conversation`);
-			injectText(`[System: The phone call just completed. Tell the user this result naturally.]\n\nCall transcript:\n${transcript}`);
+			injectText(session, `[System: The phone call just completed. Tell the user this result naturally.]\n\nCall transcript:\n${transcript}`);
 		} catch (err) { console.error(`${ts()} [CallResult] Error:`, err); }
 	}, 2000);
 
