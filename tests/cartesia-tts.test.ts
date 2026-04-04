@@ -105,3 +105,40 @@ describe('createWavHeader', () => {
 		assert.equal(header.readUInt32LE(40), 0);  // data size = 0
 	});
 });
+
+describe('sentence splitting', () => {
+	function splitSentences(text: string): string[] {
+		const matched = text.match(/[^.!?]+[.!?]+/g) || [];
+		const matchedText = matched.join('');
+		const tail = text.slice(matchedText.length).trim();
+		return matched.length > 0
+			? (tail ? [...matched, tail] : matched)
+			: [text];
+	}
+
+	it('handles text with no terminal punctuation', () => {
+		assert.deepEqual(splitSentences('Hello world'), ['Hello world']);
+	});
+
+	it('captures trailing text without punctuation', () => {
+		const result = splitSentences('Hello world. Testing');
+		assert.equal(result.length, 2);
+		assert.ok(result[0].includes('Hello world.'));
+		assert.equal(result[1], 'Testing');
+	});
+
+	it('handles multiple sentences plus trailing text', () => {
+		const result = splitSentences('One. Two! Three');
+		assert.equal(result.length, 3);
+		assert.equal(result[2], 'Three');
+	});
+
+	it('handles empty string', () => {
+		assert.deepEqual(splitSentences(''), ['']);
+	});
+
+	it('handles text ending with punctuation (no tail)', () => {
+		const result = splitSentences('Hello world.');
+		assert.deepEqual(result, ['Hello world.']);
+	});
+});

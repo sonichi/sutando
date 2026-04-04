@@ -16,9 +16,9 @@ import Cartesia from '@cartesia/cartesia-js';
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
-const CARTESIA_API_KEY = process.env.CARTESIA_API_KEY || '';
-const CARTESIA_VOICE_ID = process.env.CARTESIA_VOICE_ID || 'f786b574-daa5-4673-aa0c-cbe3e8534c02';
-const WORKSPACE = process.env.WORKSPACE_DIR || process.cwd();
+const getCartesiaApiKey = () => process.env.CARTESIA_API_KEY || '';
+const getCartesiaVoiceId = () => process.env.CARTESIA_VOICE_ID || 'f786b574-daa5-4673-aa0c-cbe3e8534c02';
+const getWorkspace = () => process.env.WORKSPACE_DIR || process.cwd();
 
 const SAMPLE_RATE = 24000;
 const CHANNELS = 1;
@@ -35,22 +35,22 @@ export async function generateSpeech(
 	text: string,
 	options: { outputPath?: string; category?: string; label?: string } = {},
 ): Promise<string> {
-	if (!CARTESIA_API_KEY) throw new Error('CARTESIA_API_KEY not set');
+	if (!getCartesiaApiKey()) throw new Error('CARTESIA_API_KEY not set');
 	if (!text.trim()) throw new Error('Empty text');
 
 	// Organize: results/audio/{category}/{label}-{timestamp}.wav
 	const category = options.category || 'general';
 	const label = options.label || 'tts';
-	const outDir = join(WORKSPACE, 'results', 'audio', category);
+	const outDir = join(getWorkspace(), 'results', 'audio', category);
 	mkdirSync(outDir, { recursive: true });
 	const outPath = options.outputPath || join(outDir, `${label}-${Date.now()}.wav`);
 
-	const client = new Cartesia({ apiKey: CARTESIA_API_KEY });
+	const client = new Cartesia({ apiKey: getCartesiaApiKey() });
 	const ws = await client.tts.websocket();
 	try {
 		const ctx = ws.context({
 			model_id: 'sonic-3',
-			voice: { mode: 'id', id: CARTESIA_VOICE_ID },
+			voice: { mode: 'id', id: getCartesiaVoiceId() },
 			output_format: {
 				container: 'raw',
 				encoding: 'pcm_s16le',
@@ -59,7 +59,12 @@ export async function generateSpeech(
 		});
 
 		// Push text in sentence chunks for natural prosody
-		const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
+		const matched = text.match(/[^.!?]+[.!?]+/g) || [];
+		const matchedText = matched.join('');
+		const tail = text.slice(matchedText.length).trim();
+		const sentences = matched.length > 0
+			? (tail ? [...matched, tail] : matched)
+			: [text];
 		for (const s of sentences) {
 			await ctx.push({ transcript: s.trim() + ' ' });
 		}
