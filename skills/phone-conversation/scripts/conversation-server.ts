@@ -590,9 +590,9 @@ async function createCallSession(params: {
 	};
 
 	// Start live transcript file
-	const liveTranscriptPath = `/tmp/sutando-live-transcript-${callSid}.txt`;
+	const liveTranscriptPath = `/tmp/sutando-live-transcript-${params.callSid}.txt`;
 	try {
-		writeFileSync(liveTranscriptPath, `--- Live Transcript: ${new Date().toISOString()} ---\nCall: ${callSid}\n\n`);
+		writeFileSync(liveTranscriptPath, `--- Live Transcript: ${new Date().toISOString()} ---\nCall: ${params.callSid}\n\n`);
 		try { unlinkSync('/tmp/sutando-live-transcript.txt'); } catch {}
 		symlinkSync(liveTranscriptPath, '/tmp/sutando-live-transcript.txt');
 	} catch {}
@@ -696,10 +696,10 @@ async function createCallSession(params: {
 			if (item.content === lastTranscriptText) continue;
 			if (item.role === 'user') {
 				callSession.transcript.push({ role: 'caller', text: item.content });
-				try { appendFileSync(`/tmp/sutando-live-transcript-${callSid}.txt`, `[${new Date().toLocaleTimeString('en-US', {hour12:false})}] Caller: ${item.content}\n`); } catch {}
+				try { appendFileSync(`/tmp/sutando-live-transcript-${callSession.callSid}.txt`, `[${new Date().toLocaleTimeString('en-US', {hour12:false})}] Caller: ${item.content}\n`); } catch {}
 			} else if (item.role === 'assistant') {
 				callSession.transcript.push({ role: 'sutando', text: item.content });
-				try { appendFileSync(`/tmp/sutando-live-transcript-${callSid}.txt`, `[${new Date().toLocaleTimeString('en-US', {hour12:false})}] Sutando: ${item.content}\n`); } catch {}
+				try { appendFileSync(`/tmp/sutando-live-transcript-${callSession.callSid}.txt`, `[${new Date().toLocaleTimeString('en-US', {hour12:false})}] Sutando: ${item.content}\n`); } catch {}
 			}
 		}
 		lastProcessedIdx = items.length;
