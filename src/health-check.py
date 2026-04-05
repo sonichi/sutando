@@ -155,6 +155,7 @@ def run_all_checks() -> list[dict]:
 
     # Phone conversation server (optional — only check if Twilio configured)
     env_path = REPO_DIR / ".env"
+    has_twilio = False
     if env_path.exists():
         env_content = env_path.read_text()
         has_twilio = "TWILIO_ACCOUNT_SID=" in env_content and not env_content.split("TWILIO_ACCOUNT_SID=")[1].startswith("\n")
@@ -164,6 +165,21 @@ def run_all_checks() -> list[dict]:
                 c["status"] = "warn"
                 c["detail"] = "not running (starts on demand)"
             checks.append(c)
+
+    # Ngrok tunnel (required for inbound phone calls)
+    if has_twilio:
+        try:
+            import urllib.request
+            resp = urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels", timeout=2)
+            data = json.loads(resp.read())
+            tunnels = [t for t in data.get("tunnels", []) if t.get("proto") == "https"]
+            if tunnels:
+                url = tunnels[0]["public_url"]
+                checks.append({"name": "ngrok-tunnel", "status": "ok", "detail": url[:45]})
+            else:
+                checks.append({"name": "ngrok-tunnel", "status": "warn", "detail": "ngrok running but no HTTPS tunnel"})
+        except Exception:
+            checks.append({"name": "ngrok-tunnel", "status": "warn", "detail": "not running (inbound calls disabled)"})
 
     # Messaging bridges (optional — only check if configured)
     channels_dir = Path.home() / ".claude" / "channels"
