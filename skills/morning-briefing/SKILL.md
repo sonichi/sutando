@@ -26,6 +26,8 @@ Collect from each source (skip any that aren't configured):
 
 5. **System status** — Run `python3 src/health-check.py`. Report any issues.
 
+6. **Daily insight** — Run `python3 src/daily-insight.py`. If it produces an insight, include it at the end of the briefing as "💡 Insight: ..."
+
 ## How to deliver
 
 Format as a concise briefing:
@@ -38,6 +40,7 @@ Good morning. Here's your briefing:
 💬 Discord: [summary of overnight activity]
 📋 Tasks: [pending items]
 🖥️ System: [health status]
+💡 Insight: [behavioral pattern from daily-insight.py, if available]
 ```
 
 Deliver via:
