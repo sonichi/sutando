@@ -13,9 +13,9 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
-// Re-export recording/screen tools from browser-tools (tools unique to that module)
-export { describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool } from './browser-tools.js';
-import { describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool } from './browser-tools.js';
+// Re-export recording/screen/browser tools from browser-tools
+export { describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool, switchTabTool, scrollTool } from './browser-tools.js';
+import { describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool, switchTabTool, scrollTool } from './browser-tools.js';
 
 // --- Keyboard tool ---
 
@@ -60,85 +60,11 @@ export const pressKeyTool: ToolDefinition = {
 	},
 };
 
-// --- Browser tools ---
+// --- Browser tools (scroll, switchTab) imported from browser-tools.ts above ---
+// They include STT corrections for speech-garbled names and Chrome JS-based scrolling.
 
-export const scrollTool: ToolDefinition = {
-	name: 'scroll',
-	description:
-		'Scroll the Chrome browser page. Use for: "scroll down", "scroll up", "scroll to the top", "scroll to the bottom".',
-	parameters: z.object({
-		direction: z.enum(['down', 'up', 'top', 'bottom']).describe('Scroll direction. Use "top" for "scroll to the very top" and "bottom" for "scroll to the very bottom".'),
-	}),
-	execution: 'inline',
-	async execute(args) {
-		const { direction } = args as { direction: 'down' | 'up' | 'top' | 'bottom' };
-		try {
-			if (direction === 'top' || direction === 'bottom') {
-				const key = direction === 'top' ? 'Home' : 'End';
-				execSync(`osascript -e 'tell application "Google Chrome" to activate' -e 'delay 0.2' -e 'tell application "System Events" to key code ${direction === "top" ? 115 : 119}'`, { timeout: 3_000 });
-			} else {
-				const keyCode = direction === 'down' ? 125 : 126;
-				const presses = 10;
-				const keyPresses = Array(presses).fill(`key code ${keyCode}`).join('\n');
-				execSync(`osascript -e 'tell application "Google Chrome" to activate' -e 'delay 0.2' -e 'tell application "System Events"
-${keyPresses}
-end tell'`, { timeout: 5_000 });
-			}
-			console.log(`${ts()} [Scroll] ${direction}`);
-			return { status: 'scrolled', direction };
-		} catch (err) {
-			return { error: `Scroll failed: ${err instanceof Error ? err.message : err}` };
-		}
-	},
-};
-
-// Tab keyword aliases — map common names to URL patterns
-// Load tab aliases from config file (falls back to minimal defaults)
-const TAB_ALIASES: Record<string, string> = (() => {
-	const defaults: Record<string, string> = {
-		'github': 'github.com', 'gmail': 'mail.google.com', 'email': 'mail.google.com',
-		'calendar': 'calendar.google.com', 'dashboard': 'localhost:7844',
-		'sutando': 'localhost:8080', 'twitter': 'x.com', 'x': 'x.com',
-	};
-	try {
-		return { ...defaults, ...JSON.parse(readFileSync('tab-aliases.json', 'utf-8')) };
-	} catch { return defaults; }
-})();
-
-export const switchTabTool: ToolDefinition = {
-	name: 'switch_tab',
-	description:
-		'Switch to a Chrome tab by keyword. Searches both tab titles and URLs. Use for: "switch to GitHub", "go to Gmail", "open the calendar tab".',
-	parameters: z.object({
-		keyword: z.string().describe('Keyword to match in tab title or URL (e.g., "GitHub", "Gmail", "calendar")'),
-	}),
-	execution: 'inline',
-	async execute(args) {
-		const { keyword } = args as { keyword: string };
-		// Resolve aliases to URL patterns
-		const alias = TAB_ALIASES[keyword.toLowerCase()];
-		const searchTerms = alias ? [keyword, alias] : [keyword];
-		const conditions = searchTerms.map(t => {
-			const safe = t.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-			return `title of t contains "${safe}" or URL of t contains "${safe}"`;
-		}).join(' or ');
-		try {
-			const script = `tell application "Google Chrome"\nset tabIndex to 0\nrepeat with w in windows\nset tabIndex to 0\nrepeat with t in tabs of w\nset tabIndex to tabIndex + 1\nignoring case\nif ${conditions} then\nset active tab index of w to tabIndex\nset index of w to 1\nactivate\nreturn title of t\nend if\nend ignoring\nend repeat\nend repeat\nreturn "not found"\nend tell`;
-			const tmpFile = `/tmp/sutando-switchtab-${Date.now()}.scpt`;
-			writeFileSync(tmpFile, script);
-			const result = execSync(`osascript ${tmpFile}`, { timeout: 5_000 }).toString().trim();
-			try { unlinkSync(tmpFile); } catch {}
-			if (result === 'not found') {
-				console.log(`${ts()} [SwitchTab] no tab matching "${keyword}"`);
-				return { error: `No Chrome tab found matching "${keyword}"` };
-			}
-			console.log(`${ts()} [SwitchTab] switched to: ${result}`);
-			return { status: 'switched', tab: result };
-		} catch (err) {
-			return { error: `Failed: ${err instanceof Error ? err.message : err}` };
-		}
-	},
-};
+// Placeholder to maintain the export shape — the real tools are imported at the top
+const _browserToolsImported = { switchTabTool, scrollTool }; // eslint-disable-line @typescript-eslint/no-unused-vars
 
 export const openUrlTool: ToolDefinition = {
 	name: 'open_url',
