@@ -24,6 +24,14 @@ def transcribe(video_path):
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         wav_path = f.name
 
+    # Vocabulary hint: primes Whisper with project-specific terms to improve accuracy.
+    # Whisper uses initial_prompt as context — spelling these correctly reduces misrecognitions.
+    VOCAB_HINT = (
+        "Sutando, sonichi, MassGen, Cherry Blossoms, SVG, GitHub, "
+        "Susan Liu, Claude Code, Gemini, Zoom, screen share, "
+        "narration, recording, subtitle, describe screen"
+    )
+
     try:
         subprocess.run(
             ["ffmpeg", "-y", "-i", video_path, "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", wav_path],
@@ -34,7 +42,8 @@ def transcribe(video_path):
         srt_dir = tempfile.mkdtemp()
         subprocess.run(
             ["whisper", wav_path, "--model", "base", "--output_format", "srt", "--output_dir", srt_dir,
-             "--language", "en", "--word_timestamps", "True"],
+             "--language", "en", "--word_timestamps", "True",
+             "--initial_prompt", VOCAB_HINT],
             capture_output=True, timeout=120
         )
 
