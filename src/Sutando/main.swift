@@ -10,7 +10,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var hotKeyRef: EventHotKeyRef?
     var voiceHotKeyRef: EventHotKeyRef?
     var muteHotKeyRef: EventHotKeyRef?
-    let workspace = NSHomeDirectory() + "/Desktop/sutando"
+    let workspace: String = {
+        // Derive from binary location (src/Sutando/Sutando → repo root)
+        let url = URL(fileURLWithPath: ProcessInfo.processInfo.arguments[0]).resolvingSymlinksInPath()
+        return url.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().path
+    }()
 
     var resultWatchSource: DispatchSourceFileSystemObject?
     var lastResultCount = 0
