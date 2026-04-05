@@ -156,6 +156,15 @@ wacli chats list --limit 20
 wacli messages search "keyword" --limit 10
 ```
 
+**X (Twitter)** — post tweets with text, images, and video:
+```bash
+python3 src/x-post.py "Tweet text here"                                    # text only
+python3 src/x-post.py "Tweet with video" --media /path/to/video.mp4        # with video
+python3 src/x-post.py --reply-to 123456789 "Reply text"                    # reply
+```
+Requires X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET in .env.
+Always confirm post content with user before publishing.
+
 **Reminders** — read/write macOS Reminders (to-do list):
 ```bash
 python3 ~/.claude/skills/macos-tools/scripts/reminders.py list             # incomplete reminders
