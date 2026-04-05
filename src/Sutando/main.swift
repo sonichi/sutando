@@ -294,7 +294,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             end if
         end tell
         """)
-        script?.executeAndReturnError(nil)
+        var error: NSDictionary?
+        script?.executeAndReturnError(&error)
+        if let error = error {
+            let msg = error[NSAppleScript.errorMessage] as? String ?? ""
+            if msg.contains("not allowed") || msg.contains("JavaScript") || msg.contains("permission") {
+                notify("Sutando", "⌃V needs: Chrome → View → Developer → Allow JavaScript from Apple Events")
+            }
+        }
         NSSound.beep()
     }
 
