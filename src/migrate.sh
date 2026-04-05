@@ -157,16 +157,13 @@ if [ -d "$BUNDLE_DIR/sutando-personal" ]; then
   echo "  ✓ Personal scripts restored"
 fi
 
-# Restore Claude Code session
+# Restore Claude Code session history
 if [ -d "$BUNDLE_DIR/session" ]; then
   SESSION_DIR="$HOME/.claude/projects/-Users-$(whoami)-Desktop-sutando"
   mkdir -p "$SESSION_DIR"
   cp "$BUNDLE_DIR/session/"*.jsonl "$SESSION_DIR/" 2>/dev/null
   [ -f "$BUNDLE_DIR/session/sessions-index.json" ] && cp "$BUNDLE_DIR/session/sessions-index.json" "$SESSION_DIR/"
-  if [ -f "$BUNDLE_DIR/session/session-id.txt" ]; then
-    SID=$(cat "$BUNDLE_DIR/session/session-id.txt")
-    echo "  ✓ Session restored — try: claude --resume $SID"
-  fi
+  echo "  ✓ Session history restored"
 fi
 
 # Restore flywheel data
