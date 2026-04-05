@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "start": "tsx src/voice-agent.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "bash scripts/verify-whatsapp-skill.sh"
   },
   "dependencies": {
     "@ai-sdk/google": "^1.2.0",
