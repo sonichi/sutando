@@ -462,12 +462,19 @@ export function startRecordingNarration(session: any): void {
 	}, durationMs + 1000); // +1s buffer for auto-stop to finish
 }
 
-function findRecording(): string | null {
+function findRecording(version?: 'raw' | 'narrated' | 'subtitled'): string | null {
 	try {
-		const files = execSync('ls -t /tmp/sutando-recording-*.mov 2>/dev/null | grep -v narrated | head -1', { timeout: 3_000 }).toString().trim();
+		const files = execSync('ls -t /tmp/sutando-recording-*.mov 2>/dev/null | grep -v narrated | grep -v subtitled | head -1', { timeout: 3_000 }).toString().trim();
 		if (files && existsSync(files)) {
+			if (version === 'raw') return files;
+			const subtitled = files.replace('.mov', '-narrated-subtitled.mov');
+			if (version === 'subtitled') return existsSync(subtitled) ? subtitled : files;
 			const narrated = files.replace('.mov', '-narrated.mov');
-			return existsSync(narrated) ? narrated : files;
+			if (version === 'narrated') return existsSync(narrated) ? narrated : files;
+			// Default: prefer subtitled > narrated > raw
+			if (existsSync(subtitled)) return subtitled;
+			if (existsSync(narrated)) return narrated;
+			return files;
 		}
 	} catch {}
 	return null;
@@ -477,18 +484,30 @@ export const playRecordingTool: ToolDefinition = {
 	name: 'play_recording',
 	description:
 		'Control video playback. Use for ANY request about videos, recordings, or media files. ' +
-		'Actions: "open" (just open, no playback), "play" (play + stream audio), "pause", "stop", "status". ' +
-		'IMPORTANT: "open" and "play" are DIFFERENT. "open the video" → action:"open". "play the video" → action:"play". Default is open.',
+		'Actions: "open" (just open, no playback), "play" (play + stream audio), "pause", "stop", "close" (quit player), "replay" (start from beginning), "status". ' +
+		'IMPORTANT: "open" and "play" are DIFFERENT. "open the video" → action:"open". "play the video" → action:"play". ' +
+		'"close this video" → action:"close". "replay from the top" or "start over" → action:"replay".',
 	parameters: z.object({
-		action: z.enum(['open', 'play', 'pause', 'stop', 'status']).default('open'),
+		action: z.enum(['open', 'play', 'pause', 'stop', 'close', 'replay', 'status']).default('open'),
 		path: z.string().optional().describe('File path. Omit for latest screen recording.'),
+		version: z.enum(['raw', 'narrated', 'subtitled']).optional().describe('Which version: "raw" (no narration), "narrated", or "subtitled". Omit for best available.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		let { action, path: filePath } = args as { action: 'open' | 'play' | 'pause' | 'stop' | 'status'; path?: string };
+		let { action, path: filePath, version } = args as { action: 'open' | 'play' | 'pause' | 'stop' | 'close' | 'replay' | 'status'; path?: string; version?: 'raw' | 'narrated' | 'subtitled' };
+		const isReplay = action === 'replay';
 		if (action === 'stop') action = 'pause';
+		if (isReplay) action = 'play';
 		demoState = 'idle';
 		try {
+			if (action === 'close') {
+				try { execSync(`osascript -e 'tell application "QuickTime Player" to quit'`, { timeout: 5_000 }); } catch {}
+				try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
+				try { unlinkSync('/tmp/sutando-playback-path'); } catch {}
+				console.log(`${ts()} [PlayRecording] closed`);
+				return { status: 'closed', instruction: 'Video player closed.' };
+			}
+
 			if (action === 'pause') {
 				try { writeFileSync('/tmp/sutando-playback-pause', '1'); } catch {}
 				try { execSync(`osascript -e 'tell application "QuickTime Player"' -e 'if (count of documents) > 0 then' -e 'pause document 1' -e 'end if' -e 'end tell'`, { timeout: 5_000 }); } catch {}
@@ -509,7 +528,7 @@ export const playRecordingTool: ToolDefinition = {
 			if (!recPath) {
 				try { recPath = readFileSync('/tmp/sutando-playback-path', 'utf8').trim() || null; } catch {}
 			}
-			if (!recPath) recPath = findRecording();
+			if (!recPath) recPath = findRecording(version);
 			if (recPath && !existsSync(recPath)) recPath = null;
 			if (!recPath) return { error: filePath ? `File not found: ${filePath}` : 'No screen recording found' };
 
@@ -528,11 +547,16 @@ export const playRecordingTool: ToolDefinition = {
 				const c = execSync(`osascript -e 'tell application "QuickTime Player" to count of documents'`, { timeout: 2_000 }).toString().trim();
 				if (parseInt(c) > 0) {
 					alreadyOpen = true;
-					const pos = execSync(`osascript -e 'tell application "QuickTime Player"' -e 'set d to document 1' -e 'return current time of d' -e 'end tell'`, { timeout: 3_000 }).toString().trim();
-					const dur = execSync(`osascript -e 'tell application "QuickTime Player"' -e 'set d to document 1' -e 'return duration of d' -e 'end tell'`, { timeout: 3_000 }).toString().trim();
-					const posNum = parseFloat(pos) || 0;
-					const durNum = parseFloat(dur) || 1;
-					seekSec = (posNum / durNum > 0.9 || posNum < 0.5) ? 0 : posNum;
+					if (isReplay) {
+						// Replay: always seek to 0
+						seekSec = 0;
+					} else {
+						const pos = execSync(`osascript -e 'tell application "QuickTime Player"' -e 'set d to document 1' -e 'return current time of d' -e 'end tell'`, { timeout: 3_000 }).toString().trim();
+						const dur = execSync(`osascript -e 'tell application "QuickTime Player"' -e 'set d to document 1' -e 'return duration of d' -e 'end tell'`, { timeout: 3_000 }).toString().trim();
+						const posNum = parseFloat(pos) || 0;
+						const durNum = parseFloat(dur) || 1;
+						seekSec = (posNum / durNum > 0.95) ? 0 : (posNum < 0.5 ? 0 : posNum);
+					}
 					if (seekSec === 0) {
 						try { execSync(`osascript -e 'tell application "QuickTime Player"' -e 'set d to document 1' -e 'set current time of d to 0' -e 'end tell'`, { timeout: 3_000 }); } catch {}
 					}
