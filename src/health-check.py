@@ -214,6 +214,19 @@ def run_all_checks() -> list[dict]:
 
         checks.append({"name": name, "status": status, "detail": detail})
 
+    # Sutando menu bar app (optional — only check if binary exists)
+    sutando_bin = REPO_DIR / "src" / "Sutando" / "Sutando"
+    if sutando_bin.exists():
+        try:
+            result = subprocess.run(["pgrep", "-f", "Sutando/Sutando"], capture_output=True, text=True)
+            pids = [p for p in result.stdout.strip().split("\n") if p]
+        except:
+            pids = []
+        if pids:
+            checks.append({"name": "sutando-app", "status": "ok", "detail": f"running (⌃C/⌃V/⌃M)"})
+        else:
+            checks.append({"name": "sutando-app", "status": "warn", "detail": "not running — hotkeys disabled"})
+
     return checks
 
 
@@ -260,6 +273,11 @@ def main():
                     subprocess.Popen(["python3", str(REPO_DIR / "src" / "discord-bridge.py")],
                                      stdout=open(str(REPO_DIR / "src" / "discord-bridge.log"), "a"),
                                      stderr=subprocess.STDOUT, start_new_session=True)
+                    print(f"  {c['name']}: restarted")
+                elif c["name"] == "sutando-app":
+                    sutando_bin = REPO_DIR / "src" / "Sutando" / "Sutando"
+                    subprocess.Popen([str(sutando_bin)], start_new_session=True,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     print(f"  {c['name']}: restarted")
 
     # Email alert if critical issues found and --fix didn't resolve them
