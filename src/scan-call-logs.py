@@ -138,6 +138,53 @@ def detect_fabrication(transcript: str) -> list[dict]:
     return issues
 
 
+def detect_reconnect_leak(transcript: str) -> list[dict]:
+    """Detect 'I'm back' reconnect leak — Gemini says this after WebSocket reconnect."""
+    issues = []
+    sutando_lines = [l for l in transcript.split('\n') if l.strip().startswith('Sutando:')]
+    for line in sutando_lines:
+        if re.search(r"I'm back|I am back|Welcome back", line, re.IGNORECASE):
+            issues.append({
+                "pattern": "reconnect_leak",
+                "severity": "medium",
+                "category": "team-fixable",
+                "summary": "Gemini said 'I'm back' after reconnect",
+                "fix_hint": "Turn-count replay detection should suppress this. Check PR #105 fix.",
+            })
+            break
+    return issues
+
+
+def detect_repeated_command(transcript: str) -> list[dict]:
+    """Detect user repeating the same command 3+ times (tool not triggering)."""
+    issues = []
+    recipient_lines = [l.split(':', 1)[1].strip().lower()
+                       for l in transcript.split('\n')
+                       if 'Recipient:' in l or 'Caller:' in l]
+    # Look for repeated summon/share screen attempts
+    summon_count = sum(1 for l in recipient_lines
+                       if any(w in l for w in ['summon', 'share screen', 'computer to zoom', 'screen to zoom']))
+    if summon_count >= 3:
+        issues.append({
+            "pattern": "repeated_summon",
+            "severity": "medium",
+            "category": "team-fixable",
+            "summary": f"User asked to summon {summon_count}x — tool may not be triggering reliably",
+            "fix_hint": "Gemini STT may garble 'summon'. Check summon tool description for speech variants.",
+        })
+    # Look for repeated tab switch attempts
+    switch_phrases = [l for l in recipient_lines if 'switch' in l or 'tab' in l or 'open the' in l]
+    if len(switch_phrases) >= 3:
+        issues.append({
+            "pattern": "repeated_tab_switch",
+            "severity": "low",
+            "category": "team-fixable",
+            "summary": f"User asked to switch tabs {len(switch_phrases)}x — fuzzy matching may be failing",
+            "fix_hint": "Check STT corrections in browser-tools.ts and tab alias list.",
+        })
+    return issues
+
+
 def detect_identity_confusion(transcript: str) -> list[dict]:
     """Detect agent identity confusion (e.g., claiming to be the owner)."""
     issues = []
@@ -167,6 +214,8 @@ ALL_DETECTORS = [
     detect_task_timeout,
     detect_confusion,
     detect_fabrication,
+    detect_reconnect_leak,
+    detect_repeated_command,
     detect_identity_confusion,
 ]
 
