@@ -6,7 +6,7 @@
 #   # Transfer to new Mac, then:
 #   bash setup-new-mac.sh            # runs on new machine
 
-set -uo pipefail  # Don't use -e: many optional paths legitimately don't exist
+set -e
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 BUNDLE="$HOME/Desktop/sutando-migration"
 rm -rf "$BUNDLE"
@@ -25,13 +25,8 @@ echo "Collecting files..."
 # 1. Environment (secrets)
 cp "$REPO/.env" "$BUNDLE/.env" 2>/dev/null && echo "  ✓ .env"
 
-# 2. Memory system — auto-detect from repo path
-REPO_SLUG=$(echo "$REPO" | sed 's|/|-|g')
-MEMORY_DIR="$HOME/.claude/projects/$REPO_SLUG/memory"
-if [ ! -d "$MEMORY_DIR" ]; then
-  # Fallback: try the default Desktop path
-  MEMORY_DIR="$HOME/.claude/projects/-Users-$(whoami)-Desktop-sutando/memory"
-fi
+# 2. Memory system
+MEMORY_DIR="$HOME/.claude/projects/-Users-$(whoami)-Desktop-sutando/memory"
 if [ -d "$MEMORY_DIR" ]; then
   cp -r "$MEMORY_DIR" "$BUNDLE/memory"
   echo "  ✓ memory ($(ls "$MEMORY_DIR"/*.md 2>/dev/null | wc -l) files)"
@@ -66,10 +61,7 @@ if [ -d "$HOME/scripts/sutando-personal" ]; then
 fi
 
 # 7. Claude Code session history (startup.sh reconnects via --name)
-SESSION_DIR="$HOME/.claude/projects/$REPO_SLUG"
-if [ ! -d "$SESSION_DIR" ]; then
-  SESSION_DIR="$HOME/.claude/projects/-Users-$(whoami)-Desktop-sutando"
-fi
+SESSION_DIR="$HOME/.claude/projects/-Users-$(whoami)-Desktop-sutando"
 if [ -d "$SESSION_DIR" ]; then
   mkdir -p "$BUNDLE/session"
   LATEST=$(ls -t "$SESSION_DIR"/*.jsonl 2>/dev/null | head -1)

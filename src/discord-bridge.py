@@ -346,41 +346,6 @@ async def poll_results():
                 result_file.unlink(missing_ok=True)
                 task_file = TASKS_DIR / f"{task_id}.txt"
                 task_file.unlink(missing_ok=True)
-        # Scan for proactive messages (results/proactive-*.txt) → send to owner DM
-        import glob
-        for pf in glob.glob(str(RESULTS_DIR / "proactive-*.txt")):
-            ppath = Path(pf)
-            try:
-                import re as _re
-                content = ppath.read_text().strip()
-                file_pattern = _re.compile(r'\[(?:file|send|attach):\s*([^\]]+)\]')
-                files = file_pattern.findall(content)
-                clean_text = file_pattern.sub('', content).strip()
-
-                # Find owner's DM channel
-                allowed = load_allowed()
-                owner_id = int(next(iter(allowed))) if allowed else None
-                if owner_id:
-                    owner_user = await client.fetch_user(owner_id)
-                    dm_channel = await owner_user.create_dm()
-                    if clean_text:
-                        for i in range(0, len(clean_text), 1900):
-                            await dm_channel.send(clean_text[i:i+1900])
-                    for fpath in files:
-                        fpath = fpath.strip()
-                        if os.path.isfile(fpath):
-                            await dm_channel.send(file=discord.File(fpath))
-                            print(f"  Proactive file sent: {fpath}")
-                    print(f"  Proactive msg sent: {clean_text[:80]}...")
-                ppath.unlink(missing_ok=True)
-            except Exception as e:
-                print(f"  Proactive send failed: {e}")
-                # Rename to .failed instead of deleting — preserves message for inspection
-                try:
-                    ppath.rename(ppath.with_suffix('.failed'))
-                except Exception:
-                    pass
-
         await asyncio.sleep(1)
 
 
