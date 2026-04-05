@@ -28,7 +28,7 @@ TASKS_DIR = REPO / "tasks"
 PORT = int(sys.argv[sys.argv.index("--port") + 1]) if "--port" in sys.argv else 7847
 
 # Events we care about and how to summarize them
-def format_event(event_type: str, payload: dict) -> str | None:
+def format_event(event_type: str, payload: dict):
     """Convert a GitHub webhook payload into a task description. Returns None to skip."""
     action = payload.get("action", "")
     repo = payload.get("repository", {}).get("full_name", "unknown")
