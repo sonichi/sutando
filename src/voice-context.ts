@@ -63,6 +63,29 @@ export function buildVoiceAgentContext(): string {
 		} catch { /* best effort */ }
 	}
 
+	// Read recent phone call summaries (last 3 calls)
+	const callsFile = join(REPO_DIR, 'results', 'calls', 'calls.jsonl');
+	if (existsSync(callsFile)) {
+		try {
+			const callLines = readFileSync(callsFile, 'utf-8').trim().split('\n').filter(Boolean);
+			const recentCalls = callLines.slice(-3).reverse();
+			if (recentCalls.length > 0) {
+				lines.push('RECENT PHONE CALLS:');
+				for (const line of recentCalls) {
+					try {
+						const call = JSON.parse(line);
+						const who = call.caller || call.to || 'unknown';
+						const when = call.start_time || call.timestamp || '';
+						const summary = call.summary || call.topic || '(no summary)';
+						const dateStr = when ? new Date(when).toLocaleDateString() : '';
+						lines.push(`  ${dateStr} ${who}: ${summary.slice(0, 120)}`);
+					} catch { /* skip malformed */ }
+				}
+				lines.push('');
+			}
+		} catch { /* best effort */ }
+	}
+
 	return lines.join('\n');
 }
 
