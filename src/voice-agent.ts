@@ -21,7 +21,7 @@
 import 'dotenv/config';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
-import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync, appendFileSync, writeFileSync } from 'node:fs';
 import { inlineTools } from './inline-tools.js';
 import { join } from 'node:path';
 import {
@@ -318,12 +318,16 @@ async function main() {
 	}, () => session.clientConnected);
 
 	let lastLoggedIndex = 0;
+	const liveTranscriptPath = '/tmp/sutando-live-transcript-voice.txt';
+	try { writeFileSync(liveTranscriptPath, `--- Live Transcript: ${new Date().toISOString()} ---\n\n`); } catch {}
 	session.eventBus.subscribe('turn.end', () => {
 		const items = session.conversationContext.items;
 		for (const item of items.slice(lastLoggedIndex)) {
 			if (item.role === 'user' || item.role === 'assistant') {
 				console.log(`${ts()}   [${item.role}] ${item.content}`);
 				logConversation(item.role, item.content);
+				const label = item.role === 'user' ? 'User' : 'Sutando';
+				try { appendFileSync(liveTranscriptPath, `[${new Date().toLocaleTimeString('en-US', {hour12:false})}] ${label}: ${item.content}\n`); } catch {}
 			}
 		}
 		lastLoggedIndex = items.length;

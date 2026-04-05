@@ -44,7 +44,7 @@
 
 import 'dotenv/config';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { mkdirSync, writeFileSync, appendFileSync, unlinkSync, existsSync, readFileSync, readdirSync } from 'node:fs';
+import { mkdirSync, writeFileSync, appendFileSync, unlinkSync, existsSync, readFileSync, readdirSync, symlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execSync, spawn, type ChildProcess } from 'node:child_process';
@@ -589,6 +589,14 @@ async function createCallSession(params: {
 		resultQueue: [],
 	};
 
+	// Start live transcript file
+	const liveTranscriptPath = `/tmp/sutando-live-transcript-${callSid}.txt`;
+	try {
+		writeFileSync(liveTranscriptPath, `--- Live Transcript: ${new Date().toISOString()} ---\nCall: ${callSid}\n\n`);
+		try { unlinkSync('/tmp/sutando-live-transcript.txt'); } catch {}
+		symlinkSync(liveTranscriptPath, '/tmp/sutando-live-transcript.txt');
+	} catch {}
+
 	const agent = buildAgent(callSession);
 
 	const session = new VoiceSession({
@@ -688,8 +696,10 @@ async function createCallSession(params: {
 			if (item.content === lastTranscriptText) continue;
 			if (item.role === 'user') {
 				callSession.transcript.push({ role: 'caller', text: item.content });
+				try { appendFileSync(`/tmp/sutando-live-transcript-${callSid}.txt`, `[${new Date().toLocaleTimeString('en-US', {hour12:false})}] Caller: ${item.content}\n`); } catch {}
 			} else if (item.role === 'assistant') {
 				callSession.transcript.push({ role: 'sutando', text: item.content });
+				try { appendFileSync(`/tmp/sutando-live-transcript-${callSid}.txt`, `[${new Date().toLocaleTimeString('en-US', {hour12:false})}] Sutando: ${item.content}\n`); } catch {}
 			}
 		}
 		lastProcessedIdx = items.length;
