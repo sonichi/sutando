@@ -210,9 +210,11 @@ The Sutando menu bar app (`src/Sutando/`) provides global keyboard shortcuts. It
 
 The menu bar also has **Open Core** (brings up the Claude Code terminal) and **Open Dashboard** (opens the status dashboard at localhost:7844).
 
-On first run, grant **Accessibility** permission to the Sutando app in System Settings → Privacy & Security.
+On first run:
+1. Grant **Accessibility** permission to the Sutando app in System Settings → Privacy & Security
+2. Enable **Allow JavaScript from Apple Events** in Chrome: View → Developer → Allow JavaScript from Apple Events (required for ⌃V voice toggle)
 
-To compile manually: `cd src/Sutando && swiftc -o Sutando main.swift -framework Cocoa -framework Carbon -framework ApplicationServices`
+The binary auto-compiles on `startup.sh` if missing. To compile manually: `cd src/Sutando && swiftc -O -o Sutando main.swift -framework Cocoa -framework Carbon -framework ApplicationServices`
 
 ---
 
