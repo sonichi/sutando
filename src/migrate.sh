@@ -53,7 +53,19 @@ if [ -d "$HOME/scripts/sutando-personal" ]; then
   echo "  ✓ sutando-personal scripts"
 fi
 
-# 6. Generate setup script for new machine
+# 7. Behavioral flywheel data (conversation history, call logs, build log)
+mkdir -p "$BUNDLE/flywheel"
+[ -f "$REPO/conversation.log" ] && cp "$REPO/conversation.log" "$BUNDLE/flywheel/" && echo "  ✓ conversation.log"
+[ -f "$REPO/build_log.md" ] && cp "$REPO/build_log.md" "$BUNDLE/flywheel/" && echo "  ✓ build_log.md"
+[ -d "$REPO/results/calls" ] && cp -r "$REPO/results/calls" "$BUNDLE/flywheel/calls" && echo "  ✓ call transcripts"
+# Task result history (recent)
+if [ -d "$REPO/results" ]; then
+  mkdir -p "$BUNDLE/flywheel/results"
+  find "$REPO/results" -name "task-*.txt" -maxdepth 1 | head -100 | while read f; do cp "$f" "$BUNDLE/flywheel/results/"; done
+  echo "  ✓ task results (recent)"
+fi
+
+# 8. Generate setup script for new machine
 cat > "$BUNDLE/setup-new-mac.sh" << 'SETUP'
 #!/bin/bash
 # Sutando New Mac Setup — run after transferring migration bundle
@@ -119,6 +131,14 @@ if [ -d "$BUNDLE_DIR/sutando-personal" ]; then
   mkdir -p "$HOME/scripts"
   cp -r "$BUNDLE_DIR/sutando-personal" "$HOME/scripts/sutando-personal"
   echo "  ✓ Personal scripts restored"
+fi
+
+# Restore flywheel data
+if [ -d "$BUNDLE_DIR/flywheel" ]; then
+  [ -f "$BUNDLE_DIR/flywheel/conversation.log" ] && cp "$BUNDLE_DIR/flywheel/conversation.log" "$REPO/" && echo "  ✓ conversation.log restored"
+  [ -f "$BUNDLE_DIR/flywheel/build_log.md" ] && cp "$BUNDLE_DIR/flywheel/build_log.md" "$REPO/" && echo "  ✓ build_log.md restored"
+  [ -d "$BUNDLE_DIR/flywheel/calls" ] && mkdir -p "$REPO/results" && cp -r "$BUNDLE_DIR/flywheel/calls" "$REPO/results/calls" && echo "  ✓ call transcripts restored"
+  [ -d "$BUNDLE_DIR/flywheel/results" ] && mkdir -p "$REPO/results" && cp "$BUNDLE_DIR/flywheel/results/"* "$REPO/results/" 2>/dev/null && echo "  ✓ task results restored"
 fi
 
 # Compile Sutando app
