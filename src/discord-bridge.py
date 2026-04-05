@@ -375,7 +375,11 @@ async def poll_results():
                 ppath.unlink(missing_ok=True)
             except Exception as e:
                 print(f"  Proactive send failed: {e}")
-                ppath.unlink(missing_ok=True)
+                # Rename to .failed instead of deleting — preserves message for inspection
+                try:
+                    ppath.rename(ppath.with_suffix('.failed'))
+                except Exception:
+                    pass
 
         await asyncio.sleep(1)
 

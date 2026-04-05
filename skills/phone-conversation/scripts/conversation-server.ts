@@ -1494,7 +1494,7 @@ async function start(): Promise<void> {
 		console.log(`╠════════════════════════════════════════════════════╣`);
 		console.log(`║  Local:    http://localhost:${String(PORT).padEnd(27)}║`);
 		console.log(`║  Tunnel:   ${WEBHOOK_BASE_URL.slice(0, 40).padEnd(40)}║`);
-		console.log(`║  Phone:    ${TWILIO_PHONE_NUMBER.slice(0, 2) + '***' + TWILIO_PHONE_NUMBER.slice(-2).padEnd(40)}║`);
+		console.log(`║  Phone:    ${(TWILIO_PHONE_NUMBER.slice(0, 2) + '***' + TWILIO_PHONE_NUMBER.slice(-4)).padEnd(40)}║`);
 		console.log(`╠════════════════════════════════════════════════════╣`);
 		console.log(`║  POST /call              — outbound call           ║`);
 		console.log(`║  POST /concurrent-call   — child call (for Claude) ║`);

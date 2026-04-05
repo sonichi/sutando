@@ -34,7 +34,10 @@ if [ -z "$NGROK_URL" ]; then
 fi
 
 # Get Twilio phone number SID
-ENCODED_NUM=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$TWILIO_PHONE_NUMBER'))")
+ENCODED_NUM=$(TWILIO_PHONE_NUMBER="$TWILIO_PHONE_NUMBER" python3 -c '
+import os, urllib.parse
+print(urllib.parse.quote(os.environ["TWILIO_PHONE_NUMBER"]))
+')
 PHONE_SID=$(curl -s -u "$TWILIO_ACCOUNT_SID:$TWILIO_AUTH_TOKEN" \
   "https://api.twilio.com/2010-04-01/Accounts/$TWILIO_ACCOUNT_SID/IncomingPhoneNumbers.json?PhoneNumber=$ENCODED_NUM" \
   2>/dev/null | python3 -c "
