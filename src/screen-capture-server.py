@@ -20,12 +20,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
 
     def do_GET(self):
-        if self.path == "/capture":
+        if self.path.startswith("/capture"):
             os.makedirs(DIR, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-            path = f"{DIR}/screen-{ts}.png"
+            # Parse display number from query: /capture?display=2
+            from urllib.parse import urlparse, parse_qs
+            query = parse_qs(urlparse(self.path).query)
+            display = query.get("display", [None])[0]
+            suffix = f"-d{display}" if display else ""
+            path = f"{DIR}/screen-{ts}{suffix}.png"
             try:
-                subprocess.run(["screencapture", "-x", path], timeout=5, check=True)
+                cmd = ["screencapture", "-x"]
+                if display:
+                    cmd.append(f"-D{display}")
+                cmd.append(path)
+                subprocess.run(cmd, timeout=5, check=True)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()

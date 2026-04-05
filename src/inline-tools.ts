@@ -203,15 +203,19 @@ export const switchAppTool: ToolDefinition = {
 export const captureScreenTool: ToolDefinition = {
 	name: 'capture_screen',
 	description:
-		'Capture a screenshot of the screen. Use for: "take a screenshot", "what\'s on my screen", "look at this". Instant.',
-	parameters: z.object({}),
+		'Capture a screenshot of the screen. Use for: "take a screenshot", "what\'s on my screen", "look at this". Supports multi-monitor: pass display=2 for secondary screen, display=3 for third, etc. Default captures the main display. Instant.',
+	parameters: z.object({
+		display: z.number().optional().describe('Display number: 1=main, 2=secondary, 3=third. Default: main display.'),
+	}),
 	execution: 'inline',
-	async execute() {
+	async execute(args) {
 		try {
-			const res = await fetch('http://localhost:7845/capture');
+			const { display } = args as { display?: number };
+			const query = display ? `?display=${display}` : '';
+			const res = await fetch(`http://localhost:7845/capture${query}`);
 			const data = await res.json() as { status: string; path?: string; error?: string };
 			if (data.status === 'ok' && data.path) {
-				console.log(`${ts()} [Screen] Captured: ${data.path}`);
+				console.log(`${ts()} [Screen] Captured${display ? ` display ${display}` : ''}: ${data.path}`);
 				return { status: 'captured', path: data.path };
 			}
 			return { status: 'failed', error: data.error || 'unknown error' };
