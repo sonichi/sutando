@@ -149,12 +149,14 @@ imsg messages --chat "+14155551234" --limit 10    # read messages
 ```
 Always confirm message content with user before sending.
 
-**WhatsApp** — send messages via WhatsApp (requires `wacli auth` first):
+**WhatsApp** — send/search via [wacli](https://github.com/steipete/wacli) (`brew install steipete/tap/wacli`). Full commands and setup: `~/.claude/skills/whatsapp/SKILL.md` (install skill: `bash skills/install.sh`). Requires `wacli auth` first; session is under `~/.wacli`.
 ```bash
 wacli send text --to "+14155551234" --message "Hello!"
 wacli chats list --limit 20
 wacli messages search "keyword" --limit 10
 ```
+Optional: `WACLI_DEVICE_LABEL`, `WACLI_DEVICE_PLATFORM` in `.env` — see `.env.example`.
+Always confirm message content with user before sending.
 
 **X (Twitter)** — post, search, read, and monitor:
 ```bash
