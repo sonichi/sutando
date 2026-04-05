@@ -22,7 +22,7 @@ const HTML = /* html */ `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Sutando Web UI</title>
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-user-select: text; user-select: text; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     background: #0a0a12; color: #c0c0d0;
@@ -143,7 +143,7 @@ const HTML = /* html */ `<!DOCTYPE html>
   .task-time { color: #444; font-size: 10px; }
 
   /* Dynamic region */
-  #dynamic-region { padding: 0 16px 8px; width: 100%; box-sizing: border-box; }
+  #dynamic-region { padding: 0 16px 8px; width: 100%; box-sizing: border-box; user-select: text; -webkit-user-select: text; }
   #dynamic-region:empty { display: none; }
   #core-status-bar { font-size: 11px; color: #555; }
   #core-status-bar:empty { display: none; }
@@ -1409,7 +1409,7 @@ function ensureTabStructure() {
   if (!dr) return;
   if (!document.getElementById('dr-tabs')) {
     dr.innerHTML = '<div id="dr-tabs" style="display:flex;gap:2px;margin-bottom:8px"></div>' +
-      '<div id="dr-content" style="min-width:100%;word-wrap:break-word;overflow-wrap:break-word"></div>';
+      '<div id="dr-content" style="min-width:100%;word-wrap:break-word;overflow-wrap:break-word;user-select:text;-webkit-user-select:text;cursor:text"></div>';
   }
   updateTabHighlights();
 }
