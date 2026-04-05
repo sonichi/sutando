@@ -84,7 +84,14 @@ const HTML = /* html */ `<!DOCTYPE html>
     overflow-y: auto; font-size: 13px; line-height: 1.6;
     margin-bottom: 6px;
   }
-  .t-entry { margin-bottom: 6px; }
+  .t-entry { margin-bottom: 6px; position: relative; user-select: text; }
+  .t-entry .copy-btn {
+    display: none; position: absolute; right: 0; top: 0;
+    background: #1e1e30; border: 1px solid #2a2a40; color: #666; font-size: 10px;
+    padding: 2px 6px; border-radius: 4px; cursor: pointer;
+  }
+  .t-entry:hover .copy-btn { display: inline-block; }
+  .t-entry .copy-btn:hover { color: #4ecca3; border-color: #4ecca3; }
   .t-user { color: #7fb3e0; }
   .t-user::before { content: 'You: '; font-weight: 600; color: #5a9fd4; }
   .t-assistant { color: #a8d8b0; }
@@ -478,6 +485,19 @@ let currentUserEl = null;
 let currentAssistantEl = null;
 let serverUserTextReceived = false;  // blocks Chrome STT overwrites after server sends
 
+function addCopyBtn(el) {
+  const btn = document.createElement('span');
+  btn.className = 'copy-btn';
+  btn.textContent = 'Copy';
+  btn.onclick = function(e) {
+    e.stopPropagation();
+    navigator.clipboard.writeText(el.textContent.replace(/^(You: |Sutando: )/, '').replace(/Copy$/, '').trim());
+    btn.textContent = 'Copied';
+    setTimeout(function() { btn.textContent = 'Copy'; }, 1500);
+  };
+  el.appendChild(btn);
+}
+
 function handleTranscript(role, text, partial) {
   if (role === 'user') {
     dbg('[Server STT] ' + (partial ? 'partial' : 'FINAL') + ': ' + text);
@@ -497,6 +517,7 @@ function handleTranscript(role, text, partial) {
       }
       currentUserEl.className = 't-entry t-user';
       currentUserEl.textContent = text;
+      addCopyBtn(currentUserEl);
       currentUserEl = null;
     }
   } else {
@@ -506,7 +527,7 @@ function handleTranscript(role, text, partial) {
       $('transcript').appendChild(currentAssistantEl);
     }
     currentAssistantEl.textContent = text;
-    if (!partial) currentAssistantEl = null;
+    if (!partial) { addCopyBtn(currentAssistantEl); currentAssistantEl = null; }
   }
   $('transcript').scrollTop = $('transcript').scrollHeight;
 }
@@ -515,6 +536,7 @@ function addSystem(text, isHtml) {
   const el = document.createElement('div');
   el.className = 't-entry t-system';
   if (isHtml) { el.innerHTML = text; } else { el.textContent = text; }
+  addCopyBtn(el);
   $('transcript').appendChild(el);
   $('transcript').scrollTop = $('transcript').scrollHeight;
 }
@@ -1269,6 +1291,7 @@ function sendText() {
                 const re = document.createElement('div');
                 re.className = 't-entry t-assistant';
                 re.textContent = r.result;
+                addCopyBtn(re);
                 $('transcript').appendChild(re);
                 $('transcript').scrollTop = $('transcript').scrollHeight;
               }
