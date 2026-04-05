@@ -256,6 +256,21 @@ const HTML = /* html */ `<!DOCTYPE html>
   /* When voice is active, hide hero */
   body.voice-active .hero { display: none; }
   body.voice-active .main { display: flex; }
+  /* Toast notifications */
+  .toast-container {
+    position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%);
+    z-index: 100; display: flex; flex-direction: column; gap: 6px; align-items: center;
+  }
+  .toast {
+    background: #1a2e24; border: 1px solid #2a4a36; color: #c0c0d0;
+    padding: 10px 16px; border-radius: 10px; font-size: 12px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+    animation: toastIn 0.3s ease, toastOut 0.3s ease 3.7s forwards;
+    max-width: 400px; text-align: center;
+  }
+  .toast .toast-label { color: #4ecca3; font-weight: 600; }
+  @keyframes toastIn { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
+  @keyframes toastOut { from { opacity: 1; } to { opacity: 0; transform: translateY(-8px); } }
 </style>
 </head>
 <body>
@@ -325,6 +340,7 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
 
 <div class="main" id="main-area">
 
+<div class="toast-container" id="toast-container"></div>
 <div id="bottom-panel">
 <div id="transcript">
   <div class="t-entry t-system">Ask Sutando anything.</div>
@@ -590,6 +606,18 @@ function renderTasks() {
   }).join('');
 }
 
+// ─── Toast notifications ────────────────────────────────
+function showToast(msg) {
+  const container = document.getElementById('toast-container');
+  if (!container) return;
+  const el = document.createElement('div');
+  el.className = 'toast';
+  el.innerHTML = msg;
+  container.appendChild(el);
+  setTimeout(() => { if (el.parentNode) el.remove(); }, 4000);
+}
+const knownTaskIds = new Set(Object.keys(taskMap));
+
 // ─── Poll agent API for task status ───────────────────────
 let taskPollTimer = null;
 function startTaskPolling() {
@@ -604,6 +632,16 @@ function startTaskPolling() {
       for (const t of (data.tasks || [])) {
         apiTasks.add(t.id);
         const existing = taskMap[t.id] || {};
+        // Toast for new tasks
+        if (!knownTaskIds.has(t.id)) {
+          knownTaskIds.add(t.id);
+          const snippet = (t.text || '').slice(0, 60);
+          showToast('<span class="toast-label">Context received</span> ' + snippet);
+        }
+        // Toast for completed tasks
+        if (t.status === 'done' && existing.status && existing.status !== 'done') {
+          showToast('<span class="toast-label">Done</span> ' + (t.text || t.id).slice(0, 60));
+        }
         // Auto-expand latest completed task (collapse others if user had collapsed)
         if (t.status === 'done' && existing.status !== 'done' && (t.result || existing.result)) {
           if (userCollapsed) expandedTasks.clear();

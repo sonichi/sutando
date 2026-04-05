@@ -39,14 +39,13 @@ Each pass, in order:
 
 0. **Signal loop start.** Write `{"status":"running","step":"Starting pass...","ts":DATE_NOW}` to `core-status.json`. Update the `step` field as you progress through each step. Write `{"status":"idle","ts":DATE_NOW}` when the pass ends.
 
-0.5. **Check quota.** Run `python3 ~/.claude/skills/quota-tracker/scripts/read-quota.py`. Note remaining % and exact reset time. Then calculate sustainable pace:
-   - **Passes until reset** = minutes until reset / 5
-   - **Budget per pass** = remaining % / passes until reset
-   - If budget per pass is **>3%**: Full — research agents, code changes, heavy tasks
-   - If budget per pass is **1-3%**: Medium — code fixes, monitoring, no subagents
-   - If budget per pass is **<1%**: Light — task processing and health checks only
-   - Always process user tasks regardless of quota
-   - If quota is exhausted, still run all steps but skip step 6 (discretionary work)
+0.5. **Check quota.** Run `python3 ~/.claude/skills/quota-tracker/scripts/read-quota.py`. Note remaining % and exact reset time.
+   - **Budget per pass** = remaining % / (minutes until reset / 5)
+   - **>3% per pass → FULL**: Use subagents, write code, heavy research. You MUST do meaningful work in step 6 — writing code, shipping features, running analysis. A pass that only checks tasks and health is a wasted pass.
+   - **1-3% per pass → MEDIUM**: Code fixes, monitoring, no subagents. Still do step 6 work.
+   - **<1% per pass → LIGHT**: Task processing and health checks only. Skip step 6.
+   - **0% remaining → MINIMAL**: Process user tasks, health check, update log. Skip steps 5-6.
+   - CRITICAL: If budget is FULL or MEDIUM, you MUST execute steps 5 and 6. Do NOT skip them. Do NOT collapse the pass into "checked tasks, nothing to do." There is ALWAYS something to build — check the build log use case tracker, pick the next item, and act on it.
 
 1. **Check for tasks.** Look in `tasks/` for voice tasks. Look at `context-drop.txt` for context drops. Process anything found — execute the task, write results to `results/`.
    - **Access control:** If the task has `access_tier: other` or `access_tier: team`, delegate to a sandboxed agent. Do NOT process non-owner tasks with your full capabilities. Write the sandboxed output to results.
