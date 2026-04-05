@@ -108,7 +108,26 @@ def check_notes_without_follow_up():
     now = datetime.now().timestamp()
     for f in notes_dir.glob("*.md"):
         content = f.read_text()
-        if any(tag in content.lower() for tag in ["action", "todo", "follow-up", "followup"]):
+        # Only match explicit TODO markers in content body (not tags)
+        lines = content.split("\n")
+        body_start = False
+        has_todo = False
+        for line in lines:
+            if body_start and line.strip().startswith("---"):
+                continue
+            if line.strip() == "---":
+                body_start = not body_start
+                continue
+            if body_start or not line.startswith("---"):
+                low = line.lower()
+                if any(marker in low for marker in ["- [ ]", "todo:", "action:", "follow-up:", "followup:"]):
+                    has_todo = True
+                    break
+                # Also match tags line with explicit 'todo' tag
+                if "tags:" in low and "todo" in low:
+                    has_todo = True
+                    break
+        if has_todo:
             age_days = (now - f.stat().st_mtime) / 86400
             if age_days > 7:
                 title = f.stem.replace("-", " ").title()
