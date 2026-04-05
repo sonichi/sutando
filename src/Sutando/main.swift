@@ -248,7 +248,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             """
             appendLog(logFile, "[\(timestamp)] Dropped: \(selected.count) chars")
             writeTask(tasksDir, timestamp: timestamp, content: content)
-            notify("Sutando", "\(selected.count) chars dropped")
+            let snippet = String(selected.prefix(80)).replacingOccurrences(of: "\n", with: " ")
+            notify("Sutando", "Dropped: \(snippet)\(selected.count > 80 ? "…" : "")")
             return
         }
 
@@ -264,7 +265,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 """
                 appendLog(logFile, "[\(timestamp)] Dropped: \(text.count) chars")
                 writeTask(tasksDir, timestamp: timestamp, content: content)
-                notify("Sutando", "\(text.count) chars dropped")
+                let snippet = String(text.prefix(80)).replacingOccurrences(of: "\n", with: " ")
+                notify("Sutando", "Dropped: \(snippet)\(text.count > 80 ? "…" : "")")
             } else {
                 notify("Sutando", "Nothing selected — select text first")
                 appendLog(logFile, "[\(timestamp)] Nothing selected")
