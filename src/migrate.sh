@@ -60,19 +60,15 @@ if [ -d "$HOME/scripts/sutando-personal" ]; then
   echo "  ✓ sutando-personal scripts"
 fi
 
-# 7. Claude Code session (for --resume on new machine)
+# 7. Claude Code session history (startup.sh reconnects via --name)
 SESSION_DIR="$HOME/.claude/projects/-Users-$(whoami)-Desktop-sutando"
 if [ -d "$SESSION_DIR" ]; then
   mkdir -p "$BUNDLE/session"
-  # Copy most recent session JSONL (the active one)
   LATEST=$(ls -t "$SESSION_DIR"/*.jsonl 2>/dev/null | head -1)
   if [ -n "$LATEST" ]; then
     cp "$LATEST" "$BUNDLE/session/"
-    SESSION_ID=$(basename "$LATEST" .jsonl)
-    echo "$SESSION_ID" > "$BUNDLE/session/session-id.txt"
-    echo "  ✓ session transcript ($(du -h "$LATEST" | cut -f1)) — ID: $SESSION_ID"
+    echo "  ✓ session history ($(du -h "$LATEST" | cut -f1))"
   fi
-  # Copy session index if exists
   [ -f "$SESSION_DIR/sessions-index.json" ] && cp "$SESSION_DIR/sessions-index.json" "$BUNDLE/session/"
 fi
 
