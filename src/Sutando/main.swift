@@ -11,9 +11,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var voiceHotKeyRef: EventHotKeyRef?
     var muteHotKeyRef: EventHotKeyRef?
     let workspace: String = {
-        // Derive from binary location (src/Sutando/Sutando → repo root)
-        let url = URL(fileURLWithPath: ProcessInfo.processInfo.arguments[0]).resolvingSymlinksInPath()
-        return url.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().path
+        // Derive from binary location → repo root
+        // Raw binary: src/Sutando/Sutando (3 levels up)
+        // .app bundle: src/Sutando/Sutando.app/Contents/MacOS/Sutando (5 levels up)
+        var url = URL(fileURLWithPath: ProcessInfo.processInfo.arguments[0]).resolvingSymlinksInPath()
+        // Walk up until we find CLAUDE.md (repo root marker)
+        for _ in 0..<8 {
+            url = url.deletingLastPathComponent()
+            if FileManager.default.fileExists(atPath: url.appendingPathComponent("CLAUDE.md").path) {
+                return url.path
+            }
+        }
+        // Fallback: 3 levels up from binary
+        let fallback = URL(fileURLWithPath: ProcessInfo.processInfo.arguments[0]).resolvingSymlinksInPath()
+        return fallback.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().path
     }()
 
     var resultWatchSource: DispatchSourceFileSystemObject?
