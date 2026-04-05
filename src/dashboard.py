@@ -416,7 +416,12 @@ load()
                 self.send_response(400)
                 self.end_headers()
                 return
-            note_file = REPO_DIR / "notes" / f"{slug}.md"
+            notes_dir = (REPO_DIR / "notes").resolve()
+            note_file = (notes_dir / f"{slug}.md").resolve()
+            if not note_file.is_relative_to(notes_dir):
+                self.send_response(400)
+                self.end_headers()
+                return
             if note_file.exists():
                 self.send_response(200)
                 self.send_header("Content-Type", "text/markdown; charset=utf-8")
@@ -440,7 +445,12 @@ load()
                 self.send_response(400)
                 self.end_headers()
                 return
-            note_file = REPO_DIR / "notes" / f"{slug}.md"
+            notes_dir = (REPO_DIR / "notes").resolve()
+            note_file = (notes_dir / f"{slug}.md").resolve()
+            if not note_file.is_relative_to(notes_dir):
+                self.send_response(400)
+                self.end_headers()
+                return
             if note_file.exists():
                 note_file.unlink()
                 self.send_response(200)
