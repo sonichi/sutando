@@ -152,9 +152,13 @@ export const typeTextTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { text } = args as { text: string };
-		const safeText = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 		try {
-			execSync(`osascript -e 'tell application "System Events" to keystroke "${safeText}"'`, { timeout: 5_000 });
+			// Write AppleScript to temp file to avoid shell injection via text content
+			const tmpFile = `/tmp/sutando-typetext-${Date.now()}.scpt`;
+			const safeText = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+			writeFileSync(tmpFile, `tell application "System Events" to keystroke "${safeText}"`);
+			execSync(`osascript ${tmpFile}`, { timeout: 5_000 });
+			try { unlinkSync(tmpFile); } catch {}
 			console.log(`${ts()} [TypeText] typed: ${text.slice(0, 40)}`);
 			return { status: 'typed', text };
 		} catch (err) {
