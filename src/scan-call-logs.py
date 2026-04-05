@@ -312,5 +312,46 @@ def main():
                 print()
 
 
+def summary():
+    """Print a quality trend summary grouped by date."""
+    if not CALLS_FILE.exists():
+        print("No call logs found.")
+        return
+
+    entries = [json.loads(l) for l in CALLS_FILE.read_text().strip().split('\n') if l.strip()]
+    from collections import Counter
+
+    by_date = {}
+    for entry in entries:
+        ts = entry.get("timestamp", "")[:10]  # YYYY-MM-DD
+        if not ts:
+            continue
+        by_date.setdefault(ts, {"total": 0, "with_issues": 0, "patterns": Counter()})
+        by_date[ts]["total"] += 1
+        result = scan_entry(entry)
+        if result:
+            by_date[ts]["with_issues"] += 1
+            for issue in result["issues"]:
+                by_date[ts]["patterns"][issue["pattern"]] += 1
+
+    print("=== Call Quality Trend ===\n")
+    print(f"{'Date':<12} {'Calls':>5} {'Clean':>5} {'Issues':>6} {'Rate':>6}  Top issues")
+    print("-" * 75)
+    for date in sorted(by_date):
+        d = by_date[date]
+        clean = d["total"] - d["with_issues"]
+        rate = f"{d['with_issues']/d['total']*100:.0f}%" if d["total"] else "—"
+        top = ", ".join(f"{p}({c})" for p, c in d["patterns"].most_common(3))
+        print(f"{date:<12} {d['total']:>5} {clean:>5} {d['with_issues']:>6} {rate:>6}  {top}")
+
+    total = sum(d["total"] for d in by_date.values())
+    issues = sum(d["with_issues"] for d in by_date.values())
+    print("-" * 75)
+    print(f"{'Total':<12} {total:>5} {total-issues:>5} {issues:>6} {issues/total*100:.0f}%")
+
+
 if __name__ == "__main__":
-    main()
+    if "--summary" in sys.argv:
+        summary()
+    else:
+        main()
