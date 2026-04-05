@@ -25,6 +25,7 @@ run_test "Phone access control (TS)" "npx tsx tests/phone-access-control.test.ts
 run_test "Browser tools / STT (TS)" "npx tsx tests/browser-tools.test.ts"
 run_test "Security sanitization (Python)" "python3 tests/security-sanitization.test.py"
 run_test "Call log scanner (Python)" "python3 tests/call-log-scanner.test.py"
+run_test "Migration script (Bash)" "bash tests/migration.test.sh"
 
 echo
 echo "Passed: $PASSED  Failed: $FAILED"
