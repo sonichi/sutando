@@ -126,34 +126,15 @@ fi
 
 # 5b. Sutando context drop app (global hotkey ⌃C)
 if ! pgrep -f "Sutando" > /dev/null 2>&1; then
-  APP_BUNDLE="$REPO/src/Sutando/Sutando.app"
-  if [ -d "$APP_BUNDLE" ] && [ -f "$APP_BUNDLE/Contents/MacOS/Sutando" ]; then
-    echo "  Starting Sutando.app..."
-    open "$APP_BUNDLE"
+  if [ -f "$REPO/src/Sutando/Sutando" ]; then
+    echo "  Starting Sutando..."
+    "$REPO/src/Sutando/Sutando" > /dev/null 2>&1 &
     echo "  ✓ Sutando (⌃C/⌃V/⌃M)"
   elif [ -f "$REPO/src/Sutando/main.swift" ]; then
     echo "  Compiling Sutando..."
     if (cd "$REPO/src/Sutando" && swiftc -O -o Sutando main.swift -framework Cocoa -framework Carbon -framework ApplicationServices 2>/dev/null); then
-      # Create .app bundle
-      mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources"
-      cp "$REPO/src/Sutando/Sutando" "$APP_BUNDLE/Contents/MacOS/Sutando"
-      cat > "$APP_BUNDLE/Contents/Info.plist" << 'INFOPLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleExecutable</key><string>Sutando</string>
-    <key>CFBundleIdentifier</key><string>com.sutando.menubar</string>
-    <key>CFBundleName</key><string>Sutando</string>
-    <key>CFBundleVersion</key><string>1.0</string>
-    <key>CFBundlePackageType</key><string>APPL</string>
-    <key>LSUIElement</key><true/>
-    <key>NSHighResolutionCapable</key><true/>
-</dict>
-</plist>
-INFOPLIST
-      open "$APP_BUNDLE"
-      echo "  ✓ Sutando compiled and started as .app"
+      "$REPO/src/Sutando/Sutando" > /dev/null 2>&1 &
+      echo "  ✓ Sutando compiled and started"
     else
       echo "  ⚠ Sutando compile failed — hotkeys disabled"
     fi

@@ -143,7 +143,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         var voiceHotKeyID = EventHotKeyID()
         voiceHotKeyID.signature = OSType(0x5355_5444) // "SUTD"
         voiceHotKeyID.id = 2
-        RegisterEventHotKey(
+        let statusV = RegisterEventHotKey(
             UInt32(kVK_ANSI_V),
             UInt32(controlKey),
             voiceHotKeyID,
@@ -151,12 +151,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             0,
             &voiceHotKeyRef
         )
+        if statusV != noErr {
+            notify("Sutando", "Failed to register ⌃V hotkey (error \(statusV))")
+        }
 
         // Register ⌃M for mute toggle (hotkey ID 3)
         var muteHotKeyID = EventHotKeyID()
         muteHotKeyID.signature = OSType(0x5355_5444) // "SUTD"
         muteHotKeyID.id = 3
-        RegisterEventHotKey(
+        let statusM = RegisterEventHotKey(
             UInt32(kVK_ANSI_M),
             UInt32(controlKey),
             muteHotKeyID,
@@ -164,6 +167,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             0,
             &muteHotKeyRef
         )
+
+        notify("Sutando", "Hotkeys: ⌃C\(status == noErr ? "✓" : "✗") ⌃V\(statusV == noErr ? "✓" : "✗") ⌃M\(statusM == noErr ? "✓" : "✗")")
 
         // Install handler — dispatch by hotkey ID
         var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))

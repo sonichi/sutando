@@ -209,21 +209,32 @@ async function describeScreenshot(imagePath: string): Promise<string> {
 export const describeScreenTool: ToolDefinition = {
 	name: 'describe_screen',
 	description:
-		'Describe what is currently visible on screen WITHOUT scrolling. Use this to introduce/narrate the current view to the caller. Call this FIRST, then scroll separately when the caller is ready.',
-	parameters: z.object({}),
+		'Describe what is currently visible on screen WITHOUT scrolling. Captures ALL connected displays by default. Use this to introduce/narrate the current view to the caller. Pass display=2 for secondary only.',
+	parameters: z.object({
+		display: z.number().optional().describe('Specific display (1=main, 2=secondary). Omit to capture all.'),
+	}),
 	execution: 'inline',
-	async execute() {
+	async execute(args) {
 		if (demoState === 'done') return { status: 'done', description: 'Demo complete. Stop narrating. Tell the caller.' };
 		try {
-			const captureRes = await fetch('http://localhost:7845/capture');
-			const captureData = await captureRes.json() as { status: string; path?: string; error?: string };
+			const { display } = (args || {}) as { display?: number };
+			const query = display ? `?display=${display}` : '?all=true';
+			const captureRes = await fetch(`http://localhost:7845/capture${query}`);
+			const captureData = await captureRes.json() as { status: string; path?: string; all_paths?: string[]; error?: string };
 			if (captureData.status !== 'ok' || !captureData.path) {
 				return { error: `Could not capture screen: ${captureData.error || 'unknown'}` };
 			}
-			const description = await describeScreenshot(captureData.path);
+			const paths = captureData.all_paths || [captureData.path];
+			const descriptions: string[] = [];
+			for (let i = 0; i < paths.length; i++) {
+				const label = paths.length > 1 ? `Display ${i + 1}: ` : '';
+				const desc = await describeScreenshot(paths[i]);
+				descriptions.push(label + desc);
+			}
+			const fullDesc = descriptions.join(' | ');
 			if ((demoState as string) === 'done') return { status: 'done', description: 'Demo complete. Stop narrating.' };
-			console.log(`${ts()} [DescribeScreen] ${description.slice(0, 80)}...`);
-			return { status: 'ok', description, instruction: 'YOU MUST speak this description OUT LOUD to the caller NOW before calling any other tool.' };
+			console.log(`${ts()} [DescribeScreen] ${fullDesc.slice(0, 120)}...`);
+			return { status: 'ok', description: fullDesc, displays: paths.length, instruction: 'YOU MUST speak this description OUT LOUD to the caller NOW before calling any other tool.' };
 		} catch (err) {
 			return { error: `describe_screen failed: ${err instanceof Error ? err.message : err}` };
 		}
