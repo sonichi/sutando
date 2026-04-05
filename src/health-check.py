@@ -181,6 +181,21 @@ def run_all_checks() -> list[dict]:
         except Exception:
             checks.append({"name": "ngrok-tunnel", "status": "warn", "detail": "not running (inbound calls disabled)"})
 
+    # Webhook match (verify Twilio points to current tunnel — stale = silent call failure)
+    if has_twilio:
+        try:
+            result = subprocess.run(
+                ["bash", str(REPO_DIR / "src" / "check-webhook.sh")],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                checks.append({"name": "twilio-webhook", "status": "ok", "detail": "matches tunnel"})
+            elif result.returncode == 1:
+                checks.append({"name": "twilio-webhook", "status": "warn", "detail": "STALE — run check-webhook.sh --fix"})
+            # returncode 2 = ngrok not running (already covered above), skip
+        except Exception:
+            pass  # webhook check is best-effort
+
     # Messaging bridges (optional — only check if configured)
     channels_dir = Path.home() / ".claude" / "channels"
     for name, proc_name in [("telegram-bridge", "telegram-bridge"), ("discord-bridge", "discord-bridge")]:
