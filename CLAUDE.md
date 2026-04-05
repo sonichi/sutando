@@ -156,11 +156,15 @@ wacli chats list --limit 20
 wacli messages search "keyword" --limit 10
 ```
 
-**X (Twitter)** — post tweets with text, images, and video:
+**X (Twitter)** — post, search, read, and monitor:
 ```bash
-python3 src/x-post.py "Tweet text here"                                    # text only
-python3 src/x-post.py "Tweet with video" --media /path/to/video.mp4        # with video
-python3 src/x-post.py --reply-to 123456789 "Reply text"                    # reply
+python3 skills/x-twitter/x-post.py post "Tweet text"                       # post
+python3 skills/x-twitter/x-post.py post "With video" --media /path/to.mp4  # with media
+python3 skills/x-twitter/x-post.py search "query"                          # search recent
+python3 skills/x-twitter/x-post.py read 123456789                          # read tweet
+python3 skills/x-twitter/x-post.py mentions                                # recent @mentions
+python3 skills/x-twitter/x-post.py timeline                                # your tweets
+python3 skills/x-twitter/x-post.py engagement 123456789                    # likes/rt/views
 ```
 Requires X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET in .env.
 Always confirm post content with user before publishing.
