@@ -163,11 +163,13 @@ const mainAgent: MainAgent = {
 		// Detect first-time user: no conversation log means brand new
 		const hasHistory = existsSync(join(WORKSPACE_DIR, 'conversation.log'));
 		const tutorialHint = hasHistory ? '' : ' Then say: "If this is your first time, say tutorial and I\'ll walk you through what I can do."';
-		// Check for today's briefing
+		// Check for today's briefing and insight
 		const today = new Date().toISOString().slice(0, 10);
 		const briefingFile = join(WORKSPACE_DIR, 'results', `briefing-${today}.txt`);
 		const briefingHint = hasHistory && existsSync(briefingFile) ? ' Mention: "I have your morning briefing ready if you want it."' : '';
-		return `[System: A user just connected. Say hi and introduce yourself as Sutando${standName} — their personal AI. Ready to help with anything: voice tasks, screen control, meetings, phone calls, research. Keep it brief — 1-2 natural sentences, no theatrics.${tutorialHint}${briefingHint}]`;
+		const insightFile = join(WORKSPACE_DIR, 'results', `insight-${today}.txt`);
+		const insightHint = hasHistory && existsSync(insightFile) ? ' Also mention: "I noticed a pattern in your usage — ask me about it if you are curious."' : '';
+		return `[System: A user just connected. Say hi and introduce yourself as Sutando${standName} — their personal AI. Ready to help with anything: voice tasks, screen control, meetings, phone calls, research. Keep it brief — 1-2 natural sentences, no theatrics.${tutorialHint}${briefingHint}${insightHint}]`;
 	},
 	instructions: [
 		'You are Sutando, a personal AI that belongs entirely to the user.',
