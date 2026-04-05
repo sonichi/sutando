@@ -60,7 +60,23 @@ if [ -d "$HOME/scripts/sutando-personal" ]; then
   echo "  ✓ sutando-personal scripts"
 fi
 
-# 7. Behavioral flywheel data (conversation history, call logs, build log)
+# 7. Claude Code session (for --resume on new machine)
+SESSION_DIR="$HOME/.claude/projects/-Users-$(whoami)-Desktop-sutando"
+if [ -d "$SESSION_DIR" ]; then
+  mkdir -p "$BUNDLE/session"
+  # Copy most recent session JSONL (the active one)
+  LATEST=$(ls -t "$SESSION_DIR"/*.jsonl 2>/dev/null | head -1)
+  if [ -n "$LATEST" ]; then
+    cp "$LATEST" "$BUNDLE/session/"
+    SESSION_ID=$(basename "$LATEST" .jsonl)
+    echo "$SESSION_ID" > "$BUNDLE/session/session-id.txt"
+    echo "  ✓ session transcript ($(du -h "$LATEST" | cut -f1)) — ID: $SESSION_ID"
+  fi
+  # Copy session index if exists
+  [ -f "$SESSION_DIR/sessions-index.json" ] && cp "$SESSION_DIR/sessions-index.json" "$BUNDLE/session/"
+fi
+
+# 8. Behavioral flywheel data (conversation history, call logs, build log)
 mkdir -p "$BUNDLE/flywheel"
 [ -f "$REPO/session-state.md" ] && cp "$REPO/session-state.md" "$BUNDLE/flywheel/" && echo "  ✓ session-state.md"
 [ -f "$REPO/conversation.log" ] && cp "$REPO/conversation.log" "$BUNDLE/flywheel/" && echo "  ✓ conversation.log"
@@ -139,6 +155,18 @@ if [ -d "$BUNDLE_DIR/sutando-personal" ]; then
   mkdir -p "$HOME/scripts"
   cp -r "$BUNDLE_DIR/sutando-personal" "$HOME/scripts/sutando-personal"
   echo "  ✓ Personal scripts restored"
+fi
+
+# Restore Claude Code session
+if [ -d "$BUNDLE_DIR/session" ]; then
+  SESSION_DIR="$HOME/.claude/projects/-Users-$(whoami)-Desktop-sutando"
+  mkdir -p "$SESSION_DIR"
+  cp "$BUNDLE_DIR/session/"*.jsonl "$SESSION_DIR/" 2>/dev/null
+  [ -f "$BUNDLE_DIR/session/sessions-index.json" ] && cp "$BUNDLE_DIR/session/sessions-index.json" "$SESSION_DIR/"
+  if [ -f "$BUNDLE_DIR/session/session-id.txt" ]; then
+    SID=$(cat "$BUNDLE_DIR/session/session-id.txt")
+    echo "  ✓ Session restored — try: claude --resume $SID"
+  fi
 fi
 
 # Restore flywheel data
