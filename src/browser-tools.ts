@@ -152,9 +152,9 @@ export const typeTextTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { text } = args as { text: string };
+		// Fixes CodeQL #27 (js/command-line-injection): write to temp file instead of shell interpolation
 		const tmpFile = `/tmp/sutando-typetext-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.scpt`;
 		try {
-			// Write AppleScript to temp file to avoid shell injection via text content
 			const safeText = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 			writeFileSync(tmpFile, `tell application "System Events" to keystroke "${safeText}"`);
 			execSync(`osascript ${tmpFile}`, { timeout: 5_000 });

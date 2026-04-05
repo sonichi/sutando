@@ -416,6 +416,7 @@ load()
                 self.send_response(400)
                 self.end_headers()
                 return
+            # Fixes CodeQL #28-31 (py/path-injection): resolve + is_relative_to prevents symlink traversal
             notes_dir = (REPO_DIR / "notes").resolve()
             note_file = (notes_dir / f"{slug}.md").resolve()
             if not note_file.is_relative_to(notes_dir):
@@ -445,6 +446,7 @@ load()
                 self.send_response(400)
                 self.end_headers()
                 return
+            # Fixes CodeQL #28-31 (py/path-injection): resolve + is_relative_to prevents symlink traversal
             notes_dir = (REPO_DIR / "notes").resolve()
             note_file = (notes_dir / f"{slug}.md").resolve()
             if not note_file.is_relative_to(notes_dir):
