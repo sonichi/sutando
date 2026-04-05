@@ -211,11 +211,18 @@ export const captureScreenTool: ToolDefinition = {
 	async execute(args) {
 		try {
 			const { display } = args as { display?: number };
-			const query = display ? `?display=${display}` : '';
+			// If no display specified, capture all displays
+			const query = display ? `?display=${display}` : '?all=true';
 			const res = await fetch(`http://localhost:7845/capture${query}`);
-			const data = await res.json() as { status: string; path?: string; error?: string };
+			const data = await res.json() as { status: string; path?: string; all_paths?: string[]; displays?: number; error?: string };
 			if (data.status === 'ok' && data.path) {
-				console.log(`${ts()} [Screen] Captured${display ? ` display ${display}` : ''}: ${data.path}`);
+				const label = data.displays && data.displays > 1
+					? ` (${data.displays} displays)`
+					: display ? ` display ${display}` : '';
+				console.log(`${ts()} [Screen] Captured${label}: ${data.path}`);
+				if (data.all_paths && data.all_paths.length > 1) {
+					return { status: 'captured', paths: data.all_paths, displays: data.displays, note: 'Multiple displays captured. Each path is a separate screen.' };
+				}
 				return { status: 'captured', path: data.path };
 			}
 			return { status: 'failed', error: data.error || 'unknown error' };
