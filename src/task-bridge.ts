@@ -53,9 +53,10 @@ export const workTool: ToolDefinition = {
 	async execute(args) {
 		const { task } = args as { task: string };
 
-		// Reject screen-related tasks — these should use inline tools directly
-		const screenKeywords = /\b(describe|screen|scroll|capture|screenshot|narrat|introduc.*page|what.s on.*screen|look at.*screen)\b/i;
-		if (screenKeywords.test(task)) {
+		// Reject screen-viewing tasks — these should use inline tools directly
+		// Only reject "describe/view/look at screen" type tasks, not "fix screen" or "screen sharing" requests
+		const screenViewKeywords = /\b(describe.*(screen|page)|what.s on.*screen|look at.*screen|scroll.*(down|up|page)|capture.*screen|screenshot|narrat.*screen)\b/i;
+		if (screenViewKeywords.test(task)) {
 			return { status: 'rejected', message: 'Use inline tools directly: describe_screen, scroll. Do NOT use work for this.' };
 		}
 
