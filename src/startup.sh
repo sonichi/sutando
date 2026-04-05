@@ -11,7 +11,20 @@ echo "Sutando startup..."
 echo ""
 
 # Install dependencies if needed
-[ -d node_modules ] || npm install
+if [ ! -d node_modules ]; then
+  if command -v npm > /dev/null 2>&1 && npm install 2>/dev/null; then
+    echo "  ✓ Dependencies installed (npm)"
+  elif command -v pnpm > /dev/null 2>&1 && pnpm install 2>/dev/null; then
+    echo "  ✓ Dependencies installed (pnpm)"
+  elif command -v yarn > /dev/null 2>&1 && yarn install 2>/dev/null; then
+    echo "  ✓ Dependencies installed (yarn)"
+  else
+    echo "  ✗ Could not install dependencies."
+    echo "    Try: curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.0/install.sh | bash"
+    echo "    Then: nvm install 24 && npm install"
+    exit 1
+  fi
+fi
 
 # Check prerequisites
 missing=0
