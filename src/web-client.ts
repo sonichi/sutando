@@ -1492,15 +1492,17 @@ function renderTabContent() {
   } else if (tab === 'notes') {
     var DASH = 'http://' + window.location.hostname + ':7844';
     fetch(DASH + '/notes').then(function(r){return r.json()}).then(function(notes) {
+      var searchHtml = '<div style="margin-bottom:8px"><input id="note-search" type="text" placeholder="Search notes..." style="width:100%;padding:6px 10px;border-radius:8px;border:1px solid #1e1e30;background:#0e0e18;color:#ccc;font-size:12px;outline:none" oninput="filterNotes(this.value)"></div>';
       var html = '';
+      window._allNotes = notes;
       notes.forEach(function(n) {
-        html += '<div style="padding:6px 0;border-bottom:1px solid #2a2a3e;display:flex;align-items:center">' +
+        html += '<div class="note-item" data-title="' + esc(n.title).toLowerCase() + '" data-slug="' + n.slug + '" style="padding:6px 0;border-bottom:1px solid #2a2a3e;display:flex;align-items:center">' +
           '<span style="color:#7c83ff;cursor:pointer;flex:1" onclick="showNoteContent(&quot;' + n.slug + '&quot;)">' + n.title + '</span>' +
           '<span style="color:#666;font-size:11px;margin-right:8px">' + new Date(n.modified*1000).toLocaleDateString() + '</span>' +
           '<span style="color:#e94560;font-size:11px;cursor:pointer;opacity:0.5" onclick="event.stopPropagation();deleteNoteFromUI(&quot;' + n.slug + '&quot;)">x</span></div>';
       });
       if (!html) html = '<div style="color:#666;font-size:12px;text-align:center;padding:12px">No notes</div>';
-      container.innerHTML = html;
+      container.innerHTML = searchHtml + html;
     });
 
   } else if (tab === 'questions') {
@@ -1570,6 +1572,17 @@ function deleteNoteFromUI(slug) {
   });
 }
 window.deleteNoteFromUI = deleteNoteFromUI;
+
+function filterNotes(query) {
+  var items = document.querySelectorAll('.note-item');
+  var q = query.toLowerCase();
+  items.forEach(function(el) {
+    var title = el.getAttribute('data-title') || '';
+    var slug = el.getAttribute('data-slug') || '';
+    el.style.display = (!q || title.indexOf(q) >= 0 || slug.indexOf(q) >= 0) ? 'flex' : 'none';
+  });
+}
+window.filterNotes = filterNotes;
 
 function updateDynamicRegion() {
   var dr = document.getElementById('dynamic-region');
