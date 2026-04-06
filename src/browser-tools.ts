@@ -169,7 +169,7 @@ async function describeScreenshot(imagePath: string): Promise<string> {
 	const apiKey = process.env.GEMINI_API_KEY;
 	if (!apiKey) return 'Vision description unavailable (no GEMINI_API_KEY)';
 	try {
-		// Resize to 800px for faster API calls
+		// Fixes CodeQL #27 (js/command-line-injection): use execFileSync argv array instead of shell string
 		const safePath = imagePath.replace(/[^a-zA-Z0-9_\-./]/g, '');
 		const resized = safePath.endsWith('.png') ? safePath.replace(/\.png$/, '-sm.jpg') : safePath + '-sm.jpg';
 		try {
