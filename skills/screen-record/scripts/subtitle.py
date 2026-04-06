@@ -37,10 +37,12 @@ def find_live_transcript(video_path):
             if len(lines) < 2:
                 continue
             narration_lines = [l for l in content.split('\n') if re.match(r'\[\d{2}:\d{2}:\d{2}\] Sutando:', l)]
-            # Check file modification time proximity to recording
+            # Use both creation and modification time — recording may happen
+            # mid-call, so mtime (call end) can be much later than rec_epoch
             tf_mtime = os.path.getmtime(tf)
-            distance = abs(tf_mtime - rec_epoch)
-            if distance < 300:  # within 5 min
+            tf_ctime = os.stat(tf).st_birthtime  # macOS creation time
+            distance = min(abs(tf_mtime - rec_epoch), abs(tf_ctime - rec_epoch))
+            if distance < 600:  # within 10 min (calls can be long)
                 candidates.append((tf, content, distance, len(narration_lines)))
         except Exception:
             continue
@@ -48,14 +50,10 @@ def find_live_transcript(video_path):
     if not candidates:
         return None
 
-    # Prefer: closest timestamp, then most narration lines
-    candidates.sort(key=lambda c: (c[2], -c[3]))
+    # Prefer: most narration lines first, then closest timestamp
+    # The transcript with the most narration during a recording is usually the right one
+    candidates.sort(key=lambda c: (-c[3], c[2]))
     best = candidates[0]
-    # But if a further transcript has 3x more narration, prefer it
-    for c in candidates[1:]:
-        if c[3] >= best[3] * 3 and c[2] < 300:
-            best = c
-            break
 
     return (best[0], best[1])
 
