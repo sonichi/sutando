@@ -14,7 +14,7 @@
     "@types/ws": "^8.18.1",
     "ai": "^4.3.0",
     "bodhi-realtime-agent": "github:sonichi/bodhi_realtime_agent",
-    "dotenv": "^17.3.1",
+    "dotenv": "^17.4.1",
     "playwright": "^1.58.2",
     "ws": "^8.20.0",
     "zod": "^3.24.0"
