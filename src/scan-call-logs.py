@@ -211,7 +211,8 @@ def detect_recording_confusion(transcript: str) -> list[dict]:
     issues = []
     caller_lines = [l for l in transcript.split('\n') if 'Recipient:' in l or 'Caller:' in l]
     recording_complaints = [l for l in caller_lines
-                            if re.search(r'not started recording|you have not|haven.t started|still recording|stop.* record', l, re.IGNORECASE)]
+                            if re.search(r'not started recording|haven.t started record|still recording|stop.* record', l, re.IGNORECASE)
+                            and not re.search(r'entered any numbers|press \d|menu option', l, re.IGNORECASE)]
     if recording_complaints:
         issues.append({
             "pattern": "recording_confusion",
