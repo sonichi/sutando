@@ -61,20 +61,26 @@ def find_live_transcript(video_path):
 def transcript_to_srt(transcript_content, video_duration_s):
     """Convert live transcript lines to SRT format.
 
-    Only includes Sutando's narration lines (not caller lines).
-    Timestamps are relative to the first narration line.
+    Only includes Sutando's screen narration lines — descriptions of what's
+    on screen. Filters out conversational responses, tool acknowledgments, etc.
+    Timestamps are relative to the recording start time.
     """
     lines = []
     for line in transcript_content.split('\n'):
         m = re.match(r'\[(\d{2}:\d{2}:\d{2})\] Sutando: (.+)', line)
         if m:
             time_str, text = m.group(1), m.group(2)
-            # Skip non-narration lines
-            if any(skip in text.lower() for skip in [
-                'summoning', 'how can i help', 'let me check', 'switching to',
-                'closing', 'paused', 'the recording is complete',
-                'i\'m adding', 'still in progress', 'bye', 'goodbye'
-            ]):
+            # Only include screen descriptions (narration)
+            # These typically start with "The screen shows/displays" or describe visual content
+            is_narration = any(phrase in text.lower() for phrase in [
+                'the screen show', 'the screen display', 'the screen has',
+                'the page show', 'the page display',
+                'shows a', 'displays a', 'showing',
+                'the heading', 'the title',
+                'under the heading', 'with the heading',
+                'two ai-generated', 'two images',
+            ])
+            if not is_narration:
                 continue
             lines.append((time_str, text))
 
@@ -86,14 +92,26 @@ def transcript_to_srt(transcript_content, video_duration_s):
         h, m, s = map(int, t.split(':'))
         return h * 3600 + m * 60 + s
 
+    # Use first narration line as base (recording may have started slightly before)
     base_time = time_to_seconds(lines[0][0])
+    # If lines are too close together, space them out evenly across the video
+    total_span = time_to_seconds(lines[-1][0]) - base_time if len(lines) > 1 else 0
+    if total_span < 3 and len(lines) > 1:
+        # Timestamps are compressed — space evenly across video duration
+        interval = video_duration_s / len(lines)
+        spaced_lines = []
+        for i, (_, text) in enumerate(lines):
+            fake_time = i * interval
+            spaced_lines.append((fake_time, text))
+        lines_with_times = spaced_lines
+    else:
+        lines_with_times = [(time_to_seconds(t) - base_time, text) for t, text in lines]
     srt_entries = []
 
-    for i, (time_str, text) in enumerate(lines):
-        start_s = time_to_seconds(time_str) - base_time
+    for i, (start_s, text) in enumerate(lines_with_times):
         # End time: next line's start or start + estimated duration
-        if i + 1 < len(lines):
-            end_s = time_to_seconds(lines[i + 1][0]) - base_time
+        if i + 1 < len(lines_with_times):
+            end_s = lines_with_times[i + 1][0]
         else:
             # Last line: estimate 4 seconds or until video end
             end_s = min(start_s + 4, video_duration_s)
