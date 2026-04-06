@@ -206,6 +206,66 @@ def detect_identity_confusion(transcript: str) -> list[dict]:
     return issues
 
 
+def detect_recording_confusion(transcript: str) -> list[dict]:
+    """Detect recording state confusion — user thinks recording started/stopped when it didn't."""
+    issues = []
+    caller_lines = [l for l in transcript.split('\n') if 'Recipient:' in l or 'Caller:' in l]
+    recording_complaints = [l for l in caller_lines
+                            if re.search(r'not started recording|you have not|haven.t started|still recording|stop.* record', l, re.IGNORECASE)]
+    if recording_complaints:
+        issues.append({
+            "pattern": "recording_confusion",
+            "severity": "medium",
+            "category": "team-fixable",
+            "summary": f"Recording state confusion ({len(recording_complaints)} complaints)",
+            "fix_hint": "User expected recording to start/stop but it didn't. Check record tool state management.",
+        })
+    return issues
+
+
+def detect_scroll_frustration(transcript: str) -> list[dict]:
+    """Detect repeated scroll requests (3+) — scroll tool not working or wrong direction."""
+    issues = []
+    caller_lines = [l for l in transcript.split('\n') if 'Recipient:' in l or 'Caller:' in l]
+    scroll_requests = [l for l in caller_lines if re.search(r'scroll', l, re.IGNORECASE)]
+    if len(scroll_requests) >= 3:
+        # Check if user corrected direction
+        direction_change = any(re.search(r'scroll.*(up|top|down|bottom)', l, re.IGNORECASE) for l in scroll_requests)
+        issues.append({
+            "pattern": "scroll_frustration",
+            "severity": "medium",
+            "category": "team-fixable",
+            "summary": f"Scroll requested {len(scroll_requests)}x — tool may be unresponsive or wrong direction",
+            "fix_hint": "Check scroll tool execution, Gemini may be calling wrong direction or not executing.",
+        })
+    return issues
+
+
+def detect_stt_retry(transcript: str) -> list[dict]:
+    """Detect caller rephrasing the same request — likely STT garbling."""
+    issues = []
+    caller_lines = [l.split(':', 1)[1].strip().lower()
+                    for l in transcript.split('\n')
+                    if ('Recipient:' in l or 'Caller:' in l) and ':' in l]
+    retry_count = 0
+    for i in range(1, len(caller_lines)):
+        prev_words = set(caller_lines[i-1].split())
+        curr_words = set(caller_lines[i].split())
+        if len(prev_words) >= 3 and len(curr_words) >= 3:
+            overlap = len(prev_words & curr_words) / max(len(prev_words), len(curr_words))
+            if 0.3 < overlap < 0.9:  # similar but not identical = retry
+                retry_count += 1
+    if retry_count >= 2:
+        issues.append({
+            "pattern": "stt_retry",
+            "severity": "low",
+            "category": "team-fixable",
+            "summary": f"Caller rephrased {retry_count}x — possible STT recognition issues",
+            "fix_hint": "Add failing terms to vocabulary hints in system prompt (Option 1 from STT research).",
+        })
+    return issues
+
+
 # --- Scanner ---
 
 ALL_DETECTORS = [
@@ -217,6 +277,9 @@ ALL_DETECTORS = [
     detect_reconnect_leak,
     detect_repeated_command,
     detect_identity_confusion,
+    detect_recording_confusion,
+    detect_scroll_frustration,
+    detect_stt_retry,
 ]
 
 
