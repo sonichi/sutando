@@ -493,12 +493,18 @@ function findRecording(version?: 'raw' | 'narrated' | 'subtitled'): string | nul
 		const files = execSync('ls -t /tmp/sutando-recording-*.mov 2>/dev/null | grep -v narrated | grep -v subtitled | head -1', { timeout: 3_000 }).toString().trim();
 		if (files && existsSync(files)) {
 			if (version === 'raw') return files;
-			const subtitled = files.replace('.mov', '-narrated-subtitled.mov');
-			if (version === 'subtitled') return existsSync(subtitled) ? subtitled : files;
+			const narratedSubtitled = files.replace('.mov', '-narrated-subtitled.mov');
+			const subtitledOnly = files.replace('.mov', '-subtitled.mov');
 			const narrated = files.replace('.mov', '-narrated.mov');
+			if (version === 'subtitled') {
+				if (existsSync(narratedSubtitled)) return narratedSubtitled;
+				if (existsSync(subtitledOnly)) return subtitledOnly;
+				return files;
+			}
 			if (version === 'narrated') return existsSync(narrated) ? narrated : files;
-			// Default: prefer subtitled > narrated > raw
-			if (existsSync(subtitled)) return subtitled;
+			// Default: prefer narrated-subtitled > subtitled > narrated > raw
+			if (existsSync(narratedSubtitled)) return narratedSubtitled;
+			if (existsSync(subtitledOnly)) return subtitledOnly;
 			if (existsSync(narrated)) return narrated;
 			return files;
 		}
