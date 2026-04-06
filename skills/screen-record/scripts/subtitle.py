@@ -26,8 +26,7 @@ def find_live_transcript(video_path):
     match = re.search(r'recording-(\d+)', video_path)
     rec_epoch = int(match.group(1)) if match else int(video_mtime)
 
-    best_transcript = None
-    best_distance = float('inf')
+    candidates = []
 
     for tf in glob.glob('/tmp/sutando-live-transcript-CA*.txt'):
         try:
@@ -37,16 +36,28 @@ def find_live_transcript(video_path):
             lines = [l for l in content.split('\n') if l.startswith('[')]
             if len(lines) < 2:
                 continue
+            narration_lines = [l for l in content.split('\n') if re.match(r'\[\d{2}:\d{2}:\d{2}\] Sutando:', l)]
             # Check file modification time proximity to recording
             tf_mtime = os.path.getmtime(tf)
             distance = abs(tf_mtime - rec_epoch)
-            if distance < best_distance and distance < 300:  # within 5 min
-                best_distance = distance
-                best_transcript = (tf, content)
+            if distance < 300:  # within 5 min
+                candidates.append((tf, content, distance, len(narration_lines)))
         except Exception:
             continue
 
-    return best_transcript
+    if not candidates:
+        return None
+
+    # Prefer: closest timestamp, then most narration lines
+    candidates.sort(key=lambda c: (c[2], -c[3]))
+    best = candidates[0]
+    # But if a further transcript has 3x more narration, prefer it
+    for c in candidates[1:]:
+        if c[3] >= best[3] * 3 and c[2] < 300:
+            best = c
+            break
+
+    return (best[0], best[1])
 
 
 def transcript_to_srt(transcript_content, video_duration_s):
