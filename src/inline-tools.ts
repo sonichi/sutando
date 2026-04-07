@@ -529,6 +529,7 @@ else:
 				} catch { console.log(`${ts()} [Summon] No Join audio window to close`); }
 			} else {
 				// No phone dial-in — join computer audio so voice agent can hear the meeting
+				// On machines without mic (e.g. Mac Mini), dismiss any audio dialog
 				try {
 					execSync(`osascript -e '
 						tell application "zoom.us" to activate
@@ -536,29 +537,37 @@ else:
 						tell application "System Events"
 							tell process "zoom.us"
 								repeat with w in windows
-									if name of w is "Join audio" then
-										-- Click "Join with Computer Audio" button
+									set wName to name of w
+									if wName contains "audio" or wName contains "Audio" or wName is "Join audio" then
+										-- Try "Join with Computer Audio" button first
 										try
 											click button "Join with Computer Audio" of w
 											return "joined computer audio"
 										end try
 										-- Fallback: look for any button containing "Computer Audio"
 										repeat with b in buttons of w
-											if name of b contains "Computer Audio" then
-												click b
-												return "joined computer audio"
-											end if
+											try
+												if name of b contains "Computer Audio" then
+													click b
+													return "joined computer audio"
+												end if
+											end try
 										end repeat
-										-- Last resort: close the window
-										click button 1 of w
-										return "closed (no computer audio button found)"
+										-- No mic fallback: close any audio dialog to unblock the flow
+										try
+											click button 1 of w
+											return "dismissed audio dialog (no mic)"
+										end try
+										-- Nuclear option: Escape key
+										keystroke (ASCII character 27)
+										return "escaped audio dialog"
 									end if
 								end repeat
 							end tell
 						end tell
-					'`, { timeout: 5_000 });
-					console.log(`${ts()} [Summon] Joined computer audio`);
-				} catch { console.log(`${ts()} [Summon] No Join audio window found`); }
+					'`, { timeout: 8_000 });
+					console.log(`${ts()} [Summon] Handled audio dialog`);
+				} catch { console.log(`${ts()} [Summon] No audio dialog found`); }
 			}
 
 			// Wait for Zoom meeting window to appear (adaptive, up to 30s)
