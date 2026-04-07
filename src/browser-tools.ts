@@ -3,7 +3,7 @@
  * Split from inline-tools.ts for readability.
  */
 
-import { execSync } from 'node:child_process';
+import { execSync, execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
@@ -169,11 +169,11 @@ async function describeScreenshot(imagePath: string): Promise<string> {
 	const apiKey = process.env.GEMINI_API_KEY;
 	if (!apiKey) return 'Vision description unavailable (no GEMINI_API_KEY)';
 	try {
-		// Resize to 800px for faster API calls
+		// Fixes CodeQL #27 (js/command-line-injection): use execFileSync argv array instead of shell string
 		const safePath = imagePath.replace(/[^a-zA-Z0-9_\-./]/g, '');
-		const resized = safePath.replace('.png', '-sm.jpg');
+		const resized = safePath.endsWith('.png') ? safePath.replace(/\.png$/, '-sm.jpg') : safePath + '-sm.jpg';
 		try {
-			execSync(`sips -Z 800 -s format jpeg "${safePath}" --out "${resized}" 2>/dev/null`, { timeout: 2_000 });
+			execFileSync('sips', ['-Z', '800', '-s', 'format', 'jpeg', safePath, '--out', resized], { timeout: 2_000, stdio: 'ignore' });
 		} catch { /* use original if resize fails */ }
 		const actualPath = existsSync(resized) ? resized : imagePath;
 		const mimeType = actualPath.endsWith('.jpg') ? 'image/jpeg' : 'image/png';
