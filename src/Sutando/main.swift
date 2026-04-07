@@ -9,6 +9,7 @@ import UserNotifications
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var hotKeyRef: EventHotKeyRef?
+    var lastDropTime: Date = .distantPast
     var voiceHotKeyRef: EventHotKeyRef?
     var muteHotKeyRef: EventHotKeyRef?
     let workspace: String = {
@@ -200,6 +201,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Context Drop Logic
 
     @objc func dropContext() {
+        // Debounce: ignore if less than 1 second since last drop
+        let now = Date()
+        if now.timeIntervalSince(lastDropTime) < 1.0 {
+            logToFile("dropContext: debounced (too fast)")
+            return
+        }
+        lastDropTime = now
+
         let timestamp = ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withFullDate, .withTime, .withSpaceBetweenDateAndTime, .withColonSeparatorInTime])
         let dropFile = workspace + "/context-drop.txt"
         let logFile = workspace + "/src/context-drop.log"
