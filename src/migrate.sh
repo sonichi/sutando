@@ -231,6 +231,14 @@ cd "$REPO"
 # Python deps
 pip3 install google-genai discord.py python-telegram-bot Pillow 2>/dev/null || true
 
+# Install shared skills (external, not in repo)
+echo "Installing shared skills..."
+if which claude >/dev/null 2>&1; then
+  claude skill install odyssey4me/google-calendar 2>/dev/null && echo "  ✓ google-calendar skill" || echo "  ⚠ google-calendar skill — install manually: claude skill install odyssey4me/google-calendar"
+else
+  echo "  ⚠ Claude Code not in PATH — install skills after auth"
+fi
+
 echo ""
 echo "=== Setup complete ==="
 echo ""
