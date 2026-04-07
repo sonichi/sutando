@@ -32,6 +32,8 @@ Unmute to hear the real-time conversation. In this demo, the user controls their
 
 **Reach you anywhere.** Voice, Zoom, Google Meet, Telegram, Discord, web, phone, or email — same agent, same memory, any channel.
 
+**Scale across machines.** Plug in a second Mac and Sutando sets it up — the original agent opens a Discord channel, sends setup commands, and migrates services. The new machine handles phone calls 24/7 while your laptop stays portable. No migration scripts needed — the two agents coordinate the handoff themselves.
+
 ---
 
 ## Status: Alpha
@@ -40,7 +42,7 @@ This is an early-stage project. Honest status:
 
 | | Count | Details |
 |---|---|---|
-| **Verified working** | 29 | Voice, screen capture, notes, calendar, reminders, contacts, browser, phone calls, meeting dial-in, task delegation, pattern detection, health check, dashboard, Telegram, Discord, onboarding tutorial, and more |
+| **Verified working** | 30 | Voice, screen capture, notes, calendar, reminders, contacts, browser, phone calls, meeting dial-in, task delegation, pattern detection, health check, dashboard, Telegram, Discord, multi-machine migration, onboarding tutorial, and more |
 | **Needs external setup** | 3 | Twilio (phone), Telegram bot, Discord bot |
 
 We're looking for contributors to help test and harden these capabilities. If you try something and it breaks, [open an issue](https://github.com/sonichi/sutando/issues).
