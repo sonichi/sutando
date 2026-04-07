@@ -586,10 +586,9 @@ export const playRecordingTool: ToolDefinition = {
 			try {
 				execSync(`osascript -e '
 					tell application "QuickTime Player"
-						launch
+						activate
 						play document 1
 					end tell
-					tell application "zoom.us" to activate
 				'`, { timeout: 5_000 });
 			} catch {}
 			console.log(`${ts()} [PlayRecording] play from ${seekSec}s`);
