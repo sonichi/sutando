@@ -87,8 +87,10 @@ client = discord.Client(intents=intents)
 @client.event
 async def on_ready():
     print(f"Discord bridge ready: {client.user}")
-    # Start result polling loop
+    # Start polling loops
     client.loop.create_task(poll_results())
+    client.loop.create_task(poll_approved())
+    client.loop.create_task(poll_proactive())
 
 
 @client.event
@@ -172,11 +174,14 @@ async def on_message(message):
             access = {"dmPolicy": "pairing", "allowFrom": [], "pending": {}}
         code = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
         pending = access.get("pending", {})
+        # Clean expired codes
+        now_ms = int(time.time() * 1000)
+        pending = {k: v for k, v in pending.items() if v.get("expiresAt", 0) > now_ms}
         pending[code] = {
             "senderId": sender_id,
             "chatId": str(message.channel.id),
-            "createdAt": int(time.time() * 1000),
-            "expiresAt": int(time.time() * 1000) + 3600000,  # 1 hour
+            "createdAt": now_ms,
+            "expiresAt": now_ms + 3600000,  # 1 hour
         }
         access["pending"] = pending
         ACCESS_FILE.write_text(json.dumps(access, indent=2))
@@ -296,6 +301,27 @@ def save_to_allowlist(sender_id):
         ACCESS_FILE.write_text(json.dumps(data, indent=2))
 
 
+async def poll_approved():
+    """Poll approved/ dir and send 'you're in' confirmations."""
+    approved_dir = ACCESS_FILE.parent / "approved"
+    while True:
+        try:
+            if approved_dir.exists():
+                for f in approved_dir.iterdir():
+                    sender_id = f.name
+                    chat_id = f.read_text().strip()
+                    try:
+                        channel = await client.fetch_channel(int(chat_id))
+                        await channel.send(f"You're in! Access approved.")
+                        print(f"  Sent approval confirmation to {sender_id} in {chat_id}")
+                    except Exception as e:
+                        print(f"  Failed to send approval to {sender_id}: {e}")
+                    f.unlink(missing_ok=True)
+        except Exception as e:
+            print(f"  Approved poll error: {e}")
+        await asyncio.sleep(3)
+
+
 async def poll_results():
     """Poll results/ for replies to send back to Discord."""
     heartbeat_file = REPO / "src" / "discord-bridge.heartbeat"
@@ -347,6 +373,47 @@ async def poll_results():
                 task_file = TASKS_DIR / f"{task_id}.txt"
                 task_file.unlink(missing_ok=True)
         await asyncio.sleep(1)
+
+
+async def poll_proactive():
+    """Poll results/ for proactive messages and send to owner's DM."""
+    import re
+    while True:
+        try:
+            for f in RESULTS_DIR.iterdir():
+                if f.name.startswith("proactive-") and f.suffix == ".txt":
+                    text = f.read_text().strip()
+                    if not text:
+                        f.unlink(missing_ok=True)
+                        continue
+                    # Send to first owner in allowFrom
+                    allowed = load_allowed()
+                    if not allowed:
+                        print(f"  [proactive] no owner in allowFrom, skipping {f.name}")
+                        f.unlink(missing_ok=True)
+                        continue
+                    owner_id = next(iter(allowed))
+                    try:
+                        user = await client.fetch_user(int(owner_id))
+                        dm = await user.create_dm()
+                        # Extract files
+                        file_pattern = re.compile(r'\[(?:file|send|attach):\s*([^\]]+)\]')
+                        files = file_pattern.findall(text)
+                        clean_text = file_pattern.sub('', text).strip()
+                        if clean_text:
+                            for i in range(0, len(clean_text), 1900):
+                                await dm.send(clean_text[i:i+1900])
+                        for fpath in files:
+                            fpath = fpath.strip()
+                            if os.path.isfile(fpath):
+                                await dm.send(file=discord.File(fpath))
+                        print(f"  [proactive] sent to {owner_id}: {clean_text[:80]}")
+                    except Exception as e:
+                        print(f"  [proactive] failed to DM {owner_id}: {e}")
+                    f.unlink(missing_ok=True)
+        except Exception as e:
+            print(f"  [proactive] poll error: {e}")
+        await asyncio.sleep(3)
 
 
 if __name__ == "__main__":
