@@ -44,7 +44,7 @@ def transcribe(video_path):
             ["whisper", wav_path, "--model", "base", "--output_format", "srt", "--output_dir", srt_dir,
              "--language", "en", "--word_timestamps", "True",
              "--initial_prompt", VOCAB_HINT],
-            capture_output=True, timeout=120
+            capture_output=True, timeout=300
         )
 
         srt_path = os.path.join(srt_dir, os.path.basename(wav_path).replace(".wav", ".srt"))
