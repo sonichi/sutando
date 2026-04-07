@@ -909,7 +909,8 @@ function connectWs() {
     } catch (err) {
       dbg('Mic error: ' + err.message, 'err');
       setStatus('Mic error', 'error');
-      addSystem('Microphone access denied. Please allow and retry.');
+      addSystem('Microphone access denied. Please allow mic in browser settings and retry.');
+      connected = false;  // prevent auto-reconnect loop
       ws.close();
     }
   };
