@@ -502,16 +502,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func notify(_ title: String, _ message: String) {
         logToFile("notify: \(title) — \(message)")
-        let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = message
-        content.sound = .default
-        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request) { error in
-            if let error = error {
-                NSLog("Sutando: notification error: \(error.localizedDescription)")
-            }
-        }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/terminal-notifier")
+        process.arguments = ["-title", title, "-message", message, "-sound", "default", "-group", "sutando"]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try? process.run()
     }
 
     @objc func restartServices() {
