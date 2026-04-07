@@ -173,12 +173,45 @@ else
   echo "  ~ discord bridge (no token — optional)"
 fi
 
+# 8. Phone conversation server + ngrok (optional — needs Twilio creds)
+if grep -q "TWILIO_ACCOUNT_SID=" .env 2>/dev/null; then
+  if ! pgrep -f "conversation-server" > /dev/null 2>&1; then
+    echo "  Starting conversation server..."
+    npx tsx skills/phone-conversation/scripts/conversation-server.ts > /tmp/conversation-server.log 2>&1 &
+    echo "  ✓ conversation server (port 3100)"
+  else
+    echo "  ✓ conversation server (already running)"
+  fi
+  if ! pgrep -f "ngrok" > /dev/null 2>&1; then
+    echo "  Starting ngrok tunnel..."
+    ngrok http 3100 --log=stdout > /tmp/ngrok.log 2>&1 &
+    sleep 3
+    NGROK_URL=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['tunnels'][0]['public_url'])" 2>/dev/null || echo "")
+    if [ -n "$NGROK_URL" ]; then
+      # Update WEBHOOK_BASE_URL in .env
+      if grep -q "WEBHOOK_BASE_URL=" .env; then
+        sed -i '' "s|WEBHOOK_BASE_URL=.*|WEBHOOK_BASE_URL=$NGROK_URL|" .env
+      else
+        echo "WEBHOOK_BASE_URL=$NGROK_URL" >> .env
+      fi
+      echo "  ✓ ngrok ($NGROK_URL)"
+      echo "  ⚠ Update Twilio webhook to: $NGROK_URL"
+    else
+      echo "  ✗ ngrok (failed to start)"
+    fi
+  else
+    echo "  ✓ ngrok (already running)"
+  fi
+else
+  echo "  ~ conversation server (no Twilio creds — optional)"
+fi
+
 echo ""
 
 # Verify services actually started (wait a moment, then check ports)
 sleep 3
 echo "Verifying services..."
-for port_name in "9900:voice-agent" "8080:web-client" "7844:dashboard" "7843:agent-api" "7845:screen-capture"; do
+for port_name in "9900:voice-agent" "8080:web-client" "7844:dashboard" "7843:agent-api" "7845:screen-capture" "3100:conversation-server"; do
   port="${port_name%%:*}"
   name="${port_name##*:}"
   if lsof -i :"$port" > /dev/null 2>&1; then

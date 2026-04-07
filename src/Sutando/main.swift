@@ -1,5 +1,6 @@
 import Cocoa
 import Carbon
+import UserNotifications
 
 // MARK: - Sutando Drop Menu Bar App
 // Replaces Automator Quick Action for context drops.
@@ -31,10 +32,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var lastResultCount = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        setupMenuBar()
-        registerHotKey()
-        watchResults()
-        notify("Sutando Drop", "Ready — press ⌃C to drop context")
+        // Request notification permission
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, error in
+            NSLog("Sutando: notification permission granted=\(granted) error=\(String(describing: error))")
+        }
+        DispatchQueue.main.async { [self] in
+            setupMenuBar()
+            registerHotKey()
+            watchResults()
+            logToFile("App started, workspace=\(workspace)")
+        }
     }
 
     // MARK: - Result notifications (when voice is not connected)
@@ -169,7 +176,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             &muteHotKeyRef
         )
 
-        notify("Sutando", "Hotkeys: ⌃C\(status == noErr ? "✓" : "✗") ⌃V\(statusV == noErr ? "✓" : "✗") ⌃M\(statusM == noErr ? "✓" : "✗")")
+        logToFile("registerHotKey: C=\(status) V=\(statusV) M=\(statusM)")
 
         // Install handler — dispatch by hotkey ID
         var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
@@ -179,6 +186,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                               EventParamType(typeEventHotKeyID), nil,
                               MemoryLayout<EventHotKeyID>.size, nil, &hotKeyID)
             let appDelegate = NSApplication.shared.delegate as! AppDelegate
+            appDelegate.logToFile("HOTKEY FIRED: id=\(hotKeyID.id)")
             switch hotKeyID.id {
             case 1: appDelegate.dropContext()
             case 2: appDelegate.toggleVoice()
@@ -294,55 +302,37 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Voice Toggle
 
     @objc func toggleVoice() {
-        // Click the voice button in Chrome via AppleScript
-        let script = NSAppleScript(source: """
-        tell application "Google Chrome"
-            set found to false
-            repeat with w in windows
-                repeat with t in tabs of w
-                    if URL of t contains "localhost:8080" then
-                        tell t to execute javascript "document.querySelector('.btn-hero, .btn-voice').click()"
-                        set found to true
-                        exit repeat
-                    end if
-                end repeat
-                if found then exit repeat
-            end repeat
-            if not found then
-                open location "http://localhost:8080"
-            end if
-        end tell
-        """)
-        var error: NSDictionary?
-        script?.executeAndReturnError(&error)
-        if let error = error {
-            let msg = error[NSAppleScript.errorMessage] as? String ?? ""
-            if msg.contains("not allowed") || msg.contains("JavaScript") || msg.contains("permission") {
-                notify("Sutando", "⌃V needs: Chrome → View → Developer → Allow JavaScript from Apple Events")
-            }
-        }
-        NSSound.beep()
+        NSLog("Sutando: toggleVoice called")
+        // Toggle voice via HTTP — no Chrome JavaScript permission needed
+        httpToggle(endpoint: "toggle")
     }
 
     @objc func toggleMute() {
-        // Click the mute button in Chrome via AppleScript
-        let script = NSAppleScript(source: """
-        tell application "Google Chrome"
-            repeat with w in windows
-                repeat with t in tabs of w
-                    if URL of t contains "localhost:8080" then
-                        tell t to execute javascript "document.querySelector('.btn-mute').click()"
-                        exit repeat
-                    end if
-                end repeat
-            end repeat
-        end tell
-        """)
-        script?.executeAndReturnError(nil)
+        NSLog("Sutando: toggleMute called")
+        httpToggle(endpoint: "mute")
+    }
+
+    func httpToggle(endpoint: String) {
+        guard let url = URL(string: "http://localhost:8080/\(endpoint)") else { return }
+        let task = URLSession.shared.dataTask(with: url) { data, response, error in
+            if let error = error {
+                NSLog("Sutando: \(endpoint) failed: \(error.localizedDescription)")
+                // Fallback: open the web UI so user can toggle manually
+                DispatchQueue.main.async {
+                    self.notify("Sutando", "Web client not reachable — open localhost:8080")
+                }
+                return
+            }
+            if let http = response as? HTTPURLResponse, http.statusCode == 200 {
+                NSLog("Sutando: \(endpoint) OK")
+            }
+        }
+        task.resume()
         NSSound.beep()
     }
 
     @objc func openWebUI() {
+        NSLog("Sutando: openWebUI called")
         // Switch to existing localhost:8080 tab or open new one
         let script = NSAppleScript(source: """
         tell application "Google Chrome"
@@ -365,7 +355,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             end if
         end tell
         """)
-        script?.executeAndReturnError(nil)
+        var error: NSDictionary?
+        script?.executeAndReturnError(&error)
+        if let error = error {
+            let msg = error[NSAppleScript.errorMessage] as? String ?? "unknown error"
+            if msg.contains("not allowed") || msg.contains("permission") {
+                notify("Sutando", "Open Web UI needs: System Settings → Privacy & Security → Automation → allow Sutando to control Chrome")
+            } else {
+                // Fallback: just open the URL directly
+                if let url = URL(string: "http://localhost:8080") {
+                    NSWorkspace.shared.open(url)
+                }
+            }
+        }
     }
 
     @objc func openCore() {
@@ -484,18 +486,86 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         try? taskContent.write(toFile: taskPath, atomically: true, encoding: .utf8)
     }
 
+    func logToFile(_ msg: String) {
+        let path = workspace + "/src/sutando-app-debug.log"
+        let line = "\(ISO8601DateFormatter().string(from: Date())) \(msg)\n"
+        if let fh = FileHandle(forWritingAtPath: path) {
+            fh.seekToEndOfFile()
+            fh.write(Data(line.utf8))
+            fh.closeFile()
+        } else {
+            FileManager.default.createFile(atPath: path, contents: Data(line.utf8))
+        }
+    }
+
     func notify(_ title: String, _ message: String) {
-        // Spawn osascript subprocess — in-process NSAppleScript doesn't show banners
-        let escaped = message.replacingOccurrences(of: "\"", with: "\\\"")
-        let script = "display notification \"\(escaped)\" with title \"\(title)\" sound name \"Ping\""
-        // Audio beep as immediate confirmation
+        logToFile("notify: \(title) — \(message)")
+        // Play sound for immediate feedback
         NSSound.beep()
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", script]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        try? process.run()
+        // Show floating HUD window (no notification permissions needed)
+        DispatchQueue.main.async { [self] in
+            showHUD(title: title, message: message)
+        }
+    }
+
+    var hudWindow: NSWindow?
+    var hudTimer: Timer?
+
+    func showHUD(title: String, message: String) {
+        hudTimer?.invalidate()
+        hudWindow?.orderOut(nil)
+
+        let width: CGFloat = 320
+        let height: CGFloat = 60
+        guard let screen = NSScreen.main else {
+            logToFile("showHUD: no main screen")
+            return
+        }
+        let x = screen.visibleFrame.midX - width / 2
+        let y = screen.visibleFrame.maxY - height - 12
+
+        let window = NSWindow(contentRect: NSRect(x: x, y: y, width: width, height: height),
+                              styleMask: [.borderless],
+                              backing: .buffered, defer: false)
+        window.level = .screenSaver  // above everything
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = true
+        window.ignoresMouseEvents = true
+        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+
+        // Rounded dark background
+        let bg = NSVisualEffectView(frame: window.contentView!.bounds)
+        bg.material = .hudWindow
+        bg.blendingMode = .behindWindow
+        bg.state = .active
+        bg.wantsLayer = true
+        bg.layer?.cornerRadius = 10
+        bg.layer?.masksToBounds = true
+        window.contentView?.addSubview(bg)
+
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.font = NSFont.boldSystemFont(ofSize: 13)
+        titleLabel.textColor = .white
+        titleLabel.frame = NSRect(x: 12, y: 30, width: width - 24, height: 20)
+
+        let bodyLabel = NSTextField(labelWithString: String(message.prefix(120)))
+        bodyLabel.font = NSFont.systemFont(ofSize: 11)
+        bodyLabel.textColor = NSColor(white: 0.85, alpha: 1)
+        bodyLabel.frame = NSRect(x: 12, y: 8, width: width - 24, height: 18)
+        bodyLabel.lineBreakMode = .byTruncatingTail
+
+        window.contentView?.addSubview(titleLabel)
+        window.contentView?.addSubview(bodyLabel)
+        window.orderFrontRegardless()
+        hudWindow = window
+        logToFile("showHUD: displayed at \(x),\(y) size \(width)x\(height)")
+
+        hudTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.hudWindow?.orderOut(nil)
+            }
+        }
     }
 
     @objc func restartServices() {
@@ -522,6 +592,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             try? proc.run()
             proc.waitUntilExit()
         }
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        return false  // keep running as menu bar app even when HUD closes
     }
 
     @objc func quit() {

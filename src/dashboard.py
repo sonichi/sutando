@@ -85,6 +85,8 @@ def get_quota_status() -> dict:
     """Read quota state from quota-state.json (written by credential proxy)."""
     quota_file = REPO_DIR / "quota-state.json"
     if not quota_file.exists():
+        quota_file = REPO_DIR / "skills" / "quota-tracker" / "quota-state.json"
+    if not quota_file.exists():
         return {"available": True}
     try:
         data = json.loads(quota_file.read_text())
@@ -311,7 +313,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(html.encode())
         elif urlparse(self.path).path == "/avatar":
-            avatar_file = REPO_DIR / "docs" / "stand-avatar.png"
+            avatar_file = REPO_DIR / "stand-avatar.png"
+            if not avatar_file.exists():
+                avatar_file = REPO_DIR / "docs" / "stand-avatar.png"
             if avatar_file.exists():
                 self.send_response(200)
                 self.send_header("Content-Type", "image/png")

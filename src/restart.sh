@@ -16,6 +16,7 @@ pkill -f "telegram-bridge" 2>/dev/null
 pkill -f "discord-bridge" 2>/dev/null
 pkill -f "watch-tasks" 2>/dev/null
 pkill -f "conversation-server" 2>/dev/null
+pkill -f "ngrok" 2>/dev/null
 pkill -f "credential-proxy" 2>/dev/null
 pkill -f "src/Sutando/Sutando" 2>/dev/null
 echo "  All services stopped"

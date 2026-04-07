@@ -226,6 +226,26 @@ def main():
                 # Send typing indicator
                 api("sendChatAction", chat_id=chat_id, action="typing")
 
+        # Check for proactive messages to send to owner
+        try:
+            for f in RESULTS_DIR.iterdir():
+                if f.name.startswith("proactive-") and f.suffix == ".txt":
+                    text = f.read_text().strip()
+                    if not text:
+                        f.unlink(missing_ok=True)
+                        continue
+                    owner_ids = load_allowed()
+                    if owner_ids:
+                        owner_id = next(iter(owner_ids))
+                        try:
+                            send_reply(int(owner_id), text)
+                            print(f"  [proactive] sent to {owner_id}: {text[:80]}")
+                        except Exception as e:
+                            print(f"  [proactive] failed: {e}")
+                    f.unlink(missing_ok=True)
+        except Exception as e:
+            print(f"  [proactive] poll error: {e}")
+
         # Check for results to send back
         for task_id in list(pending_replies.keys()):
             result_file = RESULTS_DIR / f"{task_id}.txt"

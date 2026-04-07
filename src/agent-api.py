@@ -226,16 +226,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if pq_file.exists():
                 import re
                 content = pq_file.read_text()
-                for m in re.finditer(r'## (Q\d+) — (.+?)\n\n(.+?)\n\n\*\*Status:\*\* (\w+)', content, re.DOTALL):
-                    if m.group(4) == "Waiting":
-                        detail = m.group(3).strip()
-                        q = {"id": m.group(1), "text": m.group(2), "detail": detail}
-                        # Parse custom options if present
-                        opts_match = re.search(r'\*\*Options:\*\*\s*(.+)', detail)
-                        if opts_match:
-                            q["options"] = [o.strip() for o in opts_match.group(1).split("|")]
-                            q["detail"] = detail[:opts_match.start()].strip()
-                        questions.append(q)
+                # Split into sections by ## headers
+                sections = re.split(r'^## ', content, flags=re.MULTILINE)
+                for i, section in enumerate(sections):
+                    if not section.strip():
+                        continue
+                    lines = section.strip().split('\n')
+                    title = lines[0].strip()
+                    body = '\n'.join(lines[1:])
+                    # Skip preamble (sections without question metadata)
+                    if '**Asked:**' not in body and '**Question:**' not in body:
+                        continue
+                    # Skip resolved/answered questions
+                    if re.search(r'\*\*Status:\*\*\s*(resolved|answered|done)', body, re.IGNORECASE):
+                        continue
+                    # Extract question text
+                    q_match = re.search(r'\*\*Question:\*\*\s*(.+)', body)
+                    q_text = q_match.group(1).strip() if q_match else title
+                    q = {"id": f"Q{i}", "text": title, "detail": q_text}
+                    # Parse custom options if present
+                    opts_match = re.search(r'\*\*Options:\*\*\s*(.+)', body)
+                    if opts_match:
+                        q["options"] = [o.strip() for o in opts_match.group(1).split("|")]
+                    questions.append(q)
             self.send_json(200, {"tasks": tasks, "watcher": watcher_ok, "claude": claude_ok, "questions": questions})
         elif path.startswith("/result/"):
             task_id = path[len("/result/"):]
@@ -510,11 +523,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pq_file = REPO_DIR / "pending-questions.md"
                 if pq_file.exists():
                     content = pq_file.read_text()
-                    # Update status from Waiting to answered
+                    # Update status from unanswered to answered
                     import re
-                    pattern = rf'(## {re.escape(qid)} — .+?\n\n)(.*?)(\n\n\*\*Status:\*\* )Waiting'
                     safe_answer = answer.replace('\n', ' ')
-                    new_content = re.sub(pattern, lambda m: m.group(1) + m.group(2) + m.group(3) + 'Answered: ' + safe_answer, content, flags=re.DOTALL)
+                    # Try new format: - **Status:** unanswered
+                    pattern = rf'(## [^\n]*\n(?:.*?\n)*?- \*\*Status:\*\* )unanswered'
+                    # Find the right section by matching the question ID
+                    sections = re.split(r'(^## )', content, flags=re.MULTILINE)
+                    new_content = content
+                    # Reconstruct and find the section matching this qid
+                    idx = 0
+                    for si, section in enumerate(re.split(r'^## ', content, flags=re.MULTILINE)):
+                        if not section.strip():
+                            continue
+                        lines = section.strip().split('\n')
+                        title = lines[0].strip()
+                        body = '\n'.join(lines[1:])
+                        if '**Asked:**' not in body and '**Question:**' not in body:
+                            continue
+                        if re.search(r'\*\*Status:\*\*\s*(resolved|answered|done)', body, re.IGNORECASE):
+                            continue
+                        idx += 1
+                        if f"Q{idx}" == qid:
+                            old_status = re.search(r'- \*\*Status:\*\* unanswered', body)
+                            if old_status:
+                                new_body = body.replace('- **Status:** unanswered', f'- **Status:** answered: {safe_answer}')
+                                new_content = content.replace(body, new_body)
+                            break
                     if new_content != content:
                         pq_file.write_text(new_content)
                         # Also write as a task so the agent picks it up

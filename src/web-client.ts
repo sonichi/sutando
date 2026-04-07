@@ -405,6 +405,14 @@ window.addEventListener('DOMContentLoaded', () => {
   try { if (sessionStorage.getItem('sutando-voice')) { setTimeout(() => toggle(), 500); } } catch {}
 });
 
+// ─── Remote toggle via SSE ────────────────────────────────
+(function initRemoteToggle() {
+  const evtSource = new EventSource('/sse');
+  evtSource.addEventListener('toggle-voice', () => toggle());
+  evtSource.addEventListener('toggle-mute', () => toggleMute());
+  evtSource.onerror = () => setTimeout(() => initRemoteToggle(), 5000);
+})();
+
 // ─── State ────────────────────────────────────────────────
 let ws = null;
 let audioCtx = null;
@@ -909,7 +917,8 @@ function connectWs() {
     } catch (err) {
       dbg('Mic error: ' + err.message, 'err');
       setStatus('Mic error', 'error');
-      addSystem('Microphone access denied. Please allow and retry.');
+      addSystem('Microphone access denied. Please allow mic in browser settings and retry.');
+      connected = false;  // prevent auto-reconnect loop
       ws.close();
     }
   };
@@ -1692,7 +1701,38 @@ updateDynamicRegion();
 </body>
 </html>`;
 
-const server = createServer((_req, res) => {
+// SSE clients for remote toggle
+const sseClients: import('node:http').ServerResponse[] = [];
+
+const server = createServer((req, res) => {
+	const url = new URL(req.url || '/', `http://${req.headers.host}`);
+
+	if (url.pathname === '/sse') {
+		res.writeHead(200, {
+			'Content-Type': 'text/event-stream',
+			'Cache-Control': 'no-cache',
+			'Connection': 'keep-alive',
+			'Access-Control-Allow-Origin': '*',
+		});
+		res.write(':\n\n'); // heartbeat
+		sseClients.push(res);
+		req.on('close', () => {
+			const idx = sseClients.indexOf(res);
+			if (idx >= 0) sseClients.splice(idx, 1);
+		});
+		return;
+	}
+
+	if (url.pathname === '/toggle' || url.pathname === '/mute') {
+		const event = url.pathname === '/toggle' ? 'toggle-voice' : 'toggle-mute';
+		for (const client of sseClients) {
+			client.write(`event: ${event}\ndata: 1\n\n`);
+		}
+		res.writeHead(200, { 'Content-Type': 'application/json' });
+		res.end(JSON.stringify({ ok: true, event, clients: sseClients.length }));
+		return;
+	}
+
 	res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
 	res.end(HTML);
 });
