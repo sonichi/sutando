@@ -12,7 +12,7 @@
     "@anthropic-ai/claude-agent-sdk": "^0.1.0",
     "@google/genai": "^1.41.0",
     "@types/ws": "^8.18.1",
-    "ai": "^4.3.0",
+    "ai": "^6.0.149",
     "bodhi-realtime-agent": "github:sonichi/bodhi_realtime_agent",
     "dotenv": "^17.4.1",
     "playwright": "^1.58.2",
