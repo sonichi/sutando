@@ -282,6 +282,7 @@ async def on_message(message):
         f"access_tier: {access_tier}\n"
     )
     pending_replies[task_id] = message.channel
+    save_pending_replies()
 
     # Typing indicator
     async with message.channel.typing():
@@ -322,8 +323,31 @@ async def poll_approved():
         await asyncio.sleep(3)
 
 
+PENDING_REPLIES_FILE = REPO / "src" / ".discord-pending-replies.json"
+
+def save_pending_replies():
+    """Persist pending_replies channel IDs to disk for crash recovery."""
+    try:
+        data = {k: str(v.id) for k, v in pending_replies.items()}
+        PENDING_REPLIES_FILE.write_text(json.dumps(data))
+    except Exception:
+        pass
+
+def load_pending_replies_from_disk():
+    """Load pending_replies from disk on startup (channel IDs only — resolved lazily)."""
+    try:
+        if PENDING_REPLIES_FILE.exists():
+            return json.loads(PENDING_REPLIES_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+# Recovered replies: task_id → channel_id (str) — not yet resolved to channel objects
+_recovered_replies = load_pending_replies_from_disk()
+
 async def poll_results():
     """Poll results/ for replies to send back to Discord."""
+    global _recovered_replies
     heartbeat_file = REPO / "src" / "discord-bridge.heartbeat"
     last_heartbeat = 0
     while True:
@@ -335,12 +359,24 @@ async def poll_results():
                 last_heartbeat = now
             except Exception:
                 pass
+
+        # Merge recovered replies into pending_replies (resolve channel objects)
+        for task_id, channel_id_str in list(_recovered_replies.items()):
+            if task_id not in pending_replies:
+                try:
+                    channel = await client.fetch_channel(int(channel_id_str))
+                    pending_replies[task_id] = channel
+                except Exception as e:
+                    print(f"  [recovery] failed to resolve channel {channel_id_str}: {e}")
+            del _recovered_replies[task_id]
+
         for task_id in list(pending_replies.keys()):
             result_file = RESULTS_DIR / f"{task_id}.txt"
             if result_file.exists():
                 import re
                 reply_text = result_file.read_text().strip()
                 channel = pending_replies.pop(task_id)
+                save_pending_replies()
                 # Skip sending if already replied directly (core agent used MCP)
                 if reply_text.startswith('[no-send]') or reply_text.startswith('[REPLIED]'):
                     print(f"  Skipped (already replied): {task_id}")
