@@ -31,10 +31,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var lastResultCount = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        setupMenuBar()
-        registerHotKey()
-        watchResults()
-        notify("Sutando Drop", "Ready — press ⌃C to drop context")
+        DispatchQueue.main.async { [self] in
+            setupMenuBar()
+            registerHotKey()
+            watchResults()
+            logToFile("App started, workspace=\(workspace)")
+            notify("Sutando Drop", "Ready — press ⌃C to drop context")
+        }
     }
 
     // MARK: - Result notifications (when voice is not connected)
@@ -169,6 +172,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             &muteHotKeyRef
         )
 
+        logToFile("registerHotKey: C=\(status) V=\(statusV) M=\(statusM)")
         notify("Sutando", "Hotkeys: ⌃C\(status == noErr ? "✓" : "✗") ⌃V\(statusV == noErr ? "✓" : "✗") ⌃M\(statusM == noErr ? "✓" : "✗")")
 
         // Install handler — dispatch by hotkey ID
@@ -179,6 +183,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                               EventParamType(typeEventHotKeyID), nil,
                               MemoryLayout<EventHotKeyID>.size, nil, &hotKeyID)
             let appDelegate = NSApplication.shared.delegate as! AppDelegate
+            appDelegate.logToFile("HOTKEY FIRED: id=\(hotKeyID.id)")
             switch hotKeyID.id {
             case 1: appDelegate.dropContext()
             case 2: appDelegate.toggleVoice()
@@ -294,6 +299,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Voice Toggle
 
     @objc func toggleVoice() {
+        NSLog("Sutando: toggleVoice called")
         // Click the voice button in Chrome via AppleScript
         let script = NSAppleScript(source: """
         tell application "Google Chrome"
@@ -343,6 +349,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func openWebUI() {
+        NSLog("Sutando: openWebUI called")
         // Switch to existing localhost:8080 tab or open new one
         let script = NSAppleScript(source: """
         tell application "Google Chrome"
@@ -365,7 +372,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             end if
         end tell
         """)
-        script?.executeAndReturnError(nil)
+        var error: NSDictionary?
+        script?.executeAndReturnError(&error)
+        if let error = error {
+            let msg = error[NSAppleScript.errorMessage] as? String ?? "unknown error"
+            if msg.contains("not allowed") || msg.contains("permission") {
+                notify("Sutando", "Open Web UI needs: System Settings → Privacy & Security → Automation → allow Sutando to control Chrome")
+            } else {
+                // Fallback: just open the URL directly
+                if let url = URL(string: "http://localhost:8080") {
+                    NSWorkspace.shared.open(url)
+                }
+            }
+        }
     }
 
     @objc func openCore() {
@@ -484,7 +503,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         try? taskContent.write(toFile: taskPath, atomically: true, encoding: .utf8)
     }
 
+    func logToFile(_ msg: String) {
+        let path = workspace + "/src/sutando-app-debug.log"
+        let line = "\(ISO8601DateFormatter().string(from: Date())) \(msg)\n"
+        if let fh = FileHandle(forWritingAtPath: path) {
+            fh.seekToEndOfFile()
+            fh.write(Data(line.utf8))
+            fh.closeFile()
+        } else {
+            FileManager.default.createFile(atPath: path, contents: Data(line.utf8))
+        }
+    }
+
     func notify(_ title: String, _ message: String) {
+        logToFile("notify: \(title) — \(message)")
         // Spawn osascript subprocess — in-process NSAppleScript doesn't show banners
         let escaped = message.replacingOccurrences(of: "\"", with: "\\\"")
         let script = "display notification \"\(escaped)\" with title \"\(title)\" sound name \"Ping\""
