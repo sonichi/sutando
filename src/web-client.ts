@@ -1209,7 +1209,7 @@ function answerQuestion(qid, answer) {
       var qParent = qItem ? qItem.closest('.q-item') : null;
       if (qParent) {
         var actions = qParent.querySelector('.q-actions');
-        if (actions) actions.innerHTML = '<span style="color:#4ecca3;font-size:12px">Answered: ' + esc(answer.trim().substring(0, 60)) + '</span>';
+        if (actions) actions.innerHTML = '<span style="color:#4ecca3;font-size:12px">Answered: ' + esc(answer.trim()) + '</span>';
       }
       // Remove after brief delay so user sees confirmation
       setTimeout(function() {

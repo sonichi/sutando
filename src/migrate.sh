@@ -45,6 +45,10 @@ fi
 for f in stand-identity.json stand-avatar.png tab-aliases.json PERSONAL_CLAUDE.md; do
   [ -f "$REPO/$f" ] && cp "$REPO/$f" "$BUNDLE/" && echo "  ✓ $f"
 done
+# Gitignored repo files (inside subdirectories)
+for f in skills/schedule-crons/crons.json; do
+  [ -f "$REPO/$f" ] && mkdir -p "$BUNDLE/repo-gitignored/$(dirname $f)" && cp "$REPO/$f" "$BUNDLE/repo-gitignored/$f" && echo "  ✓ $f"
+done
 
 # 5. Google credentials (gmail — encrypted creds + token cache)
 if [ -d "$HOME/.config/gws" ]; then
@@ -198,6 +202,10 @@ fi
 for f in stand-identity.json stand-avatar.png tab-aliases.json PERSONAL_CLAUDE.md; do
   [ -f "$BUNDLE_DIR/$f" ] && cp "$BUNDLE_DIR/$f" "$REPO/" && echo "  ✓ $f restored"
 done
+# Restore gitignored repo files (crons.json, etc.)
+if [ -d "$BUNDLE_DIR/repo-gitignored" ]; then
+  cp -r "$BUNDLE_DIR/repo-gitignored/"* "$REPO/" 2>/dev/null && echo "  ✓ gitignored repo files restored (crons.json, etc.)"
+fi
 
 # Copy Google credentials (gmail)
 if [ -d "$BUNDLE_DIR/gws" ]; then

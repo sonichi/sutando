@@ -153,12 +153,13 @@ def run_all_checks() -> list[dict]:
     # Notes
     checks.append(check_directory(REPO_DIR / "notes", "notes-dir"))
 
-    # Phone conversation server (optional — only check if Twilio configured)
+    # Phone conversation server (optional — only check if Twilio configured and not skipped)
     env_path = REPO_DIR / ".env"
     if env_path.exists():
         env_content = env_path.read_text()
         has_twilio = "TWILIO_ACCOUNT_SID=" in env_content and not env_content.split("TWILIO_ACCOUNT_SID=")[1].startswith("\n")
-        if has_twilio:
+        skip_phone = "SKIP_PHONE=1" in env_content or os.environ.get("SKIP_PHONE") == "1"
+        if has_twilio and not skip_phone:
             c = check_port(3100, "conversation-server")
             if c["status"] != "ok":
                 c["status"] = "warn"
@@ -174,10 +175,13 @@ def run_all_checks() -> list[dict]:
                     ngrok_c["detail"] = "not running — phone calls won't reach server"
                 checks.append(ngrok_c)
 
-    # Messaging bridges (optional — only check if configured)
+    # Messaging bridges (optional — only check if configured and not skipped)
+    skip_telegram = (env_path.exists() and "SKIP_TELEGRAM=1" in env_path.read_text()) or os.environ.get("SKIP_TELEGRAM") == "1"
     channels_dir = Path.home() / ".claude" / "channels"
     for name, proc_name in [("telegram-bridge", "telegram-bridge"), ("discord-bridge", "discord-bridge")]:
         channel_name = name.replace("-bridge", "")
+        if channel_name == "telegram" and skip_telegram:
+            continue
         env_file = channels_dir / channel_name / ".env"
         access_file = channels_dir / channel_name / "access.json"
         # Check if configured via either .env or access.json

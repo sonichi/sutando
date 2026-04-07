@@ -145,8 +145,10 @@ fi
 
 echo ""
 
-# 6. Telegram bridge (optional — needs TELEGRAM_BOT_TOKEN)
-if [ -f "$HOME/.claude/channels/telegram/.env" ] && grep -q "TELEGRAM_BOT_TOKEN=" "$HOME/.claude/channels/telegram/.env" 2>/dev/null; then
+# 6. Telegram bridge (optional — needs TELEGRAM_BOT_TOKEN, skip with SKIP_TELEGRAM=1)
+if [ "${SKIP_TELEGRAM:-}" = "1" ]; then
+  echo "  ~ telegram bridge (skipped via SKIP_TELEGRAM)"
+elif [ -f "$HOME/.claude/channels/telegram/.env" ] && grep -q "TELEGRAM_BOT_TOKEN=" "$HOME/.claude/channels/telegram/.env" 2>/dev/null; then
   if ! pgrep -f "telegram-bridge" > /dev/null 2>&1; then
     echo "  Starting Telegram bridge..."
     python3 src/telegram-bridge.py > src/telegram-bridge.log 2>&1 &
@@ -173,8 +175,10 @@ else
   echo "  ~ discord bridge (no token — optional)"
 fi
 
-# 8. Phone conversation server + ngrok (optional — needs Twilio creds)
-if grep -q "TWILIO_ACCOUNT_SID=" .env 2>/dev/null; then
+# 8. Phone conversation server + ngrok (optional — needs Twilio creds, skip with SKIP_PHONE=1)
+if [ "${SKIP_PHONE:-}" = "1" ]; then
+  echo "  ~ conversation server (skipped via SKIP_PHONE)"
+elif grep -q "TWILIO_ACCOUNT_SID=" .env 2>/dev/null; then
   if ! pgrep -f "conversation-server" > /dev/null 2>&1; then
     echo "  Starting conversation server..."
     npx tsx skills/phone-conversation/scripts/conversation-server.ts > /tmp/conversation-server.log 2>&1 &
@@ -211,7 +215,11 @@ echo ""
 # Verify services actually started (wait a moment, then check ports)
 sleep 3
 echo "Verifying services..."
-for port_name in "9900:voice-agent" "8080:web-client" "7844:dashboard" "7843:agent-api" "7845:screen-capture" "3100:conversation-server"; do
+VERIFY_PORTS="9900:voice-agent 8080:web-client 7844:dashboard 7843:agent-api 7845:screen-capture"
+if [ "${SKIP_PHONE:-}" != "1" ] && grep -q "TWILIO_ACCOUNT_SID=" .env 2>/dev/null; then
+  VERIFY_PORTS="$VERIFY_PORTS 3100:conversation-server"
+fi
+for port_name in $VERIFY_PORTS; do
   port="${port_name%%:*}"
   name="${port_name##*:}"
   if lsof -i :"$port" > /dev/null 2>&1; then
