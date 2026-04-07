@@ -467,17 +467,14 @@ export function startRecordingNarration(session: any): void {
 	}, durationMs + 1000); // +1s buffer for auto-stop to finish
 }
 
-function findRecording(version?: 'raw' | 'narrated' | 'subtitled'): string | null {
+function findRecording(version?: 'raw' | 'narrated'): string | null {
 	try {
 		const files = execSync('ls -t /tmp/sutando-recording-*.mov 2>/dev/null | grep -v narrated | grep -v subtitled | head -1', { timeout: 3_000 }).toString().trim();
 		if (files && existsSync(files)) {
 			if (version === 'raw') return files;
-			const subtitled = files.replace('.mov', '-narrated-subtitled.mov');
-			if (version === 'subtitled') return existsSync(subtitled) ? subtitled : files;
 			const narrated = files.replace('.mov', '-narrated.mov');
 			if (version === 'narrated') return existsSync(narrated) ? narrated : files;
-			// Default: prefer subtitled > narrated > raw
-			if (existsSync(subtitled)) return subtitled;
+			// Default: prefer narrated > raw
 			if (existsSync(narrated)) return narrated;
 			return files;
 		}
@@ -495,11 +492,11 @@ export const playRecordingTool: ToolDefinition = {
 	parameters: z.object({
 		action: z.enum(['open', 'play', 'pause', 'stop', 'close', 'replay', 'status']).default('open'),
 		path: z.string().optional().describe('File path. Omit for latest screen recording.'),
-		version: z.enum(['raw', 'narrated', 'subtitled']).optional().describe('Which version: "raw" (no narration), "narrated", or "subtitled". Omit for best available.'),
+		version: z.enum(['raw', 'narrated']).optional().describe('Which version: "raw" (no narration) or "narrated" (with voice). Omit for best available. For subtitles, use the work tool to add them.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		let { action, path: filePath, version } = args as { action: 'open' | 'play' | 'pause' | 'stop' | 'close' | 'replay' | 'status'; path?: string; version?: 'raw' | 'narrated' | 'subtitled' };
+		let { action, path: filePath, version } = args as { action: 'open' | 'play' | 'pause' | 'stop' | 'close' | 'replay' | 'status'; path?: string; version?: 'raw' | 'narrated' };
 		const isReplay = action === 'replay';
 		if (action === 'stop') action = 'pause';
 		if (isReplay) action = 'play';
