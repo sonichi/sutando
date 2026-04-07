@@ -6,6 +6,7 @@
 # The incoming session reads this in CLAUDE.md or as part of the proactive loop.
 
 REPO="$HOME/Desktop/sutando"
+export PATH="/opt/homebrew/bin:$HOME/.nvm/versions/node/v24.14.1/bin:$PATH"
 STATE_FILE="$REPO/session-state.md"
 TRANSCRIPT="$1"  # Passed by PreCompact hook as $TRANSCRIPT_PATH
 
@@ -48,11 +49,13 @@ TRANSCRIPT="$1"  # Passed by PreCompact hook as $TRANSCRIPT_PATH
 
   # Quota (with reset times)
   echo "## Quota"
-  if [ -f "$REPO/quota-state.json" ]; then
+  QUOTA_FILE="$REPO/skills/quota-tracker/quota-state.json"
+  [ ! -f "$QUOTA_FILE" ] && QUOTA_FILE="$REPO/quota-state.json"
+  if [ -f "$QUOTA_FILE" ]; then
     python3 -c "
 import json
 from datetime import datetime
-d=json.load(open('$REPO/quota-state.json'))
+d=json.load(open('$QUOTA_FILE'))
 now=datetime.now()
 r5=datetime.fromtimestamp(int(d['headers']['anthropic-ratelimit-unified-5h-reset']))
 m5=int((r5-now).total_seconds()/60)
