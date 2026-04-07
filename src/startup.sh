@@ -42,6 +42,14 @@ fi
 if [ $missing -eq 1 ]; then echo ""; echo "Fix the above and try again."; exit 1; fi
 
 # Check macOS permissions (can't grant programmatically, just warn)
+# Prevent display sleep (important for always-on Mac Mini — Zoom/summon fails on lock screen)
+if ! pgrep -q caffeinate; then
+  caffeinate -d -i -s &
+  echo "  ✓ caffeinate started (prevents display sleep)"
+else
+  echo "  ✓ caffeinate already running"
+fi
+
 echo "Checking permissions..."
 if ! screencapture -x /tmp/sutando-permcheck.png 2>/dev/null; then
   echo "  ⚠ Screen Recording not granted"
