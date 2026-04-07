@@ -164,6 +164,15 @@ def run_all_checks() -> list[dict]:
                 c["status"] = "warn"
                 c["detail"] = "not running (starts on demand)"
             checks.append(c)
+            # ngrok tunnel (required when conversation-server is running)
+            if c["status"] == "ok":
+                ngrok_c = check_port(4040, "ngrok")
+                if ngrok_c["status"] == "ok":
+                    ngrok_c["detail"] = "tunnel active (port 4040)"
+                else:
+                    ngrok_c["status"] = "warn"
+                    ngrok_c["detail"] = "not running — phone calls won't reach server"
+                checks.append(ngrok_c)
 
     # Messaging bridges (optional — only check if configured)
     channels_dir = Path.home() / ".claude" / "channels"
