@@ -314,17 +314,10 @@ export const scrollAndDescribeTool: ToolDefinition = {
 				scrolledTotal += pxPerStep;
 			}, SCROLL_INTERVAL_MS);
 
-			// Auto-stop after duration, then auto-subtitle using live transcript
+			// Auto-stop after duration
 			setTimeout(() => {
 				clearInterval(scrollInterval);
-				try {
-					const stopResult = execSync('python3 skills/screen-record/scripts/record.py stop', { timeout: 10_000 }).toString().trim();
-					const stopParsed = JSON.parse(stopResult);
-					if (stopParsed.path) {
-						// Auto-subtitle in background — uses live transcript, no Whisper
-						setTimeout(() => autoSubtitle(stopParsed.path), 500);
-					}
-				} catch {}
+				try { execSync('python3 skills/screen-record/scripts/record.py stop', { timeout: 10_000 }); } catch {}
 				demoState = 'done';
 				console.log(`${ts()} [ScrollAndDescribe] auto-stop`);
 			}, duration_seconds * 1000);
@@ -349,25 +342,6 @@ export const recordingState = { muted: false };
 /** Stop any active screen recording */
 export function stopActiveRecording(): void {
 	try { execSync('python3 skills/screen-record/scripts/record.py stop', { timeout: 5_000 }); } catch {}
-}
-
-/** Auto-subtitle a recording using live transcript (no Whisper needed).
- *  Runs in background — doesn't block the call. Logs result. */
-export function autoSubtitle(videoPath: string): void {
-	try {
-		const result = execSync(
-			`python3 skills/screen-record/scripts/subtitle.py "${videoPath}"`,
-			{ timeout: 30_000 }
-		).toString().trim();
-		const parsed = JSON.parse(result);
-		if (parsed.status === 'done') {
-			console.log(`${ts()} [AutoSubtitle] done: ${parsed.path} (${parsed.size_mb}MB)`);
-		} else {
-			console.log(`${ts()} [AutoSubtitle] failed: ${parsed.error || 'unknown'}`);
-		}
-	} catch (err) {
-		console.log(`${ts()} [AutoSubtitle] error: ${err instanceof Error ? err.message : err}`);
-	}
 }
 
 /** Check if a recording is currently active */
@@ -498,18 +472,12 @@ function findRecording(version?: 'raw' | 'narrated' | 'subtitled'): string | nul
 		const files = execSync('ls -t /tmp/sutando-recording-*.mov 2>/dev/null | grep -v narrated | grep -v subtitled | head -1', { timeout: 3_000 }).toString().trim();
 		if (files && existsSync(files)) {
 			if (version === 'raw') return files;
-			const narratedSubtitled = files.replace('.mov', '-narrated-subtitled.mov');
-			const subtitledOnly = files.replace('.mov', '-subtitled.mov');
+			const subtitled = files.replace('.mov', '-narrated-subtitled.mov');
+			if (version === 'subtitled') return existsSync(subtitled) ? subtitled : files;
 			const narrated = files.replace('.mov', '-narrated.mov');
-			if (version === 'subtitled') {
-				if (existsSync(narratedSubtitled)) return narratedSubtitled;
-				if (existsSync(subtitledOnly)) return subtitledOnly;
-				return files;
-			}
 			if (version === 'narrated') return existsSync(narrated) ? narrated : files;
-			// Default: prefer narrated-subtitled > subtitled > narrated > raw
-			if (existsSync(narratedSubtitled)) return narratedSubtitled;
-			if (existsSync(subtitledOnly)) return subtitledOnly;
+			// Default: prefer subtitled > narrated > raw
+			if (existsSync(subtitled)) return subtitled;
 			if (existsSync(narrated)) return narrated;
 			return files;
 		}
@@ -671,25 +639,12 @@ export const screenRecordTool: ToolDefinition = {
 				demoState = 'recording';
 				const capped = Math.min(duration_seconds || 20, 60);
 				setTimeout(() => {
-					try {
-						const stopRes = execSync('python3 skills/screen-record/scripts/record.py stop', { timeout: 10_000 }).toString().trim();
-						const stopData = JSON.parse(stopRes);
-						if (stopData.path) {
-							setTimeout(() => autoSubtitle(stopData.path), 500);
-						}
-					} catch {}
+					try { execSync('python3 skills/screen-record/scripts/record.py stop', { timeout: 10_000 }); } catch {}
 					demoState = 'done';
 					console.log(`${ts()} [ScreenRecord] auto-stop after ${capped}s (requested ${duration_seconds}s)`);
 				}, capped * 1000);
 			}
-			if (action === 'stop') {
-				demoState = 'done';
-				// Auto-subtitle using live transcript
-				const stopParsed = JSON.parse(result);
-				if (stopParsed.path) {
-					setTimeout(() => autoSubtitle(stopParsed.path), 500);
-				}
-			}
+			if (action === 'stop') demoState = 'done';
 			const parsed = JSON.parse(result);
 			console.log(`${ts()} [ScreenRecord] ${action}: ${result}`);
 			return parsed;
