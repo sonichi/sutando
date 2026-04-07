@@ -228,7 +228,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 content = pq_file.read_text()
                 for m in re.finditer(r'## (Q\d+) — (.+?)\n\n(.+?)\n\n\*\*Status:\*\* (\w+)', content, re.DOTALL):
                     if m.group(4) == "Waiting":
-                        questions.append({"id": m.group(1), "text": m.group(2), "detail": m.group(3).strip()})
+                        detail = m.group(3).strip()
+                        q = {"id": m.group(1), "text": m.group(2), "detail": detail}
+                        # Parse custom options if present
+                        opts_match = re.search(r'\*\*Options:\*\*\s*(.+)', detail)
+                        if opts_match:
+                            q["options"] = [o.strip() for o in opts_match.group(1).split("|")]
+                            q["detail"] = detail[:opts_match.start()].strip()
+                        questions.append(q)
             self.send_json(200, {"tasks": tasks, "watcher": watcher_ok, "claude": claude_ok, "questions": questions})
         elif path.startswith("/result/"):
             task_id = path[len("/result/"):]

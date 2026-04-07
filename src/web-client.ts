@@ -1515,8 +1515,11 @@ function renderTabContent() {
           return '<div class="q-item"><b>' + esc(q.id) + '</b>: ' + esc(q.text) +
             (q.detail ? '<div style="color:#999;font-size:11px;margin-top:2px;white-space:pre-wrap">' + esc(q.detail) + '</div>' : '') +
             '<div class="q-actions">' +
+            (q.options ? q.options.map(function(opt) {
+              return '<button class="q-btn" data-qid="' + q.id + '" data-ans="' + esc(opt) + '" style="border-color:#4ecca366;color:#4ecca3">' + esc(opt) + '</button>';
+            }).join('') :
             '<button class="q-btn q-yes" data-qid="' + q.id + '" data-ans="Yes">Yes</button>' +
-            '<button class="q-btn q-no" data-qid="' + q.id + '" data-ans="No">No</button>' +
+            '<button class="q-btn q-no" data-qid="' + q.id + '" data-ans="No">No</button>') +
             '<input class="q-input" data-qid="' + q.id + '" placeholder="Or type a response...">' +
             '<button class="q-btn q-send" data-qid="' + q.id + '">Send</button>' +
             '</div></div>';

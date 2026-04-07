@@ -42,7 +42,7 @@ if [ -d "$HOME/.claude" ]; then
 fi
 
 # 4. Gitignored runtime files
-for f in stand-identity.json tab-aliases.json PERSONAL_CLAUDE.md; do
+for f in stand-identity.json stand-avatar.png tab-aliases.json PERSONAL_CLAUDE.md; do
   [ -f "$REPO/$f" ] && cp "$REPO/$f" "$BUNDLE/" && echo "  ✓ $f"
 done
 
@@ -89,31 +89,82 @@ fi
 cat > "$BUNDLE/setup-new-mac.sh" << 'SETUP'
 #!/bin/bash
 # Sutando New Mac Setup — run after transferring migration bundle
-set -e
+# No set -e — we handle errors gracefully so PATH fixes always run
 
 echo "=== Sutando New Mac Setup ==="
+echo ""
 
-# Install prerequisites
-echo "Installing prerequisites..."
-which brew >/dev/null || /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-brew install fswatch ffmpeg python3 node 2>/dev/null || true
+# ── 1. Homebrew ──
+echo "Step 1/6: Homebrew..."
+if ! which brew >/dev/null 2>&1; then
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+fi
+# Always load brew into this shell
+eval "$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null || eval "$(/usr/local/bin/brew shellenv)" 2>/dev/null || true
+grep -q 'brew shellenv' ~/.zshrc 2>/dev/null || echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zshrc
+which brew >/dev/null 2>&1 && echo "  ✓ Homebrew" || echo "  ✗ Homebrew failed"
 
-# Install Claude Code (native installer — recommended, auto-updates)
-echo "Installing Claude Code..."
-curl -fsSL https://claude.ai/install.sh | bash
+# ── 2. System packages ──
+echo "Step 2/6: System packages..."
+brew install fswatch ffmpeg python3 2>/dev/null
+echo "  ✓ fswatch, ffmpeg, python3"
 
-# Clone repo
+# ── 3. Node.js via nvm ──
+echo "Step 3/6: Node.js..."
+export NVM_DIR="$HOME/.nvm"
+if [ ! -d "$NVM_DIR" ]; then
+  curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+fi
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+if ! which node >/dev/null 2>&1; then
+  nvm install 24
+fi
+which node >/dev/null 2>&1 && echo "  ✓ Node.js $(node -v)" || echo "  ✗ Node.js failed"
+
+# ── 4. Claude Code ──
+echo "Step 4/6: Claude Code..."
+if ! which claude >/dev/null 2>&1; then
+  curl -fsSL https://claude.ai/install.sh | bash 2>/dev/null || true
+fi
+export PATH="$HOME/.local/bin:$PATH"
+grep -q '.local/bin' ~/.zshrc 2>/dev/null || echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+which claude >/dev/null 2>&1 && echo "  ✓ Claude Code" || echo "  ✗ Claude Code — install manually: https://docs.anthropic.com/en/docs/claude-code"
+
+# ── 5. Clone repo + install deps ──
+echo "Step 5/6: Repository..."
+BUNDLE_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO="$HOME/Desktop/sutando"
-if [ ! -d "$REPO" ]; then
+
+# Save bundle files BEFORE git clone (clone would overwrite them)
+SAVED="/tmp/sutando-bundle-saved"
+rm -rf "$SAVED" && mkdir -p "$SAVED"
+cp -r "$BUNDLE_DIR"/* "$SAVED/" 2>/dev/null || true
+cp "$BUNDLE_DIR"/.env "$SAVED/" 2>/dev/null || true
+
+if [ ! -d "$REPO/.git" ]; then
   git clone https://github.com/sonichi/sutando.git "$REPO"
 fi
 cd "$REPO"
+# Re-source nvm in case shell lost it after cd
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+npm install 2>/dev/null || echo "  ⚠ npm install had issues — will retry on startup"
 
-# Install npm deps
-npm install
+# Use saved bundle dir for restore steps below
+BUNDLE_DIR="$SAVED"
+
+# ── Verify all deps ──
+echo ""
+echo "Dependency check:"
+for cmd in brew node npm claude fswatch python3 git; do
+  which $cmd >/dev/null 2>&1 && echo "  ✓ $cmd" || echo "  ✗ $cmd NOT FOUND"
+done
+echo ""
+
+# ── 6. Restore all bundle files ──
+echo "Step 6/6: Restoring files..."
 
 # Copy .env
-BUNDLE_DIR="$(cd "$(dirname "$0")" && pwd)"
 [ -f "$BUNDLE_DIR/.env" ] && cp "$BUNDLE_DIR/.env" "$REPO/.env" && echo "  ✓ .env restored"
 
 # Copy memory
@@ -134,7 +185,7 @@ if [ -d "$BUNDLE_DIR/claude-config" ]; then
 fi
 
 # Copy gitignored files
-for f in stand-identity.json tab-aliases.json PERSONAL_CLAUDE.md; do
+for f in stand-identity.json stand-avatar.png tab-aliases.json PERSONAL_CLAUDE.md; do
   [ -f "$BUNDLE_DIR/$f" ] && cp "$BUNDLE_DIR/$f" "$REPO/" && echo "  ✓ $f restored"
 done
 
@@ -184,23 +235,27 @@ echo ""
 echo "=== Setup complete ==="
 echo ""
 echo "Next steps:"
-echo "  1. Run: bash src/startup.sh"
-echo "  2. Grant macOS permissions when prompted (Screen Recording, Accessibility, Notifications)"
-echo "  3. Start the proactive loop: /proactive-loop"
+echo "  1. Authenticate Claude Code: claude auth login"
+echo "  2. Run: bash src/startup.sh"
+echo "  3. Grant macOS permissions when prompted (Screen Recording, Accessibility, Notifications)"
+echo "  4. Start the proactive loop: /proactive-loop"
 echo ""
 echo "Note: Google Calendar uses macOS keyring — run the calendar script once to re-authenticate."
 echo "      Gmail (gws) credentials are transferred but may need token refresh."
 SETUP
 chmod +x "$BUNDLE/setup-new-mac.sh"
 
-# Create tarball
+# Create tarball (wraps in sutando-migration/ directory so extract is clean)
 cd "$HOME/Desktop"
-tar czf sutando-migration.tar.gz -C "$BUNDLE" .
+mv "$BUNDLE" "$HOME/Desktop/sutando-migration"
+tar czf sutando-migration.tar.gz sutando-migration
 echo ""
 echo "=== Bundle created ==="
 echo "  $(du -h "$HOME/Desktop/sutando-migration.tar.gz" | cut -f1) → ~/Desktop/sutando-migration.tar.gz"
 echo ""
-echo "Transfer to new Mac, extract, and run: bash setup-new-mac.sh"
+echo "Transfer to new Mac and run:"
+echo "  tar xzf sutando-migration.tar.gz"
+echo "  bash sutando-migration/setup-new-mac.sh"
 
 # Cleanup
-rm -rf "$BUNDLE"
+rm -rf "$HOME/Desktop/sutando-migration"

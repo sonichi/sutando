@@ -28,6 +28,8 @@ Collect from each source (skip any that aren't configured):
 
 6. **Daily insight** — Run `python3 src/daily-insight.py`. If it produces an insight, include it at the end of the briefing as "💡 Insight: ..."
 
+7. **Friction check** — Run `python3 src/friction-detector.py`. If friction items found, include as "⚠️ Friction: [count] items need attention" with the top 3.
+
 ## How to deliver
 
 Format as a concise briefing:
