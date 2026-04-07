@@ -41,7 +41,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             registerHotKey()
             watchResults()
             logToFile("App started, workspace=\(workspace)")
-            notify("Sutando Drop", "Ready — press ⌃C to drop context")
         }
     }
 
@@ -178,7 +177,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
 
         logToFile("registerHotKey: C=\(status) V=\(statusV) M=\(statusM)")
-        notify("Sutando", "Hotkeys: ⌃C\(status == noErr ? "✓" : "✗") ⌃V\(statusV == noErr ? "✓" : "✗") ⌃M\(statusM == noErr ? "✓" : "✗")")
 
         // Install handler — dispatch by hotkey ID
         var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
@@ -502,12 +500,72 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func notify(_ title: String, _ message: String) {
         logToFile("notify: \(title) — \(message)")
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/terminal-notifier")
-        process.arguments = ["-title", title, "-message", message, "-sound", "default", "-group", "sutando"]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        try? process.run()
+        // Play sound for immediate feedback
+        NSSound.beep()
+        // Show floating HUD window (no notification permissions needed)
+        DispatchQueue.main.async { [self] in
+            showHUD(title: title, message: message)
+        }
+    }
+
+    var hudWindow: NSWindow?
+    var hudTimer: Timer?
+
+    func showHUD(title: String, message: String) {
+        hudTimer?.invalidate()
+        hudWindow?.orderOut(nil)
+
+        let width: CGFloat = 320
+        let height: CGFloat = 60
+        guard let screen = NSScreen.main else {
+            logToFile("showHUD: no main screen")
+            return
+        }
+        let x = screen.visibleFrame.midX - width / 2
+        let y = screen.visibleFrame.maxY - height - 12
+
+        let window = NSWindow(contentRect: NSRect(x: x, y: y, width: width, height: height),
+                              styleMask: [.borderless],
+                              backing: .buffered, defer: false)
+        window.level = .screenSaver  // above everything
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = true
+        window.ignoresMouseEvents = true
+        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+
+        // Rounded dark background
+        let bg = NSVisualEffectView(frame: window.contentView!.bounds)
+        bg.material = .hudWindow
+        bg.blendingMode = .behindWindow
+        bg.state = .active
+        bg.wantsLayer = true
+        bg.layer?.cornerRadius = 10
+        bg.layer?.masksToBounds = true
+        window.contentView?.addSubview(bg)
+
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.font = NSFont.boldSystemFont(ofSize: 13)
+        titleLabel.textColor = .white
+        titleLabel.frame = NSRect(x: 12, y: 30, width: width - 24, height: 20)
+
+        let bodyLabel = NSTextField(labelWithString: String(message.prefix(120)))
+        bodyLabel.font = NSFont.systemFont(ofSize: 11)
+        bodyLabel.textColor = NSColor(white: 0.85, alpha: 1)
+        bodyLabel.frame = NSRect(x: 12, y: 8, width: width - 24, height: 18)
+        bodyLabel.lineBreakMode = .byTruncatingTail
+
+        window.contentView?.addSubview(titleLabel)
+        window.contentView?.addSubview(bodyLabel)
+        window.orderFrontRegardless()
+        hudWindow = window
+        logToFile("showHUD: displayed at \(x),\(y) size \(width)x\(height)")
+
+        hudTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.hudWindow?.orderOut(nil)
+            }
+        }
     }
 
     @objc func restartServices() {
@@ -534,6 +592,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             try? proc.run()
             proc.waitUntilExit()
         }
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        return false  // keep running as menu bar app even when HUD closes
     }
 
     @objc func quit() {

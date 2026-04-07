@@ -85,6 +85,8 @@ def get_quota_status() -> dict:
     """Read quota state from quota-state.json (written by credential proxy)."""
     quota_file = REPO_DIR / "quota-state.json"
     if not quota_file.exists():
+        quota_file = REPO_DIR / "skills" / "quota-tracker" / "quota-state.json"
+    if not quota_file.exists():
         return {"available": True}
     try:
         data = json.loads(quota_file.read_text())
