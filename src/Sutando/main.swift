@@ -1,5 +1,6 @@
 import Cocoa
 import Carbon
+import UserNotifications
 
 // MARK: - Sutando Drop Menu Bar App
 // Replaces Automator Quick Action for context drops.
@@ -31,6 +32,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var lastResultCount = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Request notification permission
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, error in
+            NSLog("Sutando: notification permission granted=\(granted) error=\(String(describing: error))")
+        }
         DispatchQueue.main.async { [self] in
             setupMenuBar()
             registerHotKey()
@@ -300,51 +305,31 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func toggleVoice() {
         NSLog("Sutando: toggleVoice called")
-        // Click the voice button in Chrome via AppleScript
-        let script = NSAppleScript(source: """
-        tell application "Google Chrome"
-            set found to false
-            repeat with w in windows
-                repeat with t in tabs of w
-                    if URL of t contains "localhost:8080" then
-                        tell t to execute javascript "document.querySelector('.btn-hero, .btn-voice').click()"
-                        set found to true
-                        exit repeat
-                    end if
-                end repeat
-                if found then exit repeat
-            end repeat
-            if not found then
-                open location "http://localhost:8080"
-            end if
-        end tell
-        """)
-        var error: NSDictionary?
-        script?.executeAndReturnError(&error)
-        if let error = error {
-            let msg = error[NSAppleScript.errorMessage] as? String ?? ""
-            if msg.contains("not allowed") || msg.contains("JavaScript") || msg.contains("permission") {
-                notify("Sutando", "⌃V needs: Chrome → View → Developer → Allow JavaScript from Apple Events")
-            }
-        }
-        NSSound.beep()
+        // Toggle voice via HTTP — no Chrome JavaScript permission needed
+        httpToggle(endpoint: "toggle")
     }
 
     @objc func toggleMute() {
-        // Click the mute button in Chrome via AppleScript
-        let script = NSAppleScript(source: """
-        tell application "Google Chrome"
-            repeat with w in windows
-                repeat with t in tabs of w
-                    if URL of t contains "localhost:8080" then
-                        tell t to execute javascript "document.querySelector('.btn-mute').click()"
-                        exit repeat
-                    end if
-                end repeat
-            end repeat
-        end tell
-        """)
-        script?.executeAndReturnError(nil)
+        NSLog("Sutando: toggleMute called")
+        httpToggle(endpoint: "mute")
+    }
+
+    func httpToggle(endpoint: String) {
+        guard let url = URL(string: "http://localhost:8080/\(endpoint)") else { return }
+        let task = URLSession.shared.dataTask(with: url) { data, response, error in
+            if let error = error {
+                NSLog("Sutando: \(endpoint) failed: \(error.localizedDescription)")
+                // Fallback: open the web UI so user can toggle manually
+                DispatchQueue.main.async {
+                    self.notify("Sutando", "Web client not reachable — open localhost:8080")
+                }
+                return
+            }
+            if let http = response as? HTTPURLResponse, http.statusCode == 200 {
+                NSLog("Sutando: \(endpoint) OK")
+            }
+        }
+        task.resume()
         NSSound.beep()
     }
 
@@ -517,17 +502,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func notify(_ title: String, _ message: String) {
         logToFile("notify: \(title) — \(message)")
-        // Spawn osascript subprocess — in-process NSAppleScript doesn't show banners
-        let escaped = message.replacingOccurrences(of: "\"", with: "\\\"")
-        let script = "display notification \"\(escaped)\" with title \"\(title)\" sound name \"Ping\""
-        // Audio beep as immediate confirmation
-        NSSound.beep()
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", script]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        try? process.run()
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = message
+        content.sound = .default
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error = error {
+                NSLog("Sutando: notification error: \(error.localizedDescription)")
+            }
+        }
     }
 
     @objc func restartServices() {
