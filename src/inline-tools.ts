@@ -401,46 +401,34 @@ export const summonTool: ToolDefinition = {
 				console.log(`${ts()} [Summon] Waiting for Zoom preview window...`);
 			await new Promise(r => setTimeout(r, 2000));
 			try {
-				execSync(`/usr/bin/python3 -c "
-import Quartz, subprocess, time
-
-# Get the Zoom meeting preview window position
-result = subprocess.run(['osascript', '-e', '''
-tell application \\\"zoom.us\\\" to activate
-tell application \\\"System Events\\\"
-    tell process \\\"zoom.us\\\"
-        repeat with w in windows
-            try
-                set wName to name of w
-                if wName contains \\\"Meeting\\\" or wName contains \\\"Personal\\\" then
-                    set wPos to position of w
-                    set wSize to size of w
-                    return (item 1 of wPos as text) & \\\",\\\" & (item 2 of wPos as text) & \\\",\\\" & (item 1 of wSize as text) & \\\",\\\" & (item 2 of wSize as text)
-                end if
-            end try
-        end repeat
-    end tell
-end tell
-return \\\"not_found\\\"
-'''], capture_output=True, text=True, timeout=10)
-
-coords = result.stdout.strip()
-if coords and coords != 'not_found':
-    x0, y0, w, h = [int(float(v)) for v in coords.split(',')]
-    # Join button is at bottom-right of preview: roughly 80% across, 93% down
-    bx = x0 + int(w * 0.80)
-    by = y0 + int(h * 0.93)
-    print(f'Preview at ({x0},{y0}) size ({w},{h}), clicking Join at ({bx},{by})')
-    evt = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventLeftMouseDown, (bx, by), 0)
-    Quartz.CGEventPost(Quartz.kCGHIDEventTap, evt)
-    time.sleep(0.1)
-    evt = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventLeftMouseUp, (bx, by), 0)
-    Quartz.CGEventPost(Quartz.kCGHIDEventTap, evt)
-    print('Join clicked')
-else:
-    print('No preview window found — may have auto-joined')
-"`, { timeout: 20_000 });
-				console.log(`${ts()} [Summon] Join button clicked`);
+				// Click Join button using cliclick (no Quartz dependency needed)
+				const previewCoords = execSync(`osascript -e '
+					tell application "zoom.us" to activate
+					tell application "System Events"
+						tell process "zoom.us"
+							repeat with w in windows
+								try
+									set wName to name of w
+									if wName contains "Meeting" or wName contains "Personal" or wName contains "Preview" then
+										set wPos to position of w
+										set wSize to size of w
+										return (item 1 of wPos as text) & "," & (item 2 of wPos as text) & "," & (item 1 of wSize as text) & "," & (item 2 of wSize as text)
+									end if
+								end try
+							end repeat
+						end tell
+					end tell
+					return "not_found"
+				'`, { timeout: 10_000 }).toString().trim();
+				if (previewCoords !== 'not_found') {
+					const [px, py, pw, ph] = previewCoords.split(',').map(Number);
+					const jx = px + Math.round(pw * 0.80);
+					const jy = py + Math.round(ph * 0.93);
+					try { execSync(`cliclick c:${jx},${jy}`, { timeout: 3_000 }); } catch {}
+					console.log(`${ts()} [Summon] Join button clicked at (${jx},${jy})`);
+				} else {
+					console.log(`${ts()} [Summon] No preview window — may have auto-joined`);
+				}
 			} catch (err) {
 				console.log(`${ts()} [Summon] Join click failed (may have auto-joined): ${err}`);
 			}
@@ -528,46 +516,85 @@ else:
 					console.log(`${ts()} [Summon] Join audio window closed (phone handles audio)`);
 				} catch { console.log(`${ts()} [Summon] No Join audio window to close`); }
 			} else {
-				// No phone dial-in — join computer audio so voice agent can hear the meeting
-				// On machines without mic (e.g. Mac Mini), dismiss any audio dialog
-				try {
-					execSync(`osascript -e '
-						tell application "zoom.us" to activate
-						delay 0.5
-						tell application "System Events"
-							tell process "zoom.us"
-								repeat with w in windows
-									set wName to name of w
-									if wName contains "audio" or wName contains "Audio" or wName is "Join audio" then
-										-- Try "Join with Computer Audio" button first
-										try
-											click button "Join with Computer Audio" of w
-											return "joined computer audio"
-										end try
-										-- Fallback: look for any button containing "Computer Audio"
-										repeat with b in buttons of w
-											try
-												if name of b contains "Computer Audio" then
-													click b
-													return "joined computer audio"
-												end if
-											end try
-										end repeat
-										-- No mic fallback: close any audio dialog to unblock the flow
-										try
-											click button 1 of w
-											return "dismissed audio dialog (no mic)"
-										end try
-										-- Nuclear option: Escape key
-										keystroke (ASCII character 27)
-										return "escaped audio dialog"
-									end if
-								end repeat
+				// No phone dial-in — handle audio dialog
+				// Detect if machine has audio input (mic)
+				const hasMic = (() => { try { return execSync(`system_profiler SPAudioDataType 2>/dev/null | grep -c "Input"`, { timeout: 5_000 }).toString().trim() !== '0'; } catch { return false; } })();
+				console.log(`${ts()} [Summon] Audio input detected: ${hasMic}`);
+
+				// Handle the audio dialogs using cliclick for reliable clicking
+				// Zoom uses web-based UI that AppleScript can't access by button name
+				for (let attempt = 0; attempt < 3; attempt++) {
+					await new Promise(r => setTimeout(r, 1500));
+					try {
+						// Get the audio dialog window position
+						const coords = execSync(`osascript -e '
+							tell application "System Events"
+								tell process "zoom.us"
+									repeat with w in windows
+										set wName to name of w
+										if wName contains "audio" or wName contains "Audio" then
+											set wPos to position of w
+											set wSize to size of w
+											return (item 1 of wPos as text) & "," & (item 2 of wPos as text) & "," & (item 1 of wSize as text) & "," & (item 2 of wSize as text)
+										end if
+									end repeat
+								end tell
 							end tell
-						end tell
-					'`, { timeout: 8_000 });
-					console.log(`${ts()} [Summon] Handled audio dialog`);
-				} catch { console.log(`${ts()} [Summon] No audio dialog found`); }
+							return "none"
+						'`, { timeout: 5_000 }).toString().trim();
+
+						if (coords === 'none') {
+							console.log(`${ts()} [Summon] No audio dialog found (attempt ${attempt + 1})`);
+							break;
+						}
+
+						const [x0, y0, w, h] = coords.split(',').map(Number);
+						if (hasMic) {
+							// Click "Join with Computer Audio" — centered blue button, ~50% across, ~55% down
+							const bx = x0 + Math.round(w * 0.5);
+							const by = y0 + Math.round(h * 0.55);
+							execSync(`cliclick c:${bx},${by}`, { timeout: 3_000 });
+							console.log(`${ts()} [Summon] Clicked Join with Computer Audio at (${bx},${by})`);
+						} else {
+							// No mic — first click dismisses to "Continue without audio?" dialog
+							// Then click "Continue" (left button, ~40% across, ~75% down)
+							const bx = x0 + Math.round(w * 0.5);
+							const by = y0 + Math.round(h * 0.55);
+							execSync(`cliclick c:${bx},${by}`, { timeout: 3_000 });
+							console.log(`${ts()} [Summon] Clicked audio dialog at (${bx},${by}), checking for confirmation...`);
+							await new Promise(r => setTimeout(r, 1000));
+							// Check if "continue without audio" confirmation appeared
+							try {
+								const coords2 = execSync(`osascript -e '
+									tell application "System Events"
+										tell process "zoom.us"
+											repeat with w in windows
+												set wName to name of w
+												if wName contains "audio" or wName contains "Audio" then
+													set wPos to position of w
+													set wSize to size of w
+													return (item 1 of wPos as text) & "," & (item 2 of wPos as text) & "," & (item 1 of wSize as text) & "," & (item 2 of wSize as text)
+												end if
+											end repeat
+										end tell
+									end tell
+									return "none"
+								'`, { timeout: 5_000 }).toString().trim();
+								if (coords2 !== 'none') {
+									const [x2, y2, w2, h2] = coords2.split(',').map(Number);
+									// "Continue" button is left of center, ~38% across, ~72% down
+									const cx = x2 + Math.round(w2 * 0.38);
+									const cy = y2 + Math.round(h2 * 0.72);
+									execSync(`cliclick c:${cx},${cy}`, { timeout: 3_000 });
+									console.log(`${ts()} [Summon] Clicked Continue (no audio) at (${cx},${cy})`);
+								}
+							} catch {}
+						}
+						break;
+					} catch (e) {
+						console.log(`${ts()} [Summon] Audio dialog handling attempt ${attempt + 1} failed: ${e}`);
+					}
+				}
 			}
 
 			// Wait for Zoom meeting window to appear (adaptive, up to 30s)
