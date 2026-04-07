@@ -235,14 +235,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     title = lines[0].strip()
                     body = '\n'.join(lines[1:])
                     # Skip preamble (sections without question metadata)
-                    if '**Asked:**' not in body and '**Question:**' not in body:
+                    if '**Status:**' not in body and '**Options:**' not in body:
                         continue
                     # Skip resolved/answered questions
-                    if re.search(r'\*\*Status:\*\*\s*(resolved|answered|done)', body, re.IGNORECASE):
+                    if re.search(r'\*\*Status:\*\*\s*(resolved|answered|done|complete)', body, re.IGNORECASE):
                         continue
-                    # Extract question text
-                    q_match = re.search(r'\*\*Question:\*\*\s*(.+)', body)
-                    q_text = q_match.group(1).strip() if q_match else title
+                    # Extract question text — use body before first metadata field
+                    q_text = re.split(r'\*\*(?:Status|Options|Asked|Question):\*\*', body)[0].strip()
+                    q_text = q_text if q_text else title
                     q = {"id": f"Q{i}", "text": title, "detail": q_text}
                     # Parse custom options if present
                     opts_match = re.search(r'\*\*Options:\*\*\s*(.+)', body)
@@ -539,15 +539,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         lines = section.strip().split('\n')
                         title = lines[0].strip()
                         body = '\n'.join(lines[1:])
-                        if '**Asked:**' not in body and '**Question:**' not in body:
+                        if '**Status:**' not in body and '**Options:**' not in body:
                             continue
-                        if re.search(r'\*\*Status:\*\*\s*(resolved|answered|done)', body, re.IGNORECASE):
+                        if re.search(r'\*\*Status:\*\*\s*(resolved|answered|done|complete)', body, re.IGNORECASE):
                             continue
                         idx += 1
-                        if f"Q{idx}" == qid:
-                            old_status = re.search(r'- \*\*Status:\*\* unanswered', body)
-                            if old_status:
-                                new_body = body.replace('- **Status:** unanswered', f'- **Status:** answered: {safe_answer}')
+                        if f"Q{si}" == qid:
+                            # Match any waiting/unanswered status line
+                            new_body = re.sub(
+                                r'\*\*Status:\*\*\s*(?:Waiting|unanswered).*',
+                                f'**Status:** Answered — {safe_answer}',
+                                body
+                            )
+                            if new_body != body:
                                 new_content = content.replace(body, new_body)
                             break
                     if new_content != content:
