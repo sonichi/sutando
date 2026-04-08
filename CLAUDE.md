@@ -19,6 +19,18 @@ Be concise and direct. Prefer action over explanation. Default to the smallest a
 - **Inline tools** are only for tools that need instant response from Gemini. Prefer skill scripts for complex logic. Only promote to inline if the user says the skill approach is too slow.
 - When refactoring, do NOT change prompts or tool behavior. Prompts are tuned through testing and must be preserved exactly.
 
+### Where does new code belong? (decision guide — issue #222)
+
+Walk this list top-to-bottom and stop at the first match:
+
+1. **Does it need an instant response from Gemini (< 1s round-trip)?** → inline tool in `src/inline-tools.ts` or `src/browser-tools.ts`. Keep it a thin wrapper around a system command. If it grows past ~50 lines or needs subprocess orchestration, push it back to a skill.
+2. **Is it a phone-call session concern (Twilio WS, audio routing, call lifecycle, hang_up/dtmf)?** → `skills/phone-conversation/scripts/conversation-server.ts`. Does NOT belong: recording, subtitling, observability dashboards, business logic.
+3. **Is it a voice-session concern (bodhi `VoiceSession` config, web client wiring, task-bridge plumbing)?** → `src/voice-agent.ts`. Does NOT belong: phone-specific logic, tool implementations.
+4. **Is it a self-contained feature (recording, image generation, skill discovery, etc.)?** → new skill under `skills/<name>/`. Each skill is optional — core must still boot if it's removed.
+5. **Is it core infrastructure shared by multiple skills (task bridge, health check, memory sync)?** → `src/`.
+
+If two layers seem to fit, prefer the more specific one (skill > core). If you're patching a bug, keep the patch in the layer where the bug lives — don't smuggle a refactor into a fix commit.
+
 ## Repo rules
 
 Before creating a PR, check `gh pr list --state open` for an existing PR on the same topic. If one exists, push to its branch instead of creating a new PR.
