@@ -1,0 +1,27 @@
+[
+  {
+    "name": "main-loop",
+    "cron": "*/5 * * * *",
+    "prompt_skill": "proactive-loop"
+  },
+  {
+    "name": "morning-briefing",
+    "cron": "57 6 * * *",
+    "prompt_skill": "morning-briefing"
+  },
+  {
+    "name": "daily-insight",
+    "cron": "50 6 * * *",
+    "prompt": "Run python3 src/daily-insight.py to generate today's behavioral insight. If it produces output, include it in the morning briefing."
+  },
+  {
+    "name": "pending-questions",
+    "cron": "*/30 * * * *",
+    "prompt": "Run python3 src/check-pending-questions.py to notify about unanswered pending questions."
+  },
+  {
+    "name": "sync-memory",
+    "cron": "*/30 * * * *",
+    "prompt": "Run bash src/sync-memory.sh to sync memory and notes to the private memory repo (requires SUTANDO_MEMORY_REPO in .env)."
+  }
+]

@@ -6,7 +6,12 @@ Re-create all session cron jobs for Sutando. Run this on startup or after a sess
 
 ## How It Works
 
-Jobs are defined in `skills/schedule-crons/crons.json`. Each entry has:
+Jobs are defined in `skills/schedule-crons/crons.json` (gitignored — personal). A template is in `crons.example.json` — copy it on first setup:
+```bash
+cp skills/schedule-crons/crons.example.json skills/schedule-crons/crons.json
+```
+
+Each entry has:
 - `name` — unique identifier (used to avoid duplicates)
 - `cron` — 5-field cron expression
 - `prompt` — the prompt to run (direct text)
