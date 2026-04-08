@@ -208,8 +208,7 @@ interface CallSession {
 	// provides toolCallId, not toolName. Without this, the play_recording context
 	// reminder (line ~621) checks e.toolName which is undefined and never matches.
 	_toolIdMap?: Map<string, string>;
-	// Observability: per-call metrics
-	startedAt: number;
+	// Observability: per-call metrics (startTime already on CallSession from #209)
 	toolCalls: { name: string; durationMs: number; timestamp: string }[];
 	events: { event: string; timestamp: string }[];
 }
@@ -601,7 +600,6 @@ async function createCallSession(params: {
 		startTime: Date.now(),
 		transcript: [],
 		resultQueue: [],
-		startedAt: Date.now(),
 		toolCalls: [],
 		events: [{ event: 'call_started', timestamp: new Date().toISOString() }],
 	};
@@ -863,7 +861,7 @@ function cleanupCall(callSid: string): void {
 
 	// Observability: write per-call metrics to data/call-metrics.jsonl
 	session.events.push({ event: 'call_ended', timestamp: new Date().toISOString() });
-	const durationMs = Date.now() - session.startedAt;
+	const durationMs = Date.now() - session.startTime;
 	const metrics = {
 		timestamp: new Date().toISOString(),
 		callSid,
