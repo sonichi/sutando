@@ -30,7 +30,8 @@ if [ -d "$MEMORY_DIR" ]; then
     cp "$MEMORY_DIR"/*.md memory/ 2>/dev/null
 fi
 if [ -d "$NOTES_DIR" ]; then
-    cp "$NOTES_DIR"/*.md notes/ 2>/dev/null
+    # Recursive sync — includes subdirs (meetings/, archive/) and non-md files (PNGs, etc.)
+    rsync -a --delete --exclude='.gitkeep' "$NOTES_DIR/" notes/ 2>/dev/null
 fi
 
 # Check for changes
@@ -48,7 +49,7 @@ if [ -d "$MEMORY_DIR" ]; then
     cp memory/*.md "$MEMORY_DIR/" 2>/dev/null
 fi
 if [ -d "$NOTES_DIR" ]; then
-    cp notes/*.md "$NOTES_DIR/" 2>/dev/null
+    rsync -a --exclude='.gitkeep' notes/ "$NOTES_DIR/" 2>/dev/null
 fi
 
-echo "Sync complete. Memory: $(ls memory/*.md 2>/dev/null | wc -l | tr -d ' ') files, Notes: $(ls notes/*.md 2>/dev/null | wc -l | tr -d ' ') files."
+echo "Sync complete. Memory: $(ls memory/*.md 2>/dev/null | wc -l | tr -d ' ') files, Notes: $(find notes -type f 2>/dev/null | wc -l | tr -d ' ') files."

@@ -25,10 +25,8 @@ pending-questions.md
 .claude/
 ACTIVITY.md
 build_log.md
-notes/*.md
-!notes/setup-guide.md
-notes/meetings/
-!notes/meetings/.gitkeep
+notes/*
+!notes/.gitkeep
 data/follow-ups.json
 
 telegram-inbox/
