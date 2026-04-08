@@ -98,8 +98,10 @@ async def on_message(message):
     if message.author == client.user:
         return
     # Skip messages from other bots (e.g. another Sutando node) to avoid
-    # double-processing in shared channels like the inter-machine bridge
-    if message.author.bot:
+    # double-processing in shared channels like the inter-machine bridge.
+    # EXCEPTION: if the bot @mentions this bot specifically, treat it as a
+    # legitimate cross-machine task (e.g. MacBook bot asking Mini bot to do X).
+    if message.author.bot and client.user not in message.mentions:
         return
 
     sender_id = str(message.author.id)
