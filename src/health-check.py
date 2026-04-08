@@ -164,6 +164,47 @@ def run_all_checks() -> list[dict]:
             if c["status"] != "ok":
                 c["status"] = "warn"
                 c["detail"] = "not running (starts on demand)"
+            else:
+                # Stale-code check (mirrors PR #228 for Python bridges, but the
+                # source file lives under skills/ and is .ts, so it needs its
+                # own path lookup).
+                try:
+                    src_file = REPO_DIR / "skills" / "phone-conversation" / "scripts" / "conversation-server.ts"
+                    if src_file.exists():
+                        ps_pids = subprocess.run(
+                            ["pgrep", "-f", "conversation-server.ts"],
+                            capture_output=True, text=True, timeout=5
+                        ).stdout.strip().split("\n")
+                        ps_pids = [p for p in ps_pids if p]
+                        if ps_pids:
+                            # Walk PIDs and pick the oldest start time — the
+                            # tsx wrapper spawns a child node process; we want
+                            # the parent so its start time reflects the original
+                            # launch.
+                            ps_out = subprocess.run(
+                                ["ps", "-o", "lstart=", "-p", ",".join(ps_pids)],
+                                capture_output=True, text=True, timeout=5
+                            ).stdout.strip().split("\n")
+                            from datetime import datetime as _dt
+                            starts = []
+                            for line in ps_out:
+                                line = line.strip()
+                                if line:
+                                    try:
+                                        starts.append(_dt.strptime(line, "%a %b %d %H:%M:%S %Y").timestamp())
+                                    except ValueError:
+                                        pass
+                            if starts:
+                                proc_start = min(starts)
+                                src_mtime = src_file.stat().st_mtime
+                                # Threshold matches PR #228 for Python bridges:
+                                # 30 min tolerates routine `git checkout` mtime
+                                # bumps; real stale deploys are hours/days old.
+                                if src_mtime - proc_start > 1800:  # source >30 min newer
+                                    c["status"] = "stale"
+                                    c["detail"] = f"running but code is {int((src_mtime - proc_start) / 60)} min newer than process — restart needed"
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
             checks.append(c)
             # Tunnel check — depends on TWILIO_WEBHOOK_URL host (Funnel) or ngrok
             if c["status"] == "ok":
