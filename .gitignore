@@ -27,6 +27,9 @@ ACTIVITY.md
 build_log.md
 notes/*.md
 !notes/setup-guide.md
+notes/meetings/
+!notes/meetings/.gitkeep
+data/follow-ups.json
 
 telegram-inbox/
 discord-inbox/
