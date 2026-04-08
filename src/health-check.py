@@ -263,7 +263,13 @@ def run_all_checks() -> list[dict]:
                 if ps_out:
                     from datetime import datetime as _dt
                     proc_start = _dt.strptime(ps_out, "%a %b %d %H:%M:%S %Y").timestamp()
-                    if src_mtime - proc_start > 300:  # source >5 min newer
+                    # Threshold tuned to avoid false positives from `git checkout`
+                    # which bumps the mtime of every file that differs between
+                    # branches, even when content is identical. Real stale deploys
+                    # (the original target of #228) are usually hours/days old,
+                    # so 30 min comfortably catches them while tolerating routine
+                    # branch switching.
+                    if src_mtime - proc_start > 1800:  # source >30 min newer
                         status = "stale"
                         detail = f"running but code is {int((src_mtime - proc_start) / 60)} min newer than process — restart needed"
         except (subprocess.TimeoutExpired, ValueError, OSError):
