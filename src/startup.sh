@@ -74,7 +74,7 @@ echo ""
 bash "$REPO/skills/install.sh" 2>/dev/null || true
 
 # Create tasks/ and results/ directories
-mkdir -p tasks results
+mkdir -p tasks results data
 
 # 0. Credential proxy for quota tracking (port 7846)
 if ! lsof -i :7846 > /dev/null 2>&1; then
