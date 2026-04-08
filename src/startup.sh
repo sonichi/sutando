@@ -196,7 +196,15 @@ elif grep -q "TWILIO_ACCOUNT_SID=" .env 2>/dev/null; then
   fi
   if ! pgrep -f "ngrok" > /dev/null 2>&1; then
     echo "  Starting ngrok tunnel..."
-    ngrok http 3100 --log=stdout > /tmp/ngrok.log 2>&1 &
+    # If NGROK_DOMAIN is set in .env, use the reserved domain for a stable URL.
+    # Otherwise ngrok picks a random subdomain and the Twilio webhook must be
+    # updated manually on every restart.
+    NGROK_DOMAIN_VAL=$(grep -E '^NGROK_DOMAIN=' .env 2>/dev/null | head -1 | cut -d'=' -f2- | tr -d '"' | tr -d "'")
+    if [ -n "$NGROK_DOMAIN_VAL" ]; then
+      ngrok http 3100 --domain="$NGROK_DOMAIN_VAL" --log=stdout > /tmp/ngrok.log 2>&1 &
+    else
+      ngrok http 3100 --log=stdout > /tmp/ngrok.log 2>&1 &
+    fi
     sleep 3
     NGROK_URL=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['tunnels'][0]['public_url'])" 2>/dev/null || echo "")
     if [ -n "$NGROK_URL" ]; then
@@ -206,8 +214,12 @@ elif grep -q "TWILIO_ACCOUNT_SID=" .env 2>/dev/null; then
       else
         echo "WEBHOOK_BASE_URL=$NGROK_URL" >> .env
       fi
-      echo "  ✓ ngrok ($NGROK_URL)"
-      echo "  ⚠ Update Twilio webhook to: $NGROK_URL"
+      if [ -n "$NGROK_DOMAIN_VAL" ]; then
+        echo "  ✓ ngrok ($NGROK_URL — reserved domain, no Twilio update needed)"
+      else
+        echo "  ✓ ngrok ($NGROK_URL)"
+        echo "  ⚠ Update Twilio webhook to: $NGROK_URL"
+      fi
     else
       echo "  ✗ ngrok (failed to start)"
     fi
