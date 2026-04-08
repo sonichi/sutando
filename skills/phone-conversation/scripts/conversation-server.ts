@@ -1488,7 +1488,14 @@ async function start(): Promise<void> {
 	console.log(`${ts()} [Server] listening on port ${PORT}`);
 
 	try {
-		WEBHOOK_BASE_URL = await startNgrokCli(PORT);
+		// Use TWILIO_WEBHOOK_URL env var if set (e.g. Tailscale Funnel), else spawn ngrok
+		const externalUrl = process.env.TWILIO_WEBHOOK_URL?.replace(/\/$/, '');
+		if (externalUrl) {
+			WEBHOOK_BASE_URL = externalUrl;
+			console.log(`${ts()} [Server] Using external tunnel: ${WEBHOOK_BASE_URL}`);
+		} else {
+			WEBHOOK_BASE_URL = await startNgrokCli(PORT);
+		}
 		console.log(`\n╔════════════════════════════════════════════════════╗`);
 		console.log(`║  Phone Server (bodhi VoiceSession)                 ║`);
 		console.log(`╠════════════════════════════════════════════════════╣`);
