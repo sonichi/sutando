@@ -2,11 +2,25 @@
 # Sync memory + notes between machines via private git repo
 # Run: bash src/sync-memory.sh
 # Add to cron for auto-sync: */10 * * * * bash ~/Desktop/sutando/src/sync-memory.sh
+#
+# Set SUTANDO_MEMORY_REPO in .env to your private repo URL, e.g.:
+#   SUTANDO_MEMORY_REPO=git@github.com:youruser/sutando-memory.git
+# If unset, sync is skipped (script exits cleanly).
 
 SYNC_DIR="$HOME/.sutando-memory-sync"
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 MEMORY_DIR="$HOME/.claude/projects/-Users-$(whoami)-Desktop-sutando/memory"
 NOTES_DIR="$REPO_DIR/notes"
+
+# Load SUTANDO_MEMORY_REPO from .env if not in shell env
+if [ -z "$SUTANDO_MEMORY_REPO" ] && [ -f "$REPO_DIR/.env" ]; then
+    SUTANDO_MEMORY_REPO=$(grep -E '^SUTANDO_MEMORY_REPO=' "$REPO_DIR/.env" | cut -d= -f2- | tr -d '"' | tr -d "'")
+fi
+
+if [ -z "$SUTANDO_MEMORY_REPO" ]; then
+    echo "sync-memory: SUTANDO_MEMORY_REPO not set in .env, skipping sync."
+    exit 0
+fi
 
 # Auto-detect memory dir (may vary by machine)
 if [ ! -d "$MEMORY_DIR" ]; then
@@ -15,8 +29,8 @@ if [ ! -d "$MEMORY_DIR" ]; then
 fi
 
 if [ ! -d "$SYNC_DIR" ]; then
-    echo "Setting up sync repo..."
-    git clone https://github.com/sonichi/sutando-memory.git "$SYNC_DIR"
+    echo "Setting up sync repo from $SUTANDO_MEMORY_REPO..."
+    git clone "$SUTANDO_MEMORY_REPO" "$SYNC_DIR"
 fi
 
 cd "$SYNC_DIR" || exit 1
