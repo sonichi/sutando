@@ -171,7 +171,8 @@ def run_all_checks() -> list[dict]:
                 if ngrok_c["status"] == "ok":
                     ngrok_c["detail"] = "tunnel active (port 4040)"
                 else:
-                    ngrok_c["status"] = "warn"
+                    # Critical: phone calls fail without ngrok
+                    ngrok_c["status"] = "down"
                     ngrok_c["detail"] = "not running — phone calls won't reach server"
                 checks.append(ngrok_c)
 
@@ -291,6 +292,27 @@ def main():
                     sutando_bin = REPO_DIR / "src" / "Sutando" / "Sutando"
                     subprocess.Popen([str(sutando_bin)], start_new_session=True,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    print(f"  {c['name']}: restarted")
+                elif c["name"] == "ngrok":
+                    # Read ngrok domain from .env if set, otherwise use default
+                    env_path = REPO_DIR / ".env"
+                    domain_arg = []
+                    if env_path.exists():
+                        for line in env_path.read_text().splitlines():
+                            if line.startswith("NGROK_DOMAIN="):
+                                domain = line.split("=", 1)[1].strip().strip('"').strip("'")
+                                if domain:
+                                    domain_arg = [f"--domain={domain}"]
+                                break
+                    subprocess.Popen(["ngrok", "http", "3100"] + domain_arg,
+                                     stdout=open("/tmp/ngrok.log", "a"),
+                                     stderr=subprocess.STDOUT, start_new_session=True)
+                    print(f"  {c['name']}: restarted")
+                elif c["name"] == "conversation-server":
+                    subprocess.Popen(["npx", "tsx", "skills/phone-conversation/scripts/conversation-server.ts"],
+                                     cwd=str(REPO_DIR),
+                                     stdout=open("/tmp/conversation-server.log", "a"),
+                                     stderr=subprocess.STDOUT, start_new_session=True)
                     print(f"  {c['name']}: restarted")
 
     # Email alert if critical issues found and --fix didn't resolve them
