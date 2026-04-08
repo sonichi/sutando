@@ -431,11 +431,25 @@ def main():
                                    capture_output=True, timeout=10)
                     print(f"  {c['name']}: restarted")
                 elif c["name"] == "conversation-server":
+                    # If stale, kill old PIDs first so the new process doesn't
+                    # bind-fail or end up alongside a still-running zombie.
+                    if c["status"] == "stale":
+                        try:
+                            old_pids = subprocess.run(
+                                ["pgrep", "-f", "conversation-server.ts"],
+                                capture_output=True, text=True
+                            ).stdout.strip().split("\n")
+                            for pid in old_pids:
+                                if pid:
+                                    subprocess.run(["kill", pid], check=False)
+                            import time as _t; _t.sleep(1)
+                        except Exception:
+                            pass
                     subprocess.Popen(["npx", "tsx", "skills/phone-conversation/scripts/conversation-server.ts"],
                                      cwd=str(REPO_DIR),
                                      stdout=open("/tmp/conversation-server.log", "a"),
                                      stderr=subprocess.STDOUT, start_new_session=True)
-                    print(f"  {c['name']}: restarted")
+                    print(f"  {c['name']}: {'restarted (stale code)' if c['status'] == 'stale' else 'restarted'}")
 
     # Email alert if critical issues found and --fix didn't resolve them
     if issues and do_fix:
