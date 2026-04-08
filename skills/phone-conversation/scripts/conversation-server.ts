@@ -207,6 +207,10 @@ interface CallSession {
 	// provides toolCallId, not toolName. Without this, the play_recording context
 	// reminder (line ~621) checks e.toolName which is undefined and never matches.
 	_toolIdMap?: Map<string, string>;
+	// Observability: per-call metrics
+	startedAt: number;
+	toolCalls: { name: string; durationMs: number; timestamp: string }[];
+	events: { event: string; timestamp: string }[];
 }
 
 const activeCalls = new Map<string, CallSession>();
@@ -245,6 +249,7 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 
 	callSession.pendingTasks++;
 	console.log(`${ts()} [Task] delegated: ${taskId} — "${taskDescription}" (pending: ${callSession.pendingTasks})`);
+	callSession.events.push({ event: `task_delegated:${taskDescription.slice(0, 60)}`, timestamp: new Date().toISOString() });
 
 	const fullTranscript = callSession.transcript.slice(-20)
 		.map(t => `${t.role === 'sutando' ? 'Sutando' : 'Caller'}: ${t.text}`)
@@ -267,6 +272,7 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 			callSession.pendingTasks = Math.max(0, callSession.pendingTasks - 1);
 			const result = readFileSync(resultPath, 'utf-8').trim();
 			console.log(`${ts()} [Task] result for ${taskId} (${Date.now() - startTime}ms): ${result.slice(0, 200)}`);
+			callSession.events.push({ event: `task_result:${taskId}:${Date.now() - startTime}ms`, timestamp: new Date().toISOString() });
 			try { unlinkSync(resultPath); } catch {}
 			// Cache result so duplicate requests get instant replay
 			if (!callSession.taskResultCache) callSession.taskResultCache = new Map();
@@ -593,6 +599,9 @@ async function createCallSession(params: {
 		pendingTasks: 0,
 		transcript: [],
 		resultQueue: [],
+		startedAt: Date.now(),
+		toolCalls: [],
+		events: [{ event: 'call_started', timestamp: new Date().toISOString() }],
 	};
 
 	// Start live transcript file
@@ -624,11 +633,14 @@ async function createCallSession(params: {
 				// bodhi's onToolResult only provides toolCallId, not toolName.
 				if (!callSession._toolIdMap) callSession._toolIdMap = new Map();
 				callSession._toolIdMap.set(e.toolCallId, e.toolName);
+				callSession.events.push({ event: `tool_call:${e.toolName}`, timestamp: new Date().toISOString() });
 			},
 			onToolResult: (e) => {
 				// Resolve tool name from the map since e.toolName is undefined in onToolResult
 				const toolName = callSession._toolIdMap?.get(e.toolCallId) || 'unknown';
 				console.log(`${ts()} [Tool] result: ${toolName} (${e.status}, ${e.durationMs}ms)`);
+				callSession.toolCalls.push({ name: toolName, durationMs: e.durationMs, timestamp: new Date().toISOString() });
+				callSession.events.push({ event: `tool_result:${toolName}:${e.durationMs}ms`, timestamp: new Date().toISOString() });
 				// After play_recording pause/play, inject context reminder
 				if (toolName === 'play_recording') {
 					setTimeout(() => {
@@ -710,9 +722,11 @@ async function createCallSession(params: {
 			if (item.content === lastTranscriptText) continue;
 			if (item.role === 'user') {
 				callSession.transcript.push({ role: 'caller', text: item.content });
+				callSession.events.push({ event: `caller:${item.content.slice(0, 60)}`, timestamp: new Date().toISOString() });
 				try { appendFileSync(`/tmp/sutando-live-transcript-${callSession.callSid}.txt`, `[${new Date().toLocaleTimeString('en-US', {hour12:false})}] Caller: ${item.content}\n`); } catch {}
 			} else if (item.role === 'assistant') {
 				callSession.transcript.push({ role: 'sutando', text: item.content });
+				callSession.events.push({ event: `sutando:${item.content.slice(0, 60)}`, timestamp: new Date().toISOString() });
 				try { appendFileSync(`/tmp/sutando-live-transcript-${callSession.callSid}.txt`, `[${new Date().toLocaleTimeString('en-US', {hour12:false})}] Sutando: ${item.content}\n`); } catch {}
 			}
 		}
@@ -832,6 +846,26 @@ function cleanupCall(callSid: string): void {
 		}
 	}
 	console.log(`${ts()} [Phone] call finalized: ${callSid}`);
+
+	// Observability: write per-call metrics to data/call-metrics.jsonl
+	session.events.push({ event: 'call_ended', timestamp: new Date().toISOString() });
+	const durationMs = Date.now() - session.startedAt;
+	const metrics = {
+		timestamp: new Date().toISOString(),
+		callSid,
+		caller: session.callerNumber,
+		isOwner: session.isOwner,
+		isMeeting: session.isMeeting,
+		durationMs,
+		transcriptLines: session.transcript.length,
+		toolCalls: session.toolCalls,
+		toolCount: session.toolCalls.length,
+		pendingTasks: session.pendingTasks,
+		events: session.events,
+	};
+	try {
+		appendFileSync(join(WORKSPACE_DIR, 'data', 'call-metrics.jsonl'), JSON.stringify(metrics) + '\n');
+	} catch { /* best effort */ }
 
 	// Auto-scan the latest call for issues (async, best effort)
 	try {
