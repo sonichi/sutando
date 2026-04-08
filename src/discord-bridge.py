@@ -135,6 +135,14 @@ async def on_message(message):
             print(f"  [skip] not mentioned (requireMention=true)", flush=True)
             return
 
+        # In shared channels (require_mention=False), if there ARE other bot
+        # @mentions but THIS bot isn't mentioned, skip — let the addressed bot handle it
+        if not require_mention and message.mentions and not bot_mentioned:
+            other_bot_mentions = [m for m in message.mentions if m.bot]
+            if other_bot_mentions:
+                print(f"  [skip] message addressed to other bot(s): {[str(m) for m in other_bot_mentions]}", flush=True)
+                return
+
         # Strip mentions from the text
         text = text.replace(f"<@{client.user.id}>", "")
         for role in message.role_mentions:
