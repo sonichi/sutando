@@ -199,6 +199,7 @@ interface CallSession {
 	childCallSids: string[];
 	hangingUp: boolean;
 	pendingTasks: number;
+	startTime: number;
 	transcript: { role: string; text: string }[];
 	resultQueue: { text: string }[];
 	taskResultCache?: Map<string, string>;
@@ -587,6 +588,7 @@ async function createCallSession(params: {
 		childCallSids: [],
 		hangingUp: false,
 		pendingTasks: 0,
+		startTime: Date.now(),
 		transcript: [],
 		resultQueue: [],
 	};
@@ -805,7 +807,19 @@ function cleanupCall(callSid: string): void {
 			const label = t.role === 'sutando' ? 'Sutando' : 'Recipient';
 			return `${label}: ${t.text}`;
 		}).join('\n');
-		const data = JSON.stringify({ callSid, transcript: formatted, timestamp: new Date().toISOString() });
+		const duration_seconds = session.startTime ? Math.round((Date.now() - session.startTime) / 1000) : 0;
+		const data = JSON.stringify({
+			callSid,
+			transcript: formatted,
+			timestamp: new Date().toISOString(),
+			start_time: session.startTime ? new Date(session.startTime).toISOString() : undefined,
+			duration_seconds,
+			caller: session.callerNumber || 'unknown',
+			purpose: session.purpose,
+			is_meeting: !!session.meetingId,
+			meeting_id: session.meetingId,
+			is_owner: session.isOwner,
+		});
 		writeFileSync(join(CALLS_DIR, 'latest-result.json'), data);
 		appendFileSync(join(CALLS_DIR, 'calls.jsonl'), data + '\n');
 	}
