@@ -649,11 +649,11 @@ async function createCallSession(params: {
 						try {
 							if (existsSync('/tmp/sutando-playback-pause')) {
 								(session as any).transport.sendContent([
-									{ role: 'user', text: '[System: Video PAUSED. When user says play/continue/resume, call play_recording({action:"play"}) immediately. Do NOT use work or describe_screen.]' },
+									{ role: 'user', text: '[System: Video PAUSED. ONLY call play_recording({action:"play"}) when user explicitly says "play", "resume", or "continue". Do NOT resume on other speech. Do NOT use work or describe_screen.]' },
 								], true);
 							} else {
 								(session as any).transport.sendContent([
-									{ role: 'user', text: '[System: Video PLAYING. Be silent. When user says pause/stop, call play_recording({action:"pause"}).]' },
+									{ role: 'user', text: '[System: Video PLAYING. Say NOTHING at all. Do NOT speak, narrate, or comment. ONLY respond to "pause", "stop", or "close". Ignore all other speech while video is playing.]' },
 								], true);
 							}
 						} catch {}

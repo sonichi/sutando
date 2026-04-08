@@ -492,8 +492,8 @@ export const playRecordingTool: ToolDefinition = {
 	name: 'play_recording',
 	description:
 		'Control video playback. Use for ANY request about videos, recordings, or media files. ' +
-		'Actions: "open" (just open, no playback), "play" (play + stream audio), "pause", "stop", "close" (quit player), "replay" (start from beginning), "status". ' +
-		'IMPORTANT: "open" and "play" are DIFFERENT. "open the video" → action:"open". "play the video" → action:"play". ' +
+		'Actions: "open" (just open in QuickTime, do NOT play), "play" (play + stream audio to phone), "pause", "stop", "close" (quit player), "replay" (start from beginning), "status". ' +
+		'CRITICAL: "open" and "play" are DIFFERENT actions. When user says "open the video", "open the recording", or "can you open it" → use action:"open". NEVER use action:"play" unless the user explicitly says "play". ' +
 		'"close this video" → action:"close". "replay from the top" or "start over" → action:"replay".',
 	parameters: z.object({
 		action: z.enum(['open', 'play', 'pause', 'stop', 'close', 'replay', 'status']).default('open'),
