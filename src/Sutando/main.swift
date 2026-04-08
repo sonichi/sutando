@@ -33,9 +33,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var lastResultCount = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Request notification permission
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, error in
-            NSLog("Sutando: notification permission granted=\(granted) error=\(String(describing: error))")
+        // Request notification permission — only when running as .app bundle
+        // (UNUserNotificationCenter crashes when run as raw binary)
+        if Bundle.main.bundleIdentifier != nil {
+            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, error in
+                NSLog("Sutando: notification permission granted=\(granted) error=\(String(describing: error))")
+            }
         }
         DispatchQueue.main.async { [self] in
             setupMenuBar()
