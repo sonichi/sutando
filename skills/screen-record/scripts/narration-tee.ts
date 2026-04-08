@@ -37,9 +37,9 @@ export function teeAudio(pcmBuf: Buffer): void {
 				const outPath = videoFile.replace('.mov', '-narrated.mov');
 				try {
 					// -map 1:v -map 0:a: use video from the recording (input 1) and audio from
-// the narration tee (input 0). Without -map, ffmpeg defaults to the video's
-// own audio track which is silent mic ambient — not the Gemini narration.
-execSync(`ffmpeg -y -f s16le -ar 24000 -ac 1 -i "${audioFile}" -i "${videoFile}" -map 1:v -map 0:a -c:v copy -c:a aac -shortest "${outPath}"`, { timeout: 60_000 });
+					// the narration tee (input 0). Without -map, ffmpeg defaults to the video's
+					// own audio track which is silent mic ambient — not the Gemini narration.
+					execSync(`ffmpeg -y -f s16le -ar 24000 -ac 1 -i "${audioFile}" -i "${videoFile}" -map 1:v -map 0:a -c:v copy -c:a aac -shortest "${outPath}"`, { timeout: 60_000 });
 					console.log(`${ts()} [NarrationTee] muxed → ${outPath}`);
 				} catch (e) {
 					console.log(`${ts()} [NarrationTee] mux failed: ${e instanceof Error ? e.message : e}`);
@@ -63,9 +63,9 @@ export function cleanup(): void {
 			const outPath = videoFile.replace('.mov', '-narrated.mov');
 			try {
 				// -map 1:v -map 0:a: use video from the recording (input 1) and audio from
-// the narration tee (input 0). Without -map, ffmpeg defaults to the video's
-// own audio track which is silent mic ambient — not the Gemini narration.
-execSync(`ffmpeg -y -f s16le -ar 24000 -ac 1 -i "${audioFile}" -i "${videoFile}" -map 1:v -map 0:a -c:v copy -c:a aac -shortest "${outPath}"`, { timeout: 60_000 });
+				// the narration tee (input 0). Without -map, ffmpeg defaults to the video's
+				// own audio track which is silent mic ambient — not the Gemini narration.
+				execSync(`ffmpeg -y -f s16le -ar 24000 -ac 1 -i "${audioFile}" -i "${videoFile}" -map 1:v -map 0:a -c:v copy -c:a aac -shortest "${outPath}"`, { timeout: 60_000 });
 				console.log(`${ts()} [NarrationTee] muxed on cleanup → ${outPath}`);
 			} catch (e) {
 				console.log(`${ts()} [NarrationTee] mux on cleanup failed: ${e instanceof Error ? e.message : e}`);
