@@ -203,6 +203,10 @@ interface CallSession {
 	resultQueue: { text: string }[];
 	taskResultCache?: Map<string, string>;
 	cleanupNarration?: () => void;
+	// Maps toolCallId → toolName. Needed because bodhi's onToolResult hook only
+	// provides toolCallId, not toolName. Without this, the play_recording context
+	// reminder (line ~621) checks e.toolName which is undefined and never matches.
+	_toolIdMap?: Map<string, string>;
 }
 
 const activeCalls = new Map<string, CallSession>();
@@ -614,11 +618,19 @@ async function createCallSession(params: {
 		googleSearch: true,
 		speechConfig: { voiceName: 'Aoede' },
 		hooks: {
-			onToolCall: (e) => console.log(`${ts()} [Tool] ${e.toolName} (${e.execution})`),
+			onToolCall: (e) => {
+				console.log(`${ts()} [Tool] ${e.toolName} (${e.execution})`);
+				// Track toolCallId → toolName so onToolResult can look it up.
+				// bodhi's onToolResult only provides toolCallId, not toolName.
+				if (!callSession._toolIdMap) callSession._toolIdMap = new Map();
+				callSession._toolIdMap.set(e.toolCallId, e.toolName);
+			},
 			onToolResult: (e) => {
-				console.log(`${ts()} [Tool] result: ${e.toolCallId} (${e.status}, ${e.durationMs}ms)`);
+				// Resolve tool name from the map since e.toolName is undefined in onToolResult
+				const toolName = callSession._toolIdMap?.get(e.toolCallId) || 'unknown';
+				console.log(`${ts()} [Tool] result: ${toolName} (${e.status}, ${e.durationMs}ms)`);
 				// After play_recording pause/play, inject context reminder
-				if (e.toolName === 'play_recording') {
+				if (toolName === 'play_recording') {
 					setTimeout(() => {
 						try {
 							if (existsSync('/tmp/sutando-playback-pause')) {

@@ -467,15 +467,21 @@ export function startRecordingNarration(session: any): void {
 	}, durationMs + 1000); // +1s buffer for auto-stop to finish
 }
 
+// Check file exists AND has meaningful size (>1KB). Prevents returning
+// a recording that ffmpeg is still writing or a narrated file mid-mux.
+function isReadableFile(path: string): boolean {
+	try { return existsSync(path) && statSync(path).size > 1000; } catch { return false; }
+}
+
 function findRecording(version?: 'raw' | 'narrated'): string | null {
 	try {
 		const files = execSync('ls -t /tmp/sutando-recording-*.mov 2>/dev/null | grep -v narrated | grep -v subtitled | head -1', { timeout: 3_000 }).toString().trim();
-		if (files && existsSync(files)) {
+		if (files && isReadableFile(files)) {
 			if (version === 'raw') return files;
 			const narrated = files.replace('.mov', '-narrated.mov');
-			if (version === 'narrated') return existsSync(narrated) ? narrated : files;
+			if (version === 'narrated') return isReadableFile(narrated) ? narrated : files;
 			// Default: prefer narrated > raw
-			if (existsSync(narrated)) return narrated;
+			if (isReadableFile(narrated)) return narrated;
 			return files;
 		}
 	} catch {}
@@ -531,8 +537,14 @@ export const playRecordingTool: ToolDefinition = {
 				try { recPath = readFileSync('/tmp/sutando-playback-path', 'utf8').trim() || null; } catch {}
 			}
 			if (!recPath) recPath = findRecording(version);
-			if (recPath && !existsSync(recPath)) recPath = null;
-			if (!recPath) return { error: filePath ? `File not found: ${filePath}` : 'No screen recording found' };
+			// Retry once after 3s — narration-tee mux takes ~1s after recording stops,
+			// so the narrated file may not exist yet when Gemini immediately calls play.
+			if (!recPath) {
+				await new Promise(r => setTimeout(r, 3000));
+				recPath = findRecording(version);
+			}
+			if (recPath && !isReadableFile(recPath)) recPath = null;
+			if (!recPath) return { error: filePath ? `File not found: ${filePath}` : 'No screen recording found — recording may still be saving. Try again in a few seconds.' };
 
 			writeFileSync('/tmp/sutando-playback-path', recPath);
 
