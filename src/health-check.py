@@ -290,6 +290,7 @@ def run_all_checks() -> list[dict]:
 def main():
     as_json = "--json" in sys.argv
     do_fix = "--fix" in sys.argv
+    quiet = "--quiet" in sys.argv or "-q" in sys.argv
 
     checks = run_all_checks()
     issues = [c for c in checks if c["status"] not in ("ok", "warn")]
@@ -298,17 +299,34 @@ def main():
         print(json.dumps({"checks": checks, "issues": len(issues), "total": len(checks)}, indent=2))
         return
 
+    # --quiet: print only issues (or nothing if clean). Exit code reflects state.
+    # Useful for cron callers and automation that only cares about problems.
+    if quiet:
+        if issues:
+            for c in issues:
+                icon = "♻" if c["status"] == "stale" else "✗"
+                print(f"{icon} {c['name']}: {c['status']} ({c['detail']})")
+            if do_fix:
+                # Fall through to existing fix path below
+                pass
+            else:
+                sys.exit(1)
+        else:
+            sys.exit(0)
+
     # Human-readable
-    print("Sutando Health Check")
-    print("=" * 40)
+    if not quiet:
+        print("Sutando Health Check")
+        print("=" * 40)
 
-    for c in checks:
-        icon = "✓" if c["status"] == "ok" else "⚠" if c["status"] == "warn" else "✗" if c["status"] in ("down", "missing", "not_loaded") else "♻" if c["status"] == "stale" else "~"
-        print(f"  {icon} {c['name']:30s} {c['status']:12s} {c['detail']}")
+        for c in checks:
+            icon = "✓" if c["status"] == "ok" else "⚠" if c["status"] == "warn" else "✗" if c["status"] in ("down", "missing", "not_loaded") else "♻" if c["status"] == "stale" else "~"
+            print(f"  {icon} {c['name']:30s} {c['status']:12s} {c['detail']}")
 
-    print()
+        print()
     if not issues:
-        print("All systems operational.")
+        if not quiet:
+            print("All systems operational.")
     else:
         print(f"{len(issues)} issue(s) found:")
         for c in issues:
