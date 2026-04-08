@@ -14,9 +14,8 @@ results/
 SESSION.md
 conversation.log
 quota-state.json
-data/bills.json
-data/newsletters/
-data/subscribers.txt
+data/*
+!data/*.example.json
 src/*.log
 src/cloudflare-worker.js
 AGENT_LOOP.md
@@ -27,7 +26,6 @@ ACTIVITY.md
 build_log.md
 notes/*
 !notes/.gitkeep
-data/follow-ups.json
 
 telegram-inbox/
 discord-inbox/
