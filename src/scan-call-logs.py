@@ -284,15 +284,34 @@ ALL_DETECTORS = [
 ]
 
 
+def detect_metadata_issues(entry: dict) -> list[dict]:
+    """Detect issues from enriched call metadata (#209): duration, purpose, etc."""
+    issues = []
+    duration = entry.get("duration_seconds")
+    if isinstance(duration, (int, float)) and duration > 0:
+        if duration < 10 and not entry.get("is_meeting"):
+            issues.append({
+                "pattern": "short_call",
+                "severity": "medium",
+                "category": "team-fixable",
+                "summary": f"Call lasted only {duration}s — likely immediate disconnect",
+                "fix_hint": "Check webhook 5xx, greeting bug, or caller hangup. Common after a deploy.",
+            })
+    return issues
+
+
 def scan_entry(entry: dict):
     """Scan a single call log entry. Returns issues dict or None if clean."""
     transcript = entry.get("transcript", "")
-    if not transcript or len(transcript) < 20:
-        return None
 
     all_issues = []
-    for detector in ALL_DETECTORS:
-        all_issues.extend(detector(transcript))
+    # Metadata-based detection runs even on near-empty transcripts —
+    # short calls often have nothing to say but the duration tells the story.
+    all_issues.extend(detect_metadata_issues(entry))
+
+    if transcript and len(transcript) >= 20:
+        for detector in ALL_DETECTORS:
+            all_issues.extend(detector(transcript))
 
     if not all_issues:
         return None
