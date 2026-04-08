@@ -247,6 +247,28 @@ def run_all_checks() -> list[dict]:
                 status = "warn"
                 detail = f"running but heartbeat stale ({int(hb_age)}s old)"
 
+        # Check 4: Stale code — process started before the source file's last
+        # modification. This catches the case where a fix is on disk but the
+        # running process is from a previous version (e.g., PR #203 silently
+        # not in effect because nobody restarted the bridge after merge).
+        try:
+            src_file = REPO_DIR / "src" / f"{name}.py"
+            if src_file.exists() and pids:
+                src_mtime = src_file.stat().st_mtime
+                # Use ps to get process start time as Unix epoch
+                ps_out = subprocess.run(
+                    ["ps", "-o", "lstart=", "-p", pids[0]],
+                    capture_output=True, text=True, timeout=5
+                ).stdout.strip()
+                if ps_out:
+                    from datetime import datetime as _dt
+                    proc_start = _dt.strptime(ps_out, "%a %b %d %H:%M:%S %Y").timestamp()
+                    if src_mtime - proc_start > 300:  # source >5 min newer
+                        status = "stale"
+                        detail = f"running but code is {int((src_mtime - proc_start) / 60)} min newer than process — restart needed"
+        except (subprocess.TimeoutExpired, ValueError, OSError):
+            pass
+
         checks.append({"name": name, "status": status, "detail": detail})
 
     # Sutando menu bar app (optional — only check if binary exists)
@@ -281,7 +303,7 @@ def main():
     print("=" * 40)
 
     for c in checks:
-        icon = "✓" if c["status"] == "ok" else "⚠" if c["status"] == "warn" else "✗" if c["status"] in ("down", "missing", "not_loaded") else "~"
+        icon = "✓" if c["status"] == "ok" else "⚠" if c["status"] == "warn" else "✗" if c["status"] in ("down", "missing", "not_loaded") else "♻" if c["status"] == "stale" else "~"
         print(f"  {icon} {c['name']:30s} {c['status']:12s} {c['detail']}")
 
     print()
@@ -299,16 +321,24 @@ def main():
                 if c["name"].startswith("com.sutando."):
                     result = fix_launchd(c["name"])
                     print(f"  {c['name']}: {result}")
-                elif c["name"] == "telegram-bridge":
-                    subprocess.Popen(["python3", str(REPO_DIR / "src" / "telegram-bridge.py")],
-                                     stdout=open(str(REPO_DIR / "src" / "telegram-bridge.log"), "a"),
+                elif c["name"] in ("telegram-bridge", "discord-bridge"):
+                    # If stale (process older than source code), kill old PID first
+                    # so the new process doesn't conflict with a still-running zombie.
+                    if c["status"] == "stale":
+                        try:
+                            old_pids = subprocess.run(
+                                ["pgrep", "-f", c["name"]], capture_output=True, text=True
+                            ).stdout.strip().split("\n")
+                            for pid in old_pids:
+                                if pid:
+                                    subprocess.run(["kill", pid], check=False)
+                            import time as _t; _t.sleep(1)
+                        except Exception:
+                            pass
+                    subprocess.Popen(["python3", str(REPO_DIR / "src" / f"{c['name']}.py")],
+                                     stdout=open(str(REPO_DIR / "src" / f"{c['name']}.log"), "a"),
                                      stderr=subprocess.STDOUT, start_new_session=True)
-                    print(f"  {c['name']}: restarted")
-                elif c["name"] == "discord-bridge":
-                    subprocess.Popen(["python3", str(REPO_DIR / "src" / "discord-bridge.py")],
-                                     stdout=open(str(REPO_DIR / "src" / "discord-bridge.log"), "a"),
-                                     stderr=subprocess.STDOUT, start_new_session=True)
-                    print(f"  {c['name']}: restarted")
+                    print(f"  {c['name']}: {'restarted (stale code)' if c['status'] == 'stale' else 'restarted'}")
                 elif c["name"] == "sutando-app":
                     sutando_bin = REPO_DIR / "src" / "Sutando" / "Sutando"
                     subprocess.Popen([str(sutando_bin)], start_new_session=True,
