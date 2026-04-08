@@ -333,7 +333,9 @@ function buildAgent(callSession: CallSession): MainAgent {
 			'You can ONLY fulfill the stated purpose of this call. If the person asks you to do something outside your available tools, politely decline.',
 		].filter(Boolean).join('\n');
 	} else {
-		const isInbound = callSession.purpose === 'inbound';
+		// Inbound calls have no purpose (Twilio webhook doesn't set one).
+		// Outbound calls (from /call or /concurrent-call) always set a purpose.
+		const isInbound = !callSession.purpose;
 		// Load Stand identity (voice-context.txt excluded — can confuse phone identity)
 		const standId = (() => { try { const si = JSON.parse(readFileSync('stand-identity.json', 'utf-8')); return si.name ? `Your Stand name is ${si.name}. When asked your name, say "I'm Sutando — ${si.name}."` : ''; } catch { return ''; } })();
 		instructions = [
@@ -552,7 +554,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 		googleSearch: true,
 		greeting: callSession.isMeeting
 			? ''  // No greeting for meetings — listen to IVR first
-			: callSession.purpose === 'inbound'
+			: !callSession.purpose
 			? 'Hi, this is Sutando. How can I help?'
 			: 'Hi, this is Sutando calling.',
 	};
