@@ -97,6 +97,10 @@ async def on_ready():
 async def on_message(message):
     if message.author == client.user:
         return
+    # Skip messages from other bots (e.g. another Sutando node) to avoid
+    # double-processing in shared channels like the inter-machine bridge
+    if message.author.bot:
+        return
 
     sender_id = str(message.author.id)
     username = str(message.author)
