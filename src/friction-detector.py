@@ -22,19 +22,68 @@ RESULTS_DIR = WORKSPACE / "results"
 
 
 def check_pending_questions():
-    """Find questions unanswered for >24h."""
+    """Find questions unanswered for >24h.
+
+    pending-questions.md uses sections like:
+        ## Question Title
+        - **Asked:** 2026-04-06
+        - **Question:** ...
+        - **Status:** unanswered
+
+    A previous version of this parser looked for lines starting with `- [`
+    which never matched the actual format, so it always returned an empty
+    list and friction-detector silently missed every unanswered question.
+    """
     pq = WORKSPACE / "pending-questions.md"
     if not pq.exists():
         return []
     content = pq.read_text()
     if "(No pending questions)" in content or not content.strip():
         return []
-    # Parse questions with timestamps
+
     issues = []
+    today = datetime.now().date()
+
+    # Walk sections — each starts with `## Title`. Inside the section, look
+    # for `Status: unanswered` and an `Asked:` date.
+    current_title = None
+    current_asked = None
+    current_status = None
+
+    def flush():
+        if current_title and current_status == "unanswered":
+            age_str = ""
+            if current_asked:
+                try:
+                    asked_date = datetime.fromisoformat(current_asked).date()
+                    age_days = (today - asked_date).days
+                    age_str = f" ({age_days}d old)"
+                except ValueError:
+                    pass
+            issues.append(f"Pending question unanswered{age_str}: {current_title[:80]}")
+
     for line in content.split("\n"):
-        line = line.strip()
-        if line.startswith("- ") and "[" in line:
-            issues.append(f"Pending question unanswered: {line[:80]}")
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            flush()
+            current_title = stripped[3:].strip()
+            current_asked = None
+            current_status = None
+            continue
+        # Match `- **Asked:** 2026-04-06`
+        if "**Asked:**" in stripped:
+            try:
+                current_asked = stripped.split("**Asked:**", 1)[1].strip().split()[0]
+            except IndexError:
+                pass
+        # Match `- **Status:** unanswered`
+        if "**Status:**" in stripped:
+            try:
+                current_status = stripped.split("**Status:**", 1)[1].strip().lower().split()[0]
+            except IndexError:
+                pass
+    flush()  # don't forget the last section
+
     return issues
 
 
