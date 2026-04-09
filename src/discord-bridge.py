@@ -287,6 +287,33 @@ async def _handle_discord_message(message, force=False):
         except Exception as e:
             print(f"  Download failed: {e}")
 
+    # Reply context — when the user replies to a bot message, fetch the
+    # referenced message and prepend a snippet so the core agent knows
+    # which earlier answer the user is responding to. Without this the
+    # bot sees only the new reply text in isolation.
+    reply_context = ""
+    if message.reference and message.reference.message_id:
+        try:
+            ref_msg = message.reference.resolved
+            if ref_msg is None:
+                ref_msg = await message.channel.fetch_message(message.reference.message_id)
+            if ref_msg is not None:
+                # Only include context when replying to a message FROM this
+                # bot — avoids prepending unrelated conversation fragments.
+                if ref_msg.author.id == client.user.id:
+                    ref_author = str(ref_msg.author)
+                    ref_content = (ref_msg.content or "").strip()
+                    # Strip bot-id mentions so the context doesn't show raw id soup
+                    ref_content = ref_content.replace(f"<@{client.user.id}>", "")
+                    snippet = ref_content[:400].replace("\n", " ").strip()
+                    if snippet:
+                        reply_context = (
+                            f"\n\n[Replying to {ref_author} "
+                            f"({ref_msg.created_at.strftime('%Y-%m-%d %H:%M')}): {snippet}]"
+                        )
+        except Exception as e:
+            print(f"  [reply-context] fetch failed: {e}", flush=True)
+
     if not text and not attachment_note:
         # Bare mention — user deliberately pinged the bot with no content.
         # Don't drop: fetch the last few messages of channel history so the
@@ -364,7 +391,7 @@ async def _handle_discord_message(message, force=False):
     task_file.write_text(
         f"id: {task_id}\n"
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S')}Z\n"
-        f"task: [Discord @{username}] {text}{attachment_note}\n"
+        f"task: [Discord @{username}] {text}{attachment_note}{reply_context}\n"
         f"source: discord\n"
         f"channel_id: {message.channel.id}\n"
         f"user_id: {message.author.id}\n"
