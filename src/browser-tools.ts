@@ -343,7 +343,7 @@ export const scrollAndDescribeTool: ToolDefinition = {
 				} catch {}
 				// Wait for narrated.mov to exist (narration-tee stop + mux ~2s after record.py stop)
 				const narrated = stopResult.path ? stopResult.path.replace('.mov', '-narrated.mov') : '';
-				for (let w = 0; w < 4; w++) {
+				for (let w = 0; w < 5; w++) {
 					if (narrated && isReadableFile(narrated)) break;
 					await new Promise(r => setTimeout(r, 2000));
 				}

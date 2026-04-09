@@ -641,6 +641,11 @@ async function createCallSession(params: {
 				console.log(`${ts()} [Tool] result: ${toolName} (${e.status}, ${e.durationMs}ms)`);
 				callSession.toolCalls.push({ name: toolName, durationMs: e.durationMs, timestamp: new Date().toISOString() });
 				callSession.events.push({ event: `tool_result:${toolName}:${e.durationMs}ms`, timestamp: new Date().toISOString() });
+				// Log REC indicator status for recording tools
+				if (toolName === 'scroll_and_describe' || toolName === 'screen_record') {
+					const hasIndicator = existsSync('/tmp/sutando-rec-indicator.pid');
+					callSession.events.push({ event: `rec_indicator:${hasIndicator ? 'on' : 'off'}`, timestamp: new Date().toISOString() });
+				}
 				// After video play/pause, inject context reminder
 				if (['play_video', 'pause_video', 'resume_video', 'replay_video'].includes(toolName)) {
 					setTimeout(() => {

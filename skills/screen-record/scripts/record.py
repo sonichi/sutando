@@ -27,6 +27,9 @@ def _show_indicator():
         )
         with open(INDICATOR_PID_FILE, "w") as f:
             f.write(str(proc.pid))
+        print(json.dumps({"_log": "rec_indicator_started", "pid": proc.pid}), file=sys.stderr)
+    else:
+        print(json.dumps({"_log": "rec_indicator_missing", "path": indicator_bin}), file=sys.stderr)
 
 
 def _hide_indicator():
@@ -36,9 +39,12 @@ def _hide_indicator():
             pid = int(f.read().strip())
         try:
             os.kill(pid, signal.SIGTERM)
+            print(json.dumps({"_log": "rec_indicator_stopped", "pid": pid}), file=sys.stderr)
         except ProcessLookupError:
-            pass
+            print(json.dumps({"_log": "rec_indicator_already_dead", "pid": pid}), file=sys.stderr)
         os.remove(INDICATOR_PID_FILE)
+    else:
+        print(json.dumps({"_log": "rec_indicator_no_pid_file"}), file=sys.stderr)
     subprocess.Popen(
         ["osascript", "-e", 'display notification "Screen recording stopped" with title "Sutando"'],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
