@@ -434,8 +434,12 @@ def run_all_checks() -> list[dict]:
                     # so 30 min comfortably catches them while tolerating routine
                     # branch switching.
                     if src_mtime - proc_start > 1800:  # source >30 min newer
-                        status = "stale"
-                        detail = f"running but code is {int((src_mtime - proc_start) / 60)} min newer than process — restart needed"
+                        # Cross-check with git before flagging — #253 added this
+                        # for voice-agent + web-client via mark_stale_if_outdated,
+                        # this path does the same check inline to reach bridges.
+                        if not _file_unchanged_since(src_file, proc_start):
+                            status = "stale"
+                            detail = f"running but code is {int((src_mtime - proc_start) / 60)} min newer than process — restart needed"
         except (subprocess.TimeoutExpired, ValueError, OSError):
             pass
 
