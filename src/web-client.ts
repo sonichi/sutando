@@ -1077,12 +1077,17 @@ function connectWs() {
     dbg('WS closed: code=' + e.code + ' reason=' + e.reason);
     // Server-initiated clean close (goodbye code 4000) or user clicked Disconnect
     const wasCleanDisconnect = !connected || e.code === 4000;
-    if (wasCleanDisconnect) connected = false;
+    // Always reset connected here so subsequent toggle calls (from auto-
+    // reconnect or the external SSE toggle path) take the open-new-ws
+    // branch instead of seeing stale state. Without this, an unclean drop
+    // (e.g. voice-agent restart) leaves the page in a wedged state where
+    // ws=null but connected=true, requiring a hard reload to recover.
+    connected = false;
     doCleanup();
     if (wasCleanDisconnect) {
       addSystem('Disconnected.');
     } else {
-      // Unexpected drop (Gemini timeout) — auto-reconnect with limit
+      // Unexpected drop (Gemini timeout, voice-agent restart) — auto-reconnect with limit
       reconnectAttempts++;
       if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
         addSystem('Still trying to connect. Common causes:');
@@ -1097,7 +1102,7 @@ function connectWs() {
         addSystem('Connection lost — reconnecting (' + reconnectAttempts + '/' + MAX_RECONNECT_ATTEMPTS + ')...');
         setStatus('Reconnecting...', 'error');
       }
-      // Always retry
+      // Always retry — connected is now false, so toggle() will open a fresh ws
       setTimeout(() => {
         if (!connected) {
           dbg('Auto-reconnecting (attempt ' + reconnectAttempts + ')...');
