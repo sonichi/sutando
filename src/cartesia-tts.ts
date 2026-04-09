@@ -12,11 +12,14 @@
  *   npx tsx src/cartesia-tts.ts "Hello world"
  */
 
-// @ts-expect-error -- `@cartesia/cartesia-js` is an optional dependency.
-// When CARTESIA_API_KEY is not set, voice-agent.ts skips the dynamic
-// import of this file entirely, so a missing module is never a runtime
-// error. The `@ts-expect-error` tells tsc to tolerate the missing
-// declarations on machines that ran `npm install --no-optional`.
+// `@cartesia/cartesia-js` is an optional dependency. voice-agent.ts only
+// dynamically imports this file when CARTESIA_API_KEY is set, so the module
+// missing is never a runtime error for Gemini-only users. We use @ts-ignore
+// (not @ts-expect-error) so tsc tolerates both states:
+//   - package NOT installed → ignore suppresses the "cannot find module" error
+//   - package IS installed   → ignore is a no-op (@ts-expect-error would
+//                                fail here with "unused directive")
+// @ts-ignore -- optional dependency, resolved at runtime
 import Cartesia from '@cartesia/cartesia-js';
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
