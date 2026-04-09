@@ -1576,6 +1576,12 @@ function showNoteContent(slug) {
         body: JSON.stringify({ slug: slug, content: text })
       }).catch(function(){});
     } catch (e) {}
+    // Extract the frontmatter title before stripping, so we can render it
+    // above the body. Without this, the only visible title on the page is
+    // the global stand-name H1 ("Sutando — <stand>"), which confused users
+    // into thinking that was the note's title.
+    var titleMatch = text.match(new RegExp('^---[\\s\\S]*?\\ntitle:\\s*([^\\n]+)'));
+    var noteTitle = titleMatch ? titleMatch[1].trim() : slug;
     text = text.replace(new RegExp('^---[\\s\\S]*?---\\n'), '');
     text = text.replace(/^### (.+)$/gm, '<h3>$1</h3>');
     text = text.replace(/^## (.+)$/gm, '<h2>$1</h2>');
@@ -1588,6 +1594,7 @@ function showNoteContent(slug) {
     text = text.replace(/^- (.+)$/gm, '<li>$1</li>');
     text = text.replace(new RegExp('\\n\\n', 'g'), '<br><br>');
     container.innerHTML = '<span class="suggestion" onclick="renderTabContent()" style="font-size:11px;cursor:pointer;margin-bottom:8px;display:inline-block">&larr; Back</span>' +
+      '<h2 style="font-size:15px;color:#7c83ff;margin:8px 0 10px 0;border-bottom:1px solid #2a2a3e;padding-bottom:6px">' + esc(noteTitle) + '</h2>' +
       '<div style="font-size:13px;line-height:1.5">' + text + '</div>';
   });
 }
