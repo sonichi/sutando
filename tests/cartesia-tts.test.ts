@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { createWavHeader } from '../src/cartesia-tts.js';
+import { createWavHeader, splitSentences } from '../src/cartesia-tts.js';
 
 describe('createWavHeader', () => {
 	it('produces a 44-byte header', () => {
@@ -107,15 +107,6 @@ describe('createWavHeader', () => {
 });
 
 describe('sentence splitting', () => {
-	function splitSentences(text: string): string[] {
-		const matched = text.match(/[^.!?]+[.!?]+/g) || [];
-		const matchedText = matched.join('');
-		const tail = text.slice(matchedText.length).trim();
-		return matched.length > 0
-			? (tail ? [...matched, tail] : matched)
-			: [text];
-	}
-
 	it('handles text with no terminal punctuation', () => {
 		assert.deepEqual(splitSentences('Hello world'), ['Hello world']);
 	});

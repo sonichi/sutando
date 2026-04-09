@@ -332,8 +332,12 @@ async function main() {
 			// Voice not connected — generate Cartesia TTS for async playback
 			const truncated = (result.match(/^[\s\S]{0,500}[.!?]/)?.[0] || result.slice(0, 500)).trim();
 			generateSpeech(truncated, { category: 'result', label: 'task-result' }).then(audioPath => {
+				// Convert absolute path to repo-relative so /media/ route can serve it
+				const relativeSrc = audioPath.startsWith(WORKSPACE_DIR)
+					? audioPath.slice(WORKSPACE_DIR.replace(/\/$/, '').length + 1)
+					: audioPath;
 				writeFileSync(join(WORKSPACE_DIR, 'dynamic-content.json'), JSON.stringify({
-					type: 'audio', src: audioPath, title: 'Task Complete',
+					type: 'audio', src: relativeSrc, title: 'Task Complete',
 				}));
 				console.log(`${ts()} [CartesiaTTS] Audio generated: ${audioPath}`);
 			}).catch(err => console.error(`${ts()} [CartesiaTTS] ${err.message}`));

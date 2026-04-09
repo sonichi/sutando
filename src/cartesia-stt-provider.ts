@@ -65,6 +65,10 @@ export class CartesiaSTTProvider implements STTProvider {
 
 	feedAudio(base64Pcm: string): void {
 		const chunkBytes = Math.ceil(base64Pcm.length * 0.75);
+		if (chunkBytes > MAX_BUFFER_BYTES) {
+			console.warn(`${ts()} [CartesiaSTT] Dropping oversized chunk (${chunkBytes} bytes > ${MAX_BUFFER_BYTES} cap)`);
+			return;
+		}
 		// FIFO eviction: drop oldest chunks to make room (preserves most recent speech)
 		while (this.bufferBytes + chunkBytes > MAX_BUFFER_BYTES && this.audioChunks.length > 0) {
 			const dropped = this.audioChunks.shift();

@@ -10,16 +10,16 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
-/** Send text to Gemini via sendRealtimeInput (3.1+) or sendContent (2.5).
- *  See also: voice-agent.ts:injectText */
+/** Send text to Gemini via sendRealtimeInput when available, otherwise sendContent. */
 export function injectText(session: any, text: string) {
 	try {
-		const model = process.env.VOICE_NATIVE_AUDIO_MODEL || 'gemini-3.1-flash-live-preview';
 		const transport = session?.transport;
-		if (model.includes('3.1')) {
+		if (typeof transport?.session?.sendRealtimeInput === 'function') {
 			transport.session.sendRealtimeInput({ text });
+		} else if (typeof transport?.sendContent === 'function') {
+			transport.sendContent([{ role: 'user', text }], true);
 		} else {
-			transport?.sendContent([{ role: 'user', text }], true);
+			console.warn(`${ts()} [InjectText] No supported text injection method on transport`);
 		}
 	} catch (err) {
 		console.error(`${ts()} [InjectText] Error:`, err);

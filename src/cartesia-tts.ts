@@ -24,6 +24,16 @@ const SAMPLE_RATE = 24000;
 const CHANNELS = 1;
 const BIT_DEPTH = 16;
 
+/** Split text into sentences for chunked TTS. Captures trailing non-punctuated text. */
+export function splitSentences(text: string): string[] {
+	const matched = text.match(/[^.!?]+[.!?]+/g) || [];
+	const matchedText = matched.join('');
+	const tail = text.slice(matchedText.length).trim();
+	return matched.length > 0
+		? (tail ? [...matched, tail] : matched)
+		: [text];
+}
+
 /**
  * Generate speech audio from text.
  * @param text Text to speak
@@ -59,12 +69,7 @@ export async function generateSpeech(
 		});
 
 		// Push text in sentence chunks for natural prosody
-		const matched = text.match(/[^.!?]+[.!?]+/g) || [];
-		const matchedText = matched.join('');
-		const tail = text.slice(matchedText.length).trim();
-		const sentences = matched.length > 0
-			? (tail ? [...matched, tail] : matched)
-			: [text];
+		const sentences = splitSentences(text);
 		for (const s of sentences) {
 			await ctx.push({ transcript: s.trim() + ' ' });
 		}
