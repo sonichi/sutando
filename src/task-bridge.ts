@@ -197,6 +197,12 @@ export function startContextDropWatcher(onContextDrop: (content: string) => void
  * note doesn't re-inject.
  */
 let lastNoteViewingTs = '';
+// Track the last event we *logged* separately from the last we *handled*,
+// so that when the keep-pending-on-disconnect path (PR #246) retries an
+// event every 2s, we emit only one "Note view detected" line per unique
+// event.ts. Without this, voice-agent.log fills with ~30 identical lines
+// per minute whenever the user opens a note while voice is disconnected.
+let lastNoteViewingLoggedTs = '';
 /**
  * Read the current note-viewing event from disk, if any. Used for
  * on-reconnect delivery so the voice agent can catch up on what the user
@@ -223,7 +229,10 @@ export function startNoteViewingWatcher(
 		const event = readCurrentNoteViewing();
 		if (!event) return;
 		if (event.ts === lastNoteViewingTs) return;  // already handled
-		console.log(`${ts()} [TaskBridge] Note view detected: ${event.slug}`);
+		if (event.ts !== lastNoteViewingLoggedTs) {
+			console.log(`${ts()} [TaskBridge] Note view detected: ${event.slug}`);
+			lastNoteViewingLoggedTs = event.ts;
+		}
 		const handled = onNoteView(event.slug, event.content);
 		// Only mark as handled if the callback actually delivered it. This
 		// lets a voice-disconnected callback return false/void-with-falsy
@@ -240,6 +249,9 @@ export function startNoteViewingWatcher(
  */
 export function resetNoteViewingDebounce(): void {
 	lastNoteViewingTs = '';
+	// Also reset the logged-ts so the next delivery attempt logs again —
+	// a reconnect is a meaningful event that should show up in the log.
+	lastNoteViewingLoggedTs = '';
 }
 
 export function startResultWatcher(onResult: (result: string) => void, isClientConnected: () => boolean): void {
