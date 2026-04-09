@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.json'
+      - 'src/**'
+      - 'tests/**'
+      - 'skills/**/*.ts'
+      - '.github/workflows/ci.yml'
+  push:
+    branches: [main]
+
+jobs:
+  typecheck-and-test:
+    name: tsc + tests (clean install)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      # `npm ci` installs deps AND optionalDependencies. This catches the
+      # failure mode PR #234 introduced: a new static import of a package
+      # that isn't actually resolvable from a clean checkout. If a PR adds
+      # a dep but forgets to update package-lock.json (or forgets to use
+      # lazy imports for optional deps), this step fails fast.
+      - name: Install dependencies (clean)
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Run tests
+        run: npm test
+        if: hashFiles('tests/**/*.test.ts') != ''
