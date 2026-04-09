@@ -12,6 +12,11 @@
  *   npx tsx src/cartesia-tts.ts "Hello world"
  */
 
+// @ts-expect-error -- `@cartesia/cartesia-js` is an optional dependency.
+// When CARTESIA_API_KEY is not set, voice-agent.ts skips the dynamic
+// import of this file entirely, so a missing module is never a runtime
+// error. The `@ts-expect-error` tells tsc to tolerate the missing
+// declarations on machines that ran `npm install --no-optional`.
 import Cartesia from '@cartesia/cartesia-js';
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';

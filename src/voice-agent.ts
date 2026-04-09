@@ -29,12 +29,19 @@ import {
 	VoiceSession,
 	GeminiBatchSTTProvider,
 } from 'bodhi-realtime-agent';
-import { CartesiaSTTProvider } from './cartesia-stt-provider.js';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
 import { workTool, cancelTask, startResultWatcher, startContextDropWatcher, logConversation, getRecentConversation, setTaskStatusCallback } from './task-bridge.js';
 import { buildSutandoSystemPrompt, buildVoiceAgentContext } from './voice-context.js';
-import { generateSpeech } from './cartesia-tts.js';
+
+// Cartesia is loaded dynamically at the bottom of the config section so
+// the `@cartesia/cartesia-js` package is only required when the user has
+// set CARTESIA_API_KEY. Gemini-only setups (the default) skip the import
+// entirely — no install cost, no type-check cost (see tsconfig `exclude`).
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let CartesiaSTTProvider: any = null;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let generateSpeech: ((text: string, opts: { category: string; label: string }) => Promise<string>) | null = null;
 
 // =============================================================================
 // Config
@@ -60,6 +67,28 @@ const VOICE_NATIVE_AUDIO_MODEL = process.env.VOICE_NATIVE_AUDIO_MODEL || 'gemini
 const STT_MODEL = process.env.STT_MODEL || 'gemini-3-flash-preview';
 const CARTESIA_API_KEY = process.env.CARTESIA_API_KEY || '';
 const STT_PROVIDER = process.env.STT_PROVIDER || (CARTESIA_API_KEY ? 'cartesia' : 'gemini');
+
+// Lazy-load Cartesia modules only when a key is set. This means Gemini-only
+// users don't need `@cartesia/cartesia-js` installed at all — the
+// cartesia-*.ts files are excluded from tsc via tsconfig and never loaded
+// by tsx at runtime unless this branch runs.
+if (CARTESIA_API_KEY) {
+	try {
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const sttMod: any = await import('./cartesia-stt-provider.js');
+		CartesiaSTTProvider = sttMod.CartesiaSTTProvider;
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const ttsMod: any = await import('./cartesia-tts.js');
+		generateSpeech = ttsMod.generateSpeech;
+	} catch (err) {
+		console.error(
+			`[Cartesia] failed to load modules — is @cartesia/cartesia-js installed?`,
+			err instanceof Error ? err.message : err
+		);
+		// CartesiaSTTProvider and generateSpeech stay null; guards below
+		// will fall back to Gemini paths.
+	}
+}
 
 const google = createGoogleGenerativeAI({ apiKey: GEMINI_API_KEY });
 let sessionRef: VoiceSession | null = null;
@@ -294,7 +323,7 @@ async function main() {
 		host: HOST,
 		model: google(VOICE_MODEL),
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
-		sttProvider: STT_PROVIDER === 'cartesia' && CARTESIA_API_KEY
+		sttProvider: STT_PROVIDER === 'cartesia' && CARTESIA_API_KEY && CartesiaSTTProvider
 			? new CartesiaSTTProvider({ apiKey: CARTESIA_API_KEY })
 			: new GeminiBatchSTTProvider({ apiKey: GEMINI_API_KEY, model: STT_MODEL }),
 		speechConfig: { voiceName: 'Puck' },
@@ -328,7 +357,7 @@ async function main() {
 			setTimeout(() => {
 				injectText(session, `[System: Task completed. Briefly tell the user this result in one sentence:] ${result}`);
 			}, 1500);
-		} else if (CARTESIA_API_KEY) {
+		} else if (CARTESIA_API_KEY && generateSpeech) {
 			// Voice not connected — generate Cartesia TTS for async playback
 			const truncated = (result.match(/^[\s\S]{0,500}[.!?]/)?.[0] || result.slice(0, 500)).trim();
 			generateSpeech(truncated, { category: 'result', label: 'task-result' }).then(audioPath => {
