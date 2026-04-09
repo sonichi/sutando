@@ -414,8 +414,16 @@ def main():
                     # so the new process doesn't conflict with a still-running zombie.
                     if c["status"] == "stale":
                         try:
+                            # Anchor to `\.py$` to match the detect path at
+                            # line ~277. Without this, a bare `pgrep -f
+                            # discord-bridge` also catches grep pipelines
+                            # and shell invocations whose command line
+                            # contains the bridge name, and we'd kill them
+                            # instead of (or in addition to) the real
+                            # bridge process. PR #243 fixed the detect
+                            # side; this keeps the kill side consistent.
                             old_pids = subprocess.run(
-                                ["pgrep", "-f", c["name"]], capture_output=True, text=True
+                                ["pgrep", "-f", f"{c['name']}\\.py$"], capture_output=True, text=True
                             ).stdout.strip().split("\n")
                             for pid in old_pids:
                                 if pid:
