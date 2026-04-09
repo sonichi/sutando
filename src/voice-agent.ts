@@ -435,6 +435,20 @@ async function main() {
 	// the path. Silent acknowledgement — unlike context drop this is not an
 	// action, just situational awareness.
 	startNoteViewingWatcher((slug, content) => {
+		// Gate on a real user turn. Without this, every reconnect re-injects
+		// the currently-viewed note before the user has said anything, and
+		// notes containing words that match our behavior rules (e.g.
+		// uiuc-trip-conflicts.md has "better to fully disconnect") derail
+		// the greeting into an apology loop where the assistant hallucinates
+		// a goodbye, calls end_session, gets refused, apologizes, fires
+		// end_session again, and never yields the turn. Once the user has
+		// spoken at least once, their real intent dominates and the note
+		// context is useful.
+		if (userTurnCount === 0) {
+			// Return false so the debounce doesn't bump — the next poll
+			// (after a user turn) will re-deliver the same event.
+			return false;
+		}
 		if (session.sessionManager.isActive && session.clientConnected) {
 			console.log(`${ts()} [NoteView] Injecting: ${slug}`);
 			const truncated = content.length > 4000 ? content.slice(0, 4000) + '\n\n[...truncated]' : content;
