@@ -642,7 +642,7 @@ async function createCallSession(params: {
 				callSession.toolCalls.push({ name: toolName, durationMs: e.durationMs, timestamp: new Date().toISOString() });
 				callSession.events.push({ event: `tool_result:${toolName}:${e.durationMs}ms`, timestamp: new Date().toISOString() });
 				// Log REC indicator status for recording tools
-				if (toolName === 'scroll_and_describe' || toolName === 'screen_record') {
+				if (toolName === 'scroll_and_describe' || toolName === 'screen_record' || toolName === 'open_video') {
 					const hasIndicator = existsSync('/tmp/sutando-rec-indicator.pid');
 					callSession.events.push({ event: `rec_indicator:${hasIndicator ? 'on' : 'off'}`, timestamp: new Date().toISOString() });
 				}
