@@ -70,6 +70,10 @@ const TASK_TIMEOUT_MS = 120_000;
 const OWNER_NAME = process.env.owner ?? '';
 const OWNER_NUMBER = process.env.OWNER_NUMBER ?? '';
 
+// Model configuration — override via .env
+const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
+const VOICE_NATIVE_AUDIO_MODEL = process.env.VOICE_NATIVE_AUDIO_MODEL || 'gemini-3.1-flash-live-preview';
+
 /** Normalize phone number to digits only for comparison (strips +, -, spaces, parens) */
 function normalizePhone(num: string): string {
 	const digits = num.replace(/\D/g, '');
@@ -622,8 +626,8 @@ async function createCallSession(params: {
 		initialAgent: 'phone',
 		port: bodhiPort,
 		host: '127.0.0.1',
-		model: google('gemini-2.5-flash'),
-		geminiModel: 'gemini-2.5-flash-native-audio-preview-12-2025',
+		model: google(VOICE_MODEL),
+		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
 		googleSearch: true,
 		speechConfig: { voiceName: 'Aoede' },
 		hooks: {
