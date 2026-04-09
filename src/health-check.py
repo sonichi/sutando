@@ -161,10 +161,48 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
         proc_start = min(starts)
         src_mtime = src_file.stat().st_mtime
         if src_mtime - proc_start > threshold_sec:
+            # Before flagging stale, cross-check with git: mtime gets bumped by
+            # `git checkout`/`pull`/`rebase` even when the file content is
+            # identical, which produced a steady stream of false positives
+            # whenever a branch switch left the working tree unchanged on a
+            # specific file. Ask git for the last commit time that actually
+            # touched this file. If that's older than proc_start AND there
+            # are no uncommitted changes to the file, it's a mtime-only
+            # bump — the running code is still current.
+            if _file_unchanged_since(src_file, proc_start):
+                return
             check["status"] = "stale"
             check["detail"] = f"running but code is {int((src_mtime - proc_start) / 60)} min newer than process — restart needed"
     except (subprocess.TimeoutExpired, OSError):
         pass
+
+
+def _file_unchanged_since(src_file: Path, proc_start: float) -> bool:
+    """Return True if git's last-commit-time for src_file predates proc_start
+    AND the file has no uncommitted changes. Used to suppress stale-detection
+    false positives from git operations that bump mtime without changing
+    content. Silent-failure: returns False on any git error so real stale
+    deploys aren't hidden.
+    """
+    try:
+        log = subprocess.run(
+            ["git", "log", "-1", "--format=%ct", "HEAD", "--", str(src_file)],
+            cwd=REPO_DIR, capture_output=True, text=True, timeout=5
+        )
+        if log.returncode != 0 or not log.stdout.strip():
+            return False
+        commit_time = int(log.stdout.strip())
+        if commit_time >= proc_start:
+            # Real commit landed after proc_start — genuinely stale
+            return False
+        # No commits since proc_start; check for uncommitted edits
+        diff = subprocess.run(
+            ["git", "diff", "--quiet", "HEAD", "--", str(src_file)],
+            cwd=REPO_DIR, capture_output=True, timeout=5
+        )
+        return diff.returncode == 0  # 0 = no diff
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        return False
 
 
 # Watchers task-bridge starts at voice-agent boot. If any of these is
