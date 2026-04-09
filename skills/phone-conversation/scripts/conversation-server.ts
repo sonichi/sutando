@@ -731,6 +731,9 @@ async function createCallSession(params: {
 			if (item.content === lastTranscriptText) continue;
 			if (item.role === 'user') {
 				callSession.transcript.push({ role: 'caller', text: item.content });
+				// 12s offset: Gemini STT commits transcript ~12s after the caller actually spoke
+				// (measured via iPad recording comparison on 2026-04-09). Without this, caller
+				// timestamps appear after Sutando's responses in the observability timeline.
 				callSession.events.push({ event: `caller:${item.content.slice(0, 60)}`, timestamp: new Date(Date.now() - 12000).toISOString() });
 				try { appendFileSync(`/tmp/sutando-live-transcript-${callSession.callSid}.txt`, `[${new Date(Date.now() - 12000).toLocaleTimeString('en-US', {hour12:false})}] Caller: ${item.content}\n`); } catch {}
 			} else if (item.role === 'assistant') {

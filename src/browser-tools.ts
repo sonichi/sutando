@@ -347,8 +347,10 @@ export const scrollAndDescribeTool: ToolDefinition = {
 				scrolledTotal += pxPerStep;
 			}, SCROLL_INTERVAL_MS);
 
-			// Auto-stop after duration — wait 3s for narration-tee mux to finish
-			// before setting demoState='done' so play_recording can find the file
+			// Auto-stop after duration — wait for narration-tee mux, then burn subtitles.
+			// Capture start time: if user starts a 2nd recording before this timer fires,
+			// liveTranscriptRecordingStart will be overwritten. Only clear if still ours.
+			const myRecStart = liveTranscriptRecordingStart;
 			setTimeout(async () => {
 				clearInterval(scrollInterval);
 				let stopResult: any = {};
@@ -367,7 +369,7 @@ export const scrollAndDescribeTool: ToolDefinition = {
 					burnLiveTranscriptSubtitles(narrated);
 					console.log(`${ts()} [ScrollAndDescribe] subtitle burned on: ${narrated}`);
 				}
-				liveTranscriptRecordingStart = 0;
+				if (liveTranscriptRecordingStart === myRecStart) liveTranscriptRecordingStart = 0;
 				demoState = 'done';
 				console.log(`${ts()} [ScrollAndDescribe] auto-stop`);
 			}, duration_seconds * 1000);
@@ -710,7 +712,8 @@ function burnLiveTranscriptSubtitles(videoPath: string): string | null {
 			const match = line.match(/^\[(\d{2}):(\d{2}):(\d{2})\]\s+(.+)$/);
 			if (!match) continue;
 			const [, hh, mm, ss, content] = match;
-			// Only include Sutando's screen descriptions, skip caller and non-narration responses
+			// Exclude caller speech — already audible in the narrated audio track.
+			// Subtitles only show Sutando's screen descriptions to avoid redundancy.
 			if (content.startsWith('Caller:') || content.startsWith('User:')) continue;
 			const text = content.replace(/^Sutando:\s*/, '');
 			// Skip short conversational responses — long lines starting with filler are screen descriptions
@@ -738,7 +741,10 @@ function burnLiveTranscriptSubtitles(videoPath: string): string | null {
 			}
 		}
 
-		// Auto-align: distribute entries evenly across recording duration
+		// Auto-align: STT timestamps have ~12s lag, so wall-clock times are unreliable.
+		// Distribute entries evenly across recording duration instead.
+		// +5000 tail padding accounts for final description still displaying; *6000 fallback
+		// when all timestamps collapse to the same second (single burst of descriptions).
 		const totalDurationMs = chunked[chunked.length - 1].timeMs - chunked[0].timeMs;
 		const recordingDurationMs = totalDurationMs > 0 ? totalDurationMs + 5000 : chunked.length * 6000;
 		const interval = recordingDurationMs / chunked.length;
