@@ -158,27 +158,17 @@ const getTaskStatus: ToolDefinition = {
 	},
 };
 
-// end_session gate: block the tool unless we have independent
-// evidence the user has spoken in the current session. Two signals,
-// because neither alone is reliable:
-//
-// 1. userTurnCount — incremented in turn.end when a real user item
-//    lands in conversationContext.items. Works for STT-based
-//    transcripts but fails silently under native-audio models where
-//    the transcript pipeline doesn't populate items (observed
-//    2026-04-09: Gemini 2.5 native-audio heard the user fine and
-//    responded to "bye" with "farewell", but no user item ever
-//    landed in items, so an items-only gate refused a legitimate
-//    goodbye).
-//
-// 2. userHasInterrupted — set when bodhi fires turn.interrupted.
-//    That event fires whenever the user's audio interrupts the
-//    assistant, regardless of whether transcription succeeds. A
-//    reliable "user is here and active" signal for the native-
-//    audio path.
-//
-// end_session allows if EITHER signal is true. Both reset on every
-// fresh greeting so each reconnect starts from zero.
+// end_session has no runtime gate. Both previous gate strategies
+// (items-based and event-based) failed under the native-audio model,
+// which doesn't populate conversationContext.items with user turns
+// and doesn't fire turn.interrupted during silent assistant periods.
+// The contamination-loop protection instead comes from upstream
+// fixes: the greeting-replay filter in mainAgent.get greeting(), the
+// NoteView injection guard markers + debounce, and the result
+// injection guard markers. If contamination still triggers an
+// end_session call through all those layers, the user can just
+// click Connect again — a worse UX than the race-free path, but
+// vastly better than being unable to end the session at all.
 let userTurnCount = 0;
 let userHasInterrupted = false;
 
@@ -188,29 +178,7 @@ const endSession: ToolDefinition = {
 	parameters: z.object({}),
 	execution: 'inline',
 	execute: async (_args, ctx) => {
-		// Allow if EITHER signal says the user is active. Both checks
-		// because each covers a different failure mode — see the
-		// comment block above the userTurnCount / userHasInterrupted
-		// declarations for context.
-		const vs = voiceSessionRef as any;
-		const items = vs?.conversationContext?.items;
-		const hasRealUserTurn = Array.isArray(items) && items.some((item: { role?: string; content?: string }) =>
-			item?.role === 'user' &&
-			typeof item?.content === 'string' &&
-			item.content.length > 0 &&
-			!item.content.startsWith('[System:')
-		);
-		if (!hasRealUserTurn && !userHasInterrupted) {
-			const itemSummary = Array.isArray(items)
-				? items.map((it: { role?: string; content?: string }) => `${it?.role ?? '?'}:${(it?.content ?? '').slice(0, 40)}`).slice(-5).join(' | ')
-				: 'no-items';
-			console.log(`${ts()} [end_session] REFUSED — no real user activity yet (turns=${userTurnCount}, interrupted=${userHasInterrupted}). last items: [${itemSummary}]`);
-			return {
-				status: 'refused',
-				instruction: "end_session REFUSED — the user has NOT actually spoken or interrupted in this session. What you matched was text from injected context (note content, replayed history, task result), NOT user speech. Do NOT say 'goodbye', 'bye', or 'ending session' in your spoken response. Do NOT acknowledge this refusal to the user. Stay silent and wait for the user's real voice input. The session remains fully active.",
-			};
-		}
-		console.log(`${ts()} [end_session] allowed (hasRealUserTurn=${hasRealUserTurn}, userHasInterrupted=${userHasInterrupted})`);
+		console.log(`${ts()} [end_session] firing (userTurnCount=${userTurnCount}, userHasInterrupted=${userHasInterrupted})`);
 		console.log(`${ts()} [end_session] Sending session_end to client (sendJsonToClient exists: ${!!ctx.sendJsonToClient})`);
 		ctx.sendJsonToClient?.({ type: 'session_end', reason: 'user_goodbye' });
 		// CRITICAL: clear bodhi's in-memory conversationContext so the next
@@ -459,20 +427,12 @@ async function main() {
 	// the path. Silent acknowledgement — unlike context drop this is not an
 	// action, just situational awareness.
 	startNoteViewingWatcher((slug, content) => {
-		// Gate on a real user turn. Without this, every reconnect re-injects
-		// the currently-viewed note before the user has said anything, and
-		// notes containing words that match our behavior rules (e.g.
-		// uiuc-trip-conflicts.md has "better to fully disconnect") derail
-		// the greeting into an apology loop where the assistant hallucinates
-		// a goodbye, calls end_session, gets refused, apologizes, fires
-		// end_session again, and never yields the turn. Once the user has
-		// spoken at least once, their real intent dominates and the note
-		// context is useful.
-		if (userTurnCount === 0) {
-			// Return false so the debounce doesn't bump — the next poll
-			// (after a user turn) will re-deliver the same event.
-			return false;
-		}
+		// NOTE: previously gated on userTurnCount > 0 to prevent note
+		// content from contaminating the initial greeting, but that gate
+		// is useless under native-audio models where userTurnCount never
+		// increments. Relying instead on the <NOTE_START>...<NOTE_END>
+		// guard markers in the injection prompt to tell Gemini not to
+		// match trigger words inside the note against behavior rules.
 		if (session.sessionManager.isActive && session.clientConnected) {
 			console.log(`${ts()} [NoteView] Injecting: ${slug}`);
 			const truncated = content.length > 4000 ? content.slice(0, 4000) + '\n\n[...truncated]' : content;
