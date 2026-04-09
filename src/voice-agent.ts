@@ -177,9 +177,15 @@ const endSession: ToolDefinition = {
 		// clears the state machine; conversationContext persists separately.
 		try {
 			const vs = voiceSessionRef as any;
-			if (vs?.conversationContext?.items) {
-				const count = vs.conversationContext.items.length;
-				vs.conversationContext.items = [];
+			const items = vs?.conversationContext?.items;
+			// `items` is a GETTER returning bodhi's underlying _items array
+			// by reference. We can't reassign to it (TypeError: only has a
+			// getter, hit live at 23:01:09 on 2026-04-09) but we CAN mutate
+			// in place via `length = 0`. Verified against bodhi dist
+			// ConversationContext class around line 945 of index.js.
+			if (Array.isArray(items)) {
+				const count = items.length;
+				items.length = 0;
 				console.log(`${ts()} [end_session] Cleared ${count} conversationContext items`);
 			}
 		} catch (e) {
