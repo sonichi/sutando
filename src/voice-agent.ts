@@ -31,7 +31,7 @@ import {
 } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
-import { workTool, cancelTask, startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, logConversation, getRecentConversation, setTaskStatusCallback } from './task-bridge.js';
+import { workTool, cancelTask, startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, resetNoteViewingDebounce, logConversation, getRecentConversation, setTaskStatusCallback } from './task-bridge.js';
 import { buildSutandoSystemPrompt, buildVoiceAgentContext } from './voice-context.js';
 
 // Cartesia is loaded dynamically at the bottom of the config section so
@@ -194,6 +194,11 @@ let voiceSessionRef: VoiceSession | null = null;
 const mainAgent: MainAgent = {
 	name: 'main',
 	get greeting() {
+		// Reset note-viewing debounce so any note the user was already
+		// looking at (from a previous disconnected session) re-fires on
+		// the next watcher poll. Without this, a note opened while voice
+		// was offline would never reach Gemini after reconnect.
+		resetNoteViewingDebounce();
 		const recent = getRecentConversation(8);
 		if (recent) {
 			return `[System: The user reconnected. Here is the recent conversation history — continue naturally without repeating the introduction. If they ask a follow-up, use this context.]\n\n${recent}\n\n[Say "Welcome back" briefly — one sentence.]`;
@@ -359,7 +364,12 @@ async function main() {
 			console.log(`${ts()} [NoteView] Injecting: ${slug}`);
 			const truncated = content.length > 4000 ? content.slice(0, 4000) + '\n\n[...truncated]' : content;
 			injectText(session, `[System: The user is now viewing notes/${slug}.md in the web UI. Do not acknowledge this out loud — just use it as context for whatever they ask next. Note content:]\n\n${truncated}`);
+			return true;  // handled — watcher bumps its debounce
 		}
+		// Not connected: return false so the watcher keeps the event
+		// pending. On reconnect we reset the debounce (below) and this
+		// poll will fire again with the same content.
+		return false;
 	});
 
 	startResultWatcher((result) => {

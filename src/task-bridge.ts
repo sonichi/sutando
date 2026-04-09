@@ -197,21 +197,49 @@ export function startContextDropWatcher(onContextDrop: (content: string) => void
  * note doesn't re-inject.
  */
 let lastNoteViewingTs = '';
-export function startNoteViewingWatcher(onNoteView: (slug: string, content: string) => void): void {
+/**
+ * Read the current note-viewing event from disk, if any. Used for
+ * on-reconnect delivery so the voice agent can catch up on what the user
+ * is looking at without waiting for a fresh click.
+ */
+export function readCurrentNoteViewing(): { slug: string; content: string; ts: string } | null {
+	if (!existsSync(NOTE_VIEWING_FILE)) return null;
+	try {
+		const raw = readFileSync(NOTE_VIEWING_FILE, 'utf-8').trim();
+		if (!raw) return null;
+		const event = JSON.parse(raw) as { slug?: string; content?: string; ts?: string };
+		if (!event.slug || !event.content || !event.ts) return null;
+		return { slug: event.slug, content: event.content, ts: event.ts };
+	} catch {
+		return null;
+	}
+}
+
+export function startNoteViewingWatcher(
+	onNoteView: (slug: string, content: string) => boolean | void,
+): void {
 	console.log(`${ts()} [TaskBridge] Watching for note views (${NOTE_VIEWING_FILE})`);
 	setInterval(() => {
-		if (!existsSync(NOTE_VIEWING_FILE)) return;
-		try {
-			const raw = readFileSync(NOTE_VIEWING_FILE, 'utf-8').trim();
-			if (!raw) return;
-			const event = JSON.parse(raw) as { slug?: string; content?: string; ts?: string };
-			if (!event.slug || !event.content || !event.ts) return;
-			if (event.ts === lastNoteViewingTs) return;  // already handled
-			lastNoteViewingTs = event.ts;
-			console.log(`${ts()} [TaskBridge] Note view detected: ${event.slug}`);
-			onNoteView(event.slug, event.content);
-		} catch { /* file might be in transit or malformed */ }
+		const event = readCurrentNoteViewing();
+		if (!event) return;
+		if (event.ts === lastNoteViewingTs) return;  // already handled
+		console.log(`${ts()} [TaskBridge] Note view detected: ${event.slug}`);
+		const handled = onNoteView(event.slug, event.content);
+		// Only mark as handled if the callback actually delivered it. This
+		// lets a voice-disconnected callback return false/void-with-falsy
+		// and we'll try again on the next poll — which matters when a
+		// reconnect handler also calls back through here.
+		if (handled !== false) lastNoteViewingTs = event.ts;
 	}, 2000);
+}
+
+/**
+ * Reset the note-viewing debounce so a subsequent poll re-delivers the
+ * current event. Called from the voice session on reconnect so that a
+ * note the user was already looking at gets injected fresh.
+ */
+export function resetNoteViewingDebounce(): void {
+	lastNoteViewingTs = '';
 }
 
 export function startResultWatcher(onResult: (result: string) => void, isClientConnected: () => boolean): void {
