@@ -141,11 +141,39 @@ export function logConversation(role: string, text: string): void {
 	try { appendFileSync(CONVERSATION_LOG, line); } catch { /* best effort */ }
 }
 
-/** Read the last N conversation entries from disk. Survives restarts. */
+/** Append a session-end boundary marker. Used by voice-agent's
+ *  endSession tool so that getRecentConversation() can trim its
+ *  replay window at the last session boundary — preventing goodbye
+ *  text from a prior session from contaminating the reconnect
+ *  greeting. Replaces the pattern-match filter that got defeated
+ *  multiple times on 2026-04-09 (commits 1-6 of PR #257).
+ *
+ *  Format: ISO-ts|SESSION_END|<reason>
+ *  The `SESSION_END` sentinel is unique so the reader can locate
+ *  it without regex gymnastics. */
+export function logSessionBoundary(reason: string = 'user_goodbye'): void {
+	const line = `${new Date().toISOString()}|SESSION_END|${reason}\n`;
+	try { appendFileSync(CONVERSATION_LOG, line); } catch { /* best effort */ }
+}
+
+/** Read recent conversation entries from disk, trimming at the most
+ *  recent SESSION_END marker. Survives restarts. Returns at most
+ *  `count` entries from the current session only — a cleanly-ended
+ *  prior session has no meaningful follow-up context. */
 export function getRecentConversation(count = 10): string {
 	if (!existsSync(CONVERSATION_LOG)) return '';
 	try {
-		const lines = readFileSync(CONVERSATION_LOG, 'utf-8').trim().split('\n').slice(-count);
+		const allLines = readFileSync(CONVERSATION_LOG, 'utf-8').trim().split('\n');
+		// Find the last SESSION_END marker and keep only lines after it
+		let lastBoundary = -1;
+		for (let i = allLines.length - 1; i >= 0; i--) {
+			if (allLines[i].includes('|SESSION_END|')) {
+				lastBoundary = i;
+				break;
+			}
+		}
+		const currentSession = lastBoundary >= 0 ? allLines.slice(lastBoundary + 1) : allLines;
+		const lines = currentSession.slice(-count);
 		return lines.map(l => {
 			const [, role, text] = l.split('|', 3);
 			return role && text ? `${role}: ${text}` : '';
