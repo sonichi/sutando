@@ -18,16 +18,11 @@ export function injectText(session: any, text: string) {
 			transport.session.sendRealtimeInput({ text });
 		} else if (typeof transport?.sendContent === 'function') {
 			transport.sendContent([{ role: 'user', text }], true);
-		} else {
-			console.warn(`${ts()} [InjectText] No supported text injection method on transport`);
 		}
 	} catch (err) {
 		console.error(`${ts()} [InjectText] Error:`, err);
 	}
 }
-
-// Vision model — override via .env (default: flash-lite for this trivial 20-word task)
-const VISION_MODEL = process.env.VISION_MODEL || 'gemini-3.1-flash-lite-preview';
 
 // --- Scroll ---
 
@@ -189,7 +184,7 @@ export const typeTextTool: ToolDefinition = {
 
 // --- Describe screen (vision) ---
 
-async function describeScreenshot(imagePath: string, previousDescs: string[] = []): Promise<string> {
+async function describeScreenshot(imagePath: string): Promise<string> {
 	const apiKey = process.env.GEMINI_API_KEY;
 	if (!apiKey) return 'Vision description unavailable (no GEMINI_API_KEY)';
 	try {
@@ -202,25 +197,15 @@ async function describeScreenshot(imagePath: string, previousDescs: string[] = [
 		const actualPath = existsSync(resized) ? resized : imagePath;
 		const mimeType = actualPath.endsWith('.jpg') ? 'image/jpeg' : 'image/png';
 		const imageData = readFileSync(actualPath).toString('base64');
-		// Issue #189: when continuing a narration, the vision model should build
-		// on what was already said instead of re-introducing the page every
-		// time. First call: introduce with the heading. Later calls: flow on.
-		let prompt: string;
-		if (previousDescs.length === 0) {
-			prompt = 'Describe what is on screen in exactly 1 short sentence (max 20 words). Quote the main heading. This will be spoken aloud.';
-		} else {
-			const recent = previousDescs.slice(-3).map((d, i) => `${i + 1}. ${d}`).join(' | ');
-			prompt = `You are narrating a screen recording aloud. Already spoken: ${recent}. Describe ONLY what is NEW or has changed. Use a natural continuation ("Scrolling down...", "Next...", "Now we see...", "Further down..."). Do NOT restart with "The screen shows/displays" — the viewer already knows what page this is. 1 short sentence, max 20 words.`;
-		}
 		const res = await fetch(
-			`https://generativelanguage.googleapis.com/v1beta/models/${VISION_MODEL}:generateContent?key=${apiKey}`,
+			`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
 			{
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({
 					contents: [{
 						parts: [
-							{ text: prompt },
+							{ text: 'Describe what is on screen in exactly 1 short sentence (max 20 words). Quote the main heading. This will be spoken aloud.' },
 							{ inlineData: { mimeType, data: imageData } },
 						],
 					}],
@@ -318,6 +303,10 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			execSync(`osascript -e 'tell application "System Events" to key code 126 using command down'`, { timeout: 5_000 });
 
 			// Start recording + first describe_screen in parallel
+			// Always enable live transcript subtitles during scroll_and_describe recordings
+			liveTranscriptRecordingStart = Date.now();
+			liveTranscriptBaselineLines = countTranscriptLines();
+			try { unlinkSync(LIVE_TRANSCRIPT_SRT_PATH); } catch {}
 			execSync('python3 skills/screen-record/scripts/record.py start', { timeout: 10_000 });
 			const captureRes = await fetch('http://localhost:7845/capture');
 			const captureData = await captureRes.json() as { status: string; path?: string };
@@ -343,10 +332,27 @@ export const scrollAndDescribeTool: ToolDefinition = {
 				scrolledTotal += pxPerStep;
 			}, SCROLL_INTERVAL_MS);
 
-			// Auto-stop after duration
-			setTimeout(() => {
+			// Auto-stop after duration — wait 3s for narration-tee mux to finish
+			// before setting demoState='done' so play_recording can find the file
+			setTimeout(async () => {
 				clearInterval(scrollInterval);
-				try { execSync('python3 skills/screen-record/scripts/record.py stop', { timeout: 10_000 }); } catch {}
+				let stopResult: any = {};
+				try {
+					const raw = execSync('python3 skills/screen-record/scripts/record.py stop', { timeout: 10_000 }).toString().trim();
+					stopResult = JSON.parse(raw);
+				} catch {}
+				// Wait for narrated.mov to exist (narration-tee stop + mux ~2s after record.py stop)
+				const narrated = stopResult.path ? stopResult.path.replace('.mov', '-narrated.mov') : '';
+				for (let w = 0; w < 4; w++) {
+					if (narrated && isReadableFile(narrated)) break;
+					await new Promise(r => setTimeout(r, 2000));
+				}
+				// Burn live transcript subtitles on narrated version only
+				if (liveTranscriptRecordingStart > 0 && narrated && isReadableFile(narrated)) {
+					burnLiveTranscriptSubtitles(narrated);
+					console.log(`${ts()} [ScrollAndDescribe] subtitle burned on: ${narrated}`);
+				}
+				liveTranscriptRecordingStart = 0;
 				demoState = 'done';
 				console.log(`${ts()} [ScrollAndDescribe] auto-stop`);
 			}, duration_seconds * 1000);
@@ -402,7 +408,9 @@ export function setupRecordingHooks(session: any): void {
 export function onReconnect(session: any): void {
 	if (!isRecordingActive()) return;
 	try {
-		injectText(session, '[System: You were narrating a screen demo. Continue where you left off — call describe_screen and keep narrating. Do NOT greet or say "I\'m back".]');
+		session.transport.sendContent([
+			{ role: 'user', text: '[System: You were narrating a screen demo. Continue where you left off — call describe_screen and keep narrating. Do NOT greet or say "I\'m back".]' },
+		], true);
 	} catch {}
 }
 
@@ -447,14 +455,16 @@ export function startRecordingNarration(session: any): void {
 			console.log(`${ts()} [Recording] near end — stopped pushing`);
 			clearInterval(descTimer);
 			try {
-				injectText(session, '[System: Recording ending soon. Finish your current sentence and stop.]');
+				session.transport.sendContent([
+					{ role: 'user', text: '[System: Recording ending soon. Finish your current sentence and stop.]' },
+				], true);
 			} catch {}
 			return;
 		}
 		try {
 			const path = await captureScreen();
 			if (!path) return;
-			const desc = await describeScreenshot(path, previousDescs);
+			const desc = await describeScreenshot(path);
 			if (!desc || desc === lastDesc) {
 				if (desc === lastDesc) console.log(`${ts()} [Recording] skipped duplicate`);
 				return;
@@ -464,7 +474,9 @@ export function startRecordingNarration(session: any): void {
 			if (!existsSync('/tmp/sutando-screen-record.pid')) return;
 			const remaining = Math.round((durationMs - (Date.now() - startTime)) / 1000);
 			const alreadySaid = previousDescs.slice(0, -1).map((d, i) => `${i + 1}. ${d.slice(0, 40)}`).join('; ');
-			injectText(session, `[System: ${remaining}s left. Already narrated: ${alreadySaid || 'nothing yet'}. Now narrate this NEW content only (1 short sentence, no repeats): "${desc}"]`);
+			session.transport.sendContent([
+				{ role: 'user', text: `[System: ${remaining}s left. Already narrated: ${alreadySaid || 'nothing yet'}. Now narrate this NEW content only (1 short sentence, no repeats): "${desc}"]` },
+			], true);
 			console.log(`${ts()} [Recording] pushed: ${desc.slice(0, 60)}...`);
 		} catch (err) {
 			console.log(`${ts()} [Recording] push error: ${err}`);
@@ -483,7 +495,9 @@ export function startRecordingNarration(session: any): void {
 		narrationActive = false;
 		console.log(`${ts()} [Recording] timer fired — sending stop`);
 		try {
-			injectText(session, '[System: Recording just ended. Say "The recording is complete." immediately.]');
+			session.transport.sendContent([
+				{ role: 'user', text: '[System: Recording just ended. Say "The recording is complete." immediately.]' },
+			], true);
 		} catch {}
 	}, durationMs + 1000); // +1s buffer for auto-stop to finish
 }
@@ -494,14 +508,17 @@ function isReadableFile(path: string): boolean {
 	try { return existsSync(path) && statSync(path).size > 1000; } catch { return false; }
 }
 
-function findRecording(version?: 'raw' | 'narrated'): string | null {
+function findRecording(version?: 'raw' | 'narrated' | 'subtitled'): string | null {
 	try {
 		const files = execSync('ls -t /tmp/sutando-recording-*.mov 2>/dev/null | grep -v narrated | grep -v subtitled | head -1', { timeout: 3_000 }).toString().trim();
 		if (files && isReadableFile(files)) {
 			if (version === 'raw') return files;
 			const narrated = files.replace('.mov', '-narrated.mov');
+			const subtitled = narrated.replace('.mov', '-subtitled.mov');
+			if (version === 'subtitled') return isReadableFile(subtitled) ? subtitled : (isReadableFile(narrated) ? narrated : files);
 			if (version === 'narrated') return isReadableFile(narrated) ? narrated : files;
-			// Default: prefer narrated > raw
+			// Default (no version): prefer subtitled > narrated > raw
+			if (isReadableFile(subtitled)) return subtitled;
 			if (isReadableFile(narrated)) return narrated;
 			return files;
 		}
@@ -509,129 +526,130 @@ function findRecording(version?: 'raw' | 'narrated'): string | null {
 	return null;
 }
 
-export const playRecordingTool: ToolDefinition = {
-	name: 'play_recording',
+export const openVideoTool: ToolDefinition = {
+	name: 'open_video',
 	description:
-		'Control video playback. Use for ANY request about videos, recordings, or media files. ' +
-		'Actions: "open" (just open in QuickTime, do NOT play), "play" (play + stream audio to phone), "pause", "stop", "close" (quit player), "replay" (start from beginning), "status". ' +
-		'CRITICAL: "open" and "play" are DIFFERENT actions. When user says "open the video", "open the recording", or "can you open it" → use action:"open". NEVER use action:"play" unless the user explicitly says "play". ' +
-		'"close this video" → action:"close". "replay from the top" or "start over" → action:"replay".',
+		'Open the latest screen recording in QuickTime. Finds the best available version (subtitled > narrated > raw). ' +
+		'Use when user says "open the video", "open the recording", "can you open it".',
 	parameters: z.object({
-		action: z.enum(['open', 'play', 'pause', 'stop', 'close', 'replay', 'status']).default('open'),
-		path: z.string().optional().describe('File path. Omit for latest screen recording.'),
-		version: z.enum(['raw', 'narrated']).optional().describe('Which version: "raw" (no narration) or "narrated" (with voice). Omit for best available. For subtitles, use the work tool to add them.'),
+		path: z.string().optional().describe('File path. Omit for latest recording.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		let { action, path: filePath, version } = args as { action: 'open' | 'play' | 'pause' | 'stop' | 'close' | 'replay' | 'status'; path?: string; version?: 'raw' | 'narrated' };
-		const isReplay = action === 'replay';
-		if (action === 'stop') action = 'pause';
-		if (isReplay) action = 'play';
+		const { path: filePath } = args as { path?: string };
+		console.log(`${ts()} [OpenVideo] called`);
 		demoState = 'idle';
 		try {
-			if (action === 'close') {
-				try { execSync(`osascript -e 'tell application "QuickTime Player" to quit'`, { timeout: 5_000 }); } catch {}
-				try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
-				try { unlinkSync('/tmp/sutando-playback-path'); } catch {}
-				console.log(`${ts()} [PlayRecording] closed`);
-				return { status: 'closed', instruction: 'Video player closed.' };
-			}
-
-			if (action === 'pause') {
-				try { writeFileSync('/tmp/sutando-playback-pause', '1'); } catch {}
-				try { execSync(`osascript -e 'tell application "QuickTime Player"' -e 'if (count of documents) > 0 then' -e 'pause document 1' -e 'end if' -e 'end tell'`, { timeout: 5_000 }); } catch {}
-				console.log(`${ts()} [PlayRecording] paused`);
-				return { status: 'paused', instruction: 'Video paused. When user says continue/play/resume, call play_recording({action:"play"}) to resume. Say only "Paused." now.' };
-			}
-
-			if (action === 'status') {
-				try {
-					const out = execSync(`osascript -e 'tell application "QuickTime Player"' -e 'if (count of documents) > 0 then' -e 'set d to document 1' -e 'set p to playing of d' -e 'set c to current time of d' -e 'set dur to duration of d' -e 'return (p as text) & "|" & (c as text) & "|" & (dur as text)' -e 'else' -e 'return "none"' -e 'end if' -e 'end tell'`, { timeout: 5_000 }).toString().trim();
-					if (out === 'none') return { status: 'no_video_open' };
-					const [playing, current, duration] = out.split('|');
-					return { status: playing === 'true' ? 'playing' : 'paused', current_seconds: +current, duration_seconds: +duration };
-				} catch { return { status: 'no_video_open' }; }
-			}
-
 			let recPath = filePath ? filePath.replace(/^~/, process.env.HOME || '') : null;
-			if (!recPath) {
-				try { recPath = readFileSync('/tmp/sutando-playback-path', 'utf8').trim() || null; } catch {}
-			}
-			if (!recPath) recPath = findRecording(version);
-			// Retry once after 3s — narration-tee mux takes ~1s after recording stops,
-			// so the narrated file may not exist yet when Gemini immediately calls play.
-			if (!recPath) {
-				await new Promise(r => setTimeout(r, 3000));
-				recPath = findRecording(version);
-			}
-			if (recPath && !isReadableFile(recPath)) recPath = null;
-			if (!recPath) return { error: filePath ? `File not found: ${filePath}` : 'No screen recording found — recording may still be saving. Try again in a few seconds.' };
-
+			if (!recPath) recPath = findRecording();
+			if (!recPath) { await new Promise(r => setTimeout(r, 3000)); recPath = findRecording(); }
+			if (!recPath || !isReadableFile(recPath)) return { error: 'No recording found. Try again in a few seconds.' };
 			writeFileSync('/tmp/sutando-playback-path', recPath);
-
-			if (action === 'open') {
-				execSync(`open "${recPath}"`, { timeout: 5_000 });
-				const size = statSync(recPath).size;
-				console.log(`${ts()} [PlayRecording] opened ${recPath} (${(size / 1024 / 1024).toFixed(1)}MB)`);
-				return { status: 'opened', path: recPath, size_mb: +(size / 1024 / 1024).toFixed(1), instruction: 'File opened in QuickTime (not playing). When user says play/start, call play_recording({action:"play"}).' };
-			}
-
-			let seekSec = 0;
-			let alreadyOpen = false;
-			try {
-				const c = execSync(`osascript -e 'tell application "QuickTime Player" to count of documents'`, { timeout: 2_000 }).toString().trim();
-				if (parseInt(c) > 0) {
-					alreadyOpen = true;
-					if (isReplay) {
-						// Replay: always seek to 0
-						seekSec = 0;
-					} else {
-						const pos = execSync(`osascript -e 'tell application "QuickTime Player"' -e 'set d to document 1' -e 'return current time of d' -e 'end tell'`, { timeout: 3_000 }).toString().trim();
-						const dur = execSync(`osascript -e 'tell application "QuickTime Player"' -e 'set d to document 1' -e 'return duration of d' -e 'end tell'`, { timeout: 3_000 }).toString().trim();
-						const posNum = parseFloat(pos) || 0;
-						const durNum = parseFloat(dur) || 1;
-						seekSec = (posNum / durNum > 0.95) ? 0 : (posNum < 0.5 ? 0 : posNum);
-					}
-					if (seekSec === 0) {
-						try { execSync(`osascript -e 'tell application "QuickTime Player"' -e 'set d to document 1' -e 'set current time of d to 0' -e 'end tell'`, { timeout: 3_000 }); } catch {}
-					}
-				}
-			} catch {}
-
-			if (!alreadyOpen) {
-				execSync(`open "${recPath}"`, { timeout: 5_000 });
-				for (let i = 0; i < 10; i++) {
-					try {
-						const c = execSync(`osascript -e 'tell application "QuickTime Player" to count of documents'`, { timeout: 2_000 }).toString().trim();
-						if (parseInt(c) > 0) break;
-					} catch {}
-					await new Promise(r => setTimeout(r, 300));
-				}
-			}
-
-			try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
-			fetch(`http://localhost:${process.env.PHONE_PORT || '3100'}/play-audio`, {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ path: recPath, seekSec }),
-			}).catch(() => {});
-			await new Promise(r => setTimeout(r, 300));
-			try {
-				execSync(`osascript -e '
-					tell application "QuickTime Player"
-						activate
-						play document 1
-					end tell
-				'`, { timeout: 5_000 });
-			} catch {}
-			console.log(`${ts()} [PlayRecording] play from ${seekSec}s`);
-
+			execSync(`open "${recPath}"`, { timeout: 5_000 });
+			try { execSync(`osascript -e 'tell application "QuickTime Player" to activate'`, { timeout: 3_000 }); } catch {}
 			const size = statSync(recPath).size;
-			console.log(`${ts()} [PlayRecording] ${recPath} (${(size / 1024 / 1024).toFixed(1)}MB)`);
-			return { status: 'playing', path: recPath, size_mb: +(size / 1024 / 1024).toFixed(1), narrated: recPath.includes('-narrated'), instruction: 'Video is playing. Say NOTHING. When user says pause/stop, call play_recording({action:"pause"}). When user says continue/play, call play_recording({action:"play"}).' };
+			console.log(`${ts()} [OpenVideo] opened ${recPath} (${(size / 1024 / 1024).toFixed(1)}MB)`);
+			return { status: 'opened', path: recPath, size_mb: +(size / 1024 / 1024).toFixed(1), instruction: 'File opened. When user says play, call play_video.' };
 		} catch (err) {
-			return { error: `play_recording failed: ${err instanceof Error ? err.message : err}` };
+			return { error: `open_video failed: ${err instanceof Error ? err.message : err}` };
 		}
+	},
+};
+
+/** Helper: start QuickTime playback + stream audio to phone */
+async function startPlayback(seekSec: number = 0): Promise<{ status: string; path?: string; error?: string; instruction?: string }> {
+	let recPath: string | null = null;
+	try { recPath = readFileSync('/tmp/sutando-playback-path', 'utf8').trim() || null; } catch {}
+	if (!recPath) recPath = findRecording();
+	if (!recPath) return { status: 'error', error: 'No video to play. Open a video first with open_video.' };
+	let alreadyOpen = false;
+	try {
+		const c = execSync(`osascript -e 'tell application "QuickTime Player" to count of documents'`, { timeout: 2_000 }).toString().trim();
+		alreadyOpen = parseInt(c) > 0;
+	} catch {}
+	if (!alreadyOpen) {
+		execSync(`open "${recPath}"`, { timeout: 5_000 });
+		for (let i = 0; i < 10; i++) {
+			try { const c = execSync(`osascript -e 'tell application "QuickTime Player" to count of documents'`, { timeout: 2_000 }).toString().trim(); if (parseInt(c) > 0) break; } catch {}
+			await new Promise(r => setTimeout(r, 300));
+		}
+	}
+	if (seekSec === 0) {
+		try { execSync(`osascript -e 'tell application "QuickTime Player"' -e 'set d to document 1' -e 'set current time of d to 0' -e 'end tell'`, { timeout: 3_000 }); } catch {}
+	}
+	try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
+	fetch(`http://localhost:${process.env.PHONE_PORT || '3100'}/play-audio`, {
+		method: 'POST', headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ path: recPath, seekSec }),
+	}).catch(() => {});
+	await new Promise(r => setTimeout(r, 300));
+	try { execSync(`osascript -e 'tell application "QuickTime Player"' -e 'activate' -e 'play document 1' -e 'end tell'`, { timeout: 5_000 }); } catch {}
+	return { status: 'playing', path: recPath, instruction: 'Video is playing. Say NOTHING.' };
+}
+
+export const playVideoTool: ToolDefinition = {
+	name: 'play_video',
+	description: 'Play the video from the beginning. Use ONLY when user explicitly says "play" or "play it".',
+	parameters: z.object({}),
+	execution: 'inline',
+	async execute() {
+		console.log(`${ts()} [PlayVideo] called`);
+		try { return await startPlayback(0); } catch (err) { return { error: `${err}` }; }
+	},
+};
+
+export const resumeVideoTool: ToolDefinition = {
+	name: 'resume_video',
+	description: 'Resume the paused video from where it stopped. Use ONLY when user says "resume", "continue", "go on".',
+	parameters: z.object({}),
+	execution: 'inline',
+	async execute() {
+		console.log(`${ts()} [ResumeVideo] called`);
+		try {
+			try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
+			try { execSync(`osascript -e 'tell application "QuickTime Player"' -e 'activate' -e 'play document 1' -e 'end tell'`, { timeout: 5_000 }); } catch {}
+			return { status: 'playing', instruction: 'Video resumed. Say NOTHING.' };
+		} catch (err) { return { error: `${err}` }; }
+	},
+};
+
+export const replayVideoTool: ToolDefinition = {
+	name: 'replay_video',
+	description: 'Replay the video from the beginning. Use when user says "start over", "replay", "play again".',
+	parameters: z.object({}),
+	execution: 'inline',
+	async execute() {
+		console.log(`${ts()} [ReplayVideo] called`);
+		try { return await startPlayback(0); } catch (err) { return { error: `${err}` }; }
+	},
+};
+
+export const pauseVideoTool: ToolDefinition = {
+	name: 'pause_video',
+	description:
+		'Pause the video. Use ONLY when user explicitly says "pause", "stop", "hold".',
+	parameters: z.object({}),
+	execution: 'inline',
+	async execute() {
+		console.log(`${ts()} [PauseVideo] called`);
+		try { writeFileSync('/tmp/sutando-playback-pause', '1'); } catch {}
+		try { execSync(`osascript -e 'tell application "QuickTime Player"' -e 'if (count of documents) > 0 then' -e 'pause document 1' -e 'end if' -e 'end tell'`, { timeout: 5_000 }); } catch {}
+		return { status: 'paused', instruction: 'Paused. When user says play/resume, call play_video.' };
+	},
+};
+
+export const closeVideoTool: ToolDefinition = {
+	name: 'close_video',
+	description:
+		'Close the video player. Use when user says "close the video", "close it".',
+	parameters: z.object({}),
+	execution: 'inline',
+	async execute() {
+		console.log(`${ts()} [CloseVideo] called`);
+		try { execSync(`osascript -e 'tell application "QuickTime Player" to quit'`, { timeout: 5_000 }); } catch {}
+		try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
+		try { unlinkSync('/tmp/sutando-playback-path'); } catch {}
+		return { status: 'closed' };
 	},
 };
 
@@ -640,17 +658,126 @@ export const playRecordingTool: ToolDefinition = {
 let lastScreenRecordCall = 0;
 const SCREEN_RECORD_COOLDOWN_MS = 5_000;
 
+// --- Live transcript subtitle tracking ---
+// When subtitle=true, captures conversation transcript during recording
+// and burns it as SRT into the video when recording stops.
+// Symlink points to the active call's transcript (phone or voice agent)
+const LIVE_TRANSCRIPT_PATH = '/tmp/sutando-live-transcript.txt';
+const LIVE_TRANSCRIPT_SRT_PATH = '/tmp/sutando-live-transcript-subtitle.srt';
+let liveTranscriptRecordingStart = 0;
+let liveTranscriptBaselineLines = 0;
+
+function countTranscriptLines(): number {
+	try {
+		if (!existsSync(LIVE_TRANSCRIPT_PATH)) return 0;
+		return readFileSync(LIVE_TRANSCRIPT_PATH, 'utf8').split('\n').filter(l => l.startsWith('[')).length;
+	} catch { return 0; }
+}
+
+/** Generate SRT from transcript lines added since recording started, then burn into video. */
+function burnLiveTranscriptSubtitles(videoPath: string): string | null {
+	if (liveTranscriptRecordingStart === 0) return null;
+	try {
+		if (!existsSync(LIVE_TRANSCRIPT_PATH)) return null;
+		const allLines = readFileSync(LIVE_TRANSCRIPT_PATH, 'utf8').split('\n').filter(l => l.startsWith('['));
+		const newLines = allLines.slice(liveTranscriptBaselineLines);
+		if (newLines.length === 0) return null;
+
+		// Convert wall-clock timestamps to relative (from recording start)
+		const startWall = (() => {
+			const d = new Date(liveTranscriptRecordingStart);
+			return (d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds()) * 1000;
+		})();
+
+		const fmtTime = (ms: number): string => {
+			const s = Math.floor(ms / 1000);
+			const h = Math.floor(s / 3600);
+			const m = Math.floor((s % 3600) / 60);
+			const sec = s % 60;
+			const millis = ms % 1000;
+			return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')},${String(millis).padStart(3, '0')}`;
+		};
+
+		const entries: { text: string; timeMs: number }[] = [];
+		for (const line of newLines) {
+			const match = line.match(/^\[(\d{2}):(\d{2}):(\d{2})\]\s+(.+)$/);
+			if (!match) continue;
+			const [, hh, mm, ss, content] = match;
+			// Only include Sutando's screen descriptions, skip caller and non-narration responses
+			if (content.startsWith('Caller:') || content.startsWith('User:')) continue;
+			const text = content.replace(/^Sutando:\s*/, '');
+			// Skip short conversational responses — long lines starting with filler are screen descriptions
+			if (text.length < 50 && /^(Sure|OK|Okay|Got it|I'll|I can|I'm |The recording|Is there|Hello|Hi |Done|Thanks|Already|Let me|Paused)/i.test(text)) continue;
+			const wallMs = (Number(hh) * 3600 + Number(mm) * 60 + Number(ss)) * 1000;
+			entries.push({ text, timeMs: Math.max(0, wallMs - startWall) });
+		}
+		if (entries.length === 0) return null;
+
+		// Split long entries (>15 words) into smaller chunks for readable subtitles
+		const MAX_WORDS = 15;
+		const chunked: { text: string; timeMs: number }[] = [];
+		for (const e of entries) {
+			const words = e.text.split(' ');
+			if (words.length <= MAX_WORDS) {
+				chunked.push(e);
+			} else {
+				const nChunks = Math.ceil(words.length / MAX_WORDS);
+				for (let i = 0; i < nChunks; i++) {
+					chunked.push({
+						text: words.slice(i * MAX_WORDS, (i + 1) * MAX_WORDS).join(' '),
+						timeMs: e.timeMs,
+					});
+				}
+			}
+		}
+
+		// Auto-align: distribute entries evenly across recording duration
+		const totalDurationMs = chunked[chunked.length - 1].timeMs - chunked[0].timeMs;
+		const recordingDurationMs = totalDurationMs > 0 ? totalDurationMs + 5000 : chunked.length * 6000;
+		const interval = recordingDurationMs / chunked.length;
+		for (let i = 0; i < chunked.length; i++) {
+			chunked[i].timeMs = Math.round(i * interval);
+		}
+		const entries2 = chunked;
+
+		let srt = '';
+		for (let i = 0; i < entries2.length; i++) {
+			const start = entries2[i].timeMs;
+			const end = i < entries2.length - 1 ? entries2[i + 1].timeMs : start + 5000;
+			srt += `${i + 1}\n${fmtTime(start)} --> ${fmtTime(end)}\n${entries2[i].text}\n\n`;
+		}
+
+		writeFileSync(LIVE_TRANSCRIPT_SRT_PATH, srt);
+		console.log(`${ts()} [ScreenRecord] live transcript SRT: ${entries.length} blocks`);
+
+		const outPath = videoPath.replace('.mov', '-subtitled.mov');
+		execSync(
+			`ffmpeg -y -i "${videoPath}" -vf "subtitles=${LIVE_TRANSCRIPT_SRT_PATH}:force_style='FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,MarginV=30'" -c:v h264_videotoolbox -q:v 65 -c:a aac "${outPath}"`,
+			{ timeout: 120_000 }
+		);
+		if (existsSync(outPath)) {
+			console.log(`${ts()} [ScreenRecord] live transcript subtitles burned: ${outPath}`);
+			return outPath;
+		}
+	} catch (err) {
+		console.log(`${ts()} [ScreenRecord] live transcript subtitle failed: ${err}`);
+	}
+	return null;
+}
+
 export const screenRecordTool: ToolDefinition = {
 	name: 'screen_record',
 	description:
-		'Start or stop screen recording. Uses macOS screencapture -v for reliable .mov output.',
+		'Start or stop screen recording. Uses ffmpeg avfoundation for reliable .mov output. ' +
+		'When starting, ASK the user if they want live transcript subtitles burned into the recording.',
 	parameters: z.object({
 		action: z.enum(['start', 'stop']).describe('"start" begins recording, "stop" stops and saves the file'),
 		duration_seconds: z.number().optional().describe('If provided with start, auto-stops after this many seconds.'),
+		subtitle: z.boolean().optional().describe('If true, burn live conversation transcript as subtitles into the recording. Ask the user before setting this.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { action, duration_seconds } = args as { action: 'start' | 'stop'; duration_seconds?: number };
+		const { action, duration_seconds, subtitle } = args as { action: 'start' | 'stop'; duration_seconds?: number; subtitle?: boolean };
 		// Hard block: if already recording, refuse to start again
 		if (action === 'start' && demoState === 'recording') {
 			console.log(`${ts()} [ScreenRecord] BLOCKED duplicate start (already recording)`);
@@ -666,14 +793,46 @@ export const screenRecordTool: ToolDefinition = {
 			// Auto-stop timer — cap at 60s regardless of what Gemini requests
 			if (action === 'start') {
 				demoState = 'recording';
+				// Track transcript baseline for live subtitle generation (only if user wants subtitles)
+				if (subtitle) {
+					liveTranscriptRecordingStart = Date.now();
+					liveTranscriptBaselineLines = countTranscriptLines();
+					try { unlinkSync(LIVE_TRANSCRIPT_SRT_PATH); } catch {}
+					console.log(`${ts()} [ScreenRecord] live transcript subtitles enabled`);
+				} else {
+					liveTranscriptRecordingStart = 0;
+				}
 				const capped = Math.min(duration_seconds || 20, 60);
 				setTimeout(() => {
-					try { execSync('python3 skills/screen-record/scripts/record.py stop', { timeout: 10_000 }); } catch {}
+					try {
+						const stopResult = execSync('python3 skills/screen-record/scripts/record.py stop', { timeout: 10_000 }).toString().trim();
+						const stopParsed = JSON.parse(stopResult);
+						if (liveTranscriptRecordingStart > 0 && stopParsed.path && stopParsed.exists) {
+							const narrated = stopParsed.path.replace('.mov', '-narrated.mov');
+							burnLiveTranscriptSubtitles(isReadableFile(narrated) ? narrated : stopParsed.path);
+						}
+					} catch {}
 					demoState = 'done';
+					liveTranscriptRecordingStart = 0;
 					console.log(`${ts()} [ScreenRecord] auto-stop after ${capped}s (requested ${duration_seconds}s)`);
 				}, capped * 1000);
 			}
-			if (action === 'stop') demoState = 'done';
+			if (action === 'stop') {
+				demoState = 'done';
+				const parsed = JSON.parse(result);
+				// Burn live transcript subtitles only if enabled at start
+				if (liveTranscriptRecordingStart > 0 && parsed.path && parsed.exists) {
+					const narrated = parsed.path.replace('.mov', '-narrated.mov');
+					const subtitled = burnLiveTranscriptSubtitles(isReadableFile(narrated) ? narrated : parsed.path);
+					if (subtitled) {
+						parsed.subtitled_path = subtitled;
+						console.log(`${ts()} [ScreenRecord] transcript subtitles: ${subtitled}`);
+					}
+				}
+				liveTranscriptRecordingStart = 0;
+				console.log(`${ts()} [ScreenRecord] ${action}: ${JSON.stringify(parsed)}`);
+				return parsed;
+			}
 			const parsed = JSON.parse(result);
 			console.log(`${ts()} [ScreenRecord] ${action}: ${result}`);
 			return parsed;
