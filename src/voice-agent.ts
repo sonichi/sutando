@@ -158,18 +158,29 @@ const getTaskStatus: ToolDefinition = {
 	},
 };
 
-// end_session gate: block the tool if the user hasn't actually spoken
-// in the current session yet. Distinguishes "Gemini hallucinated a
-// goodbye from note content / replay / injected context" (no user
-// turn has happened) from "user actually said goodbye" (at least one
-// user turn has been transcribed). Replaces the earlier blunt 30s
-// time-based grace period, which also blocked legitimate early
-// goodbyes. userTurnCount is incremented in the turn.end eventBus
-// subscription whenever a new item with role='user' and non-empty
-// content (and NOT an injected system prompt) is added to
-// conversationContext.items. Reset on every fresh greeting so each
-// reconnect starts from zero.
+// end_session gate: block the tool unless we have independent
+// evidence the user has spoken in the current session. Two signals,
+// because neither alone is reliable:
+//
+// 1. userTurnCount — incremented in turn.end when a real user item
+//    lands in conversationContext.items. Works for STT-based
+//    transcripts but fails silently under native-audio models where
+//    the transcript pipeline doesn't populate items (observed
+//    2026-04-09: Gemini 2.5 native-audio heard the user fine and
+//    responded to "bye" with "farewell", but no user item ever
+//    landed in items, so an items-only gate refused a legitimate
+//    goodbye).
+//
+// 2. userHasInterrupted — set when bodhi fires turn.interrupted.
+//    That event fires whenever the user's audio interrupts the
+//    assistant, regardless of whether transcription succeeds. A
+//    reliable "user is here and active" signal for the native-
+//    audio path.
+//
+// end_session allows if EITHER signal is true. Both reset on every
+// fresh greeting so each reconnect starts from zero.
 let userTurnCount = 0;
+let userHasInterrupted = false;
 
 const endSession: ToolDefinition = {
 	name: 'end_session',
@@ -177,13 +188,10 @@ const endSession: ToolDefinition = {
 	parameters: z.object({}),
 	execution: 'inline',
 	execute: async (_args, ctx) => {
-		// Check conversationContext.items directly for a real user turn.
-		// Bodhi adds the user's transcribed speech to items BEFORE the
-		// assistant processes tool calls in the same turn, so if the
-		// user really said "bye", it will be in items at the moment this
-		// tool fires. The userTurnCount counter is updated via the
-		// turn.end event which runs AFTER the tool result — racy, which
-		// is why the previous commit's gate refused legitimate goodbyes.
+		// Allow if EITHER signal says the user is active. Both checks
+		// because each covers a different failure mode — see the
+		// comment block above the userTurnCount / userHasInterrupted
+		// declarations for context.
 		const vs = voiceSessionRef as any;
 		const items = vs?.conversationContext?.items;
 		const hasRealUserTurn = Array.isArray(items) && items.some((item: { role?: string; content?: string }) =>
@@ -192,16 +200,17 @@ const endSession: ToolDefinition = {
 			item.content.length > 0 &&
 			!item.content.startsWith('[System:')
 		);
-		if (!hasRealUserTurn) {
+		if (!hasRealUserTurn && !userHasInterrupted) {
 			const itemSummary = Array.isArray(items)
 				? items.map((it: { role?: string; content?: string }) => `${it?.role ?? '?'}:${(it?.content ?? '').slice(0, 40)}`).slice(-5).join(' | ')
 				: 'no-items';
-			console.log(`${ts()} [end_session] REFUSED — no real user turn in conversationContext. last items: [${itemSummary}]`);
+			console.log(`${ts()} [end_session] REFUSED — no real user activity yet (turns=${userTurnCount}, interrupted=${userHasInterrupted}). last items: [${itemSummary}]`);
 			return {
 				status: 'refused',
-				instruction: "end_session REFUSED — the user has NOT actually spoken in this session. What you matched was text from injected context (note content, replayed history, task result), NOT user speech. Do NOT say 'goodbye', 'bye', or 'ending session' in your spoken response. Do NOT acknowledge this refusal to the user. Stay silent and wait for the user's real voice input. The session remains fully active.",
+				instruction: "end_session REFUSED — the user has NOT actually spoken or interrupted in this session. What you matched was text from injected context (note content, replayed history, task result), NOT user speech. Do NOT say 'goodbye', 'bye', or 'ending session' in your spoken response. Do NOT acknowledge this refusal to the user. Stay silent and wait for the user's real voice input. The session remains fully active.",
 			};
 		}
+		console.log(`${ts()} [end_session] allowed (hasRealUserTurn=${hasRealUserTurn}, userHasInterrupted=${userHasInterrupted})`);
 		console.log(`${ts()} [end_session] Sending session_end to client (sendJsonToClient exists: ${!!ctx.sendJsonToClient})`);
 		ctx.sendJsonToClient?.({ type: 'session_end', reason: 'user_goodbye' });
 		// CRITICAL: clear bodhi's in-memory conversationContext so the next
@@ -262,12 +271,14 @@ const mainAgent: MainAgent = {
 		// the next watcher poll. Without this, a note opened while voice
 		// was offline would never reach Gemini after reconnect.
 		resetNoteViewingDebounce();
-		// Reset the end_session user-turn gate on every fresh greeting.
-		// Each reconnect starts a fresh "has the user actually spoken
-		// yet" count so contamination-triggered end_session calls from
-		// injected context don't fire, but the first real user turn
-		// re-enables the tool immediately.
+		// Reset the end_session user-activity gates on every fresh
+		// greeting. Each reconnect starts a fresh "has the user
+		// actually spoken / interrupted yet" count so contamination-
+		// triggered end_session calls from injected context don't
+		// fire, but the first real user turn or interruption re-
+		// enables the tool immediately.
 		userTurnCount = 0;
+		userHasInterrupted = false;
 		const recent = getRecentConversation(8);
 		// Skip the replay entirely if ANY line in the recent window
 		// contains trigger words that would match the GOODBYE RULE in
@@ -421,7 +432,7 @@ async function main() {
 			: new GeminiBatchSTTProvider({ apiKey: GEMINI_API_KEY, model: STT_MODEL }),
 		speechConfig: { voiceName: 'Puck' },
 		hooks: {
-			onSessionStart: (e) => { userTurnCount = 0; console.log(`${ts()} [Session] Started: ${e.sessionId}`); },
+			onSessionStart: (e) => { userTurnCount = 0; userHasInterrupted = false; console.log(`${ts()} [Session] Started: ${e.sessionId}`); },
 			onSessionEnd: (e) => console.log(`${ts()} [Session] Ended: ${e.sessionId} (${e.reason})`),
 			onToolCall: (e) => console.log(`${ts()} [Tool] ${e.toolName} (${e.execution})`),
 			onToolResult: (e) => console.log(`${ts()} [Tool] result: ${e.toolCallId} (${e.status}, ${e.durationMs}ms)`),
@@ -533,6 +544,16 @@ async function main() {
 			}
 		}
 		lastLoggedIndex = items.length;
+	});
+
+	// Track user interruption events as a secondary signal for the
+	// end_session gate. bodhi fires turn.interrupted whenever the user's
+	// audio interrupts the assistant, regardless of whether transcription
+	// succeeds — so it works under native-audio models where items may
+	// not get populated with user turns.
+	session.eventBus.subscribe('turn.interrupted', () => {
+		userHasInterrupted = true;
+		console.log(`${ts()} [VoiceSession] user interrupt detected — userHasInterrupted=true`);
 	});
 
 	const shutdown = async () => {
