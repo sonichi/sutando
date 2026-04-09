@@ -289,11 +289,41 @@ async def _handle_discord_message(message, force=False):
 
     if not text and not attachment_note:
         # Bare mention — user deliberately pinged the bot with no content.
-        # Don't drop: pass through as a task so the core agent can respond
-        # (e.g. with a status/pong). Without this, editing a message to add
-        # a mention OR sending a follow-up bare-ping gets silently filtered.
+        # Don't drop: fetch the last few messages of channel history so the
+        # core agent can understand the implicit question (owner's model:
+        # "I asked a question, forgot to ping, then pinged as a follow-up").
+        # Without this, editing a message to add a mention OR sending a
+        # follow-up bare-ping gets silently filtered.
         if is_dm or _message_mentions_bot(message):
-            text = "(empty mention — treat as ping/status request)"
+            context_lines = []
+            try:
+                async for prev in message.channel.history(limit=5, before=message):
+                    prev_author = str(prev.author)
+                    prev_content = (prev.content or "").strip()
+                    # Strip mentions so they don't pollute the context snippet
+                    for u in prev.mentions:
+                        prev_content = prev_content.replace(f"<@{u.id}>", f"@{u.name}")
+                    for r in prev.role_mentions:
+                        prev_content = prev_content.replace(f"<@&{r.id}>", f"@&{r.name}")
+                    if not prev_content and not prev.attachments:
+                        continue
+                    # Truncate each message and collapse newlines
+                    snippet = prev_content[:200].replace("\n", " ")
+                    if prev.attachments:
+                        snippet += f" [+{len(prev.attachments)} attachment(s)]"
+                    context_lines.append(f"  {prev_author}: {snippet}")
+            except Exception as e:
+                print(f"  [bare-mention] history fetch failed: {e}", flush=True)
+            if context_lines:
+                # Oldest-first for natural reading
+                context_block = "\n".join(reversed(context_lines))
+                text = (
+                    "(empty mention — treat as ping. Recent channel history "
+                    "below; look for an implicit question or task the owner "
+                    f"was waiting on a response to.)\n\nRecent messages:\n{context_block}"
+                )
+            else:
+                text = "(empty mention — treat as ping/status request)"
         else:
             return
 
