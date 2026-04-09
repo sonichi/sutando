@@ -167,6 +167,67 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
         pass
 
 
+# Watchers task-bridge starts at voice-agent boot. If any of these is
+# missing from the log after the most recent "Sutando — Voice Interface"
+# banner, the watcher wasn't registered and the corresponding feature
+# (context drop, note view, task results) is silently broken. This
+# check was added after a 9-hour incident on 2026-04-09 where the
+# note-view watcher was silently absent and nobody noticed until a
+# user reported voice hallucinating note titles.
+REQUIRED_VOICE_WATCHERS = [
+    "Watching for context drops",
+    "Watching for note views",
+    "Watching for results",
+]
+
+
+def check_voice_watchers(voice_check: dict) -> dict:
+    """Verify all 3 task-bridge watchers are registered in the current
+    voice-agent process. Parses src/voice-agent.log for the most recent
+    boot banner and confirms each REQUIRED_VOICE_WATCHERS pattern
+    appears after it.
+    """
+    check = {"name": "voice-watchers", "status": "ok", "detail": "all 3 watchers active"}
+    # Only run if voice-agent itself is up; otherwise the check is moot
+    if voice_check.get("status") != "ok":
+        check["status"] = "warn"
+        check["detail"] = "voice-agent not running"
+        return check
+    log_file = REPO_DIR / "src" / "voice-agent.log"
+    if not log_file.exists():
+        check["status"] = "warn"
+        check["detail"] = "voice-agent.log not found"
+        return check
+    try:
+        lines = log_file.read_text(errors="replace").splitlines()
+        # Find the most recent startup banner
+        banner_idx = -1
+        for i in range(len(lines) - 1, -1, -1):
+            if "Sutando — Voice Interface" in lines[i]:
+                banner_idx = i
+                break
+        if banner_idx < 0:
+            check["status"] = "warn"
+            check["detail"] = "no startup banner found in log"
+            return check
+        tail = lines[banner_idx:]
+        # task-bridge logs watchers BEFORE the banner prints — check a
+        # bounded window both sides to be safe (20 lines before banner)
+        window_start = max(0, banner_idx - 20)
+        window = lines[window_start:]
+        missing = []
+        for pat in REQUIRED_VOICE_WATCHERS:
+            if not any(pat in line for line in window):
+                missing.append(pat.replace("Watching for ", ""))
+        if missing:
+            check["status"] = "fail"
+            check["detail"] = f"missing watcher(s): {', '.join(missing)} — restart voice-agent"
+    except OSError as e:
+        check["status"] = "warn"
+        check["detail"] = f"log read failed: {e}"
+    return check
+
+
 def run_all_checks() -> list[dict]:
     checks = []
 
@@ -175,6 +236,7 @@ def run_all_checks() -> list[dict]:
     if voice_check["status"] == "ok":
         mark_stale_if_outdated(voice_check, REPO_DIR / "src" / "voice-agent.ts", "voice-agent.ts")
     checks.append(voice_check)
+    checks.append(check_voice_watchers(voice_check))
 
     web_check = check_port(8080, "web-client")
     if web_check["status"] == "ok":
