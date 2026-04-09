@@ -33,6 +33,12 @@ const _deliveredResults = new Set<string>();
 
 const TASK_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 const _pendingTasks = new Map<string, number>(); // taskId → submission epoch ms
+const _apiToken = process.env.SUTANDO_API_TOKEN || '';
+function _apiHeaders(): Record<string, string> {
+	const h: Record<string, string> = { 'Content-Type': 'application/json' };
+	if (_apiToken) h['Authorization'] = `Bearer ${_apiToken}`;
+	return h;
+}
 
 /** Register a callback to send task status to the web client. */
 export function setTaskStatusCallback(fn: (taskId: string, status: string, text: string, result?: string) => void): void {
@@ -116,7 +122,7 @@ export const cancelTask: ToolDefinition = {
 			console.log(`${ts()} [TaskBridge] Cancelled task ${taskId}`);
 			_sendTaskStatus?.(taskId, 'cancelled', 'Task cancelled by user');
 			// Notify agent-api
-			try { fetch('http://localhost:7843/task-done', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ taskId, result: 'Cancelled by user' }) }).catch(() => {}); } catch {}
+			try { fetch('http://localhost:7843/task-done', { method: 'POST', headers: _apiHeaders(), body: JSON.stringify({ taskId, result: 'Cancelled by user' }) }).catch(() => {}); } catch {}
 			return { status: 'cancelled', taskId, message: 'Cancelled the most recent task.' };
 		} catch (err) {
 			return { status: 'error', message: `Failed to cancel: ${err instanceof Error ? err.message : err}` };
@@ -216,7 +222,7 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 					try {
 						fetch('http://localhost:7843/task-done', {
 							method: 'POST',
-							headers: { 'Content-Type': 'application/json' },
+							headers: _apiHeaders(),
 							body: JSON.stringify({ taskId, result }),
 						}).catch(() => {});
 					} catch {}

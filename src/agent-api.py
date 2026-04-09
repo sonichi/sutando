@@ -61,9 +61,15 @@ def validate_twilio_signature(handler, body: str) -> bool:
     if not signature:
         return False
 
-    host = handler.headers.get("Host", "localhost")
-    scheme = handler.headers.get("X-Forwarded-Proto", "https")
-    url = f"{scheme}://{host}{handler.path}"
+    # Prefer static base URL to prevent Host header injection bypass.
+    # TWILIO_WEBHOOK_URL is the public ngrok/funnel URL Twilio sends webhooks to.
+    base_url = os.environ.get("TWILIO_WEBHOOK_URL", "")
+    if base_url:
+        url = base_url.rstrip("/") + handler.path
+    else:
+        host = handler.headers.get("Host", "localhost")
+        scheme = handler.headers.get("X-Forwarded-Proto", "https")
+        url = f"{scheme}://{host}{handler.path}"
 
     params = parse_qs(body, keep_blank_values=True)
     param_string = url
@@ -400,8 +406,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """Check API token if configured. Returns True if authorized."""
         if not API_TOKEN:
             return True  # No token = no auth required (local use)
+        import hmac as _hmac
         token = self.headers.get("Authorization", "").replace("Bearer ", "")
-        if token == API_TOKEN:
+        if _hmac.compare_digest(token, API_TOKEN):
             return True
         self.send_json(401, {"error": "unauthorized"})
         return False
@@ -527,6 +534,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         if path == "/task-done":
+            if not self.check_auth():
+                return
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
             try:
