@@ -651,7 +651,7 @@ async function createCallSession(params: {
 								], true);
 							} else {
 								(session as any).transport.sendContent([
-									{ role: 'user', text: '[System: Video PLAYING. Say NOTHING at all. Do NOT speak, narrate, or comment. ONLY respond to "pause", "stop", or "close". Ignore all other speech while video is playing.]' },
+									{ role: 'user', text: '[System: Video PLAYING. Say NOTHING. ONLY call pause_video when user says "pause"/"stop"/"continue", or close_video when user says "close". Ignore ALL other speech.]' },
 								], true);
 							}
 						} catch {}
