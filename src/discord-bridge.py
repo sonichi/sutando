@@ -93,8 +93,44 @@ async def on_ready():
     client.loop.create_task(poll_proactive())
 
 
+def _message_mentions_bot(message):
+    """True if this message explicitly addresses this bot via @user or
+    a role mention the bot holds. Used by both on_message and on_message_edit."""
+    if client.user in message.mentions:
+        return True
+    if message.role_mentions and message.guild:
+        if any(role.name.lower() in ("sutando", "sutando bot") for role in message.role_mentions):
+            return True
+        bot_member = message.guild.get_member(client.user.id)
+        if bot_member:
+            bot_role_ids = {r.id for r in bot_member.roles}
+            if any(r.id in bot_role_ids for r in message.role_mentions):
+                return True
+    return False
+
+
 @client.event
 async def on_message(message):
+    await _handle_discord_message(message)
+
+
+@client.event
+async def on_message_edit(before, after):
+    """Handle edited messages that add a mention the bot didn't have before.
+    Scenario: user sends a message, then edits to add @Sutando mention later.
+    Without this handler, Discord fires on_message once on CREATE and the edit
+    is invisible to the bridge."""
+    if after.author == client.user:
+        return
+    if after.author.bot and client.user not in after.mentions:
+        return
+    # Only reprocess if the edit introduced a mention that wasn't there before
+    if _message_mentions_bot(after) and not _message_mentions_bot(before):
+        print(f"  [edit] mention added to msg {after.id} — reprocessing", flush=True)
+        await _handle_discord_message(after, force=True)
+
+
+async def _handle_discord_message(message, force=False):
     if message.author == client.user:
         return
     # Skip messages from other bots (e.g. another Sutando node) to avoid
@@ -252,7 +288,14 @@ async def on_message(message):
             print(f"  Download failed: {e}")
 
     if not text and not attachment_note:
-        return
+        # Bare mention — user deliberately pinged the bot with no content.
+        # Don't drop: pass through as a task so the core agent can respond
+        # (e.g. with a status/pong). Without this, editing a message to add
+        # a mention OR sending a follow-up bare-ping gets silently filtered.
+        if is_dm or _message_mentions_bot(message):
+            text = "(empty mention — treat as ping/status request)"
+        else:
+            return
 
     print(f"  @{username}: {text}{attachment_note}")
 
@@ -273,8 +316,10 @@ async def on_message(message):
         except:
             pass
 
-    # Dedup: skip if we've already processed this Discord message ID
-    if message.id in seen_message_ids:
+    # Dedup: skip if we've already processed this Discord message ID.
+    # EXCEPTION: force=True means on_message_edit is reprocessing because the
+    # edit added a new mention — re-queue even though the ID is seen.
+    if message.id in seen_message_ids and not force:
         print(f"  [dedup] skipping already-processed message {message.id} from @{username}")
         return
     seen_message_ids.add(message.id)
