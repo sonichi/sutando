@@ -166,6 +166,25 @@ const endSession: ToolDefinition = {
 	execute: async (_args, ctx) => {
 		console.log(`${ts()} [end_session] Sending session_end to client (sendJsonToClient exists: ${!!ctx.sendJsonToClient})`);
 		ctx.sendJsonToClient?.({ type: 'session_end', reason: 'user_goodbye' });
+		// CRITICAL: clear bodhi's in-memory conversationContext so the next
+		// reconnect doesn't replay the goodbye and trigger another end_session.
+		// Bodhi's handleClientConnected (CLOSED branch) builds a contextSummary
+		// from conversationContext.items.slice(-10), injects it into the
+		// reconnect prompt, and the GOODBYE RULE in our system instructions
+		// makes Gemini re-fire end_session on the replayed "goodbye" text.
+		// Death spiral observed live 2026-04-09 at 22:57 — 3 self-initiated
+		// end_session calls in 36 seconds. sessionManager.reset() only
+		// clears the state machine; conversationContext persists separately.
+		try {
+			const vs = voiceSessionRef as any;
+			if (vs?.conversationContext?.items) {
+				const count = vs.conversationContext.items.length;
+				vs.conversationContext.items = [];
+				console.log(`${ts()} [end_session] Cleared ${count} conversationContext items`);
+			}
+		} catch (e) {
+			console.log(`${ts()} [end_session] Could not clear conversationContext: ${e}`);
+		}
 		// Also force-close client WS after 4s as fallback
 		setTimeout(() => {
 			console.log(`${ts()} [end_session] Force-closing client WS`);
