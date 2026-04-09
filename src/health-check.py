@@ -251,7 +251,12 @@ def run_all_checks() -> list[dict]:
         if not env_file.exists() and not access_file.exists():
             continue
         try:
-            result = subprocess.run(["pgrep", "-f", proc_name], capture_output=True, text=True)
+            # Anchor on the .py suffix so we don't match unrelated processes
+            # whose command line happens to contain "discord-bridge" (shell
+            # invocations, ps/grep pipelines, etc). Otherwise pgrep -f bare
+            # name produces false-positive "multiple processes" warnings
+            # that scared us into thinking the bridges were zombied today.
+            result = subprocess.run(["pgrep", "-f", f"{proc_name}\\.py$"], capture_output=True, text=True)
             pids = result.stdout.strip().split("\n") if result.returncode == 0 else []
             pids = [p for p in pids if p]
         except:
