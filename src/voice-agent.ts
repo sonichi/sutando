@@ -158,14 +158,18 @@ const getTaskStatus: ToolDefinition = {
 	},
 };
 
-// Grace period during which end_session silently refuses. Prevents the
-// reconnect goodbye-loop entirely: even if Gemini misinterprets injected
-// context / note contents / replayed history as a goodbye during the
-// first 30 seconds of a session, the tool is a no-op and the loop can't
-// close. A real human saying goodbye will happen >30s after connect in
-// virtually every case.
-const END_SESSION_GRACE_MS = 30_000;
-let lastSessionStartMs = Date.now();
+// end_session gate: block the tool if the user hasn't actually spoken
+// in the current session yet. Distinguishes "Gemini hallucinated a
+// goodbye from note content / replay / injected context" (no user
+// turn has happened) from "user actually said goodbye" (at least one
+// user turn has been transcribed). Replaces the earlier blunt 30s
+// time-based grace period, which also blocked legitimate early
+// goodbyes. userTurnCount is incremented in the turn.end eventBus
+// subscription whenever a new item with role='user' and non-empty
+// content (and NOT an injected system prompt) is added to
+// conversationContext.items. Reset on every fresh greeting so each
+// reconnect starts from zero.
+let userTurnCount = 0;
 
 const endSession: ToolDefinition = {
 	name: 'end_session',
@@ -173,10 +177,17 @@ const endSession: ToolDefinition = {
 	parameters: z.object({}),
 	execution: 'inline',
 	execute: async (_args, ctx) => {
-		const sinceStart = Date.now() - lastSessionStartMs;
-		if (sinceStart < END_SESSION_GRACE_MS) {
-			console.log(`${ts()} [end_session] IGNORED — within ${END_SESSION_GRACE_MS / 1000}s grace period (${sinceStart}ms since session start)`);
-			return { status: 'ignored', reason: `end_session called within ${END_SESSION_GRACE_MS / 1000}s of session start — likely a context-contamination false positive, not a real user goodbye. Session remains active.` };
+		// Refuse if the user hasn't spoken yet in this session. A real
+		// goodbye requires a real user turn; if Gemini is calling this
+		// tool before any user speech arrived, it's a contamination-
+		// triggered false positive (note content, replay, task result,
+		// etc.) — not an actual goodbye.
+		if (userTurnCount === 0) {
+			console.log(`${ts()} [end_session] REFUSED — no user turns yet in this session (userTurnCount=0)`);
+			return {
+				status: 'refused',
+				instruction: "end_session REFUSED — the user has NOT spoken yet in this session, so there is no goodbye to honor. What you matched was text from injected context (note content, replayed history, task result), NOT user speech. Do NOT say 'goodbye', 'bye', or 'ending session' in your spoken response. Do NOT acknowledge this refusal to the user. Stay silent and wait for the user's real voice input. The session remains fully active.",
+			};
 		}
 		console.log(`${ts()} [end_session] Sending session_end to client (sendJsonToClient exists: ${!!ctx.sendJsonToClient})`);
 		ctx.sendJsonToClient?.({ type: 'session_end', reason: 'user_goodbye' });
@@ -238,14 +249,12 @@ const mainAgent: MainAgent = {
 		// the next watcher poll. Without this, a note opened while voice
 		// was offline would never reach Gemini after reconnect.
 		resetNoteViewingDebounce();
-		// Reset the end_session grace period on every reconnect that goes
-		// through a fresh greeting. bodhi's onSessionStart only fires once
-		// per voice-agent process (startedAt is sticky across reset()), so
-		// we can't rely on it alone. This getter runs on every fresh-
-		// greeting path (initial boot, CLOSED-branch reconnect) which
-		// covers all the cases where context-contamination triggers can
-		// re-enter.
-		lastSessionStartMs = Date.now();
+		// Reset the end_session user-turn gate on every fresh greeting.
+		// Each reconnect starts a fresh "has the user actually spoken
+		// yet" count so contamination-triggered end_session calls from
+		// injected context don't fire, but the first real user turn
+		// re-enables the tool immediately.
+		userTurnCount = 0;
 		const recent = getRecentConversation(8);
 		// Skip the replay entirely if ANY line in the recent window
 		// contains trigger words that would match the GOODBYE RULE in
@@ -399,7 +408,7 @@ async function main() {
 			: new GeminiBatchSTTProvider({ apiKey: GEMINI_API_KEY, model: STT_MODEL }),
 		speechConfig: { voiceName: 'Puck' },
 		hooks: {
-			onSessionStart: (e) => { lastSessionStartMs = Date.now(); console.log(`${ts()} [Session] Started: ${e.sessionId}`); },
+			onSessionStart: (e) => { userTurnCount = 0; console.log(`${ts()} [Session] Started: ${e.sessionId}`); },
 			onSessionEnd: (e) => console.log(`${ts()} [Session] Ended: ${e.sessionId} (${e.reason})`),
 			onToolCall: (e) => console.log(`${ts()} [Tool] ${e.toolName} (${e.execution})`),
 			onToolResult: (e) => console.log(`${ts()} [Tool] result: ${e.toolCallId} (${e.status}, ${e.durationMs}ms)`),
@@ -486,6 +495,14 @@ async function main() {
 				logConversation(item.role, item.content);
 				const label = item.role === 'user' ? 'User' : 'Sutando';
 				try { appendFileSync(liveTranscriptPath, `[${new Date().toLocaleTimeString('en-US', {hour12:false})}] ${label}: ${item.content}\n`); } catch {}
+				// Track real user turns for the end_session gate.
+				// Skip items that are injected system prompts: they get
+				// role='user' from bodhi's sendContent/transport but their
+				// content starts with '[System:' — those are not real
+				// speech and shouldn't unlock end_session.
+				if (item.role === 'user' && item.content && !item.content.startsWith('[System:')) {
+					userTurnCount++;
+				}
 			}
 		}
 		lastLoggedIndex = items.length;
