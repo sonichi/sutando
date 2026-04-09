@@ -121,12 +121,65 @@ def fix_launchd(label: str) -> str:
 # Main
 # ---------------------------------------------------------------------------
 
+def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, threshold_sec: int = 1800) -> None:
+    """Mark `check` as 'stale' in place if a process matching `pgrep_pattern`
+    started more than `threshold_sec` before `src_file`'s mtime.
+
+    Extracted so the same logic covers all tsx-managed services
+    (voice-agent, web-client, conversation-server) without duplication.
+    30 min default threshold tolerates `git checkout` mtime bumps; real
+    stale deploys are hours/days old. Silent on any failure — stale
+    detection is advisory, not authoritative.
+    """
+    if not src_file.exists():
+        return
+    try:
+        pids = subprocess.run(
+            ["pgrep", "-f", pgrep_pattern],
+            capture_output=True, text=True, timeout=5
+        ).stdout.strip().split("\n")
+        pids = [p for p in pids if p]
+        if not pids:
+            return
+        ps_out = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", ",".join(pids)],
+            capture_output=True, text=True, timeout=5
+        ).stdout.strip().split("\n")
+        from datetime import datetime as _dt
+        starts = []
+        for line in ps_out:
+            line = line.strip()
+            if line:
+                try:
+                    starts.append(_dt.strptime(line, "%a %b %d %H:%M:%S %Y").timestamp())
+                except ValueError:
+                    pass
+        if not starts:
+            return
+        # Pick the OLDEST start time — the tsx wrapper spawns a child node
+        # process; we want the parent's launch time, not the child's.
+        proc_start = min(starts)
+        src_mtime = src_file.stat().st_mtime
+        if src_mtime - proc_start > threshold_sec:
+            check["status"] = "stale"
+            check["detail"] = f"running but code is {int((src_mtime - proc_start) / 60)} min newer than process — restart needed"
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
 def run_all_checks() -> list[dict]:
     checks = []
 
     # Core services (required)
-    checks.append(check_port(9900, "voice-agent"))
-    checks.append(check_port(8080, "web-client"))
+    voice_check = check_port(9900, "voice-agent")
+    if voice_check["status"] == "ok":
+        mark_stale_if_outdated(voice_check, REPO_DIR / "src" / "voice-agent.ts", "voice-agent.ts")
+    checks.append(voice_check)
+
+    web_check = check_port(8080, "web-client")
+    if web_check["status"] == "ok":
+        mark_stale_if_outdated(web_check, REPO_DIR / "src" / "web-client.ts", "web-client.ts")
+    checks.append(web_check)
 
     # Optional services (downgrade missing to warning, not failure)
     for port, name in [(7843, "agent-api"), (7844, "dashboard"), (7845, "screen-capture")]:
@@ -165,46 +218,11 @@ def run_all_checks() -> list[dict]:
                 c["status"] = "warn"
                 c["detail"] = "not running (starts on demand)"
             else:
-                # Stale-code check (mirrors PR #228 for Python bridges, but the
-                # source file lives under skills/ and is .ts, so it needs its
-                # own path lookup).
-                try:
-                    src_file = REPO_DIR / "skills" / "phone-conversation" / "scripts" / "conversation-server.ts"
-                    if src_file.exists():
-                        ps_pids = subprocess.run(
-                            ["pgrep", "-f", "conversation-server.ts"],
-                            capture_output=True, text=True, timeout=5
-                        ).stdout.strip().split("\n")
-                        ps_pids = [p for p in ps_pids if p]
-                        if ps_pids:
-                            # Walk PIDs and pick the oldest start time — the
-                            # tsx wrapper spawns a child node process; we want
-                            # the parent so its start time reflects the original
-                            # launch.
-                            ps_out = subprocess.run(
-                                ["ps", "-o", "lstart=", "-p", ",".join(ps_pids)],
-                                capture_output=True, text=True, timeout=5
-                            ).stdout.strip().split("\n")
-                            from datetime import datetime as _dt
-                            starts = []
-                            for line in ps_out:
-                                line = line.strip()
-                                if line:
-                                    try:
-                                        starts.append(_dt.strptime(line, "%a %b %d %H:%M:%S %Y").timestamp())
-                                    except ValueError:
-                                        pass
-                            if starts:
-                                proc_start = min(starts)
-                                src_mtime = src_file.stat().st_mtime
-                                # Threshold matches PR #228 for Python bridges:
-                                # 30 min tolerates routine `git checkout` mtime
-                                # bumps; real stale deploys are hours/days old.
-                                if src_mtime - proc_start > 1800:  # source >30 min newer
-                                    c["status"] = "stale"
-                                    c["detail"] = f"running but code is {int((src_mtime - proc_start) / 60)} min newer than process — restart needed"
-                except (subprocess.TimeoutExpired, OSError):
-                    pass
+                mark_stale_if_outdated(
+                    c,
+                    REPO_DIR / "skills" / "phone-conversation" / "scripts" / "conversation-server.ts",
+                    "conversation-server.ts",
+                )
             checks.append(c)
             # Tunnel check — depends on TWILIO_WEBHOOK_URL host (Funnel) or ngrok
             if c["status"] == "ok":
