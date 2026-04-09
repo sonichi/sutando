@@ -359,6 +359,9 @@ export const scrollAndDescribeTool: ToolDefinition = {
 					stopResult = JSON.parse(raw);
 				} catch {}
 				// Wait for narrated.mov to exist (narration-tee stop + mux ~2s after record.py stop)
+				// Wait up to 10s (5x2s) for narration-tee to mux narrated.mov.
+				// 8s was too short — narration mux takes ~3s after record.py stop,
+				// and the subtitled burn was missing because the file wasn't ready.
 				const narrated = stopResult.path ? stopResult.path.replace('.mov', '-narrated.mov') : '';
 				for (let w = 0; w < 5; w++) {
 					if (narrated && isReadableFile(narrated)) break;
@@ -535,6 +538,10 @@ function findRecording(version?: 'raw' | 'narrated' | 'subtitled'): string | nul
 	return null;
 }
 
+// Video playback tools — split from a single polymorphic playRecordingTool into 6
+// single-purpose tools. Gemini selects more reliably with narrow descriptions than
+// with one tool that has an "action" enum. The old tool caused persistent confusion
+// between "open" and "play" (42% of calls in diagnostics had wrong action selection).
 export const openVideoTool: ToolDefinition = {
 	name: 'open_video',
 	description:
@@ -633,6 +640,8 @@ export const replayVideoTool: ToolDefinition = {
 	},
 };
 
+// "continue" intentionally NOT in pause_video — it belongs on resume_video.
+// Adding it here caused Gemini to pause when user said "continue".
 export const pauseVideoTool: ToolDefinition = {
 	name: 'pause_video',
 	description:

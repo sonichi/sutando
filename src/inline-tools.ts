@@ -721,9 +721,11 @@ export const summonTool: ToolDefinition = {
 				console.log(`${ts()} [Summon] Zoom window not detected after 30s — skipping screen share`);
 			}
 
-			// Mute Zoom audio — phone handles audio via Twilio, not Zoom.
-			// With "Automatically join computer audio" enabled in Zoom settings,
-			// audio auto-joins on meeting entry. Mute so it doesn't interfere.
+			// Mute Zoom audio after joining. Zoom presents two choices on entry:
+			// "Join Audio" or "Test Speaker & Microphone" (ringtone test). With
+			// "Automatically join computer audio" enabled, it skips the dialog and
+			// joins audio directly — avoiding the ringtone test. But audio is now
+			// live, so we must mute immediately. Phone handles audio via Twilio.
 			try {
 				execSync(`osascript -e '
 					tell application "zoom.us" to activate
@@ -1344,6 +1346,12 @@ export const deleteNoteTool: ToolDefinition = {
 	},
 };
 
+// IMPORTANT: Every tool defined in browser-tools.ts MUST be added to BOTH arrays below.
+// Tools not registered here are invisible to Gemini — it will hallucinate actions instead
+// of calling them (e.g. "I've closed the video" without actually closing it).
+// Exception: screenRecordTool is intentionally excluded — scroll_and_describe is the full
+// recording workflow (narration + REC indicator + subtitles). Registering screenRecordTool
+// caused Gemini to pick the bare recorder over scroll_and_describe, breaking narration.
 export const inlineTools = [
 	pressKeyTool, scrollTool, switchTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
