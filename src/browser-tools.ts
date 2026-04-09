@@ -303,14 +303,14 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			execSync(`osascript -e 'tell application "System Events" to key code 126 using command down'`, { timeout: 5_000 });
 
 			// Start recording + first describe_screen in parallel
-			// Always enable live transcript subtitles during scroll_and_describe recordings
-			liveTranscriptRecordingStart = Date.now();
-			liveTranscriptBaselineLines = countTranscriptLines();
 			try { unlinkSync(LIVE_TRANSCRIPT_SRT_PATH); } catch {}
 			execSync('python3 skills/screen-record/scripts/record.py start', { timeout: 10_000 });
 			const captureRes = await fetch('http://localhost:7845/capture');
 			const captureData = await captureRes.json() as { status: string; path?: string };
 			const firstDesc = captureData.path ? await describeScreenshot(captureData.path) : '';
+			// Set subtitle baseline AFTER first description — so subtitles align with audio
+			liveTranscriptRecordingStart = Date.now();
+			liveTranscriptBaselineLines = countTranscriptLines();
 
 			// Adaptive scroll speed: one pass top-to-bottom over the full duration
 			let pageHeight = 5000; // fallback
