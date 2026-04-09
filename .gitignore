@@ -16,8 +16,11 @@ conversation.log
 quota-state.json
 data/*
 !data/*.example.json
-src/*.log
 src/cloudflare-worker.js
+logs/*
+!logs/.gitkeep
+state/*
+!state/.gitkeep
 AGENT_LOOP.md
 PENDING.md
 pending-questions.md

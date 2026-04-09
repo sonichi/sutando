@@ -439,7 +439,7 @@ async def poll_approved():
         await asyncio.sleep(3)
 
 
-PENDING_REPLIES_FILE = REPO / "src" / ".discord-pending-replies.json"
+PENDING_REPLIES_FILE = REPO / "state" / "discord-pending-replies.json"
 
 def save_pending_replies():
     """Persist pending_replies channel IDs to disk for crash recovery."""
@@ -464,7 +464,7 @@ _recovered_replies = load_pending_replies_from_disk()
 async def poll_results():
     """Poll results/ for replies to send back to Discord."""
     global _recovered_replies
-    heartbeat_file = REPO / "src" / "discord-bridge.heartbeat"
+    heartbeat_file = REPO / "state" / "discord-bridge.heartbeat"
     last_heartbeat = 0
     while True:
         # Write heartbeat at most once per 60 seconds

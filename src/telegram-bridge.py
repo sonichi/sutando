@@ -146,7 +146,7 @@ def main():
     allowed = load_allowed()
     pending_replies = {}  # task_id -> chat_id
 
-    heartbeat_file = REPO / "src" / "telegram-bridge.heartbeat"
+    heartbeat_file = REPO / "state" / "telegram-bridge.heartbeat"
     last_heartbeat = 0
     while True:
         # Write heartbeat at most once per 60 seconds

@@ -214,7 +214,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let timestamp = ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withFullDate, .withTime, .withSpaceBetweenDateAndTime, .withColonSeparatorInTime])
         let dropFile = workspace + "/context-drop.txt"
-        let logFile = workspace + "/src/context-drop.log"
+        let logFile = workspace + "/logs/context-drop.log"
         let tasksDir = workspace + "/tasks"
         let epoch = Int(Date().timeIntervalSince1970 * 1000)
         let dropImage = tasksDir + "/image-\(epoch).png"
@@ -499,7 +499,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func logToFile(_ msg: String) {
-        let path = workspace + "/src/sutando-app-debug.log"
+        let path = workspace + "/logs/sutando-app-debug.log"
         let line = "\(ISO8601DateFormatter().string(from: Date())) \(msg)\n"
         if let fh = FileHandle(forWritingAtPath: path) {
             fh.seekToEndOfFile()

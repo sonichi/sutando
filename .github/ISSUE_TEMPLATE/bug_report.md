@@ -16,7 +16,7 @@ labels: bug
 <!-- What should have happened -->
 
 **Logs**
-<!-- Paste relevant logs from src/*.log -->
+<!-- Paste relevant logs from logs/*.log -->
 
 **Environment**
 - macOS version:
