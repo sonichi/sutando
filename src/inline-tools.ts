@@ -14,8 +14,8 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
 // Re-export recording/screen/browser tools from browser-tools
-export { describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool, switchTabTool, scrollTool } from './browser-tools.js';
-import { describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool, switchTabTool, scrollTool } from './browser-tools.js';
+export { describeScreenTool, clickTool, scrollAndDescribeTool, openVideoTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, scrollTool } from './browser-tools.js';
+import { describeScreenTool, clickTool, scrollAndDescribeTool, openVideoTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, scrollTool } from './browser-tools.js';
 
 // --- Keyboard tool ---
 
@@ -721,6 +721,24 @@ export const summonTool: ToolDefinition = {
 				console.log(`${ts()} [Summon] Zoom window not detected after 30s — skipping screen share`);
 			}
 
+			// Mute Zoom audio — phone handles audio via Twilio, not Zoom.
+			// With "Automatically join computer audio" enabled in Zoom settings,
+			// audio auto-joins on meeting entry. Mute so it doesn't interfere.
+			try {
+				execSync(`osascript -e '
+					tell application "zoom.us" to activate
+					delay 0.5
+					tell application "System Events"
+						tell process "zoom.us"
+							click menu item "Mute audio" of menu "Meeting" of menu bar 1
+						end tell
+					end tell
+				'`, { timeout: 5_000 });
+				console.log(`${ts()} [Summon] Muted Zoom audio (phone handles audio)`);
+			} catch {
+				console.log(`${ts()} [Summon] Could not mute Zoom audio`);
+			}
+
 			return {
 				status: 'summoned',
 				meetingId: cleanId,
@@ -1332,7 +1350,7 @@ export const inlineTools = [
 	volumeTool, brightnessTool, clipboardTool,
 	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, summonTool, dismissTool,
 	joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool,
-	describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool, slideControlTool, fullscreenTool,
+	describeScreenTool, clickTool, scrollAndDescribeTool, openVideoTool, playVideoTool, slideControlTool, fullscreenTool,
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool, ];
 
 /** Tools available to any caller (including unverified) */
@@ -1348,7 +1366,7 @@ export const ownerOnlyTools = [
 	clipboardTool, cancelTaskTool, toggleTasksTool, summonTool, dismissTool,
 	joinZoomTool, joinGmeetTool, callContactTool, slideControlTool, fullscreenTool,
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
-	describeScreenTool, clickTool, scrollAndDescribeTool, playRecordingTool,
+	describeScreenTool, clickTool, scrollAndDescribeTool, openVideoTool, playVideoTool,
 ];
 
 /** Configurable tools — default to owner-only, can be opened to verified callers */
