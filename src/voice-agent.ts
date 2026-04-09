@@ -31,7 +31,7 @@ import {
 } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
-import { workTool, cancelTask, startResultWatcher, startContextDropWatcher, logConversation, getRecentConversation, setTaskStatusCallback } from './task-bridge.js';
+import { workTool, cancelTask, startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, logConversation, getRecentConversation, setTaskStatusCallback } from './task-bridge.js';
 import { buildSutandoSystemPrompt, buildVoiceAgentContext } from './voice-context.js';
 
 // Cartesia is loaded dynamically at the bottom of the config section so
@@ -347,6 +347,18 @@ async function main() {
 		if (session.sessionManager.isActive && session.clientConnected) {
 			console.log(`${ts()} [ContextDrop] Injecting into Gemini conversation`);
 			injectText(session, `[System: The user just dropped context via keyboard shortcut. Acknowledge briefly that you received it, then call work if it requires action.]\n\n${content}`);
+		}
+	});
+
+	// Ambient UI state: when the user opens a note in the web client, inject
+	// its content so Gemini can answer questions about it without being told
+	// the path. Silent acknowledgement — unlike context drop this is not an
+	// action, just situational awareness.
+	startNoteViewingWatcher((slug, content) => {
+		if (session.sessionManager.isActive && session.clientConnected) {
+			console.log(`${ts()} [NoteView] Injecting: ${slug}`);
+			const truncated = content.length > 4000 ? content.slice(0, 4000) + '\n\n[...truncated]' : content;
+			injectText(session, `[System: The user is now viewing notes/${slug}.md in the web UI. Do not acknowledge this out loud — just use it as context for whatever they ask next. Note content:]\n\n${truncated}`);
 		}
 	});
 

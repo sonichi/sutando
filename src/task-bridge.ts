@@ -154,6 +154,7 @@ export function getRecentConversation(count = 10): string {
 }
 
 const CONTEXT_DROP_FILE = join(REPO_DIR, 'context-drop.txt');
+const NOTE_VIEWING_FILE = '/tmp/sutando-note-viewing.json';
 
 /**
  * Watch for context-drop.txt and inject into Gemini conversation.
@@ -179,6 +180,37 @@ export function startContextDropWatcher(onContextDrop: (content: string) => void
 				}
 			} catch { /* file might be in transit */ }
 		}
+	}, 2000);
+}
+
+/**
+ * Watch for note-view events and inject into Gemini conversation.
+ * The web client writes {slug, content, ts} to /tmp/sutando-note-viewing.json
+ * whenever the user opens a note in the UI. This watcher reads the latest
+ * event and hands it to the voice agent so Gemini knows what the user is
+ * currently looking at — lets questions like "what does this note say about
+ * X" work without the user dictating the note path.
+ *
+ * Unlike the context-drop watcher, this does NOT write a task file: a note
+ * view is ambient UI state, not an action to execute. We also debounce by
+ * tracking the last event's timestamp so that repeatedly viewing the same
+ * note doesn't re-inject.
+ */
+let lastNoteViewingTs = '';
+export function startNoteViewingWatcher(onNoteView: (slug: string, content: string) => void): void {
+	console.log(`${ts()} [TaskBridge] Watching for note views (${NOTE_VIEWING_FILE})`);
+	setInterval(() => {
+		if (!existsSync(NOTE_VIEWING_FILE)) return;
+		try {
+			const raw = readFileSync(NOTE_VIEWING_FILE, 'utf-8').trim();
+			if (!raw) return;
+			const event = JSON.parse(raw) as { slug?: string; content?: string; ts?: string };
+			if (!event.slug || !event.content || !event.ts) return;
+			if (event.ts === lastNoteViewingTs) return;  // already handled
+			lastNoteViewingTs = event.ts;
+			console.log(`${ts()} [TaskBridge] Note view detected: ${event.slug}`);
+			onNoteView(event.slug, event.content);
+		} catch { /* file might be in transit or malformed */ }
 	}, 2000);
 }
 

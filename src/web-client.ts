@@ -9,6 +9,7 @@
  */
 
 import { createServer } from 'node:http';
+import { writeFileSync } from 'node:fs';
 
 const HTTP_PORT = Number(process.env.CLIENT_PORT) || 8080;
 const HTTP_HOST = process.env.CLIENT_HOST || '0.0.0.0'; // '0.0.0.0' binds to all interfaces for EC2
@@ -1565,6 +1566,16 @@ function showNoteContent(slug) {
   var container = document.getElementById('dr-content');
   if (!container) return;
   fetch(DASH + '/notes/' + slug).then(function(r){return r.text()}).then(function(text) {
+    // Notify the voice agent — raw markdown (before HTML transform) is what
+    // Gemini wants to reason about. Fire-and-forget; voice agent may or may
+    // not be connected.
+    try {
+      fetch('/note-viewing', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ slug: slug, content: text })
+      }).catch(function(){});
+    } catch (e) {}
     text = text.replace(new RegExp('^---[\\s\\S]*?---\\n'), '');
     text = text.replace(/^### (.+)$/gm, '<h3>$1</h3>');
     text = text.replace(/^## (.+)$/gm, '<h2>$1</h2>');
@@ -1735,6 +1746,33 @@ const server = createServer((req, res) => {
 		}
 		res.writeHead(200, { 'Content-Type': 'application/json' });
 		res.end(JSON.stringify({ ok: true, event, clients: sseClients.length }));
+		return;
+	}
+
+	// Note view event from the in-page note reader. Writes the current slug +
+	// content to /tmp/sutando-note-viewing.json; the voice-agent's
+	// startNoteViewingWatcher picks it up and injects into Gemini so the
+	// assistant can answer questions about whatever the user is looking at.
+	if (url.pathname === '/note-viewing' && req.method === 'POST') {
+		const chunks: Buffer[] = [];
+		req.on('data', (c: Buffer) => chunks.push(c));
+		req.on('end', () => {
+			try {
+				const body = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
+				if (!body.slug || typeof body.content !== 'string') {
+					res.writeHead(400, { 'Content-Type': 'application/json' });
+					res.end(JSON.stringify({ error: 'slug and content required' }));
+					return;
+				}
+				const event = { slug: body.slug, content: body.content, ts: new Date().toISOString() };
+				writeFileSync('/tmp/sutando-note-viewing.json', JSON.stringify(event));
+				res.writeHead(200, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify({ ok: true }));
+			} catch (e) {
+				res.writeHead(400, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify({ error: e instanceof Error ? e.message : 'parse failed' }));
+			}
+		});
 		return;
 	}
 
