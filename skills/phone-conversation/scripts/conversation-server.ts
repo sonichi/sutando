@@ -518,7 +518,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 			name: 'work',
 			description:
 				'Do the work. Call this for action requests — calling someone, looking something up, ' +
-				'sending a message, scheduling, researching, editing files, generating images. ' +
+				'sending a message, scheduling, researching, editing files, generating images, changing subtitle colors, video editing. ' +
 				'Do NOT use this for scrolling or switching apps — use the scroll and switch_app tools instead.',
 			parameters: z.object({
 				task: z.string().describe('Full description of the task to perform'),
@@ -1109,7 +1109,7 @@ const server = createServer(async (req, res) => {
 				name: 'work',
 				description:
 					'Do the work. Call this for action requests — calling someone, looking something up, ' +
-					'sending a message, scheduling, researching, editing files, generating images.',
+					'sending a message, scheduling, researching, editing files, generating images, changing subtitle colors, video editing.',
 				parameters: z.object({
 					task: z.string().describe('Full description of the task to perform'),
 				}),

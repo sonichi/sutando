@@ -1350,7 +1350,7 @@ export const inlineTools = [
 	volumeTool, brightnessTool, clipboardTool,
 	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, summonTool, dismissTool,
 	joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool,
-	describeScreenTool, clickTool, scrollAndDescribeTool, openVideoTool, playVideoTool, slideControlTool, fullscreenTool,
+	describeScreenTool, clickTool, scrollAndDescribeTool, openVideoTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, slideControlTool, fullscreenTool,
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool, ];
 
 /** Tools available to any caller (including unverified) */
@@ -1366,7 +1366,7 @@ export const ownerOnlyTools = [
 	clipboardTool, cancelTaskTool, toggleTasksTool, summonTool, dismissTool,
 	joinZoomTool, joinGmeetTool, callContactTool, slideControlTool, fullscreenTool,
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
-	describeScreenTool, clickTool, scrollAndDescribeTool, openVideoTool, playVideoTool,
+	describeScreenTool, clickTool, scrollAndDescribeTool, openVideoTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool,
 ];
 
 /** Configurable tools — default to owner-only, can be opened to verified callers */
