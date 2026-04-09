@@ -627,7 +627,7 @@ export const replayVideoTool: ToolDefinition = {
 export const pauseVideoTool: ToolDefinition = {
 	name: 'pause_video',
 	description:
-		'Pause the video. Use ONLY when user explicitly says "pause", "stop", "hold".',
+		'Pause the video. Use when user says "pause", "stop", "hold", or "continue".',
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
