@@ -105,18 +105,38 @@ if grep -q 'getCurrentTimeTool' src/inline-tools.ts; then
   fi
 fi
 
-# 6. .env pin state
+# 6. .env model + googleSearch pin state
 echo ""
-echo ".env model pin:"
+echo ".env model + googleSearch config:"
 VOICE_MODEL=$(grep '^VOICE_NATIVE_AUDIO_MODEL=' .env 2>/dev/null | cut -d= -f2)
+VOICE_GSEARCH=$(grep '^VOICE_GOOGLE_SEARCH=' .env 2>/dev/null | cut -d= -f2)
+ON_31=0
 if [ -z "$VOICE_MODEL" ]; then
   warn "VOICE_NATIVE_AUDIO_MODEL not set in .env — bodhi will use its default"
 elif echo "$VOICE_MODEL" | grep -q '2\.5-flash-native-audio'; then
   pass "VOICE_NATIVE_AUDIO_MODEL=$VOICE_MODEL (safe 2.5 baseline)"
 elif echo "$VOICE_MODEL" | grep -q '3\.1-flash-live'; then
-  warn "VOICE_NATIVE_AUDIO_MODEL=$VOICE_MODEL (3.1 enabled — make sure all 3 PRs above are applied before running a real session)"
+  pass "VOICE_NATIVE_AUDIO_MODEL=$VOICE_MODEL (3.1 enabled)"
+  ON_31=1
 else
   warn "VOICE_NATIVE_AUDIO_MODEL=$VOICE_MODEL (unrecognized)"
+fi
+# VOICE_GOOGLE_SEARCH must be false when 3.1 is active — 3.1 native audio
+# rejects the googleSearch grounding tool entry with a misleading 1011.
+# See sutando #262 for the investigation and env-var gate introduction.
+if [ "$ON_31" = "1" ]; then
+  if [ -z "$VOICE_GSEARCH" ] || echo "$VOICE_GSEARCH" | grep -qi 'true'; then
+    fail "VOICE_GOOGLE_SEARCH must be 'false' when running gemini-3.1-flash-live-preview (current: '${VOICE_GSEARCH:-unset, defaults to true}') — voice-agent will hit 1011 \"exceeded your current quota\" on connect"
+  elif echo "$VOICE_GSEARCH" | grep -qi 'false'; then
+    pass "VOICE_GOOGLE_SEARCH=false (required for 3.1)"
+  else
+    warn "VOICE_GOOGLE_SEARCH=$VOICE_GSEARCH (unrecognized — must be 'true' or 'false')"
+  fi
+else
+  # On 2.5, VOICE_GOOGLE_SEARCH default true is fine; only warn if explicitly set to false (lost capability for no reason)
+  if echo "$VOICE_GSEARCH" | grep -qi 'false'; then
+    warn "VOICE_GOOGLE_SEARCH=false but you're on 2.5 — you don't need this and you're losing Google Search grounding unnecessarily"
+  fi
 fi
 
 # 7. voice-transport health probe
@@ -146,7 +166,9 @@ fi
 
 echo "Ready for 3.1 rollout. Manual next steps:"
 echo ""
-echo "  1. Edit .env: change VOICE_NATIVE_AUDIO_MODEL to gemini-3.1-flash-live-preview"
+echo "  1. Edit .env — set BOTH env vars together (3.1 rejects googleSearch):"
+echo "       VOICE_NATIVE_AUDIO_MODEL=gemini-3.1-flash-live-preview"
+echo "       VOICE_GOOGLE_SEARCH=false"
 echo "  2. Restart voice-agent:"
 echo "     launchctl kickstart -k gui/\$(id -u)/com.sutando.voice-agent"
 echo "  3. Open http://localhost:8080, connect voice"
