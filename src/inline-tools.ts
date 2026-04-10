@@ -253,12 +253,24 @@ export const openFileTool: ToolDefinition = {
 		console.log(`${ts()} [OpenFile] called`);
 		try {
 			let target = filePath ? filePath.replace(/^~/, process.env.HOME || '') : null;
-			// Fallback: find latest recording if no path given
-			if (!target) {
-				target = findRecording();
-				if (!target) { await new Promise(r => setTimeout(r, 3000)); target = findRecording(); }
+			// If Gemini hallucinated a path that doesn't exist, fall back to findRecording
+			if (target && !existsSync(target)) {
+				console.log(`${ts()} [OpenFile] path "${target}" does not exist, falling back to findRecording`);
+				target = null;
 			}
-			if (!target) return { error: 'No file found.' };
+			// Fallback: find latest recording if no path given or path invalid
+			// Poll up to 18s — subtitle burn happens async after recording stops
+			if (!target) {
+				for (let i = 0; i < 10; i++) {
+					target = findRecording();
+					// If we found a raw file but subtitled isn't ready yet, keep waiting
+					if (target && target.includes('-subtitled')) break;
+					if (target && i < 6) { await new Promise(r => setTimeout(r, 3000)); continue; }
+					if (target) break; // after 18s, use whatever we have
+					await new Promise(r => setTimeout(r, 3000));
+				}
+			}
+			if (!target) return { error: 'No file found after 30s.' };
 			// For recordings, track playback path so meeting video tools can find it
 			if (target.includes('sutando-recording')) {
 				writeFileSync('/tmp/sutando-playback-path', target);
