@@ -337,7 +337,7 @@ const mainAgent: MainAgent = {
 		'',
 		'CRITICAL RULES:',
 		'- MEETING MODE: When the user says "take notes", "be silent", "passive mode", or is in a meeting (after join_zoom, join_gmeet, or summon): you MUST be COMPLETELY SILENT. Do NOT speak. Do NOT call work. Do NOT create tasks. Do NOT respond to ANY audio — not questions, not conversation, not ambient noise. The ONLY exception: if the user says "Sutando" or "hey Sutando" followed by a direct command. Everything else is other people talking to each other — ignore it entirely. When someone says "bye" in a meeting, do NOT disconnect. Only disconnect if the user says "Sutando disconnect" or "Sutando bye".',
-		'- GOODBYE: When the user says goodbye or bye, acknowledge verbally with a brief farewell like "Goodbye! Talk to you later." You do NOT have a tool to end the session — the client will disconnect when the user clicks the End Voice button. Do NOT try to call any tool to end the session.',
+		'- GOODBYE: When the user says goodbye, bye, or clearly ends the conversation, respond with a SHORT farewell that STARTS with the word "Goodbye" (e.g. "Goodbye! Talk to you later."). Keep it under one sentence. The session will close automatically. Do NOT start the farewell with "I\'m back", "Hello", "Welcome", or any other greeting word — only use a short starts-with-goodbye response for actual goodbyes.',
 		'- NEVER pretend you called a tool. NEVER say "done" without actually calling work.',
 		'- For SIMPLE actions (press enter, clear input, select all), use press_key or type_text — do NOT use work for keystrokes.',
 		'- If you KNOW the answer from your instructions or context, answer directly. Only delegate to work for questions you genuinely cannot answer.',
@@ -372,13 +372,43 @@ const mainAgent: MainAgent = {
 	tools: [workTool, getTaskStatus, ...inlineTools],
 	googleSearch: true,
 	onEnter: async () => console.log(`${ts()} [Agent] Sutando ready`),
-	// onTurnCompleted goodbye-phrase detector also removed for the
-	// same reason: it was a SECOND autonomous disconnect path that
-	// closed the WS whenever Gemini's assistant turn contained
-	// "goodbye", "see you later", etc. Contamination from replayed
-	// history / note content could get Gemini to say those phrases
-	// without user intent, and the detector would close the session.
-	// Client-only disconnect is now the single source of truth.
+	// Voice-driven close — strict version. User wants to be able to
+	// say "bye" and have the session close, but the previous
+	// assistant-turn detector was too loose (matched "goodbye" as a
+	// substring anywhere, triggered on mid-sentence uses like
+	// "don't say goodbye yet"). Strict version:
+	//
+	//   1. Last assistant turn must be SHORT (< 80 chars, about one
+	//      sentence). Long turns are task responses, not farewells.
+	//   2. Turn must START with a farewell word (goodbye, bye, farewell,
+	//      good bye, see you). Matches "Goodbye!" or "Bye, see you
+	//      tomorrow." but not "I'm back. How can I help?".
+	//
+	// This is strict enough that contamination-induced goodbye
+	// phrasing (which tends to be embedded in longer introductions
+	// or apology loops) doesn't match. Real farewell responses to
+	// a user "bye" are almost always a short standalone line.
+	onTurnCompleted: async (ctx, _transcript) => {
+		try {
+			const turns = ctx.getRecentTurns(2) as any[];
+			const lastAssistant = turns.filter(t => t.role === 'model').pop();
+			const lastText = (lastAssistant?.parts?.map((p: any) => p.text).join(' ') || '').trim();
+			if (lastText.length === 0 || lastText.length >= 80) return;
+			const FAREWELL_START = /^(goodbye|bye\b|farewell|good\s*bye|see you)/i;
+			if (!FAREWELL_START.test(lastText)) return;
+			console.log(`${ts()} [Agent] Strict goodbye detected (${lastText.length} chars): "${lastText.slice(0, 60)}" — closing client in 3s`);
+			logSessionBoundary('voice_goodbye');
+			(ctx as any).sendJsonToClient?.({ type: 'session_end', reason: 'user_goodbye' });
+			setTimeout(() => {
+				try {
+					const vsItems = (voiceSessionRef as any)?.conversationContext?.items;
+					if (Array.isArray(vsItems)) vsItems.length = 0;
+					const ct = (voiceSessionRef as any)?.clientTransport;
+					ct?.client?.close(4000, 'goodbye');
+				} catch {}
+			}, 3000);
+		} catch {}
+	},
 };
 
 // =============================================================================
