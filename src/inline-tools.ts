@@ -241,28 +241,32 @@ export const clickTool: ToolDefinition = {
 export const openFileTool: ToolDefinition = {
 	name: 'open_file',
 	description:
-		'Open a file. When no path is given, opens the latest screen recording in QuickTime. ' +
-		'Finds the best available version (subtitled > narrated > raw). ' +
-		'Use when user says "open the video", "open the recording", "open that file", "can you open it".',
+		'Open a file with the default macOS app. Pass a path, or omit to open the latest screen recording. ' +
+		'Use when user says "open the video", "open the file", "open that", "can you open it".',
 	parameters: z.object({
-		path: z.string().optional().describe('File path. Omit for latest recording.'),
+		path: z.string().optional().describe('File path to open. Omit to open the latest screen recording.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
 		const { path: filePath } = args as { path?: string };
 		console.log(`${ts()} [OpenFile] called`);
-		setDemoState('idle');
 		try {
-			let recPath = filePath ? filePath.replace(/^~/, process.env.HOME || '') : null;
-			if (!recPath) recPath = findRecording();
-			if (!recPath) { await new Promise(r => setTimeout(r, 3000)); recPath = findRecording(); }
-			if (!recPath || !isReadableFile(recPath)) return { error: 'No recording found. Try again in a few seconds.' };
-			writeFileSync('/tmp/sutando-playback-path', recPath);
-			execSync(`open "${recPath}"`, { timeout: 5_000 });
-			try { execSync(`osascript -e 'tell application "QuickTime Player" to activate'`, { timeout: 3_000 }); } catch {}
-			const size = statSync(recPath).size;
-			console.log(`${ts()} [OpenFile] opened ${recPath} (${(size / 1024 / 1024).toFixed(1)}MB)`);
-			return { status: 'opened', path: recPath, size_mb: +(size / 1024 / 1024).toFixed(1), instruction: 'File opened. When user says play, call play_video_in_meeting.' };
+			let target = filePath ? filePath.replace(/^~/, process.env.HOME || '') : null;
+			// Fallback: find latest recording if no path given
+			if (!target) {
+				target = findRecording();
+				if (!target) { await new Promise(r => setTimeout(r, 3000)); target = findRecording(); }
+			}
+			if (!target) return { error: 'No file found.' };
+			// For recordings, track playback path so meeting video tools can find it
+			if (target.includes('sutando-recording')) {
+				writeFileSync('/tmp/sutando-playback-path', target);
+				setDemoState('idle');
+			}
+			execSync(`open "${target}"`, { timeout: 5_000 });
+			const size = existsSync(target) ? statSync(target).size : 0;
+			console.log(`${ts()} [OpenFile] opened ${target} (${(size / 1024 / 1024).toFixed(1)}MB)`);
+			return { status: 'opened', path: target, size_mb: +(size / 1024 / 1024).toFixed(1) };
 		} catch (err) {
 			return { error: `open_file failed: ${err instanceof Error ? err.message : err}` };
 		}
