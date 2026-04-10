@@ -221,7 +221,7 @@ REQUIRED_VOICE_WATCHERS = [
 
 def check_voice_watchers(voice_check: dict) -> dict:
     """Verify all 3 task-bridge watchers are registered in the current
-    voice-agent process. Parses src/voice-agent.log for the most recent
+    voice-agent process. Parses logs/voice-agent.log for the most recent
     boot banner and confirms each REQUIRED_VOICE_WATCHERS pattern
     appears after it.
     """
@@ -231,7 +231,7 @@ def check_voice_watchers(voice_check: dict) -> dict:
         check["status"] = "warn"
         check["detail"] = "voice-agent not running"
         return check
-    log_file = REPO_DIR / "src" / "voice-agent.log"
+    log_file = REPO_DIR / "logs" / "voice-agent.log"
     if not log_file.exists():
         check["status"] = "warn"
         check["detail"] = "voice-agent.log not found"
@@ -509,7 +509,7 @@ def run_all_checks() -> list[dict]:
                 detail = f"running but log stale ({int(age_sec)}s old)"
 
         # Check 3: Heartbeat file freshness (overrides log staleness if fresh)
-        heartbeat_file = REPO_DIR / "src" / f"{name}.heartbeat"
+        heartbeat_file = REPO_DIR / "state" / f"{name}.heartbeat"
         if heartbeat_file.exists():
             hb_age = time.time() - heartbeat_file.stat().st_mtime
             if hb_age <= 120:  # heartbeat is fresh — bridge is alive

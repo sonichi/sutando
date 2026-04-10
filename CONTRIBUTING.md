@@ -21,7 +21,7 @@ bash src/startup.sh
 - What you tried
 - What happened
 - What you expected
-- Logs from `src/*.log` if relevant
+- Logs from `logs/*.log` if relevant
 
 ### Add a skill
 Skills are modular capabilities in `skills/`. Each skill has:

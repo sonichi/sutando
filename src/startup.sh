@@ -7,6 +7,9 @@ set -e
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
 
+# Ensure runtime directories exist (gitignored; created on fresh clones)
+mkdir -p logs state
+
 echo "Sutando startup..."
 echo ""
 
@@ -90,7 +93,7 @@ export ANTHROPIC_BASE_URL=http://localhost:7846
 # 1. Voice agent (Gemini Live on port 9900)
 if ! lsof -i :9900 > /dev/null 2>&1; then
   echo "  Starting voice agent (port 9900)..."
-  npx tsx src/voice-agent.ts > src/voice-agent.log 2>&1 &
+  npx tsx src/voice-agent.ts > logs/voice-agent.log 2>&1 &
   echo "  ✓ voice agent"
 else
   echo "  ✓ voice agent (already running)"
@@ -99,7 +102,7 @@ fi
 # 2. Web client (port 8080)
 if ! lsof -i :8080 > /dev/null 2>&1; then
   echo "  Starting web client (port 8080)..."
-  npx tsx src/web-client.ts > src/web-client.log 2>&1 &
+  npx tsx src/web-client.ts > logs/web-client.log 2>&1 &
   echo "  ✓ web client"
 else
   echo "  ✓ web client (already running)"
@@ -108,7 +111,7 @@ fi
 # 3. Dashboard (port 7844)
 if ! lsof -i :7844 > /dev/null 2>&1; then
   echo "  Starting dashboard (port 7844)..."
-  python3 src/dashboard.py > src/dashboard.log 2>&1 &
+  python3 src/dashboard.py > logs/dashboard.log 2>&1 &
   echo "  ✓ dashboard"
 else
   echo "  ✓ dashboard (already running)"
@@ -117,7 +120,7 @@ fi
 # 4. Agent API (port 7843)
 if ! lsof -i :7843 > /dev/null 2>&1; then
   echo "  Starting agent API (port 7843)..."
-  python3 src/agent-api.py > src/agent-api.log 2>&1 &
+  python3 src/agent-api.py > logs/agent-api.log 2>&1 &
   echo "  ✓ agent API"
 else
   echo "  ✓ agent API (already running)"
@@ -126,7 +129,7 @@ fi
 # 5. Screen capture server (port 7845)
 if ! lsof -i :7845 > /dev/null 2>&1; then
   echo "  Starting screen capture (port 7845)..."
-  python3 src/screen-capture-server.py > src/screen-capture.log 2>&1 &
+  python3 src/screen-capture-server.py > logs/screen-capture.log 2>&1 &
   echo "  ✓ screen capture"
 else
   echo "  ✓ screen capture (already running)"
@@ -159,7 +162,7 @@ if [ "${SKIP_TELEGRAM:-}" = "1" ]; then
 elif [ -f "$HOME/.claude/channels/telegram/.env" ] && grep -q "TELEGRAM_BOT_TOKEN=" "$HOME/.claude/channels/telegram/.env" 2>/dev/null; then
   if ! pgrep -f "telegram-bridge" > /dev/null 2>&1; then
     echo "  Starting Telegram bridge..."
-    python3 src/telegram-bridge.py > src/telegram-bridge.log 2>&1 &
+    python3 src/telegram-bridge.py > logs/telegram-bridge.log 2>&1 &
     echo "  ✓ telegram bridge"
   else
     echo "  ✓ telegram bridge (already running)"
@@ -174,7 +177,7 @@ if [ -f "$HOME/.claude/channels/discord/.env" ] && grep -q "DISCORD_BOT_TOKEN=" 
     echo "  ~ discord bridge (needs: pip3 install discord.py)"
   elif ! pgrep -f "discord-bridge" > /dev/null 2>&1; then
     echo "  Starting Discord bridge..."
-    python3 src/discord-bridge.py > src/discord-bridge.log 2>&1 &
+    python3 src/discord-bridge.py > logs/discord-bridge.log 2>&1 &
     echo "  ✓ discord bridge"
   else
     echo "  ✓ discord bridge (already running)"
@@ -245,7 +248,7 @@ for port_name in $VERIFY_PORTS; do
   if lsof -i :"$port" > /dev/null 2>&1; then
     echo "  ✓ $name (port $port)"
   else
-    echo "  ✗ $name (port $port) — check src/${name}.log"
+    echo "  ✗ $name (port $port) — check logs/${name}.log"
   fi
 done
 echo ""
