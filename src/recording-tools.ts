@@ -1,13 +1,13 @@
 /**
- * Browser & screen tools — scrolling, screenshots, vision descriptions, screen recording, and click.
- * Chrome-specific tools (tab switching, URL opening) are in chrome-tools.ts.
- * Meeting/playback tools (summon, Zoom, video playback) are in summon-tools.ts.
+ * Recording tools — screen recording, narration, subtitles, text injection.
+ * Split from browser-tools.ts for modularity.
  */
 
-import { execSync, execFileSync } from 'node:child_process';
+import { execSync } from 'node:child_process';
 import { writeFileSync, unlinkSync, readFileSync, readlinkSync, existsSync, statSync } from 'node:fs';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
+import { captureScreen, describeScreenshot } from './inline-tools.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -27,10 +27,9 @@ export function injectText(session: any, text: string) {
 	}
 }
 
-// Vision model — override via .env (default: flash-lite for this trivial 20-word task)
-const VISION_MODEL = process.env.VISION_MODEL || 'gemini-3.1-flash-lite-preview';
+// --- Recording state ---
 
-// --- Scroll ---
+export let demoState: 'idle' | 'recording' | 'done' = 'idle';
 
 export const scrollTool: ToolDefinition = {
 	name: 'scroll',
@@ -313,200 +312,22 @@ export const scrollAndDescribeTool: ToolDefinition = {
 	},
 };
 
-// --- Recording state + narration controller ---
+export function setDemoState(val: 'idle' | 'recording' | 'done') { demoState = val; }
 
 /** Shared mute state — conversation-server checks this in audio output handler */
-export const recordingState = { muted: false };
+export let recordingMuted = false;
 
-/** Stop any active screen recording */
-export function stopActiveRecording(): void {
-	try { execSync('python3 skills/screen-record/scripts/record.py stop', { timeout: 5_000 }); } catch {}
-}
+export function setRecordingMuted(val: boolean) { recordingMuted = val; }
 
-/** Check if a recording is currently active */
-export function isRecordingActive(): boolean {
-	return existsSync('/tmp/sutando-screen-record.pid');
-}
-
-/** Check if recording audio should be muted */
-export function isRecordingMuted(): boolean {
-	return recordingState.muted;
-}
-
-/**
- * Set up all recording hooks on a voice session.
- * Call once per session — handles tool triggers, reconnect, and cleanup automatically.
- */
-export function setupRecordingHooks(session: any): void {
-	// Start narration when scroll_and_describe is called
-	session.eventBus?.subscribe?.('tool.call', (e: any) => {
-		if (e?.toolName === 'scroll_and_describe') {
-			setTimeout(() => {
-				if (isRecordingActive()) startRecordingNarration(session);
-			}, 4000);
-		}
-	});
-}
-
-/** Called on Gemini reconnect — nudge to continue narrating if recording active */
-export function onReconnect(session: any): void {
-	if (!isRecordingActive()) return;
-	try {
-		injectText(session, '[System: You were narrating a screen demo. Continue where you left off — call describe_screen and keep narrating. Do NOT greet or say "I\'m back".]');
-	} catch {}
-}
-
-/** Called on call end — stop any active recording */
-export function onCallEnd(): void {
-	stopActiveRecording();
-}
-
-/**
- * Start narration controller for an active recording.
- * Called by conversation-server when scroll_and_describe starts.
- * Handles: description pushing, stop detection, mute/unmute, reconnect narration.
- */
 let narrationActive = false;
-
-export function startRecordingNarration(session: any): void {
-	if (narrationActive) return; // prevent duplicate controllers
-	narrationActive = true;
-
-	// Read scroll info for description interval + duration
-	let descIntervalMs = 8000;
-	let durationMs = 30000;
-	try {
-		if (existsSync('/tmp/sutando-scroll-info.json')) {
-			const info = JSON.parse(readFileSync('/tmp/sutando-scroll-info.json', 'utf8'));
-			descIntervalMs = Math.max(Math.round((info.msPerViewport || 8000) * 0.7), 5000);
-			durationMs = (info.duration_seconds || 30) * 1000;
-			console.log(`${ts()} [Recording] interval: ${descIntervalMs}ms, duration: ${durationMs}ms`);
-		}
-	} catch {}
-
-	let lastDesc = '';
-	const previousDescs: string[] = []; // track all narrated descriptions
-	const startTime = Date.now();
-	const STOP_PUSHING_BEFORE_END_MS = 8000; // stop pushing 8s before recording ends
-
-	const pushDescription = async () => {
-		if (!existsSync('/tmp/sutando-screen-record.pid')) return;
-		// Stop pushing near the end so Gemini finishes naturally
-		const elapsed = Date.now() - startTime;
-		if (elapsed > durationMs - STOP_PUSHING_BEFORE_END_MS) {
-			console.log(`${ts()} [Recording] near end — stopped pushing`);
-			clearInterval(descTimer);
-			try {
-				injectText(session, '[System: Recording ending soon. Finish your current sentence and stop.]');
-			} catch {}
-			return;
-		}
-		try {
-			const path = await captureScreen();
-			if (!path) return;
-			const desc = await describeScreenshot(path, previousDescs);
-			if (!desc || desc === lastDesc) {
-				if (desc === lastDesc) console.log(`${ts()} [Recording] skipped duplicate`);
-				return;
-			}
-			lastDesc = desc;
-			previousDescs.push(desc);
-			if (!existsSync('/tmp/sutando-screen-record.pid')) return;
-			const remaining = Math.round((durationMs - (Date.now() - startTime)) / 1000);
-			const alreadySaid = previousDescs.slice(0, -1).map((d, i) => `${i + 1}. ${d.slice(0, 40)}`).join('; ');
-			injectText(session, `[System: ${remaining}s left. Already narrated: ${alreadySaid || 'nothing yet'}. Now narrate this NEW content only (1 short sentence, no repeats): "${desc}"]`);
-			console.log(`${ts()} [Recording] pushed: ${desc.slice(0, 60)}...`);
-		} catch (err) {
-			console.log(`${ts()} [Recording] push error: ${err}`);
-		}
-	};
-
-	// Early first push + interval
-	setTimeout(pushDescription, 5000);
-	const descTimer = setInterval(pushDescription, descIntervalMs);
-
-	// Timer-based stop — uses known duration, no polling
-	// Stop pushing 8s before end (already handled in pushDescription)
-	// At exactly durationMs: clear timers, send "recording complete"
-	setTimeout(() => {
-		clearInterval(descTimer);
-		narrationActive = false;
-		console.log(`${ts()} [Recording] timer fired — sending stop`);
-		try {
-			injectText(session, '[System: Recording just ended. Say "The recording is complete." immediately.]');
-		} catch {}
-	}, durationMs + 1000); // +1s buffer for auto-stop to finish
-}
-
-// Check file exists AND has meaningful size (>1KB). Prevents returning
-// a recording that ffmpeg is still writing or a narrated file mid-mux.
-export function isReadableFile(path: string): boolean {
-	try { return existsSync(path) && statSync(path).size > 1000; } catch { return false; }
-}
-
-export function findRecording(version?: 'raw' | 'narrated' | 'subtitled'): string | null {
-	try {
-		const files = execSync('ls -t /tmp/sutando-recording-*.mov 2>/dev/null | grep -v narrated | grep -v subtitled | head -1', { timeout: 3_000 }).toString().trim();
-		if (files && isReadableFile(files)) {
-			if (version === 'raw') return files;
-			const narrated = files.replace('.mov', '-narrated.mov');
-			const subtitled = narrated.replace('.mov', '-subtitled.mov');
-			if (version === 'subtitled') return isReadableFile(subtitled) ? subtitled : (isReadableFile(narrated) ? narrated : files);
-			if (version === 'narrated') return isReadableFile(narrated) ? narrated : files;
-			// Default (no version): prefer subtitled > narrated > raw
-			if (isReadableFile(subtitled)) return subtitled;
-			if (isReadableFile(narrated)) return narrated;
-			return files;
-		}
-	} catch {}
-	return null;
-}
-
-// --- Open file (generalized from open_video) ---
-// Backwards compatible: when no path given, finds the latest recording.
-
-export const openFileTool: ToolDefinition = {
-	name: 'open_file',
-	description:
-		'Open a file. When no path is given, opens the latest screen recording in QuickTime. ' +
-		'Finds the best available version (subtitled > narrated > raw). ' +
-		'Use when user says "open the video", "open the recording", "open that file", "can you open it".',
-	parameters: z.object({
-		path: z.string().optional().describe('File path. Omit for latest recording.'),
-	}),
-	execution: 'inline',
-	async execute(args) {
-		const { path: filePath } = args as { path?: string };
-		console.log(`${ts()} [OpenFile] called`);
-		demoState = 'idle';
-		try {
-			let recPath = filePath ? filePath.replace(/^~/, process.env.HOME || '') : null;
-			if (!recPath) recPath = findRecording();
-			if (!recPath) { await new Promise(r => setTimeout(r, 3000)); recPath = findRecording(); }
-			if (!recPath || !isReadableFile(recPath)) return { error: 'No recording found. Try again in a few seconds.' };
-			writeFileSync('/tmp/sutando-playback-path', recPath);
-			execSync(`open "${recPath}"`, { timeout: 5_000 });
-			try { execSync(`osascript -e 'tell application "QuickTime Player" to activate'`, { timeout: 3_000 }); } catch {}
-			const size = statSync(recPath).size;
-			console.log(`${ts()} [OpenFile] opened ${recPath} (${(size / 1024 / 1024).toFixed(1)}MB)`);
-			return { status: 'opened', path: recPath, size_mb: +(size / 1024 / 1024).toFixed(1), instruction: 'File opened. When user says play, call play_video.' };
-		} catch (err) {
-			return { error: `open_file failed: ${err instanceof Error ? err.message : err}` };
-		}
-	},
-};
+let lastScreenRecordCall = 0;
+export const SCREEN_RECORD_COOLDOWN_MS = 5_000;
 
 // --- Live transcript subtitle tracking ---
-// When subtitle=true, captures conversation transcript during recording
-// and burns it as SRT into the video when recording stops.
-// Symlink points to the active call's transcript (phone or voice agent)
 const LIVE_TRANSCRIPT_SYMLINK = '/tmp/sutando-live-transcript.txt';
 const LIVE_TRANSCRIPT_SRT_PATH = '/tmp/sutando-live-transcript-subtitle.srt';
 let liveTranscriptRecordingStart = 0;
 let liveTranscriptBaselineLines = 0;
-// Resolved path to the call-specific transcript file, captured at recording start.
-// A concurrent call (e.g. Zoom join) can overwrite the symlink, so we resolve it
-// once and use the resolved path for the entire recording lifecycle.
 let liveTranscriptResolvedPath = '';
 
 function countTranscriptLines(): number {
@@ -614,16 +435,251 @@ export function burnLiveTranscriptSubtitles(videoPath: string): string | null {
 	return null;
 }
 
-// --- Screen recording ---
+// --- Helpers ---
 
-let lastScreenRecordCall = 0;
-const SCREEN_RECORD_COOLDOWN_MS = 5_000;
+// Check file exists AND has meaningful size (>1KB). Prevents returning
+// a recording that ffmpeg is still writing or a narrated file mid-mux.
+export function isReadableFile(path: string): boolean {
+	try { return existsSync(path) && statSync(path).size > 1000; } catch { return false; }
+}
+
+export function findRecording(version?: 'raw' | 'narrated' | 'subtitled'): string | null {
+	try {
+		const files = execSync('ls -t /tmp/sutando-recording-*.mov 2>/dev/null | grep -v narrated | grep -v subtitled | head -1', { timeout: 3_000 }).toString().trim();
+		if (files && isReadableFile(files)) {
+			if (version === 'raw') return files;
+			const narrated = files.replace('.mov', '-narrated.mov');
+			const subtitled = narrated.replace('.mov', '-subtitled.mov');
+			if (version === 'subtitled') return isReadableFile(subtitled) ? subtitled : (isReadableFile(narrated) ? narrated : files);
+			if (version === 'narrated') return isReadableFile(narrated) ? narrated : files;
+			// Default (no version): prefer subtitled > narrated > raw
+			if (isReadableFile(subtitled)) return subtitled;
+			if (isReadableFile(narrated)) return narrated;
+			return files;
+		}
+	} catch {}
+	return null;
+}
+
+// --- Stop active recording ---
+
+/** Stop any active screen recording */
+export function stopActiveRecording(): void {
+	try { execSync('python3 skills/screen-record/scripts/record.py stop', { timeout: 5_000 }); } catch {}
+}
+
+// --- Recording hooks ---
+
+/**
+ * Set up all recording hooks on a voice session.
+ * Call once per session — handles tool triggers, reconnect, and cleanup automatically.
+ */
+export function setupRecordingHooks(session: any): void {
+	// Start narration when scroll_and_describe is called
+	session.eventBus?.subscribe?.('tool.call', (e: any) => {
+		if (e?.toolName === 'scroll_and_describe') {
+			setTimeout(() => {
+				if (existsSync('/tmp/sutando-screen-record.pid')) startRecordingNarration(session);
+			}, 4000);
+		}
+	});
+}
+
+/** Called on Gemini reconnect — nudge to continue narrating if recording active */
+export function onReconnect(session: any): void {
+	if (!existsSync('/tmp/sutando-screen-record.pid')) return;
+	try {
+		injectText(session, '[System: You were narrating a screen demo. Continue where you left off — call describe_screen and keep narrating. Do NOT greet or say "I\'m back".]');
+	} catch {}
+}
+
+/**
+ * Start narration controller for an active recording.
+ * Called by conversation-server when scroll_and_describe starts.
+ * Handles: description pushing, stop detection, mute/unmute, reconnect narration.
+ */
+export function startRecordingNarration(session: any): void {
+	if (narrationActive) return; // prevent duplicate controllers
+	narrationActive = true;
+
+	// Read scroll info for description interval + duration
+	let descIntervalMs = 8000;
+	let durationMs = 30000;
+	try {
+		if (existsSync('/tmp/sutando-scroll-info.json')) {
+			const info = JSON.parse(readFileSync('/tmp/sutando-scroll-info.json', 'utf8'));
+			descIntervalMs = Math.max(Math.round((info.msPerViewport || 8000) * 0.7), 5000);
+			durationMs = (info.duration_seconds || 30) * 1000;
+			console.log(`${ts()} [Recording] interval: ${descIntervalMs}ms, duration: ${durationMs}ms`);
+		}
+	} catch {}
+
+	let lastDesc = '';
+	const previousDescs: string[] = []; // track all narrated descriptions
+	const startTime = Date.now();
+	const STOP_PUSHING_BEFORE_END_MS = 8000; // stop pushing 8s before recording ends
+
+	const pushDescription = async () => {
+		if (!existsSync('/tmp/sutando-screen-record.pid')) return;
+		// Stop pushing near the end so Gemini finishes naturally
+		const elapsed = Date.now() - startTime;
+		if (elapsed > durationMs - STOP_PUSHING_BEFORE_END_MS) {
+			console.log(`${ts()} [Recording] near end — stopped pushing`);
+			clearInterval(descTimer);
+			try {
+				injectText(session, '[System: Recording ending soon. Finish your current sentence and stop.]');
+			} catch {}
+			return;
+		}
+		try {
+			const path = await captureScreen();
+			if (!path) return;
+			const desc = await describeScreenshot(path, previousDescs);
+			if (!desc || desc === lastDesc) {
+				if (desc === lastDesc) console.log(`${ts()} [Recording] skipped duplicate`);
+				return;
+			}
+			lastDesc = desc;
+			previousDescs.push(desc);
+			if (!existsSync('/tmp/sutando-screen-record.pid')) return;
+			const remaining = Math.round((durationMs - (Date.now() - startTime)) / 1000);
+			const alreadySaid = previousDescs.slice(0, -1).map((d, i) => `${i + 1}. ${d.slice(0, 40)}`).join('; ');
+			injectText(session, `[System: ${remaining}s left. Already narrated: ${alreadySaid || 'nothing yet'}. Now narrate this NEW content only (1 short sentence, no repeats): "${desc}"]`);
+			console.log(`${ts()} [Recording] pushed: ${desc.slice(0, 60)}...`);
+		} catch (err) {
+			console.log(`${ts()} [Recording] push error: ${err}`);
+		}
+	};
+
+	// Early first push + interval
+	setTimeout(pushDescription, 5000);
+	const descTimer = setInterval(pushDescription, descIntervalMs);
+
+	// Timer-based stop — uses known duration, no polling
+	// Stop pushing 8s before end (already handled in pushDescription)
+	// At exactly durationMs: clear timers, send "recording complete"
+	setTimeout(() => {
+		clearInterval(descTimer);
+		narrationActive = false;
+		console.log(`${ts()} [Recording] timer fired — sending stop`);
+		try {
+			injectText(session, '[System: Recording just ended. Say "The recording is complete." immediately.]');
+		} catch {}
+	}, durationMs + 1000); // +1s buffer for auto-stop to finish
+}
+
+// --- Scroll and Describe tool ---
+
+export const scrollAndDescribeTool: ToolDefinition = {
+	name: 'scroll_and_describe',
+	description:
+		'Record a demo video with narration. Call ONCE with duration_seconds. It starts recording, auto-scrolls, and returns a first description. ' +
+		'Do NOT announce "starting recording" — SPEAK the returned description as your first words. ' +
+		'New descriptions will be pushed as the page scrolls — speak each one. NEVER repeat earlier narration. ' +
+		'Recording auto-stops. Do NOT call this more than once per recording.',
+	parameters: z.object({
+		duration_seconds: z.number().optional().describe('Target duration in seconds (default 15, max 60). ALWAYS seconds, never minutes.'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const MAX_DURATION = 60;
+		const rawDuration = (args as { duration_seconds?: number }).duration_seconds ?? 15;
+		const duration_seconds = Math.min(rawDuration, MAX_DURATION);
+		if (rawDuration > MAX_DURATION) console.log(`${ts()} [ScrollAndDescribe] capped duration from ${rawDuration}s to ${MAX_DURATION}s`);
+		try {
+			// Prevent duplicate recordings
+			if (demoState === 'recording') return { status: 'already_recording', message: 'Already recording.' };
+			// Reset from previous recording — allow new one
+			if (demoState === 'done') demoState = 'idle';
+			demoState = 'recording';
+
+			// Scroll to top
+			execSync(`osascript -e 'tell application "System Events" to key code 126 using command down'`, { timeout: 5_000 });
+
+			// Start recording + first describe_screen in parallel
+			try { unlinkSync(LIVE_TRANSCRIPT_SRT_PATH); } catch {}
+			execSync('python3 skills/screen-record/scripts/record.py start', { timeout: 10_000 });
+			const captureRes = await fetch('http://localhost:7845/capture');
+			const captureData = await captureRes.json() as { status: string; path?: string };
+			const firstDesc = captureData.path ? await describeScreenshot(captureData.path) : '';
+			// Set subtitle baseline AFTER first description — so subtitles align with audio.
+			// Resolve the symlink NOW so a concurrent call (Zoom join) can't overwrite it.
+			try { liveTranscriptResolvedPath = readlinkSync(LIVE_TRANSCRIPT_SYMLINK); } catch { liveTranscriptResolvedPath = ''; }
+			liveTranscriptRecordingStart = Date.now();
+			liveTranscriptBaselineLines = countTranscriptLines();
+
+			// Adaptive scroll speed: one pass top-to-bottom over the full duration
+			let pageHeight = 5000; // fallback
+			try {
+				pageHeight = parseInt(execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "document.body.scrollHeight - window.innerHeight"'`, { timeout: 3_000 }).toString().trim()) || 5000;
+			} catch {}
+			const SCROLL_INTERVAL_MS = 2500;
+			const totalScrollSteps = (duration_seconds * 1000) / SCROLL_INTERVAL_MS;
+			const pxPerStep = Math.ceil(pageHeight / totalScrollSteps);
+			// Write scroll info for conversation-server to calculate description timing
+			const viewportHeight = 900; // approximate
+			const msPerViewport = Math.round((viewportHeight / pxPerStep) * SCROLL_INTERVAL_MS);
+			writeFileSync('/tmp/sutando-scroll-info.json', JSON.stringify({ pageHeight, pxPerStep, msPerViewport, duration_seconds }));
+			console.log(`${ts()} [ScrollAndDescribe] page=${pageHeight}px, ${totalScrollSteps} steps, ${pxPerStep}px/step, ${msPerViewport}ms/viewport`);
+			let scrolledTotal = 0;
+			// Inline Chrome scroll (avoids circular import with scrollTool in inline-tools)
+			const scrollInterval = setInterval(() => {
+				if (scrolledTotal >= pageHeight) return; // stop at bottom
+				try {
+					execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "window.scrollBy(0, ${pxPerStep})"'`, { timeout: 5_000 });
+				} catch {}
+				scrolledTotal += pxPerStep;
+			}, SCROLL_INTERVAL_MS);
+
+			// Auto-stop after duration — wait for narration-tee mux, then burn subtitles.
+			// Capture start time: if user starts a 2nd recording before this timer fires,
+			// liveTranscriptRecordingStart will be overwritten. Only clear if still ours.
+			const myRecStart = liveTranscriptRecordingStart;
+			setTimeout(async () => {
+				clearInterval(scrollInterval);
+				let stopResult: any = {};
+				try {
+					const raw = execSync('python3 skills/screen-record/scripts/record.py stop', { timeout: 10_000 }).toString().trim();
+					stopResult = JSON.parse(raw);
+				} catch {}
+				// Wait for narrated.mov to exist (narration-tee stop + mux ~2s after record.py stop)
+				// Wait up to 10s (5x2s) for narration-tee to mux narrated.mov.
+				// 8s was too short — narration mux takes ~3s after record.py stop,
+				// and the subtitled burn was missing because the file wasn't ready.
+				const narrated = stopResult.path ? stopResult.path.replace('.mov', '-narrated.mov') : '';
+				for (let w = 0; w < 5; w++) {
+					if (narrated && isReadableFile(narrated)) break;
+					await new Promise(r => setTimeout(r, 2000));
+				}
+				// Burn live transcript subtitles on narrated version only
+				if (liveTranscriptRecordingStart > 0 && narrated && isReadableFile(narrated)) {
+					const subtitled = burnLiveTranscriptSubtitles(narrated);
+					if (subtitled) console.log(`${ts()} [ScrollAndDescribe] subtitle burned: ${subtitled}`);
+					else console.log(`${ts()} [ScrollAndDescribe] subtitle burn failed (no transcript lines or ffmpeg error)`);
+				}
+				if (liveTranscriptRecordingStart === myRecStart) liveTranscriptRecordingStart = 0;
+				demoState = 'done';
+				console.log(`${ts()} [ScrollAndDescribe] auto-stop`);
+			}, duration_seconds * 1000);
+
+			console.log(`${ts()} [ScrollAndDescribe] recording started with first desc`);
+			return {
+				status: 'recording',
+				first_description: firstDesc,
+				message: `SPEAK THIS NOW: "${firstDesc}" — this is your narration. Auto-stops in ${duration_seconds}s.`,
+			};
+		} catch (err) {
+			return { error: `scroll_and_describe failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
+// --- Screen recording tool ---
 
 export const screenRecordTool: ToolDefinition = {
 	name: 'screen_record',
 	description:
-		'Start or stop screen recording. Uses ffmpeg avfoundation for reliable .mov output. ' +
-		'When starting, ASK the user if they want live transcript subtitles burned into the recording.',
+		'Start or stop a bare screen recording WITHOUT narration or scrolling. For recording with narration, use scroll_and_describe instead.',
 	parameters: z.object({
 		action: z.enum(['start', 'stop']).describe('"start" begins recording, "stop" stops and saves the file'),
 		duration_seconds: z.number().optional().describe('If provided with start, auto-stops after this many seconds.'),
@@ -693,55 +749,6 @@ export const screenRecordTool: ToolDefinition = {
 			return parsed;
 		} catch (err) {
 			return { error: `screen_record failed: ${err instanceof Error ? err.message : err}` };
-		}
-	},
-};
-
-// --- Click ---
-
-export const clickTool: ToolDefinition = {
-	name: 'click',
-	description:
-		'Click at a specific screen coordinate. Use with describe_screen to identify where to click. Also supports keyboard shortcuts like "cmd+shift+5".',
-	parameters: z.object({
-		x: z.number().optional().describe('X coordinate on screen'),
-		y: z.number().optional().describe('Y coordinate on screen'),
-		shortcut: z.string().optional().describe('Keyboard shortcut to press instead of clicking (e.g. "cmd+shift+5")'),
-	}),
-	execution: 'inline',
-	async execute(args) {
-		const { x, y, shortcut } = args as { x?: number; y?: number; shortcut?: string };
-		try {
-			if (shortcut) {
-				// Parse shortcut like "cmd+shift+5"
-				const parts = shortcut.toLowerCase().split('+');
-				const key = parts.pop()!;
-				const modifiers = parts.map(m => {
-					if (m === 'cmd' || m === 'command') return 'command down';
-					if (m === 'shift') return 'shift down';
-					if (m === 'ctrl' || m === 'control') return 'control down';
-					if (m === 'alt' || m === 'option') return 'option down';
-					return '';
-				}).filter(Boolean).join(', ');
-				const keyCode = key.length === 1 ? `"${key}"` : `${key}`;
-				const cmd = modifiers
-					? `tell application "System Events" to keystroke ${keyCode} using {${modifiers}}`
-					: `tell application "System Events" to keystroke ${keyCode}`;
-				execSync(`osascript -e '${cmd}'`, { timeout: 5_000 });
-				console.log(`${ts()} [Click] shortcut: ${shortcut}`);
-				return { status: 'pressed', shortcut };
-			}
-			if (x != null && y != null) {
-				execSync(`osascript -e '
-					tell application "System Events"
-						click at {${Math.round(x)}, ${Math.round(y)}}
-					end tell'`, { timeout: 5_000 });
-				console.log(`${ts()} [Click] at (${x}, ${y})`);
-				return { status: 'clicked', x, y };
-			}
-			return { error: 'Provide either x,y coordinates or a shortcut' };
-		} catch (err) {
-			return { error: `click failed: ${err instanceof Error ? err.message : err}` };
 		}
 	},
 };

@@ -23,7 +23,7 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync, appendFileSync, writeFileSync } from 'node:fs';
 import { inlineTools } from './inline-tools.js';
-import { injectText } from './browser-tools.js';
+import { injectText } from './recording-tools.js';
 import { join } from 'node:path';
 import {
 	VoiceSession,

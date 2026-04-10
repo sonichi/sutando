@@ -1,14 +1,13 @@
 /**
- * Summon/meeting tools — Zoom, Google Meet, phone dial-in, video playback sync.
- * Split from inline-tools.ts and browser-tools.ts for modularity.
+ * Meeting tools — Zoom, Google Meet, phone dial-in, video playback sync.
+ * Renamed from summon-tools.ts for clarity.
  */
 
 import { execSync } from 'node:child_process';
 import { writeFileSync, readFileSync, unlinkSync, existsSync } from 'node:fs';
-import { statSync } from 'node:fs';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
-import { findRecording } from './browser-tools.js';
+import { findRecording, isReadableFile } from './recording-tools.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -52,8 +51,8 @@ async function startPlayback(seekSec: number = 0): Promise<{ status: string; pat
 	return { status: 'playing', path: recPath, instruction: 'Video is playing. Say NOTHING.' };
 }
 
-export const playVideoTool: ToolDefinition = {
-	name: 'play_video',
+export const playVideoInMeetingTool: ToolDefinition = {
+	name: 'play_video_in_meeting',
 	description: 'Play the video from the beginning. Use ONLY when user explicitly says "play" or "play it".',
 	parameters: z.object({}),
 	execution: 'inline',
@@ -63,8 +62,8 @@ export const playVideoTool: ToolDefinition = {
 	},
 };
 
-export const resumeVideoTool: ToolDefinition = {
-	name: 'resume_video',
+export const resumeVideoInMeetingTool: ToolDefinition = {
+	name: 'resume_video_in_meeting',
 	description: 'Resume the paused video from where it stopped. Use ONLY when user says "resume", "continue", "go on".',
 	parameters: z.object({}),
 	execution: 'inline',
@@ -80,8 +79,8 @@ export const resumeVideoTool: ToolDefinition = {
 
 // "continue" intentionally NOT in pause_video — it belongs on resume_video.
 // Adding it here caused Gemini to pause when user said "continue".
-export const pauseVideoTool: ToolDefinition = {
-	name: 'pause_video',
+export const pauseVideoInMeetingTool: ToolDefinition = {
+	name: 'pause_video_in_meeting',
 	description:
 		'Pause the video. Use when user says "pause", "stop", or "hold".',
 	parameters: z.object({}),

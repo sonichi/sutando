@@ -5,21 +5,269 @@
  * Add new tools here and they auto-appear in both voice and phone agents.
  */
 
-import { execSync } from 'node:child_process';
-import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync } from 'node:fs';
+import { execSync, execFileSync } from 'node:child_process';
+import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
-// Re-export tools from browser-tools, chrome-tools, and summon-tools
-export { describeScreenTool, clickTool, scrollAndDescribeTool, openFileTool, scrollTool } from './browser-tools.js';
+// Re-export tools from chrome-tools, meeting-tools, and recording-tools
 export { switchTabTool, openUrlTool } from './chrome-tools.js';
-export { playVideoTool, pauseVideoTool, resumeVideoTool, summonTool, dismissTool, joinZoomTool, joinGmeetTool, lookupMeetingIdTool } from './summon-tools.js';
-import { describeScreenTool, clickTool, scrollAndDescribeTool, openFileTool, scrollTool } from './browser-tools.js';
+export { playVideoInMeetingTool, pauseVideoInMeetingTool, resumeVideoInMeetingTool, summonTool, dismissTool, joinZoomTool, joinGmeetTool, lookupMeetingIdTool } from './meeting-tools.js';
+export { scrollAndDescribeTool, screenRecordTool } from './recording-tools.js';
 import { switchTabTool, openUrlTool } from './chrome-tools.js';
-import { playVideoTool, pauseVideoTool, resumeVideoTool, summonTool, dismissTool, joinZoomTool, joinGmeetTool, lookupMeetingIdTool } from './summon-tools.js';
+import { playVideoInMeetingTool, pauseVideoInMeetingTool, resumeVideoInMeetingTool, summonTool, dismissTool, joinZoomTool, joinGmeetTool, lookupMeetingIdTool } from './meeting-tools.js';
+import { scrollAndDescribeTool, screenRecordTool, demoState, setDemoState, findRecording, isReadableFile } from './recording-tools.js';
+
+// --- Vision helpers (shared with recording-tools) ---
+
+// Vision model — override via .env (default: flash-lite for this trivial 20-word task)
+const VISION_MODEL = process.env.VISION_MODEL || 'gemini-3.1-flash-lite-preview';
+
+export async function captureScreen(): Promise<string | null> {
+	try {
+		const res = await fetch('http://localhost:7845/capture');
+		const data = await res.json() as { status: string; path?: string };
+		return data.status === 'ok' && data.path ? data.path : null;
+	} catch { return null; }
+}
+
+export async function describeScreenshot(imagePath: string, previousDescs: string[] = []): Promise<string> {
+	const apiKey = process.env.GEMINI_API_KEY;
+	if (!apiKey) return 'Vision description unavailable (no GEMINI_API_KEY)';
+	try {
+		// Fixes CodeQL #27 (js/command-line-injection): use execFileSync argv array instead of shell string
+		const safePath = imagePath.replace(/[^a-zA-Z0-9_\-./]/g, '');
+		const resized = safePath.endsWith('.png') ? safePath.replace(/\.png$/, '-sm.jpg') : safePath + '-sm.jpg';
+		try {
+			execFileSync('sips', ['-Z', '800', '-s', 'format', 'jpeg', safePath, '--out', resized], { timeout: 2_000, stdio: 'ignore' });
+		} catch { /* use original if resize fails */ }
+		const actualPath = existsSync(resized) ? resized : imagePath;
+		const mimeType = actualPath.endsWith('.jpg') ? 'image/jpeg' : 'image/png';
+		const imageData = readFileSync(actualPath).toString('base64');
+		// Issue #189: when continuing a narration, the vision model should build
+		// on what was already said instead of re-introducing the page every
+		// time. First call: introduce with the heading. Later calls: flow on.
+		let prompt: string;
+		if (previousDescs.length === 0) {
+			prompt = 'Describe what is on screen in exactly 1 short sentence (max 20 words). Quote the main heading. This will be spoken aloud.';
+		} else {
+			const recent = previousDescs.slice(-3).map((d, i) => `${i + 1}. ${d}`).join(' | ');
+			prompt = `You are narrating a screen recording aloud. Already spoken: ${recent}. Describe ONLY what is NEW or has changed. Use a natural continuation ("Scrolling down...", "Next...", "Now we see...", "Further down..."). Do NOT restart with "The screen shows/displays" — the viewer already knows what page this is. 1 short sentence, max 20 words.`;
+		}
+		const res = await fetch(
+			`https://generativelanguage.googleapis.com/v1beta/models/${VISION_MODEL}:generateContent?key=${apiKey}`,
+			{
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					contents: [{
+						parts: [
+							{ text: prompt },
+							{ inlineData: { mimeType, data: imageData } },
+						],
+					}],
+					generationConfig: { maxOutputTokens: 40 },
+				}),
+			},
+		);
+		const data = await res.json() as any;
+		if (!data?.candidates?.[0]) {
+			const reason = data?.promptFeedback?.blockReason || data?.error?.message || JSON.stringify(data).slice(0, 200);
+			console.log(`${new Date().toLocaleTimeString()} [DescribeScreen] API response: ${reason}`);
+			return `Could not describe the screen. (${reason})`;
+		}
+		return data.candidates[0].content?.parts?.[0]?.text ?? 'Could not describe the screen.';
+	} catch (err) {
+		return `Vision error: ${err instanceof Error ? err.message : err}`;
+	}
+}
+
+// --- Scroll ---
+
+export const scrollTool: ToolDefinition = {
+	name: 'scroll',
+	description:
+		'Scroll the active application. Works in Chrome (JS scroll) and any other app (keyboard Page Down/Up). Use for: "scroll down", "scroll up", "scroll to top", "scroll to bottom".',
+	parameters: z.object({
+		direction: z.enum(['down', 'up', 'top', 'bottom']).describe('Scroll direction. Use "top" or "bottom" to jump to start/end of page.'),
+		pixels: z.number().optional().describe('Number of pixels to scroll (default 600). Only works for down/up.'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { direction, pixels } = args as { direction: 'down' | 'up' | 'top' | 'bottom'; pixels?: number };
+		try {
+			// Detect frontmost app
+			let frontApp = 'Google Chrome';
+			try {
+				frontApp = execSync(`osascript -e 'tell application "System Events" to get name of first process whose frontmost is true'`, { timeout: 3_000 }).toString().trim();
+			} catch {}
+
+			if (frontApp === 'Google Chrome') {
+				// Use Chrome's JavaScript scrollBy to avoid focus issues (Zoom steals keystrokes)
+				if (direction === 'top') {
+					execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "window.scrollTo(0, 0)"'`, { timeout: 5_000 });
+				} else if (direction === 'bottom') {
+					execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "window.scrollTo(0, document.body.scrollHeight)"'`, { timeout: 5_000 });
+				} else {
+					const amount = direction === 'down' ? (pixels ?? 600) : -(pixels ?? 600);
+					execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "window.scrollBy(0, ${amount})"'`, { timeout: 5_000 });
+				}
+			} else {
+				// Non-Chrome apps: use keyboard events
+				if (direction === 'top') {
+					execSync(`osascript -e 'tell application "System Events" to key code 115 using command down'`, { timeout: 5_000 }); // Cmd+Home
+				} else if (direction === 'bottom') {
+					execSync(`osascript -e 'tell application "System Events" to key code 119 using command down'`, { timeout: 5_000 }); // Cmd+End
+				} else if (direction === 'down') {
+					if (pixels) {
+						// Approximate: each Page Down ~= 600px, use repeated key presses
+						const presses = Math.max(1, Math.round(pixels / 600));
+						for (let i = 0; i < presses; i++) {
+							execSync(`osascript -e 'tell application "System Events" to key code 121'`, { timeout: 5_000 });
+						}
+					} else {
+						execSync(`osascript -e 'tell application "System Events" to key code 121'`, { timeout: 5_000 }); // Page Down
+					}
+				} else {
+					if (pixels) {
+						const presses = Math.max(1, Math.round(pixels / 600));
+						for (let i = 0; i < presses; i++) {
+							execSync(`osascript -e 'tell application "System Events" to key code 116'`, { timeout: 5_000 });
+						}
+					} else {
+						execSync(`osascript -e 'tell application "System Events" to key code 116'`, { timeout: 5_000 }); // Page Up
+					}
+				}
+			}
+			console.log(`${ts()} [Scroll] ${direction}${pixels ? ` ${pixels}px` : ''} (${frontApp})`);
+			return { status: 'scrolled', direction };
+		} catch (err) {
+			return { error: `Scroll failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
+// --- Describe screen (vision) ---
+
+export const describeScreenTool: ToolDefinition = {
+	name: 'describe_screen',
+	description:
+		'Describe what is currently visible on screen WITHOUT scrolling. Captures ALL connected displays by default. Use this to introduce/narrate the current view to the caller. Pass display=2 for secondary only.',
+	parameters: z.object({
+		display: z.number().optional().describe('Specific display (1=main, 2=secondary). Omit to capture all.'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		if (demoState === 'done') return { status: 'done', description: 'Demo complete. Stop narrating. Tell the caller.' };
+		try {
+			const { display } = (args || {}) as { display?: number };
+			const query = display ? `?display=${display}` : '?all=true';
+			const captureRes = await fetch(`http://localhost:7845/capture${query}`);
+			const captureData = await captureRes.json() as { status: string; path?: string; all_paths?: string[]; error?: string };
+			if (captureData.status !== 'ok' || !captureData.path) {
+				return { error: `Could not capture screen: ${captureData.error || 'unknown'}` };
+			}
+			const paths = captureData.all_paths || [captureData.path];
+			const descriptions: string[] = [];
+			for (let i = 0; i < paths.length; i++) {
+				const label = paths.length > 1 ? `Display ${i + 1}: ` : '';
+				const desc = await describeScreenshot(paths[i]);
+				descriptions.push(label + desc);
+			}
+			const fullDesc = descriptions.join(' | ');
+			if ((demoState as string) === 'done') return { status: 'done', description: 'Demo complete. Stop narrating.' };
+			console.log(`${ts()} [DescribeScreen] ${fullDesc.slice(0, 120)}...`);
+			return { status: 'ok', description: fullDesc, displays: paths.length, instruction: 'YOU MUST speak this description OUT LOUD to the caller NOW before calling any other tool.' };
+		} catch (err) {
+			return { error: `describe_screen failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
+// --- Click ---
+
+export const clickTool: ToolDefinition = {
+	name: 'click',
+	description:
+		'Click at a specific screen coordinate. Use with describe_screen to identify where to click. Also supports keyboard shortcuts like "cmd+shift+5".',
+	parameters: z.object({
+		x: z.number().optional().describe('X coordinate on screen'),
+		y: z.number().optional().describe('Y coordinate on screen'),
+		shortcut: z.string().optional().describe('Keyboard shortcut to press instead of clicking (e.g. "cmd+shift+5")'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { x, y, shortcut } = args as { x?: number; y?: number; shortcut?: string };
+		try {
+			if (shortcut) {
+				// Parse shortcut like "cmd+shift+5"
+				const parts = shortcut.toLowerCase().split('+');
+				const key = parts.pop()!;
+				const modifiers = parts.map(m => {
+					if (m === 'cmd' || m === 'command') return 'command down';
+					if (m === 'shift') return 'shift down';
+					if (m === 'ctrl' || m === 'control') return 'control down';
+					if (m === 'alt' || m === 'option') return 'option down';
+					return '';
+				}).filter(Boolean).join(', ');
+				const keyCode = key.length === 1 ? `"${key}"` : `${key}`;
+				const cmd = modifiers
+					? `tell application "System Events" to keystroke ${keyCode} using {${modifiers}}`
+					: `tell application "System Events" to keystroke ${keyCode}`;
+				execSync(`osascript -e '${cmd}'`, { timeout: 5_000 });
+				console.log(`${ts()} [Click] shortcut: ${shortcut}`);
+				return { status: 'pressed', shortcut };
+			}
+			if (x != null && y != null) {
+				execSync(`osascript -e '
+					tell application "System Events"
+						click at {${Math.round(x)}, ${Math.round(y)}}
+					end tell'`, { timeout: 5_000 });
+				console.log(`${ts()} [Click] at (${x}, ${y})`);
+				return { status: 'clicked', x, y };
+			}
+			return { error: 'Provide either x,y coordinates or a shortcut' };
+		} catch (err) {
+			return { error: `click failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
+// --- Open file (generalized from open_video) ---
+
+export const openFileTool: ToolDefinition = {
+	name: 'open_file',
+	description:
+		'Open a file. When no path is given, opens the latest screen recording in QuickTime. ' +
+		'Finds the best available version (subtitled > narrated > raw). ' +
+		'Use when user says "open the video", "open the recording", "open that file", "can you open it".',
+	parameters: z.object({
+		path: z.string().optional().describe('File path. Omit for latest recording.'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { path: filePath } = args as { path?: string };
+		console.log(`${ts()} [OpenFile] called`);
+		setDemoState('idle');
+		try {
+			let recPath = filePath ? filePath.replace(/^~/, process.env.HOME || '') : null;
+			if (!recPath) recPath = findRecording();
+			if (!recPath) { await new Promise(r => setTimeout(r, 3000)); recPath = findRecording(); }
+			if (!recPath || !isReadableFile(recPath)) return { error: 'No recording found. Try again in a few seconds.' };
+			writeFileSync('/tmp/sutando-playback-path', recPath);
+			execSync(`open "${recPath}"`, { timeout: 5_000 });
+			try { execSync(`osascript -e 'tell application "QuickTime Player" to activate'`, { timeout: 3_000 }); } catch {}
+			const size = statSync(recPath).size;
+			console.log(`${ts()} [OpenFile] opened ${recPath} (${(size / 1024 / 1024).toFixed(1)}MB)`);
+			return { status: 'opened', path: recPath, size_mb: +(size / 1024 / 1024).toFixed(1), instruction: 'File opened. When user says play, call play_video_in_meeting.' };
+		} catch (err) {
+			return { error: `open_file failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
 
 // --- Keyboard tool ---
 
@@ -326,7 +574,7 @@ export const getCurrentTimeTool: ToolDefinition = {
 const PHONE_PORT = Number(process.env.PHONE_PORT) || 3100;
 
 // summonTool, dismissTool, joinZoomTool, joinGmeetTool, lookupMeetingIdTool
-// moved to summon-tools.ts
+// moved to meeting-tools.ts
 
 
 export const callContactTool: ToolDefinition = {
@@ -580,19 +828,18 @@ export const deleteNoteTool: ToolDefinition = {
 	},
 };
 
-// IMPORTANT: Every tool from browser-tools, chrome-tools, and summon-tools MUST be in BOTH arrays.
+// IMPORTANT: Every tool from chrome-tools, meeting-tools, and recording-tools MUST be in BOTH arrays.
 // Tools not registered here are invisible to Gemini — it will hallucinate actions instead
 // of calling them (e.g. "I've closed the video" without actually closing it).
-// Exception: screenRecordTool is intentionally excluded — scroll_and_describe is the full
-// recording workflow (narration + REC indicator + subtitles). Registering screenRecordTool
-// caused Gemini to pick the bare recorder over scroll_and_describe, breaking narration.
 export const inlineTools = [
 	pressKeyTool, scrollTool, switchTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
 	volumeTool, brightnessTool, clipboardTool,
 	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, summonTool, dismissTool,
 	joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool,
-	describeScreenTool, clickTool, scrollAndDescribeTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, slideControlTool, fullscreenTool,
+	describeScreenTool, clickTool, scrollAndDescribeTool, openFileTool,
+	playVideoInMeetingTool, pauseVideoInMeetingTool, resumeVideoInMeetingTool,
+	screenRecordTool, slideControlTool, fullscreenTool,
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool, ];
 
 /** Tools available to any caller (including unverified) */
@@ -608,7 +855,8 @@ export const ownerOnlyTools = [
 	clipboardTool, cancelTaskTool, toggleTasksTool, summonTool, dismissTool,
 	joinZoomTool, joinGmeetTool, callContactTool, slideControlTool, fullscreenTool,
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
-	describeScreenTool, clickTool, scrollAndDescribeTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool,
+	describeScreenTool, clickTool, scrollAndDescribeTool, openFileTool,
+	playVideoInMeetingTool, pauseVideoInMeetingTool, resumeVideoInMeetingTool, screenRecordTool,
 ];
 
 /** Configurable tools — default to owner-only, can be opened to verified callers */

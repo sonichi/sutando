@@ -385,10 +385,10 @@ function buildAgent(callSession: CallSession): MainAgent {
 				'TOOL EXCLUSIVITY: If an inline tool can handle the request, use ONLY the inline tool. NEVER also call work. They are mutually exclusive — calling both causes duplicate responses. Only use work when no inline tool fits.',
 				'SUMMON: Before calling summon, ALWAYS say "Summoning your screen now" FIRST — the user is on the phone and cannot see what is happening. The tool takes several seconds.',
 				'PLAYBACK RULES (CRITICAL):',
-				'0. Video tools: open_video (open), play_video (play from start), pause_video (pause), resume_video (resume/continue), replay_video (start over), close_video (close). NEVER use work for video.',
-				'1. After calling play_video or resume_video, say NOTHING. Audio streams to the phone.',
-				'2. "pause", "stop", "hold" → call pause_video, then say "Paused."',
-				'3. "play" → play_video. "resume"/"continue" → resume_video. "start over"/"replay" → replay_video.',
+				'0. Video tools: open_file (open), play_video_in_meeting (play from start), pause_video_in_meeting (pause), resume_video_in_meeting (resume/continue). NEVER use work for video.',
+				'1. After calling play_video_in_meeting or resume_video_in_meeting, say NOTHING. Audio streams to the phone.',
+				'2. "pause", "stop", "hold" → call pause_video_in_meeting, then say "Paused."',
+				'3. "play" → play_video_in_meeting. "resume"/"continue" → resume_video_in_meeting.',
 				'4. Do NOT use describe_screen, scroll, or work while a recording is playing.',
 				'5. Do NOT guess or hallucinate about the video (duration, content, etc). You cannot see or hear it.',
 				'You can make concurrent calls — stay on the line while calling someone else.',
@@ -644,21 +644,21 @@ async function createCallSession(params: {
 				callSession.toolCalls.push({ name: toolName, durationMs: e.durationMs, timestamp: new Date().toISOString() });
 				callSession.events.push({ event: `tool_result:${toolName}:${e.durationMs}ms`, timestamp: new Date().toISOString() });
 				// Log REC indicator status for recording tools
-				if (toolName === 'scroll_and_describe' || toolName === 'screen_record' || toolName === 'open_video') {
+				if (toolName === 'scroll_and_describe' || toolName === 'screen_record' || toolName === 'open_file') {
 					const hasIndicator = existsSync('/tmp/sutando-rec-indicator.pid');
 					callSession.events.push({ event: `rec_indicator:${hasIndicator ? 'on' : 'off'}`, timestamp: new Date().toISOString() });
 				}
 				// After video play/pause, inject context reminder
-				if (['play_video', 'pause_video', 'resume_video', 'replay_video'].includes(toolName)) {
+				if (['play_video_in_meeting', 'pause_video_in_meeting', 'resume_video_in_meeting'].includes(toolName)) {
 					setTimeout(() => {
 						try {
 							if (existsSync('/tmp/sutando-playback-pause')) {
 								(session as any).transport.sendContent([
-									{ role: 'user', text: '[System: Video PAUSED. ONLY call resume_video when user says "resume"/"continue", or play_video when user says "play". Do NOT resume on other speech.]' },
+									{ role: 'user', text: '[System: Video PAUSED. ONLY call resume_video_in_meeting when user says "resume"/"continue", or play_video_in_meeting when user says "play". Do NOT resume on other speech.]' },
 								], true);
 							} else {
 								(session as any).transport.sendContent([
-									{ role: 'user', text: '[System: Video PLAYING. Say NOTHING. ONLY call pause_video when user says "pause"/"stop"/"continue", or close_video when user says "close". Ignore ALL other speech.]' },
+									{ role: 'user', text: '[System: Video PLAYING. Say NOTHING. ONLY call pause_video_in_meeting when user says "pause"/"stop"/"continue", Ignore ALL other speech.]' },
 								], true);
 							}
 						} catch {}
@@ -680,8 +680,8 @@ async function createCallSession(params: {
 	const sessionAny = session as any;
 	let isReplaying = false; // suppress audio during reconnect replay
 	let turnCountBeforeDisconnect = 0; // track turns to know when replay is done
-	let _isRecordingMuted: (() => boolean) | null = null;
-	import('../../../src/browser-tools.js').then(bt => { _isRecordingMuted = bt.isRecordingMuted; }).catch(() => {});
+	let _recordingTools: { recordingMuted: boolean } | null = null;
+	import('../../../src/recording-tools.js').then(bt => { _recordingTools = bt; }).catch(() => {});
 
 	// Optional narration tee from screen-record skill
 	let _teeAudio: ((buf: Buffer) => void) | null = null;
@@ -689,7 +689,7 @@ async function createCallSession(params: {
 
 	sessionAny.handleAudioOutput = (data: string) => {
 		sessionAny.notificationQueue?.markAudioReceived?.();
-		if (isReplaying || _isRecordingMuted?.()) return;
+		if (isReplaying || _recordingTools?.recordingMuted) return;
 		const pcmBuf = Buffer.from(data, 'base64');
 		_teeAudio?.(pcmBuf);
 		if (params.twilioWs.readyState === WebSocket.OPEN) {
@@ -707,7 +707,7 @@ async function createCallSession(params: {
 	};
 
 	// Set up recording hooks (tool trigger, narration push, etc)
-	import('../../../src/browser-tools.js').then(bt => bt.setupRecordingHooks(session)).catch(() => {});
+	import('../../../src/recording-tools.js').then(bt => bt.setupRecordingHooks(session)).catch(() => {});
 
 	// Track transcripts via event bus + run goodbye detection
 	// Use a processed count per-session that resets on reconnect to avoid duplicates.
@@ -718,7 +718,7 @@ async function createCallSession(params: {
 		if (isReplaying && items.length >= turnCountBeforeDisconnect) {
 			console.log(`${ts()} [Phone] replay complete (${items.length}/${turnCountBeforeDisconnect} turns) — unmuting`);
 			isReplaying = false;
-			import('../../../src/browser-tools.js').then(bt => bt.onReconnect(session)).catch(() => {});
+			import('../../../src/recording-tools.js').then(bt => bt.onReconnect(session)).catch(() => {});
 		}
 		// Guard: if items shrunk (reconnect reset context), re-scan from start but skip already-seen text
 		if (items.length < lastProcessedIdx) lastProcessedIdx = 0;
@@ -799,7 +799,7 @@ async function createCallSession(params: {
 						if (isReplaying) {
 							console.log(`${ts()} [Phone] replay suppression fallback (${fallbackMs}ms)`);
 							isReplaying = false;
-							import('../../../src/browser-tools.js').then(bt => bt.onReconnect(session)).catch(() => {});
+							import('../../../src/recording-tools.js').then(bt => bt.onReconnect(session)).catch(() => {});
 						}
 					}, fallbackMs);
 				}
@@ -825,7 +825,7 @@ function cleanupCall(callSid: string): void {
 	activeCalls.delete(callSid);
 	if (session.meetingId) pendingMeetingJoins.delete(session.meetingId);
 
-	import('../../../src/browser-tools.js').then(bt => bt.onCallEnd()).catch(() => {});
+	import('../../../src/recording-tools.js').then(bt => bt.stopActiveRecording()).catch(() => {});
 	session.cleanupNarration?.();
 	try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
 	try { unlinkSync('/tmp/sutando-playback-path'); } catch {}
