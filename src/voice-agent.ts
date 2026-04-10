@@ -612,7 +612,10 @@ async function main() {
 				console.log(`${ts()}   [${item.role}] ${item.content}`);
 				logConversation(item.role, item.content);
 				const evtRole = item.role === 'user' ? 'user' : 'sutando';
-				voiceEvents.push({ event: `${evtRole}:${(item.content || '').slice(0, 60)}`, timestamp: new Date().toISOString() });
+				// 7s offset for user speech: Gemini STT commits transcript ~7s after
+				// the user actually spoke (measured via iPad recording comparison).
+				const evtTs = item.role === 'user' ? new Date(Date.now() - 7000).toISOString() : new Date().toISOString();
+				voiceEvents.push({ event: `${evtRole}:${item.content || ''}`, timestamp: evtTs });
 				voiceTranscript.push({ role: evtRole, text: item.content || '' });
 				const label = item.role === 'user' ? 'User' : 'Sutando';
 				try { appendFileSync(liveTranscriptPath, `[${new Date().toLocaleTimeString('en-US', {hour12:false})}] ${label}: ${item.content}\n`); } catch {}
