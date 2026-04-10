@@ -15,11 +15,11 @@ const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
 // Re-export tools from chrome-tools, meeting-tools, and recording-tools
 export { switchTabTool, openUrlTool } from './chrome-tools.js';
-export { playVideoInMeetingTool, pauseVideoInMeetingTool, resumeVideoInMeetingTool, summonTool, dismissTool, joinZoomTool, joinGmeetTool, lookupMeetingIdTool } from './meeting-tools.js';
-export { scrollAndDescribeTool, screenRecordTool } from './recording-tools.js';
+export { playVideoInMeetingTool, pauseVideoInMeetingTool, resumeVideoInMeetingTool, summonTool, dismissTool, joinZoomTool, joinGmeetTool, lookupMeetingIdTool, recordScreenWithNarrationTool } from './remote-meeting-tools.js';
+export { screenRecordTool } from './recording-tools.js';
 import { switchTabTool, openUrlTool } from './chrome-tools.js';
-import { playVideoInMeetingTool, pauseVideoInMeetingTool, resumeVideoInMeetingTool, summonTool, dismissTool, joinZoomTool, joinGmeetTool, lookupMeetingIdTool } from './meeting-tools.js';
-import { scrollAndDescribeTool, screenRecordTool, demoState, setDemoState, findRecording, isReadableFile } from './recording-tools.js';
+import { playVideoInMeetingTool, pauseVideoInMeetingTool, resumeVideoInMeetingTool, summonTool, dismissTool, joinZoomTool, joinGmeetTool, lookupMeetingIdTool, recordScreenWithNarrationTool } from './remote-meeting-tools.js';
+import { screenRecordTool, demoState, setDemoState, findRecording, isReadableFile } from './recording-tools.js';
 
 // --- Vision helpers (shared with recording-tools) ---
 
@@ -837,7 +837,7 @@ export const inlineTools = [
 	volumeTool, brightnessTool, clipboardTool,
 	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, summonTool, dismissTool,
 	joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool,
-	describeScreenTool, clickTool, scrollAndDescribeTool, openFileTool,
+	describeScreenTool, clickTool, recordScreenWithNarrationTool, openFileTool,
 	playVideoInMeetingTool, pauseVideoInMeetingTool, resumeVideoInMeetingTool,
 	screenRecordTool, slideControlTool, fullscreenTool,
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool, ];
@@ -855,7 +855,7 @@ export const ownerOnlyTools = [
 	clipboardTool, cancelTaskTool, toggleTasksTool, summonTool, dismissTool,
 	joinZoomTool, joinGmeetTool, callContactTool, slideControlTool, fullscreenTool,
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
-	describeScreenTool, clickTool, scrollAndDescribeTool, openFileTool,
+	describeScreenTool, clickTool, recordScreenWithNarrationTool, openFileTool,
 	playVideoInMeetingTool, pauseVideoInMeetingTool, resumeVideoInMeetingTool, screenRecordTool,
 ];
 

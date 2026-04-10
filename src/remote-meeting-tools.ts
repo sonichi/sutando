@@ -7,9 +7,30 @@ import { execSync } from 'node:child_process';
 import { writeFileSync, readFileSync, unlinkSync, existsSync } from 'node:fs';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
-import { findRecording, isReadableFile } from './recording-tools.js';
+import { findRecording, isReadableFile, startNarrationRecording } from './recording-tools.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
+
+// --- Record screen with narration (remote meeting only) ---
+// Narration audio is only needed when user is remote — they can't hear the computer.
+
+export const recordScreenWithNarrationTool: ToolDefinition = {
+	name: 'record_screen_with_narration',
+	description:
+		'Record a demo video with narration and scrolling. Call ONCE with duration_seconds. ' +
+		'It starts recording, auto-scrolls, and returns a first description. ' +
+		'SPEAK the returned description as your first words. ' +
+		'New descriptions will be pushed as the page scrolls — speak each one. NEVER repeat earlier narration. ' +
+		'Recording auto-stops. Do NOT call this more than once per recording.',
+	parameters: z.object({
+		duration_seconds: z.number().optional().describe('Target duration in seconds (default 15, max 60).'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { duration_seconds } = args as { duration_seconds?: number };
+		return startNarrationRecording(duration_seconds ?? 15);
+	},
+};
 
 const ZOOM_PMI = process.env.ZOOM_PERSONAL_MEETING_ID ?? '';
 

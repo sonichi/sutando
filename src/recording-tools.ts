@@ -475,9 +475,9 @@ export function stopActiveRecording(): void {
  * Call once per session — handles tool triggers, reconnect, and cleanup automatically.
  */
 export function setupRecordingHooks(session: any): void {
-	// Start narration when scroll_and_describe is called
+	// Start narration when record_screen_with_narration is called
 	session.eventBus?.subscribe?.('tool.call', (e: any) => {
-		if (e?.toolName === 'scroll_and_describe') {
+		if (e?.toolName === 'record_screen_with_narration') {
 			setTimeout(() => {
 				if (existsSync('/tmp/sutando-screen-record.pid')) startRecordingNarration(session);
 			}, 4000);
@@ -568,111 +568,77 @@ export function startRecordingNarration(session: any): void {
 	}, durationMs + 1000); // +1s buffer for auto-stop to finish
 }
 
-// --- Scroll and Describe tool ---
+// recordScreenWithNarrationTool lives in remote-meeting-tools.ts
+// (narration audio is only needed when user is remote via phone/Zoom)
+// It calls this helper which encapsulates all scroll+record+subtitle logic.
+export async function startNarrationRecording(duration_seconds: number): Promise<{ status: string; first_description?: string; message?: string; error?: string }> {
+	const MAX_DURATION = 60;
+	const capped = Math.min(duration_seconds, MAX_DURATION);
+	if (duration_seconds > MAX_DURATION) console.log(`${ts()} [RecordWithNarration] capped duration from ${duration_seconds}s to ${MAX_DURATION}s`);
+	try {
+		if (demoState === 'recording') return { status: 'already_recording', message: 'Already recording.' };
+		if (demoState === 'done') demoState = 'idle';
+		demoState = 'recording';
 
-export const scrollAndDescribeTool: ToolDefinition = {
-	name: 'scroll_and_describe',
-	description:
-		'Record a demo video with narration. Call ONCE with duration_seconds. It starts recording, auto-scrolls, and returns a first description. ' +
-		'Do NOT announce "starting recording" — SPEAK the returned description as your first words. ' +
-		'New descriptions will be pushed as the page scrolls — speak each one. NEVER repeat earlier narration. ' +
-		'Recording auto-stops. Do NOT call this more than once per recording.',
-	parameters: z.object({
-		duration_seconds: z.number().optional().describe('Target duration in seconds (default 15, max 60). ALWAYS seconds, never minutes.'),
-	}),
-	execution: 'inline',
-	async execute(args) {
-		const MAX_DURATION = 60;
-		const rawDuration = (args as { duration_seconds?: number }).duration_seconds ?? 15;
-		const duration_seconds = Math.min(rawDuration, MAX_DURATION);
-		if (rawDuration > MAX_DURATION) console.log(`${ts()} [ScrollAndDescribe] capped duration from ${rawDuration}s to ${MAX_DURATION}s`);
+		// Scroll to top
+		execSync(`osascript -e 'tell application "System Events" to key code 126 using command down'`, { timeout: 5_000 });
+
+		// Start recording + first describe_screen in parallel
+		try { unlinkSync(LIVE_TRANSCRIPT_SRT_PATH); } catch {}
+		execSync('python3 skills/screen-record/scripts/record.py start', { timeout: 10_000 });
+		const captureRes = await fetch('http://localhost:7845/capture');
+		const captureData = await captureRes.json() as { status: string; path?: string };
+		const firstDesc = captureData.path ? await describeScreenshot(captureData.path) : '';
+		// Resolve symlink NOW so a concurrent call can't overwrite it
+		try { liveTranscriptResolvedPath = readlinkSync(LIVE_TRANSCRIPT_SYMLINK); } catch { liveTranscriptResolvedPath = ''; }
+		liveTranscriptRecordingStart = Date.now();
+		liveTranscriptBaselineLines = countTranscriptLines();
+
+		// Adaptive scroll speed
+		let pageHeight = 5000;
 		try {
-			// Prevent duplicate recordings
-			if (demoState === 'recording') return { status: 'already_recording', message: 'Already recording.' };
-			// Reset from previous recording — allow new one
-			if (demoState === 'done') demoState = 'idle';
-			demoState = 'recording';
+			pageHeight = parseInt(execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "document.body.scrollHeight - window.innerHeight"'`, { timeout: 3_000 }).toString().trim()) || 5000;
+		} catch {}
+		const SCROLL_INTERVAL_MS = 2500;
+		const totalScrollSteps = (capped * 1000) / SCROLL_INTERVAL_MS;
+		const pxPerStep = Math.ceil(pageHeight / totalScrollSteps);
+		const viewportHeight = 900;
+		const msPerViewport = Math.round((viewportHeight / pxPerStep) * SCROLL_INTERVAL_MS);
+		writeFileSync('/tmp/sutando-scroll-info.json', JSON.stringify({ pageHeight, pxPerStep, msPerViewport, duration_seconds: capped }));
+		console.log(`${ts()} [RecordWithNarration] page=${pageHeight}px, ${totalScrollSteps} steps, ${pxPerStep}px/step`);
+		let scrolledTotal = 0;
+		const scrollInterval = setInterval(() => {
+			if (scrolledTotal >= pageHeight) return;
+			try { execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "window.scrollBy(0, ${pxPerStep})"'`, { timeout: 5_000 }); } catch {}
+			scrolledTotal += pxPerStep;
+		}, SCROLL_INTERVAL_MS);
 
-			// Scroll to top
-			execSync(`osascript -e 'tell application "System Events" to key code 126 using command down'`, { timeout: 5_000 });
+		const myRecStart = liveTranscriptRecordingStart;
+		setTimeout(async () => {
+			clearInterval(scrollInterval);
+			let stopResult: any = {};
+			try { stopResult = JSON.parse(execSync('python3 skills/screen-record/scripts/record.py stop', { timeout: 10_000 }).toString().trim()); } catch {}
+			const narrated = stopResult.path ? stopResult.path.replace('.mov', '-narrated.mov') : '';
+			for (let w = 0; w < 5; w++) {
+				if (narrated && isReadableFile(narrated)) break;
+				await new Promise(r => setTimeout(r, 2000));
+			}
+			if (liveTranscriptRecordingStart > 0 && narrated && isReadableFile(narrated)) {
+				const subtitled = burnLiveTranscriptSubtitles(narrated);
+				if (subtitled) console.log(`${ts()} [RecordWithNarration] subtitle burned: ${subtitled}`);
+				else console.log(`${ts()} [RecordWithNarration] subtitle burn failed`);
+			}
+			if (liveTranscriptRecordingStart === myRecStart) liveTranscriptRecordingStart = 0;
+			demoState = 'done';
+			console.log(`${ts()} [RecordWithNarration] auto-stop`);
+		}, capped * 1000);
 
-			// Start recording + first describe_screen in parallel
-			try { unlinkSync(LIVE_TRANSCRIPT_SRT_PATH); } catch {}
-			execSync('python3 skills/screen-record/scripts/record.py start', { timeout: 10_000 });
-			const captureRes = await fetch('http://localhost:7845/capture');
-			const captureData = await captureRes.json() as { status: string; path?: string };
-			const firstDesc = captureData.path ? await describeScreenshot(captureData.path) : '';
-			// Set subtitle baseline AFTER first description — so subtitles align with audio.
-			// Resolve the symlink NOW so a concurrent call (Zoom join) can't overwrite it.
-			try { liveTranscriptResolvedPath = readlinkSync(LIVE_TRANSCRIPT_SYMLINK); } catch { liveTranscriptResolvedPath = ''; }
-			liveTranscriptRecordingStart = Date.now();
-			liveTranscriptBaselineLines = countTranscriptLines();
-
-			// Adaptive scroll speed: one pass top-to-bottom over the full duration
-			let pageHeight = 5000; // fallback
-			try {
-				pageHeight = parseInt(execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "document.body.scrollHeight - window.innerHeight"'`, { timeout: 3_000 }).toString().trim()) || 5000;
-			} catch {}
-			const SCROLL_INTERVAL_MS = 2500;
-			const totalScrollSteps = (duration_seconds * 1000) / SCROLL_INTERVAL_MS;
-			const pxPerStep = Math.ceil(pageHeight / totalScrollSteps);
-			// Write scroll info for conversation-server to calculate description timing
-			const viewportHeight = 900; // approximate
-			const msPerViewport = Math.round((viewportHeight / pxPerStep) * SCROLL_INTERVAL_MS);
-			writeFileSync('/tmp/sutando-scroll-info.json', JSON.stringify({ pageHeight, pxPerStep, msPerViewport, duration_seconds }));
-			console.log(`${ts()} [ScrollAndDescribe] page=${pageHeight}px, ${totalScrollSteps} steps, ${pxPerStep}px/step, ${msPerViewport}ms/viewport`);
-			let scrolledTotal = 0;
-			// Inline Chrome scroll (avoids circular import with scrollTool in inline-tools)
-			const scrollInterval = setInterval(() => {
-				if (scrolledTotal >= pageHeight) return; // stop at bottom
-				try {
-					execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "window.scrollBy(0, ${pxPerStep})"'`, { timeout: 5_000 });
-				} catch {}
-				scrolledTotal += pxPerStep;
-			}, SCROLL_INTERVAL_MS);
-
-			// Auto-stop after duration — wait for narration-tee mux, then burn subtitles.
-			// Capture start time: if user starts a 2nd recording before this timer fires,
-			// liveTranscriptRecordingStart will be overwritten. Only clear if still ours.
-			const myRecStart = liveTranscriptRecordingStart;
-			setTimeout(async () => {
-				clearInterval(scrollInterval);
-				let stopResult: any = {};
-				try {
-					const raw = execSync('python3 skills/screen-record/scripts/record.py stop', { timeout: 10_000 }).toString().trim();
-					stopResult = JSON.parse(raw);
-				} catch {}
-				// Wait for narrated.mov to exist (narration-tee stop + mux ~2s after record.py stop)
-				// Wait up to 10s (5x2s) for narration-tee to mux narrated.mov.
-				// 8s was too short — narration mux takes ~3s after record.py stop,
-				// and the subtitled burn was missing because the file wasn't ready.
-				const narrated = stopResult.path ? stopResult.path.replace('.mov', '-narrated.mov') : '';
-				for (let w = 0; w < 5; w++) {
-					if (narrated && isReadableFile(narrated)) break;
-					await new Promise(r => setTimeout(r, 2000));
-				}
-				// Burn live transcript subtitles on narrated version only
-				if (liveTranscriptRecordingStart > 0 && narrated && isReadableFile(narrated)) {
-					const subtitled = burnLiveTranscriptSubtitles(narrated);
-					if (subtitled) console.log(`${ts()} [ScrollAndDescribe] subtitle burned: ${subtitled}`);
-					else console.log(`${ts()} [ScrollAndDescribe] subtitle burn failed (no transcript lines or ffmpeg error)`);
-				}
-				if (liveTranscriptRecordingStart === myRecStart) liveTranscriptRecordingStart = 0;
-				demoState = 'done';
-				console.log(`${ts()} [ScrollAndDescribe] auto-stop`);
-			}, duration_seconds * 1000);
-
-			console.log(`${ts()} [ScrollAndDescribe] recording started with first desc`);
-			return {
-				status: 'recording',
-				first_description: firstDesc,
-				message: `SPEAK THIS NOW: "${firstDesc}" — this is your narration. Auto-stops in ${duration_seconds}s.`,
-			};
-		} catch (err) {
-			return { error: `scroll_and_describe failed: ${err instanceof Error ? err.message : err}` };
-		}
-	},
-};
+		console.log(`${ts()} [RecordWithNarration] recording started`);
+		return { status: 'recording', first_description: firstDesc, message: `SPEAK THIS NOW: "${firstDesc}" — this is your narration. Auto-stops in ${capped}s.` };
+	} catch (err) {
+		return { status: 'error', error: `record_screen_with_narration failed: ${err instanceof Error ? err.message : err}` };
+	}
+}
 
 // --- Screen recording tool ---
 
