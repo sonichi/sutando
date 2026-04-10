@@ -4,7 +4,7 @@
  */
 
 import { execSync, execFileSync } from 'node:child_process';
-import { writeFileSync, unlinkSync, readFileSync, existsSync, statSync } from 'node:fs';
+import { writeFileSync, unlinkSync, readFileSync, readlinkSync, existsSync, statSync, symlinkSync } from 'node:fs';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 
@@ -323,7 +323,9 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			const captureRes = await fetch('http://localhost:7845/capture');
 			const captureData = await captureRes.json() as { status: string; path?: string };
 			const firstDesc = captureData.path ? await describeScreenshot(captureData.path) : '';
-			// Set subtitle baseline AFTER first description — so subtitles align with audio
+			// Set subtitle baseline AFTER first description — so subtitles align with audio.
+			// Resolve the symlink NOW so a concurrent call (Zoom join) can't overwrite it.
+			try { liveTranscriptResolvedPath = readlinkSync(LIVE_TRANSCRIPT_SYMLINK); } catch { liveTranscriptResolvedPath = ''; }
 			liveTranscriptRecordingStart = Date.now();
 			liveTranscriptBaselineLines = countTranscriptLines();
 
@@ -369,8 +371,9 @@ export const scrollAndDescribeTool: ToolDefinition = {
 				}
 				// Burn live transcript subtitles on narrated version only
 				if (liveTranscriptRecordingStart > 0 && narrated && isReadableFile(narrated)) {
-					burnLiveTranscriptSubtitles(narrated);
-					console.log(`${ts()} [ScrollAndDescribe] subtitle burned on: ${narrated}`);
+					const subtitled = burnLiveTranscriptSubtitles(narrated);
+					if (subtitled) console.log(`${ts()} [ScrollAndDescribe] subtitle burned: ${subtitled}`);
+					else console.log(`${ts()} [ScrollAndDescribe] subtitle burn failed (no transcript lines or ffmpeg error)`);
 				}
 				if (liveTranscriptRecordingStart === myRecStart) liveTranscriptRecordingStart = 0;
 				demoState = 'done';
@@ -680,15 +683,20 @@ const SCREEN_RECORD_COOLDOWN_MS = 5_000;
 // When subtitle=true, captures conversation transcript during recording
 // and burns it as SRT into the video when recording stops.
 // Symlink points to the active call's transcript (phone or voice agent)
-const LIVE_TRANSCRIPT_PATH = '/tmp/sutando-live-transcript.txt';
+const LIVE_TRANSCRIPT_SYMLINK = '/tmp/sutando-live-transcript.txt';
 const LIVE_TRANSCRIPT_SRT_PATH = '/tmp/sutando-live-transcript-subtitle.srt';
 let liveTranscriptRecordingStart = 0;
 let liveTranscriptBaselineLines = 0;
+// Resolved path to the call-specific transcript file, captured at recording start.
+// A concurrent call (e.g. Zoom join) can overwrite the symlink, so we resolve it
+// once and use the resolved path for the entire recording lifecycle.
+let liveTranscriptResolvedPath = '';
 
 function countTranscriptLines(): number {
 	try {
-		if (!existsSync(LIVE_TRANSCRIPT_PATH)) return 0;
-		return readFileSync(LIVE_TRANSCRIPT_PATH, 'utf8').split('\n').filter(l => l.startsWith('[')).length;
+		const p = liveTranscriptResolvedPath || LIVE_TRANSCRIPT_SYMLINK;
+		if (!existsSync(p)) return 0;
+		return readFileSync(p, 'utf8').split('\n').filter(l => l.startsWith('[')).length;
 	} catch { return 0; }
 }
 
@@ -696,8 +704,9 @@ function countTranscriptLines(): number {
 function burnLiveTranscriptSubtitles(videoPath: string): string | null {
 	if (liveTranscriptRecordingStart === 0) return null;
 	try {
-		if (!existsSync(LIVE_TRANSCRIPT_PATH)) return null;
-		const allLines = readFileSync(LIVE_TRANSCRIPT_PATH, 'utf8').split('\n').filter(l => l.startsWith('['));
+		const p = liveTranscriptResolvedPath || LIVE_TRANSCRIPT_SYMLINK;
+		if (!existsSync(p)) return null;
+		const allLines = readFileSync(p, 'utf8').split('\n').filter(l => l.startsWith('['));
 		const newLines = allLines.slice(liveTranscriptBaselineLines);
 		if (newLines.length === 0) return null;
 
@@ -817,6 +826,7 @@ export const screenRecordTool: ToolDefinition = {
 				demoState = 'recording';
 				// Track transcript baseline for live subtitle generation (only if user wants subtitles)
 				if (subtitle) {
+					try { liveTranscriptResolvedPath = readlinkSync(LIVE_TRANSCRIPT_SYMLINK); } catch { liveTranscriptResolvedPath = ''; }
 					liveTranscriptRecordingStart = Date.now();
 					liveTranscriptBaselineLines = countTranscriptLines();
 					try { unlinkSync(LIVE_TRANSCRIPT_SRT_PATH); } catch {}
