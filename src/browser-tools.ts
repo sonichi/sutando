@@ -674,47 +674,10 @@ export const resumeVideoTool: ToolDefinition = {
 	},
 };
 
-export const replayVideoTool: ToolDefinition = {
-	name: 'replay_video',
-	description: 'Replay the video from the beginning. Use when user says "start over", "replay", "play again".',
-	parameters: z.object({}),
-	execution: 'inline',
-	async execute() {
-		console.log(`${ts()} [ReplayVideo] called`);
-		try { return await startPlayback(0); } catch (err) { return { error: `${err}` }; }
-	},
-};
-
-// "continue" intentionally NOT in pause_video — it belongs on resume_video.
-// Adding it here caused Gemini to pause when user said "continue".
-export const pauseVideoTool: ToolDefinition = {
-	name: 'pause_video',
-	description:
-		'Pause the video. Use when user says "pause", "stop", or "hold".',
-	parameters: z.object({}),
-	execution: 'inline',
-	async execute() {
-		console.log(`${ts()} [PauseVideo] called`);
-		try { writeFileSync('/tmp/sutando-playback-pause', '1'); } catch {}
-		try { execSync(`osascript -e 'tell application "QuickTime Player"' -e 'if (count of documents) > 0 then' -e 'pause document 1' -e 'end if' -e 'end tell'`, { timeout: 5_000 }); } catch {}
-		return { status: 'paused', instruction: 'Paused. When user says play/resume, call play_video.' };
-	},
-};
-
-export const closeVideoTool: ToolDefinition = {
-	name: 'close_video',
-	description:
-		'Close the video player. Use when user says "close the video", "close it".',
-	parameters: z.object({}),
-	execution: 'inline',
-	async execute() {
-		console.log(`${ts()} [CloseVideo] called`);
-		try { execSync(`osascript -e 'tell application "QuickTime Player" to quit'`, { timeout: 5_000 }); } catch {}
-		try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
-		try { unlinkSync('/tmp/sutando-playback-path'); } catch {}
-		return { status: 'closed' };
-	},
-};
+// Removed: replayVideoTool (identical to play_video), pauseVideoTool (Space key
+// pauses QuickTime, press_key handles it), closeVideoTool (Cmd+Q quits QuickTime,
+// press_key handles it). Kept play_video and resume_video because they need phone
+// audio streaming side effects that keyboard shortcuts can't provide.
 
 // --- Screen recording ---
 

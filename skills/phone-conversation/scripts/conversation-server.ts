@@ -385,10 +385,10 @@ function buildAgent(callSession: CallSession): MainAgent {
 				'TOOL EXCLUSIVITY: If an inline tool can handle the request, use ONLY the inline tool. NEVER also call work. They are mutually exclusive — calling both causes duplicate responses. Only use work when no inline tool fits.',
 				'SUMMON: Before calling summon, ALWAYS say "Summoning your screen now" FIRST — the user is on the phone and cannot see what is happening. The tool takes several seconds.',
 				'PLAYBACK RULES (CRITICAL):',
-				'0. Video tools: open_video (open), play_video (play from start), pause_video (pause), resume_video (resume/continue), replay_video (start over), close_video (close). NEVER use work for video.',
+				'0. Video tools: open_video (open), play_video (play from start or replay), resume_video (resume/continue). For pause use press_key("space"). For close use press_key("cmd+q"). NEVER use work for video.',
 				'1. After calling play_video or resume_video, say NOTHING. Audio streams to the phone.',
-				'2. "pause", "stop", "hold" → call pause_video, then say "Paused."',
-				'3. "play" → play_video. "resume"/"continue" → resume_video. "start over"/"replay" → replay_video.',
+				'2. "pause", "stop", "hold" → call press_key with "space", then say "Paused."',
+				'3. "play"/"start over"/"replay" → play_video. "resume"/"continue" → resume_video.',
 				'4. Do NOT use describe_screen, scroll, or work while a recording is playing.',
 				'5. Do NOT guess or hallucinate about the video (duration, content, etc). You cannot see or hear it.',
 				'You can make concurrent calls — stay on the line while calling someone else.',
@@ -657,7 +657,7 @@ async function createCallSession(params: {
 					callSession.events.push({ event: `rec_indicator:${hasIndicator ? 'on' : 'off'}`, timestamp: new Date().toISOString() });
 				}
 				// After video play/pause, inject context reminder
-				if (['play_video', 'pause_video', 'resume_video', 'replay_video'].includes(toolName)) {
+				if (['play_video', 'resume_video'].includes(toolName)) {
 					setTimeout(() => {
 						try {
 							if (existsSync('/tmp/sutando-playback-pause')) {
@@ -666,7 +666,7 @@ async function createCallSession(params: {
 								], true);
 							} else {
 								(session as any).transport.sendContent([
-									{ role: 'user', text: '[System: Video PLAYING. Say NOTHING. ONLY call pause_video when user says "pause"/"stop"/"continue", or close_video when user says "close". Ignore ALL other speech.]' },
+									{ role: 'user', text: '[System: Video PLAYING. Say NOTHING. ONLY call press_key("space") when user says "pause"/"stop", or press_key("cmd+q") when user says "close". Ignore ALL other speech.]' },
 								], true);
 							}
 						} catch {}
