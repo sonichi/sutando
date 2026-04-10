@@ -104,8 +104,11 @@ voice_desired_state = "disconnected"
 
 def get_status() -> dict:
     try:
+        # Use sys.executable — under launchd, bare `python3` resolves to
+        # /usr/bin/python3 (3.9) which can't parse health-check.py's 3.10+
+        # union syntax. Same regression source as dashboard.get_health().
         result = subprocess.run(
-            ["python3", str(REPO_DIR / "src/health-check.py"), "--json"],
+            [sys.executable, str(REPO_DIR / "src/health-check.py"), "--json"],
             capture_output=True, text=True, timeout=15,
         )
         health = json.loads(result.stdout.strip())

@@ -25,9 +25,15 @@ PORT = 7844
 
 
 def get_health() -> list[dict]:
+    # Use sys.executable so the subprocess uses the same Python that's
+    # running dashboard itself (typically homebrew 3.11). When launchd
+    # spawns dashboard with a minimal PATH, bare `python3` resolves to
+    # /usr/bin/python3 (3.9.6), which can't parse 3.10+ union syntax
+    # (str | None) in health-check.py — causing a silent TypeError that
+    # empties the services panel. Regression introduced by PR #263.
     try:
         result = subprocess.run(
-            ["python3", str(REPO_DIR / "src/health-check.py"), "--json"],
+            [sys.executable, str(REPO_DIR / "src/health-check.py"), "--json"],
             capture_output=True, text=True, timeout=15,
         )
         data = json.loads(result.stdout.strip())
