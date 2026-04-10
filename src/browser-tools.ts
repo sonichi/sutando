@@ -90,12 +90,54 @@ export const switchTabTool: ToolDefinition = {
 			allTerms.push(...words);
 		}
 		const uniqueTerms = [...new Set(allTerms)];
-		const conditions = uniqueTerms.map(t => {
-			const safe = t.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-			return `title of t contains "${safe}" or URL of t contains "${safe}"`;
-		}).join(' or ');
+		const safeTerms = uniqueTerms.map(t => t.replace(/\\/g, '\\\\').replace(/"/g, '\\"'));
+		const urlConditions = safeTerms.map(t => `URL of t contains "${t}"`).join(' or ');
+		const titleConditions = safeTerms.map(t => `title of t contains "${t}"`).join(' or ');
 		try {
-			const script = `tell application "Google Chrome"\nset tabIndex to 0\nrepeat with w in windows\nset tabIndex to 0\nrepeat with t in tabs of w\nset tabIndex to tabIndex + 1\nignoring case\nif ${conditions} then\nset active tab index of w to tabIndex\nset index of w to 1\nactivate\nreturn title of t\nend if\nend ignoring\nend repeat\nend repeat\nreturn "not found"\nend tell`;
+			// Two-pass match: URL first, then title.
+			//
+			// The naive `title OR URL contains keyword` returns the first tab
+			// in window-walk order that matches ANYTHING — which is wrong when
+			// a user says "switch to dashboard" and the walk order puts a
+			// random X tweet that happens to contain the word "Sutando" in its
+			// body text ahead of the actual Sutando Dashboard tab. URL is a
+			// stronger signal than title: aliases in TAB_ALIASES are URL
+			// patterns, and the user almost always means the app/site, not a
+			// random tab whose body text mentions it. If no URL matches, fall
+			// back to title.
+			const script = `tell application "Google Chrome"
+set tabIndex to 0
+repeat with w in windows
+set tabIndex to 0
+repeat with t in tabs of w
+set tabIndex to tabIndex + 1
+ignoring case
+if ${urlConditions} then
+set active tab index of w to tabIndex
+set index of w to 1
+activate
+return title of t
+end if
+end ignoring
+end repeat
+end repeat
+set tabIndex to 0
+repeat with w in windows
+set tabIndex to 0
+repeat with t in tabs of w
+set tabIndex to tabIndex + 1
+ignoring case
+if ${titleConditions} then
+set active tab index of w to tabIndex
+set index of w to 1
+activate
+return title of t
+end if
+end ignoring
+end repeat
+end repeat
+return "not found"
+end tell`;
 			const tmpFile = `/tmp/sutando-switchtab-${Date.now()}.scpt`;
 			writeFileSync(tmpFile, script);
 			const result = execSync(`osascript ${tmpFile}`, { timeout: 5_000 }).toString().trim();
