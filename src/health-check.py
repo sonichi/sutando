@@ -741,8 +741,13 @@ def main():
                             import time as _t; _t.sleep(1)
                         except Exception:
                             pass
-                    subprocess.Popen(["python3", str(REPO_DIR / "src" / f"{c['name']}.py")],
-                                     stdout=open(str(REPO_DIR / "src" / f"{c['name']}.log"), "a"),
+                    # Use sys.executable to avoid launchd's minimal PATH
+                    # resolving `python3` to /usr/bin/python3 (3.9), which
+                    # doesn't have the homebrew site-packages (discord,
+                    # dotenv, etc.) — restart would crash on import.
+                    # Log path uses logs/ (post-PR #251 refactor).
+                    subprocess.Popen([sys.executable, str(REPO_DIR / "src" / f"{c['name']}.py")],
+                                     stdout=open(str(REPO_DIR / "logs" / f"{c['name']}.log"), "a"),
                                      stderr=subprocess.STDOUT, start_new_session=True)
                     print(f"  {c['name']}: {'restarted (stale code)' if c['status'] == 'stale' else 'restarted'}")
                 elif c["name"] == "sutando-app":
