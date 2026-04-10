@@ -612,6 +612,11 @@ async function createCallSession(params: {
 		writeFileSync(liveTranscriptPath, `--- Live Transcript: ${new Date().toISOString()} ---\nCall: ${params.callSid}\n\n`);
 		try { unlinkSync('/tmp/sutando-live-transcript.txt'); } catch {}
 		symlinkSync(liveTranscriptPath, '/tmp/sutando-live-transcript.txt');
+		// Write owner's transcript path to a stable marker file — recording tools
+		// read this instead of the symlink (which concurrent Zoom calls overwrite).
+		if (callSession.isOwner) {
+			writeFileSync('/tmp/sutando-owner-transcript-path.txt', liveTranscriptPath);
+		}
 	} catch {}
 
 	const agent = buildAgent(callSession);

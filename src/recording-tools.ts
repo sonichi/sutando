@@ -589,8 +589,12 @@ export async function startNarrationRecording(duration_seconds: number): Promise
 		const captureRes = await fetch('http://localhost:7845/capture');
 		const captureData = await captureRes.json() as { status: string; path?: string };
 		const firstDesc = captureData.path ? await describeScreenshot(captureData.path) : '';
-		// Resolve symlink NOW so a concurrent call can't overwrite it
-		try { liveTranscriptResolvedPath = readlinkSync(LIVE_TRANSCRIPT_SYMLINK); } catch { liveTranscriptResolvedPath = ''; }
+		// Read the active call's transcript path from the marker file written by
+		// conversation-server at call start. The global symlink gets overwritten by
+		// concurrent calls (Zoom join), but this marker is per-owner and stable.
+		try {
+			liveTranscriptResolvedPath = readFileSync('/tmp/sutando-owner-transcript-path.txt', 'utf8').trim();
+		} catch { liveTranscriptResolvedPath = ''; }
 		liveTranscriptRecordingStart = Date.now();
 		liveTranscriptBaselineLines = countTranscriptLines();
 
