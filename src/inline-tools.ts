@@ -242,7 +242,8 @@ export const openFileTool: ToolDefinition = {
 	name: 'open_file',
 	description:
 		'Open a file with the default macOS app. Pass a path, or omit to open the latest screen recording. ' +
-		'Use when user says "open the video", "open the file", "open that", "can you open it".',
+		'Use when user says "open the video", "open the file", "open that", "can you open it". ' +
+		'Do NOT call play_video_in_meeting after this — wait for user to explicitly say "play".',
 	parameters: z.object({
 		path: z.string().optional().describe('File path to open. Omit to open the latest screen recording.'),
 	}),
