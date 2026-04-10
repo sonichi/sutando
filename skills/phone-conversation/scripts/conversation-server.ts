@@ -535,7 +535,13 @@ function buildAgent(callSession: CallSession): MainAgent {
 				return delegateTask(callSession, task);
 			},
 		});
-		tools.push(...inlineTools);
+		// Deduplicate by name — Gemini 3.1 rejects duplicate function declarations
+		// (2.5 silently accepted them). getCurrentTimeTool is in both anyCallerTools
+		// and inlineTools, so pushing both creates a duplicate that causes 1011.
+		const seen = new Set(tools.map(t => t.name));
+		for (const t of inlineTools) {
+			if (!seen.has(t.name)) { tools.push(t); seen.add(t.name); }
+		}
 		tools.push({
 			name: 'get_task_status',
 			description: 'Check whether a delegated task is still in progress. Use when someone asks "are you still working on that?"',
