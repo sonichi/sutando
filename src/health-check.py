@@ -324,22 +324,39 @@ def check_voice_transport(voice_check: dict) -> dict:
             check["detail"] = "no startup banner found in log"
             return check
         # Walk from the banner forward. Track the most recent transport
-        # event: either "setup complete" (healthy) or "Transport closed"
-        # (potentially problematic). If the tail is an abnormal close
-        # that was NOT followed by a successful setup, flag.
+        # event and a few state flags so we can distinguish real failures
+        # from expected idle-timeout closes.
+        #
+        # Expected idle path: Gemini Live fires a `GoAway` (60s warning),
+        # then ~60s later closes the transport with code=1011
+        # "The service is currently unavailable." Bodhi transitions the
+        # session to CLOSED waiting for the next client connect. That's
+        # a normal lifecycle event, not a failure — the session
+        # reconnects fresh when a client comes back. If we flag every
+        # 1011-after-GoAway as a fail, the probe reports a false
+        # positive every time voice sits idle for 10+ minutes.
         most_recent_abnormal: str | None = None
         abnormal_recovered = False
+        goaway_before_close = False  # GoAway seen since the last setup/close
         for line in lines[banner_idx:]:
             if "Gemini setup complete" in line or "LLM transport connected and setup complete" in line:
                 if most_recent_abnormal is not None:
                     abnormal_recovered = True
                     most_recent_abnormal = None
+                goaway_before_close = False
+            elif "GoAway from Gemini" in line:
+                goaway_before_close = True
             elif "[VoiceSession] Transport closed" in line:
                 m_code = _extract_close_code(line)
                 if m_code is None:
                     continue
                 if m_code in VOICE_TRANSPORT_HEALTHY_CLOSE_CODES:
                     most_recent_abnormal = None
+                    goaway_before_close = False
+                elif goaway_before_close:
+                    # Idle timeout path — Google warned, then closed. Not an error.
+                    most_recent_abnormal = None
+                    goaway_before_close = False
                 else:
                     most_recent_abnormal = line
                     abnormal_recovered = False
