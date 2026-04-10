@@ -145,7 +145,7 @@ echo "voice-agent transport state:"
 if python3 src/health-check.py --quiet 2>&1 | grep -q "voice-transport .*ok"; then
   pass "voice-transport probe: no recent abnormal closes"
 elif lsof -iTCP:9900 -sTCP:LISTEN >/dev/null 2>&1; then
-  warn "voice-transport probe not green — check src/voice-agent.log for recent 1007/1011/1006 close codes"
+  warn "voice-transport probe not green — check logs/voice-agent.log for recent 1007/1011/1006 close codes"
 else
   warn "voice-agent not running — start it before testing 3.1"
 fi
