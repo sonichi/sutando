@@ -278,16 +278,25 @@ export const openFileTool: ToolDefinition = {
 export const pressKeyTool: ToolDefinition = {
 	name: 'press_key',
 	description:
-		'Press a keyboard key or shortcut in the frontmost app. Use for: "press enter", "press escape", ' +
-		'"press tab", "send the message" (Enter), "close the dialog" (Escape), "select all" (Cmd+A), ' +
-		'"clear the input" (Cmd+A then Delete). Instant — do NOT use work for simple keystrokes.',
+		'Press a keyboard key or shortcut. By default targets the frontmost app. ' +
+		'Pass app to target a specific application (e.g. "QuickTime Player" to pause a video, "Safari" to close a tab). ' +
+		'Use for: "press enter", "press escape", "press tab", "send the message" (Enter), ' +
+		'"close the dialog" (Escape), "select all" (Cmd+A), "pause the video" (space, app=QuickTime Player), ' +
+		'"close the video" (Cmd+Q, app=QuickTime Player). Instant — do NOT use work for simple keystrokes.',
 	parameters: z.object({
 		key: z.string().describe('Key to press: enter, escape, tab, delete, space, up, down, left, right, or a letter'),
 		modifiers: z.array(z.enum(['command', 'shift', 'control', 'option'])).optional().describe('Modifier keys'),
+		app: z.string().optional().describe('Target app name (e.g. "QuickTime Player", "Safari"). If set, activates the app before pressing the key.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { key, modifiers = [] } = args as { key: string; modifiers?: string[] };
+		const { key, modifiers = [], app } = args as { key: string; modifiers?: string[]; app?: string };
+		// Activate target app if specified
+		if (app) {
+			try {
+				execSync(`osascript -e 'tell application "${app.replace(/"/g, '\\"')}" to activate'`, { timeout: 3_000 });
+			} catch { console.log(`${ts()} [PressKey] Could not activate ${app}`); }
+		}
 		const keyMap: Record<string, number> = {
 			'enter': 36, 'return': 36, 'escape': 53, 'esc': 53, 'tab': 48,
 			'delete': 51, 'backspace': 51, 'space': 49,
@@ -296,7 +305,6 @@ export const pressKeyTool: ToolDefinition = {
 		};
 		const keyCode = keyMap[key.toLowerCase()];
 		if (keyCode === undefined) {
-			// Use keystroke for unknown keys
 			const modStr = modifiers.length ? ` using {${modifiers.map(m => m + ' down').join(', ')}}` : '';
 			try {
 				execSync(`osascript -e 'tell application "System Events" to keystroke "${key}"${modStr}'`, { timeout: 3_000 });
@@ -311,8 +319,8 @@ export const pressKeyTool: ToolDefinition = {
 				return { error: `press_key failed: ${err instanceof Error ? err.message : err}` };
 			}
 		}
-		console.log(`${ts()} [PressKey] ${modifiers.length ? modifiers.join('+') + '+' : ''}${key}`);
-		return { status: 'pressed', key, modifiers };
+		console.log(`${ts()} [PressKey] ${app ? `[${app}] ` : ''}${modifiers.length ? modifiers.join('+') + '+' : ''}${key}`);
+		return { status: 'pressed', key, modifiers, app };
 	},
 };
 
