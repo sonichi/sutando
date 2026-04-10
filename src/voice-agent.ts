@@ -438,6 +438,36 @@ const mainAgent: MainAgent = {
 async function main() {
 	assertMacOS();
 
+	// --- Voice agent observability ---
+	// Same format as phone agent's call-metrics.jsonl so diagnose.py can analyze both.
+	const voiceEvents: Array<{ event: string; timestamp: string }> = [];
+	const voiceToolCalls: Array<{ name: string; durationMs: number; timestamp: string }> = [];
+	const voiceTranscript: Array<{ role: string; text: string }> = [];
+	const voiceToolIdMap = new Map<string, string>();
+	let voiceSessionStart = Date.now();
+	let metricsWritten = false;
+
+	function writeVoiceMetrics() {
+		if (metricsWritten) return;
+		metricsWritten = true;
+		try {
+			const metrics = {
+				timestamp: new Date().toISOString(),
+				sessionId: SESSION_ID,
+				source: 'voice',
+				durationMs: Date.now() - voiceSessionStart,
+				transcriptLines: voiceTranscript.length,
+				toolCalls: voiceToolCalls,
+				toolCount: voiceToolCalls.length,
+				events: voiceEvents,
+			};
+			appendFileSync('data/voice-metrics.jsonl', JSON.stringify(metrics) + '\n');
+			console.log(`${ts()} [Observability] Wrote voice metrics: ${voiceToolCalls.length} tools, ${voiceEvents.length} events, ${voiceTranscript.length} transcript lines`);
+		} catch (err) {
+			console.log(`${ts()} [Observability] Failed to write metrics: ${err}`);
+		}
+	}
+
 	const session = new VoiceSession({
 		sessionId: SESSION_ID,
 		userId: 'user',
@@ -453,12 +483,34 @@ async function main() {
 			: new GeminiBatchSTTProvider({ apiKey: GEMINI_API_KEY, model: STT_MODEL }),
 		speechConfig: { voiceName: 'Puck' },
 		hooks: {
-			onSessionStart: (e) => { userTurnCount = 0; userHasInterrupted = false; sessionEnding = false; console.log(`${ts()} [Session] Started: ${e.sessionId}`); },
-			onSessionEnd: (e) => console.log(`${ts()} [Session] Ended: ${e.sessionId} (${e.reason})`),
-			onToolCall: (e) => console.log(`${ts()} [Tool] ${e.toolName} (${e.execution})`),
-			onToolResult: (e) => console.log(`${ts()} [Tool] result: ${e.toolCallId} (${e.status}, ${e.durationMs}ms)`),
+			onSessionStart: (e) => {
+				userTurnCount = 0; userHasInterrupted = false; sessionEnding = false;
+				voiceSessionStart = Date.now(); metricsWritten = false;
+				voiceEvents.length = 0; voiceToolCalls.length = 0; voiceTranscript.length = 0;
+				voiceEvents.push({ event: 'session_started', timestamp: new Date().toISOString() });
+				console.log(`${ts()} [Session] Started: ${e.sessionId}`);
+			},
+			onSessionEnd: (e) => {
+				voiceEvents.push({ event: `session_ended:${e.reason}`, timestamp: new Date().toISOString() });
+				console.log(`${ts()} [Session] Ended: ${e.sessionId} (${e.reason})`);
+				writeVoiceMetrics();
+			},
+			onToolCall: (e) => {
+				voiceToolIdMap.set(e.toolCallId, e.toolName);
+				voiceEvents.push({ event: `tool_call:${e.toolName}`, timestamp: new Date().toISOString() });
+				console.log(`${ts()} [Tool] ${e.toolName} (${e.execution})`);
+			},
+			onToolResult: (e) => {
+				const toolName = voiceToolIdMap.get(e.toolCallId) || 'unknown';
+				voiceToolCalls.push({ name: toolName, durationMs: e.durationMs, timestamp: new Date().toISOString() });
+				voiceEvents.push({ event: `tool_result:${toolName}:${e.durationMs}ms`, timestamp: new Date().toISOString() });
+				console.log(`${ts()} [Tool] result: ${toolName} (${e.status}, ${e.durationMs}ms)`);
+			},
 			onSubagentStep: (e) => console.log(`${ts()} [Subagent] ${e.subagentName} #${e.stepNumber} [${e.toolCalls.join(',')}]`),
-			onError: (e) => console.error(`${ts()} [Error] ${e.component}: ${e.error.message} (${e.severity})`),
+			onError: (e) => {
+				voiceEvents.push({ event: `error:${e.component}:${e.error.message}`, timestamp: new Date().toISOString() });
+				console.error(`${ts()} [Error] ${e.component}: ${e.error.message} (${e.severity})`);
+			},
 		},
 	});
 
@@ -562,6 +614,12 @@ async function main() {
 			if (item.role === 'user' || item.role === 'assistant') {
 				console.log(`${ts()}   [${item.role}] ${item.content}`);
 				logConversation(item.role, item.content);
+				const evtRole = item.role === 'user' ? 'user' : 'sutando';
+				// 7s offset for user speech: Gemini STT commits transcript ~7s after
+				// the user actually spoke (measured via iPad recording comparison).
+				const evtTs = item.role === 'user' ? new Date(Date.now() - 7000).toISOString() : new Date().toISOString();
+				voiceEvents.push({ event: `${evtRole}:${item.content || ''}`, timestamp: evtTs });
+				voiceTranscript.push({ role: evtRole, text: item.content || '' });
 				const label = item.role === 'user' ? 'User' : 'Sutando';
 				try { appendFileSync(liveTranscriptPath, `[${new Date().toLocaleTimeString('en-US', {hour12:false})}] ${label}: ${item.content}\n`); } catch {}
 				// Track real user turns for the end_session gate.
@@ -589,6 +647,7 @@ async function main() {
 
 	const shutdown = async () => {
 		console.log(`\n${ts()} Shutting down...`);
+		writeVoiceMetrics();
 		await session.close('user_hangup');
 		process.exit(0);
 	};

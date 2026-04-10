@@ -548,18 +548,10 @@ function buildAgent(callSession: CallSession): MainAgent {
 			parameters: z.object({}),
 			execution: 'inline',
 			async execute() {
-				const REPO_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
-				const tasksDir = join(REPO_DIR, 'tasks');
-				const resultsDir = join(REPO_DIR, 'results');
-				try {
-					const taskFiles = readdirSync(tasksDir).filter(f => f.startsWith('task-phone-'));
-					const pendingTasks = taskFiles.filter(f => !existsSync(join(resultsDir, f)));
-					return {
-						inProgress: pendingTasks.length > 0,
-						pendingCount: pendingTasks.length,
-						pendingTasks: pendingTasks.map(f => f.replace('.txt', '')).slice(0, 3),
-					};
-				} catch { return { inProgress: false, pendingCount: 0 }; }
+				return {
+					inProgress: callSession.pendingTasks > 0,
+					pendingCount: callSession.pendingTasks,
+				};
 			},
 		});
 	} else if (callSession.callerVerified) {
@@ -740,11 +732,11 @@ async function createCallSession(params: {
 				// 12s offset: Gemini STT commits transcript ~12s after the caller actually spoke
 				// (measured via iPad recording comparison on 2026-04-09). Without this, caller
 				// timestamps appear after Sutando's responses in the observability timeline.
-				callSession.events.push({ event: `caller:${item.content.slice(0, 60)}`, timestamp: new Date(Date.now() - 12000).toISOString() });
+				callSession.events.push({ event: `caller:${item.content}`, timestamp: new Date(Date.now() - 12000).toISOString() });
 				try { appendFileSync(`/tmp/sutando-live-transcript-${callSession.callSid}.txt`, `[${new Date(Date.now() - 12000).toLocaleTimeString('en-US', {hour12:false})}] Caller: ${item.content}\n`); } catch {}
 			} else if (item.role === 'assistant') {
 				callSession.transcript.push({ role: 'sutando', text: item.content });
-				callSession.events.push({ event: `sutando:${item.content.slice(0, 60)}`, timestamp: new Date().toISOString() });
+				callSession.events.push({ event: `sutando:${item.content}`, timestamp: new Date().toISOString() });
 				try { appendFileSync(`/tmp/sutando-live-transcript-${callSession.callSid}.txt`, `[${new Date().toLocaleTimeString('en-US', {hour12:false})}] Sutando: ${item.content}\n`); } catch {}
 			}
 		}
