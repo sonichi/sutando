@@ -19,16 +19,26 @@ LAST_NOTIFY_FILE = WORKSPACE / ".last-pq-notify"
 
 
 def get_waiting_questions():
+    """Parse pending-questions.md — matches both legacy `## Q1 — Title` and
+    the current `## Title` / `- **Status:** unanswered` format."""
     if not PQ_FILE.exists():
         return []
     content = PQ_FILE.read_text()
     questions = []
-    for m in re.finditer(r'## (Q\d+) — (.+?)\n', content):
-        # Check if this question's status is Waiting
-        qid = m.group(1)
-        title = m.group(2)
-        if f"**Status:** Waiting" in content[m.start():m.start() + 500]:
-            questions.append({"id": qid, "title": title})
+    # Walk each ## section; a section is waiting if its body contains
+    # `Status: unanswered` or `Status: Waiting`.
+    sections = re.split(r'^## ', content, flags=re.MULTILINE)
+    for sec in sections[1:]:  # skip pre-header
+        title_line, _, body = sec.partition('\n')
+        title = title_line.strip()
+        if not title:
+            continue
+        status_m = re.search(r'\*\*Status:\*\*\s*(.+)', body)
+        if not status_m:
+            continue
+        status = status_m.group(1).strip().lower()
+        if status.startswith('unanswered') or status.startswith('waiting'):
+            questions.append({"id": title[:40], "title": title})
     return questions
 
 
@@ -60,6 +70,25 @@ def notify_voice(questions):
     )
 
 
+def notify_discord_dm(questions):
+    """Write a proactive-*.txt file so discord-bridge DMs the owner.
+    Owner asked (2026-04-09, while traveling) to receive pending-question
+    pings as DMs instead of just macOS notifications."""
+    ts = int(time.time())
+    path = RESULTS_DIR / f"proactive-pending-q-{ts}.txt"
+    lines = [
+        f"⚠️ {len(questions)} pending question{'s' if len(questions) > 1 else ''} waiting:",
+        "",
+    ]
+    for q in questions[:5]:
+        lines.append(f"• {q['title']}")
+    if len(questions) > 5:
+        lines.append(f"…and {len(questions) - 5} more")
+    lines.append("")
+    lines.append("Reply here or edit pending-questions.md on the Mini to resolve.")
+    path.write_text("\n".join(lines))
+
+
 def main():
     questions = get_waiting_questions()
     if not questions:
@@ -76,6 +105,9 @@ def main():
 
     # Voice result (if voice is connected, agent will speak it)
     notify_voice(questions)
+
+    # Discord DM to owner (via discord-bridge poll_proactive)
+    notify_discord_dm(questions)
 
     # Update last notify time
     LAST_NOTIFY_FILE.write_text(str(int(time.time())))
