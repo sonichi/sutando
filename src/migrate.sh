@@ -243,7 +243,7 @@ fi
 # Compile Sutando app
 echo "Compiling Sutando menu bar app..."
 cd "$REPO/src/Sutando"
-swiftc -O -o Sutando main.swift -framework Cocoa -framework Carbon -framework ApplicationServices 2>/dev/null && echo "  ✓ Sutando compiled" || echo "  ⚠ Compile failed — run manually"
+swiftc -O -o Sutando main.swift NativeMic.swift -framework Cocoa -framework Carbon -framework ApplicationServices -framework AVFoundation 2>/dev/null && echo "  ✓ Sutando compiled" || echo "  ⚠ Compile failed — run manually"
 cd "$REPO"
 
 # Python deps

@@ -140,7 +140,7 @@ if ! pgrep -f "Sutando" > /dev/null 2>&1; then
     echo "  ✓ Sutando (⌃C/⌃V/⌃M)"
   elif [ -f "$REPO/src/Sutando/main.swift" ]; then
     echo "  Compiling Sutando..."
-    if (cd "$REPO/src/Sutando" && swiftc -O -o Sutando main.swift -framework Cocoa -framework Carbon -framework ApplicationServices 2>/dev/null); then
+    if (cd "$REPO/src/Sutando" && swiftc -O -o Sutando main.swift NativeMic.swift -framework Cocoa -framework Carbon -framework ApplicationServices -framework AVFoundation 2>/dev/null); then
       "$REPO/src/Sutando/Sutando" > /dev/null 2>&1 &
       echo "  ✓ Sutando compiled and started"
     else

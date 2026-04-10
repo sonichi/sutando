@@ -65,6 +65,15 @@ const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
 const VOICE_NATIVE_AUDIO_MODEL = process.env.VOICE_NATIVE_AUDIO_MODEL || 'gemini-3.1-flash-live-preview';
 // STT_MODEL is the model name passed to GeminiBatchSTTProvider. Only used when STT_PROVIDER=gemini.
 const STT_MODEL = process.env.STT_MODEL || 'gemini-3-flash-preview';
+// Google Search grounding — MUST be false under gemini-3.1-flash-live-preview
+// native audio. Combining googleSearch: true + 3.1 native audio causes the
+// transport to reject setup with close code 1011 "exceeded your current
+// quota" (misleading error text — actual cause is the unsupported combo;
+// 2.5 silently accepted it). Verified 2026-04-09 by flipping the flag and
+// re-running setup — 3.1 connects cleanly with googleSearch=false.
+// Default true preserves existing 2.5 behavior. Set VOICE_GOOGLE_SEARCH=false
+// in .env when unpinning VOICE_NATIVE_AUDIO_MODEL to 3.1.
+const VOICE_GOOGLE_SEARCH = (process.env.VOICE_GOOGLE_SEARCH ?? 'true').toLowerCase() !== 'false';
 const CARTESIA_API_KEY = process.env.CARTESIA_API_KEY || '';
 const STT_PROVIDER = process.env.STT_PROVIDER || (CARTESIA_API_KEY ? 'cartesia' : 'gemini');
 
@@ -370,7 +379,7 @@ const mainAgent: MainAgent = {
 	// bodhi exposes a proper "user has actually spoken" signal under
 	// native audio).
 	tools: [workTool, getTaskStatus, ...inlineTools],
-	googleSearch: true,
+	googleSearch: VOICE_GOOGLE_SEARCH,
 	onEnter: async () => console.log(`${ts()} [Agent] Sutando ready`),
 	// Voice-driven close — strict version. User wants to be able to
 	// say "bye" and have the session close, but the previous

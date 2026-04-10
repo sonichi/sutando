@@ -315,7 +315,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func toggleVoice() {
         NSLog("Sutando: toggleVoice called")
-        // Toggle voice via HTTP — no Chrome JavaScript permission needed
+        // NativeMic path is parked — see NativeMic.swift header. Echo cancellation
+        // via voice-processing IO unit fails to initialize the output node on
+        // this hardware (-10875). Re-enable once that's resolved.
         httpToggle(endpoint: "toggle")
     }
 
