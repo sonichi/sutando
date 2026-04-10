@@ -14,6 +14,8 @@ It belongs entirely to you.
 
 Unmute to hear the real-time conversation. In this demo, the user controls their Mac entirely from a phone call — sharing the screen to Zoom, recording a narrated video, adding subtitles, and playing it back. No keyboard, no mouse. [Watch on YouTube →](https://youtu.be/kpdSC3e7tM4)
 
+📺 [Watch the vision talk at UC Berkeley →](https://youtu.be/c39fJ2WAj6A?t=7719) — the idea behind Sutando, before it existed.
+
 ---
 
 ## What can you do with it?

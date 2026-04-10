@@ -52,6 +52,7 @@ tab-aliases.json
 session-state.md
 src/web-client.js
 context-drop-image.png
+generated-*.png
 contextual-chips.json
 *.heartbeat
 .agent/

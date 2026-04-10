@@ -19,6 +19,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from typing import Optional
 
 REPO = Path(__file__).resolve().parent.parent.parent.parent
 CALLS_FILE = REPO / "results" / "calls" / "calls.jsonl"
@@ -51,7 +52,7 @@ def parse_transcript(transcript: str) -> list[tuple[str, str]]:
     return turns
 
 
-def find_call(sid_query: str) -> dict | None:
+def find_call(sid_query: str) -> Optional[dict]:
     """Match by full SID or by suffix (12 chars is enough to disambiguate)."""
     if not CALLS_FILE.exists():
         return None
@@ -76,7 +77,7 @@ def find_call(sid_query: str) -> dict | None:
     return candidates[-1]
 
 
-def find_metrics(call_sid: str) -> dict | None:
+def find_metrics(call_sid: str) -> Optional[dict]:
     if not METRICS_FILE.exists():
         return None
     with METRICS_FILE.open() as f:

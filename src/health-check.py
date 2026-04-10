@@ -20,6 +20,7 @@ import socket
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 REPO_DIR = Path(__file__).parent.parent
 
@@ -274,13 +275,13 @@ def check_voice_watchers(voice_check: dict) -> dict:
 VOICE_TRANSPORT_HEALTHY_CLOSE_CODES = {"1000", "4000"}
 
 
-def _extract_close_code(line: str) -> str | None:
+def _extract_close_code(line: str) -> Optional[str]:
     import re
     m = re.search(r"code=(\d+)", line)
     return m.group(1) if m else None
 
 
-def _extract_close_reason(line: str) -> str | None:
+def _extract_close_reason(line: str) -> Optional[str]:
     import re
     m = re.search(r'reason="([^"]*)"', line)
     return m.group(1) if m else None
@@ -335,7 +336,7 @@ def check_voice_transport(voice_check: dict) -> dict:
         # reconnects fresh when a client comes back. If we flag every
         # 1011-after-GoAway as a fail, the probe reports a false
         # positive every time voice sits idle for 10+ minutes.
-        most_recent_abnormal: str | None = None
+        most_recent_abnormal: Optional[str] = None
         abnormal_recovered = False
         goaway_before_close = False  # GoAway seen since the last setup/close
         for line in lines[banner_idx:]:
