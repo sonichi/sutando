@@ -161,10 +161,48 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
         proc_start = min(starts)
         src_mtime = src_file.stat().st_mtime
         if src_mtime - proc_start > threshold_sec:
+            # Before flagging stale, cross-check with git: mtime gets bumped by
+            # `git checkout`/`pull`/`rebase` even when the file content is
+            # identical, which produced a steady stream of false positives
+            # whenever a branch switch left the working tree unchanged on a
+            # specific file. Ask git for the last commit time that actually
+            # touched this file. If that's older than proc_start AND there
+            # are no uncommitted changes to the file, it's a mtime-only
+            # bump — the running code is still current.
+            if _file_unchanged_since(src_file, proc_start):
+                return
             check["status"] = "stale"
             check["detail"] = f"running but code is {int((src_mtime - proc_start) / 60)} min newer than process — restart needed"
     except (subprocess.TimeoutExpired, OSError):
         pass
+
+
+def _file_unchanged_since(src_file: Path, proc_start: float) -> bool:
+    """Return True if git's last-commit-time for src_file predates proc_start
+    AND the file has no uncommitted changes. Used to suppress stale-detection
+    false positives from git operations that bump mtime without changing
+    content. Silent-failure: returns False on any git error so real stale
+    deploys aren't hidden.
+    """
+    try:
+        log = subprocess.run(
+            ["git", "log", "-1", "--format=%ct", "HEAD", "--", str(src_file)],
+            cwd=REPO_DIR, capture_output=True, text=True, timeout=5
+        )
+        if log.returncode != 0 or not log.stdout.strip():
+            return False
+        commit_time = int(log.stdout.strip())
+        if commit_time >= proc_start:
+            # Real commit landed after proc_start — genuinely stale
+            return False
+        # No commits since proc_start; check for uncommitted edits
+        diff = subprocess.run(
+            ["git", "diff", "--quiet", "HEAD", "--", str(src_file)],
+            cwd=REPO_DIR, capture_output=True, timeout=5
+        )
+        return diff.returncode == 0  # 0 = no diff
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        return False
 
 
 # Watchers task-bridge starts at voice-agent boot. If any of these is
@@ -228,6 +266,96 @@ def check_voice_watchers(voice_check: dict) -> dict:
     return check
 
 
+# Close codes that indicate a healthy voice-agent → Gemini Live transport
+# state. Anything else after a startup banner suggests upstream failure
+# (quota, auth, network blip, bodhi state-machine wedge).
+#   1000 = normal closure
+#   4000 = sutando custom goodbye disconnect (bodhi fork commit 44172b8)
+VOICE_TRANSPORT_HEALTHY_CLOSE_CODES = {"1000", "4000"}
+
+
+def _extract_close_code(line: str) -> str | None:
+    import re
+    m = re.search(r"code=(\d+)", line)
+    return m.group(1) if m else None
+
+
+def _extract_close_reason(line: str) -> str | None:
+    import re
+    m = re.search(r'reason="([^"]*)"', line)
+    return m.group(1) if m else None
+
+
+def check_voice_transport(voice_check: dict) -> dict:
+    """Scan voice-agent.log from the most recent startup banner forward
+    for abnormal Gemini transport closes. Flags things like:
+        code=1011 "exceeded your current quota"    (the 3.1 tier issue)
+        code=1007 "Request contains an invalid argument" (CLOSED→CLOSED)
+        code=1006 abnormal / network drop
+    Returns ok if the latest transport event since the most recent boot
+    is "setup complete", or if an abnormal close was followed by a
+    successful "setup complete" (auto-recovery worked).
+
+    Added 2026-04-09 after the Gemini 3.1 dry-run produced a 1011 that
+    health-check couldn't see — voice-agent port was up, bodhi was up,
+    every existing probe said ok, but the transport was rejected
+    server-side. Without this check, that failure mode is only visible
+    to whoever manually tails the log.
+    """
+    check = {"name": "voice-transport", "status": "ok", "detail": "no recent transport errors"}
+    if voice_check.get("status") != "ok":
+        check["status"] = "warn"
+        check["detail"] = "voice-agent not running"
+        return check
+    log_file = REPO_DIR / "src" / "voice-agent.log"
+    if not log_file.exists():
+        check["status"] = "warn"
+        check["detail"] = "voice-agent.log not found"
+        return check
+    try:
+        lines = log_file.read_text(errors="replace").splitlines()
+        banner_idx = -1
+        for i in range(len(lines) - 1, -1, -1):
+            if "Sutando — Voice Interface" in lines[i]:
+                banner_idx = i
+                break
+        if banner_idx < 0:
+            check["status"] = "warn"
+            check["detail"] = "no startup banner found in log"
+            return check
+        # Walk from the banner forward. Track the most recent transport
+        # event: either "setup complete" (healthy) or "Transport closed"
+        # (potentially problematic). If the tail is an abnormal close
+        # that was NOT followed by a successful setup, flag.
+        most_recent_abnormal: str | None = None
+        abnormal_recovered = False
+        for line in lines[banner_idx:]:
+            if "Gemini setup complete" in line or "LLM transport connected and setup complete" in line:
+                if most_recent_abnormal is not None:
+                    abnormal_recovered = True
+                    most_recent_abnormal = None
+            elif "[VoiceSession] Transport closed" in line:
+                m_code = _extract_close_code(line)
+                if m_code is None:
+                    continue
+                if m_code in VOICE_TRANSPORT_HEALTHY_CLOSE_CODES:
+                    most_recent_abnormal = None
+                else:
+                    most_recent_abnormal = line
+                    abnormal_recovered = False
+        if most_recent_abnormal is not None:
+            reason = _extract_close_reason(most_recent_abnormal) or "unknown"
+            code = _extract_close_code(most_recent_abnormal) or "?"
+            check["status"] = "fail"
+            check["detail"] = f"unrecovered transport close: code={code} reason={reason[:80]}"
+        elif abnormal_recovered:
+            check["detail"] = "transport recovered after earlier error"
+    except OSError as e:
+        check["status"] = "warn"
+        check["detail"] = f"log read failed: {e}"
+    return check
+
+
 def run_all_checks() -> list[dict]:
     checks = []
 
@@ -237,6 +365,7 @@ def run_all_checks() -> list[dict]:
         mark_stale_if_outdated(voice_check, REPO_DIR / "src" / "voice-agent.ts", "voice-agent.ts")
     checks.append(voice_check)
     checks.append(check_voice_watchers(voice_check))
+    checks.append(check_voice_transport(voice_check))
 
     web_check = check_port(8080, "web-client")
     if web_check["status"] == "ok":
@@ -396,8 +525,12 @@ def run_all_checks() -> list[dict]:
                     # so 30 min comfortably catches them while tolerating routine
                     # branch switching.
                     if src_mtime - proc_start > 1800:  # source >30 min newer
-                        status = "stale"
-                        detail = f"running but code is {int((src_mtime - proc_start) / 60)} min newer than process — restart needed"
+                        # Cross-check with git before flagging — #253 added this
+                        # for voice-agent + web-client via mark_stale_if_outdated,
+                        # this path does the same check inline to reach bridges.
+                        if not _file_unchanged_since(src_file, proc_start):
+                            status = "stale"
+                            detail = f"running but code is {int((src_mtime - proc_start) / 60)} min newer than process — restart needed"
         except (subprocess.TimeoutExpired, ValueError, OSError):
             pass
 

@@ -141,11 +141,39 @@ export function logConversation(role: string, text: string): void {
 	try { appendFileSync(CONVERSATION_LOG, line); } catch { /* best effort */ }
 }
 
-/** Read the last N conversation entries from disk. Survives restarts. */
+/** Append a session-end boundary marker. Used by voice-agent's
+ *  endSession tool so that getRecentConversation() can trim its
+ *  replay window at the last session boundary — preventing goodbye
+ *  text from a prior session from contaminating the reconnect
+ *  greeting. Replaces the pattern-match filter that got defeated
+ *  multiple times on 2026-04-09 (commits 1-6 of PR #257).
+ *
+ *  Format: ISO-ts|SESSION_END|<reason>
+ *  The `SESSION_END` sentinel is unique so the reader can locate
+ *  it without regex gymnastics. */
+export function logSessionBoundary(reason: string = 'user_goodbye'): void {
+	const line = `${new Date().toISOString()}|SESSION_END|${reason}\n`;
+	try { appendFileSync(CONVERSATION_LOG, line); } catch { /* best effort */ }
+}
+
+/** Read recent conversation entries from disk, trimming at the most
+ *  recent SESSION_END marker. Survives restarts. Returns at most
+ *  `count` entries from the current session only — a cleanly-ended
+ *  prior session has no meaningful follow-up context. */
 export function getRecentConversation(count = 10): string {
 	if (!existsSync(CONVERSATION_LOG)) return '';
 	try {
-		const lines = readFileSync(CONVERSATION_LOG, 'utf-8').trim().split('\n').slice(-count);
+		const allLines = readFileSync(CONVERSATION_LOG, 'utf-8').trim().split('\n');
+		// Find the last SESSION_END marker and keep only lines after it
+		let lastBoundary = -1;
+		for (let i = allLines.length - 1; i >= 0; i--) {
+			if (allLines[i].includes('|SESSION_END|')) {
+				lastBoundary = i;
+				break;
+			}
+		}
+		const currentSession = lastBoundary >= 0 ? allLines.slice(lastBoundary + 1) : allLines;
+		const lines = currentSession.slice(-count);
 		return lines.map(l => {
 			const [, role, text] = l.split('|', 3);
 			return role && text ? `${role}: ${text}` : '';
@@ -197,6 +225,12 @@ export function startContextDropWatcher(onContextDrop: (content: string) => void
  * note doesn't re-inject.
  */
 let lastNoteViewingTs = '';
+// Track the last event we *logged* separately from the last we *handled*,
+// so that when the keep-pending-on-disconnect path (PR #246) retries an
+// event every 2s, we emit only one "Note view detected" line per unique
+// event.ts. Without this, voice-agent.log fills with ~30 identical lines
+// per minute whenever the user opens a note while voice is disconnected.
+let lastNoteViewingLoggedTs = '';
 /**
  * Read the current note-viewing event from disk, if any. Used for
  * on-reconnect delivery so the voice agent can catch up on what the user
@@ -223,7 +257,10 @@ export function startNoteViewingWatcher(
 		const event = readCurrentNoteViewing();
 		if (!event) return;
 		if (event.ts === lastNoteViewingTs) return;  // already handled
-		console.log(`${ts()} [TaskBridge] Note view detected: ${event.slug}`);
+		if (event.ts !== lastNoteViewingLoggedTs) {
+			console.log(`${ts()} [TaskBridge] Note view detected: ${event.slug}`);
+			lastNoteViewingLoggedTs = event.ts;
+		}
 		const handled = onNoteView(event.slug, event.content);
 		// Only mark as handled if the callback actually delivered it. This
 		// lets a voice-disconnected callback return false/void-with-falsy
@@ -240,6 +277,9 @@ export function startNoteViewingWatcher(
  */
 export function resetNoteViewingDebounce(): void {
 	lastNoteViewingTs = '';
+	// Also reset the logged-ts so the next delivery attempt logs again —
+	// a reconnect is a meaningful event that should show up in the log.
+	lastNoteViewingLoggedTs = '';
 }
 
 export function startResultWatcher(onResult: (result: string) => void, isClientConnected: () => boolean): void {
