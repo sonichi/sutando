@@ -385,10 +385,10 @@ function buildAgent(callSession: CallSession): MainAgent {
 				'TOOL EXCLUSIVITY: If an inline tool can handle the request, use ONLY the inline tool. NEVER also call work. They are mutually exclusive — calling both causes duplicate responses. Only use work when no inline tool fits.',
 				'SUMMON: Before calling summon, ALWAYS say "Summoning your screen now" FIRST — the user is on the phone and cannot see what is happening. The tool takes several seconds.',
 				'PLAYBACK RULES (CRITICAL):',
-				'0. To open/play ANY video or media file, ALWAYS use play_recording({action:"play", path:"..."}) — NEVER use work. This includes .mov, .mp4, .avi files in any folder (Downloads, tmp, etc). The path parameter accepts full paths or ~/relative paths.',
-				'1. After calling play_recording, say NOTHING. No "playing now", no "recording started", no commentary. The audio streams to the phone — any speech from you will overlap and desync.',
-				'2. "Sutando pause", "pause", "stop", "hold" → call play_recording({action:"pause"}) FIRST, then say "Paused." AFTER the tool returns. NEVER say "Paused" without calling the tool. The user must say "Sutando" before "pause" for reliable detection during audio playback.',
-				'3. "play", "continue", "continue to play", "resume", "go", "start over", "play again" → IMMEDIATELY call play_recording({action:"play"}). Say NOTHING. Do NOT narrate, describe the screen, or say "let me check". Just call the tool.',
+				'0. Video tools: open_video (open), play_video (play from start), pause_video (pause), resume_video (resume/continue), replay_video (start over), close_video (close). NEVER use work for video.',
+				'1. After calling play_video or resume_video, say NOTHING. Audio streams to the phone.',
+				'2. "pause", "stop", "hold" → call pause_video, then say "Paused."',
+				'3. "play" → play_video. "resume"/"continue" → resume_video. "start over"/"replay" → replay_video.',
 				'4. Do NOT use describe_screen, scroll, or work while a recording is playing.',
 				'5. Do NOT guess or hallucinate about the video (duration, content, etc). You cannot see or hear it.',
 				'You can make concurrent calls — stay on the line while calling someone else.',
@@ -522,7 +522,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 			name: 'work',
 			description:
 				'Do the work. Call this for action requests — calling someone, looking something up, ' +
-				'sending a message, scheduling, researching, editing files, generating images. ' +
+				'sending a message, scheduling, researching, editing files, generating images, changing subtitle colors, video editing. ' +
 				'Do NOT use this for scrolling or switching apps — use the scroll and switch_app tools instead.',
 			parameters: z.object({
 				task: z.string().describe('Full description of the task to perform'),
@@ -651,17 +651,22 @@ async function createCallSession(params: {
 				console.log(`${ts()} [Tool] result: ${toolName} (${e.status}, ${e.durationMs}ms)`);
 				callSession.toolCalls.push({ name: toolName, durationMs: e.durationMs, timestamp: new Date().toISOString() });
 				callSession.events.push({ event: `tool_result:${toolName}:${e.durationMs}ms`, timestamp: new Date().toISOString() });
-				// After play_recording pause/play, inject context reminder
-				if (toolName === 'play_recording') {
+				// Log REC indicator status for recording tools
+				if (toolName === 'scroll_and_describe' || toolName === 'screen_record' || toolName === 'open_video') {
+					const hasIndicator = existsSync('/tmp/sutando-rec-indicator.pid');
+					callSession.events.push({ event: `rec_indicator:${hasIndicator ? 'on' : 'off'}`, timestamp: new Date().toISOString() });
+				}
+				// After video play/pause, inject context reminder
+				if (['play_video', 'pause_video', 'resume_video', 'replay_video'].includes(toolName)) {
 					setTimeout(() => {
 						try {
 							if (existsSync('/tmp/sutando-playback-pause')) {
 								(session as any).transport.sendContent([
-									{ role: 'user', text: '[System: Video PAUSED. ONLY call play_recording({action:"play"}) when user explicitly says "play", "resume", or "continue". Do NOT resume on other speech. Do NOT use work or describe_screen.]' },
+									{ role: 'user', text: '[System: Video PAUSED. ONLY call resume_video when user says "resume"/"continue", or play_video when user says "play". Do NOT resume on other speech.]' },
 								], true);
 							} else {
 								(session as any).transport.sendContent([
-									{ role: 'user', text: '[System: Video PLAYING. Say NOTHING at all. Do NOT speak, narrate, or comment. ONLY respond to "pause", "stop", or "close". Ignore all other speech while video is playing.]' },
+									{ role: 'user', text: '[System: Video PLAYING. Say NOTHING. ONLY call pause_video when user says "pause"/"stop"/"continue", or close_video when user says "close". Ignore ALL other speech.]' },
 								], true);
 							}
 						} catch {}
@@ -732,8 +737,11 @@ async function createCallSession(params: {
 			if (item.content === lastTranscriptText) continue;
 			if (item.role === 'user') {
 				callSession.transcript.push({ role: 'caller', text: item.content });
-				callSession.events.push({ event: `caller:${item.content.slice(0, 60)}`, timestamp: new Date().toISOString() });
-				try { appendFileSync(`/tmp/sutando-live-transcript-${callSession.callSid}.txt`, `[${new Date().toLocaleTimeString('en-US', {hour12:false})}] Caller: ${item.content}\n`); } catch {}
+				// 12s offset: Gemini STT commits transcript ~12s after the caller actually spoke
+				// (measured via iPad recording comparison on 2026-04-09). Without this, caller
+				// timestamps appear after Sutando's responses in the observability timeline.
+				callSession.events.push({ event: `caller:${item.content.slice(0, 60)}`, timestamp: new Date(Date.now() - 12000).toISOString() });
+				try { appendFileSync(`/tmp/sutando-live-transcript-${callSession.callSid}.txt`, `[${new Date(Date.now() - 12000).toLocaleTimeString('en-US', {hour12:false})}] Caller: ${item.content}\n`); } catch {}
 			} else if (item.role === 'assistant') {
 				callSession.transcript.push({ role: 'sutando', text: item.content });
 				callSession.events.push({ event: `sutando:${item.content.slice(0, 60)}`, timestamp: new Date().toISOString() });
@@ -1119,7 +1127,7 @@ const server = createServer(async (req, res) => {
 				name: 'work',
 				description:
 					'Do the work. Call this for action requests — calling someone, looking something up, ' +
-					'sending a message, scheduling, researching, editing files, generating images.',
+					'sending a message, scheduling, researching, editing files, generating images, changing subtitle colors, video editing.',
 				parameters: z.object({
 					task: z.string().describe('Full description of the task to perform'),
 				}),
