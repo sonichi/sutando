@@ -548,18 +548,10 @@ function buildAgent(callSession: CallSession): MainAgent {
 			parameters: z.object({}),
 			execution: 'inline',
 			async execute() {
-				const REPO_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
-				const tasksDir = join(REPO_DIR, 'tasks');
-				const resultsDir = join(REPO_DIR, 'results');
-				try {
-					const taskFiles = readdirSync(tasksDir).filter(f => f.startsWith('task-phone-'));
-					const pendingTasks = taskFiles.filter(f => !existsSync(join(resultsDir, f)));
-					return {
-						inProgress: pendingTasks.length > 0,
-						pendingCount: pendingTasks.length,
-						pendingTasks: pendingTasks.map(f => f.replace('.txt', '')).slice(0, 3),
-					};
-				} catch { return { inProgress: false, pendingCount: 0 }; }
+				return {
+					inProgress: callSession.pendingTasks > 0,
+					pendingCount: callSession.pendingTasks,
+				};
 			},
 		});
 	} else if (callSession.callerVerified) {

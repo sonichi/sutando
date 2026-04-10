@@ -115,11 +115,12 @@ def diagnose(call):
                     "issue": f"{name} returned in {dur}ms — likely failed silently",
                     "detail": "Tool calls under 10ms usually mean the tool hit an early error return without doing work."})
             recent_tool_results.setdefault(name, []).append(dur)
-            fast_count = sum(1 for d in recent_tool_results[name] if d < 10)
-            if fast_count >= 3 and fast_count == len([d for d in recent_tool_results[name] if d < 10]):
-                issues.append({"severity": "error", "time": ts,
-                    "issue": f"{name} failed {fast_count} times in this call",
-                    "detail": "Repeated fast returns suggest a systematic issue, not a one-off."})
+            if name not in ("work", "hang_up"):
+                fast_count = sum(1 for d in recent_tool_results[name] if d < 10)
+                if fast_count >= 3 and fast_count == len([d for d in recent_tool_results[name] if d < 10]):
+                    issues.append({"severity": "error", "time": ts,
+                        "issue": f"{name} failed {fast_count} times in this call",
+                        "detail": "Repeated fast returns suggest a systematic issue, not a one-off."})
 
         # 2. Hallucination
         if item["type"] == "event" and detail.startswith("sutando:"):
@@ -137,7 +138,9 @@ def diagnose(call):
         # 3. Inline tool delegated via work
         if item["type"] == "event" and detail.startswith("task_delegated:"):
             task_desc = detail[15:]
-            if re.search(INLINE_KEYWORDS, task_desc, re.IGNORECASE):
+            # Only match keywords in the action text, not in file paths
+            task_text = re.split(r'[/\\]tmp[/\\]', task_desc)[0]
+            if re.search(INLINE_KEYWORDS, task_text, re.IGNORECASE):
                 issues.append({"severity": "error", "time": ts,
                     "issue": f"Inline task delegated via work: \"{task_desc[:60]}\"",
                     "detail": "Recording/screenshot/playback should use inline tools directly, not work."})
