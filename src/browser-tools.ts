@@ -345,7 +345,11 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			let scrolledTotal = 0;
 			const scrollInterval = setInterval(() => {
 				if (scrolledTotal >= pageHeight) return; // stop at bottom
-				try { scrollDown(pxPerStep); } catch {}
+				try { scrollDown(pxPerStep); } catch (err) {
+					// Scroll can fail if Chrome lost focus (Zoom overlay) or tab changed.
+					// Log but don't stop — next interval may succeed.
+					console.log(`${ts()} [ScrollAndDescribe] scroll failed: ${err}`);
+				}
 				scrolledTotal += pxPerStep;
 			}, SCROLL_INTERVAL_MS);
 
