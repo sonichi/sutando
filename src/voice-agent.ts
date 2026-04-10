@@ -445,8 +445,11 @@ async function main() {
 	const voiceTranscript: Array<{ role: string; text: string }> = [];
 	const voiceToolIdMap = new Map<string, string>();
 	let voiceSessionStart = Date.now();
+	let metricsWritten = false;
 
 	function writeVoiceMetrics() {
+		if (metricsWritten) return;
+		metricsWritten = true;
 		try {
 			const metrics = {
 				timestamp: new Date().toISOString(),
@@ -482,7 +485,7 @@ async function main() {
 		hooks: {
 			onSessionStart: (e) => {
 				userTurnCount = 0; userHasInterrupted = false; sessionEnding = false;
-				voiceSessionStart = Date.now();
+				voiceSessionStart = Date.now(); metricsWritten = false;
 				voiceEvents.length = 0; voiceToolCalls.length = 0; voiceTranscript.length = 0;
 				voiceEvents.push({ event: 'session_started', timestamp: new Date().toISOString() });
 				console.log(`${ts()} [Session] Started: ${e.sessionId}`);
