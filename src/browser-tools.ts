@@ -1,10 +1,11 @@
 /**
- * Browser & screen tools — Chrome tab control, scrolling, screenshots, and vision descriptions.
- * Split from inline-tools.ts for readability.
+ * Browser & screen tools — scrolling, screenshots, vision descriptions, screen recording, and click.
+ * Chrome-specific tools (tab switching, URL opening) are in chrome-tools.ts.
+ * Meeting/playback tools (summon, Zoom, video playback) are in summon-tools.ts.
  */
 
 import { execSync, execFileSync } from 'node:child_process';
-import { writeFileSync, unlinkSync, readFileSync, readlinkSync, existsSync, statSync, symlinkSync } from 'node:fs';
+import { writeFileSync, unlinkSync, readFileSync, readlinkSync, existsSync, statSync } from 'node:fs';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 
@@ -34,7 +35,7 @@ const VISION_MODEL = process.env.VISION_MODEL || 'gemini-3.1-flash-lite-preview'
 export const scrollTool: ToolDefinition = {
 	name: 'scroll',
 	description:
-		'Scroll the Chrome browser page. Use for: "scroll down", "scroll up", "scroll to top", "scroll to bottom".',
+		'Scroll the active application. Works in Chrome (JS scroll) and any other app (keyboard Page Down/Up). Use for: "scroll down", "scroll up", "scroll to top", "scroll to bottom".',
 	parameters: z.object({
 		direction: z.enum(['down', 'up', 'top', 'bottom']).describe('Scroll direction. Use "top" or "bottom" to jump to start/end of page.'),
 	}),
@@ -42,161 +43,38 @@ export const scrollTool: ToolDefinition = {
 	async execute(args) {
 		const { direction } = args as { direction: 'down' | 'up' | 'top' | 'bottom' };
 		try {
-			// Use Chrome's JavaScript scrollBy to avoid focus issues (Zoom steals keystrokes)
-			if (direction === 'top') {
-				execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "window.scrollTo(0, 0)"'`, { timeout: 5_000 });
-			} else if (direction === 'bottom') {
-				execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "window.scrollTo(0, document.body.scrollHeight)"'`, { timeout: 5_000 });
+			// Detect frontmost app
+			let frontApp = 'Google Chrome';
+			try {
+				frontApp = execSync(`osascript -e 'tell application "System Events" to get name of first process whose frontmost is true'`, { timeout: 3_000 }).toString().trim();
+			} catch {}
+
+			if (frontApp === 'Google Chrome') {
+				// Use Chrome's JavaScript scrollBy to avoid focus issues (Zoom steals keystrokes)
+				if (direction === 'top') {
+					execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "window.scrollTo(0, 0)"'`, { timeout: 5_000 });
+				} else if (direction === 'bottom') {
+					execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "window.scrollTo(0, document.body.scrollHeight)"'`, { timeout: 5_000 });
+				} else {
+					const amount = direction === 'down' ? 600 : -600;
+					execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "window.scrollBy(0, ${amount})"'`, { timeout: 5_000 });
+				}
 			} else {
-				const amount = direction === 'down' ? 600 : -600;
-				execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "window.scrollBy(0, ${amount})"'`, { timeout: 5_000 });
+				// Non-Chrome apps: use keyboard events
+				if (direction === 'top') {
+					execSync(`osascript -e 'tell application "System Events" to key code 115 using command down'`, { timeout: 5_000 }); // Cmd+Home
+				} else if (direction === 'bottom') {
+					execSync(`osascript -e 'tell application "System Events" to key code 119 using command down'`, { timeout: 5_000 }); // Cmd+End
+				} else if (direction === 'down') {
+					execSync(`osascript -e 'tell application "System Events" to key code 121'`, { timeout: 5_000 }); // Page Down
+				} else {
+					execSync(`osascript -e 'tell application "System Events" to key code 116'`, { timeout: 5_000 }); // Page Up
+				}
 			}
-			console.log(`${ts()} [Scroll] ${direction}`);
+			console.log(`${ts()} [Scroll] ${direction} (${frontApp})`);
 			return { status: 'scrolled', direction };
 		} catch (err) {
 			return { error: `Scroll failed: ${err instanceof Error ? err.message : err}` };
-		}
-	},
-};
-
-// --- Tab switching ---
-
-const TAB_ALIASES: Record<string, string> = {
-	'github': 'github.com', 'repo': 'github.com', 'github repo': 'github.com',
-	'gmail': 'mail.google.com', 'email': 'mail.google.com', 'inbox': 'mail.google.com',
-	'calendar': 'calendar.google.com', 'gcal': 'calendar.google.com',
-	'twitter': 'x.com', 'x': 'x.com',
-	'dashboard': 'localhost:7844', 'sutando': 'localhost:8080', 'web client': 'localhost:8080',
-	'gemini': 'gemini.google.com',
-};
-
-export const switchTabTool: ToolDefinition = {
-	name: 'switch_tab',
-	description:
-		'Switch to a Chrome tab by keyword. Searches both tab titles and URLs. Use for: "switch to GitHub", "go to Gmail", "open the calendar tab".',
-	parameters: z.object({
-		keyword: z.string().describe('Keyword to match in tab title or URL (e.g., "GitHub", "Gmail", "calendar")'),
-	}),
-	execution: 'inline',
-	async execute(args) {
-		const { keyword } = args as { keyword: string };
-		// Resolve aliases to URL patterns
-		const alias = TAB_ALIASES[keyword.toLowerCase()];
-		const searchTerms = alias ? [keyword, alias] : [keyword];
-		// Split into individual words for fuzzy matching (speech-to-text often garbles multi-word names)
-		const allTerms = [...searchTerms];
-		for (const term of searchTerms) {
-			const words = term.split(/\s+/).filter(w => w.length >= 4); // only words 4+ chars
-			allTerms.push(...words);
-		}
-		const uniqueTerms = [...new Set(allTerms)];
-		const safeTerms = uniqueTerms.map(t => t.replace(/\\/g, '\\\\').replace(/"/g, '\\"'));
-		const urlConditions = safeTerms.map(t => `URL of t contains "${t}"`).join(' or ');
-		const titleConditions = safeTerms.map(t => `title of t contains "${t}"`).join(' or ');
-		try {
-			// Two-pass match: URL first, then title.
-			//
-			// The naive `title OR URL contains keyword` returns the first tab
-			// in window-walk order that matches ANYTHING — which is wrong when
-			// a user says "switch to dashboard" and the walk order puts a
-			// random X tweet that happens to contain the word "Sutando" in its
-			// body text ahead of the actual Sutando Dashboard tab. URL is a
-			// stronger signal than title: aliases in TAB_ALIASES are URL
-			// patterns, and the user almost always means the app/site, not a
-			// random tab whose body text mentions it. If no URL matches, fall
-			// back to title.
-			const script = `tell application "Google Chrome"
-set tabIndex to 0
-repeat with w in windows
-set tabIndex to 0
-repeat with t in tabs of w
-set tabIndex to tabIndex + 1
-ignoring case
-if ${urlConditions} then
-set active tab index of w to tabIndex
-set index of w to 1
-activate
-return title of t
-end if
-end ignoring
-end repeat
-end repeat
-set tabIndex to 0
-repeat with w in windows
-set tabIndex to 0
-repeat with t in tabs of w
-set tabIndex to tabIndex + 1
-ignoring case
-if ${titleConditions} then
-set active tab index of w to tabIndex
-set index of w to 1
-activate
-return title of t
-end if
-end ignoring
-end repeat
-end repeat
-return "not found"
-end tell`;
-			const tmpFile = `/tmp/sutando-switchtab-${Date.now()}.scpt`;
-			writeFileSync(tmpFile, script);
-			const result = execSync(`osascript ${tmpFile}`, { timeout: 5_000 }).toString().trim();
-			try { unlinkSync(tmpFile); } catch {}
-			if (result === 'not found') {
-				console.log(`${ts()} [SwitchTab] no tab matching "${keyword}"`);
-				return { error: `No Chrome tab found matching "${keyword}"` };
-			}
-			console.log(`${ts()} [SwitchTab] switched to: ${result}`);
-			return { status: 'switched', tab: result };
-		} catch (err) {
-			return { error: `Failed: ${err instanceof Error ? err.message : err}` };
-		}
-	},
-};
-
-// --- Open URL ---
-
-export const openUrlTool: ToolDefinition = {
-	name: 'open_url',
-	description:
-		'Open a URL in a new Chrome tab. Use for: "open github.com", "go to that link".',
-	parameters: z.object({
-		url: z.string().describe('The URL to open'),
-	}),
-	execution: 'inline',
-	async execute(args) {
-		const { url } = args as { url: string };
-		// Escape backslashes first, then quotes — prevents shell injection via osascript
-		const safeUrl = url.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
-		try {
-			execSync(`osascript -e 'tell application "Google Chrome" to tell front window to make new tab with properties {URL:"${safeUrl}"}'`, { timeout: 5_000 });
-			console.log(`${ts()} [OpenURL] opened: ${url}`);
-			return { status: 'opened', url };
-		} catch (err) {
-			return { error: `Failed to open ${url}: ${err instanceof Error ? err.message : err}` };
-		}
-	},
-};
-
-// --- Screen capture ---
-
-export const captureScreenTool: ToolDefinition = {
-	name: 'capture_screen',
-	description:
-		'Capture a screenshot of the screen. Use for: "take a screenshot", "what\'s on my screen", "look at this". Instant.',
-	parameters: z.object({}),
-	execution: 'inline',
-	async execute() {
-		try {
-			const res = await fetch('http://localhost:7845/capture');
-			const data = await res.json() as { status: string; path?: string; error?: string };
-			if (data.status === 'ok' && data.path) {
-				console.log(`${ts()} [Screen] Captured: ${data.path}`);
-				return { status: 'captured', path: data.path };
-			}
-			return { status: 'failed', error: data.error || 'unknown error' };
-		} catch {
-			return { status: 'failed', error: 'Screen capture server not running' };
 		}
 	},
 };
@@ -562,11 +440,11 @@ export function startRecordingNarration(session: any): void {
 
 // Check file exists AND has meaningful size (>1KB). Prevents returning
 // a recording that ffmpeg is still writing or a narrated file mid-mux.
-function isReadableFile(path: string): boolean {
+export function isReadableFile(path: string): boolean {
 	try { return existsSync(path) && statSync(path).size > 1000; } catch { return false; }
 }
 
-function findRecording(version?: 'raw' | 'narrated' | 'subtitled'): string | null {
+export function findRecording(version?: 'raw' | 'narrated' | 'subtitled'): string | null {
 	try {
 		const files = execSync('ls -t /tmp/sutando-recording-*.mov 2>/dev/null | grep -v narrated | grep -v subtitled | head -1', { timeout: 3_000 }).toString().trim();
 		if (files && isReadableFile(files)) {
@@ -584,22 +462,22 @@ function findRecording(version?: 'raw' | 'narrated' | 'subtitled'): string | nul
 	return null;
 }
 
-// Video playback tools — split from a single polymorphic playRecordingTool into 6
-// single-purpose tools. Gemini selects more reliably with narrow descriptions than
-// with one tool that has an "action" enum. The old tool caused persistent confusion
-// between "open" and "play" (42% of calls in diagnostics had wrong action selection).
-export const openVideoTool: ToolDefinition = {
-	name: 'open_video',
+// --- Open file (generalized from open_video) ---
+// Backwards compatible: when no path given, finds the latest recording.
+
+export const openFileTool: ToolDefinition = {
+	name: 'open_file',
 	description:
-		'Open the latest screen recording in QuickTime. Finds the best available version (subtitled > narrated > raw). ' +
-		'Use when user says "open the video", "open the recording", "can you open it".',
+		'Open a file. When no path is given, opens the latest screen recording in QuickTime. ' +
+		'Finds the best available version (subtitled > narrated > raw). ' +
+		'Use when user says "open the video", "open the recording", "open that file", "can you open it".',
 	parameters: z.object({
 		path: z.string().optional().describe('File path. Omit for latest recording.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
 		const { path: filePath } = args as { path?: string };
-		console.log(`${ts()} [OpenVideo] called`);
+		console.log(`${ts()} [OpenFile] called`);
 		demoState = 'idle';
 		try {
 			let recPath = filePath ? filePath.replace(/^~/, process.env.HOME || '') : null;
@@ -610,117 +488,13 @@ export const openVideoTool: ToolDefinition = {
 			execSync(`open "${recPath}"`, { timeout: 5_000 });
 			try { execSync(`osascript -e 'tell application "QuickTime Player" to activate'`, { timeout: 3_000 }); } catch {}
 			const size = statSync(recPath).size;
-			console.log(`${ts()} [OpenVideo] opened ${recPath} (${(size / 1024 / 1024).toFixed(1)}MB)`);
+			console.log(`${ts()} [OpenFile] opened ${recPath} (${(size / 1024 / 1024).toFixed(1)}MB)`);
 			return { status: 'opened', path: recPath, size_mb: +(size / 1024 / 1024).toFixed(1), instruction: 'File opened. When user says play, call play_video.' };
 		} catch (err) {
-			return { error: `open_video failed: ${err instanceof Error ? err.message : err}` };
+			return { error: `open_file failed: ${err instanceof Error ? err.message : err}` };
 		}
 	},
 };
-
-/** Helper: start QuickTime playback + stream audio to phone */
-async function startPlayback(seekSec: number = 0): Promise<{ status: string; path?: string; error?: string; instruction?: string }> {
-	let recPath: string | null = null;
-	try { recPath = readFileSync('/tmp/sutando-playback-path', 'utf8').trim() || null; } catch {}
-	if (!recPath) recPath = findRecording();
-	if (!recPath) return { status: 'error', error: 'No video to play. Open a video first with open_video.' };
-	let alreadyOpen = false;
-	try {
-		const c = execSync(`osascript -e 'tell application "QuickTime Player" to count of documents'`, { timeout: 2_000 }).toString().trim();
-		alreadyOpen = parseInt(c) > 0;
-	} catch {}
-	if (!alreadyOpen) {
-		execSync(`open "${recPath}"`, { timeout: 5_000 });
-		for (let i = 0; i < 10; i++) {
-			try { const c = execSync(`osascript -e 'tell application "QuickTime Player" to count of documents'`, { timeout: 2_000 }).toString().trim(); if (parseInt(c) > 0) break; } catch {}
-			await new Promise(r => setTimeout(r, 300));
-		}
-	}
-	if (seekSec === 0) {
-		try { execSync(`osascript -e 'tell application "QuickTime Player"' -e 'set d to document 1' -e 'set current time of d to 0' -e 'end tell'`, { timeout: 3_000 }); } catch {}
-	}
-	try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
-	fetch(`http://localhost:${process.env.PHONE_PORT || '3100'}/play-audio`, {
-		method: 'POST', headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({ path: recPath, seekSec }),
-	}).catch(() => {});
-	await new Promise(r => setTimeout(r, 300));
-	try { execSync(`osascript -e 'tell application "QuickTime Player"' -e 'activate' -e 'play document 1' -e 'end tell'`, { timeout: 5_000 }); } catch {}
-	return { status: 'playing', path: recPath, instruction: 'Video is playing. Say NOTHING.' };
-}
-
-export const playVideoTool: ToolDefinition = {
-	name: 'play_video',
-	description: 'Play the video from the beginning. Use ONLY when user explicitly says "play" or "play it".',
-	parameters: z.object({}),
-	execution: 'inline',
-	async execute() {
-		console.log(`${ts()} [PlayVideo] called`);
-		try { return await startPlayback(0); } catch (err) { return { error: `${err}` }; }
-	},
-};
-
-export const resumeVideoTool: ToolDefinition = {
-	name: 'resume_video',
-	description: 'Resume the paused video from where it stopped. Use ONLY when user says "resume", "continue", "go on".',
-	parameters: z.object({}),
-	execution: 'inline',
-	async execute() {
-		console.log(`${ts()} [ResumeVideo] called`);
-		try {
-			try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
-			try { execSync(`osascript -e 'tell application "QuickTime Player"' -e 'activate' -e 'play document 1' -e 'end tell'`, { timeout: 5_000 }); } catch {}
-			return { status: 'playing', instruction: 'Video resumed. Say NOTHING.' };
-		} catch (err) { return { error: `${err}` }; }
-	},
-};
-
-export const replayVideoTool: ToolDefinition = {
-	name: 'replay_video',
-	description: 'Replay the video from the beginning. Use when user says "start over", "replay", "play again".',
-	parameters: z.object({}),
-	execution: 'inline',
-	async execute() {
-		console.log(`${ts()} [ReplayVideo] called`);
-		try { return await startPlayback(0); } catch (err) { return { error: `${err}` }; }
-	},
-};
-
-// "continue" intentionally NOT in pause_video — it belongs on resume_video.
-// Adding it here caused Gemini to pause when user said "continue".
-export const pauseVideoTool: ToolDefinition = {
-	name: 'pause_video',
-	description:
-		'Pause the video. Use when user says "pause", "stop", or "hold".',
-	parameters: z.object({}),
-	execution: 'inline',
-	async execute() {
-		console.log(`${ts()} [PauseVideo] called`);
-		try { writeFileSync('/tmp/sutando-playback-pause', '1'); } catch {}
-		try { execSync(`osascript -e 'tell application "QuickTime Player"' -e 'if (count of documents) > 0 then' -e 'pause document 1' -e 'end if' -e 'end tell'`, { timeout: 5_000 }); } catch {}
-		return { status: 'paused', instruction: 'Paused. When user says play/resume, call play_video.' };
-	},
-};
-
-export const closeVideoTool: ToolDefinition = {
-	name: 'close_video',
-	description:
-		'Close the video player. Use when user says "close the video", "close it".',
-	parameters: z.object({}),
-	execution: 'inline',
-	async execute() {
-		console.log(`${ts()} [CloseVideo] called`);
-		try { execSync(`osascript -e 'tell application "QuickTime Player" to quit'`, { timeout: 5_000 }); } catch {}
-		try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
-		try { unlinkSync('/tmp/sutando-playback-path'); } catch {}
-		return { status: 'closed' };
-	},
-};
-
-// --- Screen recording ---
-
-let lastScreenRecordCall = 0;
-const SCREEN_RECORD_COOLDOWN_MS = 5_000;
 
 // --- Live transcript subtitle tracking ---
 // When subtitle=true, captures conversation transcript during recording
@@ -744,7 +518,7 @@ function countTranscriptLines(): number {
 }
 
 /** Generate SRT from transcript lines added since recording started, then burn into video. */
-function burnLiveTranscriptSubtitles(videoPath: string): string | null {
+export function burnLiveTranscriptSubtitles(videoPath: string): string | null {
 	if (liveTranscriptRecordingStart === 0) return null;
 	try {
 		const p = liveTranscriptResolvedPath || LIVE_TRANSCRIPT_SYMLINK;
@@ -839,6 +613,11 @@ function burnLiveTranscriptSubtitles(videoPath: string): string | null {
 	}
 	return null;
 }
+
+// --- Screen recording ---
+
+let lastScreenRecordCall = 0;
+const SCREEN_RECORD_COOLDOWN_MS = 5_000;
 
 export const screenRecordTool: ToolDefinition = {
 	name: 'screen_record',
@@ -966,6 +745,3 @@ export const clickTool: ToolDefinition = {
 		}
 	},
 };
-
-// --- Screen recording ---
-
