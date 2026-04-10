@@ -740,11 +740,11 @@ async function createCallSession(params: {
 				// 12s offset: Gemini STT commits transcript ~12s after the caller actually spoke
 				// (measured via iPad recording comparison on 2026-04-09). Without this, caller
 				// timestamps appear after Sutando's responses in the observability timeline.
-				callSession.events.push({ event: `caller:${item.content.slice(0, 60)}`, timestamp: new Date(Date.now() - 12000).toISOString() });
+				callSession.events.push({ event: `caller:${item.content}`, timestamp: new Date(Date.now() - 12000).toISOString() });
 				try { appendFileSync(`/tmp/sutando-live-transcript-${callSession.callSid}.txt`, `[${new Date(Date.now() - 12000).toLocaleTimeString('en-US', {hour12:false})}] Caller: ${item.content}\n`); } catch {}
 			} else if (item.role === 'assistant') {
 				callSession.transcript.push({ role: 'sutando', text: item.content });
-				callSession.events.push({ event: `sutando:${item.content.slice(0, 60)}`, timestamp: new Date().toISOString() });
+				callSession.events.push({ event: `sutando:${item.content}`, timestamp: new Date().toISOString() });
 				try { appendFileSync(`/tmp/sutando-live-transcript-${callSession.callSid}.txt`, `[${new Date().toLocaleTimeString('en-US', {hour12:false})}] Sutando: ${item.content}\n`); } catch {}
 			}
 		}
