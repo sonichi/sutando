@@ -492,7 +492,7 @@ def print_timeline(call):
         print(f"{ts} {prefix} {item['detail']}")
 
 
-def print_issues(issues):
+def print_issues(issues, timeline=None):
     if not issues:
         print("  ✓ No issues detected")
         return
@@ -501,6 +501,19 @@ def print_issues(issues):
         print(f"  {sev} [{issue['time']}] {issue['issue']}")
         if "--verbose" in sys.argv or "-v" in sys.argv:
             print(f"    → {issue['detail']}")
+        # Show surrounding timeline context (±2 events around the issue timestamp)
+        if timeline and ("--context" in sys.argv or "-c" in sys.argv):
+            issue_ts = issue.get("time", "")
+            for idx, item in enumerate(timeline):
+                item_ts = _ts_short(item.get("ts", ""))
+                if item_ts == issue_ts:
+                    start = max(0, idx - 2)
+                    end = min(len(timeline), idx + 3)
+                    for ctx in timeline[start:end]:
+                        ctx_ts = _ts_short(ctx.get("ts", ""))
+                        marker = " >>>" if ctx_ts == issue_ts else "    "
+                        print(f"{marker} {ctx_ts} {ctx['detail'][:80]}")
+                    break
 
 
 def main():
@@ -535,11 +548,12 @@ def main():
             print_timeline(call)
             print()
 
+        timeline = merge_timeline(call)
         issues = diagnose(call)
         total_issues += len(issues)
         if issues:
             print(f"\n{len(issues)} issue(s):")
-        print_issues(issues)
+        print_issues(issues, timeline)
 
     print(f"\n{'─' * 40}")
     print(f"Total: {len(calls)} call(s), {total_issues} issue(s)")
