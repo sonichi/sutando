@@ -9,7 +9,7 @@ Pick something from the "What's inside" table in [README.md](README.md), try it,
 
 ```bash
 # Clone and set up
-git clone https://github.com/sonichi/sutando.git
+git clone https://github.com/liususan091219/sutando.git
 cd sutando
 npm install
 cp .env.example .env  # add your GEMINI_API_KEY
@@ -17,7 +17,7 @@ bash src/startup.sh
 ```
 
 ### Report bugs
-[Open an issue](https://github.com/sonichi/sutando/issues) with:
+[Open an issue](https://github.com/liususan091219/sutando/issues) with:
 - What you tried
 - What happened
 - What you expected

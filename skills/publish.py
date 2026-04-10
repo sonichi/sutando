@@ -33,7 +33,7 @@ A Claude Code skill for AI agents.
 
 ```bash
 # Clone and install
-git clone https://github.com/sonichi/sutando.git
+git clone https://github.com/liususan091219/sutando.git
 cd sutando
 bash skills/install.sh
 ```
@@ -66,7 +66,7 @@ MIT
 
 ---
 
-Built by [Sutando](https://github.com/sonichi/sutando) — a personal AI agent platform.
+Built by [Sutando](https://github.com/liususan091219/sutando) — a personal AI agent platform.
 """
     return readme
 

@@ -7,7 +7,7 @@
 #   - sutando #259 (duplicate tool declaration dedup + SDK bump) — Chi
 #
 # Then runs:
-#   1. npm install github:sonichi/bodhi_realtime_agent  (pulls new bodhi SHA)
+#   1. npm install github:liususan091219/bodhi_realtime_agent  (pulls new bodhi SHA)
 #   2. Verifies the installed bodhi dist contains all 3 fixes
 #   3. Verifies sutando's tools deduplicate correctly
 #   4. Verifies .env is still pinned to 2.5 (so this run is safe to run even
@@ -15,7 +15,7 @@
 #   5. Prints the manual next-steps checklist
 #
 # Usage: bash src/verify-gemini-31.sh [--install]
-#   --install  run `npm install github:sonichi/bodhi_realtime_agent` first
+#   --install  run `npm install github:liususan091219/bodhi_realtime_agent` first
 #              (only needed once after bodhi fork main advances)
 
 set -e
@@ -37,7 +37,7 @@ echo "========================================"
 if [ "${1:-}" = "--install" ]; then
   echo ""
   echo "Pulling latest bodhi fork..."
-  npm install github:sonichi/bodhi_realtime_agent 2>&1 | tail -3
+  npm install github:liususan091219/bodhi_realtime_agent 2>&1 | tail -3
 fi
 
 # 1. Bodhi dist — sendClientContent text path (PR #1)
@@ -159,7 +159,7 @@ echo ""
 if [ "$FAIL" -gt 0 ]; then
   echo "NOT READY for 3.1 rollout. Resolve the failures above before unpinning .env."
   echo ""
-  echo "Most common fix: run 'npm install github:sonichi/bodhi_realtime_agent' to"
+  echo "Most common fix: run 'npm install github:liususan091219/bodhi_realtime_agent' to"
   echo "pull the latest bodhi fork after PRs #2 and #3 merge there."
   exit 1
 fi

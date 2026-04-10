@@ -325,7 +325,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 		].filter(Boolean).join('\n');
 
 		const meetingInstructions = callSession.callerVerified
-			? 'You are Sutando, an AI assistant in a meeting. You have full capabilities — make calls, look things up, send messages, and perform tasks. Be natural, warm, and conversational. Keep responses to 1-2 sentences. Known URLs: "sutando agent repo" = https://github.com/sonichi/sutando'
+			? 'You are Sutando, an AI assistant in a meeting. You have full capabilities — make calls, look things up, send messages, and perform tasks. Be natural, warm, and conversational. Keep responses to 1-2 sentences. Known URLs: "sutando agent repo" = https://github.com/liususan091219/sutando'
 			: 'You are Sutando, an AI note-taker in a meeting. Be natural, warm, and conversational. Keep responses to 1-2 sentences. You can listen, take notes, and answer questions about the discussion. You cannot make phone calls, send messages, or look things up — if asked, just say you can only help with notes today.';
 
 		instructions = ivrInstructions + '\n\nAfter joining the meeting:\n' + meetingInstructions;
@@ -1144,7 +1144,7 @@ const server = createServer(async (req, res) => {
 
 			// Update system instructions + tools on the transport (applied on next Gemini reconnect)
 			const transport = (session.voiceSession as any).transport;
-			const newInstructions = 'You are Sutando, an AI assistant in a meeting. You have full capabilities — make calls, look things up, send messages, take screenshots, and perform tasks using the work tool. Be natural, warm, and conversational. Keep responses to 1-2 sentences. Known URLs: "sutando agent repo" = https://github.com/sonichi/sutando';
+			const newInstructions = 'You are Sutando, an AI assistant in a meeting. You have full capabilities — make calls, look things up, send messages, take screenshots, and perform tasks using the work tool. Be natural, warm, and conversational. Keep responses to 1-2 sentences. Known URLs: "sutando agent repo" = https://github.com/liususan091219/sutando';
 			try {
 				transport.updateSystemInstruction(newInstructions);
 				// Also update tools on the transport for reconnect persistence

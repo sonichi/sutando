@@ -1096,7 +1096,7 @@ function connectWs() {
         addSystem('2. Voice agent not running — run: bash src/startup.sh');
         addSystem('3. Port 9900 blocked — check: lsof -i :9900');
         addSystem('You can type commands below while reconnecting.');
-        addSystem('<a href="https://discord.gg/uZHWXXmrCS" target="_blank" style="color:#5865F2">Ask for help on Discord</a> · <a href="https://github.com/sonichi/sutando/issues" target="_blank" style="color:#4ecca3">Report an issue</a> · <span style="color:#8899a6;cursor:pointer;text-decoration:underline" onclick="copyLogs()">Copy logs</span>', true);
+        addSystem('<a href="https://discord.gg/uZHWXXmrCS" target="_blank" style="color:#5865F2">Ask for help on Discord</a> · <a href="https://github.com/liususan091219/sutando/issues" target="_blank" style="color:#4ecca3">Report an issue</a> · <span style="color:#8899a6;cursor:pointer;text-decoration:underline" onclick="copyLogs()">Copy logs</span>', true);
         setStatus('Reconnecting...', 'error');
         reconnectAttempts = 0;  // reset counter and keep retrying
       } else {

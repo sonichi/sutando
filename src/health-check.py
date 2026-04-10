@@ -387,7 +387,7 @@ def check_bodhi_dist() -> dict:
     exercised until a client connects — so existing probes silently let
     it through. This probe catches that case on every health tick.
 
-    Fix when this check fails: `npm install github:sonichi/bodhi_realtime_agent`
+    Fix when this check fails: `npm install github:liususan091219/bodhi_realtime_agent`
     then `launchctl kickstart -k gui/$(id -u)/com.sutando.voice-agent`.
     """
     check = {"name": "bodhi-dist", "status": "ok", "detail": "Gemini 3.1 wire-format fixes present"}
@@ -436,7 +436,7 @@ def check_bodhi_dist() -> dict:
         check["status"] = "fail"
         check["detail"] = (
             f"bodhi dist stale: {'/'.join(stale)} still uses deprecated `media` key — "
-            "Gemini 3.1 rejects with 1007. Run `npm install github:sonichi/bodhi_realtime_agent`."
+            "Gemini 3.1 rejects with 1007. Run `npm install github:liususan091219/bodhi_realtime_agent`."
         )
     return check
 

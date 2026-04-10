@@ -212,7 +212,7 @@ def get_use_case_matrix() -> str:
         color = "#4ecca3" if status == "✓" else "#f0ad4e" if status == "~" else "#e94560"
         tested = '<span style="color:#4a8aaa;font-size:9px"> tested</span>' if name in TESTED_USE_CASES else ''
         anchor = name.lower().replace(" ", "-").replace("'", "").replace(",", "").replace(":", "")
-        link = f'<a href="https://github.com/sonichi/sutando/blob/main/README.md#{anchor}" target="_blank" style="color:inherit;text-decoration:none;border-bottom:1px dotted #333">{name}</a>'
+        link = f'<a href="https://github.com/liususan091219/sutando/blob/main/README.md#{anchor}" target="_blank" style="color:inherit;text-decoration:none;border-bottom:1px dotted #333">{name}</a>'
         rows.append(f'<tr><td style="color:{color}">{status}</td><td>{link}{tested}</td><td style="color:#555;font-size:10px">{detail[:60]}</td></tr>')
     if not rows:
         return ""
@@ -298,7 +298,7 @@ def render_dashboard() -> str:
 <a href="http://localhost:7844" style="color:#4a8aaa;text-decoration:none">Dashboard :7844</a>
 <a href="http://localhost:7845" style="color:#4a8aaa;text-decoration:none">Screen Capture :7845</a>
 <a href="/notes-ui" style="color:#4a8aaa;text-decoration:none">Notes Browser</a>
-<a href="https://github.com/sonichi/sutando" style="color:#4a8aaa;text-decoration:none">GitHub</a>
+<a href="https://github.com/liususan091219/sutando" style="color:#4a8aaa;text-decoration:none">GitHub</a>
 <a href="https://sutando.ai" style="color:#4a8aaa;text-decoration:none">Website</a>
 <a href="https://discord.gg/uZHWXXmrCS" style="color:#4a8aaa;text-decoration:none">Discord</a>
 </div></div>""")

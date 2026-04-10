@@ -47,7 +47,7 @@ This is an early-stage project. Honest status:
 | **Verified working** | 30 | Voice, screen capture, notes, calendar, reminders, contacts, browser, phone calls, meeting dial-in, task delegation, pattern detection, health check, dashboard, Telegram, Discord, multi-machine migration, onboarding tutorial, and more |
 | **Needs external setup** | 3 | Twilio (phone), Telegram bot, Discord bot |
 
-We're looking for contributors to help test and harden these capabilities. If you try something and it breaks, [open an issue](https://github.com/sonichi/sutando/issues).
+We're looking for contributors to help test and harden these capabilities. If you try something and it breaks, [open an issue](https://github.com/liususan091219/sutando/issues).
 
 ---
 
@@ -83,7 +83,7 @@ They communicate through files: voice agent writes tasks, the core agent execute
 
 ```bash
 # Clone
-git clone https://github.com/sonichi/sutando.git
+git clone https://github.com/liususan091219/sutando.git
 cd sutando
 
 # Configure (minimum: GEMINI_API_KEY is required)
@@ -257,7 +257,7 @@ See **[SECURITY.md](SECURITY.md)** for full details, best practices, and how to 
 This is alpha software. The biggest need is **testing** — try a capability, report what breaks.
 
 - [Join the Discord](https://discord.gg/uZHWXXmrCS) for help, discussion, and updates
-- [Open an issue](https://github.com/sonichi/sutando/issues) for bugs
+- [Open an issue](https://github.com/liususan091219/sutando/issues) for bugs
 
 ---
 
@@ -269,7 +269,7 @@ Sutando was largely built by its own autonomous build loop -- a Claude Code sess
 
 ## Acknowledgments
 
-Voice agent built on [bodhi-realtime-agent](https://github.com/sonichi/bodhi_realtime_agent), a Gemini Live voice session library.
+Voice agent built on [bodhi-realtime-agent](https://github.com/liususan091219/bodhi_realtime_agent), a Gemini Live voice session library.
 
 ---
 

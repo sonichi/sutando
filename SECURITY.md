@@ -8,7 +8,7 @@ If you discover a security vulnerability, please do not open a public issue.
 
 Instead, please report it through one of the following channels:
 
-- **GitHub**: [Report a vulnerability](https://github.com/sonichi/sutando/security/advisories/new) (private advisory)
+- **GitHub**: [Report a vulnerability](https://github.com/liususan091219/sutando/security/advisories/new) (private advisory)
 - **Email**: aisutando@gmail.com
 
 We ask that you give us sufficient time to investigate and address the vulnerability before disclosing it publicly.

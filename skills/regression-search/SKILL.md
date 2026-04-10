@@ -10,7 +10,7 @@ Two scripts for hunting down bad calls without reading every transcript:
 1. **`find-regression.py`** — search `results/calls/calls.jsonl` for calls touching a feature, classify each as working/broken, print a sorted timeline.
 2. **`diagnose-call.py`** — drill into a single call by SID, report refusals/errors/silences/repeated requests, optionally show metrics from `data/call-metrics.jsonl`.
 
-Closes [#188](https://github.com/sonichi/sutando/issues/188).
+Closes [#188](https://github.com/liususan091219/sutando/issues/188).
 
 ## When to use
 
