@@ -390,13 +390,21 @@ const mainAgent: MainAgent = {
 	// a user "bye" are almost always a short standalone line.
 	onTurnCompleted: async (ctx, _transcript) => {
 		try {
-			const turns = ctx.getRecentTurns(2) as any[];
-			const lastAssistant = turns.filter(t => t.role === 'model').pop();
-			const lastText = (lastAssistant?.parts?.map((p: any) => p.text).join(' ') || '').trim();
+			// getRecentTurns returns conversationContext.items directly —
+			// items have shape {role: 'assistant'|'user'|..., content: string}.
+			// The earlier version mistakenly used role==='model' and
+			// parts[].text which is Gemini API raw Content format, not
+			// bodhi's conversationContext item format. Filter never matched,
+			// detector never fired — observed live 00:08:04 when Gemini
+			// said "Goodbye! Talk to you later." and the session stayed open.
+			const turns = ctx.getRecentTurns(2) as Array<{ role?: string; content?: string }>;
+			const lastAssistant = turns.filter(t => t?.role === 'assistant').pop();
+			const lastText = (lastAssistant?.content || '').trim();
+			console.log(`${ts()} [Agent] onTurnCompleted: lastAssistant.length=${lastText.length} "${lastText.slice(0, 50)}"`);
 			if (lastText.length === 0 || lastText.length >= 80) return;
 			const FAREWELL_START = /^(goodbye|bye\b|farewell|good\s*bye|see you)/i;
 			if (!FAREWELL_START.test(lastText)) return;
-			console.log(`${ts()} [Agent] Strict goodbye detected (${lastText.length} chars): "${lastText.slice(0, 60)}" — closing client in 3s`);
+			console.log(`${ts()} [Agent] Strict goodbye detected — closing client in 3s`);
 			logSessionBoundary('voice_goodbye');
 			(ctx as any).sendJsonToClient?.({ type: 'session_end', reason: 'user_goodbye' });
 			setTimeout(() => {
@@ -407,7 +415,9 @@ const mainAgent: MainAgent = {
 					ct?.client?.close(4000, 'goodbye');
 				} catch {}
 			}, 3000);
-		} catch {}
+		} catch (e) {
+			console.error(`${ts()} [Agent] goodbye-detector error:`, e);
+		}
 	},
 };
 
