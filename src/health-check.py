@@ -307,7 +307,7 @@ def check_voice_transport(voice_check: dict) -> dict:
         check["status"] = "warn"
         check["detail"] = "voice-agent not running"
         return check
-    log_file = REPO_DIR / "src" / "voice-agent.log"
+    log_file = REPO_DIR / "logs" / "voice-agent.log"
     if not log_file.exists():
         check["status"] = "warn"
         check["detail"] = "voice-agent.log not found"
@@ -373,6 +373,103 @@ def check_voice_transport(voice_check: dict) -> dict:
     return check
 
 
+def check_bodhi_dist() -> dict:
+    """Verify the installed bodhi-realtime-agent dist has the Gemini 3.1
+    wire-format fixes applied. Greps the Gemini sendAudio/sendFile bodies
+    for the post-fix `audio:`/`video:` keys rather than the deprecated
+    `media:` key.
+
+    Added 2026-04-09 after the 1007 "media_chunks is deprecated" regression:
+    package-lock.json pointed at the post-fix bodhi commit, but the dist
+    on disk was stale (git pull advanced the lockfile without triggering
+    npm install). voice-agent booted fine because sendAudio isn't
+    exercised until a client connects — so existing probes silently let
+    it through. This probe catches that case on every health tick.
+
+    Fix when this check fails: `npm install github:sonichi/bodhi_realtime_agent`
+    then `launchctl kickstart -k gui/$(id -u)/com.sutando.voice-agent`.
+    """
+    check = {"name": "bodhi-dist", "status": "ok", "detail": "Gemini 3.1 wire-format fixes present"}
+    dist = REPO_DIR / "node_modules" / "bodhi-realtime-agent" / "dist" / "index.js"
+    if not dist.exists():
+        check["status"] = "warn"
+        check["detail"] = "bodhi dist not found — run `npm install`"
+        return check
+    try:
+        text = dist.read_text(errors="replace")
+    except OSError as e:
+        check["status"] = "warn"
+        check["detail"] = f"dist read failed: {e}"
+        return check
+    # Isolate the Gemini transport's sendAudio body. The OpenAI realtime
+    # transport also defines sendAudio but uses `audio: base64Data` as a
+    # flat string — a naive grep would false-positive.
+    idx = text.find("sendAudio(base64Data) {")
+    if idx < 0:
+        check["status"] = "warn"
+        check["detail"] = "could not locate sendAudio in bodhi dist"
+        return check
+    # Find the first two sendAudio definitions; the Gemini one wraps its
+    # arg in `this.session.sendRealtimeInput(...)`.
+    stale_audio = False
+    stale_file = False
+    # Scan each sendAudio body for the sendRealtimeInput caller (Gemini).
+    for start in _find_all(text, "sendAudio(base64Data) {"):
+        body = _extract_body(text, start)
+        if "sendRealtimeInput" in body:
+            if "media: { data" in body or "media:{data" in body:
+                stale_audio = True
+            break
+    for start in _find_all(text, "sendFile(base64Data, mimeType) {"):
+        body = _extract_body(text, start)
+        if "sendRealtimeInput" in body:
+            if "media: { data" in body or "media:{data" in body:
+                stale_file = True
+            break
+    stale = []
+    if stale_audio:
+        stale.append("sendAudio")
+    if stale_file:
+        stale.append("sendFile")
+    if stale:
+        check["status"] = "fail"
+        check["detail"] = (
+            f"bodhi dist stale: {'/'.join(stale)} still uses deprecated `media` key — "
+            "Gemini 3.1 rejects with 1007. Run `npm install github:sonichi/bodhi_realtime_agent`."
+        )
+    return check
+
+
+def _find_all(haystack: str, needle: str):
+    """Yield every start index where `needle` occurs in `haystack`."""
+    i = 0
+    while True:
+        i = haystack.find(needle, i)
+        if i < 0:
+            return
+        yield i
+        i += len(needle)
+
+
+def _extract_body(text: str, start: int) -> str:
+    """Extract the function body (matched-brace region) starting at the
+    first `{` at or after `start`. Returns at most the next 2000 chars.
+    """
+    brace = text.find("{", start)
+    if brace < 0:
+        return ""
+    depth = 0
+    for j in range(brace, min(brace + 2000, len(text))):
+        c = text[j]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[brace : j + 1]
+    return text[brace : brace + 2000]
+
+
 def run_all_checks() -> list[dict]:
     checks = []
 
@@ -383,6 +480,7 @@ def run_all_checks() -> list[dict]:
     checks.append(voice_check)
     checks.append(check_voice_watchers(voice_check))
     checks.append(check_voice_transport(voice_check))
+    checks.append(check_bodhi_dist())
 
     web_check = check_port(8080, "web-client")
     if web_check["status"] == "ok":
