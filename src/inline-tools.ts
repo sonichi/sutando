@@ -659,61 +659,10 @@ export const summonTool: ToolDefinition = {
 						end tell
 					'`, { timeout: 15_000 });
 					console.log(`${ts()} [Summon] Screen share started`);
-					// Handle "audio conference" panel after screen share
-					await new Promise(r => setTimeout(r, 2000));
-					if (dialIn) {
-						// Phone handles audio — dismiss the panel
-						try {
-							execSync(`osascript -e '
-								tell application "System Events"
-									tell process "zoom.us"
-										repeat with w in windows
-											if name of w contains "audio conference" then
-												set focused of w to true
-												keystroke "w" using command down
-												return "closed"
-											end if
-										end repeat
-										return "not found"
-									end tell
-								end tell
-							'`, { timeout: 5_000 });
-							console.log(`${ts()} [Summon] Audio conference panel dismissed (phone handles audio)`);
-						} catch {
-							console.log(`${ts()} [Summon] No audio conference panel to dismiss`);
-						}
-					} else {
-						// No phone — join computer audio
-						try {
-							execSync(`osascript -e '
-								tell application "System Events"
-									tell process "zoom.us"
-										repeat with w in windows
-											if name of w contains "audio conference" then
-												try
-													click button "Join with Computer Audio" of w
-													return "joined computer audio"
-												end try
-												repeat with b in buttons of w
-													if name of b contains "Computer Audio" then
-														click b
-														return "joined computer audio"
-													end if
-												end repeat
-												set focused of w to true
-												keystroke "w" using command down
-												return "closed (no computer audio button)"
-											end if
-										end repeat
-										return "not found"
-									end tell
-								end tell
-							'`, { timeout: 5_000 });
-							console.log(`${ts()} [Summon] Audio conference panel — joined computer audio`);
-						} catch {
-							console.log(`${ts()} [Summon] No audio conference panel found`);
-						}
-					}
+					// Audio dialog handling removed — it steals focus from Zoom's
+					// screen share, causing it to drop 2-5s after starting (975b8dd).
+					// Rely on Zoom's "Automatically join computer audio" setting instead.
+					// Mute is handled via Cmd+Shift+A hotkey below.
 				} catch (err) {
 					console.log(`${ts()} [Summon] Screen share failed: ${err}`);
 				}
