@@ -407,12 +407,21 @@ window.addEventListener('DOMContentLoaded', () => {
 });
 
 // ─── Remote toggle via SSE ────────────────────────────────
-(function initRemoteToggle() {
-  const evtSource = new EventSource('/sse');
-  evtSource.addEventListener('toggle-voice', () => toggle());
-  evtSource.addEventListener('toggle-mute', () => toggleMute());
-  evtSource.onerror = () => setTimeout(() => initRemoteToggle(), 5000);
-})();
+// Chrome throttles/suspends background tabs after ~5 min, killing SSE event
+// processing. On visibility change (tab returns to foreground), reconnect
+// the EventSource so ⌃V/⌃M hotkeys work immediately after tab wake-up.
+let _sseSource = null;
+function initRemoteToggle() {
+  if (_sseSource) { try { _sseSource.close(); } catch {} }
+  _sseSource = new EventSource('/sse');
+  _sseSource.addEventListener('toggle-voice', () => toggle());
+  _sseSource.addEventListener('toggle-mute', () => toggleMute());
+  _sseSource.onerror = () => setTimeout(() => initRemoteToggle(), 5000);
+}
+initRemoteToggle();
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') initRemoteToggle();
+});
 
 // ─── State ────────────────────────────────────────────────
 let ws = null;
@@ -1130,6 +1139,7 @@ function doCleanup() {
   setStatus('Text only', '');
   connected = false;
   muted = false;
+  fetch('/mute-state?muted=false&voice=false').catch(() => {}); // Reset state on disconnect
   document.body.classList.remove('voice-active');
   $('hero').style.display = '';
   $('btn').style.display = 'none';
@@ -1149,6 +1159,8 @@ function toggleMute() {
   btn.textContent = muted ? 'Unmute' : 'Mute';
   btn.className = muted ? 'btn-mute muted' : 'btn-mute';
   addSystem(muted ? 'Microphone muted.' : 'Microphone unmuted.');
+  // Report actual mute state to server for menu bar indicator
+  fetch('/mute-state?muted=' + muted).catch(() => {});
 }
 
 // ─── UI toggle (user gesture context!) ────────────────────
@@ -1174,6 +1186,7 @@ function toggle() {
 
     connected = true;
     muted = false;
+    fetch('/mute-state?muted=false&voice=true').catch(() => {}); // Report connected + unmuted
     document.body.classList.add('voice-active');
     $('hero').style.display = 'none';
     $('btn').style.display = '';
@@ -1726,6 +1739,20 @@ updateDynamicRegion();
 
 // SSE clients for remote toggle
 const sseClients: import('node:http').ServerResponse[] = [];
+// Server-side state tracking for menu bar indicator
+let _muteState = false;
+let _voiceState = false;
+
+// Heartbeat: ping every 30s, remove clients that fail to write (stale connections)
+setInterval(() => {
+	for (let i = sseClients.length - 1; i >= 0; i--) {
+		try {
+			sseClients[i].write(':\n\n'); // SSE comment = keep-alive ping
+		} catch {
+			sseClients.splice(i, 1);
+		}
+	}
+}, 30_000);
 
 const server = createServer((req, res) => {
 	const url = new URL(req.url || '/', `http://${req.headers.host}`);
@@ -1743,6 +1770,24 @@ const server = createServer((req, res) => {
 			const idx = sseClients.indexOf(res);
 			if (idx >= 0) sseClients.splice(idx, 1);
 		});
+		return;
+	}
+
+	// SSE client count + mute/voice state (safe for diagnostics + menu bar indicator)
+	if (url.pathname === '/sse-status') {
+		res.writeHead(200, { 'Content-Type': 'application/json' });
+		res.end(JSON.stringify({ clients: sseClients.length, muted: _muteState, voiceConnected: _voiceState }));
+		return;
+	}
+
+	// Mute + voice state report from browser client
+	if (url.pathname === '/mute-state') {
+		const mState = url.searchParams.get('muted');
+		const vState = url.searchParams.get('voice');
+		if (mState !== null) _muteState = mState === 'true';
+		if (vState !== null) _voiceState = vState === 'true';
+		res.writeHead(200, { 'Content-Type': 'application/json' });
+		res.end(JSON.stringify({ muted: _muteState, voiceConnected: _voiceState }));
 		return;
 	}
 

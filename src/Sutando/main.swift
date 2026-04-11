@@ -127,6 +127,41 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Stop All Services", action: #selector(stopServices), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
         statusItem.menu = menu
+
+        // Poll mute/voice state every 3 seconds for menu bar indicator
+        Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+            self?.pollMuteState()
+        }
+    }
+
+    func pollMuteState() {
+        guard let url = URL(string: "http://localhost:8080/sse-status") else { return }
+        let task = URLSession.shared.dataTask(with: url) { [weak self] data, _, error in
+            guard let data = data, error == nil,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+            let isMuted = json["muted"] as? Bool ?? false
+            let isVoiceConnected = json["voiceConnected"] as? Bool ?? false
+            DispatchQueue.main.async {
+                guard let button = self?.statusItem.button else { return }
+                if isVoiceConnected && isMuted {
+                    // Voice active + muted: show mute indicator
+                    button.title = "🔇"
+                    button.image = nil
+                } else {
+                    // Default state (disconnected or unmuted): show avatar
+                    let avatarPath = (self?.workspace ?? "") + "/docs/stand-avatar.png"
+                    if let image = NSImage(contentsOfFile: avatarPath) {
+                        image.size = NSSize(width: 18, height: 18)
+                        image.isTemplate = false
+                        button.image = image
+                        button.title = ""
+                    } else {
+                        button.title = "S"
+                    }
+                }
+            }
+        }
+        task.resume()
     }
 
     // MARK: - Global Hotkey (Ctrl+Shift+D)
