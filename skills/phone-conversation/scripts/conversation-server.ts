@@ -362,7 +362,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 			callSession.purpose ? `Purpose of this call: "${callSession.purpose}"` : '',
 			'Be natural, warm, and conversational. Have a full conversation — do NOT rush to hang up.',
 			'Ask follow-up questions to get complete information.',
-			'NEVER call hang_up unless the caller explicitly says goodbye/bye/farewell. "Close it" or "stop" about a video is NOT a goodbye.',
+			'ONLY call hang_up when the caller says goodbye/bye/farewell/"I\'m done"/"that\'s all". Closing a video, ending a task, or saying "close it"/"stop" is NOT a goodbye — those are about the current action, not the call.',
 			'Keep responses to 1-2 sentences.',
 			availableTools.length > 0 ? `You have these tools available: ${availableTools.join(', ')}. Use them when relevant to help the caller.` : '',
 			'You can ONLY fulfill the stated purpose of this call. If the person asks you to do something outside your available tools, politely decline.',
@@ -389,7 +389,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 			callSession.purpose && !isInbound ? `Purpose of this call: "${callSession.purpose}"` : '',
 			'Be natural, warm, and conversational. Keep responses to 1-2 sentences.',
 			'NEVER say "I\'m back", "Welcome back", "Working on it", or "task is queued". If the conversation resumes after a pause, just continue naturally from where you left off.',
-			'NEVER call hang_up unless the caller explicitly says goodbye/bye/farewell. "Close it" or "stop" about a video is NOT a goodbye.',
+			'ONLY call hang_up when the caller says goodbye/bye/farewell/"I\'m done"/"that\'s all". Closing a video, ending a task, or saying "close it"/"stop" is NOT a goodbye — those are about the current action, not the call.',
 		];
 
 		// Owner-only sections
