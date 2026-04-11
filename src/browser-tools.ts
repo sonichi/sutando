@@ -378,7 +378,9 @@ async function captureScreen(): Promise<string | null> {
 }
 
 function scrollDown(pixels: number = 600) {
-	execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "window.scrollBy(0, ${pixels})"'`, { timeout: 5_000 });
+	// Use widest-element heuristic (same as scrollTool) so embedded/nested scrollable containers work
+	const js = `(function(){var best=document.scrollingElement||document.documentElement,bw=0;document.querySelectorAll("*").forEach(function(el){var d=el.scrollHeight-el.clientHeight;if(d>50&&el.clientHeight>200){var w=el.getBoundingClientRect().width;if(w>bw){best=el;bw=w}}});best.scrollBy(0,${pixels})})()`;
+	execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/"/g, '\\"')}"'`, { timeout: 5_000 });
 }
 
 let demoState: 'idle' | 'recording' | 'done' = 'idle';
@@ -437,7 +439,7 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			let scrolledTotal = 0;
 			const scrollInterval = setInterval(() => {
 				if (scrolledTotal >= pageHeight) return; // stop at bottom
-				try { scrollDown(pxPerStep); } catch {}
+				try { scrollDown(pxPerStep); } catch (e) { console.error(`${ts()} [ScrollAndDescribe] scroll failed:`, e); }
 				scrolledTotal += pxPerStep;
 			}, SCROLL_INTERVAL_MS);
 
