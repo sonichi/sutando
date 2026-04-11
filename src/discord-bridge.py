@@ -252,15 +252,22 @@ async def _handle_discord_message(message, force=False):
             for embed in getattr(snap_msg, 'embeds', []):
                 if embed.title: parts.append(embed.title)
                 if embed.description: parts.append(embed.description)
-            # Extract snapshot attachment names
+            # Download snapshot attachments (forwarded images/files)
             for att in getattr(snap_msg, 'attachments', []):
-                parts.append(f"[Attachment: {att.filename}]")
+                local_path = INBOX_DIR / f"{int(time.time()*1000)}_{att.filename}"
+                try:
+                    await att.save(local_path)
+                    parts.append(f"[File attached: {local_path}]")
+                    print(f"  [forward] downloaded: {att.filename} → {local_path}", flush=True)
+                except Exception as e:
+                    parts.append(f"[Attachment: {att.filename} (download failed: {e})]")
+                    print(f"  [forward] download failed: {att.filename}: {e}", flush=True)
             if parts:
                 fwd_text = "\n".join(parts)
                 text = (text + "\n" + fwd_text).strip() if text else fwd_text.strip()
                 print(f"  [forward] extracted: {text[:100]}", flush=True)
 
-    # Handle embeds (link previews, rich content)
+    # Handle embeds (link previews, rich content, pasted images)
     embed_text = ""
     for embed in message.embeds:
         parts = []
@@ -272,6 +279,26 @@ async def _handle_discord_message(message, force=False):
             parts.append(embed.description)
         for field in embed.fields:
             parts.append(f"{field.name}: {field.value}")
+        # Download embedded images (pasted via Cmd+V — not in attachments)
+        img_url = None
+        if embed.image and embed.image.url:
+            img_url = embed.image.url
+        elif embed.thumbnail and embed.thumbnail.url:
+            img_url = embed.thumbnail.url
+        if img_url:
+            try:
+                import aiohttp
+                ext = img_url.split("?")[0].rsplit(".", 1)[-1][:4] if "." in img_url else "png"
+                local_path = INBOX_DIR / f"{int(time.time()*1000)}_embed.{ext}"
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(img_url) as resp:
+                        if resp.status == 200:
+                            local_path.write_bytes(await resp.read())
+                            parts.append(f"[File attached: {local_path}]")
+                            print(f"  [embed] downloaded image: {local_path}", flush=True)
+            except Exception as e:
+                parts.append(f"[Embed image: {img_url} (download failed: {e})]")
+                print(f"  [embed] image download failed: {e}", flush=True)
         if parts:
             embed_text += "\n".join(parts) + "\n"
     if embed_text:
