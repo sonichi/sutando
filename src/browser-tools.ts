@@ -34,23 +34,37 @@ const VISION_MODEL = process.env.VISION_MODEL || 'gemini-3.1-flash-lite-preview'
 export const scrollTool: ToolDefinition = {
 	name: 'scroll',
 	description:
-		'Scroll the Chrome browser page. Use for: "scroll down", "scroll up", "scroll to top", "scroll to bottom".',
+		'Scroll the Chrome browser page. Use for: "scroll down", "scroll up", "scroll to top", "scroll to bottom". Use target for specific areas: "sidebar", "chat history", "code block".',
 	parameters: z.object({
 		direction: z.enum(['down', 'up', 'top', 'bottom']).describe('Scroll direction. Use "top" or "bottom" to jump to start/end of page.'),
+		target: z.string().optional().describe('Optional: which area to scroll. E.g. "sidebar", "chat history", "nav", "code". Omit for main content.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { direction } = args as { direction: 'down' | 'up' | 'top' | 'bottom' };
+		const { direction, target } = args as { direction: 'down' | 'up' | 'top' | 'bottom'; target?: string };
 		try {
-			// Use Chrome's JavaScript scrollBy to avoid focus issues (Zoom steals keystrokes)
+			// Target-specific selectors for common areas
+			const targetSelector = target
+				? (target.match(/side|nav|history|menu/i) ? 'nav' : target.match(/code/i) ? 'pre,code' : target)
+				: '';
+			// Use Chrome's JavaScript scroll. If target specified, find matching scrollable element.
+			// Otherwise find the WIDEST scrollable container (main content over sidebars).
+			const scrollFn = (cmd: string) => targetSelector
+				? `(function(){var sel="${targetSelector}";var e=null;document.querySelectorAll(sel).forEach(function(el){if(!e&&el.scrollHeight-el.clientHeight>50)e=el});if(!e){var best=null,bh=0;document.querySelectorAll("*").forEach(function(el){var d=el.scrollHeight-el.clientHeight;if(d>50&&el.clientHeight>100&&el.getBoundingClientRect().width<500){if(d>bh){best=el;bh=d}}});e=best}if(e){${cmd}}})()`
+				: `(function(){var best=document.scrollingElement||document.documentElement,bw=0;document.querySelectorAll("*").forEach(function(el){var d=el.scrollHeight-el.clientHeight;if(d>50&&el.clientHeight>200){var w=el.getBoundingClientRect().width;if(w>bw){best=el;bw=w}}});var e=best;${cmd}})()`;
+			let js: string;
 			if (direction === 'top') {
-				execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "window.scrollTo(0, 0)"'`, { timeout: 5_000 });
+				js = scrollFn('e.scrollTop=0');
 			} else if (direction === 'bottom') {
-				execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "window.scrollTo(0, document.body.scrollHeight)"'`, { timeout: 5_000 });
+				js = scrollFn('e.scrollTop=e.scrollHeight');
 			} else {
 				const amount = direction === 'down' ? 600 : -600;
-				execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "window.scrollBy(0, ${amount})"'`, { timeout: 5_000 });
+				js = scrollFn(`e.scrollBy(0,${amount})`);
 			}
+			const tmpScroll = `/tmp/sutando-scroll-${Date.now()}.scpt`;
+			writeFileSync(tmpScroll, `tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/"/g, '\\"')}"`);
+			execSync(`osascript ${tmpScroll}`, { timeout: 5_000 });
+			try { unlinkSync(tmpScroll); } catch {}
 			console.log(`${ts()} [Scroll] ${direction}`);
 			return { status: 'scrolled', direction };
 		} catch (err) {
@@ -213,7 +227,42 @@ export const typeTextTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { text } = args as { text: string };
-		// Fixes CodeQL #27 (js/command-line-injection): write to temp file instead of shell interpolation
+		// Debug: log exactly what arrives from Gemini so we can trace newline issues
+		console.log(`${ts()} [TypeText] input: ${JSON.stringify(text).slice(0, 200)} len=${text.length}`);
+		// Multi-line or special-char text: use clipboard paste instead of
+		// keystroke. AppleScript `keystroke` can't handle newlines, parens,
+		// or other chars that break the osascript string. Clipboard approach:
+		// save current clipboard → write text → Cmd+V → restore clipboard.
+		// Check for actual newlines OR literal backslash-n (Gemini sends the latter)
+		const hasNewline = text.includes('\n') || text.includes('\r') || /\\n/.test(text) || text.length > 80;
+		console.log(`${ts()} [TypeText] hasNewline=${hasNewline} path=${hasNewline ? 'paste' : 'keystroke'}`);
+		if (hasNewline) {
+			try {
+				let savedClipboard = '';
+				try { savedClipboard = execSync('pbpaste', { encoding: 'utf-8', timeout: 2_000 }); } catch {}
+				const tmpClip = `/tmp/sutando-typetext-clip-${Date.now()}.txt`;
+				// Convert literal \n to actual newlines (Gemini sometimes sends escaped)
+				const pasteText = text.replace(/\\n/g, '\n').replace(/\\t/g, '\t')
+					.replace(/\\\\n/g, '\n').replace(/\\\\t/g, '\t');
+				writeFileSync(tmpClip, pasteText);
+				execSync(`pbcopy < ${tmpClip}`, { timeout: 2_000 });
+				execSync(`osascript -e 'tell application "System Events" to keystroke "v" using command down'`, { timeout: 5_000 });
+				// Brief delay for paste to complete, then restore clipboard
+				execSync('sleep 0.3');
+				if (savedClipboard) {
+					const tmpRestore = `/tmp/sutando-typetext-restore-${Date.now()}.txt`;
+					writeFileSync(tmpRestore, savedClipboard);
+					execSync(`pbcopy < ${tmpRestore}`, { timeout: 2_000 });
+					try { unlinkSync(tmpRestore); } catch {}
+				}
+				try { unlinkSync(tmpClip); } catch {}
+				console.log(`${ts()} [TypeText] pasted (multi-line): ${text.slice(0, 40)}...`);
+				return { status: 'typed', text };
+			} catch (err) {
+				return { error: `Paste failed: ${err instanceof Error ? err.message : err}` };
+			}
+		}
+		// Single-line short text: use keystroke (faster, no clipboard disruption)
 		const tmpFile = `/tmp/sutando-typetext-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.scpt`;
 		try {
 			const safeText = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
@@ -968,4 +1017,5 @@ export const clickTool: ToolDefinition = {
 };
 
 // --- Screen recording ---
+
 
