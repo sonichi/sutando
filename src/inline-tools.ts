@@ -435,7 +435,7 @@ export const typeTextTool: ToolDefinition = {
 export const volumeTool: ToolDefinition = {
 	name: 'volume',
 	description:
-		'Adjust system volume. Use for: "turn it up", "mute", "set volume to 50%". Instant.',
+		'Adjust system volume. Use ONLY when user explicitly says "volume", "turn it up/down", "mute", or "louder/quieter". NEVER change volume on your own.',
 	parameters: z.object({
 		level: z.number().min(0).max(100).optional().describe('Volume level 0-100. Omit to mute/unmute.'),
 		mute: z.boolean().optional().describe('true to mute, false to unmute'),

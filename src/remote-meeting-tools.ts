@@ -142,8 +142,8 @@ export const pauseVideoInMeetingTool: ToolDefinition = {
 	async execute() {
 		// Block pause for 5s after resume to prevent Gemini from hearing video audio and auto-pausing
 		const sinceLast = Date.now() - lastResumeTime;
-		if (sinceLast < 8000) {
-			console.log(`${ts()} [PauseVideo] BLOCKED — ${sinceLast}ms since play/resume (cooldown 8s)`);
+		if (sinceLast < 3000) {
+			console.log(`${ts()} [PauseVideo] BLOCKED — ${sinceLast}ms since play/resume (cooldown 3s)`);
 			return { status: 'playing', instruction: 'Video is still playing. Do NOT pause unless user explicitly says "pause" or "stop".' };
 		}
 		console.log(`${ts()} [PauseVideo] called`);
