@@ -168,6 +168,34 @@ export const typeTextTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { text } = args as { text: string };
+		// Multi-line or long text: use clipboard paste (keystroke can't handle newlines)
+		// Gemini sends literal \n (two chars backslash+n), not actual newlines
+		const hasNewline = text.includes('\n') || text.includes('\r') || /\\n/.test(text) || text.length > 80;
+		if (hasNewline) {
+			try {
+				let savedClipboard = '';
+				try { savedClipboard = execSync('pbpaste', { encoding: 'utf-8', timeout: 2_000 }); } catch {}
+				// Convert literal \n to actual newlines
+				const pasteText = text.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+				const tmpClip = `/tmp/sutando-typetext-clip-${Date.now()}.txt`;
+				writeFileSync(tmpClip, pasteText);
+				execSync(`pbcopy < ${tmpClip}`, { timeout: 2_000 });
+				execSync(`osascript -e 'tell application "System Events" to keystroke "v" using command down'`, { timeout: 5_000 });
+				execSync('sleep 0.3');
+				if (savedClipboard) {
+					const tmpRestore = `/tmp/sutando-typetext-restore-${Date.now()}.txt`;
+					writeFileSync(tmpRestore, savedClipboard);
+					execSync(`pbcopy < ${tmpRestore}`, { timeout: 2_000 });
+					try { unlinkSync(tmpRestore); } catch {}
+				}
+				try { unlinkSync(tmpClip); } catch {}
+				console.log(`${ts()} [TypeText] pasted (multi-line): ${text.slice(0, 40)}...`);
+				return { status: 'typed', text };
+			} catch (err) {
+				return { error: `Paste failed: ${err instanceof Error ? err.message : err}` };
+			}
+		}
+		// Single-line short text: use keystroke
 		const safeText = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 		try {
 			execSync(`osascript -e 'tell application "System Events" to keystroke "${safeText}"'`, { timeout: 5_000 });
