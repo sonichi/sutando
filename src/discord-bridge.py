@@ -492,6 +492,10 @@ async def poll_results():
             if result_file.exists():
                 import re
                 reply_text = result_file.read_text().strip()
+                # Delete result file immediately to prevent duplicate sends
+                result_file.unlink(missing_ok=True)
+                task_file = TASKS_DIR / f"{task_id}.txt"
+                task_file.unlink(missing_ok=True)
                 channel = pending_replies.pop(task_id)
                 save_pending_replies()
                 # Skip sending if already replied directly (core agent used MCP)
@@ -521,10 +525,6 @@ async def poll_results():
                     print(f"  Replied: {reply_text[:80]}...")
                 except Exception as e:
                     print(f"  Reply failed: {e}")
-                # Clean up
-                result_file.unlink(missing_ok=True)
-                task_file = TASKS_DIR / f"{task_id}.txt"
-                task_file.unlink(missing_ok=True)
         await asyncio.sleep(1)
 
 
