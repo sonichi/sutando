@@ -225,6 +225,8 @@ npx tsx -e "import 'dotenv/config'; import { summonTool } from './src/inline-too
 - Look up contacts and calendar for numbers/PINs before calling
 - The voice agent delegates "call X" and "join my meeting" requests to core via `work`
 
+**Local skills** — check `~/.claude/skills/` for user-installed skills (video processing, etc.). Always prefer a local skill over raw commands when one exists for the task.
+
 **App launcher** — open any macOS app:
 ```bash
 open -a "Safari"                    # open by name
