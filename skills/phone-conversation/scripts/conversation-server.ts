@@ -251,7 +251,7 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 	const concatMatch = /\b(prepend|concatenat|concat|image.*video|video.*image)\b/i.test(taskDescription);
 	if (concatMatch) {
 		console.log(`${ts()} [Task] concat shortcut — using video-concat skill`);
-		const { execSync: ex } = await import('node:child_process');
+			const ex = execSync;
 		try {
 			const image = ex('ls -t /tmp/discord-inbox/*.jpg /tmp/discord-inbox/*.png 2>/dev/null | head -1', { timeout: 3000 }).toString().trim();
 			const video = ex('ls -t /tmp/sutando-recording-*-narrated-subtitled.mov /tmp/sutando-recording-*-narrated.mov /tmp/sutando-recording-*.mov 2>/dev/null | head -1', { timeout: 3000 }).toString().trim();
