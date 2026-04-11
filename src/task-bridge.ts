@@ -62,11 +62,12 @@ export const workTool: ToolDefinition = {
 	async execute(args) {
 		const { task } = args as { task: string };
 
-		// Reject screen-viewing tasks — these should use inline tools directly
-		// Only reject "describe/view/look at screen" type tasks, not "fix screen" or "screen sharing" requests
-		const screenViewKeywords = /\b(describe.*(screen|page)|what.s on.*screen|look at.*screen|scroll.*(down|up|page)|capture.*screen|screenshot|narrat.*screen)\b/i;
-		if (screenViewKeywords.test(task)) {
-			return { status: 'rejected', message: 'Use inline tools directly: describe_screen, scroll. Do NOT use work for this.' };
+		// Redirect pure screen-viewing tasks to inline tools (faster, no round-trip)
+		// Narrow match: only "describe/look at my screen" — not scroll, screenshot,
+		// or screen-related tasks that the brain should handle.
+		const screenViewOnly = /\b(describe\s+(my\s+)?screen|what.s on\s+(my\s+)?screen|look at\s+(my\s+)?screen)\b/i;
+		if (screenViewOnly.test(task)) {
+			return { status: 'rejected', message: 'Use describe_screen inline tool directly for screen viewing.' };
 		}
 
 		// Check if the watcher (Claude Code brain) is running
