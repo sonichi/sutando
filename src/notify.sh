@@ -27,11 +27,13 @@ if [ -n "$DISCORD_TOKEN" ]; then
   DM_CHANNEL=$(curl -s -X POST "https://discord.com/api/v10/users/@me/channels" \
     -H "Authorization: Bot $DISCORD_TOKEN" \
     -H "Content-Type: application/json" \
+    -H "User-Agent: DiscordBot (https://github.com/sonichi/sutando, 1.0)" \
     -d "{\"recipient_id\":\"$DISCORD_USER_ID\"}" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
   if [ -n "$DM_CHANNEL" ]; then
     curl -s -X POST "https://discord.com/api/v10/channels/$DM_CHANNEL/messages" \
       -H "Authorization: Bot $DISCORD_TOKEN" \
       -H "Content-Type: application/json" \
+      -H "User-Agent: DiscordBot (https://github.com/sonichi/sutando, 1.0)" \
       -d "{\"content\":\"$MSG\"}" >/dev/null 2>&1
   fi
 fi
