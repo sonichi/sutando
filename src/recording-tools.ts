@@ -372,8 +372,9 @@ export function burnLiveTranscriptSubtitles(videoPath: string): string | null {
 			// Subtitles only show Sutando's screen descriptions to avoid redundancy.
 			if (content.startsWith('Caller:') || content.startsWith('User:')) continue;
 			const text = content.replace(/^Sutando:\s*/, '');
-			// Skip short conversational responses — long lines starting with filler are screen descriptions
+			// Skip conversational responses — only keep screen descriptions
 			if (text.length < 50 && /^(Sure|OK|Okay|Got it|I'll|I can|I'm |The recording|Is there|Hello|Hi |Done|Thanks|Already|Let me|Paused)/i.test(text)) continue;
+			if (/anything else|can I help|help you with|what else|else I can do|shall I|would you like|want me to|let me know/i.test(text)) continue;
 			const wallMs = (Number(hh) * 3600 + Number(mm) * 60 + Number(ss)) * 1000;
 			entries.push({ text, timeMs: Math.max(0, wallMs - startWall) });
 		}
@@ -544,7 +545,7 @@ export function startRecordingNarration(session: any): void {
 			if (!existsSync('/tmp/sutando-screen-record.pid')) return;
 			const remaining = Math.round((durationMs - (Date.now() - startTime)) / 1000);
 			const alreadySaid = previousDescs.slice(0, -1).map((d, i) => `${i + 1}. ${d.slice(0, 40)}`).join('; ');
-			injectText(session, `[System: ${remaining}s left. Already narrated: ${alreadySaid || 'nothing yet'}. Now narrate this NEW content only (1 short sentence, no repeats): "${desc}"]`);
+			injectText(session, `[System: ${remaining}s left. Already narrated: ${alreadySaid || 'nothing yet'}. Now narrate this NEW content only (1 short sentence, no repeats). Do NOT say "anything else", "can I help", "is there", or any conversational filler — ONLY describe what is on screen: "${desc}"]`);
 			console.log(`${ts()} [Recording] pushed: ${desc.slice(0, 60)}...`);
 		} catch (err) {
 			console.log(`${ts()} [Recording] push error: ${err}`);
@@ -635,7 +636,7 @@ export async function startNarrationRecording(duration_seconds: number): Promise
 		}, capped * 1000);
 
 		console.log(`${ts()} [RecordWithNarration] recording started`);
-		return { status: 'recording', first_description: firstDesc, message: `SPEAK THIS NOW: "${firstDesc}" — this is your narration. Auto-stops in ${capped}s.` };
+		return { status: 'recording', first_description: firstDesc, message: `Recording started. IMMEDIATELY speak this narration — NO filler, NO "okay", NO "should I": "${firstDesc}". Auto-stops in ${capped}s.` };
 	} catch (err) {
 		return { status: 'error', error: `record_screen_with_narration failed: ${err instanceof Error ? err.message : err}` };
 	}

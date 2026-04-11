@@ -4,7 +4,7 @@
  */
 
 import { execSync } from 'node:child_process';
-import { writeFileSync, readFileSync, unlinkSync, existsSync } from 'node:fs';
+import { writeFileSync, readFileSync, readlinkSync, unlinkSync, existsSync } from 'node:fs';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { findRecording, isReadableFile, startNarrationRecording } from './recording-tools.js';
@@ -63,6 +63,7 @@ async function startPlayback(seekSec: number = 0): Promise<{ status: string; pat
 		try { execSync(`osascript -e 'tell application "QuickTime Player"' -e 'set d to document 1' -e 'set current time of d to 0' -e 'end tell'`, { timeout: 3_000 }); } catch {}
 	}
 	try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
+	lastResumeTime = Date.now(); // Also set cooldown on play to prevent auto-pause
 	fetch(`http://localhost:${process.env.PHONE_PORT || '3100'}/play-audio`, {
 		method: 'POST', headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify({ path: recPath, seekSec }),
@@ -83,6 +84,8 @@ export const playVideoInMeetingTool: ToolDefinition = {
 	},
 };
 
+let lastResumeTime = 0;
+
 export const resumeVideoInMeetingTool: ToolDefinition = {
 	name: 'resume_video_in_meeting',
 	description: 'Resume the paused video from where it stopped. Use ONLY when user says "resume", "continue", "go on".',
@@ -90,8 +93,38 @@ export const resumeVideoInMeetingTool: ToolDefinition = {
 	execution: 'inline',
 	async execute() {
 		console.log(`${ts()} [ResumeVideo] called`);
+		// Only resume if caller said "resume"/"continue"/"go on"/"play" in the last 10 seconds of transcript
 		try {
+			const transcriptPath = readlinkSync('/tmp/sutando-live-transcript.txt');
+			const lines = readFileSync(transcriptPath, 'utf8').split('\n');
+			const callerLines = lines.filter(l => l.includes('Caller:'));
+			const recent = callerLines.slice(-3).join(' ').toLowerCase();
+			if (!/\b(resume|continue|go on|play it|play the)\b/.test(recent)) {
+				console.log(`${ts()} [ResumeVideo] BLOCKED — no resume keyword in recent caller speech: "${recent.slice(-80)}"`);
+				return { status: 'paused', instruction: 'Video is still paused. Only resume when user explicitly says "resume" or "play".' };
+			}
+		} catch {}
+		try {
+			lastResumeTime = Date.now();
 			try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
+			// Get current playback position from QuickTime, then restart audio stream to phone
+			let seekSec = 0;
+			try {
+				seekSec = parseFloat(execSync(`osascript -e 'tell application "QuickTime Player" to get current time of document 1'`, { timeout: 3_000 }).toString().trim()) || 0;
+			} catch {}
+			// Find the recording path
+			let recPath = '';
+			try {
+				const { findRecording } = await import('./recording-tools.js');
+				recPath = findRecording() || '';
+			} catch {}
+			if (recPath) {
+				fetch(`http://localhost:${process.env.PHONE_PORT || '3100'}/play-audio`, {
+					method: 'POST', headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ path: recPath, seekSec }),
+				}).catch(() => {});
+				await new Promise(r => setTimeout(r, 300));
+			}
 			try { execSync(`osascript -e 'tell application "QuickTime Player"' -e 'activate' -e 'play document 1' -e 'end tell'`, { timeout: 5_000 }); } catch {}
 			return { status: 'playing', instruction: 'Video resumed. Say NOTHING.' };
 		} catch (err) { return { error: `${err}` }; }
@@ -107,6 +140,12 @@ export const pauseVideoInMeetingTool: ToolDefinition = {
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
+		// Block pause for 5s after resume to prevent Gemini from hearing video audio and auto-pausing
+		const sinceLast = Date.now() - lastResumeTime;
+		if (sinceLast < 8000) {
+			console.log(`${ts()} [PauseVideo] BLOCKED — ${sinceLast}ms since play/resume (cooldown 8s)`);
+			return { status: 'playing', instruction: 'Video is still playing. Do NOT pause unless user explicitly says "pause" or "stop".' };
+		}
 		console.log(`${ts()} [PauseVideo] called`);
 		try { writeFileSync('/tmp/sutando-playback-pause', '1'); } catch {}
 		try { execSync(`osascript -e 'tell application "QuickTime Player"' -e 'if (count of documents) > 0 then' -e 'pause document 1' -e 'end if' -e 'end tell'`, { timeout: 5_000 }); } catch {}
