@@ -35,7 +35,19 @@ if ! command -v node > /dev/null 2>&1; then echo "  ✗ node not found — brew 
 if ! command -v npx > /dev/null 2>&1; then echo "  ✗ npx not found — comes with node"; missing=1; fi
 if ! command -v python3 > /dev/null 2>&1; then echo "  ✗ python3 not found"; missing=1; fi
 if ! command -v claude > /dev/null 2>&1; then echo "  ✗ claude not found — see https://docs.anthropic.com/en/docs/claude-code/getting-started"; missing=1; fi
-if ! command -v fswatch > /dev/null 2>&1; then echo "  ✗ fswatch not found — brew install fswatch"; missing=1; fi
+if ! command -v fswatch > /dev/null 2>&1; then
+  if command -v brew > /dev/null 2>&1; then
+    echo "  ⚠ fswatch not found — installing via Homebrew..."
+    brew install fswatch
+    if command -v fswatch > /dev/null 2>&1; then
+      echo "  ✓ fswatch installed"
+    else
+      echo "  ✗ fswatch installation failed"; missing=1
+    fi
+  else
+    echo "  ✗ fswatch not found — brew install fswatch"; missing=1
+  fi
+fi
 if [ ! -f .env ]; then echo "  ✗ .env not found — cp .env.example .env and add your keys"; missing=1; fi
 # Load .env and check required keys
 if [ -f .env ]; then
