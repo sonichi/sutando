@@ -9,6 +9,7 @@ Usage: python3 src/discord-bridge.py
 import asyncio
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -595,5 +596,26 @@ async def poll_proactive():
         await asyncio.sleep(3)
 
 
+def _send_via_rest(channel_id: str, message: str):
+    """Send a message via Discord REST API (no gateway connection). Exits after sending."""
+    import urllib.request
+    url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
+    data = json.dumps({"content": message}).encode()
+    req = urllib.request.Request(url, data=data, headers={
+        "Authorization": f"Bot {TOKEN}",
+        "Content-Type": "application/json",
+        "User-Agent": "DiscordBot (sutando, 1.0)",
+    })
+    try:
+        urllib.request.urlopen(req)
+        print(f"Sent to {channel_id}: {message[:80]}...")
+    except Exception as e:
+        print(f"Send failed: {e}")
+        sys.exit(1)
+
+
 if __name__ == "__main__":
-    client.run(TOKEN, log_handler=None)
+    if len(sys.argv) >= 4 and sys.argv[1] == "send":
+        _send_via_rest(sys.argv[2], " ".join(sys.argv[3:]))
+    else:
+        client.run(TOKEN, log_handler=None)
