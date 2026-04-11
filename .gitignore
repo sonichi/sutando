@@ -57,3 +57,5 @@ contextual-chips.json
 *.heartbeat
 .agent/
 .massgen/
+.env.bak
+.last-pq-notify
