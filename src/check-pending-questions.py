@@ -3,12 +3,14 @@
 
 Runs on cron — independent of the proactive loop.
 Sends notifications via macOS + Discord DM if questions are waiting.
+Use --force to bypass the 1-hour cooldown.
 """
 
 import json
 import os
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -90,11 +92,13 @@ def notify_discord_dm(questions):
 
 
 def main():
+    force = "--force" in sys.argv
     questions = get_waiting_questions()
     if not questions:
         return
 
-    if not should_notify():
+    if not force and not should_notify():
+        print(f"(cooldown) {len(questions)} pending questions — skipping notification")
         return
 
     count = len(questions)
