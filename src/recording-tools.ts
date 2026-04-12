@@ -333,27 +333,19 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			try {
 				pageHeight = parseInt(execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "document.body.scrollHeight - window.innerHeight"'`, { timeout: 3_000 }).toString().trim()) || 5000;
 			} catch {}
-			const SCROLL_INTERVAL_MS = 2500;
-			const totalScrollSteps = (duration_seconds * 1000) / SCROLL_INTERVAL_MS;
-			const pxPerStep = Math.ceil(pageHeight / totalScrollSteps);
 			const viewportHeight = 900;
-			const msPerViewport = Math.round((viewportHeight / pxPerStep) * SCROLL_INTERVAL_MS);
-			writeFileSync('/tmp/sutando-scroll-info.json', JSON.stringify({ pageHeight, pxPerStep, msPerViewport, duration_seconds }));
-			console.log(`${ts()} [ScrollAndDescribe] page=${pageHeight}px, ${totalScrollSteps} steps, ${pxPerStep}px/step, ${msPerViewport}ms/viewport`);
-			let scrolledTotal = 0;
-			scrollPausedRef.value = false;
-			const scrollInterval = setInterval(() => {
-				if (scrolledTotal >= pageHeight || scrollPausedRef.value) return;
-				try { scrollDown(pxPerStep); } catch (e) { console.error(`${ts()} [ScrollAndDescribe] scroll failed:`, e); }
-				scrolledTotal += pxPerStep;
-			}, SCROLL_INTERVAL_MS);
+			writeFileSync('/tmp/sutando-scroll-info.json', JSON.stringify({ pageHeight, viewportHeight, duration_seconds }));
+			console.log(`${ts()} [ScrollAndDescribe] page=${pageHeight}px, narration-driven scroll`);
+			// No fixed scroll timer — scroll is driven by narration cycle:
+			// speak desc → pre-capture scrolls to next viewport → capture → speak → repeat
+			scrollPausedRef.value = true; // start paused, first content already captured
 
 			// Auto-stop after duration — wait for narration-tee mux, then burn subtitles.
 			// Capture start time: if user starts a 2nd recording before this timer fires,
 			// liveTranscriptRecordingStart will be overwritten. Only clear if still ours.
 			const myRecStart = liveTranscriptRecordingStart;
 			setTimeout(async () => {
-				clearInterval(scrollInterval);
+				scrollPausedRef.value = false;
 				let stopResult: any = {};
 				try {
 					const raw = execSync('python3 skills/screen-record/scripts/record.py stop', { timeout: 10_000 }).toString().trim();
@@ -688,14 +680,17 @@ export function startRecordingNarration(session: any): void {
 	let lastPushTime = Date.now();
 	const MAX_SPEAKING_TIME = 8000; // force-clear after 8s if onTurnCompleted hasn't fired
 
-	// Pre-capture: while Gemini speaks, capture + describe the NEXT screenshot.
-	// This runs after each push, so when Gemini finishes we can inject immediately.
+	// Pre-capture: scroll to next viewport, then capture + describe.
+	// Screen stays still during speech; scroll happens here between narrations.
 	const preCapture = async () => {
 		if (!existsSync('/tmp/sutando-screen-record.pid')) return;
 		try {
-			// Pause scroll, capture what's on screen now
+			// Scroll one viewport worth to reveal new content, then pause + capture
+			scrollPausedRef.value = false;
+			scrollDown(900); // one viewport
+			await new Promise(r => setTimeout(r, 500)); // let scroll settle
 			scrollPausedRef.value = true;
-			console.log(`${ts()} [Recording] pre-capture: paused scroll, capturing...`);
+			console.log(`${ts()} [Recording] pre-capture: scrolled + capturing...`);
 			const path = await captureScreen();
 			if (!path) { scrollPausedRef.value = false; return; }
 			const desc = await describeScreenshot(path, previousDescs);
@@ -751,15 +746,17 @@ export function startRecordingNarration(session: any): void {
 		const lastSaid = lastSpokenRef.value || '(first description)';
 		narrationSpeakingRef.value = true;
 		lastPushTime = Date.now();
-		scrollPausedRef.value = false; // resume scroll when Gemini starts speaking
+		// Screen stays on the captured content while Gemini narrates it — no scroll during speech.
+		// Scroll will advance AFTER speech finishes (in preCapture, which scrolls → captures → describes).
 		injectText(session, `[System: Narrate what's new on screen. You just said: "${lastSaid}". The screen now shows: "${desc}". DO NOT read this description verbatim — rephrase it in your own words as a natural continuation. One sentence, ~5 seconds.]`);
 		console.log(`${ts()} [Recording] pushed: ${desc}`);
-		// Pre-capture next after enough scrolling for new content
-		setTimeout(preCapture, Math.max(descIntervalMs - 2000, 3000));
+		// Start pre-capturing next while Gemini speaks this one
+		setTimeout(preCapture, 2000);
 	};
 
-	// First pre-capture after one full viewport of scrolling
-	setTimeout(preCapture, Math.max(descIntervalMs, 5000));
+	// First pre-capture: wait 3s for first desc to start being spoken, then
+	// scroll to next viewport + capture while Gemini speaks
+	setTimeout(preCapture, 3000);
 	const descTimer = setInterval(tryInject, descIntervalMs);
 
 	setTimeout(() => {
