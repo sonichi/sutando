@@ -575,6 +575,19 @@ async function main() {
 
 	sessionRef = session;
 
+	// Wire narration-tee: capture Gemini's outbound audio for screen recordings
+	try {
+		const { teeAudio } = await import('../skills/screen-record/scripts/narration-tee.js');
+		const origHandleAudioOutput = (session as any).handleAudioOutput.bind(session);
+		(session as any).handleAudioOutput = (data: string) => {
+			origHandleAudioOutput(data);
+			try { teeAudio(Buffer.from(data, 'base64')); } catch {}
+		};
+		console.log(`${ts()} [NarrationTee] wired into voice agent audio output`);
+	} catch (e) {
+		console.log(`${ts()} [NarrationTee] not available: ${e instanceof Error ? e.message : e}`);
+	}
+
 	// Watch for results from the Claude Code session and deliver to user
 	// Only delivers when a client is connected — otherwise keeps files queued
 	// Watch for context drops (keyboard shortcut)
