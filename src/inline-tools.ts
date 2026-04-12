@@ -15,7 +15,7 @@ const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
 // Re-export recording/screen/browser tools from browser-tools
 export { describeScreenTool, clickTool, scrollAndDescribeTool, openVideoTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool } from './browser-tools.js';
-import { describeScreenTool, clickTool, scrollAndDescribeTool, openVideoTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool } from './browser-tools.js';
+import { describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool, openVideoTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool } from './browser-tools.js';
 
 // Re-export meeting tools from meeting-tools
 export { summonTool, dismissTool, joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool } from './meeting-tools.js';
@@ -544,16 +544,15 @@ export const deleteNoteTool: ToolDefinition = {
 // IMPORTANT: Every tool defined in browser-tools.ts MUST be added to BOTH arrays below.
 // Tools not registered here are invisible to Gemini — it will hallucinate actions instead
 // of calling them (e.g. "I've closed the video" without actually closing it).
-// Exception: screenRecordTool is intentionally excluded — scroll_and_describe is the full
-// recording workflow (narration + REC indicator + subtitles). Registering screenRecordTool
-// caused Gemini to pick the bare recorder over scroll_and_describe, breaking narration.
+// screenRecordTool re-added — descriptions now clearly distinguish plain recording
+// ("start recording") from narrated demo ("record for N seconds").
 export const inlineTools = [
 	pressKeyTool, scrollTool, switchTabTool, closeTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
 	volumeTool, brightnessTool, clipboardTool,
 	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, summonTool, dismissTool,
 	joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool,
-	describeScreenTool, clickTool, scrollAndDescribeTool, openVideoTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, slideControlTool, fullscreenTool,
+	describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool, openVideoTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, slideControlTool, fullscreenTool,
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool, ];
 
 /** Tools available to any caller (including unverified) */
@@ -569,7 +568,7 @@ export const ownerOnlyTools = [
 	clipboardTool, cancelTaskTool, toggleTasksTool, summonTool, dismissTool,
 	joinZoomTool, joinGmeetTool, callContactTool, slideControlTool, fullscreenTool,
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
-	describeScreenTool, clickTool, scrollAndDescribeTool, openVideoTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool,
+	describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool, openVideoTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool,
 ];
 
 /** Configurable tools — default to owner-only, can be opened to verified callers */
