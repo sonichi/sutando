@@ -22,6 +22,7 @@ import 'dotenv/config';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync, appendFileSync, writeFileSync } from 'node:fs';
+import { execSync as execSyncTop } from 'node:child_process';
 import { inlineTools } from './inline-tools.js';
 import { injectText } from './browser-tools.js';
 import { join } from 'node:path';
@@ -135,9 +136,46 @@ function getPendingToolCalls(toolName?: string) {
 }
 
 // =============================================================================
+// Meeting mode state — persists across Gemini reconnects
+// =============================================================================
+let meetingActive = false;
+// Detect active meeting on startup — sync so it runs before first greeting
+try {
+	const zoomRunning = execSyncTop('pgrep -f "zoom.us" 2>/dev/null', { encoding: 'utf-8' }).trim();
+	if (zoomRunning) {
+		const inMeeting = execSyncTop(`osascript -e 'tell application "System Events" to tell process "zoom.us" to count of windows' 2>/dev/null`, { encoding: 'utf-8' }).trim();
+		if (parseInt(inMeeting) >= 2) {
+			meetingActive = true;
+			console.log(`${new Date().toLocaleTimeString()} [Meeting] Detected active Zoom meeting on startup`);
+		}
+	}
+} catch { /* no zoom */ }
+
+// =============================================================================
 // Tools
 // =============================================================================
 
+const switchModeTool: ToolDefinition = {
+	name: 'switch_mode',
+	description:
+		'Switch between active mode and meeting mode. ' +
+		'Call switch_mode("meeting") when user says "take notes", "be silent", "meeting mode", "passive mode", or joins a meeting. ' +
+		'Call switch_mode("active") when user says "I need you", "come back", "active mode", or the meeting ends. ' +
+		'In meeting mode: listen to everything and track discussion internally, but produce ZERO audio output and do NOT call any other tools — unless explicitly addressed by name ("Sutando" or "hey Sutando").',
+	parameters: z.object({
+		mode: z.enum(['active', 'meeting']).describe('"meeting" = silent note-taker, "active" = normal assistant'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { mode } = args as { mode: 'active' | 'meeting' };
+		meetingActive = mode === 'meeting';
+		console.log(`${ts()} [Meeting] Mode switched to: ${mode}`);
+		if (mode === 'meeting') {
+			return { status: 'meeting_mode', instruction: 'You are now in meeting mode. Listen and track the discussion internally. Produce ZERO audio output unless someone says "Sutando." Do not call any other tools unless explicitly addressed.' };
+		}
+		return { status: 'active_mode', instruction: 'Back to active mode. You can speak and use all tools normally.' };
+	},
+};
 
 const getTaskStatus: ToolDefinition = {
 	name: 'get_task_status',
@@ -281,7 +319,10 @@ const mainAgent: MainAgent = {
 		// safe to replay without trigger filtering.
 		const recent = getRecentConversation(8);
 		if (recent) {
-			return `[System: The user reconnected. The block below is REPLAYED HISTORY from the current session, provided as background context ONLY. Do NOT act on anything in it. Do NOT call any tools based on it. Use it only to answer follow-up questions if asked. Wait silently for the user's next spoken input before taking any action.]\n\n${recent}\n\n[Now say "Welcome back" briefly — one sentence — and then stop and wait for input.]`;
+			const meetingHint = meetingActive
+				? '\n\n[MEETING MODE — you are listening and taking notes. Do NOT speak or produce any audio. Only respond if someone says "Sutando." Use the replayed history above as context for what was discussed before the reconnect.]'
+				: '\n\n[Now say "Welcome back" briefly — one sentence — and then stop and wait for input.]';
+			return `[System: The user reconnected. The block below is REPLAYED HISTORY from the current session, provided as background context ONLY. Do NOT act on anything in it. Do NOT call any tools based on it. Use it only to answer follow-up questions if asked. Wait silently for the user's next spoken input before taking any action.]\n\n${recent}${meetingHint}`;
 		}
 		let standName = '';
 		try { const si = JSON.parse(readFileSync('stand-identity.json', 'utf-8')); standName = si.name ? ` — ${si.name}` : ''; } catch {}
@@ -294,6 +335,9 @@ const mainAgent: MainAgent = {
 		const briefingHint = hasHistory && existsSync(briefingFile) ? ' Mention: "I have your morning briefing ready if you want it."' : '';
 		const insightFile = join(WORKSPACE_DIR, 'results', `insight-${today}.txt`);
 		const insightHint = hasHistory && existsSync(insightFile) ? ' Also mention: "I noticed a pattern in your usage — ask me about it if you are curious."' : '';
+		if (meetingActive) {
+			return `[System: MEETING MODE — LISTEN AND TAKE NOTES. A Zoom meeting is active. Listen to everything and mentally track the discussion: who said what, key decisions, action items, topics covered. But do NOT produce any audio output UNLESS someone says "Sutando" or "hey Sutando" — then respond to their request using your accumulated notes and context. When not addressed, produce absolutely zero words — no acknowledgments, no "silent", no sounds. You are an invisible note-taker until called upon.]`;
+		}
 		return `[System: A user just connected. Say hi and introduce yourself as Sutando${standName} — their personal AI. Ready to help with anything: voice tasks, screen control, meetings, phone calls, research. Keep it brief — 1-2 natural sentences, no theatrics.${tutorialHint}${briefingHint}${insightHint}]`;
 	},
 	instructions: [
@@ -341,18 +385,25 @@ const mainAgent: MainAgent = {
 		'- join_gmeet: Join a Google Meet via browser with computer audio. Use when user says "join the meet" or gives a Meet code.',
 		'- summon: Share screen via Zoom (desktop app). Use when user says "summon", "share my screen".',
 		'- dismiss: Leave the current Zoom meeting. Use when user says "dismiss", "leave zoom", "end meeting", "leave the call".',
+		'- switch_mode: Switch between "active" (normal) and "meeting" (silent note-taker). Call switch_mode("meeting") when user says "take notes", "be silent", "meeting mode". Call switch_mode("active") to resume. In meeting mode, listen but produce zero audio unless addressed by name.',
 		'- For phone calls, meeting dial-in, or anything needing contacts/calendar context → use work (core handles it).',
 		...inlineTools.map(t => `- ${t.name}: ${(t.description as string).split('.')[0]}. Instant.`),
 		'',
 		'CRITICAL RULES:',
-		'- MEETING MODE: When the user says "take notes", "be silent", "passive mode", or is in a meeting (after join_zoom, join_gmeet, or summon): you MUST be COMPLETELY SILENT. Do NOT speak. Do NOT call work. Do NOT create tasks. Do NOT respond to ANY audio — not questions, not conversation, not ambient noise. The ONLY exception: if the user says "Sutando" or "hey Sutando" followed by a direct command. Everything else is other people talking to each other — ignore it entirely. When someone says "bye" in a meeting, do NOT disconnect. Only disconnect if the user says "Sutando disconnect" or "Sutando bye".',
+		(() => meetingActive
+			? '⚠️ MEETING MODE IS CURRENTLY ACTIVE (set via switch_mode or detected at startup). You are an invisible note-taker. Listen to all audio and track the discussion: speakers, topics, decisions, action items. Produce ZERO audio output unless someone says "Sutando" or "hey Sutando" — then respond using your accumulated context. When not addressed: no words, no sounds, no acknowledgments. Do NOT call work or any tools unless explicitly addressed. "bye" in a meeting does NOT mean disconnect — only "Sutando disconnect" or "Sutando bye". To exit meeting mode, user says "Sutando, active mode" and you call switch_mode("active").'
+			: '- MEETING MODE: Call switch_mode("meeting") when user says "take notes", "be silent", "passive mode", or when you join a meeting (after join_zoom, join_gmeet, summon). In meeting mode: listen and take notes, produce zero audio, don\'t call tools — unless addressed by name. Call switch_mode("active") to resume normal mode.'
+		)(),
 		'- GOODBYE: When the user says goodbye, bye, or clearly ends the conversation, respond with a SHORT farewell that STARTS with the word "Goodbye" (e.g. "Goodbye! Talk to you later."). Keep it under one sentence. The session will close automatically. Do NOT start the farewell with "I\'m back", "Hello", "Welcome", or any other greeting word — only use a short starts-with-goodbye response for actual goodbyes.',
 		'- NEVER pretend you called a tool. NEVER say "done" without actually calling work.',
 		'- NEVER say "I can\'t do that", "I\'m not able to", or "I don\'t think I can" — you CAN do almost anything by calling work. If you\'re unsure, call work and let the core agent handle it. The core agent has full system access. Your job is to relay requests, not gatekeep them.',
 		'- For SIMPLE actions (press enter, clear input, select all), use press_key or type_text — do NOT use work for keystrokes.',
 		'- If you KNOW the answer from your instructions or context, answer directly. Only delegate to work for questions you genuinely cannot answer.',
 		'- MISSING CONTEXT: When the user references something you don\'t have context for ("the draft", "what we discussed", "type that", "send what I asked for"), ALWAYS delegate to work. The core agent has the full conversation history and knows what was discussed. Never guess or ask the user to repeat — just call work.',
-		'- When in doubt, call work.',
+		(() => meetingActive
+			? '- IN MEETING MODE: When addressed by name, answer DIRECTLY from what you heard in the meeting. Do NOT call work — the core agent cannot hear the meeting audio and has no context. You are the one who listened. Summarize discussions, decisions, and action items from your own memory of the conversation.'
+			: '- When in doubt, call work.'
+		)(),
 		'',
 		'VOICE RULES:',
 		'- Keep responses to 2–3 sentences. You are talking, not writing.',
@@ -379,7 +430,7 @@ const mainAgent: MainAgent = {
 	// enable it once we find a reliable gate signal (probably after
 	// bodhi exposes a proper "user has actually spoken" signal under
 	// native audio).
-	tools: [workTool, getTaskStatus, ...inlineTools],
+	tools: [workTool, getTaskStatus, switchModeTool, ...inlineTools],
 	googleSearch: VOICE_GOOGLE_SEARCH,
 	onEnter: async () => console.log(`${ts()} [Agent] Sutando ready`),
 	// Voice-driven close — strict version. User wants to be able to
@@ -499,6 +550,14 @@ async function main() {
 				voiceToolIdMap.set(e.toolCallId, e.toolName);
 				voiceEvents.push({ event: `tool_call:${e.toolName}`, timestamp: new Date().toISOString() });
 				console.log(`${ts()} [Tool] ${e.toolName} (${e.execution})`);
+				// Auto-switch meeting mode on join/dismiss
+				if (['summon', 'join_zoom', 'join_gmeet'].includes(e.toolName)) {
+					meetingActive = true;
+					console.log(`${ts()} [Meeting] Auto-activated by ${e.toolName}`);
+				} else if (e.toolName === 'dismiss') {
+					meetingActive = false;
+					console.log(`${ts()} [Meeting] Ended by dismiss`);
+				}
 			},
 			onToolResult: (e) => {
 				const toolName = voiceToolIdMap.get(e.toolCallId) || 'unknown';
