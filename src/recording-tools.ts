@@ -668,6 +668,9 @@ export function startRecordingNarration(session: any): void {
 	const startTime = Date.now();
 	const STOP_PUSHING_BEFORE_END_MS = 8000;
 
+	// Set speaking flag immediately — first description is spoken from tool return
+	narrationSpeakingRef.value = true;
+
 	const pushDescription = async () => {
 		if (!existsSync('/tmp/sutando-screen-record.pid')) return;
 		// Wait for Gemini to finish speaking before pushing next description
@@ -676,7 +679,9 @@ export function startRecordingNarration(session: any): void {
 			return;
 		}
 		const elapsed = Date.now() - startTime;
-		if (elapsed > durationMs - STOP_PUSHING_BEFORE_END_MS) {
+		// Stop pushing 5s before end (proportional minimum for short recordings)
+		const stopBefore = Math.min(STOP_PUSHING_BEFORE_END_MS, durationMs * 0.25);
+		if (elapsed > durationMs - stopBefore) {
 			console.log(`${ts()} [Recording] near end — stopped pushing`);
 			clearInterval(descTimer);
 			try {
@@ -684,28 +689,32 @@ export function startRecordingNarration(session: any): void {
 			} catch {}
 			return;
 		}
+		// Set flag BEFORE async work to prevent double-push race
+		narrationSpeakingRef.value = true;
 		try {
 			const path = await captureScreen();
-			if (!path) return;
+			if (!path) { narrationSpeakingRef.value = false; return; }
 			const desc = await describeScreenshot(path, previousDescs);
 			if (!desc || desc === lastDesc) {
 				if (desc === lastDesc) console.log(`${ts()} [Recording] skipped duplicate`);
+				narrationSpeakingRef.value = false;
 				return;
 			}
 			lastDesc = desc;
 			previousDescs.push(desc);
-			if (!existsSync('/tmp/sutando-screen-record.pid')) return;
+			if (!existsSync('/tmp/sutando-screen-record.pid')) { narrationSpeakingRef.value = false; return; }
 			const remaining = Math.round((durationMs - (Date.now() - startTime)) / 1000);
 			const alreadySaid = previousDescs.slice(0, -1).map((d, i) => `${i + 1}. ${d}`).join('\n');
-			narrationSpeakingRef.value = true; // will be cleared by voice-agent on turn complete
+			// narrationSpeakingRef stays true — cleared by voice-agent onTurnCompleted
 			injectText(session, `[System: Recording narration — ${remaining}s left.\n\nYou already said:\n${alreadySaid || '(nothing yet)'}\n\nNew content on screen: "${desc}"\n\nNarrate ONLY what's NEW — 1-2 short sentences continuing naturally from your previous narration. Do NOT repeat anything above.]`);
 			console.log(`${ts()} [Recording] pushed: ${desc.slice(0, 60)}...`);
 		} catch (err) {
+			narrationSpeakingRef.value = false;
 			console.log(`${ts()} [Recording] push error: ${err}`);
 		}
 	};
 
-	setTimeout(pushDescription, 5000);
+	// Don't push at 5s — wait for onTurnCompleted to clear the flag after first description
 	const descTimer = setInterval(pushDescription, descIntervalMs);
 
 	setTimeout(() => {
