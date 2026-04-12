@@ -7,7 +7,7 @@ import { execSync, execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync, readFileSync, readlinkSync, existsSync, statSync } from 'node:fs';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
-import { demoStateRef, narrationSpeakingRef, lastSpokenRef } from './recording-state.js';
+import { demoStateRef, narrationSpeakingRef, lastSpokenRef, nextDescRef, scrollPausedRef } from './recording-state.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -344,8 +344,9 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			writeFileSync('/tmp/sutando-scroll-info.json', JSON.stringify({ pageHeight, pxPerStep, msPerViewport, duration_seconds }));
 			console.log(`${ts()} [ScrollAndDescribe] page=${pageHeight}px, ${totalScrollSteps} steps, ${pxPerStep}px/step, ${msPerViewport}ms/viewport`);
 			let scrolledTotal = 0;
+			scrollPausedRef.value = false;
 			const scrollInterval = setInterval(() => {
-				if (scrolledTotal >= pageHeight) return;
+				if (scrolledTotal >= pageHeight || scrollPausedRef.value) return;
 				try { scrollDown(pxPerStep); } catch (e) { console.error(`${ts()} [ScrollAndDescribe] scroll failed:`, e); }
 				scrolledTotal += pxPerStep;
 			}, SCROLL_INTERVAL_MS);
@@ -668,54 +669,71 @@ export function startRecordingNarration(session: any): void {
 	const startTime = Date.now();
 	const STOP_PUSHING_BEFORE_END_MS = 8000;
 
-	// Set speaking flag immediately — first description is spoken from tool return
+	// Set speaking flag — first description is spoken from tool return
 	narrationSpeakingRef.value = true;
+	nextDescRef.value = null;
 
-	const pushDescription = async () => {
+	// Pre-capture: while Gemini speaks, capture + describe the NEXT screenshot.
+	// This runs after each push, so when Gemini finishes we can inject immediately.
+	const preCapture = async () => {
 		if (!existsSync('/tmp/sutando-screen-record.pid')) return;
-		// Wait for Gemini to finish speaking before pushing next description
-		if (narrationSpeakingRef.value) {
-			console.log(`${ts()} [Recording] skipped push — Gemini still speaking`);
+		try {
+			// Pause scroll, capture what's on screen now
+			scrollPausedRef.value = true;
+			console.log(`${ts()} [Recording] pre-capture: paused scroll, capturing...`);
+			const path = await captureScreen();
+			if (!path) { scrollPausedRef.value = false; return; }
+			const desc = await describeScreenshot(path, previousDescs);
+			if (desc && desc !== lastDesc) {
+				nextDescRef.value = desc;
+				console.log(`${ts()} [Recording] pre-captured: ${desc.slice(0, 60)}...`);
+			} else {
+				nextDescRef.value = null;
+				scrollPausedRef.value = false; // resume scroll if nothing new
+			}
+			// scroll stays paused until Gemini finishes speaking + we inject
+		} catch (err) {
+			scrollPausedRef.value = false;
+			console.log(`${ts()} [Recording] pre-capture error: ${err}`);
+		}
+	};
+
+	// Called by interval — if pre-captured desc is ready and Gemini finished speaking, inject it
+	const tryInject = () => {
+		if (!existsSync('/tmp/sutando-screen-record.pid')) return;
+		if (narrationSpeakingRef.value) return; // still speaking
+		if (!nextDescRef.value) {
+			// No pre-capture ready — start one
+			if (!scrollPausedRef.value) preCapture();
 			return;
 		}
 		const elapsed = Date.now() - startTime;
-		// Stop pushing 5s before end (proportional minimum for short recordings)
 		const stopBefore = Math.min(STOP_PUSHING_BEFORE_END_MS, durationMs * 0.25);
 		if (elapsed > durationMs - stopBefore) {
 			console.log(`${ts()} [Recording] near end — stopped pushing`);
 			clearInterval(descTimer);
-			try {
-				injectText(session, '[System: Recording ending soon. Finish your current sentence and stop.]');
-			} catch {}
+			scrollPausedRef.value = false;
+			try { injectText(session, '[System: Recording ending soon. Finish your current sentence and stop.]'); } catch {}
 			return;
 		}
-		// Set flag BEFORE async work to prevent double-push race
+		// Inject the pre-captured description
+		const desc = nextDescRef.value;
+		nextDescRef.value = null;
+		lastDesc = desc;
+		previousDescs.push(desc);
+		const remaining = Math.round((durationMs - (Date.now() - startTime)) / 1000);
+		const lastSaid = lastSpokenRef.value || '(first description)';
 		narrationSpeakingRef.value = true;
-		try {
-			const path = await captureScreen();
-			if (!path) { narrationSpeakingRef.value = false; return; }
-			const desc = await describeScreenshot(path, previousDescs);
-			if (!desc || desc === lastDesc) {
-				if (desc === lastDesc) console.log(`${ts()} [Recording] skipped duplicate`);
-				narrationSpeakingRef.value = false;
-				return;
-			}
-			lastDesc = desc;
-			previousDescs.push(desc);
-			if (!existsSync('/tmp/sutando-screen-record.pid')) { narrationSpeakingRef.value = false; return; }
-			const remaining = Math.round((durationMs - (Date.now() - startTime)) / 1000);
-			const lastSaid = lastSpokenRef.value || '(first description)';
-			// narrationSpeakingRef stays true — cleared by voice-agent onTurnCompleted
-			injectText(session, `[System: ${remaining}s left. You just said: "${lastSaid}" — Continue naturally. NEW on screen: "${desc}" — ONE short sentence, ~5 seconds. Pick up where you left off.]`);
-			console.log(`${ts()} [Recording] pushed: ${desc.slice(0, 60)}...`);
-		} catch (err) {
-			narrationSpeakingRef.value = false;
-			console.log(`${ts()} [Recording] push error: ${err}`);
-		}
+		scrollPausedRef.value = false; // resume scroll
+		injectText(session, `[System: ${remaining}s left. You just said: "${lastSaid}" — Continue naturally. NEW on screen: "${desc}" — ONE short sentence, ~5 seconds. Pick up where you left off.]`);
+		console.log(`${ts()} [Recording] pushed: ${desc.slice(0, 60)}...`);
+		// Start pre-capturing next while Gemini speaks this one
+		setTimeout(preCapture, 2000);
 	};
 
-	// Don't push at 5s — wait for onTurnCompleted to clear the flag after first description
-	const descTimer = setInterval(pushDescription, descIntervalMs);
+	// Start first pre-capture after initial description is being spoken
+	setTimeout(preCapture, 3000);
+	const descTimer = setInterval(tryInject, descIntervalMs);
 
 	setTimeout(() => {
 		clearInterval(descTimer);

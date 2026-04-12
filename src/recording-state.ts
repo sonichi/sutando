@@ -10,3 +10,9 @@ export const narrationSpeakingRef: { value: boolean } = { value: false };
 
 /** What Gemini actually said in the last narration turn. Set by voice-agent onTurnCompleted. */
 export const lastSpokenRef: { value: string } = { value: '' };
+
+/** Pre-captured next description, ready to inject when Gemini finishes speaking. */
+export const nextDescRef: { value: string | null } = { value: null };
+
+/** Scroll pause control — set true to pause, false to resume. */
+export const scrollPausedRef: { value: boolean } = { value: false };
