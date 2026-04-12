@@ -42,7 +42,10 @@
  *   - Transcript persistence
  */
 
-import 'dotenv/config';
+// Load .env from the project root (3 levels up from this script), not cwd —
+// override: true ensures .env values win over stale shell env vars
+import { config as _dotenvConfig } from 'dotenv';
+_dotenvConfig({ path: new URL('../../../.env', import.meta.url).pathname, override: true });
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { mkdirSync, writeFileSync, appendFileSync, unlinkSync, existsSync, readFileSync, readdirSync, symlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -898,8 +901,11 @@ function cleanupCall(callSid: string): void {
 			.on('close', (code) => { if (code === 0) console.log(`${ts()} [Phone] call scan complete`); });
 	} catch { /* best effort */ }
 
-	// If top-level call (no parent) with a transcript, write a summary task for Claude to pick up
-	if (!session.parentCallSid && session.transcript.length > 0) {
+	// If top-level call (no parent) with a real conversation, write a summary task for Claude to pick up
+	// Skip calls with only IVR/system prompts and no actual dialogue (e.g. failed Zoom dial-ins)
+	const hasSutandoTurn = session.transcript.some(t => t.role === 'sutando');
+	const hasCallerTurn = session.transcript.some(t => t.role !== 'sutando');
+	if (!session.parentCallSid && hasSutandoTurn && hasCallerTurn && session.transcript.length >= 2) {
 		const summaryTaskId = `task-summary-${Date.now()}`;
 		const formatted = session.transcript.map(t => {
 			const label = t.role === 'sutando' ? 'Sutando' : 'Caller';
@@ -1389,6 +1395,8 @@ wss.on('connection', (ws: WebSocket) => {
 					break;
 
 				case 'start': {
+					// Reset recording state from previous call (demoState may be stuck at 'done' or 'recording')
+					try { const { resetDemoState } = await import('../../../src/browser-tools.js'); resetDemoState(); } catch {}
 					callSid = msg.start.callSid;
 					const streamSid = msg.start.streamSid;
 					const cp = msg.start.customParameters ?? {};

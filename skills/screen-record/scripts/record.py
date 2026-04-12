@@ -66,7 +66,7 @@ def start():
 
     # Use ffmpeg instead of screencapture -v (which requires TTY)
     proc = subprocess.Popen(
-        ["ffmpeg", "-f", "avfoundation",
+        ["/opt/homebrew/bin/ffmpeg", "-f", "avfoundation",
          "-i", f"{os.environ.get('RECORD_SCREEN', 'Capture screen 0')}:{os.environ.get('RECORD_AUDIO', 'default')}",
          "-r", "15", "-pix_fmt", "yuv420p", "-y", path],
         stdin=subprocess.DEVNULL,

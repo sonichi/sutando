@@ -392,7 +392,9 @@ async function captureScreen(): Promise<string | null> {
 
 function scrollDown(pixels: number = 600) {
 	// Use widest-element heuristic (same as scrollTool) so embedded/nested scrollable containers work
-	// Use single quotes in JS to avoid double-quote escaping issues inside AppleScript
+	// NO keyboard fallback here — Chrome activate + Page Down disrupts narration audio capture
+	// during recording (breaks subtitle generation). Interactive scrollTool has the keyboard
+	// fallback for the Zoom screen share case; recording uses JS-only.
 	const js = `(function(){var best=document.scrollingElement||document.documentElement,bw=0;document.querySelectorAll('*').forEach(function(el){var d=el.scrollHeight-el.clientHeight;if(d>50&&el.clientHeight>200){var w=el.getBoundingClientRect().width;if(w>bw){best=el;bw=w}}});best.scrollBy(0,${pixels})})()`;
 	const tmpScroll = `/tmp/sutando-scroll-rec-${Date.now()}.scpt`;
 	writeFileSync(tmpScroll, `tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/"/g, '\\"')}"`);
@@ -407,6 +409,14 @@ function scrollDown(pixels: number = 600) {
 }
 
 let demoState: 'idle' | 'recording' | 'done' = 'idle';
+
+/** Reset recording state — call when a new phone call starts or previous recording is stuck */
+export function resetDemoState(): void {
+	if (demoState !== 'idle') {
+		console.log(`${ts()} [DemoState] Reset from '${demoState}' → 'idle'`);
+		demoState = 'idle';
+	}
+}
 
 export const scrollAndDescribeTool: ToolDefinition = {
 	name: 'scroll_and_describe',
@@ -440,9 +450,19 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			const captureRes = await fetch('http://localhost:7845/capture');
 			const captureData = await captureRes.json() as { status: string; path?: string };
 			const firstDesc = captureData.path ? await describeScreenshot(captureData.path) : '';
-			// Set subtitle baseline AFTER first description — so subtitles align with audio.
-			// Resolve the symlink NOW so a concurrent call (Zoom join) can't overwrite it.
-			try { liveTranscriptResolvedPath = readlinkSync(LIVE_TRANSCRIPT_SYMLINK); } catch { liveTranscriptResolvedPath = ''; }
+			// Set subtitle baseline — pick whichever transcript was updated more recently.
+			// Voice agent writes to -voice.txt; phone conversation-server writes to -CA{sid}.txt via symlink.
+			const voiceTranscript = '/tmp/sutando-live-transcript-voice.txt';
+			let phoneTranscript = '';
+			try { phoneTranscript = readlinkSync(LIVE_TRANSCRIPT_SYMLINK); } catch {}
+			if (existsSync(voiceTranscript) && phoneTranscript && existsSync(phoneTranscript)) {
+				// Both exist — use whichever was modified more recently
+				const vMtime = statSync(voiceTranscript).mtimeMs;
+				const pMtime = statSync(phoneTranscript).mtimeMs;
+				liveTranscriptResolvedPath = pMtime > vMtime ? phoneTranscript : voiceTranscript;
+			} else {
+				liveTranscriptResolvedPath = (phoneTranscript && existsSync(phoneTranscript)) ? phoneTranscript : (existsSync(voiceTranscript) ? voiceTranscript : '');
+			}
 			liveTranscriptRecordingStart = Date.now();
 			liveTranscriptBaselineLines = countTranscriptLines();
 
@@ -477,12 +497,15 @@ export const scrollAndDescribeTool: ToolDefinition = {
 					const raw = execSync('python3 skills/screen-record/scripts/record.py stop', { timeout: 10_000 }).toString().trim();
 					stopResult = JSON.parse(raw);
 				} catch {}
-				// Wait for narrated.mov to exist (narration-tee stop + mux ~2s after record.py stop)
-				// Wait up to 10s (5x2s) for narration-tee to mux narrated.mov.
-				// 8s was too short — narration mux takes ~3s after record.py stop,
-				// and the subtitled burn was missing because the file wasn't ready.
+				// Explicitly flush narration-tee (it normally triggers on next audio chunk,
+				// but after recording stops Gemini may not send audio for seconds).
+				try {
+					const { cleanup: flushNarrationTee } = await import('../skills/screen-record/scripts/narration-tee.js');
+					flushNarrationTee();
+				} catch {}
+				// Wait for narrated.mov to exist (narration-tee mux ~2-6s after flush)
 				const narrated = stopResult.path ? stopResult.path.replace('.mov', '-narrated.mov') : '';
-				for (let w = 0; w < 5; w++) {
+				for (let w = 0; w < 8; w++) {
 					if (narrated && isReadableFile(narrated)) break;
 					await new Promise(r => setTimeout(r, 2000));
 				}
@@ -901,7 +924,7 @@ function burnLiveTranscriptSubtitles(videoPath: string): string | null {
 		const outPath = videoPath.replace('.mov', '-subtitled.mov');
 		execSync(
 			// Match source bitrate to avoid 6x size inflation (narrated ~400kbps, subtitle burn was 2300kbps with -q:v 65)
-			`ffmpeg -y -i "${videoPath}" -vf "subtitles=${LIVE_TRANSCRIPT_SRT_PATH}:force_style='FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,MarginV=30'" -c:v h264_videotoolbox -b:v 500k -c:a aac "${outPath}"`,
+			`/opt/homebrew/bin/ffmpeg -y -i "${videoPath}" -vf "subtitles=${LIVE_TRANSCRIPT_SRT_PATH}:force_style='FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,MarginV=30'" -c:v h264_videotoolbox -b:v 500k -c:a aac "${outPath}"`,
 			{ timeout: 120_000 }
 		);
 		if (existsSync(outPath)) {
