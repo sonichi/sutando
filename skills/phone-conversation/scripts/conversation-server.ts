@@ -564,11 +564,13 @@ function buildAgent(callSession: CallSession): MainAgent {
 		instructions,
 		tools,
 		googleSearch: true,
+		// Greeting is injected as role:"user" by bodhi to trigger Gemini to speak.
+		// Use directive prefix so Gemini speaks the text verbatim instead of responding to it.
 		greeting: callSession.isMeeting
 			? ''  // No greeting for meetings — listen to IVR first
 			: !callSession.purpose
-			? 'Hi, this is Sutando. How can I help?'
-			: 'Hi, this is Sutando calling.',
+			? '[Speak this greeting to the caller now]: Hi, this is Sutando. How can I help?'
+			: '[Speak this greeting to the caller now]: Hi, this is Sutando calling.',
 	};
 }
 

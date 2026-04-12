@@ -718,6 +718,27 @@ export const summonTool: ToolDefinition = {
 				console.log(`${ts()} [Summon] Could not mute Zoom audio`);
 			}
 
+			// Close the zoom.us tab that Chrome opened during join (prevents scroll
+			// targeting the wrong tab and reduces user confusion)
+			try {
+				execSync(`osascript -e '
+					tell application "Google Chrome"
+						repeat with w in windows
+							set tabCount to count of tabs of w
+							repeat with i from tabCount to 1 by -1
+								set t to tab i of w
+								if URL of t contains "zoom.us" then
+									close t
+								end if
+							end repeat
+						end repeat
+					end tell
+				'`, { timeout: 5_000 });
+				console.log(`${ts()} [Summon] Closed zoom.us tab(s) in Chrome`);
+			} catch {
+				console.log(`${ts()} [Summon] No zoom.us tabs to close`);
+			}
+
 			return {
 				status: 'summoned',
 				meetingId: cleanId,
