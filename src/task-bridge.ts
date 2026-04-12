@@ -70,6 +70,22 @@ export const workTool: ToolDefinition = {
 			return { status: 'rejected', message: 'Use describe_screen inline tool directly for screen viewing.' };
 		}
 
+		// Fast path: handle known patterns inline for ~3s vs ~15s via file bridge.
+		// Same pattern as conversation-server's tryFastPath.
+		const concatMatch = /\b(prepend|concatenat|concat|image.*video|video.*image)\b/i.test(task);
+		if (concatMatch) {
+			try {
+				const { execSync } = await import('node:child_process');
+				const image = execSync('ls -t /tmp/discord-inbox/*.jpg /tmp/discord-inbox/*.png 2>/dev/null | head -1', { timeout: 3000 }).toString().trim();
+				const video = execSync('ls -t /tmp/sutando-recording-*-narrated-subtitled.mov /tmp/sutando-recording-*-narrated.mov /tmp/sutando-recording-*.mov 2>/dev/null | head -1', { timeout: 3000 }).toString().trim();
+				if (image && video) {
+					const result = execSync(`bash ~/.claude/skills/video-concat/scripts/prepend-image.sh "${image}" "${video}" 3`, { timeout: 60000 }).toString().trim();
+					const parsed = JSON.parse(result);
+					return { status: 'done', result: `Video with image prepended: ${parsed.output} (${parsed.size_mb}MB)` };
+				}
+			} catch (e) { console.log(`${ts()} [TaskBridge] fast path concat failed: ${e}`); }
+		}
+
 		// Check if the watcher (Claude Code brain) is running
 		let watcherOnline = false;
 		try {
