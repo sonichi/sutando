@@ -236,6 +236,26 @@ let nextBodhiPort = 9910; // Dynamic ports for per-call VoiceSessions
 // Resolves the tool call immediately so Gemini keeps talking.
 // Polls for result file asynchronously and injects it into Gemini when it arrives.
 
+// Fast path: handle known patterns inline without the file bridge (~3s vs ~15s).
+// Returns null if no fast path matches — caller should fall back to delegateTask.
+function tryFastPath(callSession: CallSession, task: string): Promise<unknown> | null {
+	const concatMatch = /\b(prepend|concatenat|concat|image.*video|video.*image)\b/i.test(task);
+	if (concatMatch) {
+		console.log(`${ts()} [Task] fast path: concat`);
+		try {
+			const image = execSync('ls -t /tmp/discord-inbox/*.jpg /tmp/discord-inbox/*.png 2>/dev/null | head -1', { timeout: 3000 }).toString().trim();
+			const video = execSync('ls -t /tmp/sutando-recording-*-narrated-subtitled.mov /tmp/sutando-recording-*-narrated.mov /tmp/sutando-recording-*.mov 2>/dev/null | head -1', { timeout: 3000 }).toString().trim();
+			if (image && video) {
+				const result = execSync(`bash ~/.claude/skills/video-concat/scripts/prepend-image.sh "${image}" "${video}" 3`, { timeout: 60000 }).toString().trim();
+				const parsed = JSON.parse(result);
+				callSession.resultQueue.push({ text: `[Task result] Video with image prepended: ${parsed.output} (${parsed.size_mb}MB). Report this to the caller.` });
+				return Promise.resolve({ status: 'processing', message: 'Creating the combined video now.' });
+			}
+		} catch (e) { console.log(`${ts()} [Task] fast path concat failed: ${e}`); }
+	}
+	return null;
+}
+
 // [Task chain] Gemini 'work' tool → write task file → resolve immediately → inject result later
 // The tool resolves instantly so Gemini stays conversational while Claude works.
 // When the result arrives, it's injected via sendContent.
@@ -535,6 +555,11 @@ function buildAgent(callSession: CallSession): MainAgent {
 			timeout: 120_000,
 			async execute(args) {
 				const { task } = args as { task: string };
+				// Fast path (owner-only): handle known patterns inline for ~3s response
+				if (callSession.isOwner) {
+					const fast = tryFastPath(callSession, task);
+					if (fast) return fast;
+				}
 				return delegateTask(callSession, task);
 			},
 		});
@@ -1136,6 +1161,10 @@ const server = createServer(async (req, res) => {
 				timeout: 120_000,
 				async execute(args) {
 					const { task } = args as { task: string };
+					if (session.isOwner) {
+						const fast = tryFastPath(session, task);
+						if (fast) return fast;
+					}
 					return delegateTask(session, task);
 				},
 			};
