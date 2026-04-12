@@ -833,21 +833,64 @@ async function main() {
 		} catch (err) { console.error(`${ts()} [CallResult] Error:`, err); }
 	}, 2000);
 
-	await session.start();
+	// Start session — don't let a transient Gemini failure kill the process.
+	// WS server starts *before* the LLM transport (per bodhi internals), so the
+	// listener on :PORT is already healthy; only the upstream Gemini connection is broken.
+	try {
+		await session.start();
+		console.log(`${ts()} [Startup] session.start() succeeded`);
+	} catch (err) {
+		const msg = (err as Error)?.message || String(err);
+		console.error(`${ts()} [Startup] session.start() failed: ${msg}`);
+		console.error(`${ts()} [Startup] Staying alive — WS server on :${PORT}, will retry LLM transport on next client connect`);
+		if (/credit|quota|billing|auth|401|403/i.test(msg)) {
+			console.error(`${ts()} [Startup] Likely cause: Gemini API key invalid or prepayment credits depleted`);
+			console.error(`${ts()} [Startup] Fix: top up at https://ai.studio/projects or rotate GEMINI_API_KEY in .env`);
+		}
+		// Force CLOSED so the health monitor's handleClientConnected path recovers.
+		// VoiceSession leaves state at CONNECTING after a failed start() and exposes
+		// no public reset API (reconnect()/disconnect() are on the internal transport,
+		// not on VoiceSession). CONNECTING→CLOSED is valid per bodhi's state table
+		// (index.js:1164). CREATED→CLOSED is also valid. If the state is already
+		// CLOSED or ACTIVE for some reason, transitionTo throws — log it so the
+		// mismatch is visible (the health monitor only recovers from CLOSED).
+		// TODO: drop the hack once bodhi exposes a public session.reset().
+		try {
+			session.sessionManager.transitionTo('CLOSED');
+		} catch (e) {
+			console.error(`${ts()} [Startup] Could not transition to CLOSED (state=${session.sessionManager.state}): ${(e as Error)?.message ?? e}`);
+		}
+	}
 
-	// Keep process alive, log health, and auto-recover dead sessions.
+	// Health monitor — runs regardless of whether initial start() succeeded.
+	// Serialization: bodhi's handleClientConnected() is synchronous and transitions
+	// CLOSED→CONNECTING inline before kicking off the async connect. So the next
+	// 30s tick sees state=CONNECTING (not CLOSED) and skips the guard. If the
+	// connect fails fast and bodhi flips back to CLOSED, the 60s lastReconnectAt
+	// throttle prevents a tight retry loop.
+	let lastReconnectAt = 0;
+	let lastLoggedStatus = '';
 	setInterval(() => {
-		const mgr = (session as any).sessionManager;
-		const state = mgr?.state ?? 'unknown';
+		const state = session.sessionManager.state ?? 'unknown';
 		const clientConnected = session.clientConnected;
-		console.log(`${ts()} [Health] state=${state} client=${clientConnected}`);
-		// Auto-recover: if session is CLOSED but client is connected, trigger reconnect
-		if (state === 'CLOSED' && clientConnected) {
-			console.log(`${ts()} [Health] Dead session detected — triggering reconnect`);
+		// Log only on state changes or non-ACTIVE states — avoid 2,880 lines/day of
+		// "state=ACTIVE client=true" during healthy operation.
+		const status = `state=${state} client=${clientConnected}`;
+		if (state !== 'ACTIVE' || status !== lastLoggedStatus) {
+			console.log(`${ts()} [Health] ${status}`);
+			lastLoggedStatus = status;
+		}
+		// Recover when session is CLOSED and a client is waiting. handleClientConnected
+		// is bodhi's internal entry point for this exact scenario (CLOSED + client
+		// present → transition to CONNECTING, reconnect fire-and-forget).
+		// TODO: drop the (session as any) cast once bodhi exposes a public API.
+		if (state === 'CLOSED' && clientConnected && Date.now() - lastReconnectAt > 60_000) {
+			lastReconnectAt = Date.now();
+			console.log(`${ts()} [Health] Dead session — triggering reconnect`);
 			try {
 				(session as any).handleClientConnected();
 			} catch (err) {
-				console.error(`${ts()} [Health] Reconnect failed:`, err);
+				console.error(`${ts()} [Health] Reconnect trigger failed:`, (err as Error)?.message ?? err);
 			}
 		}
 	}, 30_000);
