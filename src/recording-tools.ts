@@ -330,22 +330,32 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			liveTranscriptRecordingStart = Date.now();
 			liveTranscriptBaselineLines = countTranscriptLines();
 
-			// Scroll is now driven by the narration controller (turn.end events)
-			// instead of a fixed timer. Write scroll info so the controller knows
-			// how much to scroll per step.
+			// Fixed scroll timer — one pass top-to-bottom over the full duration.
+			// Description pushes happen via the narration controller at a separate cadence.
 			let pageHeight = 5000;
 			try {
 				pageHeight = parseInt(execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "document.body.scrollHeight - window.innerHeight"'`, { timeout: 3_000 }).toString().trim()) || 5000;
 			} catch {}
+			const SCROLL_INTERVAL_MS = 2500;
+			const totalScrollSteps = (duration_seconds * 1000) / SCROLL_INTERVAL_MS;
+			const pxPerStep = Math.ceil(pageHeight / totalScrollSteps);
 			const viewportHeight = 900;
-			writeFileSync('/tmp/sutando-scroll-info.json', JSON.stringify({ pageHeight, viewportHeight, duration_seconds }));
-			console.log(`${ts()} [ScrollAndDescribe] page=${pageHeight}px, speech-driven scroll`);
+			const msPerViewport = Math.round((viewportHeight / pxPerStep) * SCROLL_INTERVAL_MS);
+			writeFileSync('/tmp/sutando-scroll-info.json', JSON.stringify({ pageHeight, pxPerStep, msPerViewport, duration_seconds }));
+			console.log(`${ts()} [ScrollAndDescribe] page=${pageHeight}px, ${totalScrollSteps} steps, ${pxPerStep}px/step, ${msPerViewport}ms/viewport`);
+			let scrolledTotal = 0;
+			const scrollInterval = setInterval(() => {
+				if (scrolledTotal >= pageHeight) return;
+				try { scrollDown(pxPerStep); } catch (e) { console.error(`${ts()} [ScrollAndDescribe] scroll failed:`, e); }
+				scrolledTotal += pxPerStep;
+			}, SCROLL_INTERVAL_MS);
 
 			// Auto-stop after duration — wait for narration-tee mux, then burn subtitles.
 			// Capture start time: if user starts a 2nd recording before this timer fires,
 			// liveTranscriptRecordingStart will be overwritten. Only clear if still ours.
 			const myRecStart = liveTranscriptRecordingStart;
 			setTimeout(async () => {
+				clearInterval(scrollInterval);
 				let stopResult: any = {};
 				try {
 					const raw = execSync('python3 skills/screen-record/scripts/record.py stop', { timeout: 10_000 }).toString().trim();
@@ -656,16 +666,14 @@ export function startRecordingNarration(session: any): void {
 	let lastDesc = '';
 	const previousDescs: string[] = []; // track all narrated descriptions
 	const startTime = Date.now();
-	const STOP_PUSHING_BEFORE_END_MS = 8000; // stop pushing 8s before recording ends
-	let waitingForSpeech = false; // true while Gemini is speaking a description
-	let stopped = false;
+	const STOP_PUSHING_BEFORE_END_MS = 8000;
 
 	const pushDescription = async () => {
-		if (stopped || !existsSync('/tmp/sutando-screen-record.pid')) return;
+		if (!existsSync('/tmp/sutando-screen-record.pid')) return;
 		const elapsed = Date.now() - startTime;
 		if (elapsed > durationMs - STOP_PUSHING_BEFORE_END_MS) {
 			console.log(`${ts()} [Recording] near end — stopped pushing`);
-			stopped = true;
+			clearInterval(descTimer);
 			try {
 				injectText(session, '[System: Recording ending soon. Finish your current sentence and stop.]');
 			} catch {}
@@ -677,8 +685,6 @@ export function startRecordingNarration(session: any): void {
 			const desc = await describeScreenshot(path, previousDescs);
 			if (!desc || desc === lastDesc) {
 				if (desc === lastDesc) console.log(`${ts()} [Recording] skipped duplicate`);
-				// Even if duplicate, schedule next push after a short delay
-				if (!stopped) setTimeout(pushDescription, 3000);
 				return;
 			}
 			lastDesc = desc;
@@ -686,33 +692,22 @@ export function startRecordingNarration(session: any): void {
 			if (!existsSync('/tmp/sutando-screen-record.pid')) return;
 			const remaining = Math.round((durationMs - (Date.now() - startTime)) / 1000);
 			const alreadySaid = previousDescs.slice(0, -1).map((d, i) => `${i + 1}. ${d.slice(0, 40)}`).join('; ');
-			waitingForSpeech = true;
 			injectText(session, `[System: ${remaining}s left. Already narrated: ${alreadySaid || 'nothing yet'}. Now narrate this NEW content only (1 short sentence, no repeats): "${desc}"]`);
 			console.log(`${ts()} [Recording] pushed: ${desc.slice(0, 60)}...`);
-			// Next push triggered by turn.end (speech finished), not a timer
 		} catch (err) {
 			console.log(`${ts()} [Recording] push error: ${err}`);
-			if (!stopped) setTimeout(pushDescription, 3000); // retry on error
 		}
 	};
 
-	// Listen for turn.end — when Gemini finishes speaking, scroll + push next description
-	const onTurnEnd = () => {
-		if (!narrationActive || stopped || !waitingForSpeech) return;
-		waitingForSpeech = false;
-		// Scroll one viewport worth, then push next description
-		try { scrollDown(900); } catch {}
-		console.log(`${ts()} [Recording] speech done — scrolled + pushing next`);
-		setTimeout(pushDescription, 1500); // brief pause before next capture
-	};
-	session.eventBus?.subscribe?.('turn.end', onTurnEnd);
+	// Fixed interval — minimum 8s so Gemini has time to speak each description
+	const MIN_DESC_INTERVAL = 8000;
+	const effectiveInterval = Math.max(descIntervalMs, MIN_DESC_INTERVAL);
 
-	// First push after 5s (initial description already spoken by Gemini from tool return)
 	setTimeout(pushDescription, 5000);
+	const descTimer = setInterval(pushDescription, effectiveInterval);
 
-	// Timer-based stop at durationMs
 	setTimeout(() => {
-		stopped = true;
+		clearInterval(descTimer);
 		narrationActive = false;
 		console.log(`${ts()} [Recording] timer fired — sending stop`);
 		try {
