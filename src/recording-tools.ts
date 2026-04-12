@@ -735,12 +735,12 @@ export function startRecordingNarration(session: any): void {
 		scrollPausedRef.value = false; // resume scroll when Gemini starts speaking
 		injectText(session, `[System: ${remaining}s left. You just said: "${lastSaid}" — Continue naturally. NEW on screen: "${desc}" — ONE short sentence, ~5 seconds. Pick up where you left off.]`);
 		console.log(`${ts()} [Recording] pushed: ${desc.slice(0, 60)}...`);
-		// Start pre-capturing next while Gemini speaks this one
-		setTimeout(preCapture, 2000);
+		// Pre-capture next after enough scrolling for new content
+		setTimeout(preCapture, Math.max(descIntervalMs - 2000, 3000));
 	};
 
-	// Start first pre-capture after initial description is being spoken
-	setTimeout(preCapture, 3000);
+	// First pre-capture after one full viewport of scrolling
+	setTimeout(preCapture, Math.max(descIntervalMs, 5000));
 	const descTimer = setInterval(tryInject, descIntervalMs);
 
 	setTimeout(() => {
