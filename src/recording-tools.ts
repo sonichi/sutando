@@ -223,8 +223,8 @@ async function describeScreenshot(imagePath: string, previousDescs: string[] = [
 		if (previousDescs.length === 0) {
 			prompt = `Describe what is on screen in exactly 1 short sentence (max 20 words). Quote the main heading. This will be spoken aloud. ${guard}`;
 		} else {
-			const recent = previousDescs.slice(-3).map((d, i) => `${i + 1}. ${d}`).join(' | ');
-			prompt = `You are narrating a screen recording aloud. Already spoken: ${recent}. Describe ONLY what is NEW or has changed. Use a natural continuation ("Scrolling down...", "Next...", "Now we see...", "Further down..."). Do NOT restart with "The screen shows/displays" — the viewer already knows what page this is. 1 short sentence, max 20 words. ${guard}`;
+			const recent = previousDescs.slice(-2).join(' | ');
+			prompt = `Screen recording narration. Already said: "${recent}". Describe ONLY NEW content visible — ignore the browser, page title, repo name, and anything already mentioned. Start with what's different: "Scrolling down, we see...", "Next, the page shows...", "Further down...". NEVER start with "A browser", "The screen", "The page", or repeat the project name. 1 sentence, max 15 words. ${guard}`;
 		}
 		const res = await fetch(
 			`https://generativelanguage.googleapis.com/v1beta/models/${VISION_MODEL}:generateContent?key=${apiKey}`,
