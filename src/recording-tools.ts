@@ -28,7 +28,7 @@ function injectText(session: any, text: string) {
 }
 
 // Vision model — override via .env (default: flash-lite for this trivial 20-word task)
-const VISION_MODEL = process.env.VISION_MODEL || 'gemini-2.5-flash';
+const VISION_MODEL = process.env.VISION_MODEL || 'gemini-3.1-flash-lite-preview';
 
 // --- Shared recording state ---
 
