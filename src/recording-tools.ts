@@ -7,7 +7,7 @@ import { execSync, execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync, readFileSync, readlinkSync, existsSync, statSync } from 'node:fs';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
-import { demoStateRef, narrationSpeakingRef } from './recording-state.js';
+import { demoStateRef, narrationSpeakingRef, lastSpokenRef } from './recording-state.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -704,9 +704,9 @@ export function startRecordingNarration(session: any): void {
 			previousDescs.push(desc);
 			if (!existsSync('/tmp/sutando-screen-record.pid')) { narrationSpeakingRef.value = false; return; }
 			const remaining = Math.round((durationMs - (Date.now() - startTime)) / 1000);
-			const alreadySaid = previousDescs.slice(0, -1).map((d, i) => `${i + 1}. ${d}`).join('\n');
+			const lastSaid = lastSpokenRef.value || '(first description)';
 			// narrationSpeakingRef stays true — cleared by voice-agent onTurnCompleted
-			injectText(session, `[System: ${remaining}s left. You said: ${alreadySaid || 'nothing yet'}. NEW: "${desc}" — say ONE short sentence about what's new. Be brief, ~5 seconds of speech max.]`);
+			injectText(session, `[System: ${remaining}s left. You just said: "${lastSaid}" — Continue naturally. NEW on screen: "${desc}" — ONE short sentence, ~5 seconds. Pick up where you left off.]`);
 			console.log(`${ts()} [Recording] pushed: ${desc.slice(0, 60)}...`);
 		} catch (err) {
 			narrationSpeakingRef.value = false;

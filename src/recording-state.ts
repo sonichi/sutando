@@ -7,3 +7,6 @@ export const demoStateRef: { value: 'idle' | 'recording' | 'done' } = { value: '
 
 /** True while Gemini is speaking a narration description. Cleared by voice-agent on turn complete. */
 export const narrationSpeakingRef: { value: boolean } = { value: false };
+
+/** What Gemini actually said in the last narration turn. Set by voice-agent onTurnCompleted. */
+export const lastSpokenRef: { value: string } = { value: '' };

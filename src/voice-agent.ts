@@ -486,11 +486,15 @@ const mainAgent: MainAgent = {
 	// or apology loops) doesn't match. Real farewell responses to
 	// a user "bye" are almost always a short standalone line.
 	onTurnCompleted: async (ctx, _transcript) => {
-		// Clear narration speaking flag so next description can be pushed
+		// Clear narration speaking flag + capture what Gemini actually said
 		try {
-			const { narrationSpeakingRef } = await import('./recording-state.js');
+			const { narrationSpeakingRef, lastSpokenRef } = await import('./recording-state.js');
 			if (narrationSpeakingRef.value) {
 				narrationSpeakingRef.value = false;
+				// Capture what Gemini said so next description has real speech context
+				const turns = ctx.getRecentTurns(1) as Array<{ role?: string; content?: string }>;
+				const last = turns.find(t => t?.role === 'assistant');
+				if (last?.content) lastSpokenRef.value = last.content.trim();
 				console.log(`${ts()} [Recording] speech done — ready for next description`);
 			}
 		} catch {}
