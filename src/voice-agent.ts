@@ -171,9 +171,43 @@ const switchModeTool: ToolDefinition = {
 		meetingActive = mode === 'meeting';
 		console.log(`${ts()} [Meeting] Mode switched to: ${mode}`);
 		if (mode === 'meeting') {
-			return { status: 'meeting_mode', instruction: 'You are now in meeting mode. Listen and track the discussion internally. Produce ZERO audio output unless someone says "Sutando." Do not call any other tools unless explicitly addressed.' };
+			return { status: 'meeting_mode', instruction: 'You are now in meeting mode. Listen and track the discussion internally. Produce ZERO audio output unless someone says "Sutando." The ONLY tool you may call unprompted is save_meeting_note — call it every 5-10 minutes to capture key decisions, action items, and discussion points. When you exit meeting mode, call save_meeting_note with type "summary" for a final recap. Do not call work or any other tools unless explicitly addressed.' };
 		}
 		return { status: 'active_mode', instruction: 'Back to active mode. You can speak and use all tools normally.' };
+	},
+};
+
+const saveMeetingNoteTool: ToolDefinition = {
+	name: 'save_meeting_note',
+	description:
+		'Save a meeting observation, decision, or action item to notes. ' +
+		'Use this ONLY in meeting mode to periodically capture key points. ' +
+		'Call every 5-10 minutes during a meeting, or when a significant decision/action item is discussed. ' +
+		'Also call when exiting meeting mode to save a final summary.',
+	parameters: z.object({
+		content: z.string().describe('The meeting note: decisions, action items, key discussion points, or a summary. Include speaker names when known.'),
+		type: z.enum(['point', 'summary']).optional().describe('"point" for individual observations (default), "summary" for end-of-meeting summary'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { content, type } = args as { content: string; type?: 'point' | 'summary' };
+		const today = new Date().toISOString().slice(0, 10);
+		const time = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' });
+		const notePath = join(WORKSPACE_DIR, 'notes', `meeting-${today}.md`);
+		const isSummary = type === 'summary';
+
+		if (!existsSync(notePath)) {
+			// Create new meeting note file with frontmatter
+			const header = `---\ntitle: Meeting notes — ${today}\ndate: ${today}\ntags: [meeting, notes]\n---\n\n`;
+			writeFileSync(notePath, header);
+		}
+
+		const entry = isSummary
+			? `\n## Summary (${time})\n${content}\n`
+			: `\n- **[${time}]** ${content}`;
+		appendFileSync(notePath, entry);
+		console.log(`${ts()} [MeetingNote] ${isSummary ? 'Summary' : 'Point'} saved to ${notePath}`);
+		return { status: 'saved', path: notePath, type: isSummary ? 'summary' : 'point' };
 	},
 };
 
@@ -385,14 +419,15 @@ const mainAgent: MainAgent = {
 		'- join_gmeet: Join a Google Meet via browser with computer audio. Use when user says "join the meet" or gives a Meet code.',
 		'- summon: Share screen via Zoom (desktop app). Use when user says "summon", "share my screen".',
 		'- dismiss: Leave the current Zoom meeting. Use when user says "dismiss", "leave zoom", "end meeting", "leave the call".',
-		'- switch_mode: Switch between "active" (normal) and "meeting" (silent note-taker). Call switch_mode("meeting") when user says "take notes", "be silent", "meeting mode". Call switch_mode("active") to resume. In meeting mode, listen but produce zero audio unless addressed by name.',
+		'- switch_mode: Switch between "active" (normal) and "meeting" (silent note-taker). Call switch_mode("meeting") when user says "take notes", "be silent", "meeting mode". Call switch_mode("active") to resume.',
+		'- save_meeting_note: Save meeting observations to notes/meeting-{date}.md. Call every 5-10 min in meeting mode. Use type "summary" when exiting meeting mode.',
 		'- For phone calls, meeting dial-in, or anything needing contacts/calendar context → use work (core handles it).',
 		...inlineTools.map(t => `- ${t.name}: ${(t.description as string).split('.')[0]}. Instant.`),
 		'',
 		'CRITICAL RULES:',
 		(() => meetingActive
-			? '⚠️ MEETING MODE IS CURRENTLY ACTIVE (set via switch_mode or detected at startup). You are an invisible note-taker. Listen to all audio and track the discussion: speakers, topics, decisions, action items. Produce ZERO audio output unless someone says "Sutando" or "hey Sutando" — then respond using your accumulated context. When not addressed: no words, no sounds, no acknowledgments. Do NOT call work or any tools unless explicitly addressed. "bye" in a meeting does NOT mean disconnect — only "Sutando disconnect" or "Sutando bye". To exit meeting mode, user says "Sutando, active mode" and you call switch_mode("active").'
-			: '- MEETING MODE: Call switch_mode("meeting") when user says "take notes", "be silent", "passive mode", or when you join a meeting (after join_zoom, join_gmeet, summon). In meeting mode: listen and take notes, produce zero audio, don\'t call tools — unless addressed by name. Call switch_mode("active") to resume normal mode.'
+			? '⚠️ MEETING MODE IS CURRENTLY ACTIVE. You are an invisible note-taker. Listen to all audio and track: speakers, topics, decisions, action items. Produce ZERO audio output unless someone says "Sutando" or "hey Sutando." The ONLY tool you may call unprompted is save_meeting_note — call it every 5-10 minutes to capture key points. Do NOT call work or other tools unless explicitly addressed. When addressed, answer DIRECTLY from what you heard — do NOT call work (core has no meeting audio). "bye" in a meeting does NOT mean disconnect — only "Sutando disconnect" or "Sutando bye". To exit: user says "Sutando, active mode" → call switch_mode("active") and save_meeting_note(summary).'
+			: '- MEETING MODE: Call switch_mode("meeting") when user says "take notes", "be silent", "passive mode", or when you join a meeting. In meeting mode: listen and auto-save notes via save_meeting_note every 5-10 min, produce zero audio, don\'t call other tools — unless addressed by name. Call switch_mode("active") to resume.'
 		)(),
 		'- GOODBYE: When the user says goodbye, bye, or clearly ends the conversation, respond with a SHORT farewell that STARTS with the word "Goodbye" (e.g. "Goodbye! Talk to you later."). Keep it under one sentence. The session will close automatically. Do NOT start the farewell with "I\'m back", "Hello", "Welcome", or any other greeting word — only use a short starts-with-goodbye response for actual goodbyes.',
 		'- NEVER pretend you called a tool. NEVER say "done" without actually calling work.',
@@ -431,7 +466,7 @@ const mainAgent: MainAgent = {
 	// enable it once we find a reliable gate signal (probably after
 	// bodhi exposes a proper "user has actually spoken" signal under
 	// native audio).
-	tools: [workTool, getTaskStatus, switchModeTool, ...inlineTools],
+	tools: [workTool, getTaskStatus, switchModeTool, saveMeetingNoteTool, ...inlineTools],
 	googleSearch: VOICE_GOOGLE_SEARCH,
 	onEnter: async () => console.log(`${ts()} [Agent] Sutando ready`),
 	// Voice-driven close — strict version. User wants to be able to
