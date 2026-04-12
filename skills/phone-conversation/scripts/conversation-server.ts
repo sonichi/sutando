@@ -1389,6 +1389,8 @@ wss.on('connection', (ws: WebSocket) => {
 					break;
 
 				case 'start': {
+					// Reset recording state from previous call (demoState may be stuck at 'done' or 'recording')
+					try { const { resetDemoState } = await import('../../../src/browser-tools.js'); resetDemoState(); } catch {}
 					callSid = msg.start.callSid;
 					const streamSid = msg.start.streamSid;
 					const cp = msg.start.customParameters ?? {};

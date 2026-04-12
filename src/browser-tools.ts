@@ -404,6 +404,14 @@ function scrollDown(pixels: number = 600) {
 
 let demoState: 'idle' | 'recording' | 'done' = 'idle';
 
+/** Reset recording state — call when a new phone call starts or previous recording is stuck */
+export function resetDemoState(): void {
+	if (demoState !== 'idle') {
+		console.log(`${ts()} [DemoState] Reset from '${demoState}' → 'idle'`);
+		demoState = 'idle';
+	}
+}
+
 export const scrollAndDescribeTool: ToolDefinition = {
 	name: 'scroll_and_describe',
 	description:
