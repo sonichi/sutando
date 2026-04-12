@@ -696,9 +696,9 @@ export function startRecordingNarration(session: any): void {
 			previousDescs.push(desc);
 			if (!existsSync('/tmp/sutando-screen-record.pid')) return;
 			const remaining = Math.round((durationMs - (Date.now() - startTime)) / 1000);
-			const alreadySaid = previousDescs.slice(0, -1).map((d, i) => `${i + 1}. ${d.slice(0, 40)}`).join('; ');
+			const alreadySaid = previousDescs.slice(0, -1).map((d, i) => `${i + 1}. ${d}`).join('\n');
 			narrationSpeakingRef.value = true; // will be cleared by voice-agent on turn complete
-			injectText(session, `[System: ${remaining}s left. Already narrated: ${alreadySaid || 'nothing yet'}. Now narrate this NEW content only (1 short sentence, no repeats): "${desc}"]`);
+			injectText(session, `[System: Recording narration — ${remaining}s left.\n\nYou already said:\n${alreadySaid || '(nothing yet)'}\n\nNew content on screen: "${desc}"\n\nNarrate ONLY what's NEW — 1-2 short sentences continuing naturally from your previous narration. Do NOT repeat anything above.]`);
 			console.log(`${ts()} [Recording] pushed: ${desc.slice(0, 60)}...`);
 		} catch (err) {
 			console.log(`${ts()} [Recording] push error: ${err}`);
