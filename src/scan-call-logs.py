@@ -18,27 +18,48 @@ STATE_FILE = Path(__file__).parent.parent / "results" / "calls" / ".scan-state.j
 # --- Detection patterns ---
 
 def detect_duplicate_responses(transcript: str) -> list[dict]:
-    """Detect repeated assistant responses (reconnect bug)."""
+    """Detect adjacent repeated assistant responses (reconnect bug).
+
+    Only flags duplicates that appear close together in the transcript
+    (within 3 turns) — those are characteristic of reconnect replay leaks.
+    Spread-out repeats (e.g. user intentionally calling summon 10x to test)
+    are NOT flagged because they're legitimate repeated actions.
+    """
     issues = []
-    lines = [l.strip() for l in transcript.split('\n') if l.strip().startswith('Sutando:')]
-    texts = [l.split(':', 1)[1].strip() for l in lines]
-    seen = {}
-    for t in texts:
-        if len(t) < 15:
-            continue
-        key = t[:60]
-        if key in seen:
-            seen[key] += 1
+    # Walk all lines, tracking position of each Sutando turn
+    sutando_turns = []  # list of (line_index, text)
+    for idx, raw_line in enumerate(transcript.split('\n')):
+        line = raw_line.strip()
+        if line.startswith('Sutando:'):
+            text = line.split(':', 1)[1].strip()
+            if len(text) >= 15:
+                sutando_turns.append((idx, text[:60]))
+
+    # Find adjacent duplicates (same text within MAX_GAP turns of previous occurrence)
+    MAX_GAP = 3  # turns; reconnect leaks are typically immediately consecutive
+    last_seen = {}  # key -> (turn_position_in_sutando_turns, count)
+    flagged = {}   # key -> count of adjacent occurrences
+    for turn_pos, (_, key) in enumerate(sutando_turns):
+        if key in last_seen:
+            prev_pos, prev_count = last_seen[key]
+            if turn_pos - prev_pos <= MAX_GAP:
+                # Adjacent — likely reconnect leak
+                flagged[key] = flagged.get(key, prev_count) + 1
+                last_seen[key] = (turn_pos, flagged[key])
+            else:
+                # Spread out — reset (intentional repeat, not a bug)
+                last_seen[key] = (turn_pos, 1)
         else:
-            seen[key] = 1
-    for key, count in seen.items():
-        if count > 1:
+            last_seen[key] = (turn_pos, 1)
+
+    for key, count in flagged.items():
+        if count >= 2:  # at least one adjacent dup pair
             issues.append({
                 "pattern": "duplicate_response",
                 "severity": "medium",
                 "category": "team-fixable",
-                "summary": f"Repeated response ({count}x): \"{key[:50]}...\"",
-                "fix_hint": "Known reconnect bug — duplicate audio on WebSocket reconnect.",
+                "summary": f"Adjacent repeated response ({count}x within {MAX_GAP} turns): \"{key[:50]}...\"",
+                "fix_hint": "Likely reconnect bug — duplicate audio on WebSocket reconnect. Spread-out repeats (intentional) are not flagged.",
             })
     return issues
 
