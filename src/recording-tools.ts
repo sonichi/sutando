@@ -330,32 +330,22 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			liveTranscriptRecordingStart = Date.now();
 			liveTranscriptBaselineLines = countTranscriptLines();
 
-			// Adaptive scroll speed: one pass top-to-bottom over the full duration
-			let pageHeight = 5000; // fallback
+			// Scroll is now driven by the narration controller (turn.end events)
+			// instead of a fixed timer. Write scroll info so the controller knows
+			// how much to scroll per step.
+			let pageHeight = 5000;
 			try {
 				pageHeight = parseInt(execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "document.body.scrollHeight - window.innerHeight"'`, { timeout: 3_000 }).toString().trim()) || 5000;
 			} catch {}
-			const SCROLL_INTERVAL_MS = 2500;
-			const totalScrollSteps = (duration_seconds * 1000) / SCROLL_INTERVAL_MS;
-			const pxPerStep = Math.ceil(pageHeight / totalScrollSteps);
-			// Write scroll info for conversation-server to calculate description timing
-			const viewportHeight = 900; // approximate
-			const msPerViewport = Math.round((viewportHeight / pxPerStep) * SCROLL_INTERVAL_MS);
-			writeFileSync('/tmp/sutando-scroll-info.json', JSON.stringify({ pageHeight, pxPerStep, msPerViewport, duration_seconds }));
-			console.log(`${ts()} [ScrollAndDescribe] page=${pageHeight}px, ${totalScrollSteps} steps, ${pxPerStep}px/step, ${msPerViewport}ms/viewport`);
-			let scrolledTotal = 0;
-			const scrollInterval = setInterval(() => {
-				if (scrolledTotal >= pageHeight) return; // stop at bottom
-				try { scrollDown(pxPerStep); } catch (e) { console.error(`${ts()} [ScrollAndDescribe] scroll failed:`, e); }
-				scrolledTotal += pxPerStep;
-			}, SCROLL_INTERVAL_MS);
+			const viewportHeight = 900;
+			writeFileSync('/tmp/sutando-scroll-info.json', JSON.stringify({ pageHeight, viewportHeight, duration_seconds }));
+			console.log(`${ts()} [ScrollAndDescribe] page=${pageHeight}px, speech-driven scroll`);
 
 			// Auto-stop after duration — wait for narration-tee mux, then burn subtitles.
 			// Capture start time: if user starts a 2nd recording before this timer fires,
 			// liveTranscriptRecordingStart will be overwritten. Only clear if still ours.
 			const myRecStart = liveTranscriptRecordingStart;
 			setTimeout(async () => {
-				clearInterval(scrollInterval);
 				let stopResult: any = {};
 				try {
 					const raw = execSync('python3 skills/screen-record/scripts/record.py stop', { timeout: 10_000 }).toString().trim();
