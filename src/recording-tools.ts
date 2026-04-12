@@ -724,8 +724,15 @@ export function startRecordingNarration(session: any): void {
 			return;
 		}
 		// Inject the pre-captured description
-		const desc = nextDescRef.value;
+		let desc = nextDescRef.value!;
 		nextDescRef.value = null;
+		// Strip repetitive page-intro prefixes the vision model adds despite prompting
+		if (previousDescs.length > 0) {
+			desc = desc
+				.replace(/^(The screen (shows|displays)|A browser (window )?(shows|displays)|The page (shows|displays))[^,.]*(,\s*|\.\s*)/i, '')
+				.replace(/^(a |the )/i, s => s.toUpperCase());
+			if (desc.length < 10) desc = nextDescRef.value || desc; // fallback
+		}
 		lastDesc = desc;
 		previousDescs.push(desc);
 		const remaining = Math.round((durationMs - (Date.now() - startTime)) / 1000);
