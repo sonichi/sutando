@@ -174,11 +174,15 @@ async def _handle_discord_message(message, force=False):
             return
 
         # In shared channels (require_mention=False), if there ARE other bot
-        # @mentions but THIS bot isn't mentioned, skip — let the addressed bot handle it
+        # @mentions but THIS bot isn't mentioned, skip — let the addressed bot handle it.
+        # Exception: reply context auto-adds the replied-to bot as a mention —
+        # don't skip just because the user replied to another bot's message.
         if not require_mention and message.mentions and not bot_mentioned:
-            other_bot_mentions = [m for m in message.mentions if m.bot]
-            if other_bot_mentions:
-                print(f"  [skip] message addressed to other bot(s): {[str(m) for m in other_bot_mentions]}", flush=True)
+            # Filter out the replied-to author (auto-added by Discord reply)
+            reply_author_id = message.reference.resolved.author.id if message.reference and hasattr(message.reference, 'resolved') and message.reference.resolved else None
+            explicit_mentions = [m for m in message.mentions if m.bot and m.id != reply_author_id]
+            if explicit_mentions:
+                print(f"  [skip] message addressed to other bot(s): {[str(m) for m in explicit_mentions]}", flush=True)
                 return
 
         # Strip mentions from the text
