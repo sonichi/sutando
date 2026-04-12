@@ -625,6 +625,9 @@ export const screenRecordTool: ToolDefinition = {
  */
 let _narrationSession: any = null;
 
+/** Exposed for voice-agent to call when speech finishes and pre-capture is ready */
+export let _tryInjectNow: (() => void) | null = null;
+
 export function setupRecordingHooks(session: any): void {
 	_narrationSession = session;
 	// Start narration when scroll_and_describe is called
@@ -699,6 +702,11 @@ export function startRecordingNarration(session: any): void {
 			if (desc && desc !== lastDesc) {
 				nextDescRef.value = desc;
 				console.log(`${ts()} [Recording] pre-captured: ${desc.slice(0, 60)}...`);
+				// Try injecting immediately if Gemini already finished speaking
+				if (!narrationSpeakingRef.value) {
+					console.log(`${ts()} [Recording] Gemini idle — injecting immediately`);
+					tryInject();
+				}
 			} else {
 				nextDescRef.value = null;
 				scrollPausedRef.value = false; // resume scroll if nothing new
@@ -712,6 +720,7 @@ export function startRecordingNarration(session: any): void {
 
 	// Called by interval — if pre-captured desc is ready and Gemini finished speaking, inject it
 	const tryInject = () => {
+		_tryInjectNow = tryInject; // expose for voice-agent callback
 		if (!existsSync('/tmp/sutando-screen-record.pid')) return;
 		// Force-clear speaking flag after MAX_SPEAKING_TIME to prevent deadlock
 		if (narrationSpeakingRef.value && (Date.now() - lastPushTime) > MAX_SPEAKING_TIME) {

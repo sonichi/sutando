@@ -496,6 +496,12 @@ const mainAgent: MainAgent = {
 				const last = turns.find(t => t?.role === 'assistant');
 				if (last?.content) lastSpokenRef.value = last.content.trim();
 				console.log(`${ts()} [Recording] speech done — ready for next description`);
+				// If pre-captured desc is waiting, inject immediately
+				const { nextDescRef } = await import('./recording-state.js');
+				if (nextDescRef.value) {
+					const { _tryInjectNow } = await import('./recording-tools.js');
+					if (_tryInjectNow) _tryInjectNow();
+				}
 			}
 		} catch {}
 		try {
