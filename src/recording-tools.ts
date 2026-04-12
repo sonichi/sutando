@@ -395,7 +395,7 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			return {
 				status: 'recording',
 				first_description: firstDesc,
-				message: `SPEAK THIS NOW: "${firstDesc}" — say ONLY this ONE sentence, then STOP and WAIT. More descriptions will be pushed to you automatically as the page scrolls. Do NOT narrate ahead or describe future scrolling. Just speak this one description and go silent.`,
+				message: `You are narrating a screen recording. The screen shows: "${firstDesc}". Describe what you see in your own words — ONE natural sentence. Then STOP and WAIT silently. More content will be pushed as the page scrolls. Do NOT narrate ahead.`,
 			};
 		} catch (err) {
 			return { error: `scroll_and_describe failed: ${err instanceof Error ? err.message : err}` };
@@ -752,7 +752,7 @@ export function startRecordingNarration(session: any): void {
 		narrationSpeakingRef.value = true;
 		lastPushTime = Date.now();
 		scrollPausedRef.value = false; // resume scroll when Gemini starts speaking
-		injectText(session, `[System: ${remaining}s left. You just said: "${lastSaid}" — Continue naturally. NEW on screen: "${desc}" — ONE short sentence, ~5 seconds. Pick up where you left off.]`);
+		injectText(session, `[System: Narrate what's new on screen. You just said: "${lastSaid}". The screen now shows: "${desc}". DO NOT read this description verbatim — rephrase it in your own words as a natural continuation. One sentence, ~5 seconds.]`);
 		console.log(`${ts()} [Recording] pushed: ${desc}`);
 		// Pre-capture next after enough scrolling for new content
 		setTimeout(preCapture, Math.max(descIntervalMs - 2000, 3000));
