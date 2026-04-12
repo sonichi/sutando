@@ -429,8 +429,13 @@ export const openVideoTool: ToolDefinition = {
 			execSync(`open "${recPath}"`, { timeout: 5_000 });
 			try { execSync(`osascript -e 'tell application "QuickTime Player" to activate'`, { timeout: 3_000 }); } catch {}
 			const size = statSync(recPath).size;
-			console.log(`${ts()} [OpenVideo] opened ${recPath} (${(size / 1024 / 1024).toFixed(1)}MB)`);
-			return { status: 'opened', path: recPath, size_mb: +(size / 1024 / 1024).toFixed(1), instruction: 'File opened. When user says play, call play_video.' };
+			let duration_seconds: number | null = null;
+			try {
+				const dur = execSync(`/opt/homebrew/bin/ffprobe -v error -show_entries format=duration -of csv=p=0 "${recPath}"`, { timeout: 5_000 }).toString().trim();
+				duration_seconds = Math.round(parseFloat(dur));
+			} catch {}
+			console.log(`${ts()} [OpenVideo] opened ${recPath} (${(size / 1024 / 1024).toFixed(1)}MB, ${duration_seconds ?? '?'}s)`);
+			return { status: 'opened', path: recPath, size_mb: +(size / 1024 / 1024).toFixed(1), duration_seconds, instruction: 'File opened. When user says play, call play_video.' };
 		} catch (err) {
 			return { error: `open_video failed: ${err instanceof Error ? err.message : err}` };
 		}
