@@ -334,7 +334,7 @@ const mainAgent: MainAgent = {
 		'- Anything you\'re not 100% certain about',
 		'',
 		'TOOLS:',
-		'- work: THE default tool. Call it for any non-trivial request. Also called "core", "submit a task", or "send to core" — these all mean call this tool.',
+		'- work: THE default tool. Call it for any non-trivial request. Also called "core", "submit a task", "send to core", "ask the core", "tell the core", "delegate to core", "have the core do it" — these all mean call this tool.',
 		'  Returns status "pending" — say "Working on it" and wait for the result.',
 		'- get_task_status: Check if a background task is still running.',
 		'- join_zoom: Join a Zoom meeting with computer audio (no screen sharing). Use when user says "join the zoom" or gives a Zoom ID.',
