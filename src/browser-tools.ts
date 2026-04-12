@@ -393,6 +393,11 @@ function scrollDown(pixels: number = 600) {
 	// Use widest-element heuristic (same as scrollTool) so embedded/nested scrollable containers work
 	const js = `(function(){var best=document.scrollingElement||document.documentElement,bw=0;document.querySelectorAll("*").forEach(function(el){var d=el.scrollHeight-el.clientHeight;if(d>50&&el.clientHeight>200){var w=el.getBoundingClientRect().width;if(w>bw){best=el;bw=w}}});best.scrollBy(0,${pixels})})()`;
 	execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/"/g, '\\"')}"'`, { timeout: 5_000 });
+	// Keyboard fallback: Chrome skips visual repaints during Zoom screen share.
+	// Page Down forces a repaint through the OS input pipeline.
+	try {
+		execSync(`osascript -e 'tell application "Google Chrome" to activate' -e 'delay 0.1' -e 'tell application "System Events" to key code 121'`, { timeout: 3_000 });
+	} catch { /* best-effort */ }
 }
 
 let demoState: 'idle' | 'recording' | 'done' = 'idle';
