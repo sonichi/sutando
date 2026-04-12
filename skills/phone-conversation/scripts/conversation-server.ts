@@ -250,6 +250,29 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 		return Promise.resolve({ status: 'cached', message: 'This was already completed — result is being replayed.' });
 	}
 
+	// Fast path (owner-only): handle image+video concat directly via local skill.
+	// Bypasses the file bridge for ~3s response time vs ~15s. Owner-only because
+	// it executes shell commands with file paths from /tmp — non-owner callers
+	// must go through the file bridge which enforces access_tier downstream.
+	const concatMatch = /\b(prepend|concatenat|concat|image.*video|video.*image)\b/i.test(taskDescription);
+	if (concatMatch && callSession.isOwner) {
+		console.log(`${ts()} [Task] concat shortcut — using video-concat skill`);
+		try {
+			const image = execSync('ls -t /tmp/discord-inbox/*.jpg /tmp/discord-inbox/*.png 2>/dev/null | head -1', { timeout: 3000 }).toString().trim();
+			const video = execSync('ls -t /tmp/sutando-recording-*-narrated-subtitled.mov /tmp/sutando-recording-*-narrated.mov /tmp/sutando-recording-*.mov 2>/dev/null | head -1', { timeout: 3000 }).toString().trim();
+			if (image && video) {
+				const result = execSync(`bash ~/.claude/skills/video-concat/scripts/prepend-image.sh "${image}" "${video}" 3`, { timeout: 60000 }).toString().trim();
+				const parsed = JSON.parse(result);
+				callSession.pendingTasks++;
+				setTimeout(() => {
+					callSession.pendingTasks = Math.max(0, callSession.pendingTasks - 1);
+					callSession.resultQueue.push({ text: `[Task result] Video with image prepended: ${parsed.output} (${parsed.size_mb}MB). Report this to the caller.` });
+				}, 100);
+				return Promise.resolve({ status: 'processing', message: 'Creating the combined video now.' });
+			}
+		} catch (e) { console.log(`${ts()} [Task] concat shortcut failed: ${e}`); }
+	}
+
 	const taskId = `task-phone-${Date.now()}`;
 	const taskPath = join(TASKS_DIR, `${taskId}.txt`);
 	const resultPath = join(RESULTS_DIR, `${taskId}.txt`);
