@@ -436,12 +436,18 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			const captureRes = await fetch('http://localhost:7845/capture');
 			const captureData = await captureRes.json() as { status: string; path?: string };
 			const firstDesc = captureData.path ? await describeScreenshot(captureData.path) : '';
-			// Set subtitle baseline AFTER first description — so subtitles align with audio.
-			// Use voice transcript directly — the symlink may point to a phone call transcript.
+			// Set subtitle baseline — pick whichever transcript was updated more recently.
+			// Voice agent writes to -voice.txt; phone conversation-server writes to -CA{sid}.txt via symlink.
 			const voiceTranscript = '/tmp/sutando-live-transcript-voice.txt';
-			liveTranscriptResolvedPath = existsSync(voiceTranscript) ? voiceTranscript : '';
-			if (!liveTranscriptResolvedPath) {
-				try { liveTranscriptResolvedPath = readlinkSync(LIVE_TRANSCRIPT_SYMLINK); } catch { liveTranscriptResolvedPath = ''; }
+			let phoneTranscript = '';
+			try { phoneTranscript = readlinkSync(LIVE_TRANSCRIPT_SYMLINK); } catch {}
+			if (existsSync(voiceTranscript) && phoneTranscript && existsSync(phoneTranscript)) {
+				// Both exist — use whichever was modified more recently
+				const vMtime = statSync(voiceTranscript).mtimeMs;
+				const pMtime = statSync(phoneTranscript).mtimeMs;
+				liveTranscriptResolvedPath = pMtime > vMtime ? phoneTranscript : voiceTranscript;
+			} else {
+				liveTranscriptResolvedPath = (phoneTranscript && existsSync(phoneTranscript)) ? phoneTranscript : (existsSync(voiceTranscript) ? voiceTranscript : '');
 			}
 			liveTranscriptRecordingStart = Date.now();
 			liveTranscriptBaselineLines = countTranscriptLines();
