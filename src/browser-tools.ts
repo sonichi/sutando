@@ -400,6 +400,12 @@ function scrollDown(pixels: number = 600) {
 	writeFileSync(tmpScroll, `tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/"/g, '\\"')}"`);
 	execSync(`osascript ${tmpScroll}`, { timeout: 5_000 });
 	try { unlinkSync(tmpScroll); } catch {}
+	// Repaint trigger: Chrome defers visual repaints during Zoom screen share.
+	// CGEvent scroll wheel events force a repaint through the OS input pipeline
+	// without stealing focus (unlike keyboard fallback which breaks narration).
+	try {
+		execSync(`swift src/scroll-wheel.swift 1`, { timeout: 3_000 });
+	} catch { /* best-effort — scroll already happened via JS */ }
 }
 
 let demoState: 'idle' | 'recording' | 'done' = 'idle';
