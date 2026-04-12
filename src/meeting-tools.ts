@@ -9,10 +9,12 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
-const ZOOM_PMI = process.env.ZOOM_PERSONAL_MEETING_ID ?? '';
-const ZOOM_PASSCODE = process.env.ZOOM_PERSONAL_PASSCODE ?? '';
-const PHONE_PORT = Number(process.env.PHONE_PORT) || 3100;
-const ZOOM_DEFAULT_SHARE_SCREEN = process.env.ZOOM_DEFAULT_SHARE_SCREEN !== 'false'; // default true
+// Lazy env reads — ESM hoists imports before dotenv runs, so reading at
+// import time gets empty values. These getters read at call time instead.
+const getZoomPMI = () => process.env.ZOOM_PERSONAL_MEETING_ID ?? '';
+const getZoomPasscode = () => process.env.ZOOM_PERSONAL_PASSCODE ?? '';
+const getPhonePort = () => Number(process.env.PHONE_PORT) || 3100;
+const getShareScreen = () => process.env.ZOOM_DEFAULT_SHARE_SCREEN !== 'false';
 
 export const summonTool: ToolDefinition = {
 	name: 'summon',
@@ -20,7 +22,7 @@ export const summonTool: ToolDefinition = {
 		'Summon Sutando\'s screen — opens Zoom with screen sharing so the user can see and control remotely. ' +
 		'Use when user says "summon", "share my screen", "start zoom", "let me see your screen". ' +
 		'Instant — do NOT use work for this.' +
-		(ZOOM_PMI ? ` Default meeting: ${ZOOM_PMI}.` : ''),
+		(getZoomPMI() ? ` Default meeting: ${getZoomPMI()}.` : ''),
 	parameters: z.object({
 		meetingId: z.string().optional().describe('Zoom meeting ID. Omit for personal room.'),
 		passcode: z.string().optional().describe('Passcode. Omit for personal room.'),
@@ -29,9 +31,9 @@ export const summonTool: ToolDefinition = {
 	}),
 	execution: 'inline',
 	async execute(args, ctx) {
-		const { meetingId, passcode, shareScreen = ZOOM_DEFAULT_SHARE_SCREEN, dialIn = false } = args as { meetingId?: string; passcode?: string; shareScreen?: boolean; dialIn?: boolean };
-		const pwd = passcode ?? ZOOM_PASSCODE;
-		const cleanId = (meetingId ?? ZOOM_PMI).replace(/\D/g, '');
+		const { meetingId, passcode, shareScreen = getShareScreen(), dialIn = false } = args as { meetingId?: string; passcode?: string; shareScreen?: boolean; dialIn?: boolean };
+		const pwd = passcode ?? getZoomPasscode();
+		const cleanId = (meetingId ?? getZoomPMI()).replace(/\D/g, '');
 		if (!cleanId || cleanId.length < 6) return { error: `Invalid meeting ID: "${meetingId}"` };
 
 		try {
@@ -120,10 +122,10 @@ export const summonTool: ToolDefinition = {
 			// Phone dial-in only when explicitly requested (not all meetings support it)
 			let phoneJoined = false;
 			if (dialIn) try {
-				const ping = await fetch(`http://localhost:${PHONE_PORT}/health`, { signal: AbortSignal.timeout(2000) });
+				const ping = await fetch(`http://localhost:${getPhonePort()}/health`, { signal: AbortSignal.timeout(2000) });
 				if (ping.ok) {
 					console.log(`${ts()} [Summon] Phone server available — dialing into meeting for voice`);
-					const res = await fetch(`http://localhost:${PHONE_PORT}/meeting`, {
+					const res = await fetch(`http://localhost:${getPhonePort()}/meeting`, {
 						method: 'POST',
 						headers: { 'Content-Type': 'application/json' },
 						body: JSON.stringify({ meetingId: cleanId, passcode: pwd, platform: 'zoom' }),
@@ -441,8 +443,8 @@ export const joinZoomTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { meetingId, passcode } = args as { meetingId?: string; passcode?: string };
-		const pwd = passcode ?? ZOOM_PASSCODE;
-		const cleanId = (meetingId ?? ZOOM_PMI).replace(/\D/g, '');
+		const pwd = passcode ?? getZoomPasscode();
+		const cleanId = (meetingId ?? getZoomPMI()).replace(/\D/g, '');
 		if (!cleanId || cleanId.length < 6) return { error: `Invalid meeting ID: "${meetingId}"` };
 
 		try {
@@ -796,7 +798,7 @@ end tell`;
 			const purpose = message || `Calling ${contact.name}`;
 
 			console.log(`${ts()} [CallContact] calling ${contact.name}`);
-			const res = await fetch(`http://localhost:${PHONE_PORT}/call`, {
+			const res = await fetch(`http://localhost:${getPhonePort()}/call`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ to: phone, message: purpose }),
