@@ -218,14 +218,10 @@ async function describeScreenshot(imagePath: string, previousDescs: string[] = [
 		// Issue #189: when continuing a narration, the vision model should build
 		// on what was already said instead of re-introducing the page every
 		// time. First call: introduce with the heading. Later calls: flow on.
-		let prompt: string;
+		// Vision model's job: describe what's visible. Narration continuity is handled
+		// by the live model (Gemini) which has full conversation context.
 		const guard = 'ONLY describe what you SEE in the image. Do NOT use external knowledge, search the web, or add facts not visible on screen.';
-		if (previousDescs.length === 0) {
-			prompt = `Describe what is on screen in exactly 1 short sentence (max 20 words). Quote the main heading. This will be spoken aloud. ${guard}`;
-		} else {
-			const recent = previousDescs.slice(-2).join(' | ');
-			prompt = `Screen recording narration. Already said: "${recent}". Describe ONLY NEW content visible — ignore the browser, page title, repo name, and anything already mentioned. Start with what's different: "Scrolling down, we see...", "Next, the page shows...", "Further down...". NEVER start with "A browser", "The screen", "The page", or repeat the project name. 1 sentence, max 15 words. ${guard}`;
-		}
+		const prompt = `Describe the main content visible on screen in 1 sentence (max 20 words). Focus on text content, headings, and sections — not browser chrome. ${guard}`;
 		const res = await fetch(
 			`https://generativelanguage.googleapis.com/v1beta/models/${VISION_MODEL}:generateContent?key=${apiKey}`,
 			{
@@ -726,13 +722,6 @@ export function startRecordingNarration(session: any): void {
 		// Inject the pre-captured description
 		let desc = nextDescRef.value!;
 		nextDescRef.value = null;
-		// Strip repetitive page-intro prefixes the vision model adds despite prompting
-		if (previousDescs.length > 0) {
-			desc = desc
-				.replace(/^(The screen (shows|displays)|A browser (window )?(shows|displays)|The page (shows|displays))[^,.]*(,\s*|\.\s*)/i, '')
-				.replace(/^(a |the )/i, s => s.toUpperCase());
-			if (desc.length < 10) desc = nextDescRef.value || desc; // fallback
-		}
 		lastDesc = desc;
 		previousDescs.push(desc);
 		const remaining = Math.round((durationMs - (Date.now() - startTime)) / 1000);
