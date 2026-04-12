@@ -692,7 +692,7 @@ export function startRecordingNarration(session: any): void {
 		try {
 			// Scroll one viewport worth to reveal new content, then pause + capture
 			scrollPausedRef.value = false;
-			scrollDown(900); // one viewport
+			scrollDown(1400); // ~1.5 viewports — ensures mostly new content visible
 			await new Promise(r => setTimeout(r, 500)); // let scroll settle
 			scrollPausedRef.value = true;
 			console.log(`${ts()} [Recording] pre-capture: scrolled + capturing...`);
