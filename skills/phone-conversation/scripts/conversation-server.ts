@@ -239,24 +239,23 @@ let nextBodhiPort = 9910; // Dynamic ports for per-call VoiceSessions
 // [Task chain] Gemini 'work' tool → write task file → resolve immediately → inject result later
 // The tool resolves instantly so Gemini stays conversational while Claude works.
 // When the result arrives, it's injected via sendContent.
-function delegateTask(callSession: CallSession, taskDescription: string): Promise<unknown> {
-	// Dedup: if same task was already completed this call, return cached result
-	const cached = callSession.taskResultCache?.get(taskDescription);
-	if (cached) {
-		console.log(`${ts()} [Task] cache hit for "${taskDescription}" — replaying result`);
-		callSession.resultQueue.push({
-			text: `[Task result for "${taskDescription}"]\n${cached}\n\nReport this result to the caller now.`,
-		});
-		return Promise.resolve({ status: 'cached', message: 'This was already completed — result is being replayed.' });
-	}
-
-	// Fast path (owner-only): handle image+video concat directly via local skill.
-	// Bypasses the file bridge for ~3s response time vs ~15s. Owner-only because
-	// it executes shell commands with file paths from /tmp — non-owner callers
-	// must go through the file bridge which enforces access_tier downstream.
+/**
+ * Try owner-only fast paths for known task patterns. Returns a result if the
+ * fast path handled the task, or null if the caller should fall through to
+ * the regular file-bridge `delegateTask`.
+ *
+ * SECURITY: This function is owner-only by contract. The work tool's execute()
+ * MUST check `callSession.isOwner` before calling this. Non-owner callers
+ * should go directly to delegateTask which enforces access_tier downstream.
+ *
+ * Currently handles: image+video concat (was the inline shortcut in PR #274).
+ * Bypasses the file bridge for ~3s response time vs ~15s.
+ */
+function tryFastPath(callSession: CallSession, taskDescription: string): Promise<unknown> | null {
+	// Concat shortcut: detect prepend/concat/image+video phrasing
 	const concatMatch = /\b(prepend|concatenat|concat|image.*video|video.*image)\b/i.test(taskDescription);
-	if (concatMatch && callSession.isOwner) {
-		console.log(`${ts()} [Task] concat shortcut — using video-concat skill`);
+	if (concatMatch) {
+		console.log(`${ts()} [FastPath] concat — using video-concat skill`);
 		try {
 			const image = execSync('ls -t /tmp/discord-inbox/*.jpg /tmp/discord-inbox/*.png 2>/dev/null | head -1', { timeout: 3000 }).toString().trim();
 			const video = execSync('ls -t /tmp/sutando-recording-*-narrated-subtitled.mov /tmp/sutando-recording-*-narrated.mov /tmp/sutando-recording-*.mov 2>/dev/null | head -1', { timeout: 3000 }).toString().trim();
@@ -270,7 +269,20 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 				}, 100);
 				return Promise.resolve({ status: 'processing', message: 'Creating the combined video now.' });
 			}
-		} catch (e) { console.log(`${ts()} [Task] concat shortcut failed: ${e}`); }
+		} catch (e) { console.log(`${ts()} [FastPath] concat failed: ${e}`); }
+	}
+	return null;
+}
+
+function delegateTask(callSession: CallSession, taskDescription: string): Promise<unknown> {
+	// Dedup: if same task was already completed this call, return cached result
+	const cached = callSession.taskResultCache?.get(taskDescription);
+	if (cached) {
+		console.log(`${ts()} [Task] cache hit for "${taskDescription}" — replaying result`);
+		callSession.resultQueue.push({
+			text: `[Task result for "${taskDescription}"]\n${cached}\n\nReport this result to the caller now.`,
+		});
+		return Promise.resolve({ status: 'cached', message: 'This was already completed — result is being replayed.' });
 	}
 
 	const taskId = `task-phone-${Date.now()}`;
@@ -558,6 +570,13 @@ function buildAgent(callSession: CallSession): MainAgent {
 			timeout: 120_000,
 			async execute(args) {
 				const { task } = args as { task: string };
+				// Owner-only fast paths (e.g. video concat) — skip the file bridge
+				// for known patterns. Non-owner callers always go through delegateTask
+				// which enforces access_tier downstream.
+				if (callSession.isOwner) {
+					const fast = tryFastPath(callSession, task);
+					if (fast) return fast;
+				}
 				return delegateTask(callSession, task);
 			},
 		});
