@@ -14,8 +14,8 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
 // Re-export recording/screen/browser tools from browser-tools
-export { describeScreenTool, clickTool, scrollAndDescribeTool, openVideoTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool } from './browser-tools.js';
-import { describeScreenTool, clickTool, scrollAndDescribeTool, openVideoTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool } from './browser-tools.js';
+export { describeScreenTool, clickTool, scrollAndDescribeTool, openVideoTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, openUrlTool, scrollTool } from './browser-tools.js';
+import { describeScreenTool, clickTool, scrollAndDescribeTool, openVideoTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, openUrlTool, scrollTool } from './browser-tools.js';
 
 // --- Keyboard tool ---
 
@@ -66,27 +66,7 @@ export const pressKeyTool: ToolDefinition = {
 // Placeholder to maintain the export shape — the real tools are imported at the top
 const _browserToolsImported = { switchTabTool, scrollTool }; // eslint-disable-line @typescript-eslint/no-unused-vars
 
-export const openUrlTool: ToolDefinition = {
-	name: 'open_url',
-	description:
-		'Open a URL in a new Chrome tab. Use for: "open github.com", "go to that link".',
-	parameters: z.object({
-		url: z.string().describe('The URL to open'),
-	}),
-	execution: 'inline',
-	async execute(args) {
-		const { url } = args as { url: string };
-		// Escape backslashes first, then quotes — prevents shell injection via osascript
-		const safeUrl = url.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
-		try {
-			execSync(`osascript -e 'tell application "Google Chrome" to tell front window to make new tab with properties {URL:"${safeUrl}"}'`, { timeout: 5_000 });
-			console.log(`${ts()} [OpenURL] opened: ${url}`);
-			return { status: 'opened', url };
-		} catch (err) {
-			return { error: `Failed to open ${url}: ${err instanceof Error ? err.message : err}` };
-		}
-	},
-};
+// openUrlTool moved to chrome-tools.ts (imported via browser-tools.js below)
 
 // --- macOS system tools ---
 
