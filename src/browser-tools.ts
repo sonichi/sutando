@@ -65,6 +65,18 @@ export const scrollTool: ToolDefinition = {
 			writeFileSync(tmpScroll, `tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/"/g, '\\"')}"`);
 			execSync(`osascript ${tmpScroll}`, { timeout: 5_000 });
 			try { unlinkSync(tmpScroll); } catch {}
+			// Also send keyboard scroll — Chrome may skip visual repaints during
+			// Zoom screen share even though JS scrollBy updates scrollY. Keyboard
+			// input forces a repaint through the OS input pipeline.
+			if (!target) {
+				const keyMap: Record<string, string> = { down: 'page down', up: 'page up', top: 'home', bottom: 'end' };
+				const key = keyMap[direction];
+				if (key) {
+					try {
+						execSync(`osascript -e 'tell application "Google Chrome" to activate' -e 'delay 0.1' -e 'tell application "System Events" to key code ${direction === 'down' ? '121' : direction === 'up' ? '116' : direction === 'top' ? '115 using command down' : '119 using command down'}'`, { timeout: 3_000 });
+					} catch { /* keyboard fallback is best-effort */ }
+				}
+			}
 			console.log(`${ts()} [Scroll] ${direction}`);
 			return { status: 'scrolled', direction };
 		} catch (err) {
