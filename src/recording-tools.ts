@@ -304,12 +304,13 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			// Scroll to top
 			execSync(`osascript -e 'tell application "System Events" to key code 126 using command down'`, { timeout: 5_000 });
 
-			// Start recording + first describe_screen in parallel
-			try { unlinkSync(LIVE_TRANSCRIPT_SRT_PATH); } catch {}
-			execSync('python3 skills/screen-record/scripts/record.py start', { timeout: 10_000 });
+			// Capture + describe FIRST, then start recording.
+			// This way the vision API latency doesn't eat into recording time.
 			const captureRes = await fetch('http://localhost:7845/capture');
 			const captureData = await captureRes.json() as { status: string; path?: string };
 			const firstDesc = captureData.path ? await describeScreenshot(captureData.path) : '';
+			try { unlinkSync(LIVE_TRANSCRIPT_SRT_PATH); } catch {}
+			execSync('python3 skills/screen-record/scripts/record.py start', { timeout: 10_000 });
 			// Set subtitle baseline — pick whichever transcript was updated more recently.
 			// Voice agent writes to -voice.txt; phone conversation-server writes to -CA{sid}.txt via symlink.
 			const voiceTranscript = '/tmp/sutando-live-transcript-voice.txt';
