@@ -437,8 +437,12 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			const captureData = await captureRes.json() as { status: string; path?: string };
 			const firstDesc = captureData.path ? await describeScreenshot(captureData.path) : '';
 			// Set subtitle baseline AFTER first description — so subtitles align with audio.
-			// Resolve the symlink NOW so a concurrent call (Zoom join) can't overwrite it.
-			try { liveTranscriptResolvedPath = readlinkSync(LIVE_TRANSCRIPT_SYMLINK); } catch { liveTranscriptResolvedPath = ''; }
+			// Use voice transcript directly — the symlink may point to a phone call transcript.
+			const voiceTranscript = '/tmp/sutando-live-transcript-voice.txt';
+			liveTranscriptResolvedPath = existsSync(voiceTranscript) ? voiceTranscript : '';
+			if (!liveTranscriptResolvedPath) {
+				try { liveTranscriptResolvedPath = readlinkSync(LIVE_TRANSCRIPT_SYMLINK); } catch { liveTranscriptResolvedPath = ''; }
+			}
 			liveTranscriptRecordingStart = Date.now();
 			liveTranscriptBaselineLines = countTranscriptLines();
 
