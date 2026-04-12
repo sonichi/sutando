@@ -297,7 +297,7 @@ export const pressKeyTool: ToolDefinition = {
 		'Pass app to target a specific application (e.g. "QuickTime Player" to pause a video, "Safari" to close a tab). ' +
 		'Use for: "press enter", "press escape", "press tab", "send the message" (Enter), ' +
 		'"close the dialog" (Escape), "select all" (Cmd+A), "pause the video" (space, app=QuickTime Player), ' +
-		'"close the video" (Cmd+Q, app=QuickTime Player). Instant — do NOT use work for simple keystrokes.',
+		'"close the video" (Cmd+W, app=QuickTime Player). Instant — do NOT use work for simple keystrokes. NEVER use Cmd+Q to close QuickTime — use Cmd+W to close the window only.',
 	parameters: z.object({
 		key: z.string().describe('Key to press: enter, escape, tab, delete, space, up, down, left, right, or a letter'),
 		modifiers: z.array(z.enum(['command', 'shift', 'control', 'option'])).optional().describe('Modifier keys'),
