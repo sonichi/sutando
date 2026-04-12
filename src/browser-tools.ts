@@ -473,12 +473,15 @@ export const scrollAndDescribeTool: ToolDefinition = {
 					const raw = execSync('python3 skills/screen-record/scripts/record.py stop', { timeout: 10_000 }).toString().trim();
 					stopResult = JSON.parse(raw);
 				} catch {}
-				// Wait for narrated.mov to exist (narration-tee stop + mux ~2s after record.py stop)
-				// Wait up to 10s (5x2s) for narration-tee to mux narrated.mov.
-				// 8s was too short — narration mux takes ~3s after record.py stop,
-				// and the subtitled burn was missing because the file wasn't ready.
+				// Explicitly flush narration-tee (it normally triggers on next audio chunk,
+				// but after recording stops Gemini may not send audio for seconds).
+				try {
+					const { cleanup: flushNarrationTee } = await import('../skills/screen-record/scripts/narration-tee.js');
+					flushNarrationTee();
+				} catch {}
+				// Wait for narrated.mov to exist (narration-tee mux ~2-6s after flush)
 				const narrated = stopResult.path ? stopResult.path.replace('.mov', '-narrated.mov') : '';
-				for (let w = 0; w < 5; w++) {
+				for (let w = 0; w < 8; w++) {
 					if (narrated && isReadableFile(narrated)) break;
 					await new Promise(r => setTimeout(r, 2000));
 				}
