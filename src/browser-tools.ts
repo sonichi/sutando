@@ -49,9 +49,10 @@ export const scrollTool: ToolDefinition = {
 				: '';
 			// Use Chrome's JavaScript scroll. If target specified, find matching scrollable element.
 			// Otherwise find the WIDEST scrollable container (main content over sidebars).
+			// Use single quotes in JS to avoid double-quote escaping issues inside AppleScript
 			const scrollFn = (cmd: string) => targetSelector
-				? `(function(){var sel="${targetSelector}";var e=null;document.querySelectorAll(sel).forEach(function(el){if(!e&&el.scrollHeight-el.clientHeight>50)e=el});if(!e){var best=null,bh=0;document.querySelectorAll("*").forEach(function(el){var d=el.scrollHeight-el.clientHeight;if(d>50&&el.clientHeight>100&&el.getBoundingClientRect().width<500){if(d>bh){best=el;bh=d}}});e=best}if(e){${cmd}}})()`
-				: `(function(){var best=document.scrollingElement||document.documentElement,bw=0;document.querySelectorAll("*").forEach(function(el){var d=el.scrollHeight-el.clientHeight;if(d>50&&el.clientHeight>200){var w=el.getBoundingClientRect().width;if(w>bw){best=el;bw=w}}});var e=best;${cmd}})()`;
+				? `(function(){var sel='${targetSelector}';var e=null;document.querySelectorAll(sel).forEach(function(el){if(!e&&el.scrollHeight-el.clientHeight>50)e=el});if(!e){var best=null,bh=0;document.querySelectorAll('*').forEach(function(el){var d=el.scrollHeight-el.clientHeight;if(d>50&&el.clientHeight>100&&el.getBoundingClientRect().width<500){if(d>bh){best=el;bh=d}}});e=best}if(e){${cmd}}})()`
+				: `(function(){var best=document.scrollingElement||document.documentElement,bw=0;document.querySelectorAll('*').forEach(function(el){var d=el.scrollHeight-el.clientHeight;if(d>50&&el.clientHeight>200){var w=el.getBoundingClientRect().width;if(w>bw){best=el;bw=w}}});var e=best;${cmd}})()`;
 			let js: string;
 			if (direction === 'top') {
 				js = scrollFn('e.scrollTop=0');
