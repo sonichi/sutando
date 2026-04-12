@@ -218,10 +218,15 @@ async function describeScreenshot(imagePath: string, previousDescs: string[] = [
 		// Issue #189: when continuing a narration, the vision model should build
 		// on what was already said instead of re-introducing the page every
 		// time. First call: introduce with the heading. Later calls: flow on.
-		// Vision model's job: describe what's visible. Narration continuity is handled
-		// by the live model (Gemini) which has full conversation context.
-		const guard = 'ONLY describe what you SEE in the image. Do NOT use external knowledge, search the web, or add facts not visible on screen.';
-		const prompt = `Describe the main content visible on screen in 1 sentence (max 20 words). Focus on text content, headings, and sections — not browser chrome. ${guard}`;
+		// Vision model describes content. First call introduces; follow-ups focus on NEW content only.
+		const guard = 'ONLY describe what you SEE in the image. Do NOT use external knowledge.';
+		let prompt: string;
+		if (previousDescs.length === 0) {
+			prompt = `Describe what is on screen in 1 sentence (max 20 words). Name the page/heading. ${guard}`;
+		} else {
+			const alreadyCovered = previousDescs.slice(-2).join(' ');
+			prompt = `Already described: "${alreadyCovered}". What NEW section headings or content are now visible that were NOT in the previous descriptions? Ignore anything already mentioned. 1 sentence, max 15 words, only new content. If nothing new, say "same content". ${guard}`;
+		}
 		const res = await fetch(
 			`https://generativelanguage.googleapis.com/v1beta/models/${VISION_MODEL}:generateContent?key=${apiKey}`,
 			{
