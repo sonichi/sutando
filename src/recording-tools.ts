@@ -667,14 +667,15 @@ export function startRecordingNarration(session: any): void {
 	const previousDescs: string[] = []; // track all narrated descriptions
 	const startTime = Date.now();
 	const STOP_PUSHING_BEFORE_END_MS = 8000; // stop pushing 8s before recording ends
+	let waitingForSpeech = false; // true while Gemini is speaking a description
+	let stopped = false;
 
 	const pushDescription = async () => {
-		if (!existsSync('/tmp/sutando-screen-record.pid')) return;
-		// Stop pushing near the end so Gemini finishes naturally
+		if (stopped || !existsSync('/tmp/sutando-screen-record.pid')) return;
 		const elapsed = Date.now() - startTime;
 		if (elapsed > durationMs - STOP_PUSHING_BEFORE_END_MS) {
 			console.log(`${ts()} [Recording] near end — stopped pushing`);
-			clearInterval(descTimer);
+			stopped = true;
 			try {
 				injectText(session, '[System: Recording ending soon. Finish your current sentence and stop.]');
 			} catch {}
@@ -686,6 +687,8 @@ export function startRecordingNarration(session: any): void {
 			const desc = await describeScreenshot(path, previousDescs);
 			if (!desc || desc === lastDesc) {
 				if (desc === lastDesc) console.log(`${ts()} [Recording] skipped duplicate`);
+				// Even if duplicate, schedule next push after a short delay
+				if (!stopped) setTimeout(pushDescription, 3000);
 				return;
 			}
 			lastDesc = desc;
@@ -693,26 +696,37 @@ export function startRecordingNarration(session: any): void {
 			if (!existsSync('/tmp/sutando-screen-record.pid')) return;
 			const remaining = Math.round((durationMs - (Date.now() - startTime)) / 1000);
 			const alreadySaid = previousDescs.slice(0, -1).map((d, i) => `${i + 1}. ${d.slice(0, 40)}`).join('; ');
+			waitingForSpeech = true;
 			injectText(session, `[System: ${remaining}s left. Already narrated: ${alreadySaid || 'nothing yet'}. Now narrate this NEW content only (1 short sentence, no repeats): "${desc}"]`);
 			console.log(`${ts()} [Recording] pushed: ${desc.slice(0, 60)}...`);
+			// Next push triggered by turn.end (speech finished), not a timer
 		} catch (err) {
 			console.log(`${ts()} [Recording] push error: ${err}`);
+			if (!stopped) setTimeout(pushDescription, 3000); // retry on error
 		}
 	};
 
-	// Early first push + interval
-	setTimeout(pushDescription, 5000);
-	const descTimer = setInterval(pushDescription, descIntervalMs);
+	// Listen for turn.end — when Gemini finishes speaking, scroll + push next description
+	const onTurnEnd = () => {
+		if (!narrationActive || stopped || !waitingForSpeech) return;
+		waitingForSpeech = false;
+		// Scroll one viewport worth, then push next description
+		try { scrollDown(900); } catch {}
+		console.log(`${ts()} [Recording] speech done — scrolled + pushing next`);
+		setTimeout(pushDescription, 1500); // brief pause before next capture
+	};
+	session.eventBus?.subscribe?.('turn.end', onTurnEnd);
 
-	// Timer-based stop — uses known duration, no polling
-	// Stop pushing 8s before end (already handled in pushDescription)
-	// At exactly durationMs: clear timers, send "recording complete"
+	// First push after 5s (initial description already spoken by Gemini from tool return)
+	setTimeout(pushDescription, 5000);
+
+	// Timer-based stop at durationMs
 	setTimeout(() => {
-		clearInterval(descTimer);
+		stopped = true;
 		narrationActive = false;
 		console.log(`${ts()} [Recording] timer fired — sending stop`);
 		try {
 			injectText(session, '[System: Recording just ended. Say "The recording is complete." immediately.]');
 		} catch {}
-	}, durationMs + 1000); // +1s buffer for auto-stop to finish
+	}, durationMs + 1000);
 }
