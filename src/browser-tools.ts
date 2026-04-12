@@ -398,11 +398,12 @@ function scrollDown(pixels: number = 600) {
 	writeFileSync(tmpScroll, `tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/"/g, '\\"')}"`);
 	execSync(`osascript ${tmpScroll}`, { timeout: 5_000 });
 	try { unlinkSync(tmpScroll); } catch {}
-	// Keyboard fallback: Chrome skips visual repaints during Zoom screen share.
-	// Page Down forces a repaint through the OS input pipeline.
+	// Repaint trigger: Chrome defers visual repaints during Zoom screen share.
+	// CGEvent scroll wheel events force a repaint through the OS input pipeline
+	// without stealing focus (unlike keyboard fallback which breaks narration).
 	try {
-		execSync(`osascript -e 'tell application "Google Chrome" to activate' -e 'delay 0.1' -e 'tell application "System Events" to key code 121'`, { timeout: 3_000 });
-	} catch { /* best-effort */ }
+		execSync(`swift src/scroll-wheel.swift 1`, { timeout: 3_000 });
+	} catch { /* best-effort — scroll already happened via JS */ }
 }
 
 let demoState: 'idle' | 'recording' | 'done' = 'idle';
