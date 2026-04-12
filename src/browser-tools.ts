@@ -181,6 +181,25 @@ end tell`;
 	},
 };
 
+// --- Close current Chrome tab ---
+
+export const closeTabTool: ToolDefinition = {
+	name: 'close_tab',
+	description:
+		'Close the current Chrome tab (the active/frontmost tab). Use for: "close it", "close this tab", "close the tab", "close the page". Note: this is for closing browser tabs, NOT for ending the call (use hang_up for that) and NOT for closing video (use close_video).',
+	parameters: z.object({}),
+	execution: 'inline',
+	async execute() {
+		try {
+			execSync(`osascript -e 'tell application "Google Chrome" to tell front window to close active tab'`, { timeout: 5_000 });
+			console.log(`${ts()} [CloseTab] closed active tab`);
+			return { status: 'closed' };
+		} catch (err) {
+			return { error: `Failed to close tab: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
 // --- Open URL ---
 
 export const openUrlTool: ToolDefinition = {

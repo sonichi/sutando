@@ -14,8 +14,8 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
 // Re-export recording/screen/browser tools from browser-tools
-export { describeScreenTool, clickTool, scrollAndDescribeTool, openVideoTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, scrollTool } from './browser-tools.js';
-import { describeScreenTool, clickTool, scrollAndDescribeTool, openVideoTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, scrollTool } from './browser-tools.js';
+export { describeScreenTool, clickTool, scrollAndDescribeTool, openVideoTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool } from './browser-tools.js';
+import { describeScreenTool, clickTool, scrollAndDescribeTool, openVideoTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool } from './browser-tools.js';
 
 // --- Keyboard tool ---
 
@@ -1351,7 +1351,7 @@ export const deleteNoteTool: ToolDefinition = {
 // recording workflow (narration + REC indicator + subtitles). Registering screenRecordTool
 // caused Gemini to pick the bare recorder over scroll_and_describe, breaking narration.
 export const inlineTools = [
-	pressKeyTool, scrollTool, switchTabTool, openUrlTool,
+	pressKeyTool, scrollTool, switchTabTool, closeTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
 	volumeTool, brightnessTool, clipboardTool,
 	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, summonTool, dismissTool,
@@ -1367,7 +1367,7 @@ export const anyCallerTools = [
 /** Owner-only tools (require isOwner) */
 export const ownerOnlyTools = [
 	volumeTool, brightnessTool,
-	pressKeyTool, scrollTool, switchTabTool, openUrlTool,
+	pressKeyTool, scrollTool, switchTabTool, closeTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
 	clipboardTool, cancelTaskTool, toggleTasksTool, summonTool, dismissTool,
 	joinZoomTool, joinGmeetTool, callContactTool, slideControlTool, fullscreenTool,
