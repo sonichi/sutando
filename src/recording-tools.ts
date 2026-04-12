@@ -7,7 +7,7 @@ import { execSync, execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync, readFileSync, readlinkSync, existsSync, statSync } from 'node:fs';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
-import { demoStateRef } from './recording-state.js';
+import { demoStateRef, narrationSpeakingRef } from './recording-state.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -670,6 +670,11 @@ export function startRecordingNarration(session: any): void {
 
 	const pushDescription = async () => {
 		if (!existsSync('/tmp/sutando-screen-record.pid')) return;
+		// Wait for Gemini to finish speaking before pushing next description
+		if (narrationSpeakingRef.value) {
+			console.log(`${ts()} [Recording] skipped push — Gemini still speaking`);
+			return;
+		}
 		const elapsed = Date.now() - startTime;
 		if (elapsed > durationMs - STOP_PUSHING_BEFORE_END_MS) {
 			console.log(`${ts()} [Recording] near end — stopped pushing`);
@@ -692,6 +697,7 @@ export function startRecordingNarration(session: any): void {
 			if (!existsSync('/tmp/sutando-screen-record.pid')) return;
 			const remaining = Math.round((durationMs - (Date.now() - startTime)) / 1000);
 			const alreadySaid = previousDescs.slice(0, -1).map((d, i) => `${i + 1}. ${d.slice(0, 40)}`).join('; ');
+			narrationSpeakingRef.value = true; // will be cleared by voice-agent on turn complete
 			injectText(session, `[System: ${remaining}s left. Already narrated: ${alreadySaid || 'nothing yet'}. Now narrate this NEW content only (1 short sentence, no repeats): "${desc}"]`);
 			console.log(`${ts()} [Recording] pushed: ${desc.slice(0, 60)}...`);
 		} catch (err) {
@@ -699,12 +705,8 @@ export function startRecordingNarration(session: any): void {
 		}
 	};
 
-	// Fixed interval — minimum 8s so Gemini has time to speak each description
-	const MIN_DESC_INTERVAL = 8000;
-	const effectiveInterval = Math.max(descIntervalMs, MIN_DESC_INTERVAL);
-
 	setTimeout(pushDescription, 5000);
-	const descTimer = setInterval(pushDescription, effectiveInterval);
+	const descTimer = setInterval(pushDescription, descIntervalMs);
 
 	setTimeout(() => {
 		clearInterval(descTimer);

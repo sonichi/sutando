@@ -4,3 +4,6 @@
  * to coordinate the demo/recording lifecycle.
  */
 export const demoStateRef: { value: 'idle' | 'recording' | 'done' } = { value: 'idle' };
+
+/** True while Gemini is speaking a narration description. Cleared by voice-agent on turn complete. */
+export const narrationSpeakingRef: { value: boolean } = { value: false };

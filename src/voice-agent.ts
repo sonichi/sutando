@@ -486,6 +486,14 @@ const mainAgent: MainAgent = {
 	// or apology loops) doesn't match. Real farewell responses to
 	// a user "bye" are almost always a short standalone line.
 	onTurnCompleted: async (ctx, _transcript) => {
+		// Clear narration speaking flag so next description can be pushed
+		try {
+			const { narrationSpeakingRef } = await import('./recording-state.js');
+			if (narrationSpeakingRef.value) {
+				narrationSpeakingRef.value = false;
+				console.log(`${ts()} [Recording] speech done — ready for next description`);
+			}
+		} catch {}
 		try {
 			// getRecentTurns returns conversationContext.items directly —
 			// items have shape {role: 'assistant'|'user'|..., content: string}.
