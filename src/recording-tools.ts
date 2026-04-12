@@ -306,8 +306,11 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			if (demoStateRef.value === 'done') demoStateRef.value = 'idle';
 			demoStateRef.value = 'recording';
 
-			// Scroll to top
-			execSync(`osascript -e 'tell application "System Events" to key code 126 using command down'`, { timeout: 5_000 });
+			// Scroll to top and wait for it to take effect
+			execSync(`osascript -e 'tell application "Google Chrome" to activate' -e 'delay 0.3' -e 'tell application "System Events" to key code 126 using command down'`, { timeout: 5_000 });
+			// Also use JS scroll as backup (keyboard may not work if Chrome isn't focused)
+			try { execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "window.scrollTo(0,0)"'`, { timeout: 3_000 }); } catch {}
+			await new Promise(r => setTimeout(r, 500)); // let scroll settle
 
 			// Capture + describe FIRST, then start recording.
 			// This way the vision API latency doesn't eat into recording time.
