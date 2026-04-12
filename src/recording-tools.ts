@@ -383,6 +383,15 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			}, duration_seconds * 1000);
 
 			console.log(`${ts()} [ScrollAndDescribe] recording started with first desc`);
+			// Start narration controller directly (don't rely on eventBus hook)
+			if (_narrationSession) {
+				setTimeout(() => {
+					if (isRecordingActive()) {
+						console.log(`${ts()} [ScrollAndDescribe] starting narration controller`);
+						startRecordingNarration(_narrationSession);
+					}
+				}, 4000);
+			}
 			return {
 				status: 'recording',
 				first_description: firstDesc,
@@ -614,10 +623,14 @@ export const screenRecordTool: ToolDefinition = {
  * Set up all recording hooks on a voice session.
  * Call once per session — handles tool triggers, reconnect, and cleanup automatically.
  */
+let _narrationSession: any = null;
+
 export function setupRecordingHooks(session: any): void {
+	_narrationSession = session;
 	// Start narration when scroll_and_describe is called
 	session.eventBus?.subscribe?.('tool.call', (e: any) => {
 		if (e?.toolName === 'scroll_and_describe') {
+			console.log(`${ts()} [RecordingHooks] tool.call event for scroll_and_describe`);
 			setTimeout(() => {
 				if (isRecordingActive()) startRecordingNarration(session);
 			}, 4000);
