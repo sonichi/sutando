@@ -624,6 +624,15 @@ async function main() {
 		console.log(`${ts()} [NarrationTee] not available: ${e instanceof Error ? e.message : e}`);
 	}
 
+	// Wire recording hooks — enables description push during scroll_and_describe
+	try {
+		const { setupRecordingHooks } = await import('./recording-tools.js');
+		setupRecordingHooks(session);
+		console.log(`${ts()} [RecordingHooks] wired into voice agent`);
+	} catch (e) {
+		console.log(`${ts()} [RecordingHooks] not available: ${e instanceof Error ? e.message : e}`);
+	}
+
 	// Watch for results from the Claude Code session and deliver to user
 	// Only delivers when a client is connected — otherwise keeps files queued
 	// Watch for context drops (keyboard shortcut)
