@@ -706,7 +706,7 @@ export function startRecordingNarration(session: any): void {
 			const remaining = Math.round((durationMs - (Date.now() - startTime)) / 1000);
 			const alreadySaid = previousDescs.slice(0, -1).map((d, i) => `${i + 1}. ${d}`).join('\n');
 			// narrationSpeakingRef stays true — cleared by voice-agent onTurnCompleted
-			injectText(session, `[System: Recording narration — ${remaining}s left.\n\nYou already said:\n${alreadySaid || '(nothing yet)'}\n\nNew content on screen: "${desc}"\n\nNarrate ONLY what's NEW — 1-2 short sentences continuing naturally from your previous narration. Do NOT repeat anything above.]`);
+			injectText(session, `[System: ${remaining}s left. You said: ${alreadySaid || 'nothing yet'}. NEW: "${desc}" — say ONE short sentence about what's new. Be brief, ~5 seconds of speech max.]`);
 			console.log(`${ts()} [Recording] pushed: ${desc.slice(0, 60)}...`);
 		} catch (err) {
 			narrationSpeakingRef.value = false;
