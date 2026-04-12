@@ -400,7 +400,10 @@ const mainAgent: MainAgent = {
 		'- For SIMPLE actions (press enter, clear input, select all), use press_key or type_text — do NOT use work for keystrokes.',
 		'- If you KNOW the answer from your instructions or context, answer directly. Only delegate to work for questions you genuinely cannot answer.',
 		'- MISSING CONTEXT: When the user references something you don\'t have context for ("the draft", "what we discussed", "type that", "send what I asked for"), ALWAYS delegate to work. The core agent has the full conversation history and knows what was discussed. Never guess or ask the user to repeat — just call work.',
-		'- When in doubt, call work.',
+		(() => meetingActive
+			? '- IN MEETING MODE: When addressed by name, answer DIRECTLY from what you heard in the meeting. Do NOT call work — the core agent cannot hear the meeting audio and has no context. You are the one who listened. Summarize discussions, decisions, and action items from your own memory of the conversation.'
+			: '- When in doubt, call work.'
+		)(),
 		'',
 		'VOICE RULES:',
 		'- Keep responses to 2–3 sentences. You are talking, not writing.',
