@@ -672,6 +672,8 @@ export function startRecordingNarration(session: any): void {
 	// Set speaking flag — first description is spoken from tool return
 	narrationSpeakingRef.value = true;
 	nextDescRef.value = null;
+	let lastPushTime = Date.now();
+	const MAX_SPEAKING_TIME = 8000; // force-clear after 8s if onTurnCompleted hasn't fired
 
 	// Pre-capture: while Gemini speaks, capture + describe the NEXT screenshot.
 	// This runs after each push, so when Gemini finishes we can inject immediately.
@@ -701,6 +703,11 @@ export function startRecordingNarration(session: any): void {
 	// Called by interval — if pre-captured desc is ready and Gemini finished speaking, inject it
 	const tryInject = () => {
 		if (!existsSync('/tmp/sutando-screen-record.pid')) return;
+		// Force-clear speaking flag after MAX_SPEAKING_TIME to prevent deadlock
+		if (narrationSpeakingRef.value && (Date.now() - lastPushTime) > MAX_SPEAKING_TIME) {
+			console.log(`${ts()} [Recording] force-clearing speaking flag (${MAX_SPEAKING_TIME}ms timeout)`);
+			narrationSpeakingRef.value = false;
+		}
 		if (narrationSpeakingRef.value) return; // still speaking
 		if (!nextDescRef.value) {
 			// No pre-capture ready — start one
@@ -724,7 +731,8 @@ export function startRecordingNarration(session: any): void {
 		const remaining = Math.round((durationMs - (Date.now() - startTime)) / 1000);
 		const lastSaid = lastSpokenRef.value || '(first description)';
 		narrationSpeakingRef.value = true;
-		scrollPausedRef.value = false; // resume scroll
+		lastPushTime = Date.now();
+		scrollPausedRef.value = false; // resume scroll when Gemini starts speaking
 		injectText(session, `[System: ${remaining}s left. You just said: "${lastSaid}" — Continue naturally. NEW on screen: "${desc}" — ONE short sentence, ~5 seconds. Pick up where you left off.]`);
 		console.log(`${ts()} [Recording] pushed: ${desc.slice(0, 60)}...`);
 		// Start pre-capturing next while Gemini speaks this one
