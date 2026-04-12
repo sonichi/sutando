@@ -51,6 +51,22 @@ def _hide_indicator():
     )
 
 
+def _has_audio_device():
+    """Check if avfoundation reports any audio device. Headless Macs (no mic) have none."""
+    try:
+        result = subprocess.run(
+            ["/opt/homebrew/bin/ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
+            capture_output=True, text=True, timeout=5,
+        )
+        out = result.stderr
+        if "AVFoundation audio devices:" in out:
+            audio_section = out.split("AVFoundation audio devices:", 1)[1]
+            return "[0]" in audio_section.split("Error", 1)[0]
+        return False
+    except Exception:
+        return False
+
+
 def start():
     if os.path.exists(PID_FILE):
         with open(PID_FILE) as f:
@@ -64,10 +80,19 @@ def start():
 
     path = f"/tmp/sutando-recording-{int(time.time())}.mov"
 
+    # Detect audio device — headless Macs (no mic) have none, ffmpeg fails if we ask for audio.
+    screen = os.environ.get('RECORD_SCREEN', 'Capture screen 0')
+    audio_env = os.environ.get('RECORD_AUDIO', '')
+    if audio_env:
+        # Explicit override: RECORD_AUDIO=none for video-only, or specify a device
+        input_spec = screen if audio_env == 'none' else f"{screen}:{audio_env}"
+    else:
+        input_spec = f"{screen}:default" if _has_audio_device() else screen
+
     # Use ffmpeg instead of screencapture -v (which requires TTY)
     proc = subprocess.Popen(
         ["/opt/homebrew/bin/ffmpeg", "-f", "avfoundation",
-         "-i", f"{os.environ.get('RECORD_SCREEN', 'Capture screen 0')}:{os.environ.get('RECORD_AUDIO', 'default')}",
+         "-i", input_spec,
          "-r", "15", "-pix_fmt", "yuv420p", "-y", path],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
