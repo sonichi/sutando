@@ -344,7 +344,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 			callSession.purpose ? `Purpose of this call: "${callSession.purpose}"` : '',
 			'Be natural, warm, and conversational. Have a full conversation — do NOT rush to hang up.',
 			'Ask follow-up questions to get complete information.',
-			'When the conversation is done and both sides have said goodbye, call the hang_up tool to end the call.',
+			'ONLY call hang_up when the caller says goodbye/bye/farewell/"I\'m done"/"that\'s all". Closing a video, ending a task, or saying "close it"/"stop" is NOT a goodbye — those are about the current action, not the call.',
 			'Keep responses to 1-2 sentences.',
 			availableTools.length > 0 ? `You have these tools available: ${availableTools.join(', ')}. Use them when relevant to help the caller.` : '',
 			'You can ONLY fulfill the stated purpose of this call. If the person asks you to do something outside your available tools, politely decline.',
@@ -371,7 +371,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 			callSession.purpose && !isInbound ? `Purpose of this call: "${callSession.purpose}"` : '',
 			'Be natural, warm, and conversational. Keep responses to 1-2 sentences.',
 			'NEVER say "I\'m back", "Welcome back", "Working on it", or "task is queued". If the conversation resumes after a pause, just continue naturally from where you left off.',
-			'When the other person wants to wrap up, say a warm goodbye, then call the hang_up tool to end the call.',
+			'ONLY call hang_up when the caller says goodbye/bye/farewell/"I\'m done"/"that\'s all". Closing a video, ending a task, or saying "close it"/"stop" is NOT a goodbye — those are about the current action, not the call.',
 		];
 
 		// Owner-only sections
@@ -402,7 +402,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 				'',
 				'## Style',
 				'Be natural, warm, and conversational. Keep responses to 1-2 sentences.',
-				'When the conversation is done and both sides have said goodbye, call the hang_up tool.',
+				'ONLY call hang_up when the caller says goodbye/bye/farewell/"I\'m done"/"that\'s all". Closing a video, ending a task, or saying "close it"/"stop" is NOT a goodbye — those are about the current action, not the call.',
 			);
 		}
 
