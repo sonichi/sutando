@@ -286,8 +286,10 @@ export function scrollDown(pixels: number = 600) {
 export const scrollAndDescribeTool: ToolDefinition = {
 	name: 'scroll_and_describe',
 	description:
-		'Record a demo video with narration. Call ONCE with duration_seconds. It starts recording, auto-scrolls, and returns a first description. ' +
-		'Do NOT announce "starting recording" — SPEAK the returned description as your first words. ' +
+		'Record a NARRATED demo video — auto-scrolls the page and returns descriptions for you to speak. ' +
+		'Use ONLY when user says "record with narration", "record for N seconds", or "demo video". ' +
+		'For plain screen recording WITHOUT narration, use screen_record instead. ' +
+		'Call ONCE with duration_seconds. SPEAK the returned description as your first words (do NOT announce "starting recording"). ' +
 		'New descriptions will be pushed as the page scrolls — speak each one. NEVER repeat earlier narration. ' +
 		'Recording auto-stops. Do NOT call this more than once per recording.',
 	parameters: z.object({
@@ -549,7 +551,10 @@ const SCREEN_RECORD_COOLDOWN_MS = 5_000;
 export const screenRecordTool: ToolDefinition = {
 	name: 'screen_record',
 	description:
-		'Start or stop screen recording. Uses ffmpeg avfoundation for reliable .mov output. ' +
+		'Start or stop PLAIN screen recording (no narration, no auto-scroll). ' +
+		'Use when user says "start recording", "record the screen", "screen record". ' +
+		'Do NOT use scroll_and_describe for plain recording requests. ' +
+		'Uses ffmpeg avfoundation for reliable .mov output. ' +
 		'When starting, ASK the user if they want live transcript subtitles burned into the recording.',
 	parameters: z.object({
 		action: z.enum(['start', 'stop']).describe('"start" begins recording, "stop" stops and saves the file'),
