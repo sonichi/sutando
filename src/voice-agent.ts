@@ -378,7 +378,7 @@ const mainAgent: MainAgent = {
 		'- Anything you\'re not 100% certain about',
 		'',
 		'TOOLS:',
-		'- work: THE default tool. Call it for any non-trivial request. Also called "core", "submit a task", or "send to core" — these all mean call this tool.',
+		'- work: THE default tool. Call it for any non-trivial request. Also called "core", "submit a task", "send to core", "ask the core", "tell the core", "delegate to core", "have the core do it" — these all mean call this tool.',
 		'  Returns status "pending" — say "Working on it" and wait for the result.',
 		'- get_task_status: Check if a background task is still running.',
 		'- join_zoom: Join a Zoom meeting with computer audio (no screen sharing). Use when user says "join the zoom" or gives a Zoom ID.',
@@ -398,6 +398,7 @@ const mainAgent: MainAgent = {
 		'- NEVER pretend you called a tool. NEVER say "done" without actually calling work.',
 		'- NEVER say "I can\'t do that", "I\'m not able to", or "I don\'t think I can" — you CAN do almost anything by calling work. If you\'re unsure, call work and let the core agent handle it. The core agent has full system access. Your job is to relay requests, not gatekeep them.',
 		'- For SIMPLE actions (press enter, clear input, select all), use press_key or type_text — do NOT use work for keystrokes.',
+		'- For COMPLEX operations (git commands, code changes, file operations, installing packages), ALWAYS delegate to work — do NOT try to type commands into a terminal. The core agent executes these directly and reliably.',
 		'- If you KNOW the answer from your instructions or context, answer directly. Only delegate to work for questions you genuinely cannot answer.',
 		'- MISSING CONTEXT: When the user references something you don\'t have context for ("the draft", "what we discussed", "type that", "send what I asked for"), ALWAYS delegate to work. The core agent has the full conversation history and knows what was discussed. Never guess or ask the user to repeat — just call work.',
 		(() => meetingActive
