@@ -158,108 +158,8 @@ export const summonTool: ToolDefinition = {
 				console.log(`${ts()} [Summon] Phone server not available — screen share only`);
 			}
 
-			// Handle audio dialogs
-			await new Promise(r => setTimeout(r, 1000));
-			if (dialIn) {
-				// Phone handles audio — close the "Join audio" window
-				try {
-					execSync(`osascript -e '
-						tell application "zoom.us" to activate
-						delay 0.5
-						tell application "System Events"
-							tell process "zoom.us"
-								repeat with w in windows
-									if name of w is "Join audio" then
-										click button 1 of w
-										return "closed Join audio"
-									end if
-								end repeat
-							end tell
-						end tell
-					'`, { timeout: 5_000 });
-					console.log(`${ts()} [Summon] Join audio window closed (phone handles audio)`);
-				} catch { console.log(`${ts()} [Summon] No Join audio window to close`); }
-			} else {
-				// No phone dial-in — handle audio dialog
-				// Detect if machine has audio input (mic)
-				const hasMic = (() => { try { return execSync(`system_profiler SPAudioDataType 2>/dev/null | grep -c "Input"`, { timeout: 5_000 }).toString().trim() !== '0'; } catch { return false; } })();
-				console.log(`${ts()} [Summon] Audio input detected: ${hasMic}`);
-
-				// Handle the audio dialogs using cliclick for reliable clicking
-				// Zoom uses web-based UI that AppleScript can't access by button name
-				for (let attempt = 0; attempt < 3; attempt++) {
-					await new Promise(r => setTimeout(r, 1500));
-					try {
-						// Get the audio dialog window position
-						const coords = execSync(`osascript -e '
-							tell application "System Events"
-								tell process "zoom.us"
-									repeat with w in windows
-										set wName to name of w
-										if wName contains "audio" or wName contains "Audio" then
-											set wPos to position of w
-											set wSize to size of w
-											return (item 1 of wPos as text) & "," & (item 2 of wPos as text) & "," & (item 1 of wSize as text) & "," & (item 2 of wSize as text)
-										end if
-									end repeat
-								end tell
-							end tell
-							return "none"
-						'`, { timeout: 5_000 }).toString().trim();
-
-						if (coords === 'none') {
-							console.log(`${ts()} [Summon] No audio dialog found (attempt ${attempt + 1})`);
-							break;
-						}
-
-						const [x0, y0, w, h] = coords.split(',').map(Number);
-						if (hasMic) {
-							// Click "Join with Computer Audio" — centered blue button, ~50% across, ~55% down
-							const bx = x0 + Math.round(w * 0.5);
-							const by = y0 + Math.round(h * 0.55);
-							execSync(`cliclick c:${bx},${by}`, { timeout: 3_000 });
-							console.log(`${ts()} [Summon] Clicked Join with Computer Audio at (${bx},${by})`);
-						} else {
-							// No mic — first click dismisses to "Continue without audio?" dialog
-							// Then click "Continue" (left button, ~40% across, ~75% down)
-							const bx = x0 + Math.round(w * 0.5);
-							const by = y0 + Math.round(h * 0.55);
-							execSync(`cliclick c:${bx},${by}`, { timeout: 3_000 });
-							console.log(`${ts()} [Summon] Clicked audio dialog at (${bx},${by}), checking for confirmation...`);
-							await new Promise(r => setTimeout(r, 1000));
-							// Check if "continue without audio" confirmation appeared
-							try {
-								const coords2 = execSync(`osascript -e '
-									tell application "System Events"
-										tell process "zoom.us"
-											repeat with w in windows
-												set wName to name of w
-												if wName contains "audio" or wName contains "Audio" then
-													set wPos to position of w
-													set wSize to size of w
-													return (item 1 of wPos as text) & "," & (item 2 of wPos as text) & "," & (item 1 of wSize as text) & "," & (item 2 of wSize as text)
-												end if
-											end repeat
-										end tell
-									end tell
-									return "none"
-								'`, { timeout: 5_000 }).toString().trim();
-								if (coords2 !== 'none') {
-									const [x2, y2, w2, h2] = coords2.split(',').map(Number);
-									// "Continue" button is left of center, ~38% across, ~72% down
-									const cx = x2 + Math.round(w2 * 0.38);
-									const cy = y2 + Math.round(h2 * 0.72);
-									execSync(`cliclick c:${cx},${cy}`, { timeout: 3_000 });
-									console.log(`${ts()} [Summon] Clicked Continue (no audio) at (${cx},${cy})`);
-								}
-							} catch {}
-						}
-						break;
-					} catch (e) {
-						console.log(`${ts()} [Summon] Audio dialog handling attempt ${attempt + 1} failed: ${e}`);
-					}
-				}
-			}
+			// Audio dialog handling removed — it causes screen share drops.
+			// Phone audio is handled by the Twilio connection, not by Zoom's audio dialog.
 
 			// Wait for Zoom meeting window to appear (adaptive, up to 30s)
 			console.log(`${ts()} [Summon] Waiting for Zoom meeting window...`);
@@ -518,58 +418,9 @@ if result.stdout.strip():
 				} catch {}
 			}
 
-			// Click "Join with Computer Audio"
-			await new Promise(r => setTimeout(r, 1000));
-			try {
-				execSync(`osascript -e '
-					tell application "zoom.us" to activate
-					delay 0.5
-					tell application "System Events"
-						tell process "zoom.us"
-							repeat with w in windows
-								if name of w is "Join audio" then
-									try
-										click button "Join with Computer Audio" of w
-										return "joined"
-									end try
-									repeat with b in buttons of w
-										if name of b contains "Computer Audio" then
-											click b
-											return "joined"
-										end if
-									end repeat
-								end if
-							end repeat
-						end tell
-					end tell
-				'`, { timeout: 5_000 });
-				console.log(`${ts()} [join_zoom] Joined computer audio`);
-			} catch {}
-
-			// Handle "audio conference" variant
-			await new Promise(r => setTimeout(r, 500));
-			try {
-				execSync(`osascript -e '
-					tell application "System Events"
-						tell process "zoom.us"
-							repeat with w in windows
-								if name of w contains "audio conference" then
-									try
-										click button "Join with Computer Audio" of w
-										return "joined"
-									end try
-									repeat with b in buttons of w
-										if name of b contains "Computer Audio" then
-											click b
-											return "joined"
-										end if
-									end repeat
-								end if
-							end repeat
-						end tell
-					end tell
-				'`, { timeout: 5_000 });
-			} catch {}
+			// Audio dialog handling removed — causes screen share drops.
+			// When joining via phone, Twilio handles audio. When joining without phone,
+			// Zoom auto-joins computer audio without manual dialog interaction.
 
 			return { status: 'joined', meetingId: cleanId, method: 'computer_audio', instruction: 'Joined Zoom with computer audio. No screen sharing.' };
 		} catch (err) {
