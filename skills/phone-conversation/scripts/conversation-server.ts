@@ -240,7 +240,7 @@ let nextBodhiPort = 9910; // Dynamic ports for per-call VoiceSessions
 // Returns null if no fast path matches — caller should fall back to delegateTask.
 function tryFastPath(callSession: CallSession, task: string): Promise<unknown> | null {
 	const concatMatch = /\b(prepend|concatenat|concat|image.*video|video.*image)\b/i.test(task);
-	if (concatMatch) {
+	if (concatMatch && callSession.isOwner) {
 		console.log(`${ts()} [Task] fast path: concat`);
 		try {
 			const image = execSync('ls -t /tmp/discord-inbox/*.jpg /tmp/discord-inbox/*.png 2>/dev/null | head -1', { timeout: 3000 }).toString().trim();
@@ -248,7 +248,11 @@ function tryFastPath(callSession: CallSession, task: string): Promise<unknown> |
 			if (image && video) {
 				const result = execSync(`bash ~/.claude/skills/video-concat/scripts/prepend-image.sh "${image}" "${video}" 3`, { timeout: 60000 }).toString().trim();
 				const parsed = JSON.parse(result);
-				callSession.resultQueue.push({ text: `[Task result] Video with image prepended: ${parsed.output} (${parsed.size_mb}MB). Report this to the caller.` });
+				callSession.pendingTasks++;
+				setTimeout(() => {
+					callSession.pendingTasks = Math.max(0, callSession.pendingTasks - 1);
+					callSession.resultQueue.push({ text: `[Task result] Video with image prepended: ${parsed.output} (${parsed.size_mb}MB). Report this to the caller.` });
+				}, 100);
 				return Promise.resolve({ status: 'processing', message: 'Creating the combined video now.' });
 			}
 		} catch (e) { console.log(`${ts()} [Task] fast path concat failed: ${e}`); }
