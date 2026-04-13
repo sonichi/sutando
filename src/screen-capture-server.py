@@ -26,7 +26,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Parse display number from query: /capture?display=2 or /capture?all=true
             from urllib.parse import urlparse, parse_qs
             query = parse_qs(urlparse(self.path).query)
-            display = query.get("display", [None])[0]
+            display_raw = query.get("display", [None])[0]
+            display = display_raw if display_raw and display_raw.isdigit() else None
             capture_all = query.get("all", ["false"])[0] == "true"
             try:
                 if capture_all:
