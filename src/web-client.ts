@@ -618,6 +618,8 @@ function toggleAllTasks() {
   if (link) link.textContent = hasExpanded ? 'expand all' : 'collapse all';
 }
 document.addEventListener('click', function(e) {
+  // Don't toggle if clicking inside the result text (allow text selection)
+  if (e.target.closest && e.target.closest('[id^="result-"]')) return;
   const item = e.target.closest && e.target.closest('.task-item[data-taskid]');
   if (item) toggleResult(item.dataset.taskid);
 });
