@@ -408,7 +408,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 				'TOOL EXCLUSIVITY: If an inline tool can handle the request, use ONLY the inline tool. NEVER also call work. They are mutually exclusive — calling both causes duplicate responses. Only use work when no inline tool fits.',
 				'SUMMON: Before calling summon, ALWAYS say "Summoning your screen now" FIRST — the user is on the phone and cannot see what is happening. The tool takes several seconds.',
 				'PLAYBACK RULES (CRITICAL):',
-				'0. Video tools: open_video (open), play_video (play from start), pause_video (pause), resume_video (resume/continue), replay_video (start over), close_video (close). NEVER use work for video.',
+				'0. Video tools: open_file (open), play_video (play from start), pause_video (pause), resume_video (resume/continue), replay_video (start over), close_video (close). NEVER use work for video.',
 				'1. After calling play_video or resume_video, say NOTHING. Audio streams to the phone.',
 				'2. "pause", "stop", "hold" → call pause_video, then say "Paused."',
 				'3. "play" → play_video. "resume"/"continue" → resume_video. "start over"/"replay" → replay_video.',
@@ -674,7 +674,7 @@ async function createCallSession(params: {
 				callSession.toolCalls.push({ name: toolName, durationMs: e.durationMs, timestamp: new Date().toISOString() });
 				callSession.events.push({ event: `tool_result:${toolName}:${e.durationMs}ms`, timestamp: new Date().toISOString() });
 				// Log REC indicator status for recording tools
-				if (toolName === 'scroll_and_describe' || toolName === 'screen_record' || toolName === 'open_video') {
+				if (toolName === 'scroll_and_describe' || toolName === 'screen_record' || toolName === 'open_file') {
 					const hasIndicator = existsSync('/tmp/sutando-rec-indicator.pid');
 					callSession.events.push({ event: `rec_indicator:${hasIndicator ? 'on' : 'off'}`, timestamp: new Date().toISOString() });
 				}
