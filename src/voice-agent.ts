@@ -797,6 +797,16 @@ async function main() {
 
 	voiceSessionRef = session;
 
+	// Flush metrics on client disconnect — bodhi's handleClientDisconnected()
+	// doesn't trigger onSessionEnd, so metrics would never be written.
+	const origDisconnect = (session as any).handleClientDisconnected?.bind(session);
+	if (origDisconnect) {
+		(session as any).handleClientDisconnected = () => {
+			origDisconnect();
+			writeVoiceMetrics();
+		};
+	}
+
 	// Wire task status → web client
 	setTaskStatusCallback((taskId, status, text, result) => {
 		try {
