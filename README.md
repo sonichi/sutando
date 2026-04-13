@@ -83,7 +83,7 @@ They communicate through files: voice agent writes tasks, the core agent execute
 
 ```bash
 # Clone
-git clone https://github.com/liususan091219/sutando.git
+git clone https://github.com/sonichi/sutando.git
 cd sutando
 
 # Configure (minimum: GEMINI_API_KEY is required)
@@ -269,7 +269,7 @@ Sutando was largely built by its own autonomous build loop -- a Claude Code sess
 
 ## Acknowledgments
 
-Voice agent built on [bodhi-realtime-agent](https://github.com/liususan091219/bodhi_realtime_agent), a Gemini Live voice session library.
+Voice agent built on [bodhi-realtime-agent](https://github.com/sonichi/bodhi_realtime_agent), a Gemini Live voice session library.
 
 ---
 
