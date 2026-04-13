@@ -409,25 +409,44 @@ export const scrollAndDescribeTool: ToolDefinition = {
 // single-purpose tools. Gemini selects more reliably with narrow descriptions than
 // with one tool that has an "action" enum. The old tool caused persistent confusion
 // between "open" and "play" (42% of calls in diagnostics had wrong action selection).
-export const openVideoTool: ToolDefinition = {
-	name: 'open_video',
+export const openFileTool: ToolDefinition = {
+	name: 'open_file',
 	description:
-		'Open the latest screen recording in QuickTime. Finds the best available version (subtitled > narrated > raw). ' +
-		'Use when user says "open the video", "open the recording", "can you open it".',
+		'Open a file with the default macOS app. Pass a path, or omit to open the latest screen recording. ' +
+		'Use when user says "open the video", "open the file", "open that", "can you open it". ' +
+		'Do NOT call play_video after this — wait for user to explicitly say "play". ' +
+		'Known files: "diagnostic tracker" or "diagnostics" = /tmp/phone-diagnostics-tracker.html, ' +
+		'"voice diagnostics" = /tmp/voice-diagnostics-tracker.html.',
 	parameters: z.object({
-		path: z.string().optional().describe('File path. Omit for latest recording.'),
+		path: z.string().optional().describe('File path to open. Omit to open the latest screen recording. Use known file aliases for diagnostic tracker etc.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
 		const { path: filePath } = args as { path?: string };
-		console.log(`${ts()} [OpenVideo] called`);
+		console.log(`${ts()} [OpenFile] called`);
 		demoStateRef.value = 'idle';
 		try {
 			let recPath = filePath ? filePath.replace(/^~/, process.env.HOME || '') : null;
-			if (!recPath) recPath = findRecording();
-			if (!recPath) { await new Promise(r => setTimeout(r, 3000)); recPath = findRecording(); }
-			if (!recPath || !isReadableFile(recPath)) return { error: 'No recording found. Try again in a few seconds.' };
-			writeFileSync('/tmp/sutando-playback-path', recPath);
+			// If Gemini hallucinated a path that doesn't exist, fall back to findRecording
+			if (recPath && !existsSync(recPath)) {
+				console.log(`${ts()} [OpenFile] path "${recPath}" does not exist, falling back to findRecording`);
+				recPath = null;
+			}
+			// Fallback: find latest recording if no path given or path invalid
+			// Poll up to 18s — subtitle burn happens async after recording stops
+			if (!recPath) {
+				for (let i = 0; i < 10; i++) {
+					recPath = findRecording();
+					if (recPath && recPath.includes('-subtitled')) break;
+					if (recPath && i < 6) { await new Promise(r => setTimeout(r, 3000)); continue; }
+					if (!recPath) { await new Promise(r => setTimeout(r, 2000)); }
+					else break;
+				}
+			}
+			if (!recPath || !isReadableFile(recPath)) return { error: 'No file found. Try again in a few seconds.' };
+			if (recPath.includes('sutando-recording')) {
+				writeFileSync('/tmp/sutando-playback-path', recPath);
+			}
 			execSync(`open "${recPath}"`, { timeout: 5_000 });
 			try { execSync(`osascript -e 'tell application "QuickTime Player" to activate'`, { timeout: 3_000 }); } catch {}
 			const size = statSync(recPath).size;
@@ -436,10 +455,10 @@ export const openVideoTool: ToolDefinition = {
 				const dur = execSync(`/opt/homebrew/bin/ffprobe -v error -show_entries format=duration -of csv=p=0 "${recPath}"`, { timeout: 5_000 }).toString().trim();
 				duration_seconds = Math.round(parseFloat(dur));
 			} catch {}
-			console.log(`${ts()} [OpenVideo] opened ${recPath} (${(size / 1024 / 1024).toFixed(1)}MB, ${duration_seconds ?? '?'}s)`);
+			console.log(`${ts()} [OpenFile] opened ${recPath} (${(size / 1024 / 1024).toFixed(1)}MB, ${duration_seconds ?? '?'}s)`);
 			return { status: 'opened', path: recPath, size_mb: +(size / 1024 / 1024).toFixed(1), duration_seconds, instruction: 'File opened. When user says play, call play_video.' };
 		} catch (err) {
-			return { error: `open_video failed: ${err instanceof Error ? err.message : err}` };
+			return { error: `open_file failed: ${err instanceof Error ? err.message : err}` };
 		}
 	},
 };
@@ -531,12 +550,12 @@ export const pauseVideoTool: ToolDefinition = {
 export const closeVideoTool: ToolDefinition = {
 	name: 'close_video',
 	description:
-		'Close the video player. Use when user says "close the video", "close it".',
+		'"close the video" (Cmd+W, app=QuickTime Player). Instant — do NOT use work for simple keystrokes. NEVER use Cmd+Q to close QuickTime — use Cmd+W to close the window only.',
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
 		console.log(`${ts()} [CloseVideo] called`);
-		try { execSync(`osascript -e 'tell application "QuickTime Player" to quit'`, { timeout: 5_000 }); } catch {}
+		try { execSync(`osascript -e 'tell application "QuickTime Player"' -e 'activate' -e 'end tell' -e 'delay 0.3' -e 'tell application "System Events" to keystroke "w" using command down'`, { timeout: 5_000 }); } catch {}
 		try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
 		try { unlinkSync('/tmp/sutando-playback-path'); } catch {}
 		return { status: 'closed' };
