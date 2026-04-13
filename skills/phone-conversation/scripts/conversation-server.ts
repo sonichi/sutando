@@ -281,7 +281,7 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 	const fullTranscript = callSession.transcript.slice(-20)
 		.map(t => `${t.role === 'sutando' ? 'Sutando' : 'Caller'}: ${t.text}`)
 		.join('\n');
-	const content = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ncallSid: ${callSession.callSid}\ncaller: ${callSession.callerNumber || 'unknown'}\naccess_tier: ${callSession.isOwner ? 'owner' : 'other'}\ntask: ${taskDescription}\ntranscript:\n${fullTranscript}\n`;
+	const content = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ncallSid: ${callSession.callSid}\ncaller: ${callSession.callerNumber || 'unknown'}\naccess_tier: ${callSession.isOwner ? 'owner' : 'other'}\ntask: ${taskDescription}\nhint: Check ~/.claude/skills/ for a matching skill before using raw commands.\ntranscript:\n${fullTranscript}\n`;
 	writeFileSync(taskPath, content);
 
 	// Poll for result in background, inject when ready — don't block Gemini
