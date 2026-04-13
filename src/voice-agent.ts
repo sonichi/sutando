@@ -642,7 +642,7 @@ async function main() {
 		console.log(`${ts()} [NarrationTee] not available: ${e instanceof Error ? e.message : e}`);
 	}
 
-	// Wire recording hooks — enables description push during scroll_and_describe
+	// Wire recording hooks — enables description push during record_screen_with_narration
 	try {
 		const { setupRecordingHooks } = await import('./recording-tools.js');
 		setupRecordingHooks(session);

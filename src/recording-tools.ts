@@ -285,7 +285,7 @@ export function scrollDown(pixels: number = 600) {
 // --- Tools ---
 
 export const scrollAndDescribeTool: ToolDefinition = {
-	name: 'scroll_and_describe',
+	name: 'record_screen_with_narration',
 	description:
 		'Record a NARRATED demo video — auto-scrolls the page and returns descriptions for you to speak. ' +
 		'Use ONLY when user says "record with narration", "record for N seconds", or "demo video". ' +
@@ -401,7 +401,7 @@ export const scrollAndDescribeTool: ToolDefinition = {
 				message: `Recording started. IMMEDIATELY speak this narration — NO filler, NO "okay", NO "should I": "${firstDesc}". Auto-stops in ${duration_seconds}s.`,
 			};
 		} catch (err) {
-			return { error: `scroll_and_describe failed: ${err instanceof Error ? err.message : err}` };
+			return { error: `record_screen_with_narration failed: ${err instanceof Error ? err.message : err}` };
 		}
 	},
 };
@@ -608,7 +608,7 @@ export const screenRecordTool: ToolDefinition = {
 	description:
 		'Start or stop PLAIN screen recording (no narration, no auto-scroll). ' +
 		'Use when user says "start recording", "record the screen", "screen record". ' +
-		'Do NOT use scroll_and_describe for plain recording requests. ' +
+		'Do NOT use record_screen_with_narration for plain recording requests. ' +
 		'Uses ffmpeg avfoundation for reliable .mov output. ' +
 		'When starting, ASK the user if they want live transcript subtitles burned into the recording.',
 	parameters: z.object({
@@ -695,10 +695,10 @@ export let _tryInjectNow: (() => void) | null = null;
 
 export function setupRecordingHooks(session: any): void {
 	_narrationSession = session;
-	// Start narration when scroll_and_describe is called
+	// Start narration when record_screen_with_narration is called
 	session.eventBus?.subscribe?.('tool.call', (e: any) => {
-		if (e?.toolName === 'scroll_and_describe') {
-			console.log(`${ts()} [RecordingHooks] tool.call event for scroll_and_describe`);
+		if (e?.toolName === 'record_screen_with_narration') {
+			console.log(`${ts()} [RecordingHooks] tool.call event for record_screen_with_narration`);
 			setTimeout(() => {
 				if (isRecordingActive()) startRecordingNarration(session);
 			}, 4000);
@@ -721,7 +721,7 @@ export function onCallEnd(): void {
 
 /**
  * Start narration controller for an active recording.
- * Called by conversation-server when scroll_and_describe starts.
+ * Called by conversation-server when record_screen_with_narration starts.
  * Handles: description pushing, stop detection, mute/unmute, reconnect narration.
  */
 let narrationActive = false;
