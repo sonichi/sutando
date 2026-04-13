@@ -538,7 +538,9 @@ def run_all_checks() -> list[dict]:
                     if line.startswith("TWILIO_WEBHOOK_URL="):
                         webhook_url = line.split("=", 1)[1].strip().strip('"').strip("'")
                         break
-                is_funnel = "ts.net" in webhook_url
+                from urllib.parse import urlparse as _urlparse
+                _host = _urlparse(webhook_url).hostname or ""
+                is_funnel = _host.endswith(".ts.net")
                 if is_funnel:
                     # Tailscale Funnel — verify funnel is serving and reachable
                     funnel_c = {"name": "tailscale-funnel", "status": "ok", "detail": f"serving {webhook_url}"}
