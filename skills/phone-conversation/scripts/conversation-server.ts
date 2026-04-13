@@ -640,8 +640,12 @@ async function createCallSession(params: {
 	const liveTranscriptPath = `/tmp/sutando-live-transcript-${params.callSid}.txt`;
 	try {
 		writeFileSync(liveTranscriptPath, `--- Live Transcript: ${new Date().toISOString()} ---\nCall: ${params.callSid}\n\n`);
-		try { unlinkSync('/tmp/sutando-live-transcript.txt'); } catch {}
-		symlinkSync(liveTranscriptPath, '/tmp/sutando-live-transcript.txt');
+		// Only owner calls update the global symlink — non-owner calls (Zoom IVR)
+		// would overwrite it and break subtitle generation for the owner's recording.
+		if (callSession.isOwner) {
+			try { unlinkSync('/tmp/sutando-live-transcript.txt'); } catch {}
+			symlinkSync(liveTranscriptPath, '/tmp/sutando-live-transcript.txt');
+		}
 	} catch {}
 
 	const agent = buildAgent(callSession);
