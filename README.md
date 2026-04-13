@@ -10,9 +10,9 @@ It belongs entirely to you.
 
 > *Named after [Stands](https://jojo.fandom.com/wiki/Stand) from JoJo's Bizarre Adventure — a personal spirit that fights on your behalf. Like a Stand, Sutando starts unnamed. As it learns your style and earns real capabilities, it names itself and generates its own avatar — your Stand, unique to you.*
 
-[![Sutando Demo — Phone-controlled computer operation](https://img.youtube.com/vi/kpdSC3e7tM4/maxresdefault.jpg)](https://youtu.be/kpdSC3e7tM4)
+[![Sutando: Call Your Computer from Your Phone — It Picks Up](https://img.youtube.com/vi/NC0kdpLulUY/maxresdefault.jpg)](https://youtu.be/NC0kdpLulUY)
 
-Unmute to hear the real-time conversation. In this demo, the user controls their Mac entirely from a phone call — sharing the screen to Zoom, recording a narrated video, adding subtitles, and playing it back. No keyboard, no mouse. [Watch on YouTube →](https://youtu.be/kpdSC3e7tM4)
+Unmute to hear the real-time conversation. In this demo, the user controls their Mac entirely from a phone call — sharing the screen to Zoom, recording a narrated video, adding subtitles, and playing it back. No keyboard, no mouse. Demo by [@susanliu_](https://github.com/liususan091219). [Watch on YouTube →](https://youtu.be/NC0kdpLulUY)
 
 📺 [Watch the vision talk at UC Berkeley →](https://youtu.be/c39fJ2WAj6A?t=7719) — the idea behind Sutando, before it existed.
 
