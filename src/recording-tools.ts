@@ -271,7 +271,7 @@ export function scrollDown(pixels: number = 600) {
 	// fallback for the Zoom screen share case; recording uses JS-only.
 	const js = `(function(){var best=document.scrollingElement||document.documentElement,bw=0;document.querySelectorAll('*').forEach(function(el){var d=el.scrollHeight-el.clientHeight;if(d>50&&el.clientHeight>200){var w=el.getBoundingClientRect().width;if(w>bw){best=el;bw=w}}});best.scrollBy(0,${pixels})})()`;
 	const tmpScroll = `/tmp/sutando-scroll-rec-${Date.now()}.scpt`;
-	writeFileSync(tmpScroll, `tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/"/g, '\\"')}"`);
+	writeFileSync(tmpScroll, `tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`);
 	execSync(`osascript ${tmpScroll}`, { timeout: 5_000 });
 	try { unlinkSync(tmpScroll); } catch {}
 	// Repaint trigger: Chrome defers visual repaints during Zoom screen share.

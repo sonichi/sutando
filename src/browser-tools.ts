@@ -64,7 +64,7 @@ export const scrollTool: ToolDefinition = {
 				js = scrollFn(`e.scrollBy(0,${amount})`);
 			}
 			const tmpScroll = `/tmp/sutando-scroll-${Date.now()}.scpt`;
-			writeFileSync(tmpScroll, `tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/"/g, '\\"')}"`);
+			writeFileSync(tmpScroll, `tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`);
 			execSync(`osascript ${tmpScroll}`, { timeout: 5_000 });
 			try { unlinkSync(tmpScroll); } catch {}
 			// Also send keyboard scroll — Chrome may skip visual repaints during
