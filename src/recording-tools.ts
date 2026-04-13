@@ -113,7 +113,8 @@ function burnLiveTranscriptSubtitles(videoPath: string): string | null {
 			// Subtitles only show Sutando's screen descriptions to avoid redundancy.
 			if (content.startsWith('Caller:') || content.startsWith('User:')) continue;
 			const text = content.replace(/^Sutando:\s*/, '');
-			// Skip short conversational responses — long lines starting with filler are screen descriptions
+			// Skip conversational responses — only keep screen descriptions
+			if (/anything else|can I help|help you with|what else|else I can do|shall I|would you like|want me to|let me know/i.test(text)) continue;
 			if (text.length < 50 && /^(Sure|OK|Okay|Got it|I'll|I can|I'm |The recording|Is there|Hello|Hi |Done|Thanks|Already|Let me|Paused)/i.test(text)) continue;
 			const wallMs = (Number(hh) * 3600 + Number(mm) * 60 + Number(ss)) * 1000;
 			entries.push({ text, timeMs: Math.max(0, wallMs - startWall) });
@@ -397,7 +398,7 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			return {
 				status: 'recording',
 				first_description: firstDesc,
-				message: `You are narrating a screen recording. The screen shows: "${firstDesc}". Describe what you see in your own words — ONE natural sentence. Then STOP and WAIT silently. More content will be pushed as the page scrolls. Do NOT narrate ahead.`,
+				message: `Recording started. IMMEDIATELY speak this narration — NO filler, NO "okay", NO "should I": "${firstDesc}". Auto-stops in ${duration_seconds}s.`,
 			};
 		} catch (err) {
 			return { error: `scroll_and_describe failed: ${err instanceof Error ? err.message : err}` };
@@ -494,6 +495,8 @@ async function startPlayback(seekSec: number = 0): Promise<{ status: string; pat
 	return { status: 'playing', path: recPath, instruction: 'Video is playing. Say NOTHING.' };
 }
 
+let lastResumeTime = 0;
+
 export const playVideoTool: ToolDefinition = {
 	name: 'play_video',
 	description: 'Play the video from the beginning. Use ONLY when user explicitly says "play" or "play it".',
@@ -501,6 +504,7 @@ export const playVideoTool: ToolDefinition = {
 	execution: 'inline',
 	async execute() {
 		console.log(`${ts()} [PlayVideo] called`);
+		lastResumeTime = Date.now(); // Set cooldown on play to prevent auto-pause
 		try { return await startPlayback(0); } catch (err) { return { error: `${err}` }; }
 	},
 };
@@ -512,9 +516,35 @@ export const resumeVideoTool: ToolDefinition = {
 	execution: 'inline',
 	async execute() {
 		console.log(`${ts()} [ResumeVideo] called`);
+		// Only resume if caller said "resume"/"continue"/"go on"/"play" in recent transcript
+		try {
+			const transcriptPath = readlinkSync('/tmp/sutando-live-transcript.txt');
+			const lines = readFileSync(transcriptPath, 'utf8').split('\n');
+			const callerLines = lines.filter(l => l.includes('Caller:'));
+			const recent = callerLines.slice(-3).join(' ').toLowerCase();
+			if (!/\b(resume|continue|go on|play it|play the)\b/.test(recent)) {
+				console.log(`${ts()} [ResumeVideo] BLOCKED — no resume keyword in recent caller speech: "${recent.slice(-80)}"`);
+				return { status: 'paused', instruction: 'Video is still paused. Only resume when user explicitly says "resume" or "play".' };
+			}
+		} catch {}
 		try {
 			try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
+			lastResumeTime = Date.now();
 			try { execSync(`osascript -e 'tell application "QuickTime Player"' -e 'activate' -e 'play document 1' -e 'end tell'`, { timeout: 5_000 }); } catch {}
+			// Restart audio stream to phone at current position
+			let seekSec = 0;
+			try {
+				seekSec = parseFloat(execSync(`osascript -e 'tell application "QuickTime Player" to get current time of document 1'`, { timeout: 3_000 }).toString().trim()) || 0;
+			} catch {}
+			let recPath = '';
+			try { recPath = findRecording() || ''; } catch {}
+			if (recPath) {
+				fetch(`http://localhost:${process.env.PHONE_PORT || '3100'}/play-audio`, {
+					method: 'POST', headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ path: recPath, seekSec }),
+				}).catch(() => {});
+				await new Promise(r => setTimeout(r, 300));
+			}
 			return { status: 'playing', instruction: 'Video resumed. Say NOTHING.' };
 		} catch (err) { return { error: `${err}` }; }
 	},
@@ -541,6 +571,12 @@ export const pauseVideoTool: ToolDefinition = {
 	execution: 'inline',
 	async execute() {
 		console.log(`${ts()} [PauseVideo] called`);
+		// Block pause for 8s after play/resume to prevent Gemini from hearing video audio and auto-pausing
+		const sinceLast = Date.now() - lastResumeTime;
+		if (sinceLast < 8000) {
+			console.log(`${ts()} [PauseVideo] BLOCKED — ${sinceLast}ms since play/resume (cooldown 8s)`);
+			return { status: 'playing', instruction: 'Video is still playing. Do NOT pause unless user explicitly says "pause" or "stop".' };
+		}
 		try { writeFileSync('/tmp/sutando-playback-pause', '1'); } catch {}
 		try { execSync(`osascript -e 'tell application "QuickTime Player"' -e 'if (count of documents) > 0 then' -e 'pause document 1' -e 'end if' -e 'end tell'`, { timeout: 5_000 }); } catch {}
 		return { status: 'paused', instruction: 'Paused. When user says play/resume, call play_video.' };
@@ -785,7 +821,7 @@ export function startRecordingNarration(session: any): void {
 		lastPushTime = Date.now();
 		// Screen stays on the captured content while Gemini narrates it — no scroll during speech.
 		// Scroll will advance AFTER speech finishes (in preCapture, which scrolls → captures → describes).
-		injectText(session, `[System: Narrate what's new on screen. You just said: "${lastSaid}". The screen now shows: "${desc}". DO NOT read this description verbatim — rephrase it in your own words as a natural continuation. One sentence, ~5 seconds.]`);
+		injectText(session, `[System: Narrate what's new on screen. You just said: "${lastSaid}". The screen now shows: "${desc}". DO NOT read this description verbatim — rephrase it in your own words as a natural continuation. One sentence, ~5 seconds. Do NOT say "anything else", "can I help", "is there", or any conversational filler — ONLY describe what is on screen.]`);
 		console.log(`${ts()} [Recording] pushed: ${desc}`);
 		// Start pre-capturing next while Gemini speaks this one
 		setTimeout(preCapture, 2000);
