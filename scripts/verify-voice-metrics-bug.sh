@@ -1,5 +1,5 @@
 #!/bin/bash
-# Verify voice metrics disconnect bug
+# BUG-318: Verify voice metrics disconnect bug (issue #319)
 # Requires: voice agent running on port 9900
 # Usage: bash scripts/verify-voice-metrics-bug.sh
 
