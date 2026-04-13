@@ -32,10 +32,15 @@ export const pressKeyTool: ToolDefinition = {
 	parameters: z.object({
 		key: z.string().describe('Key to press: enter, escape, tab, delete, space, up, down, left, right, or a letter'),
 		modifiers: z.array(z.enum(['command', 'shift', 'control', 'option'])).optional().describe('Modifier keys'),
+		app: z.string().optional().describe('Target app name (e.g. "QuickTime Player"). If set, activates it first.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { key, modifiers = [] } = args as { key: string; modifiers?: string[] };
+		const { key, modifiers = [], app } = args as { key: string; modifiers?: string[]; app?: string };
+		// Activate target app if specified
+		if (app) {
+			try { execSync(`osascript -e 'tell application "${app}" to activate'`, { timeout: 3_000 }); await new Promise(r => setTimeout(r, 300)); } catch {}
+		}
 		const keyMap: Record<string, number> = {
 			'enter': 36, 'return': 36, 'escape': 53, 'esc': 53, 'tab': 48,
 			'delete': 51, 'backspace': 51, 'space': 49,
@@ -59,8 +64,8 @@ export const pressKeyTool: ToolDefinition = {
 				return { error: `press_key failed: ${err instanceof Error ? err.message : err}` };
 			}
 		}
-		console.log(`${ts()} [PressKey] ${modifiers.length ? modifiers.join('+') + '+' : ''}${key}`);
-		return { status: 'pressed', key, modifiers };
+		console.log(`${ts()} [PressKey] ${app ? `(${app}) ` : ''}${modifiers.length ? modifiers.join('+') + '+' : ''}${key}`);
+		return { status: 'pressed', key, modifiers, app };
 	},
 };
 
