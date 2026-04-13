@@ -804,6 +804,7 @@ async function main() {
 		(session as any).handleClientDisconnected = () => {
 			origDisconnect();
 			writeVoiceMetrics();
+			metricsWritten = false; // reset so next session can write
 		};
 	}
 
