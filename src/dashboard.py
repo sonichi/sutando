@@ -427,14 +427,14 @@ load()
             self.end_headers()
             self.wfile.write(json.dumps(notes).encode())
         elif urlparse(self.path).path.startswith("/notes/"):
-            slug = urlparse(self.path).path.split("/notes/", 1)[1]
-            # Sanitize slug — only allow alphanumeric, hyphens, underscores
+            raw_slug = urlparse(self.path).path.split("/notes/", 1)[1]
+            # Sanitize: strip all non-safe chars, reject if changed (fixes CodeQL #28-31, #35-36)
             import re
-            if not re.match(r'^[\w-]+$', slug):
+            slug = re.sub(r'[^\w-]', '', raw_slug)
+            if not slug or slug != raw_slug:
                 self.send_response(400)
                 self.end_headers()
                 return
-            # Fixes CodeQL #28-31 (py/path-injection): resolve + is_relative_to prevents symlink traversal
             notes_dir = (REPO_DIR / "notes").resolve()
             note_file = (notes_dir / f"{slug}.md").resolve()
             if not note_file.is_relative_to(notes_dir):
@@ -458,13 +458,14 @@ load()
         """Handle DELETE requests."""
         path = urlparse(self.path).path
         if path.startswith("/notes/"):
-            slug = path.split("/notes/", 1)[1]
+            raw_slug = path.split("/notes/", 1)[1]
+            # Sanitize: strip all non-safe chars, reject if changed (fixes CodeQL #28-31, #35-36)
             import re
-            if not re.match(r'^[\w-]+$', slug):
+            slug = re.sub(r'[^\w-]', '', raw_slug)
+            if not slug or slug != raw_slug:
                 self.send_response(400)
                 self.end_headers()
                 return
-            # Fixes CodeQL #28-31 (py/path-injection): resolve + is_relative_to prevents symlink traversal
             notes_dir = (REPO_DIR / "notes").resolve()
             note_file = (notes_dir / f"{slug}.md").resolve()
             if not note_file.is_relative_to(notes_dir):

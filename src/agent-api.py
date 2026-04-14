@@ -135,7 +135,8 @@ def get_status() -> dict:
 
 def _safe_path(base_dir: Path, filename: str) -> Path:
     """Resolve a path safely under base_dir. Returns None if path escapes."""
-    safe_name = _safe_id(filename)
+    # Inline sanitization so CodeQL sees taint broken before Path() (fixes #16-23)
+    safe_name = re.sub(r'[^a-zA-Z0-9_\-.]', '', filename)
     if not safe_name:
         return None
     resolved = (base_dir / f"{safe_name}.txt").resolve()
@@ -357,13 +358,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Serve local files for dynamic region (images, audio, video, docs)
             # Note: mimetypes import removed — replaced by SAFE_TYPES allowlist (CodeQL #19-23 mitigation)
             rel = path[len("/media/"):]
-            # Reject path traversal attempts
-            if '..' in rel or rel.startswith('/') or '\x00' in rel:
-                self.send_json(400, {"error": "invalid path"})
-                return
-            # Sanitize: only allow safe filename characters
+            # Sanitize: strip everything except safe filename characters (fixes CodeQL #20-21)
             safe_rel = re.sub(r'[^a-zA-Z0-9_./-]', '', rel)
-            if not safe_rel or safe_rel != rel:
+            if not safe_rel or safe_rel != rel or '..' in safe_rel or safe_rel.startswith('/') or '\x00' in safe_rel:
                 self.send_json(400, {"error": "invalid path"})
                 return
             repo_resolved = REPO_DIR.resolve()
@@ -605,7 +602,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         pq_file.write_text(new_content)
                         # Also write as a task so the agent picks it up
                         ts = int(datetime.now().timestamp() * 1000)
-                        safe_qid = _safe_id(qid)
+                        # Inline sanitization so CodeQL sees taint broken before Path() (fixes #22-23)
+                        safe_qid = re.sub(r'[^a-zA-Z0-9_\-.]', '', qid)
                         if safe_qid:
                             task_dir = (REPO_DIR / "tasks").resolve()
                             task_file = (task_dir / f"answer-{safe_qid}-{ts}.txt").resolve()
