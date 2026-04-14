@@ -19,6 +19,7 @@ import os
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -84,6 +85,30 @@ def check_directory(path: Path, name: str) -> dict:
         return {"name": name, "status": "missing", "detail": str(path)}
     count = len(list(path.glob("*.md")))
     return {"name": name, "status": "ok", "detail": f"{count} .md files"}
+
+
+def check_memory_sync() -> dict:
+    """Verify memory sync is configured and has run recently."""
+    name = "memory-sync"
+    env_path = REPO_DIR / ".env"
+    repo_url = ""
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            if line.startswith("SUTANDO_MEMORY_REPO="):
+                repo_url = line.split("=", 1)[1].strip().strip('"').strip("'")
+                break
+    if not repo_url:
+        return {"name": name, "status": "warn", "detail": "SUTANDO_MEMORY_REPO not set — cross-machine sync disabled"}
+    sync_dir = Path.home() / ".sutando-memory-sync"
+    if not sync_dir.exists():
+        return {"name": name, "status": "warn", "detail": "repo configured but never synced — run bash src/sync-memory.sh"}
+    git_dir = sync_dir / ".git" / "FETCH_HEAD"
+    if git_dir.exists():
+        age_h = (time.time() - git_dir.stat().st_mtime) / 3600
+        if age_h > 48:
+            return {"name": name, "status": "warn", "detail": f"last sync {age_h:.0f}h ago (stale)"}
+        return {"name": name, "status": "ok", "detail": f"last sync {age_h:.1f}h ago"}
+    return {"name": name, "status": "ok", "detail": "initialized, never fetched"}
 
 
 # ---------------------------------------------------------------------------
@@ -512,6 +537,9 @@ def run_all_checks() -> list[dict]:
 
     # Notes
     checks.append(check_directory(REPO_DIR / "notes", "notes-dir"))
+
+    # Memory sync
+    checks.append(check_memory_sync())
 
     # Phone conversation server (optional — only check if Twilio configured and not skipped)
     env_path = REPO_DIR / ".env"
