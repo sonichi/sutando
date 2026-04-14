@@ -9,6 +9,7 @@ import UserNotifications
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var hotKeyRef: EventHotKeyRef?
+    var screenshotHotKeyRef: EventHotKeyRef?
     var lastDropTime: Date = .distantPast
     var voiceHotKeyRef: EventHotKeyRef?
     var muteHotKeyRef: EventHotKeyRef?
@@ -116,6 +117,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Drop Context (⌃C)", action: #selector(dropContext), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Drop Screenshot (⌥C)", action: #selector(dropScreenshot), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Toggle Voice (⌃V)", action: #selector(toggleVoice), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Toggle Mute (⌃M)", action: #selector(toggleMute), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
@@ -215,7 +217,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             &muteHotKeyRef
         )
 
-        logToFile("registerHotKey: C=\(status) V=\(statusV) M=\(statusM)")
+        // Register ⌥C for screenshot drop (hotkey ID 4)
+        var screenshotHotKeyID = EventHotKeyID()
+        screenshotHotKeyID.signature = OSType(0x5355_5444) // "SUTD"
+        screenshotHotKeyID.id = 4
+        let statusS = RegisterEventHotKey(
+            UInt32(kVK_ANSI_C),
+            UInt32(optionKey),
+            screenshotHotKeyID,
+            GetApplicationEventTarget(),
+            0,
+            &screenshotHotKeyRef
+        )
+        if statusS != noErr {
+            notify("Sutando", "Failed to register ⌥C hotkey (error \(statusS))")
+        }
+
+        logToFile("registerHotKey: C=\(status) V=\(statusV) M=\(statusM) S=\(statusS)")
 
         // Install handler — dispatch by hotkey ID
         var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
@@ -230,6 +248,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             case 1: appDelegate.dropContext()
             case 2: appDelegate.toggleVoice()
             case 3: appDelegate.toggleMute()
+            case 4: appDelegate.dropScreenshot()
             default: break
             }
             return noErr
@@ -344,6 +363,53 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 appendLog(logFile, "[\(timestamp)] Nothing selected")
             }
         }
+    }
+
+    // MARK: - Screenshot Drop (⌥C)
+
+    @objc func dropScreenshot() {
+        // Debounce — share lastDropTime with text drop to avoid rapid triggers
+        let now = Date()
+        if now.timeIntervalSince(lastDropTime) < 1.0 {
+            logToFile("dropScreenshot: debounced (too fast)")
+            return
+        }
+        lastDropTime = now
+
+        let timestamp = ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withFullDate, .withTime, .withSpaceBetweenDateAndTime, .withColonSeparatorInTime])
+        let logFile = workspace + "/logs/context-drop.log"
+        let tasksDir = workspace + "/tasks"
+
+        // Call screen-capture-server to capture the screen and get the file path back.
+        // Server runs at localhost:7845, default capture is the main display.
+        guard let url = URL(string: "http://localhost:7845/capture") else { return }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 5
+        URLSession.shared.dataTask(with: req) { [self] data, _, error in
+            if let error = error {
+                notify("Sutando", "Screenshot drop failed: \(error.localizedDescription)")
+                appendLog(logFile, "[\(timestamp)] dropScreenshot: error \(error.localizedDescription)")
+                return
+            }
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let path = json["path"] as? String else {
+                notify("Sutando", "Screenshot drop failed: bad server response")
+                appendLog(logFile, "[\(timestamp)] dropScreenshot: bad server response")
+                return
+            }
+
+            let content = """
+            timestamp: \(timestamp)
+            type: image
+            path: \(path)
+            ---
+            [Screenshot dropped via ⌥C]
+            """
+            appendLog(logFile, "[\(timestamp)] dropScreenshot: \(path)")
+            writeTask(tasksDir, timestamp: timestamp, content: content)
+            notify("Sutando", "Screenshot dropped (\(URL(fileURLWithPath: path).lastPathComponent))")
+        }.resume()
     }
 
     // MARK: - Voice Toggle
