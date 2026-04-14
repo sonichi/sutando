@@ -9,7 +9,7 @@
 
 SYNC_DIR="$HOME/.sutando-memory-sync"
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-MEMORY_DIR="$HOME/.claude/projects/-Users-$(whoami)-Desktop-sutando/memory"
+MEMORY_DIR="$HOME/.claude/projects/$(echo "$REPO_DIR" | sed 's|/|-|g')/memory"
 NOTES_DIR="$REPO_DIR/notes"
 LOG="/tmp/sync-memory.log"
 LOCK_DIR="/tmp/sync-memory.lock.d"
