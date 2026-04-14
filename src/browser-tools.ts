@@ -35,52 +35,58 @@ const VISION_MODEL = process.env.VISION_MODEL || 'gemini-3.1-flash-lite-preview'
 export const scrollTool: ToolDefinition = {
 	name: 'scroll',
 	description:
-		'Scroll the Chrome browser page. Use for: "scroll down", "scroll up", "scroll to top", "scroll to bottom". Use target for specific areas: "sidebar", "chat history", "code block".',
+		'Scroll the currently focused application. Works in Chrome, VS Code, or any app. Use for: "scroll down", "scroll up", "scroll to top", "scroll to bottom". Use target for specific areas in Chrome: "sidebar", "chat history", "code block".',
 	parameters: z.object({
 		direction: z.enum(['down', 'up', 'top', 'bottom']).describe('Scroll direction. Use "top" or "bottom" to jump to start/end of page.'),
-		target: z.string().optional().describe('Optional: which area to scroll. E.g. "sidebar", "chat history", "nav", "code". Omit for main content.'),
+		target: z.string().optional().describe('Optional: which area to scroll in Chrome. E.g. "sidebar", "chat history", "nav", "code". Omit for main content.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
 		const { direction, target } = args as { direction: 'down' | 'up' | 'top' | 'bottom'; target?: string };
 		try {
-			// Target-specific selectors for common areas
-			const targetSelector = target
-				? (target.match(/side|nav|history|menu/i) ? 'nav' : target.match(/code/i) ? 'pre,code' : target)
-				: '';
-			// Use Chrome's JavaScript scroll. If target specified, find matching scrollable element.
-			// Otherwise find the WIDEST scrollable container (main content over sidebars).
-			// Use single quotes in JS to avoid double-quote escaping issues inside AppleScript
-			const scrollFn = (cmd: string) => targetSelector
-				? `(function(){var sel='${targetSelector}';var e=null;document.querySelectorAll(sel).forEach(function(el){if(!e&&el.scrollHeight-el.clientHeight>50)e=el});if(!e){var best=null,bh=0;document.querySelectorAll('*').forEach(function(el){var d=el.scrollHeight-el.clientHeight;if(d>50&&el.clientHeight>100&&el.getBoundingClientRect().width<500){if(d>bh){best=el;bh=d}}});e=best}if(e){${cmd}}})()`
-				: `(function(){var best=document.scrollingElement||document.documentElement,bw=0;document.querySelectorAll('*').forEach(function(el){var d=el.scrollHeight-el.clientHeight;if(d>50&&el.clientHeight>200){var w=el.getBoundingClientRect().width;if(w>bw){best=el;bw=w}}});var e=best;${cmd}})()`;
-			let js: string;
-			if (direction === 'top') {
-				js = scrollFn('e.scrollTop=0');
-			} else if (direction === 'bottom') {
-				js = scrollFn('e.scrollTop=e.scrollHeight');
-			} else {
-				const amount = direction === 'down' ? 600 : -600;
-				js = scrollFn(`e.scrollBy(0,${amount})`);
+			// Check which app is frontmost
+			let frontApp = '';
+			try {
+				frontApp = execSync(`osascript -e 'tell application "System Events" to get name of first application process whose frontmost is true'`, { timeout: 2_000 }).toString().trim();
+			} catch {}
+			const isChrome = frontApp === 'Google Chrome';
+			console.log(`${ts()} [Scroll] frontApp=${frontApp} direction=${direction} isChrome=${isChrome}`);
+
+			if (isChrome && !target) {
+				// Chrome: use JS scroll + keyboard fallback (for screen share repaint)
+				const scrollFn = (cmd: string) =>
+					`(function(){var best=document.scrollingElement||document.documentElement,bw=0;document.querySelectorAll('*').forEach(function(el){var d=el.scrollHeight-el.clientHeight;if(d>50&&el.clientHeight>200){var w=el.getBoundingClientRect().width;if(w>bw){best=el;bw=w}}});var e=best;${cmd}})()`;
+				let js: string;
+				if (direction === 'top') js = scrollFn('e.scrollTop=0');
+				else if (direction === 'bottom') js = scrollFn('e.scrollTop=e.scrollHeight');
+				else js = scrollFn(`e.scrollBy(0,${direction === 'down' ? 600 : -600})`);
+				const tmpScroll = `/tmp/sutando-scroll-${Date.now()}.scpt`;
+				writeFileSync(tmpScroll, `tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`);
+				execSync(`osascript ${tmpScroll}`, { timeout: 5_000 });
+				try { unlinkSync(tmpScroll); } catch {}
+			} else if (isChrome && target) {
+				// Chrome with target selector
+				const targetSelector = target.match(/side|nav|history|menu/i) ? 'nav' : target.match(/code/i) ? 'pre,code' : target;
+				const scrollFn = (cmd: string) =>
+					`(function(){var sel='${targetSelector}';var e=null;document.querySelectorAll(sel).forEach(function(el){if(!e&&el.scrollHeight-el.clientHeight>50)e=el});if(!e){var best=null,bh=0;document.querySelectorAll('*').forEach(function(el){var d=el.scrollHeight-el.clientHeight;if(d>50&&el.clientHeight>100&&el.getBoundingClientRect().width<500){if(d>bh){best=el;bh=d}}});e=best}if(e){${cmd}}})()`;
+				let js: string;
+				if (direction === 'top') js = scrollFn('e.scrollTop=0');
+				else if (direction === 'bottom') js = scrollFn('e.scrollTop=e.scrollHeight');
+				else js = scrollFn(`e.scrollBy(0,${direction === 'down' ? 600 : -600})`);
+				const tmpScroll = `/tmp/sutando-scroll-${Date.now()}.scpt`;
+				writeFileSync(tmpScroll, `tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`);
+				execSync(`osascript ${tmpScroll}`, { timeout: 5_000 });
+				try { unlinkSync(tmpScroll); } catch {}
 			}
-			const tmpScroll = `/tmp/sutando-scroll-${Date.now()}.scpt`;
-			writeFileSync(tmpScroll, `tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`);
-			execSync(`osascript ${tmpScroll}`, { timeout: 5_000 });
-			try { unlinkSync(tmpScroll); } catch {}
-			// Also send keyboard scroll — Chrome may skip visual repaints during
-			// Zoom screen share even though JS scrollBy updates scrollY. Keyboard
-			// input forces a repaint through the OS input pipeline.
-			if (!target) {
-				const keyMap: Record<string, string> = { down: 'page down', up: 'page up', top: 'home', bottom: 'end' };
-				const key = keyMap[direction];
-				if (key) {
-					try {
-						execSync(`osascript -e 'tell application "Google Chrome" to activate' -e 'delay 0.1' -e 'tell application "System Events" to key code ${direction === 'down' ? '121' : direction === 'up' ? '116' : direction === 'top' ? '115 using command down' : '119 using command down'}'`, { timeout: 3_000 });
-					} catch { /* keyboard fallback is best-effort */ }
-				}
-			}
-			console.log(`${ts()} [Scroll] ${direction}`);
-			return { status: 'scrolled', direction };
+
+			// Keyboard scroll on the frontmost app (works in any app, no focus steal)
+			const keyCode = direction === 'down' ? '121' : direction === 'up' ? '116' : direction === 'top' ? '115 using command down' : '119 using command down';
+			try {
+				execSync(`osascript -e 'tell application "System Events" to key code ${keyCode}'`, { timeout: 3_000 });
+			} catch { /* keyboard fallback is best-effort */ }
+
+			console.log(`${ts()} [Scroll] ${direction} (app: ${frontApp})`);
+			return { status: 'scrolled', direction, app: frontApp };
 		} catch (err) {
 			return { error: `Scroll failed: ${err instanceof Error ? err.message : err}` };
 		}
