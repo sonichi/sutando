@@ -137,6 +137,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Restart All Services", action: #selector(restartServices), keyEquivalent: "r"))
         menu.addItem(NSMenuItem(title: "Stop All Services", action: #selector(stopServices), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Restart Sutando App", action: #selector(restartSelf), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
         statusItem.menu = menu
 
@@ -769,6 +770,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func quit() {
         NSApplication.shared.terminate(nil)
+    }
+
+    /// Restart the Sutando.app menu bar app — useful after editing
+    /// ~/.config/sutando/hotkeys.json so the new bindings take effect.
+    /// Spawns a detached helper that waits for this process to exit, then
+    /// re-launches the same binary, then exits the current process.
+    @objc func restartSelf() {
+        let myPath = ProcessInfo.processInfo.arguments[0]
+        let myPid = ProcessInfo.processInfo.processIdentifier
+        // Detached shell: wait for current pid to die, then exec the same binary.
+        let script = "while kill -0 \(myPid) 2>/dev/null; do sleep 0.1; done; exec \"\(myPath)\""
+        let task = Process()
+        task.launchPath = "/bin/sh"
+        task.arguments = ["-c", script]
+        do {
+            try task.run()
+            logToFile("restartSelf: spawned relaunch helper (pid will be \(myPid)), terminating")
+            NSApplication.shared.terminate(nil)
+        } catch {
+            notify("Sutando", "Restart failed: \(error.localizedDescription)")
+            logToFile("restartSelf: failed to spawn helper: \(error)")
+        }
     }
 }
 
