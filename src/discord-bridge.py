@@ -328,10 +328,12 @@ async def _handle_discord_message(message, force=False):
         except Exception as e:
             print(f"  Download failed: {e}")
 
-    # Reply context — when the user replies to a bot message, fetch the
+    # Reply context — when the user replies to any message, fetch the
     # referenced message and prepend a snippet so the core agent knows
-    # which earlier answer the user is responding to. Without this the
-    # bot sees only the new reply text in isolation.
+    # which earlier message the user is pointing at. Includes replies to
+    # other users/bots/the sender's own earlier messages, not just this
+    # bot's — owners often reply to a MacBook bot message or their own
+    # earlier line to clarify which task "this" / "that" refers to.
     reply_context = ""
     if message.reference and message.reference.message_id:
         try:
@@ -339,19 +341,16 @@ async def _handle_discord_message(message, force=False):
             if ref_msg is None:
                 ref_msg = await message.channel.fetch_message(message.reference.message_id)
             if ref_msg is not None:
-                # Only include context when replying to a message FROM this
-                # bot — avoids prepending unrelated conversation fragments.
-                if ref_msg.author.id == client.user.id:
-                    ref_author = str(ref_msg.author)
-                    ref_content = (ref_msg.content or "").strip()
-                    # Strip bot-id mentions so the context doesn't show raw id soup
-                    ref_content = ref_content.replace(f"<@{client.user.id}>", "")
-                    snippet = ref_content[:400].replace("\n", " ").strip()
-                    if snippet:
-                        reply_context = (
-                            f"\n\n[Replying to {ref_author} "
-                            f"({ref_msg.created_at.strftime('%Y-%m-%d %H:%M')}): {snippet}]"
-                        )
+                ref_author = str(ref_msg.author)
+                ref_content = (ref_msg.content or "").strip()
+                # Strip bot-id mentions so the context doesn't show raw id soup
+                ref_content = ref_content.replace(f"<@{client.user.id}>", "")
+                snippet = ref_content[:400].replace("\n", " ").strip()
+                if snippet:
+                    reply_context = (
+                        f"\n\n[Replying to {ref_author} "
+                        f"({ref_msg.created_at.strftime('%Y-%m-%d %H:%M')}): {snippet}]"
+                    )
         except Exception as e:
             print(f"  [reply-context] fetch failed: {e}", flush=True)
 
