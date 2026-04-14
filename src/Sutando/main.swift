@@ -8,10 +8,11 @@ import UserNotifications
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
-    var hotKeyRef: EventHotKeyRef?
+    // Hotkeys are configurable via ~/.config/sutando/hotkeys.json.
+    // Defaults: drop_context=⌃C, drop_screenshot=⌃S, toggle_voice=⌃V, toggle_mute=⌃M
+    var hotKeyRefs: [EventHotKeyRef?] = []  // one entry per registered hotkey
+    var hotKeyActions: [UInt32: String] = [:]  // hotkey id → action name
     var lastDropTime: Date = .distantPast
-    var voiceHotKeyRef: EventHotKeyRef?
-    var muteHotKeyRef: EventHotKeyRef?
     let workspace: String = {
         // Derive from binary location → repo root
         // Raw binary: src/Sutando/Sutando (3 levels up)
@@ -115,9 +116,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Drop Context (⌃C)", action: #selector(dropContext), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Toggle Voice (⌃V)", action: #selector(toggleVoice), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Toggle Mute (⌃M)", action: #selector(toggleMute), keyEquivalent: ""))
+        // Build menu items from the loaded hotkey config so labels stay in sync
+        // with whatever's actually registered (config or defaults).
+        let hotkeys = loadHotkeyConfig()
+        let actionToSelector: [String: (String, Selector)] = [
+            "drop_context":    ("Drop Context",    #selector(dropContext)),
+            "drop_screenshot": ("Drop Screenshot", #selector(dropScreenshot)),
+            "toggle_voice":    ("Toggle Voice",    #selector(toggleVoice)),
+            "toggle_mute":     ("Toggle Mute",     #selector(toggleMute)),
+        ]
+        for hk in hotkeys {
+            guard let (label, sel) = actionToSelector[hk.action] else { continue }
+            let glyph = displayLabel(key: hk.key, modifiers: hk.modifiers)
+            menu.addItem(NSMenuItem(title: "\(label) (\(glyph))", action: sel, keyEquivalent: ""))
+        }
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Open Web UI", action: #selector(openWebUI), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Open Core CLI", action: #selector(openCore), keyEquivalent: ""))
@@ -125,6 +137,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Restart All Services", action: #selector(restartServices), keyEquivalent: "r"))
         menu.addItem(NSMenuItem(title: "Stop All Services", action: #selector(stopServices), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Restart Sutando App", action: #selector(restartSelf), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
         statusItem.menu = menu
 
@@ -164,60 +177,119 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         task.resume()
     }
 
-    // MARK: - Global Hotkey (Ctrl+Shift+D)
+    // MARK: - Configurable Global Hotkeys
+
+    /// Map a single-letter key name to a Carbon kVK_* virtual keycode.
+    /// Add more entries as needed.
+    private static let keyNameToCode: [String: Int] = [
+        "A": kVK_ANSI_A, "B": kVK_ANSI_B, "C": kVK_ANSI_C, "D": kVK_ANSI_D,
+        "E": kVK_ANSI_E, "F": kVK_ANSI_F, "G": kVK_ANSI_G, "H": kVK_ANSI_H,
+        "I": kVK_ANSI_I, "J": kVK_ANSI_J, "K": kVK_ANSI_K, "L": kVK_ANSI_L,
+        "M": kVK_ANSI_M, "N": kVK_ANSI_N, "O": kVK_ANSI_O, "P": kVK_ANSI_P,
+        "Q": kVK_ANSI_Q, "R": kVK_ANSI_R, "S": kVK_ANSI_S, "T": kVK_ANSI_T,
+        "U": kVK_ANSI_U, "V": kVK_ANSI_V, "W": kVK_ANSI_W, "X": kVK_ANSI_X,
+        "Y": kVK_ANSI_Y, "Z": kVK_ANSI_Z,
+    ]
+
+    /// Map a modifier name to its Carbon mask.
+    private static let modifierNameToMask: [String: Int] = [
+        "control": controlKey, "ctrl": controlKey, "⌃": controlKey,
+        "option":  optionKey,  "alt":  optionKey,  "⌥": optionKey,
+        "command": cmdKey,     "cmd":  cmdKey,     "⌘": cmdKey,
+        "shift":   shiftKey,   "⇧": shiftKey,
+    ]
+
+    /// Default hotkey config used when ~/.config/sutando/hotkeys.json is missing.
+    /// Keys: action name → (key letter, modifier names).
+    private static let defaultHotkeys: [(action: String, key: String, modifiers: [String])] = [
+        ("drop_context",     "C", ["control"]),
+        ("drop_screenshot",  "S", ["control"]),
+        ("toggle_voice",     "V", ["control"]),
+        ("toggle_mute",      "M", ["control"]),
+    ]
+
+    private func loadHotkeyConfig() -> [(action: String, key: String, modifiers: [String])] {
+        let configPath = NSString(string: "~/.config/sutando/hotkeys.json").expandingTildeInPath
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: configPath)),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            logToFile("loadHotkeyConfig: no config at \(configPath), using defaults")
+            return AppDelegate.defaultHotkeys
+        }
+        var result: [(String, String, [String])] = []
+        for (action, value) in json {
+            guard let entry = value as? [String: Any],
+                  let key = entry["key"] as? String,
+                  let mods = entry["modifiers"] as? [String] else {
+                logToFile("loadHotkeyConfig: skipping malformed entry for action=\(action)")
+                continue
+            }
+            result.append((action, key.uppercased(), mods))
+        }
+        if result.isEmpty {
+            logToFile("loadHotkeyConfig: empty/unreadable config, using defaults")
+            return AppDelegate.defaultHotkeys
+        }
+        logToFile("loadHotkeyConfig: loaded \(result.count) hotkeys from \(configPath)")
+        return result
+    }
+
+    private func modifierMask(from names: [String]) -> UInt32 {
+        var mask = 0
+        for n in names {
+            if let m = AppDelegate.modifierNameToMask[n.lowercased()] {
+                mask |= m
+            }
+        }
+        return UInt32(mask)
+    }
+
+    private func displayLabel(key: String, modifiers: [String]) -> String {
+        let modSymbols = modifiers.map { name -> String in
+            switch name.lowercased() {
+            case "control", "ctrl": return "⌃"
+            case "option", "alt":   return "⌥"
+            case "command", "cmd":  return "⌘"
+            case "shift":           return "⇧"
+            default: return name
+            }
+        }.joined()
+        return "\(modSymbols)\(key)"
+    }
 
     func registerHotKey() {
-        var hotKeyID = EventHotKeyID()
-        hotKeyID.signature = OSType(0x5355_5444) // "SUTD"
-        hotKeyID.id = 1
-
-        // Ctrl+C: modifiers = controlKey, keycode = 8 (C)
-        let status = RegisterEventHotKey(
-            UInt32(kVK_ANSI_C),
-            UInt32(controlKey),
-            hotKeyID,
-            GetApplicationEventTarget(),
-            0,
-            &hotKeyRef
-        )
-
-        if status != noErr {
-            notify("Sutando Drop", "Failed to register hotkey (⌃C). Another app may have claimed it.")
-            return
+        let hotkeys = loadHotkeyConfig()
+        var statuses: [String] = []
+        for (idx, hk) in hotkeys.enumerated() {
+            guard let keyCode = AppDelegate.keyNameToCode[hk.key] else {
+                logToFile("registerHotKey: unknown key '\(hk.key)' for action=\(hk.action)")
+                continue
+            }
+            let id = UInt32(idx + 1)
+            var hotKeyID = EventHotKeyID()
+            hotKeyID.signature = OSType(0x5355_5444) // "SUTD"
+            hotKeyID.id = id
+            var ref: EventHotKeyRef?
+            let status = RegisterEventHotKey(
+                UInt32(keyCode),
+                modifierMask(from: hk.modifiers),
+                hotKeyID,
+                GetApplicationEventTarget(),
+                0,
+                &ref
+            )
+            if status != noErr {
+                let label = displayLabel(key: hk.key, modifiers: hk.modifiers)
+                notify("Sutando", "Failed to register \(label) hotkey for \(hk.action) (error \(status))")
+                statuses.append("\(hk.action)=\(status)")
+                continue
+            }
+            hotKeyRefs.append(ref)
+            hotKeyActions[id] = hk.action
+            statuses.append("\(hk.action)=ok")
         }
+        logToFile("registerHotKey: \(statuses.joined(separator: " "))")
 
-        // Register ⌃V for voice toggle (hotkey ID 2)
-        var voiceHotKeyID = EventHotKeyID()
-        voiceHotKeyID.signature = OSType(0x5355_5444) // "SUTD"
-        voiceHotKeyID.id = 2
-        let statusV = RegisterEventHotKey(
-            UInt32(kVK_ANSI_V),
-            UInt32(controlKey),
-            voiceHotKeyID,
-            GetApplicationEventTarget(),
-            0,
-            &voiceHotKeyRef
-        )
-        if statusV != noErr {
-            notify("Sutando", "Failed to register ⌃V hotkey (error \(statusV))")
-        }
-
-        // Register ⌃M for mute toggle (hotkey ID 3)
-        var muteHotKeyID = EventHotKeyID()
-        muteHotKeyID.signature = OSType(0x5355_5444) // "SUTD"
-        muteHotKeyID.id = 3
-        let statusM = RegisterEventHotKey(
-            UInt32(kVK_ANSI_M),
-            UInt32(controlKey),
-            muteHotKeyID,
-            GetApplicationEventTarget(),
-            0,
-            &muteHotKeyRef
-        )
-
-        logToFile("registerHotKey: C=\(status) V=\(statusV) M=\(statusM)")
-
-        // Install handler — dispatch by hotkey ID
+        // Install handler — dispatch by action name from the config map.
         var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         InstallEventHandler(GetApplicationEventTarget(), { (_, event, _) -> OSStatus in
             var hotKeyID = EventHotKeyID()
@@ -225,11 +297,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                               EventParamType(typeEventHotKeyID), nil,
                               MemoryLayout<EventHotKeyID>.size, nil, &hotKeyID)
             let appDelegate = NSApplication.shared.delegate as! AppDelegate
-            appDelegate.logToFile("HOTKEY FIRED: id=\(hotKeyID.id)")
-            switch hotKeyID.id {
-            case 1: appDelegate.dropContext()
-            case 2: appDelegate.toggleVoice()
-            case 3: appDelegate.toggleMute()
+            let action = appDelegate.hotKeyActions[hotKeyID.id] ?? "unknown"
+            appDelegate.logToFile("HOTKEY FIRED: id=\(hotKeyID.id) action=\(action)")
+            switch action {
+            case "drop_context":    appDelegate.dropContext()
+            case "drop_screenshot": appDelegate.dropScreenshot()
+            case "toggle_voice":    appDelegate.toggleVoice()
+            case "toggle_mute":     appDelegate.toggleMute()
             default: break
             }
             return noErr
@@ -344,6 +418,53 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 appendLog(logFile, "[\(timestamp)] Nothing selected")
             }
         }
+    }
+
+    // MARK: - Screenshot Drop (⌥C)
+
+    @objc func dropScreenshot() {
+        // Debounce — share lastDropTime with text drop to avoid rapid triggers
+        let now = Date()
+        if now.timeIntervalSince(lastDropTime) < 1.0 {
+            logToFile("dropScreenshot: debounced (too fast)")
+            return
+        }
+        lastDropTime = now
+
+        let timestamp = ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withFullDate, .withTime, .withSpaceBetweenDateAndTime, .withColonSeparatorInTime])
+        let logFile = workspace + "/logs/context-drop.log"
+        let tasksDir = workspace + "/tasks"
+
+        // Call screen-capture-server to capture the screen and get the file path back.
+        // Server runs at localhost:7845, default capture is the main display.
+        guard let url = URL(string: "http://localhost:7845/capture") else { return }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 5
+        URLSession.shared.dataTask(with: req) { [self] data, _, error in
+            if let error = error {
+                notify("Sutando", "Screenshot drop failed: \(error.localizedDescription)")
+                appendLog(logFile, "[\(timestamp)] dropScreenshot: error \(error.localizedDescription)")
+                return
+            }
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let path = json["path"] as? String else {
+                notify("Sutando", "Screenshot drop failed: bad server response")
+                appendLog(logFile, "[\(timestamp)] dropScreenshot: bad server response")
+                return
+            }
+
+            let content = """
+            timestamp: \(timestamp)
+            type: image
+            path: \(path)
+            ---
+            [Screenshot dropped via ⌥C]
+            """
+            appendLog(logFile, "[\(timestamp)] dropScreenshot: \(path)")
+            writeTask(tasksDir, timestamp: timestamp, content: content)
+            notify("Sutando", "Screenshot dropped (\(URL(fileURLWithPath: path).lastPathComponent))")
+        }.resume()
     }
 
     // MARK: - Voice Toggle
@@ -649,6 +770,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func quit() {
         NSApplication.shared.terminate(nil)
+    }
+
+    /// Restart the Sutando.app menu bar app — useful after editing
+    /// ~/.config/sutando/hotkeys.json so the new bindings take effect.
+    /// Spawns a detached helper that waits for this process to exit, then
+    /// re-launches the same binary, then exits the current process.
+    @objc func restartSelf() {
+        let myPath = ProcessInfo.processInfo.arguments[0]
+        let myPid = ProcessInfo.processInfo.processIdentifier
+        // Detached shell: wait for current pid to die, then exec the same binary.
+        let script = "while kill -0 \(myPid) 2>/dev/null; do sleep 0.1; done; exec \"\(myPath)\""
+        let task = Process()
+        task.launchPath = "/bin/sh"
+        task.arguments = ["-c", script]
+        do {
+            try task.run()
+            logToFile("restartSelf: spawned relaunch helper (pid will be \(myPid)), terminating")
+            NSApplication.shared.terminate(nil)
+        } catch {
+            notify("Sutando", "Restart failed: \(error.localizedDescription)")
+            logToFile("restartSelf: failed to spawn helper: \(error)")
+        }
     }
 }
 
