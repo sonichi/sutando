@@ -201,6 +201,11 @@ async def _handle_discord_message(message, force=False):
     if policy == "disabled":
         return
 
+    # Track whether the sender has already been authorized via a per-channel
+    # allowlist. If so, the global pairing requirement at the bottom is
+    # skipped — channel allowFrom is the source of truth for that channel.
+    channel_authorized = False
+
     if is_dm:
         if policy == "allowlist" and sender_id not in allowed:
             return
@@ -210,18 +215,21 @@ async def _handle_discord_message(message, force=False):
         if channel_cfg is not None:
             _, ch_allowed = channel_cfg
             if ch_allowed is None:
-                pass  # channel set to true — open to all, skip access check
+                # channel set to `true` — open to all, skip access check
+                channel_authorized = True
             elif len(ch_allowed) > 0 and sender_id not in ch_allowed:
                 print(f"  [skip] @{username} not in channel allowlist", flush=True)
                 return
-            # empty allowFrom with requireMention = anyone who mentions can use
+            else:
+                # sender is in ch_allowed (or ch_allowed is empty + requireMention)
+                channel_authorized = True
         else:
             # Channel not configured — fall back to global allowlist
             if allowed and sender_id not in allowed:
                 print(f"  [skip] @{username} not in global allowlist", flush=True)
                 return
 
-    if policy == "pairing" and sender_id not in allowed:
+    if policy == "pairing" and sender_id not in allowed and not channel_authorized:
         # Generate pairing code — user must approve via /discord:access pair <code>
         import random, string
         try:
