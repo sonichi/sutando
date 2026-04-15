@@ -91,6 +91,13 @@ bash "$REPO/skills/install.sh" 2>/dev/null || true
 # Create tasks/ and results/ directories
 mkdir -p tasks results data
 
+# Archive stale results/*.txt (>24h) BEFORE any service starts iterating
+# results/. Prevents the 2026-04-15 DM-flood class of incidents where a
+# freshly-restarted task-bridge or discord-bridge poll loop sees a backlog
+# of long-dead result files and re-delivers them. Post-mortem:
+# notes/post-mortem-dm-flood-2026-04-15.md.
+python3 "$REPO/src/archive-stale-results.py" || true
+
 # 0. Credential proxy for quota tracking (port 7846)
 if ! lsof -i :7846 > /dev/null 2>&1; then
   echo "  Starting credential proxy (port 7846)..."
