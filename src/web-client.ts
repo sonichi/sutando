@@ -36,7 +36,14 @@ const HTML = /* html */ `<!DOCTYPE html>
     display: flex; align-items: center; gap: 14px;
     background: #0e0e18; border-bottom: 1px solid #1a1a2e;
   }
+  .header .avatar-wrap {
+    position: relative; width: 60px; height: 60px; flex-shrink: 0;
+  }
+  .header .avatar-wrap canvas {
+    position: absolute; top: 0; left: 0; width: 60px; height: 60px; pointer-events: none;
+  }
   .header .avatar {
+    position: absolute; top: 8px; left: 8px;
     width: 44px; height: 44px; border-radius: 50%;
     border: 2px solid #4ecca3; object-fit: cover; display: none;
     transition: box-shadow 0.15s ease, border-color 0.15s ease;
@@ -306,7 +313,10 @@ const HTML = /* html */ `<!DOCTYPE html>
 <body>
 
 <div class="header">
-  <img class="avatar" id="stand-avatar" src="http://localhost:7844/avatar">
+  <div class="avatar-wrap" id="avatar-wrap">
+    <canvas id="speak-canvas" width="60" height="60"></canvas>
+    <img class="avatar" id="stand-avatar" src="http://localhost:7844/avatar">
+  </div>
   <div class="info">
     <h1 id="stand-name">Sutando</h1>
     <div class="meta">
@@ -866,8 +876,12 @@ function startSpeakingDetection() {
   if (speakingRAF) return;
   var avatar = document.getElementById('stand-avatar');
   var heroAvatar = document.getElementById('hero-avatar');
+  var canvas = document.getElementById('speak-canvas') as HTMLCanvasElement | null;
+  var ctx = canvas ? canvas.getContext('2d') : null;
   var buf = new Uint8Array(analyserNode ? analyserNode.frequencyBinCount : 128);
   var smoothed = 0;
+  var NUM_BARS = 24;
+  var CX = 30, CY = 30, INNER = 24, OUTER = 30; // canvas center and radii
   function tick() {
     speakingRAF = requestAnimationFrame(tick);
     if (!analyserNode) return;
@@ -875,18 +889,33 @@ function startSpeakingDetection() {
     var sum = 0;
     for (var i = 0; i < buf.length; i++) sum += buf[i];
     var avg = sum / buf.length;
-    // Smooth: fast attack, slow decay for natural feel
-    smoothed = avg > smoothed ? avg * 0.7 + smoothed * 0.3 : avg * 0.2 + smoothed * 0.8;
+    smoothed = avg > smoothed ? avg * 0.7 + smoothed * 0.3 : avg * 0.15 + smoothed * 0.85;
     var speaking = smoothed > 6;
-    var intensity = Math.min(smoothed / 60, 1); // 0..1
-    var scale = 1 + intensity * 0.08; // 1.0 to 1.08
-    var glowSize = 8 + intensity * 24; // 8px to 32px
-    var glowAlpha = 0.2 + intensity * 0.5; // 0.2 to 0.7
-    var style = speaking
-      ? 'transform:scale(' + scale.toFixed(3) + ');box-shadow:0 0 ' + glowSize.toFixed(0) + 'px rgba(110,231,183,' + glowAlpha.toFixed(2) + ')'
-      : 'transform:scale(1);box-shadow:none';
-    if (avatar) { avatar.classList.toggle('speaking', speaking); avatar.style.cssText += ';' + style; }
-    if (heroAvatar) { heroAvatar.classList.toggle('speaking', speaking); heroAvatar.style.cssText += ';' + style; }
+    if (avatar) avatar.classList.toggle('speaking', speaking);
+    if (heroAvatar) heroAvatar.classList.toggle('speaking', speaking);
+    // Draw radial bars on canvas
+    if (ctx && canvas) {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (speaking) {
+        var step = buf.length / NUM_BARS;
+        for (var i = 0; i < NUM_BARS; i++) {
+          var val = buf[Math.floor(i * step)] / 255;
+          var barLen = 2 + val * 6; // 2px min, 8px max
+          var angle = (i / NUM_BARS) * Math.PI * 2 - Math.PI / 2;
+          var x1 = CX + Math.cos(angle) * INNER;
+          var y1 = CY + Math.sin(angle) * INNER;
+          var x2 = CX + Math.cos(angle) * (INNER + barLen);
+          var y2 = CY + Math.sin(angle) * (INNER + barLen);
+          ctx.beginPath();
+          ctx.moveTo(x1, y1);
+          ctx.lineTo(x2, y2);
+          ctx.strokeStyle = 'rgba(110,231,183,' + (0.4 + val * 0.6).toFixed(2) + ')';
+          ctx.lineWidth = 2;
+          ctx.lineCap = 'round';
+          ctx.stroke();
+        }
+      }
+    }
   }
   tick();
 }
@@ -894,8 +923,10 @@ function stopSpeakingDetection() {
   if (speakingRAF) { cancelAnimationFrame(speakingRAF); speakingRAF = null; }
   var avatar = document.getElementById('stand-avatar');
   var heroAvatar = document.getElementById('hero-avatar');
-  if (avatar) { avatar.classList.remove('speaking'); avatar.style.transform = ''; avatar.style.boxShadow = ''; }
-  if (heroAvatar) { heroAvatar.classList.remove('speaking'); heroAvatar.style.transform = ''; heroAvatar.style.boxShadow = ''; }
+  if (avatar) avatar.classList.remove('speaking');
+  if (heroAvatar) heroAvatar.classList.remove('speaking');
+  var canvas = document.getElementById('speak-canvas') as HTMLCanvasElement | null;
+  if (canvas) { var ctx = canvas.getContext('2d'); if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height); }
 }
 
 // ─── Microphone capture ───────────────────────────────────
