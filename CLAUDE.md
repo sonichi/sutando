@@ -115,14 +115,17 @@ Keep each step conversational and brief — this is spoken, not read. Focus on w
 
 ## Built-in capabilities
 
-**Calendar** — read Google Calendar events (preferred) or macOS Calendar:
+**Calendar** — read Google Calendar events via `gws calendar`:
 ```bash
-~/.claude/skills/google-calendar/scripts/google-calendar.py events list --time-min 2026-03-23T00:00:00Z --time-max 2026-03-30T23:59:59Z
+gws calendar +agenda --today            # today's events (table format by default)
+gws calendar +agenda --week              # this week
+gws calendar +agenda --days 7 --format json   # next 7 days, JSON for parsing
 ```
 
-**Screen capture** — see what's on the user's screen:
+**Screen capture** — see what's on the user's screen. The screen-capture server runs on port 7845 (started by `src/startup.sh`):
 ```bash
-bash src/screen-capture.sh              # full screen → PNG path
+curl -s http://localhost:7845/capture | python3 -c 'import json,sys; print(json.load(sys.stdin)["path"])'
+# Multi-display: add ?all=true to capture every display, or ?display=N for a specific one.
 ```
 Then use the Read tool on the returned path to view the screenshot. Use this for any screen-related question: "what am I looking at", "help me with this", "what's on my screen", etc.
 
