@@ -19,8 +19,21 @@ import urllib.request
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-DM_CHANNEL = "1485370959870431433"  # Owner's Discord DM channel
 SSE_STATUS_URL = "http://localhost:8080/sse-status"
+
+# Read DM channel from discord .env or repo .env (not hardcoded)
+DM_CHANNEL = ""
+for env_path in [
+    Path.home() / ".claude" / "channels" / "discord" / ".env",
+    REPO / ".env",
+]:
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            if line.startswith("DISCORD_DM_CHANNEL="):
+                DM_CHANNEL = line.split("=", 1)[1].strip().strip('"').strip("'")
+                break
+    if DM_CHANNEL:
+        break
 
 
 def voice_connected() -> bool:
@@ -34,9 +47,10 @@ def voice_connected() -> bool:
 
 
 def send_dm(text: str) -> bool:
-    """Send text to owner's Discord DM via the MCP Discord bridge."""
-    # Use the discord bridge's reply tool via a task file approach,
-    # or call the Discord API directly if bot token is available.
+    """Send text to owner's Discord DM via Discord API."""
+    if not DM_CHANNEL:
+        print("dm-result: DISCORD_DM_CHANNEL not set in discord .env or repo .env", file=sys.stderr)
+        return False
     # Check both locations for the Discord bot token
     token = ""
     for env_path in [
