@@ -337,9 +337,11 @@ echo "      Gmail (gws) credentials are transferred but may need token refresh."
 SETUP
 chmod +x "$BUNDLE/setup-new-mac.sh"
 
-# Create tarball (wraps in sutando-migration/ directory so extract is clean)
+# Create tarball (wraps in sutando-migration/ directory so extract is clean).
+# BUNDLE already lives at ~/Desktop/sutando-migration, so no rename is needed —
+# an earlier version had a self-rename here that failed with `mv: Invalid argument`
+# under `set -e`, aborting the whole script before the tarball was created.
 cd "$HOME/Desktop"
-mv "$BUNDLE" "$HOME/Desktop/sutando-migration"
 tar czf sutando-migration.tar.gz sutando-migration
 echo ""
 echo "=== Bundle created ==="
