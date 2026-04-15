@@ -9,6 +9,7 @@
  */
 
 import { writeFileSync, readFileSync, existsSync, unlinkSync, mkdirSync, readdirSync, appendFileSync } from 'node:fs';
+import { execSync } from 'node:child_process';
 import { join } from 'node:path';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
@@ -318,8 +319,34 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 			const files = readdirSync(RESULT_DIR).filter(f => f.endsWith('.txt')).sort();
 			if (files.length === 0) return;
 
-			// Only deliver if a client is connected — otherwise keep files queued
+			// If no voice client, send results via Discord DM fallback immediately
 			if (!isClientConnected()) {
+				for (const file of files) {
+					if (_deliveredResults.has(file)) continue;
+					const path = join(RESULT_DIR, file);
+					const result = readFileSync(path, 'utf-8').trim();
+					if (result) {
+						const taskId = file.replace('.txt', '');
+						console.log(`${ts()} [TaskBridge] Voice offline — DM fallback for ${file}`);
+						try {
+							execSync(`python3 "${join(REPO_DIR, 'src', 'dm-result.py')}" --file "${path}"`, { timeout: 15_000 });
+						} catch (e: any) {
+							console.error(`${ts()} [TaskBridge] DM fallback failed: ${e.message}`);
+						}
+						_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
+						_deliveredResults.add(file);
+						_pendingTasks.delete(taskId);
+						logConversation('core-agent', `[task:${taskId}] ${result.slice(0, 200)}`);
+						try {
+							fetch('http://localhost:7843/task-done', {
+								method: 'POST',
+								headers: _apiHeaders(),
+								body: JSON.stringify({ taskId, result }),
+							}).catch(() => {});
+						} catch {}
+						setTimeout(() => { try { unlinkSync(path); } catch {} }, 10_000);
+					}
+				}
 				return;
 			}
 
