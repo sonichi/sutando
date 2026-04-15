@@ -876,7 +876,7 @@ function startSpeakingDetection() {
   if (speakingRAF) return;
   var avatar = document.getElementById('stand-avatar');
   var heroAvatar = document.getElementById('hero-avatar');
-  var canvas = document.getElementById('speak-canvas') as HTMLCanvasElement | null;
+  var canvas = document.getElementById('speak-canvas');
   var ctx = canvas ? canvas.getContext('2d') : null;
   var buf = new Uint8Array(analyserNode ? analyserNode.frequencyBinCount : 128);
   var smoothed = 0;
@@ -925,7 +925,7 @@ function stopSpeakingDetection() {
   var heroAvatar = document.getElementById('hero-avatar');
   if (avatar) avatar.classList.remove('speaking');
   if (heroAvatar) heroAvatar.classList.remove('speaking');
-  var canvas = document.getElementById('speak-canvas') as HTMLCanvasElement | null;
+  var canvas = document.getElementById('speak-canvas');
   if (canvas) { var ctx = canvas.getContext('2d'); if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height); }
 }
 
