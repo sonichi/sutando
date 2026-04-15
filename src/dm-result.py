@@ -9,12 +9,11 @@ Checks http://localhost:8080/sse-status for voiceConnected.
 If voice is connected, does nothing (voice agent will speak the result).
 If voice is disconnected, sends the result to the owner's Discord DM.
 
-Requires DISCORD_TOKEN in .env and the Discord bridge running.
+Requires DISCORD_BOT_TOKEN in ~/.claude/channels/discord/.env.
 """
 
 import json
 import os
-import subprocess
 import sys
 import urllib.request
 from pathlib import Path
