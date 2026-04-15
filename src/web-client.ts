@@ -36,11 +36,23 @@ const HTML = /* html */ `<!DOCTYPE html>
     display: flex; align-items: center; gap: 14px;
     background: #0e0e18; border-bottom: 1px solid #1a1a2e;
   }
+  .header .avatar-wrap { position: relative; width: 80px; height: 80px; display: none; align-items: center; justify-content: center; }
+  .header .avatar-wrap.visible { display: flex; }
   .header .avatar {
     width: 44px; height: 44px; border-radius: 50%;
-    border: 2px solid #4ecca3; object-fit: cover; display: none;
+    border: 2px solid #4ecca3; object-fit: cover;
     transition: box-shadow 0.15s ease, border-color 0.15s ease;
+    position: relative; z-index: 2;
   }
+  .header .avatar-waveform {
+    position: absolute; top: 50%; left: 50%;
+    width: 80px; height: 80px;
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+    opacity: 0; transition: opacity 0.3s ease;
+    z-index: 1;
+  }
+  .header .avatar-wrap.speaking .avatar-waveform { opacity: 1; }
   .header .avatar.speaking {
     border-color: #6ee7b7;
   }
@@ -250,11 +262,23 @@ const HTML = /* html */ `<!DOCTYPE html>
     display: flex; flex-direction: column; align-items: center; justify-content: center;
     padding: 48px 20px 24px;
   }
+  .hero .avatar-hero-wrap { position: relative; width: 140px; height: 140px; display: none; align-items: center; justify-content: center; margin-bottom: 16px; }
+  .hero .avatar-hero-wrap.visible { display: flex; }
   .hero .avatar-hero {
     width: 80px; height: 80px; border-radius: 50%;
-    border: 3px solid #4ecca3; object-fit: cover; margin-bottom: 16px; display: none;
+    border: 3px solid #4ecca3; object-fit: cover;
     transition: all 0.8s ease;
+    position: relative; z-index: 2;
   }
+  .hero .avatar-hero-waveform {
+    position: absolute; top: 50%; left: 50%;
+    width: 140px; height: 140px;
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+    opacity: 0; transition: opacity 0.3s ease;
+    z-index: 1;
+  }
+  .hero .avatar-hero-wrap.speaking .avatar-hero-waveform { opacity: 1; }
   .hero .avatar-hero.speaking {
     border-color: #6ee7b7;
   }
@@ -306,7 +330,10 @@ const HTML = /* html */ `<!DOCTYPE html>
 <body>
 
 <div class="header">
-  <img class="avatar" id="stand-avatar" src="http://localhost:7844/avatar">
+  <div class="avatar-wrap" id="stand-avatar-wrap">
+    <canvas class="avatar-waveform" id="stand-waveform" width="160" height="160"></canvas>
+    <img class="avatar" id="stand-avatar" src="http://localhost:7844/avatar">
+  </div>
   <div class="info">
     <h1 id="stand-name">Sutando</h1>
     <div class="meta">
@@ -332,17 +359,18 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
     if(t) t.textContent=s.nameOrigin.split(' — ')[1]||s.nameOrigin;
   }
   if(s.avatarGenerated){
-    document.getElementById('stand-avatar').style.display='block';
-    var ha=document.getElementById('hero-avatar');
-    if(ha){ha.style.display='block';ha.style.opacity='0';}
+    var wrap=document.getElementById('stand-avatar-wrap');
+    if(wrap) wrap.classList.add('visible');
+    var hwrap=document.getElementById('hero-avatar-wrap');
+    if(hwrap){hwrap.classList.add('visible');hwrap.style.opacity='0';}
   }
   if(s.name || s.avatarGenerated){
     var hero=document.getElementById('hero');
     if(hero){
       requestAnimationFrame(function(){
         hero.classList.add('identity-reveal');
-        var ha2=document.getElementById('hero-avatar');
-        if(ha2) ha2.style.opacity='1';
+        var hwrap2=document.getElementById('hero-avatar-wrap');
+        if(hwrap2) hwrap2.style.opacity='1';
       });
     }
   }
@@ -350,7 +378,10 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
 </script>
 
 <div class="hero" id="hero">
-  <img class="avatar-hero" id="hero-avatar" src="http://localhost:7844/avatar">
+  <div class="avatar-hero-wrap" id="hero-avatar-wrap">
+    <canvas class="avatar-hero-waveform" id="hero-waveform" width="280" height="280"></canvas>
+    <img class="avatar-hero" id="hero-avatar" src="http://localhost:7844/avatar">
+  </div>
   <h2 id="hero-name">Sutando</h2>
   <p class="tagline">Summon your AI superpower</p>
   <button class="btn-hero" onclick="toggle()">Start Voice</button>
@@ -862,10 +893,46 @@ function playChunk(arrayBuf) {
 }
 
 // ─── Speaking detection (avatar animation) ────────────────
+// Draws a Siri-style radial waveform around the avatar — N bars anchored at
+// the avatar's outer edge, extending outward with length = amplitude of a
+// frequency bin. Reads unambiguously as "audio is coming out of this avatar".
+// On silence, bars collapse + the wrapper fades out via CSS opacity.
+var WAVEFORM_BARS = 32;
+function drawWaveform(canvas, bins, intensity, innerR, outerMaxR) {
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+  var w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  if (intensity <= 0) return;
+  var cx = w / 2, cy = h / 2;
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = '#6ee7b7';
+  for (var i = 0; i < WAVEFORM_BARS; i++) {
+    // Bucket frequency data into WAVEFORM_BARS bins.
+    var binIdx = Math.floor((i / WAVEFORM_BARS) * bins.length);
+    var binVal = bins[binIdx] / 255; // 0..1
+    var barLen = (outerMaxR - innerR) * binVal * intensity;
+    if (barLen < 1) continue;
+    var angle = (i / WAVEFORM_BARS) * Math.PI * 2 - Math.PI / 2;
+    var x1 = cx + Math.cos(angle) * innerR;
+    var y1 = cy + Math.sin(angle) * innerR;
+    var x2 = cx + Math.cos(angle) * (innerR + barLen);
+    var y2 = cy + Math.sin(angle) * (innerR + barLen);
+    ctx.globalAlpha = 0.4 + binVal * 0.5;
+    ctx.lineWidth = 2 + binVal * 2;
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+}
 function startSpeakingDetection() {
   if (speakingRAF) return;
-  var avatar = document.getElementById('stand-avatar');
-  var heroAvatar = document.getElementById('hero-avatar');
+  var wrap = document.getElementById('stand-avatar-wrap');
+  var heroWrap = document.getElementById('hero-avatar-wrap');
+  var canvas = document.getElementById('stand-waveform');
+  var heroCanvas = document.getElementById('hero-waveform');
   var buf = new Uint8Array(analyserNode ? analyserNode.frequencyBinCount : 128);
   var smoothed = 0;
   function tick() {
@@ -879,23 +946,25 @@ function startSpeakingDetection() {
     smoothed = avg > smoothed ? avg * 0.7 + smoothed * 0.3 : avg * 0.2 + smoothed * 0.8;
     var speaking = smoothed > 6;
     var intensity = Math.min(smoothed / 60, 1); // 0..1
-    var scale = 1 + intensity * 0.08; // 1.0 to 1.08
-    var glowSize = 8 + intensity * 24; // 8px to 32px
-    var glowAlpha = 0.2 + intensity * 0.5; // 0.2 to 0.7
-    var style = speaking
-      ? 'transform:scale(' + scale.toFixed(3) + ');box-shadow:0 0 ' + glowSize.toFixed(0) + 'px rgba(110,231,183,' + glowAlpha.toFixed(2) + ')'
-      : 'transform:scale(1);box-shadow:none';
-    if (avatar) { avatar.classList.toggle('speaking', speaking); avatar.style.cssText += ';' + style; }
-    if (heroAvatar) { heroAvatar.classList.toggle('speaking', speaking); heroAvatar.style.cssText += ';' + style; }
+    if (wrap) wrap.classList.toggle('speaking', speaking);
+    if (heroWrap) heroWrap.classList.toggle('speaking', speaking);
+    // Header canvas: 160px, inner radius = 23 (half avatar+border), outer = 75
+    drawWaveform(canvas, buf, intensity, 23, 75);
+    // Hero canvas: 280px, inner radius = 43, outer = 135
+    drawWaveform(heroCanvas, buf, intensity, 43, 135);
   }
   tick();
 }
 function stopSpeakingDetection() {
   if (speakingRAF) { cancelAnimationFrame(speakingRAF); speakingRAF = null; }
-  var avatar = document.getElementById('stand-avatar');
-  var heroAvatar = document.getElementById('hero-avatar');
-  if (avatar) { avatar.classList.remove('speaking'); avatar.style.transform = ''; avatar.style.boxShadow = ''; }
-  if (heroAvatar) { heroAvatar.classList.remove('speaking'); heroAvatar.style.transform = ''; heroAvatar.style.boxShadow = ''; }
+  var wrap = document.getElementById('stand-avatar-wrap');
+  var heroWrap = document.getElementById('hero-avatar-wrap');
+  var canvas = document.getElementById('stand-waveform');
+  var heroCanvas = document.getElementById('hero-waveform');
+  if (wrap) wrap.classList.remove('speaking');
+  if (heroWrap) heroWrap.classList.remove('speaking');
+  if (canvas) { var c1 = canvas.getContext('2d'); c1.clearRect(0, 0, canvas.width, canvas.height); }
+  if (heroCanvas) { var c2 = heroCanvas.getContext('2d'); c2.clearRect(0, 0, heroCanvas.width, heroCanvas.height); }
 }
 
 // ─── Microphone capture ───────────────────────────────────
