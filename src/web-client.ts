@@ -882,6 +882,29 @@ function startSpeakingDetection() {
   var smoothed = 0;
   var NUM_BARS = 24;
   var CX = 30, CY = 30, INNER = 24, OUTER = 30; // canvas center and radii
+  // Formant-weighting: find top-3 peak bins (approximate F1/F2/F3) per frame,
+  // then boost bars near those bins so the ring shape visibly shifts with
+  // vowel changes instead of just pulsing louder.
+  var K = 3;
+  var peakIdx = new Int16Array(K);
+  var peakVal = new Uint8Array(K);
+  function findPeaks() {
+    for (var k = 0; k < K; k++) { peakIdx[k] = -1; peakVal[k] = 0; }
+    // Skip bin 0 (DC) and last bin (Nyquist) — noisy, not formant-bearing.
+    for (var i = 1; i < buf.length - 1; i++) {
+      if (buf[i] < buf[i - 1] || buf[i] <= buf[i + 1]) continue;
+      var v = buf[i];
+      for (var k = 0; k < K; k++) {
+        if (v > peakVal[k]) {
+          for (var j = K - 1; j > k; j--) {
+            peakVal[j] = peakVal[j - 1]; peakIdx[j] = peakIdx[j - 1];
+          }
+          peakVal[k] = v; peakIdx[k] = i;
+          break;
+        }
+      }
+    }
+  }
   function tick() {
     speakingRAF = requestAnimationFrame(tick);
     if (!analyserNode) return;
@@ -897,9 +920,22 @@ function startSpeakingDetection() {
     if (ctx && canvas) {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       if (speaking) {
+        findPeaks();
         var step = buf.length / NUM_BARS;
         for (var i = 0; i < NUM_BARS; i++) {
-          var val = buf[Math.floor(i * step)] / 255;
+          var binIdx = Math.floor(i * step);
+          var raw = buf[binIdx] / 255;
+          // Bars within 6 bins of any peak get up to 1.8x their raw height.
+          // Bars far from any peak stay at their raw value. Fall back to
+          // pure amplitude (boost=1.0) when no peaks were found (silence).
+          var minDist = 999;
+          for (var k = 0; k < K; k++) {
+            if (peakIdx[k] < 0) continue;
+            var d = Math.abs(binIdx - peakIdx[k]);
+            if (d < minDist) minDist = d;
+          }
+          var boost = minDist >= 6 ? 1.0 : 1.0 + (1 - minDist / 6) * 0.8;
+          var val = Math.min(1.0, raw * boost);
           var barLen = 2 + val * 6; // 2px min, 8px max
           var angle = (i / NUM_BARS) * Math.PI * 2 - Math.PI / 2;
           var x1 = CX + Math.cos(angle) * INNER;
