@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import shlex
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -137,6 +138,7 @@ async def on_ready():
     client.loop.create_task(poll_results())
     client.loop.create_task(poll_approved())
     client.loop.create_task(poll_proactive())
+    client.loop.create_task(poll_dm_fallback())
 
 
 def _message_mentions_bot(message):
@@ -696,6 +698,68 @@ async def poll_proactive():
         except Exception as e:
             print(f"  [proactive] poll error: {e}")
         await asyncio.sleep(3)
+
+
+async def poll_dm_fallback():
+    """Fallback path for task/question/briefing results that no other
+    consumer is going to handle.
+
+    These are voice-originated or cron-originated results (not Discord or
+    Telegram, which have their own pending-reply paths). When the voice
+    client is disconnected — or the file has been sitting long enough that
+    it's clearly stale — the result would otherwise be silently lost. This
+    loop shells out to `src/dm-result.py`, which contains the
+    voiceConnected-check + Discord-DM-send logic shipped in PR #347.
+
+    Grace period: 90s. Discord-bound files are skipped via `pending_replies`
+    so we don't race with `poll_results()`. Proactive files are handled by
+    `poll_proactive()` already, so we don't touch those either.
+    """
+    GRACE_SECONDS = 90
+    FALLBACK_PREFIXES = ("task-", "question-", "briefing-", "insight-", "friction-")
+    while True:
+        try:
+            now = time.time()
+            for f in RESULTS_DIR.iterdir():
+                if f.suffix != ".txt":
+                    continue
+                if not any(f.name.startswith(p) for p in FALLBACK_PREFIXES):
+                    continue
+                # Skip anything Discord is already tracking for reply.
+                task_id = f.stem  # e.g. "task-1776286725412"
+                if task_id in pending_replies:
+                    continue
+                # Grace window so voice-agent / telegram-bridge get first dibs.
+                try:
+                    age = now - f.stat().st_mtime
+                except FileNotFoundError:
+                    continue
+                if age < GRACE_SECONDS:
+                    continue
+                # Subprocess out to the shared CLI tool so there's only one
+                # code path for the voiceConnected check + DM send.
+                try:
+                    result = subprocess.run(
+                        ["python3", str(REPO / "src" / "dm-result.py"), "--file", str(f)],
+                        capture_output=True, text=True, timeout=15,
+                    )
+                except Exception as e:
+                    print(f"  [dm-fallback] subprocess failed on {f.name}: {e}")
+                    continue
+                if result.returncode == 0:
+                    stdout = (result.stdout or "").strip()
+                    # dm-result.py prints "voice connected, skipping" when voice is up.
+                    # In that case we leave the file alone for voice-agent to pick up.
+                    if "skipping DM" in stdout:
+                        continue
+                    print(f"  [dm-fallback] sent {f.name} via dm-result.py")
+                    f.unlink(missing_ok=True)
+                else:
+                    stderr = (result.stderr or "").strip()[:200]
+                    print(f"  [dm-fallback] dm-result.py failed on {f.name}: {stderr}")
+        except Exception as e:
+            print(f"  [dm-fallback] poll error: {e}")
+        await asyncio.sleep(30)
 
 
 def _send_via_rest(channel_id: str, message: str):
