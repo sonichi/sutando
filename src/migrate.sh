@@ -32,6 +32,12 @@ if [ -d "$MEMORY_DIR" ]; then
   echo "  ✓ memory ($(ls "$MEMORY_DIR"/*.md 2>/dev/null | wc -l) files)"
 fi
 
+# 2b. Notes (durable docs, blog drafts, research memos, session handoffs)
+if [ -d "$REPO/notes" ]; then
+  cp -r "$REPO/notes" "$BUNDLE/notes"
+  echo "  ✓ notes ($(find "$REPO/notes" -name '*.md' | wc -l | tr -d ' ') files)"
+fi
+
 # 3. Claude Code settings
 if [ -d "$HOME/.claude" ]; then
   mkdir -p "$BUNDLE/claude-config"
@@ -39,6 +45,12 @@ if [ -d "$HOME/.claude" ]; then
   cp -r "$HOME/.claude/channels" "$BUNDLE/claude-config/channels" 2>/dev/null
   cp -r "$HOME/.claude/skills" "$BUNDLE/claude-config/skills" 2>/dev/null
   echo "  ✓ claude config (settings, channels, skills)"
+fi
+
+# 3b. Root ~/.claude.json (MCP server registrations — macos-use, playwright, etc.)
+if [ -f "$HOME/.claude.json" ]; then
+  cp "$HOME/.claude.json" "$BUNDLE/claude-config/claude.json"
+  echo "  ✓ ~/.claude.json (MCP servers)"
 fi
 
 # 4. Gitignored runtime files
@@ -98,8 +110,20 @@ cat > "$BUNDLE/setup-new-mac.sh" << 'SETUP'
 echo "=== Sutando New Mac Setup ==="
 echo ""
 
+# ── 0. Xcode Command Line Tools (needed for Swift — Sutando.app + mediar-ai MCP) ──
+echo "Step 0/7: Xcode command line tools..."
+if ! xcode-select -p >/dev/null 2>&1; then
+  echo "  Installing Xcode CLT (this may prompt a GUI dialog — accept it)..."
+  xcode-select --install 2>/dev/null || true
+  echo "  ⚠ If a dialog appeared, click Install and wait for it to finish, then re-run this script."
+  echo "    Otherwise the Swift compile steps below will fail."
+fi
+if xcode-select -p >/dev/null 2>&1; then
+  echo "  ✓ Xcode CLT at $(xcode-select -p)"
+fi
+
 # ── 1. Homebrew ──
-echo "Step 1/6: Homebrew..."
+echo "Step 1/7: Homebrew..."
 if ! which brew >/dev/null 2>&1; then
   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 fi
@@ -109,12 +133,12 @@ grep -q 'brew shellenv' ~/.zshrc 2>/dev/null || echo 'eval "$(/opt/homebrew/bin/
 which brew >/dev/null 2>&1 && echo "  ✓ Homebrew" || echo "  ✗ Homebrew failed"
 
 # ── 2. System packages ──
-echo "Step 2/6: System packages..."
+echo "Step 2/7: System packages..."
 brew install fswatch ffmpeg python3 2>/dev/null
 echo "  ✓ fswatch, ffmpeg, python3"
 
 # ── 3. Node.js via nvm ──
-echo "Step 3/6: Node.js..."
+echo "Step 3/7: Node.js..."
 export NVM_DIR="$HOME/.nvm"
 if [ ! -d "$NVM_DIR" ]; then
   curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
@@ -131,7 +155,7 @@ fi
 which node >/dev/null 2>&1 && echo "  ✓ Node.js $(node -v)" || echo "  ✗ Node.js failed"
 
 # ── 4. Claude Code ──
-echo "Step 4/6: Claude Code..."
+echo "Step 4/7: Claude Code..."
 if ! which claude >/dev/null 2>&1; then
   curl -fsSL https://claude.ai/install.sh | bash 2>/dev/null || true
 fi
@@ -140,7 +164,7 @@ grep -q '.local/bin' ~/.zshrc 2>/dev/null || echo 'export PATH="$HOME/.local/bin
 which claude >/dev/null 2>&1 && echo "  ✓ Claude Code" || echo "  ✗ Claude Code — install manually: https://docs.anthropic.com/en/docs/claude-code"
 
 # ── 5. Clone repo + install deps ──
-echo "Step 5/6: Repository..."
+echo "Step 5/7: Repository..."
 BUNDLE_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO="$HOME/Desktop/sutando"
 
@@ -171,7 +195,7 @@ done
 echo ""
 
 # ── 6. Restore all bundle files ──
-echo "Step 6/6: Restoring files..."
+echo "Step 6/7: Restoring files..."
 
 # Copy .env
 [ -f "$BUNDLE_DIR/.env" ] && cp "$BUNDLE_DIR/.env" "$REPO/.env" && echo "  ✓ .env restored"
@@ -182,6 +206,13 @@ if [ -d "$BUNDLE_DIR/memory" ]; then
   mkdir -p "$MEMORY_DIR"
   cp -r "$BUNDLE_DIR/memory/"* "$MEMORY_DIR/"
   echo "  ✓ memory restored"
+fi
+
+# Copy notes (durable docs, blog drafts, research memos)
+if [ -d "$BUNDLE_DIR/notes" ]; then
+  mkdir -p "$REPO/notes"
+  cp -r "$BUNDLE_DIR/notes/"* "$REPO/notes/"
+  echo "  ✓ notes restored"
 fi
 
 # Copy claude config
@@ -195,6 +226,11 @@ if [ -d "$BUNDLE_DIR/claude-config" ]; then
     echo "  ✓ discord token swapped to Sutando-Mini"
   fi
   [ -d "$BUNDLE_DIR/claude-config/skills" ] && cp -r "$BUNDLE_DIR/claude-config/skills" "$HOME/.claude/"
+  # Root ~/.claude.json (MCP server registrations)
+  if [ -f "$BUNDLE_DIR/claude-config/claude.json" ]; then
+    cp "$BUNDLE_DIR/claude-config/claude.json" "$HOME/.claude.json"
+    echo "  ✓ ~/.claude.json (MCP servers) restored"
+  fi
   echo "  ✓ claude config restored"
 fi
 
@@ -257,14 +293,44 @@ else
   echo "  ⚠ Claude Code not in PATH — install skills after auth"
 fi
 
+# Install in-repo skills (symlink into ~/.claude/skills)
+if [ -f "$REPO/skills/install.sh" ]; then
+  echo "Installing in-repo skills..."
+  bash "$REPO/skills/install.sh" 2>&1 | sed 's/^/  /'
+fi
+
+# ── 7. Build mediar-ai mcp-server-macos-use (binary is machine-specific, can't bundle) ──
+echo "Step 7/7: mediar-ai MCP server (GUI control)..."
+if [ -f "$REPO/skills/macos-use/scripts/build.sh" ]; then
+  echo "  Building mcp-server-macos-use (~35s Swift release build)..."
+  bash "$REPO/skills/macos-use/scripts/build.sh" 2>&1 | sed 's/^/  /' || {
+    echo "  ⚠ Build failed — run manually later: bash skills/macos-use/scripts/build.sh"
+  }
+  # Register the MCP server in Claude Code config
+  if [ -f "$HOME/.macos-use-mcp/.build/release/mcp-server-macos-use" ]; then
+    bash "$REPO/skills/macos-use/scripts/install-mcp.sh" 2>&1 | sed 's/^/  /' || true
+    echo "  ⚠ Remember: grant Accessibility permission to ~/.macos-use-mcp/.build/release/mcp-server-macos-use"
+    echo "    System Settings → Privacy & Security → Accessibility → click + and add the binary"
+  fi
+else
+  echo "  ⚠ skills/macos-use/ not in the bundled repo — older sutando version?"
+fi
+
 echo ""
 echo "=== Setup complete ==="
 echo ""
 echo "Next steps:"
 echo "  1. Authenticate Claude Code: claude auth login"
-echo "  2. Run: bash src/startup.sh"
-echo "  3. Grant macOS permissions when prompted (Screen Recording, Accessibility, Notifications)"
-echo "  4. Start the proactive loop: /proactive-loop"
+echo "  2. Grant Accessibility permission for mcp-server-macos-use (see step 7 above)"
+echo "  3. Review .env on this node:"
+echo "       - SUTANDO_TEAM_TIER_OWNER: if set from source node, decide whether this new"
+echo "         node should OWN team-tier processing (keep value) or DROP it (unset)."
+echo "         Unset → both nodes process (legacy); set to same value on both → one node wins."
+echo "       - stand-identity.json: update 'machine' field to this node's identifier"
+echo "         (e.g., 'mac-studio', 'macbook-air') so SUTANDO_TEAM_TIER_OWNER comparisons work."
+echo "  4. Run: bash src/startup.sh"
+echo "  5. Grant macOS permissions when prompted (Screen Recording, Accessibility, Notifications)"
+echo "  6. Start the proactive loop: /proactive-loop"
 echo ""
 echo "Note: Google Calendar uses macOS keyring — run the calendar script once to re-authenticate."
 echo "      Gmail (gws) credentials are transferred but may need token refresh."
