@@ -192,6 +192,18 @@ python3 ~/.claude/skills/macos-tools/scripts/reminders.py complete "Call Bob"  #
 ```
 Use for "add a reminder", "what's on my todo list", "remind me to...", "mark X as done".
 
+**macOS GUI control** — click, type, scroll, press keys in any Mac app via `macos-use` MCP skill. Works in non-interactive mode (which is how the proactive loop runs), unlike Claude's built-in computer-use. Accessibility-tree based — no screenshots leave the machine.
+
+Tools (after `bash skills/macos-use/scripts/build.sh && bash skills/macos-use/scripts/install-mcp.sh`):
+- `mcp__macos-use__open_application_and_traverse` — open/activate an app, return its a11y tree
+- `mcp__macos-use__click_and_traverse` — click at coordinates in a target PID
+- `mcp__macos-use__type_and_traverse` — type text into the focused element
+- `mcp__macos-use__press_key_and_traverse` — press a named key (Return, Tab, arrows, ...)
+- `mcp__macos-use__scroll_and_traverse` — scroll in a direction
+- `mcp__macos-use__refresh_traversal` — re-read the a11y tree without acting
+
+Prefer this for any "open X and do Y" task in a native app (Zoom join, Mail compose, Finder navigation). For web pages, prefer Browser automation (below). Full doc in `skills/macos-use/SKILL.md`.
+
 **Browser automation** — navigate, read, fill forms, screenshot web pages:
 
 Preferred (interactive): Use **Playwright MCP tools** (`mcp__playwright__*`) or **Chrome plugin** (`mcp__claude-in-chrome__*`). These provide real browser control with live DOM access, screenshots, and form interaction.
