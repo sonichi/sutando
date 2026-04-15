@@ -246,7 +246,9 @@ fi
 # Copy Google credentials (gmail)
 if [ -d "$BUNDLE_DIR/gws" ]; then
   mkdir -p "$HOME/.config/gws"
-  cp "$BUNDLE_DIR/gws/"* "$HOME/.config/gws/"
+  # Include dotfiles — .encryption_key is bundled but default glob skips it.
+  # `cp -a SRC/. DST/` copies contents (including dotfiles) without nesting.
+  cp -a "$BUNDLE_DIR/gws/." "$HOME/.config/gws/"
   chmod 600 "$HOME/.config/gws/.encryption_key" "$HOME/.config/gws/credentials.enc" 2>/dev/null
   echo "  ✓ Google gmail credentials restored"
 fi
