@@ -252,10 +252,12 @@ def check_voice_watchers(voice_check: dict) -> dict:
     appears after it.
     """
     check = {"name": "voice-watchers", "status": "ok", "detail": "all 3 watchers active"}
-    # Only run if voice-agent itself is up; otherwise the check is moot
-    if voice_check.get("status") != "ok":
+    # Only run if voice-agent itself is ok; otherwise the check is moot.
+    # Distinguish "stale" (process running, old code) from absent.
+    vs = voice_check.get("status")
+    if vs != "ok":
         check["status"] = "warn"
-        check["detail"] = "voice-agent not running"
+        check["detail"] = f"voice-agent {vs}" if vs else "voice-agent status unknown"
         return check
     log_file = REPO_DIR / "logs" / "voice-agent.log"
     if not log_file.exists():
@@ -329,9 +331,10 @@ def check_voice_transport(voice_check: dict) -> dict:
     to whoever manually tails the log.
     """
     check = {"name": "voice-transport", "status": "ok", "detail": "no recent transport errors"}
-    if voice_check.get("status") != "ok":
+    vs = voice_check.get("status")
+    if vs != "ok":
         check["status"] = "warn"
-        check["detail"] = "voice-agent not running"
+        check["detail"] = f"voice-agent {vs}" if vs else "voice-agent status unknown"
         return check
     log_file = REPO_DIR / "logs" / "voice-agent.log"
     if not log_file.exists():
