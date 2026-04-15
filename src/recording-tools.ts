@@ -464,7 +464,15 @@ export const openFileTool: ToolDefinition = {
 			// This lets the model tell the user + offer to wait for subtitled.
 			const isSubtitled = recPath.includes('-subtitled');
 			const isNarrated = !isSubtitled && recPath.includes('-narrated');
-			const subtitled_pending = !isSubtitled && recPath.includes('sutando-recording');
+			// Only flag subtitled_pending if there's real evidence a burn might still be in progress:
+			// SRT file exists (transcript was generated) AND no subtitled mov exists yet.
+			// Without this check, every recording is flagged as "subtitles generating" forever.
+			const expectedSubtitled = isNarrated
+				? recPath.replace('.mov', '-subtitled.mov')
+				: recPath.replace('.mov', '-narrated-subtitled.mov');
+			const subtitled_pending = !isSubtitled && recPath.includes('sutando-recording')
+				&& existsSync(LIVE_TRANSCRIPT_SRT_PATH)
+				&& !existsSync(expectedSubtitled);
 			const version = isSubtitled ? 'subtitled' : (isNarrated ? 'narrated' : 'raw');
 			const instruction = subtitled_pending
 				? `Opened the ${version} version. The subtitled version is still being generated in the background. Tell the user: "I opened the ${version} version. Subtitles are still being generated — want me to switch to the subtitled version when it's ready?" If they say yes, wait ~30 seconds and then call open_file again without arguments; it will pick up the subtitled version if the burn-in has finished. When user says play, call play_video.`
