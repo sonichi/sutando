@@ -37,6 +37,42 @@ TASKS_DIR.mkdir(exist_ok=True)
 RESULTS_DIR.mkdir(exist_ok=True)
 INBOX_DIR.mkdir(exist_ok=True)
 
+# Optional: deterministic ownership for team/other-tier tasks across nodes.
+# When set, only the node whose stand-identity.json `machine` field matches
+# SUTANDO_TEAM_TIER_OWNER will accept non-owner-tier tasks. The other nodes
+# silently drop them. Prevents the dup-processing that otherwise burns 2x
+# codex quota and posts 2x replies to the Discord channel whenever Mac Mini
+# and MacBook both receive the same team-tier @mention.
+#
+# Unset → both nodes process (legacy behavior, no regression).
+# Set same value on both nodes' .env → only the matching node processes.
+#
+# Example: SUTANDO_TEAM_TIER_OWNER=mac-mini
+TEAM_TIER_OWNER = ""
+LOCAL_MACHINE = ""
+try:
+    env_file = REPO / ".env"
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            if line.startswith("SUTANDO_TEAM_TIER_OWNER="):
+                TEAM_TIER_OWNER = line.split("=", 1)[1].strip().strip('"').strip("'")
+                break
+except Exception:
+    pass
+
+try:
+    identity_file = REPO / "stand-identity.json"
+    if identity_file.exists():
+        LOCAL_MACHINE = json.loads(identity_file.read_text()).get("machine", "")
+except Exception:
+    pass
+
+if TEAM_TIER_OWNER:
+    if LOCAL_MACHINE == TEAM_TIER_OWNER:
+        print(f"[tier-ownership] this node ({LOCAL_MACHINE}) owns team/other-tier processing")
+    else:
+        print(f"[tier-ownership] this node ({LOCAL_MACHINE or 'unknown'}) will DROP team/other-tier tasks (owner: {TEAM_TIER_OWNER})")
+
 # Dedup: skip duplicate messages (Discord gateway can replay events on reconnect)
 seen_message_ids = set()  # Discord message IDs already processed
 
@@ -423,6 +459,14 @@ async def _handle_discord_message(message, force=False):
     # Cap set size to prevent unbounded growth
     if len(seen_message_ids) > 10000:
         seen_message_ids.clear()
+
+    # Deterministic tier ownership: if SUTANDO_TEAM_TIER_OWNER is configured
+    # and this node's machine does NOT match, drop non-owner-tier tasks so the
+    # designated owner node handles them exclusively. Owner-tier tasks are
+    # always processed locally regardless of this setting.
+    if access_tier != "owner" and TEAM_TIER_OWNER and LOCAL_MACHINE != TEAM_TIER_OWNER:
+        print(f"  [tier-ownership] dropping {access_tier}-tier task from @{username} — owner is {TEAM_TIER_OWNER}, this node is {LOCAL_MACHINE or 'unknown'}")
+        return
 
     # Write as task
     ts = int(time.time() * 1000)
