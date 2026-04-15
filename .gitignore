@@ -47,6 +47,11 @@ tests/security/*.md
 !tests/security/*.md.example
 skills/schedule-crons/crons.json
 src/Sutando/Sutando
+# NativeMic.swift was removed in PR #329 and keeps getting re-added by
+# search-and-replace sweeps that leave a stale copy in the working tree
+# (regressed in #341, re-deleted in #342). Ignore it so a casual `git add .`
+# can't resurrect it.
+src/Sutando/NativeMic.swift
 voice-context.txt
 tab-aliases.json
 session-state.md
