@@ -70,8 +70,16 @@ except Exception:
 if TEAM_TIER_OWNER:
     if LOCAL_MACHINE == TEAM_TIER_OWNER:
         print(f"[tier-ownership] this node ({LOCAL_MACHINE}) owns team/other-tier processing")
+    elif not LOCAL_MACHINE:
+        # Misconfiguration: TEAM_TIER_OWNER is set but stand-identity.json is
+        # missing/unreadable. We'll silently drop ALL non-owner tasks, which
+        # looks like a complete outage from the Discord side. Flag loudly at
+        # startup so the operator notices.
+        print(f"[tier-ownership] ⚠ WARNING: SUTANDO_TEAM_TIER_OWNER={TEAM_TIER_OWNER} but local machine identity is EMPTY")
+        print(f"[tier-ownership] ⚠ stand-identity.json missing or has no 'machine' field — ALL non-owner tier tasks will be DROPPED silently")
+        print(f"[tier-ownership] ⚠ Fix: populate stand-identity.json with machine='<your-node-id>' or unset SUTANDO_TEAM_TIER_OWNER")
     else:
-        print(f"[tier-ownership] this node ({LOCAL_MACHINE or 'unknown'}) will DROP team/other-tier tasks (owner: {TEAM_TIER_OWNER})")
+        print(f"[tier-ownership] this node ({LOCAL_MACHINE}) will DROP team/other-tier tasks (owner: {TEAM_TIER_OWNER})")
 
 # Dedup: skip duplicate messages (Discord gateway can replay events on reconnect)
 seen_message_ids = set()  # Discord message IDs already processed
