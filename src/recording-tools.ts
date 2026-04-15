@@ -418,7 +418,10 @@ export const openFileTool: ToolDefinition = {
 		'If the user says "open the log" or similar, ASK which log they mean (voice-agent, discord-bridge, etc.) — do NOT default to a recording. ' +
 		'Do NOT call play_video after this — wait for user to explicitly say "play". ' +
 		'Known files: "diagnostic tracker" or "diagnostics" = /tmp/phone-diagnostics-tracker.html, ' +
-		'"voice diagnostics" = /tmp/voice-diagnostics-tracker.html.',
+		'"voice diagnostics" = /tmp/voice-diagnostics-tracker.html. ' +
+		'For recordings: returns immediately with best-available version. If `subtitled_pending` is true in the result, the subtitled burn is still running in the background — TELL the user ' +
+		'"I opened the narrated version; subtitled is still being generated — want me to switch to it when it\'s ready?" ' +
+		'and wait for the user\'s answer. If they say yes/wait, call `open_file` again in ~30 seconds and it will probably return the subtitled version.',
 	parameters: z.object({
 		path: z.string().optional().describe('File path to open. Omit to open the latest screen recording. Use known file aliases for diagnostic tracker etc.'),
 	}),
@@ -434,18 +437,18 @@ export const openFileTool: ToolDefinition = {
 				console.log(`${ts()} [OpenFile] path "${recPath}" does not exist`);
 				return { error: `File not found: ${recPath}. Ask the user for the correct path or use "work" to locate it.` };
 			}
-			// Fallback: find latest recording if no path given or path invalid
-			// Poll up to 18s — subtitle burn happens async after recording stops
+			// Recording fallback: return immediately with best-available version.
+			// No polling — the prior 18s wait for subtitled exceeded Gemini Live's
+			// tool-call timeout on phone calls (the model would then report "I
+			// can't find the recording" even though the narrated file was on
+			// disk). If subtitled isn't ready, we flag subtitled_pending and let
+			// the model ask the user whether to wait + retry.
 			if (!recPath) {
-				for (let i = 0; i < 10; i++) {
-					recPath = findRecording();
-					if (recPath && recPath.includes('-subtitled')) break;
-					if (recPath && i < 6) { await new Promise(r => setTimeout(r, 3000)); continue; }
-					if (!recPath) { await new Promise(r => setTimeout(r, 2000)); }
-					else break;
-				}
+				recPath = findRecording();
 			}
-			if (!recPath || !isReadableFile(recPath)) return { error: 'No file found. Try again in a few seconds.' };
+			if (!recPath || !isReadableFile(recPath)) {
+				return { error: 'No recording found yet. Ask the user to wait a moment and try again.' };
+			}
 			if (recPath.includes('sutando-recording')) {
 				writeFileSync('/tmp/sutando-playback-path', recPath);
 			}
@@ -457,8 +460,25 @@ export const openFileTool: ToolDefinition = {
 				const dur = execSync(`/opt/homebrew/bin/ffprobe -v error -show_entries format=duration -of csv=p=0 "${recPath}"`, { timeout: 5_000 }).toString().trim();
 				duration_seconds = Math.round(parseFloat(dur));
 			} catch {}
-			console.log(`${ts()} [OpenFile] opened ${recPath} (${(size / 1024 / 1024).toFixed(1)}MB, ${duration_seconds ?? '?'}s)`);
-			return { status: 'opened', path: recPath, size_mb: +(size / 1024 / 1024).toFixed(1), duration_seconds, instruction: 'File opened. When user says play, call play_video.' };
+			// Flag whether the opened version is the subtitled burn-in or an earlier cut.
+			// This lets the model tell the user + offer to wait for subtitled.
+			const isSubtitled = recPath.includes('-subtitled');
+			const isNarrated = !isSubtitled && recPath.includes('-narrated');
+			const subtitled_pending = !isSubtitled && recPath.includes('sutando-recording');
+			const version = isSubtitled ? 'subtitled' : (isNarrated ? 'narrated' : 'raw');
+			const instruction = subtitled_pending
+				? `Opened the ${version} version. The subtitled version is still being generated in the background. Tell the user: "I opened the ${version} version. Subtitles are still being generated — want me to switch to the subtitled version when it's ready?" If they say yes, wait ~30 seconds and then call open_file again without arguments; it will pick up the subtitled version if the burn-in has finished. When user says play, call play_video.`
+				: `File opened (${version}). When user says play, call play_video.`;
+			console.log(`${ts()} [OpenFile] opened ${recPath} (${version}, ${(size / 1024 / 1024).toFixed(1)}MB, ${duration_seconds ?? '?'}s, subtitled_pending=${subtitled_pending})`);
+			return {
+				status: 'opened',
+				path: recPath,
+				version,
+				size_mb: +(size / 1024 / 1024).toFixed(1),
+				duration_seconds,
+				subtitled_pending,
+				instruction,
+			};
 		} catch (err) {
 			return { error: `open_file failed: ${err instanceof Error ? err.message : err}` };
 		}
