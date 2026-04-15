@@ -35,15 +35,21 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 2
 fi
 
-python3 - <<PY
+# Pass values via env vars instead of heredoc interpolation so quotes /
+# special characters in $CONFIG_FILE or $BINARY can't break the Python source.
+MACOS_USE_CONFIG="$CONFIG_FILE" \
+MACOS_USE_BINARY="$BINARY" \
+MACOS_USE_SCOPE="$SCOPE" \
+python3 - <<'PY'
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 
-config_path = Path("$CONFIG_FILE")
-binary = "$BINARY"
-scope = "$SCOPE"
+config_path = Path(os.environ["MACOS_USE_CONFIG"])
+binary = os.environ["MACOS_USE_BINARY"]
+scope = os.environ["MACOS_USE_SCOPE"]
 
 if config_path.exists():
     try:
@@ -66,7 +72,22 @@ if existing == desired:
 else:
     cfg["mcpServers"]["macos-use"] = desired
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(json.dumps(cfg, indent=2) + "\n")
+    # Atomic write: tmp file in same dir + rename, so a crash mid-write
+    # can't leave a corrupted ~/.claude.json.
+    new_text = json.dumps(cfg, indent=2) + "\n"
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        prefix=config_path.name + ".", suffix=".tmp", dir=str(config_path.parent)
+    )
+    try:
+        with os.fdopen(tmp_fd, "w") as fh:
+            fh.write(new_text)
+        os.replace(tmp_path, config_path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
     action = "updated" if existing else "added"
     print(f"✓ macos-use {action} in {config_path} ({scope} scope)")
     print()

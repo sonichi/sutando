@@ -10,9 +10,10 @@
 # Usage:
 #   bash skills/macos-use/scripts/build.sh [--force]
 #
-# Idempotent: if the binary exists and is newer than the repo mtime, skips.
+# Idempotent: if the binary already exists, skips unless --force is passed.
 
 set -euo pipefail
+set -o pipefail  # fail if any command in a pipe errors (catches swift build | tail)
 
 REPO_URL="https://github.com/mediar-ai/mcp-server-macos-use.git"
 CLONE_DIR="${HOME}/.macos-use-mcp"
@@ -51,10 +52,18 @@ fi
 
 echo "→ building $BIN_NAME (~35s, release mode, swift-version 5 workaround)"
 cd "$CLONE_DIR"
-xcrun swift build -c release -Xswiftc -swift-version -Xswiftc 5 2>&1 | tail -5
+BUILD_LOG="/tmp/macos-use-mcp-build-$(date +%s).log"
+if ! xcrun swift build -c release -Xswiftc -swift-version -Xswiftc 5 >"$BUILD_LOG" 2>&1; then
+    echo "✗ build failed — last 20 lines of $BUILD_LOG:" >&2
+    tail -20 "$BUILD_LOG" >&2
+    exit 1
+fi
+# Show concise success summary (last link line)
+tail -3 "$BUILD_LOG"
 
 if [[ ! -f "$BINARY" ]]; then
-    echo "✗ build failed — binary not produced at $BINARY" >&2
+    echo "✗ build reported success but binary not produced at $BINARY" >&2
+    echo "  full log: $BUILD_LOG" >&2
     exit 1
 fi
 
