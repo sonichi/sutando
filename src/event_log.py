@@ -31,7 +31,12 @@ missing keys.
 
 No external deps. Crash-safe: writes are appended atomically (single
 write() call per line). Concurrent writers may interleave lines but will
-not corrupt them on POSIX local filesystems <= PIPE_BUF bytes per line.
+not corrupt them on POSIX local filesystems — backed by O_APPEND
+semantics + one write() per line, the kernel serializes append offsets
+atomically. Verified on APFS with 50 concurrent writers × 2500 events ×
+payloads up to 4500 bytes (see notes/event-log-atomicity-test.md).
+Pathologically large payloads (> ~1MB) may tear on some filesystems —
+keep event payloads modest.
 """
 
 from __future__ import annotations
