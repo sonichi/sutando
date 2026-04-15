@@ -39,6 +39,20 @@ const HTML = /* html */ `<!DOCTYPE html>
   .header .avatar {
     width: 44px; height: 44px; border-radius: 50%;
     border: 2px solid #4ecca3; object-fit: cover; display: none;
+    transition: box-shadow 0.15s ease, border-color 0.15s ease;
+  }
+  .header .avatar.speaking {
+    border-color: #6ee7b7;
+  }
+  .header .avatar.working:not(.speaking) {
+    border-color: #60a5fa;
+    box-shadow: 0 0 10px rgba(96,165,250,0.4);
+    animation: avatar-work 2s linear infinite;
+  }
+  @keyframes avatar-work {
+    0% { box-shadow: 0 0 8px rgba(96,165,250,0.3), 0 0 0 2px rgba(96,165,250,0.1); }
+    50% { box-shadow: 0 0 16px rgba(96,165,250,0.5), 0 0 0 4px rgba(96,165,250,0.2); }
+    100% { box-shadow: 0 0 8px rgba(96,165,250,0.3), 0 0 0 2px rgba(96,165,250,0.1); }
   }
   .header .info { flex: 1; }
   .header h1 { color: #fff; font-size: 1.1em; font-weight: 500; }
@@ -241,6 +255,14 @@ const HTML = /* html */ `<!DOCTYPE html>
     border: 3px solid #4ecca3; object-fit: cover; margin-bottom: 16px; display: none;
     transition: all 0.8s ease;
   }
+  .hero .avatar-hero.speaking {
+    border-color: #6ee7b7;
+  }
+  .hero .avatar-hero.working:not(.speaking) {
+    border-color: #60a5fa;
+    box-shadow: 0 0 14px rgba(96,165,250,0.4);
+    animation: avatar-work 2s linear infinite;
+  }
   .hero h2 { color: #fff; font-size: 1.3em; font-weight: 500; margin-bottom: 4px; transition: all 0.6s ease; }
   .hero .tagline { color: #555; font-size: 13px; margin-bottom: 24px; transition: all 0.6s ease; }
   @keyframes avatar-glow {
@@ -432,6 +454,8 @@ let connected = false;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 5;
 let nextPlayTime = 0;
+let analyserNode = null;
+let speakingRAF = null;
 let activeSources = [];
 let playbackRate = 1.0;
 let bytesSent = 0;
@@ -808,7 +832,13 @@ function playChunk(arrayBuf) {
     const src = audioCtx.createBufferSource();
     src.buffer = audioBuf;
     src.playbackRate.value = playbackRate;
-    src.connect(audioCtx.destination);
+    if (!analyserNode) {
+      analyserNode = audioCtx.createAnalyser();
+      analyserNode.fftSize = 256;
+      analyserNode.connect(audioCtx.destination);
+      startSpeakingDetection();
+    }
+    src.connect(analyserNode);
 
     const now = audioCtx.currentTime;
     if (nextPlayTime < now) {
@@ -829,6 +859,43 @@ function playChunk(arrayBuf) {
   } catch (err) {
     dbg('playChunk error: ' + err.message, 'err');
   }
+}
+
+// ─── Speaking detection (avatar animation) ────────────────
+function startSpeakingDetection() {
+  if (speakingRAF) return;
+  var avatar = document.getElementById('stand-avatar');
+  var heroAvatar = document.getElementById('hero-avatar');
+  var buf = new Uint8Array(analyserNode ? analyserNode.frequencyBinCount : 128);
+  var smoothed = 0;
+  function tick() {
+    speakingRAF = requestAnimationFrame(tick);
+    if (!analyserNode) return;
+    analyserNode.getByteFrequencyData(buf);
+    var sum = 0;
+    for (var i = 0; i < buf.length; i++) sum += buf[i];
+    var avg = sum / buf.length;
+    // Smooth: fast attack, slow decay for natural feel
+    smoothed = avg > smoothed ? avg * 0.7 + smoothed * 0.3 : avg * 0.2 + smoothed * 0.8;
+    var speaking = smoothed > 6;
+    var intensity = Math.min(smoothed / 60, 1); // 0..1
+    var scale = 1 + intensity * 0.08; // 1.0 to 1.08
+    var glowSize = 8 + intensity * 24; // 8px to 32px
+    var glowAlpha = 0.2 + intensity * 0.5; // 0.2 to 0.7
+    var style = speaking
+      ? 'transform:scale(' + scale.toFixed(3) + ');box-shadow:0 0 ' + glowSize.toFixed(0) + 'px rgba(110,231,183,' + glowAlpha.toFixed(2) + ')'
+      : 'transform:scale(1);box-shadow:none';
+    if (avatar) { avatar.classList.toggle('speaking', speaking); avatar.style.cssText += ';' + style; }
+    if (heroAvatar) { heroAvatar.classList.toggle('speaking', speaking); heroAvatar.style.cssText += ';' + style; }
+  }
+  tick();
+}
+function stopSpeakingDetection() {
+  if (speakingRAF) { cancelAnimationFrame(speakingRAF); speakingRAF = null; }
+  var avatar = document.getElementById('stand-avatar');
+  var heroAvatar = document.getElementById('hero-avatar');
+  if (avatar) { avatar.classList.remove('speaking'); avatar.style.transform = ''; avatar.style.boxShadow = ''; }
+  if (heroAvatar) { heroAvatar.classList.remove('speaking'); heroAvatar.style.transform = ''; heroAvatar.style.boxShadow = ''; }
 }
 
 // ─── Microphone capture ───────────────────────────────────
@@ -1143,6 +1210,8 @@ function doCleanup() {
   muted = false;
   fetch('/mute-state?muted=false&voice=false').catch(() => {}); // Reset state on disconnect
   document.body.classList.remove('voice-active');
+  stopSpeakingDetection();
+  analyserNode = null;
   $('hero').style.display = '';
   $('btn').style.display = 'none';
   $('btn-mute').style.display = 'none';
@@ -1728,6 +1797,12 @@ document.addEventListener('keydown', function(e) {
         var expandBtn = '';
         csBar.innerHTML = statusText + expandBtn;
       }
+      // Avatar working state — blue spin when core is active
+      var av = document.getElementById('stand-avatar');
+      var hav = document.getElementById('hero-avatar');
+      var isWorking = loopData.status === 'running';
+      if (av) av.classList.toggle('working', isWorking);
+      if (hav) hav.classList.toggle('working', isWorking);
     });
   }, 3000);
 })();
