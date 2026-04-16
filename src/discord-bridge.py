@@ -716,6 +716,7 @@ async def poll_dm_fallback():
     `poll_proactive()` already, so we don't touch those either.
     """
     GRACE_SECONDS = 90
+    MAX_RETRY_AGE_SECONDS = 86400  # 24h: give up on stale files so the loop drains
     FALLBACK_PREFIXES = ("task-", "question-", "briefing-", "insight-", "friction-")
     while True:
         try:
@@ -731,10 +732,26 @@ async def poll_dm_fallback():
                     continue
                 # Grace window so voice-agent / telegram-bridge get first dibs.
                 try:
-                    age = now - f.stat().st_mtime
+                    st = f.stat()
                 except FileNotFoundError:
                     continue
+                age = now - st.st_mtime
                 if age < GRACE_SECONDS:
+                    continue
+                # Discord rejects empty content with HTTP 400. Retrying never
+                # succeeds — drop it.
+                if st.st_size == 0:
+                    print(f"  [dm-fallback] dropping empty {f.name}", flush=True)
+                    f.unlink(missing_ok=True)
+                    continue
+                # Stop retrying after 24h. Without this cap, a permanent
+                # failure (bad channel ID, bot removed from DM, etc.)
+                # spams the log every 30s forever and starves the gateway
+                # event loop. Voice-originated results are ephemeral enough
+                # that losing one after a day is acceptable.
+                if age > MAX_RETRY_AGE_SECONDS:
+                    print(f"  [dm-fallback] dropping stale {f.name} (age={int(age)}s)", flush=True)
+                    f.unlink(missing_ok=True)
                     continue
                 # Subprocess out to the shared CLI tool so there's only one
                 # code path for the voiceConnected check + DM send.
@@ -744,7 +761,7 @@ async def poll_dm_fallback():
                         capture_output=True, text=True, timeout=15,
                     )
                 except Exception as e:
-                    print(f"  [dm-fallback] subprocess failed on {f.name}: {e}")
+                    print(f"  [dm-fallback] subprocess failed on {f.name}: {e}", flush=True)
                     continue
                 if result.returncode == 0:
                     stdout = (result.stdout or "").strip()
@@ -752,11 +769,11 @@ async def poll_dm_fallback():
                     # In that case we leave the file alone for voice-agent to pick up.
                     if "skipping DM" in stdout:
                         continue
-                    print(f"  [dm-fallback] sent {f.name} via dm-result.py")
+                    print(f"  [dm-fallback] sent {f.name} via dm-result.py", flush=True)
                     f.unlink(missing_ok=True)
                 else:
                     stderr = (result.stderr or "").strip()[:200]
-                    print(f"  [dm-fallback] dm-result.py failed on {f.name}: {stderr}")
+                    print(f"  [dm-fallback] dm-result.py failed on {f.name}: {stderr}", flush=True)
         except Exception as e:
             print(f"  [dm-fallback] poll error: {e}")
         await asyncio.sleep(30)
