@@ -149,14 +149,6 @@ def main():
     heartbeat_file = REPO / "state" / "telegram-bridge.heartbeat"
     last_heartbeat = 0
     while True:
-        # Write heartbeat at most once per 60 seconds
-        now = time.time()
-        if now - last_heartbeat >= 60:
-            try:
-                heartbeat_file.write_text(str(int(now)))
-                last_heartbeat = now
-            except Exception:
-                pass
         # Poll for new messages
         params = {"timeout": 10, "limit": 10}
         if offset:
@@ -167,6 +159,19 @@ def main():
             print(f"[Telegram] Poll error: {e}", flush=True)
             time.sleep(5)
             continue
+        # Heartbeat advances only on a successful getUpdates. A bumped
+        # heartbeat now means "the Telegram API round-trip is working,"
+        # not just "the asyncio loop is alive." Lets health-check
+        # distinguish a zombie (process up, API dead) from a healthy
+        # bridge. See: 2026-04-16 32h DNS-error zombie that had a fresh
+        # heartbeat throughout because it was written before the try.
+        now = time.time()
+        if now - last_heartbeat >= 60:
+            try:
+                heartbeat_file.write_text(str(int(now)))
+                last_heartbeat = now
+            except Exception:
+                pass
 
         if result.get("ok"):
             for update in result.get("result", []):
