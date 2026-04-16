@@ -599,9 +599,16 @@ async def poll_results():
     heartbeat_file = REPO / "state" / "discord-bridge.heartbeat"
     last_heartbeat = 0
     while True:
-        # Write heartbeat at most once per 60 seconds
+        # Heartbeat is gated on `client.is_ready()` (Discord gateway WS
+        # actually connected and identified). Without this gate, poll_results
+        # reads local files only — it would bump the heartbeat indefinitely
+        # even if the gateway was disconnected and on_message had stopped
+        # firing, making health-check report "ok" on a bridge that can't
+        # receive any Discord message. Follow-up from PR #395 which fixed
+        # the analogous telegram-bridge case (heartbeat written before the
+        # API call, so DNS-error zombies stayed "fresh" for 32h).
         now = time.time()
-        if now - last_heartbeat >= 60:
+        if now - last_heartbeat >= 60 and client.is_ready():
             try:
                 heartbeat_file.write_text(str(int(now)))
                 last_heartbeat = now
