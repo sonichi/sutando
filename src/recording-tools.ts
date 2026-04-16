@@ -11,6 +11,51 @@ import { demoStateRef, narrationSpeakingRef, lastSpokenRef, nextDescRef, scrollP
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
+/**
+ * Auto-detect an ffmpeg binary that has the `subtitles` filter (requires libass).
+ * Cached after first call so the probe only runs once per process lifetime.
+ *
+ * Probe order:
+ *   1. $FFMPEG_SUBTITLE_BIN env var (explicit override, skips probe)
+ *   2. System `ffmpeg` (whatever is on PATH)
+ *   3. Homebrew keg-only `ffmpeg-full` at /opt/homebrew/opt/ffmpeg-full/bin/ffmpeg
+ *
+ * The probe runs `ffmpeg -filters` and greps for "subtitles". ~50ms on a cold
+ * call, then cached. Returns null if no binary has the filter.
+ */
+let _cachedSubtitleFfmpeg: string | null | undefined;
+function findFfmpegWithSubtitles(): string | null {
+	if (_cachedSubtitleFfmpeg !== undefined) return _cachedSubtitleFfmpeg;
+
+	// Explicit override — skip probing entirely
+	const envBin = process.env.FFMPEG_SUBTITLE_BIN?.trim();
+	if (envBin) {
+		_cachedSubtitleFfmpeg = envBin;
+		console.log(`${ts()} [ffmpeg] using $FFMPEG_SUBTITLE_BIN: ${envBin}`);
+		return envBin;
+	}
+
+	// Probe candidates in order
+	const candidates = [
+		'ffmpeg',                                          // system PATH
+		'/opt/homebrew/bin/ffmpeg',                        // homebrew narrow
+		'/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg',        // homebrew full (keg-only)
+	];
+	for (const bin of candidates) {
+		try {
+			const out = execSync(`${bin} -filters 2>&1`, { timeout: 5_000 }).toString();
+			if (out.includes('subtitles')) {
+				_cachedSubtitleFfmpeg = bin;
+				console.log(`${ts()} [ffmpeg] subtitle filter found in: ${bin}`);
+				return bin;
+			}
+		} catch {}
+	}
+	console.log(`${ts()} [ffmpeg] no binary with subtitles filter found (checked: ${candidates.join(', ')})`);
+	_cachedSubtitleFfmpeg = null;
+	return null;
+}
+
 /** Send text to Gemini via sendRealtimeInput when available, otherwise sendContent. */
 function injectText(session: any, text: string) {
 	try {
@@ -162,24 +207,11 @@ function burnLiveTranscriptSubtitles(videoPath: string): string | null {
 		console.log(`${ts()} [ScreenRecord] live transcript SRT: ${entries.length} blocks`);
 
 		const outPath = videoPath.replace('.mov', '-subtitled.mov');
-		// The `subtitles` filter requires libass, which the narrow homebrew `ffmpeg`
-		// bottle on arm64_tahoe does NOT include. Use the keg-only `ffmpeg-full`
-		// binary (which bundles libass + libfreetype + fontconfig + 43 other deps)
-		// for the subtitle burn specifically. All other ffmpeg calls (narration mux
-		// via videotoolbox) stay on the narrow bottle — they don't need libass.
-		//
-		// Fallback: if ffmpeg-full isn't installed, try plain ffmpeg anyway so this
-		// function's behavior on other machines (MacBook, CI) isn't regressed. The
-		// plain ffmpeg call will fail loudly with the same error as before, but
-		// that's still better than the silent fallthrough.
-		//
-		// Prior silent-failure history (2026-04-15): every subtitle burn call today
-		// hit `[AVFilterGraph] No option name near '.../subtitle.srt'` because the
-		// `subtitles` filter didn't exist in the binary at all. Four wrong theories
-		// chased before Susan's "it's a dependency issue" call stuck. Fix was
-		// `brew install ffmpeg-full` + this path switch.
-		const FFMPEG_FULL = '/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg';
-		const ffmpegBin = existsSync(FFMPEG_FULL) ? FFMPEG_FULL : '/opt/homebrew/bin/ffmpeg';
+		const ffmpegBin = findFfmpegWithSubtitles();
+		if (!ffmpegBin) {
+			console.log(`${ts()} [ScreenRecord] no ffmpeg with subtitles filter found — skipping subtitle burn. Install ffmpeg-full: brew install ffmpeg-full`);
+			return null;
+		}
 		// Match source bitrate to avoid 6x size inflation (narrated ~400kbps, subtitle burn was 2300kbps with -q:v 65).
 		execSync(
 			`${ffmpegBin} -y -i "${videoPath}" -vf "subtitles=${LIVE_TRANSCRIPT_SRT_PATH}:force_style='FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,MarginV=30'" -c:v h264_videotoolbox -b:v 500k -c:a aac "${outPath}"`,
