@@ -613,6 +613,19 @@ export const pauseVideoTool: ToolDefinition = {
 			console.log(`${ts()} [PauseVideo] BLOCKED — ${sinceLast}ms since play/resume (cooldown 8s)`);
 			return { status: 'playing', instruction: 'Video is still playing. Do NOT pause unless user explicitly says "pause" or "stop".' };
 		}
+		// Mirror resume_video's runtime guard: only pause if the caller actually
+		// said a pause keyword recently. Without this, a Gemini hallucination
+		// outside the 8s cooldown still fires (Susan's 2026-04-16 report).
+		try {
+			const transcriptPath = readlinkSync('/tmp/sutando-live-transcript.txt');
+			const lines = readFileSync(transcriptPath, 'utf8').split('\n');
+			const callerLines = lines.filter(l => l.includes('Caller:'));
+			const recent = callerLines.slice(-3).join(' ').toLowerCase();
+			if (!/\b(pause|stop|hold|wait)\b/.test(recent)) {
+				console.log(`${ts()} [PauseVideo] BLOCKED — no pause keyword in recent caller speech: "${recent.slice(-80)}"`);
+				return { status: 'playing', instruction: 'Video is still playing. Only pause when user explicitly says "pause" or "stop".' };
+			}
+		} catch {}
 		try { writeFileSync('/tmp/sutando-playback-pause', '1'); } catch {}
 		try { execSync(`osascript -e 'tell application "QuickTime Player"' -e 'if (count of documents) > 0 then' -e 'pause document 1' -e 'end if' -e 'end tell'`, { timeout: 5_000 }); } catch {}
 		return { status: 'paused', instruction: 'Paused. When user says play/resume, call play_video.' };
