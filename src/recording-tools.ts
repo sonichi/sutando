@@ -11,6 +11,31 @@ import { demoStateRef, narrationSpeakingRef, lastSpokenRef, nextDescRef, scrollP
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
+/**
+ * Auto-detect an ffmpeg binary that has the `subtitles` filter (requires libass).
+ * Cached after first call so the probe only runs once per process lifetime.
+ * Probe order: $FFMPEG_SUBTITLE_BIN env → system ffmpeg → homebrew narrow → homebrew full.
+ */
+let _cachedSubtitleFfmpeg: string | null | undefined;
+function findFfmpegWithSubtitles(): string | null {
+	if (_cachedSubtitleFfmpeg !== undefined) return _cachedSubtitleFfmpeg;
+	const envBin = process.env.FFMPEG_SUBTITLE_BIN?.trim();
+	if (envBin) { _cachedSubtitleFfmpeg = envBin; console.log(`${ts()} [ffmpeg] using $FFMPEG_SUBTITLE_BIN: ${envBin}`); return envBin; }
+	const candidates = ['ffmpeg', '/opt/homebrew/bin/ffmpeg', '/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg'];
+	for (const bin of candidates) {
+		try {
+			if (execSync(`${bin} -filters 2>&1`, { timeout: 5_000 }).toString().includes('subtitles')) {
+				_cachedSubtitleFfmpeg = bin;
+				console.log(`${ts()} [ffmpeg] subtitle filter found in: ${bin}`);
+				return bin;
+			}
+		} catch {}
+	}
+	console.log(`${ts()} [ffmpeg] no binary with subtitles filter found`);
+	_cachedSubtitleFfmpeg = null;
+	return null;
+}
+
 /** Send text to Gemini via sendRealtimeInput when available, otherwise sendContent. */
 function injectText(session: any, text: string) {
 	try {
@@ -162,13 +187,17 @@ function burnLiveTranscriptSubtitles(videoPath: string): string | null {
 		console.log(`${ts()} [ScreenRecord] live transcript SRT: ${entries.length} blocks`);
 
 		const outPath = videoPath.replace('.mov', '-subtitled.mov');
+		const ffmpegBin = findFfmpegWithSubtitles();
+		if (!ffmpegBin) {
+			console.log(`${ts()} [ScreenRecord] no ffmpeg with subtitles filter — skipping burn. Install: brew install ffmpeg-full`);
+			return null;
+		}
 		execSync(
-			// Match source bitrate to avoid 6x size inflation (narrated ~400kbps, subtitle burn was 2300kbps with -q:v 65)
-			`/opt/homebrew/bin/ffmpeg -y -i "${videoPath}" -vf "subtitles=${LIVE_TRANSCRIPT_SRT_PATH}:force_style='FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,MarginV=30'" -c:v h264_videotoolbox -b:v 500k -c:a aac "${outPath}"`,
+			`${ffmpegBin} -y -i "${videoPath}" -vf "subtitles=${LIVE_TRANSCRIPT_SRT_PATH}:force_style='FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,MarginV=30'" -c:v h264_videotoolbox -b:v 500k -c:a aac "${outPath}"`,
 			{ timeout: 120_000 }
 		);
 		if (existsSync(outPath)) {
-			console.log(`${ts()} [ScreenRecord] live transcript subtitles burned: ${outPath}`);
+			console.log(`${ts()} [ScreenRecord] live transcript subtitles burned: ${outPath} (ffmpeg=${ffmpegBin})`);
 			return outPath;
 		}
 	} catch (err) {
@@ -413,41 +442,38 @@ export const scrollAndDescribeTool: ToolDefinition = {
 export const openFileTool: ToolDefinition = {
 	name: 'open_file',
 	description:
-		'Open a file with the default macOS app. Pass a path, or omit to open the latest screen recording. ' +
+		'Open a file with the default macOS app. ALWAYS pass a `path` — get it from the recording tool\'s return value or ask the user. ' +
 		'Use for: "open the video/recording", "open the file", "open that", "can you open it". ' +
 		'If the user says "open the log" or similar, ASK which log they mean (voice-agent, discord-bridge, etc.) — do NOT default to a recording. ' +
 		'Do NOT call play_video after this — wait for user to explicitly say "play". ' +
 		'Known files: "diagnostic tracker" or "diagnostics" = /tmp/phone-diagnostics-tracker.html, ' +
 		'"voice diagnostics" = /tmp/voice-diagnostics-tracker.html. ' +
-		'For recordings: returns immediately with best-available version. If `subtitled_pending` is true in the result, the subtitled burn is still running in the background — TELL the user ' +
-		'"I opened the narrated version; subtitled is still being generated — want me to switch to it when it\'s ready?" ' +
-		'and wait for the user\'s answer. If they say yes/wait, call `open_file` again in ~30 seconds and it will probably return the subtitled version.',
+		'If you need to find the latest recording but lost the path, pass find_recording=true.',
 	parameters: z.object({
-		path: z.string().optional().describe('File path to open. Omit to open the latest screen recording. Use known file aliases for diagnostic tracker etc.'),
+		path: z.string().optional().describe('File path to open. Get this from the recording tool result. Use known file aliases for diagnostic tracker etc.'),
+		find_recording: z.boolean().optional().describe('If true and no path given, find and open the latest screen recording. Only use as a fallback when you lost the recording path.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { path: filePath } = args as { path?: string };
-		console.log(`${ts()} [OpenFile] called`);
+		const { path: filePath, find_recording } = args as { path?: string; find_recording?: boolean };
+		console.log(`${ts()} [OpenFile] called (path=${filePath || 'none'}, find_latest=${find_recording || false})`);
 		demoStateRef.value = 'idle';
 		try {
 			let recPath = filePath ? filePath.replace(/^~/, process.env.HOME || '') : null;
-			// If Gemini passed a specific path that doesn't exist, return error — do NOT fall back to recording
 			if (recPath && !existsSync(recPath)) {
 				console.log(`${ts()} [OpenFile] path "${recPath}" does not exist`);
 				return { error: `File not found: ${recPath}. Ask the user for the correct path or use "work" to locate it.` };
 			}
-			// Recording fallback: return immediately with best-available version.
-			// No polling — the prior 18s wait for subtitled exceeded Gemini Live's
-			// tool-call timeout on phone calls (the model would then report "I
-			// can't find the recording" even though the narrated file was on
-			// disk). If subtitled isn't ready, we flag subtitled_pending and let
-			// the model ask the user whether to wait + retry.
-			if (!recPath) {
+			// Only find latest recording if explicitly requested — not as a silent default.
+			// The recording tool should have already told you the path.
+			if (!recPath && find_recording) {
 				recPath = findRecording();
 			}
-			if (!recPath || !isReadableFile(recPath)) {
-				return { error: 'No recording found yet. Ask the user to wait a moment and try again.' };
+			if (!recPath) {
+				return { error: 'No path provided. Pass the file path from the recording tool result, or set find_recording=true to search.' };
+			}
+			if (!isReadableFile(recPath)) {
+				return { error: `File not readable or too small: ${recPath}. It may still be writing — try again in a few seconds.` };
 			}
 			if (recPath.includes('sutando-recording')) {
 				writeFileSync('/tmp/sutando-playback-path', recPath);
@@ -460,24 +486,13 @@ export const openFileTool: ToolDefinition = {
 				const dur = execSync(`/opt/homebrew/bin/ffprobe -v error -show_entries format=duration -of csv=p=0 "${recPath}"`, { timeout: 5_000 }).toString().trim();
 				duration_seconds = Math.round(parseFloat(dur));
 			} catch {}
-			// Flag whether the opened version is the subtitled burn-in or an earlier cut.
-			// This lets the model tell the user + offer to wait for subtitled.
-			const isSubtitled = recPath.includes('-subtitled');
-			const isNarrated = !isSubtitled && recPath.includes('-narrated');
-			const subtitled_pending = !isSubtitled && recPath.includes('sutando-recording');
-			const version = isSubtitled ? 'subtitled' : (isNarrated ? 'narrated' : 'raw');
-			const instruction = subtitled_pending
-				? `Opened the ${version} version. The subtitled version is still being generated in the background. Tell the user: "I opened the ${version} version. Subtitles are still being generated — want me to switch to the subtitled version when it's ready?" If they say yes, wait ~30 seconds and then call open_file again without arguments; it will pick up the subtitled version if the burn-in has finished. When user says play, call play_video.`
-				: `File opened (${version}). When user says play, call play_video.`;
-			console.log(`${ts()} [OpenFile] opened ${recPath} (${version}, ${(size / 1024 / 1024).toFixed(1)}MB, ${duration_seconds ?? '?'}s, subtitled_pending=${subtitled_pending})`);
+			console.log(`${ts()} [OpenFile] opened ${recPath} (${(size / 1024 / 1024).toFixed(1)}MB, ${duration_seconds ?? '?'}s)`);
 			return {
 				status: 'opened',
 				path: recPath,
-				version,
 				size_mb: +(size / 1024 / 1024).toFixed(1),
 				duration_seconds,
-				subtitled_pending,
-				instruction,
+				instruction: 'File opened. When user says play, call play_video.',
 			};
 		} catch (err) {
 			return { error: `open_file failed: ${err instanceof Error ? err.message : err}` };
@@ -683,18 +698,33 @@ export const screenRecordTool: ToolDefinition = {
 			if (action === 'stop') {
 				demoStateRef.value = 'done';
 				const parsed = JSON.parse(result);
-				// Burn live transcript subtitles only if enabled at start
-				if (liveTranscriptRecordingStart > 0 && parsed.path && parsed.exists) {
+				// Build explicit file list so the model knows exactly what's available.
+				// The model should pass the recommended path to open_file — no findRecording guessing.
+				const files: { raw?: string; narrated?: string; subtitled?: string; recommended?: string } = {};
+				if (parsed.path && parsed.exists) {
+					files.raw = parsed.path;
 					const narrated = parsed.path.replace('.mov', '-narrated.mov');
-					const subtitled = burnLiveTranscriptSubtitles(isReadableFile(narrated) ? narrated : parsed.path);
-					if (subtitled) {
-						parsed.subtitled_path = subtitled;
-						console.log(`${ts()} [ScreenRecord] transcript subtitles: ${subtitled}`);
+					if (isReadableFile(narrated)) files.narrated = narrated;
+					// Burn live transcript subtitles only if enabled at start
+					if (liveTranscriptRecordingStart > 0) {
+						const subtitled = burnLiveTranscriptSubtitles(isReadableFile(narrated) ? narrated : parsed.path);
+						if (subtitled) {
+							files.subtitled = subtitled;
+							console.log(`${ts()} [ScreenRecord] transcript subtitles: ${subtitled}`);
+						}
 					}
+					// Recommend best available: subtitled > narrated > raw
+					files.recommended = files.subtitled || files.narrated || files.raw;
 				}
 				liveTranscriptRecordingStart = 0;
-				console.log(`${ts()} [ScreenRecord] ${action}: ${JSON.stringify(parsed)}`);
-				return parsed;
+				console.log(`${ts()} [ScreenRecord] ${action}: ${JSON.stringify({ ...parsed, files })}`);
+				return {
+					...parsed,
+					files,
+					instruction: files.recommended
+						? `Recording stopped. Available files: ${Object.entries(files).map(([k,v]) => `${k}=${v}`).join(', ')}. To open, call open_file with path="${files.recommended}". If user wants a different version, use the appropriate path from the list.`
+						: 'Recording stopped but no files found.',
+				};
 			}
 			const parsed = JSON.parse(result);
 			console.log(`${ts()} [ScreenRecord] ${action}: ${result}`);
