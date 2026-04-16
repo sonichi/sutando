@@ -159,21 +159,23 @@ def main():
             print(f"[Telegram] Poll error: {e}", flush=True)
             time.sleep(5)
             continue
-        # Heartbeat advances only on a successful getUpdates. A bumped
-        # heartbeat now means "the Telegram API round-trip is working,"
-        # not just "the asyncio loop is alive." Lets health-check
+        # Heartbeat advances only on a response Telegram actually accepted.
+        # A bumped heartbeat now means "the Telegram API round-trip is
+        # working," not just "the asyncio loop is alive." Gated on
+        # `result.get("ok")` because `api()` silently swallows HTTPError
+        # (auth/rate-limit/500s) and returns `{"ok": False}`; without the
+        # gate, those would still bump the heartbeat. Lets health-check
         # distinguish a zombie (process up, API dead) from a healthy
         # bridge. See: 2026-04-16 32h DNS-error zombie that had a fresh
         # heartbeat throughout because it was written before the try.
-        now = time.time()
-        if now - last_heartbeat >= 60:
-            try:
-                heartbeat_file.write_text(str(int(now)))
-                last_heartbeat = now
-            except Exception:
-                pass
-
         if result.get("ok"):
+            now = time.time()
+            if now - last_heartbeat >= 60:
+                try:
+                    heartbeat_file.write_text(str(int(now)))
+                    last_heartbeat = now
+                except Exception:
+                    pass
             for update in result.get("result", []):
                 offset = update["update_id"] + 1
                 msg = update.get("message")
