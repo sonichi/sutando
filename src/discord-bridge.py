@@ -670,13 +670,32 @@ async def poll_proactive():
                     if not text:
                         f.unlink(missing_ok=True)
                         continue
-                    # Send to first owner in allowFrom
+                    # Send to first non-bot user in allowFrom.
+                    # `allowFrom` typically contains multiple bot IDs
+                    # (MacBook bot, Mac Mini bot) plus the human owner.
+                    # `next(iter(allowed))` picked bots ~50% of the time
+                    # based on set iteration, and Discord rejects bot→bot
+                    # DMs with HTTP 400 code 50007 ("Cannot send messages
+                    # to this user"). See `src/dm-result.py` which has
+                    # the matching `_resolve_owner_id()` for the CLI path.
                     allowed = load_allowed()
                     if not allowed:
                         print(f"  [proactive] no owner in allowFrom, skipping {f.name}")
                         f.unlink(missing_ok=True)
                         continue
-                    owner_id = next(iter(allowed))
+                    owner_id = None
+                    for uid in allowed:
+                        try:
+                            u = await client.fetch_user(int(uid))
+                            if not u.bot:
+                                owner_id = str(uid)
+                                break
+                        except Exception:
+                            continue
+                    if owner_id is None:
+                        print(f"  [proactive] no human user in allowFrom, skipping {f.name}")
+                        f.unlink(missing_ok=True)
+                        continue
                     try:
                         user = await client.fetch_user(int(owner_id))
                         dm = await user.create_dm()
