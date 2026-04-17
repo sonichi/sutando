@@ -15,6 +15,7 @@ from pathlib import Path
 WORKSPACE = Path(__file__).parent.parent
 CALLS_FILE = WORKSPACE / "results" / "calls" / "calls.jsonl"
 RESULTS_DIR = WORKSPACE / "results"
+STATE_DIR = WORKSPACE / "state"
 NOTES_DIR = WORKSPACE / "notes"
 
 
@@ -185,15 +186,21 @@ def generate_insight():
 def main():
     today = datetime.now().strftime("%Y-%m-%d")
     output_path = RESULTS_DIR / f"insight-{today}.txt"
+    # Sentinel survives discord-bridge's `dm-fallback` unlink of the
+    # results file, so repeat invocations (morning-briefing, cron, manual
+    # test) on the same day don't regenerate + re-DM the insight.
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    sentinel = STATE_DIR / f"daily-insight-{today}.sentinel"
 
-    # Don't regenerate if already done today
-    if output_path.exists():
-        print(f"Insight already generated today: {output_path}")
-        print(output_path.read_text())
+    if sentinel.exists():
+        cached = sentinel.read_text()
+        print(f"Insight already generated today (sentinel: {sentinel})")
+        print(cached)
         return
 
     insight = generate_insight()
     output_path.write_text(insight)
+    sentinel.write_text(insight)
     print(f"Daily insight → {output_path}")
     print(insight)
 
