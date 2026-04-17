@@ -1276,6 +1276,7 @@ function doCleanup() {
   connected = false;
   muted = false;
   fetch('/mute-state?muted=false&voice=false').catch(() => {}); // Reset state on disconnect
+  reportAgentState();
   document.body.classList.remove('voice-active');
   stopSpeakingDetection();
   analyserNode = null;
@@ -1299,7 +1300,32 @@ function toggleMute() {
   addSystem(muted ? 'Microphone muted.' : 'Microphone unmuted.');
   // Report actual mute state to server for menu bar indicator
   fetch('/mute-state?muted=' + muted).catch(() => {});
+  reportAgentState();
 }
+
+// Derive semantic agent state from existing DOM + connection signals and
+// report it to the server. Called on explicit signal changes (mute toggle,
+// voice connect/disconnect) and from a 1s polling loop for .speaking / .working
+// class transitions which flip too fast to hook directly. Last-state dedup
+// avoids flooding the server.
+var _lastReportedAgentState = 'idle';
+function reportAgentState() {
+  var state = 'idle';
+  if (connected && !muted) {
+    var av = document.getElementById('stand-avatar');
+    if (av && av.classList.contains('speaking')) {
+      state = 'speaking';
+    } else if (av && av.classList.contains('working')) {
+      state = 'working';
+    } else {
+      state = 'listening';
+    }
+  }
+  if (state === _lastReportedAgentState) return;
+  _lastReportedAgentState = state;
+  fetch('/mute-state?state=' + state).catch(function() {});
+}
+setInterval(reportAgentState, 1000);
 
 // ─── UI toggle (user gesture context!) ────────────────────
 function toggle() {
@@ -1325,6 +1351,7 @@ function toggle() {
     connected = true;
     muted = false;
     fetch('/mute-state?muted=false&voice=true').catch(() => {}); // Report connected + unmuted
+    reportAgentState();
     document.body.classList.add('voice-active');
     $('hero').style.display = 'none';
     $('btn').style.display = '';
@@ -1886,6 +1913,12 @@ const sseClients: import('node:http').ServerResponse[] = [];
 // Server-side state tracking for menu bar indicator
 let _muteState = false;
 let _voiceState = false;
+// Semantic agent state reported by the browser. The menu bar consumes this
+// to decide when to animate (any non-'idle' value). Derivation happens in
+// the browser where the signals live (audio RMS, core-status, mute, voice);
+// the server just caches the last-reported value.
+type AgentState = 'idle' | 'listening' | 'speaking' | 'working';
+let _agentState: AgentState = 'idle';
 
 // Heartbeat: ping every 30s, remove clients that fail to write (stale connections)
 setInterval(() => {
@@ -1917,21 +1950,30 @@ const server = createServer((req, res) => {
 		return;
 	}
 
-	// SSE client count + mute/voice state (safe for diagnostics + menu bar indicator)
+	// SSE client count + mute/voice/agent state (safe for diagnostics + menu bar indicator)
 	if (url.pathname === '/sse-status') {
 		res.writeHead(200, { 'Content-Type': 'application/json' });
-		res.end(JSON.stringify({ clients: sseClients.length, muted: _muteState, voiceConnected: _voiceState }));
+		res.end(JSON.stringify({
+			clients: sseClients.length,
+			muted: _muteState,
+			voiceConnected: _voiceState,
+			state: _agentState,
+		}));
 		return;
 	}
 
-	// Mute + voice state report from browser client
+	// Mute + voice + agent state report from browser client
 	if (url.pathname === '/mute-state') {
 		const mState = url.searchParams.get('muted');
 		const vState = url.searchParams.get('voice');
+		const aState = url.searchParams.get('state');
 		if (mState !== null) _muteState = mState === 'true';
 		if (vState !== null) _voiceState = vState === 'true';
+		if (aState === 'idle' || aState === 'listening' || aState === 'speaking' || aState === 'working') {
+			_agentState = aState;
+		}
 		res.writeHead(200, { 'Content-Type': 'application/json' });
-		res.end(JSON.stringify({ muted: _muteState, voiceConnected: _voiceState }));
+		res.end(JSON.stringify({ muted: _muteState, voiceConnected: _voiceState, state: _agentState }));
 		return;
 	}
 
