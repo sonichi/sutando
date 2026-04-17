@@ -19,6 +19,24 @@ PQ_FILE = WORKSPACE / "pending-questions.md"
 RESULTS_DIR = WORKSPACE / "results"
 LAST_NOTIFY_FILE = WORKSPACE / ".last-pq-notify"
 VOICE_LOG = WORKSPACE / "logs" / "voice-agent.log"
+PRESENTER_SENTINEL = WORKSPACE / "state" / "presenter-mode.sentinel"
+
+
+def presenter_mode_active():
+    """True if scripts/presenter-mode.sh has been started and the expiry
+    timestamp in the sentinel is still in the future. Silences all
+    notifications for the ICLR talk window. Stale sentinels (past-expiry)
+    are ignored and return False — the next `status` / `stop` call will
+    remove the file."""
+    if not PRESENTER_SENTINEL.exists():
+        return False
+    try:
+        expire_iso = PRESENTER_SENTINEL.read_text().strip()
+        # Compare as ISO-8601 with Z suffix — sorts correctly as strings.
+        now_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+        return now_iso < expire_iso
+    except Exception:
+        return False
 
 
 def voice_client_connected():
@@ -117,6 +135,10 @@ def main():
     force = "--force" in sys.argv
     questions = get_waiting_questions()
     if not questions:
+        return
+
+    if not force and presenter_mode_active():
+        print(f"(presenter-mode) {len(questions)} pending questions — suppressed")
         return
 
     if not force and not should_notify():
