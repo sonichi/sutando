@@ -32,6 +32,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     var resultWatchSource: DispatchSourceFileSystemObject?
     var lastResultCount = 0
+    // Avatar animation state (PR #418 plumbing → PR #419 consumer).
+    // `currentAgentState` caches the last state from /sse-status so
+    // `startAnimation`/`stopAnimation` only fire on transitions, not every poll.
+    var currentAgentState: String = "idle"
+    var animationTimer: Timer?
+    var animationPhase: CGFloat = 1.0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Request notification permission — only when running as .app bundle
@@ -154,15 +160,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
             let isMuted = json["muted"] as? Bool ?? false
             let isVoiceConnected = json["voiceConnected"] as? Bool ?? false
+            // `state` added by PR #418. Absent on pre-#418 servers → default 'idle'.
+            let agentState = (json["state"] as? String) ?? "idle"
             DispatchQueue.main.async {
-                guard let button = self?.statusItem.button else { return }
+                guard let self = self, let button = self.statusItem.button else { return }
                 if isVoiceConnected && isMuted {
-                    // Voice active + muted: show mute indicator
+                    // Voice active + muted: show mute indicator; stop any animation
                     button.title = "🔇"
                     button.image = nil
+                    self.stopAnimation()
                 } else {
                     // Default state (disconnected or unmuted): show avatar
-                    let avatarPath = (self?.workspace ?? "") + "/docs/stand-avatar.png"
+                    let avatarPath = self.workspace + "/docs/stand-avatar.png"
                     if let image = NSImage(contentsOfFile: avatarPath) {
                         image.size = NSSize(width: 18, height: 18)
                         image.isTemplate = false
@@ -171,10 +180,42 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     } else {
                         button.title = "S"
                     }
+                    // Drive animation from semantic state. `listening`/`speaking`/`working`
+                    // all animate ("any non-idle" per owner's 07:38Z B-option decision).
+                    if self.currentAgentState != agentState {
+                        self.currentAgentState = agentState
+                        if agentState == "idle" {
+                            self.stopAnimation()
+                        } else {
+                            self.startAnimation()
+                        }
+                    }
                 }
             }
         }
         task.resume()
+    }
+
+    /// Start a slow opacity pulse on the menu-bar icon. Visible motion, but
+    /// not distracting — ~0.6s fade cycle, dropping to 55% opacity then back.
+    /// Called only on idle → non-idle transition from pollMuteState.
+    func startAnimation() {
+        animationTimer?.invalidate()
+        animationPhase = 1.0
+        animationTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
+            guard let self = self, let button = self.statusItem.button else { return }
+            // Toggle between 1.0 and 0.55 every tick → 600ms cycle
+            self.animationPhase = self.animationPhase > 0.75 ? 0.55 : 1.0
+            button.alphaValue = self.animationPhase
+        }
+    }
+
+    /// Stop the pulse and restore full opacity. Idempotent.
+    func stopAnimation() {
+        animationTimer?.invalidate()
+        animationTimer = nil
+        animationPhase = 1.0
+        statusItem?.button?.alphaValue = 1.0
     }
 
     // MARK: - Configurable Global Hotkeys
