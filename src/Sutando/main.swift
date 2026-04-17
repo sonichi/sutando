@@ -165,10 +165,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 guard let self = self, let button = self.statusItem.button else { return }
                 if isVoiceConnected && isMuted {
-                    // Voice active + muted: show mute indicator; stop any animation
+                    // Voice active + muted: show mute indicator; stop any animation.
+                    // Reset cache so un-mute re-triggers animation if agent is
+                    // still non-idle (otherwise the transition guard below would
+                    // skip startAnimation() and leave the menu bar statically
+                    // dim until the NEXT semantic state change).
                     button.title = "🔇"
                     button.image = nil
                     self.stopAnimation()
+                    self.currentAgentState = "idle"
                 } else {
                     // Default state (disconnected or unmuted): show avatar
                     let avatarPath = self.workspace + "/docs/stand-avatar.png"
