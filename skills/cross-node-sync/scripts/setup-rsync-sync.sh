@@ -54,14 +54,13 @@ PEER="${SUTANDO_SYNC_PEER:-}"
 MEM_LOCAL="$HOME/.claude/projects/-Users-xueqingliu-Documents-sutando-sutando/memory/"
 NOTES_LOCAL="$REPO_ROOT/notes/"
 
-# Peer-side paths — set via env because Claude Code's project dirs encode the
-# full absolute repo path, which differs between hosts (e.g. /Users/xueqingliu
-# on Studio vs /Users/xliu/Documents/xqq/... on MBP). Operator pokes these
-# into .env once per peer pairing.
-#   SUTANDO_PEER_MEM_DIR   — absolute peer path ending in "memory/"
-#   SUTANDO_PEER_NOTES_DIR — absolute peer path ending in "notes/"
-MEM_PEER="${SUTANDO_PEER_MEM_DIR:-}"
-NOTES_PEER="${SUTANDO_PEER_NOTES_DIR:-}"
+# Peer-side paths — default to the same literal paths as local so users only
+# need to set SUTANDO_SYNC_PEER (per owner's 2026-04-17 simplification: "only
+# sync peer is necessary, just use the same directory for both machines").
+# If your peer's sutando repo or memory dir lives at a different path, override
+# via SUTANDO_PEER_MEM_DIR / SUTANDO_PEER_NOTES_DIR — otherwise leave unset.
+MEM_PEER="${SUTANDO_PEER_MEM_DIR:-$MEM_LOCAL}"
+NOTES_PEER="${SUTANDO_PEER_NOTES_DIR:-$NOTES_LOCAL}"
 
 # Common rsync flags:
 #   -a         archive (preserves modtime/perms — critical for conflict semantics)
@@ -139,13 +138,9 @@ if [ -z "$PEER" ]; then
     say "Then: bash skills/cross-node-sync/scripts/setup-rsync-sync.sh" >&2
     exit 1
 fi
-if [ -z "$MEM_PEER" ] || [ -z "$NOTES_PEER" ]; then
-    say "ERROR: peer paths not set. Example:" >&2
-    say '    export SUTANDO_PEER_MEM_DIR=$HOME/.claude/projects/-Users-xliu-.../memory/' >&2
-    say '    export SUTANDO_PEER_NOTES_DIR=$HOME/.../sutando/notes/' >&2
-    say "(check peer with: ssh \$SUTANDO_SYNC_PEER 'ls -d \$HOME/.claude/projects/*/memory/')" >&2
-    exit 1
-fi
+# MEM_PEER / NOTES_PEER default to local paths now; no hard-error path needed.
+# (Previously required SUTANDO_PEER_* env vars; removed per owner's 2026-04-17
+# simplification. If your peer's dir layout differs, set them explicitly.)
 
 if [ "$DRY_RUN" = "1" ]; then
     say "━━━ DRY-RUN MODE — no files will be transferred ━━━"
