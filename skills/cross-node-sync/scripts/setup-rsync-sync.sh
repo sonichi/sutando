@@ -53,21 +53,15 @@ PEER="${SUTANDO_SYNC_PEER:-}"
 
 MEM_LOCAL="$HOME/.claude/projects/-Users-xueqingliu-Documents-sutando-sutando/memory/"
 NOTES_LOCAL="$REPO_ROOT/notes/"
-DATA_LOCAL="$REPO_ROOT/data/"
 
-# Peer-side paths — default to the same literal paths as local so users only
-# need to set SUTANDO_SYNC_PEER (per owner's 2026-04-17 simplification: "only
-# sync peer is necessary, just use the same directory for both machines").
-# If your peer's sutando repo or memory dir lives at a different path, override
-# via SUTANDO_PEER_MEM_DIR / SUTANDO_PEER_NOTES_DIR / SUTANDO_PEER_DATA_DIR —
-# otherwise leave unset.
-MEM_PEER="${SUTANDO_PEER_MEM_DIR:-$MEM_LOCAL}"
-NOTES_PEER="${SUTANDO_PEER_NOTES_DIR:-$NOTES_LOCAL}"
-# Data dir peer path: derive from NOTES_PEER (repo/notes/ → repo/data/) if no
-# explicit override. Covers call-metrics.jsonl, voice-metrics.jsonl,
-# subtitle-metrics.jsonl, latency.json, scanned-calls.json, etc. Owner's
-# 2026-04-17 direction: "data/* is shared, not just voice-metrics".
-DATA_PEER="${SUTANDO_PEER_DATA_DIR:-${NOTES_PEER%/notes/}/data/}"
+# Peer-side paths — set via env because Claude Code's project dirs encode the
+# full absolute repo path, which differs between hosts (e.g. /Users/xueqingliu
+# on Studio vs /Users/xliu/Documents/xqq/... on MBP). Operator pokes these
+# into .env once per peer pairing.
+#   SUTANDO_PEER_MEM_DIR   — absolute peer path ending in "memory/"
+#   SUTANDO_PEER_NOTES_DIR — absolute peer path ending in "notes/"
+MEM_PEER="${SUTANDO_PEER_MEM_DIR:-}"
+NOTES_PEER="${SUTANDO_PEER_NOTES_DIR:-}"
 
 # Common rsync flags:
 #   -a         archive (preserves modtime/perms — critical for conflict semantics)
@@ -78,13 +72,7 @@ DATA_PEER="${SUTANDO_PEER_DATA_DIR:-${NOTES_PEER%/notes/}/data/}"
 RSYNC_FLAGS=(-az --update
     --exclude '.DS_Store' --exclude '*.swp' --exclude '*.swo'
     --exclude '.stversions' --exclude '.stfolder'
-    --exclude 'MEMORY.md' --exclude 'INDEX.md'
-    --exclude 'core-status.json')
-# core-status.json is per-node proactive-loop state that occasionally lands
-# in the memory dir (voice-agent + proactive-loop both write to it and
-# sometimes pick up wrong CWD). Excluding it here so a stale snapshot from
-# one node doesn't clobber the other's live status. Seen during PR #429
-# testing on 2026-04-17 — Studio had a 24-hour-old copy inside memory/.
+    --exclude 'MEMORY.md' --exclude 'INDEX.md')
 # Index-manifest files (MEMORY.md, INDEX.md) cannot use mtime-wins — one side's
 # newer-but-shorter version clobbers the other's longer listing. Both Studio
 # and MBP hit this on 2026-04-17 (74 files on disk, only 19 linked). Workaround:
@@ -151,9 +139,13 @@ if [ -z "$PEER" ]; then
     say "Then: bash skills/cross-node-sync/scripts/setup-rsync-sync.sh" >&2
     exit 1
 fi
-# MEM_PEER / NOTES_PEER default to local paths now; no hard-error path needed.
-# (Previously required SUTANDO_PEER_* env vars; removed per owner's 2026-04-17
-# simplification. If your peer's dir layout differs, set them explicitly.)
+if [ -z "$MEM_PEER" ] || [ -z "$NOTES_PEER" ]; then
+    say "ERROR: peer paths not set. Example:" >&2
+    say '    export SUTANDO_PEER_MEM_DIR=$HOME/.claude/projects/-Users-xliu-.../memory/' >&2
+    say '    export SUTANDO_PEER_NOTES_DIR=$HOME/.../sutando/notes/' >&2
+    say "(check peer with: ssh \$SUTANDO_SYNC_PEER 'ls -d \$HOME/.claude/projects/*/memory/')" >&2
+    exit 1
+fi
 
 if [ "$DRY_RUN" = "1" ]; then
     say "━━━ DRY-RUN MODE — no files will be transferred ━━━"
@@ -183,48 +175,6 @@ say ""
 say "Syncing notes/ ..."
 run rsync "${RSYNC_FLAGS[@]}" ${DRYFLAG[@]+"${DRYFLAG[@]}"} "$NOTES_LOCAL" "$PEER:$NOTES_PEER"
 run rsync "${RSYNC_FLAGS[@]}" ${DRYFLAG[@]+"${DRYFLAG[@]}"} "$PEER:$NOTES_PEER" "$NOTES_LOCAL"
-
-# 4) Data dir sync — covers all data/* files (call-metrics.jsonl,
-# voice-metrics.jsonl, subtitle-metrics.jsonl, latency.json,
-# scanned-calls.json, latency-tracker.py, etc.). Each jsonl file needs
-# union merge (mtime-wins would drop entries written between syncs on
-# the other node); non-jsonl files fall back to rsync --update.
-#
-# Strategy:
-#   1. rsync whole peer data/ dir into a staging subdir `.peer-staging/`
-#   2. for each .jsonl in staging, run merge-voice-metrics.sh against
-#      the same-named local file (generic JSON-line merge, not
-#      voice-metrics-specific — dedup on sessionId+timestamp).
-#   3. rsync non-.jsonl files from staging to local with --update.
-#   4. rsync local data/ back to peer (non-merge files).
-#   5. push locally-merged .jsonl files back to peer explicitly.
-#   6. clean up .peer-staging/.
-say ""
-say "Syncing data/ ..."
-if [ "$DRY_RUN" = "0" ]; then
-    mkdir -p "$DATA_LOCAL"
-    STAGING="$DATA_LOCAL.peer-staging/"
-    rm -rf "$STAGING"
-    mkdir -p "$STAGING"
-    # Pull peer data/ into staging (tolerant of missing peer dir)
-    run rsync -az --exclude 'radar-topics.example.json' --exclude '.peer-staging' \
-        "$PEER:$DATA_PEER" "$STAGING"
-    # Merge each staging .jsonl into local; non-jsonl files copied via --update
-    for pf in "$STAGING"*.jsonl; do
-        [ -f "$pf" ] || continue
-        fn="$(basename "$pf")"
-        bash "$REPO_ROOT/skills/cross-node-sync/scripts/merge-voice-metrics.sh" \
-            "$DATA_LOCAL$fn" "$pf" || true
-    done
-    # Copy non-jsonl staging files into local with --update (mtime-wins)
-    run rsync -az --update --exclude '*.jsonl' "$STAGING" "$DATA_LOCAL"
-    rm -rf "$STAGING"
-    # Push merged local data/ back to peer (no --delete so peer-only files survive)
-    run rsync -az --update --exclude 'radar-topics.example.json' --exclude '.peer-staging' \
-        "$DATA_LOCAL" "$PEER:$DATA_PEER"
-else
-    say "[DRY] would pull $PEER:$DATA_PEER into .peer-staging/, merge each .jsonl, rsync non-jsonl, push back"
-fi
 
 say ""
 if [ "$DRY_RUN" = "1" ]; then

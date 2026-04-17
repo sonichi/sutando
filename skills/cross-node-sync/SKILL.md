@@ -37,34 +37,36 @@ Syncthing would still be the right call if: scope grew past a few hundred files,
 
 ## Setup
 
-Two steps, once per node:
-
+**One-time:**
 ```bash
-# 1. Generate / authorize SSH key on the peer (prints instructions)
+# 1. Generate ed25519 key pair (or reuse existing one)
 bash skills/cross-node-sync/scripts/setup-rsync-sync.sh --setup
+# Follow printed instructions to authorize the key on the peer.
 
-# 2. Set the peer host — the ONLY required env var
-echo 'export SUTANDO_SYNC_PEER="susan@MacBook-Pro.local"' >> .env   # on Studio
-echo 'export SUTANDO_SYNC_PEER="susan@Mac-Studio.local"'  >> .env   # on Mini
+# 2. Set peer host env var (per-node, in shell rc or .env)
+export SUTANDO_SYNC_PEER="susan@MacBook-Pro.local"   # on Studio
+export SUTANDO_SYNC_PEER="susan@Mac-Studio.local"    # on Mini
 ```
 
-`SUTANDO_PEER_MEM_DIR` / `SUTANDO_PEER_NOTES_DIR` default to the **same literal paths as local**, so the defaults only work when both nodes share the same OS username AND the same repo location. In practice that's rare (e.g. Studio's `/Users/xueqingliu/...` vs MacBook's `/Users/xliu/...`), so most setups will want to set them explicitly:
-
+**Each sync pass:**
 ```bash
-# Example: Studio talking to a MacBook with a different username + repo path
-export SUTANDO_PEER_MEM_DIR="/Users/xliu/.claude/projects/-Users-xliu-.../memory/"
-export SUTANDO_PEER_NOTES_DIR="/Users/xliu/path/to/sutando/notes/"
+# Dry-run first to preview what would move
+bash skills/cross-node-sync/scripts/setup-rsync-sync.sh --dry-run
+
+# Actual sync (safe to run repeatedly)
+bash skills/cross-node-sync/scripts/setup-rsync-sync.sh
 ```
 
-Get the peer's values with `ssh $SUTANDO_SYNC_PEER 'echo $HOME; ls -d ~/.claude/projects/-*sutando*'`.
-
-**Cron wiring is automatic:** the `cross-node-sync` entry already lives in `skills/schedule-crons/crons.example.json`, so the usual first-time `cp skills/schedule-crons/crons.example.json skills/schedule-crons/crons.json` wires the 7-minute sync into the proactive-loop crons with no manual JSON editing. (7 min chosen to avoid `:00/:30` collision with other crons.)
-
-**Manual sync (optional):**
-```bash
-bash skills/cross-node-sync/scripts/setup-rsync-sync.sh --dry-run   # preview
-bash skills/cross-node-sync/scripts/setup-rsync-sync.sh             # actual run
+**Cron wiring (proactive loop integration):**
+Add this to `skills/schedule-crons/crons.json` on both nodes:
+```json
+{
+  "name": "cross-node-sync",
+  "cron": "*/7 * * * *",
+  "prompt": "bash skills/cross-node-sync/scripts/setup-rsync-sync.sh"
+}
 ```
+(7 min chosen to avoid `:00/:30` collision with other crons.)
 
 ## Conflict handling
 
