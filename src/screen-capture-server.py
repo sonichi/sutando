@@ -11,16 +11,34 @@ import http.server
 import subprocess
 import json
 import os
+import urllib.request
 from datetime import datetime
 
 PORT = 7845
 DIR = "/tmp/sutando-screenshots"
+# Web-client endpoint for agent-state reporting. When a /capture happens we
+# flash state=seeing on the menu-bar avatar for ~1.5s — makes screen-capture
+# visible to the user without them needing to watch the web UI.
+WEB_CLIENT_STATE_URL = "http://localhost:8080/mute-state?state=seeing&ttl_ms=1500"
+
+
+def _signal_seeing():
+    """Best-effort POST to web-client signaling agent is looking at the screen.
+    Silent on any failure — this is a UI signal, not a critical path."""
+    try:
+        req = urllib.request.Request(WEB_CLIENT_STATE_URL, method="GET")
+        urllib.request.urlopen(req, timeout=0.3)
+    except Exception:
+        pass  # Web-client may not be running; that's fine.
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
 
     def do_GET(self):
         if self.path.startswith("/capture"):
+            # Flash agent-state=seeing on the menu-bar avatar for ~1.5s.
+            # Non-blocking fire-and-forget; capture succeeds regardless.
+            _signal_seeing()
             os.makedirs(DIR, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d-%H%M%S")
             # Parse display number from query: /capture?display=2 or /capture?all=true

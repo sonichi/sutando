@@ -1917,8 +1917,14 @@ let _voiceState = false;
 // to decide when to animate (any non-'idle' value). Derivation happens in
 // the browser where the signals live (audio RMS, core-status, mute, voice);
 // the server just caches the last-reported value.
-type AgentState = 'idle' | 'listening' | 'speaking' | 'working';
+type AgentState = 'idle' | 'listening' | 'speaking' | 'working' | 'seeing';
 let _agentState: AgentState = 'idle';
+// Timestamp of the last transition INTO 'seeing'. Screen capture is transient
+// (sub-second), so we want the 'seeing' state to flash briefly then auto-revert
+// to whatever the prior state was. Without auto-revert, a single /capture call
+// pins state=seeing forever if nothing else POSTs.
+let _seeingUntil = 0;
+let _preSeeingState: AgentState = 'idle';
 
 // Heartbeat: ping every 30s, remove clients that fail to write (stale connections)
 setInterval(() => {
@@ -1952,6 +1958,12 @@ const server = createServer((req, res) => {
 
 	// SSE client count + mute/voice/agent state (safe for diagnostics + menu bar indicator)
 	if (url.pathname === '/sse-status') {
+		// Auto-revert from 'seeing' to the prior state if the flash window expired.
+		// Screen capture + take_screenshot calls are transient; without this,
+		// a single /capture call would pin state=seeing until the next browser POST.
+		if (_agentState === 'seeing' && Date.now() > _seeingUntil) {
+			_agentState = _preSeeingState;
+		}
 		res.writeHead(200, { 'Content-Type': 'application/json' });
 		res.end(JSON.stringify({
 			clients: sseClients.length,
@@ -1969,7 +1981,17 @@ const server = createServer((req, res) => {
 		const aState = url.searchParams.get('state');
 		if (mState !== null) _muteState = mState === 'true';
 		if (vState !== null) _voiceState = vState === 'true';
-		if (aState === 'idle' || aState === 'listening' || aState === 'speaking' || aState === 'working') {
+		if (aState === 'idle' || aState === 'listening' || aState === 'speaking' || aState === 'working' || aState === 'seeing') {
+			// Special handling for 'seeing': remember pre-seeing state so we can
+			// auto-revert. Default flash window is 1.5s unless caller specifies.
+			if (aState === 'seeing') {
+				if (_agentState !== 'seeing') {
+					_preSeeingState = _agentState;
+				}
+				const ttlParam = url.searchParams.get('ttl_ms');
+				const ttl = ttlParam ? parseInt(ttlParam, 10) : 1500;
+				_seeingUntil = Date.now() + (isFinite(ttl) && ttl > 0 ? ttl : 1500);
+			}
 			_agentState = aState;
 		}
 		res.writeHead(200, { 'Content-Type': 'application/json' });
