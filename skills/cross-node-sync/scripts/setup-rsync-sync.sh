@@ -53,18 +53,15 @@ PEER="${SUTANDO_SYNC_PEER:-}"
 
 MEM_LOCAL="$HOME/.claude/projects/-Users-xueqingliu-Documents-sutando-sutando/memory/"
 NOTES_LOCAL="$REPO_ROOT/notes/"
-RESEARCH_LOCAL="$REPO_ROOT/research/"
 
 # Peer-side paths — set via env because Claude Code's project dirs encode the
 # full absolute repo path, which differs between hosts (e.g. /Users/xueqingliu
 # on Studio vs /Users/xliu/Documents/xqq/... on MBP). Operator pokes these
 # into .env once per peer pairing.
-#   SUTANDO_PEER_MEM_DIR      — absolute peer path ending in "memory/"
-#   SUTANDO_PEER_NOTES_DIR    — absolute peer path ending in "notes/"
-#   SUTANDO_PEER_RESEARCH_DIR — absolute peer path ending in "research/"
+#   SUTANDO_PEER_MEM_DIR   — absolute peer path ending in "memory/"
+#   SUTANDO_PEER_NOTES_DIR — absolute peer path ending in "notes/"
 MEM_PEER="${SUTANDO_PEER_MEM_DIR:-}"
 NOTES_PEER="${SUTANDO_PEER_NOTES_DIR:-}"
-RESEARCH_PEER="${SUTANDO_PEER_RESEARCH_DIR:-}"
 
 # Common rsync flags:
 #   -a         archive (preserves modtime/perms — critical for conflict semantics)
@@ -142,11 +139,10 @@ if [ -z "$PEER" ]; then
     say "Then: bash skills/cross-node-sync/scripts/setup-rsync-sync.sh" >&2
     exit 1
 fi
-if [ -z "$MEM_PEER" ] || [ -z "$NOTES_PEER" ] || [ -z "$RESEARCH_PEER" ]; then
+if [ -z "$MEM_PEER" ] || [ -z "$NOTES_PEER" ]; then
     say "ERROR: peer paths not set. Example:" >&2
     say '    export SUTANDO_PEER_MEM_DIR=$HOME/.claude/projects/-Users-xliu-.../memory/' >&2
     say '    export SUTANDO_PEER_NOTES_DIR=$HOME/.../sutando/notes/' >&2
-    say '    export SUTANDO_PEER_RESEARCH_DIR=$HOME/.../sutando/research/' >&2
     say "(check peer with: ssh \$SUTANDO_SYNC_PEER 'ls -d \$HOME/.claude/projects/*/memory/')" >&2
     exit 1
 fi
@@ -179,12 +175,6 @@ say ""
 say "Syncing notes/ ..."
 run rsync "${RSYNC_FLAGS[@]}" ${DRYFLAG[@]+"${DRYFLAG[@]}"} "$NOTES_LOCAL" "$PEER:$NOTES_PEER"
 run rsync "${RSYNC_FLAGS[@]}" ${DRYFLAG[@]+"${DRYFLAG[@]}"} "$PEER:$NOTES_PEER" "$NOTES_LOCAL"
-
-# 4) Research sync (both directions)
-say ""
-say "Syncing research/ ..."
-run rsync "${RSYNC_FLAGS[@]}" ${DRYFLAG[@]+"${DRYFLAG[@]}"} "$RESEARCH_LOCAL" "$PEER:$RESEARCH_PEER"
-run rsync "${RSYNC_FLAGS[@]}" ${DRYFLAG[@]+"${DRYFLAG[@]}"} "$PEER:$RESEARCH_PEER" "$RESEARCH_LOCAL"
 
 say ""
 if [ "$DRY_RUN" = "1" ]; then
