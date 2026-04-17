@@ -18,6 +18,28 @@ WORKSPACE = Path(__file__).parent.parent
 PQ_FILE = WORKSPACE / "pending-questions.md"
 RESULTS_DIR = WORKSPACE / "results"
 LAST_NOTIFY_FILE = WORKSPACE / ".last-pq-notify"
+VOICE_LOG = WORKSPACE / "logs" / "voice-agent.log"
+
+
+def voice_client_connected():
+    """True if the most recent [Health] line in voice-agent.log shows client=true.
+    When the voice client is offline, dm-fallback already delivers question-*.txt
+    files via Discord DM — writing one would double-DM with notify_discord_dm."""
+    if not VOICE_LOG.exists():
+        return False
+    try:
+        # Read the tail efficiently: open at end, walk back ~16KB
+        with VOICE_LOG.open('rb') as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 16384))
+            tail = f.read().decode('utf-8', errors='replace')
+        for line in reversed(tail.splitlines()):
+            if '[Health]' in line and 'client=' in line:
+                return 'client=true' in line
+    except Exception:
+        pass
+    return False
 
 
 def get_waiting_questions():
@@ -107,8 +129,11 @@ def main():
     # macOS notification
     notify_macos(count, titles)
 
-    # Voice result (if voice is connected, agent will speak it)
-    notify_voice(questions)
+    # Voice result — only when voice is actually connected. When offline, the
+    # discord-bridge dm-fallback would deliver question-*.txt as a duplicate
+    # of notify_discord_dm below. Skipping cuts the spam in half.
+    if voice_client_connected():
+        notify_voice(questions)
 
     # Discord DM to owner (via discord-bridge poll_proactive)
     notify_discord_dm(questions)
