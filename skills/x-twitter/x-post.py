@@ -22,14 +22,27 @@ import sys
 import time
 from pathlib import Path
 
-try:
-    import requests
-    from requests_oauthlib import OAuth1
-except ImportError:
-    print("Installing required packages...")
-    os.system("pip3 install requests requests-oauthlib")
-    import requests
-    from requests_oauthlib import OAuth1
+# `requests` + `requests_oauthlib` are only needed for write / user-context
+# commands (post, mentions, timeline). Read-only commands (search, read) work
+# with just X_BEAR_TOKEN over stdlib urllib. Keep the import lazy so a
+# bearer-only environment (no OAuth1 creds, no `pip install` permission)
+# can still run search/read.
+requests = None
+OAuth1 = None
+def _require_requests():
+    global requests, OAuth1
+    if requests is not None and OAuth1 is not None:
+        return
+    try:
+        import requests as _requests
+        from requests_oauthlib import OAuth1 as _OAuth1
+    except ImportError:
+        print("Installing required packages...")
+        os.system("pip3 install --break-system-packages requests requests-oauthlib")
+        import requests as _requests
+        from requests_oauthlib import OAuth1 as _OAuth1
+    requests = _requests
+    OAuth1 = _OAuth1
 
 # Load .env
 ENV_FILE = Path(__file__).parent.parent.parent / ".env"
@@ -43,17 +56,37 @@ API_KEY = os.environ.get("X_API_KEY", "")
 API_SECRET = os.environ.get("X_API_SECRET", "")
 ACCESS_TOKEN = os.environ.get("X_ACCESS_TOKEN", "")
 ACCESS_TOKEN_SECRET = os.environ.get("X_ACCESS_TOKEN_SECRET", "")
+BEARER_TOKEN = os.environ.get("X_BEAR_TOKEN", "")
 
 UPLOAD_URL = "https://upload.twitter.com/1.1/media/upload.json"
 TWEET_URL = "https://api.twitter.com/2/tweets"
 
 
 def get_auth():
+    _require_requests()
     if not all([API_KEY, API_SECRET, ACCESS_TOKEN, ACCESS_TOKEN_SECRET]):
         print("Error: X API credentials not set in .env")
         print("Need: X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET")
         sys.exit(1)
     return OAuth1(API_KEY, API_SECRET, ACCESS_TOKEN, ACCESS_TOKEN_SECRET)
+
+
+def _bearer_get(url):
+    """GET an X API endpoint with bearer auth using stdlib only.
+
+    Returns parsed JSON or exits on error. Used by search_tweets() and
+    read_tweet() when X_BEAR_TOKEN is set, so a bearer-only environment
+    doesn't need `requests` / `requests_oauthlib`.
+    """
+    import urllib.request, urllib.error
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {BEARER_TOKEN}"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        print(f"Error {e.code}: {body[:400]}")
+        sys.exit(1)
 
 
 def upload_media(filepath, auth):
@@ -158,14 +191,21 @@ USER_FIELDS = "user.fields=username,name"
 
 
 def search_tweets(query, auth, max_results=10):
-    """Search recent tweets."""
-    resp = requests.get(
-        f"https://api.twitter.com/2/tweets/search/recent?query={requests.utils.quote(query)}&max_results={max_results}&{TWEET_FIELDS}",
-        auth=auth)
-    if resp.status_code != 200:
-        print(f"Error {resp.status_code}: {resp.text}")
-        return
-    data = resp.json().get("data", [])
+    """Search recent tweets. Uses app-only bearer auth if X_BEAR_TOKEN is set
+    (no dependency on `requests`); otherwise falls back to OAuth1 + requests."""
+    import urllib.parse
+    q = urllib.parse.quote(query)
+    url = f"https://api.twitter.com/2/tweets/search/recent?query={q}&max_results={max_results}&{TWEET_FIELDS}"
+    if BEARER_TOKEN:
+        resp_json = _bearer_get(url)
+    else:
+        _require_requests()
+        resp = requests.get(url, auth=auth)
+        if resp.status_code != 200:
+            print(f"Error {resp.status_code}: {resp.text}")
+            return
+        resp_json = resp.json()
+    data = resp_json.get("data", [])
     if not data:
         print("No results found.")
         return
@@ -178,14 +218,17 @@ def search_tweets(query, auth, max_results=10):
 
 
 def read_tweet(tweet_id, auth):
-    """Read a single tweet with metrics."""
-    resp = requests.get(
-        f"https://api.twitter.com/2/tweets/{tweet_id}?{TWEET_FIELDS}&expansions=author_id&{USER_FIELDS}",
-        auth=auth)
-    if resp.status_code != 200:
-        print(f"Error {resp.status_code}: {resp.text}")
-        return
-    data = resp.json()
+    """Read a single tweet with metrics. Uses bearer if available."""
+    url = f"https://api.twitter.com/2/tweets/{tweet_id}?{TWEET_FIELDS}&expansions=author_id&{USER_FIELDS}"
+    if BEARER_TOKEN:
+        data = _bearer_get(url)
+    else:
+        _require_requests()
+        resp = requests.get(url, auth=auth)
+        if resp.status_code != 200:
+            print(f"Error {resp.status_code}: {resp.text}")
+            return
+        data = resp.json()
     t = data.get("data", {})
     users = {u["id"]: u for u in data.get("includes", {}).get("users", [])}
     author = users.get(t.get("author_id"), {})
@@ -267,6 +310,16 @@ def main():
     if not args.command:
         parser.print_help()
         sys.exit(1)
+
+    # Read-only commands that app-only bearer auth can handle. Skip OAuth1
+    # setup (and its `requests`/`oauthlib` install) so X_BEAR_TOKEN-only
+    # environments don't need pip.
+    if args.command in ("search", "read") and BEARER_TOKEN:
+        if args.command == "search":
+            search_tweets(args.query, auth=None, max_results=args.limit)
+        else:
+            read_tweet(args.tweet_id, auth=None)
+        return
 
     auth = get_auth()
 
