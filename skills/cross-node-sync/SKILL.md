@@ -25,7 +25,6 @@ Syncthing would still be the right call if: scope grew past a few hundred files,
 **Syncs (both directions, union semantics via `rsync --update`):**
 - `~/.claude/projects/-Users-xueqingliu-Documents-sutando-sutando/memory/` — cross-session bot memory
 - `<repo>/notes/` — user's second-brain notes
-- `<repo>/research/` — shared research material (cross-bot delegated findings, proposal source material)
 
 **Excluded (per-node state):**
 - `state/`, `tasks/`, `results/`, `logs/` — per-bot queues + histories

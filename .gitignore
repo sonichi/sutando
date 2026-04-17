@@ -29,8 +29,6 @@ ACTIVITY.md
 build_log.md
 notes/*
 !notes/.gitkeep
-research/*
-!research/.gitkeep
 
 telegram-inbox/
 discord-inbox/
