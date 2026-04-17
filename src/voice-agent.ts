@@ -624,6 +624,19 @@ async function main() {
 				voiceEvents.push({ event: `error:${e.component}:${e.error.message}`, timestamp: new Date().toISOString() });
 				console.error(`${ts()} [Error] ${e.component}: ${e.error.message} (${e.severity})`);
 			},
+			onTurnLatency: (e) => {
+				const total = e.segments.totalE2EMs;
+				const slow = total > 1500;
+				const tag = slow ? '[Latency:SLOW]' : '[Latency]';
+				const parts = [`t=${total}ms`];
+				if (e.segments.geminiProcessingMs != null) parts.push(`gemini=${e.segments.geminiProcessingMs}ms`);
+				if (e.segments.clientToBackendMs != null) parts.push(`c2b=${e.segments.clientToBackendMs}ms`);
+				if (e.segments.backendToGeminiMs != null) parts.push(`b2g=${e.segments.backendToGeminiMs}ms`);
+				if (e.segments.geminiToBackendMs != null) parts.push(`g2b=${e.segments.geminiToBackendMs}ms`);
+				if (e.segments.backendToClientMs != null) parts.push(`b2c=${e.segments.backendToClientMs}ms`);
+				console.log(`${ts()} ${tag} turn=${e.turnId} ${parts.join(' ')}`);
+				if (slow) voiceEvents.push({ event: `slow_turn:${total}ms`, timestamp: new Date().toISOString() });
+			},
 		},
 	});
 
