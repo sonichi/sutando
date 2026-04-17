@@ -632,9 +632,16 @@ async def poll_results():
                 reply_text = result_file.read_text().strip()
                 channel = pending_replies.pop(task_id)
                 save_pending_replies()
-                # Skip sending if already replied directly (core agent used MCP)
+                # Skip sending if already replied directly (core agent used MCP).
+                # Clean up the result AND task files so the watcher doesn't
+                # re-fire infinitely on the leftover task. Observed 2026-04-17:
+                # `[no-send]` tasks persisted in tasks/ because `continue`
+                # skipped the cleanup block at the bottom of this loop.
                 if reply_text.startswith('[no-send]') or reply_text.startswith('[REPLIED]'):
                     print(f"  Skipped (already replied): {task_id}")
+                    result_file.unlink(missing_ok=True)
+                    task_file = TASKS_DIR / f"{task_id}.txt"
+                    task_file.unlink(missing_ok=True)
                     continue
                 try:
                     # Extract file paths: [file: /path] or [send: /path]
