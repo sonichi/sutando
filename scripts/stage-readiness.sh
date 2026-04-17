@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# stage-readiness.sh — pre-flight checklist for the ICLR talk.
+#
+# Runs a series of checks and prints a PASS/WARN/FAIL line for each.
+# Exits 1 if any FAIL, 2 if any WARN, 0 if all PASS. Aimed at the 5-10 min
+# window before going on screen — no interactive prompts, finishes in <20s.
+#
+# Checks (all in terms of "does Sutando work RIGHT NOW for the talk?"):
+#   voice-agent:       port 9900 responsive, recent Health tick, client can connect
+#   bodhi FATAL:       0× CLOSED→RECONNECTING in the last 10 min (post-#409 expected)
+#   conversation:      port 3100 /health endpoint returns ok
+#   ngrok tunnel:      curl the public URL, expect 200-range
+#   presenter-mode:    sentinel present + future expiry, so notifications are silenced
+#   quota:             >10% remaining so we don't blow through mid-segment
+#   disk + memory:     not in low-space / low-mem territory
+#   memory-sync:       last sync <6h so memory/notes are current
+#
+# Usage: bash scripts/stage-readiness.sh
+#        -q | --quiet : only print non-pass lines + final summary
+
+set -uo pipefail
+
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+QUIET=0
+for arg in "$@"; do case "$arg" in -q|--quiet) QUIET=1 ;; esac; done
+
+PASS=0
+WARN=0
+FAIL=0
+WIDTH=20
+
+pass() { [ $QUIET -eq 0 ] && printf "  \033[32m✓ PASS\033[0m  %-${WIDTH}s %s\n" "$1" "$2"; PASS=$((PASS + 1)); }
+warn() { printf "  \033[33m⚠ WARN\033[0m  %-${WIDTH}s %s\n" "$1" "$2"; WARN=$((WARN + 1)); }
+fail() { printf "  \033[31m✗ FAIL\033[0m  %-${WIDTH}s %s\n" "$1" "$2"; FAIL=$((FAIL + 1)); }
+
+[ $QUIET -eq 0 ] && echo "━━━ Sutando Stage Readiness ━━━"
+
+# 1) voice-agent
+if lsof -iTCP:9900 -sTCP:LISTEN >/dev/null 2>&1; then
+    # Check for a Health tick in the last 60s.
+    VLOG="$REPO/logs/voice-agent.log"
+    if [ -f "$VLOG" ] && [ $(($(date +%s) - $(stat -f %m "$VLOG" 2>/dev/null || stat -c %Y "$VLOG"))) -lt 60 ]; then
+        pass "voice-agent" "port 9900 listening, log fresh (<60s)"
+    else
+        warn "voice-agent" "port 9900 listening but log stale"
+    fi
+else
+    fail "voice-agent" "port 9900 not listening — start with 'npx tsx src/voice-agent.ts'"
+fi
+
+# 2) bodhi FATAL count (since last voice-agent restart)
+VLOG="$REPO/logs/voice-agent.log"
+if [ -f "$VLOG" ]; then
+    fatals=$(grep -c "FATAL.*SessionError.*Invalid transition" "$VLOG" 2>/dev/null | tr -d '[:space:]')
+    fatals="${fatals:-0}"
+    if [ "$fatals" -eq 0 ]; then
+        pass "bodhi state machine" "0× CLOSED→RECONNECTING FATALs in current log"
+    elif [ "$fatals" -lt 5 ]; then
+        warn "bodhi state machine" "$fatals FATALs — consider restart if talk is <1h away"
+    else
+        fail "bodhi state machine" "$fatals FATALs — restart voice-agent before talk"
+    fi
+fi
+
+# 3) conversation-server
+if curl -s -m 3 "http://localhost:3100/health" 2>/dev/null | grep -q '"status":"ok"'; then
+    pass "conversation-server" "port 3100 /health ok"
+else
+    warn "conversation-server" "port 3100 /health not responding (non-blocking if not using phone)"
+fi
+
+# 4) ngrok tunnel
+# Strip quotes AND any trailing comment after `#` AND whitespace.
+NGROK_URL=$(grep -E "^TWILIO_WEBHOOK_URL=" "$REPO/.env" 2>/dev/null | cut -d= -f2- | sed 's/[[:space:]]*#.*$//' | tr -d '"' | tr -d '[:space:]' | head -1)
+if [ -n "${NGROK_URL:-}" ]; then
+    # curl -w prints "000" on connection failure; don't double-append. Also
+    # check /health explicitly since `/` on Twilio-bound ngrok may 404.
+    probe_url="$NGROK_URL"
+    [[ "$probe_url" != */* ]] || probe_url="${NGROK_URL%/}/health"
+    code=$(curl -s -m 5 -o /dev/null -w "%{http_code}" "$probe_url" 2>/dev/null)
+    code="${code:-000}"
+    if [ "$code" = "000" ]; then
+        warn "ngrok tunnel" "unreachable: $NGROK_URL (connection failed)"
+    elif [ "$code" -ge 200 ] && [ "$code" -lt 500 ]; then
+        pass "ngrok tunnel" "$NGROK_URL → HTTP $code"
+    else
+        warn "ngrok tunnel" "$NGROK_URL → HTTP $code"
+    fi
+else
+    [ $QUIET -eq 0 ] && echo "  (skip) ngrok: no TWILIO_WEBHOOK_URL configured"
+fi
+
+# 5) presenter-mode sentinel
+SENT="$REPO/state/presenter-mode.sentinel"
+if [ -f "$SENT" ]; then
+    expire_iso=$(cat "$SENT")
+    now_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    if [[ "$now_iso" < "$expire_iso" ]]; then
+        pass "presenter-mode" "ACTIVE until $expire_iso (notifications silenced)"
+    else
+        warn "presenter-mode" "sentinel expired — run 'bash scripts/presenter-mode.sh start' before talk"
+    fi
+else
+    warn "presenter-mode" "INACTIVE — run 'bash scripts/presenter-mode.sh start' before talk"
+fi
+
+# 6) quota
+QUOTA_OUT=$(python3 "$HOME/.claude/skills/quota-tracker/scripts/read-quota.py" 2>/dev/null || echo "")
+REM=$(echo "$QUOTA_OUT" | grep -oE '[0-9]+% remaining' | head -1 | grep -oE '[0-9]+')
+if [ -n "${REM:-}" ]; then
+    if [ "$REM" -ge 10 ]; then
+        pass "Claude quota" "${REM}% remaining"
+    else
+        warn "Claude quota" "${REM}% remaining — may run low mid-talk"
+    fi
+else
+    [ $QUIET -eq 0 ] && echo "  (skip) Claude quota: read-quota.py unavailable"
+fi
+
+# 7) disk
+AVAIL_GB=$(df -g / 2>/dev/null | awk 'NR==2 {print $4}')
+if [ -n "${AVAIL_GB:-}" ]; then
+    if [ "$AVAIL_GB" -gt 5 ]; then
+        pass "disk space" "${AVAIL_GB} GB free on /"
+    else
+        warn "disk space" "only ${AVAIL_GB} GB free — clean up before talk"
+    fi
+fi
+
+# 8) memory-sync age
+SYNC_HEAD="$HOME/.sutando-memory-sync/.git/FETCH_HEAD"
+if [ -f "$SYNC_HEAD" ]; then
+    age_sec=$(($(date +%s) - $(stat -f %m "$SYNC_HEAD" 2>/dev/null || stat -c %Y "$SYNC_HEAD")))
+    age_h=$((age_sec / 3600))
+    if [ "$age_h" -lt 6 ]; then
+        pass "memory-sync" "last sync ${age_h}h ago"
+    elif [ "$age_h" -lt 48 ]; then
+        warn "memory-sync" "last sync ${age_h}h ago — run 'bash src/sync-memory.sh'"
+    else
+        fail "memory-sync" "last sync ${age_h}h ago — stale, sync before talk"
+    fi
+fi
+
+echo ""
+printf "Summary: %d pass, %d warn, %d fail\n" "$PASS" "$WARN" "$FAIL"
+if [ "$FAIL" -gt 0 ]; then exit 1
+elif [ "$WARN" -gt 0 ]; then exit 2
+else exit 0; fi
