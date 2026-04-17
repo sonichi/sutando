@@ -71,7 +71,13 @@ NOTES_PEER="${SUTANDO_PEER_NOTES_DIR:-$NOTES_LOCAL}"
 RSYNC_FLAGS=(-az --update
     --exclude '.DS_Store' --exclude '*.swp' --exclude '*.swo'
     --exclude '.stversions' --exclude '.stfolder'
-    --exclude 'MEMORY.md' --exclude 'INDEX.md')
+    --exclude 'MEMORY.md' --exclude 'INDEX.md'
+    --exclude 'core-status.json')
+# core-status.json is per-node proactive-loop state that occasionally lands
+# in the memory dir (voice-agent + proactive-loop both write to it and
+# sometimes pick up wrong CWD). Excluding it here so a stale snapshot from
+# one node doesn't clobber the other's live status. Seen during PR #429
+# testing on 2026-04-17 — Studio had a 24-hour-old copy inside memory/.
 # Index-manifest files (MEMORY.md, INDEX.md) cannot use mtime-wins — one side's
 # newer-but-shorter version clobbers the other's longer listing. Both Studio
 # and MBP hit this on 2026-04-17 (74 files on disk, only 19 linked). Workaround:
