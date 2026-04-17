@@ -33,7 +33,8 @@ def load_env():
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
                     key, val = line.split("=", 1)
-                    os.environ.setdefault(key.strip(), val.strip())
+                    # .env wins over stale shell env — see PR #416.
+                    os.environ[key.strip()] = val.strip()
 
 
 def generate_image(client, args):

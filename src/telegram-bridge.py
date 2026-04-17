@@ -20,13 +20,16 @@ try:
 except ImportError:
     pass  # python-dotenv not installed — token loaded from channels config below
 
-# Also load from channels config
+# Also load from channels config — config file wins over stale shell env.
+# `setdefault` previously let a stale TELEGRAM_BOT_TOKEN from a prior shell
+# session silently override the freshly-rotated value, same bug class as
+# skills/x-twitter/x-post.py (see PR #416 commit message for full context).
 channels_env = Path.home() / ".claude" / "channels" / "telegram" / ".env"
 if channels_env.exists():
     for line in channels_env.read_text().splitlines():
         if "=" in line and not line.startswith("#"):
             k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
+            os.environ[k.strip()] = v.strip()
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 if not TOKEN:
