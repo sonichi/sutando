@@ -38,6 +38,24 @@ TASKS_DIR.mkdir(exist_ok=True)
 RESULTS_DIR.mkdir(exist_ok=True)
 INBOX_DIR.mkdir(exist_ok=True)
 
+# Presenter mode: when scripts/presenter-mode.sh is active, the bridge
+# must not send proactive DMs to the owner. The sentinel contains an
+# ISO-8601 expiry; see scripts/presenter-mode.sh for the contract.
+# Matches the check in src/check-pending-questions.py — both scripts
+# share the same sentinel path + comparison logic.
+PRESENTER_SENTINEL = REPO / "state" / "presenter-mode.sentinel"
+
+
+def presenter_mode_active():
+    if not PRESENTER_SENTINEL.exists():
+        return False
+    try:
+        expire_iso = PRESENTER_SENTINEL.read_text().strip()
+        now_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+        return now_iso < expire_iso
+    except Exception:
+        return False
+
 # Optional: deterministic ownership for team/other-tier tasks across nodes.
 # When set, only the node whose stand-identity.json `machine` field matches
 # SUTANDO_TEAM_TIER_OWNER will accept non-owner-tier tasks. The other nodes
@@ -667,10 +685,29 @@ async def poll_results():
 
 
 async def poll_proactive():
-    """Poll results/ for proactive messages and send to owner's DM."""
+    """Poll results/ for proactive messages and send to owner's DM.
+
+    When presenter-mode is active, proactive files are retained (not sent,
+    not deleted) so they flush after the talk window ends. This honors
+    the presenter-mode contract: no owner DMs during the presenter window.
+    """
     import re
+    _presenter_log_throttle = 0
     while True:
         try:
+            # Skip sends while presenter-mode is active. Files remain on
+            # disk and are sent on a later tick once the sentinel clears.
+            if presenter_mode_active():
+                _presenter_log_throttle += 1
+                if _presenter_log_throttle % 20 == 1:  # ~once per 60s
+                    pending = sum(
+                        1 for f in RESULTS_DIR.iterdir()
+                        if f.name.startswith("proactive-") and f.suffix == ".txt"
+                    )
+                    print(f"  [proactive] presenter-mode active, {pending} proactive file(s) queued")
+                await asyncio.sleep(3)
+                continue
+            _presenter_log_throttle = 0
             for f in RESULTS_DIR.iterdir():
                 if f.name.startswith("proactive-") and f.suffix == ".txt":
                     text = f.read_text().strip()
