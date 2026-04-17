@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # test-x-search-bearer.sh — verify bug fix: x-post.py search/read work with
-# only X_BEAR_TOKEN set (no OAuth1 credentials, no pip install).
+# only X_BEARER_TOKEN set (no OAuth1 credentials, no pip install).
 #
 # THE BUG (pre-fix): skills/x-twitter/x-post.py imported `requests` +
 # `requests_oauthlib` at module load and auto-ran `pip3 install ...` on
 # ImportError. On externally-managed Pythons (macOS Homebrew python3.14)
 # pip refuses without --break-system-packages, so the import raises and
 # every command exits before the argparser runs. On the Mac Studio node
-# (only X_BEAR_TOKEN is configured), the advertised skill was unusable
+# (only X_BEARER_TOKEN is configured), the advertised skill was unusable
 # — even for read-only commands that don't technically need OAuth1.
 #
 # THE FIX (this PR): read-only commands (search, read) route through a
-# stdlib-urllib bearer path when X_BEAR_TOKEN is set; `requests` + OAuth1
+# stdlib-urllib bearer path when X_BEARER_TOKEN is set; `requests` + OAuth1
 # are lazy-imported only when a write command (post, mentions, timeline)
 # actually needs them.
 #
@@ -22,14 +22,14 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 BUGGY_COMMIT="${1:-d2d4458}"  # main before the fix (docs PR #393)
-FIXED_COMMIT="${2:-5128e30}"  # this PR's commit
+FIXED_COMMIT="${2:-$(git rev-parse HEAD 2>/dev/null || echo HEAD)}"  # current branch tip
 
 check_bearer_path_in_source() {
   local commit="$1"; local label="$2"; local expect="$3"
   local src has_bearer_token has_bearer_get actual=fail
   src="$(git show ${commit}:skills/x-twitter/x-post.py 2>/dev/null)" \
     || { echo "  ✗ cannot read ${commit}:skills/x-twitter/x-post.py"; exit 1; }
-  has_bearer_token=$(echo "$src" | grep -c 'X_BEAR_TOKEN' || true)
+  has_bearer_token=$(echo "$src" | grep -c 'X_BEARER_TOKEN' || true)
   has_bearer_get=$(echo "$src" | grep -c '_bearer_get' || true)
   [ "$has_bearer_token" -gt 0 ] && [ "$has_bearer_get" -gt 0 ] && actual=pass
   if [ "$actual" = "$expect" ]; then
@@ -49,9 +49,9 @@ check_bearer_path_in_source "$FIXED_COMMIT" "fixed" "pass"
 # shellcheck disable=SC1091
 source .env 2>/dev/null || true
 
-if [ -z "${X_BEAR_TOKEN:-}" ]; then
+if [ -z "${X_BEARER_TOKEN:-}" ]; then
   echo ""
-  echo "SKIP Phase 2/3: X_BEAR_TOKEN not set — source-level checks already confirmed the fix is in place."
+  echo "SKIP Phase 2/3: X_BEARER_TOKEN not set — source-level checks already confirmed the fix is in place."
   echo "PASS"
   exit 0
 fi
@@ -79,7 +79,7 @@ echo "  ✓ stdlib urllib path active (no pip autoinstall observed)"
 echo ""
 echo "Phase 4: runtime before/after — extract both x-post.py versions and run"
 # Extract buggy x-post.py to a tmp dir and run it with a scrubbed env
-# (only X_BEAR_TOKEN passed through). This proves the buggy version fails
+# (only X_BEARER_TOKEN passed through). This proves the buggy version fails
 # for a bearer-only user even when requests is already installed on the
 # system, because it unconditionally requires the OAuth1 quadruple.
 TMPDIR=$(mktemp -d)
@@ -88,12 +88,12 @@ trap 'rm -rf "$TMPDIR"' EXIT
 git show "${BUGGY_COMMIT}":skills/x-twitter/x-post.py > "$TMPDIR/buggy.py"
 git show "${FIXED_COMMIT}":skills/x-twitter/x-post.py > "$TMPDIR/fixed.py"
 
-# Bearer-only env: strip OAuth1 keys, keep only X_BEAR_TOKEN.
+# Bearer-only env: strip OAuth1 keys, keep only X_BEARER_TOKEN.
 run_bearer_only() {
   env -i \
     "HOME=$HOME" \
     "PATH=$PATH" \
-    "X_BEAR_TOKEN=${X_BEAR_TOKEN}" \
+    "X_BEARER_TOKEN=${X_BEARER_TOKEN}" \
     python3 "$1" search "moltbook" --limit 10 2>&1
 }
 

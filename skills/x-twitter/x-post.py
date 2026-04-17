@@ -24,7 +24,7 @@ from pathlib import Path
 
 # `requests` + `requests_oauthlib` are only needed for write / user-context
 # commands (post, mentions, timeline). Read-only commands (search, read) work
-# with just X_BEAR_TOKEN over stdlib urllib. Keep the import lazy so a
+# with just X_BEARER_TOKEN over stdlib urllib. Keep the import lazy so a
 # bearer-only environment (no OAuth1 creds, no `pip install` permission)
 # can still run search/read.
 requests = None
@@ -56,7 +56,7 @@ API_KEY = os.environ.get("X_API_KEY", "")
 API_SECRET = os.environ.get("X_API_SECRET", "")
 ACCESS_TOKEN = os.environ.get("X_ACCESS_TOKEN", "")
 ACCESS_TOKEN_SECRET = os.environ.get("X_ACCESS_TOKEN_SECRET", "")
-BEARER_TOKEN = os.environ.get("X_BEAR_TOKEN", "")
+BEARER_TOKEN = os.environ.get("X_BEARER_TOKEN", "")
 
 UPLOAD_URL = "https://upload.twitter.com/1.1/media/upload.json"
 TWEET_URL = "https://api.twitter.com/2/tweets"
@@ -75,7 +75,7 @@ def _bearer_get(url):
     """GET an X API endpoint with bearer auth using stdlib only.
 
     Returns parsed JSON or exits on error. Used by search_tweets() and
-    read_tweet() when X_BEAR_TOKEN is set, so a bearer-only environment
+    read_tweet() when X_BEARER_TOKEN is set, so a bearer-only environment
     doesn't need `requests` / `requests_oauthlib`.
     """
     import urllib.request, urllib.error
@@ -191,7 +191,7 @@ USER_FIELDS = "user.fields=username,name"
 
 
 def search_tweets(query, auth, max_results=10):
-    """Search recent tweets. Uses app-only bearer auth if X_BEAR_TOKEN is set
+    """Search recent tweets. Uses app-only bearer auth if X_BEARER_TOKEN is set
     (no dependency on `requests`); otherwise falls back to OAuth1 + requests."""
     import urllib.parse
     q = urllib.parse.quote(query)
@@ -312,7 +312,7 @@ def main():
         sys.exit(1)
 
     # Read-only commands that app-only bearer auth can handle. Skip OAuth1
-    # setup (and its `requests`/`oauthlib` install) so X_BEAR_TOKEN-only
+    # setup (and its `requests`/`oauthlib` install) so X_BEARER_TOKEN-only
     # environments don't need pip.
     if args.command in ("search", "read") and BEARER_TOKEN:
         if args.command == "search":
