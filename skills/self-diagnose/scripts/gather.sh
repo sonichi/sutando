@@ -71,7 +71,10 @@ if [ -f "$REPO/src/health-check.py" ]; then
 fi
 
 # 7) Recent result files — what did the agent actually reply to?
-find "$REPO/results" -maxdepth 1 -type f -name "*.txt" -newer "$OUT/meta.txt" 2>/dev/null | head -20 > "$OUT/results-recent-paths.txt" || true
+# Use -mmin against SECONDS_AGO (not `-newer meta.txt` — meta.txt was created
+# at gather-start, so that would only match files written DURING the gather,
+# not files in the last $WINDOW).
+find "$REPO/results" -maxdepth 1 -type f -name "*.txt" -mmin "-$((SECONDS_AGO/60))" 2>/dev/null | head -20 > "$OUT/results-recent-paths.txt" || true
 
 # 8) Quota state
 if [ -f "$HOME/.claude/skills/quota-tracker/scripts/read-quota.py" ]; then

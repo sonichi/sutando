@@ -63,6 +63,28 @@ else
 	fail "3d window: gather exited non-zero"
 fi
 
+# Test 8: results-recent-paths captures files mtime-newer than SINCE_EPOCH.
+# This catches the "-newer meta.txt" bug that made this file empty on every run.
+# Touch a fake result file to 1 hour old, then gather with 24h window.
+mkdir -p results 2>/dev/null
+FAKE_RESULT="results/sutando-test-recent-$(date +%s).txt"
+echo "fake" > "$FAKE_RESULT"
+# Backdate to 1 hour ago (BSD touch on macOS, GNU touch on linux — support both)
+if date -v -1H >/dev/null 2>&1; then
+	touch -t "$(date -v -1H +%Y%m%d%H%M.%S)" "$FAKE_RESULT"
+else
+	touch -d "1 hour ago" "$FAKE_RESULT"
+fi
+if OUT8=$(bash skills/self-diagnose/scripts/gather.sh 24h 2>/dev/null); then
+	if grep -q "sutando-test-recent" "$OUT8/results-recent-paths.txt" 2>/dev/null; then
+		pass "results-recent-paths captures 1h-old file in 24h window"
+	else
+		fail "results-recent-paths empty despite 1h-old file (regression of -newer meta.txt bug)"
+	fi
+	rm -rf "$OUT8" 2>/dev/null
+fi
+rm -f "$FAKE_RESULT" 2>/dev/null
+
 # Cleanup
 [ -n "${OUT:-}" ] && rm -rf "$OUT" 2>/dev/null || true
 
