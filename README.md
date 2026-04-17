@@ -74,6 +74,8 @@ They communicate through files: voice agent writes tasks, the core agent execute
 
 ## Quick start
 
+You don't need to buy extra usage — Sutando runs on your existing Claude subscription.
+
 **Prerequisites:**
 - macOS 15+
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code/getting-started) (run `claude` once to complete login)
