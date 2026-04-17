@@ -57,7 +57,7 @@ if [ -z "${X_BEAR_TOKEN:-}" ]; then
 fi
 
 echo ""
-echo "Phase 2: bearer-only search returns tweets (live smoke test)"
+echo "Phase 2: fix commit's search returns tweets via bearer (live smoke test)"
 OUT=$(python3 skills/x-twitter/x-post.py search "moltbook" --limit 10 2>&1)
 if echo "$OUT" | grep -q "https://x.com/i/status/"; then
   COUNT=$(echo "$OUT" | grep -c "https://x.com/i/status/" || echo 0)
@@ -77,4 +77,46 @@ fi
 echo "  ✓ stdlib urllib path active (no pip autoinstall observed)"
 
 echo ""
-echo "PASS: buggy commit rejects, fix commit accepts, live bearer search works."
+echo "Phase 4: runtime before/after — extract both x-post.py versions and run"
+# Extract buggy x-post.py to a tmp dir and run it with a scrubbed env
+# (only X_BEAR_TOKEN passed through). This proves the buggy version fails
+# for a bearer-only user even when requests is already installed on the
+# system, because it unconditionally requires the OAuth1 quadruple.
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
+
+git show "${BUGGY_COMMIT}":skills/x-twitter/x-post.py > "$TMPDIR/buggy.py"
+git show "${FIXED_COMMIT}":skills/x-twitter/x-post.py > "$TMPDIR/fixed.py"
+
+# Bearer-only env: strip OAuth1 keys, keep only X_BEAR_TOKEN.
+run_bearer_only() {
+  env -i \
+    "HOME=$HOME" \
+    "PATH=$PATH" \
+    "X_BEAR_TOKEN=${X_BEAR_TOKEN}" \
+    python3 "$1" search "moltbook" --limit 10 2>&1
+}
+
+echo "  → buggy (${BUGGY_COMMIT:0:7}) output:"
+BUG_OUT=$(run_bearer_only "$TMPDIR/buggy.py" || true)
+echo "$BUG_OUT" | sed 's/^/      /' | head -6
+if echo "$BUG_OUT" | grep -qE "credentials not set|X_API_KEY|externally-managed"; then
+  echo "  ✓ buggy fails with bearer-only env (as expected)"
+else
+  echo "  ✗ buggy unexpectedly succeeded — bug may already be gone upstream?"
+  exit 1
+fi
+
+echo "  → fixed (${FIXED_COMMIT:0:7}) output:"
+FIX_OUT=$(run_bearer_only "$TMPDIR/fixed.py" || true)
+echo "$FIX_OUT" | sed 's/^/      /' | head -4
+if echo "$FIX_OUT" | grep -q "https://x.com/i/status/"; then
+  echo "  ✓ fixed succeeds with bearer-only env (returns tweets)"
+else
+  echo "  ✗ fixed did not return tweets with bearer-only env. Full output:"
+  echo "$FIX_OUT"
+  exit 1
+fi
+
+echo ""
+echo "PASS: runtime before/after confirmed — buggy rejects, fixed accepts, bearer-only env sufficient."
