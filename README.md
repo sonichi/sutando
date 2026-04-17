@@ -8,6 +8,8 @@ It shares your screen, joins your meetings, makes phone calls, and builds itself
 
 It belongs entirely to you.
 
+> **No extra usage fees.** Sutando runs on your existing Claude Code subscription. No per-task billing, no separate API key to top up, no surprise bills — unlike agents that route every action through pay-per-token APIs (OpenClaw, Hermes, Nanoclaw, and most hosted alternatives).
+
 > *Named after [Stands](https://jojo.fandom.com/wiki/Stand) from JoJo's Bizarre Adventure — a personal spirit that fights on your behalf. Like a Stand, Sutando starts unnamed. As it learns your style and earns real capabilities, it names itself and generates its own avatar — your Stand, unique to you.*
 
 https://github.com/user-attachments/assets/a86ec34e-3b26-4011-824c-d2d124753c25
@@ -73,8 +75,6 @@ They communicate through files: voice agent writes tasks, the core agent execute
 ---
 
 ## Quick start
-
-You don't need to buy extra usage — Sutando runs on your existing Claude subscription.
 
 **Prerequisites:**
 - macOS 15+
