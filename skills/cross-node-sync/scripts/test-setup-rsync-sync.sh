@@ -57,12 +57,9 @@ else
     fi
 fi
 
-# T6 — --dry-run with PEER + peer-paths set prints DRY-RUN banner.
-# Script requires SUTANDO_PEER_MEM_DIR + SUTANDO_PEER_NOTES_DIR to proceed past
-# arg validation; supply dummies so the dry-run path actually runs.
+# T6 — --dry-run with PEER set prints DRY-RUN banner. Peer paths now default
+# to local paths, so only SUTANDO_SYNC_PEER is needed.
 DRY_OUT=$(SUTANDO_SYNC_PEER=dummy@localhost \
-    SUTANDO_PEER_MEM_DIR=/tmp/peer-memory \
-    SUTANDO_PEER_NOTES_DIR=/tmp/peer-notes \
     bash "$SCRIPT" --dry-run 2>&1 || true)
 if echo "$DRY_OUT" | grep -q "DRY-RUN MODE"; then
     pass "T6: --dry-run prints DRY-RUN banner"
