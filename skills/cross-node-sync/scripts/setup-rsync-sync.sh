@@ -53,14 +53,21 @@ PEER="${SUTANDO_SYNC_PEER:-}"
 
 MEM_LOCAL="$HOME/.claude/projects/-Users-xueqingliu-Documents-sutando-sutando/memory/"
 NOTES_LOCAL="$REPO_ROOT/notes/"
+VM_LOCAL="$REPO_ROOT/data/voice-metrics.jsonl"
+VM_STAGE="$REPO_ROOT/data/voice-metrics.peer.jsonl"
 
 # Peer-side paths — default to the same literal paths as local so users only
 # need to set SUTANDO_SYNC_PEER (per owner's 2026-04-17 simplification: "only
 # sync peer is necessary, just use the same directory for both machines").
 # If your peer's sutando repo or memory dir lives at a different path, override
-# via SUTANDO_PEER_MEM_DIR / SUTANDO_PEER_NOTES_DIR — otherwise leave unset.
+# via SUTANDO_PEER_MEM_DIR / SUTANDO_PEER_NOTES_DIR / SUTANDO_PEER_REPO —
+# otherwise leave unset.
 MEM_PEER="${SUTANDO_PEER_MEM_DIR:-$MEM_LOCAL}"
 NOTES_PEER="${SUTANDO_PEER_NOTES_DIR:-$NOTES_LOCAL}"
+# Voice-metrics peer path: derive from NOTES_PEER (repo/notes/ → repo/data/)
+# if a specific override isn't given. Owner's 2026-04-17 direction: "merge
+# voice metrics in ascending order of time".
+VM_PEER="${SUTANDO_PEER_VOICE_METRICS:-${NOTES_PEER%/notes/}/data/voice-metrics.jsonl}"
 
 # Common rsync flags:
 #   -a         archive (preserves modtime/perms — critical for conflict semantics)
@@ -176,6 +183,24 @@ say ""
 say "Syncing notes/ ..."
 run rsync "${RSYNC_FLAGS[@]}" ${DRYFLAG[@]+"${DRYFLAG[@]}"} "$NOTES_LOCAL" "$PEER:$NOTES_PEER"
 run rsync "${RSYNC_FLAGS[@]}" ${DRYFLAG[@]+"${DRYFLAG[@]}"} "$PEER:$NOTES_PEER" "$NOTES_LOCAL"
+
+# 4) Voice-metrics sync — union merge, not mtime-wins.
+# Pull peer's file to a staging path, then merge-sort locally and push the
+# merged result back. Safe if peer's file doesn't exist (merge handles the
+# missing-file case; push is a no-op if LOCAL is empty).
+# This leg is tolerant of the TCC wall: if the peer's data/ dir is under a
+# Full-Disk-Access-protected path, the rsync silently fails (via the `run`
+# wrapper's `|| true`) and the merge becomes a no-op.
+say ""
+say "Syncing data/voice-metrics.jsonl ..."
+if [ "$DRY_RUN" = "0" ]; then
+    mkdir -p "$(dirname "$VM_LOCAL")"
+    run rsync -az "$PEER:$VM_PEER" "$VM_STAGE"
+    bash "$REPO_ROOT/skills/cross-node-sync/scripts/merge-voice-metrics.sh" "$VM_LOCAL" "$VM_STAGE" || true
+    run rsync -az "$VM_LOCAL" "$PEER:$VM_PEER"
+else
+    say "[DRY] would pull $PEER:$VM_PEER -> $VM_STAGE, merge into $VM_LOCAL, push back"
+fi
 
 say ""
 if [ "$DRY_RUN" = "1" ]; then
