@@ -1,0 +1,92 @@
+---
+name: cross-node-sync
+description: "Rsync-over-ssh sync between Sutando nodes (Mac Studio and MacBook) for shared memory + notes. Optional — core runs fine without it; enables automatic cross-bot learning and note propagation by running from the proactive-loop cron on each pass."
+user-invocable: false
+---
+
+# cross-node-sync
+
+Rsync-over-ssh cross-node sync for Sutando-Studio (Mac Studio) and Sutando-Mini (MacBook). Shares bot memory and user notes so both nodes converge automatically on each proactive loop pass.
+
+## Why rsync (not Syncthing)
+
+Initial design used Syncthing (peer-to-peer daemon, continuous sync). Pivoted to rsync-over-ssh after manifest comparison showed the sync scope is narrow (17 memory files, 34 notes) — a daemon + web UI is overkill. Rsync wins on:
+
+- **No new binary** — rsync is macOS-native, no brew install needed.
+- **No daemon** — fires from the existing proactive-loop cron, no process to babysit.
+- **Auditable** — each sync pass logs exactly what moved; `--dry-run` preview is first-class.
+- **SSH-keyed auth** — reuses the ssh trust relationship you already have for git, no Device-ID pairing dance.
+- **Lighter on disk** — no `.stversions/` per-file versioning, no config.xml, no index database.
+
+Syncthing would still be the right call if: scope grew past a few hundred files, we hit conflict frequency > daily, or we wanted sub-second propagation. Neither is true today.
+
+## Scope
+
+**Syncs (both directions, union semantics via `rsync --update`):**
+- `~/.claude/projects/-Users-xueqingliu-Documents-sutando-sutando/memory/` — cross-session bot memory
+- `<repo>/notes/` — user's second-brain notes
+
+**Excluded (per-node state):**
+- `state/`, `tasks/`, `results/`, `logs/` — per-bot queues + histories
+- `core-status.json`, `build_log.md`, `contextual-chips.json` — per-bot proactive state
+- `.env`, `~/.claude/channels/*/.env` — different tokens per node
+- `data/voice-metrics.jsonl` — per-node
+- `src/.discord-pending-replies.json` (legacy location), `src/Sutando/SutandoApp` (Mac binary build artifact)
+- `~/.claude/projects/` (other projects), `~/.claude/skills/` (installed per-node)
+- `.DS_Store`, `*.swp`, `*.swo`, `.stversions`, `.stfolder` (OS/editor/Syncthing-legacy noise)
+
+## Setup
+
+**One-time:**
+```bash
+# 1. Generate ed25519 key pair (or reuse existing one)
+bash skills/cross-node-sync/scripts/setup-rsync-sync.sh --setup
+# Follow printed instructions to authorize the key on the peer.
+
+# 2. Set peer host env var (per-node, in shell rc or .env)
+export SUTANDO_SYNC_PEER="susan@MacBook-Pro.local"   # on Studio
+export SUTANDO_SYNC_PEER="susan@Mac-Studio.local"    # on Mini
+```
+
+**Each sync pass:**
+```bash
+# Dry-run first to preview what would move
+bash skills/cross-node-sync/scripts/setup-rsync-sync.sh --dry-run
+
+# Actual sync (safe to run repeatedly)
+bash skills/cross-node-sync/scripts/setup-rsync-sync.sh
+```
+
+**Cron wiring (proactive loop integration):**
+Add this to `skills/schedule-crons/crons.json` on both nodes:
+```json
+{
+  "name": "cross-node-sync",
+  "cron": "*/7 * * * *",
+  "prompt": "bash skills/cross-node-sync/scripts/setup-rsync-sync.sh"
+}
+```
+(7 min chosen to avoid `:00/:30` collision with other crons.)
+
+## Conflict handling
+
+Two-direction rsync with `--update` flag: files are copied to the receiver only if newer than the receiver's copy. If both nodes edited the same file since last sync, the node with the later mtime wins. For our scope (mostly append-only memory + notes), conflicts are rare.
+
+If conflicts become a problem, add `--backup --backup-dir=../.sutando-sync-conflicts/` to preserve losers for manual merge. Not needed day one.
+
+## Diagnostics
+
+```bash
+# Show what would sync without doing it
+bash skills/cross-node-sync/scripts/setup-rsync-sync.sh --dry-run
+
+# Show SSH keypair state + setup instructions
+bash skills/cross-node-sync/scripts/setup-rsync-sync.sh --setup
+
+# Run the smoke tests
+bash skills/cross-node-sync/scripts/test-setup-rsync-sync.sh
+```
+
+## Status
+
+- 2026-04-17: Design approved in #susan. Syncthing prototype replaced with rsync after manifest comparison. `setup-rsync-sync.sh` + `test-setup-rsync-sync.sh` (10/10 pass) committed locally, NOT pushed. Still awaiting Mini's actual file inventory to validate the sync scope closes the gap.
