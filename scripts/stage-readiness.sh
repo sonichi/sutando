@@ -24,6 +24,14 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 QUIET=0
 for arg in "$@"; do case "$arg" in -q|--quiet) QUIET=1 ;; esac; done
 
+# Portable mtime helper (GNU first, BSD fallback). On Macs with Homebrew
+# coreutils in PATH, BSD `stat -f %m` emits filesystem info to stdout AND
+# exits non-zero — the previous `BSD || GNU` in `$(...)` concatenated both
+# outputs and died under `set -u` arithmetic. See #412 cold-review.
+stat_mtime() {
+    stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0
+}
+
 PASS=0
 WARN=0
 FAIL=0
@@ -39,7 +47,7 @@ fail() { printf "  \033[31m✗ FAIL\033[0m  %-${WIDTH}s %s\n" "$1" "$2"; FAIL=$(
 if lsof -iTCP:9900 -sTCP:LISTEN >/dev/null 2>&1; then
     # Check for a Health tick in the last 60s.
     VLOG="$REPO/logs/voice-agent.log"
-    if [ -f "$VLOG" ] && [ $(($(date +%s) - $(stat -f %m "$VLOG" 2>/dev/null || stat -c %Y "$VLOG"))) -lt 60 ]; then
+    if [ -f "$VLOG" ] && [ $(($(date +%s) - $(stat_mtime "$VLOG"))) -lt 60 ]; then
         pass "voice-agent" "port 9900 listening, log fresh (<60s)"
     else
         warn "voice-agent" "port 9900 listening but log stale"
@@ -76,7 +84,7 @@ if [ -n "${NGROK_URL:-}" ]; then
     # curl -w prints "000" on connection failure; don't double-append. Also
     # check /health explicitly since `/` on Twilio-bound ngrok may 404.
     probe_url="$NGROK_URL"
-    [[ "$probe_url" != */* ]] || probe_url="${NGROK_URL%/}/health"
+    probe_url="${NGROK_URL%/}/health"
     code=$(curl -s -m 5 -o /dev/null -w "%{http_code}" "$probe_url" 2>/dev/null)
     code="${code:-000}"
     if [ "$code" = "000" ]; then
@@ -118,7 +126,10 @@ else
 fi
 
 # 7) disk
-AVAIL_GB=$(df -g / 2>/dev/null | awk 'NR==2 {print $4}')
+# Portable disk-free in GB — `df -g` is BSD-only (GNU df uses `-h`/`-B`).
+# POSIX `df -k` returns KB; convert to GB via arithmetic. See #412 cold-review.
+AVAIL_KB=$(df -k / 2>/dev/null | awk 'NR==2 {print $4}')
+AVAIL_GB=$(( ${AVAIL_KB:-0} / 1024 / 1024 ))
 if [ -n "${AVAIL_GB:-}" ]; then
     if [ "$AVAIL_GB" -gt 5 ]; then
         pass "disk space" "${AVAIL_GB} GB free on /"
@@ -130,7 +141,7 @@ fi
 # 8) memory-sync age
 SYNC_HEAD="$HOME/.sutando-memory-sync/.git/FETCH_HEAD"
 if [ -f "$SYNC_HEAD" ]; then
-    age_sec=$(($(date +%s) - $(stat -f %m "$SYNC_HEAD" 2>/dev/null || stat -c %Y "$SYNC_HEAD")))
+    age_sec=$(($(date +%s) - $(stat_mtime "$SYNC_HEAD")))
     age_h=$((age_sec / 3600))
     if [ "$age_h" -lt 6 ]; then
         pass "memory-sync" "last sync ${age_h}h ago"
