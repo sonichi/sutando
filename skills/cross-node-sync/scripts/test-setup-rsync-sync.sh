@@ -63,6 +63,7 @@ fi
 DRY_OUT=$(SUTANDO_SYNC_PEER=dummy@localhost \
     SUTANDO_PEER_MEM_DIR=/tmp/peer-memory \
     SUTANDO_PEER_NOTES_DIR=/tmp/peer-notes \
+    SUTANDO_PEER_RESEARCH_DIR=/tmp/peer-research \
     bash "$SCRIPT" --dry-run 2>&1 || true)
 if echo "$DRY_OUT" | grep -q "DRY-RUN MODE"; then
     pass "T6: --dry-run prints DRY-RUN banner"
@@ -77,13 +78,14 @@ else
     fail "T7: rsync not labeled as [DRY]"
 fi
 
-# T8 — --dry-run output shows both memory and notes sync directions
+# T8 — --dry-run output shows memory, notes, and research sync directions
 MEM_LINES=$(echo "$DRY_OUT" | grep -c "Syncing memory/" || true)
 NOTES_LINES=$(echo "$DRY_OUT" | grep -c "Syncing notes/" || true)
-if [ "$MEM_LINES" -ge 1 ] && [ "$NOTES_LINES" -ge 1 ]; then
-    pass "T8: --dry-run covers both memory/ and notes/ sync steps"
+RESEARCH_LINES=$(echo "$DRY_OUT" | grep -c "Syncing research/" || true)
+if [ "$MEM_LINES" -ge 1 ] && [ "$NOTES_LINES" -ge 1 ] && [ "$RESEARCH_LINES" -ge 1 ]; then
+    pass "T8: --dry-run covers memory/, notes/, and research/ sync steps"
 else
-    fail "T8: missing memory/ ($MEM_LINES) or notes/ ($NOTES_LINES) sync step"
+    fail "T8: missing memory/ ($MEM_LINES), notes/ ($NOTES_LINES), or research/ ($RESEARCH_LINES) sync step"
 fi
 
 # T9 — unknown arg exits 2
