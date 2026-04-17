@@ -192,8 +192,19 @@ function burnLiveTranscriptSubtitles(videoPath: string): string | null {
 			console.log(`${ts()} [ScreenRecord] no ffmpeg with subtitles filter — skipping burn. Install: brew install ffmpeg-full`);
 			return null;
 		}
-		execSync(
-			`${ffmpegBin} -y -i "${videoPath}" -vf "subtitles=${LIVE_TRANSCRIPT_SRT_PATH}:force_style='FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,MarginV=30'" -c:v h264_videotoolbox -b:v 500k -c:a aac "${outPath}"`,
+		// Use execFileSync argv array to avoid shell interpolation of $ffmpegBin,
+		// $videoPath, and $outPath (same CodeQL #27 class fixed for sips below).
+		execFileSync(
+			ffmpegBin,
+			[
+				'-y',
+				'-i', videoPath,
+				'-vf', `subtitles=${LIVE_TRANSCRIPT_SRT_PATH}:force_style='FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,MarginV=30'`,
+				'-c:v', 'h264_videotoolbox',
+				'-b:v', '500k',
+				'-c:a', 'aac',
+				outPath,
+			],
 			{ timeout: 120_000 }
 		);
 		if (existsSync(outPath)) {
