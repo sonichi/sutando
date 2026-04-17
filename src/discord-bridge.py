@@ -781,9 +781,12 @@ async def poll_dm_fallback():
                     continue
                 # Subprocess out to the shared CLI tool so there's only one
                 # code path for the voiceConnected check + DM send.
+                # Use sys.executable: under launchd (discord-bridge is launchd-managed),
+                # bare `python3` may resolve to a different interpreter than the one
+                # running the bridge, or fail with "command not found" on minimal PATH.
                 try:
                     result = subprocess.run(
-                        ["python3", str(REPO / "src" / "dm-result.py"), "--file", str(f)],
+                        [sys.executable, str(REPO / "src" / "dm-result.py"), "--file", str(f)],
                         capture_output=True, text=True, timeout=15,
                     )
                 except Exception as e:

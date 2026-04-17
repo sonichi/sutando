@@ -13,6 +13,7 @@ Output: results/friction-{date}.txt
 
 import json
 import os
+import sys
 import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -129,8 +130,11 @@ def check_overdue_reminders():
         script = WORKSPACE.parent.parent / ".claude" / "skills" / "macos-tools" / "scripts" / "reminders.py"
         if not script.exists():
             return []
+        # Use sys.executable: friction-detector runs via cron (launchd-managed);
+        # bare `python3` can resolve to a different interpreter on minimal PATH.
+        # See feedback_subprocess_sys_executable.md.
         result = subprocess.run(
-            ["python3", str(script), "list"],
+            [sys.executable, str(script), "list"],
             capture_output=True, text=True, timeout=10
         )
         if result.returncode == 0:
