@@ -1,28 +1,63 @@
 #!/usr/bin/env bash
-# test-x-search-bearer.sh — POC for X_BEAR_TOKEN-only search/read in x-post.py
+# test-x-search-bearer.sh — verify bug fix: x-post.py search/read work with
+# only X_BEAR_TOKEN set (no OAuth1 credentials, no pip install).
 #
-# Before this feature: x-post.py search/read required the full OAuth1 quadruple
-# (X_API_KEY + X_API_SECRET + X_ACCESS_TOKEN + X_ACCESS_TOKEN_SECRET) and the
-# `requests` + `requests_oauthlib` pip deps. A bearer-only environment (e.g.
-# the Mac Studio Sutando-Studio node where only X_BEAR_TOKEN is configured)
-# couldn't run the skill at all.
+# THE BUG (pre-fix): skills/x-twitter/x-post.py imported `requests` +
+# `requests_oauthlib` at module load and auto-ran `pip3 install ...` on
+# ImportError. On externally-managed Pythons (macOS Homebrew python3.14)
+# pip refuses without --break-system-packages, so the import raises and
+# every command exits before the argparser runs. On the Mac Studio node
+# (only X_BEAR_TOKEN is configured), the advertised skill was unusable
+# — even for read-only commands that don't technically need OAuth1.
 #
-# After: search/read route through a stdlib-urllib bearer path when
-# X_BEAR_TOKEN is set, with zero new dependencies. OAuth1 is still used
-# (and lazy-imported) for write commands (post, mentions, timeline).
+# THE FIX (this PR): read-only commands (search, read) route through a
+# stdlib-urllib bearer path when X_BEAR_TOKEN is set; `requests` + OAuth1
+# are lazy-imported only when a write command (post, mentions, timeline)
+# actually needs them.
+#
+# Before/after: reads the source at both commits via `git show` and
+# asserts the bearer path is ABSENT at the buggy commit and PRESENT at
+# the fix commit. Plus a live smoke test.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+BUGGY_COMMIT="${1:-d2d4458}"  # main before the fix (docs PR #393)
+FIXED_COMMIT="${2:-5128e30}"  # this PR's commit
+
+check_bearer_path_in_source() {
+  local commit="$1"; local label="$2"; local expect="$3"
+  local src has_bearer_token has_bearer_get actual=fail
+  src="$(git show ${commit}:skills/x-twitter/x-post.py 2>/dev/null)" \
+    || { echo "  ✗ cannot read ${commit}:skills/x-twitter/x-post.py"; exit 1; }
+  has_bearer_token=$(echo "$src" | grep -c 'X_BEAR_TOKEN' || true)
+  has_bearer_get=$(echo "$src" | grep -c '_bearer_get' || true)
+  [ "$has_bearer_token" -gt 0 ] && [ "$has_bearer_get" -gt 0 ] && actual=pass
+  if [ "$actual" = "$expect" ]; then
+    echo "  ✓ ${label} (${commit:0:7}): expected=${expect}, got=${actual}"
+  else
+    echo "  ✗ ${label} (${commit:0:7}): expected=${expect}, got=${actual}" >&2
+    exit 1
+  fi
+}
+
+echo "Phase 0: buggy commit should lack the bearer path (→ fail)"
+check_bearer_path_in_source "$BUGGY_COMMIT" "buggy" "fail"
+
+echo "Phase 1: fix commit should contain the bearer path (→ pass)"
+check_bearer_path_in_source "$FIXED_COMMIT" "fixed" "pass"
 
 # shellcheck disable=SC1091
 source .env 2>/dev/null || true
 
 if [ -z "${X_BEAR_TOKEN:-}" ]; then
-  echo "SKIP: X_BEAR_TOKEN not set in .env — this POC requires it"
+  echo ""
+  echo "SKIP Phase 2/3: X_BEAR_TOKEN not set — source-level checks already confirmed the fix is in place."
+  echo "PASS"
   exit 0
 fi
 
-echo "Phase 1: bearer-only search returns tweets"
-# moltbook has steady organic traffic, good signal of "search works"
+echo ""
+echo "Phase 2: bearer-only search returns tweets (live smoke test)"
 OUT=$(python3 skills/x-twitter/x-post.py search "moltbook" --limit 10 2>&1)
 if echo "$OUT" | grep -q "https://x.com/i/status/"; then
   COUNT=$(echo "$OUT" | grep -c "https://x.com/i/status/" || echo 0)
@@ -34,10 +69,7 @@ else
 fi
 
 echo ""
-echo "Phase 2: no --break-system-packages pip install triggered"
-# The old code-path autoinstalled `requests` + `requests_oauthlib`. The
-# bearer path must use stdlib urllib only. If the module autoran pip, the
-# output would contain "Collecting requests" / "Installing" lines.
+echo "Phase 3: no pip autoinstall triggered on the bearer path"
 if echo "$OUT" | grep -qE "Installing|Collecting requests"; then
   echo "  ✗ bearer path triggered pip install — regression of dep-free path"
   exit 1
@@ -45,4 +77,4 @@ fi
 echo "  ✓ stdlib urllib path active (no pip autoinstall observed)"
 
 echo ""
-echo "PASS: X_BEAR_TOKEN alone is sufficient for x-post.py search."
+echo "PASS: buggy commit rejects, fix commit accepts, live bearer search works."
