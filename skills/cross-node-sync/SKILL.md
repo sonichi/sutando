@@ -48,7 +48,15 @@ echo 'export SUTANDO_SYNC_PEER="susan@MacBook-Pro.local"' >> .env   # on Studio
 echo 'export SUTANDO_SYNC_PEER="susan@Mac-Studio.local"'  >> .env   # on Mini
 ```
 
-If both nodes use the same repo + memory paths (the default), that's it — `SUTANDO_PEER_MEM_DIR` / `SUTANDO_PEER_NOTES_DIR` only need setting when the peer's layout differs.
+`SUTANDO_PEER_MEM_DIR` / `SUTANDO_PEER_NOTES_DIR` default to the **same literal paths as local**, so the defaults only work when both nodes share the same OS username AND the same repo location. In practice that's rare (e.g. Studio's `/Users/xueqingliu/...` vs MacBook's `/Users/xliu/...`), so most setups will want to set them explicitly:
+
+```bash
+# Example: Studio talking to a MacBook with a different username + repo path
+export SUTANDO_PEER_MEM_DIR="/Users/xliu/.claude/projects/-Users-xliu-.../memory/"
+export SUTANDO_PEER_NOTES_DIR="/Users/xliu/path/to/sutando/notes/"
+```
+
+Get the peer's values with `ssh $SUTANDO_SYNC_PEER 'echo $HOME; ls -d ~/.claude/projects/-*sutando*'`.
 
 **Cron wiring is automatic:** the `cross-node-sync` entry already lives in `skills/schedule-crons/crons.example.json`, so the usual first-time `cp skills/schedule-crons/crons.example.json skills/schedule-crons/crons.json` wires the 7-minute sync into the proactive-loop crons with no manual JSON editing. (7 min chosen to avoid `:00/:30` collision with other crons.)
 
