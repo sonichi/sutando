@@ -35,7 +35,10 @@ REPO = Path(__file__).resolve().parent.parent
 RESULTS = REPO / "results"
 
 RETENTION_HOURS = int(os.environ.get("RETENTION_HOURS", "24"))
-DRY_RUN = os.environ.get("DRY_RUN", "").strip() not in ("", "0", "false", "no")
+# Case-insensitive compare — without `.lower()`, `DRY_RUN=No` or `DRY_RUN=FALSE`
+# would silently evaluate truthy (dry-run mode) because "No"/"FALSE" aren't in
+# the lowercase reject list. Found in cold-review of #354.
+DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() not in ("", "0", "false", "no")
 
 
 def main() -> int:
