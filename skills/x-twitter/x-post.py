@@ -44,13 +44,17 @@ def _require_requests():
     requests = _requests
     OAuth1 = _OAuth1
 
-# Load .env
+# Load .env — .env wins over stale shell env. Previous `setdefault` let a
+# stale X_BEARER_TOKEN from a prior shell session silently override the
+# freshly-rewritten .env value, so credential rotations didn't take effect
+# without a manual `unset` first. Caught 2026-04-17 while debugging a new
+# bearer token that looked rotated in .env but resolved to the old account.
 ENV_FILE = Path(__file__).parent.parent.parent / ".env"
 if ENV_FILE.exists():
     for line in ENV_FILE.read_text().splitlines():
         if "=" in line and not line.startswith("#"):
             key, _, val = line.partition("=")
-            os.environ.setdefault(key.strip(), val.strip())
+            os.environ[key.strip()] = val.strip()
 
 API_KEY = os.environ.get("X_API_KEY", "")
 API_SECRET = os.environ.get("X_API_SECRET", "")
