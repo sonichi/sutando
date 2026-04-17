@@ -489,12 +489,18 @@ export const openFileTool: ToolDefinition = {
 			if (recPath.includes('sutando-recording')) {
 				writeFileSync('/tmp/sutando-playback-path', recPath);
 			}
-			execSync(`open "${recPath}"`, { timeout: 5_000 });
+			// execFileSync — no shell interpolation of caller-controlled recPath
+			// (same CodeQL js/command-line-injection class as #27).
+			execFileSync('open', [recPath], { timeout: 5_000 });
 			try { execSync(`osascript -e 'tell application "QuickTime Player" to activate'`, { timeout: 3_000 }); } catch {}
 			const size = statSync(recPath).size;
 			let duration_seconds: number | null = null;
 			try {
-				const dur = execSync(`/opt/homebrew/bin/ffprobe -v error -show_entries format=duration -of csv=p=0 "${recPath}"`, { timeout: 5_000 }).toString().trim();
+				const dur = execFileSync(
+					'/opt/homebrew/bin/ffprobe',
+					['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', recPath],
+					{ timeout: 5_000 }
+				).toString().trim();
 				duration_seconds = Math.round(parseFloat(dur));
 			} catch {}
 			console.log(`${ts()} [OpenFile] opened ${recPath} (${(size / 1024 / 1024).toFixed(1)}MB, ${duration_seconds ?? '?'}s)`);
