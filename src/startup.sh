@@ -230,9 +230,13 @@ elif grep -q "TWILIO_ACCOUNT_SID=" .env 2>/dev/null; then
     sleep 3
     NGROK_URL=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['tunnels'][0]['public_url'])" 2>/dev/null || echo "")
     if [ -n "$NGROK_URL" ]; then
-      # Update WEBHOOK_BASE_URL in .env
+      # Update WEBHOOK_BASE_URL in .env — portable in-place edit.
+      # `sed -i ''` is BSD-only; on Macs with Homebrew gnu-sed in PATH it
+      # silently fails (treats '' as an input filename). tmpfile + mv works
+      # on both. See #412 cold-review for the coreutils-in-PATH context.
       if grep -q "WEBHOOK_BASE_URL=" .env; then
-        sed -i '' "s|WEBHOOK_BASE_URL=.*|WEBHOOK_BASE_URL=$NGROK_URL|" .env
+        tmpfile=$(mktemp)
+        sed "s|WEBHOOK_BASE_URL=.*|WEBHOOK_BASE_URL=$NGROK_URL|" .env > "$tmpfile" && mv "$tmpfile" .env
       else
         echo "WEBHOOK_BASE_URL=$NGROK_URL" >> .env
       fi
