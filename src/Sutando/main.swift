@@ -186,13 +186,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     } else {
                         button.title = "S"
                     }
+                    button.toolTip = self.tooltipFor(state: agentState, muted: isMuted, voiceConnected: isVoiceConnected)
+                    // If voice is disconnected, don't animate — the agent
+                    // isn't doing anything actionable regardless of what
+                    // semantic state the server last cached. Prevents the
+                    // "disconnected but still blinking" bug Chi hit when
+                    // the server held a stale 'listening' state after
+                    // voice-agent restart but the browser didn't re-post
+                    // state=idle because the tab was backgrounded.
+                    if !isVoiceConnected {
+                        self.stopAnimation()
+                        self.currentAgentState = "idle"
+                        return
+                    }
                     // Drive animation from semantic state. Each non-idle state
                     // gets a distinct pulse signature so the menu bar conveys
                     // what the agent is doing without the user having to
-                    // switch tabs. Also sets a hover tooltip so the user can
-                    // read the exact state on demand — useful while Chi is
-                    // eyeballing whether the visual is correct.
-                    button.toolTip = self.tooltipFor(state: agentState, muted: isMuted, voiceConnected: isVoiceConnected)
+                    // switch tabs.
                     if self.currentAgentState != agentState {
                         self.currentAgentState = agentState
                         if agentState == "idle" {
