@@ -181,6 +181,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if !out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return  // watcher alive
         }
+
+        // Read CLI's REAL status BEFORE alerting. If Claude Code is currently
+        // working (has an active Bash/tool child process under its pane),
+        // skip the alert — the CLI will handle the restart in the normal
+        // proactive-loop Step 9 without us spamming its stdin with
+        // 'watcher' keystrokes. Only alert when the CLI is genuinely idle
+        // (waiting on user input). Chi's ask: "does the app read the real
+        // state first? and remind about the watcher only when idle?"
+        if cliIsWorking() {
+            logToFile("watcher dead; CLI is working — skipping alert")
+            return
+        }
+
         // Throttle: don't alert more than once every 120s so the CLI doesn't
         // get flooded if it's slow to restart.
         if Date().timeIntervalSince(lastWatcherAlert) < 120 { return }
@@ -203,6 +216,67 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Notify so Chi can restart manually.
         notify("Sutando", "Task watcher is down — prompt the CLI to restart it (or start CLI via scripts/start-cli.sh)")
         logToFile("watcher dead; notification fired (tmux session not found)")
+    }
+
+    /// True if Claude Code in the sutando-core tmux pane has any running
+    /// child process — indicating an active Bash/Tool call. False if only
+    /// the claude process itself is running (idle, waiting on stdin) or
+    /// if the tmux session can't be found.
+    func cliIsWorking() -> Bool {
+        let tmuxPath: String
+        if FileManager.default.fileExists(atPath: "/opt/homebrew/bin/tmux") {
+            tmuxPath = "/opt/homebrew/bin/tmux"
+        } else if FileManager.default.fileExists(atPath: "/usr/local/bin/tmux") {
+            tmuxPath = "/usr/local/bin/tmux"
+        } else {
+            return false
+        }
+        // Get the pane's PID (the interactive shell wrapping claude).
+        let list = Process()
+        list.executableURL = URL(fileURLWithPath: tmuxPath)
+        list.arguments = ["list-panes", "-t", "sutando-core", "-F", "#{pane_pid}"]
+        let pipe = Pipe()
+        list.standardOutput = pipe
+        list.standardError = FileHandle.nullDevice
+        do { try list.run() } catch { return false }
+        list.waitUntilExit()
+        if list.terminationStatus != 0 { return false }
+        let panePid = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if panePid.isEmpty { return false }
+
+        // pgrep descendants of the pane PID. Claude Code itself is a child
+        // of the shell; its tool invocations are grandchildren. We want
+        // any non-claude descendant — a running bash/tool/subprocess.
+        let tree = Process()
+        tree.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        // -P <pid> = direct children; we need the full tree, so two passes.
+        tree.arguments = ["-P", panePid]
+        let treePipe = Pipe()
+        tree.standardOutput = treePipe
+        tree.standardError = FileHandle.nullDevice
+        do { try tree.run() } catch { return false }
+        tree.waitUntilExit()
+        let children = String(data: treePipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .split(separator: "\n").map(String.init) ?? []
+        // Claude Code itself is always a child of the shell. We want to
+        // know if ANY grandchild exists (i.e. claude spawned a subprocess).
+        for child in children where !child.isEmpty {
+            let gc = Process()
+            gc.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+            gc.arguments = ["-P", child]
+            let gcPipe = Pipe()
+            gc.standardOutput = gcPipe
+            gc.standardError = FileHandle.nullDevice
+            do { try gc.run() } catch { continue }
+            gc.waitUntilExit()
+            let gcOut = String(data: gcPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !gcOut.isEmpty {
+                return true  // claude has a live subprocess → working
+            }
+        }
+        return false
     }
 
     /// Send keystrokes to a tmux pane. Returns true if the session exists
