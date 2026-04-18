@@ -135,16 +135,16 @@ bash src/verify-setup.sh
 **Shutting down:**
 ```bash
 bash src/restart.sh    # stops all services (voice agent, web client, API, bridges, etc.)
-pkill -f "src/Sutando" # stop the menu bar app
+pkill -x Sutando # stop the menu bar app
 ```
 Exiting `startup.sh` alone does NOT stop background services. Always use `restart.sh` (or `kill-all.sh` if available) to cleanly shut everything down.
 
 **Uninstalling:**
-1. Stop all services: `bash src/restart.sh && pkill -f "src/Sutando"`
+1. Stop all services: `bash src/restart.sh && pkill -x Sutando`
 2. Remove the repo: `rm -rf ~/Desktop/sutando` (or wherever you cloned it)
 3. Remove config: `rm -rf ~/.claude/projects/*sutando*`
 4. Remove npm packages (optional): the repo uses local `node_modules/` — deleted with the repo
-5. Uninstall brew dependencies (optional): `brew uninstall imsg wacli` if installed
+5. Remove any tools you installed during setup (e.g. `imsg`, `wacli`) via the package manager you used to install them.
 
 ---
 
@@ -168,9 +168,9 @@ These unlock more capabilities. Add to `.env` when ready:
 | Capability | Script | Status |
 |-----------|--------|--------|
 | Voice conversation | `voice-agent.ts` | Verified |
-| Task delegation (voice → Claude) | `task-bridge.ts` | Verified |
+| Task delegation (voice → Claude) | `task-bridge.ts` + `watch-tasks.sh` + `tasks/` dir | Verified |
 | Screen capture + analysis | `macos-tools` skill | Verified |
-| Notes / second brain | via CLAUDE.md | Verified |
+| Notes / second brain | `notes/` directory (YAML-frontmatter markdown) | Verified |
 | Context drop + shortcuts | `src/Sutando/` menu bar app | Verified |
 | Gmail read/send/search | `gws-gmail` skill | Verified |
 | Calendar reading | `google-calendar` skill | Verified |
@@ -190,6 +190,9 @@ These unlock more capabilities. Add to `.env` when ready:
 | Health monitoring | `health-check.py` | Verified |
 | Pattern detection + user modeling | Built into Claude Code memory system | Verified |
 | System dashboard | `dashboard.py` | Verified |
+| Cross-node sync (memory + notes between Macs) | `cross-node-sync` skill | Verified |
+| Info-radar (arXiv / GitHub / HN / news monitoring) | `info-radar` skill + daily digest | Verified |
+| Menu-bar avatar states (idle/listening/speaking/working) | `src/Sutando/main.swift` + `/sse-status` | Verified |
 
 ---
 
@@ -203,8 +206,9 @@ When running, Sutando exposes these local ports:
 | 7844 | Dashboard — status, activity, and capability matrix |
 | 7843 | Agent API — submit tasks from any device |
 | 9900 | Voice agent WebSocket |
-
----
+| 7845 | Screen capture server |
+| 3100 | Phone conversation server (Twilio webhook target) |
+| 4040 | ngrok admin UI (when ngrok is running) |
 
 ---
 
