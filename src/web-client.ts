@@ -2021,7 +2021,18 @@ const server = createServer((req, res) => {
 		const vState = url.searchParams.get('voice');
 		const aState = url.searchParams.get('state');
 		if (mState !== null) _muteState = mState === 'true';
-		if (vState !== null) _voiceState = vState === 'true';
+		if (vState !== null) {
+			const prev = _voiceState;
+			_voiceState = vState === 'true';
+			// When voice disconnects, force agentState back to 'idle'. Without
+			// this reset, _agentState keeps its last value (e.g. 'listening')
+			// and /sse-status keeps reporting non-idle state even though the
+			// client is gone — which drives the menu-bar pulse indefinitely.
+			// Fixes "voice disconnected but icon still blinking".
+			if (prev && !_voiceState) {
+				_agentState = 'idle';
+			}
+		}
 		if (aState === 'idle' || aState === 'listening' || aState === 'speaking' || aState === 'working' || aState === 'seeing') {
 			// Special handling for 'seeing': remember pre-seeing state so we can
 			// auto-revert. Default flash window is 1.5s unless caller specifies.
