@@ -32,6 +32,13 @@ def presenter_mode_active():
         return False
     try:
         expire_iso = PRESENTER_SENTINEL.read_text().strip()
+        # Require an ISO-8601-ish prefix (starts with a digit). Without
+        # this guard, malformed sentinel content like "garbage" compares
+        # LESS than any real now_iso ("2" < "g" in ASCII) and the mode
+        # fails OPEN — appears active forever. The same guard is in
+        # src/discord-bridge.py and src/telegram-bridge.py.
+        if not expire_iso or not expire_iso[0].isdigit():
+            return False
         # Compare as ISO-8601 with Z suffix — sorts correctly as strings.
         now_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
         return now_iso < expire_iso
