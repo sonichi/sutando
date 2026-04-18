@@ -185,15 +185,58 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // get flooded if it's slow to restart.
         if Date().timeIntervalSince(lastWatcherAlert) < 120 { return }
         lastWatcherAlert = Date()
-        // The app does NOT auto-start the watcher itself — a detached restart
-        // routes the watcher's stdout to /dev/null so Claude Code's
-        // task-notification pipe never sees it, making the watcher useless.
-        // The watcher MUST be started by the Claude Code CLI via its own
-        // run_in_background Bash. The app's role is to NOTIFY so Chi sees
-        // the watcher's death and can prompt the CLI to restart it (e.g. by
-        // typing "watcher" in the Claude Code prompt).
-        notify("Sutando", "Task watcher is down — prompt the CLI to restart it")
-        logToFile("watcher dead; notification fired (CLI must restart)")
+
+        // If Claude Code is running inside the `sutando-core` tmux session
+        // (launch via scripts/start-cli.sh), send the word `watcher` to
+        // its pane as if Chi typed it. The CLI parses that as a restart
+        // prompt and starts the watcher via its own run_in_background Bash
+        // — so the watcher's stdout routes through the task-notification
+        // pipe correctly. Any externally-started watcher (nohup etc.)
+        // has stdout → /dev/null and is useless.
+        if tmuxSendKeys(session: "sutando-core", keys: "watcher") {
+            notify("Sutando", "Task watcher down — sent 'watcher' to sutando-core tmux")
+            logToFile("watcher dead; tmux send-keys to sutando-core")
+            return
+        }
+
+        // Fallback: Claude Code isn't in the expected tmux session.
+        // Notify so Chi can restart manually.
+        notify("Sutando", "Task watcher is down — prompt the CLI to restart it (or start CLI via scripts/start-cli.sh)")
+        logToFile("watcher dead; notification fired (tmux session not found)")
+    }
+
+    /// Send keystrokes to a tmux pane. Returns true if the session exists
+    /// and send-keys succeeded. False otherwise — caller should fall back
+    /// to a macOS notification.
+    func tmuxSendKeys(session: String, keys: String) -> Bool {
+        // Find tmux binary: Homebrew on Apple Silicon, /usr/local on Intel.
+        let tmuxPath: String
+        if FileManager.default.fileExists(atPath: "/opt/homebrew/bin/tmux") {
+            tmuxPath = "/opt/homebrew/bin/tmux"
+        } else if FileManager.default.fileExists(atPath: "/usr/local/bin/tmux") {
+            tmuxPath = "/usr/local/bin/tmux"
+        } else {
+            return false
+        }
+        // Check session exists: `tmux has-session -t <name>` exits 0 if alive.
+        let has = Process()
+        has.executableURL = URL(fileURLWithPath: tmuxPath)
+        has.arguments = ["has-session", "-t", session]
+        has.standardOutput = FileHandle.nullDevice
+        has.standardError = FileHandle.nullDevice
+        do { try has.run() } catch { return false }
+        has.waitUntilExit()
+        if has.terminationStatus != 0 { return false }
+
+        // Session exists — send keys + Enter.
+        let send = Process()
+        send.executableURL = URL(fileURLWithPath: tmuxPath)
+        send.arguments = ["send-keys", "-t", session, keys, "Enter"]
+        send.standardOutput = FileHandle.nullDevice
+        send.standardError = FileHandle.nullDevice
+        do { try send.run() } catch { return false }
+        send.waitUntilExit()
+        return send.terminationStatus == 0
     }
 
     func pollMuteState() {
