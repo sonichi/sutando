@@ -513,7 +513,7 @@ def run_all_checks() -> list[dict]:
 
     web_check = check_port(8080, "web-client")
     if web_check["status"] == "ok":
-        mark_stale_if_outdated(web_check, REPO_DIR / "src" / "web-client.ts", "voice-agent")
+        mark_stale_if_outdated(web_check, REPO_DIR / "src" / "web-client.ts", "web-client.ts")
     checks.append(web_check)
 
     # Optional services (downgrade missing to warning, not failure)

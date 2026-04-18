@@ -41,6 +41,28 @@ RESULTS_DIR = REPO / "results"
 TASKS_DIR.mkdir(exist_ok=True)
 RESULTS_DIR.mkdir(exist_ok=True)
 
+# Presenter mode: silence proactive DMs during ICLR/talk windows. Sentinel
+# is written by scripts/presenter-mode.sh with an ISO-8601 expiry. Matches
+# the check in src/check-pending-questions.py and src/discord-bridge.py.
+PRESENTER_SENTINEL = REPO / "state" / "presenter-mode.sentinel"
+
+
+def presenter_mode_active():
+    if not PRESENTER_SENTINEL.exists():
+        return False
+    try:
+        expire_iso = PRESENTER_SENTINEL.read_text().strip()
+        # Require an ISO-8601-ish prefix (starts with a digit). Without
+        # this guard, malformed sentinel content like "garbage" compares
+        # LESS than any real now_iso ("2" < "g" in ASCII) and the mode
+        # fails OPEN — appears active forever.
+        if not expire_iso or not expire_iso[0].isdigit():
+            return False
+        now_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+        return now_iso < expire_iso
+    except Exception:
+        return False
+
 # Load access config
 ACCESS_FILE = Path.home() / ".claude" / "channels" / "telegram" / "access.json"
 def load_allowed():
@@ -236,23 +258,26 @@ def main():
                 # Send typing indicator
                 api("sendChatAction", chat_id=chat_id, action="typing")
 
-        # Check for proactive messages to send to owner
+        # Check for proactive messages to send to owner.
+        # Presenter-mode: retain files (don't unlink, don't send) so they
+        # flush after the talk window ends. See presenter-mode.sh contract.
         try:
-            for f in RESULTS_DIR.iterdir():
-                if f.name.startswith("proactive-") and f.suffix == ".txt":
-                    text = f.read_text().strip()
-                    if not text:
+            if not presenter_mode_active():
+                for f in RESULTS_DIR.iterdir():
+                    if f.name.startswith("proactive-") and f.suffix == ".txt":
+                        text = f.read_text().strip()
+                        if not text:
+                            f.unlink(missing_ok=True)
+                            continue
+                        owner_ids = load_allowed()
+                        if owner_ids:
+                            owner_id = next(iter(owner_ids))
+                            try:
+                                send_reply(int(owner_id), text)
+                                print(f"  [proactive] sent to {owner_id}: {text[:80]}")
+                            except Exception as e:
+                                print(f"  [proactive] failed: {e}")
                         f.unlink(missing_ok=True)
-                        continue
-                    owner_ids = load_allowed()
-                    if owner_ids:
-                        owner_id = next(iter(owner_ids))
-                        try:
-                            send_reply(int(owner_id), text)
-                            print(f"  [proactive] sent to {owner_id}: {text[:80]}")
-                        except Exception as e:
-                            print(f"  [proactive] failed: {e}")
-                    f.unlink(missing_ok=True)
         except Exception as e:
             print(f"  [proactive] poll error: {e}")
 
@@ -262,9 +287,14 @@ def main():
             if result_file.exists():
                 reply_text = result_file.read_text().strip()
                 chat_id = pending_replies.pop(task_id)
-                # Skip sending if already replied directly
+                # Skip sending if already replied directly.
+                # Clean up both files so watcher doesn't re-fire on leftover
+                # task — same bug class as discord-bridge had.
                 if reply_text.startswith('[no-send]') or reply_text.startswith('[REPLIED]'):
                     print(f"  Skipped (already replied): {task_id}")
+                    result_file.unlink(missing_ok=True)
+                    task_file = TASKS_DIR / f"{task_id}.txt"
+                    task_file.unlink(missing_ok=True)
                     continue
                 try:
                     send_reply(chat_id, reply_text)
