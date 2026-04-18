@@ -8,6 +8,8 @@ It shares your screen, joins your meetings, makes phone calls, and builds itself
 
 It belongs entirely to you.
 
+> **No *Claude Extra usage* required.** Sutando runs on your existing Claude Code subscription ($20, $100, or $200/month) with minimal extra costs — no separate Anthropic API key to top up — unlike agents that route every action through pay-per-token APIs and hosted services.
+
 > *Named after [Stands](https://jojo.fandom.com/wiki/Stand) from JoJo's Bizarre Adventure — a personal spirit that fights on your behalf. Like a Stand, Sutando starts unnamed. As it learns your style and earns real capabilities, it names itself and generates its own avatar — your Stand, unique to you.*
 
 https://github.com/user-attachments/assets/a86ec34e-3b26-4011-824c-d2d124753c25
@@ -74,8 +76,6 @@ They communicate through files: voice agent writes tasks, the core agent execute
 
 ## Quick start
 
-You don't need to buy extra usage — Sutando runs on your existing Claude subscription.
-
 **Prerequisites:**
 - macOS 15+
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code/getting-started) (run `claude` once to complete login)
@@ -99,6 +99,8 @@ bash src/startup.sh
 This starts all services (voice agent, web client, dashboard, API, Sutando menu bar app) and opens http://localhost:8080 in your browser. The autonomous loop starts automatically — click **Connect** and start talking. Look for **S** in your menu bar — it provides shortcuts (⌃C context drop, ⌃V voice toggle, ⌃M mute) plus **Open Core** (Claude Code terminal) and **Open Dashboard** (status page).
 
 > **Note:** `startup.sh` runs Claude Code with `--dangerously-skip-permissions`, giving Sutando full system access (file operations, terminal commands, browser control). This is required for autonomous operation but means you should review what it does. All actions are logged. Keep the terminal window accessible — you may need to respond there when Claude Code runs out of quota or prompts for input (e.g., CLI commands, permission confirmations).
+
+**Why macOS 15+?** The setup scripts assume the Sequoia System Settings layout for granting TCC permissions (Screen Recording, Accessibility, Input Monitoring). Earlier macOS versions may work for the headless parts (proactive loop, Discord/Telegram bridges) but aren't tested.
 
 **macOS permissions** — grant these on first run (System Settings → Privacy & Security):
 - **Screen Recording** → add `claude` and `node`
