@@ -172,6 +172,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     // dim until the NEXT semantic state change).
                     button.title = "🔇"
                     button.image = nil
+                    button.toolTip = "Sutando: muted"
                     self.stopAnimation()
                     self.currentAgentState = "idle"
                 } else {
@@ -198,6 +199,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                             self.startAnimation(for: agentState)
                         }
                     }
+                    // Hover-tooltip shows the current state as a sanity-check
+                    // that the animation users see matches the backend. Updates
+                    // every poll regardless of state-change to keep it fresh.
+                    button.toolTip = "Sutando: \(agentState)"
                 }
             }
         }
