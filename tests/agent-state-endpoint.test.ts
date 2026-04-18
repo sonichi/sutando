@@ -2,6 +2,9 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, ChildProcess } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
+import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // Integration test for PR #418 / #419 agent-state plumbing.
 // Spawns web-client.ts on a random port, exercises /sse-status + /mute-state,
@@ -10,6 +13,16 @@ import { setTimeout as delay } from 'node:timers/promises';
 // 2026-04-17 (web-client step 1 of 3, no test coverage at merge time).
 
 const PORT = 18081; // well above the 8080 dev server + 9900 voice-agent
+
+// Test spawns the same web-client.ts the prod server uses. web-client reads
+// `../core-status.json` via the #443 coreIsRunning fallback, so a mid-pass
+// `{"status":"running"}` write by the proactive loop leaks into the isolated
+// test server and turns "idle" assertions into "working". Neutralize by
+// writing an idle sentinel before the test + restoring the original bytes on
+// teardown. Without this, 2 tests fail whenever `npm test` coincides with a
+// /proactive-loop step-0 write (or any other running-state write).
+const CORE_STATUS_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'core-status.json');
+let savedCoreStatus: string | null = null;
 
 let child: ChildProcess;
 
@@ -20,6 +33,13 @@ async function fetchJson(path: string): Promise<any> {
 
 describe('/sse-status + /mute-state — agent state plumbing (PR #418)', () => {
 	before(async () => {
+		// Stash + neutralize core-status.json so a mid-pass "running" write
+		// by a live proactive loop can't leak "working" state into the test.
+		if (existsSync(CORE_STATUS_PATH)) {
+			savedCoreStatus = readFileSync(CORE_STATUS_PATH, 'utf-8');
+		}
+		writeFileSync(CORE_STATUS_PATH, JSON.stringify({ status: 'idle', ts: Math.floor(Date.now() / 1000) }) + '\n');
+
 		child = spawn(
 			'npx',
 			['tsx', 'src/web-client.ts'],
@@ -47,15 +67,22 @@ describe('/sse-status + /mute-state — agent state plumbing (PR #418)', () => {
 		// Hang-safe teardown: SIGTERM, wait up to 2s, SIGKILL fallback. Without
 		// awaiting exit, the live child-process handle keeps node --test alive
 		// past the CI job timeout (observed: 9m43s hangs after #423 merged).
-		if (!child || child.killed) return;
-		await new Promise<void>((resolve) => {
-			const hardKill = setTimeout(() => {
-				try { child.kill('SIGKILL'); } catch { /* already dead */ }
-				resolve();
-			}, 2_000);
-			child.once('exit', () => { clearTimeout(hardKill); resolve(); });
-			child.kill('SIGTERM');
-		});
+		if (child && !child.killed) {
+			await new Promise<void>((resolve) => {
+				const hardKill = setTimeout(() => {
+					try { child.kill('SIGKILL'); } catch { /* already dead */ }
+					resolve();
+				}, 2_000);
+				child.once('exit', () => { clearTimeout(hardKill); resolve(); });
+				child.kill('SIGTERM');
+			});
+		}
+		// Restore original core-status.json bytes (or delete the sentinel we
+		// wrote if no original existed). Keeps the live proactive loop's
+		// post-test reads consistent with what it wrote last.
+		if (savedCoreStatus !== null) {
+			writeFileSync(CORE_STATUS_PATH, savedCoreStatus);
+		}
 	});
 
 	it('default /sse-status returns state:"idle"', async () => {
