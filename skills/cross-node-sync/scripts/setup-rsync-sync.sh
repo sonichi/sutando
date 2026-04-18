@@ -51,7 +51,14 @@ cd "$REPO_ROOT"
 # so the script is portable between Studio and Mini without code changes.
 PEER="${SUTANDO_SYNC_PEER:-}"
 
-MEM_LOCAL="$HOME/.claude/projects/-Users-xueqingliu-Documents-sutando-sutando/memory/"
+# Derive Claude Code's per-project memory dir from REPO_ROOT.
+# Claude Code stores memory at ~/.claude/projects/<slug>/memory/ where <slug>
+# is the absolute path with '/' replaced by '-'. This makes MEM_LOCAL portable
+# across nodes whose project checkouts live at different paths (Studio:
+# /Users/xueqingliu/Documents/sutando/sutando vs Maddy:
+# /Users/xliu/Documents/xqq/.../sutando-agent-sonichi-test2/sutando).
+# Override with SUTANDO_MEM_LOCAL_DIR if the convention changes.
+MEM_LOCAL="${SUTANDO_MEM_LOCAL_DIR:-$HOME/.claude/projects/$(echo "$REPO_ROOT" | tr '/' '-')/memory/}"
 NOTES_LOCAL="$REPO_ROOT/notes/"
 DATA_LOCAL="$REPO_ROOT/data/"
 
