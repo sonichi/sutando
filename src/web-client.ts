@@ -9,7 +9,7 @@
  */
 
 import { createServer } from 'node:http';
-import { writeFileSync } from 'node:fs';
+import { writeFileSync, readFileSync, existsSync } from 'node:fs';
 
 const HTTP_PORT = Number(process.env.CLIENT_PORT) || 8080;
 const HTTP_HOST = process.env.CLIENT_HOST || '0.0.0.0'; // '0.0.0.0' binds to all interfaces for EC2
@@ -1969,11 +1969,35 @@ let _toolState: AgentState = 'idle';
 // revert. Without auto-revert, a single /capture call pins state=seeing
 // forever if nothing else POSTs.
 let _seeingUntil = 0;
+
+// Read `core-status.json` (written by the proactive loop + Claude Code passes)
+// to surface core work as a `working` state when no other track is active.
+// Without this, the menu bar stays solid while Claude Code is processing a
+// Discord/voice task even though the user would want to see that signal.
+// Lightweight: just a file read (one syscall) per /sse-status poll every 3s.
+function coreIsRunning(): boolean {
+	try {
+		const raw = readFileSync(new URL('../core-status.json', import.meta.url), 'utf-8');
+		const s = JSON.parse(raw) as { status?: string; ts?: number };
+		if (s.status !== 'running') return false;
+		// Guard against stale "running" markers from a crashed pass — treat as
+		// running only if the timestamp is within the last 10 minutes.
+		if (typeof s.ts === 'number' && Date.now() / 1000 - s.ts > 600) return false;
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 function effectiveAgentState(): AgentState {
 	if (_toolState === 'seeing' && Date.now() > _seeingUntil) {
 		_toolState = 'idle';
 	}
-	return _toolState !== 'idle' ? _toolState : _browserState;
+	if (_toolState !== 'idle') return _toolState;
+	if (_browserState !== 'idle') return _browserState;
+	// No explicit state — fall through to core-status. If the proactive loop
+	// or any Claude Code pass is active, surface that as `working`.
+	return coreIsRunning() ? 'working' : 'idle';
 }
 
 // Heartbeat: ping every 30s, remove clients that fail to write (stale connections)
