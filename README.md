@@ -100,7 +100,7 @@ This starts all services (voice agent, web client, dashboard, API, Sutando menu 
 
 > **Note:** `startup.sh` runs Claude Code with `--dangerously-skip-permissions`, giving Sutando full system access (file operations, terminal commands, browser control). This is required for autonomous operation but means you should review what it does. All actions are logged. Keep the terminal window accessible — you may need to respond there when Claude Code runs out of quota or prompts for input (e.g., CLI commands, permission confirmations).
 
-**Why macOS 15+?** The permission grants below depend on TCC panes that macOS 15 (Sequoia) consolidated. On macOS 13/14 the same toggles are scattered across several surfaces and a few don't exist yet — Sutando's setup scripts target the 15+ layout and skip the legacy fallbacks. The core proactive loop + Discord/Telegram bridges work without these grants, so pre-15 users can still try a subset; open an issue if you hit a pre-15 specific blocker.
+**Why macOS 15+?** The setup scripts assume the Sequoia System Settings layout for granting TCC permissions (Screen Recording, Accessibility, Input Monitoring). Earlier macOS versions may work for the headless parts (proactive loop, Discord/Telegram bridges) but aren't tested.
 
 **macOS permissions** — grant these on first run (System Settings → Privacy & Security):
 - **Screen Recording** → add `claude` and `node`
