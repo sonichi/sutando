@@ -1951,18 +1951,30 @@ const sseClients: import('node:http').ServerResponse[] = [];
 // Server-side state tracking for menu bar indicator
 let _muteState = false;
 let _voiceState = false;
-// Semantic agent state reported by the browser. The menu bar consumes this
-// to decide when to animate (any non-'idle' value). Derivation happens in
-// the browser where the signals live (audio RMS, core-status, mute, voice);
-// the server just caches the last-reported value.
+// Semantic agent state. Two independent tracks:
+//   - _browserState: what the browser derives from local signals
+//     (connected+unmuted → listening, audio RMS → speaking, disconnected → idle).
+//     Refreshed ~1x/second by reportAgentState in the page.
+//   - _toolState: set by server-side tool code (voice-agent onToolCall →
+//     'working', screen-capture → 'seeing'). Only tool code writes this.
+// Effective state (returned by /sse-status + broadcast via SSE) is the
+// tool track when non-idle, else the browser track. This prevents the
+// browser's 1s poll from overwriting a tool-originated 'working' back
+// to 'listening' — the bug Chi hit after the SSE bridge shipped.
 type AgentState = 'idle' | 'listening' | 'speaking' | 'working' | 'seeing';
-let _agentState: AgentState = 'idle';
+let _browserState: AgentState = 'idle';
+let _toolState: AgentState = 'idle';
 // Timestamp of the last transition INTO 'seeing'. Screen capture is transient
-// (sub-second), so we want the 'seeing' state to flash briefly then auto-revert
-// to whatever the prior state was. Without auto-revert, a single /capture call
-// pins state=seeing forever if nothing else POSTs.
+// (sub-second), so we want the 'seeing' state to flash briefly then auto-
+// revert. Without auto-revert, a single /capture call pins state=seeing
+// forever if nothing else POSTs.
 let _seeingUntil = 0;
-let _preSeeingState: AgentState = 'idle';
+function effectiveAgentState(): AgentState {
+	if (_toolState === 'seeing' && Date.now() > _seeingUntil) {
+		_toolState = 'idle';
+	}
+	return _toolState !== 'idle' ? _toolState : _browserState;
+}
 
 // Heartbeat: ping every 30s, remove clients that fail to write (stale connections)
 setInterval(() => {
@@ -1996,64 +2008,64 @@ const server = createServer((req, res) => {
 
 	// SSE client count + mute/voice/agent state (safe for diagnostics + menu bar indicator)
 	if (url.pathname === '/sse-status') {
-		// Auto-revert from 'seeing' to the prior state if the flash window expired.
-		// Screen capture + take_screenshot calls are transient; without this,
-		// a single /capture call would pin state=seeing until the next browser POST.
-		if (_agentState === 'seeing' && Date.now() > _seeingUntil) {
-			_agentState = _preSeeingState;
-		}
 		res.writeHead(200, { 'Content-Type': 'application/json' });
 		res.end(JSON.stringify({
 			clients: sseClients.length,
 			muted: _muteState,
 			voiceConnected: _voiceState,
-			state: _agentState,
+			state: effectiveAgentState(),
 		}));
 		return;
 	}
 
-	// Mute + voice + agent state report from browser client
+	// Mute + voice + agent state report. `source=tool` writes the tool
+	// track (working/seeing) and takes precedence; everything else
+	// writes the browser track (idle/listening/speaking).
 	if (url.pathname === '/mute-state') {
 		const mState = url.searchParams.get('muted');
 		const vState = url.searchParams.get('voice');
 		const aState = url.searchParams.get('state');
+		const source = url.searchParams.get('source'); // 'tool' | null (browser)
 		if (mState !== null) _muteState = mState === 'true';
 		if (vState !== null) _voiceState = vState === 'true';
 		if (aState === 'idle' || aState === 'listening' || aState === 'speaking' || aState === 'working' || aState === 'seeing') {
-			// Special handling for 'seeing': remember pre-seeing state so we can
-			// auto-revert. Default flash window is 1.5s unless caller specifies.
-			if (aState === 'seeing') {
-				if (_agentState !== 'seeing') {
-					_preSeeingState = _agentState;
-				}
-				const ttlParam = url.searchParams.get('ttl_ms');
-				const ttl = ttlParam ? parseInt(ttlParam, 10) : 1500;
-				_seeingUntil = Date.now() + (isFinite(ttl) && ttl > 0 ? ttl : 1500);
-				// Schedule an auto-revert broadcast so the browser clears the
-				// .seeing class even if nothing else POSTs a state update.
-				setTimeout(() => {
-					if (_agentState === 'seeing' && Date.now() >= _seeingUntil) {
-						_agentState = _preSeeingState;
-						for (const client of sseClients) {
-							try { client.write(`event: agent-state\ndata: ${_agentState}\n\n`); } catch {}
+			const prevEffective = effectiveAgentState();
+			if (source === 'tool') {
+				// Only working/seeing meaningfully belong on the tool track;
+				// anything else clears it back to idle (falling through to
+				// whatever the browser track currently says).
+				_toolState = (aState === 'working' || aState === 'seeing') ? aState : 'idle';
+				if (aState === 'seeing') {
+					const ttlParam = url.searchParams.get('ttl_ms');
+					const ttl = ttlParam ? parseInt(ttlParam, 10) : 1500;
+					_seeingUntil = Date.now() + (isFinite(ttl) && ttl > 0 ? ttl : 1500);
+					// Schedule an auto-revert broadcast so the browser clears
+					// .seeing even if nothing else POSTs a state update.
+					setTimeout(() => {
+						if (_toolState === 'seeing' && Date.now() >= _seeingUntil) {
+							_toolState = 'idle';
+							const eff = effectiveAgentState();
+							for (const client of sseClients) {
+								try { client.write(`event: agent-state\ndata: ${eff}\n\n`); } catch {}
+							}
 						}
-					}
-				}, (isFinite(ttl) && ttl > 0 ? ttl : 1500) + 50);
+					}, (isFinite(ttl) && ttl > 0 ? ttl : 1500) + 50);
+				}
+			} else {
+				// Browser can't legitimately know working/seeing — those
+				// originate server-side. Clamp to listening if mislabeled
+				// so a confused browser can't trample the tool track.
+				_browserState = (aState === 'working' || aState === 'seeing') ? 'listening' : aState;
 			}
-			const prevState = _agentState;
-			_agentState = aState;
-			// Push server-authoritative state to browser clients so the avatar
-			// can apply .working / .seeing CSS classes. Browser's local poll
-			// only derives listening/speaking from audio RMS; working and
-			// seeing originate from tool calls and need a server → client push.
-			if (prevState !== _agentState) {
+			const nextEffective = effectiveAgentState();
+			if (prevEffective !== nextEffective) {
 				for (const client of sseClients) {
-					try { client.write(`event: agent-state\ndata: ${_agentState}\n\n`); } catch {}
+					try { client.write(`event: agent-state\ndata: ${nextEffective}\n\n`); } catch {}
 				}
 			}
 		}
 		res.writeHead(200, { 'Content-Type': 'application/json' });
-		res.end(JSON.stringify({ muted: _muteState, voiceConnected: _voiceState, state: _agentState }));
+		res.end(JSON.stringify({ muted: _muteState, voiceConnected: _voiceState, state: effectiveAgentState() }));
 		return;
 	}
 

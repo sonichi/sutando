@@ -604,6 +604,12 @@ async function main() {
 				voiceToolIdMap.set(e.toolCallId, e.toolName);
 				voiceEvents.push({ event: `tool_call:${e.toolName}`, timestamp: new Date().toISOString() });
 				console.log(`${ts()} [Tool] ${e.toolName} (${e.execution})`);
+				// Flag the web-client that a tool is in flight so the avatar
+				// can show the blue `.working` pulse and the menu bar can
+				// switch to the slow-deep-swing signature. `source=tool` pins
+				// this to the tool track so the browser's 1s poll can't
+				// overwrite it back to listening.
+				fetch('http://localhost:8080/mute-state?state=working&source=tool').catch(() => {});
 				// Auto-switch meeting mode on join/dismiss
 				if (['summon', 'join_zoom', 'join_gmeet'].includes(e.toolName)) {
 					meetingActive = true;
@@ -618,6 +624,8 @@ async function main() {
 				voiceToolCalls.push({ name: toolName, durationMs: e.durationMs, timestamp: new Date().toISOString() });
 				voiceEvents.push({ event: `tool_result:${toolName}:${e.durationMs}ms`, timestamp: new Date().toISOString() });
 				console.log(`${ts()} [Tool] result: ${toolName} (${e.status}, ${e.durationMs}ms)`);
+				// Clear the tool track; browser track takes over immediately.
+				fetch('http://localhost:8080/mute-state?state=idle&source=tool').catch(() => {});
 			},
 			onSubagentStep: (e) => console.log(`${ts()} [Subagent] ${e.subagentName} #${e.stepNumber} [${e.toolCalls.join(',')}]`),
 			onError: (e) => {
