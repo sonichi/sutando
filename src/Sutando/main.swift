@@ -166,7 +166,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    var lastWatcherRestart: Date = .distantPast
+    var lastWatcherAlert: Date = .distantPast
     func checkWatcher() {
         // pgrep -f watch-tasks
         let proc = Process()
@@ -181,17 +181,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if !out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return  // watcher alive
         }
-        // Throttle: don't restart more than once every 60s.
-        if Date().timeIntervalSince(lastWatcherRestart) < 60 { return }
-        lastWatcherRestart = Date()
-        // Restart in background
-        let script = "/bin/bash \(workspace)/src/watch-tasks.sh"
-        let restart = Process()
-        restart.executableURL = URL(fileURLWithPath: "/bin/bash")
-        restart.arguments = ["-c", "nohup \(script) > /dev/null 2>&1 &"]
-        try? restart.run()
-        notify("Sutando", "Task watcher was down — auto-restarted")
-        logToFile("watcher dead; auto-restarted")
+        // Throttle: don't alert more than once every 120s so the CLI doesn't
+        // get flooded if it's slow to restart.
+        if Date().timeIntervalSince(lastWatcherAlert) < 120 { return }
+        lastWatcherAlert = Date()
+        // Write a prompt to context-drop.txt — the proactive-loop reads that
+        // file at the top of every pass (Step 1) so this message reaches the
+        // Claude Code CLI as real input on the next pass. Claude can then
+        // restart the watcher via its own run_in_background Bash so the
+        // watcher's output routes back through the task-notification pipe
+        // (a detached nohup restart loses that routing).
+        let dropPath = workspace + "/context-drop.txt"
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let message = """
+            timestamp: \(timestamp)
+            type: watcher-alert
+            ---
+            The task watcher (src/watch-tasks.sh) has been down for 2+ minutes. Restart it NOW via Bash `bash /Users/wangchi/Desktop/sutando/src/watch-tasks.sh` with run_in_background=true so its output routes back through the task-notification pipe.
+
+            """
+        try? message.write(toFile: dropPath, atomically: true, encoding: .utf8)
+        notify("Sutando", "Task watcher down — CLI alerted via context-drop")
+        logToFile("watcher dead; wrote context-drop alert")
     }
 
     func pollMuteState() {
