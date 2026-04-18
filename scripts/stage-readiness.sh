@@ -9,7 +9,7 @@
 #   voice-agent:       port 9900 responsive, recent Health tick, client can connect
 #   bodhi FATAL:       0× CLOSED→RECONNECTING in the last 10 min (post-#409 expected)
 #   conversation:      port 3100 /health endpoint returns ok
-#   ngrok tunnel:      curl the public URL, expect 200-range
+#   ngrok tunnel:      query local ngrok agent API (:4040), match by public_url
 #   presenter-mode:    sentinel present + future expiry, so notifications are silenced
 #   quota:             >10% remaining so we don't blow through mid-segment
 #   disk + memory:     not in low-space / low-mem territory
