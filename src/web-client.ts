@@ -1964,6 +1964,13 @@ let _voiceState = false;
 type AgentState = 'idle' | 'listening' | 'speaking' | 'working' | 'seeing';
 let _browserState: AgentState = 'idle';
 let _toolState: AgentState = 'idle';
+// Saves the tool-track state at the moment seeing is set, so after the
+// seeing TTL expires we revert to whatever tool was running BEFORE the
+// capture — most commonly 'working'. Previously seeing → idle, which
+// killed the working pulse mid-tool and made Chi think seeing "happened
+// long after" (in fact, the next working state was the next tool call,
+// which registers as a new pulse well after seeing cleared the first).
+let _preSeeingToolState: AgentState = 'idle';
 // Timestamp of the last transition INTO 'seeing'. Screen capture is transient
 // (sub-second), so we want the 'seeing' state to flash briefly then auto-
 // revert. Without auto-revert, a single /capture call pins state=seeing
@@ -1991,7 +1998,11 @@ function coreIsRunning(): boolean {
 
 function effectiveAgentState(): AgentState {
 	if (_toolState === 'seeing' && Date.now() > _seeingUntil) {
-		_toolState = 'idle';
+		// Revert to pre-seeing tool state (usually 'working' if a tool was
+		// running when the capture fired). Falling straight to 'idle' here
+		// would kill the working pulse mid-tool.
+		_toolState = _preSeeingToolState;
+		_preSeeingToolState = 'idle';
 	}
 	if (_toolState !== 'idle') return _toolState;
 	if (_browserState !== 'idle') return _browserState;
@@ -2055,25 +2066,36 @@ const server = createServer((req, res) => {
 		if (aState === 'idle' || aState === 'listening' || aState === 'speaking' || aState === 'working' || aState === 'seeing') {
 			const prevEffective = effectiveAgentState();
 			if (source === 'tool') {
-				// Only working/seeing meaningfully belong on the tool track;
-				// anything else clears it back to idle (falling through to
-				// whatever the browser track currently says).
-				_toolState = (aState === 'working' || aState === 'seeing') ? aState : 'idle';
 				if (aState === 'seeing') {
+					// Remember the tool state before overlaying seeing — most
+					// often 'working' when a describe_screen tool is in flight.
+					// Without this, the post-TTL revert would drop to idle
+					// mid-tool and kill the working pulse, which is what Chi
+					// hit ("fast blinking for seeing happened long after").
+					if (_toolState !== 'seeing') _preSeeingToolState = _toolState;
+					_toolState = 'seeing';
 					const ttlParam = url.searchParams.get('ttl_ms');
-					const ttl = ttlParam ? parseInt(ttlParam, 10) : 1500;
-					_seeingUntil = Date.now() + (isFinite(ttl) && ttl > 0 ? ttl : 1500);
+					const ttl = ttlParam ? parseInt(ttlParam, 10) : 3000;
+					const ttlMs = isFinite(ttl) && ttl > 0 ? ttl : 3000;
+					_seeingUntil = Date.now() + ttlMs;
 					// Schedule an auto-revert broadcast so the browser clears
 					// .seeing even if nothing else POSTs a state update.
 					setTimeout(() => {
 						if (_toolState === 'seeing' && Date.now() >= _seeingUntil) {
-							_toolState = 'idle';
+							_toolState = _preSeeingToolState;
+							_preSeeingToolState = 'idle';
 							const eff = effectiveAgentState();
 							for (const client of sseClients) {
 								try { client.write(`event: agent-state\ndata: ${eff}\n\n`); } catch {}
 							}
 						}
-					}, (isFinite(ttl) && ttl > 0 ? ttl : 1500) + 50);
+					}, ttlMs + 50);
+				} else {
+					// working or clear. Reset the pre-seeing memory too so a
+					// future seeing knows its true predecessor, not the stale
+					// one from a previous tool sequence.
+					_toolState = aState === 'working' ? 'working' : 'idle';
+					_preSeeingToolState = 'idle';
 				}
 			} else {
 				// Browser can't legitimately know working/seeing — those

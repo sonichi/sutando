@@ -147,8 +147,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
         statusItem.menu = menu
 
-        // Poll mute/voice state every 3 seconds for menu bar indicator
-        Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+        // Poll mute/voice state every 1 second. Previously 3s, but the seeing
+        // flash is a transient tool state (TTL ~3s) and a 3s poll has <50%
+        // probability of landing inside the TTL window — Chi saw seeing
+        // "happen long after" because the first flash was missed entirely.
+        // 1s makes the catch deterministic.
+        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.pollMuteState()
         }
     }
