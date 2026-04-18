@@ -1800,13 +1800,18 @@ function showNoteContent(slug) {
     var inlineCodeRe = new RegExp(String.fromCharCode(96) + '([^' + String.fromCharCode(96) + ']+)' + String.fromCharCode(96), 'g');
     text = text.replace(inlineCodeRe, '<code style="background:#1a1a2e;padding:1px 4px;border-radius:2px">$1</code>');
     // Images before links: ![alt](url) — else the link regex below eats the alt-text form.
-    text = text.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img src="$2" alt="$1" style="max-width:100%;border-radius:4px;margin:8px 0">');
-    text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" style="color:#7c83ff">$1</a>');
+    // Two layers of backslash-eating: the outer TS template literal halves
+    // them once, then the inner JS string literal halves again. Need FOUR
+    // backslashes in source to get one literal backslash in the regex.
+    // See feedback_inline_js_escaping.md — PR #434 regression, hit Chi
+    // three times today including once blocking his voice connection.
+    text = text.replace(new RegExp('!\\\\[([^\\\\]]*)\\\\]\\\\(([^)]+)\\\\)', 'g'), '<img src="$2" alt="$1" style="max-width:100%;border-radius:4px;margin:8px 0">');
+    text = text.replace(new RegExp('\\\\[([^\\\\]]+)\\\\]\\\\(([^)]+)\\\\)', 'g'), '<a href="$2" target="_blank" style="color:#7c83ff">$1</a>');
     // Bold before italic: the bold regex eats two asterisks so the italic one sees none.
-    text = text.replace(/[*][*](.+?)[*][*]/g, '<strong>$1</strong>');
-    text = text.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
-    text = text.replace(/^> ?(.+)$/gm, '<blockquote style="border-left:3px solid #7c83ff;padding-left:10px;color:#a0a0b0;margin:8px 0;font-style:italic">$1</blockquote>');
-    text = text.replace(/^---+$/gm, '<hr style="border:none;border-top:1px solid #2a2a3e;margin:12px 0">');
+    text = text.replace(new RegExp('[*][*](.+?)[*][*]', 'g'), '<strong>$1</strong>');
+    text = text.replace(new RegExp('(^|[^*])\\\\*([^*\\\\n]+)\\\\*', 'g'), '$1<em>$2</em>');
+    text = text.replace(new RegExp('^> ?(.+)$', 'gm'), '<blockquote style="border-left:3px solid #7c83ff;padding-left:10px;color:#a0a0b0;margin:8px 0;font-style:italic">$1</blockquote>');
+    text = text.replace(new RegExp('^---+$', 'gm'), '<hr style="border:none;border-top:1px solid #2a2a3e;margin:12px 0">');
     text = text.replace(/^- (.+)$/gm, '<li>$1</li>');
     text = text.replace(new RegExp('\\n\\n', 'g'), '<br><br>');
     container.innerHTML = '<span class="suggestion" onclick="renderTabContent()" style="font-size:11px;cursor:pointer;margin-bottom:8px;display:inline-block">&larr; Back</span>' +
