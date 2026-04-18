@@ -109,7 +109,7 @@ This starts all services (voice agent, web client, dashboard, API, Sutando menu 
 
 **Try saying:**
 - "What's on my screen?" — takes a screenshot and describes it
-- "Summon" — opens Zoom with screen sharing, join from your phone
+- "Summon my computer to zoom" — opens Zoom with screen sharing, join from your phone
 - "Join my next meeting" — checks your calendar and joins
 - "Take a note: my first idea" — saves a searchable note
 - "Tutorial" — walks you through all capabilities step by step
