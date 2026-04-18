@@ -142,7 +142,17 @@ REMAINING=$(grep -rn "sentinel\|expire_iso" src/ scripts/ --include='*.sh' --inc
     | grep -v "poc-" \
     | grep -v "stage-readiness.sh" \
     | grep -E "expire_iso.*<|<.*expire_iso" \
-    | head -5)
+    | while IFS= read -r hit; do
+        # Per Mini's review on PR #437: exclude sites where an isdigit()
+        # guard appears on the previous ~5 lines (PR #432 added them
+        # immediately above the comparison). The naive grep matched the
+        # comparison line and reported the guarded sites as unfixed.
+        file="${hit%%:*}"; line="${hit#*:}"; line="${line%%:*}"
+        start=$(( line - 5 )); [ "$start" -lt 1 ] && start=1
+        if ! sed -n "${start},${line}p" "$file" 2>/dev/null | grep -q "isdigit()\|=~ \^\[0-9\]"; then
+            echo "$hit"
+        fi
+      done | head -5)
 if [ -z "$REMAINING" ]; then
     ok "C1: no other unfixed call sites found doing bare string-compare on sentinel"
 else
