@@ -23,5 +23,10 @@
     "name": "sync-memory",
     "cron": "*/30 * * * *",
     "prompt": "Run bash src/sync-memory.sh to sync memory and notes to the private memory repo (requires SUTANDO_MEMORY_REPO in .env)."
+  },
+  {
+    "name": "cross-node-sync",
+    "cron": "*/7 * * * *",
+    "prompt": "Run bash skills/cross-node-sync/scripts/setup-rsync-sync.sh to sync memory/ + notes/ with the peer node (requires SUTANDO_SYNC_PEER in .env). Then regenerate MEMORY.md from frontmatter."
   }
 ]
