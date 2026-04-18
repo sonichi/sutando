@@ -56,10 +56,20 @@ const HTML = /* html */ `<!DOCTYPE html>
     box-shadow: 0 0 10px rgba(96,165,250,0.4);
     animation: avatar-work 2s linear infinite;
   }
+  .header .avatar.seeing:not(.speaking) {
+    border-color: #fbbf24;
+    box-shadow: 0 0 12px rgba(251,191,36,0.55);
+    animation: avatar-see 1.2s ease-in-out infinite;
+  }
   @keyframes avatar-work {
     0% { box-shadow: 0 0 8px rgba(96,165,250,0.3), 0 0 0 2px rgba(96,165,250,0.1); }
     50% { box-shadow: 0 0 16px rgba(96,165,250,0.5), 0 0 0 4px rgba(96,165,250,0.2); }
     100% { box-shadow: 0 0 8px rgba(96,165,250,0.3), 0 0 0 2px rgba(96,165,250,0.1); }
+  }
+  @keyframes avatar-see {
+    0% { box-shadow: 0 0 10px rgba(251,191,36,0.45), inset 0 0 0 0 rgba(251,191,36,0.0); }
+    50% { box-shadow: 0 0 20px rgba(251,191,36,0.8), inset 0 0 14px 2px rgba(251,191,36,0.35); }
+    100% { box-shadow: 0 0 10px rgba(251,191,36,0.45), inset 0 0 0 0 rgba(251,191,36,0.0); }
   }
   .header .info { flex: 1; }
   .header h1 { color: #fff; font-size: 1.1em; font-weight: 500; }
@@ -270,6 +280,11 @@ const HTML = /* html */ `<!DOCTYPE html>
     box-shadow: 0 0 14px rgba(96,165,250,0.4);
     animation: avatar-work 2s linear infinite;
   }
+  .hero .avatar-hero.seeing:not(.speaking) {
+    border-color: #fbbf24;
+    box-shadow: 0 0 16px rgba(251,191,36,0.55);
+    animation: avatar-see 1.2s ease-in-out infinite;
+  }
   .hero h2 { color: #fff; font-size: 1.3em; font-weight: 500; margin-bottom: 4px; transition: all 0.6s ease; }
   .hero .tagline { color: #555; font-size: 13px; margin-bottom: 24px; transition: all 0.6s ease; }
   @keyframes avatar-glow {
@@ -448,6 +463,22 @@ function initRemoteToggle() {
   _sseSource = new EventSource('/sse');
   _sseSource.addEventListener('toggle-voice', () => toggle());
   _sseSource.addEventListener('toggle-mute', () => toggleMute());
+  // Server-pushed agent state (working/seeing). Browser's own reportAgentState
+  // poll derives listening/speaking from audio RMS, but working and seeing
+  // originate from server-side tool calls (capture_screen, any inline tool
+  // run) — without this bridge, the CSS never fires during voice because
+  // the DOM doesn't know the server is in that state.
+  _sseSource.addEventListener('agent-state', (e) => {
+    try {
+      var st = String(e.data || '').trim();
+      var av = document.getElementById('stand-avatar');
+      var hav = document.getElementById('hero-avatar');
+      var setWorking = st === 'working';
+      var setSeeing = st === 'seeing';
+      if (av) { av.classList.toggle('working', setWorking); av.classList.toggle('seeing', setSeeing); }
+      if (hav) { hav.classList.toggle('working', setWorking); hav.classList.toggle('seeing', setSeeing); }
+    } catch {}
+  });
   _sseSource.onerror = () => setTimeout(() => initRemoteToggle(), 5000);
 }
 initRemoteToggle();
@@ -1998,8 +2029,28 @@ const server = createServer((req, res) => {
 				const ttlParam = url.searchParams.get('ttl_ms');
 				const ttl = ttlParam ? parseInt(ttlParam, 10) : 1500;
 				_seeingUntil = Date.now() + (isFinite(ttl) && ttl > 0 ? ttl : 1500);
+				// Schedule an auto-revert broadcast so the browser clears the
+				// .seeing class even if nothing else POSTs a state update.
+				setTimeout(() => {
+					if (_agentState === 'seeing' && Date.now() >= _seeingUntil) {
+						_agentState = _preSeeingState;
+						for (const client of sseClients) {
+							try { client.write(`event: agent-state\ndata: ${_agentState}\n\n`); } catch {}
+						}
+					}
+				}, (isFinite(ttl) && ttl > 0 ? ttl : 1500) + 50);
 			}
+			const prevState = _agentState;
 			_agentState = aState;
+			// Push server-authoritative state to browser clients so the avatar
+			// can apply .working / .seeing CSS classes. Browser's local poll
+			// only derives listening/speaking from audio RMS; working and
+			// seeing originate from tool calls and need a server → client push.
+			if (prevState !== _agentState) {
+				for (const client of sseClients) {
+					try { client.write(`event: agent-state\ndata: ${_agentState}\n\n`); } catch {}
+				}
+			}
 		}
 		res.writeHead(200, { 'Content-Type': 'application/json' });
 		res.end(JSON.stringify({ muted: _muteState, voiceConnected: _voiceState, state: _agentState }));
