@@ -2044,6 +2044,15 @@ const server = createServer((req, res) => {
 			'Access-Control-Allow-Origin': '*',
 		});
 		res.write(':\n\n'); // heartbeat
+		// Send current agent state immediately so freshly-connected clients
+		// don't display stale DOM classes from the previous session.
+		// Before this, a browser that reconnected SSE after a server
+		// restart kept whatever .working/.seeing class it had when the
+		// previous connection dropped — producing the "web UI shows working
+		// but menu bar shows listening" inconsistency Chi hit today.
+		try {
+			res.write(`event: agent-state\ndata: ${effectiveAgentState()}\n\n`);
+		} catch {}
 		sseClients.push(res);
 		req.on('close', () => {
 			const idx = sseClients.indexOf(res);
