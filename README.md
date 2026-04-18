@@ -129,6 +129,8 @@ bash src/verify-setup.sh
 - Gemini 429 errors? Your shell may have a stale `GEMINI_API_KEY` overriding `.env` — run `unset GEMINI_API_KEY` then restart
 - Screen recording produces 0-second files? `screencapture -v` needs a TTY. Sutando uses `ffmpeg` instead — make sure it's installed: `brew install ffmpeg`
 - Something broke? Run `bash src/restart.sh` — this kills all services and restarts fresh
+- Sutando acting confused, contradicting itself, or giving stale answers after a long session? Claude hallucinates more as the context window fills up — restart the Claude Code session every now and then to reset.
+- Phone call answers with "We are sorry, an error has occurred"? The conversation server (`skills/phone-conversation/scripts/conversation-server.ts`, port 3100) isn't running. Run `bash src/startup.sh` or `bash src/restart.sh` to relaunch all services.
 
 **Shutting down:**
 ```bash
