@@ -322,9 +322,9 @@ def main():
                     continue
                 try:
                     send_reply(chat_id, reply_text)
-                    print(f"  Replied to {chat_id}: {reply_text[:80]}...")
+                    print(f"  Replied to {chat_id}: {reply_text[:80]}...", flush=True)
                 except Exception as e:
-                    print(f"[Telegram] Reply error: {e}")
+                    print(f"[Telegram] Reply error: {e}", flush=True)
                 # Archive (not delete) so we can mine patterns later.
                 archive_file(result_file, "results", task_id)
                 task_file = TASKS_DIR / f"{task_id}.txt"

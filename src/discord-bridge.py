@@ -719,9 +719,9 @@ async def poll_results():
                         else:
                             await channel.send(f"(file not found: {fpath})")
 
-                    print(f"  Replied: {reply_text[:80]}...")
+                    print(f"  Replied: {reply_text[:80]}...", flush=True)
                 except Exception as e:
-                    print(f"  Reply failed: {e}")
+                    print(f"  Reply failed: {e}", flush=True)
                 # Archive (not delete) so we can mine patterns later.
                 archive_file(result_file, "results", task_id)
                 task_file = TASKS_DIR / f"{task_id}.txt"
