@@ -25,11 +25,14 @@ describe('/sse-status + /mute-state — agent state plumbing (PR #418)', () => {
 			['tsx', 'src/web-client.ts'],
 			{
 				env: { ...process.env, CLIENT_PORT: String(PORT), PORT: '19900', CLIENT_HOST: '127.0.0.1' },
-				stdio: 'pipe',
+				// 'ignore' prevents the pipe buffer from filling in CI (stdout isn't drained),
+				// which would block the child and cause the /sse-status poll to time out.
+				stdio: 'ignore',
 			}
 		);
-		// Wait up to 10s for server to start listening.
-		const deadline = Date.now() + 10_000;
+		// Wait up to 20s for server to start listening. CI cold-start on `npx tsx`
+		// with fresh node_modules can take significantly longer than a dev machine.
+		const deadline = Date.now() + 20_000;
 		while (Date.now() < deadline) {
 			try {
 				const res = await fetch(`http://localhost:${PORT}/sse-status`);
@@ -37,11 +40,22 @@ describe('/sse-status + /mute-state — agent state plumbing (PR #418)', () => {
 			} catch { /* not ready */ }
 			await delay(200);
 		}
-		throw new Error('web-client did not start within 10s');
+		throw new Error('web-client did not start within 20s');
 	});
 
-	after(() => {
-		if (child && !child.killed) child.kill('SIGTERM');
+	after(async () => {
+		// Hang-safe teardown: SIGTERM, wait up to 2s, SIGKILL fallback. Without
+		// awaiting exit, the live child-process handle keeps node --test alive
+		// past the CI job timeout (observed: 9m43s hangs after #423 merged).
+		if (!child || child.killed) return;
+		await new Promise<void>((resolve) => {
+			const hardKill = setTimeout(() => {
+				try { child.kill('SIGKILL'); } catch { /* already dead */ }
+				resolve();
+			}, 2_000);
+			child.once('exit', () => { clearTimeout(hardKill); resolve(); });
+			child.kill('SIGTERM');
+		});
 	});
 
 	it('default /sse-status returns state:"idle"', async () => {
