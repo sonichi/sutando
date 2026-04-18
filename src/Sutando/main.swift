@@ -38,6 +38,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var currentAgentState: String = "idle"
     var animationTimer: Timer?
     var animationPhase: CGFloat = 1.0
+    // Cached proactive-loop status from /core-status. Updated by a parallel
+    // poll alongside /sse-status so the menu-bar can show the "working" pulse
+    // when the loop is running even if voice is disconnected (agent-state
+    // alone isn't enough — voice disconnect forces agent-state=idle).
+    var loopRunning: Bool = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Request notification permission — only when running as .app bundle
@@ -154,6 +159,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func pollMuteState() {
+        // Parallel poll of /core-status to track proactive-loop "running" state.
+        // Cached into self.loopRunning for the union below; no-op on failure
+        // (pre-#441 servers or no core-status endpoint → stays at last value).
+        if let coreURL = URL(string: "http://localhost:7843/core-status") {
+            URLSession.shared.dataTask(with: coreURL) { [weak self] data, _, _ in
+                guard let self = self, let data = data,
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+                let running = (json["status"] as? String) == "running"
+                DispatchQueue.main.async { self.loopRunning = running }
+            }.resume()
+        }
         guard let url = URL(string: "http://localhost:8080/sse-status") else { return }
         let task = URLSession.shared.dataTask(with: url) { [weak self] data, _, error in
             guard let data = data, error == nil,
@@ -161,9 +177,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let isMuted = json["muted"] as? Bool ?? false
             let isVoiceConnected = json["voiceConnected"] as? Bool ?? false
             // `state` added by PR #418. Absent on pre-#418 servers → default 'idle'.
-            let agentState = (json["state"] as? String) ?? "idle"
+            let rawAgentState = (json["state"] as? String) ?? "idle"
             DispatchQueue.main.async {
                 guard let self = self, let button = self.statusItem.button else { return }
+                // Union with proactive-loop: if agent is idle but the loop
+                // is running a pass, show the "working" pulse anyway. Reads
+                // self.loopRunning on main-thread (cache is only ever written
+                // there, avoiding a data race). Closes the gap reported at
+                // 09:37Z ("voice disconnected + loop running = menu-bar
+                // static while web UI shows blue").
+                let agentState: String = (rawAgentState == "idle" && self.loopRunning) ? "working" : rawAgentState
                 if isVoiceConnected && isMuted {
                     // Voice active + muted: show mute indicator; stop any animation.
                     // Reset cache so un-mute re-triggers animation if agent is
