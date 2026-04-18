@@ -185,14 +185,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     } else {
                         button.title = "S"
                     }
-                    // Drive animation from semantic state. `listening`/`speaking`/`working`
-                    // all animate ("any non-idle" per owner's 07:38Z B-option decision).
+                    // Drive animation from semantic state. Each non-idle state gets
+                    // a distinct pulse shape (period + min opacity) so "working",
+                    // "speaking", "listening", "seeing" are distinguishable at a
+                    // glance. Decided 2026-04-18 at owner's request (supersedes
+                    // the earlier 07:38Z B-option collapsing).
                     if self.currentAgentState != agentState {
                         self.currentAgentState = agentState
                         if agentState == "idle" {
                             self.stopAnimation()
                         } else {
-                            self.startAnimation()
+                            self.startAnimation(for: agentState)
                         }
                     }
                 }
@@ -201,17 +204,42 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         task.resume()
     }
 
-    /// Start a slow opacity pulse on the menu-bar icon. Visible motion, but
-    /// not distracting — ~0.6s fade cycle, dropping to 55% opacity then back.
+    /// Start a per-state opacity pulse on the menu-bar icon.
+    ///
+    /// Each non-idle state has a distinct (period, minOpacity) so the four
+    /// states are distinguishable at a glance:
+    ///   - `listening` — 600ms cycle, min 55%  (slow gentle pulse — default)
+    ///   - `speaking`  — 300ms cycle, min 40%  (fast+deep — active output)
+    ///   - `working`   — 1200ms cycle, min 65% (slow heartbeat — processing)
+    ///   - `seeing`    — no pulse, static 100% (stands out against the moving ones)
     /// Called only on idle → non-idle transition from pollMuteState.
-    func startAnimation() {
+    func startAnimation(for state: String) {
         animationTimer?.invalidate()
         animationPhase = 1.0
-        animationTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
+        // seeing: static bright — no pulse; deliberately distinct from the others
+        if state == "seeing" {
+            statusItem?.button?.alphaValue = 1.0
+            return
+        }
+        // (halfPeriodSeconds, minOpacity) per state
+        let halfPeriod: Double
+        let minOpacity: CGFloat
+        switch state {
+        case "speaking":
+            halfPeriod = 0.15  // 300ms full cycle
+            minOpacity = 0.40
+        case "working":
+            halfPeriod = 0.6   // 1200ms full cycle (slow heartbeat)
+            minOpacity = 0.65
+        default:
+            // listening + any future non-idle falls through to the default slow pulse
+            halfPeriod = 0.3   // 600ms full cycle
+            minOpacity = 0.55
+        }
+        animationTimer = Timer.scheduledTimer(withTimeInterval: halfPeriod, repeats: true) { [weak self] _ in
             guard let self = self, let button = self.statusItem.button else { return }
-            // Toggle between 1.0 and 0.55 every tick → 600ms cycle
-            self.animationPhase = self.animationPhase > 0.75 ? 0.55 : 1.0
-            button.alphaValue = self.animationPhase
+            self.animationPhase = self.animationPhase > (1.0 + Double(minOpacity)) / 2.0 ? Double(minOpacity) : 1.0
+            button.alphaValue = CGFloat(self.animationPhase)
         }
     }
 

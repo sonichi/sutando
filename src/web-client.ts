@@ -61,6 +61,20 @@ const HTML = /* html */ `<!DOCTYPE html>
     50% { box-shadow: 0 0 16px rgba(96,165,250,0.5), 0 0 0 4px rgba(96,165,250,0.2); }
     100% { box-shadow: 0 0 8px rgba(96,165,250,0.3), 0 0 0 2px rgba(96,165,250,0.1); }
   }
+  /* listening — slow amber pulse */
+  .header .avatar.listening:not(.speaking):not(.working) {
+    border-color: #fbbf24;
+    animation: avatar-listen 1.6s ease-in-out infinite;
+  }
+  @keyframes avatar-listen {
+    0%, 100% { box-shadow: 0 0 6px rgba(251,191,36,0.25); }
+    50%      { box-shadow: 0 0 14px rgba(251,191,36,0.45); }
+  }
+  /* seeing — purple with a static outer ring (no pulse, calls attention differently) */
+  .header .avatar.seeing:not(.speaking):not(.working) {
+    border-color: #c084fc;
+    box-shadow: 0 0 0 3px rgba(192,132,252,0.3), 0 0 12px rgba(192,132,252,0.35);
+  }
   .header .info { flex: 1; }
   .header h1 { color: #fff; font-size: 1.1em; font-weight: 500; }
   .header .meta { font-size: 11px; color: #555; display: flex; gap: 12px; align-items: center; margin-top: 2px; }
@@ -269,6 +283,14 @@ const HTML = /* html */ `<!DOCTYPE html>
     border-color: #60a5fa;
     box-shadow: 0 0 14px rgba(96,165,250,0.4);
     animation: avatar-work 2s linear infinite;
+  }
+  .hero .avatar-hero.listening:not(.speaking):not(.working) {
+    border-color: #fbbf24;
+    animation: avatar-listen 1.6s ease-in-out infinite;
+  }
+  .hero .avatar-hero.seeing:not(.speaking):not(.working) {
+    border-color: #c084fc;
+    box-shadow: 0 0 0 4px rgba(192,132,252,0.3), 0 0 16px rgba(192,132,252,0.35);
   }
   .hero h2 { color: #fff; font-size: 1.3em; font-weight: 500; margin-bottom: 4px; transition: all 0.6s ease; }
   .hero .tagline { color: #555; font-size: 13px; margin-bottom: 24px; transition: all 0.6s ease; }
@@ -1865,15 +1887,16 @@ document.addEventListener('keydown', function(e) {
   }
 });
 
-// Poll dynamic-content + core-status
+// Poll dynamic-content + core-status + sse-status
 (function pollDynamicContent() {
   setInterval(() => {
     Promise.all([
       fetch(API_BASE + '/dynamic-content').then(r => r.json()).catch(() => ({})),
       fetch(API_BASE + '/core-status').then(r => r.json()).catch(() => ({status:'idle'})),
       fetch('http://' + window.location.hostname + ':7844/notes').then(r => r.json()).catch(() => []),
-      fetch(API_BASE + '/contextual-chips').then(r => r.json()).catch(() => ({chips:[]}))
-    ]).then(([dc, loopData, notes, ctx]) => {
+      fetch(API_BASE + '/contextual-chips').then(r => r.json()).catch(() => ({chips:[]})),
+      fetch('/sse-status').then(r => r.json()).catch(() => ({state:'idle'}))
+    ]).then(([dc, loopData, notes, ctx, sseData]) => {
       window._contextualChips = (ctx && ctx.chips) || [];
       window._drNoteCount = Array.isArray(notes) ? notes.length : 0;
       // Only overwrite content if API has real content; preserve local content (e.g. notes browser)
@@ -1898,12 +1921,23 @@ document.addEventListener('keydown', function(e) {
         var expandBtn = '';
         csBar.innerHTML = statusText + expandBtn;
       }
-      // Avatar working state — blue spin when core is active
+      // Avatar per-state visuals — each semantic state lights a distinct class.
+      // The .working class is the union of proactive-loop-running AND voice-
+      // agent-state=working so both meanings of "busy" still fire the blue
+      // border (fixes the earlier gap where voice-side tool calls didn't
+      // trigger the UI's working visual).
       var av = document.getElementById('stand-avatar');
       var hav = document.getElementById('hero-avatar');
-      var isWorking = loopData.status === 'running';
-      if (av) av.classList.toggle('working', isWorking);
-      if (hav) hav.classList.toggle('working', isWorking);
+      var agentState = (sseData && sseData.state) || 'idle';
+      var isLoopRunning = loopData.status === 'running';
+      var isWorking = isLoopRunning || agentState === 'working';
+      [av, hav].forEach(function(el) {
+        if (!el) return;
+        el.classList.toggle('working',   isWorking);
+        el.classList.toggle('listening', agentState === 'listening');
+        el.classList.toggle('seeing',    agentState === 'seeing');
+        // .speaking is already driven by the voice client (TTS events); don't fight it here.
+      });
     });
   }, 3000);
 })();
