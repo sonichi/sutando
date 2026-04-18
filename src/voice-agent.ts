@@ -807,6 +807,34 @@ async function main() {
 		};
 	}
 
+	// Reset per-session state on RE-connect. Bodhi's state machine fires
+	// onSessionStart only on the first ACTIVE transition (index.js:1219 —
+	// the `!this.startedAt` guard, and `startedAt` is never reset to null).
+	// Without this wrap, a user's second/third/Nth client-connect within
+	// the same process doesn't retrigger our onSessionStart hook, so
+	// metricsWritten stays true from the last flush, and the next
+	// onSessionEnd `writeVoiceMetrics()` returns early — record lost.
+	// Observed 2026-04-17 when a whole day of voice sessions missed the
+	// jsonl because MBP kept one voice-agent process alive across many
+	// client reconnects. First connect still goes through bodhi's
+	// onSessionStart (our callback resets state there); this wrap only
+	// kicks in on the 2nd+ connect.
+	let clientHasConnectedOnce = false;
+	const origConnect = (session as any).handleClientConnected?.bind(session);
+	if (origConnect) {
+		(session as any).handleClientConnected = () => {
+			if (clientHasConnectedOnce) {
+				userTurnCount = 0; userHasInterrupted = false; sessionEnding = false;
+				voiceSessionStart = Date.now(); metricsWritten = false;
+				voiceEvents.length = 0; voiceToolCalls.length = 0; voiceTranscript.length = 0;
+				voiceEvents.push({ event: 'session_started:client_reconnect', timestamp: new Date().toISOString() });
+				console.log(`${ts()} [Session] Client reconnected — reset metrics buffer (bodhi onSessionStart guard bypass)`);
+			}
+			clientHasConnectedOnce = true;
+			origConnect();
+		};
+	}
+
 	// Wire task status → web client
 	setTaskStatusCallback((taskId, status, text, result) => {
 		try {
