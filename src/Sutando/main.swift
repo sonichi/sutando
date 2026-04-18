@@ -262,13 +262,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// semantic state on hover so the user can verify the visual without
     /// guessing which pulse they're seeing.
     func tooltipFor(state: String, muted: Bool, voiceConnected: Bool) -> String {
+        // Tool-track states (working / seeing) describe real server-side
+        // activity and apply whether voice is up or not. Showing "voice
+        // disconnected" while the icon is pulsing working is misleading —
+        // the pulse and the tooltip must tell the same story.
+        switch state {
+        case "working": return voiceConnected ? "Sutando — running a tool" : "Sutando — running a tool (voice off)"
+        case "seeing":  return voiceConnected ? "Sutando — reading your screen" : "Sutando — reading your screen (voice off)"
+        default: break
+        }
         if !voiceConnected { return "Sutando — voice disconnected" }
         if muted { return "Sutando — muted" }
         switch state {
         case "listening": return "Sutando — listening"
         case "speaking":  return "Sutando — speaking"
-        case "working":   return "Sutando — running a tool"
-        case "seeing":    return "Sutando — reading your screen"
         case "idle":      return "Sutando — idle"
         default:          return "Sutando — \(state)"
         }
