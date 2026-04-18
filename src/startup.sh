@@ -281,10 +281,31 @@ open "http://localhost:8080"
 if pgrep -f "claude.*--name.*sutando-core" > /dev/null 2>&1; then
   echo "Claude Code (sutando-core) is already running."
   echo "To restart: kill it first, then re-run this script."
+  echo "To attach to the running session: tmux attach -t sutando-core"
   echo ""
 else
-  echo "Starting Claude Code (sutando-core)..."
+  echo "Starting Claude Code (sutando-core) inside tmux..."
   echo ""
-  exec claude --name sutando-core --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
-    -- "/proactive-loop"
+  # Wrap in a tmux session named `sutando-core` so Sutando.app can send
+  # keystrokes into the pane when the task watcher dies (see
+  # AppDelegate.checkWatcher). `tmux new-session -A -s sutando-core …`
+  # creates the session if it doesn't exist and attaches if it does,
+  # so the user sees the Claude Code prompt exactly as before.
+  # Fall back to a bare `exec claude` if tmux is missing.
+  if command -v tmux > /dev/null 2>&1; then
+    # Explicit socket path so Sutando.app (which runs under a different
+    # TMPDIR due to macOS sandboxing when launched via `open`) can reach
+    # the same tmux server. Without -S, tmux defaults to
+    # $TMPDIR/tmux-$(id -u)/default — different path app-side vs
+    # shell-side → tmux has-session fails → watcher-auto-restart falls
+    # back to macOS notification instead of sending `watcher`.
+    exec tmux -S /tmp/sutando-tmux.sock new-session -A -s sutando-core \
+      claude --name sutando-core --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
+      -- "/proactive-loop"
+  else
+    echo "  ⚠ tmux not found — running without tmux wrapper"
+    echo "    (Sutando.app's watcher-auto-restart won't work; brew install tmux to enable)"
+    exec claude --name sutando-core --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
+      -- "/proactive-loop"
+  fi
 fi

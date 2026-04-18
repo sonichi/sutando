@@ -33,6 +33,38 @@ if not TOKEN:
 
 TASKS_DIR = REPO / "tasks"
 RESULTS_DIR = REPO / "results"
+ARCHIVE_TASKS_DIR = REPO / "tasks" / "archive"
+ARCHIVE_RESULTS_DIR = REPO / "results" / "archive"
+
+
+def archive_path(kind: str, task_id: str) -> "Path":
+    """Return archive destination for a task or result file, partitioned by
+    year-month so the archive stays browsable.
+
+    kind: "tasks" or "results". task_id: e.g. "task-1776538911450"."""
+    from datetime import datetime
+    ym = datetime.now().strftime("%Y-%m")
+    base = ARCHIVE_TASKS_DIR if kind == "tasks" else ARCHIVE_RESULTS_DIR
+    month_dir = base / ym
+    month_dir.mkdir(parents=True, exist_ok=True)
+    return month_dir / f"{task_id}.txt"
+
+
+def archive_file(src: "Path", kind: str, task_id: str) -> None:
+    """Move src into the archive. Silent on failure — archive is for later
+    analysis, not critical path. Chi's 2026-04-18 ask: "instead of deleting
+    we should archive the tasks. It can be useful for self-improving"."""
+    try:
+        if src.exists():
+            import shutil
+            shutil.move(str(src), str(archive_path(kind, task_id)))
+    except Exception as e:
+        print(f"  archive_file({kind}, {task_id}) failed: {e}", flush=True)
+        # Fall back to unlink so we don't leave stale files.
+        try:
+            src.unlink(missing_ok=True)
+        except Exception:
+            pass
 INBOX_DIR = Path("/tmp/discord-inbox")
 TASKS_DIR.mkdir(exist_ok=True)
 RESULTS_DIR.mkdir(exist_ok=True)
@@ -663,9 +695,9 @@ async def poll_results():
                 # skipped the cleanup block at the bottom of this loop.
                 if reply_text.startswith('[no-send]') or reply_text.startswith('[REPLIED]'):
                     print(f"  Skipped (already replied): {task_id}")
-                    result_file.unlink(missing_ok=True)
+                    archive_file(result_file, "results", task_id)
                     task_file = TASKS_DIR / f"{task_id}.txt"
-                    task_file.unlink(missing_ok=True)
+                    archive_file(task_file, "tasks", task_id)
                     continue
                 try:
                     # Extract file paths: [file: /path] or [send: /path]
@@ -690,10 +722,10 @@ async def poll_results():
                     print(f"  Replied: {reply_text[:80]}...")
                 except Exception as e:
                     print(f"  Reply failed: {e}")
-                # Clean up
-                result_file.unlink(missing_ok=True)
+                # Archive (not delete) so we can mine patterns later.
+                archive_file(result_file, "results", task_id)
                 task_file = TASKS_DIR / f"{task_id}.txt"
-                task_file.unlink(missing_ok=True)
+                archive_file(task_file, "tasks", task_id)
         await asyncio.sleep(1)
 
 

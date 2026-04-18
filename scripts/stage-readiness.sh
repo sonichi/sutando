@@ -9,7 +9,7 @@
 #   voice-agent:       port 9900 responsive, recent Health tick, client can connect
 #   bodhi FATAL:       0× CLOSED→RECONNECTING in the last 10 min (post-#409 expected)
 #   conversation:      port 3100 /health endpoint returns ok
-#   ngrok tunnel:      curl the public URL, expect 200-range
+#   ngrok tunnel:      query local ngrok agent API (:4040), match by public_url
 #   presenter-mode:    sentinel present + future expiry, so notifications are silenced
 #   quota:             >10% remaining so we don't blow through mid-segment
 #   disk + memory:     not in low-space / low-mem territory
@@ -81,18 +81,35 @@ fi
 # Strip quotes AND any trailing comment after `#` AND whitespace.
 NGROK_URL=$(grep -E "^TWILIO_WEBHOOK_URL=" "$REPO/.env" 2>/dev/null | cut -d= -f2- | sed 's/[[:space:]]*#.*$//' | tr -d '"' | tr -d '[:space:]' | head -1)
 if [ -n "${NGROK_URL:-}" ]; then
-    # curl -w prints "000" on connection failure; don't double-append. Also
-    # check /health explicitly since `/` on Twilio-bound ngrok may 404.
-    probe_url="$NGROK_URL"
-    probe_url="${NGROK_URL%/}/health"
-    code=$(curl -s -m 5 -o /dev/null -w "%{http_code}" "$probe_url" 2>/dev/null)
-    code="${code:-000}"
-    if [ "$code" = "000" ]; then
-        warn "ngrok tunnel" "unreachable: $NGROK_URL (connection failed)"
-    elif [ "$code" -ge 200 ] && [ "$code" -lt 500 ]; then
-        pass "ngrok tunnel" "$NGROK_URL → HTTP $code"
+    # Preferred: check the local ngrok agent API. macOS ships LibreSSL which
+    # fails TLS 1.3 negotiation with modern ngrok edge servers (curl: (35)
+    # tlsv1 alert protocol version), so an external curl of $NGROK_URL gives
+    # a false "unreachable" WARN even when the tunnel is fully live. The local
+    # API at :4040 is plain HTTP and authoritative for "is my tunnel up?".
+    tunnel_json=$(curl -s -m 3 http://localhost:4040/api/tunnels 2>/dev/null)
+    if [ -n "$tunnel_json" ]; then
+        # Match if any tunnel's public_url equals $NGROK_URL (with or without
+        # trailing slash).
+        match=$(printf '%s' "$tunnel_json" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+want = '$NGROK_URL'.rstrip('/')
+for t in d.get('tunnels', []):
+    if t.get('public_url', '').rstrip('/') == want:
+        conns = t.get('metrics', {}).get('conns', {}).get('count', 0)
+        print(f\"ok conns={conns} addr={t.get('config',{}).get('addr','?')}\")
+        break
+" 2>/dev/null)
+        if [ -n "$match" ]; then
+            pass "ngrok tunnel" "$NGROK_URL → local agent reports $match"
+        else
+            warn "ngrok tunnel" "local agent up but no tunnel matches $NGROK_URL"
+        fi
     else
-        warn "ngrok tunnel" "$NGROK_URL → HTTP $code"
+        warn "ngrok tunnel" "local ngrok API at :4040 unreachable (agent down?)"
     fi
 else
     [ $QUIET -eq 0 ] && echo "  (skip) ngrok: no TWILIO_WEBHOOK_URL configured"

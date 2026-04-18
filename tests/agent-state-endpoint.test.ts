@@ -66,14 +66,47 @@ describe('/sse-status + /mute-state — agent state plumbing (PR #418)', () => {
 		assert.equal(typeof body.clients, 'number');
 	});
 
-	it('accepts all 4 valid agent states', async () => {
-		for (const state of ['idle', 'listening', 'speaking', 'working']) {
+	it('accepts all 5 valid agent states via the correct track', async () => {
+		// Browser track (no source=tool): idle / listening / speaking only.
+		for (const state of ['idle', 'listening', 'speaking']) {
 			const body = await fetchJson(`/mute-state?state=${state}`);
 			assert.equal(body.state, state, `POST state=${state} should echo back`);
-			// Verify persistence: /sse-status returns the same.
 			const status = await fetchJson('/sse-status');
 			assert.equal(status.state, state, `/sse-status should reflect ${state}`);
 		}
+		// Tool track (source=tool): working / seeing.
+		for (const state of ['working', 'seeing']) {
+			const body = await fetchJson(`/mute-state?state=${state}&source=tool`);
+			assert.equal(body.state, state, `POST state=${state}&source=tool should echo back`);
+			const status = await fetchJson('/sse-status');
+			assert.equal(status.state, state, `/sse-status should reflect ${state}`);
+			// Clear tool track before next iteration so seeing's TTL
+			// auto-revert doesn't race with the working assertion above.
+			await fetchJson('/mute-state?state=idle&source=tool');
+		}
+	});
+
+	it('clamps browser-sourced working/seeing to listening (tool track only)', async () => {
+		// Prime browser track to a known value, and make sure tool track is idle
+		await fetchJson('/mute-state?state=idle&source=tool');
+		await fetchJson('/mute-state?state=listening');
+		// Browser mis-posts working (without source=tool) — should clamp to listening
+		const body = await fetchJson('/mute-state?state=working');
+		assert.equal(body.state, 'listening', 'browser-sourced working must clamp to listening');
+		// Same for seeing
+		const body2 = await fetchJson('/mute-state?state=seeing');
+		assert.equal(body2.state, 'listening', 'browser-sourced seeing must clamp to listening');
+	});
+
+	it('tool track takes precedence over browser track', async () => {
+		await fetchJson('/mute-state?state=listening');
+		await fetchJson('/mute-state?state=working&source=tool');
+		const body = await fetchJson('/mute-state?state=listening'); // browser keeps pinging
+		assert.equal(body.state, 'working', 'tool track must not be overwritten by browser');
+		// Release tool track → falls through to browser track
+		await fetchJson('/mute-state?state=idle&source=tool');
+		const body2 = await fetchJson('/sse-status');
+		assert.equal(body2.state, 'listening', 'clearing tool track reveals browser track');
 	});
 
 	it('rejects invalid agent state (keeps previous value)', async () => {
@@ -87,7 +120,7 @@ describe('/sse-status + /mute-state — agent state plumbing (PR #418)', () => {
 	});
 
 	it('mute/voice params continue working independently of state', async () => {
-		const body = await fetchJson('/mute-state?muted=true&voice=true&state=working');
+		const body = await fetchJson('/mute-state?muted=true&voice=true&state=working&source=tool');
 		assert.equal(body.muted, true);
 		assert.equal(body.voiceConnected, true);
 		assert.equal(body.state, 'working');

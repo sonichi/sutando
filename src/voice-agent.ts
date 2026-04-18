@@ -448,6 +448,15 @@ const mainAgent: MainAgent = {
 		'- When relaying task results, be concrete: "I drafted the email and it\'s ready to review."',
 		'- If the task agent asks a follow-up, relay it naturally.',
 		'',
+		'VISUAL STATES (for answering "what state are you in" / "what\'s that pulse mean"):',
+		'You have 5 semantic states that paint both the web UI avatar and the macOS menu bar:',
+		'- idle — voice disconnected. Menu bar solid, avatar still.',
+		'- listening — voice connected, mic live, not speaking. Gentle slow pulse (0.30s tick, 45% dip) in menu bar; no avatar glow in browser.',
+		'- speaking — you are producing audio. Rapid subtle pulse (0.15s tick, 70% dip) in menu bar; green avatar border in browser.',
+		'- working — a tool is in flight (set on onToolCall, cleared on onToolResult). Slow deep swing (0.50s tick, 25% dip) in menu bar; blue glow around avatar in browser.',
+		'- seeing — reading the user\'s screen or a camera frame. Very fast scan (0.10s tick, 55% dip) in menu bar for ~1.5s; amber eye-scan effect on browser avatar.',
+		'Hovering the menu bar icon shows the current state name as a tooltip. If the user asks what state you\'re in, answer from the above — don\'t guess or delegate.',
+		'',
 		'IMPORTANT:',
 		'- For high-stakes or irreversible actions (sending email, payments, deleting files),',
 		'  confirm with the user before executing unless they have given standing approval.',
@@ -604,6 +613,12 @@ async function main() {
 				voiceToolIdMap.set(e.toolCallId, e.toolName);
 				voiceEvents.push({ event: `tool_call:${e.toolName}`, timestamp: new Date().toISOString() });
 				console.log(`${ts()} [Tool] ${e.toolName} (${e.execution})`);
+				// Flag the web-client that a tool is in flight so the avatar
+				// can show the blue `.working` pulse and the menu bar can
+				// switch to the slow-deep-swing signature. `source=tool` pins
+				// this to the tool track so the browser's 1s poll can't
+				// overwrite it back to listening.
+				fetch(`http://localhost:8080/mute-state?state=working&source=tool&label=${encodeURIComponent(e.toolName)}`).catch(() => {});
 				// Auto-switch meeting mode on join/dismiss
 				if (['summon', 'join_zoom', 'join_gmeet'].includes(e.toolName)) {
 					meetingActive = true;
@@ -618,6 +633,8 @@ async function main() {
 				voiceToolCalls.push({ name: toolName, durationMs: e.durationMs, timestamp: new Date().toISOString() });
 				voiceEvents.push({ event: `tool_result:${toolName}:${e.durationMs}ms`, timestamp: new Date().toISOString() });
 				console.log(`${ts()} [Tool] result: ${toolName} (${e.status}, ${e.durationMs}ms)`);
+				// Clear the tool track; browser track takes over immediately.
+				fetch('http://localhost:8080/mute-state?state=idle&source=tool').catch(() => {});
 			},
 			onSubagentStep: (e) => console.log(`${ts()} [Subagent] ${e.subagentName} #${e.stepNumber} [${e.toolCalls.join(',')}]`),
 			onError: (e) => {

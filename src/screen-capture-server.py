@@ -13,6 +13,7 @@ import json
 import os
 import threading
 import urllib.request
+import os as _os
 from datetime import datetime
 
 PORT = 7845
@@ -20,7 +21,15 @@ DIR = "/tmp/sutando-screenshots"
 # Web-client endpoint for agent-state reporting. When a /capture happens we
 # flash state=seeing on the menu-bar avatar for ~1.5s — makes screen-capture
 # visible to the user without them needing to watch the web UI.
-WEB_CLIENT_STATE_URL = "http://localhost:8080/mute-state?state=seeing&ttl_ms=1500"
+WEB_CLIENT_STATE_URL = "http://localhost:8080/mute-state?state=seeing&ttl_ms=1500&source=tool"
+
+# macOS notification toggle. Default on; opt out during demo recordings.
+NOTIFY_ENABLED = _os.environ.get("SUTANDO_CAPTURE_NOTIFY", "1") != "0"
+
+# Debounce: don't spam notifications for burst captures (e.g. a loop of
+# describe_screen calls every 5s). One notification per this many seconds.
+NOTIFY_DEBOUNCE_S = 5.0
+_last_notify_ts = 0.0
 
 
 def _signal_seeing_blocking():
@@ -40,6 +49,36 @@ def _signal_seeing():
     web-client is slow (flagged in #428 cold-review)."""
     threading.Thread(target=_signal_seeing_blocking, daemon=True).start()
 
+
+def _notify_capture_blocking():
+    """Fire a macOS notification that Sutando captured the screen. Chi's ask
+    per 2026-04-18 Discord: "shall we use a notification when taking
+    screenshots?". Uses osascript (no additional deps). Debounced to
+    avoid notification-center spam during describe_screen loops."""
+    try:
+        import subprocess as _sp
+        _sp.run(
+            ["osascript", "-e",
+             'display notification "Captured screen" with title "Sutando"'],
+            timeout=1.0,
+            capture_output=True,
+        )
+    except Exception:
+        pass  # Best-effort; notification absence is never critical.
+
+
+def _notify_capture():
+    """Debounced fire-and-forget macOS notification."""
+    global _last_notify_ts
+    if not NOTIFY_ENABLED:
+        return
+    import time as _time
+    now = _time.time()
+    if now - _last_notify_ts < NOTIFY_DEBOUNCE_S:
+        return
+    _last_notify_ts = now
+    threading.Thread(target=_notify_capture_blocking, daemon=True).start()
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
 
@@ -48,6 +87,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Flash agent-state=seeing on the menu-bar avatar for ~1.5s.
             # Non-blocking fire-and-forget; capture succeeds regardless.
             _signal_seeing()
+            # macOS notification "Sutando captured screen" — opt-out via
+            # SUTANDO_CAPTURE_NOTIFY=0. Debounced at 5s to avoid spam
+            # during burst captures.
+            _notify_capture()
             os.makedirs(DIR, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d-%H%M%S")
             # Parse display number from query: /capture?display=2 or /capture?all=true

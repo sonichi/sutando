@@ -9,7 +9,7 @@
  */
 
 import { createServer } from 'node:http';
-import { writeFileSync } from 'node:fs';
+import { writeFileSync, readFileSync, existsSync } from 'node:fs';
 
 const HTTP_PORT = Number(process.env.CLIENT_PORT) || 8080;
 const HTTP_HOST = process.env.CLIENT_HOST || '0.0.0.0'; // '0.0.0.0' binds to all interfaces for EC2
@@ -56,10 +56,20 @@ const HTML = /* html */ `<!DOCTYPE html>
     box-shadow: 0 0 10px rgba(96,165,250,0.4);
     animation: avatar-work 2s linear infinite;
   }
+  .header .avatar.seeing:not(.speaking) {
+    border-color: #fbbf24;
+    box-shadow: 0 0 12px rgba(251,191,36,0.55);
+    animation: avatar-see 1.2s ease-in-out infinite;
+  }
   @keyframes avatar-work {
     0% { box-shadow: 0 0 8px rgba(96,165,250,0.3), 0 0 0 2px rgba(96,165,250,0.1); }
     50% { box-shadow: 0 0 16px rgba(96,165,250,0.5), 0 0 0 4px rgba(96,165,250,0.2); }
     100% { box-shadow: 0 0 8px rgba(96,165,250,0.3), 0 0 0 2px rgba(96,165,250,0.1); }
+  }
+  @keyframes avatar-see {
+    0% { box-shadow: 0 0 10px rgba(251,191,36,0.45), inset 0 0 0 0 rgba(251,191,36,0.0); }
+    50% { box-shadow: 0 0 20px rgba(251,191,36,0.8), inset 0 0 14px 2px rgba(251,191,36,0.35); }
+    100% { box-shadow: 0 0 10px rgba(251,191,36,0.45), inset 0 0 0 0 rgba(251,191,36,0.0); }
   }
   .header .info { flex: 1; }
   .header h1 { color: #fff; font-size: 1.1em; font-weight: 500; }
@@ -270,6 +280,11 @@ const HTML = /* html */ `<!DOCTYPE html>
     box-shadow: 0 0 14px rgba(96,165,250,0.4);
     animation: avatar-work 2s linear infinite;
   }
+  .hero .avatar-hero.seeing:not(.speaking) {
+    border-color: #fbbf24;
+    box-shadow: 0 0 16px rgba(251,191,36,0.55);
+    animation: avatar-see 1.2s ease-in-out infinite;
+  }
   .hero h2 { color: #fff; font-size: 1.3em; font-weight: 500; margin-bottom: 4px; transition: all 0.6s ease; }
   .hero .tagline { color: #555; font-size: 13px; margin-bottom: 24px; transition: all 0.6s ease; }
   @keyframes avatar-glow {
@@ -448,6 +463,22 @@ function initRemoteToggle() {
   _sseSource = new EventSource('/sse');
   _sseSource.addEventListener('toggle-voice', () => toggle());
   _sseSource.addEventListener('toggle-mute', () => toggleMute());
+  // Server-pushed agent state (working/seeing). Browser's own reportAgentState
+  // poll derives listening/speaking from audio RMS, but working and seeing
+  // originate from server-side tool calls (capture_screen, any inline tool
+  // run) — without this bridge, the CSS never fires during voice because
+  // the DOM doesn't know the server is in that state.
+  _sseSource.addEventListener('agent-state', (e) => {
+    try {
+      var st = String(e.data || '').trim();
+      var av = document.getElementById('stand-avatar');
+      var hav = document.getElementById('hero-avatar');
+      var setWorking = st === 'working';
+      var setSeeing = st === 'seeing';
+      if (av) { av.classList.toggle('working', setWorking); av.classList.toggle('seeing', setSeeing); }
+      if (hav) { hav.classList.toggle('working', setWorking); hav.classList.toggle('seeing', setSeeing); }
+    } catch {}
+  });
   _sseSource.onerror = () => setTimeout(() => initRemoteToggle(), 5000);
 }
 initRemoteToggle();
@@ -1769,13 +1800,18 @@ function showNoteContent(slug) {
     var inlineCodeRe = new RegExp(String.fromCharCode(96) + '([^' + String.fromCharCode(96) + ']+)' + String.fromCharCode(96), 'g');
     text = text.replace(inlineCodeRe, '<code style="background:#1a1a2e;padding:1px 4px;border-radius:2px">$1</code>');
     // Images before links: ![alt](url) — else the link regex below eats the alt-text form.
-    text = text.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img src="$2" alt="$1" style="max-width:100%;border-radius:4px;margin:8px 0">');
-    text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" style="color:#7c83ff">$1</a>');
+    // Two layers of backslash-eating: the outer TS template literal halves
+    // them once, then the inner JS string literal halves again. Need FOUR
+    // backslashes in source to get one literal backslash in the regex.
+    // See feedback_inline_js_escaping.md — PR #434 regression, hit Chi
+    // three times today including once blocking his voice connection.
+    text = text.replace(new RegExp('!\\\\[([^\\\\]]*)\\\\]\\\\(([^)]+)\\\\)', 'g'), '<img src="$2" alt="$1" style="max-width:100%;border-radius:4px;margin:8px 0">');
+    text = text.replace(new RegExp('\\\\[([^\\\\]]+)\\\\]\\\\(([^)]+)\\\\)', 'g'), '<a href="$2" target="_blank" style="color:#7c83ff">$1</a>');
     // Bold before italic: the bold regex eats two asterisks so the italic one sees none.
-    text = text.replace(/[*][*](.+?)[*][*]/g, '<strong>$1</strong>');
-    text = text.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
-    text = text.replace(/^> ?(.+)$/gm, '<blockquote style="border-left:3px solid #7c83ff;padding-left:10px;color:#a0a0b0;margin:8px 0;font-style:italic">$1</blockquote>');
-    text = text.replace(/^---+$/gm, '<hr style="border:none;border-top:1px solid #2a2a3e;margin:12px 0">');
+    text = text.replace(new RegExp('[*][*](.+?)[*][*]', 'g'), '<strong>$1</strong>');
+    text = text.replace(new RegExp('(^|[^*])\\\\*([^*\\\\n]+)\\\\*', 'g'), '$1<em>$2</em>');
+    text = text.replace(new RegExp('^> ?(.+)$', 'gm'), '<blockquote style="border-left:3px solid #7c83ff;padding-left:10px;color:#a0a0b0;margin:8px 0;font-style:italic">$1</blockquote>');
+    text = text.replace(new RegExp('^---+$', 'gm'), '<hr style="border:none;border-top:1px solid #2a2a3e;margin:12px 0">');
     text = text.replace(/^- (.+)$/gm, '<li>$1</li>');
     text = text.replace(new RegExp('\\n\\n', 'g'), '<br><br>');
     container.innerHTML = '<span class="suggestion" onclick="renderTabContent()" style="font-size:11px;cursor:pointer;margin-bottom:8px;display:inline-block">&larr; Back</span>' +
@@ -1920,18 +1956,71 @@ const sseClients: import('node:http').ServerResponse[] = [];
 // Server-side state tracking for menu bar indicator
 let _muteState = false;
 let _voiceState = false;
-// Semantic agent state reported by the browser. The menu bar consumes this
-// to decide when to animate (any non-'idle' value). Derivation happens in
-// the browser where the signals live (audio RMS, core-status, mute, voice);
-// the server just caches the last-reported value.
+// Semantic agent state. Two independent tracks:
+//   - _browserState: what the browser derives from local signals
+//     (connected+unmuted → listening, audio RMS → speaking, disconnected → idle).
+//     Refreshed ~1x/second by reportAgentState in the page.
+//   - _toolState: set by server-side tool code (voice-agent onToolCall →
+//     'working', screen-capture → 'seeing'). Only tool code writes this.
+// Effective state (returned by /sse-status + broadcast via SSE) is the
+// tool track when non-idle, else the browser track. This prevents the
+// browser's 1s poll from overwriting a tool-originated 'working' back
+// to 'listening' — the bug Chi hit after the SSE bridge shipped.
 type AgentState = 'idle' | 'listening' | 'speaking' | 'working' | 'seeing';
-let _agentState: AgentState = 'idle';
+let _browserState: AgentState = 'idle';
+let _toolState: AgentState = 'idle';
+// Optional label for the tool track, e.g. the specific tool name
+// ('describe_screen') or core-status step. Surfaced by /sse-status so
+// the menu-bar tooltip can say "running describe_screen" instead of
+// the generic "running a tool".
+let _toolLabel: string = '';
+// Saves the tool-track state at the moment seeing is set, so after the
+// seeing TTL expires we revert to whatever tool was running BEFORE the
+// capture — most commonly 'working'. Previously seeing → idle, which
+// killed the working pulse mid-tool and made Chi think seeing "happened
+// long after" (in fact, the next working state was the next tool call,
+// which registers as a new pulse well after seeing cleared the first).
+let _preSeeingToolState: AgentState = 'idle';
 // Timestamp of the last transition INTO 'seeing'. Screen capture is transient
-// (sub-second), so we want the 'seeing' state to flash briefly then auto-revert
-// to whatever the prior state was. Without auto-revert, a single /capture call
-// pins state=seeing forever if nothing else POSTs.
+// (sub-second), so we want the 'seeing' state to flash briefly then auto-
+// revert. Without auto-revert, a single /capture call pins state=seeing
+// forever if nothing else POSTs.
 let _seeingUntil = 0;
-let _preSeeingState: AgentState = 'idle';
+
+// Read `core-status.json` (written by the proactive loop + Claude Code passes)
+// to surface core work as a `working` state when no other track is active.
+// Without this, the menu bar stays solid while Claude Code is processing a
+// Discord/voice task even though the user would want to see that signal.
+// Lightweight: just a file read (one syscall) per /sse-status poll every 3s.
+// Read core-status.json and return { running, step }. step (if present)
+// becomes the tooltip label when no tool label is set.
+function readCoreStatus(): { running: boolean; step: string } {
+	try {
+		const raw = readFileSync(new URL('../core-status.json', import.meta.url), 'utf-8');
+		const s = JSON.parse(raw) as { status?: string; ts?: number; step?: string };
+		if (s.status !== 'running') return { running: false, step: '' };
+		if (typeof s.ts === 'number' && Date.now() / 1000 - s.ts > 600) return { running: false, step: '' };
+		return { running: true, step: typeof s.step === 'string' ? s.step : '' };
+	} catch {
+		return { running: false, step: '' };
+	}
+}
+function coreIsRunning(): boolean { return readCoreStatus().running; }
+
+function effectiveAgentState(): AgentState {
+	if (_toolState === 'seeing' && Date.now() > _seeingUntil) {
+		// Revert to pre-seeing tool state (usually 'working' if a tool was
+		// running when the capture fired). Falling straight to 'idle' here
+		// would kill the working pulse mid-tool.
+		_toolState = _preSeeingToolState;
+		_preSeeingToolState = 'idle';
+	}
+	if (_toolState !== 'idle') return _toolState;
+	if (_browserState !== 'idle') return _browserState;
+	// No explicit state — fall through to core-status. If the proactive loop
+	// or any Claude Code pass is active, surface that as `working`.
+	return coreIsRunning() ? 'working' : 'idle';
+}
 
 // Heartbeat: ping every 30s, remove clients that fail to write (stale connections)
 setInterval(() => {
@@ -1955,6 +2044,15 @@ const server = createServer((req, res) => {
 			'Access-Control-Allow-Origin': '*',
 		});
 		res.write(':\n\n'); // heartbeat
+		// Send current agent state immediately so freshly-connected clients
+		// don't display stale DOM classes from the previous session.
+		// Before this, a browser that reconnected SSE after a server
+		// restart kept whatever .working/.seeing class it had when the
+		// previous connection dropped — producing the "web UI shows working
+		// but menu bar shows listening" inconsistency Chi hit today.
+		try {
+			res.write(`event: agent-state\ndata: ${effectiveAgentState()}\n\n`);
+		} catch {}
 		sseClients.push(res);
 		req.on('close', () => {
 			const idx = sseClients.indexOf(res);
@@ -1965,44 +2063,92 @@ const server = createServer((req, res) => {
 
 	// SSE client count + mute/voice/agent state (safe for diagnostics + menu bar indicator)
 	if (url.pathname === '/sse-status') {
-		// Auto-revert from 'seeing' to the prior state if the flash window expired.
-		// Screen capture + take_screenshot calls are transient; without this,
-		// a single /capture call would pin state=seeing until the next browser POST.
-		if (_agentState === 'seeing' && Date.now() > _seeingUntil) {
-			_agentState = _preSeeingState;
+		const eff = effectiveAgentState();
+		// Derive label: tool-track → _toolLabel; core-fallback → step from
+		// core-status.json. Empty otherwise. Swift menu-bar tooltip uses
+		// this for precision (e.g. "running describe_screen" vs generic
+		// "running a tool"). Per Chi's ask 2026-04-18: "running a tool is
+		// not precise."
+		let label = '';
+		if (_toolState !== 'idle') {
+			label = _toolLabel;
+		} else if (_browserState === 'idle' && eff === 'working') {
+			label = readCoreStatus().step;
 		}
 		res.writeHead(200, { 'Content-Type': 'application/json' });
 		res.end(JSON.stringify({
 			clients: sseClients.length,
 			muted: _muteState,
 			voiceConnected: _voiceState,
-			state: _agentState,
+			state: eff,
+			label,
 		}));
 		return;
 	}
 
-	// Mute + voice + agent state report from browser client
+	// Mute + voice + agent state report. `source=tool` writes the tool
+	// track (working/seeing) and takes precedence; everything else
+	// writes the browser track (idle/listening/speaking).
 	if (url.pathname === '/mute-state') {
 		const mState = url.searchParams.get('muted');
 		const vState = url.searchParams.get('voice');
 		const aState = url.searchParams.get('state');
+		const source = url.searchParams.get('source'); // 'tool' | null (browser)
 		if (mState !== null) _muteState = mState === 'true';
 		if (vState !== null) _voiceState = vState === 'true';
 		if (aState === 'idle' || aState === 'listening' || aState === 'speaking' || aState === 'working' || aState === 'seeing') {
-			// Special handling for 'seeing': remember pre-seeing state so we can
-			// auto-revert. Default flash window is 1.5s unless caller specifies.
-			if (aState === 'seeing') {
-				if (_agentState !== 'seeing') {
-					_preSeeingState = _agentState;
+			const prevEffective = effectiveAgentState();
+			if (source === 'tool') {
+				const labelParam = url.searchParams.get('label');
+				if (aState === 'seeing') {
+					// Remember the tool state before overlaying seeing — most
+					// often 'working' when a describe_screen tool is in flight.
+					// Without this, the post-TTL revert would drop to idle
+					// mid-tool and kill the working pulse, which is what Chi
+					// hit ("fast blinking for seeing happened long after").
+					if (_toolState !== 'seeing') _preSeeingToolState = _toolState;
+					_toolState = 'seeing';
+					if (labelParam) _toolLabel = labelParam;
+					const ttlParam = url.searchParams.get('ttl_ms');
+					const ttl = ttlParam ? parseInt(ttlParam, 10) : 3000;
+					const ttlMs = isFinite(ttl) && ttl > 0 ? ttl : 3000;
+					_seeingUntil = Date.now() + ttlMs;
+					// Schedule an auto-revert broadcast so the browser clears
+					// .seeing even if nothing else POSTs a state update.
+					setTimeout(() => {
+						if (_toolState === 'seeing' && Date.now() >= _seeingUntil) {
+							_toolState = _preSeeingToolState;
+							_preSeeingToolState = 'idle';
+							const eff = effectiveAgentState();
+							for (const client of sseClients) {
+								try { client.write(`event: agent-state\ndata: ${eff}\n\n`); } catch {}
+							}
+						}
+					}, ttlMs + 50);
+				} else {
+					// working or clear. Reset the pre-seeing memory too so a
+					// future seeing knows its true predecessor, not the stale
+					// one from a previous tool sequence.
+					_toolState = aState === 'working' ? 'working' : 'idle';
+					_preSeeingToolState = 'idle';
+					if (aState === 'working' && labelParam) _toolLabel = labelParam;
+					else if (aState !== 'working') _toolLabel = '';
 				}
-				const ttlParam = url.searchParams.get('ttl_ms');
-				const ttl = ttlParam ? parseInt(ttlParam, 10) : 1500;
-				_seeingUntil = Date.now() + (isFinite(ttl) && ttl > 0 ? ttl : 1500);
+			} else {
+				// Browser can't legitimately know working/seeing — those
+				// originate server-side. Clamp to listening if mislabeled
+				// so a confused browser can't trample the tool track.
+				_browserState = (aState === 'working' || aState === 'seeing') ? 'listening' : aState;
 			}
-			_agentState = aState;
+			const nextEffective = effectiveAgentState();
+			if (prevEffective !== nextEffective) {
+				for (const client of sseClients) {
+					try { client.write(`event: agent-state\ndata: ${nextEffective}\n\n`); } catch {}
+				}
+			}
 		}
 		res.writeHead(200, { 'Content-Type': 'application/json' });
-		res.end(JSON.stringify({ muted: _muteState, voiceConnected: _voiceState, state: _agentState }));
+		res.end(JSON.stringify({ muted: _muteState, voiceConnected: _voiceState, state: effectiveAgentState() }));
 		return;
 	}
 
