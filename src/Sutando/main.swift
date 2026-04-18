@@ -166,6 +166,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let isVoiceConnected = json["voiceConnected"] as? Bool ?? false
             // `state` added by PR #418. Absent on pre-#418 servers → default 'idle'.
             let agentState = (json["state"] as? String) ?? "idle"
+            // `label` added 2026-04-18 per Chi's "running a tool is not precise":
+            // optional specific tool name or core-status step.
+            let label = (json["label"] as? String) ?? ""
             DispatchQueue.main.async {
                 guard let self = self, let button = self.statusItem.button else { return }
                 if isVoiceConnected && isMuted {
@@ -190,7 +193,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     } else {
                         button.title = "S"
                     }
-                    button.toolTip = self.tooltipFor(state: agentState, muted: isMuted, voiceConnected: isVoiceConnected)
+                    button.toolTip = self.tooltipFor(state: agentState, muted: isMuted, voiceConnected: isVoiceConnected, label: label)
                     // When voice is disconnected, only tool-track states
                     // (working / seeing) keep animating — those come from
                     // server-side tool code and mean the core loop or a
@@ -265,14 +268,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Human-readable tooltip for the menu bar icon. Shows the current
     /// semantic state on hover so the user can verify the visual without
     /// guessing which pulse they're seeing.
-    func tooltipFor(state: String, muted: Bool, voiceConnected: Bool) -> String {
+    func tooltipFor(state: String, muted: Bool, voiceConnected: Bool, label: String = "") -> String {
         // Tool-track states (working / seeing) describe real server-side
         // activity and apply whether voice is up or not. Showing "voice
         // disconnected" while the icon is pulsing working is misleading —
-        // the pulse and the tooltip must tell the same story.
+        // the pulse and the tooltip must tell the same story. When a
+        // specific label is provided (tool name or core-status step),
+        // it replaces the generic "a tool" text per Chi's "running a
+        // tool is not precise" ask.
+        let voiceSuffix = voiceConnected ? "" : " (voice off)"
         switch state {
-        case "working": return voiceConnected ? "Sutando — running a tool" : "Sutando — running a tool (voice off)"
-        case "seeing":  return voiceConnected ? "Sutando — reading your screen" : "Sutando — reading your screen (voice off)"
+        case "working":
+            let what = label.isEmpty ? "a tool" : label
+            return "Sutando — running \(what)\(voiceSuffix)"
+        case "seeing":
+            let what = label.isEmpty ? "your screen" : label
+            return "Sutando — reading \(what)\(voiceSuffix)"
         default: break
         }
         if !voiceConnected { return "Sutando — voice disconnected" }

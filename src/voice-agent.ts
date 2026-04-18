@@ -618,7 +618,7 @@ async function main() {
 				// switch to the slow-deep-swing signature. `source=tool` pins
 				// this to the tool track so the browser's 1s poll can't
 				// overwrite it back to listening.
-				fetch('http://localhost:8080/mute-state?state=working&source=tool').catch(() => {});
+				fetch(`http://localhost:8080/mute-state?state=working&source=tool&label=${encodeURIComponent(e.toolName)}`).catch(() => {});
 				// Auto-switch meeting mode on join/dismiss
 				if (['summon', 'join_zoom', 'join_gmeet'].includes(e.toolName)) {
 					meetingActive = true;

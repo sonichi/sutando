@@ -1964,6 +1964,11 @@ let _voiceState = false;
 type AgentState = 'idle' | 'listening' | 'speaking' | 'working' | 'seeing';
 let _browserState: AgentState = 'idle';
 let _toolState: AgentState = 'idle';
+// Optional label for the tool track, e.g. the specific tool name
+// ('describe_screen') or core-status step. Surfaced by /sse-status so
+// the menu-bar tooltip can say "running describe_screen" instead of
+// the generic "running a tool".
+let _toolLabel: string = '';
 // Saves the tool-track state at the moment seeing is set, so after the
 // seeing TTL expires we revert to whatever tool was running BEFORE the
 // capture — most commonly 'working'. Previously seeing → idle, which
@@ -1982,19 +1987,20 @@ let _seeingUntil = 0;
 // Without this, the menu bar stays solid while Claude Code is processing a
 // Discord/voice task even though the user would want to see that signal.
 // Lightweight: just a file read (one syscall) per /sse-status poll every 3s.
-function coreIsRunning(): boolean {
+// Read core-status.json and return { running, step }. step (if present)
+// becomes the tooltip label when no tool label is set.
+function readCoreStatus(): { running: boolean; step: string } {
 	try {
 		const raw = readFileSync(new URL('../core-status.json', import.meta.url), 'utf-8');
-		const s = JSON.parse(raw) as { status?: string; ts?: number };
-		if (s.status !== 'running') return false;
-		// Guard against stale "running" markers from a crashed pass — treat as
-		// running only if the timestamp is within the last 10 minutes.
-		if (typeof s.ts === 'number' && Date.now() / 1000 - s.ts > 600) return false;
-		return true;
+		const s = JSON.parse(raw) as { status?: string; ts?: number; step?: string };
+		if (s.status !== 'running') return { running: false, step: '' };
+		if (typeof s.ts === 'number' && Date.now() / 1000 - s.ts > 600) return { running: false, step: '' };
+		return { running: true, step: typeof s.step === 'string' ? s.step : '' };
 	} catch {
-		return false;
+		return { running: false, step: '' };
 	}
 }
+function coreIsRunning(): boolean { return readCoreStatus().running; }
 
 function effectiveAgentState(): AgentState {
 	if (_toolState === 'seeing' && Date.now() > _seeingUntil) {
@@ -2043,12 +2049,25 @@ const server = createServer((req, res) => {
 
 	// SSE client count + mute/voice/agent state (safe for diagnostics + menu bar indicator)
 	if (url.pathname === '/sse-status') {
+		const eff = effectiveAgentState();
+		// Derive label: tool-track → _toolLabel; core-fallback → step from
+		// core-status.json. Empty otherwise. Swift menu-bar tooltip uses
+		// this for precision (e.g. "running describe_screen" vs generic
+		// "running a tool"). Per Chi's ask 2026-04-18: "running a tool is
+		// not precise."
+		let label = '';
+		if (_toolState !== 'idle') {
+			label = _toolLabel;
+		} else if (_browserState === 'idle' && eff === 'working') {
+			label = readCoreStatus().step;
+		}
 		res.writeHead(200, { 'Content-Type': 'application/json' });
 		res.end(JSON.stringify({
 			clients: sseClients.length,
 			muted: _muteState,
 			voiceConnected: _voiceState,
-			state: effectiveAgentState(),
+			state: eff,
+			label,
 		}));
 		return;
 	}
@@ -2066,6 +2085,7 @@ const server = createServer((req, res) => {
 		if (aState === 'idle' || aState === 'listening' || aState === 'speaking' || aState === 'working' || aState === 'seeing') {
 			const prevEffective = effectiveAgentState();
 			if (source === 'tool') {
+				const labelParam = url.searchParams.get('label');
 				if (aState === 'seeing') {
 					// Remember the tool state before overlaying seeing — most
 					// often 'working' when a describe_screen tool is in flight.
@@ -2074,6 +2094,7 @@ const server = createServer((req, res) => {
 					// hit ("fast blinking for seeing happened long after").
 					if (_toolState !== 'seeing') _preSeeingToolState = _toolState;
 					_toolState = 'seeing';
+					if (labelParam) _toolLabel = labelParam;
 					const ttlParam = url.searchParams.get('ttl_ms');
 					const ttl = ttlParam ? parseInt(ttlParam, 10) : 3000;
 					const ttlMs = isFinite(ttl) && ttl > 0 ? ttl : 3000;
@@ -2096,6 +2117,8 @@ const server = createServer((req, res) => {
 					// one from a previous tool sequence.
 					_toolState = aState === 'working' ? 'working' : 'idle';
 					_preSeeingToolState = 'idle';
+					if (aState === 'working' && labelParam) _toolLabel = labelParam;
+					else if (aState !== 'working') _toolLabel = '';
 				}
 			} else {
 				// Browser can't legitimately know working/seeing — those
