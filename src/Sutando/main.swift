@@ -185,24 +185,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // get flooded if it's slow to restart.
         if Date().timeIntervalSince(lastWatcherAlert) < 120 { return }
         lastWatcherAlert = Date()
-        // Write a prompt to context-drop.txt — the proactive-loop reads that
-        // file at the top of every pass (Step 1) so this message reaches the
-        // Claude Code CLI as real input on the next pass. Claude can then
-        // restart the watcher via its own run_in_background Bash so the
-        // watcher's output routes back through the task-notification pipe
-        // (a detached nohup restart loses that routing).
-        let dropPath = workspace + "/context-drop.txt"
-        let timestamp = ISO8601DateFormatter().string(from: Date())
-        let message = """
-            timestamp: \(timestamp)
-            type: watcher-alert
-            ---
-            The task watcher (src/watch-tasks.sh) has been down for 2+ minutes. Restart it NOW via Bash `bash /Users/wangchi/Desktop/sutando/src/watch-tasks.sh` with run_in_background=true so its output routes back through the task-notification pipe.
-
-            """
-        try? message.write(toFile: dropPath, atomically: true, encoding: .utf8)
-        notify("Sutando", "Task watcher down — CLI alerted via context-drop")
-        logToFile("watcher dead; wrote context-drop alert")
+        // The app does NOT auto-start the watcher itself — a detached restart
+        // routes the watcher's stdout to /dev/null so Claude Code's
+        // task-notification pipe never sees it, making the watcher useless.
+        // The watcher MUST be started by the Claude Code CLI via its own
+        // run_in_background Bash. The app's role is to NOTIFY so Chi sees
+        // the watcher's death and can prompt the CLI to restart it (e.g. by
+        // typing "watcher" in the Claude Code prompt).
+        notify("Sutando", "Task watcher is down — prompt the CLI to restart it")
+        logToFile("watcher dead; notification fired (CLI must restart)")
     }
 
     func pollMuteState() {
