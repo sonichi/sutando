@@ -1768,7 +1768,14 @@ function showNoteContent(slug) {
     text = text.replace(codeBlockRe, '<pre style="background:#1a1a2e;padding:8px;border-radius:4px;font-size:12px;overflow-x:auto"><code>$1</code></pre>');
     var inlineCodeRe = new RegExp(String.fromCharCode(96) + '([^' + String.fromCharCode(96) + ']+)' + String.fromCharCode(96), 'g');
     text = text.replace(inlineCodeRe, '<code style="background:#1a1a2e;padding:1px 4px;border-radius:2px">$1</code>');
+    // Images before links: ![alt](url) — else the link regex below eats the alt-text form.
+    text = text.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img src="$2" alt="$1" style="max-width:100%;border-radius:4px;margin:8px 0">');
+    text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" style="color:#7c83ff">$1</a>');
+    // Bold before italic: the bold regex eats two asterisks so the italic one sees none.
     text = text.replace(/[*][*](.+?)[*][*]/g, '<strong>$1</strong>');
+    text = text.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+    text = text.replace(/^> ?(.+)$/gm, '<blockquote style="border-left:3px solid #7c83ff;padding-left:10px;color:#a0a0b0;margin:8px 0;font-style:italic">$1</blockquote>');
+    text = text.replace(/^---+$/gm, '<hr style="border:none;border-top:1px solid #2a2a3e;margin:12px 0">');
     text = text.replace(/^- (.+)$/gm, '<li>$1</li>');
     text = text.replace(new RegExp('\\n\\n', 'g'), '<br><br>');
     container.innerHTML = '<span class="suggestion" onclick="renderTabContent()" style="font-size:11px;cursor:pointer;margin-bottom:8px;display:inline-block">&larr; Back</span>' +
@@ -1917,8 +1924,14 @@ let _voiceState = false;
 // to decide when to animate (any non-'idle' value). Derivation happens in
 // the browser where the signals live (audio RMS, core-status, mute, voice);
 // the server just caches the last-reported value.
-type AgentState = 'idle' | 'listening' | 'speaking' | 'working';
+type AgentState = 'idle' | 'listening' | 'speaking' | 'working' | 'seeing';
 let _agentState: AgentState = 'idle';
+// Timestamp of the last transition INTO 'seeing'. Screen capture is transient
+// (sub-second), so we want the 'seeing' state to flash briefly then auto-revert
+// to whatever the prior state was. Without auto-revert, a single /capture call
+// pins state=seeing forever if nothing else POSTs.
+let _seeingUntil = 0;
+let _preSeeingState: AgentState = 'idle';
 
 // Heartbeat: ping every 30s, remove clients that fail to write (stale connections)
 setInterval(() => {
@@ -1952,6 +1965,12 @@ const server = createServer((req, res) => {
 
 	// SSE client count + mute/voice/agent state (safe for diagnostics + menu bar indicator)
 	if (url.pathname === '/sse-status') {
+		// Auto-revert from 'seeing' to the prior state if the flash window expired.
+		// Screen capture + take_screenshot calls are transient; without this,
+		// a single /capture call would pin state=seeing until the next browser POST.
+		if (_agentState === 'seeing' && Date.now() > _seeingUntil) {
+			_agentState = _preSeeingState;
+		}
 		res.writeHead(200, { 'Content-Type': 'application/json' });
 		res.end(JSON.stringify({
 			clients: sseClients.length,
@@ -1969,7 +1988,17 @@ const server = createServer((req, res) => {
 		const aState = url.searchParams.get('state');
 		if (mState !== null) _muteState = mState === 'true';
 		if (vState !== null) _voiceState = vState === 'true';
-		if (aState === 'idle' || aState === 'listening' || aState === 'speaking' || aState === 'working') {
+		if (aState === 'idle' || aState === 'listening' || aState === 'speaking' || aState === 'working' || aState === 'seeing') {
+			// Special handling for 'seeing': remember pre-seeing state so we can
+			// auto-revert. Default flash window is 1.5s unless caller specifies.
+			if (aState === 'seeing') {
+				if (_agentState !== 'seeing') {
+					_preSeeingState = _agentState;
+				}
+				const ttlParam = url.searchParams.get('ttl_ms');
+				const ttl = ttlParam ? parseInt(ttlParam, 10) : 1500;
+				_seeingUntil = Date.now() + (isFinite(ttl) && ttl > 0 ? ttl : 1500);
+			}
 			_agentState = aState;
 		}
 		res.writeHead(200, { 'Content-Type': 'application/json' });

@@ -42,6 +42,7 @@ core-status.json
 dynamic-content.json
 tests/*
 !tests/*.test.ts
+!tests/*.test.py
 skills/personal-*/
 tests/security/*.md
 !tests/security/*.md.example
