@@ -8,7 +8,7 @@ It shares your screen, joins your meetings, makes phone calls, and builds itself
 
 It belongs entirely to you.
 
-> **No *Claude Extra usage* required.** Sutando runs on your existing Claude Code subscription ($20, $100, or $200/month) — no separate Anthropic API key to top up, no surprise bills — unlike agents that route every action through pay-per-token APIs and hosted services.
+> **No *Claude Extra usage* required.** Sutando runs on your existing Claude Code subscription ($20, $100, or $200/month) with minimal extra costs — no separate Anthropic API key to top up, no surprise bills — unlike agents that route every action through pay-per-token APIs and hosted services.
 
 > *Named after [Stands](https://jojo.fandom.com/wiki/Stand) from JoJo's Bizarre Adventure — a personal spirit that fights on your behalf. Like a Stand, Sutando starts unnamed. As it learns your style and earns real capabilities, it names itself and generates its own avatar — your Stand, unique to you.*
 
