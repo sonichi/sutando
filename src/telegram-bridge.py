@@ -38,8 +38,32 @@ if not TOKEN:
 
 TASKS_DIR = REPO / "tasks"
 RESULTS_DIR = REPO / "results"
+ARCHIVE_TASKS_DIR = REPO / "tasks" / "archive"
+ARCHIVE_RESULTS_DIR = REPO / "results" / "archive"
 TASKS_DIR.mkdir(exist_ok=True)
 RESULTS_DIR.mkdir(exist_ok=True)
+
+
+def archive_file(src: "Path", kind: str, task_id: str) -> None:
+    """Move src into archive/<tasks|results>/YYYY-MM/ instead of deleting.
+    Silent on failure. Chi's ask 2026-04-18: archive tasks + results for
+    later pattern-mining / self-improvement analysis."""
+    try:
+        if not src.exists():
+            return
+        from datetime import datetime
+        import shutil
+        ym = datetime.now().strftime("%Y-%m")
+        base = ARCHIVE_TASKS_DIR if kind == "tasks" else ARCHIVE_RESULTS_DIR
+        dest_dir = base / ym
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dest_dir / f"{task_id}.txt"))
+    except Exception as e:
+        print(f"[Telegram] archive_file({kind}, {task_id}) failed: {e}")
+        try:
+            src.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 # Presenter mode: silence proactive DMs during ICLR/talk windows. Sentinel
 # is written by scripts/presenter-mode.sh with an ISO-8601 expiry. Matches
@@ -292,19 +316,19 @@ def main():
                 # task — same bug class as discord-bridge had.
                 if reply_text.startswith('[no-send]') or reply_text.startswith('[REPLIED]'):
                     print(f"  Skipped (already replied): {task_id}")
-                    result_file.unlink(missing_ok=True)
+                    archive_file(result_file, "results", task_id)
                     task_file = TASKS_DIR / f"{task_id}.txt"
-                    task_file.unlink(missing_ok=True)
+                    archive_file(task_file, "tasks", task_id)
                     continue
                 try:
                     send_reply(chat_id, reply_text)
                     print(f"  Replied to {chat_id}: {reply_text[:80]}...")
                 except Exception as e:
                     print(f"[Telegram] Reply error: {e}")
-                # Clean up
-                result_file.unlink(missing_ok=True)
+                # Archive (not delete) so we can mine patterns later.
+                archive_file(result_file, "results", task_id)
                 task_file = TASKS_DIR / f"{task_id}.txt"
-                task_file.unlink(missing_ok=True)
+                archive_file(task_file, "tasks", task_id)
 
         time.sleep(1)
 

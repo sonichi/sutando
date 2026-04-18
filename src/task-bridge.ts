@@ -8,7 +8,7 @@
  * injects the result into the Gemini conversation.
  */
 
-import { writeFileSync, readFileSync, existsSync, unlinkSync, mkdirSync, readdirSync, appendFileSync } from 'node:fs';
+import { writeFileSync, readFileSync, existsSync, unlinkSync, mkdirSync, readdirSync, appendFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
@@ -17,6 +17,22 @@ const REPO_DIR = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
 const TASK_DIR = join(REPO_DIR, 'tasks');
 const RESULT_DIR = join(REPO_DIR, 'results');
 const CONVERSATION_LOG = join(REPO_DIR, 'conversation.log');
+
+/** Archive a task/result file into archive/<kind>/YYYY-MM/ instead of
+ * deleting. Chi's 2026-04-18 ask: "instead of deleting we should archive
+ * the tasks. It can be useful for self-improving". Silent on failure;
+ * fall back to unlink so the system never leaves stale files behind. */
+function archiveFile(srcPath: string, kind: 'tasks' | 'results', taskId: string): void {
+	try {
+		if (!existsSync(srcPath)) return;
+		const ym = new Date().toISOString().slice(0, 7); // YYYY-MM
+		const destDir = join(REPO_DIR, kind, 'archive', ym);
+		mkdirSync(destDir, { recursive: true });
+		renameSync(srcPath, join(destDir, `${taskId}.txt`));
+	} catch (err) {
+		try { unlinkSync(srcPath); } catch { /* ignore */ }
+	}
+}
 
 // Ensure dirs exist
 mkdirSync(TASK_DIR, { recursive: true });
@@ -134,7 +150,7 @@ export const cancelTask: ToolDefinition = {
 			}
 			const mostRecent = files[files.length - 1];
 			const taskId = mostRecent.replace('.txt', '');
-			unlinkSync(join(TASK_DIR, mostRecent));
+			archiveFile(join(TASK_DIR, mostRecent), 'tasks', taskId);
 			_pendingTasks.delete(taskId);
 			console.log(`${ts()} [TaskBridge] Cancelled task ${taskId}`);
 			_sendTaskStatus?.(taskId, 'cancelled', 'Task cancelled by user');
@@ -343,7 +359,7 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 							body: JSON.stringify({ taskId, result }),
 						}).catch(() => {});
 					} catch {}
-					setTimeout(() => { try { unlinkSync(path); } catch {} }, 10_000);
+					setTimeout(() => { archiveFile(path, 'results', path.split('/').pop()!.replace('.txt', '')); }, 10_000);
 				}
 			}
 		} catch {
