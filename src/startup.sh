@@ -293,7 +293,13 @@ else
   # so the user sees the Claude Code prompt exactly as before.
   # Fall back to a bare `exec claude` if tmux is missing.
   if command -v tmux > /dev/null 2>&1; then
-    exec tmux new-session -A -s sutando-core \
+    # Explicit socket path so Sutando.app (which runs under a different
+    # TMPDIR due to macOS sandboxing when launched via `open`) can reach
+    # the same tmux server. Without -S, tmux defaults to
+    # $TMPDIR/tmux-$(id -u)/default — different path app-side vs
+    # shell-side → tmux has-session fails → watcher-auto-restart falls
+    # back to macOS notification instead of sending `watcher`.
+    exec tmux -S /tmp/sutando-tmux.sock new-session -A -s sutando-core \
       claude --name sutando-core --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
       -- "/proactive-loop"
   else

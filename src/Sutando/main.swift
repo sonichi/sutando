@@ -39,6 +39,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var animationTimer: Timer?
     var animationPhase: CGFloat = 1.0
 
+    /// Fixed tmux socket path for the sutando-core session. The shell
+    /// (via startup.sh -S flag) and the app (launched by macOS with a
+    /// different TMPDIR due to sandboxing) must target the same socket
+    /// to find the same server. Without this, tmux has-session fails
+    /// app-side even when the session is alive shell-side.
+    let sutandoTmuxSocket = "/tmp/sutando-tmux.sock"
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Request notification permission — only when running as .app bundle
         // (UNUserNotificationCenter crashes when run as raw binary)
@@ -232,9 +239,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return false
         }
         // Get the pane's PID (the interactive shell wrapping claude).
+        // -S sutandoTmuxSocket so we find the same tmux server startup.sh
+        // created (different TMPDIR between shell and sandboxed .app).
         let list = Process()
         list.executableURL = URL(fileURLWithPath: tmuxPath)
-        list.arguments = ["list-panes", "-t", "sutando-core", "-F", "#{pane_pid}"]
+        list.arguments = ["-S", sutandoTmuxSocket, "list-panes", "-t", "sutando-core", "-F", "#{pane_pid}"]
         let pipe = Pipe()
         list.standardOutput = pipe
         list.standardError = FileHandle.nullDevice
@@ -295,7 +304,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Check session exists: `tmux has-session -t <name>` exits 0 if alive.
         let has = Process()
         has.executableURL = URL(fileURLWithPath: tmuxPath)
-        has.arguments = ["has-session", "-t", session]
+        has.arguments = ["-S", sutandoTmuxSocket, "has-session", "-t", session]
         has.standardOutput = FileHandle.nullDevice
         has.standardError = FileHandle.nullDevice
         do { try has.run() } catch { return false }
@@ -305,7 +314,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Session exists — send keys + Enter.
         let send = Process()
         send.executableURL = URL(fileURLWithPath: tmuxPath)
-        send.arguments = ["send-keys", "-t", session, keys, "Enter"]
+        send.arguments = ["-S", sutandoTmuxSocket, "send-keys", "-t", session, keys, "Enter"]
         send.standardOutput = FileHandle.nullDevice
         send.standardError = FileHandle.nullDevice
         do { try send.run() } catch { return false }
