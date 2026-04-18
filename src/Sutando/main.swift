@@ -257,35 +257,60 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // pgrep descendants of the pane PID. Claude Code itself is a child
         // of the shell; its tool invocations are grandchildren. We want
         // any non-claude descendant — a running bash/tool/subprocess.
-        let tree = Process()
-        tree.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        // -P <pid> = direct children; we need the full tree, so two passes.
-        tree.arguments = ["-P", panePid]
-        let treePipe = Pipe()
-        tree.standardOutput = treePipe
-        tree.standardError = FileHandle.nullDevice
-        do { try tree.run() } catch { return false }
-        tree.waitUntilExit()
-        let children = String(data: treePipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+        // tmux launches the pane command directly — no intermediate shell.
+        // So `pane_pid` in a startup.sh-wrapped setup IS the claude process,
+        // and its DIRECT children are tool-call subprocesses + long-lived
+        // plugin helpers (sourcekit-lsp, caffeinate, bun, npm exec, etc.).
+        // The age filter distinguishes: a child with etime < 60s is a
+        // fresh tool call; older ones are background services that don't
+        // indicate active work.
+        let list2 = Process()
+        list2.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        list2.arguments = ["-P", panePid]
+        let listPipe = Pipe()
+        list2.standardOutput = listPipe
+        list2.standardError = FileHandle.nullDevice
+        do { try list2.run() } catch { return false }
+        list2.waitUntilExit()
+        let children = String(data: listPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
             .split(separator: "\n").map(String.init) ?? []
-        // Claude Code itself is always a child of the shell. We want to
-        // know if ANY grandchild exists (i.e. claude spawned a subprocess).
-        for child in children where !child.isEmpty {
-            let gc = Process()
-            gc.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-            gc.arguments = ["-P", child]
-            let gcPipe = Pipe()
-            gc.standardOutput = gcPipe
-            gc.standardError = FileHandle.nullDevice
-            do { try gc.run() } catch { continue }
-            gc.waitUntilExit()
-            let gcOut = String(data: gcPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if !gcOut.isEmpty {
-                return true  // claude has a live subprocess → working
+        for childPid in children where !childPid.isEmpty {
+            if processAgeSeconds(pid: childPid) < 60 {
+                return true  // fresh child under pane_pid → active tool call
             }
         }
         return false
+    }
+
+    /// Parse `ps -o etime= -p <pid>` → seconds. Returns Int.max on any
+    /// parse failure so old processes stay "old" and don't false-trigger
+    /// the cliIsWorking heuristic.
+    func processAgeSeconds(pid: String) -> Int {
+        let ps = Process()
+        ps.executableURL = URL(fileURLWithPath: "/bin/ps")
+        ps.arguments = ["-o", "etime=", "-p", pid]
+        let pipe = Pipe()
+        ps.standardOutput = pipe
+        ps.standardError = FileHandle.nullDevice
+        do { try ps.run() } catch { return Int.max }
+        ps.waitUntilExit()
+        if ps.terminationStatus != 0 { return Int.max }
+        // etime format: [DD-]HH:MM:SS | [HH:]MM:SS | MM:SS
+        var raw = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        raw = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if raw.isEmpty { return Int.max }
+        var days = 0
+        var rest = raw
+        if let dashIdx = rest.firstIndex(of: "-") {
+            days = Int(rest[..<dashIdx]) ?? 0
+            rest = String(rest[rest.index(after: dashIdx)...])
+        }
+        let parts = rest.split(separator: ":").compactMap { Int($0) }
+        switch parts.count {
+        case 2: return days * 86400 + parts[0] * 60 + parts[1]
+        case 3: return days * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+        default: return Int.max
+        }
     }
 
     /// Send keystrokes to a tmux pane. Returns true if the session exists
