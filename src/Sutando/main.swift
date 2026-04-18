@@ -187,28 +187,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                         button.title = "S"
                     }
                     button.toolTip = self.tooltipFor(state: agentState, muted: isMuted, voiceConnected: isVoiceConnected)
-                    // If voice is disconnected, don't animate — the agent
-                    // isn't doing anything actionable regardless of what
-                    // semantic state the server last cached. Prevents the
-                    // "disconnected but still blinking" bug Chi hit when
-                    // the server held a stale 'listening' state after
-                    // voice-agent restart but the browser didn't re-post
-                    // state=idle because the tab was backgrounded.
-                    if !isVoiceConnected {
-                        self.stopAnimation()
-                        self.currentAgentState = "idle"
-                        return
+                    // When voice is disconnected, only tool-track states
+                    // (working / seeing) keep animating — those come from
+                    // server-side tool code and mean the core loop or a
+                    // screen capture is genuinely doing something. Browser-
+                    // track states (listening / speaking) depend on a live
+                    // WebSocket and would otherwise animate on stale cached
+                    // state. Keeps "the agent is working" visible when
+                    // voice is off while fixing the "disconnected but
+                    // blinking on stale listening" bug.
+                    let effectiveState: String
+                    if !isVoiceConnected && (agentState == "listening" || agentState == "speaking") {
+                        effectiveState = "idle"
+                    } else {
+                        effectiveState = agentState
                     }
-                    // Drive animation from semantic state. Each non-idle state
-                    // gets a distinct pulse signature so the menu bar conveys
-                    // what the agent is doing without the user having to
-                    // switch tabs.
-                    if self.currentAgentState != agentState {
-                        self.currentAgentState = agentState
-                        if agentState == "idle" {
+                    if self.currentAgentState != effectiveState {
+                        self.currentAgentState = effectiveState
+                        if effectiveState == "idle" {
                             self.stopAnimation()
                         } else {
-                            self.startAnimation(for: agentState)
+                            self.startAnimation(for: effectiveState)
                         }
                     }
                 }
