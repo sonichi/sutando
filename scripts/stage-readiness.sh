@@ -99,11 +99,17 @@ else
 fi
 
 # 5) presenter-mode sentinel
+# Same fail-open bug class as the Python helpers in discord-bridge / telegram-bridge /
+# check-pending-questions (PR #432 fixup). String comparison treats "garbage" as
+# GREATER than any real ISO timestamp — without the digit-prefix guard, malformed
+# sentinel content would appear active forever.
 SENT="$REPO/state/presenter-mode.sentinel"
 if [ -f "$SENT" ]; then
     expire_iso=$(cat "$SENT")
     now_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    if [[ "$now_iso" < "$expire_iso" ]]; then
+    if [[ ! "$expire_iso" =~ ^[0-9] ]]; then
+        warn "presenter-mode" "sentinel content malformed — run 'bash scripts/presenter-mode.sh stop' to reset"
+    elif [[ "$now_iso" < "$expire_iso" ]]; then
         pass "presenter-mode" "ACTIVE until $expire_iso (notifications silenced)"
     else
         warn "presenter-mode" "sentinel expired — run 'bash scripts/presenter-mode.sh start' before talk"
