@@ -155,6 +155,43 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.pollMuteState()
         }
+
+        // Watcher health: every 30s, verify the task watcher is running.
+        // If it's dead AND there are pending tasks AND it's been >60s since
+        // we last intervened, restart it and fire a notification. Chi's ask
+        // 2026-04-18: "can the app remind the CLI about watcher" — this
+        // goes one better by auto-restarting so no reminder is needed.
+        Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { [weak self] _ in
+            self?.checkWatcher()
+        }
+    }
+
+    var lastWatcherRestart: Date = .distantPast
+    func checkWatcher() {
+        // pgrep -f watch-tasks
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        proc.arguments = ["-f", "watch-tasks"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+        do { try proc.run() } catch { return }
+        proc.waitUntilExit()
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        if !out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return  // watcher alive
+        }
+        // Throttle: don't restart more than once every 60s.
+        if Date().timeIntervalSince(lastWatcherRestart) < 60 { return }
+        lastWatcherRestart = Date()
+        // Restart in background
+        let script = "/bin/bash \(workspace)/src/watch-tasks.sh"
+        let restart = Process()
+        restart.executableURL = URL(fileURLWithPath: "/bin/bash")
+        restart.arguments = ["-c", "nohup \(script) > /dev/null 2>&1 &"]
+        try? restart.run()
+        notify("Sutando", "Task watcher was down — auto-restarted")
+        logToFile("watcher dead; auto-restarted")
     }
 
     func pollMuteState() {
