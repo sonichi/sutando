@@ -9,7 +9,8 @@
  */
 
 import { createServer } from 'node:http';
-import { writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { writeFileSync, readFileSync, existsSync, statSync } from 'node:fs';
+import { readTmuxStatus } from './tmux-status.js';
 
 const HTTP_PORT = Number(process.env.CLIENT_PORT) || 8080;
 const HTTP_HOST = process.env.CLIENT_HOST || '0.0.0.0'; // '0.0.0.0' binds to all interfaces for EC2
@@ -1992,17 +1993,35 @@ let _seeingUntil = 0;
 // Without this, the menu bar stays solid while Claude Code is processing a
 // Discord/voice task even though the user would want to see that signal.
 // Lightweight: just a file read (one syscall) per /sse-status poll every 3s.
-// Read core-status.json and return { running, step }. step (if present)
-// becomes the tooltip label when no tool label is set.
-function readCoreStatus(): { running: boolean; step: string } {
+// Read core-status.json and return { running, step, stale }.
+// - `running`: CLI is mid-pass (status == "running" and ts within grace).
+// - `step`: tooltip label when no tool label is set.
+// - `stale`: the file is unreliable — either older than 60s on disk, or
+//   status=="running" with ts older than 60s (a proactive-loop pass that
+//   crashed between step 0 write and idle write leaves a "running" sentinel
+//   that mtime moves but content lies). When stale, consumers should fall
+//   back to the tmux pane scrape for a fresh signal.
+const CORE_STATUS_STALE_SECONDS = 60;
+function readCoreStatus(): { running: boolean; step: string; stale: boolean } {
 	try {
-		const raw = readFileSync(new URL('../core-status.json', import.meta.url), 'utf-8');
+		const url = new URL('../core-status.json', import.meta.url);
+		const raw = readFileSync(url, 'utf-8');
 		const s = JSON.parse(raw) as { status?: string; ts?: number; step?: string };
-		if (s.status !== 'running') return { running: false, step: '' };
-		if (typeof s.ts === 'number' && Date.now() / 1000 - s.ts > 600) return { running: false, step: '' };
-		return { running: true, step: typeof s.step === 'string' ? s.step : '' };
+		const nowSec = Date.now() / 1000;
+		let stale = false;
+		try {
+			const mtimeSec = statSync(url).mtimeMs / 1000;
+			if (nowSec - mtimeSec > CORE_STATUS_STALE_SECONDS) stale = true;
+		} catch { stale = true; }
+		// "Running with old ts" → loop likely crashed mid-pass, treat as stale.
+		if (s.status === 'running' && typeof s.ts === 'number' && nowSec - s.ts > CORE_STATUS_STALE_SECONDS) {
+			stale = true;
+		}
+		if (s.status !== 'running') return { running: false, step: '', stale };
+		if (typeof s.ts === 'number' && nowSec - s.ts > 600) return { running: false, step: '', stale };
+		return { running: true, step: typeof s.step === 'string' ? s.step : '', stale };
 	} catch {
-		return { running: false, step: '' };
+		return { running: false, step: '', stale: true };
 	}
 }
 function coreIsRunning(): boolean { return readCoreStatus().running; }
@@ -2019,7 +2038,17 @@ function effectiveAgentState(): AgentState {
 	if (_browserState !== 'idle') return _browserState;
 	// No explicit state — fall through to core-status. If the proactive loop
 	// or any Claude Code pass is active, surface that as `working`.
-	return coreIsRunning() ? 'working' : 'idle';
+	const core = readCoreStatus();
+	if (core.running) return 'working';
+	// Core is idle OR the file is stale. If stale, ask the tmux scrape for a
+	// hint — useful when a pass crashed before writing idle, or when the CLI
+	// is actively doing something but forgot to write. Fresh-idle file wins
+	// over tmux to prevent the scrape from spuriously lighting up the pulse.
+	if (core.stale) {
+		const scrape = readTmuxStatus();
+		if (scrape.state === 'working') return 'working';
+	}
+	return 'idle';
 }
 
 // Heartbeat: ping every 30s, remove clients that fail to write (stale connections)
@@ -2073,7 +2102,14 @@ const server = createServer((req, res) => {
 		if (_toolState !== 'idle') {
 			label = _toolLabel;
 		} else if (_browserState === 'idle' && eff === 'working') {
-			label = readCoreStatus().step;
+			const core = readCoreStatus();
+			label = core.step;
+			// If core is stale and we're in fallback territory, prefer the
+			// tmux-scrape label (usually a tool name) over the stale step.
+			if (core.stale && !core.step) {
+				const scrape = readTmuxStatus();
+				if (scrape.state === 'working') label = scrape.label;
+			}
 		}
 		res.writeHead(200, { 'Content-Type': 'application/json' });
 		res.end(JSON.stringify({
