@@ -307,7 +307,7 @@ const HTML = /* html */ `<!DOCTYPE html>
   .task-status.working { background: #1e3a5f; color: #60a5fa; animation: pulse 1.5s infinite; }
   .task-status.done { background: #1e4028; color: #4ecca3; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
-  .task-text { color: #c0c0c8; flex: 1; word-break: break-word; font-size: 14px; line-height: 1.4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .task-text { color: #c0c0c8; flex: 1; word-break: break-word; font-size: 15px; line-height: 1.4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .task-text.expanded { white-space: normal; }
   .task-time { color: #666; font-size: 11px; flex-shrink: 0; }
   .task-expand {
@@ -876,12 +876,15 @@ function updateTask(taskId, status, text, result) {
   taskMap[taskId] = { status, text: text || existing.text, time: new Date(), result: result || existing.result || '' };
   // Auto-switch to tasks tab if new task arrives and user is on starter
   if (isNew && window._drActiveTab === 'starter') { switchDRTab('tasks'); }
-  // Auto-expand the latest completed task (collapse others if user had collapsed)
-  if (status === 'done' && !wasDone && (result || existing.result)) {
-    if (userCollapsed) expandedTasks.clear(); // keep old ones collapsed
+  // Auto-expand ONLY ongoing tasks (working/pending) so the user sees progress.
+  // Done tasks stay collapsed by default — user clicks the "Show details" chip.
+  // (Was: auto-expand every newly-done task, which filled the pane with walls of text.)
+  if (status === 'working' && !expandedTasks.has(taskId)) {
     expandedTasks.add(taskId);
-    userCollapsed = false;
-    setTimeout(() => { const el = document.getElementById('result-' + taskId); if (el) el.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }, 100);
+  }
+  // When a task transitions done, explicitly collapse it (done → fold).
+  if (status === 'done' && !wasDone) {
+    expandedTasks.delete(taskId);
   }
   renderTasks();
 }
@@ -930,7 +933,7 @@ function renderTasks() {
     const resultDisplay = isExpanded ? 'block' : 'none';
     const resultHtml = hasResult ? '<div id="result-' + id + '" style="display:' + resultDisplay + ';padding:8px 12px;color:#b8c8d8;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;background:#0d1520;border-radius:8px;margin:4px 0 6px 30px">' + t.result.replace(/</g,'&lt;') + '</div>' : '';
     const rawText = t.text || id;
-    const displayText = rawText.length > 100 && !isExpanded ? rawText.slice(0, 97) + '…' : rawText;
+    const displayText = rawText.length > 40 && !isExpanded ? rawText.slice(0, 37) + '…' : rawText;
     const textClass = isExpanded ? 'task-text expanded' : 'task-text';
     const expandChip = hasResult ? '<span class="task-expand">' + (isExpanded ? 'Hide ▾' : 'Show details ▸') + '</span>' : '';
     return '<div class="task-item"' + clickAttr + '>' +
@@ -978,11 +981,12 @@ function startTaskPolling() {
         if (t.status === 'done' && existing.status && existing.status !== 'done') {
           showToast('<span class="toast-label">Done</span> ' + (t.text || t.id).slice(0, 60));
         }
-        // Auto-expand latest completed task (collapse others if user had collapsed)
-        if (t.status === 'done' && existing.status !== 'done' && (t.result || existing.result)) {
-          if (userCollapsed) expandedTasks.clear();
+        // Auto-expand ONLY working tasks (progress visibility). Done = collapse.
+        if (t.status === 'working' && !expandedTasks.has(t.id)) {
           expandedTasks.add(t.id);
-          userCollapsed = false;
+        }
+        if (t.status === 'done' && existing.status !== 'done') {
+          expandedTasks.delete(t.id);
         }
         taskMap[t.id] = { status: t.status, text: t.text, time: new Date(t.time * 1000), result: t.result || existing.result || '' };
       }
