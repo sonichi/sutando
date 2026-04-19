@@ -110,7 +110,10 @@ if (CARTESIA_API_KEY) {
 // Uses GEMINI_VOICE_API_KEY because the only consumer of `google()` below is
 // the VoiceSession `model:` field — voice-session subagent text LLM calls.
 // Routes with the voice key so free-tier voice setups don't leak subagent
-// traffic onto the paid GEMINI_API_KEY.
+// traffic onto the paid GEMINI_API_KEY. Deliberate tradeoff: subagents lose
+// access to any paid-tier quota on GEMINI_API_KEY (rate-limited on free).
+// If subagent throughput becomes a concern, revisit by giving subagents
+// their own key or routing to `createGoogleGenerativeAI({apiKey:GEMINI_API_KEY})`.
 const google = createGoogleGenerativeAI({ apiKey: GEMINI_VOICE_API_KEY });
 let sessionRef: VoiceSession | null = null;
 
