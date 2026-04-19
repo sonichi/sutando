@@ -694,7 +694,9 @@ def run_all_checks() -> list[dict]:
         except:
             pids = []
         if pids:
-            checks.append({"name": "sutando-app", "status": "ok", "detail": f"running (⌃C/⌃V/⌃M)"})
+            check = {"name": "sutando-app", "status": "ok", "detail": f"running (⌃C/⌃V/⌃M)"}
+            mark_stale_if_outdated(check, REPO_DIR / "src" / "Sutando" / "main.swift", "src/Sutando/Sutando")
+            checks.append(check)
         else:
             checks.append({"name": "sutando-app", "status": "warn", "detail": "not running — hotkeys disabled"})
 
