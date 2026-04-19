@@ -117,7 +117,15 @@ export const workTool: ToolDefinition = {
 
 		const taskId = `task-${Date.now()}`;
 		const timestamp = new Date().toISOString();
-		const content = `id: ${taskId}\ntimestamp: ${timestamp}\ntask: ${task}\nreminder: Process ALL .txt files in tasks/ before restarting the watcher. Use: bash src/watch-tasks.sh (run_in_background: true)\n`;
+		const ownerId = process.env.SUTANDO_DM_OWNER_ID || 'voice-local';
+		const content =
+			`id: ${taskId}\n` +
+			`timestamp: ${timestamp}\n` +
+			`task: ${task}\n` +
+			`source: voice\n` +
+			`channel_id: local-voice\n` +
+			`user_id: ${ownerId}\n` +
+			`access_tier: owner\n`;
 		writeFileSync(join(TASK_DIR, `${taskId}.txt`), content);
 		_pendingTasks.set(taskId, Date.now());
 		console.log(`${ts()} [TaskBridge] Task ${taskId}: ${task.slice(0, 100)}`);
@@ -233,8 +241,17 @@ export function startContextDropWatcher(onContextDrop: (content: string) => void
 					// Always write a task for sutando-core (reliable path)
 					mkdirSync(TASK_DIR, { recursive: true });
 					const taskId = `task-${Date.now()}`;
-					writeFileSync(join(TASK_DIR, `${taskId}.txt`),
-						`id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ntask: User dropped context via hotkey. Process this:\n${content}\n`);
+					const ownerId = process.env.SUTANDO_DM_OWNER_ID || 'voice-local';
+					writeFileSync(
+						join(TASK_DIR, `${taskId}.txt`),
+						`id: ${taskId}\n` +
+						`timestamp: ${new Date().toISOString()}\n` +
+						`task: User dropped context via hotkey. Process this:\n${content}\n` +
+						`source: context-drop\n` +
+						`channel_id: local-hotkey\n` +
+						`user_id: ${ownerId}\n` +
+						`access_tier: owner\n`,
+					);
 					unlinkSync(CONTEXT_DROP_FILE);
 					// Also inject into Gemini if available
 					onContextDrop(content);
