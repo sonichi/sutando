@@ -327,9 +327,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(html.encode())
         elif urlparse(self.path).path == "/avatar":
-            avatar_file = REPO_DIR / "stand-avatar.png"
+            avatar_file = REPO_DIR / "assets" / "stand-avatar.png"
             if not avatar_file.exists():
-                avatar_file = REPO_DIR / "docs" / "stand-avatar.png"
+                avatar_file = REPO_DIR / "stand-avatar.png"  # legacy root fallback
             if avatar_file.exists():
                 self.send_response(200)
                 self.send_header("Content-Type", "image/png")

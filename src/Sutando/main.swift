@@ -117,7 +117,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem.button {
-            let avatarPath = workspace + "/docs/stand-avatar.png"
+            let avatarPath = workspace + "/assets/stand-avatar.png"
             if let image = NSImage(contentsOfFile: avatarPath) {
                 image.size = NSSize(width: 18, height: 18)
                 image.isTemplate = false
@@ -374,7 +374,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     self.currentAgentState = "idle"
                 } else {
                     // Default state (disconnected or unmuted): show avatar
-                    let avatarPath = self.workspace + "/docs/stand-avatar.png"
+                    let avatarPath = self.workspace + "/assets/stand-avatar.png"
                     if let image = NSImage(contentsOfFile: avatarPath) {
                         image.size = NSSize(width: 18, height: 18)
                         image.isTemplate = false

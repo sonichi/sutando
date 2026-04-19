@@ -296,7 +296,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 self.send_json(404, {"error": "task not found"})
         elif path == "/avatar":
-            avatar_file = REPO_DIR / "docs" / "stand-avatar.png"
+            avatar_file = REPO_DIR / "assets" / "stand-avatar.png"
             if avatar_file.exists():
                 self.send_response(200)
                 self.send_header("Content-Type", "image/png")
