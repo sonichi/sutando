@@ -2301,7 +2301,14 @@ const server = createServer((req, res) => {
 		let label = '';
 		if (_toolState !== 'idle') {
 			label = _toolLabel;
-		} else if (_browserState === 'idle' && eff === 'working') {
+		} else if (eff === 'working') {
+			// Core-agent working — surface the step label regardless of
+			// whether the user's mic is hot. Previously gated on
+			// `_browserState === 'idle'`, which meant the tooltip stayed
+			// generic ("running a tool") whenever the voice tab was open.
+			// After PR #465 flipped the precedence (core beats browser),
+			// this gate became stale — keep the label in sync with the
+			// state it describes.
 			const core = readCoreStatus();
 			label = core.step;
 			// If core is stale and we're in fallback territory, prefer the
