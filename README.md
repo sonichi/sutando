@@ -88,6 +88,7 @@ Voice agent and conversation server both write requests to `tasks/` when the use
 - Node.js 22+ (`brew install node`)
 - fswatch (`brew install fswatch`)
 - [Google AI Studio API key](https://ai.google.dev) (free — click "Get API key")
+- *(optional, for phone calls)* [Twilio account](https://www.twilio.com/) + [ngrok](https://ngrok.com/) — Sutando can answer inbound calls and make outbound calls, but you can run the browser + Telegram + Discord paths without them.
 
 ```bash
 # Clone
@@ -102,7 +103,7 @@ cp .env.example .env
 bash src/startup.sh
 ```
 
-This starts all services (voice agent, web client, dashboard, API, Sutando menu bar app) and opens http://localhost:8080 in your browser. The autonomous loop starts automatically — click **Connect** and start talking. Look for **S** in your menu bar — it provides shortcuts (⌃C context drop, ⌃V voice toggle, ⌃M mute) plus **Open Core** (Claude Code terminal) and **Open Dashboard** (status page).
+This starts all services (voice agent, phone conversation server, web client, dashboard, API, Sutando menu bar app) and opens http://localhost:8080 in your browser. The autonomous loop starts automatically — click **Connect** and start talking. Look for **S** in your menu bar — it provides shortcuts (⌃C context drop, ⌃V voice toggle, ⌃M mute) plus **Open Core** (Claude Code terminal) and **Open Dashboard** (status page).
 
 > **Note:** `startup.sh` runs Claude Code with `--dangerously-skip-permissions`, giving Sutando full system access (file operations, terminal commands, browser control). This is required for autonomous operation but means you should review what it does. All actions are logged. Keep the terminal window accessible — you may need to respond there when Claude Code runs out of quota or prompts for input (e.g., CLI commands, permission confirmations).
 
