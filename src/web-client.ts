@@ -296,9 +296,12 @@ const HTML = /* html */ `<!DOCTYPE html>
   #tasks:empty { display: none; }
   .task-item {
     display: flex; align-items: center; gap: 13px;
-    padding: 15px 0; border-bottom: 1px solid #141420;
+    padding: 15px 10px; margin: 0 -10px; border-bottom: 1px solid #141420;
+    transition: background 0.12s; border-radius: 6px;
   }
   .task-item:last-child { border-bottom: none; }
+  .task-item:hover { background: #1a1a2a; cursor: pointer; }
+  .note-item:hover { background: #1a1a2a; }
   .task-status {
     width: 22px; height: 22px; border-radius: 50%;
     display: flex; align-items: center; justify-content: center;
