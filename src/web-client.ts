@@ -1549,10 +1549,26 @@ function reportAgentState() {
       state = 'listening';
     }
   }
-  if (state === _lastReportedAgentState) return;
+  // Re-assert voice=true on every agent-state heartbeat while connected.
+  // The server's _voiceState is a module-level variable that resets to
+  // false on web-client restart; without this, a mid-session restart of
+  // com.sutando.web-client leaves /sse-status reporting voiceConnected=false
+  // until the user manually toggles voice or reloads the tab.
+  // Only send on transition to avoid spamming the server with identical
+  // state on every 1s tick.
+  var needsReassert = connected && !_lastAssertedVoiceTrue;
+  if (state === _lastReportedAgentState && !needsReassert) return;
   _lastReportedAgentState = state;
-  fetch('/mute-state?state=' + state).catch(function() {});
+  var params = 'state=' + state;
+  if (connected) {
+    params += '&voice=true';
+    _lastAssertedVoiceTrue = true;
+  } else {
+    _lastAssertedVoiceTrue = false;
+  }
+  fetch('/mute-state?' + params).catch(function() {});
 }
+var _lastAssertedVoiceTrue = false;
 setInterval(reportAgentState, 1000);
 
 // ─── UI toggle (user gesture context!) ────────────────────
