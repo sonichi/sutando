@@ -105,7 +105,14 @@ bash src/startup.sh
 
 This starts all services (voice agent, phone conversation server, web client, dashboard, API, Sutando menu bar app) and opens http://localhost:8080 in your browser. The autonomous loop starts automatically — click **Connect** and start talking. Look for **S** in your menu bar — it provides shortcuts (⌃C context drop, ⌃V voice toggle, ⌃M mute) plus **Open Core** (Claude Code terminal) and **Open Dashboard** (status page).
 
-> **Note:** `startup.sh` runs Claude Code with `--dangerously-skip-permissions`, giving Sutando full system access (file operations, terminal commands, browser control). This is required for autonomous operation but means you should review what it does. All actions are logged. Keep the terminal window accessible — you may need to respond there when Claude Code runs out of quota or prompts for input (e.g., CLI commands, permission confirmations).
+> **Why Sutando runs with elevated permissions.** Autonomous voice-driven work means `startup.sh` launches Claude Code with `--dangerously-skip-permissions` — the prompts that would otherwise fire on every tool call would break the voice-in / answer-out flow. In exchange:
+>
+> - **It's local.** Sutando runs entirely on your Mac. No remote control plane, no third party with write access.
+> - **You control the audience.** 3-tier access gating means owner / verified / unverified callers get different capability bands on phone, Discord, and Telegram. Set `VERIFIED_CALLERS` in `.env` before going live.
+> - **Actions are auditable.** Every Claude Code invocation lands in `build_log.md`, every task in `tasks/` + `results/`, every shell call in the service logs (`logs/*.log`). Use `tail -f build_log.md` while it works to watch in real time.
+> - **Hooks are your brake pedal.** `git-rules-guard.sh` (see `~/.claude/hooks`) pops a Discord approval DM for any public write (push / PR / issue comment) regardless of transport. Reject with 👎 to block.
+>
+> Keep the Claude Code terminal window reachable — quota-exhaustion or an unrecognized CLI prompt can leave the core agent waiting for you to respond.
 
 **Why macOS 15+?** The setup scripts assume the Sequoia System Settings layout for granting TCC permissions (Screen Recording, Accessibility, Input Monitoring). Earlier macOS versions may work for the headless parts (proactive loop, Discord/Telegram bridges) but aren't tested.
 
