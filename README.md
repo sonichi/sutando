@@ -64,15 +64,19 @@ We're looking for contributors to help test and harden these capabilities. If yo
      │                       (Gemini Live,        │    dtmf, ...)
      │                        WS on :3100)        │
      │                                            └──┐
-     │                                               │   file bridge
-     ├──telegram──────────► Telegram bridge ─────────┼── tasks/ ──► Core agent ↻
-     │                                               │                  │
-     └──discord───────────► Discord bridge ──────────┘                  ▼
-                                                              uses anything:
-                                                              email, calendar,
-                                                              browser, files,
-                                                              phone, reminders...
-                                    ◄── results/ ◄──
+     │                                               │   file bridge       .──────▶────────.
+     ├──telegram──────────► Telegram bridge ─────────┼── tasks/ ─────────► |               |
+     │                                               │                    |   Core        |
+     │                                               │                    |   agent ↻     |
+     └──discord───────────► Discord bridge ──────────┘                    |               |
+                                                                           `──────◀────────'
+                                                                                  │
+                                                                                  ▼
+                                                                          uses anything:
+                                                                          email, calendar,
+                                                                          browser, files,
+                                                                          phone, reminders...
+                                    ◄── results/ ◄────────────────────────────────┘
                                 (spoken via voice/phone,
                                  text via Telegram/Discord)
 
@@ -176,11 +180,27 @@ These unlock more capabilities. Add to `.env` when ready:
 | Integration | What it unlocks | Setup |
 |-------------|----------------|-------|
 | Gmail | Read/send/search email from voice | `gws auth setup --login` (OAuth, no app password) |
-| Twilio + ngrok | Phone calls, SMS, meeting dial-in, task delegation via phone | [twilio.com](https://www.twilio.com) (~$1/mo) + `brew install ngrok` |
+| Twilio + ngrok | Phone calls, SMS, meeting dial-in, task delegation via phone | [twilio.com](https://www.twilio.com) + `brew install ngrok` (see [Running costs](#running-costs)) |
 | Telegram | Message Sutando from your phone | [Create bot via @BotFather](https://t.me/BotFather), then `/telegram:configure <token>` |
 | Discord | Message Sutando from Discord (DM + channel @mentions) | [Developer portal](https://discord.com/developers), then `/discord:configure <token>` |
 | Claude for Chrome | Browser automation — navigate, read pages, fill forms, interact with web apps | [Install extension](https://claude.ai/chrome), log in with the same account as Claude Code |
 | Sutando app (menu bar) | Global shortcuts: ⌃C context drop, ⌃V voice toggle, ⌃M mute | Auto-launches via `startup.sh` |
+
+---
+
+## Running costs
+
+One table, organized by capability. The only required paid piece is your Claude Code subscription — everything else is optional and mostly free-tier-sufficient.
+
+| Capability | When you need it | Service required | Cost |
+|---|---|---|---|
+| **Basic** (core agent + screen / notes / calendar / email / reminders / contacts / browser / iMessage) | Always — this is Sutando's baseline | [Claude Code](https://www.anthropic.com/pricing) + [Gemini API key](https://ai.google.dev) + Google OAuth + macOS | Claude Code $20/mon (Pro), $100/mon (Max 5×), or $200/mon (Max 20×). Gemini + OAuth + macOS all free. |
+| **Voice agent** (real-time conversation in browser or on phone) | If you want to talk to Sutando | [Gemini voice API](https://ai.google.dev) (same key as Basic) | Free tier covers normal use (~15 req/min). Heavy use: [Gemini paid](https://ai.google.dev/pricing) ~$0.30–$1.30/hr. |
+| **Telegram / Discord / WhatsApp** (message Sutando from any of these) | If you want non-voice chat from your phone or desktop | [Telegram BotFather](https://t.me/BotFather), [Discord developer portal](https://discord.com/developers/applications), `wacli` (bundled) | All free for personal use. |
+| **Phone calls / summon (remote control)** | If you want Sutando to make inbound/outbound calls, or to share its computer screen via Zoom/Google Meet and be controlled by voice from your phone | [Twilio](https://www.twilio.com/pricing) phone number + [ngrok](https://ngrok.com/download) webhook | Twilio ~$1/mon number + ~$0.0085/min inbound + ~$0.015/min outbound + [Media Streams](https://www.twilio.com/en-us/pricing) ~$0.004/min. ngrok and Zoom free tiers both work for the summon flow. |
+| **Agent joining meetings via dial-in** (PSTN join into Zoom / Google Meet) | If you want the phone agent to dial into a meeting as a participant | [Zoom Pro](https://zoom.us/pricing) OR [Google Workspace Business](https://workspace.google.com/pricing.html) *on the host side* (the meeting organizer's account needs toll dial-in enabled) | Zoom Pro ~$15/mon, Google Workspace Business Starter ~$7/mon. Sutando's side is already covered by the Phone row above. |
+
+**Minimal-cost path** (what most users want): Claude Code subscription + free Gemini + free OAuth. Everything voice + browser + messaging works at $0 beyond the Claude Code sub. Phone and meeting dial-in are opt-in.
 
 ---
 
