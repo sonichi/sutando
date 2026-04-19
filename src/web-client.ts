@@ -307,12 +307,12 @@ const HTML = /* html */ `<!DOCTYPE html>
   .task-status.working { background: #1e3a5f; color: #60a5fa; animation: pulse 1.5s infinite; }
   .task-status.done { background: #1e4028; color: #4ecca3; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
-  .task-text { color: #c0c0c8; flex: 1; word-break: break-word; font-size: 15px; line-height: 1.4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .task-text { color: #c0c0c8; flex: 1; word-break: break-word; font-size: 16px; line-height: 1.4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .task-text.expanded { white-space: normal; }
-  .task-time { color: #666; font-size: 11px; flex-shrink: 0; }
+  .task-time { color: #666; font-size: 12px; flex-shrink: 0; }
   .task-expand {
-    flex-shrink: 0; padding: 2px 8px; border-radius: 10px;
-    background: #1a2030; color: #8ab4c8; font-size: 11px; cursor: pointer;
+    flex-shrink: 0; padding: 3px 9px; border-radius: 10px;
+    background: #1a2030; color: #8ab4c8; font-size: 12px; cursor: pointer;
     border: 1px solid #2a3344; user-select: none;
   }
   .task-expand:hover { background: #233045; color: #aac4d8; }
