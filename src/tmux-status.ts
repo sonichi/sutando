@@ -39,9 +39,11 @@ const RE_TOOL = /^\s*(?:⏺|●)\s*(\w+)\(/m;
 const RE_RUNNING_INLINE = /⎿\s+Running…/;
 // Background task indicator: tool launched with run_in_background.
 const RE_RUNNING_BG = /Running in the background/;
-// Thinking spinner: "(thought for Ns)" or "Cogitated for Ns". Verb rotates
-// ("Flummoxing", "Pondering", "Nebulizing", …) but the suffix is stable.
-const RE_THOUGHT = /\(thought for \d+s\)|Cogitated for [\dm\s]+s/;
+// Thinking spinner: "thought for Ns" (embedded in a richer parenthesized
+// block — e.g. "(16s · ↓ 111 tokens · thought for 5s)") or "Cogitated for
+// Ns" (separate format). Verb rotates ("Flummoxing", "Pondering",
+// "Nebulizing", …) but the suffix is stable.
+const RE_THOUGHT = /thought for \d+s|Cogitated for [\dm\s]+s/;
 // Empty prompt: `❯ ` alone on a line (typical idle end-of-pane).
 const RE_IDLE_PROMPT = /^❯\s*$/m;
 
