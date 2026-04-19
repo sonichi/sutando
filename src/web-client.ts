@@ -1978,7 +1978,10 @@ function renderTabContent() {
     window._drLocalContent = false;
 
   } else if (tab === 'tasks') {
-    // Render tasks directly from taskMap
+    // Render tasks using the shared .task-item classes + renderTasks()
+    // template (summarizeTaskText / userExpanded / hover / 18px). Previous
+    // inline-styled path was dead-code that bypassed all CSS work — see
+    // Maddy's 2026-04-19 16:07 ET root-cause writeup.
     var entries = Object.entries(taskMap);
     if (entries.length === 0) {
       container.innerHTML = '<div style="color:#666;font-size:12px;text-align:center;padding:12px">No recent tasks</div>';
@@ -1991,11 +1994,18 @@ function renderTabContent() {
         var timeStr = ago < 60 ? ago + 's ago' : Math.round(ago / 60) + 'm ago';
         var hasResult = t.result && t.status === 'done';
         var isExpanded = expandedTasks.has(id);
-        var resultHtml = hasResult ? '<div style="display:' + (isExpanded ? 'block' : 'none') + ';padding:6px 12px;color:#8ab4c8;font-size:11px;white-space:pre-wrap;word-break:break-word;overflow-wrap:break-word;background:#0d1520;border-radius:6px;margin:4px 0;max-width:100%;box-sizing:border-box">' + esc(t.result) + '</div>' : '';
-        return '<div style="padding:4px 0;border-bottom:1px solid #1a2a3a;cursor:' + (hasResult ? 'pointer' : 'default') + '" onclick="if(this.nextElementSibling)this.nextElementSibling.style.display=this.nextElementSibling.style.display===&quot;none&quot;?&quot;block&quot;:&quot;none&quot;">' +
-          '<span style="color:' + (t.status==='done' ? '#4ecca3' : t.status==='working' ? '#f0ad4e' : '#666') + ';font-size:12px">' + (icons[t.status] || '?') + '</span> ' +
-          '<span style="font-size:12px;color:#ccc">' + esc(t.text || id) + '</span>' +
-          '<span style="float:right;font-size:10px;color:#555">' + timeStr + '</span>' +
+        var clickAttr = hasResult ? ' data-taskid="' + id + '" style="cursor:pointer"' : '';
+        var resultDisplay = isExpanded ? 'block' : 'none';
+        var resultHtml = hasResult ? '<div id="result-' + id + '" style="display:' + resultDisplay + ';padding:8px 12px;color:#b8c8d8;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;background:#0d1520;border-radius:8px;margin:4px 0 6px 30px">' + esc(t.result) + '</div>' : '';
+        var rawText = t.text || id;
+        var displayText = isExpanded ? rawText : summarizeTaskText(rawText);
+        var textClass = isExpanded ? 'task-text expanded' : 'task-text';
+        var expandChip = hasResult ? '<span class="task-expand">' + (isExpanded ? 'Hide &#9662;' : 'Show details &#9656;') + '</span>' : '';
+        return '<div class="task-item"' + clickAttr + '>' +
+          '<div class="task-status ' + t.status + '">' + (icons[t.status] || '?') + '</div>' +
+          '<span class="' + textClass + '">' + displayText + '</span>' +
+          '<span class="task-time">' + timeStr + '</span>' +
+          expandChip +
           '</div>' + resultHtml;
       }).join('');
     }
