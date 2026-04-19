@@ -60,8 +60,8 @@ We're looking for contributors to help test and harden these capabilities. If yo
      │                       (serves web client,  │
      │                        WS on :9900)        ├──► inline tools (instant,
      │                                            │    in-process: describe_screen,
-     ├──phone (Twilio)─────► Conversation server ─┤    mute, hang_up, dtmf, ...)
-     │                       (Gemini Live,        │
+     ├──phone (Twilio)─────► Conversation server ─┤    get_current_time, hang_up,
+     │                       (Gemini Live,        │    dtmf, ...)
      │                        WS on :3100)        │
      │                                            └──┐
      │                                               │   file bridge
@@ -82,7 +82,7 @@ Three processes work together:
 - **Conversation server** (Gemini Live, Twilio WebSocket on :3100) — same role for inbound and outbound phone calls.
 - **Core agent** (Claude Code CLI) — executes tasks with full system access. We use the CLI because it provides cron scheduling, plugins, and an interactive terminal that the SDK doesn't offer out of the box.
 
-Voice agent and conversation server handle conversation-scope actions with **inline tools** — in-process calls that round-trip instantly (mute, hang up, describe screen, send DTMF, read context drops). For anything outside that scope they write to `tasks/`; core reads them, executes, and writes to `results/`, which each channel speaks or messages back. Telegram and Discord bridges only use the `tasks/` path.
+Voice agent and conversation server handle conversation-scope actions with **inline tools** — in-process calls that round-trip instantly (describe the screen, hang up, send DTMF, read the clipboard/current time, capture a screenshot). For anything outside that scope they write to `tasks/`; core reads them, executes, and writes to `results/`, which each channel speaks or messages back. Telegram and Discord bridges only use the `tasks/` path.
 
 ---
 
