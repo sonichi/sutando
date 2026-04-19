@@ -295,20 +295,27 @@ const HTML = /* html */ `<!DOCTYPE html>
   }
   #tasks:empty { display: none; }
   .task-item {
-    display: flex; align-items: center; gap: 8px;
-    padding: 5px 0; border-bottom: 1px solid #141420;
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 0; border-bottom: 1px solid #141420;
   }
   .task-item:last-child { border-bottom: none; }
   .task-status {
-    width: 16px; height: 16px; border-radius: 50%;
+    width: 20px; height: 20px; border-radius: 50%;
     display: flex; align-items: center; justify-content: center;
-    font-size: 9px; flex-shrink: 0;
+    font-size: 11px; flex-shrink: 0;
   }
   .task-status.working { background: #1e3a5f; color: #60a5fa; animation: pulse 1.5s infinite; }
   .task-status.done { background: #1e4028; color: #4ecca3; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
-  .task-text { color: #888; flex: 1; word-break: break-word; }
-  .task-time { color: #444; font-size: 10px; }
+  .task-text { color: #c0c0c8; flex: 1; word-break: break-word; font-size: 13px; line-height: 1.4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .task-text.expanded { white-space: normal; }
+  .task-time { color: #666; font-size: 11px; flex-shrink: 0; }
+  .task-expand {
+    flex-shrink: 0; padding: 2px 8px; border-radius: 10px;
+    background: #1a2030; color: #8ab4c8; font-size: 11px; cursor: pointer;
+    border: 1px solid #2a3344; user-select: none;
+  }
+  .task-expand:hover { background: #233045; color: #aac4d8; }
 
   /* Dynamic region */
   #dynamic-region { padding: 0 16px 8px; width: 100%; box-sizing: border-box; user-select: text; -webkit-user-select: text; }
@@ -921,11 +928,16 @@ function renderTasks() {
     const clickAttr = hasResult ? ' data-taskid="' + id + '" style="cursor:pointer"' : '';
     const isExpanded = expandedTasks.has(id);
     const resultDisplay = isExpanded ? 'block' : 'none';
-    const resultHtml = hasResult ? '<div id="result-' + id + '" style="display:' + resultDisplay + ';padding:6px 26px;color:#8ab4c8;font-size:11px;white-space:pre-wrap;word-break:break-word;background:#0d1520;border-radius:6px;margin:4px 0 4px 26px">' + t.result.replace(/</g,'&lt;') + '</div>' : '';
+    const resultHtml = hasResult ? '<div id="result-' + id + '" style="display:' + resultDisplay + ';padding:8px 12px;color:#b8c8d8;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;background:#0d1520;border-radius:8px;margin:4px 0 6px 30px">' + t.result.replace(/</g,'&lt;') + '</div>' : '';
+    const rawText = t.text || id;
+    const displayText = rawText.length > 60 && !isExpanded ? rawText.slice(0, 57) + '…' : rawText;
+    const textClass = isExpanded ? 'task-text expanded' : 'task-text';
+    const expandChip = hasResult ? '<span class="task-expand">' + (isExpanded ? 'Hide ▾' : 'Show details ▸') + '</span>' : '';
     return '<div class="task-item"' + clickAttr + '>' +
       '<div class="task-status ' + t.status + '">' + (icons[t.status] || '?') + '</div>' +
-      '<span class="task-text">' + (t.text || id) + (hasResult ? (isExpanded ? ' ▾' : ' ▸') : '') + '</span>' +
+      '<span class="' + textClass + '">' + displayText + '</span>' +
       '<span class="task-time">' + timeStr + '</span>' +
+      expandChip +
       '</div>' + resultHtml;
   }).join('');
 }
