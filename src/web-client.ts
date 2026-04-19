@@ -2231,19 +2231,22 @@ function effectiveAgentState(): AgentState {
 		_preSeeingToolState = 'idle';
 	}
 	if (_toolState !== 'idle') return _toolState;
-	if (_browserState !== 'idle') return _browserState;
-	// No explicit state — fall through to core-status. If the proactive loop
-	// or any Claude Code pass is active, surface that as `working`.
+	// Core-agent work (proactive-loop / CLI pass) takes precedence over
+	// browser state. When the user is speaking (browser=listening) AND
+	// the core agent is actively running a pass, "working" is the true
+	// state — speaking is transient input, the pass is the real activity.
+	// Chi UX ask 2026-04-19: working-while-listening must show working.
 	const core = readCoreStatus();
 	if (core.running) return 'working';
-	// Core is idle OR the file is stale. If stale, ask the tmux scrape for a
-	// hint — useful when a pass crashed before writing idle, or when the CLI
-	// is actively doing something but forgot to write. Fresh-idle file wins
-	// over tmux to prevent the scrape from spuriously lighting up the pulse.
+	// Stale core-status falls back to the tmux scrape — useful when a
+	// pass crashed before writing idle, or when the CLI is active but
+	// forgot to write. Fresh-idle file wins over tmux to prevent the
+	// scrape from spuriously lighting up the pulse.
 	if (core.stale) {
 		const scrape = readTmuxStatus();
 		if (scrape.state === 'working') return 'working';
 	}
+	if (_browserState !== 'idle') return _browserState;
 	return 'idle';
 }
 
