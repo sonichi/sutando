@@ -323,7 +323,7 @@ const HTML = /* html */ `<!DOCTYPE html>
   /* Dynamic region */
   #dynamic-region { padding: 26px 16px 8px; width: 100%; box-sizing: border-box; user-select: text; -webkit-user-select: text; }
   #dynamic-region:empty { display: none; }
-  #core-status-bar { font-size: 11px; color: #555; }
+  #core-status-bar { font-size: 16px; color: #888; }
   #core-status-bar:empty { display: none; }
   #core-status-bar .core-running { color: #4ecca3; }
   #core-status-bar .core-idle { color: #444; }
@@ -406,7 +406,7 @@ const HTML = /* html */ `<!DOCTYPE html>
 
   /* Hidden URL input */
   #wsUrl { display: none; }
-  .stats { font-size: 10px; color: #444; }
+  .stats { font-size: 14px; color: #777; }
 
   /* Hero connect screen — shown when voice is disconnected */
   .hero {
@@ -595,13 +595,13 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
   <button class="btn-hero" onclick="toggle()">Start Voice</button>
 </div>
 
-<div id="status-bar" style="text-align:center;font-size:11px;color:#556;letter-spacing:0.5px;padding:12px 16px">
-  <kbd style="background:#1a1a2e;padding:2px 6px;border-radius:3px;border:1px solid #333;font-family:monospace;color:#8af">⌃C</kbd> drop context
-  <span style="margin:0 6px;color:#333">|</span>
-  <kbd style="background:#1a1a2e;padding:2px 6px;border-radius:3px;border:1px solid #333;font-family:monospace;color:#8af">⌃V</kbd> voice
-  <span style="margin:0 6px;color:#333">|</span>
-  <kbd style="background:#1a1a2e;padding:2px 6px;border-radius:3px;border:1px solid #333;font-family:monospace;color:#8af">⌃M</kbd> mute
-  <span style="margin:0 6px;color:#333">|</span>
+<div id="status-bar" style="text-align:center;font-size:16px;color:#888;letter-spacing:0.3px;padding:12px 16px">
+  <kbd style="background:#1a1a2e;padding:3px 8px;border-radius:4px;border:1px solid #333;font-family:monospace;color:#8af;font-size:14px">⌃C</kbd> drop context
+  <span style="margin:0 8px;color:#444">|</span>
+  <kbd style="background:#1a1a2e;padding:3px 8px;border-radius:4px;border:1px solid #333;font-family:monospace;color:#8af;font-size:14px">⌃V</kbd> voice
+  <span style="margin:0 8px;color:#444">|</span>
+  <kbd style="background:#1a1a2e;padding:3px 8px;border-radius:4px;border:1px solid #333;font-family:monospace;color:#8af;font-size:14px">⌃M</kbd> mute
+  <span style="margin:0 8px;color:#444">|</span>
   <span id="core-status-bar" style="display:inline"></span>
 </div>
 
@@ -934,8 +934,15 @@ function summarizeTaskText(raw) {
   // Iterate because a task may have multiple stacked prefixes.
   for (let i = 0; i < 4; i++) {
     const before = s;
-    s = s.replace(/^\\[(Discord|Voice|Replying to|Reply)[^\\]]*\\]\\s*/i, function(_, kind) {
-      return '[' + (kind.toLowerCase() === 'replying to' || kind.toLowerCase() === 'reply' ? 'Reply' : kind.charAt(0).toUpperCase() + kind.slice(1).toLowerCase()) + '] ';
+    s = s.replace(/^\\[(Discord|Voice|Replying to|Reply|Phone|Sutando-core|Sutando-Lucy|Sutando-Maddy|Task|Context drop)[^\\]]*\\]\\s*/i, function(_, kind) {
+      var k = kind.toLowerCase();
+      var short = k === 'replying to' || k === 'reply' ? 'Reply'
+                : k === 'sutando-core' ? 'Sutando-core'
+                : k === 'sutando-lucy' ? 'Sutando-Lucy'
+                : k === 'sutando-maddy' ? 'Sutando-Maddy'
+                : k === 'context drop' ? 'Context drop'
+                : kind.charAt(0).toUpperCase() + kind.slice(1).toLowerCase();
+      return '[' + short + '] ';
     });
     if (s === before) break;
   }
