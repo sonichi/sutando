@@ -107,7 +107,11 @@ if (CARTESIA_API_KEY) {
 	}
 }
 
-const google = createGoogleGenerativeAI({ apiKey: GEMINI_API_KEY });
+// Uses GEMINI_VOICE_API_KEY because the only consumer of `google()` below is
+// the VoiceSession `model:` field — voice-session subagent text LLM calls.
+// Routes with the voice key so free-tier voice setups don't leak subagent
+// traffic onto the paid GEMINI_API_KEY.
+const google = createGoogleGenerativeAI({ apiKey: GEMINI_VOICE_API_KEY });
 let sessionRef: VoiceSession | null = null;
 
 function ts(): string { return new Date().toISOString().slice(11, 23); }
@@ -601,7 +605,7 @@ async function main() {
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
 		sttProvider: STT_PROVIDER === 'cartesia' && CARTESIA_API_KEY && CartesiaSTTProvider
 			? new CartesiaSTTProvider({ apiKey: CARTESIA_API_KEY })
-			: new GeminiBatchSTTProvider({ apiKey: GEMINI_API_KEY, model: STT_MODEL }),
+			: new GeminiBatchSTTProvider({ apiKey: GEMINI_VOICE_API_KEY, model: STT_MODEL }),
 		speechConfig: { voiceName: 'Puck' },
 		hooks: {
 			onSessionStart: (e) => {
