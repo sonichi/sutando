@@ -349,7 +349,7 @@ const HTML = /* html */ `<!DOCTYPE html>
     border: 1px solid #2e2818; background: #12100a; color: #ccc; outline: none;
   }
   #dynamic-region .q-input:focus { border-color: #f0ad4e66; }
-  #dynamic-region .dr-proactive { text-align: center; padding: 8px; font-size: 13px; color: #8899a6; }
+  #dynamic-region .dr-proactive { text-align: center; padding: 10px; font-size: 18px; color: #a8b8c6; }
   #dynamic-region .dr-chips { text-align: center; }
   #dynamic-region .dr-chips .suggestions-label { margin-bottom: 8px; }
   #dynamic-region .dr-chips .suggestion {
@@ -367,7 +367,7 @@ const HTML = /* html */ `<!DOCTYPE html>
   #dynamic-region .dr-document {
     background: #12121e; border: 1px solid #1e1e30; border-radius: 10px; padding: 12px 16px;
   }
-  #dynamic-region .dr-doc-body { color: #bbb; font-size: 13px; line-height: 1.5; white-space: pre-wrap; }
+  #dynamic-region .dr-doc-body { color: #ccc; font-size: 18px; line-height: 1.6; white-space: pre-wrap; }
 
   /* Section labels */
   .section-label {
