@@ -291,7 +291,14 @@ else
   # AppDelegate.checkWatcher). `tmux new-session -A -s sutando-core …`
   # creates the session if it doesn't exist and attaches if it does,
   # so the user sees the Claude Code prompt exactly as before.
-  # Fall back to a bare `exec claude` if tmux is missing.
+  # Auto-install tmux via Homebrew if missing. Sutando.app's
+  # watcher-auto-restart (PR #444) depends on a tmux-wrapped CLI pane,
+  # so a first-run user without tmux silently loses that feature.
+  if ! command -v tmux > /dev/null 2>&1 && command -v brew > /dev/null 2>&1; then
+    echo "tmux not found — installing via Homebrew (required for Sutando.app watcher-auto-restart)..."
+    brew install tmux 2>&1 | tail -3
+  fi
+  # Fall back to a bare `exec claude` if tmux is still missing.
   if command -v tmux > /dev/null 2>&1; then
     # Explicit socket path so Sutando.app (which runs under a different
     # TMPDIR due to macOS sandboxing when launched via `open`) can reach
