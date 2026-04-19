@@ -11,7 +11,10 @@
  *   4. Open http://localhost:8080 in Chrome and click Connect
  *
  * Environment:
- *   GEMINI_API_KEY      — Required: Google AI Studio API key
+ *   GEMINI_API_KEY       — Required: Google AI Studio API key (text LLM + vision + STT fallback)
+ *   GEMINI_VOICE_API_KEY — Optional: separate key for the Gemini Live voice session.
+ *                          Falls back to GEMINI_API_KEY. Useful for isolating voice
+ *                          (free-tier eligible) from paid-tier spend on a single key.
  *   ANTHROPIC_API_KEY   — Optional: only needed if not using claude CLI subscription auth
  *   WORKSPACE_DIR       — Claude's working directory (default: sutando/)
  *   PORT                — WebSocket port (default: 9900)
@@ -50,6 +53,10 @@ let generateSpeech: ((text: string, opts: { category: string; label: string }) =
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY ?? '';
 if (!GEMINI_API_KEY) { console.error('Error: GEMINI_API_KEY is required'); process.exit(1); }
+// Optional: separate key for the Gemini Live voice session. Lets users put voice
+// on a free-tier key (unlimited on free tier, rate-limited) while keeping text/
+// vision/STT on a paid-tier key. Falls back to GEMINI_API_KEY when unset.
+const GEMINI_VOICE_API_KEY = process.env.GEMINI_VOICE_API_KEY || GEMINI_API_KEY;
 
 const PORT = Number(process.env.PORT) || 9900;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -585,7 +592,7 @@ async function main() {
 	const session = new VoiceSession({
 		sessionId: SESSION_ID,
 		userId: 'user',
-		apiKey: GEMINI_API_KEY,
+		apiKey: GEMINI_VOICE_API_KEY,
 		agents: [mainAgent],
 		initialAgent: 'main',
 		port: PORT,
