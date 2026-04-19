@@ -155,19 +155,31 @@ else
 fi
 
 # 5b. Sutando context drop app (global hotkey ⌃C)
-if ! pgrep -f "Sutando" > /dev/null 2>&1; then
-  if [ -f "$REPO/src/Sutando/Sutando" ]; then
-    echo "  Starting Sutando..."
-    "$REPO/src/Sutando/Sutando" > /dev/null 2>&1 &
-    echo "  ✓ Sutando (⌃C/⌃V/⌃M)"
-  elif [ -f "$REPO/src/Sutando/main.swift" ]; then
-    echo "  Compiling Sutando..."
-    if (cd "$REPO/src/Sutando" && swiftc -O -o Sutando main.swift -framework Cocoa -framework Carbon -framework ApplicationServices -framework AVFoundation 2>/dev/null); then
-      "$REPO/src/Sutando/Sutando" > /dev/null 2>&1 &
-      echo "  ✓ Sutando compiled and started"
-    else
-      echo "  ⚠ Sutando compile failed — hotkeys disabled"
+SUT_SRC="$REPO/src/Sutando/main.swift"
+SUT_BIN="$REPO/src/Sutando/Sutando"
+
+# Rebuild if source is newer than binary, or binary is missing.
+# Kill any running instance so the fresh binary can take over.
+if [ -f "$SUT_SRC" ] && { [ ! -f "$SUT_BIN" ] || [ "$SUT_SRC" -nt "$SUT_BIN" ]; }; then
+  echo "  Compiling Sutando (source newer than binary)..."
+  if (cd "$REPO/src/Sutando" && swiftc -O -o Sutando main.swift -framework Cocoa -framework Carbon -framework ApplicationServices -framework AVFoundation 2>/dev/null); then
+    echo "  ✓ Sutando compiled"
+    if pgrep -f "src/Sutando/Sutando" > /dev/null 2>&1; then
+      pkill -f "src/Sutando/Sutando" 2>/dev/null || true
+      sleep 1
     fi
+  else
+    echo "  ⚠ Sutando compile failed — keeping existing binary if any"
+  fi
+fi
+
+if ! pgrep -f "src/Sutando/Sutando" > /dev/null 2>&1; then
+  if [ -f "$SUT_BIN" ]; then
+    echo "  Starting Sutando..."
+    "$SUT_BIN" > /dev/null 2>&1 &
+    echo "  ✓ Sutando (⌃C/⌃V/⌃M)"
+  else
+    echo "  ⚠ Sutando binary missing — hotkeys disabled"
   fi
 else
   echo "  ✓ Sutando (already running)"
