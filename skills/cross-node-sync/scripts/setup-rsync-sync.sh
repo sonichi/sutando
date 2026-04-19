@@ -17,6 +17,9 @@
 #     (cross-session bot memory — MEMORY.md index + feedback/project/ref
 #     markdown files)
 #   - <repo>/notes/             (user's second-brain notes)
+#   - <repo>/assets/            (owner personal runtime assets — e.g.
+#     gitignored stand-avatar.png. `/assets` is entirely gitignored so
+#     git never sees these, and rsync keeps the nodes converged.)
 #
 # What does NOT sync (per-node, excluded via rsync --exclude):
 #   - state/, tasks/, results/, logs/
@@ -61,6 +64,7 @@ PEER="${SUTANDO_SYNC_PEER:-}"
 MEM_LOCAL="${SUTANDO_MEM_LOCAL_DIR:-$HOME/.claude/projects/$(echo "$REPO_ROOT" | tr '/' '-')/memory/}"
 NOTES_LOCAL="$REPO_ROOT/notes/"
 DATA_LOCAL="$REPO_ROOT/data/"
+ASSETS_LOCAL="$REPO_ROOT/assets/"
 
 # Peer-side paths — default to the same literal paths as local so users only
 # need to set SUTANDO_SYNC_PEER (per owner's 2026-04-17 simplification: "only
@@ -70,6 +74,7 @@ DATA_LOCAL="$REPO_ROOT/data/"
 # otherwise leave unset.
 MEM_PEER="${SUTANDO_PEER_MEM_DIR:-$MEM_LOCAL}"
 NOTES_PEER="${SUTANDO_PEER_NOTES_DIR:-$NOTES_LOCAL}"
+ASSETS_PEER="${SUTANDO_PEER_ASSETS_DIR:-$ASSETS_LOCAL}"
 # Data dir peer path: derive from NOTES_PEER (repo/notes/ → repo/data/) if no
 # explicit override. Covers call-metrics.jsonl, voice-metrics.jsonl,
 # subtitle-metrics.jsonl, latency.json, scanned-calls.json, etc. Owner's
@@ -190,6 +195,14 @@ say ""
 say "Syncing notes/ ..."
 run rsync "${RSYNC_FLAGS[@]}" ${DRYFLAG[@]+"${DRYFLAG[@]}"} "$NOTES_LOCAL" "$PEER:$NOTES_PEER"
 run rsync "${RSYNC_FLAGS[@]}" ${DRYFLAG[@]+"${DRYFLAG[@]}"} "$PEER:$NOTES_PEER" "$NOTES_LOCAL"
+
+# 3b) Assets sync (both directions) — converges owner personal runtime
+# assets (e.g. stand-avatar.png) across nodes. /assets is entirely
+# gitignored; rsync is the only transport.
+say ""
+say "Syncing assets/ ..."
+run rsync "${RSYNC_FLAGS[@]}" ${DRYFLAG[@]+"${DRYFLAG[@]}"} "$ASSETS_LOCAL" "$PEER:$ASSETS_PEER"
+run rsync "${RSYNC_FLAGS[@]}" ${DRYFLAG[@]+"${DRYFLAG[@]}"} "$PEER:$ASSETS_PEER" "$ASSETS_LOCAL"
 
 # 4) Data dir sync — covers all data/* files (call-metrics.jsonl,
 # voice-metrics.jsonl, subtitle-metrics.jsonl, latency.json,
