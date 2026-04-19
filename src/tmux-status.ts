@@ -9,7 +9,10 @@
 // All failure modes (tmux missing, timeout, parse error) return `idle` — this
 // is a best-effort hint, never ground-truth, never throws.
 
-import { execSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
 
 export type TmuxParseResult = {
 	state: 'idle' | 'working';
@@ -22,6 +25,7 @@ const CAPTURE_TIMEOUT_MS = 500;
 const LINES_BACK = 30;
 
 let _cache: { ts: number; result: TmuxParseResult } | null = null;
+let _refreshInFlight = false;
 let _lastLogAt = 0; // throttled logging
 
 function logOnce(msg: string): void {
@@ -29,6 +33,25 @@ function logOnce(msg: string): void {
 	if (now - _lastLogAt < 60_000) return;
 	_lastLogAt = now;
 	console.error(`[tmux-status] ${msg}`);
+}
+
+async function _refreshCache(): Promise<void> {
+	if (_refreshInFlight) return;
+	_refreshInFlight = true;
+	const session = process.env.SUTANDO_TMUX_SESSION || DEFAULT_SESSION;
+	try {
+		const { stdout } = await execFileAsync(
+			'tmux',
+			['capture-pane', '-t', session, '-pS', `-${LINES_BACK}`],
+			{ encoding: 'utf-8', timeout: CAPTURE_TIMEOUT_MS },
+		);
+		_cache = { ts: Date.now(), result: parseTmuxPane(stdout) };
+	} catch (err) {
+		logOnce(`capture failed: ${err instanceof Error ? err.message : String(err)}`);
+		_cache = { ts: Date.now(), result: { state: 'idle', label: '' } };
+	} finally {
+		_refreshInFlight = false;
+	}
 }
 
 // Tool invocation: "⏺ ToolName(" at the start of a line. Claude Code renders
@@ -83,35 +106,46 @@ export function parseTmuxPane(text: string): TmuxParseResult {
 }
 
 /**
- * Capture the pane and parse it. Cached for CACHE_TTL_MS to avoid shelling
- * out on every `/sse-status` poll. Respects `SUTANDO_TMUX_SCRAPE=0` kill-switch.
- * Returns `{state:'idle', label:''}` on any error (tmux missing, timeout, etc.).
+ * Return the last-known tmux-pane state hint. Non-blocking: reads a
+ * background-refreshed cache and fires an async refresh if the cache is
+ * stale. First call (no cache yet) returns the idle fallback and triggers
+ * the first refresh; subsequent polls within CACHE_TTL_MS of the last
+ * refresh return the cached result instantly.
+ *
+ * Respects `SUTANDO_TMUX_SCRAPE=0` kill-switch. Never throws. Never blocks
+ * the event loop — the previous implementation used `execSync` with a
+ * 500ms timeout, which stalled `/sse-status` polls during CLI hiccups.
  */
 export function readTmuxStatus(): TmuxParseResult {
 	if (process.env.SUTANDO_TMUX_SCRAPE === '0') return { state: 'idle', label: '' };
 
 	const now = Date.now();
-	if (_cache && now - _cache.ts < CACHE_TTL_MS) return _cache.result;
-
-	const session = process.env.SUTANDO_TMUX_SESSION || DEFAULT_SESSION;
-	try {
-		const out = execSync(
-			`tmux capture-pane -t ${session} -pS -${LINES_BACK}`,
-			{ encoding: 'utf-8', timeout: CAPTURE_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] },
-		);
-		const result = parseTmuxPane(out);
-		_cache = { ts: now, result };
-		return result;
-	} catch (err) {
-		logOnce(`capture failed: ${err instanceof Error ? err.message : String(err)}`);
-		const result: TmuxParseResult = { state: 'idle', label: '' };
-		_cache = { ts: now, result };
-		return result;
+	if (!_cache || now - _cache.ts >= CACHE_TTL_MS) {
+		// Fire and forget — the await-less call lets the sync caller return
+		// immediately with the previous cache value (or idle fallback on
+		// cold start). Errors are caught inside _refreshCache.
+		void _refreshCache();
 	}
+	return _cache ? _cache.result : { state: 'idle', label: '' };
+}
+
+/**
+ * Async variant: await the fresh capture directly. Useful when the caller
+ * can afford to suspend and wants the freshest read (e.g. a one-shot
+ * diagnostic endpoint). Most hot-path callers should stick with the sync
+ * `readTmuxStatus`.
+ */
+export async function readTmuxStatusAsync(): Promise<TmuxParseResult> {
+	if (process.env.SUTANDO_TMUX_SCRAPE === '0') return { state: 'idle', label: '' };
+	const now = Date.now();
+	if (_cache && now - _cache.ts < CACHE_TTL_MS) return _cache.result;
+	await _refreshCache();
+	return _cache ? _cache.result : { state: 'idle', label: '' };
 }
 
 /** Test-only: reset the capture cache between tests. */
 export function _resetTmuxCacheForTests(): void {
 	_cache = null;
+	_refreshInFlight = false;
 	_lastLogAt = 0;
 }
