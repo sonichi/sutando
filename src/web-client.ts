@@ -279,8 +279,8 @@ const HTML = /* html */ `<!DOCTYPE html>
     display: flex; gap: 8px;
   }
   .input-bar input {
-    flex: 1; padding: 10px 14px; border-radius: 10px;
-    border: 1px solid #1e1e30; background: #0e0e18; color: #fff; font-size: 13px;
+    flex: 1; padding: 12px 16px; border-radius: 10px;
+    border: 1px solid #1e1e30; background: #0e0e18; color: #fff; font-size: 16px;
     outline: none;
   }
   .input-bar input:focus { border-color: #4ecca3; }
@@ -329,14 +329,14 @@ const HTML = /* html */ `<!DOCTYPE html>
   #core-status-bar .core-idle { color: #444; }
   #dynamic-region .dr-questions {
     background: linear-gradient(135deg, #1e1a12, #2a2218); border: 1px solid #f0ad4e44;
-    border-radius: 10px; padding: 12px 16px; font-size: 13px; box-shadow: 0 0 12px #f0ad4e22;
+    border-radius: 10px; padding: 14px 18px; font-size: 16px; box-shadow: 0 0 12px #f0ad4e22;
   }
-  #dynamic-region .dr-questions .q-title { color: #f0ad4e; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
-  #dynamic-region .dr-questions .q-item { color: #ddd; padding: 8px 0; border-bottom: 1px solid #2e281844; }
+  #dynamic-region .dr-questions .q-title { color: #f0ad4e; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+  #dynamic-region .dr-questions .q-item { color: #ddd; padding: 10px 0; border-bottom: 1px solid #2e281844; }
   #dynamic-region .dr-questions .q-item:last-child { border-bottom: none; }
-  #dynamic-region .q-actions { margin-top: 8px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  #dynamic-region .q-actions { margin-top: 10px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   #dynamic-region .q-btn {
-    padding: 4px 14px; border-radius: 14px; font-size: 11px; cursor: pointer;
+    padding: 6px 16px; border-radius: 14px; font-size: 15px; cursor: pointer;
     border: 1px solid #2e2818; background: #1e1a12; color: #ccc; transition: all 0.15s;
   }
   #dynamic-region .q-btn:hover { background: #2e2818; border-color: #f0ad4e66; }
@@ -345,7 +345,7 @@ const HTML = /* html */ `<!DOCTYPE html>
   #dynamic-region .q-btn.q-no { border-color: #e9456066; color: #e94560; }
   #dynamic-region .q-btn.q-no:hover { background: #3a1520; }
   #dynamic-region .q-input {
-    flex: 1; min-width: 120px; padding: 4px 10px; border-radius: 14px; font-size: 11px;
+    flex: 1; min-width: 120px; padding: 6px 12px; border-radius: 14px; font-size: 15px;
     border: 1px solid #2e2818; background: #12100a; color: #ccc; outline: none;
   }
   #dynamic-region .q-input:focus { border-color: #f0ad4e66; }
