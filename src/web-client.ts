@@ -1137,10 +1137,9 @@ function startSpeakingDetection() {
         el.classList.remove('s-idle','s-listening','s-working','s-seeing');
         el.classList.add('s-speaking');
       } else if (el.classList.contains('s-speaking')) {
-        // Mirror legacy `classList.toggle('speaking', speaking)`: clear on
-        // audio drop so the SVG visor doesn't stay green until the next SSE
-        // event. Fall back to s-idle — server SSE will overwrite with the
-        // real state (listening/working/etc.) within the next poll.
+        // Clear s-speaking on audio drop so the SVG visor does not stay
+        // green until the next SSE event. Fall back to s-idle; server SSE
+        // will overwrite with the true state on the next poll.
         el.classList.remove('s-speaking');
         el.classList.add('s-idle');
       }
