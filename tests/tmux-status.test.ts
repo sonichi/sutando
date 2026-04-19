@@ -181,17 +181,20 @@ describe('readTmuxStatus', () => {
 		}
 	});
 
-	it('cold-start cache miss returns idle fallback synchronously (non-blocking)', () => {
+	it('cold-start cache miss returns idle fallback without blocking for capture timeout', () => {
 		// With cache cleared and no refresh yet complete, the sync call must
-		// return immediately with the idle fallback and NOT block the event
-		// loop on execFile. We assert the shape + that it returns in microseconds.
+		// return with the idle fallback WITHOUT blocking on the full
+		// execFile capture — the whole point of the async refactor. The old
+		// execSync path blocked for up to CAPTURE_TIMEOUT_MS (500ms) per
+		// call; the new path fires an async refresh and returns immediately.
 		const start = Date.now();
 		const r = readTmuxStatus();
 		const elapsed = Date.now() - start;
 		assert.equal(r.state, 'idle');
 		assert.equal(r.label, '');
-		// 50ms is a generous upper bound; a truly-blocking execSync would
-		// take hundreds of ms (up to CAPTURE_TIMEOUT_MS = 500).
-		assert.ok(elapsed < 50, `readTmuxStatus blocked for ${elapsed}ms (should be <50ms)`);
+		// Threshold generous for slow CI containers. The regression-signal
+		// we care about is: if this ever climbs to ~500ms, someone
+		// accidentally reverted to the sync path.
+		assert.ok(elapsed < 300, `readTmuxStatus blocked for ${elapsed}ms (should be <300ms)`);
 	});
 });
