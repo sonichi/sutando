@@ -310,7 +310,7 @@ const HTML = /* html */ `<!DOCTYPE html>
   .task-status.working { background: #1e3a5f; color: #60a5fa; animation: pulse 1.5s infinite; }
   .task-status.done { background: #1e4028; color: #4ecca3; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
-  .task-text { color: #d0d0d8; flex: 1; word-break: break-word; font-size: 18px; line-height: 1.65; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .task-text { color: #d0d0d8; flex: 1; word-break: break-word; font-size: 16px; line-height: 1.6; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .task-text.expanded { white-space: normal; }
   .task-time { color: #777; font-size: 13px; flex-shrink: 0; }
   .task-expand {
@@ -2039,7 +2039,7 @@ function renderTabContent() {
       var html = '';
       window._allNotes = notes;
       notes.forEach(function(n) {
-        html += '<div class="note-item" data-title="' + esc(n.title).toLowerCase() + '" data-slug="' + n.slug + '" style="padding:12px 10px;margin:0 -10px;border-bottom:1px solid #2a2a3e;display:flex;align-items:center;font-size:18px;line-height:1.65;border-radius:6px">' +
+        html += '<div class="note-item" data-title="' + esc(n.title).toLowerCase() + '" data-slug="' + n.slug + '" style="padding:12px 10px;margin:0 -10px;border-bottom:1px solid #2a2a3e;display:flex;align-items:center;font-size:16px;line-height:1.6;border-radius:6px">' +
           '<span style="margin-right:10px;flex-shrink:0">&#128221;</span>' +
           '<span style="color:#7c83ff;cursor:pointer;flex:1" onclick="showNoteContent(&quot;' + n.slug + '&quot;)">' + n.title + '</span>' +
           '<span style="color:#666;font-size:13px;margin-right:8px">' + new Date(n.modified*1000).toLocaleDateString() + '</span>' +
