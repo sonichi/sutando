@@ -1983,11 +1983,15 @@ function renderTabContent() {
 
   if (tab === 'starter') {
     // Cap at 5 chips per Susan's "show fewer cards rather than shrink" rule.
+    // Also cap each chip's visible label at ~32 chars so "PR 470 — task-card
+    // redesign" stays terse — full text still available via title tooltip.
     container.innerHTML = '<div class="dr-chips">' +
       '<div class="suggestions-label" style="font-size:14px;color:#999;margin-bottom:6px">Try saying or typing</div>' +
       getSuggestionChips().slice(0, 5).map(function(c) {
-        return '<span class="suggestion" onclick="trySuggestion(this)">' +
-          c.label + (c.desc ? ' — ' + c.desc : '') + '</span>';
+        var full = c.label + (c.desc ? ' — ' + c.desc : '');
+        var short = full.length > 32 ? full.slice(0, 30) + '…' : full;
+        return '<span class="suggestion" title="' + esc(full) + '" onclick="trySuggestion(this)">' +
+          esc(short) + '</span>';
       }).join('') + '</div>';
     window._drLocalContent = false;
 
