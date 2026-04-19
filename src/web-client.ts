@@ -919,23 +919,24 @@ document.addEventListener('click', function(e) {
   const item = e.target.closest && e.target.closest('.task-item[data-taskid]');
   if (item) toggleResult(item.dataset.taskid);
 });
-// Strip routing prefixes ([Discord @handle], [Replying to ...], [File attached: ...])
-// and clause fragments; keep a short semantic label.
+// Collapse routing prefixes to a short category badge + clause head.
 // "[Discord @susanliu_] maybe make it look more like this, add emoji in front"
-//   → "maybe make it look more like this"
+//   → "[Discord] maybe make it look more like this"
+// Keeps the origin channel visible per Susan's 16:53 ask while still
+// dropping the noisy handle+replyTo+file-attached chunks.
 // NOTE: regex literals live inside the HTML template string — single \ is
 // eaten by the template literal parser (so /\s+/g turns into /s+/g in the
 // browser and strips s characters!). Double-escape every backslash.
 function summarizeTaskText(raw) {
   if (!raw) return '';
   let s = String(raw).trim();
-  // Strip leading routing / reply / attachment brackets (iteratively — a task
-  // may have multiple: "[Discord @X] [Replying to Y] actual content").
+  // Collapse "[Discord @handle]" → "[Discord]", "[Voice foo]" → "[Voice]", etc.
+  // Iterate because a task may have multiple stacked prefixes.
   for (let i = 0; i < 4; i++) {
     const before = s;
-    s = s.replace(/^\\[Discord[^\\]]*\\]\\s*/i, '');
-    s = s.replace(/^\\[Replying to[^\\]]*\\]\\s*/i, '');
-    s = s.replace(/^\\[Voice[^\\]]*\\]\\s*/i, '');
+    s = s.replace(/^\\[(Discord|Voice|Replying to|Reply)[^\\]]*\\]\\s*/i, function(_, kind) {
+      return '[' + (kind.toLowerCase() === 'replying to' || kind.toLowerCase() === 'reply' ? 'Reply' : kind.charAt(0).toUpperCase() + kind.slice(1).toLowerCase()) + '] ';
+    });
     if (s === before) break;
   }
   // Strip inline "[File attached: ...]" chunks anywhere in the text.
