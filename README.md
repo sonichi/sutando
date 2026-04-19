@@ -58,14 +58,20 @@ We're looking for contributors to help test and harden these capabilities. If yo
 ```
     You ──voice (browser)──► Voice agent ─────────┐
      │                       (serves web client,  │
-     │                        WS on :9900)        │   file bridge
-     ├──phone (Twilio)─────► Conversation server ─┤── tasks/ ──► Core agent
-     │                       (Gemini Live,        │                 │
-     │                        WS on :3100)        │                 ▼
-     ├──telegram──────────► Telegram bridge ──────┤         uses anything:
-     │                                            │         email, calendar,
-     └──discord───────────► Discord bridge ───────┘         browser, files,
-                                                            phone, reminders...
+     │                        WS on :9900)        ├──► inline tools (instant,
+     │                                            │    in-process: describe_screen,
+     ├──phone (Twilio)─────► Conversation server ─┤    mute, hang_up, dtmf, ...)
+     │                       (Gemini Live,        │
+     │                        WS on :3100)        │
+     │                                            └──┐
+     │                                               │   file bridge
+     ├──telegram──────────► Telegram bridge ─────────┼── tasks/ ──► Core agent
+     │                                               │                 │
+     └──discord───────────► Discord bridge ──────────┘                 ▼
+                                                              uses anything:
+                                                              email, calendar,
+                                                              browser, files,
+                                                              phone, reminders...
                                     ◄── results/ ◄──
                                 (spoken via voice/phone,
                                  text via Telegram/Discord)
@@ -76,7 +82,7 @@ Three processes work together:
 - **Conversation server** (Gemini Live, Twilio WebSocket on :3100) — same role for inbound and outbound phone calls.
 - **Core agent** (Claude Code CLI) — executes tasks with full system access. We use the CLI because it provides cron scheduling, plugins, and an interactive terminal that the SDK doesn't offer out of the box.
 
-Voice agent and conversation server both write requests to `tasks/` when the user asks for anything outside the conversation scope; core reads them, executes, and writes to `results/`, which each channel speaks or messages back.
+Voice agent and conversation server handle conversation-scope actions with **inline tools** — in-process calls that round-trip instantly (mute, hang up, describe screen, send DTMF, read context drops). For anything outside that scope they write to `tasks/`; core reads them, executes, and writes to `results/`, which each channel speaks or messages back. Telegram and Discord bridges only use the `tasks/` path.
 
 ---
 
