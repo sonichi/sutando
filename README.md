@@ -95,11 +95,11 @@ Running Sutando costs a few cents to a couple dollars per hour of actual voice u
 
 | Component | Rate | Notes |
 |-----------|------|-------|
-| Gemini Live API | **~$0.30 – $1.30 / hour** of voice | $0.005/min input audio, $0.018/min output audio. The $1.30/hr upper end matches a peak day of ~10 hr of voice. |
+| Gemini Live API | **Free tier available — paid usage varies** | Gemini Live (voice) has a free tier with quota limits. Paid-tier published rates for Live audio are roughly $0.005/min input, $0.018/min output — actual cost depends on tier, model, and input/output mix. Check [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing) and your Google Cloud billing dashboard. |
 | Twilio Programmable Voice (US local, in + out) | **~$0.013 – $0.018 / min** | Inbound $0.0085/min, outbound $0.014/min; both + Media Streams $0.004/min. Add ~$1/mo phone-number rental. |
 | Telegram, Discord, browser voice | **Free** | No per-message cost. |
 
-A typical 3-minute phone call is under $0.15 all-in. Empirical bills match these ranges (e.g. 602 min of voice on one peak day ≈ $13 in Gemini charges ≈ $1.30/hr).
+A typical 3-minute phone call is usually under a dollar all-in (free-tier Gemini + paid Twilio). Exact cost depends on your Google Cloud tier, Gemini model, and call duration — check your dashboards for ground truth.
 
 Sources: [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing), [Twilio voice pricing](https://www.twilio.com/en-us/voice/pricing/us).
 
@@ -112,7 +112,7 @@ Sources: [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing), [Twili
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code/getting-started) (run `claude` once to complete login)
 - Node.js 22+ (`brew install node`)
 - fswatch (`brew install fswatch`)
-- [Gemini API key](https://ai.google.dev) (click "Get API key" — free to generate; Gemini Live voice is usage-billed at **~$0.30–$1.30 / hour**, see [Running costs](#running-costs))
+- [Gemini API key](https://ai.google.dev) (click "Get API key" — free to generate; Gemini Live voice may be free on the free tier or usage-billed depending on your Google Cloud account, see [Running costs](#running-costs))
 - *(optional, for phone calls)* [Twilio account](https://www.twilio.com/) + [ngrok](https://ngrok.com/) — Sutando can answer inbound calls and make outbound calls (~$0.01–0.03/min, see [Running costs](#running-costs)); you can run the browser + Telegram + Discord paths without them.
 - *(optional, for video/audio)* ffmpeg (`brew install ffmpeg`) — used by subtitle-burn, video-concat, and recording handoff.
 
