@@ -57,7 +57,10 @@ let generateSpeech: ((text: string, opts: { category: string; label: string }) =
 // instead of letting the voice session fail silently on connect.
 function assertGeminiKey(name: string, value: string): void {
 	if (!value) { console.error(`Error: ${name} is required`); process.exit(1); }
-	const looksValid = value.startsWith('AIza') && value.length >= 35 && value.length <= 50;
+	// Upper bound of 60 (vs canonical ~39) gives headroom for Google key
+	// format rotations — Mini flagged they rotated once (2020→2023) and a
+	// tight bound would fail-fast on legitimate future keys.
+	const looksValid = value.startsWith('AIza') && value.length >= 35 && value.length <= 60;
 	if (!looksValid) {
 		console.error(
 			`Error: ${name} does not look like a Google AI Studio key ` +
