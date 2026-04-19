@@ -64,15 +64,19 @@ We're looking for contributors to help test and harden these capabilities. If yo
      │                       (Gemini Live,        │    dtmf, ...)
      │                        WS on :3100)        │
      │                                            └──┐
-     │                                               │   file bridge
-     ├──telegram──────────► Telegram bridge ─────────┼── tasks/ ──► Core agent ↻
-     │                                               │                  │
-     └──discord───────────► Discord bridge ──────────┘                  ▼
-                                                              uses anything:
-                                                              email, calendar,
-                                                              browser, files,
-                                                              phone, reminders...
-                                    ◄── results/ ◄──
+     │                                               │   file bridge       .---------------.
+     ├──telegram──────────► Telegram bridge ─────────┼── tasks/ ─────────► |               |
+     │                                               │                    |   Core        |
+     │                                               │                    |   agent ↻     |
+     └──discord───────────► Discord bridge ──────────┘                    |               |
+                                                                           `---------------'
+                                                                                  │
+                                                                                  ▼
+                                                                          uses anything:
+                                                                          email, calendar,
+                                                                          browser, files,
+                                                                          phone, reminders...
+                                    ◄── results/ ◄────────────────────────────────┘
                                 (spoken via voice/phone,
                                  text via Telegram/Discord)
 
