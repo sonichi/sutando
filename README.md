@@ -56,21 +56,27 @@ We're looking for contributors to help test and harden these capabilities. If yo
 ## How it works
 
 ```
-    You ──voice──► Voice agent ──────────┐
-     │                                   │ file bridge
-     ├──telegram──► Telegram bridge ─────┤ tasks/ ──► Core agent
-     │                                   │ ◄── results/     │
-     ├──discord───► Discord bridge  ─────┤       │    uses anything:
-     │                                   │       ▼    email, calendar, browser,
-     └──browser───► Web client ──────────┘  speaks /  files, phone, reminders...
-                                            replies
+    You ──voice (browser)──► Voice agent ─────────┐
+     │                       (serves web client,  │
+     │                        WS on :9900)        │   file bridge
+     ├──phone (Twilio)─────► Conversation server ─┤── tasks/ ──► Core agent
+     │                       (Gemini Live,        │                 │
+     │                        WS on :3100)        │                 ▼
+     ├──telegram──────────► Telegram bridge ──────┤         uses anything:
+     │                                            │         email, calendar,
+     └──discord───────────► Discord bridge ───────┘         browser, files,
+                                                            phone, reminders...
+                                    ◄── results/ ◄──
+                                (spoken via voice/phone,
+                                 text via Telegram/Discord)
 ```
 
-Two processes work together:
-- **Voice agent** (Gemini Live) — listens and talks in real time, runs as a background daemon
+Three processes work together:
+- **Voice agent** (Gemini Live, WebSocket on :9900) — listens and talks in real time for browser voice; also serves the web client at :8080.
+- **Conversation server** (Gemini Live, Twilio WebSocket on :3100) — same role for inbound and outbound phone calls.
 - **Core agent** (Claude Code CLI) — executes tasks with full system access. We use the CLI because it provides cron scheduling, plugins, and an interactive terminal that the SDK doesn't offer out of the box.
 
-They communicate through files: voice agent writes tasks, the core agent executes them, writes results back, voice agent speaks the answer.
+Voice agent and conversation server both write requests to `tasks/` when the user asks for anything outside the conversation scope; core reads them, executes, and writes to `results/`, which each channel speaks or messages back.
 
 ---
 
