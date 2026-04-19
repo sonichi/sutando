@@ -17,6 +17,10 @@
 #     (cross-session bot memory — MEMORY.md index + feedback/project/ref
 #     markdown files)
 #   - <repo>/notes/             (user's second-brain notes)
+#   - <repo>/docs/              (owner's personal assets — stand-avatar.png
+#     is gitignored so it only converges across nodes via this rsync. The
+#     tracked avatar-default.html is a no-op here since git already keeps
+#     it in sync.)
 #
 # What does NOT sync (per-node, excluded via rsync --exclude):
 #   - state/, tasks/, results/, logs/
@@ -61,6 +65,7 @@ PEER="${SUTANDO_SYNC_PEER:-}"
 MEM_LOCAL="${SUTANDO_MEM_LOCAL_DIR:-$HOME/.claude/projects/$(echo "$REPO_ROOT" | tr '/' '-')/memory/}"
 NOTES_LOCAL="$REPO_ROOT/notes/"
 DATA_LOCAL="$REPO_ROOT/data/"
+DOCS_LOCAL="$REPO_ROOT/docs/"
 
 # Peer-side paths — default to the same literal paths as local so users only
 # need to set SUTANDO_SYNC_PEER (per owner's 2026-04-17 simplification: "only
@@ -70,6 +75,7 @@ DATA_LOCAL="$REPO_ROOT/data/"
 # otherwise leave unset.
 MEM_PEER="${SUTANDO_PEER_MEM_DIR:-$MEM_LOCAL}"
 NOTES_PEER="${SUTANDO_PEER_NOTES_DIR:-$NOTES_LOCAL}"
+DOCS_PEER="${SUTANDO_PEER_DOCS_DIR:-$DOCS_LOCAL}"
 # Data dir peer path: derive from NOTES_PEER (repo/notes/ → repo/data/) if no
 # explicit override. Covers call-metrics.jsonl, voice-metrics.jsonl,
 # subtitle-metrics.jsonl, latency.json, scanned-calls.json, etc. Owner's
@@ -190,6 +196,14 @@ say ""
 say "Syncing notes/ ..."
 run rsync "${RSYNC_FLAGS[@]}" ${DRYFLAG[@]+"${DRYFLAG[@]}"} "$NOTES_LOCAL" "$PEER:$NOTES_PEER"
 run rsync "${RSYNC_FLAGS[@]}" ${DRYFLAG[@]+"${DRYFLAG[@]}"} "$PEER:$NOTES_PEER" "$NOTES_LOCAL"
+
+# 3b) Docs sync (both directions) — converges owner's personal assets like
+# stand-avatar.png. avatar-default.html is tracked so git already syncs it;
+# the meaningful cross-node diff here is the gitignored PNG(s).
+say ""
+say "Syncing docs/ ..."
+run rsync "${RSYNC_FLAGS[@]}" ${DRYFLAG[@]+"${DRYFLAG[@]}"} "$DOCS_LOCAL" "$PEER:$DOCS_PEER"
+run rsync "${RSYNC_FLAGS[@]}" ${DRYFLAG[@]+"${DRYFLAG[@]}"} "$PEER:$DOCS_PEER" "$DOCS_LOCAL"
 
 # 4) Data dir sync — covers all data/* files (call-metrics.jsonl,
 # voice-metrics.jsonl, subtitle-metrics.jsonl, latency.json,

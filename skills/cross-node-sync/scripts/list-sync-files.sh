@@ -25,6 +25,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 
 MEM_DIR="$HOME/.claude/projects/-Users-xueqingliu-Documents-sutando-sutando/memory"
 NOTES_DIR="$REPO_ROOT/notes"
+DOCS_DIR="$REPO_ROOT/docs"
 
 list_dir() {
     local root="$1"
@@ -57,4 +58,5 @@ list_dir() {
 {
     list_dir "$MEM_DIR"    "memory"
     list_dir "$NOTES_DIR"  "notes"
+    list_dir "$DOCS_DIR"   "docs"
 } | sort
