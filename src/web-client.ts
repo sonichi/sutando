@@ -1997,7 +1997,7 @@ function renderTabContent() {
     // Also cap each chip's visible label at ~32 chars so "PR 470 — task-card
     // redesign" stays terse — full text still available via title tooltip.
     container.innerHTML = '<div class="dr-chips">' +
-      '<div class="suggestions-label" style="font-size:14px;color:#999;margin-bottom:6px">Try saying or typing</div>' +
+      '<div class="suggestions-label" style="font-size:14px;color:#999;margin-bottom:16px">Try saying or typing</div>' +
       getSuggestionChips().slice(0, 5).map(function(c) {
         var full = c.label + (c.desc ? ' — ' + c.desc : '');
         var short = full.length > 32 ? full.slice(0, 30) + '…' : full;
@@ -2082,15 +2082,15 @@ function renderTabContent() {
     fetch(API_BASE + '/activity').then(function(r){return r.json()}).then(function(data) {
       var items = data.activity || [];
       if (items.length === 0) {
-        container.innerHTML = '<div style="color:#666;font-size:12px;text-align:center;padding:12px">No recent activity</div>';
+        container.innerHTML = '<div style="color:#666;font-size:16px;text-align:center;padding:12px">No recent activity</div>';
         return;
       }
       var html = '';
       items.forEach(function(item) {
         if (item.type === 'commit') {
-          html += '<div style="padding:3px 0;font-size:12px"><span style="color:#555;font-family:monospace">' + item.hash + '</span> <span style="color:#7c83ff">' + esc(item.message) + '</span></div>';
+          html += '<div style="padding:6px 0;font-size:16px;line-height:1.5"><span style="color:#888;font-family:monospace;font-size:14px">' + item.hash + '</span> <span style="color:#7c83ff">' + esc(item.message) + '</span></div>';
         } else if (item.type === 'task') {
-          html += '<div style="padding:3px 0;font-size:12px;color:#4ecca3">' + esc(item.preview) + '</div>';
+          html += '<div style="padding:6px 0;font-size:16px;line-height:1.5;color:#4ecca3">' + esc(item.preview) + '</div>';
         }
       });
       container.innerHTML = html;
