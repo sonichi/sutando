@@ -73,6 +73,44 @@ const HTML = /* html */ `<!DOCTYPE html>
     100% { box-shadow: 0 0 10px rgba(251,191,36,0.45), inset 0 0 0 0 rgba(251,191,36,0.0); }
   }
 
+  /* Halo animations for the PNG avatar path (mirrors the SVG .s-* halos
+     from PR #457 so users with avatarGenerated=true still get per-state
+     feedback around the image). Keyed off the .s-* class on the parent
+     wrapper (avatar-wrap / hero), not the img itself, so SSE state wires
+     straight through. */
+  @keyframes avatar-idle {
+    0%,100% { box-shadow: 0 0 0 0 rgba(124,131,255,0.5); }
+    50%     { box-shadow: 0 0 0 6px rgba(124,131,255,0); }
+  }
+  @keyframes avatar-listen {
+    0%   { box-shadow: 0 0 0 0 rgba(167,139,250,0.7); }
+    100% { box-shadow: 0 0 0 10px rgba(167,139,250,0); }
+  }
+  @keyframes avatar-speak {
+    0%   { box-shadow: 0 0 0 0 rgba(78,204,163,0.75); }
+    100% { box-shadow: 0 0 0 9px rgba(78,204,163,0); }
+  }
+  .avatar-wrap.s-idle > .avatar,
+  .hero-svg-wrap.s-idle > .avatar {
+    border-color: #7c83ff; animation: avatar-idle 3.2s ease-in-out infinite;
+  }
+  .avatar-wrap.s-listening > .avatar,
+  .hero-svg-wrap.s-listening > .avatar {
+    border-color: #a78bfa; animation: avatar-listen 1.4s ease-out infinite;
+  }
+  .avatar-wrap.s-speaking > .avatar,
+  .hero-svg-wrap.s-speaking > .avatar {
+    border-color: #6ee7b7; animation: avatar-speak 0.9s ease-out infinite;
+  }
+  .avatar-wrap.s-working > .avatar,
+  .hero-svg-wrap.s-working > .avatar {
+    border-color: #60a5fa; animation: avatar-work 2s linear infinite;
+  }
+  .avatar-wrap.s-seeing > .avatar,
+  .hero-svg-wrap.s-seeing > .avatar {
+    border-color: #fbbf24; animation: avatar-see 1.2s ease-in-out infinite;
+  }
+
   /* Default inline-SVG avatar — shown when no custom avatar has been
      generated (most new users). Mirrors docs/avatar-default.html mockup
      from PR #443. State classes drive per-state animation via the .s-*
