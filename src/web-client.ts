@@ -1997,7 +1997,7 @@ function renderTabContent() {
     // Also cap each chip's visible label at ~32 chars so "PR 470 — task-card
     // redesign" stays terse — full text still available via title tooltip.
     container.innerHTML = '<div class="dr-chips">' +
-      '<div class="suggestions-label" style="font-size:14px;color:#999;margin-bottom:16px">Try saying or typing</div>' +
+      '<div class="suggestions-label" style="font-size:14px;color:#999;margin-bottom:28px">Try saying or typing</div>' +
       getSuggestionChips().slice(0, 5).map(function(c) {
         var full = c.label + (c.desc ? ' — ' + c.desc : '');
         var short = full.length > 32 ? full.slice(0, 30) + '…' : full;
