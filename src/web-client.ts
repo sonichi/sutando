@@ -209,12 +209,12 @@ const HTML = /* html */ `<!DOCTYPE html>
 
   .header .info { flex: 1; }
   .header h1 { color: #fff; font-size: 1.15em; font-weight: 500; }
-  .header .meta { font-size: 14px; color: #777; display: flex; gap: 14px; align-items: center; margin-top: 4px; }
-  .header .meta a { color: #888; text-decoration: none; border-bottom: 1px dotted #444; }
+  .header .meta { font-size: 16px; color: #888; display: flex; gap: 14px; align-items: center; margin-top: 4px; }
+  .header .meta a { color: #999; text-decoration: none; border-bottom: 1px dotted #555; }
   .header .meta a:hover { color: #bbb; }
   .status-pill {
-    display: inline-flex; align-items: center; gap: 5px;
-    padding: 3px 10px; border-radius: 11px; font-size: 12px; font-weight: 500;
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 12px; border-radius: 12px; font-size: 16px; font-weight: 500;
   }
   .status-pill.voice-on { background: #1a2e24; color: #4ecca3; }
   .status-pill.voice-off { background: #1a1a2e; color: #666; }
@@ -321,7 +321,7 @@ const HTML = /* html */ `<!DOCTYPE html>
   .task-expand:hover { background: #3a5075; color: #ffffff; }
 
   /* Dynamic region */
-  #dynamic-region { padding: 14px 16px 8px; width: 100%; box-sizing: border-box; user-select: text; -webkit-user-select: text; }
+  #dynamic-region { padding: 26px 16px 8px; width: 100%; box-sizing: border-box; user-select: text; -webkit-user-select: text; }
   #dynamic-region:empty { display: none; }
   #core-status-bar { font-size: 11px; color: #555; }
   #core-status-bar:empty { display: none; }
