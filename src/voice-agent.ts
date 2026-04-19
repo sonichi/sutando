@@ -600,6 +600,19 @@ async function main() {
 	let voiceSessionStart = Date.now();
 	let metricsWritten = false;
 
+	// Authoritative voice-connection state. web-client reads this file
+	// instead of caching the browser's one-shot POST, so a web-client
+	// restart during an active session re-syncs on next file read (no
+	// manual user toggle needed). Chi's 2026-04-19 regression surfaced
+	// this after ~5 PR-restart cycles desyncing voiceConnected.
+	function writeVoiceState(connected: boolean) {
+		try {
+			writeFileSync('voice-state.json', JSON.stringify({ connected, ts: Math.floor(Date.now() / 1000) }));
+		} catch (err) {
+			console.error(`${ts()} [VoiceState] write failed:`, err);
+		}
+	}
+
 	function writeVoiceMetrics() {
 		if (metricsWritten) return;
 		metricsWritten = true;
@@ -860,6 +873,7 @@ async function main() {
 		(session as any).handleClientDisconnected = () => {
 			origDisconnect();
 			writeVoiceMetrics();
+			writeVoiceState(false);
 		};
 	}
 
@@ -887,6 +901,7 @@ async function main() {
 				console.log(`${ts()} [Session] Client reconnected — reset metrics buffer (bodhi onSessionStart guard bypass)`);
 			}
 			clientHasConnectedOnce = true;
+			writeVoiceState(true);
 			origConnect();
 		};
 	}

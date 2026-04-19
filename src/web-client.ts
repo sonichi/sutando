@@ -2238,6 +2238,22 @@ function readCoreStatus(): { running: boolean; step: string; stale: boolean } {
 }
 function coreIsRunning(): boolean { return readCoreStatus().running; }
 
+const VOICE_STATE_STALE_SECONDS = 120;
+function readVoiceState(): boolean | null {
+	try {
+		const url = new URL('../voice-state.json', import.meta.url);
+		const raw = readFileSync(url, 'utf-8');
+		const s = JSON.parse(raw) as { connected?: boolean; ts?: number };
+		const nowSec = Date.now() / 1000;
+		if (typeof s.ts === 'number' && nowSec - s.ts > VOICE_STATE_STALE_SECONDS && s.connected) {
+			return null;
+		}
+		return typeof s.connected === 'boolean' ? s.connected : null;
+	} catch {
+		return null;
+	}
+}
+
 function effectiveAgentState(): AgentState {
 	if (_toolState === 'seeing' && Date.now() > _seeingUntil) {
 		// Revert to pre-seeing tool state (usually 'working' if a tool was
@@ -2334,11 +2350,16 @@ const server = createServer((req, res) => {
 				if (scrape.state === 'working') label = scrape.label;
 			}
 		}
+		// voice-state.json (written by voice-agent on connect/disconnect) is
+		// authoritative. Fall back to the browser-reported _voiceState cache
+		// if the file is missing or stale (see readVoiceState doc).
+		const vs = readVoiceState();
+		const voiceConnected = vs !== null ? vs : _voiceState;
 		res.writeHead(200, { 'Content-Type': 'application/json' });
 		res.end(JSON.stringify({
 			clients: sseClients.length,
 			muted: _muteState,
-			voiceConnected: _voiceState,
+			voiceConnected,
 			state: eff,
 			label,
 		}));
@@ -2407,7 +2428,8 @@ const server = createServer((req, res) => {
 			}
 		}
 		res.writeHead(200, { 'Content-Type': 'application/json' });
-		res.end(JSON.stringify({ muted: _muteState, voiceConnected: _voiceState, state: effectiveAgentState() }));
+		const vs2 = readVoiceState();
+		res.end(JSON.stringify({ muted: _muteState, voiceConnected: vs2 !== null ? vs2 : _voiceState, state: effectiveAgentState() }));
 		return;
 	}
 
