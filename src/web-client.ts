@@ -295,27 +295,27 @@ const HTML = /* html */ `<!DOCTYPE html>
   }
   #tasks:empty { display: none; }
   .task-item {
-    display: flex; align-items: center; gap: 10px;
-    padding: 9px 0; border-bottom: 1px solid #141420;
+    display: flex; align-items: center; gap: 13px;
+    padding: 15px 0; border-bottom: 1px solid #141420;
   }
   .task-item:last-child { border-bottom: none; }
   .task-status {
-    width: 20px; height: 20px; border-radius: 50%;
+    width: 22px; height: 22px; border-radius: 50%;
     display: flex; align-items: center; justify-content: center;
-    font-size: 11px; flex-shrink: 0;
+    font-size: 12px; flex-shrink: 0;
   }
   .task-status.working { background: #1e3a5f; color: #60a5fa; animation: pulse 1.5s infinite; }
   .task-status.done { background: #1e4028; color: #4ecca3; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
-  .task-text { color: #c0c0c8; flex: 1; word-break: break-word; font-size: 16px; line-height: 1.4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .task-text { color: #d0d0d8; flex: 1; word-break: break-word; font-size: 18px; line-height: 1.4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .task-text.expanded { white-space: normal; }
-  .task-time { color: #666; font-size: 12px; flex-shrink: 0; }
+  .task-time { color: #777; font-size: 13px; flex-shrink: 0; }
   .task-expand {
-    flex-shrink: 0; padding: 3px 9px; border-radius: 10px;
-    background: #1a2030; color: #8ab4c8; font-size: 12px; cursor: pointer;
-    border: 1px solid #2a3344; user-select: none;
+    flex-shrink: 0; padding: 5px 12px; border-radius: 12px;
+    background: #2a4060; color: #d8e8f8; font-size: 13px; font-weight: 500;
+    cursor: pointer; border: 1px solid #3a5075; user-select: none;
   }
-  .task-expand:hover { background: #233045; color: #aac4d8; }
+  .task-expand:hover { background: #3a5075; color: #ffffff; }
 
   /* Dynamic region */
   #dynamic-region { padding: 0 16px 8px; width: 100%; box-sizing: border-box; user-select: text; -webkit-user-select: text; }
@@ -878,17 +878,18 @@ function updateTask(taskId, status, text, result) {
   if (isNew && window._drActiveTab === 'starter') { switchDRTab('tasks'); }
   // Auto-expand ONLY ongoing tasks (working/pending) so the user sees progress.
   // Done tasks stay collapsed by default — user clicks the "Show details" chip.
-  // (Was: auto-expand every newly-done task, which filled the pane with walls of text.)
   if (status === 'working' && !expandedTasks.has(taskId)) {
     expandedTasks.add(taskId);
   }
-  // When a task transitions done, explicitly collapse it (done → fold).
-  if (status === 'done' && !wasDone) {
+  // When a task transitions done, auto-collapse — UNLESS the user manually
+  // expanded it (userExpanded set). Prevents the "2s flash then close" bug.
+  if (status === 'done' && !wasDone && !userExpanded.has(taskId)) {
     expandedTasks.delete(taskId);
   }
   renderTasks();
 }
 const expandedTasks = window.expandedTasks = new Set();
+const userExpanded = window.userExpanded = new Set(); // user-initiated expands — never auto-collapse these
 let userCollapsed = false; // user manually collapsed — suppress auto-expand
 // Listen for external collapse/expand commands (from inline tools via AppleScript)
 new MutationObserver(() => {
@@ -896,7 +897,7 @@ new MutationObserver(() => {
   if (document.body.dataset.taskAction === 'expand') { Object.keys(taskMap).forEach(id => { if (taskMap[id].result) expandedTasks.add(id); }); userCollapsed = false; renderTasks(); document.body.dataset.taskAction = ''; }
 }).observe(document.body, { attributes: true, attributeFilter: ['data-task-action'] });
 function toggleResult(taskId) {
-  if (expandedTasks.has(taskId)) { expandedTasks.delete(taskId); } else { expandedTasks.add(taskId); userCollapsed = false; }
+  if (expandedTasks.has(taskId)) { expandedTasks.delete(taskId); userExpanded.delete(taskId); } else { expandedTasks.add(taskId); userExpanded.add(taskId); userCollapsed = false; }
   const el = document.getElementById('result-' + taskId);
   if (el) el.style.display = expandedTasks.has(taskId) ? 'block' : 'none';
 }
@@ -915,6 +916,22 @@ document.addEventListener('click', function(e) {
   const item = e.target.closest && e.target.closest('.task-item[data-taskid]');
   if (item) toggleResult(item.dataset.taskid);
 });
+// Strip clauses / parens / colons and keep the head of the first sentence.
+// "Polymarket research summary (pulled from Studio…" → "Polymarket research summary"
+function summarizeTaskText(raw) {
+  if (!raw) return '';
+  let s = String(raw).trim();
+  // Cut at first strong boundary
+  const cuts = [' (', ' — ', ' - ', ': ', '. ', ', '];
+  for (const c of cuts) {
+    const idx = s.indexOf(c);
+    if (idx > 0 && idx < 60) { s = s.slice(0, idx); break; }
+  }
+  // Final safety: never let a single phrase exceed ~50 chars
+  if (s.length > 50) s = s.slice(0, 47) + '…';
+  return s;
+}
+
 function renderTasks() {
   const container = $('tasks');
   const entries = Object.entries(taskMap);
@@ -933,7 +950,7 @@ function renderTasks() {
     const resultDisplay = isExpanded ? 'block' : 'none';
     const resultHtml = hasResult ? '<div id="result-' + id + '" style="display:' + resultDisplay + ';padding:8px 12px;color:#b8c8d8;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;background:#0d1520;border-radius:8px;margin:4px 0 6px 30px">' + t.result.replace(/</g,'&lt;') + '</div>' : '';
     const rawText = t.text || id;
-    const displayText = rawText.length > 40 && !isExpanded ? rawText.slice(0, 37) + '…' : rawText;
+    const displayText = isExpanded ? rawText : summarizeTaskText(rawText);
     const textClass = isExpanded ? 'task-text expanded' : 'task-text';
     const expandChip = hasResult ? '<span class="task-expand">' + (isExpanded ? 'Hide ▾' : 'Show details ▸') + '</span>' : '';
     return '<div class="task-item"' + clickAttr + '>' +
@@ -981,11 +998,12 @@ function startTaskPolling() {
         if (t.status === 'done' && existing.status && existing.status !== 'done') {
           showToast('<span class="toast-label">Done</span> ' + (t.text || t.id).slice(0, 60));
         }
-        // Auto-expand ONLY working tasks (progress visibility). Done = collapse.
+        // Auto-expand ONLY working tasks (progress visibility). Done = collapse,
+        // unless the user manually expanded it via the chip (userExpanded set).
         if (t.status === 'working' && !expandedTasks.has(t.id)) {
           expandedTasks.add(t.id);
         }
-        if (t.status === 'done' && existing.status !== 'done') {
+        if (t.status === 'done' && existing.status !== 'done' && !userExpanded.has(t.id)) {
           expandedTasks.delete(t.id);
         }
         taskMap[t.id] = { status: t.status, text: t.text, time: new Date(t.time * 1000), result: t.result || existing.result || '' };
