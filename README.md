@@ -186,31 +186,17 @@ These unlock more capabilities. Add to `.env` when ready:
 
 ## Running costs
 
-Sutando is free to run at the base level — the only required paid piece is your Claude Code subscription (which you presumably already have since Sutando is a Claude Code project). Everything else is either free, free-tier-sufficient, or optional.
+One table, organized by capability. The only required paid piece is your Claude Code subscription — everything else is optional and mostly free-tier-sufficient.
 
-### Free / free-tier is enough
+| Capability | When you need it | Service required | Cost |
+|---|---|---|---|
+| **Basic** (core agent + screen / notes / calendar / email / reminders / contacts / browser / iMessage) | Always — this is Sutando's baseline | [Claude Code](https://www.anthropic.com/pricing) + [Gemini API key](https://ai.google.dev) + Google OAuth + macOS | Claude Code $20/mo (Pro), $100/mo (Max 5×), or $200/mo (Max 20×). Gemini + OAuth + macOS all free. |
+| **Voice agent** (real-time conversation in browser or on phone) | If you want to talk to Sutando | [Gemini voice API](https://ai.google.dev) (same key as Basic) | Free tier covers normal use (~15 req/min). Heavy use: [Gemini paid](https://ai.google.dev/pricing) ~$0.30–$1.30/hr. |
+| **Telegram / Discord / WhatsApp** (message Sutando from any of these) | If you want non-voice chat from your phone or desktop | [Telegram BotFather](https://t.me/BotFather), [Discord developer portal](https://discord.com/developers/applications), `wacli` (bundled) | All free for personal use. |
+| **Phone calls / summon** (inbound, outbound, "summon" via phone) | If you want Sutando to answer / place phone calls | [Twilio](https://www.twilio.com/pricing) phone number + [ngrok](https://ngrok.com/download) webhook | Twilio ~$1/mo number + ~$0.0125/min inbound + ~$0.015/min outbound (Media Streams included). ngrok free tier works. |
+| **Agent joining meetings via dial-in** (PSTN join into Zoom / Google Meet) | If you want the phone agent to dial into a meeting as a participant | [Zoom Pro](https://zoom.us/pricing) OR [Google Workspace Business](https://workspace.google.com/pricing.html) *on the host side* (the meeting organizer's account needs toll dial-in enabled) | Zoom Pro ~$15/mo, Google Workspace Business Starter ~$7/mo. Sutando's side is already covered by the Phone row above. |
 
-| Thing | Why it's free for you |
-|---|---|
-| [Gemini voice API](https://ai.google.dev) (`GEMINI_API_KEY`) | Free tier covers normal interactive use (~15 req/min). |
-| [ngrok](https://ngrok.com/download) (for phone webhook) | Free tier gives a stable subdomain with your authtoken. Only needed if you wire up phone calls. |
-| [Gmail](https://developers.google.com/gmail/api) / [Google Calendar](https://developers.google.com/calendar) / Reminders / Contacts | OAuth via `gws auth`, no cost. |
-| [Telegram bot](https://t.me/BotFather) | BotFather issues tokens free, no message caps for personal use. |
-| [Discord bot](https://discord.com/developers/applications) | Developer portal is free. |
-| [X / Twitter API](https://developer.x.com/en/portal/dashboard) | Free tier with Bearer token is fine for read-only feed pulls. |
-| macOS system integrations (iMessage, Reminders, Contacts, Screen, Browser) | Native to the OS. |
-| WhatsApp (wacli), iMessage, Contacts lookup | No per-message fees. |
-
-### Paid (required or optional)
-
-| Thing | When you need it | Ballpark cost |
-|---|---|---|
-| **[Claude Code subscription](https://www.anthropic.com/pricing)** | Required — Sutando runs on top of Claude Code | $20/mo (Pro) to $200/mo (Max), depending on usage |
-| **[Twilio](https://www.twilio.com/pricing)** phone number + voice | Only if you want inbound/outbound phone calls or meeting dial-in | ~$1/mo for the number + ~$0.0125/min inbound + ~$0.015/min outbound; Media Streams pass-through included |
-| **[Zoom Pro](https://zoom.us/pricing) or [Google Meet Business](https://workspace.google.com/pricing.html)** | Only if you want the agent to phone-dial-in to meetings (toll dial-in requires a paid meeting tier on the host side) | Zoom Pro ~$15/mo, Google Workspace Business Starter ~$7/mo |
-| [Gemini API paid tier](https://ai.google.dev/pricing) | Optional — only if you exceed free-tier quota on heavy voice use | ~$0.30–$1.30/hr of active voice |
-
-**Minimal-cost path** (what most users want): Claude Code sub + free Gemini tier + free ngrok. Everything works except phone calls. Add Twilio (~$1/mo + per-minute) only if you want phone.
+**Minimal-cost path** (what most users want): Claude Code subscription + free Gemini + free OAuth. Everything voice + browser + messaging works at $0 beyond the Claude Code sub. Phone and meeting dial-in are opt-in.
 
 ---
 
