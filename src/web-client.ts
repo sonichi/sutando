@@ -923,6 +923,9 @@ document.addEventListener('click', function(e) {
 // and clause fragments; keep a short semantic label.
 // "[Discord @susanliu_] maybe make it look more like this, add emoji in front"
 //   → "maybe make it look more like this"
+// NOTE: regex literals live inside the HTML template string — single \ is
+// eaten by the template literal parser (so /\s+/g turns into /s+/g in the
+// browser and strips s characters!). Double-escape every backslash.
 function summarizeTaskText(raw) {
   if (!raw) return '';
   let s = String(raw).trim();
@@ -930,13 +933,13 @@ function summarizeTaskText(raw) {
   // may have multiple: "[Discord @X] [Replying to Y] actual content").
   for (let i = 0; i < 4; i++) {
     const before = s;
-    s = s.replace(/^\[Discord[^\]]*\]\s*/i, '');
-    s = s.replace(/^\[Replying to[^\]]*\]\s*/i, '');
-    s = s.replace(/^\[Voice[^\]]*\]\s*/i, '');
+    s = s.replace(/^\\[Discord[^\\]]*\\]\\s*/i, '');
+    s = s.replace(/^\\[Replying to[^\\]]*\\]\\s*/i, '');
+    s = s.replace(/^\\[Voice[^\\]]*\\]\\s*/i, '');
     if (s === before) break;
   }
   // Strip inline "[File attached: ...]" chunks anywhere in the text.
-  s = s.replace(/\[File attached:[^\]]*\]/gi, '').replace(/\s+/g, ' ').trim();
+  s = s.replace(/\\[File attached:[^\\]]*\\]/gi, '').replace(/\\s+/g, ' ').trim();
   // Now cut at first strong boundary to keep the head of the first sentence.
   const cuts = [' (', ' — ', ' - ', ': ', '. ', ', '];
   for (const c of cuts) {
