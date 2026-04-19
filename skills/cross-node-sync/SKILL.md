@@ -25,6 +25,7 @@ Syncthing would still be the right call if: scope grew past a few hundred files,
 **Syncs (both directions, union semantics via `rsync --update`):**
 - `~/.claude/projects/-Users-xueqingliu-Documents-sutando-sutando/memory/` — cross-session bot memory
 - `<repo>/notes/` — user's second-brain notes
+- `<repo>/assets/` — owner personal runtime assets (e.g. gitignored `stand-avatar.png`); `/assets` is entirely gitignored, rsync is the only transport
 
 **Excluded (per-node state):**
 - `state/`, `tasks/`, `results/`, `logs/` — per-bot queues + histories
