@@ -72,6 +72,103 @@ const HTML = /* html */ `<!DOCTYPE html>
     50% { box-shadow: 0 0 20px rgba(251,191,36,0.8), inset 0 0 14px 2px rgba(251,191,36,0.35); }
     100% { box-shadow: 0 0 10px rgba(251,191,36,0.45), inset 0 0 0 0 rgba(251,191,36,0.0); }
   }
+
+  /* Default inline-SVG avatar — shown when no custom avatar has been
+     generated (most new users). Mirrors docs/avatar-default.html mockup
+     from PR #443. State classes drive per-state animation via the .s-*
+     modifier on the container (#avatar-wrap / .hero-svg-wrap). */
+  .avatar-svg-default {
+    width: 100%; height: 100%; overflow: visible; display: block;
+  }
+  .avatar-svg-default .stand-body,
+  .avatar-svg-default .stand-head {
+    fill: var(--accent, #7c83ff); transition: fill 0.4s ease;
+  }
+  .avatar-svg-default .stand-visor { fill: #0f1117; }
+  .avatar-svg-default .stand-arm {
+    stroke: var(--accent, #7c83ff); stroke-width: 1.5; fill: none;
+    opacity: 0.45; transition: stroke 0.4s ease;
+  }
+  .avatar-svg-default .halo {
+    fill: none; stroke: var(--accent, #7c83ff);
+    stroke-width: 1.5; opacity: 0; transform-origin: center;
+  }
+  .avatar-svg-default .orbit-dot { fill: var(--accent, #60a5fa); opacity: 0; }
+  .avatar-svg-default .scan-beam { fill: var(--accent, #fbbf24); opacity: 0; }
+  .avatar-svg-default .constellation { stroke: #3a3f5c; stroke-width: 0.5; opacity: 0.3; }
+  .avatar-svg-default .constellation-node { fill: #3a3f5c; opacity: 0.35; }
+
+  /* idle — indigo, faint breathe */
+  .s-idle .avatar-svg-default { --accent: #7c83ff; }
+  .s-idle .avatar-svg-default .stand-body,
+  .s-idle .avatar-svg-default .stand-head {
+    animation: svg-breathe 4s ease-in-out infinite; transform-origin: 50% 55%;
+  }
+  @keyframes svg-breathe {
+    0%, 100% { transform: scale(1); }
+    50% { transform: scale(1.02); }
+  }
+  /* listening — violet, concentric wave rings */
+  .s-listening .avatar-svg-default { --accent: #a78bfa; }
+  .s-listening .avatar-svg-default .halo { animation: svg-halo-pulse 1.6s ease-out infinite; }
+  .s-listening .avatar-svg-default .halo:nth-of-type(2) { animation-delay: 0.4s; }
+  .s-listening .avatar-svg-default .halo:nth-of-type(3) { animation-delay: 0.8s; }
+  @keyframes svg-halo-pulse {
+    0% { r: 26; opacity: 0.7; stroke-width: 2; }
+    100% { r: 46; opacity: 0; stroke-width: 0.5; }
+  }
+  /* speaking — green, visor sweep + glow */
+  .s-speaking .avatar-svg-default { --accent: #4ecca3; }
+  .s-speaking .avatar-svg-default .stand-visor { fill: url(#visorSweep); }
+  .s-speaking .avatar-svg-default .halo:nth-of-type(1) {
+    animation: svg-glow 0.8s ease-in-out infinite alternate;
+  }
+  @keyframes svg-glow {
+    0% { r: 32; opacity: 0.25; stroke-width: 2; }
+    100% { r: 36; opacity: 0.5; stroke-width: 3; }
+  }
+  /* working — blue, orbiting dots + swell */
+  .s-working .avatar-svg-default { --accent: #60a5fa; }
+  .s-working .avatar-svg-default .orbit-dot {
+    opacity: 1; animation: svg-orbit 1.2s linear infinite;
+  }
+  .s-working .avatar-svg-default .orbit-dot:nth-of-type(2) {
+    animation-delay: -0.6s; opacity: 0.55;
+  }
+  @keyframes svg-orbit {
+    0%   { transform: rotate(0deg) translateX(28px) rotate(0deg); }
+    100% { transform: rotate(360deg) translateX(28px) rotate(-360deg); }
+  }
+  .s-working .avatar-svg-default .halo:nth-of-type(1) {
+    animation: svg-work-swell 1.2s ease-in-out infinite;
+  }
+  @keyframes svg-work-swell {
+    0%, 100% { r: 28; opacity: 0.25; }
+    50% { r: 32; opacity: 0.55; }
+  }
+  /* seeing — amber, visor scan */
+  .s-seeing .avatar-svg-default { --accent: #fbbf24; }
+  .s-seeing .avatar-svg-default .scan-beam {
+    animation: svg-scan 0.7s ease-in-out infinite;
+  }
+  @keyframes svg-scan {
+    0%   { transform: translateX(-22px); opacity: 0; }
+    25%  { opacity: 0.9; }
+    75%  { opacity: 0.9; }
+    100% { transform: translateX(22px); opacity: 0; }
+  }
+  .s-seeing .avatar-svg-default .halo:nth-of-type(1) {
+    animation: svg-see-ring 0.7s ease-out infinite;
+  }
+  @keyframes svg-see-ring {
+    0%   { r: 28; opacity: 0.6; stroke-width: 2; }
+    100% { r: 38; opacity: 0; stroke-width: 0.5; }
+  }
+
+  /* Default SVG containers (hidden until identity fetch decides) */
+  #avatar-svg-wrap { position: absolute; top: 8px; left: 8px; width: 44px; height: 44px; display: none; }
+  .hero-svg-wrap { width: 80px; height: 80px; margin-bottom: 16px; display: none; }
+
   .header .info { flex: 1; }
   .header h1 { color: #fff; font-size: 1.1em; font-weight: 500; }
   .header .meta { font-size: 11px; color: #555; display: flex; gap: 12px; align-items: center; margin-top: 2px; }
@@ -329,9 +426,42 @@ const HTML = /* html */ `<!DOCTYPE html>
 <body>
 
 <div class="header">
-  <div class="avatar-wrap" id="avatar-wrap">
+  <div class="avatar-wrap s-idle" id="avatar-wrap">
     <canvas id="speak-canvas" width="60" height="60"></canvas>
     <img class="avatar" id="stand-avatar" src="http://localhost:7844/avatar">
+    <div id="avatar-svg-wrap">
+      <svg class="avatar-svg-default" viewBox="-50 -50 100 100" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <linearGradient id="visorSweep" x1="0%" y1="0%" x2="100%" y2="0%">
+            <stop offset="0%" stop-color="#6ee7b7"/>
+            <stop offset="50%" stop-color="#a7f3d0"/>
+            <stop offset="100%" stop-color="#6ee7b7"/>
+            <animate attributeName="x1" values="-100%;100%" dur="1.2s" repeatCount="indefinite"/>
+            <animate attributeName="x2" values="0%;200%" dur="1.2s" repeatCount="indefinite"/>
+          </linearGradient>
+        </defs>
+        <circle class="constellation-node" cx="-34" cy="-28" r="1.2"/>
+        <circle class="constellation-node" cx="32" cy="-30" r="1"/>
+        <circle class="constellation-node" cx="-28" cy="32" r="1.2"/>
+        <circle class="constellation-node" cx="36" cy="26" r="1"/>
+        <line class="constellation" x1="-34" y1="-28" x2="32" y2="-30"/>
+        <line class="constellation" x1="32" y1="-30" x2="36" y2="26"/>
+        <line class="constellation" x1="-28" y1="32" x2="36" y2="26"/>
+        <path class="stand-arm" d="M -14 0 Q -26 4 -30 14"/>
+        <path class="stand-arm" d="M 14 0 Q 26 4 30 14"/>
+        <path class="stand-arm" d="M -14 -2 Q -22 -14 -18 -24"/>
+        <path class="stand-arm" d="M 14 -2 Q 22 -14 18 -24"/>
+        <circle class="halo" cx="0" cy="0" r="32"/>
+        <circle class="halo" cx="0" cy="0" r="32"/>
+        <circle class="halo" cx="0" cy="0" r="32"/>
+        <ellipse class="stand-body" cx="0" cy="10" rx="14" ry="22"/>
+        <circle class="stand-head" cx="0" cy="-18" r="10"/>
+        <rect class="stand-visor" x="-8" y="-20" width="16" height="4" rx="1"/>
+        <rect class="scan-beam" x="-3" y="-22" width="6" height="8" rx="1"/>
+        <circle class="orbit-dot" cx="0" cy="0" r="2.2"/>
+        <circle class="orbit-dot" cx="0" cy="0" r="1.6"/>
+      </svg>
+    </div>
   </div>
   <div class="info">
     <h1 id="stand-name">Sutando</h1>
@@ -361,6 +491,16 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
     document.getElementById('stand-avatar').style.display='block';
     var ha=document.getElementById('hero-avatar');
     if(ha){ha.style.display='block';ha.style.opacity='0';}
+  } else {
+    // No custom avatar — show the inline-SVG default in both places.
+    // PR #443 shipped the SVG assets in docs/avatar-default.html; this
+    // wiring makes them visible at runtime for the common "no custom
+    // identity yet" path. State classes on the containers (s-idle etc.)
+    // are toggled by the SSE agent-state bridge below.
+    var svgHeader=document.getElementById('avatar-svg-wrap');
+    if(svgHeader) svgHeader.style.display='block';
+    var svgHero=document.getElementById('hero-svg-wrap');
+    if(svgHero) svgHero.style.display='block';
   }
   if(s.name || s.avatarGenerated){
     var hero=document.getElementById('hero');
@@ -375,8 +515,41 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
 }).catch(()=>{});
 </script>
 
-<div class="hero" id="hero">
+<div class="hero s-idle" id="hero">
   <img class="avatar-hero" id="hero-avatar" src="http://localhost:7844/avatar">
+  <div class="hero-svg-wrap" id="hero-svg-wrap">
+    <svg class="avatar-svg-default" viewBox="-50 -50 100 100" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <linearGradient id="visorSweepHero" x1="0%" y1="0%" x2="100%" y2="0%">
+          <stop offset="0%" stop-color="#6ee7b7"/>
+          <stop offset="50%" stop-color="#a7f3d0"/>
+          <stop offset="100%" stop-color="#6ee7b7"/>
+          <animate attributeName="x1" values="-100%;100%" dur="1.2s" repeatCount="indefinite"/>
+          <animate attributeName="x2" values="0%;200%" dur="1.2s" repeatCount="indefinite"/>
+        </linearGradient>
+      </defs>
+      <circle class="constellation-node" cx="-34" cy="-28" r="1.2"/>
+      <circle class="constellation-node" cx="32" cy="-30" r="1"/>
+      <circle class="constellation-node" cx="-28" cy="32" r="1.2"/>
+      <circle class="constellation-node" cx="36" cy="26" r="1"/>
+      <line class="constellation" x1="-34" y1="-28" x2="32" y2="-30"/>
+      <line class="constellation" x1="32" y1="-30" x2="36" y2="26"/>
+      <line class="constellation" x1="-28" y1="32" x2="36" y2="26"/>
+      <path class="stand-arm" d="M -14 0 Q -26 4 -30 14"/>
+      <path class="stand-arm" d="M 14 0 Q 26 4 30 14"/>
+      <path class="stand-arm" d="M -14 -2 Q -22 -14 -18 -24"/>
+      <path class="stand-arm" d="M 14 -2 Q 22 -14 18 -24"/>
+      <circle class="halo" cx="0" cy="0" r="32"/>
+      <circle class="halo" cx="0" cy="0" r="32"/>
+      <circle class="halo" cx="0" cy="0" r="32"/>
+      <ellipse class="stand-body" cx="0" cy="10" rx="14" ry="22"/>
+      <circle class="stand-head" cx="0" cy="-18" r="10"/>
+      <rect class="stand-visor" x="-8" y="-20" width="16" height="4" rx="1"/>
+      <rect class="scan-beam" x="-3" y="-22" width="6" height="8" rx="1"/>
+      <circle class="orbit-dot" cx="0" cy="0" r="2.2"/>
+      <circle class="orbit-dot" cx="0" cy="0" r="1.6"/>
+    </svg>
+  </div>
   <h2 id="hero-name">Sutando</h2>
   <p class="tagline">Summon your AI superpower</p>
   <button class="btn-hero" onclick="toggle()">Start Voice</button>
@@ -478,6 +651,19 @@ function initRemoteToggle() {
       var setSeeing = st === 'seeing';
       if (av) { av.classList.toggle('working', setWorking); av.classList.toggle('seeing', setSeeing); }
       if (hav) { hav.classList.toggle('working', setWorking); hav.classList.toggle('seeing', setSeeing); }
+      // Drive inline-SVG default avatar via .s-* classes on parent
+      // containers (header #avatar-wrap + .hero). Server emits 'idle',
+      // 'listening', 'speaking', 'working', 'seeing'; we keep exactly one
+      // active and default to s-idle when the state is empty/unknown.
+      var validStates = ['idle', 'listening', 'speaking', 'working', 'seeing'];
+      var next = validStates.indexOf(st) >= 0 ? st : 'idle';
+      var aw = document.getElementById('avatar-wrap');
+      var hw = document.getElementById('hero');
+      [aw, hw].forEach(function(el) {
+        if (!el) return;
+        validStates.forEach(function(s) { el.classList.remove('s-' + s); });
+        el.classList.add('s-' + next);
+      });
     } catch {}
   });
   _sseSource.onerror = () => setTimeout(() => initRemoteToggle(), 5000);
@@ -948,6 +1134,15 @@ function startSpeakingDetection() {
     var speaking = smoothed > 6;
     if (avatar) avatar.classList.toggle('speaking', speaking);
     if (heroAvatar) heroAvatar.classList.toggle('speaking', speaking);
+    // Propagate to the inline-SVG default avatar on parent containers.
+    // Local audio-RMS fires faster than the server-side 'speaking'
+    // agent-state event; without this the SVG would lag ~500ms.
+    var aw = document.getElementById('avatar-wrap');
+    var hw = document.getElementById('hero');
+    [aw, hw].forEach(function(el) {
+      if (!el) return;
+      if (speaking) { el.classList.remove('s-idle','s-listening','s-working','s-seeing'); el.classList.add('s-speaking'); }
+    });
     // Draw radial bars on canvas
     if (ctx && canvas) {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
