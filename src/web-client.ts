@@ -307,7 +307,7 @@ const HTML = /* html */ `<!DOCTYPE html>
   .task-status.working { background: #1e3a5f; color: #60a5fa; animation: pulse 1.5s infinite; }
   .task-status.done { background: #1e4028; color: #4ecca3; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
-  .task-text { color: #c0c0c8; flex: 1; word-break: break-word; font-size: 13px; line-height: 1.4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .task-text { color: #c0c0c8; flex: 1; word-break: break-word; font-size: 14px; line-height: 1.4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .task-text.expanded { white-space: normal; }
   .task-time { color: #666; font-size: 11px; flex-shrink: 0; }
   .task-expand {
@@ -930,7 +930,7 @@ function renderTasks() {
     const resultDisplay = isExpanded ? 'block' : 'none';
     const resultHtml = hasResult ? '<div id="result-' + id + '" style="display:' + resultDisplay + ';padding:8px 12px;color:#b8c8d8;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;background:#0d1520;border-radius:8px;margin:4px 0 6px 30px">' + t.result.replace(/</g,'&lt;') + '</div>' : '';
     const rawText = t.text || id;
-    const displayText = rawText.length > 60 && !isExpanded ? rawText.slice(0, 57) + '…' : rawText;
+    const displayText = rawText.length > 100 && !isExpanded ? rawText.slice(0, 97) + '…' : rawText;
     const textClass = isExpanded ? 'task-text expanded' : 'task-text';
     const expandChip = hasResult ? '<span class="task-expand">' + (isExpanded ? 'Hide ▾' : 'Show details ▸') + '</span>' : '';
     return '<div class="task-item"' + clickAttr + '>' +
