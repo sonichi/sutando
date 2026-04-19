@@ -519,15 +519,7 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
   <img class="avatar-hero" id="hero-avatar" src="http://localhost:7844/avatar">
   <div class="hero-svg-wrap" id="hero-svg-wrap">
     <svg class="avatar-svg-default" viewBox="-50 -50 100 100" xmlns="http://www.w3.org/2000/svg">
-      <defs>
-        <linearGradient id="visorSweepHero" x1="0%" y1="0%" x2="100%" y2="0%">
-          <stop offset="0%" stop-color="#6ee7b7"/>
-          <stop offset="50%" stop-color="#a7f3d0"/>
-          <stop offset="100%" stop-color="#6ee7b7"/>
-          <animate attributeName="x1" values="-100%;100%" dur="1.2s" repeatCount="indefinite"/>
-          <animate attributeName="x2" values="0%;200%" dur="1.2s" repeatCount="indefinite"/>
-        </linearGradient>
-      </defs>
+      <!-- Hero reuses header's #visorSweep gradient (single definition). -->
       <circle class="constellation-node" cx="-34" cy="-28" r="1.2"/>
       <circle class="constellation-node" cx="32" cy="-30" r="1"/>
       <circle class="constellation-node" cx="-28" cy="32" r="1.2"/>
@@ -1141,7 +1133,17 @@ function startSpeakingDetection() {
     var hw = document.getElementById('hero');
     [aw, hw].forEach(function(el) {
       if (!el) return;
-      if (speaking) { el.classList.remove('s-idle','s-listening','s-working','s-seeing'); el.classList.add('s-speaking'); }
+      if (speaking) {
+        el.classList.remove('s-idle','s-listening','s-working','s-seeing');
+        el.classList.add('s-speaking');
+      } else if (el.classList.contains('s-speaking')) {
+        // Mirror legacy `classList.toggle('speaking', speaking)`: clear on
+        // audio drop so the SVG visor doesn't stay green until the next SSE
+        // event. Fall back to s-idle — server SSE will overwrite with the
+        // real state (listening/working/etc.) within the next poll.
+        el.classList.remove('s-speaking');
+        el.classList.add('s-idle');
+      }
     });
     // Draw radial bars on canvas
     if (ctx && canvas) {
