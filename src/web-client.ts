@@ -249,10 +249,10 @@ const HTML = /* html */ `<!DOCTYPE html>
   #transcript {
     min-height: 80px; max-height: 30vh;
     background: #0e0e18; border-radius: 12px; padding: 10px 14px;
-    overflow-y: auto; font-size: 13px; line-height: 1.6;
+    overflow-y: auto; font-size: 18px; line-height: 1.6;
     margin-bottom: 6px;
   }
-  .t-entry { margin-bottom: 6px; position: relative; user-select: text; }
+  .t-entry { margin-bottom: 8px; position: relative; user-select: text; }
   .t-entry .copy-btn {
     display: none; position: absolute; right: 0; top: 0;
     background: #1e1e30; border: 1px solid #2a2a40; color: #666; font-size: 10px;
@@ -264,8 +264,8 @@ const HTML = /* html */ `<!DOCTYPE html>
   .t-user::before { content: 'You: '; font-weight: 600; color: #5a9fd4; }
   .t-assistant { color: #a8d8b0; }
   .t-assistant::before { content: 'Sutando: '; font-weight: 600; color: #6dbe82; }
-  .t-system { color: #666; font-size: 12px; }
-  .t-interim { color: #7fb3e0; opacity: 0.5; font-size: 13px; }
+  .t-system { color: #999; font-size: 16px; }
+  .t-interim { color: #7fb3e0; opacity: 0.5; font-size: 18px; }
   .t-interim::before { content: 'You: '; font-weight: 600; }
 
   /* Input bar */
@@ -351,10 +351,10 @@ const HTML = /* html */ `<!DOCTYPE html>
   #dynamic-region .q-input:focus { border-color: #f0ad4e66; }
   #dynamic-region .dr-proactive { text-align: center; padding: 8px; font-size: 13px; color: #8899a6; }
   #dynamic-region .dr-chips { text-align: center; }
-  #dynamic-region .dr-chips .suggestions-label { margin-bottom: 6px; }
+  #dynamic-region .dr-chips .suggestions-label { margin-bottom: 8px; }
   #dynamic-region .dr-chips .suggestion {
     display: inline-block; background: #1a1a2e; border: 1px solid #2a2a4e;
-    border-radius: 16px; padding: 6px 14px; margin: 3px; font-size: 11px;
+    border-radius: 18px; padding: 8px 18px; margin: 4px; font-size: 18px;
     color: #8899a6; cursor: pointer; transition: all 0.2s;
   }
   #dynamic-region .dr-chips .suggestion:hover { background: #2a2a4e; color: #ccc; border-color: #4a4a6e; }
@@ -919,12 +919,25 @@ document.addEventListener('click', function(e) {
   const item = e.target.closest && e.target.closest('.task-item[data-taskid]');
   if (item) toggleResult(item.dataset.taskid);
 });
-// Strip clauses / parens / colons and keep the head of the first sentence.
-// "Polymarket research summary (pulled from Studio…" → "Polymarket research summary"
+// Strip routing prefixes ([Discord @handle], [Replying to ...], [File attached: ...])
+// and clause fragments; keep a short semantic label.
+// "[Discord @susanliu_] maybe make it look more like this, add emoji in front"
+//   → "maybe make it look more like this"
 function summarizeTaskText(raw) {
   if (!raw) return '';
   let s = String(raw).trim();
-  // Cut at first strong boundary
+  // Strip leading routing / reply / attachment brackets (iteratively — a task
+  // may have multiple: "[Discord @X] [Replying to Y] actual content").
+  for (let i = 0; i < 4; i++) {
+    const before = s;
+    s = s.replace(/^\[Discord[^\]]*\]\s*/i, '');
+    s = s.replace(/^\[Replying to[^\]]*\]\s*/i, '');
+    s = s.replace(/^\[Voice[^\]]*\]\s*/i, '');
+    if (s === before) break;
+  }
+  // Strip inline "[File attached: ...]" chunks anywhere in the text.
+  s = s.replace(/\[File attached:[^\]]*\]/gi, '').replace(/\s+/g, ' ').trim();
+  // Now cut at first strong boundary to keep the head of the first sentence.
   const cuts = [' (', ' — ', ' - ', ': ', '. ', ', '];
   for (const c of cuts) {
     const idx = s.indexOf(c);
@@ -1959,7 +1972,7 @@ function updateTabHighlights() {
     var border = isActive ? '#4a4a6e' : '#2a2a3e';
     if (t.id === 'questions' && questions.length > 0 && !isActive) fg = '#f0ad4e';
     if (t.id === 'tasks' && hasNewTasks && !isActive) fg = '#4ecca3';
-    return '<span onclick="switchDRTab(&quot;' + t.id + '&quot;)" style="cursor:pointer;padding:4px 0;border-radius:12px;font-size:11px;border:1px solid ' + border + ';background:' + bg + ';color:' + fg + ';flex:1;text-align:center">' + t.label + '</span>';
+    return '<span onclick="switchDRTab(&quot;' + t.id + '&quot;)" style="cursor:pointer;padding:8px 0;border-radius:14px;font-size:18px;border:1px solid ' + border + ';background:' + bg + ';color:' + fg + ';flex:1;text-align:center">' + t.label + '</span>';
   }).join('');
 }
 
@@ -1969,9 +1982,10 @@ function renderTabContent() {
   var tab = window._drActiveTab;
 
   if (tab === 'starter') {
+    // Cap at 5 chips per Susan's "show fewer cards rather than shrink" rule.
     container.innerHTML = '<div class="dr-chips">' +
-      '<div class="suggestions-label" style="font-size:11px;color:#666;margin-bottom:4px">Try saying or typing</div>' +
-      getSuggestionChips().map(function(c) {
+      '<div class="suggestions-label" style="font-size:14px;color:#999;margin-bottom:6px">Try saying or typing</div>' +
+      getSuggestionChips().slice(0, 5).map(function(c) {
         return '<span class="suggestion" onclick="trySuggestion(this)">' +
           c.label + (c.desc ? ' — ' + c.desc : '') + '</span>';
       }).join('') + '</div>';
@@ -2018,7 +2032,8 @@ function renderTabContent() {
       var html = '';
       window._allNotes = notes;
       notes.forEach(function(n) {
-        html += '<div class="note-item" data-title="' + esc(n.title).toLowerCase() + '" data-slug="' + n.slug + '" style="padding:12px 0;border-bottom:1px solid #2a2a3e;display:flex;align-items:center;font-size:18px;line-height:1.65">' +
+        html += '<div class="note-item" data-title="' + esc(n.title).toLowerCase() + '" data-slug="' + n.slug + '" style="padding:12px 10px;margin:0 -10px;border-bottom:1px solid #2a2a3e;display:flex;align-items:center;font-size:18px;line-height:1.65;border-radius:6px">' +
+          '<span style="margin-right:10px;flex-shrink:0">&#128221;</span>' +
           '<span style="color:#7c83ff;cursor:pointer;flex:1" onclick="showNoteContent(&quot;' + n.slug + '&quot;)">' + n.title + '</span>' +
           '<span style="color:#666;font-size:13px;margin-right:8px">' + new Date(n.modified*1000).toLocaleDateString() + '</span>' +
           '<span style="color:#e94560;font-size:13px;cursor:pointer;opacity:0.5" onclick="event.stopPropagation();deleteNoteFromUI(&quot;' + n.slug + '&quot;)">x</span></div>';
