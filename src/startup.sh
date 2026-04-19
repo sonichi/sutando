@@ -295,7 +295,7 @@ else
   # watcher-auto-restart (PR #444) depends on a tmux-wrapped CLI pane,
   # so a first-run user without tmux silently loses that feature.
   if ! command -v tmux > /dev/null 2>&1 && command -v brew > /dev/null 2>&1; then
-    echo "tmux not found — installing via Homebrew (required for Sutando.app watcher-auto-restart)..."
+    echo "tmux not found — installing via Homebrew (~30s, required for Sutando.app watcher-auto-restart)..."
     brew install tmux 2>&1 | tail -3
   fi
   # Fall back to a bare `exec claude` if tmux is still missing.
