@@ -86,6 +86,22 @@ Voice agent and conversation server handle conversation-scope actions with **inl
 
 ---
 
+## Running costs
+
+Running Sutando costs a few cents to a couple dollars per hour of actual voice use, plus Twilio charges if you enable phone calls. Based on published rates:
+
+| Component | Rate | Notes |
+|-----------|------|-------|
+| Gemini Live API | **~$0.30 – $1.30 / hour** of voice | $0.005/min input audio, $0.018/min output audio. The $1.30/hr upper end matches a peak day of ~10 hr of voice. |
+| Twilio Programmable Voice (US local inbound) | **~$0.0125 / min** | $0.0085 voice + $0.004 Media Streams. Add ~$1/mo phone-number rental. |
+| Telegram, Discord, browser voice | **Free** | No per-message cost. |
+
+A typical 3-minute phone call is under $0.15 all-in. Empirical bills match these ranges (e.g. 602 min of voice on one peak day ≈ $13 in Gemini charges ≈ $1.30/hr).
+
+Sources: [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing), [Twilio voice pricing](https://www.twilio.com/en-us/voice/pricing/us).
+
+---
+
 ## Quick start
 
 **Prerequisites:**
@@ -93,8 +109,9 @@ Voice agent and conversation server handle conversation-scope actions with **inl
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code/getting-started) (run `claude` once to complete login)
 - Node.js 22+ (`brew install node`)
 - fswatch (`brew install fswatch`)
-- [Google AI Studio API key](https://ai.google.dev) (free — click "Get API key")
-- *(optional, for phone calls)* [Twilio account](https://www.twilio.com/) + [ngrok](https://ngrok.com/) — Sutando can answer inbound calls and make outbound calls, but you can run the browser + Telegram + Discord paths without them.
+- [Google AI Studio API key](https://ai.google.dev) (click "Get API key" — free to generate; Gemini Live voice is usage-billed, see [Running costs](#running-costs))
+- *(optional, for phone calls)* [Twilio account](https://www.twilio.com/) + [ngrok](https://ngrok.com/) — Sutando can answer inbound calls and make outbound calls (~$0.01–0.03/min, see [Running costs](#running-costs)); you can run the browser + Telegram + Discord paths without them.
+- *(optional, for video/audio)* ffmpeg (`brew install ffmpeg`) — used by subtitle-burn, video-concat, and recording handoff.
 
 ```bash
 # Clone
