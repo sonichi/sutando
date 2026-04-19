@@ -65,9 +65,9 @@ We're looking for contributors to help test and harden these capabilities. If yo
      │                        WS on :3100)        │
      │                                            └──┐
      │                                               │   file bridge
-     ├──telegram──────────► Telegram bridge ─────────┼── tasks/ ──► Core agent
-     │                                               │                 │
-     └──discord───────────► Discord bridge ──────────┘                 ▼
+     ├──telegram──────────► Telegram bridge ─────────┼── tasks/ ──► Core agent ↻
+     │                                               │                  │
+     └──discord───────────► Discord bridge ──────────┘                  ▼
                                                               uses anything:
                                                               email, calendar,
                                                               browser, files,
@@ -75,6 +75,9 @@ We're looking for contributors to help test and harden these capabilities. If yo
                                     ◄── results/ ◄──
                                 (spoken via voice/phone,
                                  text via Telegram/Discord)
+
+    ↻ = cron job — fires the core agent every 5 min to process pending tasks,
+        run health checks, and pick the next build-log item autonomously.
 ```
 
 Three processes work together:
@@ -93,7 +96,7 @@ Running Sutando costs a few cents to a couple dollars per hour of actual voice u
 | Component | Rate | Notes |
 |-----------|------|-------|
 | Gemini Live API | **~$0.30 – $1.30 / hour** of voice | $0.005/min input audio, $0.018/min output audio. The $1.30/hr upper end matches a peak day of ~10 hr of voice. |
-| Twilio Programmable Voice (US local inbound) | **~$0.0125 / min** | $0.0085 voice + $0.004 Media Streams. Add ~$1/mo phone-number rental. |
+| Twilio Programmable Voice (US local, in + out) | **~$0.013 – $0.018 / min** | Inbound $0.0085/min, outbound $0.014/min; both + Media Streams $0.004/min. Add ~$1/mo phone-number rental. |
 | Telegram, Discord, browser voice | **Free** | No per-message cost. |
 
 A typical 3-minute phone call is under $0.15 all-in. Empirical bills match these ranges (e.g. 602 min of voice on one peak day ≈ $13 in Gemini charges ≈ $1.30/hr).
@@ -109,7 +112,7 @@ Sources: [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing), [Twili
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code/getting-started) (run `claude` once to complete login)
 - Node.js 22+ (`brew install node`)
 - fswatch (`brew install fswatch`)
-- [Google AI Studio API key](https://ai.google.dev) (click "Get API key" — free to generate; Gemini Live voice is usage-billed, see [Running costs](#running-costs))
+- [Gemini API key](https://ai.google.dev) (click "Get API key" — free to generate; Gemini Live voice is usage-billed at **~$0.30–$1.30 / hour**, see [Running costs](#running-costs))
 - *(optional, for phone calls)* [Twilio account](https://www.twilio.com/) + [ngrok](https://ngrok.com/) — Sutando can answer inbound calls and make outbound calls (~$0.01–0.03/min, see [Running costs](#running-costs)); you can run the browser + Telegram + Discord paths without them.
 - *(optional, for video/audio)* ffmpeg (`brew install ffmpeg`) — used by subtitle-burn, video-concat, and recording handoff.
 
@@ -139,10 +142,7 @@ This starts all services (voice agent, phone conversation server, web client, da
 
 **Why macOS 15+?** The setup scripts assume the Sequoia System Settings layout for granting TCC permissions (Screen Recording, Accessibility, Input Monitoring). Earlier macOS versions may work for the headless parts (proactive loop, Discord/Telegram bridges) but aren't tested.
 
-**macOS permissions** — grant these on first run (System Settings → Privacy & Security):
-- **Screen Recording** → add `claude` and `node`
-- **Accessibility** → add Sutando app (for context drop + voice toggle)
-- **Microphone** → Chrome will ask on first voice connect
+**macOS permissions** — on first run, macOS will ask you to grant Screen Recording, Accessibility, and Microphone access. See [Security](#security) for what each permission is used for.
 
 **Try saying:**
 - "What's on my screen?" — takes a screenshot and describes it
@@ -294,6 +294,12 @@ It consumes API quota proportional to how much work it finds to do.
 **Recommended setup:**
 - Keep your Twilio phone number private
 - Set `VERIFIED_CALLERS` explicitly in `.env` (don't leave it empty)
+
+**macOS permissions Sutando needs** (System Settings → Privacy & Security):
+- **Screen Recording** → add `claude` and `node`. Required for `describe_screen`, `capture_screen`, and the screen-capture server (port 7845) — lets Sutando see what you're looking at when you ask "what's on my screen?". Also used by the screen-record skill for subtitled recordings.
+- **Accessibility** → add the Sutando menu-bar app. Required for the global hotkeys (⌃C context drop, ⌃V voice toggle, ⌃M mute) and for the `macos-use` skill to click/type into native apps on your behalf.
+- **Microphone** → Chrome (and Terminal, for the screen-record skill). Chrome asks on first voice connect — click Allow.
+- **Contacts / Calendar / Reminders** → asked on demand by the features that use them (contact lookup before a call, `gws calendar +agenda`, `reminders.py add/list/complete`). You can grant these when first prompted rather than up front.
 
 See **[SECURITY.md](SECURITY.md)** for full details, best practices, and how to test your setup.
 
