@@ -382,6 +382,43 @@ export const getCurrentTimeTool: ToolDefinition = {
 	},
 };
 
+// Get what the core agent (Claude Code proactive-loop) is currently doing.
+// Lets voice-agent Gemini answer "what are you working on?" truthfully
+// instead of guessing. Reads core-status.json written by the core agent.
+export const getCoreStatusTool: ToolDefinition = {
+	name: 'get_core_status',
+	description:
+		'Get what the core agent (Claude Code) is currently doing. Use when the user asks ' +
+		'"what are you working on", "what are you up to", "are you busy", "anything running", ' +
+		'or similar questions about background work. Instant file read.',
+	parameters: z.object({}),
+	execution: 'inline',
+	async execute() {
+		try {
+			const repoDir = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
+			const statusPath = join(repoDir, 'core-status.json');
+			if (!existsSync(statusPath)) {
+				return { status: 'idle', description: 'Core agent is not currently running.' };
+			}
+			const raw = readFileSync(statusPath, 'utf-8');
+			const s = JSON.parse(raw) as { status?: string; ts?: number; step?: string };
+			const nowSec = Math.floor(Date.now() / 1000);
+			const ageSec = typeof s.ts === 'number' ? nowSec - s.ts : null;
+			if (s.status === 'running' && ageSec !== null && ageSec < 600) {
+				return {
+					status: 'running',
+					step: s.step || '(no step label)',
+					ageSec,
+					description: `Core agent is working on: ${s.step || 'an unlabeled task'} (started ${ageSec}s ago).`,
+				};
+			}
+			return { status: 'idle', description: 'Core agent is idle right now.' };
+		} catch (e) {
+			return { status: 'unknown', description: `Could not read core status: ${e instanceof Error ? e.message : e}` };
+		}
+	},
+};
+
 
 // Slide control — navigate presentation slides
 export const slideControlTool: ToolDefinition = {
@@ -555,7 +592,7 @@ export const inlineTools = [
 	pressKeyTool, scrollTool, switchTabTool, closeTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
 	volumeTool, brightnessTool, clipboardTool,
-	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, summonTool, dismissTool,
+	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, getCoreStatusTool, summonTool, dismissTool,
 	joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool,
 	describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, slideControlTool, fullscreenTool,
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool, ];
@@ -563,6 +600,7 @@ export const inlineTools = [
 /** Tools available to any caller (including unverified) */
 export const anyCallerTools = [
 	getCurrentTimeTool,
+	getCoreStatusTool,
 ];
 
 /** Owner-only tools (require isOwner) */
