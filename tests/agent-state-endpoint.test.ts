@@ -2,7 +2,7 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, ChildProcess } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -24,6 +24,13 @@ const PORT = 18081; // well above the 8080 dev server + 9900 voice-agent
 const CORE_STATUS_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'core-status.json');
 let savedCoreStatus: string | null = null;
 
+// voice-state.json is read by web-client's readVoiceState() as the authoritative
+// voiceConnected source (browser POST cache is the fallback). Tests in the
+// voice-state describe block below write/remove this file to exercise both
+// branches. Stash + restore any real prod value on setup/teardown.
+const VOICE_STATE_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'voice-state.json');
+let savedVoiceState: string | null = null;
+
 let child: ChildProcess;
 
 async function fetchJson(path: string): Promise<any> {
@@ -39,6 +46,14 @@ describe('/sse-status + /mute-state — agent state plumbing (PR #418)', () => {
 			savedCoreStatus = readFileSync(CORE_STATUS_PATH, 'utf-8');
 		}
 		writeFileSync(CORE_STATUS_PATH, JSON.stringify({ status: 'idle', ts: Math.floor(Date.now() / 1000) }) + '\n');
+
+		// Same rationale as core-status.json: stash + neutralize so a prod
+		// voice-state.json at repo root doesn't leak voiceConnected=true into
+		// the idle baseline assertion below.
+		if (existsSync(VOICE_STATE_PATH)) {
+			savedVoiceState = readFileSync(VOICE_STATE_PATH, 'utf-8');
+		}
+		try { unlinkSync(VOICE_STATE_PATH); } catch { /* already gone */ }
 
 		child = spawn(
 			'npx',
@@ -82,6 +97,12 @@ describe('/sse-status + /mute-state — agent state plumbing (PR #418)', () => {
 		// post-test reads consistent with what it wrote last.
 		if (savedCoreStatus !== null) {
 			writeFileSync(CORE_STATUS_PATH, savedCoreStatus);
+		}
+		// Restore voice-state.json (or clean up our test write)
+		if (savedVoiceState !== null) {
+			writeFileSync(VOICE_STATE_PATH, savedVoiceState);
+		} else {
+			try { unlinkSync(VOICE_STATE_PATH); } catch { /* idempotent */ }
 		}
 	});
 
@@ -151,5 +172,54 @@ describe('/sse-status + /mute-state — agent state plumbing (PR #418)', () => {
 		assert.equal(body.muted, true);
 		assert.equal(body.voiceConnected, true);
 		assert.equal(body.state, 'working');
+	});
+
+	// voice-state.json — authoritative over the browser-reported _voiceState cache.
+	// Written by voice-agent on client connect/disconnect; web-client reads it in
+	// /sse-status. Covers the regression from 2026-04-19 where a web-client restart
+	// left voiceConnected=false in the cache even though voice was still connected.
+	it('/sse-status uses voice-state.json as authoritative voiceConnected', async () => {
+		// Prime the _voiceState cache to false (the desync baseline)
+		await fetchJson('/mute-state?voice=false');
+		let status = await fetchJson('/sse-status');
+		assert.equal(status.voiceConnected, false, 'cache baseline');
+
+		// Write a fresh connected=true file; readVoiceState should return true
+		writeFileSync(VOICE_STATE_PATH, JSON.stringify({ connected: true, ts: Math.floor(Date.now() / 1000) }));
+		status = await fetchJson('/sse-status');
+		assert.equal(status.voiceConnected, true, 'fresh voice-state.json overrides cache');
+
+		// Flip the file to disconnected; readVoiceState should return false
+		writeFileSync(VOICE_STATE_PATH, JSON.stringify({ connected: false, ts: Math.floor(Date.now() / 1000) }));
+		status = await fetchJson('/sse-status');
+		assert.equal(status.voiceConnected, false, 'disconnected voice-state.json overrides cache');
+
+		try { unlinkSync(VOICE_STATE_PATH); } catch {}
+	});
+
+	it('stale voice-state.json with connected=true falls back to cache', async () => {
+		// Prime cache = false
+		await fetchJson('/mute-state?voice=false');
+
+		// Write a stale (>120s old) connected=true file — should NOT trust it
+		const staleTs = Math.floor(Date.now() / 1000) - 200;
+		writeFileSync(VOICE_STATE_PATH, JSON.stringify({ connected: true, ts: staleTs }));
+		const status = await fetchJson('/sse-status');
+		assert.equal(status.voiceConnected, false, 'stale connected=true should defer to _voiceState=false');
+
+		// Flip cache to true and re-check — stale file still shouldn't matter,
+		// we fall back to cache which is now true
+		await fetchJson('/mute-state?voice=true');
+		const status2 = await fetchJson('/sse-status');
+		assert.equal(status2.voiceConnected, true, 'stale file falls back to cache=true');
+
+		try { unlinkSync(VOICE_STATE_PATH); } catch {}
+	});
+
+	it('missing voice-state.json falls back to cache', async () => {
+		try { unlinkSync(VOICE_STATE_PATH); } catch {}
+		await fetchJson('/mute-state?voice=true');
+		const status = await fetchJson('/sse-status');
+		assert.equal(status.voiceConnected, true, 'no file → _voiceState cache wins');
 	});
 });
