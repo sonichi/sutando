@@ -952,10 +952,10 @@ function summarizeTaskText(raw) {
   const cuts = [' (', ' — ', ' - ', ': ', '. ', ', '];
   for (const c of cuts) {
     const idx = s.indexOf(c);
-    if (idx > 0 && idx < 60) { s = s.slice(0, idx); break; }
+    if (idx > 0 && idx < 90) { s = s.slice(0, idx); break; }
   }
-  // Final safety: never let a single phrase exceed ~50 chars
-  if (s.length > 50) s = s.slice(0, 47) + '…';
+  // Final safety: never let a single phrase exceed ~85 chars
+  if (s.length > 85) s = s.slice(0, 82) + '…';
   return s;
 }
 
