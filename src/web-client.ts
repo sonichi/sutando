@@ -2231,9 +2231,12 @@ function effectiveAgentState(): AgentState {
 		_preSeeingToolState = 'idle';
 	}
 	if (_toolState !== 'idle') return _toolState;
-	if (_browserState !== 'idle') return _browserState;
-	// No explicit state — fall through to core-status. If the proactive loop
-	// or any Claude Code pass is active, surface that as `working`.
+	// Core-agent (Claude Code proactive-loop / task pass) running beats the
+	// browser track — if core is actively doing work, that's the truer state
+	// than "user is currently speaking". Chi's 2026-04-19 ask: "when working
+	// and listening at the same time, working should be the state". Previously
+	// _browserState short-circuited here and the core track only ran when the
+	// user was silent, so core-work during an active turn never surfaced.
 	const core = readCoreStatus();
 	if (core.running) return 'working';
 	// Core is idle OR the file is stale. If stale, ask the tmux scrape for a
@@ -2244,6 +2247,7 @@ function effectiveAgentState(): AgentState {
 		const scrape = readTmuxStatus();
 		if (scrape.state === 'working') return 'working';
 	}
+	if (_browserState !== 'idle') return _browserState;
 	return 'idle';
 }
 
