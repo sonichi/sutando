@@ -51,12 +51,34 @@ let generateSpeech: ((text: string, opts: { category: string; label: string }) =
 // Config
 // =============================================================================
 
+// Shape check: a valid Google AI Studio key starts with "AIza" and is
+// typically 39 chars (v1 format). Catches common misconfigurations
+// (truncated paste, wrong variable, stale template value) at startup
+// instead of letting the voice session fail silently on connect.
+function assertGeminiKey(name: string, value: string): void {
+	if (!value) { console.error(`Error: ${name} is required`); process.exit(1); }
+	const looksValid = value.startsWith('AIza') && value.length >= 35 && value.length <= 50;
+	if (!looksValid) {
+		console.error(
+			`Error: ${name} does not look like a Google AI Studio key ` +
+			`(expected "AIza..." ~39 chars, got ${value.length} chars starting "${value.slice(0, 4)}"). ` +
+			`Rotate at https://ai.google.dev → "Get API key" and update .env.`
+		);
+		process.exit(1);
+	}
+}
+
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY ?? '';
-if (!GEMINI_API_KEY) { console.error('Error: GEMINI_API_KEY is required'); process.exit(1); }
+assertGeminiKey('GEMINI_API_KEY', GEMINI_API_KEY);
 // Optional: separate key for the Gemini Live voice session. Lets users put voice
 // on a free-tier key (unlimited on free tier, rate-limited) while keeping text/
 // vision/STT on a paid-tier key. Falls back to GEMINI_API_KEY when unset.
 const GEMINI_VOICE_API_KEY = process.env.GEMINI_VOICE_API_KEY || GEMINI_API_KEY;
+// Only shape-check the voice key if user opted in — silent fallback to the
+// main key is the backward-compatible path.
+if (process.env.GEMINI_VOICE_API_KEY) {
+	assertGeminiKey('GEMINI_VOICE_API_KEY', process.env.GEMINI_VOICE_API_KEY);
+}
 
 const PORT = Number(process.env.PORT) || 9900;
 const HOST = process.env.HOST || '0.0.0.0';
