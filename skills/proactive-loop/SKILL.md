@@ -81,36 +81,11 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
    Log the chosen item + estimated ROI in `core-status.step` so the owner can audit pick quality.
 
-6. **Act on it.** Pick the highest-ROI work for this pass and execute. Menu is anchoring, not limiting — legitimate work space is infinite. Specific menu items live in `PERSONAL_CLAUDE.md` under `## Current Work Menu` (gitignored, per-user); the shared categories below are the skeleton.
+6. **Act on it.** Pick the highest-ROI work for this pass and execute. Menu is anchoring, not limiting — legitimate work space is infinite. Per-user menu, project specifics, channel routing, and threshold tiers live in `PERSONAL_CLAUDE.md` under `## Current Work Menu`. Absent that file, treat work categories as free-form buckets and pick the highest-ROI unblocked work you can identify from context (pending questions, open PRs, memory updates, recent conversation).
 
-   **Primary** — hands-on implementation, review, testing. Code / tests / owner-facing docs.
+   **Pivot-on-block rule:** if your primary candidate is blocked (waiting on owner, upstream, PR review, etc.), DO NOT idle. Scan the menu, pick the next-highest-ROI unblocked item. "Blocked" is never a reason to stop — only a cue to switch lanes. Quota and ROI, not time, govern depth. This list is infinite by design.
 
-   **Cross-bot** (always eligible when another bot is active) — peer coord in the bot-to-bot channel.
-   - Answer an open `@me` opinion-request.
-   - Post `@other claim: X` for a backlog item you want to take.
-   - Review the other bot's recently-opened PR.
-
-   **Maintenance / hygiene** (always eligible):
-   - Memory maintenance: trim stale entries, dedupe, verify references, update `MEMORY.md` index.
-   - Pending-questions review: resolve anything bot can without owner input; check which are actually stuck.
-   - Task-archive pattern mining: read `tasks/archive` for repeated failure shapes → propose prevention.
-   - Self-audit: re-read own recent `build_log.md` / PRs for mistakes the second-pass view catches.
-
-   **Outreach & content** — social posts + media iteration, research digests, commercial strategy writeups.
-
-   **Growth** — deep-dives into missing capabilities, self-skill improvements, revenue-generation work.
-
-   **Event prep** — conference talks, demos, press. Slide deck / script / cue-card iteration, backup clips, Q&A bank, failure-runbook, pre-talk warmup, speaker-intro drafts, post-talk follow-up artifacts.
-
-   For the owner's current specific items under each category — projects in flight, file paths, upcoming events — read `PERSONAL_CLAUDE.md`. Absent that file, treat the categories above as free-form buckets and pick the highest-ROI unblocked work you can identify from context (pending questions, open PRs, memory updates, recent conversation).
-
-   **Pivot-on-block rule:** if your primary candidate is blocked (waiting on owner, upstream, PR review, etc.), DO NOT idle. Scan the full menu, pick the next-highest-ROI unblocked item. "Blocked" is never a reason to stop — only a cue to switch lanes. Quota and ROI, not time, govern depth. This list is infinite by design.
-
-   **Status-aware pivot announcement:** before pivoting from the owner's most recent direct ask, check presence signal (`state/last-owner-activity.json`):
-   - **Active** (owner activity <5min ago on any channel): post `ping: considering pivot from X to Y because Z` in #bot2bot and wait 1 pass for input. Still do other work in that pass.
-   - **Quiet** (5min–30min): post `claim: pivoting from X to Y — auto-proceed at <now+2min>` in #bot2bot. Other bot can `nack:` by deadline; otherwise proceed.
-   - **Offline** (>30min silence across all channels): post `claim: pivoted from X to Y` in #bot2bot for audit, proceed immediately.
-   - **Presenter/meeting mode**: defer pivot until mode ends.
+   **Status-aware pivot announcement:** before pivoting from the owner's most recent direct ask, check presence signal (`state/last-owner-activity.json`). Announce the pivot in the bot-to-bot coord channel, with a tiered rule (wait-for-input / deadline-then-proceed / proceed-immediately) determined by how recently the owner was active. See `PERSONAL_CLAUDE.md` for the specific thresholds and channel target.
 
 7. **Update `build_log.md`** — mark what changed, update statuses, note what's next.
 
