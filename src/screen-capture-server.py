@@ -97,7 +97,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             from urllib.parse import urlparse, parse_qs
             query = parse_qs(urlparse(self.path).query)
             display_raw = query.get("display", [None])[0]
-            display = display_raw if display_raw and display_raw.isdigit() else None
+            # Coerce to int to short-circuit taint flow into the subprocess
+            # argument list. Display index constrained to 1..9 (macOS never has
+            # more than a handful of displays).
+            display = int(display_raw) if display_raw and display_raw.isdigit() and 1 <= int(display_raw) <= 9 else None
             capture_all = query.get("all", ["false"])[0] == "true"
             try:
                 if capture_all:
