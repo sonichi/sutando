@@ -62,9 +62,14 @@ function assertGeminiKey(name: string, value: string): void {
 	// tight bound would fail-fast on legitimate future keys.
 	const looksValid = value.startsWith('AIza') && value.length >= 35 && value.length <= 60;
 	if (!looksValid) {
+		// Note: we do NOT echo any portion of the key value back into the log,
+		// not even the 4-char prefix — CodeQL flags clear-text-logging of any
+		// substring of a secret env var. Length + pass/fail-on-prefix is
+		// enough to diagnose a truncated-paste or wrong-var misconfig.
+		const prefixOk = value.startsWith('AIza') ? 'yes' : 'no';
 		console.error(
 			`Error: ${name} does not look like a Google AI Studio key ` +
-			`(expected "AIza..." ~39 chars, got ${value.length} chars starting "${value.slice(0, 4)}"). ` +
+			`(expected "AIza..." ~39 chars, got ${value.length} chars; prefix="AIza"? ${prefixOk}). ` +
 			`Rotate at https://ai.google.dev → "Get API key" and update .env.`
 		);
 		process.exit(1);

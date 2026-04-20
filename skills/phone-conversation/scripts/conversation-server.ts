@@ -1618,11 +1618,12 @@ async function start(): Promise<void> {
 		console.log(`╠════════════════════════════════════════════════════╣`);
 		console.log(`║  Local:    http://localhost:${String(PORT).padEnd(27)}║`);
 		console.log(`║  Tunnel:   ${WEBHOOK_BASE_URL.slice(0, 40).padEnd(40)}║`);
-		// Mask phone number for logging (CodeQL #15, #37: js/clear-text-logging)
-		const maskedPhone = TWILIO_PHONE_NUMBER.length > 6
-			? TWILIO_PHONE_NUMBER.slice(0, 2) + '***' + TWILIO_PHONE_NUMBER.slice(-2)
-			: '***';
-		console.log(`║  Phone:    ${maskedPhone.padEnd(40)}║`);
+		// Don't echo any portion of TWILIO_PHONE_NUMBER — CodeQL #24 / #15 /
+		// #37 treat any substring as clear-text-logging of a sensitive env
+		// var. Presence-only signal is enough for startup diagnostics; use
+		// `env | grep TWILIO_PHONE_NUMBER` to inspect.
+		const phoneStatus = TWILIO_PHONE_NUMBER.length > 6 ? 'configured' : 'MISSING';
+		console.log(`║  Phone:    ${phoneStatus.padEnd(40)}║`);
 		console.log(`╠════════════════════════════════════════════════════╣`);
 		console.log(`║  POST /call              — outbound call           ║`);
 		console.log(`║  POST /concurrent-call   — child call (for Claude) ║`);
