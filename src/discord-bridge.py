@@ -755,6 +755,22 @@ async def poll_proactive():
             _presenter_log_throttle = 0
             for f in RESULTS_DIR.iterdir():
                 if f.name.startswith("proactive-") and f.suffix == ".txt":
+                    # Claim-by-rename: atomically move the file to a
+                    # `.sending` suffix so a concurrent poll iteration
+                    # (this coroutine, a race with the same-node telegram
+                    # bridge, or a process restart picking up a leftover)
+                    # can't pick it up and resend. 2026-04-20 saw one
+                    # proactive file delivered 9× to the owner's DM
+                    # because the prior `read → send → unlink` pattern
+                    # had no exclusive claim. Rename is atomic on POSIX
+                    # same-filesystem; FileNotFoundError from the rename
+                    # means another iteration already claimed it.
+                    claim = f.with_suffix(".sending")
+                    try:
+                        f.rename(claim)
+                    except FileNotFoundError:
+                        continue
+                    f = claim  # subsequent reads + unlink operate on the claim path
                     text = f.read_text().strip()
                     if not text:
                         f.unlink(missing_ok=True)

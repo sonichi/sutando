@@ -289,6 +289,18 @@ def main():
             if not presenter_mode_active():
                 for f in RESULTS_DIR.iterdir():
                     if f.name.startswith("proactive-") and f.suffix == ".txt":
+                        # Claim-by-rename: atomic move to a `.sending`
+                        # suffix before reading, so a concurrent poll
+                        # (same bridge, or a race with discord-bridge)
+                        # can't pick it up and resend. See
+                        # discord-bridge.py for the same fix + the
+                        # 2026-04-20 bug-scenario that motivated it.
+                        claim = f.with_suffix(".sending")
+                        try:
+                            f.rename(claim)
+                        except FileNotFoundError:
+                            continue
+                        f = claim
                         text = f.read_text().strip()
                         if not text:
                             f.unlink(missing_ok=True)
