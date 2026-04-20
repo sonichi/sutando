@@ -16,7 +16,29 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 const REPO_DIR = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
 const TASK_DIR = join(REPO_DIR, 'tasks');
 const RESULT_DIR = join(REPO_DIR, 'results');
+const STATE_DIR = join(REPO_DIR, 'state');
 const CONVERSATION_LOG = join(REPO_DIR, 'conversation.log');
+const OWNER_ACTIVITY_FILE = join(STATE_DIR, 'last-owner-activity.json');
+
+/** Record that the owner was active on <channel> right now. Atomic write
+ * via tmp-then-rename. Read by the proactive-loop status-aware-pivot rule.
+ * See notes/team-proposal-coord-loop-2026-04-20.md. */
+function writeOwnerActivity(channel: string, summary: string): void {
+	try {
+		mkdirSync(STATE_DIR, { recursive: true });
+		const payload = {
+			ts: Math.floor(Date.now() / 1000),
+			channel,
+			summary: summary.slice(0, 80),
+		};
+		const tmp = OWNER_ACTIVITY_FILE + '.tmp';
+		writeFileSync(tmp, JSON.stringify(payload));
+		renameSync(tmp, OWNER_ACTIVITY_FILE);
+	} catch (e) {
+		// Non-fatal — activity-state is best-effort
+		console.log(`${ts()} [TaskBridge] owner-activity write failed: ${e}`);
+	}
+}
 
 /** Archive a task/result file into archive/<kind>/YYYY-MM/ instead of
  * deleting. Chi's 2026-04-18 ask: "instead of deleting we should archive
@@ -128,6 +150,8 @@ export const workTool: ToolDefinition = {
 			`access_tier: owner\n`;
 		writeFileSync(join(TASK_DIR, `${taskId}.txt`), content);
 		_pendingTasks.set(taskId, Date.now());
+		// Record owner activity for status-aware-pivot in proactive loop
+		writeOwnerActivity('voice', task);
 		console.log(`${ts()} [TaskBridge] Task ${taskId}: ${task.slice(0, 100)}`);
 		_sendTaskStatus?.(taskId, 'working', task.slice(0, 60));
 		return {

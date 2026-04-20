@@ -38,10 +38,28 @@ if not TOKEN:
 
 TASKS_DIR = REPO / "tasks"
 RESULTS_DIR = REPO / "results"
+STATE_DIR = REPO / "state"
 ARCHIVE_TASKS_DIR = REPO / "tasks" / "archive"
 ARCHIVE_RESULTS_DIR = REPO / "results" / "archive"
+OWNER_ACTIVITY_FILE = STATE_DIR / "last-owner-activity.json"
 TASKS_DIR.mkdir(exist_ok=True)
 RESULTS_DIR.mkdir(exist_ok=True)
+
+
+def write_owner_activity(channel: str, summary: str) -> None:
+    """Record owner activity — see src/discord-bridge.py for schema."""
+    try:
+        STATE_DIR.mkdir(exist_ok=True)
+        payload = {
+            "ts": int(time.time()),
+            "channel": channel,
+            "summary": summary[:80],
+        }
+        tmp = OWNER_ACTIVITY_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload))
+        tmp.rename(OWNER_ACTIVITY_FILE)
+    except Exception as e:
+        print(f"  [owner-activity] write failed: {e}")
 
 
 def archive_file(src: "Path", kind: str, task_id: str) -> None:
@@ -241,6 +259,9 @@ def main():
                 if sender_id not in allowed:
                     print(f"  Dropped message from non-allowed @{username}")
                     continue
+
+                # Record owner activity for status-aware-pivot
+                write_owner_activity("telegram", text)
 
                 # Handle attachments (photos, documents, voice)
                 attachment_note = ""
