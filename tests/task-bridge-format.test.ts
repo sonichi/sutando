@@ -1,4 +1,4 @@
-import { describe, it, before, after, beforeEach, afterEach } from 'node:test';
+import { describe, it, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -33,6 +33,17 @@ describe('task-bridge workTool — PR #460 unified format', () => {
 			try { unlinkSync(join(TASK_DIR, fn)); } catch { /* already gone */ }
 		}
 		createdFiles = [];
+	});
+
+	after(() => {
+		// Leak check: after all tests + cleanup, only baseline files should
+		// remain. Anything extra means a test wrote a file but didn't track
+		// it through createdFiles (e.g. a future test that bypasses
+		// invokeWorkTool). Surfaces gaps in the cleanup harness early.
+		const final = new Set(listTaskFiles());
+		const leaked: string[] = [];
+		for (const f of final) if (!baselineFiles.has(f)) leaked.push(f);
+		assert.deepEqual(leaked, [], 'test leaked task files: ' + leaked.join(', '));
 	});
 
 	async function invokeWorkTool(task: string): Promise<string> {
