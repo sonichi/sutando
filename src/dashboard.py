@@ -24,6 +24,35 @@ REPO_DIR = Path(__file__).parent.parent
 PORT = 7844
 
 
+def _resolve_note_path(raw_slug: str):
+    """Resolve `notes/{slug}.md` with path-injection sanitization.
+
+    Returns the resolved Path, or None if the slug is invalid.
+
+    Layered defense:
+    1. Whitelist the slug to `[\\w-]+` and reject if any char was stripped.
+    2. Rebuild the filename from `Path(...).name` — strips any residual
+       path components and gives CodeQL a recognized sanitizer to break
+       the taint flow that `.is_relative_to()` alone doesn't cut.
+    3. Confine under `notes/` via `.is_relative_to()` after `.resolve()`.
+
+    CodeQL alerts #28-31, #35-36 all hit this code path before the
+    refactor; the `Path.name` sanitizer is the key addition.
+    """
+    slug = re.sub(r"[^\w-]", "", raw_slug)
+    if not slug or slug != raw_slug:
+        return None
+    notes_dir = (REPO_DIR / "notes").resolve()
+    # Path(...).name strips any path separators / traversal segments; at
+    # this point slug is already `[\w-]+` so functionally it's a no-op,
+    # but CodeQL recognizes `.name` as a sanitizer for path-injection.
+    safe_name = Path(slug + ".md").name
+    note_file = (notes_dir / safe_name).resolve()
+    if not note_file.is_relative_to(notes_dir):
+        return None
+    return note_file
+
+
 def get_health() -> list[dict]:
     # Use sys.executable so the subprocess uses the same Python that's
     # running dashboard itself (typically homebrew 3.11). When launchd
@@ -428,16 +457,8 @@ load()
             self.wfile.write(json.dumps(notes).encode())
         elif urlparse(self.path).path.startswith("/notes/"):
             raw_slug = urlparse(self.path).path.split("/notes/", 1)[1]
-            # Sanitize: strip all non-safe chars, reject if changed (fixes CodeQL #28-31, #35-36)
-            import re
-            slug = re.sub(r'[^\w-]', '', raw_slug)
-            if not slug or slug != raw_slug:
-                self.send_response(400)
-                self.end_headers()
-                return
-            notes_dir = (REPO_DIR / "notes").resolve()
-            note_file = (notes_dir / f"{slug}.md").resolve()
-            if not note_file.is_relative_to(notes_dir):
+            note_file = _resolve_note_path(raw_slug)
+            if note_file is None:
                 self.send_response(400)
                 self.end_headers()
                 return
@@ -459,16 +480,8 @@ load()
         path = urlparse(self.path).path
         if path.startswith("/notes/"):
             raw_slug = path.split("/notes/", 1)[1]
-            # Sanitize: strip all non-safe chars, reject if changed (fixes CodeQL #28-31, #35-36)
-            import re
-            slug = re.sub(r'[^\w-]', '', raw_slug)
-            if not slug or slug != raw_slug:
-                self.send_response(400)
-                self.end_headers()
-                return
-            notes_dir = (REPO_DIR / "notes").resolve()
-            note_file = (notes_dir / f"{slug}.md").resolve()
-            if not note_file.is_relative_to(notes_dir):
+            note_file = _resolve_note_path(raw_slug)
+            if note_file is None:
                 self.send_response(400)
                 self.end_headers()
                 return
@@ -477,7 +490,7 @@ load()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(json.dumps({"deleted": slug}).encode())
+                self.wfile.write(json.dumps({"deleted": note_file.stem}).encode())
             else:
                 self.send_response(404)
                 self.end_headers()
