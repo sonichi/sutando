@@ -2198,9 +2198,15 @@ function updateDynamicRegion() {
   // Ensure tab structure exists
   ensureTabStructure();
 
-  // Auto-switch to questions tab if new questions arrive
+  // Auto-switch to questions tab if NEW questions arrive. Compare against
+  // the last-seen count (tracked by updateTabHighlights on visit to the
+  // questions tab) rather than 0 — otherwise every SSE/poll cycle re-fires
+  // the switch and drags the user back to questions immediately after they
+  // click Starter. User clicking Starter = "I've acknowledged the badge,
+  // don't pull me in until something new arrives."
   var questions = window._drQuestions || [];
-  if (questions.length > 0 && window._drActiveTab === 'starter') {
+  var seen = window._lastSeenCounts = window._lastSeenCounts || {};
+  if (questions.length > (seen.questions || 0) && window._drActiveTab === 'starter') {
     window._drActiveTab = 'questions';
     updateTabHighlights();
     renderTabContent();
