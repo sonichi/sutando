@@ -68,11 +68,17 @@ def resolve_bot2bot_channel(access: dict) -> str:
     sys.exit("ERROR: no bot2bot channel found in access.json.groups")
 
 
+USER_AGENT = "DiscordBot (https://github.com/sonichi/sutando, 1.0)"
+
+
 def get_self_id(token: str) -> str:
     """Discord GET /users/@me → this bot's user ID."""
     req = urllib.request.Request(
         "https://discord.com/api/v10/users/@me",
-        headers={"Authorization": f"Bot {token}"},
+        headers={
+            "Authorization": f"Bot {token}",
+            "User-Agent": USER_AGENT,
+        },
     )
     with urllib.request.urlopen(req, timeout=10) as r:
         return json.loads(r.read())["id"]
@@ -102,6 +108,7 @@ def post(channel_id: str, text: str, token: str):
         headers={
             "Authorization": f"Bot {token}",
             "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
         },
     )
     try:
