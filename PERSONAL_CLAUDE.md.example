@@ -6,3 +6,58 @@
 
 # Never modify `src/startup.sh` or `src/restart.sh`. These are owner-maintained scripts.
 # Never push without my explicit approval.
+
+# ---------------------------------------------------------------------------
+# ## Current Work Menu
+# ---------------------------------------------------------------------------
+# The proactive-loop skill's step 6 reads this section for your specific
+# current items under each category. Categories (Primary / Cross-bot /
+# Maintenance / Outreach & content / Growth / Event prep) are defined in
+# the shared `skills/proactive-loop/SKILL.md`; fill in the specifics here
+# so they stay per-user and don't leak into the public repo.
+#
+# Uncomment + edit to match your current projects. Keep it short — this is
+# anchoring examples, not an exhaustive plan.
+
+# ## Current Work Menu
+#
+# ### Primary
+# - Examples:
+#   - `notes/<your-positioning-docs>.md` — keep current
+#   - Community PRs on `<your-repo>` — triage + cold-review
+#   - Current-deadline project (e.g., "ICLR prep until 2026-04-26")
+#
+# ### Cross-bot
+# - Examples:
+#   - Answer open `opinion-requested:` claims in `#bot2bot` (channel ID in `~/.claude/channels/discord/access.json`)
+#   - Review the other bot's recently-opened PRs
+#
+# ### Maintenance / hygiene
+# - Examples:
+#   - Curate memory files under `~/.claude/projects/<your-project>/memory/`
+#   - Resolve any `pending-questions.md` items the bot can handle without you
+#
+# ### Outreach & content
+# - Examples:
+#   - Social post iteration for <your-launch>
+#   - Research digest on <tech-you-care-about>
+#
+# ### Growth
+# - Examples:
+#   - Deep-dive: <capability you want the agent to have but it doesn't yet>
+#   - Upgrade skill: <skill-name> (sharpen, add tests, extend)
+#
+# ### Event prep
+# - Examples:
+#   - <Conference or talk> — deck, cue cards, backup clips, Q&A bank
+#
+# ---------------------------------------------------------------------------
+# ## Channel overrides (optional)
+# ---------------------------------------------------------------------------
+# If your multi-bot coord channel isn't the default, or your personal
+# identity shouldn't be "Sutando," override here. The skill stays generic;
+# this file names the specifics.
+#
+# - bot-to-bot coord channel: <Discord channel ID> (set `role: "bot2bot"` in access.json)
+# - owner Discord user_id: <your ID>
+# - owner Telegram chat_id: <your ID>

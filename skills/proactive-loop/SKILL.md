@@ -81,42 +81,28 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
    Log the chosen item + estimated ROI in `core-status.step` so the owner can audit pick quality.
 
-6. **Act on it.** Pick the highest-ROI work for this pass and execute. Menu is anchoring, not limiting — legitimate work space is infinite.
+6. **Act on it.** Pick the highest-ROI work for this pass and execute. Menu is anchoring, not limiting — legitimate work space is infinite. Specific menu items live in `PERSONAL_CLAUDE.md` under `## Current Work Menu` (gitignored, per-user); the shared categories below are the skeleton.
 
-   **Primary** (derived from step 5 priorities):
-   - Code: write/fix/refactor; open PR; review community PR
-   - Testing: cold-read own recent PRs, run probes against new code, audit skill behavior
-   - Docs (owner-facing): `notes/sutando-user-stories.md`, `notes/sutando-advantages-table.md`, README sections the owner pre-approves
+   **Primary** — hands-on implementation, review, testing. Code / tests / owner-facing docs.
 
-   **Cross-bot** (always eligible when other bot is active):
-   - Answer an open `@me` opinion-request in #bot2bot
-   - Post `@other claim: X` in #bot2bot for a backlog item you want to take
-   - Review the other bot's recently-opened PR
+   **Cross-bot** (always eligible when another bot is active) — peer coord in the bot-to-bot channel.
+   - Answer an open `@me` opinion-request.
+   - Post `@other claim: X` for a backlog item you want to take.
+   - Review the other bot's recently-opened PR.
 
    **Maintenance / hygiene** (always eligible):
-   - Memory maintenance: trim stale entries, dedupe, verify references, update `MEMORY.md` index
-   - Pending-questions review: resolve anything bot can without owner input; check which are actually stuck
-   - Task-archive pattern mining: read `tasks/archive` for repeated failure shapes → propose prevention
-   - Self-audit: re-read own recent `build_log.md` / PRs for mistakes the second-pass view catches
+   - Memory maintenance: trim stale entries, dedupe, verify references, update `MEMORY.md` index.
+   - Pending-questions review: resolve anything bot can without owner input; check which are actually stuck.
+   - Task-archive pattern mining: read `tasks/archive` for repeated failure shapes → propose prevention.
+   - Self-audit: re-read own recent `build_log.md` / PRs for mistakes the second-pass view catches.
 
-   **Outreach & content**:
-   - Prepare / refine social posts + media (X threads, LinkedIn, Discord drops) — iterate variants, alt-text, captions
-   - Research news / papers / repos in relevant tech → summarize + propose integration
-   - Commercial strategy: revenue paths, pricing ideas, partnership leads, writeups for owner review
+   **Outreach & content** — social posts + media iteration, research digests, commercial strategy writeups.
 
-   **Growth**:
-   - Discover new knowledge: deep-dive into capabilities Sutando should have but doesn't
-   - Upgrade your superpower: pick a concrete skill, build/sharpen it; new memory entries; reliability improvements to self
-   - Earn money: revenue-generation work (posts that convert, features that monetize, pitch prep)
+   **Growth** — deep-dives into missing capabilities, self-skill improvements, revenue-generation work.
 
-   **Event prep** (conference talks, demos, press):
-   - Slide deck / script / cue-card iteration
-   - Backup audio / recording drivers, stage-readiness checks, latency probes
-   - Q&A bank updates — anticipated questions, target-answer timing
-   - Failure-runbook + live-monitor scripts for the talk window
-   - Pre-talk warmup content / rehearsals
-   - Speaker-intro / pronunciation guide drafts for the host
-   - Post-talk follow-up: write-up for blog, convert reactions into canned replies
+   **Event prep** — conference talks, demos, press. Slide deck / script / cue-card iteration, backup clips, Q&A bank, failure-runbook, pre-talk warmup, speaker-intro drafts, post-talk follow-up artifacts.
+
+   For the owner's current specific items under each category — projects in flight, file paths, upcoming events — read `PERSONAL_CLAUDE.md`. Absent that file, treat the categories above as free-form buckets and pick the highest-ROI unblocked work you can identify from context (pending questions, open PRs, memory updates, recent conversation).
 
    **Pivot-on-block rule:** if your primary candidate is blocked (waiting on owner, upstream, PR review, etc.), DO NOT idle. Scan the full menu, pick the next-highest-ROI unblocked item. "Blocked" is never a reason to stop — only a cue to switch lanes. Quota and ROI, not time, govern depth. This list is infinite by design.
 
