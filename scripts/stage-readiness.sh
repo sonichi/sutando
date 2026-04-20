@@ -57,16 +57,22 @@ else
 fi
 
 # 2) bodhi FATAL count (since last voice-agent restart)
+# Scope to the current process instance — the log accumulates across restarts,
+# so a raw grep will always report historical FATALs from before a prior fix
+# was installed and fail this check forever. Use the last "Watching for
+# context drops" line as the startup marker; count FATALs only after it.
 VLOG="$REPO/logs/voice-agent.log"
 if [ -f "$VLOG" ]; then
-    fatals=$(grep -c "FATAL.*SessionError.*Invalid transition" "$VLOG" 2>/dev/null | tr -d '[:space:]')
+    last_start=$(grep -n "Watching for context drops" "$VLOG" 2>/dev/null | tail -1 | cut -d: -f1)
+    last_start="${last_start:-1}"
+    fatals=$(tail -n +"$last_start" "$VLOG" | grep -c "FATAL.*SessionError.*Invalid transition" 2>/dev/null | tr -d '[:space:]')
     fatals="${fatals:-0}"
     if [ "$fatals" -eq 0 ]; then
-        pass "bodhi state machine" "0× CLOSED→RECONNECTING FATALs in current log"
+        pass "bodhi state machine" "0× CLOSED→RECONNECTING FATALs since last restart"
     elif [ "$fatals" -lt 5 ]; then
-        warn "bodhi state machine" "$fatals FATALs — consider restart if talk is <1h away"
+        warn "bodhi state machine" "$fatals FATALs since restart — consider another restart if talk is <1h away"
     else
-        fail "bodhi state machine" "$fatals FATALs — restart voice-agent before talk"
+        fail "bodhi state machine" "$fatals FATALs since restart — restart voice-agent before talk"
     fi
 fi
 
