@@ -84,18 +84,36 @@ def get_self_id(token: str) -> str:
         return json.loads(r.read())["id"]
 
 
-def resolve_other_bot(access: dict, self_id: str):
-    """Find the other bot's user ID from allowFrom, excluding self."""
-    allow = access.get("allowFrom", [])
+def resolve_other_bot(access: dict, self_id: str, channel_id: str):
+    """Find the other bot's user ID from the bot2bot CHANNEL's allowFrom.
+
+    The top-level `allowFrom` is owner-only by the tier-isolation invariant
+    (see `scripts/validate-access-tiers.py`) — sibling bots must not appear
+    there or they'd be classified as access_tier=owner instead of team.
+    The sibling-bot ID lives in the #bot2bot channel's allowFrom.
+
+    Falls back to the top-level allowFrom for older configs that haven't
+    migrated to channel-level allowFrom yet.
+    """
+    ch_cfg = access.get("groups", {}).get(channel_id)
+    allow: list = []
+    if isinstance(ch_cfg, dict):
+        allow = list(ch_cfg.get("allowFrom", []))
+    # Fallback: legacy configs that only have top-level allowFrom
+    if not allow:
+        allow = list(access.get("allowFrom", []))
     others = [uid for uid in allow if uid != self_id]
     if not others:
         return None
-    # Heuristic: there should typically be exactly one other bot + the human
-    # owner. We can't tell them apart from access.json alone without an API
-    # call. For now, prefer IDs that are not obviously the human (access.json
-    # doesn't annotate; assume all allowFrom entries other than self are
-    # candidate recipients, and let the receiving bridge filter).
-    # Pick the first one; if multiple bots + human, caller should pass --to.
+    # Heuristic: the sibling-bot ID will not match self_id. The owner's
+    # user_id may also appear in the channel allowFrom; to pick the bot,
+    # prefer the ID that is NOT in the top-level allowFrom (owner-only).
+    global_allow = set(str(x) for x in access.get("allowFrom", []))
+    bot_candidates = [uid for uid in others if str(uid) not in global_allow]
+    if bot_candidates:
+        return bot_candidates[0]
+    # Last resort: any non-self ID (legacy configs where owner+bot share the
+    # top-level allowFrom).
     return others[0]
 
 
@@ -131,7 +149,7 @@ def main():
     access = load_access()
     channel_id = resolve_bot2bot_channel(access)
     self_id = get_self_id(token)
-    other_id = resolve_other_bot(access, self_id)
+    other_id = resolve_other_bot(access, self_id, channel_id)
 
     prefix = f"<@{other_id}> " if other_id else ""
     message = f"{prefix}{kind}: {text}"
