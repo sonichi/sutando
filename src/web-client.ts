@@ -2198,13 +2198,28 @@ function updateDynamicRegion() {
   // Ensure tab structure exists
   ensureTabStructure();
 
-  // Auto-switch to questions tab if new questions arrive
+  // Auto-switch to questions tab ONCE per new-question arrival.
+  // Track which qids we've already auto-switched for so that clicking back to
+  // Starter doesn't get stolen on every poll. A NEW qid re-arms the switch.
   var questions = window._drQuestions || [];
-  if (questions.length > 0 && window._drActiveTab === 'starter') {
+  window._drAutoSwitchedQids = window._drAutoSwitchedQids || {};
+  var hasNewQuestion = false;
+  for (var i = 0; i < questions.length; i++) {
+    if (!window._drAutoSwitchedQids[questions[i].id]) { hasNewQuestion = true; break; }
+  }
+  if (hasNewQuestion && window._drActiveTab === 'starter') {
     window._drActiveTab = 'questions';
+    for (var j = 0; j < questions.length; j++) {
+      window._drAutoSwitchedQids[questions[j].id] = true;
+    }
     updateTabHighlights();
     renderTabContent();
     return;
+  }
+  // Even if we don't switch (user already on another tab, or set is known),
+  // record current qids so we don't double-fire when they land on Starter.
+  for (var k = 0; k < questions.length; k++) {
+    window._drAutoSwitchedQids[questions[k].id] = true;
   }
 
   // Update tab badges (task count, question count) without re-rendering content
