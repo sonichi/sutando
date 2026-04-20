@@ -261,12 +261,15 @@ async def on_message_edit(before, after):
 async def _handle_discord_message(message, force=False):
     if message.author == client.user:
         return
-    # Skip messages from other bots (e.g. another Sutando node) to avoid
-    # double-processing in shared channels like the inter-machine bridge.
-    # EXCEPTION: if the bot @mentions this bot specifically, treat it as a
-    # legitimate cross-machine task (e.g. MacBook bot asking Mini bot to do X).
-    if message.author.bot and client.user not in message.mentions:
-        return
+    # NOTE: the bot-author filter ("drop bot messages without @-mention") used
+    # to fire here unconditionally. It now lives in the `if not is_dm:` branch
+    # below, gated on the channel's `requireMention` setting, so channels
+    # configured as `{role: "bot2bot", requireMention: false}` in access.json
+    # can receive bot-to-bot messages without the sender having to @-mention
+    # us on every post. DMs still require explicit mention (see the `else`
+    # branch). 2026-04-20 fix; motivated by the #bot2bot coord channel where
+    # Chi's access.json said "mention not required" but bot messages were
+    # still dropped at this line regardless.
 
     sender_id = str(message.author.id)
     username = str(message.author)
@@ -281,12 +284,24 @@ async def _handle_discord_message(message, force=False):
     if message.type != discord.MessageType.default and message.type != discord.MessageType.reply:
         print(f"  [debug] non-default message type: {message.type}", flush=True)
 
+    # DMs: bot messages always require explicit @-mention (no channel config path).
+    if is_dm and message.author.bot and client.user not in message.mentions:
+        return
+
     # In channels, check if mention is required
     if not is_dm:
         channel_cfg = load_channel_config(str(message.channel.id))
         require_mention = True  # default
         if channel_cfg is not None:
             require_mention = channel_cfg[0]
+
+        # Bot-author filter: drop bot messages without explicit @-mention ONLY
+        # when the channel's requireMention is true. Channels with
+        # requireMention=false (e.g. role:"bot2bot") intentionally let bot
+        # messages through without a mention — that's the point.
+        if message.author.bot and client.user not in message.mentions and require_mention:
+            print(f"  [skip] bot message without mention in requireMention=true channel", flush=True)
+            return
 
         bot_mentioned = client.user in message.mentions
         role_mentioned = any(role.name.lower() in ("sutando", "sutando bot") or str(client.user.id) in str(role.id) for role in message.role_mentions)
