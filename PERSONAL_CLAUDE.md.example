@@ -1,8 +1,87 @@
-# Personal Rules
+# Personal Rules & Config
 
 # Add your personal rules, preferences, and overrides here.
-# This file is gitignored — it stays local to your machine.
-# Examples:
+# This file is gitignored — copy to `PERSONAL_CLAUDE.md` on each machine
+# and fill in. It's auto-loaded by Claude Code into every session context.
 
-# Never modify `src/startup.sh` or `src/restart.sh`. These are owner-maintained scripts.
+# ─────────────────────────────────────────────────────────────────────
+# Personal rules — any behavior guidance specific to this machine / you
+# ─────────────────────────────────────────────────────────────────────
+
+# Examples (uncomment or replace):
+# Never modify `src/startup.sh` or `src/restart.sh`. Owner-maintained.
 # Never push without my explicit approval.
+# Prefer terse replies; skip trailing summaries.
+
+# ─────────────────────────────────────────────────────────────────────
+# Machine identity
+# ─────────────────────────────────────────────────────────────────────
+
+# # Machine: <hostname>
+# - Hostname:
+# - Physical role (always-on node / portable dev / etc):
+# - Known caveats (no mic, specific permissions granted, etc):
+
+# ─────────────────────────────────────────────────────────────────────
+# Owner identity (who's running this Sutando instance)
+# ─────────────────────────────────────────────────────────────────────
+
+# ## Owner Identity
+# - Owner name:
+# - Agent name (what your Sutando instance calls itself):
+# - Owner Discord ID:
+# - This bot Discord ID:
+# - Peer bot Discord ID (if running multi-node):
+# - Owner iMessage: (resolve dynamically, don't hardcode)
+
+# ─────────────────────────────────────────────────────────────────────
+# Current projects (Sutando's step-6 menu extensions)
+# ─────────────────────────────────────────────────────────────────────
+#
+# The proactive-loop skill's step-6 menu is GENERIC by design (categories
+# like Primary / Cross-bot / Maintenance / Outreach / Growth / Event prep).
+# Your actual current-project items live HERE. Sutando's loop reads this
+# file every pass and picks the highest-ROI unblocked item.
+
+# ## Current Projects
+# - <project name> — <scope + deadline if any>
+# - <next project>
+
+# ## Current Work Menu (per-category specifics)
+#
+# ### Primary
+# - <repo paths you're actively editing>
+# - <cold-review targets (community PRs, team members)>
+# - <documents to keep current>
+#
+# ### Outreach & content
+# - <social platforms + cadence>
+# - <content pipelines in progress>
+#
+# ### Event prep
+# - <upcoming talks/demos + artifact paths>
+#
+# ### Growth
+# - <capabilities to build/sharpen>
+# - <revenue paths if relevant>
+
+# ─────────────────────────────────────────────────────────────────────
+# Backlog files
+# ─────────────────────────────────────────────────────────────────────
+
+# ## Backlog Files
+# - coord/backlog.md (if using shared cross-bot backlog)
+# - build_log.md use case tracker
+# - pending-questions.md
+# - <any other personal backlog>
+
+# ─────────────────────────────────────────────────────────────────────
+# Channels configured on this node
+# ─────────────────────────────────────────────────────────────────────
+
+# ## Channels Configured
+# - Discord: <channels + role tags>
+# - Telegram: <bot + allowFrom>
+# - Voice: <port, any caveats>
+# - Phone: <Twilio + ngrok if applicable>
+# - iMessage: <working / broken / workaround>
