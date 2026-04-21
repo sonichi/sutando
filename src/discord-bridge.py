@@ -794,7 +794,7 @@ async def poll_results():
 
                     # Send files (allowlist-gated; see _is_path_sendable)
                     for fpath in files:
-                        fpath = fpath.strip()
+                        fpath = os.path.expanduser(fpath.strip())
                         if _is_path_sendable(fpath):
                             await channel.send(file=discord.File(fpath))
                             print(f"  Sent file: {fpath}")
@@ -897,7 +897,7 @@ async def poll_proactive():
                             for i in range(0, len(clean_text), 1900):
                                 await dm.send(clean_text[i:i+1900])
                         for fpath in files:
-                            fpath = fpath.strip()
+                            fpath = os.path.expanduser(fpath.strip())
                             if _is_path_sendable(fpath):
                                 await dm.send(file=discord.File(fpath))
                             elif not os.path.isfile(fpath):
