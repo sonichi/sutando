@@ -166,7 +166,13 @@ if [ -f "$SUT_SRC" ] && { [ ! -f "$SUT_BIN" ] || [ "$SUT_SRC" -nt "$SUT_BIN" ]; 
     echo "  ✓ Sutando compiled"
     if pgrep -f "src/Sutando/Sutando" > /dev/null 2>&1; then
       pkill -f "src/Sutando/Sutando" 2>/dev/null || true
-      sleep 1
+      # Wait for kernel cleanup to drain before relaunch — fixed sleep 1
+      # raced with slow shutdown on 2026-04-21, leaving dual Sutando.app
+      # instances with ghost menu-bar icons.
+      for _ in $(seq 1 30); do
+        pgrep -f "src/Sutando/Sutando" >/dev/null 2>&1 || break
+        sleep 0.1
+      done
     fi
   else
     echo "  ⚠ Sutando compile failed — keeping existing binary if any"
