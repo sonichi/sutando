@@ -26,7 +26,25 @@ if [ "$1" = "--stop-only" ]; then
     exit 0
 fi
 
-sleep 1
+# Wait for shutdown to drain before exec-ing startup.sh. Fixed `sleep 1`
+# raced the pkill'd processes: if Sutando.app (or any SIGTERM-respecting
+# service) took >1s to exit cleanly, startup.sh's `if ! pgrep ...` guard
+# skipped the relaunch and the user saw "restart did nothing."
+# See feedback_pkill_then_open_race.md and PR #499 for the same class on
+# startup.sh's recompile-replace path.
+STOP_PATTERNS=(
+    "voice-agent" "web-client.ts" "dashboard.py" "agent-api.py"
+    "screen-capture-server" "telegram-bridge" "discord-bridge" "watch-tasks"
+    "conversation-server" "ngrok" "credential-proxy" "src/Sutando/Sutando"
+)
+for _ in $(seq 1 30); do
+    still=0
+    for pat in "${STOP_PATTERNS[@]}"; do
+        if pgrep -f "$pat" >/dev/null 2>&1; then still=1; break; fi
+    done
+    [ $still -eq 0 ] && break
+    sleep 0.1
+done
 
 echo "Starting..."
 exec bash "$REPO/src/startup.sh"
