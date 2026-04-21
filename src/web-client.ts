@@ -327,6 +327,20 @@ const HTML = /* html */ `<!DOCTYPE html>
   #core-status-bar:empty { display: none; }
   #core-status-bar .core-running { color: #4ecca3; }
   #core-status-bar .core-idle { color: #444; }
+  /* Presenter-mode badge — only visible when the iclr-highlight skill
+     server at localhost:7877 reports /presenter active:true. Mirrors the
+     Swift menu-bar HUD's eventual "presenting" state on the web side. */
+  #presenter-badge {
+    display: none; margin-left: 14px; padding: 4px 10px; border-radius: 12px;
+    background: linear-gradient(135deg, #6a1b9a, #4527a0); color: #fff;
+    font-size: 13px; font-weight: 600; letter-spacing: 0.5px;
+    box-shadow: 0 0 8px #8e24aa88; vertical-align: middle;
+  }
+  #presenter-badge.active { display: inline-block; animation: pb-pulse 2s infinite; }
+  @keyframes pb-pulse {
+    0%, 100% { box-shadow: 0 0 8px #8e24aa88; }
+    50%      { box-shadow: 0 0 14px #ce93d8cc; }
+  }
   #dynamic-region .dr-questions {
     background: linear-gradient(135deg, #1e1a12, #2a2218); border: 1px solid #f0ad4e44;
     border-radius: 10px; padding: 14px 18px; font-size: 16px; box-shadow: 0 0 12px #f0ad4e22;
@@ -603,6 +617,7 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
   <kbd style="background:#1a1a2e;padding:3px 8px;border-radius:4px;border:1px solid #333;font-family:monospace;color:#8af;font-size:14px">⌃M</kbd> mute
   <span style="margin:0 8px;color:#444">|</span>
   <span id="core-status-bar" style="display:inline"></span>
+  <span id="presenter-badge">🎤 PRESENTER MODE</span>
 </div>
 
 <div id="dynamic-region"></div>
@@ -2291,6 +2306,31 @@ document.addEventListener('keydown', function(e) {
       if (hav) hav.classList.toggle('working', isWorking);
     });
   }, 3000);
+})();
+
+// Presenter-mode badge poll — hits a skill-server endpoint that reports
+// presenter state. Default URL is the iclr-highlight skill's
+// :7877/presenter; override via window._PRESENTER_URL at render time
+// so the badge stays generic and a different skill (or different port)
+// can drive it without editing this file. Silent-fail when unreachable
+// (off-stage / skill not loaded) — badge stays hidden.
+(function() {
+  var presenterUrl = (typeof window !== 'undefined' && window._PRESENTER_URL)
+    || 'http://localhost:7877/presenter';
+  setInterval(function() {
+    fetch(presenterUrl)
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(data) {
+        var badge = document.getElementById('presenter-badge');
+        if (!badge) return;
+        var active = !!(data && data.active);
+        badge.classList.toggle('active', active);
+      })
+      .catch(function() {
+        var badge = document.getElementById('presenter-badge');
+        if (badge) badge.classList.remove('active');
+      });
+  }, 2000);
 })();
 
 // Initial render
