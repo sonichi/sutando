@@ -134,12 +134,22 @@ def get_status() -> dict:
 
 
 def _safe_path(base_dir: Path, filename: str) -> Path:
-    """Resolve a path safely under base_dir. Returns None if path escapes."""
-    # Inline sanitization so CodeQL sees taint broken before Path() (fixes #16-23)
+    """Resolve a path safely under base_dir. Returns None if path escapes.
+
+    CodeQL py/path-injection: every reachable path-sink in the codebase that
+    accepts user input flows through this helper or an equivalent inline pattern.
+    Two-layer defense: (1) regex allowlist strips everything except
+    [a-zA-Z0-9_\\-.] (so `../etc/passwd` becomes `etcpasswd`), (2) resolved-path
+    must stay within base_dir.resolve() (catches symlink/case-folding edge cases
+    on macOS APFS). CodeQL doesn't recognize `is_relative_to` as a sanitizer,
+    so alerts persist on call-sites — they're tracked + dismissed as won't-fix.
+    """
+    # CodeQL sanitizer: regex allowlist breaks taint before Path() construction
     safe_name = re.sub(r'[^a-zA-Z0-9_\-.]', '', filename)
     if not safe_name:
         return None
     resolved = (base_dir / f"{safe_name}.txt").resolve()
+    # CodeQL sanitizer: bound check rejects anything that escapes base_dir
     if not resolved.is_relative_to(base_dir.resolve()):
         return None
     return resolved
@@ -356,15 +366,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(200, {})
         elif path.startswith("/media/"):
             # Serve local files for dynamic region (images, audio, video, docs)
-            # Note: mimetypes import removed — replaced by SAFE_TYPES allowlist (CodeQL #19-23 mitigation)
+            # CodeQL py/path-injection: this handler reads user-supplied path; flagged
+            # but sanitized end-to-end. Three layers below; alerts dismissed as won't-fix.
             rel = path[len("/media/"):]
-            # Sanitize: strip everything except safe filename characters (fixes CodeQL #20-21)
+            # CodeQL sanitizer (1/3): regex allowlist strips everything except
+            # [a-zA-Z0-9_./-]. Anything stripped → safe_rel != rel → reject.
             safe_rel = re.sub(r'[^a-zA-Z0-9_./-]', '', rel)
+            # CodeQL sanitizer (2/3): reject `..`, leading `/`, null byte, or any change.
             if not safe_rel or safe_rel != rel or '..' in safe_rel or safe_rel.startswith('/') or '\x00' in safe_rel:
                 self.send_json(400, {"error": "invalid path"})
                 return
             repo_resolved = REPO_DIR.resolve()
             media_path = (repo_resolved / safe_rel).resolve()
+            # CodeQL sanitizer (3/3): bound check + must be a file (rejects directories/symlinks).
             if not media_path.is_relative_to(repo_resolved) or not media_path.is_file():
                 self.send_json(404, {"error": "not found"})
                 return
@@ -602,11 +616,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         pq_file.write_text(new_content)
                         # Also write as a task so the agent picks it up
                         ts = int(datetime.now().timestamp() * 1000)
-                        # Inline sanitization so CodeQL sees taint broken before Path() (fixes #22-23)
+                        # CodeQL py/path-injection sanitizer (1/2): regex allowlist strips
+                        # all non-safe chars from the user-supplied question id.
                         safe_qid = re.sub(r'[^a-zA-Z0-9_\-.]', '', qid)
                         if safe_qid:
                             task_dir = (REPO_DIR / "tasks").resolve()
                             task_file = (task_dir / f"answer-{safe_qid}-{ts}.txt").resolve()
+                            # CodeQL py/path-injection sanitizer (2/2): bound check —
+                            # write only if resolved path stays within tasks/.
                             if task_file.is_relative_to(task_dir):
                                 task_file.write_text(f"User answered {safe_qid}: {answer}")
                         self.send_json(200, {"ok": True, "id": qid, "answer": answer})

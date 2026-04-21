@@ -428,15 +428,19 @@ load()
             self.wfile.write(json.dumps(notes).encode())
         elif urlparse(self.path).path.startswith("/notes/"):
             raw_slug = urlparse(self.path).path.split("/notes/", 1)[1]
-            # Sanitize: strip all non-safe chars, reject if changed (fixes CodeQL #28-31, #35-36)
+            # CodeQL py/path-injection: GET handler reads user-supplied note slug.
+            # Three-layer sanitization below; alerts dismissed as won't-fix.
             import re
+            # CodeQL sanitizer (1/3): \w-only allowlist (no `.`, no `/`, no `..`).
             slug = re.sub(r'[^\w-]', '', raw_slug)
+            # CodeQL sanitizer (2/3): reject if anything was stripped.
             if not slug or slug != raw_slug:
                 self.send_response(400)
                 self.end_headers()
                 return
             notes_dir = (REPO_DIR / "notes").resolve()
             note_file = (notes_dir / f"{slug}.md").resolve()
+            # CodeQL sanitizer (3/3): bound check on resolved path.
             if not note_file.is_relative_to(notes_dir):
                 self.send_response(400)
                 self.end_headers()
@@ -459,15 +463,19 @@ load()
         path = urlparse(self.path).path
         if path.startswith("/notes/"):
             raw_slug = path.split("/notes/", 1)[1]
-            # Sanitize: strip all non-safe chars, reject if changed (fixes CodeQL #28-31, #35-36)
+            # CodeQL py/path-injection: DELETE handler reads user-supplied note slug.
+            # Three-layer sanitization below; alerts dismissed as won't-fix.
             import re
+            # CodeQL sanitizer (1/3): \w-only allowlist (no `.`, no `/`, no `..`).
             slug = re.sub(r'[^\w-]', '', raw_slug)
+            # CodeQL sanitizer (2/3): reject if anything was stripped.
             if not slug or slug != raw_slug:
                 self.send_response(400)
                 self.end_headers()
                 return
             notes_dir = (REPO_DIR / "notes").resolve()
             note_file = (notes_dir / f"{slug}.md").resolve()
+            # CodeQL sanitizer (3/3): bound check on resolved path.
             if not note_file.is_relative_to(notes_dir):
                 self.send_response(400)
                 self.end_headers()
