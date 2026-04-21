@@ -470,6 +470,12 @@ const mainAgent: MainAgent = {
 		'- For phone calls, meeting dial-in, or anything needing contacts/calendar context → use work (core handles it).',
 		...inlineTools.map(t => `- ${t.name}: ${(t.description as string).split('.')[0]}. Instant.`),
 		'',
+		// Co-presenter highlight: only nudge when the highlight_slide tool is
+		// actually loaded (ENV-gated via SUTANDO_SLIDE_HIGHLIGHT_URL + the
+		// iclr-highlight skill manifest). Without the tool, the string is empty.
+		inlineTools.some(t => t.name === 'highlight_slide')
+			? 'CO-PRESENTER HIGHLIGHT MODE: When you are about to speak about a specific part of the current slide (a card, pillar, timeline item, or numbered step), call highlight_slide(topic) FIRST, before the narration. Pass the topic key from the slide-specific taxonomy (e.g. "understand", "act", "grow", "bug3", "step2", "identity"). Call highlight_slide("clear") when moving to the next slide or general narration. This is for live-presentation slide-synchronization; do NOT use it in normal conversation.'
+			: '',
 		'CRITICAL RULES:',
 		(() => meetingActive
 			? '⚠️ MEETING MODE IS CURRENTLY ACTIVE. You are an invisible note-taker. Listen to all audio and track: speakers, topics, decisions, action items. Produce ZERO audio output unless someone says "Sutando" or "hey Sutando." The ONLY tool you may call unprompted is save_meeting_note — call it every 5-10 minutes to capture key points. Do NOT call work or other tools unless explicitly addressed. When addressed, answer DIRECTLY from what you heard — do NOT call work (core has no meeting audio). "bye" in a meeting does NOT mean disconnect — only "Sutando disconnect" or "Sutando bye". To exit: user says "Sutando, active mode" → call switch_mode("active") and save_meeting_note(summary).'
