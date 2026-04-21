@@ -99,6 +99,16 @@ if [ -d "$NOTES_DIR" ]; then
     rsync -a --update --exclude='.gitkeep' "$NOTES_DIR/" notes/ 2>/dev/null
 fi
 
+# presenter-mode.sentinel: cross-node mute for the ICLR talk window.
+# `state/` is otherwise per-node (heartbeats, activity log), but this one
+# file is the global talk-day mute signal — if flipped on one Mac it
+# should mute the other. Opt-in single file, not the whole state/ dir.
+PRESENTER_SENTINEL="$REPO_DIR/state/presenter-mode.sentinel"
+if [ -f "$PRESENTER_SENTINEL" ]; then
+    mkdir -p state
+    copy_if_newer "$PRESENTER_SENTINEL" "state/presenter-mode.sentinel" || true
+fi
+
 # --- Commit and push if anything changed ---
 if git diff --quiet && git diff --cached --quiet && [ -z "$(git ls-files --others --exclude-standard)" ]; then
     log "Nothing to push"
@@ -123,6 +133,12 @@ if [ -d "$MEMORY_DIR" ]; then
 fi
 if [ -d "$NOTES_DIR" ]; then
     rsync -a --update --exclude='.gitkeep' notes/ "$NOTES_DIR/" 2>/dev/null
+fi
+
+# Reverse: pull presenter-mode.sentinel from sync (other node flipped it on).
+if [ -f "state/presenter-mode.sentinel" ]; then
+    mkdir -p "$REPO_DIR/state"
+    copy_if_newer "state/presenter-mode.sentinel" "$PRESENTER_SENTINEL" || true
 fi
 
 NOTES_COUNT=$(find notes -type f 2>/dev/null | wc -l | tr -d ' ')
