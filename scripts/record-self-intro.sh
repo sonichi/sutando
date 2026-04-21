@@ -28,6 +28,8 @@ DURATION_SEC="${2:-30}"
 OUT_DIR="$HOME/Documents/sutando-launch-assets"
 TS="$(date +%Y%m%d-%H%M%S)"
 TMP_DIR="$(mktemp -d -t sutando-selfintro-XXXX)"
+# Auto-clean TMP_DIR on exit (success OR failure) so repeated runs don't leak.
+trap 'rm -rf "$TMP_DIR"' EXIT
 RAW_MOV="$TMP_DIR/raw.mov"
 FINAL_MP4="$OUT_DIR/self-intro-autonomous-$TS.mp4"
 FALLBACK_AUDIO="$TMP_DIR/narration.mp3"
@@ -103,8 +105,12 @@ AFPLAY_PID=$!
 
 # Record screen for DURATION_SEC — blocks until done.
 # -x = silent shutter; -V = video duration (macOS 15+ only).
+# -T 2 = 2-sec countdown before capture starts, giving the operator time to
+# focus the right window or move the Sutando UI to the front. Without this,
+# the first second is often dead air (the terminal that launched the script
+# is still focused when capture begins).
 # If `-V` is rejected (older macOS), fall back to ffmpeg avfoundation.
-if ! screencapture -x -V "$DURATION_SEC" -T 0 "$RAW_MOV" 2>"$TMP_DIR/screencapture.err"; then
+if ! screencapture -x -V "$DURATION_SEC" -T 2 "$RAW_MOV" 2>"$TMP_DIR/screencapture.err"; then
     echo "  screencapture -V rejected; falling back to ffmpeg avfoundation"
     # Device 1 is typically the main display on Mac; `none` = no audio
     # (we mux the narration mp3 in the next step).
@@ -142,6 +148,15 @@ ffmpeg -y -loglevel error \
 
 if [[ ! -f "$FINAL_MP4" ]]; then
     echo "  FATAL: mux produced no output"
+    exit 1
+fi
+
+# Verify the mux actually has an audio stream. `afplay` failures (e.g.,
+# corrupt audio) get swallowed by `wait ... || true` earlier; without this
+# check, the script declares ✅ DONE on a silent video.
+if ! ffprobe -v error -select_streams a -show_entries stream=codec_type -of csv=p=0 "$FINAL_MP4" 2>/dev/null | grep -q audio; then
+    echo "  FATAL: mux produced output without an audio stream — narration likely failed"
+    echo "  Raw video preserved: $RAW_MOV (copy before the EXIT trap removes TMP_DIR)"
     exit 1
 fi
 
