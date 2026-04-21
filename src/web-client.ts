@@ -2308,12 +2308,17 @@ document.addEventListener('keydown', function(e) {
   }, 3000);
 })();
 
-// Presenter-mode badge poll — hits the iclr-highlight skill server at
-// :7877/presenter every 2s. Silent-fail when the server isn't running
-// (off-stage / skill not loaded) — badge stays hidden via .active toggle.
+// Presenter-mode badge poll — hits a skill-server endpoint that reports
+// presenter state. Default URL is the iclr-highlight skill's
+// :7877/presenter; override via window._PRESENTER_URL at render time
+// so the badge stays generic and a different skill (or different port)
+// can drive it without editing this file. Silent-fail when unreachable
+// (off-stage / skill not loaded) — badge stays hidden.
 (function() {
+  var presenterUrl = (typeof window !== 'undefined' && window._PRESENTER_URL)
+    || 'http://localhost:7877/presenter';
   setInterval(function() {
-    fetch('http://localhost:7877/presenter')
+    fetch(presenterUrl)
       .then(function(r) { return r.ok ? r.json() : null; })
       .then(function(data) {
         var badge = document.getElementById('presenter-badge');
