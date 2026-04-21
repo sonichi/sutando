@@ -45,11 +45,15 @@ OWNER_ACTIVITY_FILE = STATE_DIR / "last-owner-activity.json"
 SEND_ALLOWED_ROOTS = (
     str(REPO / "results"),
     str(REPO / "notes"),
+    str(REPO / "docs"),
     str(Path.home() / "Desktop" / "iclr-backups"),
+    str(Path.home() / "Documents" / "sutando-launch-assets"),
 )
 SEND_ALLOWED_PREFIXES = (
     "/tmp/sutando-",
     "/private/tmp/sutando-",
+    "/tmp/echo-",
+    "/private/tmp/echo-",
 )
 
 
