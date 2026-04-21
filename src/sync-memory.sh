@@ -54,6 +54,24 @@ fi
 
 cd "$SYNC_DIR" || { log "Failed to cd $SYNC_DIR"; exit 1; }
 
+# --- Assert on main before doing any sync work ---
+# If the sync repo has drifted to a feature/test branch (e.g. after a
+# manual `git checkout` in that dir), pull-rebase + commit + push will
+# operate on the wrong branch, silently stop propagating to origin/main,
+# and leave both nodes quietly diverging. Hit this 2026-04-21 pass 874
+# when my sync repo was on a stale `fix/startup-...` branch from a
+# cd-drift incident. Detect and self-heal.
+CURRENT_BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
+if [ "$CURRENT_BRANCH" != "main" ]; then
+    log "sync repo on non-main branch '$CURRENT_BRANCH' — switching to main"
+    echo "sync-memory: sync repo was on '$CURRENT_BRANCH', switching to main."
+    if ! git checkout main 2>/dev/null; then
+        log "Failed to checkout main in sync repo — manual intervention needed"
+        echo "sync-memory: could not switch to main in $SYNC_DIR — aborting sync."
+        exit 1
+    fi
+fi
+
 # --- Pull latest, detect conflicts ---
 PULL_OUT=$(git pull --rebase 2>&1)
 PULL_RC=$?
