@@ -799,7 +799,11 @@ async def poll_results():
                             await channel.send(file=discord.File(fpath))
                             print(f"  Sent file: {fpath}")
                         elif not os.path.isfile(fpath):
-                            await channel.send(f"(file not found: {fpath})")
+                            # Silent-drop to bridge log: marker-shaped prose
+                            # (e.g., regex examples in a summary) used to emit
+                            # "(file not found:)" to Discord, spamming the DM.
+                            # The log keeps the debug signal.
+                            print(f"  (file not found, dropped): {fpath}", flush=True)
                         else:
                             await channel.send(f"(file not allowed: {fpath})")
                             print(f"  REJECTED file (not in allowlist): {fpath}", flush=True)
@@ -901,7 +905,9 @@ async def poll_proactive():
                             if _is_path_sendable(fpath):
                                 await dm.send(file=discord.File(fpath))
                             elif not os.path.isfile(fpath):
-                                await dm.send(f"(file not found: {fpath})")
+                                # Silent-drop to bridge log (see reply-path
+                                # comment above for rationale).
+                                print(f"  [proactive] (file not found, dropped): {fpath}", flush=True)
                             else:
                                 await dm.send(f"(file not allowed: {fpath})")
                                 print(f"  [proactive] REJECTED file: {fpath}", flush=True)
