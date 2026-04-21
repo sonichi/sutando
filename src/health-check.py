@@ -685,16 +685,25 @@ def run_all_checks() -> list[dict]:
 
         checks.append({"name": name, "status": status, "detail": detail})
 
-    # Sutando menu bar app (optional — only check if binary exists)
+    # Sutando menu bar app (optional — only check if binary exists).
+    # Use `$`-anchored pattern to avoid matching this Claude session's
+    # tmux command line which also contains the string "Sutando".
     sutando_bin = REPO_DIR / "src" / "Sutando" / "Sutando"
     if sutando_bin.exists():
         try:
-            result = subprocess.run(["pgrep", "-f", "Sutando/Sutando"], capture_output=True, text=True)
+            result = subprocess.run(["pgrep", "-f", "Sutando/Sutando$"], capture_output=True, text=True)
             pids = [p for p in result.stdout.strip().split("\n") if p]
         except:
             pids = []
         if pids:
-            check = {"name": "sutando-app", "status": "ok", "detail": f"running (⌃C/⌃V/⌃M)"}
+            if len(pids) > 1:
+                # Multi-instance leak — menu bar shows duplicate icons, each
+                # competing for the same status-bar slot. See memory:
+                # feedback_pkill_then_open_race.md for the fix pattern.
+                check = {"name": "sutando-app", "status": "warn",
+                         "detail": f"{len(pids)} instances running (zombies — kill all + relaunch)"}
+            else:
+                check = {"name": "sutando-app", "status": "ok", "detail": f"running (⌃C/⌃V/⌃M)"}
             mark_stale_if_outdated(check, REPO_DIR / "src" / "Sutando" / "main.swift", "src/Sutando/Sutando")
             checks.append(check)
         else:

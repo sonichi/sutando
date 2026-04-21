@@ -38,6 +38,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var currentAgentState: String = "idle"
     var animationTimer: Timer?
     var animationPhase: CGFloat = 1.0
+    // Presenter-mode state mirrored from iclr-highlight server (port 7877).
+    // Updated every 1s in pollPresenterMode; nil-safe if server is down.
+    var presenterModeActive: Bool = false
+    weak var presenterMenuItem: NSMenuItem?
 
     /// Fixed tmux socket path for the sutando-core session. The shell
     /// (via startup.sh -S flag) and the app (launched by macOS with a
@@ -148,6 +152,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Open Core CLI", action: #selector(openCore), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Open Dashboard", action: #selector(openDashboard), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
+        let presenterItem = NSMenuItem(title: "Presenter: OFF (click to toggle)", action: #selector(togglePresenterMode), keyEquivalent: "")
+        presenterItem.target = self
+        menu.addItem(presenterItem)
+        presenterMenuItem = presenterItem
+        menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Restart All Services", action: #selector(restartServices), keyEquivalent: "r"))
         menu.addItem(NSMenuItem(title: "Stop All Services", action: #selector(stopServices), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Restart Sutando App", action: #selector(restartSelf), keyEquivalent: ""))
@@ -171,6 +180,48 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { [weak self] _ in
             self?.checkWatcher()
         }
+
+        // Presenter mode: poll iclr-highlight server for on/off state.
+        // Keeps menu item + tooltip fresh; silent if server is down.
+        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.pollPresenterMode()
+        }
+    }
+
+    @objc func togglePresenterMode() {
+        // Flip server-side state; the 1s pollPresenterMode tick will refresh
+        // menu title + avatar badge once the POST returns.
+        let target = presenterModeActive ? "off" : "on"
+        guard let url = URL(string: "http://localhost:7877/presenter/\(target)") else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 1.0
+        URLSession.shared.dataTask(with: req) { _, _, err in
+            if let err = err {
+                NSLog("Sutando: presenter toggle failed: \(err.localizedDescription)")
+            }
+        }.resume()
+    }
+
+    func pollPresenterMode() {
+        guard let url = URL(string: "http://localhost:7877/presenter") else { return }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 0.8
+        let task = URLSession.shared.dataTask(with: req) { [weak self] data, _, error in
+            guard let self = self else { return }
+            var active = false
+            if let data = data, error == nil,
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                active = (json["active"] as? Bool) ?? false
+            }
+            DispatchQueue.main.async {
+                guard self.presenterModeActive != active else { return }
+                self.presenterModeActive = active
+                self.presenterMenuItem?.title = active ? "● Presenter: ON (click to turn off)" : "Presenter: OFF (click to turn on)"
+                // Avatar badge re-renders on next pollMuteState tick (≤1s).
+            }
+        }
+        task.resume()
     }
 
     var lastWatcherAlert: Date = .distantPast
@@ -347,6 +398,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return send.terminationStatus == 0
     }
 
+    /// Return the avatar image, optionally badged with a purple presenter dot.
+    /// When `presenterActive` is true, composites a small filled circle
+    /// (purple #6a1b9a, matching the web UI badge) with white stroke onto
+    /// the top-right corner of the avatar so the menu bar continuously
+    /// signals presenter-mode state without taking an extra slot.
+    func avatarImage(presenterActive: Bool) -> NSImage? {
+        let avatarPath = workspace + "/assets/stand-avatar.png"
+        guard let base = NSImage(contentsOfFile: avatarPath) else { return nil }
+        base.size = NSSize(width: 18, height: 18)
+        base.isTemplate = false
+        if !presenterActive { return base }
+        let result = NSImage(size: base.size)
+        result.lockFocus()
+        base.draw(in: NSRect(origin: .zero, size: base.size))
+        let dotR: CGFloat = 4.5
+        let dotRect = NSRect(x: base.size.width - dotR * 2 - 0.5, y: base.size.height - dotR * 2 - 0.5, width: dotR * 2, height: dotR * 2)
+        NSColor(red: 0.416, green: 0.106, blue: 0.604, alpha: 1.0).setFill()
+        NSBezierPath(ovalIn: dotRect).fill()
+        NSColor.white.setStroke()
+        let stroke = NSBezierPath(ovalIn: dotRect)
+        stroke.lineWidth = 0.8
+        stroke.stroke()
+        result.unlockFocus()
+        result.isTemplate = false
+        return result
+    }
+
     func pollMuteState() {
         guard let url = URL(string: "http://localhost:8080/sse-status") else { return }
         let task = URLSession.shared.dataTask(with: url) { [weak self] data, _, error in
@@ -374,10 +452,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     self.currentAgentState = "idle"
                 } else {
                     // Default state (disconnected or unmuted): show avatar
-                    let avatarPath = self.workspace + "/assets/stand-avatar.png"
-                    if let image = NSImage(contentsOfFile: avatarPath) {
-                        image.size = NSSize(width: 18, height: 18)
-                        image.isTemplate = false
+                    // (badged with a purple dot when presenter mode is active).
+                    if let image = self.avatarImage(presenterActive: self.presenterModeActive) {
                         button.image = image
                         button.title = ""
                     } else {

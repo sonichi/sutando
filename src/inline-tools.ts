@@ -6,7 +6,7 @@
  */
 
 import { execSync } from 'node:child_process';
-import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync } from 'node:fs';
+import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
@@ -498,6 +498,61 @@ end tell'`, { timeout: 5_000 });
 	},
 };
 
+// Load tools from any skill that has a `manifest.json` with "enabled": true.
+// Manifest shape:
+//   { "name": "skill-name", "enabled": true, "access_tier": "owner",
+//     "tools": "./tools.ts", "config": { "ENV_VAR": "value" } }
+// - "enabled": false (or missing) → skill skipped
+// - "tools" path → dynamic-imported, expects `export const tools: ToolDefinition[]`
+// - "config" entries → surfaced to process.env (only set if not already defined)
+// Non-tool fields (server, startup) are for future orchestration, ignored here.
+// NOTE: "access_tier" is currently READ but NOT ENFORCED at tool-dispatch time.
+// Access control is enforced at the bridge level: non-owner tasks are routed to
+// codex sandbox which doesn't see inlineTools. If that invariant ever weakens,
+// this loader will need a per-tool tier filter at dispatch. Tracked for post-ICLR
+// in build_log.md and feedback_talk_tools_env_gated.md.
+async function loadSkillManifestTools(): Promise<ToolDefinition[]> {
+	const skillsDir = join(process.cwd(), 'skills');
+	if (!existsSync(skillsDir)) return [];
+	const out: ToolDefinition[] = [];
+	let dirs: string[];
+	try {
+		dirs = readdirSync(skillsDir).filter(n => {
+			try { return statSync(join(skillsDir, n)).isDirectory(); } catch { return false; }
+		});
+	} catch { return []; }
+	for (const dirName of dirs) {
+		const manifestPath = join(skillsDir, dirName, 'manifest.json');
+		if (!existsSync(manifestPath)) continue;
+		let manifest: { enabled?: boolean; tools?: string; config?: Record<string, string>; name?: string };
+		try {
+			manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+		} catch (err) {
+			console.warn(`[skill-loader] bad manifest ${dirName}:`, err instanceof Error ? err.message : err);
+			continue;
+		}
+		if (!manifest.enabled) continue;
+		// Surface config to env (don't clobber existing values)
+		for (const [k, v] of Object.entries(manifest.config || {})) {
+			if (process.env[k] === undefined) process.env[k] = v;
+		}
+		if (!manifest.tools) continue;
+		const toolsPath = join(skillsDir, dirName, manifest.tools.replace(/^\.\//, ''));
+		try {
+			// @ts-ignore — dynamic relative import resolved at runtime by tsx
+			const mod = await import(toolsPath);
+			if (Array.isArray(mod.tools)) {
+				out.push(...mod.tools);
+				console.log(`[skill-loader] loaded ${mod.tools.length} tool(s) from ${manifest.name || dirName}`);
+			}
+		} catch (err) {
+			console.warn(`[skill-loader] failed to import ${dirName}/${manifest.tools}:`, err instanceof Error ? err.message : err);
+		}
+	}
+	return out;
+}
+const personalTools = await loadSkillManifestTools();
+
 /** All inline tools — import and spread into your tools list */
 // ─── Notes tools ─────────────────────────────────────────
 const NOTES_DIR = join(process.cwd(), 'notes');
@@ -595,7 +650,8 @@ export const inlineTools = [
 	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, getCoreStatusTool, summonTool, dismissTool,
 	joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool,
 	describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, slideControlTool, fullscreenTool,
-	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool, ];
+	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
+	...personalTools ];
 
 /** Tools available to any caller (including unverified) */
 export const anyCallerTools = [
