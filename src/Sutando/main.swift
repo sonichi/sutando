@@ -47,6 +47,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let sutandoTmuxSocket = "/tmp/sutando-tmux.sock"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Self-preventive single-instance: if another Sutando.app is already
+        // running (e.g. manual double-launch or leftover from restartSelf()),
+        // quit immediately. Prevents the menu-bar-icon ghost stack that
+        // plagued 2026-04-21 morning (3 instances accumulated + user saw
+        // duplicate icons). Matches path via pgrep $-anchored pattern — same
+        // pattern used by health-check.py per feedback_pkill_then_open_race.
+        let myPid = ProcessInfo.processInfo.processIdentifier
+        let myPath = ProcessInfo.processInfo.arguments[0]
+        let pgrep = Process()
+        pgrep.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        pgrep.arguments = ["-f", "Sutando/Sutando$"]
+        let pipe = Pipe()
+        pgrep.standardOutput = pipe
+        pgrep.standardError = FileHandle.nullDevice
+        try? pgrep.run()
+        pgrep.waitUntilExit()
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let pids = out.split(separator: "\n").compactMap { Int32($0.trimmingCharacters(in: .whitespaces)) }
+        let others = pids.filter { $0 != myPid }
+        if !others.isEmpty {
+            NSLog("Sutando: another instance already running (\(others.map(String.init).joined(separator: ","))) — exiting to prevent duplicate menu-bar icons. Path: \(myPath)")
+            exit(0)
+        }
         // Request notification permission — only when running as .app bundle
         // (UNUserNotificationCenter crashes when run as raw binary)
         if Bundle.main.bundleIdentifier != nil {
