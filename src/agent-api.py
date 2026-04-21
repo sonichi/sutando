@@ -136,24 +136,22 @@ def get_status() -> dict:
 def _safe_path(base_dir: Path, filename: str) -> Path:
     """Resolve a path safely under base_dir. Returns None if path escapes.
 
-    Layered defense:
-    1. Whitelist-sanitize to `[a-zA-Z0-9_.-]+`.
-    2. Rebuild the filename via `Path(...).name` — CodeQL-recognized
-       sanitizer that strips any residual path components and breaks the
-       taint flow that `.is_relative_to()` alone didn't cut.
-    3. Confine under `base_dir` via `.is_relative_to()` after `.resolve()`.
+    Uses the two-stage CodeQL-recognized path-injection defense:
+    1. Whitelist the basename to `[a-zA-Z0-9_.-]+` (reject empty).
+    2. `os.path.realpath` to normalize (Path::PathNormalization).
+    3. `.startswith(base + sep)` prefix check (Path::SafeAccessCheck).
+    `os.path.realpath` and `str.startswith` are the CodeQL-modeled pair —
+    `Path.resolve` and `Path.is_relative_to` are NOT recognized, which is
+    why the earlier in-helper markers didn't close py/path-injection.
     """
     safe_name = re.sub(r'[^a-zA-Z0-9_\-.]', '', filename)
     if not safe_name:
         return None
-    # Path(...).name is a CodeQL-recognized path-injection sanitizer; it's
-    # a functional no-op after the whitelist (safe_name has no separators)
-    # but it breaks the taint flow CodeQL tracks through f-string building.
-    safe_basename = Path(safe_name + ".txt").name
-    resolved = (base_dir / safe_basename).resolve()
-    if not resolved.is_relative_to(base_dir.resolve()):
+    base_real = os.path.realpath(base_dir)
+    resolved = os.path.realpath(os.path.join(base_real, f"{safe_name}.txt"))
+    if not resolved.startswith(base_real + os.sep):
         return None
-    return resolved
+    return Path(resolved)
 
 
 def get_task_result(task_id: str):
@@ -619,17 +617,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             break
                     if new_content != content:
                         pq_file.write_text(new_content)
-                        # Also write as a task so the agent picks it up
                         ts = int(datetime.now().timestamp() * 1000)
-                        # Inline sanitization so CodeQL sees taint broken before Path() (fixes #22-23)
                         safe_qid = re.sub(r'[^a-zA-Z0-9_\-.]', '', qid)
                         if safe_qid:
-                            task_dir = (REPO_DIR / "tasks").resolve()
-                            # Path(...).name taint-breaker (see _safe_path comment).
-                            safe_basename = Path(f"answer-{safe_qid}-{ts}.txt").name
-                            task_file = (task_dir / safe_basename).resolve()
-                            if task_file.is_relative_to(task_dir):
-                                task_file.write_text(f"User answered {safe_qid}: {answer}")
+                            # os.path.realpath + str.startswith is the CodeQL-recognized
+                            # path-injection sanitizer pair (Path::PathNormalization
+                            # + Path::SafeAccessCheck in semmle.python).
+                            task_dir_real = os.path.realpath(REPO_DIR / "tasks")
+                            task_file_str = os.path.realpath(
+                                os.path.join(task_dir_real, f"answer-{safe_qid}-{ts}.txt")
+                            )
+                            if task_file_str.startswith(task_dir_real + os.sep):
+                                Path(task_file_str).write_text(f"User answered {safe_qid}: {answer}")
                         self.send_json(200, {"ok": True, "id": qid, "answer": answer})
                     else:
                         self.send_json(404, {"error": f"question {qid} not found or already answered"})

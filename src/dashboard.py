@@ -13,6 +13,7 @@ Auto-refreshes every 15 seconds.
 
 import http.server
 import json
+import os
 import re
 import subprocess
 import sys
@@ -29,28 +30,21 @@ def _resolve_note_path(raw_slug: str):
 
     Returns the resolved Path, or None if the slug is invalid.
 
-    Layered defense:
-    1. Whitelist the slug to `[\\w-]+` and reject if any char was stripped.
-    2. Rebuild the filename from `Path(...).name` — strips any residual
-       path components and gives CodeQL a recognized sanitizer to break
-       the taint flow that `.is_relative_to()` alone doesn't cut.
-    3. Confine under `notes/` via `.is_relative_to()` after `.resolve()`.
-
-    CodeQL alerts #28-31, #35-36 all hit this code path before the
-    refactor; the `Path.name` sanitizer is the key addition.
+    Uses the CodeQL-recognized sanitizer pair:
+    1. Whitelist the slug to `[\\w-]+` (reject if any char was stripped).
+    2. `os.path.realpath` to normalize (Path::PathNormalization).
+    3. `.startswith(base + sep)` prefix check (Path::SafeAccessCheck).
+    `Path.resolve` and `Path.is_relative_to` are NOT modeled by CodeQL's
+    path-injection query, so the previous refactor didn't close the alerts.
     """
     slug = re.sub(r"[^\w-]", "", raw_slug)
     if not slug or slug != raw_slug:
         return None
-    notes_dir = (REPO_DIR / "notes").resolve()
-    # Path(...).name strips any path separators / traversal segments; at
-    # this point slug is already `[\w-]+` so functionally it's a no-op,
-    # but CodeQL recognizes `.name` as a sanitizer for path-injection.
-    safe_name = Path(slug + ".md").name
-    note_file = (notes_dir / safe_name).resolve()
-    if not note_file.is_relative_to(notes_dir):
+    notes_real = os.path.realpath(REPO_DIR / "notes")
+    note_file_str = os.path.realpath(os.path.join(notes_real, f"{slug}.md"))
+    if not note_file_str.startswith(notes_real + os.sep):
         return None
-    return note_file
+    return Path(note_file_str)
 
 
 def get_health() -> list[dict]:
