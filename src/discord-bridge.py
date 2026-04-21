@@ -38,6 +38,43 @@ ARCHIVE_TASKS_DIR = REPO / "tasks" / "archive"
 ARCHIVE_RESULTS_DIR = REPO / "results" / "archive"
 OWNER_ACTIVITY_FILE = STATE_DIR / "last-owner-activity.json"
 
+# Allowlist for paths that may be attached to outgoing Discord messages.
+# Result text can embed `[file: /path]` / `[send: /path]` / `[attach: /path]`
+# markers; we only forward paths that resolve under one of these roots.
+# Fail-closed: a non-matching path is reported inline rather than sent.
+SEND_ALLOWED_ROOTS = (
+    str(REPO / "results"),
+    str(REPO / "notes"),
+    str(Path.home() / "Desktop" / "iclr-backups"),
+)
+SEND_ALLOWED_PREFIXES = (
+    "/tmp/sutando-",
+    "/private/tmp/sutando-",
+)
+
+
+def _is_path_sendable(fpath: str) -> bool:
+    """True iff `fpath` is a real file AND resolves under an allowed root.
+
+    Uses os.path.realpath to collapse symlinks / `..` segments before the
+    prefix comparison, matching the sanitizer pattern used across the
+    codebase for CodeQL py/path-injection resolution.
+    """
+    if not os.path.isfile(fpath):
+        return False
+    try:
+        real = os.path.realpath(fpath)
+    except OSError:
+        return False
+    for root in SEND_ALLOWED_ROOTS:
+        root_real = os.path.realpath(root)
+        if real == root_real or real.startswith(root_real + os.sep):
+            return True
+    for prefix in SEND_ALLOWED_PREFIXES:
+        if real.startswith(prefix):
+            return True
+    return False
+
 
 def write_owner_activity(channel: str, summary: str) -> None:
     """Record that the owner was active on <channel> right now.
@@ -751,14 +788,17 @@ async def poll_results():
                         for i in range(0, len(clean_text), 1900):
                             await channel.send(clean_text[i:i+1900])
 
-                    # Send files
+                    # Send files (allowlist-gated; see _is_path_sendable)
                     for fpath in files:
                         fpath = fpath.strip()
-                        if os.path.isfile(fpath):
+                        if _is_path_sendable(fpath):
                             await channel.send(file=discord.File(fpath))
                             print(f"  Sent file: {fpath}")
-                        else:
+                        elif not os.path.isfile(fpath):
                             await channel.send(f"(file not found: {fpath})")
+                        else:
+                            await channel.send(f"(file not allowed: {fpath})")
+                            print(f"  REJECTED file (not in allowlist): {fpath}", flush=True)
 
                     print(f"  Replied: {reply_text[:80]}...", flush=True)
                 except Exception as e:
@@ -854,8 +894,13 @@ async def poll_proactive():
                                 await dm.send(clean_text[i:i+1900])
                         for fpath in files:
                             fpath = fpath.strip()
-                            if os.path.isfile(fpath):
+                            if _is_path_sendable(fpath):
                                 await dm.send(file=discord.File(fpath))
+                            elif not os.path.isfile(fpath):
+                                await dm.send(f"(file not found: {fpath})")
+                            else:
+                                await dm.send(f"(file not allowed: {fpath})")
+                                print(f"  [proactive] REJECTED file: {fpath}", flush=True)
                         print(f"  [proactive] sent to {owner_id}: {clean_text[:80]}")
                     except Exception as e:
                         print(f"  [proactive] failed to DM {owner_id}: {e}")
