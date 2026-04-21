@@ -783,7 +783,7 @@ async def poll_results():
                     continue
                 try:
                     # Extract file paths: [file: /path] or [send: /path]
-                    file_pattern = re.compile(r'\[(?:file|send|attach):\s*([^\]]+)\]')
+                    file_pattern = re.compile(r'\[(?:file|send|attach):\s*((?:/|~/)[^\]:]+)\]')
                     files = file_pattern.findall(reply_text)
                     clean_text = file_pattern.sub('', reply_text).strip()
 
@@ -890,7 +890,7 @@ async def poll_proactive():
                         user = await client.fetch_user(int(owner_id))
                         dm = await user.create_dm()
                         # Extract files
-                        file_pattern = re.compile(r'\[(?:file|send|attach):\s*([^\]]+)\]')
+                        file_pattern = re.compile(r'\[(?:file|send|attach):\s*((?:/|~/)[^\]:]+)\]')
                         files = file_pattern.findall(text)
                         clean_text = file_pattern.sub('', text).strip()
                         if clean_text:
