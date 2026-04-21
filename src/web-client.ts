@@ -2527,13 +2527,16 @@ const server = createServer((req, res) => {
 					if (labelParam) _toolLabel = labelParam;
 					const ttlParam = url.searchParams.get('ttl_ms');
 					const ttl = ttlParam ? parseInt(ttlParam, 10) : 3000;
-					// Clamp upper bound to 60s to break CodeQL #43
-					// (js/resource-exhaustion). The "seeing" overlay is UI
-					// flash feedback (1.5-3s typical); nothing legitimate
-					// needs a minute-plus timer, and an unbounded ttl_ms would
-					// schedule a long-lived setTimeout per request.
+					// Upper-bound via RelationalComparison, which CodeQL's
+					// js/resource-exhaustion recognizes as UpperBoundsCheckSanitizerGuard.
+					// #489 used `Math.min(ttl, MAX)`, which CodeQL treats as a
+					// numeric passthrough (isNumericFlowStep) and therefore does
+					// NOT close alert #43. `ttl <= MAX ? ttl : MAX` is the
+					// equivalent clamp expressed as a relational guard.
 					const MAX_TTL_MS = 60000;
-					const ttlMs = isFinite(ttl) && ttl > 0 ? Math.min(ttl, MAX_TTL_MS) : 3000;
+					const ttlMs = (isFinite(ttl) && ttl > 0)
+						? (ttl <= MAX_TTL_MS ? ttl : MAX_TTL_MS)
+						: 3000;
 					_seeingUntil = Date.now() + ttlMs;
 					// Schedule an auto-revert broadcast so the browser clears
 					// .seeing even if nothing else POSTs a state update.
