@@ -103,11 +103,16 @@ if ! lsof -i :7846 > /dev/null 2>&1; then
   echo "  Starting credential proxy (port 7846)..."
   npx tsx ~/.claude/skills/quota-tracker/scripts/credential-proxy.ts > /tmp/credential-proxy.log 2>&1 &
   sleep 1
-  echo "  ✓ credential proxy"
+  if lsof -i :7846 > /dev/null 2>&1; then
+    echo "  ✓ credential proxy"
+    export ANTHROPIC_BASE_URL=http://localhost:7846
+  else
+    echo "  ⚠ credential proxy failed — Claude will connect directly (check /tmp/credential-proxy.log)"
+  fi
 else
   echo "  ✓ credential proxy (already running)"
+  export ANTHROPIC_BASE_URL=http://localhost:7846
 fi
-export ANTHROPIC_BASE_URL=http://localhost:7846
 
 # 1. Voice agent (Gemini Live on port 9900)
 if ! lsof -i :9900 > /dev/null 2>&1; then
