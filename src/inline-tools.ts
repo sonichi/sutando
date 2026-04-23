@@ -588,14 +588,36 @@ export const deleteNoteTool: ToolDefinition = {
 // of calling them (e.g. "I've closed the video" without actually closing it).
 // screenRecordTool re-added — descriptions now clearly distinguish plain recording
 // ("start recording") from narrated demo ("record for N seconds").
-export const inlineTools = [
+//
+// Duplicate-name guard: gemini-3.1-flash-live-preview rejects duplicate tool
+// names at bidiGenerateContent setup with ws code 1011 "Internal error
+// encountered"; gemini-2.5 silently tolerated dupes (exact pattern of the
+// Apr 9 migration bug #2 + an Apr 22-23 re-occurrence after a local skill
+// re-registered an existing name). Throws loudly at module load so any
+// future collision is caught in seconds, not after the next voice-agent
+// restart fails to connect.
+function assertUniqueToolNames(tools: ToolDefinition[]): ToolDefinition[] {
+	const counts = new Map<string, number>();
+	for (const t of tools) counts.set(t.name, (counts.get(t.name) ?? 0) + 1);
+	const dupes = [...counts.entries()].filter(([, n]) => n > 1).map(([name]) => name);
+	if (dupes.length > 0) {
+		throw new Error(
+			`[inline-tools] duplicate tool name(s): ${dupes.join(', ')}. ` +
+			`Gemini 3.1 Live rejects dup names at setup (1011). ` +
+			`Rename one side and retry.`
+		);
+	}
+	return tools;
+}
+
+export const inlineTools = assertUniqueToolNames([
 	pressKeyTool, scrollTool, switchTabTool, closeTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
 	volumeTool, brightnessTool, clipboardTool,
 	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, getCoreStatusTool, summonTool, dismissTool,
 	joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool,
 	describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, slideControlTool, fullscreenTool,
-	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool, ];
+	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool, ]);
 
 /** Tools available to any caller (including unverified) */
 export const anyCallerTools = [
