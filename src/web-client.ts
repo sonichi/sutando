@@ -1073,13 +1073,17 @@ function startTaskPolling() {
         if (t.status === 'done' && existing.status && existing.status !== 'done') {
           showToast('<span class="toast-label">Done</span> ' + (t.text || t.id).slice(0, 60));
         }
-        // Auto-expand both working AND done tasks (progress + result visibility).
-        // Mirrors updateTask()'s rule set so the polling path doesn't undo the
-        // WebSocket-delivered expansion. Respect userCollapsed (user closed all
-        // tasks via the chip) as the opt-out. Mini flagged this regression in
-        // #506 review: the old polling logic collapsed on done, contradicting
-        // the new auto-expand UX.
-        if ((t.status === 'working' || t.status === 'done') && !expandedTasks.has(t.id) && !userCollapsed) {
+        // Auto-expand working tasks every poll; auto-expand done tasks ONLY
+        // on the working→done transition. If the user clicks Hide on a done
+        // task (toggleResult removes it from expandedTasks without setting
+        // userCollapsed), the next poll must NOT re-add it. The transition
+        // check makes the expand one-shot per task. Mini flagged this in the
+        // second #506 review: the prior version fired every poll and overrode
+        // per-task user collapse.
+        if (t.status === 'working' && !expandedTasks.has(t.id) && !userCollapsed) {
+          expandedTasks.add(t.id);
+        }
+        if (t.status === 'done' && existing.status !== 'done' && !expandedTasks.has(t.id) && !userCollapsed) {
           expandedTasks.add(t.id);
         }
         taskMap[t.id] = { status: t.status, text: t.text, time: new Date(t.time * 1000), result: t.result || existing.result || '' };
