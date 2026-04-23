@@ -319,6 +319,27 @@ const HTML = /* html */ `<!DOCTYPE html>
     cursor: pointer; border: 1px solid #3a5075; user-select: none;
   }
   .task-expand:hover { background: #3a5075; color: #ffffff; }
+  .task-actions {
+    display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+    margin: -2px 0 10px 30px; padding: 0; user-select: text;
+  }
+  .task-action-btn {
+    background: #1e3a5f; color: #d8e8f8; border: 1px solid #2a4a7a;
+    padding: 5px 12px; border-radius: 14px; font-size: 12px; font-weight: 600;
+    cursor: pointer; user-select: none;
+  }
+  .task-action-btn:hover { background: #2a4a7a; color: #ffffff; border-color: #3a5a9a; }
+  .task-action-btn:active { background: #3a5a9a; }
+  .task-action-input {
+    flex: 1; min-width: 140px; background: #0d1520; border: 1px solid #2a4a7a;
+    color: #d0d0d8; padding: 5px 12px; border-radius: 14px; font-size: 12px;
+    outline: none;
+  }
+  .task-action-input:focus { border-color: #4ecca3; }
+  .task-action-sent {
+    color: #4ecca3; font-size: 12px; font-style: italic;
+    margin: 4px 0 10px 30px;
+  }
 
   /* Dynamic region */
   #dynamic-region { padding: 26px 16px 8px; width: 100%; box-sizing: border-box; user-select: text; -webkit-user-select: text; }
@@ -890,19 +911,14 @@ const taskMap = window.taskMap = {};
 function updateTask(taskId, status, text, result) {
   const existing = taskMap[taskId] || {};
   const isNew = !existing.status;
-  const wasDone = existing.status === 'done';
   taskMap[taskId] = { status, text: text || existing.text, time: new Date(), result: result || existing.result || '' };
   // Auto-switch to tasks tab if new task arrives and user is on starter
   if (isNew && window._drActiveTab === 'starter') { switchDRTab('tasks'); }
-  // Auto-expand ONLY ongoing tasks (working/pending) so the user sees progress.
-  // Done tasks stay collapsed by default — user clicks the "Show details" chip.
-  if (status === 'working' && !expandedTasks.has(taskId)) {
+  // Auto-expand ongoing tasks so the user sees progress, AND newly-finished
+  // tasks so the user sees the result land. (Respect userCollapsed — if the
+  // user hit "collapse all", don't re-expand on their behalf.)
+  if ((status === 'working' || status === 'done') && !expandedTasks.has(taskId) && !userCollapsed) {
     expandedTasks.add(taskId);
-  }
-  // When a task transitions done, auto-collapse — UNLESS the user manually
-  // expanded it (userExpanded set). Prevents the "2s flash then close" bug.
-  if (status === 'done' && !wasDone && !userExpanded.has(taskId)) {
-    expandedTasks.delete(taskId);
   }
   renderTasks();
 }
@@ -991,6 +1007,21 @@ function renderTasks() {
     const isExpanded = expandedTasks.has(id);
     const resultDisplay = isExpanded ? 'block' : 'none';
     const resultHtml = hasResult ? '<div id="result-' + id + '" style="display:' + resultDisplay + ';padding:8px 12px;color:#b8c8d8;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;background:#0d1520;border-radius:8px;margin:4px 0 6px 30px">' + t.result.replace(/</g,'&lt;') + '</div>' : '';
+    // Action buttons / reply input — only when expanded + has a result.
+    // Pattern-matches DECISION: X / Y / Z lines; otherwise offers a plain
+    // text input. Either emits a new task via replyToTask() -> /task.
+    let actionsHtml = '';
+    if (hasResult && isExpanded) {
+      const opts = parseDecisionOptions(t.result);
+      let inner = '';
+      if (opts) {
+        inner = opts.map(o => '<button class="task-action-btn" data-taskid="' + id + '" data-answer="' + esc(o) + '">' + esc(o) + '</button>').join('');
+        inner += '<input type="text" class="task-action-input" data-taskid="' + id + '" placeholder="or type a reply...">';
+      } else {
+        inner = '<input type="text" class="task-action-input" data-taskid="' + id + '" placeholder="Type a reply...">';
+      }
+      actionsHtml = '<div class="task-actions" data-replyfor="' + id + '">' + inner + '</div>';
+    }
     const rawText = t.text || id;
     // Default-tag bare tasks (no [Channel] prefix) as [Sutando-core].
     const taggedRaw = /^\\[/.test(rawText) ? rawText : '[Sutando-core] ' + rawText;
@@ -1002,7 +1033,7 @@ function renderTasks() {
       '<span class="' + textClass + '">' + displayText + '</span>' +
       '<span class="task-time">' + timeStr + '</span>' +
       expandChip +
-      '</div>' + resultHtml;
+      '</div>' + resultHtml + actionsHtml;
   }).join('');
 }
 
@@ -1738,6 +1769,92 @@ function copyLogs() {
     });
   }).catch(function() { addSystem('Could not fetch logs — is the agent API running?'); });
 }
+
+// Parse a result for decision options. Two patterns, in preference order:
+//   1. "Say X, Y, or Z" / "say X or Y"
+//   2. "DECISION: X / Y / Z"
+// NOTE: embedded in an HTML template literal — backslashes in regex literals
+// get eaten by the template. Use new RegExp('\\\\pattern') so the served JS
+// gets '\\pattern' which becomes /\pattern/ at runtime. Ref: inline-JS escape
+// memo + the wrapper regex at the bottom of this file.
+function parseDecisionOptions(text) {
+  if (!text) return null;
+  var reSay = new RegExp('\\\\bSay\\\\s+([^.\\\\n\\\\r]+?)(?:\\\\s*\\\\.|\\\\s*$)', 'im');
+  var reDecision = new RegExp('DECISION:\\\\s*([^\\\\n\\\\r]+)', 'i');
+  var reOrJoin = new RegExp(',?\\\\s+or\\\\s+', 'i');
+  var reAsterisk = new RegExp('^\\\\*\\\\*|\\\\*\\\\*$', 'g');
+  var reSplitTail = new RegExp('\\\\s*[\\\\u2014\\\\u2013(]\\\\s*|\\\\.\\\\s');
+  var reQuotes = new RegExp('^[\\\\x27\\\\x22\\\\u201C]|[\\\\x27\\\\x22\\\\u201D.]$', 'g');
+
+  var sm = text.match(reSay);
+  if (sm) {
+    var list = sm[1].trim().replace(reOrJoin, ', ');
+    var parts = list.split(',').map(function(p) { return p.trim(); }).filter(Boolean);
+    if (parts.length >= 2 && parts.every(function(p) { return p.length > 0 && p.length <= 30; })) {
+      return parts;
+    }
+  }
+  var m = text.match(reDecision);
+  if (m) {
+    var opts = m[1].split('/').map(function(p) {
+      var s = p.trim().replace(reAsterisk, '').trim();
+      var cut = s.split(reSplitTail)[0].trim();
+      cut = cut.replace(reQuotes, '').trim();
+      return cut;
+    }).filter(function(s) { return s && s.length > 0 && s.length <= 30; });
+    if (opts.length >= 2) return opts;
+  }
+  return null;
+}
+
+// Post a reply to a task via the task bridge. Creates a new task that
+// carries context about which result it is answering. Reuses /task
+// endpoint — same plumbing as sendText() voice-disconnected path.
+function replyToTask(taskId, answer) {
+  if (!answer || !answer.trim()) return;
+  var apiBase = 'http://' + location.hostname + ':7843';
+  var body = JSON.stringify({ from: 'web-reply:' + taskId, task: answer.trim() });
+  fetch(apiBase + '/task', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      var container = document.querySelector('[data-replyfor="' + taskId + '"]');
+      if (!container) return;
+      if (d.ok) {
+        container.outerHTML = '<div class="task-action-sent">Replied: ' + esc(answer.trim()) + '</div>';
+      } else {
+        alert('Reply failed: ' + (d.error || 'unknown'));
+      }
+    })
+    .catch(function() { alert('Could not reach agent API'); });
+}
+
+// Event delegation: button click + Enter in reply input. Keeps renderTasks
+// free of inline onclick handlers (avoids innerHTML-quoting issues).
+document.addEventListener('click', function(e) {
+  var btn = e.target.closest('.task-action-btn');
+  if (btn && btn.dataset.taskid) { replyToTask(btn.dataset.taskid, btn.dataset.answer); }
+});
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') {
+    var input = e.target;
+    if (input.classList && input.classList.contains('task-action-input') && input.dataset.taskid) {
+      replyToTask(input.dataset.taskid, input.value);
+    }
+    return;
+  }
+  // Global "/" — jump focus to the most recent task's reply input.
+  // Skip when user is already typing in ANY input/textarea/contenteditable.
+  if (e.key === '/') {
+    var active = document.activeElement;
+    var tag = active && active.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || (active && active.isContentEditable)) return;
+    var firstInput = document.querySelector('.task-action-input');
+    if (firstInput) {
+      e.preventDefault();
+      firstInput.focus();
+    }
+  }
+});
 
 function answerQuestion(qid, answer) {
   if (!answer || !answer.trim()) return;
