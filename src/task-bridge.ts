@@ -221,6 +221,25 @@ export function logSessionBoundary(reason: string = 'user_goodbye'): void {
 	try { appendFileSync(CONVERSATION_LOG, line); } catch { /* best effort */ }
 }
 
+/** Seconds since the most recent conversation.log entry (any line —
+ *  user/assistant turn or SESSION_END marker). Returns null if no log
+ *  exists or the last line's timestamp is unparseable. Used to detect
+ *  quick reconnects (network blips) so we can resume silently instead
+ *  of greeting the user again every time. */
+export function getSecondsSinceLastTurn(): number | null {
+	if (!existsSync(CONVERSATION_LOG)) return null;
+	try {
+		const content = readFileSync(CONVERSATION_LOG, 'utf-8').trim();
+		if (!content) return null;
+		const lines = content.split('\n');
+		const lastLine = lines[lines.length - 1];
+		const tsStr = lastLine.split('|')[0];
+		const ts = Date.parse(tsStr);
+		if (Number.isNaN(ts)) return null;
+		return (Date.now() - ts) / 1000;
+	} catch { return null; }
+}
+
 /** Read recent conversation entries from disk, trimming at the most
  *  recent SESSION_END marker. Survives restarts. Returns at most
  *  `count` entries from the current session only — a cleanly-ended

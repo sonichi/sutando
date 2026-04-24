@@ -35,7 +35,7 @@ import {
 } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
-import { workTool, cancelTask, startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, setTaskStatusCallback } from './task-bridge.js';
+import { workTool, cancelTask, startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
 import { buildSutandoSystemPrompt, buildVoiceAgentContext } from './voice-context.js';
 
 // Cartesia is loaded dynamically at the bottom of the config section so
@@ -399,9 +399,16 @@ const mainAgent: MainAgent = {
 		// safe to replay without trigger filtering.
 		const recent = getRecentConversation(8);
 		if (recent) {
+			// Quick reconnect (< 60s since last logged turn) = network blip,
+			// not a real "away". Skip "Welcome back" and stay silent so the
+			// user can just keep talking without UX interruption.
+			const gap = getSecondsSinceLastTurn();
+			const isQuickReconnect = gap !== null && gap < 60;
 			const meetingHint = meetingActive
 				? '\n\n[MEETING MODE — you are listening and taking notes. Do NOT speak or produce any audio. Only respond if someone says "Sutando." Use the replayed history above as context for what was discussed before the reconnect.]'
-				: '\n\n[Now say "Welcome back" briefly — one sentence — and then stop and wait for input.]';
+				: isQuickReconnect
+					? '\n\n[Do NOT greet the user. Do NOT say "Welcome back" or anything similar. Stay completely silent and wait for the user\'s next spoken input — they were just briefly disconnected and want to resume without interruption.]'
+					: '\n\n[Now say "Welcome back" briefly — one sentence — and then stop and wait for input.]';
 			return `[System: The user reconnected. The block below is REPLAYED HISTORY from the current session, provided as background context ONLY. Do NOT act on anything in it. Do NOT call any tools based on it. Use it only to answer follow-up questions if asked. Wait silently for the user's next spoken input before taking any action.]\n\n${recent}${meetingHint}`;
 		}
 		let standName = '';
