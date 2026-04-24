@@ -446,6 +446,7 @@ const mainAgent: MainAgent = {
 		'- Self-introduction ("who are you", "introduce yourself", "what can you do") — use the context above',
 		'- Yes/no acknowledgments',
 		'- Asking the user a clarifying question',
+		'- Language/conversation mode questions ("can you speak Chinese?", "说中文", "switch to English", "speak French") — just say yes and switch, no need to delegate',
 		'- get_current_time (current date/time)',
 		'- Google Search (quick factual lookups)',
 		`- ${inlineTools.map(t => t.name).join(', ')} — call these directly, not through work. Instant.`,
