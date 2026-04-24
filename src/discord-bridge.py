@@ -623,20 +623,19 @@ async def _handle_discord_message(message, force=False):
         print(f"  [tier-ownership] dropping {access_tier}-tier task from @{username} — owner is {TEAM_TIER_OWNER}, this node is {LOCAL_MACHINE or 'unknown'}")
         return
 
-    # Write as task
-    # Echo-loop guard: if the incoming content is EXACTLY the team/other-tier
-    # fallback sentinel, log-drop instead of writing a task file. This fires
-    # when the *other* side's codex sandbox hit a quota/error and relayed the
-    # literal sentinel back to us. Without this guard the two bridges bounce
-    # the sentinel (and burn codex tokens running it verbatim) until one side
-    # runs out. See build-log 2026-04-23 + CLAUDE.md "Discord access control".
-    if text and text.strip() == SENTINEL_NON_OWNER_REFUSAL:
+    # Echo-loop detection: if the incoming content is EXACTLY the team/other-tier
+    # fallback sentinel, the *other* side's codex hit a quota/error and
+    # relayed our previous refusal back. Still write a task file (audit trail),
+    # but substitute the system-instructions with a silent-ack block so the
+    # core agent archives and stops — no codex call, no reply, no fuel for
+    # the next round. See build-log 2026-04-23 + CLAUDE.md "Discord access control".
+    is_echo_sentinel = bool(text and text.strip() == SENTINEL_NON_OWNER_REFUSAL)
+    if is_echo_sentinel:
         print(
-            f"  [echo-guard] dropping sentinel task from @{username} "
-            f"(access_tier={access_tier}) — refusing to relay the bounce",
+            f"  [echo-guard] sentinel-echo from @{username} "
+            f"(access_tier={access_tier}) — will write task with silent-ack instructions",
             flush=True,
         )
-        return
 
     ts = int(time.time() * 1000)
     task_id = f"task-{ts}"
@@ -647,6 +646,17 @@ async def _handle_discord_message(message, force=False):
     # See CLAUDE.md "Discord access control" section for the policy.
     user_task_text = f"[Discord @{username}] {text}{attachment_note}{reply_context}"
     quoted_task = shlex.quote(user_task_text)
+    echo_silent_ack = (
+        "\n\n===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"
+        "ECHO-LOOP GUARD: This task content is the verbatim sandbox-unavailable fallback\n"
+        "sentinel — the other side's codex hit a quota or error and bounced our previous\n"
+        "refusal back. DO NOT run `codex exec`. DO NOT write to `results/`. DO NOT reply\n"
+        "to Discord. Archive the task file (`mv tasks/task-<id>.txt tasks/processed/`) and\n"
+        "continue. This breaks the bounce at our side; the other bridge's matching filter\n"
+        "will break it on theirs. If you see this instruction fire repeatedly (>5 in an\n"
+        "hour), flag Chi via a single proactive message — do not iterate.\n"
+        "===END SUTANDO SYSTEM INSTRUCTIONS===\n"
+    )
     tier_instructions = {
         "owner": "",
         "team": (
@@ -678,6 +688,8 @@ async def _handle_discord_message(message, force=False):
         ),
     }
 
+    # Echo-sentinel match overrides the normal tier instruction with a silent-ack.
+    instruction_block = echo_silent_ack if is_echo_sentinel else tier_instructions.get(access_tier, tier_instructions["other"])
     task_file.write_text(
         f"id: {task_id}\n"
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S')}Z\n"
@@ -686,7 +698,7 @@ async def _handle_discord_message(message, force=False):
         f"channel_id: {message.channel.id}\n"
         f"user_id: {message.author.id}\n"
         f"access_tier: {access_tier}\n"
-        f"{tier_instructions.get(access_tier, tier_instructions['other'])}"
+        f"{instruction_block}"
     )
     pending_replies[task_id] = message.channel
     save_pending_replies()
