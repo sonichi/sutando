@@ -941,8 +941,6 @@ function toggleAllTasks() {
   if (hasExpanded) { expandedTasks.clear(); userCollapsed = true; }
   else { Object.entries(taskMap).forEach(([id, t]) => { if (t.result) expandedTasks.add(id); }); userCollapsed = false; }
   renderTasks();
-  const link = document.querySelector('#tasks-header span:last-child');
-  if (link) link.textContent = hasExpanded ? 'expand all' : 'collapse all';
 }
 document.addEventListener('click', function(e) {
   // Don't toggle if clicking inside the result text (allow text selection)
@@ -996,7 +994,13 @@ function renderTasks() {
   window._drTaskCount = entries.length;
   const hdr = $('tasks-header');
   if (entries.length === 0) { container.innerHTML = ''; if (hdr) hdr.style.display = 'none'; return; }
-  if (hdr) hdr.style.display = 'flex';
+  if (hdr) {
+    const hasExpanded = expandedTasks.size > 0;
+    hdr.style.display = 'flex';
+    hdr.innerHTML = '<span>Tasks</span><span onclick="toggleAllTasks()" style="cursor:pointer">' +
+      (hasExpanded ? 'collapse all' : 'expand all') +
+      '</span>';
+  }
   const sorted = entries.sort((a, b) => b[1].time - a[1].time).slice(0, 8);
   container.innerHTML = sorted.map(([id, t]) => {
     const icons = { pending: '&#8987;', working: '&#9881;', done: '&#10003;', error: '&#10007;' };
