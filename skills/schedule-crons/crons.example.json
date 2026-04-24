@@ -22,7 +22,7 @@
   {
     "name": "sync-memory",
     "cron": "*/30 * * * *",
-    "prompt": "Run bash src/sync-memory.sh to sync memory and notes to the private memory repo (requires SUTANDO_MEMORY_REPO in .env)."
+    "prompt": "Run bash ~/.sutando-memory-sync/scripts/sync-memory.sh to sync memory and notes to the private memory repo (requires SUTANDO_MEMORY_REPO in .env)."
   },
   {
     "name": "cross-node-sync",
