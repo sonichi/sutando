@@ -172,6 +172,13 @@ def presenter_mode_active():
 # Example: SUTANDO_TEAM_TIER_OWNER=mac-mini
 TEAM_TIER_OWNER = ""
 LOCAL_MACHINE = ""
+
+# Verbatim fallback sentinel used by both team/other tier system-instructions
+# when `codex exec` fails (quota, not installed, etc). If we see this string
+# arriving as a task body, the *other* side is just bouncing our previous
+# refusal back — log-drop instead of relaying it further. Keep in sync with
+# the string in tier_instructions below.
+SENTINEL_NON_OWNER_REFUSAL = "Sandbox unavailable; refusing non-owner task."
 try:
     env_file = REPO / ".env"
     if env_file.exists():
@@ -617,6 +624,20 @@ async def _handle_discord_message(message, force=False):
         return
 
     # Write as task
+    # Echo-loop guard: if the incoming content is EXACTLY the team/other-tier
+    # fallback sentinel, log-drop instead of writing a task file. This fires
+    # when the *other* side's codex sandbox hit a quota/error and relayed the
+    # literal sentinel back to us. Without this guard the two bridges bounce
+    # the sentinel (and burn codex tokens running it verbatim) until one side
+    # runs out. See build-log 2026-04-23 + CLAUDE.md "Discord access control".
+    if text and text.strip() == SENTINEL_NON_OWNER_REFUSAL:
+        print(
+            f"  [echo-guard] dropping sentinel task from @{username} "
+            f"(access_tier={access_tier}) — refusing to relay the bounce",
+            flush=True,
+        )
+        return
+
     ts = int(time.time() * 1000)
     task_id = f"task-{ts}"
     task_file = TASKS_DIR / f"{task_id}.txt"
