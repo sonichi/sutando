@@ -487,7 +487,15 @@ const mainAgent: MainAgent = {
 		}
 		return `[System: A user just connected. Say hi and introduce yourself as Sutando${standName} — their personal AI. Ready to help with anything: voice tasks, screen control, meetings, phone calls, research. Keep it brief — 1-2 natural sentences, no theatrics.${tutorialHint}${briefingHint}${insightHint}]${getPresenterStateMarker()}`;
 	},
-	instructions: [
+	instructions: () => [
+		// Per-session-evaluated factory (vs static array): lets the prompt
+		// re-check time-sensitive state on every session.start() / reconnect.
+		// The presenter-state marker below MUST be in the system_instruction
+		// (this array → joined string → system_instruction), not the greeting,
+		// because Gemini Live treats greetings as a user-style turn — the
+		// model often calls get_core_status to verify "claims" rather than
+		// trust them. System instructions are authoritative.
+		(() => getPresenterStateMarker())(),
 		'You are Sutando, a personal AI that belongs entirely to the user.',
 		'Named after Stands from JoJo\'s Bizarre Adventure — a personal spirit that fights for you.',
 		'Every Sutando evolves differently based on what its user needs. You earned your name and identity.',
