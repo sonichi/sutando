@@ -6,7 +6,7 @@
  */
 
 import { execSync } from 'node:child_process';
-import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync } from 'node:fs';
+import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
@@ -610,6 +610,58 @@ function assertUniqueToolNames(tools: ToolDefinition[]): ToolDefinition[] {
 	return tools;
 }
 
+// Load tools from any skill that has a `manifest.json` with "enabled": true.
+// Manifest shape:
+//   { "name": "skill-name", "enabled": true, "access_tier": "owner",
+//     "tools": "./tools.ts", "config": { "ENV_VAR": "value" } }
+// - "enabled": false (or missing) → skill skipped
+// - "tools" path → dynamic-imported, expects `export const tools: ToolDefinition[]`
+// - "config" entries → surfaced to process.env (only set if not already defined)
+// Originally added 2026-04-20, accidentally stripped by PR #505 (dup-name guard
+// commit). Restored 2026-04-25 after the iclr-highlight skill went silent on
+// the autonav cue — voice-agent had no way to call highlight_slide because the
+// skill's tools were never being merged into inlineTools.
+async function loadSkillManifestTools(): Promise<ToolDefinition[]> {
+	const skillsDir = join(process.cwd(), 'skills');
+	if (!existsSync(skillsDir)) return [];
+	const out: ToolDefinition[] = [];
+	let dirs: string[];
+	try {
+		dirs = readdirSync(skillsDir).filter(n => {
+			try { return statSync(join(skillsDir, n)).isDirectory(); } catch { return false; }
+		});
+	} catch { return []; }
+	for (const dirName of dirs) {
+		const manifestPath = join(skillsDir, dirName, 'manifest.json');
+		if (!existsSync(manifestPath)) continue;
+		let manifest: { enabled?: boolean; tools?: string; config?: Record<string, string>; name?: string };
+		try {
+			manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+		} catch (err) {
+			console.warn(`[skill-loader] bad manifest ${dirName}:`, err instanceof Error ? err.message : err);
+			continue;
+		}
+		if (!manifest.enabled) continue;
+		for (const [k, v] of Object.entries(manifest.config || {})) {
+			if (process.env[k] === undefined) process.env[k] = v;
+		}
+		if (!manifest.tools) continue;
+		const toolsPath = join(skillsDir, dirName, manifest.tools.replace(/^\.\//, ''));
+		try {
+			// @ts-ignore — dynamic relative import resolved at runtime by tsx
+			const mod = await import(toolsPath);
+			if (Array.isArray(mod.tools)) {
+				out.push(...mod.tools);
+				console.log(`[skill-loader] loaded ${mod.tools.length} tool(s) from ${manifest.name || dirName}`);
+			}
+		} catch (err) {
+			console.warn(`[skill-loader] failed to import ${dirName}/${manifest.tools}:`, err instanceof Error ? err.message : err);
+		}
+	}
+	return out;
+}
+const personalTools = await loadSkillManifestTools();
+
 export const inlineTools = assertUniqueToolNames([
 	pressKeyTool, scrollTool, switchTabTool, closeTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
@@ -617,7 +669,8 @@ export const inlineTools = assertUniqueToolNames([
 	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, getCoreStatusTool, summonTool, dismissTool,
 	joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool,
 	describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, slideControlTool, fullscreenTool,
-	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool, ]);
+	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
+	...personalTools ]);
 
 /** Tools available to any caller (including unverified) */
 export const anyCallerTools = [
