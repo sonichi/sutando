@@ -508,9 +508,10 @@ export const openFileTool: ToolDefinition = {
 			// Fullscreen (present mode) for video showcase. Wait for QuickTime to
 			// finish loading THIS file (path-match, not just any document) before
 			// presenting — prevents fullscreening a stale prior document if QT
-			// already had one open. Falls back to `present document 1` after the
-			// 3s budget if nothing matches (rare; e.g. file path normalization
-			// disagrees), so the worst case is "present whatever is front."
+			// already had one open. If the 3s budget elapses without a match
+			// (slow load, symlink/relative-path mismatch, prior doc with no
+			// readable path), we leave the new video windowed rather than
+			// risk presenting the wrong document — Chi can ⌘Ctrl+F manually.
 			if (fullscreen) {
 				const escaped = recPath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 				const presentScript = [
@@ -533,8 +534,6 @@ export const openFileTool: ToolDefinition = {
 					'  try',
 					'    if foundDoc is not missing value then',
 					'      present foundDoc',
-					'    else if (count of documents) > 0 then',
-					'      present document 1',
 					'    end if',
 					'  end try',
 					'end tell',
