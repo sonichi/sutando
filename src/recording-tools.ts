@@ -459,15 +459,18 @@ export const openFileTool: ToolDefinition = {
 		'Do NOT call play_video after this — wait for user to explicitly say "play". ' +
 		'Known files: "diagnostic tracker" or "diagnostics" = /tmp/phone-diagnostics-tracker.html, ' +
 		'"voice diagnostics" = /tmp/voice-diagnostics-tracker.html. ' +
-		'If you need to find the latest recording but lost the path, pass find_recording=true.',
+		'If you need to find the latest recording but lost the path, pass find_recording=true. ' +
+		'For video files (.mp4 / .mov) that should play as a presentation, pass fullscreen=true — ' +
+		'QuickTime will activate fullscreen "present" mode after opening.',
 	parameters: z.object({
 		path: z.string().optional().describe('File path to open. Get this from the recording tool result. Use known file aliases for diagnostic tracker etc.'),
 		find_recording: z.boolean().optional().describe('If true and no path given, find and open the latest screen recording. Only use as a fallback when you lost the recording path.'),
+		fullscreen: z.boolean().optional().describe('If true, enter QuickTime Player fullscreen (present mode) after opening. Use for video showcase moments. No effect on non-video files or if QuickTime didn\'t claim the file.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { path: filePath, find_recording } = args as { path?: string; find_recording?: boolean };
-		console.log(`${ts()} [OpenFile] called (path=${filePath || 'none'}, find_latest=${find_recording || false})`);
+		const { path: filePath, find_recording, fullscreen } = args as { path?: string; find_recording?: boolean; fullscreen?: boolean };
+		console.log(`${ts()} [OpenFile] called (path=${filePath || 'none'}, find_latest=${find_recording || false}, fullscreen=${fullscreen || false})`);
 		demoStateRef.value = 'idle';
 		try {
 			let recPath = filePath ? filePath.replace(/^~/, process.env.HOME || '') : null;
@@ -493,6 +496,27 @@ export const openFileTool: ToolDefinition = {
 			// (same CodeQL js/command-line-injection class as #27).
 			execFileSync('open', [recPath], { timeout: 5_000 });
 			try { execSync(`osascript -e 'tell application "QuickTime Player" to activate'`, { timeout: 3_000 }); } catch {}
+			// Fullscreen (present mode) for video showcase. QuickTime needs ~100-500ms
+			// to ingest the file before `present document 1` works; wait up to 2s.
+			if (fullscreen) {
+				const presentScript = [
+					'tell application "QuickTime Player"',
+					'  activate',
+					'  repeat 20 times',
+					'    if (count of documents) > 0 then exit repeat',
+					'    delay 0.1',
+					'  end repeat',
+					'  try',
+					'    present document 1',
+					'  end try',
+					'end tell',
+				].join('\n');
+				try {
+					execFileSync('/usr/bin/osascript', ['-e', presentScript], { timeout: 4_000 });
+				} catch (err) {
+					console.log(`${ts()} [OpenFile] fullscreen AppleScript failed (non-fatal): ${err}`);
+				}
+			}
 			const size = statSync(recPath).size;
 			let duration_seconds: number | null = null;
 			try {
