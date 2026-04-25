@@ -303,8 +303,17 @@ open "http://localhost:8080"
 # Check if a sutando-core session is already running
 if pgrep -f "claude.*--name.*sutando-core" > /dev/null 2>&1; then
   echo "Claude Code (sutando-core) is already running."
+  # Auto-attach when invoked from an interactive terminal — saves the user
+  # the copy-paste of the long `tmux -S /tmp/sutando-tmux.sock attach -t
+  # sutando-core` command. Falls back to printing the instruction in
+  # non-interactive contexts (launchd, cron, CI) where exec'ing into an
+  # attach would hang without a tty.
+  if [ -t 1 ] && command -v tmux > /dev/null 2>&1; then
+    echo "Attaching... (Ctrl-b d to detach)"
+    exec tmux -S /tmp/sutando-tmux.sock attach -t sutando-core
+  fi
   echo "To restart: kill it first, then re-run this script."
-  echo "To attach to the running session: tmux attach -t sutando-core"
+  echo "To attach to the running session: tmux -S /tmp/sutando-tmux.sock attach -t sutando-core"
   echo ""
 else
   echo "Starting Claude Code (sutando-core) inside tmux..."
