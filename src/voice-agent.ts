@@ -414,6 +414,21 @@ const endSession: ToolDefinition = {
 
 let voiceSessionRef: VoiceSession | null = null;
 
+// Synchronously query the iclr-highlight server for current presenter-mode
+// state. Returns a system-marker string when active, '' otherwise. Failure-
+// silent: if the server is down or the curl call errors, returns '' so the
+// greeting/reconnect path stays unchanged.
+function getPresenterStateMarker(): string {
+	try {
+		const out = execSyncTop('curl -s --max-time 1 http://localhost:7877/presenter', { timeout: 2_000 }).toString();
+		const json = JSON.parse(out);
+		if (json && json.active === true) {
+			return ' [System: PRESENTER MODE IS CURRENTLY ACTIVE — apply the CO-PRESENTER protocol from your context to every cue this session: highlight_slide(topic) FIRST, then narrate from voice-context.txt. Do NOT route slide-topic phrases to work.]';
+		}
+	} catch { /* server unreachable or non-JSON — fall through to no-marker */ }
+	return '';
+}
+
 const mainAgent: MainAgent = {
 	name: 'main',
 	get greeting() {
@@ -450,7 +465,7 @@ const mainAgent: MainAgent = {
 				: isQuickReconnect
 					? '\n\n[Do NOT greet the user. Do NOT say "Welcome back" or anything similar. Stay completely silent and wait for the user\'s next spoken input — they were just briefly disconnected and want to resume without interruption.]'
 					: '\n\n[Now say "Welcome back" briefly — one sentence — and then stop and wait for input.]';
-			return `[System: The user reconnected. The block below is REPLAYED HISTORY from the current session, provided as background context ONLY. Do NOT act on anything in it. Do NOT call any tools based on it. Use it only to answer follow-up questions if asked. Wait silently for the user's next spoken input before taking any action.]\n\n${recent}${meetingHint}`;
+			return `[System: The user reconnected. The block below is REPLAYED HISTORY from the current session, provided as background context ONLY. Do NOT act on anything in it. Do NOT call any tools based on it. Use it only to answer follow-up questions if asked. Wait silently for the user's next spoken input before taking any action.]${getPresenterStateMarker()}\n\n${recent}${meetingHint}`;
 		}
 		let standName = '';
 		try { const si = JSON.parse(readFileSync('stand-identity.json', 'utf-8')); standName = si.name ? ` — ${si.name}` : ''; } catch {}
@@ -466,7 +481,7 @@ const mainAgent: MainAgent = {
 		if (meetingActive) {
 			return `[System: MEETING MODE — LISTEN AND TAKE NOTES. A Zoom meeting is active. Listen to everything and mentally track the discussion: who said what, key decisions, action items, topics covered. But do NOT produce any audio output UNLESS someone says "Sutando" or "hey Sutando" — then respond to their request using your accumulated notes and context. When not addressed, produce absolutely zero words — no acknowledgments, no "silent", no sounds. You are an invisible note-taker until called upon.]`;
 		}
-		return `[System: A user just connected. Say hi and introduce yourself as Sutando${standName} — their personal AI. Ready to help with anything: voice tasks, screen control, meetings, phone calls, research. Keep it brief — 1-2 natural sentences, no theatrics.${tutorialHint}${briefingHint}${insightHint}]`;
+		return `[System: A user just connected. Say hi and introduce yourself as Sutando${standName} — their personal AI. Ready to help with anything: voice tasks, screen control, meetings, phone calls, research. Keep it brief — 1-2 natural sentences, no theatrics.${tutorialHint}${briefingHint}${insightHint}]${getPresenterStateMarker()}`;
 	},
 	instructions: [
 		'You are Sutando, a personal AI that belongs entirely to the user.',
