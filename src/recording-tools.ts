@@ -724,7 +724,8 @@ export const screenRecordTool: ToolDefinition = {
 	name: 'screen_record',
 	description:
 		'Start or stop PLAIN screen recording (no narration, no auto-scroll). ' +
-		'Use when user says "start recording", "record the screen", "screen record". ' +
+		'Use ONLY when user explicitly says "start recording", "record the screen", or "screen record". ' +
+		'Do NOT match on "fullscreen", "full screen", "play fullscreen", "make it full screen", or any cue with "screen" that is not preceded by "record" — those go to fullscreen_presenter or play_video. ' +
 		'Do NOT use record_screen_with_narration for plain recording requests. ' +
 		'Uses ffmpeg avfoundation for reliable .mov output. ' +
 		'When starting, ASK the user if they want live transcript subtitles burned into the recording.',
