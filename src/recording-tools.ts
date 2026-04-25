@@ -459,15 +459,18 @@ export const openFileTool: ToolDefinition = {
 		'Do NOT call play_video after this — wait for user to explicitly say "play". ' +
 		'Known files: "diagnostic tracker" or "diagnostics" = /tmp/phone-diagnostics-tracker.html, ' +
 		'"voice diagnostics" = /tmp/voice-diagnostics-tracker.html. ' +
-		'If you need to find the latest recording but lost the path, pass find_recording=true.',
+		'If you need to find the latest recording but lost the path, pass find_recording=true. ' +
+		'For video files (.mp4 / .mov) that should play as a presentation, pass fullscreen=true — ' +
+		'QuickTime will activate fullscreen "present" mode after opening.',
 	parameters: z.object({
 		path: z.string().optional().describe('File path to open. Get this from the recording tool result. Use known file aliases for diagnostic tracker etc.'),
 		find_recording: z.boolean().optional().describe('If true and no path given, find and open the latest screen recording. Only use as a fallback when you lost the recording path.'),
+		fullscreen: z.boolean().optional().describe('If true, enter QuickTime Player fullscreen (present mode) after opening. Use for video showcase moments. No effect on non-video files or if QuickTime didn\'t claim the file.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { path: filePath, find_recording } = args as { path?: string; find_recording?: boolean };
-		console.log(`${ts()} [OpenFile] called (path=${filePath || 'none'}, find_latest=${find_recording || false})`);
+		const { path: filePath, find_recording, fullscreen } = args as { path?: string; find_recording?: boolean; fullscreen?: boolean };
+		console.log(`${ts()} [OpenFile] called (path=${filePath || 'none'}, find_latest=${find_recording || false}, fullscreen=${fullscreen || false})`);
 		demoStateRef.value = 'idle';
 		try {
 			let recPath = filePath ? filePath.replace(/^~/, process.env.HOME || '') : null;
@@ -491,8 +494,56 @@ export const openFileTool: ToolDefinition = {
 			}
 			// execFileSync — no shell interpolation of caller-controlled recPath
 			// (same CodeQL js/command-line-injection class as #27).
-			execFileSync('open', [recPath], { timeout: 5_000 });
+			// When fullscreen, force the open through QuickTime Player so we don't
+			// race with whatever app currently claims .mp4 (VLC/IINA/etc). For
+			// non-fullscreen opens, keep the default-app behaviour for non-video
+			// files (logs, PDFs, diagnostic trackers) — those should use whatever
+			// the user has set as the default.
+			if (fullscreen) {
+				execFileSync('open', ['-a', 'QuickTime Player', recPath], { timeout: 5_000 });
+			} else {
+				execFileSync('open', [recPath], { timeout: 5_000 });
+			}
 			try { execSync(`osascript -e 'tell application "QuickTime Player" to activate'`, { timeout: 3_000 }); } catch {}
+			// Fullscreen (present mode) for video showcase. Wait for QuickTime to
+			// finish loading THIS file (path-match, not just any document) before
+			// presenting — prevents fullscreening a stale prior document if QT
+			// already had one open. If the 3s budget elapses without a match
+			// (slow load, symlink/relative-path mismatch, prior doc with no
+			// readable path), we leave the new video windowed rather than
+			// risk presenting the wrong document — Chi can ⌘Ctrl+F manually.
+			if (fullscreen) {
+				const escaped = recPath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+				const presentScript = [
+					`set targetPath to "${escaped}"`,
+					'tell application "QuickTime Player"',
+					'  activate',
+					'  set foundDoc to missing value',
+					'  repeat 30 times',
+					'    try',
+					'      repeat with d in documents',
+					'        if (POSIX path of (path of d)) is targetPath then',
+					'          set foundDoc to d',
+					'          exit repeat',
+					'        end if',
+					'      end repeat',
+					'    end try',
+					'    if foundDoc is not missing value then exit repeat',
+					'    delay 0.1',
+					'  end repeat',
+					'  try',
+					'    if foundDoc is not missing value then',
+					'      present foundDoc',
+					'    end if',
+					'  end try',
+					'end tell',
+				].join('\n');
+				try {
+					execFileSync('/usr/bin/osascript', ['-e', presentScript], { timeout: 5_000 });
+				} catch (err) {
+					console.log(`${ts()} [OpenFile] fullscreen AppleScript failed (non-fatal): ${err}`);
+				}
+			}
 			const size = statSync(recPath).size;
 			let duration_seconds: number | null = null;
 			try {
