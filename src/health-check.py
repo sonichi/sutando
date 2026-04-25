@@ -101,7 +101,7 @@ def check_memory_sync() -> dict:
         return {"name": name, "status": "warn", "detail": "SUTANDO_MEMORY_REPO not set — cross-machine sync disabled"}
     sync_dir = Path.home() / ".sutando-memory-sync"
     if not sync_dir.exists():
-        return {"name": name, "status": "warn", "detail": "repo configured but never synced — run bash src/sync-memory.sh"}
+        return {"name": name, "status": "warn", "detail": "repo configured but never synced — run bash ~/.sutando-memory-sync/scripts/sync-memory.sh"}
     git_dir = sync_dir / ".git" / "FETCH_HEAD"
     if git_dir.exists():
         age_h = (time.time() - git_dir.stat().st_mtime) / 3600
