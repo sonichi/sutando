@@ -216,6 +216,15 @@ const switchModeTool: ToolDefinition = {
 		const { mode } = args as { mode: 'active' | 'meeting' };
 		meetingActive = mode === 'meeting';
 		console.log(`${ts()} [Meeting] Mode switched to: ${mode}`);
+		// Persist for cross-process reads — web-client builds the unified
+		// `mode` field for /sse-status from this sentinel + iclr-highlight's
+		// presenter sentinel. voice-agent has no HTTP server, so a flag
+		// file is the cheapest cross-process channel.
+		try {
+			writeFileSync(join(WORKSPACE_DIR, 'state', 'meeting-mode.flag'), mode);
+		} catch (err) {
+			console.warn(`${ts()} [Meeting] flag write failed: ${err instanceof Error ? err.message : err}`);
+		}
 		if (mode === 'meeting') {
 			return { status: 'meeting_mode', instruction: 'You are now in meeting mode. Listen and track the discussion internally. Produce ZERO audio output unless someone says "Sutando." The ONLY tool you may call unprompted is save_meeting_note — call it every 5-10 minutes to capture key decisions, action items, and discussion points. When you exit meeting mode, call save_meeting_note with type "summary" for a final recap. Do not call work or any other tools unless explicitly addressed.' };
 		}

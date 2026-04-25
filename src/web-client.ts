@@ -222,6 +222,10 @@ const HTML = /* html */ `<!DOCTYPE html>
     width: 6px; height: 6px; border-radius: 50%; background: #333;
   }
   .status-pill.voice-on .dot { background: #4ecca3; box-shadow: 0 0 4px #4ecca3; }
+  /* Mode pill — three states. ACTIVE is muted (default), MEETING is amber, PRESENTER is purple. Always visible per "regardless of mode" spec. */
+  .status-pill.mode-active    { background: #1a1a2e; color: #888; }
+  .status-pill.mode-meeting   { background: #2e251a; color: #f0a040; }
+  .status-pill.mode-presenter { background: #2a1a3e; color: #b8a0ff; box-shadow: 0 0 6px rgba(184,160,255,0.3); }
   .header .controls { display: flex; gap: 6px; }
   button {
     padding: 7px 14px; border-radius: 8px; border: none;
@@ -550,6 +554,7 @@ const HTML = /* html */ `<!DOCTYPE html>
     <h1 id="stand-name">Sutando</h1>
     <div class="meta">
       <span class="status-pill voice-off" id="voice-status"><span class="dot" id="dot"></span> <span id="status">Text only</span></span>
+      <span class="status-pill mode-active" id="mode-pill" title="Sutando mode (active / meeting / presenter)">MODE: <span id="mode-text">ACTIVE</span></span>
       <a href="http://localhost:7844" target="_blank">Dashboard</a>
       <span class="stats" id="stats"></span>
     </div>
@@ -2459,6 +2464,29 @@ document.addEventListener('keydown', function(e) {
   }, 2000);
 })();
 
+// Mode pill poll — hits /sse-status for the unified mode field
+// (active / meeting / presenter). Always-visible per spec. Updates the
+// pill class + text on every tick. 1.5s cadence — server-side cache is
+// 800ms so this is sub-second-stale at worst.
+// (No backticks in this comment — they would close the parent HTML
+// template literal that wraps this entire script block.)
+(function() {
+  setInterval(function() {
+    fetch('/sse-status')
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(data) {
+        var pill = document.getElementById('mode-pill');
+        var text = document.getElementById('mode-text');
+        if (!pill || !text) return;
+        var mode = (data && data.mode) || 'active';
+        text.textContent = mode.toUpperCase();
+        pill.classList.remove('mode-active', 'mode-meeting', 'mode-presenter');
+        pill.classList.add('mode-' + mode);
+      })
+      .catch(function() {});
+  }, 1500);
+})();
+
 // Initial render
 updateDynamicRegion();
 
@@ -2539,6 +2567,36 @@ function readCoreStatus(): { running: boolean; step: string; stale: boolean } {
 	}
 }
 function coreIsRunning(): boolean { return readCoreStatus().running; }
+
+// Resolve the unified app mode from two cross-process signals:
+//   - state/meeting-mode.flag (written by voice-agent's switch_mode tool)
+//   - :7877/presenter (iclr-highlight server's presenter-mode flag)
+// Priority: presenter > meeting > active. The presenter half is fetched
+// asynchronously by a 1s background refresher; the meeting half is read
+// synchronously from disk. /sse-status reads the cached presenter result
+// + the live meeting-flag and returns the resolved mode without blocking.
+type AppMode = 'active' | 'meeting' | 'presenter';
+let _presenterActive = false;
+function readModeSync(): AppMode {
+	let meeting = false;
+	try {
+		const flag = readFileSync(new URL('../state/meeting-mode.flag', import.meta.url), 'utf-8').trim();
+		meeting = flag === 'meeting';
+	} catch { /* sentinel absent → meeting off (default) */ }
+	return _presenterActive ? 'presenter' : meeting ? 'meeting' : 'active';
+}
+function refreshPresenterCache(): void {
+	fetch('http://localhost:7877/presenter', { signal: AbortSignal.timeout(800) })
+		.then((r) => (r.ok ? r.json() : null))
+		.then((data) => {
+			_presenterActive = !!(data && (data as { active?: boolean }).active);
+		})
+		.catch(() => { /* presenter server down → leave cache as-is */ });
+}
+// Initial fetch + 1s refresh loop. Skipped only if web-client is run
+// outside an event loop context (it always has one in production).
+refreshPresenterCache();
+setInterval(refreshPresenterCache, 1000);
 
 const VOICE_STATE_STALE_SECONDS = 120;
 function readVoiceState(): boolean | null {
@@ -2657,6 +2715,7 @@ const server = createServer((req, res) => {
 		// if the file is missing or stale (see readVoiceState doc).
 		const vs = readVoiceState();
 		const voiceConnected = vs !== null ? vs : _voiceState;
+		const mode = readModeSync();
 		res.writeHead(200, { 'Content-Type': 'application/json' });
 		res.end(JSON.stringify({
 			clients: sseClients.length,
@@ -2664,6 +2723,7 @@ const server = createServer((req, res) => {
 			voiceConnected,
 			state: eff,
 			label,
+			mode,
 		}));
 		return;
 	}

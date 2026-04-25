@@ -38,6 +38,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var currentAgentState: String = "idle"
     var animationTimer: Timer?
     var animationPhase: CGFloat = 1.0
+    // Cached mode from /sse-status (one of "active" / "meeting" / "presenter").
+    // Updated every pollMuteState tick. Drives the always-visible mode label
+    // shown alongside the avatar in the menu bar so Chi can tell at a glance
+    // whether Sutando is in normal (active), silent-note-taker (meeting), or
+    // live-co-presenter (presenter) mode without opening the menu or web UI.
+    var currentMode: String = "active"
 
     /// Fixed tmux socket path for the sutando-core session. The shell
     /// (via startup.sh -S flag) and the app (launched by macOS with a
@@ -382,29 +388,44 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // `label` added 2026-04-18 per Chi's "running a tool is not precise":
             // optional specific tool name or core-status step.
             let label = (json["label"] as? String) ?? ""
+            // `mode` added 2026-04-24 — three-mode indicator
+            // (active/meeting/presenter). Always visible alongside avatar
+            // so Chi can tell at a glance which mode Sutando is in. Default
+            // 'active' on pre-mode-field servers; web-client builds the
+            // unified mode from voice-agent's meeting flag + iclr-highlight's
+            // presenter flag.
+            let mode = (json["mode"] as? String) ?? "active"
             DispatchQueue.main.async {
                 guard let self = self, let button = self.statusItem.button else { return }
+                self.currentMode = mode
+                let modeLabel: String = {
+                    switch mode {
+                    case "presenter": return "PRESENTER"
+                    case "meeting":   return "MEETING"
+                    default:          return "ACTIVE"
+                    }
+                }()
                 if isVoiceConnected && isMuted {
-                    // Voice active + muted: show mute indicator; stop any animation.
-                    // Reset cache so un-mute re-triggers animation if agent is
-                    // still non-idle (otherwise the transition guard below would
-                    // skip startAnimation() and leave the menu bar statically
+                    // Voice active + muted: show mute indicator + mode; stop animation.
+                    // Reset agent-state cache so un-mute re-triggers animation if
+                    // agent is still non-idle (otherwise the transition guard below
+                    // would skip startAnimation() and leave the menu bar statically
                     // dim until the NEXT semantic state change).
-                    button.title = "🔇"
+                    button.title = "🔇 \(modeLabel)"
                     button.image = nil
-                    button.toolTip = "Sutando — muted"
+                    button.toolTip = "Sutando — muted (\(mode))"
                     self.stopAnimation()
                     self.currentAgentState = "idle"
                 } else {
-                    // Default state (disconnected or unmuted): show avatar
+                    // Default state (disconnected or unmuted): show avatar + mode label
                     let avatarPath = self.workspace + "/assets/stand-avatar.png"
                     if let image = NSImage(contentsOfFile: avatarPath) {
                         image.size = NSSize(width: 18, height: 18)
                         image.isTemplate = false
                         button.image = image
-                        button.title = ""
+                        button.title = " \(modeLabel)"
                     } else {
-                        button.title = "S"
+                        button.title = "S \(modeLabel)"
                     }
                     button.toolTip = self.tooltipFor(state: agentState, muted: isMuted, voiceConnected: isVoiceConnected, label: label)
                     // When voice is disconnected, only tool-track states
