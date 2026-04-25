@@ -494,25 +494,53 @@ export const openFileTool: ToolDefinition = {
 			}
 			// execFileSync — no shell interpolation of caller-controlled recPath
 			// (same CodeQL js/command-line-injection class as #27).
-			execFileSync('open', [recPath], { timeout: 5_000 });
-			try { execSync(`osascript -e 'tell application "QuickTime Player" to activate'`, { timeout: 3_000 }); } catch {}
-			// Fullscreen (present mode) for video showcase. QuickTime needs ~100-500ms
-			// to ingest the file before `present document 1` works; wait up to 2s.
+			// When fullscreen, force the open through QuickTime Player so we don't
+			// race with whatever app currently claims .mp4 (VLC/IINA/etc). For
+			// non-fullscreen opens, keep the default-app behaviour for non-video
+			// files (logs, PDFs, diagnostic trackers) — those should use whatever
+			// the user has set as the default.
 			if (fullscreen) {
+				execFileSync('open', ['-a', 'QuickTime Player', recPath], { timeout: 5_000 });
+			} else {
+				execFileSync('open', [recPath], { timeout: 5_000 });
+			}
+			try { execSync(`osascript -e 'tell application "QuickTime Player" to activate'`, { timeout: 3_000 }); } catch {}
+			// Fullscreen (present mode) for video showcase. Wait for QuickTime to
+			// finish loading THIS file (path-match, not just any document) before
+			// presenting — prevents fullscreening a stale prior document if QT
+			// already had one open. Falls back to `present document 1` after the
+			// 3s budget if nothing matches (rare; e.g. file path normalization
+			// disagrees), so the worst case is "present whatever is front."
+			if (fullscreen) {
+				const escaped = recPath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 				const presentScript = [
+					`set targetPath to "${escaped}"`,
 					'tell application "QuickTime Player"',
 					'  activate',
-					'  repeat 20 times',
-					'    if (count of documents) > 0 then exit repeat',
+					'  set foundDoc to missing value',
+					'  repeat 30 times',
+					'    try',
+					'      repeat with d in documents',
+					'        if (POSIX path of (path of d)) is targetPath then',
+					'          set foundDoc to d',
+					'          exit repeat',
+					'        end if',
+					'      end repeat',
+					'    end try',
+					'    if foundDoc is not missing value then exit repeat',
 					'    delay 0.1',
 					'  end repeat',
 					'  try',
-					'    present document 1',
+					'    if foundDoc is not missing value then',
+					'      present foundDoc',
+					'    else if (count of documents) > 0 then',
+					'      present document 1',
+					'    end if',
 					'  end try',
 					'end tell',
 				].join('\n');
 				try {
-					execFileSync('/usr/bin/osascript', ['-e', presentScript], { timeout: 4_000 });
+					execFileSync('/usr/bin/osascript', ['-e', presentScript], { timeout: 5_000 });
 				} catch (err) {
 					console.log(`${ts()} [OpenFile] fullscreen AppleScript failed (non-fatal): ${err}`);
 				}
