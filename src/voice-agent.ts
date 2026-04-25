@@ -185,6 +185,35 @@ function getPendingToolCalls(toolName?: string) {
 // Meeting mode state — persists across Gemini reconnects
 // =============================================================================
 let meetingActive = false;
+// Sentinel for the 3-mode indicator (menu-bar + web-badge read this).
+// Presenter mode is tracked separately by the iclr-highlight server on :7877.
+function writeVoiceModeSentinel() {
+	try {
+		mkdirSync('state', { recursive: true });
+		writeFileSync('state/voice-mode.txt', meetingActive ? 'meeting' : 'active');
+	} catch {}
+}
+writeVoiceModeSentinel();
+
+// Poll state/voice-mode.request every 1s — external controllers (Swift
+// menu-bar clickable items) write "active" or "meeting" to ask voice-agent
+// to switch. Same code path as the switch_mode tool. File is consumed on
+// apply so requests don't re-fire.
+function applyModeRequest() {
+	try {
+		const req = readFileSync('state/voice-mode.request', 'utf-8').trim().toLowerCase();
+		unlinkSync('state/voice-mode.request');
+		const want = req === 'meeting';
+		if (meetingActive === want) return; // no-op if already in that mode
+		meetingActive = want;
+		writeVoiceModeSentinel();
+		console.log(`${ts()} [Meeting] External request applied: mode=${want ? 'meeting' : 'active'}`);
+	} catch {
+		// no request file or delete failed — both are fine (silent poll)
+	}
+}
+setInterval(applyModeRequest, 1_000);
+
 // Detect active meeting on startup — sync so it runs before first greeting
 try {
 	const zoomRunning = execSyncTop('pgrep -f "zoom.us" 2>/dev/null', { encoding: 'utf-8' }).trim();

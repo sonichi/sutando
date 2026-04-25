@@ -2443,6 +2443,22 @@ document.addEventListener('keydown', function(e) {
 (function() {
   var presenterUrl = (typeof window !== 'undefined' && window._PRESENTER_URL)
     || 'http://localhost:7877/presenter';
+  // Shared presenter-active cache so the composite mode badge can compose
+  // its label without a second fetch race.
+  var lastPresenterActive = false;
+  function renderModeBadge(voiceMode) {
+    var badge = document.getElementById('mode-badge');
+    if (!badge) return;
+    // Presenter ON is already shown by #presenter-badge — avoid duplicating.
+    // Meeting is the only extra state #mode-badge owns.
+    if (!lastPresenterActive && voiceMode === 'meeting') {
+      badge.textContent = '\u25CF Meeting';
+      badge.className = 'meeting';
+    } else {
+      badge.textContent = '';
+      badge.className = '';
+    }
+  }
   setInterval(function() {
     fetch(presenterUrl)
       .then(function(r) { return r.ok ? r.json() : null; })
@@ -2451,11 +2467,22 @@ document.addEventListener('keydown', function(e) {
         if (!badge) return;
         var active = !!(data && data.active);
         badge.classList.toggle('active', active);
+        lastPresenterActive = active;
       })
       .catch(function() {
         var badge = document.getElementById('presenter-badge');
         if (badge) badge.classList.remove('active');
+        lastPresenterActive = false;
       });
+    // Same tick: poll voice-mode sentinel via our own server endpoint and
+    // render the composite mode badge.
+    fetch('/voice-mode')
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(data) {
+        var vm = (data && data.mode) || 'active';
+        renderModeBadge(vm);
+      })
+      .catch(function() { renderModeBadge('active'); });
   }, 2000);
 })();
 
@@ -2665,6 +2692,21 @@ const server = createServer((req, res) => {
 			state: eff,
 			label,
 		}));
+		return;
+	}
+
+	// Voice-agent mode sentinel (state/voice-mode.txt written by voice-agent
+	// on switch_mode / zoom-auto-flip). Returns "active" or "meeting".
+	// Falls back to "active" if the file is missing. Combined with the
+	// presenter badge poll to render the composite 3-mode badge in the UI.
+	if (url.pathname === '/voice-mode') {
+		let mode = 'active';
+		try {
+			const raw = readFileSync('state/voice-mode.txt', 'utf-8').trim();
+			if (raw === 'meeting' || raw === 'active') mode = raw;
+		} catch {}
+		res.writeHead(200, { 'Content-Type': 'application/json' });
+		res.end(JSON.stringify({ mode }));
 		return;
 	}
 
