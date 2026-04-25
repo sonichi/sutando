@@ -193,7 +193,6 @@ function writeVoiceModeSentinel() {
 		writeFileSync('state/voice-mode.txt', meetingActive ? 'meeting' : 'active');
 	} catch {}
 }
-writeVoiceModeSentinel();
 
 // Poll state/voice-mode.request every 1s — external controllers (Swift
 // menu-bar clickable items) write "active" or "meeting" to ask voice-agent
@@ -226,6 +225,12 @@ try {
 	}
 } catch { /* no zoom */ }
 
+// Write the initial voice-mode sentinel AFTER the Zoom auto-detect — so
+// the on-disk state matches the in-memory `meetingActive` decision (was
+// previously written before the auto-detect, leaving voice-mode.txt
+// stuck on "active" even when Zoom was detected as active).
+writeVoiceModeSentinel();
+
 // =============================================================================
 // Tools
 // =============================================================================
@@ -244,6 +249,13 @@ const switchModeTool: ToolDefinition = {
 	async execute(args) {
 		const { mode } = args as { mode: 'active' | 'meeting' };
 		meetingActive = mode === 'meeting';
+		// Sync the on-disk sentinel so menu-bar consumers (Sutando.app
+		// pollVoiceMode + web-client /voice-mode endpoint) reflect the
+		// switch immediately. Without this, voice-triggered switch_mode
+		// flips meetingActive in-memory but voice-mode.txt stays stale,
+		// causing the menu radio to lag + the next applyModeRequest from
+		// Sutando.app to early-return as a no-op (`meetingActive === want`).
+		writeVoiceModeSentinel();
 		console.log(`${ts()} [Meeting] Mode switched to: ${mode}`);
 		if (mode === 'meeting') {
 			return { status: 'meeting_mode', instruction: 'You are now in meeting mode. Listen and track the discussion internally. Produce ZERO audio output unless someone says "Sutando." The ONLY tool you may call unprompted is save_meeting_note — call it every 5-10 minutes to capture key decisions, action items, and discussion points. When you exit meeting mode, call save_meeting_note with type "summary" for a final recap. Do not call work or any other tools unless explicitly addressed.' };
