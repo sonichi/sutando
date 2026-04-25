@@ -221,6 +221,33 @@ export function logSessionBoundary(reason: string = 'user_goodbye'): void {
 	try { appendFileSync(CONVERSATION_LOG, line); } catch { /* best effort */ }
 }
 
+/** Seconds since the most recent user/assistant turn. Walks the log
+ *  backwards, skipping `core-agent` task-result lines (written by the
+ *  task-bridge result watcher whenever the proactive loop or any
+ *  background task posts a result) and `SESSION_END` markers — those
+ *  are not user/assistant dialogue, and a recent one would falsely
+ *  make a long-away user look like a quick reconnect. Stops at the
+ *  most recent SESSION_END so we don't reach back into a cleanly-ended
+ *  prior session. Returns null if no log exists or no user/assistant
+ *  turn is found in the current session. */
+export function getSecondsSinceLastTurn(): number | null {
+	if (!existsSync(CONVERSATION_LOG)) return null;
+	try {
+		const content = readFileSync(CONVERSATION_LOG, 'utf-8').trim();
+		if (!content) return null;
+		const lines = content.split('\n');
+		for (let i = lines.length - 1; i >= 0; i--) {
+			const role = lines[i].split('|')[1];
+			if (role === 'SESSION_END') return null;
+			if (role !== 'user' && role !== 'assistant') continue;
+			const ts = Date.parse(lines[i].split('|')[0]);
+			if (Number.isNaN(ts)) return null;
+			return (Date.now() - ts) / 1000;
+		}
+		return null;
+	} catch { return null; }
+}
+
 /** Read recent conversation entries from disk, trimming at the most
  *  recent SESSION_END marker. Survives restarts. Returns at most
  *  `count` entries from the current session only — a cleanly-ended
