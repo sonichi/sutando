@@ -514,6 +514,13 @@ export const openFileTool: ToolDefinition = {
 			// risk presenting the wrong document — Chi can ⌘Ctrl+F manually.
 			if (fullscreen) {
 				const escaped = recPath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+				// During Zoom screen-share, Zoom's floating control bar holds the
+				// foreground z-order — QuickTime's 'present' Apple event succeeds
+				// but the visible window doesn't come forward, so the user never
+				// sees fullscreen. Send Ctrl+Cmd+F (Enter Full Screen) routed
+				// through 'tell process "QuickTime Player"' so System Events
+				// targets QT directly instead of going through global keystroke
+				// focus that Zoom is grabbing — same pattern as the Chrome fix.
 				const presentScript = [
 					`set targetPath to "${escaped}"`,
 					'tell application "QuickTime Player"',
@@ -531,11 +538,13 @@ export const openFileTool: ToolDefinition = {
 					'    if foundDoc is not missing value then exit repeat',
 					'    delay 0.1',
 					'  end repeat',
-					'  try',
-					'    if foundDoc is not missing value then',
-					'      present foundDoc',
-					'    end if',
-					'  end try',
+					'end tell',
+					'delay 0.3',
+					'tell application "System Events"',
+					'  tell process "QuickTime Player"',
+					'    set frontmost to true',
+					'    keystroke "f" using {command down, control down}',
+					'  end tell',
 					'end tell',
 				].join('\n');
 				try {
