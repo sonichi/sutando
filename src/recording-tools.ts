@@ -514,6 +514,13 @@ export const openFileTool: ToolDefinition = {
 			// risk presenting the wrong document — Chi can ⌘Ctrl+F manually.
 			if (fullscreen) {
 				const escaped = recPath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+				// During Zoom screen-share, Zoom's floating control bar holds the
+				// foreground z-order — QuickTime's 'present' Apple event succeeds
+				// but the visible window doesn't come forward, so the user never
+				// sees fullscreen. Send Ctrl+Cmd+F (Enter Full Screen) routed
+				// through 'tell process "QuickTime Player"' so System Events
+				// targets QT directly instead of going through global keystroke
+				// focus that Zoom is grabbing — same pattern as the Chrome fix.
 				const presentScript = [
 					`set targetPath to "${escaped}"`,
 					'tell application "QuickTime Player"',
@@ -531,11 +538,13 @@ export const openFileTool: ToolDefinition = {
 					'    if foundDoc is not missing value then exit repeat',
 					'    delay 0.1',
 					'  end repeat',
-					'  try',
-					'    if foundDoc is not missing value then',
-					'      present foundDoc',
-					'    end if',
-					'  end try',
+					'end tell',
+					'delay 0.3',
+					'tell application "System Events"',
+					'  tell process "QuickTime Player"',
+					'    set frontmost to true',
+					'    keystroke "f" using {command down, control down}',
+					'  end tell',
 					'end tell',
 				].join('\n');
 				try {
@@ -724,7 +733,8 @@ export const screenRecordTool: ToolDefinition = {
 	name: 'screen_record',
 	description:
 		'Start or stop PLAIN screen recording (no narration, no auto-scroll). ' +
-		'Use when user says "start recording", "record the screen", "screen record". ' +
+		'Use ONLY when user explicitly says "start recording", "record the screen", or "screen record". ' +
+		'Do NOT match on "fullscreen", "full screen", "play fullscreen", "make it full screen", or any cue with "screen" that is not preceded by "record" — those go to fullscreen_presenter or play_video. ' +
 		'Do NOT use record_screen_with_narration for plain recording requests. ' +
 		'Uses ffmpeg avfoundation for reliable .mov output. ' +
 		'When starting, ASK the user if they want live transcript subtitles burned into the recording.',

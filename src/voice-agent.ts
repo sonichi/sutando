@@ -185,6 +185,34 @@ function getPendingToolCalls(toolName?: string) {
 // Meeting mode state — persists across Gemini reconnects
 // =============================================================================
 let meetingActive = false;
+// Sentinel for the 3-mode indicator (menu-bar + web-badge read this).
+// Presenter mode is tracked separately by the iclr-highlight server on :7877.
+function writeVoiceModeSentinel() {
+	try {
+		mkdirSync('state', { recursive: true });
+		writeFileSync('state/voice-mode.txt', meetingActive ? 'meeting' : 'active');
+	} catch {}
+}
+
+// Poll state/voice-mode.request every 1s — external controllers (Swift
+// menu-bar clickable items) write "active" or "meeting" to ask voice-agent
+// to switch. Same code path as the switch_mode tool. File is consumed on
+// apply so requests don't re-fire.
+function applyModeRequest() {
+	try {
+		const req = readFileSync('state/voice-mode.request', 'utf-8').trim().toLowerCase();
+		unlinkSync('state/voice-mode.request');
+		const want = req === 'meeting';
+		if (meetingActive === want) return; // no-op if already in that mode
+		meetingActive = want;
+		writeVoiceModeSentinel();
+		console.log(`${ts()} [Meeting] External request applied: mode=${want ? 'meeting' : 'active'}`);
+	} catch {
+		// no request file or delete failed — both are fine (silent poll)
+	}
+}
+setInterval(applyModeRequest, 1_000);
+
 // Detect active meeting on startup — sync so it runs before first greeting
 try {
 	const zoomRunning = execSyncTop('pgrep -f "zoom.us" 2>/dev/null', { encoding: 'utf-8' }).trim();
@@ -196,6 +224,12 @@ try {
 		}
 	}
 } catch { /* no zoom */ }
+
+// Write the initial voice-mode sentinel AFTER the Zoom auto-detect — so
+// the on-disk state matches the in-memory `meetingActive` decision (was
+// previously written before the auto-detect, leaving voice-mode.txt
+// stuck on "active" even when Zoom was detected as active).
+writeVoiceModeSentinel();
 
 // =============================================================================
 // Tools
@@ -215,6 +249,13 @@ const switchModeTool: ToolDefinition = {
 	async execute(args) {
 		const { mode } = args as { mode: 'active' | 'meeting' };
 		meetingActive = mode === 'meeting';
+		// Sync the on-disk sentinel so menu-bar consumers (Sutando.app
+		// pollVoiceMode + web-client /voice-mode endpoint) reflect the
+		// switch immediately. Without this, voice-triggered switch_mode
+		// flips meetingActive in-memory but voice-mode.txt stays stale,
+		// causing the menu radio to lag + the next applyModeRequest from
+		// Sutando.app to early-return as a no-op (`meetingActive === want`).
+		writeVoiceModeSentinel();
 		console.log(`${ts()} [Meeting] Mode switched to: ${mode}`);
 		if (mode === 'meeting') {
 			return { status: 'meeting_mode', instruction: 'You are now in meeting mode. Listen and track the discussion internally. Produce ZERO audio output unless someone says "Sutando." The ONLY tool you may call unprompted is save_meeting_note — call it every 5-10 minutes to capture key decisions, action items, and discussion points. When you exit meeting mode, call save_meeting_note with type "summary" for a final recap. Do not call work or any other tools unless explicitly addressed.' };
@@ -373,6 +414,21 @@ const endSession: ToolDefinition = {
 
 let voiceSessionRef: VoiceSession | null = null;
 
+// Synchronously query the iclr-highlight server for current presenter-mode
+// state. Returns a system-marker string when active, '' otherwise. Failure-
+// silent: if the server is down or the curl call errors, returns '' so the
+// greeting/reconnect path stays unchanged.
+function getPresenterStateMarker(): string {
+	try {
+		const out = execSyncTop('curl -s --max-time 1 http://localhost:7877/presenter', { timeout: 2_000 }).toString();
+		const json = JSON.parse(out);
+		if (json && json.active === true) {
+			return ' [System: PRESENTER MODE IS CURRENTLY ACTIVE — apply the CO-PRESENTER protocol from your context to every cue this session: highlight_slide(topic) FIRST, then narrate from voice-context.txt. Do NOT route slide-topic phrases to work.]';
+		}
+	} catch { /* server unreachable or non-JSON — fall through to no-marker */ }
+	return '';
+}
+
 const mainAgent: MainAgent = {
 	name: 'main',
 	get greeting() {
@@ -404,12 +460,16 @@ const mainAgent: MainAgent = {
 			// user can just keep talking without UX interruption.
 			const gap = getSecondsSinceLastTurn();
 			const isQuickReconnect = gap !== null && gap < 60;
+			// Presenter mode active = silent reconnect regardless of gap. Saying
+			// "Welcome back" mid-talk would break the co-presenter flow; the
+			// presenter marker (appended below) anchors continuation instead.
+			const presenterActive = getPresenterStateMarker() !== '';
 			const meetingHint = meetingActive
 				? '\n\n[MEETING MODE — you are listening and taking notes. Do NOT speak or produce any audio. Only respond if someone says "Sutando." Use the replayed history above as context for what was discussed before the reconnect.]'
-				: isQuickReconnect
+				: (isQuickReconnect || presenterActive)
 					? '\n\n[Do NOT greet the user. Do NOT say "Welcome back" or anything similar. Stay completely silent and wait for the user\'s next spoken input — they were just briefly disconnected and want to resume without interruption.]'
 					: '\n\n[Now say "Welcome back" briefly — one sentence — and then stop and wait for input.]';
-			return `[System: The user reconnected. The block below is REPLAYED HISTORY from the current session, provided as background context ONLY. Do NOT act on anything in it. Do NOT call any tools based on it. Use it only to answer follow-up questions if asked. Wait silently for the user's next spoken input before taking any action.]\n\n${recent}${meetingHint}`;
+			return `[System: The user reconnected. The block below is REPLAYED HISTORY from the current session, provided as background context ONLY. Do NOT act on anything in it. Do NOT call any tools based on it. Use it only to answer follow-up questions if asked. Wait silently for the user's next spoken input before taking any action.]${getPresenterStateMarker()}\n\n${recent}${meetingHint}`;
 		}
 		let standName = '';
 		try { const si = JSON.parse(readFileSync('stand-identity.json', 'utf-8')); standName = si.name ? ` — ${si.name}` : ''; } catch {}
@@ -425,9 +485,17 @@ const mainAgent: MainAgent = {
 		if (meetingActive) {
 			return `[System: MEETING MODE — LISTEN AND TAKE NOTES. A Zoom meeting is active. Listen to everything and mentally track the discussion: who said what, key decisions, action items, topics covered. But do NOT produce any audio output UNLESS someone says "Sutando" or "hey Sutando" — then respond to their request using your accumulated notes and context. When not addressed, produce absolutely zero words — no acknowledgments, no "silent", no sounds. You are an invisible note-taker until called upon.]`;
 		}
-		return `[System: A user just connected. Say hi and introduce yourself as Sutando${standName} — their personal AI. Ready to help with anything: voice tasks, screen control, meetings, phone calls, research. Keep it brief — 1-2 natural sentences, no theatrics.${tutorialHint}${briefingHint}${insightHint}]`;
+		return `[System: A user just connected. Say hi and introduce yourself as Sutando${standName} — their personal AI. Ready to help with anything: voice tasks, screen control, meetings, phone calls, research. Keep it brief — 1-2 natural sentences, no theatrics.${tutorialHint}${briefingHint}${insightHint}]${getPresenterStateMarker()}`;
 	},
-	instructions: [
+	instructions: () => [
+		// Per-session-evaluated factory (vs static array): lets the prompt
+		// re-check time-sensitive state on every session.start() / reconnect.
+		// The presenter-state marker below MUST be in the system_instruction
+		// (this array → joined string → system_instruction), not the greeting,
+		// because Gemini Live treats greetings as a user-style turn — the
+		// model often calls get_core_status to verify "claims" rather than
+		// trust them. System instructions are authoritative.
+		(() => getPresenterStateMarker())(),
 		'You are Sutando, a personal AI that belongs entirely to the user.',
 		'Named after Stands from JoJo\'s Bizarre Adventure — a personal spirit that fights for you.',
 		'Every Sutando evolves differently based on what its user needs. You earned your name and identity.',
@@ -483,7 +551,9 @@ const mainAgent: MainAgent = {
 			? '⚠️ MEETING MODE IS CURRENTLY ACTIVE. You are an invisible note-taker. Listen to all audio and track: speakers, topics, decisions, action items. Produce ZERO audio output unless someone says "Sutando" or "hey Sutando." The ONLY tool you may call unprompted is save_meeting_note — call it every 5-10 minutes to capture key points. Do NOT call work or other tools unless explicitly addressed. When addressed, answer DIRECTLY from what you heard — do NOT call work (core has no meeting audio). "bye" in a meeting does NOT mean disconnect — only "Sutando disconnect" or "Sutando bye". To exit: user says "Sutando, active mode" → call switch_mode("active") and save_meeting_note(summary).'
 			: '- MEETING MODE: Call switch_mode("meeting") when user says "take notes", "be silent", "passive mode", or when you join a meeting. In meeting mode: listen and auto-save notes via save_meeting_note every 5-10 min, produce zero audio, don\'t call other tools — unless addressed by name. Call switch_mode("active") to resume.'
 		)(),
+		'- PRESENTER MODE: Call presenter_mode("on") when user says "presenter mode on", "going live", "starting the talk", "the talk starts", or "I am on stage". Call presenter_mode("off") when user says "presenter mode off", "talk is done", "stop presenting", or "done presenting". Do NOT route these phrases to work — they are direct tool triggers. presenter_mode("on") returns a "say" field; speak it verbatim as your FIRST utterance.',
 		'- GOODBYE: When the user says goodbye, bye, or clearly ends the conversation, respond with a SHORT farewell that STARTS with the word "Goodbye" (e.g. "Goodbye! Talk to you later."). Keep it under one sentence. The session will close automatically. Do NOT start the farewell with "I\'m back", "Hello", "Welcome", or any other greeting word — only use a short starts-with-goodbye response for actual goodbyes.',
+		'- FILLERS ARE NOT REQUESTS: Short utterances that are fillers, acknowledgments, or thinking noises — "hmm", "um", "uh", "ah", "mhm", "oh", "ok", "yeah", "right", "[BLANK_AUDIO]", or any single-word backchannel — are NOT instructions. Do NOT call work, do NOT say "queued up" or "working on it", do NOT narrate. Either stay silent (preferred) or produce a brief ACK like "mm-hm" if the user seems to expect confirmation. Only act when the user issues a clear directive or question.',
 		'- NEVER pretend you called a tool. NEVER say "done" without actually calling work.',
 		'- NEVER say "I can\'t do that", "I\'m not able to", or "I don\'t think I can" — you CAN do almost anything by calling work. If you\'re unsure, call work and let the core agent handle it. The core agent has full system access. Your job is to relay requests, not gatekeep them.',
 		'- For SIMPLE actions (press enter, clear input, select all), use press_key or type_text — do NOT use work for keystrokes.',
