@@ -5,7 +5,7 @@
  * Add new tools here and they auto-appear in both voice and phone agents.
  */
 
-import { execSync } from 'node:child_process';
+import { execSync, execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
@@ -475,24 +475,24 @@ export const fullscreenTool: ToolDefinition = {
 		try {
 			// Detect whether QuickTime is showing a video. If so, "fullscreen"
 			// means that video, not the slide deck.
-			let qtHasDoc = false;
-			try {
-				const out = execSync(`osascript -e '
+			// Use execFileSync (no shell) to avoid apostrophes-in-comments breaking
+			// shell single-quoting on the AppleScript payload.
+			const qtDetectScript = `
 tell application "QuickTime Player"
 	if it is running then
 		return (count of documents)
 	else
 		return 0
 	end if
-end tell'`, { timeout: 2_000 }).toString().trim();
+end tell`;
+			let qtHasDoc = false;
+			try {
+				const out = execFileSync('/usr/bin/osascript', ['-e', qtDetectScript], { timeout: 2_000 }).toString().trim();
 				qtHasDoc = parseInt(out, 10) > 0;
 			} catch {}
 
 			if (qtHasDoc) {
-				// QuickTime fullscreen via Ctrl+Cmd+F routed through tell process —
-				// bypasses Zoom screen-share keystroke focus grab, same pattern as
-				// the QuickTime open_file fix.
-				execSync(`osascript -e '
+				const qtScript = `
 tell application "QuickTime Player" to activate
 delay 0.3
 tell application "System Events"
@@ -500,13 +500,13 @@ tell application "System Events"
 		set frontmost to true
 		keystroke "f" using {command down, control down}
 	end tell
-end tell'`, { timeout: 5_000 });
+end tell`;
+				execFileSync('/usr/bin/osascript', ['-e', qtScript], { timeout: 5_000 });
 				console.log(`${ts()} [Fullscreen] Toggled QuickTime`);
 				return { status: 'toggled', target: 'quicktime' };
 			}
 
-			// No QT video open — fullscreen the slide deck in Chrome.
-			execSync(`osascript -e '
+			const slidesScript = `
 tell application "Google Chrome"
 	activate
 	repeat with w in windows
@@ -521,16 +521,13 @@ tell application "Google Chrome"
 	end repeat
 end tell
 delay 0.3
--- Target the frontmost process directly so Zoom screen-share's floating
--- control bar can not intercept the keystroke. If Chrome was activated
--- above (slide tab found) frontmost is Chrome; otherwise the keystroke
--- goes to whatever the user actually has up.
 tell application "System Events"
 	set frontApp to name of first application process whose frontmost is true
 	tell process frontApp
 		keystroke "f"
 	end tell
-end tell'`, { timeout: 5_000 });
+end tell`;
+			execFileSync('/usr/bin/osascript', ['-e', slidesScript], { timeout: 5_000 });
 			console.log(`${ts()} [Fullscreen] Toggled slides`);
 			return { status: 'toggled', target: 'slides' };
 		} catch (err) {
