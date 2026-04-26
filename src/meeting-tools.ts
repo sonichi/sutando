@@ -3,7 +3,7 @@
  * Extracted from inline-tools.ts for readability.
  */
 
-import { execSync } from 'node:child_process';
+import { execSync, execFileSync } from 'node:child_process';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 
@@ -134,18 +134,22 @@ export const summonTool: ToolDefinition = {
 					if (data.callSid) {
 						phoneJoined = true;
 						console.log(`${ts()} [Summon] Phone call placed: ${data.callSid} — voice agent stays connected until phone joins`);
-						// Mute Zoom mic + speaker so voice agent doesn't pick up Zoom audio
+						// Mute Zoom mic + speaker so voice agent doesn't pick up Zoom audio.
+						// execFileSync (no shell) — the AppleScript comment below contains
+						// "doesn't bleed", and an apostrophe inside a shell-single-quoted
+						// `osascript -e '...'` argument silently ends the quoted string,
+						// which masked this whole block as a "Zoom mute failed" log line
+						// for as long as the comment has been there. Same bug class as
+						// PR #527.
+						const muteScript = `
+tell application "System Events"
+	tell process "zoom.us"
+		keystroke "a" using {command down, shift down}
+	end tell
+end tell
+set volume output volume 0`;
 						try {
-							execSync(`osascript -e '
-								tell application "System Events"
-									tell process "zoom.us"
-										-- Mute mic (Cmd+Shift+A)
-										keystroke "a" using {command down, shift down}
-									end tell
-								end tell
-								-- Mute system audio so Zoom speaker doesn\'t bleed into voice agent mic
-								set volume output volume 0
-							'`, { timeout: 5_000 });
+							execFileSync('/usr/bin/osascript', ['-e', muteScript], { timeout: 5_000 });
 							console.log(`${ts()} [Summon] Zoom mic + system audio muted`);
 						} catch { console.log(`${ts()} [Summon] Zoom mute failed`); }
 						// Voice agent stays alive — system audio muted prevents Zoom speaker
