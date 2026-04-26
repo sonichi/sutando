@@ -173,7 +173,18 @@ def check_notes_without_follow_up():
                 continue
             if body_start or not line.startswith("---"):
                 low = line.lower()
-                if any(marker in low for marker in ["- [ ]", "todo:", "action:", "follow-up:", "followup:"]):
+                # Match markers only at the start of the line (after optional
+                # leading whitespace and a list bullet). The previous "any
+                # marker anywhere in line" rule false-positived on
+                # documentation prose like "- Action: Get Contents of URL"
+                # in the Apple Shortcuts research note (the word "Action:"
+                # is shortcut-terminology, not a TODO directive).
+                stripped = low.lstrip(" \t-*")
+                # "action:" was dropped: too noisy. It's standard prose-label
+                # vocabulary (e.g. "Action: Get Contents of URL" in shortcut
+                # docs, "Action items:" as a section header, etc.). The other
+                # three are unambiguously directive.
+                if "- [ ]" in low or any(stripped.startswith(m) for m in ("todo:", "follow-up:", "followup:")):
                     has_todo = True
                     break
                 # Also match tags line with explicit 'todo' tag
