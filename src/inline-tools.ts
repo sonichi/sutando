@@ -477,10 +477,14 @@ export const fullscreenTool: ToolDefinition = {
 			// means that video, not the slide deck.
 			let qtHasDoc = false;
 			try {
-				const out = execSync(
-					`osascript -e 'tell application "QuickTime Player" to if it is running then return (count of documents) else return 0'`,
-					{ timeout: 2_000 }
-				).toString().trim();
+				const out = execSync(`osascript -e '
+tell application "QuickTime Player"
+	if it is running then
+		return (count of documents)
+	else
+		return 0
+	end if
+end tell'`, { timeout: 2_000 }).toString().trim();
 				qtHasDoc = parseInt(out, 10) > 0;
 			} catch {}
 
