@@ -487,12 +487,16 @@ tell application "Google Chrome"
 	end repeat
 end tell
 delay 0.3
--- Target Chrome process directly. When Zoom is screen-sharing, Zoom's
--- floating control bar steals global keystroke focus, so a plain
--- keystroke f to System Events lands in Zoom instead of Chrome.
--- Routing through tell process Google Chrome bypasses the focus race.
+-- Target the frontmost process directly. When Zoom is screen-sharing,
+-- Zoom's floating control bar steals global keystroke focus, so a plain
+-- keystroke f to System Events lands in Zoom instead of the foreground
+-- app. Routing through tell process <frontmost> bypasses the focus race
+-- while keeping this tool generic — if Chrome was activated above (slide
+-- tab found) frontmost is Chrome, otherwise keystroke goes to whatever
+-- the user actually has up.
 tell application "System Events"
-	tell process "Google Chrome"
+	set frontApp to name of first application process whose frontmost is true
+	tell process frontApp
 		keystroke "f"
 	end tell
 end tell'`, { timeout: 5_000 });
