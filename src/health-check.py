@@ -147,7 +147,7 @@ def fix_launchd(label: str) -> str:
 # Main
 # ---------------------------------------------------------------------------
 
-def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, threshold_sec: int = 1800) -> None:
+def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, threshold_sec: int = 1800, binary_path: Path | None = None) -> None:
     """Mark `check` as 'stale' in place if a process matching `pgrep_pattern`
     started more than `threshold_sec` before `src_file`'s mtime.
 
@@ -156,9 +156,30 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
     30 min default threshold tolerates `git checkout` mtime bumps; real
     stale deploys are hours/days old. Silent on any failure — stale
     detection is advisory, not authoritative.
+
+    If `binary_path` is supplied (compiled artifacts like the Swift
+    Sutando.app), the function ALSO checks whether the binary itself is
+    older than the source. A stale binary means the running process —
+    however recently relaunched — is executing old code. When this fires,
+    the message tells the user to rebuild, not just restart.
     """
     if not src_file.exists():
         return
+    # Compiled-artifact check: binary older than source → "rebuild needed",
+    # regardless of process start. This catches the case where --fix
+    # relaunches a stale binary repeatedly (#528 stopped the leak; this
+    # makes the message actionable).
+    if binary_path is not None and binary_path.exists():
+        try:
+            src_mtime = src_file.stat().st_mtime
+            bin_mtime = binary_path.stat().st_mtime
+            if src_mtime - bin_mtime > threshold_sec:
+                age_min = int((src_mtime - bin_mtime) / 60)
+                check["status"] = "stale"
+                check["detail"] = f"running, but binary is {age_min} min older than source — rebuild needed"
+                return
+        except OSError:
+            pass
     try:
         pids = subprocess.run(
             ["pgrep", "-f", pgrep_pattern],
@@ -695,7 +716,12 @@ def run_all_checks() -> list[dict]:
             pids = []
         if pids:
             check = {"name": "sutando-app", "status": "ok", "detail": f"running (⌃C/⌃V/⌃M)"}
-            mark_stale_if_outdated(check, REPO_DIR / "src" / "Sutando" / "main.swift", "src/Sutando/Sutando")
+            mark_stale_if_outdated(
+                check,
+                REPO_DIR / "src" / "Sutando" / "main.swift",
+                "src/Sutando/Sutando",
+                binary_path=REPO_DIR / "src" / "Sutando" / "Sutando",
+            )
             checks.append(check)
         else:
             checks.append({"name": "sutando-app", "status": "warn", "detail": "not running — hotkeys disabled"})
