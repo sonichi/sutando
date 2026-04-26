@@ -503,6 +503,28 @@ export const openFileTool: ToolDefinition = {
 		console.log(`${ts()} [OpenFile] called (path=${filePath || 'none'}, find_latest=${find_recording || false}, fullscreen=${fullscreen || false})`);
 		demoStateRef.value = 'idle';
 		try {
+			// Runtime guard: if `fullscreen=true` was requested AND QuickTime
+			// already has a video open, the user almost certainly meant
+			// "fullscreen the playing video" — not "find some recording on
+			// disk and open a fresh copy in present mode". Block and direct
+			// to the fullscreen tool. Catches the model rationalising past
+			// the description warning.
+			if (fullscreen) {
+				try {
+					const out = execSync(`osascript -e '
+tell application "QuickTime Player"
+	if it is running then
+		return (count of documents)
+	else
+		return 0
+	end if
+end tell'`, { timeout: 2_000 }).toString().trim();
+					if (parseInt(out, 10) > 0) {
+						console.log(`${ts()} [OpenFile] BLOCKED fullscreen=true while QT already has document(s) — directing to fullscreen tool`);
+						return { error: 'A video is already open in QuickTime. Call the `fullscreen` tool to enter fullscreen on it instead of opening a new file.' };
+					}
+				} catch {}
+			}
 			let recPath = filePath ? filePath.replace(/^~/, process.env.HOME || '') : null;
 			if (recPath && !existsSync(recPath)) {
 				console.log(`${ts()} [OpenFile] path "${recPath}" does not exist`);
