@@ -487,8 +487,14 @@ tell application "Google Chrome"
 	end repeat
 end tell
 delay 0.3
+-- Target Chrome process directly. When Zoom is screen-sharing, Zoom's
+-- floating control bar steals global keystroke focus, so a plain
+-- keystroke f to System Events lands in Zoom instead of Chrome.
+-- Routing through tell process Google Chrome bypasses the focus race.
 tell application "System Events"
-	keystroke "f"
+	tell process "Google Chrome"
+		keystroke "f"
+	end tell
 end tell'`, { timeout: 5_000 });
 			console.log(`${ts()} [Fullscreen] Toggled`);
 			return { status: 'toggled' };
