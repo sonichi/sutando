@@ -486,10 +486,11 @@ export const openFileTool: ToolDefinition = {
 		'Use for: "open the video/recording", "open the file", "open that", "can you open it". ' +
 		'If the user says "open the log" or similar, ASK which log they mean (voice-agent, discord-bridge, etc.) — do NOT default to a recording. ' +
 		'Do NOT call play_video after this — wait for user to explicitly say "play". ' +
+		'NEVER call this tool to enter fullscreen on a video that is already open — call the `fullscreen` tool instead. ' +
 		'Known files: "diagnostic tracker" or "diagnostics" = /tmp/phone-diagnostics-tracker.html, ' +
 		'"voice diagnostics" = /tmp/voice-diagnostics-tracker.html. ' +
 		'If you need to find the latest recording but lost the path, pass find_recording=true. ' +
-		'For video files (.mp4 / .mov) that should play as a presentation, pass fullscreen=true — ' +
+		'For OPENING A NEW video file (.mp4 / .mov) that should play as a presentation, pass fullscreen=true — ' +
 		'QuickTime will activate fullscreen "present" mode after opening.',
 	parameters: z.object({
 		path: z.string().optional().describe('File path to open. Get this from the recording tool result. Use known file aliases for diagnostic tracker etc.'),

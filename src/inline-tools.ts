@@ -463,15 +463,45 @@ end tell`;
 	},
 };
 
-// Toggle fullscreen on the presentation slides
+// Toggle fullscreen on whatever the user is currently viewing.
+// Branches: if a QuickTime video is open → fullscreen QuickTime; else slide deck.
 export const fullscreenTool: ToolDefinition = {
 	name: 'fullscreen',
 	description:
-		'Toggle fullscreen mode on the presentation slides. Use when user says "fullscreen", "enter fullscreen", "exit fullscreen", "make it full screen".',
+		'Toggle fullscreen on whatever the user is currently viewing. If a QuickTime video is open it fullscreens QuickTime; otherwise it fullscreens the slide deck. Use when user says "fullscreen", "enter fullscreen", "exit fullscreen", "make it full screen". DO NOT call open_file with fullscreen=true to enter fullscreen on an already-open video — call this tool instead.',
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
 		try {
+			// Detect whether QuickTime is showing a video. If so, "fullscreen"
+			// means that video, not the slide deck.
+			let qtHasDoc = false;
+			try {
+				const out = execSync(
+					`osascript -e 'tell application "QuickTime Player" to if it is running then return (count of documents) else return 0'`,
+					{ timeout: 2_000 }
+				).toString().trim();
+				qtHasDoc = parseInt(out, 10) > 0;
+			} catch {}
+
+			if (qtHasDoc) {
+				// QuickTime fullscreen via Ctrl+Cmd+F routed through tell process —
+				// bypasses Zoom screen-share keystroke focus grab, same pattern as
+				// the QuickTime open_file fix.
+				execSync(`osascript -e '
+tell application "QuickTime Player" to activate
+delay 0.3
+tell application "System Events"
+	tell process "QuickTime Player"
+		set frontmost to true
+		keystroke "f" using {command down, control down}
+	end tell
+end tell'`, { timeout: 5_000 });
+				console.log(`${ts()} [Fullscreen] Toggled QuickTime`);
+				return { status: 'toggled', target: 'quicktime' };
+			}
+
+			// No QT video open — fullscreen the slide deck in Chrome.
 			execSync(`osascript -e '
 tell application "Google Chrome"
 	activate
@@ -487,21 +517,18 @@ tell application "Google Chrome"
 	end repeat
 end tell
 delay 0.3
--- Target the frontmost process directly. When Zoom is screen-sharing,
--- Zoom's floating control bar steals global keystroke focus, so a plain
--- keystroke f to System Events lands in Zoom instead of the foreground
--- app. Routing through tell process <frontmost> bypasses the focus race
--- while keeping this tool generic — if Chrome was activated above (slide
--- tab found) frontmost is Chrome, otherwise keystroke goes to whatever
--- the user actually has up.
+-- Target the frontmost process directly so Zoom screen-share's floating
+-- control bar can not intercept the keystroke. If Chrome was activated
+-- above (slide tab found) frontmost is Chrome; otherwise the keystroke
+-- goes to whatever the user actually has up.
 tell application "System Events"
 	set frontApp to name of first application process whose frontmost is true
 	tell process frontApp
 		keystroke "f"
 	end tell
 end tell'`, { timeout: 5_000 });
-			console.log(`${ts()} [Fullscreen] Toggled`);
-			return { status: 'toggled' };
+			console.log(`${ts()} [Fullscreen] Toggled slides`);
+			return { status: 'toggled', target: 'slides' };
 		} catch (err) {
 			return { error: `Fullscreen toggle failed: ${err instanceof Error ? err.message : err}` };
 		}
