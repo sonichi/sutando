@@ -787,10 +787,19 @@ def main():
                                      stderr=subprocess.STDOUT, start_new_session=True)
                     print(f"  {c['name']}: {'restarted (stale code)' if c['status'] == 'stale' else 'restarted'}")
                 elif c["name"] == "sutando-app":
-                    sutando_bin = REPO_DIR / "src" / "Sutando" / "Sutando"
-                    subprocess.Popen([str(sutando_bin)], start_new_session=True,
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    print(f"  {c['name']}: restarted")
+                    # Stale here means main.swift is newer than the binary's
+                    # process start time. The bare Popen below was leaking
+                    # duplicates (macOS doesn't enforce singleton on this
+                    # bundle — observed 3 concurrent on 2026-04-19) AND it
+                    # was relaunching the same stale binary, so the stale
+                    # signal kept re-firing every cron pass.
+                    #
+                    # Real fix needs (a) pkill the existing PID, (b) swiftc
+                    # rebuild if source > binary, (c) `open src/Sutando/Sutando`.
+                    # Until that lands, surface the warning instead of
+                    # pretending we fixed it. Chi rebuilds + relaunches
+                    # manually per feedback_sutando_app_launch_method.md.
+                    print(f"  {c['name']}: not auto-fixed — needs manual rebuild + relaunch (see memory feedback_sutando_app_launch_method.md)")
                 elif c["name"] == "ngrok":
                     # Read ngrok domain from .env if set, otherwise use default
                     env_path = REPO_DIR / ".env"
