@@ -64,3 +64,12 @@ contextual-chips.json
 .massgen/
 .env.bak
 .last-pq-notify
+
+# Task archive — created by the watcher when moving processed tasks.
+# Will eventually move to $SUTANDO_PRIVATE_DIR/done/ for analytics + self-
+# improvement (option b in the 2026-04-27 done/-handling discussion).
+# Until that migration ships, keep done/ ephemeral and gitignored.
+done/
+
+# Runtime state file written by the voice client. Pure cruft, no commit value.
+voice-state.json
