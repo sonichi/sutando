@@ -4,12 +4,16 @@
 # to silently no-op (observed 2026-04-25, 9.5h of stale code mid-talk-prep).
 #
 # Verification:
-#   1. Capture PID listening on :9900 BEFORE kickstart.
+#   1. Capture LISTEN PID on :9900 BEFORE kickstart (filters out connected
+#      WebSocket clients that would otherwise pick up a non-listener PID).
 #   2. `launchctl kickstart -k gui/<uid>/com.sutando.voice-agent`.
-#   3. Sleep 3s.
-#   4. Capture PID listening on :9900 AFTER kickstart.
-#   5. Assert new PID differs from old AND new PID's etime < 30s.
-#   6. Confirm :9900 still listening.
+#   3. Poll up to MAX_DEADLINE_SECONDS for a fresh LISTEN PID. Don't fix-sleep
+#      because cold tsx boots take variable time.
+#   4. Accept the restart only when (etime <= MAX_ETIME_SECONDS), regardless
+#      of whether NEW_PID matches OLD_PID — rare PID reuse + a fresh process
+#      is still a successful restart, not a silent no-op.
+#   5. Reject when (no listener appeared by the deadline) OR (NEW_PID == OLD_PID
+#      AND etime > MAX_ETIME_SECONDS) — that's the silent-no-op signature.
 #
 # Exits 0 only when all checks pass. Non-zero with a one-line diagnostic
 # pointing at which assertion failed.
@@ -21,50 +25,18 @@ set -uo pipefail
 UID_NUM="$(id -u)"
 SERVICE="gui/${UID_NUM}/com.sutando.voice-agent"
 PORT=9900
-SLEEP_SECONDS=3
-MAX_ETIME_SECONDS=30
+MAX_DEADLINE_SECONDS=30   # how long to wait for the new listener to come up
+MAX_ETIME_SECONDS=30      # max age of an "accepted" listener (≤ deadline by design)
 
-# --- 1. capture old PID ---
-OLD_PID="$(lsof -ti tcp:${PORT} 2>/dev/null | head -1 || true)"
-if [ -z "${OLD_PID}" ]; then
-  echo "WARN  no process on :${PORT} before kickstart — may be normal if voice-agent was down"
-fi
+# Capture only the LISTENER PID — without `-sTCP:LISTEN`, lsof returns every
+# pid bound to the port including connected WebSocket clients (browser, etc).
+get_listener_pid() {
+  lsof -nP -tiTCP:${PORT} -sTCP:LISTEN 2>/dev/null | head -1
+}
 
-# --- 2. kickstart ---
-echo "kickstart ${SERVICE} (old pid: ${OLD_PID:-none})"
-if ! launchctl kickstart -k "${SERVICE}" 2>&1; then
-  echo "FAIL  launchctl kickstart returned non-zero"
-  exit 1
-fi
-
-# --- 3. sleep ---
-sleep "${SLEEP_SECONDS}"
-
-# --- 4. capture new PID ---
-NEW_PID="$(lsof -ti tcp:${PORT} 2>/dev/null | head -1 || true)"
-if [ -z "${NEW_PID}" ]; then
-  echo "FAIL  no process on :${PORT} ${SLEEP_SECONDS}s after kickstart — voice-agent did not come back up"
-  exit 2
-fi
-
-# --- 5. assertions ---
-if [ -n "${OLD_PID}" ] && [ "${NEW_PID}" = "${OLD_PID}" ]; then
-  echo "FAIL  PID unchanged (${NEW_PID}) — kickstart silently no-op'd"
-  exit 3
-fi
-
-# Read elapsed seconds via ps -o etime (formats: SS, MM:SS, HH:MM:SS, DD-HH:MM:SS).
-ETIME_RAW="$(ps -p "${NEW_PID}" -o etime= 2>/dev/null | tr -d ' ')"
-if [ -z "${ETIME_RAW}" ]; then
-  echo "FAIL  could not read etime for new pid ${NEW_PID}"
-  exit 4
-fi
-
-# Convert etime to seconds. Possible formats:
-#   SS              (e.g. "07")
-#   MM:SS           (e.g. "01:23")
-#   HH:MM:SS        (e.g. "01:02:03")
-#   DD-HH:MM:SS     (e.g. "1-02:03:04")
+# Convert ps etime (SS, MM:SS, HH:MM:SS, DD-HH:MM:SS) to seconds.
+# Forces base-10 arithmetic so leading-zero values like "08" don't get parsed
+# as octal and fail bash arithmetic.
 parse_etime_seconds() {
   local raw="$1"
   local days=0 hours=0 mins=0 secs=0
@@ -79,21 +51,70 @@ parse_etime_seconds() {
     1) secs="${parts[0]}" ;;
     2) mins="${parts[0]}"; secs="${parts[1]}" ;;
     3) hours="${parts[0]}"; mins="${parts[1]}"; secs="${parts[2]}" ;;
-    *) echo 999999; return ;;
+    *) echo ""; return 1 ;;
   esac
-  echo $(( days*86400 + hours*3600 + mins*60 + secs ))
+  # Use 10# prefix to defeat octal interpretation of values with leading 0s.
+  echo $(( 10#$days*86400 + 10#$hours*3600 + 10#$mins*60 + 10#$secs ))
 }
 
-ETIME_SECONDS="$(parse_etime_seconds "${ETIME_RAW}")"
-if [ "${ETIME_SECONDS}" -gt "${MAX_ETIME_SECONDS}" ]; then
-  echo "FAIL  new pid ${NEW_PID} has etime ${ETIME_RAW} (>${MAX_ETIME_SECONDS}s) — looks like a stale process, not a fresh restart"
+# --- 1. capture old listener PID ---
+OLD_PID="$(get_listener_pid || true)"
+if [ -z "${OLD_PID}" ]; then
+  echo "WARN  no LISTEN process on :${PORT} before kickstart — may be normal if voice-agent was down"
+fi
+
+# --- 2. kickstart ---
+echo "kickstart ${SERVICE} (old listener pid: ${OLD_PID:-none})"
+if ! launchctl kickstart -k "${SERVICE}" 2>&1; then
+  echo "FAIL  launchctl kickstart returned non-zero"
+  exit 1
+fi
+
+# --- 3. poll for a fresh listener up to the deadline ---
+DEADLINE_AT=$(( SECONDS + MAX_DEADLINE_SECONDS ))
+NEW_PID=""
+ETIME_RAW=""
+ETIME_SECONDS=""
+while [ "${SECONDS}" -lt "${DEADLINE_AT}" ]; do
+  NEW_PID="$(get_listener_pid || true)"
+  if [ -n "${NEW_PID}" ]; then
+    ETIME_RAW="$(ps -p "${NEW_PID}" -o etime= 2>/dev/null | tr -d ' ')"
+    if [ -n "${ETIME_RAW}" ]; then
+      ETIME_SECONDS="$(parse_etime_seconds "${ETIME_RAW}" || true)"
+      # Accept the moment we see a fresh listener (etime within deadline).
+      # Don't gate on NEW_PID != OLD_PID — rare PID reuse + fresh etime is
+      # still a real restart.
+      if [ -n "${ETIME_SECONDS}" ] && [ "${ETIME_SECONDS}" -le "${MAX_ETIME_SECONDS}" ]; then
+        break
+      fi
+    fi
+  fi
+  sleep 1
+done
+
+# --- 4. assertions ---
+if [ -z "${NEW_PID}" ]; then
+  echo "FAIL  no LISTEN process on :${PORT} within ${MAX_DEADLINE_SECONDS}s — voice-agent did not come back up"
+  exit 2
+fi
+
+if [ -z "${ETIME_RAW}" ]; then
+  echo "FAIL  could not read etime for new pid ${NEW_PID}"
+  exit 4
+fi
+
+if [ -z "${ETIME_SECONDS}" ]; then
+  echo "FAIL  could not parse etime '${ETIME_RAW}' for pid ${NEW_PID}"
   exit 5
 fi
 
-# --- 6. confirm port still listening (paranoia: NEW_PID was non-empty above, but check again) ---
-if ! lsof -i tcp:${PORT} -nP 2>/dev/null | grep -q LISTEN; then
-  echo "FAIL  :${PORT} not in LISTEN state"
-  exit 6
+if [ "${ETIME_SECONDS}" -gt "${MAX_ETIME_SECONDS}" ]; then
+  if [ -n "${OLD_PID}" ] && [ "${NEW_PID}" = "${OLD_PID}" ]; then
+    echo "FAIL  listener pid unchanged (${NEW_PID}) and etime ${ETIME_RAW} >${MAX_ETIME_SECONDS}s — kickstart silently no-op'd"
+    exit 3
+  fi
+  echo "FAIL  new listener pid ${NEW_PID} has etime ${ETIME_RAW} (>${MAX_ETIME_SECONDS}s) — looks like a stale process, not a fresh restart"
+  exit 5
 fi
 
 echo "OK    voice-agent restarted: pid=${NEW_PID} etime=${ETIME_RAW} listening on :${PORT}"
