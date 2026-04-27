@@ -51,8 +51,11 @@ while IFS= read -r line; do
   PREV1="$CAT"
 done <<< "$DECISION_LINES"
 
-# Idle/wait rate.
-IDLE_COUNT="$(echo "$DECISION_LINES" | grep -cE "chose: idle|category: (WAITING|idle)" || true)"
+# Idle/wait rate. Match by category only — `chose: idle-*` action names (e.g.
+# `chose: idle-rate-threshold-confirm`) on a non-WAITING category should NOT
+# count as idle. Caught 2026-04-27 pass 2618 when a MAINTENANCE entry titled
+# `chose: idle-rate-threshold-confirm` was wrongly counted as idle.
+IDLE_COUNT="$(echo "$DECISION_LINES" | grep -cE "category: (WAITING|idle)" || true)"
 IDLE_PCT=$(( IDLE_COUNT * 100 / TOTAL ))
 
 # Repeated-reason detection: identical reason text across 3+ passes.
