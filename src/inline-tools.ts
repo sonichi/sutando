@@ -660,40 +660,54 @@ function assertUniqueToolNames(tools: ToolDefinition[]): ToolDefinition[] {
 // the autonav cue — voice-agent had no way to call highlight_slide because the
 // skill's tools were never being merged into inlineTools.
 async function loadSkillManifestTools(): Promise<ToolDefinition[]> {
-	const skillsDir = join(process.cwd(), 'skills');
-	if (!existsSync(skillsDir)) return [];
+	// Scan the public-repo `skills/` dir AND the optional private skills dir
+	// pointed to by `$SUTANDO_PRIVATE_DIR/skills/` (e.g.
+	// `~/.sutando-memory-sync/skills/`). The private dir lets users keep
+	// personal tooling with real per-file git history outside the public repo.
+	// Order: public first, then private — same-name skills loaded from
+	// private take precedence (last one wins via the dup-name guard below if
+	// any; in practice they should be uniquely named).
+	const dirsToScan: string[] = [join(process.cwd(), 'skills')];
+	const privateRoot = process.env.SUTANDO_PRIVATE_DIR;
+	if (privateRoot) {
+		const expanded = privateRoot.replace(/^~/, process.env.HOME || '');
+		dirsToScan.push(join(expanded, 'skills'));
+	}
 	const out: ToolDefinition[] = [];
-	let dirs: string[];
-	try {
-		dirs = readdirSync(skillsDir).filter(n => {
-			try { return statSync(join(skillsDir, n)).isDirectory(); } catch { return false; }
-		});
-	} catch { return []; }
-	for (const dirName of dirs) {
-		const manifestPath = join(skillsDir, dirName, 'manifest.json');
-		if (!existsSync(manifestPath)) continue;
-		let manifest: { enabled?: boolean; tools?: string; config?: Record<string, string>; name?: string };
+	for (const skillsDir of dirsToScan) {
+		if (!existsSync(skillsDir)) continue;
+		let dirs: string[];
 		try {
-			manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
-		} catch (err) {
-			console.warn(`[skill-loader] bad manifest ${dirName}:`, err instanceof Error ? err.message : err);
-			continue;
-		}
-		if (!manifest.enabled) continue;
-		for (const [k, v] of Object.entries(manifest.config || {})) {
-			if (process.env[k] === undefined) process.env[k] = v;
-		}
-		if (!manifest.tools) continue;
-		const toolsPath = join(skillsDir, dirName, manifest.tools.replace(/^\.\//, ''));
-		try {
-			// @ts-ignore — dynamic relative import resolved at runtime by tsx
-			const mod = await import(toolsPath);
-			if (Array.isArray(mod.tools)) {
-				out.push(...mod.tools);
-				console.log(`[skill-loader] loaded ${mod.tools.length} tool(s) from ${manifest.name || dirName}`);
+			dirs = readdirSync(skillsDir).filter(n => {
+				try { return statSync(join(skillsDir, n)).isDirectory(); } catch { return false; }
+			});
+		} catch { continue; }
+		for (const dirName of dirs) {
+			const manifestPath = join(skillsDir, dirName, 'manifest.json');
+			if (!existsSync(manifestPath)) continue;
+			let manifest: { enabled?: boolean; tools?: string; config?: Record<string, string>; name?: string };
+			try {
+				manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+			} catch (err) {
+				console.warn(`[skill-loader] bad manifest ${dirName} in ${skillsDir}:`, err instanceof Error ? err.message : err);
+				continue;
 			}
-		} catch (err) {
-			console.warn(`[skill-loader] failed to import ${dirName}/${manifest.tools}:`, err instanceof Error ? err.message : err);
+			if (!manifest.enabled) continue;
+			for (const [k, v] of Object.entries(manifest.config || {})) {
+				if (process.env[k] === undefined) process.env[k] = v;
+			}
+			if (!manifest.tools) continue;
+			const toolsPath = join(skillsDir, dirName, manifest.tools.replace(/^\.\//, ''));
+			try {
+				// @ts-ignore — dynamic relative import resolved at runtime by tsx
+				const mod = await import(toolsPath);
+				if (Array.isArray(mod.tools)) {
+					out.push(...mod.tools);
+					console.log(`[skill-loader] loaded ${mod.tools.length} tool(s) from ${manifest.name || dirName} (${skillsDir})`);
+				}
+			} catch (err) {
+				console.warn(`[skill-loader] failed to import ${dirName}/${manifest.tools} from ${skillsDir}:`, err instanceof Error ? err.message : err);
+			}
 		}
 	}
 	return out;
