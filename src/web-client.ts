@@ -945,6 +945,11 @@ function toggleAllTasks() {
 document.addEventListener('click', function(e) {
   // Don't toggle if clicking inside the result text (allow text selection)
   if (e.target.closest && e.target.closest('[id^="result-"]')) return;
+  // Don't toggle if the click ended a drag-to-select on the task title.
+  // Without this, the mouseup at the end of a text-select fires the click
+  // handler and toggles before the user can copy.
+  const sel = window.getSelection && window.getSelection();
+  if (sel && sel.toString().length > 0) return;
   const item = e.target.closest && e.target.closest('.task-item[data-taskid]');
   if (item) toggleResult(item.dataset.taskid);
 });
