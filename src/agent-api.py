@@ -32,6 +32,7 @@ For remote access: use ngrok or SSH tunnel.
 """
 
 import http.server
+import ipaddress
 import json
 import os
 import re
@@ -169,8 +170,10 @@ def get_task_result(task_id: str):
 _webhooks: dict[str, str] = {}
 
 
-def _is_safe_callback_url(url: str) -> bool:
+def _is_safe_callback_url(url: str) -> tuple[bool, str]:
     """Validate a callback URL to prevent SSRF attacks.
+
+    Returns (is_safe, resolved_ip_or_reason).
 
     Rejects:
     - Non-HTTPS schemes (http, file, gopher, etc.)
@@ -178,26 +181,27 @@ def _is_safe_callback_url(url: str) -> bool:
     - Cloud metadata endpoints (169.254.169.254)
     - Link-local addresses (169.254.0.0/16, fe80::/10)
     - Hostnames that resolve to private IPs
+
+    The resolved IP is returned so that fire_webhook can pin the request to
+    that IP, closing the DNS-rebinding TOCTOU window between validation and
+    the actual HTTP request.
     """
-    import ipaddress
     try:
         parsed = urlparse(url)
     except Exception:
-        return False
+        return False, "invalid URL"
 
     if parsed.scheme != "https":
-        return False
+        return False, "not HTTPS"
     if not parsed.hostname:
-        return False
-    # Block common internal hostnames
+        return False, "no hostname"
     hostname_lower = parsed.hostname.lower()
     if hostname_lower in ("localhost", "localhost.localdomain"):
-        return False
-    # Resolve hostname and check against private ranges
+        return False, "localhost"
     try:
         addrinfos = socket.getaddrinfo(hostname_lower, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
     except socket.gaierror:
-        return False
+        return False, "DNS resolution failed"
     private_ranges = [
         ipaddress.ip_network(b) for b in (
             "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
@@ -210,10 +214,12 @@ def _is_safe_callback_url(url: str) -> bool:
             addr = ipaddress.ip_address(sockaddr[0])
             for net in private_ranges:
                 if addr in net:
-                    return False
+                    return False, f"private IP: {addr}"
         except ValueError:
-            return False
-    return True
+            return False, f"invalid address: {sockaddr[0]}"
+    # Return the first resolved public IP for DNS pinning
+    resolved_ip = addrinfos[0][4][0]
+    return True, resolved_ip
 
 
 def fire_webhook(task_id: str, result: str) -> None:
@@ -221,13 +227,25 @@ def fire_webhook(task_id: str, result: str) -> None:
     url = _webhooks.pop(task_id, None)
     if not url:
         return
-    if not _is_safe_callback_url(url):
-        print(f"[webhook] BLOCKED: callback URL failed SSRF check: {url}")
+    safe, resolved = _is_safe_callback_url(url)
+    if not safe:
+        print(f"[webhook] BLOCKED: callback URL failed SSRF check: {url} ({resolved})")
         return
     try:
         import urllib.request
         data = json.dumps({"task_id": task_id, "status": "completed", "result": result}).encode()
-        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        # Pin the request to the resolved IP to close the DNS-rebinding TOCTOU window.
+        # Replace the hostname in the URL with the validated IP, but keep the original
+        # hostname in the Host header so the destination server handles it correctly.
+        parsed = urlparse(url)
+        if ":" in resolved:  # IPv6
+            pinned_url = url.replace(parsed.hostname, f"[{resolved}]", 1)
+        else:
+            pinned_url = url.replace(parsed.hostname, resolved, 1)
+        req = urllib.request.Request(
+            pinned_url, data=data,
+            headers={"Content-Type": "application/json", "Host": parsed.hostname},
+        )
         urllib.request.urlopen(req, timeout=10)
     except Exception:
         pass  # Best-effort delivery
@@ -714,9 +732,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         callback_url = data.get("callback_url", "")
 
         # Validate callback URL before accepting
-        if callback_url and not _is_safe_callback_url(callback_url):
-            self.send_json(400, {"error": "callback_url failed SSRF check (must be HTTPS, no private IPs)"})
-            return
+        if callback_url:
+            safe, reason = _is_safe_callback_url(callback_url)
+            if not safe:
+                self.send_json(400, {"error": f"callback_url failed SSRF check ({reason}): must be HTTPS, no private IPs"})
+                return
 
         # Write to tasks/ for sutando-core to pick up
         task_id = f"task-{int(datetime.now().timestamp() * 1000)}"
