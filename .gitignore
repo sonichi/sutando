@@ -43,6 +43,7 @@ tests/*
 !tests/*.test.ts
 !tests/*.test.py
 skills/personal-*/
+skills/post-preview/
 tests/security/*.md
 !tests/security/*.md.example
 skills/schedule-crons/crons.json
