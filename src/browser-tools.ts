@@ -458,7 +458,6 @@ export const clickTool: ToolDefinition = {
 // Re-export recording/video tools from recording-tools
 export {
 	scrollAndDescribeTool,
-	openFileTool,
 	playVideoTool,
 	resumeVideoTool,
 	replayVideoTool,

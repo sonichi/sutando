@@ -5,8 +5,8 @@
  * Add new tools here and they auto-appear in both voice and phone agents.
  */
 
-import { execSync } from 'node:child_process';
-import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync } from 'node:fs';
+import { execSync, execFileSync } from 'node:child_process';
+import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
@@ -14,8 +14,48 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
 // Re-export recording/screen/browser tools from browser-tools
-export { describeScreenTool, clickTool, scrollAndDescribeTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool } from './browser-tools.js';
-import { describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool } from './browser-tools.js';
+export { describeScreenTool, clickTool, scrollAndDescribeTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool } from './browser-tools.js';
+import { describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool } from './browser-tools.js';
+
+// --- File-open tool (moved out of recording-tools as part of recording decoupling) ---
+
+export const openFileTool: ToolDefinition = {
+	name: 'open_file',
+	description:
+		'Open a file with the default macOS app. ALWAYS pass an absolute `path`. ' +
+		'Use for: "open the file", "open that", "can you open it". ' +
+		'If the user says "open the log" or similar, ASK which log they mean (voice-agent, discord-bridge, etc.) — do NOT guess. ' +
+		'Known files: "diagnostic tracker" or "diagnostics" = /tmp/phone-diagnostics-tracker.html, ' +
+		'"voice diagnostics" = /tmp/voice-diagnostics-tracker.html.',
+	parameters: z.object({
+		path: z.string().describe('Absolute file path to open.'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { path } = args as { path: string };
+		console.log(`${ts()} [OpenFile] called (path=${path || 'none'})`);
+		try {
+			if (!path) return { error: 'No path provided. Pass an absolute file path.' };
+			const filePath = path.replace(/^~/, process.env.HOME || '');
+			if (!existsSync(filePath)) {
+				console.log(`${ts()} [OpenFile] path "${filePath}" does not exist`);
+				return { error: `File not found: ${filePath}.` };
+			}
+			// execFileSync — no shell interpolation of caller-controlled filePath
+			// (same CodeQL js/command-line-injection class as #27).
+			execFileSync('open', [filePath], { timeout: 5_000 });
+			const size = statSync(filePath).size;
+			console.log(`${ts()} [OpenFile] opened ${filePath} (${(size / 1024 / 1024).toFixed(1)}MB)`);
+			return {
+				status: 'opened',
+				path: filePath,
+				size_mb: +(size / 1024 / 1024).toFixed(1),
+			};
+		} catch (err) {
+			return { error: `open_file failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
 
 // Re-export meeting tools from meeting-tools
 export { summonTool, dismissTool, joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool } from './meeting-tools.js';

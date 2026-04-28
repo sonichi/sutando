@@ -446,76 +446,7 @@ export const scrollAndDescribeTool: ToolDefinition = {
 	},
 };
 
-// Video playback tools — split from a single polymorphic playRecordingTool into 6
-// single-purpose tools. Gemini selects more reliably with narrow descriptions than
-// with one tool that has an "action" enum. The old tool caused persistent confusion
-// between "open" and "play" (42% of calls in diagnostics had wrong action selection).
-export const openFileTool: ToolDefinition = {
-	name: 'open_file',
-	description:
-		'Open a file with the default macOS app. ALWAYS pass a `path` — get it from the recording tool\'s return value or ask the user. ' +
-		'Use for: "open the video/recording", "open the file", "open that", "can you open it". ' +
-		'If the user says "open the log" or similar, ASK which log they mean (voice-agent, discord-bridge, etc.) — do NOT default to a recording. ' +
-		'Do NOT call play_video after this — wait for user to explicitly say "play". ' +
-		'Known files: "diagnostic tracker" or "diagnostics" = /tmp/phone-diagnostics-tracker.html, ' +
-		'"voice diagnostics" = /tmp/voice-diagnostics-tracker.html. ' +
-		'If you need to find the latest recording but lost the path, pass find_recording=true.',
-	parameters: z.object({
-		path: z.string().optional().describe('File path to open. Get this from the recording tool result. Use known file aliases for diagnostic tracker etc.'),
-		find_recording: z.boolean().optional().describe('If true and no path given, find and open the latest screen recording. Only use as a fallback when you lost the recording path.'),
-	}),
-	execution: 'inline',
-	async execute(args) {
-		const { path: filePath, find_recording } = args as { path?: string; find_recording?: boolean };
-		console.log(`${ts()} [OpenFile] called (path=${filePath || 'none'}, find_latest=${find_recording || false})`);
-		demoStateRef.value = 'idle';
-		try {
-			let recPath = filePath ? filePath.replace(/^~/, process.env.HOME || '') : null;
-			if (recPath && !existsSync(recPath)) {
-				console.log(`${ts()} [OpenFile] path "${recPath}" does not exist`);
-				return { error: `File not found: ${recPath}. Ask the user for the correct path or use "work" to locate it.` };
-			}
-			// Only find latest recording if explicitly requested — not as a silent default.
-			// The recording tool should have already told you the path.
-			if (!recPath && find_recording) {
-				recPath = findRecording();
-			}
-			if (!recPath) {
-				return { error: 'No path provided. Pass the file path from the recording tool result, or set find_recording=true to search.' };
-			}
-			if (!isReadableFile(recPath)) {
-				return { error: `File not readable or too small: ${recPath}. It may still be writing — try again in a few seconds.` };
-			}
-			if (recPath.includes('sutando-recording')) {
-				writeFileSync('/tmp/sutando-playback-path', recPath);
-			}
-			// execFileSync — no shell interpolation of caller-controlled recPath
-			// (same CodeQL js/command-line-injection class as #27).
-			execFileSync('open', [recPath], { timeout: 5_000 });
-			try { execSync(`osascript -e 'tell application "QuickTime Player" to activate'`, { timeout: 3_000 }); } catch {}
-			const size = statSync(recPath).size;
-			let duration_seconds: number | null = null;
-			try {
-				const dur = execFileSync(
-					'/opt/homebrew/bin/ffprobe',
-					['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', recPath],
-					{ timeout: 5_000 }
-				).toString().trim();
-				duration_seconds = Math.round(parseFloat(dur));
-			} catch {}
-			console.log(`${ts()} [OpenFile] opened ${recPath} (${(size / 1024 / 1024).toFixed(1)}MB, ${duration_seconds ?? '?'}s)`);
-			return {
-				status: 'opened',
-				path: recPath,
-				size_mb: +(size / 1024 / 1024).toFixed(1),
-				duration_seconds,
-				instruction: 'File opened. When user says play, call play_video.',
-			};
-		} catch (err) {
-			return { error: `open_file failed: ${err instanceof Error ? err.message : err}` };
-		}
-	},
-};
+// openFileTool moved to ./inline-tools.ts — generic file open is not recording-specific.
 
 /** Helper: start QuickTime playback + stream audio to phone */
 async function startPlayback(seekSec: number = 0): Promise<{ status: string; path?: string; error?: string; instruction?: string }> {
@@ -715,9 +646,17 @@ export const screenRecordTool: ToolDefinition = {
 					try {
 						const stopResult = execSync('python3 skills/screen-record/scripts/record.py stop', { timeout: 10_000 }).toString().trim();
 						const stopParsed = JSON.parse(stopResult);
-						if (liveTranscriptRecordingStart > 0 && stopParsed.path && stopParsed.exists) {
+						if (stopParsed.path && stopParsed.exists) {
 							const narrated = stopParsed.path.replace('.mov', '-narrated.mov');
-							burnLiveTranscriptSubtitles(isReadableFile(narrated) ? narrated : stopParsed.path);
+							const burnedSubtitled = liveTranscriptRecordingStart > 0
+								? burnLiveTranscriptSubtitles(isReadableFile(narrated) ? narrated : stopParsed.path)
+								: null;
+							// Persist playback-path so play_video can find this recording after auto-stop,
+							// without depending on open_file (which is now generic / not recording-specific).
+							const recommended = burnedSubtitled || (isReadableFile(narrated) ? narrated : stopParsed.path);
+							if (recommended) {
+								try { writeFileSync('/tmp/sutando-playback-path', recommended); } catch {}
+							}
 						}
 					} catch {}
 					demoStateRef.value = 'done';
@@ -731,6 +670,7 @@ export const screenRecordTool: ToolDefinition = {
 				// Build explicit file list so the model knows exactly what's available.
 				// The model should pass the recommended path to open_file — no findRecording guessing.
 				const files: { raw?: string; narrated?: string; subtitled?: string; recommended?: string } = {};
+				let duration_seconds: number | null = null;
 				if (parsed.path && parsed.exists) {
 					files.raw = parsed.path;
 					const narrated = parsed.path.replace('.mov', '-narrated.mov');
@@ -745,14 +685,31 @@ export const screenRecordTool: ToolDefinition = {
 					}
 					// Recommend best available: subtitled > narrated > raw
 					files.recommended = files.subtitled || files.narrated || files.raw;
+					// Persist playback-path so play_video knows what to play after the model
+					// calls open_file. Used to live in openFileTool; moved here so open_file can
+					// stay generic / decoupled from recording.
+					if (files.recommended) {
+						try { writeFileSync('/tmp/sutando-playback-path', files.recommended); } catch {}
+					}
+					// Probe duration once, here, so we can report it back to the model and
+					// avoid repeating the ffprobe call in open_file (which is now generic).
+					try {
+						const dur = execFileSync(
+							'/opt/homebrew/bin/ffprobe',
+							['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', files.recommended!],
+							{ timeout: 5_000 }
+						).toString().trim();
+						duration_seconds = Math.round(parseFloat(dur));
+					} catch {}
 				}
 				liveTranscriptRecordingStart = 0;
-				console.log(`${ts()} [ScreenRecord] ${action}: ${JSON.stringify({ ...parsed, files })}`);
+				console.log(`${ts()} [ScreenRecord] ${action}: ${JSON.stringify({ ...parsed, files, duration_seconds })}`);
 				return {
 					...parsed,
 					files,
+					duration_seconds,
 					instruction: files.recommended
-						? `Recording stopped. Available files: ${Object.entries(files).map(([k,v]) => `${k}=${v}`).join(', ')}. To open, call open_file with path="${files.recommended}". If user wants a different version, use the appropriate path from the list.`
+						? `Recording stopped (${duration_seconds ?? '?'}s). Available files: ${Object.entries(files).map(([k,v]) => `${k}=${v}`).join(', ')}. To open, call open_file with path="${files.recommended}". If user wants a different version, use the appropriate path from the list. When user says play, call play_video.`
 						: 'Recording stopped but no files found.',
 				};
 			}
