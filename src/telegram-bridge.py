@@ -48,6 +48,10 @@ def _is_path_sendable(fpath: str) -> bool:
         if real.startswith(prefix):
             return True
     return False
+
+
+# --- Config loading (independent of _is_path_sendable above) ---
+
 try:
     from dotenv import load_dotenv
     load_dotenv(REPO / ".env")
