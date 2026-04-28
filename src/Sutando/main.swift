@@ -844,6 +844,76 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Context Drop Logic
 
+    /// Capture frontmost-app context to enrich the dropped task with what the user was looking at.
+    /// Returns three fields: app name, frontmost-window title (via Accessibility API), and Chrome
+    /// active-tab URL when Chrome is the target. Same skip-Zoom heuristic as the fullscreen tool —
+    /// during screen share, Zoom can be frontmost while the user is interacting with another window;
+    /// we walk back to the next non-Zoom visible app so the captured context matches user intent.
+    private func getFrontmostContext() -> (app: String?, windowTitle: String?, chromeURL: String?) {
+        var targetApp: NSRunningApplication? = NSWorkspace.shared.frontmostApplication
+        let frontName = targetApp?.localizedName?.lowercased() ?? ""
+        if frontName.contains("zoom") {
+            // Skip Zoom; pick the next visible regular (non-background) app.
+            let candidates = NSWorkspace.shared.runningApplications.filter { app in
+                app.activationPolicy == .regular &&
+                !(app.localizedName?.lowercased().contains("zoom") ?? false) &&
+                app.localizedName != nil
+            }
+            // Order by launch date descending — the user's most recent non-Zoom app is the best guess.
+            targetApp = candidates.max(by: { ($0.launchDate ?? Date.distantPast) < ($1.launchDate ?? Date.distantPast) })
+        }
+        let appName = targetApp?.localizedName
+
+        // Window title via Accessibility API. Requires PID; cheap if granted, silent fail otherwise.
+        var windowTitle: String? = nil
+        if let pid = targetApp?.processIdentifier {
+            let axApp = AXUIElementCreateApplication(pid)
+            var focusedRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, &focusedRef) == .success,
+               let axWindow = focusedRef {
+                var titleRef: CFTypeRef?
+                if AXUIElementCopyAttributeValue(axWindow as! AXUIElement, kAXTitleAttribute as CFString, &titleRef) == .success,
+                   let title = titleRef as? String, !title.isEmpty {
+                    windowTitle = title
+                }
+            }
+        }
+
+        // Chrome active-tab URL via AppleScript — only when Chrome is the target. ~200ms.
+        var chromeURL: String? = nil
+        if appName == "Google Chrome" {
+            let script = "tell application \"Google Chrome\" to return URL of active tab of front window"
+            let task = Process()
+            task.launchPath = "/usr/bin/osascript"
+            task.arguments = ["-e", script]
+            let pipe = Pipe()
+            task.standardOutput = pipe
+            task.standardError = Pipe()
+            do {
+                try task.run()
+                task.waitUntilExit()
+                if task.terminationStatus == 0 {
+                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                    let url = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if let url = url, !url.isEmpty { chromeURL = url }
+                }
+            } catch {}
+        }
+
+        return (appName, windowTitle, chromeURL)
+    }
+
+    /// Format the frontmost-context fields as YAML-style header lines for the task file.
+    /// Empty if no fields captured. Lines are intentionally outside the `---` separator so
+    /// downstream readers can grep them as task metadata, not message body.
+    private func formatFrontmostContext(_ ctx: (app: String?, windowTitle: String?, chromeURL: String?)) -> String {
+        var lines: [String] = []
+        if let a = ctx.app { lines.append("top_app: \(a)") }
+        if let w = ctx.windowTitle { lines.append("top_window_title: \(w)") }
+        if let u = ctx.chromeURL { lines.append("top_url: \(u)") }
+        return lines.isEmpty ? "" : lines.joined(separator: "\n") + "\n"
+    }
+
     @objc func dropContext() {
         // Debounce: ignore if less than 1 second since last drop
         let now = Date()
@@ -860,6 +930,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let epoch = Int(Date().timeIntervalSince1970 * 1000)
         let dropImage = tasksDir + "/image-\(epoch).png"
 
+        // Capture frontmost-app context once, before the type-specific branches. Adds top_app /
+        // top_window_title / top_url (Chrome only) header lines so the core agent knows what the
+        // user was looking at when they dropped.
+        let ctx = getFrontmostContext()
+        let ctxHeader = formatFrontmostContext(ctx)
+
         // 1. Check Finder selection (only if Finder is frontmost)
         if let frontApp = NSWorkspace.shared.frontmostApplication,
            frontApp.bundleIdentifier == "com.apple.finder" {
@@ -868,7 +944,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 timestamp: \(timestamp)
                 type: file
                 path: \(finderFile)
-                ---
+                \(ctxHeader)---
                 [File selected in Finder: \(finderFile)]
                 """
                 appendLog(logFile, "[\(timestamp)] Dropped: file (\(finderFile))")
@@ -886,7 +962,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 timestamp: \(timestamp)
                 type: image
                 path: \(dropImage)
-                ---
+                \(ctxHeader)---
                 [Image dropped from clipboard]
                 """
                 appendLog(logFile, "[\(timestamp)] Dropped: image (\(imageData.count) bytes)")
@@ -906,7 +982,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 timestamp: \(timestamp)
                 type: image
                 path: \(dropImage)
-                ---
+                \(ctxHeader)---
                 [Image dropped from clipboard]
                 """
                 appendLog(logFile, "[\(timestamp)] Dropped: image (\(pngData.count) bytes)")
@@ -921,7 +997,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let content = """
             timestamp: \(timestamp)
             type: text
-            ---
+            \(ctxHeader)---
             \(selected)
             """
             appendLog(logFile, "[\(timestamp)] Dropped: \(selected.count) chars")
@@ -938,7 +1014,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 let content = """
                 timestamp: \(timestamp)
                 type: text
-                ---
+                \(ctxHeader)---
                 \(text)
                 """
                 appendLog(logFile, "[\(timestamp)] Dropped: \(text.count) chars")
