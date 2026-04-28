@@ -463,73 +463,51 @@ end tell`;
 	},
 };
 
-// Toggle fullscreen on whatever the user is currently viewing.
-// Branches: if a QuickTime video is open → fullscreen QuickTime; else slide deck.
+// Toggle fullscreen on whatever the user is currently looking at — generic.
+// Picks the frontmost app, skips Zoom (which steals focus during screen share),
+// and routes the keystroke directly to that app's process so the focus race
+// during screen-share doesn't matter. Chrome gets reveal.js 'f'; everything
+// else gets the macOS-system fullscreen Cmd+Ctrl+F.
 export const fullscreenTool: ToolDefinition = {
 	name: 'fullscreen',
 	description:
-		'Toggle fullscreen on whatever the user is currently viewing. If a QuickTime video is open it fullscreens QuickTime; otherwise it fullscreens the slide deck. Use when user says "fullscreen", "enter fullscreen", "exit fullscreen", "make it full screen". DO NOT call open_file with fullscreen=true to enter fullscreen on an already-open video — call this tool instead.',
+		'Toggle fullscreen on whatever app the user is currently looking at — generic, works for the slide deck (Chrome) AND any other window (QuickTime, VSCode, Slack, etc). Skips Zoom when it has focus during screen-share. Use when user says "fullscreen", "enter fullscreen", "exit fullscreen", "make it full screen", "full screen". DO NOT call open_file with fullscreen=true to enter fullscreen on an already-open video — call this tool instead.',
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
 		try {
-			// Detect whether QuickTime is showing a video. If so, "fullscreen"
-			// means that video, not the slide deck.
-			// Use execFileSync (no shell) to avoid apostrophes-in-comments breaking
-			// shell single-quoting on the AppleScript payload.
-			const qtDetectScript = `
-tell application "QuickTime Player"
-	if it is running then
-		return (count of documents)
-	else
-		return 0
-	end if
-end tell`;
-			let qtHasDoc = false;
-			try {
-				const out = execFileSync('/usr/bin/osascript', ['-e', qtDetectScript], { timeout: 2_000 }).toString().trim();
-				qtHasDoc = parseInt(out, 10) > 0;
-			} catch {}
-
-			if (qtHasDoc) {
-				const qtScript = `
-tell application "QuickTime Player" to activate
-delay 0.3
+			const script = `
 tell application "System Events"
-	tell process "QuickTime Player"
-		set frontmost to true
-		keystroke "f" using {command down, control down}
-	end tell
-end tell`;
-				execFileSync('/usr/bin/osascript', ['-e', qtScript], { timeout: 5_000 });
-				console.log(`${ts()} [Fullscreen] Toggled QuickTime`);
-				return { status: 'toggled', target: 'quicktime' };
-			}
-
-			const slidesScript = `
-tell application "Google Chrome"
-	activate
-	repeat with w in windows
-		set tabList to tabs of w
-		repeat with i from 1 to count of tabList
-			if URL of item i of tabList contains "index-sutando" or URL of item i of tabList contains "index-bodhi" or URL of item i of tabList contains "localhost:8888" or URL of item i of tabList contains "localhost:7877" or URL of item i of tabList contains "iclr-slides" then
-				set active tab index of w to i
-				set index of w to 1
-				exit repeat
-			end if
-		end repeat
-	end repeat
-end tell
-delay 0.3
-tell application "System Events"
+	-- Find the user's actual focus target. During Zoom screen share, Zoom's
+	-- floating control bar can be the frontmost UI even when the user is
+	-- interacting with a different window — skip Zoom and pick the next
+	-- visible app the user was using.
 	set frontApp to name of first application process whose frontmost is true
+	if frontApp contains "zoom" then
+		set candidates to name of every application process whose visible is true and (name does not contain "zoom") and background only is false
+		if (count of candidates) > 0 then
+			set frontApp to item 1 of candidates
+		end if
+	end if
+end tell
+tell application frontApp to activate
+delay 0.2
+-- Route the keystroke through the target process explicitly. tell process
+-- <name> bypasses the focus race that defeats a plain System Events
+-- keystroke when Zoom or another overlay app holds keyboard focus.
+tell application "System Events"
 	tell process frontApp
-		keystroke "f"
+		if name is "Google Chrome" then
+			keystroke "f"
+		else
+			keystroke "f" using {command down, control down}
+		end if
 	end tell
-end tell`;
-			execFileSync('/usr/bin/osascript', ['-e', slidesScript], { timeout: 5_000 });
-			console.log(`${ts()} [Fullscreen] Toggled slides`);
-			return { status: 'toggled', target: 'slides' };
+end tell
+return frontApp`;
+			const target = execFileSync('/usr/bin/osascript', ['-e', script], { timeout: 5_000 }).toString().trim();
+			console.log(`${ts()} [Fullscreen] Toggled ${target}`);
+			return { status: 'toggled', target };
 		} catch (err) {
 			return { error: `Fullscreen toggle failed: ${err instanceof Error ? err.message : err}` };
 		}
