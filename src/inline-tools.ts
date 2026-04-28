@@ -434,20 +434,24 @@ export const slideControlTool: ToolDefinition = {
 	async execute(args) {
 		const { action, slideNumber } = args as { action: 'next' | 'previous' | 'goto'; slideNumber?: number };
 		try {
-			// All slide navigation uses DOM manipulation for reliability
+			// All slide navigation uses DOM manipulation for reliability.
+			// IMPORTANT: address slides by VISUAL POSITION (1-indexed) — querySelectorAll('.slide')[N-1] —
+			// NOT by id="s"+N. The deck's slide IDs are non-contiguous (s1, s1b, s2, s2b, s3, s4, s5, s6,
+			// s65, s7, s8 — 11 slides where the visual-7th is s5, not s7). Using id="s"+N silently misroutes
+			// every "go to slide N" cue once any inter-slide (s1b/s2b/s65) is present.
 			let js: string;
 			if (action === 'goto' && slideNumber) {
-				js = `var ss=document.querySelectorAll(\\".slide\\");for(var j=0;j<ss.length;j++){ss[j].classList.remove(\\"active\\")};document.getElementById(\\"s${slideNumber}\\").classList.add(\\"active\\");document.getElementById(\\"cur\\").textContent=\\"${slideNumber}\\"`;
+				js = `var ss=document.querySelectorAll(\\".slide\\");for(var j=0;j<ss.length;j++){ss[j].classList.remove(\\"active\\")};var idx=${slideNumber}-1;if(idx>=0&&idx<ss.length){ss[idx].classList.add(\\"active\\");document.getElementById(\\"cur\\").textContent=String(${slideNumber})}`;
 			} else {
-				// next/previous: read current slide number, compute target, set it
+				// next/previous: read current slide number, compute target visual position, set it.
 				const dir = action === 'next' ? 1 : -1;
-				js = `var cur=parseInt(document.getElementById(\\"cur\\").textContent)||1;var total=document.querySelectorAll(\\".slide\\").length;var next=((cur-1+${dir}+total)%total)+1;var ss=document.querySelectorAll(\\".slide\\");for(var j=0;j<ss.length;j++){ss[j].classList.remove(\\"active\\")};document.getElementById(\\"s\\"+next).classList.add(\\"active\\");document.getElementById(\\"cur\\").textContent=String(next)`;
+				js = `var cur=parseInt(document.getElementById(\\"cur\\").textContent)||1;var ss=document.querySelectorAll(\\".slide\\");var total=ss.length;var next=((cur-1+${dir}+total)%total)+1;for(var j=0;j<ss.length;j++){ss[j].classList.remove(\\"active\\")};ss[next-1].classList.add(\\"active\\");document.getElementById(\\"cur\\").textContent=String(next)`;
 			}
 			const script = `tell application "Google Chrome"
 	repeat with w in windows
 		set tabList to tabs of w
 		repeat with i from 1 to count of tabList
-			if URL of item i of tabList contains "index-sutando" or URL of item i of tabList contains "localhost:8888" then
+			if URL of item i of tabList contains "index-sutando" or URL of item i of tabList contains "localhost:8888" or URL of item i of tabList contains "localhost:7877" or URL of item i of tabList contains "iclr-slides" then
 				tell item i of tabList to execute javascript "${js}"
 				return "done"
 			end if
