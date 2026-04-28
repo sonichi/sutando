@@ -512,7 +512,7 @@ tell application "Google Chrome"
 	repeat with w in windows
 		set tabList to tabs of w
 		repeat with i from 1 to count of tabList
-			if URL of item i of tabList contains "index-sutando" or URL of item i of tabList contains "index-bodhi" or URL of item i of tabList contains "localhost:8888" then
+			if URL of item i of tabList contains "index-sutando" or URL of item i of tabList contains "index-bodhi" or URL of item i of tabList contains "localhost:8888" or URL of item i of tabList contains "localhost:7877" or URL of item i of tabList contains "iclr-slides" then
 				set active tab index of w to i
 				set index of w to 1
 				exit repeat
