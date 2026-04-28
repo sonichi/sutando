@@ -17,7 +17,10 @@ Usage:
   python3 src/github-webhook.py --port 7846  # custom port
 """
 
+import hashlib
+import hmac
 import json
+import os
 import sys
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -26,6 +29,33 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 TASKS_DIR = REPO / "tasks"
 PORT = int(sys.argv[sys.argv.index("--port") + 1]) if "--port" in sys.argv else 7847
+
+# GitHub webhook secret for payload signature verification.
+# Set GITHUB_WEBHOOK_SECRET in your .env to match the secret configured in
+# GitHub repo Settings → Webhooks → (your webhook) → Secret.
+# If not set, all webhook payloads are rejected (fail-closed).
+WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
+
+
+def verify_github_signature(body: bytes, signature_header: str) -> bool:
+    """Verify X-Hub-Signature-256 from GitHub webhook payload.
+
+    GitHub signs every webhook delivery with HMAC-SHA256 using the shared
+    webhook secret.  See:
+    https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries
+
+    Returns True if the signature is valid, False otherwise.
+    """
+    if not WEBHOOK_SECRET:
+        return False
+    if not signature_header:
+        return False
+    if not signature_header.startswith("sha256="):
+        return False
+    expected = "sha256=" + hmac.new(
+        WEBHOOK_SECRET.encode("utf-8"), body, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature_header)
 
 # Events we care about and how to summarize them
 def format_event(event_type: str, payload: dict):
@@ -65,6 +95,17 @@ class WebhookHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
+
+        # Verify webhook signature — reject unauthenticated payloads
+        signature = self.headers.get("X-Hub-Signature-256", "")
+        if not verify_github_signature(body, signature):
+            self.send_response(403)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "invalid signature"}).encode())
+            print(f"[{time.strftime('%H:%M:%S')}] REJECTED: invalid or missing webhook signature")
+            return
+
         event_type = self.headers.get("X-GitHub-Event", "unknown")
 
         try:
