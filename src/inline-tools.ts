@@ -463,11 +463,11 @@ end tell`;
 	},
 };
 
-// Toggle fullscreen on whatever the user is currently looking at — generic.
+// Toggle fullscreen on whatever app the user is currently looking at — generic.
 // Picks the frontmost app, skips Zoom (which steals focus during screen share),
-// and routes the keystroke directly to that app's process so the focus race
-// during screen-share doesn't matter. Chrome gets reveal.js 'f'; everything
-// else gets the macOS-system fullscreen Cmd+Ctrl+F.
+// and routes Cmd+Ctrl+F (macOS standard fullscreen) directly to that app's
+// process. Process-explicit routing bypasses the keystroke focus race that
+// otherwise defeats fullscreen during a Zoom screen-share.
 export const fullscreenTool: ToolDefinition = {
 	name: 'fullscreen',
 	description:
@@ -492,16 +492,14 @@ tell application "System Events"
 end tell
 tell application frontApp to activate
 delay 0.2
--- Route the keystroke through the target process explicitly. tell process
--- <name> bypasses the focus race that defeats a plain System Events
--- keystroke when Zoom or another overlay app holds keyboard focus.
+-- Cmd+Ctrl+F is the macOS standard fullscreen keystroke and works for every
+-- native + browser window (QuickTime, Chrome, VSCode, Slack, Mail, etc).
+-- Route through the target process explicitly — that bypasses the focus
+-- race that defeats a plain System Events keystroke when Zoom or another
+-- overlay app holds keyboard focus through the activate.
 tell application "System Events"
 	tell process frontApp
-		if name is "Google Chrome" then
-			keystroke "f"
-		else
-			keystroke "f" using {command down, control down}
-		end if
+		keystroke "f" using {command down, control down}
 	end tell
 end tell
 return frontApp`;
