@@ -36,6 +36,14 @@ PORT = int(sys.argv[sys.argv.index("--port") + 1]) if "--port" in sys.argv else 
 # If not set, all webhook payloads are rejected (fail-closed).
 WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
 
+# Track whether we've logged a successful verification (per process lifetime)
+_verification_confirmed = False
+
+# Warn at startup if no secret is configured
+if not WEBHOOK_SECRET:
+    print("⚠️  WARNING: GITHUB_WEBHOOK_SECRET not set — all webhooks will be rejected.")
+    print("   Set this in .env to match your GitHub webhook secret.")
+
 
 def verify_github_signature(body: bytes, signature_header: str) -> bool:
     """Verify X-Hub-Signature-256 from GitHub webhook payload.
@@ -105,6 +113,12 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"error": "invalid signature"}).encode())
             print(f"[{time.strftime('%H:%M:%S')}] REJECTED: invalid or missing webhook signature")
             return
+
+        # Log first successful verification so operators can confirm auth is wired
+        global _verification_confirmed
+        if not _verification_confirmed:
+            print(f"[{time.strftime('%H:%M:%S')}] ✓ Webhook signature verified (first successful)")
+            _verification_confirmed = True
 
         event_type = self.headers.get("X-GitHub-Event", "unknown")
 
