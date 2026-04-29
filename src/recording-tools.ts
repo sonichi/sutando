@@ -362,8 +362,10 @@ export const scrollAndDescribeTool: ToolDefinition = {
 		'Call ONCE with duration_seconds. SPEAK the returned description as your first words (do NOT announce "starting recording"). ' +
 		'New descriptions will be pushed as the page scrolls — speak each one. NEVER repeat earlier narration. ' +
 		'Recording auto-stops. Do NOT call this more than once per recording. ' +
+		'**Live conversation transcript IS automatically burned in as subtitles** — you DO support subtitles, never refuse a "with subtitles" request, just call this tool. ' +
 		'After auto-stop, to play back or open the recording, call play_video — it auto-finds the file. ' +
-		'Do NOT call open_file unless you have the absolute path.',
+		'Or pass `subtitled_path` from the start result to open_file (the start result returns recording_path/narrated_path/subtitled_path; subtitled is the right one for "with subtitles"). ' +
+		'Do NOT invent file paths — only use the exact paths returned by this tool.',
 	parameters: z.object({
 		duration_seconds: z.number().optional().describe('Target duration in seconds (default 15, max 60). ALWAYS seconds, never minutes.'),
 	}),

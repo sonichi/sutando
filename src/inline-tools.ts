@@ -39,11 +39,11 @@ export const openFileTool: ToolDefinition = {
 		const { path, fullscreen } = args as { path: string; fullscreen?: boolean };
 		console.log(`${ts()} [OpenFile] called (path=${path || 'none'}, fullscreen=${fullscreen || false})`);
 		try {
-			if (!path) return { error: 'No path provided. Pass an absolute file path.' };
+			if (!path) return { error: 'No path provided. Pass an absolute file path. (For the most recent recording, call play_video — it auto-finds the file.)' };
 			const filePath = path.replace(/^~/, process.env.HOME || '');
 			if (!existsSync(filePath)) {
 				console.log(`${ts()} [OpenFile] path "${filePath}" does not exist`);
-				return { error: `File not found: ${filePath}.` };
+				return { error: `File not found: ${filePath}. Do not invent paths — use the exact path returned by the tool that produced the file (e.g. record_screen_with_narration returns subtitled_path/narrated_path/recording_path). For the most recent recording without a known path, call play_video instead.` };
 			}
 			// Runtime guard: if `fullscreen=true` was requested AND QuickTime
 			// already has a video open, the user almost certainly meant
