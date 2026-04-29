@@ -396,6 +396,7 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			let recordingPath = '';
 			try { recordingPath = JSON.parse(startRaw).path || ''; } catch {}
 			const narratedPath = recordingPath ? recordingPath.replace('.mov', '-narrated.mov') : '';
+			const subtitledPath = recordingPath ? recordingPath.replace('.mov', '-narrated-subtitled.mov') : '';
 			// Set subtitle baseline — pick whichever transcript was updated more recently.
 			// Voice agent writes to -voice.txt; phone conversation-server writes to -CA{sid}.txt via symlink.
 			const voiceTranscript = '/tmp/sutando-live-transcript-voice.txt';
@@ -485,7 +486,8 @@ export const scrollAndDescribeTool: ToolDefinition = {
 				first_description: firstDesc,
 				recording_path: recordingPath,
 				narrated_path: narratedPath,
-				message: `Recording started. IMMEDIATELY speak this narration — NO filler, NO "okay", NO "should I": "${firstDesc}". Auto-stops in ${duration_seconds}s. After auto-stop, the file will be at ${narratedPath || recordingPath} — pass that exact path to open_file when the user asks to open the recording.`,
+				subtitled_path: subtitledPath,
+				message: `Recording started. IMMEDIATELY speak this narration — NO filler, NO "okay", NO "should I": "${firstDesc}". Auto-stops in ${duration_seconds}s. After auto-stop, three files will exist (best→worst): subtitled=${subtitledPath}, narrated=${narratedPath}, raw=${recordingPath}. When the user asks to open "the recording" or "the recording with subtitles", pass subtitled_path to open_file. Only fall back to narrated_path if subtitled doesn't exist (rare — subtitle burn failure on missing libass).`,
 			};
 		} catch (err) {
 			return { error: `record_screen_with_narration failed: ${err instanceof Error ? err.message : err}` };
