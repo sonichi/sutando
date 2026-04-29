@@ -47,19 +47,18 @@ export const summonTool: ToolDefinition = {
 			if (alreadyInMeeting) {
 				console.log(`${ts()} [Summon] Already in a Zoom meeting — skipping join, going straight to screen share`);
 			} else {
-				// Use the running Zoom app if available — avoids login prompt from zoommtg:// protocol
-				const zoomRunning = (() => { try { execSync('pgrep -f "zoom.us"', { timeout: 2_000 }); return true; } catch { return false; } })();
-
-				if (zoomRunning) {
-					console.log(`${ts()} [Summon] Zoom running — joining via app`);
-					const joinUrl = `https://zoom.us/j/${cleanId}${pwd ? '?pwd=' + pwd : ''}`;
-					execSync(`open "${joinUrl}"`, { timeout: 10_000 });
-				} else {
-					console.log(`${ts()} [Summon] Launching Zoom`);
-					let zoomUrl = `zoommtg://zoom.us/join?confno=${cleanId}`;
-					if (pwd) zoomUrl += `&pwd=${pwd}`;
-					execSync(`open "${zoomUrl}"`, { timeout: 10_000 });
-				}
+				// Always use the zoommtg:// deeplink — direct to the Zoom app. The
+				// HTTPS https://zoom.us/j/... URL is unreliable on Zoom Workplace
+				// (Studio): it routes through the browser and the in-app prompt
+				// doesn't always fire, leaving Zoom on the home dashboard while the
+				// rest of summonTool falsely treats "any zoom window" as ready and
+				// fires Share Screen into a context that can't honor it. Fixed
+				// 2026-04-29 after a phone-summon test where the meeting never
+				// actually opened on Studio.
+				console.log(`${ts()} [Summon] Joining via zoommtg:// deeplink`);
+				let zoomUrl = `zoommtg://zoom.us/join?confno=${cleanId}`;
+				if (pwd) zoomUrl += `&pwd=${pwd}`;
+				execSync(`open "${zoomUrl}"`, { timeout: 10_000 });
 
 				// Wait for Zoom preview window, then click Join button
 				console.log(`${ts()} [Summon] Waiting for Zoom preview window...`);
@@ -165,13 +164,16 @@ set volume output volume 0`;
 			// Audio dialog handling removed — it causes screen share drops.
 			// Phone audio is handled by the Twilio connection, not by Zoom's audio dialog.
 
-			// Wait for Zoom meeting window to appear (adaptive, up to 30s)
+			// Wait for Zoom meeting window to appear (adaptive, up to 30s).
+			// Must check window NAMES, not just count — the Zoom Workplace home
+			// dashboard is a window too, and treating it as "ready" caused the
+			// 2026-04-29 share-failed-silently regression on Studio.
 			console.log(`${ts()} [Summon] Waiting for Zoom meeting window...`);
 			let zoomReady = false;
 			for (let i = 0; i < 30; i++) {
 				try {
-					const check = execSync(`osascript -e 'tell application "System Events" to return (count of windows of process "zoom.us")'`, { timeout: 3_000 }).toString().trim();
-					if (parseInt(check) > 0) { zoomReady = true; break; }
+					const winNames = execSync(`osascript -e 'tell application "System Events" to return name of every window of process "zoom.us"'`, { timeout: 3_000 }).toString().trim();
+					if (winNames.includes('Zoom Meeting') || winNames.includes('zoom share') || winNames.includes('floating video')) { zoomReady = true; break; }
 				} catch {}
 				await new Promise(r => setTimeout(r, 1000));
 			}
