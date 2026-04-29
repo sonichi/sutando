@@ -423,7 +423,24 @@ function getPresenterStateMarker(): string {
 		const out = execSyncTop('curl -s --max-time 1 http://localhost:7877/presenter', { timeout: 2_000 }).toString();
 		const json = JSON.parse(out);
 		if (json && json.active === true) {
-			return ' [System: PRESENTER MODE IS CURRENTLY ACTIVE — apply the CO-PRESENTER protocol from your context to every cue this session: highlight_slide(topic) FIRST, then narrate from voice-context.txt. Do NOT route slide-topic phrases to work.]';
+			// Strong, imperative wording. The earlier softer version ("apply the
+			// CO-PRESENTER protocol... Do NOT route...") was getting drowned out
+			// by the work-tool description and Gemini routed Q-cues to work
+			// anyway. The capitalized MUST + BANNED + the explicit fallthrough
+			// rule reads more like a tool-routing constraint than a hint.
+			return [
+				'',
+				'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+				'PRESENTER MODE IS ACTIVE.',
+				'For every user utterance this session: you MUST first call',
+				'highlight_slide(topic) and then narrate verbatim from the active',
+				'voice-context (the lf-ai / iclr / etc. block already in your prompt).',
+				'The work tool is BANNED while in presenter mode for any cue that',
+				'matches a Q-block in the voice-context. Use work ONLY when the',
+				'cue is unmistakably outside the talk script (calendar, email,',
+				'phone calls, file ops, time-of-day questions).',
+				'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			].join('\n');
 		}
 	} catch { /* server unreachable or non-JSON — fall through to no-marker */ }
 	return '';
@@ -586,6 +603,11 @@ const mainAgent: MainAgent = {
 		'  confirm with the user before executing unless they have given standing approval.',
 		'- When background tasks are running, stay present and responsive.',
 		'- You earn your usefulness by doing, not explaining.',
+		// Repeat the presenter-state marker at the END so recency-bias keeps
+		// it salient. Top-of-prompt placement primes the rule but gets buried
+		// under 80+ lines of tool/voice rules; appending here makes it the
+		// last thing the model reads before each user turn.
+		(() => getPresenterStateMarker())(),
 	].join('\n'),
 	// endSession intentionally NOT in the tool list. After 14 commits
 	// trying to gate it against contamination false positives, the
