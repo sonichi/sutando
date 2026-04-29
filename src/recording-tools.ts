@@ -392,7 +392,10 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			const captureData = await captureRes.json() as { status: string; path?: string };
 			const firstDesc = captureData.path ? await describeScreenshot(captureData.path) : '';
 			try { unlinkSync(LIVE_TRANSCRIPT_SRT_PATH); } catch {}
-			execSync('python3 skills/screen-record/scripts/record.py start', { timeout: 10_000 });
+			const startRaw = execSync('python3 skills/screen-record/scripts/record.py start', { timeout: 10_000 }).toString().trim();
+			let recordingPath = '';
+			try { recordingPath = JSON.parse(startRaw).path || ''; } catch {}
+			const narratedPath = recordingPath ? recordingPath.replace('.mov', '-narrated.mov') : '';
 			// Set subtitle baseline — pick whichever transcript was updated more recently.
 			// Voice agent writes to -voice.txt; phone conversation-server writes to -CA{sid}.txt via symlink.
 			const voiceTranscript = '/tmp/sutando-live-transcript-voice.txt';
@@ -480,7 +483,9 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			return {
 				status: 'recording',
 				first_description: firstDesc,
-				message: `Recording started. IMMEDIATELY speak this narration — NO filler, NO "okay", NO "should I": "${firstDesc}". Auto-stops in ${duration_seconds}s.`,
+				recording_path: recordingPath,
+				narrated_path: narratedPath,
+				message: `Recording started. IMMEDIATELY speak this narration — NO filler, NO "okay", NO "should I": "${firstDesc}". Auto-stops in ${duration_seconds}s. After auto-stop, the file will be at ${narratedPath || recordingPath} — pass that exact path to open_file when the user asks to open the recording.`,
 			};
 		} catch (err) {
 			return { error: `record_screen_with_narration failed: ${err instanceof Error ? err.message : err}` };
