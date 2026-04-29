@@ -364,12 +364,14 @@ const HTML = /* html */ `<!DOCTYPE html>
   }
   /* Meeting-mode badge — only visible when state/voice-mode.txt is "meeting"
      AND presenter mode is off (presenter takes precedence). renderModeBadge()
-     populates textContent + adds .meeting class to make it visible. */
+     populates textContent + adds .meeting class to make it visible. Color
+     is amber to match the menu-bar app meeting dot (#b26a00, see
+     src/Sutando/main.swift avatarImage — meeting amber dot). */
   #mode-badge {
     display: none; margin-left: 10px; padding: 3px 9px; border-radius: 12px;
-    background: linear-gradient(135deg, #1565c0, #0d47a1); color: #fff;
+    background: linear-gradient(135deg, #d68000, #b26a00); color: #fff;
     font-size: 13px; font-weight: 600; letter-spacing: 0.4px;
-    box-shadow: 0 0 6px #1976d266; vertical-align: middle;
+    box-shadow: 0 0 6px #d6800066; vertical-align: middle;
   }
   #mode-badge.meeting { display: inline-block; }
   #dynamic-region .dr-questions {
