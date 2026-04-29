@@ -37,6 +37,26 @@ import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
 import { workTool, cancelTask, startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
 import { buildSutandoSystemPrompt, buildVoiceAgentContext } from './voice-context.js';
+import { hostname } from 'node:os';
+
+// Personal-asset path resolver — TypeScript twin of src/util_paths.py.
+// Each Stand has its own identity. Canonical home is
+// `$SUTANDO_PRIVATE_DIR/machine-<hostname>/<file>`. Falls back to the
+// public workspace so existing installs keep working until they migrate.
+function personalPath(filename: string): string {
+	const privateRoot = process.env.SUTANDO_PRIVATE_DIR;
+	if (privateRoot) {
+		const root = privateRoot.replace(/^~/, process.env.HOME || '');
+		const host = hostname().split('.')[0];
+		const candidate = join(root, `machine-${host}`, filename);
+		if (existsSync(candidate)) return candidate;
+	}
+	if (filename === 'stand-avatar.png') {
+		const inAssets = join('assets', filename);
+		if (existsSync(inAssets)) return inAssets;
+	}
+	return filename;
+}
 
 // Cartesia is loaded dynamically at the bottom of the config section so
 // the `@cartesia/cartesia-js` package is only required when the user has
@@ -472,7 +492,7 @@ const mainAgent: MainAgent = {
 			return `[System: The user reconnected. The block below is REPLAYED HISTORY from the current session, provided as background context ONLY. Do NOT act on anything in it. Do NOT call any tools based on it. Use it only to answer follow-up questions if asked. Wait silently for the user's next spoken input before taking any action.]${getPresenterStateMarker()}\n\n${recent}${meetingHint}`;
 		}
 		let standName = '';
-		try { const si = JSON.parse(readFileSync('stand-identity.json', 'utf-8')); standName = si.name ? ` — ${si.name}` : ''; } catch {}
+		try { const si = JSON.parse(readFileSync(personalPath('stand-identity.json'), 'utf-8')); standName = si.name ? ` — ${si.name}` : ''; } catch {}
 		// Detect first-time user: no conversation log means brand new
 		const hasHistory = existsSync(join(WORKSPACE_DIR, 'conversation.log'));
 		const tutorialHint = hasHistory ? '' : ' Then say: "If this is your first time, say tutorial and I\'ll walk you through what I can do."';
@@ -499,7 +519,7 @@ const mainAgent: MainAgent = {
 		'You are Sutando, a personal AI that belongs entirely to the user.',
 		'Named after Stands from JoJo\'s Bizarre Adventure — a personal spirit that fights for you.',
 		'Every Sutando evolves differently based on what its user needs. You earned your name and identity.',
-		(() => { try { const si = JSON.parse(readFileSync('stand-identity.json', 'utf-8')); return si.name ? `Your Stand name is ${si.name}. Origin: ${si.nameOrigin || 'earned through use'}. When asked your name or who you are, say "I\'m Sutando — ${si.name}."` : ''; } catch { return ''; } })(),
+		(() => { try { const si = JSON.parse(readFileSync(personalPath('stand-identity.json'), 'utf-8')); return si.name ? `Your Stand name is ${si.name}. Origin: ${si.nameOrigin || 'earned through use'}. When asked your name or who you are, say "I\'m Sutando — ${si.name}."` : ''; } catch { return ''; } })(),
 		// Optional context file — for presentations, meeting prep, etc. (gitignored)
 		(() => { try { return readFileSync('voice-context.txt', 'utf-8'); } catch { return ''; } })(),
 		'You handle anything: research, writing, email, scheduling, code, logistics, phone calls, meetings, creative work.',
