@@ -362,6 +362,16 @@ const HTML = /* html */ `<!DOCTYPE html>
     0%, 100% { box-shadow: 0 0 8px #8e24aa88; }
     50%      { box-shadow: 0 0 14px #ce93d8cc; }
   }
+  /* Meeting-mode badge — only visible when state/voice-mode.txt is "meeting"
+     AND presenter mode is off (presenter takes precedence). renderModeBadge()
+     populates textContent + adds .meeting class to make it visible. */
+  #mode-badge {
+    display: none; margin-left: 10px; padding: 3px 9px; border-radius: 12px;
+    background: linear-gradient(135deg, #1565c0, #0d47a1); color: #fff;
+    font-size: 13px; font-weight: 600; letter-spacing: 0.4px;
+    box-shadow: 0 0 6px #1976d266; vertical-align: middle;
+  }
+  #mode-badge.meeting { display: inline-block; }
   #dynamic-region .dr-questions {
     background: linear-gradient(135deg, #1e1a12, #2a2218); border: 1px solid #f0ad4e44;
     border-radius: 10px; padding: 14px 18px; font-size: 16px; box-shadow: 0 0 12px #f0ad4e22;
@@ -639,6 +649,7 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
   <span style="margin:0 8px;color:#444">|</span>
   <span id="core-status-bar" style="display:inline"></span>
   <span id="presenter-badge">🎤 PRESENTER MODE</span>
+  <span id="mode-badge"></span>
 </div>
 
 <div id="dynamic-region"></div>
