@@ -513,7 +513,11 @@ const mainAgent: MainAgent = {
 					const root = privateRoot.replace(/^~/, process.env.HOME || '');
 					const pointerPath = join(root, 'voice-contexts', 'active');
 					const name = readFileSync(pointerPath, 'utf-8').trim();
-					if (name) {
+					// Whitelist the pointer content to a safe basename. Reject any
+					// path-like input — `../../foo` could otherwise escape the
+					// voice-contexts/ dir via join() and load arbitrary `.txt`
+					// content into the system prompt.
+					if (name && /^[A-Za-z0-9._-]+$/.test(name)) {
 						return readFileSync(join(root, 'voice-contexts', `${name}.txt`), 'utf-8');
 					}
 				}
