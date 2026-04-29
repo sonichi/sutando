@@ -400,7 +400,7 @@ async def _handle_discord_message(message, force=False):
                 # channel set to `true` — open to all, skip access check
                 channel_authorized = True
             elif len(ch_allowed) > 0 and sender_id not in ch_allowed:
-                print(f"  [skip] @{username} not in channel allowlist", flush=True)
+                print(f"  [skip] @{username} (id={sender_id}) not in channel allowlist", flush=True)
                 return
             else:
                 # sender is in ch_allowed (or ch_allowed is empty + requireMention)
