@@ -60,38 +60,32 @@ export const summonTool: ToolDefinition = {
 				if (pwd) zoomUrl += `&pwd=${pwd}`;
 				execSync(`open "${zoomUrl}"`, { timeout: 10_000 });
 
-				// Wait for Zoom preview window, then click Join button
+				// Wait for Zoom preview window, then click Join button by a11y
+				// description (stable across window-position differences). The
+				// previous cliclick coordinate hack (preview-bottom-right * 0.80,0.93)
+				// missed the Join button on Studio's Zoom Workplace layout —
+				// 2026-04-29 phone-summon test left the meeting un-joined.
 				console.log(`${ts()} [Summon] Waiting for Zoom preview window...`);
 			await new Promise(r => setTimeout(r, 2000));
 			try {
-				// Click Join button using cliclick (no Quartz dependency needed)
-				const previewCoords = execSync(`osascript -e '
+				const joinResult = execSync(`osascript -e '
 					tell application "zoom.us" to activate
 					tell application "System Events"
 						tell process "zoom.us"
 							repeat with w in windows
 								try
-									set wName to name of w
-									if wName contains "Meeting" or wName contains "Personal" or wName contains "Preview" then
-										set wPos to position of w
-										set wSize to size of w
-										return (item 1 of wPos as text) & "," & (item 2 of wPos as text) & "," & (item 1 of wSize as text) & "," & (item 2 of wSize as text)
+									set joinBtns to (buttons of w whose description is "Join")
+									if (count of joinBtns) > 0 then
+										click item 1 of joinBtns
+										return "clicked"
 									end if
 								end try
 							end repeat
 						end tell
 					end tell
-					return "not_found"
+					return "no_button"
 				'`, { timeout: 10_000 }).toString().trim();
-				if (previewCoords !== 'not_found') {
-					const [px, py, pw, ph] = previewCoords.split(',').map(Number);
-					const jx = px + Math.round(pw * 0.80);
-					const jy = py + Math.round(ph * 0.93);
-					try { execSync(`cliclick c:${jx},${jy}`, { timeout: 3_000 }); } catch {}
-					console.log(`${ts()} [Summon] Join button clicked at (${jx},${jy})`);
-				} else {
-					console.log(`${ts()} [Summon] No preview window — may have auto-joined`);
-				}
+				console.log(`${ts()} [Summon] Join button: ${joinResult}`);
 			} catch (err) {
 				console.log(`${ts()} [Summon] Join click failed (may have auto-joined): ${err}`);
 			}
@@ -104,7 +98,11 @@ export const summonTool: ToolDefinition = {
 				for (let i = 0; i < 20; i++) {
 					try {
 						const winNames = execSync(`osascript -e 'tell application "System Events" to return name of every window of process "zoom.us"'`, { timeout: 3_000 }).toString().trim();
-						if (winNames.includes('Zoom Meeting') || winNames.includes('Meeting')) {
+						// Strict — same set as the share-readiness check.
+						// Plain "Meeting" matched the "Personal Meeting Room"
+						// preview window and gave a false-positive host=joined
+						// even when the click missed and meeting never opened.
+						if (winNames.includes('Zoom Meeting') || winNames.includes('zoom share') || winNames.includes('floating video')) {
 							hostJoined = true;
 							break;
 						}
