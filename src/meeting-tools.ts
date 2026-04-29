@@ -30,6 +30,11 @@ export const summonTool: ToolDefinition = {
 		dialIn: z.boolean().optional().describe('Also dial into the meeting via phone for voice (default: false). Only if user explicitly asks.'),
 	}),
 	execution: 'inline',
+	// Bodhi's default tool timeout is 30s; on Studio Zoom Workplace,
+	// "open meeting after Join click" was observed at 29-31s, racing the
+	// 30s default and the share-menu firing after the tool already errored.
+	// 60s covers the worst case + 30s of the share/mute AppleScripts.
+	timeout: 60_000,
 	async execute(args, ctx) {
 		const { meetingId, passcode, shareScreen = getShareScreen(), dialIn = false } = args as { meetingId?: string; passcode?: string; shareScreen?: boolean; dialIn?: boolean };
 		const pwd = passcode ?? getZoomPasscode();
