@@ -361,7 +361,9 @@ export const scrollAndDescribeTool: ToolDefinition = {
 		'For plain screen recording WITHOUT narration, use screen_record instead. ' +
 		'Call ONCE with duration_seconds. SPEAK the returned description as your first words (do NOT announce "starting recording"). ' +
 		'New descriptions will be pushed as the page scrolls — speak each one. NEVER repeat earlier narration. ' +
-		'Recording auto-stops. Do NOT call this more than once per recording.',
+		'Recording auto-stops. Do NOT call this more than once per recording. ' +
+		'After auto-stop, to play back or open the recording, call play_video — it auto-finds the file. ' +
+		'Do NOT call open_file unless you have the absolute path.',
 	parameters: z.object({
 		duration_seconds: z.number().optional().describe('Target duration in seconds (default 15, max 60). ALWAYS seconds, never minutes.'),
 	}),
@@ -444,14 +446,25 @@ export const scrollAndDescribeTool: ToolDefinition = {
 					await new Promise(r => setTimeout(r, 2000));
 				}
 				// Burn live transcript subtitles on narrated version only
+				let subtitledPath = '';
 				if (liveTranscriptRecordingStart > 0 && narrated && isReadableFile(narrated)) {
 					const subtitled = burnLiveTranscriptSubtitles(narrated);
-					if (subtitled) console.log(`${ts()} [ScrollAndDescribe] subtitle burned: ${subtitled}`);
-					else console.log(`${ts()} [ScrollAndDescribe] subtitle burn failed (no transcript lines or ffmpeg error)`);
+					if (subtitled) {
+						subtitledPath = subtitled;
+						console.log(`${ts()} [ScrollAndDescribe] subtitle burned: ${subtitled}`);
+					} else console.log(`${ts()} [ScrollAndDescribe] subtitle burn failed (no transcript lines or ffmpeg error)`);
+				}
+				// Persist playback-path so play_video can replay this recording without
+				// the user (or model) knowing the absolute path. Matches the pattern in
+				// screen_record stop. Required after PR #546 made open_file generic
+				// (no longer falls back to findRecording).
+				const recommended = subtitledPath || (narrated && isReadableFile(narrated) ? narrated : (stopResult?.path || ''));
+				if (recommended) {
+					try { writeFileSync('/tmp/sutando-playback-path', recommended); } catch {}
 				}
 				if (liveTranscriptRecordingStart === myRecStart) liveTranscriptRecordingStart = 0;
 				demoStateRef.value = 'done';
-				console.log(`${ts()} [ScrollAndDescribe] auto-stop`);
+				console.log(`${ts()} [ScrollAndDescribe] auto-stop (playback-path=${recommended || 'none'})`);
 			}, duration_seconds * 1000);
 
 			console.log(`${ts()} [ScrollAndDescribe] recording started with first desc`);
