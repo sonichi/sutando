@@ -25,19 +25,16 @@ export const openFileTool: ToolDefinition = {
 		'Open a file with the default macOS app. ALWAYS pass an absolute `path`. ' +
 		'Use for: "open the file", "open that", "can you open it". ' +
 		'If the user says "open the log" or similar, ASK which log they mean (voice-agent, discord-bridge, etc.) — do NOT guess. ' +
-		'NEVER call this tool to enter fullscreen on a video that is already open — call the `fullscreen` tool instead. ' +
 		'Known files: "diagnostic tracker" or "diagnostics" = /tmp/phone-diagnostics-tracker.html, ' +
 		'"voice diagnostics" = /tmp/voice-diagnostics-tracker.html. ' +
-		'For OPENING A NEW video file (.mp4 / .mov) that should play as a presentation, pass fullscreen=true — ' +
-		'QuickTime will activate fullscreen "present" mode after opening.',
+		'For fullscreen on whatever was just opened, call the `fullscreen` tool separately afterwards.',
 	parameters: z.object({
 		path: z.string().describe('Absolute file path to open.'),
-		fullscreen: z.boolean().optional().describe('If true, force-open in QuickTime Player and enter fullscreen (present mode) after opening. Use for video showcase moments. No effect on non-video files.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { path, fullscreen } = args as { path: string; fullscreen?: boolean };
-		console.log(`${ts()} [OpenFile] called (path=${path || 'none'}, fullscreen=${fullscreen || false})`);
+		const { path } = args as { path: string };
+		console.log(`${ts()} [OpenFile] called (path=${path || 'none'})`);
 		try {
 			if (!path) return { error: 'No path provided. Pass an absolute file path. (For the most recent recording, call play_video — it auto-finds the file.)' };
 			const filePath = path.replace(/^~/, process.env.HOME || '');
@@ -45,69 +42,13 @@ export const openFileTool: ToolDefinition = {
 				console.log(`${ts()} [OpenFile] path "${filePath}" does not exist`);
 				return { error: `File not found: ${filePath}. Do not invent paths — use the exact path returned by the tool that produced the file (e.g. record_screen_with_narration returns subtitled_path/narrated_path/recording_path). For the most recent recording without a known path, call play_video instead.` };
 			}
-			// Runtime guard: if `fullscreen=true` was requested AND QuickTime
-			// already has a video open, the user almost certainly meant
-			// "fullscreen the playing video" — block and direct to the fullscreen tool.
-			if (fullscreen) {
-				try {
-					const out = execSync(`osascript -e '
-tell application "QuickTime Player"
-	if it is running then
-		return (count of documents)
-	else
-		return 0
-	end if
-end tell'`, { timeout: 2_000 }).toString().trim();
-					if (parseInt(out, 10) > 0) {
-						console.log(`${ts()} [OpenFile] BLOCKED fullscreen=true while QT already has document(s) — directing to fullscreen tool`);
-						return { error: 'A video is already open in QuickTime. Call the `fullscreen` tool to enter fullscreen on it instead of opening a new file.' };
-					}
-				} catch {}
-			}
 			// execFileSync — no shell interpolation of caller-controlled filePath
 			// (same CodeQL js/command-line-injection class as #27).
-			// When fullscreen, force the open through QuickTime Player so we don't
-			// race with whatever app currently claims .mp4 (VLC/IINA/etc).
-			if (fullscreen) {
-				execFileSync('open', ['-a', 'QuickTime Player', filePath], { timeout: 5_000 });
-				try { execSync(`osascript -e 'tell application "QuickTime Player" to activate'`, { timeout: 3_000 }); } catch {}
-				// Wait for QuickTime to load THIS file (path-match) before presenting,
-				// to avoid fullscreening a stale prior document.
-				const escaped = filePath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-				const presentScript = [
-					`set targetPath to "${escaped}"`,
-					'tell application "QuickTime Player"',
-					'  activate',
-					'  set foundDoc to missing value',
-					'  repeat 30 times',
-					'    try',
-					'      repeat with d in documents',
-					'        if (POSIX path of (path of d)) is targetPath then',
-					'          set foundDoc to d',
-					'          exit repeat',
-					'        end if',
-					'      end repeat',
-					'    end try',
-					'    if foundDoc is not missing value then exit repeat',
-					'    delay 0.1',
-					'  end repeat',
-					'end tell',
-					'delay 0.3',
-					'tell application "System Events"',
-					'  tell process "QuickTime Player"',
-					'    set frontmost to true',
-					'    keystroke "f" using {command down, control down}',
-					'  end tell',
-					'end tell',
-				].join('\n');
-				try {
-					execFileSync('/usr/bin/osascript', ['-e', presentScript], { timeout: 5_000 });
-				} catch (err) {
-					console.log(`${ts()} [OpenFile] fullscreen AppleScript failed (non-fatal): ${err}`);
-				}
-			} else {
-				execFileSync('open', [filePath], { timeout: 5_000 });
-			}
+			// `open <path>` lets macOS's LaunchServices route to the user's default
+			// app for that file type. open_file is GENERIC — no app forcing, no
+			// video logic, no fullscreen logic. Use the `fullscreen` tool after
+			// open_file if the user wants fullscreen on whatever just opened.
+			execFileSync('open', [filePath], { timeout: 5_000 });
 			const size = statSync(filePath).size;
 			console.log(`${ts()} [OpenFile] opened ${filePath} (${(size / 1024 / 1024).toFixed(1)}MB)`);
 			return {
