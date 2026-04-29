@@ -30,11 +30,12 @@ export const summonTool: ToolDefinition = {
 		dialIn: z.boolean().optional().describe('Also dial into the meeting via phone for voice (default: false). Only if user explicitly asks.'),
 	}),
 	execution: 'inline',
-	// Bodhi's default tool timeout is 30s; on Studio Zoom Workplace,
-	// "open meeting after Join click" was observed at 29-31s, racing the
-	// 30s default and the share-menu firing after the tool already errored.
-	// 60s covers the worst case + 30s of the share/mute AppleScripts.
-	timeout: 60_000,
+	// Bodhi's default tool timeout is 30s; on Studio Zoom Workplace, "open
+	// meeting after Join click" was observed at 29-31s. Per Mini's PR #546
+	// review, the worst path can hit ~85s (Join up to 10s + 60s combined
+	// readiness/Join-retry loop + share script 15s + mute/cleanup 10s + dial-in
+	// host wait 20s). 120s gives meaningful margin without being absurd.
+	timeout: 120_000,
 	async execute(args, ctx) {
 		const { meetingId, passcode, shareScreen = getShareScreen(), dialIn = false } = args as { meetingId?: string; passcode?: string; shareScreen?: boolean; dialIn?: boolean };
 		const pwd = passcode ?? getZoomPasscode();
@@ -65,35 +66,13 @@ export const summonTool: ToolDefinition = {
 				if (pwd) zoomUrl += `&pwd=${pwd}`;
 				execSync(`open "${zoomUrl}"`, { timeout: 10_000 });
 
-				// Wait for Zoom preview window, then click Join button by a11y
-				// description (stable across window-position differences). The
-				// previous cliclick coordinate hack (preview-bottom-right * 0.80,0.93)
-				// missed the Join button on Studio's Zoom Workplace layout —
-				// 2026-04-29 phone-summon test left the meeting un-joined.
-				console.log(`${ts()} [Summon] Waiting for Zoom preview window...`);
-			await new Promise(r => setTimeout(r, 2000));
-			try {
-				const joinResult = execSync(`osascript -e '
-					tell application "zoom.us" to activate
-					tell application "System Events"
-						tell process "zoom.us"
-							repeat with w in windows
-								try
-									set joinBtns to (buttons of w whose description is "Join")
-									if (count of joinBtns) > 0 then
-										click item 1 of joinBtns
-										return "clicked"
-									end if
-								end try
-							end repeat
-						end tell
-					end tell
-					return "no_button"
-				'`, { timeout: 10_000 }).toString().trim();
-				console.log(`${ts()} [Summon] Join button: ${joinResult}`);
-			} catch (err) {
-				console.log(`${ts()} [Summon] Join click failed (may have auto-joined): ${err}`);
-			}
+				// Wait briefly for Zoom to register the deeplink, then enter the
+				// combined Join-and-wait-for-meeting loop below. Per Mini's PR #546
+				// review: the previous one-shot Join click could miss if the
+				// preview window came up late (race between zoommtg:// open and
+				// our 2s timer). The Join click is now retried inside the
+				// readiness loop, not done once up front.
+				await new Promise(r => setTimeout(r, 2000));
 			} // end: not already in meeting
 
 			// If phone dial-in requested, wait for host to join before dialing
@@ -167,20 +146,49 @@ set volume output volume 0`;
 			// Audio dialog handling removed — it causes screen share drops.
 			// Phone audio is handled by the Twilio connection, not by Zoom's audio dialog.
 
-			// Wait for Zoom meeting window to appear (adaptive, up to 30s).
-			// Must check window NAMES, not just count — the Zoom Workplace home
-			// dashboard is a window too, and treating it as "ready" caused the
-			// 2026-04-29 share-failed-silently regression on Studio.
-			console.log(`${ts()} [Summon] Waiting for Zoom meeting window...`);
+			// Combined Join-click + meeting-window-readiness loop (up to 60s total).
+			// Per Mini's PR #546 review: the prior split (one-shot Join + 30s
+			// readiness) let a late preview window leave the meeting un-joined
+			// while the readiness loop ran out the clock. Now: each iteration
+			// checks for an actual meeting window first; if not present, retries
+			// the a11y Join click. Either path → break on meeting-window found.
+			console.log(`${ts()} [Summon] Waiting for Zoom meeting window (retry Join click each second)...`);
 			let zoomReady = false;
-			for (let i = 0; i < 30; i++) {
+			let joinAttempts = 0;
+			for (let i = 0; i < 60; i++) {
 				try {
 					const winNames = execSync(`osascript -e 'tell application "System Events" to return name of every window of process "zoom.us"'`, { timeout: 3_000 }).toString().trim();
 					if (winNames.includes('Zoom Meeting') || winNames.includes('zoom share') || winNames.includes('floating video')) { zoomReady = true; break; }
+					// Not in meeting yet — retry the a11y-description Join click
+					try {
+						const joinResult = execSync(`osascript -e '
+							tell application "zoom.us" to activate
+							tell application "System Events"
+								tell process "zoom.us"
+									repeat with w in windows
+										try
+											set joinBtns to (buttons of w whose description is "Join")
+											if (count of joinBtns) > 0 then
+												click item 1 of joinBtns
+												return "clicked"
+											end if
+										end try
+									end repeat
+								end tell
+							end tell
+							return "no_button"
+						'`, { timeout: 3_000 }).toString().trim();
+						if (joinResult === 'clicked') {
+							joinAttempts++;
+							console.log(`${ts()} [Summon] Join click (attempt ${joinAttempts}) — waiting for meeting window...`);
+						}
+					} catch {}
 				} catch {}
 				await new Promise(r => setTimeout(r, 1000));
 			}
+			console.log(`${ts()} [Summon] zoomReady=${zoomReady} (${joinAttempts} Join click(s))`);
 
+			let shareStarted = false;
 			if (shareScreen && zoomReady) {
 				console.log(`${ts()} [Summon] Zoom ready — sharing screen...`);
 				try {
@@ -231,6 +239,7 @@ set volume output volume 0`;
 							end tell
 						end tell
 					'`, { timeout: 15_000 });
+					shareStarted = true;
 					console.log(`${ts()} [Summon] Screen share started`);
 					// Audio dialog handling removed — it steals focus from Zoom's
 					// screen share, causing it to drop 2-5s after starting (975b8dd).
@@ -240,7 +249,7 @@ set volume output volume 0`;
 					console.log(`${ts()} [Summon] Screen share failed: ${err}`);
 				}
 			} else if (shareScreen) {
-				console.log(`${ts()} [Summon] Zoom window not detected after 30s — skipping screen share`);
+				console.log(`${ts()} [Summon] Zoom meeting window not detected after 60s — skipping screen share`);
 			}
 
 			// Mute Zoom audio after joining. Zoom presents two choices on entry:
@@ -284,14 +293,32 @@ set volume output volume 0`;
 				console.log(`${ts()} [Summon] No zoom.us tabs to close`);
 			}
 
+			// Honest status — per Mini's PR #546 review the old hardcoded
+			// "joined with screen sharing" claim was misleading when zoomReady or
+			// share fired up false. status reflects what actually happened.
+			const status = !zoomReady ? 'meeting_window_not_detected'
+				: (shareScreen && !shareStarted) ? 'joined_share_failed'
+				: 'summoned';
+			let instruction: string;
+			if (!zoomReady) {
+				instruction = `Zoom meeting window did not appear within the timeout (${joinAttempts} Join click attempts). Tell the user the meeting may not have opened — ask them to check Zoom and re-summon if needed.`;
+			} else if (shareScreen && !shareStarted) {
+				instruction = 'Joined the Zoom meeting but screen share AppleScript failed. Tell the user the meeting is up but the screen is not shared yet.';
+			} else if (phoneJoined) {
+				instruction = 'Screen is shared and Sutando is dialing in via phone. Voice stays connected.';
+			} else if (shareScreen) {
+				instruction = 'Zoom meeting joined with screen sharing and computer audio. Voice stays connected.';
+			} else {
+				instruction = 'Zoom meeting joined (no screen share requested).';
+			}
 			return {
-				status: 'summoned',
+				status,
 				meetingId: cleanId,
 				screenShare: shareScreen,
+				zoomReady,
+				shareStarted,
 				phoneAgent: phoneJoined,
-				instruction: phoneJoined
-					? 'Screen is shared and Sutando is dialing in via phone. Voice stays connected.'
-					: 'Zoom meeting joined with screen sharing and computer audio. Voice stays connected.',
+				instruction,
 			};
 		} catch (err) {
 			return { error: `Summon failed: ${err instanceof Error ? err.message : err}` };

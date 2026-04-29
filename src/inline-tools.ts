@@ -27,14 +27,15 @@ export const openFileTool: ToolDefinition = {
 		'If the user says "open the log" or similar, ASK which log they mean (voice-agent, discord-bridge, etc.) — do NOT guess. ' +
 		'Known files: "diagnostic tracker" or "diagnostics" = /tmp/phone-diagnostics-tracker.html, ' +
 		'"voice diagnostics" = /tmp/voice-diagnostics-tracker.html. ' +
-		'For fullscreen on whatever was just opened, call the `fullscreen` tool separately afterwards.',
+		'Pass `fullscreen=true` if the user wants the file opened in fullscreen — works generically for any file type via Cmd+Ctrl+F to whichever app the OS routed the file to (QuickTime → Present mode, Preview → fullscreen PDF, Chrome → fullscreen page, etc.).',
 	parameters: z.object({
 		path: z.string().describe('Absolute file path to open.'),
+		fullscreen: z.boolean().optional().describe('If true, send Cmd+Ctrl+F to the default app right after opening — generic native-fullscreen toggle, works for any file type (video, PDF, image, web page).'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { path } = args as { path: string };
-		console.log(`${ts()} [OpenFile] called (path=${path || 'none'})`);
+		const { path, fullscreen } = args as { path: string; fullscreen?: boolean };
+		console.log(`${ts()} [OpenFile] called (path=${path || 'none'}, fullscreen=${fullscreen || false})`);
 		try {
 			if (!path) return { error: 'No path provided. Pass an absolute file path. (For the most recent recording, call play_video — it auto-finds the file.)' };
 			const filePath = path.replace(/^~/, process.env.HOME || '');
@@ -45,16 +46,29 @@ export const openFileTool: ToolDefinition = {
 			// execFileSync — no shell interpolation of caller-controlled filePath
 			// (same CodeQL js/command-line-injection class as #27).
 			// `open <path>` lets macOS's LaunchServices route to the user's default
-			// app for that file type. open_file is GENERIC — no app forcing, no
-			// video logic, no fullscreen logic. Use the `fullscreen` tool after
-			// open_file if the user wants fullscreen on whatever just opened.
+			// app for that file type. open_file stays generic — no app forcing.
 			execFileSync('open', [filePath], { timeout: 5_000 });
+			if (fullscreen) {
+				// Brief delay so the just-opened app becomes frontmost before
+				// the keystroke lands. Cmd+Ctrl+F is the macOS native-fullscreen
+				// toggle — every app that supports fullscreen handles it (QT
+				// enters Present mode, Preview/Chrome/Pages all enter fullscreen).
+				// No app-specific logic — open_file is generic.
+				await new Promise(r => setTimeout(r, 1500));
+				try {
+					execFileSync('/usr/bin/osascript', ['-e', 'tell application "System Events" to keystroke "f" using {command down, control down}'], { timeout: 3_000 });
+					console.log(`${ts()} [OpenFile] fullscreen keystroke sent (Cmd+Ctrl+F)`);
+				} catch (err) {
+					console.log(`${ts()} [OpenFile] fullscreen keystroke failed (non-fatal): ${err}`);
+				}
+			}
 			const size = statSync(filePath).size;
 			console.log(`${ts()} [OpenFile] opened ${filePath} (${(size / 1024 / 1024).toFixed(1)}MB)`);
 			return {
 				status: 'opened',
 				path: filePath,
 				size_mb: +(size / 1024 / 1024).toFixed(1),
+				fullscreen: !!fullscreen,
 			};
 		} catch (err) {
 			return { error: `open_file failed: ${err instanceof Error ? err.message : err}` };

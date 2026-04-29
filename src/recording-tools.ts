@@ -362,7 +362,7 @@ export const scrollAndDescribeTool: ToolDefinition = {
 		'Call ONCE with duration_seconds. SPEAK the returned description as your first words (do NOT announce "starting recording"). ' +
 		'New descriptions will be pushed as the page scrolls — speak each one. NEVER repeat earlier narration. ' +
 		'Recording auto-stops. Do NOT call this more than once per recording. ' +
-		'**Live conversation transcript IS automatically burned in as subtitles** — you DO support subtitles, never refuse a "with subtitles" request, just call this tool. ' +
+		'**Subtitles are attempted automatically** when both transcript text exists and a libass-capable ffmpeg is installed — you DO support subtitles, never refuse a "with subtitles" request, just call this tool (the burn may silently skip if transcript is empty or ffmpeg lacks libass; the subtitled_path field will then point at a non-existent file and the model should fall back to narrated_path). ' +
 		'After auto-stop, to play back or open the recording, call play_video — it auto-finds the file. ' +
 		'Or pass `subtitled_path` from the start result to open_file (the start result returns recording_path/narrated_path/subtitled_path; subtitled is the right one for "with subtitles"). ' +
 		'Do NOT invent file paths — only use the exact paths returned by this tool.',
