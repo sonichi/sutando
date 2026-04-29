@@ -164,36 +164,7 @@ export const workTool: ToolDefinition = {
 	},
 };
 
-// ---------------------------------------------------------------------------
-// Cancel task tool — removes the most recent pending task
-// ---------------------------------------------------------------------------
-
-export const cancelTask: ToolDefinition = {
-	name: 'cancel_task',
-	description:
-		'Cancel a pending task. Use when the user says cancel, nevermind, stop, or forget it.',
-	parameters: z.object({}),
-	execution: 'inline',
-	async execute() {
-		try {
-			const files = readdirSync(TASK_DIR).filter(f => f.endsWith('.txt')).sort();
-			if (files.length === 0) {
-				return { status: 'nothing_to_cancel', message: 'No pending tasks to cancel.' };
-			}
-			const mostRecent = files[files.length - 1];
-			const taskId = mostRecent.replace('.txt', '');
-			archiveFile(join(TASK_DIR, mostRecent), 'tasks', taskId);
-			_pendingTasks.delete(taskId);
-			console.log(`${ts()} [TaskBridge] Cancelled task ${taskId}`);
-			_sendTaskStatus?.(taskId, 'cancelled', 'Task cancelled by user');
-			// Notify agent-api
-			try { fetch('http://localhost:7843/task-done', { method: 'POST', headers: _apiHeaders(), body: JSON.stringify({ taskId, result: 'Cancelled by user' }) }).catch(() => {}); } catch {}
-			return { status: 'cancelled', taskId, message: 'Cancelled the most recent task.' };
-		} catch (err) {
-			return { status: 'error', message: `Failed to cancel: ${err instanceof Error ? err.message : err}` };
-		}
-	},
-};
+// cancelTask tool moved — canonical version is `cancelTaskTool` in inline-tools.ts.
 
 // ---------------------------------------------------------------------------
 // Result watcher — call this once at startup to watch for results
