@@ -381,6 +381,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        // Skip when "watcher" is already queued in the CLI input buffer.
+        // claude-code queues keystrokes during a turn and processes them
+        // when the turn ends. cliIsWorking() catches fresh (<60s) tool
+        // children, but a long-running tool (>60s) returns false here —
+        // the next watcher tick would then double-send "watcher", so the
+        // CLI processes "watcher\nwatcher" serially and spawns watcher
+        // twice. Capture-pane the bottom of the pane and skip if
+        // "watcher" appears near the prompt area.
+        if watcherKeystrokesQueued() {
+            logToFile("watcher dead; 'watcher' already queued in pane — skipping send")
+            return
+        }
+
         // Throttle: don't alert more than once every 120s so the CLI doesn't
         // get flooded if it's slow to restart.
         if Date().timeIntervalSince(lastWatcherAlert) < 120 { return }
@@ -525,6 +538,40 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         do { try send.run() } catch { return false }
         send.waitUntilExit()
         return send.terminationStatus == 0
+    }
+
+    /// Detect whether the word "watcher" is already typed/queued into the
+    /// claude-code prompt in the sutando-core pane. Capture-pane the bottom
+    /// 5 lines and search for "watcher" — claude-code renders queued input
+    /// at the prompt line during a busy turn, so a previous send-keys that
+    /// hasn't yet been processed is still visible there.
+    ///
+    /// Returns false on any tmux failure so a missing tmux doesn't suppress
+    /// alerts in environments where the session isn't reachable.
+    func watcherKeystrokesQueued() -> Bool {
+        let tmuxPath: String
+        if FileManager.default.fileExists(atPath: "/opt/homebrew/bin/tmux") {
+            tmuxPath = "/opt/homebrew/bin/tmux"
+        } else if FileManager.default.fileExists(atPath: "/usr/local/bin/tmux") {
+            tmuxPath = "/usr/local/bin/tmux"
+        } else {
+            return false
+        }
+        let cap = Process()
+        cap.executableURL = URL(fileURLWithPath: tmuxPath)
+        // -p prints to stdout, -S 0 starts at line 0 of the visible region,
+        // -E 5 to capture the last 5 lines of the visible region.
+        cap.arguments = ["-S", sutandoTmuxSocket, "capture-pane", "-t", "sutando-core", "-p", "-S", "-5"]
+        let pipe = Pipe()
+        cap.standardOutput = pipe
+        cap.standardError = FileHandle.nullDevice
+        do { try cap.run() } catch { return false }
+        cap.waitUntilExit()
+        if cap.terminationStatus != 0 { return false }
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        // Match "watcher" as a whole word so we don't fire on "watch-tasks"
+        // mentioned in unrelated logs above the prompt.
+        return out.range(of: #"\bwatcher\b"#, options: .regularExpression) != nil
     }
 
     /// Return the avatar image, badged per composite mode:
