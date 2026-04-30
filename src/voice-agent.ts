@@ -527,6 +527,11 @@ const mainAgent: MainAgent = {
 		// or the pointer/file is missing. Switcher tool: set_voice_context(name)
 		// from skills/personal-voice-context/ writes the pointer.
 		(() => {
+			// Log which voice-context file was loaded so the operator can see at
+			// a glance whether the dynamic loader picked up the private dir or
+			// fell through to the public fallback. Silent loads are hard to
+			// debug — Apr 29 spent 30+ minutes diff'ing files because the load
+			// path was opaque.
 			try {
 				const privateRoot = process.env.SUTANDO_PRIVATE_DIR;
 				if (privateRoot) {
@@ -538,11 +543,21 @@ const mainAgent: MainAgent = {
 					// voice-contexts/ dir via join() and load arbitrary `.txt`
 					// content into the system prompt.
 					if (name && /^[A-Za-z0-9._-]+$/.test(name)) {
-						return readFileSync(join(root, 'voice-contexts', `${name}.txt`), 'utf-8');
+						const ctxPath = join(root, 'voice-contexts', `${name}.txt`);
+						const content = readFileSync(ctxPath, 'utf-8');
+						console.log(`${ts()} [voice-context] loaded ${content.length} bytes from ${ctxPath}`);
+						return content;
 					}
 				}
 			} catch {}
-			try { return readFileSync('voice-context.txt', 'utf-8'); } catch { return ''; }
+			try {
+				const content = readFileSync('voice-context.txt', 'utf-8');
+				console.log(`${ts()} [voice-context] loaded ${content.length} bytes from voice-context.txt (fallback)`);
+				return content;
+			} catch {
+				console.log(`${ts()} [voice-context] no context loaded (no env, no pointer, no fallback file)`);
+				return '';
+			}
 		})(),
 		'You handle anything: research, writing, email, scheduling, code, logistics, phone calls, meetings, creative work.',
 		'You can join Google Meet and Zoom meetings, make phone calls, see the user\'s screen, and reach them on Telegram, Discord, web, or phone.',
