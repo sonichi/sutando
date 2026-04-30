@@ -30,6 +30,14 @@ REPO = Path(__file__).resolve().parent.parent
 TASKS_DIR = REPO / "tasks"
 PORT = int(sys.argv[sys.argv.index("--port") + 1]) if "--port" in sys.argv else 7847
 
+# Load .env before reading secrets so launchctl / systemd managed restarts
+# pick up GITHUB_WEBHOOK_SECRET without needing it in the plist/unit file.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(REPO / ".env")
+except ImportError:
+    pass
+
 # GitHub webhook secret for payload signature verification.
 # Set GITHUB_WEBHOOK_SECRET in your .env to match the secret configured in
 # GitHub repo Settings → Webhooks → (your webhook) → Secret.
