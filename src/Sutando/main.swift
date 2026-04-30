@@ -576,13 +576,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         cap.waitUntilExit()
         if cap.terminationStatus != 0 { return false }
         let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        // Find the LAST line starting with "❯ " — that's the current prompt.
+        // Find the LAST line starting with "❯" — that's the current prompt.
         // Past prompts in scrollback don't represent queued input.
+        //
+        // Match "❯" without requiring a trailing space: an EMPTY prompt is
+        // rendered as `❯ ` (prompt + space), but `trimmingCharacters` strips
+        // the trailing space → we'd miss the empty prompt and fall back to
+        // an earlier prompt-with-text in scrollback. Bug from PR #559 that
+        // caused continuous "queued in pane — skipping send" even on empty
+        // prompt. Fix: trim only LEADING whitespace; check `❯` prefix; the
+        // input portion is whatever follows.
         var lastPromptInput: String? = nil
         for line in out.split(separator: "\n") {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("❯ ") {
-                lastPromptInput = String(trimmed.dropFirst(2))
+            // Trim only leading whitespace (not trailing) so empty prompt
+            // `❯ ` is preserved as `❯ ` (prompt + space + nothing).
+            let leading = line.drop(while: { $0 == " " || $0 == "\t" })
+            if leading.hasPrefix("❯") {
+                // Drop the prompt char + any single space that follows it.
+                var rest = leading.dropFirst()  // drop "❯"
+                if rest.hasPrefix(" ") { rest = rest.dropFirst() }  // drop one space if present
+                lastPromptInput = String(rest)
             }
         }
         guard let input = lastPromptInput else { return false }
