@@ -540,14 +540,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return send.terminationStatus == 0
     }
 
-    /// Detect whether the word "watcher" is already typed/queued into the
-    /// claude-code prompt in the sutando-core pane. Capture-pane the bottom
-    /// 5 lines and search for "watcher" — claude-code renders queued input
-    /// at the prompt line during a busy turn, so a previous send-keys that
-    /// hasn't yet been processed is still visible there.
+    /// Detect whether the word "watcher" is already typed at the claude-code
+    /// prompt line in the sutando-core pane. claude-code's prompt is the line
+    /// starting with "❯ " — only THAT line indicates queued input. Past tool
+    /// output and prose containing "watcher" must be ignored.
     ///
-    /// Returns false on any tmux failure so a missing tmux doesn't suppress
-    /// alerts in environments where the session isn't reachable.
+    /// Original PR #553 used `\bwatcher\b` over the bottom 5 lines, which
+    /// over-fired: every loop pass writes prose containing "watcher" (this
+    /// proactive-loop literally has "Ensure the watcher is running" as
+    /// step 9), so app log filled with `watcher dead; 'watcher' already
+    /// queued in pane — skipping send` and the reminder never fired.
+    ///
+    /// Fix: capture last 3 lines, find lines starting with "❯ ", check those
+    /// only. Returns false on any tmux failure so a missing tmux doesn't
+    /// suppress alerts.
     func watcherKeystrokesQueued() -> Bool {
         let tmuxPath: String
         if FileManager.default.fileExists(atPath: "/opt/homebrew/bin/tmux") {
@@ -559,9 +565,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let cap = Process()
         cap.executableURL = URL(fileURLWithPath: tmuxPath)
-        // -p prints to stdout, -S 0 starts at line 0 of the visible region,
-        // -E 5 to capture the last 5 lines of the visible region.
-        cap.arguments = ["-S", sutandoTmuxSocket, "capture-pane", "-t", "sutando-core", "-p", "-S", "-5"]
+        cap.arguments = ["-S", sutandoTmuxSocket, "capture-pane", "-t", "sutando-core", "-p", "-S", "-3"]
         let pipe = Pipe()
         cap.standardOutput = pipe
         cap.standardError = FileHandle.nullDevice
@@ -569,9 +573,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         cap.waitUntilExit()
         if cap.terminationStatus != 0 { return false }
         let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        // Match "watcher" as a whole word so we don't fire on "watch-tasks"
-        // mentioned in unrelated logs above the prompt.
-        return out.range(of: #"\bwatcher\b"#, options: .regularExpression) != nil
+        // Walk lines bottom-up; only inspect prompt lines (starting with "❯ ").
+        // Match "watcher" as a whole word on those — past output prose with
+        // the word is ignored.
+        for line in out.split(separator: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix("❯ ") else { continue }
+            let promptInput = String(trimmed.dropFirst(2))
+            if promptInput.range(of: #"\bwatcher\b"#, options: .regularExpression) != nil {
+                return true
+            }
+        }
+        return false
     }
 
     /// Return the avatar image, badged per composite mode:
