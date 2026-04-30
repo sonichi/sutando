@@ -9,6 +9,7 @@ Usage: python3 src/discord-bridge.py
 import asyncio
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -63,26 +64,61 @@ SEND_ALLOWED_PREFIXES = (
 )
 
 
+_FENCE_LINE = re.compile(r"^\s{0,3}(`{3,}|~{3,})\s*([^\s`~][^`~]*)?\s*$")
+
+
+def _is_fence_open_line(line: str):
+    """Return the fence opener string if `line` is a real Markdown block-fence line.
+
+    A fence line is one whose stripped content is just a backtick/tilde run of >=3
+    optionally followed by a language/info string. Lines like `print("```")`,
+    shell heredocs, or `use ```js inline` do NOT match — they have non-fence
+    content before the fence chars on the same line.
+
+    Returns the full fence opener (e.g. "```python", "~~~", "````markdown")
+    so the chunker can reopen the SAME opener after a chunk boundary, preserving
+    the language tag and the fence-token kind/length.
+
+    Returns None if the line is not a fence line.
+    """
+    m = _FENCE_LINE.match(line)
+    if not m:
+        return None
+    return line.strip()
+
+
 def _chunk_for_discord(text: str, max_len: int = 1900):
-    """Yield Discord-safe chunks <= max_len chars, preserving triple-backtick code fences.
+    """Yield Discord-safe chunks <= max_len chars, preserving Markdown code fences.
 
-    The naive `range(0, len, max_len)` chunker breaks code blocks: if a triple-backtick
-    fence opens before the chunk boundary and closes after, the first chunk renders as
-    a half-open code block on Discord and the second chunk leaks the literal trailing
-    backticks as plain text.
+    The naive `range(0, len, max_len)` chunker breaks code blocks: if a fence
+    opens before the chunk boundary and closes after, the first chunk renders as
+    a half-open code block on Discord and the second chunk leaks the literal
+    trailing backticks as plain text.
 
-    This chunker walks line-by-line, tracking fence state (open/closed). When a new
-    line would push the buffer past max_len, it closes the current fence (if open),
-    yields the buffer, and reopens the fence in the next chunk.
+    This chunker walks line-by-line, tracks fence state (the exact opener string
+    when inside a fence; None when outside). When a new line would push the
+    buffer past max_len, it closes the current fence (if open) with a matching
+    closer, yields the buffer, and reopens the SAME opener in the next chunk —
+    preserving language tags and fence-token length.
 
-    Single-line content longer than max_len gets hard-split mid-line (rare); fence
-    state is still preserved across the split.
+    Fence detection only matches real block-fence lines (regex-anchored). Inline
+    backticks in code or prose (`print("```")`, `use ```js`) do NOT toggle state.
+
+    Single-line content longer than max_len is hard-split mid-line; fence state
+    is preserved across the split.
     """
     if not text:
         return
-    in_fence = False
+    fence_opener = None  # full opener string when inside a fence; None when outside
     buf = []
     buf_len = 0
+
+    def fence_closer(opener):
+        # Match the fence-token kind (` or ~) and use 3 of them. Discord's
+        # parser closes on >=3 matching chars, so a 3-char closer suffices
+        # even if opener was 4+ chars (the literal opener length doesn't have
+        # to match for closure, only the char kind).
+        return opener[0] * 3 if opener else "```"
 
     def flush():
         nonlocal buf, buf_len
@@ -90,27 +126,31 @@ def _chunk_for_discord(text: str, max_len: int = 1900):
             return None
         chunk = "\n".join(buf)
         # If we're mid-fence at chunk boundary, close it so Discord renders cleanly
-        if in_fence:
-            chunk = chunk + "\n```"
+        if fence_opener:
+            chunk = chunk + "\n" + fence_closer(fence_opener)
         buf = []
         buf_len = 0
         return chunk
 
     for line in text.split("\n"):
-        # Toggle fence state for any triple-backtick on this line (paired)
-        fences_on_line = line.count("```")
+        # Real fence-line detection (only at start of stripped line, not anywhere)
+        opener_on_line = _is_fence_open_line(line)
+        # If we're outside a fence and this line is a fence-open, treat as opening.
+        # If we're inside a fence and this line matches the fence-token kind,
+        # treat as closing (we don't require exact length match for close).
 
-        # Pessimistic length check: assume we may need to add a closing fence
         line_overhead = len(line) + 1  # +1 for newline
-        reserve = 4 if in_fence else 0  # space for "\n```" close
+        # Reserve space for closing fence if we'd cut mid-fence
+        reserve = (len(fence_closer(fence_opener)) + 1) if fence_opener else 0
+
         if buf_len + line_overhead + reserve > max_len and buf:
             chunk = flush()
             if chunk is not None:
                 yield chunk
             # Reopen fence in next chunk if we were inside one
-            if in_fence:
-                buf.append("```")
-                buf_len = 4
+            if fence_opener:
+                buf.append(fence_opener)
+                buf_len = len(fence_opener) + 1
 
         # Single line longer than max_len → hard-split
         if line_overhead + reserve > max_len:
@@ -121,9 +161,9 @@ def _chunk_for_discord(text: str, max_len: int = 1900):
                     chunk = flush()
                     if chunk is not None:
                         yield chunk
-                    if in_fence:
-                        buf.append("```")
-                        buf_len = 4
+                    if fence_opener:
+                        buf.append(fence_opener)
+                        buf_len = len(fence_opener) + 1
                     take = max_len - reserve - buf_len - 1
                 buf.append(remaining[:take])
                 buf_len += take + 1
@@ -131,18 +171,23 @@ def _chunk_for_discord(text: str, max_len: int = 1900):
                 chunk = flush()
                 if chunk is not None:
                     yield chunk
-                if in_fence:
-                    buf.append("```")
-                    buf_len = 4
+                if fence_opener:
+                    buf.append(fence_opener)
+                    buf_len = len(fence_opener) + 1
             buf.append(remaining)
             buf_len += len(remaining) + 1
         else:
             buf.append(line)
             buf_len += line_overhead
 
-        # Update fence state AFTER we've placed the line (the line itself is intact)
-        if fences_on_line % 2 == 1:
-            in_fence = not in_fence
+        # Update fence state AFTER placing the line (the line itself is intact)
+        if opener_on_line is not None:
+            if fence_opener is None:
+                fence_opener = opener_on_line
+            else:
+                # Fence-line at this position closes the active fence
+                # (Discord/CommonMark allows any close-fence of the same kind to close)
+                fence_opener = None
 
     chunk = flush()
     if chunk is not None:

@@ -27,6 +27,7 @@ Per-node correctness:
 
 import json
 import os
+import re
 import sys
 import urllib.request
 from pathlib import Path
@@ -34,6 +35,95 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 ACCESS_JSON = Path.home() / ".claude" / "channels" / "discord" / "access.json"
 SSE_STATUS_URL = "http://localhost:8080/sse-status"
+
+
+_FENCE_LINE = re.compile(r"^\s{0,3}(`{3,}|~{3,})\s*([^\s`~][^`~]*)?\s*$")
+
+
+def _is_fence_open_line(line: str):
+    """Return the fence opener string if `line` is a real Markdown fence line, else None."""
+    if not _FENCE_LINE.match(line):
+        return None
+    return line.strip()
+
+
+def _chunk_for_discord(text: str, max_len: int = 1900):
+    """Yield Discord-safe chunks <= max_len, preserving Markdown code fences.
+
+    Mirrors src/discord-bridge.py:_chunk_for_discord. Tracks the exact fence
+    opener (so language tag and fence-token kind are preserved across chunk
+    boundaries) and uses anchored fence-line detection so inline backticks
+    in code/prose don't toggle state.
+    """
+    if not text:
+        return
+    fence_opener = None
+    buf = []
+    buf_len = 0
+
+    def fence_closer(opener):
+        return opener[0] * 3 if opener else "```"
+
+    def flush():
+        nonlocal buf, buf_len
+        if not buf:
+            return None
+        chunk = "\n".join(buf)
+        if fence_opener:
+            chunk = chunk + "\n" + fence_closer(fence_opener)
+        buf = []
+        buf_len = 0
+        return chunk
+
+    for line in text.split("\n"):
+        opener_on_line = _is_fence_open_line(line)
+        line_overhead = len(line) + 1
+        reserve = (len(fence_closer(fence_opener)) + 1) if fence_opener else 0
+
+        if buf_len + line_overhead + reserve > max_len and buf:
+            chunk = flush()
+            if chunk is not None:
+                yield chunk
+            if fence_opener:
+                buf.append(fence_opener)
+                buf_len = len(fence_opener) + 1
+
+        if line_overhead + reserve > max_len:
+            remaining = line
+            while len(remaining) + 1 + reserve > max_len - buf_len:
+                take = max_len - reserve - buf_len - 1
+                if take <= 0:
+                    chunk = flush()
+                    if chunk is not None:
+                        yield chunk
+                    if fence_opener:
+                        buf.append(fence_opener)
+                        buf_len = len(fence_opener) + 1
+                    take = max_len - reserve - buf_len - 1
+                buf.append(remaining[:take])
+                buf_len += take + 1
+                remaining = remaining[take:]
+                chunk = flush()
+                if chunk is not None:
+                    yield chunk
+                if fence_opener:
+                    buf.append(fence_opener)
+                    buf_len = len(fence_opener) + 1
+            buf.append(remaining)
+            buf_len += len(remaining) + 1
+        else:
+            buf.append(line)
+            buf_len += line_overhead
+
+        if opener_on_line is not None:
+            if fence_opener is None:
+                fence_opener = opener_on_line
+            else:
+                fence_opener = None
+
+    chunk = flush()
+    if chunk is not None:
+        yield chunk
 
 
 def voice_connected() -> bool:
@@ -149,17 +239,21 @@ def send_dm(text: str) -> bool:
         print(f"dm-result: failed to open DM channel with {owner_id}: {e}", file=sys.stderr)
         return False
 
-    # Truncate if too long for Discord (2000 char limit; leave room for suffix).
-    if len(text) > 1900:
-        text = text[:1900] + "\n... (truncated)"
+    # Chunk into Discord-safe pieces, preserving code fences across boundaries.
+    chunks = list(_chunk_for_discord(text)) or [text]
+    for i, chunk in enumerate(chunks):
+        try:
+            _discord_api("POST", f"/channels/{channel_id}/messages", token, {"content": chunk})
+        except Exception as e:
+            print(
+                f"dm-result: failed to send DM chunk {i+1}/{len(chunks)} to channel {channel_id}: {e}",
+                file=sys.stderr,
+            )
+            return False
 
-    try:
-        _discord_api("POST", f"/channels/{channel_id}/messages", token, {"content": text})
-    except Exception as e:
-        print(f"dm-result: failed to send DM to channel {channel_id}: {e}", file=sys.stderr)
-        return False
-
-    print(f"dm-result: sent to DM ({len(text)} chars) via channel {channel_id}")
+    print(
+        f"dm-result: sent to DM ({len(text)} chars in {len(chunks)} chunk(s)) via channel {channel_id}"
+    )
     return True
 
 
