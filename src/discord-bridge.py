@@ -63,6 +63,92 @@ SEND_ALLOWED_PREFIXES = (
 )
 
 
+def _chunk_for_discord(text: str, max_len: int = 1900):
+    """Yield Discord-safe chunks <= max_len chars, preserving triple-backtick code fences.
+
+    The naive `range(0, len, max_len)` chunker breaks code blocks: if a triple-backtick
+    fence opens before the chunk boundary and closes after, the first chunk renders as
+    a half-open code block on Discord and the second chunk leaks the literal trailing
+    backticks as plain text.
+
+    This chunker walks line-by-line, tracking fence state (open/closed). When a new
+    line would push the buffer past max_len, it closes the current fence (if open),
+    yields the buffer, and reopens the fence in the next chunk.
+
+    Single-line content longer than max_len gets hard-split mid-line (rare); fence
+    state is still preserved across the split.
+    """
+    if not text:
+        return
+    in_fence = False
+    buf = []
+    buf_len = 0
+
+    def flush():
+        nonlocal buf, buf_len
+        if not buf:
+            return None
+        chunk = "\n".join(buf)
+        # If we're mid-fence at chunk boundary, close it so Discord renders cleanly
+        if in_fence:
+            chunk = chunk + "\n```"
+        buf = []
+        buf_len = 0
+        return chunk
+
+    for line in text.split("\n"):
+        # Toggle fence state for any triple-backtick on this line (paired)
+        fences_on_line = line.count("```")
+
+        # Pessimistic length check: assume we may need to add a closing fence
+        line_overhead = len(line) + 1  # +1 for newline
+        reserve = 4 if in_fence else 0  # space for "\n```" close
+        if buf_len + line_overhead + reserve > max_len and buf:
+            chunk = flush()
+            if chunk is not None:
+                yield chunk
+            # Reopen fence in next chunk if we were inside one
+            if in_fence:
+                buf.append("```")
+                buf_len = 4
+
+        # Single line longer than max_len → hard-split
+        if line_overhead + reserve > max_len:
+            remaining = line
+            while len(remaining) + reserve > max_len:
+                take = max_len - reserve - buf_len - 1
+                if take <= 0:
+                    chunk = flush()
+                    if chunk is not None:
+                        yield chunk
+                    if in_fence:
+                        buf.append("```")
+                        buf_len = 4
+                    take = max_len - reserve - buf_len - 1
+                buf.append(remaining[:take])
+                buf_len += take + 1
+                remaining = remaining[take:]
+                chunk = flush()
+                if chunk is not None:
+                    yield chunk
+                if in_fence:
+                    buf.append("```")
+                    buf_len = 4
+            buf.append(remaining)
+            buf_len += len(remaining) + 1
+        else:
+            buf.append(line)
+            buf_len += line_overhead
+
+        # Update fence state AFTER we've placed the line (the line itself is intact)
+        if fences_on_line % 2 == 1:
+            in_fence = not in_fence
+
+    chunk = flush()
+    if chunk is not None:
+        yield chunk
+
+
 def _is_path_sendable(fpath: str) -> bool:
     """True iff `fpath` is a real file AND resolves under an allowed root.
 
@@ -800,10 +886,10 @@ async def poll_results():
                     files = file_pattern.findall(reply_text)
                     clean_text = file_pattern.sub('', reply_text).strip()
 
-                    # Send text
+                    # Send text — fence-aware chunker preserves triple-backtick code blocks
                     if clean_text:
-                        for i in range(0, len(clean_text), 1900):
-                            await channel.send(clean_text[i:i+1900])
+                        for chunk in _chunk_for_discord(clean_text):
+                            await channel.send(chunk)
 
                     # Send files (allowlist-gated; see _is_path_sendable)
                     for fpath in files:
@@ -907,8 +993,8 @@ async def poll_proactive():
                         files = file_pattern.findall(text)
                         clean_text = file_pattern.sub('', text).strip()
                         if clean_text:
-                            for i in range(0, len(clean_text), 1900):
-                                await dm.send(clean_text[i:i+1900])
+                            for chunk in _chunk_for_discord(clean_text):
+                                await dm.send(chunk)
                         for fpath in files:
                             fpath = os.path.expanduser(fpath.strip())
                             if _is_path_sendable(fpath):
