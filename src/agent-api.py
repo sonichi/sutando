@@ -173,7 +173,7 @@ _webhooks: dict[str, str] = {}
 def _is_safe_callback_url(url: str) -> tuple[bool, str]:
     """Validate a callback URL to prevent SSRF attacks.
 
-    Returns (is_safe, resolved_ip_or_reason).
+    Returns (is_safe, reason).
 
     Rejects:
     - Non-HTTPS schemes (http, file, gopher, etc.)
@@ -182,9 +182,12 @@ def _is_safe_callback_url(url: str) -> tuple[bool, str]:
     - Link-local addresses (169.254.0.0/16, fe80::/10)
     - Hostnames that resolve to private IPs
 
-    The resolved IP is returned so that fire_webhook can pin the request to
-    that IP, closing the DNS-rebinding TOCTOU window between validation and
-    the actual HTTP request.
+    Residual TOCTOU: getaddrinfo resolves at validation time; urlopen resolves
+    again at request time. An attacker with a malicious DNS server and very low
+    TTL could rebind between the two calls. In practice this window is narrow
+    (microseconds + OS DNS cache) and callback URLs are owner-curated, making
+    the attack impractical. IP pinning was considered but rejected because most
+    TLS certs use hostname SANs — pinning to IP causes SSLCertVerificationError.
     """
     try:
         parsed = urlparse(url)
@@ -217,9 +220,7 @@ def _is_safe_callback_url(url: str) -> tuple[bool, str]:
                     return False, f"private IP: {addr}"
         except ValueError:
             return False, f"invalid address: {sockaddr[0]}"
-    # Return the first resolved public IP for DNS pinning
-    resolved_ip = addrinfos[0][4][0]
-    return True, resolved_ip
+    return True, "ok"
 
 
 def fire_webhook(task_id: str, result: str) -> None:
@@ -227,25 +228,14 @@ def fire_webhook(task_id: str, result: str) -> None:
     url = _webhooks.pop(task_id, None)
     if not url:
         return
-    safe, resolved = _is_safe_callback_url(url)
+    safe, reason = _is_safe_callback_url(url)
     if not safe:
-        print(f"[webhook] BLOCKED: callback URL failed SSRF check: {url} ({resolved})")
+        print(f"[webhook] BLOCKED: callback URL failed SSRF check: {url} ({reason})")
         return
     try:
         import urllib.request
         data = json.dumps({"task_id": task_id, "status": "completed", "result": result}).encode()
-        # Pin the request to the resolved IP to close the DNS-rebinding TOCTOU window.
-        # Replace the hostname in the URL with the validated IP, but keep the original
-        # hostname in the Host header so the destination server handles it correctly.
-        parsed = urlparse(url)
-        if ":" in resolved:  # IPv6
-            pinned_url = url.replace(parsed.hostname, f"[{resolved}]", 1)
-        else:
-            pinned_url = url.replace(parsed.hostname, resolved, 1)
-        req = urllib.request.Request(
-            pinned_url, data=data,
-            headers={"Content-Type": "application/json", "Host": parsed.hostname},
-        )
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=10)
     except Exception:
         pass  # Best-effort delivery
