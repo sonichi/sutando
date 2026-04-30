@@ -32,6 +32,7 @@ For remote access: use ngrok or SSH tunnel.
 """
 
 import http.server
+import ipaddress
 import json
 import os
 import re
@@ -175,10 +176,67 @@ def get_task_result(task_id: str):
 _webhooks: dict[str, str] = {}
 
 
+def _is_safe_callback_url(url: str) -> tuple[bool, str]:
+    """Validate a callback URL to prevent SSRF attacks.
+
+    Returns (is_safe, reason).
+
+    Rejects:
+    - Non-HTTPS schemes (http, file, gopher, etc.)
+    - Private / reserved IPs (127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+    - Cloud metadata endpoints (169.254.169.254)
+    - Link-local addresses (169.254.0.0/16, fe80::/10)
+    - Hostnames that resolve to private IPs
+
+    Residual TOCTOU: getaddrinfo resolves at validation time; urlopen resolves
+    again at request time. An attacker with a malicious DNS server and very low
+    TTL could rebind between the two calls. In practice this window is narrow
+    (microseconds + OS DNS cache) and callback URLs are owner-curated, making
+    the attack impractical. IP pinning was considered but rejected because most
+    TLS certs use hostname SANs — pinning to IP causes SSLCertVerificationError.
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False, "invalid URL"
+
+    if parsed.scheme != "https":
+        return False, "not HTTPS"
+    if not parsed.hostname:
+        return False, "no hostname"
+    hostname_lower = parsed.hostname.lower()
+    if hostname_lower in ("localhost", "localhost.localdomain"):
+        return False, "localhost"
+    try:
+        addrinfos = socket.getaddrinfo(hostname_lower, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    except socket.gaierror:
+        return False, "DNS resolution failed"
+    private_ranges = [
+        ipaddress.ip_network(b) for b in (
+            "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+            "169.254.0.0/16", "0.0.0.0/8", "100.64.0.0/10", "198.18.0.0/15",
+            "::1/128", "fc00::/7", "fe80::/10", "ff00::/8",
+        )
+    ]
+    for family, _type, _proto, _canon, sockaddr in addrinfos:
+        try:
+            addr = ipaddress.ip_address(sockaddr[0])
+            for net in private_ranges:
+                if addr in net:
+                    return False, f"private IP: {addr}"
+        except ValueError:
+            return False, f"invalid address: {sockaddr[0]}"
+    return True, "ok"
+
+
 def fire_webhook(task_id: str, result: str) -> None:
     """POST result to registered webhook URL."""
     url = _webhooks.pop(task_id, None)
     if not url:
+        return
+    safe, reason = _is_safe_callback_url(url)
+    if not safe:
+        print(f"[webhook] BLOCKED: callback URL failed SSRF check: {url} ({reason})")
         return
     try:
         import urllib.request
@@ -668,6 +726,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         callback_url = data.get("callback_url", "")
+
+        # Validate callback URL before accepting
+        if callback_url:
+            safe, reason = _is_safe_callback_url(callback_url)
+            if not safe:
+                self.send_json(400, {"error": f"callback_url failed SSRF check ({reason}): must be HTTPS, no private IPs"})
+                return
 
         # Write to tasks/ for sutando-core to pick up
         task_id = f"task-{int(datetime.now().timestamp() * 1000)}"
