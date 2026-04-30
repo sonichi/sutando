@@ -540,20 +540,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return send.terminationStatus == 0
     }
 
-    /// Detect whether the word "watcher" is already typed at the claude-code
-    /// prompt line in the sutando-core pane. claude-code's prompt is the line
-    /// starting with "❯ " — only THAT line indicates queued input. Past tool
-    /// output and prose containing "watcher" must be ignored.
+    /// Detect whether the word "watcher" is already typed at claude-code's
+    /// CURRENT prompt line in the sutando-core pane. Only the current prompt
+    /// (the bottom-most `❯ ` line) indicates queued input — past prompts in
+    /// scrollback don't.
     ///
-    /// Original PR #553 used `\bwatcher\b` over the bottom 5 lines, which
-    /// over-fired: every loop pass writes prose containing "watcher" (this
-    /// proactive-loop literally has "Ensure the watcher is running" as
-    /// step 9), so app log filled with `watcher dead; 'watcher' already
-    /// queued in pane — skipping send` and the reminder never fired.
+    /// History of this function:
+    /// - PR #553: matched `\bwatcher\b` across bottom 5 lines → over-fired
+    ///   on prose like "Ensure the watcher is running" in tool output.
+    /// - PR #557: filtered to lines starting with `❯ `. But `capture-pane
+    ///   -S -3` returns the visible pane PLUS scrollback (≠ "last 3 lines"),
+    ///   so old prompts like `❯ why is watcher reminder not sent?` were
+    ///   still treated as queued input → still over-fired.
+    /// - This PR: walk all lines, remember the LAST `❯ ` line seen (the
+    ///   current prompt), check only that one.
     ///
-    /// Fix: capture last 3 lines, find lines starting with "❯ ", check those
-    /// only. Returns false on any tmux failure so a missing tmux doesn't
-    /// suppress alerts.
+    /// Returns false on any tmux failure so a missing tmux doesn't suppress
+    /// alerts.
     func watcherKeystrokesQueued() -> Bool {
         let tmuxPath: String
         if FileManager.default.fileExists(atPath: "/opt/homebrew/bin/tmux") {
@@ -565,7 +568,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let cap = Process()
         cap.executableURL = URL(fileURLWithPath: tmuxPath)
-        cap.arguments = ["-S", sutandoTmuxSocket, "capture-pane", "-t", "sutando-core", "-p", "-S", "-3"]
+        cap.arguments = ["-S", sutandoTmuxSocket, "capture-pane", "-t", "sutando-core", "-p"]
         let pipe = Pipe()
         cap.standardOutput = pipe
         cap.standardError = FileHandle.nullDevice
@@ -573,18 +576,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         cap.waitUntilExit()
         if cap.terminationStatus != 0 { return false }
         let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        // Walk lines bottom-up; only inspect prompt lines (starting with "❯ ").
-        // Match "watcher" as a whole word on those — past output prose with
-        // the word is ignored.
+        // Find the LAST line starting with "❯ " — that's the current prompt.
+        // Past prompts in scrollback don't represent queued input.
+        var lastPromptInput: String? = nil
         for line in out.split(separator: "\n") {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard trimmed.hasPrefix("❯ ") else { continue }
-            let promptInput = String(trimmed.dropFirst(2))
-            if promptInput.range(of: #"\bwatcher\b"#, options: .regularExpression) != nil {
-                return true
+            if trimmed.hasPrefix("❯ ") {
+                lastPromptInput = String(trimmed.dropFirst(2))
             }
         }
-        return false
+        guard let input = lastPromptInput else { return false }
+        return input.range(of: #"\bwatcher\b"#, options: .regularExpression) != nil
     }
 
     /// Return the avatar image, badged per composite mode:
