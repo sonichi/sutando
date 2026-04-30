@@ -73,3 +73,4 @@ done/
 
 # Runtime state file written by the voice client. Pure cruft, no commit value.
 voice-state.json
+src/ax-read/ax-read
