@@ -29,10 +29,7 @@ import { execSync as execSyncTop } from 'node:child_process';
 import { inlineTools } from './inline-tools.js';
 import { injectText } from './browser-tools.js';
 import { join } from 'node:path';
-import {
-	VoiceSession,
-	GeminiBatchSTTProvider,
-} from 'bodhi-realtime-agent';
+import { VoiceSession } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
 import { workTool, startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
@@ -62,8 +59,6 @@ function personalPath(filename: string): string {
 // the `@cartesia/cartesia-js` package is only required when the user has
 // set CARTESIA_API_KEY. Gemini-only setups (the default) skip the import
 // entirely — no install cost, no type-check cost (see tsconfig `exclude`).
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let CartesiaSTTProvider: any = null;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let generateSpeech: ((text: string, opts: { category: string; label: string }) => Promise<string>) | null = null;
 
@@ -123,8 +118,6 @@ const CALL_RESULTS_DIR = join(new URL('.', import.meta.url).pathname, '..', 'res
 // Model configuration — override via .env for cost/quality tuning
 const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
 const VOICE_NATIVE_AUDIO_MODEL = process.env.VOICE_NATIVE_AUDIO_MODEL || 'gemini-3.1-flash-live-preview';
-// STT_MODEL is the model name passed to GeminiBatchSTTProvider. Only used when STT_PROVIDER=gemini.
-const STT_MODEL = process.env.STT_MODEL || 'gemini-3-flash-preview';
 // Google Search grounding — MUST be false under gemini-3.1-flash-live-preview
 // native audio. Combining googleSearch: true + 3.1 native audio causes the
 // transport to reject setup with close code 1011 "exceeded your current
@@ -135,27 +128,22 @@ const STT_MODEL = process.env.STT_MODEL || 'gemini-3-flash-preview';
 // in .env when unpinning VOICE_NATIVE_AUDIO_MODEL to 3.1.
 const VOICE_GOOGLE_SEARCH = (process.env.VOICE_GOOGLE_SEARCH ?? 'true').toLowerCase() !== 'false';
 const CARTESIA_API_KEY = process.env.CARTESIA_API_KEY || '';
-const STT_PROVIDER = process.env.STT_PROVIDER || (CARTESIA_API_KEY ? 'cartesia' : 'gemini');
 
-// Lazy-load Cartesia modules only when a key is set. This means Gemini-only
+// Lazy-load Cartesia TTS only when a key is set. This means Gemini-only
 // users don't need `@cartesia/cartesia-js` installed at all — the
 // cartesia-*.ts files are excluded from tsc via tsconfig and never loaded
 // by tsx at runtime unless this branch runs.
 if (CARTESIA_API_KEY) {
 	try {
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const sttMod: any = await import('./cartesia-stt-provider.js');
-		CartesiaSTTProvider = sttMod.CartesiaSTTProvider;
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const ttsMod: any = await import('./cartesia-tts.js');
 		generateSpeech = ttsMod.generateSpeech;
 	} catch (err) {
 		console.error(
-			`[Cartesia] failed to load modules — is @cartesia/cartesia-js installed?`,
+			`[Cartesia] failed to load TTS module — is @cartesia/cartesia-js installed?`,
 			err instanceof Error ? err.message : err
 		);
-		// CartesiaSTTProvider and generateSpeech stay null; guards below
-		// will fall back to Gemini paths.
+		// generateSpeech stays null; the Cartesia TTS branch below will be skipped.
 	}
 }
 
@@ -786,9 +774,6 @@ async function main() {
 		host: HOST,
 		model: google(VOICE_MODEL),
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
-		sttProvider: STT_PROVIDER === 'cartesia' && CARTESIA_API_KEY && CartesiaSTTProvider
-			? new CartesiaSTTProvider({ apiKey: CARTESIA_API_KEY })
-			: new GeminiBatchSTTProvider({ apiKey: GEMINI_VOICE_API_KEY, model: STT_MODEL }),
 		speechConfig: { voiceName: 'Puck' },
 		hooks: {
 			onSessionStart: (e) => {
@@ -1145,7 +1130,7 @@ async function main() {
 	console.log(`  Models:`);
 	console.log(`    Voice LLM:       ${VOICE_MODEL}`);
 	console.log(`    Native audio:    ${VOICE_NATIVE_AUDIO_MODEL}`);
-	console.log(`    STT:             ${STT_PROVIDER} (${STT_PROVIDER === 'cartesia' ? 'ink-whisper' : STT_MODEL})`);
+	console.log(`    STT:             native Gemini Live inputAudioTranscription`);
 	console.log(`    Cartesia TTS:    ${CARTESIA_API_KEY ? 'sonic-3' : 'disabled'}`);
 	console.log();
 	console.log('Start the web client:');
