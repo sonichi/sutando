@@ -518,7 +518,11 @@ return frontApp`;
 
 /** All inline tools — import and spread into your tools list */
 // ─── Notes tools ─────────────────────────────────────────
-const NOTES_DIR = join(process.cwd(), 'notes');
+// Resolve at module-init: $SUTANDO_PRIVATE_DIR/notes (canonical) when set,
+// else cwd/notes (legacy fallback). Notes are SHARED across the fleet so
+// they live at the top-level private dir, not under machine-<host>/.
+import { sharedPersonalPath } from './util_paths.js';
+const NOTES_DIR = sharedPersonalPath('notes', process.cwd());
 
 export const showViewTool: ToolDefinition = {
 	name: 'show_view',

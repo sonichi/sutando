@@ -18,6 +18,8 @@ from pathlib import Path
 import discord
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from util_paths import shared_personal_path  # noqa: E402
 
 # Load token from channels config
 TOKEN = ""
@@ -45,6 +47,10 @@ OWNER_ACTIVITY_FILE = STATE_DIR / "last-owner-activity.json"
 SEND_ALLOWED_ROOTS = (
     str(REPO / "results"),
     str(REPO / "notes"),
+    # Notes canonical home (private dir) — once saved by save_note, paths
+    # reference the private location. Both old and new paths allowed during
+    # the transition; the resolver picks whichever exists.
+    str(shared_personal_path("notes", REPO)),
     str(REPO / "docs"),
     str(Path.home() / "Desktop" / "iclr-backups"),
     str(Path.home() / "Documents" / "sutando-launch-assets"),

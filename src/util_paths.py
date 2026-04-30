@@ -63,3 +63,34 @@ def personal_path(filename: str, workspace: Path | None = None) -> Path:
     if filename in {"stand-avatar.png"}:
         return ws / "assets" / filename
     return ws / filename
+
+
+def shared_personal_path(filename: str, workspace: Path | None = None) -> Path:
+    """Resolve a shared-private path (notes, build_log, etc.) — files that
+    sync across all of an owner's machines, not per-machine state.
+
+    Order: `$SUTANDO_PRIVATE_DIR/<filename>` (top-level, shared) → `<workspace>/<filename>`.
+
+    Difference vs `personal_path`: this resolves to the top-level private dir,
+    NOT `machine-<host>/`. Use for files like notes/, where every Mac in
+    Chi's fleet should see the same content.
+
+    Returns the FIRST existing path. If none exist, returns the preferred
+    private path so the caller's `.exists()` check fails gracefully.
+    """
+    ws = workspace if workspace is not None else REPO_DIR
+
+    root = os.environ.get("SUTANDO_PRIVATE_DIR")
+    if root:
+        private = Path(os.path.expanduser(root)) / filename
+        if private.exists():
+            return private
+        # Fall back to workspace if private doesn't have it, but remember
+        # the preferred private path for the "nothing exists" branch.
+        p = ws / filename
+        if p.exists():
+            return p
+        return private
+
+    p = ws / filename
+    return p

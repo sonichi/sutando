@@ -18,6 +18,9 @@ import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent))
+from util_paths import personal_path, shared_personal_path  # noqa: E402
+
 WORKSPACE = Path(__file__).parent.parent
 RESULTS_DIR = WORKSPACE / "results"
 
@@ -35,7 +38,7 @@ def check_pending_questions():
     which never matched the actual format, so it always returned an empty
     list and friction-detector silently missed every unanswered question.
     """
-    pq = WORKSPACE / "pending-questions.md"
+    pq = Path(personal_path("pending-questions.md", WORKSPACE))
     if not pq.exists():
         return []
     content = pq.read_text()
@@ -155,7 +158,7 @@ def check_stale_results():
 def check_notes_without_follow_up():
     """Find notes tagged 'action' or 'todo' that are >7 days old."""
     issues = []
-    notes_dir = WORKSPACE / "notes"
+    notes_dir = Path(shared_personal_path("notes", WORKSPACE))
     if not notes_dir.exists():
         return []
     now = datetime.now().timestamp()

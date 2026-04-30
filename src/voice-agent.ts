@@ -37,26 +37,8 @@ import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
 import { workTool, cancelTask, startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
 import { buildSutandoSystemPrompt, buildVoiceAgentContext } from './voice-context.js';
-import { hostname } from 'node:os';
 
-// Personal-asset path resolver — TypeScript twin of src/util_paths.py.
-// Each Stand has its own identity. Canonical home is
-// `$SUTANDO_PRIVATE_DIR/machine-<hostname>/<file>`. Falls back to the
-// public workspace so existing installs keep working until they migrate.
-function personalPath(filename: string): string {
-	const privateRoot = process.env.SUTANDO_PRIVATE_DIR;
-	if (privateRoot) {
-		const root = privateRoot.replace(/^~/, process.env.HOME || '');
-		const host = hostname().split('.')[0];
-		const candidate = join(root, `machine-${host}`, filename);
-		if (existsSync(candidate)) return candidate;
-	}
-	if (filename === 'stand-avatar.png') {
-		const inAssets = join('assets', filename);
-		if (existsSync(inAssets)) return inAssets;
-	}
-	return filename;
-}
+import { personalPath, sharedPersonalPath } from './util_paths.js';
 
 // Cartesia is loaded dynamically at the bottom of the config section so
 // the `@cartesia/cartesia-js` package is only required when the user has
@@ -300,7 +282,7 @@ const saveMeetingNoteTool: ToolDefinition = {
 		const { content, type } = args as { content: string; type?: 'point' | 'summary' };
 		const today = new Date().toISOString().slice(0, 10);
 		const time = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' });
-		const notePath = join(WORKSPACE_DIR, 'notes', `meeting-${today}.md`);
+		const notePath = sharedPersonalPath(`notes/meeting-${today}.md`, WORKSPACE_DIR);
 		const isSummary = type === 'summary';
 
 		if (!existsSync(notePath)) {

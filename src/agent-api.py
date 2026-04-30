@@ -275,7 +275,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             tasks = [{"id": tid, **tdata} for tid, tdata in sorted_tasks]
             # Parse pending questions
             questions = []
-            pq_file = REPO_DIR / "pending-questions.md"
+            pq_file = Path(personal_path("pending-questions.md", REPO_DIR))
             if pq_file.exists():
                 import re
                 content = pq_file.read_text()
@@ -587,7 +587,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if not qid or not answer:
                     self.send_json(400, {"error": "id and answer required"})
                     return
-                pq_file = REPO_DIR / "pending-questions.md"
+                pq_file = Path(personal_path("pending-questions.md", REPO_DIR))
                 if pq_file.exists():
                     content = pq_file.read_text()
                     # Update status from unanswered to answered
