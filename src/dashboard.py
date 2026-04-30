@@ -22,6 +22,11 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 REPO_DIR = Path(__file__).parent.parent
+
+# Personal-asset path resolver — see src/util_paths.py. Used for /avatar
+# and /stand-identity endpoints so they prefer per-machine private dir.
+sys.path.insert(0, str(Path(__file__).parent))
+from util_paths import personal_path  # noqa: E402
 PORT = 7844
 
 
@@ -350,9 +355,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(html.encode())
         elif urlparse(self.path).path == "/avatar":
-            avatar_file = REPO_DIR / "assets" / "stand-avatar.png"
-            if not avatar_file.exists():
-                avatar_file = REPO_DIR / "stand-avatar.png"  # legacy root fallback
+            avatar_file = personal_path("stand-avatar.png", workspace=REPO_DIR)
             if avatar_file.exists():
                 self.send_response(200)
                 self.send_header("Content-Type", "image/png")
@@ -363,7 +366,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_response(404)
                 self.end_headers()
         elif urlparse(self.path).path == "/stand-identity":
-            si_file = REPO_DIR / "stand-identity.json"
+            si_file = personal_path("stand-identity.json", workspace=REPO_DIR)
             data = json.loads(si_file.read_text()) if si_file.exists() else {}
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

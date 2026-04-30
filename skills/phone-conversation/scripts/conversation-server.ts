@@ -49,6 +49,19 @@ _dotenvConfig({ path: new URL('../../../.env', import.meta.url).pathname, overri
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { mkdirSync, writeFileSync, appendFileSync, unlinkSync, existsSync, readFileSync, readdirSync, symlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
+import { hostname } from 'node:os';
+
+// Personal-asset path resolver — twin of util_paths.py / voice-agent.ts:personalPath.
+function personalPath(filename: string): string {
+	const privateRoot = process.env.SUTANDO_PRIVATE_DIR;
+	if (privateRoot) {
+		const root = privateRoot.replace(/^~/, process.env.HOME || '');
+		const host = hostname().split('.')[0];
+		const candidate = join(root, `machine-${host}`, filename);
+		if (existsSync(candidate)) return candidate;
+	}
+	return filename;
+}
 import { fileURLToPath } from 'node:url';
 import { execSync, spawn, type ChildProcess } from 'node:child_process';
 import { VoiceSession, type ToolDefinition, type MainAgent } from 'bodhi-realtime-agent';
@@ -378,7 +391,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 		// Outbound calls (from /call or /concurrent-call) always set a purpose.
 		const isInbound = !callSession.purpose;
 		// Load Stand identity (voice-context.txt excluded — can confuse phone identity)
-		const standId = (() => { try { const si = JSON.parse(readFileSync('stand-identity.json', 'utf-8')); return si.name ? `Your Stand name is ${si.name}. When asked your name, say "I'm Sutando — ${si.name}."` : ''; } catch { return ''; } })();
+		const standId = (() => { try { const si = JSON.parse(readFileSync(personalPath('stand-identity.json'), 'utf-8')); return si.name ? `Your Stand name is ${si.name}. When asked your name, say "I'm Sutando — ${si.name}."` : ''; } catch { return ''; } })();
 		instructions = [
 			'You are Sutando, a personal AI assistant.',
 			standId,

@@ -85,6 +85,12 @@ REPO_DIR = Path(__file__).parent.parent
 TASK_DIR = REPO_DIR / "tasks"
 PORT = 7843
 
+# Personal-asset path resolver — see src/util_paths.py. Imported here so the
+# /avatar and /stand-identity endpoints prefer the per-machine private dir
+# over the public workspace.
+sys.path.insert(0, str(Path(__file__).parent))
+from util_paths import personal_path  # noqa: E402
+
 # Simple token auth — set SUTANDO_API_TOKEN in .env for remote access security
 API_TOKEN = os.environ.get("SUTANDO_API_TOKEN", "")
 
@@ -305,7 +311,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 self.send_json(404, {"error": "task not found"})
         elif path == "/avatar":
-            avatar_file = REPO_DIR / "assets" / "stand-avatar.png"
+            avatar_file = personal_path("stand-avatar.png", workspace=REPO_DIR)
             if avatar_file.exists():
                 self.send_response(200)
                 self.send_header("Content-Type", "image/png")
@@ -316,7 +322,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 self.send_json(404, {"error": "no avatar"})
         elif path == "/stand-identity":
-            si_file = REPO_DIR / "stand-identity.json"
+            si_file = personal_path("stand-identity.json", workspace=REPO_DIR)
             data = json.loads(si_file.read_text()) if si_file.exists() else {}
             self.send_json(200, data)
         elif path == "/activity":

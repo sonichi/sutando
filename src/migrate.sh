@@ -53,10 +53,14 @@ if [ -f "$HOME/.claude.json" ]; then
   echo "  ✓ ~/.claude.json (MCP servers)"
 fi
 
-# 4. Gitignored runtime files
-for f in stand-identity.json stand-avatar.png tab-aliases.json PERSONAL_CLAUDE.md; do
+# 4. Gitignored runtime files. stand-avatar.png lives under assets/ (not repo
+# root); util_paths.py / personalPath() handles read-side, but bundle copy
+# uses the source path it actually exists at. Other files are at repo root.
+for f in stand-identity.json tab-aliases.json PERSONAL_CLAUDE.md; do
   [ -f "$REPO/$f" ] && cp "$REPO/$f" "$BUNDLE/" && echo "  ✓ $f"
 done
+# stand-avatar.png is at assets/stand-avatar.png in the public workspace.
+[ -f "$REPO/assets/stand-avatar.png" ] && cp "$REPO/assets/stand-avatar.png" "$BUNDLE/stand-avatar.png" && echo "  ✓ stand-avatar.png"
 # Gitignored repo files (inside subdirectories)
 for f in skills/schedule-crons/crons.json; do
   [ -f "$REPO/$f" ] && mkdir -p "$BUNDLE/repo-gitignored/$(dirname $f)" && cp "$REPO/$f" "$BUNDLE/repo-gitignored/$f" && echo "  ✓ $f"
@@ -234,10 +238,16 @@ if [ -d "$BUNDLE_DIR/claude-config" ]; then
   echo "  ✓ claude config restored"
 fi
 
-# Copy gitignored files
-for f in stand-identity.json stand-avatar.png tab-aliases.json PERSONAL_CLAUDE.md; do
+# Copy gitignored files. stand-avatar.png target is assets/ (not root) to
+# match where the public workspace expects it; util_paths still resolves
+# correctly from either location.
+for f in stand-identity.json tab-aliases.json PERSONAL_CLAUDE.md; do
   [ -f "$BUNDLE_DIR/$f" ] && cp "$BUNDLE_DIR/$f" "$REPO/" && echo "  ✓ $f restored"
 done
+if [ -f "$BUNDLE_DIR/stand-avatar.png" ]; then
+  mkdir -p "$REPO/assets"
+  cp "$BUNDLE_DIR/stand-avatar.png" "$REPO/assets/stand-avatar.png" && echo "  ✓ stand-avatar.png restored to assets/"
+fi
 # Restore gitignored repo files (crons.json, etc.)
 if [ -d "$BUNDLE_DIR/repo-gitignored" ]; then
   cp -r "$BUNDLE_DIR/repo-gitignored/"* "$REPO/" 2>/dev/null && echo "  ✓ gitignored repo files restored (crons.json, etc.)"
