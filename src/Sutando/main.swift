@@ -924,7 +924,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         lastDropTime = now
 
         let timestamp = ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withFullDate, .withTime, .withSpaceBetweenDateAndTime, .withColonSeparatorInTime])
-        let dropFile = workspace + "/context-drop.txt"
         let logFile = workspace + "/logs/context-drop.log"
         let tasksDir = workspace + "/tasks"
         let epoch = Int(Date().timeIntervalSince1970 * 1000)
