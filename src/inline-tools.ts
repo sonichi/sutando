@@ -305,9 +305,6 @@ export const brightnessTool: ToolDefinition = {
 		if (level <= 1 && level > 0) level = Math.round(level * 100);
 		const bLevel = (level / 100).toFixed(2);
 		try {
-			execSync(`osascript -e 'tell application "System Events" to tell appearance preferences to set dark mode to false'`, { timeout: 1_000 }).toString();
-		} catch {} // ignore — just trying to ensure display is active
-		try {
 			execSync(`brightness ${bLevel}`, { timeout: 5_000 });
 			console.log(`${ts()} [Brightness] set to ${level}%`);
 			return { status: 'set', level };
