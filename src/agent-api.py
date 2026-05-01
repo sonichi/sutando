@@ -209,6 +209,7 @@ def _is_safe_callback_url(url: str) -> tuple[bool, str]:
         ipaddress.ip_network(b) for b in (
             "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
             "169.254.0.0/16", "0.0.0.0/8", "100.64.0.0/10", "198.18.0.0/15",
+            "224.0.0.0/4", "240.0.0.0/4",
             "::1/128", "fc00::/7", "fe80::/10", "ff00::/8",
         )
     ]
@@ -725,7 +726,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if callback_url:
             safe, reason = _is_safe_callback_url(callback_url)
             if not safe:
-                self.send_json(400, {"error": f"callback_url failed SSRF check ({reason}): must be HTTPS, no private IPs"})
+                print(f"[api] BLOCKED: callback_url failed SSRF check ({reason}): {callback_url}")
+                self.send_json(400, {"error": "callback_url failed validation"})
                 return
 
         # Write to tasks/ for sutando-core to pick up
