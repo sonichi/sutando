@@ -36,7 +36,7 @@ try:
     from dotenv import load_dotenv
     load_dotenv(REPO / ".env")
 except ImportError:
-    pass
+    print("⚠️ python-dotenv not installed — relying on shell env for GITHUB_WEBHOOK_SECRET")
 
 # GitHub webhook secret for payload signature verification.
 # Set GITHUB_WEBHOOK_SECRET in your .env to match the secret configured in
@@ -161,6 +161,9 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
 
 def main():
+    # NOTE: binds to all interfaces (0.0.0.0). For production, consider
+    # binding to 127.0.0.1 and placing behind a reverse proxy (nginx, ngrok)
+    # for defense-in-depth on top of the HMAC signature check.
     server = HTTPServer(("0.0.0.0", PORT), WebhookHandler)
     print(f"GitHub webhook bridge listening on port {PORT}")
     print(f"Events: issues.opened, pull_request.opened/merged, star.created, issue_comment.created")
