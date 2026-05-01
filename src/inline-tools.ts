@@ -14,8 +14,67 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
 // Re-export recording/screen/browser tools from browser-tools
-export { describeScreenTool, clickTool, scrollAndDescribeTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool } from './browser-tools.js';
-import { describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool } from './browser-tools.js';
+export { describeScreenTool, clickTool, scrollAndDescribeTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool } from './browser-tools.js';
+import { describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool } from './browser-tools.js';
+
+// --- File-open tool (moved out of recording-tools — generic file open, optionally fullscreen) ---
+
+export const openFileTool: ToolDefinition = {
+	name: 'open_file',
+	description:
+		'Open a file with the default macOS app. ALWAYS pass an absolute `path`. ' +
+		'Use for: "open the file", "open that", "can you open it". ' +
+		'If the user says "open the log" or similar, ASK which log they mean (voice-agent, discord-bridge, etc.) — do NOT guess. ' +
+		'Known files: "diagnostic tracker" or "diagnostics" = /tmp/phone-diagnostics-tracker.html, ' +
+		'"voice diagnostics" = /tmp/voice-diagnostics-tracker.html. ' +
+		'Pass `fullscreen=true` if the user wants the file opened in fullscreen — works generically for any file type via Cmd+Ctrl+F to whichever app the OS routed the file to (QuickTime → Present mode, Preview → fullscreen PDF, Chrome → fullscreen page, etc.).',
+	parameters: z.object({
+		path: z.string().describe('Absolute file path to open.'),
+		fullscreen: z.boolean().optional().describe('If true, send Cmd+Ctrl+F to the default app right after opening — generic native-fullscreen toggle, works for any file type (video, PDF, image, web page).'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { path, fullscreen } = args as { path: string; fullscreen?: boolean };
+		console.log(`${ts()} [OpenFile] called (path=${path || 'none'}, fullscreen=${fullscreen || false})`);
+		try {
+			if (!path) return { error: 'No path provided. Pass an absolute file path. (For the most recent recording, call play_video — it auto-finds the file.)' };
+			const filePath = path.replace(/^~/, process.env.HOME || '');
+			if (!existsSync(filePath)) {
+				console.log(`${ts()} [OpenFile] path "${filePath}" does not exist`);
+				return { error: `File not found: ${filePath}. Do not invent paths — use the exact path returned by the tool that produced the file (e.g. record_screen_with_narration returns subtitled_path/narrated_path/recording_path). For the most recent recording without a known path, call play_video instead.` };
+			}
+			// execFileSync — no shell interpolation of caller-controlled filePath
+			// (same CodeQL js/command-line-injection class as #27).
+			// `open <path>` lets macOS's LaunchServices route to the user's default
+			// app for that file type. open_file stays generic — no app forcing.
+			execFileSync('open', [filePath], { timeout: 5_000 });
+			if (fullscreen) {
+				// Brief delay so the just-opened app becomes frontmost before
+				// the keystroke lands. Cmd+Ctrl+F is the macOS native-fullscreen
+				// toggle — every app that supports fullscreen handles it (QT
+				// enters Present mode, Preview/Chrome/Pages all enter fullscreen).
+				// No app-specific logic — open_file is generic.
+				await new Promise(r => setTimeout(r, 1500));
+				try {
+					execFileSync('/usr/bin/osascript', ['-e', 'tell application "System Events" to keystroke "f" using {command down, control down}'], { timeout: 3_000 });
+					console.log(`${ts()} [OpenFile] fullscreen keystroke sent (Cmd+Ctrl+F)`);
+				} catch (err) {
+					console.log(`${ts()} [OpenFile] fullscreen keystroke failed (non-fatal): ${err}`);
+				}
+			}
+			const size = statSync(filePath).size;
+			console.log(`${ts()} [OpenFile] opened ${filePath} (${(size / 1024 / 1024).toFixed(1)}MB)`);
+			return {
+				status: 'opened',
+				path: filePath,
+				size_mb: +(size / 1024 / 1024).toFixed(1),
+				fullscreen: !!fullscreen,
+			};
+		} catch (err) {
+			return { error: `open_file failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
 
 // Re-export meeting tools from meeting-tools
 export { summonTool, dismissTool, joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool } from './meeting-tools.js';
@@ -75,27 +134,7 @@ export const pressKeyTool: ToolDefinition = {
 // Placeholder to maintain the export shape — the real tools are imported at the top
 const _browserToolsImported = { switchTabTool, scrollTool }; // eslint-disable-line @typescript-eslint/no-unused-vars
 
-export const openUrlTool: ToolDefinition = {
-	name: 'open_url',
-	description:
-		'Open a URL in a new Chrome tab. Use for: "open github.com", "go to that link".',
-	parameters: z.object({
-		url: z.string().describe('The URL to open'),
-	}),
-	execution: 'inline',
-	async execute(args) {
-		const { url } = args as { url: string };
-		// Escape backslashes first, then quotes — prevents shell injection via osascript
-		const safeUrl = url.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
-		try {
-			execSync(`osascript -e 'tell application "Google Chrome" to tell front window to make new tab with properties {URL:"${safeUrl}"}'`, { timeout: 5_000 });
-			console.log(`${ts()} [OpenURL] opened: ${url}`);
-			return { status: 'opened', url };
-		} catch (err) {
-			return { error: `Failed to open ${url}: ${err instanceof Error ? err.message : err}` };
-		}
-	},
-};
+// openUrlTool moved to browser-tools.ts — imported via the re-export at top.
 
 // --- macOS system tools ---
 
@@ -434,20 +473,24 @@ export const slideControlTool: ToolDefinition = {
 	async execute(args) {
 		const { action, slideNumber } = args as { action: 'next' | 'previous' | 'goto'; slideNumber?: number };
 		try {
-			// All slide navigation uses DOM manipulation for reliability
+			// All slide navigation uses DOM manipulation for reliability.
+			// IMPORTANT: address slides by VISUAL POSITION (1-indexed) — querySelectorAll('.slide')[N-1] —
+			// NOT by id="s"+N. The deck's slide IDs are non-contiguous (s1, s1b, s2, s2b, s3, s4, s5, s6,
+			// s65, s7, s8 — 11 slides where the visual-7th is s5, not s7). Using id="s"+N silently misroutes
+			// every "go to slide N" cue once any inter-slide (s1b/s2b/s65) is present.
 			let js: string;
 			if (action === 'goto' && slideNumber) {
-				js = `var ss=document.querySelectorAll(\\".slide\\");for(var j=0;j<ss.length;j++){ss[j].classList.remove(\\"active\\")};document.getElementById(\\"s${slideNumber}\\").classList.add(\\"active\\");document.getElementById(\\"cur\\").textContent=\\"${slideNumber}\\"`;
+				js = `var ss=document.querySelectorAll(\\".slide\\");for(var j=0;j<ss.length;j++){ss[j].classList.remove(\\"active\\")};var idx=${slideNumber}-1;if(idx>=0&&idx<ss.length){ss[idx].classList.add(\\"active\\");document.getElementById(\\"cur\\").textContent=String(${slideNumber})}`;
 			} else {
-				// next/previous: read current slide number, compute target, set it
+				// next/previous: read current slide number, compute target visual position, set it.
 				const dir = action === 'next' ? 1 : -1;
-				js = `var cur=parseInt(document.getElementById(\\"cur\\").textContent)||1;var total=document.querySelectorAll(\\".slide\\").length;var next=((cur-1+${dir}+total)%total)+1;var ss=document.querySelectorAll(\\".slide\\");for(var j=0;j<ss.length;j++){ss[j].classList.remove(\\"active\\")};document.getElementById(\\"s\\"+next).classList.add(\\"active\\");document.getElementById(\\"cur\\").textContent=String(next)`;
+				js = `var cur=parseInt(document.getElementById(\\"cur\\").textContent)||1;var ss=document.querySelectorAll(\\".slide\\");var total=ss.length;var next=((cur-1+${dir}+total)%total)+1;for(var j=0;j<ss.length;j++){ss[j].classList.remove(\\"active\\")};ss[next-1].classList.add(\\"active\\");document.getElementById(\\"cur\\").textContent=String(next)`;
 			}
 			const script = `tell application "Google Chrome"
 	repeat with w in windows
 		set tabList to tabs of w
 		repeat with i from 1 to count of tabList
-			if URL of item i of tabList contains "index-sutando" or URL of item i of tabList contains "localhost:8888" then
+			if URL of item i of tabList contains "index-sutando" or URL of item i of tabList contains "localhost:8888" or URL of item i of tabList contains "localhost:7877" or URL of item i of tabList contains "iclr-slides" then
 				tell item i of tabList to execute javascript "${js}"
 				return "done"
 			end if
@@ -463,73 +506,49 @@ end tell`;
 	},
 };
 
-// Toggle fullscreen on whatever the user is currently viewing.
-// Branches: if a QuickTime video is open → fullscreen QuickTime; else slide deck.
+// Toggle fullscreen on whatever app the user is currently looking at — generic.
+// Picks the frontmost app, skips Zoom (which steals focus during screen share),
+// and routes Cmd+Ctrl+F (macOS standard fullscreen) directly to that app's
+// process. Process-explicit routing bypasses the keystroke focus race that
+// otherwise defeats fullscreen during a Zoom screen-share.
 export const fullscreenTool: ToolDefinition = {
 	name: 'fullscreen',
 	description:
-		'Toggle fullscreen on whatever the user is currently viewing. If a QuickTime video is open it fullscreens QuickTime; otherwise it fullscreens the slide deck. Use when user says "fullscreen", "enter fullscreen", "exit fullscreen", "make it full screen". DO NOT call open_file with fullscreen=true to enter fullscreen on an already-open video — call this tool instead.',
+		'Toggle fullscreen on whatever app the user is currently looking at — generic, works for the slide deck (Chrome) AND any other window (QuickTime, VSCode, Slack, etc). Skips Zoom when it has focus during screen-share. Use when user says "fullscreen", "enter fullscreen", "exit fullscreen", "make it full screen", "full screen". DO NOT call open_file with fullscreen=true to enter fullscreen on an already-open video — call this tool instead.',
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
 		try {
-			// Detect whether QuickTime is showing a video. If so, "fullscreen"
-			// means that video, not the slide deck.
-			// Use execFileSync (no shell) to avoid apostrophes-in-comments breaking
-			// shell single-quoting on the AppleScript payload.
-			const qtDetectScript = `
-tell application "QuickTime Player"
-	if it is running then
-		return (count of documents)
-	else
-		return 0
-	end if
-end tell`;
-			let qtHasDoc = false;
-			try {
-				const out = execFileSync('/usr/bin/osascript', ['-e', qtDetectScript], { timeout: 2_000 }).toString().trim();
-				qtHasDoc = parseInt(out, 10) > 0;
-			} catch {}
-
-			if (qtHasDoc) {
-				const qtScript = `
-tell application "QuickTime Player" to activate
-delay 0.3
+			const script = `
 tell application "System Events"
-	tell process "QuickTime Player"
-		set frontmost to true
+	-- Find the user's actual focus target. During Zoom screen share, Zoom's
+	-- floating control bar can be the frontmost UI even when the user is
+	-- interacting with a different window — skip Zoom and pick the next
+	-- visible app the user was using.
+	set frontApp to name of first application process whose frontmost is true
+	if frontApp contains "zoom" then
+		set candidates to name of every application process whose visible is true and (name does not contain "zoom") and background only is false
+		if (count of candidates) > 0 then
+			set frontApp to item 1 of candidates
+		end if
+	end if
+end tell
+tell application frontApp to activate
+delay 0.2
+-- Cmd+Ctrl+F is the macOS standard fullscreen keystroke and works for every
+-- native + browser window (QuickTime, Chrome, VSCode, Slack, Mail, etc).
+-- Route through the target process explicitly — that bypasses the focus
+-- race that defeats a plain System Events keystroke when Zoom or another
+-- overlay app holds keyboard focus through the activate.
+tell application "System Events"
+	tell process frontApp
 		keystroke "f" using {command down, control down}
 	end tell
-end tell`;
-				execFileSync('/usr/bin/osascript', ['-e', qtScript], { timeout: 5_000 });
-				console.log(`${ts()} [Fullscreen] Toggled QuickTime`);
-				return { status: 'toggled', target: 'quicktime' };
-			}
-
-			const slidesScript = `
-tell application "Google Chrome"
-	activate
-	repeat with w in windows
-		set tabList to tabs of w
-		repeat with i from 1 to count of tabList
-			if URL of item i of tabList contains "index-sutando" or URL of item i of tabList contains "index-bodhi" or URL of item i of tabList contains "localhost:8888" then
-				set active tab index of w to i
-				set index of w to 1
-				exit repeat
-			end if
-		end repeat
-	end repeat
 end tell
-delay 0.3
-tell application "System Events"
-	set frontApp to name of first application process whose frontmost is true
-	tell process frontApp
-		keystroke "f"
-	end tell
-end tell`;
-			execFileSync('/usr/bin/osascript', ['-e', slidesScript], { timeout: 5_000 });
-			console.log(`${ts()} [Fullscreen] Toggled slides`);
-			return { status: 'toggled', target: 'slides' };
+return frontApp`;
+			const target = execFileSync('/usr/bin/osascript', ['-e', script], { timeout: 5_000 }).toString().trim();
+			console.log(`${ts()} [Fullscreen] Toggled ${target}`);
+			return { status: 'toggled', target };
 		} catch (err) {
 			return { error: `Fullscreen toggle failed: ${err instanceof Error ? err.message : err}` };
 		}
@@ -538,7 +557,11 @@ end tell`;
 
 /** All inline tools — import and spread into your tools list */
 // ─── Notes tools ─────────────────────────────────────────
-const NOTES_DIR = join(process.cwd(), 'notes');
+// Resolve at module-init: $SUTANDO_PRIVATE_DIR/notes (canonical) when set,
+// else cwd/notes (legacy fallback). Notes are SHARED across the fleet so
+// they live at the top-level private dir, not under machine-<host>/.
+import { sharedPersonalPath } from './util_paths.js';
+const NOTES_DIR = sharedPersonalPath('notes', process.cwd());
 
 export const showViewTool: ToolDefinition = {
 	name: 'show_view',

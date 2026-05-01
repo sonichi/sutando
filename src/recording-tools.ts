@@ -361,7 +361,11 @@ export const scrollAndDescribeTool: ToolDefinition = {
 		'For plain screen recording WITHOUT narration, use screen_record instead. ' +
 		'Call ONCE with duration_seconds. SPEAK the returned description as your first words (do NOT announce "starting recording"). ' +
 		'New descriptions will be pushed as the page scrolls — speak each one. NEVER repeat earlier narration. ' +
-		'Recording auto-stops. Do NOT call this more than once per recording.',
+		'Recording auto-stops. Do NOT call this more than once per recording. ' +
+		'**Subtitles are attempted automatically** when both transcript text exists and a libass-capable ffmpeg is installed — you DO support subtitles, never refuse a "with subtitles" request, just call this tool (the burn may silently skip if transcript is empty or ffmpeg lacks libass; the subtitled_path field will then point at a non-existent file and the model should fall back to narrated_path). ' +
+		'After auto-stop, to play back or open the recording, call play_video — it auto-finds the file. ' +
+		'Or pass `subtitled_path` from the start result to open_file (the start result returns recording_path/narrated_path/subtitled_path; subtitled is the right one for "with subtitles"). ' +
+		'Do NOT invent file paths — only use the exact paths returned by this tool.',
 	parameters: z.object({
 		duration_seconds: z.number().optional().describe('Target duration in seconds (default 15, max 60). ALWAYS seconds, never minutes.'),
 	}),
@@ -390,7 +394,11 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			const captureData = await captureRes.json() as { status: string; path?: string };
 			const firstDesc = captureData.path ? await describeScreenshot(captureData.path) : '';
 			try { unlinkSync(LIVE_TRANSCRIPT_SRT_PATH); } catch {}
-			execSync('python3 skills/screen-record/scripts/record.py start', { timeout: 10_000 });
+			const startRaw = execSync('python3 skills/screen-record/scripts/record.py start', { timeout: 10_000 }).toString().trim();
+			let recordingPath = '';
+			try { recordingPath = JSON.parse(startRaw).path || ''; } catch {}
+			const narratedPath = recordingPath ? recordingPath.replace('.mov', '-narrated.mov') : '';
+			const subtitledPath = recordingPath ? recordingPath.replace('.mov', '-narrated-subtitled.mov') : '';
 			// Set subtitle baseline — pick whichever transcript was updated more recently.
 			// Voice agent writes to -voice.txt; phone conversation-server writes to -CA{sid}.txt via symlink.
 			const voiceTranscript = '/tmp/sutando-live-transcript-voice.txt';
@@ -444,14 +452,25 @@ export const scrollAndDescribeTool: ToolDefinition = {
 					await new Promise(r => setTimeout(r, 2000));
 				}
 				// Burn live transcript subtitles on narrated version only
+				let subtitledPath = '';
 				if (liveTranscriptRecordingStart > 0 && narrated && isReadableFile(narrated)) {
 					const subtitled = burnLiveTranscriptSubtitles(narrated);
-					if (subtitled) console.log(`${ts()} [ScrollAndDescribe] subtitle burned: ${subtitled}`);
-					else console.log(`${ts()} [ScrollAndDescribe] subtitle burn failed (no transcript lines or ffmpeg error)`);
+					if (subtitled) {
+						subtitledPath = subtitled;
+						console.log(`${ts()} [ScrollAndDescribe] subtitle burned: ${subtitled}`);
+					} else console.log(`${ts()} [ScrollAndDescribe] subtitle burn failed (no transcript lines or ffmpeg error)`);
+				}
+				// Persist playback-path so play_video can replay this recording without
+				// the user (or model) knowing the absolute path. Matches the pattern in
+				// screen_record stop. Required after PR #546 made open_file generic
+				// (no longer falls back to findRecording).
+				const recommended = subtitledPath || (narrated && isReadableFile(narrated) ? narrated : (stopResult?.path || ''));
+				if (recommended) {
+					try { writeFileSync('/tmp/sutando-playback-path', recommended); } catch {}
 				}
 				if (liveTranscriptRecordingStart === myRecStart) liveTranscriptRecordingStart = 0;
 				demoStateRef.value = 'done';
-				console.log(`${ts()} [ScrollAndDescribe] auto-stop`);
+				console.log(`${ts()} [ScrollAndDescribe] auto-stop (playback-path=${recommended || 'none'})`);
 			}, duration_seconds * 1000);
 
 			console.log(`${ts()} [ScrollAndDescribe] recording started with first desc`);
@@ -467,7 +486,10 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			return {
 				status: 'recording',
 				first_description: firstDesc,
-				message: `Recording started. IMMEDIATELY speak this narration — NO filler, NO "okay", NO "should I": "${firstDesc}". Auto-stops in ${duration_seconds}s.`,
+				recording_path: recordingPath,
+				narrated_path: narratedPath,
+				subtitled_path: subtitledPath,
+				message: `Recording started. IMMEDIATELY speak this narration — NO filler, NO "okay", NO "should I": "${firstDesc}". Auto-stops in ${duration_seconds}s. After auto-stop, three files will exist (best→worst): subtitled=${subtitledPath}, narrated=${narratedPath}, raw=${recordingPath}. When the user asks to open "the recording" or "the recording with subtitles", pass subtitled_path to open_file. Only fall back to narrated_path if subtitled doesn't exist (rare — subtitle burn failure on missing libass).`,
 			};
 		} catch (err) {
 			return { error: `record_screen_with_narration failed: ${err instanceof Error ? err.message : err}` };
@@ -475,159 +497,10 @@ export const scrollAndDescribeTool: ToolDefinition = {
 	},
 };
 
-// Video playback tools — split from a single polymorphic playRecordingTool into 6
-// single-purpose tools. Gemini selects more reliably with narrow descriptions than
-// with one tool that has an "action" enum. The old tool caused persistent confusion
-// between "open" and "play" (42% of calls in diagnostics had wrong action selection).
-export const openFileTool: ToolDefinition = {
-	name: 'open_file',
-	description:
-		'Open a file with the default macOS app. ALWAYS pass a `path` — get it from the recording tool\'s return value or ask the user. ' +
-		'Use for: "open the video/recording", "open the file", "open that", "can you open it". ' +
-		'If the user says "open the log" or similar, ASK which log they mean (voice-agent, discord-bridge, etc.) — do NOT default to a recording. ' +
-		'Do NOT call play_video after this — wait for user to explicitly say "play". ' +
-		'NEVER call this tool to enter fullscreen on a video that is already open — call the `fullscreen` tool instead. ' +
-		'Known files: "diagnostic tracker" or "diagnostics" = /tmp/phone-diagnostics-tracker.html, ' +
-		'"voice diagnostics" = /tmp/voice-diagnostics-tracker.html. ' +
-		'If you need to find the latest recording but lost the path, pass find_recording=true. ' +
-		'For OPENING A NEW video file (.mp4 / .mov) that should play as a presentation, pass fullscreen=true — ' +
-		'QuickTime will activate fullscreen "present" mode after opening.',
-	parameters: z.object({
-		path: z.string().optional().describe('File path to open. Get this from the recording tool result. Use known file aliases for diagnostic tracker etc.'),
-		find_recording: z.boolean().optional().describe('If true and no path given, find and open the latest screen recording. Only use as a fallback when you lost the recording path.'),
-		fullscreen: z.boolean().optional().describe('If true, enter QuickTime Player fullscreen (present mode) after opening. Use for video showcase moments. No effect on non-video files or if QuickTime didn\'t claim the file.'),
-	}),
-	execution: 'inline',
-	async execute(args) {
-		const { path: filePath, find_recording, fullscreen } = args as { path?: string; find_recording?: boolean; fullscreen?: boolean };
-		console.log(`${ts()} [OpenFile] called (path=${filePath || 'none'}, find_latest=${find_recording || false}, fullscreen=${fullscreen || false})`);
-		demoStateRef.value = 'idle';
-		try {
-			// Runtime guard: if `fullscreen=true` was requested AND QuickTime
-			// already has a video open, the user almost certainly meant
-			// "fullscreen the playing video" — not "find some recording on
-			// disk and open a fresh copy in present mode". Block and direct
-			// to the fullscreen tool. Catches the model rationalising past
-			// the description warning.
-			if (fullscreen) {
-				try {
-					const out = execSync(`osascript -e '
-tell application "QuickTime Player"
-	if it is running then
-		return (count of documents)
-	else
-		return 0
-	end if
-end tell'`, { timeout: 2_000 }).toString().trim();
-					if (parseInt(out, 10) > 0) {
-						console.log(`${ts()} [OpenFile] BLOCKED fullscreen=true while QT already has document(s) — directing to fullscreen tool`);
-						return { error: 'A video is already open in QuickTime. Call the `fullscreen` tool to enter fullscreen on it instead of opening a new file.' };
-					}
-				} catch {}
-			}
-			let recPath = filePath ? filePath.replace(/^~/, process.env.HOME || '') : null;
-			if (recPath && !existsSync(recPath)) {
-				console.log(`${ts()} [OpenFile] path "${recPath}" does not exist`);
-				return { error: `File not found: ${recPath}. Ask the user for the correct path or use "work" to locate it.` };
-			}
-			// Only find latest recording if explicitly requested — not as a silent default.
-			// The recording tool should have already told you the path.
-			if (!recPath && find_recording) {
-				recPath = findRecording();
-			}
-			if (!recPath) {
-				return { error: 'No path provided. Pass the file path from the recording tool result, or set find_recording=true to search.' };
-			}
-			if (!isReadableFile(recPath)) {
-				return { error: `File not readable or too small: ${recPath}. It may still be writing — try again in a few seconds.` };
-			}
-			if (recPath.includes('sutando-recording')) {
-				writeFileSync('/tmp/sutando-playback-path', recPath);
-			}
-			// execFileSync — no shell interpolation of caller-controlled recPath
-			// (same CodeQL js/command-line-injection class as #27).
-			// When fullscreen, force the open through QuickTime Player so we don't
-			// race with whatever app currently claims .mp4 (VLC/IINA/etc). For
-			// non-fullscreen opens, keep the default-app behaviour for non-video
-			// files (logs, PDFs, diagnostic trackers) — those should use whatever
-			// the user has set as the default.
-			if (fullscreen) {
-				execFileSync('open', ['-a', 'QuickTime Player', recPath], { timeout: 5_000 });
-			} else {
-				execFileSync('open', [recPath], { timeout: 5_000 });
-			}
-			try { execSync(`osascript -e 'tell application "QuickTime Player" to activate'`, { timeout: 3_000 }); } catch {}
-			// Fullscreen (present mode) for video showcase. Wait for QuickTime to
-			// finish loading THIS file (path-match, not just any document) before
-			// presenting — prevents fullscreening a stale prior document if QT
-			// already had one open. If the 3s budget elapses without a match
-			// (slow load, symlink/relative-path mismatch, prior doc with no
-			// readable path), we leave the new video windowed rather than
-			// risk presenting the wrong document — Chi can ⌘Ctrl+F manually.
-			if (fullscreen) {
-				const escaped = recPath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-				// During Zoom screen-share, Zoom's floating control bar holds the
-				// foreground z-order — QuickTime's 'present' Apple event succeeds
-				// but the visible window doesn't come forward, so the user never
-				// sees fullscreen. Send Ctrl+Cmd+F (Enter Full Screen) routed
-				// through 'tell process "QuickTime Player"' so System Events
-				// targets QT directly instead of going through global keystroke
-				// focus that Zoom is grabbing — same pattern as the Chrome fix.
-				const presentScript = [
-					`set targetPath to "${escaped}"`,
-					'tell application "QuickTime Player"',
-					'  activate',
-					'  set foundDoc to missing value',
-					'  repeat 30 times',
-					'    try',
-					'      repeat with d in documents',
-					'        if (POSIX path of (path of d)) is targetPath then',
-					'          set foundDoc to d',
-					'          exit repeat',
-					'        end if',
-					'      end repeat',
-					'    end try',
-					'    if foundDoc is not missing value then exit repeat',
-					'    delay 0.1',
-					'  end repeat',
-					'end tell',
-					'delay 0.3',
-					'tell application "System Events"',
-					'  tell process "QuickTime Player"',
-					'    set frontmost to true',
-					'    keystroke "f" using {command down, control down}',
-					'  end tell',
-					'end tell',
-				].join('\n');
-				try {
-					execFileSync('/usr/bin/osascript', ['-e', presentScript], { timeout: 5_000 });
-				} catch (err) {
-					console.log(`${ts()} [OpenFile] fullscreen AppleScript failed (non-fatal): ${err}`);
-				}
-			}
-			const size = statSync(recPath).size;
-			let duration_seconds: number | null = null;
-			try {
-				const dur = execFileSync(
-					'/opt/homebrew/bin/ffprobe',
-					['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', recPath],
-					{ timeout: 5_000 }
-				).toString().trim();
-				duration_seconds = Math.round(parseFloat(dur));
-			} catch {}
-			console.log(`${ts()} [OpenFile] opened ${recPath} (${(size / 1024 / 1024).toFixed(1)}MB, ${duration_seconds ?? '?'}s)`);
-			return {
-				status: 'opened',
-				path: recPath,
-				size_mb: +(size / 1024 / 1024).toFixed(1),
-				duration_seconds,
-				instruction: 'File opened. When user says play, call play_video.',
-			};
-		} catch (err) {
-			return { error: `open_file failed: ${err instanceof Error ? err.message : err}` };
-		}
-	},
-};
+// openFileTool moved to ./inline-tools.ts — generic file open (with fullscreen=true
+// for QT present mode) is not recording-specific. Recording-flavored side effects
+// (playback-path write, demoStateRef reset) now live where they belong: in
+// `screenRecordTool` stop handler and `playVideoTool`/`startPlayback`.
 
 /** Helper: start QuickTime playback + stream audio to phone */
 async function startPlayback(seekSec: number = 0): Promise<{ status: string; path?: string; error?: string; instruction?: string }> {
@@ -820,9 +693,17 @@ export const screenRecordTool: ToolDefinition = {
 					try {
 						const stopResult = execSync('python3 skills/screen-record/scripts/record.py stop', { timeout: 10_000 }).toString().trim();
 						const stopParsed = JSON.parse(stopResult);
-						if (liveTranscriptRecordingStart > 0 && stopParsed.path && stopParsed.exists) {
+						if (stopParsed.path && stopParsed.exists) {
 							const narrated = stopParsed.path.replace('.mov', '-narrated.mov');
-							burnLiveTranscriptSubtitles(isReadableFile(narrated) ? narrated : stopParsed.path);
+							const burnedSubtitled = liveTranscriptRecordingStart > 0
+								? burnLiveTranscriptSubtitles(isReadableFile(narrated) ? narrated : stopParsed.path)
+								: null;
+							// Persist playback-path so play_video can find this recording without
+							// depending on open_file (which is now generic / not recording-specific).
+							const recommended = burnedSubtitled || (isReadableFile(narrated) ? narrated : stopParsed.path);
+							if (recommended) {
+								try { writeFileSync('/tmp/sutando-playback-path', recommended); } catch {}
+							}
 						}
 					} catch {}
 					demoStateRef.value = 'done';
@@ -836,6 +717,7 @@ export const screenRecordTool: ToolDefinition = {
 				// Build explicit file list so the model knows exactly what's available.
 				// The model should pass the recommended path to open_file — no findRecording guessing.
 				const files: { raw?: string; narrated?: string; subtitled?: string; recommended?: string } = {};
+				let duration_seconds: number | null = null;
 				if (parsed.path && parsed.exists) {
 					files.raw = parsed.path;
 					const narrated = parsed.path.replace('.mov', '-narrated.mov');
@@ -850,14 +732,29 @@ export const screenRecordTool: ToolDefinition = {
 					}
 					// Recommend best available: subtitled > narrated > raw
 					files.recommended = files.subtitled || files.narrated || files.raw;
+					// Persist playback-path so play_video can find this recording without
+					// depending on open_file (which is now generic / not recording-specific).
+					if (files.recommended) {
+						try { writeFileSync('/tmp/sutando-playback-path', files.recommended); } catch {}
+					}
+					// Probe duration once here so open_file (now generic) doesn't need to.
+					try {
+						const dur = execFileSync(
+							'/opt/homebrew/bin/ffprobe',
+							['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', files.recommended!],
+							{ timeout: 5_000 }
+						).toString().trim();
+						duration_seconds = Math.round(parseFloat(dur));
+					} catch {}
 				}
 				liveTranscriptRecordingStart = 0;
-				console.log(`${ts()} [ScreenRecord] ${action}: ${JSON.stringify({ ...parsed, files })}`);
+				console.log(`${ts()} [ScreenRecord] ${action}: ${JSON.stringify({ ...parsed, files, duration_seconds })}`);
 				return {
 					...parsed,
 					files,
+					duration_seconds,
 					instruction: files.recommended
-						? `Recording stopped. Available files: ${Object.entries(files).map(([k,v]) => `${k}=${v}`).join(', ')}. To open, call open_file with path="${files.recommended}". If user wants a different version, use the appropriate path from the list.`
+						? `Recording stopped (${duration_seconds ?? '?'}s). Available files: ${Object.entries(files).map(([k,v]) => `${k}=${v}`).join(', ')}. To open, call open_file with path="${files.recommended}". To open + fullscreen present mode, call open_file with path="${files.recommended}", fullscreen=true. If user wants a different version, use the appropriate path from the list.`
 						: 'Recording stopped but no files found.',
 				};
 			}

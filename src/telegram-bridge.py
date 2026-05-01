@@ -14,6 +14,44 @@ import urllib.error
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+TASKS_DIR = REPO / "tasks"
+RESULTS_DIR = REPO / "results"
+
+# Allowlist for paths that may be sent via Telegram [file: /path] markers.
+# Mirrors _is_path_sendable() in discord-bridge.py.
+SEND_ALLOWED_ROOTS = (
+    str(REPO / "results"),
+    str(REPO / "notes"),
+    str(REPO / "docs"),
+)
+SEND_ALLOWED_PREFIXES = (
+    "/tmp/sutando-",
+    "/private/tmp/sutando-",
+    "/tmp/echo-",
+    "/private/tmp/echo-",
+)
+
+
+def _is_path_sendable(fpath: str) -> bool:
+    """True iff `fpath` is a real file AND resolves under an allowed root."""
+    if not os.path.isfile(fpath):
+        return False
+    try:
+        real = os.path.realpath(fpath)
+    except OSError:
+        return False
+    for root in SEND_ALLOWED_ROOTS:
+        root_real = os.path.realpath(root)
+        if real == root_real or real.startswith(root_real + os.sep):
+            return True
+    for prefix in SEND_ALLOWED_PREFIXES:
+        if real.startswith(prefix):
+            return True
+    return False
+
+
+# --- Config loading (independent of _is_path_sendable above) ---
+
 try:
     from dotenv import load_dotenv
     load_dotenv(REPO / ".env")
@@ -198,12 +236,15 @@ def send_reply(chat_id, text):
         for i in range(0, len(clean_text), 4000):
             api("sendMessage", chat_id=chat_id, text=clean_text[i:i+4000])
 
-    # Send files
+    # Send files (allowlist-gated; see _is_path_sendable)
     for fpath in files:
         fpath = fpath.strip()
-        if os.path.isfile(fpath):
+        if _is_path_sendable(fpath):
             send_file(chat_id, fpath)
             print(f"  Sent file: {fpath}")
+        elif os.path.isfile(fpath):
+            api("sendMessage", chat_id=chat_id, text=f"(file access denied: {fpath})")
+            print(f"  BLOCKED file: {fpath}")
         else:
             api("sendMessage", chat_id=chat_id, text=f"(file not found: {fpath})")
 

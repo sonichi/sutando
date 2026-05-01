@@ -63,7 +63,9 @@ def _machine_id() -> str:
     if _CACHED_MACHINE is not None:
         return _CACHED_MACHINE
     try:
-        identity = REPO_DIR / "stand-identity.json"
+        sys.path.insert(0, str(Path(__file__).parent))
+        from util_paths import personal_path
+        identity = personal_path("stand-identity.json", workspace=REPO_DIR)
         if identity.exists():
             _CACHED_MACHINE = json.loads(identity.read_text()).get("machine", "") or "unknown"
         else:

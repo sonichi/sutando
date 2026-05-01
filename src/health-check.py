@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Optional
 
 REPO_DIR = Path(__file__).parent.parent
+sys.path.insert(0, str(Path(__file__).parent))
+from util_paths import shared_personal_path  # noqa: E402
 
 def _default_memory_dir() -> str:
     """Auto-detect Claude Code memory dir from repo path."""
@@ -559,8 +561,8 @@ def run_all_checks() -> list[dict]:
     else:
         checks.append({"name": "memory-dir", "status": "ok", "detail": "not yet created (normal for new installs)"})
 
-    # Notes
-    checks.append(check_directory(REPO_DIR / "notes", "notes-dir"))
+    # Notes — canonical home is shared private dir post-migration
+    checks.append(check_directory(Path(shared_personal_path("notes", REPO_DIR)), "notes-dir"))
 
     # Memory sync
     checks.append(check_memory_sync())

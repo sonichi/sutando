@@ -233,89 +233,8 @@ export const openUrlTool: ToolDefinition = {
 
 // --- Screen capture ---
 
-export const captureScreenTool: ToolDefinition = {
-	name: 'capture_screen',
-	description:
-		'Capture a screenshot of the screen. Use for: "take a screenshot", "what\'s on my screen", "look at this". Instant.',
-	parameters: z.object({}),
-	execution: 'inline',
-	async execute() {
-		try {
-			const res = await fetch('http://localhost:7845/capture');
-			const data = await res.json() as { status: string; path?: string; error?: string };
-			if (data.status === 'ok' && data.path) {
-				console.log(`${ts()} [Screen] Captured: ${data.path}`);
-				return { status: 'captured', path: data.path };
-			}
-			return { status: 'failed', error: data.error || 'unknown error' };
-		} catch {
-			return { status: 'failed', error: 'Screen capture server not running' };
-		}
-	},
-};
-
-// --- Type text ---
-
-export const typeTextTool: ToolDefinition = {
-	name: 'type_text',
-	description:
-		'Type text into the currently focused field. Use for: "type hello", "enter my email". Instant.',
-	parameters: z.object({
-		text: z.string().describe('The text to type'),
-	}),
-	execution: 'inline',
-	async execute(args) {
-		const { text } = args as { text: string };
-		// Debug: log exactly what arrives from Gemini so we can trace newline issues
-		console.log(`${ts()} [TypeText] input: ${JSON.stringify(text).slice(0, 200)} len=${text.length}`);
-		// Multi-line or special-char text: use clipboard paste instead of
-		// keystroke. AppleScript `keystroke` can't handle newlines, parens,
-		// or other chars that break the osascript string. Clipboard approach:
-		// save current clipboard → write text → Cmd+V → restore clipboard.
-		// Check for actual newlines OR literal backslash-n (Gemini sends the latter)
-		const hasNewline = text.includes('\n') || text.includes('\r') || /\\n/.test(text) || text.length > 80;
-		console.log(`${ts()} [TypeText] hasNewline=${hasNewline} path=${hasNewline ? 'paste' : 'keystroke'}`);
-		if (hasNewline) {
-			try {
-				let savedClipboard = '';
-				try { savedClipboard = execSync('pbpaste', { encoding: 'utf-8', timeout: 2_000 }); } catch {}
-				const tmpClip = `/tmp/sutando-typetext-clip-${Date.now()}.txt`;
-				// Convert literal \n to actual newlines (Gemini sometimes sends escaped)
-				const pasteText = text.replace(/\\n/g, '\n').replace(/\\t/g, '\t')
-					.replace(/\\\\n/g, '\n').replace(/\\\\t/g, '\t');
-				writeFileSync(tmpClip, pasteText);
-				execSync(`pbcopy < ${tmpClip}`, { timeout: 2_000 });
-				execSync(`osascript -e 'tell application "System Events" to keystroke "v" using command down'`, { timeout: 5_000 });
-				// Brief delay for paste to complete, then restore clipboard
-				execSync('sleep 0.3');
-				if (savedClipboard) {
-					const tmpRestore = `/tmp/sutando-typetext-restore-${Date.now()}.txt`;
-					writeFileSync(tmpRestore, savedClipboard);
-					execSync(`pbcopy < ${tmpRestore}`, { timeout: 2_000 });
-					try { unlinkSync(tmpRestore); } catch {}
-				}
-				try { unlinkSync(tmpClip); } catch {}
-				console.log(`${ts()} [TypeText] pasted (multi-line): ${text.slice(0, 40)}...`);
-				return { status: 'typed', text };
-			} catch (err) {
-				return { error: `Paste failed: ${err instanceof Error ? err.message : err}` };
-			}
-		}
-		// Single-line short text: use keystroke (faster, no clipboard disruption)
-		const tmpFile = `/tmp/sutando-typetext-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.scpt`;
-		try {
-			const safeText = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-			writeFileSync(tmpFile, `tell application "System Events" to keystroke "${safeText}"`);
-			execSync(`osascript ${tmpFile}`, { timeout: 5_000 });
-			console.log(`${ts()} [TypeText] typed: ${text.slice(0, 40)}`);
-			return { status: 'typed', text };
-		} catch (err) {
-			return { error: `Type failed: ${err instanceof Error ? err.message : err}` };
-		} finally {
-			try { unlinkSync(tmpFile); } catch {}
-		}
-	},
-};
+// captureScreenTool moved — canonical version lives in inline-tools.ts.
+// typeTextTool moved — canonical version lives in inline-tools.ts.
 
 // --- Describe screen (vision) ---
 
@@ -458,7 +377,6 @@ export const clickTool: ToolDefinition = {
 // Re-export recording/video tools from recording-tools
 export {
 	scrollAndDescribeTool,
-	openFileTool,
 	playVideoTool,
 	resumeVideoTool,
 	replayVideoTool,

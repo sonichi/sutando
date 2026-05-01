@@ -33,10 +33,17 @@ TRANSCRIPT="$1"  # Passed by PreCompact hook as $TRANSCRIPT_PATH
   gh pr list --repo sonichi/sutando --state open --limit 5 2>/dev/null || echo "(couldn't fetch)"
   echo ""
 
-  # Pending questions
+  # Pending questions — canonical home is private machine-<host>/ post-migration.
+  # Resolves via util_paths.personal_path() with cwd fallback.
+  PQ_PATH=$(SUTANDO_PRIVATE_DIR="${SUTANDO_PRIVATE_DIR:-}" python3 -c "
+import sys; sys.path.insert(0, '$REPO/src')
+from util_paths import personal_path
+from pathlib import Path
+print(personal_path('pending-questions.md', Path('$REPO')))
+" 2>/dev/null || echo "$REPO/pending-questions.md")
   echo "## Pending Questions"
-  if [ -f "$REPO/pending-questions.md" ]; then
-    grep -A1 "^## Q" "$REPO/pending-questions.md" | head -20
+  if [ -f "$PQ_PATH" ]; then
+    grep -A1 "^## Q" "$PQ_PATH" | head -20
   else
     echo "None"
   fi

@@ -14,8 +14,11 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent))
+from util_paths import personal_path  # noqa: E402
+
 WORKSPACE = Path(__file__).parent.parent
-PQ_FILE = WORKSPACE / "pending-questions.md"
+PQ_FILE = Path(personal_path("pending-questions.md", WORKSPACE))
 RESULTS_DIR = WORKSPACE / "results"
 LAST_NOTIFY_FILE = WORKSPACE / ".last-pq-notify"
 VOICE_LOG = WORKSPACE / "logs" / "voice-agent.log"

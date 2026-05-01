@@ -381,6 +381,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        // Skip when "watcher" is already queued in the CLI input buffer.
+        // claude-code queues keystrokes during a turn and processes them
+        // when the turn ends. cliIsWorking() catches fresh (<60s) tool
+        // children, but a long-running tool (>60s) returns false here —
+        // the next watcher tick would then double-send "watcher", so the
+        // CLI processes "watcher\nwatcher" serially and spawns watcher
+        // twice. Capture-pane the bottom of the pane and skip if
+        // "watcher" appears near the prompt area.
+        if watcherKeystrokesQueued() {
+            logToFile("watcher dead; 'watcher' already queued in pane — skipping send")
+            return
+        }
+
         // Throttle: don't alert more than once every 120s so the CLI doesn't
         // get flooded if it's slow to restart.
         if Date().timeIntervalSince(lastWatcherAlert) < 120 { return }
@@ -525,6 +538,68 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         do { try send.run() } catch { return false }
         send.waitUntilExit()
         return send.terminationStatus == 0
+    }
+
+    /// Detect whether the word "watcher" is already typed at claude-code's
+    /// CURRENT prompt line in the sutando-core pane. Only the current prompt
+    /// (the bottom-most `❯ ` line) indicates queued input — past prompts in
+    /// scrollback don't.
+    ///
+    /// History of this function:
+    /// - PR #553: matched `\bwatcher\b` across bottom 5 lines → over-fired
+    ///   on prose like "Ensure the watcher is running" in tool output.
+    /// - PR #557: filtered to lines starting with `❯ `. But `capture-pane
+    ///   -S -3` returns the visible pane PLUS scrollback (≠ "last 3 lines"),
+    ///   so old prompts like `❯ why is watcher reminder not sent?` were
+    ///   still treated as queued input → still over-fired.
+    /// - This PR: walk all lines, remember the LAST `❯ ` line seen (the
+    ///   current prompt), check only that one.
+    ///
+    /// Returns false on any tmux failure so a missing tmux doesn't suppress
+    /// alerts.
+    func watcherKeystrokesQueued() -> Bool {
+        let tmuxPath: String
+        if FileManager.default.fileExists(atPath: "/opt/homebrew/bin/tmux") {
+            tmuxPath = "/opt/homebrew/bin/tmux"
+        } else if FileManager.default.fileExists(atPath: "/usr/local/bin/tmux") {
+            tmuxPath = "/usr/local/bin/tmux"
+        } else {
+            return false
+        }
+        let cap = Process()
+        cap.executableURL = URL(fileURLWithPath: tmuxPath)
+        cap.arguments = ["-S", sutandoTmuxSocket, "capture-pane", "-t", "sutando-core", "-p"]
+        let pipe = Pipe()
+        cap.standardOutput = pipe
+        cap.standardError = FileHandle.nullDevice
+        do { try cap.run() } catch { return false }
+        cap.waitUntilExit()
+        if cap.terminationStatus != 0 { return false }
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        // Find the LAST line starting with "❯" — that's the current prompt.
+        // Past prompts in scrollback don't represent queued input.
+        //
+        // Match "❯" without requiring a trailing space: an EMPTY prompt is
+        // rendered as `❯ ` (prompt + space), but `trimmingCharacters` strips
+        // the trailing space → we'd miss the empty prompt and fall back to
+        // an earlier prompt-with-text in scrollback. Bug from PR #559 that
+        // caused continuous "queued in pane — skipping send" even on empty
+        // prompt. Fix: trim only LEADING whitespace; check `❯` prefix; the
+        // input portion is whatever follows.
+        var lastPromptInput: String? = nil
+        for line in out.split(separator: "\n") {
+            // Trim only leading whitespace (not trailing) so empty prompt
+            // `❯ ` is preserved as `❯ ` (prompt + space + nothing).
+            let leading = line.drop(while: { $0 == " " || $0 == "\t" })
+            if leading.hasPrefix("❯") {
+                // Drop the prompt char + any single space that follows it.
+                var rest = leading.dropFirst()  // drop "❯"
+                if rest.hasPrefix(" ") { rest = rest.dropFirst() }  // drop one space if present
+                lastPromptInput = String(rest)
+            }
+        }
+        guard let input = lastPromptInput else { return false }
+        return input.range(of: #"\bwatcher\b"#, options: .regularExpression) != nil
     }
 
     /// Return the avatar image, badged per composite mode:
@@ -844,6 +919,76 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Context Drop Logic
 
+    /// Capture frontmost-app context to enrich the dropped task with what the user was looking at.
+    /// Returns three fields: app name, frontmost-window title (via Accessibility API), and Chrome
+    /// active-tab URL when Chrome is the target. Same skip-Zoom heuristic as the fullscreen tool —
+    /// during screen share, Zoom can be frontmost while the user is interacting with another window;
+    /// we walk back to the next non-Zoom visible app so the captured context matches user intent.
+    private func getFrontmostContext() -> (app: String?, windowTitle: String?, chromeURL: String?) {
+        var targetApp: NSRunningApplication? = NSWorkspace.shared.frontmostApplication
+        let frontName = targetApp?.localizedName?.lowercased() ?? ""
+        if frontName.contains("zoom") {
+            // Skip Zoom; pick the next visible regular (non-background) app.
+            let candidates = NSWorkspace.shared.runningApplications.filter { app in
+                app.activationPolicy == .regular &&
+                !(app.localizedName?.lowercased().contains("zoom") ?? false) &&
+                app.localizedName != nil
+            }
+            // Order by launch date descending — the user's most recent non-Zoom app is the best guess.
+            targetApp = candidates.max(by: { ($0.launchDate ?? Date.distantPast) < ($1.launchDate ?? Date.distantPast) })
+        }
+        let appName = targetApp?.localizedName
+
+        // Window title via Accessibility API. Requires PID; cheap if granted, silent fail otherwise.
+        var windowTitle: String? = nil
+        if let pid = targetApp?.processIdentifier {
+            let axApp = AXUIElementCreateApplication(pid)
+            var focusedRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, &focusedRef) == .success,
+               let axWindow = focusedRef {
+                var titleRef: CFTypeRef?
+                if AXUIElementCopyAttributeValue(axWindow as! AXUIElement, kAXTitleAttribute as CFString, &titleRef) == .success,
+                   let title = titleRef as? String, !title.isEmpty {
+                    windowTitle = title
+                }
+            }
+        }
+
+        // Chrome active-tab URL via AppleScript — only when Chrome is the target. ~200ms.
+        var chromeURL: String? = nil
+        if appName == "Google Chrome" {
+            let script = "tell application \"Google Chrome\" to return URL of active tab of front window"
+            let task = Process()
+            task.launchPath = "/usr/bin/osascript"
+            task.arguments = ["-e", script]
+            let pipe = Pipe()
+            task.standardOutput = pipe
+            task.standardError = Pipe()
+            do {
+                try task.run()
+                task.waitUntilExit()
+                if task.terminationStatus == 0 {
+                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                    let url = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if let url = url, !url.isEmpty { chromeURL = url }
+                }
+            } catch {}
+        }
+
+        return (appName, windowTitle, chromeURL)
+    }
+
+    /// Format the frontmost-context fields as YAML-style header lines for the task file.
+    /// Empty if no fields captured. Lines are intentionally outside the `---` separator so
+    /// downstream readers can grep them as task metadata, not message body.
+    private func formatFrontmostContext(_ ctx: (app: String?, windowTitle: String?, chromeURL: String?)) -> String {
+        var lines: [String] = []
+        if let a = ctx.app { lines.append("top_app: \(a)") }
+        if let w = ctx.windowTitle { lines.append("top_window_title: \(w)") }
+        if let u = ctx.chromeURL { lines.append("top_url: \(u)") }
+        return lines.isEmpty ? "" : lines.joined(separator: "\n") + "\n"
+    }
+
     @objc func dropContext() {
         // Debounce: ignore if less than 1 second since last drop
         let now = Date()
@@ -854,11 +999,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         lastDropTime = now
 
         let timestamp = ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withFullDate, .withTime, .withSpaceBetweenDateAndTime, .withColonSeparatorInTime])
-        let dropFile = workspace + "/context-drop.txt"
         let logFile = workspace + "/logs/context-drop.log"
         let tasksDir = workspace + "/tasks"
         let epoch = Int(Date().timeIntervalSince1970 * 1000)
         let dropImage = tasksDir + "/image-\(epoch).png"
+
+        // Capture frontmost-app context once, before the type-specific branches. Adds top_app /
+        // top_window_title / top_url (Chrome only) header lines so the core agent knows what the
+        // user was looking at when they dropped.
+        let ctx = getFrontmostContext()
+        let ctxHeader = formatFrontmostContext(ctx)
 
         // 1. Check Finder selection (only if Finder is frontmost)
         if let frontApp = NSWorkspace.shared.frontmostApplication,
@@ -868,7 +1018,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 timestamp: \(timestamp)
                 type: file
                 path: \(finderFile)
-                ---
+                \(ctxHeader)---
                 [File selected in Finder: \(finderFile)]
                 """
                 appendLog(logFile, "[\(timestamp)] Dropped: file (\(finderFile))")
@@ -886,7 +1036,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 timestamp: \(timestamp)
                 type: image
                 path: \(dropImage)
-                ---
+                \(ctxHeader)---
                 [Image dropped from clipboard]
                 """
                 appendLog(logFile, "[\(timestamp)] Dropped: image (\(imageData.count) bytes)")
@@ -906,7 +1056,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 timestamp: \(timestamp)
                 type: image
                 path: \(dropImage)
-                ---
+                \(ctxHeader)---
                 [Image dropped from clipboard]
                 """
                 appendLog(logFile, "[\(timestamp)] Dropped: image (\(pngData.count) bytes)")
@@ -921,7 +1071,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let content = """
             timestamp: \(timestamp)
             type: text
-            ---
+            \(ctxHeader)---
             \(selected)
             """
             appendLog(logFile, "[\(timestamp)] Dropped: \(selected.count) chars")
@@ -938,7 +1088,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 let content = """
                 timestamp: \(timestamp)
                 type: text
-                ---
+                \(ctxHeader)---
                 \(text)
                 """
                 appendLog(logFile, "[\(timestamp)] Dropped: \(text.count) chars")

@@ -12,11 +12,14 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent))
+from util_paths import shared_personal_path  # noqa: E402
+
 WORKSPACE = Path(__file__).parent.parent
 CALLS_FILE = WORKSPACE / "results" / "calls" / "calls.jsonl"
 RESULTS_DIR = WORKSPACE / "results"
 STATE_DIR = WORKSPACE / "state"
-NOTES_DIR = WORKSPACE / "notes"
+NOTES_DIR = Path(shared_personal_path("notes", WORKSPACE))
 
 
 def load_calls():

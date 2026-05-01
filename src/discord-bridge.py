@@ -18,6 +18,8 @@ from pathlib import Path
 import discord
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from util_paths import shared_personal_path  # noqa: E402
 
 # Load token from channels config
 TOKEN = ""
@@ -45,6 +47,10 @@ OWNER_ACTIVITY_FILE = STATE_DIR / "last-owner-activity.json"
 SEND_ALLOWED_ROOTS = (
     str(REPO / "results"),
     str(REPO / "notes"),
+    # Notes canonical home (private dir) — once saved by save_note, paths
+    # reference the private location. Both old and new paths allowed during
+    # the transition; the resolver picks whichever exists.
+    str(shared_personal_path("notes", REPO)),
     str(REPO / "docs"),
     str(Path.home() / "Desktop" / "iclr-backups"),
     str(Path.home() / "Documents" / "sutando-launch-assets"),
@@ -400,7 +406,7 @@ async def _handle_discord_message(message, force=False):
                 # channel set to `true` — open to all, skip access check
                 channel_authorized = True
             elif len(ch_allowed) > 0 and sender_id not in ch_allowed:
-                print(f"  [skip] @{username} not in channel allowlist", flush=True)
+                print(f"  [skip] @{username} (id={sender_id}) not in channel allowlist", flush=True)
                 return
             else:
                 # sender is in ch_allowed (or ch_allowed is empty + requireMention)

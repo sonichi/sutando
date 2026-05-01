@@ -29,21 +29,18 @@ import { execSync as execSyncTop } from 'node:child_process';
 import { inlineTools } from './inline-tools.js';
 import { injectText } from './browser-tools.js';
 import { join } from 'node:path';
-import {
-	VoiceSession,
-	GeminiBatchSTTProvider,
-} from 'bodhi-realtime-agent';
+import { VoiceSession } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
-import { workTool, cancelTask, startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
+import { workTool, startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
 import { buildSutandoSystemPrompt, buildVoiceAgentContext } from './voice-context.js';
+
+import { personalPath, sharedPersonalPath } from './util_paths.js';
 
 // Cartesia is loaded dynamically at the bottom of the config section so
 // the `@cartesia/cartesia-js` package is only required when the user has
 // set CARTESIA_API_KEY. Gemini-only setups (the default) skip the import
 // entirely — no install cost, no type-check cost (see tsconfig `exclude`).
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let CartesiaSTTProvider: any = null;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let generateSpeech: ((text: string, opts: { category: string; label: string }) => Promise<string>) | null = null;
 
@@ -103,8 +100,6 @@ const CALL_RESULTS_DIR = join(new URL('.', import.meta.url).pathname, '..', 'res
 // Model configuration — override via .env for cost/quality tuning
 const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
 const VOICE_NATIVE_AUDIO_MODEL = process.env.VOICE_NATIVE_AUDIO_MODEL || 'gemini-3.1-flash-live-preview';
-// STT_MODEL is the model name passed to GeminiBatchSTTProvider. Only used when STT_PROVIDER=gemini.
-const STT_MODEL = process.env.STT_MODEL || 'gemini-3-flash-preview';
 // Google Search grounding — MUST be false under gemini-3.1-flash-live-preview
 // native audio. Combining googleSearch: true + 3.1 native audio causes the
 // transport to reject setup with close code 1011 "exceeded your current
@@ -115,27 +110,22 @@ const STT_MODEL = process.env.STT_MODEL || 'gemini-3-flash-preview';
 // in .env when unpinning VOICE_NATIVE_AUDIO_MODEL to 3.1.
 const VOICE_GOOGLE_SEARCH = (process.env.VOICE_GOOGLE_SEARCH ?? 'true').toLowerCase() !== 'false';
 const CARTESIA_API_KEY = process.env.CARTESIA_API_KEY || '';
-const STT_PROVIDER = process.env.STT_PROVIDER || (CARTESIA_API_KEY ? 'cartesia' : 'gemini');
 
-// Lazy-load Cartesia modules only when a key is set. This means Gemini-only
+// Lazy-load Cartesia TTS only when a key is set. This means Gemini-only
 // users don't need `@cartesia/cartesia-js` installed at all — the
 // cartesia-*.ts files are excluded from tsc via tsconfig and never loaded
 // by tsx at runtime unless this branch runs.
 if (CARTESIA_API_KEY) {
 	try {
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const sttMod: any = await import('./cartesia-stt-provider.js');
-		CartesiaSTTProvider = sttMod.CartesiaSTTProvider;
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const ttsMod: any = await import('./cartesia-tts.js');
 		generateSpeech = ttsMod.generateSpeech;
 	} catch (err) {
 		console.error(
-			`[Cartesia] failed to load modules — is @cartesia/cartesia-js installed?`,
+			`[Cartesia] failed to load TTS module — is @cartesia/cartesia-js installed?`,
 			err instanceof Error ? err.message : err
 		);
-		// CartesiaSTTProvider and generateSpeech stay null; guards below
-		// will fall back to Gemini paths.
+		// generateSpeech stays null; the Cartesia TTS branch below will be skipped.
 	}
 }
 
@@ -280,7 +270,7 @@ const saveMeetingNoteTool: ToolDefinition = {
 		const { content, type } = args as { content: string; type?: 'point' | 'summary' };
 		const today = new Date().toISOString().slice(0, 10);
 		const time = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' });
-		const notePath = join(WORKSPACE_DIR, 'notes', `meeting-${today}.md`);
+		const notePath = sharedPersonalPath(`notes/meeting-${today}.md`, WORKSPACE_DIR);
 		const isSummary = type === 'summary';
 
 		if (!existsSync(notePath)) {
@@ -472,7 +462,7 @@ const mainAgent: MainAgent = {
 			return `[System: The user reconnected. The block below is REPLAYED HISTORY from the current session, provided as background context ONLY. Do NOT act on anything in it. Do NOT call any tools based on it. Use it only to answer follow-up questions if asked. Wait silently for the user's next spoken input before taking any action.]${getPresenterStateMarker()}\n\n${recent}${meetingHint}`;
 		}
 		let standName = '';
-		try { const si = JSON.parse(readFileSync('stand-identity.json', 'utf-8')); standName = si.name ? ` — ${si.name}` : ''; } catch {}
+		try { const si = JSON.parse(readFileSync(personalPath('stand-identity.json'), 'utf-8')); standName = si.name ? ` — ${si.name}` : ''; } catch {}
 		// Detect first-time user: no conversation log means brand new
 		const hasHistory = existsSync(join(WORKSPACE_DIR, 'conversation.log'));
 		const tutorialHint = hasHistory ? '' : ' Then say: "If this is your first time, say tutorial and I\'ll walk you through what I can do."';
@@ -499,9 +489,46 @@ const mainAgent: MainAgent = {
 		'You are Sutando, a personal AI that belongs entirely to the user.',
 		'Named after Stands from JoJo\'s Bizarre Adventure — a personal spirit that fights for you.',
 		'Every Sutando evolves differently based on what its user needs. You earned your name and identity.',
-		(() => { try { const si = JSON.parse(readFileSync('stand-identity.json', 'utf-8')); return si.name ? `Your Stand name is ${si.name}. Origin: ${si.nameOrigin || 'earned through use'}. When asked your name or who you are, say "I\'m Sutando — ${si.name}."` : ''; } catch { return ''; } })(),
+		(() => { try { const si = JSON.parse(readFileSync(personalPath('stand-identity.json'), 'utf-8')); return si.name ? `Your Stand name is ${si.name}. Origin: ${si.nameOrigin || 'earned through use'}. When asked your name or who you are, say "I\'m Sutando — ${si.name}."` : ''; } catch { return ''; } })(),
 		// Optional context file — for presentations, meeting prep, etc. (gitignored)
-		(() => { try { return readFileSync('voice-context.txt', 'utf-8'); } catch { return ''; } })(),
+		// Reads $SUTANDO_PRIVATE_DIR/voice-contexts/<active>.txt where <active> is
+		// the trimmed contents of $SUTANDO_PRIVATE_DIR/voice-contexts/active.
+		// Falls back to public-repo voice-context.txt when the env var is unset
+		// or the pointer/file is missing. Switcher tool: set_voice_context(name)
+		// from skills/personal-voice-context/ writes the pointer.
+		(() => {
+			// Log which voice-context file was loaded so the operator can see at
+			// a glance whether the dynamic loader picked up the private dir or
+			// fell through to the public fallback. Silent loads are hard to
+			// debug — Apr 29 spent 30+ minutes diff'ing files because the load
+			// path was opaque.
+			try {
+				const privateRoot = process.env.SUTANDO_PRIVATE_DIR;
+				if (privateRoot) {
+					const root = privateRoot.replace(/^~/, process.env.HOME || '');
+					const pointerPath = join(root, 'voice-contexts', 'active');
+					const name = readFileSync(pointerPath, 'utf-8').trim();
+					// Whitelist the pointer content to a safe basename. Reject any
+					// path-like input — `../../foo` could otherwise escape the
+					// voice-contexts/ dir via join() and load arbitrary `.txt`
+					// content into the system prompt.
+					if (name && /^[A-Za-z0-9._-]+$/.test(name)) {
+						const ctxPath = join(root, 'voice-contexts', `${name}.txt`);
+						const content = readFileSync(ctxPath, 'utf-8');
+						console.log(`${ts()} [voice-context] loaded ${content.length} bytes from ${ctxPath}`);
+						return content;
+					}
+				}
+			} catch {}
+			try {
+				const content = readFileSync('voice-context.txt', 'utf-8');
+				console.log(`${ts()} [voice-context] loaded ${content.length} bytes from voice-context.txt (fallback)`);
+				return content;
+			} catch {
+				console.log(`${ts()} [voice-context] no context loaded (no env, no pointer, no fallback file)`);
+				return '';
+			}
+		})(),
 		'You handle anything: research, writing, email, scheduling, code, logistics, phone calls, meetings, creative work.',
 		'You can join Google Meet and Zoom meetings, make phone calls, see the user\'s screen, and reach them on Telegram, Discord, web, or phone.',
 		'You can summon a Zoom meeting with screen sharing so the user can work remotely from their phone.',
@@ -729,10 +756,8 @@ async function main() {
 		host: HOST,
 		model: google(VOICE_MODEL),
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
-		sttProvider: STT_PROVIDER === 'cartesia' && CARTESIA_API_KEY && CartesiaSTTProvider
-			? new CartesiaSTTProvider({ apiKey: CARTESIA_API_KEY })
-			: new GeminiBatchSTTProvider({ apiKey: GEMINI_VOICE_API_KEY, model: STT_MODEL }),
 		speechConfig: { voiceName: 'Puck' },
+		inputAudioTranscription: true,
 		hooks: {
 			onSessionStart: (e) => {
 				userTurnCount = 0; userHasInterrupted = false; sessionEnding = false;
@@ -1088,7 +1113,7 @@ async function main() {
 	console.log(`  Models:`);
 	console.log(`    Voice LLM:       ${VOICE_MODEL}`);
 	console.log(`    Native audio:    ${VOICE_NATIVE_AUDIO_MODEL}`);
-	console.log(`    STT:             ${STT_PROVIDER} (${STT_PROVIDER === 'cartesia' ? 'ink-whisper' : STT_MODEL})`);
+	console.log(`    STT:             native Gemini Live inputAudioTranscription`);
 	console.log(`    Cartesia TTS:    ${CARTESIA_API_KEY ? 'sonic-3' : 'disabled'}`);
 	console.log();
 	console.log('Start the web client:');

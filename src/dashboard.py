@@ -22,6 +22,11 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 REPO_DIR = Path(__file__).parent.parent
+
+# Personal-asset path resolver — see src/util_paths.py. Used for /avatar
+# and /stand-identity endpoints so they prefer per-machine private dir.
+sys.path.insert(0, str(Path(__file__).parent))
+from util_paths import personal_path, shared_personal_path  # noqa: E402
 PORT = 7844
 
 
@@ -40,7 +45,7 @@ def _resolve_note_path(raw_slug: str):
     slug = re.sub(r"[^\w-]", "", raw_slug)
     if not slug or slug != raw_slug:
         return None
-    notes_real = os.path.realpath(REPO_DIR / "notes")
+    notes_real = os.path.realpath(shared_personal_path("notes", REPO_DIR))
     note_file_str = os.path.realpath(os.path.join(notes_real, f"{slug}.md"))
     if not note_file_str.startswith(notes_real + os.sep):
         return None
@@ -92,7 +97,7 @@ def get_activity(max_items: int = 10) -> list[dict]:
 
 
 def get_pending_count() -> dict:
-    pending_file = REPO_DIR / "pending-questions.md"
+    pending_file = Path(personal_path("pending-questions.md", REPO_DIR))
     if not pending_file.exists():
         return {"open": 0, "done": 0}
     content = pending_file.read_text()
@@ -350,9 +355,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(html.encode())
         elif urlparse(self.path).path == "/avatar":
-            avatar_file = REPO_DIR / "assets" / "stand-avatar.png"
-            if not avatar_file.exists():
-                avatar_file = REPO_DIR / "stand-avatar.png"  # legacy root fallback
+            avatar_file = personal_path("stand-avatar.png", workspace=REPO_DIR)
             if avatar_file.exists():
                 self.send_response(200)
                 self.send_header("Content-Type", "image/png")
@@ -363,7 +366,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_response(404)
                 self.end_headers()
         elif urlparse(self.path).path == "/stand-identity":
-            si_file = REPO_DIR / "stand-identity.json"
+            si_file = personal_path("stand-identity.json", workspace=REPO_DIR)
             data = json.loads(si_file.read_text()) if si_file.exists() else {}
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -431,7 +434,7 @@ load()
             self.end_headers()
             self.wfile.write(html.encode())
         elif urlparse(self.path).path == "/notes":
-            notes_dir = REPO_DIR / "notes"
+            notes_dir = Path(shared_personal_path("notes", REPO_DIR))
             notes = []
             for f in sorted(notes_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True):
                 title = f.stem.replace("-", " ").title()
