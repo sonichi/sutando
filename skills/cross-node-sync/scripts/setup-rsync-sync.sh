@@ -91,6 +91,7 @@ RSYNC_FLAGS=(-az --update
     --exclude '.DS_Store' --exclude '*.swp' --exclude '*.swo'
     --exclude '.stversions' --exclude '.stfolder'
     --exclude 'MEMORY.md' --exclude 'INDEX.md'
+    --exclude 'self_identity.md'
     --exclude 'core-status.json')
 # core-status.json is per-node proactive-loop state that occasionally lands
 # in the memory dir (voice-agent + proactive-loop both write to it and
