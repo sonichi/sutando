@@ -357,22 +357,69 @@ export const clipboardTool: ToolDefinition = {
 
 export const cancelTaskTool: ToolDefinition = {
 	name: 'cancel_task',
-	description: 'Cancel the most recent pending task. Use when someone says "cancel", "nevermind", "stop that".',
-	parameters: z.object({}),
+	description:
+		'Cancel a pending task. Default (no args) cancels the most recent. ' +
+		'Pass `taskId` to cancel a specific task by id (e.g. "task-1777686932069"). ' +
+		'Pass `query` to cancel the first task whose content contains the substring (case-insensitive). ' +
+		'Pass `list: true` to list pending tasks (id + first 60 chars of content) without cancelling. ' +
+		'Use when user says "cancel", "nevermind", "stop that", "what\'s queued", "cancel the one about X".',
+	parameters: z.object({
+		taskId: z.string().optional().describe('Specific task id to cancel (matches the filename without .txt).'),
+		query: z.string().optional().describe('Case-insensitive substring to match against task content. Cancels first match.'),
+		list: z.boolean().optional().describe('If true, list pending tasks (id + 60-char preview) without cancelling.'),
+	}),
 	execution: 'inline',
-	async execute() {
+	async execute(args) {
+		const { taskId, query, list } = (args ?? {}) as { taskId?: string; query?: string; list?: boolean };
 		try {
 			const tasksDir = join(process.cwd(), 'tasks');
 			const resultsDir = join(process.cwd(), 'results');
 			const files = readdirSync(tasksDir).filter(f => f.endsWith('.txt')).sort();
 			if (files.length === 0) return { status: 'nothing_to_cancel' };
-			const mostRecent = files[files.length - 1];
-			const taskId = mostRecent.replace('.txt', '');
+
+			// list mode: return id + preview, no cancel
+			if (list) {
+				const items = files.map(f => {
+					const id = f.replace('.txt', '');
+					let preview = '';
+					try {
+						const body = readFileSync(join(tasksDir, f), 'utf-8');
+						const taskLine = body.split('\n').find(l => l.startsWith('task:')) ?? body;
+						preview = taskLine.replace(/^task:\s*/, '').slice(0, 60);
+					} catch { /* ignore */ }
+					return { id, preview };
+				});
+				console.log(`${ts()} [CancelTask] list: ${items.length} pending`);
+				return { status: 'pending_tasks', count: items.length, tasks: items };
+			}
+
+			// targeted cancel: by exact id
+			let target: string | undefined;
+			if (taskId) {
+				const wantFile = taskId.endsWith('.txt') ? taskId : `${taskId}.txt`;
+				if (files.includes(wantFile)) target = wantFile;
+				else return { status: 'not_found', taskId };
+			} else if (query) {
+				// targeted cancel: by content query (case-insensitive substring)
+				const needle = query.toLowerCase();
+				for (const f of files) {
+					try {
+						const body = readFileSync(join(tasksDir, f), 'utf-8').toLowerCase();
+						if (body.includes(needle)) { target = f; break; }
+					} catch { /* ignore */ }
+				}
+				if (!target) return { status: 'not_found', query };
+			} else {
+				// default: most recent
+				target = files[files.length - 1];
+			}
+
+			const targetId = target.replace('.txt', '');
 			// Write a cancelled result so the web UI shows it with the cancelled icon
-			writeFileSync(join(resultsDir, mostRecent), 'Cancelled.');
-			unlinkSync(join(tasksDir, mostRecent));
-			console.log(`${ts()} [CancelTask] cancelled: ${taskId}`);
-			return { status: 'cancelled', taskId };
+			writeFileSync(join(resultsDir, target), 'Cancelled.');
+			unlinkSync(join(tasksDir, target));
+			console.log(`${ts()} [CancelTask] cancelled: ${targetId}${taskId ? ' (by id)' : query ? ` (by query: ${query})` : ''}`);
+			return { status: 'cancelled', taskId: targetId };
 		} catch (err) {
 			return { error: `Cancel failed: ${err instanceof Error ? err.message : err}` };
 		}
