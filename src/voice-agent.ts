@@ -29,6 +29,7 @@ import { execSync as execSyncTop } from 'node:child_process';
 import { inlineTools } from './inline-tools.js';
 import { injectText } from './browser-tools.js';
 import { join } from 'node:path';
+import { homedir } from 'node:os';
 import { VoiceSession } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
@@ -700,8 +701,30 @@ const mainAgent: MainAgent = {
 // Main
 // =============================================================================
 
+// Ensure the long-term memory directory exists at startup so the agent can
+// proactively write user_profile / feedback / project / reference files
+// without first having to remember to mkdir. Honours $SUTANDO_MEMORY_DIR
+// when set; otherwise uses the Claude Code default
+// (~/.claude/projects/-{slug}/memory). Failure-silent: a missing memory
+// dir should never block voice startup.
+function bootstrapMemoryDir(): void {
+	const slug = '-' + WORKSPACE_DIR.replace(/\/$/, '').split('/').filter(Boolean).join('-');
+	const memDir = process.env.SUTANDO_MEMORY_DIR || join(homedir(), '.claude', 'projects', slug, 'memory');
+	try {
+		mkdirSync(memDir, { recursive: true });
+		const indexPath = join(memDir, 'MEMORY.md');
+		if (!existsSync(indexPath)) {
+			writeFileSync(indexPath, '# Sutando memory index\n\nDurable facts about the user, project, and references. One line per entry: `- [Title](file.md) — one-line hook`. See CLAUDE.md `## Memory` for the schema.\n');
+			console.log(`${ts()} [Memory] Initialized ${memDir}`);
+		}
+	} catch (err) {
+		console.log(`${ts()} [Memory] bootstrap failed (non-fatal): ${err instanceof Error ? err.message : err}`);
+	}
+}
+
 async function main() {
 	assertMacOS();
+	bootstrapMemoryDir();
 
 	// --- Voice agent observability ---
 	// Same format as phone agent's call-metrics.jsonl so diagnose.py can analyze both.
