@@ -7,11 +7,20 @@ set -e
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
 
-# Ensure runtime directories exist (gitignored; created on fresh clones)
-mkdir -p logs state
+# Auto-bootstrap: create-if-missing files and dirs that the agent + skills
+# expect to exist (logs, state, tasks, results, notes, contextual-chips.json,
+# pending-questions.md, build_log.md, crons.json, …). Idempotent — safe to
+# run on every start. Replaces the bare `mkdir -p logs state` that used to
+# live here. See src/init.sh for the full list.
+bash "$REPO/src/init.sh" --auto
 
 echo "Sutando startup..."
 echo ""
+
+# Preflight summary line — what env / CLI / perms are missing. One line, no
+# blocking; problems are surfaced but startup continues so the user can fix
+# things piece by piece.
+bash "$REPO/src/init.sh" --preflight | tail -1
 
 # Install dependencies if needed
 if [ ! -d node_modules ]; then
