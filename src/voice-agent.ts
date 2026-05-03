@@ -34,6 +34,7 @@ import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
 import { workTool, startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
 import { buildSutandoSystemPrompt, buildVoiceAgentContext } from './voice-context.js';
+import { classifyTransportClose, type ClassifiedClose } from './voice-error-classifier.js';
 
 import { personalPath, sharedPersonalPath } from './util_paths.js';
 
@@ -807,6 +808,65 @@ async function main() {
 	});
 
 	sessionRef = session;
+
+	// Wire voice-failure classifier: when the Gemini Live transport closes
+	// with a non-retryable reason (credits depleted, quota exceeded, key
+	// invalid, model not found), surface an actionable message via the
+	// proactive-result channel + an OS notification. Throttled per category
+	// so the 30s reconnect loop doesn't spam.
+	(() => {
+		const transport = (session as any).transport;
+		if (!transport || typeof transport !== 'object') {
+			console.error(`${ts()} [VoiceFailure] no transport on session — classifier not wired`);
+			return;
+		}
+		const origOnClose = typeof transport.onClose === 'function'
+			? transport.onClose.bind(transport)
+			: null;
+		const notifiedCategories = new Set<string>();
+		const handleClose = (c: ClassifiedClose): void => {
+			if (c.retryable) return;
+			if (notifiedCategories.has(c.category)) return;
+			notifiedCategories.add(c.category);
+			console.error(`${ts()} [VoiceFailure] ${c.category}: ${c.userMessage} (raw="${c.rawReason}")`);
+			// Surface via proactive-result channel — picked up by web-client
+			// task feed and the Discord/Telegram bridges if configured.
+			try {
+				const tsMs = Date.now();
+				const path = join(WORKSPACE_DIR, 'results', `proactive-voice-${c.category}-${tsMs}.txt`);
+				const body = c.userActionUrl
+					? `${c.userMessage} ${c.userActionUrl}`
+					: c.userMessage;
+				writeFileSync(path, body);
+			} catch (e) {
+				console.error(`${ts()} [VoiceFailure] proactive write failed: ${(e as Error)?.message ?? e}`);
+			}
+			// OS notification — visible even if no browser tab is open.
+			// Sanitize the message for the AppleScript string literal: drop
+			// double-quotes and backslashes so the shell command can't break.
+			try {
+				const safe = c.userMessage.replace(/["\\]/g, '');
+				execSyncTop(
+					`osascript -e 'display notification "${safe}" with title "Sutando — voice offline"'`,
+					{ stdio: 'ignore' } as any,
+				);
+			} catch {}
+		};
+		transport.onClose = (code?: number, reason?: string) => {
+			if (origOnClose) {
+				try { origOnClose(code, reason); } catch (e) {
+					console.error(`${ts()} [VoiceFailure] origOnClose threw: ${(e as Error)?.message ?? e}`);
+				}
+			}
+			try {
+				const c = classifyTransportClose(code, reason);
+				handleClose(c);
+			} catch (e) {
+				console.error(`${ts()} [VoiceFailure] classifier threw: ${(e as Error)?.message ?? e}`);
+			}
+		};
+		console.log(`${ts()} [VoiceFailure] classifier wired into transport.onClose`);
+	})();
 
 	// Wire narration-tee: capture Gemini's outbound audio for screen recordings
 	try {
