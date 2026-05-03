@@ -7,7 +7,7 @@
 
 import { execSync, execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, extname } from 'node:path';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 
@@ -41,10 +41,23 @@ export const openFileTool: ToolDefinition = {
 			if (!path) return { error: 'No path provided. Pass an absolute file path. (For the most recent recording, call play_video — it auto-finds the file.)' };
 			// Expand $VAR / ${VAR} env-var references and ~ in the path so Sutando
 			// can pass paths like "$SUTANDO_PRIVATE_DIR/voice-contexts/X.txt"
-			// without us hardcoding a fallback root.
+			// without us hardcoding a fallback root. Track any unset variables so
+			// we can surface them as a clear diagnostic rather than letting the
+			// silently-empty substitution flow through to a generic "file not
+			// found" error below.
+			const unresolvedVars: string[] = [];
 			const filePath = path
 				.replace(/^~/, process.env.HOME || '')
-				.replace(/\$\{([A-Z_][A-Z0-9_]*)\}|\$([A-Z_][A-Z0-9_]*)/g, (_, a, b) => process.env[a || b] || '');
+				.replace(/\$\{([A-Z_][A-Z0-9_]*)\}|\$([A-Z_][A-Z0-9_]*)/g, (_, a, b) => {
+					const name = a || b;
+					const val = process.env[name];
+					if (val === undefined) unresolvedVars.push(name);
+					return val || '';
+				});
+			if (unresolvedVars.length > 0) {
+				console.log(`${ts()} [OpenFile] path "${path}" has unset env var(s): ${unresolvedVars.join(', ')}`);
+				return { error: `Unresolved env var(s) in path: ${unresolvedVars.join(', ')}. Set them before calling open_file, or pass a fully-expanded absolute path.` };
+			}
 			if (!existsSync(filePath)) {
 				console.log(`${ts()} [OpenFile] path "${filePath}" does not exist`);
 				return { error: `File not found: ${filePath}. Do not invent paths — use the exact path returned by the tool that produced the file (e.g. record_screen_with_narration returns subtitled_path/narrated_path/recording_path). For the most recent recording without a known path, call play_video instead.` };
@@ -78,7 +91,7 @@ export const openFileTool: ToolDefinition = {
 			// "No video to play". This makes the existing tool surface QuickTime-
 			// aware, regardless of whether the video came from a phone-call
 			// recording or open_file.
-			const ext = filePath.toLowerCase().slice(filePath.lastIndexOf('.'));
+			const ext = extname(filePath).toLowerCase();
 			if (['.mp4', '.mov', '.webm', '.m4v'].includes(ext)) {
 				try {
 					const fs = await import('node:fs');
