@@ -35,6 +35,15 @@ shopt -u nullglob
 # Stream subsequent events. -l 0.5 = 500ms latency batch (fswatch coalesces
 # burst events). --event Created --event Renamed catches new file
 # appearance whether it lands as a fresh write or a rename-into-place.
+#
+# Existence check after match: fswatch fires Renamed events on BOTH ends of
+# a rename (source path AND destination path). For tasks/ that means
+# `mv tasks/X.txt tasks/archive/Y/` triggers a Renamed event for the source
+# `tasks/X.txt` AFTER the file has moved out — emitting a spurious
+# `TASK_FILE: X.txt` for a file no longer in the watched dir. The
+# `[ -f "$path" ]` test filters out those rename-OUT-of-watched-dir events
+# while still letting rename-INTO-place events through (file does exist at
+# the watched path). Caught 2026-05-03 during the live Monitor-mode rollout.
 fswatch \
   -l 0.5 \
   --event Created \
@@ -42,6 +51,10 @@ fswatch \
   "$TASKS_DIR" 2>/dev/null \
 | while IFS= read -r path; do
   case "$path" in
-    *.txt) echo "TASK_FILE: $(basename "$path")" ;;
+    *.txt)
+      if [ -f "$path" ]; then
+        echo "TASK_FILE: $(basename "$path")"
+      fi
+      ;;
   esac
 done
