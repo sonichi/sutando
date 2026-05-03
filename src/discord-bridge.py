@@ -506,8 +506,12 @@ async def _handle_discord_message(message, force=False):
                 print(f"  [skip] message addressed to other bot(s): {[str(m) for m in explicit_mentions]}", flush=True)
                 return
 
-        # Strip mentions from the text
-        text = text.replace(f"<@{client.user.id}>", "")
+        # Strip role mentions only. User mentions (this bot's and other
+        # bots') are kept verbatim so consumers can see the full addressee
+        # list — stripping own-id used to mislead each bot in a multi-bot
+        # mention into "addressed to the other, not me" deferrals
+        # (incident 2026-05-03: Lucy + Maddy both deferred a `<@Maddy>
+        # <@Lucy>` ping in #dev for 40 min).
         for role in message.role_mentions:
             text = text.replace(f"<@&{role.id}>", "")
         text = text.strip()
