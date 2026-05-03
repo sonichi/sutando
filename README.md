@@ -80,13 +80,17 @@ We're looking for contributors to help test and harden these capabilities. If yo
                                 (spoken via voice/phone,
                                  text via Telegram/Discord)
 
-    ↻ = cron job — fires the core agent every 5 min to process pending tasks,
-        run health checks, and pick the next build-log item autonomously.
+    ↻ = the Claude Code session runs the `/proactive-loop` skill (default
+        10-minute interval), which keeps a persistent watcher on `tasks/`
+        via Claude Code's `Monitor` tool, processes pending tasks the
+        moment they arrive, runs health checks, and picks the next
+        build-log item autonomously between ticks.
 ```
 
-Three processes work together:
-- **Voice agent** (Gemini Live, WebSocket on :9900) — listens and talks in real time for browser voice; also serves the web client at :8080.
-- **Conversation server** (Gemini Live, Twilio WebSocket on :3100) — same role for inbound and outbound phone calls.
+Four processes work together:
+- **Voice agent** (Gemini Live, WebSocket on :9900) — listens and talks in real time for browser voice.
+- **Web client** (`com.sutando.web-client.plist`, HTTP on :8080) — separate launchd service that serves the browser UI and proxies to the voice agent over the WebSocket.
+- **Conversation server** (Gemini Live, Twilio WebSocket on :3100) — same role as the voice agent for inbound and outbound phone calls.
 - **Core agent** (Claude Code CLI) — executes tasks with full system access. We use the CLI because it provides cron scheduling, plugins, and an interactive terminal that the SDK doesn't offer out of the box.
 
 Voice agent and conversation server handle conversation-scope actions with **inline tools** — in-process calls that round-trip instantly (describe the screen, hang up, send DTMF, read the clipboard/current time, capture a screenshot). For anything outside that scope they write to `tasks/`; core reads them, executes, and writes to `results/`, which each channel speaks or messages back. Telegram and Discord bridges only use the `tasks/` path.
@@ -209,7 +213,7 @@ One table, organized by capability. The only required paid piece is your Claude 
 | Capability | Script | Status |
 |-----------|--------|--------|
 | Voice conversation | `voice-agent.ts` | Verified |
-| Task delegation (voice → Claude) | `task-bridge.ts` + `watch-tasks.sh` + `tasks/` dir | Verified |
+| Task delegation (voice → Claude) | `task-bridge.ts` + `watch-tasks-stream.sh` + `tasks/` dir | Verified |
 | Screen capture + analysis | `macos-tools` skill | Verified |
 | Notes / second brain | `notes/` directory (YAML-frontmatter markdown) | Verified |
 | Context drop + shortcuts | `src/Sutando/` menu bar app | Verified |
