@@ -69,87 +69,23 @@ function ts(): string { return new Date().toISOString().slice(11, 23); }
 let _sendTaskStatus: ((taskId: string, status: string, text: string, result?: string) => void) | null = null;
 const _deliveredResults = new Set<string>();
 
-export const TASK_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
-// First status-check nudge fires once a task has been pending this long
-// without a result. Higher than TASK_TIMEOUT_MS so we don't nudge for every
-// slow-but-progressing task — only ones that look genuinely stuck.
-// Subsequent nudges fire every NUDGE_AT_MS thereafter (so nudge #N fires at
-// N × NUDGE_AT_MS).
-export const NUDGE_AT_MS = 3 * TASK_TIMEOUT_MS;
-// Stop after this many unanswered nudges. After the last one fires, the
-// task is escalated via Discord DM to the owner so they know core looks
-// genuinely stuck. We don't keep spamming nudges past this — N status
-// checks unanswered is enough signal.
-export const MAX_NUDGES = 3;
+export const TASK_TIMEOUT_MS = 10 * 60 * 1000; // 10 min
 type PendingTask = { submittedAt: number; task: string };
 export const _pendingTasks = new Map<string, PendingTask>(); // taskId → entry
 
 // Track which pending entries have already had their timeout badge fired so
 // we don't re-emit the same status event every 2s after the deadline passes.
 const _timeoutBadgeFired = new Set<string>();
-// Per-task nudge counter (0..MAX_NUDGES). Cleared when a result arrives so
-// the SAME task re-submitted later restarts the cycle.
-const _nudgeCount = new Map<string, number>();
-// Flag: did this task already get its post-MAX_NUDGES Discord escalation?
-const _escalated = new Set<string>();
-
-/** Default nudge-writer: drops a status-check task file in TASK_DIR. The
- * watcher will pick it up like any other task. Injected via a parameter on
- * `_checkPendingTimeouts` so tests can capture the call without writing
- * to disk. */
-function _defaultWriteNudge(nudgeId: string, content: string): void {
-	writeFileSync(join(TASK_DIR, `${nudgeId}.txt`), content);
-}
-
-/** Default escalator: writes a `results/proactive-stuck-{ts}.txt` file. The
- * Discord bridge watches that prefix and DMs the owner. Per CLAUDE.md
- * "Proactive messages: write to `results/proactive-{ts}.txt` to speak to
- * the user". Injected so tests can capture without DM-ing. */
-function _defaultEscalate(taskId: string, originalTask: string, ageMs: number, nudgeCount: number): void {
-	const ageMin = Math.floor(ageMs / 60000);
-	const truncated = originalTask.slice(0, 80);
-	const ts = Date.now();
-	const body = `[Sutando-stuck-alert] Core looks stuck on task ${taskId}: "${truncated}" (${ageMin} min old, ${nudgeCount} status-check nudges unanswered). You may want to check core's logs or run /pull-and-restart.`;
-	writeFileSync(join(RESULT_DIR, `proactive-stuck-${ts}.txt`), body);
-}
-
-function _buildNudgeContent(nudgeId: string, originalTaskId: string, originalTask: string, ageMs: number, attempt: number): string {
-	const ageMin = Math.floor(ageMs / 60000);
-	const ownerId = process.env.SUTANDO_DM_OWNER_ID || 'voice-local';
-	const truncated = originalTask.slice(0, 80);
-	return (
-		`id: ${nudgeId}\n` +
-		`timestamp: ${new Date().toISOString()}\n` +
-		`task: [Sutando-status-check #${attempt}] ${ageMin} min ago I queued: "${truncated}". Are you still working on it? If yes, post a brief status (what you've done so far). If you're stuck, name the blocker. If the task is no longer relevant, just say so. Don't restart the original task — only report status.\n` +
-		`source: voice\n` +
-		`channel_id: local-voice\n` +
-		`user_id: ${ownerId}\n` +
-		`access_tier: owner\n` +
-		`parent_task_id: ${originalTaskId}\n`
-	);
-}
 
 /**
  * Pure timeout check, extracted from startResultWatcher's setInterval so it
  * can be unit-tested without the 2s timer or the fs.readdir loop.
  *
- * Three escalating effects, each deduped per task:
- *
- * 1. UI-only / silent timeout badge once age > TASK_TIMEOUT_MS — marks the
- *    Tasks-tab row yellow. Does NOT fire `onResult`, so the voice agent
- *    stays silent. The pending entry is intentionally LEFT IN PLACE — if
- *    core eventually returns a result, `_processResult` will flip the row
- *    to `done` the normal way.
- *
- * 2. Status-check nudges starting at age > NUDGE_AT_MS, then every
- *    NUDGE_AT_MS thereafter, up to MAX_NUDGES total. Each nudge writes a
- *    new status-check task file (not a re-submit) so the in-flight task
- *    isn't duplicated. nudgeCount per task is cleared when the result
- *    arrives.
- *
- * 3. Discord DM escalation once nudgeCount reaches MAX_NUDGES — writes
- *    `results/proactive-stuck-{ts}.txt` which the Discord bridge picks up
- *    and DMs the owner. Fires exactly once per task per result-cycle.
+ * Silent UI-only badge once age > TASK_TIMEOUT_MS — marks the Tasks-tab
+ * row yellow. Does NOT fire `onResult`, so the voice agent stays silent.
+ * The pending entry is intentionally LEFT IN PLACE — if core eventually
+ * returns a result, `_processResult` will flip the row to `done` the
+ * normal way.
  */
 export function _checkPendingTimeouts(
 	now: number,
@@ -157,10 +93,6 @@ export function _checkPendingTimeouts(
 	sendStatus: ((taskId: string, status: string, text: string, result?: string) => void) | null,
 	_onResult: (result: string) => void,
 	firedSet: Set<string> = _timeoutBadgeFired,
-	nudgeCount: Map<string, number> = _nudgeCount,
-	writeNudge: (nudgeId: string, content: string) => void = _defaultWriteNudge,
-	escalated: Set<string> = _escalated,
-	escalate: (taskId: string, originalTask: string, ageMs: number, nudgeCount: number) => void = _defaultEscalate,
 ): void {
 	for (const [taskId, entry] of pending) {
 		const age = now - entry.submittedAt;
@@ -168,36 +100,6 @@ export function _checkPendingTimeouts(
 			firedSet.add(taskId);
 			console.error(`${ts()} [TaskBridge] Task ${taskId} timed out after ${TASK_TIMEOUT_MS / 1000}s (silent — UI badge only)`);
 			sendStatus?.(taskId, 'timeout', `Timed out: ${entry.task.slice(0, 60)}`);
-		}
-
-		// Periodic nudges: nudge #N fires at age >= N × NUDGE_AT_MS, capped at
-		// MAX_NUDGES total. Compute the highest nudge number this age qualifies
-		// for, then fire any not-yet-fired ones in order (in steady state we'll
-		// only fire one per tick, but this also handles long sleeps).
-		const fired = nudgeCount.get(taskId) ?? 0;
-		const target = Math.min(MAX_NUDGES, Math.floor(age / NUDGE_AT_MS));
-		if (target > fired) {
-			for (let attempt = fired + 1; attempt <= target; attempt++) {
-				const nudgeId = `task-${now}-nudge-${attempt}`;
-				try {
-					writeNudge(nudgeId, _buildNudgeContent(nudgeId, taskId, entry.task, age, attempt));
-					console.error(`${ts()} [TaskBridge] Status-check nudge #${attempt}/${MAX_NUDGES} ${nudgeId} sent for ${taskId} (${Math.floor(age / 60000)} min old)`);
-				} catch (e) {
-					console.error(`${ts()} [TaskBridge] Nudge write failed:`, e);
-				}
-			}
-			nudgeCount.set(taskId, target);
-		}
-
-		// Escalate via Discord DM after the MAX_NUDGES'th nudge has fired.
-		if ((nudgeCount.get(taskId) ?? 0) >= MAX_NUDGES && !escalated.has(taskId)) {
-			escalated.add(taskId);
-			try {
-				escalate(taskId, entry.task, age, MAX_NUDGES);
-				console.error(`${ts()} [TaskBridge] Escalated stuck-task ${taskId} to owner DM (${Math.floor(age / 60000)} min old, ${MAX_NUDGES} nudges unanswered)`);
-			} catch (e) {
-				console.error(`${ts()} [TaskBridge] Escalation failed:`, e);
-			}
 		}
 	}
 }
@@ -492,14 +394,7 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 		_checkPendingTimeouts(Date.now(), _pendingTasks, _sendTaskStatus, onResult);
 
 		try {
-			// Skip `proactive-*.txt` — those are outbound messages we WROTE
-			// (e.g. stuck-task escalations). The Discord bridge picks them up
-			// from results/, but the voice-agent's own result-watcher must NOT
-			// re-deliver them as task results: that would (a) inject the alert
-			// into the Gemini context (voice narrates it, breaking silent
-			// timeout) and (b) bodhi-push it as task.status='done' for a
-			// synthetic taskId, which spawns an extra row in the Tasks tab.
-			const files = readdirSync(RESULT_DIR).filter(f => f.endsWith('.txt') && !f.startsWith('proactive-')).sort();
+			const files = readdirSync(RESULT_DIR).filter(f => f.endsWith('.txt')).sort();
 			if (files.length === 0) return;
 
 			// Only deliver if a client is connected — otherwise keep files queued
@@ -518,8 +413,6 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 					_deliveredResults.add(file);
 					_pendingTasks.delete(taskId);
 					_timeoutBadgeFired.delete(taskId);
-					_nudgeCount.delete(taskId);
-					_escalated.delete(taskId);
 					logConversation('core-agent', `[task:${taskId}] ${result.slice(0, 200)}`);
 					onResult(result);
 					// Notify agent-api directly, then delete file

@@ -298,28 +298,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # List active tasks + system status for the web client
             watcher_ok = subprocess.run(["pgrep", "-f", "watch-tasks"], capture_output=True).returncode == 0
             claude_ok = subprocess.run(["pgrep", "-f", "claude.*sutando-core"], capture_output=True).returncode == 0
-            # Build a parent_task_id → nudge count map by scanning TASK_DIR for
-            # status-check nudge files. task-bridge writes them with a
-            # `parent_task_id:` field; we count how many children each task has
-            # so the web-client can show "+N nudges sent" beside the TIMEOUT
-            # badge. Cheap O(N) scan — N is bounded (we cap visible tasks at 10).
-            nudge_counts: dict[str, int] = {}
-            for nf in TASK_DIR.glob("task-*-nudge-*.txt"):
-                try:
-                    for line in nf.read_text().splitlines():
-                        if line.startswith("parent_task_id:"):
-                            pid = line.split(":", 1)[1].strip()
-                            nudge_counts[pid] = nudge_counts.get(pid, 0) + 1
-                            break
-                except Exception:
-                    pass
             # Scan disk for active tasks, update history (preserve existing text).
-            # Skip status-check nudge children — they're status pings task-bridge
-            # writes for stuck parents; surface them as a counter pill on the
-            # parent row, not as new rows.
             for f in sorted(TASK_DIR.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True):
-                if "-nudge-" in f.name:
-                    continue
                 task_id = f.stem
                 content = f.read_text()
                 task_line = ""
@@ -341,7 +321,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "text": task_line or existing.get("text", task_id),
                     "time": f.stat().st_mtime,
                     "result": result_text or existing.get("result", ""),
-                    "nudges": nudge_counts.get(task_id, 0),
                 }
             # Also check for result files without task files (already cleaned up)
             for f in sorted(RESULT_DIR.glob("task-*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]:
