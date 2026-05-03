@@ -78,7 +78,7 @@ As of 2026-05-03, the public repo has no manifest-loaded tools shipping by defau
 | Skill | Tools contributed | Notes |
 |---|---|---|
 | `voice-context` | `set_voice_context`, `list_voice_contexts` | Switches the active per-talk voice script via `$SUTANDO_PRIVATE_DIR/voice-contexts/active`. Restarts voice-agent on switch so the new context loads. |
-| `talk-highlight` | `highlight_slide` | Drives on-stage slide highlights during live talks via the local highlight server (`localhost:7877`). |
+| `talk-highlight` | `highlight_slide`, `presenter_mode`, `fullscreen_presenter`, `set_active_slides` | Drives on-stage slide highlights during live talks via the local highlight server (`localhost:7877`). `highlight_slide` glows a topic key and dims siblings; `presenter_mode` toggles the session-level talk flag; `fullscreen_presenter` switches the slide window into fullscreen; `set_active_slides` swaps the deck pointer (`talk-slides/active`) so the same server can drive different decks across a session. |
 | `personal-deictic` | `read_selection` | Reads the macOS selected text + cursor via the `ax-read` Swift binary; foundation for "this/that" deictic edits. |
 | `personal-talk-prep` | (none — script-only skill, invoked via `/personal-talk-prep`) | Listed for completeness; no manifest tools. |
 
@@ -96,7 +96,7 @@ The phone agent picks up the same tools automatically — no separate registrati
 
 ## Phone-agent tool access
 
-For owner callers, `conversation-server.ts` deduplicates by name and pushes `inlineTools` into the call session's tool table (`conversation-server.ts:587`). This means the phone agent has the **same tool surface** as the web voice agent for owner calls, including all manifest-loaded skills.
+For owner callers, `conversation-server.ts` deduplicates by name and pushes `inlineTools` into the call session's tool table (`conversation-server.ts:587`). This means the phone agent has the **same inline-tool surface** as the web voice agent for owner calls, including all manifest-loaded skills. (System prompt and conversation lifecycle differ between phone and web — what's identical is the inline-tool table.)
 
 For non-owner callers, only `anyCallerTools` and (for verified callers) `configurableTools` are exposed — manifest-loaded tools are NOT exposed to non-owners.
 
