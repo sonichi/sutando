@@ -310,6 +310,11 @@ const HTML = /* html */ `<!DOCTYPE html>
   .task-status.working { background: #1e3a5f; color: #60a5fa; animation: pulse 1.5s infinite; }
   .task-status.done { background: #1e4028; color: #4ecca3; }
   .task-status.timeout { background: #4a3a1e; color: #f59e0b; animation: pulse 1.5s infinite; }
+  .task-status-label.timeout {
+    flex-shrink: 0; padding: 2px 8px; border-radius: 10px;
+    background: #4a3a1e; color: #f59e0b; font-size: 11px; font-weight: 600;
+    letter-spacing: 0.05em; text-transform: uppercase; align-self: center;
+  }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
   .task-text { color: #d0d0d8; flex: 1; word-break: break-word; font-size: 16px; line-height: 1.6; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .task-text.expanded { white-space: normal; }
@@ -1053,6 +1058,7 @@ function renderTasks() {
     const expandChip = hasResult ? '<span class="task-expand">' + (isExpanded ? 'Hide ▾' : 'Show details ▸') + '</span>' : '';
     return '<div class="task-item"' + clickAttr + '>' +
       '<div class="task-status ' + t.status + '">' + (icons[t.status] || '?') + '</div>' +
+      (t.status === 'timeout' ? '<span class="task-status-label timeout">timeout</span>' : '') +
       '<span class="' + textClass + '">' + displayText + '</span>' +
       '<span class="task-time">' + timeStr + '</span>' +
       expandChip +
@@ -2198,6 +2204,7 @@ function renderTabContent() {
         var expandChip = hasResult ? '<span class="task-expand">' + (isExpanded ? 'Hide &#9662;' : 'Show details &#9656;') + '</span>' : '';
         return '<div class="task-item"' + clickAttr + '>' +
           '<div class="task-status ' + t.status + '">' + (icons[t.status] || '?') + '</div>' +
+      (t.status === 'timeout' ? '<span class="task-status-label timeout">timeout</span>' : '') +
           '<span class="' + textClass + '">' + displayText + '</span>' +
           '<span class="task-time">' + timeStr + '</span>' +
           expandChip +

@@ -20,6 +20,7 @@ import { join } from 'node:path';
 import {
 	_checkPendingTimeouts,
 	_pendingTasks,
+	MAX_NUDGES,
 	NUDGE_AT_MS,
 	TASK_TIMEOUT_MS,
 	workTool,
@@ -106,33 +107,60 @@ test('integration: workTool submission stores task text so timeout title remains
 	assert.match(call!.text, /integration-canary task text/);
 });
 
-test('nudge fires once at NUDGE_AT_MS, sends a status-check (not a re-submit)', () => {
+test('nudges fire periodically up to MAX_NUDGES, then escalate via Discord DM', () => {
 	const pending = new Map<string, { submittedAt: number; task: string }>();
 	pending.set('task-x', { submittedAt: 0, task: 'long-running analysis of the open PRs' });
 	const { statusCalls, onResultCalls, sendStatus, onResult } = makeCaptures();
 	const fired = new Set<string>();
-	const nudge = new Set<string>();
+	const nudgeCount = new Map<string, number>();
 	const nudgeWrites: { id: string; content: string }[] = [];
 	const writeNudge = (id: string, content: string) => { nudgeWrites.push({ id, content }); };
+	const escalated = new Set<string>();
+	const escalateCalls: { taskId: string; task: string; ageMs: number; nudges: number }[] = [];
+	const escalate = (taskId: string, task: string, ageMs: number, n: number) => {
+		escalateCalls.push({ taskId, task, ageMs, nudges: n });
+	};
+	const callAt = (now: number) => _checkPendingTimeouts(now, pending, sendStatus, onResult, fired, nudgeCount, writeNudge, escalated, escalate);
 
-	// Below NUDGE_AT_MS — only the regular timeout badge, no nudge yet.
-	_checkPendingTimeouts(NUDGE_AT_MS - 1, pending, sendStatus, onResult, fired, nudge, writeNudge);
+	// Below NUDGE_AT_MS — timeout badge only, no nudge.
+	callAt(NUDGE_AT_MS - 1);
 	assert.equal(nudgeWrites.length, 0, 'no nudge before NUDGE_AT_MS');
 	assert.equal(statusCalls.length, 1, 'timeout badge fired (silent)');
+	assert.equal(escalateCalls.length, 0);
 
-	// Past NUDGE_AT_MS — nudge written exactly once.
-	_checkPendingTimeouts(NUDGE_AT_MS + 1, pending, sendStatus, onResult, fired, nudge, writeNudge);
-	assert.equal(nudgeWrites.length, 1, 'nudge fires once past NUDGE_AT_MS');
-	assert.match(nudgeWrites[0].content, /\[Sutando-status-check\]/, 'nudge is a status-check, not a re-submit');
-	assert.match(nudgeWrites[0].content, /long-running analysis of the open PRs/, 'nudge cites the original task text so core knows what to report on');
-	assert.match(nudgeWrites[0].content, /parent_task_id: task-x/, 'nudge carries parent_task_id for traceability');
+	// Past 1×NUDGE_AT_MS — nudge #1.
+	callAt(NUDGE_AT_MS + 1);
+	assert.equal(nudgeWrites.length, 1, 'nudge #1 fires past 1× threshold');
+	assert.match(nudgeWrites[0].content, /\[Sutando-status-check #1\]/);
+	assert.match(nudgeWrites[0].content, /long-running analysis of the open PRs/, 'nudge cites original task text');
+	assert.match(nudgeWrites[0].content, /parent_task_id: task-x/, 'nudge carries parent_task_id');
 	assert.match(nudgeWrites[0].content, /Don't restart the original task/, 'nudge explicitly tells core not to restart');
-	assert.equal(onResultCalls.length, 0, 'still silent — nudge does not narrate');
+	assert.equal(escalateCalls.length, 0, 'no escalation yet');
 
-	// Repeat ticks past the nudge threshold — must NOT fire a second nudge.
-	_checkPendingTimeouts(NUDGE_AT_MS + 60_000, pending, sendStatus, onResult, fired, nudge, writeNudge);
-	_checkPendingTimeouts(NUDGE_AT_MS + 120_000, pending, sendStatus, onResult, fired, nudge, writeNudge);
-	assert.equal(nudgeWrites.length, 1, 'nudge dedupes across ticks (only one per pending task)');
+	// Tick again before 2× threshold — no new nudge.
+	callAt(NUDGE_AT_MS + 60_000);
+	assert.equal(nudgeWrites.length, 1, 'no second nudge until 2×');
+
+	// Past 2×NUDGE_AT_MS — nudge #2.
+	callAt(2 * NUDGE_AT_MS + 1);
+	assert.equal(nudgeWrites.length, 2, 'nudge #2 fires past 2× threshold');
+	assert.match(nudgeWrites[1].content, /\[Sutando-status-check #2\]/);
+	assert.equal(escalateCalls.length, 0, 'no escalation yet');
+
+	// Past 3×NUDGE_AT_MS — nudge #3 + Discord escalation.
+	callAt(3 * NUDGE_AT_MS + 1);
+	assert.equal(nudgeWrites.length, 3, 'nudge #3 fires past 3× threshold');
+	assert.match(nudgeWrites[2].content, /\[Sutando-status-check #3\]/);
+	assert.equal(escalateCalls.length, 1, 'escalation fires after MAX_NUDGES');
+	assert.equal(escalateCalls[0].taskId, 'task-x');
+	assert.equal(escalateCalls[0].nudges, MAX_NUDGES);
+
+	// Past 4×NUDGE_AT_MS — capped at MAX_NUDGES, no nudge #4 and no second escalation.
+	callAt(4 * NUDGE_AT_MS + 1);
+	assert.equal(nudgeWrites.length, MAX_NUDGES, 'capped at MAX_NUDGES total');
+	assert.equal(escalateCalls.length, 1, 'escalation dedupes — only fires once');
+
+	assert.equal(onResultCalls.length, 0, 'still silent throughout — no voice narration');
 });
 
 test('timeout title carries original task text so distinct tasks render distinctly (THIS IS THE BUG)', () => {
