@@ -69,8 +69,31 @@ function ts(): string { return new Date().toISOString().slice(11, 23); }
 let _sendTaskStatus: ((taskId: string, status: string, text: string, result?: string) => void) | null = null;
 const _deliveredResults = new Set<string>();
 
-const TASK_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
-const _pendingTasks = new Map<string, number>(); // taskId → submission epoch ms
+export const TASK_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+type PendingTask = { submittedAt: number; task: string };
+export const _pendingTasks = new Map<string, PendingTask>(); // taskId → entry
+
+/**
+ * Pure timeout check, extracted from startResultWatcher's setInterval so it
+ * can be unit-tested without the 2s timer or the fs.readdir loop. Mutates
+ * `pending` (deletes timed-out entries) and invokes the two callbacks for
+ * each timed-out task.
+ */
+export function _checkPendingTimeouts(
+	now: number,
+	pending: Map<string, PendingTask>,
+	sendStatus: ((taskId: string, status: string, text: string, result?: string) => void) | null,
+	onResult: (result: string) => void,
+): void {
+	for (const [taskId, entry] of pending) {
+		if (now - entry.submittedAt > TASK_TIMEOUT_MS) {
+			pending.delete(taskId);
+			console.error(`${ts()} [TaskBridge] Task ${taskId} timed out after ${TASK_TIMEOUT_MS / 1000}s`);
+			sendStatus?.(taskId, 'timeout', `Timed out: ${entry.task.slice(0, 60)}`);
+			onResult(`[Task timed out after ${Math.floor(TASK_TIMEOUT_MS / 60000)} minutes. The processing engine may need to be restarted.]`);
+		}
+	}
+}
 const _apiToken = process.env.SUTANDO_API_TOKEN || '';
 function _apiHeaders(): Record<string, string> {
 	const h: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -149,7 +172,7 @@ export const workTool: ToolDefinition = {
 			`user_id: ${ownerId}\n` +
 			`access_tier: owner\n`;
 		writeFileSync(join(TASK_DIR, `${taskId}.txt`), content);
-		_pendingTasks.set(taskId, Date.now());
+		_pendingTasks.set(taskId, { submittedAt: Date.now(), task });
 		// Record owner activity for status-aware-pivot in proactive loop
 		writeOwnerActivity('voice', task);
 		console.log(`${ts()} [TaskBridge] Task ${taskId}: ${task.slice(0, 100)}`);
@@ -359,15 +382,7 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 
 	// Check every 2 seconds for new result files
 	setInterval(() => {
-		// Check for timed-out tasks — runs every interval regardless of result files
-		for (const [taskId, submittedAt] of _pendingTasks) {
-			if (Date.now() - submittedAt > TASK_TIMEOUT_MS) {
-				_pendingTasks.delete(taskId);
-				console.error(`${ts()} [TaskBridge] Task ${taskId} timed out after ${TASK_TIMEOUT_MS / 1000}s`);
-				_sendTaskStatus?.(taskId, 'timeout', 'Task timed out — core agent may be unresponsive');
-				onResult(`[Task timed out after ${Math.floor(TASK_TIMEOUT_MS / 60000)} minutes. The processing engine may need to be restarted.]`);
-			}
-		}
+		_checkPendingTimeouts(Date.now(), _pendingTasks, _sendTaskStatus, onResult);
 
 		try {
 			const files = readdirSync(RESULT_DIR).filter(f => f.endsWith('.txt')).sort();
