@@ -1141,21 +1141,36 @@ async def poll_dm_fallback():
 
 
 def _send_via_rest(channel_id: str, message: str):
-    """Send a message via Discord REST API (no gateway connection). Exits after sending."""
+    """Send a message via Discord REST API (no gateway connection).
+
+    Chunks via `_chunk_for_discord` so messages over Discord's 2000-char limit
+    (or with code fences spanning chunk boundaries) deliver intact across N
+    sequential POSTs. Without chunking the API returns 400 and the message
+    is silently dropped — this caused codex-output replies (often >2KB) to
+    never reach the channel.
+    """
     import urllib.request
     url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
-    data = json.dumps({"content": message}).encode()
-    req = urllib.request.Request(url, data=data, headers={
+    headers = {
         "Authorization": f"Bot {TOKEN}",
         "Content-Type": "application/json",
         "User-Agent": "DiscordBot (sutando, 1.0)",
-    })
-    try:
-        urllib.request.urlopen(req)
-        print(f"Sent to {channel_id}: {message[:80]}...")
-    except Exception as e:
-        print(f"Send failed: {e}")
-        sys.exit(1)
+    }
+    chunks = list(_chunk_for_discord(message))
+    if not chunks:
+        # Empty message — nothing to send. Treat as no-op rather than error.
+        return
+    for i, chunk in enumerate(chunks, 1):
+        data = json.dumps({"content": chunk}).encode()
+        req = urllib.request.Request(url, data=data, headers=headers)
+        try:
+            urllib.request.urlopen(req)
+        except Exception as e:
+            print(f"Send failed (chunk {i}/{len(chunks)}): {e}")
+            sys.exit(1)
+    suffix = "..." if len(message) > 80 else ""
+    chunk_note = f" ({len(chunks)} chunks)" if len(chunks) > 1 else ""
+    print(f"Sent to {channel_id}: {message[:80]}{suffix}{chunk_note}")
 
 
 if __name__ == "__main__":
