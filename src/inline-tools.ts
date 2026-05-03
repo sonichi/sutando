@@ -22,11 +22,12 @@ import { describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool,
 export const openFileTool: ToolDefinition = {
 	name: 'open_file',
 	description:
-		'Open a file with the default macOS app. ALWAYS pass an absolute `path`. ' +
+		'Open a file with the default macOS app. ALWAYS pass an absolute `path` (or one starting with $VAR / ~). ' +
 		'Use for: "open the file", "open that", "can you open it". ' +
 		'If the user says "open the log" or similar, ASK which log they mean (voice-agent, discord-bridge, etc.) — do NOT guess. ' +
 		'Known files: "diagnostic tracker" or "diagnostics" = /tmp/phone-diagnostics-tracker.html, ' +
-		'"voice diagnostics" = /tmp/voice-diagnostics-tracker.html. ' +
+		'"voice diagnostics" = /tmp/voice-diagnostics-tracker.html, ' +
+		'"voice context" / "the voice context file" / "the active context" = $SUTANDO_PRIVATE_DIR/voice-contexts/<active>.txt where <active> is the trimmed contents of $SUTANDO_PRIVATE_DIR/voice-contexts/active. Pass it with the env-var expanded by you (e.g. /Users/wangchi/.sutando-memory-sync/voice-contexts/ag2ai-investor.txt) or as $SUTANDO_PRIVATE_DIR/voice-contexts/ag2ai-investor.txt — both work. ' +
 		'Pass `fullscreen=true` if the user wants the file opened in fullscreen — works generically for any file type via Cmd+Ctrl+F to whichever app the OS routed the file to (QuickTime → Present mode, Preview → fullscreen PDF, Chrome → fullscreen page, etc.).',
 	parameters: z.object({
 		path: z.string().describe('Absolute file path to open.'),
@@ -38,7 +39,12 @@ export const openFileTool: ToolDefinition = {
 		console.log(`${ts()} [OpenFile] called (path=${path || 'none'}, fullscreen=${fullscreen || false})`);
 		try {
 			if (!path) return { error: 'No path provided. Pass an absolute file path. (For the most recent recording, call play_video — it auto-finds the file.)' };
-			const filePath = path.replace(/^~/, process.env.HOME || '');
+			// Expand $VAR / ${VAR} env-var references and ~ in the path so Sutando
+			// can pass paths like "$SUTANDO_PRIVATE_DIR/voice-contexts/X.txt"
+			// without us hardcoding a fallback root.
+			const filePath = path
+				.replace(/^~/, process.env.HOME || '')
+				.replace(/\$\{([A-Z_][A-Z0-9_]*)\}|\$([A-Z_][A-Z0-9_]*)/g, (_, a, b) => process.env[a || b] || '');
 			if (!existsSync(filePath)) {
 				console.log(`${ts()} [OpenFile] path "${filePath}" does not exist`);
 				return { error: `File not found: ${filePath}. Do not invent paths — use the exact path returned by the tool that produced the file (e.g. record_screen_with_narration returns subtitled_path/narrated_path/recording_path). For the most recent recording without a known path, call play_video instead.` };
@@ -64,6 +70,22 @@ export const openFileTool: ToolDefinition = {
 			}
 			const size = statSync(filePath).size;
 			console.log(`${ts()} [OpenFile] opened ${filePath} (${(size / 1024 / 1024).toFixed(1)}MB)`);
+			// If we just opened a video file, write the path to the playback-path
+			// marker so the existing video-control tools (pause_video / replay_video
+			// / etc.) work against the open_file-opened video. Without this, those
+			// tools fall back to findRecording() which only finds phone-call
+			// recordings — so any "pause" / "replay" cue after open_file returns
+			// "No video to play". This makes the existing tool surface QuickTime-
+			// aware, regardless of whether the video came from a phone-call
+			// recording or open_file.
+			const ext = filePath.toLowerCase().slice(filePath.lastIndexOf('.'));
+			if (['.mp4', '.mov', '.webm', '.m4v'].includes(ext)) {
+				try {
+					const fs = await import('node:fs');
+					fs.writeFileSync('/tmp/sutando-playback-path', filePath);
+					console.log(`${ts()} [OpenFile] wrote playback-path for video-control tools`);
+				} catch {}
+			}
 			return {
 				status: 'opened',
 				path: filePath,
