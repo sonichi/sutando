@@ -309,6 +309,7 @@ const HTML = /* html */ `<!DOCTYPE html>
   }
   .task-status.working { background: #1e3a5f; color: #60a5fa; animation: pulse 1.5s infinite; }
   .task-status.done { background: #1e4028; color: #4ecca3; }
+  .task-status.timeout { background: #4a3a1e; color: #f59e0b; animation: pulse 1.5s infinite; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
   .task-text { color: #d0d0d8; flex: 1; word-break: break-word; font-size: 16px; line-height: 1.6; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .task-text.expanded { white-space: normal; }
@@ -1021,7 +1022,7 @@ function renderTasks() {
   }
   const sorted = entries.sort((a, b) => b[1].time - a[1].time).slice(0, 8);
   container.innerHTML = sorted.map(([id, t]) => {
-    const icons = { pending: '&#8987;', working: '&#9881;', done: '&#10003;', error: '&#10007;' };
+    const icons = { pending: '&#8987;', working: '&#9881;', done: '&#10003;', error: '&#10007;', timeout: '&#9201;' };
     const ago = Math.round((Date.now() - t.time) / 1000);
     const timeStr = ago < 60 ? ago + 's ago' : Math.round(ago / 60) + 'm ago';
     const hasResult = t.result && t.status === 'done';
@@ -2177,7 +2178,7 @@ function renderTabContent() {
       container.innerHTML = '<div style="color:#666;font-size:12px;text-align:center;padding:12px">No recent tasks</div>';
     } else {
       var sorted = entries.sort(function(a,b) { return b[1].time - a[1].time; }).slice(0, 10);
-      var icons = { pending: '&#8987;', working: '&#9881;', done: '&#10003;', error: '&#10007;' };
+      var icons = { pending: '&#8987;', working: '&#9881;', done: '&#10003;', error: '&#10007;', timeout: '&#9201;' };
       container.innerHTML = sorted.map(function(entry) {
         var id = entry[0], t = entry[1];
         var ago = Math.round((Date.now() - t.time) / 1000);

@@ -1,11 +1,17 @@
 // Unit tests for the task-bridge timeout path.
 //
-// Bug being covered: when a task hits TASK_TIMEOUT_MS, the status event
-// fired to the web UI used a generic title — "Task timed out — core agent
-// may be unresponsive" — which collapses N distinct timed-out tasks into
-// N visually-identical Tasks-tab rows (see screenshot 2026-05-02 8.54pm:
-// 16 indistinguishable rows). The desired behavior is that the timeout
-// status carries the original task text so each row remains identifiable.
+// Two layered bugs covered:
+//
+// (1) Generic timeout title collapsed N distinct timed-out tasks into N
+//     visually-identical Tasks-tab rows (16-row screenshot 2026-05-02
+//     8.54pm). Fix: timeout status carries the original task text.
+//
+// (2) Timeout fired `onResult(...)` which was funneled into the voice
+//     agent's LLM context, causing it to narrate "the task timed out" out
+//     loud — annoying when a slow task often eventually completes anyway.
+//     Fix: timeout is UI-only (silent). The badge is set exactly once, the
+//     pending entry is left in place so an eventual real result still
+//     flips the row to `done` via the normal `_processResult` path.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -33,17 +39,17 @@ function makeCaptures() {
 	return { statusCalls, onResultCalls, sendStatus, onResult };
 }
 
-test('timeout fires for tasks older than TASK_TIMEOUT_MS', () => {
+test('timeout fires UI badge but stays silent (no onResult), pending entry survives', () => {
 	const pending = new Map<string, { submittedAt: number; task: string }>();
 	pending.set('task-1', { submittedAt: 0, task: 'summarize the 5 open PRs by sonichi' });
 	const { statusCalls, onResultCalls, sendStatus, onResult } = makeCaptures();
 
-	_checkPendingTimeouts(TASK_TIMEOUT_MS + 1, pending, sendStatus, onResult);
+	_checkPendingTimeouts(TASK_TIMEOUT_MS + 1, pending, sendStatus, onResult, new Set());
 
 	assert.equal(statusCalls.length, 1, 'one timeout status fired');
 	assert.equal(statusCalls[0].status, 'timeout');
-	assert.equal(onResultCalls.length, 1);
-	assert.equal(pending.size, 0, 'pending entry removed after timeout');
+	assert.equal(onResultCalls.length, 0, 'silent — no voice narration');
+	assert.equal(pending.size, 1, 'pending entry kept so an eventual result still flips to done');
 });
 
 test('timeout does NOT fire for tasks within the deadline', () => {
@@ -51,11 +57,24 @@ test('timeout does NOT fire for tasks within the deadline', () => {
 	pending.set('task-1', { submittedAt: 0, task: 'still working' });
 	const { statusCalls, onResultCalls, sendStatus, onResult } = makeCaptures();
 
-	_checkPendingTimeouts(TASK_TIMEOUT_MS - 1, pending, sendStatus, onResult);
+	_checkPendingTimeouts(TASK_TIMEOUT_MS - 1, pending, sendStatus, onResult, new Set());
 
 	assert.equal(statusCalls.length, 0);
 	assert.equal(onResultCalls.length, 0);
 	assert.equal(pending.size, 1, 'still pending');
+});
+
+test('timeout badge dedupes across ticks (does not re-fire every 2s)', () => {
+	const pending = new Map<string, { submittedAt: number; task: string }>();
+	pending.set('task-1', { submittedAt: 0, task: 'long-running task' });
+	const { statusCalls, sendStatus, onResult } = makeCaptures();
+	const fired = new Set<string>();
+
+	_checkPendingTimeouts(TASK_TIMEOUT_MS + 1, pending, sendStatus, onResult, fired);
+	_checkPendingTimeouts(TASK_TIMEOUT_MS + 2000, pending, sendStatus, onResult, fired);
+	_checkPendingTimeouts(TASK_TIMEOUT_MS + 4000, pending, sendStatus, onResult, fired);
+
+	assert.equal(statusCalls.length, 1, 'timeout badge fires exactly once even though the deadline keeps being exceeded');
 });
 
 test('integration: workTool submission stores task text so timeout title remains identifiable', async () => {
@@ -79,7 +98,7 @@ test('integration: workTool submission stores task text so timeout title remains
 
 	// Drive the timeout and confirm the title carries the text end-to-end.
 	const { statusCalls, sendStatus, onResult } = makeCaptures();
-	_checkPendingTimeouts(entry!.submittedAt + TASK_TIMEOUT_MS + 1, _pendingTasks, sendStatus, onResult);
+	_checkPendingTimeouts(entry!.submittedAt + TASK_TIMEOUT_MS + 1, _pendingTasks, sendStatus, onResult, new Set());
 	const call = statusCalls.find(c => c.taskId === taskId);
 	assert.ok(call, 'timeout fired for the submitted task');
 	assert.equal(call!.status, 'timeout');
@@ -92,7 +111,7 @@ test('timeout title carries original task text so distinct tasks render distinct
 	pending.set('task-b', { submittedAt: 0, task: 'what is on my screen' });
 	const { statusCalls, sendStatus, onResult } = makeCaptures();
 
-	_checkPendingTimeouts(TASK_TIMEOUT_MS + 1, pending, sendStatus, onResult);
+	_checkPendingTimeouts(TASK_TIMEOUT_MS + 1, pending, sendStatus, onResult, new Set());
 
 	assert.equal(statusCalls.length, 2);
 	const titles = statusCalls.map(c => c.text);

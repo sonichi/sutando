@@ -73,24 +73,33 @@ export const TASK_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 type PendingTask = { submittedAt: number; task: string };
 export const _pendingTasks = new Map<string, PendingTask>(); // taskId → entry
 
+// Track which pending entries have already had their timeout badge fired so
+// we don't re-emit the same status event every 2s after the deadline passes.
+const _timeoutBadgeFired = new Set<string>();
+
 /**
  * Pure timeout check, extracted from startResultWatcher's setInterval so it
- * can be unit-tested without the 2s timer or the fs.readdir loop. Mutates
- * `pending` (deletes timed-out entries) and invokes the two callbacks for
- * each timed-out task.
+ * can be unit-tested without the 2s timer or the fs.readdir loop.
+ *
+ * UI-only / silent: marks each timed-out row with a `timeout` badge in the
+ * Tasks tab and does NOT fire `onResult`, so the voice agent stays silent.
+ * The pending entry is intentionally LEFT IN PLACE — if the core agent
+ * eventually returns a result, `_processResult` will flip the row to `done`
+ * the normal way. The `firedSet` arg dedupes the badge across timer ticks.
  */
 export function _checkPendingTimeouts(
 	now: number,
 	pending: Map<string, PendingTask>,
 	sendStatus: ((taskId: string, status: string, text: string, result?: string) => void) | null,
-	onResult: (result: string) => void,
+	_onResult: (result: string) => void,
+	firedSet: Set<string> = _timeoutBadgeFired,
 ): void {
 	for (const [taskId, entry] of pending) {
+		if (firedSet.has(taskId)) continue;
 		if (now - entry.submittedAt > TASK_TIMEOUT_MS) {
-			pending.delete(taskId);
-			console.error(`${ts()} [TaskBridge] Task ${taskId} timed out after ${TASK_TIMEOUT_MS / 1000}s`);
+			firedSet.add(taskId);
+			console.error(`${ts()} [TaskBridge] Task ${taskId} timed out after ${TASK_TIMEOUT_MS / 1000}s (silent — UI badge only)`);
 			sendStatus?.(taskId, 'timeout', `Timed out: ${entry.task.slice(0, 60)}`);
-			onResult(`[Task timed out after ${Math.floor(TASK_TIMEOUT_MS / 60000)} minutes. The processing engine may need to be restarted.]`);
 		}
 	}
 }
@@ -403,6 +412,7 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
 					_deliveredResults.add(file);
 					_pendingTasks.delete(taskId);
+					_timeoutBadgeFired.delete(taskId);
 					logConversation('core-agent', `[task:${taskId}] ${result.slice(0, 200)}`);
 					onResult(result);
 					// Notify agent-api directly, then delete file
