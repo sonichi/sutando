@@ -517,14 +517,16 @@ const mainAgent: MainAgent = {
 					if (name && /^[A-Za-z0-9._-]+$/.test(name)) {
 						const ctxPath = join(root, 'voice-contexts', `${name}.txt`);
 						const content = readFileSync(ctxPath, 'utf-8');
-						console.log(`${ts()} [voice-context] loaded ${content.length} bytes from ${ctxPath}`);
+						const byteLen = Buffer.byteLength(content, 'utf-8');
+						console.log(`${ts()} [voice-context] loaded ${content.length} chars / ${byteLen} bytes from ${ctxPath}`);
 						return content;
 					}
 				}
 			} catch {}
 			try {
 				const content = readFileSync('voice-context.txt', 'utf-8');
-				console.log(`${ts()} [voice-context] loaded ${content.length} bytes from voice-context.txt (fallback)`);
+				const byteLen = Buffer.byteLength(content, 'utf-8');
+				console.log(`${ts()} [voice-context] loaded ${content.length} chars / ${byteLen} bytes from voice-context.txt (fallback)`);
 				return content;
 			} catch {
 				console.log(`${ts()} [voice-context] no context loaded (no env, no pointer, no fallback file)`);
