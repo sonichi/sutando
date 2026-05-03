@@ -57,7 +57,7 @@ We're looking for contributors to help test and harden these capabilities. If yo
 
 ```
     You ──voice (browser)──► Voice agent ─────────┐
-     │                       (serves web client,  │
+     │                       (Gemini Live,        │
      │                        WS on :9900)        ├──► inline tools (instant,
      │                                            │    in-process: describe_screen,
      ├──phone (Twilio)─────► Conversation server ─┤    get_current_time, hang_up,
