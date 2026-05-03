@@ -39,6 +39,7 @@ import re
 import socket
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -85,6 +86,13 @@ def validate_twilio_signature(handler, body: str) -> bool:
 REPO_DIR = Path(__file__).parent.parent
 TASK_DIR = REPO_DIR / "tasks"
 PORT = 7843
+
+# Task timeout for the /tasks/active polling endpoint. Must mirror
+# TASK_TIMEOUT_MS in src/task-bridge.ts so the web-client polled status
+# matches the bodhi-pushed status (otherwise the poll silently overwrites
+# the timeout badge back to "working" every 2s). Override with
+# SUTANDO_TASK_TIMEOUT_S at start time, e.g. for shorter dev/test loops.
+TASK_TIMEOUT_S = int(os.environ.get("SUTANDO_TASK_TIMEOUT_S", "600"))
 
 # Personal-asset path resolver — see src/util_paths.py. Imported here so the
 # /avatar and /stand-identity endpoints prefer the per-machine private dir
@@ -300,7 +308,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         task_line = line[5:].strip()
                         break
                 result_file = RESULT_DIR / f.name
-                status = "done" if result_file.exists() else "working"
+                if result_file.exists():
+                    status = "done"
+                elif (time.time() - f.stat().st_mtime) > TASK_TIMEOUT_S:
+                    status = "timeout"
+                else:
+                    status = "working"
                 result_text = result_file.read_text().strip() if result_file.exists() else ""
                 existing = task_history.get(task_id, {})
                 task_history[task_id] = {"status": status, "text": task_line or existing.get("text", task_id), "time": f.stat().st_mtime, "result": result_text or existing.get("result", "")}

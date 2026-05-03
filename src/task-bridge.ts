@@ -70,22 +70,62 @@ let _sendTaskStatus: ((taskId: string, status: string, text: string, result?: st
 const _deliveredResults = new Set<string>();
 
 export const TASK_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+// Send a status-check nudge task to core once a task has been pending this
+// long without a result. Higher than TASK_TIMEOUT_MS so we don't nudge for
+// every slow-but-progressing task — only ones that look genuinely stuck.
+export const NUDGE_AT_MS = 3 * TASK_TIMEOUT_MS;
 type PendingTask = { submittedAt: number; task: string };
 export const _pendingTasks = new Map<string, PendingTask>(); // taskId → entry
 
 // Track which pending entries have already had their timeout badge fired so
 // we don't re-emit the same status event every 2s after the deadline passes.
 const _timeoutBadgeFired = new Set<string>();
+// Per-task once-per-task nudge dedupe. Cleared when a result arrives (so the
+// SAME task being re-submitted later can nudge again, but the still-pending
+// one only nudges once).
+const _nudgeFired = new Set<string>();
+
+/** Default nudge-writer: drops a status-check task file in TASK_DIR. The
+ * watcher will pick it up like any other task. Injected via a parameter on
+ * `_checkPendingTimeouts` so tests can capture the call without writing
+ * to disk. */
+function _defaultWriteNudge(nudgeId: string, content: string): void {
+	writeFileSync(join(TASK_DIR, `${nudgeId}.txt`), content);
+}
+
+function _buildNudgeContent(nudgeId: string, originalTaskId: string, originalTask: string, ageMs: number): string {
+	const ageMin = Math.floor(ageMs / 60000);
+	const ownerId = process.env.SUTANDO_DM_OWNER_ID || 'voice-local';
+	const truncated = originalTask.slice(0, 80);
+	return (
+		`id: ${nudgeId}\n` +
+		`timestamp: ${new Date().toISOString()}\n` +
+		`task: [Sutando-status-check] ${ageMin} min ago I queued: "${truncated}". Are you still working on it? If yes, post a brief status (what you've done so far). If you're stuck, name the blocker. If the task is no longer relevant, just say so. Don't restart the original task — only report status.\n` +
+		`source: voice\n` +
+		`channel_id: local-voice\n` +
+		`user_id: ${ownerId}\n` +
+		`access_tier: owner\n` +
+		`parent_task_id: ${originalTaskId}\n`
+	);
+}
 
 /**
  * Pure timeout check, extracted from startResultWatcher's setInterval so it
  * can be unit-tested without the 2s timer or the fs.readdir loop.
  *
- * UI-only / silent: marks each timed-out row with a `timeout` badge in the
- * Tasks tab and does NOT fire `onResult`, so the voice agent stays silent.
- * The pending entry is intentionally LEFT IN PLACE — if the core agent
- * eventually returns a result, `_processResult` will flip the row to `done`
- * the normal way. The `firedSet` arg dedupes the badge across timer ticks.
+ * Two effects, both deduped per task:
+ *
+ * 1. UI-only / silent timeout badge once age > TASK_TIMEOUT_MS — marks the
+ *    Tasks-tab row yellow. Does NOT fire `onResult`, so the voice agent
+ *    stays silent. The pending entry is intentionally LEFT IN PLACE — if
+ *    core eventually returns a result, `_processResult` will flip the row
+ *    to `done` the normal way.
+ *
+ * 2. Status-check nudge once age > NUDGE_AT_MS (3× timeout) — writes a new
+ *    task file asking core to report status on the still-pending original
+ *    task. Status-check, not re-submit, so an in-flight task doesn't get
+ *    duplicated; only fires once per pending task (cleared when the result
+ *    finally arrives).
  */
 export function _checkPendingTimeouts(
 	now: number,
@@ -93,13 +133,25 @@ export function _checkPendingTimeouts(
 	sendStatus: ((taskId: string, status: string, text: string, result?: string) => void) | null,
 	_onResult: (result: string) => void,
 	firedSet: Set<string> = _timeoutBadgeFired,
+	nudgeSet: Set<string> = _nudgeFired,
+	writeNudge: (nudgeId: string, content: string) => void = _defaultWriteNudge,
 ): void {
 	for (const [taskId, entry] of pending) {
-		if (firedSet.has(taskId)) continue;
-		if (now - entry.submittedAt > TASK_TIMEOUT_MS) {
+		const age = now - entry.submittedAt;
+		if (age > TASK_TIMEOUT_MS && !firedSet.has(taskId)) {
 			firedSet.add(taskId);
 			console.error(`${ts()} [TaskBridge] Task ${taskId} timed out after ${TASK_TIMEOUT_MS / 1000}s (silent — UI badge only)`);
 			sendStatus?.(taskId, 'timeout', `Timed out: ${entry.task.slice(0, 60)}`);
+		}
+		if (age > NUDGE_AT_MS && !nudgeSet.has(taskId)) {
+			nudgeSet.add(taskId);
+			const nudgeId = `task-${now}-nudge`;
+			try {
+				writeNudge(nudgeId, _buildNudgeContent(nudgeId, taskId, entry.task, age));
+				console.error(`${ts()} [TaskBridge] Status-check nudge ${nudgeId} sent for ${taskId} (${Math.floor(age / 60000)} min old)`);
+			} catch (e) {
+				console.error(`${ts()} [TaskBridge] Nudge write failed:`, e);
+			}
 		}
 	}
 }
@@ -413,6 +465,7 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 					_deliveredResults.add(file);
 					_pendingTasks.delete(taskId);
 					_timeoutBadgeFired.delete(taskId);
+					_nudgeFired.delete(taskId);
 					logConversation('core-agent', `[task:${taskId}] ${result.slice(0, 200)}`);
 					onResult(result);
 					// Notify agent-api directly, then delete file

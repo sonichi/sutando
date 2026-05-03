@@ -20,6 +20,7 @@ import { join } from 'node:path';
 import {
 	_checkPendingTimeouts,
 	_pendingTasks,
+	NUDGE_AT_MS,
 	TASK_TIMEOUT_MS,
 	workTool,
 } from '../src/task-bridge.ts';
@@ -103,6 +104,35 @@ test('integration: workTool submission stores task text so timeout title remains
 	assert.ok(call, 'timeout fired for the submitted task');
 	assert.equal(call!.status, 'timeout');
 	assert.match(call!.text, /integration-canary task text/);
+});
+
+test('nudge fires once at NUDGE_AT_MS, sends a status-check (not a re-submit)', () => {
+	const pending = new Map<string, { submittedAt: number; task: string }>();
+	pending.set('task-x', { submittedAt: 0, task: 'long-running analysis of the open PRs' });
+	const { statusCalls, onResultCalls, sendStatus, onResult } = makeCaptures();
+	const fired = new Set<string>();
+	const nudge = new Set<string>();
+	const nudgeWrites: { id: string; content: string }[] = [];
+	const writeNudge = (id: string, content: string) => { nudgeWrites.push({ id, content }); };
+
+	// Below NUDGE_AT_MS — only the regular timeout badge, no nudge yet.
+	_checkPendingTimeouts(NUDGE_AT_MS - 1, pending, sendStatus, onResult, fired, nudge, writeNudge);
+	assert.equal(nudgeWrites.length, 0, 'no nudge before NUDGE_AT_MS');
+	assert.equal(statusCalls.length, 1, 'timeout badge fired (silent)');
+
+	// Past NUDGE_AT_MS — nudge written exactly once.
+	_checkPendingTimeouts(NUDGE_AT_MS + 1, pending, sendStatus, onResult, fired, nudge, writeNudge);
+	assert.equal(nudgeWrites.length, 1, 'nudge fires once past NUDGE_AT_MS');
+	assert.match(nudgeWrites[0].content, /\[Sutando-status-check\]/, 'nudge is a status-check, not a re-submit');
+	assert.match(nudgeWrites[0].content, /long-running analysis of the open PRs/, 'nudge cites the original task text so core knows what to report on');
+	assert.match(nudgeWrites[0].content, /parent_task_id: task-x/, 'nudge carries parent_task_id for traceability');
+	assert.match(nudgeWrites[0].content, /Don't restart the original task/, 'nudge explicitly tells core not to restart');
+	assert.equal(onResultCalls.length, 0, 'still silent — nudge does not narrate');
+
+	// Repeat ticks past the nudge threshold — must NOT fire a second nudge.
+	_checkPendingTimeouts(NUDGE_AT_MS + 60_000, pending, sendStatus, onResult, fired, nudge, writeNudge);
+	_checkPendingTimeouts(NUDGE_AT_MS + 120_000, pending, sendStatus, onResult, fired, nudge, writeNudge);
+	assert.equal(nudgeWrites.length, 1, 'nudge dedupes across ticks (only one per pending task)');
 });
 
 test('timeout title carries original task text so distinct tasks render distinctly (THIS IS THE BUG)', () => {
