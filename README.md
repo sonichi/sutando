@@ -80,16 +80,18 @@ We're looking for contributors to help test and harden these capabilities. If yo
                                 (spoken via voice/phone,
                                  text via Telegram/Discord)
 
-    ↻ = the Claude Code session runs the `/proactive-loop` skill (default
-        10-minute interval), which keeps a persistent watcher on `tasks/`
-        via Claude Code's `Monitor` tool, processes pending tasks the
-        moment they arrive, runs health checks, and picks the next
-        build-log item autonomously between ticks.
+    ↻ = a cron job fires the `/proactive-loop` skill every 5 minutes
+        (`*/5 * * * *` in `skills/schedule-crons/crons.json`). The skill
+        runs as a 10-minute pass that keeps a persistent watcher on
+        `tasks/` via Claude Code's `Monitor` tool — pending tasks are
+        processed the moment they arrive, not just on the cron tick.
+        Each pass also runs health checks and picks the next build-log
+        item autonomously.
 ```
 
 Four processes work together:
 - **Voice agent** (Gemini Live, WebSocket on :9900) — listens and talks in real time for browser voice.
-- **Web client** (`com.sutando.web-client.plist`, HTTP on :8080) — separate launchd service that serves the browser UI and proxies to the voice agent over the WebSocket.
+- **Web client** (`com.sutando.web-client.plist`, HTTP on :8080) — separate launchd service that serves the browser UI. The browser then connects directly to the voice agent's WebSocket on :9900 — the web client is not in the WebSocket data path.
 - **Conversation server** (Gemini Live, Twilio WebSocket on :3100) — same role as the voice agent for inbound and outbound phone calls.
 - **Core agent** (Claude Code CLI) — executes tasks with full system access. We use the CLI because it provides cron scheduling, plugins, and an interactive terminal that the SDK doesn't offer out of the box.
 
