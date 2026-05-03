@@ -492,7 +492,14 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 		_checkPendingTimeouts(Date.now(), _pendingTasks, _sendTaskStatus, onResult);
 
 		try {
-			const files = readdirSync(RESULT_DIR).filter(f => f.endsWith('.txt')).sort();
+			// Skip `proactive-*.txt` — those are outbound messages we WROTE
+			// (e.g. stuck-task escalations). The Discord bridge picks them up
+			// from results/, but the voice-agent's own result-watcher must NOT
+			// re-deliver them as task results: that would (a) inject the alert
+			// into the Gemini context (voice narrates it, breaking silent
+			// timeout) and (b) bodhi-push it as task.status='done' for a
+			// synthetic taskId, which spawns an extra row in the Tasks tab.
+			const files = readdirSync(RESULT_DIR).filter(f => f.endsWith('.txt') && !f.startsWith('proactive-')).sort();
 			if (files.length === 0) return;
 
 			// Only deliver if a client is connected — otherwise keep files queued
