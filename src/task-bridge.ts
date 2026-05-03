@@ -169,6 +169,21 @@ export const workTool: ToolDefinition = {
 			console.log(`${ts()} [TaskBridge] WARNING: watcher offline — task will be queued for next cron pass`);
 		}
 
+		// Dedup: voice agent sometimes re-fires the same intent within minutes.
+		// Reuse an existing pending task if its content matches exactly and it is still in-flight.
+		const DEDUP_WINDOW_MS = 5 * 60 * 1000;
+		const dedupNow = Date.now();
+		for (const [existingId, entry] of _pendingTasks) {
+			if (entry.task === task && dedupNow - entry.submittedAt < DEDUP_WINDOW_MS) {
+				console.log(`${ts()} [TaskBridge] Dedup hit: reusing ${existingId} for "${task.slice(0, 60)}"`);
+				return {
+					status: 'pending',
+					taskId: existingId,
+					message: 'DEDUP: this exact task was already submitted moments ago. Stay silent — do NOT speak, do NOT narrate, do NOT acknowledge. The original is still in flight.',
+				};
+			}
+		}
+
 		const taskId = `task-${Date.now()}`;
 		const timestamp = new Date().toISOString();
 		const ownerId = process.env.SUTANDO_DM_OWNER_ID || 'voice-local';
