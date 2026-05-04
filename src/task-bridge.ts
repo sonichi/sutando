@@ -76,6 +76,28 @@ const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes default
 // can flip it true on critical tasks to get a fallback notification.
 type PendingTask = { submittedAt: number; timeoutMs: number; dmOnTimeout: boolean };
 const _pendingTasks = new Map<string, PendingTask>();
+
+/** True if the task file (in tasks/, tasks/processed/, or tasks/archive/)
+ * is voice-originated (channel_id: local-voice). Used by the result watcher
+ * to decide whether to forward an unsent result to Discord DM when voice is
+ * offline. Returns false on missing file or parse error — bias toward not
+ * forwarding to keep Susan-rejected always-DM behavior off by default for
+ * non-voice tasks. */
+function _isVoiceTask(taskId: string): boolean {
+	const candidates = [
+		join(TASK_DIR, `${taskId}.txt`),
+		join(TASK_DIR, 'processed', `${taskId}.txt`),
+		join(TASK_DIR, 'archive', `${taskId}.txt`),
+	];
+	for (const p of candidates) {
+		if (!existsSync(p)) continue;
+		try {
+			const body = readFileSync(p, 'utf-8');
+			return body.split('\n').some(l => l.startsWith('channel_id: local-voice') || l.startsWith('source: voice'));
+		} catch {}
+	}
+	return false;
+}
 const _apiToken = process.env.SUTANDO_API_TOKEN || '';
 function _apiHeaders(): Record<string, string> {
 	const h: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -464,17 +486,37 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 			const files = readdirSync(RESULT_DIR).filter(f => f.endsWith('.txt')).sort();
 			if (files.length === 0) return;
 
-			// Only deliver if a client is connected — otherwise keep files queued
-			if (!isClientConnected()) {
-				return;
-			}
+			const clientConnected = isClientConnected();
 
 			for (const file of files) {
 				if (_deliveredResults.has(file)) continue;
 				const path = join(RESULT_DIR, file);
 				const result = readFileSync(path, 'utf-8').trim();
+				if (!result) continue;
+				const taskId = file.replace('.txt', '');
+				// Voice client offline → forward voice-task results to Discord DM
+				// via a proactive-result-*.txt file (poll_proactive in
+				// discord-bridge.py picks it up and DMs the owner). Skips files
+				// that aren't voice-originated tasks (Discord/Telegram bridges
+				// handle their own deliveries via pending_replies).
+				if (!clientConnected) {
+					if (file.startsWith('task-') && _isVoiceTask(taskId)) {
+						try {
+							const proactiveTs = Math.floor(Date.now() / 1000);
+							const proactivePath = join(RESULT_DIR, `proactive-result-${taskId}-${proactiveTs}.txt`);
+							writeFileSync(proactivePath, result);
+							console.log(`${ts()} [TaskBridge] Voice offline; forwarded ${taskId} result to Discord DM via ${proactivePath}`);
+							_deliveredResults.add(file);
+							_pendingTasks.delete(taskId);
+							setTimeout(() => { archiveFile(path, 'results', taskId); }, 10_000);
+						} catch (e) {
+							console.error(`${ts()} [TaskBridge] Failed to forward ${taskId} to Discord:`, e);
+						}
+					}
+					// Other non-voice unsent results stay queued (their bridges deliver them)
+					continue;
+				}
 				if (result) {
-					const taskId = file.replace('.txt', '');
 					console.log(`${ts()} [TaskBridge] Result ${file}: ${result.slice(0, 100)}`);
 					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
 					_deliveredResults.add(file);
