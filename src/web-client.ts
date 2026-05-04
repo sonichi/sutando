@@ -1056,7 +1056,11 @@ function renderTasks() {
       (hasExpanded ? 'collapse all' : 'expand all') +
       '</span>';
   }
-  const sorted = entries.sort((a, b) => b[1].time - a[1].time).slice(0, 8);
+  // Render top-30 most recent. Was 8, but in active sessions (e.g. a kid
+  // iterating on a party plan) new tasks pushed earlier valuable results out
+  // of view within seconds. 30 keeps a longer history visible; localStorage
+  // persistence above keeps results from being lost across refreshes.
+  const sorted = entries.sort((a, b) => b[1].time - a[1].time).slice(0, 30);
   container.innerHTML = sorted.map(([id, t]) => {
     const icons = { pending: '&#8987;', working: '&#9881;', done: '&#10003;', error: '&#10007;' };
     const ago = Math.round((Date.now() - t.time) / 1000);
