@@ -366,6 +366,19 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 				console.error(`${ts()} [TaskBridge] Task ${taskId} timed out after ${TASK_TIMEOUT_MS / 1000}s`);
 				_sendTaskStatus?.(taskId, 'timeout', 'Task timed out — core agent may be unresponsive');
 				onResult(`[Task timed out after ${Math.floor(TASK_TIMEOUT_MS / 60000)} minutes. The processing engine may need to be restarted.]`);
+				// Move the task file out of tasks/ so /tasks/active stops listing it
+				// as 'working' forever. (Without this, dedup-orphan tasks left behind
+				// after a consolidated reply pile up in the UI as stuck spinners.)
+				const taskFile = join(TASK_DIR, `${taskId}.txt`);
+				if (existsSync(taskFile)) {
+					try {
+						const processedDir = join(TASK_DIR, 'processed');
+						mkdirSync(processedDir, { recursive: true });
+						renameSync(taskFile, join(processedDir, `${taskId}.txt`));
+					} catch (e) {
+						console.error(`${ts()} [TaskBridge] Failed to archive timed-out task ${taskId}:`, e);
+					}
+				}
 			}
 		}
 
