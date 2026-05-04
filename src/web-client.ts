@@ -1090,8 +1090,9 @@ function renderTasks() {
       actionsHtml = '<div class="task-actions" data-replyfor="' + id + '">' + inner + '</div>';
     }
     const rawText = t.text || id;
-    // Default-tag bare tasks (no [Channel] prefix) as [Sutando-core].
-    const taggedRaw = /^\\[/.test(rawText) ? rawText : '[Sutando-core] ' + rawText;
+    // Default-tag bare tasks (no [Channel] prefix) as [Voice] — the
+    // overwhelming majority of un-prefixed tasks come from the voice agent.
+    const taggedRaw = /^\\[/.test(rawText) ? rawText : '[Voice] ' + rawText;
     const displayText = isExpanded ? taggedRaw : summarizeTaskText(taggedRaw);
     const textClass = isExpanded ? 'task-text expanded' : 'task-text';
     const expandChip = hasResult ? '<span class="task-expand">' + (isExpanded ? 'Hide ▾' : 'Show details ▸') + '</span>' : '';
@@ -2237,10 +2238,10 @@ function renderTabContent() {
         var resultDisplay = isExpanded ? 'block' : 'none';
         var resultHtml = hasResult ? '<div id="result-' + id + '" style="display:' + resultDisplay + ';padding:8px 12px;color:#b8c8d8;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;background:#0d1520;border-radius:8px;margin:4px 0 6px 30px">' + esc(t.result) + '</div>' : '';
         var rawText = t.text || id;
-        // Default-tag bare tasks (no [Channel] prefix) as [Sutando-core]
-        // so every row in the list shows a channel badge per Susan's
-        // 2026-04-19 17:04 ask.
-        var taggedRaw = /^\\[/.test(rawText) ? rawText : '[Sutando-core] ' + rawText;
+        // Default-tag bare tasks (no [Channel] prefix) as [Voice] — the
+        // overwhelming majority of un-prefixed tasks come from the voice agent.
+        // (Was [Sutando-core]; renamed 2026-05-03 per Chi's "rename to Voice".)
+        var taggedRaw = /^\\[/.test(rawText) ? rawText : '[Voice] ' + rawText;
         var displayText = isExpanded ? taggedRaw : summarizeTaskText(taggedRaw);
         var textClass = isExpanded ? 'task-text expanded' : 'task-text';
         var expandChip = hasResult ? '<span class="task-expand">' + (isExpanded ? 'Hide &#9662;' : 'Show details &#9656;') + '</span>' : '';

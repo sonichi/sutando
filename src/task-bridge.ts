@@ -363,13 +363,34 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 		for (const [taskId, submittedAt] of _pendingTasks) {
 			if (Date.now() - submittedAt > TASK_TIMEOUT_MS) {
 				_pendingTasks.delete(taskId);
-				console.error(`${ts()} [TaskBridge] Task ${taskId} timed out after ${TASK_TIMEOUT_MS / 1000}s`);
-				_sendTaskStatus?.(taskId, 'timeout', 'Task timed out — core agent may be unresponsive');
-				onResult(`[Task timed out after ${Math.floor(TASK_TIMEOUT_MS / 60000)} minutes. The processing engine may need to be restarted.]`);
+				// Read the task body (or a snippet of it) so the timeout message
+				// can identify which task timed out — the prior generic "[Task
+				// timed out]" string left no clue when multiple tasks were in
+				// flight. Snippet is bounded to 80 chars to keep the voice
+				// narration short.
+				const taskFile = join(TASK_DIR, `${taskId}.txt`);
+				let taskSnippet = '';
+				if (existsSync(taskFile)) {
+					try {
+						const body = readFileSync(taskFile, 'utf-8');
+						const taskLine = body.split('\n').find(l => l.startsWith('task:'));
+						const raw = (taskLine ? taskLine.slice(5) : '').trim();
+						taskSnippet = raw.length > 80 ? raw.slice(0, 77) + '...' : raw;
+					} catch {}
+				}
+				console.error(`${ts()} [TaskBridge] Task ${taskId} (${taskSnippet || '?'}) timed out after ${TASK_TIMEOUT_MS / 1000}s`);
+				const statusMsg = taskSnippet
+					? `Task '${taskSnippet}' timed out — core agent may be unresponsive`
+					: 'Task timed out — core agent may be unresponsive';
+				_sendTaskStatus?.(taskId, 'timeout', statusMsg);
+				const minutes = Math.floor(TASK_TIMEOUT_MS / 60000);
+				const userMsg = taskSnippet
+					? `[Task ${taskId} ('${taskSnippet}') timed out after ${minutes} minutes. The processing engine may need to be restarted.]`
+					: `[Task ${taskId} timed out after ${minutes} minutes. The processing engine may need to be restarted.]`;
+				onResult(userMsg);
 				// Move the task file out of tasks/ so /tasks/active stops listing it
 				// as 'working' forever. (Without this, dedup-orphan tasks left behind
 				// after a consolidated reply pile up in the UI as stuck spinners.)
-				const taskFile = join(TASK_DIR, `${taskId}.txt`);
 				if (existsSync(taskFile)) {
 					try {
 						const processedDir = join(TASK_DIR, 'processed');
