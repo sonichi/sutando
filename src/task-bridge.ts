@@ -514,7 +514,11 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 							body: JSON.stringify({ taskId, result }),
 						}).catch(() => {});
 					} catch {}
-					setTimeout(() => { archiveFile(path, 'results', taskId); }, 5_000);
+					setTimeout(() => {
+						archiveFile(path, 'results', taskId);
+						const taskFile = join(TASK_DIR, `${taskId}.txt`);
+						if (existsSync(taskFile)) archiveFile(taskFile, 'tasks', taskId);
+					}, 5_000);
 					continue;
 				}
 				// Voice client offline → forward voice-task results to Discord DM
@@ -531,7 +535,11 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 							console.log(`${ts()} [TaskBridge] Voice offline; forwarded ${taskId} result to Discord DM via ${proactivePath}`);
 							_deliveredResults.add(file);
 							_pendingTasks.delete(taskId);
-							setTimeout(() => { archiveFile(path, 'results', taskId); }, 10_000);
+							setTimeout(() => {
+								archiveFile(path, 'results', taskId);
+								const taskFile = join(TASK_DIR, `${taskId}.txt`);
+								if (existsSync(taskFile)) archiveFile(taskFile, 'tasks', taskId);
+							}, 10_000);
 						} catch (e) {
 							console.error(`${ts()} [TaskBridge] Failed to forward ${taskId} to Discord:`, e);
 						}
@@ -554,7 +562,17 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 							body: JSON.stringify({ taskId, result }),
 						}).catch(() => {});
 					} catch {}
-					setTimeout(() => { archiveFile(path, 'results', path.split('/').pop()!.replace('.txt', '')); }, 10_000);
+					setTimeout(() => {
+						const taskIdFromFile = path.split('/').pop()!.replace('.txt', '');
+						archiveFile(path, 'results', taskIdFromFile);
+						// Also archive the originating task file so get_task_status
+						// stops counting it as "queued" — voice agent reads
+						// tasks/*.txt directly and otherwise sees stale files
+						// (Chi reported "task done in UI but queued in voice"
+						// on 2026-05-04 with 32 stale files in tasks/).
+						const taskFile = join(TASK_DIR, `${taskIdFromFile}.txt`);
+						if (existsSync(taskFile)) archiveFile(taskFile, 'tasks', taskIdFromFile);
+					}, 10_000);
 				}
 			}
 		} catch {
