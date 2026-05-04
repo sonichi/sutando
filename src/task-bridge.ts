@@ -497,6 +497,26 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 				const result = readFileSync(path, 'utf-8').trim();
 				if (!result) continue;
 				const taskId = file.replace('.txt', '');
+				// Deduped-marker result: agent consolidated this task's reply
+				// into another task's result file. Mark this task done silently
+				// and archive — no Discord post, no voice narration, no timeout.
+				// Format: first line is "[deduped: <other-task-id>]" (rest of
+				// file optional, displayed as the result body in the UI).
+				if (file.startsWith('task-') && /^\s*\[deduped:\s*task-/i.test(result)) {
+					console.log(`${ts()} [TaskBridge] ${taskId} is deduped marker; archiving silently`);
+					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
+					_deliveredResults.add(file);
+					_pendingTasks.delete(taskId);
+					try {
+						fetch('http://localhost:7843/task-done', {
+							method: 'POST',
+							headers: _apiHeaders(),
+							body: JSON.stringify({ taskId, result }),
+						}).catch(() => {});
+					} catch {}
+					setTimeout(() => { archiveFile(path, 'results', taskId); }, 5_000);
+					continue;
+				}
 				// Voice client offline → forward voice-task results to Discord DM
 				// via a proactive-result-*.txt file (poll_proactive in
 				// discord-bridge.py picks it up and DMs the owner). Skips files

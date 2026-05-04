@@ -926,8 +926,11 @@ async def poll_results():
                 # re-fire infinitely on the leftover task. Observed 2026-04-17:
                 # `[no-send]` tasks persisted in tasks/ because `continue`
                 # skipped the cleanup block at the bottom of this loop.
-                if reply_text.startswith('[no-send]') or reply_text.startswith('[REPLIED]'):
-                    print(f"  Skipped (already replied): {task_id}")
+                if reply_text.startswith('[no-send]') or reply_text.startswith('[REPLIED]') or reply_text.startswith('[deduped:'):
+                    # `[deduped: <id>]` = agent consolidated this task's reply
+                    # into another task's result. Silent archive, no Discord
+                    # post — same UX as [no-send] / [REPLIED].
+                    print(f"  Skipped (already replied or deduped): {task_id}")
                     archive_file(result_file, "results", task_id)
                     task_file = TASKS_DIR / f"{task_id}.txt"
                     archive_file(task_file, "tasks", task_id)
