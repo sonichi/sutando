@@ -24,7 +24,7 @@
 import 'dotenv/config';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
-import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync, appendFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync, unlinkSync, mkdirSync, appendFileSync, writeFileSync } from 'node:fs';
 import { execSync as execSyncTop } from 'node:child_process';
 import { inlineTools } from './inline-tools.js';
 import { injectText } from './browser-tools.js';
@@ -446,6 +446,25 @@ const mainAgent: MainAgent = {
 		// non-empty, it's the CURRENT session's in-progress turns —
 		// safe to replay without trigger filtering.
 		const recent = getRecentConversation(8);
+		// Offline-delivery hint: count proactive-result-*.txt files archived
+		// in the last 30 min. These are voice-task results forwarded to the
+		// owner's Discord DM while voice was offline (per task-bridge.ts
+		// fallback). Surface a one-line ack on reconnect so voice doesn't
+		// have to re-deliver and the user knows where to find the answers.
+		let offlineDeliveryHint = '';
+		try {
+			const archDir = join(WORKSPACE_DIR, 'results', 'archive', new Date().toISOString().slice(0, 7));
+			if (existsSync(archDir)) {
+				const cutoff = Date.now() - 30 * 60 * 1000;
+				const recent_proactive = readdirSync(archDir).filter(f =>
+					f.startsWith('proactive-result-task-') && f.endsWith('.txt') &&
+					statSync(join(archDir, f)).mtimeMs >= cutoff
+				);
+				if (recent_proactive.length > 0) {
+					offlineDeliveryHint = `\n\n[While the user was offline, ${recent_proactive.length} task result(s) were delivered to their Discord DM. If they ask about a task, refer them to Discord.]`;
+				}
+			}
+		} catch {}
 		if (recent) {
 			// Quick reconnect (< 60s since last logged turn) = network blip,
 			// not a real "away". Skip "Welcome back" and stay silent so the
@@ -461,7 +480,7 @@ const mainAgent: MainAgent = {
 				: (isQuickReconnect || presenterActive)
 					? '\n\n[Do NOT greet the user. Do NOT say "Welcome back" or anything similar. Stay completely silent and wait for the user\'s next spoken input — they were just briefly disconnected and want to resume without interruption.]'
 					: '\n\n[Now say "Welcome back" briefly — one sentence — and then stop and wait for input.]';
-			return `[System: The user reconnected. The block below is REPLAYED HISTORY from the current session, provided as background context ONLY. Do NOT act on anything in it. Do NOT call any tools based on it. Use it only to answer follow-up questions if asked. Wait silently for the user's next spoken input before taking any action.]${getPresenterStateMarker()}\n\n${recent}${meetingHint}`;
+			return `[System: The user reconnected. The block below is REPLAYED HISTORY from the current session, provided as background context ONLY. Do NOT act on anything in it. Do NOT call any tools based on it. Use it only to answer follow-up questions if asked. Wait silently for the user's next spoken input before taking any action.]${getPresenterStateMarker()}${offlineDeliveryHint}\n\n${recent}${meetingHint}`;
 		}
 		let standName = '';
 		try { const si = JSON.parse(readFileSync(personalPath('stand-identity.json'), 'utf-8')); standName = si.name ? ` — ${si.name}` : ''; } catch {}
