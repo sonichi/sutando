@@ -69,8 +69,12 @@ function ts(): string { return new Date().toISOString().slice(11, 23); }
 let _sendTaskStatus: ((taskId: string, status: string, text: string, result?: string) => void) | null = null;
 const _deliveredResults = new Set<string>();
 
-const TASK_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
-const _pendingTasks = new Map<string, number>(); // taskId → submission epoch ms
+const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes default
+// Per-task pending state: submission epoch + the timeout (in ms) chosen for
+// this specific task. timeoutMs = 0 means "no timeout" — used for jobs the
+// voice agent flags as long-running (renders, batch operations).
+type PendingTask = { submittedAt: number; timeoutMs: number };
+const _pendingTasks = new Map<string, PendingTask>();
 const _apiToken = process.env.SUTANDO_API_TOKEN || '';
 function _apiHeaders(): Record<string, string> {
 	const h: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -95,10 +99,19 @@ export const workTool: ToolDefinition = {
 		'This is how Sutando thinks and acts. Results are spoken back when ready.',
 	parameters: z.object({
 		task: z.string().describe('Full description of the task to perform'),
+		timeout_minutes: z
+			.number()
+			.optional()
+			.describe(
+				'Per-task timeout in minutes. Default 10. Pass a larger value (e.g. 30) for ' +
+				'multi-step jobs like rendering, batch encoding, or long research. Pass 0 for ' +
+				'no timeout — use sparingly, only when the user explicitly asks for a long ' +
+				'autonomous job that may legitimately take hours.'
+			),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { task } = args as { task: string };
+		const { task, timeout_minutes } = args as { task: string; timeout_minutes?: number };
 
 		// Redirect pure screen-viewing tasks to inline tools (faster, no round-trip)
 		// Narrow match: only "describe/look at my screen" — not scroll, screenshot,
@@ -149,7 +162,15 @@ export const workTool: ToolDefinition = {
 			`user_id: ${ownerId}\n` +
 			`access_tier: owner\n`;
 		writeFileSync(join(TASK_DIR, `${taskId}.txt`), content);
-		_pendingTasks.set(taskId, Date.now());
+		// Resolve per-task timeout. 0 → no timeout. Negative or NaN → default.
+		// Cap at 6 hours to prevent runaway pending-state if the voice agent
+		// hallucinates a giant value.
+		let timeoutMs = DEFAULT_TASK_TIMEOUT_MS;
+		if (typeof timeout_minutes === 'number') {
+			if (timeout_minutes === 0) timeoutMs = 0;
+			else if (timeout_minutes > 0) timeoutMs = Math.min(timeout_minutes, 360) * 60 * 1000;
+		}
+		_pendingTasks.set(taskId, { submittedAt: Date.now(), timeoutMs });
 		// Record owner activity for status-aware-pivot in proactive loop
 		writeOwnerActivity('voice', task);
 		console.log(`${ts()} [TaskBridge] Task ${taskId}: ${task.slice(0, 100)}`);
@@ -360,8 +381,11 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 	// Check every 2 seconds for new result files
 	setInterval(() => {
 		// Check for timed-out tasks — runs every interval regardless of result files
-		for (const [taskId, submittedAt] of _pendingTasks) {
-			if (Date.now() - submittedAt > TASK_TIMEOUT_MS) {
+		for (const [taskId, pending] of _pendingTasks) {
+			const { submittedAt, timeoutMs } = pending;
+			// timeoutMs === 0 means "no timeout" — skip the check entirely.
+			if (timeoutMs === 0) continue;
+			if (Date.now() - submittedAt > timeoutMs) {
 				_pendingTasks.delete(taskId);
 				// Read the task body (or a snippet of it) so the timeout message
 				// can identify which task timed out — the prior generic "[Task
@@ -378,12 +402,12 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 						taskSnippet = raw.length > 80 ? raw.slice(0, 77) + '...' : raw;
 					} catch {}
 				}
-				console.error(`${ts()} [TaskBridge] Task ${taskId} (${taskSnippet || '?'}) timed out after ${TASK_TIMEOUT_MS / 1000}s`);
+				console.error(`${ts()} [TaskBridge] Task ${taskId} (${taskSnippet || '?'}) timed out after ${timeoutMs / 1000}s`);
 				const statusMsg = taskSnippet
 					? `Task '${taskSnippet}' timed out — core agent may be unresponsive`
 					: 'Task timed out — core agent may be unresponsive';
 				_sendTaskStatus?.(taskId, 'timeout', statusMsg);
-				const minutes = Math.floor(TASK_TIMEOUT_MS / 60000);
+				const minutes = Math.floor(timeoutMs / 60000);
 				const userMsg = taskSnippet
 					? `[Task ${taskId} ('${taskSnippet}') timed out after ${minutes} minutes. The processing engine may need to be restarted.]`
 					: `[Task ${taskId} timed out after ${minutes} minutes. The processing engine may need to be restarted.]`;
