@@ -920,7 +920,37 @@ function setStatus(text, state) {
 
 // ─── Task list ────────────────────────────────────────────
 // Expose on window so inline tools can access via Chrome AppleScript JS injection
-const taskMap = window.taskMap = {};
+// Restore taskMap + expandedTasks from localStorage so results don't disappear
+// across page refreshes. The /tasks/active API only returns the result text on
+// the first poll after the bridge writes it; once the result file is moved to
+// archive, the API returns the task with an empty result. Without persistence
+// here, refreshing the page wipes the results from the UI.
+const PERSIST_KEY_TASKS = 'sutando-taskmap-v1';
+const PERSIST_KEY_EXPAND = 'sutando-expanded-v1';
+function loadPersistedTaskMap() {
+  try {
+    const raw = localStorage.getItem(PERSIST_KEY_TASKS);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    // Reconstruct Date objects on time fields
+    Object.values(parsed).forEach(t => { if (t && t.time) t.time = new Date(t.time); });
+    return parsed;
+  } catch { return {}; }
+}
+function loadPersistedExpanded() {
+  try {
+    const raw = localStorage.getItem(PERSIST_KEY_EXPAND);
+    if (!raw) return new Set();
+    return new Set(JSON.parse(raw));
+  } catch { return new Set(); }
+}
+function persistTaskMap() {
+  try { localStorage.setItem(PERSIST_KEY_TASKS, JSON.stringify(taskMap)); } catch {}
+}
+function persistExpanded() {
+  try { localStorage.setItem(PERSIST_KEY_EXPAND, JSON.stringify(Array.from(expandedTasks))); } catch {}
+}
+const taskMap = window.taskMap = loadPersistedTaskMap();
 function updateTask(taskId, status, text, result) {
   const existing = taskMap[taskId] || {};
   const isNew = !existing.status;
@@ -933,9 +963,11 @@ function updateTask(taskId, status, text, result) {
   if ((status === 'working' || status === 'done') && !expandedTasks.has(taskId) && !userCollapsed) {
     expandedTasks.add(taskId);
   }
+  persistTaskMap();
+  persistExpanded();
   renderTasks();
 }
-const expandedTasks = window.expandedTasks = new Set();
+const expandedTasks = window.expandedTasks = loadPersistedExpanded();
 const userExpanded = window.userExpanded = new Set(); // user-initiated expands — never auto-collapse these
 let userCollapsed = false; // user manually collapsed — suppress auto-expand
 // Listen for external collapse/expand commands (from inline tools via AppleScript)
@@ -949,6 +981,7 @@ function toggleResult(taskId) {
   // the "Show details" chip flips to "Hide", the displayText switches from
   // summary to full, and the reply/action buttons appear. Just toggling the
   // result block's display left the task header in a half-expanded state.
+  persistExpanded();
   renderTasks();
 }
 window.toggleAllTasks = toggleAllTasks;
@@ -956,6 +989,7 @@ function toggleAllTasks() {
   const hasExpanded = expandedTasks.size > 0;
   if (hasExpanded) { expandedTasks.clear(); userCollapsed = true; }
   else { Object.entries(taskMap).forEach(([id, t]) => { if (t.result) expandedTasks.add(id); }); userCollapsed = false; }
+  persistExpanded();
   renderTasks();
 }
 document.addEventListener('click', function(e) {
@@ -1119,6 +1153,7 @@ function startTaskPolling() {
           delete taskMap[id];
         }
       }
+      persistTaskMap();
       renderTasks();
       // Update system status indicators
       const statusParts = [];
