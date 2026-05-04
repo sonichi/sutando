@@ -70,10 +70,11 @@ let _sendTaskStatus: ((taskId: string, status: string, text: string, result?: st
 const _deliveredResults = new Set<string>();
 
 const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes default
-// Per-task pending state: submission epoch + the timeout (in ms) chosen for
-// this specific task. timeoutMs = 0 means "no timeout" — used for jobs the
-// voice agent flags as long-running (renders, batch operations).
-type PendingTask = { submittedAt: number; timeoutMs: number };
+// Per-task pending state: submission epoch, timeout (ms), and whether to
+// emit a Discord DM to the owner if this task hits its timeout. dm_on_timeout
+// defaults to false (silent timeout — Susan's PR #578 contract). Voice agent
+// can flip it true on critical tasks to get a fallback notification.
+type PendingTask = { submittedAt: number; timeoutMs: number; dmOnTimeout: boolean };
 const _pendingTasks = new Map<string, PendingTask>();
 const _apiToken = process.env.SUTANDO_API_TOKEN || '';
 function _apiHeaders(): Record<string, string> {
@@ -108,10 +109,22 @@ export const workTool: ToolDefinition = {
 				'no timeout — use sparingly, only when the user explicitly asks for a long ' +
 				'autonomous job that may legitimately take hours.'
 			),
+		dm_on_timeout: z
+			.boolean()
+			.optional()
+			.describe(
+				'If true, send a Discord DM to the owner when this task hits its timeout. ' +
+				'Default false (silent UI-only timeout, per Susan PR #578). Use only for ' +
+				'tasks the user has explicitly flagged as critical.'
+			),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { task, timeout_minutes } = args as { task: string; timeout_minutes?: number };
+		const { task, timeout_minutes, dm_on_timeout } = args as {
+			task: string;
+			timeout_minutes?: number;
+			dm_on_timeout?: boolean;
+		};
 
 		// Redirect pure screen-viewing tasks to inline tools (faster, no round-trip)
 		// Narrow match: only "describe/look at my screen" — not scroll, screenshot,
@@ -170,7 +183,7 @@ export const workTool: ToolDefinition = {
 			if (timeout_minutes === 0) timeoutMs = 0;
 			else if (timeout_minutes > 0) timeoutMs = Math.min(timeout_minutes, 360) * 60 * 1000;
 		}
-		_pendingTasks.set(taskId, { submittedAt: Date.now(), timeoutMs });
+		_pendingTasks.set(taskId, { submittedAt: Date.now(), timeoutMs, dmOnTimeout: dm_on_timeout === true });
 		// Record owner activity for status-aware-pivot in proactive loop
 		writeOwnerActivity('voice', task);
 		console.log(`${ts()} [TaskBridge] Task ${taskId}: ${task.slice(0, 100)}`);
@@ -382,7 +395,7 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 	setInterval(() => {
 		// Check for timed-out tasks — runs every interval regardless of result files
 		for (const [taskId, pending] of _pendingTasks) {
-			const { submittedAt, timeoutMs } = pending;
+			const { submittedAt, timeoutMs, dmOnTimeout } = pending;
 			// timeoutMs === 0 means "no timeout" — skip the check entirely.
 			if (timeoutMs === 0) continue;
 			if (Date.now() - submittedAt > timeoutMs) {
@@ -422,6 +435,23 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 						renameSync(taskFile, join(processedDir, `${taskId}.txt`));
 					} catch (e) {
 						console.error(`${ts()} [TaskBridge] Failed to archive timed-out task ${taskId}:`, e);
+					}
+				}
+				// Discord DM fallback (opt-in via dm_on_timeout). Default off per
+				// Susan's PR #578 contract — silent timeout. We emit by writing
+				// a proactive-*.txt file; discord-bridge.py poll_proactive sends
+				// it to the owner's DM.
+				if (dmOnTimeout) {
+					try {
+						const proactiveTs = Math.floor(Date.now() / 1000);
+						const proactivePath = join(RESULT_DIR, `proactive-timeout-${taskId}-${proactiveTs}.txt`);
+						const dmBody = taskSnippet
+							? `⏱ Task '${taskSnippet}' timed out after ${minutes}m. The processing engine may need to be restarted, or the task may need a longer timeout via timeout_minutes.`
+							: `⏱ Task ${taskId} timed out after ${minutes}m.`;
+						writeFileSync(proactivePath, dmBody);
+						console.log(`${ts()} [TaskBridge] Wrote DM-on-timeout proactive file for ${taskId}`);
+					} catch (e) {
+						console.error(`${ts()} [TaskBridge] Failed to emit DM-on-timeout for ${taskId}:`, e);
 					}
 				}
 			}
