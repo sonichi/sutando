@@ -599,6 +599,7 @@ const mainAgent: MainAgent = {
 			'',
 			'DELEGATABLE SKILLS (call via work — core runs these, not voice-inline):',
 			...coreDocumentedSkills.map(s => `- ${s.name}: ${s.description}`),
+			'IMPORTANT: these are NOT inline tools you can call directly. When the user requests one, call work({task: "<verbatim user request>"}) — core picks up the skill and runs it. Do NOT attempt to call <skill-name> as if it were an inline tool; that will fail.',
 		] : []),
 		'',
 		'CRITICAL RULES:',
