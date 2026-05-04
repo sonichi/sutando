@@ -300,10 +300,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         task_line = line[5:].strip()
                         break
                 result_file = RESULT_DIR / f.name
-                status = "done" if result_file.exists() else "working"
-                result_text = result_file.read_text().strip() if result_file.exists() else ""
                 existing = task_history.get(task_id, {})
-                task_history[task_id] = {"status": status, "text": task_line or existing.get("text", task_id), "time": f.stat().st_mtime, "result": result_text or existing.get("result", "")}
+                # Look for the result in three places, in priority order:
+                # (1) live results/ dir, (2) prior in-memory history (covers
+                # the case where the bridge has already archived the file),
+                # (3) results/archive/<YYYY-MM>/. Without (3), an agent-api
+                # restart loses every prior task's result and the web UI
+                # shows them all as "working" with no body.
+                archived_file = None
+                for month_dir in (RESULT_DIR / "archive").glob("*/"):
+                    candidate = month_dir / f.name
+                    if candidate.exists():
+                        archived_file = candidate
+                        break
+                if result_file.exists():
+                    status = "done"
+                    result_text = result_file.read_text().strip()
+                elif existing.get("status") == "done" or existing.get("result"):
+                    status = "done"
+                    result_text = existing.get("result", "")
+                elif archived_file is not None:
+                    status = "done"
+                    result_text = archived_file.read_text().strip()
+                else:
+                    status = "working"
+                    result_text = ""
+                task_history[task_id] = {"status": status, "text": task_line or existing.get("text", task_id), "time": f.stat().st_mtime, "result": result_text}
             # Also check for result files without task files (already cleaned up)
             for f in sorted(RESULT_DIR.glob("task-*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]:
                 task_id = f.stem
