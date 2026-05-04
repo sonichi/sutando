@@ -26,7 +26,7 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { existsSync, readFileSync, readdirSync, statSync, unlinkSync, mkdirSync, appendFileSync, writeFileSync } from 'node:fs';
 import { execSync as execSyncTop } from 'node:child_process';
-import { inlineTools } from './inline-tools.js';
+import { inlineTools, coreDocumentedSkills } from './inline-tools.js';
 import { injectText } from './browser-tools.js';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
@@ -595,6 +595,11 @@ const mainAgent: MainAgent = {
 		'- save_meeting_note: Save meeting observations to notes/meeting-{date}.md. Call every 5-10 min in meeting mode. Use type "summary" when exiting meeting mode.',
 		'- For phone calls, meeting dial-in, or anything needing contacts/calendar context → use work (core handles it).',
 		...inlineTools.map(t => `- ${t.name}: ${(t.description as string).split('.')[0]}. Instant.`),
+		...(coreDocumentedSkills.length > 0 ? [
+			'',
+			'DELEGATABLE SKILLS (call via work — core runs these, not voice-inline):',
+			...coreDocumentedSkills.map(s => `- ${s.name}: ${s.description}`),
+		] : []),
 		'',
 		'CRITICAL RULES:',
 		(() => meetingActive
