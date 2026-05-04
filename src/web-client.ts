@@ -2228,7 +2228,10 @@ function renderTabContent() {
         var id = entry[0], t = entry[1];
         var ago = Math.round((Date.now() - t.time) / 1000);
         var timeStr = ago < 60 ? ago + 's ago' : Math.round(ago / 60) + 'm ago';
-        var hasResult = t.result && t.status === 'done';
+        // Render results whenever they exist — agent's task bookkeeping
+        // sometimes leaves tasks in 'working' state even after the result
+        // file is written. Same fix as the main renderTasks path above.
+        var hasResult = !!t.result;
         var isExpanded = expandedTasks.has(id);
         var clickAttr = hasResult ? ' data-taskid="' + id + '" style="cursor:pointer"' : '';
         var resultDisplay = isExpanded ? 'block' : 'none';
