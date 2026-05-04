@@ -456,14 +456,12 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 				// Move the task file out of tasks/ so /tasks/active stops listing it
 				// as 'working' forever. (Without this, dedup-orphan tasks left behind
 				// after a consolidated reply pile up in the UI as stuck spinners.)
+				// Use archiveFile() — same destination (tasks/archive/<YYYY-MM>/) as
+				// the result-delivery archival paths so all timeout/done/dedupe lands
+				// in one place. (Mini's #589 review flagged the previous
+				// tasks/processed/ split as a learn-collector scan footprint.)
 				if (existsSync(taskFile)) {
-					try {
-						const processedDir = join(TASK_DIR, 'processed');
-						mkdirSync(processedDir, { recursive: true });
-						renameSync(taskFile, join(processedDir, `${taskId}.txt`));
-					} catch (e) {
-						console.error(`${ts()} [TaskBridge] Failed to archive timed-out task ${taskId}:`, e);
-					}
+					archiveFile(taskFile, 'tasks', taskId);
 				}
 				// Discord DM fallback (opt-in via dm_on_timeout). Default off per
 				// Susan's PR #578 contract — silent timeout. We emit by writing
