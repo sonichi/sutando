@@ -113,9 +113,10 @@ export const workTool: ToolDefinition = {
 			.boolean()
 			.optional()
 			.describe(
-				'If true, send a Discord DM to the owner when this task hits its timeout. ' +
-				'Default false (silent UI-only timeout, per Susan PR #578). Use only for ' +
-				'tasks the user has explicitly flagged as critical.'
+				'If true (default), send a Discord DM to the owner when this task hits its ' +
+				'timeout. Default flipped to true 2026-05-03 per owner override of the prior ' +
+				'PR #578 silent-timeout default. Set false on low-priority background tasks ' +
+				'where a timeout DM would be noise.'
 			),
 	}),
 	execution: 'inline',
@@ -183,7 +184,9 @@ export const workTool: ToolDefinition = {
 			if (timeout_minutes === 0) timeoutMs = 0;
 			else if (timeout_minutes > 0) timeoutMs = Math.min(timeout_minutes, 360) * 60 * 1000;
 		}
-		_pendingTasks.set(taskId, { submittedAt: Date.now(), timeoutMs, dmOnTimeout: dm_on_timeout === true });
+		// Default true (Chi override of Susan's PR #578 silent-timeout default).
+		// Caller can pass dm_on_timeout: false to opt out for low-priority tasks.
+		_pendingTasks.set(taskId, { submittedAt: Date.now(), timeoutMs, dmOnTimeout: dm_on_timeout !== false });
 		// Record owner activity for status-aware-pivot in proactive loop
 		writeOwnerActivity('voice', task);
 		console.log(`${ts()} [TaskBridge] Task ${taskId}: ${task.slice(0, 100)}`);
