@@ -1065,7 +1065,11 @@ function renderTasks() {
     const icons = { pending: '&#8987;', working: '&#9881;', done: '&#10003;', error: '&#10007;' };
     const ago = Math.round((Date.now() - t.time) / 1000);
     const timeStr = ago < 60 ? ago + 's ago' : Math.round(ago / 60) + 'm ago';
-    const hasResult = t.result && t.status === 'done';
+    // Show the result if it exists, regardless of status. The agent's task
+    // bookkeeping sometimes leaves tasks in 'working' even after the result
+    // file is written — gating render on status === 'done' meant those
+    // results never showed up in the UI even though they were in taskMap.
+    const hasResult = !!t.result;
     const clickAttr = hasResult ? ' data-taskid="' + id + '" style="cursor:pointer"' : '';
     const isExpanded = expandedTasks.has(id);
     const resultDisplay = isExpanded ? 'block' : 'none';
