@@ -22,21 +22,23 @@ import { describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool,
 export const openFileTool: ToolDefinition = {
 	name: 'open_file',
 	description:
-		'Open a file with the default macOS app. ALWAYS pass an absolute `path` (or one starting with $VAR / ~). ' +
+		'Open a file with macOS. ALWAYS pass an absolute `path` (or one starting with $VAR / ~). ' +
 		'Use for: "open the file", "open that", "can you open it". ' +
 		'If the user says "open the log" or similar, ASK which log they mean (voice-agent, discord-bridge, etc.) — do NOT guess. ' +
 		'Known files: "diagnostic tracker" or "diagnostics" = /tmp/phone-diagnostics-tracker.html, ' +
 		'"voice diagnostics" = /tmp/voice-diagnostics-tracker.html, ' +
 		'"voice context" / "the voice context file" / "the active context" = $SUTANDO_PRIVATE_DIR/voice-contexts/<active>.txt where <active> is the trimmed contents of $SUTANDO_PRIVATE_DIR/voice-contexts/active. Pass it with the env-var expanded by you (e.g. /Users/wangchi/.sutando-memory-sync/voice-contexts/ag2ai-investor.txt) or as $SUTANDO_PRIVATE_DIR/voice-contexts/ag2ai-investor.txt — both work. ' +
+		'Pass `app` when the user names a specific app ("open with Sublime Text", "open the SQLite db in TablePlus") OR when recent conversation makes the intended app clear (e.g. user just said "I\'ll review this in VS Code"). Without `app`, macOS uses its default handler for that file type — leave unset when the default is fine. ' +
 		'Pass `fullscreen=true` if the user wants the file opened in fullscreen — works generically for any file type via Cmd+Ctrl+F to whichever app the OS routed the file to (QuickTime → Present mode, Preview → fullscreen PDF, Chrome → fullscreen page, etc.).',
 	parameters: z.object({
 		path: z.string().describe('Absolute file path to open.'),
+		app: z.string().optional().describe('Optional app name (e.g. "Sublime Text", "VS Code", "TablePlus") to open the file with. If omitted, macOS uses its default handler for the file type. Set this when the user names an app explicitly OR recent conversation makes the intended app clear; otherwise leave unset.'),
 		fullscreen: z.boolean().optional().describe('If true, send Cmd+Ctrl+F to the default app right after opening — generic native-fullscreen toggle, works for any file type (video, PDF, image, web page).'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { path, fullscreen } = args as { path: string; fullscreen?: boolean };
-		console.log(`${ts()} [OpenFile] called (path=${path || 'none'}, fullscreen=${fullscreen || false})`);
+		const { path, app, fullscreen } = args as { path: string; app?: string; fullscreen?: boolean };
+		console.log(`${ts()} [OpenFile] called (path=${path || 'none'}, app=${app || 'default'}, fullscreen=${fullscreen || false})`);
 		try {
 			if (!path) return { error: 'No path provided. Pass an absolute file path. (For the most recent recording, call play_video — it auto-finds the file.)' };
 			// Expand $VAR / ${VAR} env-var references and ~ in the path so Sutando
@@ -63,10 +65,18 @@ export const openFileTool: ToolDefinition = {
 				return { error: `File not found: ${filePath}. Do not invent paths — use the exact path returned by the tool that produced the file (e.g. record_screen_with_narration returns subtitled_path/narrated_path/recording_path). For the most recent recording without a known path, call play_video instead.` };
 			}
 			// execFileSync — no shell interpolation of caller-controlled filePath
-			// (same CodeQL js/command-line-injection class as #27).
-			// `open <path>` lets macOS's LaunchServices route to the user's default
-			// app for that file type. open_file stays generic — no app forcing.
-			execFileSync('open', [filePath], { timeout: 5_000 });
+			// or caller-controlled app name (same CodeQL js/command-line-injection
+			// class as #27). Both are passed as separate argv entries, never spliced
+			// into a shell string.
+			//
+			// Resolution per issue #560:
+			//   1. Explicit `app` arg → `open -a <app> <path>`
+			//   2. No `app` → `open <path>` (macOS LaunchServices picks default)
+			// Contextual inference (rule 2 from issue) is the model's job — Gemini
+			// reads the conversation and decides whether to pass `app`. The tool
+			// only honors what it's told.
+			const openArgs = app ? ['-a', app, filePath] : [filePath];
+			execFileSync('open', openArgs, { timeout: 5_000 });
 			if (fullscreen) {
 				// Brief delay so the just-opened app becomes frontmost before
 				// the keystroke lands. Cmd+Ctrl+F is the macOS native-fullscreen
