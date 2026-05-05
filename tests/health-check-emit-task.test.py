@@ -26,7 +26,6 @@ import json
 import sys
 import tempfile
 import time
-import unittest.mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
