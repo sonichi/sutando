@@ -776,6 +776,17 @@ async function main() {
 		}
 	}
 
+	// Initialize voice-state.json at startup so dm-fallback's voiceConnected
+	// query has a fresh, authoritative file to read even before any client
+	// has ever connected. Without this, the file doesn't exist on instances
+	// that have never seen a client (e.g. Mac Mini, where voice routes to
+	// MacBook), and dm-result.py falls back to web-client.ts's `_voiceState`
+	// module variable — a sticky value set by browser SSE reports with no
+	// TTL. That caused the 2026-05-05 9h friction-delivery delay (see
+	// notes/friction-9h-delay-investigation-2026-05-05.md). With this write,
+	// the file is always present + always reflects the latest known state.
+	writeVoiceState(false);
+
 	function writeVoiceMetrics() {
 		if (metricsWritten) return;
 		metricsWritten = true;
