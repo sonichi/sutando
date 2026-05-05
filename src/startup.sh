@@ -7,6 +7,13 @@ set -e
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
 
+# Export workspace root so child processes (skills, gather scripts, etc.) can
+# resolve "the Sutando workspace" without walking dirname-relative paths that
+# break when the script is invoked via a userSettings hardlink. Picked up by
+# skills/self-diagnose/scripts/gather.sh and any other script that honors
+# $SUTANDO_ROOT.
+export SUTANDO_ROOT="$REPO"
+
 # Auto-bootstrap: create-if-missing files and dirs that the agent + skills
 # expect to exist (logs, state, tasks, results, notes, contextual-chips.json,
 # pending-questions.md, build_log.md, crons.json, …). Idempotent — safe to

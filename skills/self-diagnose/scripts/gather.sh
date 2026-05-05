@@ -8,18 +8,30 @@ set -euo pipefail
 
 WINDOW="${1:-24h}"
 # REPO resolution: prefer SUTANDO_ROOT env, then $PWD if it looks like a
-# Sutando workspace (has build_log.md), else fall back to script-relative
-# dirname-walk. The dirname-walk fails when the skill is invoked via its
-# userSettings hardlink at ~/.claude/skills/... — $0 resolves there and
-# walking up 3 lands at ~/.claude/ instead of the workspace root. Caught
-# 2026-05-05 when /self-diagnose silently ran against ~/.claude/ on Mini,
-# producing empty git-log/build_log/health.txt.
+# Sutando workspace (has build_log.md), else walk up from $0 looking for
+# build_log.md (handles invocation via the userSettings hardlink at
+# ~/.claude/skills/... where the original 3-level dirname-walk landed at
+# ~/.claude/ instead of the workspace). Caught 2026-05-05 when /self-diagnose
+# silently ran against ~/.claude/ on Mini, producing empty
+# git-log/build_log/health.txt.
+REPO=""
 if [ -n "${SUTANDO_ROOT:-}" ] && [ -f "${SUTANDO_ROOT}/build_log.md" ]; then
 	REPO="$SUTANDO_ROOT"
 elif [ -f "$PWD/build_log.md" ]; then
 	REPO="$PWD"
 else
-	REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
+	# Walk up from $0 looking for build_log.md (max 5 levels)
+	DIR="$(cd "$(dirname "$0")" && pwd)"
+	for _ in 1 2 3 4 5; do
+		if [ -f "$DIR/build_log.md" ]; then
+			REPO="$DIR"
+			break
+		fi
+		DIR="$(dirname "$DIR")"
+		[ "$DIR" = "/" ] && break
+	done
+	# Last-resort fallback: original 3-level dirname-walk
+	[ -z "$REPO" ] && REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
 fi
 TS="$(date +%s)"
 OUT="/tmp/sutando-diagnose-$TS"
