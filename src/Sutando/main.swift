@@ -233,6 +233,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.checkWatcher()
         }
 
+        // Contextual chips: every 120s, refresh contextual-chips.json from
+        // cheap mechanical sources (open PRs, top pending question, recent
+        // results). No LLM round-trip. Replaces the (never-shipped) draft
+        // /personal-reactive-loop skill — the cadence is purely mechanical
+        // polling, so the natural home is the menu-bar app that already
+        // does watcher liveness. Per Chi's review 2026-05-05: "if it's only
+        // scripts, can it be merged with the sutando app?"
+        Timer.scheduledTimer(withTimeInterval: 120.0, repeats: true) { [weak self] _ in
+            self?.refreshContextualChips()
+        }
+        // Also fire once at startup so the chip set isn't stale-from-yesterday
+        // until the first 120s tick.
+        DispatchQueue.global(qos: .background).async { [weak self] in
+            self?.refreshContextualChips()
+        }
+
         // Presenter mode: poll iclr-highlight server for on/off state.
         // Keeps menu item + tooltip fresh; silent if server is down.
         // Also rechecks voice-agent mode sentinel on the same tick.
@@ -416,6 +432,118 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Notify so Chi can restart manually.
         notify("Sutando", "Task watcher is down — prompt the CLI to restart it (or start CLI via scripts/start-cli.sh)")
         logToFile("watcher dead; notification fired (tmux session not found)")
+    }
+
+    /// Refresh `contextual-chips.json` from cheap mechanical sources. No LLM
+    /// round-trip — just shell-out to `gh pr list`, read top `## Title` line
+    /// of `pending-questions.md`, scan `results/` for unread items. Atomic
+    /// write via tmp + replaceItem. Fires every 120s + once at startup. The
+    /// web UI polls the file and pins matching chips at the top of the
+    /// starter tab.
+    func refreshContextualChips() {
+        var chips: [[String: String]] = []
+
+        // 1. Open PRs authored by sonichi (both bots commit under this account).
+        // Resolve gh path explicitly — apps launched via `open` inherit a
+        // minimal PATH (no /opt/homebrew or /usr/local) so `/usr/bin/env gh`
+        // wouldn't find the binary. Fall through Apple-Silicon then Intel.
+        let ghPath: String? = {
+            for p in ["/opt/homebrew/bin/gh", "/usr/local/bin/gh"] {
+                if FileManager.default.fileExists(atPath: p) { return p }
+            }
+            return nil
+        }()
+        if let gh = ghPath,
+           // Pass --repo explicitly: the app's CWD when launched via `open`
+           // is the user's home directory (not a git repo), so without
+           // --repo, gh fails with "fatal: not a git repository".
+           let prJSON = runShell(gh, ["pr", "list", "--repo", "sonichi/sutando", "--state", "open", "--limit", "5", "--author", "sonichi", "--json", "number,title"]),
+           let prData = prJSON.data(using: .utf8),
+           let prs = try? JSONSerialization.jsonObject(with: prData) as? [[String: Any]] {
+            for pr in prs.prefix(3) {
+                let n = (pr["number"] as? NSNumber)?.intValue
+                if let n = n, let t = pr["title"] as? String {
+                    let title = t.count > 60 ? String(t.prefix(57)) + "..." : t
+                    chips.append(["label": "Review PR #\(n)", "desc": title])
+                }
+            }
+        }
+
+        // 2. Top pending question (read first `## Title` line of pending-questions.md).
+        let pqPath = workspace + "/pending-questions.md"
+        if let pq = try? String(contentsOfFile: pqPath, encoding: .utf8) {
+            // Skip the leading "# Memory" or similar h1, find first h2.
+            for line in pq.split(separator: "\n") {
+                if line.hasPrefix("## ") {
+                    let title = String(line.dropFirst(3))
+                    let preview = title.count > 60 ? String(title.prefix(57)) + "..." : title
+                    chips.append(["label": "Pending: \(preview)", "desc": "Resolve in pending-questions.md"])
+                    break
+                }
+            }
+        }
+
+        // 3. Most recent unread result (results/task-*.txt newest mtime).
+        let resultsDir = workspace + "/results"
+        if let entries = try? FileManager.default.contentsOfDirectory(atPath: resultsDir) {
+            let taskResults = entries
+                .filter { $0.hasPrefix("task-") && $0.hasSuffix(".txt") }
+                .compactMap { name -> (String, Date)? in
+                    let path = resultsDir + "/" + name
+                    guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+                          let mtime = attrs[.modificationDate] as? Date else { return nil }
+                    return (name, mtime)
+                }
+                .sorted { $0.1 > $1.1 }
+            if let latest = taskResults.first {
+                // Only show if it landed in the last 10 minutes — older
+                // results are no longer "unread" by reasonable definition.
+                if Date().timeIntervalSince(latest.1) < 600 {
+                    chips.append(["label": "Recent result", "desc": latest.0])
+                }
+            }
+        }
+
+        // Serialize + atomic write via tmp+replaceItem.
+        let payload: [String: Any] = ["chips": chips, "ts": Int(Date().timeIntervalSince1970)]
+        guard let json = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted]) else { return }
+        let dst = URL(fileURLWithPath: workspace + "/contextual-chips.json")
+        let tmp = URL(fileURLWithPath: workspace + "/contextual-chips.json.tmp")
+        do {
+            try json.write(to: tmp, options: [.atomic])
+            _ = try FileManager.default.replaceItemAt(dst, withItemAt: tmp)
+        } catch {
+            // Best-effort. Cleanup tmp if rename failed.
+            try? FileManager.default.removeItem(at: tmp)
+        }
+    }
+
+    /// Run an executable, capture stdout as String. Returns nil on failure
+    /// or non-zero exit. Used by refreshContextualChips for `gh` / `gws` /
+    /// other CLI shell-outs that are mechanical and need no LLM judgment.
+    func runShell(_ path: String, _ args: [String]) -> String? {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: path)
+        proc.arguments = args
+        // Inherit parent env; also force PATH to include homebrew so child
+        // tools that themselves shell-out (e.g. `gh` invoking `git`) find
+        // their own deps. Apps launched via `open` get a minimal PATH
+        // that excludes /opt/homebrew/bin → gh can't find git → exits non-zero.
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + (env["PATH"] ?? "")
+        proc.environment = env
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        proc.standardOutput = outPipe
+        proc.standardError = errPipe
+        do { try proc.run() } catch { return nil }
+        proc.waitUntilExit()
+        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+        // errData is intentionally read to drain the pipe (avoid SIGPIPE)
+        // even though we don't surface it on success.
+        _ = errPipe.fileHandleForReading.readDataToEndOfFile()
+        if proc.terminationStatus != 0 { return nil }
+        return String(data: outData, encoding: .utf8)
     }
 
     /// True if Claude Code in the sutando-core tmux pane has any running
