@@ -866,11 +866,22 @@ async def poll_approved():
 
 PENDING_REPLIES_FILE = REPO / "state" / "discord-pending-replies.json"
 
+def _atomic_write_pending_replies(data: dict) -> None:
+    """Write JSON atomically: tmp + rename. Avoids truncation on mid-write
+    crash (rare but real for unattended bridge restarts). Per MacBook's
+    review on PR #597."""
+    try:
+        tmp = PENDING_REPLIES_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data))
+        tmp.replace(PENDING_REPLIES_FILE)
+    except Exception:
+        pass
+
 def save_pending_replies():
     """Persist pending_replies channel IDs to disk for crash recovery."""
     try:
         data = {k: str(v.id) for k, v in pending_replies.items()}
-        PENDING_REPLIES_FILE.write_text(json.dumps(data))
+        _atomic_write_pending_replies(data)
     except Exception:
         pass
 
@@ -901,10 +912,7 @@ def load_pending_replies_from_disk():
                 pass
         if aged_out:
             print(f"  [recovery] aged out {len(aged_out)} pending_replies > 7d", flush=True)
-            try:
-                PENDING_REPLIES_FILE.write_text(json.dumps(data))
-            except Exception:
-                pass
+            _atomic_write_pending_replies(data)
         return data
     except Exception:
         pass
