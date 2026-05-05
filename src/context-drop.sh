@@ -24,21 +24,33 @@ TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 
 # --- Check for Finder file selection FIRST (before clipboard) ---
 # Always check Finder selection regardless of frontmost app
-# (Automator may steal focus before script runs)
-FINDER_FILE=$(osascript -e '
+# (Automator may steal focus before script runs).
+# Returns newline-separated POSIX paths for ALL selected items (not just first).
+FINDER_FILES=$(osascript -e '
 tell application "Finder"
   try
     set sel to selection
-    if (count of sel) > 0 then
-      return POSIX path of (item 1 of sel as alias)
-    end if
+    set out to ""
+    repeat with anItem in sel
+      set out to out & POSIX path of (anItem as alias) & linefeed
+    end repeat
+    return out
   on error
     return ""
   end try
 end tell
 ' 2>/dev/null)
 
-if [ -n "$FINDER_FILE" ] && [ -e "$FINDER_FILE" ]; then
+# Filter to existing files; count valid ones.
+VALID_FILES=()
+while IFS= read -r f; do
+  if [ -n "$f" ] && [ -e "$f" ]; then
+    VALID_FILES+=("$f")
+  fi
+done <<< "$FINDER_FILES"
+
+if [ ${#VALID_FILES[@]} -eq 1 ]; then
+  FINDER_FILE="${VALID_FILES[0]}"
   cat > "$DROP_FILE" << EOF
 timestamp: $TIMESTAMP
 type: file
@@ -49,6 +61,24 @@ EOF
   echo "[$TIMESTAMP] Dropped: file ($FINDER_FILE)" >> "$LOG_FILE"
   BASENAME=$(basename "$FINDER_FILE")
   osascript -e "display notification \"File dropped: $BASENAME\" with title \"Sutando\""
+  exit 0
+elif [ ${#VALID_FILES[@]} -gt 1 ]; then
+  PATHS_BLOCK=""
+  for f in "${VALID_FILES[@]}"; do
+    PATHS_BLOCK+="  - $f"$'\n'
+  done
+  PATHS_BLOCK="${PATHS_BLOCK%$'\n'}"
+  cat > "$DROP_FILE" << EOF
+timestamp: $TIMESTAMP
+type: files
+paths:
+$PATHS_BLOCK
+---
+[Files selected in Finder: ${#VALID_FILES[@]} files]
+$PATHS_BLOCK
+EOF
+  echo "[$TIMESTAMP] Dropped: ${#VALID_FILES[@]} files" >> "$LOG_FILE"
+  osascript -e "display notification \"${#VALID_FILES[@]} files dropped\" with title \"Sutando\""
   exit 0
 fi
 

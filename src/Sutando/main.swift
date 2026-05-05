@@ -1013,7 +1013,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // 1. Check Finder selection (only if Finder is frontmost)
         if let frontApp = NSWorkspace.shared.frontmostApplication,
            frontApp.bundleIdentifier == "com.apple.finder" {
-            if let finderFile = getFinderSelection() {
+            let finderFiles = getFinderSelection()
+            if finderFiles.count == 1 {
+                let finderFile = finderFiles[0]
                 let content = """
                 timestamp: \(timestamp)
                 type: file
@@ -1024,6 +1026,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 appendLog(logFile, "[\(timestamp)] Dropped: file (\(finderFile))")
                 writeTask(tasksDir, timestamp: timestamp, content: content)
                 notify("Sutando", "File dropped: \(URL(fileURLWithPath: finderFile).lastPathComponent)")
+                return
+            } else if finderFiles.count > 1 {
+                let pathsBlock = finderFiles.map { "  - \($0)" }.joined(separator: "\n")
+                let content = """
+                timestamp: \(timestamp)
+                type: files
+                paths:
+                \(pathsBlock)
+                \(ctxHeader)---
+                [Files selected in Finder: \(finderFiles.count) files]
+                \(pathsBlock)
+                """
+                appendLog(logFile, "[\(timestamp)] Dropped: \(finderFiles.count) files")
+                writeTask(tasksDir, timestamp: timestamp, content: content)
+                notify("Sutando", "\(finderFiles.count) files dropped")
                 return
             }
         }
@@ -1266,27 +1283,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Helpers
 
-    func getFinderSelection() -> String? {
+    func getFinderSelection() -> [String] {
         let script = """
         tell application "Finder"
             try
                 set sel to selection
-                if (count of sel) > 0 then
-                    return POSIX path of (item 1 of sel as alias)
-                end if
+                set out to ""
+                repeat with anItem in sel
+                    set out to out & POSIX path of (anItem as alias) & "\n"
+                end repeat
+                return out
             on error
                 return ""
             end try
         end tell
         """
-        guard let appleScript = NSAppleScript(source: script) else { return nil }
+        guard let appleScript = NSAppleScript(source: script) else { return [] }
         var error: NSDictionary?
         let result = appleScript.executeAndReturnError(&error)
-        let path = result.stringValue
-        if let path = path, !path.isEmpty, FileManager.default.fileExists(atPath: path) {
-            return path
-        }
-        return nil
+        guard let raw = result.stringValue, !raw.isEmpty else { return [] }
+        return raw.split(separator: "\n").map(String.init).filter { !$0.isEmpty && FileManager.default.fileExists(atPath: $0) }
     }
 
     func getSelectedText() -> String? {
