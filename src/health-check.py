@@ -652,9 +652,15 @@ def run_all_checks() -> list[dict]:
             checks.append({"name": name, "status": "warn", "detail": f"multiple processes ({len(pids)} PIDs: {','.join(pids)})"})
             continue
 
-        # Check 2: Log file freshness
+        # Check 2: Log file freshness — prefer logs/ (where startup.sh writes)
+        # and fall back to src/ for legacy. The src/ default was silently a
+        # no-op since 2026-04 when startup.sh was changed to write logs/<name>.log,
+        # so log-stale warnings never fired (caught 2026-05-05 when Mini's
+        # logs/discord-bridge.log was 36h stale but health-check stayed "ok").
         import time
-        log_file = REPO_DIR / "src" / f"{name}.log"
+        log_file = REPO_DIR / "logs" / f"{name}.log"
+        if not log_file.exists():
+            log_file = REPO_DIR / "src" / f"{name}.log"
         detail = "running"
         status = "ok"
         if log_file.exists():
@@ -704,6 +710,32 @@ def run_all_checks() -> list[dict]:
                             status = "stale"
                             detail = f"running but code is {int((src_mtime - proc_start) / 60)} min newer than process — restart needed"
         except (subprocess.TimeoutExpired, ValueError, OSError):
+            pass
+
+        # Check 5: Dead-log-inode detection — last so heartbeat doesn't override.
+        # Bridge process FDs point to a path that's been renamed/deleted (the
+        # 2026-05-05 case where discord-bridge stdout was going to
+        # /discord-bridge.log.bak after the file was unlinked, so logging
+        # silently went to /dev/null while bridge appeared healthy). Heartbeats
+        # don't catch this because they're written to a separate file via
+        # state/<name>.heartbeat.
+        try:
+            lsof_out = subprocess.run(
+                ["lsof", "-p", pids[0]], capture_output=True, text=True, timeout=5
+            ).stdout
+            for line in lsof_out.splitlines():
+                parts = line.split()
+                # Columns: COMMAND PID USER FD TYPE DEVICE SIZE NODE NAME
+                # FD column is index 3 — "1w" or "2w" carry log writes
+                if len(parts) < 9 or parts[3] not in ("1w", "2w"):
+                    continue
+                log_path = parts[-1]
+                if log_path.endswith(".log") or log_path.endswith(".log.bak"):
+                    if not Path(log_path).exists():
+                        status = "warn"
+                        detail = f"running but log inode dead ({log_path} unlinked) — restart for clean logging"
+                        break
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             pass
 
         checks.append({"name": name, "status": status, "detail": detail})
