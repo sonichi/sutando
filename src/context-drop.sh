@@ -63,19 +63,21 @@ EOF
   osascript -e "display notification \"File dropped: $BASENAME\" with title \"Sutando\""
   exit 0
 elif [ ${#VALID_FILES[@]} -gt 1 ]; then
-  PATHS_BLOCK=""
+  # Emit JSON-array on the `paths:` line so a path with spaces or colons
+  # parses unambiguously (no YAML lib needed downstream).
+  PATHS_JSON=$(printf '%s\n' "${VALID_FILES[@]}" | python3 -c 'import sys,json; print(json.dumps([l.rstrip("\n") for l in sys.stdin]))')
+  HUMAN_LIST=""
   for f in "${VALID_FILES[@]}"; do
-    PATHS_BLOCK+="  - $f"$'\n'
+    HUMAN_LIST+="  - $f"$'\n'
   done
-  PATHS_BLOCK="${PATHS_BLOCK%$'\n'}"
+  HUMAN_LIST="${HUMAN_LIST%$'\n'}"
   cat > "$DROP_FILE" << EOF
 timestamp: $TIMESTAMP
 type: files
-paths:
-$PATHS_BLOCK
+paths: $PATHS_JSON
 ---
 [Files selected in Finder: ${#VALID_FILES[@]} files]
-$PATHS_BLOCK
+$HUMAN_LIST
 EOF
   echo "[$TIMESTAMP] Dropped: ${#VALID_FILES[@]} files" >> "$LOG_FILE"
   osascript -e "display notification \"${#VALID_FILES[@]} files dropped\" with title \"Sutando\""

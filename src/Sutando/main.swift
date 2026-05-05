@@ -1028,15 +1028,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 notify("Sutando", "File dropped: \(URL(fileURLWithPath: finderFile).lastPathComponent)")
                 return
             } else if finderFiles.count > 1 {
-                let pathsBlock = finderFiles.map { "  - \($0)" }.joined(separator: "\n")
+                // Emit JSON-array on the `paths:` line for unambiguous parsing
+                // (handles paths with spaces, colons, etc. without YAML lib).
+                // Body trailer keeps a human-readable multi-line list.
+                let pathsJSON: String = {
+                    let data = try? JSONSerialization.data(withJSONObject: finderFiles, options: [])
+                    return data.flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+                }()
+                let humanList = finderFiles.map { "  - \($0)" }.joined(separator: "\n")
                 let content = """
                 timestamp: \(timestamp)
                 type: files
-                paths:
-                \(pathsBlock)
+                paths: \(pathsJSON)
                 \(ctxHeader)---
                 [Files selected in Finder: \(finderFiles.count) files]
-                \(pathsBlock)
+                \(humanList)
                 """
                 appendLog(logFile, "[\(timestamp)] Dropped: \(finderFiles.count) files")
                 writeTask(tasksDir, timestamp: timestamp, content: content)
