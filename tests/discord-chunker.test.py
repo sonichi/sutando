@@ -7,9 +7,26 @@ test both. Loads via importlib because filenames contain hyphens.
 
 import importlib.util
 import sys
+import types
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+
+# discord-bridge.py does `import discord` + `discord.Intents.default()` +
+# `discord.Client(intents=...)` at module load. CI runners without
+# discord.py installed would ImportError out before reaching the chunker,
+# so stub a minimal `discord` module when the real one isn't available.
+# Locally this no-ops because the import succeeds. The chunker itself is
+# pure string ops — doesn't depend on discord at runtime.
+try:
+    import discord  # noqa: F401
+except ImportError:
+    stub = types.ModuleType("discord")
+    stub.Intents = type("Intents", (), {"default": staticmethod(lambda: type("I", (), {"message_content": False})())})
+    stub.Client = type("Client", (), {"__init__": lambda self, **kw: None, "event": staticmethod(lambda fn: fn)})
+    stub.File = type("File", (), {})
+    stub.Message = type("Message", (), {})
+    sys.modules["discord"] = stub
 
 
 def _load(name: str, path: Path):
