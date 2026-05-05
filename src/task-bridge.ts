@@ -233,9 +233,16 @@ export const workTool: ToolDefinition = {
 // and inject them into the conversation via a callback
 // ---------------------------------------------------------------------------
 
-/** Append a message to the persistent conversation log. */
+/** Append a message to the persistent conversation log. The text cap
+ *  matches Discord's per-message limit (2000 chars) so a single transcript
+ *  line never exceeds what could legitimately appear elsewhere in the
+ *  conversation. The previous 200-char cap was aggressive — it truncated
+ *  ordinary user/assistant turns mid-sentence, especially in CJK where one
+ *  character can render as multiple bytes. Lifted to LOG_LINE_MAX_CHARS;
+ *  override via SUTANDO_LOG_LINE_MAX_CHARS env if a host wants tighter logs. */
+const LOG_LINE_MAX_CHARS = Number(process.env.SUTANDO_LOG_LINE_MAX_CHARS) || 2000;
 export function logConversation(role: string, text: string): void {
-	const line = `${new Date().toISOString()}|${role}|${text.replace(/\n/g, ' ').slice(0, 200)}\n`;
+	const line = `${new Date().toISOString()}|${role}|${text.replace(/\n/g, ' ').slice(0, LOG_LINE_MAX_CHARS)}\n`;
 	try { appendFileSync(CONVERSATION_LOG, line); } catch { /* best effort */ }
 }
 
@@ -550,7 +557,7 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
 					_deliveredResults.add(file);
 					_pendingTasks.delete(taskId);
-					logConversation('core-agent', `[task:${taskId}] ${result.slice(0, 200)}`);
+					logConversation('core-agent', `[task:${taskId}] ${result.slice(0, LOG_LINE_MAX_CHARS)}`);
 					onResult(result);
 					// Notify agent-api directly, then delete file
 					try {
