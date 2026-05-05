@@ -123,7 +123,7 @@ cp .env.example .env
 bash src/startup.sh
 ```
 
-This starts all services (voice agent, phone conversation server, web client, dashboard, API, Sutando menu bar app) and opens http://localhost:8080 in your browser. The autonomous loop starts automatically — click **Connect** and start talking. Look for **S** in your menu bar — it provides shortcuts (⌃C context drop, ⌃V voice toggle, ⌃M mute) plus **Open Core** (Claude Code terminal) and **Open Dashboard** (status page).
+This starts all services (voice agent, phone conversation server, web client, dashboard, API, Sutando menu bar app) and opens http://localhost:8080 in your browser. The autonomous loop starts automatically — click **Connect** and start talking. Look for **S** in your menu bar — it provides global hotkeys (see [Keyboard shortcuts](#keyboard-shortcuts)) plus **Open Core** (Claude Code terminal) and **Open Dashboard** (status page).
 
 > **Why Sutando runs with elevated permissions.** Autonomous voice-driven work means `startup.sh` launches Claude Code with `--dangerously-skip-permissions` — the prompts that would otherwise fire on every tool call would break the voice-in / answer-out flow. In exchange:
 >
@@ -190,7 +190,7 @@ These unlock more capabilities. Add to `.env` when ready:
 | Telegram | Message Sutando from your phone | [Create bot via @BotFather](https://t.me/BotFather), then `/telegram:configure <token>` |
 | Discord | Message Sutando from Discord (DM + channel @mentions) | [Developer portal](https://discord.com/developers), then `/discord:configure <token>` |
 | Claude for Chrome | Browser automation — navigate, read pages, fill forms, interact with web apps | [Install extension](https://claude.ai/chrome), log in with the same account as Claude Code |
-| Sutando app (menu bar) | Global shortcuts: ⌃C context drop, ⌃V voice toggle, ⌃M mute | Auto-launches via `startup.sh` |
+| Sutando app (menu bar) | Global hotkeys (see [Keyboard shortcuts](#keyboard-shortcuts)) | Auto-launches via `startup.sh` |
 
 ---
 
@@ -266,6 +266,7 @@ The Sutando menu bar app (`src/Sutando/`) provides global keyboard shortcuts. It
 | Shortcut | Action |
 |----------|--------|
 | ⌃C | **Context drop** — sends selected text, clipboard image, or Finder file to Sutando |
+| ⌃S | **Screenshot drop** — sends a screenshot of the active window/screen to Sutando |
 | ⌃V | **Voice toggle** — connects/disconnects voice in the browser |
 | ⌃M | **Mute toggle** — mutes/unmutes microphone during voice |
 
@@ -307,7 +308,7 @@ It consumes API quota proportional to how much work it finds to do.
 
 **macOS permissions Sutando needs** (System Settings → Privacy & Security):
 - **Screen Recording** → add `claude` and `node`. Required for `describe_screen`, `capture_screen`, and the screen-capture server (port 7845) — lets Sutando see what you're looking at when you ask "what's on my screen?". Also used by the screen-record skill for subtitled recordings.
-- **Accessibility** → add the Sutando menu-bar app. Required for the global hotkeys (⌃C context drop, ⌃V voice toggle, ⌃M mute) and for the `macos-use` skill to click/type into native apps on your behalf.
+- **Accessibility** → add the Sutando menu-bar app. Required for the global hotkeys (see [Keyboard shortcuts](#keyboard-shortcuts)) and for the `macos-use` skill to click/type into native apps on your behalf.
 - **Microphone** → Chrome (and Terminal, for the screen-record skill). Chrome asks on first voice connect — click Allow.
 - **Contacts / Calendar / Reminders** → asked on demand by the features that use them (contact lookup before a call, `gws calendar +agenda`, `reminders.py add/list/complete`). You can grant these when first prompted rather than up front.
 
