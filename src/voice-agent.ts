@@ -1096,7 +1096,10 @@ async function main() {
 	// clientConnected=false (the existing health monitor only reconnects
 	// CLOSED→CONNECTING when a client is present), so once we transition there
 	// no phantoms can fire until the next legitimate client reconnect.
-	const IDLE_TEARDOWN_MS = 60_000;
+	// Tunable via env var per Mini's #602 review note. Defaults to 60s — sane
+	// for the voice / phone reconnect cadence we've observed; raise if a host
+	// has frequent ~70s connect/disconnect churn that re-opens too aggressively.
+	const IDLE_TEARDOWN_MS = Number(process.env.SUTANDO_VOICE_IDLE_TEARDOWN_MS) || 60_000;
 	let idleTeardownTimer: ReturnType<typeof setTimeout> | null = null;
 
 	const cancelIdleTeardown = () => {
