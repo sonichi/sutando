@@ -729,11 +729,17 @@ def run_all_checks() -> list[dict]:
                 # FD column is index 3 — "1w" or "2w" carry log writes
                 if len(parts) < 9 or parts[3] not in ("1w", "2w"):
                     continue
-                log_path = parts[-1]
+                # NAME starts at col 8 — join remaining tokens to handle paths
+                # with spaces (per MacBook's PR #596 review nit).
+                log_path = " ".join(parts[8:])
                 if log_path.endswith(".log") or log_path.endswith(".log.bak"):
                     if not Path(log_path).exists():
                         status = "warn"
-                        detail = f"running but log inode dead ({log_path} unlinked) — restart for clean logging"
+                        detail = (
+                            f"running but log inode dead ({log_path} unlinked) — "
+                            f"restart with: launchctl kickstart -k gui/$(id -u)/com.sutando.{name} "
+                            "(or nohup+disown on Mini)"
+                        )
                         break
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             pass
