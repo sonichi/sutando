@@ -1665,6 +1665,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// "Open Core CLI" in the menu (or `tmux -S /tmp/sutando-tmux.sock
     /// attach -t sutando-core` from a terminal).
     ///
+    /// **Hazard** (per Mini's #608 review): this MUST be invoked from
+    /// outside the sutando-core CLI session — Sutando.app menu, terminal,
+    /// future health-check emit-task, etc. If a future agent runs this
+    /// from WITHIN the sutando-core session (e.g., processing a "restart
+    /// core" task), --restart will kill its own parent session and
+    /// terminate the agent mid-task. The menu-bar app is safe; agent
+    /// self-invocation is not.
+    ///
     /// Per Chi 2026-05-05: voice-agent restart explicitly excluded —
     /// this only restarts the Claude Code CLI session.
     @objc func restartCore() {
@@ -1673,11 +1681,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
         proc.arguments = [script, "--restart"]
+        // Capture stderr so we can surface failures via notify rather than
+        // silently swallowing (per Mini's #608 review nit #1). stdout still
+        // discarded — script's success messages aren't useful to the user.
+        let errPipe = Pipe()
         proc.standardOutput = FileHandle.nullDevice
-        proc.standardError = FileHandle.nullDevice
-        DispatchQueue.global(qos: .utility).async {
-            try? proc.run()
+        proc.standardError = errPipe
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            do {
+                try proc.run()
+            } catch {
+                self?.notify("Sutando", "Core restart failed to start: \(error.localizedDescription)")
+                return
+            }
             proc.waitUntilExit()
+            if proc.terminationStatus == 0 {
+                self?.notify("Sutando", "Core restarted. Attach via Open Core CLI in menu.")
+            } else {
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                let errStr = String(data: errData, encoding: .utf8) ?? ""
+                let preview = String(errStr.prefix(200))
+                self?.notify("Sutando", "Core restart failed (exit \(proc.terminationStatus)): \(preview)")
+            }
         }
     }
 

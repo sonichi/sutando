@@ -24,12 +24,22 @@ SESSION="sutando-core"
 # --restart: kill any existing session before starting fresh. Without this,
 # the script's "already running → attach" path returns and the old session
 # keeps running.
+#
+# HAZARD: --restart MUST NOT be invoked from inside the sutando-core
+# session itself — kill-session terminates the running agent mid-task.
+# Safe callers: Sutando.app menu, terminal one-off, future health-check
+# emit-task. Unsafe: a future agent processing a "restart core" task by
+# exec'ing this script from within sutando-core. Per Mini's #608 review.
 if [ "$1" = "--restart" ]; then
   if pgrep -f "claude.*--name.*$SESSION" > /dev/null 2>&1; then
     echo "Killing existing $SESSION session..."
     tmux -S "$TMUX_SOCKET" kill-session -t "$SESSION" 2>/dev/null || true
-    # Give tmux + claude a beat to release the socket + shut down cleanly.
-    sleep 1
+    # Poll for actual shutdown — robust on slow machines, faster on fast
+    # ones (~1s ceiling) than a fixed sleep.
+    for _ in 1 2 3 4 5; do
+      pgrep -f "claude.*--name.*$SESSION" > /dev/null 2>&1 || break
+      sleep 0.2
+    done
   fi
 fi
 
