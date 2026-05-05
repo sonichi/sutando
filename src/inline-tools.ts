@@ -145,8 +145,10 @@ export const pressKeyTool: ToolDefinition = {
 		if (keyCode === undefined) {
 			// Use keystroke for unknown keys
 			const modStr = modifiers.length ? ` using {${modifiers.map(m => m + ' down').join(', ')}}` : '';
+			// Escape single quotes for shell context (same pattern as switchAppTool).
+			const safeKey = key.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
 			try {
-				execSync(`osascript -e 'tell application "System Events" to keystroke "${key}"${modStr}'`, { timeout: 3_000 });
+				execSync(`osascript -e 'tell application "System Events" to keystroke "${safeKey}"${modStr}'`, { timeout: 3_000 });
 			} catch (err) {
 				return { error: `press_key failed: ${err instanceof Error ? err.message : err}` };
 			}
@@ -279,7 +281,10 @@ export const typeTextTool: ToolDefinition = {
 			}
 		}
 		// Single-line short text: use keystroke
-		const safeText = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+		// Escape backslash for AppleScript, single-quote for shell, double-quote for AppleScript.
+		// Same three-step chain as switchAppTool — missing single-quote escape allowed
+		// shell breakout via text containing apostrophes.
+		const safeText = text.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
 		try {
 			execSync(`osascript -e 'tell application "System Events" to keystroke "${safeText}"'`, { timeout: 5_000 });
 			console.log(`${ts()} [TypeText] typed: ${text.slice(0, 40)}`);
@@ -377,7 +382,13 @@ export const clipboardTool: ToolDefinition = {
 				return { status: 'read', content };
 			} else {
 				if (!text) return { error: 'No text provided to write' };
-				execSync(`echo ${JSON.stringify(text)} | pbcopy`, { timeout: 5_000 });
+				// Write to temp file then pipe to pbcopy — avoids shell injection via
+				// echo "$(cmd)" since JSON.stringify wraps in double-quotes which don't
+				// prevent $() substitution in bash.
+				const tmpPb = `/tmp/sutando-clipboard-${Date.now()}.txt`;
+				writeFileSync(tmpPb, text);
+				execSync(`pbcopy < "${tmpPb}"`, { timeout: 5_000 });
+				try { unlinkSync(tmpPb); } catch {}
 				console.log(`${ts()} [Clipboard] wrote: ${text.slice(0, 40)}`);
 				return { status: 'written', text };
 			}
