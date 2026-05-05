@@ -786,7 +786,13 @@ def emit_task_for_failures(checks: list[dict]) -> None:
     hash changes and a new task fires. Cooldown is 1h per hash so a
     persistent failure re-alerts after a reasonable window.
     """
-    failures = [c for c in checks if c["status"] in ("down", "missing", "not_loaded", "fail", "stale")]
+    # `warn` is the status used for "service is up but has a real issue"
+    # (e.g., the dead-log-inode case from PR #596 — bridge running but
+    # logging silently to a deleted file). Including warn means the
+    # watchdog catches the bug class that motivated this PR. Excluding
+    # would have missed Mini's discord-bridge issue this morning. Per
+    # her PR review note 2026-05-05.
+    failures = [c for c in checks if c["status"] in ("down", "missing", "not_loaded", "fail", "stale", "warn")]
     if not failures:
         return
 
