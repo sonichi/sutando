@@ -316,51 +316,7 @@ done
 echo ""
 open "http://localhost:8080"
 
-# Check if a sutando-core session is already running
-if pgrep -f "claude.*--name.*sutando-core" > /dev/null 2>&1; then
-  echo "Claude Code (sutando-core) is already running."
-  # Auto-attach when invoked from an interactive terminal — saves the user
-  # the copy-paste of the long `tmux -S /tmp/sutando-tmux.sock attach -t
-  # sutando-core` command. Falls back to printing the instruction in
-  # non-interactive contexts (launchd, cron, CI) where exec'ing into an
-  # attach would hang without a tty.
-  if [ -t 1 ] && command -v tmux > /dev/null 2>&1; then
-    echo "Attaching... (Ctrl-b d to detach)"
-    exec tmux -S /tmp/sutando-tmux.sock attach -t sutando-core
-  fi
-  echo "To restart: kill it first, then re-run this script."
-  echo "To attach to the running session: tmux -S /tmp/sutando-tmux.sock attach -t sutando-core"
-  echo ""
-else
-  echo "Starting Claude Code (sutando-core) inside tmux..."
-  echo ""
-  # Wrap in a tmux session named `sutando-core` so Sutando.app can send
-  # keystrokes into the pane when the task watcher dies (see
-  # AppDelegate.checkWatcher). `tmux new-session -A -s sutando-core …`
-  # creates the session if it doesn't exist and attaches if it does,
-  # so the user sees the Claude Code prompt exactly as before.
-  # Auto-install tmux via Homebrew if missing. Sutando.app's
-  # watcher-auto-restart (PR #444) depends on a tmux-wrapped CLI pane,
-  # so a first-run user without tmux silently loses that feature.
-  if ! command -v tmux > /dev/null 2>&1 && command -v brew > /dev/null 2>&1; then
-    echo "tmux not found — installing via Homebrew (~30s, required for Sutando.app watcher-auto-restart)..."
-    brew install tmux 2>&1 | tail -3
-  fi
-  # Fall back to a bare `exec claude` if tmux is still missing.
-  if command -v tmux > /dev/null 2>&1; then
-    # Explicit socket path so Sutando.app (which runs under a different
-    # TMPDIR due to macOS sandboxing when launched via `open`) can reach
-    # the same tmux server. Without -S, tmux defaults to
-    # $TMPDIR/tmux-$(id -u)/default — different path app-side vs
-    # shell-side → tmux has-session fails → watcher-auto-restart falls
-    # back to macOS notification instead of sending `watcher`.
-    exec tmux -S /tmp/sutando-tmux.sock new-session -A -s sutando-core \
-      claude --name sutando-core --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
-      -- "/proactive-loop"
-  else
-    echo "  ⚠ tmux not found — running without tmux wrapper"
-    echo "    (Sutando.app's watcher-auto-restart won't work; brew install tmux to enable)"
-    exec claude --name sutando-core --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
-      -- "/proactive-loop"
-  fi
-fi
+# Delegate to scripts/start-cli.sh — canonical sutando-core launch command.
+# Single source of truth so Sutando.app's Restart Core menu can invoke the
+# same launch path without duplicating the tmux + claude flags.
+exec bash "$REPO/scripts/start-cli.sh"

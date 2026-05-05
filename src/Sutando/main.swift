@@ -217,6 +217,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Pause Loop (30 min)", action: #selector(pauseLoop30), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Resume Loop", action: #selector(resumeLoop), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "Restart Core CLI", action: #selector(restartCore), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Restart All Services", action: #selector(restartServices), keyEquivalent: "r"))
         menu.addItem(NSMenuItem(title: "Stop All Services", action: #selector(stopServices), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Restart Sutando App", action: #selector(restartSelf), keyEquivalent: ""))
@@ -1655,6 +1656,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             notify("Sutando", "Loop resumed.")
         } else {
             notify("Sutando", "Loop wasn't paused.")
+        }
+    }
+
+    /// Restart the Claude Code core session (sutando-core tmux session).
+    /// Invokes scripts/start-cli.sh --restart which kills any existing
+    /// session and starts fresh detached. User can re-attach via
+    /// "Open Core CLI" in the menu (or `tmux -S /tmp/sutando-tmux.sock
+    /// attach -t sutando-core` from a terminal).
+    ///
+    /// Per Chi 2026-05-05: voice-agent restart explicitly excluded —
+    /// this only restarts the Claude Code CLI session.
+    @objc func restartCore() {
+        notify("Sutando", "Restarting Core CLI…")
+        let script = workspace + "/scripts/start-cli.sh"
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+        proc.arguments = [script, "--restart"]
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        DispatchQueue.global(qos: .utility).async {
+            try? proc.run()
+            proc.waitUntilExit()
         }
     }
 
