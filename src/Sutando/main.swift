@@ -209,6 +209,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // by updateModeMenuItem() now.
         presenterMenuItem = presenterItem
         menu.addItem(NSMenuItem.separator())
+        // Loop pause/resume — proactive-loop's skip-conditions check
+        // `state/loop-paused-until.sentinel` (per skills/proactive-loop/SKILL.md
+        // Skip Conditions §(d)). Pause writes a future-dated sentinel; Resume
+        // deletes it. Sentinel format: ISO-8601 expiry timestamp (UTC).
+        // Auto-expires so a forgotten pause re-enables itself.
+        menu.addItem(NSMenuItem(title: "Pause Loop (30 min)", action: #selector(pauseLoop30), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Resume Loop", action: #selector(resumeLoop), keyEquivalent: ""))
+        menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Restart All Services", action: #selector(restartServices), keyEquivalent: "r"))
         menu.addItem(NSMenuItem(title: "Stop All Services", action: #selector(stopServices), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Restart Sutando App", action: #selector(restartSelf), keyEquivalent: ""))
@@ -1614,6 +1622,40 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func quit() {
         NSApplication.shared.terminate(nil)
+    }
+
+    /// Pause the proactive loop for 30 minutes by writing the sentinel
+    /// the loop's skip-conditions check (per
+    /// `~/.claude/skills/proactive-loop/SKILL.md` Skip Conditions §(d)).
+    /// Format: ISO-8601 expiry timestamp (UTC). Auto-expires — forgetting
+    /// to resume just means the loop self-re-enables in 30 min.
+    @objc func pauseLoop30() {
+        let expiry = Date().addingTimeInterval(30 * 60)
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        let iso = formatter.string(from: expiry)
+        let path = workspace + "/state/loop-paused-until.sentinel"
+        let dir = workspace + "/state"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        do {
+            try iso.write(toFile: path, atomically: true, encoding: .utf8)
+            let humanTime = DateFormatter.localizedString(from: expiry, dateStyle: .none, timeStyle: .short)
+            notify("Sutando", "Loop paused until \(humanTime). Click Resume Loop to re-enable sooner.")
+        } catch {
+            notify("Sutando", "Loop pause failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Resume the proactive loop by deleting the pause sentinel. No-op
+    /// if the sentinel doesn't exist (loop wasn't paused).
+    @objc func resumeLoop() {
+        let path = workspace + "/state/loop-paused-until.sentinel"
+        if FileManager.default.fileExists(atPath: path) {
+            try? FileManager.default.removeItem(atPath: path)
+            notify("Sutando", "Loop resumed.")
+        } else {
+            notify("Sutando", "Loop wasn't paused.")
+        }
     }
 
     /// Restart the Sutando.app menu bar app — useful after editing
