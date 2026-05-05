@@ -313,6 +313,7 @@ def render_dashboard() -> str:
 <div class="check">{shortcut_status}</div>
 <div style="margin-top:8px;font-size:12px;color:#555">
 <div style="margin:4px 0"><kbd style="background:#222;color:#aaa;padding:2px 6px;border-radius:3px;font-family:monospace">⌃C</kbd> Context drop (text/image/file)</div>
+<div style="margin:4px 0"><kbd style="background:#222;color:#aaa;padding:2px 6px;border-radius:3px;font-family:monospace">⌃S</kbd> Drop screenshot</div>
 <div style="margin:4px 0"><kbd style="background:#222;color:#aaa;padding:2px 6px;border-radius:3px;font-family:monospace">⌃V</kbd> Toggle voice</div>
 <div style="margin:4px 0"><kbd style="background:#222;color:#aaa;padding:2px 6px;border-radius:3px;font-family:monospace">⌃M</kbd> Toggle mute</div>
 </div></div>""")

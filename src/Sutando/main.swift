@@ -256,6 +256,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.pollPresenterMode()
             self?.pollVoiceMode()
         }
+        // Render the initial mode bullet on the dropdown. Without this, the
+        // first pollVoiceMode() tick bails early when sentinel matches the
+        // default `voiceMode = "active"`, leaving the menu items at their
+        // creation-time titles ("  Mode: Active") with no `●` marker. Caught
+        // 2026-05-05 — Chi reported the dot-next-to-Active was gone after a
+        // restart that landed in active mode (the common case). Calling
+        // updateModeMenuItem() once at end-of-launch makes the bullet appear
+        // immediately regardless of whether mode ever changes.
+        updateModeMenuItem()
     }
 
     // Write state/voice-mode.request for voice-agent to pick up on its 1s

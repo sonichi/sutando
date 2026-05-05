@@ -645,6 +645,8 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
 <div id="status-bar" style="text-align:center;font-size:16px;color:#888;letter-spacing:0.3px;padding:12px 16px">
   <kbd style="background:#1a1a2e;padding:3px 8px;border-radius:4px;border:1px solid #333;font-family:monospace;color:#8af;font-size:14px">⌃C</kbd> drop context
   <span style="margin:0 8px;color:#444">|</span>
+  <kbd style="background:#1a1a2e;padding:3px 8px;border-radius:4px;border:1px solid #333;font-family:monospace;color:#8af;font-size:14px">⌃S</kbd> drop screenshot
+  <span style="margin:0 8px;color:#444">|</span>
   <kbd style="background:#1a1a2e;padding:3px 8px;border-radius:4px;border:1px solid #333;font-family:monospace;color:#8af;font-size:14px">⌃V</kbd> voice
   <span style="margin:0 8px;color:#444">|</span>
   <kbd style="background:#1a1a2e;padding:3px 8px;border-radius:4px;border:1px solid #333;font-family:monospace;color:#8af;font-size:14px">⌃M</kbd> mute
