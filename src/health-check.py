@@ -14,6 +14,7 @@ Checks:
   - Notes directory
 """
 
+import hashlib
 import json
 import os
 import socket
@@ -769,13 +770,91 @@ def run_all_checks() -> list[dict]:
     return checks
 
 
+def emit_task_for_failures(checks: list[dict]) -> None:
+    """Emit a task file describing health-check failures so the proactive
+    loop's CLI session sees them via the watcher and can decide what to do
+    (restart, DM owner, ignore as transient).
+
+    Bridges the detection-vs-action gap: dashboard + morning-briefing already
+    surface failures to the user, but no path drove the AGENT to act on them.
+    Now health-check at any cron tick can produce a task file → watcher fires
+    → CLI processes as owner-tier task → LLM judgment at the act step.
+
+    Dedup via failure-SET hash to avoid spamming a task every tick when a
+    failure persists. The hash covers the full active set (sorted member
+    names) — if the set changes (one service recovers, another fails), the
+    hash changes and a new task fires. Cooldown is 1h per hash so a
+    persistent failure re-alerts after a reasonable window.
+    """
+    failures = [c for c in checks if c["status"] in ("down", "missing", "not_loaded", "fail", "stale")]
+    if not failures:
+        return
+
+    REPO = Path(__file__).resolve().parent.parent
+    state_file = REPO / "state" / "health-last-alerted.json"
+    tasks_dir = REPO / "tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Hash the full failure set (sorted) — Mini's #2 review note: hash MUST
+    # cover the active set, not member-by-member, else suppressing legit
+    # re-alerts when the set is identical to last alert.
+    set_key = "|".join(sorted(c["name"] for c in failures))
+    hash_key = hashlib.sha256(set_key.encode()).hexdigest()[:16]
+    now_ms = int(time.time() * 1000)
+    cooldown_ms = 3600 * 1000  # 1h
+
+    # Read prior alert state.
+    history: dict = {}
+    try:
+        if state_file.exists():
+            history = json.loads(state_file.read_text())
+    except Exception:
+        history = {}
+
+    last_alerted = history.get(hash_key, 0)
+    if now_ms - last_alerted < cooldown_ms:
+        # Same failure set, within cooldown — skip.
+        return
+
+    # Build task content.
+    ts_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    bullet_lines = [f"- {c['name']}: {c['status']} ({c['detail']})" for c in failures]
+    body = (
+        f"id: task-health-{int(time.time())}\n"
+        f"timestamp: {ts_iso}\n"
+        f"task: Health check found issues. Decide whether to restart, DM owner, or treat as transient:\n"
+        + "\n".join(bullet_lines) + "\n"
+        f"source: health-check\n"
+        f"user_id: health-check\n"
+        f"access_tier: owner\n"
+    )
+    task_path = tasks_dir / f"task-health-{int(time.time())}.txt"
+    task_path.write_text(body)
+
+    # Update history. Prune entries older than 24h to bound file size.
+    history[hash_key] = now_ms
+    cutoff = now_ms - (24 * 3600 * 1000)
+    history = {k: v for k, v in history.items() if v >= cutoff}
+    try:
+        state_file.write_text(json.dumps(history))
+    except Exception:
+        pass
+
+
 def main():
     as_json = "--json" in sys.argv
     do_fix = "--fix" in sys.argv
+    do_emit = "--emit-task" in sys.argv
     quiet = "--quiet" in sys.argv or "-q" in sys.argv
 
     checks = run_all_checks()
     issues = [c for c in checks if c["status"] not in ("ok", "warn")]
+
+    # Optional: emit a task for the CLI to act on. Runs before --json early-
+    # return so cron-driven --json --emit-task callers get both behaviors.
+    if do_emit:
+        emit_task_for_failures(checks)
 
     if as_json:
         print(json.dumps({"checks": checks, "issues": len(issues), "total": len(checks)}, indent=2))
