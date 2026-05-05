@@ -457,7 +457,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
            // Pass --repo explicitly: the app's CWD when launched via `open`
            // is the user's home directory (not a git repo), so without
            // --repo, gh fails with "fatal: not a git repository".
-           let prJSON = runShell(gh, ["pr", "list", "--repo", "sonichi/sutando", "--state", "open", "--limit", "5", "--author", "sonichi", "--json", "number,title"]),
+           // No --author filter — community PRs (e.g. #594 Jason, #593 Vasiliy)
+           // are also chip-worthy. Both bots commit as sonichi so this still
+           // surfaces fleet PRs, plus catches external contributions for triage.
+           let prJSON = runShell(gh, ["pr", "list", "--repo", "sonichi/sutando", "--state", "open", "--limit", "5", "--json", "number,title"]),
            let prData = prJSON.data(using: .utf8),
            let prs = try? JSONSerialization.jsonObject(with: prData) as? [[String: Any]] {
             for pr in prs.prefix(3) {
