@@ -770,7 +770,7 @@ def run_all_checks() -> list[dict]:
     return checks
 
 
-def emit_task_for_failures(checks: list[dict]) -> None:
+def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None, tasks_dir: Optional[Path] = None) -> None:
     """Emit a task file describing health-check failures so the proactive
     loop's CLI session sees them via the watcher and can decide what to do
     (restart, DM owner, ignore as transient).
@@ -785,6 +785,9 @@ def emit_task_for_failures(checks: list[dict]) -> None:
     names) — if the set changes (one service recovers, another fails), the
     hash changes and a new task fires. Cooldown is 1h per hash so a
     persistent failure re-alerts after a reasonable window.
+
+    `state_file` and `tasks_dir` default to the workspace paths used in
+    production. Tests inject temp paths.
     """
     # `warn` is the status used for "service is up but has a real issue"
     # (e.g., the dead-log-inode case from PR #596 — bridge running but
@@ -796,9 +799,12 @@ def emit_task_for_failures(checks: list[dict]) -> None:
     if not failures:
         return
 
-    REPO = Path(__file__).resolve().parent.parent
-    state_file = REPO / "state" / "health-last-alerted.json"
-    tasks_dir = REPO / "tasks"
+    if state_file is None or tasks_dir is None:
+        REPO = Path(__file__).resolve().parent.parent
+        if state_file is None:
+            state_file = REPO / "state" / "health-last-alerted.json"
+        if tasks_dir is None:
+            tasks_dir = REPO / "tasks"
     tasks_dir.mkdir(parents=True, exist_ok=True)
     state_file.parent.mkdir(parents=True, exist_ok=True)
 
