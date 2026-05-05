@@ -6,7 +6,8 @@
   "scripts": {
     "start": "tsx src/voice-agent.ts",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test tests/*.test.ts"
+    "test": "tsx --test tests/*.test.ts && npm run test:py",
+    "test:py": "for f in tests/*.test.py; do echo \"--- $f ---\" && python3 \"$f\" || exit 1; done"
   },
   "dependencies": {
     "@ai-sdk/google": "^1.2.0",
