@@ -975,15 +975,33 @@ async def poll_results():
                     archive_file(task_file, "tasks", task_id)
                     continue
                 try:
+                    # Extract optional [reply: <message_id>] directive — the
+                    # agent signals "this result is a reply to that message"
+                    # so the bridge POSTs with `message_reference` (Discord's
+                    # reply-style) rather than as a fresh message. Used for
+                    # welcome posts that reply to a new-user message + any
+                    # context-replying response. msze 2026-05-06 ask.
+                    reply_pattern = re.compile(r'\[reply:\s*(\d{17,20})\]')
+                    reply_match = reply_pattern.search(reply_text)
+                    reply_to_id = int(reply_match.group(1)) if reply_match else None
+                    if reply_match:
+                        reply_text = reply_pattern.sub('', reply_text).strip()
+
                     # Extract file paths: [file: /path] or [send: /path]
                     file_pattern = re.compile(r'\[(?:file|send|attach):\s*((?:/|~/)[^\]:]+)\]')
                     files = file_pattern.findall(reply_text)
                     clean_text = file_pattern.sub('', reply_text).strip()
 
                     # Send text — fence-aware chunker preserves triple-backtick code blocks
+                    # First chunk uses message_reference (if set); subsequent chunks
+                    # are fresh — Discord allows only one reply-anchor per message,
+                    # and split-chunk continuation isn't itself a reply.
                     if clean_text:
+                        first = True
                         for chunk in _chunk_for_discord(clean_text):
-                            await channel.send(chunk)
+                            ref = discord.MessageReference(message_id=reply_to_id, channel_id=int(channel_id), fail_if_not_exists=False) if (first and reply_to_id) else None
+                            await channel.send(chunk, reference=ref)
+                            first = False
 
                     # Send files (allowlist-gated; see _is_path_sendable)
                     for fpath in files:
