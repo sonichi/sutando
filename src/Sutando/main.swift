@@ -258,6 +258,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.refreshContextualChips()
         }
 
+        // Health-check: every 30min, run health-check.py --fix and append
+        // to logs/health-check.log. Same pattern as watcher-liveness +
+        // chips. Replaces ~/Library/LaunchAgents/com.sutando.health-check
+        // .plist (retired in the same change set per trio-design-current
+        // .md "Health-check ownership"). After this binary ships:
+        //   launchctl bootout gui/$UID/com.sutando.health-check
+        //   rm ~/Library/LaunchAgents/com.sutando.health-check.plist
+        Timer.scheduledTimer(withTimeInterval: 1800.0, repeats: true) { [weak self] _ in
+            self?.runHealthCheck()
+        }
+        // Fire once at startup so a fresh check is captured immediately
+        // rather than waiting 30min.
+        DispatchQueue.global(qos: .background).async { [weak self] in
+            self?.runHealthCheck()
+        }
+
         // Presenter mode: poll iclr-highlight server for on/off state.
         // Keeps menu item + tooltip fresh; silent if server is down.
         // Also rechecks voice-agent mode sentinel on the same tick.
@@ -1507,6 +1523,57 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         """
         let taskPath = tasksDir + "/task-\(ts).txt"
         try? taskContent.write(toFile: taskPath, atomically: true, encoding: .utf8)
+    }
+
+    var lastHealthCheckStart: Date = .distantPast
+    func runHealthCheck() {
+        // Throttle: never more than once per 60s, even if the Timer +
+        // startup-fire happen to align.
+        let now = Date()
+        if now.timeIntervalSince(lastHealthCheckStart) < 60 { return }
+        lastHealthCheckStart = now
+
+        let logPath = workspace + "/logs/health-check.log"
+        let scriptPath = workspace + "/src/health-check.py"
+        // Match the (retired) launchd plist's interpreter so behavior is
+        // identical. Falls back to /usr/bin/env python3 if homebrew python
+        // is missing on this host.
+        let homebrewPython = "/opt/homebrew/opt/python@3.11/libexec/bin/python3"
+        let pythonPath = FileManager.default.fileExists(atPath: homebrewPython)
+            ? homebrewPython : "/usr/bin/env"
+        let arguments: [String] = (pythonPath == "/usr/bin/env")
+            ? ["python3", scriptPath, "--fix"]
+            : [scriptPath, "--fix"]
+
+        DispatchQueue.global(qos: .background).async { [weak self] in
+            guard let self = self else { return }
+            if !FileManager.default.fileExists(atPath: logPath) {
+                FileManager.default.createFile(atPath: logPath, contents: Data())
+            }
+            guard let fh = FileHandle(forWritingAtPath: logPath) else {
+                self.logToFile("runHealthCheck: failed to open \(logPath)")
+                return
+            }
+            fh.seekToEndOfFile()
+
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: pythonPath)
+            proc.arguments = arguments
+            proc.standardOutput = fh
+            proc.standardError = fh
+            proc.currentDirectoryURL = URL(fileURLWithPath: self.workspace)
+
+            do {
+                try proc.run()
+                proc.waitUntilExit()
+                if proc.terminationStatus != 0 {
+                    self.logToFile("runHealthCheck: exit \(proc.terminationStatus)")
+                }
+            } catch {
+                self.logToFile("runHealthCheck: spawn failed — \(error.localizedDescription)")
+            }
+            try? fh.close()
+        }
     }
 
     func logToFile(_ msg: String) {
