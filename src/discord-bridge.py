@@ -999,7 +999,7 @@ async def poll_results():
                     if clean_text:
                         first = True
                         for chunk in _chunk_for_discord(clean_text):
-                            ref = discord.MessageReference(message_id=reply_to_id, channel_id=int(channel_id), fail_if_not_exists=False) if (first and reply_to_id) else None
+                            ref = discord.MessageReference(message_id=reply_to_id, channel_id=channel.id, fail_if_not_exists=False) if (first and reply_to_id) else None
                             await channel.send(chunk, reference=ref)
                             first = False
 
