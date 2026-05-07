@@ -1003,6 +1003,140 @@ async def _dispatch_verdicts(verdicts, messages_by_id, client_ref, off_topic_tra
     return summary
 
 
+# ---------------------------------------------------------------------------
+# AG2 auto-mod LLM-judge — buffer + flush + on_message hook (PR6 of 6).
+# Final integration. The buffer-collection observe runs at the TOP of
+# `_handle_discord_message` and only OBSERVES (no immediate action), so
+# the existing task pipeline (mentions, allowFrom, requireMention, etc.)
+# remains untouched. Auto-mod actions run from the periodic flush.
+
+MOD_BUFFER_FLUSH_INTERVAL_S = 5      # flush every N seconds when buffer non-empty
+MOD_BUFFER_SIZE_THRESHOLD = 20       # also flush when buffer hits this size
+_mod_buffer = []                     # type: list  (each entry is a dict + the discord.Message)
+_mod_buffer_lock = None              # asyncio.Lock created in on_ready
+_mod_dupe_tracker = _DupeTracker()
+_mod_streak_tracker = _OffTopicStreakTracker()
+
+
+def _ensure_mod_lock():
+    """Lazy-init asyncio.Lock — must run inside an event loop."""
+    global _mod_buffer_lock
+    if _mod_buffer_lock is None:
+        _mod_buffer_lock = asyncio.Lock()
+    return _mod_buffer_lock
+
+
+async def _observe_for_mod(message):
+    """Push a message into the auto-mod buffer if its guild has mod_active=True
+    and the author is not a mod (G1). Called from the top of
+    `_handle_discord_message`. Returns silently — never blocks the existing
+    task pipeline."""
+    try:
+        guild = getattr(message, "guild", None)
+        if guild is None:
+            return  # DMs / private contexts not auto-modded
+        active, mod_role_ids = _load_mod_config(guild.id)
+        if not active:
+            return  # this guild hasn't opted in
+        if _is_moderator(message.author, mod_role_ids):
+            return  # G1 — mod immunity at observation time
+        # Build a queued-message record and append to buffer.
+        rec = {
+            "msg_id": str(getattr(message, "id", "")),
+            "channel_name": getattr(message.channel, "name", "?"),
+            "channel_id": getattr(message.channel, "id", None),
+            "author_name": str(getattr(message.author, "display_name", message.author)),
+            "author_id": getattr(message.author, "id", None),
+            "content": getattr(message, "content", "") or "",
+            "is_reply": bool(getattr(message, "reference", None)),
+            "parent_content": _resolve_reply_parent_content(message),
+            "_msg": message,  # discord.Message ref, used at dispatch time
+        }
+        lock = _ensure_mod_lock()
+        async with lock:
+            _mod_buffer.append(rec)
+            buffer_full = len(_mod_buffer) >= MOD_BUFFER_SIZE_THRESHOLD
+        if buffer_full:
+            # Eager flush — don't wait for the 5s timer if we hit threshold.
+            asyncio.create_task(_flush_mod_buffer())
+    except Exception as e:
+        print(f"  [mod-observe] failed: {e}", flush=True)
+
+
+def _resolve_reply_parent_content(message):
+    """Best-effort: pull parent message content for reply-context. Returns
+    "" if not a reply or parent not resolvable."""
+    try:
+        ref = getattr(message, "reference", None)
+        if ref is None:
+            return ""
+        resolved = getattr(ref, "resolved", None)
+        if resolved is None:
+            return ""
+        return getattr(resolved, "content", "") or ""
+    except Exception:
+        return ""
+
+
+async def _flush_mod_buffer():
+    """Drain the buffer, run codex batch judge, dispatch actions. Idempotent
+    when buffer is empty. Caller (timer / threshold trigger) doesn't need
+    to coordinate — internal lock makes this safe to invoke concurrently."""
+    lock = _ensure_mod_lock()
+    async with lock:
+        if not _mod_buffer:
+            return
+        batch = _mod_buffer[:]
+        _mod_buffer.clear()
+    # Build the message list for codex judge prompt
+    messages_for_judge = [
+        {
+            "msg_id": r["msg_id"],
+            "channel_name": r["channel_name"],
+            "author_name": r["author_name"],
+            "content": r["content"],
+            "is_reply": r["is_reply"],
+            "parent_content": r["parent_content"],
+        }
+        for r in batch
+    ]
+    messages_by_id = {r["msg_id"]: r["_msg"] for r in batch}
+    try:
+        verdicts = await _codex_judge_batch(messages_for_judge)
+    except Exception as e:
+        print(f"  [mod-flush] codex judge failed: {e}", flush=True)
+        return
+    if not verdicts:
+        return
+    try:
+        summary = await _dispatch_verdicts(verdicts, messages_by_id, client_ref=client,
+                                             off_topic_tracker=_mod_streak_tracker)
+        print(f"  [mod-flush] batch={len(batch)} verdicts={len(verdicts)} {summary}", flush=True)
+    except Exception as e:
+        print(f"  [mod-flush] dispatch failed: {e}", flush=True)
+    # GC the dupe tracker periodically so it doesn't grow unbounded
+    try:
+        import time as _t
+        _mod_dupe_tracker.gc(now_s=_t.time())
+    except Exception:
+        pass
+
+
+async def _mod_flush_timer_loop():
+    """Background task: flush every N seconds when buffer non-empty.
+    Started in on_ready alongside the existing poll_results / poll_proactive
+    tasks."""
+    while True:
+        try:
+            await asyncio.sleep(MOD_BUFFER_FLUSH_INTERVAL_S)
+            if _mod_buffer:
+                await _flush_mod_buffer()
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            print(f"  [mod-flush-timer] error: {e}", flush=True)
+
+
 # Track pending replies: task_id -> channel
 pending_replies = {}
 
@@ -1019,6 +1153,8 @@ async def on_ready():
     client.loop.create_task(poll_approved())
     client.loop.create_task(poll_proactive())
     client.loop.create_task(poll_dm_fallback())
+    # Auto-mod LLM-judge flush timer (per-guild gate enforced inside flush)
+    client.loop.create_task(_mod_flush_timer_loop())
 
 
 def _message_mentions_bot(message):
@@ -1061,6 +1197,10 @@ async def on_message_edit(before, after):
 async def _handle_discord_message(message, force=False):
     if message.author == client.user:
         return
+    # Auto-mod LLM-judge observation hook (per-guild opt-in via access.json
+    # `mod_active`). Pure observe — never blocks the rest of the function.
+    # Action only fires from the periodic flush task, not at receive time.
+    await _observe_for_mod(message)
     # NOTE: the bot-author filter ("drop bot messages without @-mention") used
     # to fire here unconditionally. It now lives in the `if not is_dm:` branch
     # below, gated on the channel's `requireMention` setting, so channels
