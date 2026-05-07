@@ -585,13 +585,16 @@ def _format_judge_prompt(messages, rules_context=""):
     return "\n".join(lines)
 
 
-async def _codex_judge_batch(messages, rules_context="", model="gpt-4o-mini", timeout_s=30):
+async def _codex_judge_batch(messages, rules_context="", model=None, timeout_s=30):
     """Async wrapper that invokes codex CLI to judge a batch of messages.
 
-    Spawns `codex exec --sandbox read-only -m <model> -- <prompt>` via
-    asyncio subprocess. Captures stdout (the judge's JSON output) and parses
-    via `_parse_judge_output`. Returns list of verdict dicts; [] on any
-    failure (timeout, non-zero exit, malformed JSON).
+    Spawns `codex exec --sandbox read-only -o <tmpfile> -- <prompt>` via
+    asyncio subprocess. The `-o` flag writes only the agent's final
+    message to the file (no agent-headers / token counts / shell
+    execution traces) — that's the clean read path for codex-as-judge.
+    `model` is optional; None uses codex's configured default
+    (gpt-5.5 currently). Returns list of verdict dicts; [] on any
+    failure (timeout, non-zero exit, malformed JSON, missing output).
 
     Caller is responsible for the buffer/flush logic that decides WHEN to
     invoke this. This function is stateless.
@@ -608,19 +611,37 @@ async def _codex_judge_batch(messages, rules_context="", model="gpt-4o-mini", ti
 async def _run_codex_subprocess(prompt, model, timeout_s):
     """Default codex subprocess invocation. Patched in tests.
 
-    Returns the captured stdout (judge's JSON string) or "" on any failure.
-    Stays read-only (codex won't act, just judges). Doesn't escape — the
-    prompt is passed as a single argv argument so shell-quoting isn't a
-    concern.
+    Uses the `-o <tmpfile>` flag so codex writes ONLY the agent's final
+    message (the JSON we care about) to a tempfile — bypasses the agent-
+    header wrapping that pollutes stdout. Returns the file contents on
+    success, "" on any failure (timeout / non-zero exit / file missing).
+    Stays read-only sandbox (codex won't shell out for any tool).
+
+    `model` is None to use codex's configured default (avoids the
+    "model not supported under ChatGPT account" 400 we'd get with
+    `-m gpt-4o-mini` under that auth path).
     """
+    import tempfile, os
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "codex", "exec", "--sandbox", "read-only", "-m", model, "--", prompt,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        out_fd, out_path = tempfile.mkstemp(prefix="sutando-mod-judge-", suffix=".json")
+        os.close(out_fd)
+    except Exception:
+        return ""
+    try:
+        argv = ["codex", "exec", "--sandbox", "read-only", "-o", out_path]
+        if model:
+            argv.extend(["-m", model])
+        argv.extend(["--", prompt])
         try:
-            stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except Exception:
+            return ""
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
         except asyncio.TimeoutError:
             try:
                 proc.kill()
@@ -629,9 +650,16 @@ async def _run_codex_subprocess(prompt, model, timeout_s):
             return ""
         if proc.returncode != 0:
             return ""
-        return stdout.decode("utf-8", errors="replace") if stdout else ""
-    except Exception:
-        return ""
+        try:
+            with open(out_path, "r", encoding="utf-8", errors="replace") as fp:
+                return fp.read()
+        except Exception:
+            return ""
+    finally:
+        try:
+            os.unlink(out_path)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
