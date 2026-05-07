@@ -12,6 +12,9 @@ Options:
   --review                        Use `codex review` instead of `codex exec`
   --uncommitted                   Review uncommitted changes
   --base <branch>                 Review changes against a base branch
+  --goal                          Spec-driven one-shot build mode (prepends `/goal` to prompt,
+                                  defaults sandbox to workspace-write, enables --full-auto).
+                                  Use for self-contained HTML/CSS/JS prototypes from a tight spec.
   --model <model>                 Pass `-m` to `codex exec`
   --sandbox <mode>                read-only | workspace-write | danger-full-access
   --cd <dir>                      Working directory to hand to Codex
@@ -23,6 +26,7 @@ Options:
 Examples:
   codex-run.sh -- "Find the likely cause of the failing tests"
   codex-run.sh --review --uncommitted -- "Review for bugs and missing tests"
+  codex-run.sh --goal -- "$(cat spec.md)"
 EOF
 }
 
@@ -42,6 +46,7 @@ MODE="exec"
 UNCOMMITTED=0
 FULL_AUTO=0
 JSON=0
+GOAL=0
 BASE=""
 MODEL=""
 SANDBOX="workspace-write"
@@ -61,6 +66,11 @@ while [[ $# -gt 0 ]]; do
       ;;
     --uncommitted)
       UNCOMMITTED=1
+      shift
+      ;;
+    --goal)
+      GOAL=1
+      FULL_AUTO=1
       shift
       ;;
     --base)
@@ -141,6 +151,10 @@ if [[ "$MODE" == "review" ]]; then
 fi
 
 [[ -n "$PROMPT" ]] || fail "prompt required unless --check is used"
+
+if [[ "$GOAL" -eq 1 ]]; then
+  PROMPT="/goal $PROMPT"
+fi
 
 cmd=(codex exec -C "$WORKDIR" -s "$SANDBOX")
 [[ -n "$MODEL" ]] && cmd+=(-m "$MODEL")

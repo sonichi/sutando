@@ -18,6 +18,8 @@ ARGUMENTS: $ARGUMENTS
 - "Use my Codex subscription from Claude Code"
 - Need a second model to inspect a bug, review a diff, or propose an implementation
 - Need a Codex result saved or streamed from the current repo
+- Spec-driven one-shot build of a self-contained artifact (HTML/CSS/JS prototype, single-file
+  demo) — use `--goal` to invoke Codex's `/goal` mode
 
 ## Guardrails
 
@@ -47,7 +49,27 @@ bash "$SKILL_DIR/scripts/codex-run.sh" --review --base main -- "Focus on regress
 
 # Save the last Codex message to a file
 bash "$SKILL_DIR/scripts/codex-run.sh" --output-last-message results/codex-review.txt -- "Review the current workspace"
+
+# Spec-driven one-shot build (Codex /goal mode)
+bash "$SKILL_DIR/scripts/codex-run.sh" --goal -- "$(cat path/to/spec.md)"
 ```
+
+## `/goal` mode (`--goal`)
+
+Wraps Codex's interactive `/goal` slash-command for non-interactive use. The flag prepends
+`/goal ` to the prompt and forces `--full-auto` so Codex can write files unattended.
+
+Reach for it when:
+
+- The task is a self-contained artifact (single HTML file, one-off demo, isolated script).
+- You have a tight written spec and want a one-shot build with a known cost ceiling.
+- A second-model take on a prototype is useful (run `--goal` in parallel with Claude's own
+  build for cross-check).
+
+Skip it when:
+
+- The task touches in-repo code or needs memory/context Claude already has.
+- You expect to iterate — `/goal` is one-shot and does not self-correct on failure.
 
 ## If Invoked As A Slash Command
 
