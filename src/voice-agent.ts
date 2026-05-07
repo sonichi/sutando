@@ -870,6 +870,17 @@ async function main() {
 
 	sessionRef = session;
 
+	// Bumped 5min into the future on every non-retryable transport close
+	// (set inside the classifier IIFE below). Read by the 30s health
+	// monitor — when the deadline is in the future, the monitor skips its
+	// reconnect-trigger so a permanent upstream failure (credits depleted,
+	// key invalid, quota exceeded) doesn't produce a tight 60s retry loop
+	// that spams logs + Gemini API requests until the user fixes things.
+	// Auto-recovery resumes ~5min after the last fatal close. Reset to 0
+	// when the session reaches ACTIVE so a transient close after recovery
+	// doesn't inherit a stale backoff window.
+	let voiceFatalBackoffUntil = 0;
+
 	// Wire voice-failure classifier: when the Gemini Live transport closes
 	// with a non-retryable reason (credits depleted, quota exceeded, key
 	// invalid, model not found), surface an actionable message via the
@@ -887,6 +898,12 @@ async function main() {
 		const notifiedCategories = new Set<string>();
 		const handleClose = (c: ClassifiedClose): void => {
 			if (c.retryable) return;
+			// Push the health-monitor reconnect window out by 5min on every
+			// non-retryable close — including repeats of an already-notified
+			// category — so the 60s retry loop doesn't keep firing while the
+			// upstream issue persists. Without this, a 1011 credit-depleted
+			// loop produces ~6 log lines / 60s indefinitely.
+			voiceFatalBackoffUntil = Date.now() + 5 * 60 * 1000;
 			if (notifiedCategories.has(c.category)) return;
 			notifiedCategories.add(c.category);
 			console.error(`${ts()} [VoiceFailure] ${c.category}: ${c.userMessage} (raw="${c.rawReason}")`);
@@ -1210,11 +1227,18 @@ async function main() {
 			console.log(`${ts()} [Health] ${status}`);
 			lastLoggedStatus = status;
 		}
+		// Clear any stale fatal-backoff once we observe a healthy session —
+		// otherwise a brief outage that triggered a backoff would suppress
+		// recovery from a later transient close even after the upstream
+		// issue was fixed.
+		if (state === 'ACTIVE' && voiceFatalBackoffUntil > 0) {
+			voiceFatalBackoffUntil = 0;
+		}
 		// Recover when session is CLOSED and a client is waiting. handleClientConnected
 		// is bodhi's internal entry point for this exact scenario (CLOSED + client
 		// present → transition to CONNECTING, reconnect fire-and-forget).
 		// TODO: drop the (session as any) cast once bodhi exposes a public API.
-		if (state === 'CLOSED' && clientConnected && Date.now() - lastReconnectAt > 60_000) {
+		if (state === 'CLOSED' && clientConnected && Date.now() - lastReconnectAt > 60_000 && Date.now() > voiceFatalBackoffUntil) {
 			lastReconnectAt = Date.now();
 			console.log(`${ts()} [Health] Dead session — triggering reconnect`);
 			try {
