@@ -136,6 +136,8 @@ if [[ ! -d "$WORKDIR" ]]; then
   fail "working directory does not exist: $WORKDIR"
 fi
 
+[[ "$GOAL" -eq 1 && "$MODE" == "review" ]] && fail "--goal cannot be combined with --review"
+
 PROMPT="${PROMPT_ARGS[*]-}"
 
 if [[ "$MODE" == "review" ]]; then
@@ -152,7 +154,7 @@ fi
 
 [[ -n "$PROMPT" ]] || fail "prompt required unless --check is used"
 
-if [[ "$GOAL" -eq 1 ]]; then
+if [[ "$GOAL" -eq 1 && "$PROMPT" != /goal\ * ]]; then
   PROMPT="/goal $PROMPT"
 fi
 
