@@ -1623,11 +1623,25 @@ async def _handle_discord_message(message, force=False):
             if do_welcome:
                 template = _read_welcome_template(welcome_template_path)
                 if template:
+                    # Mark BEFORE sending so two near-simultaneous first posts
+                    # from the same user don't both pass the welcomed-check
+                    # during the await on `channel.send`. Tradeoff: if send
+                    # fails, the user is marked welcomed without seeing the
+                    # message — recoverable manually by editing the state
+                    # file. Better than a double-welcome.
+                    _mark_user_welcomed(guild.id, message.author.id)
                     body = f"<@{message.author.id}> {template}"
+                    # `allowed_mentions` constrains who can be pinged via the
+                    # welcome body — defense in depth against an operator-
+                    # supplied template containing @everyone / @here / role
+                    # mentions. Only the welcomed user themselves can be
+                    # actually pinged.
+                    am = discord.AllowedMentions(
+                        everyone=False, roles=False, users=[message.author]
+                    )
                     try:
                         for chunk in _chunk_for_discord(body):
-                            await message.channel.send(chunk)
-                        _mark_user_welcomed(guild.id, message.author.id)
+                            await message.channel.send(chunk, allowed_mentions=am)
                         print(f"  [welcome] sent to {message.author} in #{getattr(message.channel,'name','?')}", flush=True)
                     except Exception as e:
                         print(f"  [welcome] send failed for {message.author}: {e}", flush=True)
