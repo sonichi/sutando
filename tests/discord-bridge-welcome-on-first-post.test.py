@@ -101,7 +101,7 @@ def _make_message(guild_id, channel_id, author_id, is_bot=False):
 def case_load_welcome_channel_per_guild() -> list[str]:
     fails = []
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-        json.dump({"guilds": {"1153072414184452236": {"welcome_channel": "1307539994751139893"}}}, f)
+        json.dump({"guilds": {"1153072414184452236": {"welcome_channel": "1307539994751139893", "welcome_template": "/tmp/t.md"}}}, f)
         path = Path(f.name)
     orig = bridge.ACCESS_FILE
     try:
@@ -110,6 +110,19 @@ def case_load_welcome_channel_per_guild() -> list[str]:
             fails.append("a) configured guild should resolve to int channel id")
         if bridge._load_welcome_channel(99999999999999999) is not None:
             fails.append("a) unconfigured guild should return None")
+        # Per-guild template path
+        ch, tpl = bridge._load_welcome_config(1153072414184452236)
+        if tpl != "/tmp/t.md":
+            fails.append(f"a) per-guild welcome_template should resolve, got {tpl!r}")
+        # Channel-only (no template) → tpl=None
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f2:
+            json.dump({"guilds": {"42": {"welcome_channel": "100"}}}, f2)
+            ch_only_path = Path(f2.name)
+        bridge.ACCESS_FILE = ch_only_path
+        ch, tpl = bridge._load_welcome_config(42)
+        if ch != 100 or tpl is not None:
+            fails.append(f"a) channel-only config should give (100, None); got ({ch}, {tpl})")
+        ch_only_path.unlink(missing_ok=True)
     finally:
         bridge.ACCESS_FILE = orig
         path.unlink(missing_ok=True)
@@ -144,26 +157,23 @@ def case_read_welcome_template_round_trip() -> list[str]:
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
         f.write("Hello body\n")
         path = Path(f.name)
-    orig = bridge.WELCOME_TEMPLATE_PATH
     try:
-        bridge.WELCOME_TEMPLATE_PATH = path
-        if bridge._read_welcome_template() != "Hello body\n":
+        # Caller passes the path explicitly; no module-level constant.
+        if bridge._read_welcome_template(str(path)) != "Hello body\n":
             fails.append("c) template content not returned")
     finally:
-        bridge.WELCOME_TEMPLATE_PATH = orig
         path.unlink(missing_ok=True)
     return fails
 
 
 def case_read_welcome_template_missing_returns_empty() -> list[str]:
     fails = []
-    orig = bridge.WELCOME_TEMPLATE_PATH
-    try:
-        bridge.WELCOME_TEMPLATE_PATH = Path("/nonexistent/welcome.md")
-        if bridge._read_welcome_template() != "":
-            fails.append("d) missing template should return empty (skip-welcome signal)")
-    finally:
-        bridge.WELCOME_TEMPLATE_PATH = orig
+    if bridge._read_welcome_template("/nonexistent/welcome.md") != "":
+        fails.append("d) missing template should return empty (skip-welcome signal)")
+    if bridge._read_welcome_template(None) != "":
+        fails.append("d) None path should return empty (no bridge-side default)")
+    if bridge._read_welcome_template("") != "":
+        fails.append("d) empty string path should return empty")
     return fails
 
 
@@ -247,7 +257,7 @@ def case_is_user_welcomed_check() -> list[str]:
 def case_should_welcome_happy_path() -> list[str]:
     fails = []
     msg = _make_message(guild_id=1, channel_id=100, author_id=999)
-    do, reason = bridge._should_welcome_first_post(msg, welcome_channel_id=100, welcomed_users={})
+    do, reason = bridge._should_welcome_first_post(msg, welcome_channel_id=100, welcome_template_path="/tmp/t.md", welcomed_users={})
     if not do:
         fails.append(f"h) happy path should welcome, reason={reason}")
     return fails
@@ -261,27 +271,32 @@ def case_should_welcome_skip_reasons() -> list[str]:
         channel=types.SimpleNamespace(id=100),
         author=types.SimpleNamespace(id=999, bot=False),
     )
-    do, reason = bridge._should_welcome_first_post(msg, welcome_channel_id=100, welcomed_users={})
+    do, reason = bridge._should_welcome_first_post(msg, welcome_channel_id=100, welcome_template_path="/tmp/t.md", welcomed_users={})
     if do or reason != "no_guild":
         fails.append(f"i) no_guild expected, got do={do} reason={reason}")
     # No welcome channel configured → skip
     msg = _make_message(1, 100, 999)
-    do, reason = bridge._should_welcome_first_post(msg, welcome_channel_id=None, welcomed_users={})
+    do, reason = bridge._should_welcome_first_post(msg, welcome_channel_id=None, welcome_template_path="/tmp/t.md", welcomed_users={})
     if do or reason != "no_welcome_channel_configured":
         fails.append(f"i) no_welcome_channel expected, got do={do} reason={reason}")
+    # No welcome template configured → skip
+    msg = _make_message(1, 100, 999)
+    do, reason = bridge._should_welcome_first_post(msg, welcome_channel_id=100, welcome_template_path=None, welcomed_users={})
+    if do or reason != "no_welcome_template_configured":
+        fails.append(f"i) no_welcome_template expected, got do={do} reason={reason}")
     # Wrong channel (message in #general, welcome in #welcome) → skip
     msg = _make_message(1, 999, 1234)
-    do, reason = bridge._should_welcome_first_post(msg, welcome_channel_id=100, welcomed_users={})
+    do, reason = bridge._should_welcome_first_post(msg, welcome_channel_id=100, welcome_template_path="/tmp/t.md", welcomed_users={})
     if do or reason != "wrong_channel":
         fails.append(f"i) wrong_channel expected, got do={do} reason={reason}")
     # Bot author → skip
     msg = _make_message(1, 100, 999, is_bot=True)
-    do, reason = bridge._should_welcome_first_post(msg, welcome_channel_id=100, welcomed_users={})
+    do, reason = bridge._should_welcome_first_post(msg, welcome_channel_id=100, welcome_template_path="/tmp/t.md", welcomed_users={})
     if do or reason != "bot_account":
         fails.append(f"i) bot_account expected, got do={do} reason={reason}")
     # Already welcomed → skip
     msg = _make_message(1, 100, 999)
-    do, reason = bridge._should_welcome_first_post(msg, welcome_channel_id=100, welcomed_users={"1": {"999"}})
+    do, reason = bridge._should_welcome_first_post(msg, welcome_channel_id=100, welcome_template_path="/tmp/t.md", welcomed_users={"1": {"999"}})
     if do or reason != "already_welcomed":
         fails.append(f"i) already_welcomed expected, got do={do} reason={reason}")
     return fails
@@ -292,13 +307,13 @@ def case_dedup_across_two_messages() -> list[str]:
     fails = []
     welcomed = {}
     msg1 = _make_message(1, 100, 999)
-    do1, _ = bridge._should_welcome_first_post(msg1, welcome_channel_id=100, welcomed_users=welcomed)
+    do1, _ = bridge._should_welcome_first_post(msg1, welcome_channel_id=100, welcome_template_path="/tmp/t.md", welcomed_users=welcomed)
     if not do1:
         fails.append("j) first post should welcome")
     # Caller would then mark welcomed before processing next msg
     welcomed.setdefault("1", set()).add("999")
     msg2 = _make_message(1, 100, 999)
-    do2, reason2 = bridge._should_welcome_first_post(msg2, welcome_channel_id=100, welcomed_users=welcomed)
+    do2, reason2 = bridge._should_welcome_first_post(msg2, welcome_channel_id=100, welcome_template_path="/tmp/t.md", welcomed_users=welcomed)
     if do2:
         fails.append(f"j) second post should NOT welcome, reason={reason2}")
     return fails
