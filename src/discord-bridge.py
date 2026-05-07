@@ -381,6 +381,138 @@ def load_channel_allowed(channel_id):
         return None
     return cfg[1]
 
+
+# ---------------------------------------------------------------------------
+# AG2 auto-mod LLM-judge helpers (per `notes/ag2-moderator-policy.md` §6.1).
+# Locked-in 2026-05-06 with msze + Chi: codex CLI + gpt-4o-mini, batched
+# 5s/20msgs, 7 rules + 2 global guardrails (G1 mod immunity / G2 escalate-on-
+# uncertainty). This PR ships the pure helpers + tests; the on_message hook +
+# action dispatchers ship in a follow-up so each PR stays focused.
+#
+# Per-guild config in access.json:
+#   {"guilds": {"<guild_id>": {
+#     "mod_active": true,
+#     "moderator_roles": ["<role_id_1>", "<role_id_2>"],
+#     ...
+#   }}}
+# `mod_active` defaults to false; the bridge does no auto-mod on a guild
+# without an explicit opt-in. AG2 starts in observer-mode until msze + Chi
+# flip the flag.
+
+# Per-rule confidence thresholds for G2 (escalate if confidence < threshold).
+MOD_RULE_CONFIDENCE = {
+    "rule_1": 0.85,  # crypto-job spam → auto-delete
+    "rule_2": 0.85,  # CSAM-bait → auto-delete + T&S rec
+    "rule_3": 0.85,  # cross-channel duplicate → server-rules-check
+    "rule_4": 0.85,  # job-availability → delete + redirect
+    "rule_5": 0.90,  # personal attack → escalate-only (highest FP risk)
+    "rule_6": 0.85,  # bare invite link → conditional delete
+    "rule_7": 0.85,  # off-topic streak → polite reminder
+}
+
+
+def _load_mod_config(guild_id):
+    """Return (mod_active: bool, moderator_role_ids: list[str]) for `guild_id`
+    from access.json. Defaults: (False, []) if guild not configured or
+    access.json missing/malformed. Defensive parsing — caller treats
+    mod_active=False as "do nothing" (the safe default)."""
+    try:
+        data = json.loads(ACCESS_FILE.read_text())
+    except Exception:
+        return False, []
+    g = data.get("guilds", {}).get(str(guild_id))
+    if not isinstance(g, dict):
+        return False, []
+    active = bool(g.get("mod_active", False))
+    roles_raw = g.get("moderator_roles", [])
+    roles = [str(r) for r in roles_raw] if isinstance(roles_raw, list) else []
+    return active, roles
+
+
+def _is_moderator(member, mod_role_ids):
+    """G1 — moderator immunity gate. Return True if `member` has any role in
+    `mod_role_ids` (or owns the guild). Pure function for testability —
+    caller passes the resolved role list."""
+    if member is None:
+        return False
+    # Server owner is always a mod
+    guild = getattr(member, "guild", None)
+    if guild is not None and getattr(guild, "owner_id", None) == getattr(member, "id", None):
+        return True
+    member_roles = getattr(member, "roles", []) or []
+    member_role_ids = {str(getattr(r, "id", r)) for r in member_roles}
+    return bool(member_role_ids.intersection(set(mod_role_ids)))
+
+
+def _should_auto_action(verdict, rule_threshold=None):
+    """G2 — confidence gate. Return True if the LLM verdict is confident
+    enough to act on. `verdict` is a dict with at least `confidence` (float)
+    and `rule_match` (str like "rule_1"). Below-threshold verdicts go to
+    escalate-only path even if rule_match is set."""
+    if not isinstance(verdict, dict):
+        return False
+    if not verdict.get("rule_match"):
+        return False
+    rm = verdict.get("rule_match")
+    threshold = rule_threshold if rule_threshold is not None else MOD_RULE_CONFIDENCE.get(rm, 0.85)
+    try:
+        conf = float(verdict.get("confidence", 0))
+    except (TypeError, ValueError):
+        return False
+    return conf >= threshold
+
+
+def _parse_judge_output(json_str):
+    """Parse codex's batched-judge output into a list of verdict dicts.
+
+    Expected schema (per message):
+        {
+          "msg_id": "<discord_msg_id>",
+          "rule_match": "rule_1" | "rule_2" | ... | null,
+          "confidence": 0.0–1.0,
+          "rationale": "<short explanation>"
+        }
+
+    Returns [] on any parse / schema failure (caller treats empty as
+    "no verdicts; don't act"). Lenient on extra keys; strict on required
+    keys (msg_id, confidence). `rule_match` may be null for clean messages.
+    """
+    if not isinstance(json_str, str) or not json_str.strip():
+        return []
+    try:
+        data = json.loads(json_str)
+    except Exception:
+        return []
+    # Accept either a list of verdicts or {"verdicts": [...]} wrapper
+    if isinstance(data, dict):
+        data = data.get("verdicts", [])
+    if not isinstance(data, list):
+        return []
+    out = []
+    for v in data:
+        if not isinstance(v, dict):
+            continue
+        msg_id = v.get("msg_id")
+        conf = v.get("confidence")
+        if not msg_id or conf is None:
+            continue
+        try:
+            conf_f = float(conf)
+        except (TypeError, ValueError):
+            continue
+        rule_match = v.get("rule_match")
+        if rule_match is not None and not isinstance(rule_match, str):
+            continue
+        rationale = v.get("rationale") if isinstance(v.get("rationale"), str) else ""
+        out.append({
+            "msg_id": str(msg_id),
+            "rule_match": rule_match,
+            "confidence": max(0.0, min(1.0, conf_f)),
+            "rationale": rationale,
+        })
+    return out
+
+
 # Track pending replies: task_id -> channel
 pending_replies = {}
 
