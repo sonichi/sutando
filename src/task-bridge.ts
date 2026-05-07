@@ -77,18 +77,35 @@ const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes default
 type PendingTask = { submittedAt: number; timeoutMs: number; dmOnTimeout: boolean };
 const _pendingTasks = new Map<string, PendingTask>();
 
-/** True if the task file (in tasks/, tasks/processed/, or tasks/archive/)
- * is voice-originated (channel_id: local-voice). Used by the result watcher
+/** True if the task file (in tasks/, tasks/processed/, or tasks/archive/
+ * — including month-partitioned subdirs `tasks/archive/YYYY-MM/`) is
+ * voice-originated (channel_id: local-voice). Used by the result watcher
  * to decide whether to forward an unsent result to Discord DM when voice is
  * offline. Returns false on missing file or parse error — bias toward not
  * forwarding to keep Susan-rejected always-DM behavior off by default for
  * non-voice tasks. */
-function _isVoiceTask(taskId: string): boolean {
-	const candidates = [
+export function _isVoiceTask(taskId: string): boolean {
+	const candidates: string[] = [
 		join(TASK_DIR, `${taskId}.txt`),
 		join(TASK_DIR, 'processed', `${taskId}.txt`),
+		// Legacy flat-archive location — kept for any task archived before
+		// the YYYY-MM partitioning (PR #591) was introduced.
 		join(TASK_DIR, 'archive', `${taskId}.txt`),
 	];
+	// Active archive layout: tasks/archive/YYYY-MM/<taskId>.txt. Glob the
+	// month subdirs rather than rebuild the YYYY-MM from the task's mtime —
+	// the writer's archive month and current month can differ around month
+	// boundaries.
+	const archiveRoot = join(TASK_DIR, 'archive');
+	if (existsSync(archiveRoot)) {
+		try {
+			for (const entry of readdirSync(archiveRoot)) {
+				// Only month-shaped names (YYYY-MM); skip stray files.
+				if (!/^\d{4}-\d{2}$/.test(entry)) continue;
+				candidates.push(join(archiveRoot, entry, `${taskId}.txt`));
+			}
+		} catch {}
+	}
 	for (const p of candidates) {
 		if (!existsSync(p)) continue;
 		try {
