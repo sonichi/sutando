@@ -1065,13 +1065,15 @@ async def _dispatch_verdicts(verdicts, messages_by_id, client_ref, off_topic_tra
         if not rule_match:
             # Clean message — no action. But for Rule 7, we still record
             # the on-topic verdict (off_topic=False) into the streak tracker.
+            # Mod messages never reach this path: `_observe_for_mod()` filters
+            # them at observation time and feeds the streak tracker directly
+            # with is_mod=True. So is_mod is always False here.
             if off_topic_tracker is not None:
                 channel_id = getattr(msg.channel, "id", None)
                 user_id = getattr(msg.author, "id", None)
-                is_mod = bool(getattr(v, "_is_mod", False))  # caller can flag
                 if channel_id is not None and user_id is not None:
                     import time as _t
-                    off_topic_tracker.record(channel_id, user_id, off_topic=False, is_mod=is_mod, now_s=_t.time())
+                    off_topic_tracker.record(channel_id, user_id, off_topic=False, is_mod=False, now_s=_t.time())
             summary["skipped"] += 1
             continue
         # Rule 7 path: judge says message is off-topic. Feed off_topic=True
@@ -1148,7 +1150,8 @@ async def _dispatch_verdicts(verdicts, messages_by_id, client_ref, off_topic_tra
 MOD_BUFFER_FLUSH_INTERVAL_S = 5      # flush every N seconds when buffer non-empty
 MOD_BUFFER_SIZE_THRESHOLD = 20       # also flush when buffer hits this size
 _mod_buffer = []                     # type: list  (each entry is a dict + the discord.Message)
-_mod_buffer_lock = None              # asyncio.Lock created in on_ready
+_mod_buffer_lock = None              # asyncio.Lock guarding _mod_buffer mutation
+_mod_flush_lock = None               # asyncio.Lock serializing whole-flush executions
 _mod_dupe_tracker = _DupeTracker()
 _mod_streak_tracker = _OffTopicStreakTracker()
 
@@ -1161,11 +1164,29 @@ def _ensure_mod_lock():
     return _mod_buffer_lock
 
 
+def _ensure_mod_flush_lock():
+    """Lazy-init asyncio.Lock that serializes flushes. Single-flight guard:
+    only one `_flush_mod_buffer` call runs at a time. Subsequent invocations
+    await this lock, then re-snapshot the buffer (which by then has been
+    cleared of the prior batch on success, or still contains it on failure
+    so the retry processes it). Without this, a threshold-eager flush + the
+    timer flush can race and double-judge / double-action the same batch."""
+    global _mod_flush_lock
+    if _mod_flush_lock is None:
+        _mod_flush_lock = asyncio.Lock()
+    return _mod_flush_lock
+
+
 async def _observe_for_mod(message):
     """Push a message into the auto-mod buffer if its guild has mod_active=True
     and the author is not a mod (G1). Called from the top of
     `_handle_discord_message`. Returns silently — never blocks the existing
-    task pipeline."""
+    task pipeline.
+
+    Mod messages are NOT buffered (G1 immunity) but they DO feed the
+    Rule 7 streak tracker as `is_mod=True` so an in-channel mod intervention
+    resets any pending off-topic streak — which is the whole point of the
+    streak-tracker's mod-reset rule."""
     try:
         guild = getattr(message, "guild", None)
         if guild is None:
@@ -1174,7 +1195,19 @@ async def _observe_for_mod(message):
         if not active:
             return  # this guild hasn't opted in
         if _is_moderator(message.author, mod_role_ids):
-            return  # G1 — mod immunity at observation time
+            # G1 — mods aren't judged. But Rule 7 wants mod intervention to
+            # reset the channel streak; feed the tracker directly.
+            channel_id = getattr(message.channel, "id", None)
+            user_id = getattr(message.author, "id", None)
+            if channel_id is not None and user_id is not None:
+                try:
+                    import time as _t
+                    _mod_streak_tracker.record(
+                        channel_id, user_id, off_topic=False, is_mod=True, now_s=_t.time()
+                    )
+                except Exception as e:
+                    print(f"  [mod-observe] mod-reset streak failed: {e}", flush=True)
+            return
         # Build a queued-message record and append to buffer.
         rec = {
             "msg_id": str(getattr(message, "id", "")),
@@ -1215,13 +1248,23 @@ def _resolve_reply_parent_content(message):
 
 async def _flush_mod_buffer():
     """Drain the buffer, run codex batch judge, dispatch actions. Idempotent
-    when buffer is empty. Caller (timer / threshold trigger) doesn't need
-    to coordinate — internal lock makes this safe to invoke concurrently.
+    when buffer is empty. Concurrent calls are serialized by `_mod_flush_lock`
+    — single-flight, so the same messages cannot be judged twice.
 
     Failure semantics: snapshot buffer WITHOUT clearing. Clear only after
     successful dispatch. On codex/judge failure or empty-verdicts the
     messages remain in the buffer for the next flush. Prevents silent
     data loss when codex times out or returns malformed output."""
+    flush_lock = _ensure_mod_flush_lock()
+    async with flush_lock:
+        await _flush_mod_buffer_inner()
+
+
+async def _flush_mod_buffer_inner():
+    """Body of `_flush_mod_buffer`. Caller MUST hold `_mod_flush_lock`.
+    Split out so tests can drive the body directly without the outer lock
+    (e.g. the concurrency test asserts that two parallel _flush_mod_buffer
+    calls serialize and don't double-process)."""
     lock = _ensure_mod_lock()
     async with lock:
         if not _mod_buffer:
@@ -1234,6 +1277,10 @@ async def _flush_mod_buffer():
     # >= DUPE_CHANNEL_THRESHOLD distinct channels see the same content from
     # the same user within DUPE_WINDOW_S. Collect those msg_ids.
     rule3_ids = set()
+    # (user_id, text) keys whose buckets fired Rule 3 in this batch — clear
+    # them after dispatch success so a follow-up repost in the 5min window
+    # doesn't inherit the stale 3-channel evidence.
+    triggered_keys = []
     try:
         import time as _t
         now_s = _t.time()
@@ -1249,6 +1296,7 @@ async def _flush_mod_buffer():
             if trigger:
                 # All msg_ids in the trigger list are Rule 3 candidates
                 rule3_ids.update(m for (_c, m) in trigger)
+                triggered_keys.append((user_id, r["content"]))
     except Exception as e:
         print(f"  [mod-flush] dupe-tracker error (continuing without rule_3 context): {e}", flush=True)
     messages_for_judge = [
@@ -1286,6 +1334,13 @@ async def _flush_mod_buffer():
                                              off_topic_tracker=_mod_streak_tracker)
         async with lock:
             _mod_buffer[:] = [r for r in _mod_buffer if r["msg_id"] not in batch_ids]
+        # Clear Rule 3 evidence for keys that fired in this batch — only
+        # after dispatch success so a retry can still re-trigger if needed.
+        for (uid, text) in triggered_keys:
+            try:
+                _mod_dupe_tracker.clear(uid, text)
+            except Exception as e:
+                print(f"  [mod-flush] dupe-tracker clear failed for ({uid}): {e}", flush=True)
         print(f"  [mod-flush] batch={len(batch)} verdicts={len(verdicts)} {summary}", flush=True)
     except Exception as e:
         print(f"  [mod-flush] dispatch failed: {e} — batch retained in buffer for retry", flush=True)

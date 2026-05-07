@@ -328,6 +328,174 @@ def case_h_mention_injection_sanitized():
     return fails
 
 
+def case_i_concurrent_flush_single_flight():
+    """v2 HIGH: Two parallel `_flush_mod_buffer()` calls must not double-judge
+    the same batch. Original bug (pre-fix): snapshot under buffer-lock, release
+    for codex, only clear after dispatch — so a second flush snapshots the same
+    still-populated buffer and the same messages get judged twice. Fix uses a
+    flush-level lock for single-flight execution.
+
+    Test: launch 2 flushes concurrently with a slow codex stub; assert codex
+    is invoked exactly once with all messages, and the buffer ends empty."""
+    fails = []
+    bridge._mod_buffer.clear()
+    # Reset locks so a fresh asyncio event loop can recreate them
+    bridge._mod_buffer_lock = None
+    bridge._mod_flush_lock = None
+    ch = _MockChannel("general", 9999)
+    msgs = []
+    for i in range(3):
+        m = _MockMessage(f"m{i}", ch, content=f"hello {i}", author_id=900 + i)
+        msgs.append(m)
+        bridge._mod_buffer.append({
+            "msg_id": f"m{i}", "channel_name": "general", "channel_id": 9999,
+            "author_name": f"user{i}", "author_id": 900 + i, "content": f"hello {i}",
+            "is_reply": False, "parent_content": "", "_msg": m,
+        })
+    invocations = {"count": 0, "msg_ids_seen": []}
+
+    async def slow_codex(messages_for_judge, rules_context="", **kw):
+        invocations["count"] += 1
+        invocations["msg_ids_seen"].append([m["msg_id"] for m in messages_for_judge])
+        # Simulate codex latency so the concurrent flush has time to enter
+        # and try to snapshot the same buffer.
+        await asyncio.sleep(0.05)
+        return [{"msg_id": m["msg_id"], "rule_match": None, "confidence": 0.9, "rationale": "ok"}
+                for m in messages_for_judge]
+    orig = bridge._codex_judge_batch
+    bridge._codex_judge_batch = slow_codex
+    try:
+        async def run_two():
+            await asyncio.gather(
+                bridge._flush_mod_buffer(),
+                bridge._flush_mod_buffer(),
+            )
+        asyncio.run(run_two())
+        if invocations["count"] != 1:
+            fails.append(f"i) codex should be invoked exactly once for one batch (got {invocations['count']})")
+        if invocations["msg_ids_seen"] and len(invocations["msg_ids_seen"][0]) != 3:
+            fails.append(f"i) first invocation should see all 3 messages (got {invocations['msg_ids_seen']})")
+        if len(bridge._mod_buffer) != 0:
+            fails.append(f"i) buffer should be cleared after successful dispatch (got {len(bridge._mod_buffer)})")
+    finally:
+        bridge._codex_judge_batch = orig
+        bridge._mod_buffer.clear()
+    return fails
+
+
+def case_j_rule3_clears_after_trigger():
+    """v2 MEDIUM: After a Rule 3 trigger fires and dispatch succeeds, the
+    DupeTracker bucket for that (user_id, text) key must be cleared. Otherwise
+    a follow-up post in the 5-min window inherits the old 3-channel evidence
+    and re-triggers Rule 3 with weak evidence (1 new + 3 stale msgs).
+
+    Test: trigger Rule 3, run flush, then assert the bucket is empty so a
+    new post in a 4th channel does NOT immediately trigger again."""
+    fails = []
+    bridge._mod_buffer.clear()
+    bridge._mod_dupe_tracker = bridge._DupeTracker()
+    # Reset flush lock so this test's event loop creates a fresh one
+    bridge._mod_buffer_lock = None
+    bridge._mod_flush_lock = None
+    spam_text = "JOIN MY CRYPTO discord.gg/zzz"
+    user_id = 13579
+
+    async def clean_codex(messages_for_judge, rules_context="", **kw):
+        return [{"msg_id": m["msg_id"], "rule_match": "rule_3", "confidence": 0.95,
+                 "rationale": "dupe", "violates_server_rules": True}
+                for m in messages_for_judge]
+    orig = bridge._codex_judge_batch
+    bridge._codex_judge_batch = clean_codex
+    try:
+        # First batch: same user, same text, 3 distinct channels → fires Rule 3
+        for i, ch_id in enumerate([100, 200, 300]):
+            ch = _MockChannel(f"ch{i}", ch_id)
+            m = _MockMessage(f"m{i}", ch, content=spam_text, author_id=user_id)
+            bridge._mod_buffer.append({
+                "msg_id": f"m{i}", "channel_name": f"ch{i}", "channel_id": ch_id,
+                "author_name": "spammer", "author_id": user_id, "content": spam_text,
+                "is_reply": False, "parent_content": "", "_msg": m,
+            })
+        asyncio.run(bridge._flush_mod_buffer())
+        # Assert dupe-tracker bucket cleared for this (user, text)
+        norm_key = (str(user_id), bridge._normalize_msg_text(spam_text))
+        bucket = bridge._mod_dupe_tracker._store.get(norm_key)
+        if bucket and len(bucket) > 0:
+            fails.append(f"j) DupeTracker bucket for triggered (user,text) should be cleared "
+                         f"after dispatch success (got {len(bucket)} entries: {bucket})")
+        # And: a follow-up post in a 4th channel should NOT immediately re-fire,
+        # because the bucket is fresh — only 1 entry, well under threshold of 3.
+        import time as _t
+        trigger = bridge._mod_dupe_tracker.add(
+            user_id=user_id, channel_id=400, msg_id="m_follow",
+            text=spam_text, now_s=_t.time(),
+        )
+        if trigger:
+            fails.append(f"j) a single follow-up post should NOT re-trigger Rule 3 "
+                         f"after the bucket was cleared (got trigger={trigger})")
+    finally:
+        bridge._codex_judge_batch = orig
+        bridge._mod_buffer.clear()
+    return fails
+
+
+def case_k_mod_message_resets_offtopic_streak():
+    """v2 MEDIUM: A moderator posting in an mod-active channel must reset the
+    Rule 7 off-topic streak. Original bugs: (1) `_observe_for_mod` returns
+    silently for mods so they never reach the streak tracker; (2) the dispatcher
+    clean-verdict path read `getattr(v, "_is_mod", False)` on a dict (always
+    False). Fix: `_observe_for_mod` feeds the streak tracker directly with
+    is_mod=True for mod authors.
+
+    Test: pre-load a streak with off-topic entries, then call _observe_for_mod
+    with a mod author; assert the channel's streak buffer is empty afterwards.
+    """
+    fails = []
+    bridge._mod_streak_tracker = bridge._OffTopicStreakTracker()
+    # Reset buffer lock so the observe call's event loop creates a fresh one
+    bridge._mod_buffer_lock = None
+    bridge._mod_flush_lock = None
+    bridge._mod_buffer.clear()
+    channel_id = 5555
+    # Pre-load streak with 3 off-topic entries from a regular user
+    import time as _t
+    now = _t.time()
+    for i in range(3):
+        bridge._mod_streak_tracker.record(
+            channel_id, user_id=999 + i, off_topic=True, is_mod=False, now_s=now,
+        )
+    pre = bridge._mod_streak_tracker._streaks.get(str(channel_id), [])
+    if len(pre) != 3:
+        fails.append(f"k) test setup: expected 3 pre-loaded streak entries, got {len(pre)}")
+        return fails
+    # Stub _load_mod_config + _is_moderator so the observe path classifies
+    # the author as a mod and the guild as mod_active=True.
+    orig_load = bridge._load_mod_config
+    orig_is_mod = bridge._is_moderator
+    bridge._load_mod_config = lambda gid: (True, ["mod-role-1"])
+    bridge._is_moderator = lambda member, mod_role_ids: True
+    try:
+        ch = _MockChannel("general", channel_id)
+        mod_msg = _MockMessage("m_mod", ch, content="please stay on-topic everyone",
+                                author_id=42, author_name="modA")
+        # Author needs roles attribute for _is_moderator path (but our stub
+        # bypasses that — the real path is exercised in unit tests).
+        mod_msg.author.roles = []
+        asyncio.run(bridge._observe_for_mod(mod_msg))
+        post = bridge._mod_streak_tracker._streaks.get(str(channel_id), [])
+        if post and len(post) > 0:
+            fails.append(f"k) mod message should reset channel streak to empty "
+                         f"(got {len(post)} entries remaining)")
+        # Mod messages also must NOT be added to the buffer (G1 immunity)
+        if any(r.get("msg_id") == "m_mod" for r in bridge._mod_buffer):
+            fails.append("k) mod message should NOT be added to mod buffer (G1)")
+    finally:
+        bridge._load_mod_config = orig_load
+        bridge._is_moderator = orig_is_mod
+        bridge._mod_buffer.clear()
+    return fails
+
+
 def main():
     cases = [
         ("a-batch-retained-on-codex-failure", case_a_batch_retained_on_codex_failure),
@@ -338,6 +506,9 @@ def main():
         ("f-violates-server-rules-preserved", case_f_violates_server_rules_preserved),
         ("g-rule3-legit-crosspost-escalates-only", case_g_rule3_legit_crosspost_escalates_only),
         ("h-mention-injection-sanitized", case_h_mention_injection_sanitized),
+        ("i-concurrent-flush-single-flight", case_i_concurrent_flush_single_flight),
+        ("j-rule3-clears-after-trigger", case_j_rule3_clears_after_trigger),
+        ("k-mod-message-resets-offtopic-streak", case_k_mod_message_resets_offtopic_streak),
     ]
     failures = []
     for label, fn in cases:
