@@ -1391,10 +1391,10 @@ async def _mod_flush_timer_loop():
 #   {"guilds": {"<guild_id>": {"welcome_channel": "<id>", "welcome_template": "<path>"}}}
 # Both fields required for welcome to fire. Bridge does NOT bake an AG2
 # default — operator picks the template path per-guild. Welcomed-users
-# dedup state at state/welcomed-users.json keeps a user from being welcomed
+# dedup state at state/discord-welcomed-users.json keeps a user from being welcomed
 # twice in the same guild across bridge restarts.
 
-WELCOMED_USERS_FILE = STATE_DIR / "welcomed-users.json"
+WELCOMED_USERS_FILE = STATE_DIR / "discord-welcomed-users.json"
 
 
 def _load_welcome_config(guild_id):

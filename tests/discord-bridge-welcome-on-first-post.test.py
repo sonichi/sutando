@@ -189,7 +189,7 @@ def case_welcomed_users_round_trip() -> list[str]:
         orig_file = bridge.WELCOMED_USERS_FILE
         try:
             bridge.STATE_DIR = td
-            bridge.WELCOMED_USERS_FILE = td / "welcomed-users.json"
+            bridge.WELCOMED_USERS_FILE = td / "discord-welcomed-users.json"
             # Empty initial state
             if bridge._load_welcomed_users() != {}:
                 fails.append("e) fresh state should be empty dict")
