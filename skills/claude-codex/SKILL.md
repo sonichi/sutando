@@ -74,7 +74,14 @@ Skip it when:
 ## If Invoked As A Slash Command
 
 - If ARGUMENTS is empty, explain the available modes and suggest `--review --uncommitted` for diffs or a plain prompt for general delegation.
-- If ARGUMENTS is present, run:
+- If ARGUMENTS starts with `--goal ` (e.g., `/claude-codex --goal Build a self-playing demo`), strip the prefix and route the remaining text through `--goal` mode:
+
+```bash
+PROMPT="${ARGUMENTS#--goal }"
+bash "$SKILL_DIR/scripts/codex-run.sh" --goal -- "$PROMPT"
+```
+
+- Otherwise (plain prompt), run:
 
 ```bash
 bash "$SKILL_DIR/scripts/codex-run.sh" -- "$ARGUMENTS"
