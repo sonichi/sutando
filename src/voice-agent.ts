@@ -818,7 +818,7 @@ async function main() {
 		host: HOST,
 		model: google(VOICE_MODEL),
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
-		speechConfig: { voiceName: 'Puck' },
+		speechConfig: { voiceName: process.env.VOICE_NAME || 'Puck' },
 		inputAudioTranscription: true,
 		hooks: {
 			onSessionStart: (e) => {
