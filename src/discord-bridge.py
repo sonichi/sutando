@@ -513,6 +513,127 @@ def _parse_judge_output(json_str):
     return out
 
 
+# ---------------------------------------------------------------------------
+# AG2 auto-mod LLM-judge — codex subprocess wrapper + prompt builder.
+# Per `notes/ag2-moderator-policy.md` §6.1: codex CLI + gpt-4o-mini, batched
+# 5s/20msgs. PR2 of 3 — pure prompt builder + the codex invocation. Action
+# dispatchers + on_message buffer/flush wiring come in PR3.
+
+# Prefix that the LLM judge prompt includes for every batch — names the rules
+# and global guardrails. Source of truth for rule definitions stays in
+# `notes/ag2-moderator-policy.md`; this is the LLM-readable distillation.
+MOD_JUDGE_SYSTEM_PROMPT = """You are a Discord moderation judge for the AG2 server. For each user message in the batch below, decide whether it matches one of these rules. Return STRICT JSON.
+
+Rules (return rule_match = "rule_N" if the message matches; null if clean):
+
+rule_1 — Crypto-job-listing spam: message advertises crypto-related employment with payment offers (e.g. "Beta tester $X/hour", "Moderator $Y/week") + @everyone/@here/DM-bait. Excludes legit hiring posts in #jobs that mention crypto as a topic but lack scam markers.
+
+rule_2 — CSAM-bait invite spam: explicit-content language (teen, underage, leaks) AND mass-broadcast pattern (@everyone/@here OR Discord invite tied to such content). Must combine both signals.
+
+rule_3 — Cross-channel duplicate: this is detected upstream by the bridge (caller sets rule_match=rule_3 in the prompt context if applicable). When triggered, your job is to also judge whether the duplicates VIOLATE any general AG2 server rule (separate from duplication itself).
+
+rule_4 — Job-availability post outside #jobs: user offering their own services for hire ("I'm a full-stack dev looking for work", "iOS dev DM me", "Looking for teammate to build X"). Excludes hiring-FROM-a-company posts and on-topic mentions where someone happens to mention they're available.
+
+rule_5 — Personal attack / derogatory toward community: personal attack, harassment, slurs, name-calling, content asserting community members are worthless / bad / criminal. Excludes vigorous technical disagreement, self-deprecation, non-targeted humor.
+
+rule_6 — Bare invite-link from non-mod: message contains a Discord invite (`discord.gg/...`) or external server invite link, with no surrounding conversational context, in a non-#geo / non-#announcements channel. Exception: if the message is a reply to a parent that's asking for that invite, return rule_match=null.
+
+rule_7 — Off-topic in focused channel: this is detected upstream as a streak of 5+ off-topic messages. When triggered, your job is to verify each message is indeed off-topic for the channel's stated topic.
+
+Global guardrails (apply to every rule):
+- G1: Moderator messages are always rule_match=null regardless of content. Bridge enforces this upstream; you can rely on the moderator filter happening before this prompt.
+- G2: When uncertain, lower the confidence (don't force a match). Bridge gates auto-action on confidence ≥ per-rule threshold.
+
+Output schema — STRICT JSON, no prose, no code fences:
+{"verdicts": [
+  {"msg_id": "<discord_msg_id>", "rule_match": "rule_N" | null, "confidence": 0.0–1.0, "rationale": "<one sentence>"}
+]}
+
+One entry per input message. Preserve msg_id strings exactly as given.
+"""
+
+
+def _format_judge_prompt(messages, rules_context=""):
+    """Build the codex judge prompt for a batch of messages.
+
+    `messages`: list of dicts with at least {msg_id, channel_name, author_name, content, is_reply, parent_content}.
+    `rules_context`: optional extra context (e.g. for Rule 3 the cross-channel-
+    duplicate evidence; for Rule 7 the channel topic + recent context).
+    Returns the full prompt string ready to feed `codex exec ... -- <prompt>`.
+    """
+    lines = [MOD_JUDGE_SYSTEM_PROMPT.strip(), ""]
+    if rules_context:
+        lines.append("Additional context for this batch:")
+        lines.append(rules_context.strip())
+        lines.append("")
+    lines.append("Messages to judge:")
+    for m in messages:
+        msg_id = m.get("msg_id", "?")
+        ch = m.get("channel_name", "?")
+        author = m.get("author_name", "?")
+        content = (m.get("content") or "").replace("\n", " ").strip()[:500]
+        is_reply = bool(m.get("is_reply"))
+        parent = m.get("parent_content", "") if is_reply else ""
+        prefix = f"  msg_id={msg_id} #{ch} @{author}"
+        if is_reply and parent:
+            parent_short = parent.replace("\n", " ").strip()[:120]
+            prefix += f' [reply to: "{parent_short}"]'
+        lines.append(f"{prefix}:")
+        lines.append(f"    {content!r}")
+    lines.append("")
+    lines.append("Respond with STRICT JSON only.")
+    return "\n".join(lines)
+
+
+async def _codex_judge_batch(messages, rules_context="", model="gpt-4o-mini", timeout_s=30):
+    """Async wrapper that invokes codex CLI to judge a batch of messages.
+
+    Spawns `codex exec --sandbox read-only -m <model> -- <prompt>` via
+    asyncio subprocess. Captures stdout (the judge's JSON output) and parses
+    via `_parse_judge_output`. Returns list of verdict dicts; [] on any
+    failure (timeout, non-zero exit, malformed JSON).
+
+    Caller is responsible for the buffer/flush logic that decides WHEN to
+    invoke this. This function is stateless.
+
+    Tests should patch `_run_codex_subprocess` to avoid real LLM calls.
+    """
+    if not messages:
+        return []
+    prompt = _format_judge_prompt(messages, rules_context)
+    raw = await _run_codex_subprocess(prompt, model, timeout_s)
+    return _parse_judge_output(raw)
+
+
+async def _run_codex_subprocess(prompt, model, timeout_s):
+    """Default codex subprocess invocation. Patched in tests.
+
+    Returns the captured stdout (judge's JSON string) or "" on any failure.
+    Stays read-only (codex won't act, just judges). Doesn't escape — the
+    prompt is passed as a single argv argument so shell-quoting isn't a
+    concern.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "codex", "exec", "--sandbox", "read-only", "-m", model, "--", prompt,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return ""
+        if proc.returncode != 0:
+            return ""
+        return stdout.decode("utf-8", errors="replace") if stdout else ""
+    except Exception:
+        return ""
+
+
 # Track pending replies: task_id -> channel
 pending_replies = {}
 
