@@ -158,7 +158,7 @@ if [[ "$GOAL" -eq 1 && "$PROMPT" != /goal\ * ]]; then
   PROMPT="/goal $PROMPT"
 fi
 
-cmd=(codex exec -C "$WORKDIR" -s "$SANDBOX")
+cmd=(codex exec -C "$WORKDIR" -s "$SANDBOX" --skip-git-repo-check)
 [[ -n "$MODEL" ]] && cmd+=(-m "$MODEL")
 [[ "$FULL_AUTO" -eq 1 ]] && cmd+=(--full-auto)
 [[ "$JSON" -eq 1 ]] && cmd+=(--json)

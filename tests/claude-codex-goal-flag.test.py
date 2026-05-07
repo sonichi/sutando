@@ -64,6 +64,15 @@ def test_default_mode_unchanged(bin_dir: Path, mock_out: Path) -> None:
     assert "--full-auto" not in argv, f"--full-auto leaked: {argv}"
 
 
+def test_skip_git_repo_check_always_present(bin_dir: Path, mock_out: Path) -> None:
+    """Regression for the non-git-workdir hang: the wrapper must always pass
+    --skip-git-repo-check so codex doesn't bail when invoked outside a repo."""
+    rc, _ = run(bin_dir, "--", "any prompt", mock_out=mock_out)
+    assert rc == 0
+    argv = mock_out.read_text().splitlines()
+    assert "--skip-git-repo-check" in argv, f"missing --skip-git-repo-check: {argv}"
+
+
 def test_goal_review_combo_rejected(bin_dir: Path, mock_out: Path) -> None:
     rc, out = run(bin_dir, "--goal", "--review", "--uncommitted", mock_out=mock_out)
     assert rc != 0, "expected non-zero exit for --goal --review"
@@ -89,6 +98,7 @@ def main() -> None:
             test_default_mode_unchanged,
             test_goal_review_combo_rejected,
             test_goal_no_double_prefix,
+            test_skip_git_repo_check_always_present,
         ):
             mock_out = tmp / f"{fn.__name__}.argv"
             fn(bin_dir, mock_out)
