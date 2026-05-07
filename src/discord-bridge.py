@@ -767,6 +767,139 @@ async def _action_polite_reminder(channel, channel_topic_hint=None):
         return None
 
 
+# ---------------------------------------------------------------------------
+# AG2 auto-mod LLM-judge — stateful detectors (PR4 of 5).
+# Two pure state-machine classes that the buffer/flush logic in PR5 will
+# call. Each class is parameterized for testability — caller passes in
+# `now_s` rather than the trackers reading `time.time()` themselves.
+#
+# `_DupeTracker` — Rule 3 cross-channel-duplicate detection. Tracks
+# (user_id, normalized_text) → set of (channel_id, ts_s). Rolling 5-min
+# window. Fires when same (user, text) spans ≥3 distinct channels in
+# the window.
+#
+# `_OffTopicStreakTracker` — Rule 7 streak detection. Per-channel
+# rolling list of off-topic verdicts. Mod messages reset the streak.
+# Fires when 5 consecutive off-topic non-mod messages accumulate (per
+# channel, per cooldown).
+
+DUPE_WINDOW_S = 5 * 60      # Rule 3 rolling window: 5 minutes
+DUPE_CHANNEL_THRESHOLD = 3  # Rule 3: fire on 3+ distinct channels in window
+OFFTOPIC_STREAK_LEN = 5     # Rule 7: 5 consecutive off-topic msgs trigger
+OFFTOPIC_REMINDER_COOLDOWN_S = 30 * 60  # Rule 7: 30 min between reminders per channel
+
+
+def _normalize_msg_text(text):
+    """Same normalization as Rule 3 / dedup — lowercase, collapse runs of
+    whitespace, trim, cap at 200 chars. Differs slightly from work-tool
+    dedup (150 chars) — moderation can afford a bit more context for
+    matching cross-channel raid spam."""
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", text).strip().lower()[:200]
+
+
+class _DupeTracker:
+    """Rule 3 detector. Tracks (user_id, normalized_text) → set of
+    (channel_id, msg_id, ts_s). Rolling 5-min window. Caller passes
+    `now_s` for testability."""
+
+    def __init__(self, window_s=DUPE_WINDOW_S, channel_threshold=DUPE_CHANNEL_THRESHOLD):
+        self._window_s = window_s
+        self._channel_threshold = channel_threshold
+        # key: (user_id_str, normalized_text) → list[(channel_id, msg_id, ts_s)]
+        self._store = {}
+
+    def add(self, user_id, channel_id, msg_id, text, now_s):
+        """Record a message. Returns the dupe-set if this addition triggers
+        Rule 3 (>= channel_threshold distinct channels), else None.
+
+        On trigger, returns list[(channel_id, msg_id)] of all duplicate
+        copies in the window — caller deletes them all + escalates."""
+        key = (str(user_id), _normalize_msg_text(text))
+        if not key[1]:
+            return None  # empty/normalized-to-blank text → ignore
+        bucket = self._store.setdefault(key, [])
+        # Drop entries outside window
+        bucket[:] = [(c, m, t) for (c, m, t) in bucket if (now_s - t) <= self._window_s]
+        bucket.append((str(channel_id), str(msg_id), now_s))
+        distinct_channels = {c for (c, _m, _t) in bucket}
+        if len(distinct_channels) >= self._channel_threshold:
+            # Trigger! Return all duplicate (channel, msg) pairs in window.
+            return [(c, m) for (c, m, _t) in bucket]
+        return None
+
+    def clear(self, user_id, text):
+        """Manual reset for a (user, text) key — used after Rule 3 fires
+        and the duplicates are deleted, so the same evidence doesn't
+        re-trigger on subsequent messages."""
+        key = (str(user_id), _normalize_msg_text(text))
+        self._store.pop(key, None)
+
+    def gc(self, now_s):
+        """Drop empty + expired entries to keep memory bounded. Caller
+        should run this periodically (e.g. on every flush)."""
+        for k in list(self._store.keys()):
+            self._store[k] = [(c, m, t) for (c, m, t) in self._store[k] if (now_s - t) <= self._window_s]
+            if not self._store[k]:
+                del self._store[k]
+
+
+class _OffTopicStreakTracker:
+    """Rule 7 detector. Per-channel rolling list of recent verdicts.
+    Mod messages reset the streak (we don't count them). Fires when
+    OFFTOPIC_STREAK_LEN consecutive non-mod off-topic verdicts accumulate.
+    Per-channel cooldown after each fire so we don't spam reminders."""
+
+    def __init__(self, streak_len=OFFTOPIC_STREAK_LEN, cooldown_s=OFFTOPIC_REMINDER_COOLDOWN_S):
+        self._streak_len = streak_len
+        self._cooldown_s = cooldown_s
+        # channel_id_str → deque-like list of dicts {user_id, ts, off_topic, is_mod}
+        self._streaks = {}
+        # channel_id_str → ts_s of last reminder fire
+        self._last_reminder = {}
+
+    def record(self, channel_id, user_id, off_topic, is_mod, now_s):
+        """Record a message verdict for this channel. Returns True if
+        this addition triggers a reminder (passes cooldown + streak). On
+        trigger, the streak buffer is cleared so the next reminder needs
+        a fresh streak."""
+        ch = str(channel_id)
+        # Mod messages: reset streak (we don't count them at all)
+        if is_mod:
+            self._streaks[ch] = []
+            return False
+        # Cooldown gate: only suppresses if a reminder has already fired
+        # (last_reminder set). Initial state has no entry, so the first
+        # fire is unrestricted.
+        last_fire = self._last_reminder.get(ch)
+        in_cooldown = last_fire is not None and (now_s - last_fire) < self._cooldown_s
+        buf = self._streaks.setdefault(ch, [])
+        buf.append({"user": str(user_id), "ts": now_s, "off_topic": bool(off_topic)})
+        # Cap buffer to streak_len so we don't grow unbounded
+        if len(buf) > self._streak_len:
+            buf[:] = buf[-self._streak_len:]
+        if in_cooldown:
+            return False
+        # Streak fires only if there are streak_len consecutive off-topic
+        # entries from AFTER the cooldown window expired. Entries during
+        # cooldown are stale and don't count toward the next fire.
+        if last_fire is None:
+            cutoff = 0  # no prior fire — all entries valid
+        else:
+            cutoff = last_fire + self._cooldown_s
+        relevant = [e for e in buf if e["ts"] > cutoff]
+        if len(relevant) >= self._streak_len and all(e["off_topic"] for e in relevant[-self._streak_len:]):
+            self._last_reminder[ch] = now_s
+            self._streaks[ch] = []  # clear so next reminder needs fresh streak
+            return True
+        return False
+
+    def reset_channel(self, channel_id):
+        """Manual reset (e.g. after a mod posts in the channel out-of-band)."""
+        self._streaks[str(channel_id)] = []
+
+
 # Track pending replies: task_id -> channel
 pending_replies = {}
 
