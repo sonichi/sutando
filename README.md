@@ -176,6 +176,7 @@ Exiting `startup.sh` alone does NOT stop background services. Always use `restar
 3. Remove config: `rm -rf ~/.claude/projects/*sutando*`
 4. Remove npm packages (optional): the repo uses local `node_modules/` — deleted with the repo
 5. Remove any tools you installed during setup (e.g. `imsg`, `wacli`) via the package manager you used to install them.
+6. If you installed the OS-supervised health checks: `bash src/install-health-check-launchd.sh --uninstall` (idempotent — no-op if not installed).
 
 ---
 
@@ -191,6 +192,7 @@ These unlock more capabilities. Add to `.env` when ready:
 | Discord | Message Sutando from Discord (DM + channel @mentions) | [Developer portal](https://discord.com/developers), then `/discord:configure <token>` |
 | Claude for Chrome | Browser automation — navigate, read pages, fill forms, interact with web apps | [Install extension](https://claude.ai/chrome), log in with the same account as Claude Code |
 | Sutando app (menu bar) | Global hotkeys (see [Keyboard shortcuts](#keyboard-shortcuts)) | Auto-launches via `startup.sh` |
+| OS-supervised health checks | Detect stuck loops, dead watchers, and queue pileups even when core is unresponsive — macOS notifies you when Sutando is broken | `bash src/install-health-check-launchd.sh` (idempotent; uninstall with `--uninstall`) |
 
 ---
 

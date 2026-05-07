@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Sutando — health-check launchd job (template).
+
+  Installed by `bash src/install-health-check-launchd.sh` after the install
+  script substitutes __REPO__, __PYTHON__, and __HOMEBREW_BIN__ with the
+  user's actual paths. Do NOT load this template directly — paths must be
+  expanded first.
+
+  Behavior:
+    - Fires every 60s (StartInterval).
+    - Runs `python3 src/health-check.py --emit-task --notify-on-fail --quiet`.
+    - Surfaces failures as tasks/task-health-*.txt AND macOS notifications.
+    - ThrottleInterval=30 prevents crash-loop thrash.
+    - Exit-only job (KeepAlive omitted) — launchd waits StartInterval, fires
+      again, no zombie process between runs.
+    - All output goes to logs/health-check-launchd.log for postmortem.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.sutando.health-check</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>__REPO__/src/health-check.py</string>
+        <string>--emit-task</string>
+        <string>--notify-on-fail</string>
+        <string>--quiet</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+
+    <key>StartInterval</key>
+    <integer>60</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HOMEBREW_BIN__:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__REPO__/logs/health-check-launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__REPO__/logs/health-check-launchd.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
