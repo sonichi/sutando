@@ -522,7 +522,7 @@ def _parse_judge_output(json_str):
 # Prefix that the LLM judge prompt includes for every batch — names the rules
 # and global guardrails. Source of truth for rule definitions stays in
 # `notes/ag2-moderator-policy.md`; this is the LLM-readable distillation.
-MOD_JUDGE_SYSTEM_PROMPT = """You are a Discord moderation judge for the AG2 server. For each user message in the batch below, decide whether it matches one of these rules. Return STRICT JSON.
+MOD_JUDGE_SYSTEM_PROMPT = """You are a Discord moderation judge. For each user message in the batch below, decide whether it matches one of these rules. Return STRICT JSON.
 
 Rules (return rule_match = "rule_N" if the message matches; null if clean):
 
@@ -530,7 +530,7 @@ rule_1 — Crypto-job-listing spam: message advertises crypto-related employment
 
 rule_2 — CSAM-bait invite spam: explicit-content language (teen, underage, leaks) AND mass-broadcast pattern (@everyone/@here OR Discord invite tied to such content). Must combine both signals.
 
-rule_3 — Cross-channel duplicate: this is detected upstream by the bridge (caller sets rule_match=rule_3 in the prompt context if applicable). When triggered, your job is to also judge whether the duplicates VIOLATE any general AG2 server rule (separate from duplication itself).
+rule_3 — Cross-channel duplicate: this is detected upstream by the bridge (caller sets rule_match=rule_3 in the prompt context if applicable). When triggered, your job is to also judge whether the duplicates VIOLATE any general server rule (separate from duplication itself).
 
 rule_4 — Job-availability post outside #jobs: user offering their own services for hire ("I'm a full-stack dev looking for work", "iOS dev DM me", "Looking for teammate to build X"). Excludes hiring-FROM-a-company posts and on-topic mentions where someone happens to mention they're available.
 
@@ -671,18 +671,51 @@ async def _run_codex_subprocess(prompt, model, timeout_s):
 # Buffer + flush + on_message wiring + Rule 3/7 stateful detectors come in
 # the final PR4.
 
-# Snowflakes for the 3 mods to cc on every escalation post (per the locked
-# ruleset). For now hardcoded to AG2's mod set; per-guild override could
-# come later if Sutando ever runs in a second moderated server.
-MOD_ESCALATION_CCS = (
-    "<@1022910063620390932>",  # Chi (sonichi)
-    "<@1025828152183885925>",  # Qingyun Wu
-    "<@786410785197785088>",   # msze_
-)
-# Discord channel id for AG2's #moderator-only — escalation destination.
-MOD_ESCALATION_CHANNEL_ID = 1153753796321738863
-# Discord channel id for AG2's #jobs — Rule 4 redirect destination.
-MOD_JOBS_CHANNEL_ID = 1168719200605437952
+# Per-guild moderation channels and CC roster live in access.json under
+# `guilds.<guild_id>` keys: `escalation_channel` (int channel id),
+# `escalation_cc_user_ids` (list of user-id strings or ints),
+# `redirect_channel_jobs` (int channel id for Rule 4). No bridge-side
+# default — operator must configure per-guild.
+
+
+def _load_mod_server_config(guild_id):
+    """Return dict of per-guild moderation config:
+        {
+          "escalation_channel": int | None,
+          "escalation_ccs": tuple[str, ...],   # `<@id>` mention strings
+          "redirect_channel_jobs": int | None,
+        }
+    Defaults to empty/None on any missing/malformed access.json entry.
+    Caller must handle None channels (skip the action with a log line)."""
+    try:
+        data = json.loads(ACCESS_FILE.read_text())
+    except Exception:
+        return {"escalation_channel": None, "escalation_ccs": (), "redirect_channel_jobs": None}
+    g = data.get("guilds", {}).get(str(guild_id))
+    if not isinstance(g, dict):
+        return {"escalation_channel": None, "escalation_ccs": (), "redirect_channel_jobs": None}
+    def _to_int(v):
+        try:
+            return int(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+    raw_ccs = g.get("escalation_cc_user_ids", [])
+    ccs = tuple(f"<@{u}>" for u in raw_ccs) if isinstance(raw_ccs, list) else ()
+    return {
+        "escalation_channel": _to_int(g.get("escalation_channel")),
+        "escalation_ccs": ccs,
+        "redirect_channel_jobs": _to_int(g.get("redirect_channel_jobs")),
+    }
+
+
+def _guild_id_of(message):
+    """Best-effort extract guild_id from a discord.Message-like object.
+    Returns None for DMs or when guild attribute is missing."""
+    try:
+        g = getattr(message, "guild", None)
+        return getattr(g, "id", None) if g is not None else None
+    except Exception:
+        return None
 
 
 async def _post_mod_escalation(client_ref, suspect_message, rule_label, llm_rationale, extras_md=""):
@@ -694,9 +727,15 @@ async def _post_mod_escalation(client_ref, suspect_message, rule_label, llm_rati
     Returns the posted message object on success, None on failure.
     """
     try:
-        mod_ch = client_ref.get_channel(MOD_ESCALATION_CHANNEL_ID)
+        guild_id = _guild_id_of(suspect_message)
+        cfg = _load_mod_server_config(guild_id)
+        ch_id = cfg["escalation_channel"]
+        if ch_id is None:
+            print(f"  [mod-escalate] no escalation_channel configured for guild {guild_id}; skipping", flush=True)
+            return None
+        mod_ch = client_ref.get_channel(ch_id)
         if mod_ch is None:
-            print(f"  [mod-escalate] {MOD_ESCALATION_CHANNEL_ID} not in client cache; skipping", flush=True)
+            print(f"  [mod-escalate] {ch_id} not in client cache; skipping", flush=True)
             return None
         suspect_link = ""
         try:
@@ -718,8 +757,9 @@ async def _post_mod_escalation(client_ref, suspect_message, rule_label, llm_rati
         if extras_md:
             body_lines.append("")
             body_lines.append(extras_md.strip())
-        body_lines.append("")
-        body_lines.append(f"cc {' '.join(MOD_ESCALATION_CCS)}")
+        if cfg["escalation_ccs"]:
+            body_lines.append("")
+            body_lines.append(f"cc {' '.join(cfg['escalation_ccs'])}")
         return await mod_ch.send("\n".join(body_lines))
     except Exception as e:
         print(f"  [mod-escalate] post failed: {e}", flush=True)
@@ -757,8 +797,13 @@ async def _action_redirect_to_jobs(client_ref, suspect_message, verdict):
         author_id = getattr(suspect_message.author, "id", None)
         if author_id is None:
             return deleted_ok, None
+        guild_id = _guild_id_of(suspect_message)
+        jobs_ch = _load_mod_server_config(guild_id)["redirect_channel_jobs"]
+        if jobs_ch is None:
+            print(f"  [mod-action] no redirect_channel_jobs configured for guild {guild_id}; skipping redirect post", flush=True)
+            return deleted_ok, None
         body = (
-            f"<@{author_id}> Looking-for-work posts belong in <#{MOD_JOBS_CHANNEL_ID}> — "
+            f"<@{author_id}> Looking-for-work posts belong in <#{jobs_ch}> — "
             f"please re-post there. (Automated reminder.)"
         )
         redirect_msg = await suspect_message.channel.send(body)

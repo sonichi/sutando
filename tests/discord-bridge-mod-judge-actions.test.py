@@ -73,6 +73,25 @@ def load_bridge():
 bridge = load_bridge()
 
 
+# Per-guild mod config fixture: provide channels + cc list that the action
+# functions look up via `_load_mod_server_config(guild_id)`. Replaces real
+# access.json read so tests don't need a populated file.
+_TEST_ESCALATION_CHANNEL_ID = 1153753796321738863
+_TEST_JOBS_CHANNEL_ID = 1168719200605437952
+_TEST_ESCALATION_CCS = ("<@1022910063620390932>", "<@1025828152183885925>", "<@786410785197785088>")
+
+
+def _fake_server_config(guild_id):
+    return {
+        "escalation_channel": _TEST_ESCALATION_CHANNEL_ID,
+        "escalation_ccs": _TEST_ESCALATION_CCS,
+        "redirect_channel_jobs": _TEST_JOBS_CHANNEL_ID,
+    }
+
+
+bridge._load_mod_server_config = _fake_server_config
+
+
 # ---------------------------------------------------------------------------
 # Mock helpers
 # ---------------------------------------------------------------------------
@@ -109,9 +128,9 @@ class _MockMessage:
 
 
 def _client_with_mod_channel(mock_mod_ch):
-    """Return a client mock where get_channel(MOD_ESCALATION_CHANNEL_ID) returns mock_mod_ch."""
+    """Return a client mock where get_channel(_TEST_ESCALATION_CHANNEL_ID) returns mock_mod_ch."""
     def get_channel(cid):
-        if cid == bridge.MOD_ESCALATION_CHANNEL_ID:
+        if cid == _TEST_ESCALATION_CHANNEL_ID:
             return mock_mod_ch
         return None
     return types.SimpleNamespace(get_channel=get_channel)
@@ -222,7 +241,7 @@ def case_action_redirect_to_jobs_happy() -> list[str]:
         fails.append("f) redirect should be posted in same channel")
         return fails
     redirect_text = src_ch.sent[0]
-    if f"<#{bridge.MOD_JOBS_CHANNEL_ID}>" not in redirect_text:
+    if f"<#{_TEST_JOBS_CHANNEL_ID}>" not in redirect_text:
         fails.append("f) redirect should mention #jobs channel by id")
     if f"<@{msg.author.id}>" not in redirect_text:
         fails.append("f) redirect should @-mention the original author")
