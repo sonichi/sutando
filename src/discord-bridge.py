@@ -634,6 +634,139 @@ async def _run_codex_subprocess(prompt, model, timeout_s):
         return ""
 
 
+# ---------------------------------------------------------------------------
+# AG2 auto-mod LLM-judge — per-rule action dispatchers (PR3 of 4).
+# Per `notes/ag2-moderator-policy.md` §6.1. These are the async functions
+# that execute Discord operations (delete / post) when a verdict matches a
+# rule. They're parameterized so they can be unit-tested with mocked
+# discord.py message + channel objects (no real Discord API hits in tests).
+# Buffer + flush + on_message wiring + Rule 3/7 stateful detectors come in
+# the final PR4.
+
+# Snowflakes for the 3 mods to cc on every escalation post (per the locked
+# ruleset). For now hardcoded to AG2's mod set; per-guild override could
+# come later if Sutando ever runs in a second moderated server.
+MOD_ESCALATION_CCS = (
+    "<@1022910063620390932>",  # Chi (sonichi)
+    "<@1025828152183885925>",  # Qingyun Wu
+    "<@786410785197785088>",   # msze_
+)
+# Discord channel id for AG2's #moderator-only — escalation destination.
+MOD_ESCALATION_CHANNEL_ID = 1153753796321738863
+# Discord channel id for AG2's #jobs — Rule 4 redirect destination.
+MOD_JOBS_CHANNEL_ID = 1168719200605437952
+
+
+async def _post_mod_escalation(client_ref, suspect_message, rule_label, llm_rationale, extras_md=""):
+    """Shared escalation post template. Used by Rules 1/2/3-violates/5/6.
+
+    `client_ref` is the discord.Client (so we can resolve the mod channel
+    by id). `suspect_message` is the discord.Message that triggered. Posts
+    a structured msg to #moderator-only with cc-mentions of the 3 mods.
+    Returns the posted message object on success, None on failure.
+    """
+    try:
+        mod_ch = client_ref.get_channel(MOD_ESCALATION_CHANNEL_ID)
+        if mod_ch is None:
+            print(f"  [mod-escalate] {MOD_ESCALATION_CHANNEL_ID} not in client cache; skipping", flush=True)
+            return None
+        suspect_link = ""
+        try:
+            suspect_link = f" — [jump]({suspect_message.jump_url})" if hasattr(suspect_message, "jump_url") else ""
+        except Exception:
+            pass
+        author = getattr(suspect_message.author, "display_name", None) or str(suspect_message.author)
+        ch_name = getattr(suspect_message.channel, "name", "?")
+        body_preview = (getattr(suspect_message, "content", None) or "")[:300]
+        body_lines = [
+            f"**Mod escalation — {rule_label}** (auto-judge)",
+            "",
+            f"From: **{author}** in `#{ch_name}`{suspect_link}",
+            "Suspect message preview:",
+            f"> {body_preview}" if body_preview else "> (no text content)",
+            "",
+            f"LLM rationale: {llm_rationale}",
+        ]
+        if extras_md:
+            body_lines.append("")
+            body_lines.append(extras_md.strip())
+        body_lines.append("")
+        body_lines.append(f"cc {' '.join(MOD_ESCALATION_CCS)}")
+        return await mod_ch.send("\n".join(body_lines))
+    except Exception as e:
+        print(f"  [mod-escalate] post failed: {e}", flush=True)
+        return None
+
+
+async def _action_delete_and_escalate(client_ref, suspect_message, verdict, extras_md=""):
+    """Rules 1, 2, 6 (and Rule 3 when duplicates violate server rules):
+    delete the offending message + post mod escalation. Returns
+    (deleted_ok: bool, escalation_msg or None)."""
+    deleted_ok = False
+    try:
+        await suspect_message.delete()
+        deleted_ok = True
+    except Exception as e:
+        print(f"  [mod-action] delete failed for {getattr(suspect_message,'id','?')}: {e}", flush=True)
+    rule_label = verdict.get("rule_match", "rule_?")
+    rationale = verdict.get("rationale", "")
+    esc = await _post_mod_escalation(client_ref, suspect_message, rule_label, rationale, extras_md)
+    return deleted_ok, esc
+
+
+async def _action_redirect_to_jobs(client_ref, suspect_message, verdict):
+    """Rule 4: delete the misplaced message + post a redirect with
+    @-mention in the same channel pointing to #jobs. No mod escalation
+    (legit user, just wrong channel). Returns (deleted_ok, redirect_msg)."""
+    deleted_ok = False
+    try:
+        await suspect_message.delete()
+        deleted_ok = True
+    except Exception as e:
+        print(f"  [mod-action] redirect-delete failed: {e}", flush=True)
+    redirect_msg = None
+    try:
+        author_id = getattr(suspect_message.author, "id", None)
+        if author_id is None:
+            return deleted_ok, None
+        body = (
+            f"<@{author_id}> Looking-for-work posts belong in <#{MOD_JOBS_CHANNEL_ID}> — "
+            f"please re-post there. (Automated reminder.)"
+        )
+        redirect_msg = await suspect_message.channel.send(body)
+    except Exception as e:
+        print(f"  [mod-action] redirect post failed: {e}", flush=True)
+    return deleted_ok, redirect_msg
+
+
+async def _action_escalate_only(client_ref, suspect_message, verdict, extras_md=""):
+    """Rule 5 (personal attack), Rule 3 non-violating duplicates, and any
+    G2-uncertain verdict: post to #moderator-only WITHOUT deleting the
+    suspect message. Mods decide. Returns the escalation message or None."""
+    rule_label = verdict.get("rule_match", "rule_?")
+    rationale = verdict.get("rationale", "")
+    return await _post_mod_escalation(client_ref, suspect_message, rule_label, rationale, extras_md)
+
+
+async def _action_polite_reminder(channel, channel_topic_hint=None):
+    """Rule 7: post one polite reminder when a 5-msg off-topic streak hits.
+    No @-mention (don't single anyone out). Returns the reminder message
+    or None on failure. Caller is responsible for cooldown bookkeeping
+    (only fire once per channel per cooldown window) — this function just
+    posts."""
+    try:
+        topic = channel_topic_hint or "#" + getattr(channel, "name", "this channel")
+        body = (
+            f"Hey folks 👋 — looks like the chat's drifting from the {topic} focus. "
+            f"No worries, but if you want to keep going, a more general channel might be a great spot. "
+            f"Carry on if it's still relevant!"
+        )
+        return await channel.send(body)
+    except Exception as e:
+        print(f"  [mod-action] polite reminder post failed: {e}", flush=True)
+        return None
+
+
 # Track pending replies: task_id -> channel
 pending_replies = {}
 
