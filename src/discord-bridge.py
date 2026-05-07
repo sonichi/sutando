@@ -900,6 +900,109 @@ class _OffTopicStreakTracker:
         self._streaks[str(channel_id)] = []
 
 
+# ---------------------------------------------------------------------------
+# AG2 auto-mod LLM-judge — verdict dispatcher (PR5 of 6).
+# Takes a batch of LLM verdicts + the source messages, routes each to the
+# right action (delete/escalate/redirect/polite-reminder) per the rule
+# match. Buffer + on_message integration ship in PR6.
+
+# Per-rule action routing. Rule 3 is special-cased (handled at on_message
+# time by _DupeTracker before the judge runs); the dispatcher handles
+# verdicts on Rule 3-flagged messages by either delete-and-escalate (if
+# the LLM judges them as also violating server rules) or escalate-only.
+RULE_TO_ACTION = {
+    "rule_1": "delete_and_escalate",  # crypto-job spam
+    "rule_2": "delete_and_escalate",  # CSAM-bait spam
+    "rule_3": "rule_3_conditional",   # routed via verdict.violates_server_rules
+    "rule_4": "redirect_to_jobs",     # job-availability misplaced
+    "rule_5": "escalate_only",        # personal attack
+    "rule_6": "delete_and_escalate",  # bare invite link
+    "rule_7": "rule_7_streak",        # off-topic streak (handled separately)
+}
+
+
+async def _dispatch_verdicts(verdicts, messages_by_id, client_ref, off_topic_tracker=None):
+    """Process a batch of verdicts. For each verdict:
+      - Look up the corresponding source message by msg_id.
+      - Apply G2: if confidence below per-rule threshold, escalate-only.
+      - Otherwise route to the action keyed in RULE_TO_ACTION.
+      - For rule_7, feed the off_topic signal into the streak tracker;
+        fire a polite reminder if the streak triggers.
+
+    `messages_by_id`: dict of {msg_id_str: discord.Message}. Caller assembles
+    this from the buffer at flush time.
+    `off_topic_tracker`: optional `_OffTopicStreakTracker`. If provided,
+    Rule 7 verdicts feed into it.
+
+    Returns a summary dict for logging:
+      {"acted": <count>, "escalated_only": <count>, "skipped": <count>}.
+    """
+    summary = {"acted": 0, "escalated_only": 0, "skipped": 0}
+    for v in verdicts:
+        msg_id = str(v.get("msg_id", ""))
+        msg = messages_by_id.get(msg_id)
+        if msg is None:
+            summary["skipped"] += 1
+            continue
+        rule_match = v.get("rule_match")
+        if not rule_match:
+            # Clean message — no action. But for Rule 7, we still record
+            # the on-topic verdict (off_topic=False) into the streak tracker.
+            if off_topic_tracker is not None:
+                channel_id = getattr(msg.channel, "id", None)
+                user_id = getattr(msg.author, "id", None)
+                is_mod = bool(getattr(v, "_is_mod", False))  # caller can flag
+                if channel_id is not None and user_id is not None:
+                    import time as _t
+                    off_topic_tracker.record(channel_id, user_id, off_topic=False, is_mod=is_mod, now_s=_t.time())
+            summary["skipped"] += 1
+            continue
+        # Rule 7 path: judge says message is off-topic; feed into streak
+        # tracker. Action only if the streak fires (handled separately —
+        # caller pulls trigger from the tracker's record() return value
+        # during on_message dispatch). Here we just no-op (action ran or
+        # didn't already).
+        if rule_match == "rule_7":
+            summary["skipped"] += 1
+            continue
+        # G2 confidence gate. Below threshold → escalate-only fallback.
+        if not _should_auto_action(v):
+            await _action_escalate_only(client_ref, msg, v,
+                                          extras_md="(G2: LLM confidence below threshold)")
+            summary["escalated_only"] += 1
+            continue
+        # Above-threshold action routing
+        action = RULE_TO_ACTION.get(rule_match, "escalate_only")
+        if action == "delete_and_escalate":
+            await _action_delete_and_escalate(client_ref, msg, v)
+            summary["acted"] += 1
+        elif action == "redirect_to_jobs":
+            await _action_redirect_to_jobs(client_ref, msg, v)
+            summary["acted"] += 1
+        elif action == "escalate_only":
+            await _action_escalate_only(client_ref, msg, v)
+            summary["escalated_only"] += 1
+        elif action == "rule_3_conditional":
+            # Rule 3: LLM also judged whether duplicates violate server
+            # rules. The verdict's `violates_server_rules` field (if set)
+            # disambiguates. If True or unset (default to caution), delete.
+            # Otherwise escalate-only (legit cross-post).
+            if v.get("violates_server_rules", True):
+                await _action_delete_and_escalate(client_ref, msg, v,
+                                                    extras_md="(Rule 3: cross-channel duplicate violates server rules)")
+                summary["acted"] += 1
+            else:
+                await _action_escalate_only(client_ref, msg, v,
+                                              extras_md="(Rule 3: cross-channel duplicate, NOT violating server rules — for human review)")
+                summary["escalated_only"] += 1
+        else:
+            # Unknown rule label → escalate-only as safe default.
+            await _action_escalate_only(client_ref, msg, v,
+                                          extras_md=f"(unknown rule_match={rule_match!r})")
+            summary["escalated_only"] += 1
+    return summary
+
+
 # Track pending replies: task_id -> channel
 pending_replies = {}
 
