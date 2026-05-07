@@ -77,6 +77,51 @@ const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes default
 type PendingTask = { submittedAt: number; timeoutMs: number; dmOnTimeout: boolean };
 const _pendingTasks = new Map<string, PendingTask>();
 
+// Submit-side dedup map — issue #561. Keyed by taskId, value is the
+// normalized task text. Used by workTool to detect "same task already in
+// flight" and return the existing taskId rather than spawning a parallel
+// duplicate. Cleared on every _pendingTasks.delete site below so a task
+// text legitimately re-submitted after its first attempt finishes (or
+// times out) is treated as fresh work.
+const _pendingTaskTexts = new Map<string, string>();
+
+/** Normalize task text for dedup comparison: lowercase, collapse runs of
+ *  whitespace to single space, trim, and cap at the first 150 chars.
+ *  Cap is intentional — voice users phrasing the same intent two slightly-
+ *  different ways ("summarize the call" vs "summarize that call I just
+ *  had") tend to differ in suffix, not prefix; a normalized prefix match
+ *  catches the common dedup case while staying conservative on near-
+ *  duplicates that are actually different work. */
+export function _normalizeTaskTextForDedup(s: string): string {
+	return s.toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 150);
+}
+
+/** Check whether a normalized text matches any currently-pending task that
+ *  has not yet timed out. Returns the matching taskId or null. Exported for
+ *  testability — the dedup decision in workTool is a one-liner that calls
+ *  this. */
+export function _findActivePendingByText(normalized: string, now: number = Date.now()): string | null {
+	for (const [existingTaskId, existingNormalized] of _pendingTaskTexts) {
+		if (existingNormalized !== normalized) continue;
+		const pending = _pendingTasks.get(existingTaskId);
+		if (!pending) continue;
+		// timeoutMs === 0 means "no timeout" — always considered active until
+		// the result watcher cleans it up. Otherwise, only dedup against
+		// non-timed-out submissions.
+		if (pending.timeoutMs !== 0 && now - pending.submittedAt > pending.timeoutMs) continue;
+		return existingTaskId;
+	}
+	return null;
+}
+
+/** Test-only: clear both pending maps. Module state survives across tests
+ *  in the same process, so each describe block calls this in `before` /
+ *  `afterEach`. */
+export function _resetPendingForTests(): void {
+	_pendingTasks.clear();
+	_pendingTaskTexts.clear();
+}
+
 /** True if the task file (in tasks/, tasks/processed/, or tasks/archive/)
  * is voice-originated (channel_id: local-voice). Used by the result watcher
  * to decide whether to forward an unsent result to Discord DM when voice is
@@ -187,6 +232,22 @@ export const workTool: ToolDefinition = {
 			console.log(`${ts()} [TaskBridge] WARNING: watcher offline — task will be queued for next cron pass`);
 		}
 
+		// Submit-side dedup (issue #561). Voice users repeating "the same
+		// thing" — usually because the previous submission is taking too
+		// long — used to spawn a parallel duplicate that doubled work and
+		// produced two spoken results. Now: if a same-text task is already
+		// pending and not timed out, return the existing taskId.
+		const normalizedText = _normalizeTaskTextForDedup(task);
+		const existingTaskId = _findActivePendingByText(normalizedText);
+		if (existingTaskId !== null) {
+			console.log(`${ts()} [TaskBridge] Dedup: same-text task already pending as ${existingTaskId}; not spawning duplicate`);
+			return {
+				status: 'pending',
+				taskId: existingTaskId,
+				message: `Already working on this — task ${existingTaskId} is still in flight. The result will be spoken when ready. Tell the user you're already on it; do not re-confirm or re-acknowledge.`,
+			};
+		}
+
 		const taskId = `task-${Date.now()}`;
 		const timestamp = new Date().toISOString();
 		const ownerId = process.env.SUTANDO_DM_OWNER_ID || 'voice-local';
@@ -212,6 +273,7 @@ export const workTool: ToolDefinition = {
 		// default was producing unwanted DMs). Caller must explicitly pass
 		// dm_on_timeout: true on critical tasks where they want the fallback.
 		_pendingTasks.set(taskId, { submittedAt: Date.now(), timeoutMs, dmOnTimeout: dm_on_timeout === true });
+		_pendingTaskTexts.set(taskId, normalizedText);
 		// Record owner activity for status-aware-pivot in proactive loop
 		writeOwnerActivity('voice', task);
 		console.log(`${ts()} [TaskBridge] Task ${taskId}: ${task.slice(0, 100)}`);
@@ -435,6 +497,7 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 			if (timeoutMs === 0) continue;
 			if (Date.now() - submittedAt > timeoutMs) {
 				_pendingTasks.delete(taskId);
+				_pendingTaskTexts.delete(taskId);
 				// Read the task body (or a snippet of it) so the timeout message
 				// can identify which task timed out — the prior generic "[Task
 				// timed out]" string left no clue when multiple tasks were in
@@ -512,6 +575,7 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
 					_deliveredResults.add(file);
 					_pendingTasks.delete(taskId);
+					_pendingTaskTexts.delete(taskId);
 					try {
 						fetch('http://localhost:7843/task-done', {
 							method: 'POST',
@@ -540,6 +604,7 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 							console.log(`${ts()} [TaskBridge] Voice offline; forwarded ${taskId} result to Discord DM via ${proactivePath}`);
 							_deliveredResults.add(file);
 							_pendingTasks.delete(taskId);
+							_pendingTaskTexts.delete(taskId);
 							setTimeout(() => {
 								archiveFile(path, 'results', taskId);
 								const taskFile = join(TASK_DIR, `${taskId}.txt`);
@@ -557,6 +622,7 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
 					_deliveredResults.add(file);
 					_pendingTasks.delete(taskId);
+					_pendingTaskTexts.delete(taskId);
 					logConversation('core-agent', `[task:${taskId}] ${result.slice(0, LOG_LINE_MAX_CHARS)}`);
 					onResult(result);
 					// Notify agent-api directly, then delete file
