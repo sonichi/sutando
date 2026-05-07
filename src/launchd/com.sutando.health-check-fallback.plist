@@ -1,6 +1,18 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Sutando — health-check launchd job (template).
+  Sutando — health-check FALLBACK launchd job (template).
+
+  Role: OS-level safety net for "all of Sutando is dead." Sutando.app's
+  in-process Timer (PR #613) is the primary 30min health-check while the
+  menu-bar app is alive. This launchd job is the redundant supervisor
+  that keeps running even when Sutando.app exits / crashes / is signed
+  out, closing the circular-dependency gap (a stuck proactive loop also
+  stops Sutando.app's Timer from being the only check).
+
+  Cadence: every 5min. Higher than #613's 30min so the stuck-loop and
+  task-queue checks (which require 5–10min thresholds before warning)
+  fire promptly. Lower than the original 60s — those underlying
+  thresholds make sub-5min polling redundant.
 
   Installed by `bash src/install-health-check-launchd.sh` after the install
   script substitutes __REPO__, __PYTHON__, and __HOMEBREW_BIN__ with the
@@ -8,10 +20,10 @@
   expanded first.
 
   Behavior:
-    - Fires every 60s (StartInterval).
+    - Fires every 300s (StartInterval).
     - Runs `python3 src/health-check.py --emit-task --notify-on-fail --quiet`.
     - Surfaces failures as tasks/task-health-*.txt AND macOS notifications.
-    - ThrottleInterval=30 prevents crash-loop thrash.
+    - ThrottleInterval=60 prevents crash-loop thrash.
     - Exit-only job (KeepAlive omitted) — launchd waits StartInterval, fires
       again, no zombie process between runs.
     - All output goes to logs/health-check-launchd.log for postmortem.
@@ -19,7 +31,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.sutando.health-check</string>
+    <string>com.sutando.health-check-fallback</string>
 
     <key>ProgramArguments</key>
     <array>
@@ -34,13 +46,13 @@
     <string>__REPO__</string>
 
     <key>StartInterval</key>
-    <integer>60</integer>
+    <integer>300</integer>
 
     <key>RunAtLoad</key>
     <true/>
 
     <key>ThrottleInterval</key>
-    <integer>30</integer>
+    <integer>60</integer>
 
     <key>EnvironmentVariables</key>
     <dict>

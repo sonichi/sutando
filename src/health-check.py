@@ -955,9 +955,9 @@ def notify_for_failures(
     set hash, 1h cooldown, separate state file). Two surfaces are needed for
     robustness: emit-task only delivers if the agent is alive to read tasks/,
     osascript runs at OS level and surfaces even when every Sutando service
-    is dead. The launchd-supervised health-check (com.sutando.health-check)
-    relies on this property — it's the alert path that survives "all of
-    Sutando is down."
+    is dead. The launchd-supervised fallback health-check
+    (com.sutando.health-check-fallback) relies on this property — it's the
+    alert path that survives "all of Sutando is down."
 
     `notify_cmd` is the executable + args used to fire the notification;
     defaults to `osascript` driving `display notification`. Tests inject a
@@ -1030,9 +1030,9 @@ def main():
     if do_emit:
         emit_task_for_failures(checks)
     # Optional: macOS notification surface for the launchd-supervised path
-    # (com.sutando.health-check). Independent dedup state from emit-task —
-    # the two surfaces are deliberately decoupled so neither can suppress
-    # the other.
+    # (com.sutando.health-check-fallback). Independent dedup state from
+    # emit-task — the two surfaces are deliberately decoupled so neither
+    # can suppress the other.
     if do_notify:
         notify_for_failures(checks)
 

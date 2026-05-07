@@ -1,12 +1,19 @@
 #!/bin/bash
-# Install / uninstall the launchd-supervised health-check job.
+# Install / uninstall the launchd-supervised health-check FALLBACK job.
+#
+# Role: OS-level safety net for "all of Sutando is dead." Sutando.app's
+# in-process Timer (PR #613) is the primary 30min health-check while the
+# menu-bar app is alive. This job is the redundant supervisor that keeps
+# running even when Sutando.app exits / crashes / signs out — closing the
+# circular-dependency gap that motivated PR #616.
 #
 # What this does:
-#   - Renders src/launchd/com.sutando.health-check.plist with absolute paths
-#     and writes it to ~/Library/LaunchAgents/com.sutando.health-check.plist
+#   - Renders src/launchd/com.sutando.health-check-fallback.plist with
+#     absolute paths and writes it to
+#     ~/Library/LaunchAgents/com.sutando.health-check-fallback.plist
 #   - Loads it via `launchctl bootstrap gui/$UID` (the modern Sequoia idiom).
 #   - Result: macOS runs `python3 src/health-check.py --emit-task
-#     --notify-on-fail --quiet` every 60s, independent of any other Sutando
+#     --notify-on-fail --quiet` every 5min, independent of any other Sutando
 #     process. Failures surface as tasks (for the agent to act on) AND as
 #     macOS notifications (so the human sees them even if all of Sutando is
 #     dead).
@@ -32,7 +39,7 @@
 
 set -e
 
-LABEL="com.sutando.health-check"
+LABEL="com.sutando.health-check-fallback"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 TEMPLATE="$REPO/src/launchd/$LABEL.plist"
 DEST="$HOME/Library/LaunchAgents/$LABEL.plist"
@@ -105,7 +112,7 @@ case "$cmd" in
         launchctl bootstrap "$DOMAIN" "$DEST"
         echo "  Loaded via $SERVICE"
         echo
-        echo "Sutando — Health Check is now running every 60s."
+        echo "Sutando — Health Check (fallback) is now running every 5min."
         echo "  • Failures fire macOS notifications + write tasks/task-health-*.txt"
         echo "  • View status:  bash $0 --status"
         echo "  • Uninstall:    bash $0 --uninstall"
