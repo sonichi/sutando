@@ -999,36 +999,6 @@ def main():
                                      stderr=subprocess.STDOUT, start_new_session=True)
                     print(f"  {c['name']}: {'restarted (stale code)' if c['status'] == 'stale' else 'restarted'}")
 
-    # Email alert if critical issues found and --fix didn't resolve them
-    if issues and do_fix:
-        # Re-check after fix attempts
-        import time
-        time.sleep(2)
-        rechecks = run_all_checks()
-        remaining = [c for c in rechecks if c["status"] not in ("ok",)]
-        if remaining:
-            alert_lines = ["Sutando health check found issues that auto-fix couldn't resolve:", ""]
-            for c in remaining:
-                alert_lines.append(f"  - {c['name']}: {c['status']} ({c['detail']})")
-            alert_lines.append("")
-            alert_lines.append("Check manually or run: python3 src/health-check.py")
-            alert_body = "\\n".join(alert_lines)
-            try:
-                subject = "Sutando: health check alert"
-                script = (
-                    'tell application "Mail"\n'
-                    f'    set m to make new outgoing message with properties {{subject:"{subject}", content:"{alert_body}", visible:false}}\n'
-                    '    tell m\n'
-                    f'        make new to recipient at end of to recipients with properties {{address:"{os.environ.get("NOTIFICATION_EMAIL", "")}"}}\n'
-                    '    end tell\n'
-                    '    send m\n'
-                    'end tell'
-                )
-                subprocess.run(["osascript", "-e", script], capture_output=True, timeout=15)
-                print("Alert email sent.")
-            except Exception:
-                pass
-
     sys.exit(1 if issues else 0)
 
 
