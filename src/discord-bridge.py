@@ -381,6 +381,22 @@ def load_channel_allowed(channel_id):
         return None
     return cfg[1]
 
+def load_channel_auto_react(channel_id):
+    """Return list of emoji strings to auto-react with on each new message in this
+    channel, or empty list if not configured. Reactions land at gateway-event
+    speed (~hundreds of ms) while task-file processing happens downstream —
+    gives users an immediate visual ack that the bot saw their message.
+    The task handler removes the reaction when it posts a response."""
+    try:
+        data = json.loads(ACCESS_FILE.read_text())
+        cfg = data.get("groups", {}).get(str(channel_id))
+        if isinstance(cfg, dict):
+            val = cfg.get("auto_react", [])
+            return val if isinstance(val, list) else []
+        return []
+    except Exception:
+        return []
+
 # Track pending replies: task_id -> channel
 pending_replies = {}
 
@@ -811,6 +827,19 @@ async def _handle_discord_message(message, force=False):
             "===END SUTANDO SYSTEM INSTRUCTIONS===\n"
         ),
     }
+
+    # Auto-react BEFORE writing the task — gives the user an instant visual ack
+    # at gateway-event speed, while the rest of task processing (file write,
+    # watcher pickup, agent response craft) happens downstream. The task
+    # handler is expected to remove the reaction when it posts its reply.
+    # Configured per-channel via `auto_react: ["👀", ...]` in access.json.
+    # No-op if the channel has no `auto_react` config.
+    if not is_dm:
+        for react_emoji in load_channel_auto_react(message.channel.id):
+            try:
+                await message.add_reaction(react_emoji)
+            except Exception as e:
+                print(f"  [auto-react] {react_emoji} failed: {e}", flush=True)
 
     task_file.write_text(
         f"id: {task_id}\n"
