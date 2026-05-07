@@ -504,12 +504,22 @@ def _parse_judge_output(json_str):
         if rule_match is not None and not isinstance(rule_match, str):
             continue
         rationale = v.get("rationale") if isinstance(v.get("rationale"), str) else ""
-        out.append({
+        verdict = {
             "msg_id": str(msg_id),
             "rule_match": rule_match,
             "confidence": max(0.0, min(1.0, conf_f)),
             "rationale": rationale,
-        })
+        }
+        # Rule 3 carries an extra boolean: violates_server_rules. If the LLM
+        # returned it, preserve it so the dispatcher can branch on legit
+        # cross-post (false) vs spam (true). Default missing → True (act
+        # conservatively: treat as violation when LLM didn't say otherwise).
+        if "violates_server_rules" in v:
+            try:
+                verdict["violates_server_rules"] = bool(v.get("violates_server_rules"))
+            except Exception:
+                pass
+        out.append(verdict)
     return out
 
 
@@ -718,6 +728,22 @@ def _guild_id_of(message):
         return None
 
 
+def _sanitize_for_quote(text):
+    """Neutralize mention-shaped substrings so quoting them in the mod
+    channel doesn't ping anyone. Inserts a zero-width space after each `@`
+    so Discord's parser no longer matches `@everyone`, `<@id>`, `<@&id>`,
+    etc. Also collapses `>` so the embedded line doesn't break the outer
+    blockquote. Reads visually identical to the original."""
+    if not isinstance(text, str):
+        return ""
+    # ZWSP = U+200B; invisible but breaks mention/everyone parsing
+    return (
+        text
+        .replace("@", "@\u200b")
+        .replace("\n>", "\n>\u200b")  # avoid nested blockquote issues inside our `> ` line
+    )
+
+
 async def _post_mod_escalation(client_ref, suspect_message, rule_label, llm_rationale, extras_md=""):
     """Shared escalation post template. Used by Rules 1/2/3-violates/5/6.
 
@@ -744,7 +770,13 @@ async def _post_mod_escalation(client_ref, suspect_message, rule_label, llm_rati
             pass
         author = getattr(suspect_message.author, "display_name", None) or str(suspect_message.author)
         ch_name = getattr(suspect_message.channel, "name", "?")
-        body_preview = (getattr(suspect_message, "content", None) or "")[:300]
+        # Sanitize the suspect message preview to prevent mention-injection:
+        # a malicious message containing @everyone / <@user> / <@&role> would
+        # otherwise emit real pings when we replay it in the mod channel. We
+        # neutralize by inserting a zero-width space after the @ — the mention
+        # is no longer parsed by Discord, but reads identically.
+        raw_content = (getattr(suspect_message, "content", None) or "")[:300]
+        body_preview = _sanitize_for_quote(raw_content)
         body_lines = [
             f"**Mod escalation — {rule_label}** (auto-judge)",
             "",
@@ -760,7 +792,19 @@ async def _post_mod_escalation(client_ref, suspect_message, rule_label, llm_rati
         if cfg["escalation_ccs"]:
             body_lines.append("")
             body_lines.append(f"cc {' '.join(cfg['escalation_ccs'])}")
-        return await mod_ch.send("\n".join(body_lines))
+        # Belt + suspenders: also use Discord's allowed_mentions to whitelist
+        # ONLY the explicit cc user-ids; suppress @everyone/@here/@role and
+        # any user mentions not in the cc list.
+        try:
+            cc_ids = [int(s.strip("<@>")) for s in cfg["escalation_ccs"] if s.startswith("<@") and s.endswith(">")]
+        except Exception:
+            cc_ids = []
+        try:
+            am = discord.AllowedMentions(everyone=False, roles=False, users=cc_ids)
+            return await mod_ch.send("\n".join(body_lines), allowed_mentions=am)
+        except Exception:
+            # Fallback if discord.AllowedMentions is unavailable in stub/test env
+            return await mod_ch.send("\n".join(body_lines))
     except Exception as e:
         print(f"  [mod-escalate] post failed: {e}", flush=True)
         return None
@@ -1030,13 +1074,31 @@ async def _dispatch_verdicts(verdicts, messages_by_id, client_ref, off_topic_tra
                     off_topic_tracker.record(channel_id, user_id, off_topic=False, is_mod=is_mod, now_s=_t.time())
             summary["skipped"] += 1
             continue
-        # Rule 7 path: judge says message is off-topic; feed into streak
-        # tracker. Action only if the streak fires (handled separately —
-        # caller pulls trigger from the tracker's record() return value
-        # during on_message dispatch). Here we just no-op (action ran or
-        # didn't already).
+        # Rule 7 path: judge says message is off-topic. Feed off_topic=True
+        # into the streak tracker; if the streak fires (5+ off-topic in
+        # cooldown window), post a polite reminder in the channel.
         if rule_match == "rule_7":
-            summary["skipped"] += 1
+            if off_topic_tracker is not None:
+                channel_id = getattr(msg.channel, "id", None)
+                user_id = getattr(msg.author, "id", None)
+                if channel_id is not None and user_id is not None:
+                    import time as _t
+                    fired = off_topic_tracker.record(
+                        channel_id, user_id, off_topic=True, is_mod=False, now_s=_t.time()
+                    )
+                    if fired:
+                        try:
+                            await _action_polite_reminder(msg.channel)
+                            summary["acted"] += 1
+                        except Exception as e:
+                            print(f"  [mod-action] rule_7 reminder failed: {e}", flush=True)
+                            summary["skipped"] += 1
+                    else:
+                        summary["skipped"] += 1
+                else:
+                    summary["skipped"] += 1
+            else:
+                summary["skipped"] += 1
             continue
         # G2 confidence gate. Below threshold → escalate-only fallback.
         if not _should_auto_action(v):
@@ -1154,14 +1216,41 @@ def _resolve_reply_parent_content(message):
 async def _flush_mod_buffer():
     """Drain the buffer, run codex batch judge, dispatch actions. Idempotent
     when buffer is empty. Caller (timer / threshold trigger) doesn't need
-    to coordinate — internal lock makes this safe to invoke concurrently."""
+    to coordinate — internal lock makes this safe to invoke concurrently.
+
+    Failure semantics: snapshot buffer WITHOUT clearing. Clear only after
+    successful dispatch. On codex/judge failure or empty-verdicts the
+    messages remain in the buffer for the next flush. Prevents silent
+    data loss when codex times out or returns malformed output."""
     lock = _ensure_mod_lock()
     async with lock:
         if not _mod_buffer:
             return
+        # Snapshot — do NOT clear yet. Clear only after successful dispatch.
         batch = _mod_buffer[:]
-        _mod_buffer.clear()
-    # Build the message list for codex judge prompt
+        batch_ids = {r["msg_id"] for r in batch}
+    # Feed bridge-side dupe-tracker; identify Rule 3 candidates to pass into prompt.
+    # `_DupeTracker.add()` returns a trigger list (channel_id, msg_id) when
+    # >= DUPE_CHANNEL_THRESHOLD distinct channels see the same content from
+    # the same user within DUPE_WINDOW_S. Collect those msg_ids.
+    rule3_ids = set()
+    try:
+        import time as _t
+        now_s = _t.time()
+        for r in batch:
+            ch_id = r.get("channel_id")
+            user_id = r.get("author_id")
+            if ch_id is None or user_id is None:
+                continue
+            trigger = _mod_dupe_tracker.add(
+                user_id=user_id, channel_id=ch_id, msg_id=r["msg_id"],
+                text=r["content"], now_s=now_s,
+            )
+            if trigger:
+                # All msg_ids in the trigger list are Rule 3 candidates
+                rule3_ids.update(m for (_c, m) in trigger)
+    except Exception as e:
+        print(f"  [mod-flush] dupe-tracker error (continuing without rule_3 context): {e}", flush=True)
     messages_for_judge = [
         {
             "msg_id": r["msg_id"],
@@ -1170,23 +1259,36 @@ async def _flush_mod_buffer():
             "content": r["content"],
             "is_reply": r["is_reply"],
             "parent_content": r["parent_content"],
+            "_rule3_candidate": r["msg_id"] in rule3_ids,
         }
         for r in batch
     ]
     messages_by_id = {r["msg_id"]: r["_msg"] for r in batch}
+    rules_context = ""
+    if rule3_ids:
+        rules_context = (
+            f"Rule 3 candidates (cross-channel duplicates detected by bridge in last 5min): "
+            f"{sorted(rule3_ids)}. For these set rule_match=rule_3 AND additionally include "
+            f"a boolean violates_server_rules: true|false in the verdict (true if the duplicates "
+            f"violate a general server rule, false if benign legit cross-post)."
+        )
     try:
-        verdicts = await _codex_judge_batch(messages_for_judge)
+        verdicts = await _codex_judge_batch(messages_for_judge, rules_context=rules_context)
     except Exception as e:
-        print(f"  [mod-flush] codex judge failed: {e}", flush=True)
+        print(f"  [mod-flush] codex judge failed: {e} — batch retained in buffer for retry", flush=True)
         return
     if not verdicts:
+        print(f"  [mod-flush] codex returned no verdicts — batch retained in buffer for retry", flush=True)
         return
+    # Dispatch — clear the judged messages from the buffer ONLY on dispatch success.
     try:
         summary = await _dispatch_verdicts(verdicts, messages_by_id, client_ref=client,
                                              off_topic_tracker=_mod_streak_tracker)
+        async with lock:
+            _mod_buffer[:] = [r for r in _mod_buffer if r["msg_id"] not in batch_ids]
         print(f"  [mod-flush] batch={len(batch)} verdicts={len(verdicts)} {summary}", flush=True)
     except Exception as e:
-        print(f"  [mod-flush] dispatch failed: {e}", flush=True)
+        print(f"  [mod-flush] dispatch failed: {e} — batch retained in buffer for retry", flush=True)
     # GC the dupe tracker periodically so it doesn't grow unbounded
     try:
         import time as _t
