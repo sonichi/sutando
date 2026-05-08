@@ -73,6 +73,16 @@ _discord_stub.Intents = _Intents
 _discord_stub.Client = _Client
 _discord_stub.AllowedMentions = _AllowedMentions
 _discord_stub.MessageType = types.SimpleNamespace(default=0, reply=1)
+# Discord exception types — bridge's sender-auth gate catches NotFound /
+# Forbidden / HTTPException explicitly for the fetch_member fallback path.
+class _DiscordException(Exception): pass
+class _HTTPException(_DiscordException): pass
+class _NotFound(_HTTPException): pass
+class _Forbidden(_HTTPException): pass
+_discord_stub.DiscordException = _DiscordException
+_discord_stub.HTTPException = _HTTPException
+_discord_stub.NotFound = _NotFound
+_discord_stub.Forbidden = _Forbidden
 # ChannelType — match the subset bridge whitelists for DM-origin escalation
 _discord_stub.ChannelType = types.SimpleNamespace(
     text="text",
@@ -123,15 +133,26 @@ class _MockChannel:
 
 
 class _MockGuild:
-    def __init__(self, gid, members=None):
+    def __init__(self, gid, members=None, fetch_raises=None):
         self.id = gid
         # members: dict of {user_id: _MockMember}; sender-auth gate looks up
-        # the sender via ch_guild.get_member(sender_id)
+        # the sender via ch_guild.get_member(sender_id) (cache hit) then
+        # falls back to ch_guild.fetch_member(...) (HTTP, can raise).
         self._members = members or {}
+        # fetch_raises: optional Exception instance to raise from fetch_member
+        # — used to test the NotFound / Forbidden / HTTPException paths.
+        self._fetch_raises = fetch_raises
     def get_member(self, user_id):
         return self._members.get(user_id)
     async def fetch_member(self, user_id):
-        return self._members.get(user_id)
+        if self._fetch_raises is not None:
+            raise self._fetch_raises
+        # discord.py's real fetch_member raises NotFound for non-members; the
+        # mock matches that behavior when fetch_raises is unset and member
+        # is missing.
+        if user_id not in self._members:
+            raise _NotFound("user not in guild")
+        return self._members[user_id]
 
 
 class _MockMember:
@@ -325,11 +346,17 @@ def case_n_dm_origin_sender_not_member_rejected():
     gate, NOT a sender-auth gate. A team-tier-trusted DM sender is "trusted
     by Sutando" but that doesn't extend to driving escalations into a guild
     they're not a member of. DM-origin gate 2: reject if sender is not a
-    member of the target guild."""
+    member of the target guild.
+
+    The mock's `fetch_member` raises `_NotFound` when sender is not in the
+    `members` dict (mirrors discord.py's actual behavior — it raises
+    `discord.NotFound`, NOT returns None). The bridge's gate must catch
+    that explicitly to take the silent NO-REPLY path."""
     fails = []
     sender_id = 999
     # Target guild has mod_active=True BUT sender is NOT a member
-    referenced_guild = _MockGuild(99, members={})  # empty members → sender not in
+    # _MockGuild.fetch_member will raise _NotFound (mirrors discord.NotFound)
+    referenced_guild = _MockGuild(99, members={})
     referenced_ch = _MockChannel(1307539994751139893, referenced_guild, ch_type="text")
     esc_ch = _MockChannel(1153753796321738863, referenced_guild, name="mod-only", ch_type="text")
     _install_mock_client({1307539994751139893: referenced_ch, 1153753796321738863: esc_ch})
@@ -341,7 +368,50 @@ def case_n_dm_origin_sender_not_member_rejected():
     if result is not True:
         fails.append(f"n) non-member sender should still return True (silent); got {result}")
     if esc_ch.sent:
-        fails.append("n) non-member sender should NOT trigger an escalation post")
+        fails.append("n) non-member sender should NOT trigger an escalation post (NotFound path)")
+    return fails
+
+
+def case_o_fetch_member_forbidden_silent():
+    """Per MacBook v3 review: `fetch_member` can raise `Forbidden` (bot
+    lacks permission to view members of that guild). Fail-closed: no post,
+    no public reply."""
+    fails = []
+    sender_id = 999
+    referenced_guild = _MockGuild(99, members={}, fetch_raises=_Forbidden("bot lacks Members intent"))
+    referenced_ch = _MockChannel(1307539994751139893, referenced_guild, ch_type="text")
+    esc_ch = _MockChannel(1153753796321738863, referenced_guild, name="mod-only", ch_type="text")
+    _install_mock_client({1307539994751139893: referenced_ch, 1153753796321738863: esc_ch})
+    bridge._load_mod_server_config = lambda gid: {"escalation_channel": 1153753796321738863, "escalation_ccs": (), "redirect_channel_jobs": None}
+    bridge._load_mod_config = lambda gid: (True, [])
+    dm_origin = _MockChannel(1501715985584099398, None)
+    msg = _MockMessage("m", dm_origin, guild=None, author_id=sender_id)
+    result = asyncio.run(bridge._silent_escalate_for_discord_state(msg, "look at <#1307539994751139893>"))
+    if result is not True:
+        fails.append(f"o) Forbidden should still return True (silent); got {result}")
+    if esc_ch.sent:
+        fails.append("o) Forbidden should NOT trigger an escalation post")
+    return fails
+
+
+def case_p_fetch_member_http_exception_silent():
+    """Per MacBook v3 review: `fetch_member` can raise generic
+    `HTTPException` (5xx, rate limit, etc.). Fail-closed."""
+    fails = []
+    sender_id = 999
+    referenced_guild = _MockGuild(99, members={}, fetch_raises=_HTTPException("503 transient"))
+    referenced_ch = _MockChannel(1307539994751139893, referenced_guild, ch_type="text")
+    esc_ch = _MockChannel(1153753796321738863, referenced_guild, name="mod-only", ch_type="text")
+    _install_mock_client({1307539994751139893: referenced_ch, 1153753796321738863: esc_ch})
+    bridge._load_mod_server_config = lambda gid: {"escalation_channel": 1153753796321738863, "escalation_ccs": (), "redirect_channel_jobs": None}
+    bridge._load_mod_config = lambda gid: (True, [])
+    dm_origin = _MockChannel(1501715985584099398, None)
+    msg = _MockMessage("m", dm_origin, guild=None, author_id=sender_id)
+    result = asyncio.run(bridge._silent_escalate_for_discord_state(msg, "look at <#1307539994751139893>"))
+    if result is not True:
+        fails.append(f"p) HTTPException should still return True (silent); got {result}")
+    if esc_ch.sent:
+        fails.append("p) HTTPException should NOT trigger an escalation post")
     return fails
 
 
@@ -382,6 +452,8 @@ def main():
         ("l-dm-origin-wrong-channel-type-rejected", case_l_dm_origin_referenced_channel_wrong_type),
         ("m-guild-origin-unaffected-by-dm-gates", case_m_guild_origin_unaffected_by_dm_gates),
         ("n-dm-origin-sender-not-member-rejected", case_n_dm_origin_sender_not_member_rejected),
+        ("o-fetch-member-forbidden-silent", case_o_fetch_member_forbidden_silent),
+        ("p-fetch-member-http-exception-silent", case_p_fetch_member_http_exception_silent),
     ]
     failures = []
     for label, fn in cases:

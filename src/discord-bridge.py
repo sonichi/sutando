@@ -866,16 +866,38 @@ async def _silent_escalate_for_discord_state(message, user_task_text):
             sender_id = getattr(message.author, "id", None) if hasattr(message, "author") else None
             if sender_id is None:
                 continue
+            sender_member = None
             try:
-                sender_member = ch_guild.get_member(sender_id) if hasattr(ch_guild, "get_member") else None
-                if sender_member is None and hasattr(ch_guild, "fetch_member"):
-                    try:
-                        sender_member = await ch_guild.fetch_member(sender_id)
-                    except Exception:
-                        sender_member = None
+                if hasattr(ch_guild, "get_member"):
+                    sender_member = ch_guild.get_member(sender_id)
             except Exception as e:
-                print(f"  [discord-state-escalate] failed to check sender {sender_id} membership in guild {ch_guild.id}: {e}", flush=True)
+                print(f"  [discord-state-escalate] get_member raised for sender {sender_id} in guild {ch_guild.id}: {e}", flush=True)
                 sender_member = None
+            # If cache miss, fall back to HTTP. Per discord.py docs:
+            #   `Guild.fetch_member()` raises `discord.NotFound` when the user
+            #   is NOT in the guild (NOT `None`); also `discord.Forbidden` if
+            #   the bot lacks permission, and `discord.HTTPException` for
+            #   transient errors. All three should silently fail-closed (no
+            #   routing). Per MacBook's #639 v3 follow-up review.
+            if sender_member is None and hasattr(ch_guild, "fetch_member"):
+                _NotFound = getattr(discord, "NotFound", None)
+                _Forbidden = getattr(discord, "Forbidden", None)
+                _HTTPException = getattr(discord, "HTTPException", None)
+                try:
+                    sender_member = await ch_guild.fetch_member(sender_id)
+                except Exception as e:
+                    if _NotFound is not None and isinstance(e, _NotFound):
+                        # Expected: user is not in this guild — the silent path
+                        sender_member = None
+                    elif _Forbidden is not None and isinstance(e, _Forbidden):
+                        print(f"  [discord-state-escalate] fetch_member forbidden for sender {sender_id} in guild {ch_guild.id}: {e}", flush=True)
+                        sender_member = None
+                    elif _HTTPException is not None and isinstance(e, _HTTPException):
+                        print(f"  [discord-state-escalate] fetch_member http error for sender {sender_id} in guild {ch_guild.id}: {e}", flush=True)
+                        sender_member = None
+                    else:
+                        print(f"  [discord-state-escalate] fetch_member unexpected error for sender {sender_id} in guild {ch_guild.id}: {e}", flush=True)
+                        sender_member = None
             if sender_member is None:
                 print(f"  [discord-state-escalate] sender {sender_id} not a member of guild {ch_guild.id}; not routing DM-referenced escalation", flush=True)
                 continue
