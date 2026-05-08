@@ -848,13 +848,36 @@ async def _silent_escalate_for_discord_state(message, user_task_text):
             ch_guild = getattr(ch, "guild", None)
             if ch_guild is None:
                 continue
-            # DM-origin gate: require explicit mod_active=True for routing
+            # DM-origin gate 1: require explicit mod_active=True for routing
+            # (the same opt-in signal #633's mod-judge uses).
             try:
                 guild_active, _roles = _load_mod_config(ch_guild.id)
             except Exception:
                 guild_active = False
             if not guild_active:
                 print(f"  [discord-state-escalate] guild {ch_guild.id} has mod_active=False; not routing DM-referenced escalation", flush=True)
+                continue
+            # DM-origin gate 2 (per MacBook #639 v2 follow-up review):
+            # `mod_active=True` is an opt-in gate, NOT a sender-auth gate.
+            # A team-tier-trusted DM sender is "trusted by Sutando" but that
+            # doesn't extend to routing escalations to ANOTHER guild they
+            # may not be a member of. Require the sender to be a member of
+            # the target guild before routing.
+            sender_id = getattr(message.author, "id", None) if hasattr(message, "author") else None
+            if sender_id is None:
+                continue
+            try:
+                sender_member = ch_guild.get_member(sender_id) if hasattr(ch_guild, "get_member") else None
+                if sender_member is None and hasattr(ch_guild, "fetch_member"):
+                    try:
+                        sender_member = await ch_guild.fetch_member(sender_id)
+                    except Exception:
+                        sender_member = None
+            except Exception as e:
+                print(f"  [discord-state-escalate] failed to check sender {sender_id} membership in guild {ch_guild.id}: {e}", flush=True)
+                sender_member = None
+            if sender_member is None:
+                print(f"  [discord-state-escalate] sender {sender_id} not a member of guild {ch_guild.id}; not routing DM-referenced escalation", flush=True)
                 continue
             target_guild_id = ch_guild.id
             break

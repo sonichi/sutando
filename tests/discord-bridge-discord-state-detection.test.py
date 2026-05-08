@@ -123,8 +123,21 @@ class _MockChannel:
 
 
 class _MockGuild:
-    def __init__(self, gid):
+    def __init__(self, gid, members=None):
         self.id = gid
+        # members: dict of {user_id: _MockMember}; sender-auth gate looks up
+        # the sender via ch_guild.get_member(sender_id)
+        self._members = members or {}
+    def get_member(self, user_id):
+        return self._members.get(user_id)
+    async def fetch_member(self, user_id):
+        return self._members.get(user_id)
+
+
+class _MockMember:
+    def __init__(self, user_id, roles=()):
+        self.id = user_id
+        self.roles = roles
 
 
 class _MockMessage:
@@ -217,13 +230,14 @@ def case_g_guild_origin_with_config():
 def case_h_dm_origin_resolves_via_referenced_channel():
     fails = []
     # DM origin (msg.guild is None), task references a guild text channel that's
-    # mod_active=True. Should resolve target guild + post.
-    referenced_guild = _MockGuild(99)
+    # mod_active=True AND sender is a member. Should resolve target guild + post.
+    sender_id = 999  # _MockMessage default author_id
+    referenced_guild = _MockGuild(99, members={sender_id: _MockMember(sender_id)})
     referenced_ch = _MockChannel(1307539994751139893, referenced_guild, ch_type="text")
     esc_ch = _MockChannel(1153753796321738863, referenced_guild, name="mod-only", ch_type="text")
     _install_mock_client({1307539994751139893: referenced_ch, 1153753796321738863: esc_ch})
     bridge._load_mod_server_config = lambda gid: ({"escalation_channel": 1153753796321738863, "escalation_ccs": (), "redirect_channel_jobs": None} if gid == 99 else {"escalation_channel": None, "escalation_ccs": (), "redirect_channel_jobs": None})
-    bridge._load_mod_config = lambda gid: ((True, []) if gid == 99 else (False, []))  # DM-origin gate: must be mod_active=True
+    bridge._load_mod_config = lambda gid: ((True, []) if gid == 99 else (False, []))  # DM-origin gate 1: must be mod_active=True
     dm_origin = _MockChannel(1501715985584099398, None)  # DM
     msg = _MockMessage("m", dm_origin, guild=None)
     result = asyncio.run(bridge._silent_escalate_for_discord_state(msg, "look at <#1307539994751139893>"))
@@ -265,12 +279,13 @@ def case_k_dm_origin_target_guild_not_mod_active():
     guild the bot is in and route their request to that guild's escalation
     channel — information leak vector. Gate enforcement must NOT post."""
     fails = []
-    referenced_guild = _MockGuild(99)
+    sender_id = 999
+    referenced_guild = _MockGuild(99, members={sender_id: _MockMember(sender_id)})
     referenced_ch = _MockChannel(1307539994751139893, referenced_guild, ch_type="text")
     esc_ch = _MockChannel(1153753796321738863, referenced_guild, name="mod-only", ch_type="text")
     _install_mock_client({1307539994751139893: referenced_ch, 1153753796321738863: esc_ch})
     bridge._load_mod_server_config = lambda gid: {"escalation_channel": 1153753796321738863, "escalation_ccs": (), "redirect_channel_jobs": None}
-    # mod_active=False for the target guild — gate should reject
+    # mod_active=False for the target guild — gate 1 should reject
     bridge._load_mod_config = lambda gid: (False, [])
     dm_origin = _MockChannel(1501715985584099398, None)
     msg = _MockMessage("m", dm_origin, guild=None)
@@ -287,7 +302,8 @@ def case_l_dm_origin_referenced_channel_wrong_type():
     channels (voice/category/etc.). Even if mod_active=True, a category or
     voice channel reference shouldn't drive routing."""
     fails = []
-    referenced_guild = _MockGuild(99)
+    sender_id = 999
+    referenced_guild = _MockGuild(99, members={sender_id: _MockMember(sender_id)})
     # Non-text channel type
     referenced_ch = _MockChannel(1307539994751139893, referenced_guild, ch_type="category")
     esc_ch = _MockChannel(1153753796321738863, referenced_guild, name="mod-only", ch_type="text")
@@ -301,6 +317,31 @@ def case_l_dm_origin_referenced_channel_wrong_type():
         fails.append(f"l) wrong-type referenced channel should still return True silently; got {result}")
     if esc_ch.sent:
         fails.append("l) wrong-type referenced channel should NOT post to escalation channel")
+    return fails
+
+
+def case_n_dm_origin_sender_not_member_rejected():
+    """Per MacBook #639 v2 follow-up review: `mod_active=True` is an opt-in
+    gate, NOT a sender-auth gate. A team-tier-trusted DM sender is "trusted
+    by Sutando" but that doesn't extend to driving escalations into a guild
+    they're not a member of. DM-origin gate 2: reject if sender is not a
+    member of the target guild."""
+    fails = []
+    sender_id = 999
+    # Target guild has mod_active=True BUT sender is NOT a member
+    referenced_guild = _MockGuild(99, members={})  # empty members → sender not in
+    referenced_ch = _MockChannel(1307539994751139893, referenced_guild, ch_type="text")
+    esc_ch = _MockChannel(1153753796321738863, referenced_guild, name="mod-only", ch_type="text")
+    _install_mock_client({1307539994751139893: referenced_ch, 1153753796321738863: esc_ch})
+    bridge._load_mod_server_config = lambda gid: {"escalation_channel": 1153753796321738863, "escalation_ccs": (), "redirect_channel_jobs": None}
+    bridge._load_mod_config = lambda gid: (True, [])  # passes gate 1, fails gate 2
+    dm_origin = _MockChannel(1501715985584099398, None)
+    msg = _MockMessage("m", dm_origin, guild=None, author_id=sender_id)
+    result = asyncio.run(bridge._silent_escalate_for_discord_state(msg, "look at <#1307539994751139893>"))
+    if result is not True:
+        fails.append(f"n) non-member sender should still return True (silent); got {result}")
+    if esc_ch.sent:
+        fails.append("n) non-member sender should NOT trigger an escalation post")
     return fails
 
 
@@ -340,6 +381,7 @@ def main():
         ("k-dm-origin-mod-active-false-rejected", case_k_dm_origin_target_guild_not_mod_active),
         ("l-dm-origin-wrong-channel-type-rejected", case_l_dm_origin_referenced_channel_wrong_type),
         ("m-guild-origin-unaffected-by-dm-gates", case_m_guild_origin_unaffected_by_dm_gates),
+        ("n-dm-origin-sender-not-member-rejected", case_n_dm_origin_sender_not_member_rejected),
     ]
     failures = []
     for label, fn in cases:
