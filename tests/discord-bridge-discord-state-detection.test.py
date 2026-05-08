@@ -415,6 +415,50 @@ def case_p_fetch_member_http_exception_silent():
     return fails
 
 
+def case_q_extract_user_id_mentions_excludes_roles():
+    """Per MacBook v4 line-level review: `<@&role_id>` strings would have
+    crashed cc_ids extraction with ValueError under the old
+    `s.startswith('<@')` check (the strip would yield `&123`, int() fails).
+    `_extract_user_id_mentions` must accept user mentions and skip role
+    mentions cleanly."""
+    fails = []
+    mixed = ["<@111>", "<@&222>", "<@333>", "garbage", "<@444>"]
+    result = bridge._extract_user_id_mentions(mixed)
+    expected = [111, 333, 444]
+    if result != expected:
+        fails.append(f"q1) expected user-only IDs {expected}, got {result}")
+    if bridge._extract_user_id_mentions(()) != []:
+        fails.append("q2) empty input should return []")
+    if bridge._extract_user_id_mentions(None) != []:
+        fails.append("q3) None input should return []")
+    if bridge._extract_user_id_mentions(["<@&100>", "<@&200>"]) != []:
+        fails.append("q4) role-only input should return []")
+    return fails
+
+
+def case_r_role_mention_in_escalation_ccs_does_not_crash():
+    """End-to-end: when access.json has a role mention in escalation_ccs,
+    the escalation post still goes through (role just doesn't appear in
+    `allowed_mentions.users`). Pre-fix this would ValueError + escalation-fail."""
+    fails = []
+    guild = _MockGuild(42)
+    origin_ch = _MockChannel(7777, guild)
+    msg = _MockMessage("m", origin_ch, guild=guild)
+    esc_ch = _MockChannel(9001, guild, name="mod-only")
+    _install_mock_client({9001: esc_ch})
+    bridge._load_mod_server_config = lambda gid: {
+        "escalation_channel": 9001,
+        "escalation_ccs": ("<@111>", "<@&999>", "<@222>"),
+        "redirect_channel_jobs": None,
+    }
+    result = asyncio.run(bridge._silent_escalate_for_discord_state(msg, "look at <#1234567890>"))
+    if result is not True:
+        fails.append(f"r) escalation with mixed cc list should still return True; got {result}")
+    if not esc_ch.sent:
+        fails.append("r) escalation should still post — role mentions must not crash the path")
+    return fails
+
+
 def case_m_guild_origin_unaffected_by_dm_gates():
     """Counter-case to k/l: when origin IS a guild channel, the DM-origin
     extra gates (mod_active check, channel-type validation) should NOT apply.
@@ -454,6 +498,8 @@ def main():
         ("n-dm-origin-sender-not-member-rejected", case_n_dm_origin_sender_not_member_rejected),
         ("o-fetch-member-forbidden-silent", case_o_fetch_member_forbidden_silent),
         ("p-fetch-member-http-exception-silent", case_p_fetch_member_http_exception_silent),
+        ("q-extract-user-id-mentions-excludes-roles", case_q_extract_user_id_mentions_excludes_roles),
+        ("r-role-mention-in-escalation-ccs-does-not-crash", case_r_role_mention_in_escalation_ccs_does_not_crash),
     ]
     failures = []
     for label, fn in cases:

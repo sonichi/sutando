@@ -76,6 +76,27 @@ _FENCE_LINE = re.compile(r"^\s{0,3}(`{3,}|~{3,})\s*([^\s`~][^`~]*)?\s*$")
 # string). Per msze_'s 2026-05-07 directive + Chi's "ship 1" call.
 _DISCORD_CHANNEL_REF_RE = re.compile(r"<#(\d+)>")
 
+# User-mention regex used by escalation cc_ids extraction. Critical: this
+# explicitly rejects role mentions `<@&id>` (the leading `&` after `<@`).
+# Earlier code did `s.strip("<@>")` after a startswith("<@") check, which
+# matched both shapes — role mentions then produced `&123` and `int(...)`
+# raised ValueError, killing the escalation post entirely. Per MacBook's
+# #639 v4 line-level review.
+_DISCORD_USER_MENTION_RE = re.compile(r"^<@(\d+)>$")
+
+
+def _extract_user_id_mentions(mention_strs):
+    """Parse `<@user_id>` strings from a sequence into int user_ids. Skips
+    role mentions `<@&role_id>` and any malformed entry. Used by escalation
+    paths that build a Discord `AllowedMentions(users=...)` list from
+    access.json's `escalation_cc_user_ids`."""
+    out = []
+    for s in mention_strs or ():
+        m = _DISCORD_USER_MENTION_RE.match(s)
+        if m:
+            out.append(int(m.group(1)))
+    return out
+
 
 def _is_fence_open_line(line: str):
     """Return the fence opener string if `line` is a real Markdown block-fence line.
@@ -944,7 +965,7 @@ async def _silent_escalate_for_discord_state(message, user_task_text):
     ]
     cc_ids = []
     if cfg.get("escalation_ccs"):
-        cc_ids = [int(s.strip("<@>")) for s in cfg["escalation_ccs"] if s.startswith("<@") and s.endswith(">")]
+        cc_ids = _extract_user_id_mentions(cfg["escalation_ccs"])
     am = discord.AllowedMentions(everyone=False, roles=False, users=cc_ids)
     try:
         await esc_ch.send("\n".join(body_lines), allowed_mentions=am)
@@ -1006,7 +1027,7 @@ async def _post_mod_escalation(client_ref, suspect_message, rule_label, llm_rati
         # ONLY the explicit cc user-ids; suppress @everyone/@here/@role and
         # any user mentions not in the cc list.
         try:
-            cc_ids = [int(s.strip("<@>")) for s in cfg["escalation_ccs"] if s.startswith("<@") and s.endswith(">")]
+            cc_ids = _extract_user_id_mentions(cfg["escalation_ccs"])
         except Exception:
             cc_ids = []
         try:
@@ -2158,8 +2179,15 @@ async def _handle_discord_message(message, force=False):
         try:
             already_escalated = await _silent_escalate_for_discord_state(message, user_task_text)
         except Exception as e:
-            print(f"  [discord-state-escalate] outer guard caught: {e}", flush=True)
-            already_escalated = False
+            # Per MacBook's #639 v4 review: fail-SILENT on unknown error in
+            # the escalate path. The previous fail-open default
+            # (already_escalated=False → run codex publicly) meant a broken
+            # escalation infra would leak the cold "Sandbox unavailable"
+            # string into public channels, which is exactly what msze_'s
+            # original directive said to avoid. Fail-silent matches the
+            # "don't surface internal errors publicly" intent.
+            print(f"  [discord-state-escalate] outer guard caught: {e}; fail-silent (NO-REPLY archive)", flush=True)
+            already_escalated = True
 
     # When the bridge has already silently escalated, the agent has nothing to
     # do — skip the task-file write entirely. Otherwise the task would land in
