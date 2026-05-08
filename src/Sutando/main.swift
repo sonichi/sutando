@@ -1541,9 +1541,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let homebrewPython = "/opt/homebrew/opt/python@3.11/libexec/bin/python3"
         let pythonPath = FileManager.default.fileExists(atPath: homebrewPython)
             ? homebrewPython : "/usr/bin/env"
+        // `--emit-task` writes tasks/task-health-{ts}.txt on failure (with
+        // built-in dedup: 1h cooldown per failure-set hash). The agent picks
+        // it up via the bridge as a regular owner task — gives the trio's
+        // surface_owner path a redundant peer in the file-bridge layer, so
+        // health failures the trio's coverage scanner suppresses by cooldown
+        // (or the LLM step archives by judgment) still reach the agent. Per
+        // Chi 2026-05-07 PT.
         let arguments: [String] = (pythonPath == "/usr/bin/env")
-            ? ["python3", scriptPath, "--fix"]
-            : [scriptPath, "--fix"]
+            ? ["python3", scriptPath, "--fix", "--emit-task"]
+            : [scriptPath, "--fix", "--emit-task"]
 
         DispatchQueue.global(qos: .background).async { [weak self] in
             guard let self = self else { return }
