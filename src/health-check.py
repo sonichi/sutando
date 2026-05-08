@@ -1025,16 +1025,18 @@ def main():
     checks = run_all_checks()
     issues = [c for c in checks if c["status"] not in ("ok", "warn")]
 
-    # Optional: emit a task for the CLI to act on. Runs before --json early-
-    # return so cron-driven --json --emit-task callers get both behaviors.
-    if do_emit:
-        emit_task_for_failures(checks)
     # Optional: macOS notification surface for the launchd-supervised path
-    # (com.sutando.health-check-fallback). Independent dedup state from
+    # (com.sutando.health-check-fallback). Notifies on the INITIAL check set
+    # — the launchd fallback wants the user-visible alert immediately, even
+    # if --fix would resolve some issues. Independent dedup state from
     # emit-task — the two surfaces are deliberately decoupled so neither
     # can suppress the other.
     if do_notify:
         notify_for_failures(checks)
+
+    # Note: emit-task is moved to AFTER the fix loop below, so it surfaces
+    # the RESIDUAL failure set (per PR #640 v2 review). Pre-fix surfacing
+    # creates owner tasks for failures fixed in the same invocation.
 
     if as_json:
         print(json.dumps({"checks": checks, "issues": len(issues), "total": len(checks)}, indent=2))
@@ -1166,6 +1168,20 @@ def main():
                                      stdout=open("/tmp/conversation-server.log", "a"),
                                      stderr=subprocess.STDOUT, start_new_session=True)
                     print(f"  {c['name']}: {'restarted (stale code)' if c['status'] == 'stale' else 'restarted'}")
+
+    # Emit task on the RESIDUAL failure set (per PR #640 v2 review).
+    # When --fix ran, re-run checks to capture post-fix state — restarts
+    # may have resolved some staleness in-place. When --fix did NOT run,
+    # the initial `checks` IS the residual.
+    if do_emit:
+        if do_fix and issues:
+            # Brief delay so restarts have a chance to register before re-check.
+            # 2s matches the fix-loop's per-service `time.sleep(1)` budget.
+            import time as _t; _t.sleep(2)
+            residual_checks = run_all_checks()
+        else:
+            residual_checks = checks
+        emit_task_for_failures(residual_checks)
 
     sys.exit(1 if issues else 0)
 
