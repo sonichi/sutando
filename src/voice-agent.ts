@@ -102,6 +102,7 @@ const CALL_RESULTS_DIR = join(new URL('.', import.meta.url).pathname, '..', 'res
 // Model configuration — override via .env for cost/quality tuning
 const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
 const VOICE_NATIVE_AUDIO_MODEL = process.env.VOICE_NATIVE_AUDIO_MODEL || 'gemini-3.1-flash-live-preview';
+const VOICE_NAME = process.env.VOICE_NAME || 'Puck';
 // Google Search grounding — MUST be false under gemini-3.1-flash-live-preview
 // native audio. Combining googleSearch: true + 3.1 native audio causes the
 // transport to reject setup with close code 1011 "exceeded your current
@@ -818,7 +819,7 @@ async function main() {
 		host: HOST,
 		model: google(VOICE_MODEL),
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
-		speechConfig: { voiceName: process.env.VOICE_NAME || 'Puck' },
+		speechConfig: { voiceName: VOICE_NAME },
 		inputAudioTranscription: true,
 		hooks: {
 			onSessionStart: (e) => {
@@ -1303,6 +1304,7 @@ async function main() {
 	console.log(`  Models:`);
 	console.log(`    Voice LLM:       ${VOICE_MODEL}`);
 	console.log(`    Native audio:    ${VOICE_NATIVE_AUDIO_MODEL}`);
+	console.log(`    Voice name:      ${VOICE_NAME}`);
 	console.log(`    STT:             native Gemini Live inputAudioTranscription`);
 	console.log(`    Cartesia TTS:    ${CARTESIA_API_KEY ? 'sonic-3' : 'disabled'}`);
 	console.log();
