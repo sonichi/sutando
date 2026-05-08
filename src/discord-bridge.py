@@ -814,18 +814,50 @@ async def _silent_escalate_for_discord_state(message, user_task_text):
     if msg_guild is not None:
         target_guild_id = msg_guild.id
     else:
-        # DM origin — try resolving the first referenced channel to its guild
+        # DM origin — try resolving the first referenced channel to its guild.
+        # Two extra gates here vs origin-guild path (per MacBook's #639 review):
+        #   (a) reject anything that isn't a guild text/thread channel — a fetch
+        #       success on a category/voice/etc. doesn't mean it's safe to use
+        #       for routing, and we want fail-closed on weird shapes.
+        #   (b) require the target guild to have `mod_active=True` (explicit
+        #       opt-in for moderation flow) — without this, an arbitrary user
+        #       DM'ing a `<#...>` reference for ANY guild the bot is in could
+        #       leak their request into that guild's escalation channel.
+        guild_text_types = {
+            getattr(discord, "ChannelType", None) and discord.ChannelType.text,
+            getattr(discord, "ChannelType", None) and discord.ChannelType.public_thread,
+            getattr(discord, "ChannelType", None) and discord.ChannelType.private_thread,
+            getattr(discord, "ChannelType", None) and discord.ChannelType.news_thread,
+            getattr(discord, "ChannelType", None) and discord.ChannelType.news,
+        }
+        guild_text_types.discard(None)
         for ref_ch_id in refs:
             try:
                 ch = client.get_channel(ref_ch_id)
                 if ch is None:
                     ch = await client.fetch_channel(ref_ch_id)
-                ch_guild = getattr(ch, "guild", None)
-                if ch_guild is not None:
-                    target_guild_id = ch_guild.id
-                    break
             except Exception as e:
                 print(f"  [discord-state-escalate] failed to resolve channel {ref_ch_id}: {e}", flush=True)
+                continue
+            if ch is None:
+                continue
+            ch_type = getattr(ch, "type", None)
+            if guild_text_types and ch_type is not None and ch_type not in guild_text_types:
+                print(f"  [discord-state-escalate] channel {ref_ch_id} type={ch_type} is not a guild text/thread channel; skipping", flush=True)
+                continue
+            ch_guild = getattr(ch, "guild", None)
+            if ch_guild is None:
+                continue
+            # DM-origin gate: require explicit mod_active=True for routing
+            try:
+                guild_active, _roles = _load_mod_config(ch_guild.id)
+            except Exception:
+                guild_active = False
+            if not guild_active:
+                print(f"  [discord-state-escalate] guild {ch_guild.id} has mod_active=False; not routing DM-referenced escalation", flush=True)
+                continue
+            target_guild_id = ch_guild.id
+            break
 
     if target_guild_id is None:
         print(f"  [discord-state-escalate] no target guild resolvable; staying silent (NO-REPLY)", flush=True)
@@ -2083,27 +2115,31 @@ async def _handle_discord_message(message, force=False):
         except Exception as e:
             print(f"  [discord-state-escalate] outer guard caught: {e}", flush=True)
             already_escalated = False
+
+    # When the bridge has already silently escalated, the agent has nothing to
+    # do — skip the task-file write entirely. Otherwise the task would land in
+    # `pending_replies` (line ~2080 below) but no `results/task-*.txt` would
+    # ever appear (the new `already_escalated` tier instruction is NO-REPLY),
+    # leaving the entry to age out via _recovery only. Skipping the write
+    # avoids the leak + avoids a spurious 👀 auto-react that signals "the bot
+    # is processing this." Per MacBook #639 review finding #2.
+    if already_escalated:
+        print(f"  [discord-state-escalate] silent escalation handled; no task file written for {username} in #{getattr(message.channel, 'name', '?')}", flush=True)
+        return
     # Absolute path for codex's `-o` flag. The team-tier command runs from
     # the bridge's cwd (the repo) so a relative `results/...` path would work,
     # but the other-tier command uses `-C /tmp` which would resolve a
     # relative `-o results/...` against `/tmp/results/` (does not exist) and
     # codex fails with `os error 2`. Reuse the module-level RESULTS_DIR so
     # both tier blocks are robust regardless of cwd.
+    # Note: the silent-escalate path (above) `return`s before this point when
+    # `already_escalated=True`, so the only valid keys consumed below are
+    # owner/team/other. (An earlier draft had an `already_escalated` tier
+    # instruction that told the agent to NO-REPLY archive, but that left the
+    # task in `pending_replies` until age-out — leak-prone per MacBook's #639
+    # review. Removed in favor of skipping the task-file write entirely.)
     tier_instructions = {
         "owner": "",
-        "already_escalated": (
-            "\n\n===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"
-            "This task references Discord-side state (channel mention or recent-message lookup) that the "
-            "codex sandbox cannot access. The bridge has already posted a silent notification to the "
-            "configured escalation channel where a moderator can review and respond directly.\n\n"
-            "ACTION: archive this task without sender reply. Do NOT write results/task-{id}.txt. Do NOT "
-            "invoke codex. Move tasks/task-{id}.txt to tasks/archive/.\n\n"
-            "Rationale: per msze_'s 2026-05-07 directive, Sutando should not surface internal-mechanism "
-            "errors (e.g. 'Sandbox unavailable; refusing non-owner task.') on public channels. When the "
-            "request asks for Discord-side state the bot can't see, the appropriate escalation has "
-            "already been routed to the moderators silently.\n"
-            "===END SUTANDO SYSTEM INSTRUCTIONS===\n"
-        ),
         "team": (
             "\n\n===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"
             "This task is from a TEAM tier sender. Choose ONE of three actions based on the content:\n\n"
@@ -2154,7 +2190,6 @@ async def _handle_discord_message(message, force=False):
             except Exception as e:
                 print(f"  [auto-react] {react_emoji} failed: {e}", flush=True)
 
-    instruction_key = "already_escalated" if already_escalated else access_tier
     task_file.write_text(
         f"id: {task_id}\n"
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S')}Z\n"
@@ -2163,7 +2198,7 @@ async def _handle_discord_message(message, force=False):
         f"channel_id: {message.channel.id}\n"
         f"user_id: {message.author.id}\n"
         f"access_tier: {access_tier}\n"
-        f"{tier_instructions.get(instruction_key, tier_instructions['other'])}"
+        f"{tier_instructions.get(access_tier, tier_instructions['other'])}"
     )
     pending_replies[task_id] = message.channel
     save_pending_replies()

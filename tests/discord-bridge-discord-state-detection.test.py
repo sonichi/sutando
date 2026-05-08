@@ -73,6 +73,17 @@ _discord_stub.Intents = _Intents
 _discord_stub.Client = _Client
 _discord_stub.AllowedMentions = _AllowedMentions
 _discord_stub.MessageType = types.SimpleNamespace(default=0, reply=1)
+# ChannelType — match the subset bridge whitelists for DM-origin escalation
+_discord_stub.ChannelType = types.SimpleNamespace(
+    text="text",
+    public_thread="public_thread",
+    private_thread="private_thread",
+    news_thread="news_thread",
+    news="news",
+    voice="voice",
+    category="category",
+    forum="forum",
+)
 _discord_stub.File = lambda *a, **kw: None
 _discord_stub.DMChannel = _DMChannel
 
@@ -101,10 +112,11 @@ bridge = load_bridge()
 # ---------------------------------------------------------------------------
 
 class _MockChannel:
-    def __init__(self, channel_id, guild=None, name="ch"):
+    def __init__(self, channel_id, guild=None, name="ch", ch_type="text"):
         self.id = channel_id
         self.guild = guild
         self.name = name
+        self.type = ch_type  # mirror discord.Channel.type — used by escalate's DM-origin gate
         self.sent = []
     async def send(self, content, allowed_mentions=None):
         self.sent.append({"content": content, "allowed_mentions": allowed_mentions})
@@ -204,12 +216,14 @@ def case_g_guild_origin_with_config():
 
 def case_h_dm_origin_resolves_via_referenced_channel():
     fails = []
-    # DM origin (msg.guild is None), but task references a channel that resolves to a guild
+    # DM origin (msg.guild is None), task references a guild text channel that's
+    # mod_active=True. Should resolve target guild + post.
     referenced_guild = _MockGuild(99)
-    referenced_ch = _MockChannel(1307539994751139893, referenced_guild)
-    esc_ch = _MockChannel(1153753796321738863, referenced_guild, name="mod-only")
+    referenced_ch = _MockChannel(1307539994751139893, referenced_guild, ch_type="text")
+    esc_ch = _MockChannel(1153753796321738863, referenced_guild, name="mod-only", ch_type="text")
     _install_mock_client({1307539994751139893: referenced_ch, 1153753796321738863: esc_ch})
     bridge._load_mod_server_config = lambda gid: ({"escalation_channel": 1153753796321738863, "escalation_ccs": (), "redirect_channel_jobs": None} if gid == 99 else {"escalation_channel": None, "escalation_ccs": (), "redirect_channel_jobs": None})
+    bridge._load_mod_config = lambda gid: ((True, []) if gid == 99 else (False, []))  # DM-origin gate: must be mod_active=True
     dm_origin = _MockChannel(1501715985584099398, None)  # DM
     msg = _MockMessage("m", dm_origin, guild=None)
     result = asyncio.run(bridge._silent_escalate_for_discord_state(msg, "look at <#1307539994751139893>"))
@@ -245,6 +259,72 @@ def case_j_no_target_guild_resolvable():
     return fails
 
 
+def case_k_dm_origin_target_guild_not_mod_active():
+    """Per MacBook #639 review #3: DM-origin path requires mod_active=True on
+    the target guild. Otherwise an arbitrary user could DM a `<#...>` for any
+    guild the bot is in and route their request to that guild's escalation
+    channel — information leak vector. Gate enforcement must NOT post."""
+    fails = []
+    referenced_guild = _MockGuild(99)
+    referenced_ch = _MockChannel(1307539994751139893, referenced_guild, ch_type="text")
+    esc_ch = _MockChannel(1153753796321738863, referenced_guild, name="mod-only", ch_type="text")
+    _install_mock_client({1307539994751139893: referenced_ch, 1153753796321738863: esc_ch})
+    bridge._load_mod_server_config = lambda gid: {"escalation_channel": 1153753796321738863, "escalation_ccs": (), "redirect_channel_jobs": None}
+    # mod_active=False for the target guild — gate should reject
+    bridge._load_mod_config = lambda gid: (False, [])
+    dm_origin = _MockChannel(1501715985584099398, None)
+    msg = _MockMessage("m", dm_origin, guild=None)
+    result = asyncio.run(bridge._silent_escalate_for_discord_state(msg, "look at <#1307539994751139893>"))
+    if result is not True:
+        fails.append(f"k) gate-rejected DM origin should still return True (silent); got {result}")
+    if esc_ch.sent:
+        fails.append("k) gate-rejected DM origin should NOT post to escalation channel")
+    return fails
+
+
+def case_l_dm_origin_referenced_channel_wrong_type():
+    """Per MacBook #639 review #3: DM-origin path must reject non-guild-text
+    channels (voice/category/etc.). Even if mod_active=True, a category or
+    voice channel reference shouldn't drive routing."""
+    fails = []
+    referenced_guild = _MockGuild(99)
+    # Non-text channel type
+    referenced_ch = _MockChannel(1307539994751139893, referenced_guild, ch_type="category")
+    esc_ch = _MockChannel(1153753796321738863, referenced_guild, name="mod-only", ch_type="text")
+    _install_mock_client({1307539994751139893: referenced_ch, 1153753796321738863: esc_ch})
+    bridge._load_mod_server_config = lambda gid: {"escalation_channel": 1153753796321738863, "escalation_ccs": (), "redirect_channel_jobs": None}
+    bridge._load_mod_config = lambda gid: (True, [])  # mod_active=True but channel type wrong
+    dm_origin = _MockChannel(1501715985584099398, None)
+    msg = _MockMessage("m", dm_origin, guild=None)
+    result = asyncio.run(bridge._silent_escalate_for_discord_state(msg, "look at <#1307539994751139893>"))
+    if result is not True:
+        fails.append(f"l) wrong-type referenced channel should still return True silently; got {result}")
+    if esc_ch.sent:
+        fails.append("l) wrong-type referenced channel should NOT post to escalation channel")
+    return fails
+
+
+def case_m_guild_origin_unaffected_by_dm_gates():
+    """Counter-case to k/l: when origin IS a guild channel, the DM-origin
+    extra gates (mod_active check, channel-type validation) should NOT apply.
+    Origin-guild path uses the message's own guild directly."""
+    fails = []
+    guild = _MockGuild(42)
+    origin_ch = _MockChannel(7777, guild, ch_type="text")
+    msg = _MockMessage("m", origin_ch, guild=guild)
+    esc_ch = _MockChannel(9001, guild, name="mod-only", ch_type="text")
+    _install_mock_client({9001: esc_ch})
+    bridge._load_mod_server_config = lambda gid: {"escalation_channel": 9001, "escalation_ccs": (), "redirect_channel_jobs": None}
+    # Even with mod_active=False, origin-guild path should still post
+    bridge._load_mod_config = lambda gid: (False, [])
+    result = asyncio.run(bridge._silent_escalate_for_discord_state(msg, "look at <#1234567890>"))
+    if result is not True:
+        fails.append(f"m) origin-guild should return True (got {result})")
+    if not esc_ch.sent:
+        fails.append("m) origin-guild path should post regardless of mod_active gate (DM-only gate)")
+    return fails
+
+
 def main():
     cases = [
         ("a-plain-text", case_a_plain_text),
@@ -257,6 +337,9 @@ def main():
         ("h-dm-origin-resolves-via-referenced-channel", case_h_dm_origin_resolves_via_referenced_channel),
         ("i-no-escalation-channel-returns-true-no-post", case_i_no_escalation_channel_returns_true_no_post),
         ("j-no-target-guild-resolvable", case_j_no_target_guild_resolvable),
+        ("k-dm-origin-mod-active-false-rejected", case_k_dm_origin_target_guild_not_mod_active),
+        ("l-dm-origin-wrong-channel-type-rejected", case_l_dm_origin_referenced_channel_wrong_type),
+        ("m-guild-origin-unaffected-by-dm-gates", case_m_guild_origin_unaffected_by_dm_gates),
     ]
     failures = []
     for label, fn in cases:
