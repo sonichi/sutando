@@ -800,6 +800,121 @@ def _extract_referenced_channels(text):
     return [int(m) for m in _DISCORD_CHANNEL_REF_RE.findall(text)]
 
 
+_PREFETCH_MAX_MESSAGES_PER_REF = 5
+_PREFETCH_EXCERPT_MAX = 280
+_PREFETCH_CACHE = {}  # (channel_id, bucket_60s) -> formatted block; in-process only
+_PREFETCH_CACHE_TTL_S = 60
+
+
+async def _fetch_discord_channel_messages(channel_id, n=_PREFETCH_MAX_MESSAGES_PER_REF):
+    """Fetch the last `n` messages from a Discord channel via the bot's REST
+    client. Returns a formatted text block (newest-first, with author + relative
+    timestamp + truncated content) or None on any failure (channel not found,
+    bot lacks permission, channel not text/thread, transient API error).
+
+    Returning None — not raising — is deliberate: the caller falls through to
+    silent-escalate if pre-fetch yields nothing usable.
+    """
+    cache_bucket = int(time.time() // _PREFETCH_CACHE_TTL_S)
+    cache_key = (int(channel_id), cache_bucket)
+    if cache_key in _PREFETCH_CACHE:
+        return _PREFETCH_CACHE[cache_key]
+    try:
+        ch = client.get_channel(int(channel_id))
+        if ch is None:
+            ch = await client.fetch_channel(int(channel_id))
+    except Exception as e:
+        print(f"  [discord-state-prefetch] resolve channel {channel_id} failed: {e}", flush=True)
+        return None
+    if ch is None:
+        return None
+    # Only fetch from text/thread channels — voice/category/etc. would either
+    # 404 on history() or yield nothing useful for the agent.
+    guild_text_types = {
+        getattr(discord, "ChannelType", None) and discord.ChannelType.text,
+        getattr(discord, "ChannelType", None) and discord.ChannelType.public_thread,
+        getattr(discord, "ChannelType", None) and discord.ChannelType.private_thread,
+        getattr(discord, "ChannelType", None) and discord.ChannelType.news_thread,
+        getattr(discord, "ChannelType", None) and discord.ChannelType.news,
+    }
+    guild_text_types.discard(None)
+    ch_type = getattr(ch, "type", None)
+    if guild_text_types and ch_type is not None and ch_type not in guild_text_types:
+        print(f"  [discord-state-prefetch] channel {channel_id} type={ch_type} not text/thread; skipping", flush=True)
+        return None
+    try:
+        msgs = []
+        async for m in ch.history(limit=n):
+            msgs.append(m)
+    except Exception as e:
+        # Forbidden / NotFound / HTTPException / unexpected — all silent-fail.
+        # The `_silent_escalate_for_discord_state` path is the safety net.
+        print(f"  [discord-state-prefetch] history({n}) on channel {channel_id} failed: {type(e).__name__}: {e}", flush=True)
+        return None
+    if not msgs:
+        # Channel exists + readable but empty — return empty marker so we don't
+        # re-fetch on every retry within the cache window. Caller treats as no
+        # useful prefetched content.
+        formatted = ""
+        _PREFETCH_CACHE[cache_key] = formatted
+        return formatted
+    lines = []
+    for m in msgs:  # history(limit=n) yields newest-first; preserve that order
+        author = getattr(getattr(m, "author", None), "name", "?")
+        ts = getattr(m, "created_at", None)
+        ts_str = ts.strftime("%Y-%m-%dT%H:%MZ") if ts is not None else "?"
+        content = (getattr(m, "content", "") or "")[:_PREFETCH_EXCERPT_MAX]
+        lines.append(f"  [{ts_str}] {author}: {content}")
+    formatted = "\n".join(lines)
+    _PREFETCH_CACHE[cache_key] = formatted
+    # Light-touch GC: if the cache grew past 200 entries, drop oldest buckets.
+    # Bridge restarts wipe state anyway; this just guards a long-running process.
+    if len(_PREFETCH_CACHE) > 200:
+        cutoff = cache_bucket - 5
+        for k in [kk for kk in _PREFETCH_CACHE if kk[1] < cutoff]:
+            del _PREFETCH_CACHE[k]
+    return formatted
+
+
+async def _prefetch_discord_state_refs(user_task_text):
+    """For every `<#channel_id>` reference in `user_task_text`, attempt to fetch
+    the channel's recent messages via the bot's REST client and produce a
+    prepended context block. Returns the enriched task body (context block +
+    `[Original task body:]` separator + original text) when at least one ref
+    fetched usefully. Returns None when there are no refs OR all fetches
+    failed (caller falls through to `_silent_escalate_for_discord_state`).
+
+    This is the proactive path (option 3 from Chi's 2026-05-08 strategy chat)
+    that lets the agent layer answer Discord-state questions WITHOUT codex
+    sandbox needing API access. Replaces the old "always silent-escalate on a
+    `<#...>` ref" behavior with a try-then-fall-through shape.
+    """
+    if not user_task_text:
+        return None
+    refs = _extract_referenced_channels(user_task_text)
+    if not refs:
+        return None
+    # Deduplicate while preserving order — sometimes the same ref appears
+    # twice in a task body (e.g. quoted reply + body).
+    seen = set()
+    ordered_refs = []
+    for r in refs:
+        if r in seen:
+            continue
+        seen.add(r)
+        ordered_refs.append(r)
+    blocks = []
+    for ref in ordered_refs:
+        formatted = await _fetch_discord_channel_messages(ref)
+        if not formatted:  # None (failed) or empty string (channel empty)
+            continue
+        blocks.append(f"[Channel <#{ref}> recent messages:\n{formatted}\n]")
+    if not blocks:
+        return None
+    enriched = "\n\n".join(blocks) + "\n\n[Original task body:]\n" + user_task_text
+    return enriched
+
+
 async def _silent_escalate_for_discord_state(message, user_task_text):
     """Detect tasks that reference Discord-side state (channel mentions like
     `<#1234>`) and silently escalate to the appropriate guild's
@@ -2177,27 +2292,47 @@ async def _handle_discord_message(message, force=False):
     Path(prompt_path).write_text(user_task_text)
     quoted_task = f'"$(cat {prompt_path})"'
 
-    # Pre-classify Discord-state-reference tasks (per msze_'s 2026-05-07
-    # directive + Chi's "ship 1" call). If the task body contains a
-    # channel-mention `<#1234>`, codex sandbox cannot read that channel's
-    # content; rather than letting the agent emit the cold "Sandbox
-    # unavailable" string publicly, the bridge silently escalates to the
-    # appropriate guild's escalation_channel and writes an "already_escalated"
-    # tier instruction telling the agent to NO-REPLY archive.
+    # Pre-classify Discord-state-reference tasks. Two-tier flow (per Chi's
+    # 2026-05-08 strategy chat — option 3 systemic fix):
+    #
+    # Tier 1 — pre-fetch (proactive). For team/other-tier tasks containing
+    # `<#channel_id>` references, attempt to fetch each referenced channel's
+    # recent messages via the bot's REST client and PREPEND them to the task
+    # body. The agent (codex sandbox or core) then has the data inline and
+    # can answer normally without needing API access mid-task.
+    #
+    # Tier 2 — silent-escalate (fallback). If pre-fetch yields nothing useful
+    # (channel not found, bot lacks permission, all fetches errored), fall
+    # through to `_silent_escalate_for_discord_state` — the existing PR #639
+    # path that silently routes to the guild's escalation_channel + writes
+    # an `already_escalated` NO-REPLY instruction.
+    #
+    # Order matters: the proactive path can ANSWER the user's question; the
+    # fallback path just declines silently. Try answering first.
     already_escalated = False
     if access_tier in ("team", "other"):
         try:
-            already_escalated = await _silent_escalate_for_discord_state(message, user_task_text)
+            enriched = await _prefetch_discord_state_refs(user_task_text)
         except Exception as e:
-            # Per MacBook's #639 v4 review: fail-SILENT on unknown error in
-            # the escalate path. The previous fail-open default
-            # (already_escalated=False → run codex publicly) meant a broken
-            # escalation infra would leak the cold "Sandbox unavailable"
-            # string into public channels, which is exactly what msze_'s
-            # original directive said to avoid. Fail-silent matches the
-            # "don't surface internal errors publicly" intent.
-            print(f"  [discord-state-escalate] outer guard caught: {e}; fail-silent (NO-REPLY archive)", flush=True)
-            already_escalated = True
+            print(f"  [discord-state-prefetch] outer guard caught: {e}; falling through to silent-escalate", flush=True)
+            enriched = None
+        if enriched:
+            print(f"  [discord-state-prefetch] enriched task body for {username} in #{getattr(message.channel, 'name', '?')}", flush=True)
+            user_task_text = enriched
+            quoted_task = shlex.quote(user_task_text)
+        else:
+            try:
+                already_escalated = await _silent_escalate_for_discord_state(message, user_task_text)
+            except Exception as e:
+                # Per MacBook's #639 v4 review: fail-SILENT on unknown error in
+                # the escalate path. The previous fail-open default
+                # (already_escalated=False → run codex publicly) meant a broken
+                # escalation infra would leak the cold "Sandbox unavailable"
+                # string into public channels, which is exactly what msze_'s
+                # original directive said to avoid. Fail-silent matches the
+                # "don't surface internal errors publicly" intent.
+                print(f"  [discord-state-escalate] outer guard caught: {e}; fail-silent (NO-REPLY archive)", flush=True)
+                already_escalated = True
 
     # When the bridge has already silently escalated, the agent has nothing to
     # do — skip the task-file write entirely. Otherwise the task would land in
