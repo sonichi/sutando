@@ -239,6 +239,71 @@ def render_support_frame(hero_path: Path, caption: str, out_path: Path,
     out.save(out_path, "PNG")
 
 
+def render_video_overlay(caption: str, out_path: Path, badge: str = ""):
+    """Transparent-bg PNG used as overlay on a video clip. Contains the bottom
+    caption strip + optional top-left name-chip — same layout as the still
+    support frame, but background pixels are 0-alpha so the source video shows
+    through everywhere else.
+
+    Used when a manifest support entry has `is_video: true` (Lucy v1.7
+    integration: Pentagon UAP sensor clip plays as full-frame video instead of
+    a Ken-Burns still).
+    """
+    from PIL import Image, ImageDraw
+    overlay = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    strip_h = 180
+    draw.rectangle([(0, CANVAS_H - strip_h), (CANVAS_W, CANVAS_H)], fill=CAPTION_BG)
+
+    cap_font = get_font(34)
+    lines = wrap_text(caption.strip(), 60)[:3]
+    y = CANVAS_H - strip_h + 22
+    for line in lines:
+        draw.text((40, y), line, fill=TEXT, font=cap_font)
+        y += 48
+
+    if badge:
+        badge_text = badge.upper()
+        badge_font = get_font(28)
+        bbb = draw.textbbox((0, 0), badge_text, font=badge_font)
+        bw, bh = bbb[2] - bbb[0], bbb[3] - bbb[1]
+        pad_x, pad_y = 18, 12
+        chip_w = bw + pad_x * 2
+        chip_h = bh + pad_y * 2 + 6
+        draw.rectangle([(40, 40), (40 + chip_w, 40 + chip_h)], fill=ACCENT)
+        draw.text((40 + pad_x, 40 + pad_y), badge_text, fill=TEXT, font=badge_font)
+
+    overlay.save(out_path, "PNG")
+
+
+def video_clip(video_source: Path, overlay_png: Path, duration_s: float,
+               clip_idx: int, out_path: Path):
+    """Clip a source video to `duration_s` and composite the caption/badge
+    overlay PNG over it. Output is silent h264 (audio overlaid on final concat).
+
+    Source video is scaled to 1280×720 cover-style; overlay PNG is full canvas
+    transparent except for caption strip + badge regions.
+    """
+    vf = (
+        "[0:v]scale=1280:720:force_original_aspect_ratio=increase,"
+        "crop=1280:720,setsar=1[v];"
+        "[v][1:v]overlay=0:0[out]"
+    )
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(video_source),
+        "-i", str(overlay_png),
+        "-filter_complex", vf,
+        "-map", "[out]",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", str(FPS),
+        "-t", f"{duration_s:.3f}",
+        "-an",
+        str(out_path),
+    ]
+    subprocess.run(cmd, check=True)
+
+
 def render_closer_frame(text: str, hero_path: Optional[Path], out_path: Path):
     """Hero image (lightly dimmed) + share-shape closing line, centered, large."""
     from PIL import Image, ImageDraw
@@ -512,6 +577,7 @@ def main():
     # which under-allocates frames whose text is longer than average).
     durations = []  # placeholders, filled after TTS via word-share
     frame_words = []  # parallel: word count of each frame's narration
+    video_source = []  # parallel: Path(mp4) if frame is video-sourced, else None
     frame_idx = 0
 
     if sections.get("HOOK"):
@@ -519,6 +585,7 @@ def main():
         render_hook_frame(sections["HOOK"], hook_path, frames_dir / f"frame_{frame_idx:03d}.png")
         durations.append(0.0)
         frame_words.append(len(sections["HOOK"].split()))
+        video_source.append(None)
         frame_idx += 1
 
     support_text = sections.get("SUPPORT", "")
@@ -527,12 +594,21 @@ def main():
 
     for i, fact in enumerate(support_facts):
         sup_asset, sup_entry = asset_for("support", i)
-        if sup_asset:
+        is_video = bool(sup_entry and sup_entry.get("is_video"))
+        if is_video and sup_asset:
+            # Video-sourced support: render only the transparent caption/badge
+            # overlay PNG; full clip is built from the source video at clip-gen time.
+            badge = sup_entry.get("badge", "")
+            render_video_overlay(fact, frames_dir / f"frame_{frame_idx:03d}.png", badge=badge)
+            video_source.append(sup_asset)
+        elif sup_asset:
             badge = (sup_entry.get("badge", "") if sup_entry else "")
             render_support_frame(sup_asset, fact, frames_dir / f"frame_{frame_idx:03d}.png",
                                   crop_seed=i, badge=badge)
+            video_source.append(None)
         else:
             render_closer_frame(fact, None, frames_dir / f"frame_{frame_idx:03d}.png")
+            video_source.append(None)
         durations.append(0.0)
         frame_words.append(len(fact.split()))
         frame_idx += 1
@@ -542,6 +618,7 @@ def main():
         render_closer_frame(sections["CLOSER"], closer_path, frames_dir / f"frame_{frame_idx:03d}.png")
         durations.append(0.0)
         frame_words.append(len(sections["CLOSER"].split()))
+        video_source.append(None)
         frame_idx += 1
 
     # Track narration-mapped frame count BEFORE adding the slate. The slate
@@ -597,13 +674,19 @@ def main():
 
     print(f"[render] total: {sum(durations):.1f}s ({narration_dur:.1f}s narration + {sum(durations[narration_frame_count:]):.1f}s slate)", file=sys.stderr)
 
-    # Pre-render each frame as a Ken-Burns clip
+    # Per-frame clip generation. Stills get Ken-Burns (zoompan); video-sourced
+    # frames get the source video clipped + overlay PNG composited.
     clip_paths = []
-    for i, (frame, dur) in enumerate(zip(sorted(frames_dir.glob("frame_*.png")), durations)):
+    sorted_frames = sorted(frames_dir.glob("frame_*.png"))
+    for i, (frame, dur) in enumerate(zip(sorted_frames, durations)):
         clip = clips_dir / f"clip_{i:03d}.mp4"
-        kenburns_clip(frame, dur, i, clip)
+        if i < len(video_source) and video_source[i] is not None:
+            video_clip(video_source[i], frame, dur, i, clip)
+            print(f"[render] clip {i}: video-sourced ({video_source[i].name})", file=sys.stderr)
+        else:
+            kenburns_clip(frame, dur, i, clip)
         clip_paths.append(clip)
-    print(f"[render] {len(clip_paths)} Ken-Burns clips", file=sys.stderr)
+    print(f"[render] {len(clip_paths)} clips ({sum(1 for v in video_source if v)} video-sourced)", file=sys.stderr)
 
     out = workdir / "video.mp4"
     # Slate (if present) extends video duration past narration by slate_duration.
