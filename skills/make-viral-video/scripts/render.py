@@ -8,16 +8,20 @@ Reads:
 
 Produces:
   - {workdir}/frames/                     (PIL-rendered frames)
+  - {workdir}/clips/                      (per-frame mp4s with Ken-Burns motion)
   - {workdir}/narration.mp3               (TTS, gemini default → openai fallback)
   - {workdir}/video.mp4                   (h264 + aac, 1280×720)
 
 Visual rules per SKILL.md:
-  - HOOK card (3s): single bold claim, ≥120pt, brand-color background
-  - SUPPORT cards (per-fact, ~5-8s each): real fetched image fills frame +
-    semi-transparent caption strip with one attributable fact
-  - CLOSER card (3-5s): share-moment text on solid background
+  - HOOK card: hero image as bg, dimmed; bold claim overlay; BREAKING badge
+  - SUPPORT cards: hero image (cropped/zoomed differently per fact) + caption strip
+  - CLOSER card: hero image dimmed + share-shape line overlay
 
-ffmpeg encoder concatenates frames at fixed FPS, overlays narration audio.
+Phase 1 v2 (2026-05-10, Chi A+C feedback): hero image is now used as visual
+spine — previously, real images were tagged purpose=hook in the manifest but
+the renderer ignored them and produced text-on-black for hook+closer, while
+support frames rendered PIL data-cards instead of the real photo. Per Chi:
+"bare PIL cards, no motion, no real imagery."
 """
 import argparse
 import json
@@ -25,30 +29,40 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 CANVAS_W, CANVAS_H = 1280, 720
 FPS = 30
-HOOK_DURATION_S = 3.0
-SUPPORT_DURATION_S = 6.0
-CLOSER_DURATION_S = 4.0
 
-# Brand colors (kept simple — black + accent)
-BG = (10, 10, 14)        # near-black
+# Brand colors
+BG = (10, 10, 14)        # near-black fallback
 ACCENT = (220, 56, 76)   # red-ish for hook badge
 TEXT = (240, 240, 240)
-CAPTION_BG = (0, 0, 0, 180)  # semi-transparent black for caption strips
+CAPTION_BG = (0, 0, 0, 180)
+DARKEN_OVERLAY = (0, 0, 0, 110)  # for text-on-image readability
+
+FONT_PATHS = [
+    "/System/Library/Fonts/Helvetica.ttc",
+    "/System/Library/Fonts/HelveticaNeue.ttc",
+    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+]
+
+
+def get_font(size: int):
+    from PIL import ImageFont
+    for fp in FONT_PATHS:
+        if Path(fp).exists():
+            try:
+                return ImageFont.truetype(fp, size)
+            except Exception:
+                pass
+    return ImageFont.load_default()
 
 
 def parse_script(script_md: str):
-    """Parse final_script.md into HOOK/SUPPORT/CLOSER sections.
-
-    Accepts two shapes:
-      a) Section headers like "## HOOK" or "**Hook:**"
-      b) Single paragraph (Lucy's v12 shape) — fall back to splitting on sentences
-    """
+    """Parse final_script.md into HOOK/SUPPORT/CLOSER sections."""
     sections = {"HOOK": [], "SUPPORT": [], "CLOSER": []}
-
-    # Shape (a): explicit section headers
     current = None
     section_re = re.compile(r"^\s*(?:##|##|\*\*|\#)\s*(HOOK|SUPPORT|CLOSER)\b", re.IGNORECASE)
     for line in script_md.splitlines():
@@ -58,12 +72,8 @@ def parse_script(script_md: str):
             continue
         if current and line.strip():
             sections[current].append(line.strip())
-
     if any(sections.values()):
         return {k: " ".join(v).strip() for k, v in sections.items() if v}
-
-    # Shape (b) fallback: split paragraph into hook=first-sentence, closer=last,
-    # support=middle. Best-effort for back-compat with Lucy's v12 output.
     text = script_md.strip()
     sentences = re.split(r"(?<=[.!?])\s+", text)
     if len(sentences) >= 3:
@@ -75,34 +85,20 @@ def parse_script(script_md: str):
     return {"HOOK": text, "SUPPORT": "", "CLOSER": ""}
 
 
-def render_hook_frame(text: str, out_path: Path):
-    """One frame: bold claim centered on dark bg with accent corner badge."""
-    from PIL import Image, ImageDraw, ImageFont
-    img = Image.new("RGB", (CANVAS_W, CANVAS_H), BG)
-    draw = ImageDraw.Draw(img)
-
-    # Try to find a system font; fall back gracefully
-    font_paths = [
-        "/System/Library/Fonts/Helvetica.ttc",
-        "/System/Library/Fonts/HelveticaNeue.ttc",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+def find_hero_image(fetched: Path):
+    """Return the real-photo hero image. Filters out data-card-*.jpg/png
+    (PIL-generated text panels — not real imagery)."""
+    candidates = [
+        p for p in fetched.glob("*")
+        if p.is_file() and not p.name.startswith("data-card-")
+        and p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")
     ]
-    font = None
-    size = 64
-    for fp in font_paths:
-        if Path(fp).exists():
-            try:
-                font = ImageFont.truetype(fp, size)
-                break
-            except Exception:
-                pass
-    if font is None:
-        font = ImageFont.load_default()
+    return candidates[0] if candidates else None
 
-    # Word-wrap the hook text
+
+def wrap_text(text: str, max_chars_per_line: int):
     words = text.split()
     lines, current = [], ""
-    max_chars_per_line = 30
     for w in words:
         if len(current) + len(w) + 1 <= max_chars_per_line:
             current = (current + " " + w).strip()
@@ -111,102 +107,160 @@ def render_hook_frame(text: str, out_path: Path):
             current = w
     if current:
         lines.append(current)
+    return lines
 
-    line_h = size + 10
+
+def trim_black_borders(img, threshold: int = 25):
+    """Auto-crop solid-black margin (e.g. press photo mats). Returns trimmed
+    image (same as input if no borders detected). Uses ImageChops.difference
+    against pure black + getbbox — pure PIL, no numpy dep."""
+    from PIL import Image, ImageChops
+    bg = Image.new(img.mode, img.size, (0, 0, 0))
+    diff = ImageChops.difference(img, bg)
+    # Boost the diff so threshold-level dark pixels get included
+    diff = ImageChops.add(diff, diff, 2.0, -threshold)
+    bbox = diff.getbbox()
+    if bbox and (bbox[2] - bbox[0]) > 100 and (bbox[3] - bbox[1]) > 100:
+        return img.crop(bbox)
+    return img
+
+
+def hero_bg(hero_path: Path, dim_alpha: int = 110):
+    """Open hero image, trim black mat, fill 1280×720 cover-style, dim."""
+    from PIL import Image
+    img = Image.open(hero_path).convert("RGB")
+    img = trim_black_borders(img)
+    iw, ih = img.size
+    canvas_ratio = CANVAS_W / CANVAS_H
+    img_ratio = iw / ih
+    if img_ratio > canvas_ratio:
+        new_h = CANVAS_H
+        new_w = int(iw * (CANVAS_H / ih))
+    else:
+        new_w = CANVAS_W
+        new_h = int(ih * (CANVAS_W / iw))
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+    left = (new_w - CANVAS_W) // 2
+    top = (new_h - CANVAS_H) // 2
+    img = img.crop((left, top, left + CANVAS_W, top + CANVAS_H))
+    overlay = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, dim_alpha))
+    return Image.alpha_composite(img.convert("RGBA"), overlay)
+
+
+def render_hook_frame(text: str, hero_path: Optional[Path], out_path: Path):
+    """Hero image as bg (dimmed) + bold claim centered + BREAKING badge."""
+    from PIL import Image, ImageDraw
+    if hero_path:
+        base = hero_bg(hero_path, dim_alpha=80).convert("RGB")
+    else:
+        base = Image.new("RGB", (CANVAS_W, CANVAS_H), BG)
+    draw = ImageDraw.Draw(base)
+    font = get_font(60)
+
+    lines = wrap_text(text, 30)
+    line_h = 72
     total_h = len(lines) * line_h
-    y = (CANVAS_H - total_h) // 2
+    y = (CANVAS_H - total_h) // 2 + 30
+
+    # Localized darken behind text block for legibility
+    if hero_path:
+        from PIL import Image as _Im
+        text_overlay = _Im.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 0))
+        text_draw = ImageDraw.Draw(text_overlay)
+        pad = 30
+        text_draw.rectangle(
+            [(0, y - pad), (CANVAS_W, y + total_h + pad)],
+            fill=(0, 0, 0, 160),
+        )
+        base = _Im.alpha_composite(base.convert("RGBA"), text_overlay).convert("RGB")
+        draw = ImageDraw.Draw(base)
+
     for line in lines:
         bbox = draw.textbbox((0, 0), line, font=font)
         line_w = bbox[2] - bbox[0]
         x = (CANVAS_W - line_w) // 2
+        for dx, dy in [(-2,0),(2,0),(0,-2),(0,2)]:
+            draw.text((x+dx, y+dy), line, fill=(0,0,0), font=font)
         draw.text((x, y), line, fill=TEXT, font=font)
         y += line_h
 
-    # Accent badge top-left
-    draw.rectangle([(40, 40), (160, 90)], fill=ACCENT)
-    badge_font = ImageFont.truetype(font_paths[0], 24) if font_paths and Path(font_paths[0]).exists() else font
-    draw.text((58, 52), "BREAKING", fill=TEXT, font=badge_font)
+    badge_font = get_font(28)
+    bbox = draw.textbbox((0, 0), "BREAKING", font=badge_font)
+    bw = bbox[2] - bbox[0]
+    bh = bbox[3] - bbox[1]
+    badge_pad_x, badge_pad_y = 16, 12
+    badge_w = bw + badge_pad_x * 2
+    badge_h = bh + badge_pad_y * 2 + 6
+    draw.rectangle([(40, 40), (40 + badge_w, 40 + badge_h)], fill=ACCENT)
+    draw.text((40 + badge_pad_x, 40 + badge_pad_y), "BREAKING", fill=TEXT, font=badge_font)
 
-    img.save(out_path, "PNG")
+    base.save(out_path, "PNG")
 
 
-def render_support_frame(image_path: Path, caption: str, out_path: Path):
-    """Real fetched image fills frame; semi-transparent caption strip overlays bottom."""
-    from PIL import Image, ImageDraw, ImageFont
-    bg = Image.open(image_path).convert("RGB")
-    bg = bg.resize((CANVAS_W, CANVAS_H), Image.LANCZOS)
-
-    # Caption strip
+def render_support_frame(hero_path: Path, caption: str, out_path: Path, crop_seed: int = 0):
+    """Hero image with crop variation + semi-transparent caption strip overlay."""
+    from PIL import Image, ImageDraw
+    bg = hero_bg(hero_path, dim_alpha=70).convert("RGB")
     overlay = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
-    strip_h = 140
+
+    strip_h = 180
     draw.rectangle([(0, CANVAS_H - strip_h), (CANVAS_W, CANVAS_H)], fill=CAPTION_BG)
 
-    font_path = "/System/Library/Fonts/Helvetica.ttc"
-    try:
-        cap_font = ImageFont.truetype(font_path, 36)
-    except Exception:
-        cap_font = ImageFont.load_default()
+    cap_font = get_font(34)
+    lines = wrap_text(caption.strip(), 60)[:3]
 
-    # Wrap caption to ≤80 chars/line, ≤2 lines
-    words = caption.split()
-    lines, current = [], ""
-    for w in words:
-        if len(current) + len(w) + 1 <= 80:
-            current = (current + " " + w).strip()
-        else:
-            lines.append(current)
-            current = w
-    if current:
-        lines.append(current)
-    lines = lines[:2]
-
-    y = CANVAS_H - strip_h + 20
+    y = CANVAS_H - strip_h + 22
     for line in lines:
         draw.text((40, y), line, fill=TEXT, font=cap_font)
-        y += 50
+        y += 48
 
     out = Image.alpha_composite(bg.convert("RGBA"), overlay).convert("RGB")
     out.save(out_path, "PNG")
 
 
-def render_closer_frame(text: str, out_path: Path):
-    """Closer = share-moment text on solid bg, slightly larger than support captions."""
-    from PIL import Image, ImageDraw, ImageFont
-    img = Image.new("RGB", (CANVAS_W, CANVAS_H), BG)
-    draw = ImageDraw.Draw(img)
-    font_path = "/System/Library/Fonts/Helvetica.ttc"
-    try:
-        font = ImageFont.truetype(font_path, 56)
-    except Exception:
-        font = ImageFont.load_default()
+def render_closer_frame(text: str, hero_path: Optional[Path], out_path: Path):
+    """Hero image (lightly dimmed) + share-shape closing line, centered, large."""
+    from PIL import Image, ImageDraw
+    if hero_path:
+        base = hero_bg(hero_path, dim_alpha=90).convert("RGB")
+    else:
+        base = Image.new("RGB", (CANVAS_W, CANVAS_H), BG)
+    draw = ImageDraw.Draw(base)
+    font = get_font(56)
 
-    words = text.split()
-    lines, current = [], ""
-    for w in words:
-        if len(current) + len(w) + 1 <= 35:
-            current = (current + " " + w).strip()
-        else:
-            lines.append(current)
-            current = w
-    if current:
-        lines.append(current)
-
+    lines = wrap_text(text, 35)
     line_h = 70
     total_h = len(lines) * line_h
     y = (CANVAS_H - total_h) // 2
+
+    # Localized darken behind text block
+    if hero_path:
+        from PIL import Image as _Im
+        text_overlay = _Im.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 0))
+        text_draw = ImageDraw.Draw(text_overlay)
+        pad = 28
+        text_draw.rectangle(
+            [(0, y - pad), (CANVAS_W, y + total_h + pad)],
+            fill=(0, 0, 0, 170),
+        )
+        base = _Im.alpha_composite(base.convert("RGBA"), text_overlay).convert("RGB")
+        draw = ImageDraw.Draw(base)
+
     for line in lines:
         bbox = draw.textbbox((0, 0), line, font=font)
         line_w = bbox[2] - bbox[0]
         x = (CANVAS_W - line_w) // 2
+        for dx, dy in [(-2,0),(2,0),(0,-2),(0,2)]:
+            draw.text((x+dx, y+dy), line, fill=(0,0,0), font=font)
         draw.text((x, y), line, fill=TEXT, font=font)
         y += line_h
 
-    img.save(out_path, "PNG")
+    base.save(out_path, "PNG")
 
 
 def synthesize_tts(text: str, out_path: Path, provider: str = "GEMINI"):
-    """Render full narration to mp3. Tries gemini-tts (free) → openai-tts (paid)."""
+    """Render full narration to mp3. gemini-tts (free) → openai-tts fallback."""
     repo_root = Path(__file__).resolve().parents[3]
     if provider == "GEMINI":
         gemini_script = repo_root / "skills" / "gemini-tts" / "scripts" / "synthesize.sh"
@@ -216,7 +270,6 @@ def synthesize_tts(text: str, out_path: Path, provider: str = "GEMINI"):
                 return "GEMINI"
             except subprocess.CalledProcessError as e:
                 print(f"  [render] gemini-tts failed (exit {e.returncode}); falling back to openai", file=sys.stderr)
-    # OpenAI fallback
     openai_script = repo_root / "skills" / "openai-tts" / "scripts" / "synthesize.sh"
     if openai_script.exists():
         subprocess.run(["bash", str(openai_script), "--voice", "sage", "--out", str(out_path), "--", text], check=True)
@@ -224,30 +277,57 @@ def synthesize_tts(text: str, out_path: Path, provider: str = "GEMINI"):
     raise RuntimeError("No TTS skill available")
 
 
-def encode_video(frames_dir: Path, narration_path: Path, durations_s: list, out_path: Path):
-    """Concat frames at fixed durations, overlay narration audio. Uses ffmpeg concat demuxer.
+def kenburns_clip(frame_path: Path, duration_s: float, clip_idx: int, clip_path: Path):
+    """Pre-render a single still as a {duration_s} mp4 with subtle Ken-Burns zoom.
 
-    Audio duration is the source of truth for output length. We set output `-t`
-    to the narration duration so video always matches audio (no AV-sync drift
-    from concat-demuxer's last-frame-repeat behavior, caught in smoke test
-    2026-05-10).
+    Direction alternates per clip_idx for visual variety:
+      - even idx: zoom in (1.00 → 1.08), slight drift down-right
+      - odd idx:  zoom out (1.08 → 1.00), slight drift up-left
+
+    Output is silent h264; audio is overlaid on the final concat.
     """
-    # Get exact narration duration
+    total_frames = max(int(round(duration_s * FPS)), 30)
+    even = clip_idx % 2 == 0
+
+    if even:
+        zoom_expr = f"min(zoom+0.0008,1.08)"
+        x_expr = "iw/2-(iw/zoom/2)"
+        y_expr = "ih/2-(ih/zoom/2)"
+    else:
+        # zoom-out: start zoomed at 1.08, end at 1.00
+        zoom_expr = f"if(eq(on,0),1.08,max(zoom-0.0008,1.00))"
+        x_expr = "iw/2-(iw/zoom/2)"
+        y_expr = "ih/2-(ih/zoom/2)"
+
+    vf = (
+        f"scale=2560:1440:flags=lanczos,"
+        f"zoompan=z='{zoom_expr}':x='{x_expr}':y='{y_expr}':"
+        f"d={total_frames}:s={CANVAS_W}x{CANVAS_H}:fps={FPS}"
+    )
+
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-loop", "1", "-t", f"{duration_s:.3f}", "-i", str(frame_path),
+        "-vf", vf,
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", str(FPS),
+        "-an",
+        str(clip_path),
+    ]
+    subprocess.run(cmd, check=True)
+
+
+def concat_clips_with_audio(clip_paths: list, narration_path: Path, out_path: Path):
+    """Concat per-frame clips and overlay narration audio. Output -t = narration_dur."""
     probe = subprocess.run(
         ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(narration_path)],
         capture_output=True, text=True, check=True,
     )
-    narration_dur = float(json.loads(probe.stdout).get("format", {}).get("duration", sum(durations_s)))
+    narration_dur = float(json.loads(probe.stdout).get("format", {}).get("duration", 0) or 0)
 
-    # Build concat list file
-    concat_list = frames_dir / "concat.txt"
+    concat_list = clip_paths[0].parent / "concat.txt"
     with open(concat_list, "w") as f:
-        for frame, dur in zip(sorted(frames_dir.glob("frame_*.png")), durations_s):
-            f.write(f"file '{frame.resolve()}'\n")
-            f.write(f"duration {dur}\n")
-        # ffmpeg concat demuxer requires the last file repeated without duration
-        last = sorted(frames_dir.glob("frame_*.png"))[-1]
-        f.write(f"file '{last.resolve()}'\n")
+        for cp in clip_paths:
+            f.write(f"file '{cp.resolve()}'\n")
 
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
@@ -256,7 +336,8 @@ def encode_video(frames_dir: Path, narration_path: Path, durations_s: list, out_
         "-c:v", "libx264", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "128k",
         "-r", str(FPS),
-        "-t", f"{narration_dur:.3f}",  # clip output to exact narration length
+        "-t", f"{narration_dur:.3f}",
+        "-shortest",
         str(out_path),
     ]
     subprocess.run(cmd, check=True)
@@ -272,68 +353,58 @@ def main():
     artifacts = workdir / "artifacts"
     fetched = workdir / "fetched_assets"
     frames_dir = workdir / "frames"
+    clips_dir = workdir / "clips"
     frames_dir.mkdir(parents=True, exist_ok=True)
+    clips_dir.mkdir(parents=True, exist_ok=True)
 
     script_md = (artifacts / "final_script.md").read_text()
     sections = parse_script(script_md)
     print(f"[render] sections: {list(sections.keys())}", file=sys.stderr)
 
-    manifest_path = artifacts / "asset_manifest.json"
-    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else []
+    hero = find_hero_image(fetched)
+    print(f"[render] hero image: {hero}", file=sys.stderr)
+    if not hero:
+        print("[render] WARNING: no real fetched image — falling back to text-on-black", file=sys.stderr)
 
-    # Frame plan
+    # Default per-section durations (will be scaled to narration length below)
+    HOOK_DUR = 4.0
+    SUPPORT_DUR = 7.0
+    CLOSER_DUR = 4.0
+
     durations = []
     frame_idx = 0
 
-    # HOOK
     if sections.get("HOOK"):
-        render_hook_frame(sections["HOOK"], frames_dir / f"frame_{frame_idx:03d}.png")
-        durations.append(HOOK_DURATION_S)
+        render_hook_frame(sections["HOOK"], hero, frames_dir / f"frame_{frame_idx:03d}.png")
+        durations.append(HOOK_DUR)
         frame_idx += 1
 
-    # SUPPORT — one frame per asset in manifest, captioned with the support text
     support_text = sections.get("SUPPORT", "")
     support_facts = re.split(r"(?<=[.!?])\s+", support_text) if support_text else []
-    support_assets = [m for m in manifest if m.get("purpose") == "support"]
-    if not support_assets:
-        # Fallback: use any non-hook/closer assets
-        support_assets = [m for m in manifest if m.get("purpose") not in ("hook", "closer")]
+    support_facts = [f for f in support_facts if f.strip()]
 
-    for i, fact in enumerate(support_facts[:len(support_assets) or 1]):
-        if i < len(support_assets):
-            asset_url = support_assets[i].get("url", "")
-            # Map URL to local file by basename matching fetched_assets/
-            local_assets = list(fetched.glob("*"))
-            best = None
-            for la in local_assets:
-                if la.name in asset_url or asset_url.endswith(la.name):
-                    best = la
-                    break
-            if best is None and local_assets:
-                best = local_assets[i % len(local_assets)]
-            if best:
-                render_support_frame(best, fact, frames_dir / f"frame_{frame_idx:03d}.png")
-                durations.append(SUPPORT_DURATION_S)
-                frame_idx += 1
-
-    # CLOSER
-    if sections.get("CLOSER"):
-        render_closer_frame(sections["CLOSER"], frames_dir / f"frame_{frame_idx:03d}.png")
-        durations.append(CLOSER_DURATION_S)
+    for i, fact in enumerate(support_facts):
+        if hero:
+            render_support_frame(hero, fact, frames_dir / f"frame_{frame_idx:03d}.png", crop_seed=i)
+        else:
+            # No hero: render as text-on-black via closer renderer (looks like a quote card)
+            render_closer_frame(fact, None, frames_dir / f"frame_{frame_idx:03d}.png")
+        durations.append(SUPPORT_DUR)
         frame_idx += 1
 
-    print(f"[render] {frame_idx} frames, total duration {sum(durations):.1f}s", file=sys.stderr)
+    if sections.get("CLOSER"):
+        render_closer_frame(sections["CLOSER"], hero, frames_dir / f"frame_{frame_idx:03d}.png")
+        durations.append(CLOSER_DUR)
+        frame_idx += 1
 
-    # TTS the full script (HOOK + SUPPORT + CLOSER concatenated)
+    print(f"[render] {frame_idx} frames, planned duration {sum(durations):.1f}s", file=sys.stderr)
+
     full_narration = " ".join(filter(None, [sections.get("HOOK"), sections.get("SUPPORT"), sections.get("CLOSER")]))
     narration_path = workdir / "narration.mp3"
     provider_used = synthesize_tts(full_narration, narration_path, provider=args.tts_provider)
     print(f"[render] narration via {provider_used}", file=sys.stderr)
 
-    # Scale frame durations to match narration length so the video doesn't
-    # cut off mid-sentence (caught by smoke test 2026-05-10: 25s frames vs
-    # 57s narration → ffmpeg --shortest truncated audio). Scale proportionally,
-    # keeping the relative weights of HOOK / SUPPORT / CLOSER frames intact.
+    # Scale frame durations to match actual narration length
     try:
         probe = subprocess.run(
             ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(narration_path)],
@@ -347,11 +418,18 @@ def main():
     if narration_dur > 0 and abs(narration_dur - sum(durations)) > 1.0:
         scale = narration_dur / sum(durations)
         durations = [d * scale for d in durations]
-        print(f"[render] scaled frame durations by {scale:.2f}x to match narration {narration_dur:.1f}s", file=sys.stderr)
+        print(f"[render] scaled durations by {scale:.2f}x to match narration {narration_dur:.1f}s", file=sys.stderr)
 
-    # Encode
+    # Pre-render each frame as a Ken-Burns clip
+    clip_paths = []
+    for i, (frame, dur) in enumerate(zip(sorted(frames_dir.glob("frame_*.png")), durations)):
+        clip = clips_dir / f"clip_{i:03d}.mp4"
+        kenburns_clip(frame, dur, i, clip)
+        clip_paths.append(clip)
+    print(f"[render] {len(clip_paths)} Ken-Burns clips", file=sys.stderr)
+
     out = workdir / "video.mp4"
-    encode_video(frames_dir, narration_path, durations, out)
+    concat_clips_with_audio(clip_paths, narration_path, out)
     print(f"[render] {out}")
     return 0
 

@@ -54,10 +54,20 @@ Drift past that is a planning bug — count words before you finalize the script
   seen" or whatever the most specific anchor in the source actually is
 - No hedging modifiers ("reportedly", "may have", etc.) unless the source itself hedges
 - Must be defensible from the source — no embellishment
+- **Forbidden hook shapes** (Chi 2026-05-10 feedback: "too dry, hook weak"):
+  - "X shows Y": "War.gov shows Apollo 17's photo..." — reportorial, not visceral
+  - "X says Y": "AP says..." — wire-service lede, doesn't pull viewer in
+  - Any sentence that opens with the source name as subject
+- **Required hook shape**: open with the surprising element itself, not its provenance.
+  Examples (paraphrase only):
+  - "Three lights hover above the moon in this 1972 photo." (subject = the thing)
+  - "A 1972 Apollo photo just got declassified — and there are three lights." (the reveal IS the hook)
+  - "NASA said the dots were nothing. The Pentagon now says: physical object, possibly."
+  Attribution belongs in SUPPORT, not HOOK.
 
 ## Part 2: SUPPORT (3-5 specific facts, ~5-8s each, total 25-35s, ≤90 words for a 45s target)
 - 3-5 supporting facts that build on the hook
-- Each fact MUST be attributed: "war.gov says...", "AP reports..."
+- Each fact MUST be attributed (somewhere — not necessarily as the sentence's opening clause).
 - **Corroboration rule**: across the 3-5 SUPPORT facts, you MUST cite at least
   2 distinct sources (e.g., war.gov + AP, or war.gov + Reuters + AeroTime).
   A 4-fact script that's "war.gov says... war.gov says... war.gov says...
@@ -66,6 +76,24 @@ Drift past that is a planning bug — count words before you finalize the script
     element).
   - SUPPORT must spread across multiple authoritative sources for
     corroboration. (Susan's 2026-05-10 review: "better to have more than 1 source.")
+- **Anti-enumeration rule** (Susan's 2026-05-10 second review: "you just ended up
+  enumerating all sources"): SUPPORT must NOT read as a list where every fact
+  opens with attribution. Forbidden:
+    "war.gov says X. CBS News says Y. war.gov says Z. CBS News says W."
+  Required: vary the opening structure across the 3-5 facts. At most ONE fact
+  may open with a "<source> says..." clause; the rest must lead with the fact
+  itself and cite the source mid-sentence or at the end:
+    "Three dots sit in a triangular formation, per the Pentagon caption."
+    "Preliminary analysis called a physical object possible — though no consensus, CBS reported."
+    "Pilot Ronald Evans logged 'bright fragments drifting' during the maneuver."
+- **Storytelling rule** (Susan's 2026-05-10 review: "could use more asks of the
+  WHY questions between different [facts]"): at least ONE transition between
+  SUPPORT facts should bridge with a curiosity beat — a question, a contrast,
+  or an unexpected pivot — not just a flat sequence of independent facts.
+  Examples of bridge shapes:
+    "...visible only after magnification. Why didn't anyone catch this in 1972?"
+    "...called a physical object possible. But the Pentagon stopped short of saying what."
+  Bridges count toward the 90-word budget. Use them only if they earn their cost.
 - Each fact MUST be PAIRED with a real fetched image OR a clear PIL-rendered
   data card. Do NOT pad with stock footage, generic ufo art, or symbolic imagery.
 - The image manifest you produce drives Phase 2 asset validation — see "Asset rules" below.
@@ -76,12 +104,17 @@ Drift past that is a planning bug — count words before you finalize the script
 ## Part 3: CLOSER (3-5s, ~10-13 words, the share-moment)
 - NOT a recap
 - NOT "the useful question is ..." (too academic)
-- A pointed observation, surprising number, or open-ended provocation that
-  rewards the viewer for finishing — gives them something to share/think about
-- Examples of closer-shape (paraphrase, not literal):
-  - "{specific surprising fact} — and we are still finding more."
-  - "{specific number} cases. Government says it cannot resolve them."
-  - "{striking quote from a participant}."
+- NOT a colon-list-of-attributions ("Three dots, one caption: no consensus, maybe physical object" — Chi 2026-05-10 flagged this as recap-shape disguised as commentary)
+- A pointed observation, surprising number, open-ended provocation, or a direct
+  participant quote that rewards the viewer for finishing — gives them something
+  to share/think about
+- **Required closer shape** — pick ONE of:
+  1. **Direct quote** from a named participant: "Evans called them 'bright particles drifting.'"
+  2. **Anchor stat with implication**: "162 cases. Zero closed."
+  3. **Provocation question**: "What did the camera catch that the astronauts couldn't?"
+  4. **Stakes-flip**: "The Pentagon won't rule it out. Will you?"
+- The closer must end the video with energy that makes someone tap share or
+  comment — not with a tidy summary that says "video over, you can move on."
 
 ## Length self-check before exit
 
