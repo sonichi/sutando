@@ -58,6 +58,14 @@ Drift past that is a planning bug — count words before you finalize the script
 ## Part 2: SUPPORT (3-5 specific facts, ~5-8s each, total 25-35s, ≤90 words for a 45s target)
 - 3-5 supporting facts that build on the hook
 - Each fact MUST be attributed: "war.gov says...", "AP reports..."
+- **Corroboration rule**: across the 3-5 SUPPORT facts, you MUST cite at least
+  2 distinct sources (e.g., war.gov + AP, or war.gov + Reuters + AeroTime).
+  A 4-fact script that's "war.gov says... war.gov says... war.gov says...
+  war.gov says..." reads as single-sourced and lacks credibility.
+  - HOOK can stay single-sourced (the strongest anchor for the one striking
+    element).
+  - SUPPORT must spread across multiple authoritative sources for
+    corroboration. (Susan's 2026-05-10 review: "better to have more than 1 source.")
 - Each fact MUST be PAIRED with a real fetched image OR a clear PIL-rendered
   data card. Do NOT pad with stock footage, generic ufo art, or symbolic imagery.
 - The image manifest you produce drives Phase 2 asset validation — see "Asset rules" below.
