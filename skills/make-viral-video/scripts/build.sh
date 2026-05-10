@@ -55,6 +55,20 @@ echo "tts_provider: $TTS_PROVIDER"
 echo "out_dir: $OUT_DIR"
 
 # ----------------------------------------------------------------
+# Phase 0.5: Asset-cache preload (best-effort)
+# ----------------------------------------------------------------
+# If the run dir already has a manifest (e.g. from a prior partial run, or
+# core-agent Phase 1 that pre-staged it), preload any cache hits before
+# codex/Phase 1 starts so we don't re-fetch identical URLs across runs.
+# Per Chi 2026-05-10: "Make existing assets available."
+if [[ -f "$OUT_DIR/artifacts/asset_manifest.json" ]]; then
+  hits=$(python3 "$SKILL_DIR/scripts/asset_cache.py" preload "$OUT_DIR" 2>&1)
+  echo "[Phase 0.5] $hits"
+else
+  echo "[Phase 0.5] no manifest yet; cache preload deferred to Phase 1.5"
+fi
+
+# ----------------------------------------------------------------
 # Phase 1: Codex script + asset manifest generation
 # ----------------------------------------------------------------
 echo ""
@@ -76,6 +90,17 @@ sed -e "s|{{TOPIC}}|$TOPIC|g" \
 # Per `feedback_codex_nested_quotes_hang_stdin.md`: pass via "$(cat /tmp/file)" not raw -- arg
 codex exec --sandbox workspace-write -o "$OUT_DIR/artifacts/codex-output.txt" -- "$(cat "$PROMPT_FILE")"
 echo "[Phase 1] codex done; output at $OUT_DIR/artifacts/codex-output.txt"
+
+# ----------------------------------------------------------------
+# Phase 1.5: Cache preload after codex writes manifest
+# ----------------------------------------------------------------
+# Codex may have failed to fetch some URLs (DNS, 403, etc.). If the cache has
+# them from a prior run, copy them in before validation. Idempotent — skipping
+# any file that already exists with matching size.
+if [[ -f "$OUT_DIR/artifacts/asset_manifest.json" ]]; then
+  hits=$(python3 "$SKILL_DIR/scripts/asset_cache.py" preload "$OUT_DIR" 2>&1)
+  echo "[Phase 1.5] $hits"
+fi
 
 # ----------------------------------------------------------------
 # Phase 2: Asset validation
@@ -109,6 +134,15 @@ if [[ $fail_count -ge 3 ]]; then
   echo "ERROR: $fail_count/$total_count assets failed validation. Aborting before render." >&2
   exit 1
 fi
+
+# ----------------------------------------------------------------
+# Phase 2.5: Promote validated assets to shared cache
+# ----------------------------------------------------------------
+# Only files that passed validation reach the cache. URL keys come from the
+# manifest. Per Chi 2026-05-10: "Make existing assets available." Future runs
+# of any topic that share asset URLs will see cache hits at Phase 0.5/1.5.
+promoted=$(python3 "$SKILL_DIR/scripts/asset_cache.py" promote "$OUT_DIR" 2>&1)
+echo "[Phase 2.5] $promoted"
 
 # ----------------------------------------------------------------
 # Phase 3+5: Frame composition + TTS + ffmpeg encode
