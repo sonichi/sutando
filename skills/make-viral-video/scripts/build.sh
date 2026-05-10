@@ -125,9 +125,22 @@ python3 "$SKILL_DIR/scripts/render.py" --workdir "$OUT_DIR" --tts-provider "$TTS
 echo ""
 echo "--- Phase 6: ffprobe gate ---"
 
-if ! python3 "$SKILL_DIR/scripts/verify_video.py" "$OUT_DIR/video.mp4" --expected-duration "$TARGET_DURATION"; then
+# Gate validates structure (h264 + aac + dims + AV sync), not absolute duration.
+# Per 2026-05-10 Lucy-Mini iteration: TTS rate varies 117-138 wpm with Aoede;
+# the user-supplied --target-duration is a planning hint, not a hard constraint.
+# Structural gate stays hard; absolute-duration drift is a soft warning.
+if ! python3 "$SKILL_DIR/scripts/verify_video.py" "$OUT_DIR/video.mp4"; then
   echo "ERROR: video failed ffprobe gate. NOT publishing." >&2
   exit 1
+fi
+
+# Soft warning if narration drifted ±10s from target
+ACTUAL_DUR=$(ffprobe -v quiet -print_format json -show_format "$OUT_DIR/video.mp4" | python3 -c 'import json,sys;print(int(float(json.load(sys.stdin)["format"]["duration"])))')
+if [[ -n "$ACTUAL_DUR" ]] && [[ -n "$TARGET_DURATION" ]]; then
+  DIFF=$((ACTUAL_DUR - TARGET_DURATION))
+  if [[ $DIFF -gt 10 ]] || [[ $DIFF -lt -10 ]]; then
+    echo "  [warn] narration drifted ${DIFF}s from target ${TARGET_DURATION}s (actual: ${ACTUAL_DUR}s) — gate passed on AV-sync, but consider tighter prompt"
+  fi
 fi
 
 # ----------------------------------------------------------------
