@@ -35,9 +35,17 @@ You will fetch this URL (use curl + Playwright fallback for JS-rendered pages),
 read its content, and identify the ONE most striking specific element — a number,
 an image, a quote, an event, or a juxtaposition — that lands as a share-moment.
 
-# Output structure (3 parts)
+# Output structure (3 parts) — STRICT length budget
 
-## Part 1: HOOK (3-5s narration, single striking claim)
+**Total narration budget: ≤ {{TARGET_DURATION_S}} seconds at TTS pace.**
+At ~155 words/minute (typical TTS rate for Aoede / sage), this means
+≤ ⌊{{TARGET_DURATION_S}} × 2.6⌋ words across HOOK + SUPPORT + CLOSER combined.
+For a 45s target, that's ~117 words. For a 30s target, ~78 words.
+
+The ffprobe pre-publish gate enforces narration duration ≤ {{TARGET_DURATION_S}}+5s.
+Drift past that is a planning bug — count words before you finalize the script.
+
+## Part 1: HOOK (3-5s narration, ~10-13 words, single striking claim)
 - One sentence
 - The MOST specific thing in the source — NOT "162 files released" but
   "an FBI report from 1947 about an unidentified object the public has never
@@ -45,14 +53,17 @@ an image, a quote, an event, or a juxtaposition — that lands as a share-moment
 - No hedging modifiers ("reportedly", "may have", etc.) unless the source itself hedges
 - Must be defensible from the source — no embellishment
 
-## Part 2: SUPPORT (3-5 specific facts, ~5-8s each, 25-35s total)
+## Part 2: SUPPORT (3-5 specific facts, ~5-8s each, total 25-35s, ≤90 words for a 45s target)
 - 3-5 supporting facts that build on the hook
 - Each fact MUST be attributed: "war.gov says...", "AP reports..."
 - Each fact MUST be PAIRED with a real fetched image OR a clear PIL-rendered
   data card. Do NOT pad with stock footage, generic ufo art, or symbolic imagery.
 - The image manifest you produce drives Phase 2 asset validation — see "Asset rules" below.
+- If you find yourself needing more than 90 words to support the hook,
+  CUT support facts down to 3 strongest. Coverage is the failure mode the
+  specificity-shape framing is designed to prevent.
 
-## Part 3: CLOSER (3-5s, the share-moment)
+## Part 3: CLOSER (3-5s, ~10-13 words, the share-moment)
 - NOT a recap
 - NOT "the useful question is ..." (too academic)
 - A pointed observation, surprising number, or open-ended provocation that
@@ -61,6 +72,13 @@ an image, a quote, an event, or a juxtaposition — that lands as a share-moment
   - "{specific surprising fact} — and we are still finding more."
   - "{specific number} cases. Government says it cannot resolve them."
   - "{striking quote from a participant}."
+
+## Length self-check before exit
+
+Count words in your final HOOK + SUPPORT + CLOSER. Multiply by 60 / 155 to
+estimate seconds. If estimate exceeds {{TARGET_DURATION_S}}+3s, trim the
+weakest support fact and recount. Do this BEFORE writing files. The gate
+is a hard contract — drift past it means you ship nothing.
 
 # Asset rules (Phase 2 validation will enforce)
 
