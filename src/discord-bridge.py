@@ -2351,7 +2351,12 @@ async def _handle_discord_message(message, force=False):
         if enriched:
             print(f"  [discord-state-prefetch] enriched task body for {username} in #{getattr(message.channel, 'name', '?')}", flush=True)
             user_task_text = enriched
-            quoted_task = shlex.quote(user_task_text)
+            # Rewrite the prompt file with the enriched body. quoted_task
+            # already points to `"$(cat {prompt_path})"` — keep the heredoc
+            # form (per PR #652's codex-stdin-hang fix). Using shlex.quote
+            # here would reintroduce the nested-escape pathology codex's
+            # stdin parser hangs on. Per MacBook's #644 v2 review 2026-05-10.
+            Path(prompt_path).write_text(user_task_text)
         else:
             try:
                 already_escalated = await _silent_escalate_for_discord_state(message, user_task_text)
