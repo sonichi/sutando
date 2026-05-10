@@ -259,13 +259,15 @@ def render_closer_frame(text: str, hero_path: Optional[Path], out_path: Path):
     base.save(out_path, "PNG")
 
 
-def render_slate_frame(series_title: str, episode: str, date: str, out_path: Path):
+def render_slate_frame(series_title: str, episode: str, date: str, out_path: Path,
+                        byline: str = ""):
     """Series signature slate — 2s end card. Black bg, large brand-red wordmark,
-    small episode + date subtitle. Mini Wire branding per Chi 2026-05-10.
+    small episode + date subtitle, optional byline. Branding per Chi 2026-05-10.
 
-    Layout:
+    Layout (byline optional):
         [vertical center]
         SERIES TITLE         ← large, brand red, bold
+        byline               ← smaller, white, optional (e.g. "by Echo Act IV · Sutando")
         ep. NNN · YYYY.MM.DD ← smaller, white
     """
     from PIL import Image, ImageDraw
@@ -273,32 +275,41 @@ def render_slate_frame(series_title: str, episode: str, date: str, out_path: Pat
     draw = ImageDraw.Draw(base)
 
     title_font = get_font(120)
+    byline_font = get_font(34)
     sub_font = get_font(36)
 
     title_text = series_title.upper()
     sub_text = f"ep. {episode} · {date}"
 
-    # Title bbox
     tbb = draw.textbbox((0, 0), title_text, font=title_font)
-    tw = tbb[2] - tbb[0]
-    th = tbb[3] - tbb[1]
-    # Subtitle bbox
+    tw, th = tbb[2] - tbb[0], tbb[3] - tbb[1]
     sbb = draw.textbbox((0, 0), sub_text, font=sub_font)
-    sw = sbb[2] - sbb[0]
-    sh = sbb[3] - sbb[1]
+    sw, sh = sbb[2] - sbb[0], sbb[3] - sbb[1]
+    if byline:
+        bbb = draw.textbbox((0, 0), byline, font=byline_font)
+        bw, bh = bbb[2] - bbb[0], bbb[3] - bbb[1]
+    else:
+        bw = bh = 0
 
-    gap = 30
-    total_h = th + gap + sh
+    gap_above_byline = 24
+    gap_above_sub = 22 if byline else 30
+    total_h = th + (gap_above_byline + bh if byline else 0) + gap_above_sub + sh
     y_title = (CANVAS_H - total_h) // 2
 
     # Title in brand red
     x_title = (CANVAS_W - tw) // 2
     draw.text((x_title, y_title), title_text, fill=ACCENT, font=title_font)
 
-    # Subtitle in white
-    y_sub = y_title + th + gap
+    y = y_title + th
+    if byline:
+        y += gap_above_byline
+        x_byline = (CANVAS_W - bw) // 2
+        draw.text((x_byline, y), byline, fill=TEXT, font=byline_font)
+        y += bh
+
+    y += gap_above_sub
     x_sub = (CANVAS_W - sw) // 2
-    draw.text((x_sub, y_sub), sub_text, fill=TEXT, font=sub_font)
+    draw.text((x_sub, y), sub_text, fill=TEXT, font=sub_font)
 
     base.save(out_path, "PNG")
 
@@ -430,6 +441,9 @@ def main():
                    help="Branded series name shown on the end-card slate (set empty to skip slate).")
     p.add_argument("--episode", default="001", help="Episode number for slate (e.g. '001')")
     p.add_argument("--date", default=None, help="Date for slate (YYYY.MM.DD); defaults to today")
+    p.add_argument("--byline", default="",
+                   help="Optional byline shown between title and ep/date (e.g. 'by Echo Act IV · Sutando'). "
+                        "Empty string omits the byline. Free-text — caller controls identity wording.")
     p.add_argument("--slate-duration", type=float, default=2.0, help="End-card slate duration (s)")
     args = p.parse_args()
 
@@ -514,7 +528,8 @@ def main():
         from datetime import datetime
         slate_date = args.date or datetime.now().strftime("%Y.%m.%d")
         render_slate_frame(args.series_title, args.episode, slate_date,
-                           frames_dir / f"frame_{frame_idx:03d}.png")
+                           frames_dir / f"frame_{frame_idx:03d}.png",
+                           byline=args.byline)
         durations.append(args.slate_duration)  # slate gets fixed duration, not narration-proportional
         frame_words.append(0)  # no narration on slate
         frame_idx += 1
