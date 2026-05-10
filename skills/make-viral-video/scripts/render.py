@@ -454,17 +454,19 @@ def main():
                 return p
         return hero
 
-    # Default per-section durations (will be scaled to narration length below)
-    HOOK_DUR = 4.0
-    SUPPORT_DUR = 7.0
-    CLOSER_DUR = 4.0
-
-    durations = []
+    # Per-frame durations are allocated PROPORTIONAL to that frame's narration
+    # word count (Mini fix 2026-05-10 after Chi: "initial scene changed
+    # prematurely before narration finished" — earlier code used fixed
+    # HOOK=4 / SUPPORT=7 / CLOSER=4 then uniformly scaled to TTS length,
+    # which under-allocates frames whose text is longer than average).
+    durations = []  # placeholders, filled after TTS via word-share
+    frame_words = []  # parallel: word count of each frame's narration
     frame_idx = 0
 
     if sections.get("HOOK"):
         render_hook_frame(sections["HOOK"], asset_for("hook"), frames_dir / f"frame_{frame_idx:03d}.png")
-        durations.append(HOOK_DUR)
+        durations.append(0.0)
+        frame_words.append(len(sections["HOOK"].split()))
         frame_idx += 1
 
     support_text = sections.get("SUPPORT", "")
@@ -476,14 +478,15 @@ def main():
         if sup_asset:
             render_support_frame(sup_asset, fact, frames_dir / f"frame_{frame_idx:03d}.png", crop_seed=i)
         else:
-            # No asset: render as text-on-black via closer renderer (quote-card shape)
             render_closer_frame(fact, None, frames_dir / f"frame_{frame_idx:03d}.png")
-        durations.append(SUPPORT_DUR)
+        durations.append(0.0)
+        frame_words.append(len(fact.split()))
         frame_idx += 1
 
     if sections.get("CLOSER"):
         render_closer_frame(sections["CLOSER"], asset_for("closer"), frames_dir / f"frame_{frame_idx:03d}.png")
-        durations.append(CLOSER_DUR)
+        durations.append(0.0)
+        frame_words.append(len(sections["CLOSER"].split()))
         frame_idx += 1
 
     # Track narration-mapped frame count BEFORE adding the slate. The slate
@@ -497,18 +500,16 @@ def main():
         slate_date = args.date or datetime.now().strftime("%Y.%m.%d")
         render_slate_frame(args.series_title, args.episode, slate_date,
                            frames_dir / f"frame_{frame_idx:03d}.png")
-        durations.append(args.slate_duration)
+        durations.append(args.slate_duration)  # slate gets fixed duration, not narration-proportional
+        frame_words.append(0)  # no narration on slate
         frame_idx += 1
         print(f"[render] added slate: {args.series_title} ep.{args.episode} {slate_date}", file=sys.stderr)
-
-    print(f"[render] {frame_idx} frames, planned duration {sum(durations):.1f}s", file=sys.stderr)
 
     full_narration = " ".join(filter(None, [sections.get("HOOK"), sections.get("SUPPORT"), sections.get("CLOSER")]))
     narration_path = workdir / "narration.mp3"
     provider_used = synthesize_tts(full_narration, narration_path, provider=args.tts_provider)
     print(f"[render] narration via {provider_used}", file=sys.stderr)
 
-    # Scale frame durations to match actual narration length
     try:
         probe = subprocess.run(
             ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(narration_path)],
@@ -516,14 +517,26 @@ def main():
         )
         narration_dur = float(json.loads(probe.stdout).get("format", {}).get("duration", 0))
     except Exception as e:
-        print(f"[render] ffprobe on narration failed ({e}); using planned durations", file=sys.stderr)
-        narration_dur = sum(durations[:narration_frame_count])
+        print(f"[render] ffprobe on narration failed ({e}); fallback to 36s", file=sys.stderr)
+        narration_dur = 36.0
 
-    narrated_planned = sum(durations[:narration_frame_count])
-    if narration_dur > 0 and abs(narration_dur - narrated_planned) > 1.0:
-        scale = narration_dur / narrated_planned
-        durations = [d * scale for d in durations[:narration_frame_count]] + durations[narration_frame_count:]
-        print(f"[render] scaled narrated durations by {scale:.2f}x (slate kept at {durations[narration_frame_count] if narration_frame_count < len(durations) else 0:.1f}s)", file=sys.stderr)
+    # Allocate narration_dur across narrated frames PROPORTIONAL TO WORD COUNT.
+    # Each frame is on-screen for the time its text is being narrated. A frame
+    # with 22 words gets ~22/total_words × narration_dur. Slate (0 words, set
+    # earlier to args.slate_duration) is left unchanged.
+    narrated_words_total = sum(frame_words[:narration_frame_count])
+    if narrated_words_total > 0 and narration_dur > 0:
+        for i in range(narration_frame_count):
+            durations[i] = narration_dur * (frame_words[i] / narrated_words_total)
+        print(f"[render] word-share durations: " +
+              " ".join(f"{frame_words[i]}w→{durations[i]:.1f}s" for i in range(narration_frame_count)),
+              file=sys.stderr)
+    else:
+        # Fallback if no narration: keep stub durations
+        for i in range(narration_frame_count):
+            durations[i] = narration_dur / max(narration_frame_count, 1)
+
+    print(f"[render] total: {sum(durations):.1f}s ({narration_dur:.1f}s narration + {sum(durations[narration_frame_count:]):.1f}s slate)", file=sys.stderr)
 
     # Pre-render each frame as a Ken-Burns clip
     clip_paths = []
