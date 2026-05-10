@@ -2165,7 +2165,17 @@ async def _handle_discord_message(message, force=False):
     # accidentally process a non-owner task with full capabilities.
     # See CLAUDE.md "Discord access control" section for the policy.
     user_task_text = f"[Discord @{username}] {text}{attachment_note}{reply_context}"
-    quoted_task = shlex.quote(user_task_text)
+    # Write task text to a /tmp file and reference via `"$(cat ...)"` heredoc
+    # form instead of shlex.quote'ing it inline. Reason: codex's stdin parser
+    # hangs 7-20min on nested-quote escapes (`'"'"'` style) that arise when
+    # the agent's Bash tool eval-wraps the bridge-injected codex command. The
+    # heredoc form has no nesting depth at any layer; codex receives the file
+    # contents directly via shell command substitution. Per memory
+    # `feedback_codex_nested_quotes_hang_stdin` (Lucy 2026-05-08) + reproduced
+    # live 2026-05-09 PT on Mini coord ping (task-1778363006905, hung 7+min).
+    prompt_path = f"/tmp/sutando-{task_id}.txt"
+    Path(prompt_path).write_text(user_task_text)
+    quoted_task = f'"$(cat {prompt_path})"'
 
     # Pre-classify Discord-state-reference tasks (per msze_'s 2026-05-07
     # directive + Chi's "ship 1" call). If the task body contains a
