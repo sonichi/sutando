@@ -259,6 +259,50 @@ def render_closer_frame(text: str, hero_path: Optional[Path], out_path: Path):
     base.save(out_path, "PNG")
 
 
+def render_slate_frame(series_title: str, episode: str, date: str, out_path: Path):
+    """Series signature slate — 2s end card. Black bg, large brand-red wordmark,
+    small episode + date subtitle. Mini Wire branding per Chi 2026-05-10.
+
+    Layout:
+        [vertical center]
+        SERIES TITLE         ← large, brand red, bold
+        ep. NNN · YYYY.MM.DD ← smaller, white
+    """
+    from PIL import Image, ImageDraw
+    base = Image.new("RGB", (CANVAS_W, CANVAS_H), BG)
+    draw = ImageDraw.Draw(base)
+
+    title_font = get_font(120)
+    sub_font = get_font(36)
+
+    title_text = series_title.upper()
+    sub_text = f"ep. {episode} · {date}"
+
+    # Title bbox
+    tbb = draw.textbbox((0, 0), title_text, font=title_font)
+    tw = tbb[2] - tbb[0]
+    th = tbb[3] - tbb[1]
+    # Subtitle bbox
+    sbb = draw.textbbox((0, 0), sub_text, font=sub_font)
+    sw = sbb[2] - sbb[0]
+    sh = sbb[3] - sbb[1]
+
+    gap = 30
+    total_h = th + gap + sh
+    y_title = (CANVAS_H - total_h) // 2
+
+    # Title in brand red
+    x_title = (CANVAS_W - tw) // 2
+    draw.text((x_title, y_title), title_text, fill=ACCENT, font=title_font)
+
+    # Subtitle in white
+    y_sub = y_title + th + gap
+    x_sub = (CANVAS_W - sw) // 2
+    draw.text((x_sub, y_sub), sub_text, fill=TEXT, font=sub_font)
+
+    base.save(out_path, "PNG")
+
+
 def synthesize_tts(text: str, out_path: Path, provider: str = "GEMINI"):
     """Render full narration to mp3. gemini-tts (free) → openai-tts fallback."""
     repo_root = Path(__file__).resolve().parents[3]
@@ -323,28 +367,41 @@ def kenburns_clip(frame_path: Path, duration_s: float, clip_idx: int, clip_path:
     subprocess.run(cmd, check=True)
 
 
-def concat_clips_with_audio(clip_paths: list, narration_path: Path, out_path: Path):
-    """Concat per-frame clips and overlay narration audio. Output -t = narration_dur."""
+def concat_clips_with_audio(clip_paths: list, narration_path: Path, out_path: Path,
+                             extra_silent_tail_s: float = 0.0):
+    """Concat per-frame clips, overlay narration audio. Output duration =
+    narration_dur + extra_silent_tail_s (slate gets a silent tail).
+
+    Without extra_silent_tail_s the video clips at narration end (TTS finishes,
+    clips truncate at -t). With extra_silent_tail_s we extend video by exactly
+    that much past the narration, leaving the final frame (slate) visible
+    in silence.
+    """
     probe = subprocess.run(
         ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(narration_path)],
         capture_output=True, text=True, check=True,
     )
     narration_dur = float(json.loads(probe.stdout).get("format", {}).get("duration", 0) or 0)
+    total_dur = narration_dur + extra_silent_tail_s
 
     concat_list = clip_paths[0].parent / "concat.txt"
     with open(concat_list, "w") as f:
         for cp in clip_paths:
             f.write(f"file '{cp.resolve()}'\n")
 
+    # Pad audio with silence so AV streams stay synced through the slate.
+    # apad=pad_dur=<extra> appends silence; -t clips total to total_dur.
+    audio_filter = ["-af", f"apad=pad_dur={extra_silent_tail_s:.3f}"] if extra_silent_tail_s > 0 else []
+
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-f", "concat", "-safe", "0", "-i", str(concat_list),
         "-i", str(narration_path),
+        *audio_filter,
         "-c:v", "libx264", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "128k",
         "-r", str(FPS),
-        "-t", f"{narration_dur:.3f}",
-        "-shortest",
+        "-t", f"{total_dur:.3f}",
         str(out_path),
     ]
     subprocess.run(cmd, check=True)
@@ -354,6 +411,11 @@ def main():
     p = argparse.ArgumentParser(description="Render make-viral-video output")
     p.add_argument("--workdir", required=True, help="state/viral-{ts}/ directory")
     p.add_argument("--tts-provider", default="GEMINI", choices=["GEMINI", "OPENAI"])
+    p.add_argument("--series-title", default="Mini Wire",
+                   help="Branded series name shown on the end-card slate (set empty to skip slate).")
+    p.add_argument("--episode", default="001", help="Episode number for slate (e.g. '001')")
+    p.add_argument("--date", default=None, help="Date for slate (YYYY.MM.DD); defaults to today")
+    p.add_argument("--slate-duration", type=float, default=2.0, help="End-card slate duration (s)")
     args = p.parse_args()
 
     workdir = Path(args.workdir)
@@ -424,6 +486,21 @@ def main():
         durations.append(CLOSER_DUR)
         frame_idx += 1
 
+    # Track narration-mapped frame count BEFORE adding the slate. The slate
+    # is silent (extends video beyond TTS) and must NOT be scaled to fit
+    # narration duration. Only durations[:narration_frame_count] get scaled.
+    narration_frame_count = frame_idx
+
+    # Series signature slate (Mini Wire branding per Chi 2026-05-10).
+    if args.series_title:
+        from datetime import datetime
+        slate_date = args.date or datetime.now().strftime("%Y.%m.%d")
+        render_slate_frame(args.series_title, args.episode, slate_date,
+                           frames_dir / f"frame_{frame_idx:03d}.png")
+        durations.append(args.slate_duration)
+        frame_idx += 1
+        print(f"[render] added slate: {args.series_title} ep.{args.episode} {slate_date}", file=sys.stderr)
+
     print(f"[render] {frame_idx} frames, planned duration {sum(durations):.1f}s", file=sys.stderr)
 
     full_narration = " ".join(filter(None, [sections.get("HOOK"), sections.get("SUPPORT"), sections.get("CLOSER")]))
@@ -440,12 +517,13 @@ def main():
         narration_dur = float(json.loads(probe.stdout).get("format", {}).get("duration", 0))
     except Exception as e:
         print(f"[render] ffprobe on narration failed ({e}); using planned durations", file=sys.stderr)
-        narration_dur = sum(durations)
+        narration_dur = sum(durations[:narration_frame_count])
 
-    if narration_dur > 0 and abs(narration_dur - sum(durations)) > 1.0:
-        scale = narration_dur / sum(durations)
-        durations = [d * scale for d in durations]
-        print(f"[render] scaled durations by {scale:.2f}x to match narration {narration_dur:.1f}s", file=sys.stderr)
+    narrated_planned = sum(durations[:narration_frame_count])
+    if narration_dur > 0 and abs(narration_dur - narrated_planned) > 1.0:
+        scale = narration_dur / narrated_planned
+        durations = [d * scale for d in durations[:narration_frame_count]] + durations[narration_frame_count:]
+        print(f"[render] scaled narrated durations by {scale:.2f}x (slate kept at {durations[narration_frame_count] if narration_frame_count < len(durations) else 0:.1f}s)", file=sys.stderr)
 
     # Pre-render each frame as a Ken-Burns clip
     clip_paths = []
@@ -456,7 +534,9 @@ def main():
     print(f"[render] {len(clip_paths)} Ken-Burns clips", file=sys.stderr)
 
     out = workdir / "video.mp4"
-    concat_clips_with_audio(clip_paths, narration_path, out)
+    # Slate (if present) extends video duration past narration by slate_duration.
+    extra_tail = args.slate_duration if args.series_title else 0.0
+    concat_clips_with_audio(clip_paths, narration_path, out, extra_silent_tail_s=extra_tail)
     print(f"[render] {out}")
     return 0
 
