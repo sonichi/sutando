@@ -73,11 +73,65 @@ Per Chi's "visual needs improvement too":
 - Aspect: 1280×720 (16:9). NOT vertical 9:16 (Lucy's v10/v11 cropped pictures because of this; landscape preserves news-photo composition).
 - Typography: max 2 fonts (one display, one body). Body font must read at 36pt against any image (test: bottom-third of the frame must contain text or be black-strip overlay).
 
-## TTS provider selection
+## TTS provider + voice selection
 
-Default: `GEMINI` (free tier, Aoede voice, 1500 req/day quota). Fallback: `OPENAI` (sage voice, paid, ~$0.02/min).
+Default: `GEMINI` (free tier, 1500 req/day quota) → `OPENAI` (sage voice, ~$0.02/min) fallback.
 
-Override: `TTS_PROVIDER=OPENAI` env var.
+Voice flags (per `render.py --help`):
+- `--gemini-voice {Aoede,Charon,Kore,Puck}` (default `Aoede`)
+  - **Aoede** — alto/neutral, default, fits documentary tone
+  - **Charon** — baritone news-anchor; per Susan/Lucy 2026-05-10: matches news-explainer shape
+  - Kore (mid expressive), Puck (high conversational)
+- `--openai-voice` — free-text (used only on OpenAI fallback path)
+
+## Series branding (Mini Wire)
+
+The skill ships an end-card slate (last 2s) for series identity. Per Chi 2026-05-10:
+
+```
+MINI WIRE
+by Echo Act IV · Sutando   (optional byline)
+ep. 001 · 2026.05.10
+```
+
+Slate flags:
+- `--series-title "Mini Wire"` — wordmark in brand red. Empty string skips the slate entirely.
+- `--episode 001`
+- `--date 2026.05.10` (defaults to today)
+- `--byline "by Echo Act IV · Sutando"` — free-text, between title and episode line. Empty omits byline. **Caller controls every word — no hardcoded identity in render.py.**
+- `--slate-duration 2.0` — seconds
+
+The slate is **silent** — narration runs over the prior frames; slate gets a `apad=pad_dur=2` audio tail so AV streams stay synced through the silent end-card.
+
+## Multi-image visual support
+
+`render.py` reads `asset_manifest.json` and maps each entry's `purpose` to its frame:
+- `purpose=hook` → HOOK frame bg
+- `purpose=support` (idx N) → SUPPORT[N] frame bg
+- `purpose=closer` → CLOSER frame bg
+- Falls back to first non-`data-card-*` real image if no explicit asset
+
+Manifest entries have shape:
+```json
+{
+  "url": "https://example.com/photo.jpg",
+  "local_file": "photo.jpg",
+  "alt": "...",
+  "purpose": "hook|support|closer",
+  "provenance": "..."
+}
+```
+
+Per-frame durations are allocated **proportional to that frame's narration word count** (not fixed allocations). 18-word HOOK gets ~3× the screen time of a 6-word SUPPORT sliver — fixes the "scene changed before narration finished" failure mode.
+
+## Asset cache (cross-run reuse)
+
+Shared cache at `state/viral-cache/fetched_assets/` keyed by URL → local-file mapping. `build.sh` automatically:
+- Phase 0.5: preload cache hits (if manifest exists) before fetch attempts
+- Phase 1.5: preload again after codex writes manifest (catches DNS/403 failures the cache can fix)
+- Phase 2.5: promote validated assets to cache for future runs
+
+Manual control via `python3 skills/make-viral-video/scripts/asset_cache.py {preload|promote|list} <run_dir>`. Cache index at `state/viral-cache/index.json`.
 
 ## Smoke test
 
