@@ -267,6 +267,34 @@ def archive_file(src: "Path", kind: str, task_id: str) -> None:
             src.unlink(missing_ok=True)
         except Exception:
             pass
+
+
+def notify_agent_api_task_done(task_id: str, result: str) -> None:
+    """POST to agent-api /task-done so web UI flips status without waiting
+    for its next /tasks/active poll. Best-effort; silent on failure (web UI
+    will catch up on next poll regardless).
+
+    Mirrors voice-agent's task-bridge.ts:533 path. Used after bridge
+    dm-fallback successfully delivers a result that voice-agent never saw
+    (i.e., voice was down). Without this, web UI has a ~5s lag flipping
+    the task to done.
+    """
+    try:
+        import urllib.request
+        token = os.environ.get("SUTANDO_API_TOKEN", "")
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        body = json.dumps({"taskId": task_id, "result": result}).encode("utf-8")
+        req = urllib.request.Request(
+            "http://localhost:7843/task-done",
+            data=body,
+            headers=headers,
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=2).read()
+    except Exception:
+        pass  # best-effort; agent-api will catch up via polling
 INBOX_DIR = Path("/tmp/discord-inbox")
 TASKS_DIR.mkdir(exist_ok=True)
 RESULTS_DIR.mkdir(exist_ok=True)
@@ -2365,6 +2393,12 @@ async def poll_dm_fallback():
                 if st.st_size == 0:
                     print(f"  [dm-fallback] dropping empty {f.name}", flush=True)
                     f.unlink(missing_ok=True)
+                    # Archive matching task file so audit_orphan_tasks sees
+                    # the task as processed (even if drop-without-reply).
+                    _task_id = f.stem
+                    _task_file = TASKS_DIR / f"{_task_id}.txt"
+                    if _task_file.exists():
+                        archive_file(_task_file, "tasks", _task_id)
                     continue
                 # Stop retrying after 24h. Without this cap, a permanent
                 # failure (bad channel ID, bot removed from DM, etc.)
@@ -2374,6 +2408,10 @@ async def poll_dm_fallback():
                 if age > MAX_RETRY_AGE_SECONDS:
                     print(f"  [dm-fallback] dropping stale {f.name} (age={int(age)}s)", flush=True)
                     f.unlink(missing_ok=True)
+                    _task_id = f.stem
+                    _task_file = TASKS_DIR / f"{_task_id}.txt"
+                    if _task_file.exists():
+                        archive_file(_task_file, "tasks", _task_id)
                     continue
                 # Subprocess out to the shared CLI tool so there's only one
                 # code path for the voiceConnected check + DM send.
@@ -2381,9 +2419,13 @@ async def poll_dm_fallback():
                 # bare `python3` may resolve to a different interpreter than the one
                 # running the bridge, or fail with "command not found" on minimal PATH.
                 try:
+                    # stdin=DEVNULL: under launchd, parent's fd 0 may be invalid,
+                    # causing the child Python's `init_sys_streams` to fail with
+                    # `OSError: [Errno 9] Bad file descriptor`. Force clean stdin.
                     result = subprocess.run(
                         [sys.executable, str(REPO / "src" / "dm-result.py"), "--file", str(f)],
                         capture_output=True, text=True, timeout=15,
+                        stdin=subprocess.DEVNULL,
                     )
                 except Exception as e:
                     print(f"  [dm-fallback] subprocess failed on {f.name}: {e}", flush=True)
@@ -2395,7 +2437,25 @@ async def poll_dm_fallback():
                     if "skipping DM" in stdout:
                         continue
                     print(f"  [dm-fallback] sent {f.name} via dm-result.py", flush=True)
-                    f.unlink(missing_ok=True)
+                    # Archive both result and matching task file (parity with
+                    # the main reply path at line ~2219). Without this, tasks
+                    # accumulate in tasks/ forever and audit_orphan_tasks
+                    # reports false-positive orphans.
+                    _task_id = f.stem
+                    # Read result content BEFORE archive so we can POST to
+                    # /task-done. Voice-agent's task-bridge does the same
+                    # via fetch(); this keeps web UI status in sync without
+                    # waiting for agent-api's next /tasks/active poll.
+                    try:
+                        _result_text = f.read_text(encoding="utf-8", errors="replace")
+                    except OSError:
+                        _result_text = ""
+                    archive_file(f, "results", _task_id)
+                    _task_file = TASKS_DIR / f"{_task_id}.txt"
+                    if _task_file.exists():
+                        archive_file(_task_file, "tasks", _task_id)
+                    if _result_text and _task_id.startswith("task-"):
+                        notify_agent_api_task_done(_task_id, _result_text)
                 else:
                     stderr = (result.stderr or "").strip()[:200]
                     print(f"  [dm-fallback] dm-result.py failed on {f.name}: {stderr}", flush=True)
