@@ -804,16 +804,19 @@ _PREFETCH_MAX_MESSAGES_PER_REF = 5
 _PREFETCH_EXCERPT_MAX = 280
 _PREFETCH_CACHE = {}  # (channel_id, bucket_60s) -> formatted block; in-process only
 _PREFETCH_CACHE_TTL_S = 60
+_PREFETCH_PER_REF_TIMEOUT_S = 8.0  # bounded wait per fetch_channel + history call
 
 
 async def _fetch_discord_channel_messages(channel_id, n=_PREFETCH_MAX_MESSAGES_PER_REF):
     """Fetch the last `n` messages from a Discord channel via the bot's REST
-    client. Returns a formatted text block (newest-first, with author + relative
-    timestamp + truncated content) or None on any failure (channel not found,
-    bot lacks permission, channel not text/thread, transient API error).
+    client. Returns one of three sentinel values:
+      - a non-empty formatted string  → channel has messages
+      - the empty string `""`         → channel exists + readable but is empty
+      - the literal `None`            → fetch FAILED (perms / NotFound / timeout / wrong type)
 
-    Returning None — not raising — is deliberate: the caller falls through to
-    silent-escalate if pre-fetch yields nothing usable.
+    The empty-string-vs-None distinction lets the caller treat empty channels
+    as a real answer ("no recent messages") rather than escalating as if the
+    fetch had failed.
     """
     cache_bucket = int(time.time() // _PREFETCH_CACHE_TTL_S)
     cache_key = (int(channel_id), cache_bucket)
@@ -822,7 +825,13 @@ async def _fetch_discord_channel_messages(channel_id, n=_PREFETCH_MAX_MESSAGES_P
     try:
         ch = client.get_channel(int(channel_id))
         if ch is None:
-            ch = await client.fetch_channel(int(channel_id))
+            ch = await asyncio.wait_for(
+                client.fetch_channel(int(channel_id)),
+                timeout=_PREFETCH_PER_REF_TIMEOUT_S,
+            )
+    except asyncio.TimeoutError:
+        print(f"  [discord-state-prefetch] resolve channel {channel_id} timed out after {_PREFETCH_PER_REF_TIMEOUT_S}s", flush=True)
+        return None
     except Exception as e:
         print(f"  [discord-state-prefetch] resolve channel {channel_id} failed: {e}", flush=True)
         return None
@@ -843,9 +852,16 @@ async def _fetch_discord_channel_messages(channel_id, n=_PREFETCH_MAX_MESSAGES_P
         print(f"  [discord-state-prefetch] channel {channel_id} type={ch_type} not text/thread; skipping", flush=True)
         return None
     try:
-        msgs = []
-        async for m in ch.history(limit=n):
-            msgs.append(m)
+        async def _drain_history():
+            collected = []
+            async for m in ch.history(limit=n):
+                collected.append(m)
+            return collected
+
+        msgs = await asyncio.wait_for(_drain_history(), timeout=_PREFETCH_PER_REF_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        print(f"  [discord-state-prefetch] history({n}) on channel {channel_id} timed out after {_PREFETCH_PER_REF_TIMEOUT_S}s", flush=True)
+        return None
     except Exception as e:
         # Forbidden / NotFound / HTTPException / unexpected — all silent-fail.
         # The `_silent_escalate_for_discord_state` path is the safety net.
@@ -853,8 +869,8 @@ async def _fetch_discord_channel_messages(channel_id, n=_PREFETCH_MAX_MESSAGES_P
         return None
     if not msgs:
         # Channel exists + readable but empty — return empty marker so we don't
-        # re-fetch on every retry within the cache window. Caller treats as no
-        # useful prefetched content.
+        # re-fetch on every retry within the cache window. Caller treats as a
+        # successful "no recent messages" answer (distinct from a failed fetch).
         formatted = ""
         _PREFETCH_CACHE[cache_key] = formatted
         return formatted
@@ -880,14 +896,22 @@ async def _prefetch_discord_state_refs(user_task_text):
     """For every `<#channel_id>` reference in `user_task_text`, attempt to fetch
     the channel's recent messages via the bot's REST client and produce a
     prepended context block. Returns the enriched task body (context block +
-    `[Original task body:]` separator + original text) when at least one ref
-    fetched usefully. Returns None when there are no refs OR all fetches
-    failed (caller falls through to `_silent_escalate_for_discord_state`).
+    `[Original task body:]` separator + original text) when ALL refs fetched
+    usefully (including empty channels — those render as "[no recent messages]"
+    so the agent gets a real answer). Returns None when there are no refs OR
+    ANY ref fetch failed — falling through to silent-escalate avoids handing
+    the agent partial context that could lead to wrong answers.
 
     This is the proactive path (option 3 from Chi's 2026-05-08 strategy chat)
     that lets the agent layer answer Discord-state questions WITHOUT codex
     sandbox needing API access. Replaces the old "always silent-escalate on a
     `<#...>` ref" behavior with a try-then-fall-through shape.
+
+    All-or-nothing semantics on multi-ref tasks (per PR #644 cold review):
+    if a user asks "compare <#A> with <#B>" and <#B> is Forbidden, the bridge
+    should NOT proceed with only <#A> — that would let the agent confidently
+    answer half the question. Instead, return None and let silent-escalate
+    handle the whole task with the in-band rule.
     """
     if not user_task_text:
         return None
@@ -906,10 +930,18 @@ async def _prefetch_discord_state_refs(user_task_text):
     blocks = []
     for ref in ordered_refs:
         formatted = await _fetch_discord_channel_messages(ref)
-        if not formatted:  # None (failed) or empty string (channel empty)
-            continue
-        blocks.append(f"[Channel <#{ref}> recent messages:\n{formatted}\n]")
+        if formatted is None:
+            # Failure (perms / NotFound / timeout / wrong type). Fail-closed:
+            # one bad ref invalidates the whole prefetch. Caller silent-escalates.
+            print(f"  [discord-state-prefetch] one ref failed (<#{ref}>); failing whole prefetch to avoid partial context", flush=True)
+            return None
+        if formatted == "":
+            # Channel exists + readable + empty. That IS a real answer.
+            blocks.append(f"[Channel <#{ref}> recent messages:\n  [no recent messages]\n]")
+        else:
+            blocks.append(f"[Channel <#{ref}> recent messages:\n{formatted}\n]")
     if not blocks:
+        # No refs survived (e.g. all dedup'd to empty after filter). Fall through.
         return None
     enriched = "\n\n".join(blocks) + "\n\n[Original task body:]\n" + user_task_text
     return enriched

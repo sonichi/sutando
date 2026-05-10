@@ -282,18 +282,22 @@ def case_f_duplicate_refs_dedup():
     return fails
 
 
-def case_g_empty_channel_no_block():
-    """Channel readable but no messages → empty-string marker; no block emitted."""
+def case_g_empty_channel_renders_marker():
+    """Channel readable but no messages → empty-string from fetch; rendered as
+    `[no recent messages]` block in enriched body. Empty IS a real answer
+    (per PR #644 v2 review fix #2 — distinguish empty from failed fetch)."""
     fails = []
     _clear_cache()
     ch = _MockChannel(666, "empty", "text", messages=[])
     _install_mock_client({666: ch})
     enriched = asyncio.run(bridge._prefetch_discord_state_refs("look at <#666>"))
-    # Empty channel returns "" from _fetch_..., which is falsy in
-    # _prefetch loop's `if not formatted` test → block not added → no usable
-    # blocks → overall returns None.
-    if enriched is not None:
-        fails.append(f"g) empty channel should yield None overall (no usable blocks); got enriched")
+    if enriched is None:
+        fails.append("g) empty channel should yield enriched body with 'no recent messages' marker; got None")
+        return fails
+    if "no recent messages" not in enriched:
+        fails.append(f"g) enriched body should contain 'no recent messages' marker; got: {enriched[:200]!r}")
+    if "Channel <#666>" not in enriched:
+        fails.append(f"g) enriched body should reference <#666>; got: {enriched[:200]!r}")
     return fails
 
 
@@ -347,6 +351,67 @@ def case_j_unexpected_exception_silent_fail():
     return fails
 
 
+def case_k_partial_failure_fails_whole_prefetch():
+    """v2 fix #1: multi-ref task where one ref succeeds and one fails should
+    fail the whole prefetch (return None), not return partial context. Lets
+    silent-escalate handle the whole task instead of letting the agent see
+    only half the references and answer confidently-wrong."""
+    fails = []
+    _clear_cache()
+    good = _MockChannel(111, "good", "text", [_MockMessage("a", "u1", "msg from good", _now_dt())])
+    bad = _MockChannel(222, "bad", "text", history_raises=_Forbidden("no access"))
+    _install_mock_client({111: good, 222: bad})
+    body = "compare <#111> with <#222>"
+    enriched = asyncio.run(bridge._prefetch_discord_state_refs(body))
+    if enriched is not None:
+        fails.append("k) one-ref-fails should fail whole prefetch (return None); got partial enriched body")
+        if "Channel <#111>" in (enriched or "") and "Channel <#222>" not in (enriched or ""):
+            fails.append("k)   ...and partial body contains good ref but not bad — exactly the wrong-answer pattern PR #644 v2 prevents")
+    return fails
+
+
+def case_l_history_timeout_returns_none():
+    """v2 fix #3: a history() call that hangs longer than the per-ref timeout
+    should be treated as a failed fetch. Simulated by patching
+    _PREFETCH_PER_REF_TIMEOUT_S to a small value and an async history that
+    sleeps longer."""
+    fails = []
+    _clear_cache()
+    import asyncio as _asyncio
+
+    class _SlowHistory:
+        def __init__(self, delay_s):
+            self._delay = delay_s
+        def __aiter__(self): return self
+        async def __anext__(self):
+            await _asyncio.sleep(self._delay)
+            raise StopAsyncIteration
+
+    class _SlowChannel:
+        def __init__(self, channel_id, delay_s):
+            self.id = channel_id
+            self.type = "text"
+            self.name = "slow"
+            self._delay = delay_s
+            self.history_call_count = 0
+        def history(self, limit=5):
+            self.history_call_count += 1
+            return _SlowHistory(self._delay)
+
+    # Bridge will use whatever _PREFETCH_PER_REF_TIMEOUT_S is at call time.
+    original_timeout = bridge._PREFETCH_PER_REF_TIMEOUT_S
+    try:
+        bridge._PREFETCH_PER_REF_TIMEOUT_S = 0.05  # 50ms
+        slow = _SlowChannel(999, delay_s=0.5)  # 500ms — well over the timeout
+        _install_mock_client({999: slow})
+        enriched = asyncio.run(bridge._prefetch_discord_state_refs("read <#999>"))
+        if enriched is not None:
+            fails.append("l) history timeout should fail prefetch (return None); got enriched body")
+    finally:
+        bridge._PREFETCH_PER_REF_TIMEOUT_S = original_timeout
+    return fails
+
+
 def main():
     cases = [
         ("a-ref-with-perms-prepends", case_a_ref_with_perms_prepends),
@@ -355,10 +420,12 @@ def main():
         ("d-wrong-channel-type-falls-through", case_d_wrong_channel_type_falls_through),
         ("e-multiple-refs-source-order", case_e_multiple_refs_all_prepended_in_order),
         ("f-duplicate-refs-dedup", case_f_duplicate_refs_dedup),
-        ("g-empty-channel-no-block", case_g_empty_channel_no_block),
+        ("g-empty-channel-renders-marker", case_g_empty_channel_renders_marker),
         ("h-cache-hit-skips-refetch", case_h_cache_hit_skips_refetch),
         ("i-no-refs-returns-none", case_i_no_refs_returns_none),
         ("j-unexpected-exception-silent-fail", case_j_unexpected_exception_silent_fail),
+        ("k-partial-failure-fails-whole-prefetch", case_k_partial_failure_fails_whole_prefetch),
+        ("l-history-timeout-returns-none", case_l_history_timeout_returns_none),
     ]
     failures = []
     for label, fn in cases:
