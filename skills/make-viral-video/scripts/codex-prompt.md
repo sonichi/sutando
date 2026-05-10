@@ -38,9 +38,11 @@ an image, a quote, an event, or a juxtaposition — that lands as a share-moment
 # Output structure (3 parts) — STRICT length budget
 
 **Total narration budget: ≤ {{TARGET_DURATION_S}} seconds at TTS pace.**
-At ~155 words/minute (typical TTS rate for Aoede / sage), this means
-≤ ⌊{{TARGET_DURATION_S}} × 2.6⌋ words across HOOK + SUPPORT + CLOSER combined.
-For a 45s target, that's ~117 words. For a 30s target, ~78 words.
+At ~120 words/minute (typical TTS rate for Aoede / sage), this means
+≤ ⌊{{TARGET_DURATION_S}} × 2.0⌋ words across HOOK + SUPPORT + CLOSER combined.
+For a 45s target, that's ~90 words. For a 30s target, ~60 words.
+
+(Empirically: Aoede TTS = ~117 wpm on 2026-05-10 UAP re-run. Conservative budget at 120 wpm leaves 3-5s headroom for inter-sentence silence.)
 
 The ffprobe pre-publish gate enforces narration duration ≤ {{TARGET_DURATION_S}}+5s.
 Drift past that is a planning bug — count words before you finalize the script.
