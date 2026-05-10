@@ -305,11 +305,18 @@ def kenburns_clip(frame_path: Path, duration_s: float, clip_idx: int, clip_path:
         f"d={total_frames}:s={CANVAS_W}x{CANVAS_H}:fps={FPS}"
     )
 
+    # CRITICAL: -t goes at the OUTPUT, not the input. Input -t with -loop 1 + zoompan
+    # causes zoompan to fire per-input-frame, producing duration*fps output frames
+    # PER input frame (so a 4s clip ended up 400s). With -t at output, zoompan
+    # uses the d=total_frames as the motion span, and -t clips the encode to
+    # exactly duration_s. Bug caught 2026-05-10 after re-run 5 sampled frames
+    # showed only the HOOK across the whole 36s video.
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        "-loop", "1", "-t", f"{duration_s:.3f}", "-i", str(frame_path),
+        "-loop", "1", "-i", str(frame_path),
         "-vf", vf,
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", str(FPS),
+        "-t", f"{duration_s:.3f}",
         "-an",
         str(clip_path),
     ]
