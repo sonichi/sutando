@@ -368,10 +368,29 @@ def main():
     sections = parse_script(script_md)
     print(f"[render] sections: {list(sections.keys())}", file=sys.stderr)
 
+    # Per-frame asset selection from manifest (Mini Phase 3, 2026-05-10).
+    # Manifest entries with purpose in {hook, support, closer} map to frames.
+    # Multi-image support — fixes Lucy's "only one image across the whole video"
+    # critique on re-run 5b. Fallback: hero (first real image) if no explicit
+    # asset for a frame.
+    manifest_path = artifacts / "asset_manifest.json"
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else []
     hero = find_hero_image(fetched)
-    print(f"[render] hero image: {hero}", file=sys.stderr)
-    if not hero:
-        print("[render] WARNING: no real fetched image — falling back to text-on-black", file=sys.stderr)
+    print(f"[render] hero (fallback): {hero}", file=sys.stderr)
+
+    def asset_for(purpose: str, idx: int = 0):
+        matches = [m for m in manifest if m.get("purpose") == purpose]
+        if purpose == "support" and idx < len(matches):
+            target = matches[idx].get("local_file") or matches[idx].get("url", "").split("/")[-1]
+            p = fetched / target
+            if p.is_file():
+                return p
+        elif purpose != "support" and matches:
+            target = matches[0].get("local_file") or matches[0].get("url", "").split("/")[-1]
+            p = fetched / target
+            if p.is_file():
+                return p
+        return hero
 
     # Default per-section durations (will be scaled to narration length below)
     HOOK_DUR = 4.0
@@ -382,7 +401,7 @@ def main():
     frame_idx = 0
 
     if sections.get("HOOK"):
-        render_hook_frame(sections["HOOK"], hero, frames_dir / f"frame_{frame_idx:03d}.png")
+        render_hook_frame(sections["HOOK"], asset_for("hook"), frames_dir / f"frame_{frame_idx:03d}.png")
         durations.append(HOOK_DUR)
         frame_idx += 1
 
@@ -391,16 +410,17 @@ def main():
     support_facts = [f for f in support_facts if f.strip()]
 
     for i, fact in enumerate(support_facts):
-        if hero:
-            render_support_frame(hero, fact, frames_dir / f"frame_{frame_idx:03d}.png", crop_seed=i)
+        sup_asset = asset_for("support", i)
+        if sup_asset:
+            render_support_frame(sup_asset, fact, frames_dir / f"frame_{frame_idx:03d}.png", crop_seed=i)
         else:
-            # No hero: render as text-on-black via closer renderer (looks like a quote card)
+            # No asset: render as text-on-black via closer renderer (quote-card shape)
             render_closer_frame(fact, None, frames_dir / f"frame_{frame_idx:03d}.png")
         durations.append(SUPPORT_DUR)
         frame_idx += 1
 
     if sections.get("CLOSER"):
-        render_closer_frame(sections["CLOSER"], hero, frames_dir / f"frame_{frame_idx:03d}.png")
+        render_closer_frame(sections["CLOSER"], asset_for("closer"), frames_dir / f"frame_{frame_idx:03d}.png")
         durations.append(CLOSER_DUR)
         frame_idx += 1
 
