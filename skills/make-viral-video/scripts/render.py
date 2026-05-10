@@ -197,8 +197,15 @@ def render_hook_frame(text: str, hero_path: Optional[Path], out_path: Path):
     base.save(out_path, "PNG")
 
 
-def render_support_frame(hero_path: Path, caption: str, out_path: Path, crop_seed: int = 0):
-    """Hero image with crop variation + semi-transparent caption strip overlay."""
+def render_support_frame(hero_path: Path, caption: str, out_path: Path,
+                          crop_seed: int = 0, badge: str = ""):
+    """Hero image with crop variation + caption strip + optional name badge.
+
+    If `badge` is non-empty, draws a styled name-chip in the top-left of the
+    frame (e.g. "HARRISON SCHMITT"). Per Lucy's v1.7 design: when the bg image
+    is a person's portrait, the badge anchors who's on screen for viewers
+    who joined mid-scroll. Free-text — caller controls the wording.
+    """
     from PIL import Image, ImageDraw
     bg = hero_bg(hero_path, dim_alpha=70).convert("RGB")
     overlay = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 0))
@@ -214,6 +221,19 @@ def render_support_frame(hero_path: Path, caption: str, out_path: Path, crop_see
     for line in lines:
         draw.text((40, y), line, fill=TEXT, font=cap_font)
         y += 48
+
+    # Top-left name badge (e.g. "HARRISON SCHMITT") in brand-red chip
+    if badge:
+        badge_text = badge.upper()
+        badge_font = get_font(28)
+        bbb = draw.textbbox((0, 0), badge_text, font=badge_font)
+        bw = bbb[2] - bbb[0]
+        bh = bbb[3] - bbb[1]
+        pad_x, pad_y = 18, 12
+        chip_w = bw + pad_x * 2
+        chip_h = bh + pad_y * 2 + 6
+        draw.rectangle([(40, 40), (40 + chip_w, 40 + chip_h)], fill=ACCENT)
+        draw.text((40 + pad_x, 40 + pad_y), badge_text, fill=TEXT, font=badge_font)
 
     out = Image.alpha_composite(bg.convert("RGBA"), overlay).convert("RGB")
     out.save(out_path, "PNG")
@@ -470,18 +490,20 @@ def main():
     print(f"[render] hero (fallback): {hero}", file=sys.stderr)
 
     def asset_for(purpose: str, idx: int = 0):
+        """Return (Path, manifest_entry) for the requested purpose+idx, or
+        (hero, None) on fallback. Manifest entry exposes badge / alt / etc."""
         matches = [m for m in manifest if m.get("purpose") == purpose]
+        entry = None
         if purpose == "support" and idx < len(matches):
-            target = matches[idx].get("local_file") or matches[idx].get("url", "").split("/")[-1]
-            p = fetched / target
-            if p.is_file():
-                return p
+            entry = matches[idx]
         elif purpose != "support" and matches:
-            target = matches[0].get("local_file") or matches[0].get("url", "").split("/")[-1]
+            entry = matches[0]
+        if entry:
+            target = entry.get("local_file") or entry.get("url", "").split("/")[-1]
             p = fetched / target
             if p.is_file():
-                return p
-        return hero
+                return p, entry
+        return hero, None
 
     # Per-frame durations are allocated PROPORTIONAL to that frame's narration
     # word count (Mini fix 2026-05-10 after Chi: "initial scene changed
@@ -493,7 +515,8 @@ def main():
     frame_idx = 0
 
     if sections.get("HOOK"):
-        render_hook_frame(sections["HOOK"], asset_for("hook"), frames_dir / f"frame_{frame_idx:03d}.png")
+        hook_path, _ = asset_for("hook")
+        render_hook_frame(sections["HOOK"], hook_path, frames_dir / f"frame_{frame_idx:03d}.png")
         durations.append(0.0)
         frame_words.append(len(sections["HOOK"].split()))
         frame_idx += 1
@@ -503,9 +526,11 @@ def main():
     support_facts = [f for f in support_facts if f.strip()]
 
     for i, fact in enumerate(support_facts):
-        sup_asset = asset_for("support", i)
+        sup_asset, sup_entry = asset_for("support", i)
         if sup_asset:
-            render_support_frame(sup_asset, fact, frames_dir / f"frame_{frame_idx:03d}.png", crop_seed=i)
+            badge = (sup_entry.get("badge", "") if sup_entry else "")
+            render_support_frame(sup_asset, fact, frames_dir / f"frame_{frame_idx:03d}.png",
+                                  crop_seed=i, badge=badge)
         else:
             render_closer_frame(fact, None, frames_dir / f"frame_{frame_idx:03d}.png")
         durations.append(0.0)
@@ -513,7 +538,8 @@ def main():
         frame_idx += 1
 
     if sections.get("CLOSER"):
-        render_closer_frame(sections["CLOSER"], asset_for("closer"), frames_dir / f"frame_{frame_idx:03d}.png")
+        closer_path, _ = asset_for("closer")
+        render_closer_frame(sections["CLOSER"], closer_path, frames_dir / f"frame_{frame_idx:03d}.png")
         durations.append(0.0)
         frame_words.append(len(sections["CLOSER"].split()))
         frame_idx += 1
