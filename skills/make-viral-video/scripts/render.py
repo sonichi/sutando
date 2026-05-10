@@ -225,7 +225,20 @@ def synthesize_tts(text: str, out_path: Path, provider: str = "GEMINI"):
 
 
 def encode_video(frames_dir: Path, narration_path: Path, durations_s: list, out_path: Path):
-    """Concat frames at fixed durations, overlay narration audio. Uses ffmpeg concat demuxer."""
+    """Concat frames at fixed durations, overlay narration audio. Uses ffmpeg concat demuxer.
+
+    Audio duration is the source of truth for output length. We set output `-t`
+    to the narration duration so video always matches audio (no AV-sync drift
+    from concat-demuxer's last-frame-repeat behavior, caught in smoke test
+    2026-05-10).
+    """
+    # Get exact narration duration
+    probe = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(narration_path)],
+        capture_output=True, text=True, check=True,
+    )
+    narration_dur = float(json.loads(probe.stdout).get("format", {}).get("duration", sum(durations_s)))
+
     # Build concat list file
     concat_list = frames_dir / "concat.txt"
     with open(concat_list, "w") as f:
@@ -243,7 +256,7 @@ def encode_video(frames_dir: Path, narration_path: Path, durations_s: list, out_
         "-c:v", "libx264", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "128k",
         "-r", str(FPS),
-        "-shortest",
+        "-t", f"{narration_dur:.3f}",  # clip output to exact narration length
         str(out_path),
     ]
     subprocess.run(cmd, check=True)
@@ -316,6 +329,25 @@ def main():
     narration_path = workdir / "narration.mp3"
     provider_used = synthesize_tts(full_narration, narration_path, provider=args.tts_provider)
     print(f"[render] narration via {provider_used}", file=sys.stderr)
+
+    # Scale frame durations to match narration length so the video doesn't
+    # cut off mid-sentence (caught by smoke test 2026-05-10: 25s frames vs
+    # 57s narration → ffmpeg --shortest truncated audio). Scale proportionally,
+    # keeping the relative weights of HOOK / SUPPORT / CLOSER frames intact.
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(narration_path)],
+            capture_output=True, text=True, check=True,
+        )
+        narration_dur = float(json.loads(probe.stdout).get("format", {}).get("duration", 0))
+    except Exception as e:
+        print(f"[render] ffprobe on narration failed ({e}); using planned durations", file=sys.stderr)
+        narration_dur = sum(durations)
+
+    if narration_dur > 0 and abs(narration_dur - sum(durations)) > 1.0:
+        scale = narration_dur / sum(durations)
+        durations = [d * scale for d in durations]
+        print(f"[render] scaled frame durations by {scale:.2f}x to match narration {narration_dur:.1f}s", file=sys.stderr)
 
     # Encode
     out = workdir / "video.mp4"

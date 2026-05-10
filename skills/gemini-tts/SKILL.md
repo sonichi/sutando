@@ -6,7 +6,7 @@ user-invocable: true
 
 # Gemini TTS
 
-Synthesize speech via Google's `gemini-2.5-flash-tts` (or `-pro-tts` / `-lite-preview-tts` per env override). Reads `GEMINI_API_KEY` from `.env`.
+Synthesize speech via Google's `gemini-2.5-flash-preview-tts` (or `-pro-tts` / `-lite-preview-tts` per env override). Reads `GEMINI_API_KEY` from `.env`.
 
 This is offline synthesis — distinct from voice-agent's bidirectional Gemini Live audio. Same model family, different surface (POST text → get audio bytes back, no streaming).
 
@@ -20,7 +20,7 @@ ARGUMENTS: $ARGUMENTS
 
 ## Model selection
 
-Default: `gemini-2.5-flash-tts` (free tier, 1500 req/day, $0 within quota).
+Default: `gemini-2.5-flash-preview-tts` (free tier, 1500 req/day, $0 within quota).
 
 Override via `GEMINI_TTS_MODEL` env var:
 - `gemini-2.5-pro-tts` — paid, higher fidelity

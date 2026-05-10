@@ -8,7 +8,7 @@ set -euo pipefail
 
 VOICE="Aoede"
 OUT=""
-MODEL="${GEMINI_TTS_MODEL:-gemini-2.5-flash-tts}"
+MODEL="${GEMINI_TTS_MODEL:-gemini-2.5-flash-preview-tts}"
 ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
