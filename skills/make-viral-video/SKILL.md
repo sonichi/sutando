@@ -118,9 +118,27 @@ Manifest entries have shape:
   "local_file": "photo.jpg",
   "alt": "...",
   "purpose": "hook|support|closer",
-  "provenance": "..."
+  "badge": "Optional upper-strip badge text",
+  "is_video": false,
+  "source_tag": {
+    "event_id": "pursue-release-01-2026-05-08",
+    "case_id": "apollo-17-vm6-1972",
+    "source_agency": "NASA",
+    "source_url": "https://www.war.gov/UFO/",
+    "source_type": "primary",
+    "attribution": "war.gov/UFO/ · NASA",
+    "license": "public-domain",
+    "footer_short": "Apollo 17 / 1972"
+  },
+  "provenance": "Free-text operator note."
 }
 ```
+
+**`source_tag` is optional** (v1.0, Mini↔Lucy 2026-05-10). When present, renderer:
+- Auto-derives `--footer` from distinct `event_id + footer_short` values across manifest entries (operator-supplied `--footer` overrides).
+- Warns on stderr for any entry with `license: needs-license` and empty `attribution`.
+
+Full schema reference: `notes/sutando-wire/source-tag-schema-v1.md`. v1.1 candidate adds optional `primary: bool` for multi-event Deep-slot pieces (gates which event_ids enter the auto-footer chain).
 
 Per-frame durations are allocated **proportional to that frame's narration word count** (not fixed allocations). 18-word HOOK gets ~3× the screen time of a 6-word SUPPORT sliver — fixes the "scene changed before narration finished" failure mode.
 
