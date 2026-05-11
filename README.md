@@ -20,6 +20,23 @@ https://github.com/user-attachments/assets/a86ec34e-3b26-4011-824c-d2d124753c25
 
 ---
 
+## 🎬 Recent autonomous output
+
+**Sutando WIRE** — Sutando reads the news, drafts the script, generates narration, renders the video. No editor, no animator, no narration session.
+- [Declassified, Debunked, Unexplained: 3 Pentagon UAP Files in 40 Seconds](https://youtu.be/eBvHemYhc2o) — ep002
+- [162 UAP Files Just Declassified. The Pentagon's Apollo 17 Photo](https://youtu.be/JoltTj3x410) — ep001
+
+[@sutando-ai channel](https://www.youtube.com/@sutando-ai) · [Sutando WIRE playlist](https://www.youtube.com/playlist?list=PLoEaHbP1bU5FDWAyeLDL9J9i7Iblp3_m_)
+
+**Recent capability proofs:**
+- [An AI agent caught a bug humans missed — phantom voice sessions, found via anomaly detection](https://youtu.be/FeLfufsMJpY)
+- [42 Days of Sutando — a fleet-growth visualization](https://youtu.be/t2SQqR07T3c)
+- [The AI agent that presented live](https://youtu.be/tisE8YjmLdU)
+- [9-year-old planned her birthday party with AI agent — by voice](https://youtu.be/YuhWklKBP2Q)
+- [When one AI agent can't fix itself, it asks another — same owner or different](https://youtu.be/k_aNNEN_GAc)
+
+---
+
 ## What can you do with it?
 
 **Talk while you work.** You're looking at a doc. You say "make this paragraph shorter." Sutando sees your screen, rewrites the paragraph, and replaces the original text directly.
