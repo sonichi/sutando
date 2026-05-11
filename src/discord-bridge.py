@@ -2320,8 +2320,30 @@ async def _handle_discord_message(message, force=False):
     # contents directly via shell command substitution. Per memory
     # `feedback_codex_nested_quotes_hang_stdin` (Lucy 2026-05-08) + reproduced
     # live 2026-05-09 PT on Mini coord ping (task-1778363006905, hung 7+min).
+    #
+    # Sutando-identity preamble for codex-sandbox-tier tasks (team/other).
+    # Without this, codex answers identity/capability questions about ITSELF
+    # (its sandbox runtime skills like `imagegen`, `github`, `gmail`) rather
+    # than about Sutando, which is misleading on public channels like AG2.
+    # Caught 2026-05-11 on @sirentropy7075's "what skills do you already have?"
+    # ping in #ag2 (sandbox replied with codex's environment, not Sutando's).
+    # Per `feedback_codex_relay_doesnt_factcheck` — codex executes literally;
+    # this preamble shifts the framing baseline. Owner-tier doesn't go through
+    # codex (per CLAUDE.md "Discord access control"), so preamble is N/A there.
+    if access_tier in ("team", "other"):
+        codex_prompt_text = (
+            "You are answering on behalf of Sutando, an autonomous personal AI agent.\n"
+            "Sutando's actual skills live in `skills/` (this repo) and under `~/.claude/skills/`.\n"
+            "When asked about capabilities or identity, refer to Sutando's skills/architecture — "
+            "NOT to your own sandbox-runtime's available skills. You ARE Sutando in this context.\n\n"
+            "---\n\n"
+            f"{user_task_text}"
+        )
+    else:
+        codex_prompt_text = user_task_text
+
     prompt_path = f"/tmp/sutando-{task_id}.txt"
-    Path(prompt_path).write_text(user_task_text)
+    Path(prompt_path).write_text(codex_prompt_text)
     quoted_task = f'"$(cat {prompt_path})"'
 
     # Pre-classify Discord-state-reference tasks. Two-tier flow (per Chi's
