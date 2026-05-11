@@ -662,9 +662,42 @@ def main():
     # Apply persistent footer to all narrated frames (skipped on slate).
     # Per Lucy v1.7 pattern: small lower-strip with event-ID anchor on every
     # narrated frame. Skipped silently if --footer is empty.
-    if args.footer:
+    #
+    # source_tag schema v1 (Mini ↔ Lucy 2026-05-10): if --footer is empty but
+    # manifest entries carry `source_tag.footer_short` + `source_tag.event_id`,
+    # auto-build the footer from those fields. Preserves wedge-1 (primary-source
+    # citation density) without operator having to hand-craft the --footer string.
+    footer_text = args.footer
+    if not footer_text and manifest:
+        event_ids = []
+        shorts = []
+        for entry in manifest:
+            st = entry.get("source_tag") or {}
+            if isinstance(st, dict):
+                ev = st.get("event_id")
+                fs = st.get("footer_short")
+                if ev and ev not in event_ids:
+                    event_ids.append(ev)
+                if fs and fs not in shorts:
+                    shorts.append(fs)
+        if event_ids and shorts:
+            footer_text = " · ".join(event_ids + shorts)
+            print(f"[render] auto-footer from source_tag: {footer_text}", file=sys.stderr)
+
+    # License gate (source_tag v1): warn on any manifest entry that claims
+    # needs-license without supplying attribution. Non-fatal in v1 — operator
+    # gets a stderr line, render continues. Can be made fatal in a later pass.
+    if manifest:
+        for entry in manifest:
+            st = entry.get("source_tag") or {}
+            if isinstance(st, dict) and st.get("license") == "needs-license" and not st.get("attribution"):
+                print(f"[render] WARN license-gate: {entry.get('local_file', '?')} "
+                      f"is `needs-license` with no attribution — fix before publishing",
+                      file=sys.stderr)
+
+    if footer_text:
         for i in range(narration_frame_count):
-            draw_footer_strip(frames_dir / f"frame_{i:03d}.png", args.footer)
+            draw_footer_strip(frames_dir / f"frame_{i:03d}.png", footer_text)
         print(f"[render] footer applied to {narration_frame_count} narrated frames", file=sys.stderr)
 
     # Series signature slate (Mini Wire branding per Chi 2026-05-10).
