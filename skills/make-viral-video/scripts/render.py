@@ -239,6 +239,35 @@ def render_support_frame(hero_path: Path, caption: str, out_path: Path,
     out.save(out_path, "PNG")
 
 
+def draw_footer_strip(frame_path: Path, footer_text: str):
+    """Open a rendered frame PNG, draw a thin lower-strip with footer_text,
+    re-save in place. Persistent footer for event-ID anchoring per Lucy v1.7
+    pattern. Skipped silently if footer_text is empty.
+
+    Preserves the input mode (RGB for still frames; RGBA for video-overlay
+    frames — so the overlay's transparent regions stay transparent and only
+    the footer strip becomes opaque).
+    """
+    if not footer_text:
+        return
+    from PIL import Image, ImageDraw
+    img = Image.open(frame_path)
+    src_mode = img.mode
+    img = img.convert("RGBA")
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    strip_h = 32
+    draw.rectangle([(0, img.size[1] - strip_h), (img.size[0], img.size[1])],
+                   fill=(0, 0, 0, 200))
+    fnt = get_font(20)
+    draw.text((20, img.size[1] - strip_h + 6), footer_text, fill=(220, 220, 220), font=fnt)
+    out = Image.alpha_composite(img, overlay)
+    # Preserve original mode — RGB for stills, RGBA for video-overlays
+    if src_mode != "RGBA":
+        out = out.convert(src_mode)
+    out.save(frame_path, "PNG")
+
+
 def render_video_overlay(caption: str, out_path: Path, badge: str = ""):
     """Transparent-bg PNG used as overlay on a video clip. Contains the bottom
     caption strip + optional top-left name-chip — same layout as the still
@@ -530,6 +559,10 @@ def main():
                    help="Optional byline shown between title and ep/date (e.g. 'by Echo Act IV · Sutando'). "
                         "Empty string omits the byline. Free-text — caller controls identity wording.")
     p.add_argument("--slate-duration", type=float, default=2.0, help="End-card slate duration (s)")
+    p.add_argument("--footer", default="",
+                   help="Optional persistent footer text drawn on every narrated frame (small lower-strip). "
+                        "Free-text — e.g. 'pursue-release-01 · Apollo 17 / 1972 · wind farm / 2024'. "
+                        "Anchors viewers in the event-ID across the whole video. Per Lucy v1.7 pattern. Empty = no footer.")
     args = p.parse_args()
 
     workdir = Path(args.workdir)
@@ -625,6 +658,14 @@ def main():
     # is silent (extends video beyond TTS) and must NOT be scaled to fit
     # narration duration. Only durations[:narration_frame_count] get scaled.
     narration_frame_count = frame_idx
+
+    # Apply persistent footer to all narrated frames (skipped on slate).
+    # Per Lucy v1.7 pattern: small lower-strip with event-ID anchor on every
+    # narrated frame. Skipped silently if --footer is empty.
+    if args.footer:
+        for i in range(narration_frame_count):
+            draw_footer_strip(frames_dir / f"frame_{i:03d}.png", args.footer)
+        print(f"[render] footer applied to {narration_frame_count} narrated frames", file=sys.stderr)
 
     # Series signature slate (Mini Wire branding per Chi 2026-05-10).
     if args.series_title:
