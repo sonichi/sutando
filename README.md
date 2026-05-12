@@ -210,6 +210,7 @@ These unlock more capabilities. Add to `.env` when ready:
 | Claude for Chrome | Browser automation — navigate, read pages, fill forms, interact with web apps | [Install extension](https://claude.ai/chrome), log in with the same account as Claude Code |
 | Sutando app (menu bar) | Global hotkeys (see [Keyboard shortcuts](#keyboard-shortcuts)) | Auto-launches via `startup.sh` |
 | OS-supervised health checks | Detect stuck loops, dead watchers, and queue pileups even when core is unresponsive — macOS notifies you when Sutando is broken | `bash src/install-health-check-launchd.sh` (idempotent; uninstall with `--uninstall`) |
+| Multi-machine memory sync | Run the same agent identity across Mac mini + MacBook + Mac Studio etc.; memory + notes stay consistent via a private git repo you own | Create a private repo, add `SUTANDO_MEMORY_REPO=...` to `.env`, run `bash scripts/sync-memory.sh` once + cron it. See [docs/memory-sync.md](docs/memory-sync.md) |
 
 ---
 
