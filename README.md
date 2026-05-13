@@ -4,7 +4,7 @@
 
 **My AI Stand — Realtime by Day, Coding Itself by Night.**
 
-Realtime by day — voice, vision, screen, meetings, calls. Coding itself by night. Runs across my Macs, interacts with people & their Stands.
+Voice, vision, screen, meetings, calls when I'm engaged. Code when I'm not. Runs across my Macs, interacts with people & their Stands.
 
 It belongs entirely to you.
 
