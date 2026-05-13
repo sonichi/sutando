@@ -2,9 +2,9 @@
 
 [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/uZHWXXmrCS) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Website](https://img.shields.io/badge/Web-sutando.ai-blue)](https://sutando.ai)
 
-**Summon your AI superpower — voice, vision, and autonomous action.**
+**My AI Stand — Realtime by Day, Coding Itself by Night.**
 
-It shares your screen, joins your meetings, makes phone calls, and builds itself.
+Realtime when I'm engaged. Coding itself when I'm not. Runs across my Macs, interacts with people & their Stands.
 
 It belongs entirely to you.
 
