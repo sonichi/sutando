@@ -140,18 +140,25 @@ def start():
         picked = _pick_audio_device()
         input_spec = f"{screen}:{picked}" if picked is not None else screen
 
-    # Use ffmpeg instead of screencapture -v (which requires TTY)
+    # Use ffmpeg instead of screencapture -v (which requires TTY).
+    # Capture stderr to a sibling log file so audio-acquisition errors are
+    # visible after the fact. Per Chi 2026-05-13: silent recordings were
+    # untraceable because the previous DEVNULL-stderr discarded ffmpeg's
+    # mic-conflict / permission / format errors. With this log the silence
+    # guard from PR #667 can point to a root cause instead of just warning.
+    log_path = path + ".ffmpeg.log"
+    log_fh = open(log_path, "w")
     proc = subprocess.Popen(
         ["/opt/homebrew/bin/ffmpeg", "-f", "avfoundation",
          "-i", input_spec,
          "-r", "15", "-pix_fmt", "yuv420p", "-y", path],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=log_fh,
     )
 
     with open(PID_FILE, "w") as f:
-        json.dump({"pid": proc.pid, "path": path, "started": time.time()}, f)
+        json.dump({"pid": proc.pid, "path": path, "started": time.time(), "log_path": log_path, "input_spec": input_spec}, f)
 
     _show_indicator()
     print(json.dumps({"status": "recording", "path": path, "pid": proc.pid}))
@@ -213,6 +220,33 @@ def stop():
     out = {"status": "stopped", "path": path, "exists": exists, "size_mb": round(size / 1024 / 1024, 1)}
     if audio_warning:
         out["audio_warning"] = audio_warning
+        # When the guard fires, scan the ffmpeg stderr log for known audio-failure
+        # signatures so we point at root cause (mic-conflict / permission / format)
+        # instead of just saying "it was silent." Per Chi 2026-05-13 deeper audit.
+        ffmpeg_log = info.get("log_path")
+        if ffmpeg_log and os.path.exists(ffmpeg_log):
+            try:
+                with open(ffmpeg_log) as f:
+                    log_text = f.read()
+                signature_hits = []
+                # Common avfoundation/CoreAudio failure modes
+                for sig, hint in [
+                    ("Permission denied", "macOS Microphone permission denied for ffmpeg"),
+                    ("Cannot find audio device", "audio device index/name not found (device list may have shifted)"),
+                    ("device or resource busy", "device locked by another process (likely voice-agent or Zoom)"),
+                    ("kAudioHardwareNotRunningError", "CoreAudio not running — try restarting coreaudiod"),
+                    ("Inappropriate ioctl", "audio device acquired in incompatible mode (HAL exclusive vs shared)"),
+                    ("Operation not permitted", "macOS sandbox or TCC denial on audio device"),
+                ]:
+                    if sig in log_text:
+                        signature_hits.append(hint)
+                if signature_hits:
+                    out["audio_root_cause"] = "; ".join(signature_hits)
+                out["ffmpeg_log"] = ffmpeg_log
+            except Exception:
+                pass
+        if info.get("input_spec"):
+            out["input_spec"] = info["input_spec"]
     print(json.dumps(out))
 
 
