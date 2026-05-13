@@ -182,7 +182,38 @@ def stop():
     path = info["path"]
     exists = os.path.exists(path)
     size = os.path.getsize(path) if exists else 0
-    print(json.dumps({"status": "stopped", "path": path, "exists": exists, "size_mb": round(size / 1024 / 1024, 1)}))
+
+    # Audio-silence guard (Chi 2026-05-13: a recording came back at -91 dB pure
+    # digital silence even though _pick_audio_device returned the right mic.
+    # Transient mic-acquisition failure — ffmpeg started, captured nothing on the
+    # audio stream, finished cleanly. Without a check, the user gets a "stopped"
+    # status and discovers silence in QuickTime). Run ffmpeg volumedetect on the
+    # finished file; if mean_volume is below the silence floor, warn in the
+    # return JSON so the caller (voice agent / CLI / web UI) can surface it.
+    audio_warning = None
+    if exists and size > 1024:  # skip vanishingly-small files
+        try:
+            r = subprocess.run(
+                ["/opt/homebrew/bin/ffmpeg", "-i", path, "-af", "volumedetect", "-vn", "-f", "null", "/dev/null"],
+                capture_output=True, text=True, timeout=10,
+            )
+            mean_db = None
+            for line in r.stderr.splitlines():
+                if "mean_volume:" in line:
+                    try:
+                        mean_db = float(line.split("mean_volume:", 1)[1].strip().split()[0])
+                    except (ValueError, IndexError):
+                        pass
+                    break
+            if mean_db is not None and mean_db < -80.0:
+                audio_warning = f"audio captured but silent (mean {mean_db:.1f} dB) — likely transient mic-acquisition failure; retry the recording or check input device level"
+        except Exception:
+            pass  # don't fail stop() on guard issues
+
+    out = {"status": "stopped", "path": path, "exists": exists, "size_mb": round(size / 1024 / 1024, 1)}
+    if audio_warning:
+        out["audio_warning"] = audio_warning
+    print(json.dumps(out))
 
 
 if __name__ == "__main__":
