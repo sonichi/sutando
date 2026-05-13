@@ -51,20 +51,68 @@ def _hide_indicator():
     )
 
 
-def _has_audio_device():
-    """Check if avfoundation reports any audio device. Headless Macs (no mic) have none."""
+def _list_audio_devices():
+    """Parse avfoundation -list_devices output → list of (index, name) tuples for audio devices.
+    Returns [] if no devices or ffmpeg fails."""
     try:
         result = subprocess.run(
             ["/opt/homebrew/bin/ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
             capture_output=True, text=True, timeout=5,
         )
         out = result.stderr
-        if "AVFoundation audio devices:" in out:
-            audio_section = out.split("AVFoundation audio devices:", 1)[1]
-            return "[0]" in audio_section.split("Error", 1)[0]
-        return False
+        if "AVFoundation audio devices:" not in out:
+            return []
+        audio_section = out.split("AVFoundation audio devices:", 1)[1].split("Error", 1)[0]
+        # Lines look like: "[AVFoundation indev @ 0x...] [N] DeviceName"
+        import re as _re
+        devices = []
+        # Format: "[AVFoundation indev @ 0x...] [N] DeviceName"
+        for m in _re.finditer(r"\[AVFoundation[^\]]*\]\s*\[(\d+)\]\s*([^\n\r]+)", audio_section):
+            devices.append((int(m.group(1)), m.group(2).strip()))
+        return devices
     except Exception:
-        return False
+        return []
+
+
+def _has_audio_device():
+    """Check if avfoundation reports any audio device. Headless Macs (no mic) have none."""
+    return len(_list_audio_devices()) > 0
+
+
+def _pick_audio_device():
+    """Pick the best audio device index for recording.
+
+    Priority (Chi 2026-05-13 silence-recording diagnosis):
+    1. Built-in MacBook mic — matches /MacBook.*Microphone/. This is the right default
+       for solo demos. Virtual devices (ZoomAudioDevice, Microsoft Teams Audio, BlackHole)
+       carry silence when their host app isn't actively streaming audio.
+    2. Fall back to first non-virtual device (skip known-virtual names).
+    3. Last resort: device index 0 (the system "default" — may still be virtual).
+    4. Returns None if no audio devices present.
+
+    For Zoom-call recording specifically, set RECORD_AUDIO=ZoomAudioDevice (or its
+    index) explicitly. The picker doesn't try to guess from process state because
+    "zoom is running" ≠ "in an active call routing audio".
+    """
+    devices = _list_audio_devices()
+    if not devices:
+        return None
+
+    builtin_mic_idx = None
+    first_real_idx = None
+    virtual_keywords = ("zoomaudio", "microsoftteams", "teamsaudio", "blackhole", "aggregate")
+    for idx, name in devices:
+        lname = name.lower().replace(" ", "")
+        if "macbook" in lname and "microphone" in lname:
+            builtin_mic_idx = idx
+        elif not any(v in lname for v in virtual_keywords) and first_real_idx is None:
+            first_real_idx = idx
+
+    if builtin_mic_idx is not None:
+        return builtin_mic_idx
+    if first_real_idx is not None:
+        return first_real_idx
+    return devices[0][0]  # all virtual, fall back to first listed
 
 
 def start():
@@ -81,13 +129,16 @@ def start():
     path = f"/tmp/sutando-recording-{int(time.time())}.mov"
 
     # Detect audio device — headless Macs (no mic) have none, ffmpeg fails if we ask for audio.
+    # Pick a real input over the "default" alias (which on machines with Zoom installed maps
+    # to ZoomAudioDevice and captures silence when Zoom isn't running). Per Chi 2026-05-13.
     screen = os.environ.get('RECORD_SCREEN', 'Capture screen 0')
     audio_env = os.environ.get('RECORD_AUDIO', '')
     if audio_env:
-        # Explicit override: RECORD_AUDIO=none for video-only, or specify a device
+        # Explicit override: RECORD_AUDIO=none for video-only, or specify a device (name or index)
         input_spec = screen if audio_env == 'none' else f"{screen}:{audio_env}"
     else:
-        input_spec = f"{screen}:default" if _has_audio_device() else screen
+        picked = _pick_audio_device()
+        input_spec = f"{screen}:{picked}" if picked is not None else screen
 
     # Use ffmpeg instead of screencapture -v (which requires TTY)
     proc = subprocess.Popen(
