@@ -102,6 +102,8 @@ Tasks arrive from multiple channels via the same file bridge:
 
 **IMPORTANT:** On session start, check if the task watcher is running (`pgrep -f "watch-tasks"`). If not, start it with `bash src/watch-tasks.sh` using `run_in_background: true`. When notified, read the output — it lists ALL pending task files. Process every one, write results to `results/`, then restart the watcher. This is how voice commands reach you.
 
+**Cancel handling.** When you read a task whose `task:` body starts with `CANCEL_INSTRUCTION:` — written by the `cancel_task` voice tool — stop any in-flight work on the referenced task ID, write a brief confirm result for the CANCEL_INSTRUCTION task itself (e.g. `"Cancelled task-X (was in progress)"` or `"task-X already completed, nothing to cancel"`), and do NOT process the original referenced task. The CANCEL_INSTRUCTION task uses the regular task pipeline as its signal channel — picking it up means you've reached the user's cancel intent.
+
 ## Tutorial
 
 When the user says "tutorial", "walk me through", or "show me what you can do" (via voice or text):

@@ -421,11 +421,14 @@ export const clipboardTool: ToolDefinition = {
 export const cancelTaskTool: ToolDefinition = {
 	name: 'cancel_task',
 	description:
-		'Cancel a pending task. Default (no args) cancels the most recent. ' +
+		'Cancel a pending or in-flight task by writing a CANCEL_INSTRUCTION task that core will see next. ' +
+		'Default (no args) cancels the most recent. ' +
 		'Pass `taskId` to cancel a specific task by id (e.g. "task-1777686932069"). ' +
 		'Pass `query` to cancel the first task whose content contains the substring (case-insensitive). ' +
 		'Pass `list: true` to list pending tasks (id + first 60 chars of content) without cancelling. ' +
-		'Use when user says "cancel", "nevermind", "stop that", "what\'s queued", "cancel the one about X".',
+		'Use when user says "cancel", "nevermind", "stop that", "what\'s queued", "cancel the one about X". ' +
+		'Note: in-flight processing only halts when core reaches the CANCEL_INSTRUCTION task in its queue — ' +
+		'this prevents future pickup + tells core to abort if mid-task, but doesn\'t interrupt a single LLM turn.',
 	parameters: z.object({
 		taskId: z.string().optional().describe('Specific task id to cancel (matches the filename without .txt).'),
 		query: z.string().optional().describe('Case-insensitive substring to match against task content. Cancels first match.'),
@@ -438,10 +441,10 @@ export const cancelTaskTool: ToolDefinition = {
 			const tasksDir = join(process.cwd(), 'tasks');
 			const resultsDir = join(process.cwd(), 'results');
 			const files = readdirSync(tasksDir).filter(f => f.endsWith('.txt')).sort();
-			if (files.length === 0) return { status: 'nothing_to_cancel' };
 
 			// list mode: return id + preview, no cancel
 			if (list) {
+				if (files.length === 0) return { status: 'nothing_pending', count: 0, tasks: [] };
 				const items = files.map(f => {
 					const id = f.replace('.txt', '');
 					let preview = '';
@@ -456,33 +459,62 @@ export const cancelTaskTool: ToolDefinition = {
 				return { status: 'pending_tasks', count: items.length, tasks: items };
 			}
 
-			// targeted cancel: by exact id
-			let target: string | undefined;
+			// Targeting: by exact id, by query, or default-to-most-recent.
+			// IMPORTANT: target can be a file in `tasks/` OR a recently-archived task whose
+			// processing is in-flight (file already moved). For id-based cancels we accept
+			// either case; for query-based we need the file present to grep its content.
+			let targetId: string | undefined;
+			let targetFile: string | undefined;
 			if (taskId) {
 				const wantFile = taskId.endsWith('.txt') ? taskId : `${taskId}.txt`;
-				if (files.includes(wantFile)) target = wantFile;
-				else return { status: 'not_found', taskId };
+				targetId = wantFile.replace('.txt', '');
+				if (files.includes(wantFile)) targetFile = wantFile;
+				// else: accept the cancel even if file is gone (in-flight); core sees CANCEL and decides
 			} else if (query) {
-				// targeted cancel: by content query (case-insensitive substring)
+				if (files.length === 0) return { status: 'nothing_pending' };
 				const needle = query.toLowerCase();
 				for (const f of files) {
 					try {
 						const body = readFileSync(join(tasksDir, f), 'utf-8').toLowerCase();
-						if (body.includes(needle)) { target = f; break; }
+						if (body.includes(needle)) { targetFile = f; targetId = f.replace('.txt', ''); break; }
 					} catch { /* ignore */ }
 				}
-				if (!target) return { status: 'not_found', query };
+				if (!targetId) return { status: 'not_found', query };
 			} else {
-				// default: most recent
-				target = files[files.length - 1];
+				// default: most recent pending file
+				if (files.length === 0) return { status: 'nothing_pending' };
+				targetFile = files[files.length - 1];
+				targetId = targetFile.replace('.txt', '');
 			}
 
-			const targetId = target.replace('.txt', '');
-			// Write a cancelled result so the web UI shows it with the cancelled icon
-			writeFileSync(join(resultsDir, target), 'Cancelled.');
-			unlinkSync(join(tasksDir, target));
-			console.log(`${ts()} [CancelTask] cancelled: ${targetId}${taskId ? ' (by id)' : query ? ` (by query: ${query})` : ''}`);
-			return { status: 'cancelled', taskId: targetId };
+			// Write a CANCEL_INSTRUCTION task — core picks it up next and aborts/skips
+			// the named target. Design (Chi 2026-05-13): reuse the task pipeline as the
+			// cancel signal channel instead of building a parallel one.
+			const cancelTs = Date.now();
+			const cancelFilename = `task-${cancelTs}.txt`;
+			const cancelBody = [
+				`id: task-${cancelTs}`,
+				`timestamp: ${new Date().toISOString()}`,
+				`task: CANCEL_INSTRUCTION: stop processing ${targetId} if still in flight. If already completed, no-op. Reply briefly confirming.`,
+				`source: voice`,
+				`channel_id: local-voice`,
+				`user_id: voice-local`,
+				`access_tier: owner`,
+				``,
+			].join('\n');
+			writeFileSync(join(tasksDir, cancelFilename), cancelBody);
+
+			// Also unlink the original task file if it's still present — prevents
+			// double-pickup if core hadn't started yet. Best-effort.
+			if (targetFile) {
+				try { unlinkSync(join(tasksDir, targetFile)); } catch { /* already gone is fine */ }
+			}
+
+			// Touch a cancelled result for the web UI's cancel icon (best-effort).
+			try { writeFileSync(join(resultsDir, `${targetId}.txt`), 'Cancelled.'); } catch { /* ignore */ }
+
+			console.log(`${ts()} [CancelTask] cancel-instruction written for ${targetId}${taskId ? ' (by id)' : query ? ` (by query: ${query})` : ''} → ${cancelFilename}`);
+			return { status: 'cancel_instruction_queued', taskId: targetId, instruction: `task-${cancelTs}` };
 		} catch (err) {
 			return { error: `Cancel failed: ${err instanceof Error ? err.message : err}` };
 		}
