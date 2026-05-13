@@ -256,13 +256,17 @@ export const captureScreenTool: ToolDefinition = {
 export const typeTextTool: ToolDefinition = {
 	name: 'type_text',
 	description:
-		'Type text into the currently focused field. Use for: "type hello", "enter my email". Instant.',
+		'Type text into the currently focused field. Use for: "type hello", "enter my email". Instant. ' +
+		'Pass `append=true` when the user wants the text added AFTER any existing selection ("add this", ' +
+		'"append", "type at the end") — without it, the paste branch will REPLACE the selection per macOS ' +
+		'Cmd-V semantics. Default is replace, which matches most "type X here" intents.',
 	parameters: z.object({
 		text: z.string().describe('The text to type'),
+		append: z.boolean().optional().describe('If true, collapse any selection to its end before pasting so the text is appended rather than replacing the selection. Use when the user says "add", "append", or "type at the end".'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { text } = args as { text: string };
+		const { text, append } = args as { text: string; append?: boolean };
 		// Multi-line, long, or non-ASCII text: use clipboard paste.
 		// AppleScript's `keystroke "..."` routes through virtual-key codes that
 		// can't represent characters outside the basic ASCII typing range —
@@ -289,12 +293,18 @@ export const typeTextTool: ToolDefinition = {
 				// Convert literal \n to actual newlines
 				const pasteText = text.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
 				execSync('pbcopy', { input: pasteText, encoding: 'utf-8', timeout: 2_000, env: utf8Env });
+				// Append mode: collapse selection to its end via Right-arrow before Cmd-V.
+				// Without this, macOS Cmd-V replaces the selection (standard semantics).
+				// Per Chi 2026-05-13: "the tool is replacing my selected text instead of appending."
+				if (append) {
+					execSync(`osascript -e 'tell application "System Events" to key code 124'`, { timeout: 3_000, env: utf8Env });
+				}
 				execSync(`osascript -e 'tell application "System Events" to keystroke "v" using command down'`, { timeout: 5_000, env: utf8Env });
 				execSync('sleep 0.3');
 				if (savedClipboard) {
 					execSync('pbcopy', { input: savedClipboard, encoding: 'utf-8', timeout: 2_000, env: utf8Env });
 				}
-				console.log(`${ts()} [TypeText] pasted (multi-line): ${text.slice(0, 40)}...`);
+				console.log(`${ts()} [TypeText] pasted (multi-line${append ? ', append' : ''}): ${text.slice(0, 40)}...`);
 				return { status: 'typed', text };
 			} catch (err) {
 				return { error: `Paste failed: ${err instanceof Error ? err.message : err}` };
@@ -306,8 +316,14 @@ export const typeTextTool: ToolDefinition = {
 		// shell breakout via text containing apostrophes.
 		const safeText = text.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
 		try {
+			// Append mode: collapse selection to its end via Right-arrow before typing.
+			// Without this, AppleScript keystroke replaces the selection (same Cmd-V-style
+			// behavior — System Events treats a keystroke into a selected region as replace).
+			if (append) {
+				execSync(`osascript -e 'tell application "System Events" to key code 124'`, { timeout: 3_000 });
+			}
 			execSync(`osascript -e 'tell application "System Events" to keystroke "${safeText}"'`, { timeout: 5_000 });
-			console.log(`${ts()} [TypeText] typed: ${text.slice(0, 40)}`);
+			console.log(`${ts()} [TypeText] typed${append ? ' (append)' : ''}: ${text.slice(0, 40)}`);
 			return { status: 'typed', text };
 		} catch (err) {
 			return { error: `Type failed: ${err instanceof Error ? err.message : err}` };
