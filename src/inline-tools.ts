@@ -263,10 +263,17 @@ export const typeTextTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { text } = args as { text: string };
-		// Multi-line or long text: use clipboard paste (keystroke can't handle newlines)
-		// Gemini sends literal \n (two chars backslash+n), not actual newlines
-		const hasNewline = text.includes('\n') || text.includes('\r') || /\\n/.test(text) || text.length > 80;
-		if (hasNewline) {
+		// Multi-line, long, or non-ASCII text: use clipboard paste.
+		// AppleScript's `keystroke "..."` routes through virtual-key codes that
+		// can't represent characters outside the basic ASCII typing range —
+		// em-dashes (U+2014), curly quotes (U+2018-U+201D), and emoji all get
+		// corrupted (UTF-8 bytes reinterpreted as Mac Roman → e.g. 🤖 mojibake,
+		// — → "‚Äî"). The paste branch round-trips through the system pasteboard
+		// which preserves bytes. Per Chi 2026-05-13 frustration with emoji corruption.
+		// Gemini sends literal \n (two chars backslash+n), not actual newlines.
+		const hasNonAscii = /[^\x00-\x7f]/.test(text);
+		const needsPaste = text.includes('\n') || text.includes('\r') || /\\n/.test(text) || text.length > 80 || hasNonAscii;
+		if (needsPaste) {
 			try {
 				let savedClipboard = '';
 				try { savedClipboard = execSync('pbpaste', { encoding: 'utf-8', timeout: 2_000 }); } catch {}
