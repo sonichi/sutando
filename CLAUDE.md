@@ -104,6 +104,17 @@ Tasks arrive from multiple channels via the same file bridge:
 
 **Cancel handling.** When you read a task whose `task:` body starts with `CANCEL_INSTRUCTION:` — written by the `cancel_task` voice tool — stop any in-flight work on the referenced task ID, write a brief confirm result for the CANCEL_INSTRUCTION task itself (e.g. `"Cancelled task-X (was in progress)"` or `"task-X already completed, nothing to cancel"`), and do NOT process the original referenced task. The CANCEL_INSTRUCTION task uses the regular task pipeline as its signal channel — picking it up means you've reached the user's cancel intent.
 
+**Voice session context.** Voice-agent's Gemini context window rolls off after ~10 minutes of turns; voice forgets specifics like "the post" or "Mini Draft A" that landed earlier in your session. Whenever you make a durable decision the voice agent may need to reference later — picking a draft, writing text to clipboard for a pending paste, committing to an active task — update `state/voice-session-context.json`. Schema:
+```json
+{
+  "updated_at": "<ISO ts>",
+  "active_drafts": [{"name": "...", "summary": "...", "path": "..."}],
+  "pending_action": {"kind": "paste|review|other", "what": "...", "where": "..."} | null,
+  "last_results": [{"task_id": "...", "subject": "...", "ts": "..."}]
+}
+```
+Keep `active_drafts` and `last_results` to ~3 entries each (drop oldest). Voice can call the `recent_context` tool to read this file when it senses confusion ("what was the post?" / "what's pending?"). Per Chi 2026-05-13.
+
 ## Tutorial
 
 When the user says "tutorial", "walk me through", or "show me what you can do" (via voice or text):

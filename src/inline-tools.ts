@@ -802,6 +802,59 @@ export const deleteNoteTool: ToolDefinition = {
 	},
 };
 
+// --- Voice session context (Chi 2026-05-13: voice agent loses context across turns) ---
+//
+// Background: voice-agent's Gemini context window is independent from core's. After
+// ~10 minutes of turns earlier transcript rolls off and voice "forgets" specifics
+// like "the post" or "Mini Draft A". The fix is a small JSON file at
+// `state/voice-session-context.json` that core writes whenever a durable decision
+// lands (active draft, pending paste, today's selected option). Voice can ask for
+// the file's contents at any time via `recent_context`.
+//
+// Schema (informal):
+//   {
+//     "updated_at": "<ISO ts>",
+//     "active_drafts": [
+//       { "name": "Mini Draft A", "summary": "...", "path": "/tmp/sutando-draft.txt" }
+//     ],
+//     "pending_action": { "kind": "paste", "what": "Mini Draft A", "where": "Cursor / X compose" } | null,
+//     "last_results": [
+//       { "task_id": "task-...", "subject": "DeepMind post drafted", "ts": "<ISO>" }
+//     ]
+//   }
+//
+// Core writes the file by direct fs operations — no inline tool needed for the writer
+// path (core is this Claude Code session and already has fs access). The tool here
+// is the READ path that voice-agent's Gemini can call when it senses confusion
+// ("what was the post we picked?" / "what's pending?").
+
+const VOICE_SESSION_CONTEXT_PATH = join(process.cwd(), 'state', 'voice-session-context.json');
+
+export const recentContextTool: ToolDefinition = {
+	name: 'recent_context',
+	description:
+		'Return the current voice-session context — active drafts, pending actions, recent task results — so you can pick up a thread even if it predates your Gemini context window. ' +
+		'Call this when the user references something with a deictic pronoun ("the post", "the draft", "the one I just typed") that you can\'t place from your own recent transcript. ' +
+		'Also fine to call proactively at the start of an active session to ground yourself. ' +
+		'Returns JSON with keys: active_drafts (array), pending_action (object|null), last_results (array of {task_id, subject, ts}). ' +
+		'If the file is missing or empty, returns {note: "no context recorded yet"}.',
+	parameters: z.object({}),
+	execution: 'inline',
+	async execute() {
+		try {
+			if (!existsSync(VOICE_SESSION_CONTEXT_PATH)) {
+				return { note: 'no context recorded yet — core hasn\'t written voice-session-context.json' };
+			}
+			const raw = readFileSync(VOICE_SESSION_CONTEXT_PATH, 'utf-8');
+			const parsed = JSON.parse(raw);
+			console.log(`${ts()} [RecentContext] returned (updated_at=${parsed.updated_at || 'unknown'}, ${(parsed.active_drafts || []).length} drafts, ${(parsed.last_results || []).length} results)`);
+			return parsed;
+		} catch (err) {
+			return { error: `recent_context read failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
 // IMPORTANT: Every tool defined in browser-tools.ts MUST be added to BOTH arrays below.
 // Tools not registered here are invisible to Gemini — it will hallucinate actions instead
 // of calling them (e.g. "I've closed the video" without actually closing it).
@@ -955,6 +1008,7 @@ export const inlineTools = assertUniqueToolNames([
 	joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool,
 	describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, slideControlTool, fullscreenTool,
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
+	recentContextTool,
 	...personalTools ]);
 
 /** Tools available to any caller (including unverified) */
@@ -971,6 +1025,7 @@ export const ownerOnlyTools = [
 	clipboardTool, cancelTaskTool, toggleTasksTool, summonTool, dismissTool,
 	joinZoomTool, joinGmeetTool, callContactTool, slideControlTool, fullscreenTool,
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
+	recentContextTool,
 	describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool,
 ];
 
