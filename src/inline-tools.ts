@@ -275,22 +275,25 @@ export const typeTextTool: ToolDefinition = {
 		const needsPaste = text.includes('\n') || text.includes('\r') || /\\n/.test(text) || text.length > 80 || hasNonAscii;
 		if (needsPaste) {
 			try {
+				// Force UTF-8 locale for the child shell — voice-agent runs under
+				// launchd which doesn't inherit terminal LANG/LC_CTYPE, so the
+				// default POSIX/C locale would make `pbcopy < file` treat
+				// multi-byte UTF-8 sequences as garbled single-byte and put
+				// "??" on the pasteboard instead of 🤖. Pipe via stdin (input:)
+				// to bypass shell redirection entirely. Per Chi 2026-05-13 (PR #660
+				// follow-up: the first fix routed emoji to paste-branch but
+				// pbcopy still mangled bytes in launchd context).
+				const utf8Env = { ...process.env, LANG: 'en_US.UTF-8', LC_ALL: 'en_US.UTF-8' };
 				let savedClipboard = '';
-				try { savedClipboard = execSync('pbpaste', { encoding: 'utf-8', timeout: 2_000 }); } catch {}
+				try { savedClipboard = execSync('pbpaste', { encoding: 'utf-8', timeout: 2_000, env: utf8Env }); } catch {}
 				// Convert literal \n to actual newlines
 				const pasteText = text.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
-				const tmpClip = `/tmp/sutando-typetext-clip-${Date.now()}.txt`;
-				writeFileSync(tmpClip, pasteText);
-				execSync(`pbcopy < ${tmpClip}`, { timeout: 2_000 });
-				execSync(`osascript -e 'tell application "System Events" to keystroke "v" using command down'`, { timeout: 5_000 });
+				execSync('pbcopy', { input: pasteText, encoding: 'utf-8', timeout: 2_000, env: utf8Env });
+				execSync(`osascript -e 'tell application "System Events" to keystroke "v" using command down'`, { timeout: 5_000, env: utf8Env });
 				execSync('sleep 0.3');
 				if (savedClipboard) {
-					const tmpRestore = `/tmp/sutando-typetext-restore-${Date.now()}.txt`;
-					writeFileSync(tmpRestore, savedClipboard);
-					execSync(`pbcopy < ${tmpRestore}`, { timeout: 2_000 });
-					try { unlinkSync(tmpRestore); } catch {}
+					execSync('pbcopy', { input: savedClipboard, encoding: 'utf-8', timeout: 2_000, env: utf8Env });
 				}
-				try { unlinkSync(tmpClip); } catch {}
 				console.log(`${ts()} [TypeText] pasted (multi-line): ${text.slice(0, 40)}...`);
 				return { status: 'typed', text };
 			} catch (err) {
