@@ -1063,7 +1063,9 @@ document.addEventListener('click', function(e) {
   // handler and toggles before the user can copy.
   const sel = window.getSelection && window.getSelection();
   if (sel && sel.toString().length > 0) return;
-  const item = e.target.closest && e.target.closest('.task-item[data-taskid]');
+  // Only working-with-result items are clickable; data-taskid is on every
+  // task-item now (for flash), so gate the toggle on data-clickable.
+  const item = e.target.closest && e.target.closest('.task-item[data-clickable]');
   if (item) toggleResult(item.dataset.taskid);
 });
 // Collapse routing prefixes to a short category badge + clause head.
@@ -1147,7 +1149,9 @@ function renderTasks() {
     // file is written — gating render on status === 'done' meant those
     // results never showed up in the UI even though they were in taskMap.
     const hasResult = !!t.result;
-    const clickAttr = hasResult ? ' data-taskid="' + id + '" style="cursor:pointer"' : '';
+    // Always emit data-taskid so flash + expand:N can target working tasks
+    // too. cursor:pointer + data-clickable only when there's a result to show.
+    const clickAttr = ' data-taskid="' + id + '"' + (hasResult ? ' data-clickable="1" style="cursor:pointer"' : '');
     const isExpanded = expandedTasks.has(id);
     const resultDisplay = isExpanded ? 'block' : 'none';
     const resultHtml = hasResult ? '<div id="result-' + id + '" style="display:' + resultDisplay + ';padding:8px 12px;color:#b8c8d8;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;background:#0d1520;border-radius:8px;margin:4px 0 6px 30px">' + t.result.replace(/</g,'&lt;') + '</div>' : '';
@@ -2316,7 +2320,9 @@ function renderTabContent() {
         // file is written. Same fix as the main renderTasks path above.
         var hasResult = !!t.result;
         var isExpanded = expandedTasks.has(id);
-        var clickAttr = hasResult ? ' data-taskid="' + id + '" style="cursor:pointer"' : '';
+        // Always emit data-taskid (matches primary renderTasks path) so flash
+        // + expand:N can target working tasks. cursor only when clickable.
+        var clickAttr = ' data-taskid="' + id + '"' + (hasResult ? ' data-clickable="1" style="cursor:pointer"' : '');
         var resultDisplay = isExpanded ? 'block' : 'none';
         var resultHtml = hasResult ? '<div id="result-' + id + '" style="display:' + resultDisplay + ';padding:8px 12px;color:#b8c8d8;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;background:#0d1520;border-radius:8px;margin:4px 0 6px 30px">' + esc(t.result) + '</div>' : '';
         var rawText = t.text || id;
