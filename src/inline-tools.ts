@@ -570,7 +570,7 @@ export const toggleTasksTool: ToolDefinition = {
 				end repeat
 				return "not found"
 			end tell'`, { timeout: 5_000 });
-			console.log(`${ts()} [ToggleTasks] ${action}`);
+			console.log(`${ts()} [ToggleTasks] ${actionStr}`);
 			return { status: action === 'collapse' ? 'collapsed' : 'expanded' };
 		} catch (err) {
 			return { error: `Toggle tasks failed: ${err instanceof Error ? err.message : err}` };
