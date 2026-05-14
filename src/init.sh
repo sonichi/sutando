@@ -140,7 +140,9 @@ preflight() {
   done
 
   # macOS permissions — non-fatal, just a hint.
-  # macOS 15+ silently writes a black PNG when perm is denied (exit 0); check size too.
+  # macOS 15+ silently writes a tiny PNG when perm is denied (exit 0).
+  # Denied artifacts are <2KB; real captures are hundreds-of-KB to MB.
+  # Black 5120x2880 PNG compresses to ~43KB, so 5KB is the safe floor.
   local perms_warn=0
   local permcheck_ok=1
   screencapture -x /tmp/sutando-permcheck.png 2>/dev/null || permcheck_ok=0
@@ -148,11 +150,11 @@ preflight() {
     # wc -c is portable across BSD (macOS) and GNU coreutils (Homebrew may override).
     local permcheck_size
     permcheck_size=$(wc -c < /tmp/sutando-permcheck.png 2>/dev/null | tr -d ' ' || echo 0)
-    if [ "${permcheck_size:-0}" -lt 100000 ]; then permcheck_ok=0; fi
+    if [ "${permcheck_size:-0}" -lt 5000 ]; then permcheck_ok=0; fi
   fi
   rm -f /tmp/sutando-permcheck.png
   if [ "$permcheck_ok" -eq 0 ]; then
-    log "  ⚠ Screen Recording not granted (System Settings → Privacy → Screen Recording → grant your Terminal app, then quit + relaunch Terminal)"
+    log "  ⚠ Screen Recording not granted (System Settings → Privacy → Screen Recording → grant the app running this terminal, then quit + relaunch it)"
     perms_warn=1
   fi
   if ! osascript -e 'tell application "System Events" to get name of first process whose frontmost is true' > /dev/null 2>&1; then
