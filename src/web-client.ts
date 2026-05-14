@@ -311,6 +311,14 @@ const HTML = /* html */ `<!DOCTYPE html>
   .task-status.done { background: #1e4028; color: #4ecca3; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
   .task-text { color: #d0d0d8; flex: 1; word-break: break-word; font-size: 16px; line-height: 1.6; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* 1s yellow flash on a task-item when voice expand:N targets it.
+     Visual confirmation that the expand landed, independent of whether
+     the task has a result body to display. */
+  @keyframes task-flash-anim {
+    0% { background: rgba(255, 220, 100, 0.45); }
+    100% { background: transparent; }
+  }
+  .task-item.task-flash { animation: task-flash-anim 1s ease-out; }
   .task-text.expanded { white-space: normal; }
   .task-time { color: #777; font-size: 13px; flex-shrink: 0; }
   .task-expand {
@@ -1009,6 +1017,21 @@ new MutationObserver(() => {
     }
     else if (verb === 'collapse') { expandedTasks.delete(targetId); userExpanded.delete(targetId); }
     renderTasks();
+    // Visual flash on the targeted task-item across BOTH render paths
+    // (primary + dynamic-region). 50ms delay lets renderTasks() paint
+    // first. Querying after the delay also catches the dr-content
+    // element which re-renders on its own 3s tick — by the time the
+    // user issues subsequent commands the flash will have ridden the
+    // next dynamic-region paint too.
+    setTimeout(function() {
+      document.querySelectorAll('[data-taskid="' + targetId + '"]').forEach(function(el) {
+        el.classList.remove('task-flash');
+        // Force reflow so the animation re-triggers on repeat expand:N.
+        void (el as HTMLElement).offsetWidth;
+        el.classList.add('task-flash');
+        setTimeout(function() { el.classList.remove('task-flash'); }, 1100);
+      });
+    }, 50);
   } else {
     if (verb === 'collapse') { expandedTasks.clear(); userCollapsed = true; renderTasks(); }
     else if (verb === 'expand') { ids.forEach(id => { if (taskMap[id].result) expandedTasks.add(id); }); userCollapsed = false; renderTasks(); }
