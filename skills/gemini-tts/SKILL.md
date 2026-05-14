@@ -18,6 +18,14 @@ ARGUMENTS: $ARGUMENTS
 
 `Aoede` (default — alto, neutral), `Charon` (baritone, news-anchor), `Kore` (mid, expressive), `Puck` (high, conversational). Per Lucy's 2026-05-09 testing: Aoede is the closest match to OpenAI's `sage`.
 
+## Audio tags for expression
+
+Inline bracket tags like `[whispers]`, `[excitedly]`, `[slowly]` are interpreted as stylistic direction, not spoken literally. Empirically verified against `gemini-2.5-flash-preview-tts` (per PR #646 comment): `[whispers] hello` → 1.05s audio; `hello` alone → 1.01s. If the tag were spoken literally as 8 words, the clip would be ~5× longer.
+
+```bash
+bash "$SKILL_DIR/scripts/synthesize.sh" -- "[whispers] Pull request 691 has landed."
+```
+
 ## Model selection
 
 Default: `gemini-2.5-flash-preview-tts` (free tier, 1500 req/day, $0 within quota).
