@@ -259,9 +259,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // does watcher liveness. Per Chi's review 2026-05-05: "if it's only
         // scripts, can it be merged with the sutando app?"
         Timer.scheduledTimer(withTimeInterval: 120.0, repeats: true) { [weak self] _ in
-            guard let s = self else { return }
-            if s.pauseSentinelActive() { return }  // skip while loop is paused
-            s.refreshContextualChips()
+            self?.refreshContextualChips()
         }
         // Also fire once at startup so the chip set isn't stale-from-yesterday
         // until the first 120s tick.
@@ -277,9 +275,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         //   launchctl bootout gui/$UID/com.sutando.health-check
         //   rm ~/Library/LaunchAgents/com.sutando.health-check.plist
         Timer.scheduledTimer(withTimeInterval: 1800.0, repeats: true) { [weak self] _ in
-            guard let s = self else { return }
-            if s.pauseSentinelActive() { return }  // skip while loop is paused
-            s.runHealthCheck()
+            self?.runHealthCheck()
         }
         // Fire once at startup so a fresh check is captured immediately
         // rather than waiting 30min.
@@ -488,6 +484,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// web UI polls the file and pins matching chips at the top of the
     /// starter tab.
     func refreshContextualChips() {
+        // Skip when loop is paused — quiets the menu bar during a meeting /
+        // dinner break. Guard at the function body (not just Timer
+        // callbacks) so startup one-shot calls also respect the pause.
+        if pauseSentinelActive() { return }
         var chips: [[String: String]] = []
 
         // 1. Open PRs authored by sonichi (both bots commit under this account).
@@ -1540,6 +1540,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     var lastHealthCheckStart: Date = .distantPast
     func runHealthCheck() {
+        // Skip when loop is paused — health pings during a paused window
+        // would just produce noise. Guard at the function body (not just
+        // Timer callbacks) so startup one-shot calls also respect the pause.
+        if pauseSentinelActive() { return }
         // Throttle: never more than once per 60s, even if the Timer +
         // startup-fire happen to align.
         let now = Date()
@@ -1744,11 +1748,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func pauseLoopIndefinite() {
-        // Year-2099 expiry — far enough out that the sentinel-check treats
-        // it as permanent, but still uses the same ISO-8601 format so no
-        // protocol change downstream. Resume Loop deletes the sentinel.
-        let secondsTo2099 = max(0, Date(timeIntervalSince1970: 4_071_686_400).timeIntervalSinceNow)
-        writePauseSentinel(seconds: secondsTo2099, label: "indefinite")
+        // Far-future expiry (2099-01-10T00:00:00Z) — far enough out that
+        // the sentinel-check treats it as permanent, but still uses the
+        // same ISO-8601 format so no protocol change downstream. Resume
+        // Loop deletes the sentinel.
+        let indefiniteExpiry = ISO8601DateFormatter().date(from: "2099-01-10T00:00:00Z") ?? Date().addingTimeInterval(365 * 24 * 60 * 60 * 75)
+        let secondsToFar = max(0, indefiniteExpiry.timeIntervalSinceNow)
+        writePauseSentinel(seconds: secondsToFar, label: "indefinite")
     }
 
     /// Returns true if the loop-pause sentinel exists AND its expiry is in
