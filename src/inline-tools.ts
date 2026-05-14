@@ -149,6 +149,12 @@ export const pressKeyTool: ToolDefinition = {
 			'enter': 36, 'return': 36, 'escape': 53, 'esc': 53, 'tab': 48,
 			'delete': 51, 'backspace': 51, 'space': 49,
 			'up': 126, 'down': 125, 'left': 123, 'right': 124,
+			// Common voice-spoken aliases — without these, the fallthrough to
+			// `keystroke "<key>"` types the literal string into the focused
+			// field instead of pressing the arrow. Observed 2026-05-13 voice
+			// call: Gemini called press_key(key="downarrow"); nothing scrolled.
+			'uparrow': 126, 'downarrow': 125, 'leftarrow': 123, 'rightarrow': 124,
+			'arrowup': 126, 'arrowdown': 125, 'arrowleft': 123, 'arrowright': 124,
 			'a': 0, 'c': 8, 'v': 9, 'x': 7, 'z': 6, 'f': 3, 's': 1, 'w': 13, 'q': 12,
 		};
 		const keyCode = keyMap[key.toLowerCase()];
