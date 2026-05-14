@@ -82,12 +82,26 @@ else
 fi
 
 echo "Checking permissions..."
-if ! screencapture -x /tmp/sutando-permcheck.png 2>/dev/null; then
-  echo "  ⚠ Screen Recording not granted"
+# macOS 15+ silently writes a black PNG when Screen Recording is denied (exit 0).
+# Real captures are >100KB; black PNGs are <10KB. Check both exit code AND size.
+permcheck_ok=1
+screencapture -x /tmp/sutando-permcheck.png 2>/dev/null || permcheck_ok=0
+if [ "$permcheck_ok" -eq 1 ]; then
+  # wc -c is portable across BSD (macOS) and GNU coreutils (Homebrew may override).
+  permcheck_size=$(wc -c < /tmp/sutando-permcheck.png 2>/dev/null | tr -d ' ' || echo 0)
+  if [ "${permcheck_size:-0}" -lt 100000 ]; then permcheck_ok=0; fi
+fi
+rm -f /tmp/sutando-permcheck.png
+if [ "$permcheck_ok" -eq 0 ]; then
+  echo "  ⚠ Screen Recording not granted (or stale)"
   echo "    → System Settings → Privacy & Security → Screen & System Audio Recording"
-  echo "    → Add 'claude' and 'node'"
+  echo "    → Add your Terminal app (Terminal.app / iTerm2 / Warp / etc.)"
+  echo "    → Fully Quit the Terminal app, then re-open. macOS caches the perm until process restart."
+  if lsof -i :7845 > /dev/null 2>&1; then
+    echo "    → A screen-capture server is already running on :7845 with the old (denied) perm."
+    echo "      Kill it before re-running: lsof -ti:7845 | xargs kill"
+  fi
 else
-  rm -f /tmp/sutando-permcheck.png
   echo "  ✓ Screen Recording"
 fi
 
