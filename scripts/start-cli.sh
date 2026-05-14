@@ -78,6 +78,12 @@ fi
 # attaches. `mouse on` lets users two-finger scrollback in the Claude Code
 # pane (the default behavior, where Up-arrow goes to readline history and
 # you can't easily review prior agent output, is confusing for new installs).
+#
+# Tradeoff: `mouse on` intercepts native Cmd+drag text selection in the pane.
+# To copy text the macOS-native way, hold Option while dragging (Terminal.app,
+# iTerm2, Ghostty all honor Option-drag as a tmux-bypass). Documenting here
+# so future readers don't think this is a regression.
+#
 # Idempotent: re-running it on an already-configured server is a no-op.
 tmux -S "$TMUX_SOCKET" start-server 2>/dev/null || true
 tmux -S "$TMUX_SOCKET" set-option -g mouse on 2>/dev/null || true
