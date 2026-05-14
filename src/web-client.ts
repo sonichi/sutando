@@ -984,10 +984,24 @@ function updateTask(taskId, status, text, result) {
 const expandedTasks = window.expandedTasks = loadPersistedExpanded();
 const userExpanded = window.userExpanded = new Set(); // user-initiated expands — never auto-collapse these
 let userCollapsed = false; // user manually collapsed — suppress auto-expand
-// Listen for external collapse/expand commands (from inline tools via AppleScript)
+// Listen for external collapse/expand commands (from inline tools via AppleScript).
+// Action is 'collapse' / 'expand' for all-tasks, or 'collapse:N' / 'expand:N' (1-based) for one.
 new MutationObserver(() => {
-  if (document.body.dataset.taskAction === 'collapse') { expandedTasks.clear(); userCollapsed = true; renderTasks(); document.body.dataset.taskAction = ''; }
-  if (document.body.dataset.taskAction === 'expand') { Object.keys(taskMap).forEach(id => { if (taskMap[id].result) expandedTasks.add(id); }); userCollapsed = false; renderTasks(); document.body.dataset.taskAction = ''; }
+  const a = document.body.dataset.taskAction || '';
+  if (!a) return;
+  const [verb, idxStr] = a.split(':');
+  const idx = idxStr ? parseInt(idxStr, 10) : NaN;
+  const ids = Object.keys(taskMap);
+  if (Number.isInteger(idx) && idx >= 1 && idx <= ids.length) {
+    const targetId = ids[idx - 1];
+    if (verb === 'expand') { expandedTasks.add(targetId); userExpanded.add(targetId); userCollapsed = false; }
+    else if (verb === 'collapse') { expandedTasks.delete(targetId); userExpanded.delete(targetId); }
+    renderTasks();
+  } else {
+    if (verb === 'collapse') { expandedTasks.clear(); userCollapsed = true; renderTasks(); }
+    else if (verb === 'expand') { ids.forEach(id => { if (taskMap[id].result) expandedTasks.add(id); }); userCollapsed = false; renderTasks(); }
+  }
+  document.body.dataset.taskAction = '';
 }).observe(document.body, { attributes: true, attributeFilter: ['data-task-action'] });
 function toggleResult(taskId) {
   if (expandedTasks.has(taskId)) { expandedTasks.delete(taskId); userExpanded.delete(taskId); } else { expandedTasks.add(taskId); userExpanded.add(taskId); userCollapsed = false; }

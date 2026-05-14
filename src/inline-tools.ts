@@ -540,15 +540,18 @@ export const cancelTaskTool: ToolDefinition = {
 export const toggleTasksTool: ToolDefinition = {
 	name: 'toggle_tasks',
 	description:
-		'Collapse or expand all tasks in the web UI. Use for: "collapse tasks", "expand tasks", "hide tasks", "show tasks". Instant.',
+		'Collapse or expand tasks in the web UI. Use for: "collapse tasks", "expand tasks", "hide tasks", "show tasks", "expand only the first task". Pass taskIndex=1 for "the first task", 2 for "the second", etc. (1-based, by display order); omit for all-tasks. Instant.',
 	parameters: z.object({
-		action: z.enum(['collapse', 'expand']).describe('"collapse" to hide all task results, "expand" to show them'),
+		action: z.enum(['collapse', 'expand']).describe('"collapse" to hide task results, "expand" to show them'),
+		taskIndex: z.number().int().min(1).optional().describe('1-based index of a single task to act on (by display order). Omit to act on all tasks.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { action } = args as { action: 'collapse' | 'expand' };
-		// Set data attribute on body — MutationObserver in the page picks it up and updates state
-		const js = `document.body.dataset.taskAction = \\\"${action}\\\"; \\\"done\\\"`;
+		const { action, taskIndex } = args as { action: 'collapse' | 'expand'; taskIndex?: number };
+		// Set data attribute on body — MutationObserver in the page picks it up and updates state.
+		// When taskIndex is set, encode as "expand:N" / "collapse:N"; handler in web-client.ts parses the suffix.
+		const actionStr = taskIndex ? `${action}:${taskIndex}` : action;
+		const js = `document.body.dataset.taskAction = \\\"${actionStr}\\\"; \\\"done\\\"`;
 		try {
 			execSync(`osascript -e 'tell application "Google Chrome"
 				repeat with w in windows
