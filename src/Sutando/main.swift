@@ -242,12 +242,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.pollMuteState()
         }
 
-        // Watcher health: every 30s, verify the task watcher is running.
-        // If it's dead AND there are pending tasks AND it's been >60s since
-        // we last intervened, restart it and fire a notification. Chi's ask
-        // 2026-04-18: "can the app remind the CLI about watcher" — this
-        // goes one better by auto-restarting so no reminder is needed.
-        Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { [weak self] _ in
+        // Watcher health: every 5 min, verify the task watcher is running.
+        // Bumped from 30s → 300s on 2026-05-14 (Chi greenlit) — with Claude
+        // Code's `Monitor` tool now driving `watch-tasks-stream.sh` as the
+        // canonical persistent watcher, the menu-bar Timer is purely a
+        // safety net (catches Monitor crash / session-restart race / tmux
+        // pane death). 30s polling was overkill; 5 min keeps recovery in
+        // human-interactive territory (worst-case lag = ~5 min stale before
+        // auto-restart) while cutting 12× the wake-ups.
+        //
+        // Original design context (Chi 2026-04-18): "can the app remind the
+        // CLI about watcher" — auto-restart instead of remind, no UX
+        // change beyond cadence.
+        Timer.scheduledTimer(withTimeInterval: 300.0, repeats: true) { [weak self] _ in
             self?.checkWatcher()
         }
 
