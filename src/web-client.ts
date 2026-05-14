@@ -1027,7 +1027,7 @@ new MutationObserver(() => {
       document.querySelectorAll('[data-taskid="' + targetId + '"]').forEach(function(el) {
         el.classList.remove('task-flash');
         // Force reflow so the animation re-triggers on repeat expand:N.
-        void (el as HTMLElement).offsetWidth;
+        void el.offsetWidth;
         el.classList.add('task-flash');
         setTimeout(function() { el.classList.remove('task-flash'); }, 1100);
       });
