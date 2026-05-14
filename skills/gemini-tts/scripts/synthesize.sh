@@ -25,6 +25,7 @@ TEXT="${ARGS[*]-}"
 
 REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
 KEY="${GEMINI_API_KEY:-$(grep -E '^GEMINI_API_KEY=' "$REPO/.env" 2>/dev/null | cut -d= -f2-)}"
+KEY="${KEY%\"}"; KEY="${KEY#\"}"; KEY="${KEY%\'}"; KEY="${KEY#\'}"
 [[ -n "$KEY" ]] || { echo "GEMINI_API_KEY missing (set env or add to .env)" >&2; exit 1; }
 
 [[ -n "$OUT" ]] || OUT="$REPO/results/gemini-tts-$(date +%s).mp3"
