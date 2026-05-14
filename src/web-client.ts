@@ -310,6 +310,7 @@ const HTML = /* html */ `<!DOCTYPE html>
   .task-status.working { background: #1e3a5f; color: #60a5fa; animation: pulse 1.5s infinite; }
   .task-status.done { background: #1e4028; color: #4ecca3; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+  .task-num { color: #6b7a90; font-size: 14px; min-width: 24px; flex-shrink: 0; user-select: none; }
   .task-text { color: #d0d0d8; flex: 1; word-break: break-word; font-size: 16px; line-height: 1.6; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .task-text.expanded { white-space: normal; }
   .task-time { color: #777; font-size: 13px; flex-shrink: 0; }
@@ -1108,7 +1109,11 @@ function renderTasks() {
   // of view within seconds. 30 keeps a longer history visible; localStorage
   // persistence above keeps results from being lost across refreshes.
   const sorted = visible.sort((a, b) => b[1].time - a[1].time).slice(0, 30);
-  container.innerHTML = sorted.map(([id, t]) => {
+  container.innerHTML = sorted.map(([id, t], i) => {
+    // Display index (1-based) so voice can say "expand task 3" knowing
+    // exactly which task it is. Matches the taskIndex param the toggle_tasks
+    // tool accepts.
+    const taskNum = '<span class="task-num">' + (i + 1) + '.</span>';
     const icons = { pending: '&#8987;', working: '&#9881;', done: '&#10003;', error: '&#10007;' };
     const ago = Math.round((Date.now() - t.time) / 1000);
     const timeStr = ago < 60 ? ago + 's ago' : Math.round(ago / 60) + 'm ago';
@@ -1145,6 +1150,7 @@ function renderTasks() {
     const expandChip = hasResult ? '<span class="task-expand">' + (isExpanded ? 'Hide ▾' : 'Show details ▸') + '</span>' : '';
     return '<div class="task-item"' + clickAttr + '>' +
       '<div class="task-status ' + t.status + '">' + (icons[t.status] || '?') + '</div>' +
+      taskNum +
       '<span class="' + textClass + '">' + displayText + '</span>' +
       '<span class="task-time">' + timeStr + '</span>' +
       expandChip +
