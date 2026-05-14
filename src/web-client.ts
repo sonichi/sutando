@@ -999,7 +999,14 @@ new MutationObserver(() => {
     .map(([id]) => id);
   if (Number.isInteger(idx) && idx >= 1 && idx <= ids.length) {
     const targetId = ids[idx - 1];
-    if (verb === 'expand') { expandedTasks.add(targetId); userExpanded.add(targetId); userCollapsed = false; }
+    if (verb === 'expand') {
+      // Add target. Do NOT reset userCollapsed — if the user just said
+      // "collapse all" → "expand task N", we want ONLY N visible.
+      // Resetting userCollapsed to false lets the API-poll auto-expand
+      // block re-add all working tasks on the next 3s tick, undoing the
+      // collapse and making per-task expand look like a no-op.
+      expandedTasks.add(targetId); userExpanded.add(targetId);
+    }
     else if (verb === 'collapse') { expandedTasks.delete(targetId); userExpanded.delete(targetId); }
     renderTasks();
   } else {
