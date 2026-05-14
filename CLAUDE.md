@@ -100,6 +100,12 @@ Tasks arrive from multiple channels via the same file bridge:
 - Proactive messages: write to `results/proactive-{ts}.txt` to speak to the user
 - To send files in replies, include `[file: /path/to/file]` in the result text
 
+**Result-body protocol markers** — when the result body STARTS with one of these, the bridge handles delivery specially. Use them when multiple related tasks should produce ONE user-facing reply instead of N separate ones:
+- `[deduped: task-<other-id>]` — both voice (task-bridge) and Discord (discord-bridge) silently archive this task as done, no narration, no DM. Put the full reply in the other task's result file and put this marker in each superseded task's result. The canonical way to handle thread-consolidated replies (e.g. when voice over-delegates 3 tasks for the same continuation utterance — see `src/task-bridge.ts:527`).
+- `[no-send]` — Discord bridge skips delivery for this task (still archives). Use when the task is internally handled but produces no user-visible reply.
+- `[REPLIED]` — Discord bridge skips delivery (already sent through another path).
+- `[file: /path]` / `[send: /path]` / `[attach: /path]` — Discord bridge extracts and attaches the file alongside the text body.
+
 **IMPORTANT:** On session start, check if the task watcher is running (`pgrep -f "watch-tasks"`). If not, start it with `bash src/watch-tasks.sh` using `run_in_background: true`. When notified, read the output — it lists ALL pending task files. Process every one, write results to `results/`, then restart the watcher. This is how voice commands reach you.
 
 ## Tutorial
