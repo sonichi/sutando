@@ -991,7 +991,12 @@ new MutationObserver(() => {
   if (!a) return;
   const [verb, idxStr] = a.split(':');
   const idx = idxStr ? parseInt(idxStr, 10) : NaN;
-  const ids = Object.keys(taskMap);
+  // Match display order in renderTasks(): filter to visible (non-done unless
+  // showDone), then sort by time descending. "First task" = top of the list.
+  const ids = Object.entries(taskMap)
+    .filter(([, t]) => showDone || t.status !== 'done')
+    .sort((a, b) => b[1].time - a[1].time)
+    .map(([id]) => id);
   if (Number.isInteger(idx) && idx >= 1 && idx <= ids.length) {
     const targetId = ids[idx - 1];
     if (verb === 'expand') { expandedTasks.add(targetId); userExpanded.add(targetId); userCollapsed = false; }
