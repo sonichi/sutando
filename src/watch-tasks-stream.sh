@@ -1,14 +1,13 @@
 #!/bin/bash
-# Streaming task watcher — companion to watch-tasks.sh.
+# Streaming task watcher — the canonical task-detection path.
 #
 # Runs fswatch indefinitely and emits ONE line per new task file appearance.
 # Designed to be invoked via Claude Code's `Monitor` tool, which streams
 # stdout lines as per-event notifications without process-restart cycles.
 #
-# Compared to watch-tasks.sh (one-shot, exits on first event so the caller
-# can be notified via process-exit): this script never exits during normal
-# operation. Migration is gated by which invocation pattern the agent uses
-# (Bash run_in_background vs Monitor), not by removing the old script.
+# Replaces the one-shot `watch-tasks.sh` (retired 2026-05-14) — that one
+# exited on first event so the caller had to restart it; this one stays
+# alive for the lifetime of the CLI session.
 #
 # Output format per event:
 #   TASK_FILE: <basename>

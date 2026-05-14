@@ -530,7 +530,7 @@ def _extract_body(text: str, start: int) -> str:
 # ---------------------------------------------------------------------------
 # These two checks together catch the failure mode observed 2026-05-06 where
 # voice-queued tasks piled up in tasks/ for 5+ minutes with no processing,
-# because (a) the watch-tasks.sh fswatch shim wasn't running and (b) the
+# because (a) the watch-tasks fswatch shim wasn't running and (b) the
 # core proactive loop's last status update was 5 days old (status="running"
 # with a stale ts means a pass crashed mid-execution and the loop never
 # re-armed). Each check is a *consequence* signal that fires regardless of
