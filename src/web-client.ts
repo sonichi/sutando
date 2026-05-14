@@ -2277,7 +2277,7 @@ function renderTabContent() {
     } else {
       var sorted = entries.sort(function(a,b) { return b[1].time - a[1].time; }).slice(0, 10);
       var icons = { pending: '&#8987;', working: '&#9881;', done: '&#10003;', error: '&#10007;' };
-      container.innerHTML = sorted.map(function(entry) {
+      container.innerHTML = sorted.map(function(entry, i) {
         var id = entry[0], t = entry[1];
         var ago = Math.round((Date.now() - t.time) / 1000);
         var timeStr = ago < 60 ? ago + 's ago' : Math.round(ago / 60) + 'm ago';
@@ -2294,7 +2294,10 @@ function renderTabContent() {
         // overwhelming majority of un-prefixed tasks come from the voice agent.
         // (Was [Sutando-core]; renamed 2026-05-03 per Chi's "rename to Voice".)
         var taggedRaw = /^\\[/.test(rawText) ? rawText : '[Voice] ' + rawText;
-        var displayText = isExpanded ? taggedRaw : summarizeTaskText(taggedRaw);
+        // Prepend 1-based index — same as the primary renderTasks path,
+        // so voice can target tasks by number on this dynamic-region list too.
+        var numPrefix = (i + 1) + '. ';
+        var displayText = numPrefix + (isExpanded ? taggedRaw : summarizeTaskText(taggedRaw));
         var textClass = isExpanded ? 'task-text expanded' : 'task-text';
         var expandChip = hasResult ? '<span class="task-expand">' + (isExpanded ? 'Hide &#9662;' : 'Show details &#9656;') + '</span>' : '';
         return '<div class="task-item"' + clickAttr + '>' +
