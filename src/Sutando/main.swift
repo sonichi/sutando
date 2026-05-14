@@ -419,7 +419,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         modePresenterMenuItem?.title = (active == "presenter" ? "● " : "  ") + "Mode: Presenter"
     }
 
-    var lastWatcherAlert: Date = .distantPast
     func checkWatcher() {
         // pgrep -f watch-tasks
         let proc = Process()
@@ -460,10 +459,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // Throttle: don't alert more than once every 120s so the CLI doesn't
-        // get flooded if it's slow to restart.
-        if Date().timeIntervalSince(lastWatcherAlert) < 120 { return }
-        lastWatcherAlert = Date()
+        // (Removed 120s inner throttle 2026-05-14: now strictly dead code under
+        // the 300s outer Timer cadence — two consecutive ticks are always 300s
+        // apart, so the throttle never gated. Flood-protection is now solely
+        // the watcherKeystrokesQueued() check above + the Timer interval.)
 
         // If Claude Code is running inside the `sutando-core` tmux session
         // (launch via scripts/start-cli.sh), send the word `watcher` to
