@@ -999,14 +999,27 @@ new MutationObserver(() => {
   if (!a) return;
   const [verb, idxStr] = a.split(':');
   const idx = idxStr ? parseInt(idxStr, 10) : NaN;
-  // Match display order in renderTasks(): filter to visible (non-done unless
-  // showDone), then sort by time descending. "First task" = top of the list.
-  const ids = Object.entries(taskMap)
+  // Per-task ops ("expand:3") must use the SAME ordering the user actually sees.
+  // The primary #tasks container is display:none — only the dr-content "tasks"
+  // sub-tab is visible, which renders top-10 by time desc with no filter
+  // (line 2308 below). Voice "expand task N" hitting a different list than
+  // what the user can see produces the bug Chi caught — voice targeted a
+  // 3-day-old timeout task because it ranked 3rd in the unsliced filtered
+  // observer list, but the user's "task 3" was a recent done task that
+  // wasn't in the filtered set.
+  const visibleIds = Object.entries(taskMap)
+    .sort((a, b) => b[1].time - a[1].time)
+    .slice(0, 10)
+    .map(([id]) => id);
+  // All-tasks ops ("expand"/"collapse" with no index) still use the broader
+  // filtered list — "expand all" should reach everything non-done, not just
+  // the visible 10.
+  const allIds = Object.entries(taskMap)
     .filter(([, t]) => showDone || t.status !== 'done')
     .sort((a, b) => b[1].time - a[1].time)
     .map(([id]) => id);
-  if (Number.isInteger(idx) && idx >= 1 && idx <= ids.length) {
-    const targetId = ids[idx - 1];
+  if (Number.isInteger(idx) && idx >= 1 && idx <= visibleIds.length) {
+    const targetId = visibleIds[idx - 1];
     if (verb === 'expand') {
       // Add target. Do NOT reset userCollapsed — if the user just said
       // "collapse all" → "expand task N", we want ONLY N visible.
@@ -1034,7 +1047,7 @@ new MutationObserver(() => {
     }, 50);
   } else {
     if (verb === 'collapse') { expandedTasks.clear(); userCollapsed = true; renderTasks(); }
-    else if (verb === 'expand') { ids.forEach(id => { if (taskMap[id].result) expandedTasks.add(id); }); userCollapsed = false; renderTasks(); }
+    else if (verb === 'expand') { allIds.forEach(id => { if (taskMap[id].result) expandedTasks.add(id); }); userCollapsed = false; renderTasks(); }
   }
   document.body.dataset.taskAction = '';
 }).observe(document.body, { attributes: true, attributeFilter: ['data-task-action'] });
