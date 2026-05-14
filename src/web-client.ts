@@ -310,7 +310,7 @@ const HTML = /* html */ `<!DOCTYPE html>
   .task-status.working { background: #1e3a5f; color: #60a5fa; animation: pulse 1.5s infinite; }
   .task-status.done { background: #1e4028; color: #4ecca3; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
-  .task-num { color: #6b7a90; font-size: 14px; min-width: 24px; flex-shrink: 0; user-select: none; }
+  .task-num { color: #9aa8c0; font-size: 15px; font-weight: 600; min-width: 28px; flex-shrink: 0; user-select: none; display: inline-block; }
   .task-text { color: #d0d0d8; flex: 1; word-break: break-word; font-size: 16px; line-height: 1.6; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .task-text.expanded { white-space: normal; }
   .task-time { color: #777; font-size: 13px; flex-shrink: 0; }
