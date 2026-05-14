@@ -35,14 +35,16 @@ const VISION_MODEL = process.env.VISION_MODEL || 'gemini-3.1-flash-lite-preview'
 export const scrollTool: ToolDefinition = {
 	name: 'scroll',
 	description:
-		'Scroll the currently focused application. Works in Chrome, VS Code, or any app. Use for: "scroll down", "scroll up", "scroll to top", "scroll to bottom". Use target for specific areas in Chrome: "sidebar", "chat history", "code block".',
+		'Scroll the currently focused application. Works in Chrome, VS Code, or any app. Use for: "scroll down", "scroll up", "scroll to top", "scroll to bottom". Pass amount=small for "scroll a little" / "a bit", large for "scroll a lot". Use target for specific areas in Chrome: "sidebar", "chat history", "code block".',
 	parameters: z.object({
 		direction: z.enum(['down', 'up', 'top', 'bottom']).describe('Scroll direction. Use "top" or "bottom" to jump to start/end of page.'),
+		amount: z.enum(['small', 'medium', 'large']).optional().describe('How far to scroll for down/up. small=150px, medium=400px (default), large=800px. Ignored for top/bottom.'),
 		target: z.string().optional().describe('Optional: which area to scroll in Chrome. E.g. "sidebar", "chat history", "nav", "code". Omit for main content.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { direction, target } = args as { direction: 'down' | 'up' | 'top' | 'bottom'; target?: string };
+		const { direction, amount, target } = args as { direction: 'down' | 'up' | 'top' | 'bottom'; amount?: 'small' | 'medium' | 'large'; target?: string };
+		const px = amount === 'small' ? 150 : amount === 'large' ? 800 : 400;
 		try {
 			// Check which app is frontmost
 			let frontApp = '';
@@ -59,7 +61,7 @@ export const scrollTool: ToolDefinition = {
 				let js: string;
 				if (direction === 'top') js = scrollFn('e.scrollTop=0');
 				else if (direction === 'bottom') js = scrollFn('e.scrollTop=e.scrollHeight');
-				else js = scrollFn(`e.scrollBy(0,${direction === 'down' ? 600 : -600})`);
+				else js = scrollFn(`e.scrollBy(0,${direction === 'down' ? px : -px})`);
 				const tmpScroll = `/tmp/sutando-scroll-${Date.now()}.scpt`;
 				writeFileSync(tmpScroll, `tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`);
 				execSync(`osascript ${tmpScroll}`, { timeout: 5_000 });
@@ -72,7 +74,7 @@ export const scrollTool: ToolDefinition = {
 				let js: string;
 				if (direction === 'top') js = scrollFn('e.scrollTop=0');
 				else if (direction === 'bottom') js = scrollFn('e.scrollTop=e.scrollHeight');
-				else js = scrollFn(`e.scrollBy(0,${direction === 'down' ? 600 : -600})`);
+				else js = scrollFn(`e.scrollBy(0,${direction === 'down' ? px : -px})`);
 				const tmpScroll = `/tmp/sutando-scroll-${Date.now()}.scpt`;
 				writeFileSync(tmpScroll, `tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`);
 				execSync(`osascript ${tmpScroll}`, { timeout: 5_000 });
