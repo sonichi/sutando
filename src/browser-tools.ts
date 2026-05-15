@@ -214,7 +214,7 @@ export const closeTabTool: ToolDefinition = {
 export const openUrlTool: ToolDefinition = {
 	name: 'open_url',
 	description:
-		'Open a URL in a new Chrome tab. Use for: "open github.com", "go to that link".',
+		'Open a URL in Chrome. Reuses the active tab when the target shares origin (scheme + host + port) with what\'s already in the active tab; spawns a new tab only for cross-origin URLs. Use for: "open github.com", "go to that link".',
 	parameters: z.object({
 		url: z.string().describe('The URL to open'),
 	}),
@@ -223,10 +223,32 @@ export const openUrlTool: ToolDefinition = {
 		const { url } = args as { url: string };
 		// Escape backslashes first, then quotes — prevents shell injection via osascript
 		const safeUrl = url.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
+		// Parse target origin (scheme + host + port). If unparseable, fall back to new-tab behavior.
+		let targetOrigin = '';
+		try { targetOrigin = new URL(url).origin; } catch { /* not a real URL, e.g. "about:blank" — let Chrome handle */ }
 		try {
-			execSync(`osascript -e 'tell application "Google Chrome" to tell front window to make new tab with properties {URL:"${safeUrl}"}'`, { timeout: 5_000 });
-			console.log(`${ts()} [OpenURL] opened: ${url}`);
-			return { status: 'opened', url };
+			// Query active-tab URL to decide reuse vs new-tab. If origin matches, set URL on active
+			// tab; otherwise open a new tab. Falls back to new-tab on any error so callers never
+			// silently fail to open the URL.
+			let reused = false;
+			if (targetOrigin) {
+				try {
+					const activeUrl = execSync(`osascript -e 'tell application "Google Chrome" to get URL of active tab of front window'`, { timeout: 3_000 }).toString().trim();
+					if (activeUrl) {
+						let activeOrigin = '';
+						try { activeOrigin = new URL(activeUrl).origin; } catch {}
+						if (activeOrigin && activeOrigin === targetOrigin) {
+							execSync(`osascript -e 'tell application "Google Chrome" to set URL of active tab of front window to "${safeUrl}"'`, { timeout: 5_000 });
+							reused = true;
+						}
+					}
+				} catch { /* fall through to new-tab */ }
+			}
+			if (!reused) {
+				execSync(`osascript -e 'tell application "Google Chrome" to tell front window to make new tab with properties {URL:"${safeUrl}"}'`, { timeout: 5_000 });
+			}
+			console.log(`${ts()} [OpenURL] ${reused ? 'reused active tab' : 'opened new tab'}: ${url}`);
+			return { status: reused ? 'reused' : 'opened', url };
 		} catch (err) {
 			return { error: `Failed to open ${url}: ${err instanceof Error ? err.message : err}` };
 		}

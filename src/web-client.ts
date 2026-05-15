@@ -674,7 +674,7 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
     </svg>
   </div>
   <h2 id="hero-name">Sutando</h2>
-  <p class="tagline">My AI Stand</p>
+  <p class="tagline">My AI Stand · Summon my AI superpower</p>
   <button class="btn-hero" onclick="toggle()">Start Voice</button>
 </div>
 
