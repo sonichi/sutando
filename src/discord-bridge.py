@@ -26,8 +26,8 @@ import discord
 # than the workspace. That divergence stranded owner DMs on 2026-05-14 — the
 # bridge wrote tasks to bundle-tasks/ while core agent watched workspace-tasks/.
 import os
-_workspace_env = os.environ.get("SUTANDO_WORKSPACE")
-REPO = Path(_workspace_env) if _workspace_env else Path(__file__).resolve().parent.parent
+_workspace_env = os.environ.get("SUTANDO_WORKSPACE", "").strip()
+REPO = Path(_workspace_env).expanduser() if _workspace_env else Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from util_paths import shared_personal_path  # noqa: E402
 
