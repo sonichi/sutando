@@ -56,12 +56,15 @@ const triageEmailTool: ToolDefinition = {
 				encoding: 'utf8',
 				stdio: ['ignore', 'pipe', 'pipe'],
 			});
-			// gws prints diagnostic header lines + JSON; find the first '['.
-			const jsonStart = stdout.indexOf('[');
+			// gws prints diagnostic header lines + JSON object. Schema:
+			//   { messages: [...], query: "...", resultSizeEstimate: N }
+			// Find the first '{', parse, extract messages.
+			const jsonStart = stdout.indexOf('{');
 			if (jsonStart === -1) return { error: 'triage_email: gws did not return JSON' };
-			const messages = JSON.parse(stdout.slice(jsonStart));
-			console.log(`${ts()} [TriageEmail] ${Array.isArray(messages) ? messages.length : '?'} messages`);
-			return { status: 'ok', count: Array.isArray(messages) ? messages.length : 0, messages };
+			const parsed = JSON.parse(stdout.slice(jsonStart));
+			const messages = Array.isArray(parsed) ? parsed : parsed.messages ?? [];
+			console.log(`${ts()} [TriageEmail] ${messages.length} messages`);
+			return { status: 'ok', count: messages.length, messages, query: parsed.query };
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
 			console.log(`${ts()} [TriageEmail] failed: ${msg}`);
