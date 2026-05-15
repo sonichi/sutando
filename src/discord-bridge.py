@@ -18,7 +18,16 @@ from pathlib import Path
 
 import discord
 
-REPO = Path(__file__).resolve().parent.parent
+# REPO resolution: prefer SUTANDO_WORKSPACE env var so the bridge writes to the
+# user's workspace tasks/results/state dirs, not the app-bundle's copy. When
+# this file lives under /Applications/Sutando.app/.../repo/src/, the workspace
+# `src/` is typically a symlink into the bundle, so `Path(__file__).resolve()`
+# walks INTO the bundle and `parent.parent` returns the bundle root rather
+# than the workspace. That divergence stranded owner DMs on 2026-05-14 — the
+# bridge wrote tasks to bundle-tasks/ while core agent watched workspace-tasks/.
+import os
+_workspace_env = os.environ.get("SUTANDO_WORKSPACE")
+REPO = Path(_workspace_env) if _workspace_env else Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from util_paths import shared_personal_path  # noqa: E402
 
