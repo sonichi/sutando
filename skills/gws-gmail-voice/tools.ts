@@ -7,8 +7,9 @@
 //
 // 3-tier path (cache → live gws → work fallback):
 //   1) CACHE — read `state/external-cache/inbox-important.json` (importance-
-//      scored top-3, refreshed periodically by ACT loop's cache_email_triage
-//      action via skills/gws-gmail-voice/scripts/refresh-cache.py). Sub-50ms.
+//      scored top-3, refreshed periodically by the ACT loop's `score-inbox-llm`
+//      cron — LLM judges importance using inbox + calendar + recent owner-
+//      intent context, with incremental scoring of new mail only). Sub-50ms.
 //      Returns top-3 ranked by importance, not recency.
 //   2) LIVE — cache stale (>15min) or missing → call `gws gmail +triage` directly.
 //      Returns up to `max` messages by recency.
