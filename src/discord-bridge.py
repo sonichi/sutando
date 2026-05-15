@@ -2880,6 +2880,23 @@ async def poll_dm_fallback():
                     if _task_file.exists():
                         archive_file(_task_file, "tasks", _task_id)
                     continue
+                # Honor result-body suppression markers (parity with the
+                # main reply path at line ~2660). Without this, results
+                # written specifically to suppress delivery (deduped /
+                # internally-handled / already-replied-elsewhere) get DM'd
+                # to the owner via this fallback when voice is offline.
+                try:
+                    _peek = f.read_text(encoding="utf-8", errors="replace").lstrip()
+                except OSError:
+                    _peek = ""
+                if _peek.startswith('[no-send]') or _peek.startswith('[REPLIED]') or _peek.startswith('[deduped:'):
+                    print(f"  [dm-fallback] skipped (suppression marker): {f.name}", flush=True)
+                    _task_id = f.stem
+                    _task_file = TASKS_DIR / f"{_task_id}.txt"
+                    if _task_file.exists():
+                        archive_file(_task_file, "tasks", _task_id)
+                    archive_file(f, "results", _task_id)
+                    continue
                 # Subprocess out to the shared CLI tool so there's only one
                 # code path for the voiceConnected check + DM send.
                 # Use sys.executable: under launchd (discord-bridge is launchd-managed),
