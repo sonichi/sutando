@@ -35,7 +35,7 @@ const triageEmailTool: ToolDefinition = {
 		'Summarize the user\'s unread Gmail inbox. ' +
 		'Use when the caller asks: "what unread emails do I have", "summarize my inbox", "what\'s the most important email I missed", "any urgent emails". ' +
 		'Returns a list of recent unread messages with sender, subject, and date. ' +
-		'Do NOT use openUrlTool to open Gmail in Chrome — that path can\'t read the content back to the caller. ' +
+		'On timeout/error: tell the caller you\'re using a slower path, then call the `work` tool with "check gmail unread inbox via gws gmail +triage" — it returns the same data via a slower but more reliable channel. ' +
 		'For sending email, deletion, or replies, delegate to work; this tool is read-only triage.',
 	parameters: z.object({
 		max: z.number().int().min(1).max(20).optional().describe('Max messages to return (default 5).'),
@@ -52,14 +52,17 @@ const triageEmailTool: ToolDefinition = {
 			const cmdArgs = ['gmail', '+triage', '--format', 'json', '--max', String(max)];
 			if (query) cmdArgs.push('--query', query);
 			const stdout = execFileSync('gws', cmdArgs, {
-				timeout: 5_000,
+				timeout: 10_000,
 				encoding: 'utf8',
 				stdio: ['ignore', 'pipe', 'pipe'],
 			});
 			// gws prints diagnostic header lines + JSON object. Schema:
 			//   { messages: [...], query: "...", resultSizeEstimate: N }
-			// Find the first '{', parse, extract messages.
-			const jsonStart = stdout.indexOf('{');
+			// Match `{` at start-of-line (multiline) — robust against future
+			// header lines that contain a literal `{` (e.g. `Loading {token}.json`).
+			// Falls back to first `{` if no line-start brace found. Per Mini PR #702 nit.
+			const match = stdout.match(/^\{/m);
+			const jsonStart = match?.index ?? stdout.indexOf('{');
 			if (jsonStart === -1) return { error: 'triage_email: gws did not return JSON' };
 			const parsed = JSON.parse(stdout.slice(jsonStart));
 			const messages = Array.isArray(parsed) ? parsed : parsed.messages ?? [];

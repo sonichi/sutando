@@ -902,7 +902,10 @@ function assertUniqueToolNames(tools: ToolDefinition[]): ToolDefinition[] {
 // commit). Restored 2026-04-25 after the iclr-highlight skill went silent on
 // the autonav cue — voice-agent had no way to call highlight_slide because the
 // skill's tools were never being merged into inlineTools.
-async function loadSkillManifestTools(): Promise<ToolDefinition[]> {
+// Split by manifest `access_tier` so phone-conversation can include
+// owner-tier tools only when the caller is the verified owner. Manifest
+// access_tier values: "owner" (default if omitted) | "any_caller".
+async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyCaller: ToolDefinition[] }> {
 	// Scan the public-repo `skills/` dir AND the optional private skills dir
 	// pointed to by `$SUTANDO_PRIVATE_DIR/skills/` (e.g.
 	// `~/.sutando-memory-sync/skills/`). The private dir lets users keep
@@ -916,7 +919,8 @@ async function loadSkillManifestTools(): Promise<ToolDefinition[]> {
 		const expanded = privateRoot.replace(/^~/, process.env.HOME || '');
 		dirsToScan.push(join(expanded, 'skills'));
 	}
-	const out: ToolDefinition[] = [];
+	const owner: ToolDefinition[] = [];
+	const anyCaller: ToolDefinition[] = [];
 	for (const skillsDir of dirsToScan) {
 		if (!existsSync(skillsDir)) continue;
 		let dirs: string[];
@@ -928,7 +932,7 @@ async function loadSkillManifestTools(): Promise<ToolDefinition[]> {
 		for (const dirName of dirs) {
 			const manifestPath = join(skillsDir, dirName, 'manifest.json');
 			if (!existsSync(manifestPath)) continue;
-			let manifest: { enabled?: boolean; tools?: string; config?: Record<string, string>; name?: string };
+			let manifest: { enabled?: boolean; tools?: string; config?: Record<string, string>; name?: string; access_tier?: string };
 			try {
 				manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
 			} catch (err) {
@@ -941,21 +945,23 @@ async function loadSkillManifestTools(): Promise<ToolDefinition[]> {
 			}
 			if (!manifest.tools) continue;
 			const toolsPath = join(skillsDir, dirName, manifest.tools.replace(/^\.\//, ''));
+			const tier = manifest.access_tier === 'any_caller' ? 'any_caller' : 'owner';
 			try {
 				// @ts-ignore — dynamic relative import resolved at runtime by tsx
 				const mod = await import(toolsPath);
 				if (Array.isArray(mod.tools)) {
-					out.push(...mod.tools);
-					console.log(`[skill-loader] loaded ${mod.tools.length} tool(s) from ${manifest.name || dirName} (${skillsDir})`);
+					(tier === 'any_caller' ? anyCaller : owner).push(...mod.tools);
+					console.log(`[skill-loader] loaded ${mod.tools.length} tool(s) from ${manifest.name || dirName} [tier=${tier}] (${skillsDir})`);
 				}
 			} catch (err) {
 				console.warn(`[skill-loader] failed to import ${dirName}/${manifest.tools} from ${skillsDir}:`, err instanceof Error ? err.message : err);
 			}
 		}
 	}
-	return out;
+	return { owner, anyCaller };
 }
 const personalTools = await loadSkillManifestTools();
+const personalAllTools = [...personalTools.owner, ...personalTools.anyCaller];
 
 // Manifest-driven discovery of skills that core (not voice-inline) runs.
 // When a manifest has `documented_for_core: true` and a `core_description`,
@@ -1018,12 +1024,13 @@ export const inlineTools = assertUniqueToolNames([
 	describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, slideControlTool, fullscreenTool,
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
 	recentContextTool,
-	...personalTools ]);
+	...personalAllTools ]);
 
 /** Tools available to any caller (including unverified) */
 export const anyCallerTools = [
 	getCurrentTimeTool,
 	getCoreStatusTool,
+	...personalTools.anyCaller,
 ];
 
 /** Owner-only tools (require isOwner) */
@@ -1036,6 +1043,7 @@ export const ownerOnlyTools = [
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
 	recentContextTool,
 	describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool,
+	...personalTools.owner,
 ];
 
 /** Configurable tools — default to owner-only, can be opened to verified callers */
