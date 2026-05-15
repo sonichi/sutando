@@ -187,7 +187,7 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
             pass
     try:
         pids = subprocess.run(
-            ["pgrep", "-f", pgrep_pattern],
+            ["/usr/bin/pgrep", "-f", pgrep_pattern],
             capture_output=True, text=True, timeout=5
         ).stdout.strip().split("\n")
         pids = [p for p in pids if p]
@@ -719,7 +719,7 @@ def run_all_checks() -> list[dict]:
             # invocations, ps/grep pipelines, etc). Otherwise pgrep -f bare
             # name produces false-positive "multiple processes" warnings
             # that scared us into thinking the bridges were zombied today.
-            result = subprocess.run(["pgrep", "-f", f"{proc_name}\\.py$"], capture_output=True, text=True)
+            result = subprocess.run(["/usr/bin/pgrep", "-f", f"{proc_name}\\.py$"], capture_output=True, text=True)
             pids = result.stdout.strip().split("\n") if result.returncode == 0 else []
             pids = [p for p in pids if p]
         except:
@@ -832,7 +832,7 @@ def run_all_checks() -> list[dict]:
     sutando_bin = REPO_DIR / "src" / "Sutando" / "Sutando"
     if sutando_bin.exists():
         try:
-            result = subprocess.run(["pgrep", "-f", "Sutando/Sutando"], capture_output=True, text=True)
+            result = subprocess.run(["/usr/bin/pgrep", "-f", "Sutando/Sutando"], capture_output=True, text=True)
             pids = [p for p in result.stdout.strip().split("\n") if p]
         except:
             pids = []
@@ -1102,7 +1102,7 @@ def main():
                             # bridge process. PR #243 fixed the detect
                             # side; this keeps the kill side consistent.
                             old_pids = subprocess.run(
-                                ["pgrep", "-f", f"{c['name']}\\.py$"], capture_output=True, text=True
+                                ["/usr/bin/pgrep", "-f", f"{c['name']}\\.py$"], capture_output=True, text=True
                             ).stdout.strip().split("\n")
                             for pid in old_pids:
                                 if pid:
@@ -1160,7 +1160,7 @@ def main():
                     if c["status"] == "stale":
                         try:
                             old_pids = subprocess.run(
-                                ["pgrep", "-f", "conversation-server.ts"],
+                                ["/usr/bin/pgrep", "-f", "conversation-server.ts"],
                                 capture_output=True, text=True
                             ).stdout.strip().split("\n")
                             for pid in old_pids:
