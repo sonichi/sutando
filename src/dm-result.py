@@ -37,8 +37,8 @@ from pathlib import Path
 # discord-bridge.py (PR #708) — when src/ is a symlink into a packaged
 # Sutando.app bundle, Path(__file__).resolve().parent.parent returns the bundle
 # root rather than the workspace.
-_workspace_env = os.environ.get("SUTANDO_WORKSPACE")
-REPO = Path(_workspace_env) if _workspace_env else Path(__file__).resolve().parent.parent
+_workspace_env = os.environ.get("SUTANDO_WORKSPACE", "").strip()
+REPO = Path(_workspace_env).expanduser() if _workspace_env else Path(__file__).resolve().parent.parent
 ACCESS_JSON = Path.home() / ".claude" / "channels" / "discord" / "access.json"
 SSE_STATUS_URL = "http://localhost:8080/sse-status"
 
