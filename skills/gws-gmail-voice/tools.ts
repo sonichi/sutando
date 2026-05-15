@@ -34,7 +34,9 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
 const CACHE_PATH = join(process.cwd(), 'state', 'external-cache', 'inbox-important.json');
-const CACHE_MAX_AGE_MS = 15 * 60 * 1000;  // 15 minutes
+// 30 min TTL: balances cache-hit rate (~95% at 30min vs ~70% at 15min) against
+// staleness. Live gws fallback covers the freshness edge case anyway. Per Mini PR #704 review.
+const CACHE_MAX_AGE_MS = 30 * 60 * 1000;
 
 function gwsAvailable(): boolean {
 	try {
@@ -59,20 +61,25 @@ function readCacheIfFresh(): { ts: string; top_3_important: unknown[]; all_unrea
 const triageEmailTool: ToolDefinition = {
 	name: 'triage_email',
 	description:
-		'Get the user\'s most important unread Gmail. ' +
+		'Get the user\'s unread Gmail. ' +
 		'Use when the caller asks: "what unread emails do I have", "what\'s the most important email I missed", "any urgent emails", "summarize my inbox". ' +
-		'**Default behavior (mode=important):** returns top-3 importance-RANKED unread messages — these are pre-scored by the ACT loop (filtered for newsletters/digests; promoted by deadline/RSVP/CI/academic keywords; weighted by sender). DO NOT pass `max=1` — the tool already returns the most important; passing max only matters for mode="recent". ' +
-		'**mode="recent"**: returns top-N by date (no importance ranking). Use only when caller explicitly asks for "list my latest emails" or "show me everything unread". ' +
+		'**mode="important" (default):** returns top-3 importance-RANKED unread messages — pre-scored by the ACT loop (filters newsletters/digests; promotes deadline/RSVP/CI/academic keywords; weights by sender). `max` is ignored in this mode (always returns top-3). ' +
+		'**mode="recent":** returns top-N by date (no importance ranking). Pass `max` to control N (default 5). Use only when caller explicitly asks for "list my latest emails" or "show me everything unread". ' +
 		'On timeout/error: tell the caller you\'re using a slower path, then call the `work` tool with "check gmail unread inbox via gws gmail +triage". ' +
 		'For sending email, deletion, or replies, delegate to work; this tool is read-only triage.',
 	parameters: z.object({
 		mode: z.enum(['important', 'recent']).optional().describe('"important" (default): top-3 importance-ranked. "recent": top-N by date.'),
-		max: z.number().int().min(1).max(20).optional().describe('Only used when mode="recent". Default 5.'),
+		max: z.number().int().min(1).max(20).optional().describe('Top-N for mode="recent" (default 5). Ignored when mode="important".'),
 		query: z.string().optional().describe('Optional Gmail search query (default: is:unread). Only used in live calls.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
 		const { mode = 'important', max = 5, query } = args as { mode?: 'important' | 'recent'; max?: number; query?: string };
+		// In important mode, `max` is schema-meaningless — the cache returns
+		// pre-ranked top-3 regardless. Log if Gemini passes it so we can audit.
+		if (mode === 'important' && args && (args as { max?: number }).max !== undefined) {
+			console.log(`${ts()} [TriageEmail] mode=important: ignoring max=${(args as { max?: number }).max} (cache returns top-3)`);
+		}
 		console.log(`${ts()} [TriageEmail] called (mode=${mode}, max=${max}${query ? `, query="${query}"` : ''})`);
 
 		// Tier 1: cache hit (importance mode only — recent mode always wants live)

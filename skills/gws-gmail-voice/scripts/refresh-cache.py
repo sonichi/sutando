@@ -30,18 +30,25 @@ CACHE_PATH = REPO_ROOT / "state" / "external-cache" / "inbox-important.json"
 TMP_PATH = CACHE_PATH.with_suffix(".json.tmp")
 
 # Domains whose mail is overwhelmingly newsletter / digest / promotional.
+# Generic patterns only — specific brand names (foundercoho, odsc) overfit one
+# user's inbox; the noreply/marketing/newsletter prefix patterns catch them
+# anyway. Per Mini PR #704 review.
 BLACKLIST_DOMAINS = (
     "linkedin.com",  # messaging digests
     "substack.com",
-    "foundercoho",
-    "odsc.com",
     "workspace-noreply@google.com",
     "noreply@medium.com",
     "newsletter@",
     "marketing@",
     "no-reply@",
-    "notifications@openreview.net",  # academic notifs are still high — handled separately
+    "noreply@",
+    "notifications@openreview.net",  # academic notifs handled separately as +10
 )
+
+# Owner's email domain for self-notification scoring. OSS users set
+# SUTANDO_OWNER_EMAIL_DOMAIN=their.tld to get their own self-CI bumps.
+# Empty → skip the bump (no penalty, just no boost for that path).
+OWNER_EMAIL_DOMAIN = os.environ.get("SUTANDO_OWNER_EMAIL_DOMAIN", "").strip().lower()
 
 # Subjects matching these are high-importance.
 SUBJECT_BUMP_PATTERNS = [
@@ -62,8 +69,10 @@ def score_message(msg: dict) -> int:
     score = 0
     if any(b in sender for b in BLACKLIST_DOMAINS):
         score -= 100
-    if "@chiwang.cc" in sender or "notifications@github.com" in sender:
-        score += 15  # self-notifications (CI, GitHub) are HIGH
+    if "notifications@github.com" in sender:
+        score += 15  # GitHub notifications (CI failures, PR comments) HIGH
+    if OWNER_EMAIL_DOMAIN and f"@{OWNER_EMAIL_DOMAIN}" in sender:
+        score += 15  # owner self-domain mail HIGH (set via $SUTANDO_OWNER_EMAIL_DOMAIN)
     if re.search(r"@[\w-]+\.edu\b", sender):
         score += 5
     if "openreview.net" in sender:
