@@ -5,9 +5,20 @@
 // to core agent → ~5-30s round-trip). Today's phone-call failure (2026-05-14):
 // Gemini reached for openUrlTool and hallucinated the Gmail URL.
 //
-// This skill exposes `triage_email` as an inline tool that wraps the existing
-// `gws gmail +triage` CLI (from `~/.claude/skills/gws-gmail/`) and returns
-// parsed JSON the LLM can summarize in-band, sub-second.
+// 3-tier path (cache → live gws → work fallback):
+//   1) CACHE — read `state/external-cache/inbox-important.json` (importance-
+//      scored top-3, refreshed periodically by ACT loop's cache_email_triage
+//      action via skills/gws-gmail-voice/scripts/refresh-cache.py). Sub-50ms.
+//      Returns top-3 ranked by importance, not recency.
+//   2) LIVE — cache stale (>15min) or missing → call `gws gmail +triage` directly.
+//      Returns up to `max` messages by recency.
+//   3) WORK — gws call fails (timeout / OAuth / network) → description tells
+//      Gemini to call the `work` tool with "check gmail unread inbox".
+//
+// Why cache-first solves the recency-vs-importance bug: importance scoring is
+// expensive and stateful (sender frequency, blacklist domains, keyword matches);
+// pre-computing in ACT amortizes it and makes the voice path instant. Gemini
+// sees pre-ranked top-3 instead of having to rank from raw N-by-date.
 //
 // OSS-safety: if the `gws` CLI is not on PATH (user hasn't installed the
 // gws-gmail skill / configured OAuth), this module exports an empty tools
@@ -15,10 +26,15 @@
 // no error noise. Detection is at module-load time via execFileSync('which').
 
 import { execFileSync } from 'node:child_process';
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { join } from 'node:path';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
+
+const CACHE_PATH = join(process.cwd(), 'state', 'external-cache', 'inbox-important.json');
+const CACHE_MAX_AGE_MS = 15 * 60 * 1000;  // 15 minutes
 
 function gwsAvailable(): boolean {
 	try {
@@ -29,26 +45,56 @@ function gwsAvailable(): boolean {
 	}
 }
 
+function readCacheIfFresh(): { ts: string; top_3_important: unknown[]; all_unread_count: number; query?: string } | null {
+	if (!existsSync(CACHE_PATH)) return null;
+	try {
+		const age = Date.now() - statSync(CACHE_PATH).mtimeMs;
+		if (age > CACHE_MAX_AGE_MS) return null;
+		return JSON.parse(readFileSync(CACHE_PATH, 'utf8'));
+	} catch {
+		return null;
+	}
+}
+
 const triageEmailTool: ToolDefinition = {
 	name: 'triage_email',
 	description:
-		'Summarize the user\'s unread Gmail inbox. ' +
-		'Use when the caller asks: "what unread emails do I have", "summarize my inbox", "what\'s the most important email I missed", "any urgent emails". ' +
-		'Returns a list of recent unread messages with sender, subject, and date. ' +
-		'On timeout/error: tell the caller you\'re using a slower path, then call the `work` tool with "check gmail unread inbox via gws gmail +triage" — it returns the same data via a slower but more reliable channel. ' +
+		'Get the user\'s most important unread Gmail. ' +
+		'Use when the caller asks: "what unread emails do I have", "what\'s the most important email I missed", "any urgent emails", "summarize my inbox". ' +
+		'**Default behavior (mode=important):** returns top-3 importance-RANKED unread messages — these are pre-scored by the ACT loop (filtered for newsletters/digests; promoted by deadline/RSVP/CI/academic keywords; weighted by sender). DO NOT pass `max=1` — the tool already returns the most important; passing max only matters for mode="recent". ' +
+		'**mode="recent"**: returns top-N by date (no importance ranking). Use only when caller explicitly asks for "list my latest emails" or "show me everything unread". ' +
+		'On timeout/error: tell the caller you\'re using a slower path, then call the `work` tool with "check gmail unread inbox via gws gmail +triage". ' +
 		'For sending email, deletion, or replies, delegate to work; this tool is read-only triage.',
 	parameters: z.object({
-		max: z.number().int().min(1).max(20).optional().describe('Max messages to return (default 5).'),
-		query: z.string().optional().describe('Optional Gmail search query (default: is:unread).'),
+		mode: z.enum(['important', 'recent']).optional().describe('"important" (default): top-3 importance-ranked. "recent": top-N by date.'),
+		max: z.number().int().min(1).max(20).optional().describe('Only used when mode="recent". Default 5.'),
+		query: z.string().optional().describe('Optional Gmail search query (default: is:unread). Only used in live calls.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { max = 5, query } = args as { max?: number; query?: string };
-		console.log(`${ts()} [TriageEmail] called (max=${max}${query ? `, query="${query}"` : ''})`);
+		const { mode = 'important', max = 5, query } = args as { mode?: 'important' | 'recent'; max?: number; query?: string };
+		console.log(`${ts()} [TriageEmail] called (mode=${mode}, max=${max}${query ? `, query="${query}"` : ''})`);
+
+		// Tier 1: cache hit (importance mode only — recent mode always wants live)
+		if (mode === 'important' && !query) {
+			const cached = readCacheIfFresh();
+			if (cached) {
+				console.log(`${ts()} [TriageEmail] cache hit (top_3 of ${cached.all_unread_count} unread, cached at ${cached.ts})`);
+				return {
+					status: 'ok',
+					source: 'cache',
+					mode: 'important',
+					count: cached.top_3_important.length,
+					messages: cached.top_3_important,
+					all_unread_count: cached.all_unread_count,
+					cached_at: cached.ts,
+				};
+			}
+			console.log(`${ts()} [TriageEmail] cache miss/stale — falling back to live gws`);
+		}
+
+		// Tier 2: live gws call
 		try {
-			// execFileSync — no shell interpolation. `gws` is the canonical CLI
-			// from ~/.claude/skills/gws-gmail/; --format json gives a structured
-			// payload we can pass back to the LLM.
 			const cmdArgs = ['gmail', '+triage', '--format', 'json', '--max', String(max)];
 			if (query) cmdArgs.push('--query', query);
 			const stdout = execFileSync('gws', cmdArgs, {
@@ -56,22 +102,21 @@ const triageEmailTool: ToolDefinition = {
 				encoding: 'utf8',
 				stdio: ['ignore', 'pipe', 'pipe'],
 			});
-			// gws prints diagnostic header lines + JSON object. Schema:
-			//   { messages: [...], query: "...", resultSizeEstimate: N }
-			// Match `{` at start-of-line (multiline) — robust against future
-			// header lines that contain a literal `{` (e.g. `Loading {token}.json`).
-			// Falls back to first `{` if no line-start brace found. Per Mini PR #702 nit.
+			// gws emits diagnostic header lines + JSON object: { messages, query, resultSizeEstimate }.
+			// Match `{` at start-of-line (multiline) — robust against future header lines that contain
+			// a literal `{` (e.g. `Loading {token}.json`). Fall back to first `{` if not found.
 			const match = stdout.match(/^\{/m);
 			const jsonStart = match?.index ?? stdout.indexOf('{');
 			if (jsonStart === -1) return { error: 'triage_email: gws did not return JSON' };
 			const parsed = JSON.parse(stdout.slice(jsonStart));
 			const messages = Array.isArray(parsed) ? parsed : parsed.messages ?? [];
-			console.log(`${ts()} [TriageEmail] ${messages.length} messages`);
-			return { status: 'ok', count: messages.length, messages, query: parsed.query };
+			console.log(`${ts()} [TriageEmail] live ${messages.length} messages`);
+			return { status: 'ok', source: 'live', mode, count: messages.length, messages, query: parsed.query };
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
 			console.log(`${ts()} [TriageEmail] failed: ${msg}`);
-			return { error: `triage_email failed: ${msg}` };
+			// Tier 3: signaled in description — Gemini calls `work` next.
+			return { error: `triage_email failed: ${msg}. Fall back to work tool: "check gmail unread inbox".` };
 		}
 	},
 };
