@@ -18,7 +18,7 @@ The LLM judges importance with full grounding. Rules retired in PR #705 (per Chi
 
 1. **Read existing cache** at `state/external-cache/inbox-important.json`. If absent, treat `scored_emails` as `{}`.
 
-2. **Fetch current unread** via `gws gmail +triage --format json --max 30`.
+2. **Fetch current unread** via `gws gmail +triage --format json --max 200`. (The full unread queue is ~200 messages; the runbook's incremental algorithm — see step 5 — means each one gets scored ONCE then reused via `scored_at` TTL, so wider net = same steady-state cost. The prior `--max 30` was caught missing buried-important items like calendar invitations and academic follow-ups several days into the queue.)
 
 3. **Diff** against cached:
    - `new_ids = current_ids - cached_ids` (need scoring)
