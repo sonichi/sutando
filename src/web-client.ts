@@ -1162,6 +1162,7 @@ function renderTasks() {
   if (hdr) {
     const hasExpanded = expandedTasks.size > 0;
     hdr.style.display = 'flex';
+    hdr.style.gap = '12px';
     const doneToggle = doneCount > 0
       ? '<span onclick="toggleShowDone()" style="cursor:pointer">' +
         (showDone ? 'hide ' + doneCount + ' done' : 'show ' + doneCount + ' done') +
