@@ -328,7 +328,7 @@ def render_dashboard() -> str:
 <a href="http://localhost:7845" style="color:#4a8aaa;text-decoration:none">Screen Capture :7845</a>
 <a href="/notes-ui" style="color:#4a8aaa;text-decoration:none">Notes Browser</a>
 <a href="https://github.com/sonichi/sutando" style="color:#4a8aaa;text-decoration:none">GitHub</a>
-<a href="https://sutando.ag2.ai" style="color:#4a8aaa;text-decoration:none">Website</a>
+<a href="https://sutando.ai" style="color:#4a8aaa;text-decoration:none">Website</a>
 <a href="https://discord.gg/uZHWXXmrCS" style="color:#4a8aaa;text-decoration:none">Discord</a>
 </div></div>""")
 
