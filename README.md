@@ -1,6 +1,6 @@
 # Sutando
 
-[![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/uZHWXXmrCS) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Website](https://img.shields.io/badge/Web-sutando.ag2.ai-blue)](https://sutando.ag2.ai)
+[![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/uZHWXXmrCS) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Website](https://img.shields.io/badge/Web-sutando.ai-blue)](https://sutando.ai)
 
 **My AI Stand — Realtime by Day, Coding Itself by Night.**
 
@@ -9,7 +9,7 @@ Voice, vision, screen, meetings, calls when I'm engaged. Learns my patterns, shi
 It belongs entirely to you.
 
 > 🛠 **Open source:** this repo — clone, build, run locally on your own Mac.
-> 🍎 **Native app preview:** [sutando.ag2.ai](https://sutando.ag2.ai) — packaged Mac app, request access.
+> 🍎 **Native app preview:** [sutando.ai](https://sutando.ai) — packaged Mac app, request access.
 
 > **No *Claude Extra usage* required.** Sutando runs on your existing Claude Code subscription ($20, $100, or $200/month) with minimal extra costs — no separate Anthropic API key to top up — unlike agents that route every action through pay-per-token APIs and hosted services.
 
