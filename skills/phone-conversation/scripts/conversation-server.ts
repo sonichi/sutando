@@ -968,7 +968,7 @@ function cleanupCall(callSid: string): void {
 			`instructions:`,
 			`  1. Write a structured summary: ## Key Topics, ## Decisions, ## Action Items, ## Notable Quotes`,
 			`  2. Save to notes/meetings/${summaryTaskId}.md with YAML frontmatter (title, date, tags: [meeting])`,
-			`  3. Send a concise version (3-5 bullet points) to Discord DM (channel 1485370959870431433)`,
+			`  3. Send a concise version (3-5 bullet points) to Discord DM (bridge resolves owner DM channel from $SUTANDO_DM_OWNER_ID / access.json allowFrom)`,
 			`  4. Write result to results/${summaryTaskId}.txt so voice agent can speak it`,
 			`transcript:`,
 			formatted,
