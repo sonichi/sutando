@@ -2913,7 +2913,10 @@ async def poll_dm_fallback():
                     if _task_file.exists():
                         archive_file(_task_file, "tasks", _task_id)
                     if _result_text and _task_id.startswith("task-"):
-                        notify_agent_api_task_done(_task_id, _result_text)
+                        # urlopen is blocking — run in thread so we don't stall
+                        # the asyncio event loop for up to 2s per dm-fallback.
+                        # Per rudyalways PR #653 post-merge review.
+                        await asyncio.to_thread(notify_agent_api_task_done, _task_id, _result_text)
                 else:
                     stderr = (result.stderr or "").strip()[:200]
                     print(f"  [dm-fallback] dm-result.py failed on {f.name}: {stderr}", flush=True)
