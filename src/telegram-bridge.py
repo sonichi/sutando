@@ -8,12 +8,30 @@ Usage: python3 src/telegram-bridge.py
 
 import json
 import os
+import sys
 import time
 import urllib.request
 import urllib.error
 from pathlib import Path
 
+# Vision-frame helper — pushes the latest photo into the active voice session
+# so Gemini can react in-stream. No-op when voice isn't connected. Import is
+# best-effort so the bridge keeps booting if vision_push.py is missing.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from vision_push import push_image as _push_vision_image  # type: ignore
+except Exception:  # pragma: no cover — bridge must keep running
+    def _push_vision_image(path: str, source: str = "telegram") -> bool:  # type: ignore
+        return False
+
 REPO = Path(__file__).resolve().parent.parent
+# REPO resolution: prefer SUTANDO_WORKSPACE env var so the bridge writes to the
+# user's workspace tasks/results/state dirs, not the app-bundle's copy. Same
+# rationale as discord-bridge.py (PR #708) — when src/ is a symlink into a
+# packaged Sutando.app bundle, Path(__file__).resolve().parent.parent returns
+# the bundle root rather than the workspace.
+_workspace_env = os.environ.get("SUTANDO_WORKSPACE", "").strip()
+REPO = Path(_workspace_env).expanduser() if _workspace_env else Path(__file__).resolve().parent.parent
 TASKS_DIR = REPO / "tasks"
 RESULTS_DIR = REPO / "results"
 
@@ -311,6 +329,13 @@ def main():
                     local_path = download_file(file_id, "photo")
                     if local_path:
                         attachment_note = f"\n[Photo attached: {local_path}]"
+                        # If voice is connected, also push the photo as a
+                        # vision frame so Gemini sees it in-stream (in
+                        # addition to the file-attached task pipeline).
+                        try:
+                            _push_vision_image(local_path, source="telegram")
+                        except Exception:
+                            pass
                 if "document" in msg:
                     file_id = msg["document"]["file_id"]
                     fname = msg["document"].get("file_name", "file")

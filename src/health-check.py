@@ -58,7 +58,7 @@ def check_launchd(label: str) -> dict:
     """Check if a launchd job is loaded and running."""
     try:
         result = subprocess.run(
-            ["launchctl", "list"],
+            ["/bin/launchctl", "list"],
             capture_output=True, text=True, timeout=5,
         )
         for line in result.stdout.split("\n"):
@@ -130,17 +130,17 @@ def fix_launchd(label: str) -> str:
     if not plist or not plist.exists():
         return f"no plist found for {label}"
 
-    uid = subprocess.run(["id", "-u"], capture_output=True, text=True).stdout.strip()
+    uid = subprocess.run(["/usr/bin/id", "-u"], capture_output=True, text=True).stdout.strip()
     # Try kickstart
     result = subprocess.run(
-        ["launchctl", "kickstart", "-k", f"gui/{uid}/{label}"],
+        ["/bin/launchctl", "kickstart", "-k", f"gui/{uid}/{label}"],
         capture_output=True, text=True, timeout=10,
     )
     if result.returncode == 0:
         return f"restarted {label}"
     # Try bootstrap
     result = subprocess.run(
-        ["launchctl", "bootstrap", f"gui/{uid}", str(plist)],
+        ["/bin/launchctl", "bootstrap", f"gui/{uid}", str(plist)],
         capture_output=True, text=True, timeout=10,
     )
     if result.returncode == 0:
@@ -187,14 +187,14 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
             pass
     try:
         pids = subprocess.run(
-            ["pgrep", "-f", pgrep_pattern],
+            ["/usr/bin/pgrep", "-f", pgrep_pattern],
             capture_output=True, text=True, timeout=5
         ).stdout.strip().split("\n")
         pids = [p for p in pids if p]
         if not pids:
             return
         ps_out = subprocess.run(
-            ["ps", "-o", "lstart=", "-p", ",".join(pids)],
+            ["/bin/ps", "-o", "lstart=", "-p", ",".join(pids)],
             capture_output=True, text=True, timeout=5
         ).stdout.strip().split("\n")
         from datetime import datetime as _dt
@@ -238,7 +238,7 @@ def _file_unchanged_since(src_file: Path, proc_start: float) -> bool:
     """
     try:
         log = subprocess.run(
-            ["git", "log", "-1", "--format=%ct", "HEAD", "--", str(src_file)],
+            ["/usr/bin/git", "log", "-1", "--format=%ct", "HEAD", "--", str(src_file)],
             cwd=REPO_DIR, capture_output=True, text=True, timeout=5
         )
         if log.returncode != 0 or not log.stdout.strip():
@@ -249,7 +249,7 @@ def _file_unchanged_since(src_file: Path, proc_start: float) -> bool:
             return False
         # No commits since proc_start; check for uncommitted edits
         diff = subprocess.run(
-            ["git", "diff", "--quiet", "HEAD", "--", str(src_file)],
+            ["/usr/bin/git", "diff", "--quiet", "HEAD", "--", str(src_file)],
             cwd=REPO_DIR, capture_output=True, timeout=5
         )
         return diff.returncode == 0  # 0 = no diff
@@ -719,7 +719,7 @@ def run_all_checks() -> list[dict]:
             # invocations, ps/grep pipelines, etc). Otherwise pgrep -f bare
             # name produces false-positive "multiple processes" warnings
             # that scared us into thinking the bridges were zombied today.
-            result = subprocess.run(["pgrep", "-f", f"{proc_name}\\.py$"], capture_output=True, text=True)
+            result = subprocess.run(["/usr/bin/pgrep", "-f", f"{proc_name}\\.py$"], capture_output=True, text=True)
             pids = result.stdout.strip().split("\n") if result.returncode == 0 else []
             pids = [p for p in pids if p]
         except:
@@ -772,7 +772,7 @@ def run_all_checks() -> list[dict]:
                 src_mtime = src_file.stat().st_mtime
                 # Use ps to get process start time as Unix epoch
                 ps_out = subprocess.run(
-                    ["ps", "-o", "lstart=", "-p", pids[0]],
+                    ["/bin/ps", "-o", "lstart=", "-p", pids[0]],
                     capture_output=True, text=True, timeout=5
                 ).stdout.strip()
                 if ps_out:
@@ -803,7 +803,7 @@ def run_all_checks() -> list[dict]:
         # state/<name>.heartbeat.
         try:
             lsof_out = subprocess.run(
-                ["lsof", "-p", pids[0]], capture_output=True, text=True, timeout=5
+                ["/usr/sbin/lsof", "-p", pids[0]], capture_output=True, text=True, timeout=5
             ).stdout
             for line in lsof_out.splitlines():
                 parts = line.split()
@@ -832,7 +832,7 @@ def run_all_checks() -> list[dict]:
     sutando_bin = REPO_DIR / "src" / "Sutando" / "Sutando"
     if sutando_bin.exists():
         try:
-            result = subprocess.run(["pgrep", "-f", "Sutando/Sutando"], capture_output=True, text=True)
+            result = subprocess.run(["/usr/bin/pgrep", "-f", "Sutando/Sutando"], capture_output=True, text=True)
             pids = [p for p in result.stdout.strip().split("\n") if p]
         except:
             pids = []
@@ -1102,11 +1102,11 @@ def main():
                             # bridge process. PR #243 fixed the detect
                             # side; this keeps the kill side consistent.
                             old_pids = subprocess.run(
-                                ["pgrep", "-f", f"{c['name']}\\.py$"], capture_output=True, text=True
+                                ["/usr/bin/pgrep", "-f", f"{c['name']}\\.py$"], capture_output=True, text=True
                             ).stdout.strip().split("\n")
                             for pid in old_pids:
                                 if pid:
-                                    subprocess.run(["kill", pid], check=False)
+                                    subprocess.run(["/bin/kill", pid], check=False)
                             import time as _t; _t.sleep(1)
                         except Exception:
                             pass
@@ -1160,12 +1160,12 @@ def main():
                     if c["status"] == "stale":
                         try:
                             old_pids = subprocess.run(
-                                ["pgrep", "-f", "conversation-server.ts"],
+                                ["/usr/bin/pgrep", "-f", "conversation-server.ts"],
                                 capture_output=True, text=True
                             ).stdout.strip().split("\n")
                             for pid in old_pids:
                                 if pid:
-                                    subprocess.run(["kill", pid], check=False)
+                                    subprocess.run(["/bin/kill", pid], check=False)
                             import time as _t; _t.sleep(1)
                         except Exception:
                             pass

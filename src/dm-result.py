@@ -32,7 +32,13 @@ import sys
 import urllib.request
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
+# REPO resolution: prefer SUTANDO_WORKSPACE env var so the script reads from the
+# user's workspace results/ dir, not the app-bundle's copy. Same rationale as
+# discord-bridge.py (PR #708) — when src/ is a symlink into a packaged
+# Sutando.app bundle, Path(__file__).resolve().parent.parent returns the bundle
+# root rather than the workspace.
+_workspace_env = os.environ.get("SUTANDO_WORKSPACE", "").strip()
+REPO = Path(_workspace_env).expanduser() if _workspace_env else Path(__file__).resolve().parent.parent
 ACCESS_JSON = Path.home() / ".claude" / "channels" / "discord" / "access.json"
 SSE_STATUS_URL = "http://localhost:8080/sse-status"
 
