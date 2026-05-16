@@ -52,8 +52,6 @@ This applies to all work — proactive loop passes, voice tasks, user requests, 
 
 When you accept a non-trivial commitment from the user via **chat** (direct text input, not through voice/Discord/Telegram bridges), write a task file so the dashboard can track it.
 
-Note: this is the **shell path** for the core agent (Claude Code). The `/chat` web UI would use the `create_chat_task` inline tool instead (see `src/inline-tools.ts`), but that tool is currently a future hook — no caller in the architecture yet (`/chat` connects to agent-api, not voice-agent). Both produce the same `task-chat-*` file format.
-
 **When to write a task file from chat:**
 - The user asks you to do something concrete (close a PR, send an email, research a topic, fix a bug)
 - NOT for: quick questions, greetings, simple lookups, clarifications

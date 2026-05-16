@@ -726,13 +726,19 @@ return frontApp`;
 	},
 };
 
+// --- Chat task creation (future hook) ------------------------------------------
+// Definition kept here for when /chat gets a tool-calling surface (SSE wiring +
+// UI handler). Currently NOT registered in inlineTools / ownerOnlyTools because
+// no caller in the architecture can reach it — /chat connects to agent-api, not
+// voice-agent. The active chat-path tracking is the shell snippet in CLAUDE.md.
+// See round-5 discussion on PR #695 for the architectural analysis.
 export const createChatTaskTool: ToolDefinition = {
 	name: 'create_chat_task',
 	description:
 		'Create a tracked task entry for the /chat web UI route. ' +
 		'Future hook: no current caller in the chat path (/chat connects to agent-api, not voice-agent). ' +
 		'The core agent (Claude Code) uses the CLAUDE.md shell-snippet path instead. ' +
-		'Voice tasks have their own tracking (source: voice).',
+		'Voice tasks have their own tracking (source: voice).',,
 	parameters: z.object({
 		task: z.string().describe('Description of the task being tracked'),
 	}),
@@ -1065,7 +1071,7 @@ export const ownerOnlyTools = [
 	clipboardTool, cancelTaskTool, toggleTasksTool, summonTool, dismissTool,
 	joinZoomTool, joinGmeetTool, callContactTool, slideControlTool, fullscreenTool,
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
-	recentContextTool, createChatTaskTool,
+	recentContextTool,
 	describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool,
 	sendVisionFrameTool, startVisionTool, stopVisionTool,
 	...personalTools.owner,
