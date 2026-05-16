@@ -240,6 +240,19 @@ const HTML = /* html */ `<!DOCTYPE html>
   .btn-mute { background: #2a2a3e; color: #888; }
   .btn-mute:hover { background: #3a3a4e; color: #fff; }
   .btn-mute.muted { background: #4a1a1a; color: #e94560; }
+  /* Watch (vision streaming) — matches the avatar 'seeing' palette (#fbbf24). */
+  .btn-watch { background: #2a2a3e; color: #888; }
+  .btn-watch:hover { background: #3a3a4e; color: #fff; }
+  .btn-watch.watching {
+    background: #3a2e10; color: #fbbf24; border: 1px solid #7a5a14;
+    box-shadow: 0 0 10px rgba(251, 191, 36, 0.35);
+    animation: btn-watch-pulse 1.6s ease-in-out infinite;
+  }
+  .btn-watch.watching:hover { background: #4a3a14; color: #ffd966; }
+  @keyframes btn-watch-pulse {
+    0%, 100% { box-shadow: 0 0 8px rgba(251, 191, 36, 0.3); }
+    50%      { box-shadow: 0 0 16px rgba(251, 191, 36, 0.55); }
+  }
   .btn-subtle { background: transparent; color: #444; font-size: 11px; padding: 5px 8px; }
   .btn-subtle:hover { color: #888; }
 
@@ -605,7 +618,18 @@ const HTML = /* html */ `<!DOCTYPE html>
   <div class="controls">
     <button id="btn" class="btn-voice" onclick="toggle()" style="display:none">End Voice</button>
     <button id="btn-mute" class="btn-mute" onclick="toggleMute()" style="display:none">Mute</button>
+    <button id="btn-watch" class="btn-watch" onclick="toggleWatch()" title="Let Sutando watch your screen" style="display:none">👁️ Watch</button>
   </div>
+</div>
+<!-- Vision preview — shows what Sutando is seeing. Mirrors the MediaStream
+     captured by getDisplayMedia so the user can verify the picked surface
+     and see the same view the model gets. -->
+<div id="vision-preview-wrap" style="display:none; position: fixed; bottom: 16px; right: 16px; z-index: 200; background: rgba(0,0,0,0.6); border: 2px solid #fbbf24; border-radius: 10px; padding: 6px 6px 4px; box-shadow: 0 4px 18px rgba(0,0,0,0.35), 0 0 14px rgba(251,191,36,0.45); max-width: 280px;">
+  <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:4px; font: 11px/1.2 -apple-system, system-ui, sans-serif; color:#fbbf24;">
+    <span style="display:inline-flex; align-items:center; gap:6px;">👁️ Sutando is seeing</span>
+    <span id="vision-preview-stats" style="color:#bbb; font-size:10px;"></span>
+  </div>
+  <video id="vision-preview" autoplay muted playsinline style="display:block; width: 100%; max-height: 180px; background:#000; border-radius:6px;"></video>
 </div>
 <input type="text" id="wsUrl" value="${DEFAULT_WS_URL}" />
 <script>
@@ -1860,11 +1884,288 @@ function doCleanup() {
   $('hero').style.display = '';
   $('btn').style.display = 'none';
   $('btn-mute').style.display = 'none';
+  $('btn-watch').style.display = 'none';
+  teardownPushSession();
+  stopVisionPoll();
   $('voice-status').className = 'status-pill voice-off';
   try { sessionStorage.removeItem('sutando-voice'); } catch {}
   if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
   updateStats();
 }
+
+// ─── Vision toggle (let Sutando see your screen) ──────────
+// The browser owns capture (so the user gets the native Chrome Tab / Window /
+// Entire Screen picker), and we POST each frame to /vision/frame. The same
+// MediaStream renders into the on-screen preview so the user sees exactly
+// what Sutando sees. Voice tools (start_vision/stop_vision) still flip the
+// button via the 2s poll for the server-side screencapture path.
+var VISION_FRAME_INTERVAL_MS = 1500; // 1280x720 JPEG q=0.6 → ~80–150KB/frame; ~0.7 fps
+var VISION_FRAME_WIDTH = 1280;
+var VISION_FRAME_HEIGHT = 720;
+var VISION_FRAME_QUALITY = 0.6;
+var _visionStreaming = false;        // last-known server state (push or pull)
+var _visionPushActive = false;       // this browser is the push-mode driver
+var _visionPollTimer = null;
+var _visionStream = null;            // MediaStream from getDisplayMedia
+var _visionFrameTimer = null;
+var _visionFrameCount = 0;
+var _visionCanvas = null;            // hidden canvas reused for toBlob
+// Auto-recover state: when voice-agent restarts, the browser still holds
+// a live MediaStream but the server has pushMode=false. We re-issue
+// /vision/start (without re-prompting for getDisplayMedia) to recover.
+// Capped to prevent thrashing if recovery genuinely fails.
+var _visionRearmInFlight = false;
+var _visionRearmCount = 0;
+var _VISION_REARM_LIMIT = 3;
+
+function applyVisionState(state) {
+  if (!state) return;
+  var streaming = !!state.streaming;
+  _visionStreaming = streaming;
+  var btn = document.getElementById('btn-watch');
+  if (!btn) return;
+  btn.className = streaming ? 'btn-watch watching' : 'btn-watch';
+  if (streaming) {
+    var src = state.source || 'screen';
+    var label = src === 'browser' ? 'screen' : src;
+    btn.textContent = '👁️ Watching (' + label + ')';
+    btn.title = 'Sutando is watching your ' + label + ' — click to stop';
+  } else {
+    btn.textContent = '👁️ Watch';
+    btn.title = 'Let Sutando watch your screen';
+  }
+  // Auto-recover: the server has fallen out of push mode (voice-agent
+  // restart, race, etc.) but we still hold a live MediaStream. Re-arm
+  // push mode without re-prompting for getDisplayMedia. If the stream
+  // is gone, just tear down our side.
+  var ourSideStale = _visionPushActive && (!streaming || state.source !== 'browser');
+  if (ourSideStale) {
+    if (_visionStream && _visionStream.active) {
+      rearmPushMode();
+    } else {
+      teardownPushSession();
+    }
+  } else if (streaming && state.source === 'browser') {
+    // Healthy push session — clear any prior recovery attempts.
+    _visionRearmCount = 0;
+  }
+}
+
+// Re-issue /vision/start so the server re-enters push mode, without
+// re-prompting the user for getDisplayMedia. The browser's MediaStream
+// is still live; only the server-side flag was lost. Capped at
+// _VISION_REARM_LIMIT consecutive attempts to prevent thrashing if
+// recovery genuinely fails (e.g., voice session is gone).
+function rearmPushMode() {
+  if (_visionRearmInFlight || _visionRearmCount >= _VISION_REARM_LIMIT) return;
+  if (!_visionStream || !_visionStream.active) return;
+  _visionRearmInFlight = true;
+  _visionRearmCount++;
+  fetch('/vision/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ source: 'browser' }),
+  }).then(function(r) {
+    return r.json().catch(function() { return {}; });
+  }).then(function(d) {
+    if (d && d.status === 'streaming') {
+      _visionRearmCount = 0;
+      addSystem('Vision: push mode re-armed (server restart detected).');
+    } else if (_visionRearmCount >= _VISION_REARM_LIMIT) {
+      addSystem('Vision: re-arm failed — click Watch to share again.');
+      teardownPushSession();
+    }
+  }).catch(function() {
+    if (_visionRearmCount >= _VISION_REARM_LIMIT) {
+      teardownPushSession();
+    }
+  }).finally(function() {
+    _visionRearmInFlight = false;
+  });
+}
+function pollVisionState() {
+  fetch('/vision/state').then(function(r) {
+    if (!r.ok) return null;
+    return r.json();
+  }).then(function(s) { if (s) applyVisionState(s); }).catch(function() {});
+}
+function startVisionPoll() {
+  pollVisionState();
+  if (_visionPollTimer) clearInterval(_visionPollTimer);
+  _visionPollTimer = setInterval(pollVisionState, 2000);
+}
+function stopVisionPoll() {
+  if (_visionPollTimer) { clearInterval(_visionPollTimer); _visionPollTimer = null; }
+  _visionStreaming = false;
+}
+
+function updateVisionPreviewStats() {
+  var stats = document.getElementById('vision-preview-stats');
+  if (stats) stats.textContent = _visionFrameCount + ' frame' + (_visionFrameCount === 1 ? '' : 's');
+}
+
+function captureAndSendFrame() {
+  var preview = document.getElementById('vision-preview');
+  if (!preview || !_visionStream) return;
+  // Wait for the video to actually have pixels — readyState >= HAVE_CURRENT_DATA (2)
+  if (preview.readyState < 2 || !preview.videoWidth || !preview.videoHeight) return;
+  if (!_visionCanvas) _visionCanvas = document.createElement('canvas');
+  _visionCanvas.width = VISION_FRAME_WIDTH;
+  _visionCanvas.height = VISION_FRAME_HEIGHT;
+  var ctx = _visionCanvas.getContext('2d');
+  ctx.drawImage(preview, 0, 0, VISION_FRAME_WIDTH, VISION_FRAME_HEIGHT);
+  _visionCanvas.toBlob(function(blob) {
+    if (!blob) return;
+    // Skip blank frames — getDisplayMedia sometimes paints a black frame
+    // for the first tick when the user switches surfaces; uploading a
+    // black JPEG just wastes context.
+    if (blob.size < 2048) return;
+    fetch('/vision/frame', {
+      method: 'POST',
+      headers: { 'Content-Type': 'image/jpeg' },
+      body: blob,
+    }).then(function(r) {
+      if (r.ok) {
+        _visionFrameCount++;
+        // Successful POST → server is in push mode again. Reset the
+        // recovery counter so future restarts get a fresh budget.
+        _visionRearmCount = 0;
+        updateVisionPreviewStats();
+      } else {
+        // 409 means the server's pushMode flag is false (voice-agent
+        // restart) — try to re-arm without waiting for the 2s state poll.
+        if (r.status === 409 && _visionPushActive) {
+          rearmPushMode();
+        }
+        // Surface the first rejection so the user sees why Sutando doesn't
+        // see frames (e.g. push mode not active because voice isn't ready).
+        if (_visionFrameCount === 0) {
+          r.text().then(function(t) { addSystem('Vision frame rejected (' + r.status + '): ' + t); }).catch(function() {});
+        }
+      }
+    }).catch(function() { /* network blip — next tick will retry */ });
+  }, 'image/jpeg', VISION_FRAME_QUALITY);
+}
+
+function teardownPushSession() {
+  _visionPushActive = false;
+  if (_visionFrameTimer) { clearInterval(_visionFrameTimer); _visionFrameTimer = null; }
+  if (_visionStream) {
+    try { _visionStream.getTracks().forEach(function(t) { t.stop(); }); } catch (e) {}
+    _visionStream = null;
+  }
+  var preview = document.getElementById('vision-preview');
+  if (preview) preview.srcObject = null;
+  var wrap = document.getElementById('vision-preview-wrap');
+  if (wrap) wrap.style.display = 'none';
+  _visionFrameCount = 0;
+  _visionRearmCount = 0;
+}
+
+async function startWatch() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+    addSystem('Vision: this browser does not support screen sharing.');
+    return;
+  }
+  var stream;
+  try {
+    // User picks Chrome Tab / Window / Entire Screen here.
+    stream = await navigator.mediaDevices.getDisplayMedia({
+      video: { width: VISION_FRAME_WIDTH, height: VISION_FRAME_HEIGHT, frameRate: 2 },
+      audio: false,
+    });
+  } catch (err) {
+    // NotAllowedError when the user cancels the picker — silent.
+    if (err && err.name !== 'NotAllowedError') {
+      addSystem('Vision: ' + (err.message || 'screen share failed'));
+    }
+    return;
+  }
+  _visionStream = stream;
+  var preview = document.getElementById('vision-preview');
+  var wrap = document.getElementById('vision-preview-wrap');
+  if (preview) preview.srcObject = stream;
+  if (wrap) wrap.style.display = '';
+
+  // User can end sharing from the browser's native UI ("Stop sharing"
+  // toolbar) — clean up our side and tell the server.
+  var track = stream.getVideoTracks()[0];
+  if (track) track.addEventListener('ended', function() {
+    console.log('[Vision] track.ended fired — user stopped share via Chrome native UI (or track died)');
+    stopWatch();
+  });
+
+  // Tell the server we're entering push mode.
+  var startResp;
+  try {
+    var r = await fetch('/vision/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: 'browser' }),
+    });
+    startResp = await r.json().catch(function() { return { status: 'failed', error: 'bad json' }; });
+  } catch (e) {
+    startResp = { status: 'failed', error: 'voice-agent not reachable' };
+  }
+  if (startResp.status === 'failed') {
+    addSystem('Vision: ' + (startResp.error || 'failed to start'));
+    teardownPushSession();
+    pollVisionState();
+    return;
+  }
+  _visionPushActive = true;
+  _visionFrameCount = 0;
+  updateVisionPreviewStats();
+
+  // Wait for the first painted frame, then start the ticker. Without this
+  // the first capture often paints a black canvas because the video
+  // element hasn't rendered any data yet.
+  var startTicker = function() {
+    if (_visionFrameTimer) clearInterval(_visionFrameTimer);
+    setTimeout(captureAndSendFrame, 250);
+    _visionFrameTimer = setInterval(captureAndSendFrame, VISION_FRAME_INTERVAL_MS);
+  };
+  if (preview && preview.readyState >= 2 && preview.videoWidth) {
+    startTicker();
+  } else if (preview) {
+    preview.addEventListener('playing', startTicker, { once: true });
+  }
+  pollVisionState();
+}
+
+async function stopWatch() {
+  console.log('[Vision] stopWatch called — tearing down push session and POSTing /vision/stop');
+  console.trace('[Vision] stopWatch caller');
+  teardownPushSession();
+  try {
+    await fetch('/vision/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  } catch (e) {}
+  pollVisionState();
+}
+
+function toggleWatch() {
+  // Debug: log entry state so we can see why a click went to stop vs start.
+  // Common gotcha: a stale _visionPushActive=true from a prior dead
+  // session sends the click to stopWatch silently, and the user is stuck.
+  var streamAlive = !!(_visionStream && _visionStream.active);
+  console.log('[Vision] toggleWatch:',
+    'pushActive=' + _visionPushActive,
+    'streaming=' + _visionStreaming,
+    'streamAlive=' + streamAlive);
+  // Defensive: if we *think* we're pushing but the MediaStream is gone
+  // or its tracks have ended, drop the stale flag so the click resolves
+  // to startWatch instead of a no-op stopWatch.
+  if (_visionPushActive && !streamAlive) {
+    console.log('[Vision] toggleWatch: clearing stale _visionPushActive — stream is dead');
+    teardownPushSession();
+  }
+  if (_visionPushActive || _visionStreaming) {
+    stopWatch();
+  } else {
+    startWatch();
+  }
+}
+window.toggleWatch = toggleWatch;
 
 // ─── Mute toggle ──────────────────────────────────────────
 function toggleMute() {
@@ -1953,6 +2254,10 @@ function toggle() {
     $('btn-mute').style.display = '';
     $('btn-mute').textContent = 'Mute';
     $('btn-mute').className = 'btn-mute';
+    $('btn-watch').style.display = '';
+    $('btn-watch').textContent = '👁️ Watch';
+    $('btn-watch').className = 'btn-watch';
+    startVisionPoll();
     $('voice-status').className = 'status-pill voice-on';
     $('status').textContent = 'Voice active';
     try { sessionStorage.setItem('sutando-voice', '1'); } catch {}
@@ -3302,6 +3607,46 @@ const server = createServer((req, res) => {
 		}
 		res.writeHead(200, { 'Content-Type': 'application/json' });
 		res.end(JSON.stringify({ ok: true, event, clients: sseClients.length }));
+		return;
+	}
+
+	// Vision control proxy. The voice-agent process exposes /vision/{state,
+	// start, stop, frame} on 127.0.0.1:VISION_CONTROL_PORT (default 7847); the
+	// browser hits us same-origin to avoid CORS and to keep one public surface.
+	// /vision/frame carries a binary JPEG body — preserve content-type and
+	// pass the buffer through. If voice-agent isn't up, the fetch fails and
+	// we surface a synthetic "session not ready" state so the Watch button
+	// can't get stuck mid-toggle.
+	if (
+		url.pathname === '/vision/state' ||
+		url.pathname === '/vision/start' ||
+		url.pathname === '/vision/stop' ||
+		url.pathname === '/vision/frame'
+	) {
+		const port = Number(process.env.VISION_CONTROL_PORT) || 7847;
+		const method = req.method === 'POST' ? 'POST' : 'GET';
+		const isFrame = url.pathname === '/vision/frame';
+		const chunks: Buffer[] = [];
+		req.on('data', (c: Buffer) => chunks.push(c));
+		req.on('end', async () => {
+			try {
+				const incomingType = (req.headers['content-type'] as string | undefined) || (isFrame ? 'image/jpeg' : 'application/json');
+				const r = await fetch(`http://127.0.0.1:${port}${url.pathname}`, {
+					method,
+					headers: method === 'POST' ? { 'Content-Type': incomingType } : undefined,
+					body: method === 'POST' ? (chunks.length ? Buffer.concat(chunks) : (isFrame ? Buffer.alloc(0) : '{}')) : undefined,
+				});
+				const text = await r.text();
+				res.writeHead(r.status, { 'Content-Type': 'application/json' });
+				res.end(text);
+			} catch (err) {
+				const fallback = url.pathname === '/vision/state'
+					? { streaming: false, source: null, fps: 0, frames: 0, durationMs: 0, sessionReady: false }
+					: { status: 'failed', error: 'voice-agent not reachable' };
+				res.writeHead(url.pathname === '/vision/state' ? 200 : 503, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify(fallback));
+			}
+		});
 		return;
 	}
 

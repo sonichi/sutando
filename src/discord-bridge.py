@@ -31,6 +31,15 @@ REPO = Path(_workspace_env).expanduser() if _workspace_env else Path(__file__).r
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from util_paths import shared_personal_path  # noqa: E402
 
+# Vision-frame helper — pushes image attachments into the active voice session
+# so Gemini reacts in-stream. Best-effort: import failure or unreachable
+# voice-agent leaves the regular task pipeline unchanged.
+try:
+    from vision_push import push_image as _push_vision_image  # noqa: E402
+except Exception:  # pragma: no cover
+    def _push_vision_image(path: str, source: str = "discord") -> bool:  # type: ignore
+        return False
+
 # Load token from channels config
 TOKEN = ""
 channels_env = Path.home() / ".claude" / "channels" / "discord" / ".env"
@@ -2231,6 +2240,17 @@ async def _handle_discord_message(message, force=False):
         try:
             await att.save(local_path)
             attachment_note += f"\n[File attached: {local_path}]"
+            # If voice is connected and the attachment is an image, also push
+            # it as a vision frame so Gemini sees it in-stream (in addition
+            # to the file-attached task pipeline).
+            try:
+                ct = (getattr(att, "content_type", "") or "").lower()
+                if ct.startswith("image/") or str(local_path).lower().endswith(
+                    (".jpg", ".jpeg", ".png", ".webp", ".gif")
+                ):
+                    _push_vision_image(str(local_path), source="discord")
+            except Exception:
+                pass
         except Exception as e:
             print(f"  Download failed: {e}")
 
