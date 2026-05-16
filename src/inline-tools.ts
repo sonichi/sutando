@@ -738,7 +738,7 @@ export const createChatTaskTool: ToolDefinition = {
 		'Create a tracked task entry for the /chat web UI route. ' +
 		'Future hook: no current caller in the chat path (/chat connects to agent-api, not voice-agent). ' +
 		'The core agent (Claude Code) uses the CLAUDE.md shell-snippet path instead. ' +
-		'Voice tasks have their own tracking (source: voice).',,
+		'Voice tasks have their own tracking (source: voice).',
 	parameters: z.object({
 		task: z.string().describe('Description of the task being tracked'),
 	}),
