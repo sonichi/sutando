@@ -258,6 +258,21 @@ else
 fi
 
 say ""
+
+# Rebuild MEMORY.md from per-file YAML frontmatter. We exclude MEMORY.md from
+# the rsync pass (mtime-wins truncates the index — see comment near MEM rsync
+# above and issue #712), so each node regenerates its own index after every
+# sync. Falls back to a friendly skip if the memory dir doesn't exist.
+if [ "$DRY_RUN" != "1" ]; then
+    if command -v python3 >/dev/null 2>&1; then
+        say "Regenerating MEMORY.md from frontmatter..."
+        python3 "$REPO_ROOT/skills/cross-node-sync/scripts/regenerate-memory-index.py" \
+            2>&1 | sed 's/^/  /' || say "  (regen failed; MEMORY.md may be stale until next pass)"
+    else
+        say "python3 not on PATH — skipping MEMORY.md regen"
+    fi
+fi
+
 if [ "$DRY_RUN" = "1" ]; then
     say "━━━ DRY-RUN complete ━━━"
 else
