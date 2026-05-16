@@ -142,7 +142,7 @@ def get_system_stats() -> dict:
     st = os.statvfs("/")
     free_gb = (st.f_bavail * st.f_frsize) / (1024 ** 3)
 
-    result = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True, timeout=5)
+    result = subprocess.run(["/usr/bin/pmset", "-g", "batt"], capture_output=True, text=True, timeout=5)
     battery_m = re.search(r'(\d+)%', result.stdout)
     battery = f"{battery_m.group(1)}%" if battery_m else "?"
     charging = "charging" in result.stdout.lower() or "ac power" in result.stdout.lower()

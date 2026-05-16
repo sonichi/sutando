@@ -411,7 +411,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             activity = []
             try:
                 git_log = subprocess.run(
-                    ["git", "-C", str(REPO_DIR), "log", "--oneline", "--since=24 hours ago", "-10"],
+                    ["/usr/bin/git", "-C", str(REPO_DIR), "log", "--oneline", "--since=24 hours ago", "-10"],
                     capture_output=True, text=True, timeout=5
                 ).stdout.strip()
                 for line in git_log.split("\n"):
