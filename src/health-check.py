@@ -271,6 +271,29 @@ REQUIRED_VOICE_WATCHERS = [
 ]
 
 
+def _voice_log_path() -> Path:
+    """Resolve where voice-agent's stdout/stderr lands.
+
+    Two paths exist for legitimate reasons:
+    - launchd plist (~/Library/LaunchAgents/com.sutando.voice-agent.plist)
+      pipes StandardOut/ErrorPath to `~/Library/Application Support/Sutando/
+      logs/voice-agent.log`. This is the normal path under Sutando.app —
+      the file goes to macOS standard Application Support, not the repo.
+    - `src/startup.sh:153` writes to `<workspace>/logs/voice-agent.log`
+      when the user starts voice-agent manually (dev mode).
+
+    Prefer the launchd path when it has content. Falls back to the
+    workspace path so manually-launched voice-agents still resolve.
+    Without this resolver, `voice-watchers` and `voice-transport` would
+    permanently warn "voice-agent.log not found" on Sutando.app installs.
+    """
+    launchd_log = Path.home() / "Library/Application Support/Sutando/logs/voice-agent.log"
+    workspace_log = REPO_DIR / "logs" / "voice-agent.log"
+    if launchd_log.exists() and launchd_log.stat().st_size > 0:
+        return launchd_log
+    return workspace_log
+
+
 def check_voice_watchers(voice_check: dict) -> dict:
     """Verify all 3 task-bridge watchers are registered in the current
     voice-agent process. Parses logs/voice-agent.log for the most recent
@@ -285,7 +308,7 @@ def check_voice_watchers(voice_check: dict) -> dict:
         check["status"] = "warn"
         check["detail"] = f"voice-agent {vs}" if vs else "voice-agent status unknown"
         return check
-    log_file = REPO_DIR / "logs" / "voice-agent.log"
+    log_file = _voice_log_path()
     if not log_file.exists():
         check["status"] = "warn"
         check["detail"] = "voice-agent.log not found"
@@ -362,7 +385,7 @@ def check_voice_transport(voice_check: dict) -> dict:
         check["status"] = "warn"
         check["detail"] = f"voice-agent {vs}" if vs else "voice-agent status unknown"
         return check
-    log_file = REPO_DIR / "logs" / "voice-agent.log"
+    log_file = _voice_log_path()
     if not log_file.exists():
         check["status"] = "warn"
         check["detail"] = "voice-agent.log not found"
