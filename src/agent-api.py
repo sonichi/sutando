@@ -490,8 +490,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(media_path.read_bytes())
         elif path == "/logs/voice":
-            # Return last 30 lines of voice-agent.log for debugging
-            log_file = REPO_DIR / "src" / "voice-agent.log"
+            # Return last 30 lines of voice-agent.log for debugging.
+            # Canonical path is logs/voice-agent.log (see startup.sh:153,
+            # health-check.py:288, check-pending-questions.py:24). The
+            # original src/ path here predated that migration and silently
+            # 404'd every /logs/voice request from web-client.ts:2183's
+            # "Copy logs" button.
+            log_file = REPO_DIR / "logs" / "voice-agent.log"
             if log_file.exists():
                 lines = log_file.read_text().splitlines()[-30:]
                 self.send_json(200, {"lines": lines})
