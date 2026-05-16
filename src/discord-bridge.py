@@ -2699,6 +2699,65 @@ async def poll_results():
                     if reply_match:
                         reply_text = reply_pattern.sub('', reply_text).strip()
 
+                    # Extract optional [channel: <channel_id>] redirect — the
+                    # agent can route a DM-originated reply to a different
+                    # channel (e.g. respond from a DM task by posting in
+                    # #general). Without this, the bridge always replies to
+                    # the task-source channel. Falls back to the original
+                    # channel on resolution failure (don't drop the reply).
+                    #
+                    # Authorization: owner tier only. The bridge already gates
+                    # inbound tasks by tier (lines ~2326+) and the access_tier
+                    # field is written into every task file (line ~2534). A
+                    # sandboxed team/other-tier result that names a channel
+                    # the requester can't reach must NOT be honored — that
+                    # would let a non-owner redirect into the owner's private
+                    # spaces. We read the tier back from the task file rather
+                    # than threading it through pending_replies so the gate
+                    # survives a bridge restart.
+                    channel_pattern = re.compile(r'\[channel:\s*(\d{17,20})\]')
+                    channel_match = channel_pattern.search(reply_text)
+                    if channel_match:
+                        target_channel_id = int(channel_match.group(1))
+                        reply_text = channel_pattern.sub('', reply_text).strip()
+                        task_tier = "other"
+                        try:
+                            task_body = (TASKS_DIR / f"{task_id}.txt").read_text()
+                            for ln in task_body.splitlines():
+                                if ln.startswith("access_tier:"):
+                                    task_tier = ln.split(":", 1)[1].strip() or "other"
+                                    break
+                        except Exception:
+                            # Missing/unreadable task file → treat as non-owner.
+                            task_tier = "other"
+                        if task_tier != "owner":
+                            print(
+                                f"  [channel-redirect] dropped — tier '{task_tier}' is not owner "
+                                f"(target {target_channel_id}); replying to original channel",
+                                flush=True,
+                            )
+                        else:
+                            try:
+                                target_channel = client.get_channel(target_channel_id)
+                                if target_channel is None:
+                                    target_channel = await client.fetch_channel(target_channel_id)
+                                if target_channel:
+                                    channel = target_channel
+                                    # reply_to_id still references the original task's
+                                    # channel — if the redirected channel differs, the
+                                    # reply-anchor would 404. Clear it so we post as a
+                                    # fresh message instead.
+                                    reply_to_id = None
+                                    print(f"  [channel-redirect] sending to channel {target_channel_id}", flush=True)
+                                else:
+                                    print(
+                                        f"  [channel-redirect] channel {target_channel_id} unresolved, "
+                                        f"falling back to task source",
+                                        flush=True,
+                                    )
+                            except Exception as e:
+                                print(f"  [channel-redirect] failed to resolve channel {target_channel_id}, falling back to task source: {e}", flush=True)
+
                     # Extract file paths: [file: /path] or [send: /path]
                     file_pattern = re.compile(r'\[(?:file|send|attach):\s*((?:/|~/)[^\]:]+)\]')
                     files = file_pattern.findall(reply_text)
