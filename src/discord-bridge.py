@@ -16,7 +16,40 @@ import sys
 import time
 from pathlib import Path
 
-import discord
+# Self-rescue: this bridge HAS to keep running — Discord is the primary channel
+# the owner uses to reach Sutando. If `python3` on $PATH happens to resolve to
+# an interpreter that lacks `discord.py` (e.g. miniconda's python on a Mac that
+# also has Homebrew Python with the package installed), DON'T crash — search
+# for a sibling interpreter that has the module and re-exec with that.
+#
+# Bug class: this session alone hit the same `ModuleNotFoundError: No module
+# named 'discord'` twice — startup.sh:262 uses bare `python3` which resolves
+# unpredictably. Even with startup.sh fixed, any future launcher (cron, plist,
+# `pgrep`-respawn shim, a shell script someone writes 6 months from now) can
+# silently regress this. The self-rescue makes the bridge defensible regardless.
+try:
+    import discord
+except ModuleNotFoundError:
+    _RESCUE_CANDIDATES = [
+        "/opt/homebrew/bin/python3",     # Homebrew on Apple Silicon
+        "/usr/local/bin/python3",        # Homebrew on Intel Mac (or Linux-style)
+        "/opt/homebrew/opt/python@3.13/bin/python3",
+        "/opt/homebrew/opt/python@3.14/bin/python3",
+    ]
+    _current = os.path.realpath(sys.executable)
+    for _cand in _RESCUE_CANDIDATES:
+        if not os.path.exists(_cand) or os.path.realpath(_cand) == _current:
+            continue
+        _check = subprocess.run([_cand, "-c", "import discord"], capture_output=True)
+        if _check.returncode == 0:
+            print(
+                f"discord-bridge: launched with {_current} (no discord.py); "
+                f"re-execing under {_cand}",
+                file=sys.stderr, flush=True,
+            )
+            os.execv(_cand, [_cand, __file__, *sys.argv[1:]])
+    # No rescue interpreter available — re-raise so the operator sees the real error.
+    raise
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
