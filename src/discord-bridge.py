@@ -2976,6 +2976,87 @@ async def poll_dm_fallback():
                         archive_file(_task_file, "tasks", _task_id)
                     archive_file(f, "results", _task_id)
                     continue
+
+                # Honor [channel: <id>] redirect (parity with poll_results
+                # lines ~2702-2759). Without this, a voice- or cron-originated
+                # result that includes the redirect marker would either
+                # (a) leak the literal `[channel: <id>]` string into the
+                # owner's DM via dm-result.py, or (b) lose the redirect intent
+                # entirely. Both modes break the marker's contract.
+                channel_pattern = re.compile(r'\[channel:\s*(\d{17,20})\]')
+                channel_match = channel_pattern.search(_peek)
+                if channel_match:
+                    target_channel_id = int(channel_match.group(1))
+                    clean_body = channel_pattern.sub('', _peek).strip()
+                    _task_id = f.stem
+                    # Tier read from task file. Default "other" on missing /
+                    # unreadable: voice- and cron-originated tasks don't write
+                    # an access_tier field (only the Discord bridge does at
+                    # line ~2534), so they'll fall into this default. The
+                    # tradeoff is intentional — denying redirect for
+                    # tier-unknown tasks is the safe-by-default posture; a
+                    # voice user who genuinely wants channel-redirect can
+                    # have voice-agent write `access_tier: owner` into the
+                    # task file (the same shape Discord uses).
+                    task_tier = "other"
+                    try:
+                        task_body = (TASKS_DIR / f"{_task_id}.txt").read_text()
+                        for ln in task_body.splitlines():
+                            if ln.startswith("access_tier:"):
+                                task_tier = ln.split(":", 1)[1].strip() or "other"
+                                break
+                    except Exception:
+                        task_tier = "other"
+
+                    if task_tier == "owner":
+                        try:
+                            target_channel = client.get_channel(target_channel_id)
+                            if target_channel is None:
+                                target_channel = await client.fetch_channel(target_channel_id)
+                        except Exception as e:
+                            target_channel = None
+                            print(f"  [dm-fallback channel-redirect] failed to resolve {target_channel_id}: {e}", flush=True)
+                        if target_channel:
+                            # File markers (parity with poll_results 2761-2784).
+                            file_pattern = re.compile(r'\[(?:file|send|attach):\s*((?:/|~/)[^\]:]+)\]')
+                            file_list = file_pattern.findall(clean_body)
+                            text_only = file_pattern.sub('', clean_body).strip()
+                            if text_only:
+                                for chunk in _chunk_for_discord(text_only):
+                                    await target_channel.send(chunk)
+                            for fpath in file_list:
+                                fpath = os.path.expanduser(fpath.strip())
+                                if _is_path_sendable(fpath):
+                                    await target_channel.send(file=discord.File(fpath))
+                                    print(f"  [dm-fallback channel-redirect] sent file: {fpath}", flush=True)
+                                elif not os.path.isfile(fpath):
+                                    await target_channel.send(f"(file not found: {fpath})")
+                            print(f"  [dm-fallback channel-redirect] sent {f.name} to channel {target_channel_id}", flush=True)
+                            _task_file = TASKS_DIR / f"{_task_id}.txt"
+                            if _task_file.exists():
+                                archive_file(_task_file, "tasks", _task_id)
+                            archive_file(f, "results", _task_id)
+                            continue
+                        # Unresolved → fall through to DM, but strip marker
+                        # so dm-result.py doesn't leak the literal text.
+                        print(f"  [dm-fallback channel-redirect] channel {target_channel_id} unresolved; falling back to DM", flush=True)
+                    else:
+                        print(
+                            f"  [dm-fallback channel-redirect] dropped — tier '{task_tier}' is not owner "
+                            f"(target {target_channel_id}); falling back to DM",
+                            flush=True,
+                        )
+                    # Either non-owner or unresolved-channel path: rewrite the
+                    # result file with the marker stripped so the dm-result.py
+                    # subprocess (below) DMs clean text. Atomic-ish write —
+                    # the only other consumer of results/ at this point is
+                    # voice-agent's task-bridge, which is read-only and would
+                    # tolerate an intermediate marker-vs-clean view.
+                    try:
+                        f.write_text(clean_body + ("\n" if not clean_body.endswith("\n") else ""), encoding="utf-8")
+                    except OSError as e:
+                        print(f"  [dm-fallback channel-redirect] write-back failed on {f.name}: {e}", flush=True)
+
                 # Subprocess out to the shared CLI tool so there's only one
                 # code path for the voiceConnected check + DM send.
                 # Use sys.executable: under launchd (discord-bridge is launchd-managed),
