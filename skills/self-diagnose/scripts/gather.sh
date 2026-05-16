@@ -41,6 +41,11 @@ mkdir -p "$OUT"
 # "Workspace contract" section). Falls back to $REPO/notes if env unset, matching
 # the historic pre-workspace-contract behavior. Same precedence as
 # `src/workspace_default.py:resolve_workspace()` for Python callers.
+# TODO(post-2026-08-15): drop the $REPO/notes fallback once all known
+# installs are confirmed on the workspace contract. Tracked via Lucy's
+# #769 review obs 4. Dual-path was added so pre-#762 installs don't
+# silently lose cold-review-log access; safe to remove after every node
+# has resolved its workspace at least once.
 if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
 	NOTES_DIR="$SUTANDO_WORKSPACE/notes"
 else

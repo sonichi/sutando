@@ -109,10 +109,20 @@ def _migrate_inrepo_notes(workspace: Path) -> bool:
     that aren't under `<workspace>/notes/`. The trigger condition is
     "workspace and in-repo location are different, AND in-repo has notes."
 
+    Scope: top-level `.md`/`.txt` files only. Subdirectories (e.g.
+    `notes/projects/`, `notes/media/`) are intentionally NOT migrated —
+    workspace notes are flat by current convention. If/when nested notes
+    become supported, this migrator grows a `recursive=True` flag rather
+    than silently changing posture. Owner's notes layout (2026-05-16) is
+    flat; this matches.
+
     Symmetric to `_migrate_from_legacy`'s posture: non-destructive on collision
     (skip the file if it already exists at the workspace location), logs each
     moved file to stderr, idempotent (second run finds in-repo empty and
-    bails).
+    bails). Also writes a sentinel (`<workspace>/.notes-migrated`) after a
+    successful run so subsequent `resolve_workspace()` calls short-circuit
+    on the cheap stat-check rather than re-running iterdir; per Lucy's #769
+    review obs 2.
 
     Per owner directive 2026-05-16: every design change must ship with an
     automatic migration script so existing users don't have to migrate
@@ -120,6 +130,12 @@ def _migrate_inrepo_notes(workspace: Path) -> bool:
 
     Returns True iff at least one file was migrated.
     """
+    # Sentinel-file short-circuit: after a previous successful migration we
+    # leave a marker so this function exits in O(1) instead of O(directory
+    # listing) on every bridge restart. Per Lucy's #769 review obs 2.
+    sentinel = workspace / ".notes-migrated"
+    if sentinel.exists():
+        return False
     repo_root = _legacy_repo_root()
     # If workspace IS the repo root, there's nothing to migrate (both names
     # resolve to the same dir). Owner's case: workspace = <repo>/workspace/,
@@ -133,12 +149,20 @@ def _migrate_inrepo_notes(workspace: Path) -> bool:
     if not inrepo_notes.is_dir():
         return False
     # Only operate on regular md/txt files at the top level of in-repo notes/.
-    # Subdirectories (e.g. `notes/media/`) and the historic memory-sync symlink
-    # convention are left alone — they may have their own semantics this
-    # migration shouldn't touch.
+    # Subdirectories (e.g. `notes/media/`, `notes/projects/`) and the historic
+    # memory-sync symlink convention are left alone — they may have their own
+    # semantics this migration shouldn't touch. See function docstring on
+    # the flat-notes convention.
     candidates = [p for p in inrepo_notes.iterdir()
                   if p.is_file() and p.suffix in (".md", ".txt")]
     if not candidates:
+        # No top-level notes to migrate — drop the sentinel anyway so we
+        # don't iterdir again on next call (Lucy obs 2). Cheap touch.
+        try:
+            workspace.mkdir(parents=True, exist_ok=True)
+            sentinel.touch()
+        except Exception:
+            pass  # sentinel is an optimization, never fatal
         return False
     target_notes = workspace / "notes"
     target_notes.mkdir(parents=True, exist_ok=True)
@@ -159,6 +183,13 @@ def _migrate_inrepo_notes(workspace: Path) -> bool:
             f"{', …' if len(moved) > 5 else ''})",
             file=sys.stderr,
         )
+    # Drop the sentinel so subsequent calls short-circuit on the cheap exists()
+    # check (Lucy's #769 obs 2). Best-effort; if the touch fails we'll just
+    # iterdir() again next call — correctness unaffected.
+    try:
+        sentinel.touch()
+    except Exception:
+        pass
     return bool(moved)
 
 
