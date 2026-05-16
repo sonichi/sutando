@@ -2918,8 +2918,16 @@ async def poll_dm_fallback():
                     # stdin=DEVNULL: under launchd, parent's fd 0 may be invalid,
                     # causing the child Python's `init_sys_streams` to fail with
                     # `OSError: [Errno 9] Bad file descriptor`. Force clean stdin.
+                    # dm-result.py is a SIBLING of this script in src/, not a
+                    # workspace artifact. Resolving via Path(__file__) keeps the
+                    # invocation correct after PR #762 — which made REPO point
+                    # at the runtime workspace (a subdir of the repo root), so
+                    # `REPO / "src" / "dm-result.py"` would resolve to
+                    # `<workspace>/src/dm-result.py` (does not exist) and the
+                    # dm-fallback path errored out silently before delivering.
+                    _DM_RESULT_SCRIPT = Path(__file__).resolve().parent / "dm-result.py"
                     result = subprocess.run(
-                        [sys.executable, str(REPO / "src" / "dm-result.py"), "--file", str(f)],
+                        [sys.executable, str(_DM_RESULT_SCRIPT), "--file", str(f)],
                         capture_output=True, text=True, timeout=15,
                         stdin=subprocess.DEVNULL,
                     )
