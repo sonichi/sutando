@@ -27,6 +27,7 @@ import { z } from 'zod';
 import { existsSync, readFileSync, readdirSync, statSync, unlinkSync, mkdirSync, appendFileSync, writeFileSync } from 'node:fs';
 import { execSync as execSyncTop } from 'node:child_process';
 import { inlineTools, coreDocumentedSkills } from './inline-tools.js';
+import { setVisionSession, startVisionControlServer, stopVisionControlServer } from './vision-tools.js';
 import { injectText } from './browser-tools.js';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
@@ -871,6 +872,12 @@ async function main() {
 	});
 
 	sessionRef = session;
+	// Wire vision streaming — the start_vision tool needs the live session
+	// to call session.transport.sendFile for each frame. Also boot the local
+	// HTTP control endpoint so the web-client Watch button can drive the
+	// same controller (proxied through web-client to stay same-origin).
+	setVisionSession(session);
+	startVisionControlServer();
 
 	// Bumped 5min into the future on every non-retryable transport close
 	// (set inside the classifier IIFE below). Read by the 30s health
@@ -1102,6 +1109,8 @@ async function main() {
 	const shutdown = async () => {
 		console.log(`\n${ts()} Shutting down...`);
 		writeVoiceMetrics();
+		setVisionSession(null);
+		stopVisionControlServer();
 		await session.close('user_hangup');
 		process.exit(0);
 	};
