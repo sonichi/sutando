@@ -693,39 +693,45 @@ def run_all_checks() -> list[dict]:
                     "conversation-server.ts",
                 )
             checks.append(c)
-            # Tunnel check — depends on TWILIO_WEBHOOK_URL host (Funnel) or ngrok
+            # Tunnel check — depends on TWILIO_WEBHOOK_URL host (Funnel) or ngrok.
+            # Skip the whole block when TWILIO_WEBHOOK_URL is unset/empty: with
+            # no inbound webhook, no tunnel is required, so flagging ngrok
+            # "down — phone calls won't reach server" would be a false alarm
+            # (issue #710). The has_twilio gate above only requires
+            # TWILIO_ACCOUNT_SID, which the owner may set for outbound-only.
             if c["status"] == "ok":
                 webhook_url = ""
                 for line in env_content.splitlines():
                     if line.startswith("TWILIO_WEBHOOK_URL="):
                         webhook_url = line.split("=", 1)[1].strip().strip('"').strip("'")
                         break
-                from urllib.parse import urlparse as _urlparse
-                _host = _urlparse(webhook_url).hostname or ""
-                is_funnel = _host.endswith(".ts.net")
-                if is_funnel:
-                    # Tailscale Funnel — verify funnel is serving and reachable
-                    funnel_c = {"name": "tailscale-funnel", "status": "ok", "detail": f"serving {webhook_url}"}
-                    try:
-                        import urllib.request
-                        req = urllib.request.Request(f"{webhook_url}/health", headers={"User-Agent": "sutando-healthcheck"})
-                        with urllib.request.urlopen(req, timeout=5) as resp:
-                            if resp.status != 200:
-                                funnel_c["status"] = "down"
-                                funnel_c["detail"] = f"webhook returned {resp.status}"
-                    except Exception as e:
-                        funnel_c["status"] = "down"
-                        funnel_c["detail"] = f"unreachable: {str(e)[:60]}"
-                    checks.append(funnel_c)
-                else:
-                    ngrok_c = check_port(4040, "ngrok")
-                    if ngrok_c["status"] == "ok":
-                        ngrok_c["detail"] = "tunnel active (port 4040)"
+                if webhook_url:
+                    from urllib.parse import urlparse as _urlparse
+                    _host = _urlparse(webhook_url).hostname or ""
+                    is_funnel = _host.endswith(".ts.net")
+                    if is_funnel:
+                        # Tailscale Funnel — verify funnel is serving and reachable
+                        funnel_c = {"name": "tailscale-funnel", "status": "ok", "detail": f"serving {webhook_url}"}
+                        try:
+                            import urllib.request
+                            req = urllib.request.Request(f"{webhook_url}/health", headers={"User-Agent": "sutando-healthcheck"})
+                            with urllib.request.urlopen(req, timeout=5) as resp:
+                                if resp.status != 200:
+                                    funnel_c["status"] = "down"
+                                    funnel_c["detail"] = f"webhook returned {resp.status}"
+                        except Exception as e:
+                            funnel_c["status"] = "down"
+                            funnel_c["detail"] = f"unreachable: {str(e)[:60]}"
+                        checks.append(funnel_c)
                     else:
-                        # Critical: phone calls fail without ngrok
-                        ngrok_c["status"] = "down"
-                        ngrok_c["detail"] = "not running — phone calls won't reach server"
-                    checks.append(ngrok_c)
+                        ngrok_c = check_port(4040, "ngrok")
+                        if ngrok_c["status"] == "ok":
+                            ngrok_c["detail"] = "tunnel active (port 4040)"
+                        else:
+                            # Critical: phone calls fail without ngrok
+                            ngrok_c["status"] = "down"
+                            ngrok_c["detail"] = "not running — phone calls won't reach server"
+                        checks.append(ngrok_c)
 
     # Messaging bridges (optional — only check if configured and not skipped)
     skip_telegram = (env_path.exists() and "SKIP_TELEGRAM=1" in env_path.read_text()) or os.environ.get("SKIP_TELEGRAM") == "1"
