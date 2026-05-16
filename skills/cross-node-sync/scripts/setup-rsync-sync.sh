@@ -49,6 +49,16 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
+# Load .env from the sutando workspace early — non-interactive shells (cron,
+# launchd) don't run user shell startup, so SUTANDO_SYNC_PEER / SUTANDO_PEER_*
+# wouldn't otherwise be visible even when set in .env (same root cause as #714).
+if [ -f "$REPO_ROOT/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . "$REPO_ROOT/.env"
+    set +a
+fi
+
 # --- Config ------------------------------------------------------------------
 # Peer host: set via SUTANDO_SYNC_PEER env var (e.g. "susan@macbook.local")
 # so the script is portable between Studio and Mini without code changes.
