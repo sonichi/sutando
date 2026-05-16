@@ -24,6 +24,11 @@ import urllib.error
 VISION_PORT = int(os.environ.get("VISION_CONTROL_PORT", "7847"))
 VISION_BASE = f"http://127.0.0.1:{VISION_PORT}"
 
+# Skip bytes below typical JPEG minimum to avoid forwarding corrupted or
+# in-flight downloads — a partial fetch returning under 2 KB is almost
+# certainly not a real frame (header + tiny payload at best).
+MIN_FRAME_BYTES = 2048
+
 
 def _post(path: str, body: bytes, content_type: str, timeout: float = 3.0) -> tuple[int, bytes]:
     req = urllib.request.Request(
@@ -70,8 +75,8 @@ def push_image(path: str, source: str = "bridge") -> bool:
             data = fh.read()
     except OSError:
         return False
-    if len(data) < 2048:
-        return False  # blank/tiny
+    if len(data) < MIN_FRAME_BYTES:
+        return False  # blank/tiny/partial
 
     if not is_voice_ready():
         return False

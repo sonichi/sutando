@@ -63,7 +63,11 @@ const screenSource: VisionSource = {
 		}
 		const buf = readFileSync(data.path);
 		// Drop the on-disk copy — we've already uploaded the bytes.
-		try { unlinkSync(data.path); } catch {}
+		try {
+			unlinkSync(data.path);
+		} catch (err) {
+			console.warn(`${ts()} [Vision] failed to unlink ${data.path}: ${(err as Error)?.message ?? err}`);
+		}
 		return { data: buf, mimeType: 'image/jpeg' };
 	},
 };
@@ -535,6 +539,9 @@ export function startVisionControlServer(port: number = DEFAULT_CONTROL_PORT): S
 		// the existing instance owns the control endpoint.
 		if (err.code === 'EADDRINUSE') {
 			console.warn(`${ts()} [Vision] control port ${port} in use; skipping (another voice-agent?)`);
+			// Intentionally null — another process owns the listener, so our
+			// stopVisionControlServer() should be a no-op (don't close
+			// someone else's server on shutdown).
 			controlServer = null;
 			return;
 		}
