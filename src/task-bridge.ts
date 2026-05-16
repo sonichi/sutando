@@ -445,6 +445,18 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 
 	// Check every 2 seconds for new result files
 	setInterval(() => {
+		// Defensive try/catch around the timeout-check loop. Without this,
+		// a single throw during _pendingTasks iteration (corrupt entry,
+		// race with concurrent delete/set, unhandled rejection in a
+		// destructure of `pending`) takes down the visible behavior of
+		// this tick — the readdir block below has its own try/catch, but
+		// the loop above did not. Observed live 2026-05-16: post-restart
+		// voice-agent's result-watcher fell silent (no TaskBridge log
+		// lines across 30+ minutes) while the 30s health monitor's
+		// setInterval kept firing normally — same Node process, same
+		// event loop, so the only differential was an early throw in
+		// this body that propagated past the setInterval callback.
+		try {
 		// Check for timed-out tasks — runs every interval regardless of result files
 		for (const [taskId, pending] of _pendingTasks) {
 			const { submittedAt, timeoutMs, dmOnTimeout } = pending;
@@ -505,6 +517,9 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 					}
 				}
 			}
+		}
+		} catch (err) {
+			console.error(`${ts()} [TaskBridge] timeout-check loop threw (non-fatal, continuing watch):`, err);
 		}
 
 		try {
@@ -597,8 +612,14 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 					}, 10_000);
 				}
 			}
-		} catch {
-			// Directory might not exist yet or file in transit
+		} catch (err) {
+			// Directory might not exist yet or file in transit. Log on
+			// unusual exceptions (not ENOENT) so a real file-system
+			// problem is observable, while still containing the throw.
+			const code = (err as NodeJS.ErrnoException)?.code;
+			if (code && code !== 'ENOENT') {
+				console.error(`${ts()} [TaskBridge] result-scan threw (non-fatal):`, err);
+			}
 		}
 	}, 2000);
 }
