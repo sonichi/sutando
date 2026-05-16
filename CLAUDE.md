@@ -48,6 +48,40 @@ Signal your work status to `core-status.json` so the web UI can display it:
 - When done: `echo '{"status":"idle","ts":<epoch>}' > core-status.json`
 This applies to all work — proactive loop passes, voice tasks, user requests, code changes.
 
+## Chat-path task tracking (issue #585)
+
+When you accept a non-trivial commitment from the user via **chat** (direct text input, not through voice/Discord/Telegram bridges), write a task file so the dashboard can track it.
+
+Note: this is the **shell path** for the core agent (Claude Code). The `/chat` web UI would use the `create_chat_task` inline tool instead (see `src/inline-tools.ts`), but that tool is currently a future hook — no caller in the architecture yet (`/chat` connects to agent-api, not voice-agent). Both produce the same `task-chat-*` file format.
+
+**When to write a task file from chat:**
+- The user asks you to do something concrete (close a PR, send an email, research a topic, fix a bug)
+- NOT for: quick questions, greetings, simple lookups, clarifications
+
+**How:**
+```bash
+local _ts="$(date +%s)"
+cat > "tasks/task-chat-${_ts}.txt" << EOF
+id: task-chat-${_ts}
+timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+task: <concise description of what you're doing>
+source: chat
+channel_id: local-chat
+user_id: ${SUTANDO_DM_OWNER_ID:-chat-local}
+access_tier: owner
+EOF
+```
+
+**When done:**
+Write a result file using the same task ID:
+```bash
+cat > "results/task-chat-${_ts}.txt" << EOF
+<result summary>
+EOF
+```
+
+This ensures the dashboard, result-watcher, and timeout logic work the same regardless of entry path.
+
 ## Memory
 
 Full memory index: $SUTANDO_MEMORY_DIR (default: ~/.claude/projects/.../memory)/MEMORY.md

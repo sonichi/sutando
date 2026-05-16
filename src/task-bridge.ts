@@ -62,6 +62,32 @@ mkdirSync(RESULT_DIR, { recursive: true });
 
 function ts(): string { return new Date().toISOString().slice(11, 23); }
 
+/**
+ * Write a chat-path task file so the dashboard tracks chat-originated work.
+ * Called by the core agent (Claude Code) when it accepts a non-trivial task from chat.
+ * Reuses the same tasks/ directory and file format as voice/Discord/Telegram paths.
+ *
+ * Note: access_tier is hardcoded to "owner" because chat is local to the operator.
+ * Revisit if /chat ever opens to non-owner users (team/other tier).
+ */
+export function writeChatTask(taskDescription: string): string {
+	const taskId = `task-chat-${Date.now()}`;
+	const timestamp = new Date().toISOString();
+	const content = [
+		`id: ${taskId}`,
+		`timestamp: ${timestamp}`,
+		`task: ${taskDescription}`,
+		`source: chat`,
+		`channel_id: local-chat`,
+		`user_id: ${process.env.SUTANDO_DM_OWNER_ID || 'chat-local'}`,
+		`access_tier: owner`,
+		'',
+	].join('\n');
+	writeFileSync(join(TASK_DIR, `${taskId}.txt`), content);
+	console.log(`${ts()} [TaskBridge] Chat task: ${taskId}: ${taskDescription.slice(0, 100)}`);
+	return taskId;
+}
+
 // ---------------------------------------------------------------------------
 // Task status notifications — sent to the web client
 // ---------------------------------------------------------------------------
@@ -565,6 +591,19 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 						} catch (e) {
 							console.error(`${ts()} [TaskBridge] Failed to forward ${taskId} to Discord:`, e);
 						}
+					}
+					// Chat-path tasks have no bridge consumer — archive them directly
+					// so results/task-chat-*.txt files don't accumulate forever.
+					if (taskId.startsWith('task-chat-')) {
+						_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
+						_deliveredResults.add(file);
+						_pendingTasks.delete(taskId);
+						console.log(`${ts()} [TaskBridge] Chat task archived (no client): ${taskId}`);
+						setTimeout(() => {
+							archiveFile(path, 'results', taskId);
+							const taskFile = join(TASK_DIR, `${taskId}.txt`);
+							if (existsSync(taskFile)) archiveFile(taskFile, 'tasks', taskId);
+						}, 10_000);
 					}
 					// Other non-voice unsent results stay queued (their bridges deliver them)
 					continue;

@@ -726,6 +726,25 @@ return frontApp`;
 	},
 };
 
+export const createChatTaskTool: ToolDefinition = {
+	name: 'create_chat_task',
+	description:
+		'Create a tracked task entry for the /chat web UI route. ' +
+		'Future hook: no current caller in the chat path (/chat connects to agent-api, not voice-agent). ' +
+		'The core agent (Claude Code) uses the CLAUDE.md shell-snippet path instead. ' +
+		'Voice tasks have their own tracking (source: voice).',
+	parameters: z.object({
+		task: z.string().describe('Description of the task being tracked'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { task } = args as { task: string };
+		const { writeChatTask } = await import('./task-bridge.js');
+		const taskId = writeChatTask(task);
+		return { status: 'created', taskId, message: `Chat task created: ${taskId}` };
+	},
+};
+
 /** All inline tools — import and spread into your tools list */
 // ─── Notes tools ─────────────────────────────────────────
 // Resolve at module-init: $SUTANDO_PRIVATE_DIR/notes (canonical) when set,
@@ -1046,7 +1065,7 @@ export const ownerOnlyTools = [
 	clipboardTool, cancelTaskTool, toggleTasksTool, summonTool, dismissTool,
 	joinZoomTool, joinGmeetTool, callContactTool, slideControlTool, fullscreenTool,
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
-	recentContextTool,
+	recentContextTool, createChatTaskTool,
 	describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool,
 	sendVisionFrameTool, startVisionTool, stopVisionTool,
 	...personalTools.owner,
