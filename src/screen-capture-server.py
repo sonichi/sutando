@@ -84,43 +84,54 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.startswith("/capture"):
-            # Flash agent-state=seeing on the menu-bar avatar for ~1.5s.
-            # Non-blocking fire-and-forget; capture succeeds regardless.
-            _signal_seeing()
-            # macOS notification "Sutando captured screen" — opt-out via
-            # SUTANDO_CAPTURE_NOTIFY=0. Debounced at 5s to avoid spam
-            # during burst captures.
-            _notify_capture()
-            os.makedirs(DIR, exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
             # Parse display number from query: /capture?display=2 or /capture?all=true
             from urllib.parse import urlparse, parse_qs
             query = parse_qs(urlparse(self.path).query)
+            # silent=true suppresses the menu-bar flash + notification. Used by
+            # the vision streaming ticker, which fires once per second and would
+            # otherwise spam the indicator and notification center.
+            silent = query.get("silent", ["false"])[0] == "true"
+            if not silent:
+                # Flash agent-state=seeing on the menu-bar avatar for ~1.5s.
+                # Non-blocking fire-and-forget; capture succeeds regardless.
+                _signal_seeing()
+                # macOS notification "Sutando captured screen" — opt-out via
+                # SUTANDO_CAPTURE_NOTIFY=0. Debounced at 5s to avoid spam
+                # during burst captures.
+                _notify_capture()
+            os.makedirs(DIR, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
             display_raw = query.get("display", [None])[0]
             # Coerce to int to short-circuit taint flow into the subprocess
             # argument list. Display index constrained to 1..9 (macOS never has
             # more than a handful of displays).
             display = int(display_raw) if display_raw and display_raw.isdigit() and 1 <= int(display_raw) <= 9 else None
             capture_all = query.get("all", ["false"])[0] == "true"
+            # format=jpeg → screencapture -t jpg, smaller files for streaming.
+            fmt = query.get("format", ["png"])[0]
+            if fmt not in ("png", "jpg", "jpeg"):
+                fmt = "png"
+            ext = "jpg" if fmt in ("jpg", "jpeg") else "png"
+            type_flag = "jpg" if ext == "jpg" else "png"
             try:
                 if capture_all:
                     # Capture all displays separately
                     paths = []
                     for d in range(1, 5):  # up to 4 displays
-                        p = f"{DIR}/screen-{ts}-d{d}.png"
-                        result = subprocess.run(["screencapture", "-x", f"-D{d}", p], timeout=5, capture_output=True)
+                        p = f"{DIR}/screen-{ts}-d{d}.{ext}"
+                        result = subprocess.run(["screencapture", "-x", "-t", type_flag, f"-D{d}", p], timeout=5, capture_output=True)
                         if result.returncode == 0 and os.path.exists(p) and os.path.getsize(p) > 0:
                             paths.append(p)
                         else:
                             try: os.unlink(p)
                             except: pass
                             break  # no more displays
-                    path = paths[0] if paths else f"{DIR}/screen-{ts}.png"
+                    path = paths[0] if paths else f"{DIR}/screen-{ts}.{ext}"
                 else:
                     suffix = f"-d{display}" if display else ""
-                    path = f"{DIR}/screen-{ts}{suffix}.png"
+                    path = f"{DIR}/screen-{ts}{suffix}.{ext}"
                     paths = [path]
-                    cmd = ["screencapture", "-x"]
+                    cmd = ["screencapture", "-x", "-t", type_flag]
                     if display:
                         cmd.append(f"-D{display}")
                     cmd.append(path)

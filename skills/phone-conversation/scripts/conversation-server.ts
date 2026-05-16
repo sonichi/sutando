@@ -69,6 +69,27 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '../../../src/inline-tools.js';
+// Lazy vision-session handle. Only loaded if a call ever needs it — keeps the
+// phone-agent boot path free of the vision-tools.ts side-effects on cold start.
+let _setVisionSession: ((s: unknown) => void) | null = null;
+let _priorVisionSession: unknown = undefined; // snapshot to restore on hang-up
+async function attachVisionToCall(session: unknown): Promise<void> {
+	try {
+		if (!_setVisionSession) {
+			const m = await import('../../../src/vision-tools.js');
+			_setVisionSession = m.setVisionSession;
+			// First time only: there's no public getter, so we just mark the
+			// snapshot as null (web session, if any, will re-set itself when
+			// vision is needed there again — voice tools call setVisionSession
+			// on every connect).
+			_priorVisionSession = null;
+		}
+		_setVisionSession(session);
+	} catch {}
+}
+function detachVisionFromCall(): void {
+	try { _setVisionSession?.(_priorVisionSession ?? null); } catch {}
+}
 
 // --- Config ---
 
@@ -722,6 +743,12 @@ async function createCallSession(params: {
 
 	callSession.voiceSession = session;
 
+	// Route vision frames to this call's session for its duration. Push-mode
+	// senders (Mentra glasses, Discord/Telegram photo helper, the web Watch
+	// button) now reach the phone caller's session instead of the web
+	// session. Restored on hang-up (see endCall).
+	await attachVisionToCall(session);
+
 	// Start VoiceSession (creates ClientTransport WebSocket server on bodhiPort)
 	await session.start();
 	console.log(`${ts()} [Bodhi] VoiceSession started on port ${bodhiPort} for ${params.callSid}`);
@@ -880,6 +907,11 @@ function cleanupCall(callSid: string): void {
 	session.cleanupNarration?.();
 	try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
 	try { unlinkSync('/tmp/sutando-playback-path'); } catch {}
+
+	// Restore vision session to the prior (likely web) session before tearing
+	// down the call's VoiceSession so push-mode frames don't get sent to a
+	// closed transport.
+	detachVisionFromCall();
 
 	// Close VoiceSession
 	session.voiceSession.close('call_ended').catch(e =>

@@ -17,6 +17,10 @@ const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 export { describeScreenTool, clickTool, scrollAndDescribeTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool } from './browser-tools.js';
 import { describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool } from './browser-tools.js';
 
+// Vision: one-shot frame + start/stop live screen-to-Gemini video.
+export { sendVisionFrameTool, startVisionTool, stopVisionTool } from './vision-tools.js';
+import { sendVisionFrameTool, startVisionTool, stopVisionTool } from './vision-tools.js';
+
 // --- File-open tool (moved out of recording-tools — generic file open, optionally fullscreen) ---
 
 export const openFileTool: ToolDefinition = {
@@ -1024,6 +1028,7 @@ export const inlineTools = assertUniqueToolNames([
 	describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, slideControlTool, fullscreenTool,
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
 	recentContextTool,
+	sendVisionFrameTool, startVisionTool, stopVisionTool,
 	...personalAllTools ]);
 
 /** Tools available to any caller (including unverified) */
@@ -1043,6 +1048,7 @@ export const ownerOnlyTools = [
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
 	recentContextTool,
 	describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool,
+	sendVisionFrameTool, startVisionTool, stopVisionTool,
 	...personalTools.owner,
 ];
 
