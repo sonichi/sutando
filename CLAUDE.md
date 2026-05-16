@@ -82,8 +82,11 @@ source: chat
 channel_id: local-chat
 user_id: ${SUTANDO_DM_OWNER_ID:-chat-local}
 access_tier: owner
+priority: normal
 EOF
 ```
+
+**Priority field**: `urgent` (voice/phone, sub-second latency target) | `normal` (chat/owner DM, default) | `low` (cron, health-check, non-owner DMs). When more than one task is pending, the consumer processes highest-priority first; tie-breaker is mtime FIFO. Defaults per source are encoded in `src/task_priority.py:default_priority_for_source`.
 
 **When done:**
 Write a result file using the same task ID:

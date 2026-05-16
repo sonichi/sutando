@@ -81,6 +81,7 @@ export function writeChatTask(taskDescription: string): string {
 		`channel_id: local-chat`,
 		`user_id: ${process.env.SUTANDO_DM_OWNER_ID || 'chat-local'}`,
 		`access_tier: owner`,
+		`priority: normal`,
 		'',
 	].join('\n');
 	writeFileSync(join(TASK_DIR, `${taskId}.txt`), content);
@@ -240,7 +241,8 @@ export const workTool: ToolDefinition = {
 			`source: voice\n` +
 			`channel_id: local-voice\n` +
 			`user_id: ${ownerId}\n` +
-			`access_tier: owner\n`;
+			`access_tier: owner\n` +
+			`priority: urgent\n`;
 		writeFileSync(join(TASK_DIR, `${taskId}.txt`), content);
 		// Resolve per-task timeout. 0 → no timeout. Negative or NaN → default.
 		// Cap at 6 hours to prevent runaway pending-state if the voice agent
@@ -384,7 +386,8 @@ export function startContextDropWatcher(onContextDrop: (content: string) => void
 						`source: context-drop\n` +
 						`channel_id: local-hotkey\n` +
 						`user_id: ${ownerId}\n` +
-						`access_tier: owner\n`,
+						`access_tier: owner\n` +
+						`priority: normal\n`,
 					);
 					unlinkSync(CONTEXT_DROP_FILE);
 					// Also inject into Gemini if available
