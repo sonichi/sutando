@@ -80,6 +80,25 @@ EOF
 
 This ensures the dashboard, result-watcher, and timeout logic work the same regardless of entry path.
 
+## Core liveness signal
+
+Each running sutando-core writes `<workspace>/state/cores/<hostname>.alive`
+every 30 seconds (started by `src/startup.sh` as a background process; source
+at `src/core_heartbeat.py`). The file is per-host so multiple cores on
+different machines coexist; mtime is the cross-host "is this core alive?"
+signal (younger than ~90s → alive). On SIGTERM/SIGINT the .alive file is
+unlinked so peers see a graceful shutdown immediately.
+
+Payload schema:
+```json
+{"host": "...", "pid": ..., "started_at": ..., "last_beat_at": ..., "status": "...", "schema_version": 1}
+```
+
+This is foundation for the lease-based multi-core scheduler — workers consult
+the alive directory to know who's available before assigning a claim. For
+single-machine use today it also gives `health-check.py` and the dashboard a
+cleaner liveness probe than scanning `pgrep -f claude`.
+
 ## Memory
 
 Full memory index: $SUTANDO_MEMORY_DIR (default: ~/.claude/projects/.../memory)/MEMORY.md

@@ -131,6 +131,17 @@ mkdir -p tasks results data
 # notes/post-mortem-dm-flood-2026-04-15.md.
 python3 "$REPO/src/archive-stale-results.py" || true
 
+# Core heartbeat — per-host alive signal under state/cores/<hostname>.alive.
+# Foundation for multi-core / cross-machine "who's running?" checks. Single
+# instance per host; gracefully cleans up its .alive file on SIGTERM.
+if ! pgrep -f "src/core_heartbeat.py" > /dev/null 2>&1; then
+  echo "  Starting core heartbeat..."
+  python3 "$REPO/src/core_heartbeat.py" > /tmp/core-heartbeat.log 2>&1 &
+  echo "  ✓ core heartbeat"
+else
+  echo "  ✓ core heartbeat (already running)"
+fi
+
 # 0. Credential proxy for quota tracking (port 7846)
 if ! lsof -i :7846 > /dev/null 2>&1; then
   echo "  Starting credential proxy (port 7846)..."
