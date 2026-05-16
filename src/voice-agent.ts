@@ -1117,6 +1117,19 @@ async function main() {
 	process.on('SIGINT', shutdown);
 	process.on('SIGTERM', shutdown);
 	process.on('uncaughtException', (err) => {
+		// EADDRINUSE on the WS port means another voice-agent (typically the
+		// launchd-managed one) already owns it. The existing process is the
+		// one with the live Gemini transport — the duplicate that tripped
+		// this handler has already bound the vision control port and would
+		// happily answer /vision/start with a dead sessionRef, breaking
+		// push-mode screen sharing for the active session. Release the
+		// control port and exit so the launchd voice-agent (or the next
+		// restart) can claim 7847 with a live session.
+		if ((err as NodeJS.ErrnoException)?.code === 'EADDRINUSE') {
+			console.error(`${ts()} [FATAL] EADDRINUSE on :${PORT} — another voice-agent is listening; exiting so the live one keeps the vision control port.`);
+			try { stopVisionControlServer(); } catch {}
+			process.exit(1);
+		}
 		console.error(`${ts()} [FATAL] uncaught exception (staying alive):`, err);
 	});
 	process.on('unhandledRejection', (err) => {
