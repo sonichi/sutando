@@ -27,13 +27,12 @@ class TestWorkspaceDefault(unittest.TestCase):
         elif "SUTANDO_WORKSPACE" in os.environ:
             del os.environ["SUTANDO_WORKSPACE"]
 
-    def test_default_is_application_support_workspace_subdir(self):
+    def test_default_is_dot_sutando_workspace_under_home(self):
         d = default_workspace_dir()
         self.assertEqual(d.name, "workspace")
-        self.assertEqual(d.parent.name, "sutando")
-        self.assertEqual(d.parent.parent.name, "Application Support")
-        self.assertEqual(d.parent.parent.parent.name, "Library")
-        self.assertEqual(d, Path.home() / "Library" / "Application Support" / "sutando" / "workspace")
+        self.assertEqual(d.parent.name, ".sutando")
+        self.assertEqual(d.parent.parent, Path.home())
+        self.assertEqual(d, Path.home() / ".sutando" / "workspace")
 
     def test_resolve_uses_env_when_set(self):
         os.environ["SUTANDO_WORKSPACE"] = "/tmp/test-ws"

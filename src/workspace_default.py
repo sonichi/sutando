@@ -2,9 +2,10 @@
 
 All runtime artifacts (tasks/, results/, state/, data/, build_log.md, ...) live
 under the workspace dir. Components MUST consult `SUTANDO_WORKSPACE` first;
-when unset, fall back to `~/Library/Application Support/sutando/workspace/`
-(a subdir, not the parent — Sutando.app owns the parent for its Chromium-style
-cache: Cache/, GPUCache/, Cookies/, blob_storage/, etc.).
+when unset, fall back to `~/.sutando/workspace/` — a hidden, OS-neutral home-
+relative path that stays out of Sutando.app's `~/Library/Application Support/
+sutando/` (which owns Chromium-style cache: Cache/, GPUCache/, Cookies/,
+blob_storage/, etc.).
 
 Historic anti-pattern: bridges fell back to `Path(__file__).resolve().parent.parent`
 which resolved to the repo root, polluting `git status` with runtime artifacts
@@ -17,11 +18,11 @@ import os
 from pathlib import Path
 
 
-_DEFAULT_SUBPATH = ("Library", "Application Support", "sutando", "workspace")
+_DEFAULT_SUBPATH = (".sutando", "workspace")
 
 
 def default_workspace_dir() -> Path:
-    """Return `~/Library/Application Support/sutando/workspace/`."""
+    """Return `~/.sutando/workspace/`."""
     return Path.home().joinpath(*_DEFAULT_SUBPATH)
 
 
@@ -30,7 +31,7 @@ def resolve_workspace() -> Path:
 
     Order:
       1. `$SUTANDO_WORKSPACE` env var, expanded (`~` honored).
-      2. `~/Library/Application Support/sutando/workspace/`.
+      2. `~/.sutando/workspace/`.
 
     Returns a `Path` — does NOT create the directory; the caller decides.
     """

@@ -267,7 +267,7 @@ def write_owner_activity(channel: str, summary: str) -> None:
     `notes/team-proposal-coord-loop-2026-04-20.md`.
     """
     try:
-        STATE_DIR.mkdir(exist_ok=True)
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
         payload = {
             "ts": int(time.time()),
             "channel": channel,
@@ -337,8 +337,8 @@ def notify_agent_api_task_done(task_id: str, result: str) -> None:
     except Exception:
         pass  # best-effort; agent-api will catch up via polling
 INBOX_DIR = Path("/tmp/discord-inbox")
-TASKS_DIR.mkdir(exist_ok=True)
-RESULTS_DIR.mkdir(exist_ok=True)
+TASKS_DIR.mkdir(parents=True, exist_ok=True)
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 INBOX_DIR.mkdir(exist_ok=True)
 
 # Presenter mode: when scripts/presenter-mode.sh is active, the bridge

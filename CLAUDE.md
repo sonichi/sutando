@@ -44,13 +44,13 @@ All per-user mutable state — `tasks/`, `results/`, `state/`, `data/`, `logs/`,
 **Resolution (every service reads the same):**
 
 1. `$SUTANDO_WORKSPACE` env var (override; `~` is expanded).
-2. `~/Library/Application Support/sutando/workspace/` (default).
+2. `~/.sutando/workspace/` (default).
 
-The `workspace/` subdir matters: the parent `~/Library/Application Support/sutando/` is Sutando.app's territory (Chromium-style Cache/, GPUCache/, Cookies/, blob_storage/, etc.). The user-task workspace is a clearly labeled sibling subdir so the two concerns never collide. Historic anti-pattern: bridges fell back to the script's repo root via `Path(__file__).resolve().parent.parent`, which polluted `git status` and — when invoked from an app-bundled `src/` symlink — stranded owner DMs in a bundle-tasks/ dir while the watcher polled workspace-tasks/.
+The default deliberately avoids `~/Library/Application Support/sutando/` — that path is Sutando.app's territory (Chromium-style Cache/, GPUCache/, Cookies/, blob_storage/, etc.); the user-task workspace lives under its own hidden home-relative dir so the two concerns never collide. Historic anti-pattern: bridges fell back to the script's repo root via `Path(__file__).resolve().parent.parent`, which polluted `git status` and — when invoked from an app-bundled `src/` symlink — stranded owner DMs in a bundle-tasks/ dir while the watcher polled workspace-tasks/.
 
 **Use the helper, don't reinvent the fallback:**
 - Python: `from workspace_default import resolve_workspace` → returns a `Path`.
-- TypeScript: `process.env.SUTANDO_WORKSPACE || join(homedir(), 'Library', 'Application Support', 'sutando', 'workspace')`.
+- TypeScript: `process.env.SUTANDO_WORKSPACE || join(homedir(), '.sutando', 'workspace')`.
 
 ## Personal overrides
 
