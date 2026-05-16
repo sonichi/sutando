@@ -26,8 +26,8 @@ import discord
 # than the workspace. That divergence stranded owner DMs on 2026-05-14 — the
 # bridge wrote tasks to bundle-tasks/ while core agent watched workspace-tasks/.
 import os
-_workspace_env = os.environ.get("SUTANDO_WORKSPACE")
-REPO = Path(_workspace_env) if _workspace_env else Path(__file__).resolve().parent.parent
+_workspace_env = os.environ.get("SUTANDO_WORKSPACE", "").strip()
+REPO = Path(_workspace_env).expanduser() if _workspace_env else Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from util_paths import shared_personal_path  # noqa: E402
 
@@ -2899,6 +2899,23 @@ async def poll_dm_fallback():
                     _task_file = TASKS_DIR / f"{_task_id}.txt"
                     if _task_file.exists():
                         archive_file(_task_file, "tasks", _task_id)
+                    continue
+                # Honor result-body suppression markers (parity with the
+                # main reply path at line ~2660). Without this, results
+                # written specifically to suppress delivery (deduped /
+                # internally-handled / already-replied-elsewhere) get DM'd
+                # to the owner via this fallback when voice is offline.
+                try:
+                    _peek = f.read_text(encoding="utf-8", errors="replace").lstrip()
+                except OSError:
+                    _peek = ""
+                if _peek.startswith('[no-send]') or _peek.startswith('[REPLIED]') or _peek.startswith('[deduped:'):
+                    print(f"  [dm-fallback] skipped (suppression marker): {f.name}", flush=True)
+                    _task_id = f.stem
+                    _task_file = TASKS_DIR / f"{_task_id}.txt"
+                    if _task_file.exists():
+                        archive_file(_task_file, "tasks", _task_id)
+                    archive_file(f, "results", _task_id)
                     continue
                 # Subprocess out to the shared CLI tool so there's only one
                 # code path for the voiceConnected check + DM send.

@@ -25,6 +25,13 @@ except Exception:  # pragma: no cover — bridge must keep running
         return False
 
 REPO = Path(__file__).resolve().parent.parent
+# REPO resolution: prefer SUTANDO_WORKSPACE env var so the bridge writes to the
+# user's workspace tasks/results/state dirs, not the app-bundle's copy. Same
+# rationale as discord-bridge.py (PR #708) — when src/ is a symlink into a
+# packaged Sutando.app bundle, Path(__file__).resolve().parent.parent returns
+# the bundle root rather than the workspace.
+_workspace_env = os.environ.get("SUTANDO_WORKSPACE", "").strip()
+REPO = Path(_workspace_env).expanduser() if _workspace_env else Path(__file__).resolve().parent.parent
 TASKS_DIR = REPO / "tasks"
 RESULTS_DIR = REPO / "results"
 
