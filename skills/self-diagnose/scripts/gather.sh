@@ -37,6 +37,16 @@ TS="$(date +%s)"
 OUT="/tmp/sutando-diagnose-$TS"
 mkdir -p "$OUT"
 
+# Notes dir lives under $SUTANDO_WORKSPACE per the workspace contract (CLAUDE.md
+# "Workspace contract" section). Falls back to $REPO/notes if env unset, matching
+# the historic pre-workspace-contract behavior. Same precedence as
+# `src/workspace_default.py:resolve_workspace()` for Python callers.
+if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
+	NOTES_DIR="$SUTANDO_WORKSPACE/notes"
+else
+	NOTES_DIR="$REPO/notes"
+fi
+
 # Convert window to seconds for log filtering
 case "$WINDOW" in
 	*h) SECONDS_AGO=$((${WINDOW%h} * 3600)) ;;
@@ -83,7 +93,7 @@ fi
 # 3) Build log tail + pending questions + cold-review log (small files, copy whole)
 tail -150 "$REPO/build_log.md" > "$OUT/build_log-tail.md" 2>/dev/null || true
 cp "$REPO/pending-questions.md" "$OUT/pending-questions.md" 2>/dev/null || true
-cp "$REPO/notes/cold-review-log.md" "$OUT/cold-review-log.md" 2>/dev/null || true
+cp "$NOTES_DIR/cold-review-log.md" "$OUT/cold-review-log.md" 2>/dev/null || true
 
 # 4) Voice-agent log — filter to window, grep for signal lines, keep it bounded.
 # Signals: transport closes (1006/1011/1007/1008), errors, GoAway, setup complete, 1006/1011 numeric.
