@@ -52,6 +52,24 @@ The default deliberately avoids `~/Library/Application Support/sutando/` — tha
 - Python: `from workspace_default import resolve_workspace` → returns a `Path`.
 - TypeScript: `process.env.SUTANDO_WORKSPACE || join(homedir(), '.sutando', 'workspace')`.
 
+### Existing-repo installs MUST pin `SUTANDO_WORKSPACE`
+
+If your loop / cron / scripts run from `<repo>/` itself (the historic default before #762) and you do NOT explicitly set `SUTANDO_WORKSPACE`, you will hit a silent **path divergence**:
+
+- The bridge (and any caller of `resolve_workspace()`) writes new tasks to the canonical default `~/.sutando/workspace/tasks/`.
+- The proactive-loop session and any non-Python component polling `tasks/` via a relative path keep reading `<repo>/tasks/`.
+- Result: new tasks never reach the loop. Observed 2026-05-16 — 7 owner DMs orphaned over 19 minutes before the divergence was caught.
+
+**Fix for existing installs:** put one line in `.env` at the repo root:
+
+```bash
+SUTANDO_WORKSPACE=/full/path/to/your/repo
+```
+
+After setting, restart the discord/telegram bridges so they re-read the env. Everything then writes and reads from the same `<repo>/tasks/` and `<repo>/results/` — no symlinks needed.
+
+**Fresh installs** can skip this — the `~/.sutando/workspace/` default works because nothing else polls the repo path.
+
 ## Personal overrides
 
 If `PERSONAL_CLAUDE.md` exists in the workspace root, read and follow it. It contains user-specific rules, preferences, and configuration that override or extend these shared instructions.
