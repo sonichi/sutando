@@ -87,7 +87,20 @@ Inherits the full `inlineTools` + `ownerOnlyTools` set from `src/inline-tools.ts
 
 - `work` — delegate non-trivial tasks to core (writes `tasks/voice-task-{ts}.txt`, blocks on result).
 - `dismiss` — leave the current voice presence. Polymorphic via `DISCORD_VOICE_SERVER` env: SIGTERMs self in Discord mode, runs Zoom AppleScript otherwise.
-- `get_current_time`, `get_core_status`, `summon`, `join_zoom`, `join_gmeet`, `lookup_meeting_id`, `call_contact` — all standard.
+- `share_screen` / `stop_share_screen` — drive Discord's screen-share picker. **Has a hard dependency — see below.**
+- `summon` — skill-local override redirecting "share my screen" to `share_screen` (the core `summon` opens Zoom, wrong app when user is in Discord).
+- `get_current_time`, `get_core_status`, `join_zoom`, `join_gmeet`, `lookup_meeting_id`, `call_contact` — all standard.
+
+## Screen sharing — extra setup required
+
+`share_screen` / `stop_share_screen` are NOT free — they CGEvent-click the Discord webapp's "Share Your Screen" button and the Chrome native share-picker. That means:
+
+1. **You need a separate Chrome instance running with Discord logged in.** The tool targets the `chrome-devtools-mcp` Chrome profile specifically (at `~/.cache/chrome-devtools-mcp/chrome-profile`), so the share happens as whoever is logged into THAT Chrome — not the bot, not necessarily your main Discord. Recommended: create a secondary ("alt") Discord account and log into the MCP-Chrome as that, so your primary Discord (in regular Chrome / desktop app) stays uninterrupted. The alt and the bot both join the voice channel; the alt's screen is what gets shared.
+2. **That Chrome window must be open to the Discord voice channel detail view** (not a text channel, not minimized). The script clicks at a hardcoded screen coord that corresponds to the main-view "Share Your Screen" button.
+3. **Hardcoded coords assume a maximized Chrome window** (screenX=0, screenY=32 on macOS, 1920×972 outer). Move/resize the window and clicks miss. Re-derive coords via `macos-use refresh_traversal` on the MCP-Chrome main PID, then update `COORDS` in `scripts/share-screen-modal.py`.
+4. **macOS Accessibility permission** is required for the controlling process (Claude Code / Terminal) to post CGEvent clicks. Grant in System Settings → Privacy & Security → Accessibility.
+
+If you don't want screen-sharing, the rest of the skill (voice conversation, tool delegation) works without any of this — `share_screen` will fail silently with no impact on voice.
 
 ## Graceful shutdown
 
