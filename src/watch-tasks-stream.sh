@@ -21,18 +21,23 @@
 set -u
 
 # Resolve TASKS_DIR. Priority: explicit positional arg → $SUTANDO_WORKSPACE/tasks
-# → repo-relative fallback. The SUTANDO_WORKSPACE branch matches what every
-# bridge does (discord-bridge.py, telegram-bridge.py, dm-result.py — see
-# PRs #708/#720/#722/#723) — without it, the bridges write tasks to the
-# workspace but the watcher polls the repo's tasks/, so owner DMs land but
-# the agent never sees them. Diagnosed 2026-05-15 (~3 dropped DMs over
-# 17 min before the workaround restart).
+# → canonical default `~/.sutando/workspace/tasks` (matching
+# `workspace_default.resolve_workspace()` — the shared contract every bridge
+# already follows). The bridges (discord-bridge.py, telegram-bridge.py,
+# dm-result.py — see PRs #708/#720/#722/#723) write to that default when env
+# is unset; if this watcher fell back to `<repo>/tasks/` instead, the bridges
+# would write to one dir and the watcher would poll another, so owner DMs land
+# silently. Diagnosed 2026-05-15 (~3 dropped DMs over 17 min) and again
+# 2026-05-16 (~45 min silent gap when the Monitor was started without
+# SUTANDO_WORKSPACE exported into its env) — second incident motivated
+# replacing the legacy `<repo>/tasks` fallback with the workspace default so
+# the divergence can't happen even when callers forget to export.
 if [ -n "${1:-}" ]; then
   TASKS_DIR="$1"
 elif [ -n "${SUTANDO_WORKSPACE:-}" ]; then
   TASKS_DIR="$SUTANDO_WORKSPACE/tasks"
 else
-  TASKS_DIR="$(dirname "$0")/../tasks"
+  TASKS_DIR="$HOME/.sutando/workspace/tasks"
 fi
 mkdir -p "$TASKS_DIR"
 # Canonicalize watched dir for the parent-dir filter below. fswatch always
