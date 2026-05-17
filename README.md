@@ -1,6 +1,6 @@
 # Sutando
 
-[![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/uZHWXXmrCS) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Website](https://img.shields.io/badge/Web-sutando.ai-blue)](https://sutando.ai) [![GitHub Trending](https://img.shields.io/badge/GitHub_Trending-%231_Python_(May_16)-FFD700?logo=github&logoColor=white)](https://github.com/trending/developers/python?since=daily)
+[![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/uZHWXXmrCS) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Website](https://img.shields.io/badge/Web-sutando.ai-blue)](https://sutando.ai) [![GitHub Trending](https://img.shields.io/badge/GitHub_Trending-%231_Developer_(May_17)-FFD700?logo=github&logoColor=white)](https://github.com/trending/developers?since=daily)
 
 **My AI Stand — Realtime by Day, Rewriting Itself by Night.**
 **Summon my AI superpower.**
