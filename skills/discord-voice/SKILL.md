@@ -1,175 +1,84 @@
 ---
 name: discord-voice
-description: "Drop Sutando into a Discord voice channel — captures user audio, runs Gemini Live conversation, plays the AI reply back through the bot, with tool-call support."
+description: Sutando joins a Discord voice channel and runs a 2-way Gemini Live conversation. Standalone TS process — discord.js + @discordjs/voice + bodhi VoiceSession.
+when_to_use: When the user (in a DM or task) asks Sutando to "join voice", "join the lounge", or generally to be present in a Discord voice channel for live conversation.
 ---
 
 # Discord Voice
 
-Lucy (or any Sutando bot) joins a Discord voice channel and has a real multi-turn spoken conversation, powered by Gemini Live — same UX as `phone-conversation`, but on Discord instead of Twilio.
+Sutando joins a Discord voice channel and runs a real-time 2-way conversation via Gemini Live, reusing the same bodhi `VoiceSession` + tool wiring as `skills/phone-conversation/scripts/conversation-server.ts` (Twilio path).
 
 ## When to Use
 
-- "Hop into the #voice channel and chat"
-- "Join voice and walk me through this"
-- Co-presenting / pairing where you want spoken interaction over Discord rather than a phone call
+- User says "join voice", "join the lounge", "join `<voice channel name>`", or any equivalent.
+- A task arrives asking Sutando to be present in a Discord voice channel.
 
-## Option A (pure Python) — `discord-voice-server-py.py`
+NOT for: silent presence (no Gemini), text-only Discord channels (use `discord-bridge.py`), Zoom/Meet/phone (use the respective skills).
 
-Single-process Python server. No bodhi, no Node bridge.
+## Architecture
+
+One process, all in TypeScript:
+
+```
+Discord user voice
+    ↓
+@discordjs/voice receiver (opus packets per speaking user)
+    ↓ prism opus.Decoder → PCM s16le 48k stereo
+    ↓ downsample48StereoTo16Mono
+    ↓
+bodhi VoiceSession.handleAudioFromClient (PCM 16k mono)
+    ↓
+Gemini Live
+    ↓ base64 PCM 24k mono
+    ↓ upsample24MonoTo48Stereo
+    ↓
+@discordjs/voice AudioPlayer → opus-encoded out to voice connection
+    ↓
+Discord channel audio out
+```
+
+`@discordjs/voice` handles Discord's DAVE (E2EE) via `DAVESession` first-party — no extra config.
+
+## Setup
+
+1. **Register a Discord bot account** at the [Discord developer portal](https://discord.com/developers/applications). Give it the `bot` scope with `applications.commands` + the voice perms (`Connect`, `Speak`, `Use Voice Activity`).
+2. **Add the bot token** to `~/.claude/channels/discord/.env`:
+   ```
+   DISCORD_BOT_TOKEN=...
+   ```
+3. **Invite the bot** to your Discord server with voice channel access.
+4. **Set `GEMINI_API_KEY`** in `.env` at the repo root.
+
+## Run
 
 ```bash
-python3 skills/discord-voice/scripts/discord-voice-server-py.py \
-  --guild   1485653766404444352 \
-  --channel <voice_channel_id>
+DISCORD_VOICE_SERVER=1 \
+  npx tsx skills/discord-voice/scripts/discord-voice-server.ts \
+  --guild <GUILD_ID> \
+  --channel <VOICE_CHANNEL_ID>
 ```
 
-Env requirements (loaded from `.env` and `~/.claude/channels/discord/.env`):
-- `GEMINI_API_KEY` (or `GEMINI_VOICE_API_KEY`)
-- `DISCORD_BOT_TOKEN`
-- `OPUS_PATH` (default `/opt/homebrew/lib/libopus.dylib`)
+Optional env:
+- `VOICE_MODEL` / `VOICE_NATIVE_AUDIO_MODEL` — mirrors `voice-agent.ts`.
+- `SUTANDO_WORKSPACE` — workspace root for tasks/results/data/logs.
+- `DISCORD_VOICE_OWNER` — `true` (default) gates the `work` tool to the channel owner.
 
-Optional overrides:
-- `VOICE_NATIVE_AUDIO_MODEL` — Gemini Live model (default `gemini-2.5-flash-native-audio-preview-09-2025`)
-- `GEMINI_VOICE_NAME` — voice profile (default `Aoede`)
+`DISCORD_VOICE_SERVER=1` flips the polymorphic `dismiss` tool (`src/meeting-tools.ts`) into "SIGTERM self" mode instead of its default Zoom AppleScript path. Without it, asking Sutando to "leave"/"dismiss" in the channel would try to leave a (non-existent) Zoom meeting.
 
-Python dependencies (install once via `pip3 install --break-system-packages`):
-- `discord.py >= 2.7`
-- `discord-ext-voice-recv`
-- `google-genai`
-- `python-dotenv`
-- `PyNaCl`
-- libopus + ffmpeg on the host
+## DM-triggered join
 
-### Architecture
+Anyone running a Sutando proactive loop can DM their bot "join the lounge voice channel in `<server>`" — the loop spawns the run command above as a subprocess. No separate launcher needed; the task-bridge → proactive-loop → Bash pipeline already handles it.
 
-```
-                          ┌─────────────────────────┐
-   Discord voice gateway  │ discord-ext-voice-recv  │
-   (Opus, 48k stereo) ───▶│  BasicSink(decode=True) │
-                          └────────────┬────────────┘
-                                       ▼
-                          ┌─────────────────────────┐
-                          │ discord_pcm_to_         │
-                          │ gemini_input            │  (audioop: stereo→mono, 48k→16k)
-                          └────────────┬────────────┘
-                                       ▼
-                          ┌─────────────────────────┐
-                          │ asyncio.Queue           │
-                          │ session.inbound_q       │
-                          └────────────┬────────────┘
-                                       ▼
-                          ┌─────────────────────────┐
-                          │ Gemini Live             │
-                          │ send_realtime_input     │
-                          └────────────┬────────────┘
-                                       ▼
-                          ┌─────────────────────────┐
-                          │ Gemini Live receive()   │  (audio 24k mono, tool_calls)
-                          └────┬────────────────┬───┘
-                               │                │
-                               ▼                ▼
-                  ┌────────────────────┐  ┌────────────────────┐
-                  │ tool dispatch:     │  │ gemini_output_to_  │  (audioop: 24k→48k, mono→stereo)
-                  │ get_time, hang_up  │  │ discord_pcm        │
-                  └────────────────────┘  └─────────┬──────────┘
-                                                    ▼
-                                       ┌────────────────────────┐
-                                       │ asyncio.Queue           │
-                                       │ session.outbound_q      │
-                                       └────────────┬───────────┘
-                                                    ▼
-                                       ┌────────────────────────┐
-                                       │ GeminiAudioSource.read │  (20ms / 3840 B frames)
-                                       └────────────┬───────────┘
-                                                    ▼
-                                          Discord voice gateway
-```
+## Tools
 
-### Conversation log
+Inherits the full `inlineTools` + `ownerOnlyTools` set from `src/inline-tools.ts` (same surface as `voice-agent.ts` and `conversation-server.ts`). Notable Discord-relevant tools:
 
-JSONL log per session: `<workspace>/data/discord-voice-<timestamp>.jsonl`. One line per event (`session_start`, `user_text`, `assistant_text`, `tool_call`, `tool_result`, `session_end`).
+- `work` — delegate non-trivial tasks to core (writes `tasks/voice-task-{ts}.txt`, blocks on result).
+- `dismiss` — leave the current voice presence. Polymorphic via `DISCORD_VOICE_SERVER` env: SIGTERMs self in Discord mode, runs Zoom AppleScript otherwise.
+- `get_current_time`, `get_core_status`, `summon`, `join_zoom`, `join_gmeet`, `lookup_meeting_id`, `call_contact` — all standard.
 
-### Tools
+## Graceful shutdown
 
-Minimal tool surface to prove the round-trip end-to-end:
+`SIGTERM`/`SIGINT` triggers `cleanupSession()` which calls `connection.destroy()` (sends Discord voice-gateway disconnect frame) and `voiceSession.close()`. The handler then waits 1.5s before `process.exit(0)` so the disconnect frame actually flushes — without that delay, Discord pins the bot in-channel until its own 60-90s heartbeat timeout.
 
-| name      | what it does                                                  |
-|-----------|---------------------------------------------------------------|
-| `get_time`| Runs `date` on the host and returns the result for narration. |
-| `hang_up` | Disconnects from the voice channel after a clear goodbye.     |
-
-Wider tool wiring (the dozens of inline / browser / vision tools) stays in `src/inline-tools.ts` / `voice-agent.ts`. This server is intentionally narrow so the audio path is the part you trust on day one.
-
-### Graceful shutdown
-
-`SIGTERM` / `SIGINT` triggers an ordered shutdown: stop the Gemini bridge, drain the audio source, disconnect the voice client, close the discord.py client, write `session_end`.
-
-## Option B (Python bridge + TS bodhi sidecar)
-
-Two-process design that reuses bodhi `VoiceSession` end-to-end. Same tool wiring
-(`work`, `inlineTools`, `ownerOnlyTools`, `coreDocumentedSkills`, vision attach)
-as `skills/phone-conversation/scripts/conversation-server.ts` — without
-re-implementing it in Python.
-
-### Process 1 — TS sidecar (`scripts/discord-voice-server.ts`)
-
-Owns the bodhi `VoiceSession` + Gemini Live transport. Mirrors the
-conversation-server structure: same env config, same agent prompt scaffolding,
-same `work` / inline / owner-only / configurable tool layering, same
-`get_task_status`, same conversation-log + per-session metrics pattern
-(`data/discord-voice-{ts}.jsonl`, `data/discord-voice-metrics.jsonl`), same
-auto-reconnect on Gemini transport close, lazy vision attach.
-
-Skipped (Twilio-only): mu-law conversion, ngrok, STIR/SHAKEN, DTMF, IVR,
-concurrent-call, meeting approval. Discord voice is a clean PCM pipe.
-
-```bash
-npx tsx skills/discord-voice/scripts/discord-voice-server.ts
-# env: DISCORD_VOICE_PORT (default 3200), GEMINI_API_KEY, VOICE_MODEL,
-#      VOICE_NATIVE_AUDIO_MODEL, SUTANDO_WORKSPACE,
-#      DISCORD_VOICE_OWNER (default true — gates the work tool)
-```
-
-Health check: `curl http://localhost:3200/health`.
-
-### Process 2 — Python bridge (`scripts/discord-voice-bridge.py`)
-
-Joins a Discord voice channel via `discord.py` + `discord-ext-voice-recv`,
-captures decoded PCM (48 kHz stereo), downmixes + downsamples to 16 kHz mono,
-forwards to the sidecar over WebSocket. Receives Gemini PCM (24 kHz mono),
-upsamples to 48 kHz stereo, plays back via `discord.AudioSource`. Reconnects
-to the sidecar on disconnect with exponential backoff.
-
-```bash
-python3 skills/discord-voice/scripts/discord-voice-bridge.py \
-    --guild <GUILD_ID> \
-    --channel <VOICE_CHANNEL_ID> \
-    [--sidecar ws://localhost:3200/voice]
-# env: DISCORD_BOT_TOKEN, DISCORD_VOICE_SIDECAR
-```
-
-Kept separate from any "silent-presence-only" bot script — Option B is for
-full Gemini conversation mode.
-
-### Option B — WebSocket protocol
-
-JSON text frames over `ws://localhost:3200/voice`. Single-tenant: a new
-`hello` closes the previous session.
-
-| Direction | Message |
-| --- | --- |
-| Bridge → Server | `{"type":"hello","guild":"...","channel":"..."}` |
-| Bridge → Server | `{"type":"audio","pcm":"<base64 PCM s16le 16 kHz mono>"}` |
-| Bridge → Server | `{"type":"bye"}` |
-| Server → Bridge | `{"type":"ready","sessionId":"..."}` |
-| Server → Bridge | `{"type":"audio","pcm":"<base64 PCM s16le 24 kHz mono>"}` |
-| Server → Bridge | `{"type":"transcript","role":"user|assistant","text":"..."}` |
-
-### Option A vs Option B — when to pick which
-
-- **Option A** is self-contained (single Python process, narrow tool surface).
-  Use for quick demos and audio-pipeline experiments.
-- **Option B** reuses the phone-agent's full tool wiring. Use when you want
-  the bot to actually *do things* (work-delegation, screen control, vision,
-  meeting join, etc.) from the Discord voice channel.
-
+Metrics + transcripts land in `$SUTANDO_WORKSPACE/data/discord-voice-{sessionId}.jsonl` and `discord-voice-metrics.jsonl`.
