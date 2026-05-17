@@ -30,16 +30,29 @@ export interface ScreenCompanionConfig {
 	goal_template?: string;
 }
 
+// LaunchAgent's PATH (`/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`) finds
+// Homebrew's python3 first, which has no PyYAML — `import yaml` fails at
+// runtime when activation is triggered from voice. Try a list of common
+// python3 binaries and pick the first one that can import yaml. macOS's
+// `/usr/bin/python3` ships PyYAML by default, so the system Python is the
+// usual winner here.
+const PYTHON_CANDIDATES = ['/usr/bin/python3', '/opt/homebrew/bin/python3', 'python3'];
+const YAML_SCRIPT = 'import sys, json, yaml; print(json.dumps(yaml.safe_load(open(sys.argv[1]))))';
+
 export function parseYaml(path: string): unknown {
-	const result = spawnSync(
-		'python3',
-		['-c', 'import sys, json, yaml; print(json.dumps(yaml.safe_load(open(sys.argv[1]))))', path],
-		{ encoding: 'utf-8' },
-	);
-	if (result.status !== 0) {
-		throw new Error(`YAML parse failed for ${path}: ${result.stderr}`);
+	const errors: string[] = [];
+	for (const py of PYTHON_CANDIDATES) {
+		const result = spawnSync(py, ['-c', YAML_SCRIPT, path], { encoding: 'utf-8' });
+		if (result.error) {
+			errors.push(`${py}: ${result.error.message}`);
+			continue;
+		}
+		if (result.status === 0) return JSON.parse(result.stdout);
+		errors.push(`${py}: ${result.stderr.trim().split('\n').pop()}`);
 	}
-	return JSON.parse(result.stdout);
+	throw new Error(
+		`YAML parse failed for ${path}: no python3 with PyYAML found. Tried: ${errors.join('; ')}`,
+	);
 }
 
 export function validateConfig(raw: unknown, path: string): ScreenCompanionConfig {
