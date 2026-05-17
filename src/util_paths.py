@@ -19,6 +19,20 @@ from pathlib import Path
 REPO_DIR = Path(__file__).resolve().parent.parent
 
 
+def _workspace_root() -> Path:
+    """Workspace root for runtime-state paths. Honors SUTANDO_WORKSPACE.
+
+    Falls back to REPO_DIR for back-compat with installs that don't pin the
+    env var. The two-variable distinction (REPO_DIR = source tree;
+    workspace = runtime state) matches PR #775's split for agent-api.py +
+    github-webhook.py + task-bridge.ts.
+    """
+    env = os.environ.get("SUTANDO_WORKSPACE")
+    if env:
+        return Path(os.path.expanduser(env))
+    return REPO_DIR
+
+
 def _private_machine_dir() -> Path | None:
     root = os.environ.get("SUTANDO_PRIVATE_DIR")
     if not root:
@@ -39,7 +53,7 @@ def personal_path(filename: str, workspace: Path | None = None) -> Path:
     Returns the FIRST existing path. If none exist, returns the preferred
     private-dir path so the caller's `.exists()` check fails gracefully.
     """
-    ws = workspace if workspace is not None else REPO_DIR
+    ws = workspace if workspace is not None else _workspace_root()
 
     private = _private_machine_dir()
     if private is not None:
@@ -78,7 +92,7 @@ def shared_personal_path(filename: str, workspace: Path | None = None) -> Path:
     Returns the FIRST existing path. If none exist, returns the preferred
     private path so the caller's `.exists()` check fails gracefully.
     """
-    ws = workspace if workspace is not None else REPO_DIR
+    ws = workspace if workspace is not None else _workspace_root()
 
     root = os.environ.get("SUTANDO_PRIVATE_DIR")
     if root:
