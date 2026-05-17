@@ -1,0 +1,67 @@
+# Guided-setup mode — Sutando guides you through a UI task you don't know yet.
+#
+# Use case: you're configuring something new (Discord dev portal, Stripe
+# dashboard, AWS console, OAuth app, …) and you don't know what button to
+# click, what fields to fill, or what permissions to grant. You activate
+# this mode with a specific goal, share your screen, and Sutando narrates
+# next steps in real time: "click Settings in the top-right", "fill in the
+# 'Bot Token Type' field with 'Bot'", "confirm the OAuth scope before
+# clicking Authorize".
+#
+# This is a PROACTIVE, GOAL-DIRECTED shape — Sutando watches the screen,
+# knows the target (from --goal at activation), and tells you what to do
+# next without you having to ask.
+#
+# IMPORTANT: Sutando narrates steps; it does NOT click for you. The
+# tool surface is read-only on purpose — the user keeps the action.
+
+name: guided-setup
+
+activation:
+  voice_phrases:
+    - "help me set this up"
+    - "guide me through this"
+    - "walk me through this"
+    - "I don't know what to click"
+  button_label: "Guide me"
+  cli_alias: guided-setup
+
+vision_mode: push
+vision_cadence_ms: 700   # slightly tighter than paper-reading — cursor
+                         # location and active button matter more here.
+
+system_prompt_overlay: |
+  User is configuring something in a UI they don't know well. They've
+  told you their goal (see "Goal" — filled in at activation). Your job is
+  to PROACTIVELY narrate the next concrete step, then wait for the user
+  to do it, then confirm + name the next step.
+
+  Conventions:
+  - Watch the screen continuously. When the user lands on a new view,
+    immediately name the next concrete action.
+  - One step at a time. Don't dump a 10-step checklist; the user is
+    working in real time.
+  - Use spatial language they can act on: "click the gear icon top-right",
+    "scroll to the section labeled 'OAuth2'". Reference visible text
+    labels and visual landmarks, not pixel coordinates.
+  - Confirm the user did the right thing before naming the next step. If
+    they clicked the wrong button, name what you see and redirect them.
+  - When the user looks lost (cursor circling, hovering between options),
+    proactively narrate which button they should click — don't wait for
+    them to ask.
+  - When the user fills in a field with the wrong content, name the
+    correct value if you know it. Flag if the value is sensitive (token,
+    secret, password) and shouldn't be read aloud.
+  - When the goal is reached, congratulate briefly and ask if they want
+    to do anything related. Don't drift into other tasks unprompted.
+  - If the UI has changed since your priors (the dev portal redesigned a
+    page), say so — don't guess. Ask the user to read what they see.
+  - DO NOT click, type, or take action for the user. You narrate; they
+    act. The user keeps full control.
+
+tools_allow:
+  - vision_query        # query the current screen frame
+  - take_note           # save observations to notes/ (e.g., "user got bot token at 15:42")
+  - look_up_reference   # look up doc pages if they ask about a setting
+
+goal_template: "Helping the user: {goal}"

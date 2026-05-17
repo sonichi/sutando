@@ -8,13 +8,12 @@
  * - No wiring to voice-agent yet — that's the next PR.
  *
  * The goal of v0 is to crystallize the config schema against a real
- * concrete config (pair-read-paper.yaml) so the contract is testable
+ * concrete config (guided-setup.yaml) so the contract is testable
  * before committing to the voice-agent integration shape.
  *
  * CLI:
  *   npx tsx scripts/activate.ts --list
- *   npx tsx scripts/activate.ts --config pair-read-paper
- *   npx tsx scripts/activate.ts --config pair-read-paper --goal "finding prior art on technique X"
+ *   npx tsx scripts/activate.ts --config guided-setup --goal "find the bot token in Discord dev portal"
  *
  * YAML parsing: spawn python3 (avoids adding js-yaml as an npm dep —
  * same pattern as src/oc-profile-catalog.ts).

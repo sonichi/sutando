@@ -37,10 +37,18 @@ The skill itself is small — most of the value lives in the configs. New use ca
 
 ## Configs ship with v0
 
-| Config | Activation | Vision mode |
-|---|---|---|
-| `pair-read-paper` | `--config pair-read-paper` or *"read this with me"* | push, 1000ms |
-| (more to come — `pair-debug`, `pair-review-code`) | | |
+| Config | Activation | Vision mode | Shape |
+|---|---|---|---|
+| `guided-setup` | `--config guided-setup --goal "..."` or *"guide me through this"* | push, 700ms | **proactive + goal-directed** (Sutando narrates next steps for a configuration task) |
+
+**v0 demo angle:** "Sutando helps you set up something you've never done before" (e.g., a Discord dev portal bot config). User shares screen, names the goal at activation, Sutando narrates the next concrete step in real time. More visceral demo than paper-reading; matches a near-universal user pain (everybody fights some dev portal once a quarter).
+
+### Coming in follow-up PRs (sketched in `screen_companion.md` at repo root)
+
+- `pair-debug` — reactive + exploratory mode for stack-trace + IDE pair-debug.
+- `pair-review-code` — reactive + exploratory mode for GitHub PR diff walk-through.
+
+These don't ship in this PR — the schema gets validated against `guided-setup` first; siblings land once the integration shape is locked in.
 
 ## Adding a new use case
 
@@ -68,7 +76,7 @@ After adding, run `bash scripts/activate.ts --list` to confirm the loader picks 
 ## Run (v0 skeleton — load + print only)
 
 ```bash
-npx tsx skills/screen-companion/scripts/activate.ts --config pair-read-paper
+npx tsx skills/screen-companion/scripts/activate.ts --config guided-setup --goal "find the bot token in the Discord developer portal"
 ```
 
 This v0 ships the **loader + printer**: it reads the config and prints what *would* happen (mode prompt, tools allowed, vision cadence). No wiring to the voice agent yet. Followups: real wiring as a separate PR.
@@ -80,3 +88,20 @@ See `screen_companion.md` at the repo root. Owner is iterating on the model (M1 
 ## Trust + scope
 
 Configs are non-executable YAML — they only declare the interaction shape. No path to arbitrary code execution from a config alone. The tool allow-list is enforced at activation time; configs cannot grant tools the active VoiceSession doesn't already expose.
+
+## Privacy + data handling
+
+**By default, this skill DOES NOT take screenshots, record video, or persist frames to disk.** Frames are sent to Gemini Live for real-time understanding (the API call itself), and discarded — nothing lands on the local filesystem.
+
+What IS persisted by default:
+- **Text transcript** of the spoken conversation, in `<workspace>/data/screen-companion-<sessionId>.jsonl`. Same convention as `phone-conversation/conversation-server.ts` + `discord-voice/discord-voice-server.ts`.
+- **Notes the user explicitly asks Sutando to take** via the `take_note` tool, in `<workspace>/notes/`.
+
+What is NOT persisted by default:
+- Vision frames (the screenshots themselves) — sent to Gemini Live and discarded.
+- Audio recordings — same.
+- Video recordings of the session — never.
+
+If the user explicitly asks ("save this screenshot", "record this session"), Sutando will explain what gets saved and where, then either do it or ask for confirmation depending on the action's reversibility. Saving is opt-in per request, not per session.
+
+The transmission boundary: frames cross the wire to Google's Gemini Live API (that's where the understanding happens). Per `phone-conversation/SKILL.md` precedent, that's documented as the trust boundary — anyone who's comfortable with screen-sharing to a Gemini-Live-backed voice agent is the audience for this skill. If you wouldn't share the screen to a colleague's video call, don't share it here.
