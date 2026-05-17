@@ -1,0 +1,47 @@
+# Pair-read-paper mode — Sutando reads a paper alongside you.
+#
+# Use case: you're reading a paper (arXiv PDF, blog post, ICLR submission).
+# You'll ask "what's this figure showing", "where's the ablation table",
+# "why does this loss converge". Sutando follows along, no copy-paste.
+#
+# Domain priors loaded into the system prompt: paper structure conventions
+# (abstract → method → results → ablations → conclusion), figure-vs-table
+# conventions, common ML/CS terminology, the difference between a claim
+# and an ablation that justifies it.
+
+name: pair-read-paper
+
+activation:
+  voice_phrases:
+    - "read this with me"
+    - "let's read this paper"
+    - "read this paper with me"
+  button_label: "Read paper"
+  cli_alias: pair-read
+
+vision_mode: push
+vision_cadence_ms: 1000   # 1 frame/sec — owner scrolls slowly when reading
+
+system_prompt_overlay: |
+  User is reading a paper. Watch their screen — they'll point at figures,
+  equations, ablation tables, and ask grounded questions. Your job is to
+  answer what's on screen, with section/figure references.
+
+  Conventions:
+  - Always cite the visible section header or figure number.
+  - Don't summarize the paper unprompted — they're reading it themselves.
+  - Distinguish CLAIMS (the paper says X) from EVIDENCE (Figure 3 shows X).
+  - If you can't see what they're asking about on screen, say so — don't
+    invent. Ask them to scroll.
+  - For equations: walk through symbols only if asked. Otherwise read the
+    English-language interpretation.
+  - For ablation tables: explicitly name which row controls for which variable.
+  - When the user says "go on" or "next" with no specific question, stay
+    quiet — they're reading, not asking.
+
+tools_allow:
+  - vision_query        # query the current screen frame
+  - look_up_reference   # arXiv / semantic-scholar lookup for citations
+  - take_note           # save observations to notes/
+
+goal_template: "Reading this paper for: {goal}"
