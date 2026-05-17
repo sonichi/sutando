@@ -17,20 +17,35 @@ Usage:
 """
 
 import json
+import os
 import re
+import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
 
-# Default metrics path — override with --metrics <path>
+# Default metrics source order:
+#   1. --metrics <path>           — explicit jsonl override (back-compat)
+#   2. data/conversation.sqlite   — primary as of #603 (sessions table)
+#   3. data/call-metrics.jsonl    — frozen archive fallback
 _cwd_path = Path.cwd() / "data" / "call-metrics.jsonl"
 _script_path = Path(__file__).resolve().parents[3] / "data" / "call-metrics.jsonl"
 METRICS_PATH = _cwd_path if _cwd_path.exists() else _script_path
 
-# Parse --metrics flag early so load_calls uses the right file
+_repo_root = Path(__file__).resolve().parents[3]
+SQLITE_PATH = Path(os.environ.get("SUTANDO_CONVERSATION_DB", _repo_root / "data" / "conversation.sqlite"))
+
+# Parse early flags so load_calls picks the right source
+SOURCE_FILTER = "phone"   # 'voice' | 'phone' | 'all' — selectable via --source
+FORCE_JSONL = False       # set by --metrics
 for _i, _arg in enumerate(sys.argv):
     if _arg == "--metrics" and _i + 1 < len(sys.argv):
         METRICS_PATH = Path(sys.argv[_i + 1])
+        FORCE_JSONL = True
+        break
+for _i, _arg in enumerate(sys.argv):
+    if _arg == "--source" and _i + 1 < len(sys.argv):
+        SOURCE_FILTER = sys.argv[_i + 1]
         break
 
 INLINE_KEYWORDS = r"\b(record|recording|screen.?record|scroll.?and.?describe|play.?recording|screenshot|describe.?screen)\b"
@@ -43,7 +58,67 @@ HALLUCINATION_PHRASES = [
 ]
 
 
+def _load_from_sqlite(call_sid=None, last_n=1):
+    """Query sessions table from conversation.sqlite. Returns dicts matching
+    the legacy jsonl shape (callSid/sessionId/timestamp/events/toolCalls)."""
+    if not SQLITE_PATH.exists():
+        return None
+    try:
+        db = sqlite3.connect(str(SQLITE_PATH))
+        db.row_factory = sqlite3.Row
+        sql = (
+            "SELECT ts_unix, source, session_id, call_sid, caller, is_owner, is_meeting, "
+            "duration_ms, transcript_lines, tool_count, pending_tasks, tool_calls, events "
+            "FROM sessions "
+        )
+        params = []
+        wh = []
+        if SOURCE_FILTER != "all":
+            wh.append("source = ?")
+            params.append(SOURCE_FILTER)
+        if call_sid:
+            wh.append("(call_sid = ? OR session_id = ?)")
+            params.append(call_sid); params.append(call_sid)
+        if wh:
+            sql += "WHERE " + " AND ".join(wh) + " "
+        sql += "ORDER BY ts_unix ASC"
+        if not call_sid and last_n:
+            sql = "SELECT * FROM (" + sql + f") ORDER BY ts_unix DESC LIMIT {int(last_n)}"
+        rows = db.execute(sql, params).fetchall()
+        db.close()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["timestamp"] = datetime.fromtimestamp(d.pop("ts_unix")).isoformat() + "Z"
+            d["durationMs"] = d.pop("duration_ms")
+            d["transcriptLines"] = d.pop("transcript_lines")
+            d["toolCount"] = d.pop("tool_count")
+            d["pendingTasks"] = d.pop("pending_tasks")
+            d["callSid"] = d.pop("call_sid") or d.get("session_id") or "unknown"
+            d["sessionId"] = d.pop("session_id") or d["callSid"]
+            d["isOwner"] = bool(d.pop("is_owner")) if d.get("is_owner") is not None else None
+            d["isMeeting"] = bool(d.pop("is_meeting")) if d.get("is_meeting") is not None else None
+            d["toolCalls"] = json.loads(d.pop("tool_calls")) if d.get("tool_calls") else []
+            d["events"] = json.loads(d.pop("events")) if d.get("events") else []
+            out.append(d)
+        out.sort(key=lambda c: c.get("timestamp", ""))
+        if call_sid:
+            return out
+        return out[-last_n:] if last_n else out
+    except Exception as e:
+        print(f"  sqlite load failed: {e}", file=sys.stderr)
+        return None
+
+
 def load_calls(call_sid=None, last_n=1):
+    # Primary path: sqlite (#603), unless --metrics forced a jsonl file
+    if not FORCE_JSONL:
+        sqlite_rows = _load_from_sqlite(call_sid=call_sid, last_n=last_n)
+        if sqlite_rows is not None and sqlite_rows:
+            return sqlite_rows
+        # Empty sqlite result is fine — fall through only if file doesn't exist
+        if sqlite_rows is not None:
+            return []
     if not METRICS_PATH.exists():
         print(f"No metrics file: {METRICS_PATH}")
         return []
@@ -745,10 +820,12 @@ if __name__ == "__main__":
 
     if "--tracker" in sys.argv:
         calls = load_calls(last_n=999)
-        source = "phone"  # voice-metrics.jsonl writes removed in #603; sqlite now
+        # Source selection now from SOURCE_FILTER (--source voice|phone|all),
+        # which sqlite path honors in WHERE clause. Default phone.
+        source = SOURCE_FILTER if SOURCE_FILTER in ("voice", "phone") else "phone"
         out_path = f"/tmp/{source}-diagnostics-tracker.html"
         out = generate_tracker_html(calls, out_path, source_type=source)
         content = Path(out).read_text()
-        title = "Phone Call Diagnostics Tracker"
+        title = "Voice Agent Diagnostics Tracker" if source == "voice" else "Phone Call Diagnostics Tracker"
         Path(out).write_text(content.replace("TRACKER_TITLE_PLACEHOLDER", title))
         print(f"\nTracker: {out}")

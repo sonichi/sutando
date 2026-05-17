@@ -1191,7 +1191,7 @@ async function main() {
 		for (const item of items.slice(lastLoggedIndex)) {
 			if (item.role === 'user' || item.role === 'assistant') {
 				console.log(`${ts()}   [${item.role}] ${item.content}`);
-				logConversation(item.role, item.content);
+				logConversation(item.role, item.content, SESSION_ID);
 				const evtRole = item.role === 'user' ? 'user' : 'sutando';
 				// 7s offset for user speech: Gemini STT commits transcript ~7s after
 				// the user actually spoke (measured via iPad recording comparison).
