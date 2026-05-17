@@ -26,7 +26,13 @@ import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
+# Workspace resolver — see src/workspace_default.py. SUTANDO_WORKSPACE env
+# (if set) wins; otherwise falls back to ~/.sutando/workspace/. Keeps task
+# writes aligned with the watcher and other workspace-aware bridges.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from workspace_default import resolve_workspace  # noqa: E402
+
+REPO = resolve_workspace()
 TASKS_DIR = REPO / "tasks"
 PORT = int(sys.argv[sys.argv.index("--port") + 1]) if "--port" in sys.argv else 7847
 

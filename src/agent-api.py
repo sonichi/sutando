@@ -82,14 +82,19 @@ def validate_twilio_signature(handler, body: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
-REPO_DIR = Path(__file__).parent.parent
+# Workspace resolver — see src/workspace_default.py. SUTANDO_WORKSPACE env
+# (if set) wins; otherwise falls back to ~/.sutando/workspace/. Keeps task/
+# result writes aligned with the watcher and other workspace-aware bridges.
+sys.path.insert(0, str(Path(__file__).parent))
+from workspace_default import resolve_workspace  # noqa: E402
+
+REPO_DIR = resolve_workspace()
 TASK_DIR = REPO_DIR / "tasks"
 PORT = 7843
 
 # Personal-asset path resolver — see src/util_paths.py. Imported here so the
 # /avatar and /stand-identity endpoints prefer the per-machine private dir
 # over the public workspace.
-sys.path.insert(0, str(Path(__file__).parent))
 from util_paths import personal_path  # noqa: E402
 
 # Simple token auth — set SUTANDO_API_TOKEN in .env for remote access security

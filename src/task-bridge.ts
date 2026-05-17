@@ -13,7 +13,7 @@ import { join } from 'node:path';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 
-const REPO_DIR = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
+const REPO_DIR = process.env.SUTANDO_WORKSPACE || new URL('..', import.meta.url).pathname.replace(/\/$/, '');
 const TASK_DIR = join(REPO_DIR, 'tasks');
 const RESULT_DIR = join(REPO_DIR, 'results');
 const STATE_DIR = join(REPO_DIR, 'state');
