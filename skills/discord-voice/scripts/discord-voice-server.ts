@@ -362,9 +362,11 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 		tools.push({
 			name: 'share_screen',
 			description:
-				'Share your screen in the current Discord voice channel (Entire Screen mode). ' +
-				'Use when user says "share screen", "share my screen", "show my screen", "屏幕共享", "分享屏幕". ' +
-				'Picker handled automatically by the proactive loop. To stop, dismiss the voice session or click Stop Streaming in Discord.',
+				'STRONG MATCH for any "share screen" / "share my screen" / "screen share" / "show my screen" / "屏幕共享" / "分享屏幕" / "把屏幕分享" utterance — in a Discord voice channel this is ALWAYS this tool. ' +
+				'Shares the owner\'s screen (Entire Screen mode, picker handled automatically by the proactive loop). ' +
+				'Call again to re-share even if already shared (user wants a fresh share). ' +
+				'DO NOT route share-screen utterances to switch_tab — switch_tab is for navigating between EXISTING Chrome tabs by tab-name keyword, not for screen-share workflows. ' +
+				'To stop, dismiss the voice session or the user clicks Stop Streaming in Discord.',
 			parameters: z.object({}),
 			execution: 'inline',
 			pendingMessage: 'Setting up screen share — picker handled by the proactive loop.',
