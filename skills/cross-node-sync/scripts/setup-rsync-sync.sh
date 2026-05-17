@@ -72,8 +72,15 @@ PEER="${SUTANDO_SYNC_PEER:-}"
 # /Users/xliu/Documents/xqq/.../sutando-agent-sonichi-test2/sutando).
 # Override with SUTANDO_MEM_LOCAL_DIR if the convention changes.
 MEM_LOCAL="${SUTANDO_MEM_LOCAL_DIR:-$HOME/.claude/projects/$(echo "$REPO_ROOT" | tr '/' '-')/memory/}"
-NOTES_LOCAL="$REPO_ROOT/notes/"
-DATA_LOCAL="$REPO_ROOT/data/"
+# Notes + data live under $SUTANDO_WORKSPACE per the workspace contract (CLAUDE.md
+# "Workspace contract"); fall back to $REPO_ROOT for pre-contract installs.
+if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
+	NOTES_LOCAL="$SUTANDO_WORKSPACE/notes/"
+	DATA_LOCAL="$SUTANDO_WORKSPACE/data/"
+else
+	NOTES_LOCAL="$REPO_ROOT/notes/"
+	DATA_LOCAL="$REPO_ROOT/data/"
+fi
 ASSETS_LOCAL="$REPO_ROOT/assets/"
 
 # Peer-side paths — default to the same literal paths as local so users only
