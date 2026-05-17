@@ -175,7 +175,14 @@ if [ -f "$SYNC_HEAD" ]; then
     if [ "$age_h" -lt 6 ]; then
         pass "memory-sync" "last sync ${age_h}h ago"
     elif [ "$age_h" -lt 48 ]; then
-        warn "memory-sync" "last sync ${age_h}h ago — run 'bash ~/.sutando-memory-sync/scripts/sync-memory.sh'"
+        # Show whichever sync-script path exists locally (new default is
+        # ~/.sutando/memory-sync/; legacy ~/.sutando-memory-sync/ still
+        # works until the next sync-memory.sh run auto-migrates).
+        if [ -d "$HOME/.sutando/memory-sync" ]; then
+            warn "memory-sync" "last sync ${age_h}h ago — run 'bash ~/.sutando/memory-sync/scripts/sync-memory.sh'"
+        else
+            warn "memory-sync" "last sync ${age_h}h ago — run 'bash ~/.sutando-memory-sync/scripts/sync-memory.sh'"
+        fi
     else
         fail "memory-sync" "last sync ${age_h}h ago — stale, sync before talk"
     fi

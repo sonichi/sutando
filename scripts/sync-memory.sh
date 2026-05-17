@@ -18,15 +18,17 @@
 # Env vars (all optional except SUTANDO_MEMORY_REPO):
 #   SUTANDO_MEMORY_REPO     — git URL of your private memory repo (REQUIRED)
 #   SUTANDO_WORKSPACE       — public sutando checkout. Default: ~/Desktop/sutando
-#   SUTANDO_MEMORY_SYNC_DIR — local clone path. Default: ~/.sutando-memory-sync
+#   SUTANDO_MEMORY_SYNC_DIR — local clone path. Default: ~/.sutando/memory-sync
+#                             (was ~/.sutando-memory-sync before #762's
+#                             companion PR; one-time auto-migration below)
 #
 # Run: bash scripts/sync-memory.sh
 
 # If SUTANDO_MEMORY_SYNC_DIR is not set, try to auto-detect: if the script
-# lives inside an existing ~/.sutando-memory-sync/scripts/ checkout, use
-# that. Otherwise default to ~/.sutando-memory-sync/. This lets the script
-# work both when bundled in the public sutando repo AND when copied into
-# the private sync clone.
+# lives inside an existing memory-sync clone, use that. Otherwise default
+# to ~/.sutando/memory-sync/. The auto-detect handles both the new convention
+# (~/.sutando/memory-sync/) and the legacy convention (~/.sutando-memory-sync/)
+# so a sync clone with this script copied in keeps working through the move.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT_PARENT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
@@ -41,12 +43,37 @@ if [ -f "$SCRIPT_PARENT/.env" ]; then
     set +a
 fi
 
+# One-time migration from legacy default (~/.sutando-memory-sync/) to the
+# new convention (~/.sutando/memory-sync/). Triggers only when the env var
+# is unset (user hasn't pinned a path), the legacy dir exists, AND the new
+# default doesn't yet exist — so env-pinned installs and fresh installs
+# both skip this. Idempotent: second run finds the new path populated and
+# the migration becomes a no-op. Per owner directive (2026-05-16): default
+# changes should ship with automatic migration, not just docs telling users
+# to mv manually.
+__OLD_DEFAULT="$HOME/.sutando-memory-sync"
+__NEW_DEFAULT="$HOME/.sutando/memory-sync"
+if [ -z "${SUTANDO_MEMORY_SYNC_DIR:-}" ] && [ -d "$__OLD_DEFAULT" ] && [ ! -e "$__NEW_DEFAULT" ]; then
+    mkdir -p "$(dirname "$__NEW_DEFAULT")"
+    if mv "$__OLD_DEFAULT" "$__NEW_DEFAULT" 2>/dev/null; then
+        echo "sync-memory: migrated $__OLD_DEFAULT -> $__NEW_DEFAULT (one-time)" >&2
+    fi
+fi
+
 if [ -n "$SUTANDO_MEMORY_SYNC_DIR" ]; then
     SYNC_DIR="$SUTANDO_MEMORY_SYNC_DIR"
+elif [ "$(basename "$SCRIPT_PARENT")" = "memory-sync" ] \
+     && [ "$(basename "$(dirname "$SCRIPT_PARENT")")" = ".sutando" ]; then
+    # New convention: script is inside ~/.sutando/memory-sync/scripts/
+    SYNC_DIR="$SCRIPT_PARENT"
 elif [ "$(basename "$SCRIPT_PARENT")" = ".sutando-memory-sync" ]; then
+    # Legacy convention kept for backward compat — auto-migration above
+    # should have moved this case to the new path, but if a user has
+    # SUTANDO_MEMORY_SYNC_DIR pointing somewhere else and the script lives
+    # inside the old layout, still honor it.
     SYNC_DIR="$SCRIPT_PARENT"
 else
-    SYNC_DIR="$HOME/.sutando-memory-sync"
+    SYNC_DIR="$__NEW_DEFAULT"
 fi
 REPO_DIR="${SUTANDO_WORKSPACE:-$HOME/Desktop/sutando}"
 if [ ! -d "$REPO_DIR" ]; then
