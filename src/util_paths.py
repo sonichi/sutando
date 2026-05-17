@@ -20,17 +20,28 @@ REPO_DIR = Path(__file__).resolve().parent.parent
 
 
 def _workspace_root() -> Path:
-    """Workspace root for runtime-state paths. Honors SUTANDO_WORKSPACE.
+    """Workspace root for runtime-state paths.
 
-    Falls back to REPO_DIR for back-compat with installs that don't pin the
-    env var. The two-variable distinction (REPO_DIR = source tree;
-    workspace = runtime state) matches PR #775's split for agent-api.py +
-    github-webhook.py + task-bridge.ts.
+    Per the workspace contract (docs/workspace-contract.md): REPO_DIR is
+    SOURCE-TREE-ONLY (exec'ing source files, git cwd, reading checked-in
+    files). All user/runtime paths go through the workspace. Delegates to
+    workspace_default.resolve_workspace() so SUTANDO_WORKSPACE, the
+    canonical default (~/.sutando/workspace/), and PR #762's one-time
+    legacy migration are all honored in one call.
+
+    `migrate=False` — path resolution shouldn't trigger migrations on
+    every call. Migration runs from src/startup.sh and the bridge boot
+    paths where it belongs.
     """
-    env = os.environ.get("SUTANDO_WORKSPACE")
-    if env:
-        return Path(os.path.expanduser(env))
-    return REPO_DIR
+    try:
+        from workspace_default import resolve_workspace
+        return resolve_workspace(migrate=False)
+    except ImportError:
+        # Inline fallback. NEVER REPO_DIR — that's source-tree, not workspace.
+        env = os.environ.get("SUTANDO_WORKSPACE")
+        if env:
+            return Path(os.path.expanduser(env))
+        return Path.home() / ".sutando" / "workspace"
 
 
 def _private_machine_dir() -> Path | None:
