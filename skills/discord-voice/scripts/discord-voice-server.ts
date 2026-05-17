@@ -330,6 +330,25 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 				return delegateTask(s, task);
 			},
 		});
+		// Skill-local override of `dismiss` — in a Discord voice context, the
+		// generic core dismissTool (which runs Zoom AppleScript) is wrong; here
+		// dismiss = SIGTERM self so cleanupSession() handler runs.
+		// Pushed BEFORE the inline-tools merge loop so the dedupe-by-name
+		// keeps THIS one and drops the core dismissTool.
+		tools.push({
+			name: 'dismiss',
+			description:
+				'Leave the current Discord voice channel and exit the voice session. ' +
+				'Use when user says "dismiss", "leave", "leave discord", "log off", "bye", "end this", "退出", "下线", "你走吧". ' +
+				'NOT for ending an in-progress task or hanging up a phone call.',
+			parameters: z.object({}),
+			execution: 'inline',
+			async execute() {
+				console.log(`${ts()} [Dismiss] Discord voice context — SIGTERM`);
+				setTimeout(() => { try { process.kill(process.pid, 'SIGTERM'); } catch {} }, 400);
+				return { status: 'left_discord_voice' };
+			},
+		});
 		const seen = new Set(tools.map(t => t.name));
 		for (const t of inlineTools) {
 			if (!seen.has(t.name)) { tools.push(t); seen.add(t.name); }
