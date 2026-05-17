@@ -6,7 +6,8 @@
  * ## Audio chain
  *   Discord user → @discordjs/voice receiver (opus packets per speaking user)
  *     → prism opus.Decoder → PCM s16le 48k stereo
- *     → downsample48StereoTo16Mono → VoiceSession.handleAudioFromClient (PCM 16k mono)
+ *     → ffmpeg s16le resample (48k stereo → 16k mono, anti-aliased)
+ *     → VoiceSession.handleAudioFromClient (PCM 16k mono)
  *
  *   Gemini Live → handleAudioOutput (base64 PCM 24k mono)
  *     → upsample24MonoTo48Stereo → PassThrough (PCM 48k stereo s16le)
@@ -138,20 +139,6 @@ function logLine(role: 'user' | 'assistant' | 'system', text: string, extra: Rec
 // --- Audio conversion helpers ----------------------------------------------
 
 /** PCM s16le 48k stereo → PCM s16le 16k mono (avg L+R, then decimate 3:1). */
-function downsample48StereoTo16Mono(pcm: Buffer): Buffer {
-	const inSamplePairs = pcm.length / 4; // 4 bytes per stereo sample
-	const mono48 = new Int16Array(inSamplePairs);
-	for (let i = 0; i < inSamplePairs; i++) {
-		const l = pcm.readInt16LE(i * 4);
-		const r = pcm.readInt16LE(i * 4 + 2);
-		mono48[i] = (l + r) >> 1;
-	}
-	const outLen = Math.floor(mono48.length / 3);
-	const mono16 = new Int16Array(outLen);
-	for (let i = 0; i < outLen; i++) mono16[i] = mono48[i * 3];
-	return Buffer.from(mono16.buffer, mono16.byteOffset, mono16.byteLength);
-}
-
 /** PCM s16le 24k mono → PCM s16le 48k stereo (sample-double upsample, mono→L=R). */
 function upsample24MonoTo48Stereo(pcm: Buffer): Buffer {
 	const mono24 = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.length / 2);
@@ -441,9 +428,19 @@ const SILENCE_20MS_16K_MONO = Buffer.alloc(640); // 320 samples × 2 bytes
 const SILENCE_BURST_FRAMES = 75; // ~1500ms — overshoot Gemini's silenceDurationMs default
 
 function triggerSilenceBurst(s: DiscordVoiceSession): void {
+	// In-flight guard so overlapping speakers (userA ends → burst starts;
+	// userB ends within 1500ms) don't stack two intervals that both call
+	// handleAudioFromClient at 20ms — Gemini would see doubled silence.
+	// Per @qingyun-wu cold-review on PR #783.
+	if ((s as any)._silenceBursting) return;
+	(s as any)._silenceBursting = true;
 	let n = 0;
 	const handle = setInterval(() => {
-		if (s.closing || n >= SILENCE_BURST_FRAMES) { clearInterval(handle); return; }
+		if (s.closing || n >= SILENCE_BURST_FRAMES) {
+			clearInterval(handle);
+			(s as any)._silenceBursting = false;
+			return;
+		}
 		try { (s.voiceSession as any).handleAudioFromClient(SILENCE_20MS_16K_MONO); } catch {}
 		n++;
 	}, 20);
