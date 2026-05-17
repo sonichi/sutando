@@ -115,9 +115,18 @@ def check_memory_sync() -> dict:
                 break
     if not repo_url:
         return {"name": name, "status": "warn", "detail": "SUTANDO_MEMORY_REPO not set — cross-machine sync disabled"}
-    sync_dir = Path.home() / ".sutando-memory-sync"
-    if not sync_dir.exists():
-        return {"name": name, "status": "warn", "detail": "repo configured but never synced — run bash ~/.sutando-memory-sync/scripts/sync-memory.sh"}
+    # Memory-sync clone dir: PR #764 renamed legacy ~/.sutando-memory-sync/
+    # → ~/.sutando/memory-sync/. Check new path first; fall back to legacy
+    # for installs that haven't migrated yet (sync-memory.sh auto-migrates
+    # on next run when env is unset).
+    sync_dir_new = Path.home() / ".sutando" / "memory-sync"
+    sync_dir_legacy = Path.home() / ".sutando-memory-sync"
+    if sync_dir_new.exists():
+        sync_dir = sync_dir_new
+    elif sync_dir_legacy.exists():
+        sync_dir = sync_dir_legacy
+    else:
+        return {"name": name, "status": "warn", "detail": "repo configured but never synced — run bash scripts/sync-memory.sh"}
     git_dir = sync_dir / ".git" / "FETCH_HEAD"
     if git_dir.exists():
         age_h = (time.time() - git_dir.stat().st_mtime) / 3600
