@@ -31,6 +31,7 @@ If Chrome window is moved/resized, coords drift. Re-derive via
 """
 from __future__ import annotations
 import argparse
+import subprocess
 import sys
 import time
 
@@ -52,12 +53,40 @@ except ImportError:
 
 # Screen coords (points, top-left origin) measured 2026-05-17 via
 # macos-use refresh_traversal on the MCP Chrome main process.
+# The Discord button uses the MAIN VIEW Share Your Screen — the voice-strip
+# variant is unreliable (disappears when other voice participants leave).
+# Main-view button is at (1056, 951) w=41 h=40 → center (1077, 971). Requires
+# the voice channel detail to be the current view (Discord page = channel).
 COORDS = {
-    "discord_share_button": (338, 809),  # voice-strip btn at 322,793 w=32 h=32
+    "discord_share_button": (1077, 971),  # main-view btn (stable)
     "entire_screen_tab":    (1142, 211),  # tab at 1041,195 w=203 h=32
     "thumbnail":            (825, 355),   # at 692,243 w=266 h=224
     "share_button":         (1206, 656),  # at 1168,638 w=76 h=36
 }
+
+
+def activate_mcp_chrome() -> None:
+    """Bring the MCP-Chrome window (NOT user's regular Chrome) to front so
+    CGEvent clicks register as button-presses. The user typically has two
+    Chrome instances running: the regular one with their normal profile, and
+    the chrome-devtools-mcp instance with the Discord webapp. `tell
+    application "Google Chrome" to activate` picks the wrong one half the
+    time. Activate by PID via System Events instead."""
+    try:
+        pid = subprocess.run(
+            ["pgrep", "-f",
+             "Google Chrome.app/Contents/MacOS/Google Chrome --.*chrome-devtools-mcp/chrome-profile"],
+            check=False, timeout=1, capture_output=True, text=True,
+        ).stdout.strip().splitlines()
+        if not pid:
+            return
+        subprocess.run(
+            ["osascript", "-e",
+             f'tell application "System Events" to set frontmost of (first process whose unix id is {pid[0]}) to true'],
+            check=False, timeout=1, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
 
 
 def click(x: int, y: int) -> None:
@@ -88,6 +117,15 @@ def main() -> int:
         for name, (x, y) in COORDS.items():
             print(f"  {name}: ({x}, {y})")
         return 0
+
+    # Bring MCP Chrome to front so CGEvent clicks on the Discord button
+    # register as button-presses (focus-only swallow otherwise, especially
+    # since user's regular Chrome shares the bundle id). Modal-only mode
+    # skips this — the modal is a native macOS dialog, already frontmost
+    # when it appears, so its 3 clicks don't need Chrome focus.
+    if not args.modal:
+        activate_mcp_chrome()
+        time.sleep(0.08)
 
     start = time.time()
 
