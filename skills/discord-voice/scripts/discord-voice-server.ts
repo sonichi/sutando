@@ -349,6 +349,39 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 				return { status: 'left_discord_voice' };
 			},
 		});
+		// Skill-local share_screen tool. Voice-server can't directly invoke
+		// chrome-devtools-mcp + macos-use (those are MCP tools owned by the
+		// proactive-loop Claude session, not this Node process). So this tool
+		// delegates by writing a task file the proactive-loop picks up and
+		// executes via the validated hybrid 4-click sequence:
+		//   1. chrome-devtools-mcp click Share Your Screen (Discord webpage uid)
+		//   2. macos-use click Entire Screen tab (Chrome modal)
+		//   3. macos-use click screen thumbnail
+		//   4. macos-use click Share button
+		// End-to-end ~3 sec, validated 2026-05-17 in Orion #General.
+		tools.push({
+			name: 'share_screen',
+			description:
+				'Share your screen in the current Discord voice channel (Entire Screen mode). ' +
+				'Use when user says "share screen", "share my screen", "show my screen", "屏幕共享", "分享屏幕". ' +
+				'Picker handled automatically by the proactive loop. To stop, dismiss the voice session or click Stop Streaming in Discord.',
+			parameters: z.object({}),
+			execution: 'inline',
+			pendingMessage: 'Setting up screen share — picker handled by the proactive loop.',
+			async execute() {
+				const tsNow = Date.now();
+				const taskFile = join(TASKS_DIR, `task-discord-share-screen-${tsNow}.txt`);
+				const body = `id: task-discord-share-screen-${tsNow}
+timestamp: ${new Date().toISOString()}
+task: [discord-voice share_screen] Drive the share-screen flow on the chrome-devtools-mcp Chrome (PID via 'pgrep -f chrome-devtools-mcp/chrome-profile'). Validated hybrid 4-click sequence: (1) chrome-devtools-mcp take_snapshot on the Discord page, find button with description="Share Your Screen" (uid like 1_90), click it. (2) macos-use refresh_traversal on the MCP-Chrome PID, click_and_traverse element="Entire Screen" (the tab at ~1041,195). (3) macos-use click_and_traverse x=692 y=243 width=266 height=224 (screen thumbnail). (4) macos-use click_and_traverse element="Share" role=AXButton. Verify "Stop Streaming" appears in Discord page after.
+source: discord-voice
+access_tier: owner
+`;
+				writeFileSync(taskFile, body);
+				console.log(`${ts()} [ShareScreen] delegated to proactive-loop via ${taskFile}`);
+				return { status: 'share_screen_requested', message: 'Picker click sequence handed off to the proactive loop.' };
+			},
+		});
 		const seen = new Set(tools.map(t => t.name));
 		for (const t of inlineTools) {
 			if (!seen.has(t.name)) { tools.push(t); seen.add(t.name); }
