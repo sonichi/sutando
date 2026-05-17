@@ -359,6 +359,22 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 		//   3. macos-use click screen thumbnail
 		//   4. macos-use click Share button
 		// End-to-end ~3 sec, validated 2026-05-17 in Orion #General.
+		// Common 4-click share-screen delegation. Used by both share_screen and
+		// the skill-local summon override (which exists because the core
+		// summonTool description matches "share my screen" → opens Zoom).
+		const writeShareScreenTask = (source: string) => {
+			const tsNow = Date.now();
+			const taskFile = join(TASKS_DIR, `task-discord-share-screen-${tsNow}.txt`);
+			const body = `id: task-discord-share-screen-${tsNow}
+timestamp: ${new Date().toISOString()}
+task: [discord-voice ${source}] Drive the share-screen 4-click sequence. (1) chrome-devtools-mcp take_snapshot on the Discord page, click button description="Share Your Screen". (2) macos-use refresh_traversal on the MCP-Chrome PID (pgrep -f chrome-devtools-mcp/chrome-profile), click_and_traverse element="Entire Screen". (3) macos-use click_and_traverse x=692 y=243 width=266 height=224. (4) macos-use click_and_traverse element="Share" role=AXButton. Verify "Stop Streaming" appears.
+source: discord-voice
+access_tier: owner
+`;
+			writeFileSync(taskFile, body);
+			console.log(`${ts()} [ShareScreen via ${source}] delegated to proactive-loop via ${taskFile}`);
+			return { status: 'share_screen_requested', message: 'Picker click sequence handed off to the proactive loop.' };
+		};
 		tools.push({
 			name: 'share_screen',
 			description:
@@ -367,6 +383,10 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 				'Call again to re-share even if already shared (user wants a fresh share). ' +
 				'DO NOT route share-screen utterances to switch_tab (that\'s for Chrome tab navigation) OR to summon / join_zoom (those open the Zoom desktop app — wrong app, user is in Discord). ' +
 				'To stop, use stop_share_screen tool (NOT dismiss — dismiss leaves the whole voice session).',
+			parameters: z.object({}),
+			execution: 'inline',
+			pendingMessage: 'Setting up screen share — picker handled by the proactive loop.',
+			async execute() { return writeShareScreenTask('share_screen'); },
 		});
 		// Skill-local override: the core `summon` tool opens Zoom.app — wrong
 		// behavior when the user is in a Discord voice channel saying "summon"
@@ -374,40 +394,12 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 		tools.push({
 			name: 'summon',
 			description:
-				'In a Discord voice channel context, "summon" / "share my screen" / "start zoom" / "let me see your screen" / "show me your screen" all mean: share the Discord screen via share_screen tool. ' +
-				'Call share_screen instead of this tool whenever possible. ' +
-				'This tool exists only to catch utterances that the LLM might otherwise route to the core Zoom-opening summon tool — which would be wrong here (the user is in Discord, not Zoom).',
+				'In a Discord voice channel context, "summon" / "share my screen" / "start zoom" / "let me see your screen" / "show me your screen" all mean: share the Discord screen via share_screen. ' +
+				'Call share_screen directly instead of this tool whenever possible. ' +
+				'This override exists only because the core summon tool would otherwise open Zoom.app — wrong app when the user is in Discord.',
 			parameters: z.object({}),
 			execution: 'inline',
-			async execute() {
-				const tsNow = Date.now();
-				const taskFile = join(TASKS_DIR, `task-discord-share-screen-${tsNow}.txt`);
-				const body = `id: task-discord-share-screen-${tsNow}
-timestamp: ${new Date().toISOString()}
-task: [discord-voice summon→share_screen] User said "summon" / "share my screen" in Discord voice context. Drive the share-screen 4-click sequence: (1) chrome-devtools-mcp take_snapshot Discord page, click button description="Share Your Screen". (2) macos-use on the MCP-Chrome PID: click_and_traverse element="Entire Screen". (3) macos-use click_and_traverse x=692 y=243 width=266 height=224. (4) macos-use click_and_traverse element="Share" role=AXButton. Verify "Stop Streaming" appears.
-source: discord-voice
-access_tier: owner
-`;
-				writeFileSync(taskFile, body);
-				console.log(`${ts()} [Summon→Share] delegated to proactive-loop via ${taskFile}`);
-				return { status: 'share_screen_requested', message: 'Discord summon = share screen — handed to proactive loop.' };
-			},
-			parameters: z.object({}),
-			execution: 'inline',
-			pendingMessage: 'Setting up screen share — picker handled by the proactive loop.',
-			async execute() {
-				const tsNow = Date.now();
-				const taskFile = join(TASKS_DIR, `task-discord-share-screen-${tsNow}.txt`);
-				const body = `id: task-discord-share-screen-${tsNow}
-timestamp: ${new Date().toISOString()}
-task: [discord-voice share_screen] Drive the share-screen flow on the chrome-devtools-mcp Chrome (PID via 'pgrep -f chrome-devtools-mcp/chrome-profile'). Validated hybrid 4-click sequence: (1) chrome-devtools-mcp take_snapshot on the Discord page, find button with description="Share Your Screen" (uid like 1_90), click it. (2) macos-use refresh_traversal on the MCP-Chrome PID, click_and_traverse element="Entire Screen" (the tab at ~1041,195). (3) macos-use click_and_traverse x=692 y=243 width=266 height=224 (screen thumbnail). (4) macos-use click_and_traverse element="Share" role=AXButton. Verify "Stop Streaming" appears in Discord page after.
-source: discord-voice
-access_tier: owner
-`;
-				writeFileSync(taskFile, body);
-				console.log(`${ts()} [ShareScreen] delegated to proactive-loop via ${taskFile}`);
-				return { status: 'share_screen_requested', message: 'Picker click sequence handed off to the proactive loop.' };
-			},
+			async execute() { return writeShareScreenTask('summon→share_screen'); },
 		});
 		// Skill-local stop_share_screen tool. Same delegation pattern as
 		// share_screen — write a task file the proactive-loop picks up and
