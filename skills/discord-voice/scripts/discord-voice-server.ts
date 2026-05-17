@@ -359,15 +359,18 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 		//   3. macos-use click screen thumbnail
 		//   4. macos-use click Share button
 		// End-to-end ~3 sec, validated 2026-05-17 in Orion #General.
-		// Common 4-click share-screen delegation. Used by both share_screen and
-		// the skill-local summon override (which exists because the core
+		// Common share-screen delegation. Used by both share_screen and the
+		// skill-local summon override (which exists because the core
 		// summonTool description matches "share my screen" → opens Zoom).
+		// Fast path: chrome-devtools-mcp click on Share Your Screen (~0.5s),
+		// then `share-screen-modal.py` does 3 CGEvent clicks (~0.5s) skipping
+		// macos-use traversal overhead. Total ~1s vs old ~3s.
 		const writeShareScreenTask = (source: string) => {
 			const tsNow = Date.now();
 			const taskFile = join(TASKS_DIR, `task-discord-share-screen-${tsNow}.txt`);
 			const body = `id: task-discord-share-screen-${tsNow}
 timestamp: ${new Date().toISOString()}
-task: [discord-voice ${source}] Drive the share-screen 4-click sequence. (1) chrome-devtools-mcp take_snapshot on the Discord page, click button description="Share Your Screen". (2) macos-use refresh_traversal on the MCP-Chrome PID (pgrep -f chrome-devtools-mcp/chrome-profile), click_and_traverse element="Entire Screen". (3) macos-use click_and_traverse x=692 y=243 width=266 height=224. (4) macos-use click_and_traverse element="Share" role=AXButton. Verify "Stop Streaming" appears.
+task: [discord-voice ${source}] Drive the share-screen FAST sequence (~1s total). (1) chrome-devtools-mcp take_snapshot on the Discord page, click button description="Share Your Screen". (2) After modal opens (~300ms), run \`python3 skills/discord-voice/scripts/share-screen-modal.py\` — this CGEvent-clicks Entire Screen tab, thumbnail, Share button in ~0.5s (no macos-use traversal). Verify "Stop Streaming" appears via chrome-devtools snapshot.
 source: discord-voice
 access_tier: owner
 `;
