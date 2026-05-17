@@ -16,20 +16,45 @@ import sys
 import time
 from pathlib import Path
 
-import discord
+# Self-rescue: this bridge HAS to keep running — Discord is the primary channel
+# the owner uses to reach Sutando. If `python3` on $PATH happens to resolve to
+# an interpreter that lacks `discord.py` (e.g. miniconda's python on a Mac that
+# also has Homebrew Python with the package installed), DON'T crash — search
+# for a sibling interpreter that has the module and re-exec with that.
+#
+# Bug class: this session alone hit the same `ModuleNotFoundError: No module
+# named 'discord'` twice — startup.sh:262 uses bare `python3` which resolves
+# unpredictably. Even with startup.sh fixed, any future launcher (cron, plist,
+# `pgrep`-respawn shim, a shell script someone writes 6 months from now) can
+# silently regress this. The self-rescue makes the bridge defensible regardless.
+try:
+    import discord
+except ModuleNotFoundError:
+    _RESCUE_CANDIDATES = [
+        "/opt/homebrew/bin/python3",     # Homebrew on Apple Silicon
+        "/usr/local/bin/python3",        # Homebrew on Intel Mac (or Linux-style)
+        "/opt/homebrew/opt/python@3.13/bin/python3",
+        "/opt/homebrew/opt/python@3.14/bin/python3",
+    ]
+    _current = os.path.realpath(sys.executable)
+    for _cand in _RESCUE_CANDIDATES:
+        if not os.path.exists(_cand) or os.path.realpath(_cand) == _current:
+            continue
+        _check = subprocess.run([_cand, "-c", "import discord"], capture_output=True)
+        if _check.returncode == 0:
+            print(
+                f"discord-bridge: launched with {_current} (no discord.py); "
+                f"re-execing under {_cand}",
+                file=sys.stderr, flush=True,
+            )
+            os.execv(_cand, [_cand, __file__, *sys.argv[1:]])
+    # No rescue interpreter available — re-raise so the operator sees the real error.
+    raise
 
-# REPO resolution: prefer SUTANDO_WORKSPACE env var so the bridge writes to the
-# user's workspace tasks/results/state dirs, not the app-bundle's copy. When
-# this file lives under /Applications/Sutando.app/.../repo/src/, the workspace
-# `src/` is typically a symlink into the bundle, so `Path(__file__).resolve()`
-# walks INTO the bundle and `parent.parent` returns the bundle root rather
-# than the workspace. That divergence stranded owner DMs on 2026-05-14 — the
-# bridge wrote tasks to bundle-tasks/ while core agent watched workspace-tasks/.
-import os
-_workspace_env = os.environ.get("SUTANDO_WORKSPACE", "").strip()
-REPO = Path(_workspace_env).expanduser() if _workspace_env else Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from workspace_default import resolve_workspace  # noqa: E402
 from util_paths import shared_personal_path  # noqa: E402
+REPO = resolve_workspace()
 
 # Vision-frame helper — pushes image attachments into the active voice session
 # so Gemini reacts in-stream. Best-effort: import failure or unreachable
@@ -275,7 +300,7 @@ def write_owner_activity(channel: str, summary: str) -> None:
     `notes/team-proposal-coord-loop-2026-04-20.md`.
     """
     try:
-        STATE_DIR.mkdir(exist_ok=True)
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
         payload = {
             "ts": int(time.time()),
             "channel": channel,
@@ -345,8 +370,8 @@ def notify_agent_api_task_done(task_id: str, result: str) -> None:
     except Exception:
         pass  # best-effort; agent-api will catch up via polling
 INBOX_DIR = Path("/tmp/discord-inbox")
-TASKS_DIR.mkdir(exist_ok=True)
-RESULTS_DIR.mkdir(exist_ok=True)
+TASKS_DIR.mkdir(parents=True, exist_ok=True)
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 INBOX_DIR.mkdir(exist_ok=True)
 
 # Presenter mode: when scripts/presenter-mode.sh is active, the bridge
@@ -2699,6 +2724,65 @@ async def poll_results():
                     if reply_match:
                         reply_text = reply_pattern.sub('', reply_text).strip()
 
+                    # Extract optional [channel: <channel_id>] redirect — the
+                    # agent can route a DM-originated reply to a different
+                    # channel (e.g. respond from a DM task by posting in
+                    # #general). Without this, the bridge always replies to
+                    # the task-source channel. Falls back to the original
+                    # channel on resolution failure (don't drop the reply).
+                    #
+                    # Authorization: owner tier only. The bridge already gates
+                    # inbound tasks by tier (lines ~2326+) and the access_tier
+                    # field is written into every task file (line ~2534). A
+                    # sandboxed team/other-tier result that names a channel
+                    # the requester can't reach must NOT be honored — that
+                    # would let a non-owner redirect into the owner's private
+                    # spaces. We read the tier back from the task file rather
+                    # than threading it through pending_replies so the gate
+                    # survives a bridge restart.
+                    channel_pattern = re.compile(r'\[channel:\s*(\d{17,20})\]')
+                    channel_match = channel_pattern.search(reply_text)
+                    if channel_match:
+                        target_channel_id = int(channel_match.group(1))
+                        reply_text = channel_pattern.sub('', reply_text).strip()
+                        task_tier = "other"
+                        try:
+                            task_body = (TASKS_DIR / f"{task_id}.txt").read_text()
+                            for ln in task_body.splitlines():
+                                if ln.startswith("access_tier:"):
+                                    task_tier = ln.split(":", 1)[1].strip() or "other"
+                                    break
+                        except Exception:
+                            # Missing/unreadable task file → treat as non-owner.
+                            task_tier = "other"
+                        if task_tier != "owner":
+                            print(
+                                f"  [channel-redirect] dropped — tier '{task_tier}' is not owner "
+                                f"(target {target_channel_id}); replying to original channel",
+                                flush=True,
+                            )
+                        else:
+                            try:
+                                target_channel = client.get_channel(target_channel_id)
+                                if target_channel is None:
+                                    target_channel = await client.fetch_channel(target_channel_id)
+                                if target_channel:
+                                    channel = target_channel
+                                    # reply_to_id still references the original task's
+                                    # channel — if the redirected channel differs, the
+                                    # reply-anchor would 404. Clear it so we post as a
+                                    # fresh message instead.
+                                    reply_to_id = None
+                                    print(f"  [channel-redirect] sending to channel {target_channel_id}", flush=True)
+                                else:
+                                    print(
+                                        f"  [channel-redirect] channel {target_channel_id} unresolved, "
+                                        f"falling back to task source",
+                                        flush=True,
+                                    )
+                            except Exception as e:
+                                print(f"  [channel-redirect] failed to resolve channel {target_channel_id}, falling back to task source: {e}", flush=True)
+
                     # Extract file paths: [file: /path] or [send: /path]
                     file_pattern = re.compile(r'\[(?:file|send|attach):\s*((?:/|~/)[^\]:]+)\]')
                     files = file_pattern.findall(reply_text)
@@ -2917,6 +3001,87 @@ async def poll_dm_fallback():
                         archive_file(_task_file, "tasks", _task_id)
                     archive_file(f, "results", _task_id)
                     continue
+
+                # Honor [channel: <id>] redirect (parity with poll_results
+                # lines ~2702-2759). Without this, a voice- or cron-originated
+                # result that includes the redirect marker would either
+                # (a) leak the literal `[channel: <id>]` string into the
+                # owner's DM via dm-result.py, or (b) lose the redirect intent
+                # entirely. Both modes break the marker's contract.
+                channel_pattern = re.compile(r'\[channel:\s*(\d{17,20})\]')
+                channel_match = channel_pattern.search(_peek)
+                if channel_match:
+                    target_channel_id = int(channel_match.group(1))
+                    clean_body = channel_pattern.sub('', _peek).strip()
+                    _task_id = f.stem
+                    # Tier read from task file. Default "other" on missing /
+                    # unreadable: voice- and cron-originated tasks don't write
+                    # an access_tier field (only the Discord bridge does at
+                    # line ~2534), so they'll fall into this default. The
+                    # tradeoff is intentional — denying redirect for
+                    # tier-unknown tasks is the safe-by-default posture; a
+                    # voice user who genuinely wants channel-redirect can
+                    # have voice-agent write `access_tier: owner` into the
+                    # task file (the same shape Discord uses).
+                    task_tier = "other"
+                    try:
+                        task_body = (TASKS_DIR / f"{_task_id}.txt").read_text()
+                        for ln in task_body.splitlines():
+                            if ln.startswith("access_tier:"):
+                                task_tier = ln.split(":", 1)[1].strip() or "other"
+                                break
+                    except Exception:
+                        task_tier = "other"
+
+                    if task_tier == "owner":
+                        try:
+                            target_channel = client.get_channel(target_channel_id)
+                            if target_channel is None:
+                                target_channel = await client.fetch_channel(target_channel_id)
+                        except Exception as e:
+                            target_channel = None
+                            print(f"  [dm-fallback channel-redirect] failed to resolve {target_channel_id}: {e}", flush=True)
+                        if target_channel:
+                            # File markers (parity with poll_results 2761-2784).
+                            file_pattern = re.compile(r'\[(?:file|send|attach):\s*((?:/|~/)[^\]:]+)\]')
+                            file_list = file_pattern.findall(clean_body)
+                            text_only = file_pattern.sub('', clean_body).strip()
+                            if text_only:
+                                for chunk in _chunk_for_discord(text_only):
+                                    await target_channel.send(chunk)
+                            for fpath in file_list:
+                                fpath = os.path.expanduser(fpath.strip())
+                                if _is_path_sendable(fpath):
+                                    await target_channel.send(file=discord.File(fpath))
+                                    print(f"  [dm-fallback channel-redirect] sent file: {fpath}", flush=True)
+                                elif not os.path.isfile(fpath):
+                                    await target_channel.send(f"(file not found: {fpath})")
+                            print(f"  [dm-fallback channel-redirect] sent {f.name} to channel {target_channel_id}", flush=True)
+                            _task_file = TASKS_DIR / f"{_task_id}.txt"
+                            if _task_file.exists():
+                                archive_file(_task_file, "tasks", _task_id)
+                            archive_file(f, "results", _task_id)
+                            continue
+                        # Unresolved → fall through to DM, but strip marker
+                        # so dm-result.py doesn't leak the literal text.
+                        print(f"  [dm-fallback channel-redirect] channel {target_channel_id} unresolved; falling back to DM", flush=True)
+                    else:
+                        print(
+                            f"  [dm-fallback channel-redirect] dropped — tier '{task_tier}' is not owner "
+                            f"(target {target_channel_id}); falling back to DM",
+                            flush=True,
+                        )
+                    # Either non-owner or unresolved-channel path: rewrite the
+                    # result file with the marker stripped so the dm-result.py
+                    # subprocess (below) DMs clean text. Atomic-ish write —
+                    # the only other consumer of results/ at this point is
+                    # voice-agent's task-bridge, which is read-only and would
+                    # tolerate an intermediate marker-vs-clean view.
+                    try:
+                        f.write_text(clean_body + ("\n" if not clean_body.endswith("\n") else ""), encoding="utf-8")
+                    except OSError as e:
+                        print(f"  [dm-fallback channel-redirect] write-back failed on {f.name}: {e}", flush=True)
+
                 # Subprocess out to the shared CLI tool so there's only one
                 # code path for the voiceConnected check + DM send.
                 # Use sys.executable: under launchd (discord-bridge is launchd-managed),
@@ -2926,8 +3091,16 @@ async def poll_dm_fallback():
                     # stdin=DEVNULL: under launchd, parent's fd 0 may be invalid,
                     # causing the child Python's `init_sys_streams` to fail with
                     # `OSError: [Errno 9] Bad file descriptor`. Force clean stdin.
+                    # dm-result.py is a SIBLING of this script in src/, not a
+                    # workspace artifact. Resolving via Path(__file__) keeps the
+                    # invocation correct after PR #762 — which made REPO point
+                    # at the runtime workspace (a subdir of the repo root), so
+                    # `REPO / "src" / "dm-result.py"` would resolve to
+                    # `<workspace>/src/dm-result.py` (does not exist) and the
+                    # dm-fallback path errored out silently before delivering.
+                    _DM_RESULT_SCRIPT = Path(__file__).resolve().parent / "dm-result.py"
                     result = subprocess.run(
-                        [sys.executable, str(REPO / "src" / "dm-result.py"), "--file", str(f)],
+                        [sys.executable, str(_DM_RESULT_SCRIPT), "--file", str(f)],
                         capture_output=True, text=True, timeout=15,
                         stdin=subprocess.DEVNULL,
                     )
