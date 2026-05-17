@@ -80,7 +80,15 @@ if [ ! -d "$REPO_DIR" ]; then
     echo "sync-memory: workspace not found at $REPO_DIR; set SUTANDO_WORKSPACE or clone sutando to ~/Desktop/sutando." >&2
     exit 0
 fi
-MEMORY_DIR="$HOME/.claude/projects/$(echo "$REPO_DIR" | sed 's|/|-|g')/memory"
+# Claude's per-project memory dir is keyed on the LAUNCH-CWD path, not on
+# SUTANDO_WORKSPACE. Use SCRIPT_PARENT (this script's parent.parent = repo
+# root where the user launched Claude) — that's the canonical key on any
+# sane install. Prior implementation used REPO_DIR (= SUTANDO_WORKSPACE),
+# which silently picked a non-existent key on env-set hosts and then fell
+# back via `find … | head -1` to whichever sibling memory dir landed first
+# (alphabetical). Bug silently skipped real memory writes for 5+ weeks
+# before being caught. See docs/workspace-contract.md.
+MEMORY_DIR="$HOME/.claude/projects/$(echo "$SCRIPT_PARENT" | sed 's|/|-|g')/memory"
 NOTES_DIR="$REPO_DIR/notes"
 LOG="/tmp/sync-memory.log"
 LOCK_DIR="/tmp/sync-memory.lock.d"

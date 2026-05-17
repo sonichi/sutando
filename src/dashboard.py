@@ -21,12 +21,15 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
+# Two-variable split (see docs/workspace-contract.md):
+#   - REPO_DIR      = source tree (this file's parent.parent) — for source paths
+#   - WORKSPACE_DIR = runtime state (resolve_workspace()) — for build_log, etc.
+# Matches PR #775's pattern for agent-api.py + github-webhook.py + task-bridge.ts.
 REPO_DIR = Path(__file__).parent.parent
-
-# Personal-asset path resolver — see src/util_paths.py. Used for /avatar
-# and /stand-identity endpoints so they prefer per-machine private dir.
 sys.path.insert(0, str(Path(__file__).parent))
+from workspace_default import resolve_workspace  # noqa: E402
 from util_paths import personal_path, shared_personal_path  # noqa: E402
+WORKSPACE_DIR = resolve_workspace()
 PORT = 7844
 
 
@@ -45,7 +48,7 @@ def _resolve_note_path(raw_slug: str):
     slug = re.sub(r"[^\w-]", "", raw_slug)
     if not slug or slug != raw_slug:
         return None
-    notes_real = os.path.realpath(shared_personal_path("notes", REPO_DIR))
+    notes_real = os.path.realpath(shared_personal_path("notes"))
     note_file_str = os.path.realpath(os.path.join(notes_real, f"{slug}.md"))
     if not note_file_str.startswith(notes_real + os.sep):
         return None
@@ -97,7 +100,7 @@ def get_activity(max_items: int = 10) -> list[dict]:
 
 
 def get_pending_count() -> dict:
-    pending_file = Path(personal_path("pending-questions.md", REPO_DIR))
+    pending_file = Path(personal_path("pending-questions.md"))
     if not pending_file.exists():
         return {"open": 0, "done": 0}
     content = pending_file.read_text()
@@ -107,7 +110,7 @@ def get_pending_count() -> dict:
 
 
 def get_score() -> str:
-    build_log = REPO_DIR / "build_log.md"
+    build_log = WORKSPACE_DIR / "build_log.md"
     if not build_log.exists():
         return "?"
     content = build_log.read_text()
@@ -116,8 +119,14 @@ def get_score() -> str:
 
 
 def get_quota_status() -> dict:
-    """Read quota state from quota-state.json (written by credential proxy)."""
-    quota_file = REPO_DIR / "quota-state.json"
+    """Read quota state from quota-state.json (written by credential proxy).
+
+    Quota state IS runtime state, so the canonical home is the workspace
+    (docs/workspace-contract.md: REPO_DIR is source-tree-only). The
+    legacy skill-dir path is preserved as a fallback for the existing
+    writer until that's migrated separately.
+    """
+    quota_file = WORKSPACE_DIR / "quota-state.json"
     if not quota_file.exists():
         quota_file = REPO_DIR / "skills" / "quota-tracker" / "quota-state.json"
     if not quota_file.exists():
@@ -228,7 +237,7 @@ TESTED_USE_CASES = {
 }
 
 def get_use_case_matrix() -> str:
-    build_log = REPO_DIR / "build_log.md"
+    build_log = WORKSPACE_DIR / "build_log.md"
     if not build_log.exists():
         return ""
     content = build_log.read_text()
@@ -356,7 +365,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(html.encode())
         elif urlparse(self.path).path == "/avatar":
-            avatar_file = personal_path("stand-avatar.png", workspace=REPO_DIR)
+            avatar_file = personal_path("stand-avatar.png")
             if avatar_file.exists():
                 self.send_response(200)
                 self.send_header("Content-Type", "image/png")
@@ -367,7 +376,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_response(404)
                 self.end_headers()
         elif urlparse(self.path).path == "/stand-identity":
-            si_file = personal_path("stand-identity.json", workspace=REPO_DIR)
+            si_file = personal_path("stand-identity.json")
             data = json.loads(si_file.read_text()) if si_file.exists() else {}
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -435,7 +444,7 @@ load()
             self.end_headers()
             self.wfile.write(html.encode())
         elif urlparse(self.path).path == "/notes":
-            notes_dir = Path(shared_personal_path("notes", REPO_DIR))
+            notes_dir = Path(shared_personal_path("notes"))
             notes = []
             for f in sorted(notes_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True):
                 title = f.stem.replace("-", " ").title()
