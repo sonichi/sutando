@@ -79,7 +79,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '../../../src/inline-tools.js';
-import { recordSession } from '../../../src/conversation-store.js';
+import { recordSession, recordConversation } from '../../../src/conversation-store.js';
 // Lazy vision-session handle. Only loaded if a call ever needs it — keeps the
 // phone-agent boot path free of the vision-tools.ts side-effects on cold start.
 let _setVisionSession: ((s: unknown) => void) | null = null;
@@ -951,14 +951,16 @@ function cleanupCall(callSid: string): void {
 		writeFileSync(join(CALLS_DIR, 'latest-result.json'), data);
 		appendFileSync(join(CALLS_DIR, 'calls.jsonl'), data + '\n');
 	}
-	// Append to shared conversation.log for cross-agent context
+	// Append to shared conversation.log + sqlite mirror for cross-agent context
 	if (session.transcript.length > 0) {
 		const logPath = join(WORKSPACE_DIR, 'conversation.log');
 		const callType = session.meetingId ? `meeting-${session.meetingId}` : `call-${session.callerNumber || 'unknown'}`;
 		for (const t of session.transcript) {
 			const role = t.role === 'sutando' ? 'phone-agent' : 'phone-caller';
-			const line = `${new Date().toISOString()}|${role}|[${callType}] ${t.text.replace(/\n/g, ' ').slice(0, 200)}\n`;
+			const text = `[${callType}] ${t.text.replace(/\n/g, ' ').slice(0, 200)}`;
+			const line = `${new Date().toISOString()}|${role}|${text}\n`;
 			try { appendFileSync(logPath, line); } catch { /* best effort */ }
+			recordConversation(role, text, callSid); // #603 sqlite mirror
 		}
 	}
 	console.log(`${ts()} [Phone] call finalized: ${callSid}`);
