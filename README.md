@@ -57,7 +57,7 @@ https://github.com/user-attachments/assets/a86ec34e-3b26-4011-824c-d2d124753c25
 
 **Remember everything — and act on it.** You have an idea while walking. Say it out loud. Sutando captures it, tags it, and saves it as a searchable note. If there's something actionable, it starts working on it right away or queues it for the next free cycle.
 
-**Reach you anywhere.** Voice, Zoom, Google Meet, Telegram, Discord, web, phone, or email — same agent, same memory, any channel.
+**Reach you anywhere.** Voice, Zoom, Google Meet, Telegram, Discord (text + voice channel), web, phone, or email — same agent, same memory, any channel.
 
 **Scale across machines.** Plug in a second Mac and Sutando sets it up — the original agent opens a Discord channel, sends setup commands, and migrates services. The new machine handles phone calls 24/7 while your laptop stays portable. No migration scripts needed — the two agents coordinate the handoff themselves.
 
@@ -259,6 +259,7 @@ One table, organized by capability. The only required paid piece is your Claude 
 | Inbound call handling | `phone-conversation/` | Verified (needs Twilio) |
 | Telegram messaging | `telegram-bridge.py` | Verified (text + photos + files + voice) |
 | Discord messaging | `discord-bridge.py` | Verified (DMs + channel @mentions + files) |
+| Discord voice channel | `skills/discord-voice/` | Verified (2-way voice + screen share) |
 | Cross-device task submission | `agent-api.py` | Verified |
 | Health monitoring | `health-check.py` | Verified |
 | Pattern detection + user modeling | Built into Claude Code memory system | Verified |
