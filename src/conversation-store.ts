@@ -158,6 +158,56 @@ export interface SessionMetrics {
 	events?: unknown;        // JSON-serializable array
 }
 
+/**
+ * Read the latest ts_unix for a user/assistant turn in the *current*
+ * session (after the most recent SESSION_END marker). Returns null if
+ * none exists or the DB isn't available. Used by getSecondsSinceLastTurn.
+ *
+ * Replaces the O(file_size) backwards-walk over conversation.log with
+ * an O(log N) index lookup. SESSION_END marker is queried first; only
+ * user/assistant rows after that marker count.
+ */
+export function queryLastTurnTs(): number | null {
+	init();
+	if (!db) return null;
+	try {
+		const boundary = db.prepare(
+			"SELECT ts_unix FROM conversation WHERE role = 'SESSION_END' ORDER BY ts_unix DESC LIMIT 1"
+		).get() as { ts_unix: number } | undefined;
+		const boundaryTs = boundary?.ts_unix ?? 0;
+		const row = db.prepare(
+			"SELECT ts_unix FROM conversation WHERE role IN ('user','assistant') AND ts_unix > ? ORDER BY ts_unix DESC LIMIT 1"
+		).get(boundaryTs) as { ts_unix: number } | undefined;
+		return row?.ts_unix ?? null;
+	} catch (e) {
+		console.error('[conversation-store] queryLastTurnTs failed:', e);
+		return null;
+	}
+}
+
+/**
+ * Read up to `count` most recent conversation rows from the *current*
+ * session (after the most recent SESSION_END marker), oldest-first.
+ * Used by getRecentConversation. Returns empty array on any failure.
+ */
+export function queryRecentTurns(count: number): Array<{ role: string; text: string }> {
+	init();
+	if (!db) return [];
+	try {
+		const boundary = db.prepare(
+			"SELECT ts_unix FROM conversation WHERE role = 'SESSION_END' ORDER BY ts_unix DESC LIMIT 1"
+		).get() as { ts_unix: number } | undefined;
+		const boundaryTs = boundary?.ts_unix ?? 0;
+		const rows = db.prepare(
+			"SELECT role, text FROM conversation WHERE ts_unix > ? ORDER BY ts_unix DESC LIMIT ?"
+		).all(boundaryTs, count) as Array<{ role: string; text: string }>;
+		return rows.reverse(); // oldest-first matches text-log reader's slice(-count)
+	} catch (e) {
+		console.error('[conversation-store] queryRecentTurns failed:', e);
+		return [];
+	}
+}
+
 /** Parse a value that should be a timestamp into unix seconds, or null. */
 function tsToUnix(t: unknown): number | null {
 	if (typeof t === 'string') {

@@ -79,7 +79,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '../../../src/inline-tools.js';
-import { recordSession, recordConversation } from '../../../src/conversation-store.js';
+import { recordSession, recordConversation, queryRecentTurns } from '../../../src/conversation-store.js';
 // Lazy vision-session handle. Only loaded if a call ever needs it — keeps the
 // phone-agent boot path free of the vision-tools.ts side-effects on cold start.
 let _setVisionSession: ((s: unknown) => void) | null = null;
@@ -129,8 +129,18 @@ function normalizePhone(num: string): string {
 	return digits.length === 10 ? '1' + digits : digits;
 }
 
-/** Read recent conversation context, relabeled to avoid identity confusion */
+/** Read recent conversation context, relabeled to avoid identity confusion.
+ *  Sqlite path (#603) replaces the O(file_size) text-log read. Falls back
+ *  to text log if sqlite isn't populated yet. */
 function getSafeContext(lines = 5): string {
+	const rows = queryRecentTurns(lines);
+	if (rows.length > 0) {
+		return rows.map(r => {
+			if (r.role === 'user') return `Owner said: ${r.text}`;
+			if (r.role === 'assistant') return `You (Sutando) replied: ${r.text}`;
+			return '';
+		}).filter(Boolean).join('\n');
+	}
 	try {
 		const logPath = join(WORKSPACE_DIR, 'conversation.log');
 		if (!existsSync(logPath)) return '';
