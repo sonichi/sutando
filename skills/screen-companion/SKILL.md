@@ -73,13 +73,27 @@ goal_template: "Optional one-liner with {goal} placeholder"
 
 After adding, run `bash scripts/activate.ts --list` to confirm the loader picks it up. No skill rebuild required — configs are loaded fresh on each activation.
 
-## Run (v0 skeleton — load + print only)
+## Run
+
+**Via voice (preferred):** say one of the activation phrases for the mode you want. For `guided-setup`: *"help me set this up"*, *"guide me through this"*, *"walk me through this"*, or *"I don't know what to click"*. Sutando picks up the phrase, asks for the goal if it isn't already clear from context, then activates the mode via the `activate_screen_companion` tool.
+
+**Via CLI (preview the config without activating):**
 
 ```bash
 npx tsx skills/screen-companion/scripts/activate.ts --config guided-setup --goal "find the bot token in the Discord developer portal"
 ```
 
-This v0 ships the **loader + printer**: it reads the config and prints what *would* happen (mode prompt, tools allowed, vision cadence). No wiring to the voice agent yet. Followups: real wiring as a separate PR.
+This prints the activation card — mode prompt, tools allowed, vision cadence — without entering the mode. Useful for tuning a new config before wiring it to voice.
+
+## How activation wires through
+
+The voice agent loads `activate_screen_companion` via the skill manifest (`manifest.json` → `tools.ts`). When Gemini calls it with `mode` + `goal`:
+
+1. The tool reads `configs/<mode>.yaml` and returns a structured payload (`instructions`, `tools_allow`, `vision_mode`, `vision_cadence_ms`, `activation_message`).
+2. Gemini speaks `activation_message`, then treats `instructions` as its operating prompt for the rest of the session.
+3. If `vision_mode` is `push` and screen-share isn't already streaming, Gemini asks the user to start it. Vision is owner-driven (the user starts screen-share); the tool does not toggle it directly.
+
+Restart the voice-agent for the manifest to pick up newly-added configs / SKILL.md changes (configs themselves are loaded fresh on each activation, so they don't require a restart).
 
 ## Open questions still being worked
 
