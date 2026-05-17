@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from './workspace_default.js';
+import { recordConversation, recordSessionBoundary } from './conversation-store.js';
 
 const REPO_DIR = resolveWorkspace();
 const TASK_DIR = join(REPO_DIR, 'tasks');
@@ -310,8 +311,10 @@ export const workTool: ToolDefinition = {
  *  override via SUTANDO_LOG_LINE_MAX_CHARS env if a host wants tighter logs. */
 const LOG_LINE_MAX_CHARS = Number(process.env.SUTANDO_LOG_LINE_MAX_CHARS) || 2000;
 export function logConversation(role: string, text: string): void {
-	const line = `${new Date().toISOString()}|${role}|${text.replace(/\n/g, ' ').slice(0, LOG_LINE_MAX_CHARS)}\n`;
+	const capped = text.replace(/\n/g, ' ').slice(0, LOG_LINE_MAX_CHARS);
+	const line = `${new Date().toISOString()}|${role}|${capped}\n`;
 	try { appendFileSync(CONVERSATION_LOG, line); } catch { /* best effort */ }
+	recordConversation(role, capped); // #603 sqlite mirror — best-effort, swallowed inside
 }
 
 /** Append a session-end boundary marker. Used by voice-agent's
@@ -327,6 +330,7 @@ export function logConversation(role: string, text: string): void {
 export function logSessionBoundary(reason: string = 'user_goodbye'): void {
 	const line = `${new Date().toISOString()}|SESSION_END|${reason}\n`;
 	try { appendFileSync(CONVERSATION_LOG, line); } catch { /* best effort */ }
+	recordSessionBoundary(reason); // #603 sqlite mirror
 }
 
 /** Seconds since the most recent user/assistant turn. Walks the log
