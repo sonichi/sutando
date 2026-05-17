@@ -14,6 +14,27 @@ cd "$REPO"
 # $SUTANDO_ROOT.
 export SUTANDO_ROOT="$REPO"
 
+# Git committer attribution from stand-identity.json (opt-in, no env var).
+# The repo-local `user.email` (set to the GitHub privacy noreply) is the
+# AUTHOR — CLA-Assistant resolves it to the owner's GitHub account, gating
+# the PR check. The COMMITTER is free to carry per-host attribution so that
+# `git log --format='%h %an / %cn %s'` distinguishes which Sutando host
+# crafted each commit (Mini, MacBook, …). Without this, all bot commits
+# share both fields and you lose track of which fleet host did the work.
+#
+# Silent fall-through on every "no identity" path: missing file, missing
+# jq, empty/malformed fields. OSS users see no change — they don't ship a
+# stand-identity.json. Fleet hosts opt in by virtue of having one.
+if [ -f "$REPO/stand-identity.json" ] && command -v jq > /dev/null 2>&1; then
+  _stand_name=$(jq -r '.name // empty' "$REPO/stand-identity.json" 2>/dev/null)
+  _stand_machine=$(jq -r '.machine // empty' "$REPO/stand-identity.json" 2>/dev/null)
+  if [ -n "$_stand_name" ] && [ -n "$_stand_machine" ]; then
+    git -C "$REPO" config committer.name "$_stand_name"
+    git -C "$REPO" config committer.email "${_stand_machine}@noreply.sutando.local"
+  fi
+  unset _stand_name _stand_machine
+fi
+
 # Auto-bootstrap: create-if-missing files and dirs that the agent + skills
 # expect to exist (logs, state, tasks, results, notes, contextual-chips.json,
 # pending-questions.md, build_log.md, crons.json, …). Idempotent — safe to
