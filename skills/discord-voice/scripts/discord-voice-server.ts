@@ -33,7 +33,6 @@ _dotenvConfig({ path: join(process.env.HOME ?? '', '.claude/channels/discord/.en
 
 import { fileURLToPath } from 'node:url';
 import { execSync, spawn } from 'node:child_process';
-import { PassThrough } from 'node:stream';
 import { VoiceSession, type ToolDefinition, type MainAgent } from 'bodhi-realtime-agent';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
@@ -172,7 +171,6 @@ interface DiscordVoiceSession {
 	sessionId: string;
 	connection: VoiceConnection;
 	player: AudioPlayer;
-	pcmOut: PassThrough;
 	voiceSession: VoiceSession;
 	guildId: string;
 	channelId: string;
@@ -533,22 +531,21 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 	// the queue into a fresh AudioResource and play. This avoids the
 	// outbound-silence-pump pattern (which buffered up and added latency on
 	// every reconnect). Each Gemini burst becomes one resource.
-	const pcmOut = new PassThrough({ highWaterMark: 1 << 20 }); // legacy, unused, kept for type compat
 	const audioOutQueue: Buffer[] = [];
 	const player = createAudioPlayer({
 		behaviors: { noSubscriber: NoSubscriberBehavior.Play },
 	});
 	connection.subscribe(player);
 
-	function flushAudioQueue(): void {
+	const flushAudioQueue = (): void => {
 		if (audioOutQueue.length === 0) return;
 		const merged = Buffer.concat(audioOutQueue.splice(0));
 		const stream = Readable.from([merged]);
 		const resource = createAudioResource(stream, { inputType: StreamType.Raw });
 		player.play(resource);
-	}
+	};
 
-	(player as any)._pushAudio = (chunk: Buffer) => {
+	const pushAudio = (chunk: Buffer): void => {
 		audioOutQueue.push(chunk);
 		if (player.state.status === AudioPlayerStatus.Idle) flushAudioQueue();
 	};
@@ -568,7 +565,6 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 		sessionId,
 		connection,
 		player,
-		pcmOut,
 		guildId: GUILD_ID!,
 		channelId: CHANNEL_ID!,
 		voiceSession: null as unknown as VoiceSession,
@@ -629,7 +625,7 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 		try {
 			const pcm24Mono = Buffer.from(data, 'base64');
 			const pcm48Stereo = upsample24MonoTo48Stereo(pcm24Mono);
-			(player as any)._pushAudio(pcm48Stereo);
+			pushAudio(pcm48Stereo);
 			outChunks++;
 			if (outChunks === 1 || outChunks % 50 === 0) {
 				console.log(`${ts()} [Audio] outbound chunks: ${outChunks} (last=${pcm48Stereo.length}B)`);
@@ -676,18 +672,20 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 
 	sessionAny.handleClientConnected();
 
+	// In-flight guard so repeated transport flaps don't stack reconnect timers.
+	let reconnectPending = false;
 	const origHandleTransportClose = sessionAny.handleTransportClose.bind(sessionAny);
 	sessionAny.handleTransportClose = (code?: number, reason?: string) => {
 		console.log(`${ts()} [Voice] transport closed: code=${code} reason=${reason}`);
 		origHandleTransportClose(code, reason);
-		if (!s.closing && active === s) {
-			setTimeout(() => {
-				if (!s.closing && active === s) {
-					console.log(`${ts()} [Voice] reconnecting Gemini for ${sessionId}`);
-					sessionAny.handleClientConnected();
-				}
-			}, 1500);
-		}
+		if (s.closing || active !== s || reconnectPending) return;
+		reconnectPending = true;
+		setTimeout(() => {
+			reconnectPending = false;
+			if (s.closing || active !== s) return;
+			console.log(`${ts()} [Voice] reconnecting Gemini for ${sessionId}`);
+			sessionAny.handleClientConnected();
+		}, 1500);
 	};
 
 	// Subscribe to anyone currently speaking, and to anyone who starts.
@@ -715,7 +713,6 @@ function cleanupSession(s: DiscordVoiceSession): void {
 	try { clearInterval((s as any)._tickHandle); } catch {}
 	try { clearInterval((s as any)._outTickHandle); } catch {}
 	try { s.player.stop(true); } catch {}
-	try { s.pcmOut.end(); } catch {}
 	try { s.connection.destroy(); } catch {}
 
 	s.voiceSession.close('discord_voice_disconnect').catch(e =>
