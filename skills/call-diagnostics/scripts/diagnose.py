@@ -745,10 +745,10 @@ if __name__ == "__main__":
 
     if "--tracker" in sys.argv:
         calls = load_calls(last_n=999)
-        source = "voice" if "voice-metrics" in str(METRICS_PATH) else "phone"
+        source = "phone"  # voice-metrics.jsonl writes removed in #603; sqlite now
         out_path = f"/tmp/{source}-diagnostics-tracker.html"
         out = generate_tracker_html(calls, out_path, source_type=source)
         content = Path(out).read_text()
-        title = "Voice Agent Diagnostics Tracker" if source == "voice" else "Phone Call Diagnostics Tracker"
+        title = "Phone Call Diagnostics Tracker"
         Path(out).write_text(content.replace("TRACKER_TITLE_PLACEHOLDER", title))
         print(f"\nTracker: {out}")

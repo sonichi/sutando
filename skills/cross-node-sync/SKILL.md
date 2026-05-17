@@ -31,7 +31,7 @@ Syncthing would still be the right call if: scope grew past a few hundred files,
 - `state/`, `tasks/`, `results/`, `logs/` — per-bot queues + histories
 - `core-status.json`, `build_log.md`, `contextual-chips.json` — per-bot proactive state
 - `.env`, `~/.claude/channels/*/.env` — different tokens per node
-- `data/voice-metrics.jsonl` — per-node
+- `data/voice-metrics.jsonl`, `data/call-metrics.jsonl` — frozen historical archives (writers removed in #603; new session rollups go to `data/conversation.sqlite` instead)
 - `src/.discord-pending-replies.json` (legacy location), `src/Sutando/SutandoApp` (Mac binary build artifact)
 - `~/.claude/projects/` (other projects), `~/.claude/skills/` (installed per-node)
 - `.DS_Store`, `*.swp`, `*.swo`, `.stversions`, `.stfolder` (OS/editor/Syncthing-legacy noise)
