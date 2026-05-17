@@ -366,7 +366,7 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 				'Shares the owner\'s screen (Entire Screen mode, picker handled automatically by the proactive loop). ' +
 				'Call again to re-share even if already shared (user wants a fresh share). ' +
 				'DO NOT route share-screen utterances to switch_tab — switch_tab is for navigating between EXISTING Chrome tabs by tab-name keyword, not for screen-share workflows. ' +
-				'To stop, dismiss the voice session or the user clicks Stop Streaming in Discord.',
+				'To stop, use stop_share_screen tool (NOT dismiss — dismiss leaves the whole voice session).',
 			parameters: z.object({}),
 			execution: 'inline',
 			pendingMessage: 'Setting up screen share — picker handled by the proactive loop.',
@@ -382,6 +382,33 @@ access_tier: owner
 				writeFileSync(taskFile, body);
 				console.log(`${ts()} [ShareScreen] delegated to proactive-loop via ${taskFile}`);
 				return { status: 'share_screen_requested', message: 'Picker click sequence handed off to the proactive loop.' };
+			},
+		});
+		// Skill-local stop_share_screen tool. Same delegation pattern as
+		// share_screen — write a task file the proactive-loop picks up and
+		// clicks the "Stop Streaming" button via chrome-devtools-mcp (no
+		// modal needed for stop).
+		tools.push({
+			name: 'stop_share_screen',
+			description:
+				'STRONG MATCH for any "stop share" / "stop sharing" / "stop screen share" / "unshare" / "停止分享" / "停止共享" / "别分享了" utterance. ' +
+				'Stops the active Discord screen share by clicking the Stop Streaming button. Voice channel stays connected. ' +
+				'No-op if not currently sharing.',
+			parameters: z.object({}),
+			execution: 'inline',
+			pendingMessage: 'Stopping screen share — handed to the proactive loop.',
+			async execute() {
+				const tsNow = Date.now();
+				const taskFile = join(TASKS_DIR, `task-discord-stop-share-${tsNow}.txt`);
+				const body = `id: task-discord-stop-share-${tsNow}
+timestamp: ${new Date().toISOString()}
+task: [discord-voice stop_share_screen] On the chrome-devtools-mcp Chrome, take_snapshot on the Discord voice channel page and click the button with description="Stop Streaming" (main view, uid likely 6_93 or similar — the button replaces "Share Your Screen" while sharing is active). Verify "Share Your Screen" reappears after.
+source: discord-voice
+access_tier: owner
+`;
+				writeFileSync(taskFile, body);
+				console.log(`${ts()} [StopShare] delegated to proactive-loop via ${taskFile}`);
+				return { status: 'stop_share_requested', message: 'Stop-share click handed off to the proactive loop.' };
 			},
 		});
 		const seen = new Set(tools.map(t => t.name));
