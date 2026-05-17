@@ -52,23 +52,25 @@ The default deliberately avoids `~/Library/Application Support/sutando/` — tha
 - Python: `from workspace_default import resolve_workspace` → returns a `Path`.
 - TypeScript: `process.env.SUTANDO_WORKSPACE || join(homedir(), '.sutando', 'workspace')`.
 
-### Existing-repo installs MUST pin `SUTANDO_WORKSPACE`
+### Existing-repo installs: trigger the migration (or pin `SUTANDO_WORKSPACE` as stop-gap)
 
-If your loop / cron / scripts run from `<repo>/` itself (the historic default before #762) and you do NOT explicitly set `SUTANDO_WORKSPACE`, you will hit a silent **path divergence**:
+If your loop / cron / scripts polled `<repo>/tasks/` directly before #762 (and any component — Python or TS — that hardcoded the repo path via `Path(__file__).parent.parent` or `new URL('..', import.meta.url)` is still doing so), you'll see a silent **path divergence**:
 
 - The bridge (and any caller of `resolve_workspace()`) writes new tasks to the canonical default `~/.sutando/workspace/tasks/`.
-- The proactive-loop session and any non-Python component polling `tasks/` via a relative path keep reading `<repo>/tasks/`.
+- Any component still reading from `<repo>/tasks/` via a relative path won't see them.
 - Result: new tasks never reach the loop. Observed 2026-05-16 — 7 owner DMs orphaned over 19 minutes before the divergence was caught.
 
-**Fix for existing installs:** put one line in `.env` at the repo root:
+**Preferred fix:** restart the bridge and sutando-app. The migration code from #762 (`_migrate_from_legacy`) auto-moves `<repo>/{tasks,results,state}` → `~/.sutando/workspace/{tasks,results,state}` on first new-default run. After migration, both sides agree on the canonical default and no env var is needed.
+
+**Stop-gap (if migration won't run):** pin `SUTANDO_WORKSPACE` in `.env` at the repo root and restart the bridges:
 
 ```bash
 SUTANDO_WORKSPACE=/full/path/to/your/repo
 ```
 
-After setting, restart the discord/telegram bridges so they re-read the env. Everything then writes and reads from the same `<repo>/tasks/` and `<repo>/results/` — no symlinks needed.
+**Caveat:** this revives the git-status-pollution antipattern that #762 was designed to escape (every `tasks/`, `results/`, `state/` write shows up in `git status`). Use sparingly; prefer the migration when possible.
 
-**Fresh installs** can skip this — the `~/.sutando/workspace/` default works because nothing else polls the repo path.
+**Fresh installs** can skip this entirely — the `~/.sutando/workspace/` default works because nothing else polls the repo path.
 
 ## Personal overrides
 
