@@ -101,9 +101,9 @@ Full memory index: $SUTANDO_MEMORY_DIR (default: ~/.claude/projects/.../memory)/
 
 Key files:
 - User profile: $SUTANDO_MEMORY_DIR (default: ~/.claude/projects/.../memory)/user_profile.md
+- Feedback (response style): $SUTANDO_MEMORY_DIR (default: ~/.claude/projects/.../memory)/feedback_response_style.md
+- Feedback (operating principle): $SUTANDO_MEMORY_DIR (default: ~/.claude/projects/.../memory)/feedback_minimal_cost_max_value.md
 - Build log (what's built, what's next): build_log.md
-
-`MEMORY.md` is the source of truth for available memory files — read it first to discover the current set (feedback, project, reference entries). Hardcoded paths here drift; MEMORY.md doesn't.
 
 Read relevant memory files when user preferences or history would improve task quality. Write new memory when you learn something durable about the user or the project.
 
