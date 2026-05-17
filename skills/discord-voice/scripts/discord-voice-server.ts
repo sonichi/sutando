@@ -728,8 +728,15 @@ async function start(): Promise<void> {
 	});
 }
 
-process.on('SIGINT', () => { if (active) cleanupSession(active); process.exit(0); });
-process.on('SIGTERM', () => { if (active) cleanupSession(active); process.exit(0); });
+// Give connection.destroy() ~1.5s to flush the voice-gateway disconnect frame
+// before exiting; otherwise Discord keeps the bot pinned in the channel until
+// its own heartbeat timeout (~60-90s).
+function shutdownAfterFlush(code: number): void {
+	if (active) { try { cleanupSession(active); } catch {} }
+	setTimeout(() => process.exit(code), 1500);
+}
+process.on('SIGINT', () => shutdownAfterFlush(0));
+process.on('SIGTERM', () => shutdownAfterFlush(0));
 process.on('uncaughtException', (err) => { console.error(`${ts()} [FATAL]`, err); if (active) cleanupSession(active); process.exit(1); });
 process.on('unhandledRejection', (err) => { console.error(`${ts()} [FATAL]`, err); if (active) cleanupSession(active); process.exit(1); });
 

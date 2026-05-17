@@ -309,11 +309,19 @@ set volume output volume 0`;
 export const dismissTool: ToolDefinition = {
 	name: 'dismiss',
 	description:
-		'Leave the current Zoom meeting. The opposite of summon/join_zoom. ' +
-		'Use when user says "dismiss", "leave zoom", "end meeting", "leave the call", "hang up zoom".',
+		'Leave the current voice presence. Polymorphic: in a Discord voice channel, ' +
+		'exits the Discord voice session (SIGTERM to discord-voice-server). Otherwise leaves the current Zoom meeting (AppleScript). ' +
+		'Use when user says "dismiss", "leave", "leave zoom", "leave discord", "log off", "bye", "end meeting", "hang up", "退出", "下线", "你走吧". ' +
+		'NOT for ending an in-progress task or hanging up a phone call.',
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
+		// Discord-voice context: SIGTERM self so cleanupSession handler runs.
+		if (process.env.DISCORD_VOICE_SERVER === '1') {
+			console.log(`${ts()} [Dismiss] Discord voice context — SIGTERM`);
+			setTimeout(() => { try { process.kill(process.pid, 'SIGTERM'); } catch {} }, 400);
+			return { status: 'left_discord_voice' };
+		}
 		try {
 			// 1. Stop screen share (Cmd+Shift+S), 2. Cmd+W leave dialog, 3. Enter confirm
 			execSync(`osascript -e '
@@ -682,3 +690,4 @@ end tell`;
 		}
 	},
 };
+
