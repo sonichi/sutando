@@ -32,7 +32,7 @@ _dotenvConfig({ path: new URL('../../../.env', import.meta.url).pathname, overri
 _dotenvConfig({ path: join(process.env.HOME ?? '', '.claude/channels/discord/.env'), override: false });
 
 import { fileURLToPath } from 'node:url';
-import { execSync } from 'node:child_process';
+import { execSync, spawn } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { VoiceSession, type ToolDefinition, type MainAgent } from 'bodhi-realtime-agent';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
@@ -349,34 +349,22 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 				return { status: 'left_discord_voice' };
 			},
 		});
-		// Skill-local share_screen tool. Voice-server can't directly invoke
-		// chrome-devtools-mcp + macos-use (those are MCP tools owned by the
-		// proactive-loop Claude session, not this Node process). So this tool
-		// delegates by writing a task file the proactive-loop picks up and
-		// executes via the validated hybrid 4-click sequence:
-		//   1. chrome-devtools-mcp click Share Your Screen (Discord webpage uid)
-		//   2. macos-use click Entire Screen tab (Chrome modal)
-		//   3. macos-use click screen thumbnail
-		//   4. macos-use click Share button
-		// End-to-end ~3 sec, validated 2026-05-17 in Orion #General.
-		// Common share-screen delegation. Used by both share_screen and the
-		// skill-local summon override (which exists because the core
-		// summonTool description matches "share my screen" → opens Zoom).
-		// Fast path: chrome-devtools-mcp click on Share Your Screen (~0.5s),
-		// then `share-screen-modal.py` does 3 CGEvent clicks (~0.5s) skipping
-		// macos-use traversal overhead. Total ~1s vs old ~3s.
-		const writeShareScreenTask = (source: string) => {
-			const tsNow = Date.now();
-			const taskFile = join(TASKS_DIR, `task-discord-share-screen-${tsNow}.txt`);
-			const body = `id: task-discord-share-screen-${tsNow}
-timestamp: ${new Date().toISOString()}
-task: [discord-voice ${source}] Drive the share-screen FAST sequence (~1s total). (1) chrome-devtools-mcp take_snapshot on the Discord page, click button description="Share Your Screen". (2) After modal opens (~300ms), run \`python3 skills/discord-voice/scripts/share-screen-modal.py\` — this CGEvent-clicks Entire Screen tab, thumbnail, Share button in ~0.5s (no macos-use traversal). Verify "Stop Streaming" appears via chrome-devtools snapshot.
-source: discord-voice
-access_tier: owner
-`;
-			writeFileSync(taskFile, body);
-			console.log(`${ts()} [ShareScreen via ${source}] delegated to proactive-loop via ${taskFile}`);
-			return { status: 'share_screen_requested', message: 'Picker click sequence handed off to the proactive loop.' };
+		// Skill-local share_screen — full sub-2s path. The voice-server
+		// directly spawns share-screen-modal.py (--full mode) which does ALL
+		// 5 CGEvent clicks (Discord Share button + Entire Screen tab +
+		// thumbnail + Share button) in ~0.7s. No MCP, no task-bridge, no
+		// proactive-loop hop. Coords hard-coded in the python script —
+		// re-derive via macos-use refresh_traversal on the MCP-Chrome main
+		// PID if Discord/Chrome UI moves.
+		const SHARE_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'share-screen-modal.py');
+		const spawnShareScreen = (source: string, mode: 'full' | 'stop') => {
+			const flag = mode === 'stop' ? '--stop' : '--full';
+			const child = spawn('python3', [SHARE_SCRIPT, flag], { stdio: 'ignore', detached: true });
+			child.on('error', (err) => console.log(`${ts()} [ShareScreen ${source}] spawn error:`, err));
+			child.unref();
+			console.log(`${ts()} [ShareScreen ${source} ${flag}] spawned PID ${child.pid}`);
+			return { status: mode === 'stop' ? 'stop_share_clicked' : 'share_screen_clicked',
+			         message: mode === 'stop' ? 'Stop-share click fired.' : 'Picker drive fired (sub-1s).' };
 		};
 		tools.push({
 			name: 'share_screen',
@@ -388,8 +376,8 @@ access_tier: owner
 				'To stop, use stop_share_screen tool (NOT dismiss — dismiss leaves the whole voice session).',
 			parameters: z.object({}),
 			execution: 'inline',
-			pendingMessage: 'Setting up screen share — picker handled by the proactive loop.',
-			async execute() { return writeShareScreenTask('share_screen'); },
+			pendingMessage: 'Setting up screen share.',
+			async execute() { return spawnShareScreen('share_screen', 'full'); },
 		});
 		// Skill-local override: the core `summon` tool opens Zoom.app — wrong
 		// behavior when the user is in a Discord voice channel saying "summon"
@@ -402,12 +390,11 @@ access_tier: owner
 				'This override exists only because the core summon tool would otherwise open Zoom.app — wrong app when the user is in Discord.',
 			parameters: z.object({}),
 			execution: 'inline',
-			async execute() { return writeShareScreenTask('summon→share_screen'); },
+			async execute() { return spawnShareScreen('summon→share_screen', 'full'); },
 		});
-		// Skill-local stop_share_screen tool. Same delegation pattern as
-		// share_screen — write a task file the proactive-loop picks up and
-		// clicks the "Stop Streaming" button via chrome-devtools-mcp (no
-		// modal needed for stop).
+		// Skill-local stop_share_screen — same fast path. Single CGEvent
+		// click on the Discord voice-strip button at (338, 809) which
+		// morphs to "Stop Streaming" when a share is active.
 		tools.push({
 			name: 'stop_share_screen',
 			description:
@@ -416,20 +403,8 @@ access_tier: owner
 				'No-op if not currently sharing.',
 			parameters: z.object({}),
 			execution: 'inline',
-			pendingMessage: 'Stopping screen share — handed to the proactive loop.',
-			async execute() {
-				const tsNow = Date.now();
-				const taskFile = join(TASKS_DIR, `task-discord-stop-share-${tsNow}.txt`);
-				const body = `id: task-discord-stop-share-${tsNow}
-timestamp: ${new Date().toISOString()}
-task: [discord-voice stop_share_screen] On the chrome-devtools-mcp Chrome, take_snapshot on the Discord voice channel page and click the button with description="Stop Streaming" (main view, uid likely 6_93 or similar — the button replaces "Share Your Screen" while sharing is active). Verify "Share Your Screen" reappears after.
-source: discord-voice
-access_tier: owner
-`;
-				writeFileSync(taskFile, body);
-				console.log(`${ts()} [StopShare] delegated to proactive-loop via ${taskFile}`);
-				return { status: 'stop_share_requested', message: 'Stop-share click handed off to the proactive loop.' };
-			},
+			pendingMessage: 'Stopping screen share.',
+			async execute() { return spawnShareScreen('stop_share_screen', 'stop'); },
 		});
 		const seen = new Set(tools.map(t => t.name));
 		for (const t of inlineTools) {
@@ -486,9 +461,9 @@ function triggerSilenceBurst(s: DiscordVoiceSession): void {
 //
 // FIX: only send silence in a short BURST after Discord's
 // EndBehaviorType.AfterSilence fires (i.e. user stopped speaking). The burst
-// is ~250ms (12 frames × 20ms) which is enough to push Gemini past its
-// silenceDurationMs (~1s default) when combined with the 200ms AfterSilence
-// gap already provided by Discord, but doesn't flood the WS continuously.
+// is ~1500ms (SILENCE_BURST_FRAMES = 75 frames × 20ms) — set high to overshoot
+// Gemini Live's silenceDurationMs (~1s default) reliably even on a flaky WS,
+// while still terminating instead of flooding silence forever.
 //
 // `triggerSilenceBurst(s)` is called from decoder.on('end') in subscribeUser.
 function startAudioTicker(s: DiscordVoiceSession): void {
