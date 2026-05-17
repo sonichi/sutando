@@ -79,6 +79,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '../../../src/inline-tools.js';
+import { recordSession } from '../../../src/conversation-store.js';
 // Lazy vision-session handle. Only loaded if a call ever needs it — keeps the
 // phone-agent boot path free of the vision-tools.ts side-effects on cold start.
 let _setVisionSession: ((s: unknown) => void) | null = null;
@@ -962,25 +963,22 @@ function cleanupCall(callSid: string): void {
 	}
 	console.log(`${ts()} [Phone] call finalized: ${callSid}`);
 
-	// Observability: write per-call metrics to data/call-metrics.jsonl
+	// Observability: per-call metrics → sqlite (data/conversation.sqlite, #603)
 	session.events.push({ event: 'call_ended', timestamp: new Date().toISOString() });
 	const durationMs = Date.now() - session.startTime;
-	const metrics = {
-		timestamp: new Date().toISOString(),
+	recordSession({
+		source: 'phone',
 		callSid,
 		caller: session.callerNumber,
 		isOwner: session.isOwner,
 		isMeeting: session.isMeeting,
 		durationMs,
 		transcriptLines: session.transcript.length,
-		toolCalls: session.toolCalls,
 		toolCount: session.toolCalls.length,
 		pendingTasks: session.pendingTasks,
+		toolCalls: session.toolCalls,
 		events: session.events,
-	};
-	try {
-		appendFileSync(join(WORKSPACE_DIR, 'data', 'call-metrics.jsonl'), JSON.stringify(metrics) + '\n');
-	} catch { /* best effort */ }
+	});
 
 	// Auto-scan the latest call for issues (async, best effort)
 	try {
