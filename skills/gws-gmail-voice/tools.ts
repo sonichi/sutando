@@ -129,9 +129,90 @@ const triageEmailTool: ToolDefinition = {
 	},
 };
 
+// Closes the §5 Now "Gmail gap" — adds inline read + search tools so voice
+// doesn't have to fall through to `work` (5-30s round-trip) for those calls.
+// Send / reply / delete intentionally remain `work`-delegated because they
+// need explicit owner confirmation; this surface stays read-only.
+
+const readEmailTool: ToolDefinition = {
+	name: 'read_email',
+	description:
+		'Read a specific Gmail message by id. Use after `triage_email` returns a list and the caller asks to hear one specific message ("read me the first one", "open the email from Jane"). ' +
+		'Returns the message body (plain text by default) + headers (From, Subject, Date). Pass the `id` from a prior `triage_email` result. ' +
+		'On error: tell the caller you\'re using a slower path, then call the `work` tool with "read gmail message <id> via gws gmail +read".',
+	parameters: z.object({
+		id: z.string().describe('Gmail message id (from a prior triage_email result).'),
+		html: z.boolean().optional().describe('Return HTML body instead of plain text. Default false.'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { id, html = false } = args as { id: string; html?: boolean };
+		console.log(`${ts()} [ReadEmail] id=${id} html=${html}`);
+		try {
+			const cmdArgs = ['gmail', '+read', '--id', id, '--format', 'json', '--headers'];
+			if (html) cmdArgs.push('--html');
+			const stdout = execFileSync('gws', cmdArgs, {
+				timeout: 10_000,
+				encoding: 'utf8',
+				stdio: ['ignore', 'pipe', 'pipe'],
+			});
+			const match = stdout.match(/^\{/m);
+			const jsonStart = match?.index ?? stdout.indexOf('{');
+			if (jsonStart === -1) return { error: 'read_email: gws did not return JSON' };
+			const parsed = JSON.parse(stdout.slice(jsonStart));
+			return { status: 'ok', message: parsed };
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			console.log(`${ts()} [ReadEmail] failed: ${msg}`);
+			return { error: `read_email failed: ${msg}. Fall back to work tool: "read gmail message ${id} via gws gmail +read".` };
+		}
+	},
+};
+
+const searchEmailTool: ToolDefinition = {
+	name: 'search_email',
+	description:
+		'Search Gmail by query string. Use when the caller asks "find emails from X", "did I get an email about Y", "search inbox for Z". ' +
+		'`query` follows Gmail search syntax — `from:foo@example.com`, `subject:invoice`, `after:2026/05/01`, `has:attachment`, etc. ' +
+		'Returns matching messages (id, sender, subject, date). Pass an id to `read_email` to hear the body. ' +
+		'On error: fall back to `work` with "search gmail for <query>".',
+	parameters: z.object({
+		query: z.string().describe('Gmail search query (from:, subject:, after:, has:, etc.). Required.'),
+		max: z.number().int().min(1).max(20).optional().describe('Max results (default 5).'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { query, max = 5 } = args as { query: string; max?: number };
+		console.log(`${ts()} [SearchEmail] query="${query}" max=${max}`);
+		try {
+			// +triage with --query is the existing search surface; reuse it so the
+			// JSON shape matches triage_email's. Avoid `users messages list`
+			// which returns ids only (would force a second fetch per message).
+			const cmdArgs = ['gmail', '+triage', '--format', 'json', '--max', String(max), '--query', query];
+			const stdout = execFileSync('gws', cmdArgs, {
+				timeout: 10_000,
+				encoding: 'utf8',
+				stdio: ['ignore', 'pipe', 'pipe'],
+			});
+			const match = stdout.match(/^\{/m);
+			const jsonStart = match?.index ?? stdout.indexOf('{');
+			if (jsonStart === -1) return { error: 'search_email: gws did not return JSON' };
+			const parsed = JSON.parse(stdout.slice(jsonStart));
+			const messages = Array.isArray(parsed) ? parsed : parsed.messages ?? [];
+			return { status: 'ok', count: messages.length, messages, query: parsed.query ?? query };
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			console.log(`${ts()} [SearchEmail] failed: ${msg}`);
+			return { error: `search_email failed: ${msg}. Fall back to work tool: "search gmail for ${query}".` };
+		}
+	},
+};
+
 // Self-detection: skip registration on OSS systems without gws-gmail installed.
-export const tools: ToolDefinition[] = gwsAvailable() ? [triageEmailTool] : [];
+export const tools: ToolDefinition[] = gwsAvailable()
+	? [triageEmailTool, readEmailTool, searchEmailTool]
+	: [];
 
 if (tools.length === 0) {
-	console.log(`${ts()} [gws-gmail-voice] gws CLI not on PATH — triage_email not registered (install gws-gmail skill to enable)`);
+	console.log(`${ts()} [gws-gmail-voice] gws CLI not on PATH — Gmail tools not registered (install gws-gmail skill to enable)`);
 }

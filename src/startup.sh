@@ -253,13 +253,27 @@ else
   echo "  ~ telegram bridge (no token — optional)"
 fi
 
-# 7. Discord bridge (optional — needs DISCORD_BOT_TOKEN)
+# 7. Discord bridge (optional — needs DISCORD_BOT_TOKEN + discord.py)
+#
+# `python3` on $PATH is unpredictable across installs (miniconda, system,
+# Homebrew). The bridge itself self-rescues by re-execing under a known-good
+# interpreter (see top of src/discord-bridge.py), but launching it with the
+# right one in the first place avoids the wasted process + traceback noise.
+# Probe a fixed list of candidates in priority order; first one with discord.py
+# wins. Same probe is also what's used in the bridge's rescue fallback.
 if [ -f "$HOME/.claude/channels/discord/.env" ] && grep -q "DISCORD_BOT_TOKEN=" "$HOME/.claude/channels/discord/.env" 2>/dev/null; then
-  if ! python3 -c "import discord" 2>/dev/null; then
-    echo "  ~ discord bridge (needs: pip3 install discord.py)"
+  PYTHON_WITH_DISCORD=""
+  for _p in /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
+    if command -v "$_p" >/dev/null 2>&1 && "$_p" -c "import discord" 2>/dev/null; then
+      PYTHON_WITH_DISCORD="$_p"
+      break
+    fi
+  done
+  if [ -z "$PYTHON_WITH_DISCORD" ]; then
+    echo "  ~ discord bridge (no python with discord.py — run: /opt/homebrew/bin/pip3 install discord.py)"
   elif ! pgrep -f "discord-bridge" > /dev/null 2>&1; then
-    echo "  Starting Discord bridge..."
-    python3 src/discord-bridge.py > logs/discord-bridge.log 2>&1 &
+    echo "  Starting Discord bridge with $PYTHON_WITH_DISCORD..."
+    "$PYTHON_WITH_DISCORD" src/discord-bridge.py > logs/discord-bridge.log 2>&1 &
     echo "  ✓ discord bridge"
   else
     echo "  ✓ discord bridge (already running)"
