@@ -24,7 +24,13 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 
 MEM_DIR="$HOME/.claude/projects/-Users-xueqingliu-Documents-sutando-sutando/memory"
-NOTES_DIR="$REPO_ROOT/notes"
+# Notes lives under $SUTANDO_WORKSPACE per the workspace contract (CLAUDE.md
+# "Workspace contract"); fall back to $REPO_ROOT for pre-contract installs.
+if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
+    NOTES_DIR="$SUTANDO_WORKSPACE/notes"
+else
+    NOTES_DIR="$REPO_ROOT/notes"
+fi
 ASSETS_DIR="$REPO_ROOT/assets"
 
 list_dir() {
