@@ -37,6 +37,21 @@ Before creating a PR, check `gh pr list --state open` for an existing PR on the 
 
 Never commit directly to main. Always work on a feature branch.
 
+## Workspace contract
+
+All per-user mutable state — `tasks/`, `results/`, `state/`, `data/`, `logs/`, `notes/`, `build_log.md`, `pending-questions.md`, `contextual-chips.json`, `core-status.json`, etc. — lives under a single **workspace** directory. Code, skills source, and repo configuration stay in the repo root (separate concern).
+
+**Resolution (every service reads the same):**
+
+1. `$SUTANDO_WORKSPACE` env var (override; `~` is expanded).
+2. `~/.sutando/workspace/` (default).
+
+The default deliberately avoids `~/Library/Application Support/sutando/` — that path is Sutando.app's territory (Chromium-style Cache/, GPUCache/, Cookies/, blob_storage/, etc.); the user-task workspace lives under its own hidden home-relative dir so the two concerns never collide. Historic anti-pattern: bridges fell back to the script's repo root via `Path(__file__).resolve().parent.parent`, which polluted `git status` and — when invoked from an app-bundled `src/` symlink — stranded owner DMs in a bundle-tasks/ dir while the watcher polled workspace-tasks/.
+
+**Use the helper, don't reinvent the fallback:**
+- Python: `from workspace_default import resolve_workspace` → returns a `Path`.
+- TypeScript: `process.env.SUTANDO_WORKSPACE || join(homedir(), '.sutando', 'workspace')`.
+
 ## Personal overrides
 
 If `PERSONAL_CLAUDE.md` exists in the workspace root, read and follow it. It contains user-specific rules, preferences, and configuration that override or extend these shared instructions.
@@ -47,6 +62,38 @@ Signal your work status to `core-status.json` so the web UI can display it:
 - Start of significant work: `echo '{"status":"running","step":"<description>","ts":<epoch>}' > core-status.json`
 - When done: `echo '{"status":"idle","ts":<epoch>}' > core-status.json`
 This applies to all work — proactive loop passes, voice tasks, user requests, code changes.
+
+## Chat-path task tracking (issue #585)
+
+When you accept a non-trivial commitment from the user via **chat** (direct text input, not through voice/Discord/Telegram bridges), write a task file so the dashboard can track it.
+
+**When to write a task file from chat:**
+- The user asks you to do something concrete (close a PR, send an email, research a topic, fix a bug)
+- NOT for: quick questions, greetings, simple lookups, clarifications
+
+**How:**
+```bash
+local _ts="$(date +%s)"
+cat > "tasks/task-chat-${_ts}.txt" << EOF
+id: task-chat-${_ts}
+timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+task: <concise description of what you're doing>
+source: chat
+channel_id: local-chat
+user_id: ${SUTANDO_DM_OWNER_ID:-chat-local}
+access_tier: owner
+EOF
+```
+
+**When done:**
+Write a result file using the same task ID:
+```bash
+cat > "results/task-chat-${_ts}.txt" << EOF
+<result summary>
+EOF
+```
+
+This ensures the dashboard, result-watcher, and timeout logic work the same regardless of entry path.
 
 ## Memory
 

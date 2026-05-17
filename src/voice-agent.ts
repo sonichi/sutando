@@ -24,7 +24,7 @@
 import 'dotenv/config';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
-import { existsSync, readFileSync, readdirSync, statSync, unlinkSync, mkdirSync, appendFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync, unlinkSync, mkdirSync, appendFileSync, writeFileSync, openSync, writeSync, closeSync } from 'node:fs';
 import { execSync as execSyncTop } from 'node:child_process';
 import { inlineTools, coreDocumentedSkills } from './inline-tools.js';
 import { setVisionSession, startVisionControlServer, stopVisionControlServer } from './vision-tools.js';
@@ -94,11 +94,67 @@ const PORT = Number(process.env.PORT) || 9900;
 const HOST = process.env.HOST || '0.0.0.0';
 // Default to sutando/ so Claude Code subprocess picks up CLAUDE.md automatically
 const WORKSPACE_DIR = process.env.WORKSPACE_DIR || new URL('..', import.meta.url).pathname;
+const PIDFILE = join(WORKSPACE_DIR, '.voice-agent.pid');
 const DEFAULT_THREAD_KEY = 'sutando_main';
 const SESSION_ID = `session_${Date.now()}`;
 const PHONE_PORT = Number(process.env.PHONE_PORT) || 3100;
 const PHONE_SERVER_URL = `http://localhost:${PHONE_PORT}`;
 const CALL_RESULTS_DIR = join(new URL('.', import.meta.url).pathname, '..', 'results', 'calls');
+
+/** Single-instance lock for this workspace.
+ *
+ * Voice-agent owns two ports (`:9900` WS server, `:7847` vision control) plus
+ * a fan-out of file watchers (tasks/, results/, context-drop, voice-state).
+ * A second copy that races for those ports — typically a terminal-launched
+ * `npm exec tsx src/voice-agent.ts` next to a healthy launchd one — used to
+ * survive an EADDRINUSE on `:9900` AND keep `:7847` bound with a dead Gemini
+ * session, so push-mode `/vision/start` from the web-client returned
+ * `No active voice session — vision streaming requires a connected session.`
+ *
+ * The pidfile prevents the duplicate from reaching ANY side effect (no port
+ * binds, no watchers wired, no `setVisionSession`) — it exits before the
+ * `VoiceSession` constructor runs.
+ *
+ * Stale pidfiles (SIGKILL / crash without `process.on('exit')` firing) are
+ * detected via `process.kill(pid, 0)` and overwritten. The rare race between
+ * two simultaneous startups is backstopped by the EADDRINUSE branch in
+ * `uncaughtException` below.
+ */
+function isProcessAlive(pid: number): boolean {
+	try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+function acquirePidLock(): void {
+	const myPid = process.pid;
+	try {
+		// Atomic create-or-fail (O_EXCL). If another voice-agent is starting
+		// concurrently, exactly one open() wins; the other gets EEXIST.
+		const fd = openSync(PIDFILE, 'wx');
+		try { writeSync(fd, Buffer.from(`${myPid}\n`)); }
+		finally { closeSync(fd); }
+	} catch (e) {
+		if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+		let raw = '';
+		try { raw = readFileSync(PIDFILE, 'utf-8').trim(); } catch {}
+		const oldPid = Number.parseInt(raw, 10);
+		if (oldPid && oldPid !== myPid && isProcessAlive(oldPid)) {
+			console.error(`${ts()} [Startup] FATAL: voice-agent already running (pid ${oldPid}) for ${WORKSPACE_DIR}`);
+			console.error(`${ts()} [Startup] Kill it first or remove ${PIDFILE}. Exiting.`);
+			process.exit(1);
+		}
+		console.warn(`${ts()} [Startup] Stale pidfile (pid=${raw || 'empty'} not alive) — overwriting.`);
+		writeFileSync(PIDFILE, `${myPid}\n`);
+	}
+	// Only unlink if WE still own the pidfile — protects against a race where
+	// a restart-driven successor overwrote it between our exit signal and
+	// this handler running.
+	process.on('exit', () => {
+		try {
+			const raw = readFileSync(PIDFILE, 'utf-8').trim();
+			if (Number.parseInt(raw, 10) === myPid) unlinkSync(PIDFILE);
+		} catch {}
+	});
+}
 
 // Model configuration — override via .env for cost/quality tuning
 const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
@@ -756,6 +812,10 @@ function bootstrapMemoryDir(): void {
 async function main() {
 	assertMacOS();
 	bootstrapMemoryDir();
+	// Refuse to start when another voice-agent already owns this workspace.
+	// Runs BEFORE any side effects (port binds, watchers, session construction)
+	// so a duplicate exits without stranding `:7847` with a dead session.
+	acquirePidLock();
 
 	// --- Voice agent observability ---
 	// Same format as phone agent's call-metrics.jsonl so diagnose.py can analyze both.
@@ -1117,6 +1177,19 @@ async function main() {
 	process.on('SIGINT', shutdown);
 	process.on('SIGTERM', shutdown);
 	process.on('uncaughtException', (err) => {
+		// EADDRINUSE on the WS port means another voice-agent (typically the
+		// launchd-managed one) already owns it. The existing process is the
+		// one with the live Gemini transport — the duplicate that tripped
+		// this handler has already bound the vision control port and would
+		// happily answer /vision/start with a dead sessionRef, breaking
+		// push-mode screen sharing for the active session. Release the
+		// control port and exit so the launchd voice-agent (or the next
+		// restart) can claim 7847 with a live session.
+		if ((err as NodeJS.ErrnoException)?.code === 'EADDRINUSE') {
+			console.error(`${ts()} [FATAL] EADDRINUSE on :${PORT} — another voice-agent is listening; exiting so the live one keeps the vision control port.`);
+			try { stopVisionControlServer(); } catch {}
+			process.exit(1);
+		}
 		console.error(`${ts()} [FATAL] uncaught exception (staying alive):`, err);
 	});
 	process.on('unhandledRejection', (err) => {

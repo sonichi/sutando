@@ -10,6 +10,8 @@
 
 import { createServer } from 'node:http';
 import { writeFileSync, readFileSync, existsSync, statSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { readTmuxStatus } from './tmux-status.js';
 import { CHAT_HTML } from './chat-ui.js';
 
@@ -17,6 +19,16 @@ const HTTP_PORT = Number(process.env.CLIENT_PORT) || 8080;
 const HTTP_HOST = process.env.CLIENT_HOST || '0.0.0.0'; // '0.0.0.0' binds to all interfaces for EC2
 const WS_PORT = Number(process.env.PORT) || 9900;
 const DEFAULT_WS_URL = `ws://localhost:${WS_PORT}`;
+
+// Workspace-relative paths must be resolved against an absolute REPO_DIR (not
+// process.cwd()) so the client works when launched from a bundle/launchd/symlink
+// install where CWD isn't the workspace root. Matches task-bridge.ts (issue #713).
+const REPO_DIR = (process.env.SUTANDO_WORKSPACE && existsSync(process.env.SUTANDO_WORKSPACE))
+    ? process.env.SUTANDO_WORKSPACE
+    : resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const TASK_DIR = join(REPO_DIR, 'tasks');
+const STATE_DIR = join(REPO_DIR, 'state');
+const SUBSCRIPTIONS_PATH = join(REPO_DIR, 'skills/subscription-scanner/state/subscriptions.json');
 
 const HTML = /* html */ `<!DOCTYPE html>
 <html lang="en">
@@ -3516,7 +3528,7 @@ const server = createServer((req, res) => {
 	if (url.pathname === '/voice-mode') {
 		let mode = 'active';
 		try {
-			const raw = readFileSync('state/voice-mode.txt', 'utf-8').trim();
+			const raw = readFileSync(join(STATE_DIR, 'voice-mode.txt'), 'utf-8').trim();
 			if (raw === 'meeting' || raw === 'active') mode = raw;
 		} catch {}
 		res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -3694,7 +3706,7 @@ const server = createServer((req, res) => {
 	// Trigger an out-of-cycle scan via POST to /paidsubscriptions/scan.
 	if (url.pathname === '/paidsubscriptions') {
 		try {
-			const dataPath = 'skills/subscription-scanner/state/subscriptions.json';
+			const dataPath = SUBSCRIPTIONS_PATH;
 			const raw = existsSync(dataPath) ? readFileSync(dataPath, 'utf-8') : '{"last_scan":null,"subscriptions":[],"scan_history":[]}';
 			res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
 			res.end(renderSubscriptionsHtml(raw));
@@ -3706,7 +3718,7 @@ const server = createServer((req, res) => {
 	}
 	if (url.pathname === '/paidsubscriptions/data') {
 		try {
-			const dataPath = 'skills/subscription-scanner/state/subscriptions.json';
+			const dataPath = SUBSCRIPTIONS_PATH;
 			const raw = existsSync(dataPath) ? readFileSync(dataPath, 'utf-8') : '{"last_scan":null,"subscriptions":[],"scan_history":[]}';
 			res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' });
 			res.end(raw);
@@ -3746,7 +3758,7 @@ const server = createServer((req, res) => {
 			// Chi's review — relying on the absence-of-field default
 			// is fragile.
 			const taskContent = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ntask: Run subscription scan (out-of-cycle, triggered from /paidsubscriptions UI). Read the full instructions in skills/subscription-scanner/scan-prompt.md and follow them verbatim.\nsource: web\nfrom: paidsubscriptions-ui\naccess_tier: owner\n`;
-			writeFileSync(`tasks/${taskId}.txt`, taskContent);
+			writeFileSync(join(TASK_DIR, `${taskId}.txt`), taskContent);
 			res.writeHead(200, { 'Content-Type': 'application/json' });
 			res.end(JSON.stringify({ ok: true, task_id: taskId, message: 'Scan queued; the next proactive-loop pass will pick it up (~1 min). Refresh to see results.' }));
 		} catch (e: any) {

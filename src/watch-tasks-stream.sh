@@ -20,7 +20,20 @@
 
 set -u
 
-TASKS_DIR="${1:-$(dirname "$0")/../tasks}"
+# Resolve TASKS_DIR. Priority: explicit positional arg → $SUTANDO_WORKSPACE/tasks
+# → repo-relative fallback. The SUTANDO_WORKSPACE branch matches what every
+# bridge does (discord-bridge.py, telegram-bridge.py, dm-result.py — see
+# PRs #708/#720/#722/#723) — without it, the bridges write tasks to the
+# workspace but the watcher polls the repo's tasks/, so owner DMs land but
+# the agent never sees them. Diagnosed 2026-05-15 (~3 dropped DMs over
+# 17 min before the workaround restart).
+if [ -n "${1:-}" ]; then
+  TASKS_DIR="$1"
+elif [ -n "${SUTANDO_WORKSPACE:-}" ]; then
+  TASKS_DIR="$SUTANDO_WORKSPACE/tasks"
+else
+  TASKS_DIR="$(dirname "$0")/../tasks"
+fi
 mkdir -p "$TASKS_DIR"
 # Canonicalize watched dir for the parent-dir filter below. fswatch always
 # emits PHYSICAL paths (e.g. /private/tmp/... not /tmp/...), so we resolve

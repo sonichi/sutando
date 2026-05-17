@@ -288,8 +288,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, get_status())
         elif path == "/tasks/active":
             # List active tasks + system status for the web client
-            watcher_ok = subprocess.run(["pgrep", "-f", "watch-tasks"], capture_output=True).returncode == 0
-            claude_ok = subprocess.run(["pgrep", "-f", "claude.*sutando-core"], capture_output=True).returncode == 0
+            watcher_ok = subprocess.run(["/usr/bin/pgrep", "-f", "watch-tasks"], capture_output=True).returncode == 0
+            claude_ok = subprocess.run(["/usr/bin/pgrep", "-f", "claude.*sutando-core"], capture_output=True).returncode == 0
             # Scan disk for active tasks, update history (preserve existing text)
             for f in sorted(TASK_DIR.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]:
                 task_id = f.stem
@@ -411,7 +411,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             activity = []
             try:
                 git_log = subprocess.run(
-                    ["git", "-C", str(REPO_DIR), "log", "--oneline", "--since=24 hours ago", "-10"],
+                    ["/usr/bin/git", "-C", str(REPO_DIR), "log", "--oneline", "--since=24 hours ago", "-10"],
                     capture_output=True, text=True, timeout=5
                 ).stdout.strip()
                 for line in git_log.split("\n"):
@@ -490,8 +490,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(media_path.read_bytes())
         elif path == "/logs/voice":
-            # Return last 30 lines of voice-agent.log for debugging
-            log_file = REPO_DIR / "src" / "voice-agent.log"
+            # Return last 30 lines of voice-agent.log for debugging.
+            # Canonical path is logs/voice-agent.log (see startup.sh:153,
+            # health-check.py:288, check-pending-questions.py:24). The
+            # original src/ path here predated that migration and silently
+            # 404'd every /logs/voice request from web-client.ts:2183's
+            # "Copy logs" button.
+            log_file = REPO_DIR / "logs" / "voice-agent.log"
             if log_file.exists():
                 lines = log_file.read_text().splitlines()[-30:]
                 self.send_json(200, {"lines": lines})

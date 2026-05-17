@@ -55,11 +55,26 @@ git -C "$REPO" log --since="$SINCE_ISO" --pretty=format:'%h %ad %s' --date=short
 git -C "$REPO" status --short > "$OUT/git-status.txt" 2>/dev/null || true
 
 # 2) Open PRs + recently merged (last 14d) — cheap, already cached by gh
-if command -v gh >/dev/null; then
-	gh pr list --state open --limit 20 --json number,title,mergeable,headRefName,author,updatedAt \
+# Resolve the real GitHub CLI. On systems where another tool named `gh` (e.g.
+# miniconda's `gh v0.0.4`) precedes /opt/homebrew/bin/gh on PATH, plain
+# `command -v gh` returns the wrong binary and every invocation below would
+# silently fail through `|| true`, producing empty PR data with no error.
+GH=""
+for _gh_cand in $(/usr/bin/which -a gh 2>/dev/null); do
+	# Discriminator: real GitHub CLI prints "gh version 2.x.x (...)" with NO
+	# colon — distinct from miniconda's `gh v0.0.4` which prints "gh version:
+	# v0.0.4" (note colon). Require the literal " version N." form.
+	if "$_gh_cand" --version 2>/dev/null | grep -Eq '^gh version [0-9]+\.'; then
+		GH="$_gh_cand"
+		break
+	fi
+done
+[ -z "$GH" ] && [ -x /opt/homebrew/bin/gh ] && GH=/opt/homebrew/bin/gh
+if [ -n "$GH" ]; then
+	"$GH" pr list --state open --limit 20 --json number,title,mergeable,headRefName,author,updatedAt \
 		--jq '.[] | "#\(.number) \(.headRefName) [@\(.author.login)] \(.title) — \(.mergeable)"' \
 		> "$OUT/prs-open.txt" 2>/dev/null || true
-	gh pr list --state merged --search "merged:>$(date -v -14d +%Y-%m-%d 2>/dev/null || date -d '14 days ago' +%Y-%m-%d)" \
+	"$GH" pr list --state merged --search "merged:>$(date -v -14d +%Y-%m-%d 2>/dev/null || date -d '14 days ago' +%Y-%m-%d)" \
 		--limit 30 --json number,title,mergedAt,author \
 		--jq '.[] | "#\(.number) \(.mergedAt[:10]) [@\(.author.login)] \(.title)"' \
 		> "$OUT/prs-recent-merged.txt" 2>/dev/null || true

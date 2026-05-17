@@ -5,7 +5,7 @@
 # Reads the transcript, extracts key signals, and writes to session-state.md.
 # The incoming session reads this in CLAUDE.md or as part of the proactive loop.
 
-REPO="$HOME/Desktop/sutando"
+REPO="${SUTANDO_WORKSPACE:-$HOME/Desktop/sutando}"
 export PATH="/opt/homebrew/bin:$HOME/.nvm/versions/node/v24.14.1/bin:$PATH"
 STATE_FILE="$REPO/session-state.md"
 TRANSCRIPT="$1"  # Passed by PreCompact hook as $TRANSCRIPT_PATH

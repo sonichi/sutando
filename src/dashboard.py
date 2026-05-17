@@ -142,7 +142,7 @@ def get_system_stats() -> dict:
     st = os.statvfs("/")
     free_gb = (st.f_bavail * st.f_frsize) / (1024 ** 3)
 
-    result = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True, timeout=5)
+    result = subprocess.run(["/usr/bin/pmset", "-g", "batt"], capture_output=True, text=True, timeout=5)
     battery_m = re.search(r'(\d+)%', result.stdout)
     battery = f"{battery_m.group(1)}%" if battery_m else "?"
     charging = "charging" in result.stdout.lower() or "ac power" in result.stdout.lower()
@@ -306,7 +306,7 @@ def render_dashboard() -> str:
         cards.append(f'<div class="card full"><h2>Capabilities Matrix</h2>{matrix_html}</div>')
 
     # Keyboard shortcuts
-    sutando_running = subprocess.run(["pgrep", "-f", "src/Sutando/Sutando"], capture_output=True).returncode == 0
+    sutando_running = subprocess.run(["/usr/bin/pgrep", "-f", "src/Sutando/Sutando"], capture_output=True).returncode == 0
     shortcut_status = '<span class="ok">✓</span> Sutando app running' if sutando_running else '<span class="bad">✗</span> Sutando app not running'
     cards.append(f"""<div class="card">
 <h2>Keyboard Shortcuts</h2>

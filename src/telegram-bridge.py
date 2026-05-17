@@ -24,14 +24,8 @@ except Exception:  # pragma: no cover — bridge must keep running
     def _push_vision_image(path: str, source: str = "telegram") -> bool:  # type: ignore
         return False
 
-REPO = Path(__file__).resolve().parent.parent
-# REPO resolution: prefer SUTANDO_WORKSPACE env var so the bridge writes to the
-# user's workspace tasks/results/state dirs, not the app-bundle's copy. Same
-# rationale as discord-bridge.py (PR #708) — when src/ is a symlink into a
-# packaged Sutando.app bundle, Path(__file__).resolve().parent.parent returns
-# the bundle root rather than the workspace.
-_workspace_env = os.environ.get("SUTANDO_WORKSPACE", "").strip()
-REPO = Path(_workspace_env).expanduser() if _workspace_env else Path(__file__).resolve().parent.parent
+from workspace_default import resolve_workspace  # noqa: E402
+REPO = resolve_workspace()
 TASKS_DIR = REPO / "tasks"
 RESULTS_DIR = REPO / "results"
 
@@ -98,14 +92,14 @@ STATE_DIR = REPO / "state"
 ARCHIVE_TASKS_DIR = REPO / "tasks" / "archive"
 ARCHIVE_RESULTS_DIR = REPO / "results" / "archive"
 OWNER_ACTIVITY_FILE = STATE_DIR / "last-owner-activity.json"
-TASKS_DIR.mkdir(exist_ok=True)
-RESULTS_DIR.mkdir(exist_ok=True)
+TASKS_DIR.mkdir(parents=True, exist_ok=True)
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def write_owner_activity(channel: str, summary: str) -> None:
     """Record owner activity — see src/discord-bridge.py for schema."""
     try:
-        STATE_DIR.mkdir(exist_ok=True)
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
         payload = {
             "ts": int(time.time()),
             "channel": channel,

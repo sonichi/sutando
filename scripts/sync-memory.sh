@@ -29,6 +29,18 @@
 # the private sync clone.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT_PARENT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Load .env from the sutando workspace early — non-interactive shells (cron,
+# launchd) don't run user shell startup, so SUTANDO_WORKSPACE / SUTANDO_MEMORY_REPO
+# wouldn't otherwise be visible even when set in .env. Without this the script
+# exits 0 silently with "workspace not found" or "MEMORY_REPO not set" (issue #714).
+if [ -f "$SCRIPT_PARENT/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . "$SCRIPT_PARENT/.env"
+    set +a
+fi
+
 if [ -n "$SUTANDO_MEMORY_SYNC_DIR" ]; then
     SYNC_DIR="$SUTANDO_MEMORY_SYNC_DIR"
 elif [ "$(basename "$SCRIPT_PARENT")" = ".sutando-memory-sync" ]; then

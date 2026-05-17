@@ -16,20 +16,45 @@ import sys
 import time
 from pathlib import Path
 
-import discord
+# Self-rescue: this bridge HAS to keep running — Discord is the primary channel
+# the owner uses to reach Sutando. If `python3` on $PATH happens to resolve to
+# an interpreter that lacks `discord.py` (e.g. miniconda's python on a Mac that
+# also has Homebrew Python with the package installed), DON'T crash — search
+# for a sibling interpreter that has the module and re-exec with that.
+#
+# Bug class: this session alone hit the same `ModuleNotFoundError: No module
+# named 'discord'` twice — startup.sh:262 uses bare `python3` which resolves
+# unpredictably. Even with startup.sh fixed, any future launcher (cron, plist,
+# `pgrep`-respawn shim, a shell script someone writes 6 months from now) can
+# silently regress this. The self-rescue makes the bridge defensible regardless.
+try:
+    import discord
+except ModuleNotFoundError:
+    _RESCUE_CANDIDATES = [
+        "/opt/homebrew/bin/python3",     # Homebrew on Apple Silicon
+        "/usr/local/bin/python3",        # Homebrew on Intel Mac (or Linux-style)
+        "/opt/homebrew/opt/python@3.13/bin/python3",
+        "/opt/homebrew/opt/python@3.14/bin/python3",
+    ]
+    _current = os.path.realpath(sys.executable)
+    for _cand in _RESCUE_CANDIDATES:
+        if not os.path.exists(_cand) or os.path.realpath(_cand) == _current:
+            continue
+        _check = subprocess.run([_cand, "-c", "import discord"], capture_output=True)
+        if _check.returncode == 0:
+            print(
+                f"discord-bridge: launched with {_current} (no discord.py); "
+                f"re-execing under {_cand}",
+                file=sys.stderr, flush=True,
+            )
+            os.execv(_cand, [_cand, __file__, *sys.argv[1:]])
+    # No rescue interpreter available — re-raise so the operator sees the real error.
+    raise
 
-# REPO resolution: prefer SUTANDO_WORKSPACE env var so the bridge writes to the
-# user's workspace tasks/results/state dirs, not the app-bundle's copy. When
-# this file lives under /Applications/Sutando.app/.../repo/src/, the workspace
-# `src/` is typically a symlink into the bundle, so `Path(__file__).resolve()`
-# walks INTO the bundle and `parent.parent` returns the bundle root rather
-# than the workspace. That divergence stranded owner DMs on 2026-05-14 — the
-# bridge wrote tasks to bundle-tasks/ while core agent watched workspace-tasks/.
-import os
-_workspace_env = os.environ.get("SUTANDO_WORKSPACE", "").strip()
-REPO = Path(_workspace_env).expanduser() if _workspace_env else Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from workspace_default import resolve_workspace  # noqa: E402
 from util_paths import shared_personal_path  # noqa: E402
+REPO = resolve_workspace()
 
 # Vision-frame helper — pushes image attachments into the active voice session
 # so Gemini reacts in-stream. Best-effort: import failure or unreachable
@@ -275,7 +300,7 @@ def write_owner_activity(channel: str, summary: str) -> None:
     `notes/team-proposal-coord-loop-2026-04-20.md`.
     """
     try:
-        STATE_DIR.mkdir(exist_ok=True)
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
         payload = {
             "ts": int(time.time()),
             "channel": channel,
@@ -345,8 +370,8 @@ def notify_agent_api_task_done(task_id: str, result: str) -> None:
     except Exception:
         pass  # best-effort; agent-api will catch up via polling
 INBOX_DIR = Path("/tmp/discord-inbox")
-TASKS_DIR.mkdir(exist_ok=True)
-RESULTS_DIR.mkdir(exist_ok=True)
+TASKS_DIR.mkdir(parents=True, exist_ok=True)
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 INBOX_DIR.mkdir(exist_ok=True)
 
 # Presenter mode: when scripts/presenter-mode.sh is active, the bridge
@@ -3066,8 +3091,16 @@ async def poll_dm_fallback():
                     # stdin=DEVNULL: under launchd, parent's fd 0 may be invalid,
                     # causing the child Python's `init_sys_streams` to fail with
                     # `OSError: [Errno 9] Bad file descriptor`. Force clean stdin.
+                    # dm-result.py is a SIBLING of this script in src/, not a
+                    # workspace artifact. Resolving via Path(__file__) keeps the
+                    # invocation correct after PR #762 — which made REPO point
+                    # at the runtime workspace (a subdir of the repo root), so
+                    # `REPO / "src" / "dm-result.py"` would resolve to
+                    # `<workspace>/src/dm-result.py` (does not exist) and the
+                    # dm-fallback path errored out silently before delivering.
+                    _DM_RESULT_SCRIPT = Path(__file__).resolve().parent / "dm-result.py"
                     result = subprocess.run(
-                        [sys.executable, str(REPO / "src" / "dm-result.py"), "--file", str(f)],
+                        [sys.executable, str(_DM_RESULT_SCRIPT), "--file", str(f)],
                         capture_output=True, text=True, timeout=15,
                         stdin=subprocess.DEVNULL,
                     )
