@@ -1,6 +1,6 @@
 # Sutando
 
-[![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/uZHWXXmrCS) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Website](https://img.shields.io/badge/Web-sutando.ai-blue)](https://sutando.ai)
+[![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/uZHWXXmrCS) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Website](https://img.shields.io/badge/Web-sutando.ai-blue)](https://sutando.ai) [![GitHub Trending](https://img.shields.io/badge/GitHub_Trending-%231_Python_(May_16)-FFD700?logo=github&logoColor=white)](https://github.com/trending/developers/python?since=daily)
 
 **My AI Stand — Realtime by Day, Rewriting Itself by Night.**
 **Summon my AI superpower.**
@@ -19,6 +19,8 @@ It belongs entirely to you.
 https://github.com/user-attachments/assets/a86ec34e-3b26-4011-824c-d2d124753c25
 
 > 24 tool calls. 6 tasks. 7 minutes. All by voice from a phone. Demo by [@liususan091219](https://github.com/liususan091219). [Watch on YouTube (full quality) →](https://youtu.be/NC0kdpLulUY)
+
+⭐ **If Sutando is useful to you, [star this repo](https://github.com/sonichi/sutando) — it's how other people find it.**
 
 📺 [Watch the vision talk at UC Berkeley →](https://youtu.be/c39fJ2WAj6A?t=7719) — the idea behind Sutando, before it existed.
 
