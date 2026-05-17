@@ -962,6 +962,7 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
         f"source: health-check\n"
         f"user_id: health-check\n"
         f"access_tier: owner\n"
+        f"priority: low\n"
     )
     task_path = tasks_dir / f"task-health-{int(time.time())}.txt"
     task_path.write_text(body)

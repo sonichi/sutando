@@ -23,6 +23,7 @@ try:
 except Exception:  # pragma: no cover — bridge must keep running
     def _push_vision_image(path: str, source: str = "telegram") -> bool:  # type: ignore
         return False
+from task_priority import default_priority_for_source  # noqa: E402
 
 from workspace_default import resolve_workspace  # noqa: E402
 REPO = resolve_workspace()
@@ -351,12 +352,14 @@ def main():
                 ts = int(time.time() * 1000)
                 task_id = f"task-{ts}"
                 task_file = TASKS_DIR / f"{task_id}.txt"
+                priority = default_priority_for_source("telegram", "owner")
                 task_file.write_text(
                     f"id: {task_id}\n"
                     f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S')}Z\n"
                     f"task: [Telegram @{username}] {text}{attachment_note}\n"
                     f"source: telegram\n"
                     f"chat_id: {chat_id}\n"
+                    f"priority: {priority}\n"
                 )
                 pending_replies[task_id] = chat_id
 

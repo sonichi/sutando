@@ -54,6 +54,7 @@ except ModuleNotFoundError:
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
 from util_paths import shared_personal_path  # noqa: E402
+from task_priority import default_priority_for_source  # noqa: E402
 REPO = resolve_workspace()
 
 # Vision-frame helper — pushes image attachments into the active voice session
@@ -2549,6 +2550,7 @@ async def _handle_discord_message(message, force=False):
             except Exception as e:
                 print(f"  [auto-react] {react_emoji} failed: {e}", flush=True)
 
+    priority = default_priority_for_source("discord", access_tier)
     task_file.write_text(
         f"id: {task_id}\n"
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S')}Z\n"
@@ -2557,6 +2559,7 @@ async def _handle_discord_message(message, force=False):
         f"channel_id: {message.channel.id}\n"
         f"user_id: {message.author.id}\n"
         f"access_tier: {access_tier}\n"
+        f"priority: {priority}\n"
         f"{tier_instructions.get(access_tier, tier_instructions['other'])}"
     )
     pending_replies[task_id] = message.channel
