@@ -197,6 +197,7 @@ def tofu_onboard(sender_id, username):
         "tofuOnboardedUsername": username or None,
     }
     ACCESS_FILE.write_text(json.dumps(payload, indent=2) + "\n")
+    os.chmod(ACCESS_FILE, 0o600)  # don't inherit umask 644 — file holds owner's Telegram user ID
     print(f"  TOFU: auto-onboarded @{username} (id={sender_id}) as owner — wrote {ACCESS_FILE}")
     return {sender_id}
 
