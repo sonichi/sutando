@@ -74,8 +74,21 @@ export function validateConfig(raw: unknown, path: string): ScreenCompanionConfi
 	if (c.vision_mode !== 'push' && c.vision_mode !== 'pull') {
 		throw new Error(`${path}: vision_mode must be "push" or "pull", got "${c.vision_mode}"`);
 	}
-	if (c.vision_mode === 'push' && typeof c.vision_cadence_ms !== 'number') {
-		throw new Error(`${path}: vision_mode=push requires vision_cadence_ms (number)`);
+	if (c.vision_mode === 'push') {
+		if (typeof c.vision_cadence_ms !== 'number') {
+			throw new Error(`${path}: vision_mode=push requires vision_cadence_ms (number)`);
+		}
+		// Guard YAML typos. 70000 (70s) instead of 700 would silently produce
+		// useless cadence; 50 (50ms) would saturate the network. 100–5000 is
+		// the practical range for screen-companion modes today.
+		if (c.vision_cadence_ms < 100 || c.vision_cadence_ms > 5000) {
+			throw new Error(
+				`${path}: vision_cadence_ms must be 100–5000ms, got ${c.vision_cadence_ms}`,
+			);
+		}
+	}
+	if (!Array.isArray(c.tools_allow) || !c.tools_allow.every(t => typeof t === 'string')) {
+		throw new Error(`${path}: tools_allow must be a string[] (got ${typeof c.tools_allow})`);
 	}
 	return c as unknown as ScreenCompanionConfig;
 }

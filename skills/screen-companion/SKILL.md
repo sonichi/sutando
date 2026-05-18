@@ -71,7 +71,7 @@ tools_allow:
 goal_template: "Optional one-liner with {goal} placeholder"
 ```
 
-After adding, run `bash scripts/activate.ts --list` to confirm the loader picks it up. No skill rebuild required — configs are loaded fresh on each activation.
+After adding, run `npx tsx scripts/activate.ts --list` to confirm the loader picks it up. No skill rebuild required — configs are loaded fresh on each activation.
 
 ## Run
 
