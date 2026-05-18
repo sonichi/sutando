@@ -73,9 +73,11 @@ def main() -> int:
                     "owner's Slack user ID, must not inherit umask 644",
                     tofu_block)
 
-    # 3. _write_task fails closed on unknown sender
+    # 3. _write_task fails closed on unknown sender. Budget bumped from
+    # 2000 to 4000 in commit 98e188b — function body grew once file-
+    # attachment download + thread_ts disambiguation moved in.
     write_match = re.search(
-        r"def _write_task\([^)]*\)[^:]*:\s*\n([\s\S]{0,2000}?)(?=\n\ndef |\Z)",
+        r"def _write_task\([^)]*\)[^:]*:\s*\n([\s\S]{0,4000}?)(?=\n\ndef |\Z)",
         src,
     )
     if not write_match:
