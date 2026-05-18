@@ -163,6 +163,8 @@ Sutando is built on a host CLI tool (today: Claude Code). Some agent-state surfa
 
 **Today's policy.** We document the surface internally (engineering inventory) without listing specific paths in this public doc. Specific paths are implementation detail of the current host CLI; publishing them invites bit-rot when the host CLI's conventions change.
 
+**Greppable surface.** Sutando code that needs to read or write inside the host CLI's home directory goes through a single helper — `claude_home_path()` in `src/util_paths.py`, `claudeHomePath()` in `src/util_paths.ts` (added in #860). One canonical resolver = one grep target = a future swap is a 1-day grep+replace rather than re-architecture. Use the helper for any new code that touches the host CLI's home; don't reach for `~/.claude/`-relative paths directly.
+
 If you're a contributor who needs the inventory to make a code change touching the host CLI's home dir, ask in the team channel and the maintainer will point you at the workspace-private engineering note.
 
 ## Relationship to other docs
