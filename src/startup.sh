@@ -330,6 +330,32 @@ else
   echo "  ~ discord bridge (no token — optional)"
 fi
 
+# 7b. Slack bridge (optional — needs SLACK_BOT_TOKEN + SLACK_APP_TOKEN + slack_bolt)
+# Probes the same Python-interpreter candidates as the discord bridge so a
+# fresh-install miniconda env doesn't silently miss slack_bolt.
+if [ -f "$HOME/.claude/channels/slack/.env" ] && grep -q "SLACK_BOT_TOKEN=" "$HOME/.claude/channels/slack/.env" 2>/dev/null; then
+  PYTHON_WITH_SLACK=""
+  for _p in /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
+    if command -v "$_p" >/dev/null 2>&1 && "$_p" -c "import slack_bolt" 2>/dev/null; then
+      PYTHON_WITH_SLACK="$_p"
+      break
+    fi
+  done
+  if [ -z "$PYTHON_WITH_SLACK" ]; then
+    echo "  ~ slack bridge (no python with slack_bolt — run: /opt/homebrew/bin/pip3 install slack_bolt)"
+  elif ! pgrep -f "slack-bridge" > /dev/null 2>&1; then
+    echo "  Starting Slack bridge with $PYTHON_WITH_SLACK..."
+    # Source the env file so SLACK_BOT_TOKEN / SLACK_APP_TOKEN reach the child.
+    set -a; . "$HOME/.claude/channels/slack/.env"; set +a
+    "$PYTHON_WITH_SLACK" src/slack-bridge.py > logs/slack-bridge.log 2>&1 &
+    echo "  ✓ slack bridge"
+  else
+    echo "  ✓ slack bridge (already running)"
+  fi
+else
+  echo "  ~ slack bridge (no token — optional)"
+fi
+
 # 8. Phone conversation server + ngrok (optional — needs Twilio creds, skip with SKIP_PHONE=1)
 if [ "${SKIP_PHONE:-}" = "1" ]; then
   echo "  ~ conversation server (skipped via SKIP_PHONE)"
