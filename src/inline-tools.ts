@@ -129,9 +129,12 @@ export const openFileTool: ToolDefinition = {
 	},
 };
 
-// Re-export meeting tools from meeting-tools
-export { summonTool, dismissTool, joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool } from './meeting-tools.js';
-import { summonTool, dismissTool, joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool } from './meeting-tools.js';
+// Re-export Zoom tools from skill
+export { summonTool, dismissTool, joinZoomTool } from '../skills/zoom/tools.js';
+import { summonTool, dismissTool, joinZoomTool } from '../skills/zoom/tools.js';
+// Re-export remaining meeting tools
+export { joinGmeetTool, lookupMeetingIdTool, callContactTool } from './meeting-tools.js';
+import { joinGmeetTool, lookupMeetingIdTool, callContactTool } from './meeting-tools.js';
 
 // --- Keyboard tool ---
 

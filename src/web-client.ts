@@ -14,21 +14,20 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readTmuxStatus } from './tmux-status.js';
 import { CHAT_HTML } from './chat-ui.js';
+import { resolveWorkspace } from './workspace_default.js';
 
 const HTTP_PORT = Number(process.env.CLIENT_PORT) || 8080;
 const HTTP_HOST = process.env.CLIENT_HOST || '0.0.0.0'; // '0.0.0.0' binds to all interfaces for EC2
 const WS_PORT = Number(process.env.PORT) || 9900;
 const DEFAULT_WS_URL = `ws://localhost:${WS_PORT}`;
 
-// Workspace-relative paths must be resolved against an absolute REPO_DIR (not
-// process.cwd()) so the client works when launched from a bundle/launchd/symlink
-// install where CWD isn't the workspace root. Matches task-bridge.ts (issue #713).
-const REPO_DIR = (process.env.SUTANDO_WORKSPACE && existsSync(process.env.SUTANDO_WORKSPACE))
-    ? process.env.SUTANDO_WORKSPACE
-    : resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const TASK_DIR = join(REPO_DIR, 'tasks');
-const STATE_DIR = join(REPO_DIR, 'state');
-const SUBSCRIPTIONS_PATH = join(REPO_DIR, 'skills/subscription-scanner/state/subscriptions.json');
+// Workspace-relative paths use resolveWorkspace() (closes #763). Skills paths
+// (non-runtime, code-adjacent) remain anchored to the repo root.
+const WORKSPACE_DIR = resolveWorkspace();
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const TASK_DIR = join(WORKSPACE_DIR, 'tasks');
+const STATE_DIR = join(WORKSPACE_DIR, 'state');
+const SUBSCRIPTIONS_PATH = join(REPO_ROOT, 'skills/subscription-scanner/state/subscriptions.json');
 
 const HTML = /* html */ `<!DOCTYPE html>
 <html lang="en">

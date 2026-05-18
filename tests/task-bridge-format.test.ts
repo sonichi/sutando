@@ -1,8 +1,8 @@
 import { describe, it, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync } from 'node:fs';
-import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
+import { resolveWorkspace } from '../src/workspace_default.js';
 import { workTool } from '../src/task-bridge.js';
 
 // Integration test for PR #460's unified task-file schema. Every voice /
@@ -10,8 +10,9 @@ import { workTool } from '../src/task-bridge.js';
 // emits, so downstream consumers (Claude Code session, access-tier
 // sandboxing) can treat all tasks uniformly.
 
-const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
-const TASK_DIR = join(REPO_ROOT, 'tasks');
+// Task dir is wherever the bridge writes — `resolveWorkspace()/tasks/`. Was
+// `<REPO_ROOT>/tasks/` pre-#821, when the bridge fell back to repo root.
+const TASK_DIR = join(resolveWorkspace(), 'tasks');
 
 function listTaskFiles(): string[] {
 	if (!existsSync(TASK_DIR)) return [];
