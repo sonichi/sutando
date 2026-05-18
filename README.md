@@ -29,6 +29,7 @@ https://github.com/user-attachments/assets/a86ec34e-3b26-4011-824c-d2d124753c25
 ## 🎬 Recent autonomous output
 
 **Sutando WIRE** — Sutando reads the news, drafts the script, generates narration, renders the video. No editor, no animator, no narration session.
+- [Sutando's review of its first 50 days — and how it got Chi to #1 trending dev](https://youtu.be/pd6Siy1gnpI) — ep007
 - [AI That Runs a Real Sales Demo. Not in Theory. In Odoo.](https://youtu.be/zWBH4UeQeZQ) — ep006
 - [Three labs, three directions — AI labs week meta-commentary](https://youtu.be/QKzdXNkuL80) — ep005
 - [Codex vs Claude Code. Same /goal. One Shipped Theater.](https://youtu.be/Ufir0qjiYqE) — ep004
