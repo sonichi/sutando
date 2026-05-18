@@ -1,4 +1,4 @@
-import { describe, it, before, after } from 'node:test';
+import { describe, it, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, ChildProcess } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -104,6 +104,17 @@ describe('/sse-status + /mute-state — agent state plumbing (PR #418)', () => {
 		} else {
 			try { unlinkSync(VOICE_STATE_PATH); } catch { /* idempotent */ }
 		}
+	});
+
+	// Reset both tracks to idle before every subtest so order-dependence can't
+	// flake on CI. The describe block shares one spawned web-client child for
+	// all subtests, so the tool-track 'working' from one test would otherwise
+	// linger into the next if the prior teardown raced with CI scheduling.
+	// Issue #840: 2 unrelated PRs flaked on this same suite same day.
+	beforeEach(async () => {
+		await fetchJson('/mute-state?state=idle&source=tool');  // clear tool track
+		await fetchJson('/mute-state?state=idle');               // clear browser track
+		await delay(20);                                          // small flush window
 	});
 
 	it('default /sse-status returns state:"idle"', async () => {
