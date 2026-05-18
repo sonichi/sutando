@@ -5,7 +5,19 @@
 # Reads the transcript, extracts key signals, and writes to session-state.md.
 # The incoming session reads this in CLAUDE.md or as part of the proactive loop.
 
-REPO="${SUTANDO_WORKSPACE:-$HOME/Desktop/sutando}"
+# REPO resolves to: (1) $SUTANDO_REPO_DIR if set, (2) auto-detect from the
+# script's parent dir using a sutando-checkout signature, (3) ~/Desktop/sutando
+# as last-resort default. SUTANDO_WORKSPACE intentionally NOT in the fallback
+# (CLAUDE.md reserves it for the per-user workspace dir; using it as a REPO
+# alias would silently pick the wrong path).
+__SCRIPT_PARENT="$(cd "$(dirname "$0")/.." && pwd 2>/dev/null || echo "")"
+if [ -n "${SUTANDO_REPO_DIR:-}" ]; then
+    REPO="$SUTANDO_REPO_DIR"
+elif [ -n "$__SCRIPT_PARENT" ] && [ -f "$__SCRIPT_PARENT/CLAUDE.md" ] && [ -d "$__SCRIPT_PARENT/skills" ] && [ -d "$__SCRIPT_PARENT/.git" ]; then
+    REPO="$__SCRIPT_PARENT"
+else
+    REPO="$HOME/Desktop/sutando"
+fi
 export PATH="/opt/homebrew/bin:$HOME/.nvm/versions/node/v24.14.1/bin:$PATH"
 STATE_FILE="$REPO/session-state.md"
 TRANSCRIPT="$1"  # Passed by PreCompact hook as $TRANSCRIPT_PATH
