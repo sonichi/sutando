@@ -311,7 +311,7 @@ def _voice_log_path() -> Path:
     permanently warn "voice-agent.log not found" on Sutando.app installs.
     """
     launchd_log = Path.home() / "Library/Application Support/Sutando/logs/voice-agent.log"
-    workspace_log = REPO_DIR / "logs" / "voice-agent.log"
+    workspace_log = WORKSPACE_DIR / "logs" / "voice-agent.log"
     if launchd_log.exists() and launchd_log.stat().st_size > 0:
         return launchd_log
     return workspace_log
@@ -595,7 +595,7 @@ def check_core_proactive_loop(threshold_sec: int = 600) -> dict:
     Status is anything other than "running" → ok regardless of age.
     """
     name = "core-proactive-loop"
-    status_path = REPO_DIR / "core-status.json"
+    status_path = WORKSPACE_DIR / "core-status.json"
     if not status_path.exists():
         return {"name": name, "status": "ok", "detail": "core-status.json not yet written"}
     try:
@@ -678,7 +678,7 @@ def run_all_checks() -> list[dict]:
     # Critical files
     for name, path in [
         ("CLAUDE.md", REPO_DIR / "CLAUDE.md"),
-        ("build_log.md", REPO_DIR / "build_log.md"),
+        ("build_log.md", WORKSPACE_DIR / "build_log.md"),
         (".env", REPO_DIR / ".env"),
     ]:
         checks.append(check_file(path, name))
@@ -792,7 +792,7 @@ def run_all_checks() -> list[dict]:
         # so log-stale warnings never fired (caught 2026-05-05 when Mini's
         # logs/discord-bridge.log was 36h stale but health-check stayed "ok").
         import time
-        log_file = REPO_DIR / "logs" / f"{name}.log"
+        log_file = WORKSPACE_DIR / "logs" / f"{name}.log"
         if not log_file.exists():
             log_file = REPO_DIR / "src" / f"{name}.log"
         detail = "running"
@@ -804,7 +804,7 @@ def run_all_checks() -> list[dict]:
                 detail = f"running but log stale ({int(age_sec)}s old)"
 
         # Check 3: Heartbeat file freshness (overrides log staleness if fresh)
-        heartbeat_file = REPO_DIR / "state" / f"{name}.heartbeat"
+        heartbeat_file = WORKSPACE_DIR / "state" / f"{name}.heartbeat"
         if heartbeat_file.exists():
             hb_age = time.time() - heartbeat_file.stat().st_mtime
             if hb_age <= 120:  # heartbeat is fresh — bridge is alive
@@ -1168,7 +1168,7 @@ def main():
                     # dotenv, etc.) — restart would crash on import.
                     # Log path uses logs/ (post-PR #251 refactor).
                     subprocess.Popen([sys.executable, str(REPO_DIR / "src" / f"{c['name']}.py")],
-                                     stdout=open(str(REPO_DIR / "logs" / f"{c['name']}.log"), "a"),
+                                     stdout=open(str(WORKSPACE_DIR / "logs" / f"{c['name']}.log"), "a"),
                                      stderr=subprocess.STDOUT, start_new_session=True)
                     print(f"  {c['name']}: {'restarted (stale code)' if c['status'] == 'stale' else 'restarted'}")
                 elif c["name"] == "sutando-app":

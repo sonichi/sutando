@@ -22,7 +22,10 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-CALLS_FILE = Path(__file__).parent.parent / "results" / "calls" / "calls.jsonl"
+sys.path.insert(0, str(Path(__file__).parent))
+from workspace_default import resolve_workspace  # noqa: E402
+
+CALLS_FILE = resolve_workspace() / "results" / "calls" / "calls.jsonl"
 
 
 def load_calls():
