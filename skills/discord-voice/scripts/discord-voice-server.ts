@@ -725,28 +725,20 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 	// (this instance is the default responder; un-named cold openers route
 	// here), otherwise false (require explicit address on first turn — avoids
 	// double-response on cold openers when multiple instances share a channel).
-	let lastAddressedToMe = process.env.SUTANDO_PRIMARY === 'true';
-	let turnDecision: 'pending' | 'allow' | 'drop' = 'pending';
-	let pendingAudio: Buffer[] = [];
-	const resetTurnGate = () => {
-		turnDecision = 'pending';
-		pendingAudio = [];
-	};
-	session.eventBus.subscribe('turn.start', resetTurnGate);
-	session.eventBus.subscribe('turn.interrupted', resetTurnGate);
+	// Per-response gating model (rewritten 2026-05-17 to replace the buffered
+	// time-window model that had unfixable tail-bleed at turn boundaries):
+	//   - responseAllowed is a single boolean state, updated at each turn.end
+	//   - handleAudioOutput just checks the current state — no buffering
+	//   - chunks arriving in the first ~50ms after a turn boundary use the
+	//     PREVIOUS turn's decision (acceptable small leak)
+	let responseAllowed = process.env.SUTANDO_PRIMARY === 'true';
 
 	sessionAny.handleAudioOutput = (data: string) => {
 		sessionAny.notificationQueue?.markAudioReceived?.();
 		try {
 			const pcm24Mono = Buffer.from(data, 'base64');
 			const pcm48Stereo = upsample24MonoTo48Stereo(pcm24Mono);
-			if (nameGateActive) {
-				if (turnDecision === 'drop') return;
-				if (turnDecision === 'pending') {
-					pendingAudio.push(pcm48Stereo);
-					return;
-				}
-			}
+			if (nameGateActive && !responseAllowed) return; // silently drop
 			pushAudio(pcm48Stereo);
 			outChunks++;
 			if (outChunks === 1 || outChunks % 50 === 0) {
@@ -780,23 +772,11 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 		}
 		lastProcessedIdx = items.length;
 
-		// Apply the name-gate decision now that the user turn transcript is in.
-		// Defer ~500ms — turn.end can fire BEFORE Gemini's audio starts streaming,
-		// so we have to wait long enough for the first audio chunks to land in
-		// pendingAudio before we decide allow/drop. 50ms was too tight (chunks
-		// would arrive AFTER the decision, get buffered as "pending" but assigned
-		// to the wrong next turn → false-drop bug observed live 2026-05-17).
-		// IMPORTANT: bodhi doesn't publish 'turn.start', so we re-arm at the end of
-		// each decision (any subsequent audio is assumed to belong to the next turn).
+		// Apply the per-response gate decision. Single boolean state, sticky
+		// across un-named follow-ups; flipped when an address pattern matches.
 		if (nameGateActive) {
 			setTimeout(() => {
-				if (turnDecision !== 'pending') {
-					// Previous turn's decision still in effect — re-arm for next turn.
-					turnDecision = 'pending';
-					pendingAudio = [];
-					return;
-				}
-				// Re-scan the latest user item now that items list is populated.
+				// Re-scan latest user item from items (now populated after turn.end tick)
 				const allItems = session.conversationContext.items;
 				let userText = latestUserText;
 				for (let i = allItems.length - 1; i >= 0; i--) {
@@ -805,35 +785,16 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 						break;
 					}
 				}
-				// Sticky-address logic: update lastAddressedToMe based on this turn,
-				// then use it as the decision (so a follow-up un-named turn after
-				// "Hi Lucy, ..." still routes to Lucy until owner names another bot).
 				const haveMyName = transcriptContainsName(userText);
 				const haveOtherName = transcriptContainsOther(userText);
-				if (haveMyName) lastAddressedToMe = true;
-				else if (haveOtherName) lastAddressedToMe = false;
-				const named = lastAddressedToMe;
-				if (named) {
-					turnDecision = 'allow';
-					for (const buf of pendingAudio) {
-						pushAudio(buf);
-						outChunks++;
-					}
-					console.log(`${ts()} [NameGate] allow — flushed ${pendingAudio.length} chunks (user: "${userText.slice(0,60)}")`);
-					pendingAudio = [];
-				} else {
-					turnDecision = 'drop';
-					const dropped = pendingAudio.length;
-					pendingAudio = [];
-					console.log(`${ts()} [NameGate] drop — suppressed ${dropped} chunks (user: "${userText.slice(0,60)}")`);
+				const before = responseAllowed;
+				if (haveMyName) responseAllowed = true;
+				else if (haveOtherName) responseAllowed = false;
+				// else: sticky — unchanged
+				if (before !== responseAllowed || haveMyName || haveOtherName) {
+					console.log(`${ts()} [NameGate] ${responseAllowed ? 'allow' : 'drop'} (user: "${userText.slice(0, 60)}")`);
 				}
-				// Re-arm grace ~4s — long enough for most Gemini responses,
-				// short enough that the next turn's audio doesn't get misrouted.
-				setTimeout(() => {
-					turnDecision = 'pending';
-					pendingAudio = [];
-				}, 4000);
-			}, 200);
+			}, 50);
 		}
 
 		if (s.resultQueue.length > 0) {
