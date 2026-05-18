@@ -701,15 +701,16 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 	// Mere mentions like "thanks Lucy" or "Lucy's answer" do NOT count.
 	const isAddressedBy = (text: string, names: string[]): boolean => {
 		const lc = text.toLowerCase();
-		const ADDRESS_VERBS = '(can|are|is|will|could|should|please|do|did|tell|answer|design|write|read|check|look|help|stop|start|leave|join|log)';
+		const ADDRESS_VERBS = '(can|could|will|would|please|tell|answer|design|write|read|check|look|help|stop|start|leave|join|log)';
 		for (const n of names) {
-			// "hi/hey/hello NAME" — greeting + name anywhere (word boundary)
+			// "hi/hey/hello NAME" — greeting + name anywhere
 			const greet = new RegExp(`\\b(hi|hey|hello|yo|okay|ok)\\s+${n}\\b`, 'i');
-			// "NAME," / "NAME?" — tag-style address (word boundary anywhere)
-			const tagged = new RegExp(`\\b${n}\\s*[,?]`, 'i');
-			// "NAME VERB" — name followed by imperative/auxiliary
-			const verbed = new RegExp(`\\b${n}\\s+${ADDRESS_VERBS}\\b`, 'i');
-			if (greet.test(lc) || tagged.test(lc) || verbed.test(lc)) return true;
+			// "NAME," — comma-tag (definite address marker)
+			const commaTag = new RegExp(`\\b${n}\\s*,`, 'i');
+			// "NAME VERB" — imperative form only at sentence start
+			// (sentence start = beginning of text OR after a period/!/? + optional whitespace)
+			const verbed = new RegExp(`(^|[.!?]\\s*)${n}\\s+${ADDRESS_VERBS}\\b`, 'i');
+			if (greet.test(lc) || commaTag.test(lc) || verbed.test(lc)) return true;
 		}
 		return false;
 	};
