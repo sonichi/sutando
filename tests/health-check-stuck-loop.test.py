@@ -59,11 +59,13 @@ def make_checks(*statuses_and_names):
     return [{"name": n, "status": s, "detail": "test"} for (s, n) in statuses_and_names]
 
 
-def write_status(repo_dir: Path, payload: dict | None) -> None:
-    """Write core-status.json into a temp REPO_DIR override; pass None to
-    skip writing the file at all."""
+def write_status(workspace_dir: Path, payload: dict | None) -> None:
+    """Write core-status.json into a temp WORKSPACE_DIR override; pass None
+    to skip writing the file at all. (Was REPO_DIR pre-PR #836;
+    check_core_proactive_loop now reads from WORKSPACE_DIR — core-status.json
+    is per-user runtime state, not code.)"""
     if payload is not None:
-        (repo_dir / "core-status.json").write_text(json.dumps(payload))
+        (workspace_dir / "core-status.json").write_text(json.dumps(payload))
 
 
 def write_task(tasks_dir: Path, name: str, age_sec: int) -> Path:
@@ -79,17 +81,19 @@ def write_task(tasks_dir: Path, name: str, age_sec: int) -> Path:
 # ---------------------------------------------------------------------------
 
 def with_repo_override(payload):
-    """Run check_core_proactive_loop against a temp REPO_DIR. Returns the
-    check dict. `payload=None` means don't write the status file."""
+    """Run check_core_proactive_loop against a temp WORKSPACE_DIR. Returns
+    the check dict. `payload=None` means don't write the status file.
+    Renamed semantics: pre-PR #836 this mocked REPO_DIR; core-status.json
+    now lives in WORKSPACE_DIR (per-user runtime state)."""
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         write_status(td, payload)
-        orig_repo = hc.REPO_DIR
+        orig_ws = hc.WORKSPACE_DIR
         try:
-            hc.REPO_DIR = td
+            hc.WORKSPACE_DIR = td
             return hc.check_core_proactive_loop(threshold_sec=600)
         finally:
-            hc.REPO_DIR = orig_repo
+            hc.WORKSPACE_DIR = orig_ws
 
 
 def case_a_status_missing() -> list[str]:
@@ -105,12 +109,12 @@ def case_b_status_malformed() -> list[str]:
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         (td / "core-status.json").write_text("{ this is not json")
-        orig = hc.REPO_DIR
+        orig = hc.WORKSPACE_DIR
         try:
-            hc.REPO_DIR = td
+            hc.WORKSPACE_DIR = td
             r = hc.check_core_proactive_loop(threshold_sec=600)
         finally:
-            hc.REPO_DIR = orig
+            hc.WORKSPACE_DIR = orig
     if r["status"] != "ok":
         fails.append(f"b) malformed JSON should be ok (don't false-alarm), got {r['status']}")
     return fails
