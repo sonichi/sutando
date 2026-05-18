@@ -807,12 +807,14 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 					console.log(`${ts()} [NameGate] drop — suppressed ${dropped} chunks (user: "${userText.slice(0,60)}")`);
 				}
 				// Re-arm after a grace window so the next turn's chunks start as pending.
-				// Grace covers any late-arriving chunks of THIS turn; tuned to ~3s.
+				// Grace covers any late-arriving chunks of THIS turn; tuned to ~8s
+				// (Gemini's longer responses can extend past 5s; shorter windows
+				// caused late audio to be misrouted to the next turn's decision).
 				setTimeout(() => {
 					turnDecision = 'pending';
 					pendingAudio = [];
-				}, 3000);
-			}, 500);
+				}, 8000);
+			}, 1500);
 		}
 
 		if (s.resultQueue.length > 0) {
