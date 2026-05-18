@@ -28,6 +28,7 @@
 import { config as _dotenvConfig } from 'dotenv';
 import { mkdirSync, writeFileSync, appendFileSync, existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
+import { resolveWorkspace } from '../../../src/workspace_default.js';
 
 _dotenvConfig({ path: new URL('../../../.env', import.meta.url).pathname, override: true });
 _dotenvConfig({ path: join(process.env.HOME ?? '', '.claude/channels/discord/.env'), override: false });
@@ -64,9 +65,7 @@ import {
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY ?? '';
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN ?? '';
-const WORKSPACE_DIR =
-	process.env.SUTANDO_WORKSPACE ||
-	join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+const WORKSPACE_DIR = resolveWorkspace();
 const DATA_DIR = join(WORKSPACE_DIR, 'data');
 const RESULTS_DIR = process.env.DISCORD_VOICE_RESULTS_DIR || join(WORKSPACE_DIR, 'results');
 const TASKS_DIR = join(WORKSPACE_DIR, 'tasks');

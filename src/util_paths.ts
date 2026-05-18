@@ -11,11 +11,16 @@
 //                                     (notes/, build_log.md).
 //
 // Both fall back to `<workspace>/<filename>` so existing installs keep working
-// until they migrate.
+// until they migrate. The `workspace` arg is optional; when omitted, the
+// helpers resolve to `$SUTANDO_WORKSPACE` (default `~/.sutando/workspace/`)
+// via resolveWorkspace() — NOT process.cwd(). Pre-#839 fixes the fallback was
+// cwd, which silently produced the wrong path on hosts where the caller's
+// cwd drifted from the workspace dir.
 
 import { existsSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
+import { resolveWorkspace } from './workspace_default.js';
 
 function expandHome(p: string): string {
 	return p.replace(/^~/, process.env.HOME || '');
@@ -23,7 +28,7 @@ function expandHome(p: string): string {
 
 /** Per-machine resolver. */
 export function personalPath(filename: string, workspace?: string): string {
-	const ws = workspace ?? process.cwd();
+	const ws = workspace ?? resolveWorkspace();
 	const privateRoot = process.env.SUTANDO_PRIVATE_DIR;
 	if (privateRoot) {
 		const root = expandHome(privateRoot);
@@ -51,7 +56,7 @@ export function personalPath(filename: string, workspace?: string): string {
 
 /** Shared-across-fleet resolver (top-level private dir, not per-machine). */
 export function sharedPersonalPath(filename: string, workspace?: string): string {
-	const ws = workspace ?? process.cwd();
+	const ws = workspace ?? resolveWorkspace();
 	const privateRoot = process.env.SUTANDO_PRIVATE_DIR;
 	if (privateRoot) {
 		const root = expandHome(privateRoot);
