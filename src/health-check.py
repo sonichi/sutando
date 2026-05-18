@@ -689,8 +689,11 @@ def run_all_checks() -> list[dict]:
     else:
         checks.append({"name": "memory-dir", "status": "ok", "detail": "not yet created (normal for new installs)"})
 
-    # Notes — canonical home is shared private dir post-migration
-    checks.append(check_directory(Path(shared_personal_path("notes", REPO_DIR)), "notes-dir"))
+    # Notes — canonical home is shared private dir post-migration.
+    # Pass WORKSPACE_DIR (not REPO_DIR) so the check resolves to
+    # ~/.sutando/workspace/notes rather than <repo>/notes — the notes/
+    # .gitkeep was removed from the repo in #793's workspace migration.
+    checks.append(check_directory(Path(shared_personal_path("notes", WORKSPACE_DIR)), "notes-dir"))
 
     # Memory sync
     checks.append(check_memory_sync())
