@@ -10,6 +10,14 @@ import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync, statS
 import { join, extname } from 'node:path';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
+import { resolveWorkspace } from './workspace_default.js';
+
+// Tasks/, results/, state/, dynamic-content.json are per-user runtime state
+// — live under $SUTANDO_WORKSPACE. Pre-fix, sites below resolved against
+// `process.cwd()` which only happened to match the workspace when the
+// voice-agent was launched from the repo with SUTANDO_WORKSPACE unset.
+// resolveWorkspace() is the canonical TS helper introduced in #821.
+const WORKSPACE_DIR = resolveWorkspace();
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -471,8 +479,8 @@ export const cancelTaskTool: ToolDefinition = {
 	async execute(args) {
 		const { taskId, query, list } = (args ?? {}) as { taskId?: string; query?: string; list?: boolean };
 		try {
-			const tasksDir = join(process.cwd(), 'tasks');
-			const resultsDir = join(process.cwd(), 'results');
+			const tasksDir = join(WORKSPACE_DIR, 'tasks');
+			const resultsDir = join(WORKSPACE_DIR, 'results');
 			const files = readdirSync(tasksDir).filter(f => f.endsWith('.txt')).sort();
 
 			// list mode: return id + preview, no cancel
@@ -761,10 +769,10 @@ export const createChatTaskTool: ToolDefinition = {
 /** All inline tools — import and spread into your tools list */
 // ─── Notes tools ─────────────────────────────────────────
 // Resolve at module-init: $SUTANDO_PRIVATE_DIR/notes (canonical) when set,
-// else cwd/notes (legacy fallback). Notes are SHARED across the fleet so
-// they live at the top-level private dir, not under machine-<host>/.
+// else <workspace>/notes (legacy fallback). Notes are SHARED across the
+// fleet so they live at the top-level private dir, not under machine-<host>/.
 import { sharedPersonalPath } from './util_paths.js';
-const NOTES_DIR = sharedPersonalPath('notes', process.cwd());
+const NOTES_DIR = sharedPersonalPath('notes', WORKSPACE_DIR);
 
 export const showViewTool: ToolDefinition = {
 	name: 'show_view',
@@ -775,7 +783,7 @@ export const showViewTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { view } = args as { view: string };
-		const dcPath = join(process.cwd(), 'dynamic-content.json');
+		const dcPath = join(WORKSPACE_DIR, 'dynamic-content.json');
 		writeFileSync(dcPath, JSON.stringify({ type: 'view', view }));
 		// Auto-clear after 3 seconds so it doesn't persist
 		setTimeout(() => { try { unlinkSync(dcPath); } catch {} }, 3000);
@@ -873,7 +881,7 @@ export const deleteNoteTool: ToolDefinition = {
 // is the READ path that voice-agent's Gemini can call when it senses confusion
 // ("what was the post we picked?" / "what's pending?").
 
-const VOICE_SESSION_CONTEXT_PATH = join(process.cwd(), 'state', 'voice-session-context.json');
+const VOICE_SESSION_CONTEXT_PATH = join(WORKSPACE_DIR, 'state', 'voice-session-context.json');
 
 export const recentContextTool: ToolDefinition = {
 	name: 'recent_context',

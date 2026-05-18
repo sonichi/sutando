@@ -2884,28 +2884,48 @@ async def poll_proactive():
                     if not text:
                         f.unlink(missing_ok=True)
                         continue
-                    # Send to first non-bot user in allowFrom.
-                    # `allowFrom` typically contains multiple bot IDs
-                    # (MacBook bot, Mac Mini bot) plus the human owner.
-                    # `next(iter(allowed))` picked bots ~50% of the time
-                    # based on set iteration, and Discord rejects bot→bot
-                    # DMs with HTTP 400 code 50007 ("Cannot send messages
-                    # to this user"). See `src/dm-result.py` which has
-                    # the matching `_resolve_owner_id()` for the CLI path.
-                    allowed = load_allowed()
-                    if not allowed:
-                        print(f"  [proactive] no owner in allowFrom, skipping {f.name}")
-                        f.unlink(missing_ok=True)
-                        continue
-                    owner_id = None
-                    for uid in allowed:
+                    # Resolve the DM recipient. Priority (mirrors
+                    # src/dm-result.py:_resolve_owner_id, modulo the
+                    # async/event-loop shape):
+                    #   1. $SUTANDO_DM_OWNER_ID env override.
+                    #   2. tierMap[uid] == "owner" — the unique tier-tagged
+                    #      owner from access.json.
+                    #   3. First non-bot user from allowFrom IN LIST ORDER.
+                    #
+                    # Pre-fix used `load_allowed()` which returns a SET, so
+                    # iteration was insertion/hash-ordered — on 2026-05-18
+                    # this picked a team-tier user (msze_) over the
+                    # owner-tier user (qingyunwu) because the set yielded
+                    # msze_ first. allowFrom is a *list* in access.json with
+                    # a meaningful first-entry-wins convention; preserving
+                    # that order fixes the routing.
+                    owner_id = os.environ.get("SUTANDO_DM_OWNER_ID", "").strip() or None
+                    if not owner_id:
                         try:
-                            u = await client.fetch_user(int(uid))
-                            if not u.bot:
-                                owner_id = str(uid)
-                                break
+                            access_data = json.loads(ACCESS_FILE.read_text())
                         except Exception:
+                            access_data = {}
+                        allow_list = access_data.get("allowFrom") or []
+                        tier_map = access_data.get("tierMap") or {}
+                        if not allow_list:
+                            print(f"  [proactive] no owner in allowFrom, skipping {f.name}")
+                            f.unlink(missing_ok=True)
                             continue
+                        # Preferred: the tier-tagged owner if one exists in allowFrom.
+                        owner_id = next(
+                            (uid for uid in allow_list if tier_map.get(uid) == "owner"),
+                            None,
+                        )
+                        # Fallback: first non-bot user, list order preserved.
+                        if owner_id is None:
+                            for uid in allow_list:
+                                try:
+                                    u = await client.fetch_user(int(uid))
+                                    if not u.bot:
+                                        owner_id = str(uid)
+                                        break
+                                except Exception:
+                                    continue
                     if owner_id is None:
                         print(f"  [proactive] no human user in allowFrom, skipping {f.name}")
                         f.unlink(missing_ok=True)
