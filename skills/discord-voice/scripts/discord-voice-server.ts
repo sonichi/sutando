@@ -299,19 +299,26 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 			try { return execSync('git remote get-url origin', { timeout: 2_000 }).toString().trim().replace(/\.git$/, ''); }
 			catch { return ''; }
 		})();
+		// When OTHER_INSTANCES is set, the silence-gate prompt OVERRIDES the
+		// chatty "be helpful, use any tool" framing — same as voice-agent.ts
+		// meeting mode pattern (a strict prompt that occupies the whole
+		// first-turn framing rather than a permissive item buried in a list).
+		// Without this override Gemini gets a mixed signal: «full capabilities»
+		// vs «stay silent unless addressed» — and the capability framing wins,
+		// causing leak / spurious work-tool calls (2026-05-18 PR #796 live test).
+		const silenceFirst = OTHER_INSTANCES.length > 0
+			? [buildSilenceGatePrompt({
+				mode: 'multi-bot',
+				instanceName: INSTANCE_NAME,
+				aliases: INSTANCE_NAME_ALIASES,
+				otherInstances: OTHER_INSTANCES,
+				otherAliases: OTHER_INSTANCE_ALIASES,
+			})]
+			: [];
 		instructions = [
+			...silenceFirst,
 			`You are Sutando${INSTANCE_NAME ? ` (this instance is named ${INSTANCE_NAME})` : ''}, a personal AI assistant. You are in a Discord voice channel with your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''}.`,
 			`YOU are Sutando${INSTANCE_NAME ? ` / ${INSTANCE_NAME}` : ''} — the AI assistant. The owner may address you by either name; both refer to you. The person speaking is your OWNER, a human. Do NOT confuse yourself with them.`,
-			...(OTHER_INSTANCES.length > 0 ? [
-				`## Other Sutando instances share this channel`,
-				buildSilenceGatePrompt({
-					mode: 'multi-bot',
-					instanceName: INSTANCE_NAME,
-					aliases: INSTANCE_NAME_ALIASES,
-					otherInstances: OTHER_INSTANCES,
-					otherAliases: OTHER_INSTANCE_ALIASES,
-				}),
-			] : []),
 			'You have full capabilities — use the work tool for anything: check the screen, send emails, look things up, make calls, browse the web, or check results of previous tasks.',
 			'',
 			'## How to think',
@@ -476,12 +483,26 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 		});
 	}
 
+	// Greeting fires once at session start. Empty in single-bot mode (no
+	// announcement until the operator speaks). In multi-bot mode, fire the
+	// silence-gate prompt so the very first thing Gemini sees is «stay
+	// silent» — matches voice-agent.ts meeting-mode pattern.
+	const greeting = OTHER_INSTANCES.length > 0
+		? buildSilenceGatePrompt({
+			mode: 'multi-bot',
+			instanceName: INSTANCE_NAME,
+			aliases: INSTANCE_NAME_ALIASES,
+			otherInstances: OTHER_INSTANCES,
+			otherAliases: OTHER_INSTANCE_ALIASES,
+		})
+		: '';
+
 	return {
 		name: 'discord-voice',
 		instructions,
 		tools,
 		googleSearch: true,
-		greeting: '',
+		greeting,
 	};
 }
 
