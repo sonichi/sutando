@@ -102,8 +102,12 @@ const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes default
 // emit a Discord DM to the owner if this task hits its timeout. dm_on_timeout
 // defaults to false (silent timeout — Susan's PR #578 contract). Voice agent
 // can flip it true on critical tasks to get a fallback notification.
-type PendingTask = { submittedAt: number; timeoutMs: number; dmOnTimeout: boolean };
+type PendingTask = { submittedAt: number; timeoutMs: number; dmOnTimeout: boolean; taskText: string };
 const _pendingTasks = new Map<string, PendingTask>();
+
+// Dedup window: identical task text within 2 minutes → return existing taskId.
+const DEDUP_WINDOW_MS = 2 * 60 * 1000;
+const normalizeTask = (t: string) => t.toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 150);
 
 /** True if the task file (in tasks/, tasks/processed/, or tasks/archive/
  * — including month-partitioned subdirs `tasks/archive/YYYY-MM/`) is
@@ -232,6 +236,24 @@ export const workTool: ToolDefinition = {
 			console.log(`${ts()} [TaskBridge] WARNING: watcher offline — task will be queued for next cron pass`);
 		}
 
+		// Dedup: if the same task text is already pending (within DEDUP_WINDOW_MS),
+		// return the existing taskId instead of writing a duplicate task file.
+		const normalizedTask = normalizeTask(task);
+		const now = Date.now();
+		for (const [existingId, pending] of _pendingTasks) {
+			if (
+				normalizeTask(pending.taskText) === normalizedTask &&
+				now - pending.submittedAt < DEDUP_WINDOW_MS
+			) {
+				console.log(`${ts()} [TaskBridge] Dedup: task matches ${existingId} (submitted ${Math.round((now - pending.submittedAt) / 1000)}s ago)`);
+				return {
+					status: 'duplicate',
+					taskId: existingId,
+					message: `Task already pending as ${existingId}. Do NOT submit again — tell the user you are already working on it.`,
+				};
+			}
+		}
+
 		const taskId = `task-${Date.now()}`;
 		const timestamp = new Date().toISOString();
 		const ownerId = process.env.SUTANDO_DM_OWNER_ID || 'voice-local';
@@ -257,7 +279,7 @@ export const workTool: ToolDefinition = {
 		// Chi's 2026-05-03 06:00 override was reverted at 06:47 — the always-on
 		// default was producing unwanted DMs). Caller must explicitly pass
 		// dm_on_timeout: true on critical tasks where they want the fallback.
-		_pendingTasks.set(taskId, { submittedAt: Date.now(), timeoutMs, dmOnTimeout: dm_on_timeout === true });
+		_pendingTasks.set(taskId, { submittedAt: Date.now(), timeoutMs, dmOnTimeout: dm_on_timeout === true, taskText: task });
 		// Record owner activity for status-aware-pivot in proactive loop
 		writeOwnerActivity('voice', task);
 		console.log(`${ts()} [TaskBridge] Task ${taskId}: ${task.slice(0, 100)}`);

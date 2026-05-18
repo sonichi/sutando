@@ -134,6 +134,18 @@ Key files:
 
 Read relevant memory files when user preferences or history would improve task quality. Write new memory when you learn something durable about the user or the project.
 
+## Telegram access control
+
+Telegram uses trust-on-first-use (TOFU) onboarding: **the first DM after the bridge starts auto-enrolls the sender as owner** and writes `~/.claude/channels/telegram/access.json`. Subsequent senders are checked against `allowFrom` in that file.
+
+- **None** (file missing) → TOFU-eligible; the next sender becomes owner.
+- **Empty set** (`allowFrom: []`) → locked down; no one gets in, no TOFU.
+- **Populated set** → normal allowlist check.
+
+To allow additional senders after onboarding: add their numeric Telegram user ID to `allowFrom` in `~/.claude/channels/telegram/access.json`.
+
+Telegram tasks include an `access_tier` field set by the bridge (same tiers as Discord).
+
 ## Discord access control
 
 Discord tasks include an `access_tier` field set by the bridge:
