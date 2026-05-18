@@ -382,9 +382,10 @@ const HTML = /* html */ `<!DOCTYPE html>
   #core-status-bar:empty { display: none; }
   #core-status-bar .core-running { color: #4ecca3; }
   #core-status-bar .core-idle { color: #444; }
-  /* Presenter-mode badge — only visible when the iclr-highlight skill
-     server at localhost:7877 reports /presenter active:true. Mirrors the
-     Swift menu-bar HUD's eventual "presenting" state on the web side. */
+  /* Presenter-mode badge — only visible when the /presenter same-origin
+     endpoint reports active:true. The endpoint reads state/presenter-mode.sentinel
+     (written by scripts/presenter-mode.sh). Mirrors the Swift menu-bar HUD's
+     eventual "presenting" state on the web side. */
   #presenter-badge {
     display: none; margin-left: 14px; padding: 4px 10px; border-radius: 12px;
     background: linear-gradient(135deg, #6a1b9a, #4527a0); color: #fff;
@@ -2968,15 +2969,14 @@ document.addEventListener('keydown', function(e) {
   }, 3000);
 })();
 
-// Presenter-mode badge poll — hits a skill-server endpoint that reports
-// presenter state. Default URL is the iclr-highlight skill's
-// :7877/presenter; override via window._PRESENTER_URL at render time
-// so the badge stays generic and a different skill (or different port)
-// can drive it without editing this file. Silent-fail when unreachable
-// (off-stage / skill not loaded) — badge stays hidden.
+// Presenter-mode badge poll — hits the same-origin /presenter endpoint
+// that reads state/presenter-mode.sentinel. Override via
+// window._PRESENTER_URL at render time so a different skill (or different
+// port) can drive it without editing this file. Silent-fail when
+// unreachable — badge stays hidden.
 (function() {
   var presenterUrl = (typeof window !== 'undefined' && window._PRESENTER_URL)
-    || 'http://localhost:7877/presenter';
+    || '/presenter';
   // Shared presenter-active cache so the composite mode badge can compose
   // its label without a second fetch race.
   var lastPresenterActive = false;
@@ -3533,6 +3533,25 @@ const server = createServer((req, res) => {
 		} catch {}
 		res.writeHead(200, { 'Content-Type': 'application/json' });
 		res.end(JSON.stringify({ mode }));
+		return;
+	}
+
+	// Presenter-mode sentinel (state/presenter-mode.sentinel written by
+	// scripts/presenter-mode.sh). Replaces the old localhost:7877 poll that
+	// required the iclr-highlight skill server. Uses the same malformed-
+	// sentinel guard as check-pending-questions.py / discord-bridge.py /
+	// telegram-bridge.py: first char must be a digit → fail CLOSED on garbage.
+	if (url.pathname === '/presenter') {
+		let active = false;
+		try {
+			const raw = readFileSync(join(STATE_DIR, 'presenter-mode.sentinel'), 'utf-8').trim();
+			if (raw && raw[0] >= '0' && raw[0] <= '9') {
+				const nowISO = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+				active = nowISO < raw;
+			}
+		} catch {}
+		res.writeHead(200, { 'Content-Type': 'application/json' });
+		res.end(JSON.stringify({ active }));
 		return;
 	}
 
