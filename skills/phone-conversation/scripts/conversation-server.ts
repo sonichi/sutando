@@ -48,8 +48,9 @@ import { config as _dotenvConfig } from 'dotenv';
 _dotenvConfig({ path: new URL('../../../.env', import.meta.url).pathname, override: true });
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { mkdirSync, writeFileSync, appendFileSync, unlinkSync, existsSync, readFileSync, readdirSync, symlinkSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join } from 'node:path';
 import { hostname } from 'node:os';
+import { resolveWorkspace } from '../../../src/workspace_default.js';
 
 // Personal-asset path resolver — twin of util_paths.py / voice-agent.ts:personalPath.
 function personalPath(filename: string): string {
@@ -62,7 +63,6 @@ function personalPath(filename: string): string {
 	}
 	return filename;
 }
-import { fileURLToPath } from 'node:url';
 import { execSync, spawn, type ChildProcess } from 'node:child_process';
 import { VoiceSession, type ToolDefinition, type MainAgent } from 'bodhi-realtime-agent';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -99,7 +99,7 @@ const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN ?? '';
 const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER ?? '';
 const NGROK_AUTHTOKEN = process.env.NGROK_AUTHTOKEN ?? '';
 const PORT = Number(process.env.PHONE_PORT) || 3100;
-const WORKSPACE_DIR = process.env.SUTANDO_WORKSPACE || join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+const WORKSPACE_DIR = resolveWorkspace();
 const RESULTS_DIR = process.env.PHONE_RESULTS_DIR || join(WORKSPACE_DIR, 'results');
 const TASKS_DIR = join(WORKSPACE_DIR, 'tasks');
 const TASK_POLL_INTERVAL_MS = 500;
@@ -1355,9 +1355,8 @@ const server = createServer(async (req, res) => {
 			const preVerified = VERIFIED_MEETINGS.has(originalId) || VERIFIED_MEETINGS.has(digits);
 			if (!preVerified) {
 				const taskId = `task-approve-${Date.now()}`;
-				const REPO_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 				const taskContent = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ntask: Sutando joined meeting ${originalId || digits} (${platform}) — call SID ${sid}. Ask the user on Telegram whether to enable task delegation for this meeting. If approved, POST to http://localhost:3100/meeting-approve with {"callSid":"${sid}"}. If denied or no response within 2 minutes, do nothing (notes-only mode).\n`;
-				writeFileSync(join(REPO_DIR, 'tasks', `${taskId}.txt`), taskContent);
+				writeFileSync(join(WORKSPACE_DIR, 'tasks', `${taskId}.txt`), taskContent);
 				console.log(`${ts()} [Meeting] Approval requested: ${taskId}`);
 			} else {
 				VERIFIED_MEETINGS.add(originalId).add(digits);

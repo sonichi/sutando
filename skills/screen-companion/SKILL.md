@@ -111,7 +111,7 @@ Configs are non-executable YAML — they only declare the interaction shape. No 
 
 What IS persisted by default:
 - **Text transcript** of the spoken conversation, in `<workspace>/data/screen-companion-<sessionId>.jsonl`. Same convention as `phone-conversation/conversation-server.ts` + `discord-voice/discord-voice-server.ts`.
-- **Notes the user explicitly asks Sutando to take** via the `take_note` tool, in `<workspace>/notes/`.
+- **Notes the user explicitly asks Sutando to take** — saved to `<workspace>/notes/` once a `take_note` tool lands (planned; see issue #797). Today, "remember this" requests are persisted only as part of the conversation transcript above.
 
 What is NOT persisted by default:
 - Vision frames (the screenshots themselves) — sent to Gemini Live and discarded.

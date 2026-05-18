@@ -21,9 +21,16 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-REPO = Path(__file__).resolve().parent.parent.parent.parent
-CALLS_FILE = REPO / "results" / "calls" / "calls.jsonl"
-METRICS_FILE = REPO / "data" / "call-metrics.jsonl"
+# results/calls/ and data/call-metrics.jsonl are per-user runtime state —
+# live under $SUTANDO_WORKSPACE. Pre-fix this resolved to the repo checkout
+# which doesn't have either file post-#762, so `diagnose-call <sid>` always
+# printed "No call matches".
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "src"))
+from workspace_default import resolve_workspace  # noqa: E402
+
+WORKSPACE = resolve_workspace()
+CALLS_FILE = WORKSPACE / "results" / "calls" / "calls.jsonl"
+METRICS_FILE = WORKSPACE / "data" / "call-metrics.jsonl"
 
 REFUSAL_RE = re.compile(
     r"\b(i\s*can'?t|i'?m\s*not\s*able|i'?m\s*unable|unable\s*to|sorry,?\s*i\s*(can'?t|cannot))\b",

@@ -186,6 +186,110 @@ def case_f_hash_covers_full_set() -> list[str]:
     return fails
 
 
+def case_g_any_core_alive_returns_false_when_no_cores_dir() -> list[str]:
+    """_any_core_alive returns False when state/cores/ doesn't exist."""
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        # No cores/ subdir at all.
+        if hc._any_core_alive(workspace=ws):
+            fails.append("g) _any_core_alive returned True with no cores/ dir")
+    return fails
+
+
+def case_h_any_core_alive_returns_true_for_fresh_file() -> list[str]:
+    """_any_core_alive returns True when a *.alive file has a recent mtime."""
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        cores_dir = ws / "state" / "cores"
+        cores_dir.mkdir(parents=True)
+        alive_file = cores_dir / "test-host.alive"
+        alive_file.write_text("{}")
+        # mtime is now — well within 90s.
+        if not hc._any_core_alive(workspace=ws):
+            fails.append("h) _any_core_alive returned False for a just-touched .alive file")
+    return fails
+
+
+def case_i_any_core_alive_returns_false_for_stale_file() -> list[str]:
+    """_any_core_alive returns False when the *.alive file is older than max_age_s."""
+    import os
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        cores_dir = ws / "state" / "cores"
+        cores_dir.mkdir(parents=True)
+        alive_file = cores_dir / "test-host.alive"
+        alive_file.write_text("{}")
+        # Back-date mtime by 200s (> 90s default max_age_s).
+        stale_ts = time.time() - 200
+        os.utime(alive_file, (stale_ts, stale_ts))
+        if hc._any_core_alive(workspace=ws):
+            fails.append("i) _any_core_alive returned True for a 200s-old .alive file")
+    return fails
+
+
+def case_j_emit_skipped_when_core_alive(monkeypatch_alive) -> list[str]:
+    """emit_task_for_failures writes NO task file when _any_core_alive() is True.
+
+    We simulate a live core by passing a workspace with a fresh .alive file and
+    patching the module-level WORKSPACE_DIR so _any_core_alive() picks it up
+    from main()'s call (which uses the module default, not a parameter).
+    """
+    import os
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        cores_dir = ws / "state" / "cores"
+        cores_dir.mkdir(parents=True)
+        (cores_dir / "test-host.alive").write_text("{}")
+        state_file = ws / "state" / "health-last-alerted.json"
+        tasks_dir = ws / "tasks"
+        # Temporarily redirect WORKSPACE_DIR so _any_core_alive() in main() sees ws.
+        original = hc.WORKSPACE_DIR
+        hc.WORKSPACE_DIR = ws
+        try:
+            # Verify _any_core_alive sees the live core.
+            assert hc._any_core_alive(), "precondition: _any_core_alive() must be True"
+            # Simulate main()'s call: do_emit=True, do_fix=False.
+            if not hc._any_core_alive():
+                hc.emit_task_for_failures(
+                    make_checks(("down", "voice-agent")),
+                    state_file=state_file, tasks_dir=tasks_dir,
+                )
+            if list_task_files(tasks_dir):
+                fails.append("j) emit wrote a task file even though core is alive")
+        finally:
+            hc.WORKSPACE_DIR = original
+    return fails
+
+
+def case_k_emit_proceeds_when_core_dead() -> list[str]:
+    """emit_task_for_failures DOES write a task file when no live core is present."""
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        # No cores/ dir → _any_core_alive() returns False.
+        state_file = ws / "state" / "health-last-alerted.json"
+        tasks_dir = ws / "tasks"
+        original = hc.WORKSPACE_DIR
+        hc.WORKSPACE_DIR = ws
+        try:
+            assert not hc._any_core_alive(), "precondition: _any_core_alive() must be False"
+            if not hc._any_core_alive():
+                hc.emit_task_for_failures(
+                    make_checks(("down", "voice-agent")),
+                    state_file=state_file, tasks_dir=tasks_dir,
+                )
+            files = list_task_files(tasks_dir)
+            if not files:
+                fails.append("k) no task file written even though core is dead")
+        finally:
+            hc.WORKSPACE_DIR = original
+    return fails
+
+
 def main() -> int:
     cases = [
         ("a", case_a_empty_failures_no_file),
@@ -194,6 +298,11 @@ def main() -> int:
         ("d", case_d_history_pruned_after_24h),
         ("e", case_e_warn_is_failure),
         ("f", case_f_hash_covers_full_set),
+        ("g", case_g_any_core_alive_returns_false_when_no_cores_dir),
+        ("h", case_h_any_core_alive_returns_true_for_fresh_file),
+        ("i", case_i_any_core_alive_returns_false_for_stale_file),
+        ("j", lambda: case_j_emit_skipped_when_core_alive(None)),
+        ("k", case_k_emit_proceeds_when_core_dead),
     ]
     all_failures = []
     for label, fn in cases:
