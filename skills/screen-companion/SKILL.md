@@ -101,7 +101,9 @@ See `screen_companion.md` at the repo root. Owner is iterating on the model (M1 
 
 ## Trust + scope
 
-Configs are non-executable YAML — they only declare the interaction shape. No path to arbitrary code execution from a config alone. The tool allow-list is enforced at activation time; configs cannot grant tools the active VoiceSession doesn't already expose.
+Configs are non-executable YAML — they only declare the interaction shape. No path to arbitrary code execution from a config alone.
+
+**`tools_allow` is advisory in v0.** The activation tool returns the allow-list in its payload and instructs Gemini to self-restrict via the system-prompt note. There is no hard-enforcement path that scopes the live VoiceSession's tool surface to the allow-list — Gemini sees the field as guidance, not a hard constraint. A future PR will add hard enforcement at the bodhi-realtime-agent layer; until then, treat configs as the documented intent, not the security boundary. Configs still cannot grant tools the active VoiceSession doesn't already expose (the field is a hint, not a grant), so the worst case is "Gemini calls a tool you didn't intend to allow" — not privilege escalation.
 
 ## Privacy + data handling
 
