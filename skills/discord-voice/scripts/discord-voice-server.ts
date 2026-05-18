@@ -27,6 +27,7 @@
 
 import { config as _dotenvConfig } from 'dotenv';
 import { buildSilenceGatePrompt } from '../../../src/silence-gate-prompt.js';
+import { recordDiscordVoiceTurn, recordDiscordVoiceSession } from './discord-voice-store.js';
 import { mkdirSync, writeFileSync, appendFileSync, existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 
@@ -745,10 +746,12 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 				s.transcript.push({ role: 'user', text: item.content });
 				s.events.push({ event: `user:${item.content}`, timestamp: new Date().toISOString() });
 				logLine('user', item.content);
+				recordDiscordVoiceTurn('discord-user', item.content, s.sessionId);
 			} else if (item.role === 'assistant') {
 				s.transcript.push({ role: 'sutando', text: item.content });
 				s.events.push({ event: `sutando:${item.content}`, timestamp: new Date().toISOString() });
 				logLine('assistant', item.content);
+				recordDiscordVoiceTurn('discord-agent', item.content, s.sessionId);
 			}
 		}
 		lastProcessedIdx = items.length;
@@ -834,6 +837,15 @@ function cleanupSession(s: DiscordVoiceSession): void {
 	try {
 		appendFileSync(join(DATA_DIR, 'discord-voice-metrics.jsonl'), JSON.stringify(metrics) + '\n');
 	} catch {}
+	recordDiscordVoiceSession({
+		sessionId: s.sessionId,
+		durationMs,
+		transcriptLines: s.transcript.length,
+		toolCount: s.toolCalls.length,
+		pendingTasks: s.pendingTasks,
+		toolCalls: s.toolCalls,
+		events: s.events,
+	});
 	console.log(`${ts()} [Voice] session finalized: ${s.sessionId} (${durationMs}ms, ${s.transcript.length} turns)`);
 }
 
