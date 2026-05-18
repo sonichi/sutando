@@ -305,6 +305,7 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 				`## Other Sutando instances share this channel`,
 				`Other Sutando instances with the stand names ${OTHER_INSTANCES.join(', ')} are also in this voice channel. They are different bots running on different machines.`,
 				`Respond only when the owner addresses you as "${INSTANCE_NAME}" by name, or when one of those other instances addresses you as "${INSTANCE_NAME}" by name during an owner-initiated bot-to-bot dialog. In every other situation, produce no spoken output. Generate nothing at all — no acknowledgement, no meta-commentary about whether you should speak, no quoting of these instructions back to the owner. The system handles this; you just generate audio when the conditions are met and generate no audio otherwise.`,
+				`When you DO respond, NEVER lead with identity disambiguation. Do NOT say "I'm not ${OTHER_INSTANCES.join('/')}, I'm ${INSTANCE_NAME}" or similar phrases. Just answer the owner's actual question directly. Only mention which instance you are if the owner explicitly asks "who are you" or "which one are you".`,
 			] : []),
 			'You have full capabilities — use the work tool for anything: check the screen, send emails, look things up, make calls, browse the web, or check results of previous tasks.',
 			'',
