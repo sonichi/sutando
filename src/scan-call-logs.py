@@ -12,8 +12,12 @@ import json, re, sys, os
 from pathlib import Path
 from datetime import datetime
 
-CALLS_FILE = Path(__file__).parent.parent / "results" / "calls" / "calls.jsonl"
-STATE_FILE = Path(__file__).parent.parent / "results" / "calls" / ".scan-state.json"
+sys.path.insert(0, str(Path(__file__).parent))
+from workspace_default import resolve_workspace  # noqa: E402
+
+_WORKSPACE = resolve_workspace()
+CALLS_FILE = _WORKSPACE / "results" / "calls" / "calls.jsonl"
+STATE_FILE = _WORKSPACE / "results" / "calls" / ".scan-state.json"
 
 # --- Detection patterns ---
 
