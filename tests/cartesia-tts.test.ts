@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createWavHeader, splitSentences } from '../src/cartesia-tts.js';
 
-describe('createWavHeader', () => {
+describe('createWavHeader', () =>/ {
 	it('produces a 44-byte header', () => {
 		const header = createWavHeader(0, 24000, 1, 16);
 		assert.equal(header.length, 44);
