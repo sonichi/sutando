@@ -123,6 +123,47 @@ if [ ! -d "$SYNC_DIR" ]; then
     git clone --depth=10 "$SUTANDO_MEMORY_REPO" "$SYNC_DIR" 2>&1 | tee -a "$LOG"
 fi
 
+# --- Workspace symlink bootstrap (issue #769 fix) ---
+# PR #769 migrated `notes/` from `<repo>/notes/` to `$SUTANDO_WORKSPACE/notes/`
+# without preserving the pre-PR symlink to the private repo. Result: edits to
+# workspace/notes/ no longer reach the private repo, breaking cross-machine
+# sync silently. This block restores the symlink architecture:
+#
+#   $SUTANDO_WORKSPACE/notes  → $SYNC_DIR/notes  (symlink, idempotent)
+#
+# Behavior:
+#   - already-correct symlink: no-op
+#   - real dir at the target path: log WARN; manual reconcile required
+#     (don't silently overwrite local data — operator does rsync + mv + ln -s)
+#   - missing path: create the symlink
+#
+# The same convention is documented in this script's pre-2026-05-11 history
+# ("notes/ bidirectional rsync removed: both nodes now symlink").
+WS_DIR="${SUTANDO_WORKSPACE_DIR:-$HOME/.sutando/workspace}"
+mkdir -p "$WS_DIR"
+for pair in "notes:notes"; do
+    src="$WS_DIR/${pair%%:*}"
+    tgt="$SYNC_DIR/${pair##*:}"
+    if [ -L "$src" ]; then
+        actual=$(readlink "$src")
+        if [ "$actual" != "$tgt" ]; then
+            log "symlink mismatch: $src → $actual (expected $tgt)"
+            echo "sync-memory: WARN — $src points at $actual not $tgt; investigate." >&2
+        fi
+    elif [ -d "$src" ]; then
+        log "WARN: $src is a real dir not a symlink — manual reconcile needed"
+        echo "sync-memory: WARN — $src is a real dir, not a symlink to $tgt." >&2
+        echo "  Manual reconcile (preserves data): " >&2
+        echo "    rsync -au $src/ $tgt/ && rm -rf $src && ln -s $tgt $src" >&2
+    elif [ ! -e "$src" ]; then
+        mkdir -p "$(dirname "$src")"
+        if ln -s "$tgt" "$src"; then
+            log "symlink created: $src → $tgt"
+            echo "sync-memory: symlinked $src → $tgt" >&2
+        fi
+    fi
+done
+
 cd "$SYNC_DIR" || { log "Failed to cd $SYNC_DIR"; exit 1; }
 
 # --- Assert on main before doing any sync work (restored from PR #504, dropped by PR #511) ---
