@@ -69,10 +69,17 @@ def _migrate_from_legacy(target: Path) -> bool:
     if target.exists() and any(target.iterdir()):
         return False
     # Look for runtime evidence in the legacy root before doing anything.
+    # Originally checked only for "task-*" files, which missed observer-only
+    # nodes (no tasks written, but results/ or state/ are populated — e.g. a
+    # secondary node that only reads results). Widened per issue #770.
     runtime_evidence = False
     for d in _LEGACY_DIRS:
         legacy_d = legacy / d
-        if legacy_d.is_dir() and any(legacy_d.glob("task-*")):
+        if not legacy_d.is_dir():
+            continue
+        # task-* → primary node evidence. Any file in results/ or state/ →
+        # observer-node evidence. notes/ with files → user note-taking node.
+        if any(legacy_d.iterdir()):
             runtime_evidence = True
             break
     if not runtime_evidence:

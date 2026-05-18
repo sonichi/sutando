@@ -10,6 +10,7 @@ Usage:
   python3 src/health-check.py --notify-on-fail # macOS notification on failure
 
 Checks:
+  - macOS TCC Documents-folder access (when repo is under ~/Documents)
   - Voice agent (port 9900), web client, agent API, dashboard
   - Critical files (CLAUDE.md, build_log.md, ACTIVITY.md)
   - Memory system (MEMORY.md index, key memory files)
@@ -134,6 +135,53 @@ def check_memory_sync() -> dict:
             return {"name": name, "status": "warn", "detail": f"last sync {age_h:.0f}h ago (stale)"}
         return {"name": name, "status": "ok", "detail": f"last sync {age_h:.1f}h ago"}
     return {"name": name, "status": "ok", "detail": "initialized, never fetched"}
+
+
+def check_tcc_documents_access() -> dict:
+    """Detect macOS TCC denial of Documents-folder access (issue #709).
+
+    Relevant when REPO_DIR is inside ~/Documents — the default location for
+    git checkouts on macOS. A process that hasn't been granted Documents access
+    in System Settings → Privacy & Security → Files and Folders will hit
+    PermissionError on every file read/write in the repo, causing tasks to go
+    missing and services to crash on startup with no obvious error.
+
+    Probe: attempt to list REPO_DIR and write+unlink a throwaway temp file.
+    Safe even when access is denied — the PermissionError is caught and reported
+    rather than propagated.
+    """
+    name = "tcc-documents-access"
+    docs_dir = Path.home() / "Documents"
+    try:
+        in_documents = str(REPO_DIR.resolve()).startswith(str(docs_dir.resolve()))
+    except OSError:
+        in_documents = True  # can't resolve → assume we're in Documents and probe
+
+    if not in_documents:
+        return {"name": name, "status": "ok", "detail": "repo not in ~/Documents — TCC check N/A"}
+
+    probe = REPO_DIR / ".tcc-probe"
+    try:
+        list(REPO_DIR.iterdir())
+        probe.write_text("")
+        probe.unlink()
+        return {"name": name, "status": "ok", "detail": "Documents folder access granted"}
+    except PermissionError:
+        try:
+            probe.unlink()
+        except Exception:
+            pass
+        return {
+            "name": name,
+            "status": "fail",
+            "detail": (
+                "macOS TCC denied Documents folder access — grant in "
+                "System Settings → Privacy & Security → Files and Folders "
+                "→ Terminal (or your IDE/launchd app)"
+            ),
+        }
+    except OSError:
+        return {"name": name, "status": "ok", "detail": "Documents access check inconclusive"}
 
 
 # ---------------------------------------------------------------------------
@@ -675,6 +723,10 @@ def run_all_checks() -> list[dict]:
             c["detail"] = "not running (optional)"
         checks.append(c)
 
+    # macOS TCC — must come before critical-file checks so if TCC is blocking
+    # everything, the operator sees the root cause before the downstream failures.
+    checks.append(check_tcc_documents_access())
+
     # Critical files
     for name, path in [
         ("CLAUDE.md", REPO_DIR / "CLAUDE.md"),
@@ -689,8 +741,11 @@ def run_all_checks() -> list[dict]:
     else:
         checks.append({"name": "memory-dir", "status": "ok", "detail": "not yet created (normal for new installs)"})
 
-    # Notes — canonical home is shared private dir post-migration
-    checks.append(check_directory(Path(shared_personal_path("notes", REPO_DIR)), "notes-dir"))
+    # Notes — canonical home is shared private dir post-migration.
+    # Pass WORKSPACE_DIR (not REPO_DIR) so the check resolves to
+    # ~/.sutando/workspace/notes rather than <repo>/notes — the notes/
+    # .gitkeep was removed from the repo in #793's workspace migration.
+    checks.append(check_directory(Path(shared_personal_path("notes", WORKSPACE_DIR)), "notes-dir"))
 
     # Memory sync
     checks.append(check_memory_sync())
@@ -912,6 +967,32 @@ def run_all_checks() -> list[dict]:
     return checks
 
 
+def _any_core_alive(workspace: Optional[Path] = None, max_age_s: float = 90.0) -> bool:
+    """Return True if any sutando-core on any host has a live heartbeat.
+
+    Each running core writes `<workspace>/state/cores/<hostname>.alive` every
+    30 seconds (src/core_heartbeat.py). A file younger than `max_age_s` (3
+    missed beats at 30s each) means the core is alive. When it is, the
+    proactive loop already handles health inline — no need to queue a task.
+
+    `workspace` defaults to `WORKSPACE_DIR` at call time (not at import time)
+    so tests can patch the module-level name and have the change take effect.
+    """
+    if workspace is None:
+        workspace = WORKSPACE_DIR
+    cores_dir = workspace / "state" / "cores"
+    if not cores_dir.is_dir():
+        return False
+    now = time.time()
+    for alive_file in cores_dir.glob("*.alive"):
+        try:
+            if now - alive_file.stat().st_mtime < max_age_s:
+                return True
+        except OSError:
+            pass
+    return False
+
+
 def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None, tasks_dir: Optional[Path] = None) -> None:
     """Emit a task file describing health-check failures so the proactive
     loop's CLI session sees them via the watcher and can decide what to do
@@ -1093,7 +1174,12 @@ def main():
     # `--quiet --emit-task --notify-on-fail` invocation bypassed via the
     # quiet-path sys.exit(1). Splitting the emit logic by --fix state
     # restores coverage for the no-fix path.
-    if do_emit and not do_fix:
+    #
+    # Skip when a live core is present (issue #635 dedup-runners): the
+    # proactive loop already handles health inline — writing a task file
+    # here creates a duplicate that re-queues the same check. The task-file
+    # path is only useful when the core is dead (queues for next restart).
+    if do_emit and not do_fix and not _any_core_alive():
         emit_task_for_failures(checks)
 
     if as_json:
@@ -1231,7 +1317,7 @@ def main():
     # review). The no-fix path emits earlier, before --quiet / --json early
     # exits (per #640 v2-regression: launchd's `--quiet --emit-task` was
     # bypassing the end-of-main emit via sys.exit(1)).
-    if do_emit and do_fix and issues:
+    if do_emit and do_fix and issues and not _any_core_alive():
         # Brief delay so restarts have a chance to register before re-check.
         # 2s matches the fix-loop's per-service `time.sleep(1)` budget.
         import time as _t; _t.sleep(2)
