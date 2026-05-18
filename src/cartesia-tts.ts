@@ -23,10 +23,16 @@
 import Cartesia from '@cartesia/cartesia-js';
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { resolveWorkspace } from './workspace_default.js';
 
 const getCartesiaApiKey = () => process.env.CARTESIA_API_KEY || '';
 const getCartesiaVoiceId = () => process.env.CARTESIA_VOICE_ID || 'f786b574-daa5-4673-aa0c-cbe3e8534c02';
-const getWorkspace = () => process.env.WORKSPACE_DIR || process.cwd();
+// Audio output (results/audio/) is per-user runtime state — lives under
+// $SUTANDO_WORKSPACE. Pre-fix used the legacy `WORKSPACE_DIR` env var name
+// (not `SUTANDO_WORKSPACE`) with a `process.cwd()` fallback, which wrote
+// to the repo when launched from there. resolveWorkspace() is the
+// canonical TS helper introduced in #821.
+const getWorkspace = () => resolveWorkspace();
 
 const SAMPLE_RATE = 24000;
 const CHANNELS = 1;

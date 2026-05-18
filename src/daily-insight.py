@@ -14,8 +14,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from util_paths import shared_personal_path  # noqa: E402
+from workspace_default import resolve_workspace  # noqa: E402
 
-WORKSPACE = Path(__file__).parent.parent
+WORKSPACE = resolve_workspace()
 CALLS_FILE = WORKSPACE / "results" / "calls" / "calls.jsonl"
 RESULTS_DIR = WORKSPACE / "results"
 STATE_DIR = WORKSPACE / "state"
