@@ -65,12 +65,15 @@ const activateScreenCompanionTool: ToolDefinition = {
 		console.log(`${ts()} [ScreenCompanion] activate mode=${mode} goal=${goal ? `"${goal}"` : '(none)'}`);
 		try {
 			const config = loadConfig(mode);
-			const filledGoal = renderGoal(config, goal);
+			// Run the goal-required guard BEFORE renderGoal so we never
+			// produce a string with an un-substituted `{goal}` placeholder.
+			// Per sonichi review #4 on PR #794.
 			if (config.goal_template && !goal) {
 				return {
 					error: `Mode "${mode}" requires a goal. Ask the user: "What are you trying to set up?" then call activate_screen_companion again with goal=...`,
 				};
 			}
+			const filledGoal = renderGoal(config, goal);
 			const visionHint =
 				config.vision_mode === 'push'
 					? `Vision mode is PUSH (frames stream at ${config.vision_cadence_ms ?? 1000}ms cadence). If the user is not already screen-sharing, ask them to start it now so you can see what they're doing.`
@@ -99,7 +102,7 @@ const activateScreenCompanionTool: ToolDefinition = {
 			return {
 				error: msg,
 				available_modes: availableModes(),
-				hint: 'If the user\'s request doesn\'t match any available mode, do NOT call this tool — fall back to regular vision_query / take_note / look_up_reference behavior.',
+				hint: 'If the user\'s request doesn\'t match any available mode, do NOT call this tool — operate normally with whatever tools the session already has registered.',
 			};
 		}
 	},
