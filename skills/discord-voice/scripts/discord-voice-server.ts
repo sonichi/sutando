@@ -723,6 +723,54 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 	};
 	const transcriptContainsName = (text: string): boolean => _addressed(text, nameVariants);
 	const transcriptContainsOther = (text: string): boolean => _addressed(text, otherVariantsLc);
+	// Open-world "addressed to NOT-me" detector — catches address patterns where
+	// the named token is anything other than one of my own variants. So if the
+	// operator says "Hi Bob" or "Hi Daddy" or any name we haven't explicitly
+	// listed, Lucy still recognizes it as "not me" and flips sticky to drop.
+	// Per Susan 2026-05-18: "停到一个hi 不是lucy的都drop". Doesn't require
+	// the OTHER list to enumerate every possible mishearing.
+	const _addressedToNotMe = (text: string): boolean => {
+		if (!text) return false;
+		const myLc = nameVariants.filter(Boolean);
+		const lc = text.toLowerCase();
+		const patterns = [
+			// greet+name anywhere
+			/\b(hi|hey|hello|yo|okay|ok)[,!:]?\s+([a-z][a-z'-]*(?:\s+[a-z][a-z'-]*)?)\b/gi,
+			// commaTag — require start-of-clause (^ or .!?) before name, else
+			// random nouns like "math?" / "name?" false-positive as addresses.
+			/(^|[.!?]\s*)([a-z][a-z'-]*)\s*[,?]/gi,
+			// imperative — start-of-clause + name + verb.
+			/(^|[.!?]\s*)([a-z][a-z'-]*)\s+(can|could|will|would|please|tell|answer|design|write|read|check|look|help|stop|start|leave|join|log|hang|end)\b/gi,
+		];
+		const STOPWORDS = new Set([
+			// pronouns + question words
+			'i', 'me', 'my', 'mine', 'you', 'your', 'yours', 'we', 'us', 'our', 'ours',
+			'they', 'them', 'their', 'theirs', 'he', 'him', 'his', 'she', 'her', 'hers',
+			'it', 'its', 'this', 'that', 'these', 'those', 'there', 'here',
+			'who', 'whom', 'whose', 'what', 'which', 'when', 'where', 'why', 'how',
+			// affirmations / acknowledgements
+			'yes', 'no', 'yep', 'nope', 'yeah', 'nah', 'okay', 'ok', 'sure', 'right',
+			'thanks', 'thank', 'please', 'sorry', 'maybe',
+			// fillers / interjections
+			'oh', 'um', 'uh', 'well', 'so', 'just', 'now', 'now', 'still', 'also',
+			'and', 'or', 'but', 'if', 'as',
+			// common short verbs that often start clauses
+			'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had',
+			'do', 'does', 'did', 'go', 'goes', 'went', 'come', 'came',
+			'one', 'two', 'three', 'a', 'an', 'the', 'all', 'some', 'any',
+		]);
+		for (const re of patterns) {
+			let m;
+			while ((m = re.exec(lc)) !== null) {
+				// Group containing the captured name varies by pattern; find non-empty
+				const name = (m[2] || m[1] || '').trim();
+				if (!name || STOPWORDS.has(name)) continue;
+				const isMe = myLc.some(v => v === name || name.startsWith(v + ' ') || name === v);
+				if (!isMe) return true;
+			}
+		}
+		return false;
+	};
 	// Sticky "last-addressed-was-me" so the owner doesn't have to re-name on
 	// every follow-up turn. Starts false (requires explicit address first turn);
 	// flips true on my-name, false on other-name, unchanged on no-name.
@@ -829,14 +877,24 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 				s.transcript.push({ role: 'sutando', text: item.content });
 				s.events.push({ event: `sutando:${item.content}`, timestamp: new Date().toISOString() });
 				logLine('assistant', item.content);
-				// Only buffer for sqlite if this assistant item BELONGS to the
-				// current turn (i.e., appears after the latest user item in
-				// this slice). Earlier assistant items are late from a previous
-				// turn whose gate already decided.
+				// Two cases:
+				// (1) Assistant appears AFTER latest user in this slice → belongs
+				//     to the current turn → buffer for this turn's gate decision.
+				// (2) Assistant appears BEFORE latest user → late response to the
+				//     PREVIOUS user turn. Use that turn's stored gate decision
+				//     (lastUserGateDecision) to decide write-or-discard.
 				if (latestUserIdxInSlice >= 0 && i > latestUserIdxInSlice) {
 					(s as any)._pendingAssistantText = ((s as any)._pendingAssistantText ?? []).concat([item.content]);
+				} else if ((s as any).lastUserGateDecision === 'allow') {
+					// Late from a previous turn that the gate ALLOWED → user heard
+					// this audio → write to sqlite (Susan 2026-05-18: previous skip
+					// was discarding real heard responses). Apply same +10s heard
+					// offset as the in-turn path.
+					const lateBase = currentTurnAudioOutTs ?? Date.now() / 1000;
+					recordDiscordVoiceTurn('discord-agent', item.content, s.sessionId, lateBase + 10);
+					console.log(`${ts()} [NameGate] wrote late-assistant text (previous turn was allow)`);
 				} else {
-					console.log(`${ts()} [NameGate] discarded late-assistant text from previous turn (not added to sqlite buffer)`);
+					console.log(`${ts()} [NameGate] discarded late-assistant text (previous turn was drop or unknown)`);
 				}
 			}
 		}
@@ -872,11 +930,23 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 				// "Hi Lucy, ..." still routes to Lucy until owner names another bot).
 				const haveMyName = transcriptContainsName(userText);
 				const haveOtherName = transcriptContainsOther(userText);
+				// Open-world drop: any address pattern naming someone other than me.
+				const haveNotMeAddress = !haveMyName && _addressedToNotMe(userText);
+				// Per-utterance evaluation (Susan 2026-05-18 "每句都判断一下，这句话
+				// 我应不应该接"): no sticky carry-over. Each turn evaluated alone.
+				// Names me → allow. Anything else (named someone else, or no name
+				// at all) → drop. User must re-name on every turn.
 				if (haveMyName) lastAddressedToMe = true;
-				else if (haveOtherName) lastAddressedToMe = false;
+				else lastAddressedToMe = false;
+				void haveOtherName; void haveNotMeAddress; // logged elsewhere
 				// Mark this user text as "processed by the gate" — lazy-allow's
 				// freshness check uses this to avoid re-deciding on stale text.
 				lastGateAppliedUserText = userText;
+				// Remember THIS turn's gate decision so late-arriving assistant
+				// items (response chunks that land in items[] after this turn.end
+				// but before the NEXT turn.end) can use it: see the late-assistant
+				// branch in the turn.end loop.
+				(s as any).lastUserGateDecision = lastAddressedToMe ? 'allow' : 'drop';
 				// Mirror to session so the dismiss tool (defined in buildAgent
 				// scope) can read the sticky state instead of doing its own
 				// per-call name check that rejects valid follow-up dismisses.
@@ -906,10 +976,15 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 					}
 					console.log(`${ts()} [NameGate] allow — flushed ${pendingAudio.length} chunks (user: "${userText.slice(0,60)}")`);
 					pendingAudio = [];
-					// Stamp agent rows with the audio-out-time (when audio actually
-					// played), not the gate-decision-write time. Falls back to wall
-					// clock if no chunks ever flowed (shouldn't happen on allow).
-					const agentTs = currentTurnAudioOutTs ?? undefined;
+					// Stamp agent rows with the audio-out-time (when audio first
+					// chunk PUSHED) + a 10s "user-heard" offset. The offset
+					// approximates audio playback duration + Discord transport
+					// jitter so sqlite timestamps roughly match when Susan
+					// actually heard the reply (per 2026-05-18 calibration).
+					// Falls back to wall clock if no chunks ever flowed.
+					const HEARD_OFFSET_SEC = 10;
+					const baseTs = currentTurnAudioOutTs ?? Date.now() / 1000;
+					const agentTs = baseTs + HEARD_OFFSET_SEC;
 					for (const t of pendingAsstText) {
 						recordDiscordVoiceTurn('discord-agent', t, s.sessionId, agentTs);
 					}
