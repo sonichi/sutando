@@ -4,7 +4,8 @@
  */
 
 import { execSync, execFileSync } from 'node:child_process';
-import { writeFileSync, unlinkSync, readFileSync, existsSync } from 'node:fs';
+import { writeFileSync, unlinkSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { demoStateRef } from './recording-state.js';
@@ -396,6 +397,110 @@ export const clickTool: ToolDefinition = {
 			return { error: 'Provide either x,y coordinates or a shortcut' };
 		} catch (err) {
 			return { error: `click failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
+// --- Point at (Pointer Teacher) ---
+
+// gemini-3-flash-preview with Gemini's NATIVE point format and thinking
+// disabled was proven by the Pointer Teacher grill POCs to land 1–3 px on real
+// UI targets in VSCode. On the same screenshot, gemini-3.1-flash-lite was
+// 108 px off and Clicky's raw-pixel `[POINT:x,y]` prompt was 23–69 px off.
+// See docs/adr/0001-pointer-teacher-brain.md. Do NOT swap the model or the
+// prompt format without re-running that POC — both choices are load-bearing.
+const POINTER_MODEL = process.env.POINTER_MODEL || 'gemini-3-flash-preview';
+// IPC: Sutando.app watches <workspace>/state via DispatchSource and flies the
+// bezier pointer to whatever lands here. process.cwd() is the repo root for
+// core (same convention as VOICE_SESSION_CONTEXT_PATH / tasks/ / results/),
+// which is also what the Swift app resolves as `workspace`.
+const POINTER_CMD_PATH = join(process.cwd(), 'state', 'pointer-cmd.json');
+
+export const pointAtTool: ToolDefinition = {
+	name: 'point_at',
+	description:
+		'Physically point at something on the user\'s screen — flies an on-screen marker to it and gives you what to say. This is the embodied "show me where" / teaching gesture: use it whenever the user asks where something is or how to do something in the app in front of them ("where do I commit?", "show me the search", "point at the deploy button", "teach me — where do I start?"). Captures the main display, locates the target, and animates a pointer there. After it returns you MUST speak the returned `say` sentence aloud.',
+	parameters: z.object({
+		query: z.string().describe('What to point at, in plain words — a control, icon, menu, or region. E.g. "the commit button", "the Source Control icon", "where do I run the app".'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { query } = args as { query: string };
+		// Free-tier eligible voice key preferred (the POC proved gemini-3-flash-preview
+		// works on it); falls back to the paid key. Same precedence as describe_screen.
+		const apiKey = process.env.GEMINI_VOICE_API_KEY || process.env.GEMINI_API_KEY;
+		if (!apiKey) return { error: 'point_at unavailable (no GEMINI_VOICE_API_KEY or GEMINI_API_KEY)' };
+		if (!query?.trim()) return { error: 'point_at needs a query (what to point at)' };
+		try {
+			// 1. capture the main display (single-display scope guard) via :7845
+			const capRes = await fetch('http://localhost:7845/capture?display=1');
+			const cap = await capRes.json() as { status: string; path?: string; error?: string };
+			if (cap.status !== 'ok' || !cap.path) return { error: `point_at capture failed: ${cap.error || 'unknown'}` };
+			// Downscale; sips -Z preserves aspect, so 0–1 normalized coords map
+			// straight onto the display with no extra transform (open item #2).
+			const small = '/tmp/pointer-shot.jpg';
+			try {
+				execFileSync('sips', ['-s', 'format', 'jpeg', '-Z', '1568', cap.path, '--out', small], { timeout: 4_000, stdio: 'ignore' });
+			} catch { /* fall back to the full-size capture below */ }
+			const imgPath = existsSync(small) ? small : cap.path;
+			const imageData = readFileSync(imgPath).toString('base64');
+
+			// 2. resolve the Target via Gemini's native point format (thinking off)
+			const prompt =
+				`Point to ${query}. Return ONLY minified JSON, no prose, no code fence: ` +
+				`{"point":[y,x],"label":"<3 words>","say":"<one friendly spoken sentence ` +
+				`(max 20 words) telling me where it is and what to do>"}. ` +
+				`point is [y, x] normalized to 0-1000 over the whole image.`;
+			const res = await fetch(
+				`https://generativelanguage.googleapis.com/v1beta/models/${POINTER_MODEL}:generateContent?key=${apiKey}`,
+				{
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({
+						contents: [{ parts: [{ text: prompt }, { inlineData: { mimeType: 'image/jpeg', data: imageData } }] }],
+						// thinkingBudget:0 is required — gemini-3-flash-preview is a
+						// thinking model and burns the token budget reasoning instead
+						// of answering, truncating the point. Proven in the POC.
+						generationConfig: { temperature: 0, maxOutputTokens: 1200, thinkingConfig: { thinkingBudget: 0 } },
+					}),
+				},
+			);
+			const data = await res.json() as any;
+			if (!data?.candidates?.[0]) {
+				const reason = data?.promptFeedback?.blockReason || data?.error?.message || JSON.stringify(data).slice(0, 160);
+				return { error: `point_at model error: ${reason}` };
+			}
+			const txt = (data.candidates[0].content?.parts?.[0]?.text ?? '').trim();
+			const cleaned = txt.replace(/^```(?:json)?|```$/gm, '').trim();
+			let y: number, x: number, label = query, say = '';
+			try {
+				const obj = JSON.parse(cleaned);
+				y = Number(obj.point[0]); x = Number(obj.point[1]);
+				label = obj.label || query; say = obj.say || '';
+			} catch {
+				// Fallback: pull the first [y, x] pair out of a noisier reply.
+				const m = cleaned.match(/\[\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*\]/);
+				if (!m) return { error: `point_at unparseable reply: ${txt.slice(0, 160)}` };
+				y = Number(m[1]); x = Number(m[2]);
+			}
+
+			// 3. hand the Target to the Swift overlay (runs in the real GUI session)
+			mkdirSync(join(process.cwd(), 'state'), { recursive: true });
+			const cmd = {
+				nx: Math.round((x / 1000) * 1e5) / 1e5,
+				ny: Math.round((y / 1000) * 1e5) / 1e5,
+				label, say, ts: Date.now() / 1000,
+			};
+			writeFileSync(POINTER_CMD_PATH, JSON.stringify(cmd));
+			console.log(`${ts()} [PointAt] "${query}" -> nx=${cmd.nx} ny=${cmd.ny} label="${label}"`);
+			return {
+				status: 'pointing',
+				label,
+				say,
+				instruction: 'A pointer is now flying to the target on the user\'s screen. Speak the `say` sentence aloud to the user NOW, then keep teaching.',
+			};
+		} catch (err) {
+			return { error: `point_at failed: ${err instanceof Error ? err.message : err}` };
 		}
 	},
 };
