@@ -704,14 +704,25 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 		.filter(Boolean).map(n => n.toLowerCase());
 	const otherVariantsLc = [...OTHER_INSTANCES, ...OTHER_INSTANCE_ALIASES]
 		.map(n => n.toLowerCase());
-	const transcriptContainsName = (text: string): boolean => {
+	// Strict address detection — substring match alone caused 替别人回答 bugs:
+	// "thank you, Maddie" and "Maddie's answer" both matched as if Maddie was
+	// being addressed. Require one of: greet+name ("hi Maddie"), comma-tag
+	// ("Maddie,"), or sentence-start imperative ("Maddie can ...").
+	const _GATE_VERBS = '(can|could|will|would|please|tell|answer|design|write|read|check|look|help|stop|start|leave|join|log|hang|end)';
+	const _addressed = (text: string, names: string[]): boolean => {
+		if (!text || names.length === 0) return false;
 		const lc = text.toLowerCase();
-		return nameVariants.some(v => lc.includes(v));
+		for (const n of names) {
+			if (!n) continue;
+			const greet = new RegExp(`\\b(hi|hey|hello|yo|okay|ok)[,!:]?\\s+${n}\\b`, 'i');
+			const commaTag = new RegExp(`\\b${n}\\s*[,?]`, 'i');
+			const verbed = new RegExp(`(^|[.!?]\\s*)${n}\\s+${_GATE_VERBS}\\b`, 'i');
+			if (greet.test(lc) || commaTag.test(lc) || verbed.test(lc)) return true;
+		}
+		return false;
 	};
-	const transcriptContainsOther = (text: string): boolean => {
-		const lc = text.toLowerCase();
-		return otherVariantsLc.some(v => lc.includes(v));
-	};
+	const transcriptContainsName = (text: string): boolean => _addressed(text, nameVariants);
+	const transcriptContainsOther = (text: string): boolean => _addressed(text, otherVariantsLc);
 	// Sticky "last-addressed-was-me" so the owner doesn't have to re-name on
 	// every follow-up turn. Starts false (requires explicit address first turn);
 	// flips true on my-name, false on other-name, unchanged on no-name.
