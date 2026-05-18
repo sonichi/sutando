@@ -721,9 +721,16 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 		// Apply the name-gate decision now that the user turn transcript is in.
 		// Defer one tick — turn.end can fire fractionally before conversationContext
 		// is populated with the user item, leaving latestUserText='' (false-drop bug).
-		if (nameGateActive && turnDecision === 'pending') {
+		// IMPORTANT: bodhi doesn't publish 'turn.start', so we re-arm at the end of
+		// each decision (any subsequent audio is assumed to belong to the next turn).
+		if (nameGateActive) {
 			setTimeout(() => {
-				if (turnDecision !== 'pending') return; // turn.start may have re-reset
+				if (turnDecision !== 'pending') {
+					// Previous turn's decision still in effect — re-arm for next turn.
+					turnDecision = 'pending';
+					pendingAudio = [];
+					return;
+				}
 				// Re-scan the latest user item now that items list is populated.
 				const allItems = session.conversationContext.items;
 				let userText = latestUserText;
@@ -746,10 +753,14 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 					turnDecision = 'drop';
 					const dropped = pendingAudio.length;
 					pendingAudio = [];
-					if (dropped > 0) {
-						console.log(`${ts()} [NameGate] drop — suppressed ${dropped} chunks (user: "${userText.slice(0,60)}")`);
-					}
+					console.log(`${ts()} [NameGate] drop — suppressed ${dropped} chunks (user: "${userText.slice(0,60)}")`);
 				}
+				// Re-arm after a grace window so the next turn's chunks start as pending.
+				// Grace covers any late-arriving chunks of THIS turn; tuned to ~1.5s.
+				setTimeout(() => {
+					turnDecision = 'pending';
+					pendingAudio = [];
+				}, 1500);
 			}, 50);
 		}
 
