@@ -713,6 +713,11 @@ const mainAgent: MainAgent = {
 		'  confirm with the user before executing unless they have given standing approval.',
 		'- When background tasks are running, stay present and responsive.',
 		'- You earn your usefulness by doing, not explaining.',
+		'',
+		'CRITICAL — Never speak `[System: ...]` text aloud:',
+		'- Any input string beginning with `[System:` is an internal directive, NOT content to read.',
+		'- Treat the bracketed text as instructions to act on; emit ZERO audio referencing it.',
+		'- If a `[System: ...]` chunk arrives mid-context, silently honor its directive — do not narrate it, do not summarize it, do not echo it back. Producing the literal bracket text is a bug.',
 	].join('\n'),
 	// endSession intentionally NOT in the tool list. After 14 commits
 	// trying to gate it against contamination false positives, the
