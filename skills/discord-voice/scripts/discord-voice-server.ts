@@ -656,11 +656,35 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 	// [Outbound] Gemini PCM 24k mono → upsample to 48k stereo → pipe to AudioPlayer.
 	const sessionAny = session as any;
 	let outChunks = 0;
+
+	// Name-gated audio output (when OTHER_INSTANCES is set).
+	// Buffers audio until end-of-turn transcript can be inspected; if the user's
+	// turn didn't mention INSTANCE_NAME, the entire buffered response is dropped
+	// (Gemini's prompt-only silence rule is unreliable; code-level gate is the
+	// real enforcement). When OTHER_INSTANCES is empty, gate is fully disabled.
+	const nameGateActive = OTHER_INSTANCES.length > 0 && !!INSTANCE_NAME;
+	const instanceNameLc = INSTANCE_NAME.toLowerCase();
+	let turnDecision: 'pending' | 'allow' | 'drop' = 'pending';
+	let pendingAudio: Buffer[] = [];
+	const resetTurnGate = () => {
+		turnDecision = 'pending';
+		pendingAudio = [];
+	};
+	session.eventBus.subscribe('turn.start', resetTurnGate);
+	session.eventBus.subscribe('turn.interrupted', resetTurnGate);
+
 	sessionAny.handleAudioOutput = (data: string) => {
 		sessionAny.notificationQueue?.markAudioReceived?.();
 		try {
 			const pcm24Mono = Buffer.from(data, 'base64');
 			const pcm48Stereo = upsample24MonoTo48Stereo(pcm24Mono);
+			if (nameGateActive) {
+				if (turnDecision === 'drop') return;
+				if (turnDecision === 'pending') {
+					pendingAudio.push(pcm48Stereo);
+					return;
+				}
+			}
 			pushAudio(pcm48Stereo);
 			outChunks++;
 			if (outChunks === 1 || outChunks % 50 === 0) {
@@ -677,9 +701,12 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 		const items = session.conversationContext.items;
 		if (items.length < lastProcessedIdx) lastProcessedIdx = 0;
 		const lastText = s.transcript.length > 0 ? s.transcript[s.transcript.length - 1].text : null;
+		// Find the most-recent user item in this turn (for the name-gate decision).
+		let latestUserText = '';
 		for (const item of items.slice(lastProcessedIdx)) {
 			if (item.content === lastText) continue;
 			if (item.role === 'user') {
+				latestUserText = item.content;
 				s.transcript.push({ role: 'user', text: item.content });
 				s.events.push({ event: `user:${item.content}`, timestamp: new Date().toISOString() });
 				logLine('user', item.content);
@@ -690,6 +717,27 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 			}
 		}
 		lastProcessedIdx = items.length;
+
+		// Apply the name-gate decision now that the user turn transcript is in.
+		if (nameGateActive && turnDecision === 'pending') {
+			const named = latestUserText.toLowerCase().includes(instanceNameLc);
+			if (named) {
+				turnDecision = 'allow';
+				for (const buf of pendingAudio) {
+					pushAudio(buf);
+					outChunks++;
+				}
+				console.log(`${ts()} [NameGate] allow — flushed ${pendingAudio.length} chunks (user said "${INSTANCE_NAME}")`);
+				pendingAudio = [];
+			} else {
+				turnDecision = 'drop';
+				const dropped = pendingAudio.length;
+				pendingAudio = [];
+				if (dropped > 0) {
+					console.log(`${ts()} [NameGate] drop — suppressed ${dropped} chunks (user did not say "${INSTANCE_NAME}")`);
+				}
+			}
+		}
 
 		if (s.resultQueue.length > 0) {
 			const queued = s.resultQueue.splice(0);
