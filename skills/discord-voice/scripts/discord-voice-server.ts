@@ -369,6 +369,27 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 			parameters: z.object({}),
 			execution: 'inline',
 			async execute() {
+				// Multi-instance safety: if peer instances share this channel,
+				// require the most-recent user transcript to address THIS instance
+				// by name. Otherwise "Lucy logoff" would dismiss Maddy too.
+				if (OTHER_INSTANCES.length > 0 && INSTANCE_NAME) {
+					const items = (s.voiceSession as any).conversationContext?.items ?? [];
+					let lastUserText = '';
+					for (let i = items.length - 1; i >= 0; i--) {
+						if (items[i].role === 'user') {
+							lastUserText = items[i].content || '';
+							break;
+						}
+					}
+					const lc = lastUserText.toLowerCase();
+					const variants = [INSTANCE_NAME, ...INSTANCE_NAME_ALIASES]
+						.filter(Boolean).map(n => n.toLowerCase());
+					const namedMe = variants.some(v => lc.includes(v));
+					if (!namedMe) {
+						console.log(`${ts()} [Dismiss] suppressed — user did not address "${INSTANCE_NAME}" (last: "${lastUserText.slice(0,60)}")`);
+						return { status: 'suppressed_not_addressed_by_name' };
+					}
+				}
 				console.log(`${ts()} [Dismiss] Discord voice context — SIGTERM`);
 				setTimeout(() => { try { process.kill(process.pid, 'SIGTERM'); } catch {} }, 400);
 				return { status: 'left_discord_voice' };
