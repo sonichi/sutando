@@ -13,19 +13,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var hotKeyRefs: [EventHotKeyRef?] = []  // one entry per registered hotkey
     var hotKeyActions: [UInt32: String] = [:]  // hotkey id → action name
     var lastDropTime: Date = .distantPast
+    // Runtime state lives under the per-user workspace dir, not the repo
+    // checkout. Mirrors src/workspace_default.py + src/workspace_default.ts
+    // (PR #762 / #821). Resolution:
+    //   1. $SUTANDO_WORKSPACE (override; ~ expansion supported)
+    //   2. ~/.sutando/workspace/ (canonical default)
+    //
+    // Pre-#762 main.swift wrote tasks/logs/state under the repo checkout via
+    // CLAUDE.md walk-up. Post-#762 that dir no longer exists, so writeTask
+    // silently failed (try? write returns nil if parent dir missing) — the
+    // bug Chi hit 2026-05-18 where context-drop notified + logged but the
+    // bridge never saw the task.
     let workspace: String = {
-        // Derive from binary location → repo root
-        // Raw binary: src/Sutando/Sutando (3 levels up)
-        // .app bundle: src/Sutando/Sutando.app/Contents/MacOS/Sutando (5 levels up)
+        let env = ProcessInfo.processInfo.environment["SUTANDO_WORKSPACE"]?.trimmingCharacters(in: .whitespaces)
+        if let env = env, !env.isEmpty {
+            return (env as NSString).expandingTildeInPath
+        }
+        return NSHomeDirectory() + "/.sutando/workspace"
+    }()
+
+    // Repo checkout for skills-adjacent paths (assets, src/*.py, scripts/*.sh)
+    // that ship alongside the code. Same CLAUDE.md walk-up used before #762.
+    let repoRoot: String = {
         var url = URL(fileURLWithPath: ProcessInfo.processInfo.arguments[0]).resolvingSymlinksInPath()
-        // Walk up until we find CLAUDE.md (repo root marker)
         for _ in 0..<8 {
             url = url.deletingLastPathComponent()
             if FileManager.default.fileExists(atPath: url.appendingPathComponent("CLAUDE.md").path) {
                 return url.path
             }
         }
-        // Fallback: 3 levels up from binary
         let fallback = URL(fileURLWithPath: ProcessInfo.processInfo.arguments[0]).resolvingSymlinksInPath()
         return fallback.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().path
     }()
@@ -96,6 +112,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             registerHotKey()
             watchResults()
             logToFile("App started, workspace=\(workspace)")
+            // Startup smoke: ensure the runtime dirs exist so the silent-
+            // write class can't recur (Mini nit #3). mkdir is idempotent;
+            // missing-dir is logged so an unexpected absence is visible.
+            for sub in ["tasks", "logs", "state", "results"] {
+                let dir = workspace + "/" + sub
+                if !FileManager.default.fileExists(atPath: dir) {
+                    logToFile("startup-smoke: \(sub)/ missing under \(workspace) — creating")
+                }
+                try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            }
         }
     }
 
@@ -154,7 +180,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem.button {
-            let avatarPath = workspace + "/assets/stand-avatar.png"
+            let avatarPath = repoRoot + "/assets/stand-avatar.png"
             if let image = NSImage(contentsOfFile: avatarPath) {
                 image.size = NSSize(width: 18, height: 18)
                 image.isTemplate = false
@@ -793,7 +819,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Composited onto the top-right corner of the 18×18 avatar so the
     /// menu bar continuously signals mode without taking an extra slot.
     func avatarImage(presenterActive: Bool, meetingActive: Bool = false) -> NSImage? {
-        let avatarPath = workspace + "/assets/stand-avatar.png"
+        let avatarPath = repoRoot + "/assets/stand-avatar.png"
         guard let base = NSImage(contentsOfFile: avatarPath) else { return nil }
         base.size = NSSize(width: 18, height: 18)
         base.isTemplate = false
@@ -1523,12 +1549,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func appendLog(_ path: String, _ line: String) {
+        // mkdir -p parent so the write doesn't silently drop when the log
+        // dir is missing — same defensive pattern as writeTask (Mini nit #2).
+        let parent = (path as NSString).deletingLastPathComponent
+        try? FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
         if let handle = FileHandle(forWritingAtPath: path) {
             handle.seekToEndOfFile()
             handle.write((line + "\n").data(using: .utf8)!)
             handle.closeFile()
         } else {
-            try? (line + "\n").write(toFile: path, atomically: true, encoding: .utf8)
+            do {
+                try (line + "\n").write(toFile: path, atomically: true, encoding: .utf8)
+            } catch {
+                // Last-resort log so disk-full / permission failures aren't
+                // silent (Mini nit #1). logToFile writes to a different dir
+                // so a single-dir failure doesn't cascade.
+                logToFile("appendLog: write failed for \(path) — \(error.localizedDescription)")
+            }
         }
     }
 
@@ -1541,7 +1578,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         \(content)
         """
         let taskPath = tasksDir + "/task-\(ts).txt"
-        try? taskContent.write(toFile: taskPath, atomically: true, encoding: .utf8)
+        // mkdir -p the parent dir to prevent the silent-failure class where
+        // try?-write returns nil and the dropped context vanishes. This was
+        // the bug Chi hit 2026-05-18: workspace var pointed at repo, but
+        // tasks/ had been moved to the workspace dir by PR #762, so
+        // try? write to <repo>/tasks/task-X.txt silently dropped the data.
+        try? FileManager.default.createDirectory(atPath: tasksDir, withIntermediateDirectories: true)
+        do {
+            try taskContent.write(toFile: taskPath, atomically: true, encoding: .utf8)
+        } catch {
+            // disk-full / permission fail (Mini nit #1) — don't lose the
+            // signal silently. Surface to debug log.
+            logToFile("writeTask: write failed for \(taskPath) — \(error.localizedDescription)")
+        }
     }
 
     var lastHealthCheckStart: Date = .distantPast
@@ -1557,7 +1606,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         lastHealthCheckStart = now
 
         let logPath = workspace + "/logs/health-check.log"
-        let scriptPath = workspace + "/src/health-check.py"
+        let scriptPath = repoRoot + "/src/health-check.py"
         // Match the (retired) launchd plist's interpreter so behavior is
         // identical. Falls back to /usr/bin/env python3 if homebrew python
         // is missing on this host.
@@ -1692,7 +1741,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         notify("Sutando", "Restarting all services...")
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-        proc.arguments = [workspace + "/src/restart.sh"]
+        proc.arguments = [repoRoot + "/src/restart.sh"]
         proc.standardOutput = FileHandle.nullDevice
         proc.standardError = FileHandle.nullDevice
         DispatchQueue.global(qos: .utility).async {
@@ -1705,7 +1754,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         notify("Sutando", "Stopping all services...")
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-        proc.arguments = [workspace + "/src/stop.sh"]
+        proc.arguments = [repoRoot + "/src/stop.sh"]
         proc.standardOutput = FileHandle.nullDevice
         proc.standardError = FileHandle.nullDevice
         DispatchQueue.global(qos: .utility).async {
@@ -1807,7 +1856,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// this only restarts the Claude Code CLI session.
     @objc func restartCore() {
         notify("Sutando", "Restarting Core CLI…")
-        let script = workspace + "/scripts/start-cli.sh"
+        let script = repoRoot + "/scripts/start-cli.sh"
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
         proc.arguments = [script, "--restart"]
