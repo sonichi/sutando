@@ -65,6 +65,38 @@ Optional env:
 
 `DISCORD_VOICE_SERVER=1` flips the polymorphic `dismiss` tool (`src/meeting-tools.ts`) into "SIGTERM self" mode instead of its default Zoom AppleScript path. Without it, asking Sutando to "leave"/"dismiss" in the channel would try to leave a (non-existent) Zoom meeting.
 
+## Multi-instance mode (run two+ bots in the same voice channel)
+
+For operators running multiple Sutando instances (e.g. Lucy on Mac Studio + Maddy on MacBook) that share one Discord guild — and especially when both bots land in the same voice channel — set the per-instance env vars below. All are no-ops when unset; single-instance operators ignore this section.
+
+| Env | Effect |
+|---|---|
+| `SUTANDO_INSTANCE_NAME` | Stand name (e.g. `Lucy`, `Maddy`, `Mini`). Injected into the system prompt + appended to the bot's guild nickname as `Sutando (Lucy)` on voice-channel join. |
+| `SUTANDO_INSTANCE_NAME_ALIASES` | Comma-separated ASR-mishearing aliases that should still match "this is me" (e.g. `Lucie,Lou,Luci,süssi,Susie`). Gemini's ASR often mis-transcribes short names; without aliases, "Hi Lucie" silently drops. |
+| `SUTANDO_VOICE_NAME` | Gemini Live voice color so concurrent bots are audio-distinguishable. Suggested split: Lucy=`Aoede`, Maddy=`Puck`, Mini=`Charon`. |
+| `SUTANDO_OTHER_INSTANCES` | Comma-separated names of the OTHER bots in the channel. Used for **open-world drop**: any address pattern naming a non-me bot flips this turn's gate to "not for me", even if no me-name appears. |
+| `SUTANDO_OTHER_ALIASES` | Aliases for the OTHER bots (analogous to NAME_ALIASES, per peer). |
+| `SUTANDO_IGNORE_USER_IDS` | Comma-separated Discord user_ids whose audio is dropped at the ffmpeg layer — typically the peer bots. **Required when two bots share a channel**, otherwise Gemini's turn detection runs on continuous (always-talking) audio and never fires `turn.end`. |
+| `SUTANDO_PEER_USER_IDS` | Tagging-only: user_ids that, when speaking within 3s of an assistant turn, get the role `discord-peer` in the sqlite mirror (instead of `discord-user`). Lets the log distinguish sibling-bot speech from owner speech. |
+
+**Per-turn gate semantics.** Each user transcript is evaluated independently — no sticky carry-over from prior turns:
+
+1. **Audio buffering + lazy allow.** Voice chunks buffer until `turn.end`. If the transcript names this instance (greet+name / name+`,?` at clause-start / name+verb at clause-start), the buffer flushes to Gemini and the response is allowed. Otherwise the buffer is dropped — Gemini never sees the audio.
+2. **Open-world drop.** Any address pattern naming a non-me bot flips the gate to drop, even if no me-name appears. Stops `"Hi Maddy, ..."` from getting answered by Lucy.
+3. **Mention ≠ address.** `"Thank you Lucy"` (after Lucy's turn) does NOT count as addressing Lucy — the prompt is tuned to keep both bots silent in that case.
+4. **Dismiss tool gating.** `dismiss` is suppressed unless EITHER (a) the prior turn was addressed-to-me, OR (b) the latest user transcript names this instance. Prevents one bot dismissing on another bot's "leave" command.
+5. **Late-assistant attribution.** Assistant responses arriving after the gate decision are attributed by `lastUserGateDecision`, so they still land in sqlite even when the audio→text→tool pipeline overlaps a turn boundary.
+
+## sqlite mirror
+
+Every user/agent turn is written to `data/conversation.sqlite` — the same DB used by phone (`skills/phone-conversation`) and single-bot voice (`src/voice-agent.ts`), so all three modes diagnose with the same tooling (`call-diagnostics/scripts/diagnose.py`, etc.).
+
+- `role`: `discord-user` (human owner), `discord-agent` (this bot's spoken response), `discord-peer` (sibling-bot speech that this bot transcribed)
+- Agent rows are stamped with audio-out-time + 10s heard-offset — matches when the owner actually heard the response, not when Gemini emitted the first chunk.
+- `sessions` table additionally records `tool_calls` JSON (with timestamps) + `events` JSON (full turn-by-turn timeline) at session-end.
+
+When debugging a multi-bot session, merge both bots' `conversation.sqlite` rows by audio-out-time into one chronological stream — that's the canonical view (no per-bot two-section dumps).
+
 ## Trust boundary — read this before inviting the bot anywhere shared
 
 `DISCORD_VOICE_OWNER=true` is the deliberate default for a personal-use bot and it has a sharp edge: **anyone who can speak in the same voice channel inherits owner-tier `work` privileges** — full task delegation, file edits, message sends, anything the proactive loop can do.
