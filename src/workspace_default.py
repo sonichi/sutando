@@ -200,6 +200,64 @@ def _migrate_inrepo_notes(workspace: Path) -> bool:
     return bool(moved)
 
 
+def _migrate_inrepo_build_log(workspace: Path) -> bool:
+    """One-time migration of `<repo>/build_log.md` -> `<workspace>/build_log.md`.
+
+    Parallel to `_migrate_inrepo_notes`: fires regardless of env state when the
+    in-repo `build_log.md` exists and workspace != repo root. Build_log is a
+    single file (unlike notes which is a dir), so the logic is simpler.
+
+    Per workspace contract (CLAUDE.md): build_log.md is a per-user mutable
+    runtime artifact and belongs in the workspace, not the repo. Historic
+    placement at the repo root polluted `git status` and split-brained
+    dashboard.py / health-check.py (which already read from workspace) vs
+    voice-context.ts / sync-memory.sh (which still wrote to repo). This
+    migration fixes the split.
+
+    Non-destructive on collision (skip if workspace already has build_log.md),
+    sentinel-gated for O(1) re-entry (`<workspace>/.build_log-migrated`).
+    """
+    sentinel = workspace / ".build_log-migrated"
+    if sentinel.exists():
+        return False
+    repo_root = _legacy_repo_root()
+    try:
+        if repo_root.resolve() == workspace.resolve():
+            return False
+    except OSError:
+        return False
+    inrepo_build_log = repo_root / "build_log.md"
+    if not inrepo_build_log.is_file():
+        try:
+            workspace.mkdir(parents=True, exist_ok=True)
+            sentinel.touch()
+        except Exception:
+            pass
+        return False
+    target = workspace / "build_log.md"
+    if target.exists():
+        try:
+            sentinel.touch()
+        except Exception:
+            pass
+        return False
+    workspace.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.move(str(inrepo_build_log), str(target))
+        print(
+            f"build_log migration: moved {inrepo_build_log} -> {target} (one-time)",
+            file=sys.stderr,
+        )
+    except Exception as e:  # pragma: no cover — best-effort
+        print(f"build_log migration: failed: {e}", file=sys.stderr)
+        return False
+    try:
+        sentinel.touch()
+    except Exception:
+        pass
+    return True
+
+
 def resolve_workspace(migrate: bool = True) -> Path:
     """Resolve the workspace directory per the canonical contract.
 
@@ -207,15 +265,16 @@ def resolve_workspace(migrate: bool = True) -> Path:
       1. `$SUTANDO_WORKSPACE` env var, expanded (`~` honored).
       2. `~/.sutando/workspace/`.
 
-    When `migrate=True` (default) the function ALSO runs two one-time
+    When `migrate=True` (default) the function ALSO runs one-time
     auto-migrations:
       • `_migrate_from_legacy` — fires when env is unset and the new default
         doesn't yet exist; pulls tasks/results/state/notes from the legacy
         repo-root fallback.
-      • `_migrate_inrepo_notes` — fires when env IS set and workspace != repo
-        root; pulls top-level notes/*.md|*.txt from the in-repo `notes/` dir
-        into `<workspace>/notes/`. Covers users who set $SUTANDO_WORKSPACE
-        mid-stream while code was still writing to in-repo `notes/`.
+      • `_migrate_inrepo_notes` — fires when workspace != repo root; pulls
+        top-level notes/*.md|*.txt from the in-repo `notes/` dir into
+        `<workspace>/notes/`.
+      • `_migrate_inrepo_build_log` — fires when workspace != repo root; moves
+        in-repo `build_log.md` to `<workspace>/build_log.md`.
 
     Returns a `Path` — does NOT create the directory; the caller decides.
     Pass `migrate=False` from tests that want pure resolution semantics.
@@ -228,6 +287,10 @@ def resolve_workspace(migrate: bool = True) -> Path:
                 _migrate_inrepo_notes(target)
             except Exception as e:  # pragma: no cover — must never break resolution
                 print(f"notes migration: skipped due to error: {e}", file=sys.stderr)
+            try:
+                _migrate_inrepo_build_log(target)
+            except Exception as e:  # pragma: no cover — must never break resolution
+                print(f"build_log migration: skipped due to error: {e}", file=sys.stderr)
         return target
     target = default_workspace_dir()
     if migrate:
@@ -235,4 +298,8 @@ def resolve_workspace(migrate: bool = True) -> Path:
             _migrate_from_legacy(target)
         except Exception as e:  # pragma: no cover — must never break resolution
             print(f"workspace migration: skipped due to error: {e}", file=sys.stderr)
+        try:
+            _migrate_inrepo_build_log(target)
+        except Exception as e:  # pragma: no cover — must never break resolution
+            print(f"build_log migration: skipped due to error: {e}", file=sys.stderr)
     return target

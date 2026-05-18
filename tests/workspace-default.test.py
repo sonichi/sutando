@@ -280,5 +280,79 @@ class TestInRepoNotesMigration(unittest.TestCase):
         self.assertFalse((self.repo_root / "notes" / "e2e.md").exists())
 
 
+class TestInRepoBuildLogMigration(unittest.TestCase):
+    """Tests for `_migrate_inrepo_build_log` — moves build_log.md from repo
+    root to workspace (parallel to _migrate_inrepo_notes but single-file)."""
+
+    def setUp(self):
+        self._saved_env = os.environ.get("SUTANDO_WORKSPACE")
+        self.repo_root = Path(tempfile.mkdtemp(prefix="ws-repo-"))
+        self.workspace = Path(tempfile.mkdtemp(prefix="ws-target-"))
+        os.environ["SUTANDO_WORKSPACE"] = str(self.workspace)
+
+    def tearDown(self):
+        if self._saved_env is not None:
+            os.environ["SUTANDO_WORKSPACE"] = self._saved_env
+        elif "SUTANDO_WORKSPACE" in os.environ:
+            del os.environ["SUTANDO_WORKSPACE"]
+        shutil.rmtree(self.repo_root, ignore_errors=True)
+        shutil.rmtree(self.workspace, ignore_errors=True)
+
+    def test_migrate_when_inrepo_exists_and_workspace_differs(self):
+        (self.repo_root / "build_log.md").write_text("# Old log\n\nLog content.\n")
+        with patch.object(workspace_default, "_legacy_repo_root", return_value=self.repo_root):
+            moved = workspace_default._migrate_inrepo_build_log(self.workspace)
+        self.assertTrue(moved)
+        self.assertTrue((self.workspace / "build_log.md").is_file())
+        self.assertEqual(
+            (self.workspace / "build_log.md").read_text(),
+            "# Old log\n\nLog content.\n",
+        )
+        self.assertFalse((self.repo_root / "build_log.md").exists())
+
+    def test_skip_when_workspace_equals_repo(self):
+        (self.repo_root / "build_log.md").write_text("dont touch")
+        with patch.object(workspace_default, "_legacy_repo_root", return_value=self.repo_root):
+            moved = workspace_default._migrate_inrepo_build_log(self.repo_root)
+        self.assertFalse(moved)
+        self.assertTrue((self.repo_root / "build_log.md").exists())
+
+    def test_skip_when_inrepo_missing(self):
+        with patch.object(workspace_default, "_legacy_repo_root", return_value=self.repo_root):
+            moved = workspace_default._migrate_inrepo_build_log(self.workspace)
+        self.assertFalse(moved)
+
+    def test_no_clobber_on_collision(self):
+        (self.repo_root / "build_log.md").write_text("REPO version")
+        (self.workspace).mkdir(parents=True, exist_ok=True)
+        (self.workspace / "build_log.md").write_text("WORKSPACE wins")
+        with patch.object(workspace_default, "_legacy_repo_root", return_value=self.repo_root):
+            workspace_default._migrate_inrepo_build_log(self.workspace)
+        # Workspace untouched, in-repo file still present (skipped, not moved).
+        self.assertEqual((self.workspace / "build_log.md").read_text(), "WORKSPACE wins")
+        self.assertTrue((self.repo_root / "build_log.md").exists())
+
+    def test_idempotent_via_sentinel(self):
+        (self.repo_root / "build_log.md").write_text("once")
+        with patch.object(workspace_default, "_legacy_repo_root", return_value=self.repo_root):
+            moved_1 = workspace_default._migrate_inrepo_build_log(self.workspace)
+            # Re-seed the in-repo file so we can verify the sentinel (not the
+            # missing-file early-return) is what prevents re-migration.
+            (self.repo_root / "build_log.md").write_text("twice")
+            moved_2 = workspace_default._migrate_inrepo_build_log(self.workspace)
+        self.assertTrue(moved_1)
+        self.assertFalse(moved_2)
+        # Workspace still has the FIRST content (second run skipped via sentinel).
+        self.assertEqual((self.workspace / "build_log.md").read_text(), "once")
+
+    def test_resolve_workspace_runs_build_log_migration_when_env_set(self):
+        (self.repo_root / "build_log.md").write_text("e2e content")
+        with patch.object(workspace_default, "_legacy_repo_root", return_value=self.repo_root):
+            ws = resolve_workspace(migrate=True)
+        self.assertEqual(ws, self.workspace)
+        self.assertTrue((self.workspace / "build_log.md").exists())
+        self.assertFalse((self.repo_root / "build_log.md").exists())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

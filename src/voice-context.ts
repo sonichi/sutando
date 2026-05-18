@@ -6,6 +6,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { resolveWorkspace } from './workspace_default.js';
 
 function defaultMemoryDir(): string {
     const repo = resolve(join(import.meta.dirname, '..'));
@@ -15,6 +16,7 @@ function defaultMemoryDir(): string {
 
 const MEMORY_DIR = process.env.SUTANDO_MEMORY_DIR || defaultMemoryDir();
 const REPO_DIR = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
+const WORKSPACE_DIR = resolveWorkspace();
 
 function readMemory(filename: string): string | null {
 	const path = join(MEMORY_DIR, filename);
@@ -40,7 +42,7 @@ export function buildVoiceAgentContext(): string {
 	}
 
 	// Read build log summary
-	const buildLog = join(REPO_DIR, 'build_log.md');
+	const buildLog = join(WORKSPACE_DIR, 'build_log.md');
 	if (existsSync(buildLog)) {
 		try {
 			const content = readFileSync(buildLog, 'utf-8');
