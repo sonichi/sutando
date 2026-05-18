@@ -61,10 +61,42 @@ fi
 # to mv manually.
 __OLD_DEFAULT="$HOME/.sutando-memory-sync"
 __NEW_DEFAULT="$HOME/.sutando/memory-sync"
+__MIGRATED=0
 if [ -z "${SUTANDO_MEMORY_SYNC_DIR:-}" ] && [ -d "$__OLD_DEFAULT" ] && [ ! -e "$__NEW_DEFAULT" ]; then
     mkdir -p "$(dirname "$__NEW_DEFAULT")"
     if mv "$__OLD_DEFAULT" "$__NEW_DEFAULT" 2>/dev/null; then
         echo "sync-memory: migrated $__OLD_DEFAULT -> $__NEW_DEFAULT (one-time)" >&2
+        __MIGRATED=1
+    fi
+fi
+
+# --- Orphan symlink scan (post-migration) ---
+# After moving __OLD_DEFAULT, any pre-existing symlinks pointing at the legacy
+# path are now broken (target moved out from under them). Common cases:
+#   - ~/.sutando/workspace/notes  → ~/.sutando-memory-sync/notes  (PR #831 rollout)
+#   - ~/.claude/skills/personal-* → ~/.sutando-memory-sync/skills/personal-*
+#   - any user-created convenience symlinks under ~/
+# The migration can't enumerate external symlinks, so this scan WARNs the user
+# post-fact with a one-line re-point recipe. Scoped to common dirs to keep cost
+# bounded — full ~/ scan is too slow on large homes.
+if [ "$__MIGRATED" = "1" ]; then
+    __SCAN_DIRS=("$HOME/.sutando" "$HOME/.claude/skills" "$HOME/.config")
+    __ORPHAN_COUNT=0
+    for __dir in "${__SCAN_DIRS[@]}"; do
+        [ -d "$__dir" ] || continue
+        while IFS= read -r __orphan; do
+            [ -z "$__orphan" ] && continue
+            __ORPHAN_COUNT=$((__ORPHAN_COUNT + 1))
+            __target=$(readlink "$__orphan")
+            __new_target="${__target/$__OLD_DEFAULT/$__NEW_DEFAULT}"
+            if [ "$__ORPHAN_COUNT" = "1" ]; then
+                echo "sync-memory: WARN — found orphan symlinks pointing at old path. Re-point with:" >&2
+            fi
+            echo "  rm $__orphan && ln -s $__new_target $__orphan" >&2
+        done < <(find "$__dir" -type l -lname "${__OLD_DEFAULT}*" 2>/dev/null)
+    done
+    if [ "$__ORPHAN_COUNT" -gt 0 ]; then
+        echo "sync-memory: WARN — $__ORPHAN_COUNT orphan symlink(s) total. Run the rm+ln pairs above to fix." >&2
     fi
 fi
 
