@@ -2,9 +2,9 @@ import { describe, it, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, ChildProcess } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
-import { writeFileSync, unlinkSync, mkdtempSync, rmSync } from 'node:fs';
+import { writeFileSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { setupTempWorkspace } from './_helpers/temp-workspace.js';
 
 // Integration test for PR #418 / #419 agent-state plumbing.
 // Spawns web-client.ts on a random port, exercises /sse-status + /mute-state,
@@ -20,7 +20,8 @@ const PORT = 18081; // well above the 8080 dev server + 9900 voice-agent
 // reads. Before #840 fix: both tests shared <REPO_ROOT>/core-status.json
 // and node:test parallel file runs caused intermittent
 // `expected listening, got working` on the agent-state assertions.
-const TEMP_WORKSPACE = mkdtempSync(join(tmpdir(), 'sutando-test-agent-state-'));
+const { workspace: TEMP_WORKSPACE, cleanup: cleanupTempWorkspace } =
+	setupTempWorkspace('agent-state');
 const CORE_STATUS_PATH = join(TEMP_WORKSPACE, 'core-status.json');
 
 // voice-state.json is read by web-client's readVoiceState() as the authoritative
@@ -100,7 +101,7 @@ describe('/sse-status + /mute-state — agent state plumbing (PR #418)', () => {
 		}
 		// Remove the per-test-process workspace temp dir wholesale.
 		// This now also covers voice-state.json (in the same temp dir).
-		try { rmSync(TEMP_WORKSPACE, { recursive: true, force: true }); } catch { /* idempotent */ }
+		cleanupTempWorkspace();
 	});
 
 	// Reset both tracks to idle before every subtest so order-dependence can't
