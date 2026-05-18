@@ -153,8 +153,17 @@ for pair in "notes:notes"; do
     elif [ -d "$src" ]; then
         log "WARN: $src is a real dir not a symlink — manual reconcile needed"
         echo "sync-memory: WARN — $src is a real dir, not a symlink to $tgt." >&2
-        echo "  Manual reconcile (preserves data): " >&2
-        echo "    rsync -au $src/ $tgt/ && rm -rf $src && ln -s $tgt $src" >&2
+        echo "  Manual reconcile (preserves data; excludes build noise): " >&2
+        echo "    rsync -au \\" >&2
+        echo "      --exclude='**/node_modules/' --exclude='**/.cache/' \\" >&2
+        echo "      --exclude='**/.remotion/'    --exclude='**/dist/' \\" >&2
+        echo "      --exclude='*.mp4.bak'        --exclude='*-rerun*.mp4' \\" >&2
+        echo "      --exclude='*-rerun*.mov'     --exclude='*-v[0-9][0-9]-[0-9]*.mp4' \\" >&2
+        echo "      --exclude='*-v[0-9][0-9]-[0-9]*.mov' --exclude='*-v[0-9]-v[0-9]*.mp4' \\" >&2
+        echo "      --exclude='*-v[0-9]-v[0-9]*.mov'     --exclude='*_v[0-9]*.mp4' \\" >&2
+        echo "      --exclude='*_v[0-9]*.mov'    --exclude='ep[0-9]*-v[0-9]*.mp4' \\" >&2
+        echo "      --exclude='sutando-wire-*-v[0-9]*.mp4' \\" >&2
+        echo "      $src/ $tgt/ && rm -rf $src && ln -s $tgt $src" >&2
     elif [ ! -e "$src" ]; then
         mkdir -p "$(dirname "$src")"
         if ln -s "$tgt" "$src"; then
