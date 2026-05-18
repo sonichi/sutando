@@ -307,6 +307,8 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 				`Respond only when the owner addresses you as "${INSTANCE_NAME}" by name, or when one of those other instances addresses you as "${INSTANCE_NAME}" by name during an owner-initiated bot-to-bot dialog. In every other situation, produce no spoken output. Generate nothing at all — no acknowledgement, no meta-commentary about whether you should speak, no quoting of these instructions back to the owner. The system handles this; you just generate audio when the conditions are met and generate no audio otherwise.`,
 				`When you DO respond, NEVER lead with identity disambiguation. Do NOT say "I'm not ${OTHER_INSTANCES.join('/')}, I'm ${INSTANCE_NAME}" or similar phrases. Just answer the owner's actual question directly. Only mention which instance you are if the owner explicitly asks "who are you" or "which one are you".`,
 			] : []),
+			`## Never speak [System: ...] framing aloud (issue #829)`,
+			`Any input string starting with \`[System:\` is an internal directive, NOT content to read. Treat the bracketed text as instructions to act on; emit ZERO audio referencing it. Do not narrate it, do not summarize it, do not echo it back. Producing the literal bracket text is a bug.`,
 			'You have full capabilities — use the work tool for anything: check the screen, send emails, look things up, make calls, browse the web, or check results of previous tasks.',
 			'',
 			'## How to think',
@@ -684,63 +686,19 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 	const sessionAny = session as any;
 	let outChunks = 0;
 
-	// Name-gated audio output (when OTHER_INSTANCES is set).
-	// Buffers audio until end-of-turn transcript can be inspected; if the user's
-	// turn didn't mention INSTANCE_NAME, the entire buffered response is dropped
-	// (Gemini's prompt-only silence rule is unreliable; code-level gate is the
-	// real enforcement). When OTHER_INSTANCES is empty, gate is fully disabled.
-	const nameGateActive = OTHER_INSTANCES.length > 0 && !!INSTANCE_NAME
-		&& process.env.SUTANDO_AUDIO_GATE_OFF !== 'true';
-	const nameVariants = [INSTANCE_NAME, ...INSTANCE_NAME_ALIASES]
-		.filter(Boolean).map(n => n.toLowerCase());
-	const otherVariantsLc = [...OTHER_INSTANCES, ...OTHER_INSTANCE_ALIASES]
-		.map(n => n.toLowerCase());
-	// Detect addressing intent — not just substring presence. A name counts
-	// as "addressed" only if it appears in one of these forms (per sentence):
-	//   - "Hi/Hey/Hello/Yo NAME" or "Hi NAME, ..."
-	//   - "NAME," or "NAME?" at the start of a sentence (e.g. "Lucy, can you...")
-	//   - "NAME" followed by an imperative/auxiliary verb at sentence start
-	// Mere mentions like "thanks Lucy" or "Lucy's answer" do NOT count.
-	const isAddressedBy = (text: string, names: string[]): boolean => {
-		const lc = text.toLowerCase();
-		const ADDRESS_VERBS = '(can|could|will|would|please|tell|answer|design|write|read|check|look|help|stop|start|leave|join|log)';
-		for (const n of names) {
-			// "hi/hey/hello NAME" — greeting + name anywhere; allow optional
-			// punctuation (",", "!", ":") between greeting and name ("Hi, Maddie")
-			const greet = new RegExp(`\\b(hi|hey|hello|yo|okay|ok)[,!:]?\\s+${n}\\b`, 'i');
-			// "NAME," — comma-tag (definite address marker)
-			const commaTag = new RegExp(`\\b${n}\\s*,`, 'i');
-			// "NAME VERB" — imperative form only at sentence start
-			// (sentence start = beginning of text OR after a period/!/? + optional whitespace)
-			const verbed = new RegExp(`(^|[.!?]\\s*)${n}\\s+${ADDRESS_VERBS}\\b`, 'i');
-			if (greet.test(lc) || commaTag.test(lc) || verbed.test(lc)) return true;
-		}
-		return false;
-	};
-	const transcriptContainsName = (text: string): boolean =>
-		isAddressedBy(text, nameVariants);
-	const transcriptContainsOther = (text: string): boolean =>
-		isAddressedBy(text, otherVariantsLc);
-	// Sticky "last-addressed-was-me" so the owner doesn't have to re-name on
-	// every follow-up turn. flips true on my-name, false on other-name,
-	// unchanged on no-name. Initial value: true if SUTANDO_PRIMARY=true is set
-	// (this instance is the default responder; un-named cold openers route
-	// here), otherwise false (require explicit address on first turn — avoids
-	// double-response on cold openers when multiple instances share a channel).
-	// Per-response gating model (rewritten 2026-05-17 to replace the buffered
-	// time-window model that had unfixable tail-bleed at turn boundaries):
-	//   - responseAllowed is a single boolean state, updated at each turn.end
-	//   - handleAudioOutput just checks the current state — no buffering
-	//   - chunks arriving in the first ~50ms after a turn boundary use the
-	//     PREVIOUS turn's decision (acceptable small leak)
-	let responseAllowed = process.env.SUTANDO_PRIMARY === 'true';
+	// Multi-bot silence is enforced by the system prompt (see buildAgent
+	// instructions in this file + meeting-mode pattern in voice-agent.ts) —
+	// when OTHER_INSTANCES is set, the prompt tells this instance to stay
+	// silent unless addressed by name. No audio-level gate, no per-turn
+	// state machine. If prompt-level proves unreliable in practice, the
+	// fallback is a single ignore-by-user-id filter on the inbound subscribe,
+	// not an outbound buffer-and-decide loop.
 
 	sessionAny.handleAudioOutput = (data: string) => {
 		sessionAny.notificationQueue?.markAudioReceived?.();
 		try {
 			const pcm24Mono = Buffer.from(data, 'base64');
 			const pcm48Stereo = upsample24MonoTo48Stereo(pcm24Mono);
-			if (nameGateActive && !responseAllowed) return; // silently drop
 			pushAudio(pcm48Stereo);
 			outChunks++;
 			if (outChunks === 1 || outChunks % 50 === 0) {
@@ -757,12 +715,9 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 		const items = session.conversationContext.items;
 		if (items.length < lastProcessedIdx) lastProcessedIdx = 0;
 		const lastText = s.transcript.length > 0 ? s.transcript[s.transcript.length - 1].text : null;
-		// Find the most-recent user item in this turn (for the name-gate decision).
-		let latestUserText = '';
 		for (const item of items.slice(lastProcessedIdx)) {
 			if (item.content === lastText) continue;
 			if (item.role === 'user') {
-				latestUserText = item.content;
 				s.transcript.push({ role: 'user', text: item.content });
 				s.events.push({ event: `user:${item.content}`, timestamp: new Date().toISOString() });
 				logLine('user', item.content);
@@ -773,39 +728,6 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 			}
 		}
 		lastProcessedIdx = items.length;
-
-		// Apply the per-response gate decision. Single boolean state, sticky
-		// across un-named follow-ups; flipped when an address pattern matches.
-		if (nameGateActive) {
-			setTimeout(() => {
-				// Re-scan latest user item from items (now populated after turn.end tick)
-				const allItems = session.conversationContext.items;
-				let userText = latestUserText;
-				for (let i = allItems.length - 1; i >= 0; i--) {
-					if (allItems[i].role === 'user') {
-						userText = allItems[i].content;
-						break;
-					}
-				}
-				const haveMyName = transcriptContainsName(userText);
-				const haveOtherName = transcriptContainsOther(userText);
-				const before = responseAllowed;
-				if (haveMyName) responseAllowed = true;
-				else if (haveOtherName) responseAllowed = false;
-				// else: sticky — unchanged
-				if (before !== responseAllowed || haveMyName || haveOtherName) {
-					console.log(`${ts()} [NameGate] ${responseAllowed ? 'allow' : 'drop'} (user: "${userText.slice(0, 60)}")`);
-				}
-				// If we just flipped from allow → drop, KILL any in-flight audio
-				// (Gemini was speaking; cut it off mid-word so user doesn't hear
-				// a leak from chunks that arrived BEFORE this decision).
-				if (before === true && responseAllowed === false) {
-					audioOutQueue.length = 0;
-					try { player.stop(true); } catch {}
-					console.log(`${ts()} [NameGate] cut off in-flight audio (flipped to drop)`);
-				}
-			}, 50);
-		}
 
 		if (s.resultQueue.length > 0) {
 			const queued = s.resultQueue.splice(0);
