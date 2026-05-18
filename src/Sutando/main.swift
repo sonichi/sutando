@@ -42,6 +42,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let pointerView = PointerOverlayView()
     var pointerWatchSource: DispatchSourceFileSystemObject?
     var pointerAnim: Timer?
+    var pointerPulseTimer: Timer?
+    var pointerHoldTimer: Timer?
+    var pointerFadeTimer: Timer?
     var pointerLastTS: Double = 0
     // Avatar animation state (PR #418 plumbing → PR #419 consumer).
     // `currentAgentState` caches the last state from /sse-status so
@@ -1762,7 +1765,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// lift, triangle rotated tangent to travel; beep + held pulsing halo on
     /// arrival. Math ported verbatim from the proven tracer overlay.
     func flyPointer(to dst: CGPoint, label: String) {
+        // Cancel every timer from a prior point_at — a stale hold/pulse/fade
+        // would otherwise keep mutating halo/alpha/showLabel and hide the new
+        // marker mid-flight (Codex review, high). Reset the visual state too.
         pointerAnim?.invalidate()
+        pointerPulseTimer?.invalidate(); pointerPulseTimer = nil
+        pointerHoldTimer?.invalidate(); pointerHoldTimer = nil
+        pointerFadeTimer?.invalidate(); pointerFadeTimer = nil
+        pointerView.halo = 0
+        pointerView.alpha = 0
         pointerView.showLabel = false
         pointerView.label = label
         let start = pointerView.pos
@@ -1800,22 +1811,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Pulse a halo ring for 8s at the Target, then fade the marker out.
     func holdPointer() {
         var phase = 0.0
-        let pulse = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+        pointerPulseTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             phase += 0.07
             self.pointerView.halo = 26 + 12 * CGFloat(abs(sin(phase)))   // 26–38 px breathing ring
             self.pointerView.needsDisplay = true
         }
-        Timer.scheduledTimer(withTimeInterval: 8.0, repeats: false) { [weak self] _ in
-            pulse.invalidate()
+        pointerHoldTimer = Timer.scheduledTimer(withTimeInterval: 8.0, repeats: false) { [weak self] _ in
             guard let self = self else { return }
+            self.pointerPulseTimer?.invalidate(); self.pointerPulseTimer = nil
             var a: CGFloat = 1
-            Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { t in
+            self.pointerFadeTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] t in
+                guard let self = self else { t.invalidate(); return }
                 a -= 1.0 / 42.0
                 self.pointerView.alpha = max(a, 0)
                 self.pointerView.needsDisplay = true
                 if a <= 0 {
                     t.invalidate()
+                    self.pointerFadeTimer = nil
                     self.pointerView.showLabel = false
                     self.pointerView.halo = 0
                 }

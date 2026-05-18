@@ -4,7 +4,7 @@
  */
 
 import { execSync, execFileSync } from 'node:child_process';
-import { writeFileSync, unlinkSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
+import { writeFileSync, unlinkSync, readFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
@@ -432,18 +432,26 @@ export const pointAtTool: ToolDefinition = {
 		if (!apiKey) return { error: 'point_at unavailable (no GEMINI_VOICE_API_KEY or GEMINI_API_KEY)' };
 		if (!query?.trim()) return { error: 'point_at needs a query (what to point at)' };
 		try {
-			// 1. capture the main display (single-display scope guard) via :7845
-			const capRes = await fetch('http://localhost:7845/capture?display=1');
+			// 1. capture the main display (single-display scope guard) via :7845.
+			// Timeout-bounded — point_at is on the sub-second inline lane and must
+			// never hang it if the capture server is wedged.
+			const capRes = await fetch('http://localhost:7845/capture?display=1', { signal: AbortSignal.timeout(8_000) });
+			if (!capRes.ok) return { error: `point_at capture HTTP ${capRes.status}` };
 			const cap = await capRes.json() as { status: string; path?: string; error?: string };
 			if (cap.status !== 'ok' || !cap.path) return { error: `point_at capture failed: ${cap.error || 'unknown'}` };
 			// Downscale; sips -Z preserves aspect, so 0–1 normalized coords map
 			// straight onto the display with no extra transform (open item #2).
-			const small = '/tmp/pointer-shot.jpg';
+			// Per-invocation temp path + success flag so a failed sips can never
+			// feed a stale screenshot from a previous call into the model.
+			const small = `/tmp/pointer-shot-${process.pid}-${Date.now()}.jpg`;
+			let resized = false;
 			try {
 				execFileSync('sips', ['-s', 'format', 'jpeg', '-Z', '1568', cap.path, '--out', small], { timeout: 4_000, stdio: 'ignore' });
+				resized = existsSync(small);
 			} catch { /* fall back to the full-size capture below */ }
-			const imgPath = existsSync(small) ? small : cap.path;
+			const imgPath = resized ? small : cap.path;
 			const imageData = readFileSync(imgPath).toString('base64');
+			if (resized) { try { unlinkSync(small); } catch { /* best-effort cleanup */ } }
 
 			// 2. resolve the Target via Gemini's native point format (thinking off)
 			const prompt =
@@ -463,9 +471,13 @@ export const pointAtTool: ToolDefinition = {
 						// of answering, truncating the point. Proven in the POC.
 						generationConfig: { temperature: 0, maxOutputTokens: 1200, thinkingConfig: { thinkingBudget: 0 } },
 					}),
+					signal: AbortSignal.timeout(60_000),
 				},
 			);
-			const data = await res.json() as any;
+			const data = await res.json().catch(() => null) as any;
+			if (!res.ok) {
+				return { error: `point_at model HTTP ${res.status}: ${data?.error?.message || JSON.stringify(data)?.slice(0, 160) || 'no body'}` };
+			}
 			if (!data?.candidates?.[0]) {
 				const reason = data?.promptFeedback?.blockReason || data?.error?.message || JSON.stringify(data).slice(0, 160);
 				return { error: `point_at model error: ${reason}` };
@@ -483,15 +495,25 @@ export const pointAtTool: ToolDefinition = {
 				if (!m) return { error: `point_at unparseable reply: ${txt.slice(0, 160)}` };
 				y = Number(m[1]); x = Number(m[2]);
 			}
+			// Reject garbage before it reaches the overlay — a NaN/out-of-range
+			// point would otherwise fly the marker off-screen or be silently
+			// dropped by the Swift side while we still report success.
+			if (![x, y].every(n => Number.isFinite(n) && n >= 0 && n <= 1000)) {
+				return { error: `point_at got an out-of-range point [${y}, ${x}] for "${query}"` };
+			}
 
-			// 3. hand the Target to the Swift overlay (runs in the real GUI session)
+			// 3. hand the Target to the Swift overlay (runs in the real GUI session).
+			// Atomic publish: write a sibling temp file then rename over the
+			// command file so the dir-watcher never reads a half-written JSON.
 			mkdirSync(join(process.cwd(), 'state'), { recursive: true });
 			const cmd = {
 				nx: Math.round((x / 1000) * 1e5) / 1e5,
 				ny: Math.round((y / 1000) * 1e5) / 1e5,
 				label, say, ts: Date.now() / 1000,
 			};
-			writeFileSync(POINTER_CMD_PATH, JSON.stringify(cmd));
+			const tmpCmd = `${POINTER_CMD_PATH}.${process.pid}.tmp`;
+			writeFileSync(tmpCmd, JSON.stringify(cmd));
+			renameSync(tmpCmd, POINTER_CMD_PATH);
 			console.log(`${ts()} [PointAt] "${query}" -> nx=${cmd.nx} ny=${cmd.ny} label="${label}"`);
 			return {
 				status: 'pointing',
