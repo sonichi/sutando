@@ -29,7 +29,7 @@ import { z } from 'zod';
 import { existsSync, readFileSync, readdirSync, statSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, openSync, writeSync, closeSync } from 'node:fs';
 import { execSync as execSyncTop } from 'node:child_process';
 import { inlineTools, coreDocumentedSkills } from './inline-tools.js';
-import { setVisionSession, startVisionControlServer, stopVisionControlServer } from './vision-tools.js';
+import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater } from './vision-tools.js';
 import { clearActiveArtifact } from './artifact-cache-tools.js';
 import { injectText } from './browser-tools.js';
 import { join, dirname } from 'node:path';
@@ -512,6 +512,8 @@ function getPresenterStateMarker(): string {
 	return '';
 }
 
+const mainAgentTools: ToolDefinition[] = [workTool, getTaskStatus, switchModeTool, saveMeetingNoteTool, ...inlineTools];
+
 const mainAgent: MainAgent = {
 	name: 'main',
 	get greeting() {
@@ -759,7 +761,7 @@ const mainAgent: MainAgent = {
 	// enable it once we find a reliable gate signal (probably after
 	// bodhi exposes a proper "user has actually spoken" signal under
 	// native audio).
-	tools: [workTool, getTaskStatus, switchModeTool, saveMeetingNoteTool, ...inlineTools],
+	tools: mainAgentTools,
 	googleSearch: VOICE_GOOGLE_SEARCH,
 	onEnter: async () => console.log(`${ts()} [Agent] Sutando ready`),
 	// Voice-driven close — strict version. User wants to be able to
@@ -988,6 +990,10 @@ async function main() {
 	// HTTP control endpoint so the web-client Watch button can drive the
 	// same controller (proxied through web-client to stay same-origin).
 	setVisionSession(session);
+	// updateTools is on the private transport (GeminiLiveTransport), not VoiceSession.
+	// Applied on next reconnect — restricts what Gemini sees after the next transport cycle.
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	setSessionToolUpdater((tools) => (session as any).transport?.updateTools?.(tools), mainAgentTools);
 	startVisionControlServer();
 
 	// Bumped 5min into the future on every non-retryable transport close
@@ -1253,6 +1259,7 @@ async function main() {
 		console.log(`\n${ts()} Shutting down...`);
 		writeVoiceMetrics();
 		setVisionSession(null);
+		setSessionToolUpdater(null, []);
 		stopVisionControlServer();
 		await session.close('user_hangup');
 		process.exit(0);

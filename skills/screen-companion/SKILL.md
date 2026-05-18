@@ -103,7 +103,13 @@ See `screen_companion.md` at the repo root. Owner is iterating on the model (M1 
 
 Configs are non-executable YAML — they only declare the interaction shape. No path to arbitrary code execution from a config alone.
 
-**`tools_allow` is advisory in v0.** The activation tool returns the allow-list in its payload and instructs Gemini to self-restrict via the system-prompt note. There is no hard-enforcement path that scopes the live VoiceSession's tool surface to the allow-list — Gemini sees the field as guidance, not a hard constraint. A future PR will add hard enforcement at the bodhi-realtime-agent layer; until then, treat configs as the documented intent, not the security boundary. Configs still cannot grant tools the active VoiceSession doesn't already expose (the field is a hint, not a grant), so the worst case is "Gemini calls a tool you didn't intend to allow" — not privilege escalation.
+**`tools_allow` is hard-enforced at activation time.** When `activate_screen_companion` is called, the tool invokes `session.updateTools()` via the `callUpdateTools` hook in `src/vision-tools.ts`, replacing the live VoiceSession's tool surface with only the tools named in `tools_allow` plus two always-retained tools (`activate_screen_companion` for mode-switching, `deactivate_screen_companion` for exit). Gemini physically cannot call tools outside this set for the rest of the session.
+
+To exit: the user says "exit" / "stop" / "done" and Gemini calls `deactivate_screen_companion`, which calls `callRestoreTools()` to restore the full pre-activation tool surface.
+
+**Fallback**: if the session updater is not registered (e.g. phone-conversation context, tests), `callUpdateTools` returns false and the enforcement is silently skipped — advisory behavior remains as a safe fallback.
+
+Configs still cannot grant tools the active VoiceSession doesn't already expose — `tools_allow` is a restriction list, not a grant. The worst case if a config names a tool that doesn't exist in the session is that the tool simply isn't included in the restricted surface.
 
 ## Privacy + data handling
 
