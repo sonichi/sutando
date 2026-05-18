@@ -719,24 +719,38 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 		lastProcessedIdx = items.length;
 
 		// Apply the name-gate decision now that the user turn transcript is in.
+		// Defer one tick — turn.end can fire fractionally before conversationContext
+		// is populated with the user item, leaving latestUserText='' (false-drop bug).
 		if (nameGateActive && turnDecision === 'pending') {
-			const named = latestUserText.toLowerCase().includes(instanceNameLc);
-			if (named) {
-				turnDecision = 'allow';
-				for (const buf of pendingAudio) {
-					pushAudio(buf);
-					outChunks++;
+			setTimeout(() => {
+				if (turnDecision !== 'pending') return; // turn.start may have re-reset
+				// Re-scan the latest user item now that items list is populated.
+				const allItems = session.conversationContext.items;
+				let userText = latestUserText;
+				for (let i = allItems.length - 1; i >= 0; i--) {
+					if (allItems[i].role === 'user') {
+						userText = allItems[i].content;
+						break;
+					}
 				}
-				console.log(`${ts()} [NameGate] allow — flushed ${pendingAudio.length} chunks (user said "${INSTANCE_NAME}")`);
-				pendingAudio = [];
-			} else {
-				turnDecision = 'drop';
-				const dropped = pendingAudio.length;
-				pendingAudio = [];
-				if (dropped > 0) {
-					console.log(`${ts()} [NameGate] drop — suppressed ${dropped} chunks (user did not say "${INSTANCE_NAME}")`);
+				const named = userText.toLowerCase().includes(instanceNameLc);
+				if (named) {
+					turnDecision = 'allow';
+					for (const buf of pendingAudio) {
+						pushAudio(buf);
+						outChunks++;
+					}
+					console.log(`${ts()} [NameGate] allow — flushed ${pendingAudio.length} chunks (user: "${userText.slice(0,60)}")`);
+					pendingAudio = [];
+				} else {
+					turnDecision = 'drop';
+					const dropped = pendingAudio.length;
+					pendingAudio = [];
+					if (dropped > 0) {
+						console.log(`${ts()} [NameGate] drop — suppressed ${dropped} chunks (user: "${userText.slice(0,60)}")`);
+					}
 				}
-			}
+			}, 50);
 		}
 
 		if (s.resultQueue.length > 0) {
