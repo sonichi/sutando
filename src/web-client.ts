@@ -3134,8 +3134,15 @@ function coreIsRunning(): boolean { return readCoreStatus().running; }
 const VOICE_STATE_STALE_SECONDS = 120;
 function readVoiceState(): boolean | null {
 	try {
-		const url = new URL('../voice-state.json', import.meta.url);
-		const raw = readFileSync(url, 'utf-8');
+		// voice-state.json is per-user runtime state — lives under
+		// $SUTANDO_WORKSPACE. Pre-fix this read from REPO_ROOT via the
+		// import.meta.url-relative path — but voice-agent's writer also
+		// resolved relative to its cwd (= REPO_ROOT when launched from
+		// there), so both sides happened to align on the same install.
+		// On SUTANDO_WORKSPACE-set hosts (or cwd-drift), the two split.
+		// Same workspace-contract fix as #849 for core-status.json.
+		const statusPath = join(WORKSPACE_DIR, 'voice-state.json');
+		const raw = readFileSync(statusPath, 'utf-8');
 		const s = JSON.parse(raw) as { connected?: boolean; ts?: number };
 		const nowSec = Date.now() / 1000;
 		if (typeof s.ts === 'number' && nowSec - s.ts > VOICE_STATE_STALE_SECONDS && s.connected) {

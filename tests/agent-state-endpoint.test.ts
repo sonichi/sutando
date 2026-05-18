@@ -2,10 +2,9 @@ import { describe, it, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, ChildProcess } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
-import { readFileSync, writeFileSync, existsSync, unlinkSync, mkdtempSync, rmSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { writeFileSync, unlinkSync, mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { fileURLToPath } from 'node:url';
 
 // Integration test for PR #418 / #419 agent-state plumbing.
 // Spawns web-client.ts on a random port, exercises /sse-status + /mute-state,
@@ -27,11 +26,11 @@ const CORE_STATUS_PATH = join(TEMP_WORKSPACE, 'core-status.json');
 // voice-state.json is read by web-client's readVoiceState() as the authoritative
 // voiceConnected source (browser POST cache is the fallback). Tests in the
 // voice-state describe block below write/remove this file to exercise both
-// branches. Stash + restore any real prod value on setup/teardown. This file
-// still lives at REPO_ROOT (readVoiceState not yet migrated — separate PR);
-// stash/restore retained until that's fixed.
-const VOICE_STATE_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'voice-state.json');
-let savedVoiceState: string | null = null;
+// branches. Lives in the same per-test-process TEMP_WORKSPACE as core-status.json
+// — no stash/restore needed, the temp dir didn't exist before this test and
+// gets rm'd on teardown. (Was REPO_ROOT pre-#853 fix; migrated to match the
+// post-#849 web-client reader semantics.)
+const VOICE_STATE_PATH = join(TEMP_WORKSPACE, 'voice-state.json');
 
 let child: ChildProcess;
 
@@ -47,12 +46,10 @@ describe('/sse-status + /mute-state — agent state plumbing (PR #418)', () => {
 		// and gets rm'd on teardown.
 		writeFileSync(CORE_STATUS_PATH, JSON.stringify({ status: 'idle', ts: Math.floor(Date.now() / 1000) }) + '\n');
 
-		// Stash + neutralize voice-state.json (still lives at REPO_ROOT until
-		// readVoiceState migrates) so a prod voice-state.json doesn't leak
-		// voiceConnected=true into the idle baseline assertion below.
-		if (existsSync(VOICE_STATE_PATH)) {
-			savedVoiceState = readFileSync(VOICE_STATE_PATH, 'utf-8');
-		}
+		// voice-state.json lives in TEMP_WORKSPACE post-#853 migration, so no
+		// prod-state leak is possible (the temp dir is fresh). Just ensure the
+		// file is absent before the spawned web-client reads it for the
+		// "missing voice-state.json falls back to cache" subtest baseline.
 		try { unlinkSync(VOICE_STATE_PATH); } catch { /* already gone */ }
 
 		child = spawn(
@@ -102,13 +99,8 @@ describe('/sse-status + /mute-state — agent state plumbing (PR #418)', () => {
 			});
 		}
 		// Remove the per-test-process workspace temp dir wholesale.
+		// This now also covers voice-state.json (in the same temp dir).
 		try { rmSync(TEMP_WORKSPACE, { recursive: true, force: true }); } catch { /* idempotent */ }
-		// Restore voice-state.json (still at REPO_ROOT — separate migration).
-		if (savedVoiceState !== null) {
-			writeFileSync(VOICE_STATE_PATH, savedVoiceState);
-		} else {
-			try { unlinkSync(VOICE_STATE_PATH); } catch { /* idempotent */ }
-		}
 	});
 
 	// Reset both tracks to idle before every subtest so order-dependence can't

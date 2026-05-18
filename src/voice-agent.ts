@@ -850,7 +850,14 @@ async function main() {
 	// this after ~5 PR-restart cycles desyncing voiceConnected.
 	function writeVoiceState(connected: boolean) {
 		try {
-			writeFileSync('voice-state.json', JSON.stringify({ connected, ts: Math.floor(Date.now() / 1000) }));
+			// voice-state.json is per-user runtime state — lives under
+			// $SUTANDO_WORKSPACE. Pre-fix this was a cwd-relative write
+			// (effectively REPO_ROOT when launched from there), so the
+			// web-client's REPO_ROOT-relative reader happened to find it —
+			// but on hosts where SUTANDO_WORKSPACE is set or cwd drifts,
+			// voice-agent wrote one place and the consumer read another.
+			// Same workspace-contract fix as #849 for core-status.json.
+			writeFileSync(join(WORKSPACE_DIR, 'voice-state.json'), JSON.stringify({ connected, ts: Math.floor(Date.now() / 1000) }));
 		} catch (err) {
 			console.error(`${ts()} [VoiceState] write failed:`, err);
 		}
