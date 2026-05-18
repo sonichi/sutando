@@ -701,16 +701,15 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 	// Mere mentions like "thanks Lucy" or "Lucy's answer" do NOT count.
 	const isAddressedBy = (text: string, names: string[]): boolean => {
 		const lc = text.toLowerCase();
-		const sentences = lc.split(/[.!?]+\s*/).map(s => s.trim()).filter(Boolean);
-		const ADDRESS_VERBS = '(can|are|is|will|could|should|please|do|did|tell|answer|design|write|read|check|look|help|stop|start|leave|join)';
-		for (const s of sentences) {
-			for (const n of names) {
-				// "hi/hey/hello/yo NAME" or "NAME," / "NAME?" / "NAME VERB"
-				const greet = new RegExp(`^(hi|hey|hello|yo|okay|ok)\\s+${n}\\b`, 'i');
-				const tagged = new RegExp(`^${n}\\s*[,?]`, 'i');
-				const verbed = new RegExp(`^${n}\\s+${ADDRESS_VERBS}\\b`, 'i');
-				if (greet.test(s) || tagged.test(s) || verbed.test(s)) return true;
-			}
+		const ADDRESS_VERBS = '(can|are|is|will|could|should|please|do|did|tell|answer|design|write|read|check|look|help|stop|start|leave|join|log)';
+		for (const n of names) {
+			// "hi/hey/hello NAME" — greeting + name anywhere (word boundary)
+			const greet = new RegExp(`\\b(hi|hey|hello|yo|okay|ok)\\s+${n}\\b`, 'i');
+			// "NAME," / "NAME?" — tag-style address (word boundary anywhere)
+			const tagged = new RegExp(`\\b${n}\\s*[,?]`, 'i');
+			// "NAME VERB" — name followed by imperative/auxiliary
+			const verbed = new RegExp(`\\b${n}\\s+${ADDRESS_VERBS}\\b`, 'i');
+			if (greet.test(lc) || tagged.test(lc) || verbed.test(lc)) return true;
 		}
 		return false;
 	};
