@@ -734,6 +734,12 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 	// using stale text from a previous turn (the 2026-05-18 lazy-allow
 	// staleness bug that leaked Lucy/Maddy audio into sibling-addressed turns).
 	let lastGateAppliedUserText = '';
+	// First-audio-chunk timestamp of the current outbound turn. Used as the
+	// agent row's ts_unix so sqlite reflects WHEN AUDIO PLAYED, not when the
+	// gate-decision write happened. Without this, agent rows can be ~10-20s
+	// late if Gemini's response straddles two user turns (Susan 2026-05-18:
+	// "你得calibrate一下"). Reset at turn.end.
+	let currentTurnAudioOutTs: number | null = null;
 	const resetTurnGate = () => {
 		turnDecision = 'pending';
 		pendingAudio = [];
@@ -764,6 +770,7 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 								turnDecision = 'allow';
 								lastAddressedToMe = true;
 								(s as any).lastAddressedToMe = true;
+								if (currentTurnAudioOutTs === null) currentTurnAudioOutTs = Date.now() / 1000;
 								for (const buf of pendingAudio) { pushAudio(buf); outChunks++; }
 								console.log(`${ts()} [NameGate] lazy-allow — flushed ${pendingAudio.length} pre-chunks (user: "${userText.slice(0,60)}")`);
 								pendingAudio = [];
@@ -777,6 +784,7 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 					}
 				}
 			}
+			if (currentTurnAudioOutTs === null) currentTurnAudioOutTs = Date.now() / 1000;
 			pushAudio(pcm48Stereo);
 			outChunks++;
 			if (outChunks === 1 || outChunks % 50 === 0) {
@@ -889,15 +897,24 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 
 				if (named && !shouldDeferToPeer) {
 					turnDecision = 'allow';
+					if (currentTurnAudioOutTs === null && pendingAudio.length > 0) {
+						currentTurnAudioOutTs = Date.now() / 1000;
+					}
 					for (const buf of pendingAudio) {
 						pushAudio(buf);
 						outChunks++;
 					}
 					console.log(`${ts()} [NameGate] allow — flushed ${pendingAudio.length} chunks (user: "${userText.slice(0,60)}")`);
 					pendingAudio = [];
+					// Stamp agent rows with the audio-out-time (when audio actually
+					// played), not the gate-decision-write time. Falls back to wall
+					// clock if no chunks ever flowed (shouldn't happen on allow).
+					const agentTs = currentTurnAudioOutTs ?? undefined;
 					for (const t of pendingAsstText) {
-						recordDiscordVoiceTurn('discord-agent', t, s.sessionId);
+						recordDiscordVoiceTurn('discord-agent', t, s.sessionId, agentTs);
 					}
+					// Reset for next turn.
+					currentTurnAudioOutTs = null;
 				} else if (shouldDeferToPeer) {
 					turnDecision = 'drop';
 					const dropped = pendingAudio.length;
@@ -916,6 +933,7 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 				setTimeout(() => {
 					turnDecision = 'pending';
 					pendingAudio = [];
+					currentTurnAudioOutTs = null;
 				}, 3000);
 			}, 500);
 		}
