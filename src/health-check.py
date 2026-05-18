@@ -912,6 +912,32 @@ def run_all_checks() -> list[dict]:
     return checks
 
 
+def _any_core_alive(workspace: Optional[Path] = None, max_age_s: float = 90.0) -> bool:
+    """Return True if any sutando-core on any host has a live heartbeat.
+
+    Each running core writes `<workspace>/state/cores/<hostname>.alive` every
+    30 seconds (src/core_heartbeat.py). A file younger than `max_age_s` (3
+    missed beats at 30s each) means the core is alive. When it is, the
+    proactive loop already handles health inline — no need to queue a task.
+
+    `workspace` defaults to `WORKSPACE_DIR` at call time (not at import time)
+    so tests can patch the module-level name and have the change take effect.
+    """
+    if workspace is None:
+        workspace = WORKSPACE_DIR
+    cores_dir = workspace / "state" / "cores"
+    if not cores_dir.is_dir():
+        return False
+    now = time.time()
+    for alive_file in cores_dir.glob("*.alive"):
+        try:
+            if now - alive_file.stat().st_mtime < max_age_s:
+                return True
+        except OSError:
+            pass
+    return False
+
+
 def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None, tasks_dir: Optional[Path] = None) -> None:
     """Emit a task file describing health-check failures so the proactive
     loop's CLI session sees them via the watcher and can decide what to do
@@ -1093,7 +1119,12 @@ def main():
     # `--quiet --emit-task --notify-on-fail` invocation bypassed via the
     # quiet-path sys.exit(1). Splitting the emit logic by --fix state
     # restores coverage for the no-fix path.
-    if do_emit and not do_fix:
+    #
+    # Skip when a live core is present (issue #635 dedup-runners): the
+    # proactive loop already handles health inline — writing a task file
+    # here creates a duplicate that re-queues the same check. The task-file
+    # path is only useful when the core is dead (queues for next restart).
+    if do_emit and not do_fix and not _any_core_alive():
         emit_task_for_failures(checks)
 
     if as_json:
@@ -1231,7 +1262,7 @@ def main():
     # review). The no-fix path emits earlier, before --quiet / --json early
     # exits (per #640 v2-regression: launchd's `--quiet --emit-task` was
     # bypassing the end-of-main emit via sys.exit(1)).
-    if do_emit and do_fix and issues:
+    if do_emit and do_fix and issues and not _any_core_alive():
         # Brief delay so restarts have a chance to register before re-check.
         # 2s matches the fix-loop's per-service `time.sleep(1)` budget.
         import time as _t; _t.sleep(2)
