@@ -54,6 +54,14 @@ import {
 import { Readable } from 'node:stream';
 import prism from 'prism-media';
 import { recordDiscordVoiceTurn, recordDiscordVoiceSession } from './discord-voice-store.js';
+import { isAddressedBy, isAddressedToOther } from './name-gate.js';
+
+// Agent-row timestamp adjustment. discord-voice stamps sqlite agent rows with
+// (audio-out-first-chunk-time + HEARD_OFFSET_SEC) so the timestamp roughly
+// matches when the owner actually HEARD the reply, not when Gemini emitted
+// its first chunk. 10s ≈ audio playback duration + Discord transport jitter
+// observed during the 2026-05-18 calibration ("你得calibrate一下").
+const HEARD_OFFSET_SEC = 10;
 import {
 	inlineTools,
 	ownerOnlyTools,
@@ -395,6 +403,11 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 							break;
 						}
 					}
+					// NOTE: dismiss intentionally uses its OWN narrower verb list +
+					// mid-sentence anchor (different from name-gate's start-of-clause
+					// anchor). Don't unify — these semantics differ on purpose:
+					// dismiss must catch "sure Lucy can leave" but the name-gate
+					// must NOT, or the gate over-allows. See refactor commit msg.
 					const lc = lastUserText.toLowerCase();
 					const variants = [INSTANCE_NAME, ...INSTANCE_NAME_ALIASES]
 						.filter(Boolean).map(n => n.toLowerCase());
@@ -717,69 +730,13 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 	// "thank you, Maddie" and "Maddie's answer" both matched as if Maddie was
 	// being addressed. Require one of: greet+name ("hi Maddie"), comma-tag
 	// ("Maddie,"), or sentence-start imperative ("Maddie can ...").
-	const _GATE_VERBS = '(can|could|will|would|please|tell|answer|design|write|read|check|look|help|stop|start|leave|join|log|hang|end)';
-	const _addressed = (text: string, names: string[]): boolean => {
-		if (!text || names.length === 0) return false;
-		const lc = text.toLowerCase();
-		for (const n of names) {
-			if (!n) continue;
-			const greet = new RegExp(`\\b(hi|hey|hello|yo|okay|ok)[,!:]?\\s+${n}\\b`, 'i');
-			const commaTag = new RegExp(`\\b${n}\\s*[,?]`, 'i');
-			const verbed = new RegExp(`(^|[.!?]\\s*)${n}\\s+${_GATE_VERBS}\\b`, 'i');
-			if (greet.test(lc) || commaTag.test(lc) || verbed.test(lc)) return true;
-		}
-		return false;
-	};
-	const transcriptContainsName = (text: string): boolean => _addressed(text, nameVariants);
-	const transcriptContainsOther = (text: string): boolean => _addressed(text, otherVariantsLc);
-	// Open-world "addressed to NOT-me" detector — catches address patterns where
-	// the named token is anything other than one of my own variants. So if the
-	// operator says "Hi Bob" or "Hi Daddy" or any name we haven't explicitly
-	// listed, Lucy still recognizes it as "not me" and flips sticky to drop.
-	// Per Susan 2026-05-18: "停到一个hi 不是lucy的都drop". Doesn't require
-	// the OTHER list to enumerate every possible mishearing.
-	const _addressedToNotMe = (text: string): boolean => {
-		if (!text) return false;
-		const myLc = nameVariants.filter(Boolean);
-		const lc = text.toLowerCase();
-		const patterns = [
-			// greet+name anywhere
-			/\b(hi|hey|hello|yo|okay|ok)[,!:]?\s+([a-z][a-z'-]*(?:\s+[a-z][a-z'-]*)?)\b/gi,
-			// commaTag — require start-of-clause (^ or .!?) before name, else
-			// random nouns like "math?" / "name?" false-positive as addresses.
-			/(^|[.!?]\s*)([a-z][a-z'-]*)\s*[,?]/gi,
-			// imperative — start-of-clause + name + verb.
-			/(^|[.!?]\s*)([a-z][a-z'-]*)\s+(can|could|will|would|please|tell|answer|design|write|read|check|look|help|stop|start|leave|join|log|hang|end)\b/gi,
-		];
-		const STOPWORDS = new Set([
-			// pronouns + question words
-			'i', 'me', 'my', 'mine', 'you', 'your', 'yours', 'we', 'us', 'our', 'ours',
-			'they', 'them', 'their', 'theirs', 'he', 'him', 'his', 'she', 'her', 'hers',
-			'it', 'its', 'this', 'that', 'these', 'those', 'there', 'here',
-			'who', 'whom', 'whose', 'what', 'which', 'when', 'where', 'why', 'how',
-			// affirmations / acknowledgements
-			'yes', 'no', 'yep', 'nope', 'yeah', 'nah', 'okay', 'ok', 'sure', 'right',
-			'thanks', 'thank', 'please', 'sorry', 'maybe',
-			// fillers / interjections
-			'oh', 'um', 'uh', 'well', 'so', 'just', 'now', 'now', 'still', 'also',
-			'and', 'or', 'but', 'if', 'as',
-			// common short verbs that often start clauses
-			'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had',
-			'do', 'does', 'did', 'go', 'goes', 'went', 'come', 'came',
-			'one', 'two', 'three', 'a', 'an', 'the', 'all', 'some', 'any',
-		]);
-		for (const re of patterns) {
-			let m;
-			while ((m = re.exec(lc)) !== null) {
-				// Group containing the captured name varies by pattern; find non-empty
-				const name = (m[2] || m[1] || '').trim();
-				if (!name || STOPWORDS.has(name)) continue;
-				const isMe = myLc.some(v => v === name || name.startsWith(v + ' ') || name === v);
-				if (!isMe) return true;
-			}
-		}
-		return false;
-	};
+	// Address detection lives in name-gate.ts — single source of truth shared
+	// with tests/discord-voice-gate.test.ts (46 cases). isAddressedBy escapes
+	// regex metacharacters in names (the inline version here did not).
+	const transcriptContainsName = (text: string): boolean => isAddressedBy(text, nameVariants);
+	const transcriptContainsOther = (text: string): boolean => isAddressedBy(text, otherVariantsLc);
+	// Open-world drop detector — see name-gate.ts isAddressedToOther.
+	const _addressedToNotMe = (text: string): boolean => isAddressedToOther(text, nameVariants);
 	// Sticky "last-addressed-was-me" so the owner doesn't have to re-name on
 	// every follow-up turn. Starts false (requires explicit address first turn);
 	// flips true on my-name, false on other-name, unchanged on no-name.
@@ -993,13 +950,9 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 					}
 					console.log(`${ts()} [NameGate] allow — flushed ${pendingAudio.length} chunks (user: "${userText.slice(0,60)}")`);
 					pendingAudio = [];
-					// Stamp agent rows with the audio-out-time (when audio first
-					// chunk PUSHED) + a 10s "user-heard" offset. The offset
-					// approximates audio playback duration + Discord transport
-					// jitter so sqlite timestamps roughly match when Susan
-					// actually heard the reply (per 2026-05-18 calibration).
-					// Falls back to wall clock if no chunks ever flowed.
-					const HEARD_OFFSET_SEC = 10;
+					// Stamp agent rows with audio-out-time + HEARD_OFFSET_SEC
+					// (file-top constant). Falls back to wall clock if no chunks
+					// ever flowed.
 					const baseTs = currentTurnAudioOutTs ?? Date.now() / 1000;
 					const agentTs = baseTs + HEARD_OFFSET_SEC;
 					for (const t of pendingAsstText) {
