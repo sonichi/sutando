@@ -112,6 +112,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             registerHotKey()
             watchResults()
             logToFile("App started, workspace=\(workspace)")
+            // Startup smoke: ensure the runtime dirs exist so the silent-
+            // write class can't recur (Mini nit #3). mkdir is idempotent;
+            // missing-dir is logged so an unexpected absence is visible.
+            for sub in ["tasks", "logs", "state", "results"] {
+                let dir = workspace + "/" + sub
+                if !FileManager.default.fileExists(atPath: dir) {
+                    logToFile("startup-smoke: \(sub)/ missing under \(workspace) — creating")
+                }
+                try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            }
         }
     }
 
@@ -1539,12 +1549,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func appendLog(_ path: String, _ line: String) {
+        // mkdir -p parent so the write doesn't silently drop when the log
+        // dir is missing — same defensive pattern as writeTask (Mini nit #2).
+        let parent = (path as NSString).deletingLastPathComponent
+        try? FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
         if let handle = FileHandle(forWritingAtPath: path) {
             handle.seekToEndOfFile()
             handle.write((line + "\n").data(using: .utf8)!)
             handle.closeFile()
         } else {
-            try? (line + "\n").write(toFile: path, atomically: true, encoding: .utf8)
+            do {
+                try (line + "\n").write(toFile: path, atomically: true, encoding: .utf8)
+            } catch {
+                // Last-resort log so disk-full / permission failures aren't
+                // silent (Mini nit #1). logToFile writes to a different dir
+                // so a single-dir failure doesn't cascade.
+                logToFile("appendLog: write failed for \(path) — \(error.localizedDescription)")
+            }
         }
     }
 
@@ -1563,7 +1584,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // tasks/ had been moved to the workspace dir by PR #762, so
         // try? write to <repo>/tasks/task-X.txt silently dropped the data.
         try? FileManager.default.createDirectory(atPath: tasksDir, withIntermediateDirectories: true)
-        try? taskContent.write(toFile: taskPath, atomically: true, encoding: .utf8)
+        do {
+            try taskContent.write(toFile: taskPath, atomically: true, encoding: .utf8)
+        } catch {
+            // disk-full / permission fail (Mini nit #1) — don't lose the
+            // signal silently. Surface to debug log.
+            logToFile("writeTask: write failed for \(taskPath) — \(error.localizedDescription)")
+        }
     }
 
     var lastHealthCheckStart: Date = .distantPast
