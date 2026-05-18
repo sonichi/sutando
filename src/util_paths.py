@@ -119,3 +119,37 @@ def shared_personal_path(filename: str, workspace: Path | None = None) -> Path:
 
     p = ws / filename
     return p
+
+
+# ---------------------------------------------------------------------------
+# Claude Code home directory — the host CLI's per-user state lives at
+# `~/.claude/`. Sutando consumes several subpaths (channels/, projects/,
+# skills/, settings.json, etc.); centralizing the resolution here keeps the
+# host-CLI dependency surface a single grep.
+#
+# Why this helper: per the 2026-05-18 workspace-design RFC discussion, the
+# dependency on `~/.claude/` is real (memory storage, channel tokens, skill
+# discovery, slash-command write convention) and we accept it operationally —
+# but we want the surface countable so a future swap is a 1-day grep+replace
+# rather than a re-architecture. ANY new read/write into the Claude Code home
+# directory should go through this helper.
+#
+# Resolution: prefer $CLAUDE_HOME if set (override / testing), else
+# `~/.claude/`. Does NOT create the dir.
+# ---------------------------------------------------------------------------
+
+def claude_home_path(*subpath: str) -> Path:
+    """Resolve a path under Claude Code's per-user home (`~/.claude/`).
+
+    Pass subpath components positionally, e.g.:
+        claude_home_path("channels", "discord", "access.json")
+        claude_home_path("projects", project_slug, "memory", "MEMORY.md")
+        claude_home_path("skills", skill_name)
+
+    Override the base with `$CLAUDE_HOME` for tests + alt-host installs.
+    """
+    base_env = os.environ.get("CLAUDE_HOME")
+    base = Path(os.path.expanduser(base_env)) if base_env else (Path.home() / ".claude")
+    if not subpath:
+        return base
+    return base.joinpath(*subpath)
