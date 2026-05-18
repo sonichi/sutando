@@ -85,6 +85,11 @@ const INSTANCE_NAME_ALIASES = (process.env.SUTANDO_NAME_ALIASES ?? '')
 // to stay silent (someone else is being addressed).
 const OTHER_INSTANCES = (process.env.SUTANDO_OTHER_INSTANCES ?? '')
 	.split(',').map(s => s.trim()).filter(Boolean);
+// Spoken-form aliases for OTHER_INSTANCES — same idea as SUTANDO_NAME_ALIASES
+// but for the peer side, so this bot correctly detects when a peer is addressed
+// under an ASR-variant spelling (e.g. "Maddie" for Maddy on Lucy's side).
+const OTHER_INSTANCE_ALIASES = (process.env.SUTANDO_OTHER_ALIASES ?? '')
+	.split(',').map(s => s.trim()).filter(Boolean);
 // Comma-separated Discord user_ids whose audio should be FILTERED OUT entirely
 // (typically peer Sutando bots in the same channel). Prevents bot-to-bot
 // cross-chatter when multiple instances share a voice channel.
@@ -665,7 +670,8 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 	const nameGateActive = OTHER_INSTANCES.length > 0 && !!INSTANCE_NAME;
 	const nameVariants = [INSTANCE_NAME, ...INSTANCE_NAME_ALIASES]
 		.filter(Boolean).map(n => n.toLowerCase());
-	const otherVariantsLc = OTHER_INSTANCES.map(n => n.toLowerCase());
+	const otherVariantsLc = [...OTHER_INSTANCES, ...OTHER_INSTANCE_ALIASES]
+		.map(n => n.toLowerCase());
 	const transcriptContainsName = (text: string): boolean => {
 		const lc = text.toLowerCase();
 		return nameVariants.some(v => lc.includes(v));
