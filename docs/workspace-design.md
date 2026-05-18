@@ -63,7 +63,7 @@ User-content. The user reads it, edits it directly, expects it to follow them. S
 - Python: `from util_paths import personalPath, sharedPersonalPath`.
 - TypeScript: `import { personalPath, sharedPersonalPath } from './util_paths.js'`.
 
-**Lives at:** `$SUTANDO_PRIVATE_DIR` (e.g. `~/.sutando-memory/`). Falls back to State when unset (backwards-compatible for fresh installs).
+**Lives at:** `$SUTANDO_PRIVATE_DIR` (e.g. `~/.sutando-memory/`). Falls back to State when unset — this is **intentional onboarding friction reduction**, not a bug. Fresh installs work without setting `SUTANDO_PRIVATE_DIR`; the user can opt into a separate Memory location later. The lifecycle distinction is documented but not enforced.
 
 **Sync model:** private git remote (`<user>-sutando-memory.git`). `scripts/sync-memory.sh` is the canonical sync.
 
@@ -126,6 +126,16 @@ Low — mostly documentation. The runtime contract is already correct end-to-end
 - Bigger work: doc + vocabulary shift in CLAUDE.md and onboarding materials.
 
 No re-audit needed.
+
+## A note on IDE / editor config
+
+Files like `.cursorrules`, `.claude/` (project-local Claude Code config), and `.vscode/` are sometimes per-user and sometimes shared. The 3-space model doesn't have a clean home for them:
+
+- If checked in (e.g. `.vscode/extensions.json` recommendations), they're **Code** — shared with everyone who clones.
+- If per-user (e.g. `.vscode/settings.json` with personal font preferences), they're effectively **Memory** but live at the repo root for tool-discovery reasons.
+- The practical answer: `.gitignore` the per-user variants, check in the shared ones. Same convention every IDE-aware repo uses. The 3-space model doesn't change this — it's an existing convention that maps to Code (shared) or stays out (per-user, untracked).
+
+Worth flagging because new contributors sometimes ask "should `.cursorrules` go in Memory?" — the answer is no, it stays in Code-or-untracked per IDE convention.
 
 ## Relationship to other docs
 
