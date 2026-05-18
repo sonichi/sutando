@@ -688,7 +688,8 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 	// turn didn't mention INSTANCE_NAME, the entire buffered response is dropped
 	// (Gemini's prompt-only silence rule is unreliable; code-level gate is the
 	// real enforcement). When OTHER_INSTANCES is empty, gate is fully disabled.
-	const nameGateActive = OTHER_INSTANCES.length > 0 && !!INSTANCE_NAME;
+	const nameGateActive = OTHER_INSTANCES.length > 0 && !!INSTANCE_NAME
+		&& process.env.SUTANDO_AUDIO_GATE_OFF !== 'true';
 	const nameVariants = [INSTANCE_NAME, ...INSTANCE_NAME_ALIASES]
 		.filter(Boolean).map(n => n.toLowerCase());
 	const otherVariantsLc = [...OTHER_INSTANCES, ...OTHER_INSTANCE_ALIASES]
