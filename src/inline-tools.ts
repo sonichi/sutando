@@ -21,6 +21,10 @@ import { describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool,
 export { sendVisionFrameTool, startVisionTool, stopVisionTool } from './vision-tools.js';
 import { sendVisionFrameTool, startVisionTool, stopVisionTool } from './vision-tools.js';
 
+// Active artifact cache — load a file once, query repeatedly without task-bridge round-trips.
+export { setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool, clearActiveArtifact } from './artifact-cache-tools.js';
+import { setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool } from './artifact-cache-tools.js';
+
 // --- File-open tool (moved out of recording-tools — generic file open, optionally fullscreen) ---
 
 export const openFileTool: ToolDefinition = {
@@ -1054,6 +1058,7 @@ export const inlineTools = assertUniqueToolNames([
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
 	recentContextTool,
 	sendVisionFrameTool, startVisionTool, stopVisionTool,
+	setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool,
 	...personalAllTools ]);
 
 /** Tools available to any caller (including unverified) */
@@ -1074,6 +1079,7 @@ export const ownerOnlyTools = [
 	recentContextTool,
 	describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool,
 	sendVisionFrameTool, startVisionTool, stopVisionTool,
+	setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool,
 	...personalTools.owner,
 ];
 

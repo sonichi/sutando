@@ -28,6 +28,7 @@ import { existsSync, readFileSync, readdirSync, statSync, unlinkSync, mkdirSync,
 import { execSync as execSyncTop } from 'node:child_process';
 import { inlineTools, coreDocumentedSkills } from './inline-tools.js';
 import { setVisionSession, startVisionControlServer, stopVisionControlServer } from './vision-tools.js';
+import { clearActiveArtifact } from './artifact-cache-tools.js';
 import { injectText } from './browser-tools.js';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
@@ -894,6 +895,7 @@ async function main() {
 			onSessionEnd: (e) => {
 				voiceEvents.push({ event: `session_ended:${e.reason}`, timestamp: new Date().toISOString() });
 				console.log(`${ts()} [Session] Ended: ${e.sessionId} (${e.reason})`);
+				clearActiveArtifact();
 				writeVoiceMetrics();
 			},
 			onToolCall: (e) => {
