@@ -17,7 +17,15 @@
 #
 # Env vars (all optional except SUTANDO_MEMORY_REPO):
 #   SUTANDO_MEMORY_REPO     — git URL of your private memory repo (REQUIRED)
-#   SUTANDO_WORKSPACE       — public sutando checkout. Default: ~/Desktop/sutando
+#   SUTANDO_REPO_DIR        — public sutando checkout. Auto-detected from the
+#                             script's parent dir when invoked as
+#                             `<repo>/scripts/sync-memory.sh` (zero-config for
+#                             the common case, regardless of clone location).
+#                             Falls back to ~/Desktop/sutando only when the
+#                             auto-detect signature doesn't match (e.g. invoked
+#                             from the memory-sync-dir copy of the script).
+#   SUTANDO_WORKSPACE       — local workspace dir (per CLAUDE.md workspace
+#                             contract). Default: ~/.sutando/workspace
 #   SUTANDO_MEMORY_SYNC_DIR — local clone path. Default: ~/.sutando/memory-sync
 #                             (was ~/.sutando-memory-sync before #762's
 #                             companion PR; one-time auto-migration below)
@@ -75,9 +83,26 @@ elif [ "$(basename "$SCRIPT_PARENT")" = ".sutando-memory-sync" ]; then
 else
     SYNC_DIR="$__NEW_DEFAULT"
 fi
-REPO_DIR="${SUTANDO_WORKSPACE:-$HOME/Desktop/sutando}"
+# Public-repo path resolution:
+#   1. $SUTANDO_REPO_DIR (explicit override)
+#   2. $SCRIPT_PARENT if it carries a sutando-checkout signature
+#      (CLAUDE.md + skills/ + .git/) — zero-config for the common case
+#      of `bash <repo>/scripts/sync-memory.sh` regardless of clone location.
+#   3. ~/Desktop/sutando as last-resort default for the memory-sync-dir-copy
+#      invocation (where SCRIPT_PARENT is the sync-dir, not the repo).
+#
+# Why no SUTANDO_WORKSPACE fallback: SUTANDO_WORKSPACE is reserved by CLAUDE.md
+# for the per-user workspace dir (~/.sutando/workspace/); using it as a
+# REPO_DIR alias would silently pick the wrong path on CLAUDE.md-compliant hosts.
+if [ -n "${SUTANDO_REPO_DIR:-}" ]; then
+    REPO_DIR="$SUTANDO_REPO_DIR"
+elif [ -f "$SCRIPT_PARENT/CLAUDE.md" ] && [ -d "$SCRIPT_PARENT/skills" ] && [ -d "$SCRIPT_PARENT/.git" ]; then
+    REPO_DIR="$SCRIPT_PARENT"
+else
+    REPO_DIR="$HOME/Desktop/sutando"
+fi
 if [ ! -d "$REPO_DIR" ]; then
-    echo "sync-memory: workspace not found at $REPO_DIR; set SUTANDO_WORKSPACE or clone sutando to ~/Desktop/sutando." >&2
+    echo "sync-memory: public repo not found at $REPO_DIR; set SUTANDO_REPO_DIR or invoke the script from <repo>/scripts/." >&2
     exit 0
 fi
 # Claude's per-project memory dir is keyed on the LAUNCH-CWD path, not on
@@ -130,6 +155,65 @@ if [ ! -d "$SYNC_DIR" ]; then
     echo "Setting up sync repo from $SUTANDO_MEMORY_REPO..."
     git clone --depth=10 "$SUTANDO_MEMORY_REPO" "$SYNC_DIR" 2>&1 | tee -a "$LOG"
 fi
+
+# --- Workspace symlink bootstrap (issue #769 fix) ---
+# PR #769 migrated `notes/` from `<repo>/notes/` to `$SUTANDO_WORKSPACE/notes/`
+# without preserving the pre-PR symlink to the private repo. Result: edits to
+# workspace/notes/ no longer reach the private repo, breaking cross-machine
+# sync silently. This block restores the symlink architecture:
+#
+#   $SUTANDO_WORKSPACE/notes  → $SYNC_DIR/notes  (symlink, idempotent)
+#
+# Behavior:
+#   - already-correct symlink: no-op
+#   - real dir at the target path: log WARN; manual reconcile required
+#     (don't silently overwrite local data — operator does rsync + mv + ln -s)
+#   - missing path: create the symlink
+#
+# The same convention is documented in this script's pre-2026-05-11 history
+# ("notes/ bidirectional rsync removed: both nodes now symlink").
+WS_DIR="${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}"
+# Disambiguation guard: if a host has SUTANDO_WORKSPACE pointing at a public-repo
+# checkout (legacy semantic), the symlink-bootstrap below would point at
+# `<repo>/notes` not the workspace `notes/`. Detect via `.git` presence + skip.
+if [ -d "$WS_DIR/.git" ]; then
+    log "skipping workspace-symlink bootstrap: SUTANDO_WORKSPACE='$WS_DIR' looks like a public-repo checkout, not a workspace. Set SUTANDO_WORKSPACE=$HOME/.sutando/workspace per CLAUDE.md and re-run."
+    WS_DIR=""
+fi
+if [ -n "$WS_DIR" ]; then
+mkdir -p "$WS_DIR"
+for pair in "notes:notes"; do
+    src="$WS_DIR/${pair%%:*}"
+    tgt="$SYNC_DIR/${pair##*:}"
+    if [ -L "$src" ]; then
+        actual=$(readlink "$src")
+        if [ "$actual" != "$tgt" ]; then
+            log "symlink mismatch: $src → $actual (expected $tgt)"
+            echo "sync-memory: WARN — $src points at $actual not $tgt; investigate." >&2
+        fi
+    elif [ -d "$src" ]; then
+        log "WARN: $src is a real dir not a symlink — manual reconcile needed"
+        echo "sync-memory: WARN — $src is a real dir, not a symlink to $tgt." >&2
+        echo "  Manual reconcile (preserves data; excludes build noise): " >&2
+        echo "    rsync -au \\" >&2
+        echo "      --exclude='**/node_modules/' --exclude='**/.cache/' \\" >&2
+        echo "      --exclude='**/.remotion/'    --exclude='**/dist/' \\" >&2
+        echo "      --exclude='*.mp4.bak'        --exclude='*-rerun*.mp4' \\" >&2
+        echo "      --exclude='*-rerun*.mov'     --exclude='*-v[0-9][0-9]-[0-9]*.mp4' \\" >&2
+        echo "      --exclude='*-v[0-9][0-9]-[0-9]*.mov' --exclude='*-v[0-9]-v[0-9]*.mp4' \\" >&2
+        echo "      --exclude='*-v[0-9]-v[0-9]*.mov'     --exclude='*_v[0-9]*.mp4' \\" >&2
+        echo "      --exclude='*_v[0-9]*.mov'    --exclude='ep[0-9]*-v[0-9]*.mp4' \\" >&2
+        echo "      --exclude='sutando-wire-*-v[0-9]*.mp4' \\" >&2
+        echo "      $src/ $tgt/ && rm -rf $src && ln -s $tgt $src" >&2
+    elif [ ! -e "$src" ]; then
+        mkdir -p "$(dirname "$src")"
+        if ln -s "$tgt" "$src"; then
+            log "symlink created: $src → $tgt"
+            echo "sync-memory: symlinked $src → $tgt" >&2
+        fi
+    fi
+done
+fi  # WS_DIR symlink-bootstrap guard
 
 cd "$SYNC_DIR" || { log "Failed to cd $SYNC_DIR"; exit 1; }
 
