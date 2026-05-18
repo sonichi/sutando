@@ -154,7 +154,7 @@ fi
 
 [[ -n "$PROMPT" ]] || fail "prompt required unless --check is used"
 
-if [[ "$GOAL" -eq 1 && "$PROMPT" != /goal\ * ]]; then
+if [[ "$GOAL" -eq 1 && "$PROMPT" != /goal* ]]; then
   PROMPT="/goal $PROMPT"
 fi
 
