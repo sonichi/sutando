@@ -26,8 +26,6 @@
  */
 
 import { config as _dotenvConfig } from 'dotenv';
-import { buildSilenceGatePrompt } from '../../../src/silence-gate-prompt.js';
-import { recordDiscordVoiceTurn, recordDiscordVoiceSession } from './discord-voice-store.js';
 import { mkdirSync, writeFileSync, appendFileSync, existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 
@@ -55,6 +53,7 @@ import {
 } from '@discordjs/voice';
 import { Readable } from 'node:stream';
 import prism from 'prism-media';
+import { recordDiscordVoiceTurn, recordDiscordVoiceSession } from './discord-voice-store.js';
 import {
 	inlineTools,
 	ownerOnlyTools,
@@ -300,26 +299,14 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 			try { return execSync('git remote get-url origin', { timeout: 2_000 }).toString().trim().replace(/\.git$/, ''); }
 			catch { return ''; }
 		})();
-		// When OTHER_INSTANCES is set, the silence-gate prompt OVERRIDES the
-		// chatty "be helpful, use any tool" framing — same as voice-agent.ts
-		// meeting mode pattern (a strict prompt that occupies the whole
-		// first-turn framing rather than a permissive item buried in a list).
-		// Without this override Gemini gets a mixed signal: «full capabilities»
-		// vs «stay silent unless addressed» — and the capability framing wins,
-		// causing leak / spurious work-tool calls (2026-05-18 PR #796 live test).
-		const silenceFirst = OTHER_INSTANCES.length > 0
-			? [buildSilenceGatePrompt({
-				mode: 'multi-bot',
-				instanceName: INSTANCE_NAME,
-				aliases: INSTANCE_NAME_ALIASES,
-				otherInstances: OTHER_INSTANCES,
-				otherAliases: OTHER_INSTANCE_ALIASES,
-			})]
-			: [];
 		instructions = [
-			...silenceFirst,
 			`You are Sutando${INSTANCE_NAME ? ` (this instance is named ${INSTANCE_NAME})` : ''}, a personal AI assistant. You are in a Discord voice channel with your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''}.`,
 			`YOU are Sutando${INSTANCE_NAME ? ` / ${INSTANCE_NAME}` : ''} — the AI assistant. The owner may address you by either name; both refer to you. The person speaking is your OWNER, a human. Do NOT confuse yourself with them.`,
+			...(OTHER_INSTANCES.length > 0 ? [
+				`## Other Sutando instances share this channel`,
+				`Other Sutando instances with the stand names ${OTHER_INSTANCES.join(', ')} are also in this voice channel. They are different bots running on different machines.`,
+				`Respond only when the owner addresses you as "${INSTANCE_NAME}" by name, or when one of those other instances addresses you as "${INSTANCE_NAME}" by name during an owner-initiated bot-to-bot dialog. In every other situation, produce no spoken output. Generate nothing at all — no acknowledgement, no meta-commentary about whether you should speak, no quoting of these instructions back to the owner. The system handles this; you just generate audio when the conditions are met and generate no audio otherwise.`,
+			] : []),
 			'You have full capabilities — use the work tool for anything: check the screen, send emails, look things up, make calls, browse the web, or check results of previous tasks.',
 			'',
 			'## How to think',
@@ -383,9 +370,13 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 			parameters: z.object({}),
 			execution: 'inline',
 			async execute() {
-				// Multi-instance safety: if peer instances share this channel,
-				// require the most-recent user transcript to address THIS instance
-				// by name. Otherwise "Lucy logoff" would dismiss Maddy too.
+				// Multi-instance safety: allow dismiss if EITHER (a) sticky
+				// last-addressed-to-me, OR (b) the latest user transcript
+				// addresses this instance by name. (a) covers follow-up
+				// dismisses ("leave the meeting" after "Hi Maddy ..."). (b)
+				// covers the race where Gemini's dismiss tool call fires
+				// BEFORE turn.end updates the sticky state (observed
+				// 2026-05-18 15:12 — dismiss at .762, sticky update at .828).
 				if (OTHER_INSTANCES.length > 0 && INSTANCE_NAME) {
 					const items = (s.voiceSession as any).conversationContext?.items ?? [];
 					let lastUserText = '';
@@ -398,10 +389,16 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 					const lc = lastUserText.toLowerCase();
 					const variants = [INSTANCE_NAME, ...INSTANCE_NAME_ALIASES]
 						.filter(Boolean).map(n => n.toLowerCase());
-					const namedMe = variants.some(v => lc.includes(v));
-					if (!namedMe) {
-						console.log(`${ts()} [Dismiss] suppressed — user did not address "${INSTANCE_NAME}" (last: "${lastUserText.slice(0,60)}")`);
-						return { status: 'suppressed_not_addressed_by_name' };
+					const verbs = '(can|could|will|would|please|tell|leave|stop|log|hang|end)';
+					const namedNow = variants.some(n => {
+						const greet = new RegExp(`\\b(hi|hey|hello|yo|okay|ok)[,!:]?\\s+${n}\\b`, 'i');
+						const commaTag = new RegExp(`\\b${n}\\s*[,?]`, 'i');
+						const verbed = new RegExp(`\\b${n}\\s+${verbs}\\b`, 'i');
+						return greet.test(lc) || commaTag.test(lc) || verbed.test(lc);
+					});
+					if (!(s as any).lastAddressedToMe && !namedNow) {
+						console.log(`${ts()} [Dismiss] suppressed — sticky+fresh both fail (last user: "${lastUserText.slice(0,60)}")`);
+						return { status: 'suppressed_not_addressed' };
 					}
 				}
 				console.log(`${ts()} [Dismiss] Discord voice context — SIGTERM`);
@@ -484,19 +481,12 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 		});
 	}
 
-	// Greeting fires once at session start. Empty in both modes — the
-	// silence-gate prompt is already in instructions[0], so sending it again
-	// as a "greeting" text-input made Gemini parse it as a user message and
-	// (a) sometimes parrot the prompt back as audio (#829) and (b) cost a full
-	// first-turn of latency (Susan saw 10-12s first response on 2026-05-18).
-	const greeting = '';
-
 	return {
 		name: 'discord-voice',
 		instructions,
 		tools,
 		googleSearch: true,
-		greeting,
+		greeting: '',
 	};
 }
 
@@ -704,63 +694,78 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 	const sessionAny = session as any;
 	let outChunks = 0;
 
-	// Multi-bot silence: prompt is the soft check; this is the hard one. The
-	// prompt-only version (c669765) proved unreliable in live test 2026-05-18 —
-	// Gemini ignored the silence rule and responded to "hi <sibling>". Audio
-	// gate dropped here is deterministic. When OTHER_INSTANCES is unset (single
-	// bot) the gate is fully disabled.
-	const nameGateActive = OTHER_INSTANCES.length > 0 && !!INSTANCE_NAME
-		&& process.env.SUTANDO_AUDIO_GATE_OFF !== 'true';
-	const nameVariantsLc = [INSTANCE_NAME, ...INSTANCE_NAME_ALIASES]
+	// Name-gated audio output (when OTHER_INSTANCES is set).
+	// Buffers audio until end-of-turn transcript can be inspected; if the user's
+	// turn didn't mention INSTANCE_NAME, the entire buffered response is dropped
+	// (Gemini's prompt-only silence rule is unreliable; code-level gate is the
+	// real enforcement). When OTHER_INSTANCES is empty, gate is fully disabled.
+	const nameGateActive = OTHER_INSTANCES.length > 0 && !!INSTANCE_NAME;
+	const nameVariants = [INSTANCE_NAME, ...INSTANCE_NAME_ALIASES]
 		.filter(Boolean).map(n => n.toLowerCase());
 	const otherVariantsLc = [...OTHER_INSTANCES, ...OTHER_INSTANCE_ALIASES]
-		.filter(Boolean).map(n => n.toLowerCase());
-	// Address detection — substring presence is too loose ("thanks Lucy" must
-	// NOT count as addressing Lucy). Match: greeting+name, "name," tag, or
-	// "name VERB" at sentence start.
-	const isAddressedBy = (text: string, names: string[]): boolean => {
+		.map(n => n.toLowerCase());
+	const transcriptContainsName = (text: string): boolean => {
 		const lc = text.toLowerCase();
-		const VERBS = '(can|could|will|would|please|tell|answer|design|write|read|check|look|help|stop|start|leave|join|log)';
-		for (const n of names) {
-			const greet = new RegExp(`\\b(hi|hey|hello|yo|okay|ok)[,!:]?\\s+${n}\\b`, 'i');
-			const commaTag = new RegExp(`\\b${n}\\s*[,?]`, 'i');
-			const verbed = new RegExp(`(^|[.!?]\\s*)${n}\\s+${VERBS}\\b`, 'i');
-			if (greet.test(lc) || commaTag.test(lc) || verbed.test(lc)) return true;
-		}
-		return false;
+		return nameVariants.some(v => lc.includes(v));
 	};
-	// Sticky: flips on address, unchanged on no-name turns. Initial =
-	// SUTANDO_PRIMARY for cold-opener routing.
-	let responseAllowed = process.env.SUTANDO_PRIMARY === 'true';
-	// First-audio-chunk timestamp of the current outbound turn. Used as the
-	// agent row's ts_unix so `agent.ts_unix - user.ts_unix` reflects perceived
-	// latency (the gap voice self-repair watches). Reset at turn.end.
-	let currentTurnAudioOutTs: number | null = null;
+	const transcriptContainsOther = (text: string): boolean => {
+		const lc = text.toLowerCase();
+		return otherVariantsLc.some(v => lc.includes(v));
+	};
+	// Sticky "last-addressed-was-me" so the owner doesn't have to re-name on
+	// every follow-up turn. Starts false (requires explicit address first turn);
+	// flips true on my-name, false on other-name, unchanged on no-name.
+	let lastAddressedToMe = false;
+	let turnDecision: 'pending' | 'allow' | 'drop' = 'pending';
+	let pendingAudio: Buffer[] = [];
+	// User text that turn.end's gate decision was last applied to. Lazy-allow
+	// only fires when the latest user transcript is DIFFERENT — otherwise we're
+	// using stale text from a previous turn (the 2026-05-18 lazy-allow
+	// staleness bug that leaked Lucy/Maddy audio into sibling-addressed turns).
+	let lastGateAppliedUserText = '';
+	const resetTurnGate = () => {
+		turnDecision = 'pending';
+		pendingAudio = [];
+	};
+	session.eventBus.subscribe('turn.start', resetTurnGate);
+	session.eventBus.subscribe('turn.interrupted', resetTurnGate);
 
 	sessionAny.handleAudioOutput = (data: string) => {
 		sessionAny.notificationQueue?.markAudioReceived?.();
 		try {
 			const pcm24Mono = Buffer.from(data, 'base64');
 			const pcm48Stereo = upsample24MonoTo48Stereo(pcm24Mono);
-			if (nameGateActive && !responseAllowed) {
-				// Lazy upgrade: turn.end fires AFTER Gemini's response audio
-				// has started flowing, so the first response after an address
-				// would be dropped because the gate update is lagged. Before
-				// dropping, peek at the latest user item — if Gemini already
-				// transcribed the address, flip the gate on the spot.
-				const items = session.conversationContext.items;
-				for (let i = items.length - 1; i >= 0; i--) {
-					if (items[i].role === 'user') {
-						if (isAddressedBy(items[i].content, nameVariantsLc)) {
-							responseAllowed = true;
-							console.log(`${ts()} [NameGate] lazy-allow (user: "${items[i].content.slice(0, 60)}")`);
+			if (nameGateActive) {
+				if (turnDecision === 'drop') return;
+				if (turnDecision === 'pending') {
+					// Lazy-allow: peek at current user transcript. If it's NEW
+					// (differs from lastGateAppliedUserText) AND contains my name,
+					// flip to allow on the spot. Newer-text guard prevents the
+					// staleness bug where a stale "Hi Lucy" turn's text gets
+					// reused to allow chunks belonging to a fresh "Hi Maddie"
+					// turn (observed 2026-05-18: 抢答 in both directions).
+					const items = session.conversationContext.items;
+					for (let i = items.length - 1; i >= 0; i--) {
+						if (items[i].role === 'user') {
+							const userText = items[i].content || '';
+							const isFresh = userText && userText !== lastGateAppliedUserText;
+							if (isFresh && transcriptContainsName(userText)) {
+								turnDecision = 'allow';
+								lastAddressedToMe = true;
+								(s as any).lastAddressedToMe = true;
+								for (const buf of pendingAudio) { pushAudio(buf); outChunks++; }
+								console.log(`${ts()} [NameGate] lazy-allow — flushed ${pendingAudio.length} pre-chunks (user: "${userText.slice(0,60)}")`);
+								pendingAudio = [];
+							}
+							break;
 						}
-						break;
+					}
+					if (turnDecision === 'pending') {
+						pendingAudio.push(pcm48Stereo);
+						return;
 					}
 				}
-				if (!responseAllowed) return; // silently drop
 			}
-			if (currentTurnAudioOutTs === null) currentTurnAudioOutTs = Date.now() / 1000;
 			pushAudio(pcm48Stereo);
 			outChunks++;
 			if (outChunks === 1 || outChunks % 50 === 0) {
@@ -777,8 +782,23 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 		const items = session.conversationContext.items;
 		if (items.length < lastProcessedIdx) lastProcessedIdx = 0;
 		const lastText = s.transcript.length > 0 ? s.transcript[s.transcript.length - 1].text : null;
+		// Find the most-recent user item in this turn (for the name-gate decision).
 		let latestUserText = '';
-		for (const item of items.slice(lastProcessedIdx)) {
+		// Late-assistant skip: any assistant item BEFORE the latest user in this
+		// slice belongs to the previous turn (Gemini's response arrived late, after
+		// turn.end fired but before THIS turn.end). Drop them — they'd otherwise
+		// piggyback on this turn's gate decision and leak via an allow path
+		// (Susan's "text leak still happening" 2026-05-18).
+		const slice = items.slice(lastProcessedIdx);
+		let latestUserIdxInSlice = -1;
+		for (let i = slice.length - 1; i >= 0; i--) {
+			if (slice[i].role === 'user' && slice[i].content !== lastText) {
+				latestUserIdxInSlice = i;
+				break;
+			}
+		}
+		for (let i = 0; i < slice.length; i++) {
+			const item = slice[i];
 			if (item.content === lastText) continue;
 			if (item.role === 'user') {
 				latestUserText = item.content;
@@ -790,26 +810,103 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 				s.transcript.push({ role: 'sutando', text: item.content });
 				s.events.push({ event: `sutando:${item.content}`, timestamp: new Date().toISOString() });
 				logLine('assistant', item.content);
-				recordDiscordVoiceTurn('discord-agent', item.content, s.sessionId, currentTurnAudioOutTs ?? undefined);
+				// Only buffer for sqlite if this assistant item BELONGS to the
+				// current turn (i.e., appears after the latest user item in
+				// this slice). Earlier assistant items are late from a previous
+				// turn whose gate already decided.
+				if (latestUserIdxInSlice >= 0 && i > latestUserIdxInSlice) {
+					(s as any)._pendingAssistantText = ((s as any)._pendingAssistantText ?? []).concat([item.content]);
+				} else {
+					console.log(`${ts()} [NameGate] discarded late-assistant text from previous turn (not added to sqlite buffer)`);
+				}
 			}
 		}
 		lastProcessedIdx = items.length;
 
-		// Reset audio-out timestamp at turn boundary so next turn captures
-		// its own first-chunk time.
-		currentTurnAudioOutTs = null;
+		// Apply the name-gate decision now that the user turn transcript is in.
+		// Defer ~500ms — turn.end can fire BEFORE Gemini's audio starts streaming,
+		// so we have to wait long enough for the first audio chunks to land in
+		// pendingAudio before we decide allow/drop. 50ms was too tight (chunks
+		// would arrive AFTER the decision, get buffered as "pending" but assigned
+		// to the wrong next turn → false-drop bug observed live 2026-05-17).
+		// IMPORTANT: bodhi doesn't publish 'turn.start', so we re-arm at the end of
+		// each decision (any subsequent audio is assumed to belong to the next turn).
+		if (nameGateActive) {
+			setTimeout(() => {
+				if (turnDecision !== 'pending') {
+					// Previous turn's decision still in effect — re-arm for next turn.
+					turnDecision = 'pending';
+					pendingAudio = [];
+					return;
+				}
+				// Re-scan the latest user item now that items list is populated.
+				const allItems = session.conversationContext.items;
+				let userText = latestUserText;
+				for (let i = allItems.length - 1; i >= 0; i--) {
+					if (allItems[i].role === 'user') {
+						userText = allItems[i].content;
+						break;
+					}
+				}
+				// Sticky-address logic: update lastAddressedToMe based on this turn,
+				// then use it as the decision (so a follow-up un-named turn after
+				// "Hi Lucy, ..." still routes to Lucy until owner names another bot).
+				const haveMyName = transcriptContainsName(userText);
+				const haveOtherName = transcriptContainsOther(userText);
+				if (haveMyName) lastAddressedToMe = true;
+				else if (haveOtherName) lastAddressedToMe = false;
+				// Mark this user text as "processed by the gate" — lazy-allow's
+				// freshness check uses this to avoid re-deciding on stale text.
+				lastGateAppliedUserText = userText;
+				// Mirror to session so the dismiss tool (defined in buildAgent
+				// scope) can read the sticky state instead of doing its own
+				// per-call name check that rejects valid follow-up dismisses.
+				(s as any).lastAddressedToMe = lastAddressedToMe;
+				const named = lastAddressedToMe;
+				// Peer-speaking suppression: even if sticky says allow, if a
+				// sibling bot was speaking in the last 3s AND this turn didn't
+				// explicitly name me, my "allow" is likely an ASR-miss carry-
+				// over. Defer to the sibling.
+				const peerTs = (s as any).peerLastSpokeTs || 0;
+				const peerActiveMs = Date.now() - peerTs;
+				const peerSpokeRecently = peerTs > 0 && peerActiveMs < 3000;
+				const shouldDeferToPeer = named && !haveMyName && peerSpokeRecently;
+				// Pending assistant text from the turn.end loop — write to sqlite
+				// only if audio actually plays (allow); drop on suppress.
+				const pendingAsstText: string[] = ((s as any)._pendingAssistantText ?? []);
+				(s as any)._pendingAssistantText = [];
 
-		// Update name-gate state from latest user turn. Flip on my-name,
-		// flip off on other-name, sticky on no-name.
-		if (nameGateActive && latestUserText) {
-			const haveMine = isAddressedBy(latestUserText, nameVariantsLc);
-			const haveOther = isAddressedBy(latestUserText, otherVariantsLc);
-			const before = responseAllowed;
-			if (haveMine) responseAllowed = true;
-			else if (haveOther) responseAllowed = false;
-			if (before !== responseAllowed || haveMine || haveOther) {
-				console.log(`${ts()} [NameGate] ${responseAllowed ? 'allow' : 'drop'} (user: "${latestUserText.slice(0, 60)}")`);
-			}
+				if (named && !shouldDeferToPeer) {
+					turnDecision = 'allow';
+					for (const buf of pendingAudio) {
+						pushAudio(buf);
+						outChunks++;
+					}
+					console.log(`${ts()} [NameGate] allow — flushed ${pendingAudio.length} chunks (user: "${userText.slice(0,60)}")`);
+					pendingAudio = [];
+					for (const t of pendingAsstText) {
+						recordDiscordVoiceTurn('discord-agent', t, s.sessionId);
+					}
+				} else if (shouldDeferToPeer) {
+					turnDecision = 'drop';
+					const dropped = pendingAudio.length;
+					pendingAudio = [];
+					console.log(`${ts()} [NameGate] defer-to-peer — suppressed ${dropped} chunks (peer spoke ${peerActiveMs}ms ago; user: "${userText.slice(0,60)}")`);
+					if (pendingAsstText.length) console.log(`${ts()} [NameGate] dropped ${pendingAsstText.length} unspoken assistant text(s) — not written to sqlite`);
+				} else {
+					turnDecision = 'drop';
+					const dropped = pendingAudio.length;
+					pendingAudio = [];
+					console.log(`${ts()} [NameGate] drop — suppressed ${dropped} chunks (user: "${userText.slice(0,60)}")`);
+					if (pendingAsstText.length) console.log(`${ts()} [NameGate] dropped ${pendingAsstText.length} unspoken assistant text(s) — not written to sqlite`);
+				}
+				// Re-arm after a grace window so the next turn's chunks start as pending.
+				// Grace covers any late-arriving chunks of THIS turn; tuned to ~3s.
+				setTimeout(() => {
+					turnDecision = 'pending';
+					pendingAudio = [];
+				}, 3000);
+			}, 500);
 		}
 
 		if (s.resultQueue.length > 0) {
@@ -846,7 +943,17 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 	};
 
 	// Subscribe to anyone currently speaking, and to anyone who starts.
-	connection.receiver.speaking.on('start', (userId) => subscribeUser(s, userId));
+	// Also track speaking from peer bots (IGNORE_USER_IDS) so we can suppress
+	// our own response when a sibling is mid-turn (Susan's "Maddy抢答" bug
+	// 2026-05-18: ASR mishearing made Maddy's gate stay sticky-allow after a
+	// turn that was actually addressed to Lucy; Lucy was the only one with
+	// "speaking start" for that turn, so Maddy can see this signal and back off).
+	connection.receiver.speaking.on('start', (userId) => {
+		if (IGNORE_USER_IDS.has(userId)) {
+			(s as any).peerLastSpokeTs = Date.now();
+		}
+		subscribeUser(s, userId);
+	});
 	// Start the constant-rate ticker that flushes audio to Gemini every 20ms.
 	startAudioTicker(s);
 
@@ -893,15 +1000,17 @@ function cleanupSession(s: DiscordVoiceSession): void {
 	try {
 		appendFileSync(join(DATA_DIR, 'discord-voice-metrics.jsonl'), JSON.stringify(metrics) + '\n');
 	} catch {}
-	recordDiscordVoiceSession({
-		sessionId: s.sessionId,
-		durationMs,
-		transcriptLines: s.transcript.length,
-		toolCount: s.toolCalls.length,
-		pendingTasks: s.pendingTasks,
-		toolCalls: s.toolCalls,
-		events: s.events,
-	});
+	try {
+		recordDiscordVoiceSession({
+			sessionId: s.sessionId,
+			durationMs,
+			transcriptLines: s.transcript.length,
+			toolCount: s.toolCalls.length,
+			pendingTasks: s.pendingTasks,
+			toolCalls: s.toolCalls,
+			events: s.events,
+		});
+	} catch {}
 	console.log(`${ts()} [Voice] session finalized: ${s.sessionId} (${durationMs}ms, ${s.transcript.length} turns)`);
 }
 
