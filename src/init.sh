@@ -62,12 +62,10 @@ tier1() {
   create_dir_if_missing "notes"
   create_dir_if_missing "data"
 
-  # Files — placeholders only, content added by the agent later
-  create_file_if_missing "build_log.md" \
-    "# Sutando build log
-
-Notes on what's built, what's next, and known issues. The proactive loop reads + updates this each pass.
-"
+  # Files — placeholders only, content added by the agent later.
+  # build_log.md lives under $SUTANDO_WORKSPACE per workspace contract; seeded
+  # there by workspace_default.py + dashboard/health-check readers expect it
+  # at WORKSPACE_DIR / "build_log.md". Not seeded here.
 
   create_file_if_missing "pending-questions.md" \
     "# Pending Questions

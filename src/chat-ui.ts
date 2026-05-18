@@ -82,6 +82,12 @@ export const CHAT_HTML = /* html */ `<!DOCTYPE html>
     background: #14141e; padding: 2px 6px; border-radius: 4px;
     color: #888; font-size: 12px;
   }
+  .empty .caps {
+    display: inline-grid; grid-template-columns: auto 1fr;
+    gap: 3px 12px; margin-top: 28px; text-align: left;
+  }
+  .empty .caps dt { color: #6af; font-size: 12px; white-space: nowrap; }
+  .empty .caps dd { color: #444; font-size: 12px; margin: 0; }
 
   .msg { display: flex; gap: 12px; max-width: 100%; }
   .msg .avatar {
@@ -217,6 +223,14 @@ export const CHAT_HTML = /* html */ `<!DOCTYPE html>
           Tasks route through the same bridge as Telegram, Discord, and voice.<br>
           Press <code>Enter</code> to send, <code>Shift+Enter</code> for newline.
         </div>
+        <dl class="caps">
+          <dt>Voice + screen</dt><dd>control any Mac app by voice; read what's on screen</dd>
+          <dt>Comms</dt><dd>phone, iMessage, Telegram, Discord</dd>
+          <dt>Calendar + email</dt><dd>Gmail / Google Calendar; draft replies; book meetings</dd>
+          <dt>Autonomous work</dt><dd>ships code, summarizes news, runs benchmarks</dd>
+          <dt>Fleet</dt><dd>coordinates with other Sutandos under access tiers</dd>
+          <dt>Skills</dt><dd><code>/list-skills</code> to see all installed</dd>
+        </dl>
       </div>
     </div>
   </div>

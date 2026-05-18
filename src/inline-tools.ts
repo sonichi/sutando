@@ -7,7 +7,8 @@
 
 import { execSync, execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync, statSync } from 'node:fs';
-import { join, extname } from 'node:path';
+import { join, extname, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from './workspace_default.js';
@@ -18,6 +19,11 @@ import { resolveWorkspace } from './workspace_default.js';
 // voice-agent was launched from the repo with SUTANDO_WORKSPACE unset.
 // resolveWorkspace() is the canonical TS helper introduced in #821.
 const WORKSPACE_DIR = resolveWorkspace();
+
+// Code-adjacent paths (skills/, etc.) ship with the repo checkout, NOT the
+// workspace. Compute REPO_ROOT from this file's URL so the resolution
+// survives any cwd drift at startup. Used by the skill-loader below.
+const REPO_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -620,8 +626,12 @@ export const getCoreStatusTool: ToolDefinition = {
 	execution: 'inline',
 	async execute() {
 		try {
-			const repoDir = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
-			const statusPath = join(repoDir, 'core-status.json');
+			// core-status.json is per-user runtime state at $SUTANDO_WORKSPACE
+			// (default ~/.sutando/workspace/). Pre-fix this read from REPO_ROOT
+			// via import.meta.url-relative path — but Python writers migrated
+			// to WORKSPACE_DIR in #836, so the TS reader silently saw stale or
+			// missing data. Same workspace-contract fix as #821/#842/#843.
+			const statusPath = join(WORKSPACE_DIR, 'core-status.json');
 			if (!existsSync(statusPath)) {
 				return { status: 'idle', description: 'Core agent is not currently running.' };
 			}
@@ -957,7 +967,7 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 	// Order: public first, then private — same-name skills loaded from
 	// private take precedence (last one wins via the dup-name guard below if
 	// any; in practice they should be uniquely named).
-	const dirsToScan: string[] = [join(process.cwd(), 'skills')];
+	const dirsToScan: string[] = [join(REPO_ROOT, 'skills')];
 	const privateRoot = process.env.SUTANDO_PRIVATE_DIR;
 	if (privateRoot) {
 		const expanded = privateRoot.replace(/^~/, process.env.HOME || '');
@@ -1021,7 +1031,7 @@ const personalAllTools = [...personalTools.owner, ...personalTools.anyCaller];
 // a tools.ts. Don't try to align them — they're correctly sync/async for
 // what each one does.
 function loadCoreDocumentedSkills(): { name: string; description: string }[] {
-	const dirsToScan: string[] = [join(process.cwd(), 'skills')];
+	const dirsToScan: string[] = [join(REPO_ROOT, 'skills')];
 	const privateRoot = process.env.SUTANDO_PRIVATE_DIR;
 	if (privateRoot) {
 		const expanded = privateRoot.replace(/^~/, process.env.HOME || '');
