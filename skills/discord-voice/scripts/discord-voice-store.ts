@@ -79,7 +79,7 @@ function init(): void {
 }
 
 export function recordDiscordVoiceTurn(
-	role: 'discord-user' | 'discord-agent',
+	role: 'discord-user' | 'discord-agent' | 'discord-peer',
 	text: string,
 	sessionId: string,
 	tsOverride?: number,

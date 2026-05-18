@@ -98,6 +98,15 @@ const IGNORE_USER_IDS = new Set(
 	(process.env.SUTANDO_IGNORE_USER_IDS ?? '')
 		.split(',').map(s => s.trim()).filter(Boolean)
 );
+// Peer Sutando-bot user_ids — TAGGING ONLY (not dropped). Audio from these
+// users still goes to Gemini (so this bot has full conversation context), but
+// their resulting user-transcripts are written to sqlite with role='discord-
+// peer' instead of 'discord-user', so reports can distinguish bot-spoken
+// utterances from the human owner's. Per Susan 2026-05-18: "tag differently".
+const PEER_USER_IDS = new Set(
+	(process.env.SUTANDO_PEER_USER_IDS ?? '')
+		.split(',').map(s => s.trim()).filter(Boolean)
+);
 // Per-instance Gemini voice color so listeners can audio-distinguish
 // concurrent instances. Override via SUTANDO_VOICE_NAME; otherwise pick from
 // the known-instance map; otherwise fall back to Aoede.
@@ -872,7 +881,15 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 				s.transcript.push({ role: 'user', text: item.content });
 				s.events.push({ event: `user:${item.content}`, timestamp: new Date().toISOString() });
 				logLine('user', item.content);
-				recordDiscordVoiceTurn('discord-user', item.content, s.sessionId);
+				// Tag peer-spoken transcripts as 'discord-peer' so reports can
+				// distinguish bot-spoken utterances from the human owner's.
+				// Heuristic: if peer spoke in the last 3s and no other speaker
+				// was active in this window, this transcript is likely from peer.
+				const peerTs = (s as any).peerLastSpokeTs || 0;
+				const peerActiveMs = Date.now() - peerTs;
+				const peerSpokeRecently = peerTs > 0 && peerActiveMs < 3000;
+				const role = peerSpokeRecently ? 'discord-peer' : 'discord-user';
+				recordDiscordVoiceTurn(role, item.content, s.sessionId);
 			} else if (item.role === 'assistant') {
 				s.transcript.push({ role: 'sutando', text: item.content });
 				s.events.push({ event: `sutando:${item.content}`, timestamp: new Date().toISOString() });
@@ -1053,7 +1070,7 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 	// turn that was actually addressed to Lucy; Lucy was the only one with
 	// "speaking start" for that turn, so Maddy can see this signal and back off).
 	connection.receiver.speaking.on('start', (userId) => {
-		if (IGNORE_USER_IDS.has(userId)) {
+		if (IGNORE_USER_IDS.has(userId) || PEER_USER_IDS.has(userId)) {
 			(s as any).peerLastSpokeTs = Date.now();
 		}
 		subscribeUser(s, userId);
