@@ -76,6 +76,10 @@ const OWNER_NAME = process.env.owner ?? '';
 // Optional instance name (e.g. "Lucy") — when set, the bot also answers to this name.
 // Lets the same OSS code respond to per-machine stand identities without recompiling.
 const INSTANCE_NAME = process.env.SUTANDO_INSTANCE_NAME ?? '';
+// Spoken-form aliases for INSTANCE_NAME — covers ASR mishearings (e.g.
+// "Maddy" gets transcribed as "Maddie"). Comma-separated.
+const INSTANCE_NAME_ALIASES = (process.env.SUTANDO_NAME_ALIASES ?? '')
+	.split(',').map(s => s.trim()).filter(Boolean);
 // Comma-separated stand names of other Sutando instances that may share the
 // same voice channel. Used by the system prompt so this instance knows when
 // to stay silent (someone else is being addressed).
@@ -663,7 +667,12 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 	// (Gemini's prompt-only silence rule is unreliable; code-level gate is the
 	// real enforcement). When OTHER_INSTANCES is empty, gate is fully disabled.
 	const nameGateActive = OTHER_INSTANCES.length > 0 && !!INSTANCE_NAME;
-	const instanceNameLc = INSTANCE_NAME.toLowerCase();
+	const nameVariants = [INSTANCE_NAME, ...INSTANCE_NAME_ALIASES]
+		.filter(Boolean).map(n => n.toLowerCase());
+	const transcriptContainsName = (text: string): boolean => {
+		const lc = text.toLowerCase();
+		return nameVariants.some(v => lc.includes(v));
+	};
 	let turnDecision: 'pending' | 'allow' | 'drop' = 'pending';
 	let pendingAudio: Buffer[] = [];
 	const resetTurnGate = () => {
@@ -743,7 +752,7 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 						break;
 					}
 				}
-				const named = userText.toLowerCase().includes(instanceNameLc);
+				const named = transcriptContainsName(userText);
 				if (named) {
 					turnDecision = 'allow';
 					for (const buf of pendingAudio) {
