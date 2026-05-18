@@ -14,21 +14,20 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readTmuxStatus } from './tmux-status.js';
 import { CHAT_HTML } from './chat-ui.js';
+import { resolveWorkspace } from './workspace_default.js';
 
 const HTTP_PORT = Number(process.env.CLIENT_PORT) || 8080;
 const HTTP_HOST = process.env.CLIENT_HOST || '0.0.0.0'; // '0.0.0.0' binds to all interfaces for EC2
 const WS_PORT = Number(process.env.PORT) || 9900;
 const DEFAULT_WS_URL = `ws://localhost:${WS_PORT}`;
 
-// Workspace-relative paths must be resolved against an absolute REPO_DIR (not
-// process.cwd()) so the client works when launched from a bundle/launchd/symlink
-// install where CWD isn't the workspace root. Matches task-bridge.ts (issue #713).
-const REPO_DIR = (process.env.SUTANDO_WORKSPACE && existsSync(process.env.SUTANDO_WORKSPACE))
-    ? process.env.SUTANDO_WORKSPACE
-    : resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const TASK_DIR = join(REPO_DIR, 'tasks');
-const STATE_DIR = join(REPO_DIR, 'state');
-const SUBSCRIPTIONS_PATH = join(REPO_DIR, 'skills/subscription-scanner/state/subscriptions.json');
+// Workspace-relative paths use resolveWorkspace() (closes #763). Skills paths
+// (non-runtime, code-adjacent) remain anchored to the repo root.
+const WORKSPACE_DIR = resolveWorkspace();
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const TASK_DIR = join(WORKSPACE_DIR, 'tasks');
+const STATE_DIR = join(WORKSPACE_DIR, 'state');
+const SUBSCRIPTIONS_PATH = join(REPO_ROOT, 'skills/subscription-scanner/state/subscriptions.json');
 
 const HTML = /* html */ `<!DOCTYPE html>
 <html lang="en">
@@ -536,6 +535,20 @@ const HTML = /* html */ `<!DOCTYPE html>
   /* When voice is active, hide hero */
   body.voice-active .hero { display: none; }
   body.voice-active .main { display: flex; }
+  /* Capabilities panel — shown on idle, hidden when voice is active */
+  .caps-panel {
+    max-width: 480px; margin: 0 auto 20px; padding: 12px 18px;
+    border: 1px solid #252540; border-radius: 8px;
+    background: rgba(26,26,60,0.4);
+  }
+  body.voice-active .caps-panel { display: none; }
+  .caps-panel .caps-heading {
+    font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase;
+    color: #444; margin-bottom: 8px;
+  }
+  .caps-panel dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; }
+  .caps-panel dt { color: #6af; font-size: 12px; white-space: nowrap; padding: 2px 0; }
+  .caps-panel dd { color: #555; font-size: 12px; margin: 0; padding: 2px 0; }
   /* Toast notifications */
   .toast-container {
     position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%);
@@ -713,6 +726,18 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
   <h2 id="hero-name">Sutando</h2>
   <p class="tagline">My AI Stand · Summon my AI superpower</p>
   <button class="btn-hero" onclick="toggle()">Start Voice</button>
+</div>
+
+<div class="caps-panel">
+  <p class="caps-heading">What I can do</p>
+  <dl>
+    <dt>Voice + screen</dt><dd>control any Mac app by voice; read what's on screen</dd>
+    <dt>Comms</dt><dd>phone, iMessage, Telegram, Discord</dd>
+    <dt>Calendar + email</dt><dd>Gmail / Google Calendar; draft replies; book meetings</dd>
+    <dt>Autonomous work</dt><dd>ships code, summarizes news, runs benchmarks</dd>
+    <dt>Fleet</dt><dd>coordinates with other Sutandos under access tiers</dd>
+    <dt>Skills</dt><dd><code style="color:#8af;font-size:11px">/list-skills</code> to see all installed</dd>
+  </dl>
 </div>
 
 <div id="status-bar" style="text-align:center;font-size:16px;color:#888;letter-spacing:0.3px;padding:12px 16px">

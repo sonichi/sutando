@@ -50,8 +50,11 @@ from typing import Any
 
 __all__ = ["log_event", "get_log_path", "LOGS_DIR"]
 
-REPO_DIR = Path(__file__).resolve().parent.parent
-LOGS_DIR = REPO_DIR / "logs"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from workspace_default import resolve_workspace  # noqa: E402
+
+WORKSPACE_DIR = resolve_workspace()
+LOGS_DIR = WORKSPACE_DIR / "logs"
 
 _CACHED_MACHINE: str | None = None
 
@@ -65,7 +68,7 @@ def _machine_id() -> str:
     try:
         sys.path.insert(0, str(Path(__file__).parent))
         from util_paths import personal_path
-        identity = personal_path("stand-identity.json", workspace=REPO_DIR)
+        identity = personal_path("stand-identity.json", workspace=WORKSPACE_DIR)
         if identity.exists():
             _CACHED_MACHINE = json.loads(identity.read_text()).get("machine", "") or "unknown"
         else:

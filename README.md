@@ -29,6 +29,11 @@ https://github.com/user-attachments/assets/a86ec34e-3b26-4011-824c-d2d124753c25
 ## 🎬 Recent autonomous output
 
 **Sutando WIRE** — Sutando reads the news, drafts the script, generates narration, renders the video. No editor, no animator, no narration session.
+- [Sutando's review of its first 50 days — and how it got Chi to #1 trending dev](https://youtu.be/pd6Siy1gnpI) — ep007
+- [AI That Runs a Real Sales Demo. Not in Theory. In Odoo.](https://youtu.be/zWBH4UeQeZQ) — ep006
+- [Three labs, three directions — AI labs week meta-commentary](https://youtu.be/QKzdXNkuL80) — ep005
+- [Codex vs Claude Code. Same /goal. One Shipped Theater.](https://youtu.be/Ufir0qjiYqE) — ep004
+- [Pentagon's 158 UAP Files, Mapped. Only 8 Match the Community Catalog](https://youtu.be/c3AD1mrR4y4) — ep003
 - [Declassified, Debunked, Unexplained: 3 Pentagon UAP Files in 40 Seconds](https://youtu.be/eBvHemYhc2o) — ep002
 - [162 UAP Files Just Declassified. The Pentagon's Apollo 17 Photo](https://youtu.be/JoltTj3x410) — ep001
 
@@ -211,7 +216,7 @@ These unlock more capabilities. Add to `.env` when ready:
 |-------------|----------------|-------|
 | Gmail | Read/send/search email from voice | `gws auth setup --login` (OAuth, no app password) |
 | Twilio + ngrok | Phone calls, SMS, meeting dial-in, task delegation via phone | [twilio.com](https://www.twilio.com) + `brew install ngrok` (see [Running costs](#running-costs)) |
-| Telegram | Message Sutando from your phone | [Create bot via @BotFather](https://t.me/BotFather), then `/telegram:configure <token>` |
+| Telegram | Message Sutando from your phone. **First DM auto-enrolls you as owner** (trust-on-first-use). Subsequent senders need to be added: edit `~/.claude/channels/telegram/access.json` → `allowFrom` list. | [Create bot via @BotFather](https://t.me/BotFather), then `/telegram:configure <token>` |
 | Discord | Message Sutando from Discord (DM + channel @mentions) | [Developer portal](https://discord.com/developers), then `/discord:configure <token>` |
 | Claude for Chrome | Browser automation — navigate, read pages, fill forms, interact with web apps | [Install extension](https://claude.ai/chrome), log in with the same account as Claude Code |
 | Sutando app (menu bar) | Global hotkeys (see [Keyboard shortcuts](#keyboard-shortcuts)) | Auto-launches via `startup.sh` |
