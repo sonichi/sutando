@@ -13,20 +13,32 @@ Env vars:
 
 Bot scopes (OAuth & Permissions):
     chat:write, im:history, im:write, app_mentions:read,
-    channels:history, groups:history
+    channels:history, groups:history, files:read, files:write,
+    users:read
 
 Access list (TOFU onboarding, same schema as telegram):
     ~/.claude/channels/slack/access.json
         {"allowFrom": ["U0123..."], "tofuOwner": "U0123...", ...}
 
-File attachments are NOT supported in v0 — see issue #866 for the full scope.
+File round-trip:
+    Inbound  — files attached to DMs/mentions are downloaded into
+               $SUTANDO_WORKSPACE/slack-inbox/ and the path is surfaced
+               in the task body as "[File attached: /path]".
+    Outbound — result bodies may include [file: /path], [send: /path],
+               or [attach: /path] markers. Paths are allowlisted via
+               _is_path_sendable() (same realpath+startswith sanitizer
+               the telegram/discord bridges use) and uploaded via
+               files_upload_v2.
 """
 
 import json
+import mimetypes
 import os
+import re
 import sys
 import threading
 import time
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -44,17 +56,58 @@ REPO = resolve_workspace()
 TASKS_DIR = REPO / "tasks"
 RESULTS_DIR = REPO / "results"
 STATE_DIR = REPO / "state"
+INBOX_DIR = REPO / "slack-inbox"
 ARCHIVE_TASKS_DIR = REPO / "tasks" / "archive"
 ARCHIVE_RESULTS_DIR = REPO / "results" / "archive"
 OWNER_ACTIVITY_FILE = STATE_DIR / "last-owner-activity.json"
 TASKS_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+INBOX_DIR.mkdir(parents=True, exist_ok=True)
 
 BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 APP_TOKEN = os.environ.get("SLACK_APP_TOKEN", "")
 if not BOT_TOKEN or not APP_TOKEN:
     print("SLACK_BOT_TOKEN and/or SLACK_APP_TOKEN not set", file=sys.stderr)
     sys.exit(1)
+
+
+# Outbound file-send allowlist — mirrors _is_path_sendable() in
+# discord-bridge.py + telegram-bridge.py. Fail-closed by default.
+SEND_ALLOWED_ROOTS = (
+    str(REPO / "results"),
+    str(REPO / "notes"),
+    str(REPO / "docs"),
+    str(INBOX_DIR),
+)
+SEND_ALLOWED_PREFIXES = (
+    "/tmp/sutando-",
+    "/private/tmp/sutando-",
+    "/tmp/echo-",
+    "/private/tmp/echo-",
+)
+
+
+def _is_path_sendable(fpath: str) -> bool:
+    """True iff `fpath` is a real file AND resolves under an allowed root.
+
+    Uses os.path.realpath + startswith — CodeQL recognizes this pattern as
+    a path-injection sanitizer. Do NOT swap for Path.resolve() without
+    re-proving to CodeQL. Same shape as the discord/telegram allowlist.
+    """
+    if not os.path.isfile(fpath):
+        return False
+    try:
+        real = os.path.realpath(fpath)
+    except OSError:
+        return False
+    for root in SEND_ALLOWED_ROOTS:
+        root_real = os.path.realpath(root)
+        if real == root_real or real.startswith(root_real + os.sep):
+            return True
+    for prefix in SEND_ALLOWED_PREFIXES:
+        if real.startswith(prefix):
+            return True
+    return False
 
 
 def write_owner_activity(channel: str, summary: str) -> None:
@@ -153,8 +206,43 @@ def tofu_onboard(user_id: str, username: str | None) -> set:
 pending_replies: dict[str, dict] = {}
 pending_replies_lock = threading.Lock()
 
+# Username cache — users.info is rate-limited (Tier 4 = 100/min). One
+# cache lookup per known user saves a network hop on every DM. Cache
+# never invalidates because display names rarely change and a stale
+# username is only a cosmetic issue in the task body. Cleared on
+# process restart.
+_username_cache: dict[str, str | None] = {}
+_username_cache_lock = threading.Lock()
+
 # Bolt App. Socket Mode handler attaches via SocketModeHandler below.
 app = App(token=BOT_TOKEN)
+
+
+def _download_slack_file(file_dict: dict) -> str | None:
+    """Download a Slack file to INBOX_DIR. Returns the local path or None.
+
+    Slack file URLs require the bot token in an Authorization header — they
+    are NOT public. We GET url_private and write to a name-mangled local
+    file using the original filename suffix where possible.
+    """
+    url = file_dict.get("url_private_download") or file_dict.get("url_private")
+    if not url:
+        return None
+    name_hint = file_dict.get("name") or file_dict.get("id") or "file"
+    # Slack returns filenames that may contain path separators or weird
+    # chars. Strip to basename and replace anything sketchy with _.
+    safe_name = os.path.basename(name_hint).replace(os.sep, "_") or "file"
+    local_path = INBOX_DIR / f"{int(time.time() * 1000)}-{safe_name}"
+    try:
+        req = urllib.request.Request(
+            url, headers={"Authorization": f"Bearer {BOT_TOKEN}"}
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp, open(local_path, "wb") as f:
+            f.write(resp.read())
+        return str(local_path)
+    except Exception as e:
+        print(f"  [file] download failed for {name_hint}: {e}", flush=True)
+        return None
 
 
 def _write_task(event: dict, prefix: str, text: str, username: str | None) -> str | None:
@@ -171,11 +259,29 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         print(f"  Dropped message from non-allowed user {user_id}", flush=True)
         return None
 
-    write_owner_activity("slack", text)
+    # Download any attached files BEFORE writing the task, so the task body
+    # carries the local paths. Skips silently on failure — task still goes
+    # through with whatever files did download.
+    attachment_lines = []
+    for file_dict in event.get("files") or []:
+        local_path = _download_slack_file(file_dict)
+        if local_path:
+            attachment_lines.append(f"[File attached: {local_path}]")
+    attachment_note = ("\n" + "\n".join(attachment_lines)) if attachment_lines else ""
+
+    if not text and not attachment_note:
+        return None
+
+    write_owner_activity("slack", text or attachment_note)
 
     channel = event.get("channel", "")
-    # Reply in-thread for channel @mentions, top-level for DMs.
-    thread_ts = event.get("thread_ts") or event.get("ts") if event.get("channel_type") != "im" else None
+    # Reply in-thread for channel @mentions, top-level for DMs. parens for
+    # readability; Python's `or` + ternary precedence is correct here but
+    # the explicit grouping makes the intent obvious to humans.
+    if event.get("channel_type") != "im":
+        thread_ts = event.get("thread_ts") or event.get("ts")
+    else:
+        thread_ts = None
 
     ts = int(time.time() * 1000)
     task_id = f"task-{ts}"
@@ -184,7 +290,7 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     task_file.write_text(
         f"id: {task_id}\n"
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S')}Z\n"
-        f"task: [{prefix} @{username or user_id}] {text}\n"
+        f"task: [{prefix} @{username or user_id}] {text}{attachment_note}\n"
         f"source: slack\n"
         f"channel_id: {channel}\n"
         f"user_id: {user_id}\n"
@@ -199,11 +305,24 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
 
 
 def _resolve_username(user_id: str) -> str | None:
+    """Resolve Slack user_id → display_name, cached.
+
+    The cache is unbounded but keyed by user_id, so practical size is
+    O(distinct senders) per process lifetime — fine for a personal agent.
+    Never invalidates: a stale display name is only cosmetic.
+    """
+    with _username_cache_lock:
+        if user_id in _username_cache:
+            return _username_cache[user_id]
+    name: str | None = None
     try:
         resp = app.client.users_info(user=user_id)
-        return resp["user"]["profile"].get("display_name") or resp["user"].get("name")
+        name = resp["user"]["profile"].get("display_name") or resp["user"].get("name")
     except Exception:
-        return None
+        pass
+    with _username_cache_lock:
+        _username_cache[user_id] = name
+    return name
 
 
 @app.event("app_mention")
@@ -211,12 +330,9 @@ def handle_mention(event, say):
     """Channel @mention → task file."""
     user_id = event.get("user")
     username = _resolve_username(user_id) if user_id else None
-    # Strip the leading <@BOTID> mention from the text body for cleanliness.
     raw = event.get("text", "")
-    import re
+    # Strip the leading <@BOTID> mention from the text body for cleanliness.
     text = re.sub(r"^<@[A-Z0-9]+>\s*", "", raw).strip()
-    if not text:
-        return
     _write_task(event, "Slack mention", text, username)
 
 
@@ -235,26 +351,91 @@ def handle_message(event, say):
     if not user_id:
         return
     username = _resolve_username(user_id)
-    text = event.get("text", "").strip()
-    if not text:
-        return
+    text = (event.get("text") or "").strip()
     _write_task(event, "Slack DM", text, username)
 
 
-def _send_reply(channel: str, thread_ts: str | None, text: str) -> None:
-    """Post a reply via chat.postMessage. Slack truncates messages at ~40KB
-    but Discord-style 2000-char chunking keeps things readable in the UI."""
-    if not text:
-        return
-    for i in range(0, len(text), 4000):
-        kwargs = {"channel": channel, "text": text[i:i + 4000]}
+# Markers that the bridge handles specially in result bodies. Same set as
+# discord-bridge.py + telegram-bridge.py — see CLAUDE.md "Result-body
+# protocol markers".
+FILE_MARKER_RE = re.compile(r'\[(?:file|send|attach):\s*([^\]]+)\]')
+
+
+def _send_file(channel: str, thread_ts: str | None, fpath: str) -> bool:
+    """Upload a file to a Slack channel/DM via files_upload_v2.
+
+    Returns True on success. Caller is responsible for allowlist-gating
+    the path before invocation — this function does not re-check.
+    """
+    try:
+        kwargs: dict = {
+            "channel": channel,
+            "file": fpath,
+            "filename": os.path.basename(fpath),
+        }
         if thread_ts:
             kwargs["thread_ts"] = thread_ts
-        try:
-            app.client.chat_postMessage(**kwargs)
-        except Exception as e:
-            print(f"[Slack] chat_postMessage failed: {e}", flush=True)
-            break
+        # files_upload_v2 is the recommended modern endpoint; the older
+        # files.upload is deprecated as of March 2025.
+        app.client.files_upload_v2(**kwargs)
+        return True
+    except Exception as e:
+        print(f"[Slack] files_upload_v2 failed for {fpath}: {e}", flush=True)
+        return False
+
+
+def _send_reply(channel: str, thread_ts: str | None, text: str) -> None:
+    """Post a reply via chat.postMessage with file-marker extraction.
+
+    Extracts [file:]/[send:]/[attach:] markers, uploads each allowlisted
+    file via files_upload_v2, and posts whatever text remains via
+    chat.postMessage. Chunks long text into 4000-char Slack messages.
+    """
+    if not text:
+        return
+
+    # Extract file paths first so the text body doesn't carry them.
+    file_paths = [m.strip() for m in FILE_MARKER_RE.findall(text)]
+    clean_text = FILE_MARKER_RE.sub('', text).strip()
+
+    # Post the text body in 4000-char chunks (Slack's per-message limit is
+    # 40k chars but readability suffers above ~4k).
+    if clean_text:
+        for i in range(0, len(clean_text), 4000):
+            kwargs = {"channel": channel, "text": clean_text[i:i + 4000]}
+            if thread_ts:
+                kwargs["thread_ts"] = thread_ts
+            try:
+                app.client.chat_postMessage(**kwargs)
+            except Exception as e:
+                print(f"[Slack] chat_postMessage failed: {e}", flush=True)
+                break
+
+    # Then upload each file. Fail-closed via _is_path_sendable.
+    for fpath in file_paths:
+        if _is_path_sendable(fpath):
+            if _send_file(channel, thread_ts, fpath):
+                print(f"  Sent file: {fpath}", flush=True)
+        elif os.path.isfile(fpath):
+            # Path exists but isn't allowlisted — surface a visible deny.
+            try:
+                app.client.chat_postMessage(
+                    channel=channel,
+                    text=f"(file access denied: {fpath})",
+                    **({"thread_ts": thread_ts} if thread_ts else {}),
+                )
+            except Exception:
+                pass
+            print(f"  BLOCKED file: {fpath}", flush=True)
+        else:
+            try:
+                app.client.chat_postMessage(
+                    channel=channel,
+                    text=f"(file not found: {fpath})",
+                    **({"thread_ts": thread_ts} if thread_ts else {}),
+                )
+            except Exception:
+                pass
 
 
 def result_watcher():
