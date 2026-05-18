@@ -12,6 +12,27 @@
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { loadConfig, discoverConfigs, renderGoal } from './scripts/load-config.js';
+import { registerVisionOnContributor } from '../../src/vision-tools.js';
+
+// Contributor for the screen-share-started system note. Tells Gemini the
+// screen-companion catalog is available AND names the configs the user can
+// activate. Registered at module-load time (= when the skill-loader at
+// src/inline-tools.ts:937 imports this file). If this skill is disabled or
+// removed, the registration never runs and the share-start note is generic.
+// This is the architecturally clean fix for sonichi's PR #794 review #3:
+// no feature-specific knowledge leaks into src/vision-tools.ts.
+registerVisionOnContributor(() => {
+	const modes = discoverConfigs().map(c => c.name);
+	if (modes.length === 0) return null;
+	const modeList = modes.map(m => `\`${m}\``).join(', ');
+	return (
+		`Screen-companion mode is available with these pre-built configs: ${modeList}. ` +
+		`Each one encodes one use case (interaction pattern + tool subset + vision cadence). ` +
+		`If the user's goal matches a configured mode (e.g. an unfamiliar UI to set up → \`guided-setup\`), ` +
+		`call the \`activate_screen_companion\` tool with the matching mode + their goal. ` +
+		`If the goal doesn't match a configured mode, operate normally with screen awareness.`
+	);
+});
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
