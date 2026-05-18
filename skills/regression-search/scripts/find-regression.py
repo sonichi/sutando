@@ -18,7 +18,14 @@ import re
 import sys
 from pathlib import Path
 
-CALLS_FILE = Path(__file__).resolve().parent.parent.parent.parent / "results" / "calls" / "calls.jsonl"
+# results/calls/ is per-user runtime state — lives under $SUTANDO_WORKSPACE.
+# Pre-fix this resolved to <repo>/results/calls/calls.jsonl which doesn't
+# exist post-#762, so every `find-regression "..."` query silently returned
+# "calls file not found" instead of scanning real call history.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "src"))
+from workspace_default import resolve_workspace  # noqa: E402
+
+CALLS_FILE = resolve_workspace() / "results" / "calls" / "calls.jsonl"
 
 # (label, regex) pairs — label is what shows up in the reasons column
 REFUSAL_PATTERNS = [

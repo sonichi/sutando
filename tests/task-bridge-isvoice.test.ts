@@ -2,7 +2,7 @@ import { describe, it, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFileSync, existsSync, unlinkSync, mkdirSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { resolveWorkspace } from '../src/workspace_default.js';
 import { _isVoiceTask } from '../src/task-bridge.js';
 
 // Regression for the archive-path drift bug flagged by VasiliyRad 2026-05-06:
@@ -15,8 +15,9 @@ import { _isVoiceTask } from '../src/task-bridge.js';
 // archive lookup all surface a voice task; non-voice content stays false; missing
 // task files stay false.
 
-const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
-const TASK_DIR = join(REPO_ROOT, 'tasks');
+// Task dir is wherever the bridge looks — `resolveWorkspace()/tasks/`. Was
+// `<REPO_ROOT>/tasks/` pre-#821, when the bridge fell back to repo root.
+const TASK_DIR = join(resolveWorkspace(), 'tasks');
 const ARCHIVE_DIR = join(TASK_DIR, 'archive');
 
 const VOICE_BODY = `id: task-isvoice-test-aaa
