@@ -31,8 +31,17 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
-RESULTS = REPO / "results"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from workspace_default import resolve_workspace  # noqa: E402
+
+# results/ is per-user runtime state — lives under $SUTANDO_WORKSPACE
+# (default ~/.sutando/workspace/), not the repo checkout. Pre-#762 this
+# resolved to <repo>/results/ which doesn't exist post-migration; the
+# archiver silently no-op'd because `if not RESULTS.is_dir()` short-circuits
+# the whole sweep. The DM-flood prevention this script was built for was
+# defeated until this fix.
+WORKSPACE = resolve_workspace()
+RESULTS = WORKSPACE / "results"
 
 RETENTION_HOURS = int(os.environ.get("RETENTION_HOURS", "24"))
 # Case-insensitive compare — without `.lower()`, `DRY_RUN=No` or `DRY_RUN=FALSE`

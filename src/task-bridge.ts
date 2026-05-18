@@ -12,8 +12,9 @@ import { writeFileSync, readFileSync, existsSync, unlinkSync, mkdirSync, readdir
 import { join } from 'node:path';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
+import { resolveWorkspace } from './workspace_default.js';
 
-const REPO_DIR = process.env.SUTANDO_WORKSPACE || new URL('..', import.meta.url).pathname.replace(/\/$/, '');
+const REPO_DIR = resolveWorkspace();
 const TASK_DIR = join(REPO_DIR, 'tasks');
 const RESULT_DIR = join(REPO_DIR, 'results');
 const STATE_DIR = join(REPO_DIR, 'state');
