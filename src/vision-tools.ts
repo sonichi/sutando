@@ -240,18 +240,20 @@ export function startStreaming(
 			startedAt = Date.now();
 			console.log(`${ts()} [Vision] started ${lower} (push mode)`);
 			// Tell the model push just started so it can briefly acknowledge
-			// on its next turn ("I can see your screen now") AND offer guided
-			// help — without this, share-then-silence forces the user to know
-			// the activation phrases for screen-companion modes. The single-
-			// line nudge is mode-agnostic: if they describe a goal, the model
-			// routes to `activate_screen_companion` for any matching config.
+			// on its next turn AND surface the screen-companion catalog by
+			// name — without this, the user shares their screen and has no
+			// signal that pre-built companion modes (guided-setup etc.)
+			// exist. Per owner spec 2026-05-17 17:30 PT: keep it to one
+			// line BUT explicitly mention "screen-companion mode" and the
+			// available config name(s); Gemini already knows the live
+			// catalog from `activate_screen_companion`'s tool description.
 			// Symmetric to the stop-side cache-clear injection in stopStream().
 			const transport = sessionRef?.transport;
 			if (transport && typeof transport.sendContent === 'function') {
 				try {
 					transport.sendContent([{
 						role: 'user',
-						text: `[system note] User just started sharing their screen via the Watch button (source='${lower}'). Frames are now flowing live. On your next turn, briefly acknowledge that you can see their shared screen AND ask if they want guided help — e.g. "I can see your screen now. Want me to help you through something?" Keep it to one line. If they describe a goal that fits a screen-companion mode (any pre-built config — a UI they don't know yet, a paper to read with them, code to review together, etc.), call \`activate_screen_companion\` with the matching mode + goal. If their goal does not match a configured mode, just operate normally with screen awareness. Do not describe the screen in detail unless the user asks.`,
+						text: `[system note] User just started sharing their screen via the Watch button (source='${lower}'). Frames are now flowing live. On your next turn, deliver ONE sentence that does ALL of these: (1) acknowledge you can see their screen, (2) explicitly name "screen-companion mode" as available, (3) name the available companion configs by name (you know them from the \`activate_screen_companion\` tool description — e.g. "guided-setup" for stepping through an unfamiliar UI), (4) ask what they're trying to do. Example shape: "I can see your screen — screen-companion mode is available with guided-setup for UI walkthroughs. What are you trying to do?" If they describe a goal that fits a configured mode, call \`activate_screen_companion\` with the matching mode + goal. If their goal does not match any configured mode, just operate normally with screen awareness. Do not describe the screen in detail unless the user asks.`,
 					}], false);
 					console.log(`${ts()} [Vision] injected screen-share-started context hint`);
 				} catch (err) {
