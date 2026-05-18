@@ -1754,16 +1754,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
               let tsv = o["ts"] as? Double, tsv > pointerLastTS,
               let nx = o["nx"] as? Double, let ny = o["ny"] as? Double else { return }
         pointerLastTS = tsv
-        guard let screen = NSScreen.main else { return }
+        let lbl = o["label"] as? String ?? ""
+        guard let screen = NSScreen.main else {
+            logToFile("pollPointerCmd: accepted ts=\(tsv) nx=\(nx) ny=\(ny) label='\(lbl)' but NSScreen.main is nil — cannot fly")
+            return
+        }
         let f = screen.frame
         // nx,ny = fraction of the main display, top-left origin → AppKit bottom-left.
-        let target = CGPoint(x: CGFloat(nx) * f.width, y: f.height - CGFloat(ny) * f.height)
-        flyPointer(to: target, label: o["label"] as? String ?? "")
+        let raw = CGPoint(x: CGFloat(nx) * f.width, y: f.height - CGFloat(ny) * f.height)
+        // Clicky's "sit beside the element, not on top of it" offset: 8px right,
+        // 12px below (below = smaller y in our bottom-left space). Clamp 20px in.
+        let target = CGPoint(
+            x: min(max(raw.x + 8, 20), f.width - 20),
+            y: min(max(raw.y - 12, 20), f.height - 20))
+        logToFile("pollPointerCmd: accepted ts=\(tsv) nx=\(nx) ny=\(ny) label='\(lbl)' raw=(\(Int(raw.x)),\(Int(raw.y))) → target=(\(Int(target.x)),\(Int(target.y))) on \(Int(f.width))x\(Int(f.height))")
+        flyPointer(to: target, label: lbl)
     }
 
     /// Clicky-style quadratic-bezier flight: smoothstep easing, slight arc
-    /// lift, triangle rotated tangent to travel; beep + held pulsing halo on
-    /// arrival. Math ported verbatim from the proven tracer overlay.
+    /// lift, triangle rotated tangent to travel + mid-flight scale swoop;
+    /// beep + settle into the -35° cursor pose on arrival.
     func flyPointer(to dst: CGPoint, label: String) {
         // Cancel every timer from a prior point_at — a stale hold/pulse/fade
         // would otherwise keep mutating halo/alpha/showLabel and hide the new
@@ -1772,7 +1782,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         pointerPulseTimer?.invalidate(); pointerPulseTimer = nil
         pointerHoldTimer?.invalidate(); pointerHoldTimer = nil
         pointerFadeTimer?.invalidate(); pointerFadeTimer = nil
-        pointerView.halo = 0
+        pointerView.scale = 1
         pointerView.alpha = 0
         pointerView.showLabel = false
         pointerView.label = label
@@ -1784,6 +1794,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let frames = max(Int(dur * 60), 1)
         var i = 0
         pointerView.alpha = 1
+        logToFile("flyPointer: START from (\(Int(start.x)),\(Int(start.y))) → (\(Int(dst.x)),\(Int(dst.y))) frames=\(frames) dur=\(String(format: "%.2f", dur)) winVisible=\(pointerWindow?.isVisible ?? false) level=\(pointerWindow?.level.rawValue ?? -999)")
         pointerAnim = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] t in
             guard let self = self else { t.invalidate(); return }
             i += 1
@@ -1796,30 +1807,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let ty = 2*mt*(ctrl.y - start.y) + 2*u*(dst.y - ctrl.y)
             self.pointerView.pos = CGPoint(x: bx, y: by)
             self.pointerView.angle = atan2(ty, tx) - .pi / 2
+            self.pointerView.scale = 1 + 0.3 * CGFloat(sin(.pi * u))   // Clicky swoop, peaks ~1.3 mid-flight
             self.pointerView.needsDisplay = true
             if i >= frames {
                 t.invalidate()
-                self.pointerView.angle = 0
+                self.pointerView.angle = PointerOverlayView.restAngle   // settle into cursor pose
+                self.pointerView.scale = 1
                 self.pointerView.showLabel = true
                 self.pointerView.needsDisplay = true
+                self.logToFile("flyPointer: ARRIVED at (\(Int(dst.x)),\(Int(dst.y))) — holding 8s, winVisible=\(self.pointerWindow?.isVisible ?? false)")
                 NSSound.beep()
                 self.holdPointer()
             }
         }
     }
 
-    /// Pulse a halo ring for 8s at the Target, then fade the marker out.
+    /// Hold the cursor-pose marker steadily on the target for 8s (Clicky just
+    /// sits at rest — no pulsing ring), then fade out over ~0.7s.
     func holdPointer() {
-        var phase = 0.0
-        pointerPulseTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
-            phase += 0.07
-            self.pointerView.halo = 26 + 12 * CGFloat(abs(sin(phase)))   // 26–38 px breathing ring
-            self.pointerView.needsDisplay = true
-        }
         pointerHoldTimer = Timer.scheduledTimer(withTimeInterval: 8.0, repeats: false) { [weak self] _ in
             guard let self = self else { return }
-            self.pointerPulseTimer?.invalidate(); self.pointerPulseTimer = nil
             var a: CGFloat = 1
             self.pointerFadeTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] t in
                 guard let self = self else { t.invalidate(); return }
@@ -1830,7 +1837,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     t.invalidate()
                     self.pointerFadeTimer = nil
                     self.pointerView.showLabel = false
-                    self.pointerView.halo = 0
                 }
             }
         }
@@ -2009,17 +2015,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
 // MARK: - Pointer Teacher overlay view
 
-/// Renders the Clicky-style flying triangle + pulsing halo + label bubble.
+/// Renders the Clicky-style cursor triangle (soft blue glow, no halo) + label.
 /// Pure view — the flight is driven by AppDelegate. Ported verbatim from
 /// pointer-teacher-tracer/pointer-overlay.swift (proven by the grill POCs).
 final class PointerOverlayView: NSView {
     static let blue = NSColor(calibratedRed: 0.20, green: 0.62, blue: 1.0, alpha: 1.0)
-    var pos = CGPoint.zero          // current triangle position (view coords, bottom-left)
-    var angle: CGFloat = 0          // radians; 0 = tip up
+    // Clicky-faithful pointer. Small cursor-like triangle, NO halo ring (Clicky
+    // has none — just a soft blue glow). Resting pose is a -35° tilt so it reads
+    // as a pointer, not a fat upward triangle. The centroid sits at `pos`, which
+    // pollPointerCmd offsets +8px right / +12px below the real element so the
+    // marker points *beside* the target instead of covering it.
+    static let triSize: CGFloat = 18                 // Clicky uses 16; 18 for retina legibility
+    static let restAngle: CGFloat = 35 * .pi / 180   // cursor-like tilt at rest
+    var pos = CGPoint.zero          // triangle centroid (view coords, bottom-left)
+    var angle: CGFloat = restAngle  // radians; restAngle = cursor pose
+    var scale: CGFloat = 1          // flight "swoop" (peaks ~1.3 at mid-flight)
     var label = ""
     var showLabel = false
     var alpha: CGFloat = 0          // overall opacity 0..1 (0 = idle/invisible)
-    var halo: CGFloat = 0           // pulsing ring radius (0 = off)
 
     override var isFlipped: Bool { false }
     override func hitTest(_ p: NSPoint) -> NSView? { nil }   // never capture input
@@ -2030,43 +2043,44 @@ final class PointerOverlayView: NSView {
         ctx.setAlpha(alpha)
         let blue = PointerOverlayView.blue
 
-        // pulsing halo ring around the Target (very visible)
-        if halo > 0 {
-            ctx.saveGState()
-            ctx.setStrokeColor(blue.withAlphaComponent(0.8).cgColor)
-            ctx.setLineWidth(4)
-            ctx.setShadow(offset: .zero, blur: 16, color: blue.cgColor)
-            ctx.strokeEllipse(in: CGRect(x: pos.x - halo, y: pos.y - halo,
-                                         width: halo * 2, height: halo * 2))
-            ctx.restoreGState()
-        }
-
-        // triangle (equilateral, tip along `angle`)
-        let s: CGFloat = 44, h = s * sqrt(3) / 2
+        // Cursor-like triangle (Clicky vertex ratios), centroid at origin,
+        // rotated by `angle`, scaled by `scale`. Soft blue glow grows with the
+        // flight scale — no stroked halo ring.
+        let s = PointerOverlayView.triSize, h = s * sqrt(3) / 2
         ctx.saveGState()
         ctx.translateBy(x: pos.x, y: pos.y)
         ctx.rotate(by: angle)
+        ctx.scaleBy(x: scale, y: scale)
         let p = CGMutablePath()
-        p.move(to: CGPoint(x: 0, y: h * 0.66))
-        p.addLine(to: CGPoint(x: -s / 2, y: -h * 0.34))
-        p.addLine(to: CGPoint(x: s / 2, y: -h * 0.34))
+        p.move(to: CGPoint(x: 0, y: h / 1.5))           // tip
+        p.addLine(to: CGPoint(x: -s / 2, y: -h / 3))    // back-left
+        p.addLine(to: CGPoint(x: s / 2, y: -h / 3))     // back-right
         p.closeSubpath()
         ctx.addPath(p)
+        ctx.setShadow(offset: .zero, blur: 8 + (scale - 1.0) * 16,
+                      color: blue.withAlphaComponent(0.9).cgColor)
         ctx.setFillColor(blue.cgColor)
-        ctx.setShadow(offset: .zero, blur: 12, color: blue.withAlphaComponent(0.9).cgColor)
         ctx.fillPath()
+        // hairline white edge so it stays legible on dark and light UIs
+        ctx.addPath(p)
+        ctx.setShadow(offset: .zero, blur: 0, color: NSColor.clear.cgColor)
+        ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.9).cgColor)
+        ctx.setLineWidth(1.0 / max(scale, 0.01))
+        ctx.setLineJoin(.round)
+        ctx.strokePath()
         ctx.restoreGState()
 
-        // label bubble
+        // Small label, offset clear of the element (up-right of the marker) so
+        // it never covers what the pointer indicates.
         if showLabel, !label.isEmpty {
             let attrs: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: 16, weight: .semibold),
+                .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
                 .foregroundColor: NSColor.white]
             let sz = (label as NSString).size(withAttributes: attrs)
-            let pad: CGFloat = 8
-            let box = NSRect(x: pos.x + 18, y: pos.y + 8,
+            let pad: CGFloat = 6
+            let box = NSRect(x: pos.x + 16, y: pos.y + 14,
                              width: sz.width + pad * 2, height: sz.height + pad)
-            let rp = NSBezierPath(roundedRect: box, xRadius: 7, yRadius: 7)
+            let rp = NSBezierPath(roundedRect: box, xRadius: 6, yRadius: 6)
             blue.setFill(); rp.fill()
             (label as NSString).draw(at: NSPoint(x: box.minX + pad, y: box.minY + pad / 2),
                                      withAttributes: attrs)
