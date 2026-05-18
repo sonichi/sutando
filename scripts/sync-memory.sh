@@ -17,7 +17,12 @@
 #
 # Env vars (all optional except SUTANDO_MEMORY_REPO):
 #   SUTANDO_MEMORY_REPO     — git URL of your private memory repo (REQUIRED)
-#   SUTANDO_WORKSPACE       — public sutando checkout. Default: ~/Desktop/sutando
+#   SUTANDO_REPO_DIR        — public sutando checkout. Default: ~/Desktop/sutando
+#                             (legacy alias: SUTANDO_WORKSPACE — still honored
+#                             but deprecated; CLAUDE.md reserves SUTANDO_WORKSPACE
+#                             for the workspace dir per the workspace contract.)
+#   SUTANDO_WORKSPACE       — local workspace dir (per CLAUDE.md workspace
+#                             contract). Default: ~/.sutando/workspace
 #   SUTANDO_MEMORY_SYNC_DIR — local clone path. Default: ~/.sutando/memory-sync
 #                             (was ~/.sutando-memory-sync before #762's
 #                             companion PR; one-time auto-migration below)
@@ -75,9 +80,16 @@ elif [ "$(basename "$SCRIPT_PARENT")" = ".sutando-memory-sync" ]; then
 else
     SYNC_DIR="$__NEW_DEFAULT"
 fi
-REPO_DIR="${SUTANDO_WORKSPACE:-$HOME/Desktop/sutando}"
+# Public-repo path: prefer canonical SUTANDO_REPO_DIR; fall back to the legacy
+# SUTANDO_WORKSPACE alias (pre-2026-05-18 hosts used this name; CLAUDE.md now
+# reserves SUTANDO_WORKSPACE for the per-user workspace dir).
+REPO_DIR="${SUTANDO_REPO_DIR:-${SUTANDO_WORKSPACE:-$HOME/Desktop/sutando}}"
+if [ -z "${SUTANDO_REPO_DIR:-}" ] && [ -n "${SUTANDO_WORKSPACE:-}" ] && [ -d "$REPO_DIR/.git" ]; then
+    # Legacy SUTANDO_WORKSPACE-as-repo-path detected. Log a one-time hint.
+    echo "sync-memory: NOTE — using legacy SUTANDO_WORKSPACE='$SUTANDO_WORKSPACE' as the public-repo path. Please rename to SUTANDO_REPO_DIR in your .env; SUTANDO_WORKSPACE is reserved for the workspace dir per CLAUDE.md." >&2
+fi
 if [ ! -d "$REPO_DIR" ]; then
-    echo "sync-memory: workspace not found at $REPO_DIR; set SUTANDO_WORKSPACE or clone sutando to ~/Desktop/sutando." >&2
+    echo "sync-memory: public repo not found at $REPO_DIR; set SUTANDO_REPO_DIR or clone sutando to ~/Desktop/sutando." >&2
     exit 0
 fi
 MEMORY_DIR="$HOME/.claude/projects/$(echo "$REPO_DIR" | sed 's|/|-|g')/memory"
@@ -139,7 +151,15 @@ fi
 #
 # The same convention is documented in this script's pre-2026-05-11 history
 # ("notes/ bidirectional rsync removed: both nodes now symlink").
-WS_DIR="${SUTANDO_WORKSPACE_DIR:-$HOME/.sutando/workspace}"
+WS_DIR="${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}"
+# Disambiguation guard: if a host has SUTANDO_WORKSPACE pointing at a public-repo
+# checkout (legacy semantic), the symlink-bootstrap below would point at
+# `<repo>/notes` not the workspace `notes/`. Detect via `.git` presence + skip.
+if [ -d "$WS_DIR/.git" ]; then
+    log "skipping workspace-symlink bootstrap: SUTANDO_WORKSPACE='$WS_DIR' looks like a public-repo checkout, not a workspace. Set SUTANDO_WORKSPACE=$HOME/.sutando/workspace per CLAUDE.md and re-run."
+    WS_DIR=""
+fi
+if [ -n "$WS_DIR" ]; then
 mkdir -p "$WS_DIR"
 for pair in "notes:notes"; do
     src="$WS_DIR/${pair%%:*}"
@@ -172,6 +192,7 @@ for pair in "notes:notes"; do
         fi
     fi
 done
+fi  # WS_DIR symlink-bootstrap guard
 
 cd "$SYNC_DIR" || { log "Failed to cd $SYNC_DIR"; exit 1; }
 
