@@ -702,9 +702,12 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 		return otherVariantsLc.some(v => lc.includes(v));
 	};
 	// Sticky "last-addressed-was-me" so the owner doesn't have to re-name on
-	// every follow-up turn. Starts false (requires explicit address first turn);
-	// flips true on my-name, false on other-name, unchanged on no-name.
-	let lastAddressedToMe = false;
+	// every follow-up turn. flips true on my-name, false on other-name,
+	// unchanged on no-name. Initial value: true if SUTANDO_PRIMARY=true is set
+	// (this instance is the default responder; un-named cold openers route
+	// here), otherwise false (require explicit address on first turn — avoids
+	// double-response on cold openers when multiple instances share a channel).
+	let lastAddressedToMe = process.env.SUTANDO_PRIMARY === 'true';
 	let turnDecision: 'pending' | 'allow' | 'drop' = 'pending';
 	let pendingAudio: Buffer[] = [];
 	const resetTurnGate = () => {
