@@ -795,6 +795,14 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 				if (before !== responseAllowed || haveMyName || haveOtherName) {
 					console.log(`${ts()} [NameGate] ${responseAllowed ? 'allow' : 'drop'} (user: "${userText.slice(0, 60)}")`);
 				}
+				// If we just flipped from allow → drop, KILL any in-flight audio
+				// (Gemini was speaking; cut it off mid-word so user doesn't hear
+				// a leak from chunks that arrived BEFORE this decision).
+				if (before === true && responseAllowed === false) {
+					audioOutQueue.length = 0;
+					try { player.stop(true); } catch {}
+					console.log(`${ts()} [NameGate] cut off in-flight audio (flipped to drop)`);
+				}
 			}, 50);
 		}
 
