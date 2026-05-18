@@ -693,14 +693,31 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 		.filter(Boolean).map(n => n.toLowerCase());
 	const otherVariantsLc = [...OTHER_INSTANCES, ...OTHER_INSTANCE_ALIASES]
 		.map(n => n.toLowerCase());
-	const transcriptContainsName = (text: string): boolean => {
+	// Detect addressing intent — not just substring presence. A name counts
+	// as "addressed" only if it appears in one of these forms (per sentence):
+	//   - "Hi/Hey/Hello/Yo NAME" or "Hi NAME, ..."
+	//   - "NAME," or "NAME?" at the start of a sentence (e.g. "Lucy, can you...")
+	//   - "NAME" followed by an imperative/auxiliary verb at sentence start
+	// Mere mentions like "thanks Lucy" or "Lucy's answer" do NOT count.
+	const isAddressedBy = (text: string, names: string[]): boolean => {
 		const lc = text.toLowerCase();
-		return nameVariants.some(v => lc.includes(v));
+		const sentences = lc.split(/[.!?]+\s*/).map(s => s.trim()).filter(Boolean);
+		const ADDRESS_VERBS = '(can|are|is|will|could|should|please|do|did|tell|answer|design|write|read|check|look|help|stop|start|leave|join)';
+		for (const s of sentences) {
+			for (const n of names) {
+				// "hi/hey/hello/yo NAME" or "NAME," / "NAME?" / "NAME VERB"
+				const greet = new RegExp(`^(hi|hey|hello|yo|okay|ok)\\s+${n}\\b`, 'i');
+				const tagged = new RegExp(`^${n}\\s*[,?]`, 'i');
+				const verbed = new RegExp(`^${n}\\s+${ADDRESS_VERBS}\\b`, 'i');
+				if (greet.test(s) || tagged.test(s) || verbed.test(s)) return true;
+			}
+		}
+		return false;
 	};
-	const transcriptContainsOther = (text: string): boolean => {
-		const lc = text.toLowerCase();
-		return otherVariantsLc.some(v => lc.includes(v));
-	};
+	const transcriptContainsName = (text: string): boolean =>
+		isAddressedBy(text, nameVariants);
+	const transcriptContainsOther = (text: string): boolean =>
+		isAddressedBy(text, otherVariantsLc);
 	// Sticky "last-addressed-was-me" so the owner doesn't have to re-name on
 	// every follow-up turn. flips true on my-name, false on other-name,
 	// unchanged on no-name. Initial value: true if SUTANDO_PRIMARY=true is set
