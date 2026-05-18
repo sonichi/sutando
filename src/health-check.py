@@ -29,6 +29,17 @@ from typing import Optional
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 from util_paths import shared_personal_path  # noqa: E402
+from workspace_default import resolve_workspace  # noqa: E402
+
+# Workspace = runtime-state root (tasks/, results/, state/). REPO_DIR stays the
+# source-code root (src/, skills/, logs/, .env, build_log.md). Before PR #762's
+# resolver existed, every consumer hardcoded REPO_DIR / "tasks" — so when the
+# owner set $SUTANDO_WORKSPACE to a non-repo location, health-check kept
+# writing alerts to <repo>/tasks/ while the watcher was reading from
+# $SUTANDO_WORKSPACE/tasks/. Three task-health alerts on 2026-05-16 landed in
+# the wrong dir before this fix; same drift class as src/watch-tasks-stream.sh
+# pre-#736 and skills/self-diagnose pre-#769.
+WORKSPACE_DIR = resolve_workspace()
 
 def _default_memory_dir() -> str:
     """Auto-detect Claude Code memory dir from repo path."""
@@ -104,9 +115,18 @@ def check_memory_sync() -> dict:
                 break
     if not repo_url:
         return {"name": name, "status": "warn", "detail": "SUTANDO_MEMORY_REPO not set — cross-machine sync disabled"}
-    sync_dir = Path.home() / ".sutando-memory-sync"
-    if not sync_dir.exists():
-        return {"name": name, "status": "warn", "detail": "repo configured but never synced — run bash ~/.sutando-memory-sync/scripts/sync-memory.sh"}
+    # Memory-sync clone dir: PR #764 renamed legacy ~/.sutando-memory-sync/
+    # → ~/.sutando/memory-sync/. Check new path first; fall back to legacy
+    # for installs that haven't migrated yet (sync-memory.sh auto-migrates
+    # on next run when env is unset).
+    sync_dir_new = Path.home() / ".sutando" / "memory-sync"
+    sync_dir_legacy = Path.home() / ".sutando-memory-sync"
+    if sync_dir_new.exists():
+        sync_dir = sync_dir_new
+    elif sync_dir_legacy.exists():
+        sync_dir = sync_dir_legacy
+    else:
+        return {"name": name, "status": "warn", "detail": "repo configured but never synced — run bash scripts/sync-memory.sh"}
     git_dir = sync_dir / ".git" / "FETCH_HEAD"
     if git_dir.exists():
         age_h = (time.time() - git_dir.stat().st_mtime) / 3600
@@ -610,7 +630,7 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> 
     alert.
     """
     name = "task-queue"
-    tasks_dir = REPO_DIR / "tasks"
+    tasks_dir = WORKSPACE_DIR / "tasks"
     if not tasks_dir.exists():
         return {"name": name, "status": "ok", "detail": "tasks/ not yet created"}
     # *.txt at the top level only — archive lives in tasks/archive/<YYYY-MM>/
@@ -922,11 +942,10 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
         return
 
     if state_file is None or tasks_dir is None:
-        REPO = Path(__file__).resolve().parent.parent
         if state_file is None:
-            state_file = REPO / "state" / "health-last-alerted.json"
+            state_file = WORKSPACE_DIR / "state" / "health-last-alerted.json"
         if tasks_dir is None:
-            tasks_dir = REPO / "tasks"
+            tasks_dir = WORKSPACE_DIR / "tasks"
     tasks_dir.mkdir(parents=True, exist_ok=True)
     state_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1001,7 +1020,7 @@ def notify_for_failures(
         return
 
     if state_file is None:
-        state_file = REPO_DIR / "state" / "health-last-notified.json"
+        state_file = WORKSPACE_DIR / "state" / "health-last-notified.json"
     state_file.parent.mkdir(parents=True, exist_ok=True)
 
     set_key = "|".join(sorted(c["name"] for c in failures))

@@ -159,11 +159,46 @@ def presenter_mode_active():
 # Load access config
 ACCESS_FILE = Path.home() / ".claude" / "channels" / "telegram" / "access.json"
 def load_allowed():
+    """Return the set of allowed sender IDs, OR None if access.json doesn't exist.
+
+    The None vs empty-set distinction matters for trust-on-first-use (TOFU)
+    auto-onboarding: "file missing" → the bridge has never been configured,
+    so the first DM should auto-onboard the sender as the owner. "File exists
+    but empty allowFrom" → the admin explicitly locked it down; never TOFU.
+    """
     try:
         data = json.loads(ACCESS_FILE.read_text())
         return set(data.get("allowFrom", []))
-    except:
+    except FileNotFoundError:
+        return None
+    except Exception:
         return set()
+
+
+def tofu_onboard(sender_id, username):
+    """First-time auto-onboard: write access.json with this sender as owner.
+
+    Triggered when access.json doesn't exist (i.e., the bridge has never been
+    configured for any user) AND a DM arrives. The expected flow is: user
+    rotates a token, starts the bridge, sends "hi" to their own bot, and
+    Sutando auto-trusts that first DM as coming from them. Subsequent senders
+    will be rejected as non-allowed and need explicit `/telegram:access allow`.
+
+    Logs the onboarding so the act is visible. Safe-by-default: if the file
+    already exists at write time (race with manual config), we don't clobber.
+    """
+    if ACCESS_FILE.exists():  # race-safety: someone else wrote it first
+        return load_allowed() or set()
+    ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "allowFrom": [sender_id],
+        "tofuOwner": sender_id,
+        "tofuOnboardedAt": int(time.time()),
+        "tofuOnboardedUsername": username or None,
+    }
+    ACCESS_FILE.write_text(json.dumps(payload, indent=2) + "\n")
+    print(f"  TOFU: auto-onboarded @{username} (id={sender_id}) as owner — wrote {ACCESS_FILE}")
+    return {sender_id}
 
 def api(method, **params):
     url = f"https://api.telegram.org/bot{TOKEN}/{method}"
@@ -310,6 +345,10 @@ def main():
 
                 # Reload access list periodically
                 allowed = load_allowed()
+                if allowed is None:
+                    # First-ever DM after install — access.json doesn't exist.
+                    # Auto-onboard this sender as the owner (TOFU).
+                    allowed = tofu_onboard(sender_id, username)
                 if sender_id not in allowed:
                     print(f"  Dropped message from non-allowed @{username}")
                     continue

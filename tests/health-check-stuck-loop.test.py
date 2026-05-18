@@ -158,20 +158,22 @@ def case_f_running_no_ts() -> list[str]:
 # ---------------------------------------------------------------------------
 
 def with_tasks_override(setup_fn):
-    """Run check_task_queue against a temp REPO_DIR/tasks. setup_fn(tasks_dir)
-    populates the queue."""
+    """Run check_task_queue against a temp WORKSPACE_DIR/tasks. setup_fn(tasks_dir)
+    populates the queue. (Was REPO_DIR pre-#762; check_task_queue now resolves
+    against the workspace because that's where the watcher reads from — see
+    health-check.py top-of-file comment for the drift class.)"""
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         tasks_dir = td / "tasks"
         if setup_fn is not None:
             tasks_dir.mkdir(parents=True, exist_ok=True)
             setup_fn(tasks_dir)
-        orig = hc.REPO_DIR
+        orig = hc.WORKSPACE_DIR
         try:
-            hc.REPO_DIR = td
+            hc.WORKSPACE_DIR = td
             return hc.check_task_queue(threshold_count=3, threshold_age_sec=300)
         finally:
-            hc.REPO_DIR = orig
+            hc.WORKSPACE_DIR = orig
 
 
 def case_g_no_tasks_dir() -> list[str]:
@@ -322,12 +324,12 @@ def case_q_separate_state_from_emit() -> list[str]:
     fails = []
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
-        orig = hc.REPO_DIR
+        orig = hc.WORKSPACE_DIR
         try:
-            hc.REPO_DIR = td
+            hc.WORKSPACE_DIR = td
             hc.notify_for_failures(make_checks(("down", "svc")), notify_cmd=["true"])
         finally:
-            hc.REPO_DIR = orig
+            hc.WORKSPACE_DIR = orig
         notified = td / "state" / "health-last-notified.json"
         alerted = td / "state" / "health-last-alerted.json"
         if not notified.exists():

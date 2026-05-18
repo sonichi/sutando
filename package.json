@@ -12,11 +12,15 @@
   "dependencies": {
     "@ai-sdk/google": "^1.2.0",
     "@anthropic-ai/claude-agent-sdk": "^0.1.0",
+    "@discordjs/opus": "^0.10.0",
+    "@discordjs/voice": "^0.19.2",
     "@google/genai": "^1.49.0",
     "@types/ws": "^8.18.1",
     "ai": "^6.0.149",
     "bodhi-realtime-agent": "github:sonichi/bodhi_realtime_agent#ffec0cd",
+    "discord.js": "^14.26.4",
     "dotenv": "^17.4.1",
+    "libsodium-wrappers": "^0.8.4",
     "playwright": "^1.58.2",
     "ws": "^8.20.0",
     "zod": "^3.24.0"
