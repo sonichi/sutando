@@ -16,7 +16,9 @@
  *                          Falls back to GEMINI_API_KEY. Useful for isolating voice
  *                          (free-tier eligible) from paid-tier spend on a single key.
  *   ANTHROPIC_API_KEY   — Optional: only needed if not using claude CLI subscription auth
- *   WORKSPACE_DIR       — Claude's working directory (default: sutando/)
+ *   SUTANDO_WORKSPACE   — Per-user workspace dir (default: ~/.sutando/workspace/).
+ *                          Stores tasks/, results/, state/, logs/, conversation.log.
+ *                          See workspace_default.ts (#821) for the canonical resolver.
  *   PORT                — WebSocket port (default: 9900)
  *   HOST                — Bind address (default: 0.0.0.0)
  */
@@ -93,14 +95,23 @@ if (process.env.GEMINI_VOICE_API_KEY) {
 
 const PORT = Number(process.env.PORT) || 9900;
 const HOST = process.env.HOST || '0.0.0.0';
-// Default to sutando/ so Claude Code subprocess picks up CLAUDE.md automatically
-const WORKSPACE_DIR = process.env.WORKSPACE_DIR || new URL('..', import.meta.url).pathname;
+// Per-user runtime state lives under $SUTANDO_WORKSPACE (default
+// ~/.sutando/workspace/), not the repo checkout. Pre-#762 voice-agent
+// resolved its tasks/results/state against the repo path via the legacy
+// `WORKSPACE_DIR` env name + `import.meta.url`-relative fallback; post-#762
+// the canonical workspace lives elsewhere. resolveWorkspace() is the TS
+// twin of resolve_workspace() introduced in #821. Also remove the prior
+// "default to sutando/ so Claude Code subprocess picks up CLAUDE.md" comment
+// — voice-agent no longer spawns Claude Code (task-bridge handles that via
+// the file pipeline); the dual-use rationale is obsolete.
+import { resolveWorkspace } from './workspace_default.js';
+const WORKSPACE_DIR = resolveWorkspace();
 const PIDFILE = join(WORKSPACE_DIR, '.voice-agent.pid');
 const DEFAULT_THREAD_KEY = 'sutando_main';
 const SESSION_ID = `session_${Date.now()}`;
 const PHONE_PORT = Number(process.env.PHONE_PORT) || 3100;
 const PHONE_SERVER_URL = `http://localhost:${PHONE_PORT}`;
-const CALL_RESULTS_DIR = join(new URL('.', import.meta.url).pathname, '..', 'results', 'calls');
+const CALL_RESULTS_DIR = join(WORKSPACE_DIR, 'results', 'calls');
 
 /** Single-instance lock for this workspace.
  *
