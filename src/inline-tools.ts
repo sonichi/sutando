@@ -620,8 +620,12 @@ export const getCoreStatusTool: ToolDefinition = {
 	execution: 'inline',
 	async execute() {
 		try {
-			const repoDir = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
-			const statusPath = join(repoDir, 'core-status.json');
+			// core-status.json is per-user runtime state at $SUTANDO_WORKSPACE
+			// (default ~/.sutando/workspace/). Pre-fix this read from REPO_ROOT
+			// via import.meta.url-relative path — but Python writers migrated
+			// to WORKSPACE_DIR in #836, so the TS reader silently saw stale or
+			// missing data. Same workspace-contract fix as #821/#842/#843.
+			const statusPath = join(WORKSPACE_DIR, 'core-status.json');
 			if (!existsSync(statusPath)) {
 				return { status: 'idle', description: 'Core agent is not currently running.' };
 			}

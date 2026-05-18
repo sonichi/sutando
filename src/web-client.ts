@@ -3104,13 +3104,18 @@ let _seeingUntil = 0;
 const CORE_STATUS_STALE_SECONDS = 60;
 function readCoreStatus(): { running: boolean; step: string; stale: boolean } {
 	try {
-		const url = new URL('../core-status.json', import.meta.url);
-		const raw = readFileSync(url, 'utf-8');
+		// core-status.json is per-user runtime state at $SUTANDO_WORKSPACE
+		// (default ~/.sutando/workspace/). Pre-fix this read from REPO_ROOT via
+		// import.meta.url-relative `../core-status.json` — but Python writers
+		// migrated to WORKSPACE_DIR in #836, so the TS reader silently saw stale
+		// or missing data. Same workspace-contract fix as #821/#842/#843.
+		const statusPath = join(WORKSPACE_DIR, 'core-status.json');
+		const raw = readFileSync(statusPath, 'utf-8');
 		const s = JSON.parse(raw) as { status?: string; ts?: number; step?: string };
 		const nowSec = Date.now() / 1000;
 		let stale = false;
 		try {
-			const mtimeSec = statSync(url).mtimeMs / 1000;
+			const mtimeSec = statSync(statusPath).mtimeMs / 1000;
 			if (nowSec - mtimeSec > CORE_STATUS_STALE_SECONDS) stale = true;
 		} catch { stale = true; }
 		// "Running with old ts" → loop likely crashed mid-pass, treat as stale.
