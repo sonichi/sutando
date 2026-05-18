@@ -73,6 +73,32 @@ const TASKS_DIR = join(WORKSPACE_DIR, 'tasks');
 const TASK_POLL_INTERVAL_MS = 500;
 const TASK_POLL_TIMEOUT_MS = 300_000;
 const OWNER_NAME = process.env.owner ?? '';
+// Optional instance name (e.g. "Lucy") — when set, the bot also answers to this name.
+// Lets the same OSS code respond to per-machine stand identities without recompiling.
+const INSTANCE_NAME = process.env.SUTANDO_INSTANCE_NAME ?? '';
+// Comma-separated stand names of other Sutando instances that may share the
+// same voice channel. Used by the system prompt so this instance knows when
+// to stay silent (someone else is being addressed).
+const OTHER_INSTANCES = (process.env.SUTANDO_OTHER_INSTANCES ?? '')
+	.split(',').map(s => s.trim()).filter(Boolean);
+// Comma-separated Discord user_ids whose audio should be FILTERED OUT entirely
+// (typically peer Sutando bots in the same channel). Prevents bot-to-bot
+// cross-chatter when multiple instances share a voice channel.
+const IGNORE_USER_IDS = new Set(
+	(process.env.SUTANDO_IGNORE_USER_IDS ?? '')
+		.split(',').map(s => s.trim()).filter(Boolean)
+);
+// Per-instance Gemini voice color so listeners can audio-distinguish
+// concurrent instances. Override via SUTANDO_VOICE_NAME; otherwise pick from
+// the known-instance map; otherwise fall back to Aoede.
+const INSTANCE_VOICE_MAP: Record<string, string> = {
+	Lucy: 'Aoede',
+	Mini: 'Charon',
+	Maddy: 'Puck',
+};
+const VOICE_NAME = process.env.SUTANDO_VOICE_NAME
+	?? INSTANCE_VOICE_MAP[INSTANCE_NAME]
+	?? 'Aoede';
 
 const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
 const VOICE_NATIVE_AUDIO_MODEL =
@@ -264,8 +290,21 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 			catch { return ''; }
 		})();
 		instructions = [
-			`You are Sutando, a personal AI assistant. You are in a Discord voice channel with your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''}.`,
-			'YOU are Sutando — the AI assistant. The person speaking is your OWNER, a human. Do NOT confuse yourself with them.',
+			`You are Sutando${INSTANCE_NAME ? ` (this instance is named ${INSTANCE_NAME})` : ''}, a personal AI assistant. You are in a Discord voice channel with your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''}.`,
+			`YOU are Sutando${INSTANCE_NAME ? ` / ${INSTANCE_NAME}` : ''} — the AI assistant. The owner may address you by either name; both refer to you. The person speaking is your OWNER, a human. Do NOT confuse yourself with them.`,
+			...(OTHER_INSTANCES.length > 0 ? [
+				`## Other Sutando instances`,
+				`Other Sutando instances may also be in this voice channel with their own stand names: ${OTHER_INSTANCES.join(', ')}. Those are DIFFERENT instances of Sutando running on different machines — NOT you.`,
+				`CRITICAL — when to stay silent:`,
+				`- If the owner addresses one of those other names (e.g. "${OTHER_INSTANCES[0]}, ...") — STAY SILENT. The other instance will respond.`,
+				`- If the owner says "Sutando" with no specific stand name AND you can hear another Sutando instance, STAY SILENT. Ambiguous — let the owner clarify.`,
+				`- If another Sutando instance is speaking spontaneously (not in direct response to a question YOU were asked) — STAY SILENT. Don't reply to their speech.`,
+				`CRITICAL — when to RESPOND:`,
+				`- The owner explicitly addresses you as "${INSTANCE_NAME}" by name.`,
+				`- You are the only Sutando instance present in the channel.`,
+				`- ANOTHER Sutando instance directly addresses YOU by your stand name "${INSTANCE_NAME}" (e.g. "${INSTANCE_NAME}, what do you think about X?"). This happens when the owner initiated a directed bot-to-bot dialog — engage normally, the owner is using you both to think out loud.`,
+				`When in doubt, do not speak. Bot-to-bot crosstalk that the owner did NOT initiate creates chaos.`,
+			] : []),
 			'You have full capabilities — use the work tool for anything: check the screen, send emails, look things up, make calls, browse the web, or check results of previous tasks.',
 			'',
 			'## How to think',
@@ -482,6 +521,10 @@ function startAudioTicker(s: DiscordVoiceSession): void {
 
 function subscribeUser(s: DiscordVoiceSession, userId: string): void {
 	if (s.subscribedUsers.has(userId)) return;
+	if (IGNORE_USER_IDS.has(userId)) {
+		// Peer bot or otherwise filtered — never pipe their audio to Gemini.
+		return;
+	}
 	s.subscribedUsers.add(userId);
 
 	const opusStream = s.connection.receiver.subscribe(userId, {
@@ -589,7 +632,7 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 		model: google(VOICE_MODEL),
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
 		googleSearch: true,
-		speechConfig: { voiceName: 'Aoede' },
+		speechConfig: { voiceName: VOICE_NAME },
 		hooks: {
 			onToolCall: (e) => {
 				console.log(`${ts()} [Tool] ${e.toolName} (${e.execution})`);
@@ -762,6 +805,20 @@ async function start(): Promise<void> {
 		process.exit(1);
 	}
 	console.log(`${ts()} [Setup] joining voice channel #${(channel as any).name} in guild ${guild.name}`);
+
+	// Per-instance guild nickname so Susan can tell Lucy vs Mini apart in the voice tile.
+	if (INSTANCE_NAME) {
+		try {
+			const me = await guild.members.fetchMe();
+			const desired = `Sutando (${INSTANCE_NAME})`;
+			if (me.nickname !== desired) {
+				await me.setNickname(desired);
+				console.log(`${ts()} [Setup] guild nickname set: ${desired}`);
+			}
+		} catch (e: any) {
+			console.warn(`${ts()} [Setup] nickname set failed (need Change Nickname perm?): ${e?.message ?? e}`);
+		}
+	}
 
 	const connection = joinVoiceChannel({
 		channelId: CHANNEL_ID!,
