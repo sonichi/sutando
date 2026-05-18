@@ -704,8 +704,9 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 		const lc = text.toLowerCase();
 		const ADDRESS_VERBS = '(can|could|will|would|please|tell|answer|design|write|read|check|look|help|stop|start|leave|join|log)';
 		for (const n of names) {
-			// "hi/hey/hello NAME" — greeting + name anywhere
-			const greet = new RegExp(`\\b(hi|hey|hello|yo|okay|ok)\\s+${n}\\b`, 'i');
+			// "hi/hey/hello NAME" — greeting + name anywhere; allow optional
+			// punctuation (",", "!", ":") between greeting and name ("Hi, Maddie")
+			const greet = new RegExp(`\\b(hi|hey|hello|yo|okay|ok)[,!:]?\\s+${n}\\b`, 'i');
 			// "NAME," — comma-tag (definite address marker)
 			const commaTag = new RegExp(`\\b${n}\\s*,`, 'i');
 			// "NAME VERB" — imperative form only at sentence start
