@@ -216,7 +216,7 @@ These unlock more capabilities. Add to `.env` when ready:
 |-------------|----------------|-------|
 | Gmail | Read/send/search email from voice | `gws auth setup --login` (OAuth, no app password) |
 | Twilio + ngrok | Phone calls, SMS, meeting dial-in, task delegation via phone | [twilio.com](https://www.twilio.com) + `brew install ngrok` (see [Running costs](#running-costs)) |
-| Telegram | Message Sutando from your phone | [Create bot via @BotFather](https://t.me/BotFather), then `/telegram:configure <token>` |
+| Telegram | Message Sutando from your phone. **First DM auto-enrolls you as owner** (trust-on-first-use). Subsequent senders need to be added: edit `~/.claude/channels/telegram/access.json` → `allowFrom` list. | [Create bot via @BotFather](https://t.me/BotFather), then `/telegram:configure <token>` |
 | Discord | Message Sutando from Discord (DM + channel @mentions) | [Developer portal](https://discord.com/developers), then `/discord:configure <token>` |
 | Claude for Chrome | Browser automation — navigate, read pages, fill forms, interact with web apps | [Install extension](https://claude.ai/chrome), log in with the same account as Claude Code |
 | Sutando app (menu bar) | Global hotkeys (see [Keyboard shortcuts](#keyboard-shortcuts)) | Auto-launches via `startup.sh` |
