@@ -109,7 +109,8 @@ const TAB_ALIASES: Record<string, string> = {
 export const switchTabTool: ToolDefinition = {
 	name: 'switch_tab',
 	description:
-		'Switch to a Chrome tab by keyword. Searches both tab titles and URLs. Use for: "switch to GitHub", "go to Gmail", "open the calendar tab".',
+		'Switch to a Chrome tab by keyword. Searches both tab titles and URLs. Use for: "switch to GitHub", "go to Gmail", "open the calendar tab". ' +
+		'NOT for "share screen" / "screen share" / "show my screen" — those are screen-share workflows, route to share_screen instead.',
 	parameters: z.object({
 		keyword: z.string().describe('Keyword to match in tab title or URL (e.g., "GitHub", "Gmail", "calendar")'),
 	}),

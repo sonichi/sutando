@@ -141,6 +141,39 @@ interface MinimalSession {
 
 let sessionRef: MinimalSession | null = null;
 
+// --- Vision-on contributor registry ---------------------------------------
+//
+// When push mode starts, we inject a hidden system note that tells the model
+// what's happening. The BASE note is core's concern (frames flowing, brief
+// acknowledgement, default screen-aware behavior). Anything skill-specific —
+// e.g. "screen-companion mode is available with guided-setup" — must NOT
+// live in this file (per CLAUDE.md: core services contain no feature-specific
+// logic; skills are optional). Instead, skills register a contributor at
+// module-load time; the injection concatenates the base note + each
+// contributor's text.
+//
+// If no skills register, the injected note is generic and never mentions
+// modes that don't exist on this install.
+
+export type VisionOnContributor = () => string | null | undefined;
+const visionOnContributors: VisionOnContributor[] = [];
+
+/** Register a contributor whose output is appended to the screen-share-started
+ *  system note. Called by skills at module-load time. Returns an unregister
+ *  function (useful for tests). */
+export function registerVisionOnContributor(fn: VisionOnContributor): () => void {
+	visionOnContributors.push(fn);
+	return () => {
+		const i = visionOnContributors.indexOf(fn);
+		if (i >= 0) visionOnContributors.splice(i, 1);
+	};
+}
+
+/** Visible for tests. */
+export function _getVisionOnContributorCount(): number {
+	return visionOnContributors.length;
+}
+
 // TODO(roadmap §5 Now: "Define DeviceSession"): Replace this single-session
 // global with a DeviceSession map keyed by device ID. Today push-mode senders
 // (browser, Mentra glasses, Discord/Telegram photo helper, phone agent) all
@@ -240,18 +273,30 @@ export function startStreaming(
 			startedAt = Date.now();
 			console.log(`${ts()} [Vision] started ${lower} (push mode)`);
 			// Tell the model push just started so it can briefly acknowledge
-			// on its next turn ("I can see your screen now"). Without this
-			// the user clicks Watch and gets no audible confirmation — silent
-			// activation feels broken even when frames are flowing. Symmetric
-			// to the stop-side cache-clear injection in stopStream().
+			// on its next turn. The BASE note is generic — anything skill-
+			// specific (mode catalogs, etc.) comes from contributors that
+			// skills register at module-load time via
+			// registerVisionOnContributor. If no skills register, the model
+			// gets just the base note and operates in default screen-aware
+			// mode. Symmetric to the stop-side cache-clear in stopStream().
 			const transport = sessionRef?.transport;
 			if (transport && typeof transport.sendContent === 'function') {
 				try {
-					transport.sendContent([{
-						role: 'user',
-						text: `[system note] User just started sharing their screen via the Watch button (source='${lower}'). Frames are now flowing live. On your next turn, briefly acknowledge that you can see their shared screen — e.g. "I can see your screen now." Do not describe it in detail unless the user asks.`,
-					}], false);
-					console.log(`${ts()} [Vision] injected screen-share-started context hint`);
+					const baseNote =
+						`[system note] User just started sharing their screen via the Watch button (source='${lower}'). Frames are now flowing live. On your next turn, briefly acknowledge that you can see their shared screen and ask what they're trying to do. Keep it to one sentence. Do not describe the screen in detail unless the user asks.`;
+					const contributions = visionOnContributors
+						.map(fn => {
+							try { return fn(); } catch (e) {
+								console.warn(`${ts()} [Vision] contributor threw: ${(e as Error).message}`);
+								return null;
+							}
+						})
+						.filter((s): s is string => typeof s === 'string' && s.length > 0);
+					const fullText = contributions.length > 0
+						? `${baseNote}\n\n${contributions.join('\n\n')}`
+						: baseNote;
+					transport.sendContent([{ role: 'user', text: fullText }], false);
+					console.log(`${ts()} [Vision] injected screen-share-started context hint (${contributions.length} contributor(s))`);
 				} catch (err) {
 					console.warn(`${ts()} [Vision] failed to inject screen-share-started hint: ${(err as Error).message}`);
 				}

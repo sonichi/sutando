@@ -82,20 +82,31 @@ def validate_twilio_signature(handler, body: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
+# Two separate concerns (per qingyun review on PR #775):
+# - REPO_DIR  = source tree (this file's parent.parent) — for reading source
+#               files like src/health-check.py, running `git -C` against the
+#               checkout, loading .env, etc. Stays anchored to the checkout.
+# - WORKSPACE_DIR = runtime state (resolve_workspace()) — for tasks/, results/,
+#               core-status.json, pending-questions.md, contextual-chips.json,
+#               etc. Honors SUTANDO_WORKSPACE when set so watcher + bridges
+#               stay aligned with these writes.
 REPO_DIR = Path(__file__).parent.parent
-TASK_DIR = REPO_DIR / "tasks"
+sys.path.insert(0, str(Path(__file__).parent))
+from workspace_default import resolve_workspace  # noqa: E402
+
+WORKSPACE_DIR = resolve_workspace()
+TASK_DIR = WORKSPACE_DIR / "tasks"
 PORT = 7843
 
 # Personal-asset path resolver — see src/util_paths.py. Imported here so the
 # /avatar and /stand-identity endpoints prefer the per-machine private dir
 # over the public workspace.
-sys.path.insert(0, str(Path(__file__).parent))
 from util_paths import personal_path  # noqa: E402
 
 # Simple token auth — set SUTANDO_API_TOKEN in .env for remote access security
 API_TOKEN = os.environ.get("SUTANDO_API_TOKEN", "")
 
-RESULT_DIR = REPO_DIR / "results"
+RESULT_DIR = WORKSPACE_DIR / "results"
 TASK_DIR.mkdir(exist_ok=True)
 RESULT_DIR.mkdir(exist_ok=True)
 
@@ -272,7 +283,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"pong": True})
         elif path == "/core-status":
             # Read loop status file for web UI
-            status_file = REPO_DIR / "core-status.json"
+            status_file = WORKSPACE_DIR / "core-status.json"
             if status_file.exists():
                 import json as _json
                 try:
@@ -356,7 +367,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             tasks = [{"id": tid, **tdata} for tid, tdata in sorted_tasks]
             # Parse pending questions
             questions = []
-            pq_file = Path(personal_path("pending-questions.md", REPO_DIR))
+            pq_file = Path(personal_path("pending-questions.md", WORKSPACE_DIR))
             if pq_file.exists():
                 import re
                 content = pq_file.read_text()
@@ -392,7 +403,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 self.send_json(404, {"error": "task not found"})
         elif path == "/avatar":
-            avatar_file = personal_path("stand-avatar.png", workspace=REPO_DIR)
+            avatar_file = personal_path("stand-avatar.png", workspace=WORKSPACE_DIR)
             if avatar_file.exists():
                 self.send_response(200)
                 self.send_header("Content-Type", "image/png")
@@ -403,7 +414,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 self.send_json(404, {"error": "no avatar"})
         elif path == "/stand-identity":
-            si_file = personal_path("stand-identity.json", workspace=REPO_DIR)
+            si_file = personal_path("stand-identity.json", workspace=WORKSPACE_DIR)
             data = json.loads(si_file.read_text()) if si_file.exists() else {}
             self.send_json(200, data)
         elif path == "/activity":
@@ -422,7 +433,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pass
             # Recent results
             try:
-                results_dir = REPO_DIR / "results"
+                results_dir = WORKSPACE_DIR / "results"
                 result_files = sorted(results_dir.glob("task-*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)[:5]
                 for f in result_files:
                     content = f.read_text()[:200]
@@ -431,7 +442,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pass
             self.send_json(200, {"activity": activity})
         elif path == "/contextual-chips":
-            chips_file = REPO_DIR / "contextual-chips.json"
+            chips_file = WORKSPACE_DIR / "contextual-chips.json"
             if chips_file.exists():
                 try:
                     data = json.loads(chips_file.read_text())
@@ -441,7 +452,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 self.send_json(200, {"chips": []})
         elif path == "/dynamic-content":
-            dc_file = REPO_DIR / "dynamic-content.json"
+            dc_file = WORKSPACE_DIR / "dynamic-content.json"
             if dc_file.exists():
                 try:
                     data = json.loads(dc_file.read_text())
@@ -467,7 +478,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not safe_parts:
                 self.send_json(400, {"error": "invalid path"})
                 return
-            repo_resolved = REPO_DIR.resolve()
+            repo_resolved = WORKSPACE_DIR.resolve()  # /media/ serves from workspace (results/, data/, notes/)
             media_path = repo_resolved.joinpath(*safe_parts).resolve()
             if not media_path.is_relative_to(repo_resolved) or not media_path.is_file():
                 self.send_json(404, {"error": "not found"})
@@ -496,7 +507,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # original src/ path here predated that migration and silently
             # 404'd every /logs/voice request from web-client.ts:2183's
             # "Copy logs" button.
-            log_file = REPO_DIR / "logs" / "voice-agent.log"
+            log_file = WORKSPACE_DIR / "logs" / "voice-agent.log"
             if log_file.exists():
                 lines = log_file.read_text().splitlines()[-30:]
                 self.send_json(200, {"lines": lines})
@@ -673,7 +684,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if not qid or not answer:
                     self.send_json(400, {"error": "id and answer required"})
                     return
-                pq_file = Path(personal_path("pending-questions.md", REPO_DIR))
+                pq_file = Path(personal_path("pending-questions.md", WORKSPACE_DIR))
                 if pq_file.exists():
                     content = pq_file.read_text()
                     # Update status from unanswered to answered
@@ -715,7 +726,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             # os.path.realpath + str.startswith is the CodeQL-recognized
                             # path-injection sanitizer pair (Path::PathNormalization
                             # + Path::SafeAccessCheck in semmle.python).
-                            task_dir_real = os.path.realpath(REPO_DIR / "tasks")
+                            task_dir_real = os.path.realpath(WORKSPACE_DIR / "tasks")
                             task_file_str = os.path.realpath(
                                 os.path.join(task_dir_real, f"answer-{safe_qid}-{ts}.txt")
                             )

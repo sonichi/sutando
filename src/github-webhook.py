@@ -26,12 +26,22 @@ import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
+# Two separate concerns (per qingyun review on PR #775):
+# - REPO  = source tree (this file's parent.parent) — for loading .env from
+#           the checkout root. Stays anchored regardless of SUTANDO_WORKSPACE.
+# - WORKSPACE_DIR = runtime state (resolve_workspace()) — for tasks/ writes so
+#           the workspace-aware watcher picks them up.
 REPO = Path(__file__).resolve().parent.parent
-TASKS_DIR = REPO / "tasks"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from workspace_default import resolve_workspace  # noqa: E402
+
+WORKSPACE_DIR = resolve_workspace()
+TASKS_DIR = WORKSPACE_DIR / "tasks"
 PORT = int(sys.argv[sys.argv.index("--port") + 1]) if "--port" in sys.argv else 7847
 
-# Load .env before reading secrets so launchctl / systemd managed restarts
-# pick up GITHUB_WEBHOOK_SECRET without needing it in the plist/unit file.
+# Load .env from the repo root (not workspace) so launchctl / systemd managed
+# restarts pick up GITHUB_WEBHOOK_SECRET without needing it in the plist/unit
+# file. The .env lives in the checkout, not the runtime workspace.
 try:
     from dotenv import load_dotenv
     load_dotenv(REPO / ".env")

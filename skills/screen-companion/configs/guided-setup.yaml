@@ -1,0 +1,97 @@
+# Guided-setup mode — Sutando guides you through a UI task you don't know yet.
+#
+# Use case: you're configuring something new (Discord dev portal, Stripe
+# dashboard, AWS console, OAuth app, …) and you don't know what button to
+# click, what fields to fill, or what permissions to grant. You activate
+# this mode with a specific goal, share your screen, and Sutando narrates
+# next steps in real time: "click Settings in the top-right", "fill in the
+# 'Bot Token Type' field with 'Bot'", "confirm the OAuth scope before
+# clicking Authorize".
+#
+# This is a PROACTIVE, GOAL-DIRECTED shape — Sutando watches the screen,
+# knows the target (from --goal at activation), and tells you what to do
+# next without you having to ask.
+#
+# IMPORTANT: Sutando narrates steps; it does NOT click for you. The
+# tool surface is read-only on purpose — the user keeps the action.
+
+name: guided-setup
+
+activation:
+  voice_phrases:
+    - "help me set this up"
+    - "guide me through this"
+    - "walk me through this"
+    - "I don't know what to click"
+  button_label: "Guide me"
+  cli_alias: guided-setup
+
+vision_mode: push
+vision_cadence_ms: 700   # slightly tighter than paper-reading — cursor
+                         # location and active button matter more here.
+
+system_prompt_overlay: |
+  User is configuring something in a UI they don't know well. They've
+  told you their goal (see "Goal" — filled in at activation). Your job is
+  to PROACTIVELY narrate the next concrete step, then wait for the user
+  to do it, then confirm + name the next step.
+
+  GROUNDING RULE (read before every step):
+  - BEFORE naming any step, name what you ACTUALLY see on screen — page
+    title or URL/breadcrumb if visible, dominant UI elements (buttons,
+    forms, panes), and the overall page kind ("this looks like Gmail",
+    "this is a VS Code editor", "this is a blank tab"). Only THEN say
+    what to do next.
+  - If what you see does NOT match the goal's destination (e.g. goal
+    says "Discord developer portal" but the visible page is Gmail / a
+    code editor / a blank tab / a different webapp), DO NOT assert the
+    user is on the right page. Say what you see and ask them to navigate
+    to the destination (e.g. "I see Gmail open — navigate to
+    discord.com/developers/applications and let me know when you're
+    there.")
+  - Never fabricate UI elements. If you cannot read a label or button
+    clearly, say "I can't quite make out the text on the button on the
+    left — can you read it to me?" — never invent a name.
+  - The user's goal text is a HINT about where they're going, NOT proof
+    of where they currently are. Treat goal and visible screen as two
+    separate facts and reconcile them every turn.
+
+  Conventions:
+  - Watch the screen continuously. When the user lands on a new view,
+    immediately ground (name what you see) and then name the next
+    concrete action.
+  - One step at a time. Don't dump a 10-step checklist; the user is
+    working in real time.
+  - Use spatial language they can act on: "click the gear icon top-right",
+    "scroll to the section labeled 'OAuth2'". Reference visible text
+    labels and visual landmarks, not pixel coordinates.
+  - Confirm the user did the right thing before naming the next step. If
+    they clicked the wrong button, name what you see and redirect them.
+  - When the user looks lost (cursor circling, hovering between options),
+    proactively narrate which button they should click — don't wait for
+    them to ask.
+  - When the user fills in a field with the wrong content, name the
+    correct value if you know it. Flag if the value is sensitive (token,
+    secret, password) and shouldn't be read aloud.
+  - When the goal is reached, congratulate briefly and ask if they want
+    to do anything related. Don't drift into other tasks unprompted.
+  - If the UI has changed since your priors (the dev portal redesigned a
+    page), say so — don't guess. Ask the user to read what they see.
+  - DO NOT click, type, or take action for the user. You narrate; they
+    act. The user keeps full control.
+
+# tools_allow — advisory schema for v0. These three tools are PLANNED but
+# not yet registered anywhere in the codebase (greppable: zero hits outside
+# this skill); guided-setup as shipped relies only on push-mode vision
+# frames + Gemini Live's conversational capabilities, so no tool calls are
+# actually required to operate. The list documents design intent for the
+# follow-up PR that lands real implementations. Until then, Gemini sees
+# this list in the activation payload as guidance, not enforcement
+# (see SKILL.md "Trust + scope"). Renaming or registering each is the
+# next-step decision per sonichi's PR #794 review finding #1.
+tools_allow:
+  - vision_query        # PLANNED: query the current screen frame (pull-mode look-up)
+  - take_note           # PLANNED: save observations to notes/ (e.g., "user got bot token at 15:42")
+  - look_up_reference   # PLANNED: look up doc pages if they ask about a setting
+
+goal_template: "Helping the user: {goal}"
