@@ -58,10 +58,10 @@ except ImportError:
 # Main-view button is at (1056, 951) w=41 h=40 → center (1077, 971). Requires
 # the voice channel detail to be the current view (Discord page = channel).
 COORDS = {
-    "discord_share_button": (1077, 971),  # main-view btn (stable)
-    "entire_screen_tab":    (1142, 211),  # tab at 1041,195 w=203 h=32
-    "thumbnail":            (825, 355),   # at 692,243 w=266 h=224
-    "share_button":         (1206, 656),  # at 1168,638 w=76 h=36
+    "discord_share_button": (1098, 966),  # main-view btn at 1078,946 w=41 h=40 — re-derived 2026-05-18 via macos-use; was (1077,971), drifted +21x -5y after MCP-Chrome window layout settled
+    "entire_screen_tab":    (1142, 209),  # tab at 1041,193 w=203 h=32
+    "thumbnail":            (825, 353),   # at 692,241 w=266 h=224
+    "share_button":         (1206, 654),  # at 1168,636 w=76 h=36
 }
 
 
