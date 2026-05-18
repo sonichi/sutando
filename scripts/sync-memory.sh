@@ -17,7 +17,8 @@
 #
 # Env vars (all optional except SUTANDO_MEMORY_REPO):
 #   SUTANDO_MEMORY_REPO     — git URL of your private memory repo (REQUIRED)
-#   SUTANDO_WORKSPACE       — public sutando checkout. Default: ~/Desktop/sutando
+#   SUTANDO_REPO_DIR        — sutando checkout location. Default: resolved from
+#                             this script's own location (../ from scripts/)
 #   SUTANDO_MEMORY_SYNC_DIR — local clone path. Default: ~/.sutando/memory-sync
 #                             (was ~/.sutando-memory-sync before #762's
 #                             companion PR; one-time auto-migration below)
@@ -75,9 +76,13 @@ elif [ "$(basename "$SCRIPT_PARENT")" = ".sutando-memory-sync" ]; then
 else
     SYNC_DIR="$__NEW_DEFAULT"
 fi
-REPO_DIR="${SUTANDO_WORKSPACE:-$HOME/Desktop/sutando}"
+# Resolve repo from script location (every other script in scripts/ does this).
+# SUTANDO_REPO_DIR overrides if the user needs a non-standard checkout path.
+# (Renamed from SUTANDO_WORKSPACE to avoid collision with the post-#762
+#  workspace contract where SUTANDO_WORKSPACE means ~/.sutando/workspace/.)
+REPO_DIR="${SUTANDO_REPO_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 if [ ! -d "$REPO_DIR" ]; then
-    echo "sync-memory: workspace not found at $REPO_DIR; set SUTANDO_WORKSPACE or clone sutando to ~/Desktop/sutando." >&2
+    echo "sync-memory: sutando checkout not found at $REPO_DIR; set SUTANDO_REPO_DIR or run this script from inside the repo." >&2
     exit 0
 fi
 # Claude's per-project memory dir is keyed on the LAUNCH-CWD path, not on
