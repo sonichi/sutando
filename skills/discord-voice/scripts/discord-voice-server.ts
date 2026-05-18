@@ -665,10 +665,19 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 	const nameGateActive = OTHER_INSTANCES.length > 0 && !!INSTANCE_NAME;
 	const nameVariants = [INSTANCE_NAME, ...INSTANCE_NAME_ALIASES]
 		.filter(Boolean).map(n => n.toLowerCase());
+	const otherVariantsLc = OTHER_INSTANCES.map(n => n.toLowerCase());
 	const transcriptContainsName = (text: string): boolean => {
 		const lc = text.toLowerCase();
 		return nameVariants.some(v => lc.includes(v));
 	};
+	const transcriptContainsOther = (text: string): boolean => {
+		const lc = text.toLowerCase();
+		return otherVariantsLc.some(v => lc.includes(v));
+	};
+	// Sticky "last-addressed-was-me" so the owner doesn't have to re-name on
+	// every follow-up turn. Starts false (requires explicit address first turn);
+	// flips true on my-name, false on other-name, unchanged on no-name.
+	let lastAddressedToMe = false;
 	let turnDecision: 'pending' | 'allow' | 'drop' = 'pending';
 	let pendingAudio: Buffer[] = [];
 	const resetTurnGate = () => {
@@ -748,7 +757,14 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 						break;
 					}
 				}
-				const named = transcriptContainsName(userText);
+				// Sticky-address logic: update lastAddressedToMe based on this turn,
+				// then use it as the decision (so a follow-up un-named turn after
+				// "Hi Lucy, ..." still routes to Lucy until owner names another bot).
+				const haveMyName = transcriptContainsName(userText);
+				const haveOtherName = transcriptContainsOther(userText);
+				if (haveMyName) lastAddressedToMe = true;
+				else if (haveOtherName) lastAddressedToMe = false;
+				const named = lastAddressedToMe;
 				if (named) {
 					turnDecision = 'allow';
 					for (const buf of pendingAudio) {
