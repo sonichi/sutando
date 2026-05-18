@@ -241,6 +241,22 @@ if [ -f "$SUT_SRC" ] && { [ ! -f "$SUT_BIN" ] || [ "$SUT_SRC" -nt "$SUT_BIN" ]; 
   echo "  Compiling Sutando (source newer than binary)..."
   if (cd "$REPO/src/Sutando" && swiftc -O -o Sutando main.swift -framework Cocoa -framework Carbon -framework ApplicationServices -framework AVFoundation 2>/dev/null); then
     echo "  ✓ Sutando compiled"
+
+    # Sync the fresh binary into the .app bundle if one exists, ensure the
+    # AppleEvents usage-description key is present, and re-sign so the
+    # cdhash matches. Without NSAppleEventsUsageDescription macOS silently
+    # denies AppleEvents — getFinderSelection() returns [] and the ⌃C
+    # drop handler logs "Nothing selected" with no permission prompt.
+    SUT_APP="$REPO/src/Sutando/Sutando.app"
+    if [ -d "$SUT_APP" ]; then
+      cp "$SUT_BIN" "$SUT_APP/Contents/MacOS/Sutando"
+      /usr/libexec/PlistBuddy \
+        -c "Add :NSAppleEventsUsageDescription string 'Sutando reads your Finder selection to drop files into the agent task queue.'" \
+        "$SUT_APP/Contents/Info.plist" 2>/dev/null || true
+      codesign --force --sign - "$SUT_APP" 2>/dev/null || true
+      echo "  ✓ Sutando.app synced + signed"
+    fi
+
     if pgrep -f "src/Sutando/Sutando" > /dev/null 2>&1; then
       pkill -f "src/Sutando/Sutando" 2>/dev/null || true
       # Wait for kernel cleanup to drain before relaunch — fixed sleep 1
