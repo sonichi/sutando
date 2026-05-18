@@ -484,7 +484,9 @@ function buildAgent(callSession: CallSession): MainAgent {
 			'(1) only you said goodbye but the caller did not, ' +
 			'(2) the caller\'s speech is unclear or garbled, ' +
 			'(3) you just completed an action — always report the result first and wait for the caller to respond, ' +
-			'(4) the conversation is still going. When in doubt, do NOT hang up — ask if they need anything else.',
+			'(4) the conversation is still going, ' +
+			'(5) the caller is PROPOSING to say goodbye but hasn\'t actually said it — "it\'s time to say goodbye", "let me say goodbye", "I want to say goodbye", "let\'s wrap up", "I should probably go soon" are PROPOSALS, not the goodbye itself. Wait until the caller actually ends with "bye"/"goodbye"/"talk to you later"/"I\'m done"/etc. as their final utterance. ' +
+			'When in doubt, do NOT hang up — ask if they need anything else.',
 		parameters: z.object({}),
 		execution: 'inline',
 		async execute() {
