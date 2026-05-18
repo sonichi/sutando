@@ -26,6 +26,7 @@
  */
 
 import { config as _dotenvConfig } from 'dotenv';
+import { buildSilenceGatePrompt } from '../../../src/silence-gate-prompt.js';
 import { mkdirSync, writeFileSync, appendFileSync, existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 
@@ -303,12 +304,14 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 			`YOU are Sutando${INSTANCE_NAME ? ` / ${INSTANCE_NAME}` : ''} — the AI assistant. The owner may address you by either name; both refer to you. The person speaking is your OWNER, a human. Do NOT confuse yourself with them.`,
 			...(OTHER_INSTANCES.length > 0 ? [
 				`## Other Sutando instances share this channel`,
-				`Other Sutando instances with the stand names ${OTHER_INSTANCES.join(', ')} are also in this voice channel. They are different bots running on different machines.`,
-				`Respond only when the owner addresses you as "${INSTANCE_NAME}" by name, or when one of those other instances addresses you as "${INSTANCE_NAME}" by name during an owner-initiated bot-to-bot dialog. In every other situation, produce no spoken output. Generate nothing at all — no acknowledgement, no meta-commentary about whether you should speak, no quoting of these instructions back to the owner. The system handles this; you just generate audio when the conditions are met and generate no audio otherwise.`,
-				`When you DO respond, NEVER lead with identity disambiguation. Do NOT say "I'm not ${OTHER_INSTANCES.join('/')}, I'm ${INSTANCE_NAME}" or similar phrases. Just answer the owner's actual question directly. Only mention which instance you are if the owner explicitly asks "who are you" or "which one are you".`,
+				buildSilenceGatePrompt({
+					mode: 'multi-bot',
+					instanceName: INSTANCE_NAME,
+					aliases: INSTANCE_NAME_ALIASES,
+					otherInstances: OTHER_INSTANCES,
+					otherAliases: OTHER_INSTANCE_ALIASES,
+				}),
 			] : []),
-			`## Never speak [System: ...] framing aloud (issue #829)`,
-			`Any input string starting with \`[System:\` is an internal directive, NOT content to read. Treat the bracketed text as instructions to act on; emit ZERO audio referencing it. Do not narrate it, do not summarize it, do not echo it back. Producing the literal bracket text is a bug.`,
 			'You have full capabilities — use the work tool for anything: check the screen, send emails, look things up, make calls, browse the web, or check results of previous tasks.',
 			'',
 			'## How to think',
