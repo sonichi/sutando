@@ -137,6 +137,20 @@ Files like `.cursorrules`, `.claude/` (project-local Claude Code config), and `.
 
 Worth flagging because new contributors sometimes ask "should `.cursorrules` go in Memory?" — the answer is no, it stays in Code-or-untracked per IDE convention.
 
+## Host CLI dependency surface
+
+Sutando is built on a host CLI tool (today: Claude Code). Some agent-state surfaces — agent memory, bridge auth tokens, skill discovery, slash-command config — live inside that host CLI's user-home directory rather than under `$SUTANDO_WORKSPACE` or `$SUTANDO_PRIVATE_DIR`. These are not Sutando-owned; we read and write them via the host CLI's conventions, the way a Node app uses `~/.npm/` or `~/.config/`.
+
+**Portability cost.** If Sutando ever switches host CLIs (Codex, gemini-cli, a future tool), this dependency surface needs to be re-bound:
+
+- **High-cost re-bind:** agent memory storage + skill discovery. Both rely on the host CLI's own tooling (memory load-on-session-start, skill loader).
+- **Low-cost re-bind:** bridge tokens + access state. Just data movement to new paths.
+- **Interop loss:** slash commands provided by the host CLI lose their surface; would need re-implementation as Sutando-owned subcommands.
+
+**Today's policy.** We document the surface internally (engineering inventory) without listing specific paths in this public doc. Specific paths are implementation detail of the current host CLI; publishing them invites bit-rot when the host CLI's conventions change.
+
+If you're a contributor who needs the inventory to make a code change touching the host CLI's home dir, ask in the team channel and the maintainer will point you at the workspace-private engineering note.
+
 ## Relationship to other docs
 
 - `docs/workspace-contract.md` — implementation reference. How to use the resolvers, the migration story from pre-#762. This doc complements it with the why + the taxonomy.
