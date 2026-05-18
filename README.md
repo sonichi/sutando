@@ -1,6 +1,6 @@
 # Sutando
 
-[![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/uZHWXXmrCS) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Website](https://img.shields.io/badge/Web-sutando.ai-blue)](https://sutando.ai) [![GitHub Trending](https://img.shields.io/badge/GitHub_Trending-%231_Python_(May_16)-FFD700?logo=github&logoColor=white)](https://github.com/trending/developers/python?since=daily)
+[![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/uZHWXXmrCS) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Website](https://img.shields.io/badge/Web-sutando.ai-blue)](https://sutando.ai) [![GitHub Trending](https://img.shields.io/badge/GitHub_Trending-%231_Developer_(May_17)-FFD700?logo=github&logoColor=white)](https://github.com/trending/developers?since=daily)
 
 **My AI Stand — Realtime by Day, Rewriting Itself by Night.**
 **Summon my AI superpower.**
@@ -29,6 +29,11 @@ https://github.com/user-attachments/assets/a86ec34e-3b26-4011-824c-d2d124753c25
 ## 🎬 Recent autonomous output
 
 **Sutando WIRE** — Sutando reads the news, drafts the script, generates narration, renders the video. No editor, no animator, no narration session.
+- [Sutando's review of its first 50 days — and how it got Chi to #1 trending dev](https://youtu.be/pd6Siy1gnpI) — ep007
+- [AI That Runs a Real Sales Demo. Not in Theory. In Odoo.](https://youtu.be/zWBH4UeQeZQ) — ep006
+- [Three labs, three directions — AI labs week meta-commentary](https://youtu.be/QKzdXNkuL80) — ep005
+- [Codex vs Claude Code. Same /goal. One Shipped Theater.](https://youtu.be/Ufir0qjiYqE) — ep004
+- [Pentagon's 158 UAP Files, Mapped. Only 8 Match the Community Catalog](https://youtu.be/c3AD1mrR4y4) — ep003
 - [Declassified, Debunked, Unexplained: 3 Pentagon UAP Files in 40 Seconds](https://youtu.be/eBvHemYhc2o) — ep002
 - [162 UAP Files Just Declassified. The Pentagon's Apollo 17 Photo](https://youtu.be/JoltTj3x410) — ep001
 
@@ -57,7 +62,7 @@ https://github.com/user-attachments/assets/a86ec34e-3b26-4011-824c-d2d124753c25
 
 **Remember everything — and act on it.** You have an idea while walking. Say it out loud. Sutando captures it, tags it, and saves it as a searchable note. If there's something actionable, it starts working on it right away or queues it for the next free cycle.
 
-**Reach you anywhere.** Voice, Zoom, Google Meet, Telegram, Discord, web, phone, or email — same agent, same memory, any channel.
+**Reach you anywhere.** Voice, Zoom, Google Meet, Telegram, Discord (text + voice channel), web, phone, or email — same agent, same memory, any channel.
 
 **Scale across machines.** Plug in a second Mac and Sutando sets it up — the original agent opens a Discord channel, sends setup commands, and migrates services. The new machine handles phone calls 24/7 while your laptop stays portable. No migration scripts needed — the two agents coordinate the handoff themselves.
 
@@ -259,6 +264,7 @@ One table, organized by capability. The only required paid piece is your Claude 
 | Inbound call handling | `phone-conversation/` | Verified (needs Twilio) |
 | Telegram messaging | `telegram-bridge.py` | Verified (text + photos + files + voice) |
 | Discord messaging | `discord-bridge.py` | Verified (DMs + channel @mentions + files) |
+| Discord voice channel | `skills/discord-voice/` | Verified (2-way voice + screen share) |
 | Cross-device task submission | `agent-api.py` | Verified |
 | Health monitoring | `health-check.py` | Verified |
 | Pattern detection + user modeling | Built into Claude Code memory system | Verified |

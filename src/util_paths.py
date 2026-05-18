@@ -19,6 +19,31 @@ from pathlib import Path
 REPO_DIR = Path(__file__).resolve().parent.parent
 
 
+def _workspace_root() -> Path:
+    """Workspace root for runtime-state paths.
+
+    Per the workspace contract (docs/workspace-contract.md): REPO_DIR is
+    SOURCE-TREE-ONLY (exec'ing source files, git cwd, reading checked-in
+    files). All user/runtime paths go through the workspace. Delegates to
+    workspace_default.resolve_workspace() so SUTANDO_WORKSPACE, the
+    canonical default (~/.sutando/workspace/), and PR #762's one-time
+    legacy migration are all honored in one call.
+
+    `migrate=False` — path resolution shouldn't trigger migrations on
+    every call. Migration runs from src/startup.sh and the bridge boot
+    paths where it belongs.
+    """
+    try:
+        from workspace_default import resolve_workspace
+        return resolve_workspace(migrate=False)
+    except ImportError:
+        # Inline fallback. NEVER REPO_DIR — that's source-tree, not workspace.
+        env = os.environ.get("SUTANDO_WORKSPACE")
+        if env:
+            return Path(os.path.expanduser(env))
+        return Path.home() / ".sutando" / "workspace"
+
+
 def _private_machine_dir() -> Path | None:
     root = os.environ.get("SUTANDO_PRIVATE_DIR")
     if not root:
@@ -39,7 +64,7 @@ def personal_path(filename: str, workspace: Path | None = None) -> Path:
     Returns the FIRST existing path. If none exist, returns the preferred
     private-dir path so the caller's `.exists()` check fails gracefully.
     """
-    ws = workspace if workspace is not None else REPO_DIR
+    ws = workspace if workspace is not None else _workspace_root()
 
     private = _private_machine_dir()
     if private is not None:
@@ -78,7 +103,7 @@ def shared_personal_path(filename: str, workspace: Path | None = None) -> Path:
     Returns the FIRST existing path. If none exist, returns the preferred
     private path so the caller's `.exists()` check fails gracefully.
     """
-    ws = workspace if workspace is not None else REPO_DIR
+    ws = workspace if workspace is not None else _workspace_root()
 
     root = os.environ.get("SUTANDO_PRIVATE_DIR")
     if root:
