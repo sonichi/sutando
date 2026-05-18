@@ -7,7 +7,8 @@
 
 import { execSync, execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync, statSync } from 'node:fs';
-import { join, extname } from 'node:path';
+import { join, extname, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from './workspace_default.js';
@@ -18,6 +19,11 @@ import { resolveWorkspace } from './workspace_default.js';
 // voice-agent was launched from the repo with SUTANDO_WORKSPACE unset.
 // resolveWorkspace() is the canonical TS helper introduced in #821.
 const WORKSPACE_DIR = resolveWorkspace();
+
+// Code-adjacent paths (skills/, etc.) ship with the repo checkout, NOT the
+// workspace. Compute REPO_ROOT from this file's URL so the resolution
+// survives any cwd drift at startup. Used by the skill-loader below.
+const REPO_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -957,7 +963,7 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 	// Order: public first, then private — same-name skills loaded from
 	// private take precedence (last one wins via the dup-name guard below if
 	// any; in practice they should be uniquely named).
-	const dirsToScan: string[] = [join(process.cwd(), 'skills')];
+	const dirsToScan: string[] = [join(REPO_ROOT, 'skills')];
 	const privateRoot = process.env.SUTANDO_PRIVATE_DIR;
 	if (privateRoot) {
 		const expanded = privateRoot.replace(/^~/, process.env.HOME || '');
@@ -1021,7 +1027,7 @@ const personalAllTools = [...personalTools.owner, ...personalTools.anyCaller];
 // a tools.ts. Don't try to align them — they're correctly sync/async for
 // what each one does.
 function loadCoreDocumentedSkills(): { name: string; description: string }[] {
-	const dirsToScan: string[] = [join(process.cwd(), 'skills')];
+	const dirsToScan: string[] = [join(REPO_ROOT, 'skills')];
 	const privateRoot = process.env.SUTANDO_PRIVATE_DIR;
 	if (privateRoot) {
 		const expanded = privateRoot.replace(/^~/, process.env.HOME || '');
