@@ -82,11 +82,17 @@ export function recordDiscordVoiceTurn(
 	role: 'discord-user' | 'discord-agent',
 	text: string,
 	sessionId: string,
+	tsOverride?: number,
 ): void {
 	init();
 	if (!turnStmt || !text) return;
 	try {
-		turnStmt.run(Date.now() / 1000, role, text, sessionId);
+		// For agent rows, callers pass the first-audio-out time so
+		// `agent.ts_unix - user.ts_unix` measures perceived latency
+		// (what self-repair watches for). Falls back to wall clock when
+		// audio was gated/dropped and no real emit happened.
+		const ts = tsOverride ?? Date.now() / 1000;
+		turnStmt.run(ts, role, text, sessionId);
 	} catch (e) {
 		console.error(`[discord-voice-store] turn write failed (${role}):`, e);
 	}

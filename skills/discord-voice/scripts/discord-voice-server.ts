@@ -484,19 +484,12 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 		});
 	}
 
-	// Greeting fires once at session start. Empty in single-bot mode (no
-	// announcement until the operator speaks). In multi-bot mode, fire the
-	// silence-gate prompt so the very first thing Gemini sees is «stay
-	// silent» — matches voice-agent.ts meeting-mode pattern.
-	const greeting = OTHER_INSTANCES.length > 0
-		? buildSilenceGatePrompt({
-			mode: 'multi-bot',
-			instanceName: INSTANCE_NAME,
-			aliases: INSTANCE_NAME_ALIASES,
-			otherInstances: OTHER_INSTANCES,
-			otherAliases: OTHER_INSTANCE_ALIASES,
-		})
-		: '';
+	// Greeting fires once at session start. Empty in both modes — the
+	// silence-gate prompt is already in instructions[0], so sending it again
+	// as a "greeting" text-input made Gemini parse it as a user message and
+	// (a) sometimes parrot the prompt back as audio (#829) and (b) cost a full
+	// first-turn of latency (Susan saw 10-12s first response on 2026-05-18).
+	const greeting = '';
 
 	return {
 		name: 'discord-voice',
@@ -711,19 +704,63 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 	const sessionAny = session as any;
 	let outChunks = 0;
 
-	// Multi-bot silence is enforced by the system prompt (see buildAgent
-	// instructions in this file + meeting-mode pattern in voice-agent.ts) —
-	// when OTHER_INSTANCES is set, the prompt tells this instance to stay
-	// silent unless addressed by name. No audio-level gate, no per-turn
-	// state machine. If prompt-level proves unreliable in practice, the
-	// fallback is a single ignore-by-user-id filter on the inbound subscribe,
-	// not an outbound buffer-and-decide loop.
+	// Multi-bot silence: prompt is the soft check; this is the hard one. The
+	// prompt-only version (c669765) proved unreliable in live test 2026-05-18 —
+	// Gemini ignored the silence rule and responded to "hi <sibling>". Audio
+	// gate dropped here is deterministic. When OTHER_INSTANCES is unset (single
+	// bot) the gate is fully disabled.
+	const nameGateActive = OTHER_INSTANCES.length > 0 && !!INSTANCE_NAME
+		&& process.env.SUTANDO_AUDIO_GATE_OFF !== 'true';
+	const nameVariantsLc = [INSTANCE_NAME, ...INSTANCE_NAME_ALIASES]
+		.filter(Boolean).map(n => n.toLowerCase());
+	const otherVariantsLc = [...OTHER_INSTANCES, ...OTHER_INSTANCE_ALIASES]
+		.filter(Boolean).map(n => n.toLowerCase());
+	// Address detection — substring presence is too loose ("thanks Lucy" must
+	// NOT count as addressing Lucy). Match: greeting+name, "name," tag, or
+	// "name VERB" at sentence start.
+	const isAddressedBy = (text: string, names: string[]): boolean => {
+		const lc = text.toLowerCase();
+		const VERBS = '(can|could|will|would|please|tell|answer|design|write|read|check|look|help|stop|start|leave|join|log)';
+		for (const n of names) {
+			const greet = new RegExp(`\\b(hi|hey|hello|yo|okay|ok)[,!:]?\\s+${n}\\b`, 'i');
+			const commaTag = new RegExp(`\\b${n}\\s*[,?]`, 'i');
+			const verbed = new RegExp(`(^|[.!?]\\s*)${n}\\s+${VERBS}\\b`, 'i');
+			if (greet.test(lc) || commaTag.test(lc) || verbed.test(lc)) return true;
+		}
+		return false;
+	};
+	// Sticky: flips on address, unchanged on no-name turns. Initial =
+	// SUTANDO_PRIMARY for cold-opener routing.
+	let responseAllowed = process.env.SUTANDO_PRIMARY === 'true';
+	// First-audio-chunk timestamp of the current outbound turn. Used as the
+	// agent row's ts_unix so `agent.ts_unix - user.ts_unix` reflects perceived
+	// latency (the gap voice self-repair watches). Reset at turn.end.
+	let currentTurnAudioOutTs: number | null = null;
 
 	sessionAny.handleAudioOutput = (data: string) => {
 		sessionAny.notificationQueue?.markAudioReceived?.();
 		try {
 			const pcm24Mono = Buffer.from(data, 'base64');
 			const pcm48Stereo = upsample24MonoTo48Stereo(pcm24Mono);
+			if (nameGateActive && !responseAllowed) {
+				// Lazy upgrade: turn.end fires AFTER Gemini's response audio
+				// has started flowing, so the first response after an address
+				// would be dropped because the gate update is lagged. Before
+				// dropping, peek at the latest user item — if Gemini already
+				// transcribed the address, flip the gate on the spot.
+				const items = session.conversationContext.items;
+				for (let i = items.length - 1; i >= 0; i--) {
+					if (items[i].role === 'user') {
+						if (isAddressedBy(items[i].content, nameVariantsLc)) {
+							responseAllowed = true;
+							console.log(`${ts()} [NameGate] lazy-allow (user: "${items[i].content.slice(0, 60)}")`);
+						}
+						break;
+					}
+				}
+				if (!responseAllowed) return; // silently drop
+			}
+			if (currentTurnAudioOutTs === null) currentTurnAudioOutTs = Date.now() / 1000;
 			pushAudio(pcm48Stereo);
 			outChunks++;
 			if (outChunks === 1 || outChunks % 50 === 0) {
@@ -740,9 +777,11 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 		const items = session.conversationContext.items;
 		if (items.length < lastProcessedIdx) lastProcessedIdx = 0;
 		const lastText = s.transcript.length > 0 ? s.transcript[s.transcript.length - 1].text : null;
+		let latestUserText = '';
 		for (const item of items.slice(lastProcessedIdx)) {
 			if (item.content === lastText) continue;
 			if (item.role === 'user') {
+				latestUserText = item.content;
 				s.transcript.push({ role: 'user', text: item.content });
 				s.events.push({ event: `user:${item.content}`, timestamp: new Date().toISOString() });
 				logLine('user', item.content);
@@ -751,10 +790,27 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 				s.transcript.push({ role: 'sutando', text: item.content });
 				s.events.push({ event: `sutando:${item.content}`, timestamp: new Date().toISOString() });
 				logLine('assistant', item.content);
-				recordDiscordVoiceTurn('discord-agent', item.content, s.sessionId);
+				recordDiscordVoiceTurn('discord-agent', item.content, s.sessionId, currentTurnAudioOutTs ?? undefined);
 			}
 		}
 		lastProcessedIdx = items.length;
+
+		// Reset audio-out timestamp at turn boundary so next turn captures
+		// its own first-chunk time.
+		currentTurnAudioOutTs = null;
+
+		// Update name-gate state from latest user turn. Flip on my-name,
+		// flip off on other-name, sticky on no-name.
+		if (nameGateActive && latestUserText) {
+			const haveMine = isAddressedBy(latestUserText, nameVariantsLc);
+			const haveOther = isAddressedBy(latestUserText, otherVariantsLc);
+			const before = responseAllowed;
+			if (haveMine) responseAllowed = true;
+			else if (haveOther) responseAllowed = false;
+			if (before !== responseAllowed || haveMine || haveOther) {
+				console.log(`${ts()} [NameGate] ${responseAllowed ? 'allow' : 'drop'} (user: "${latestUserText.slice(0, 60)}")`);
+			}
+		}
 
 		if (s.resultQueue.length > 0) {
 			const queued = s.resultQueue.splice(0);
