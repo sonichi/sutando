@@ -10,6 +10,7 @@ Usage:
   python3 src/health-check.py --notify-on-fail # macOS notification on failure
 
 Checks:
+  - macOS TCC Documents-folder access (when repo is under ~/Documents)
   - Voice agent (port 9900), web client, agent API, dashboard
   - Critical files (CLAUDE.md, build_log.md, ACTIVITY.md)
   - Memory system (MEMORY.md index, key memory files)
@@ -134,6 +135,53 @@ def check_memory_sync() -> dict:
             return {"name": name, "status": "warn", "detail": f"last sync {age_h:.0f}h ago (stale)"}
         return {"name": name, "status": "ok", "detail": f"last sync {age_h:.1f}h ago"}
     return {"name": name, "status": "ok", "detail": "initialized, never fetched"}
+
+
+def check_tcc_documents_access() -> dict:
+    """Detect macOS TCC denial of Documents-folder access (issue #709).
+
+    Relevant when REPO_DIR is inside ~/Documents — the default location for
+    git checkouts on macOS. A process that hasn't been granted Documents access
+    in System Settings → Privacy & Security → Files and Folders will hit
+    PermissionError on every file read/write in the repo, causing tasks to go
+    missing and services to crash on startup with no obvious error.
+
+    Probe: attempt to list REPO_DIR and write+unlink a throwaway temp file.
+    Safe even when access is denied — the PermissionError is caught and reported
+    rather than propagated.
+    """
+    name = "tcc-documents-access"
+    docs_dir = Path.home() / "Documents"
+    try:
+        in_documents = str(REPO_DIR.resolve()).startswith(str(docs_dir.resolve()))
+    except OSError:
+        in_documents = True  # can't resolve → assume we're in Documents and probe
+
+    if not in_documents:
+        return {"name": name, "status": "ok", "detail": "repo not in ~/Documents — TCC check N/A"}
+
+    probe = REPO_DIR / ".tcc-probe"
+    try:
+        list(REPO_DIR.iterdir())
+        probe.write_text("")
+        probe.unlink()
+        return {"name": name, "status": "ok", "detail": "Documents folder access granted"}
+    except PermissionError:
+        try:
+            probe.unlink()
+        except Exception:
+            pass
+        return {
+            "name": name,
+            "status": "fail",
+            "detail": (
+                "macOS TCC denied Documents folder access — grant in "
+                "System Settings → Privacy & Security → Files and Folders "
+                "→ Terminal (or your IDE/launchd app)"
+            ),
+        }
+    except OSError:
+        return {"name": name, "status": "ok", "detail": "Documents access check inconclusive"}
 
 
 # ---------------------------------------------------------------------------
@@ -674,6 +722,10 @@ def run_all_checks() -> list[dict]:
             c["status"] = "warn"
             c["detail"] = "not running (optional)"
         checks.append(c)
+
+    # macOS TCC — must come before critical-file checks so if TCC is blocking
+    # everything, the operator sees the root cause before the downstream failures.
+    checks.append(check_tcc_documents_access())
 
     # Critical files
     for name, path in [
