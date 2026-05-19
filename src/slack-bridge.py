@@ -271,6 +271,21 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     if not user_id:
         return None
 
+    # Per-event state probe — captures whether ACCESS_FILE exists at the moment
+    # _write_task runs, and its mtime if it does. This is the instrumentation
+    # asked for by #899 (intermittent file wipe + re-TOFU despite the race-guard
+    # in tofu_onboard). The wipe must be happening externally (Sutando.app
+    # Settings UI, manual rm, or an undiscovered code path), and the only way
+    # to catch it is to log the file's state on every inbound event. One line
+    # per event; cheap; bridges already log per-event.
+    try:
+        af_exists = ACCESS_FILE.exists()
+        af_mtime = ACCESS_FILE.stat().st_mtime if af_exists else None
+        print(f"  [access-probe] file_present={af_exists} mtime={af_mtime}", flush=True)
+    except Exception:
+        # Don't let a probe failure block real work; just skip the log line.
+        pass
+
     # Access control via TOFU
     allowed = load_allowed()
     if allowed is None:
