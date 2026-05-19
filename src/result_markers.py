@@ -97,7 +97,10 @@ _SKIP_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 # Redirect marker — Discord channel IDs are 17-20 digits; Slack channel IDs
 # match `[CDG][A-Z0-9]+`. Accept both via a permissive group; the bridge
 # validates the id format for its platform when applying.
-_REDIRECT_RE = re.compile(r"^\s*\[channel:\s*([^\]]+)\]\s*\n?", re.MULTILINE)
+# Note: used with `.match()` below, which always anchors at string start —
+# no MULTILINE flag needed (re.MULTILINE only affects `^`/`$` in scan-style
+# methods like `.search()` / `.finditer()`).
+_REDIRECT_RE = re.compile(r"^\s*\[channel:\s*([^\]]+)\]\s*\n?")
 
 # Attach markers — file/send/attach are aliases.
 _ATTACH_RE = re.compile(r"\[(?:file|send|attach):\s*([^\]]+)\]")
