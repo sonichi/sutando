@@ -280,5 +280,131 @@ class TestInRepoNotesMigration(unittest.TestCase):
         self.assertFalse((self.repo_root / "notes" / "e2e.md").exists())
 
 
+class TestInRepoBuildLogMigration(unittest.TestCase):
+    """Tests for `_migrate_inrepo_build_log` — moves build_log.md from repo
+    root to workspace (parallel to _migrate_inrepo_notes but single-file)."""
+
+    def setUp(self):
+        self._saved_env = os.environ.get("SUTANDO_WORKSPACE")
+        self.repo_root = Path(tempfile.mkdtemp(prefix="ws-repo-"))
+        self.workspace = Path(tempfile.mkdtemp(prefix="ws-target-"))
+        os.environ["SUTANDO_WORKSPACE"] = str(self.workspace)
+
+    def tearDown(self):
+        if self._saved_env is not None:
+            os.environ["SUTANDO_WORKSPACE"] = self._saved_env
+        elif "SUTANDO_WORKSPACE" in os.environ:
+            del os.environ["SUTANDO_WORKSPACE"]
+        shutil.rmtree(self.repo_root, ignore_errors=True)
+        shutil.rmtree(self.workspace, ignore_errors=True)
+
+    def test_migrate_when_inrepo_exists_and_workspace_differs(self):
+        (self.repo_root / "build_log.md").write_text("# Old log\n\nLog content.\n")
+        with patch.object(workspace_default, "_legacy_repo_root", return_value=self.repo_root):
+            moved = workspace_default._migrate_inrepo_build_log(self.workspace)
+        self.assertTrue(moved)
+        self.assertTrue((self.workspace / "build_log.md").is_file())
+        self.assertEqual(
+            (self.workspace / "build_log.md").read_text(),
+            "# Old log\n\nLog content.\n",
+        )
+        self.assertFalse((self.repo_root / "build_log.md").exists())
+
+    def test_skip_when_workspace_equals_repo(self):
+        (self.repo_root / "build_log.md").write_text("dont touch")
+        with patch.object(workspace_default, "_legacy_repo_root", return_value=self.repo_root):
+            moved = workspace_default._migrate_inrepo_build_log(self.repo_root)
+        self.assertFalse(moved)
+        self.assertTrue((self.repo_root / "build_log.md").exists())
+
+    def test_skip_when_inrepo_missing(self):
+        with patch.object(workspace_default, "_legacy_repo_root", return_value=self.repo_root):
+            moved = workspace_default._migrate_inrepo_build_log(self.workspace)
+        self.assertFalse(moved)
+
+    def test_no_clobber_on_collision(self):
+        (self.repo_root / "build_log.md").write_text("REPO version")
+        (self.workspace).mkdir(parents=True, exist_ok=True)
+        (self.workspace / "build_log.md").write_text("WORKSPACE wins")
+        with patch.object(workspace_default, "_legacy_repo_root", return_value=self.repo_root):
+            workspace_default._migrate_inrepo_build_log(self.workspace)
+        # Workspace untouched, in-repo file still present (skipped, not moved).
+        self.assertEqual((self.workspace / "build_log.md").read_text(), "WORKSPACE wins")
+        self.assertTrue((self.repo_root / "build_log.md").exists())
+
+    def test_idempotent_via_sentinel(self):
+        (self.repo_root / "build_log.md").write_text("once")
+        with patch.object(workspace_default, "_legacy_repo_root", return_value=self.repo_root):
+            moved_1 = workspace_default._migrate_inrepo_build_log(self.workspace)
+            # Re-seed the in-repo file so we can verify the sentinel (not the
+            # missing-file early-return) is what prevents re-migration.
+            (self.repo_root / "build_log.md").write_text("twice")
+            moved_2 = workspace_default._migrate_inrepo_build_log(self.workspace)
+        self.assertTrue(moved_1)
+        self.assertFalse(moved_2)
+        # Workspace still has the FIRST content (second run skipped via sentinel).
+        self.assertEqual((self.workspace / "build_log.md").read_text(), "once")
+
+    def test_resolve_workspace_runs_build_log_migration_when_env_set(self):
+        (self.repo_root / "build_log.md").write_text("e2e content")
+        with patch.object(workspace_default, "_legacy_repo_root", return_value=self.repo_root):
+            ws = resolve_workspace(migrate=True)
+        self.assertEqual(ws, self.workspace)
+        self.assertTrue((self.workspace / "build_log.md").exists())
+        self.assertFalse((self.repo_root / "build_log.md").exists())
+
+    def test_legacy_install_env_unset_build_log_migrates_after_dirs(self):
+        """Corner case Mini flagged in PR #859 review:
+          - Legacy install: repo has tasks/, results/, state/ with content
+          - env SUTANDO_WORKSPACE unset
+          - New default doesn't yet exist
+          - build_log.md ALSO at repo root
+
+        Expected sequence inside resolve_workspace():
+          1. _migrate_from_legacy fires (env unset + target absent + runtime
+             evidence) → moves tasks/results/state to target.
+          2. _migrate_inrepo_build_log fires after (env-unset path also calls it,
+             per v4 of _migrate_inrepo_build_log) → sees workspace now exists,
+             workspace has no build_log.md yet, repo has one → migrates it.
+
+        Mini's concern was that step-2 might "skip (collision)" because step-1
+        created the target dir. This test pins the actual behavior: build_log
+        DOES migrate (target check is against the FILE workspace/build_log.md,
+        not the dir).
+        """
+        # Drop env so the unset-branch of resolve_workspace executes.
+        self._saved_env = os.environ.pop("SUTANDO_WORKSPACE", None)
+        try:
+            legacy = Path(tempfile.mkdtemp(prefix="ws-mini-nit-legacy-"))
+            target = Path(tempfile.mkdtemp(prefix="ws-mini-nit-target-"))
+            target.rmdir()  # _migrate_from_legacy bails if target exists+nonempty
+            # Seed legacy: runtime dirs with content + build_log at root.
+            (legacy / "tasks").mkdir()
+            (legacy / "tasks" / "task-1.txt").write_text("legacy task")
+            (legacy / "results").mkdir()
+            (legacy / "results" / "task-1.txt").write_text("legacy result")
+            (legacy / "state").mkdir()
+            (legacy / "state" / "x.json").write_text("{}")
+            (legacy / "build_log.md").write_text("# legacy build log\nimportant\n")
+            with patch.object(workspace_default, "_legacy_repo_root", return_value=legacy), \
+                 patch.object(workspace_default, "default_workspace_dir", return_value=target):
+                ws = resolve_workspace(migrate=True)
+            self.assertEqual(ws, target)
+            # Runtime dirs landed at target.
+            self.assertTrue((target / "tasks" / "task-1.txt").exists())
+            self.assertTrue((target / "results" / "task-1.txt").exists())
+            self.assertTrue((target / "state" / "x.json").exists())
+            # AND build_log.md ALSO migrated — not stranded.
+            self.assertTrue((target / "build_log.md").is_file())
+            self.assertEqual(
+                (target / "build_log.md").read_text(),
+                "# legacy build log\nimportant\n",
+            )
+            self.assertFalse((legacy / "build_log.md").exists())
+        finally:
+            shutil.rmtree(legacy, ignore_errors=True)
+            shutil.rmtree(target, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

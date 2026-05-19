@@ -41,7 +41,7 @@ import { workTool, startResultWatcher, startContextDropWatcher, startNoteViewing
 import { buildSutandoSystemPrompt, buildVoiceAgentContext } from './voice-context.js';
 import { classifyTransportClose, type ClassifiedClose } from './voice-error-classifier.js';
 
-import { personalPath, sharedPersonalPath } from './util_paths.js';
+import { personalPath, sharedPersonalPath, memoryDirEnv } from './util_paths.js';
 
 // Cartesia is loaded dynamically at the bottom of the config section so
 // the `@cartesia/cartesia-js` package is only required when the user has
@@ -582,19 +582,20 @@ const mainAgent: MainAgent = {
 		'Every Sutando evolves differently based on what its user needs. You earned your name and identity.',
 		(() => { try { const si = JSON.parse(readFileSync(personalPath('stand-identity.json'), 'utf-8')); return si.name ? `Your Stand name is ${si.name}. Origin: ${si.nameOrigin || 'earned through use'}. When asked your name or who you are, say "I\'m Sutando — ${si.name}."` : ''; } catch { return ''; } })(),
 		// Optional context file — for presentations, meeting prep, etc. (gitignored)
-		// Reads $SUTANDO_PRIVATE_DIR/voice-contexts/<active>.txt where <active> is
-		// the trimmed contents of $SUTANDO_PRIVATE_DIR/voice-contexts/active.
+		// Reads $SUTANDO_MEMORY_DIR/voice-contexts/<active>.txt where <active> is
+		// the trimmed contents of $SUTANDO_MEMORY_DIR/voice-contexts/active
+		// (legacy $SUTANDO_PRIVATE_DIR honored via memoryDirEnv()).
 		// Falls back to public-repo voice-context.txt when the env var is unset
 		// or the pointer/file is missing. Switcher tool: set_voice_context(name)
 		// from skills/personal-voice-context/ writes the pointer.
 		(() => {
 			// Log which voice-context file was loaded so the operator can see at
-			// a glance whether the dynamic loader picked up the private dir or
+			// a glance whether the dynamic loader picked up the memory dir or
 			// fell through to the public fallback. Silent loads are hard to
 			// debug — Apr 29 spent 30+ minutes diff'ing files because the load
 			// path was opaque.
 			try {
-				const privateRoot = process.env.SUTANDO_PRIVATE_DIR;
+				const privateRoot = memoryDirEnv();
 				if (privateRoot) {
 					const root = privateRoot.replace(/^~/, process.env.HOME || '');
 					const pointerPath = join(root, 'voice-contexts', 'active');
@@ -850,7 +851,14 @@ async function main() {
 	// this after ~5 PR-restart cycles desyncing voiceConnected.
 	function writeVoiceState(connected: boolean) {
 		try {
-			writeFileSync('voice-state.json', JSON.stringify({ connected, ts: Math.floor(Date.now() / 1000) }));
+			// voice-state.json is per-user runtime state — lives under
+			// $SUTANDO_WORKSPACE. Pre-fix this was a cwd-relative write
+			// (effectively REPO_ROOT when launched from there), so the
+			// web-client's REPO_ROOT-relative reader happened to find it —
+			// but on hosts where SUTANDO_WORKSPACE is set or cwd drifts,
+			// voice-agent wrote one place and the consumer read another.
+			// Same workspace-contract fix as #849 for core-status.json.
+			writeFileSync(join(WORKSPACE_DIR, 'voice-state.json'), JSON.stringify({ connected, ts: Math.floor(Date.now() / 1000) }));
 		} catch (err) {
 			console.error(`${ts()} [VoiceState] write failed:`, err);
 		}

@@ -53,8 +53,18 @@ import { hostname } from 'node:os';
 import { resolveWorkspace } from '../../../src/workspace_default.js';
 
 // Personal-asset path resolver — twin of util_paths.py / voice-agent.ts:personalPath.
+// Reads $SUTANDO_MEMORY_DIR (canonical post-#870), honors legacy $SUTANDO_PRIVATE_DIR
+// as a fallback with a one-release deprecation warning on every read.
 function personalPath(filename: string): string {
-	const privateRoot = process.env.SUTANDO_PRIVATE_DIR;
+	let privateRoot = process.env.SUTANDO_MEMORY_DIR;
+	if (!privateRoot && process.env.SUTANDO_PRIVATE_DIR) {
+		console.warn(
+			'[conversation-server] DEPRECATION: SUTANDO_PRIVATE_DIR is the old name ' +
+				'for the memory dir; set SUTANDO_MEMORY_DIR instead (this alias will ' +
+				'be removed in the next release). See #870.',
+		);
+		privateRoot = process.env.SUTANDO_PRIVATE_DIR;
+	}
 	if (privateRoot) {
 		const root = privateRoot.replace(/^~/, process.env.HOME || '');
 		const host = hostname().split('.')[0];

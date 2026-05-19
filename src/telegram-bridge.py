@@ -24,6 +24,7 @@ except Exception:  # pragma: no cover — bridge must keep running
     def _push_vision_image(path: str, source: str = "telegram") -> bool:  # type: ignore
         return False
 from task_priority import default_priority_for_source  # noqa: E402
+from result_markers import parse_markers  # noqa: E402
 
 from workspace_default import resolve_workspace  # noqa: E402
 REPO = resolve_workspace()
@@ -447,11 +448,14 @@ def main():
             if result_file.exists():
                 reply_text = result_file.read_text().strip()
                 chat_id = pending_replies.pop(task_id)
-                # Skip sending if already replied directly.
-                # Clean up both files so watcher doesn't re-fire on leftover
-                # task — same bug class as discord-bridge had.
-                if reply_text.startswith('[no-send]') or reply_text.startswith('[REPLIED]'):
-                    print(f"  Skipped (already replied): {task_id}")
+                # Parse markers via the unified module (#873). Telegram
+                # honors [no-send] / [REPLIED] / [deduped: <id>] as skip
+                # and strips file markers from the text it sends. It
+                # ignores [channel:] redirects (no concept in Telegram —
+                # the marker is silently dropped from body, not leaked).
+                parsed = parse_markers(reply_text)
+                if any(a.kind == "skip" for a in parsed.actions):
+                    print(f"  Skipped (marker): {task_id}", flush=True)
                     archive_file(result_file, "results", task_id)
                     task_file = TASKS_DIR / f"{task_id}.txt"
                     archive_file(task_file, "tasks", task_id)

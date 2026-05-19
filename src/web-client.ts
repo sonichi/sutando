@@ -3104,13 +3104,18 @@ let _seeingUntil = 0;
 const CORE_STATUS_STALE_SECONDS = 60;
 function readCoreStatus(): { running: boolean; step: string; stale: boolean } {
 	try {
-		const url = new URL('../core-status.json', import.meta.url);
-		const raw = readFileSync(url, 'utf-8');
+		// core-status.json is per-user runtime state at $SUTANDO_WORKSPACE
+		// (default ~/.sutando/workspace/). Pre-fix this read from REPO_ROOT via
+		// import.meta.url-relative `../core-status.json` — but Python writers
+		// migrated to WORKSPACE_DIR in #836, so the TS reader silently saw stale
+		// or missing data. Same workspace-contract fix as #821/#842/#843.
+		const statusPath = join(WORKSPACE_DIR, 'core-status.json');
+		const raw = readFileSync(statusPath, 'utf-8');
 		const s = JSON.parse(raw) as { status?: string; ts?: number; step?: string };
 		const nowSec = Date.now() / 1000;
 		let stale = false;
 		try {
-			const mtimeSec = statSync(url).mtimeMs / 1000;
+			const mtimeSec = statSync(statusPath).mtimeMs / 1000;
 			if (nowSec - mtimeSec > CORE_STATUS_STALE_SECONDS) stale = true;
 		} catch { stale = true; }
 		// "Running with old ts" → loop likely crashed mid-pass, treat as stale.
@@ -3129,8 +3134,15 @@ function coreIsRunning(): boolean { return readCoreStatus().running; }
 const VOICE_STATE_STALE_SECONDS = 120;
 function readVoiceState(): boolean | null {
 	try {
-		const url = new URL('../voice-state.json', import.meta.url);
-		const raw = readFileSync(url, 'utf-8');
+		// voice-state.json is per-user runtime state — lives under
+		// $SUTANDO_WORKSPACE. Pre-fix this read from REPO_ROOT via the
+		// import.meta.url-relative path — but voice-agent's writer also
+		// resolved relative to its cwd (= REPO_ROOT when launched from
+		// there), so both sides happened to align on the same install.
+		// On SUTANDO_WORKSPACE-set hosts (or cwd-drift), the two split.
+		// Same workspace-contract fix as #849 for core-status.json.
+		const statusPath = join(WORKSPACE_DIR, 'voice-state.json');
+		const raw = readFileSync(statusPath, 'utf-8');
 		const s = JSON.parse(raw) as { connected?: boolean; ts?: number };
 		const nowSec = Date.now() / 1000;
 		if (typeof s.ts === 'number' && nowSec - s.ts > VOICE_STATE_STALE_SECONDS && s.connected) {

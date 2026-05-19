@@ -45,9 +45,12 @@ TRANSCRIPT="$1"  # Passed by PreCompact hook as $TRANSCRIPT_PATH
   gh pr list --repo sonichi/sutando --state open --limit 5 2>/dev/null || echo "(couldn't fetch)"
   echo ""
 
-  # Pending questions — canonical home is private machine-<host>/ post-migration.
-  # Resolves via util_paths.personal_path() with cwd fallback.
-  PQ_PATH=$(SUTANDO_PRIVATE_DIR="${SUTANDO_PRIVATE_DIR:-}" python3 -c "
+  # Pending questions — canonical home is memory-dir machine-<host>/ post-migration.
+  # Resolves via util_paths.personal_path() with cwd fallback. Pass through both
+  # the canonical SUTANDO_MEMORY_DIR and the legacy SUTANDO_PRIVATE_DIR; the
+  # helper prefers the new name and honors the legacy one with a deprecation
+  # warning for one release (#870).
+  PQ_PATH=$(SUTANDO_MEMORY_DIR="${SUTANDO_MEMORY_DIR:-}" SUTANDO_PRIVATE_DIR="${SUTANDO_PRIVATE_DIR:-}" python3 -c "
 import sys; sys.path.insert(0, '$REPO/src')
 from util_paths import personal_path
 from pathlib import Path

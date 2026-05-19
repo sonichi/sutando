@@ -60,11 +60,16 @@ describe('init.sh --auto (Tier 1: directories)', () => {
 });
 
 describe('init.sh --auto (Tier 1: placeholder files)', () => {
-	it('creates build_log.md with a header pointing at the proactive loop', () => {
+	it('does NOT create build_log.md at the repo (lives in workspace per contract)', () => {
 		runInit(scratch, '--auto');
-		const body = readFileSync(join(scratch, 'build_log.md'), 'utf-8');
-		assert.match(body, /^# Sutando build log/);
-		assert.match(body, /proactive loop/i);
+		// build_log.md is a workspace artifact, owned by workspace_default.py +
+		// dashboard/health-check. init.sh seeding at repo would resurrect the
+		// pre-2026-05-18 split-brain. Confirm absence at repo root.
+		assert.equal(
+			existsSync(join(scratch, 'build_log.md')),
+			false,
+			'build_log.md should not be seeded at the repo root',
+		);
 	});
 
 	it('creates pending-questions.md with an empty placeholder', () => {
@@ -94,13 +99,6 @@ describe('init.sh --auto (Tier 1: placeholder files)', () => {
 		const body = readFileSync(join(scratch, 'voice-state.json'), 'utf-8');
 		const parsed = JSON.parse(body);
 		assert.equal(parsed.connected, false);
-	});
-
-	it('does NOT clobber an existing build_log.md', () => {
-		writeFileSync(join(scratch, 'build_log.md'), '# my custom log\n\nimportant content\n');
-		runInit(scratch, '--auto');
-		const body = readFileSync(join(scratch, 'build_log.md'), 'utf-8');
-		assert.equal(body, '# my custom log\n\nimportant content\n');
 	});
 
 	it('does NOT clobber an existing contextual-chips.json', () => {

@@ -8,22 +8,23 @@ set -euo pipefail
 
 WINDOW="${1:-24h}"
 # REPO resolution: prefer SUTANDO_ROOT env, then $PWD if it looks like a
-# Sutando workspace (has build_log.md), else walk up from $0 looking for
-# build_log.md (handles invocation via the userSettings hardlink at
-# ~/.claude/skills/... where the original 3-level dirname-walk landed at
-# ~/.claude/ instead of the workspace). Caught 2026-05-05 when /self-diagnose
-# silently ran against ~/.claude/ on Mini, producing empty
-# git-log/build_log/health.txt.
+# Sutando repo (has CLAUDE.md), else walk up from $0 looking for CLAUDE.md
+# (handles invocation via the userSettings hardlink at ~/.claude/skills/...
+# where the original 3-level dirname-walk landed at ~/.claude/ instead of
+# the workspace). Caught 2026-05-05 when /self-diagnose silently ran against
+# ~/.claude/ on Mini, producing empty git-log/build_log/health.txt.
+# Marker file is CLAUDE.md (stable, identity-bearing). Previously build_log.md,
+# swapped 2026-05-18 when build_log.md moved to $SUTANDO_WORKSPACE.
 REPO=""
-if [ -n "${SUTANDO_ROOT:-}" ] && [ -f "${SUTANDO_ROOT}/build_log.md" ]; then
+if [ -n "${SUTANDO_ROOT:-}" ] && [ -f "${SUTANDO_ROOT}/CLAUDE.md" ]; then
 	REPO="$SUTANDO_ROOT"
-elif [ -f "$PWD/build_log.md" ]; then
+elif [ -f "$PWD/CLAUDE.md" ]; then
 	REPO="$PWD"
 else
-	# Walk up from $0 looking for build_log.md (max 5 levels)
+	# Walk up from $0 looking for CLAUDE.md (max 5 levels)
 	DIR="$(cd "$(dirname "$0")" && pwd)"
 	for _ in 1 2 3 4 5; do
-		if [ -f "$DIR/build_log.md" ]; then
+		if [ -f "$DIR/CLAUDE.md" ]; then
 			REPO="$DIR"
 			break
 		fi

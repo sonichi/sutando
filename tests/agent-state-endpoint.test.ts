@@ -2,9 +2,9 @@ import { describe, it, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, ChildProcess } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
-import { readFileSync, writeFileSync, existsSync, unlinkSync } from 'node:fs';
-import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { writeFileSync, unlinkSync } from 'node:fs';
+import { join } from 'node:path';
+import { setupTempWorkspace } from './_helpers/temp-workspace.js';
 
 // Integration test for PR #418 / #419 agent-state plumbing.
 // Spawns web-client.ts on a random port, exercises /sse-status + /mute-state,
@@ -14,22 +14,24 @@ import { fileURLToPath } from 'node:url';
 
 const PORT = 18081; // well above the 8080 dev server + 9900 voice-agent
 
-// Test spawns the same web-client.ts the prod server uses. web-client reads
-// `../core-status.json` via the #443 coreIsRunning fallback, so a mid-pass
-// `{"status":"running"}` write by the proactive loop leaks into the isolated
-// test server and turns "idle" assertions into "working". Neutralize by
-// writing an idle sentinel before the test + restoring the original bytes on
-// teardown. Without this, 2 tests fail whenever `npm test` coincides with a
-// /proactive-loop step-0 write (or any other running-state write).
-const CORE_STATUS_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'core-status.json');
-let savedCoreStatus: string | null = null;
+// Each test process gets its own SUTANDO_WORKSPACE temp dir so concurrent
+// test files (notably tests/get-core-status-tool.test.ts, which writes
+// core-status.json with status:'running' as a fixture) can't race with our
+// reads. Before #840 fix: both tests shared <REPO_ROOT>/core-status.json
+// and node:test parallel file runs caused intermittent
+// `expected listening, got working` on the agent-state assertions.
+const { workspace: TEMP_WORKSPACE, cleanup: cleanupTempWorkspace } =
+	setupTempWorkspace('agent-state');
+const CORE_STATUS_PATH = join(TEMP_WORKSPACE, 'core-status.json');
 
 // voice-state.json is read by web-client's readVoiceState() as the authoritative
 // voiceConnected source (browser POST cache is the fallback). Tests in the
 // voice-state describe block below write/remove this file to exercise both
-// branches. Stash + restore any real prod value on setup/teardown.
-const VOICE_STATE_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'voice-state.json');
-let savedVoiceState: string | null = null;
+// branches. Lives in the same per-test-process TEMP_WORKSPACE as core-status.json
+// — no stash/restore needed, the temp dir didn't exist before this test and
+// gets rm'd on teardown. (Was REPO_ROOT pre-#853 fix; migrated to match the
+// post-#849 web-client reader semantics.)
+const VOICE_STATE_PATH = join(TEMP_WORKSPACE, 'voice-state.json');
 
 let child: ChildProcess;
 
@@ -40,26 +42,31 @@ async function fetchJson(path: string): Promise<any> {
 
 describe('/sse-status + /mute-state — agent state plumbing (PR #418)', () => {
 	before(async () => {
-		// Stash + neutralize core-status.json so a mid-pass "running" write
-		// by a live proactive loop can't leak "working" state into the test.
-		if (existsSync(CORE_STATUS_PATH)) {
-			savedCoreStatus = readFileSync(CORE_STATUS_PATH, 'utf-8');
-		}
+		// Write idle core-status into the per-test-process workspace temp dir.
+		// No stash/restore needed — the temp dir didn't exist before this test
+		// and gets rm'd on teardown.
 		writeFileSync(CORE_STATUS_PATH, JSON.stringify({ status: 'idle', ts: Math.floor(Date.now() / 1000) }) + '\n');
 
-		// Same rationale as core-status.json: stash + neutralize so a prod
-		// voice-state.json at repo root doesn't leak voiceConnected=true into
-		// the idle baseline assertion below.
-		if (existsSync(VOICE_STATE_PATH)) {
-			savedVoiceState = readFileSync(VOICE_STATE_PATH, 'utf-8');
-		}
+		// voice-state.json lives in TEMP_WORKSPACE post-#853 migration, so no
+		// prod-state leak is possible (the temp dir is fresh). Just ensure the
+		// file is absent before the spawned web-client reads it for the
+		// "missing voice-state.json falls back to cache" subtest baseline.
 		try { unlinkSync(VOICE_STATE_PATH); } catch { /* already gone */ }
 
 		child = spawn(
 			'npx',
 			['tsx', 'src/web-client.ts'],
 			{
-				env: { ...process.env, CLIENT_PORT: String(PORT), PORT: '19900', CLIENT_HOST: '127.0.0.1' },
+				env: {
+					...process.env,
+					CLIENT_PORT: String(PORT),
+					PORT: '19900',
+					CLIENT_HOST: '127.0.0.1',
+					// Spawned web-client uses TEMP_WORKSPACE for core-status.json,
+					// so concurrent test processes can't race on the file. Same
+					// SUTANDO_WORKSPACE env override the rest of the test suite uses.
+					SUTANDO_WORKSPACE: TEMP_WORKSPACE,
+				},
 				// 'ignore' prevents the pipe buffer from filling in CI (stdout isn't drained),
 				// which would block the child and cause the /sse-status poll to time out.
 				stdio: 'ignore',
@@ -92,18 +99,9 @@ describe('/sse-status + /mute-state — agent state plumbing (PR #418)', () => {
 				child.kill('SIGTERM');
 			});
 		}
-		// Restore original core-status.json bytes (or delete the sentinel we
-		// wrote if no original existed). Keeps the live proactive loop's
-		// post-test reads consistent with what it wrote last.
-		if (savedCoreStatus !== null) {
-			writeFileSync(CORE_STATUS_PATH, savedCoreStatus);
-		}
-		// Restore voice-state.json (or clean up our test write)
-		if (savedVoiceState !== null) {
-			writeFileSync(VOICE_STATE_PATH, savedVoiceState);
-		} else {
-			try { unlinkSync(VOICE_STATE_PATH); } catch { /* idempotent */ }
-		}
+		// Remove the per-test-process workspace temp dir wholesale.
+		// This now also covers voice-state.json (in the same temp dir).
+		cleanupTempWorkspace();
 	});
 
 	// Reset both tracks to idle before every subtest so order-dependence can't
