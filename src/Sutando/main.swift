@@ -1,6 +1,7 @@
 import Cocoa
 import Carbon
 import UserNotifications
+import ApplicationServices
 
 // MARK: - Sutando Drop Menu Bar App
 // Replaces Automator Quick Action for context drops.
@@ -13,6 +14,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var hotKeyRefs: [EventHotKeyRef?] = []  // one entry per registered hotkey
     var hotKeyActions: [UInt32: String] = [:]  // hotkey id → action name
     var lastDropTime: Date = .distantPast
+    var screencaptureInFlight: Bool = false  // guards against stacked crosshair launches
     // Runtime state lives under the per-user workspace dir, not the repo
     // checkout. Mirrors src/workspace_default.py + src/workspace_default.ts
     // (PR #762 / #821). Resolution:
@@ -109,6 +111,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         DispatchQueue.main.async { [self] in
             setupMenuBar()
+            // Check Accessibility trust at startup. AX-related features
+            // (kAXSelectedTextAttribute reads in dropContext, synthetic Cmd+C
+            // via CGEventPost) silently fail when the bundle's TCC entry is
+            // stale — usually after a codesign identity change. Empirical
+            // case 2026-05-19: dropContext started returning "Nothing
+            // selected" for every app (Discord and TextEdit both) after
+            // Sutando.app was re-signed (ad-hoc Identifier=Sutando →
+            // cert-signed Identifier=com.sutando.menubar). The Accessibility
+            // TCC entry from the prior signature didn't transfer to the new
+            // binary; macOS silently returned AX errors without re-prompting.
+            // AXIsProcessTrustedWithOptions with prompt=true forces a
+            // re-bind: if the running binary's signature doesn't match any
+            // granted TCC row, the standard "Sutando wants Accessibility"
+            // dialog opens, and on Allow the TCC entry is recreated against
+            // the current signature. Idempotent when already trusted
+            // (returns true, no dialog). The result is also logged so future
+            // drift surfaces in the debug log on session 0.
+            let axOpts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+            let axTrusted = AXIsProcessTrustedWithOptions(axOpts)
+            logToFile("startup: AXIsProcessTrusted=\(axTrusted)")
             registerHotKey()
             watchResults()
             logToFile("App started, workspace=\(workspace)")
@@ -1261,78 +1283,233 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // 2. Check clipboard for image (PNG)
-        if let imageData = NSPasteboard.general.data(forType: .png) {
-            do {
-                try imageData.write(to: URL(fileURLWithPath: dropImage))
-                let content = """
-                timestamp: \(timestamp)
-                type: image
-                path: \(dropImage)
-                \(ctxHeader)---
-                [Image dropped from clipboard]
-                """
-                appendLog(logFile, "[\(timestamp)] Dropped: image (\(imageData.count) bytes)")
-                writeTask(tasksDir, timestamp: timestamp, content: content)
-                notify("Sutando", "Image dropped (\(imageData.count / 1024)KB)")
-                return
-            } catch {}
-        }
-
-        // 3. Check clipboard for TIFF image (screenshots sometimes use TIFF)
-        if let tiffData = NSPasteboard.general.data(forType: .tiff),
-           let bitmapRep = NSBitmapImageRep(data: tiffData),
-           let pngData = bitmapRep.representation(using: .png, properties: [:]) {
-            do {
-                try pngData.write(to: URL(fileURLWithPath: dropImage))
-                let content = """
-                timestamp: \(timestamp)
-                type: image
-                path: \(dropImage)
-                \(ctxHeader)---
-                [Image dropped from clipboard]
-                """
-                appendLog(logFile, "[\(timestamp)] Dropped: image (\(pngData.count) bytes)")
-                writeTask(tasksDir, timestamp: timestamp, content: content)
-                notify("Sutando", "Image dropped (\(pngData.count / 1024)KB)")
-                return
-            } catch {}
-        }
-
-        // 4. Try to get selected text via Accessibility API
-        if let selected = getSelectedText(), !selected.isEmpty {
+        // Drop-resolution chain. All text paths run before any image path so
+        // lingering clipboard screenshots don't pre-empt selected-text drops.
+        //
+        // Text-emit helper — captures the AX/clipboard metadata block if
+        // present, writes the task, notifies. Returns true on success.
+        let emitText: (String, String?, String?, String?, String?, String) -> Void = {
+            [self] (selected, app, windowTitle, urlVal, axPath, source) in
+            var meta: [String] = []
+            if let a = app, !a.isEmpty { meta.append("app: \(a)") }
+            if let w = windowTitle, !w.isEmpty { meta.append("window: \(w)") }
+            if let u = urlVal, !u.isEmpty { meta.append("url: \(u)") }
+            if let p = axPath, !p.isEmpty { meta.append("ax_path: \(p)") }
+            let metaBlock = meta.isEmpty ? "" : meta.joined(separator: "\n") + "\n"
             let content = """
             timestamp: \(timestamp)
             type: text
-            \(ctxHeader)---
+            \(metaBlock)\(ctxHeader)---
             \(selected)
             """
-            appendLog(logFile, "[\(timestamp)] Dropped: \(selected.count) chars")
+            appendLog(logFile, "[\(timestamp)] Dropped: \(selected.count) chars (\(source))")
             writeTask(tasksDir, timestamp: timestamp, content: content)
             let snippet = String(selected.prefix(80)).replacingOccurrences(of: "\n", with: " ")
             notify("Sutando", "Dropped: \(snippet)\(selected.count > 80 ? "…" : "")")
+        }
+
+        // 2. ax-read (preferred text path; subprocess, has changeCount-safe
+        //    clipboard fallback + restores prior pasteboard).
+        if let axRead = invokeAxRead() {
+            let selected = (axRead["selected"] as? String) ?? ""
+            if !selected.isEmpty {
+                emitText(selected,
+                         axRead["app"] as? String,
+                         axRead["window_title"] as? String,
+                         axRead["url"] as? String,
+                         axRead["path"] as? String,
+                         "ax-read")
+                return
+            }
+        }
+
+        // 3. Legacy in-process AX (fallback when ax-read binary missing).
+        if let selected = getSelectedText(), !selected.isEmpty {
+            emitText(selected, nil, nil, nil, nil, "legacy-ax")
             return
         }
 
-        // 5. Fallback: simulate Cmd+C, read clipboard
+        // 4. Legacy Cmd+C simulation with changeCount guard. Async wait so the
+        //    main run loop is free to deliver the synthetic event. If still no
+        //    text after the wait, fall through to image branches and finally
+        //    the interactive screencapture fallback.
+        let pb = NSPasteboard.general
+        let priorChangeCount = pb.changeCount
         simulateCopy()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [self] in
-            if let text = NSPasteboard.general.string(forType: .string), !text.isEmpty {
-                let content = """
-                timestamp: \(timestamp)
-                type: text
-                \(ctxHeader)---
-                \(text)
-                """
-                appendLog(logFile, "[\(timestamp)] Dropped: \(text.count) chars")
-                writeTask(tasksDir, timestamp: timestamp, content: content)
-                let snippet = String(text.prefix(80)).replacingOccurrences(of: "\n", with: " ")
-                notify("Sutando", "Dropped: \(snippet)\(text.count > 80 ? "…" : "")")
-            } else {
-                notify("Sutando", "Nothing selected — select text first")
-                appendLog(logFile, "[\(timestamp)] Nothing selected")
+            if pb.changeCount > priorChangeCount,
+               let text = pb.string(forType: .string), !text.isEmpty {
+                emitText(text, nil, nil, nil, nil, "legacy-cmd+c")
+                return
+            }
+
+            // 5. Clipboard PNG.
+            if let imageData = pb.data(forType: .png) {
+                do {
+                    try imageData.write(to: URL(fileURLWithPath: dropImage))
+                    let content = """
+                    timestamp: \(timestamp)
+                    type: image
+                    path: \(dropImage)
+                    \(ctxHeader)---
+                    [Image dropped from clipboard]
+                    """
+                    appendLog(logFile, "[\(timestamp)] Dropped: image (\(imageData.count) bytes, clipboard-png)")
+                    writeTask(tasksDir, timestamp: timestamp, content: content)
+                    notify("Sutando", "Image dropped (\(imageData.count / 1024)KB)")
+                    return
+                } catch {}
+            }
+
+            // 6. Clipboard TIFF (some screenshot tools).
+            if let tiffData = pb.data(forType: .tiff),
+               let bitmapRep = NSBitmapImageRep(data: tiffData),
+               let pngData = bitmapRep.representation(using: .png, properties: [:]) {
+                do {
+                    try pngData.write(to: URL(fileURLWithPath: dropImage))
+                    let content = """
+                    timestamp: \(timestamp)
+                    type: image
+                    path: \(dropImage)
+                    \(ctxHeader)---
+                    [Image dropped from clipboard]
+                    """
+                    appendLog(logFile, "[\(timestamp)] Dropped: image (\(pngData.count) bytes, clipboard-tiff→png)")
+                    writeTask(tasksDir, timestamp: timestamp, content: content)
+                    notify("Sutando", "Image dropped (\(pngData.count / 1024)KB)")
+                    return
+                } catch {}
+            }
+
+            // 7. Last resort: interactive region capture. Esc cancels. Run on
+            //    a background queue so the main run loop stays responsive
+            //    while the user drags (waitUntilExit can take many seconds).
+            //    In-flight guard prevents stacked crosshairs from rapid ⌃C.
+            if self.screencaptureInFlight {
+                appendLog(logFile, "[\(timestamp)] screencapture already in flight, skipping")
+                return
+            }
+            self.screencaptureInFlight = true
+            appendLog(logFile, "[\(timestamp)] launching screencapture -i -c")
+            let priorPbChange = pb.changeCount
+            DispatchQueue.global(qos: .userInitiated).async { [self] in
+                defer { DispatchQueue.main.async { self.screencaptureInFlight = false } }
+                let cap = Process()
+                cap.launchPath = "/usr/sbin/screencapture"
+                cap.arguments = ["-i", "-c"]
+                cap.standardOutput = Pipe()
+                cap.standardError = Pipe()
+                do {
+                    try cap.run()
+                    cap.waitUntilExit()
+                } catch {
+                    DispatchQueue.main.async { [self] in
+                        appendLog(logFile, "[\(timestamp)] screencapture failed: \(error.localizedDescription)")
+                        notify("Sutando", "Nothing selected — screencapture unavailable")
+                    }
+                    return
+                }
+                DispatchQueue.main.async { [self] in
+                    if pb.changeCount > priorPbChange {
+                        if let png = pb.data(forType: .png) {
+                            do {
+                                try png.write(to: URL(fileURLWithPath: dropImage))
+                                let content = """
+                                timestamp: \(timestamp)
+                                type: image
+                                path: \(dropImage)
+                                \(ctxHeader)---
+                                [Image dropped via screen-region capture]
+                                """
+                                appendLog(logFile, "[\(timestamp)] Dropped: image (\(png.count) bytes, screencapture-region)")
+                                writeTask(tasksDir, timestamp: timestamp, content: content)
+                                notify("Sutando", "Region captured (\(png.count / 1024)KB)")
+                                return
+                            } catch {}
+                        }
+                        if let tiff = pb.data(forType: .tiff),
+                           let rep = NSBitmapImageRep(data: tiff),
+                           let png = rep.representation(using: .png, properties: [:]) {
+                            do {
+                                try png.write(to: URL(fileURLWithPath: dropImage))
+                                let content = """
+                                timestamp: \(timestamp)
+                                type: image
+                                path: \(dropImage)
+                                \(ctxHeader)---
+                                [Image dropped via screen-region capture]
+                                """
+                                appendLog(logFile, "[\(timestamp)] Dropped: image (\(png.count) bytes, screencapture-region tiff→png)")
+                                writeTask(tasksDir, timestamp: timestamp, content: content)
+                                notify("Sutando", "Region captured (\(png.count / 1024)KB)")
+                                return
+                            } catch {}
+                        }
+                    }
+                    notify("Sutando", "Cancelled — nothing dropped")
+                    appendLog(logFile, "[\(timestamp)] cancelled (screencapture esc / no clipboard change)")
+                }
             }
         }
+    }
+
+    // MARK: - ax-read subprocess (voice agent's read_selection primitive)
+    //
+    // Resolution order for the binary path:
+    //   1. $SUTANDO_MEMORY_DIR/skills/personal-deictic/ax-read  (current canonical)
+    //   2. $SUTANDO_PRIVATE_DIR/skills/personal-deictic/ax-read (legacy alias, PR #876)
+    //   3. ~/.sutando/memory-sync/skills/personal-deictic/ax-read (default)
+    //
+    // Returns nil when the binary is missing, doesn't execute cleanly, or
+    // returns malformed JSON — callers fall back to the legacy in-process path.
+
+    func resolveAxReadPath() -> String? {
+        let env = ProcessInfo.processInfo.environment
+        let suffix = "/skills/personal-deictic/ax-read"
+        let candidates = [
+            env["SUTANDO_MEMORY_DIR"].map { $0 + suffix },
+            env["SUTANDO_PRIVATE_DIR"].map { $0 + suffix },
+            NSString(string: "~/.sutando/memory-sync" + suffix).expandingTildeInPath,
+        ].compactMap { $0 }
+        let fm = FileManager.default
+        for path in candidates {
+            if fm.isExecutableFile(atPath: path) {
+                return path
+            }
+        }
+        return nil
+    }
+
+    func invokeAxRead() -> [String: Any]? {
+        guard let binPath = resolveAxReadPath() else { return nil }
+        let task = Process()
+        task.launchPath = binPath
+        task.arguments = []
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        task.standardOutput = outPipe
+        task.standardError = errPipe
+        do {
+            try task.run()
+        } catch {
+            return nil
+        }
+        // 3s deadline matches ax-read's max screencapture timeout (1s) plus
+        // headroom for Cmd+C fallback wait (120ms). Anything longer means the
+        // subprocess is stuck — fall back to legacy.
+        let deadline = Date().addingTimeInterval(3.0)
+        while task.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        if task.isRunning {
+            task.terminate()
+            return nil
+        }
+        let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return json
     }
 
     // MARK: - Screenshot Drop (⌥C)

@@ -253,8 +253,26 @@ if [ -f "$SUT_SRC" ] && { [ ! -f "$SUT_BIN" ] || [ "$SUT_SRC" -nt "$SUT_BIN" ]; 
       /usr/libexec/PlistBuddy \
         -c "Add :NSAppleEventsUsageDescription string 'Sutando reads your Finder selection to drop files into the agent task queue.'" \
         "$SUT_APP/Contents/Info.plist" 2>/dev/null || true
-      codesign --force --sign - "$SUT_APP" 2>/dev/null || true
-      echo "  ✓ Sutando.app synced + signed"
+      # Prefer a stable signing identity when one is installed so the TCC
+      # Accessibility grant survives rebuilds (cdhash churn). Falls back to
+      # ad-hoc when no such identity exists — public-repo users without a
+      # personal signing cert get the same behavior as before.
+      #
+      # The designated requirement is identifier-only on purpose: the
+      # grant binds to the bundle ID rather than cdhash, so a rebuild
+      # against the same identity satisfies the requirement without
+      # re-prompting. For installs without a cert, ad-hoc still requires
+      # re-grant on each rebuild — same as the legacy behavior.
+      SUT_SIGN_ID="$(security find-identity -v -p codesigning 2>/dev/null | awk '/"Sutando Dev"/{print $2; exit}')"
+      if [ -n "$SUT_SIGN_ID" ]; then
+        codesign --force --sign "$SUT_SIGN_ID" --identifier com.sutando.menubar \
+          --requirements '=designated => identifier "com.sutando.menubar"' \
+          "$SUT_APP" 2>/dev/null || codesign --force --sign - "$SUT_APP" 2>/dev/null || true
+        echo "  ✓ Sutando.app synced + signed (Sutando Dev + identifier-only DR)"
+      else
+        codesign --force --sign - "$SUT_APP" 2>/dev/null || true
+        echo "  ✓ Sutando.app synced + signed (ad-hoc; install \"Sutando Dev\" cert for stable TCC)"
+      fi
     fi
 
     if pgrep -f "src/Sutando/Sutando" > /dev/null 2>&1; then
