@@ -1,10 +1,16 @@
 """Resolve personal-asset paths with private-dir-first lookup.
 
 Each Stand has its own identity + avatar. These files are gitignored and
-machine-local. Canonical home is `$SUTANDO_PRIVATE_DIR/machine-<hostname>/`
+machine-local. Canonical home is `$SUTANDO_MEMORY_DIR/machine-<hostname>/`
 so they live with the rest of the per-machine memory under the private
 sync repo. Public-workspace fallback is preserved so existing installs
 keep working until they migrate.
+
+The env var `SUTANDO_MEMORY_DIR` is the canonical name per the 2026-05-18
+workspace-design RFC (#858, Decision 2). The legacy name `SUTANDO_PRIVATE_DIR`
+is honored as a fallback for one release with a deprecation warning on
+every read (cron environments miss startup-only warnings, so logging at
+every resolution is intentional).
 
 Usage:
     from util_paths import personal_path
@@ -14,9 +20,39 @@ Usage:
 from __future__ import annotations
 import os
 import socket
+import sys
 from pathlib import Path
 
 REPO_DIR = Path(__file__).resolve().parent.parent
+
+
+def _memory_dir_env() -> str | None:
+    """Return the resolved memory-dir env value, preferring the new name.
+
+    Lookup order:
+      1. `SUTANDO_MEMORY_DIR` (canonical post-#858 / #870)
+      2. `SUTANDO_PRIVATE_DIR` (legacy, with deprecation warning emitted
+         to stderr on every read — not just once at startup; cron and
+         launchd environments miss startup-only warnings).
+
+    Returns the raw env value (caller must `os.path.expanduser` if needed),
+    or None when neither is set."""
+    new = os.environ.get("SUTANDO_MEMORY_DIR")
+    if new:
+        return new
+    legacy = os.environ.get("SUTANDO_PRIVATE_DIR")
+    if legacy:
+        # Every-read deprecation warning. This is loud by design — the
+        # legacy alias will drop in the next release and silent users
+        # would otherwise miss the cutover. See #870 for the rename plan.
+        print(
+            "[util_paths.py] DEPRECATION: SUTANDO_PRIVATE_DIR is the old name "
+            "for the memory dir; set SUTANDO_MEMORY_DIR instead (this alias "
+            "will be removed in the next release). See #870.",
+            file=sys.stderr,
+        )
+        return legacy
+    return None
 
 
 def _workspace_root() -> Path:
@@ -45,7 +81,7 @@ def _workspace_root() -> Path:
 
 
 def _private_machine_dir() -> Path | None:
-    root = os.environ.get("SUTANDO_PRIVATE_DIR")
+    root = _memory_dir_env()
     if not root:
         return None
     expanded = os.path.expanduser(root)
@@ -56,7 +92,9 @@ def _private_machine_dir() -> Path | None:
 def personal_path(filename: str, workspace: Path | None = None) -> Path:
     """Resolve a personal-asset path.
 
-    Order: `$SUTANDO_PRIVATE_DIR/machine-<host>/<filename>` → `<workspace>/<filename>`.
+    Order: `$SUTANDO_MEMORY_DIR/machine-<host>/<filename>` → `<workspace>/<filename>`.
+    (Legacy `$SUTANDO_PRIVATE_DIR` is honored as a fallback with a
+    deprecation warning — see `_memory_dir_env()`.)
     For files known to live under `assets/` in the public workspace
     (currently `stand-avatar.png`), also tries `<workspace>/assets/<filename>`
     before falling back to `<workspace>/<filename>`.
@@ -94,7 +132,9 @@ def shared_personal_path(filename: str, workspace: Path | None = None) -> Path:
     """Resolve a shared-private path (notes, build_log, etc.) — files that
     sync across all of an owner's machines, not per-machine state.
 
-    Order: `$SUTANDO_PRIVATE_DIR/<filename>` (top-level, shared) → `<workspace>/<filename>`.
+    Order: `$SUTANDO_MEMORY_DIR/<filename>` (top-level, shared) → `<workspace>/<filename>`.
+    (Legacy `$SUTANDO_PRIVATE_DIR` is honored as a fallback with a
+    deprecation warning — see `_memory_dir_env()`.)
 
     Difference vs `personal_path`: this resolves to the top-level private dir,
     NOT `machine-<host>/`. Use for files like notes/, where every Mac in
@@ -105,7 +145,7 @@ def shared_personal_path(filename: str, workspace: Path | None = None) -> Path:
     """
     ws = workspace if workspace is not None else _workspace_root()
 
-    root = os.environ.get("SUTANDO_PRIVATE_DIR")
+    root = _memory_dir_env()
     if root:
         private = Path(os.path.expanduser(root)) / filename
         if private.exists():
