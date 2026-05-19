@@ -39,6 +39,7 @@ Clicky's soul is not Q&A — it is *teaching happens while you work, in the real
 3. **AX tree → element selector** — the fast path still needs a cheap label/role match over the `macos-use` tree to turn intent into a Target (the half the AX POC did not cover).
 4. **IPC** — how `point_at` drives the Swift overlay (the menubar app currently watches files / `~/.config`; choose socket vs localhost endpoint vs command file).
 5. **Embodiment/persona** — replicate Clicky's blue triangle vs a Sutando-native pointer (reversible; defer).
+6. **`POINTER_MODEL` preview-id longevity** — `point_at` uses `gemini-3-flash-preview`. The May 25 2026 `gemini-3.1-flash-lite-preview` deprecation (#715) is a *different* model family and does **not** affect this one — verified on [Google's deprecation page](https://ai.google.dev/gemini-api/docs/deprecations) on 2026-05-19: no shutdown date announced. Escape hatch is the `POINTER_MODEL` env override (zero code change). Tracked follow-up: re-run the pointing POC on the GA id if/when one is published before swapping the default.
 
 ## 6. v1 — productionized into Sutando ✅
 
