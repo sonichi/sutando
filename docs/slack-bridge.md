@@ -19,10 +19,20 @@ pipeline as voice / Discord / Telegram.
    `im:write`, `app_mentions:read`, `channels:history`,
    `groups:history`, `files:read`, `files:write`, `users:read`.
 
-4. **Event Subscriptions**: enable. Subscribe to bot events `app_mention` and
-   `message.im` (DMs).
+4. **Event Subscriptions**: turn the **Enable Events** toggle ON at the
+   top of the page. Leave the Request URL field blank — Socket Mode
+   delivers events over the WebSocket, no public webhook needed. Under
+   **Subscribe to bot events**, add `message.im` and `app_mention`.
+   Click **Save Changes**.
 
-5. **Install to workspace**. Copy the Bot User OAuth Token (`xoxb-...`).
+5. **App Home → Messages Tab**: in the left sidebar pick **App Home**,
+   scroll to **Show Tabs** → **Messages Tab**, and check
+   **"Allow users to send Slash commands and messages from the messages
+   tab"**. Without this, the bot's DM screen shows
+   *"Sending messages to this app has been turned off"* and your DMs
+   silently fail.
+
+6. **Install to workspace**. Copy the Bot User OAuth Token (`xoxb-...`).
 
 ## Local config
 
@@ -97,3 +107,39 @@ bash src/startup.sh     # restart (and all other bridges)
 ```
 
 Logs land in `logs/slack-bridge.log`.
+
+## Install gotchas hit during real installs
+
+The Slack API config UI has a few places where a sensible default
+silently blocks the bridge. If your DMs aren't reaching the bridge,
+check these in order:
+
+1. **App-Level Token scope** — must be `connections:write`, NOT
+   `app_configurations:write`. The token-create dialog defaults to the
+   wrong one. The daemon crashes on boot with
+   `slack_sdk.errors.SlackApiError: missing_scope` if you picked the
+   other.
+
+2. **Bot Token Scopes vs User Token Scopes** — OAuth & Permissions has
+   two scope lists. Sutando runs entirely as a bot, so User Token
+   Scopes stays empty.
+
+3. **Event Subscriptions disabled** — the `Enable Events` toggle defaults
+   to OFF. Even with Socket Mode running, no events flow until this is
+   on. Bridge log will show only "Socket Mode connecting…" with no
+   subsequent activity, and `~/.claude/channels/slack/access.json` will
+   never be created.
+
+4. **Save Changes button greyed out** — when Event Subscriptions has
+   pending changes but Save is greyed, the form's Socket Mode state is
+   stale. Hard-refresh the page (cmd-shift-R) and try again. If still
+   greyed, type any placeholder URL into Request URL (e.g.
+   `https://example.com/x`); Socket Mode overrides it after save.
+
+5. **Messages Tab disabled in App Home** — see step 5 of setup above. If
+   you forget this, DMs to the bot show "Sending messages to this app
+   has been turned off" before the message even leaves Slack.
+
+6. **Forgot to reinstall after scope changes** — Slack shows a yellow
+   banner "Workspace needs to reinstall app" any time you add scopes.
+   Click it and re-authorize, otherwise the new scopes don't take effect.
