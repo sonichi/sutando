@@ -417,6 +417,18 @@ const POINTER_MODEL = process.env.POINTER_MODEL || 'gemini-3-flash-preview';
 // which is also what the Swift app resolves as `workspace`.
 const POINTER_CMD_PATH = join(process.cwd(), 'state', 'pointer-cmd.json');
 
+// Atomic publish to the pointer IPC file. The temp name is unique per call
+// (pid + ms + random) — a fixed per-process name lets two overlapping point_at
+// calls clobber each other's write/rename (Codex review, high). The rename is
+// atomic and the Swift side's monotonic `ts` guard decides which command wins,
+// so no lock is needed.
+function publishPointerCmd(cmd: Record<string, unknown>): void {
+	mkdirSync(join(process.cwd(), 'state'), { recursive: true });
+	const tmpCmd = `${POINTER_CMD_PATH}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 9)}.tmp`;
+	writeFileSync(tmpCmd, JSON.stringify(cmd));
+	renameSync(tmpCmd, POINTER_CMD_PATH);
+}
+
 export const pointAtTool: ToolDefinition = {
 	name: 'point_at',
 	description:
@@ -433,6 +445,17 @@ export const pointAtTool: ToolDefinition = {
 		if (!apiKey) return { error: 'point_at unavailable (no GEMINI_VOICE_API_KEY or GEMINI_API_KEY)' };
 		if (!query?.trim()) return { error: 'point_at needs a query (what to point at)' };
 		try {
+			// 0. Clear any overlay still on screen from a previous point_at
+			// before screenshotting. The :7845 server shells out to
+			// `screencapture`, which grabs the raw framebuffer and ignores
+			// NSWindow.sharingType — so the only way to keep a stale pointer
+			// out of the shot (and out of the model's input, which would bias
+			// the next target) is to tell the Swift overlay to hide, then give
+			// the dir-watcher → main-thread orderOut a moment to land before we
+			// capture (Codex review, high). ~250ms is negligible against the
+			// ~8s capture + ~60s model budget below.
+			publishPointerCmd({ hide: true, ts: Date.now() / 1000 });
+			await new Promise(r => setTimeout(r, 250));
 			// 1. capture the main display (single-display scope guard) via :7845.
 			// Timeout-bounded — point_at is on the sub-second inline lane and must
 			// never hang it if the capture server is wedged.
@@ -504,17 +527,15 @@ export const pointAtTool: ToolDefinition = {
 			}
 
 			// 3. hand the Target to the Swift overlay (runs in the real GUI session).
-			// Atomic publish: write a sibling temp file then rename over the
-			// command file so the dir-watcher never reads a half-written JSON.
-			mkdirSync(join(process.cwd(), 'state'), { recursive: true });
+			// Atomic publish via the shared helper (unique sibling temp →
+			// rename), so the dir-watcher never reads a half-written JSON and
+			// concurrent calls can't collide.
 			const cmd = {
 				nx: Math.round((x / 1000) * 1e5) / 1e5,
 				ny: Math.round((y / 1000) * 1e5) / 1e5,
 				label, say, ts: Date.now() / 1000,
 			};
-			const tmpCmd = `${POINTER_CMD_PATH}.${process.pid}.tmp`;
-			writeFileSync(tmpCmd, JSON.stringify(cmd));
-			renameSync(tmpCmd, POINTER_CMD_PATH);
+			publishPointerCmd(cmd);
 			console.log(`${ts()} [PointAt] "${query}" -> nx=${cmd.nx} ny=${cmd.ny} label="${label}"`);
 			return {
 				status: 'pointing',

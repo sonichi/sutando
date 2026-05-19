@@ -1744,16 +1744,52 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         src.setCancelHandler { close(fd) }
         src.resume()
         pointerWatchSource = src
+        // The window/view are sized once here, but pollPointerCmd maps coords
+        // against the *current* NSScreen.main.frame — a runtime resolution /
+        // scaling / arrangement change would desync them (Codex review,
+        // medium). Re-fit the overlay whenever the screen layout changes.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil, queue: .main) { [weak self] _ in self?.resizePointerOverlay() }
         logToFile("setupPointerOverlay: up on \(Int(f.width))x\(Int(f.height)), watching \(cmdPath)")
+    }
+
+    /// Re-fit the overlay window+view to the current main screen after a
+    /// display reconfiguration so it stays aligned with pollPointerCmd's
+    /// coordinate mapping (Codex review, medium).
+    func resizePointerOverlay() {
+        guard let screen = NSScreen.main, let window = pointerWindow else { return }
+        let f = screen.frame
+        window.setFrame(f, display: false)
+        pointerView.frame = NSRect(origin: .zero, size: f.size)
+        pointerView.needsDisplay = true
+        logToFile("resizePointerOverlay: now \(Int(f.width))x\(Int(f.height))")
     }
 
     func pollPointerCmd() {
         let cmdPath = workspace + "/state/pointer-cmd.json"
         guard let d = try? Data(contentsOf: URL(fileURLWithPath: cmdPath)),
               let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-              let tsv = o["ts"] as? Double, tsv > pointerLastTS,
-              let nx = o["nx"] as? Double, let ny = o["ny"] as? Double else { return }
+              let tsv = o["ts"] as? Double, tsv > pointerLastTS else { return }
         pointerLastTS = tsv
+        // hide-before-capture: point_at publishes {hide:true} just before it
+        // screenshots, because the :7845 server uses `screencapture` (raw
+        // framebuffer, ignores sharingType). Tear the overlay fully off the
+        // screen so a stale pointer can't bias the next capture (Codex review,
+        // high).
+        if o["hide"] as? Bool == true {
+            pointerAnim?.invalidate()
+            pointerPulseTimer?.invalidate(); pointerPulseTimer = nil
+            pointerHoldTimer?.invalidate(); pointerHoldTimer = nil
+            pointerFadeTimer?.invalidate(); pointerFadeTimer = nil
+            pointerView.alpha = 0
+            pointerView.showLabel = false
+            pointerView.needsDisplay = true
+            pointerWindow?.orderOut(nil)
+            logToFile("pollPointerCmd: hide ts=\(tsv) — overlay ordered out")
+            return
+        }
+        guard let nx = o["nx"] as? Double, let ny = o["ny"] as? Double else { return }
         let lbl = o["label"] as? String ?? ""
         guard let screen = NSScreen.main else {
             logToFile("pollPointerCmd: accepted ts=\(tsv) nx=\(nx) ny=\(ny) label='\(lbl)' but NSScreen.main is nil — cannot fly")
@@ -1786,6 +1822,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         pointerView.alpha = 0
         pointerView.showLabel = false
         pointerView.label = label
+        pointerWindow?.orderFrontRegardless()   // a prior {hide} ordered it out
         let start = pointerView.pos
         let dist = hypot(dst.x - start.x, dst.y - start.y)
         let dur = min(max(Double(dist) / 600.0, 1.0), 2.0)

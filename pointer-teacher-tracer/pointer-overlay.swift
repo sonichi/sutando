@@ -77,6 +77,12 @@ final class Overlay: NSObject {
     let view = PointerView()
     var lastTS: Double = 0
     var anim: Timer?
+    // Stored so a new fly() can cancel a prior flight's timers — mirrors the
+    // production fix in src/Sutando/main.swift. Local timers survive scope and
+    // would keep mutating halo/alpha during the next flight.
+    var pulseTimer: Timer?
+    var holdTimer: Timer?
+    var fadeTimer: Timer?
 
     override init() {
         let f = NSScreen.main!.frame
@@ -111,7 +117,12 @@ final class Overlay: NSObject {
     }
 
     func fly(to dst: CGPoint, label: String) {
+        // Cancel every timer from a prior flight — a stale hold/pulse/fade
+        // would otherwise keep mutating halo/alpha during the new flight.
         anim?.invalidate()
+        pulseTimer?.invalidate(); pulseTimer = nil
+        holdTimer?.invalidate(); holdTimer = nil
+        fadeTimer?.invalidate(); fadeTimer = nil
         view.showLabel = false
         view.label = label
         let start = view.pos
@@ -147,20 +158,21 @@ final class Overlay: NSObject {
 
     func hold() {   // pulse a halo for 8s, then fade out over ~0.7s
         var phase = 0.0
-        let pulse = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { _ in
+        pulseTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { _ in
             phase += 0.07
             self.view.halo = 26 + 12 * CGFloat(abs(sin(phase)))   // 26–38 px breathing ring
             self.view.needsDisplay = true
         }
-        Timer.scheduledTimer(withTimeInterval: 8.0, repeats: false) { _ in
-            pulse.invalidate()
+        holdTimer = Timer.scheduledTimer(withTimeInterval: 8.0, repeats: false) { _ in
+            self.pulseTimer?.invalidate(); self.pulseTimer = nil
             var a: CGFloat = 1
-            Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { t in
+            self.fadeTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { t in
                 a -= 1.0 / 42.0
                 self.view.alpha = max(a, 0)
                 self.view.needsDisplay = true
                 if a <= 0 {
                     t.invalidate()
+                    self.fadeTimer = nil
                     self.view.showLabel = false
                     self.view.halo = 0
                 }
