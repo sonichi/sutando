@@ -20,7 +20,7 @@ python3 "$SKILL_DIR/scripts/submit_use_case.py" \
     --summary "Outcome-first summary that appears on tile + detail page." \
     --bullets "bullet1" --bullets "bullet2" \
     [--video /abs/path/to/clip.mp4] \
-    [--image-url https://example.com/thumb.jpg] \
+    [--media-url https://example.com/clip.jpg] \
     [--youtube-id ABCDEFG1234] \
     [--x-url https://x.com/...] \
     [--linkedin-url https://www.linkedin.com/...] \
