@@ -175,7 +175,7 @@ If you're a contributor who needs the inventory to make a code change touching t
 
 ## Decisions
 
-The RFC opens 6 decisions. Each is summarized below with the current proposal, alternatives, and the latest team input. Live discussion lives in the tracking issue; the comments below are reflected as of the doc's last update.
+The RFC opens 6 decisions, all **ratified at PR #858 merge** (3 endorsements, no objections). Items with implementation work are tracked in separate issues — linked below. The summaries here are the doc-reference; the issues are where impl progress lives.
 
 ### 1. Naming the spaces
 
@@ -188,7 +188,7 @@ The RFC opens 6 decisions. Each is summarized below with the current proposal, a
 - "State" captures ephemeral + rebuildable.
 - "Memory" captures the user-edit + agent-recall double-use.
 
-**Input so far:** Endorsed.
+**Status:** Ratified — vocabulary lands with this PR's merge. No follow-up issue needed.
 
 ### 2. Env-var rename: `SUTANDO_PRIVATE_DIR` → `SUTANDO_MEMORY_DIR`
 
@@ -198,7 +198,7 @@ The RFC opens 6 decisions. Each is summarized below with the current proposal, a
 
 **Migration scope:** ~5 files (`util_paths.{py,ts}`, `scripts/sync-memory.sh`, possibly bundle resolver). Single-release deprecation.
 
-**Input so far:** Endorsed.
+**Status:** Ratified. Implementation tracked in [#870](https://github.com/sonichi/sutando/issues/870).
 
 ### 3. Host segmentation in Memory
 
@@ -208,7 +208,7 @@ The RFC opens 6 decisions. Each is summarized below with the current proposal, a
 
 **Rationale:** Zero migration cost for existing installs. Users who care about stable identity (rename-Mac-in-Settings, multi-install on one machine) opt in by setting the label. UUID is cleanest theoretically but opaque-in-folder-tree adds friction when the user inspects the private repo.
 
-**Input so far:** Endorsed.
+**Status:** Ratified. Implementation tracked in [#871](https://github.com/sonichi/sutando/issues/871).
 
 ### 4. Should State *ever* sync?
 
@@ -218,7 +218,7 @@ The RFC opens 6 decisions. Each is summarized below with the current proposal, a
 
 **Open sub-thread:** The shared-task-queue case (Qingyun raised 2026-05-18T20:09Z) is the strongest pull toward syncing more of State. Possible refinement: introduce a `state/fleet/` subdir inside `$SUTANDO_WORKSPACE` for paths that explicitly want cross-machine visibility (task queue, results), with a coordination protocol (claim files via atomic `mv`). This is option (B) from my proposal; the allowlist (this decision) is option (B)-lite.
 
-**Input so far:** Endorsed default-no + allowlist. Owner has not yet confirmed whether to fold the `state/fleet/` sub-axis in this doc or defer to a follow-up.
+**Status:** Ratified default-no + allowlist. The `state/fleet/` sub-axis is deferred to a separate design pass. Both tracked in [#872](https://github.com/sonichi/sutando/issues/872).
 
 ### 5. Secrets (`.env` and similar)
 
@@ -231,7 +231,7 @@ The RFC opens 6 decisions. Each is summarized below with the current proposal, a
 - Adding a 4th space increases the model's surface area without a clear win.
 - Memory-with-gitignore is risky: a Memory bug that leaks a notes/ file is annoying; one that leaks an API key is a security incident.
 
-**Input so far:** Endorsed staying at `.env`. Defer the "keys across Macs" UX problem to a separate workstream.
+**Status:** Ratified — secrets stay at `.env`. The "keys across Macs" UX problem is deferred to a separate workstream (1Password CLI / system Keychain). No follow-up issue for this PR; the cross-Mac-keys workstream will get its own issue when scoped.
 
 ### 6. Sutando.app bundle reconciliation
 
@@ -239,7 +239,7 @@ The RFC opens 6 decisions. Each is summarized below with the current proposal, a
 
 **Rationale:** Workspace design is orthogonal to "which Swift files are in git." Treating them as the same conversation slows both.
 
-**Input so far:** Endorsed. Tracked separately.
+**Status:** Ratified — tracked separately under the pre-existing 2026-05-13 bundle-reconciliation issue.
 
 ---
 
