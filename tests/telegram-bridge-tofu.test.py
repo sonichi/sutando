@@ -33,6 +33,7 @@ Exit code: 0 on pass, 1 on fail.
 
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -48,7 +49,14 @@ def load_bridge_module():
     Hyphenated filename can't be `import`ed directly, hence the importlib
     dance. The module's `if __name__ == '__main__'` guard means the polling
     loop does NOT start on import — only the module-level definitions run.
+
+    Note: src/telegram-bridge.py calls `exit(1)` at module level if
+    TELEGRAM_BOT_TOKEN is unset — CI doesn't have one. Set a placeholder
+    BEFORE exec_module so the module loads cleanly. The token is never
+    used in these tests (no API calls fire), only the access-control
+    helpers are exercised.
     """
+    os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-placeholder-token")
     spec = importlib.util.spec_from_file_location(
         "telegram_bridge", REPO / "src" / "telegram-bridge.py"
     )
