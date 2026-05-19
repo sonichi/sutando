@@ -434,7 +434,7 @@ def main():
                 priority = default_priority_for_source("telegram", "owner")
                 task_file.write_text(
                     f"id: {task_id}\n"
-                    f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S')}Z\n"
+                    f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
                     f"task: [Telegram @{username}{forward_note}] {text}{attachment_note}\n"
                     f"source: telegram\n"
                     f"chat_id: {chat_id}\n"

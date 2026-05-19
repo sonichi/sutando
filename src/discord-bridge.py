@@ -2570,7 +2570,7 @@ async def _handle_discord_message(message, force=False):
     priority = default_priority_for_source("discord", access_tier)
     task_file.write_text(
         f"id: {task_id}\n"
-        f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S')}Z\n"
+        f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
         f"task: {user_task_text}\n"
         f"source: discord\n"
         f"channel_id: {message.channel.id}\n"
