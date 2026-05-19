@@ -16,17 +16,20 @@ Send messages, list chats, and search history using [wacli](https://github.com/s
 ## Install + auth
 
 ```bash
-brew install steipete/tap/wacli       # one-time install
+brew install steipete/tap/wacli       # one-time install (3rd-party tap, NOT Homebrew-core)
 wacli auth                            # opens a QR for the user to scan from WhatsApp → Linked Devices
 ```
 
+`steipete/tap` is a third-party Homebrew tap (not Homebrew-core), and wacli stores a WhatsApp Web session locally at `~/.wacli/`. Review the tap source before installing if security-sensitive.
+
 The session lives at `~/.wacli/`. Stays signed in across reboots until the user revokes the linked device from their phone.
 
-Optional `.env` settings (label shown in WhatsApp's Linked Devices screen):
+Optional `.env` settings (label shown in WhatsApp's Linked Devices screen on the user's phone):
 
 ```bash
-WACLI_DEVICE_LABEL=Sutando
-WACLI_DEVICE_PLATFORM=CHROME
+WACLI_DEVICE_LABEL=Sutando            # any string; appears next to the device in WhatsApp → Linked Devices
+WACLI_DEVICE_PLATFORM=CHROME          # default per wacli is DESKTOP; CHROME is the fallback if an invalid value is set.
+                                      # See wacli's docs (https://github.com/steipete/wacli) for the full platform-string list.
 ```
 
 ## Commands
@@ -43,7 +46,7 @@ Phone numbers are in E.164 (`+countrycode...`). For groups, pass the JID returne
 
 ## Conventions
 
-- **Always confirm message content with the user before sending.** Matches the iMessage / SMS / X-post pattern in CLAUDE.md.
+- **Always confirm message content with the user before sending.** Matches the iMessage / SMS / X-post pattern in CLAUDE.md. **The confirmation flow lives in the agent / bridge that calls `wacli send` — this skill itself has no confirm step.** Treating the SKILL.md as the confirmation surface would skip the check entirely on direct CLI invocations.
 - For multi-line / long messages, write to a `/tmp/wa-*.txt` and pass via `--message "$(cat /tmp/wa-X.txt)"` — avoids shell-escape issues with quotes and emoji.
 - WhatsApp delivers messages best-effort; `wacli send text` returning success means the message hit WhatsApp's servers, not that the recipient has read it.
 
