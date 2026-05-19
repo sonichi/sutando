@@ -98,6 +98,42 @@ TASKS_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def extract_forward_note(msg: dict) -> str:
+    """Return a ` [forwarded from ...]` suffix for a Telegram message dict.
+
+    Handles Bot API 7.0+ `forward_origin` (user / hidden_user / chat / channel)
+    and legacy `forward_from` / `forward_sender_name`. Returns "" for
+    non-forwarded messages or unknown `forward_origin.type` values so the
+    bridge fails open rather than crashing on future Telegram additions.
+    """
+    fwd_origin = msg.get("forward_origin") or {}
+    if fwd_origin:
+        fwd_type = fwd_origin.get("type")
+        if fwd_type == "user":
+            u = fwd_origin.get("sender_user", {})
+            name = u.get("username") or u.get("first_name") or "unknown"
+            return f" [forwarded from @{name}]"
+        if fwd_type == "hidden_user":
+            name = fwd_origin.get("sender_user_name", "hidden")
+            return f" [forwarded from {name}]"
+        if fwd_type == "chat":
+            chat = fwd_origin.get("sender_chat", {})
+            name = chat.get("title") or chat.get("username") or "channel"
+            return f" [forwarded from chat: {name}]"
+        if fwd_type == "channel":
+            chat = fwd_origin.get("chat", {})
+            name = chat.get("title") or chat.get("username") or "channel"
+            return f" [forwarded from channel: {name}]"
+        return ""
+    if "forward_from" in msg:
+        u = msg["forward_from"]
+        name = u.get("username") or u.get("first_name") or "unknown"
+        return f" [forwarded from @{name}]"
+    if "forward_sender_name" in msg:
+        return f" [forwarded from {msg['forward_sender_name']}]"
+    return ""
+
+
 def write_owner_activity(channel: str, summary: str) -> None:
     """Record owner activity — see src/discord-bridge.py for schema."""
     try:
@@ -387,7 +423,9 @@ def main():
                 if not text and not attachment_note:
                     continue
 
-                print(f"  @{username}: {text}{attachment_note}")
+                forward_note = extract_forward_note(msg)
+
+                print(f"  @{username}{forward_note}: {text}{attachment_note}")
 
                 # Write as task (same format as voice bridge)
                 ts = int(time.time() * 1000)
@@ -397,7 +435,7 @@ def main():
                 task_file.write_text(
                     f"id: {task_id}\n"
                     f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S')}Z\n"
-                    f"task: [Telegram @{username}] {text}{attachment_note}\n"
+                    f"task: [Telegram @{username}{forward_note}] {text}{attachment_note}\n"
                     f"source: telegram\n"
                     f"chat_id: {chat_id}\n"
                     f"priority: {priority}\n"
