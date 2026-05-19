@@ -9,6 +9,60 @@ related: notes/release-process-proposal-mini.md, docs/release-process.md (not ye
 
 > **Plan-only document.** Owner (Chi) explicitly said "Plan and make proposals first. Do not implement anything yet." This is half of a co-drafted proposal — Mini covers the *when* + tag conventions; this covers the *what goes in* + migration framework + the joint coupling section.
 
+## Overview — what we're trying to do, why it matters
+
+**What**: define a release process for the Sutando engine (`sonichi/sutando`) — currently install-from-`main` with no versioning, no snapshots, no migration story. Two parts:
+
+1. **Release process** — when to cut a tag, what goes into release notes, who curates the CHANGELOG.
+2. **Migration framework** — when a release changes the shape of state on disk (env vars, JSON schemas, workspace layout), existing installs get auto-migrated cleanly on `git pull` instead of breaking silently.
+
+**Why it matters**:
+
+- **Rollback discipline.** Today: "we broke something — what's the last known good state?" Answer: hunt for a commit SHA. After: `git checkout engine-v0.1.0`.
+- **Commercial pinning.** `sutando.ag2.ai` install instructions can't currently say "we ship engine v0.X" because there are no engine versions. Bundle releases (Sutando.app) need to name an engine snapshot they ride on.
+- **Silent breakage prevention.** Recent PRs (#876 env rename, #892 tierMap, #884 multi-core state-dir) each invented their own backward-compat trick. No registry, no startup-time check, no upgrade-path test. The first non-additive change (workspace contract A/B, pending question 2026-05-17 00:40) WILL break some installs. We need migration infra before then.
+- **Coord between bots.** Sutando-Mini and qingyun-sutando are both contributing to release plumbing. Without a written RFC we'll diverge.
+- **Continuous gate, not annual ritual.** The "non-breaking-state gate" baked into the release process (CI + health + migrations) becomes a per-PR discipline, not just a once-per-tag check.
+
+**What it does NOT try to do**: time-based release cadence, backward migrations (rollback un-migrate), data content re-encoding, lockstep with the product (Sutando.app) version. Those are explicitly deferred.
+
+**Co-author split** (per task-1779222840893): Mini takes *when to cut* + tag conventions; this doc takes *what goes in* + CHANGELOG culture + migration framework + the joint engine↔product coupling section. Both halves consolidate on this PR's branch.
+
+## Motivations
+
+Why now, and why both halves of this proposal exist:
+
+### M1. We need named snapshots of known-good states
+
+Today the install model is `git clone && bash src/startup.sh` — users (commercial waitlist, OSS contributors, sister-node fleets) install at whatever `main` HEAD happens to be. When something breaks, "downgrade to the last good state" means hunting for a commit SHA. Named release tags make rollback a single instruction (`git checkout engine-v0.1.0`) and let install docs pin to a specific snapshot instead of moving with main.
+
+### M2. State-format and contract changes happen often — silently breaking users
+
+Recent contract churn that's already shipped: `SUTANDO_PRIVATE_DIR → SUTANDO_MEMORY_DIR` rename (#876), `tierMap` added to Slack `access.json` (#892), `state/cores/<id>.alive` schema for multi-core (#884). Each PR re-invented its own backward-compat trick (env var alias, default-to-owner if absent, etc.). No central registry, no startup-time enforcement, no test coverage of the "user upgrades through this version" path. The first non-additive change on the horizon (workspace contract A/B, pending-question 2026-05-17 00:40) WILL break installs that just `git pull`. Migration framework before then, not after.
+
+### M3. Commercial deploys need a pin point
+
+`sutando.ag2.ai` install instructions currently can't say "we ship engine v0.X" because there are no engine versions. Product cuts (Sutando.app v0.3.0 next) need a corresponding engine snapshot they're built against, so customers who hit a bug can correlate bundle version → engine state.
+
+### M4. Two bots are coordinating — we need a shared spec
+
+Sutando-Mini + qingyun-sutando are both contributing to the release-process design. Without a written RFC, we'll drift to incompatible models in our own implementations. This document is the shared contract for what we both build against.
+
+### M5. The release process is also the migration-test framework
+
+If we have a "non-breaking-state gate" baked into the release process (CI green + health-check green + smoke test the headline feature + **all migrations applied + tested**), then we get a continuous safety net, not just a once-per-release one. Every PR that touches state format is held to "ship a migration" by the same checklist that gates the next release. Discipline lives in the workflow, not in tribal memory.
+
+## Non-goals
+
+Things this proposal explicitly does NOT do, to keep scope small:
+
+- **Time-based cadence** (weekly/monthly releases) — feature-completion is the trigger.
+- **Backward migrations** (rolling back v0.4 → v0.3 cleanly) — manual steps in release notes for now.
+- **Data re-encoding** (transforming memory file contents). Skip unless real need.
+- **Synchronizing engine version with product version 1:1.** They are two release lines.
+- **Beta / RC channels** (`v0.4.0-rc.1`). Skip until a real soft-launch need shows up.
+- **Automatic CHANGELOG generation purely from PR titles.** We use author-curated entries with `gh release create --generate-notes` as a secondary view, not a primary source.
+
 ## Scope of this half
 
 Per the split agreed with Sutando-Mini in #dev (task-1779222840893, 2026-05-19 13:34 PT):
