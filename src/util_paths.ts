@@ -2,11 +2,11 @@
 //
 // Two helpers, one for per-machine state, one for shared-across-fleet state:
 //
-//   personalPath(filename)          — `$SUTANDO_PRIVATE_DIR/machine-<host>/<filename>`
+//   personalPath(filename)          — `$SUTANDO_MEMORY_DIR/machine-<host>/<filename>`
 //                                     For files where each Mac has its own copy
 //                                     (stand-identity.json, pending-questions.md).
 //
-//   sharedPersonalPath(filename)    — `$SUTANDO_PRIVATE_DIR/<filename>`
+//   sharedPersonalPath(filename)    — `$SUTANDO_MEMORY_DIR/<filename>`
 //                                     For files synced across the whole fleet
 //                                     (notes/, build_log.md).
 //
@@ -16,6 +16,12 @@
 // via resolveWorkspace() — NOT process.cwd(). Pre-#839 fixes the fallback was
 // cwd, which silently produced the wrong path on hosts where the caller's
 // cwd drifted from the workspace dir.
+//
+// Env var `SUTANDO_MEMORY_DIR` is the canonical name post-#858 / #870. The
+// legacy alias `SUTANDO_PRIVATE_DIR` is honored as a fallback for one release
+// with a deprecation warning logged to stderr on every read (cron / launchd
+// environments miss startup-only warnings, so logging at every resolution is
+// intentional).
 
 import { existsSync } from 'node:fs';
 import { hostname } from 'node:os';
@@ -26,10 +32,40 @@ function expandHome(p: string): string {
 	return p.replace(/^~/, process.env.HOME || '');
 }
 
+/**
+ * Return the resolved memory-dir env value, preferring the new name.
+ *
+ * Lookup order:
+ *   1. `SUTANDO_MEMORY_DIR` (canonical post-#858 / #870)
+ *   2. `SUTANDO_PRIVATE_DIR` (legacy, with deprecation warning emitted to
+ *      stderr on every read — not just once at startup; cron and launchd
+ *      environments miss startup-only warnings).
+ *
+ * Returns the raw env value (caller must expandHome if needed), or undefined
+ * when neither is set.
+ */
+export function memoryDirEnv(): string | undefined {
+	const next = process.env.SUTANDO_MEMORY_DIR;
+	if (next) return next;
+	const legacy = process.env.SUTANDO_PRIVATE_DIR;
+	if (legacy) {
+		// Every-read deprecation warning. Loud by design — the legacy alias
+		// will drop in the next release and silent users would otherwise miss
+		// the cutover. See #870 for the rename plan.
+		console.warn(
+			'[util_paths.ts] DEPRECATION: SUTANDO_PRIVATE_DIR is the old name ' +
+				'for the memory dir; set SUTANDO_MEMORY_DIR instead (this alias ' +
+				'will be removed in the next release). See #870.',
+		);
+		return legacy;
+	}
+	return undefined;
+}
+
 /** Per-machine resolver. */
 export function personalPath(filename: string, workspace?: string): string {
 	const ws = workspace ?? resolveWorkspace();
-	const privateRoot = process.env.SUTANDO_PRIVATE_DIR;
+	const privateRoot = memoryDirEnv();
 	if (privateRoot) {
 		const root = expandHome(privateRoot);
 		const host = hostname().split('.')[0];
@@ -57,7 +93,7 @@ export function personalPath(filename: string, workspace?: string): string {
 /** Shared-across-fleet resolver (top-level private dir, not per-machine). */
 export function sharedPersonalPath(filename: string, workspace?: string): string {
 	const ws = workspace ?? resolveWorkspace();
-	const privateRoot = process.env.SUTANDO_PRIVATE_DIR;
+	const privateRoot = memoryDirEnv();
 	if (privateRoot) {
 		const root = expandHome(privateRoot);
 		const candidate = join(root, filename);

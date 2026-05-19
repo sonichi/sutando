@@ -39,7 +39,7 @@ Never commit directly to main. Always work on a feature branch.
 
 ## Workspace contract
 
-Sutando's file state lives in three concentric spaces — **Code** (`$SUTANDO_REPO_DIR`, the git checkout), **State** (`$SUTANDO_WORKSPACE`, per-user runtime), **Memory** (`$SUTANDO_PRIVATE_DIR`, user-content synced across the fleet). See [`docs/workspace-design.md`](docs/workspace-design.md) for the 3-space mental model + "Quick decision: which space?" flowchart when adding new code or data.
+Sutando's file state lives in three concentric spaces — **Code** (`$SUTANDO_REPO_DIR`, the git checkout), **State** (`$SUTANDO_WORKSPACE`, per-user runtime), **Memory** (`$SUTANDO_MEMORY_DIR`, user-content synced across the fleet — legacy alias `$SUTANDO_PRIVATE_DIR` honored for one release per #870). See [`docs/workspace-design.md`](docs/workspace-design.md) for the 3-space mental model + "Quick decision: which space?" flowchart when adding new code or data.
 
 All per-user mutable state — `tasks/`, `results/`, `state/`, `data/`, `logs/`, `notes/`, `build_log.md`, `pending-questions.md`, `contextual-chips.json`, `core-status.json`, etc. — lives under a single **workspace** directory. Code, skills source, and repo configuration stay in the repo root (separate concern).
 

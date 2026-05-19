@@ -49,7 +49,7 @@ export const openFileTool: ToolDefinition = {
 		'If the user says "open the log" or similar, ASK which log they mean (voice-agent, discord-bridge, etc.) — do NOT guess. ' +
 		'Known files: "diagnostic tracker" or "diagnostics" = /tmp/phone-diagnostics-tracker.html, ' +
 		'"voice diagnostics" = /tmp/voice-diagnostics-tracker.html, ' +
-		'"voice context" / "the voice context file" / "the active context" = $SUTANDO_PRIVATE_DIR/voice-contexts/<active>.txt where <active> is the trimmed contents of $SUTANDO_PRIVATE_DIR/voice-contexts/active. Pass it with the env-var expanded by you, or as $SUTANDO_PRIVATE_DIR/voice-contexts/<active>.txt — both work. ' +
+		'"voice context" / "the voice context file" / "the active context" = $SUTANDO_MEMORY_DIR/voice-contexts/<active>.txt where <active> is the trimmed contents of $SUTANDO_MEMORY_DIR/voice-contexts/active (legacy users may have $SUTANDO_PRIVATE_DIR set instead — either expands). Pass it with the env-var expanded by you, or as $SUTANDO_MEMORY_DIR/voice-contexts/<active>.txt — both work. ' +
 		'Pass `app` when the user names a specific app ("open with Sublime Text", "open the SQLite db in TablePlus") OR when recent conversation makes the intended app clear (e.g. user just said "I\'ll review this in VS Code"). Without `app`, macOS uses its default handler for that file type — leave unset when the default is fine. ' +
 		'Pass `fullscreen=true` if the user wants the file opened in fullscreen — works generically for any file type via Cmd+Ctrl+F to whichever app the OS routed the file to (QuickTime → Present mode, Preview → fullscreen PDF, Chrome → fullscreen page, etc.).',
 	parameters: z.object({
@@ -64,7 +64,7 @@ export const openFileTool: ToolDefinition = {
 		try {
 			if (!path) return { error: 'No path provided. Pass an absolute file path. (For the most recent recording, call play_video — it auto-finds the file.)' };
 			// Expand $VAR / ${VAR} env-var references and ~ in the path so Sutando
-			// can pass paths like "$SUTANDO_PRIVATE_DIR/voice-contexts/X.txt"
+			// can pass paths like "$SUTANDO_MEMORY_DIR/voice-contexts/X.txt"
 			// without us hardcoding a fallback root. Track any unset variables so
 			// we can surface them as a clear diagnostic rather than letting the
 			// silently-empty substitution flow through to a generic "file not
@@ -778,10 +778,11 @@ export const createChatTaskTool: ToolDefinition = {
 
 /** All inline tools — import and spread into your tools list */
 // ─── Notes tools ─────────────────────────────────────────
-// Resolve at module-init: $SUTANDO_PRIVATE_DIR/notes (canonical) when set,
-// else <workspace>/notes (legacy fallback). Notes are SHARED across the
-// fleet so they live at the top-level private dir, not under machine-<host>/.
-import { sharedPersonalPath } from './util_paths.js';
+// Resolve at module-init: $SUTANDO_MEMORY_DIR/notes (canonical) when set
+// (legacy $SUTANDO_PRIVATE_DIR honored via sharedPersonalPath()), else
+// <workspace>/notes fallback. Notes are SHARED across the fleet so they live
+// at the top-level memory dir, not under machine-<host>/.
+import { sharedPersonalPath, memoryDirEnv } from './util_paths.js';
 const NOTES_DIR = sharedPersonalPath('notes', WORKSPACE_DIR);
 
 export const showViewTool: ToolDefinition = {
@@ -961,14 +962,15 @@ function assertUniqueToolNames(tools: ToolDefinition[]): ToolDefinition[] {
 // access_tier values: "owner" (default if omitted) | "any_caller".
 async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyCaller: ToolDefinition[] }> {
 	// Scan the public-repo `skills/` dir AND the optional private skills dir
-	// pointed to by `$SUTANDO_PRIVATE_DIR/skills/` (e.g.
-	// `~/.sutando-memory-sync/skills/`). The private dir lets users keep
-	// personal tooling with real per-file git history outside the public repo.
-	// Order: public first, then private — same-name skills loaded from
-	// private take precedence (last one wins via the dup-name guard below if
-	// any; in practice they should be uniquely named).
+	// pointed to by `$SUTANDO_MEMORY_DIR/skills/` (legacy `$SUTANDO_PRIVATE_DIR`
+	// honored via memoryDirEnv(); e.g. `~/.sutando/memory-sync/skills/`). The
+	// private dir lets users keep personal tooling with real per-file git
+	// history outside the public repo. Order: public first, then private —
+	// same-name skills loaded from private take precedence (last one wins via
+	// the dup-name guard below if any; in practice they should be uniquely
+	// named).
 	const dirsToScan: string[] = [join(REPO_ROOT, 'skills')];
-	const privateRoot = process.env.SUTANDO_PRIVATE_DIR;
+	const privateRoot = memoryDirEnv();
 	if (privateRoot) {
 		const expanded = privateRoot.replace(/^~/, process.env.HOME || '');
 		dirsToScan.push(join(expanded, 'skills'));
@@ -1032,7 +1034,7 @@ const personalAllTools = [...personalTools.owner, ...personalTools.anyCaller];
 // what each one does.
 function loadCoreDocumentedSkills(): { name: string; description: string }[] {
 	const dirsToScan: string[] = [join(REPO_ROOT, 'skills')];
-	const privateRoot = process.env.SUTANDO_PRIVATE_DIR;
+	const privateRoot = memoryDirEnv();
 	if (privateRoot) {
 		const expanded = privateRoot.replace(/^~/, process.env.HOME || '');
 		dirsToScan.push(join(expanded, 'skills'));
