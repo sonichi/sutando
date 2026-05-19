@@ -35,6 +35,6 @@ The first time `ax-read` runs it'll trigger the macOS Accessibility prompt for *
 
 ## Relationship to the private `personal-deictic` skill
 
-The private `personal-deictic` skill ships a richer AX-read with screenshot + cursor capture for deictic phrases ("this", "here"). The skill here is the text-only subset Sutando.app's ⌃C handler needs. Public-repo users get the full ⌃C experience without needing the private skill installed.
+This skill emits the **shared text-selection subset** of `personal-deictic`'s richer output. The private package additionally captures a screenshot of the focused window and the cursor position for deictic phrases ("this", "here") — those fields stay private. Output schemas overlap on the five fields Sutando.app's `invokeAxRead` consumes (`app`, `window_title`, `url`, `selected`, `path`); `personal-deictic` adds `screenshot_path` and `cursor` for the voice agent's `read_selection` tool.
 
-`Sutando.app::resolveAxReadPath()` tries the private path first (when available) and falls back to this public binary, so users with the private skill keep their richer deictic captures while public users get the text-only path.
+`Sutando.app::resolveAxReadPath()` tries the private path first (when available) and falls back to this public binary, so users with the private skill keep their richer deictic captures while public users get the text-only path. If anything other than Sutando.app's `dropContext` ever spawns this public binary, it should not assume `screenshot_path`/`cursor` will be present — the contract is the five-field subset only.

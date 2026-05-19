@@ -173,7 +173,7 @@ if focusedErr == .success, let element = focused {
     }
 }
 
-// Clipboard fallback (Cmd+C → read NSPasteboard → restore prior string).
+// Clipboard fallback (Cmd+C → read NSPasteboard → restore full prior items).
 //
 // AX-on-Electron (Chrome, VS Code, Cursor, Slack, Discord) doesn't expose
 // AXSelectedText reliably — Monaco/CodeMirror/web text-fields render outside
@@ -182,10 +182,27 @@ if focusedErr == .success, let element = focused {
 // distinguishes "Cmd+C wrote something" from "clipboard was already
 // populated" — otherwise the previous clipboard contents would be reported
 // as the new selection (the stale-clipboard regression class).
+//
+// We snapshot ALL pasteboard items (not just `.string`) and restore them
+// verbatim. Sutando.app's dropContext invokes ax-read BEFORE checking the
+// clipboard for images, so if we only saved/restored string content, a
+// no-selection ax-read run would silently drop image/file clipboard data
+// before Sutando got a chance to handle it. Per Mini's review on PR #907.
 if selected.isEmpty {
     let pb = NSPasteboard.general
     let priorChangeCount = pb.changeCount
-    let priorString = pb.string(forType: .string)
+
+    // Snapshot every (type, data) pair on each existing pasteboard item.
+    // We rebuild from this set if Cmd+C dirties the pasteboard.
+    let priorSnapshot: [[NSPasteboard.PasteboardType: Data]] = (pb.pasteboardItems ?? []).map { item in
+        var dict: [NSPasteboard.PasteboardType: Data] = [:]
+        for type in item.types {
+            if let data = item.data(forType: type) {
+                dict[type] = data
+            }
+        }
+        return dict
+    }
 
     let src = CGEventSource(stateID: .hidSystemState)
     let cDown = CGEvent(keyboardEventSource: src, virtualKey: 0x08, keyDown: true)
@@ -202,14 +219,17 @@ if selected.isEmpty {
             selected = copied
             path = "clipboard"
         }
-    }
-
-    // Restore prior pasteboard string (best effort, .string-type only).
-    // Non-string clipboard contents (images, file refs) are not preserved
-    // — acceptable trade-off for a read-only fallback path.
-    pb.clearContents()
-    if let prior = priorString {
-        pb.setString(prior, forType: .string)
+        // Restore the full pasteboard contents we snapshotted. Only do this
+        // if Cmd+C actually dirtied the clipboard — if it didn't fire, the
+        // pasteboard is unchanged and we skip the clear/rewrite entirely.
+        pb.clearContents()
+        for entry in priorSnapshot {
+            let item = NSPasteboardItem()
+            for (type, data) in entry {
+                item.setData(data, forType: type)
+            }
+            pb.writeObjects([item])
+        }
     }
 }
 

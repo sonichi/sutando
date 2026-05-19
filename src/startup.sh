@@ -235,19 +235,29 @@ fi
 SUT_SRC="$REPO/src/Sutando/main.swift"
 SUT_BIN="$REPO/src/Sutando/Sutando"
 
-# Build the public ax-read CLI if missing or older than its source. Sutando.app's
-# resolveAxReadPath() prefers private personal-deictic when installed; this
-# public binary is the text-only fallback so public-repo users still get the
-# ⌃C selection-drop experience.
+# Build the public ax-read CLI if missing or older than any of its source
+# files. Sutando.app's resolveAxReadPath() prefers private personal-deictic
+# when installed; this public binary is the text-only fallback so public-repo
+# users still get the ⌃C selection-drop experience.
+#
+# Staleness widened (per Mini's PR #907 review): trigger a rebuild when
+# Package.swift / build.sh / any *.swift under Sources/ is newer than the
+# binary, not just the main entry-point. Build failures are surfaced loudly
+# (not >/dev/null 2>&1) — silent failure here was the exact regression class
+# this skill is meant to prevent.
 AXR_DIR="$REPO/skills/context-drop"
 AXR_BIN="$AXR_DIR/ax-read"
-AXR_SRC="$AXR_DIR/Sources/ax-read/main.swift"
-if [ -f "$AXR_SRC" ] && { [ ! -f "$AXR_BIN" ] || [ "$AXR_SRC" -nt "$AXR_BIN" ]; }; then
+AXR_NEWEST_SRC="$(find "$AXR_DIR/Sources" "$AXR_DIR/Package.swift" "$AXR_DIR/build.sh" -type f \( -name '*.swift' -o -name 'Package.swift' -o -name 'build.sh' \) 2>/dev/null | xargs -I{} stat -f '%m {}' {} 2>/dev/null | sort -rn | head -1 | awk '{print $2}')"
+if [ -n "$AXR_NEWEST_SRC" ] && { [ ! -f "$AXR_BIN" ] || [ "$AXR_NEWEST_SRC" -nt "$AXR_BIN" ]; }; then
   echo "  Compiling public ax-read (skills/context-drop)..."
-  if (cd "$AXR_DIR" && bash build.sh >/dev/null 2>&1); then
+  if ! command -v swift >/dev/null 2>&1; then
+    echo "  ⚠ ax-read build skipped: 'swift' not in PATH"
+    echo "    → install Xcode Command Line Tools (xcode-select --install) for ⌃C selection drops on public-repo installs"
+  elif (cd "$AXR_DIR" && bash build.sh); then
     echo "  ✓ ax-read built at $AXR_BIN"
   else
-    echo "  ⚠ ax-read build failed — Sutando.app will fall back to legacy in-process AX"
+    echo "  ⚠ ax-read build FAILED — see Swift compiler output above"
+    echo "    → Sutando.app will fall back to legacy in-process AX (broken for Electron under LSUIElement context)"
   fi
 fi
 
