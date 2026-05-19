@@ -214,6 +214,13 @@ pending_replies_lock = threading.Lock()
 _username_cache: dict[str, str | None] = {}
 _username_cache_lock = threading.Lock()
 
+# Event counter — used by the no-events-after-60s hint thread to detect
+# the "Socket Mode connected but Event Subscriptions disabled" install
+# trap. Cost of the most common install hang-up is ~1h of owner time
+# (verified 2026-05-18). The hint is cheap insurance.
+_event_count = 0
+_event_count_lock = threading.Lock()
+
 # Bolt App. Socket Mode handler attaches via SocketModeHandler below.
 app = App(token=BOT_TOKEN)
 
@@ -299,6 +306,10 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     )
     with pending_replies_lock:
         pending_replies[task_id] = {"channel": channel, "thread_ts": thread_ts}
+
+    global _event_count
+    with _event_count_lock:
+        _event_count += 1
 
     print(f"  Wrote {task_id} from {prefix} @{username}", flush=True)
     return task_id
@@ -513,9 +524,39 @@ def result_watcher():
             time.sleep(5)
 
 
+def _no_events_hint_thread():
+    """One-shot watchdog: 60s after start, if no events have arrived,
+    log a hint pointing at the most common install trap (Event
+    Subscriptions disabled). Suppresses itself once any event is seen.
+
+    Owner spent ~1h on 2026-05-18 hitting exactly this state: bridge
+    alive, Socket Mode WS connected to Slack, but Event Subscriptions
+    was off so no events ever flowed. The bridge log was silent past
+    "Socket Mode connecting…" — no signal to act on. This hint surfaces
+    the diagnostic the next install will need.
+    """
+    time.sleep(60)
+    with _event_count_lock:
+        n = _event_count
+    if n == 0:
+        print(
+            "[Slack] HINT: 60s elapsed with zero events received.\n"
+            "  Bridge is connected to Slack's edge, but events are not arriving.\n"
+            "  Most common cause: Event Subscriptions is disabled in your app config.\n"
+            "  Fix: https://api.slack.com/apps → your app → Event Subscriptions →\n"
+            "    1. Toggle 'Enable Events' to ON\n"
+            "    2. Under 'Subscribe to bot events' add: message.im, app_mention\n"
+            "    3. Save Changes (if greyed, see docs/slack-bridge.md install gotchas)\n"
+            "    4. Reinstall app if Slack prompts a yellow banner\n"
+            "  Then send a DM to your bot — TOFU will auto-onboard you as owner.",
+            flush=True,
+        )
+
+
 def main():
     print("Slack bridge started. Socket Mode connecting...", flush=True)
     threading.Thread(target=result_watcher, name="slack-result-watcher", daemon=True).start()
+    threading.Thread(target=_no_events_hint_thread, name="slack-no-events-hint", daemon=True).start()
     handler = SocketModeHandler(app, APP_TOKEN)
     handler.start()  # blocks
 
