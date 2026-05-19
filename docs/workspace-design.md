@@ -153,23 +153,14 @@ Worth flagging because new contributors sometimes ask "should `.cursorrules` go 
 
 ## Host CLI dependency surface
 
-Sutando is built on a host CLI tool (today: Claude Code). Some agent-state surfaces — agent memory, bridge auth tokens, skill discovery, slash-command config — live inside that host CLI's user-home directory rather than under `$SUTANDO_WORKSPACE` or `$SUTANDO_PRIVATE_DIR`. These are not Sutando-owned; we read and write them via the host CLI's conventions, the way a Node app uses `~/.npm/` or `~/.config/`.
+Sutando rides on a host CLI tool (today: Claude Code) for a handful of agent-state surfaces — agent memory, skill discovery, bridge tokens, slash commands — that live inside the host CLI's user-home directory rather than under any Sutando-owned space. See **[`docs/host-cli-bindings.md`](host-cli-bindings.md)** for the surface taxonomy, the per-surface re-bind cost on a host-CLI swap, and the canonical helper (`claude_home_path()` / `claudeHomePath()`) you should call when new code touches the host CLI's home.
 
-**Portability cost.** If Sutando ever switches host CLIs (Codex, gemini-cli, a future tool), this dependency surface needs to be re-bound:
-
-- **High-cost re-bind:** agent memory storage + skill discovery. Both rely on the host CLI's own tooling (memory load-on-session-start, skill loader).
-- **Low-cost re-bind:** bridge tokens + access state. Just data movement to new paths.
-- **Interop loss:** slash commands provided by the host CLI lose their surface; would need re-implementation as Sutando-owned subcommands.
-
-**Today's policy.** We document the surface internally (engineering inventory) without listing specific paths in this public doc. Specific paths are implementation detail of the current host CLI; publishing them invites bit-rot when the host CLI's conventions change.
-
-**Greppable surface.** Sutando code that needs to read or write inside the host CLI's home directory goes through a single helper — `claude_home_path()` in `src/util_paths.py`, `claudeHomePath()` in `src/util_paths.ts` (added in #860). One canonical resolver = one grep target = a future swap is a 1-day grep+replace rather than re-architecture. Use the helper for any new code that touches the host CLI's home; don't reach for `~/.claude/`-relative paths directly.
-
-If you're a contributor who needs the inventory to make a code change touching the host CLI's home dir, ask in the team channel and the maintainer will point you at the workspace-private engineering note.
+Short version for this RFC: the dependency surface exists, it's intentionally countable through a single greppable helper, and specific path strings stay in the workspace-private engineering note (publishing them in public docs invites bit-rot when the host CLI's conventions change).
 
 ## Relationship to other docs
 
 - `docs/workspace-contract.md` — implementation reference. How to use the resolvers, the migration story from pre-#762. This doc complements it with the why + the taxonomy.
+- `docs/host-cli-bindings.md` — host-CLI dependency surface taxonomy + re-bind costs + the canonical `claudeHomePath()` helper. Read this when adding code that touches the host CLI's home dir.
 - `docs/memory-sync.md` — Memory sync mechanics (private repo, merge strategy, conflict resolution).
 - `CLAUDE.md` — per-session operating instructions. References these docs for on-demand reading; doesn't carry the full content.
 
