@@ -7,7 +7,7 @@ status: draft (plan only; nothing implemented)
 related: notes/release-process-proposal-mini.md, docs/release-process.md (not yet written)
 ---
 
-> **Plan-only document.** Owner (Chi) explicitly said "Plan and make proposals first. Do not implement anything yet." This is half of a co-drafted proposal — Mini covers the *when* + tag conventions; this covers the *what goes in* + migration framework + the joint coupling section.
+> **Plan-only document.** This is half of a co-drafted proposal — companion `docs/release-process-proposal-mini.md` covers the *when* + tag conventions; this covers the *what goes in* + migration framework + the joint coupling section.
 
 ## Overview — what we're trying to do, why it matters
 
@@ -40,11 +40,15 @@ Today the install model is `git clone && bash src/startup.sh` — users install 
 
 Recent contract churn that's already shipped: `SUTANDO_PRIVATE_DIR → SUTANDO_MEMORY_DIR` rename (#876), `tierMap` added to Slack `access.json` (#892), `state/cores/<id>.alive` schema for multi-core (#884). Each PR re-invented its own backward-compat trick (env var alias, default-to-owner if absent, etc.). No central registry, no startup-time enforcement, no test coverage of the "user upgrades through this version" path. The first non-additive change on the horizon (workspace contract A/B, pending-question 2026-05-17 00:40) WILL break installs that just `git pull`. Migration framework before then, not after.
 
-### M3. Two bots are coordinating — we need a shared spec
+### M3. Pin points for downstream consumers and bundle deploys
+
+Anyone building on top of the engine — forks, sister-node fleets, packaged bundles like Sutando.app, AG2-internal deploys (`sutando.ag2.ai`), commercial integrators — needs a stable identifier for "the engine version I'm running." Without tags, install docs can only reference a moving target (`main`) or a bare commit SHA. Both modes break the "I'm on engine v0.X" question that downstream users need to answer when reporting bugs, pinning environments, or coordinating compatibility.
+
+### M4. Two bots are coordinating — we need a shared spec
 
 Sutando-Mini + qingyun-sutando are both contributing to the release-process design. Without a written RFC, we'll drift to incompatible models in our own implementations. This document is the shared contract for what we both build against.
 
-### M4. The release process is also the migration-test framework
+### M5. The release process is also the migration-test framework
 
 If we have a "non-breaking-state gate" baked into the release process (CI green + health-check green + smoke test the headline feature + **all migrations applied + tested**), then we get a continuous safety net, not just a once-per-release one. Every PR that touches state format is held to "ship a migration" by the same checklist that gates the next release. Discipline lives in the workflow, not in tribal memory.
 
