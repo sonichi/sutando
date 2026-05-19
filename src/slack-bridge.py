@@ -180,6 +180,18 @@ def load_allowed():
         return set()
 
 
+def load_tier_map() -> dict:
+    """Return the per-user-id → tier map from access.json `tierMap`, or
+    empty dict if missing. Recognized tiers: "owner", "team", "other".
+    Unmapped users default to "owner" — preserves the pre-tierMap behavior
+    where every entry in `allowFrom` was treated as owner-tier."""
+    try:
+        data = json.loads(ACCESS_FILE.read_text())
+        return data.get("tierMap") or {}
+    except Exception:
+        return {}
+
+
 def tofu_onboard(user_id: str, username: str | None) -> set:
     """First-time auto-onboard — same contract as telegram-bridge.py."""
     if ACCESS_FILE.exists():
@@ -290,18 +302,50 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     else:
         thread_ts = None
 
+    # Resolve access_tier from `tierMap`. Unmapped users default to "owner"
+    # — preserves the pre-tierMap contract (everything in allowFrom was
+    # treated as owner). Mapping a user to "team" or "other" downgrades them.
+    # See CLAUDE.md "Discord access control" for the broader policy this
+    # mirrors. The core agent reads access_tier from the task body and is
+    # expected to delegate non-owner tasks to a sandboxed agent.
+    access_tier = load_tier_map().get(user_id, "owner")
+    if access_tier not in ("owner", "team", "other"):
+        # Unknown tier value in config → degrade safely to "other" rather
+        # than treating as owner.
+        access_tier = "other"
+
+    # Prepend an in-band system instruction for non-owner tiers so the
+    # core agent cannot accidentally process a downgraded task with full
+    # capabilities. Mirrors the Discord bridge's tier-specific instruction
+    # block (see discord-bridge.py around `===SUTANDO SYSTEM INSTRUCTIONS===`).
+    # Kept short here because Slack's downgrade surface today is just
+    # "delegate to sandboxed read-only agent" — no Slack-state-prefetch
+    # path equivalent to Discord's `_prefetch_discord_state_refs`.
+    user_task_text = f"[{prefix} @{username or user_id}] {text}{attachment_note}"
+    if access_tier != "owner":
+        user_task_text = (
+            f"{user_task_text}\n\n"
+            f"===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"
+            f"This Slack task is from a {access_tier.upper()} tier sender, NOT the owner. "
+            f"You MUST delegate to a sandboxed agent (e.g. `codex exec --sandbox read-only`) "
+            f"and NEVER process it with full core-agent capabilities. "
+            f"For 'team' tier: information lookups OK, no system mutations. "
+            f"For 'other' tier: information-only replies about Sutando itself. "
+            f"Write the sandboxed output to `results/{{task_id}}.txt` as the user-facing reply.\n"
+        )
+
     ts = int(time.time() * 1000)
     task_id = f"task-{ts}"
     task_file = TASKS_DIR / f"{task_id}.txt"
-    priority = default_priority_for_source("slack", "owner")
+    priority = default_priority_for_source("slack", access_tier)
     task_file.write_text(
         f"id: {task_id}\n"
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S')}Z\n"
-        f"task: [{prefix} @{username or user_id}] {text}{attachment_note}\n"
+        f"task: {user_task_text}\n"
         f"source: slack\n"
         f"channel_id: {channel}\n"
         f"user_id: {user_id}\n"
-        f"access_tier: owner\n"
+        f"access_tier: {access_tier}\n"
         f"priority: {priority}\n"
     )
     with pending_replies_lock:
