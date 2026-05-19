@@ -80,13 +80,33 @@ def _workspace_root() -> Path:
         return Path.home() / ".sutando" / "workspace"
 
 
+def _host_label() -> str:
+    """Return the per-machine label used in `machine-<label>/` Memory paths.
+
+    Resolution:
+      1. `SUTANDO_HOST_LABEL` env var (override) — for users who rename their
+         Mac in System Settings or whose hostname changes between Wi-Fi /
+         Ethernet (different mDNS suffixes), pinning the label keeps Memory
+         continuity across the rename.
+      2. `socket.gethostname().split('.')[0]` — today's default.
+
+    Empty / whitespace-only overrides are treated as unset so a stray empty
+    env-var entry can't silently collapse all hosts into `machine-/`.
+
+    Issue #871 (RFC #858 Decision 3).
+    """
+    override = os.environ.get("SUTANDO_HOST_LABEL")
+    if override and override.strip():
+        return override.strip()
+    return socket.gethostname().split(".")[0]
+
+
 def _private_machine_dir() -> Path | None:
     root = _memory_dir_env()
     if not root:
         return None
     expanded = os.path.expanduser(root)
-    host = socket.gethostname().split(".")[0]
-    return Path(expanded) / f"machine-{host}"
+    return Path(expanded) / f"machine-{_host_label()}"
 
 
 def personal_path(filename: str, workspace: Path | None = None) -> Path:

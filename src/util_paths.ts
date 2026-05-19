@@ -33,6 +33,27 @@ function expandHome(p: string): string {
 }
 
 /**
+ * Return the per-machine label used in `machine-<label>/` Memory paths.
+ *
+ * Resolution:
+ *   1. `SUTANDO_HOST_LABEL` env var (override) — for users who rename their
+ *      Mac in System Settings or whose hostname changes between Wi-Fi /
+ *      Ethernet (different mDNS suffixes), pinning the label keeps Memory
+ *      continuity across the rename.
+ *   2. `hostname().split('.')[0]` — today's default.
+ *
+ * Empty / whitespace-only overrides are treated as unset so a stray empty
+ * env-var entry can't silently collapse all hosts into `machine-/`.
+ *
+ * Issue #871 (RFC #858 Decision 3).
+ */
+export function hostLabel(): string {
+	const override = process.env.SUTANDO_HOST_LABEL;
+	if (override && override.trim()) return override.trim();
+	return hostname().split('.')[0];
+}
+
+/**
  * Return the resolved memory-dir env value, preferring the new name.
  *
  * Lookup order:
@@ -68,7 +89,7 @@ export function personalPath(filename: string, workspace?: string): string {
 	const privateRoot = memoryDirEnv();
 	if (privateRoot) {
 		const root = expandHome(privateRoot);
-		const host = hostname().split('.')[0];
+		const host = hostLabel();
 		const candidate = join(root, `machine-${host}`, filename);
 		if (existsSync(candidate)) return candidate;
 	}
@@ -83,7 +104,7 @@ export function personalPath(filename: string, workspace?: string): string {
 	// check fails gracefully.
 	if (privateRoot) {
 		const root = expandHome(privateRoot);
-		const host = hostname().split('.')[0];
+		const host = hostLabel();
 		return join(root, `machine-${host}`, filename);
 	}
 	if (filename === 'stand-avatar.png') return join(ws, 'assets', filename);

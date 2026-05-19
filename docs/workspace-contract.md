@@ -84,7 +84,7 @@ Walk the question top-to-bottom and stop at the first match:
 1. **Is the file checked into git?** → `REPO_DIR`. (Source code, scripts, docs, tests, package.json.)
 2. **Is the file a stable cross-machine reference Claude can read on session start?** (e.g., `CLAUDE.md`, README) → `REPO_DIR`.
 3. **Otherwise — does it mutate during runtime?** → `WORKSPACE_DIR`. (Tasks, results, state, logs, notes, build_log, pending-questions, status JSON.)
-4. **Is it per-machine personal state?** (Stand identity, avatar) → `personal_path()` (honors `SUTANDO_MEMORY_DIR` first; legacy `SUTANDO_PRIVATE_DIR` falls through for one release per #870).
+4. **Is it per-machine personal state?** (Stand identity, avatar) → `personal_path()` (honors `SUTANDO_MEMORY_DIR` first; legacy `SUTANDO_PRIVATE_DIR` falls through for one release per #870). The per-machine subdirectory is `machine-<label>/` where `<label>` defaults to the system hostname but can be pinned via `SUTANDO_HOST_LABEL` (#871) — set this if you've renamed your Mac in System Settings and want to keep Memory continuity, or if your hostname flips between Wi-Fi / Ethernet suffixes.
 5. **Is it fleet-shared user state?** (Notes, shared memory) → `shared_personal_path()` (honors `SUTANDO_MEMORY_DIR` first, falls back to workspace; legacy `SUTANDO_PRIVATE_DIR` honored for one release per #870).
 
 ## Related PRs

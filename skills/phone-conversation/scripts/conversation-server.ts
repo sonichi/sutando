@@ -55,6 +55,7 @@ import { resolveWorkspace } from '../../../src/workspace_default.js';
 // Personal-asset path resolver — twin of util_paths.py / voice-agent.ts:personalPath.
 // Reads $SUTANDO_MEMORY_DIR (canonical post-#870), honors legacy $SUTANDO_PRIVATE_DIR
 // as a fallback with a one-release deprecation warning on every read.
+// Per-machine label resolves via $SUTANDO_HOST_LABEL override → hostname (#871).
 function personalPath(filename: string): string {
 	let privateRoot = process.env.SUTANDO_MEMORY_DIR;
 	if (!privateRoot && process.env.SUTANDO_PRIVATE_DIR) {
@@ -67,7 +68,11 @@ function personalPath(filename: string): string {
 	}
 	if (privateRoot) {
 		const root = privateRoot.replace(/^~/, process.env.HOME || '');
-		const host = hostname().split('.')[0];
+		const labelOverride = process.env.SUTANDO_HOST_LABEL;
+		const host =
+			labelOverride && labelOverride.trim()
+				? labelOverride.trim()
+				: hostname().split('.')[0];
 		const candidate = join(root, `machine-${host}`, filename);
 		if (existsSync(candidate)) return candidate;
 	}
