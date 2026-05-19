@@ -1,8 +1,8 @@
 import { describe, it, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync, existsSync, unlinkSync, mkdtempSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { setupTempWorkspace } from './_helpers/temp-workspace.js';
 
 // Unit tests for the get_core_status inline tool (PR #467).
 // The tool reads `<SUTANDO_WORKSPACE>/core-status.json` (post-#840 fix). Tests
@@ -11,8 +11,8 @@ import { tmpdir } from 'node:os';
 // web-client that ALSO reads core-status.json) can't race. Before #840: both
 // tests shared <REPO_ROOT>/core-status.json and node:test parallel-file mode
 // caused intermittent failures.
-const TEMP_WORKSPACE = mkdtempSync(join(tmpdir(), 'sutando-test-getcore-'));
-process.env.SUTANDO_WORKSPACE = TEMP_WORKSPACE;
+const { workspace: TEMP_WORKSPACE, cleanup: cleanupTempWorkspace } =
+	setupTempWorkspace('getcore');
 const CORE_STATUS_PATH = join(TEMP_WORKSPACE, 'core-status.json');
 
 // Import AFTER setting SUTANDO_WORKSPACE so the tool's module-load resolves
@@ -27,10 +27,7 @@ async function invoke(): Promise<any> {
 }
 
 describe('get_core_status inline tool', () => {
-	after(() => {
-		// Remove the per-test-process workspace temp dir wholesale.
-		try { rmSync(TEMP_WORKSPACE, { recursive: true, force: true }); } catch { /* idempotent */ }
-	});
+	after(cleanupTempWorkspace);
 
 	it('returns status:running with step + ageSec when fresh running file exists', async () => {
 		const nowSec = Math.floor(Date.now() / 1000);
