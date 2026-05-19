@@ -80,7 +80,19 @@ fi
 # SUTANDO_REPO_DIR overrides if the user needs a non-standard checkout path.
 # (Renamed from SUTANDO_WORKSPACE to avoid collision with the post-#762
 #  workspace contract where SUTANDO_WORKSPACE means ~/.sutando/workspace/.)
-REPO_DIR="${SUTANDO_REPO_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+#
+# Deprecation fallback: if SUTANDO_REPO_DIR is unset but the old
+# SUTANDO_WORKSPACE is set AND points at a directory containing
+# scripts/sync-memory.sh, honor it with a one-time stderr warning.
+# Remove after one release cycle.
+if [ -n "${SUTANDO_REPO_DIR:-}" ]; then
+    REPO_DIR="$SUTANDO_REPO_DIR"
+elif [ -n "${SUTANDO_WORKSPACE:-}" ] && [ -d "${SUTANDO_WORKSPACE}/scripts" ]; then
+    echo "sync-memory: SUTANDO_WORKSPACE is deprecated, use SUTANDO_REPO_DIR instead. Falling back to \'$SUTANDO_WORKSPACE\' for now." >&2
+    REPO_DIR="$SUTANDO_WORKSPACE"
+else
+    REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+fi
 if [ ! -d "$REPO_DIR" ]; then
     echo "sync-memory: sutando checkout not found at $REPO_DIR; set SUTANDO_REPO_DIR or run this script from inside the repo." >&2
     exit 0
