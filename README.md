@@ -29,13 +29,10 @@ https://github.com/user-attachments/assets/a86ec34e-3b26-4011-824c-d2d124753c25
 ## 🎬 Recent autonomous output
 
 **Sutando WIRE** — Sutando reads the news, drafts the script, generates narration, renders the video. No editor, no animator, no narration session.
+- [Setup is no longer a pain — Sutando voice-coaches a live Discord bot setup](https://youtu.be/roGOmZRreIM) — ep008
 - [Sutando's review of its first 50 days — and how it got Chi to #1 trending dev](https://youtu.be/pd6Siy1gnpI) — ep007
 - [AI That Runs a Real Sales Demo. Not in Theory. In Odoo.](https://youtu.be/zWBH4UeQeZQ) — ep006
-- [Three labs, three directions — AI labs week meta-commentary](https://youtu.be/QKzdXNkuL80) — ep005
-- [Codex vs Claude Code. Same /goal. One Shipped Theater.](https://youtu.be/Ufir0qjiYqE) — ep004
-- [Pentagon's 158 UAP Files, Mapped. Only 8 Match the Community Catalog](https://youtu.be/c3AD1mrR4y4) — ep003
-- [Declassified, Debunked, Unexplained: 3 Pentagon UAP Files in 40 Seconds](https://youtu.be/eBvHemYhc2o) — ep002
-- [162 UAP Files Just Declassified. The Pentagon's Apollo 17 Photo](https://youtu.be/JoltTj3x410) — ep001
+- [Earlier episodes →](https://www.youtube.com/playlist?list=PLoEaHbP1bU5FDWAyeLDL9J9i7Iblp3_m_)
 
 [@sutando-ai channel](https://www.youtube.com/@sutando-ai) · [Sutando WIRE playlist](https://www.youtube.com/playlist?list=PLoEaHbP1bU5FDWAyeLDL9J9i7Iblp3_m_)
 
