@@ -98,6 +98,42 @@ TASKS_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def extract_forward_note(msg: dict) -> str:
+    """Return a ` [forwarded from ...]` suffix for a Telegram message dict.
+
+    Handles Bot API 7.0+ `forward_origin` (user / hidden_user / chat / channel)
+    and legacy `forward_from` / `forward_sender_name`. Returns "" for
+    non-forwarded messages or unknown `forward_origin.type` values so the
+    bridge fails open rather than crashing on future Telegram additions.
+    """
+    fwd_origin = msg.get("forward_origin") or {}
+    if fwd_origin:
+        fwd_type = fwd_origin.get("type")
+        if fwd_type == "user":
+            u = fwd_origin.get("sender_user", {})
+            name = u.get("username") or u.get("first_name") or "unknown"
+            return f" [forwarded from @{name}]"
+        if fwd_type == "hidden_user":
+            name = fwd_origin.get("sender_user_name", "hidden")
+            return f" [forwarded from {name}]"
+        if fwd_type == "chat":
+            chat = fwd_origin.get("sender_chat", {})
+            name = chat.get("title") or chat.get("username") or "channel"
+            return f" [forwarded from chat: {name}]"
+        if fwd_type == "channel":
+            chat = fwd_origin.get("chat", {})
+            name = chat.get("title") or chat.get("username") or "channel"
+            return f" [forwarded from channel: {name}]"
+        return ""
+    if "forward_from" in msg:
+        u = msg["forward_from"]
+        name = u.get("username") or u.get("first_name") or "unknown"
+        return f" [forwarded from @{name}]"
+    if "forward_sender_name" in msg:
+        return f" [forwarded from {msg['forward_sender_name']}]"
+    return ""
+
+
 def write_owner_activity(channel: str, summary: str) -> None:
     """Record owner activity — see src/discord-bridge.py for schema."""
     try:
@@ -387,38 +423,7 @@ def main():
                 if not text and not attachment_note:
                     continue
 
-                # Forwarded message attribution. Telegram populates
-                # `forward_origin` (Bot API 7.0+) or the legacy `forward_from` /
-                # `forward_sender_name` fields when the user forwards a message.
-                # Without this, the bridge attributes Boris-forwarded-by-Chi
-                # to Chi alone and the original sender's name disappears.
-                forward_note = ""
-                fwd_origin = msg.get("forward_origin") or {}
-                if fwd_origin:
-                    fwd_type = fwd_origin.get("type")
-                    if fwd_type == "user":
-                        u = fwd_origin.get("sender_user", {})
-                        name = u.get("username") or u.get("first_name") or "unknown"
-                        forward_note = f" [forwarded from @{name}]"
-                    elif fwd_type == "hidden_user":
-                        name = fwd_origin.get("sender_user_name", "hidden")
-                        forward_note = f" [forwarded from {name}]"
-                    elif fwd_type == "chat":
-                        chat = fwd_origin.get("sender_chat", {})
-                        name = chat.get("title") or chat.get("username") or "channel"
-                        forward_note = f" [forwarded from chat: {name}]"
-                    elif fwd_type == "channel":
-                        chat = fwd_origin.get("chat", {})
-                        name = chat.get("title") or chat.get("username") or "channel"
-                        forward_note = f" [forwarded from channel: {name}]"
-                else:
-                    # Legacy fallback for older Bot API responses.
-                    if "forward_from" in msg:
-                        u = msg["forward_from"]
-                        name = u.get("username") or u.get("first_name") or "unknown"
-                        forward_note = f" [forwarded from @{name}]"
-                    elif "forward_sender_name" in msg:
-                        forward_note = f" [forwarded from {msg['forward_sender_name']}]"
+                forward_note = extract_forward_note(msg)
 
                 print(f"  @{username}{forward_note}: {text}{attachment_note}")
 
