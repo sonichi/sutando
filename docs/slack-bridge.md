@@ -8,12 +8,16 @@ pipeline as voice / Discord / Telegram.
 1. **Create the app**: https://api.slack.com/apps → "Create New App" → "From scratch".
    Pick a name + a workspace.
 
-2. **Socket Mode**: enable on the "Socket Mode" page. Generate an App-level
-   token with scope `connections:write`. Copy it (`xapp-...`).
+2. **Socket Mode**: enable on the "Socket Mode" page. Generate an
+   **App-Level Token** with scope **`connections:write`** (NOT
+   `app_configurations:write` — that's a different scope and the daemon
+   will crash on boot with `missing_scope` if you pick the wrong one).
+   Copy the token (`xapp-...`).
 
-3. **OAuth & Permissions**: under "Bot Token Scopes", add
-   `chat:write`, `im:history`, `im:write`, `app_mentions:read`,
-   `channels:history`, `groups:history`.
+3. **OAuth & Permissions**: under "Bot Token Scopes" (NOT "User Token
+   Scopes" — leave that one empty), add `chat:write`, `im:history`,
+   `im:write`, `app_mentions:read`, `channels:history`,
+   `groups:history`, `files:read`, `files:write`, `users:read`.
 
 4. **Event Subscriptions**: enable. Subscribe to bot events `app_mention` and
    `message.im` (DMs).
