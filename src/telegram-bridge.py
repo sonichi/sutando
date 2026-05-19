@@ -387,7 +387,40 @@ def main():
                 if not text and not attachment_note:
                     continue
 
-                print(f"  @{username}: {text}{attachment_note}")
+                # Forwarded message attribution. Telegram populates
+                # `forward_origin` (Bot API 7.0+) or the legacy `forward_from` /
+                # `forward_sender_name` fields when the user forwards a message.
+                # Without this, the bridge attributes Boris-forwarded-by-Chi
+                # to Chi alone and the original sender's name disappears.
+                forward_note = ""
+                fwd_origin = msg.get("forward_origin") or {}
+                if fwd_origin:
+                    fwd_type = fwd_origin.get("type")
+                    if fwd_type == "user":
+                        u = fwd_origin.get("sender_user", {})
+                        name = u.get("username") or u.get("first_name") or "unknown"
+                        forward_note = f" [forwarded from @{name}]"
+                    elif fwd_type == "hidden_user":
+                        name = fwd_origin.get("sender_user_name", "hidden")
+                        forward_note = f" [forwarded from {name}]"
+                    elif fwd_type == "chat":
+                        chat = fwd_origin.get("sender_chat", {})
+                        name = chat.get("title") or chat.get("username") or "channel"
+                        forward_note = f" [forwarded from chat: {name}]"
+                    elif fwd_type == "channel":
+                        chat = fwd_origin.get("chat", {})
+                        name = chat.get("title") or chat.get("username") or "channel"
+                        forward_note = f" [forwarded from channel: {name}]"
+                else:
+                    # Legacy fallback for older Bot API responses.
+                    if "forward_from" in msg:
+                        u = msg["forward_from"]
+                        name = u.get("username") or u.get("first_name") or "unknown"
+                        forward_note = f" [forwarded from @{name}]"
+                    elif "forward_sender_name" in msg:
+                        forward_note = f" [forwarded from {msg['forward_sender_name']}]"
+
+                print(f"  @{username}{forward_note}: {text}{attachment_note}")
 
                 # Write as task (same format as voice bridge)
                 ts = int(time.time() * 1000)
@@ -397,7 +430,7 @@ def main():
                 task_file.write_text(
                     f"id: {task_id}\n"
                     f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S')}Z\n"
-                    f"task: [Telegram @{username}] {text}{attachment_note}\n"
+                    f"task: [Telegram @{username}{forward_note}] {text}{attachment_note}\n"
                     f"source: telegram\n"
                     f"chat_id: {chat_id}\n"
                     f"priority: {priority}\n"
