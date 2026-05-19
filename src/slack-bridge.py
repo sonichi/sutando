@@ -43,6 +43,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from task_priority import default_priority_for_source  # noqa: E402
+from result_markers import parse_markers  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
 try:
@@ -440,18 +441,35 @@ def _send_file(channel: str, thread_ts: str | None, fpath: str) -> bool:
 
 
 def _send_reply(channel: str, thread_ts: str | None, text: str) -> None:
-    """Post a reply via chat.postMessage with file-marker extraction.
+    """Post a reply via chat.postMessage with marker extraction.
 
-    Extracts [file:]/[send:]/[attach:] markers, uploads each allowlisted
-    file via files_upload_v2, and posts whatever text remains via
-    chat.postMessage. Chunks long text into 4000-char Slack messages.
+    Honors the unified marker protocol from `src/result_markers.py` (#873):
+    - `[channel: <id>]` at body start → redirect to <id>, drop thread_ts
+      (cross-channel posts don't carry the original thread context).
+    - `[file:]/[send:]/[attach:]` anywhere → upload via files_upload_v2,
+      stripped from text body.
+    Skip markers ([no-send] / [REPLIED] / [deduped:]) are handled upstream
+    in result_watcher() so we never see them here.
+
+    Long text chunked at 4000 chars per Slack message (40k hard cap, but
+    readability suffers above ~4k).
     """
     if not text:
         return
 
-    # Extract file paths first so the text body doesn't carry them.
-    file_paths = [m.strip() for m in FILE_MARKER_RE.findall(text)]
-    clean_text = FILE_MARKER_RE.sub('', text).strip()
+    parsed = parse_markers(text)
+    clean_text = parsed.body
+
+    # [channel:] redirect — for cross-channel posting (e.g., reply to a DM
+    # task by sending into a public channel instead). Drop thread_ts since
+    # we're moving to a new channel.
+    for action in parsed.actions:
+        if action.kind == "redirect":
+            channel = action.value
+            thread_ts = None
+            break
+
+    file_paths = [a.value for a in parsed.actions if a.kind == "attach"]
 
     # Post the text body in 4000-char chunks (Slack's per-message limit is
     # 40k chars but readability suffers above ~4k).
@@ -512,9 +530,12 @@ def result_watcher():
                 if not target:
                     continue
 
-                if (reply_text.startswith("[no-send]")
-                        or reply_text.startswith("[REPLIED]")
-                        or reply_text.startswith("[deduped:")):
+                # Skip-marker check via unified parser (#873). Equivalent to
+                # the prior startswith trio but routed through one source of
+                # truth so future skip markers added in result_markers.py
+                # automatically apply here.
+                _skip_parsed = parse_markers(reply_text)
+                if any(a.kind == "skip" for a in _skip_parsed.actions):
                     print(f"  Skipped (marker): {task_id}", flush=True)
                 else:
                     try:
