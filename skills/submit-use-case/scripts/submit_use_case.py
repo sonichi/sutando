@@ -12,7 +12,7 @@ import dependency).
 
 Usage:
     submit_use_case.py --title T --summary S [--bullets B1 ...] \
-        [--video PATH] [--image-url URL] [--youtube-id ID] \
+        [--video PATH] [--media-url URL] [--youtube-id ID] \
         [--x-url URL] [--linkedin-url URL] [--contact STR] \
         [--issue-only | --pr-only] [--dry-run]
 """
@@ -147,9 +147,15 @@ def existing_issue_url(title: str) -> str | None:
 
 # --- content rendering ------------------------------------------------------
 def render_long_description(summary: str, bullets: list[str]) -> str:
-    """Deterministic stitched paragraph. Real fleet can pipe through a subagent."""
-    body = " ".join(b.rstrip(".") + "." for b in bullets) if bullets else summary
-    return body if len(body) > len(summary) else summary
+    """Deterministic stitched paragraph: summary followed by joined bullets.
+
+    Bullets always extend the summary when present (no length-comparison fallback
+    that silently dropped short bullets in earlier revisions).
+    """
+    if not bullets:
+        return summary
+    body = " ".join(b.rstrip(".") + "." for b in bullets)
+    return f"{summary} {body}"
 
 
 def _yaml_escape(s: str) -> str:
@@ -189,7 +195,7 @@ def render_pr_file(
 
 def render_issue_body(
     *, slug: str, title: str, summary: str, bullets: list[str],
-    video_path: str | None, image_url: str | None, youtube_id: str | None,
+    video_path: str | None, media_url: str | None, youtube_id: str | None,
     x_url: str | None, linkedin_url: str | None,
     contact: str | None, pr_branch: str | None,
 ) -> str:
@@ -202,8 +208,8 @@ def render_issue_body(
     links = []
     if video_path:
         links.append(f"- Video (local path on submitter's machine): `{video_path}`")
-    if image_url:
-        links.append(f"- Image: {image_url}")
+    if media_url:
+        links.append(f"- Media: {media_url}")
     if youtube_id:
         links.append(f"- YouTube: https://youtu.be/{youtube_id}")
     if x_url:
@@ -241,8 +247,8 @@ def main():
     ap.add_argument("--bullets", action="append", default=[])
     ap.add_argument("--video", type=Path,
                     help="Local path; referenced in the issue body, NOT uploaded.")
-    ap.add_argument("--image-url",
-                    help="Hosted image URL; recorded in frontmatter as videoUrl alternative.")
+    ap.add_argument("--media-url",
+                    help="Hosted media URL (image or video link). Recorded in frontmatter as videoUrl for compat with the AG2Platform UseCase schema; rendered as a link in the issue body.")
     ap.add_argument("--youtube-id")
     ap.add_argument("--x-url")
     ap.add_argument("--linkedin-url")
@@ -271,7 +277,7 @@ def main():
         die("slug derived from title is empty")
     print(f"slug: {slug}")
 
-    submitted_at = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    submitted_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     branch = f"community-use-case/{slug}"
     do_issue = not args.pr_only
     do_pr = not args.issue_only
@@ -279,14 +285,14 @@ def main():
     long_desc = render_long_description(args.summary, args.bullets)
     pr_file_text = render_pr_file(
         slug=slug, title=args.title, summary=args.summary, long_desc=long_desc,
-        video_url=args.image_url, youtube_id=args.youtube_id,
+        video_url=args.media_url, youtube_id=args.youtube_id,
         x_url=args.x_url, linkedin_url=args.linkedin_url,
         contact=args.contact, submitted_at=submitted_at,
     )
     issue_body = render_issue_body(
         slug=slug, title=args.title, summary=args.summary, bullets=args.bullets,
         video_path=str(args.video) if args.video else None,
-        image_url=args.image_url, youtube_id=args.youtube_id,
+        media_url=args.media_url, youtube_id=args.youtube_id,
         x_url=args.x_url, linkedin_url=args.linkedin_url,
         contact=args.contact, pr_branch=branch if do_pr else None,
     )
