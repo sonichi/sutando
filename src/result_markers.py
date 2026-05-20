@@ -102,6 +102,17 @@ _SKIP_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 # methods like `.search()` / `.finditer()`).
 _REDIRECT_RE = re.compile(r"^\s*\[channel:\s*([^\]]+)\]\s*\n?")
 
+# D7 reply-header pattern (owner directive 2026-05-19) — pool cores prepend
+# `**[core: N]**` plus an optional italic `_(...)_` sub-line to every
+# user-facing reply so chat clients can see which core handled the message.
+# The header lives at byte 0, which would shadow `[channel:]` since the
+# redirect regex anchors with `re.match()`. We peel the header off before
+# marker parsing and stitch it back onto the returned body so the human
+# reader still sees it.
+_D7_HEADER_RE = re.compile(
+    r"\A\*\*\[core:\s*[^\]]+\]\*\*\s*\n(?:_[^\n]*_\s*\n)?\s*"
+)
+
 # Attach markers — file/send/attach are aliases.
 _ATTACH_RE = re.compile(r"\[(?:file|send|attach):\s*([^\]]+)\]")
 
@@ -126,9 +137,25 @@ def parse_markers(text: str) -> ParseResult:
 
     actions: list[Action] = []
 
+    # Peel off optional D7 reply-header before any marker scan so neither
+    # the skip patterns nor the redirect regex are shadowed by it. The
+    # header is re-stitched onto the returned body for non-skip results;
+    # skip results are invisible to the user regardless, so the header is
+    # discarded alongside the body.
+    d7_prefix = ""
+    d7_match = _D7_HEADER_RE.match(text)
+    if d7_match:
+        d7_prefix = d7_match.group(0)
+        body = text[d7_match.end():]
+    else:
+        body = text
+
     # 1. SKIP — matches anchored at body start. Whitespace before is OK.
+    # If a result has a D7 header followed by a skip marker, the result is
+    # still invisible to the user — skip is terminal and the header is
+    # discarded along with the body.
     for pat, reason in _SKIP_PATTERNS:
-        m = pat.match(text)
+        m = pat.match(body)
         if m:
             extra = None
             if reason == "deduped":
@@ -138,16 +165,17 @@ def parse_markers(text: str) -> ParseResult:
             # No further parsing — skip is terminal.
             return ParseResult(body="", actions=actions)
 
-    body = text
-
-    # 2. REDIRECT — must be the first non-empty line. The regex uses
-    # MULTILINE so ^ anchors at any newline, but we restrict to the first
-    # such match.
+    # 2. REDIRECT — must be the first non-empty line (after any D7 header).
     redirect_match = _REDIRECT_RE.match(body)
     if redirect_match:
         channel = redirect_match.group(1).strip()
         actions.append(Action(kind="redirect", value=channel))
         body = body[redirect_match.end():]
+
+    # Restore D7 header so it appears in the user-facing body. (It was only
+    # peeled off so it didn't shadow the marker regexes.)
+    if d7_prefix:
+        body = d7_prefix + body
 
     # 3. ATTACH — scan everywhere in the (possibly already-redirected) body.
     # Document-order paths.

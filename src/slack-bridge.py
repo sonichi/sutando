@@ -467,7 +467,7 @@ def _send_file(channel: str, thread_ts: str | None, fpath: str) -> bool:
         return False
 
 
-def _send_reply(channel: str, thread_ts: str | None, text: str) -> None:
+def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | None = None) -> None:
     """Post a reply via chat.postMessage with marker extraction.
 
     Honors the unified marker protocol from `src/result_markers.py` (#873):
@@ -501,6 +501,7 @@ def _send_reply(channel: str, thread_ts: str | None, text: str) -> None:
     # Post the text body in 4000-char chunks (Slack's per-message limit is
     # 40k chars but readability suffers above ~4k).
     if clean_text:
+        all_chunks_sent = True
         for i in range(0, len(clean_text), 4000):
             kwargs = {"channel": channel, "text": clean_text[i:i + 4000]}
             if thread_ts:
@@ -509,7 +510,22 @@ def _send_reply(channel: str, thread_ts: str | None, text: str) -> None:
                 app.client.chat_postMessage(**kwargs)
             except Exception as e:
                 print(f"[Slack] chat_postMessage failed: {e}", flush=True)
+                all_chunks_sent = False
                 break
+        if all_chunks_sent:
+            # Slack channel id starts with D (DM), C (public/private channel),
+            # G (legacy group). Best-effort classification for the audit log.
+            ch_type = "slack_dm" if channel.startswith("D") else "slack_channel"
+            try:
+                import outbox_log
+                outbox_log.append(
+                    channel_type=ch_type,
+                    recipient=channel,
+                    body=clean_text,
+                    task_id=task_id,
+                )
+            except Exception:
+                pass
 
     # Then upload each file. Fail-closed via _is_path_sendable.
     for fpath in file_paths:
@@ -566,7 +582,7 @@ def result_watcher():
                     print(f"  Skipped (marker): {task_id}", flush=True)
                 else:
                     try:
-                        _send_reply(target["channel"], target.get("thread_ts"), reply_text)
+                        _send_reply(target["channel"], target.get("thread_ts"), reply_text, task_id=task_id)
                         print(f"  Replied to {target['channel']}: {reply_text[:80]}...", flush=True)
                     except Exception as e:
                         print(f"[Slack] reply error: {e}", flush=True)
