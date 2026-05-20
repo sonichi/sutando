@@ -1141,8 +1141,24 @@ async function main() {
 			if (inject()) return;
 			setTimeout(() => {
 				if (inject()) return;
+				// Stuck-voice fallback. Per Susan's PR #924 review (Q3): Cartesia
+				// only reaches the user if they're watching the web client with
+				// audio playback — a user in a stuck voice session is probably
+				// looking at the voice surface, not the web UI. So the
+				// stuck-voice result can go into the void. Always also write a
+				// Discord DM via a proactive-*.txt file so the result is never
+				// silently lost. Cartesia stays as a bonus path when available
+				// (some users keep the web UI open).
+				console.log(`${ts()} [TaskBridge] Voice not active after 3s — falling back to Discord DM${CARTESIA_API_KEY && generateSpeech ? ' + Cartesia' : ''}`);
+				try {
+					const proactiveTs = Math.floor(Date.now() / 1000);
+					const proactivePath = join(WORKSPACE_DIR, 'results', `proactive-voice-stuck-${proactiveTs}.txt`);
+					const dmBody = `🎤 Voice session was stuck — couldn't speak this. Task result:\n\n${result}`;
+					writeFileSync(proactivePath, dmBody);
+				} catch (e) {
+					console.error(`${ts()} [TaskBridge] Failed to write stuck-voice Discord fallback:`, e);
+				}
 				if (CARTESIA_API_KEY && generateSpeech) {
-					console.log(`${ts()} [TaskBridge] Voice not active after 3s — falling back to Cartesia`);
 					const truncated = (result.match(/^[\s\S]{0,500}[.!?]/)?.[0] || result.slice(0, 500)).trim();
 					generateSpeech(truncated, { category: 'result', label: 'task-result' }).then(audioPath => {
 						const relativeSrc = audioPath.startsWith(WORKSPACE_DIR)
@@ -1153,8 +1169,6 @@ async function main() {
 						}));
 						console.log(`${ts()} [CartesiaTTS] Audio generated: ${audioPath}`);
 					}).catch(err => console.error(`${ts()} [CartesiaTTS] ${err.message}`));
-				} else {
-					console.log(`${ts()} [TaskBridge] Voice not active after 3s and no Cartesia fallback — result dropped`);
 				}
 			}, 1500);
 		}, 1500);
