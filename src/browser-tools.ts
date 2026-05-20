@@ -221,7 +221,22 @@ export const openUrlTool: ToolDefinition = {
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { url } = args as { url: string };
+		const { url: rawUrl } = args as { url: string };
+		// Normalize spoken-URL artifacts before handing to osascript. The LLM
+		// sometimes passes a URL with surrounding whitespace from voice
+		// transcription, or with embedded spaces that AppleScript / Chrome
+		// reject as "Invalid URL entered. (5)" — opaque error. Trim and
+		// reject-up-front so the caller gets a clear diagnostic + the
+		// arg appears in the log, instead of three silent osascript errors.
+		const url = (rawUrl || '').trim();
+		if (!url) {
+			console.log(`${ts()} [OpenURL] rejected empty url`);
+			return { error: 'Failed to open: empty URL' };
+		}
+		if (/\s/.test(url)) {
+			console.log(`${ts()} [OpenURL] rejected url with whitespace: ${JSON.stringify(url)}`);
+			return { error: `Failed to open: URL contains whitespace (got ${JSON.stringify(url)})` };
+		}
 		// Escape backslashes first, then quotes — prevents shell injection via osascript
 		const safeUrl = url.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
 		// Parse target origin (scheme + host + port). If unparseable, fall back to new-tab behavior.
@@ -251,6 +266,12 @@ export const openUrlTool: ToolDefinition = {
 			console.log(`${ts()} [OpenURL] ${reused ? 'reused active tab' : 'opened new tab'}: ${url}`);
 			return { status: reused ? 'reused' : 'opened', url };
 		} catch (err) {
+			// Log the URL too — the prior version returned the URL only in the
+			// error string, which voice-agent's stdout strips by the time it
+			// reaches the log, leaving "Invalid URL entered. (5)" with no
+			// hint of what URL voice actually passed. 2026-05-19 incident:
+			// three back-to-back open_url failures with no observable arg.
+			console.log(`${ts()} [OpenURL] FAILED url=${JSON.stringify(url)} err=${err instanceof Error ? err.message : err}`);
 			return { error: `Failed to open ${url}: ${err instanceof Error ? err.message : err}` };
 		}
 	},
