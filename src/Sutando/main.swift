@@ -608,11 +608,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // Serialize + atomic write via tmp+replaceItem.
+        // Serialize + atomic write via tmp+replaceItem. Status files live under
+        // <workspace>/state/ (the workspace root is structural — directories only).
         let payload: [String: Any] = ["chips": chips, "ts": Int(Date().timeIntervalSince1970)]
         guard let json = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted]) else { return }
-        let dst = URL(fileURLWithPath: workspace + "/contextual-chips.json")
-        let tmp = URL(fileURLWithPath: workspace + "/contextual-chips.json.tmp")
+        let stateDir = workspace + "/state"
+        try? FileManager.default.createDirectory(atPath: stateDir, withIntermediateDirectories: true)
+        let dst = URL(fileURLWithPath: stateDir + "/contextual-chips.json")
+        let tmp = URL(fileURLWithPath: stateDir + "/contextual-chips.json.tmp")
         do {
             try json.write(to: tmp, options: [.atomic])
             _ = try FileManager.default.replaceItemAt(dst, withItemAt: tmp)

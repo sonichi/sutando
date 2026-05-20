@@ -27,7 +27,7 @@ from urllib.parse import urlparse
 # Matches PR #775's pattern for agent-api.py + github-webhook.py + task-bridge.ts.
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
-from workspace_default import resolve_workspace  # noqa: E402
+from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from util_paths import personal_path, shared_personal_path  # noqa: E402
 WORKSPACE_DIR = resolve_workspace()
 PORT = 7844
@@ -121,12 +121,13 @@ def get_score() -> str:
 def get_quota_status() -> dict:
     """Read quota state from quota-state.json (written by credential proxy).
 
-    Quota state IS runtime state, so the canonical home is the workspace
-    (docs/workspace-contract.md: REPO_DIR is source-tree-only). The
-    legacy skill-dir path is preserved as a fallback for the existing
-    writer until that's migrated separately.
+    Quota state IS runtime state; canonical home is <workspace>/state/.
+    status_read_path prefers state/quota-state.json and falls back to the
+    legacy workspace-root path for one release. The skill-dir path is
+    preserved as a last-resort fallback until older credential-proxy
+    installs roll over.
     """
-    quota_file = WORKSPACE_DIR / "quota-state.json"
+    quota_file = status_read_path("quota-state.json", WORKSPACE_DIR)
     if not quota_file.exists():
         quota_file = REPO_DIR / "skills" / "quota-tracker" / "quota-state.json"
     if not quota_file.exists():

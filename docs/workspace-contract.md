@@ -13,7 +13,7 @@ This is the strong form of the split. If you find yourself typing `REPO_DIR / "<
 | Concept | Path on this machine | What lives here | Use it when |
 |---|---|---|---|
 | **Source tree (`REPO_DIR`)** | wherever you cloned the repo (e.g. `~/Documents/github/sutando`) | `src/`, `skills/`, `scripts/`, `docs/`, `tests/`, `CLAUDE.md`, `package.json` — anything that's in git and is part of the codebase. | Exec'ing a source script. Running `git -C` against the tree. Reading a checked-in file (docs, sample config, source). |
-| **Workspace (`WORKSPACE_DIR`)** | `$SUTANDO_WORKSPACE` (if set) or `~/.sutando/workspace/` (canonical default) | Per-user mutable runtime state: `tasks/`, `results/`, `state/`, `data/`, `logs/`, `notes/`, `build_log.md`, `pending-questions.md`, `contextual-chips.json`, `core-status.json`, `voice-state.json`, `quota-state.json`, anything else the running agent generates or accumulates. | Always, unless one of the three "use REPO_DIR" cases above applies. |
+| **Workspace (`WORKSPACE_DIR`)** | `$SUTANDO_WORKSPACE` (if set) or `~/.sutando/workspace/` (canonical default) | Per-user mutable runtime state: `tasks/`, `results/`, `state/`, `data/`, `logs/`, `notes/`, `build_log.md`, `pending-questions.md`, anything else the running agent generates or accumulates. Loose status `.json` files (`core-status.json`, `voice-state.json`, `contextual-chips.json`, `dynamic-content.json`, `quota-state.json`) live under `state/` — use the `status_path` / `statusPath` helpers. | Always, unless one of the three "use REPO_DIR" cases above applies. |
 
 The two paths **can** be the same (default for fresh installs without `SUTANDO_WORKSPACE`), but designing for them as separate is the right structural shape — multiple Sutando nodes on one machine, separate-from-code workspace, OSS readers running the engine without polluting their own git tree.
 
@@ -28,7 +28,7 @@ For every `REPO_DIR / "..."` (or equivalent `Path(__file__).parent.parent / "...
 REPO_DIR = Path(__file__).resolve().parent.parent
 
 # Runtime state — for tasks/, results/, state/, data/, logs/, notes/,
-# build_log.md, pending-questions.md, core-status.json, etc.
+# build_log.md, pending-questions.md, etc. (status .json files: state/)
 from workspace_default import resolve_workspace
 WORKSPACE_DIR = resolve_workspace()
 ```

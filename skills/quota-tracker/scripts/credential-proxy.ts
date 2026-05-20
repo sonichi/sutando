@@ -5,7 +5,7 @@
  * - Runs as a local HTTP proxy between Claude Code and api.anthropic.com
  * - Injects OAuth credentials from macOS keychain
  * - Reads `anthropic-ratelimit-unified-*` headers from responses
- * - Writes quota state to quota-state.json for the dashboard
+ * - Writes quota state to <workspace>/state/quota-state.json for the dashboard
  *
  * Usage:
  *   npx tsx src/credential-proxy.ts              # start on port 7846
@@ -15,12 +15,16 @@
 import { createServer, request as httpRequest, type RequestOptions } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { execSync } from 'node:child_process';
-import { writeFileSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { writeFileSync, readFileSync, mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
+import { statusPath } from '../../../src/workspace_default.js';
 
 const PORT = 7846;
 const UPSTREAM = 'https://api.anthropic.com';
-const QUOTA_FILE = join(import.meta.dirname, '..', 'quota-state.json');
+// Quota state is per-user runtime state — canonical home is <workspace>/state/.
+// Historically written into the skill dir; readers (dashboard.py, read-quota.py)
+// keep the skill-dir path as a last-resort fallback for one release.
+const QUOTA_FILE = statusPath('quota-state.json');
 
 function ts(): string { return new Date().toISOString().slice(11, 23); }
 
@@ -64,6 +68,7 @@ function updateQuotaState(headers: Record<string, string>): void {
 			state.exhausted_since = new Date().toISOString();
 		}
 
+		mkdirSync(dirname(QUOTA_FILE), { recursive: true });
 		writeFileSync(QUOTA_FILE, JSON.stringify(state, null, 2));
 	} catch { /* best effort */ }
 }

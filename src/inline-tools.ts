@@ -11,7 +11,7 @@ import { join, extname, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
-import { resolveWorkspace } from './workspace_default.js';
+import { resolveWorkspace, statusPath, statusReadPath } from './workspace_default.js';
 
 // Tasks/, results/, state/, dynamic-content.json are per-user runtime state
 // — live under $SUTANDO_WORKSPACE. Pre-fix, sites below resolved against
@@ -626,16 +626,14 @@ export const getCoreStatusTool: ToolDefinition = {
 	execution: 'inline',
 	async execute() {
 		try {
-			// core-status.json is per-user runtime state at $SUTANDO_WORKSPACE
-			// (default ~/.sutando/workspace/). Pre-fix this read from REPO_ROOT
-			// via import.meta.url-relative path — but Python writers migrated
-			// to WORKSPACE_DIR in #836, so the TS reader silently saw stale or
-			// missing data. Same workspace-contract fix as #821/#842/#843.
-			const statusPath = join(WORKSPACE_DIR, 'core-status.json');
-			if (!existsSync(statusPath)) {
+			// core-status.json is per-user runtime state under $SUTANDO_WORKSPACE/state/
+			// (default ~/.sutando/workspace/state/). statusReadPath falls back to the
+			// legacy workspace-root location for one release.
+			const corePath = statusReadPath('core-status.json', WORKSPACE_DIR);
+			if (!existsSync(corePath)) {
 				return { status: 'idle', description: 'Core agent is not currently running.' };
 			}
-			const raw = readFileSync(statusPath, 'utf-8');
+			const raw = readFileSync(corePath, 'utf-8');
 			const s = JSON.parse(raw) as { status?: string; ts?: number; step?: string };
 			const nowSec = Math.floor(Date.now() / 1000);
 			const ageSec = typeof s.ts === 'number' ? nowSec - s.ts : null;
@@ -794,7 +792,7 @@ export const showViewTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { view } = args as { view: string };
-		const dcPath = join(WORKSPACE_DIR, 'dynamic-content.json');
+		const dcPath = statusPath('dynamic-content.json', WORKSPACE_DIR);
 		writeFileSync(dcPath, JSON.stringify({ type: 'view', view }));
 		// Auto-clear after 3 seconds so it doesn't persist
 		setTimeout(() => { try { unlinkSync(dcPath); } catch {} }, 3000);

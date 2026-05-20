@@ -19,7 +19,7 @@ const REPO_DIR = resolveWorkspace();
 const TASK_DIR = join(REPO_DIR, 'tasks');
 const RESULT_DIR = join(REPO_DIR, 'results');
 const STATE_DIR = join(REPO_DIR, 'state');
-const CONVERSATION_LOG = join(REPO_DIR, 'conversation.log');
+const CONVERSATION_LOG = join(REPO_DIR, 'logs', 'conversation.log');
 const OWNER_ACTIVITY_FILE = join(STATE_DIR, 'last-owner-activity.json');
 
 /** Record that the owner was active on <channel> right now. Atomic write

@@ -135,7 +135,7 @@ function normalizePhone(num: string): string {
  *  may lag, so it must not be authoritative here. */
 function getSafeContext(lines = 5): string {
 	try {
-		const logPath = join(WORKSPACE_DIR, 'conversation.log');
+		const logPath = join(WORKSPACE_DIR, 'logs', 'conversation.log');
 		if (!existsSync(logPath)) return '';
 		const entries = readFileSync(logPath, 'utf-8').trim().split('\n').slice(-lines);
 		return entries.map(line => {
@@ -956,7 +956,7 @@ function cleanupCall(callSid: string): void {
 	}
 	// Append to shared conversation.log + sqlite mirror for cross-agent context
 	if (session.transcript.length > 0) {
-		const logPath = join(WORKSPACE_DIR, 'conversation.log');
+		const logPath = join(WORKSPACE_DIR, 'logs', 'conversation.log');
 		const callType = session.meetingId ? `meeting-${session.meetingId}` : `call-${session.callerNumber || 'unknown'}`;
 		for (const t of session.transcript) {
 			const role = t.role === 'sutando' ? 'phone-agent' : 'phone-caller';
