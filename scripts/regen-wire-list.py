@@ -99,19 +99,29 @@ def fetch_playlist_videos(playlist_id: str) -> list[dict]:
 
 
 def fetch_video_stats(video_ids: list[str]) -> dict[str, dict]:
-    """Return {video_id: {likeCount, viewCount}}. Batches by 50."""
+    """Return {video_id: {likeCount, viewCount, privacyStatus}}.
+
+    `privacyStatus` is the load-bearing field: a playlist can contain
+    `private` / `unlisted` videos whose title comes back as "Private video"
+    from the API. Those must be filtered out before any list-rendering,
+    otherwise the README ends up with a "Private video" link.
+    Batches by 50 (the API's `id` max-length).
+    """
     stats = {}
     for i in range(0, len(video_ids), 50):
         batch = video_ids[i : i + 50]
         data = api_get(
             "videos",
-            {"part": "statistics", "id": ",".join(batch)},
+            {"part": "statistics,status", "id": ",".join(batch)},
         )
         for v in data.get("items", []):
             s = v.get("statistics", {})
             stats[v["id"]] = {
                 "likeCount": int(s.get("likeCount", 0)),
                 "viewCount": int(s.get("viewCount", 0)),
+                "privacyStatus": v.get("status", {}).get(
+                    "privacyStatus", "private"
+                ),
             }
     return stats
 
@@ -122,19 +132,33 @@ def age_days(published_at: str) -> int:
 
 
 def render_block(videos: list[dict]) -> str:
-    """Build the markdown block — newest N, hero N, playlist link."""
+    """Build the markdown block — newest N, hero N, playlist link.
+
+    Caller is responsible for passing only `public` videos; `videos` here
+    is already post-filter. When hero candidates fall short of HERO_SLOTS
+    (small/young channel state), fill from the oldest remaining public
+    videos so the total stays at NEWEST_SLOTS + HERO_SLOTS where possible.
+    """
     by_date = sorted(videos, key=lambda v: v["publishedAt"], reverse=True)
     newest = by_date[:NEWEST_SLOTS]
-    newest_ids = {v["videoId"] for v in newest}
+    used_ids = {v["videoId"] for v in newest}
 
     hero_candidates = [
         v
         for v in videos
-        if v["videoId"] not in newest_ids
+        if v["videoId"] not in used_ids
         and age_days(v["publishedAt"]) >= HERO_MIN_AGE_DAYS
     ]
     hero_candidates.sort(key=lambda v: v.get("likeCount", 0), reverse=True)
     hero = hero_candidates[:HERO_SLOTS]
+    used_ids.update(v["videoId"] for v in hero)
+
+    # Fallback: hero short → fill from any remaining unused videos by
+    # likeCount (relaxing the age floor) so the total reaches the target.
+    if len(hero) < HERO_SLOTS:
+        fallback = [v for v in videos if v["videoId"] not in used_ids]
+        fallback.sort(key=lambda v: v.get("likeCount", 0), reverse=True)
+        hero.extend(fallback[: HERO_SLOTS - len(hero)])
 
     lines = []
     for v in newest + hero:
@@ -178,9 +202,31 @@ def main():
         sys.exit(1)
     stats = fetch_video_stats([v["videoId"] for v in items])
     for v in items:
-        v.update(stats.get(v["videoId"], {"likeCount": 0, "viewCount": 0}))
+        v.update(
+            stats.get(
+                v["videoId"],
+                {"likeCount": 0, "viewCount": 0, "privacyStatus": "private"},
+            )
+        )
 
-    new_block = render_block(items)
+    # Drop anything that isn't publicly viewable. The YouTube API returns
+    # "Private video" as the title for `private` items (and sometimes for
+    # `unlisted` depending on auth), so without this filter the README ends
+    # up with a "Private video" link — exactly the bug Chi caught in #918.
+    public_items = [v for v in items if v.get("privacyStatus") == "public"]
+    if not public_items:
+        print(
+            "ERR: no public videos in playlist; refusing to render an empty list",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if len(public_items) < len(items):
+        skipped = len(items) - len(public_items)
+        print(
+            f"  skipped {skipped} non-public video(s)", file=sys.stderr
+        )
+
+    new_block = render_block(public_items)
 
     if args.dry_run:
         print(new_block)
