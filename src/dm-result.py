@@ -256,6 +256,16 @@ def send_dm(text: str) -> bool:
     print(
         f"dm-result: sent to DM ({len(text)} chars in {len(chunks)} chunk(s)) via channel {channel_id}"
     )
+    try:
+        import outbox_log
+        outbox_log.append(
+            channel_type="discord_dm",
+            recipient=str(owner_id),
+            body=text,
+            recipient_label="owner DM (via dm-result.py)",
+        )
+    except Exception:
+        pass
     return True
 
 
