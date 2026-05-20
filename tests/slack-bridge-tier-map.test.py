@@ -100,10 +100,11 @@ def main() -> int:
         "tierMap": {"Uteam": "team", "Uother": "other"},
     })
     tm = load_tier_map()
-    expect("Uowner unmapped → owner default", tm.get("Uowner", "owner"), "owner")
-    expect("Uteam mapped → team", tm.get("Uteam", "owner"), "team")
-    expect("Uother mapped → other", tm.get("Uother", "owner"), "other")
-    expect("Uunknown unmapped → owner default", tm.get("Uunknown", "owner"), "owner")
+    expect("Uteam mapped → team", tm.get("Uteam"), "team")
+    expect("Uother mapped → other", tm.get("Uother"), "other")
+    # load_tier_map() returns raw dict; _write_task handles the split default.
+    # When tierMap is non-empty and uid is missing, caller should use "other".
+    expect("Uowner in raw tierMap → None (not mapped)", tm.get("Uowner"), None)
 
     # Case 2: tierMap completely absent (pre-tierMap config). Everyone defaults to owner.
     _write_access(mod, {
@@ -112,7 +113,6 @@ def main() -> int:
     })
     tm = load_tier_map()
     expect("absent tierMap returns empty dict", tm, {})
-    expect("absent tierMap → all default to owner", tm.get("Uolduser", "owner"), "owner")
 
     # Case 3: tierMap with unknown tier value — caller-side fail-safe check.
     # load_tier_map() itself just returns the map; the caller in _write_task
@@ -139,7 +139,64 @@ def main() -> int:
     tm = load_tier_map()
     expect("missing file → empty dict", tm, {})
 
-    print()
+    # --- Caller-side split-default logic tests ---
+    # Mirrors the _write_task access_tier resolution in slack-bridge.py.
+    # Rules:
+    #   uid in tierMap → use mapped value
+    #   tierMap non-empty, uid missing → "other" (fail-safe, #893)
+    #   tierMap empty/absent → "owner" (pre-tierMap compat)
+    #   unknown tier value → degrade to "other"
+    def _resolve_tier(uid: str, tier_map: dict) -> str:
+        if uid in tier_map:
+            tier = tier_map[uid]
+        elif tier_map:
+            tier = "other"
+        else:
+            tier = "owner"
+        if tier not in ("owner", "team", "other"):
+            tier = "other"
+        return tier
+
+    # Case 7: tierMap present, uid missing → "other" (the #893 fix)
+    expect(
+        "tierMap non-empty, uid missing → 'other'",
+        _resolve_tier("Unewguy", {"Uteam": "team"}),
+        "other",
+    )
+
+    # Case 8: tierMap absent → "owner" (backward compat)
+    expect(
+        "tierMap absent → 'owner'",
+        _resolve_tier("Uolduser", {}),
+        "owner",
+    )
+
+    # Case 9: uid in tierMap → mapped value
+    expect(
+        "uid mapped to 'team' → 'team'",
+        _resolve_tier("Uteam", {"Uteam": "team"}),
+        "team",
+    )
+
+    # Case 10: unknown tier value → degrade to "other"
+    expect(
+        "unknown tier value → 'other'",
+        _resolve_tier("Ubad", {"Ubad": "rando"}),
+        "other",
+    )
+
+    # Case 11: tierMap present, multiple uids, one missing
+    tm_multi = {"Uteam": "team", "Uother": "other"}
+    expect(
+        "mixed tierMap, unmapped uid → 'other'",
+        _resolve_tier("Umissing", tm_multi),
+        "other",
+    )
+    expect(
+        "mixed tierMap, mapped uid → correct tier",
+        _resolve_tier("Uteam", tm_multi),
+        "team",
+    )
     print(f"Results: {passes} passed, {fails} failed")
     return 0 if fails == 0 else 1
 

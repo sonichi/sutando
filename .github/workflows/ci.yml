@@ -3,15 +3,6 @@ name: CI
 on:
   pull_request:
     branches: [main]
-    paths:
-      - 'package.json'
-      - 'package-lock.json'
-      - 'tsconfig.json'
-      - 'src/**'
-      - 'tests/**'
-      - 'skills/**/*.ts'
-      - 'scripts/**'
-      - '.github/workflows/ci.yml'
   push:
     branches: [main]
 
@@ -50,3 +41,27 @@ jobs:
       - name: Run tests
         run: npm test
         if: hashFiles('tests/**/*.test.ts') != ''
+
+      # Run standalone Python tests (*.test.py) — stdlib-only, no deps needed.
+      # Covers telegram-bridge TOFU tri-state, slack-bridge tier-map, discord-bridge
+      # access tiers, result-markers, and more. See #897.
+      #
+      # Quiet mode: suppress PASS lines (only FAIL + summary shown) to keep CI
+      # log compact across 32+ test files. Non-zero exit on any failure.
+      - name: Run Python standalone tests
+        run: |
+          failed=0
+          while IFS= read -r f; do
+            echo "→ $f"
+            output=$(python3 "$f" 2>&1)
+            rc=$?
+            # Always show FAIL lines and summary
+            echo "$output" | grep -E 'FAIL|^Results:' || true
+            if [ $rc -ne 0 ]; then
+              # Test failed — emit full output (PASS + FAIL + traceback) so
+              # debugging info isn't dropped on ImportError / uncaught exception.
+              echo "$output"
+              failed=1
+            fi
+          done < <(find tests -name '*.test.py' -not -path '*/node_modules/*' | sort)
+          exit "$failed"
