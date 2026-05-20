@@ -142,7 +142,24 @@ echo ""
 # Install Claude Code skills (runs every startup, idempotent)
 bash "$REPO/skills/install.sh" 2>/dev/null || true
 
-# Create tasks/ and results/ directories
+# Resolve the runtime workspace (separate from $REPO so per-user state lives
+# outside the git checkout). Same resolution shape as src/workspace_default.py:
+#   1. $SUTANDO_WORKSPACE env override (tilde-expand if needed)
+#   2. ~/.sutando/workspace/ (canonical default)
+#
+# All service logs + tasks/results land under $WORKSPACE/logs etc. instead of
+# the repo-root legacy paths. health-check + dashboard already read from
+# $WORKSPACE/logs — this redirects the writes to match.
+if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
+  WORKSPACE="${SUTANDO_WORKSPACE/#\~/$HOME}"
+else
+  WORKSPACE="$HOME/.sutando/workspace"
+fi
+mkdir -p "$WORKSPACE/logs" "$WORKSPACE/tasks" "$WORKSPACE/results" "$WORKSPACE/data"
+LOGS_DIR="$WORKSPACE/logs"
+
+# Legacy repo-root tasks/results/data still created for back-compat with
+# scripts that haven't migrated yet; safe no-op once everything's switched.
 mkdir -p tasks results data
 
 # Archive stale results/*.txt (>24h) BEFORE any service starts iterating
@@ -182,7 +199,7 @@ fi
 # 1. Voice agent (Gemini Live on port 9900)
 if ! lsof -i :9900 > /dev/null 2>&1; then
   echo "  Starting voice agent (port 9900)..."
-  npx tsx src/voice-agent.ts > logs/voice-agent.log 2>&1 &
+  npx tsx src/voice-agent.ts > "$LOGS_DIR/voice-agent.log" 2>&1 &
   echo "  ✓ voice agent"
 else
   echo "  ✓ voice agent (already running)"
@@ -191,7 +208,7 @@ fi
 # 2. Web client (port 8080)
 if ! lsof -i :8080 > /dev/null 2>&1; then
   echo "  Starting web client (port 8080)..."
-  npx tsx src/web-client.ts > logs/web-client.log 2>&1 &
+  npx tsx src/web-client.ts > "$LOGS_DIR/web-client.log" 2>&1 &
   echo "  ✓ web client"
 else
   echo "  ✓ web client (already running)"
@@ -200,7 +217,7 @@ fi
 # 3. Dashboard (port 7844)
 if ! lsof -i :7844 > /dev/null 2>&1; then
   echo "  Starting dashboard (port 7844)..."
-  python3 src/dashboard.py > logs/dashboard.log 2>&1 &
+  python3 src/dashboard.py > "$LOGS_DIR/dashboard.log" 2>&1 &
   echo "  ✓ dashboard"
 else
   echo "  ✓ dashboard (already running)"
@@ -209,7 +226,7 @@ fi
 # 4. Agent API (port 7843)
 if ! lsof -i :7843 > /dev/null 2>&1; then
   echo "  Starting agent API (port 7843)..."
-  python3 src/agent-api.py > logs/agent-api.log 2>&1 &
+  python3 src/agent-api.py > "$LOGS_DIR/agent-api.log" 2>&1 &
   echo "  ✓ agent API"
 else
   echo "  ✓ agent API (already running)"
@@ -222,7 +239,7 @@ fi
 if ! lsof -i :7845 > /dev/null 2>&1; then
   if [ "$PERM_OK" -eq 1 ]; then
     echo "  Starting screen capture (port 7845)..."
-    python3 src/screen-capture-server.py > logs/screen-capture.log 2>&1 &
+    python3 src/screen-capture-server.py > "$LOGS_DIR/screen-capture.log" 2>&1 &
     echo "  ✓ screen capture"
   else
     echo "  ⊘ screen capture skipped — grant Screen Recording perm first, then re-run startup.sh"
@@ -234,6 +251,32 @@ fi
 # 5b. Sutando context drop app (global hotkey ⌃C)
 SUT_SRC="$REPO/src/Sutando/main.swift"
 SUT_BIN="$REPO/src/Sutando/Sutando"
+
+# Build the public ax-read CLI if missing or older than any of its source
+# files. Sutando.app's resolveAxReadPath() prefers private personal-deictic
+# when installed; this public binary is the text-only fallback so public-repo
+# users still get the ⌃C selection-drop experience.
+#
+# Staleness widened (per Mini's PR #907 review): trigger a rebuild when
+# Package.swift / build.sh / any *.swift under Sources/ is newer than the
+# binary, not just the main entry-point. Build failures are surfaced loudly
+# (not >/dev/null 2>&1) — silent failure here was the exact regression class
+# this skill is meant to prevent.
+AXR_DIR="$REPO/skills/context-drop"
+AXR_BIN="$AXR_DIR/ax-read"
+AXR_NEWEST_SRC="$(find "$AXR_DIR/Sources" "$AXR_DIR/Package.swift" "$AXR_DIR/build.sh" -type f \( -name '*.swift' -o -name 'Package.swift' -o -name 'build.sh' \) 2>/dev/null | xargs -I{} stat -f '%m {}' {} 2>/dev/null | sort -rn | head -1 | awk '{print $2}')"
+if [ -n "$AXR_NEWEST_SRC" ] && { [ ! -f "$AXR_BIN" ] || [ "$AXR_NEWEST_SRC" -nt "$AXR_BIN" ]; }; then
+  echo "  Compiling public ax-read (skills/context-drop)..."
+  if ! command -v swift >/dev/null 2>&1; then
+    echo "  ⚠ ax-read build skipped: 'swift' not in PATH"
+    echo "    → install Xcode Command Line Tools (xcode-select --install) for ⌃C selection drops on public-repo installs"
+  elif (cd "$AXR_DIR" && bash build.sh); then
+    echo "  ✓ ax-read built at $AXR_BIN"
+  else
+    echo "  ⚠ ax-read build FAILED — see Swift compiler output above"
+    echo "    → Sutando.app will fall back to legacy in-process AX (broken for Electron under LSUIElement context)"
+  fi
+fi
 
 # Rebuild if source is newer than binary, or binary is missing.
 # Kill any running instance so the fresh binary can take over.
@@ -253,8 +296,26 @@ if [ -f "$SUT_SRC" ] && { [ ! -f "$SUT_BIN" ] || [ "$SUT_SRC" -nt "$SUT_BIN" ]; 
       /usr/libexec/PlistBuddy \
         -c "Add :NSAppleEventsUsageDescription string 'Sutando reads your Finder selection to drop files into the agent task queue.'" \
         "$SUT_APP/Contents/Info.plist" 2>/dev/null || true
-      codesign --force --sign - "$SUT_APP" 2>/dev/null || true
-      echo "  ✓ Sutando.app synced + signed"
+      # Prefer a stable signing identity when one is installed so the TCC
+      # Accessibility grant survives rebuilds (cdhash churn). Falls back to
+      # ad-hoc when no such identity exists — public-repo users without a
+      # personal signing cert get the same behavior as before.
+      #
+      # The designated requirement is identifier-only on purpose: the
+      # grant binds to the bundle ID rather than cdhash, so a rebuild
+      # against the same identity satisfies the requirement without
+      # re-prompting. For installs without a cert, ad-hoc still requires
+      # re-grant on each rebuild — same as the legacy behavior.
+      SUT_SIGN_ID="$(security find-identity -v -p codesigning 2>/dev/null | awk '/"Sutando Dev"/{print $2; exit}')"
+      if [ -n "$SUT_SIGN_ID" ]; then
+        codesign --force --sign "$SUT_SIGN_ID" --identifier com.sutando.menubar \
+          --requirements '=designated => identifier "com.sutando.menubar"' \
+          "$SUT_APP" 2>/dev/null || codesign --force --sign - "$SUT_APP" 2>/dev/null || true
+        echo "  ✓ Sutando.app synced + signed (Sutando Dev + identifier-only DR)"
+      else
+        codesign --force --sign - "$SUT_APP" 2>/dev/null || true
+        echo "  ✓ Sutando.app synced + signed (ad-hoc; install \"Sutando Dev\" cert for stable TCC)"
+      fi
     fi
 
     if pgrep -f "src/Sutando/Sutando" > /dev/null 2>&1; then
@@ -292,7 +353,7 @@ if [ "${SKIP_TELEGRAM:-}" = "1" ]; then
 elif [ -f "$HOME/.claude/channels/telegram/.env" ] && grep -q "TELEGRAM_BOT_TOKEN=" "$HOME/.claude/channels/telegram/.env" 2>/dev/null; then
   if ! pgrep -f "telegram-bridge" > /dev/null 2>&1; then
     echo "  Starting Telegram bridge..."
-    python3 src/telegram-bridge.py > logs/telegram-bridge.log 2>&1 &
+    python3 src/telegram-bridge.py > "$LOGS_DIR/telegram-bridge.log" 2>&1 &
     echo "  ✓ telegram bridge"
   else
     echo "  ✓ telegram bridge (already running)"
@@ -321,13 +382,39 @@ if [ -f "$HOME/.claude/channels/discord/.env" ] && grep -q "DISCORD_BOT_TOKEN=" 
     echo "  ~ discord bridge (no python with discord.py — run: /opt/homebrew/bin/pip3 install discord.py)"
   elif ! pgrep -f "discord-bridge" > /dev/null 2>&1; then
     echo "  Starting Discord bridge with $PYTHON_WITH_DISCORD..."
-    "$PYTHON_WITH_DISCORD" src/discord-bridge.py > logs/discord-bridge.log 2>&1 &
+    "$PYTHON_WITH_DISCORD" src/discord-bridge.py > "$LOGS_DIR/discord-bridge.log" 2>&1 &
     echo "  ✓ discord bridge"
   else
     echo "  ✓ discord bridge (already running)"
   fi
 else
   echo "  ~ discord bridge (no token — optional)"
+fi
+
+# 7b. Slack bridge (optional — needs SLACK_BOT_TOKEN + SLACK_APP_TOKEN + slack_bolt)
+# Probes the same Python-interpreter candidates as the discord bridge so a
+# fresh-install miniconda env doesn't silently miss slack_bolt.
+if [ -f "$HOME/.claude/channels/slack/.env" ] && grep -q "SLACK_BOT_TOKEN=" "$HOME/.claude/channels/slack/.env" 2>/dev/null; then
+  PYTHON_WITH_SLACK=""
+  for _p in /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
+    if command -v "$_p" >/dev/null 2>&1 && "$_p" -c "import slack_bolt" 2>/dev/null; then
+      PYTHON_WITH_SLACK="$_p"
+      break
+    fi
+  done
+  if [ -z "$PYTHON_WITH_SLACK" ]; then
+    echo "  ~ slack bridge (no python with slack_bolt — run: /opt/homebrew/bin/pip3 install slack_bolt)"
+  elif ! pgrep -f "slack-bridge" > /dev/null 2>&1; then
+    echo "  Starting Slack bridge with $PYTHON_WITH_SLACK..."
+    # Source the env file so SLACK_BOT_TOKEN / SLACK_APP_TOKEN reach the child.
+    set -a; . "$HOME/.claude/channels/slack/.env"; set +a
+    "$PYTHON_WITH_SLACK" src/slack-bridge.py > "$LOGS_DIR/slack-bridge.log" 2>&1 &
+    echo "  ✓ slack bridge"
+  else
+    echo "  ✓ slack bridge (already running)"
+  fi
+else
+  echo "  ~ slack bridge (no token — optional)"
 fi
 
 # 8. Phone conversation server + ngrok (optional — needs Twilio creds, skip with SKIP_PHONE=1)
@@ -396,7 +483,7 @@ for port_name in $VERIFY_PORTS; do
   if lsof -i :"$port" > /dev/null 2>&1; then
     echo "  ✓ $name (port $port)"
   else
-    echo "  ✗ $name (port $port) — check logs/${name}.log"
+    echo "  ✗ $name (port $port) — check $LOGS_DIR/${name}.log"
   fi
 done
 echo ""

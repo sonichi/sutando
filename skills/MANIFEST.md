@@ -11,7 +11,7 @@ A manifest-loaded skill is a directory containing:
 - `tools.ts` (if `manifest.tools` is set) — exports `tools: ToolDefinition[]`, picked up at agent startup
 - optional `server.py` / `start.sh` / other runtime infrastructure the tools rely on
 
-At voice-agent startup, `loadSkillManifestTools()` in `src/inline-tools.ts` scans the public `skills/` directory **and** the optional `$SUTANDO_PRIVATE_DIR/skills/` directory, dynamically imports each tools entry point, and merges the exported tool definitions into `inlineTools`.
+At voice-agent startup, `loadSkillManifestTools()` in `src/inline-tools.ts` scans the public `skills/` directory **and** the optional `$SUTANDO_MEMORY_DIR/skills/` directory (legacy `$SUTANDO_PRIVATE_DIR` honored for one release per #870), dynamically imports each tools entry point, and merges the exported tool definitions into `inlineTools`.
 
 The same `inlineTools` list is also pushed into the phone agent's tool table (see `skills/phone-conversation/scripts/conversation-server.ts:587`), so any tool a manifest-loaded skill contributes is automatically available to:
 
@@ -53,7 +53,7 @@ Tools that need an instant response (sub-second round-trip) live in `src/inline-
 ```text
 1. Build dirsToScan = [
      <repo>/skills,
-     $SUTANDO_PRIVATE_DIR/skills (if set)
+     $SUTANDO_MEMORY_DIR/skills (if set; legacy $SUTANDO_PRIVATE_DIR also honored)
    ]
 2. For each dir, read each subdirectory:
    - If no manifest.json, skip.
@@ -71,13 +71,13 @@ Order: public first, then private. If a private skill shares a tool name with a 
 
 ## Currently active manifest skills
 
-Run `grep -l '"enabled": true' skills/*/manifest.json $SUTANDO_PRIVATE_DIR/skills/*/manifest.json` for the live list.
+Run `grep -l '"enabled": true' skills/*/manifest.json "$SUTANDO_MEMORY_DIR/skills"/*/manifest.json` for the live list (legacy users may need `$SUTANDO_PRIVATE_DIR` in place of the new var).
 
 As of 2026-05-03, the public repo has no manifest-loaded tools shipping by default; the four currently-active manifest skills all live in the private dir:
 
 | Skill | Tools contributed | Notes |
 |---|---|---|
-| `voice-context` | `set_voice_context`, `list_voice_contexts` | Switches the active per-talk voice script via `$SUTANDO_PRIVATE_DIR/voice-contexts/active`. Restarts voice-agent on switch so the new context loads. |
+| `voice-context` | `set_voice_context`, `list_voice_contexts` | Switches the active per-talk voice script via `$SUTANDO_MEMORY_DIR/voice-contexts/active` (legacy `$SUTANDO_PRIVATE_DIR` honored). Restarts voice-agent on switch so the new context loads. |
 | `talk-highlight` | `highlight_slide`, `presenter_mode`, `fullscreen_presenter`, `set_active_slides` | Drives on-stage slide highlights during live talks via the local highlight server (`localhost:7877`). `highlight_slide` glows a topic key and dims siblings; `presenter_mode` toggles the session-level talk flag; `fullscreen_presenter` switches the slide window into fullscreen; `set_active_slides` swaps the deck pointer (`talk-slides/active`) so the same server can drive different decks across a session. |
 | `personal-deictic` | `read_selection` | Reads the macOS selected text + cursor via the `ax-read` Swift binary; foundation for "this/that" deictic edits. |
 | `personal-talk-prep` | (none — script-only skill, invoked via `/personal-talk-prep`) | Listed for completeness; no manifest tools. |
@@ -86,7 +86,7 @@ When a Sutando user enables a new manifest skill, the tool name appears in `[ski
 
 ## How to add a new manifest-loaded skill
 
-1. Create `skills/<name>/manifest.json` (or `$SUTANDO_PRIVATE_DIR/skills/<name>/manifest.json` for personal tools).
+1. Create `skills/<name>/manifest.json` (or `$SUTANDO_MEMORY_DIR/skills/<name>/manifest.json` for personal tools; legacy `$SUTANDO_PRIVATE_DIR` honored for one release per #870).
 2. Set `"enabled": true`, `"access_tier": "owner"`, `"tools": "./tools.ts"`.
 3. Write `tools.ts` that exports `tools: ToolDefinition[]`. Each tool needs `name`, `description`, `parameters` (a Zod schema), `execution: 'inline'`, and an `execute()` function. Reuse the shape from existing skills.
 4. Restart voice-agent: `launchctl kickstart -k gui/$(id -u)/com.sutando.voice-agent`.

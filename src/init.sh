@@ -13,6 +13,17 @@ set -e
 REPO="${SUTANDO_REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
 MODE="${1:-full}"
 
+# Resolve runtime workspace. Same resolution shape as src/workspace_default.py
+# and startup.sh: $SUTANDO_WORKSPACE override (tilde-expanded), fallback to
+# ~/.sutando/workspace/. Runtime state files (logs, state, tasks, results,
+# notes, data, pending-questions.md, core-status.json, …) live here. Repo
+# stays for the code + skills + the schedule-crons.json copy below.
+if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
+  WORKSPACE="${SUTANDO_WORKSPACE/#\~/$HOME}"
+else
+  WORKSPACE="$HOME/.sutando/workspace"
+fi
+
 case "$MODE" in
   --auto|--preflight|--full|full) ;;
   *) echo "Usage: bash src/init.sh [--auto | --preflight]"; exit 2;;
@@ -23,23 +34,27 @@ log() {
   if [ "$MODE" != "--auto" ]; then echo "$@"; fi
 }
 
+# Workspace-rooted helpers — runtime state (logs, state, tasks, results, …).
 create_file_if_missing() {
   local path="$1"; local body="$2"
-  if [ ! -f "$REPO/$path" ]; then
-    mkdir -p "$(dirname "$REPO/$path")"
-    printf '%s' "$body" > "$REPO/$path"
+  if [ ! -f "$WORKSPACE/$path" ]; then
+    mkdir -p "$(dirname "$WORKSPACE/$path")"
+    printf '%s' "$body" > "$WORKSPACE/$path"
     echo "  ✓ created $path"
   fi
 }
 
 create_dir_if_missing() {
   local path="$1"
-  if [ ! -d "$REPO/$path" ]; then
-    mkdir -p "$REPO/$path"
+  if [ ! -d "$WORKSPACE/$path" ]; then
+    mkdir -p "$WORKSPACE/$path"
     echo "  ✓ created $path/"
   fi
 }
 
+# Repo-rooted copy helper — for shipping example configs from the checkout
+# into a stable location. Used today only for skills/schedule-crons/crons.json
+# which lives in the repo, NOT the workspace.
 copy_if_missing() {
   local src="$1"; local dst="$2"
   if [ ! -f "$REPO/$dst" ] && [ -f "$REPO/$src" ]; then
@@ -48,9 +63,78 @@ copy_if_missing() {
   fi
 }
 
+# One-time migration of stale repo-root runtime state into $WORKSPACE. Fires
+# only when the migration sentinel is absent — same idempotent posture as
+# workspace_default.py's _migrate_from_legacy (PR #762). Non-destructive on
+# collision: if a workspace copy already exists at the destination, the repo
+# copy is left in place (so a partial migration on a prior pass never
+# clobbers fresh workspace writes).
+#
+# Surfaces a single stderr line per moved item + writes a sentinel
+# `$WORKSPACE/.legacy-migrated-911` after a successful sweep. Second run
+# sees the sentinel and bails — no log noise on every startup.
+#
+# Triggered by Susan's PR #913 review (2026-05-19). Without this, installs
+# that pre-date #911 keep two copies: stale repo-root logs/state/tasks/...
+# alongside the new workspace copies. git status pollution + future
+# debugging confusion.
+migrate_legacy_runtime_state() {
+  local sentinel="$WORKSPACE/.legacy-migrated-911"
+  if [ -f "$sentinel" ]; then
+    return 0
+  fi
+  # Only migrate when the legacy repo actually has runtime state. New
+  # installs (post-#911) skip this path entirely.
+  local have_evidence=0
+  for d in logs state tasks results notes data; do
+    if [ -d "$REPO/$d" ] && [ -n "$(ls -A "$REPO/$d" 2>/dev/null)" ]; then
+      have_evidence=1
+      break
+    fi
+  done
+  if [ "$have_evidence" -eq 0 ]; then
+    # Nothing to migrate; write sentinel so we don't re-check every run.
+    mkdir -p "$WORKSPACE"
+    : > "$sentinel"
+    return 0
+  fi
+  mkdir -p "$WORKSPACE"
+  local moved_any=0
+  # Dirs: move whole tree iff workspace target doesn't already exist.
+  for d in logs state tasks results notes data; do
+    local src="$REPO/$d"
+    local dst="$WORKSPACE/$d"
+    if [ -d "$src" ] && [ ! -e "$dst" ]; then
+      if mv "$src" "$dst" 2>/dev/null; then
+        echo "  → migrated $d/ from repo to workspace" >&2
+        moved_any=1
+      fi
+    fi
+  done
+  # Top-level state files: move iff workspace target absent.
+  for f in pending-questions.md core-status.json contextual-chips.json voice-state.json build_log.md; do
+    local src="$REPO/$f"
+    local dst="$WORKSPACE/$f"
+    if [ -f "$src" ] && [ ! -e "$dst" ]; then
+      if mv "$src" "$dst" 2>/dev/null; then
+        echo "  → migrated $f from repo to workspace" >&2
+        moved_any=1
+      fi
+    fi
+  done
+  : > "$sentinel"
+  if [ "$moved_any" -eq 1 ]; then
+    echo "  ✓ legacy runtime state migrated (sentinel: $sentinel)" >&2
+  fi
+}
+
 # --- Tier 1: auto-bootstrap (always safe to run) ---
 tier1() {
   log "Tier 1 — auto-bootstrap..."
+
+  # First-run sweep: any stale repo-root runtime state lands in workspace
+  # before we start creating fresh files. Idempotent + non-destructive.
+  migrate_legacy_runtime_state
 
   # Directories
   create_dir_if_missing "logs"
@@ -62,12 +146,10 @@ tier1() {
   create_dir_if_missing "notes"
   create_dir_if_missing "data"
 
-  # Files — placeholders only, content added by the agent later
-  create_file_if_missing "build_log.md" \
-    "# Sutando build log
-
-Notes on what's built, what's next, and known issues. The proactive loop reads + updates this each pass.
-"
+  # Files — placeholders only, content added by the agent later.
+  # build_log.md lives under $SUTANDO_WORKSPACE per workspace contract; seeded
+  # there by workspace_default.py + dashboard/health-check readers expect it
+  # at WORKSPACE_DIR / "build_log.md". Not seeded here.
 
   create_file_if_missing "pending-questions.md" \
     "# Pending Questions

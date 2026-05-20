@@ -81,6 +81,15 @@ if [ -f .env ]; then
   else
     warn "Discord not configured (optional — run /discord:configure)"
   fi
+  if [ -f "$HOME/.claude/channels/slack/.env" ]; then
+    if python3 -c "import slack_bolt" 2>/dev/null; then
+      pass "Slack bot configured"
+    else
+      warn "Slack configured but slack_bolt missing (pip3 install slack_bolt)"
+    fi
+  else
+    warn "Slack not configured (optional — run /slack:configure)"
+  fi
 else
   fail ".env file missing (cp .env.example .env and edit)"
 fi
