@@ -356,7 +356,7 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     priority = default_priority_for_source("slack", access_tier)
     task_file.write_text(
         f"id: {task_id}\n"
-        f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S')}Z\n"
+        f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
         f"task: {user_task_text}\n"
         f"source: slack\n"
         f"channel_id: {channel}\n"

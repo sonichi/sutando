@@ -10,6 +10,7 @@ on:
       - 'src/**'
       - 'tests/**'
       - 'skills/**/*.ts'
+      - 'scripts/**'
       - '.github/workflows/ci.yml'
   push:
     branches: [main]
@@ -23,6 +24,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # Catches local-time timestamps mislabeled as UTC (issue #908 / #909).
+      # No deps needed — runs on the runner's stock python3.
+      - name: UTC timestamp check
+        run: python3 scripts/check-utc-z-strftime.py
 
       - name: Setup Node
         uses: actions/setup-node@v4
