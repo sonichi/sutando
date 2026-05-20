@@ -586,6 +586,24 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 				const result = readFileSync(path, 'utf-8').trim();
 				if (!result) continue;
 				const taskId = file.replace('.txt', '');
+
+				// Voice-only push channel: files named `voice-*.txt` are spoken
+				// by the voice agent on next turn, OR held in queue until the
+				// voice client reconnects. Discord-bridge skips them. Use this
+				// when the content is meaningless on Discord (e.g. a draft
+				// meant for voice to TYPE into a text field). Per Chi's
+				// 2026-05-20 02:25 ask after the proactive-* race.
+				if (file.startsWith('voice-')) {
+					if (!clientConnected) {
+						// Hold in queue; don't archive. Next poll will try again.
+						continue;
+					}
+					console.log(`${ts()} [TaskBridge] Voice-only result: ${file} (${result.slice(0, 80)})`);
+					onResult(result);
+					_deliveredResults.add(file);
+					setTimeout(() => archiveFile(path, 'results', `voice-${Date.now()}`), 10_000);
+					continue;
+				}
 				// Deduped-marker result: agent consolidated this task's reply
 				// into another task's result file. Mark this task done silently
 				// and archive — no Discord post, no voice narration, no timeout.
