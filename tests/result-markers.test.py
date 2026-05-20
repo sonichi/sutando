@@ -173,5 +173,81 @@ class TestNoLeakInvariant(unittest.TestCase):
             self.assertEqual(r.body, "")
 
 
+class TestD7HeaderTolerance(unittest.TestCase):
+    """D7 (owner directive 2026-05-19) prepends `**[core: N]**` + optional
+    italic sub-line to every owner-facing reply. The header sits at byte 0,
+    which previously shadowed the redirect regex (anchored at body start).
+    The parser now peels the header off before marker scanning and re-stitches
+    it onto the returned body — markers fire correctly, header stays visible.
+    """
+
+    def test_d7_header_does_not_shadow_redirect(self):
+        text = "**[core: 2]**\n\n[channel: C09XYZ]\nHello redirected."
+        r = parse_markers(text)
+        self.assertEqual(first_action(r, "redirect").value, "C09XYZ")
+        # Header preserved in user-facing body.
+        self.assertTrue(r.body.startswith("**[core: 2]**"))
+        # Redirect line itself stripped.
+        self.assertNotIn("[channel:", r.body)
+        # Discord channel-id form also accepted.
+        r2 = parse_markers("**[core: 1]**\n\n[channel: 1506182697142325298]\nx")
+        self.assertEqual(first_action(r2, "redirect").value, "1506182697142325298")
+
+    def test_d7_header_with_italic_subline(self):
+        text = (
+            "**[core: 2]**\n"
+            "_(channel→core handler switch from core-1)_\n"
+            "\n"
+            "[channel: C09XYZ]\n"
+            "Body."
+        )
+        r = parse_markers(text)
+        self.assertEqual(first_action(r, "redirect").value, "C09XYZ")
+        # Both header lines preserved.
+        self.assertIn("**[core: 2]**", r.body)
+        self.assertIn("_(channel→core handler switch from core-1)_", r.body)
+
+    def test_d7_header_without_marker_passes_through(self):
+        text = "**[core: 2]**\n\nJust a normal reply, no markers."
+        r = parse_markers(text)
+        self.assertEqual(r.actions, [])
+        # Body unchanged (header + content intact).
+        self.assertEqual(r.body, text)
+
+    def test_d7_plus_skip_keeps_skip_terminal(self):
+        # Skip markers are invisible to the user — when combined with a D7
+        # header, the header is discarded along with the body. Otherwise the
+        # bridge would deliver a header-only message with no content.
+        text = "**[core: 2]**\n\n[no-send]\nthis-is-internal"
+        r = parse_markers(text)
+        self.assertEqual(first_action(r, "skip").value, "no-send")
+        self.assertEqual(r.body, "")
+
+    def test_d7_plus_deduped_keeps_skip_terminal(self):
+        text = "**[core: 2]**\n[deduped: task-1779164273868]\nfull elsewhere"
+        r = parse_markers(text)
+        skip = first_action(r, "skip")
+        self.assertEqual(skip.value, "deduped")
+        self.assertEqual(skip.extra, "task-1779164273868")
+        self.assertEqual(r.body, "")
+
+    def test_d7_plus_redirect_plus_attach(self):
+        text = (
+            "**[core: 2]**\n"
+            "\n"
+            "[channel: C09XYZ]\n"
+            "[file: /tmp/x.txt]\n"
+            "Body with attachment."
+        )
+        r = parse_markers(text)
+        kinds = [a.kind for a in r.actions]
+        self.assertEqual(kinds, ["redirect", "attach"])
+        self.assertEqual(first_action(r, "attach").value, "/tmp/x.txt")
+        # No marker leaks; header still in body.
+        self.assertNotIn("[channel:", r.body)
+        self.assertNotIn("[file:", r.body)
+        self.assertIn("**[core: 2]**", r.body)
+
+
 if __name__ == "__main__":
     unittest.main()
