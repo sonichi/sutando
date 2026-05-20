@@ -318,13 +318,25 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     else:
         thread_ts = None
 
-    # Resolve access_tier from `tierMap`. Unmapped users default to "owner"
-    # — preserves the pre-tierMap contract (everything in allowFrom was
-    # treated as owner). Mapping a user to "team" or "other" downgrades them.
-    # See CLAUDE.md "Discord access control" for the broader policy this
-    # mirrors. The core agent reads access_tier from the task body and is
-    # expected to delegate non-owner tasks to a sandboxed agent.
-    access_tier = load_tier_map().get(user_id, "owner")
+    # Resolve access_tier from `tierMap`.
+    # Two cases for unmapped users:
+    #   1. tierMap absent (pre-tierMap config) → "owner" (backward compat)
+    #   2. tierMap present but uid missing → "other" (fail-safe, prevents
+    #      silent privilege escalation when operator forgets a tierMap line)
+    # See #893 for the rationale behind the split default.
+    tier_map = load_tier_map()
+    if user_id in tier_map:
+        access_tier = tier_map[user_id]
+    elif tier_map:
+        # tierMap exists but uid is missing — degrade to "other"
+        print(
+            f"  [tier-map] WARNING: User {user_id} in allowFrom but missing from tierMap; defaulting to 'other'",
+            flush=True,
+        )
+        access_tier = "other"
+    else:
+        # tierMap absent entirely — pre-tierMap config, all users are owner
+        access_tier = "owner"
     if access_tier not in ("owner", "team", "other"):
         # Unknown tier value in config → degrade safely to "other" rather
         # than treating as owner.
