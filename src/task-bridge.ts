@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from './workspace_default.js';
+import { recordConversation, recordSessionBoundary } from './conversation-store.js';
 
 const REPO_DIR = resolveWorkspace();
 const TASK_DIR = join(REPO_DIR, 'tasks');
@@ -309,9 +310,11 @@ export const workTool: ToolDefinition = {
  *  character can render as multiple bytes. Lifted to LOG_LINE_MAX_CHARS;
  *  override via SUTANDO_LOG_LINE_MAX_CHARS env if a host wants tighter logs. */
 const LOG_LINE_MAX_CHARS = Number(process.env.SUTANDO_LOG_LINE_MAX_CHARS) || 2000;
-export function logConversation(role: string, text: string): void {
-	const line = `${new Date().toISOString()}|${role}|${text.replace(/\n/g, ' ').slice(0, LOG_LINE_MAX_CHARS)}\n`;
+export function logConversation(role: string, text: string, sessionId?: string): void {
+	const capped = text.replace(/\n/g, ' ').slice(0, LOG_LINE_MAX_CHARS);
+	const line = `${new Date().toISOString()}|${role}|${capped}\n`;
 	try { appendFileSync(CONVERSATION_LOG, line); } catch { /* best effort */ }
+	recordConversation(role, capped, sessionId); // #603 sqlite mirror — best-effort, swallowed inside
 }
 
 /** Append a session-end boundary marker. Used by voice-agent's
@@ -327,6 +330,7 @@ export function logConversation(role: string, text: string): void {
 export function logSessionBoundary(reason: string = 'user_goodbye'): void {
 	const line = `${new Date().toISOString()}|SESSION_END|${reason}\n`;
 	try { appendFileSync(CONVERSATION_LOG, line); } catch { /* best effort */ }
+	recordSessionBoundary(reason); // #603 sqlite mirror
 }
 
 /** Seconds since the most recent user/assistant turn. Walks the log
@@ -339,6 +343,11 @@ export function logSessionBoundary(reason: string = 'user_goodbye'): void {
  *  prior session. Returns null if no log exists or no user/assistant
  *  turn is found in the current session. */
 export function getSecondsSinceLastTurn(): number | null {
+	// Reads the text conversation.log directly: it is the primary truth for
+	// per-turn content. The sqlite mirror is a best-effort parallel write
+	// (errors swallowed in conversation-store.ts) so it can silently lag the
+	// log — trusting it here could return a stale "last turn". The current
+	// session is small, so the backward walk is cheap regardless.
 	if (!existsSync(CONVERSATION_LOG)) return null;
 	try {
 		const content = readFileSync(CONVERSATION_LOG, 'utf-8').trim();
@@ -361,6 +370,9 @@ export function getSecondsSinceLastTurn(): number | null {
  *  `count` entries from the current session only — a cleanly-ended
  *  prior session has no meaningful follow-up context. */
 export function getRecentConversation(count = 10): string {
+	// Reads the text conversation.log directly — primary truth for per-turn
+	// content. The sqlite mirror is best-effort and may lag; trusting it
+	// could replay a stale window. Current-session window is small.
 	if (!existsSync(CONVERSATION_LOG)) return '';
 	try {
 		const allLines = readFileSync(CONVERSATION_LOG, 'utf-8').trim().split('\n');
@@ -586,6 +598,24 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 				const result = readFileSync(path, 'utf-8').trim();
 				if (!result) continue;
 				const taskId = file.replace('.txt', '');
+
+				// Voice-only push channel: files named `voice-*.txt` are spoken
+				// by the voice agent on next turn, OR held in queue until the
+				// voice client reconnects. Discord-bridge skips them. Use this
+				// when the content is meaningless on Discord (e.g. a draft
+				// meant for voice to TYPE into a text field). Per Chi's
+				// 2026-05-20 02:25 ask after the proactive-* race.
+				if (file.startsWith('voice-')) {
+					if (!clientConnected) {
+						// Hold in queue; don't archive. Next poll will try again.
+						continue;
+					}
+					console.log(`${ts()} [TaskBridge] Voice-only result: ${file} (${result.slice(0, 80)})`);
+					onResult(result);
+					_deliveredResults.add(file);
+					setTimeout(() => archiveFile(path, 'results', `voice-${Date.now()}`), 10_000);
+					continue;
+				}
 				// Deduped-marker result: agent consolidated this task's reply
 				// into another task's result file. Mark this task done silently
 				// and archive — no Discord post, no voice narration, no timeout.

@@ -938,12 +938,35 @@ def run_all_checks() -> list[dict]:
     # Sutando menu bar app (optional — only check if binary exists)
     sutando_bin = REPO_DIR / "src" / "Sutando" / "Sutando"
     if sutando_bin.exists():
+        # Distinguish pgrep failures (exit code != 0 and != 1) from a real
+        # no-match (exit code 1). Pre-fix the bare try/except swallowed
+        # subprocess errors AND empty results into a single "no pids" path,
+        # which surfaced as a false "not running" warn when pgrep itself
+        # hiccupped (CPU contention, fd exhaustion, etc.). Chi hit this
+        # 2026-05-18 — app was alive (PID 34586 since May 17) but a
+        # health-check tick reported "not running."
+        pgrep_status = None  # "ok-running" | "ok-stopped" | "error"
+        pgrep_err = ""
+        pids: list[str] = []
         try:
-            result = subprocess.run(["/usr/bin/pgrep", "-f", "Sutando/Sutando"], capture_output=True, text=True)
-            pids = [p for p in result.stdout.strip().split("\n") if p]
-        except:
-            pids = []
-        if pids:
+            result = subprocess.run(
+                ["/usr/bin/pgrep", "-f", "Sutando/Sutando"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                pids = [p for p in result.stdout.strip().split("\n") if p]
+                pgrep_status = "ok-running"
+            elif result.returncode == 1:
+                # pgrep convention: 1 = no match
+                pgrep_status = "ok-stopped"
+            else:
+                pgrep_status = "error"
+                pgrep_err = (result.stderr or f"pgrep exit={result.returncode}").strip()[:120]
+        except Exception as e:
+            pgrep_status = "error"
+            pgrep_err = f"{type(e).__name__}: {e}"[:120]
+
+        if pgrep_status == "ok-running" and pids:
             check = {"name": "sutando-app", "status": "ok", "detail": f"running (⌃C/⌃V/⌃M)"}
             mark_stale_if_outdated(
                 check,
@@ -952,8 +975,13 @@ def run_all_checks() -> list[dict]:
                 binary_path=REPO_DIR / "src" / "Sutando" / "Sutando",
             )
             checks.append(check)
-        else:
+        elif pgrep_status == "ok-stopped":
             checks.append({"name": "sutando-app", "status": "warn", "detail": "not running — hotkeys disabled"})
+        else:
+            # pgrep itself errored — don't false-alarm "not running" when we
+            # actually couldn't determine state. Surface as a transient warn
+            # with the cause so it's debuggable, not a routine "app is down."
+            checks.append({"name": "sutando-app", "status": "warn", "detail": f"detection failed (pgrep: {pgrep_err or 'unknown error'}) — actual app state unknown"})
 
     # Stuck-loop / queue-pileup detection — consequence-level signals that
     # fire whether the watcher died, the proactive loop crashed mid-pass, or

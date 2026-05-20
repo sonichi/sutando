@@ -80,15 +80,17 @@ mkdir -p "$LOCAL_DIR" "$REMOTE_DIR"
 
 # Resolve our local repo root so we can invoke the LOCAL gather.sh + write
 # the persisted notes/ copy. Mirrors gather.sh's own resolution.
+# Marker file is CLAUDE.md (stable, identity-bearing). Previously build_log.md,
+# swapped 2026-05-18 when build_log.md moved to $SUTANDO_WORKSPACE.
 LOCAL_REPO=""
-if [ -n "${SUTANDO_ROOT:-}" ] && [ -f "$SUTANDO_ROOT/build_log.md" ]; then
+if [ -n "${SUTANDO_ROOT:-}" ] && [ -f "$SUTANDO_ROOT/CLAUDE.md" ]; then
     LOCAL_REPO="$SUTANDO_ROOT"
-elif [ -f "$PWD/build_log.md" ]; then
+elif [ -f "$PWD/CLAUDE.md" ]; then
     LOCAL_REPO="$PWD"
 else
     DIR="$(cd "$(dirname "$0")" && pwd)"
     for _ in 1 2 3 4 5; do
-        if [ -f "$DIR/build_log.md" ]; then
+        if [ -f "$DIR/CLAUDE.md" ]; then
             LOCAL_REPO="$DIR"
             break
         fi
@@ -96,7 +98,7 @@ else
         [ "$DIR" = "/" ] && break
     done
 fi
-[ -z "$LOCAL_REPO" ] && { echo "gather-remote: cannot find local sutando repo (no build_log.md found)" >&2; exit 1; }
+[ -z "$LOCAL_REPO" ] && { echo "gather-remote: cannot find local sutando repo (no CLAUDE.md found)" >&2; exit 1; }
 
 echo "gather-remote: peer=$PEER, window=$WINDOW, out=$OUT" >&2
 
