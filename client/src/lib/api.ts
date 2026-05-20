@@ -37,6 +37,38 @@ export async function postMuteState(patch: {
 	await fetch(apiUrl(`/mute-state?${qs.toString()}`)).catch(() => {});
 }
 
+export interface SlackSettingsStatus {
+	botConfigured: boolean;
+	appConfigured: boolean;
+}
+
+/**
+ * Report whether the Slack bridge tokens are already on disk
+ * (`~/.claude/channels/slack/.env`). The endpoint never echoes the token
+ * values — only a configured/not-configured flag per token.
+ */
+export async function fetchSlackSettings(signal?: AbortSignal): Promise<SlackSettingsStatus> {
+	const res = await fetch(apiUrl('/settings/slack'), { signal });
+	if (!res.ok) throw new Error(`/settings/slack returned ${res.status}`);
+	return (await res.json()) as SlackSettingsStatus;
+}
+
+/**
+ * Persist Slack bridge credentials. The server validates the `xoxb-` /
+ * `xapp-` prefixes and writes `~/.claude/channels/slack/.env` mode 0600.
+ */
+export async function saveSlackSettings(botToken: string, appToken: string): Promise<void> {
+	const res = await fetch(apiUrl('/settings/slack'), {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ botToken, appToken }),
+	});
+	if (!res.ok) {
+		const detail = (await res.json().catch(() => null)) as { error?: string } | null;
+		throw new Error(detail?.error ?? `/settings/slack returned ${res.status}`);
+	}
+}
+
 export interface StandIdentity {
 	name?: string;
 	nameOrigin?: string;

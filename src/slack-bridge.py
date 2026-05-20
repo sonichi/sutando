@@ -65,10 +65,24 @@ TASKS_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 INBOX_DIR.mkdir(parents=True, exist_ok=True)
 
+# Credentials live in ~/.claude/channels/slack/.env (written by the Settings
+# UI, via web-server.ts), same convention as the Discord/Telegram bridges.
+# Ambient env vars still win — useful for one-off overrides in startup.sh.
+channels_env = Path.home() / ".claude" / "channels" / "slack" / ".env"
+if channels_env.is_file():
+    for line in channels_env.read_text().splitlines():
+        if "=" in line and not line.startswith("#"):
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip())
+
 BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 APP_TOKEN = os.environ.get("SLACK_APP_TOKEN", "")
 if not BOT_TOKEN or not APP_TOKEN:
-    print("SLACK_BOT_TOKEN and/or SLACK_APP_TOKEN not set", file=sys.stderr)
+    print(
+        "SLACK_BOT_TOKEN and/or SLACK_APP_TOKEN not set — add them in the "
+        "Settings page or write ~/.claude/channels/slack/.env",
+        file=sys.stderr,
+    )
     sys.exit(1)
 
 

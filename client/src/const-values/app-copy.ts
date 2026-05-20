@@ -91,6 +91,23 @@ export const APP_COPY = {
 	convShortcutDropScreenshot: 'drop screenshot',
 	convShortcutVoice: 'voice',
 	convShortcutMute: 'mute',
+
+	// Settings — Slack integration
+	settingsIntegrationsTitle: 'Integrations',
+	slackCardTitle: 'Slack',
+	slackCardHint:
+		'Connect a Slack app so you can message Sutando from Slack DMs and @mentions. Create an app at api.slack.com/apps with Socket Mode enabled, then paste its two tokens below.',
+	slackBotTokenLabel: 'Bot token',
+	slackBotTokenPlaceholder: 'xoxb-…',
+	slackAppTokenLabel: 'App-level token',
+	slackAppTokenPlaceholder: 'xapp-…',
+	slackConfigured: 'Configured',
+	slackNotConfigured: 'Not configured',
+	slackSave: 'Save tokens',
+	slackSaving: 'Saving…',
+	slackSaved: 'Saved. Restart the Slack bridge to apply.',
+	slackSaveFailed: 'Save failed —',
+	slackLoadFailed: 'Could not reach the settings endpoint —',
 } as const;
 
 export type VoiceStatusKey =
