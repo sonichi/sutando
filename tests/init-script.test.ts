@@ -23,8 +23,16 @@ interface RunResult { stdout: string; stderr: string; status: number | null }
 function runInit(repoDir: string, mode?: '--auto' | '--preflight'): RunResult {
 	const args = ['bash', INIT_SH];
 	if (mode) args.push(mode);
+	// init.sh resolves WORKSPACE from $SUTANDO_WORKSPACE (or $HOME/.sutando/workspace).
+	// Point WORKSPACE at repoDir so Tier 1 creates files/dirs where the tests
+	// expect them (directly under scratch, not inside a nested .sutando tree).
 	const proc = spawnSync(args[0]!, args.slice(1), {
-		env: { ...process.env, SUTANDO_REPO: repoDir, HOME: repoDir + '/.fake-home' },
+		env: {
+			...process.env,
+			SUTANDO_REPO: repoDir,
+			SUTANDO_WORKSPACE: repoDir,
+			HOME: repoDir + '/.fake-home',
+		},
 		encoding: 'utf-8',
 	});
 	return { stdout: proc.stdout, stderr: proc.stderr, status: proc.status };
