@@ -50,3 +50,17 @@ jobs:
       - name: Run tests
         run: npm test
         if: hashFiles('tests/**/*.test.ts') != ''
+
+      # Run standalone Python tests (*.test.py) — stdlib-only, no deps needed.
+      # Covers telegram-bridge TOFU tri-state, slack-bridge tier-map, discord-bridge
+      # access tiers, result-markers, and more. See #897.
+      - name: Run Python standalone tests
+        run: |
+          failed=0
+          while IFS= read -r f; do
+            echo "→ $f"
+            if ! python3 "$f"; then
+              failed=1
+            fi
+          done < <(find tests -name '*.test.py' -not -path '*/node_modules/*' | sort)
+          exit "$failed"
