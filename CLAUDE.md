@@ -102,6 +102,17 @@ Tasks arrive from multiple channels via the same file bridge:
 
 **IMPORTANT:** On session start, check if the task watcher is running (`pgrep -f "watch-tasks"`). If not, start it with `bash src/watch-tasks.sh` using `run_in_background: true`. When notified, read the output — it lists ALL pending task files. Process every one, write results to `results/`, then restart the watcher. This is how voice commands reach you.
 
+**Voice session context.** Voice-agent's Gemini context window rolls off after ~10 minutes of turns; voice forgets specifics like "the post" or "Mini Draft A" that landed earlier in your session. Whenever you make a durable decision the voice agent may need to reference later — picking a draft, writing text to clipboard for a pending paste, committing to an active task — update `state/voice-session-context.json`. Schema:
+```json
+{
+  "updated_at": "<ISO ts>",
+  "active_drafts": [{"name": "...", "summary": "...", "path": "..."}],
+  "pending_action": {"kind": "paste|review|other", "what": "...", "where": "..."} | null,
+  "last_results": [{"task_id": "...", "subject": "...", "ts": "..."}]
+}
+```
+Keep `active_drafts` and `last_results` to ~3 entries each (drop oldest). Voice can call the `recent_context` tool to read this file when it senses confusion ("what was the post?" / "what's pending?"). Per Chi 2026-05-13.
+
 ## Tutorial
 
 When the user says "tutorial", "walk me through", or "show me what you can do" (via voice or text):

@@ -107,3 +107,6 @@ voice-state.json
 # SPM build cache — committed accidentally on josh/ui-update when .build/
 # was not yet ignored. These are multi-MB binary .pcm files with no repo value.
 /.build/
+
+# voice-agent single-instance lock
+.voice-agent.pid
