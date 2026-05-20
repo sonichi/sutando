@@ -13,6 +13,17 @@ set -e
 REPO="${SUTANDO_REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
 MODE="${1:-full}"
 
+# Resolve runtime workspace. Same resolution shape as src/workspace_default.py
+# and startup.sh: $SUTANDO_WORKSPACE override (tilde-expanded), fallback to
+# ~/.sutando/workspace/. Runtime state files (logs, state, tasks, results,
+# notes, data, pending-questions.md, core-status.json, …) live here. Repo
+# stays for the code + skills + the schedule-crons.json copy below.
+if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
+  WORKSPACE="${SUTANDO_WORKSPACE/#\~/$HOME}"
+else
+  WORKSPACE="$HOME/.sutando/workspace"
+fi
+
 case "$MODE" in
   --auto|--preflight|--full|full) ;;
   *) echo "Usage: bash src/init.sh [--auto | --preflight]"; exit 2;;
@@ -23,23 +34,27 @@ log() {
   if [ "$MODE" != "--auto" ]; then echo "$@"; fi
 }
 
+# Workspace-rooted helpers — runtime state (logs, state, tasks, results, …).
 create_file_if_missing() {
   local path="$1"; local body="$2"
-  if [ ! -f "$REPO/$path" ]; then
-    mkdir -p "$(dirname "$REPO/$path")"
-    printf '%s' "$body" > "$REPO/$path"
+  if [ ! -f "$WORKSPACE/$path" ]; then
+    mkdir -p "$(dirname "$WORKSPACE/$path")"
+    printf '%s' "$body" > "$WORKSPACE/$path"
     echo "  ✓ created $path"
   fi
 }
 
 create_dir_if_missing() {
   local path="$1"
-  if [ ! -d "$REPO/$path" ]; then
-    mkdir -p "$REPO/$path"
+  if [ ! -d "$WORKSPACE/$path" ]; then
+    mkdir -p "$WORKSPACE/$path"
     echo "  ✓ created $path/"
   fi
 }
 
+# Repo-rooted copy helper — for shipping example configs from the checkout
+# into a stable location. Used today only for skills/schedule-crons/crons.json
+# which lives in the repo, NOT the workspace.
 copy_if_missing() {
   local src="$1"; local dst="$2"
   if [ ! -f "$REPO/$dst" ] && [ -f "$REPO/$src" ]; then
