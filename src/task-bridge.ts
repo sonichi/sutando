@@ -13,7 +13,7 @@ import { join } from 'node:path';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from './workspace_default.js';
-import { recordConversation, recordSessionBoundary, queryLastTurnTs, queryRecentTurns } from './conversation-store.js';
+import { recordConversation, recordSessionBoundary } from './conversation-store.js';
 
 const REPO_DIR = resolveWorkspace();
 const TASK_DIR = join(REPO_DIR, 'tasks');
@@ -343,11 +343,11 @@ export function logSessionBoundary(reason: string = 'user_goodbye'): void {
  *  prior session. Returns null if no log exists or no user/assistant
  *  turn is found in the current session. */
 export function getSecondsSinceLastTurn(): number | null {
-	// Sqlite path (O(log N) index lookup) — #603. Falls back to text-log
-	// walk only if sqlite is unavailable (init failed / first boot before
-	// any writes).
-	const tsUnix = queryLastTurnTs();
-	if (tsUnix !== null) return (Date.now() / 1000) - tsUnix;
+	// Reads the text conversation.log directly: it is the primary truth for
+	// per-turn content. The sqlite mirror is a best-effort parallel write
+	// (errors swallowed in conversation-store.ts) so it can silently lag the
+	// log — trusting it here could return a stale "last turn". The current
+	// session is small, so the backward walk is cheap regardless.
 	if (!existsSync(CONVERSATION_LOG)) return null;
 	try {
 		const content = readFileSync(CONVERSATION_LOG, 'utf-8').trim();
@@ -370,11 +370,9 @@ export function getSecondsSinceLastTurn(): number | null {
  *  `count` entries from the current session only — a cleanly-ended
  *  prior session has no meaningful follow-up context. */
 export function getRecentConversation(count = 10): string {
-	// Sqlite path (indexed range query) — #603.
-	const rows = queryRecentTurns(count);
-	if (rows.length > 0) {
-		return rows.map(r => `${r.role}: ${r.text}`).join('\n');
-	}
+	// Reads the text conversation.log directly — primary truth for per-turn
+	// content. The sqlite mirror is best-effort and may lag; trusting it
+	// could replay a stale window. Current-session window is small.
 	if (!existsSync(CONVERSATION_LOG)) return '';
 	try {
 		const allLines = readFileSync(CONVERSATION_LOG, 'utf-8').trim().split('\n');

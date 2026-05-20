@@ -12,6 +12,10 @@ Idempotency: by default, INSERT every row — re-running duplicates.
 Pass --reload to TRUNCATE the 3 tables first and reimport.
 Pass --dry-run to count rows without writing.
 
+--reload deletes then reimports; a live writer racing the DELETE would lose
+rows. It therefore requires the voice/phone services to be stopped — the
+script aborts if it detects those processes. Pass --force to override.
+
 Usage:
     python3 scripts/import-session-metrics.py
     python3 scripts/import-session-metrics.py --reload
@@ -22,14 +26,40 @@ import argparse
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[1]
-DEFAULT_VOICE = REPO / "data" / "voice-metrics.jsonl"
-DEFAULT_CALL = REPO / "data" / "call-metrics.jsonl"
-DEFAULT_DB = Path(os.environ.get("SUTANDO_CONVERSATION_DB", REPO / "data" / "conversation.sqlite"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from workspace_default import resolve_workspace  # noqa: E402
+
+# DB + jsonl archives live under the resolved workspace (~/.sutando/workspace),
+# the same tree the runtime writers use — not the repo root.
+WORKSPACE = resolve_workspace(migrate=False)
+DEFAULT_VOICE = WORKSPACE / "data" / "voice-metrics.jsonl"
+DEFAULT_CALL = WORKSPACE / "data" / "call-metrics.jsonl"
+DEFAULT_DB = Path(os.environ.get("SUTANDO_CONVERSATION_DB", WORKSPACE / "data" / "conversation.sqlite"))
+
+# Process patterns that write conversation.sqlite live. --reload must not run
+# while any of these is up (see module docstring).
+_LIVE_WRITER_PATTERNS = [
+    ("voice-agent.ts", "voice-agent"),
+    ("conversation-server.ts", "phone conversation-server"),
+]
+
+
+def live_writers() -> list[str]:
+    """Return labels of voice/phone writer processes currently running."""
+    found = []
+    for pat, label in _LIVE_WRITER_PATTERNS:
+        try:
+            r = subprocess.run(["pgrep", "-f", pat], capture_output=True, text=True)
+            if r.returncode == 0 and r.stdout.strip():
+                found.append(label)
+        except Exception:
+            pass
+    return found
 
 
 def iso_to_unix(ts: str | None) -> float | None:
@@ -166,34 +196,58 @@ def main() -> int:
     ap.add_argument("--db", type=Path, default=DEFAULT_DB)
     ap.add_argument("--reload", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--force", action="store_true",
+                    help="skip the live-writer guard on --reload")
     args = ap.parse_args()
 
-    args.db.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(str(args.db))
-    db.execute("PRAGMA journal_mode = WAL")
-    ensure_schema(db)
-    if args.reload and not args.dry_run:
-        for t in ("sessions", "tool_calls", "session_events"):
-            n = db.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
-            db.execute(f"DELETE FROM {t}")
-            print(f"reload: deleted {n} from {t}")
-
+    # dry-run: count jsonl lines only, never touch the DB.
     if args.dry_run:
-        # count would-be-inserted rows quickly (lines only)
         for path in (args.voice, args.call):
             n = sum(1 for _ in open(path)) if path.exists() else 0
             print(f"  {path}: {n} jsonl lines (= sessions)")
         return 0
 
-    print(f"importing voice metrics from {args.voice}")
-    vs, vt, ve = import_file(db, args.voice, "voice")
-    print(f"  sessions: {vs}   tool_calls: {vt}   events: {ve}")
+    # --reload truncates then reimports — a live writer racing the DELETE
+    # would have its rows deleted-without-reimport. Require services stopped.
+    # (The jsonl sources are frozen post-#603, but conversation.sqlite still
+    # has live writers via recordSession.)
+    if args.reload and not args.force:
+        live = live_writers()
+        if live:
+            print(f"error: --reload needs the voice/phone services stopped; still running: "
+                  f"{', '.join(live)}. Stop them, or pass --force to override.", file=sys.stderr)
+            return 1
 
-    print(f"importing call metrics from {args.call}")
-    cs, ct, ce = import_file(db, args.call, "phone")
-    print(f"  sessions: {cs}   tool_calls: {ct}   events: {ce}")
+    args.db.parent.mkdir(parents=True, exist_ok=True)
+    # isolation_level=None → autocommit; we manage the transaction explicitly.
+    db = sqlite3.connect(str(args.db), isolation_level=None)
+    db.execute("PRAGMA journal_mode = WAL")
+    ensure_schema(db)
 
-    db.commit()
+    # One IMMEDIATE transaction holds the write lock across DELETE + reimport,
+    # so the operation is atomic and serialized against any writer.
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        if args.reload:
+            for t in ("sessions", "tool_calls", "session_events"):
+                n = db.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                db.execute(f"DELETE FROM {t}")
+                print(f"reload: deleted {n} from {t}")
+
+        print(f"importing voice metrics from {args.voice}")
+        vs, vt, ve = import_file(db, args.voice, "voice")
+        print(f"  sessions: {vs}   tool_calls: {vt}   events: {ve}")
+
+        print(f"importing call metrics from {args.call}")
+        cs, ct, ce = import_file(db, args.call, "phone")
+        print(f"  sessions: {cs}   tool_calls: {ct}   events: {ce}")
+
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        db.close()
+        raise
+
     db.close()
     print(f"done.  totals: sessions={vs+cs}  tool_calls={vt+ct}  events={ve+ce}  → {args.db}")
     return 0

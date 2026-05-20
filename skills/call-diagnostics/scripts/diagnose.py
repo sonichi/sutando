@@ -32,8 +32,14 @@ _cwd_path = Path.cwd() / "data" / "call-metrics.jsonl"
 _script_path = Path(__file__).resolve().parents[3] / "data" / "call-metrics.jsonl"
 METRICS_PATH = _cwd_path if _cwd_path.exists() else _script_path
 
-_repo_root = Path(__file__).resolve().parents[3]
-SQLITE_PATH = Path(os.environ.get("SUTANDO_CONVERSATION_DB", _repo_root / "data" / "conversation.sqlite"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+from workspace_default import resolve_workspace  # noqa: E402
+
+# conversation.sqlite lives under the resolved workspace (~/.sutando/workspace),
+# the same tree the runtime writers use — not the repo root.
+SQLITE_PATH = Path(os.environ.get(
+    "SUTANDO_CONVERSATION_DB",
+    resolve_workspace(migrate=False) / "data" / "conversation.sqlite"))
 
 # Parse early flags so load_calls picks the right source
 SOURCE_FILTER = "phone"   # 'voice' | 'phone' | 'all' — selectable via --source

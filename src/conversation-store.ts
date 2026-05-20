@@ -18,10 +18,14 @@
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
+import { resolveWorkspace } from './workspace_default.js';
 
-const REPO_DIR = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
+// DB lives under the resolved workspace (same tree as conversation.log,
+// which task-bridge.ts writes to `<workspace>/conversation.log`). Using the
+// repo root here would strand the sqlite mirror in a different tree from the
+// text log once runtime state moved to ~/.sutando/workspace (#831).
 const DB_PATH = process.env.SUTANDO_CONVERSATION_DB
-	|| join(REPO_DIR, 'data', 'conversation.sqlite');
+	|| join(resolveWorkspace(), 'data', 'conversation.sqlite');
 
 let db: DatabaseSync | null = null;
 let insertStmt: ReturnType<DatabaseSync['prepare']> | null = null;
@@ -48,9 +52,9 @@ function init(): void {
 				text       TEXT NOT NULL,
 				session_id TEXT
 			);
-			CREATE INDEX IF NOT EXISTS idx_ts ON conversation(ts_unix);
-			CREATE INDEX IF NOT EXISTS idx_role_ts ON conversation(role, ts_unix);
-			CREATE INDEX IF NOT EXISTS idx_session ON conversation(session_id, ts_unix);
+			CREATE INDEX IF NOT EXISTS idx_conversation_ts ON conversation(ts_unix);
+			CREATE INDEX IF NOT EXISTS idx_conversation_role_ts ON conversation(role, ts_unix);
+			CREATE INDEX IF NOT EXISTS idx_conversation_session ON conversation(session_id, ts_unix);
 
 			-- Per-session rollups (replaces data/voice-metrics.jsonl + data/call-metrics.jsonl).
 			-- Unified table covers voice + phone + future discord-voice sources.
@@ -156,56 +160,6 @@ export interface SessionMetrics {
 	pendingTasks?: number | null;
 	toolCalls?: unknown;     // JSON-serializable array
 	events?: unknown;        // JSON-serializable array
-}
-
-/**
- * Read the latest ts_unix for a user/assistant turn in the *current*
- * session (after the most recent SESSION_END marker). Returns null if
- * none exists or the DB isn't available. Used by getSecondsSinceLastTurn.
- *
- * Replaces the O(file_size) backwards-walk over conversation.log with
- * an O(log N) index lookup. SESSION_END marker is queried first; only
- * user/assistant rows after that marker count.
- */
-export function queryLastTurnTs(): number | null {
-	init();
-	if (!db) return null;
-	try {
-		const boundary = db.prepare(
-			"SELECT ts_unix FROM conversation WHERE role = 'SESSION_END' ORDER BY ts_unix DESC LIMIT 1"
-		).get() as { ts_unix: number } | undefined;
-		const boundaryTs = boundary?.ts_unix ?? 0;
-		const row = db.prepare(
-			"SELECT ts_unix FROM conversation WHERE role IN ('user','assistant') AND ts_unix > ? ORDER BY ts_unix DESC LIMIT 1"
-		).get(boundaryTs) as { ts_unix: number } | undefined;
-		return row?.ts_unix ?? null;
-	} catch (e) {
-		console.error('[conversation-store] queryLastTurnTs failed:', e);
-		return null;
-	}
-}
-
-/**
- * Read up to `count` most recent conversation rows from the *current*
- * session (after the most recent SESSION_END marker), oldest-first.
- * Used by getRecentConversation. Returns empty array on any failure.
- */
-export function queryRecentTurns(count: number): Array<{ role: string; text: string }> {
-	init();
-	if (!db) return [];
-	try {
-		const boundary = db.prepare(
-			"SELECT ts_unix FROM conversation WHERE role = 'SESSION_END' ORDER BY ts_unix DESC LIMIT 1"
-		).get() as { ts_unix: number } | undefined;
-		const boundaryTs = boundary?.ts_unix ?? 0;
-		const rows = db.prepare(
-			"SELECT role, text FROM conversation WHERE ts_unix > ? ORDER BY ts_unix DESC LIMIT ?"
-		).all(boundaryTs, count) as Array<{ role: string; text: string }>;
-		return rows.reverse(); // oldest-first matches text-log reader's slice(-count)
-	} catch (e) {
-		console.error('[conversation-store] queryRecentTurns failed:', e);
-		return [];
-	}
 }
 
 /** Parse a value that should be a timestamp into unix seconds, or null. */
