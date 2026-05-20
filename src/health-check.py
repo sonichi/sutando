@@ -10,6 +10,7 @@ Usage:
   python3 src/health-check.py --notify-on-fail # macOS notification on failure
 
 Checks:
+  - macOS TCC Documents-folder access (when repo is under ~/Documents)
   - Voice agent (port 9900), web client, agent API, dashboard
   - Critical files (CLAUDE.md, build_log.md, ACTIVITY.md)
   - Memory system (MEMORY.md index, key memory files)
@@ -134,6 +135,53 @@ def check_memory_sync() -> dict:
             return {"name": name, "status": "warn", "detail": f"last sync {age_h:.0f}h ago (stale)"}
         return {"name": name, "status": "ok", "detail": f"last sync {age_h:.1f}h ago"}
     return {"name": name, "status": "ok", "detail": "initialized, never fetched"}
+
+
+def check_tcc_documents_access() -> dict:
+    """Detect macOS TCC denial of Documents-folder access (issue #709).
+
+    Relevant when REPO_DIR is inside ~/Documents — the default location for
+    git checkouts on macOS. A process that hasn't been granted Documents access
+    in System Settings → Privacy & Security → Files and Folders will hit
+    PermissionError on every file read/write in the repo, causing tasks to go
+    missing and services to crash on startup with no obvious error.
+
+    Probe: attempt to list REPO_DIR and write+unlink a throwaway temp file.
+    Safe even when access is denied — the PermissionError is caught and reported
+    rather than propagated.
+    """
+    name = "tcc-documents-access"
+    docs_dir = Path.home() / "Documents"
+    try:
+        in_documents = str(REPO_DIR.resolve()).startswith(str(docs_dir.resolve()))
+    except OSError:
+        in_documents = True  # can't resolve → assume we're in Documents and probe
+
+    if not in_documents:
+        return {"name": name, "status": "ok", "detail": "repo not in ~/Documents — TCC check N/A"}
+
+    probe = REPO_DIR / ".tcc-probe"
+    try:
+        list(REPO_DIR.iterdir())
+        probe.write_text("")
+        probe.unlink()
+        return {"name": name, "status": "ok", "detail": "Documents folder access granted"}
+    except PermissionError:
+        try:
+            probe.unlink()
+        except Exception:
+            pass
+        return {
+            "name": name,
+            "status": "fail",
+            "detail": (
+                "macOS TCC denied Documents folder access — grant in "
+                "System Settings → Privacy & Security → Files and Folders "
+                "→ Terminal (or your IDE/launchd app)"
+            ),
+        }
+    except OSError:
+        return {"name": name, "status": "ok", "detail": "Documents access check inconclusive"}
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +359,7 @@ def _voice_log_path() -> Path:
     permanently warn "voice-agent.log not found" on Sutando.app installs.
     """
     launchd_log = Path.home() / "Library/Application Support/Sutando/logs/voice-agent.log"
-    workspace_log = REPO_DIR / "logs" / "voice-agent.log"
+    workspace_log = WORKSPACE_DIR / "logs" / "voice-agent.log"
     if launchd_log.exists() and launchd_log.stat().st_size > 0:
         return launchd_log
     return workspace_log
@@ -595,7 +643,7 @@ def check_core_proactive_loop(threshold_sec: int = 600) -> dict:
     Status is anything other than "running" → ok regardless of age.
     """
     name = "core-proactive-loop"
-    status_path = REPO_DIR / "core-status.json"
+    status_path = WORKSPACE_DIR / "core-status.json"
     if not status_path.exists():
         return {"name": name, "status": "ok", "detail": "core-status.json not yet written"}
     try:
@@ -675,10 +723,14 @@ def run_all_checks() -> list[dict]:
             c["detail"] = "not running (optional)"
         checks.append(c)
 
+    # macOS TCC — must come before critical-file checks so if TCC is blocking
+    # everything, the operator sees the root cause before the downstream failures.
+    checks.append(check_tcc_documents_access())
+
     # Critical files
     for name, path in [
         ("CLAUDE.md", REPO_DIR / "CLAUDE.md"),
-        ("build_log.md", REPO_DIR / "build_log.md"),
+        ("build_log.md", WORKSPACE_DIR / "build_log.md"),
         (".env", REPO_DIR / ".env"),
     ]:
         checks.append(check_file(path, name))
@@ -689,8 +741,11 @@ def run_all_checks() -> list[dict]:
     else:
         checks.append({"name": "memory-dir", "status": "ok", "detail": "not yet created (normal for new installs)"})
 
-    # Notes — canonical home is shared private dir post-migration
-    checks.append(check_directory(Path(shared_personal_path("notes", REPO_DIR)), "notes-dir"))
+    # Notes — canonical home is shared private dir post-migration.
+    # Pass WORKSPACE_DIR (not REPO_DIR) so the check resolves to
+    # ~/.sutando/workspace/notes rather than <repo>/notes — the notes/
+    # .gitkeep was removed from the repo in #793's workspace migration.
+    checks.append(check_directory(Path(shared_personal_path("notes", WORKSPACE_DIR)), "notes-dir"))
 
     # Memory sync
     checks.append(check_memory_sync())
@@ -792,7 +847,7 @@ def run_all_checks() -> list[dict]:
         # so log-stale warnings never fired (caught 2026-05-05 when Mini's
         # logs/discord-bridge.log was 36h stale but health-check stayed "ok").
         import time
-        log_file = REPO_DIR / "logs" / f"{name}.log"
+        log_file = WORKSPACE_DIR / "logs" / f"{name}.log"
         if not log_file.exists():
             log_file = REPO_DIR / "src" / f"{name}.log"
         detail = "running"
@@ -804,7 +859,7 @@ def run_all_checks() -> list[dict]:
                 detail = f"running but log stale ({int(age_sec)}s old)"
 
         # Check 3: Heartbeat file freshness (overrides log staleness if fresh)
-        heartbeat_file = REPO_DIR / "state" / f"{name}.heartbeat"
+        heartbeat_file = WORKSPACE_DIR / "state" / f"{name}.heartbeat"
         if heartbeat_file.exists():
             hb_age = time.time() - heartbeat_file.stat().st_mtime
             if hb_age <= 120:  # heartbeat is fresh — bridge is alive
@@ -883,12 +938,35 @@ def run_all_checks() -> list[dict]:
     # Sutando menu bar app (optional — only check if binary exists)
     sutando_bin = REPO_DIR / "src" / "Sutando" / "Sutando"
     if sutando_bin.exists():
+        # Distinguish pgrep failures (exit code != 0 and != 1) from a real
+        # no-match (exit code 1). Pre-fix the bare try/except swallowed
+        # subprocess errors AND empty results into a single "no pids" path,
+        # which surfaced as a false "not running" warn when pgrep itself
+        # hiccupped (CPU contention, fd exhaustion, etc.). Chi hit this
+        # 2026-05-18 — app was alive (PID 34586 since May 17) but a
+        # health-check tick reported "not running."
+        pgrep_status = None  # "ok-running" | "ok-stopped" | "error"
+        pgrep_err = ""
+        pids: list[str] = []
         try:
-            result = subprocess.run(["/usr/bin/pgrep", "-f", "Sutando/Sutando"], capture_output=True, text=True)
-            pids = [p for p in result.stdout.strip().split("\n") if p]
-        except:
-            pids = []
-        if pids:
+            result = subprocess.run(
+                ["/usr/bin/pgrep", "-f", "Sutando/Sutando"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                pids = [p for p in result.stdout.strip().split("\n") if p]
+                pgrep_status = "ok-running"
+            elif result.returncode == 1:
+                # pgrep convention: 1 = no match
+                pgrep_status = "ok-stopped"
+            else:
+                pgrep_status = "error"
+                pgrep_err = (result.stderr or f"pgrep exit={result.returncode}").strip()[:120]
+        except Exception as e:
+            pgrep_status = "error"
+            pgrep_err = f"{type(e).__name__}: {e}"[:120]
+
+        if pgrep_status == "ok-running" and pids:
             check = {"name": "sutando-app", "status": "ok", "detail": f"running (⌃C/⌃V/⌃M)"}
             mark_stale_if_outdated(
                 check,
@@ -897,8 +975,13 @@ def run_all_checks() -> list[dict]:
                 binary_path=REPO_DIR / "src" / "Sutando" / "Sutando",
             )
             checks.append(check)
-        else:
+        elif pgrep_status == "ok-stopped":
             checks.append({"name": "sutando-app", "status": "warn", "detail": "not running — hotkeys disabled"})
+        else:
+            # pgrep itself errored — don't false-alarm "not running" when we
+            # actually couldn't determine state. Surface as a transient warn
+            # with the cause so it's debuggable, not a routine "app is down."
+            checks.append({"name": "sutando-app", "status": "warn", "detail": f"detection failed (pgrep: {pgrep_err or 'unknown error'}) — actual app state unknown"})
 
     # Stuck-loop / queue-pileup detection — consequence-level signals that
     # fire whether the watcher died, the proactive loop crashed mid-pass, or
@@ -910,6 +993,32 @@ def run_all_checks() -> list[dict]:
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
 
     return checks
+
+
+def _any_core_alive(workspace: Optional[Path] = None, max_age_s: float = 90.0) -> bool:
+    """Return True if any sutando-core on any host has a live heartbeat.
+
+    Each running core writes `<workspace>/state/cores/<hostname>.alive` every
+    30 seconds (src/core_heartbeat.py). A file younger than `max_age_s` (3
+    missed beats at 30s each) means the core is alive. When it is, the
+    proactive loop already handles health inline — no need to queue a task.
+
+    `workspace` defaults to `WORKSPACE_DIR` at call time (not at import time)
+    so tests can patch the module-level name and have the change take effect.
+    """
+    if workspace is None:
+        workspace = WORKSPACE_DIR
+    cores_dir = workspace / "state" / "cores"
+    if not cores_dir.is_dir():
+        return False
+    now = time.time()
+    for alive_file in cores_dir.glob("*.alive"):
+        try:
+            if now - alive_file.stat().st_mtime < max_age_s:
+                return True
+        except OSError:
+            pass
+    return False
 
 
 def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None, tasks_dir: Optional[Path] = None) -> None:
@@ -1093,7 +1202,12 @@ def main():
     # `--quiet --emit-task --notify-on-fail` invocation bypassed via the
     # quiet-path sys.exit(1). Splitting the emit logic by --fix state
     # restores coverage for the no-fix path.
-    if do_emit and not do_fix:
+    #
+    # Skip when a live core is present (issue #635 dedup-runners): the
+    # proactive loop already handles health inline — writing a task file
+    # here creates a duplicate that re-queues the same check. The task-file
+    # path is only useful when the core is dead (queues for next restart).
+    if do_emit and not do_fix and not _any_core_alive():
         emit_task_for_failures(checks)
 
     if as_json:
@@ -1168,7 +1282,7 @@ def main():
                     # dotenv, etc.) — restart would crash on import.
                     # Log path uses logs/ (post-PR #251 refactor).
                     subprocess.Popen([sys.executable, str(REPO_DIR / "src" / f"{c['name']}.py")],
-                                     stdout=open(str(REPO_DIR / "logs" / f"{c['name']}.log"), "a"),
+                                     stdout=open(str(WORKSPACE_DIR / "logs" / f"{c['name']}.log"), "a"),
                                      stderr=subprocess.STDOUT, start_new_session=True)
                     print(f"  {c['name']}: {'restarted (stale code)' if c['status'] == 'stale' else 'restarted'}")
                 elif c["name"] == "sutando-app":
@@ -1231,7 +1345,7 @@ def main():
     # review). The no-fix path emits earlier, before --quiet / --json early
     # exits (per #640 v2-regression: launchd's `--quiet --emit-task` was
     # bypassing the end-of-main emit via sys.exit(1)).
-    if do_emit and do_fix and issues:
+    if do_emit and do_fix and issues and not _any_core_alive():
         # Brief delay so restarts have a chance to register before re-check.
         # 2s matches the fix-loop's per-service `time.sleep(1)` budget.
         import time as _t; _t.sleep(2)

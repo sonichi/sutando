@@ -84,8 +84,8 @@ Walk the question top-to-bottom and stop at the first match:
 1. **Is the file checked into git?** → `REPO_DIR`. (Source code, scripts, docs, tests, package.json.)
 2. **Is the file a stable cross-machine reference Claude can read on session start?** (e.g., `CLAUDE.md`, README) → `REPO_DIR`.
 3. **Otherwise — does it mutate during runtime?** → `WORKSPACE_DIR`. (Tasks, results, state, logs, notes, build_log, pending-questions, status JSON.)
-4. **Is it per-machine personal state?** (Stand identity, avatar) → `personal_path()` (honors `SUTANDO_PRIVATE_DIR` first).
-5. **Is it fleet-shared user state?** (Notes, shared memory) → `shared_personal_path()` (honors `SUTANDO_PRIVATE_DIR` first, falls back to workspace).
+4. **Is it per-machine personal state?** (Stand identity, avatar) → `personal_path()` (honors `SUTANDO_MEMORY_DIR` first; legacy `SUTANDO_PRIVATE_DIR` falls through for one release per #870).
+5. **Is it fleet-shared user state?** (Notes, shared memory) → `shared_personal_path()` (honors `SUTANDO_MEMORY_DIR` first, falls back to workspace; legacy `SUTANDO_PRIVATE_DIR` honored for one release per #870).
 
 ## Related PRs
 
@@ -94,3 +94,29 @@ Walk the question top-to-bottom and stop at the first match:
 - **This PR** — applies the same split to `health-check.py`, `conversation-server.ts`, `sync-memory.sh`, `util_paths.py`, `dashboard.py`. Documents the contract.
 
 Any code in the OSS tree that still uses the old pattern is a fix candidate — file an issue or open a PR following the same shape.
+
+---
+
+## Existing-repo installs: trigger the migration (or pin `SUTANDO_WORKSPACE` as stop-gap)
+
+If your loop / cron / scripts polled `<repo>/tasks/` directly before #762 (and any component — Python or TS — that hardcoded the repo path via `Path(__file__).parent.parent` or `new URL('..', import.meta.url)` is still doing so), you'll see a silent **path divergence**:
+
+- The bridge (and any caller of `resolve_workspace()`) writes new tasks to the canonical default `~/.sutando/workspace/tasks/`.
+- Any component still reading from `<repo>/tasks/` via a relative path won't see them.
+- Result: new tasks never reach the loop. Observed 2026-05-16 — 7 owner DMs orphaned over 19 minutes before the divergence was caught.
+
+**Preferred fix:** restart the bridge and sutando-app. The migration code from #762 (`_migrate_from_legacy`) auto-moves `<repo>/{tasks,results,state}` → `~/.sutando/workspace/{tasks,results,state}` on first new-default run. After migration, both sides agree on the canonical default and no env var is needed.
+
+**Stop-gap (if migration won't run):** pin `SUTANDO_WORKSPACE` in `.env` at the repo root and restart the bridges:
+
+```bash
+SUTANDO_WORKSPACE=/full/path/to/your/repo
+```
+
+**Caveat:** this revives the git-status-pollution antipattern that #762 was designed to escape (every `tasks/`, `results/`, `state/` write shows up in `git status`). Use sparingly; prefer the migration when possible.
+
+**Fresh installs** can skip this entirely — the `~/.sutando/workspace/` default works because nothing else polls the repo path.
+
+## Orphan symlinks (post-migration cleanup)
+
+If you hand-created any symlinks against the legacy `~/.sutando-memory-sync/...` path before the auto-migration moved it to `~/.sutando/memory-sync/`, those symlinks are now stale (the target moved out from under them). `scripts/sync-memory.sh` (post-#835) scans `~/.sutando/`, `~/.claude/skills/`, and `~/.config/` for orphaned symlinks the first time it actually triggers the migration and emits one `rm + ln -s` recipe per orphan to stderr. Run the printed pairs to re-point them at the canonical path. Subsequent runs skip the scan (no false positives).

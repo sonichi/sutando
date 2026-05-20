@@ -24,6 +24,7 @@ except Exception:  # pragma: no cover — bridge must keep running
     def _push_vision_image(path: str, source: str = "telegram") -> bool:  # type: ignore
         return False
 from task_priority import default_priority_for_source  # noqa: E402
+from result_markers import parse_markers  # noqa: E402
 
 from workspace_default import resolve_workspace  # noqa: E402
 REPO = resolve_workspace()
@@ -95,6 +96,42 @@ ARCHIVE_RESULTS_DIR = REPO / "results" / "archive"
 OWNER_ACTIVITY_FILE = STATE_DIR / "last-owner-activity.json"
 TASKS_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def extract_forward_note(msg: dict) -> str:
+    """Return a ` [forwarded from ...]` suffix for a Telegram message dict.
+
+    Handles Bot API 7.0+ `forward_origin` (user / hidden_user / chat / channel)
+    and legacy `forward_from` / `forward_sender_name`. Returns "" for
+    non-forwarded messages or unknown `forward_origin.type` values so the
+    bridge fails open rather than crashing on future Telegram additions.
+    """
+    fwd_origin = msg.get("forward_origin") or {}
+    if fwd_origin:
+        fwd_type = fwd_origin.get("type")
+        if fwd_type == "user":
+            u = fwd_origin.get("sender_user", {})
+            name = u.get("username") or u.get("first_name") or "unknown"
+            return f" [forwarded from @{name}]"
+        if fwd_type == "hidden_user":
+            name = fwd_origin.get("sender_user_name", "hidden")
+            return f" [forwarded from {name}]"
+        if fwd_type == "chat":
+            chat = fwd_origin.get("sender_chat", {})
+            name = chat.get("title") or chat.get("username") or "channel"
+            return f" [forwarded from chat: {name}]"
+        if fwd_type == "channel":
+            chat = fwd_origin.get("chat", {})
+            name = chat.get("title") or chat.get("username") or "channel"
+            return f" [forwarded from channel: {name}]"
+        return ""
+    if "forward_from" in msg:
+        u = msg["forward_from"]
+        name = u.get("username") or u.get("first_name") or "unknown"
+        return f" [forwarded from @{name}]"
+    if "forward_sender_name" in msg:
+        return f" [forwarded from {msg['forward_sender_name']}]"
+    return ""
 
 
 def write_owner_activity(channel: str, summary: str) -> None:
@@ -273,7 +310,7 @@ def send_file(chat_id, file_path, caption=""):
         print(f"  Send file failed: {e}")
         return {"ok": False}
 
-def send_reply(chat_id, text):
+def send_reply(chat_id, text, task_id: str | None = None):
     import re
     # Extract file paths: [file: /path/to/file] or [send: /path/to/file]
     file_pattern = re.compile(r'\[(?:file|send|attach):\s*([^\]]+)\]')
@@ -284,6 +321,16 @@ def send_reply(chat_id, text):
     if clean_text:
         for i in range(0, len(clean_text), 4000):
             api("sendMessage", chat_id=chat_id, text=clean_text[i:i+4000])
+        try:
+            import outbox_log
+            outbox_log.append(
+                channel_type="telegram",
+                recipient=str(chat_id),
+                body=clean_text,
+                task_id=task_id,
+            )
+        except Exception:
+            pass
 
     # Send files (allowlist-gated; see _is_path_sendable)
     for fpath in files:
@@ -386,7 +433,9 @@ def main():
                 if not text and not attachment_note:
                     continue
 
-                print(f"  @{username}: {text}{attachment_note}")
+                forward_note = extract_forward_note(msg)
+
+                print(f"  @{username}{forward_note}: {text}{attachment_note}")
 
                 # Write as task (same format as voice bridge)
                 ts = int(time.time() * 1000)
@@ -395,8 +444,8 @@ def main():
                 priority = default_priority_for_source("telegram", "owner")
                 task_file.write_text(
                     f"id: {task_id}\n"
-                    f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S')}Z\n"
-                    f"task: [Telegram @{username}] {text}{attachment_note}\n"
+                    f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
+                    f"task: [Telegram @{username}{forward_note}] {text}{attachment_note}\n"
                     f"source: telegram\n"
                     f"chat_id: {chat_id}\n"
                     f"priority: {priority}\n"
@@ -447,17 +496,20 @@ def main():
             if result_file.exists():
                 reply_text = result_file.read_text().strip()
                 chat_id = pending_replies.pop(task_id)
-                # Skip sending if already replied directly.
-                # Clean up both files so watcher doesn't re-fire on leftover
-                # task — same bug class as discord-bridge had.
-                if reply_text.startswith('[no-send]') or reply_text.startswith('[REPLIED]'):
-                    print(f"  Skipped (already replied): {task_id}")
+                # Parse markers via the unified module (#873). Telegram
+                # honors [no-send] / [REPLIED] / [deduped: <id>] as skip
+                # and strips file markers from the text it sends. It
+                # ignores [channel:] redirects (no concept in Telegram —
+                # the marker is silently dropped from body, not leaked).
+                parsed = parse_markers(reply_text)
+                if any(a.kind == "skip" for a in parsed.actions):
+                    print(f"  Skipped (marker): {task_id}", flush=True)
                     archive_file(result_file, "results", task_id)
                     task_file = TASKS_DIR / f"{task_id}.txt"
                     archive_file(task_file, "tasks", task_id)
                     continue
                 try:
-                    send_reply(chat_id, reply_text)
+                    send_reply(chat_id, reply_text, task_id=task_id)
                     print(f"  Replied to {chat_id}: {reply_text[:80]}...", flush=True)
                 except Exception as e:
                     print(f"[Telegram] Reply error: {e}", flush=True)

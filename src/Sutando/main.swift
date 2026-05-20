@@ -1,6 +1,7 @@
 import Cocoa
 import Carbon
 import UserNotifications
+import ApplicationServices
 
 // MARK: - Sutando Drop Menu Bar App
 // Replaces Automator Quick Action for context drops.
@@ -13,19 +14,36 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var hotKeyRefs: [EventHotKeyRef?] = []  // one entry per registered hotkey
     var hotKeyActions: [UInt32: String] = [:]  // hotkey id → action name
     var lastDropTime: Date = .distantPast
+    var screencaptureInFlight: Bool = false  // guards against stacked crosshair launches
+    // Runtime state lives under the per-user workspace dir, not the repo
+    // checkout. Mirrors src/workspace_default.py + src/workspace_default.ts
+    // (PR #762 / #821). Resolution:
+    //   1. $SUTANDO_WORKSPACE (override; ~ expansion supported)
+    //   2. ~/.sutando/workspace/ (canonical default)
+    //
+    // Pre-#762 main.swift wrote tasks/logs/state under the repo checkout via
+    // CLAUDE.md walk-up. Post-#762 that dir no longer exists, so writeTask
+    // silently failed (try? write returns nil if parent dir missing) — the
+    // bug Chi hit 2026-05-18 where context-drop notified + logged but the
+    // bridge never saw the task.
     let workspace: String = {
-        // Derive from binary location → repo root
-        // Raw binary: src/Sutando/Sutando (3 levels up)
-        // .app bundle: src/Sutando/Sutando.app/Contents/MacOS/Sutando (5 levels up)
+        let env = ProcessInfo.processInfo.environment["SUTANDO_WORKSPACE"]?.trimmingCharacters(in: .whitespaces)
+        if let env = env, !env.isEmpty {
+            return (env as NSString).expandingTildeInPath
+        }
+        return NSHomeDirectory() + "/.sutando/workspace"
+    }()
+
+    // Repo checkout for skills-adjacent paths (assets, src/*.py, scripts/*.sh)
+    // that ship alongside the code. Same CLAUDE.md walk-up used before #762.
+    let repoRoot: String = {
         var url = URL(fileURLWithPath: ProcessInfo.processInfo.arguments[0]).resolvingSymlinksInPath()
-        // Walk up until we find CLAUDE.md (repo root marker)
         for _ in 0..<8 {
             url = url.deletingLastPathComponent()
             if FileManager.default.fileExists(atPath: url.appendingPathComponent("CLAUDE.md").path) {
                 return url.path
             }
         }
-        // Fallback: 3 levels up from binary
         let fallback = URL(fileURLWithPath: ProcessInfo.processInfo.arguments[0]).resolvingSymlinksInPath()
         return fallback.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().path
     }()
@@ -107,10 +125,40 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         DispatchQueue.main.async { [self] in
             setupMenuBar()
+            // Check Accessibility trust at startup. AX-related features
+            // (kAXSelectedTextAttribute reads in dropContext, synthetic Cmd+C
+            // via CGEventPost) silently fail when the bundle's TCC entry is
+            // stale — usually after a codesign identity change. Empirical
+            // case 2026-05-19: dropContext started returning "Nothing
+            // selected" for every app (Discord and TextEdit both) after
+            // Sutando.app was re-signed (ad-hoc Identifier=Sutando →
+            // cert-signed Identifier=com.sutando.menubar). The Accessibility
+            // TCC entry from the prior signature didn't transfer to the new
+            // binary; macOS silently returned AX errors without re-prompting.
+            // AXIsProcessTrustedWithOptions with prompt=true forces a
+            // re-bind: if the running binary's signature doesn't match any
+            // granted TCC row, the standard "Sutando wants Accessibility"
+            // dialog opens, and on Allow the TCC entry is recreated against
+            // the current signature. Idempotent when already trusted
+            // (returns true, no dialog). The result is also logged so future
+            // drift surfaces in the debug log on session 0.
+            let axOpts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+            let axTrusted = AXIsProcessTrustedWithOptions(axOpts)
+            logToFile("startup: AXIsProcessTrusted=\(axTrusted)")
             registerHotKey()
             watchResults()
             setupPointerOverlay()
             logToFile("App started, workspace=\(workspace)")
+            // Startup smoke: ensure the runtime dirs exist so the silent-
+            // write class can't recur (Mini nit #3). mkdir is idempotent;
+            // missing-dir is logged so an unexpected absence is visible.
+            for sub in ["tasks", "logs", "state", "results"] {
+                let dir = workspace + "/" + sub
+                if !FileManager.default.fileExists(atPath: dir) {
+                    logToFile("startup-smoke: \(sub)/ missing under \(workspace) — creating")
+                }
+                try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            }
         }
     }
 
@@ -169,7 +217,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem.button {
-            let avatarPath = workspace + "/assets/stand-avatar.png"
+            let avatarPath = repoRoot + "/assets/stand-avatar.png"
             if let image = NSImage(contentsOfFile: avatarPath) {
                 image.size = NSSize(width: 18, height: 18)
                 image.isTemplate = false
@@ -808,7 +856,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Composited onto the top-right corner of the 18×18 avatar so the
     /// menu bar continuously signals mode without taking an extra slot.
     func avatarImage(presenterActive: Bool, meetingActive: Bool = false) -> NSImage? {
-        let avatarPath = workspace + "/assets/stand-avatar.png"
+        let avatarPath = repoRoot + "/assets/stand-avatar.png"
         guard let base = NSImage(contentsOfFile: avatarPath) else { return nil }
         base.size = NSSize(width: 18, height: 18)
         base.isTemplate = false
@@ -1250,78 +1298,238 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // 2. Check clipboard for image (PNG)
-        if let imageData = NSPasteboard.general.data(forType: .png) {
-            do {
-                try imageData.write(to: URL(fileURLWithPath: dropImage))
-                let content = """
-                timestamp: \(timestamp)
-                type: image
-                path: \(dropImage)
-                \(ctxHeader)---
-                [Image dropped from clipboard]
-                """
-                appendLog(logFile, "[\(timestamp)] Dropped: image (\(imageData.count) bytes)")
-                writeTask(tasksDir, timestamp: timestamp, content: content)
-                notify("Sutando", "Image dropped (\(imageData.count / 1024)KB)")
-                return
-            } catch {}
-        }
-
-        // 3. Check clipboard for TIFF image (screenshots sometimes use TIFF)
-        if let tiffData = NSPasteboard.general.data(forType: .tiff),
-           let bitmapRep = NSBitmapImageRep(data: tiffData),
-           let pngData = bitmapRep.representation(using: .png, properties: [:]) {
-            do {
-                try pngData.write(to: URL(fileURLWithPath: dropImage))
-                let content = """
-                timestamp: \(timestamp)
-                type: image
-                path: \(dropImage)
-                \(ctxHeader)---
-                [Image dropped from clipboard]
-                """
-                appendLog(logFile, "[\(timestamp)] Dropped: image (\(pngData.count) bytes)")
-                writeTask(tasksDir, timestamp: timestamp, content: content)
-                notify("Sutando", "Image dropped (\(pngData.count / 1024)KB)")
-                return
-            } catch {}
-        }
-
-        // 4. Try to get selected text via Accessibility API
-        if let selected = getSelectedText(), !selected.isEmpty {
+        // Drop-resolution chain. All text paths run before any image path so
+        // lingering clipboard screenshots don't pre-empt selected-text drops.
+        //
+        // Text-emit helper — captures the AX/clipboard metadata block if
+        // present, writes the task, notifies. Returns true on success.
+        let emitText: (String, String?, String?, String?, String?, String) -> Void = {
+            [self] (selected, app, windowTitle, urlVal, axPath, source) in
+            var meta: [String] = []
+            if let a = app, !a.isEmpty { meta.append("app: \(a)") }
+            if let w = windowTitle, !w.isEmpty { meta.append("window: \(w)") }
+            if let u = urlVal, !u.isEmpty { meta.append("url: \(u)") }
+            if let p = axPath, !p.isEmpty { meta.append("ax_path: \(p)") }
+            let metaBlock = meta.isEmpty ? "" : meta.joined(separator: "\n") + "\n"
             let content = """
             timestamp: \(timestamp)
             type: text
-            \(ctxHeader)---
+            \(metaBlock)\(ctxHeader)---
             \(selected)
             """
-            appendLog(logFile, "[\(timestamp)] Dropped: \(selected.count) chars")
+            appendLog(logFile, "[\(timestamp)] Dropped: \(selected.count) chars (\(source))")
             writeTask(tasksDir, timestamp: timestamp, content: content)
             let snippet = String(selected.prefix(80)).replacingOccurrences(of: "\n", with: " ")
             notify("Sutando", "Dropped: \(snippet)\(selected.count > 80 ? "…" : "")")
+        }
+
+        // 2. ax-read (preferred text path; subprocess, has changeCount-safe
+        //    clipboard fallback + restores prior pasteboard).
+        if let axRead = invokeAxRead() {
+            let selected = (axRead["selected"] as? String) ?? ""
+            if !selected.isEmpty {
+                emitText(selected,
+                         axRead["app"] as? String,
+                         axRead["window_title"] as? String,
+                         axRead["url"] as? String,
+                         axRead["path"] as? String,
+                         "ax-read")
+                return
+            }
+        }
+
+        // 3. Legacy in-process AX (fallback when ax-read binary missing).
+        if let selected = getSelectedText(), !selected.isEmpty {
+            emitText(selected, nil, nil, nil, nil, "legacy-ax")
             return
         }
 
-        // 5. Fallback: simulate Cmd+C, read clipboard
+        // 4. Legacy Cmd+C simulation with changeCount guard. Async wait so the
+        //    main run loop is free to deliver the synthetic event. If still no
+        //    text after the wait, fall through to image branches and finally
+        //    the interactive screencapture fallback.
+        let pb = NSPasteboard.general
+        let priorChangeCount = pb.changeCount
         simulateCopy()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [self] in
-            if let text = NSPasteboard.general.string(forType: .string), !text.isEmpty {
-                let content = """
-                timestamp: \(timestamp)
-                type: text
-                \(ctxHeader)---
-                \(text)
-                """
-                appendLog(logFile, "[\(timestamp)] Dropped: \(text.count) chars")
-                writeTask(tasksDir, timestamp: timestamp, content: content)
-                let snippet = String(text.prefix(80)).replacingOccurrences(of: "\n", with: " ")
-                notify("Sutando", "Dropped: \(snippet)\(text.count > 80 ? "…" : "")")
-            } else {
-                notify("Sutando", "Nothing selected — select text first")
-                appendLog(logFile, "[\(timestamp)] Nothing selected")
+            if pb.changeCount > priorChangeCount,
+               let text = pb.string(forType: .string), !text.isEmpty {
+                emitText(text, nil, nil, nil, nil, "legacy-cmd+c")
+                return
+            }
+
+            // 5. Clipboard PNG.
+            if let imageData = pb.data(forType: .png) {
+                do {
+                    try imageData.write(to: URL(fileURLWithPath: dropImage))
+                    let content = """
+                    timestamp: \(timestamp)
+                    type: image
+                    path: \(dropImage)
+                    \(ctxHeader)---
+                    [Image dropped from clipboard]
+                    """
+                    appendLog(logFile, "[\(timestamp)] Dropped: image (\(imageData.count) bytes, clipboard-png)")
+                    writeTask(tasksDir, timestamp: timestamp, content: content)
+                    notify("Sutando", "Image dropped (\(imageData.count / 1024)KB)")
+                    return
+                } catch {}
+            }
+
+            // 6. Clipboard TIFF (some screenshot tools).
+            if let tiffData = pb.data(forType: .tiff),
+               let bitmapRep = NSBitmapImageRep(data: tiffData),
+               let pngData = bitmapRep.representation(using: .png, properties: [:]) {
+                do {
+                    try pngData.write(to: URL(fileURLWithPath: dropImage))
+                    let content = """
+                    timestamp: \(timestamp)
+                    type: image
+                    path: \(dropImage)
+                    \(ctxHeader)---
+                    [Image dropped from clipboard]
+                    """
+                    appendLog(logFile, "[\(timestamp)] Dropped: image (\(pngData.count) bytes, clipboard-tiff→png)")
+                    writeTask(tasksDir, timestamp: timestamp, content: content)
+                    notify("Sutando", "Image dropped (\(pngData.count / 1024)KB)")
+                    return
+                } catch {}
+            }
+
+            // 7. Last resort: interactive region capture. Esc cancels. Run on
+            //    a background queue so the main run loop stays responsive
+            //    while the user drags (waitUntilExit can take many seconds).
+            //    In-flight guard prevents stacked crosshairs from rapid ⌃C.
+            if self.screencaptureInFlight {
+                appendLog(logFile, "[\(timestamp)] screencapture already in flight, skipping")
+                return
+            }
+            self.screencaptureInFlight = true
+            appendLog(logFile, "[\(timestamp)] launching screencapture -i -c")
+            let priorPbChange = pb.changeCount
+            DispatchQueue.global(qos: .userInitiated).async { [self] in
+                defer { DispatchQueue.main.async { self.screencaptureInFlight = false } }
+                let cap = Process()
+                cap.launchPath = "/usr/sbin/screencapture"
+                cap.arguments = ["-i", "-c"]
+                cap.standardOutput = Pipe()
+                cap.standardError = Pipe()
+                do {
+                    try cap.run()
+                    cap.waitUntilExit()
+                } catch {
+                    DispatchQueue.main.async { [self] in
+                        appendLog(logFile, "[\(timestamp)] screencapture failed: \(error.localizedDescription)")
+                        notify("Sutando", "Nothing selected — screencapture unavailable")
+                    }
+                    return
+                }
+                DispatchQueue.main.async { [self] in
+                    if pb.changeCount > priorPbChange {
+                        if let png = pb.data(forType: .png) {
+                            do {
+                                try png.write(to: URL(fileURLWithPath: dropImage))
+                                let content = """
+                                timestamp: \(timestamp)
+                                type: image
+                                path: \(dropImage)
+                                \(ctxHeader)---
+                                [Image dropped via screen-region capture]
+                                """
+                                appendLog(logFile, "[\(timestamp)] Dropped: image (\(png.count) bytes, screencapture-region)")
+                                writeTask(tasksDir, timestamp: timestamp, content: content)
+                                notify("Sutando", "Region captured (\(png.count / 1024)KB)")
+                                return
+                            } catch {}
+                        }
+                        if let tiff = pb.data(forType: .tiff),
+                           let rep = NSBitmapImageRep(data: tiff),
+                           let png = rep.representation(using: .png, properties: [:]) {
+                            do {
+                                try png.write(to: URL(fileURLWithPath: dropImage))
+                                let content = """
+                                timestamp: \(timestamp)
+                                type: image
+                                path: \(dropImage)
+                                \(ctxHeader)---
+                                [Image dropped via screen-region capture]
+                                """
+                                appendLog(logFile, "[\(timestamp)] Dropped: image (\(png.count) bytes, screencapture-region tiff→png)")
+                                writeTask(tasksDir, timestamp: timestamp, content: content)
+                                notify("Sutando", "Region captured (\(png.count / 1024)KB)")
+                                return
+                            } catch {}
+                        }
+                    }
+                    notify("Sutando", "Cancelled — nothing dropped")
+                    appendLog(logFile, "[\(timestamp)] cancelled (screencapture esc / no clipboard change)")
+                }
             }
         }
+    }
+
+    // MARK: - ax-read subprocess (voice agent's read_selection primitive)
+    //
+    // Resolution order for the binary path:
+    //   1. $SUTANDO_MEMORY_DIR/skills/personal-deictic/ax-read  (private, richer
+    //      — includes screenshot + cursor for deictic phrases)
+    //   2. $SUTANDO_PRIVATE_DIR/skills/personal-deictic/ax-read (legacy alias, PR #876)
+    //   3. ~/.sutando/memory-sync/skills/personal-deictic/ax-read (default private)
+    //   4. <repo>/skills/context-drop/ax-read                    (public fallback,
+    //      text-only — ships in this repo so public-repo installs get the same
+    //      ⌃C experience without needing the private personal-deictic skill)
+    //
+    // Returns nil when no binary is found; callers fall back to the in-process
+    // legacy AX path.
+
+    func resolveAxReadPath() -> String? {
+        let env = ProcessInfo.processInfo.environment
+        let privateSuffix = "/skills/personal-deictic/ax-read"
+        let candidates = [
+            env["SUTANDO_MEMORY_DIR"].map { $0 + privateSuffix },
+            env["SUTANDO_PRIVATE_DIR"].map { $0 + privateSuffix },
+            NSString(string: "~/.sutando/memory-sync" + privateSuffix).expandingTildeInPath,
+            repoRoot + "/skills/context-drop/ax-read",
+        ].compactMap { $0 }
+        let fm = FileManager.default
+        for path in candidates {
+            if fm.isExecutableFile(atPath: path) {
+                return path
+            }
+        }
+        return nil
+    }
+
+    func invokeAxRead() -> [String: Any]? {
+        guard let binPath = resolveAxReadPath() else { return nil }
+        let task = Process()
+        task.launchPath = binPath
+        task.arguments = []
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        task.standardOutput = outPipe
+        task.standardError = errPipe
+        do {
+            try task.run()
+        } catch {
+            return nil
+        }
+        // 3s deadline matches ax-read's max screencapture timeout (1s) plus
+        // headroom for Cmd+C fallback wait (120ms). Anything longer means the
+        // subprocess is stuck — fall back to legacy.
+        let deadline = Date().addingTimeInterval(3.0)
+        while task.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        if task.isRunning {
+            task.terminate()
+            return nil
+        }
+        let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return json
     }
 
     // MARK: - Screenshot Drop (⌥C)
@@ -1538,12 +1746,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func appendLog(_ path: String, _ line: String) {
+        // mkdir -p parent so the write doesn't silently drop when the log
+        // dir is missing — same defensive pattern as writeTask (Mini nit #2).
+        let parent = (path as NSString).deletingLastPathComponent
+        try? FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
         if let handle = FileHandle(forWritingAtPath: path) {
             handle.seekToEndOfFile()
             handle.write((line + "\n").data(using: .utf8)!)
             handle.closeFile()
         } else {
-            try? (line + "\n").write(toFile: path, atomically: true, encoding: .utf8)
+            do {
+                try (line + "\n").write(toFile: path, atomically: true, encoding: .utf8)
+            } catch {
+                // Last-resort log so disk-full / permission failures aren't
+                // silent (Mini nit #1). logToFile writes to a different dir
+                // so a single-dir failure doesn't cascade.
+                logToFile("appendLog: write failed for \(path) — \(error.localizedDescription)")
+            }
         }
     }
 
@@ -1556,7 +1775,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         \(content)
         """
         let taskPath = tasksDir + "/task-\(ts).txt"
-        try? taskContent.write(toFile: taskPath, atomically: true, encoding: .utf8)
+        // mkdir -p the parent dir to prevent the silent-failure class where
+        // try?-write returns nil and the dropped context vanishes. This was
+        // the bug Chi hit 2026-05-18: workspace var pointed at repo, but
+        // tasks/ had been moved to the workspace dir by PR #762, so
+        // try? write to <repo>/tasks/task-X.txt silently dropped the data.
+        try? FileManager.default.createDirectory(atPath: tasksDir, withIntermediateDirectories: true)
+        do {
+            try taskContent.write(toFile: taskPath, atomically: true, encoding: .utf8)
+        } catch {
+            // disk-full / permission fail (Mini nit #1) — don't lose the
+            // signal silently. Surface to debug log.
+            logToFile("writeTask: write failed for \(taskPath) — \(error.localizedDescription)")
+        }
     }
 
     var lastHealthCheckStart: Date = .distantPast
@@ -1572,7 +1803,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         lastHealthCheckStart = now
 
         let logPath = workspace + "/logs/health-check.log"
-        let scriptPath = workspace + "/src/health-check.py"
+        let scriptPath = repoRoot + "/src/health-check.py"
         // Match the (retired) launchd plist's interpreter so behavior is
         // identical. Falls back to /usr/bin/env python3 if homebrew python
         // is missing on this host.
@@ -1883,7 +2114,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         notify("Sutando", "Restarting all services...")
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-        proc.arguments = [workspace + "/src/restart.sh"]
+        proc.arguments = [repoRoot + "/src/restart.sh"]
         proc.standardOutput = FileHandle.nullDevice
         proc.standardError = FileHandle.nullDevice
         DispatchQueue.global(qos: .utility).async {
@@ -1896,7 +2127,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         notify("Sutando", "Stopping all services...")
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-        proc.arguments = [workspace + "/src/stop.sh"]
+        proc.arguments = [repoRoot + "/src/stop.sh"]
         proc.standardOutput = FileHandle.nullDevice
         proc.standardError = FileHandle.nullDevice
         DispatchQueue.global(qos: .utility).async {
@@ -1998,7 +2229,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// this only restarts the Claude Code CLI session.
     @objc func restartCore() {
         notify("Sutando", "Restarting Core CLI…")
-        let script = workspace + "/scripts/start-cli.sh"
+        let script = repoRoot + "/scripts/start-cli.sh"
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
         proc.arguments = [script, "--restart"]

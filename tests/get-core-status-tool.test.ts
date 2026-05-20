@@ -1,17 +1,23 @@
 import { describe, it, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync, existsSync, unlinkSync } from 'node:fs';
-import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { getCoreStatusTool } from '../src/inline-tools.js';
+import { join } from 'node:path';
+import { setupTempWorkspace } from './_helpers/temp-workspace.js';
 
 // Unit tests for the get_core_status inline tool (PR #467).
-// The tool is an async fn that reads core-status.json via a hardcoded
-// relative path (repo-root). Tests stash + restore any live value on the
-// disk so a concurrent /proactive-loop pass doesn't corrupt the fixtures.
+// The tool reads `<SUTANDO_WORKSPACE>/core-status.json` (post-#840 fix). Tests
+// run with SUTANDO_WORKSPACE pointing at a per-process temp dir so concurrent
+// test files (notably tests/agent-state-endpoint.test.ts, which spawns a
+// web-client that ALSO reads core-status.json) can't race. Before #840: both
+// tests shared <REPO_ROOT>/core-status.json and node:test parallel-file mode
+// caused intermittent failures.
+const { workspace: TEMP_WORKSPACE, cleanup: cleanupTempWorkspace } =
+	setupTempWorkspace('getcore');
+const CORE_STATUS_PATH = join(TEMP_WORKSPACE, 'core-status.json');
 
-const CORE_STATUS_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'core-status.json');
-let saved: string | null = null;
+// Import AFTER setting SUTANDO_WORKSPACE so the tool's module-load resolves
+// to the temp dir, not whatever the test process's env was before.
+const { getCoreStatusTool } = await import('../src/inline-tools.js');
 
 // Tool execute returns a plain object. Use any here because ToolDefinition
 // typing makes the return a generic JsonValue.
@@ -21,19 +27,7 @@ async function invoke(): Promise<any> {
 }
 
 describe('get_core_status inline tool', () => {
-	before(() => {
-		if (existsSync(CORE_STATUS_PATH)) {
-			saved = readFileSync(CORE_STATUS_PATH, 'utf-8');
-		}
-	});
-
-	after(() => {
-		if (saved !== null) {
-			writeFileSync(CORE_STATUS_PATH, saved);
-		} else {
-			try { unlinkSync(CORE_STATUS_PATH); } catch { /* idempotent */ }
-		}
-	});
+	after(cleanupTempWorkspace);
 
 	it('returns status:running with step + ageSec when fresh running file exists', async () => {
 		const nowSec = Math.floor(Date.now() / 1000);

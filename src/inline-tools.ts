@@ -7,9 +7,23 @@
 
 import { execSync, execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync, statSync } from 'node:fs';
-import { join, extname } from 'node:path';
+import { join, extname, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
+import { resolveWorkspace } from './workspace_default.js';
+
+// Tasks/, results/, state/, dynamic-content.json are per-user runtime state
+// — live under $SUTANDO_WORKSPACE. Pre-fix, sites below resolved against
+// `process.cwd()` which only happened to match the workspace when the
+// voice-agent was launched from the repo with SUTANDO_WORKSPACE unset.
+// resolveWorkspace() is the canonical TS helper introduced in #821.
+const WORKSPACE_DIR = resolveWorkspace();
+
+// Code-adjacent paths (skills/, etc.) ship with the repo checkout, NOT the
+// workspace. Compute REPO_ROOT from this file's URL so the resolution
+// survives any cwd drift at startup. Used by the skill-loader below.
+const REPO_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -21,6 +35,10 @@ import { describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, scre
 export { sendVisionFrameTool, startVisionTool, stopVisionTool } from './vision-tools.js';
 import { sendVisionFrameTool, startVisionTool, stopVisionTool } from './vision-tools.js';
 
+// Active artifact cache — load a file once, query repeatedly without task-bridge round-trips.
+export { setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool, clearActiveArtifact } from './artifact-cache-tools.js';
+import { setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool } from './artifact-cache-tools.js';
+
 // --- File-open tool (moved out of recording-tools — generic file open, optionally fullscreen) ---
 
 export const openFileTool: ToolDefinition = {
@@ -31,7 +49,7 @@ export const openFileTool: ToolDefinition = {
 		'If the user says "open the log" or similar, ASK which log they mean (voice-agent, discord-bridge, etc.) — do NOT guess. ' +
 		'Known files: "diagnostic tracker" or "diagnostics" = /tmp/phone-diagnostics-tracker.html, ' +
 		'"voice diagnostics" = /tmp/voice-diagnostics-tracker.html, ' +
-		'"voice context" / "the voice context file" / "the active context" = $SUTANDO_PRIVATE_DIR/voice-contexts/<active>.txt where <active> is the trimmed contents of $SUTANDO_PRIVATE_DIR/voice-contexts/active. Pass it with the env-var expanded by you, or as $SUTANDO_PRIVATE_DIR/voice-contexts/<active>.txt — both work. ' +
+		'"voice context" / "the voice context file" / "the active context" = $SUTANDO_MEMORY_DIR/voice-contexts/<active>.txt where <active> is the trimmed contents of $SUTANDO_MEMORY_DIR/voice-contexts/active (legacy users may have $SUTANDO_PRIVATE_DIR set instead — either expands). Pass it with the env-var expanded by you, or as $SUTANDO_MEMORY_DIR/voice-contexts/<active>.txt — both work. ' +
 		'Pass `app` when the user names a specific app ("open with Sublime Text", "open the SQLite db in TablePlus") OR when recent conversation makes the intended app clear (e.g. user just said "I\'ll review this in VS Code"). Without `app`, macOS uses its default handler for that file type — leave unset when the default is fine. ' +
 		'Pass `fullscreen=true` if the user wants the file opened in fullscreen — works generically for any file type via Cmd+Ctrl+F to whichever app the OS routed the file to (QuickTime → Present mode, Preview → fullscreen PDF, Chrome → fullscreen page, etc.).',
 	parameters: z.object({
@@ -46,7 +64,7 @@ export const openFileTool: ToolDefinition = {
 		try {
 			if (!path) return { error: 'No path provided. Pass an absolute file path. (For the most recent recording, call play_video — it auto-finds the file.)' };
 			// Expand $VAR / ${VAR} env-var references and ~ in the path so Sutando
-			// can pass paths like "$SUTANDO_PRIVATE_DIR/voice-contexts/X.txt"
+			// can pass paths like "$SUTANDO_MEMORY_DIR/voice-contexts/X.txt"
 			// without us hardcoding a fallback root. Track any unset variables so
 			// we can surface them as a clear diagnostic rather than letting the
 			// silently-empty substitution flow through to a generic "file not
@@ -125,9 +143,12 @@ export const openFileTool: ToolDefinition = {
 	},
 };
 
-// Re-export meeting tools from meeting-tools
-export { summonTool, dismissTool, joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool } from './meeting-tools.js';
-import { summonTool, dismissTool, joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool } from './meeting-tools.js';
+// Re-export Zoom tools from skill
+export { summonTool, dismissTool, joinZoomTool } from '../skills/zoom/tools.js';
+import { summonTool, dismissTool, joinZoomTool } from '../skills/zoom/tools.js';
+// Re-export remaining meeting tools
+export { joinGmeetTool, lookupMeetingIdTool, callContactTool } from './meeting-tools.js';
+import { joinGmeetTool, lookupMeetingIdTool, callContactTool } from './meeting-tools.js';
 
 // --- Keyboard tool ---
 
@@ -464,8 +485,8 @@ export const cancelTaskTool: ToolDefinition = {
 	async execute(args) {
 		const { taskId, query, list } = (args ?? {}) as { taskId?: string; query?: string; list?: boolean };
 		try {
-			const tasksDir = join(process.cwd(), 'tasks');
-			const resultsDir = join(process.cwd(), 'results');
+			const tasksDir = join(WORKSPACE_DIR, 'tasks');
+			const resultsDir = join(WORKSPACE_DIR, 'results');
 			const files = readdirSync(tasksDir).filter(f => f.endsWith('.txt')).sort();
 
 			// list mode: return id + preview, no cancel
@@ -605,8 +626,12 @@ export const getCoreStatusTool: ToolDefinition = {
 	execution: 'inline',
 	async execute() {
 		try {
-			const repoDir = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
-			const statusPath = join(repoDir, 'core-status.json');
+			// core-status.json is per-user runtime state at $SUTANDO_WORKSPACE
+			// (default ~/.sutando/workspace/). Pre-fix this read from REPO_ROOT
+			// via import.meta.url-relative path — but Python writers migrated
+			// to WORKSPACE_DIR in #836, so the TS reader silently saw stale or
+			// missing data. Same workspace-contract fix as #821/#842/#843.
+			const statusPath = join(WORKSPACE_DIR, 'core-status.json');
 			if (!existsSync(statusPath)) {
 				return { status: 'idle', description: 'Core agent is not currently running.' };
 			}
@@ -753,11 +778,12 @@ export const createChatTaskTool: ToolDefinition = {
 
 /** All inline tools — import and spread into your tools list */
 // ─── Notes tools ─────────────────────────────────────────
-// Resolve at module-init: $SUTANDO_PRIVATE_DIR/notes (canonical) when set,
-// else cwd/notes (legacy fallback). Notes are SHARED across the fleet so
-// they live at the top-level private dir, not under machine-<host>/.
-import { sharedPersonalPath } from './util_paths.js';
-const NOTES_DIR = sharedPersonalPath('notes', process.cwd());
+// Resolve at module-init: $SUTANDO_MEMORY_DIR/notes (canonical) when set
+// (legacy $SUTANDO_PRIVATE_DIR honored via sharedPersonalPath()), else
+// <workspace>/notes fallback. Notes are SHARED across the fleet so they live
+// at the top-level memory dir, not under machine-<host>/.
+import { sharedPersonalPath, memoryDirEnv } from './util_paths.js';
+const NOTES_DIR = sharedPersonalPath('notes', WORKSPACE_DIR);
 
 export const showViewTool: ToolDefinition = {
 	name: 'show_view',
@@ -768,7 +794,7 @@ export const showViewTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { view } = args as { view: string };
-		const dcPath = join(process.cwd(), 'dynamic-content.json');
+		const dcPath = join(WORKSPACE_DIR, 'dynamic-content.json');
 		writeFileSync(dcPath, JSON.stringify({ type: 'view', view }));
 		// Auto-clear after 3 seconds so it doesn't persist
 		setTimeout(() => { try { unlinkSync(dcPath); } catch {} }, 3000);
@@ -866,7 +892,7 @@ export const deleteNoteTool: ToolDefinition = {
 // is the READ path that voice-agent's Gemini can call when it senses confusion
 // ("what was the post we picked?" / "what's pending?").
 
-const VOICE_SESSION_CONTEXT_PATH = join(process.cwd(), 'state', 'voice-session-context.json');
+const VOICE_SESSION_CONTEXT_PATH = join(WORKSPACE_DIR, 'state', 'voice-session-context.json');
 
 export const recentContextTool: ToolDefinition = {
 	name: 'recent_context',
@@ -936,14 +962,15 @@ function assertUniqueToolNames(tools: ToolDefinition[]): ToolDefinition[] {
 // access_tier values: "owner" (default if omitted) | "any_caller".
 async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyCaller: ToolDefinition[] }> {
 	// Scan the public-repo `skills/` dir AND the optional private skills dir
-	// pointed to by `$SUTANDO_PRIVATE_DIR/skills/` (e.g.
-	// `~/.sutando-memory-sync/skills/`). The private dir lets users keep
-	// personal tooling with real per-file git history outside the public repo.
-	// Order: public first, then private — same-name skills loaded from
-	// private take precedence (last one wins via the dup-name guard below if
-	// any; in practice they should be uniquely named).
-	const dirsToScan: string[] = [join(process.cwd(), 'skills')];
-	const privateRoot = process.env.SUTANDO_PRIVATE_DIR;
+	// pointed to by `$SUTANDO_MEMORY_DIR/skills/` (legacy `$SUTANDO_PRIVATE_DIR`
+	// honored via memoryDirEnv(); e.g. `~/.sutando/memory-sync/skills/`). The
+	// private dir lets users keep personal tooling with real per-file git
+	// history outside the public repo. Order: public first, then private —
+	// same-name skills loaded from private take precedence (last one wins via
+	// the dup-name guard below if any; in practice they should be uniquely
+	// named).
+	const dirsToScan: string[] = [join(REPO_ROOT, 'skills')];
+	const privateRoot = memoryDirEnv();
 	if (privateRoot) {
 		const expanded = privateRoot.replace(/^~/, process.env.HOME || '');
 		dirsToScan.push(join(expanded, 'skills'));
@@ -1006,8 +1033,8 @@ const personalAllTools = [...personalTools.owner, ...personalTools.anyCaller];
 // a tools.ts. Don't try to align them — they're correctly sync/async for
 // what each one does.
 function loadCoreDocumentedSkills(): { name: string; description: string }[] {
-	const dirsToScan: string[] = [join(process.cwd(), 'skills')];
-	const privateRoot = process.env.SUTANDO_PRIVATE_DIR;
+	const dirsToScan: string[] = [join(REPO_ROOT, 'skills')];
+	const privateRoot = memoryDirEnv();
 	if (privateRoot) {
 		const expanded = privateRoot.replace(/^~/, process.env.HOME || '');
 		dirsToScan.push(join(expanded, 'skills'));
@@ -1054,6 +1081,7 @@ export const inlineTools = assertUniqueToolNames([
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
 	recentContextTool,
 	sendVisionFrameTool, startVisionTool, stopVisionTool,
+	setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool,
 	...personalAllTools ]);
 
 /** Tools available to any caller (including unverified) */
@@ -1074,6 +1102,7 @@ export const ownerOnlyTools = [
 	recentContextTool,
 	describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool,
 	sendVisionFrameTool, startVisionTool, stopVisionTool,
+	setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool,
 	...personalTools.owner,
 ];
 

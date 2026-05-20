@@ -14,21 +14,20 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readTmuxStatus } from './tmux-status.js';
 import { CHAT_HTML } from './chat-ui.js';
+import { resolveWorkspace } from './workspace_default.js';
 
 const HTTP_PORT = Number(process.env.CLIENT_PORT) || 8080;
 const HTTP_HOST = process.env.CLIENT_HOST || '0.0.0.0'; // '0.0.0.0' binds to all interfaces for EC2
 const WS_PORT = Number(process.env.PORT) || 9900;
 const DEFAULT_WS_URL = `ws://localhost:${WS_PORT}`;
 
-// Workspace-relative paths must be resolved against an absolute REPO_DIR (not
-// process.cwd()) so the client works when launched from a bundle/launchd/symlink
-// install where CWD isn't the workspace root. Matches task-bridge.ts (issue #713).
-const REPO_DIR = (process.env.SUTANDO_WORKSPACE && existsSync(process.env.SUTANDO_WORKSPACE))
-    ? process.env.SUTANDO_WORKSPACE
-    : resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const TASK_DIR = join(REPO_DIR, 'tasks');
-const STATE_DIR = join(REPO_DIR, 'state');
-const SUBSCRIPTIONS_PATH = join(REPO_DIR, 'skills/subscription-scanner/state/subscriptions.json');
+// Workspace-relative paths use resolveWorkspace() (closes #763). Skills paths
+// (non-runtime, code-adjacent) remain anchored to the repo root.
+const WORKSPACE_DIR = resolveWorkspace();
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const TASK_DIR = join(WORKSPACE_DIR, 'tasks');
+const STATE_DIR = join(WORKSPACE_DIR, 'state');
+const SUBSCRIPTIONS_PATH = join(REPO_ROOT, 'skills/subscription-scanner/state/subscriptions.json');
 
 const HTML = /* html */ `<!DOCTYPE html>
 <html lang="en">
@@ -382,9 +381,10 @@ const HTML = /* html */ `<!DOCTYPE html>
   #core-status-bar:empty { display: none; }
   #core-status-bar .core-running { color: #4ecca3; }
   #core-status-bar .core-idle { color: #444; }
-  /* Presenter-mode badge — only visible when the iclr-highlight skill
-     server at localhost:7877 reports /presenter active:true. Mirrors the
-     Swift menu-bar HUD's eventual "presenting" state on the web side. */
+  /* Presenter-mode badge — only visible when the /presenter same-origin
+     endpoint reports active:true. The endpoint reads state/presenter-mode.sentinel
+     (written by scripts/presenter-mode.sh). Mirrors the Swift menu-bar HUD's
+     eventual "presenting" state on the web side. */
   #presenter-badge {
     display: none; margin-left: 14px; padding: 4px 10px; border-radius: 12px;
     background: linear-gradient(135deg, #6a1b9a, #4527a0); color: #fff;
@@ -535,6 +535,20 @@ const HTML = /* html */ `<!DOCTYPE html>
   /* When voice is active, hide hero */
   body.voice-active .hero { display: none; }
   body.voice-active .main { display: flex; }
+  /* Capabilities panel — shown on idle, hidden when voice is active */
+  .caps-panel {
+    max-width: 480px; margin: 0 auto 20px; padding: 12px 18px;
+    border: 1px solid #252540; border-radius: 8px;
+    background: rgba(26,26,60,0.4);
+  }
+  body.voice-active .caps-panel { display: none; }
+  .caps-panel .caps-heading {
+    font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase;
+    color: #444; margin-bottom: 8px;
+  }
+  .caps-panel dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; }
+  .caps-panel dt { color: #6af; font-size: 12px; white-space: nowrap; padding: 2px 0; }
+  .caps-panel dd { color: #555; font-size: 12px; margin: 0; padding: 2px 0; }
   /* Toast notifications */
   .toast-container {
     position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%);
@@ -712,6 +726,18 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
   <h2 id="hero-name">Sutando</h2>
   <p class="tagline">My AI Stand · Summon my AI superpower</p>
   <button class="btn-hero" onclick="toggle()">Start Voice</button>
+</div>
+
+<div class="caps-panel">
+  <p class="caps-heading">What I can do</p>
+  <dl>
+    <dt>Voice + screen</dt><dd>control any Mac app by voice; read what's on screen</dd>
+    <dt>Comms</dt><dd>phone, iMessage, Telegram, Discord</dd>
+    <dt>Calendar + email</dt><dd>Gmail / Google Calendar; draft replies; book meetings</dd>
+    <dt>Autonomous work</dt><dd>ships code, summarizes news, runs benchmarks</dd>
+    <dt>Fleet</dt><dd>coordinates with other Sutandos under access tiers</dd>
+    <dt>Skills</dt><dd><code style="color:#8af;font-size:11px">/list-skills</code> to see all installed</dd>
+  </dl>
 </div>
 
 <div id="status-bar" style="text-align:center;font-size:16px;color:#888;letter-spacing:0.3px;padding:12px 16px">
@@ -2968,15 +2994,14 @@ document.addEventListener('keydown', function(e) {
   }, 3000);
 })();
 
-// Presenter-mode badge poll — hits a skill-server endpoint that reports
-// presenter state. Default URL is the iclr-highlight skill's
-// :7877/presenter; override via window._PRESENTER_URL at render time
-// so the badge stays generic and a different skill (or different port)
-// can drive it without editing this file. Silent-fail when unreachable
-// (off-stage / skill not loaded) — badge stays hidden.
+// Presenter-mode badge poll — hits the same-origin /presenter endpoint
+// that reads state/presenter-mode.sentinel. Override via
+// window._PRESENTER_URL at render time so a different skill (or different
+// port) can drive it without editing this file. Silent-fail when
+// unreachable — badge stays hidden.
 (function() {
   var presenterUrl = (typeof window !== 'undefined' && window._PRESENTER_URL)
-    || 'http://localhost:7877/presenter';
+    || '/presenter';
   // Shared presenter-active cache so the composite mode badge can compose
   // its label without a second fetch race.
   var lastPresenterActive = false;
@@ -3079,13 +3104,18 @@ let _seeingUntil = 0;
 const CORE_STATUS_STALE_SECONDS = 60;
 function readCoreStatus(): { running: boolean; step: string; stale: boolean } {
 	try {
-		const url = new URL('../core-status.json', import.meta.url);
-		const raw = readFileSync(url, 'utf-8');
+		// core-status.json is per-user runtime state at $SUTANDO_WORKSPACE
+		// (default ~/.sutando/workspace/). Pre-fix this read from REPO_ROOT via
+		// import.meta.url-relative `../core-status.json` — but Python writers
+		// migrated to WORKSPACE_DIR in #836, so the TS reader silently saw stale
+		// or missing data. Same workspace-contract fix as #821/#842/#843.
+		const statusPath = join(WORKSPACE_DIR, 'core-status.json');
+		const raw = readFileSync(statusPath, 'utf-8');
 		const s = JSON.parse(raw) as { status?: string; ts?: number; step?: string };
 		const nowSec = Date.now() / 1000;
 		let stale = false;
 		try {
-			const mtimeSec = statSync(url).mtimeMs / 1000;
+			const mtimeSec = statSync(statusPath).mtimeMs / 1000;
 			if (nowSec - mtimeSec > CORE_STATUS_STALE_SECONDS) stale = true;
 		} catch { stale = true; }
 		// "Running with old ts" → loop likely crashed mid-pass, treat as stale.
@@ -3104,8 +3134,15 @@ function coreIsRunning(): boolean { return readCoreStatus().running; }
 const VOICE_STATE_STALE_SECONDS = 120;
 function readVoiceState(): boolean | null {
 	try {
-		const url = new URL('../voice-state.json', import.meta.url);
-		const raw = readFileSync(url, 'utf-8');
+		// voice-state.json is per-user runtime state — lives under
+		// $SUTANDO_WORKSPACE. Pre-fix this read from REPO_ROOT via the
+		// import.meta.url-relative path — but voice-agent's writer also
+		// resolved relative to its cwd (= REPO_ROOT when launched from
+		// there), so both sides happened to align on the same install.
+		// On SUTANDO_WORKSPACE-set hosts (or cwd-drift), the two split.
+		// Same workspace-contract fix as #849 for core-status.json.
+		const statusPath = join(WORKSPACE_DIR, 'voice-state.json');
+		const raw = readFileSync(statusPath, 'utf-8');
 		const s = JSON.parse(raw) as { connected?: boolean; ts?: number };
 		const nowSec = Date.now() / 1000;
 		if (typeof s.ts === 'number' && nowSec - s.ts > VOICE_STATE_STALE_SECONDS && s.connected) {
@@ -3533,6 +3570,25 @@ const server = createServer((req, res) => {
 		} catch {}
 		res.writeHead(200, { 'Content-Type': 'application/json' });
 		res.end(JSON.stringify({ mode }));
+		return;
+	}
+
+	// Presenter-mode sentinel (state/presenter-mode.sentinel written by
+	// scripts/presenter-mode.sh). Replaces the old localhost:7877 poll that
+	// required the iclr-highlight skill server. Uses the same malformed-
+	// sentinel guard as check-pending-questions.py / discord-bridge.py /
+	// telegram-bridge.py: first char must be a digit → fail CLOSED on garbage.
+	if (url.pathname === '/presenter') {
+		let active = false;
+		try {
+			const raw = readFileSync(join(STATE_DIR, 'presenter-mode.sentinel'), 'utf-8').trim();
+			if (raw && raw[0] >= '0' && raw[0] <= '9') {
+				const nowISO = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+				active = nowISO < raw;
+			}
+		} catch {}
+		res.writeHead(200, { 'Content-Type': 'application/json' });
+		res.end(JSON.stringify({ active }));
 		return;
 	}
 

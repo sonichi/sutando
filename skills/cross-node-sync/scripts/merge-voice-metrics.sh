@@ -1,32 +1,35 @@
 #!/usr/bin/env bash
-# merge-voice-metrics.sh — merge two data/*.jsonl files by timestamp
-# ascending, de-duplicating on a schema-aware identity key. Writes result
-# atomically back to the local file.
+# merge-voice-metrics.sh — generic jsonl union-merger keyed on
+# (id-like-field, timestamp). Writes result atomically back to the local file.
+#
+# Historical note: named "voice-metrics" because that was the original
+# use case, but the implementation is and always was generic. As of
+# #603 (sqlite migration), voice-metrics.jsonl + call-metrics.jsonl are
+# frozen archives — new session rollups live in data/conversation.sqlite.
+# This script remains in use for subtitle-metrics.jsonl + any future
+# per-line jsonl files cross-node-sync drops into the same pipeline.
 #
 # Works for any per-entry jsonl where each line has:
 #   - a "timestamp" field (ISO 8601), AND
-#   - one of: "callSid" (call-metrics), "sessionId" (voice-metrics),
-#     "id" / "uuid" (generic). Falls back to timestamp-only dedup if
-#     none are present.
-#
-# Covers today's data/ contents: voice-metrics.jsonl, call-metrics.jsonl,
-# subtitle-metrics.jsonl — and any new .jsonl the cross-node-sync drops
-# into the same pipeline.
+#   - one of: "callSid", "sessionId", "id", "uuid" (any id-like field).
+#     Falls back to timestamp-only dedup if none are present.
 #
 # Invoked from cross-node-sync after rsync has staged the peer's copy.
 # Safe to run standalone.
 #
 # Usage:
-#   bash merge-voice-metrics.sh                      # default paths (voice-metrics)
-#   bash merge-voice-metrics.sh LOCAL PEER           # explicit file paths
+#   bash merge-voice-metrics.sh LOCAL PEER           # explicit file paths required
 #
 # Per owner's 2026-04-17 direction: "merge in ascending order of time".
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
-LOCAL="${1:-$REPO_ROOT/data/voice-metrics.jsonl}"
-PEER="${2:-$REPO_ROOT/data/voice-metrics.peer.jsonl}"
+if [ "$#" -lt 2 ]; then
+    echo "usage: $0 LOCAL_JSONL PEER_JSONL" >&2
+    exit 2
+fi
+LOCAL="$1"
+PEER="$2"
 
 [ -f "$LOCAL" ] || { mkdir -p "$(dirname "$LOCAL")"; : > "$LOCAL"; }
 [ -f "$PEER" ]  || { echo "merge-voice-metrics: no peer file at $PEER (nothing to merge)"; exit 0; }

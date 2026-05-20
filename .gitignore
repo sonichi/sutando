@@ -43,6 +43,8 @@ tests/*
 !tests/*.test.ts
 !tests/*.test.py
 !tests/*.test.sh
+!tests/_helpers/
+!tests/_helpers/*.ts
 skills/personal-*/
 tests/security/*.md
 !tests/security/*.md.example
