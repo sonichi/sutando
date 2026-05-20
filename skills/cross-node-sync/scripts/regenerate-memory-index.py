@@ -101,10 +101,35 @@ def main() -> int:
     body = render(entries)
     target = memdir / "MEMORY.md"
 
+    # Guard: refuse to clobber an existing non-trivial MEMORY.md when the
+    # frontmatter scan finds 0 entries. This happens when the sync-repo has
+    # not been rsynced yet (SUTANDO_SYNC_PEER unset) or when all memory
+    # entries are still inline (no per-file frontmatter). Without this guard
+    # the cron (every 7 min) silently overwrites accumulated inline entries
+    # with a bare header. See issue #787.
+    #
+    # In --dry-run mode the guard emits the warning but continues so the
+    # operator can still see what would be written (dry-run is read-only
+    # so there is no risk of clobbering). Per qingyun-wu's review on #806.
+    clobber_guard = False
+    if len(entries) == 0 and target.exists():
+        existing = target.read_text().strip()
+        # "non-trivial" = more than just a heading or whitespace
+        # (list items, paragraphs, fenced code, etc. all count)
+        content_lines = [l for l in existing.splitlines() if l.strip() and not l.strip().startswith("#")]
+        if content_lines:
+            print(f"warning: 0 frontmatter entries but MEMORY.md has {len(content_lines)} content lines — refusing to clobber. "
+                  f"Add per-file frontmatter to memory entries, or set SUTANDO_SYNC_PEER to fetch the synced memory dir.",
+                  file=sys.stderr)
+            clobber_guard = True
+
     if args.dry_run:
         print(f"would write {len(entries)} entries to {target}")
         print(body[:400])
-        return 0
+        return 1 if clobber_guard else 0
+
+    if clobber_guard:
+        return 1
 
     target.write_text(body)
     print(f"wrote {len(entries)} entries to {target}")

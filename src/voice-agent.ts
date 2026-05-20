@@ -38,6 +38,7 @@ import { VoiceSession } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
 import { workTool, startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
+import { recordSession } from './conversation-store.js';
 import { buildSutandoSystemPrompt, buildVoiceAgentContext } from './voice-context.js';
 import { classifyTransportClose, type ClassifiedClose } from './voice-error-classifier.js';
 
@@ -879,18 +880,16 @@ async function main() {
 		if (metricsWritten) return;
 		metricsWritten = true;
 		try {
-			const metrics = {
-				timestamp: new Date().toISOString(),
-				sessionId: SESSION_ID,
+			recordSession({
 				source: 'voice',
+				sessionId: SESSION_ID,
 				durationMs: Date.now() - voiceSessionStart,
 				transcriptLines: voiceTranscript.length,
-				toolCalls: voiceToolCalls,
 				toolCount: voiceToolCalls.length,
+				toolCalls: voiceToolCalls,
 				events: voiceEvents,
-			};
-			appendFileSync('data/voice-metrics.jsonl', JSON.stringify(metrics) + '\n');
-			console.log(`${ts()} [Observability] Wrote voice metrics: ${voiceToolCalls.length} tools, ${voiceEvents.length} events, ${voiceTranscript.length} transcript lines`);
+			});
+			console.log(`${ts()} [Observability] Recorded voice session: ${voiceToolCalls.length} tools, ${voiceEvents.length} events, ${voiceTranscript.length} transcript lines (sqlite, #603)`);
 		} catch (err) {
 			console.log(`${ts()} [Observability] Failed to write metrics: ${err}`);
 		}
@@ -1192,7 +1191,7 @@ async function main() {
 		for (const item of items.slice(lastLoggedIndex)) {
 			if (item.role === 'user' || item.role === 'assistant') {
 				console.log(`${ts()}   [${item.role}] ${item.content}`);
-				logConversation(item.role, item.content);
+				logConversation(item.role, item.content, SESSION_ID);
 				const evtRole = item.role === 'user' ? 'user' : 'sutando';
 				// 7s offset for user speech: Gemini STT commits transcript ~7s after
 				// the user actually spoke (measured via iPad recording comparison).
