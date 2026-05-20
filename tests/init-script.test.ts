@@ -10,9 +10,10 @@ import { fileURLToPath } from 'node:url';
  * Tests for src/init.sh — the auto-bootstrap + preflight script.
  *
  * Each test runs the actual shell script against a fresh tmpdir treated
- * as a synthetic Sutando repo (we point the script at it via SUTANDO_REPO).
- * That gives us real coverage without trampling the developer's actual
- * repo state.
+ * as a synthetic Sutando repo (pointed at via SUTANDO_REPO). Runtime state
+ * (logs, state, tasks, results, placeholder files, …) lives under the
+ * workspace, not the repo, since #913 — so each run also gets a dedicated
+ * SUTANDO_WORKSPACE dir, and Tier-1 assertions check there.
  */
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -24,16 +25,23 @@ function runInit(repoDir: string, mode?: '--auto' | '--preflight'): RunResult {
 	const args = ['bash', INIT_SH];
 	if (mode) args.push(mode);
 	const proc = spawnSync(args[0]!, args.slice(1), {
-		env: { ...process.env, SUTANDO_REPO: repoDir, HOME: repoDir + '/.fake-home' },
+		env: {
+			...process.env,
+			SUTANDO_REPO: repoDir,
+			SUTANDO_WORKSPACE: join(repoDir, '.workspace'),
+			HOME: repoDir + '/.fake-home',
+		},
 		encoding: 'utf-8',
 	});
 	return { stdout: proc.stdout, stderr: proc.stderr, status: proc.status };
 }
 
 let scratch: string;
+let workspace: string;
 
 beforeEach(() => {
 	scratch = mkdtempSync(join(tmpdir(), 'sutando-init-'));
+	workspace = join(scratch, '.workspace');
 });
 
 afterEach(() => {
@@ -45,16 +53,16 @@ describe('init.sh --auto (Tier 1: directories)', () => {
 		const out = runInit(scratch, '--auto');
 		assert.equal(out.status, 0, `script exit non-zero: stderr=${out.stderr}`);
 		for (const d of ['logs', 'state', 'tasks', 'results', 'results/archive', 'results/calls', 'notes', 'data']) {
-			assert.equal(existsSync(join(scratch, d)), true, `expected directory ${d}`);
+			assert.equal(existsSync(join(workspace, d)), true, `expected directory ${d}`);
 		}
 	});
 
 	it('is idempotent — second invocation does not error or recreate', () => {
 		runInit(scratch, '--auto');
-		const before = statSync(join(scratch, 'logs')).birthtimeMs;
+		const before = statSync(join(workspace, 'logs')).birthtimeMs;
 		const second = runInit(scratch, '--auto');
 		assert.equal(second.status, 0);
-		const after = statSync(join(scratch, 'logs')).birthtimeMs;
+		const after = statSync(join(workspace, 'logs')).birthtimeMs;
 		assert.equal(before, after, 'logs/ should not be recreated on second run');
 	});
 });
@@ -74,14 +82,14 @@ describe('init.sh --auto (Tier 1: placeholder files)', () => {
 
 	it('creates pending-questions.md with an empty placeholder', () => {
 		runInit(scratch, '--auto');
-		const body = readFileSync(join(scratch, 'pending-questions.md'), 'utf-8');
+		const body = readFileSync(join(workspace, 'pending-questions.md'), 'utf-8');
 		assert.match(body, /^# Pending Questions/);
 		assert.match(body, /none open/);
 	});
 
 	it('creates contextual-chips.json with a parseable shape', () => {
 		runInit(scratch, '--auto');
-		const body = readFileSync(join(scratch, 'contextual-chips.json'), 'utf-8');
+		const body = readFileSync(join(workspace, 'contextual-chips.json'), 'utf-8');
 		const parsed = JSON.parse(body);
 		assert.equal(Array.isArray(parsed.chips), true);
 		assert.equal(typeof parsed.ts, 'number');
@@ -89,22 +97,23 @@ describe('init.sh --auto (Tier 1: placeholder files)', () => {
 
 	it('creates core-status.json initialised to idle', () => {
 		runInit(scratch, '--auto');
-		const body = readFileSync(join(scratch, 'core-status.json'), 'utf-8');
+		const body = readFileSync(join(workspace, 'core-status.json'), 'utf-8');
 		const parsed = JSON.parse(body);
 		assert.equal(parsed.status, 'idle');
 	});
 
 	it('creates voice-state.json initialised to disconnected', () => {
 		runInit(scratch, '--auto');
-		const body = readFileSync(join(scratch, 'voice-state.json'), 'utf-8');
+		const body = readFileSync(join(workspace, 'voice-state.json'), 'utf-8');
 		const parsed = JSON.parse(body);
 		assert.equal(parsed.connected, false);
 	});
 
 	it('does NOT clobber an existing contextual-chips.json', () => {
-		writeFileSync(join(scratch, 'contextual-chips.json'), '{"chips":[{"label":"x","desc":"y"}],"ts":1}');
+		mkdirSync(workspace, { recursive: true });
+		writeFileSync(join(workspace, 'contextual-chips.json'), '{"chips":[{"label":"x","desc":"y"}],"ts":1}');
 		runInit(scratch, '--auto');
-		const body = readFileSync(join(scratch, 'contextual-chips.json'), 'utf-8');
+		const body = readFileSync(join(workspace, 'contextual-chips.json'), 'utf-8');
 		assert.match(body, /"label":"x"/);
 	});
 });
@@ -190,7 +199,7 @@ describe('init.sh argument parsing', () => {
 	it('runs both tiers by default (no flag)', () => {
 		const out = runInit(scratch);
 		assert.equal(out.status, 0);
-		assert.equal(existsSync(join(scratch, 'logs')), true, 'Tier 1 should have created logs/');
+		assert.equal(existsSync(join(workspace, 'logs')), true, 'Tier 1 should have created logs/');
 		assert.match(out.stdout, /\[Preflight\]/, 'Tier 2 should have emitted summary line');
 	});
 });
