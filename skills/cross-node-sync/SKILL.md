@@ -59,15 +59,23 @@ export SUTANDO_PEER_NOTES_DIR="/Users/xliu/path/to/sutando/notes/"
 
 Get the peer's values with `ssh $SUTANDO_SYNC_PEER 'echo $HOME; ls -d ~/.claude/projects/-*sutando*'`.
 
-**Cron wiring (first install):** the `cross-node-sync` entry already lives in `skills/schedule-crons/crons.example.json`, so the usual first-time `cp skills/schedule-crons/crons.example.json skills/schedule-crons/crons.json` wires the 7-minute sync into the proactive-loop crons with no manual JSON editing. (7 min chosen to avoid `:00/:30` collision with other crons.)
+**Cron wiring (explicit opt-in):** as of #936, the `cross-node-sync` entry is **no longer** in `skills/schedule-crons/crons.example.json` — the default `cp ... crons.json` doesn't wire it. Cross-node-sync requires `SUTANDO_SYNC_PEER` + SSH peer auth + the per-file-frontmatter memory model, none of which apply to a single-host setup, so it's opt-in.
 
-**Cron wiring (upgrading an existing install):** if you cloned Sutando before this skill was added (or have a live `crons.json` that predates the example), the entry will be **missing** from your live file. Check with:
+If you want the 7-minute sync, add this block to your live `skills/schedule-crons/crons.json` (inside the top-level array):
 
-```bash
-jq '.jobs[].name' skills/schedule-crons/crons.json | grep cross-node-sync || echo "MISSING — add manually"
+```json
+{
+  "name": "cross-node-sync",
+  "cron": "*/7 * * * *",
+  "prompt": "Run bash skills/cross-node-sync/scripts/setup-rsync-sync.sh to sync memory/ + notes/ with the peer node (requires SUTANDO_SYNC_PEER in .env). Then regenerate MEMORY.md from frontmatter."
+}
 ```
 
-To add, copy the `cross-node-sync` block from `crons.example.json` into your `crons.json`'s `jobs` array. `feedback_sync_crons_json.md` in memory reminds to always mirror cron config changes between the two files so future re-copies work.
+(7 min chosen to avoid `:00/:30` collision with other crons.) Verify with:
+
+```bash
+jq '.[].name' skills/schedule-crons/crons.json | grep cross-node-sync || echo "MISSING — add manually"
+```
 
 **Manual sync (optional):**
 ```bash
