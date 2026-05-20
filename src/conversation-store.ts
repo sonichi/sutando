@@ -46,7 +46,14 @@ function init(): void {
 		db.exec('PRAGMA journal_mode = WAL');
 		db.exec('PRAGMA busy_timeout = 1000');
 		db.exec(`
+			-- id: monotonic insertion-order key — the canonical conversational
+			-- sequence. Replay a conversation by ORDER BY id, never by ts_unix
+			-- alone: agent rows are stamped with a calibrated heard-offset
+			-- (audio-out time + offset), so ts_unix can disagree with the true
+			-- turn order and a pure ts_unix sort scrambles an exchange. ts_unix
+			-- stays for time-range filters ("what did we say around 9pm").
 			CREATE TABLE IF NOT EXISTS conversation (
+				id         INTEGER PRIMARY KEY,
 				ts_unix    REAL NOT NULL,
 				role       TEXT NOT NULL,
 				text       TEXT NOT NULL,

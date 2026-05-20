@@ -65,6 +65,6 @@ SELECT datetime(ts_unix, 'unixepoch', 'localtime') AS ts,
        substr(text, 1, 200) AS text_preview
 FROM conversation
 $where_clause
-ORDER BY ts_unix DESC
+ORDER BY rowid DESC
 LIMIT $limit;
 "
