@@ -465,8 +465,17 @@ def main():
         # Check for proactive messages to send to owner.
         # Presenter-mode: retain files (don't unlink, don't send) so they
         # flush after the talk window ends. See presenter-mode.sh contract.
+        # Channel routing: skip the proactive scan entirely if telegram
+        # is not the last-active channel. Pre-fix the discord-bridge
+        # and telegram-bridge raced for the SAME proactive-*.txt files
+        # and whichever ran first delivered, producing cross-channel
+        # surprises. See proactive_routing.py for the decision rule.
+        from proactive_routing import should_claim_proactive
         try:
-            if not presenter_mode_active():
+            if (
+                not presenter_mode_active()
+                and should_claim_proactive(OWNER_ACTIVITY_FILE, "telegram")
+            ):
                 for f in RESULTS_DIR.iterdir():
                     if f.name.startswith("proactive-") and f.suffix == ".txt":
                         # Claim-by-rename: atomic move to a `.sending`

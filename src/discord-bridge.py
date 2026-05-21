@@ -2876,6 +2876,21 @@ async def poll_proactive():
                 await asyncio.sleep(3)
                 continue
             _presenter_log_throttle = 0
+            # Channel routing: skip the entire proactive scan if this
+            # bridge is not the last-active channel. The pre-fix race
+            # between discord-bridge and telegram-bridge for the SAME
+            # proactive-*.txt files produced unpredictable cross-channel
+            # delivery — a Discord-context follow-up could land on
+            # Telegram or vice versa. See proactive_routing.py for the
+            # decision rule (last-active channel from
+            # state/last-owner-activity.json; default discord on missing
+            # state).
+            from proactive_routing import should_claim_proactive  # noqa: E402
+            if not should_claim_proactive(
+                STATE_DIR / "last-owner-activity.json", "discord"
+            ):
+                await asyncio.sleep(3)
+                continue
             for f in RESULTS_DIR.iterdir():
                 if f.name.startswith("proactive-") and f.suffix == ".txt":
                     # Claim-by-rename: atomically move the file to a
