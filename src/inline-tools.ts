@@ -166,9 +166,16 @@ export const pressKeyTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { key, modifiers = [], app } = args as { key: string; modifiers?: string[]; app?: string };
-		// Activate target app if specified
+		// Activate target app if specified. Escape `app` before embedding
+		// in the AppleScript string literal — without this, a value like
+		// `"; do shell script "rm -rf ~"; tell application "Finder` would
+		// break out of `tell application "..."` and run arbitrary
+		// AppleScript (and AppleScript can `do shell script`, so this is
+		// arbitrary code execution from a tool-call argument). Same
+		// escape pattern as `safeKey` below and `safeApp` in switchAppTool.
 		if (app) {
-			try { execSync(`osascript -e 'tell application "${app}" to activate'`, { timeout: 3_000 }); await new Promise(r => setTimeout(r, 300)); } catch {}
+			const safeApp = app.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
+			try { execSync(`osascript -e 'tell application "${safeApp}" to activate'`, { timeout: 3_000 }); await new Promise(r => setTimeout(r, 300)); } catch {}
 		}
 		const keyMap: Record<string, number> = {
 			'enter': 36, 'return': 36, 'escape': 53, 'esc': 53, 'tab': 48,
