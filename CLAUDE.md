@@ -65,9 +65,14 @@ If `PERSONAL_CLAUDE.md` exists in the workspace root, read and follow it. It con
 
 ## Work Status
 
-Signal your work status to `state/core-status.json` so the web UI can display it:
-- Start of significant work: `echo '{"status":"running","step":"<description>","ts":<epoch>}' > state/core-status.json`
-- When done: `echo '{"status":"idle","ts":<epoch>}' > state/core-status.json`
+Signal your work status to the workspace `core-status.json` so the web UI and `health-check.py` can display it. Write the **absolute** workspace path: the session cwd is the repo, so a bare `state/core-status.json` lands in `<repo>/state/` — where no reader looks. Readers resolve `<workspace>/state/core-status.json` via `status_read_path` (`src/workspace_default.py`).
+
+```bash
+CORE_STATUS="${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}/state/core-status.json"
+echo '{"status":"running","step":"<description>","ts":<epoch>}' > "$CORE_STATUS"   # start of significant work
+echo '{"status":"idle","ts":<epoch>}' > "$CORE_STATUS"                            # when done
+```
+
 This applies to all work — proactive loop passes, voice tasks, user requests, code changes.
 
 ## Chat-path task tracking (issue #585)
