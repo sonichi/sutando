@@ -30,7 +30,7 @@ import { mkdirSync, writeFileSync, appendFileSync, existsSync, readFileSync, unl
 import { join, dirname } from 'node:path';
 import { resolveWorkspace } from '../../../src/workspace_default.js';
 import { recordConversation, recordSession } from '../../../src/conversation-store.js';
-import { type Tier, loadAccessTiers, tierFor, toolAllowed } from './access-tier.js';
+import { type Tier, loadAccessTiers, tierFor, toolAllowed, toolNeed } from './access-tier.js';
 
 _dotenvConfig({ path: new URL('../../../.env', import.meta.url).pathname, override: true });
 _dotenvConfig({ path: join(process.env.HOME ?? '', '.claude/channels/discord/.env'), override: false });
@@ -436,20 +436,17 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 	}
 
 	// Per-speaker tier gate. The Gemini session's tool list is fixed at start,
-	// so enforce the tier at execute() time, keyed off the last speaker:
+	// so enforce the tier at execute() time, keyed off the last speaker.
+	// toolNeed() classifies each tool (see access-tier.ts):
 	//   owner-only — work, screen-share tools, ownerOnlyTools
 	//   owner+team — configurableTools + dismiss (a teammate may end the
 	//                session — owner can rejoin via DM)
 	//   open       — inlineTools + get_task_status (read-only surface)
-	const OWNER_ONLY = new Set<string>([
-		'work', 'share_screen', 'summon', 'stop_share_screen',
-		...ownerOnlyTools.map(t => t.name),
-	]);
-	const OWNER_OR_TEAM = new Set<string>(['dismiss', ...configurableTools.map(t => t.name)]);
+	const ownerOnlyNames = new Set<string>(ownerOnlyTools.map(t => t.name));
+	const teamNames = new Set<string>(configurableTools.map(t => t.name));
 	for (let i = 0; i < tools.length; i++) {
 		const t = tools[i];
-		const need: Tier | null = OWNER_ONLY.has(t.name) ? 'owner'
-			: OWNER_OR_TEAM.has(t.name) ? 'team' : null;
+		const need: Tier | null = toolNeed(t.name, ownerOnlyNames, teamNames);
 		if (!need) continue;
 		const inner = t.execute.bind(t);
 		tools[i] = {

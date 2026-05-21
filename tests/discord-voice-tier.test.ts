@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { tierFor, toolAllowed, type AccessTiers } from '../skills/discord-voice/scripts/access-tier.js';
+import { tierFor, toolAllowed, toolNeed, SKILL_TOOL_TIER, type AccessTiers } from '../skills/discord-voice/scripts/access-tier.js';
 
 // Synthetic ids — the logic doesn't care about the id shape.
 const access: AccessTiers = {
@@ -44,5 +44,33 @@ describe('toolAllowed', () => {
 		assert.equal(toolAllowed(null, 'owner'), true);
 		assert.equal(toolAllowed(null, 'team'), true);
 		assert.equal(toolAllowed(null, 'other'), true);
+	});
+});
+
+describe('SKILL_TOOL_TIER — per-tool tiering of skill-local tools', () => {
+	it('dismiss is team-tier (policy: a teammate may end the session)', () => {
+		assert.equal(SKILL_TOOL_TIER.dismiss, 'team');
+	});
+	it('work + screen-share tools are owner-only', () => {
+		assert.equal(SKILL_TOOL_TIER.work, 'owner');
+		assert.equal(SKILL_TOOL_TIER.share_screen, 'owner');
+		assert.equal(SKILL_TOOL_TIER.summon, 'owner');
+		assert.equal(SKILL_TOOL_TIER.stop_share_screen, 'owner');
+	});
+});
+
+describe('toolNeed — full tool classification', () => {
+	const ownerOnly = new Set(['some_owner_only_tool']);
+	const team = new Set(['some_configurable_tool']);
+	it('dismiss → team, work → owner', () => {
+		assert.equal(toolNeed('dismiss', ownerOnly, team), 'team');
+		assert.equal(toolNeed('work', ownerOnly, team), 'owner');
+	});
+	it('registry ownerOnly tool → owner; configurable tool → team', () => {
+		assert.equal(toolNeed('some_owner_only_tool', ownerOnly, team), 'owner');
+		assert.equal(toolNeed('some_configurable_tool', ownerOnly, team), 'team');
+	});
+	it('an unclassified (inline read-only) tool → null (open to all)', () => {
+		assert.equal(toolNeed('get_current_time', ownerOnly, team), null);
 	});
 });

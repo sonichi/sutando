@@ -49,3 +49,30 @@ export function toolAllowed(need: Tier | null, tier: Tier): boolean {
 	if (need === 'owner') return tier === 'owner';
 	return tier !== 'other';
 }
+
+/**
+ * Minimum tier for the skill-local discord-voice tools. Per the access-tier
+ * policy: `dismiss` is team-tier (a teammate may end the voice session);
+ * `work` + the screen-share tools are owner-only. Tools from the core
+ * inline-tools registry are classified separately (see `toolNeed`).
+ */
+export const SKILL_TOOL_TIER: Record<string, Tier> = {
+	work: 'owner',
+	share_screen: 'owner',
+	summon: 'owner',
+	stop_share_screen: 'owner',
+	dismiss: 'team',
+};
+
+/**
+ * Minimum tier a tool requires, or null if open to every tier.
+ *   ownerOnly / team — tool-name sets from the core inline-tools registry
+ *                      (`ownerOnlyTools` / `configurableTools`).
+ * Skill-local discord-voice tools are classified by SKILL_TOOL_TIER.
+ */
+export function toolNeed(name: string, ownerOnly: Set<string>, team: Set<string>): Tier | null {
+	if (name in SKILL_TOOL_TIER) return SKILL_TOOL_TIER[name];
+	if (ownerOnly.has(name)) return 'owner';
+	if (team.has(name)) return 'team';
+	return null;
+}
