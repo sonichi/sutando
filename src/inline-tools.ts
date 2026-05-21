@@ -6,7 +6,7 @@
  */
 
 import { execSync, execFileSync } from 'node:child_process';
-import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync, statSync } from 'node:fs';
+import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync, statSync, mkdirSync } from 'node:fs';
 import { join, extname, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
@@ -838,6 +838,10 @@ export const saveNoteTool: ToolDefinition = {
 		const tagList = tags ? tags.split(',').map(t => t.trim()) : ['personal'];
 		const md = `---\ntitle: ${title}\ndate: ${date}\ntags: [${tagList.join(', ')}]\n---\n\n${content}\n`;
 		try {
+			// NOTES_DIR resolves against the workspace, which may not have a
+			// notes/ subdir yet on a fresh install — create it before writing
+			// so the first save_note never fails with ENOENT.
+			mkdirSync(NOTES_DIR, { recursive: true });
 			writeFileSync(join(NOTES_DIR, `${slug}.md`), md);
 			return { status: 'saved', title, slug, path: `notes/${slug}.md` };
 		} catch (e) { return { error: String(e) }; }
