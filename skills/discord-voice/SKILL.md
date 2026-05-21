@@ -70,7 +70,7 @@ Optional env:
 Owner-tier tools are gated **per speaker**, by Discord user id, not per channel. Each turn is attributed to the speaker who started it, and tools are gated by that speaker's tier — read from the same `~/.claude/channels/discord/access.json` the discord-bridge uses, so the two never drift:
 
 - **owner** — the `owner` field in `access.json` (one id, the instance operator). Full tool surface: `work`, `dismiss`, screen-share, file edits, message sends.
-- **team** — the rest of `allowFrom` (trusted circle: peers, collaborators). Read-only inline tools + configurable tools; no `work` / `dismiss` / file edits.
+- **team** — the rest of `allowFrom` (trusted circle: peers, collaborators). Read-only inline tools + configurable tools + `dismiss`; no `work` / file edits. (`dismiss` is intentional: a teammate can end the bot's voice session — useful when the owner isn't present to close the room; the owner can rejoin via DM.)
 - **other** — anyone else speaking in the channel. Read-only inline tools only (time, status, lookups).
 
 Set it up by adding `"owner": "<your-discord-user-id>"` to `access.json`. If no `owner` is configured, the gate falls back to the legacy process-global `DISCORD_VOICE_OWNER` flag.

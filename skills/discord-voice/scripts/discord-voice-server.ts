@@ -437,14 +437,15 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 
 	// Per-speaker tier gate. The Gemini session's tool list is fixed at start,
 	// so enforce the tier at execute() time, keyed off the last speaker:
-	//   owner-only — work, dismiss, screen-share tools, ownerOnlyTools
-	//   owner+team — configurableTools
+	//   owner-only — work, screen-share tools, ownerOnlyTools
+	//   owner+team — configurableTools + dismiss (a teammate may end the
+	//                session — owner can rejoin via DM)
 	//   open       — inlineTools + get_task_status (read-only surface)
 	const OWNER_ONLY = new Set<string>([
-		'work', 'dismiss', 'share_screen', 'summon', 'stop_share_screen',
+		'work', 'share_screen', 'summon', 'stop_share_screen',
 		...ownerOnlyTools.map(t => t.name),
 	]);
-	const OWNER_OR_TEAM = new Set<string>(configurableTools.map(t => t.name));
+	const OWNER_OR_TEAM = new Set<string>(['dismiss', ...configurableTools.map(t => t.name)]);
 	for (let i = 0; i < tools.length; i++) {
 		const t = tools[i];
 		const need: Tier | null = OWNER_ONLY.has(t.name) ? 'owner'
