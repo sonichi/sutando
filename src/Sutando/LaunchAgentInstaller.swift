@@ -359,9 +359,10 @@ class LaunchAgentInstaller {
         //   - google-genai  → image-generation
         //   - Pillow         → image-generation + make-viral-video
         //   - discord.py     → discord-bridge
+        //   - slack_bolt     → slack-bridge (Socket Mode client)
         // Other skills (telegram-bridge, openai-tts, x-twitter) either use
         // urllib or self-install on demand.
-        let packages = ["google-genai", "Pillow", "discord.py"]
+        let packages = ["google-genai", "Pillow", "discord.py", "slack_bolt"]
         let logDir = (NSHomeDirectory() as NSString)
             .appendingPathComponent(".sutando/workspace/logs")
         try? FileManager.default.createDirectory(atPath: logDir, withIntermediateDirectories: true)

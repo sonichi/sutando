@@ -125,15 +125,24 @@ enum SettingsField: String, CaseIterable {
     }
 }
 
+/// One credential field within a channel. Most channels have a single
+/// token; Slack needs two (a bot `xoxb-` token and an app-level `xapp-`
+/// token), so a channel carries a list of these.
+struct ChannelField {
+    let envKey: String          // e.g. "DISCORD_BOT_TOKEN"
+    let label: String           // e.g. "Bot token"
+    let placeholder: String     // e.g. "xoxb-…"
+}
+
 /// Channel-bot configuration. Each row pairs a desktop launchd service
 /// (com.sutando.<id>-bridge) with a per-channel env file at
 /// ~/.claude/channels/<id>/.env. The launchd plist is PathState-gated
 /// on that file, so the lifecycle is "save token → file appears →
 /// bridge starts" without any extra wiring.
 struct ChannelConfig {
-    let id: String              // "discord" | "telegram"
+    let id: String              // "discord" | "telegram" | "slack"
     let displayName: String
-    let envKey: String          // "DISCORD_BOT_TOKEN" | "TELEGRAM_BOT_TOKEN"
+    let fields: [ChannelField]  // one or more credential fields
     let helpURL: URL?
     let helpText: String
     let launchdLabel: String
@@ -145,7 +154,8 @@ struct ChannelConfig {
     static let discord = ChannelConfig(
         id: "discord",
         displayName: "Discord",
-        envKey: "DISCORD_BOT_TOKEN",
+        fields: [ChannelField(envKey: "DISCORD_BOT_TOKEN", label: "Bot token",
+                               placeholder: "stored at ~/.claude/channels/discord/.env (mode 0600)")],
         helpURL: URL(string: "https://discord.com/developers/applications"),
         helpText: "Create an app in Discord's developer portal, add a bot, copy the token here.",
         launchdLabel: "com.sutando.discord-bridge"
@@ -154,13 +164,26 @@ struct ChannelConfig {
     static let telegram = ChannelConfig(
         id: "telegram",
         displayName: "Telegram",
-        envKey: "TELEGRAM_BOT_TOKEN",
+        fields: [ChannelField(envKey: "TELEGRAM_BOT_TOKEN", label: "Bot token",
+                               placeholder: "stored at ~/.claude/channels/telegram/.env (mode 0600)")],
         helpURL: URL(string: "https://t.me/BotFather"),
         helpText: "Message @BotFather on Telegram → /newbot → copy the HTTP API token here.",
         launchdLabel: "com.sutando.telegram-bridge"
     )
 
-    static let all: [ChannelConfig] = [.discord, .telegram]
+    static let slack = ChannelConfig(
+        id: "slack",
+        displayName: "Slack",
+        fields: [
+            ChannelField(envKey: "SLACK_BOT_TOKEN", label: "Bot token", placeholder: "xoxb-…"),
+            ChannelField(envKey: "SLACK_APP_TOKEN", label: "App-level token", placeholder: "xapp-…"),
+        ],
+        helpURL: URL(string: "https://api.slack.com/apps"),
+        helpText: "Create a Slack app with Socket Mode enabled. Bot token (xoxb-) is on OAuth & Permissions; app-level token (xapp-) is on Basic Information.",
+        launchdLabel: "com.sutando.slack-bridge"
+    )
+
+    static let all: [ChannelConfig] = [.discord, .telegram, .slack]
 }
 
 final class SettingsWindowController: NSWindowController, NSWindowDelegate {
@@ -993,7 +1016,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         labelRow.spacing = 8
         labelRow.alignment = .firstBaseline
 
-        let label = NSTextField(labelWithString: "\(channel.displayName) bot token")
+        let label = NSTextField(labelWithString: channel.displayName)
         label.font = .systemFont(ofSize: 12, weight: .medium)
         labelRow.addArrangedSubview(label)
 
@@ -1018,12 +1041,21 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         }
         row.addArrangedSubview(labelRow)
 
-        let editor = NSSecureTextField()
-        editor.placeholderString = "stored at ~/.claude/channels/\(channel.id)/.env (mode 0600)"
-        editor.translatesAutoresizingMaskIntoConstraints = false
-        editor.widthAnchor.constraint(equalToConstant: 504).isActive = true
-        row.addArrangedSubview(editor)
-        channelEditors[channel.id] = editor
+        // One secure field per credential. Single-token channels (Discord,
+        // Telegram) render one; Slack renders two (bot + app-level token).
+        for field in channel.fields {
+            let fieldLabel = NSTextField(labelWithString: field.label)
+            fieldLabel.font = .systemFont(ofSize: 11)
+            fieldLabel.textColor = .secondaryLabelColor
+            row.addArrangedSubview(fieldLabel)
+
+            let editor = NSSecureTextField()
+            editor.placeholderString = field.placeholder
+            editor.translatesAutoresizingMaskIntoConstraints = false
+            editor.widthAnchor.constraint(equalToConstant: 504).isActive = true
+            row.addArrangedSubview(editor)
+            channelEditors["\(channel.id)/\(field.envKey)"] = editor
+        }
 
         let hint = NSTextField(labelWithString: channel.helpText)
         hint.font = .systemFont(ofSize: 11)
@@ -1777,19 +1809,23 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private func saveChannelTokens() -> [String] {
         var changed: [String] = []
         for channel in ChannelConfig.all {
-            guard let editor = channelEditors[channel.id] else { continue }
-            let newValue = editor.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             var env = EnvFile.at(channel.envPath)
-            let oldValue = env.value(for: channel.envKey) ?? ""
-            if newValue == oldValue { continue }
+            // Collect the trimmed editor value for every field, paired with
+            // the value currently on disk.
+            let entries: [(key: String, newValue: String, oldValue: String)] = channel.fields.map { field in
+                let editor = channelEditors["\(channel.id)/\(field.envKey)"]
+                let newValue = editor?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                return (field.envKey, newValue, env.value(for: field.envKey) ?? "")
+            }
+            if entries.allSatisfy({ $0.newValue == $0.oldValue }) { continue }
 
-            if newValue.isEmpty {
+            if entries.allSatisfy({ $0.newValue.isEmpty }) {
                 // Drop the whole file so launchd's PathState gate stops
                 // the bridge. Leaving an empty KEY= behind would keep the
                 // file present, which would crash-loop the bridge.
                 try? FileManager.default.removeItem(atPath: channel.envPath)
             } else {
-                env.set(channel.envKey, newValue)
+                for entry in entries { env.set(entry.key, entry.newValue) }
                 do {
                     try env.write(to: channel.envPath, mode: 0o600)
                 } catch {
@@ -2044,7 +2080,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private func loadChannelTokensFromDisk() {
         for channel in ChannelConfig.all {
             let env = EnvFile.at(channel.envPath)
-            channelEditors[channel.id]?.stringValue = env.value(for: channel.envKey) ?? ""
+            for field in channel.fields {
+                channelEditors["\(channel.id)/\(field.envKey)"]?.stringValue = env.value(for: field.envKey) ?? ""
+            }
         }
     }
 
