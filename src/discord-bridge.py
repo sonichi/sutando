@@ -269,6 +269,31 @@ def _chunk_for_discord(text: str, max_len: int = 1900):
         yield chunk
 
 
+# Marker regex for inline file references in result bodies. The pattern
+# requires absolute paths (`/...` or `~/...`) — the earlier relative-
+# path-allowing form resolved against the bridge's CWD, which differed
+# between launchd-managed and bare-shell runs. Three call sites in this
+# module (poll_results, poll_proactive, poll_dm_fallback channel-
+# redirect) previously re-defined this regex inline; consolidated here
+# so a future hardening only needs one edit.
+_FILE_MARKER_RE = re.compile(r'\[(?:file|send|attach):\s*((?:/|~/)[^\]:]+)\]')
+
+
+def _split_file_markers(text: str) -> tuple[str, list[str]]:
+    """Split a result body into ``(clean_text, files)``.
+
+    ``files`` is the list of paths extracted from ``[file:|send:|attach:]``
+    markers (in textual order). ``clean_text`` is the original text with
+    every marker removed and surrounding whitespace stripped.
+
+    Pure function — single source of truth for the marker pattern
+    across every send path in this bridge.
+    """
+    files = _FILE_MARKER_RE.findall(text)
+    clean_text = _FILE_MARKER_RE.sub('', text).strip()
+    return clean_text, files
+
+
 def _is_path_sendable(fpath: str) -> bool:
     """True iff `fpath` is a real file AND resolves under an allowed root.
 
@@ -2804,9 +2829,7 @@ async def poll_results():
                                 print(f"  [channel-redirect] failed to resolve channel {target_channel_id}, falling back to task source: {e}", flush=True)
 
                     # Extract file paths: [file: /path] or [send: /path]
-                    file_pattern = re.compile(r'\[(?:file|send|attach):\s*((?:/|~/)[^\]:]+)\]')
-                    files = file_pattern.findall(reply_text)
-                    clean_text = file_pattern.sub('', reply_text).strip()
+                    clean_text, files = _split_file_markers(reply_text)
 
                     # Send text — fence-aware chunker preserves triple-backtick code blocks
                     # First chunk uses message_reference (if set); subsequent chunks
@@ -2948,9 +2971,7 @@ async def poll_proactive():
                         user = await client.fetch_user(int(owner_id))
                         dm = await user.create_dm()
                         # Extract files
-                        file_pattern = re.compile(r'\[(?:file|send|attach):\s*((?:/|~/)[^\]:]+)\]')
-                        files = file_pattern.findall(text)
-                        clean_text = file_pattern.sub('', text).strip()
+                        clean_text, files = _split_file_markers(text)
                         if clean_text:
                             for chunk in _chunk_for_discord(clean_text):
                                 await dm.send(chunk)
@@ -3104,9 +3125,7 @@ async def poll_dm_fallback():
                             print(f"  [dm-fallback channel-redirect] failed to resolve {target_channel_id}: {e}", flush=True)
                         if target_channel:
                             # File markers (parity with poll_results 2761-2784).
-                            file_pattern = re.compile(r'\[(?:file|send|attach):\s*((?:/|~/)[^\]:]+)\]')
-                            file_list = file_pattern.findall(clean_body)
-                            text_only = file_pattern.sub('', clean_body).strip()
+                            text_only, file_list = _split_file_markers(clean_body)
                             if text_only:
                                 for chunk in _chunk_for_discord(text_only):
                                     await target_channel.send(chunk)
