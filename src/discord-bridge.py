@@ -2837,7 +2837,10 @@ async def poll_results():
                             await channel.send(file=discord.File(fpath))
                             print(f"  Sent file: {fpath}")
                         elif not os.path.isfile(fpath):
-                            await channel.send(f"(file not found: {fpath})")
+                            # Prose-quoted `[file:/path]` substrings extract
+                            # as markers but reference no real file. Log for
+                            # operator visibility; don't surface to the user.
+                            print(f"  [file marker, file not found — likely a prose quotation]: {fpath}", flush=True)
                         else:
                             await channel.send(f"(file not allowed: {fpath})")
                             print(f"  REJECTED file (not in allowlist): {fpath}", flush=True)
@@ -2969,7 +2972,8 @@ async def poll_proactive():
                             if _is_path_sendable(fpath):
                                 await dm.send(file=discord.File(fpath))
                             elif not os.path.isfile(fpath):
-                                await dm.send(f"(file not found: {fpath})")
+                                # See poll_results — log only, no user noise.
+                                print(f"  [proactive] file marker, file not found: {fpath}", flush=True)
                             else:
                                 await dm.send(f"(file not allowed: {fpath})")
                                 print(f"  [proactive] REJECTED file: {fpath}", flush=True)
@@ -3126,7 +3130,8 @@ async def poll_dm_fallback():
                                     await target_channel.send(file=discord.File(fpath))
                                     print(f"  [dm-fallback channel-redirect] sent file: {fpath}", flush=True)
                                 elif not os.path.isfile(fpath):
-                                    await target_channel.send(f"(file not found: {fpath})")
+                                    # See poll_results — log only, no user noise.
+                                    print(f"  [dm-fallback channel-redirect] file marker, file not found: {fpath}", flush=True)
                             print(f"  [dm-fallback channel-redirect] sent {f.name} to channel {target_channel_id}", flush=True)
                             _task_file = TASKS_DIR / f"{_task_id}.txt"
                             if _task_file.exists():

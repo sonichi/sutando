@@ -349,7 +349,11 @@ def send_reply(chat_id, text, task_id: str | None = None):
             api("sendMessage", chat_id=chat_id, text=f"(file access denied: {fpath})")
             print(f"  BLOCKED file: {fpath}")
         else:
-            api("sendMessage", chat_id=chat_id, text=f"(file not found: {fpath})")
+            # Prose-quoted `[file:/path]` substrings extract as markers
+            # but reference no actual file. Don't ship the warning to
+            # the user; log for operator visibility on real typos. Same
+            # rationale as discord-bridge:poll_results.
+            print(f"  file marker, file not found — likely a prose quotation: {fpath}", flush=True)
 
 def main():
     print(f"Telegram bridge started. Polling for messages...", flush=True)
