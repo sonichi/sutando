@@ -13,10 +13,11 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-# Canonical home is <workspace>/state/quota-state.json (written by the
-# credential proxy). status_read_path also tries the legacy workspace-root
-# path; the skill-dir / cwd entries below stay as last-resort fallbacks for
-# one release while older proxy installs roll over.
+# Canonical (and only) home is <workspace>/state/quota-state.json, written by
+# the credential proxy. The skill-dir / cwd fallbacks were removed: a stale
+# leftover quota-state.json under skills/quota-tracker/ silently shadowed the
+# fresh file and froze the dashboard for ~12h (2026-05-21). One path, one
+# source of truth — if it's missing, say so rather than read a stale copy.
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 try:
@@ -25,14 +26,8 @@ try:
 except Exception:
     _canonical = None
 
-for candidate in [
-    _canonical,
-    Path(__file__).parent.parent / "quota-state.json",
-    Path.cwd() / "quota-state.json",
-]:
-    if candidate is not None and candidate.exists():
-        QUOTA_FILE = candidate
-        break
+if _canonical is not None and _canonical.exists():
+    QUOTA_FILE = _canonical
 else:
     print("No quota-state.json found. Is the credential proxy running?")
     sys.exit(1)

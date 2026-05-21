@@ -121,15 +121,13 @@ def get_score() -> str:
 def get_quota_status() -> dict:
     """Read quota state from quota-state.json (written by credential proxy).
 
-    Quota state IS runtime state; canonical home is <workspace>/state/.
-    status_read_path prefers state/quota-state.json and falls back to the
-    legacy workspace-root path for one release. The skill-dir path is
-    preserved as a last-resort fallback until older credential-proxy
-    installs roll over.
+    Quota state IS runtime state; the canonical (and only) home is
+    <workspace>/state/quota-state.json. The skill-dir fallback was removed:
+    a stale leftover copy under skills/quota-tracker/ silently shadowed the
+    fresh file and froze this dashboard's quota panel for ~12h (2026-05-21).
+    One path, one source of truth.
     """
     quota_file = status_read_path("quota-state.json", WORKSPACE_DIR)
-    if not quota_file.exists():
-        quota_file = REPO_DIR / "skills" / "quota-tracker" / "quota-state.json"
     if not quota_file.exists():
         return {"available": True}
     try:
