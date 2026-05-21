@@ -6,6 +6,13 @@ Works alongside the voice task bridge. Runs as a background daemon.
 Usage: python3 src/telegram-bridge.py
 """
 
+# startup.sh launches this via bare `python3`, which is /usr/bin/python3 (3.9)
+# on stock macOS. PEP-604 unions (`str | None`) are evaluated at def-time on
+# 3.9 and raise TypeError, crashing the bridge on import. Lazy annotations
+# (PEP 563) make every annotation in this file a string — never evaluated —
+# so 3.9 is safe. Must precede all other imports.
+from __future__ import annotations
+
 import json
 import os
 import sys
