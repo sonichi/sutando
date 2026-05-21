@@ -23,6 +23,31 @@ ARGUMENTS: `$ARGUMENTS`
 3. **Save.** Write the report to `notes/diagnose-YYYY-MM-DD-HHMM.md` with frontmatter (`title`, `date`, `tags: [diagnose, self]`).
 4. **Summarize.** Reply to the caller with a 5–10 line executive summary + path to the full report.
 
+## Cross-node mode (resolves #421)
+
+When Sutando works on one machine but is broken on another, the helper script
+runs `gather.sh` on both sides over SSH and produces a structured comparison:
+
+```bash
+bash skills/self-diagnose/scripts/gather-remote.sh <ssh-target> [window]
+# e.g.
+bash skills/self-diagnose/scripts/gather-remote.sh mac-mini
+bash skills/self-diagnose/scripts/gather-remote.sh user@macbook.local 6h
+```
+
+Output: `/tmp/sutando-diagnose-cross-<ts>/{local,remote,diff.md}` plus a
+persisted copy at `notes/diagnose-cross-node-<YYYY-MM-DD>.md`. The comparison
+report surfaces commit drift, health-check differences, voice-agent error
+counts, quota state, and PR-view divergence per side.
+
+Override the remote sutando path via `SUTANDO_REMOTE_REPO=/path/on/peer` if
+the failing node's checkout isn't at the default `~/Desktop/sutando`.
+
+**Security posture** (per #421): read-only on the remote (only gather.sh
+runs there, no mutation), allowlist enforced by gather.sh's existing scope
+(no `.env`, no tokens), per-session SSH (no daemon, no persistent state on
+the remote).
+
 ## Default window
 
 24 hours if unspecified. Accept: `24h`, `3d`, `1w`. Longer windows = broader scope, higher token cost.

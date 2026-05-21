@@ -52,6 +52,7 @@ dynamic-content.json
 tests/*
 !tests/*.test.ts
 !tests/*.test.py
+!tests/*.test.sh
 skills/personal-*/
 tests/security/*.md
 !tests/security/*.md.example

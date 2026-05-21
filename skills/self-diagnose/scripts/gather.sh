@@ -8,22 +8,23 @@ set -euo pipefail
 
 WINDOW="${1:-24h}"
 # REPO resolution: prefer SUTANDO_ROOT env, then $PWD if it looks like a
-# Sutando workspace (has build_log.md), else walk up from $0 looking for
-# build_log.md (handles invocation via the userSettings hardlink at
-# ~/.claude/skills/... where the original 3-level dirname-walk landed at
-# ~/.claude/ instead of the workspace). Caught 2026-05-05 when /self-diagnose
-# silently ran against ~/.claude/ on Mini, producing empty
-# git-log/build_log/health.txt.
+# Sutando repo (has CLAUDE.md), else walk up from $0 looking for CLAUDE.md
+# (handles invocation via the userSettings hardlink at ~/.claude/skills/...
+# where the original 3-level dirname-walk landed at ~/.claude/ instead of
+# the workspace). Caught 2026-05-05 when /self-diagnose silently ran against
+# ~/.claude/ on Mini, producing empty git-log/build_log/health.txt.
+# Marker file is CLAUDE.md (stable, identity-bearing). Previously build_log.md,
+# swapped 2026-05-18 when build_log.md moved to $SUTANDO_WORKSPACE.
 REPO=""
-if [ -n "${SUTANDO_ROOT:-}" ] && [ -f "${SUTANDO_ROOT}/build_log.md" ]; then
+if [ -n "${SUTANDO_ROOT:-}" ] && [ -f "${SUTANDO_ROOT}/CLAUDE.md" ]; then
 	REPO="$SUTANDO_ROOT"
-elif [ -f "$PWD/build_log.md" ]; then
+elif [ -f "$PWD/CLAUDE.md" ]; then
 	REPO="$PWD"
 else
-	# Walk up from $0 looking for build_log.md (max 5 levels)
+	# Walk up from $0 looking for CLAUDE.md (max 5 levels)
 	DIR="$(cd "$(dirname "$0")" && pwd)"
 	for _ in 1 2 3 4 5; do
-		if [ -f "$DIR/build_log.md" ]; then
+		if [ -f "$DIR/CLAUDE.md" ]; then
 			REPO="$DIR"
 			break
 		fi
@@ -36,6 +37,21 @@ fi
 TS="$(date +%s)"
 OUT="/tmp/sutando-diagnose-$TS"
 mkdir -p "$OUT"
+
+# Notes dir lives under $SUTANDO_WORKSPACE per the workspace contract (CLAUDE.md
+# "Workspace contract" section). Falls back to $REPO/notes if env unset, matching
+# the historic pre-workspace-contract behavior. Same precedence as
+# `src/workspace_default.py:resolve_workspace()` for Python callers.
+# TODO(post-2026-08-15): drop the $REPO/notes fallback once all known
+# installs are confirmed on the workspace contract. Tracked via Lucy's
+# #769 review obs 4. Dual-path was added so pre-#762 installs don't
+# silently lose cold-review-log access; safe to remove after every node
+# has resolved its workspace at least once.
+if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
+	NOTES_DIR="$SUTANDO_WORKSPACE/notes"
+else
+	NOTES_DIR="$REPO/notes"
+fi
 
 # Convert window to seconds for log filtering
 case "$WINDOW" in
@@ -55,11 +71,26 @@ git -C "$REPO" log --since="$SINCE_ISO" --pretty=format:'%h %ad %s' --date=short
 git -C "$REPO" status --short > "$OUT/git-status.txt" 2>/dev/null || true
 
 # 2) Open PRs + recently merged (last 14d) — cheap, already cached by gh
-if command -v gh >/dev/null; then
-	gh pr list --state open --limit 20 --json number,title,mergeable,headRefName,author,updatedAt \
+# Resolve the real GitHub CLI. On systems where another tool named `gh` (e.g.
+# miniconda's `gh v0.0.4`) precedes /opt/homebrew/bin/gh on PATH, plain
+# `command -v gh` returns the wrong binary and every invocation below would
+# silently fail through `|| true`, producing empty PR data with no error.
+GH=""
+for _gh_cand in $(/usr/bin/which -a gh 2>/dev/null); do
+	# Discriminator: real GitHub CLI prints "gh version 2.x.x (...)" with NO
+	# colon — distinct from miniconda's `gh v0.0.4` which prints "gh version:
+	# v0.0.4" (note colon). Require the literal " version N." form.
+	if "$_gh_cand" --version 2>/dev/null | grep -Eq '^gh version [0-9]+\.'; then
+		GH="$_gh_cand"
+		break
+	fi
+done
+[ -z "$GH" ] && [ -x /opt/homebrew/bin/gh ] && GH=/opt/homebrew/bin/gh
+if [ -n "$GH" ]; then
+	"$GH" pr list --state open --limit 20 --json number,title,mergeable,headRefName,author,updatedAt \
 		--jq '.[] | "#\(.number) \(.headRefName) [@\(.author.login)] \(.title) — \(.mergeable)"' \
 		> "$OUT/prs-open.txt" 2>/dev/null || true
-	gh pr list --state merged --search "merged:>$(date -v -14d +%Y-%m-%d 2>/dev/null || date -d '14 days ago' +%Y-%m-%d)" \
+	"$GH" pr list --state merged --search "merged:>$(date -v -14d +%Y-%m-%d 2>/dev/null || date -d '14 days ago' +%Y-%m-%d)" \
 		--limit 30 --json number,title,mergedAt,author \
 		--jq '.[] | "#\(.number) \(.mergedAt[:10]) [@\(.author.login)] \(.title)"' \
 		> "$OUT/prs-recent-merged.txt" 2>/dev/null || true
@@ -68,7 +99,7 @@ fi
 # 3) Build log tail + pending questions + cold-review log (small files, copy whole)
 tail -150 "$REPO/build_log.md" > "$OUT/build_log-tail.md" 2>/dev/null || true
 cp "$REPO/pending-questions.md" "$OUT/pending-questions.md" 2>/dev/null || true
-cp "$REPO/notes/cold-review-log.md" "$OUT/cold-review-log.md" 2>/dev/null || true
+cp "$NOTES_DIR/cold-review-log.md" "$OUT/cold-review-log.md" 2>/dev/null || true
 
 # 4) Voice-agent log — filter to window, grep for signal lines, keep it bounded.
 # Signals: transport closes (1006/1011/1007/1008), errors, GoAway, setup complete, 1006/1011 numeric.
