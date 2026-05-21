@@ -106,4 +106,4 @@ If you don't want screen-sharing, the rest of the skill (voice conversation, too
 
 `SIGTERM`/`SIGINT` triggers `cleanupSession()` which calls `connection.destroy()` (sends Discord voice-gateway disconnect frame) and `voiceSession.close()`. The handler then waits 1.5s before `process.exit(0)` so the disconnect frame actually flushes — without that delay, Discord pins the bot in-channel until its own 60-90s heartbeat timeout.
 
-Metrics + transcripts land in `$SUTANDO_WORKSPACE/data/discord-voice-{sessionId}.jsonl` and `discord-voice-metrics.jsonl`.
+Transcripts + session metrics land in `conversation.sqlite` — the shared `conversation` and `sessions` tables (also used by voice + phone) — and are mirrored into the shared `logs/conversation.log` text log.
