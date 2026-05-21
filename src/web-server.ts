@@ -27,8 +27,9 @@
  */
 
 import { createServer } from 'node:http';
-import { writeFileSync, readFileSync, statSync } from 'node:fs';
-import { extname, normalize, sep } from 'node:path';
+import { writeFileSync, readFileSync, statSync, existsSync, mkdirSync, chmodSync } from 'node:fs';
+import { extname, normalize, sep, join } from 'node:path';
+import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { readTmuxStatus } from './tmux-status.js';
 import { statePath } from './state-paths.js';
@@ -38,6 +39,9 @@ import { statePath } from './state-paths.js';
 // workspace root. PR-C step 6 retired the inline HTML fallback; `pnpm
 // build:client` must run for `/` to render anything.
 const CLIENT_DIST_DIR = fileURLToPath(new URL('../client/dist/', import.meta.url));
+
+// Slack bridge credential file — shared convention with Discord/Telegram.
+const SLACK_ENV_PATH = join(homedir(), '.claude', 'channels', 'slack', '.env');
 
 const STATIC_MIME_TYPES: Record<string, string> = {
 	'.html': 'text/html; charset=utf-8',
@@ -463,6 +467,51 @@ export function startWebServer(opts: WebServerOptions): import('node:http').Serv
 					}
 					const event = { slug: body.slug, content: body.content, ts: new Date().toISOString() };
 					writeFileSync('/tmp/sutando-note-viewing.json', JSON.stringify(event));
+					res.writeHead(200, { 'Content-Type': 'application/json' });
+					res.end(JSON.stringify({ ok: true }));
+				} catch (e) {
+					res.writeHead(400, { 'Content-Type': 'application/json' });
+					res.end(JSON.stringify({ error: e instanceof Error ? e.message : 'parse failed' }));
+				}
+			});
+			return;
+		}
+
+		// Slack bridge credentials. Mirrors the Discord/Telegram convention —
+		// tokens live in `~/.claude/channels/slack/.env`, not the repo .env.
+		// GET reports only whether each token is set (never echoes the value);
+		// POST writes the file 0600. slack-bridge.py loads this file on start.
+		if (url.pathname === '/settings/slack' && req.method === 'GET') {
+			let botConfigured = false;
+			let appConfigured = false;
+			try {
+				if (existsSync(SLACK_ENV_PATH)) {
+					const env = readFileSync(SLACK_ENV_PATH, 'utf-8');
+					botConfigured = /^SLACK_BOT_TOKEN=.+/m.test(env);
+					appConfigured = /^SLACK_APP_TOKEN=.+/m.test(env);
+				}
+			} catch { /* report not-configured on any read error */ }
+			res.writeHead(200, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify({ botConfigured, appConfigured }));
+			return;
+		}
+
+		if (url.pathname === '/settings/slack' && req.method === 'POST') {
+			const chunks: Buffer[] = [];
+			req.on('data', (c: Buffer) => chunks.push(c));
+			req.on('end', () => {
+				try {
+					const body = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
+					const botToken = typeof body.botToken === 'string' ? body.botToken.trim() : '';
+					const appToken = typeof body.appToken === 'string' ? body.appToken.trim() : '';
+					if (!botToken.startsWith('xoxb-') || !appToken.startsWith('xapp-')) {
+						res.writeHead(400, { 'Content-Type': 'application/json' });
+						res.end(JSON.stringify({ error: 'Bot token must start with "xoxb-" and app token with "xapp-".' }));
+						return;
+					}
+					mkdirSync(join(homedir(), '.claude', 'channels', 'slack'), { recursive: true });
+					writeFileSync(SLACK_ENV_PATH, `SLACK_BOT_TOKEN=${botToken}\nSLACK_APP_TOKEN=${appToken}\n`);
+					chmodSync(SLACK_ENV_PATH, 0o600);
 					res.writeHead(200, { 'Content-Type': 'application/json' });
 					res.end(JSON.stringify({ ok: true }));
 				} catch (e) {

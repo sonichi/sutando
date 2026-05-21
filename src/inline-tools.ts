@@ -19,6 +19,14 @@ const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 export { describeScreenTool, clickTool, scrollAndDescribeTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool } from './browser-tools.js';
 import { describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool } from './browser-tools.js';
 
+// Vision: one-shot frame + start/stop live screen-to-Gemini video.
+export { sendVisionFrameTool, startVisionTool, stopVisionTool } from './vision-tools.js';
+import { sendVisionFrameTool, startVisionTool, stopVisionTool } from './vision-tools.js';
+
+// Active artifact cache — load a file once, query repeatedly without task-bridge round-trips.
+export { setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool, clearActiveArtifact } from './artifact-cache-tools.js';
+import { setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool } from './artifact-cache-tools.js';
+
 // --- File-open tool (moved out of recording-tools — generic file open, optionally fullscreen) ---
 
 export const openFileTool: ToolDefinition = {
@@ -657,6 +665,30 @@ return frontApp`;
 	},
 };
 
+// --- Chat task creation (future hook) ------------------------------------------
+// Definition kept here for when /chat gets a tool-calling surface (SSE wiring +
+// UI handler). Currently NOT registered in inlineTools / ownerOnlyTools because
+// no caller in the architecture can reach it — /chat connects to agent-api, not
+// voice-agent. The active chat-path tracking is the shell snippet in CLAUDE.md.
+export const createChatTaskTool: ToolDefinition = {
+	name: 'create_chat_task',
+	description:
+		'Create a tracked task entry for the /chat web UI route. ' +
+		'Future hook: no current caller in the chat path (/chat connects to agent-api, not voice-agent). ' +
+		'The core agent (Claude Code) uses the CLAUDE.md shell-snippet path instead. ' +
+		'Voice tasks have their own tracking (source: voice).',
+	parameters: z.object({
+		task: z.string().describe('Description of the task being tracked'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { task } = args as { task: string };
+		const { writeChatTask } = await import('./task-bridge.js');
+		const taskId = writeChatTask(task);
+		return { status: 'created', taskId, message: `Chat task created: ${taskId}` };
+	},
+};
+
 /** All inline tools — import and spread into your tools list */
 // ─── Notes tools ─────────────────────────────────────────
 // Resolve at module-init: $SUTANDO_PRIVATE_DIR/notes (canonical) when set,
@@ -747,6 +779,58 @@ export const deleteNoteTool: ToolDefinition = {
 	},
 };
 
+// --- Voice session context (Chi 2026-05-13: voice agent loses context across turns) ---
+//
+// Background: voice-agent's Gemini context window is independent from core's. After
+// ~10 minutes of turns earlier transcript rolls off and voice "forgets" specifics
+// like "the post" or "Mini Draft A". The fix is a small JSON file at
+// `state/voice-session-context.json` that core writes whenever a durable decision
+// lands (active draft, pending paste, today's selected option). Voice can ask for
+// the file's contents at any time via `recent_context`.
+//
+// Schema (informal):
+//   {
+//     "updated_at": "<ISO ts>",
+//     "active_drafts": [
+//       { "name": "Mini Draft A", "summary": "...", "path": "/tmp/sutando-draft.txt" }
+//     ],
+//     "pending_action": { "kind": "paste", "what": "Mini Draft A", "where": "Cursor / X compose" } | null,
+//     "last_results": [
+//       { "task_id": "task-...", "subject": "DeepMind post drafted", "ts": "<ISO>" }
+//     ]
+//   }
+//
+// Core writes the file by direct fs operations — no inline tool needed for the writer
+// path (core is this Claude Code session and already has fs access). The tool here
+// is the READ path that voice-agent's Gemini can call when it senses confusion.
+
+const VOICE_SESSION_CONTEXT_PATH = statePath('voice-session-context.json');
+
+export const recentContextTool: ToolDefinition = {
+	name: 'recent_context',
+	description:
+		'Return the current voice-session context — active drafts, pending actions, recent task results — so you can pick up a thread even if it predates your Gemini context window. ' +
+		'Call this when the user references something with a deictic pronoun ("the post", "the draft", "the one I just typed") that you can\'t place from your own recent transcript. ' +
+		'Also fine to call proactively at the start of an active session to ground yourself. ' +
+		'Returns JSON with keys: active_drafts (array), pending_action (object|null), last_results (array of {task_id, subject, ts}). ' +
+		'If the file is missing or empty, returns {note: "no context recorded yet"}.',
+	parameters: z.object({}),
+	execution: 'inline',
+	async execute() {
+		try {
+			if (!existsSync(VOICE_SESSION_CONTEXT_PATH)) {
+				return { note: 'no context recorded yet — core hasn\'t written voice-session-context.json' };
+			}
+			const raw = readFileSync(VOICE_SESSION_CONTEXT_PATH, 'utf-8');
+			const parsed = JSON.parse(raw);
+			console.log(`${ts()} [RecentContext] returned (updated_at=${parsed.updated_at || 'unknown'}, ${(parsed.active_drafts || []).length} drafts, ${(parsed.last_results || []).length} results)`);
+			return parsed;
+		} catch (err) {
+			return { error: `recent_context read failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
 // IMPORTANT: Every tool defined in browser-tools.ts MUST be added to BOTH arrays below.
 // Tools not registered here are invisible to Gemini — it will hallucinate actions instead
 // of calling them (e.g. "I've closed the video" without actually closing it).
@@ -793,7 +877,10 @@ function cloudSkillsScanDir(): string {
 	return join(resolveWorkspace(), 'cloud-skills');
 }
 
-async function loadSkillManifestTools(): Promise<ToolDefinition[]> {
+// Split by manifest `access_tier` so phone-conversation can include
+// owner-tier tools only when the caller is the verified owner. Manifest
+// access_tier values: "owner" (default if omitted) | "any_caller".
+async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyCaller: ToolDefinition[] }> {
 	// Scan the public-repo `skills/` dir, the optional private skills dir
 	// pointed to by `$SUTANDO_PRIVATE_DIR/skills/`, AND the cloud-skills
 	// install dir where Superpower Station drops freshly-installed bundles.
@@ -808,7 +895,7 @@ async function loadSkillManifestTools(): Promise<ToolDefinition[]> {
 		dirsToScan.push(join(expanded, 'skills'));
 	}
 	dirsToScan.push(cloudSkillsScanDir());
-	const bySkill = new Map<string, ToolDefinition[]>();
+	const bySkill = new Map<string, { tools: ToolDefinition[]; tier: 'owner' | 'any_caller' }>();
 	for (const skillsDir of dirsToScan) {
 		if (!existsSync(skillsDir)) continue;
 		let dirs: string[];
@@ -820,7 +907,7 @@ async function loadSkillManifestTools(): Promise<ToolDefinition[]> {
 		for (const dirName of dirs) {
 			const manifestPath = join(skillsDir, dirName, 'manifest.json');
 			if (!existsSync(manifestPath)) continue;
-			let manifest: { enabled?: boolean; tools?: string; config?: Record<string, string>; name?: string };
+			let manifest: { enabled?: boolean; tools?: string; config?: Record<string, string>; name?: string; access_tier?: string };
 			try {
 				manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
 			} catch (err) {
@@ -833,6 +920,7 @@ async function loadSkillManifestTools(): Promise<ToolDefinition[]> {
 			}
 			if (!manifest.tools) continue;
 			const toolsPath = join(skillsDir, dirName, manifest.tools.replace(/^\.\//, ''));
+			const tier = manifest.access_tier === 'any_caller' ? 'any_caller' : 'owner';
 			try {
 				// @ts-ignore — dynamic relative import resolved at runtime by tsx
 				const mod = await import(toolsPath);
@@ -841,19 +929,23 @@ async function loadSkillManifestTools(): Promise<ToolDefinition[]> {
 					// Last-write-wins: a later (private) pass replaces the
 					// public skill of the same name. Without this, the
 					// per-tool unique-name guard at module bottom throws.
-					bySkill.set(skillName, mod.tools);
-					console.log(`[skill-loader] loaded ${mod.tools.length} tool(s) from ${skillName} (${skillsDir})`);
+					bySkill.set(skillName, { tools: mod.tools, tier });
+					console.log(`[skill-loader] loaded ${mod.tools.length} tool(s) from ${skillName} [tier=${tier}] (${skillsDir})`);
 				}
 			} catch (err) {
 				console.warn(`[skill-loader] failed to import ${dirName}/${manifest.tools} from ${skillsDir}:`, err instanceof Error ? err.message : err);
 			}
 		}
 	}
-	const out: ToolDefinition[] = [];
-	for (const tools of bySkill.values()) out.push(...tools);
-	return out;
+	const owner: ToolDefinition[] = [];
+	const anyCaller: ToolDefinition[] = [];
+	for (const { tools, tier } of bySkill.values()) {
+		(tier === 'any_caller' ? anyCaller : owner).push(...tools);
+	}
+	return { owner, anyCaller };
 }
 const personalTools = await loadSkillManifestTools();
+const personalAllTools = [...personalTools.owner, ...personalTools.anyCaller];
 
 // Manifest-driven discovery of skills that core (not voice-inline) runs.
 // When a manifest has `documented_for_core: true` and a `core_description`,
@@ -916,12 +1008,16 @@ export const inlineTools = assertUniqueToolNames([
 	joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool,
 	describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, slideControlTool, fullscreenTool,
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
-	...personalTools ]);
+	recentContextTool,
+	sendVisionFrameTool, startVisionTool, stopVisionTool,
+	setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool,
+	...personalAllTools ]);
 
 /** Tools available to any caller (including unverified) */
 export const anyCallerTools = [
 	getCurrentTimeTool,
 	getCoreStatusTool,
+	...personalTools.anyCaller,
 ];
 
 /** Owner-only tools (require isOwner) */
@@ -932,7 +1028,11 @@ export const ownerOnlyTools = [
 	clipboardTool, cancelTaskTool, toggleTasksTool, summonTool, dismissTool,
 	joinZoomTool, joinGmeetTool, callContactTool, slideControlTool, fullscreenTool,
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
+	recentContextTool,
 	describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool,
+	sendVisionFrameTool, startVisionTool, stopVisionTool,
+	setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool,
+	...personalTools.owner,
 ];
 
 /** Configurable tools — default to owner-only, can be opened to verified callers */

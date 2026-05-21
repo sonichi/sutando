@@ -1,0 +1,7 @@
+{
+  "name": "gws-gmail-voice",
+  "enabled": true,
+  "access_tier": "owner",
+  "description": "Inline Gmail triage for voice/phone agents — wraps `gws gmail +triage` so Gemini can summarize unread inbox without going through openUrlTool + Chrome.",
+  "tools": "./tools.ts"
+}

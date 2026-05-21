@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.sutando.slack-bridge</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{PYTHON_BIN}}</string>
+        <string>{{REPO_DIR}}/src/slack-bridge.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>{{REPO_DIR}}</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>SUTANDO_WORKSPACE</key>
+        <string>{{SUTANDO_WORKSPACE}}</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>{{LOG_DIR}}/slack-bridge.log</string>
+    <key>StandardErrorPath</key>
+    <string>{{LOG_DIR}}/slack-bridge.log</string>
+
+    <!-- Only run while the token file exists. The bridge reads
+         SLACK_BOT_TOKEN / SLACK_APP_TOKEN from ~/.claude/channels/slack/.env
+         and exits(1) when they're missing; gating on PathState avoids a
+         crash-loop on a clean install where the user hasn't configured
+         tokens yet. Settings → Channels writes that file on save. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>PathState</key>
+        <dict>
+            <key>{{HOME}}/.claude/channels/slack/.env</key>
+            <true/>
+        </dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>
