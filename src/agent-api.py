@@ -92,7 +92,7 @@ def validate_twilio_signature(handler, body: str) -> bool:
 #               stay aligned with these writes.
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
-from workspace_default import resolve_workspace  # noqa: E402
+from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 
 WORKSPACE_DIR = resolve_workspace()
 TASK_DIR = WORKSPACE_DIR / "tasks"
@@ -283,7 +283,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"pong": True})
         elif path == "/core-status":
             # Read loop status file for web UI
-            status_file = WORKSPACE_DIR / "core-status.json"
+            status_file = status_read_path("core-status.json", WORKSPACE_DIR)
             if status_file.exists():
                 import json as _json
                 try:
@@ -442,7 +442,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pass
             self.send_json(200, {"activity": activity})
         elif path == "/contextual-chips":
-            chips_file = WORKSPACE_DIR / "contextual-chips.json"
+            chips_file = status_read_path("contextual-chips.json", WORKSPACE_DIR)
             if chips_file.exists():
                 try:
                     data = json.loads(chips_file.read_text())
@@ -452,7 +452,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 self.send_json(200, {"chips": []})
         elif path == "/dynamic-content":
-            dc_file = WORKSPACE_DIR / "dynamic-content.json"
+            dc_file = status_read_path("dynamic-content.json", WORKSPACE_DIR)
             if dc_file.exists():
                 try:
                     data = json.loads(dc_file.read_text())

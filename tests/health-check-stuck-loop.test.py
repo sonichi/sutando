@@ -61,11 +61,12 @@ def make_checks(*statuses_and_names):
 
 def write_status(workspace_dir: Path, payload: dict | None) -> None:
     """Write core-status.json into a temp WORKSPACE_DIR override; pass None
-    to skip writing the file at all. (Was REPO_DIR pre-PR #836;
-    check_core_proactive_loop now reads from WORKSPACE_DIR — core-status.json
-    is per-user runtime state, not code.)"""
+    to skip writing the file at all. (Was REPO_DIR pre-PR #836; status files
+    moved under state/ — check_core_proactive_loop reads via status_read_path.)"""
     if payload is not None:
-        (workspace_dir / "core-status.json").write_text(json.dumps(payload))
+        state_dir = workspace_dir / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "core-status.json").write_text(json.dumps(payload))
 
 
 def write_task(tasks_dir: Path, name: str, age_sec: int) -> Path:

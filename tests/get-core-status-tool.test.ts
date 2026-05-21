@@ -1,19 +1,20 @@
 import { describe, it, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync, existsSync, unlinkSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, unlinkSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { setupTempWorkspace } from './_helpers/temp-workspace.js';
 
 // Unit tests for the get_core_status inline tool (PR #467).
-// The tool reads `<SUTANDO_WORKSPACE>/core-status.json` (post-#840 fix). Tests
-// run with SUTANDO_WORKSPACE pointing at a per-process temp dir so concurrent
-// test files (notably tests/agent-state-endpoint.test.ts, which spawns a
-// web-client that ALSO reads core-status.json) can't race. Before #840: both
-// tests shared <REPO_ROOT>/core-status.json and node:test parallel-file mode
-// caused intermittent failures.
+// The tool reads `<SUTANDO_WORKSPACE>/state/core-status.json`. Tests run with
+// SUTANDO_WORKSPACE pointing at a per-process temp dir so concurrent test
+// files (notably tests/agent-state-endpoint.test.ts, which spawns a web-client
+// that ALSO reads core-status.json) can't race. Before #840: both tests
+// shared <REPO_ROOT>/core-status.json and node:test parallel-file mode caused
+// intermittent failures.
 const { workspace: TEMP_WORKSPACE, cleanup: cleanupTempWorkspace } =
 	setupTempWorkspace('getcore');
-const CORE_STATUS_PATH = join(TEMP_WORKSPACE, 'core-status.json');
+mkdirSync(join(TEMP_WORKSPACE, 'state'), { recursive: true });
+const CORE_STATUS_PATH = join(TEMP_WORKSPACE, 'state', 'core-status.json');
 
 // Import AFTER setting SUTANDO_WORKSPACE so the tool's module-load resolves
 // to the temp dir, not whatever the test process's env was before.

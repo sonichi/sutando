@@ -16,7 +16,12 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 import workspace_default  # noqa: E402
-from workspace_default import default_workspace_dir, resolve_workspace  # noqa: E402
+from workspace_default import (  # noqa: E402
+    default_workspace_dir,
+    resolve_workspace,
+    status_path,
+    status_read_path,
+)
 
 
 class TestWorkspaceDefault(unittest.TestCase):
@@ -404,6 +409,166 @@ class TestInRepoBuildLogMigration(unittest.TestCase):
         finally:
             shutil.rmtree(legacy, ignore_errors=True)
             shutil.rmtree(target, ignore_errors=True)
+
+
+class TestStatusPathHelpers(unittest.TestCase):
+    """Tests for `status_path` (write location) and `status_read_path`
+    (read location with one-release legacy-root fallback)."""
+
+    def setUp(self):
+        self.workspace = Path(tempfile.mkdtemp(prefix="ws-status-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.workspace, ignore_errors=True)
+
+    def test_status_path_is_under_state(self):
+        p = status_path("core-status.json", self.workspace)
+        self.assertEqual(p, self.workspace / "state" / "core-status.json")
+
+    def test_read_path_prefers_state(self):
+        (self.workspace / "state").mkdir(parents=True)
+        (self.workspace / "state" / "core-status.json").write_text("{}")
+        (self.workspace / "core-status.json").write_text("{}")  # legacy too
+        self.assertEqual(
+            status_read_path("core-status.json", self.workspace),
+            self.workspace / "state" / "core-status.json",
+        )
+
+    def test_read_path_falls_back_to_legacy_root(self):
+        (self.workspace / "core-status.json").write_text("{}")
+        self.assertEqual(
+            status_read_path("core-status.json", self.workspace),
+            self.workspace / "core-status.json",
+        )
+
+    def test_read_path_returns_state_path_when_neither_exists(self):
+        # Caller handles the missing case; we always point at the canonical home.
+        self.assertEqual(
+            status_read_path("core-status.json", self.workspace),
+            self.workspace / "state" / "core-status.json",
+        )
+
+
+class TestRootStatusMigration(unittest.TestCase):
+    """Tests for `_migrate_root_status` — sweeps loose workspace-root status
+    .json files into `state/`. Parallel posture to `_migrate_inrepo_build_log`:
+    non-destructive on collision, sentinel-gated."""
+
+    def setUp(self):
+        self.workspace = Path(tempfile.mkdtemp(prefix="ws-rootstatus-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.workspace, ignore_errors=True)
+
+    def test_moves_root_status_files_into_state(self):
+        (self.workspace / "core-status.json").write_text('{"status":"idle"}')
+        (self.workspace / "voice-state.json").write_text('{"connected":false}')
+        moved = workspace_default._migrate_root_status(self.workspace)
+        self.assertTrue(moved)
+        self.assertEqual(
+            (self.workspace / "state" / "core-status.json").read_text(),
+            '{"status":"idle"}',
+        )
+        self.assertTrue((self.workspace / "state" / "voice-state.json").is_file())
+        # Root copies are gone (moved, not copied).
+        self.assertFalse((self.workspace / "core-status.json").exists())
+        self.assertFalse((self.workspace / "voice-state.json").exists())
+
+    def test_no_clobber_on_collision(self):
+        (self.workspace / "core-status.json").write_text("ROOT version")
+        (self.workspace / "state").mkdir()
+        (self.workspace / "state" / "core-status.json").write_text("STATE wins")
+        workspace_default._migrate_root_status(self.workspace)
+        # state/ copy untouched, root copy left in place (skipped, not moved).
+        self.assertEqual(
+            (self.workspace / "state" / "core-status.json").read_text(), "STATE wins"
+        )
+        self.assertTrue((self.workspace / "core-status.json").exists())
+
+    def test_idempotent_via_sentinel(self):
+        (self.workspace / "core-status.json").write_text("once")
+        moved_1 = workspace_default._migrate_root_status(self.workspace)
+        # Re-seed a root file; the sentinel (not a missing file) must block it.
+        (self.workspace / "voice-state.json").write_text("twice")
+        moved_2 = workspace_default._migrate_root_status(self.workspace)
+        self.assertTrue(moved_1)
+        self.assertFalse(moved_2)
+        self.assertTrue((self.workspace / ".status-migrated").exists())
+        # Second file stayed at root because the sentinel short-circuited.
+        self.assertTrue((self.workspace / "voice-state.json").exists())
+
+    def test_writes_sentinel_even_when_nothing_to_move(self):
+        moved = workspace_default._migrate_root_status(self.workspace)
+        self.assertFalse(moved)
+        self.assertTrue((self.workspace / ".status-migrated").exists())
+
+
+class TestConversationLogMigration(unittest.TestCase):
+    """Tests for `_migrate_conversation_log` — moves conversation.log from the
+    workspace root into `logs/` (it's a transcript, not a status file)."""
+
+    def setUp(self):
+        self.workspace = Path(tempfile.mkdtemp(prefix="ws-convlog-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.workspace, ignore_errors=True)
+
+    def test_moves_conversation_log_into_logs(self):
+        (self.workspace / "conversation.log").write_text("turn 1\nturn 2\n")
+        moved = workspace_default._migrate_conversation_log(self.workspace)
+        self.assertTrue(moved)
+        self.assertEqual(
+            (self.workspace / "logs" / "conversation.log").read_text(),
+            "turn 1\nturn 2\n",
+        )
+        self.assertFalse((self.workspace / "conversation.log").exists())
+
+    def test_no_clobber_on_collision(self):
+        (self.workspace / "conversation.log").write_text("ROOT log")
+        (self.workspace / "logs").mkdir()
+        (self.workspace / "logs" / "conversation.log").write_text("LOGS wins")
+        workspace_default._migrate_conversation_log(self.workspace)
+        self.assertEqual(
+            (self.workspace / "logs" / "conversation.log").read_text(), "LOGS wins"
+        )
+
+    def test_idempotent_via_sentinel(self):
+        (self.workspace / "conversation.log").write_text("once")
+        moved_1 = workspace_default._migrate_conversation_log(self.workspace)
+        (self.workspace / "conversation.log").write_text("twice")
+        moved_2 = workspace_default._migrate_conversation_log(self.workspace)
+        self.assertTrue(moved_1)
+        self.assertFalse(moved_2)
+        self.assertTrue((self.workspace / ".conversation-log-migrated").exists())
+
+
+class TestResolveWorkspaceRunsNewMigrators(unittest.TestCase):
+    """End-to-end: resolve_workspace sweeps root status files + conversation.log
+    on the way through, for both the env-set and default branches."""
+
+    def setUp(self):
+        self._saved_env = os.environ.get("SUTANDO_WORKSPACE")
+        self.workspace = Path(tempfile.mkdtemp(prefix="ws-e2e-"))
+        os.environ["SUTANDO_WORKSPACE"] = str(self.workspace)
+
+    def tearDown(self):
+        if self._saved_env is not None:
+            os.environ["SUTANDO_WORKSPACE"] = self._saved_env
+        elif "SUTANDO_WORKSPACE" in os.environ:
+            del os.environ["SUTANDO_WORKSPACE"]
+        shutil.rmtree(self.workspace, ignore_errors=True)
+
+    def test_env_set_resolve_runs_status_and_convlog_migration(self):
+        (self.workspace / "core-status.json").write_text('{"status":"idle"}')
+        (self.workspace / "conversation.log").write_text("a turn\n")
+        # Avoid the in-repo notes/build_log migrators touching the real repo.
+        with patch.object(workspace_default, "_legacy_repo_root", return_value=self.workspace):
+            ws = resolve_workspace(migrate=True)
+        self.assertEqual(ws, self.workspace)
+        self.assertTrue((self.workspace / "state" / "core-status.json").is_file())
+        self.assertFalse((self.workspace / "core-status.json").exists())
+        self.assertTrue((self.workspace / "logs" / "conversation.log").is_file())
+        self.assertFalse((self.workspace / "conversation.log").exists())
 
 
 if __name__ == "__main__":

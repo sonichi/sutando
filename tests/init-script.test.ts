@@ -87,34 +87,46 @@ describe('init.sh --auto (Tier 1: placeholder files)', () => {
 		assert.match(body, /none open/);
 	});
 
-	it('creates contextual-chips.json with a parseable shape', () => {
+	it('creates state/contextual-chips.json with a parseable shape', () => {
 		runInit(scratch, '--auto');
-		const body = readFileSync(join(workspace, 'contextual-chips.json'), 'utf-8');
+		const body = readFileSync(join(workspace, 'state', 'contextual-chips.json'), 'utf-8');
 		const parsed = JSON.parse(body);
 		assert.equal(Array.isArray(parsed.chips), true);
 		assert.equal(typeof parsed.ts, 'number');
 	});
 
-	it('creates core-status.json initialised to idle', () => {
+	it('creates state/core-status.json initialised to idle', () => {
 		runInit(scratch, '--auto');
-		const body = readFileSync(join(workspace, 'core-status.json'), 'utf-8');
+		const body = readFileSync(join(workspace, 'state', 'core-status.json'), 'utf-8');
 		const parsed = JSON.parse(body);
 		assert.equal(parsed.status, 'idle');
 	});
 
-	it('creates voice-state.json initialised to disconnected', () => {
+	it('creates state/voice-state.json initialised to disconnected', () => {
 		runInit(scratch, '--auto');
-		const body = readFileSync(join(workspace, 'voice-state.json'), 'utf-8');
+		const body = readFileSync(join(workspace, 'state', 'voice-state.json'), 'utf-8');
 		const parsed = JSON.parse(body);
 		assert.equal(parsed.connected, false);
 	});
 
-	it('does NOT clobber an existing contextual-chips.json', () => {
-		mkdirSync(workspace, { recursive: true });
-		writeFileSync(join(workspace, 'contextual-chips.json'), '{"chips":[{"label":"x","desc":"y"}],"ts":1}');
+	it('does NOT clobber an existing state/contextual-chips.json', () => {
+		mkdirSync(join(workspace, 'state'), { recursive: true });
+		writeFileSync(join(workspace, 'state', 'contextual-chips.json'), '{"chips":[{"label":"x","desc":"y"}],"ts":1}');
 		runInit(scratch, '--auto');
-		const body = readFileSync(join(workspace, 'contextual-chips.json'), 'utf-8');
+		const body = readFileSync(join(workspace, 'state', 'contextual-chips.json'), 'utf-8');
 		assert.match(body, /"label":"x"/);
+	});
+
+	it('sweeps a legacy workspace-root status file into state/', () => {
+		// An install from before the state/ relocation has core-status.json at
+		// the workspace root. migrate_root_status_to_state moves it into state/
+		// before the create_file_if_missing seed runs, so the real data wins.
+		mkdirSync(workspace, { recursive: true });
+		writeFileSync(join(workspace, 'core-status.json'), '{"status":"running","step":"legacy","ts":1}');
+		runInit(scratch, '--auto');
+		assert.equal(existsSync(join(workspace, 'core-status.json')), false, 'root copy should be moved');
+		const body = readFileSync(join(workspace, 'state', 'core-status.json'), 'utf-8');
+		assert.match(body, /"step":"legacy"/, 'migrated file keeps its content');
 	});
 });
 

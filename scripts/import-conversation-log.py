@@ -30,9 +30,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from workspace_default import resolve_workspace  # noqa: E402
 
 # DB + conversation.log live under the resolved workspace (~/.sutando/workspace),
-# the same tree the runtime writers use — not the repo root.
+# the same tree the runtime writers use — not the repo root. conversation.log
+# is an append-only transcript, so it lives under logs/ (not state/).
 WORKSPACE = resolve_workspace(migrate=False)
-DEFAULT_SRC = WORKSPACE / "conversation.log"
+DEFAULT_SRC = WORKSPACE / "logs" / "conversation.log"
 DEFAULT_DB = Path(os.environ.get("SUTANDO_CONVERSATION_DB", WORKSPACE / "data" / "conversation.sqlite"))
 
 # Process patterns that write conversation.sqlite live. --reload must not run

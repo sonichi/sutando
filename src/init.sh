@@ -16,8 +16,9 @@ MODE="${1:-full}"
 # Resolve runtime workspace. Same resolution shape as src/workspace_default.py
 # and startup.sh: $SUTANDO_WORKSPACE override (tilde-expanded), fallback to
 # ~/.sutando/workspace/. Runtime state files (logs, state, tasks, results,
-# notes, data, pending-questions.md, core-status.json, …) live here. Repo
-# stays for the code + skills + the schedule-crons.json copy below.
+# notes, data, pending-questions.md, …) live here; loose status .json files
+# (core-status.json, voice-state.json, …) live under state/. Repo stays for
+# the code + skills + the schedule-crons.json copy below.
 if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
   WORKSPACE="${SUTANDO_WORKSPACE/#\~/$HOME}"
 else
@@ -128,6 +129,40 @@ migrate_legacy_runtime_state() {
   fi
 }
 
+# One-time sweep of loose workspace-root status .json files into state/.
+# Bash twin of workspace_default.py's _migrate_root_status — shares the
+# `.status-migrated` sentinel so whichever runs first does the move and the
+# other short-circuits. init.sh runs before the Python services (startup.sh),
+# so without this sweep the create_file_if_missing calls below would seed a
+# fresh state/ file and strand a real workspace-root copy. Non-destructive on
+# collision; file list matches _STATUS_FILES.
+migrate_root_status_to_state() {
+  local sentinel="$WORKSPACE/.status-migrated"
+  if [ -f "$sentinel" ]; then
+    return 0
+  fi
+  mkdir -p "$WORKSPACE/state"
+  local moved_any=0
+  # Single source of truth for this list is `_STATUS_FILES` in
+  # src/workspace_default.py — keep the two in sync. Adding a 6th status
+  # file there without adding it here (or vice versa) silently drifts the
+  # Python and bash migrator twins.
+  for f in core-status.json voice-state.json contextual-chips.json dynamic-content.json quota-state.json; do
+    local src="$WORKSPACE/$f"
+    local dst="$WORKSPACE/state/$f"
+    if [ -f "$src" ] && [ ! -e "$dst" ]; then
+      if mv "$src" "$dst" 2>/dev/null; then
+        echo "  → migrated $f into state/" >&2
+        moved_any=1
+      fi
+    fi
+  done
+  : > "$sentinel"
+  if [ "$moved_any" -eq 1 ]; then
+    echo "  ✓ workspace-root status files swept into state/" >&2
+  fi
+}
+
 # --- Tier 1: auto-bootstrap (always safe to run) ---
 tier1() {
   log "Tier 1 — auto-bootstrap..."
@@ -135,6 +170,9 @@ tier1() {
   # First-run sweep: any stale repo-root runtime state lands in workspace
   # before we start creating fresh files. Idempotent + non-destructive.
   migrate_legacy_runtime_state
+  # Then sweep loose workspace-root status files into state/ — must run
+  # before the create_file_if_missing calls below.
+  migrate_root_status_to_state
 
   # Directories
   create_dir_if_missing "logs"
@@ -157,15 +195,17 @@ tier1() {
 _(none open)_
 "
 
-  create_file_if_missing "contextual-chips.json" \
+  # Status files live under state/ (the workspace root is structural —
+  # directories only). create_file_if_missing mkdir's the parent.
+  create_file_if_missing "state/contextual-chips.json" \
     "{\"chips\":[],\"ts\":$(date +%s)}
 "
 
-  create_file_if_missing "core-status.json" \
+  create_file_if_missing "state/core-status.json" \
     "{\"status\":\"idle\",\"ts\":$(date +%s)}
 "
 
-  create_file_if_missing "voice-state.json" \
+  create_file_if_missing "state/voice-state.json" \
     "{\"connected\":false,\"ts\":$(date +%s)}
 "
 

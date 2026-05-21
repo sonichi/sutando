@@ -2,7 +2,7 @@ import { describe, it, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, ChildProcess } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
-import { writeFileSync, unlinkSync } from 'node:fs';
+import { writeFileSync, unlinkSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { setupTempWorkspace } from './_helpers/temp-workspace.js';
 
@@ -22,7 +22,10 @@ const PORT = 18081; // well above the 8080 dev server + 9900 voice-agent
 // `expected listening, got working` on the agent-state assertions.
 const { workspace: TEMP_WORKSPACE, cleanup: cleanupTempWorkspace } =
 	setupTempWorkspace('agent-state');
-const CORE_STATUS_PATH = join(TEMP_WORKSPACE, 'core-status.json');
+// Status files live under <workspace>/state/ — the web-client reads them via
+// statusReadPath. The temp helper doesn't pre-create subdirs, so make state/.
+mkdirSync(join(TEMP_WORKSPACE, 'state'), { recursive: true });
+const CORE_STATUS_PATH = join(TEMP_WORKSPACE, 'state', 'core-status.json');
 
 // voice-state.json is read by web-client's readVoiceState() as the authoritative
 // voiceConnected source (browser POST cache is the fallback). Tests in the
@@ -31,7 +34,7 @@ const CORE_STATUS_PATH = join(TEMP_WORKSPACE, 'core-status.json');
 // — no stash/restore needed, the temp dir didn't exist before this test and
 // gets rm'd on teardown. (Was REPO_ROOT pre-#853 fix; migrated to match the
 // post-#849 web-client reader semantics.)
-const VOICE_STATE_PATH = join(TEMP_WORKSPACE, 'voice-state.json');
+const VOICE_STATE_PATH = join(TEMP_WORKSPACE, 'state', 'voice-state.json');
 
 let child: ChildProcess;
 

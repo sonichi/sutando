@@ -105,7 +105,7 @@ const HOST = process.env.HOST || '0.0.0.0';
 // "default to sutando/ so Claude Code subprocess picks up CLAUDE.md" comment
 // — voice-agent no longer spawns Claude Code (task-bridge handles that via
 // the file pipeline); the dual-use rationale is obsolete.
-import { resolveWorkspace } from './workspace_default.js';
+import { resolveWorkspace, statusPath } from './workspace_default.js';
 const WORKSPACE_DIR = resolveWorkspace();
 const PIDFILE = join(WORKSPACE_DIR, '.voice-agent.pid');
 const DEFAULT_THREAD_KEY = 'sutando_main';
@@ -556,7 +556,7 @@ const mainAgent: MainAgent = {
 		let standName = '';
 		try { const si = JSON.parse(readFileSync(personalPath('stand-identity.json'), 'utf-8')); standName = si.name ? ` — ${si.name}` : ''; } catch {}
 		// Detect first-time user: no conversation log means brand new
-		const hasHistory = existsSync(join(WORKSPACE_DIR, 'conversation.log'));
+		const hasHistory = existsSync(join(WORKSPACE_DIR, 'logs', 'conversation.log'));
 		const tutorialHint = hasHistory ? '' : ' Then say: "If this is your first time, say tutorial and I\'ll walk you through what I can do."';
 		// Check for today's briefing and insight
 		const today = new Date().toISOString().slice(0, 10);
@@ -853,13 +853,13 @@ async function main() {
 	function writeVoiceState(connected: boolean) {
 		try {
 			// voice-state.json is per-user runtime state — lives under
-			// $SUTANDO_WORKSPACE. Pre-fix this was a cwd-relative write
+			// $SUTANDO_WORKSPACE/state/. Pre-fix this was a cwd-relative write
 			// (effectively REPO_ROOT when launched from there), so the
 			// web-client's REPO_ROOT-relative reader happened to find it —
 			// but on hosts where SUTANDO_WORKSPACE is set or cwd drifts,
 			// voice-agent wrote one place and the consumer read another.
 			// Same workspace-contract fix as #849 for core-status.json.
-			writeFileSync(join(WORKSPACE_DIR, 'voice-state.json'), JSON.stringify({ connected, ts: Math.floor(Date.now() / 1000) }));
+			writeFileSync(statusPath('voice-state.json', WORKSPACE_DIR), JSON.stringify({ connected, ts: Math.floor(Date.now() / 1000) }));
 		} catch (err) {
 			console.error(`${ts()} [VoiceState] write failed:`, err);
 		}
@@ -1163,7 +1163,7 @@ async function main() {
 						const relativeSrc = audioPath.startsWith(WORKSPACE_DIR)
 							? audioPath.slice(WORKSPACE_DIR.replace(/\/$/, '').length + 1)
 							: audioPath;
-						writeFileSync(join(WORKSPACE_DIR, 'dynamic-content.json'), JSON.stringify({
+						writeFileSync(statusPath('dynamic-content.json', WORKSPACE_DIR), JSON.stringify({
 							type: 'audio', src: relativeSrc, title: 'Task Complete',
 						}));
 						console.log(`${ts()} [CartesiaTTS] Audio generated: ${audioPath}`);

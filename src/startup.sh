@@ -14,26 +14,20 @@ cd "$REPO"
 # $SUTANDO_ROOT.
 export SUTANDO_ROOT="$REPO"
 
-# Git committer attribution from stand-identity.json (opt-in, no env var).
-# The repo-local `user.email` (set to the GitHub privacy noreply) is the
-# AUTHOR — CLA-Assistant resolves it to the owner's GitHub account, gating
-# the PR check. The COMMITTER is free to carry per-host attribution so that
-# `git log --format='%h %an / %cn %s'` distinguishes which Sutando host
-# crafted each commit (Mini, MacBook, …). Without this, all bot commits
-# share both fields and you lose track of which fleet host did the work.
+# Git committer attribution: REMOVED (2026-05-21). This block used to set
+# committer.name/committer.email from stand-identity.json so `git log %cn`
+# showed which fleet host crafted a commit. But git 2.31+ honors committer.*
+# config natively, making the COMMITTER a non-GitHub identity
+# (`<host>@noreply.sutando.local`) — and CLA-Assistant gates on BOTH the
+# author AND the committer. Result: every fleet commit was CLA-blocked
+# (PR #947 and others, 2026-05-21). Per-host attribution is not worth
+# blocking every PR; if still wanted, carry it in a commit-message trailer
+# (CLA-Assistant ignores trailers), never in the committer identity.
 #
-# Silent fall-through on every "no identity" path: missing file, missing
-# jq, empty/malformed fields. OSS users see no change — they don't ship a
-# stand-identity.json. Fleet hosts opt in by virtue of having one.
-if [ -f "$REPO/stand-identity.json" ] && command -v jq > /dev/null 2>&1; then
-  _stand_name=$(jq -r '.name // empty' "$REPO/stand-identity.json" 2>/dev/null)
-  _stand_machine=$(jq -r '.machine // empty' "$REPO/stand-identity.json" 2>/dev/null)
-  if [ -n "$_stand_name" ] && [ -n "$_stand_machine" ]; then
-    git -C "$REPO" config committer.name "$_stand_name"
-    git -C "$REPO" config committer.email "${_stand_machine}@noreply.sutando.local"
-  fi
-  unset _stand_name _stand_machine
-fi
+# Actively clear any stale committer.* a prior startup wrote, so every
+# fleet host self-heals on its next boot.
+git -C "$REPO" config --unset committer.name 2>/dev/null || true
+git -C "$REPO" config --unset committer.email 2>/dev/null || true
 
 # Auto-bootstrap: create-if-missing files and dirs that the agent + skills
 # expect to exist (logs, state, tasks, results, notes, contextual-chips.json,

@@ -13,13 +13,24 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-# Look for quota-state.json in skill dir, parent, or cwd
+# Canonical home is <workspace>/state/quota-state.json (written by the
+# credential proxy). status_read_path also tries the legacy workspace-root
+# path; the skill-dir / cwd entries below stay as last-resort fallbacks for
+# one release while older proxy installs roll over.
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+try:
+    from workspace_default import status_read_path  # noqa: E402
+    _canonical = status_read_path("quota-state.json")
+except Exception:
+    _canonical = None
+
 for candidate in [
-    Path(__file__).parent.parent.parent / "quota-state.json",
+    _canonical,
     Path(__file__).parent.parent / "quota-state.json",
     Path.cwd() / "quota-state.json",
 ]:
-    if candidate.exists():
+    if candidate is not None and candidate.exists():
         QUOTA_FILE = candidate
         break
 else:
