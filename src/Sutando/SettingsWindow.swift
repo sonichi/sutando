@@ -1062,6 +1062,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         hint.textColor = .secondaryLabelColor
         hint.maximumNumberOfLines = 2
         hint.lineBreakMode = .byWordWrapping
+        // Pin the hint to the editor width. Without this its intrinsic
+        // width is the full single-line text — a long help string (Slack's)
+        // widens the whole row past the 504px editors and knocks the row
+        // out of left-alignment with the others.
+        hint.translatesAutoresizingMaskIntoConstraints = false
+        hint.preferredMaxLayoutWidth = 504
+        hint.widthAnchor.constraint(equalToConstant: 504).isActive = true
         row.addArrangedSubview(hint)
         return row
     }
