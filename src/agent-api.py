@@ -91,6 +91,14 @@ PORT = int(os.environ.get("AGENT_API_PORT", "7843"))
 sys.path.insert(0, str(Path(__file__).parent))
 from util_paths import personal_path  # noqa: E402
 from state_paths import state_dir, state_path  # noqa: E402
+from workspace_default import resolve_workspace  # noqa: E402
+
+# Per-user mutable state (pending-questions.md, etc.) lives under the
+# workspace, NOT the repo. REPO_DIR is only correct for repo-bundled public
+# assets (stand-avatar.png, stand-identity.json). Passing REPO_DIR to
+# personal_path() for pending-questions.md resolved to a non-existent path,
+# so the web UI Questions panel was always empty.
+WORKSPACE = resolve_workspace()
 
 # Simple token auth — set SUTANDO_API_TOKEN in .env for remote access security
 API_TOKEN = os.environ.get("SUTANDO_API_TOKEN", "")
@@ -367,7 +375,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             tasks = [{"id": tid, **tdata} for tid, tdata in sorted_tasks]
             # Parse pending questions
             questions = []
-            pq_file = Path(personal_path("pending-questions.md", REPO_DIR))
+            pq_file = Path(personal_path("pending-questions.md", WORKSPACE))
             if pq_file.exists():
                 import re
                 content = pq_file.read_text()
@@ -679,7 +687,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if not qid or not answer:
                     self.send_json(400, {"error": "id and answer required"})
                     return
-                pq_file = Path(personal_path("pending-questions.md", REPO_DIR))
+                pq_file = Path(personal_path("pending-questions.md", WORKSPACE))
                 if pq_file.exists():
                     content = pq_file.read_text()
                     # Update status from unanswered to answered

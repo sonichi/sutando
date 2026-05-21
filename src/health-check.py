@@ -644,7 +644,11 @@ def check_core_proactive_loop(threshold_sec: int = 600) -> dict:
     Status is anything other than "running" → ok regardless of age.
     """
     name = "core-proactive-loop"
-    status_path = WORKSPACE_DIR / "core-status.json"
+    # core-status.json was relocated from the workspace root to state/ in
+    # PR #940 (see CLAUDE.md "Work Status" + the proactive-loop step-0
+    # instruction). Reading the old root path saw a stale pre-relocation
+    # orphan and warned on every pass — a permanent false positive.
+    status_path = WORKSPACE_DIR / "state" / "core-status.json"
     if not status_path.exists():
         return {"name": name, "status": "ok", "detail": "core-status.json not yet written"}
     try:
