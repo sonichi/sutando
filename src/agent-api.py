@@ -294,7 +294,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "/tasks/active":
             # List active tasks + system status for the web client
             watcher_ok = _pgrep_ok("watch-tasks")
-            claude_ok = _pgrep_ok("claude.*sutando-core")
+            # The core agent runs as `claude … -- /proactive-loop` inside the
+            # `sutando-core` tmux session (src/run-core-agent.sh). "sutando-core"
+            # is only the tmux session name — never in the claude process args —
+            # so the old `claude.*sutando-core` pattern matched nothing and the
+            # dashboard always showed "brain offline". Match the proactive-loop
+            # command the core agent is actually launched with.
+            claude_ok = _pgrep_ok("claude.*proactive-loop")
             # Scan disk for active tasks, update history (preserve existing text)
             for f in sorted(TASK_DIR.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]:
                 task_id = f.stem
