@@ -92,6 +92,34 @@ const WATCHDOG_STALL_MS = Number(process.env.SUTANDO_WATCHDOG_STALL_MS) || 20000
 // trusted (single-operator Lounge, not community/public).
 const TREAT_AS_OWNER = (process.env.DISCORD_VOICE_OWNER ?? 'false') === 'true';
 
+// --- Per-speaker access tier (owner / team / other) -------------------------
+// Mirrors the discord-bridge access model so the two never drift — read from
+// the same ~/.claude/channels/discord/access.json the bridge uses:
+//   owner — the `owner` field (this instance's single operator)
+//   team  — the rest of `allowFrom` (trusted circle: peers, collaborators)
+//   other — anyone else who speaks in the channel
+// A Gemini Live session's tool list is fixed at session start, so the tier
+// is enforced per-turn at tool execute() time, keyed off the last speaker.
+type Tier = 'owner' | 'team' | 'other';
+
+function loadAccessTiers(): { owner: string; team: Set<string> } {
+	try {
+		const p = join(process.env.HOME ?? '', '.claude/channels/discord/access.json');
+		const a = JSON.parse(readFileSync(p, 'utf-8'));
+		return { owner: String(a.owner ?? ''), team: new Set<string>(a.allowFrom ?? []) };
+	} catch {
+		return { owner: '', team: new Set<string>() };
+	}
+}
+const ACCESS = loadAccessTiers();
+
+function tierFor(userId: string | undefined): Tier {
+	if (!userId) return 'other';
+	if (ACCESS.owner && userId === ACCESS.owner) return 'owner';
+	if (ACCESS.team.has(userId)) return 'team';
+	return 'other';
+}
+
 // CLI: --guild <id> --channel <voice_channel_id>
 function getArg(name: string): string | undefined {
 	const i = process.argv.indexOf(`--${name}`);
@@ -180,9 +208,15 @@ interface DiscordVoiceSession {
 	taskResultCache?: Map<string, string>;
 	_toolIdMap?: Map<string, string>;
 	subscribedUsers: Set<string>;
+	lastSpeakerId?: string;
 	audioPending: Buffer[];
 	toolCalls: { name: string; durationMs: number; timestamp: string }[];
 	events: { event: string; timestamp: string }[];
+}
+
+// Tier of the most-recent speaker — the gate owner-tier tools check.
+function currentTier(s: DiscordVoiceSession): Tier {
+	return tierFor(s.lastSpeakerId);
 }
 
 let active: DiscordVoiceSession | null = null;
@@ -217,7 +251,7 @@ function delegateTask(s: DiscordVoiceSession, taskDescription: string): Promise<
 		`source: discord-voice\n` +
 		`guild: ${s.guildId}\n` +
 		`channel: ${s.channelId}\n` +
-		`access_tier: ${TREAT_AS_OWNER ? 'owner' : 'other'}\n` +
+		`access_tier: ${currentTier(s)}\n` +
 		`task: ${taskDescription}\n` +
 		`hint: Check ~/.claude/skills/ for a matching skill before using raw commands.\n` +
 		`transcript:\n${fullTranscript}\n`;
@@ -266,7 +300,9 @@ function delegateTask(s: DiscordVoiceSession, taskDescription: string): Promise<
 // --- Build agent ------------------------------------------------------------
 
 function buildAgent(s: DiscordVoiceSession): MainAgent {
-	const isOwner = TREAT_AS_OWNER;
+	// Declare the full owner toolset whenever an owner is configured (access.json)
+	// or the legacy flag is on; the per-speaker tier is then enforced at execute().
+	const isOwner = TREAT_AS_OWNER || !!ACCESS.owner;
 
 	let instructions: string;
 	if (isOwner) {
@@ -418,6 +454,36 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 				return { inProgress: s.pendingTasks > 0, pendingCount: s.pendingTasks };
 			},
 		});
+	}
+
+	// Per-speaker tier gate. The Gemini session's tool list is fixed at start,
+	// so enforce the tier at execute() time, keyed off the last speaker:
+	//   owner-only — work, dismiss, screen-share tools, ownerOnlyTools
+	//   owner+team — configurableTools
+	//   open       — inlineTools + get_task_status (read-only surface)
+	const OWNER_ONLY = new Set<string>([
+		'work', 'dismiss', 'share_screen', 'summon', 'stop_share_screen',
+		...ownerOnlyTools.map(t => t.name),
+	]);
+	const OWNER_OR_TEAM = new Set<string>(configurableTools.map(t => t.name));
+	for (let i = 0; i < tools.length; i++) {
+		const t = tools[i];
+		const need: Tier | null = OWNER_ONLY.has(t.name) ? 'owner'
+			: OWNER_OR_TEAM.has(t.name) ? 'team' : null;
+		if (!need) continue;
+		const inner = t.execute.bind(t);
+		tools[i] = {
+			...t,
+			execute: async (args: any) => {
+				const tier = currentTier(s);
+				const ok = need === 'owner' ? tier === 'owner' : tier !== 'other';
+				if (!ok) {
+					console.log(`${ts()} [Tier] '${t.name}' denied — speaker tier=${tier}, needs ${need}`);
+					return { status: 'denied', message: `That needs ${need}-tier access; the current speaker is ${tier}-tier.` };
+				}
+				return inner(args);
+			},
+		};
 	}
 
 	return {
@@ -743,7 +809,10 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 	(s as any)._watchdogHandle = watchdog;
 
 	// Subscribe to anyone currently speaking, and to anyone who starts.
-	connection.receiver.speaking.on('start', (userId) => subscribeUser(s, userId));
+	connection.receiver.speaking.on('start', (userId) => {
+		s.lastSpeakerId = userId;
+		subscribeUser(s, userId);
+	});
 	// Start the constant-rate ticker that flushes audio to Gemini every 20ms.
 	startAudioTicker(s);
 
