@@ -5,6 +5,7 @@
  * CLAUDE.md § Frontend Conventions ("no fetch calls in components").
  */
 
+import type { SubscriptionsData } from '@/types/subscription';
 import { resolveConfig } from './config';
 
 export type AgentState = 'idle' | 'listening' | 'speaking' | 'working' | 'seeing';
@@ -74,6 +75,78 @@ export interface StandIdentity {
 	nameOrigin?: string;
 	avatarGenerated?: boolean;
 	avatarUrl?: string;
+}
+
+/**
+ * Fetch the agent-maintained subscription tracker
+ * (`skills/subscription-scanner/state/subscriptions.json`). The server
+ * returns an empty shape when no scan has run yet, so this never 404s.
+ */
+export async function fetchSubscriptions(signal?: AbortSignal): Promise<SubscriptionsData> {
+	const res = await fetch(apiUrl('/paidsubscriptions/data'), { signal });
+	if (!res.ok) throw new Error(`/paidsubscriptions/data returned ${res.status}`);
+	return (await res.json()) as SubscriptionsData;
+}
+
+/**
+ * Queue an out-of-cycle subscription scan. The server gates this to
+ * localhost and writes a task file the next loop pass picks up — the
+ * scan itself runs asynchronously in the agent.
+ */
+export async function triggerSubscriptionScan(): Promise<{ taskId: string }> {
+	const res = await fetch(apiUrl('/paidsubscriptions/scan'), { method: 'POST' });
+	if (!res.ok) {
+		const detail = (await res.json().catch(() => null)) as { error?: string } | null;
+		throw new Error(detail?.error ?? `/paidsubscriptions/scan returned ${res.status}`);
+	}
+	return (await res.json()) as { taskId: string };
+}
+
+export interface VisionState {
+	streaming: boolean;
+	source: string | null;
+	fps: number;
+	frames: number;
+	durationMs: number;
+	sessionReady: boolean;
+}
+
+/** Current vision-streaming state — proxied to the voice-agent's control server. */
+export async function fetchVisionState(signal?: AbortSignal): Promise<VisionState> {
+	const res = await fetch(apiUrl('/vision/state'), { signal });
+	if (!res.ok) throw new Error(`/vision/state returned ${res.status}`);
+	return (await res.json()) as VisionState;
+}
+
+/** Tell the voice agent we are entering browser push mode. */
+export async function postVisionStart(): Promise<{ status: string; error?: string }> {
+	const res = await fetch(apiUrl('/vision/start'), {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ source: 'browser' }),
+	});
+	return (await res.json().catch(() => ({ status: 'failed', error: 'bad json' }))) as {
+		status: string;
+		error?: string;
+	};
+}
+
+/** Stop vision streaming. Failure-safe — teardown should not block on it. */
+export async function postVisionStop(): Promise<void> {
+	await fetch(apiUrl('/vision/stop'), {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: '{}',
+	}).catch(() => {});
+}
+
+/** Push one captured JPEG frame into the active vision stream. */
+export async function postVisionFrame(blob: Blob): Promise<Response> {
+	return fetch(apiUrl('/vision/frame'), {
+		method: 'POST',
+		headers: { 'Content-Type': 'image/jpeg' },
+		body: blob,
+	});
 }
 
 /**

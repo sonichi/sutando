@@ -51,3 +51,50 @@
 	padding: 0;
 	margin: 0;
 }
+
+/* Rendered markdown inside chat bubbles (ConversationStream → MarkdownBody).
+   Scoped to `.chat-md` so it only touches sanitized message HTML. Spacing is
+   tight — bubbles are small. Colors inherit the bubble's `currentColor` so
+   the same rules read correctly on both the dark user bubble and the light
+   assistant bubble. */
+.chat-md > :first-child { margin-top: 0; }
+.chat-md > :last-child { margin-bottom: 0; }
+.chat-md p { margin: 0 0 0.5em; }
+.chat-md ul,
+.chat-md ol { margin: 0.35em 0; padding-left: 1.35em; }
+.chat-md li { margin: 0.15em 0; }
+.chat-md h1,
+.chat-md h2,
+.chat-md h3,
+.chat-md h4 { margin: 0.6em 0 0.3em; font-weight: 600; line-height: 1.25; }
+.chat-md h1 { font-size: 1.15em; }
+.chat-md h2 { font-size: 1.08em; }
+.chat-md h3,
+.chat-md h4 { font-size: 1em; }
+.chat-md a { color: inherit; text-decoration: underline; text-underline-offset: 2px; }
+.chat-md code {
+	font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+	font-size: 0.88em;
+	background: rgba(127, 127, 127, 0.22);
+	padding: 0.1em 0.34em;
+	border-radius: 4px;
+}
+.chat-md pre {
+	margin: 0.45em 0;
+	padding: 0.6em 0.75em;
+	background: rgba(127, 127, 127, 0.18);
+	border-radius: 8px;
+	overflow-x: auto;
+}
+.chat-md pre code { background: none; padding: 0; font-size: 0.85em; }
+.chat-md blockquote {
+	margin: 0.45em 0;
+	padding-left: 0.7em;
+	border-left: 3px solid currentColor;
+	opacity: 0.85;
+}
+.chat-md table { border-collapse: collapse; margin: 0.45em 0; }
+.chat-md th,
+.chat-md td { border: 1px solid rgba(127, 127, 127, 0.4); padding: 0.25em 0.5em; }
+.chat-md img { max-width: 100%; border-radius: 8px; }
+.chat-md hr { border: none; border-top: 1px solid rgba(127, 127, 127, 0.35); margin: 0.6em 0; }

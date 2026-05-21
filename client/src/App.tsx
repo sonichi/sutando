@@ -6,6 +6,7 @@ import ConversationPage from '@/pages/conversation';
 import CoreCLIPage from '@/pages/core-cli';
 import DashboardPage from '@/pages/dashboard';
 import SettingsPage from '@/pages/settings';
+import SubscriptionsPage from '@/pages/subscriptions';
 
 const renderPage = (id: AppRouteId) => {
 	switch (id) {
@@ -15,6 +16,8 @@ const renderPage = (id: AppRouteId) => {
 			return <CoreCLIPage />;
 		case 'dashboard':
 			return <DashboardPage />;
+		case 'subscriptions':
+			return <SubscriptionsPage />;
 		case 'settings':
 			return <SettingsPage />;
 		default:

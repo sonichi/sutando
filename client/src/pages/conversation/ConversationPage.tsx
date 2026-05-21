@@ -1,4 +1,6 @@
 import { useCallback, useState } from 'react';
+import CapabilitiesPanel from '@/components/atoms/capabilities-panel';
+import VisionPreview from '@/components/atoms/vision-preview';
 import ConversationComposer from '@/components/molecules/conversation-composer';
 import ConversationHero from '@/components/molecules/conversation-hero';
 import ConversationTopBar from '@/components/molecules/conversation-top-bar';
@@ -15,6 +17,7 @@ import { useStandIdentity } from '@/hooks/useStandIdentity';
 import { useTaskPolling } from '@/hooks/useTaskPolling';
 import { useTaskToastDriver } from '@/hooks/useTaskToastDriver';
 import { useTextSubmit } from '@/hooks/useTextSubmit';
+import { useVision } from '@/hooks/useVision';
 import { useVoiceAutoReconnect } from '@/hooks/useVoiceAutoReconnect';
 import { useVoiceSession } from '@/hooks/useVoiceSession';
 
@@ -56,6 +59,9 @@ export default function ConversationPage() {
 	const tagline =
 		identity?.nameOrigin?.split(' — ')[1] ?? identity?.nameOrigin ?? APP_COPY.convTagline;
 	const isLive = voice.status === 'live';
+	// Vision (screen sharing into the voice session) is only meaningful
+	// while voice is live — the hook tears its push session down otherwise.
+	const vision = useVision(isLive);
 	// Text-only submissions append to the same conversation store the voice
 	// stream feeds. Without this, hitting Send in idle mode wiped the
 	// composer and surfaced nothing — the user's message + reply went into
@@ -89,10 +95,12 @@ export default function ConversationPage() {
 					standName={standName}
 					voiceStatus={voice.status}
 					muted={voice.muted}
+					watching={vision.watching}
 					dashboardUrl={DASHBOARD_ORIGIN}
 					onStartVoice={onStartVoice}
 					onStopVoice={onStopVoice}
 					onToggleMute={toggleMute}
+					onToggleWatch={vision.toggleWatch}
 				/>
 				<ConversationPanels />
 			</div>
@@ -110,6 +118,7 @@ export default function ConversationPage() {
 							avatarPngUrl={avatarPngUrl}
 							onStartVoice={onStartVoice}
 						/>
+						<CapabilitiesPanel />
 						<KbdHintsRow />
 						<QuickStartGrid connected={isLive} onPick={onPickPrompt} />
 					</>
@@ -125,6 +134,7 @@ export default function ConversationPage() {
 				onToggleMute={toggleMute}
 			/>
 
+			<VisionPreview stream={vision.stream} frameCount={vision.frameCount} />
 			<ToastOverlay />
 		</div>
 	);

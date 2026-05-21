@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import { APP_COPY } from '@/const-values/app-copy';
 import { useConversation } from '@/hooks/useConversation';
+import { renderChatMarkdown } from '@/lib/chat-markdown';
 import type { TranscriptEntry } from '@/types/conversation';
 
 /**
@@ -62,6 +63,28 @@ function CopyBubble({ text }: { text: string }) {
 			{copied ? 'Copied' : 'Copy'}
 		</button>
 	);
+}
+
+/**
+ * Finalized user/assistant text renders as sanitized markdown. System
+ * pills and still-streaming (interim) entries stay plain text — partial
+ * markdown flickers mid-stream, and system copy is never markdown.
+ * Memoized on `text` so an unrelated entry update doesn't re-parse every
+ * bubble in the transcript.
+ */
+const MarkdownBody = memo(function MarkdownBody({ text }: { text: string }) {
+	return (
+		<div
+			className="chat-md"
+			// renderChatMarkdown runs marked → DOMPurify; output is sanitized.
+			dangerouslySetInnerHTML={{ __html: renderChatMarkdown(text) }}
+		/>
+	);
+});
+
+function MessageText({ entry }: { entry: TranscriptEntry }) {
+	if (entry.role === 'system' || entry.interim) return <span>{entry.text}</span>;
+	return <MarkdownBody text={entry.text} />;
 }
 
 function MediaSlot({ entry }: { entry: TranscriptEntry }) {
@@ -134,7 +157,7 @@ export default function ConversationStream({ errorMessage }: ConversationStreamP
 									{ROLE_LABEL[entry.role]}
 								</span>
 							) : null}
-							<span>{entry.text}</span>
+							<MessageText entry={entry} />
 							<MediaSlot entry={entry} />
 							{showCopy ? <CopyBubble text={entry.text} /> : null}
 						</div>

@@ -86,6 +86,8 @@ export const APP_COPY = {
 	convMute: 'Mute',
 	convUnmute: 'Unmute',
 	convEnd: 'End',
+	convWatch: '👁️ Watch',
+	convWatching: '👁️ Watching',
 	convStreamEmpty: 'No messages yet. Try a quick start or speak with the orb.',
 	convShortcutDropContext: 'drop context',
 	convShortcutDropScreenshot: 'drop screenshot',
@@ -108,6 +110,27 @@ export const APP_COPY = {
 	slackSaved: 'Saved. Restart the Slack bridge to apply.',
 	slackSaveFailed: 'Save failed —',
 	slackLoadFailed: 'Could not reach the settings endpoint —',
+
+	// Subscriptions — paid-subscription tracker
+	subsTitle: 'Paid subscriptions',
+	subsHint: 'Tracked from Gmail receipts by the subscription-scanner skill.',
+	subsLoading: 'Loading subscriptions…',
+	subsLoadFailed: 'Could not load subscriptions —',
+	subsEmpty: 'No scan yet. Run a scan to populate this from your Gmail receipts.',
+	subsNeverScanned: 'Never scanned',
+	subsLastScan: 'Last scan',
+	subsScanNow: 'Scan now',
+	subsScanning: 'Scanning… (runs in the background)',
+	subsCardActive: 'Active',
+	subsCardBurn: 'Monthly burn',
+	subsCardUncertain: 'Uncertain',
+	subsCardCancelled: 'Recently cancelled',
+	subsColVendor: 'Vendor',
+	subsColAmount: 'Amount',
+	subsColFrequency: 'Frequency',
+	subsColAccount: 'Account',
+	subsColNextCharge: 'Next charge',
+	subsColStatus: 'Status',
 } as const;
 
 export type VoiceStatusKey =
