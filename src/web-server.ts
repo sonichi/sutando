@@ -16,6 +16,9 @@
  *                             Used by main.swift, voice-agent.ts tool hooks, and the page.
  *   GET  /toggle, /mute     — Broadcast SSE events (driven by menu-bar hotkeys).
  *   POST /note-viewing      — Write /tmp/sutando-note-viewing.json (consumed by the agent).
+ *   GET  /paidsubscriptions/data  — subscription-scanner skill state JSON.
+ *   POST /paidsubscriptions/scan  — queue an out-of-cycle scan (localhost-only).
+ *   *    /vision/{state,start,stop,frame} — proxy to the voice-agent vision server.
  *
  * Lifecycle: started by voice-agent.ts in the same process — replaces the old
  * standalone `com.sutando.web-client` launchd service. One Node process owns
@@ -32,13 +35,25 @@ import { extname, normalize, sep, join } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { readTmuxStatus } from './tmux-status.js';
-import { statePath } from './state-paths.js';
+import { statePath, statePathEnsured } from './state-paths.js';
 
 // Dist directory for the React bundle (`client/`). Resolved once at module
 // load — web-server.ts lives in `src/`, so `../client/dist` lands at the
 // workspace root. PR-C step 6 retired the inline HTML fallback; `pnpm
 // build:client` must run for `/` to render anything.
 const CLIENT_DIST_DIR = fileURLToPath(new URL('../client/dist/', import.meta.url));
+
+// Repo root — web-server.ts lives in `src/`, so `../` is the checkout root.
+// The subscription-scanner skill's state file lives in the repo tree
+// (gitignored — personal financial data), populated by the agent on a scan.
+const REPO_DIR = fileURLToPath(new URL('../', import.meta.url));
+const SUBSCRIPTIONS_FILE = join(
+	REPO_DIR,
+	'skills',
+	'subscription-scanner',
+	'state',
+	'subscriptions.json'
+);
 
 // Slack bridge credential file — shared convention with Discord/Telegram.
 const SLACK_ENV_PATH = join(homedir(), '.claude', 'channels', 'slack', '.env');
@@ -517,6 +532,111 @@ export function startWebServer(opts: WebServerOptions): import('node:http').Serv
 				} catch (e) {
 					res.writeHead(400, { 'Content-Type': 'application/json' });
 					res.end(JSON.stringify({ error: e instanceof Error ? e.message : 'parse failed' }));
+				}
+			});
+			return;
+		}
+
+		// Paid-subscriptions dashboard data. Reads the subscription-scanner
+		// skill's state file (gitignored — populated by the agent during a
+		// scan). Returns an empty shape when the file is absent so the client
+		// renders a clean "no scan yet" state instead of erroring.
+		if (url.pathname === '/paidsubscriptions/data' && req.method === 'GET') {
+			let data: unknown = { last_scan: null, subscriptions: [], scan_history: [] };
+			try {
+				data = JSON.parse(readFileSync(SUBSCRIPTIONS_FILE, 'utf-8'));
+			} catch { /* missing or unparseable → default empty shape */ }
+			res.writeHead(200, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify(data));
+			return;
+		}
+
+		// Queue an out-of-cycle subscription scan. LOCALHOST-ONLY: the server
+		// binds 0.0.0.0, so without this gate anyone on the LAN (or a
+		// tailscale-funnel'd public URL) could enqueue an owner-tier task that
+		// the watcher runs with full agent privileges. Check the socket peer
+		// address directly — X-Forwarded-For is spoofable behind any proxy.
+		// The task body points at scan-prompt.md by path rather than inlining
+		// it, so a line in that file shaped like a task header (`source:`,
+		// `access_tier:`) can never be parsed as a real header.
+		if (url.pathname === '/paidsubscriptions/scan' && req.method === 'POST') {
+			const peer = req.socket.remoteAddress || '';
+			const isLocal =
+				peer === '127.0.0.1' || peer === '::1' || peer === '::ffff:127.0.0.1';
+			if (!isLocal) {
+				res.writeHead(403, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify({ error: 'Scan can only be triggered from localhost.' }));
+				return;
+			}
+			try {
+				const ts = Math.floor(Date.now() / 1000);
+				const id = `task-subscan-${ts}`;
+				const body =
+					[
+						`id: ${id}`,
+						`timestamp: ${new Date().toISOString()}`,
+						'task: Run an out-of-cycle paid-subscription scan. Read skills/subscription-scanner/scan-prompt.md and follow its instructions verbatim — update skills/subscription-scanner/state/subscriptions.json, snapshot history, and notify only on changes.',
+						'source: web',
+						'access_tier: owner',
+					].join('\n') + '\n';
+				writeFileSync(statePathEnsured(`tasks/${id}.txt`), body);
+				res.writeHead(200, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify({ ok: true, taskId: id }));
+			} catch (e) {
+				res.writeHead(500, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify({ error: e instanceof Error ? e.message : 'failed to queue scan' }));
+			}
+			return;
+		}
+
+		// Vision control proxy. The voice-agent process exposes
+		// /vision/{state,start,stop,frame} on 127.0.0.1:VISION_CONTROL_PORT
+		// (default 7848); the browser hits us same-origin to avoid CORS and
+		// keep one public surface. /vision/frame carries a binary JPEG body —
+		// preserve the content-type and pass the buffer straight through.
+		// When voice-agent isn't reachable, surface a synthetic state so the
+		// Watch button can't get stuck mid-toggle.
+		if (
+			url.pathname === '/vision/state' ||
+			url.pathname === '/vision/start' ||
+			url.pathname === '/vision/stop' ||
+			url.pathname === '/vision/frame'
+		) {
+			const visionPort = Number(process.env.VISION_CONTROL_PORT) || 7848;
+			const method = req.method === 'POST' ? 'POST' : 'GET';
+			const isFrame = url.pathname === '/vision/frame';
+			const visionPath = url.pathname;
+			const chunks: Buffer[] = [];
+			req.on('data', (c: Buffer) => chunks.push(c));
+			req.on('end', async () => {
+				try {
+					const incomingType =
+						(req.headers['content-type'] as string | undefined) ||
+						(isFrame ? 'image/jpeg' : 'application/json');
+					const upstream = await fetch(`http://127.0.0.1:${visionPort}${visionPath}`, {
+						method,
+						headers: method === 'POST' ? { 'Content-Type': incomingType } : undefined,
+						body:
+							method === 'POST'
+								? chunks.length
+									? Buffer.concat(chunks)
+									: isFrame
+										? Buffer.alloc(0)
+										: '{}'
+								: undefined,
+					});
+					const text = await upstream.text();
+					res.writeHead(upstream.status, { 'Content-Type': 'application/json' });
+					res.end(text);
+				} catch {
+					const fallback =
+						visionPath === '/vision/state'
+							? { streaming: false, source: null, fps: 0, frames: 0, durationMs: 0, sessionReady: false }
+							: { status: 'failed', error: 'voice-agent not reachable' };
+					res.writeHead(visionPath === '/vision/state' ? 200 : 503, {
+						'Content-Type': 'application/json',
+					});
+					res.end(JSON.stringify(fallback));
 				}
 			});
 			return;

@@ -131,9 +131,12 @@ export const openFileTool: ToolDefinition = {
 	},
 };
 
-// Re-export meeting tools from meeting-tools
-export { summonTool, dismissTool, joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool } from './meeting-tools.js';
-import { summonTool, dismissTool, joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool } from './meeting-tools.js';
+// Re-export Zoom tools from skill
+export { summonTool, dismissTool, joinZoomTool } from '../skills/zoom/tools.js';
+import { summonTool, dismissTool, joinZoomTool } from '../skills/zoom/tools.js';
+// Re-export remaining meeting tools
+export { joinGmeetTool, lookupMeetingIdTool, callContactTool } from './meeting-tools.js';
+import { joinGmeetTool, lookupMeetingIdTool, callContactTool } from './meeting-tools.js';
 
 // --- Keyboard tool ---
 
@@ -159,6 +162,11 @@ export const pressKeyTool: ToolDefinition = {
 			'enter': 36, 'return': 36, 'escape': 53, 'esc': 53, 'tab': 48,
 			'delete': 51, 'backspace': 51, 'space': 49,
 			'up': 126, 'down': 125, 'left': 123, 'right': 124,
+			// Common voice-spoken aliases — without these, the fallthrough to
+			// `keystroke "<key>"` types the literal string into the focused
+			// field instead of pressing the arrow.
+			'uparrow': 126, 'downarrow': 125, 'leftarrow': 123, 'rightarrow': 124,
+			'arrowup': 126, 'arrowdown': 125, 'arrowleft': 123, 'arrowright': 124,
 			'a': 0, 'c': 8, 'v': 9, 'x': 7, 'z': 6, 'f': 3, 's': 1, 'w': 13, 'q': 12,
 		};
 		const keyCode = keyMap[key.toLowerCase()];
@@ -266,35 +274,51 @@ export const captureScreenTool: ToolDefinition = {
 export const typeTextTool: ToolDefinition = {
 	name: 'type_text',
 	description:
-		'Type text into the currently focused field. Use for: "type hello", "enter my email". Instant.',
+		'Type text into the currently focused field. Use for: "type hello", "enter my email". Instant. ' +
+		'Pass `append=true` when the user wants the text added AFTER any existing selection ("add this", ' +
+		'"append", "type at the end") — without it, the paste branch will REPLACE the selection per macOS ' +
+		'Cmd-V semantics. Default is replace, which matches most "type X here" intents.',
 	parameters: z.object({
 		text: z.string().describe('The text to type'),
+		append: z.boolean().optional().describe('If true, collapse any selection to its end before pasting so the text is appended rather than replacing the selection. Use when the user says "add", "append", or "type at the end".'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { text } = args as { text: string };
-		// Multi-line or long text: use clipboard paste (keystroke can't handle newlines)
-		// Gemini sends literal \n (two chars backslash+n), not actual newlines
-		const hasNewline = text.includes('\n') || text.includes('\r') || /\\n/.test(text) || text.length > 80;
-		if (hasNewline) {
+		const { text, append } = args as { text: string; append?: boolean };
+		// Multi-line, long, or non-ASCII text: use clipboard paste.
+		// AppleScript's `keystroke "..."` routes through virtual-key codes that
+		// can't represent characters outside the basic ASCII typing range —
+		// em-dashes (U+2014), curly quotes (U+2018-U+201D), and emoji all get
+		// corrupted (UTF-8 bytes reinterpreted as Mac Roman → e.g. 🤖 mojibake,
+		// — → "‚Äî"). The paste branch round-trips through the system pasteboard
+		// which preserves bytes. Per Chi 2026-05-13 frustration with emoji corruption.
+		// Gemini sends literal \n (two chars backslash+n), not actual newlines.
+		const hasNonAscii = /[^\x00-\x7f]/.test(text);
+		const needsPaste = text.includes('\n') || text.includes('\r') || /\\n/.test(text) || text.length > 80 || hasNonAscii;
+		if (needsPaste) {
 			try {
+				// Force UTF-8 locale for the child shell — voice-agent runs under
+				// launchd which doesn't inherit terminal LANG/LC_CTYPE, so the
+				// default POSIX/C locale would make pbcopy treat multi-byte UTF-8
+				// as garbled single-byte and put "??" on the pasteboard. Pipe via
+				// stdin (input:) to bypass shell redirection entirely.
+				const utf8Env = { ...process.env, LANG: 'en_US.UTF-8', LC_ALL: 'en_US.UTF-8' };
 				let savedClipboard = '';
-				try { savedClipboard = execSync('pbpaste', { encoding: 'utf-8', timeout: 2_000 }); } catch {}
+				try { savedClipboard = execSync('pbpaste', { encoding: 'utf-8', timeout: 2_000, env: utf8Env }); } catch {}
 				// Convert literal \n to actual newlines
 				const pasteText = text.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
-				const tmpClip = `/tmp/sutando-typetext-clip-${Date.now()}.txt`;
-				writeFileSync(tmpClip, pasteText);
-				execSync(`pbcopy < ${tmpClip}`, { timeout: 2_000 });
-				execSync(`osascript -e 'tell application "System Events" to keystroke "v" using command down'`, { timeout: 5_000 });
+				execSync('pbcopy', { input: pasteText, encoding: 'utf-8', timeout: 2_000, env: utf8Env });
+				// Append mode: collapse selection to its end via Right-arrow before Cmd-V.
+				// Without this, macOS Cmd-V replaces the selection (standard semantics).
+				if (append) {
+					execSync(`osascript -e 'tell application "System Events" to key code 124'`, { timeout: 3_000, env: utf8Env });
+				}
+				execSync(`osascript -e 'tell application "System Events" to keystroke "v" using command down'`, { timeout: 5_000, env: utf8Env });
 				execSync('sleep 0.3');
 				if (savedClipboard) {
-					const tmpRestore = `/tmp/sutando-typetext-restore-${Date.now()}.txt`;
-					writeFileSync(tmpRestore, savedClipboard);
-					execSync(`pbcopy < ${tmpRestore}`, { timeout: 2_000 });
-					try { unlinkSync(tmpRestore); } catch {}
+					execSync('pbcopy', { input: savedClipboard, encoding: 'utf-8', timeout: 2_000, env: utf8Env });
 				}
-				try { unlinkSync(tmpClip); } catch {}
-				console.log(`${ts()} [TypeText] pasted (multi-line): ${text.slice(0, 40)}...`);
+				console.log(`${ts()} [TypeText] pasted (multi-line${append ? ', append' : ''}): ${text.slice(0, 40)}...`);
 				return { status: 'typed', text };
 			} catch (err) {
 				return { error: `Paste failed: ${err instanceof Error ? err.message : err}` };
@@ -306,8 +330,12 @@ export const typeTextTool: ToolDefinition = {
 		// shell breakout via text containing apostrophes.
 		const safeText = text.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
 		try {
+			// Append mode: collapse selection to its end via Right-arrow before typing.
+			if (append) {
+				execSync(`osascript -e 'tell application "System Events" to key code 124'`, { timeout: 3_000 });
+			}
 			execSync(`osascript -e 'tell application "System Events" to keystroke "${safeText}"'`, { timeout: 5_000 });
-			console.log(`${ts()} [TypeText] typed: ${text.slice(0, 40)}`);
+			console.log(`${ts()} [TypeText] typed${append ? ' (append)' : ''}: ${text.slice(0, 40)}`);
 			return { status: 'typed', text };
 		} catch (err) {
 			return { error: `Type failed: ${err instanceof Error ? err.message : err}` };
@@ -421,11 +449,14 @@ export const clipboardTool: ToolDefinition = {
 export const cancelTaskTool: ToolDefinition = {
 	name: 'cancel_task',
 	description:
-		'Cancel a pending task. Default (no args) cancels the most recent. ' +
+		'Cancel a pending or in-flight task by writing a CANCEL_INSTRUCTION task that core will see next. ' +
+		'Default (no args) cancels the most recent. ' +
 		'Pass `taskId` to cancel a specific task by id (e.g. "task-1777686932069"). ' +
 		'Pass `query` to cancel the first task whose content contains the substring (case-insensitive). ' +
 		'Pass `list: true` to list pending tasks (id + first 60 chars of content) without cancelling. ' +
-		'Use when user says "cancel", "nevermind", "stop that", "what\'s queued", "cancel the one about X".',
+		'Use when user says "cancel", "nevermind", "stop that", "what\'s queued", "cancel the one about X". ' +
+		'Note: in-flight processing only halts when core reaches the CANCEL_INSTRUCTION task in its queue — ' +
+		'this prevents future pickup + tells core to abort if mid-task, but doesn\'t interrupt a single LLM turn.',
 	parameters: z.object({
 		taskId: z.string().optional().describe('Specific task id to cancel (matches the filename without .txt).'),
 		query: z.string().optional().describe('Case-insensitive substring to match against task content. Cancels first match.'),
@@ -438,10 +469,10 @@ export const cancelTaskTool: ToolDefinition = {
 			const tasksDir = stateDir('tasks');
 			const resultsDir = stateDir('results');
 			const files = readdirSync(tasksDir).filter(f => f.endsWith('.txt')).sort();
-			if (files.length === 0) return { status: 'nothing_to_cancel' };
 
 			// list mode: return id + preview, no cancel
 			if (list) {
+				if (files.length === 0) return { status: 'nothing_pending', count: 0, tasks: [] };
 				const items = files.map(f => {
 					const id = f.replace('.txt', '');
 					let preview = '';
@@ -456,33 +487,62 @@ export const cancelTaskTool: ToolDefinition = {
 				return { status: 'pending_tasks', count: items.length, tasks: items };
 			}
 
-			// targeted cancel: by exact id
-			let target: string | undefined;
+			// Targeting: by exact id, by query, or default-to-most-recent.
+			// IMPORTANT: target can be a file in `tasks/` OR a recently-archived task whose
+			// processing is in-flight (file already moved). For id-based cancels we accept
+			// either case; for query-based we need the file present to grep its content.
+			let targetId: string | undefined;
+			let targetFile: string | undefined;
 			if (taskId) {
 				const wantFile = taskId.endsWith('.txt') ? taskId : `${taskId}.txt`;
-				if (files.includes(wantFile)) target = wantFile;
-				else return { status: 'not_found', taskId };
+				targetId = wantFile.replace('.txt', '');
+				if (files.includes(wantFile)) targetFile = wantFile;
+				// else: accept the cancel even if file is gone (in-flight); core sees CANCEL and decides
 			} else if (query) {
-				// targeted cancel: by content query (case-insensitive substring)
+				if (files.length === 0) return { status: 'nothing_pending' };
 				const needle = query.toLowerCase();
 				for (const f of files) {
 					try {
 						const body = readFileSync(join(tasksDir, f), 'utf-8').toLowerCase();
-						if (body.includes(needle)) { target = f; break; }
+						if (body.includes(needle)) { targetFile = f; targetId = f.replace('.txt', ''); break; }
 					} catch { /* ignore */ }
 				}
-				if (!target) return { status: 'not_found', query };
+				if (!targetId) return { status: 'not_found', query };
 			} else {
-				// default: most recent
-				target = files[files.length - 1];
+				// default: most recent pending file
+				if (files.length === 0) return { status: 'nothing_pending' };
+				targetFile = files[files.length - 1];
+				targetId = targetFile.replace('.txt', '');
 			}
 
-			const targetId = target.replace('.txt', '');
-			// Write a cancelled result so the web UI shows it with the cancelled icon
-			writeFileSync(join(resultsDir, target), 'Cancelled.');
-			unlinkSync(join(tasksDir, target));
-			console.log(`${ts()} [CancelTask] cancelled: ${targetId}${taskId ? ' (by id)' : query ? ` (by query: ${query})` : ''}`);
-			return { status: 'cancelled', taskId: targetId };
+			// Write a CANCEL_INSTRUCTION task — core picks it up next and aborts/skips
+			// the named target. Design (Chi 2026-05-13): reuse the task pipeline as the
+			// cancel signal channel instead of building a parallel one.
+			const cancelTs = Date.now();
+			const cancelFilename = `task-${cancelTs}.txt`;
+			const cancelBody = [
+				`id: task-${cancelTs}`,
+				`timestamp: ${new Date().toISOString()}`,
+				`task: CANCEL_INSTRUCTION: stop processing ${targetId} if still in flight. If already completed, no-op. Reply briefly confirming.`,
+				`source: voice`,
+				`channel_id: local-voice`,
+				`user_id: voice-local`,
+				`access_tier: owner`,
+				``,
+			].join('\n');
+			writeFileSync(join(tasksDir, cancelFilename), cancelBody);
+
+			// Also unlink the original task file if it's still present — prevents
+			// double-pickup if core hadn't started yet. Best-effort.
+			if (targetFile) {
+				try { unlinkSync(join(tasksDir, targetFile)); } catch { /* already gone is fine */ }
+			}
+
+			// Touch a cancelled result for the web UI's cancel icon (best-effort).
+			try { writeFileSync(join(resultsDir, `${targetId}.txt`), 'Cancelled.'); } catch { /* ignore */ }
+
+			console.log(`${ts()} [CancelTask] cancel-instruction written for ${targetId}${taskId ? ' (by id)' : query ? ` (by query: ${query})` : ''} → ${cancelFilename}`);
+			return { status: 'cancel_instruction_queued', taskId: targetId, instruction: `task-${cancelTs}` };
 		} catch (err) {
 			return { error: `Cancel failed: ${err instanceof Error ? err.message : err}` };
 		}

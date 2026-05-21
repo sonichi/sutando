@@ -25,7 +25,7 @@
 #   - state/, tasks/, results/, logs/
 #   - .env, .env.* (different secrets per node)
 #   - core-status.json, build_log.md, contextual-chips.json
-#   - data/voice-metrics.jsonl
+#   - data/voice-metrics.jsonl, data/call-metrics.jsonl (frozen archives — writers removed in #603; new session rollups live in data/conversation.sqlite)
 #   - src/.discord-pending-replies.json, src/Sutando/SutandoApp
 #   - ~/.claude/projects/ (other projects' session transcripts)
 #   - ~/.claude/skills/ (installed per-node)
@@ -49,6 +49,16 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
+# Load .env from the sutando workspace early — non-interactive shells (cron,
+# launchd) don't run user shell startup, so SUTANDO_SYNC_PEER / SUTANDO_PEER_*
+# wouldn't otherwise be visible even when set in .env (same root cause as #714).
+if [ -f "$REPO_ROOT/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . "$REPO_ROOT/.env"
+    set +a
+fi
+
 # --- Config ------------------------------------------------------------------
 # Peer host: set via SUTANDO_SYNC_PEER env var (e.g. "susan@macbook.local")
 # so the script is portable between Studio and Mini without code changes.
@@ -62,8 +72,15 @@ PEER="${SUTANDO_SYNC_PEER:-}"
 # /Users/xliu/Documents/xqq/.../sutando-agent-sonichi-test2/sutando).
 # Override with SUTANDO_MEM_LOCAL_DIR if the convention changes.
 MEM_LOCAL="${SUTANDO_MEM_LOCAL_DIR:-$HOME/.claude/projects/$(echo "$REPO_ROOT" | tr '/' '-')/memory/}"
-NOTES_LOCAL="$REPO_ROOT/notes/"
-DATA_LOCAL="$REPO_ROOT/data/"
+# Notes + data live under $SUTANDO_WORKSPACE per the workspace contract (CLAUDE.md
+# "Workspace contract"); fall back to $REPO_ROOT for pre-contract installs.
+if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
+	NOTES_LOCAL="$SUTANDO_WORKSPACE/notes/"
+	DATA_LOCAL="$SUTANDO_WORKSPACE/data/"
+else
+	NOTES_LOCAL="$REPO_ROOT/notes/"
+	DATA_LOCAL="$REPO_ROOT/data/"
+fi
 ASSETS_LOCAL="$REPO_ROOT/assets/"
 
 # Peer-side paths — default to the same literal paths as local so users only
@@ -76,9 +93,11 @@ MEM_PEER="${SUTANDO_PEER_MEM_DIR:-$MEM_LOCAL}"
 NOTES_PEER="${SUTANDO_PEER_NOTES_DIR:-$NOTES_LOCAL}"
 ASSETS_PEER="${SUTANDO_PEER_ASSETS_DIR:-$ASSETS_LOCAL}"
 # Data dir peer path: derive from NOTES_PEER (repo/notes/ → repo/data/) if no
-# explicit override. Covers call-metrics.jsonl, voice-metrics.jsonl,
-# subtitle-metrics.jsonl, latency.json, scanned-calls.json, etc. Owner's
-# 2026-04-17 direction: "data/* is shared, not just voice-metrics".
+# explicit override. Covers subtitle-metrics.jsonl, latency.json,
+# scanned-calls.json, conversation.sqlite (slice-1 mirror; merge handled by
+# direct rsync since sqlite is single-writer-per-node), the frozen
+# voice-metrics.jsonl + call-metrics.jsonl archives, etc. Owner's 2026-04-17
+# direction: "data/* is shared".
 DATA_PEER="${SUTANDO_PEER_DATA_DIR:-${NOTES_PEER%/notes/}/data/}"
 
 # Common rsync flags:
@@ -205,17 +224,22 @@ say "Syncing assets/ ..."
 run rsync "${RSYNC_FLAGS[@]}" ${DRYFLAG[@]+"${DRYFLAG[@]}"} "$ASSETS_LOCAL" "$PEER:$ASSETS_PEER"
 run rsync "${RSYNC_FLAGS[@]}" ${DRYFLAG[@]+"${DRYFLAG[@]}"} "$PEER:$ASSETS_PEER" "$ASSETS_LOCAL"
 
-# 4) Data dir sync — covers all data/* files (call-metrics.jsonl,
-# voice-metrics.jsonl, subtitle-metrics.jsonl, latency.json,
-# scanned-calls.json, latency-tracker.py, etc.). Each jsonl file needs
-# union merge (mtime-wins would drop entries written between syncs on
-# the other node); non-jsonl files fall back to rsync --update.
+# 4) Data dir sync — covers all data/* files (subtitle-metrics.jsonl,
+# latency.json, scanned-calls.json, latency-tracker.py, the frozen
+# voice/call-metrics.jsonl archives, etc.). Each jsonl file needs union
+# merge (mtime-wins would drop entries written between syncs on the
+# other node); non-jsonl files fall back to rsync --update.
+#
+# As of #603, voice-agent.ts + phone conversation-server.ts no longer
+# append to voice-metrics.jsonl / call-metrics.jsonl — new session
+# rollups go to data/conversation.sqlite. The jsonl files remain on disk
+# as frozen historical archives, so the merge loop still keeps them in
+# sync across nodes (just with no new entries arriving).
 #
 # Strategy:
 #   1. rsync whole peer data/ dir into a staging subdir `.peer-staging/`
-#   2. for each .jsonl in staging, run merge-voice-metrics.sh against
-#      the same-named local file (generic JSON-line merge, not
-#      voice-metrics-specific — dedup on sessionId+timestamp).
+#   2. for each .jsonl in staging, run the generic jsonl merger against
+#      the same-named local file (dedup on sessionId+timestamp).
 #   3. rsync non-.jsonl files from staging to local with --update.
 #   4. rsync local data/ back to peer (non-merge files).
 #   5. push locally-merged .jsonl files back to peer explicitly.
@@ -248,6 +272,21 @@ else
 fi
 
 say ""
+
+# Rebuild MEMORY.md from per-file YAML frontmatter. We exclude MEMORY.md from
+# the rsync pass (mtime-wins truncates the index — see comment near MEM rsync
+# above and issue #712), so each node regenerates its own index after every
+# sync. Falls back to a friendly skip if the memory dir doesn't exist.
+if [ "$DRY_RUN" != "1" ]; then
+    if command -v python3 >/dev/null 2>&1; then
+        say "Regenerating MEMORY.md from frontmatter..."
+        python3 "$REPO_ROOT/skills/cross-node-sync/scripts/regenerate-memory-index.py" \
+            2>&1 | sed 's/^/  /' || say "  (regen failed; MEMORY.md may be stale until next pass)"
+    else
+        say "python3 not on PATH — skipping MEMORY.md regen"
+    fi
+fi
+
 if [ "$DRY_RUN" = "1" ]; then
     say "━━━ DRY-RUN complete ━━━"
 else

@@ -15,10 +15,12 @@ export interface ConversationTopBarProps {
 	standName: string;
 	voiceStatus: VoiceSessionStatus;
 	muted: boolean;
+	watching: boolean;
 	dashboardUrl: string;
 	onStartVoice: () => void;
 	onStopVoice: () => void;
 	onToggleMute: () => void;
+	onToggleWatch: () => void;
 }
 
 const isVoiceLive = (s: VoiceSessionStatus) => s === 'live';
@@ -28,10 +30,12 @@ export default function ConversationTopBar({
 	standName,
 	voiceStatus,
 	muted,
+	watching,
 	dashboardUrl,
 	onStartVoice,
 	onStopVoice,
 	onToggleMute,
+	onToggleWatch,
 }: ConversationTopBarProps) {
 	const live = isVoiceLive(voiceStatus);
 	const busy = isVoiceBusy(voiceStatus);
@@ -68,6 +72,14 @@ export default function ConversationTopBar({
 							aria-pressed={muted}
 						>
 							{muted ? APP_COPY.convUnmute : APP_COPY.convMute}
+						</PillButton>
+						<PillButton
+							variant={watching ? 'watching' : 'default'}
+							onClick={onToggleWatch}
+							aria-pressed={watching}
+							title="Let Sutando watch your screen"
+						>
+							{watching ? APP_COPY.convWatching : APP_COPY.convWatch}
 						</PillButton>
 						<PillButton variant="danger" onClick={onStopVoice}>
 							{APP_COPY.convEnd}

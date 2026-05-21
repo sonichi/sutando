@@ -11,6 +11,8 @@
     "typecheck": "tsc -b --noEmit"
   },
   "dependencies": {
+    "dompurify": "^3.4.5",
+    "marked": "^18.0.4",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },

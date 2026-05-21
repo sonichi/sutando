@@ -52,6 +52,9 @@ dynamic-content.json
 tests/*
 !tests/*.test.ts
 !tests/*.test.py
+!tests/*.test.sh
+!tests/_helpers/
+!tests/_helpers/*.ts
 skills/personal-*/
 tests/security/*.md
 !tests/security/*.md.example
@@ -108,5 +111,5 @@ voice-state.json
 # was not yet ignored. These are multi-MB binary .pcm files with no repo value.
 /.build/
 
-# voice-agent single-instance lock
+# Single-instance lock written by src/voice-agent.ts (acquirePidLock).
 .voice-agent.pid

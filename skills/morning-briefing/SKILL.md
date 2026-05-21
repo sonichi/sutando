@@ -18,9 +18,9 @@ Collect from each source (skip any that aren't configured):
 
 1. **Email** — Run `gws gmail +triage` to get unread inbox. Summarize top 5 by priority. Flag anything urgent.
 
-2. **Calendar** — Run `~/.claude/skills/google-calendar/scripts/google-calendar.py events list --time-min TODAY_START --time-max TODAY_END`. List meetings with times. For each: who's attending, what it's about.
+2. **Calendar** — Run `gws calendar +agenda --today` (table output). If you need JSON for parsing, use `gws calendar +agenda --today --format json`. List meetings with times. For each: who's attending, what it's about. Flag any travel (flights, OOO).
 
-3. **Discord** — Fetch recent messages from configured channels (reference_discord_channels.md). Summarize anything actionable from overnight.
+3. **Discord** — Read recent messages from `logs/discord-bridge.log` (tail ~100 lines). Summarize anything actionable from overnight. Reference channel ID mapping at `$SUTANDO_MEMORY_DIR/reference_discord_channels.md`. Only surface messages NOT already replied to by the bridge.
 
 4. **Pending tasks** — Check `pending-questions.md` for unanswered items. Check `tasks/` for queued tasks.
 

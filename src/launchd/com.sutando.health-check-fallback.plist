@@ -26,7 +26,8 @@
     - ThrottleInterval=60 prevents crash-loop thrash.
     - Exit-only job (KeepAlive omitted) — launchd waits StartInterval, fires
       again, no zombie process between runs.
-    - All output goes to logs/health-check-launchd.log for postmortem.
+    - All output goes to $WORKSPACE/logs/health-check-launchd.log for
+      postmortem (per PR #911 workspace-vs-repo split).
 -->
 <plist version="1.0">
 <dict>
@@ -61,10 +62,10 @@
     </dict>
 
     <key>StandardOutPath</key>
-    <string>__REPO__/logs/health-check-launchd.log</string>
+    <string>__WORKSPACE__/logs/health-check-launchd.log</string>
 
     <key>StandardErrorPath</key>
-    <string>__REPO__/logs/health-check-launchd.log</string>
+    <string>__WORKSPACE__/logs/health-check-launchd.log</string>
 
     <key>ProcessType</key>
     <string>Background</string>

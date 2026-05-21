@@ -71,9 +71,75 @@ copy_if_missing() {
   fi
 }
 
+# One-time migration of stale repo-root runtime state into $STATE_ROOT. Fires
+# only when the migration sentinel is absent — same idempotent posture as
+# workspace_default.py's _migrate_from_legacy. Non-destructive on collision:
+# if a workspace copy already exists at the destination, the repo copy is
+# left in place (so a partial migration never clobbers fresh workspace
+# writes). One stderr line per moved item; sentinel written after the sweep.
+#
+# Only the items this fork workspace-roots are swept (logs/state/tasks/
+# results/data + the three per-machine JSON files). notes/, build_log.md,
+# and pending-questions.md are intentionally NOT migrated — the fork keeps
+# those repo-rooted (cross-fleet-shared via SUTANDO_PRIVATE_DIR; see the
+# create_repo_* helpers above).
+migrate_legacy_runtime_state() {
+  local sentinel="$STATE_ROOT/.legacy-migrated-911"
+  if [ -f "$sentinel" ]; then
+    return 0
+  fi
+  # Only migrate when the legacy repo actually has runtime state. Fresh
+  # installs (already workspace-rooted) skip this path entirely.
+  local have_evidence=0
+  for d in logs state tasks results data; do
+    if [ -d "$REPO/$d" ] && [ -n "$(ls -A "$REPO/$d" 2>/dev/null)" ]; then
+      have_evidence=1
+      break
+    fi
+  done
+  if [ "$have_evidence" -eq 0 ]; then
+    # Nothing to migrate; write sentinel so we don't re-check every run.
+    mkdir -p "$STATE_ROOT"
+    : > "$sentinel"
+    return 0
+  fi
+  mkdir -p "$STATE_ROOT"
+  local moved_any=0
+  # Dirs: move whole tree iff workspace target doesn't already exist.
+  for d in logs state tasks results data; do
+    local src="$REPO/$d"
+    local dst="$STATE_ROOT/$d"
+    if [ -d "$src" ] && [ ! -e "$dst" ]; then
+      if mv "$src" "$dst" 2>/dev/null; then
+        echo "  → migrated $d/ from repo to workspace" >&2
+        moved_any=1
+      fi
+    fi
+  done
+  # Per-machine state files: move iff workspace target absent.
+  for f in core-status.json contextual-chips.json voice-state.json; do
+    local src="$REPO/$f"
+    local dst="$STATE_ROOT/$f"
+    if [ -f "$src" ] && [ ! -e "$dst" ]; then
+      if mv "$src" "$dst" 2>/dev/null; then
+        echo "  → migrated $f from repo to workspace" >&2
+        moved_any=1
+      fi
+    fi
+  done
+  : > "$sentinel"
+  if [ "$moved_any" -eq 1 ]; then
+    echo "  ✓ legacy runtime state migrated (sentinel: $sentinel)" >&2
+  fi
+}
+
 # --- Tier 1: auto-bootstrap (always safe to run) ---
 tier1() {
   log "Tier 1 — auto-bootstrap..."
+
+  # First-run sweep: any stale repo-root runtime state lands in the
+  # workspace before we create fresh files. Idempotent + non-destructive.
+  migrate_legacy_runtime_state
 
   # Per-machine state directories (under SUTANDO_HOME if set, else repo)
   create_state_dir_if_missing "logs"

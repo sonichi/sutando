@@ -9,12 +9,13 @@ import type { ButtonHTMLAttributes, ReactNode } from 'react';
  *              action visible at any time
  *   - danger:  red-tinted (End)
  *   - muted:   red outline (mute is on)
+ *   - watching: amber-tinted (screen-share / vision is on)
  *
  * No gradients — primary actions are pure inversion so the brand reads
  * as a single high-contrast surface, not a color story.
  */
 
-type PillVariant = 'default' | 'primary' | 'danger' | 'muted';
+type PillVariant = 'default' | 'primary' | 'danger' | 'muted' | 'watching';
 
 export interface PillButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
 	variant?: PillVariant;
@@ -33,6 +34,8 @@ const CLASS_BY_VARIANT: Record<PillVariant, string> = {
 		'border border-rose-500/35 bg-rose-500/15 text-rose-100 hover:bg-rose-500/25',
 	muted:
 		'border border-rose-500/30 bg-rose-500/10 text-rose-300',
+	watching:
+		'border border-amber-500/40 bg-amber-500/15 text-amber-300 hover:bg-amber-500/25',
 };
 
 export default function PillButton({
