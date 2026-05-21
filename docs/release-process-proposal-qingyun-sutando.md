@@ -1,13 +1,16 @@
 ---
 title: Release process proposal — qingyun-sutando's half
-date: 2026-05-19
+date: 2026-05-19 (review-round resolutions integrated 2026-05-20)
 tags: [release-process, proposal, plan-only]
 author: qingyun-sutando
-status: draft (plan only; nothing implemented)
+status: draft — open questions resolved; pending merge
+reviewers_integrated: bassilkhilo-ag2 (2026-05-20 06:28), liususan091219 (2026-05-20 11:31), sonichi (sub-agent draft 19:28 + owner-pick 20:30)
 related: notes/release-process-proposal-mini.md, docs/release-process.md (not yet written)
 ---
 
 > **Plan-only document.** This is half of a co-drafted proposal — companion `docs/release-process-proposal-mini.md` covers the *when* + tag conventions; this covers the *what goes in* + migration framework + the joint coupling section.
+>
+> **Review round integrated 2026-05-20.** All open questions resolved (see end of doc). Lucy's 3 implementation questions addressed in §2.7 (fresh-clone gate scope) and §2.8 (multi-core race + merge-order collision). Engine tag format swept from `engine-vX.Y.Z` → bare `vX.Y.Z` per Chi's owner-pick. Per Chi 2026-05-20 20:30: "Once the RFC text reflects these, it's mergeable."
 
 ## Overview — what we're trying to do, why it matters
 
@@ -18,7 +21,7 @@ related: notes/release-process-proposal-mini.md, docs/release-process.md (not ye
 
 **Why it matters**:
 
-- **Rollback discipline.** Today: "we broke something — what's the last known good state?" Answer: hunt for a commit SHA. After: `git checkout engine-v0.1.0`.
+- **Rollback discipline.** Today: "we broke something — what's the last known good state?" Answer: hunt for a commit SHA. After: `git checkout v0.1.0`.
 - **Pinning for anyone building on top.** Forks, downstream consumers, sister-node fleets, anyone running their own Sutando — install docs can say "we tested against engine v0.X" and pin reliably. Without versions, install instructions can only reference a moving target (`main`) or a bare commit SHA.
 - **Silent breakage prevention.** Recent PRs (#876 env rename, #892 tierMap, #884 multi-core state-dir) each invented their own backward-compat trick. No registry, no startup-time check, no upgrade-path test. The first non-additive change (workspace contract A/B, pending question 2026-05-17 00:40) WILL break some installs. We need migration infra before then.
 - **Coord between bots.** Sutando-Mini and qingyun-sutando are both contributing to release plumbing. Without a written RFC we'll diverge.
@@ -34,7 +37,7 @@ Why now, and why both halves of this proposal exist:
 
 ### M1. We need named snapshots of known-good states
 
-Today the install model is `git clone && bash src/startup.sh` — users install at whatever `main` HEAD happens to be. When something breaks, "downgrade to the last good state" means hunting for a commit SHA. Named release tags make rollback a single instruction (`git checkout engine-v0.1.0`) and let install docs pin to a specific snapshot instead of moving with main.
+Today the install model is `git clone && bash src/startup.sh` — users install at whatever `main` HEAD happens to be. When something breaks, "downgrade to the last good state" means hunting for a commit SHA. Named release tags make rollback a single instruction (`git checkout v0.1.0`) and let install docs pin to a specific snapshot instead of moving with main.
 
 ### M2. State-format and contract changes happen often — silently breaking users
 
@@ -161,7 +164,7 @@ state/
 {
   "applied": [1, 2],
   "current": 2,
-  "engine_version_at_apply": "engine-v0.1.0"
+  "engine_version_at_apply": "v0.1.0"
 }
 ```
 
@@ -207,8 +210,8 @@ Where `src/run_migrations.py`:
 For env vars and config keys, the **release that ships the new shape** keeps reading the old shape too (alias / fallback). The migration writes the new shape. The **next release** removes the old-shape reader.
 
 Example timeline:
-- `engine-v0.1.0`: introduces `SUTANDO_MEMORY_DIR`. Code reads `MEMORY_DIR or PRIVATE_DIR` (alias). Migration 0001 rewrites env file.
-- `engine-v0.1.1`: code drops the `PRIVATE_DIR` alias. Anyone who skipped 0.1.0's migration is broken — they had one release of warning.
+- `v0.1.0`: introduces `SUTANDO_MEMORY_DIR`. Code reads `MEMORY_DIR or PRIVATE_DIR` (alias). Migration 0001 rewrites env file.
+- `v0.1.1`: code drops the `PRIVATE_DIR` alias. Anyone who skipped 0.1.0's migration is broken — they had one release of warning.
 
 Users have **one release of safety to upgrade through**, not over. Skip-version users (going 0.0 → 0.2 in one jump) still work because the runner replays migrations 1 then 2 in order; the alias-window for any given var is one release.
 
@@ -253,13 +256,39 @@ Catches: forgot to handle case X, migration script crashes on missing input file
 
 ### 2.7 Tied back into the release process
 
-The "non-breaking state gate" from Mini's half becomes:
+Per Chi's owner-pick (§ Open questions §4a), the cut gate is now:
 
-1. CI green.
-2. Health-check all-green.
+**Necessary conditions:**
+
+1. **`main` is in a working state** — CI green, no known-blocker issues, no half-finished migration on top of last tag.
+2. **Something worth tagging** — at least one `feat` or `breaking` entry in `CHANGELOG-PENDING.md` since the last tag.
+
+**At cut time, on the tagging machine:**
+
 3. **All migrations for this version's PRs are present, idempotent, and tested.** ← from this section.
 4. Manual smoke-check headline feature.
 5. **Migration smoke-test**: run prior-release first → `git pull` to this release → observe `startup.sh` applies migrations cleanly and the rest of startup continues.
+
+**Health-check scope clarification** (responds to Lucy Q3): the gate items above run against the **tagging machine's existing install** (workspace + credentials present), NOT a fresh clone. A fresh clone legitimately fails several health-check items (no `.sutando/env`, no credentials, no `workspace/state/`); requiring it to pass would be incoherent. Fresh-install path has its own first-run checklist (covered separately in `docs/install.md` when written).
+
+### 2.8 Concurrency & ordering (open implementation Qs from Lucy's review)
+
+Raised in Lucy's 2026-05-20 11:31 PT review. Recording the resolutions inline so the framework spec is self-contained.
+
+**Q1 — startup-time runner vs multi-core pool.** Multiple pool cores boot near-simultaneously (#880) and could race the migration runner against the same `state/schema-version.json`. Resolution: **migrations run as a pre-pool step, not per-core.** `src/startup.sh` invokes `run_migrations.py` BEFORE `install-core-pool.sh` bootstraps the launchd cores. Pool cores assume migrations are already applied — if `current` < the migration set baked into their code, they refuse to start (same fail-closed contract as the runner). Single-writer-by-construction, no lock needed.
+
+For sessions started outside `startup.sh` (e.g. a manual `claude` invocation), the runner is also called from the first import of `workspace_default.resolve_workspace()` — sentinel-gated, sees `applied` already populated, exits as no-op. Idempotency makes the extra call free.
+
+**Q2 — migration number allocation under concurrent PRs.** The numeric replay invariant assumes monotonic `NNNN-*.{sh,py}` files. PR author allocates the next number, but two PRs racing for the same number is possible. Resolution: **number is reserved at merge time, not author time.**
+
+- Author opens PR with `NNNN-description.sh` matching the highest existing number + 1 they observe.
+- A pre-merge CI check (`tests/migrations/test_no_collision.py`) fails if two open PRs propose the same number, OR if a PR's number isn't `max(main) + 1` at merge attempt.
+- On collision: the second PR rebases, renumbers, re-pushes. Cost is bounded — the CI signal fires before the merge button is enabled.
+- Replay order is then guaranteed monotonic on `main`, so the runner's "for each N > current, run N" loop has no ambiguity.
+
+This is the same shape as Rails ActiveRecord migrations and Alembic — both ship the collision-on-merge convention.
+
+**Q3 — health-check gate on fresh clone.** Addressed in §2.7 above (fresh clone has its own first-run path; release gate runs against the tagging install).
 
 ---
 
@@ -273,10 +302,10 @@ The "non-breaking state gate" from Mini's half becomes:
 
 ### Option A: Loose coupling (recommended)
 
-- Engine repo has its own SemVer line — first cut is `engine-v0.1.0`. Bumps when engine features land.
+- Engine repo has its own SemVer line — first cut is `v0.1.0`. Bumps when engine features land.
 - Sutando.app has its own SemVer line (currently v0.2.11, next `v0.3.0`). Bumps when product releases ship.
 - **Coupling**: each Sutando.app release's notes name the engine commit SHA + tag it ships with. e.g.:
-  > "Sutando.app v0.3.0 — ships with `sonichi/sutando@engine-v0.1.0` (commit abc1234)"
+  > "Sutando.app v0.3.0 — ships with `sonichi/sutando@v0.1.0` (commit abc1234)"
 - Anyone running the bundle who hits a bug can correlate their bundle version → engine state via the notes. Downstream consumers can pin install instructions to an engine tag, not a bare sha.
 
 ### Option B: Lockstep
@@ -298,27 +327,49 @@ Mini may have a different read since they own the *when to cut* half. Worth conv
 
 ---
 
-## Open questions for owner
+## Open questions for owner — RESOLVED 2026-05-20
 
-These need explicit owner direction before consolidation:
+All 4 questions resolved in the review round (Bassil cold-review 06:28, Lucy review 11:31, Chi sub-agent draft 19:28, Chi owner-pick 20:30). Recording the decisions inline so the history reads as a single thread.
 
-1. **Engine versioning starts at?** I've been writing `engine-v0.1.0` as the first cut. Alternative: bare `v0.1.0` in the engine repo namespace (less Tag-name verbose). Owner picks.
-2. **CHANGELOG location** — top-of-repo `CHANGELOG.md` (traditional) or `docs/changelog/` per-release files (more granular but more files)? I lean traditional `CHANGELOG.md`.
-3. **Who is the release curator** — owner only, or any of the bots can curate with owner approval at tag-time? Memory `bot2bot conventions` says "No merge authority for bots" — same constraint applies to releases. Bots can prepare CHANGELOG drafts, owner cuts the tag.
-4. **What to cut next** — three options:
-   - (a) Cut `engine-v0.1.0` from current main without migration framework. Risky if multi-core changes aren't strictly additive.
-   - (b) Build Phase 1 migration framework first, then cut `engine-v0.1.0` with migration 0001 as the first applied step. Cleaner, +1-2 PRs latency.
-   - (c) Cut `engine-v0.1.0` NOW with manual migration steps in release notes, build framework as `engine-v0.1.1`. Pragmatic.
+1. **Engine tag format** → **bare `v0.MINOR.PATCH`** (no `engine-` prefix). All three reviewers converged; product repo (Sutando.app) ships separately under its own tag line, so the namespace collision the `engine-` prefix was defending against doesn't exist (see Joint section, Option A). The doc has been swept to remove every prior `engine-vX.Y.Z` instance.
+2. **CHANGELOG location** → **top-of-repo `CHANGELOG.md`** (single file). Bassil's argument: the common reader question is "what changed recently?" and `docs/changelog/` per-release files scatter the answer.
+3. **Release curator** → **owner cuts the tag; any bot can draft the release notes**. Mirrors the working PR-review pattern (bots prepare + review, owner merges).
+4. **What to cut next** → **option (c)**, with refinement: cut the first release from current main with a manual "no migration needed" note in the release body, then ship the migration framework as the primary payload of the next release. Bassil flagged that the queued PRs are additive/fix-only — there's nothing for a migration runner to do in the cut-from-current-main path. The **workspace contract A/B change** (pending question 2026-05-17 00:40) is the right forcing function for shipping the framework — when that PR is ready it needs `migrations/0002-workspace-contract.{sh,py}` to be safe.
 
-   I lean **(c)** for pragmatism. Confirmed in #dev. Mini may have a different view.
+### 4a. "When to cut" gate — Chi's owner-pick (refines Mini's Part 1.1)
+
+Chi's final formulation (2026-05-20 20:30 PT) replaces commit-count thresholds with a **working-state** check:
+
+> A release cut requires `main` to be in a **working state** — CI green, no known-blocker issues that would land in a broken `v0.x.0`, no half-finished migration on top of last tag. AND there's something worth tagging — a `feat` or `breaking` entry in `CHANGELOG-PENDING.md` since the last tag.
+
+Quality gate, not quantity. If the repo stays green for weeks without a feature trigger, that's fine; if it goes red mid-iteration we don't cut even if 100+ commits have landed since last tag. Single dispatch: *is main green & not actively in a half-finished migration?* Yes + something to tag → cut. Otherwise → wait.
+
+This supersedes the "≤50 commits since last tag" ceiling from Chi's earlier sub-agent draft.
+
+### 4b. GPG-signed tags
+
+**Deferred.** Use unsigned `git tag v0.X.Y` for v0.1.x. Tracked in the open-items list (§ "Future hardening" below).
 
 ---
 
+## Future hardening (deferred — track separately)
+
+These came up in review but are deliberately out of scope for the first version of the framework. Each gets its own tracking issue when the time comes.
+
+- **Signed tags (`git tag -s v0.X.Y`).** Per Chi 2026-05-20: unsigned for v0.1.x. Future hardening = `gpg.signingkey` config on the tagging machine + workflow lint that rejects unsigned tag pushes.
+- **Backward migrations** (`v0.4 → v0.3` rollback). Manual notes in release body until a real downgrade case forces the infra. Most users won't downgrade.
+- **Data re-encoding** (transforming memory file contents on schema change). Skip unless a real case appears.
+- **PR template `migration:` checklist item** with CI guard that diffs state-file shapes against main and flags PRs missing a migration entry when shapes change. Phase 3 in §2.6.
+- **`docs/install.md`** — fresh-install path needs its own first-run checklist (separate from the release-gate health-check scope, see §2.7).
+- **`docs/release-process.md`** — promote this RFC + Mini's companion sections into the canonical user-facing doc once both halves are greenlit.
+
 ## Next move
 
-1. Mini drafts `notes/release-process-proposal-mini.md` (when to cut + tag conventions).
-2. Merge into `notes/release-process-consolidated.md`.
-3. Chi + Qingyun review.
-4. If greenlight, promote to `docs/release-process.md` + open issues for Phase 1 framework work.
+Per Chi's 2026-05-20 20:30 owner-pick ("Once the RFC text reflects these, it's mergeable"), the next steps are:
 
-No code shipped this turn. Plan only.
+1. **Merge this PR.** All open questions resolved; tag format swept; Lucy's Q1+Q2+Q3 addressed in §2.8 + §2.7.
+2. **Open Phase 1 framework PRs** — `migrations/` registry + runner + `schema-version.json` + tests/migrations/ harness. Suggested issues: one for runner+harness, one for migration 0001 (PRIVATE_DIR → MEMORY_DIR backfill as the first recorded migration).
+3. **Cut `v0.1.0`** from current main with manual "no migration needed" release note (option (c) per Open question §4) once Phase 1 is in.
+4. **Workspace contract A/B PR (pending question 2026-05-17 00:40)** ships migration 0002 as a forcing-function test of the framework.
+
+No code shipped in this RFC. Plan only.
