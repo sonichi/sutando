@@ -53,7 +53,7 @@ function injectText(session: any, text: string) {
 }
 
 // Vision model — override via .env (default: flash-lite for this trivial 20-word task)
-const VISION_MODEL = process.env.VISION_MODEL || 'gemini-3.1-flash-lite-preview';
+const VISION_MODEL = process.env.VISION_MODEL || 'gemini-3.1-flash-lite';
 
 // --- Shared recording state ---
 
@@ -273,8 +273,10 @@ function findRecording(version?: 'raw' | 'narrated' | 'subtitled'): string | nul
 // --- Vision helpers ---
 
 async function describeScreenshot(imagePath: string, previousDescs: string[] = []): Promise<string> {
-	const apiKey = process.env.GEMINI_API_KEY;
-	if (!apiKey) return 'Vision description unavailable (no GEMINI_API_KEY)';
+	// Prefer free-tier voice key (gemini-3.1-flash-lite-preview is free-tier eligible on REST
+	// generateContent — verified 2026-05-14). Falls back to paid GEMINI_API_KEY if voice key absent.
+	const apiKey = process.env.GEMINI_VOICE_API_KEY || process.env.GEMINI_API_KEY;
+	if (!apiKey) return 'Vision description unavailable (no GEMINI_VOICE_API_KEY or GEMINI_API_KEY)';
 	try {
 		// Fixes CodeQL #27 (js/command-line-injection): use execFileSync argv array instead of shell string
 		const safePath = imagePath.replace(/[^a-zA-Z0-9_\-./]/g, '');

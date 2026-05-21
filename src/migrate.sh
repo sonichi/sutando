@@ -295,7 +295,7 @@ swiftc -O -o Sutando main.swift -framework Cocoa -framework Carbon -framework Ap
 cd "$REPO"
 
 # Python deps
-pip3 install google-genai discord.py python-telegram-bot Pillow 2>/dev/null || true
+pip3 install google-genai discord.py python-telegram-bot slack_bolt Pillow 2>/dev/null || true
 
 # Install shared skills (external, not in repo)
 echo "Installing shared skills..."

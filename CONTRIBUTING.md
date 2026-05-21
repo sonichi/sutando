@@ -2,6 +2,10 @@
 
 Thanks for your interest! Sutando is alpha software — the biggest need is **testing and hardening**.
 
+## Contributor License Agreement (CLA)
+
+Before your first contribution can be merged, you'll be asked to sign the project's CLA — a one-time, web-based "I agree" via the [CLA Assistant](https://cla-assistant.io) bot. The bot will comment on your PR with a link; just click through and sign. The CLA text is in [`CLA.md`](CLA.md). Subsequent PRs are auto-recognized.
+
 ## Quick ways to contribute
 
 ### Test a capability
