@@ -35,14 +35,16 @@ const VISION_MODEL = process.env.VISION_MODEL || 'gemini-3.1-flash-lite-preview'
 export const scrollTool: ToolDefinition = {
 	name: 'scroll',
 	description:
-		'Scroll the currently focused application. Works in Chrome, VS Code, or any app. Use for: "scroll down", "scroll up", "scroll to top", "scroll to bottom". Use target for specific areas in Chrome: "sidebar", "chat history", "code block".',
+		'Scroll the currently focused application. Works in Chrome, VS Code, or any app. Use for: "scroll down", "scroll up", "scroll to top", "scroll to bottom". Pass amount=small for "scroll a little" / "a bit", large for "scroll a lot". Use target for specific areas in Chrome: "sidebar", "chat history", "code block".',
 	parameters: z.object({
 		direction: z.enum(['down', 'up', 'top', 'bottom']).describe('Scroll direction. Use "top" or "bottom" to jump to start/end of page.'),
+		amount: z.enum(['small', 'medium', 'large']).optional().describe('How far to scroll for down/up. small=150px, medium=400px (default), large=800px. Ignored for top/bottom.'),
 		target: z.string().optional().describe('Optional: which area to scroll in Chrome. E.g. "sidebar", "chat history", "nav", "code". Omit for main content.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { direction, target } = args as { direction: 'down' | 'up' | 'top' | 'bottom'; target?: string };
+		const { direction, amount, target } = args as { direction: 'down' | 'up' | 'top' | 'bottom'; amount?: 'small' | 'medium' | 'large'; target?: string };
+		const px = amount === 'small' ? 150 : amount === 'large' ? 800 : 400;
 		try {
 			// Check which app is frontmost
 			let frontApp = '';
@@ -59,7 +61,7 @@ export const scrollTool: ToolDefinition = {
 				let js: string;
 				if (direction === 'top') js = scrollFn('e.scrollTop=0');
 				else if (direction === 'bottom') js = scrollFn('e.scrollTop=e.scrollHeight');
-				else js = scrollFn(`e.scrollBy(0,${direction === 'down' ? 600 : -600})`);
+				else js = scrollFn(`e.scrollBy(0,${direction === 'down' ? px : -px})`);
 				const tmpScroll = `/tmp/sutando-scroll-${Date.now()}.scpt`;
 				writeFileSync(tmpScroll, `tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`);
 				execSync(`osascript ${tmpScroll}`, { timeout: 5_000 });
@@ -72,7 +74,7 @@ export const scrollTool: ToolDefinition = {
 				let js: string;
 				if (direction === 'top') js = scrollFn('e.scrollTop=0');
 				else if (direction === 'bottom') js = scrollFn('e.scrollTop=e.scrollHeight');
-				else js = scrollFn(`e.scrollBy(0,${direction === 'down' ? 600 : -600})`);
+				else js = scrollFn(`e.scrollBy(0,${direction === 'down' ? px : -px})`);
 				const tmpScroll = `/tmp/sutando-scroll-${Date.now()}.scpt`;
 				writeFileSync(tmpScroll, `tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`);
 				execSync(`osascript ${tmpScroll}`, { timeout: 5_000 });
@@ -210,23 +212,70 @@ export const closeTabTool: ToolDefinition = {
 
 // --- Open URL ---
 
+// Strip query string for log lines so signed/OAuth URLs don't leak token
+// query-params to the logfile verbatim. The error-return path keeps the full
+// URL so callers/users still see exactly what they tried to open.
+const redactQuery = (u: string): string => JSON.stringify(u.replace(/\?.*$/, '?…'));
+
 export const openUrlTool: ToolDefinition = {
 	name: 'open_url',
 	description:
-		'Open a URL in a new Chrome tab. Use for: "open github.com", "go to that link".',
+		'Open a URL in Chrome. Reuses the active tab when the target shares origin (scheme + host + port) with what\'s already in the active tab; spawns a new tab only for cross-origin URLs. Use for: "open github.com", "go to that link".',
 	parameters: z.object({
 		url: z.string().describe('The URL to open'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { url } = args as { url: string };
+		const { url: rawUrl } = args as { url: string };
+		// Normalize spoken-URL artifacts before handing to osascript. Voice
+		// transcription can leave surrounding whitespace or embedded spaces
+		// that Chrome rejects as the opaque "Invalid URL entered. (5)".
+		// Reject up front so the caller gets a clear diagnostic + the arg
+		// is logged.
+		const url = (rawUrl || '').trim();
+		if (!url) {
+			console.log(`${ts()} [OpenURL] rejected empty url`);
+			return { error: 'Failed to open: empty URL' };
+		}
+		if (/\s/.test(url)) {
+			console.log(`${ts()} [OpenURL] rejected url with whitespace: ${redactQuery(url)}`);
+			return { error: `Failed to open: URL contains whitespace (got ${JSON.stringify(url)})` };
+		}
+		// Zero-width chars (U+200B/200C/200D/2060) aren't in `\s` and survive
+		// `.trim()` — reject them too for a symmetric observable error.
+		if (/[\u200B\u200C\u200D\u2060]/.test(url)) {
+			console.log(`${ts()} [OpenURL] rejected url with zero-width char: ${redactQuery(url)}`);
+			return { error: `Failed to open: URL contains zero-width character (got ${JSON.stringify(url)})` };
+		}
 		// Escape backslashes first, then quotes — prevents shell injection via osascript
 		const safeUrl = url.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
+		// Parse target origin (scheme + host + port). If unparseable, fall back to new-tab behavior.
+		let targetOrigin = '';
+		try { targetOrigin = new URL(url).origin; } catch { /* not a real URL, e.g. "about:blank" — let Chrome handle */ }
 		try {
-			execSync(`osascript -e 'tell application "Google Chrome" to tell front window to make new tab with properties {URL:"${safeUrl}"}'`, { timeout: 5_000 });
-			console.log(`${ts()} [OpenURL] opened: ${url}`);
-			return { status: 'opened', url };
+			// Reuse the active tab when origin matches; otherwise open a new tab.
+			// Falls back to new-tab on any error so callers never silently fail.
+			let reused = false;
+			if (targetOrigin) {
+				try {
+					const activeUrl = execSync(`osascript -e 'tell application "Google Chrome" to get URL of active tab of front window'`, { timeout: 3_000 }).toString().trim();
+					if (activeUrl) {
+						let activeOrigin = '';
+						try { activeOrigin = new URL(activeUrl).origin; } catch {}
+						if (activeOrigin && activeOrigin === targetOrigin) {
+							execSync(`osascript -e 'tell application "Google Chrome" to set URL of active tab of front window to "${safeUrl}"'`, { timeout: 5_000 });
+							reused = true;
+						}
+					}
+				} catch { /* fall through to new-tab */ }
+			}
+			if (!reused) {
+				execSync(`osascript -e 'tell application "Google Chrome" to tell front window to make new tab with properties {URL:"${safeUrl}"}'`, { timeout: 5_000 });
+			}
+			console.log(`${ts()} [OpenURL] ${reused ? 'reused active tab' : 'opened new tab'}: ${url}`);
+			return { status: reused ? 'reused' : 'opened', url };
 		} catch (err) {
+			console.log(`${ts()} [OpenURL] FAILED url=${redactQuery(url)} err=${err instanceof Error ? err.message : err}`);
 			return { error: `Failed to open ${url}: ${err instanceof Error ? err.message : err}` };
 		}
 	},
