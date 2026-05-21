@@ -649,13 +649,15 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 			if (item.role === 'user') {
 				s.transcript.push({ role: 'user', text: item.content });
 				s.events.push({ event: `user:${item.content}`, timestamp: new Date().toISOString() });
-				recordConversation('discord-user', item.content, s.sessionId);
+				// conversation.log is the primary; write it before the sqlite
+				// mirror so a row never exists in sqlite without a log line.
 				appendConversationLog('discord-user', item.content);
+				recordConversation('discord-user', item.content, s.sessionId);
 			} else if (item.role === 'assistant') {
 				s.transcript.push({ role: 'sutando', text: item.content });
 				s.events.push({ event: `sutando:${item.content}`, timestamp: new Date().toISOString() });
-				recordConversation('discord-agent', item.content, s.sessionId);
 				appendConversationLog('discord-agent', item.content);
+				recordConversation('discord-agent', item.content, s.sessionId);
 			}
 		}
 		lastProcessedIdx = items.length;
