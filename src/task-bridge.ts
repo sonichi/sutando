@@ -61,6 +61,32 @@ function archiveFile(srcPath: string, kind: 'tasks' | 'results', taskId: string)
 
 function ts(): string { return new Date().toISOString().slice(11, 23); }
 
+/**
+ * Write a chat-path task file so the dashboard tracks chat-originated work.
+ * Called by the core agent (Claude Code) when it accepts a non-trivial task from chat.
+ * Reuses the same tasks/ directory and file format as voice/Discord/Telegram paths.
+ *
+ * Note: access_tier is hardcoded to "owner" because chat is local to the operator.
+ * Revisit if /chat ever opens to non-owner users (team/other tier).
+ */
+export function writeChatTask(taskDescription: string): string {
+	const taskId = `task-chat-${Date.now()}`;
+	const timestamp = new Date().toISOString();
+	const content = [
+		`id: ${taskId}`,
+		`timestamp: ${timestamp}`,
+		`task: ${taskDescription}`,
+		`source: chat`,
+		`channel_id: local-chat`,
+		`user_id: ${process.env.SUTANDO_DM_OWNER_ID || 'chat-local'}`,
+		`access_tier: owner`,
+		'',
+	].join('\n');
+	writeFileSync(join(TASK_DIR, `${taskId}.txt`), content);
+	console.log(`${ts()} [TaskBridge] Chat task: ${taskId}: ${taskDescription.slice(0, 100)}`);
+	return taskId;
+}
+
 // ---------------------------------------------------------------------------
 // Task status notifications — sent to the web client
 // ---------------------------------------------------------------------------
@@ -73,8 +99,12 @@ const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes default
 // emit a Discord DM to the owner if this task hits its timeout. dm_on_timeout
 // defaults to false (silent timeout — Susan's PR #578 contract). Voice agent
 // can flip it true on critical tasks to get a fallback notification.
-type PendingTask = { submittedAt: number; timeoutMs: number; dmOnTimeout: boolean };
+type PendingTask = { submittedAt: number; timeoutMs: number; dmOnTimeout: boolean; taskText: string };
 const _pendingTasks = new Map<string, PendingTask>();
+
+// Dedup window: identical task text within 2 minutes → return existing taskId.
+const DEDUP_WINDOW_MS = 2 * 60 * 1000;
+const normalizeTask = (t: string) => t.toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 150);
 
 /** True if the task file (in tasks/, tasks/processed/, or tasks/archive/
  * — including month-partitioned subdirs `tasks/archive/YYYY-MM/`) is
@@ -203,6 +233,26 @@ export const workTool: ToolDefinition = {
 			console.log(`${ts()} [TaskBridge] WARNING: watcher offline — task will be queued for next cron pass`);
 		}
 
+		// Dedup: if the same task text is already pending (within DEDUP_WINDOW_MS),
+		// return the existing taskId instead of writing a duplicate task file.
+		// Voice over-delegation made Gemini call work() 3-5x with identical text
+		// in sub-second bursts; each one spawned a parallel run + duplicate DM.
+		const normalizedTask = normalizeTask(task);
+		const dedupNow = Date.now();
+		for (const [existingId, pending] of _pendingTasks) {
+			if (
+				normalizeTask(pending.taskText) === normalizedTask &&
+				dedupNow - pending.submittedAt < DEDUP_WINDOW_MS
+			) {
+				console.log(`${ts()} [TaskBridge] Dedup: task matches ${existingId} (submitted ${Math.round((dedupNow - pending.submittedAt) / 1000)}s ago)`);
+				return {
+					status: 'duplicate',
+					taskId: existingId,
+					message: `Task already pending as ${existingId}. Do NOT submit again — tell the user you are already working on it.`,
+				};
+			}
+		}
+
 		const taskId = `task-${Date.now()}`;
 		const timestamp = new Date().toISOString();
 		const ownerId = process.env.SUTANDO_DM_OWNER_ID || 'voice-local';
@@ -227,7 +277,7 @@ export const workTool: ToolDefinition = {
 		// Chi's 2026-05-03 06:00 override was reverted at 06:47 — the always-on
 		// default was producing unwanted DMs). Caller must explicitly pass
 		// dm_on_timeout: true on critical tasks where they want the fallback.
-		_pendingTasks.set(taskId, { submittedAt: Date.now(), timeoutMs, dmOnTimeout: dm_on_timeout === true });
+		_pendingTasks.set(taskId, { submittedAt: Date.now(), timeoutMs, dmOnTimeout: dm_on_timeout === true, taskText: task });
 		// Record owner activity for status-aware-pivot in proactive loop
 		writeOwnerActivity('voice', task);
 		// Funnel: first task submission marks activation. recordOnboarding
@@ -452,6 +502,14 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 
 	// Check every 2 seconds for new result files
 	setInterval(() => {
+		// Defensive try/catch around the timeout-check loop. Without this, a
+		// single throw during _pendingTasks iteration (corrupt entry, race
+		// with a concurrent delete/set) takes down the visible behavior of
+		// this tick — the readdir block below has its own try/catch, the loop
+		// above did not. Observed 2026-05-16: post-restart voice-agent's
+		// result-watcher fell silent for 30+ minutes while the 30s health
+		// monitor's setInterval kept firing in the same process.
+		try {
 		// Check for timed-out tasks — runs every interval regardless of result files
 		for (const [taskId, pending] of _pendingTasks) {
 			const { submittedAt, timeoutMs, dmOnTimeout } = pending;
@@ -513,6 +571,9 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 				}
 			}
 		}
+		} catch (err) {
+			console.error(`${ts()} [TaskBridge] timeout-check loop threw (non-fatal, continuing watch):`, err);
+		}
 
 		try {
 			const files = readdirSync(RESULT_DIR).filter(f => f.endsWith('.txt')).sort();
@@ -526,6 +587,23 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 				const result = readFileSync(path, 'utf-8').trim();
 				if (!result) continue;
 				const taskId = file.replace('.txt', '');
+
+				// Voice-only push channel: files named `voice-*.txt` are spoken
+				// by the voice agent on next turn, OR held in queue until the
+				// voice client reconnects. Discord-bridge skips them. Use this
+				// when the content is meaningless on Discord (e.g. a draft
+				// meant for voice to TYPE into a text field).
+				if (file.startsWith('voice-')) {
+					if (!clientConnected) {
+						// Hold in queue; don't archive. Next poll will try again.
+						continue;
+					}
+					console.log(`${ts()} [TaskBridge] Voice-only result: ${file} (${result.slice(0, 80)})`);
+					onResult(result);
+					_deliveredResults.add(file);
+					setTimeout(() => archiveFile(path, 'results', `voice-${Date.now()}`), 10_000);
+					continue;
+				}
 				// Deduped-marker result: agent consolidated this task's reply
 				// into another task's result file. Mark this task done silently
 				// and archive — no Discord post, no voice narration, no timeout.
@@ -573,6 +651,19 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 							console.error(`${ts()} [TaskBridge] Failed to forward ${taskId} to Discord:`, e);
 						}
 					}
+					// Chat-path tasks have no bridge consumer — archive them directly
+					// so results/task-chat-*.txt files don't accumulate forever.
+					if (taskId.startsWith('task-chat-')) {
+						_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
+						_deliveredResults.add(file);
+						_pendingTasks.delete(taskId);
+						console.log(`${ts()} [TaskBridge] Chat task archived (no client): ${taskId}`);
+						setTimeout(() => {
+							archiveFile(path, 'results', taskId);
+							const taskFile = join(TASK_DIR, `${taskId}.txt`);
+							if (existsSync(taskFile)) archiveFile(taskFile, 'tasks', taskId);
+						}, 10_000);
+					}
 					// Other non-voice unsent results stay queued (their bridges deliver them)
 					continue;
 				}
@@ -604,8 +695,14 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 					}, 10_000);
 				}
 			}
-		} catch {
-			// Directory might not exist yet or file in transit
+		} catch (err) {
+			// Directory might not exist yet or file in transit. Log on
+			// unusual exceptions (not ENOENT) so a real file-system problem
+			// is observable, while still containing the throw.
+			const code = (err as NodeJS.ErrnoException)?.code;
+			if (code && code !== 'ENOENT') {
+				console.error(`${ts()} [TaskBridge] result-scan threw (non-fatal):`, err);
+			}
 		}
 	}, 2000);
 }

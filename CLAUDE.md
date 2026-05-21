@@ -48,6 +48,38 @@ Signal your work status to `core-status.json` so the web UI can display it:
 - When done: `echo '{"status":"idle","ts":<epoch>}' > core-status.json`
 This applies to all work — proactive loop passes, voice tasks, user requests, code changes.
 
+## Chat-path task tracking (issue #585)
+
+When you accept a non-trivial commitment from the user via **chat** (direct text input, not through voice/Discord/Telegram bridges), write a task file so the dashboard can track it.
+
+**When to write a task file from chat:**
+- The user asks you to do something concrete (close a PR, send an email, research a topic, fix a bug)
+- NOT for: quick questions, greetings, simple lookups, clarifications
+
+**How:**
+```bash
+local _ts="$(date +%s)"
+cat > "tasks/task-chat-${_ts}.txt" << EOF
+id: task-chat-${_ts}
+timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+task: <concise description of what you're doing>
+source: chat
+channel_id: local-chat
+user_id: ${SUTANDO_DM_OWNER_ID:-chat-local}
+access_tier: owner
+EOF
+```
+
+**When done:**
+Write a result file using the same task ID:
+```bash
+cat > "results/task-chat-${_ts}.txt" << EOF
+<result summary>
+EOF
+```
+
+This ensures the dashboard, result-watcher, and timeout logic work the same regardless of entry path.
+
 ## Memory
 
 Full memory index: $SUTANDO_MEMORY_DIR (default: ~/.claude/projects/.../memory)/MEMORY.md
@@ -99,6 +131,12 @@ Tasks arrive from multiple channels via the same file bridge:
 - Each bridge polls `results/` and sends the reply back to the originating channel
 - Proactive messages: write to `results/proactive-{ts}.txt` to speak to the user
 - To send files in replies, include `[file: /path/to/file]` in the result text
+
+**Result-body protocol markers** — when the result body STARTS with one of these, the bridge handles delivery specially. Use them when multiple related tasks should produce ONE user-facing reply instead of N separate ones:
+- `[deduped: task-<other-id>]` — both voice (task-bridge) and Discord (discord-bridge) silently archive this task as done, no narration, no DM. Put the full reply in the other task's result file and put this marker in each superseded task's result. The canonical way to handle thread-consolidated replies (e.g. when voice over-delegates 3 tasks for the same continuation utterance).
+- `[no-send]` — Discord bridge skips delivery for this task (still archives). Use when the task is internally handled but produces no user-visible reply.
+- `[REPLIED]` — Discord bridge skips delivery (already sent through another path).
+- `[file: /path]` / `[send: /path]` / `[attach: /path]` — Discord bridge extracts and attaches the file alongside the text body.
 
 **IMPORTANT:** On session start, check if the task watcher is running (`pgrep -f "watch-tasks"`). If not, start it with `bash src/watch-tasks.sh` using `run_in_background: true`. When notified, read the output — it lists ALL pending task files. Process every one, write results to `results/`, then restart the watcher. This is how voice commands reach you.
 
