@@ -10,9 +10,12 @@ import { fileURLToPath } from 'node:url';
  * Tests for src/init.sh — the auto-bootstrap + preflight script.
  *
  * Each test runs the actual shell script against a fresh tmpdir treated
- * as a synthetic Sutando repo (we point the script at it via SUTANDO_REPO).
- * That gives us real coverage without trampling the developer's actual
- * repo state.
+ * as a synthetic Sutando repo (pointed at via SUTANDO_REPO). Per-machine
+ * runtime state (logs, state, tasks, results, data, the JSON status files)
+ * lives under a SEPARATE workspace dir — so each run also gets a dedicated
+ * SUTANDO_WORKSPACE, and those assertions check there. Cross-fleet-shared
+ * artifacts (notes/, build_log.md, pending-questions.md) + the crons.json
+ * copy stay repo-rooted and are asserted against the repo.
  */
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -27,9 +30,9 @@ function runInit(repoDir: string, mode?: '--auto' | '--preflight'): RunResult {
 		env: {
 			...process.env,
 			SUTANDO_REPO: repoDir,
-			// init.sh writes runtime state under $SUTANDO_WORKSPACE; point it
-			// at the scratch repo so the per-dir assertions resolve there.
-			SUTANDO_WORKSPACE: repoDir,
+			// init.sh writes runtime state under $SUTANDO_WORKSPACE — a
+			// separate dir from the repo, so the split is actually exercised.
+			SUTANDO_WORKSPACE: join(repoDir, '.workspace'),
 			HOME: repoDir + '/.fake-home',
 		},
 		encoding: 'utf-8',
@@ -38,9 +41,11 @@ function runInit(repoDir: string, mode?: '--auto' | '--preflight'): RunResult {
 }
 
 let scratch: string;
+let workspace: string;
 
 beforeEach(() => {
 	scratch = mkdtempSync(join(tmpdir(), 'sutando-init-'));
+	workspace = join(scratch, '.workspace');
 });
 
 afterEach(() => {
@@ -51,18 +56,57 @@ describe('init.sh --auto (Tier 1: directories)', () => {
 	it('creates every expected directory in an empty repo', () => {
 		const out = runInit(scratch, '--auto');
 		assert.equal(out.status, 0, `script exit non-zero: stderr=${out.stderr}`);
-		for (const d of ['logs', 'state', 'tasks', 'results', 'results/archive', 'results/calls', 'notes', 'data']) {
-			assert.equal(existsSync(join(scratch, d)), true, `expected directory ${d}`);
+		// Per-machine runtime dirs land in the workspace.
+		for (const d of ['logs', 'state', 'tasks', 'results', 'results/archive', 'results/calls', 'data']) {
+			assert.equal(existsSync(join(workspace, d)), true, `expected workspace directory ${d}`);
 		}
+		// notes/ is cross-fleet-shared — repo-rooted.
+		assert.equal(existsSync(join(scratch, 'notes')), true, 'expected repo directory notes');
 	});
 
 	it('is idempotent — second invocation does not error or recreate', () => {
 		runInit(scratch, '--auto');
-		const before = statSync(join(scratch, 'logs')).birthtimeMs;
+		const before = statSync(join(workspace, 'logs')).birthtimeMs;
 		const second = runInit(scratch, '--auto');
 		assert.equal(second.status, 0);
-		const after = statSync(join(scratch, 'logs')).birthtimeMs;
+		const after = statSync(join(workspace, 'logs')).birthtimeMs;
 		assert.equal(before, after, 'logs/ should not be recreated on second run');
+	});
+});
+
+describe('init.sh --auto (Tier 1: legacy runtime-state migration)', () => {
+	it('moves stale repo-root runtime state into the workspace on first run', () => {
+		// Simulate a pre-#913 install: runtime state sitting in the repo.
+		mkdirSync(join(scratch, 'logs'), { recursive: true });
+		writeFileSync(join(scratch, 'logs', 'old.log'), 'stale\n');
+		writeFileSync(join(scratch, 'core-status.json'), '{"status":"running","ts":1}');
+		const out = runInit(scratch, '--auto');
+		assert.equal(out.status, 0, `stderr=${out.stderr}`);
+		// Migrated into the workspace, content preserved.
+		assert.equal(readFileSync(join(workspace, 'logs', 'old.log'), 'utf-8'), 'stale\n');
+		assert.equal(JSON.parse(readFileSync(join(workspace, 'core-status.json'), 'utf-8')).status, 'running');
+		// Repo copies gone; migration sentinel written.
+		assert.equal(existsSync(join(scratch, 'logs')), false, 'repo-root logs/ should be moved away');
+		assert.equal(existsSync(join(workspace, '.legacy-migrated-911')), true, 'sentinel should be written');
+		assert.match(out.stderr, /migrated logs\//);
+	});
+
+	it('is non-destructive — keeps the repo copy if the workspace target already exists', () => {
+		mkdirSync(join(scratch, 'logs'), { recursive: true });
+		writeFileSync(join(scratch, 'logs', 'repo.log'), 'repo\n');
+		mkdirSync(join(workspace, 'logs'), { recursive: true });
+		writeFileSync(join(workspace, 'logs', 'ws.log'), 'workspace\n');
+		runInit(scratch, '--auto');
+		// Workspace copy untouched; repo copy left in place (collision).
+		assert.equal(existsSync(join(workspace, 'logs', 'ws.log')), true);
+		assert.equal(existsSync(join(scratch, 'logs', 'repo.log')), true);
+	});
+
+	it('skips silently on a fresh install (no stale repo state)', () => {
+		const out = runInit(scratch, '--auto');
+		assert.equal(out.status, 0);
+		assert.doesNotMatch(out.stderr, /migrated/);
+		assert.equal(existsSync(join(workspace, '.legacy-migrated-911')), true);
 	});
 });
 
@@ -83,7 +127,7 @@ describe('init.sh --auto (Tier 1: placeholder files)', () => {
 
 	it('creates contextual-chips.json with a parseable shape', () => {
 		runInit(scratch, '--auto');
-		const body = readFileSync(join(scratch, 'contextual-chips.json'), 'utf-8');
+		const body = readFileSync(join(workspace, 'contextual-chips.json'), 'utf-8');
 		const parsed = JSON.parse(body);
 		assert.equal(Array.isArray(parsed.chips), true);
 		assert.equal(typeof parsed.ts, 'number');
@@ -91,14 +135,14 @@ describe('init.sh --auto (Tier 1: placeholder files)', () => {
 
 	it('creates core-status.json initialised to idle', () => {
 		runInit(scratch, '--auto');
-		const body = readFileSync(join(scratch, 'core-status.json'), 'utf-8');
+		const body = readFileSync(join(workspace, 'core-status.json'), 'utf-8');
 		const parsed = JSON.parse(body);
 		assert.equal(parsed.status, 'idle');
 	});
 
 	it('creates voice-state.json initialised to disconnected', () => {
 		runInit(scratch, '--auto');
-		const body = readFileSync(join(scratch, 'voice-state.json'), 'utf-8');
+		const body = readFileSync(join(workspace, 'voice-state.json'), 'utf-8');
 		const parsed = JSON.parse(body);
 		assert.equal(parsed.connected, false);
 	});
@@ -111,9 +155,10 @@ describe('init.sh --auto (Tier 1: placeholder files)', () => {
 	});
 
 	it('does NOT clobber an existing contextual-chips.json', () => {
-		writeFileSync(join(scratch, 'contextual-chips.json'), '{"chips":[{"label":"x","desc":"y"}],"ts":1}');
+		mkdirSync(workspace, { recursive: true });
+		writeFileSync(join(workspace, 'contextual-chips.json'), '{"chips":[{"label":"x","desc":"y"}],"ts":1}');
 		runInit(scratch, '--auto');
-		const body = readFileSync(join(scratch, 'contextual-chips.json'), 'utf-8');
+		const body = readFileSync(join(workspace, 'contextual-chips.json'), 'utf-8');
 		assert.match(body, /"label":"x"/);
 	});
 });
@@ -199,7 +244,7 @@ describe('init.sh argument parsing', () => {
 	it('runs both tiers by default (no flag)', () => {
 		const out = runInit(scratch);
 		assert.equal(out.status, 0);
-		assert.equal(existsSync(join(scratch, 'logs')), true, 'Tier 1 should have created logs/');
+		assert.equal(existsSync(join(workspace, 'logs')), true, 'Tier 1 should have created logs/');
 		assert.match(out.stdout, /\[Preflight\]/, 'Tier 2 should have emitted summary line');
 	});
 });
