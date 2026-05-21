@@ -8,7 +8,10 @@
 
 set -e
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-BUNDLE="$HOME/Desktop/sutando-migration"
+# Bundle lives under ~/.sutando/ — NOT ~/Desktop/. The bundle carries .env
+# with real secrets; ~/Desktop is synced to iCloud on many Macs, which would
+# push unscrubbed credentials to the cloud. ~/.sutando/ is not sync-backed.
+BUNDLE="$HOME/.sutando/migration-bundle"
 rm -rf "$BUNDLE"
 mkdir -p "$BUNDLE"
 
@@ -201,8 +204,15 @@ echo ""
 # ── 6. Restore all bundle files ──
 echo "Step 6/7: Restoring files..."
 
-# Copy .env
-[ -f "$BUNDLE_DIR/.env" ] && cp "$BUNDLE_DIR/.env" "$REPO/.env" && echo "  ✓ .env restored"
+# Copy .env — non-destructive: back up any existing .env first, so a stale or
+# placeholder-key bundle .env can never silently wipe real keys (2026-05-21).
+if [ -f "$BUNDLE_DIR/.env" ]; then
+  if [ -f "$REPO/.env" ]; then
+    cp "$REPO/.env" "$REPO/.env.bak.$(date +%Y%m%d-%H%M%S)" \
+      && echo "  ✓ existing .env backed up (.env.bak.*)"
+  fi
+  cp "$BUNDLE_DIR/.env" "$REPO/.env" && echo "  ✓ .env restored"
+fi
 
 # Copy memory
 if [ -d "$BUNDLE_DIR/memory" ]; then
