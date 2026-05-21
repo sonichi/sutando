@@ -77,6 +77,13 @@ const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
 const VOICE_NATIVE_AUDIO_MODEL =
 	process.env.VOICE_NATIVE_AUDIO_MODEL || 'gemini-3.1-flash-live-preview';
 
+// Hung-session watchdog threshold. A Gemini Live session can silently stall —
+// audio keeps flowing in but it stops emitting turn.end, with no transport
+// close event to trigger the reconnect path. If utterances have piled up
+// since the last turn AND the user last stopped speaking longer ago than
+// this, treat the session as hung and force a reconnect. Env-overridable.
+const WATCHDOG_STALL_MS = Number(process.env.SUTANDO_WATCHDOG_STALL_MS) || 20000;
+
 // Default false (safe): non-owner speakers in the voice channel get the
 // read-only tool surface but NOT owner-tier work/file-edit/message-send.
 // Set DISCORD_VOICE_OWNER=true explicitly to inherit owner privileges to
@@ -513,6 +520,11 @@ function subscribeUser(s: DiscordVoiceSession, userId: string): void {
 	resampler.on('end', () => {
 		s.subscribedUsers.delete(userId);
 		console.log(`${ts()} [Voice] user ${userId} stopped speaking (${chunks} chunks) — silence burst`);
+		// Watchdog bookkeeping: an utterance just finished. A healthy Gemini
+		// fires turn.end within seconds; these counters let the watchdog tell
+		// a hang apart from a normal pause.
+		(s as any).lastSpeakStopTs = Date.now();
+		(s as any).utterancesSinceTurn = ((s as any).utterancesSinceTurn || 0) + 1;
 		triggerSilenceBurst(s);
 	});
 	resampler.on('error', (e) => {
@@ -639,6 +651,9 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 	// Transcript mirroring + result-queue drain
 	let lastProcessedIdx = 0;
 	session.eventBus.subscribe('turn.end', () => {
+		// Watchdog: a turn completed — clear the hang counters.
+		(s as any).lastTurnActivityTs = Date.now();
+		(s as any).utterancesSinceTurn = 0;
 		const items = session.conversationContext.items;
 		if (items.length < lastProcessedIdx) lastProcessedIdx = 0;
 		const lastText = s.transcript.length > 0 ? s.transcript[s.transcript.length - 1].text : null;
@@ -689,6 +704,38 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 		}, 1500);
 	};
 
+	// Hung-session watchdog. A healthy Gemini fires turn.end within seconds of
+	// the user finishing an utterance. If >=2 utterances have piled up since
+	// the last turn activity and the user last stopped speaking more than
+	// WATCHDOG_STALL_MS ago, the session has silently stalled — force a
+	// reconnect through the same path as a transport close. The >=2 guard
+	// keeps a single Gemini-ignored micro-utterance from tripping it.
+	(s as any).lastTurnActivityTs = Date.now();
+	const watchdog = setInterval(() => {
+		if (s.closing || active !== s || reconnectPending) return;
+		const stop = (s as any).lastSpeakStopTs || 0;
+		const turn = (s as any).lastTurnActivityTs || 0;
+		const pile = (s as any).utterancesSinceTurn || 0;
+		const idleMs = Date.now() - stop;
+		if (stop > turn && pile >= 2 && idleMs > WATCHDOG_STALL_MS) {
+			console.error(`${ts()} [Watchdog] Gemini session hung — ${pile} utterances / ${Math.round(idleMs / 1000)}s since last speech, no turn. Reconnecting.`);
+			reconnectPending = true;
+			setTimeout(() => {
+				reconnectPending = false;
+				if (s.closing || active !== s) return;
+				// Clear the hang condition so the watchdog doesn't immediately re-fire.
+				(s as any).lastTurnActivityTs = Date.now();
+				(s as any).utterancesSinceTurn = 0;
+				try {
+					sessionAny.handleClientConnected();
+				} catch (e) {
+					console.error(`${ts()} [Watchdog] reconnect failed:`, e);
+				}
+			}, 500);
+		}
+	}, 10000);
+	(s as any)._watchdogHandle = watchdog;
+
 	// Subscribe to anyone currently speaking, and to anyone who starts.
 	connection.receiver.speaking.on('start', (userId) => subscribeUser(s, userId));
 	// Start the constant-rate ticker that flushes audio to Gemini every 20ms.
@@ -713,6 +760,7 @@ function cleanupSession(s: DiscordVoiceSession): void {
 
 	try { clearInterval((s as any)._tickHandle); } catch {}
 	try { clearInterval((s as any)._outTickHandle); } catch {}
+	try { clearInterval((s as any)._watchdogHandle); } catch {}
 	try { s.player.stop(true); } catch {}
 	try { s.connection.destroy(); } catch {}
 
