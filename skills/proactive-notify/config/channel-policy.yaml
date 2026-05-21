@@ -1,0 +1,44 @@
+# Escalation policy used by channel_router.py.
+# Picks the action channel given (Ping, presence-snapshot).
+# Overrides are walked in order, first match wins. Falls through to default_channel.
+
+quiet_hours:
+  start: "23:00"
+  end: "07:00"
+  timezone: "America/Los_Angeles"
+
+# Channel chosen per urgency tier when no override matches.
+default_channel:
+  critical: call
+  important: sms
+  fyi: queue
+
+# Overrides — first match wins. Each entry may rewrite the channel-per-urgency
+# mapping. Conditions reference fields on PresenceSnapshot (see presence.py).
+overrides:
+  - name: presenter_mode_mutes_call
+    if: presenter_mode_active
+    behavior:
+      critical: sms
+      important: queue
+      fyi: queue
+
+  - name: voice_session_prefers_voice
+    if: voice_client_connected
+    behavior:
+      critical: voice
+      important: voice
+      fyi: voice
+
+  - name: discord_active_meets_owner_there
+    if: owner_active_in_discord_within_min_5
+    behavior:
+      important: discord_dm
+      fyi: discord_dm
+
+  - name: in_quiet_hours_downgrades
+    if: in_quiet_hours
+    behavior:
+      critical: sms
+      important: queue
+      fyi: queue
