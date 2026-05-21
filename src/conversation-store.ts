@@ -15,10 +15,19 @@
  *
  * Query from CLI: scripts/query-conversation.sh "<term>"
  */
-import { DatabaseSync } from 'node:sqlite';
+import type { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
+import { createRequire } from 'node:module';
 import { resolveWorkspace } from './workspace_default.js';
+
+// `node:sqlite` is a flagged-experimental builtin until Node 22.13 — older
+// runtimes (e.g. the bundled .app runtime) throw ERR_UNKNOWN_BUILTIN_MODULE
+// on a static `import`, which would crash every process that imports this
+// module. Load it lazily via require() inside init() so an unavailable
+// node:sqlite degrades the mirror to a no-op instead of taking down the
+// caller — consistent with the best-effort contract below.
+const require = createRequire(import.meta.url);
 
 // DB lives under the resolved workspace (same tree as conversation.log,
 // which task-bridge.ts writes to `<workspace>/conversation.log`). Using the
@@ -37,8 +46,17 @@ let initFailed = false;
 function init(): void {
 	if (db || initFailed) return;
 	try {
+		// Lazy require — see the node:sqlite note at the top of this file.
+		let DatabaseSyncCtor: new (path: string) => DatabaseSync;
+		try {
+			DatabaseSyncCtor = require('node:sqlite').DatabaseSync;
+		} catch (e) {
+			initFailed = true;
+			console.warn(`[conversation-store] node:sqlite unavailable — sqlite mirror disabled (text conversation.log unaffected): ${(e as Error).message}`);
+			return;
+		}
 		mkdirSync(dirname(DB_PATH), { recursive: true });
-		db = new DatabaseSync(DB_PATH);
+		db = new DatabaseSyncCtor(DB_PATH);
 		// WAL: concurrent readers don't block the writer. busy_timeout lets
 		// the second concurrent writer wait ~1s before erroring instead of
 		// failing immediately on SQLITE_BUSY — adequate for the low write
