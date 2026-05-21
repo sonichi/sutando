@@ -594,6 +594,9 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
 		googleSearch: true,
 		speechConfig: { voiceName: 'Aoede' },
+		// Shorten Gemini's end-of-speech silence wait so turn-end (and the
+		// reply) is detected faster. Default ~1s+; env-overridable for tuning.
+		vadConfig: { silenceDurationMs: Number(process.env.SUTANDO_VAD_SILENCE_MS) || 500 },
 		hooks: {
 			onToolCall: (e) => {
 				console.log(`${ts()} [Tool] ${e.toolName} (${e.execution})`);
@@ -608,6 +611,9 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 				s.events.push({ event: `tool_result:${toolName}:${e.durationMs}ms`, timestamp: new Date().toISOString() });
 			},
 			onError: (e) => console.error(`${ts()} [Error] ${e.component}: ${e.error.message} (${e.severity})`),
+			onTurnLatency: (e) => {
+				console.log(`${ts()} [Latency] turn=${e.turnId} ${JSON.stringify(e.segments)}`);
+			},
 		},
 	});
 
