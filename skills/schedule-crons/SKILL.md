@@ -25,7 +25,7 @@ Each entry has:
    - Skip if a job with matching prompt/name already exists
    - If `prompt_skill` is set, invoke it as `/skill-name`
    - Call CronCreate with the cron expression and prompt
-4. Ensure a task watcher is running. The canonical pattern is the `Monitor` tool streaming `bash src/watch-tasks-stream.sh` (started by the CLI session itself, not by this skill). If `pgrep -f watch-tasks` finds nothing, prompt the CLI to start it — don't kick off `bash src/watch-tasks.sh` (retired 2026-05-14).
+4. Start the streaming task watcher via the `Monitor` tool — pass `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`, `description: 'Streaming task watcher'`. The script emits one `TASK_FILE: <basename>` line per new task file (initial sweep + each subsequent event). Read the named file via the Read tool when notifications arrive. (Pattern mirrors `/proactive-loop` activation step 2 — both bootstrap paths land here, so post-#954 CLI startup via `/schedule-crons` immediately gets a watcher; no gap until the first `main-loop` cron fire.) If `pgrep -f watch-tasks-stream` already shows a running watcher, skip the Monitor call — the existing one continues. Don't kick off `bash src/watch-tasks.sh` (retired 2026-05-14).
 5. Confirm what was scheduled
 
 ## Adding New Crons
