@@ -50,6 +50,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     var resultWatchSource: DispatchSourceFileSystemObject?
     var lastResultCount = 0
+    // Pointer Teacher overlay (Clicky-style flying marker). A persistent
+    // screenSaver-level click-through window; the triangle stays invisible
+    // (alpha 0) until a Target arrives via <workspace>/state/pointer-cmd.json
+    // — written by the `point_at` inline tool, watched with the same
+    // DispatchSource idiom as watchResults(). Lives inside the real menubar
+    // app's GUI session, which the standalone tracer binary could not reach.
+    var pointerWindow: NSWindow?
+    let pointerView = PointerOverlayView()
+    var pointerWatchSource: DispatchSourceFileSystemObject?
+    var pointerAnim: Timer?
+    var pointerPulseTimer: Timer?
+    var pointerHoldTimer: Timer?
+    var pointerFadeTimer: Timer?
+    var pointerLastTS: Double = 0
     // Avatar animation state (PR #418 plumbing → PR #419 consumer).
     // `currentAgentState` caches the last state from /sse-status so
     // `startAnimation`/`stopAnimation` only fire on transitions, not every poll.
@@ -133,6 +147,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             logToFile("startup: AXIsProcessTrusted=\(axTrusted)")
             registerHotKey()
             watchResults()
+            setupPointerOverlay()
             logToFile("App started, workspace=\(workspace)")
             // Startup smoke: ensure the runtime dirs exist so the silent-
             // write class can't recur (Mini nit #3). mkdir is idempotent;
@@ -1922,6 +1937,182 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: - Pointer Teacher overlay
+
+    /// Stand up the persistent click-through pointer window and watch the
+    /// state dir for Targets. Same window flags as showHUD; same DispatchSource
+    /// idiom as watchResults() (watch the dir, not the file, so the inline
+    /// tool's atomic rewrite still fires the event).
+    func setupPointerOverlay() {
+        guard let screen = NSScreen.main else { logToFile("setupPointerOverlay: no main screen"); return }
+        let f = screen.frame
+        let window = NSWindow(contentRect: f, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.level = .screenSaver
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = false
+        window.ignoresMouseEvents = true
+        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        pointerView.frame = NSRect(origin: .zero, size: f.size)
+        pointerView.pos = CGPoint(x: f.width / 2, y: f.height / 2)
+        window.contentView = pointerView
+        window.orderFrontRegardless()
+        pointerWindow = window
+
+        let stateDir = workspace + "/state"
+        try? FileManager.default.createDirectory(atPath: stateDir, withIntermediateDirectories: true)
+        let cmdPath = stateDir + "/pointer-cmd.json"
+        if !FileManager.default.fileExists(atPath: cmdPath) {
+            FileManager.default.createFile(atPath: cmdPath, contents: Data("{}".utf8))
+        }
+        // Prime lastTS so a stale command from a previous run doesn't fire on launch.
+        if let d = try? Data(contentsOf: URL(fileURLWithPath: cmdPath)),
+           let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+           let t = o["ts"] as? Double { pointerLastTS = t }
+        let fd = open(stateDir, O_EVTONLY)
+        guard fd >= 0 else { logToFile("setupPointerOverlay: cannot watch \(stateDir)"); return }
+        let src = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: .write, queue: DispatchQueue.global(qos: .utility))
+        src.setEventHandler { [weak self] in
+            DispatchQueue.main.async { self?.pollPointerCmd() }
+        }
+        src.setCancelHandler { close(fd) }
+        src.resume()
+        pointerWatchSource = src
+        // The window/view are sized once here, but pollPointerCmd maps coords
+        // against the *current* NSScreen.main.frame — a runtime resolution /
+        // scaling / arrangement change would desync them (Codex review,
+        // medium). Re-fit the overlay whenever the screen layout changes.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil, queue: .main) { [weak self] _ in self?.resizePointerOverlay() }
+        logToFile("setupPointerOverlay: up on \(Int(f.width))x\(Int(f.height)), watching \(cmdPath)")
+    }
+
+    /// Re-fit the overlay window+view to the current main screen after a
+    /// display reconfiguration so it stays aligned with pollPointerCmd's
+    /// coordinate mapping (Codex review, medium).
+    func resizePointerOverlay() {
+        guard let screen = NSScreen.main, let window = pointerWindow else { return }
+        let f = screen.frame
+        window.setFrame(f, display: false)
+        pointerView.frame = NSRect(origin: .zero, size: f.size)
+        pointerView.needsDisplay = true
+        logToFile("resizePointerOverlay: now \(Int(f.width))x\(Int(f.height))")
+    }
+
+    func pollPointerCmd() {
+        let cmdPath = workspace + "/state/pointer-cmd.json"
+        guard let d = try? Data(contentsOf: URL(fileURLWithPath: cmdPath)),
+              let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+              let tsv = o["ts"] as? Double, tsv > pointerLastTS else { return }
+        pointerLastTS = tsv
+        // hide-before-capture: point_at publishes {hide:true} just before it
+        // screenshots, because the :7845 server uses `screencapture` (raw
+        // framebuffer, ignores sharingType). Tear the overlay fully off the
+        // screen so a stale pointer can't bias the next capture (Codex review,
+        // high).
+        if o["hide"] as? Bool == true {
+            pointerAnim?.invalidate()
+            pointerPulseTimer?.invalidate(); pointerPulseTimer = nil
+            pointerHoldTimer?.invalidate(); pointerHoldTimer = nil
+            pointerFadeTimer?.invalidate(); pointerFadeTimer = nil
+            pointerView.alpha = 0
+            pointerView.showLabel = false
+            pointerView.needsDisplay = true
+            pointerWindow?.orderOut(nil)
+            logToFile("pollPointerCmd: hide ts=\(tsv) — overlay ordered out")
+            return
+        }
+        guard let nx = o["nx"] as? Double, let ny = o["ny"] as? Double else { return }
+        let lbl = o["label"] as? String ?? ""
+        guard let screen = NSScreen.main else {
+            logToFile("pollPointerCmd: accepted ts=\(tsv) nx=\(nx) ny=\(ny) label='\(lbl)' but NSScreen.main is nil — cannot fly")
+            return
+        }
+        let f = screen.frame
+        // nx,ny = fraction of the main display, top-left origin → AppKit bottom-left.
+        let raw = CGPoint(x: CGFloat(nx) * f.width, y: f.height - CGFloat(ny) * f.height)
+        // Clicky's "sit beside the element, not on top of it" offset: 8px right,
+        // 12px below (below = smaller y in our bottom-left space). Clamp 20px in.
+        let target = CGPoint(
+            x: min(max(raw.x + 8, 20), f.width - 20),
+            y: min(max(raw.y - 12, 20), f.height - 20))
+        logToFile("pollPointerCmd: accepted ts=\(tsv) nx=\(nx) ny=\(ny) label='\(lbl)' raw=(\(Int(raw.x)),\(Int(raw.y))) → target=(\(Int(target.x)),\(Int(target.y))) on \(Int(f.width))x\(Int(f.height))")
+        flyPointer(to: target, label: lbl)
+    }
+
+    /// Clicky-style quadratic-bezier flight: smoothstep easing, slight arc
+    /// lift, triangle rotated tangent to travel + mid-flight scale swoop;
+    /// beep + settle into the -35° cursor pose on arrival.
+    func flyPointer(to dst: CGPoint, label: String) {
+        // Cancel every timer from a prior point_at — a stale hold/pulse/fade
+        // would otherwise keep mutating halo/alpha/showLabel and hide the new
+        // marker mid-flight (Codex review, high). Reset the visual state too.
+        pointerAnim?.invalidate()
+        pointerPulseTimer?.invalidate(); pointerPulseTimer = nil
+        pointerHoldTimer?.invalidate(); pointerHoldTimer = nil
+        pointerFadeTimer?.invalidate(); pointerFadeTimer = nil
+        pointerView.scale = 1
+        pointerView.alpha = 0
+        pointerView.showLabel = false
+        pointerView.label = label
+        pointerWindow?.orderFrontRegardless()   // a prior {hide} ordered it out
+        let start = pointerView.pos
+        let dist = hypot(dst.x - start.x, dst.y - start.y)
+        let dur = min(max(Double(dist) / 600.0, 1.0), 2.0)
+        let arc = min(dist * 0.2, 80)
+        let ctrl = CGPoint(x: (start.x + dst.x) / 2, y: (start.y + dst.y) / 2 + arc)
+        let frames = max(Int(dur * 60), 1)
+        var i = 0
+        pointerView.alpha = 1
+        logToFile("flyPointer: START from (\(Int(start.x)),\(Int(start.y))) → (\(Int(dst.x)),\(Int(dst.y))) frames=\(frames) dur=\(String(format: "%.2f", dur)) winVisible=\(pointerWindow?.isVisible ?? false) level=\(pointerWindow?.level.rawValue ?? -999)")
+        pointerAnim = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] t in
+            guard let self = self else { t.invalidate(); return }
+            i += 1
+            let lp = Double(i) / Double(frames)
+            let u = lp * lp * (3 - 2 * lp)            // smoothstep
+            let mt = 1 - u
+            let bx = mt*mt*start.x + 2*mt*u*ctrl.x + u*u*dst.x
+            let by = mt*mt*start.y + 2*mt*u*ctrl.y + u*u*dst.y
+            let tx = 2*mt*(ctrl.x - start.x) + 2*u*(dst.x - ctrl.x)
+            let ty = 2*mt*(ctrl.y - start.y) + 2*u*(dst.y - ctrl.y)
+            self.pointerView.pos = CGPoint(x: bx, y: by)
+            self.pointerView.angle = atan2(ty, tx) - .pi / 2
+            self.pointerView.scale = 1 + 0.3 * CGFloat(sin(.pi * u))   // Clicky swoop, peaks ~1.3 mid-flight
+            self.pointerView.needsDisplay = true
+            if i >= frames {
+                t.invalidate()
+                self.pointerView.angle = PointerOverlayView.restAngle   // settle into cursor pose
+                self.pointerView.scale = 1
+                self.pointerView.showLabel = true
+                self.pointerView.needsDisplay = true
+                self.logToFile("flyPointer: ARRIVED at (\(Int(dst.x)),\(Int(dst.y))) — holding 8s, winVisible=\(self.pointerWindow?.isVisible ?? false)")
+                NSSound.beep()
+                self.holdPointer()
+            }
+        }
+    }
+
+    /// Hold the cursor-pose marker steadily on the target for 8s (Clicky just
+    /// sits at rest — no pulsing ring), then fade out over ~0.7s.
+    func holdPointer() {
+        pointerHoldTimer = Timer.scheduledTimer(withTimeInterval: 8.0, repeats: false) { [weak self] _ in
+            guard let self = self else { return }
+            var a: CGFloat = 1
+            self.pointerFadeTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] t in
+                guard let self = self else { t.invalidate(); return }
+                a -= 1.0 / 42.0
+                self.pointerView.alpha = max(a, 0)
+                self.pointerView.needsDisplay = true
+                if a <= 0 {
+                    t.invalidate()
+                    self.pointerFadeTimer = nil
+                    self.pointerView.showLabel = false
+                }
+            }
+        }
+    }
+
     @objc func restartServices() {
         notify("Sutando", "Restarting all services...")
         let proc = Process()
@@ -2089,6 +2280,81 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } catch {
             notify("Sutando", "Restart failed: \(error.localizedDescription)")
             logToFile("restartSelf: failed to spawn helper: \(error)")
+        }
+    }
+}
+
+// MARK: - Pointer Teacher overlay view
+
+/// Renders the Clicky-style cursor triangle (soft blue glow, no halo) + label.
+/// Pure view — the flight is driven by AppDelegate. Ported verbatim from
+/// pointer-teacher-tracer/pointer-overlay.swift (proven by the grill POCs).
+final class PointerOverlayView: NSView {
+    static let blue = NSColor(calibratedRed: 0.20, green: 0.62, blue: 1.0, alpha: 1.0)
+    // Clicky-faithful pointer. Small cursor-like triangle, NO halo ring (Clicky
+    // has none — just a soft blue glow). Resting pose is a -35° tilt so it reads
+    // as a pointer, not a fat upward triangle. The centroid sits at `pos`, which
+    // pollPointerCmd offsets +8px right / +12px below the real element so the
+    // marker points *beside* the target instead of covering it.
+    static let triSize: CGFloat = 18                 // Clicky uses 16; 18 for retina legibility
+    static let restAngle: CGFloat = 35 * .pi / 180   // cursor-like tilt at rest
+    var pos = CGPoint.zero          // triangle centroid (view coords, bottom-left)
+    var angle: CGFloat = restAngle  // radians; restAngle = cursor pose
+    var scale: CGFloat = 1          // flight "swoop" (peaks ~1.3 at mid-flight)
+    var label = ""
+    var showLabel = false
+    var alpha: CGFloat = 0          // overall opacity 0..1 (0 = idle/invisible)
+
+    override var isFlipped: Bool { false }
+    override func hitTest(_ p: NSPoint) -> NSView? { nil }   // never capture input
+
+    override func draw(_ r: NSRect) {
+        guard alpha > 0.01 else { return }
+        let ctx = NSGraphicsContext.current!.cgContext
+        ctx.setAlpha(alpha)
+        let blue = PointerOverlayView.blue
+
+        // Cursor-like triangle (Clicky vertex ratios), centroid at origin,
+        // rotated by `angle`, scaled by `scale`. Soft blue glow grows with the
+        // flight scale — no stroked halo ring.
+        let s = PointerOverlayView.triSize, h = s * sqrt(3) / 2
+        ctx.saveGState()
+        ctx.translateBy(x: pos.x, y: pos.y)
+        ctx.rotate(by: angle)
+        ctx.scaleBy(x: scale, y: scale)
+        let p = CGMutablePath()
+        p.move(to: CGPoint(x: 0, y: h / 1.5))           // tip
+        p.addLine(to: CGPoint(x: -s / 2, y: -h / 3))    // back-left
+        p.addLine(to: CGPoint(x: s / 2, y: -h / 3))     // back-right
+        p.closeSubpath()
+        ctx.addPath(p)
+        ctx.setShadow(offset: .zero, blur: 8 + (scale - 1.0) * 16,
+                      color: blue.withAlphaComponent(0.9).cgColor)
+        ctx.setFillColor(blue.cgColor)
+        ctx.fillPath()
+        // hairline white edge so it stays legible on dark and light UIs
+        ctx.addPath(p)
+        ctx.setShadow(offset: .zero, blur: 0, color: NSColor.clear.cgColor)
+        ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.9).cgColor)
+        ctx.setLineWidth(1.0 / max(scale, 0.01))
+        ctx.setLineJoin(.round)
+        ctx.strokePath()
+        ctx.restoreGState()
+
+        // Small label, offset clear of the element (up-right of the marker) so
+        // it never covers what the pointer indicates.
+        if showLabel, !label.isEmpty {
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+                .foregroundColor: NSColor.white]
+            let sz = (label as NSString).size(withAttributes: attrs)
+            let pad: CGFloat = 6
+            let box = NSRect(x: pos.x + 16, y: pos.y + 14,
+                             width: sz.width + pad * 2, height: sz.height + pad)
+            let rp = NSBezierPath(roundedRect: box, xRadius: 6, yRadius: 6)
+            blue.setFill(); rp.fill()
+            (label as NSString).draw(at: NSPoint(x: box.minX + pad, y: box.minY + pad / 2),
+                                     withAttributes: attrs)
         }
     }
 }

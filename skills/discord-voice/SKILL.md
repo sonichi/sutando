@@ -61,21 +61,21 @@ DISCORD_VOICE_SERVER=1 \
 Optional env:
 - `VOICE_MODEL` / `VOICE_NATIVE_AUDIO_MODEL` — mirrors `voice-agent.ts`.
 - `SUTANDO_WORKSPACE` — workspace root for tasks/results/data/logs.
-- `DISCORD_VOICE_OWNER` — `true` (default) treats every speaker in the voice channel as the owner — see **Trust boundary** below.
+- `DISCORD_VOICE_OWNER` — `false` (default) gates owner-tier tools (`work`, file edits, message sends) to the configured `owner` env; non-owner speakers still get the safe read-only surface. Set `=true` to inherit owner privileges to every speaker — only safe in fully-trusted single-operator channels. See **Trust boundary** below.
 
 `DISCORD_VOICE_SERVER=1` flips the polymorphic `dismiss` tool (`src/meeting-tools.ts`) into "SIGTERM self" mode instead of its default Zoom AppleScript path. Without it, asking Sutando to "leave"/"dismiss" in the channel would try to leave a (non-existent) Zoom meeting.
 
-## Trust boundary — read this before inviting the bot anywhere shared
+## Trust boundary — read this before flipping the default
 
-`DISCORD_VOICE_OWNER=true` is the deliberate default for a personal-use bot and it has a sharp edge: **anyone who can speak in the same voice channel inherits owner-tier `work` privileges** — full task delegation, file edits, message sends, anything the proactive loop can do.
+`DISCORD_VOICE_OWNER=false` is the **safe default**: non-owner speakers in the voice channel get the read-only tool surface (current time, status checks, lookups) but NOT owner-tier `work`, file edits, or message sends. Only the configured `owner` env (your own Discord user id) gets the full surface.
 
-This is fine because every Sutando install runs its own bot in its own guild, and the operator controls who they let into the voice channel. But it means:
+`DISCORD_VOICE_OWNER=true` is the opt-in for **single-operator personal-use mode**: it inherits owner-tier privileges to every speaker in the channel. It has a sharp edge — anyone who can speak in the same voice channel can delegate `work`, edit files, send messages, anything the proactive loop can do. Only flip this on for voice channels whose membership is fully trusted (your own Lounge, never community/public).
+
+Either way:
 
 - Don't invite the bot to a voice channel you don't trust the membership of.
-- Don't leave the bot connected to a public/community voice channel unattended.
-- If you want a shared / community deployment, set `DISCORD_VOICE_OWNER=false` — that gates `work` and the other owner-only tools to the configured `owner` env. (Non-owner callers still get the safe read-only tools.)
-
-There is no per-user ACL inside the voice channel; the unit of trust is "who's allowed in the channel" (Discord channel permissions own that), not "who's speaking right now".
+- Don't leave the bot connected to a public/community voice channel unattended on `=true`.
+- There is no per-user ACL inside the voice channel; the unit of trust is "who's allowed in the channel" (Discord channel permissions own that), not "who's speaking right now".
 
 ## DM-triggered join
 
