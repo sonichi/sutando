@@ -19,6 +19,9 @@ Bot scopes (OAuth & Permissions):
 Access list (TOFU onboarding, same schema as telegram):
     ~/.claude/channels/slack/access.json
         {"allowFrom": ["U0123..."], "tofuOwner": "U0123...", ...}
+    Set SLACK_OWNER_ID to pin the owner — TOFU then enrolls that user
+    instead of whoever DMs first. A sidecar access.json.bak self-heals
+    the access list if the live file is wiped externally (#899).
 
 File round-trip:
     Inbound  — files attached to DMs/mentions are downloaded into
@@ -179,6 +182,18 @@ def presenter_mode_active() -> bool:
 
 
 ACCESS_FILE = Path.home() / ".claude" / "channels" / "slack" / "access.json"
+ACCESS_BACKUP = ACCESS_FILE.with_name("access.json.bak")
+
+
+def _backup_access_file() -> None:
+    """Mirror a valid access.json to a sidecar .bak so load_allowed() can
+    self-heal if the live file is wiped externally (#899)."""
+    try:
+        if ACCESS_FILE.exists():
+            ACCESS_BACKUP.write_text(ACCESS_FILE.read_text())
+            os.chmod(ACCESS_BACKUP, 0o600)
+    except Exception:
+        pass
 
 
 def load_allowed():
@@ -188,8 +203,21 @@ def load_allowed():
     empty allowFrom means admin explicitly locked it down (no TOFU)."""
     try:
         data = json.loads(ACCESS_FILE.read_text())
+        _backup_access_file()  # keep the .bak fresh on every good read
         return set(data.get("allowFrom", []))
     except FileNotFoundError:
+        # #899: the live file can be wiped externally. Restore from the
+        # sidecar backup before treating this as never-configured — which
+        # would otherwise re-trigger TOFU and risk enrolling the wrong owner.
+        try:
+            if ACCESS_BACKUP.exists():
+                ACCESS_FILE.write_text(ACCESS_BACKUP.read_text())
+                os.chmod(ACCESS_FILE, 0o600)
+                print(f"  [access-heal] restored {ACCESS_FILE} from backup", flush=True)
+                data = json.loads(ACCESS_FILE.read_text())
+                return set(data.get("allowFrom", []))
+        except Exception:
+            pass
         return None
     except Exception:
         return set()
@@ -207,24 +235,43 @@ def load_tier_map() -> dict:
         return {}
 
 
+def _pinned_owner() -> str | None:
+    """Slack user ID to force as owner, from the SLACK_OWNER_ID env var.
+
+    When set, TOFU enrolls this user as owner instead of first-DM-wins —
+    so a stray first DM (or an access.json wipe, #899) can never enroll the
+    wrong person. Mirrors the SUTANDO_DM_OWNER_ID override the Discord bridge
+    uses for proactive routing, applied here at onboarding time."""
+    return os.environ.get("SLACK_OWNER_ID", "").strip() or None
+
+
 def tofu_onboard(user_id: str, username: str | None) -> set:
-    """First-time auto-onboard — same contract as telegram-bridge.py."""
+    """First-time auto-onboard — same contract as telegram-bridge.py.
+
+    If SLACK_OWNER_ID is pinned, the pinned user is enrolled as owner
+    regardless of who sent the first DM. Without a pin, falls back to
+    first-DM-wins TOFU."""
     if ACCESS_FILE.exists():
         return load_allowed() or set()
+    pinned = _pinned_owner()
+    owner_id = pinned or user_id
     ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "allowFrom": [user_id],
-        "tofuOwner": user_id,
+        "allowFrom": [owner_id],
+        "tofuOwner": owner_id,
         "tofuOnboardedAt": int(time.time()),
-        "tofuOnboardedUsername": username or None,
+        "tofuOnboardedUsername": (username if owner_id == user_id else None),
+        "tofuPinned": bool(pinned),
     }
     ACCESS_FILE.write_text(json.dumps(payload, indent=2) + "\n")
     os.chmod(ACCESS_FILE, 0o600)
+    _backup_access_file()
     print(
-        f"  TOFU: auto-onboarded @{username} (id={user_id}) as owner — wrote {ACCESS_FILE}",
+        f"  TOFU: {'pinned' if pinned else 'auto'}-onboarded {owner_id} "
+        f"as owner — wrote {ACCESS_FILE}",
         flush=True,
     )
-    return {user_id}
+    return {owner_id}
 
 
 # Track which Slack channel/thread to reply into for each task we wrote.
