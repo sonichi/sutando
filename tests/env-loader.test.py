@@ -65,6 +65,19 @@ def check(path: Path) -> list[str]:
             f"comment — intent may be lost in next refactor"
         )
 
+    # Quote-strip invariant. Without this, `KEY="value"` in .env stored
+    # the literal `"value"` (with quotes) in os.environ, and downstream
+    # API auth/URL paths embedded the quotes verbatim — producing
+    # cryptic 401/404 from the upstream service. The fix is a 3-line
+    # inline matching-quote strip in each loader.
+    if not re.search(r"val\[0\]\s*==\s*val\[-1\]|v\[0\]\s*==\s*v\[-1\]", text):
+        failures.append(
+            f"{path.relative_to(REPO)}: no matching-quote strip detected in "
+            f"the env loader. `KEY=\"value\"` in .env will be stored as "
+            f"`\"value\"` (with quotes) in os.environ. Add a 3-line strip "
+            f"after the val.strip() call (mirror python-dotenv's behavior)."
+        )
+
     return failures
 
 

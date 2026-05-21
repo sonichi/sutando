@@ -88,7 +88,16 @@ if channels_env.exists():
     for line in channels_env.read_text().splitlines():
         if "=" in line and not line.startswith("#"):
             k, v = line.split("=", 1)
-            os.environ[k.strip()] = v.strip()
+            v = v.strip()
+            # Strip matching surrounding quotes — mirrors python-dotenv.
+            # Without this, `TELEGRAM_BOT_TOKEN="abc"` in .env stores
+            # the literal `"abc"` (with quotes) in os.environ; the
+            # Telegram REST URL becomes
+            # `https://api.telegram.org/bot"abc"/getUpdates` and Telegram
+            # returns 404. Quoted .env values are a common convention.
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+                v = v[1:-1]
+            os.environ[k.strip()] = v
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 if not TOKEN:
