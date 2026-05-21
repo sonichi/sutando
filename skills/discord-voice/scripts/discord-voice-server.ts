@@ -77,7 +77,12 @@ const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
 const VOICE_NATIVE_AUDIO_MODEL =
 	process.env.VOICE_NATIVE_AUDIO_MODEL || 'gemini-3.1-flash-live-preview';
 
-const TREAT_AS_OWNER = (process.env.DISCORD_VOICE_OWNER ?? 'true') !== 'false';
+// Default false (safe): non-owner speakers in the voice channel get the
+// read-only tool surface but NOT owner-tier work/file-edit/message-send.
+// Set DISCORD_VOICE_OWNER=true explicitly to inherit owner privileges to
+// every speaker — only safe in voice channels whose membership is fully
+// trusted (single-operator Lounge, not community/public).
+const TREAT_AS_OWNER = (process.env.DISCORD_VOICE_OWNER ?? 'false') === 'true';
 
 // CLI: --guild <id> --channel <voice_channel_id>
 function getArg(name: string): string | undefined {
