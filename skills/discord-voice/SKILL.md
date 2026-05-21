@@ -77,9 +77,11 @@ Set it up by adding `"owner": "<your-discord-user-id>"` to `access.json`. If no 
 
 This means the bot can sit safely in a shared/multi-person voice channel: a non-owner speaker physically cannot trigger owner-tier tools — the gate runs at tool-execution time, so even if the model tries, the call is denied.
 
-## DM-triggered join
+## DM-triggered join — owner only
 
-Anyone running a Sutando proactive loop can DM their bot "join the lounge voice channel in `<server>`" — the loop spawns the run command above as a subprocess. No separate launcher needed; the task-bridge → proactive-loop → Bash pipeline already handles it.
+The bot joins a voice channel when its owner DMs it "join the lounge voice channel in `<server>`" — the loop spawns the run command above as a subprocess. The task-bridge → proactive-loop → Bash pipeline handles it.
+
+**A join request is honored only when the originating task's `access_tier` is `owner`.** access_tier is set by `discord-bridge.py` from `access.json` (owner = the `owner` field; team = the rest of `allowFrom`; other = neither). A `team`- or `other`-tier "join voice" request is declined — a non-owner cannot make the bot enter a voice channel. This holds at two layers: non-owner Discord tasks are already routed to a read-only sandbox (see CLAUDE.md "Discord access control") which cannot spawn the server, and the join request itself is owner-gated on top of that.
 
 ## Tools
 
