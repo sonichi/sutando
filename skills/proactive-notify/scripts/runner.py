@@ -38,11 +38,26 @@ from presence import snapshot  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
 SKILL_DIR = SCRIPTS_DIR.parent
-DEFAULT_PINGS = SKILL_DIR / "config" / "pings.yaml"
-DEFAULT_POLICY = SKILL_DIR / "config" / "channel-policy.yaml"
-STATE_DIR = SKILL_DIR / "state"
+SKILL_NAME = SKILL_DIR.name
+TEMPLATE_DIR = SKILL_DIR / "config"
+WORKSPACE_SKILL_DIR = resolve_workspace() / "skills" / SKILL_NAME
+DEFAULT_PINGS = WORKSPACE_SKILL_DIR / "pings.yaml"
+DEFAULT_POLICY = WORKSPACE_SKILL_DIR / "channel-policy.yaml"
+STATE_DIR = WORKSPACE_SKILL_DIR / "state"
 FIRED_PATH = STATE_DIR / "fired.json"
 DRY_RUN_LOG = resolve_workspace() / "logs" / "proactive-notify-dryrun.log"
+
+
+def _bootstrap_workspace_config() -> None:
+    """First-run: copy .example templates from repo to workspace if absent."""
+    WORKSPACE_SKILL_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    for live, template in (
+        (DEFAULT_PINGS, TEMPLATE_DIR / "pings.yaml.example"),
+        (DEFAULT_POLICY, TEMPLATE_DIR / "channel-policy.yaml.example"),
+    ):
+        if not live.exists() and template.exists():
+            live.write_text(template.read_text())
 
 
 def _load_yaml(path: Path) -> dict:
@@ -168,6 +183,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--policy", type=Path, default=DEFAULT_POLICY)
     args = parser.parse_args(argv)
 
+    _bootstrap_workspace_config()
     pings_doc = _load_yaml(args.pings)
     policy = _load_yaml(args.policy)
     presence_snap = snapshot(policy)

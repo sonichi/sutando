@@ -13,12 +13,14 @@ Returns events starting within `lookahead_min` of now, each as a dict with:
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
 from datetime import datetime, timezone
 from typing import Iterator
 
 
-GWS_BIN = "/Users/qingyunwu/.local/bin/gws"
+GWS_BIN = os.environ.get("GWS_BIN") or shutil.which("gws") or "gws"
 
 
 def _parse_event_start(start_str: str) -> datetime:

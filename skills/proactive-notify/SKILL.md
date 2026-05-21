@@ -40,13 +40,36 @@ Cron entry (auto-added by `/schedule-crons` once `crons.json` has the entry belo
 }
 ```
 
+## Where config lives (data-vs-code split)
+
+The repo carries only **templates** (`config/*.example`) and code; the live per-user config + state live under the workspace:
+
+```
+Repo (shared, git-tracked):
+  skills/proactive-notify/
+    config/pings.yaml.example
+    config/channel-policy.yaml.example
+    scripts/*.py
+    SKILL.md
+
+Workspace (per-user, NOT git-tracked):
+  $SUTANDO_WORKSPACE/skills/proactive-notify/
+    pings.yaml             ← edit your pings here
+    channel-policy.yaml    ← edit your escalation policy here
+    state/fired.json       ← runtime dedup state
+```
+
+The runner bootstraps the workspace copy from `.example` template on first run, then reads workspace from then on.
+
 ## Adding a ping
 
-Edit `config/pings.yaml`. Each entry needs: `name`, `source`, `match`, `urgency`, `body_template`. Optional: `voice_natural`, `prefer_channel`, `quiet_hours_override`.
+Edit `$SUTANDO_WORKSPACE/skills/proactive-notify/pings.yaml`. Each entry needs: `name`, `source`, `match`, `urgency`, `body_template`. Optional: `voice_natural`, `prefer_channel`, `quiet_hours_override`.
 
 ## Adding a source / action
 
 Drop a new module in `scripts/sources/<name>.py` or `scripts/actions/<name>.py` with the contract documented in their `__init__.py`. The runner picks them up by `import_module` of the `source:` / channel name.
+
+**No personal literals in code**: per `feedback_user_config_in_workspace`, source/action code must be generic. Use `os.environ.get(K) or shutil.which(K) or "default"` for binaries; pull owner identifiers from `.env`; never hardcode owner phone / Discord ID / personal path in `if` checks.
 
 ## Default escalation rules
 
