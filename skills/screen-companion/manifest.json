@@ -1,0 +1,7 @@
+{
+  "name": "screen-companion",
+  "enabled": true,
+  "access_tier": "owner",
+  "description": "Screen Companion mode entry — voice tool that loads a use-case config (guided-setup, etc.) and returns the prompt overlay + activation message Gemini should follow for the rest of the session.",
+  "tools": "./tools.ts"
+}

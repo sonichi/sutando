@@ -1,0 +1,11 @@
+{
+  "chips": ["M2", "M3", "M4"],
+  "exclude_chips": ["M1"],
+  "min_ram_gb": 16,
+  "min_storage_gb": 512,
+  "max_price_usd": 500,
+  "zip": "94566",
+  "search_radius_miles": 50,
+  "search_query": "mac mini",
+  "soft_match_when_specs_missing": true
+}
