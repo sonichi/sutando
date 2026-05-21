@@ -24,7 +24,7 @@ const TOOL_IN_PROGRESS = `⏺ Bash(npm install 2>&1 | tail -6)
 ──── sutando-core ──
 ❯ `;
 
-const TOOL_BG = `⏺ Bash(bash src/watch-tasks.sh)
+const TOOL_BG = `⏺ Bash(bash src/watch-tasks-stream.sh)
   ⎿  Running in the background (↓ to manage)
 ──── sutando-core ──
 ❯ `;

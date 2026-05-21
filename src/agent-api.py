@@ -109,7 +109,7 @@ voice_desired_state = "disconnected"
 
 def _pgrep_ok(pattern: str) -> bool:
     try:
-        return subprocess.run(["pgrep", "-f", pattern], capture_output=True, timeout=2).returncode == 0
+        return subprocess.run(["/usr/bin/pgrep", "-f", pattern], capture_output=True, timeout=2).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
 
@@ -422,7 +422,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             activity = []
             try:
                 git_log = subprocess.run(
-                    ["git", "-C", str(REPO_DIR), "log", "--oneline", "--since=24 hours ago", "-10"],
+                    ["/usr/bin/git", "-C", str(REPO_DIR), "log", "--oneline", "--since=24 hours ago", "-10"],
                     capture_output=True, text=True, timeout=5
                 ).stdout.strip()
                 for line in git_log.split("\n"):

@@ -14,6 +14,22 @@ cd "$REPO"
 # $SUTANDO_ROOT.
 export SUTANDO_ROOT="$REPO"
 
+# Git committer attribution from stand-identity.json (opt-in, no env var).
+# The repo-local `user.email` (GitHub privacy noreply) is the AUTHOR — CLA
+# resolves it to the owner's account. The COMMITTER carries per-host
+# attribution so `git log --format='%h %an / %cn %s'` shows which Sutando
+# host crafted each commit. Silent fall-through on every "no identity" path
+# (missing file, missing jq, empty fields); OSS users ship no identity file.
+if [ -f "$REPO/stand-identity.json" ] && command -v jq > /dev/null 2>&1; then
+  _stand_name=$(jq -r '.name // empty' "$REPO/stand-identity.json" 2>/dev/null)
+  _stand_machine=$(jq -r '.machine // empty' "$REPO/stand-identity.json" 2>/dev/null)
+  if [ -n "$_stand_name" ] && [ -n "$_stand_machine" ]; then
+    git -C "$REPO" config committer.name "$_stand_name"
+    git -C "$REPO" config committer.email "${_stand_machine}@noreply.sutando.local"
+  fi
+  unset _stand_name _stand_machine
+fi
+
 # Per-machine runtime state. Resolves $SUTANDO_WORKSPACE, defaulting to
 # ~/.sutando/workspace/ (the canonical workspace per docs/workspace-design.md).
 # The .app build may pin SUTANDO_WORKSPACE to another location if needed.
@@ -87,12 +103,27 @@ else
 fi
 
 echo "Checking permissions..."
-if ! screencapture -x /tmp/sutando-permcheck.png 2>/dev/null; then
-  echo "  ⚠ Screen Recording not granted"
+# macOS 15+ silently writes a tiny PNG when Screen Recording is denied (exit 0).
+# Discriminator: real captures are hundreds-of-KB to MB; denied artifacts <2KB.
+# An all-black 5120x2880 PNG compresses to ~43KB, so 5KB is the safe floor.
+PERM_OK=1
+screencapture -x /tmp/sutando-permcheck.png 2>/dev/null || PERM_OK=0
+if [ "$PERM_OK" -eq 1 ]; then
+  # wc -c is portable across BSD (macOS) and GNU coreutils.
+  permcheck_size=$(wc -c < /tmp/sutando-permcheck.png 2>/dev/null | tr -d ' ' || echo 0)
+  if [ "${permcheck_size:-0}" -lt 5000 ]; then PERM_OK=0; fi
+fi
+rm -f /tmp/sutando-permcheck.png
+if [ "$PERM_OK" -eq 0 ]; then
+  echo "  ⚠ Screen Recording not granted (or stale)"
   echo "    → System Settings → Privacy & Security → Screen & System Audio Recording"
-  echo "    → Add 'claude' and 'node'"
+  echo "    → Add the app running this terminal (Terminal.app / iTerm2 / Warp / VS Code / Cursor / etc.)"
+  echo "    → Fully Quit the terminal app, then re-open. macOS caches the perm until process restart."
+  if lsof -i :7845 > /dev/null 2>&1; then
+    echo "    → A screen-capture server is already running on :7845 with the old (denied) perm."
+    echo "      Kill it before re-running: lsof -ti:7845 | xargs kill"
+  fi
 else
-  rm -f /tmp/sutando-permcheck.png
   echo "  ✓ Screen Recording"
 fi
 
@@ -165,10 +196,16 @@ else
 fi
 
 # 4. Screen capture server (port 7845)
+# Skip when Screen Recording perm is missing — otherwise we'd start a server
+# that returns black-PNG denials, the stale-7845 state the permcheck warns about.
 if ! lsof -i :7845 > /dev/null 2>&1; then
-  echo "  Starting screen capture (port 7845)..."
-  python3 src/screen-capture-server.py > "$LOGS_DIR/screen-capture.log" 2>&1 &
-  echo "  ✓ screen capture"
+  if [ "$PERM_OK" -eq 1 ]; then
+    echo "  Starting screen capture (port 7845)..."
+    python3 src/screen-capture-server.py > "$LOGS_DIR/screen-capture.log" 2>&1 &
+    echo "  ✓ screen capture"
+  else
+    echo "  ⊘ screen capture skipped — grant Screen Recording perm first, then re-run startup.sh"
+  fi
 else
   echo "  ✓ screen capture (already running)"
 fi

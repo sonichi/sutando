@@ -46,6 +46,16 @@ DEST="$HOME/Library/LaunchAgents/$LABEL.plist"
 DOMAIN="gui/$(id -u)"
 SERVICE="$DOMAIN/$LABEL"
 
+# Resolve runtime workspace — launchd job writes its log under
+# $WORKSPACE/logs/ instead of the repo-root legacy path (per PR #911's
+# workspace-vs-repo split). Same resolution shape as src/startup.sh +
+# workspace_default.py.
+if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
+  WORKSPACE="${SUTANDO_WORKSPACE/#\~/$HOME}"
+else
+  WORKSPACE="$HOME/.sutando/workspace"
+fi
+
 cmd="${1:-install}"
 
 bootout_if_loaded() {
@@ -101,10 +111,11 @@ case "$cmd" in
         echo "  python:  $PYTHON_BIN"
         echo "  brew:    $BREW_BIN"
         mkdir -p "$HOME/Library/LaunchAgents"
-        mkdir -p "$REPO/logs"
+        mkdir -p "$WORKSPACE/logs"
         # Render the template. Use a delimiter unlikely to appear in paths.
         sed \
             -e "s|__REPO__|$REPO|g" \
+            -e "s|__WORKSPACE__|$WORKSPACE|g" \
             -e "s|__PYTHON__|$PYTHON_BIN|g" \
             -e "s|__HOMEBREW_BIN__|$BREW_BIN|g" \
             "$TEMPLATE" > "$DEST"
