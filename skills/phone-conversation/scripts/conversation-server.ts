@@ -957,6 +957,9 @@ function cleanupCall(callSid: string): void {
 	// Append to shared conversation.log + sqlite mirror for cross-agent context
 	if (session.transcript.length > 0) {
 		const logPath = join(WORKSPACE_DIR, 'logs', 'conversation.log');
+		// logs/ is created by init.sh, but a service started outside that path
+		// (e.g. a direct `tsx` run) may hit this write first — ensure the parent.
+		mkdirSync(join(WORKSPACE_DIR, 'logs'), { recursive: true });
 		const callType = session.meetingId ? `meeting-${session.meetingId}` : `call-${session.callerNumber || 'unknown'}`;
 		for (const t of session.transcript) {
 			const role = t.role === 'sutando' ? 'phone-agent' : 'phone-caller';

@@ -143,6 +143,10 @@ migrate_root_status_to_state() {
   fi
   mkdir -p "$WORKSPACE/state"
   local moved_any=0
+  # Single source of truth for this list is `_STATUS_FILES` in
+  # src/workspace_default.py — keep the two in sync. Adding a 6th status
+  # file there without adding it here (or vice versa) silently drifts the
+  # Python and bash migrator twins.
   for f in core-status.json voice-state.json contextual-chips.json dynamic-content.json quota-state.json; do
     local src="$WORKSPACE/$f"
     local dst="$WORKSPACE/state/$f"
