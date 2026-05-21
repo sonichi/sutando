@@ -55,7 +55,7 @@ Engine release cadence is **driven by feature-completion**, not by a calendar. A
 
 A bot proposes a release by:
 
-1. Writing `notes/release-proposals/proposed-engine-vX.Y.Z.md` with: motivation, version bump rationale, CHANGELOG draft, gate-readiness checklist.
+1. Writing `notes/release-proposals/proposed-vX.Y.Z.md` with: motivation, version bump rationale, CHANGELOG draft, gate-readiness checklist.
 2. Posting a notification to `#dev` (Discord) tagging the owner.
 3. Waiting. Owner either says go (and runs `gh release create`) or says wait.
 
@@ -71,7 +71,7 @@ Memory feedback `feedback_pr_restraint.md` applies one tier up: don't tag for th
 
 ### 2.1 Recommendation: SemVer
 
-`engine-vMAJOR.MINOR.PATCH` (matches qingyun-sutando's `engine-v0.1.0` convention).
+`vMAJOR.MINOR.PATCH` (matches qingyun-sutando's `v0.1.0` convention).
 
 | Rule | Bump | Example |
 |------|------|---------|
@@ -88,17 +88,11 @@ Memory feedback `feedback_pr_restraint.md` applies one tier up: don't tag for th
 
 **Pre-release suffixes (`-rc.1`, `-alpha.1`)**: deferred per qingyun-sutando's non-goals. We add when a real soft-launch need shows up, not before.
 
-### 2.2 Tag namespace: `engine-vX.Y.Z`, not bare `vX.Y.Z`
+### 2.2 Tag namespace: bare `vX.Y.Z`
 
-Open question 1 from qingyun-sutando's draft asks for owner direction. **My recommendation: keep the `engine-` prefix.**
+**Resolved 2026-05-20: bare `vX.Y.Z`, no prefix.** (This half originally recommended an `engine-` prefix; the review round overrode it.)
 
-Reasons:
-
-- The repo (`sonichi/sutando`) is the engine codebase **and** the home for the future product-side bundle metadata. Sutando.app's own version line (v0.2.11, next v0.3.0) is *not* in this repo today, but it could end up here later (or vice versa). Two version lines colliding in the same `git tag` namespace is a sharp edge worth avoiding pre-emptively.
-- The cost of typing `engine-v0.1.0` is one prefix; the cost of disambiguating later (after `v0.3.0` collides with a hypothetical engine `v0.3.0`) is renaming history. One-time inconvenience vs. permanent ambiguity.
-- The pattern is well-known: `kubernetes/kubectl-v1.28.0`, `homebrew/homebrew-cask/v3.x`. Prefix-namespaced tags are a normal pattern when one repo carries multiple release lines.
-
-If owner picks bare `vX.Y.Z`: harmless for now; we'd add the prefix only if/when product versioning lands in this repo. Cost of switching later is rewriting tags (annoying but not destructive).
+The prefix was proposed to defend against a future namespace collision if product (Sutando.app) versioning ever shared this repo's `git tag` namespace. The decision: that collision doesn't materialize — the product ships from its own repo under its own tag line — so this repo carries one version line and a bare `vX.Y.Z` is the conventional, lower-friction choice. See the consolidated doc §2.2.
 
 ---
 
@@ -118,16 +112,16 @@ The tag is just a named pointer at a commit on `main`. No `release/0.1.x` branch
 
 - We do not patch old releases. If a bug is found in 0.1.0 after 0.2.0 ships, users upgrade to 0.2.0; there is no 0.1.1 patch backport. This is correct for a fast-moving engine with a small install base.
 - Release branches add a maintenance burden (cherry-picks, divergent CI, "which branch is canonical?") that pays off only when supporting parallel released lines. Not our shape today.
-- Bundle-deployers (Sutando.app) pin to a specific tag, not a branch — so `engine-v0.1.0` as a tag on main is sufficient for their needs.
+- Bundle-deployers (Sutando.app) pin to a specific tag, not a branch — so `v0.1.0` as a tag on main is sufficient for their needs.
 
-**Caveat — when to revisit**: if Sutando.app ever needs a critical patch on an engine version that has already had a successor (commercial customer pinned to engine-v0.3.0, but engine-v0.4.0 has shipped and broke something they need), we cut `release/0.3.x` lazily at that point. Pre-emptive release branching is YAGNI.
+**Caveat — when to revisit**: if Sutando.app ever needs a critical patch on an engine version that has already had a successor (commercial customer pinned to v0.3.0, but v0.4.0 has shipped and broke something they need), we cut `release/0.3.x` lazily at that point. Pre-emptive release branching is YAGNI.
 
 ### 3.2 What if `main` is in a "not-quite-ready" state at tag time?
 
 Two options, in order of preference:
 
 1. **Wait and stabilize main.** Ideal — fewer parallel branches.
-2. **Tag at an earlier commit on main.** If `main` is at SHA `F` but only commits A→D are release-ready, tag `engine-v0.1.0` at D. Subsequent commits E and F ride the next release.
+2. **Tag at an earlier commit on main.** If `main` is at SHA `F` but only commits A→D are release-ready, tag `v0.1.0` at D. Subsequent commits E and F ride the next release.
 
 We **do not** cut a release branch and stabilize there. If main isn't tag-ready, the discipline lives in not merging speculatively to main, not in branching around it.
 
@@ -141,11 +135,11 @@ Mechanically:
 
 ```bash
 # After PR for vX.Y.Z lands on main:
-git tag -a engine-vX.Y.Z -m "engine vX.Y.Z — <one-line summary>"
-git push origin engine-vX.Y.Z
+git tag -a vX.Y.Z -m "engine vX.Y.Z — <one-line summary>"
+git push origin vX.Y.Z
 
 # Then immediately:
-gh release create engine-vX.Y.Z \
+gh release create vX.Y.Z \
   --title "engine vX.Y.Z — <one-line summary>" \
   --notes-file release-notes-vX.Y.Z.md \
   --generate-notes  # also captures PR-titles as a secondary view
@@ -175,7 +169,7 @@ Soft gates (warn but don't block):
 ### 4.3 Annotated, signed tag
 
 ```bash
-git tag -a -s engine-vX.Y.Z -m "..."
+git tag -a -s vX.Y.Z -m "..."
 ```
 
 `-s` (signed) is the right default if owner has GPG configured. Skipping it is fine for the first few cuts; harden later. Bot-prepared tags should never push `-s`; only owner pushes signed tags. This guarantees the cryptographic anchor is owner-attested.
@@ -184,7 +178,7 @@ git tag -a -s engine-vX.Y.Z -m "..."
 
 ## Part 5: What to cut next (open question 4 from qingyun-sutando)
 
-qingyun-sutando proposed three options and leaned **(c)** — cut `engine-v0.1.0` now with manual migration steps in release notes; build the framework as `engine-v0.1.1`.
+qingyun-sutando proposed three options and leaned **(c)** — cut `v0.1.0` now with manual migration steps in release notes; build the framework as `v0.1.1`.
 
 **My read: (c) for pragmatism. Same conclusion, slightly different reasoning.**
 
@@ -194,7 +188,7 @@ qingyun-sutando proposed three options and leaned **(c)** — cut `engine-v0.1.0
 
 **Concrete proposal for v0.1.0 contents:**
 
-- Tag: `engine-v0.1.0`
+- Tag: `v0.1.0`
 - Date: as soon as owner greenlights this RFC + the CHANGELOG-PENDING.md is consolidated from current main's PR titles.
 - CHANGELOG narrative: "Initial engine snapshot. All changes since project inception are batch-recorded. No automatic migrations — install instructions name manual steps where needed (currently: SUTANDO_PRIVATE_DIR → SUTANDO_MEMORY_DIR rename, see PR #876)."
 - Manual migration list in release notes: the small set of "if upgrading from a pre-tag install, do X" steps. Today there's effectively one (the env var rename), and the alias from #876 means most installs don't even need to act.
@@ -212,7 +206,7 @@ Explicit wiring (so the consolidated doc has no contradictions):
 | "Tag-time gate #4: all migrations for this version present + tested" (4.2) | "Per-PR discipline: PR template checklist 'does this change state format?'" (2.6 phase 3) | Same check, two enforcement points. Per-PR is the early gate; release-time is the final gate. Both required; redundant on purpose. |
 | "Tag-time gate #5: migration smoke-test" (4.2) | "Migration smoke-test in release process" (2.7 step 5) | Same procedure. This half names it as part of the tag-push gate; that half names it as part of the framework. |
 | "Trigger M1 = headline feature merged" (1.1) | "CHANGELOG category = feat" (1.1) | A `feat` entry doesn't auto-trigger a tag, but the existence of `feat` entries with no tag is the "tag drift" signal that arms the floor in 1.1. |
-| "SemVer with engine- prefix" (2.1 + 2.2) | "engine-v0.1.0 first cut" (open question 1) | Aligned; this half answers the open question. |
+| "SemVer, bare `vX.Y.Z`" (2.1 + 2.2) | "v0.1.0 first cut" | Aligned; bare tag (no prefix) per the resolved decision. |
 | "Cut v0.1.0 now, framework as v0.1.1" (Part 5) | "Phase 1 framework as v0.1.1; Phase 2 = workspace contract migration" (2.6) | Same plan, this half phases it onto the version axis. |
 
 No double-coverage. No gap.
@@ -221,10 +215,10 @@ No double-coverage. No gap.
 
 ## Open questions for owner
 
-These need explicit owner direction before consolidation. (qingyun-sutando's section also has open questions; the consolidated doc will batch them.)
+**All resolved 2026-05-20** — see the consolidated doc's "Consolidated decisions" section. Kept here as the original proposal's open items, with resolutions:
 
-1. **Tag-name prefix**: `engine-vX.Y.Z` (my recommendation) vs bare `vX.Y.Z`. Either works for now; the prefix protects against future namespace collision when product versioning lands.
-2. **First cut timing**: greenlight (c) — cut `engine-v0.1.0` from current main, framework as `v0.1.1` next? Or prefer (b) — block on framework?
+1. **Tag-name prefix** → resolved: **bare `vX.Y.Z`** (this half's `engine-` recommendation was overridden in the review round).
+2. **First cut timing**: greenlight (c) — cut `v0.1.0` from current main, framework as `v0.1.1` next? Or prefer (b) — block on framework?
 3. **Signed tags**: GPG-sign the owner-pushed tag by default, or skip until later? Probably skip for v0.1.0, revisit at v0.2.0.
 4. **Release-curator role**: this doc and qingyun-sutando's both lean "owner cuts the tag." Should we name a fallback curator (a specific bot, or just "any bot can prepare; owner pushes")?
 
@@ -235,7 +229,7 @@ These need explicit owner direction before consolidation. (qingyun-sutando's sec
 1. Consolidate this half + qingyun-sutando's half → `notes/release-process-consolidated.md`. Single doc, no overlap, joint open-questions section.
 2. Owner + Qingyun review.
 3. If greenlit: promote consolidated doc to `docs/release-process.md`. Open issues:
-   - "Cut engine-v0.1.0" (one-shot, owner-driven, blocked on consolidation greenlight).
+   - "Cut v0.1.0" (one-shot, owner-driven, blocked on consolidation greenlight).
    - "Phase 1 migration framework" (qingyun-sutando's territory, sized 1-2 PRs).
    - "PR template + CI guard for state-format changes" (Phase 3 from qingyun-sutando's section 2.6, deferred).
 
