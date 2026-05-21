@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { demoStateRef } from './recording-state.js';
+import { resolveWorkspace } from './workspace_default.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -450,10 +451,12 @@ export const clickTool: ToolDefinition = {
 // prompt format without re-running that POC — both choices are load-bearing.
 const POINTER_MODEL = process.env.POINTER_MODEL || 'gemini-3-flash-preview';
 // IPC: Sutando.app watches <workspace>/state via DispatchSource and flies the
-// bezier pointer to whatever lands here. process.cwd() is the repo root for
-// core (same convention as VOICE_SESSION_CONTEXT_PATH / tasks/ / results/),
-// which is also what the Swift app resolves as `workspace`.
-const POINTER_CMD_PATH = join(process.cwd(), 'state', 'pointer-cmd.json');
+// bezier pointer to whatever lands here. Go through resolveWorkspace() so we
+// agree with the Swift side's `AppDelegate.workspace` (added in #837) — not
+// process.cwd(), which silently bifurcates when SUTANDO_WORKSPACE points
+// anywhere other than the launch CWD (closes #934).
+const POINTER_STATE_DIR = join(resolveWorkspace(), 'state');
+const POINTER_CMD_PATH = join(POINTER_STATE_DIR, 'pointer-cmd.json');
 
 // Atomic publish to the pointer IPC file. The temp name is unique per call
 // (pid + ms + random) — a fixed per-process name lets two overlapping point_at
@@ -461,7 +464,7 @@ const POINTER_CMD_PATH = join(process.cwd(), 'state', 'pointer-cmd.json');
 // atomic and the Swift side's monotonic `ts` guard decides which command wins,
 // so no lock is needed.
 function publishPointerCmd(cmd: Record<string, unknown>): void {
-	mkdirSync(join(process.cwd(), 'state'), { recursive: true });
+	mkdirSync(POINTER_STATE_DIR, { recursive: true });
 	const tmpCmd = `${POINTER_CMD_PATH}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 9)}.tmp`;
 	writeFileSync(tmpCmd, JSON.stringify(cmd));
 	renameSync(tmpCmd, POINTER_CMD_PATH);
