@@ -64,6 +64,35 @@ export const SKILL_TOOL_TIER: Record<string, Tier> = {
 	dismiss: 'team',
 };
 
+const TIER_RANK: Record<Tier, number> = { other: 0, team: 1, owner: 2 };
+
+/** Least-privileged tier among the given tiers; 'other' if empty (fail closed). */
+export function mostRestrictiveTier(tiers: Tier[]): Tier {
+	let lo: Tier = 'other';
+	let loRank = Infinity;
+	for (const t of tiers) {
+		if (TIER_RANK[t] < loRank) { loRank = TIER_RANK[t]; lo = t; }
+	}
+	return lo;
+}
+
+/**
+ * Effective tier of a turn, given every speaker who contributed audio to it.
+ * Fails closed: the least-privileged speaker governs the whole turn, so a
+ * non-owner cannot inherit owner tier just because the owner also made a
+ * sound before the tool's execute() ran, and an empty set (no attributed
+ * speaker) resolves to 'other'. The legacy DISCORD_VOICE_OWNER escape hatch
+ * (treatAsOwner) overrides everything to owner.
+ */
+export function effectiveTier(
+	speakerIds: Iterable<string>,
+	access: AccessTiers,
+	treatAsOwner: boolean,
+): Tier {
+	if (treatAsOwner) return 'owner';
+	return mostRestrictiveTier([...speakerIds].map(id => tierFor(id, access)));
+}
+
 /**
  * Minimum tier a tool requires, or null if open to every tier.
  *   ownerOnly / team — tool-name sets from the core inline-tools registry

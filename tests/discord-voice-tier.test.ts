@@ -1,6 +1,14 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { tierFor, toolAllowed, toolNeed, SKILL_TOOL_TIER, type AccessTiers } from '../skills/discord-voice/scripts/access-tier.js';
+import {
+	tierFor,
+	toolAllowed,
+	toolNeed,
+	SKILL_TOOL_TIER,
+	mostRestrictiveTier,
+	effectiveTier,
+	type AccessTiers,
+} from '../skills/discord-voice/scripts/access-tier.js';
 
 // Synthetic ids — the logic doesn't care about the id shape.
 const access: AccessTiers = {
@@ -56,6 +64,51 @@ describe('SKILL_TOOL_TIER — per-tool tiering of skill-local tools', () => {
 		assert.equal(SKILL_TOOL_TIER.share_screen, 'owner');
 		assert.equal(SKILL_TOOL_TIER.summon, 'owner');
 		assert.equal(SKILL_TOOL_TIER.stop_share_screen, 'owner');
+	});
+});
+
+describe('mostRestrictiveTier', () => {
+	it('empty → other (fail closed)', () => {
+		assert.equal(mostRestrictiveTier([]), 'other');
+	});
+	it('single tier → itself', () => {
+		assert.equal(mostRestrictiveTier(['owner']), 'owner');
+		assert.equal(mostRestrictiveTier(['team']), 'team');
+		assert.equal(mostRestrictiveTier(['other']), 'other');
+	});
+	it('mixed → the least-privileged present', () => {
+		assert.equal(mostRestrictiveTier(['owner', 'team']), 'team');
+		assert.equal(mostRestrictiveTier(['owner', 'other']), 'other');
+		assert.equal(mostRestrictiveTier(['team', 'other']), 'other');
+		assert.equal(mostRestrictiveTier(['owner', 'team', 'other']), 'other');
+	});
+});
+
+describe('effectiveTier — per-turn speaker attribution', () => {
+	it('a turn with only the owner → owner', () => {
+		assert.equal(effectiveTier(['owner-0001'], access, false), 'owner');
+	});
+	it('a turn with only a team speaker → team', () => {
+		assert.equal(effectiveTier(['peer-bot-A'], access, false), 'team');
+	});
+	it('a turn with only a stranger → other', () => {
+		assert.equal(effectiveTier(['stranger-9999'], access, false), 'other');
+	});
+	it('TOCTOU guard: non-owner + owner in the same turn → most-restrictive, never owner', () => {
+		// A non-owner asks for an owner-tier tool; the owner makes a sound
+		// before execute(). Both ids are attributed to the turn → team, so
+		// the owner-tier tool is denied (no privilege escalation).
+		assert.equal(effectiveTier(['stranger-9999', 'owner-0001'], access, false), 'other');
+		assert.equal(effectiveTier(['peer-bot-A', 'owner-0001'], access, false), 'team');
+	});
+	it('empty speaker set → other (fail closed)', () => {
+		assert.equal(effectiveTier([], access, false), 'other');
+	});
+	it('legacy DISCORD_VOICE_OWNER (treatAsOwner) overrides everything to owner', () => {
+		assert.equal(effectiveTier(['stranger-9999'], access, true), 'owner');
+		assert.equal(effectiveTier([], access, true), 'owner');
+		const noOwner: AccessTiers = { owner: '', team: new Set() };
+		assert.equal(effectiveTier(['anyone'], noOwner, true), 'owner');
 	});
 });
 

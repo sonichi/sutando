@@ -30,7 +30,7 @@ import { mkdirSync, writeFileSync, appendFileSync, existsSync, readFileSync, unl
 import { join, dirname } from 'node:path';
 import { resolveWorkspace } from '../../../src/workspace_default.js';
 import { recordConversation, recordSession } from '../../../src/conversation-store.js';
-import { type Tier, loadAccessTiers, tierFor, toolAllowed, toolNeed } from './access-tier.js';
+import { type Tier, loadAccessTiers, effectiveTier, toolAllowed, toolNeed } from './access-tier.js';
 
 _dotenvConfig({ path: new URL('../../../.env', import.meta.url).pathname, override: true });
 _dotenvConfig({ path: join(process.env.HOME ?? '', '.claude/channels/discord/.env'), override: false });
@@ -187,15 +187,22 @@ interface DiscordVoiceSession {
 	taskResultCache?: Map<string, string>;
 	_toolIdMap?: Map<string, string>;
 	subscribedUsers: Set<string>;
-	lastSpeakerId?: string;
+	// Every Discord user who contributed audio to the in-progress Gemini turn.
+	// Added on speaking.start, cleared on turn.end. The tier gate reads this
+	// set (not a live last-speaker pointer) so a tool call is attributed to
+	// the turn that produced it, not to whoever spoke most recently.
+	turnSpeakers: Set<string>;
 	audioPending: Buffer[];
 	toolCalls: { name: string; durationMs: number; timestamp: string }[];
 	events: { event: string; timestamp: string }[];
 }
 
-// Tier of the most-recent speaker — the gate owner-tier tools check.
+// Effective tier of the in-progress turn — the gate owner/team tools check.
+// Resolves across every speaker who contributed audio to this turn, failing
+// closed to the least-privileged among them (see effectiveTier). TREAT_AS_OWNER
+// (legacy DISCORD_VOICE_OWNER) overrides to owner.
 function currentTier(s: DiscordVoiceSession): Tier {
-	return tierFor(s.lastSpeakerId, ACCESS);
+	return effectiveTier(s.turnSpeakers, ACCESS, TREAT_AS_OWNER);
 }
 
 let active: DiscordVoiceSession | null = null;
@@ -632,6 +639,7 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 		pendingTasks: 0,
 		closing: false,
 		subscribedUsers: new Set(),
+		turnSpeakers: new Set(),
 		audioPending: [],
 		toolCalls: [],
 		events: [{ event: 'session_started', timestamp: new Date().toISOString() }],
@@ -699,6 +707,9 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 		// Watchdog: a turn completed — clear the hang counters.
 		(s as any).lastTurnActivityTs = Date.now();
 		(s as any).utterancesSinceTurn = 0;
+		// Tier gate: the turn is over — its speaker attribution no longer
+		// applies. The next turn re-accumulates speakers from speaking.start.
+		s.turnSpeakers.clear();
 		const items = session.conversationContext.items;
 		if (items.length < lastProcessedIdx) lastProcessedIdx = 0;
 		const lastText = s.transcript.length > 0 ? s.transcript[s.transcript.length - 1].text : null;
@@ -787,7 +798,9 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 
 	// Subscribe to anyone currently speaking, and to anyone who starts.
 	connection.receiver.speaking.on('start', (userId) => {
-		s.lastSpeakerId = userId;
+		// Attribute this speaker to the in-progress turn. The gate resolves
+		// the turn's effective tier across the whole set (cleared on turn.end).
+		s.turnSpeakers.add(userId);
 		subscribeUser(s, userId);
 	});
 	// Start the constant-rate ticker that flushes audio to Gemini every 20ms.
