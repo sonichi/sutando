@@ -75,6 +75,7 @@ import { fileURLToPath } from 'node:url';
 import { execSync, spawn, type ChildProcess } from 'node:child_process';
 import { VoiceSession, type ToolDefinition, type MainAgent } from 'bodhi-realtime-agent';
 import { WebSocketServer, WebSocket } from 'ws';
+import { recordSession, recordConversation } from '../../../src/conversation-store.js';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '../../../src/inline-tools.js';
@@ -926,19 +927,21 @@ function cleanupCall(callSid: string): void {
 		writeFileSync(join(CALLS_DIR, 'latest-result.json'), data);
 		appendFileSync(join(CALLS_DIR, 'calls.jsonl'), data + '\n');
 	}
-	// Append to shared conversation.log for cross-agent context
+	// Append to shared conversation.log + sqlite mirror for cross-agent context
 	if (session.transcript.length > 0) {
 		const logPath = join(WORKSPACE_DIR, 'conversation.log');
 		const callType = session.meetingId ? `meeting-${session.meetingId}` : `call-${session.callerNumber || 'unknown'}`;
 		for (const t of session.transcript) {
 			const role = t.role === 'sutando' ? 'phone-agent' : 'phone-caller';
-			const line = `${new Date().toISOString()}|${role}|[${callType}] ${t.text.replace(/\n/g, ' ').slice(0, 200)}\n`;
+			const text = `[${callType}] ${t.text.replace(/\n/g, ' ').slice(0, 200)}`;
+			const line = `${new Date().toISOString()}|${role}|${text}\n`;
 			try { appendFileSync(logPath, line); } catch { /* best effort */ }
+			recordConversation(role, text, callSid); // #603 sqlite mirror
 		}
 	}
 	console.log(`${ts()} [Phone] call finalized: ${callSid}`);
 
-	// Observability: write per-call metrics to data/call-metrics.jsonl
+	// Observability: per-call metrics → sqlite (data/conversation.sqlite, #603)
 	session.events.push({ event: 'call_ended', timestamp: new Date().toISOString() });
 	const durationMs = Date.now() - session.startTime;
 	const durationSeconds = Math.max(0, Math.round(durationMs / 1000));
@@ -980,22 +983,19 @@ function cleanupCall(callSid: string): void {
 			}
 		})();
 	}
-	const metrics = {
-		timestamp: new Date().toISOString(),
+	recordSession({
+		source: 'phone',
 		callSid,
 		caller: session.callerNumber,
 		isOwner: session.isOwner,
 		isMeeting: session.isMeeting,
 		durationMs,
 		transcriptLines: session.transcript.length,
-		toolCalls: session.toolCalls,
 		toolCount: session.toolCalls.length,
 		pendingTasks: session.pendingTasks,
+		toolCalls: session.toolCalls,
 		events: session.events,
-	};
-	try {
-		appendFileSync(join(WORKSPACE_DIR, 'data', 'call-metrics.jsonl'), JSON.stringify(metrics) + '\n');
-	} catch { /* best effort */ }
+	});
 
 	// Auto-scan the latest call for issues (async, best effort)
 	try {
