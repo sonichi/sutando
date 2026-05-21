@@ -66,6 +66,8 @@ contextual-chips.json
 .agent/
 .massgen/
 .env.bak
+.env.bak*
+.env.*.bak
 .last-pq-notify
 
 # Task archive — created by the watcher when moving processed tasks.
