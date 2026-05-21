@@ -30,6 +30,7 @@ import { mkdirSync, writeFileSync, appendFileSync, existsSync, readFileSync, unl
 import { join, dirname } from 'node:path';
 import { resolveWorkspace } from '../../../src/workspace_default.js';
 import { recordConversation, recordSession } from '../../../src/conversation-store.js';
+import { type Tier, loadAccessTiers, tierFor, toolAllowed } from './access-tier.js';
 
 _dotenvConfig({ path: new URL('../../../.env', import.meta.url).pathname, override: true });
 _dotenvConfig({ path: join(process.env.HOME ?? '', '.claude/channels/discord/.env'), override: false });
@@ -93,32 +94,10 @@ const WATCHDOG_STALL_MS = Number(process.env.SUTANDO_WATCHDOG_STALL_MS) || 20000
 const TREAT_AS_OWNER = (process.env.DISCORD_VOICE_OWNER ?? 'false') === 'true';
 
 // --- Per-speaker access tier (owner / team / other) -------------------------
-// Mirrors the discord-bridge access model so the two never drift — read from
-// the same ~/.claude/channels/discord/access.json the bridge uses:
-//   owner — the `owner` field (this instance's single operator)
-//   team  — the rest of `allowFrom` (trusted circle: peers, collaborators)
-//   other — anyone else who speaks in the channel
-// A Gemini Live session's tool list is fixed at session start, so the tier
-// is enforced per-turn at tool execute() time, keyed off the last speaker.
-type Tier = 'owner' | 'team' | 'other';
-
-function loadAccessTiers(): { owner: string; team: Set<string> } {
-	try {
-		const p = join(process.env.HOME ?? '', '.claude/channels/discord/access.json');
-		const a = JSON.parse(readFileSync(p, 'utf-8'));
-		return { owner: String(a.owner ?? ''), team: new Set<string>(a.allowFrom ?? []) };
-	} catch {
-		return { owner: '', team: new Set<string>() };
-	}
-}
-const ACCESS = loadAccessTiers();
-
-function tierFor(userId: string | undefined): Tier {
-	if (!userId) return 'other';
-	if (ACCESS.owner && userId === ACCESS.owner) return 'owner';
-	if (ACCESS.team.has(userId)) return 'team';
-	return 'other';
-}
+// Tier logic lives in ./access-tier.ts (pure + unit-tested). A Gemini Live
+// session's tool list is fixed at session start, so the tier is enforced
+// per-turn at tool execute() time, keyed off the last speaker.
+const ACCESS = loadAccessTiers(process.env.HOME ?? '');
 
 // CLI: --guild <id> --channel <voice_channel_id>
 function getArg(name: string): string | undefined {
@@ -216,7 +195,7 @@ interface DiscordVoiceSession {
 
 // Tier of the most-recent speaker — the gate owner-tier tools check.
 function currentTier(s: DiscordVoiceSession): Tier {
-	return tierFor(s.lastSpeakerId);
+	return tierFor(s.lastSpeakerId, ACCESS);
 }
 
 let active: DiscordVoiceSession | null = null;
@@ -476,7 +455,7 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 			...t,
 			execute: async (args: any) => {
 				const tier = currentTier(s);
-				const ok = need === 'owner' ? tier === 'owner' : tier !== 'other';
+				const ok = toolAllowed(need, tier);
 				if (!ok) {
 					console.log(`${ts()} [Tier] '${t.name}' denied — speaker tier=${tier}, needs ${need}`);
 					return { status: 'denied', message: `That needs ${need}-tier access; the current speaker is ${tier}-tier.` };
