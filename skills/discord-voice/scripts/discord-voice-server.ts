@@ -26,9 +26,10 @@
  */
 
 import { config as _dotenvConfig } from 'dotenv';
-import { mkdirSync, writeFileSync, appendFileSync, existsSync, readFileSync, unlinkSync } from 'node:fs';
+import { mkdirSync, writeFileSync, existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { resolveWorkspace } from '../../../src/workspace_default.js';
+import { recordConversation, recordSession } from '../../../src/conversation-store.js';
 
 _dotenvConfig({ path: new URL('../../../.env', import.meta.url).pathname, override: true });
 _dotenvConfig({ path: join(process.env.HOME ?? '', '.claude/channels/discord/.env'), override: false });
@@ -122,22 +123,6 @@ async function attachVisionToSession(session: unknown): Promise<void> {
 }
 function detachVisionFromSession(): void {
 	try { _setVisionSession?.(_priorVisionSession ?? null); } catch {}
-}
-
-// --- Conversation log -------------------------------------------------------
-
-const LOG_PATH = join(
-	DATA_DIR,
-	`discord-voice-${new Date().toISOString().replace(/[:.]/g, '-')}.jsonl`,
-);
-
-function logLine(role: 'user' | 'assistant' | 'system', text: string, extra: Record<string, unknown> = {}): void {
-	try {
-		appendFileSync(
-			LOG_PATH,
-			JSON.stringify({ timestamp: new Date().toISOString(), role, text, ...extra }) + '\n',
-		);
-	} catch {}
 }
 
 // --- Audio conversion helpers ----------------------------------------------
@@ -647,11 +632,11 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 			if (item.role === 'user') {
 				s.transcript.push({ role: 'user', text: item.content });
 				s.events.push({ event: `user:${item.content}`, timestamp: new Date().toISOString() });
-				logLine('user', item.content);
+				recordConversation('discord-user', item.content, s.sessionId);
 			} else if (item.role === 'assistant') {
 				s.transcript.push({ role: 'sutando', text: item.content });
 				s.events.push({ event: `sutando:${item.content}`, timestamp: new Date().toISOString() });
-				logLine('assistant', item.content);
+				recordConversation('discord-agent', item.content, s.sessionId);
 			}
 		}
 		lastProcessedIdx = items.length;
@@ -722,21 +707,16 @@ function cleanupSession(s: DiscordVoiceSession): void {
 
 	s.events.push({ event: 'session_ended', timestamp: new Date().toISOString() });
 	const durationMs = Date.now() - s.startTime;
-	const metrics = {
-		timestamp: new Date().toISOString(),
+	recordSession({
+		source: 'discord-voice',
 		sessionId: s.sessionId,
-		guildId: s.guildId,
-		channelId: s.channelId,
 		durationMs,
 		transcriptLines: s.transcript.length,
-		toolCalls: s.toolCalls,
 		toolCount: s.toolCalls.length,
 		pendingTasks: s.pendingTasks,
+		toolCalls: s.toolCalls,
 		events: s.events,
-	};
-	try {
-		appendFileSync(join(DATA_DIR, 'discord-voice-metrics.jsonl'), JSON.stringify(metrics) + '\n');
-	} catch {}
+	});
 	console.log(`${ts()} [Voice] session finalized: ${s.sessionId} (${durationMs}ms, ${s.transcript.length} turns)`);
 }
 
