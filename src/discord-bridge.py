@@ -2570,7 +2570,7 @@ async def _handle_discord_message(message, force=False):
     priority = default_priority_for_source("discord", access_tier)
     task_file.write_text(
         f"id: {task_id}\n"
-        f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S')}Z\n"
+        f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
         f"task: {user_task_text}\n"
         f"source: discord\n"
         f"channel_id: {message.channel.id}\n"
@@ -2818,6 +2818,17 @@ async def poll_results():
                             ref = discord.MessageReference(message_id=reply_to_id, channel_id=channel.id, fail_if_not_exists=False) if (first and reply_to_id) else None
                             await channel.send(chunk, reference=ref)
                             first = False
+                        try:
+                            import outbox_log
+                            ch_type = "discord_dm" if isinstance(channel, discord.DMChannel) else "discord_channel"
+                            outbox_log.append(
+                                channel_type=ch_type,
+                                recipient=str(channel.id),
+                                body=clean_text,
+                                task_id=task_id,
+                            )
+                        except Exception:
+                            pass
 
                     # Send files (allowlist-gated; see _is_path_sendable)
                     for fpath in files:
@@ -2943,6 +2954,16 @@ async def poll_proactive():
                         if clean_text:
                             for chunk in _chunk_for_discord(clean_text):
                                 await dm.send(chunk)
+                            try:
+                                import outbox_log
+                                outbox_log.append(
+                                    channel_type="discord_dm",
+                                    recipient=str(owner_id),
+                                    body=clean_text,
+                                    task_id=f.stem,
+                                )
+                            except Exception:
+                                pass
                         for fpath in files:
                             fpath = os.path.expanduser(fpath.strip())
                             if _is_path_sendable(fpath):
@@ -3089,6 +3110,16 @@ async def poll_dm_fallback():
                             if text_only:
                                 for chunk in _chunk_for_discord(text_only):
                                     await target_channel.send(chunk)
+                                try:
+                                    import outbox_log
+                                    outbox_log.append(
+                                        channel_type="discord_channel",
+                                        recipient=str(target_channel_id),
+                                        body=text_only,
+                                        task_id=_task_id,
+                                    )
+                                except Exception:
+                                    pass
                             for fpath in file_list:
                                 fpath = os.path.expanduser(fpath.strip())
                                 if _is_path_sendable(fpath):

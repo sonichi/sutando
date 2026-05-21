@@ -95,7 +95,7 @@ fi
 # 8. Behavioral flywheel data (conversation history, call logs, build log)
 mkdir -p "$BUNDLE/flywheel"
 [ -f "$REPO/session-state.md" ] && cp "$REPO/session-state.md" "$BUNDLE/flywheel/" && echo "  ✓ session-state.md"
-[ -f "$REPO/conversation.log" ] && cp "$REPO/conversation.log" "$BUNDLE/flywheel/" && echo "  ✓ conversation.log"
+[ -f "$REPO/logs/conversation.log" ] && cp "$REPO/logs/conversation.log" "$BUNDLE/flywheel/" && echo "  ✓ conversation.log"
 [ -f "$REPO/build_log.md" ] && cp "$REPO/build_log.md" "$BUNDLE/flywheel/" && echo "  ✓ build_log.md"
 [ -d "$REPO/results/calls" ] && cp -r "$REPO/results/calls" "$BUNDLE/flywheel/calls" && echo "  ✓ call transcripts"
 # Task result history (recent)
@@ -282,7 +282,7 @@ fi
 # Restore flywheel data
 if [ -d "$BUNDLE_DIR/flywheel" ]; then
   [ -f "$BUNDLE_DIR/flywheel/session-state.md" ] && cp "$BUNDLE_DIR/flywheel/session-state.md" "$REPO/" && echo "  ✓ session-state.md restored"
-  [ -f "$BUNDLE_DIR/flywheel/conversation.log" ] && cp "$BUNDLE_DIR/flywheel/conversation.log" "$REPO/" && echo "  ✓ conversation.log restored"
+  [ -f "$BUNDLE_DIR/flywheel/conversation.log" ] && mkdir -p "$REPO/logs" && cp "$BUNDLE_DIR/flywheel/conversation.log" "$REPO/logs/" && echo "  ✓ conversation.log restored"
   [ -f "$BUNDLE_DIR/flywheel/build_log.md" ] && cp "$BUNDLE_DIR/flywheel/build_log.md" "$REPO/" && echo "  ✓ build_log.md restored"
   [ -d "$BUNDLE_DIR/flywheel/calls" ] && mkdir -p "$REPO/results" && cp -r "$BUNDLE_DIR/flywheel/calls" "$REPO/results/calls" && echo "  ✓ call transcripts restored"
   [ -d "$BUNDLE_DIR/flywheel/results" ] && mkdir -p "$REPO/results" && cp "$BUNDLE_DIR/flywheel/results/"* "$REPO/results/" 2>/dev/null && echo "  ✓ task results restored"

@@ -318,13 +318,25 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     else:
         thread_ts = None
 
-    # Resolve access_tier from `tierMap`. Unmapped users default to "owner"
-    # — preserves the pre-tierMap contract (everything in allowFrom was
-    # treated as owner). Mapping a user to "team" or "other" downgrades them.
-    # See CLAUDE.md "Discord access control" for the broader policy this
-    # mirrors. The core agent reads access_tier from the task body and is
-    # expected to delegate non-owner tasks to a sandboxed agent.
-    access_tier = load_tier_map().get(user_id, "owner")
+    # Resolve access_tier from `tierMap`.
+    # Two cases for unmapped users:
+    #   1. tierMap absent (pre-tierMap config) → "owner" (backward compat)
+    #   2. tierMap present but uid missing → "other" (fail-safe, prevents
+    #      silent privilege escalation when operator forgets a tierMap line)
+    # See #893 for the rationale behind the split default.
+    tier_map = load_tier_map()
+    if user_id in tier_map:
+        access_tier = tier_map[user_id]
+    elif tier_map:
+        # tierMap exists but uid is missing — degrade to "other"
+        print(
+            f"  [tier-map] WARNING: User {user_id} in allowFrom but missing from tierMap; defaulting to 'other'",
+            flush=True,
+        )
+        access_tier = "other"
+    else:
+        # tierMap absent entirely — pre-tierMap config, all users are owner
+        access_tier = "owner"
     if access_tier not in ("owner", "team", "other"):
         # Unknown tier value in config → degrade safely to "other" rather
         # than treating as owner.
@@ -356,7 +368,7 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     priority = default_priority_for_source("slack", access_tier)
     task_file.write_text(
         f"id: {task_id}\n"
-        f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S')}Z\n"
+        f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
         f"task: {user_task_text}\n"
         f"source: slack\n"
         f"channel_id: {channel}\n"
@@ -455,7 +467,7 @@ def _send_file(channel: str, thread_ts: str | None, fpath: str) -> bool:
         return False
 
 
-def _send_reply(channel: str, thread_ts: str | None, text: str) -> None:
+def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | None = None) -> None:
     """Post a reply via chat.postMessage with marker extraction.
 
     Honors the unified marker protocol from `src/result_markers.py` (#873):
@@ -489,6 +501,7 @@ def _send_reply(channel: str, thread_ts: str | None, text: str) -> None:
     # Post the text body in 4000-char chunks (Slack's per-message limit is
     # 40k chars but readability suffers above ~4k).
     if clean_text:
+        all_chunks_sent = True
         for i in range(0, len(clean_text), 4000):
             kwargs = {"channel": channel, "text": clean_text[i:i + 4000]}
             if thread_ts:
@@ -497,7 +510,22 @@ def _send_reply(channel: str, thread_ts: str | None, text: str) -> None:
                 app.client.chat_postMessage(**kwargs)
             except Exception as e:
                 print(f"[Slack] chat_postMessage failed: {e}", flush=True)
+                all_chunks_sent = False
                 break
+        if all_chunks_sent:
+            # Slack channel id starts with D (DM), C (public/private channel),
+            # G (legacy group). Best-effort classification for the audit log.
+            ch_type = "slack_dm" if channel.startswith("D") else "slack_channel"
+            try:
+                import outbox_log
+                outbox_log.append(
+                    channel_type=ch_type,
+                    recipient=channel,
+                    body=clean_text,
+                    task_id=task_id,
+                )
+            except Exception:
+                pass
 
     # Then upload each file. Fail-closed via _is_path_sendable.
     for fpath in file_paths:
@@ -554,7 +582,7 @@ def result_watcher():
                     print(f"  Skipped (marker): {task_id}", flush=True)
                 else:
                     try:
-                        _send_reply(target["channel"], target.get("thread_ts"), reply_text)
+                        _send_reply(target["channel"], target.get("thread_ts"), reply_text, task_id=task_id)
                         print(f"  Replied to {target['channel']}: {reply_text[:80]}...", flush=True)
                     except Exception as e:
                         print(f"[Slack] reply error: {e}", flush=True)

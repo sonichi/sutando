@@ -16,6 +16,7 @@
  *   2. ~/.sutando/workspace/
  */
 
+import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -23,4 +24,28 @@ export function resolveWorkspace(): string {
 	const env = process.env.SUTANDO_WORKSPACE?.trim();
 	if (env) return env.replace(/^~/, homedir());
 	return join(homedir(), '.sutando', 'workspace');
+}
+
+/**
+ * Canonical WRITE location of a status file: `<workspace>/state/<name>`.
+ * Loose status .json files live under state/, not the workspace root — the
+ * root is structural (directories only). Twin of workspace_default.py's
+ * `status_path`. Writers always use this.
+ */
+export function statusPath(name: string, workspace?: string): string {
+	return join(workspace ?? resolveWorkspace(), 'state', name);
+}
+
+/**
+ * READ location of a status file: prefer `state/<name>`, fall back to the
+ * legacy workspace-root `<name>` so an un-migrated install keeps working for
+ * one release. Returns the `state/` path when neither exists. The fallback
+ * branch is removed the release after this one.
+ */
+export function statusReadPath(name: string, workspace?: string): string {
+	const ws = workspace ?? resolveWorkspace();
+	const p = join(ws, 'state', name);
+	if (existsSync(p)) return p;
+	const legacy = join(ws, name);
+	return existsSync(legacy) ? legacy : p;
 }

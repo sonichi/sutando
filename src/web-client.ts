@@ -14,7 +14,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readTmuxStatus } from './tmux-status.js';
 import { CHAT_HTML } from './chat-ui.js';
-import { resolveWorkspace } from './workspace_default.js';
+import { resolveWorkspace, statusReadPath } from './workspace_default.js';
 
 const HTTP_PORT = Number(process.env.CLIENT_PORT) || 8080;
 const HTTP_HOST = process.env.CLIENT_HOST || '0.0.0.0'; // '0.0.0.0' binds to all interfaces for EC2
@@ -3104,12 +3104,13 @@ let _seeingUntil = 0;
 const CORE_STATUS_STALE_SECONDS = 60;
 function readCoreStatus(): { running: boolean; step: string; stale: boolean } {
 	try {
-		// core-status.json is per-user runtime state at $SUTANDO_WORKSPACE
-		// (default ~/.sutando/workspace/). Pre-fix this read from REPO_ROOT via
-		// import.meta.url-relative `../core-status.json` — but Python writers
+		// core-status.json is per-user runtime state under $SUTANDO_WORKSPACE/state/
+		// (default ~/.sutando/workspace/state/). Pre-fix this read from REPO_ROOT
+		// via import.meta.url-relative `../core-status.json` — but Python writers
 		// migrated to WORKSPACE_DIR in #836, so the TS reader silently saw stale
-		// or missing data. Same workspace-contract fix as #821/#842/#843.
-		const statusPath = join(WORKSPACE_DIR, 'core-status.json');
+		// or missing data. statusReadPath falls back to the legacy workspace-root
+		// location for one release.
+		const statusPath = statusReadPath('core-status.json', WORKSPACE_DIR);
 		const raw = readFileSync(statusPath, 'utf-8');
 		const s = JSON.parse(raw) as { status?: string; ts?: number; step?: string };
 		const nowSec = Date.now() / 1000;
@@ -3140,8 +3141,9 @@ function readVoiceState(): boolean | null {
 		// resolved relative to its cwd (= REPO_ROOT when launched from
 		// there), so both sides happened to align on the same install.
 		// On SUTANDO_WORKSPACE-set hosts (or cwd-drift), the two split.
-		// Same workspace-contract fix as #849 for core-status.json.
-		const statusPath = join(WORKSPACE_DIR, 'voice-state.json');
+		// Same workspace-contract fix as #849 for core-status.json. Lives under
+		// state/ now; statusReadPath falls back to the legacy root for one release.
+		const statusPath = statusReadPath('voice-state.json', WORKSPACE_DIR);
 		const raw = readFileSync(statusPath, 'utf-8');
 		const s = JSON.parse(raw) as { connected?: boolean; ts?: number };
 		const nowSec = Date.now() / 1000;

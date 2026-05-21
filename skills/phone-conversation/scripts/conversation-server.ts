@@ -79,6 +79,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '../../../src/inline-tools.js';
+import { recordSession, recordConversation } from '../../../src/conversation-store.js';
 // Lazy vision-session handle. Only loaded if a call ever needs it — keeps the
 // phone-agent boot path free of the vision-tools.ts side-effects on cold start.
 let _setVisionSession: ((s: unknown) => void) | null = null;
@@ -128,10 +129,13 @@ function normalizePhone(num: string): string {
 	return digits.length === 10 ? '1' + digits : digits;
 }
 
-/** Read recent conversation context, relabeled to avoid identity confusion */
+/** Read recent conversation context, relabeled to avoid identity confusion.
+ *  Reads the text conversation.log directly — it is the primary truth for
+ *  per-turn content. The sqlite mirror is a best-effort parallel write and
+ *  may lag, so it must not be authoritative here. */
 function getSafeContext(lines = 5): string {
 	try {
-		const logPath = join(WORKSPACE_DIR, 'conversation.log');
+		const logPath = join(WORKSPACE_DIR, 'logs', 'conversation.log');
 		if (!existsSync(logPath)) return '';
 		const entries = readFileSync(logPath, 'utf-8').trim().split('\n').slice(-lines);
 		return entries.map(line => {
@@ -950,37 +954,39 @@ function cleanupCall(callSid: string): void {
 		writeFileSync(join(CALLS_DIR, 'latest-result.json'), data);
 		appendFileSync(join(CALLS_DIR, 'calls.jsonl'), data + '\n');
 	}
-	// Append to shared conversation.log for cross-agent context
+	// Append to shared conversation.log + sqlite mirror for cross-agent context
 	if (session.transcript.length > 0) {
-		const logPath = join(WORKSPACE_DIR, 'conversation.log');
+		const logPath = join(WORKSPACE_DIR, 'logs', 'conversation.log');
+		// logs/ is created by init.sh, but a service started outside that path
+		// (e.g. a direct `tsx` run) may hit this write first — ensure the parent.
+		mkdirSync(join(WORKSPACE_DIR, 'logs'), { recursive: true });
 		const callType = session.meetingId ? `meeting-${session.meetingId}` : `call-${session.callerNumber || 'unknown'}`;
 		for (const t of session.transcript) {
 			const role = t.role === 'sutando' ? 'phone-agent' : 'phone-caller';
-			const line = `${new Date().toISOString()}|${role}|[${callType}] ${t.text.replace(/\n/g, ' ').slice(0, 200)}\n`;
+			const text = `[${callType}] ${t.text.replace(/\n/g, ' ').slice(0, 200)}`;
+			const line = `${new Date().toISOString()}|${role}|${text}\n`;
 			try { appendFileSync(logPath, line); } catch { /* best effort */ }
+			recordConversation(role, text, callSid); // #603 sqlite mirror
 		}
 	}
 	console.log(`${ts()} [Phone] call finalized: ${callSid}`);
 
-	// Observability: write per-call metrics to data/call-metrics.jsonl
+	// Observability: per-call metrics → sqlite (data/conversation.sqlite, #603)
 	session.events.push({ event: 'call_ended', timestamp: new Date().toISOString() });
 	const durationMs = Date.now() - session.startTime;
-	const metrics = {
-		timestamp: new Date().toISOString(),
+	recordSession({
+		source: 'phone',
 		callSid,
 		caller: session.callerNumber,
 		isOwner: session.isOwner,
 		isMeeting: session.isMeeting,
 		durationMs,
 		transcriptLines: session.transcript.length,
-		toolCalls: session.toolCalls,
 		toolCount: session.toolCalls.length,
 		pendingTasks: session.pendingTasks,
+		toolCalls: session.toolCalls,
 		events: session.events,
-	};
-	try {
-		appendFileSync(join(WORKSPACE_DIR, 'data', 'call-metrics.jsonl'), JSON.stringify(metrics) + '\n');
-	} catch { /* best effort */ }
+	});
 
 	// Auto-scan the latest call for issues (async, best effort)
 	try {

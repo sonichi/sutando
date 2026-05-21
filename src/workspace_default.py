@@ -21,6 +21,17 @@ from pathlib import Path
 
 
 _DEFAULT_SUBPATH = (".sutando", "workspace")
+# Loose status/state .json files that historically sat at the workspace root.
+# Per the workspace-design model they belong under `state/` alongside the other
+# machine-local status files (state/cores/, state/subscriptions.json, …). The
+# root is structural (directories only); `_migrate_root_status` sweeps these in.
+_STATUS_FILES = (
+    "core-status.json",
+    "voice-state.json",
+    "contextual-chips.json",
+    "dynamic-content.json",
+    "quota-state.json",
+)
 _LEGACY_DIRS = ("tasks", "results", "state", "notes")  # the runtime-state dirs that, if
                                                        # found in a legacy fallback location,
                                                        # signal an in-use older install we
@@ -258,6 +269,110 @@ def _migrate_inrepo_build_log(workspace: Path) -> bool:
     return True
 
 
+def status_path(name: str, workspace: Path | None = None) -> Path:
+    """Canonical WRITE location of a status file: `<workspace>/state/<name>`.
+
+    Writers always target this. Pair with `status_read_path` for readers, which
+    falls back to the legacy root location for one release. Keeps the directory
+    choice in one place so call sites stay a single line.
+    """
+    ws = workspace if workspace is not None else resolve_workspace()
+    return ws / "state" / name
+
+
+def status_read_path(name: str, workspace: Path | None = None) -> Path:
+    """READ location of a status file: prefer `state/<name>`, fall back to the
+    legacy workspace-root `<name>` so an un-migrated install keeps working for
+    one release. Returns the `state/` path when neither exists (caller handles
+    missing). The fallback branch is removed the release after this one.
+    """
+    ws = workspace if workspace is not None else resolve_workspace()
+    new = ws / "state" / name
+    if new.exists():
+        return new
+    legacy = ws / name
+    return legacy if legacy.exists() else new
+
+
+def _migrate_root_status(workspace: Path) -> bool:
+    """One-time migration of loose workspace-root status files into `state/`.
+
+    Parallel to `_migrate_inrepo_build_log` in posture: non-destructive on
+    collision (skip if `state/<name>` already exists), sentinel-gated for O(1)
+    re-entry (`<workspace>/.status-migrated`, kept at the workspace root for
+    consistency with the existing `.notes-migrated` / `.build_log-migrated`
+    sentinels), never raises into resolution.
+
+    Runs in BOTH `resolve_workspace` branches and AFTER `_migrate_from_legacy`,
+    so any status files pulled in from a legacy repo-root install land in the
+    workspace first, then get swept into `state/` here.
+
+    Returns True iff at least one file was migrated.
+    """
+    sentinel = workspace / ".status-migrated"
+    if sentinel.exists():
+        return False
+    state_dir = workspace / "state"
+    moved = []
+    for name in _STATUS_FILES:
+        src = workspace / name
+        if not src.is_file():
+            continue
+        dst = state_dir / name
+        if dst.exists():
+            continue  # don't clobber a fresh state/ write
+        try:
+            state_dir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dst))
+            moved.append(name)
+        except Exception as e:  # pragma: no cover — best-effort
+            print(f"status migration: failed to move {src} -> {dst}: {e}", file=sys.stderr)
+    if moved:
+        print(
+            f"status migration: moved {', '.join(moved)} into {state_dir} (one-time)",
+            file=sys.stderr,
+        )
+    # Drop the sentinel so subsequent calls short-circuit on the cheap exists()
+    # check. Best-effort; failure just means we iterdir-equivalent again.
+    try:
+        workspace.mkdir(parents=True, exist_ok=True)
+        sentinel.touch()
+    except Exception:
+        pass
+    return bool(moved)
+
+
+def _migrate_conversation_log(workspace: Path) -> bool:
+    """One-time migration of `<workspace>/conversation.log` -> `logs/`.
+
+    `conversation.log` is an append-only transcript, not a status file, so it
+    belongs in `logs/` rather than `state/`. Same sentinel-gated, non-destructive
+    posture as `_migrate_root_status`; sentinel `<workspace>/.conversation-log-migrated`.
+
+    Returns True iff the file was migrated.
+    """
+    sentinel = workspace / ".conversation-log-migrated"
+    if sentinel.exists():
+        return False
+    src = workspace / "conversation.log"
+    dst = workspace / "logs" / "conversation.log"
+    moved = False
+    if src.is_file() and not dst.exists():
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dst))
+            print(f"conversation.log migration: moved {src} -> {dst} (one-time)", file=sys.stderr)
+            moved = True
+        except Exception as e:  # pragma: no cover — best-effort
+            print(f"conversation.log migration: failed: {e}", file=sys.stderr)
+    try:
+        workspace.mkdir(parents=True, exist_ok=True)
+        sentinel.touch()
+    except Exception:
+        pass
+    return moved
+
+
 def resolve_workspace(migrate: bool = True) -> Path:
     """Resolve the workspace directory per the canonical contract.
 
@@ -275,6 +390,10 @@ def resolve_workspace(migrate: bool = True) -> Path:
         `<workspace>/notes/`.
       • `_migrate_inrepo_build_log` — fires when workspace != repo root; moves
         in-repo `build_log.md` to `<workspace>/build_log.md`.
+      • `_migrate_root_status` — sweeps loose workspace-root status `.json`
+        files into `<workspace>/state/`.
+      • `_migrate_conversation_log` — moves `<workspace>/conversation.log` into
+        `<workspace>/logs/`.
 
     Returns a `Path` — does NOT create the directory; the caller decides.
     Pass `migrate=False` from tests that want pure resolution semantics.
@@ -291,6 +410,14 @@ def resolve_workspace(migrate: bool = True) -> Path:
                 _migrate_inrepo_build_log(target)
             except Exception as e:  # pragma: no cover — must never break resolution
                 print(f"build_log migration: skipped due to error: {e}", file=sys.stderr)
+            try:
+                _migrate_root_status(target)
+            except Exception as e:  # pragma: no cover — must never break resolution
+                print(f"status migration: skipped due to error: {e}", file=sys.stderr)
+            try:
+                _migrate_conversation_log(target)
+            except Exception as e:  # pragma: no cover — must never break resolution
+                print(f"conversation.log migration: skipped due to error: {e}", file=sys.stderr)
         return target
     target = default_workspace_dir()
     if migrate:
@@ -302,4 +429,12 @@ def resolve_workspace(migrate: bool = True) -> Path:
             _migrate_inrepo_build_log(target)
         except Exception as e:  # pragma: no cover — must never break resolution
             print(f"build_log migration: skipped due to error: {e}", file=sys.stderr)
+        try:
+            _migrate_root_status(target)
+        except Exception as e:  # pragma: no cover — must never break resolution
+            print(f"status migration: skipped due to error: {e}", file=sys.stderr)
+        try:
+            _migrate_conversation_log(target)
+        except Exception as e:  # pragma: no cover — must never break resolution
+            print(f"conversation.log migration: skipped due to error: {e}", file=sys.stderr)
     return target

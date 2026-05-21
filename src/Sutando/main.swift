@@ -608,11 +608,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // Serialize + atomic write via tmp+replaceItem.
+        // Serialize + atomic write via tmp+replaceItem. Status files live under
+        // <workspace>/state/ (the workspace root is structural — directories only).
         let payload: [String: Any] = ["chips": chips, "ts": Int(Date().timeIntervalSince1970)]
         guard let json = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted]) else { return }
-        let dst = URL(fileURLWithPath: workspace + "/contextual-chips.json")
-        let tmp = URL(fileURLWithPath: workspace + "/contextual-chips.json.tmp")
+        let stateDir = workspace + "/state"
+        try? FileManager.default.createDirectory(atPath: stateDir, withIntermediateDirectories: true)
+        let dst = URL(fileURLWithPath: stateDir + "/contextual-chips.json")
+        let tmp = URL(fileURLWithPath: stateDir + "/contextual-chips.json.tmp")
         do {
             try json.write(to: tmp, options: [.atomic])
             _ = try FileManager.default.replaceItemAt(dst, withItemAt: tmp)
@@ -1456,20 +1459,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - ax-read subprocess (voice agent's read_selection primitive)
     //
     // Resolution order for the binary path:
-    //   1. $SUTANDO_MEMORY_DIR/skills/personal-deictic/ax-read  (current canonical)
+    //   1. $SUTANDO_MEMORY_DIR/skills/personal-deictic/ax-read  (private, richer
+    //      — includes screenshot + cursor for deictic phrases)
     //   2. $SUTANDO_PRIVATE_DIR/skills/personal-deictic/ax-read (legacy alias, PR #876)
-    //   3. ~/.sutando/memory-sync/skills/personal-deictic/ax-read (default)
+    //   3. ~/.sutando/memory-sync/skills/personal-deictic/ax-read (default private)
+    //   4. <repo>/skills/context-drop/ax-read                    (public fallback,
+    //      text-only — ships in this repo so public-repo installs get the same
+    //      ⌃C experience without needing the private personal-deictic skill)
     //
-    // Returns nil when the binary is missing, doesn't execute cleanly, or
-    // returns malformed JSON — callers fall back to the legacy in-process path.
+    // Returns nil when no binary is found; callers fall back to the in-process
+    // legacy AX path.
 
     func resolveAxReadPath() -> String? {
         let env = ProcessInfo.processInfo.environment
-        let suffix = "/skills/personal-deictic/ax-read"
+        let privateSuffix = "/skills/personal-deictic/ax-read"
         let candidates = [
-            env["SUTANDO_MEMORY_DIR"].map { $0 + suffix },
-            env["SUTANDO_PRIVATE_DIR"].map { $0 + suffix },
-            NSString(string: "~/.sutando/memory-sync" + suffix).expandingTildeInPath,
+            env["SUTANDO_MEMORY_DIR"].map { $0 + privateSuffix },
+            env["SUTANDO_PRIVATE_DIR"].map { $0 + privateSuffix },
+            NSString(string: "~/.sutando/memory-sync" + privateSuffix).expandingTildeInPath,
+            repoRoot + "/skills/context-drop/ax-read",
         ].compactMap { $0 }
         let fm = FileManager.default
         for path in candidates {

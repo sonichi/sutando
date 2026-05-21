@@ -30,7 +30,7 @@ from typing import Optional
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 from util_paths import shared_personal_path  # noqa: E402
-from workspace_default import resolve_workspace  # noqa: E402
+from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 
 # Workspace = runtime-state root (tasks/, results/, state/). REPO_DIR stays the
 # source-code root (src/, skills/, logs/, .env, build_log.md). Before PR #762's
@@ -643,7 +643,7 @@ def check_core_proactive_loop(threshold_sec: int = 600) -> dict:
     Status is anything other than "running" → ok regardless of age.
     """
     name = "core-proactive-loop"
-    status_path = WORKSPACE_DIR / "core-status.json"
+    status_path = status_read_path("core-status.json", WORKSPACE_DIR)
     if not status_path.exists():
         return {"name": name, "status": "ok", "detail": "core-status.json not yet written"}
     try:

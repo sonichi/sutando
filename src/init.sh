@@ -13,6 +13,18 @@ set -e
 REPO="${SUTANDO_REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
 MODE="${1:-full}"
 
+# Resolve runtime workspace. Same resolution shape as src/workspace_default.py
+# and startup.sh: $SUTANDO_WORKSPACE override (tilde-expanded), fallback to
+# ~/.sutando/workspace/. Runtime state files (logs, state, tasks, results,
+# notes, data, pending-questions.md, …) live here; loose status .json files
+# (core-status.json, voice-state.json, …) live under state/. Repo stays for
+# the code + skills + the schedule-crons.json copy below.
+if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
+  WORKSPACE="${SUTANDO_WORKSPACE/#\~/$HOME}"
+else
+  WORKSPACE="$HOME/.sutando/workspace"
+fi
+
 case "$MODE" in
   --auto|--preflight|--full|full) ;;
   *) echo "Usage: bash src/init.sh [--auto | --preflight]"; exit 2;;
@@ -23,23 +35,27 @@ log() {
   if [ "$MODE" != "--auto" ]; then echo "$@"; fi
 }
 
+# Workspace-rooted helpers — runtime state (logs, state, tasks, results, …).
 create_file_if_missing() {
   local path="$1"; local body="$2"
-  if [ ! -f "$REPO/$path" ]; then
-    mkdir -p "$(dirname "$REPO/$path")"
-    printf '%s' "$body" > "$REPO/$path"
+  if [ ! -f "$WORKSPACE/$path" ]; then
+    mkdir -p "$(dirname "$WORKSPACE/$path")"
+    printf '%s' "$body" > "$WORKSPACE/$path"
     echo "  ✓ created $path"
   fi
 }
 
 create_dir_if_missing() {
   local path="$1"
-  if [ ! -d "$REPO/$path" ]; then
-    mkdir -p "$REPO/$path"
+  if [ ! -d "$WORKSPACE/$path" ]; then
+    mkdir -p "$WORKSPACE/$path"
     echo "  ✓ created $path/"
   fi
 }
 
+# Repo-rooted copy helper — for shipping example configs from the checkout
+# into a stable location. Used today only for skills/schedule-crons/crons.json
+# which lives in the repo, NOT the workspace.
 copy_if_missing() {
   local src="$1"; local dst="$2"
   if [ ! -f "$REPO/$dst" ] && [ -f "$REPO/$src" ]; then
@@ -48,9 +64,115 @@ copy_if_missing() {
   fi
 }
 
+# One-time migration of stale repo-root runtime state into $WORKSPACE. Fires
+# only when the migration sentinel is absent — same idempotent posture as
+# workspace_default.py's _migrate_from_legacy (PR #762). Non-destructive on
+# collision: if a workspace copy already exists at the destination, the repo
+# copy is left in place (so a partial migration on a prior pass never
+# clobbers fresh workspace writes).
+#
+# Surfaces a single stderr line per moved item + writes a sentinel
+# `$WORKSPACE/.legacy-migrated-911` after a successful sweep. Second run
+# sees the sentinel and bails — no log noise on every startup.
+#
+# Triggered by Susan's PR #913 review (2026-05-19). Without this, installs
+# that pre-date #911 keep two copies: stale repo-root logs/state/tasks/...
+# alongside the new workspace copies. git status pollution + future
+# debugging confusion.
+migrate_legacy_runtime_state() {
+  local sentinel="$WORKSPACE/.legacy-migrated-911"
+  if [ -f "$sentinel" ]; then
+    return 0
+  fi
+  # Only migrate when the legacy repo actually has runtime state. New
+  # installs (post-#911) skip this path entirely.
+  local have_evidence=0
+  for d in logs state tasks results notes data; do
+    if [ -d "$REPO/$d" ] && [ -n "$(ls -A "$REPO/$d" 2>/dev/null)" ]; then
+      have_evidence=1
+      break
+    fi
+  done
+  if [ "$have_evidence" -eq 0 ]; then
+    # Nothing to migrate; write sentinel so we don't re-check every run.
+    mkdir -p "$WORKSPACE"
+    : > "$sentinel"
+    return 0
+  fi
+  mkdir -p "$WORKSPACE"
+  local moved_any=0
+  # Dirs: move whole tree iff workspace target doesn't already exist.
+  for d in logs state tasks results notes data; do
+    local src="$REPO/$d"
+    local dst="$WORKSPACE/$d"
+    if [ -d "$src" ] && [ ! -e "$dst" ]; then
+      if mv "$src" "$dst" 2>/dev/null; then
+        echo "  → migrated $d/ from repo to workspace" >&2
+        moved_any=1
+      fi
+    fi
+  done
+  # Top-level state files: move iff workspace target absent.
+  for f in pending-questions.md core-status.json contextual-chips.json voice-state.json build_log.md; do
+    local src="$REPO/$f"
+    local dst="$WORKSPACE/$f"
+    if [ -f "$src" ] && [ ! -e "$dst" ]; then
+      if mv "$src" "$dst" 2>/dev/null; then
+        echo "  → migrated $f from repo to workspace" >&2
+        moved_any=1
+      fi
+    fi
+  done
+  : > "$sentinel"
+  if [ "$moved_any" -eq 1 ]; then
+    echo "  ✓ legacy runtime state migrated (sentinel: $sentinel)" >&2
+  fi
+}
+
+# One-time sweep of loose workspace-root status .json files into state/.
+# Bash twin of workspace_default.py's _migrate_root_status — shares the
+# `.status-migrated` sentinel so whichever runs first does the move and the
+# other short-circuits. init.sh runs before the Python services (startup.sh),
+# so without this sweep the create_file_if_missing calls below would seed a
+# fresh state/ file and strand a real workspace-root copy. Non-destructive on
+# collision; file list matches _STATUS_FILES.
+migrate_root_status_to_state() {
+  local sentinel="$WORKSPACE/.status-migrated"
+  if [ -f "$sentinel" ]; then
+    return 0
+  fi
+  mkdir -p "$WORKSPACE/state"
+  local moved_any=0
+  # Single source of truth for this list is `_STATUS_FILES` in
+  # src/workspace_default.py — keep the two in sync. Adding a 6th status
+  # file there without adding it here (or vice versa) silently drifts the
+  # Python and bash migrator twins.
+  for f in core-status.json voice-state.json contextual-chips.json dynamic-content.json quota-state.json; do
+    local src="$WORKSPACE/$f"
+    local dst="$WORKSPACE/state/$f"
+    if [ -f "$src" ] && [ ! -e "$dst" ]; then
+      if mv "$src" "$dst" 2>/dev/null; then
+        echo "  → migrated $f into state/" >&2
+        moved_any=1
+      fi
+    fi
+  done
+  : > "$sentinel"
+  if [ "$moved_any" -eq 1 ]; then
+    echo "  ✓ workspace-root status files swept into state/" >&2
+  fi
+}
+
 # --- Tier 1: auto-bootstrap (always safe to run) ---
 tier1() {
   log "Tier 1 — auto-bootstrap..."
+
+  # First-run sweep: any stale repo-root runtime state lands in workspace
+  # before we start creating fresh files. Idempotent + non-destructive.
+  migrate_legacy_runtime_state
+  # Then sweep loose workspace-root status files into state/ — must run
+  # before the create_file_if_missing calls below.
+  migrate_root_status_to_state
 
   # Directories
   create_dir_if_missing "logs"
@@ -73,15 +195,17 @@ tier1() {
 _(none open)_
 "
 
-  create_file_if_missing "contextual-chips.json" \
+  # Status files live under state/ (the workspace root is structural —
+  # directories only). create_file_if_missing mkdir's the parent.
+  create_file_if_missing "state/contextual-chips.json" \
     "{\"chips\":[],\"ts\":$(date +%s)}
 "
 
-  create_file_if_missing "core-status.json" \
+  create_file_if_missing "state/core-status.json" \
     "{\"status\":\"idle\",\"ts\":$(date +%s)}
 "
 
-  create_file_if_missing "voice-state.json" \
+  create_file_if_missing "state/voice-state.json" \
     "{\"connected\":false,\"ts\":$(date +%s)}
 "
 

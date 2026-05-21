@@ -41,7 +41,7 @@ Never commit directly to main. Always work on a feature branch.
 
 Sutando's file state lives in three concentric spaces — **Code** (`$SUTANDO_REPO_DIR`, the git checkout), **State** (`$SUTANDO_WORKSPACE`, per-user runtime), **Memory** (`$SUTANDO_MEMORY_DIR`, user-content synced across the fleet — legacy alias `$SUTANDO_PRIVATE_DIR` honored for one release per #870). See [`docs/workspace-design.md`](docs/workspace-design.md) for the 3-space mental model + "Quick decision: which space?" flowchart when adding new code or data.
 
-All per-user mutable state — `tasks/`, `results/`, `state/`, `data/`, `logs/`, `notes/`, `build_log.md`, `pending-questions.md`, `contextual-chips.json`, `core-status.json`, etc. — lives under a single **workspace** directory. Code, skills source, and repo configuration stay in the repo root (separate concern).
+All per-user mutable state — `tasks/`, `results/`, `state/`, `data/`, `logs/`, `notes/`, `build_log.md`, `pending-questions.md`, etc. — lives under a single **workspace** directory. Loose status/state `.json` files (`core-status.json`, `voice-state.json`, `contextual-chips.json`, `dynamic-content.json`, `quota-state.json`) live under `state/`; the workspace root holds only the top-level directories. Code, skills source, and repo configuration stay in the repo root (separate concern).
 
 **Resolution (every service reads the same):**
 
@@ -65,9 +65,9 @@ If `PERSONAL_CLAUDE.md` exists in the workspace root, read and follow it. It con
 
 ## Work Status
 
-Signal your work status to `core-status.json` so the web UI can display it:
-- Start of significant work: `echo '{"status":"running","step":"<description>","ts":<epoch>}' > core-status.json`
-- When done: `echo '{"status":"idle","ts":<epoch>}' > core-status.json`
+Signal your work status to `state/core-status.json` so the web UI can display it:
+- Start of significant work: `echo '{"status":"running","step":"<description>","ts":<epoch>}' > state/core-status.json`
+- When done: `echo '{"status":"idle","ts":<epoch>}' > state/core-status.json`
 This applies to all work — proactive loop passes, voice tasks, user requests, code changes.
 
 ## Chat-path task tracking (issue #585)
