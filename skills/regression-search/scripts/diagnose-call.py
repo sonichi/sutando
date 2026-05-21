@@ -16,6 +16,7 @@ other. Closes the second half of #188.
 
 import argparse
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -23,10 +24,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-REPO = Path(__file__).resolve().parent.parent.parent.parent
-_cwd_db = Path.cwd() / "data" / "conversation.sqlite"
-_repo_db = REPO / "data" / "conversation.sqlite"
-DB_FILE = _cwd_db if _cwd_db.exists() else _repo_db
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+from workspace_default import resolve_workspace  # noqa: E402
+
+# conversation.sqlite is per-user runtime state — it lives under the resolved
+# workspace ($SUTANDO_WORKSPACE), the same tree the runtime writers use, not
+# the repo checkout. Honor SUTANDO_CONVERSATION_DB, matching diagnose.py and
+# the import-* scripts.
+DB_FILE = Path(os.environ.get(
+    "SUTANDO_CONVERSATION_DB",
+    resolve_workspace(migrate=False) / "data" / "conversation.sqlite"))
 
 REFUSAL_RE = re.compile(
     r"\b(i\s*can'?t|i'?m\s*not\s*able|i'?m\s*unable|unable\s*to|sorry,?\s*i\s*(can'?t|cannot))\b",
