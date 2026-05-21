@@ -67,7 +67,7 @@ if ! command -v tmux > /dev/null 2>&1; then
   echo "  ⚠ tmux not found — running without tmux wrapper"
   echo "    (Sutando.app's watcher-auto-restart won't work; brew install tmux to enable)"
   exec claude --name "$SESSION" --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
-    -- "/proactive-loop"
+    -- "/schedule-crons"
 fi
 
 # Explicit -S socket path so Sutando.app (which runs under a different
@@ -96,11 +96,11 @@ tmux -S "$TMUX_SOCKET" set-option -g mouse on 2>/dev/null || true
 if [ -t 1 ]; then
   exec tmux -S "$TMUX_SOCKET" new-session -A -s "$SESSION" \
     claude --name "$SESSION" --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
-    -- "/proactive-loop"
+    -- "/schedule-crons"
 else
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" \
     claude --name "$SESSION" --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
-    -- "/proactive-loop"
+    -- "/schedule-crons"
   echo "Started $SESSION detached. Attach via Open Core CLI in menu bar, or:"
   echo "  tmux -S $TMUX_SOCKET attach -t $SESSION"
 fi
