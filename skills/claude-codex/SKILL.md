@@ -1,6 +1,6 @@
 ---
 name: claude-codex
-description: "Use the local Codex CLI from Claude Code with the user's existing Codex login or API key. Use for Codex reviews, second-opinion analysis, implementation delegation, or non-interactive Codex runs in the current workspace."
+description: "Bash wrapper around the local Codex CLI for non-interactive runs from inside Sutando (bridges, cron, scripts). For interactive code review or task hand-off from this Claude Code session, prefer the official `/codex:*` plugin commands; this skill is the file-bridge-compatible path that `discord-bridge.py` invokes for team-tier sandboxed delegation."
 user-invocable: true
 ---
 
@@ -20,6 +20,22 @@ ARGUMENTS: $ARGUMENTS
 - Need a Codex result saved or streamed from the current repo
 - Spec-driven one-shot build of a self-contained artifact (HTML/CSS/JS prototype, single-file
   demo) — use `--goal` to invoke Codex's `/goal` mode
+
+## When NOT to Use
+
+- **Interactive review from this Claude Code session** → use `/codex:review`, `/codex:adversarial-review`, or `/codex:rescue` from the openai/codex-plugin-cc plugin. They're the discoverable, versioned path.
+- **Anything that needs a Codex session ID / job tracking / status polling** → plugin's `/codex:status` is the right surface.
+
+If you don't see `/codex:*` slash-commands available, install the plugin in this Claude Code session:
+
+```
+/plugin marketplace add openai/codex-plugin-cc
+/plugin install codex@openai-codex
+/reload-plugins
+/codex:setup
+```
+
+This skill stays as the **non-interactive bash-wrapper** path — invoked by `discord-bridge.py`'s team-tier `===SUTANDO SYSTEM INSTRUCTIONS===` block (codex exec --sandbox read-only on Discord tasks from non-owner senders), cron-fired jobs that need a one-shot codex call, and similar file-bridge workflows where a plugin slash-command can't reach.
 
 ## Guardrails
 
