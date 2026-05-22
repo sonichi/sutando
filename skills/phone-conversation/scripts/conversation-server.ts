@@ -47,7 +47,7 @@
 import { config as _dotenvConfig } from 'dotenv';
 _dotenvConfig({ path: new URL('../../../.env', import.meta.url).pathname, override: true });
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { mkdirSync, writeFileSync, appendFileSync, unlinkSync, existsSync, readFileSync, readdirSync, symlinkSync } from 'node:fs';
+import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, unlinkSync, existsSync, readFileSync, readdirSync, symlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { voiceApiKey } from '../../../src/voice-key.js';
@@ -125,13 +125,32 @@ const TASK_TIMEOUT_MS = 120_000;
 const OWNER_NAME = process.env.owner ?? '';
 const OWNER_NUMBER = process.env.OWNER_NUMBER ?? '';
 
-// Model configuration — text/STT model still env-driven; native-audio model
-// + googleSearch grounding live in skills/phone-conversation/config.json
-// (schema: src/voice-config.ts). Phone ships with the package default
-// 2.5+search:true.
+// Model configuration — text/STT model still env-driven; the native-audio
+// model + googleSearch grounding are per-user config: data, not code, so they
+// live in the workspace, NOT in the git repo.
+//   live config: $SUTANDO_WORKSPACE/config/phone-conversation.json
+//   template:    skills/phone-conversation/config.json.example (committed)
+// On first run, if the workspace config is missing, the committed .example
+// template is copied into place so the operator has a file to edit. If the
+// copy fails (or the template is gone), loadVoiceConfig falls back to its
+// built-in defaults (schema: src/voice-config.ts). Phone ships with the
+// package default 2.5+search:true.
 const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
 const _phoneSkillDir = dirname(dirname(fileURLToPath(import.meta.url)));
-const PHONE_VOICE_CONFIG = loadVoiceConfig(join(_phoneSkillDir, 'config.json'));
+const PHONE_VOICE_CONFIG_PATH = join(WORKSPACE_DIR, 'config', 'phone-conversation.json');
+if (!existsSync(PHONE_VOICE_CONFIG_PATH)) {
+	const _exampleConfigPath = join(_phoneSkillDir, 'config.json.example');
+	try {
+		mkdirSync(dirname(PHONE_VOICE_CONFIG_PATH), { recursive: true });
+		if (existsSync(_exampleConfigPath)) {
+			copyFileSync(_exampleConfigPath, PHONE_VOICE_CONFIG_PATH);
+			console.log(`${new Date().toISOString().slice(11, 23)} [phone-conversation] seeded config from template → ${PHONE_VOICE_CONFIG_PATH}`);
+		}
+	} catch (e) {
+		console.warn(`${new Date().toISOString().slice(11, 23)} [phone-conversation] could not seed config at ${PHONE_VOICE_CONFIG_PATH}: ${(e as Error).message} — using built-in defaults`);
+	}
+}
+const PHONE_VOICE_CONFIG = loadVoiceConfig(PHONE_VOICE_CONFIG_PATH);
 const VOICE_NATIVE_AUDIO_MODEL = PHONE_VOICE_CONFIG.model;
 const PHONE_GOOGLE_SEARCH = PHONE_VOICE_CONFIG.googleSearch;
 

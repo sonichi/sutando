@@ -1,8 +1,19 @@
 /**
- * Per-skill voice configuration loader.
+ * Per-surface voice configuration loader.
  *
- * Each voice surface (voice-agent, phone-conversation, discord-voice) ships a
- * sibling `config.json` (or `*.config.json` for core-resident surfaces). Schema:
+ * `loadVoiceConfig(path)` is path-agnostic — each caller decides where its
+ * config lives and passes the absolute path in. The config is per-user DATA
+ * (model + grounding prefs the operator tunes), not code, so it does NOT live
+ * in the git repo — it lives in the workspace:
+ *
+ *   - voice-agent        → `$SUTANDO_WORKSPACE/config/voice-agent.json`
+ *   - phone-conversation → `$SUTANDO_WORKSPACE/config/phone-conversation.json`
+ *   - discord-voice      → `$SUTANDO_WORKSPACE/config/discord-voice.json`
+ *
+ * Each surface ships a committed `*.example` template (`src/voice-agent.config
+ * .json.example`, `skills/<surface>/config.json.example`); on first run the
+ * surface copies the template into the workspace if the live config is
+ * missing. Schema:
  *
  *   { "model": "gemini-2.5-flash-native-audio-preview-12-2025", "googleSearch": true }
  *
@@ -14,9 +25,9 @@
  * works on either key but loses Web grounding by default — that's degrading
  * capability rather than picking a safe baseline). Surfaces that explicitly
  * want a different combo (e.g. voice-agent prefers 3.1 + search:false for the
- * web client's code-heavy workload) ship their own `config.json` with the
- * override. Phone and discord-voice inherit the default and don't need a file
- * unless they later want to diverge.
+ * web client's code-heavy workload) ship a `.example` template carrying that
+ * override. Phone inherits the default; discord-voice's template carries it
+ * too, so a fresh install behaves identically.
  */
 
 import { readFileSync, existsSync } from 'fs';

@@ -1,7 +1,10 @@
 /**
  * Voice tool: switch voice-agent's model + googleSearch preset at runtime.
  *
- * Writes `src/voice-agent.config.json` and kicks `launchctl kickstart -k
+ * Writes the per-user voice-agent config at
+ * `$SUTANDO_WORKSPACE/config/voice-agent.json` (data, not code — NOT a
+ * committed repo file; the repo ships voice-agent.config.json.example as a
+ * template) and kicks `launchctl kickstart -k
  * gui/$(id -u)/com.sutando.voice-agent` so voice-agent restarts and picks
  * up the new config. The web client auto-reconnects on restart, so the
  * user-visible flow is: spoken command → ack → ~2-3s silence → voice
@@ -17,12 +20,12 @@
  */
 
 import { z } from 'zod';
-import { writeFileSync, renameSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { writeFileSync, renameSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { VOICE_CONFIG_DEFAULTS, type VoiceConfig } from './voice-config.js';
+import { resolveWorkspace } from './workspace_default.js';
 
 const PRESETS: Record<'search' | 'no-search', VoiceConfig> = {
 	search: { model: 'gemini-2.5-flash-native-audio-preview-12-2025', googleSearch: true },
@@ -52,16 +55,16 @@ export const switchVoiceConfigTool: ToolDefinition = {
 			return { error: `Unknown preset "${preset}". Use "search" or "no-search".` };
 		}
 
-		// Resolve config path next to voice-agent.ts. import.meta.url resolves
-		// to this file's URL — both compiled .js and source .ts share the same
-		// parent dir (src/), so the config path is identical regardless of
-		// runtime.
-		const thisDir = dirname(fileURLToPath(import.meta.url));
-		const configPath = join(thisDir, 'voice-agent.config.json');
+		// The voice-agent config is per-user data — it lives in the workspace
+		// ($SUTANDO_WORKSPACE/config/voice-agent.json), NOT in the git repo.
+		// voice-agent reads from the same path; mkdir the config/ dir in case
+		// this switch fires before voice-agent has seeded it.
+		const configPath = join(resolveWorkspace(), 'config', 'voice-agent.json');
 
 		// Atomic write (tmp+rename) so a partial config never lands.
 		const tmpPath = `${configPath}.tmp-${process.pid}`;
 		try {
+			mkdirSync(join(resolveWorkspace(), 'config'), { recursive: true });
 			// Merge with defaults so the on-disk file is complete + auditable.
 			const next: VoiceConfig = { ...VOICE_CONFIG_DEFAULTS, ...cfg };
 			writeFileSync(tmpPath, JSON.stringify(next, null, 2) + '\n');
