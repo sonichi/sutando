@@ -145,9 +145,11 @@ export const openFileTool: ToolDefinition = {
 	},
 };
 
-// Re-export Zoom tools from skill
-export { summonTool, dismissTool, joinZoomTool } from '../skills/zoom/tools.js';
-import { summonTool, dismissTool, joinZoomTool } from '../skills/zoom/tools.js';
+// Zoom tools (summon, dismiss, join_zoom) are NOT imported here — they live in
+// the manifest-loaded skill `skills/zoom/` (manifest.json + tools.ts) and reach
+// `inlineTools` / `ownerOnlyTools` via the loadSkillManifestTools() path below
+// (#976 conformance). Core no longer has a compile-time dependency on the skill,
+// so it is genuinely optional.
 // Re-export remaining meeting tools
 export { joinGmeetTool, lookupMeetingIdTool, callContactTool } from './meeting-tools.js';
 import { joinGmeetTool, lookupMeetingIdTool, callContactTool } from './meeting-tools.js';
@@ -1086,8 +1088,8 @@ export const inlineTools = assertUniqueToolNames([
 	pressKeyTool, scrollTool, switchTabTool, closeTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
 	volumeTool, brightnessTool, clipboardTool,
-	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, getCoreStatusTool, summonTool, dismissTool,
-	joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool,
+	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, getCoreStatusTool,
+	joinGmeetTool, lookupMeetingIdTool, callContactTool,
 	describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, slideControlTool, fullscreenTool,
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
 	recentContextTool,
@@ -1108,8 +1110,8 @@ export const ownerOnlyTools = [
 	volumeTool, brightnessTool,
 	pressKeyTool, scrollTool, switchTabTool, closeTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
-	clipboardTool, cancelTaskTool, toggleTasksTool, summonTool, dismissTool,
-	joinZoomTool, joinGmeetTool, callContactTool, slideControlTool, fullscreenTool,
+	clipboardTool, cancelTaskTool, toggleTasksTool,
+	joinGmeetTool, callContactTool, slideControlTool, fullscreenTool,
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
 	recentContextTool,
 	describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool,
