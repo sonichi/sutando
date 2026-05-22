@@ -5,12 +5,19 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 // SUTANDO_WORKSPACE must be set BEFORE importing task-bridge.ts —
-// resolveWorkspace() captures it at module-load time.
+// resolveWorkspace() captures it at module-load time. ES-module `import`
+// statements are *hoisted* (per spec), so a top-of-module static import
+// would run BEFORE the env-set on the line above it — making the env set
+// arrive too late and `_isVoiceTask` look at the ambient workspace, not
+// the TMP dir. Top-level `await import(...)` runs in source order, which
+// is what this test needs. (Pre-fix, tests expecting `true` failed in CI
+// because the fixture files weren't where `_isVoiceTask` looked; tests
+// expecting `false` passed *by accident* — file-not-found → false.)
 const TMP = mkdtempSync(join(tmpdir(), 'sutando-isvoice-test-'));
 process.env.SUTANDO_WORKSPACE = TMP;
 mkdirSync(join(TMP, 'tasks'), { recursive: true });
 
-import { _isVoiceTask } from '../src/task-bridge.js';
+const { _isVoiceTask } = await import('../src/task-bridge.js');
 
 // Closes the residual half of PR #982 that @qingyun-wu flagged on the
 // post-merge review:
