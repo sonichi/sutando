@@ -11,6 +11,9 @@ importers:
       '@ai-sdk/google':
         specifier: ^1.2.0
         version: 1.2.22(zod@3.25.76)
+      '@anthropic-ai/claude-agent-sdk':
+        specifier: ^0.1.0
+        version: 0.1.77(zod@3.25.76)
       '@discordjs/opus':
         specifier: ^0.10.0
         version: 0.10.0
@@ -2192,7 +2195,6 @@ snapshots:
       '@img/sharp-linuxmusl-arm64': 0.33.5
       '@img/sharp-linuxmusl-x64': 0.33.5
       '@img/sharp-win32-x64': 0.33.5
-    optional: true
 
   '@babel/code-frame@7.29.0':
     dependencies:
