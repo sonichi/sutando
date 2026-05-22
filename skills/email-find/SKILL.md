@@ -18,9 +18,9 @@ ARGUMENTS: $ARGUMENTS
 
 2. **Broad before narrow.** Always run at least one query that scans the full inbox by recency before narrowing on subject or sender keywords. A reply about Topic-X can land on a thread whose subject names a different topic, with zero topic-X tokens in the subject — a keyword filter throws those threads away.
 
-3. **Expand sender to partners, not just the named entity.** When the user mentions a customer / vendor / collaborator by name, also search for known associated email domains. Operational replies often come from data-ops partners, contractors, or assistants — not the named principal contact. See `## Per-user partner-domain memory` below for how this is stored per user.
+3. **Expand sender to partners, not just the named entity.** When the user mentions a customer / vendor / collaborator by name, also search for known associated email domains. Operational replies often come from data-ops partners, contractors, or assistants — not the named principal contact.
 
-4. **Re-fetch threads in full.** `get_thread` may show only a subset of messages when called with `MINIMAL` format on a previously-summarized thread. If you've identified the candidate thread, fetch it again with `FULL_CONTENT` (or scan `MINIMAL` carefully — the message count should match what's in the Gmail web UI). Long threads (29+ messages) are particularly prone to truncation.
+4. **Re-fetch threads in full.** `get_thread` may show only a subset of messages when called with `MINIMAL` format on a previously-summarized thread. If you've identified the candidate thread, fetch it again with `FULL_CONTENT` and compare the message count against what's visible in the Gmail web UI. Long threads are particularly prone to truncation.
 
 5. **Show the search trail.** End every "found it" or "still hunting" reply with the list of queries you tried, so the user can see what worked and what didn't.
 
@@ -46,7 +46,7 @@ If Phase 1 didn't surface it, run **one query per partner domain** the user may 
 search_threads query="from:DOMAIN OR from:NAMED-ADDRESS" pageSize=10
 ```
 
-**If no partner-domain file exists yet**, skip this phase — proceed straight to Phase 3. (Phase 2 only adds value when you've accumulated mappings; the skill works fine without it.) When Phases 3–4 surface an email from a domain you didn't expect for the named entity, **auto-record the mapping** per `## Per-user partner-domain memory § Auto-learn on discovery` below — silently, no user confirmation.
+If no partner-domain file exists yet, skip this phase and proceed to Phase 3. When Phases 3–4 later surface an email from an unexpected domain, auto-record the mapping per `## Per-user partner-domain memory` below.
 
 ### Phase 3 — Walk threads by participant
 
@@ -73,56 +73,38 @@ When you ask, include the actual list of senders + subjects you saw, so the user
 
 ## Per-user partner-domain memory
 
-The mapping of "named entity → partner email domains" is per-user knowledge that lives in the user's memory directory, not in this skill file. The skill works without it (Phase 2 just becomes a no-op), but accumulating these mappings makes future searches much faster.
+Named-entity → partner-domain mappings live in the user's memory directory, not in this skill.
 
-### Where the file lives
+### File location
 
-The agent should look in the user's memory directory:
+Resolve `SUTANDO_MEMORY_DIR` (default: `~/.claude/projects/<project-id>/memory/`). Look for `reference_partner_domains.md`, `partner_domains*.md`, or a `## Partner domains` section in `user_profile.md`. If none exist, the skill remains fully functional — Phase 2 just no-ops.
 
-1. **Read** the env var `SUTANDO_MEMORY_DIR`. If unset, fall back to the default `~/.claude/projects/<project-id>/memory/` (the same path the Sutando memory system uses — see Sutando's CLAUDE.md for the exact resolution).
-2. **Look** for any file matching the patterns: `reference_partner_domains.md`, `partner_domains*.md`, or check whether `user_profile.md` has a `## Partner domains` section.
-3. **If found**, parse the table and use it in Phase 2.
-4. **If not found**, skip Phase 2 and proceed with Phases 3–4. Do not error out — the skill is fully functional without this file.
+### Auto-learn
 
-### Auto-learn on discovery (no user confirmation)
-
-Whenever the skill surfaces an email from a domain the user didn't explicitly name (e.g. user asked for "K12 email" and the hit came from `soulilution.com`), **silently record the mapping** in the partner-domains file. Do **not** ask the user "want me to save this?" — that's friction. Worst case is an extra row that doesn't match anything later; the cost of recording is near-zero, the cost of asking is real.
-
-If the file doesn't exist yet, create it on first discovery. Use the format below.
-
-Implementation notes:
-- Do not chain a confirmation question into the same reply that delivers the email — just write to memory in the background and move on.
-- Don't mention the save in the reply unless the user explicitly asks "how did you find this?" — silent learning beats narrated learning.
+When Phases 3–4 surface an email from a domain the user didn't name for that entity, append the mapping to the partner-domains file silently. Do not ask for confirmation; do not narrate the save in the reply. If the file doesn't exist, create it on first discovery. The cost of an unhelpful row is one extra query in a future fanout; the cost of asking is friction every time.
 
 ### Timestamps and pruning
 
-Every row in the partner-domains file carries two timestamps:
-
-- `first_seen` — when the mapping was first recorded
-- `last_useful` — last time the mapping helped surface an email (i.e. a Phase 2 query using this row returned a result)
-
-Each time Phase 2 runs and a domain row produces a hit, update its `last_useful` to today. Each time the file is read for any reason, also run a pruning pass: **drop any row whose `last_useful` is more than 365 days old** (or `first_seen` if it never got marked useful). Keeps the file from accumulating dead aliases.
-
-The pruning runs at most once per day per file — track via a `pruned_at` header. This keeps repeated reads cheap.
+Each row carries `first_seen` (when recorded) and `last_useful` (when this row last produced a Phase 2 hit). Update `last_useful` to today whenever a row contributes a result. On every read, drop any row whose `last_useful` is older than 365 days (or `first_seen` if `last_useful` is unset). Track `pruned_at` in the frontmatter so the prune pass runs at most once per day.
 
 ### File format
 
 ```markdown
 ---
 name: partner-domains
-description: Map of named entities (customers, vendors, collaborators) to associated email domains. Auto-maintained by the /email-find skill.
+description: Named entities → associated email domains. Auto-maintained by /email-find.
 metadata:
   type: reference
-  pruned_at: 2026-05-22
+  pruned_at: YYYY-MM-DD
 ---
 
 | Named entity | Associated email domains | first_seen | last_useful |
 |---|---|---|---|
-| Acme Corp | `*@acmecorp.com`, `*@acme-data-ops.com` | 2026-05-22 | 2026-05-22 |
-| Foo Foundation | `*@foo.org`, `programs@foo.org` | 2026-05-22 | 2026-05-22 |
+| Acme Corp | `*@acmecorp.com`, `*@acme-data-ops.com` | YYYY-MM-DD | YYYY-MM-DD |
+| Foo Foundation | `*@foo.org`, `programs@foo.org` | YYYY-MM-DD | YYYY-MM-DD |
 ```
 
-The agent should treat this format as a template — match whatever frontmatter / heading convention the user already uses elsewhere in their memory dir.
+Match whatever frontmatter convention the user already uses elsewhere in their memory dir.
 
 ## Subject-mismatch heuristic (no subject filtering in Phases 1–3)
 
@@ -151,8 +133,6 @@ If nothing was found after Phase 4, reply with:
 
 ## Don't
 
-- Don't conclude "not found" before completing Phases 1–4.
-- Don't subject-filter on the named entity in Phases 1–3 — the subject often doesn't carry that token.
-- Don't trust a partial `get_thread` result. Long threads truncate.
-- Don't ask the user for clarification before showing them the broad-scan list — they can usually spot the email in 10 seconds if you put it in front of them.
-- Don't hardcode partner mappings in this skill. They live in user memory per `## Per-user partner-domain memory`.
+- Conclude "not found" before completing Phases 1–4.
+- Show clarification questions before showing the broad-scan list.
+- Hardcode partner mappings in this skill — they live in user memory.
