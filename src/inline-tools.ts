@@ -6,7 +6,7 @@
  */
 
 import { execSync, execFileSync } from 'node:child_process';
-import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync, statSync } from 'node:fs';
+import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync, statSync, mkdirSync } from 'node:fs';
 import { join, extname, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
@@ -166,9 +166,16 @@ export const pressKeyTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { key, modifiers = [], app } = args as { key: string; modifiers?: string[]; app?: string };
-		// Activate target app if specified
+		// Activate target app if specified. Escape `app` before embedding
+		// in the AppleScript string literal — without this, a value like
+		// `"; do shell script "rm -rf ~"; tell application "Finder` would
+		// break out of `tell application "..."` and run arbitrary
+		// AppleScript (and AppleScript can `do shell script`, so this is
+		// arbitrary code execution from a tool-call argument). Same
+		// escape pattern as `safeKey` below and `safeApp` in switchAppTool.
 		if (app) {
-			try { execSync(`osascript -e 'tell application "${app}" to activate'`, { timeout: 3_000 }); await new Promise(r => setTimeout(r, 300)); } catch {}
+			const safeApp = app.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
+			try { execSync(`osascript -e 'tell application "${safeApp}" to activate'`, { timeout: 3_000 }); await new Promise(r => setTimeout(r, 300)); } catch {}
 		}
 		const keyMap: Record<string, number> = {
 			'enter': 36, 'return': 36, 'escape': 53, 'esc': 53, 'tab': 48,
@@ -838,6 +845,10 @@ export const saveNoteTool: ToolDefinition = {
 		const tagList = tags ? tags.split(',').map(t => t.trim()) : ['personal'];
 		const md = `---\ntitle: ${title}\ndate: ${date}\ntags: [${tagList.join(', ')}]\n---\n\n${content}\n`;
 		try {
+			// NOTES_DIR resolves against the workspace, which may not have a
+			// notes/ subdir yet on a fresh install — create it before writing
+			// so the first save_note never fails with ENOENT.
+			mkdirSync(NOTES_DIR, { recursive: true });
 			writeFileSync(join(NOTES_DIR, `${slug}.md`), md);
 			return { status: 'saved', title, slug, path: `notes/${slug}.md` };
 		} catch (e) { return { error: String(e) }; }
