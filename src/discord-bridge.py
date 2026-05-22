@@ -2152,6 +2152,54 @@ async def _handle_discord_message(message, force=False):
                 bot_role_ids = {r.id for r in bot_member.roles}
                 role_mentioned = any(r.id in bot_role_ids for r in message.role_mentions)
 
+        # Thread auto-engage: when the bot is *directly* @-mentioned in a
+        # Discord thread, persist that thread to access.json's groups so
+        # subsequent unmentioned messages in the thread pass the requireMention
+        # gate. Only the thread gets the bypass entry; the parent channel's
+        # config is untouched. Managed downstream via `/discord:access group rm`.
+        #
+        # Trigger is bot_mentioned only, NOT role_mentioned. Role pings let a
+        # single message route through the per-message gate above, but using
+        # them to *persist* would mean any broad-role @ that happens to cover
+        # the bot could lock a thread open. Direct @-bot is the explicit signal.
+        #
+        # Parent-config inheritance for the new thread entry:
+        #  - dict parent w/ allowFrom → inherit verbatim (members who could
+        #    already speak in the parent keep their access).
+        #  - dict parent w/o allowFrom → engager-only ([author_id]).
+        #  - parent_cfg is True (open shorthand) → leave thread open: emit
+        #    {requireMention: False} with no allowFrom (no restriction). A
+        #    thread under an open parent must not be MORE restrictive.
+        #  - missing parent_cfg → engager-only [author_id] (safe default).
+        if bot_mentioned and isinstance(message.channel, discord.Thread):
+            try:
+                access_data = json.loads(ACCESS_FILE.read_text())
+                access_groups = access_data.setdefault('groups', {})
+                thread_id_str = str(message.channel.id)
+                if thread_id_str not in access_groups:
+                    parent_id_str = str(message.channel.parent_id) if message.channel.parent_id else None
+                    parent_cfg = access_groups.get(parent_id_str) if parent_id_str else None
+                    if parent_cfg is True:
+                        thread_entry = {'requireMention': False}
+                    elif isinstance(parent_cfg, dict):
+                        inherited_allow = parent_cfg.get('allowFrom', [str(message.author.id)])
+                        thread_entry = {'requireMention': False, 'allowFrom': inherited_allow}
+                    else:
+                        thread_entry = {'requireMention': False, 'allowFrom': [str(message.author.id)]}
+                    access_groups[thread_id_str] = thread_entry
+                    # Atomic tmp+rename. Bare write_text truncates-then-writes,
+                    # exposing a window where a concurrent reader (every
+                    # message hits load_channel_config which re-reads
+                    # access.json) or a crash could see a partial file. Same
+                    # change also closes the lost-update race with the
+                    # `/discord:access` skill's read-modify-write.
+                    tmp_path = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + '.tmp')
+                    tmp_path.write_text(json.dumps(access_data, indent=2))
+                    os.replace(tmp_path, ACCESS_FILE)
+                    print(f"  [thread-engage] added thread {thread_id_str} (parent {parent_id_str}) to access.json with {thread_entry}", flush=True)
+            except Exception as e:
+                print(f"  [thread-engage] failed to update access.json: {e}", flush=True)
+
         if require_mention and not bot_mentioned and not role_mentioned:
             print(f"  [skip] not mentioned (requireMention=true)", flush=True)
             return

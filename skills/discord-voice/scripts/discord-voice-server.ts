@@ -303,7 +303,15 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 			'Be natural, warm, and conversational. Keep responses to 1-2 sentences.',
 			'Discord voice channels are persistent — do NOT say "goodbye" or try to hang up. Just stop speaking when you have nothing more to add.',
 			'NEVER say "I\'m back", "Welcome back", "Working on it", or "task is queued". If the conversation resumes after a pause, just continue naturally.',
-			'NEVER fabricate specific details. If you don\'t know it, use the work tool to look it up.',
+			// "Look it up" pointer — conditional on per-surface config.
+			// Search on → native Web grounding (~2-3s, in-conversation);
+			// search off → `work` tool fallback (round-trip ~8-15s).
+			// Earlier code had both a permanent "use work" line + a soft
+			// nudge; model read the imperative as imperative and the nudge
+			// as optional. One conditional line so only one path appears.
+			DISCORD_VOICE_GOOGLE_SEARCH
+				? 'NEVER fabricate specific details. If you don\'t know it, use your built-in Web search to look it up — it\'s faster than delegating, and the answer stays in the conversation. If your built-in search returns nothing useful, OR the question needs deeper-than-one-lookup research (multi-step, multiple sources, file reading), call the work tool — it routes to the core agent which can do extensive research.'
+				: 'NEVER fabricate specific details. If you don\'t know it, use the work tool to look it up.',
 			repoUrl ? `\n## Known info\nSutando GitHub repo: ${repoUrl}` : '',
 		].filter(Boolean).join('\n');
 	} else {

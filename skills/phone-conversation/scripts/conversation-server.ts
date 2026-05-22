@@ -494,9 +494,17 @@ function buildAgent(callSession: CallSession): MainAgent {
 		instructions = instructions.filter(Boolean).join('\n');
 	}
 
-	// Grounding
+	// Grounding. The "look it up" pointer is conditional on per-surface
+	// config: native Web search when googleSearch is enabled (~2-3s, answer
+	// in conversation), `work` tool otherwise (round-trip ~8-15s). Earlier
+	// versions had a permanent "use work" line + a soft nudge toward native
+	// search — the model read the first as imperative and the nudge as
+	// optional, so it kept delegating even with search on. One conditional
+	// line so only one path is presented per config.
 	if (callSession.isOwner) {
-		instructions += '\n\nNEVER fabricate specific details. If you don\'t know it, use the work tool to look it up.';
+		instructions += PHONE_GOOGLE_SEARCH
+			? '\n\nNEVER fabricate specific details. If you don\'t know it, use your built-in Web search to look it up — it\'s faster than delegating, and the answer stays in the conversation. If your built-in search returns nothing useful, OR the question needs deeper-than-one-lookup research (multi-step, multiple sources, file reading), call the work tool — it routes to the core agent which can do extensive research.'
+			: '\n\nNEVER fabricate specific details. If you don\'t know it, use the work tool to look it up.';
 	}
 
 	const tools: ToolDefinition[] = [];
