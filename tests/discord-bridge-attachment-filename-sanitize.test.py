@@ -36,6 +36,16 @@ REPO = Path(__file__).resolve().parent.parent
 
 _WORKSPACE_TMP = tempfile.mkdtemp(prefix="sutando-discord-filename-test-")
 os.environ["SUTANDO_WORKSPACE"] = _WORKSPACE_TMP
+# `discord-bridge.py` reads its token from `~/.claude/channels/discord/.env`
+# (file path), not from `os.environ["DISCORD_BOT_TOKEN"]`, and `exit(1)`s
+# at module load when the file is missing. CI has no such file. Stub the
+# home dir + write a fake token so the module loads cleanly without
+# requiring a real bot credential in CI.
+_HOME_TMP = tempfile.mkdtemp(prefix="sutando-discord-filename-test-home-")
+os.environ["HOME"] = _HOME_TMP
+_token_dir = Path(_HOME_TMP) / ".claude" / "channels" / "discord"
+_token_dir.mkdir(parents=True, exist_ok=True)
+(_token_dir / ".env").write_text("DISCORD_BOT_TOKEN=test-token-not-real\n")
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token-not-real")
 
 
