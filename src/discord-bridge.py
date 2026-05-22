@@ -2152,6 +2152,31 @@ async def _handle_discord_message(message, force=False):
                 bot_role_ids = {r.id for r in bot_member.roles}
                 role_mentioned = any(r.id in bot_role_ids for r in message.role_mentions)
 
+        # Thread auto-engage: when the bot is @-mentioned in a Discord thread,
+        # persist that thread to access.json's groups so subsequent messages
+        # in the thread bypass the requireMention gate. The thread's parent
+        # config keeps its own (likely requireMention=true) for the main
+        # channel; only the thread gets the bypass. Inherits allowFrom from
+        # the parent so non-author users can keep chatting in the thread.
+        # Managed downstream via `/discord:access group rm <thread_id>`.
+        if (bot_mentioned or role_mentioned) and isinstance(message.channel, discord.Thread):
+            try:
+                access_data = json.loads(ACCESS_FILE.read_text())
+                access_groups = access_data.setdefault('groups', {})
+                thread_id_str = str(message.channel.id)
+                if thread_id_str not in access_groups:
+                    parent_id_str = str(message.channel.parent_id) if message.channel.parent_id else None
+                    parent_cfg = access_groups.get(parent_id_str, {}) if parent_id_str else {}
+                    if isinstance(parent_cfg, dict):
+                        inherited_allow = parent_cfg.get('allowFrom', [str(message.author.id)])
+                    else:
+                        inherited_allow = [str(message.author.id)]
+                    access_groups[thread_id_str] = {'requireMention': False, 'allowFrom': inherited_allow}
+                    ACCESS_FILE.write_text(json.dumps(access_data, indent=2))
+                    print(f"  [thread-engage] added thread {thread_id_str} (parent {parent_id_str}) to access.json with requireMention=false", flush=True)
+            except Exception as e:
+                print(f"  [thread-engage] failed to update access.json: {e}", flush=True)
+
         if require_mention and not bot_mentioned and not role_mentioned:
             print(f"  [skip] not mentioned (requireMention=true)", flush=True)
             return
