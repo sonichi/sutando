@@ -2789,8 +2789,19 @@ async def poll_results():
                     # when the channel is already a Discord thread — thread
                     # context anchors the reply implicitly, no extra quote
                     # needed.
-                    if reply_to_id is None and not isinstance(channel, discord.Thread):
-                        reply_to_id = pending_reply_anchors.get(task_id)
+                    #
+                    # getattr instead of bare `discord.Thread` so the
+                    # test-stub discord module (tests/discord-bridge-*.test.py)
+                    # — which intentionally omits Thread to keep the stub
+                    # surface small — doesn't AttributeError here. Production
+                    # discord.py always provides Thread; the getattr fallback
+                    # only matters under test, where treating "no Thread
+                    # class" as "channel isn't a thread" is correct.
+                    if reply_to_id is None:
+                        _thread_cls = getattr(discord, 'Thread', None)
+                        is_thread = _thread_cls is not None and isinstance(channel, _thread_cls)
+                        if not is_thread:
+                            reply_to_id = pending_reply_anchors.get(task_id)
 
                     # Extract optional [channel: <channel_id>] redirect — the
                     # agent can route a DM-originated reply to a different
