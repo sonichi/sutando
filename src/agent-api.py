@@ -775,6 +775,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         task = data.get("task", "")
         priority = data.get("priority", "normal")
 
+        # Task-file header injection guard. `from_agent` lands on a single
+        # line in the task file ("from: <value>\n"). Without sanitization,
+        # a `\n` in the value forges extra task-file fields downstream
+        # consumers parse line-by-line — e.g. `from_agent =
+        # "evil\nchannel_id: local-voice"` makes the task file look
+        # voice-originated to `_isVoiceTask` (which scans every line for
+        # `channel_id: local-voice`). The misclassif routes the task
+        # through the voice-only fallback path with incorrect downstream
+        # behavior. Strip line terminators; cap to a sane single-line
+        # length.
+        from_agent = (
+            from_agent.replace("\r", " ").replace("\n", " ").strip()[:120]
+            or "unknown"
+        )
+
         if not task:
             self.send_json(400, {"error": "task is required"})
             return
@@ -791,7 +806,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         # Write to tasks/ for sutando-core to pick up
         task_id = f"task-{int(datetime.now().timestamp() * 1000)}"
-        task_content = f"id: {task_id}\ntimestamp: {datetime.now().isoformat()}\ntask: {task}\nsource: api\nfrom: {from_agent}\n"
+        # Write to tasks/ for sutando-core to pick up. Field order matters:
+        # `task:` is the LAST line so any newlines in the user-supplied
+        # task body just extend the task body rather than forge new
+        # task-file fields below. Pre-fix the format was
+        # `id, timestamp, task, source, from` — a task body containing
+        # `\nsource: voice` would land between the legitimate `source:` and
+        # `from:` lines, and `_isVoiceTask` (any-line scan) would treat the
+        # task as voice-originated. With `task:` last, the body's newlines
+        # have no field to inject into; the file ends with the body.
+        task_content = (
+            f"id: {task_id}\n"
+            f"timestamp: {datetime.now().isoformat()}\n"
+            f"source: api\n"
+            f"from: {from_agent}\n"
+            f"task: {task}\n"
+        )
         (TASK_DIR / f"{task_id}.txt").write_text(task_content)
 
         # Register webhook callback if provided

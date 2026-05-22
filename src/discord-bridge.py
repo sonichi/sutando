@@ -1974,6 +1974,11 @@ def _should_welcome_first_post(message, welcome_channel_id, welcome_template_pat
 
 # Track pending replies: task_id -> channel
 pending_replies = {}
+# Track source message id per pending task so the result-sender can default
+# reply_to_id to the triggering message (visually threads the reply). Lives
+# in memory only — crash-recovery isn't critical; missing entry just means
+# the reply goes as a fresh message instead of a quote-reply.
+pending_reply_anchors: dict[str, int] = {}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -2146,6 +2151,54 @@ async def _handle_discord_message(message, force=False):
             if bot_member:
                 bot_role_ids = {r.id for r in bot_member.roles}
                 role_mentioned = any(r.id in bot_role_ids for r in message.role_mentions)
+
+        # Thread auto-engage: when the bot is *directly* @-mentioned in a
+        # Discord thread, persist that thread to access.json's groups so
+        # subsequent unmentioned messages in the thread pass the requireMention
+        # gate. Only the thread gets the bypass entry; the parent channel's
+        # config is untouched. Managed downstream via `/discord:access group rm`.
+        #
+        # Trigger is bot_mentioned only, NOT role_mentioned. Role pings let a
+        # single message route through the per-message gate above, but using
+        # them to *persist* would mean any broad-role @ that happens to cover
+        # the bot could lock a thread open. Direct @-bot is the explicit signal.
+        #
+        # Parent-config inheritance for the new thread entry:
+        #  - dict parent w/ allowFrom → inherit verbatim (members who could
+        #    already speak in the parent keep their access).
+        #  - dict parent w/o allowFrom → engager-only ([author_id]).
+        #  - parent_cfg is True (open shorthand) → leave thread open: emit
+        #    {requireMention: False} with no allowFrom (no restriction). A
+        #    thread under an open parent must not be MORE restrictive.
+        #  - missing parent_cfg → engager-only [author_id] (safe default).
+        if bot_mentioned and isinstance(message.channel, discord.Thread):
+            try:
+                access_data = json.loads(ACCESS_FILE.read_text())
+                access_groups = access_data.setdefault('groups', {})
+                thread_id_str = str(message.channel.id)
+                if thread_id_str not in access_groups:
+                    parent_id_str = str(message.channel.parent_id) if message.channel.parent_id else None
+                    parent_cfg = access_groups.get(parent_id_str) if parent_id_str else None
+                    if parent_cfg is True:
+                        thread_entry = {'requireMention': False}
+                    elif isinstance(parent_cfg, dict):
+                        inherited_allow = parent_cfg.get('allowFrom', [str(message.author.id)])
+                        thread_entry = {'requireMention': False, 'allowFrom': inherited_allow}
+                    else:
+                        thread_entry = {'requireMention': False, 'allowFrom': [str(message.author.id)]}
+                    access_groups[thread_id_str] = thread_entry
+                    # Atomic tmp+rename. Bare write_text truncates-then-writes,
+                    # exposing a window where a concurrent reader (every
+                    # message hits load_channel_config which re-reads
+                    # access.json) or a crash could see a partial file. Same
+                    # change also closes the lost-update race with the
+                    # `/discord:access` skill's read-modify-write.
+                    tmp_path = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + '.tmp')
+                    tmp_path.write_text(json.dumps(access_data, indent=2))
+                    os.replace(tmp_path, ACCESS_FILE)
+                    print(f"  [thread-engage] added thread {thread_id_str} (parent {parent_id_str}) to access.json with {thread_entry}", flush=True)
+            except Exception as e:
+                print(f"  [thread-engage] failed to update access.json: {e}", flush=True)
 
         if require_mention and not bot_mentioned and not role_mentioned:
             print(f"  [skip] not mentioned (requireMention=true)", flush=True)
@@ -2599,12 +2652,17 @@ async def _handle_discord_message(message, force=False):
         f"task: {user_task_text}\n"
         f"source: discord\n"
         f"channel_id: {message.channel.id}\n"
+        f"source_message_id: {message.id}\n"
         f"user_id: {message.author.id}\n"
         f"access_tier: {access_tier}\n"
         f"priority: {priority}\n"
         f"{tier_instructions.get(access_tier, tier_instructions['other'])}"
     )
     pending_replies[task_id] = message.channel
+    # Track source-message-id so the result-sender can auto-attach reply_to
+    # (visually thread the reply to the triggering message). Skipped when
+    # the channel is already a Discord thread — thread context is enough.
+    pending_reply_anchors[task_id] = message.id
     save_pending_replies()
 
     # Typing indicator
@@ -2741,6 +2799,13 @@ async def poll_results():
                 import re
                 reply_text = result_file.read_text().strip()
                 channel = pending_replies.pop(task_id)
+                # Capture anchor BEFORE pop so the auto-thread block below
+                # can use it. The previous version popped+forgot, leaving
+                # `pending_reply_anchors.get(task_id)` at line ~2810 always
+                # returning None — symptom: replies appeared as fresh
+                # messages instead of quote-replies. Caught by live test
+                # 2026-05-22 ~03:00 UTC: "it's not a quote reply".
+                source_message_anchor = pending_reply_anchors.pop(task_id, None)
                 save_pending_replies()
                 # Skip sending if already replied directly (core agent used MCP).
                 # Clean up the result AND task files so the watcher doesn't
@@ -2768,6 +2833,25 @@ async def poll_results():
                     reply_to_id = int(reply_match.group(1)) if reply_match else None
                     if reply_match:
                         reply_text = reply_pattern.sub('', reply_text).strip()
+                    # Auto-thread: if the agent didn't pick an explicit
+                    # [reply: <id>], default to the triggering message so the
+                    # reply appears quoted under what it's answering. Skip
+                    # when the channel is already a Discord thread — thread
+                    # context anchors the reply implicitly, no extra quote
+                    # needed.
+                    #
+                    # getattr instead of bare `discord.Thread` so the
+                    # test-stub discord module (tests/discord-bridge-*.test.py)
+                    # — which intentionally omits Thread to keep the stub
+                    # surface small — doesn't AttributeError here. Production
+                    # discord.py always provides Thread; the getattr fallback
+                    # only matters under test, where treating "no Thread
+                    # class" as "channel isn't a thread" is correct.
+                    if reply_to_id is None:
+                        _thread_cls = getattr(discord, 'Thread', None)
+                        is_thread = _thread_cls is not None and isinstance(channel, _thread_cls)
+                        if not is_thread:
+                            reply_to_id = source_message_anchor
 
                     # Extract optional [channel: <channel_id>] redirect — the
                     # agent can route a DM-originated reply to a different

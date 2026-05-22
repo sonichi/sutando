@@ -48,7 +48,10 @@ import { config as _dotenvConfig } from 'dotenv';
 _dotenvConfig({ path: new URL('../../../.env', import.meta.url).pathname, override: true });
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { mkdirSync, writeFileSync, appendFileSync, unlinkSync, existsSync, readFileSync, readdirSync, symlinkSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { voiceApiKey } from '../../../src/voice-key.js';
+import { loadVoiceConfig } from '../../../src/voice-config.js';
 import { hostname } from 'node:os';
 import { resolveWorkspace } from '../../../src/workspace_default.js';
 
@@ -74,6 +77,7 @@ function personalPath(filename: string): string {
 	return filename;
 }
 import { execSync, spawn, type ChildProcess } from 'node:child_process';
+import { isAllowedAudioPath } from './audio_path_guard.js';
 import { VoiceSession, type ToolDefinition, type MainAgent } from 'bodhi-realtime-agent';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
@@ -104,7 +108,10 @@ function detachVisionFromCall(): void {
 
 // --- Config ---
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY ?? '';
+// Voice surfaces share the GEMINI_VOICE_API_KEY → GEMINI_API_KEY fallback
+// chain via voiceApiKey() (src/voice-key.ts). VOICE-key path isolates voice
+// billing onto a paid-tier key; MAIN-key fallback preserves single-key setup.
+const GEMINI_API_KEY = voiceApiKey();
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID ?? '';
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN ?? '';
 const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER ?? '';
@@ -118,9 +125,15 @@ const TASK_TIMEOUT_MS = 120_000;
 const OWNER_NAME = process.env.owner ?? '';
 const OWNER_NUMBER = process.env.OWNER_NUMBER ?? '';
 
-// Model configuration — override via .env
+// Model configuration — text/STT model still env-driven; native-audio model
+// + googleSearch grounding live in skills/phone-conversation/config.json
+// (schema: src/voice-config.ts). Phone ships with the package default
+// 2.5+search:true.
 const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
-const VOICE_NATIVE_AUDIO_MODEL = process.env.VOICE_NATIVE_AUDIO_MODEL || 'gemini-3.1-flash-live-preview';
+const _phoneSkillDir = dirname(dirname(fileURLToPath(import.meta.url)));
+const PHONE_VOICE_CONFIG = loadVoiceConfig(join(_phoneSkillDir, 'config.json'));
+const VOICE_NATIVE_AUDIO_MODEL = PHONE_VOICE_CONFIG.model;
+const PHONE_GOOGLE_SEARCH = PHONE_VOICE_CONFIG.googleSearch;
 
 /** Normalize phone number to digits only for comparison (strips +, -, spaces, parens) */
 function normalizePhone(num: string): string {
@@ -481,9 +494,17 @@ function buildAgent(callSession: CallSession): MainAgent {
 		instructions = instructions.filter(Boolean).join('\n');
 	}
 
-	// Grounding
+	// Grounding. The "look it up" pointer is conditional on per-surface
+	// config: native Web search when googleSearch is enabled (~2-3s, answer
+	// in conversation), `work` tool otherwise (round-trip ~8-15s). Earlier
+	// versions had a permanent "use work" line + a soft nudge toward native
+	// search — the model read the first as imperative and the nudge as
+	// optional, so it kept delegating even with search on. One conditional
+	// line so only one path is presented per config.
 	if (callSession.isOwner) {
-		instructions += '\n\nNEVER fabricate specific details. If you don\'t know it, use the work tool to look it up.';
+		instructions += PHONE_GOOGLE_SEARCH
+			? '\n\nNEVER fabricate specific details. If you don\'t know it, use your built-in Web search to look it up — it\'s faster than delegating, and the answer stays in the conversation. If your built-in search returns nothing useful, OR the question needs deeper-than-one-lookup research (multi-step, multiple sources, file reading), call the work tool — it routes to the core agent which can do extensive research.'
+			: '\n\nNEVER fabricate specific details. If you don\'t know it, use the work tool to look it up.';
 	}
 
 	const tools: ToolDefinition[] = [];
@@ -643,7 +664,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 		name: 'phone',
 		instructions,
 		tools,
-		googleSearch: true,
+		googleSearch: PHONE_GOOGLE_SEARCH,
 		// Greeting is injected as role:"user" by bodhi to trigger Gemini to speak.
 		// Use directive prefix so Gemini speaks the text verbatim instead of responding to it.
 		greeting: callSession.isMeeting
@@ -712,7 +733,7 @@ async function createCallSession(params: {
 		host: '127.0.0.1',
 		model: google(VOICE_MODEL),
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
-		googleSearch: true,
+		googleSearch: PHONE_GOOGLE_SEARCH,
 		speechConfig: { voiceName: 'Aoede' },
 		hooks: {
 			onToolCall: (e) => {
@@ -1302,7 +1323,19 @@ const server = createServer(async (req, res) => {
 			// Stream an audio/video file's audio track through Twilio to the caller's phone
 			const body = JSON.parse(await readBody(req)) as { path: string; callSid?: string; seekSec?: number };
 			if (!body.path) { json(res, 400, { error: 'path required' }); return; }
-			if (!existsSync(body.path)) { json(res, 404, { error: 'file not found' }); return; }
+			// Path-allowlist gate (see audio_path_guard.ts for the
+			// rationale). Pre-fix this endpoint validated only
+			// `existsSync(body.path)`, so any LAN caller could have
+			// ffmpeg open any local file the server's user could read
+			// and stream the audio to whoever was on the active call.
+			// The allowlist restricts to the recording skill's
+			// `/tmp/sutando-*` convention and realpath-collapses to
+			// defeat symlink escapes.
+			if (!isAllowedAudioPath(body.path)) {
+				console.log(`${ts()} [PlayAudio] REJECTED path (not allowlisted): ${body.path}`);
+				json(res, 403, { error: 'path not allowed' });
+				return;
+			}
 			let session: CallSession | undefined;
 			if (body.callSid) {
 				session = activeCalls.get(body.callSid);
