@@ -24,19 +24,54 @@ import re
 import sys
 from pathlib import Path
 
+# workspace_default lives in <repo>/src/. The repo tree is mirrored verbatim
+# into the app bundle, so following the skills/ symlink here is harmless — it
+# locates a valid copy of the helper either way. resolve_workspace() itself
+# resolves the workspace from $SUTANDO_WORKSPACE / ~/.sutando/workspace and
+# never from __file__, so the path it returns is correct regardless.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "src"))
+from workspace_default import resolve_workspace  # noqa: E402
+
 EXCLUDE_FILES = {"MEMORY.md", "INDEX.md", "self_identity.md"}
 FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---", re.DOTALL)
 MAX_LINE = 200  # per CLAUDE.md: "Keep index entries to one line under ~200 chars"
 
 
+def _slugify_path(p: Path) -> str:
+    """Claude Code project-slug convention: every non-alphanumeric char in the
+    absolute path becomes '-'.
+
+    e.g. /Users/x/.sutando/workspace -> -Users-x--sutando-workspace
+    (note the '--' where '/.' was). The old code only replaced '/', which
+    left the dot in '.sutando' intact and produced a slug that did not match
+    Claude Code's actual project directory.
+    """
+    return re.sub(r"[^A-Za-z0-9]", "-", str(p))
+
+
 def default_memory_dir() -> Path:
+    """Resolve the memory dir.
+
+    Order:
+      1. $SUTANDO_MEMORY_DIR env var.
+      2. ~/.claude/projects/<workspace-slug>/memory — slug derived from the
+         WORKSPACE dir (the Claude Code session cwd), not this script's path.
+
+    Historic bug: the fallback derived the slug from
+    ``Path(__file__).resolve().parent`` walked up four levels. When ``skills/``
+    is an app-bundle symlink (the normal install layout), ``.resolve()``
+    follows it into ``/Applications/Sutando.app/Contents/Resources/repo`` — so
+    the slug pointed at an empty memory dir, ``collect_entries`` found 0
+    frontmatter files, and the clobber guard made the regen a silent no-op on
+    every cross-node-sync cron pass (every 7 min). Deriving from
+    ``resolve_workspace()`` — the canonical workspace contract — fixes this
+    regardless of where the script file physically lives.
+    """
     env = os.environ.get("SUTANDO_MEMORY_DIR")
     if env:
         return Path(env).expanduser()
-    # Derive from this script's location: <repo>/skills/cross-node-sync/scripts/<this>
-    repo_root = Path(__file__).resolve().parent.parent.parent.parent
-    slug = str(repo_root.resolve()).replace("/", "-")
-    return Path.home() / ".claude" / "projects" / slug / "memory"
+    workspace = resolve_workspace(migrate=False)
+    return Path.home() / ".claude" / "projects" / _slugify_path(workspace) / "memory"
 
 
 def parse_frontmatter(text: str) -> dict:
