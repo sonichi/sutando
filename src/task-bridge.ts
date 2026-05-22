@@ -173,6 +173,27 @@ export function _isVoiceTask(taskId: string): boolean {
 	}
 	return false;
 }
+
+/** Belt-suspenders guard for the result-watcher's unconditional fallthrough
+ * (issue #1035, follow-up to PR #1033). Returns true iff the filename is one
+ * that task-bridge legitimately delivers via `onResult()`. Rejects everything
+ * else — most importantly, the new `<channel-key>.task-{id}.txt` namespace
+ * PR #1033 introduced for the per-channel pull path (discord-voice / phone),
+ * which the per-channel scanner consumes itself.
+ *
+ * `proactive-*` IS allowed: per the long-standing proactive-voice rule,
+ * proactive messages are spoken by the voice agent when the client is
+ * connected (in parallel to discord-bridge's poll_proactive DM-delivery).
+ * That delivery has no explicit handler upstream in this watcher — the
+ * fallthrough IS the path — so blocking `proactive-*` here would silently
+ * disable voice-spoken proactive messages.
+ *
+ * Exported for unit testing — the watcher's setInterval body is otherwise
+ * awkward to exercise in isolation. */
+export function _shouldFallthrough(file: string): boolean {
+	return file.startsWith('task-') || file.startsWith('voice-') || file.startsWith('proactive-');
+}
+
 const _apiToken = process.env.SUTANDO_API_TOKEN || '';
 function _apiHeaders(): Record<string, string> {
 	const h: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -703,6 +724,18 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 					// Other non-voice unsent results stay queued (their bridges deliver them)
 					continue;
 				}
+				// Belt-suspenders guard (issue #1035, follow-up to PR #1033):
+				// the fallthrough below fires onResult() for any non-empty .txt
+				// when the voice client is connected. PR #1033 introduced a new
+				// filename namespace `<channel-key>.task-{id}.txt` for the
+				// per-channel pull path used by discord-voice / phone — those
+				// files are NOT meant for task-bridge to inject into voice.
+				// PR #1033's mitigation is the per-channel scanner's
+				// read-and-delete winning the race; this guard closes the
+				// race by gating the fallthrough to filenames task-bridge
+				// legitimately consumes. See _shouldFallthrough for the
+				// allowlisted prefixes.
+				if (!_shouldFallthrough(file)) continue;
 				if (result) {
 					console.log(`${ts()} [TaskBridge] Result ${file}: ${result.slice(0, 100)}`);
 					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
