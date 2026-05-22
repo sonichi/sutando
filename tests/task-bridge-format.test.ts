@@ -1,18 +1,35 @@
 import { describe, it, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { resolveWorkspace } from '../src/workspace_default.js';
-import { workTool } from '../src/task-bridge.js';
+import type { ToolDefinition } from 'bodhi-realtime-agent';
 
 // Integration test for PR #460's unified task-file schema. Every voice /
 // work-tool task should emit the same set of fields the Discord bridge
 // emits, so downstream consumers (Claude Code session, access-tier
 // sandboxing) can treat all tasks uniformly.
 
-// Task dir is wherever the bridge writes — `resolveWorkspace()/tasks/`. Was
-// `<REPO_ROOT>/tasks/` pre-#821, when the bridge fell back to repo root.
-const TASK_DIR = join(resolveWorkspace(), 'tasks');
+// Isolation: workTool writes real task files (and state/last-owner-activity.json)
+// into resolveWorkspace(). Pointed at the live workspace, this test polluted
+// production state — the stream watcher fired TASK_FILE events for fixture
+// bodies ("first", "second", "default fallback", …) and the bridge wrote
+// fixture summaries into last-owner-activity.json, the owner-presence signal
+// the proactive loop reads. afterEach() unlinks the task files, but the
+// side effects (watcher event, owner-activity write) had already fired.
+//
+// Fix: redirect the workspace to a throwaway tmpdir BEFORE task-bridge.ts is
+// loaded. The bridge caches TASK_DIR/STATE_DIR at module-import time, so the
+// env var must be set first AND the import must be dynamic (a static import
+// is hoisted above this assignment). resolveWorkspace() reads the env live,
+// so TASK_DIR below also resolves into the tmpdir.
+const TMP_WORKSPACE = mkdtempSync(join(tmpdir(), 'sutando-format-test-'));
+process.env.SUTANDO_WORKSPACE = TMP_WORKSPACE;
+
+const TASK_DIR = join(TMP_WORKSPACE, 'tasks');
+
+// Populated by before() via dynamic import, once SUTANDO_WORKSPACE is set.
+let workTool: ToolDefinition;
 
 function listTaskFiles(): string[] {
 	if (!existsSync(TASK_DIR)) return [];
@@ -23,13 +40,16 @@ describe('task-bridge workTool — PR #460 unified format', () => {
 	let createdFiles: string[] = [];
 	let baselineFiles: Set<string>;
 
-	before(() => {
+	before(async () => {
+		// Dynamic import: task-bridge.ts resolves its TASK_DIR/STATE_DIR consts
+		// at module-init, so SUTANDO_WORKSPACE must already point at the tmpdir.
+		({ workTool } = await import('../src/task-bridge.js'));
 		mkdirSync(TASK_DIR, { recursive: true });
 		baselineFiles = new Set(listTaskFiles());
 	});
 
 	afterEach(() => {
-		// Clean up only the files we created; leave prod task files alone.
+		// Clean up only the files we created.
 		for (const fn of createdFiles) {
 			try { unlinkSync(join(TASK_DIR, fn)); } catch { /* already gone */ }
 		}
@@ -45,6 +65,8 @@ describe('task-bridge workTool — PR #460 unified format', () => {
 		const leaked: string[] = [];
 		for (const f of final) if (!baselineFiles.has(f)) leaked.push(f);
 		assert.deepEqual(leaked, [], 'test leaked task files: ' + leaked.join(', '));
+		// Drop the throwaway workspace entirely.
+		rmSync(TMP_WORKSPACE, { recursive: true, force: true });
 	});
 
 	async function invokeWorkTool(task: string): Promise<string> {
