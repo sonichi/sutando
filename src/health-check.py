@@ -670,6 +670,44 @@ def check_core_proactive_loop(threshold_sec: int = 600) -> dict:
     return {"name": name, "status": "ok", "detail": f"running ({age}s ago)"}
 
 
+def check_discord_voice() -> dict:
+    """Detect the discord-voice-server process — an on-demand voice session
+    process under skills/discord-voice/scripts/discord-voice-server.ts.
+
+    Like conversation-server, this is NOT a long-lived daemon: it's launched
+    per Discord voice session and SIGTERM'd by the `dismiss` tool when the
+    session ends. So "not running" is the expected steady state, not an error
+    — this returns a soft `warn` ("not running (on-demand)") when down and
+    `ok` when up, mirroring the conversation-server check. `warn` keeps it out
+    of the `N issue(s) found` error count (main() treats only down/missing/
+    not_loaded/fail as issues; warn is excluded).
+
+    Detection: `pgrep -f discord-voice-server` — the process has no listening
+    port, unlike conversation-server (port 3100), so it can't use check_port.
+    The detail string deliberately contains the word "running" in both states
+    so the dashboard's service filter (src/dashboard.py — keeps checks whose
+    detail mentions "port"/"running") surfaces it either way.
+    """
+    name = "discord-voice"
+    try:
+        result = subprocess.run(
+            ["/usr/bin/pgrep", "-f", "discord-voice-server"],
+            capture_output=True, text=True, timeout=5,
+        )
+        pids = [p for p in result.stdout.strip().split("\n") if p] if result.returncode == 0 else []
+    except (subprocess.TimeoutExpired, OSError):
+        pids = []
+    if pids:
+        check = {"name": name, "status": "ok", "detail": "running"}
+        mark_stale_if_outdated(
+            check,
+            REPO_DIR / "skills" / "discord-voice" / "scripts" / "discord-voice-server.ts",
+            "discord-voice-server.ts",
+        )
+        return check
+    return {"name": name, "status": "warn", "detail": "not running (on-demand)"}
+
+
 def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> dict:
     """Detect a task-queue pileup — tasks/ directory growing without
     being drained. Independent of which watcher / loop is dying: the queue
@@ -934,6 +972,12 @@ def run_all_checks() -> list[dict]:
             pass
 
         checks.append({"name": name, "status": status, "detail": detail})
+
+    # Discord voice server — on-demand process (launched per voice session,
+    # SIGTERM'd by the `dismiss` tool). Soft-warn when down, like
+    # conversation-server. Always checked: discord-voice can be started any
+    # time the discord-bridge / owner triggers a voice session.
+    checks.append(check_discord_voice())
 
     # Sutando menu bar app (optional — only check if binary exists)
     sutando_bin = REPO_DIR / "src" / "Sutando" / "Sutando"

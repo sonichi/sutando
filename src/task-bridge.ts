@@ -75,15 +75,19 @@ function ts(): string { return new Date().toISOString().slice(11, 23); }
 export function writeChatTask(taskDescription: string): string {
 	const taskId = `task-chat-${Date.now()}`;
 	const timestamp = new Date().toISOString();
+	// Field order: `task:` LAST so the user-supplied multi-line body
+	// can't forge header fields below it. Same shape as agent-api.py's
+	// /task endpoint after PR #982; consumers (`_isVoiceTask`,
+	// `parse_priority_from_text`) stop scanning at the first `task:`.
 	const content = [
 		`id: ${taskId}`,
 		`timestamp: ${timestamp}`,
-		`task: ${taskDescription}`,
 		`source: chat`,
 		`channel_id: local-chat`,
 		`user_id: ${process.env.SUTANDO_DM_OWNER_ID || 'chat-local'}`,
 		`access_tier: owner`,
 		`priority: normal`,
+		`task: ${taskDescription}`,
 		'',
 	].join('\n');
 	writeFileSync(join(TASK_DIR, `${taskId}.txt`), content);
@@ -143,11 +147,45 @@ export function _isVoiceTask(taskId: string): boolean {
 		if (!existsSync(p)) continue;
 		try {
 			const body = readFileSync(p, 'utf-8');
-			return body.split('\n').some(l => l.startsWith('channel_id: local-voice') || l.startsWith('source: voice'));
+			// Stop scanning at the first `task:` delimiter. The task-file
+			// format puts `task:` last on the line preceding the user-
+			// supplied multi-line task body (see agent-api.py and the
+			// /meeting handler). Without this stop, a body of
+			// `do thing\nchannel_id: local-voice` would forge a voice-
+			// task classification — the residual half of the PR #982
+			// fix Qingyun flagged. Stop-at-`task:` makes consumers
+			// honor the delimiter PR #982 already established.
+			const headerLines: string[] = [];
+			for (const l of body.split('\n')) {
+				if (l.startsWith('task:')) break;
+				headerLines.push(l);
+			}
+			return headerLines.some(l => l.startsWith('channel_id: local-voice') || l.startsWith('source: voice'));
 		} catch {}
 	}
 	return false;
 }
+
+/** Belt-suspenders guard for the result-watcher's unconditional fallthrough
+ * (issue #1035, follow-up to PR #1033). Returns true iff the filename is one
+ * that task-bridge legitimately delivers via `onResult()`. Rejects everything
+ * else — most importantly, the new `<channel-key>.task-{id}.txt` namespace
+ * PR #1033 introduced for the per-channel pull path (discord-voice / phone),
+ * which the per-channel scanner consumes itself.
+ *
+ * `proactive-*` IS allowed: per the long-standing proactive-voice rule,
+ * proactive messages are spoken by the voice agent when the client is
+ * connected (in parallel to discord-bridge's poll_proactive DM-delivery).
+ * That delivery has no explicit handler upstream in this watcher — the
+ * fallthrough IS the path — so blocking `proactive-*` here would silently
+ * disable voice-spoken proactive messages.
+ *
+ * Exported for unit testing — the watcher's setInterval body is otherwise
+ * awkward to exercise in isolation. */
+export function _shouldFallthrough(file: string): boolean {
+	return file.startsWith('task-') || file.startsWith('voice-') || file.startsWith('proactive-');
+}
+
 const _apiToken = process.env.SUTANDO_API_TOKEN || '';
 function _apiHeaders(): Record<string, string> {
 	const h: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -258,15 +296,20 @@ export const workTool: ToolDefinition = {
 		const taskId = `task-${Date.now()}`;
 		const timestamp = new Date().toISOString();
 		const ownerId = process.env.SUTANDO_DM_OWNER_ID || 'voice-local';
+		// Field order: `task:` LAST so the user-supplied (Gemini-relayed,
+		// possibly multi-line) task body can't forge header fields. Same
+		// shape as agent-api.py's /task endpoint after PR #982; consumers
+		// (`_isVoiceTask`, `parse_priority_from_text`) stop scanning at
+		// the first `task:` line.
 		const content =
 			`id: ${taskId}\n` +
 			`timestamp: ${timestamp}\n` +
-			`task: ${task}\n` +
 			`source: voice\n` +
 			`channel_id: local-voice\n` +
 			`user_id: ${ownerId}\n` +
 			`access_tier: owner\n` +
-			`priority: urgent\n`;
+			`priority: urgent\n` +
+			`task: ${task}\n`;
 		writeFileSync(join(TASK_DIR, `${taskId}.txt`), content);
 		// Resolve per-task timeout. 0 → no timeout. Negative or NaN → default.
 		// Cap at 6 hours to prevent runaway pending-state if the voice agent
@@ -413,16 +456,19 @@ export function startContextDropWatcher(onContextDrop: (content: string) => void
 					mkdirSync(TASK_DIR, { recursive: true });
 					const taskId = `task-${Date.now()}`;
 					const ownerId = process.env.SUTANDO_DM_OWNER_ID || 'voice-local';
+					// `task:` last so the (multi-line) context-drop body can't
+					// forge header fields. Same shape as the voice/chat task
+					// writers and agent-api.py's /task endpoint per PR #982.
 					writeFileSync(
 						join(TASK_DIR, `${taskId}.txt`),
 						`id: ${taskId}\n` +
 						`timestamp: ${new Date().toISOString()}\n` +
-						`task: User dropped context via hotkey. Process this:\n${content}\n` +
 						`source: context-drop\n` +
 						`channel_id: local-hotkey\n` +
 						`user_id: ${ownerId}\n` +
 						`access_tier: owner\n` +
-						`priority: normal\n`,
+						`priority: normal\n` +
+						`task: User dropped context via hotkey. Process this:\n${content}\n`,
 					);
 					unlinkSync(CONTEXT_DROP_FILE);
 					// Also inject into Gemini if available
@@ -679,6 +725,18 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 					// Other non-voice unsent results stay queued (their bridges deliver them)
 					continue;
 				}
+				// Belt-suspenders guard (issue #1035, follow-up to PR #1033):
+				// the fallthrough below fires onResult() for any non-empty .txt
+				// when the voice client is connected. PR #1033 introduced a new
+				// filename namespace `<channel-key>.task-{id}.txt` for the
+				// per-channel pull path used by discord-voice / phone — those
+				// files are NOT meant for task-bridge to inject into voice.
+				// PR #1033's mitigation is the per-channel scanner's
+				// read-and-delete winning the race; this guard closes the
+				// race by gating the fallthrough to filenames task-bridge
+				// legitimately consumes. See _shouldFallthrough for the
+				// allowlisted prefixes.
+				if (!_shouldFallthrough(file)) continue;
 				if (result) {
 					console.log(`${ts()} [TaskBridge] Result ${file}: ${result.slice(0, 100)}`);
 					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
