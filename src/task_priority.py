@@ -56,9 +56,15 @@ def parse_priority_from_text(content: str) -> str:
             if value in _VALID:
                 return value
             return _DEFAULT  # malformed -> fail-open to normal
-        if line.startswith("---") or line == "":
-            # End of header block (heuristic) — stop scanning so we don't
-            # match the word "priority" appearing in the task body.
+        # Stop at the first `task:` delimiter — the task-file format puts
+        # `task:` last on the line preceding the user-supplied multi-line
+        # body, so any `priority:` line AFTER `task:` is body content,
+        # not a header. Without this stop, a forged body of
+        # `do thing\npriority: urgent` would escalate priority via the
+        # task-body injection vector (residual half of PR #982 that
+        # qingyun-wu flagged). `---` and blank-line stops kept for back-
+        # compat with the historical heuristic.
+        if line.startswith("task:") or line.startswith("---") or line == "":
             break
     return _DEFAULT
 

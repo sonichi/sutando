@@ -47,7 +47,7 @@
 import { config as _dotenvConfig } from 'dotenv';
 _dotenvConfig({ path: new URL('../../../.env', import.meta.url).pathname, override: true });
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { mkdirSync, writeFileSync, appendFileSync, unlinkSync, existsSync, readFileSync, readdirSync, symlinkSync } from 'node:fs';
+import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, unlinkSync, existsSync, readFileSync, readdirSync, symlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { voiceApiKey } from '../../../src/voice-key.js';
@@ -84,6 +84,7 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '../../../src/inline-tools.js';
 import { recordSession, recordConversation } from '../../../src/conversation-store.js';
+import { resultBelongsTo } from '../../../src/result-channel-key.js';
 // Lazy vision-session handle. Only loaded if a call ever needs it — keeps the
 // phone-agent boot path free of the vision-tools.ts side-effects on cold start.
 let _setVisionSession: ((s: unknown) => void) | null = null;
@@ -125,13 +126,32 @@ const TASK_TIMEOUT_MS = 120_000;
 const OWNER_NAME = process.env.owner ?? '';
 const OWNER_NUMBER = process.env.OWNER_NUMBER ?? '';
 
-// Model configuration — text/STT model still env-driven; native-audio model
-// + googleSearch grounding live in skills/phone-conversation/config.json
-// (schema: src/voice-config.ts). Phone ships with the package default
-// 2.5+search:true.
+// Model configuration — text/STT model still env-driven; the native-audio
+// model + googleSearch grounding are per-user config: data, not code, so they
+// live in the workspace, NOT in the git repo.
+//   live config: $SUTANDO_WORKSPACE/config/phone-conversation.json
+//   template:    skills/phone-conversation/config.json.example (committed)
+// On first run, if the workspace config is missing, the committed .example
+// template is copied into place so the operator has a file to edit. If the
+// copy fails (or the template is gone), loadVoiceConfig falls back to its
+// built-in defaults (schema: src/voice-config.ts). Phone ships with the
+// package default 2.5+search:true.
 const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
 const _phoneSkillDir = dirname(dirname(fileURLToPath(import.meta.url)));
-const PHONE_VOICE_CONFIG = loadVoiceConfig(join(_phoneSkillDir, 'config.json'));
+const PHONE_VOICE_CONFIG_PATH = join(WORKSPACE_DIR, 'config', 'phone-conversation.json');
+if (!existsSync(PHONE_VOICE_CONFIG_PATH)) {
+	const _exampleConfigPath = join(_phoneSkillDir, 'config.json.example');
+	try {
+		mkdirSync(dirname(PHONE_VOICE_CONFIG_PATH), { recursive: true });
+		if (existsSync(_exampleConfigPath)) {
+			copyFileSync(_exampleConfigPath, PHONE_VOICE_CONFIG_PATH);
+			console.log(`${new Date().toISOString().slice(11, 23)} [phone-conversation] seeded config from template → ${PHONE_VOICE_CONFIG_PATH}`);
+		}
+	} catch (e) {
+		console.warn(`${new Date().toISOString().slice(11, 23)} [phone-conversation] could not seed config at ${PHONE_VOICE_CONFIG_PATH}: ${(e as Error).message} — using built-in defaults`);
+	}
+}
+const PHONE_VOICE_CONFIG = loadVoiceConfig(PHONE_VOICE_CONFIG_PATH);
 const VOICE_NATIVE_AUDIO_MODEL = PHONE_VOICE_CONFIG.model;
 const PHONE_GOOGLE_SEARCH = PHONE_VOICE_CONFIG.googleSearch;
 
@@ -279,6 +299,11 @@ interface CallSession {
 	// Observability: per-call metrics (startTime already on CallSession from #209)
 	toolCalls: { name: string; durationMs: number; timestamp: string }[];
 	events: { event: string; timestamp: string }[];
+	// Per-call channel-scan state (results/<callSid>.task-*.txt pull path).
+	channelScanHandle?: NodeJS.Timeout;
+	// Safety-net against silent unlinkSync failures — `name -> first-seen ms`,
+	// pruned at 60s/tick so it can't grow unbounded for long calls.
+	channelScanSeen?: Map<string, number>;
 }
 
 const activeCalls = new Map<string, CallSession>();
@@ -933,6 +958,69 @@ async function createCallSession(params: {
 		import('../../../skills/screen-record/scripts/narration-tee.js').then(m => m.cleanup()).catch(() => {});
 	};
 
+	// --- Per-call pull path for non-delegated task results -----------------
+	// Regular `work`-tool delegations land at `results/task-phone-*.txt` and
+	// are claimed by the per-task poll in delegateTask(). This separate scan
+	// picks up the scoped namespace `results/<callSid>.task-*.txt` — used
+	// when the core agent (or another tool) needs to deliver a result to THIS
+	// specific call without having delegated through the work tool. Existing
+	// consumers' patterns don't match the `<callSid>.` prefix, so a file in
+	// this namespace is invisible to them — only this scan and the matching
+	// discord-voice scan claim it.
+	//
+	// Scoped by callSid so different concurrent calls never cross — a
+	// parent-call result can't land in the child call's session and vice
+	// versa. Cadence is 3s (cross-surface handoffs, not turn-taking). Read-
+	// and-delete mirrors delegateTask()'s fail-soft style.
+	callSession.channelScanSeen = new Map();
+	const CHANNEL_SCAN_TTL_MS = 60_000;
+	callSession.channelScanHandle = setInterval(() => {
+		if (callSession.hangingUp || !activeCalls.has(callSession.callSid)) return;
+		// Prune entries older than the TTL so the map doesn't grow unbounded
+		// during long calls.
+		const cutoff = Date.now() - CHANNEL_SCAN_TTL_MS;
+		for (const [k, ts0] of callSession.channelScanSeen!) {
+			if (ts0 < cutoff) callSession.channelScanSeen!.delete(k);
+		}
+		let entries: string[];
+		try {
+			entries = readdirSync(RESULTS_DIR);
+		} catch {
+			return;
+		}
+		for (const name of entries) {
+			// .txt guard — never touch a writer's atomic-write temp
+			// (`<callSid>.task-X.txt.tmp`, `.sending`, `.partial`, etc).
+			// Belt-and-suspenders: `resultBelongsTo` also gates on .txt.
+			if (!name.endsWith('.txt')) continue;
+			if (callSession.channelScanSeen!.has(name)) continue;
+			if (!resultBelongsTo(name, callSession.callSid)) continue;
+			callSession.channelScanSeen!.set(name, Date.now());
+			const full = join(RESULTS_DIR, name);
+			let body: string;
+			try {
+				body = readFileSync(full, 'utf-8').trim();
+			} catch {
+				continue;
+			}
+			if (!body) {
+				try { unlinkSync(full); } catch {}
+				continue;
+			}
+			console.log(`${ts()} [ChannelScan] picked up ${name} for ${callSession.callSid} (${body.length}B)`);
+			callSession.events.push({ event: `channel_result:${name}`, timestamp: new Date().toISOString() });
+			try {
+				(callSession.voiceSession as any).transport.sendContent(
+					[{ role: 'user', text: `[Channel result]\n${body}\n\nReport this result to the caller now.` }],
+					true,
+				);
+			} catch (e) {
+				console.log(`${ts()} [ChannelScan] inject failed for ${name}: ${e}`);
+			}
+			try { unlinkSync(full); } catch {}
+		}
+	}, 3000);
+
 	return callSession;
 }
 
@@ -948,6 +1036,7 @@ function cleanupCall(callSid: string): void {
 
 	import('../../../src/browser-tools.js').then(bt => bt.onCallEnd()).catch(() => {});
 	session.cleanupNarration?.();
+	try { if (session.channelScanHandle) clearInterval(session.channelScanHandle); } catch {}
 	try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
 	try { unlinkSync('/tmp/sutando-playback-path'); } catch {}
 
