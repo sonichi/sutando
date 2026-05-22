@@ -54,6 +54,10 @@ skills/schedule-crons/crons.json
 # ships only the *.example templates — never commit a live config here.
 src/voice-agent.config.json
 skills/phone-conversation/config.json
+# discord-voice config is per-user data (Discord channel ids, owner-mode) and
+# lives in $SUTANDO_WORKSPACE/config/discord-voice.json. The repo ships only
+# config.json.example as a template — never commit a live config.json here.
+skills/discord-voice/config.json
 src/Sutando/Sutando
 # NativeMic.swift was removed in PR #329 and keeps getting re-added by
 # search-and-replace sweeps that leave a stale copy in the working tree

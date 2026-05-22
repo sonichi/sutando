@@ -60,17 +60,29 @@ DISCORD_VOICE_SERVER=1 \
 
 Optional env:
 - `VOICE_MODEL` / `VOICE_NATIVE_AUDIO_MODEL` — mirrors `voice-agent.ts`.
-- `SUTANDO_WORKSPACE` — workspace root for tasks/results/data/logs.
+- `SUTANDO_WORKSPACE` — workspace root for tasks/results/data/logs **and the per-user config** (see below).
+
 `DISCORD_VOICE_SERVER=1` flips the polymorphic `dismiss` tool (`src/meeting-tools.ts`) into "SIGTERM self" mode instead of its default Zoom AppleScript path. Without it, asking Sutando to "leave"/"dismiss" in the channel would try to leave a (non-existent) Zoom meeting.
 
-## Owner-mode config
+## Config — per-user, lives in the workspace
 
-Owner-mode is set in `skills/discord-voice/config.json` (not an env var). Two keys:
+This skill's config carries **per-user data** (your Discord channel ids, your owner-mode choices), so it does NOT live in the git repo. It lives in the workspace:
 
-- `owner_mode` — skill-wide default (boolean). `false` by default.
+```
+$SUTANDO_WORKSPACE/config/discord-voice.json
+```
+
+(default `~/.sutando/workspace/config/discord-voice.json`; `$SUTANDO_WORKSPACE` is resolved by the canonical workspace helper).
+
+The repo ships a committed **template** — `skills/discord-voice/config.json.example` — with the safe defaults. On first run, if the workspace config is missing, the server copies the template into place; you then edit the workspace copy. (If the copy can't happen, the server falls back to the built-in defaults — `owner_mode: false`, every channel read-only.) **Never commit a live `discord-voice.json` back into the repo** — it's per-user data, not code.
+
+Keys:
+
+- `model` / `googleSearch` — voice model + Web-grounding preference (defaults: `gemini-2.5-flash-native-audio-preview-12-2025`, `true`).
+- `owner_mode` — skill-wide owner-mode default (boolean). `false` by default.
 - `channels` — per-voice-channel override map: `{ "<voice_channel_id>": { "owner_mode": true } }`. The channel entry is an object so it stays extensible.
 
-Resolution for a given channel: `channels[<channel_id>].owner_mode` if that entry exists, else the skill-wide `owner_mode`, else `false`. A fresh `config.json` (`owner_mode: false`, `channels: {}`) runs every channel read-only.
+Resolution for a given channel: `channels[<channel_id>].owner_mode` if that entry exists, else the skill-wide `owner_mode`, else `false`. A fresh config (`owner_mode: false`, `channels: {}`) runs every channel read-only.
 
 ```json
 {
@@ -87,7 +99,7 @@ Resolution for a given channel: `channels[<channel_id>].owner_mode` if that entr
 
 `owner_mode: false` is the **safe default**: non-owner speakers in the voice channel get the read-only tool surface (current time, status checks, lookups) but NOT owner-tier `work`, file edits, or message sends.
 
-`owner_mode: true` — whether set skill-wide or per-channel via `channels` — is the opt-in for **single-operator personal-use mode**: it inherits owner-tier privileges to every speaker in the channel. It has a sharp edge — anyone who can speak in the same voice channel can delegate `work`, edit files, send messages, anything the proactive loop can do. Only enable it for voice channels whose membership is fully trusted (your own Lounge, never community/public). Prefer the per-channel `channels` override over the skill-wide `owner_mode` so a trusted-channel grant doesn't leak to every channel the bot joins.
+`owner_mode: true` — whether set skill-wide or per-channel via `channels` — is the opt-in for **single-operator personal-use mode**: it inherits owner-tier privileges to every speaker in the channel. It has a sharp edge — anyone who can speak in the same voice channel can delegate `work`, edit files, send messages, anything the proactive loop can do. Only enable it for voice channels whose membership is fully trusted (your own Lounge, never community/public). Prefer the per-channel `channels` override over the skill-wide `owner_mode` so a trusted-channel grant doesn't leak to every channel the bot joins. Set it in the workspace config (`$SUTANDO_WORKSPACE/config/discord-voice.json`), never the committed `.example` template.
 
 ## Trust boundary — per-speaker access tiers
 

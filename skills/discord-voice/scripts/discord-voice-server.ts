@@ -21,13 +21,16 @@
  * ## Env
  *   DISCORD_BOT_TOKEN  — bot token (~/.claude/channels/discord/.env)
  *   GEMINI_API_KEY (or GEMINI_VOICE_API_KEY) — required; voiceApiKey()
- *   VOICE_MODEL — text/STT model; native-audio model + googleSearch live
- *                 in skills/discord-voice/config.json (see src/voice-config.ts)
- *   SUTANDO_WORKSPACE  — workspace root for tasks/results/data
+ *   VOICE_MODEL — text/STT model; native-audio model + googleSearch +
+ *                 owner_mode/channels live in the per-user config at
+ *                 $SUTANDO_WORKSPACE/config/discord-voice.json — NOT a
+ *                 committed repo file (the repo ships config.json.example
+ *                 as a template; see src/voice-config.ts for the schema)
+ *   SUTANDO_WORKSPACE  — workspace root for tasks/results/data + config
  */
 
 import { config as _dotenvConfig } from 'dotenv';
-import { mkdirSync, writeFileSync, appendFileSync, existsSync, readFileSync, unlinkSync } from 'node:fs';
+import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { resolveWorkspace } from '../../../src/workspace_default.js';
 import { recordConversation, recordSession } from '../../../src/conversation-store.js';
@@ -81,10 +84,29 @@ const TASK_POLL_TIMEOUT_MS = 300_000;
 const OWNER_NAME = process.env.owner ?? '';
 
 const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
-// Per-skill voice config (native-audio model + googleSearch) lives in
-// skills/discord-voice/config.json. Schema + defaults: src/voice-config.ts.
+// Per-user voice config (native-audio model + googleSearch + owner_mode +
+// channels) is data, not code: it lives in the workspace, NOT in the git repo.
+//   live config: $SUTANDO_WORKSPACE/config/discord-voice.json
+//   template:    skills/discord-voice/config.json.example (committed)
+// On first run, if the workspace config is missing, the committed .example
+// template is copied into place so the operator has a file to edit. If the
+// copy fails (or the template is gone), loadVoiceConfig falls back to its
+// built-in safe defaults. Schema + defaults: src/voice-config.ts.
 const _discordSkillDir = dirname(dirname(fileURLToPath(import.meta.url)));
-const DISCORD_VOICE_CONFIG = loadVoiceConfig(join(_discordSkillDir, 'config.json'));
+const DISCORD_VOICE_CONFIG_PATH = join(WORKSPACE_DIR, 'config', 'discord-voice.json');
+if (!existsSync(DISCORD_VOICE_CONFIG_PATH)) {
+	const _exampleConfigPath = join(_discordSkillDir, 'config.json.example');
+	try {
+		mkdirSync(dirname(DISCORD_VOICE_CONFIG_PATH), { recursive: true });
+		if (existsSync(_exampleConfigPath)) {
+			copyFileSync(_exampleConfigPath, DISCORD_VOICE_CONFIG_PATH);
+			console.log(`${new Date().toISOString().slice(11, 23)} [discord-voice] seeded config from template → ${DISCORD_VOICE_CONFIG_PATH}`);
+		}
+	} catch (e) {
+		console.warn(`${new Date().toISOString().slice(11, 23)} [discord-voice] could not seed config at ${DISCORD_VOICE_CONFIG_PATH}: ${(e as Error).message} — using built-in defaults`);
+	}
+}
+const DISCORD_VOICE_CONFIG = loadVoiceConfig(DISCORD_VOICE_CONFIG_PATH);
 const VOICE_NATIVE_AUDIO_MODEL = DISCORD_VOICE_CONFIG.model;
 const DISCORD_VOICE_GOOGLE_SEARCH = DISCORD_VOICE_CONFIG.googleSearch;
 
@@ -109,8 +131,9 @@ function getArg(name: string): string | undefined {
 const GUILD_ID = getArg('guild');
 const CHANNEL_ID = getArg('channel');
 
-// Owner-mode (issue #1016) — resolved from skills/discord-voice/config.json,
-// NOT an env var. Resolution order:
+// Owner-mode (issue #1016) — resolved from the workspace config
+// ($SUTANDO_WORKSPACE/config/discord-voice.json), NOT an env var and NOT a
+// committed repo file. Resolution order:
 //   1. config.channels[CHANNEL_ID].owner_mode  (per-channel override)
 //   2. config.owner_mode                       (skill-wide default)
 //   3. false                                   (safe default)
