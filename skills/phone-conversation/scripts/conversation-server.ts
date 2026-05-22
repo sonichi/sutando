@@ -48,7 +48,10 @@ import { config as _dotenvConfig } from 'dotenv';
 _dotenvConfig({ path: new URL('../../../.env', import.meta.url).pathname, override: true });
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { mkdirSync, writeFileSync, appendFileSync, unlinkSync, existsSync, readFileSync, readdirSync, symlinkSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { voiceApiKey } from '../../../src/voice-key.js';
+import { loadVoiceConfig } from '../../../src/voice-config.js';
 import { hostname } from 'node:os';
 import { resolveWorkspace } from '../../../src/workspace_default.js';
 
@@ -104,7 +107,10 @@ function detachVisionFromCall(): void {
 
 // --- Config ---
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY ?? '';
+// Voice surfaces share the GEMINI_VOICE_API_KEY → GEMINI_API_KEY fallback
+// chain via voiceApiKey() (src/voice-key.ts). VOICE-key path isolates voice
+// billing onto a paid-tier key; MAIN-key fallback preserves single-key setup.
+const GEMINI_API_KEY = voiceApiKey();
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID ?? '';
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN ?? '';
 const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER ?? '';
@@ -118,9 +124,15 @@ const TASK_TIMEOUT_MS = 120_000;
 const OWNER_NAME = process.env.owner ?? '';
 const OWNER_NUMBER = process.env.OWNER_NUMBER ?? '';
 
-// Model configuration — override via .env
+// Model configuration — text/STT model still env-driven; native-audio model
+// + googleSearch grounding live in skills/phone-conversation/config.json
+// (schema: src/voice-config.ts). Phone ships with the package default
+// 2.5+search:true.
 const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
-const VOICE_NATIVE_AUDIO_MODEL = process.env.VOICE_NATIVE_AUDIO_MODEL || 'gemini-3.1-flash-live-preview';
+const _phoneSkillDir = dirname(dirname(fileURLToPath(import.meta.url)));
+const PHONE_VOICE_CONFIG = loadVoiceConfig(join(_phoneSkillDir, 'config.json'));
+const VOICE_NATIVE_AUDIO_MODEL = PHONE_VOICE_CONFIG.model;
+const PHONE_GOOGLE_SEARCH = PHONE_VOICE_CONFIG.googleSearch;
 
 /** Normalize phone number to digits only for comparison (strips +, -, spaces, parens) */
 function normalizePhone(num: string): string {
@@ -643,7 +655,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 		name: 'phone',
 		instructions,
 		tools,
-		googleSearch: true,
+		googleSearch: PHONE_GOOGLE_SEARCH,
 		// Greeting is injected as role:"user" by bodhi to trigger Gemini to speak.
 		// Use directive prefix so Gemini speaks the text verbatim instead of responding to it.
 		greeting: callSession.isMeeting
@@ -712,7 +724,7 @@ async function createCallSession(params: {
 		host: '127.0.0.1',
 		model: google(VOICE_MODEL),
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
-		googleSearch: true,
+		googleSearch: PHONE_GOOGLE_SEARCH,
 		speechConfig: { voiceName: 'Aoede' },
 		hooks: {
 			onToolCall: (e) => {

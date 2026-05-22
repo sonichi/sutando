@@ -20,8 +20,9 @@
  *
  * ## Env
  *   DISCORD_BOT_TOKEN  — bot token (~/.claude/channels/discord/.env)
- *   GEMINI_API_KEY     — required
- *   VOICE_MODEL / VOICE_NATIVE_AUDIO_MODEL — mirrors voice-agent.ts
+ *   GEMINI_API_KEY (or GEMINI_VOICE_API_KEY) — required; voiceApiKey()
+ *   VOICE_MODEL — text/STT model; native-audio model + googleSearch live
+ *                 in skills/discord-voice/config.json (see src/voice-config.ts)
  *   SUTANDO_WORKSPACE  — workspace root for tasks/results/data
  */
 
@@ -35,6 +36,8 @@ _dotenvConfig({ path: new URL('../../../.env', import.meta.url).pathname, overri
 _dotenvConfig({ path: join(process.env.HOME ?? '', '.claude/channels/discord/.env'), override: false });
 
 import { fileURLToPath } from 'node:url';
+import { voiceApiKey } from '../../../src/voice-key.js';
+import { loadVoiceConfig } from '../../../src/voice-config.js';
 import { execSync, spawn } from 'node:child_process';
 import { VoiceSession, type ToolDefinition, type MainAgent } from 'bodhi-realtime-agent';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
@@ -64,7 +67,9 @@ import {
 
 // --- Config ---
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY ?? '';
+// Voice surfaces share the GEMINI_VOICE_API_KEY → GEMINI_API_KEY fallback
+// chain via voiceApiKey() (src/voice-key.ts).
+const GEMINI_API_KEY = voiceApiKey();
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN ?? '';
 const WORKSPACE_DIR = resolveWorkspace();
 const DATA_DIR = join(WORKSPACE_DIR, 'data');
@@ -75,8 +80,12 @@ const TASK_POLL_TIMEOUT_MS = 300_000;
 const OWNER_NAME = process.env.owner ?? '';
 
 const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
-const VOICE_NATIVE_AUDIO_MODEL =
-	process.env.VOICE_NATIVE_AUDIO_MODEL || 'gemini-3.1-flash-live-preview';
+// Per-skill voice config (native-audio model + googleSearch) lives in
+// skills/discord-voice/config.json. Schema + defaults: src/voice-config.ts.
+const _discordSkillDir = dirname(dirname(fileURLToPath(import.meta.url)));
+const DISCORD_VOICE_CONFIG = loadVoiceConfig(join(_discordSkillDir, 'config.json'));
+const VOICE_NATIVE_AUDIO_MODEL = DISCORD_VOICE_CONFIG.model;
+const DISCORD_VOICE_GOOGLE_SEARCH = DISCORD_VOICE_CONFIG.googleSearch;
 
 // Hung-session watchdog threshold. A Gemini Live session can silently stall —
 // audio keeps flowing in but it stops emitting turn.end, with no transport
@@ -424,7 +433,7 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 		name: 'discord-voice',
 		instructions,
 		tools,
-		googleSearch: true,
+		googleSearch: DISCORD_VOICE_GOOGLE_SEARCH,
 		greeting: '',
 	};
 }
@@ -606,7 +615,7 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 		host: '127.0.0.1',
 		model: google(VOICE_MODEL),
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
-		googleSearch: true,
+		googleSearch: DISCORD_VOICE_GOOGLE_SEARCH,
 		speechConfig: { voiceName: 'Aoede' },
 		hooks: {
 			onToolCall: (e) => {
