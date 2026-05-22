@@ -103,18 +103,15 @@ HAND_ROLLED_COMPOSITION = re.compile(
     # Python/JS: literal `.sutando/workspace/<token>` in a string —
     # bypasses resolve_workspace() entirely.
     rf'\.sutando/workspace/(?:{_SLASH})\b|'
-    # JS: `path.join(REPO_ROOT, '<token>')` style where REPO_ROOT is a
-    # __file__-like fallback. Matches as a heuristic if the file ALSO
-    # has the fallback definition (checked separately).
+    # JS: `path.join(REPO_ROOT, '<token>')` style where REPO_ROOT names
+    # itself as a fallback. The variable names (`REPO_ROOT` / `repoRoot`
+    # / `FALLBACK_ROOT`) are strong-enough signals on their own — a
+    # legitimate workspace root in this codebase would be named
+    # `WORKSPACE_DIR` / `workspace` / `repo` and is matched by the
+    # earlier alternation; these three names are reserved by convention
+    # for fallback roots.
     rf'(?:REPO_ROOT|repoRoot|FALLBACK_ROOT)\s*[,/]\s*["\'](?:{_SLASH})["\']'
     r')'
-)
-
-# Detection of the fallback DEFINITION (separate from use). Fires only
-# on substantive code lines (not comments) — the prose mention of the
-# workspace path in module docstrings is legitimate.
-FALLBACK_DEFINITION = re.compile(
-    r'Path\(__file__\)(?:\.resolve\(\))?\.parent\.parent'
 )
 
 # Canonical accessors. A file that references runtime-state must use
