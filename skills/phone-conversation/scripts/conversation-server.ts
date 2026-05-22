@@ -301,7 +301,9 @@ interface CallSession {
 	events: { event: string; timestamp: string }[];
 	// Per-call channel-scan state (results/<callSid>.task-*.txt pull path).
 	channelScanHandle?: NodeJS.Timeout;
-	channelScanSeen?: Set<string>;
+	// Safety-net against silent unlinkSync failures — `name -> first-seen ms`,
+	// pruned at 60s/tick so it can't grow unbounded for long calls.
+	channelScanSeen?: Map<string, number>;
 }
 
 const activeCalls = new Map<string, CallSession>();
@@ -962,9 +964,16 @@ async function createCallSession(params: {
 	// parent-call result can't land in the child call's session and vice
 	// versa. Cadence is 3s (cross-surface handoffs, not turn-taking). Read-
 	// and-delete mirrors delegateTask()'s fail-soft style.
-	callSession.channelScanSeen = new Set();
+	callSession.channelScanSeen = new Map();
+	const CHANNEL_SCAN_TTL_MS = 60_000;
 	callSession.channelScanHandle = setInterval(() => {
 		if (callSession.hangingUp || !activeCalls.has(callSession.callSid)) return;
+		// Prune entries older than the TTL so the map doesn't grow unbounded
+		// during long calls.
+		const cutoff = Date.now() - CHANNEL_SCAN_TTL_MS;
+		for (const [k, ts0] of callSession.channelScanSeen!) {
+			if (ts0 < cutoff) callSession.channelScanSeen!.delete(k);
+		}
 		let entries: string[];
 		try {
 			entries = readdirSync(RESULTS_DIR);
@@ -972,9 +981,13 @@ async function createCallSession(params: {
 			return;
 		}
 		for (const name of entries) {
+			// .txt guard — never touch a writer's atomic-write temp
+			// (`<callSid>.task-X.txt.tmp`, `.sending`, `.partial`, etc).
+			// Belt-and-suspenders: `resultBelongsTo` also gates on .txt.
+			if (!name.endsWith('.txt')) continue;
 			if (callSession.channelScanSeen!.has(name)) continue;
 			if (!resultBelongsTo(name, callSession.callSid)) continue;
-			callSession.channelScanSeen!.add(name);
+			callSession.channelScanSeen!.set(name, Date.now());
 			const full = join(RESULTS_DIR, name);
 			let body: string;
 			try {

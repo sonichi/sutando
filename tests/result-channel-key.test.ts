@@ -113,6 +113,45 @@ describe('resultBelongsTo', () => {
 		assert.equal(resultBelongsTo('proactive-1700000000.txt', 'anything'), false);
 		assert.equal(resultBelongsTo('1485653767402553457.proactive-foo.txt', '1485653767402553457'), false);
 	});
+
+	// Partial-write race: a writer's atomic-write temp file (`<key>.task-X.txt.tmp`,
+	// `.sending`, `.partial`, etc.) must NEVER match — picking it up would inject a
+	// half-written body and orphan the rename target. The scan loops also gate on
+	// `.endsWith('.txt')`, but lock the invariant at the helper too.
+	it('rejects atomic-write temp suffixes (partial-write race)', () => {
+		const KEY = '1485653767402553457';
+		const tempSuffixes = [
+			'1485653767402553457.task-discord-voice-1700000000.txt.tmp',
+			'1485653767402553457.task-discord-voice-1700000000.txt.partial',
+			'1485653767402553457.task-discord-voice-1700000000.txt.sending',
+			'1485653767402553457.task-discord-voice-1700000000.txt.swp',
+			'1485653767402553457.task-discord-voice-1700000000.txt.lock',
+			'1485653767402553457.task-discord-voice-1700000000.txt~',
+			'1485653767402553457.task-discord-voice-1700000000.sending',
+			'1485653767402553457.task-discord-voice-1700000000.tmp',
+			'1485653767402553457.task-discord-voice-1700000000.partial',
+			'.1485653767402553457.task-discord-voice-1700000000.txt', // dotfile prefix (vim swap, atomic-write idioms)
+		];
+		for (const f of tempSuffixes) {
+			assert.equal(
+				resultBelongsTo(f, KEY),
+				false,
+				`resultBelongsTo should reject ${f} (partial-write temp)`,
+			);
+		}
+	});
+
+	// Sanity-check: the canonical `.txt` form for the same key still matches —
+	// the temp-suffix rejection didn't accidentally over-reject.
+	it('still matches the canonical .txt form', () => {
+		assert.equal(
+			resultBelongsTo(
+				'1485653767402553457.task-discord-voice-1700000000.txt',
+				'1485653767402553457',
+			),
+			true,
+		);
+	});
 });
 
 // --- The load-bearing invariant: existing consumers don't see new files ---

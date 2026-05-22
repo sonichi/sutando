@@ -67,7 +67,16 @@ def result_belongs_to(filename: str, channel_key: str) -> bool:
     Legacy flat ``task-{id}.txt`` files return False — they're owned by
     their delegating consumer (discord-bridge / task-bridge / etc), NOT by
     a per-channel scan.
+
+    Requires an EXACT ``.txt`` suffix. Atomic-write temps like
+    ``<key>.task-X.txt.tmp``, ``.sending``, ``.partial`` etc. must NOT
+    match — reading/unlinking a writer's in-flight temp before the rename
+    completes would inject a half-written body and orphan the rename
+    target. The scan loops also gate on ``endswith('.txt')`` as belt-and-
+    suspenders.
     """
+    if not filename.endswith(".txt"):
+        return False
     key, task_id = parse_result_filename(filename)
     if key is None:
         return False

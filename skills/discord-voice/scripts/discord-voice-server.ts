@@ -878,9 +878,20 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 	// since this path is for cross-surface handoffs, not in-conversation
 	// turn-taking. Read-and-delete mirrors delegateTask()'s fail-soft style.
 	const channelKey = CHANNEL_ID!;
-	const channelScanSeen = new Set<string>();
+	// Safety-net against silent unlinkSync failures (the unlink below is wrapped
+	// in try/catch so a failed delete won't surface — without this map we'd
+	// re-deliver the same body every 3s). Stored as `name -> first-seen ms`
+	// and pruned at 60s/tick so the map can't grow unbounded. Map (not Set) so
+	// the prune is O(seen) per tick without a parallel structure.
+	const channelScanSeen = new Map<string, number>();
+	const CHANNEL_SCAN_TTL_MS = 60_000;
 	const channelScan = setInterval(() => {
 		if (s.closing || active !== s) return;
+		// Prune entries older than the TTL so the map doesn't grow unbounded.
+		const cutoff = Date.now() - CHANNEL_SCAN_TTL_MS;
+		for (const [k, ts0] of channelScanSeen) {
+			if (ts0 < cutoff) channelScanSeen.delete(k);
+		}
 		let entries: string[];
 		try {
 			entries = readdirSync(RESULTS_DIR);
@@ -888,9 +899,13 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 			return;
 		}
 		for (const name of entries) {
+			// .txt guard — never touch a writer's atomic-write temp
+			// (`<key>.task-X.txt.tmp`, `.sending`, `.partial`, etc).
+			// Belt-and-suspenders: `resultBelongsTo` also gates on .txt.
+			if (!name.endsWith('.txt')) continue;
 			if (channelScanSeen.has(name)) continue;
 			if (!resultBelongsTo(name, channelKey)) continue;
-			channelScanSeen.add(name);
+			channelScanSeen.set(name, Date.now());
 			const full = join(RESULTS_DIR, name);
 			let body: string;
 			try {

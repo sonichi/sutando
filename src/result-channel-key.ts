@@ -65,8 +65,15 @@ export function parseResultFilename(filename: string): [string | null, string] {
  * Legacy flat `task-{id}.txt` files return false — they're owned by their
  * delegating consumer (discord-bridge / task-bridge / etc), NOT by a
  * per-channel scan.
+ *
+ * Requires an EXACT `.txt` suffix. Atomic-write temps like
+ * `<key>.task-X.txt.tmp`, `.sending`, `.partial` etc. must NOT match —
+ * reading/unlinking a writer's in-flight temp before the rename completes
+ * would inject a half-written body and orphan the rename target. The scan
+ * loops also gate on `.endsWith('.txt')` as belt-and-suspenders.
  */
 export function resultBelongsTo(filename: string, channelKey: string): boolean {
+	if (!filename.endsWith('.txt')) return false;
 	const [key, taskId] = parseResultFilename(filename);
 	if (key === null) return false;
 	if (!taskId.startsWith('task-')) return false;

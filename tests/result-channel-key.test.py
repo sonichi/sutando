@@ -118,6 +118,42 @@ class TestResultBelongsTo(unittest.TestCase):
             )
         )
 
+    def test_rejects_atomic_write_temp_suffixes(self):
+        """Partial-write race: a writer's atomic-write temp file
+        (``<key>.task-X.txt.tmp``, ``.sending``, ``.partial``, etc.) must
+        NEVER match — picking it up would inject a half-written body and
+        orphan the rename target. The scan loops also gate on
+        ``endswith('.txt')``, but lock the invariant at the helper too."""
+        key = "1485653767402553457"
+        temp_suffixes = [
+            "1485653767402553457.task-discord-voice-1700000000.txt.tmp",
+            "1485653767402553457.task-discord-voice-1700000000.txt.partial",
+            "1485653767402553457.task-discord-voice-1700000000.txt.sending",
+            "1485653767402553457.task-discord-voice-1700000000.txt.swp",
+            "1485653767402553457.task-discord-voice-1700000000.txt.lock",
+            "1485653767402553457.task-discord-voice-1700000000.txt~",
+            "1485653767402553457.task-discord-voice-1700000000.sending",
+            "1485653767402553457.task-discord-voice-1700000000.tmp",
+            "1485653767402553457.task-discord-voice-1700000000.partial",
+            # dotfile prefix (vim swap, atomic-write idioms)
+            ".1485653767402553457.task-discord-voice-1700000000.txt",
+        ]
+        for f in temp_suffixes:
+            self.assertFalse(
+                result_belongs_to(f, key),
+                f"result_belongs_to should reject {f} (partial-write temp)",
+            )
+
+    def test_still_matches_canonical_txt(self):
+        """Sanity-check: canonical `.txt` form still matches — the
+        temp-suffix rejection didn't accidentally over-reject."""
+        self.assertTrue(
+            result_belongs_to(
+                "1485653767402553457.task-discord-voice-1700000000.txt",
+                "1485653767402553457",
+            )
+        )
+
 
 class TestExistingConsumersDoNotMatch(unittest.TestCase):
     """Load-bearing invariant. A scoped filename must NOT match any
