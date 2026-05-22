@@ -66,9 +66,18 @@ export const summonTool: ToolDefinition = {
 				// 2026-04-29 after a phone-summon test where the meeting never
 				// actually opened on Studio.
 				console.log(`${ts()} [Summon] Joining via zoommtg:// deeplink`);
+				// URL-encode the passcode — arbitrary string from the caller
+				// (Gemini tool arg or $ZOOM_PERSONAL_PASSCODE). Pre-fix it was
+				// spliced raw into BOTH the URL AND a shell command, so a
+				// passcode like `"; rm -rf ~/.config; #` would break out of
+				// the quoted shell argument and execute. cleanId is digit-only
+				// (`.replace(/\D/g, '')`) so safe; pwd needs the encode pass.
 				let zoomUrl = `zoommtg://zoom.us/join?confno=${cleanId}`;
-				if (pwd) zoomUrl += `&pwd=${pwd}`;
-				execSync(`open "${zoomUrl}"`, { timeout: 10_000 });
+				if (pwd) zoomUrl += `&pwd=${encodeURIComponent(pwd)}`;
+				// execFileSync — `open` receives the URL as a single argv
+				// entry, never spliced into a shell string. Closes the shell-
+				// injection class entirely.
+				execFileSync('open', [zoomUrl], { timeout: 10_000 });
 
 				// Wait briefly for Zoom to register the deeplink, then enter the
 				// combined Join-and-wait-for-meeting loop below. Per Mini's PR #546
@@ -375,12 +384,15 @@ export const joinZoomTool: ToolDefinition = {
 
 			if (!alreadyIn) {
 				const zoomRunning = (() => { try { execSync('pgrep -f "zoom.us"', { timeout: 2_000 }); return true; } catch { return false; } })();
+				// Same shell-injection fix as the summonTool join path above —
+				// pwd is arbitrary caller input. URL-encode + execFileSync.
 				if (zoomRunning) {
-					execSync(`open "https://zoom.us/j/${cleanId}${pwd ? '?pwd=' + pwd : ''}"`, { timeout: 10_000 });
+					const webUrl = `https://zoom.us/j/${cleanId}${pwd ? `?pwd=${encodeURIComponent(pwd)}` : ''}`;
+					execFileSync('open', [webUrl], { timeout: 10_000 });
 				} else {
 					let zoomUrl = `zoommtg://zoom.us/join?confno=${cleanId}`;
-					if (pwd) zoomUrl += `&pwd=${pwd}`;
-					execSync(`open "${zoomUrl}"`, { timeout: 10_000 });
+					if (pwd) zoomUrl += `&pwd=${encodeURIComponent(pwd)}`;
+					execFileSync('open', [zoomUrl], { timeout: 10_000 });
 				}
 
 				// Click Join button if preview window appears
