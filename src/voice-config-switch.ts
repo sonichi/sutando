@@ -7,9 +7,9 @@
  * user-visible flow is: spoken command → ack → ~2-3s silence → voice
  * back with new model.
  *
- * Presets:
- *   - 'search' → 2.5-flash-native-audio + googleSearch:true  (Web grounding)
- *   - 'code'   → 3.1-flash-live-preview + googleSearch:false (newer model, no Web)
+ * Presets (named after the only knob that matters — Web grounding):
+ *   - 'search'    → 2.5-flash-native-audio + googleSearch:true  (Web grounding ON)
+ *   - 'no-search' → 3.1-flash-live-preview + googleSearch:false (newer model, no Web)
  *
  * The tool returns BEFORE the kickstart fires (small setTimeout) so Gemini
  * can speak the ack before the transport closes. Kickstart kills this
@@ -24,9 +24,9 @@ import { spawn } from 'node:child_process';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { VOICE_CONFIG_DEFAULTS, type VoiceConfig } from './voice-config.js';
 
-const PRESETS: Record<'search' | 'code', VoiceConfig> = {
+const PRESETS: Record<'search' | 'no-search', VoiceConfig> = {
 	search: { model: 'gemini-2.5-flash-native-audio-preview-12-2025', googleSearch: true },
-	code: { model: 'gemini-3.1-flash-live-preview', googleSearch: false },
+	'no-search': { model: 'gemini-3.1-flash-live-preview', googleSearch: false },
 };
 
 const ts = () => new Date().toISOString().slice(11, 23);
@@ -36,20 +36,20 @@ export const switchVoiceConfigTool: ToolDefinition = {
 	description:
 		'Switch voice-agent to a different model + googleSearch preset and restart. ' +
 		'Use when the user explicitly asks to switch — e.g. "switch to search mode", ' +
-		'"use 2.5", "use 3.1", "switch to code mode", "turn search on", "turn search off". ' +
+		'"switch to no-search mode", "use 2.5", "use 3.1", "turn search on", "turn search off". ' +
 		'Presets: ' +
 		'"search" = gemini-2.5-flash-native-audio + googleSearch:true (best for Q&A with Web grounding); ' +
-		'"code" = gemini-3.1-flash-live-preview + googleSearch:false (newer model, no Web — best for code-heavy work). ' +
+		'"no-search" = gemini-3.1-flash-live-preview + googleSearch:false (newer model, no Web grounding). ' +
 		'Restart takes ~2-3 seconds during which voice will be silent; the web client auto-reconnects.',
 	parameters: z.object({
-		preset: z.enum(['search', 'code']).describe('Which preset to switch to. "search" = 2.5+Web grounding. "code" = 3.1+no-Web.'),
+		preset: z.enum(['search', 'no-search']).describe('Which preset to switch to. "search" = 2.5+Web grounding. "no-search" = 3.1+no-Web.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { preset } = args as { preset: 'search' | 'code' };
+		const { preset } = args as { preset: 'search' | 'no-search' };
 		const cfg = PRESETS[preset];
 		if (!cfg) {
-			return { error: `Unknown preset "${preset}". Use "search" or "code".` };
+			return { error: `Unknown preset "${preset}". Use "search" or "no-search".` };
 		}
 
 		// Resolve config path next to voice-agent.ts. import.meta.url resolves
@@ -88,7 +88,7 @@ export const switchVoiceConfigTool: ToolDefinition = {
 
 		const summary = preset === 'search'
 			? 'Switching to search mode: Gemini 2.5 with Web grounding. Restarting now…'
-			: 'Switching to code mode: Gemini 3.1, no Web grounding. Restarting now…';
+			: 'Switching to no-search mode: Gemini 3.1, no Web grounding. Restarting now…';
 		return {
 			ok: true,
 			preset,
