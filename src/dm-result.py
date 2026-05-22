@@ -42,6 +42,31 @@ SSE_STATUS_URL = "http://localhost:8080/sse-status"
 _FENCE_LINE = re.compile(r"^\s{0,3}(`{3,}|~{3,})\s*([^\s`~][^`~]*)?\s*$")
 
 
+# Mirror of discord-bridge.py's `_FILE_MARKER_RE` — agent-emitted file
+# attachment markers embedded in result bodies. dm-result.py is the
+# REST-only fallback delivery path used when voice isn't connected;
+# without parsing these markers it would deliver the literal text
+# `[file: /tmp/sutando-x.png]` in the DM and silently drop the
+# attachment. PR limitation: REST multipart upload for actual file
+# delivery is a follow-up — this commit strips the markers from the
+# body so the user doesn't see the literal text.
+_FILE_MARKER_RE = re.compile(r'\[(?:file|send|attach):\s*((?:/|~/)[^\]:]+)\]')
+
+
+def _split_file_markers(text: str) -> tuple[str, list[str]]:
+    """Split a result body into ``(clean_text, files)``.
+
+    Mirrors :func:`src/discord-bridge.py._split_file_markers` style.
+    ``files`` is the list of paths extracted from
+    ``[file:|send:|attach:]`` markers in textual order; ``clean_text``
+    is the original text with every marker removed and surrounding
+    whitespace stripped.
+    """
+    files = _FILE_MARKER_RE.findall(text)
+    clean_text = _FILE_MARKER_RE.sub('', text).strip()
+    return clean_text, files
+
+
 def _is_fence_open_line(line: str):
     """Return the fence opener string if `line` is a real Markdown fence line, else None."""
     if not _FENCE_LINE.match(line):
@@ -199,6 +224,21 @@ def _resolve_owner_id(token):
     if not allow:
         return ""
 
+    # Honor the explicit `tierMap[uid] == "owner"` admin tag IF the
+    # tagged user is still in allowFrom. Mirrors the same precedence
+    # used by `src/discord-bridge.py:poll_proactive` so the fallback
+    # delivery path and the live bridge agree on who the owner is —
+    # drift here would re-introduce the misroute class the bridge
+    # already fixed. Defensive: a stale tier-tag for a removed user
+    # must not resolve a delisted owner.
+    tier_map = data.get("tierMap") or {}
+    tier_owner = next(
+        (uid for uid in allow if tier_map.get(uid) == "owner"),
+        None,
+    )
+    if tier_owner is not None:
+        return str(tier_owner)
+
     # Query each user's is-bot flag. The first human wins. If lookups all
     # fail (rate limit, network, bad token), fall through to allow[0] as
     # a degraded default so send_dm() can produce an honest error later.
@@ -241,8 +281,32 @@ def send_dm(text: str) -> bool:
         print(f"dm-result: failed to open DM channel with {owner_id}: {e}", file=sys.stderr)
         return False
 
+    # Strip [file:|send:|attach:] markers from the body — the bridge's
+    # WS-connected client would attach the file directly, but dm-result
+    # is REST-only and has no multipart upload path yet, so the markers
+    # would otherwise deliver as literal text in the DM. We log the
+    # dropped files so the lossy delivery is visible in the dm-result
+    # output rather than silent.
+    clean_text, dropped_files = _split_file_markers(text)
+    if dropped_files:
+        print(
+            f"dm-result: {len(dropped_files)} file marker(s) stripped from body "
+            f"(REST multipart upload not implemented): {dropped_files}",
+            file=sys.stderr,
+        )
+
+    # An all-marker / all-whitespace body becomes empty after strip.
+    # Sending `""` to Discord returns 400 ("Cannot send an empty
+    # message"); skip the send and report the no-op instead.
+    if not clean_text:
+        print(
+            f"dm-result: body is empty after marker-strip; nothing to send "
+            f"(channel {channel_id})"
+        )
+        return True  # not an error — the input had no deliverable text
+
     # Chunk into Discord-safe pieces, preserving code fences across boundaries.
-    chunks = list(_chunk_for_discord(text)) or [text]
+    chunks = list(_chunk_for_discord(clean_text))
     for i, chunk in enumerate(chunks):
         try:
             _discord_api("POST", f"/channels/{channel_id}/messages", token, {"content": chunk})
@@ -254,7 +318,7 @@ def send_dm(text: str) -> bool:
             return False
 
     print(
-        f"dm-result: sent to DM ({len(text)} chars in {len(chunks)} chunk(s)) via channel {channel_id}"
+        f"dm-result: sent to DM ({len(clean_text)} chars in {len(chunks)} chunk(s)) via channel {channel_id}"
     )
     try:
         import outbox_log

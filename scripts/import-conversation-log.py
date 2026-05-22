@@ -41,6 +41,7 @@ DEFAULT_DB = Path(os.environ.get("SUTANDO_CONVERSATION_DB", WORKSPACE / "data" /
 _LIVE_WRITER_PATTERNS = [
     ("voice-agent.ts", "voice-agent"),
     ("conversation-server.ts", "phone conversation-server"),
+    ("discord-voice-server.ts", "discord-voice"),
 ]
 
 

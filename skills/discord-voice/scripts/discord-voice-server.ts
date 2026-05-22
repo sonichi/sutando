@@ -20,8 +20,9 @@
  *
  * ## Env
  *   DISCORD_BOT_TOKEN  — bot token (~/.claude/channels/discord/.env)
- *   GEMINI_API_KEY     — required
- *   VOICE_MODEL / VOICE_NATIVE_AUDIO_MODEL — mirrors voice-agent.ts
+ *   GEMINI_API_KEY (or GEMINI_VOICE_API_KEY) — required; voiceApiKey()
+ *   VOICE_MODEL — text/STT model; native-audio model + googleSearch live
+ *                 in skills/discord-voice/config.json (see src/voice-config.ts)
  *   SUTANDO_WORKSPACE  — workspace root for tasks/results/data
  */
 
@@ -29,11 +30,14 @@ import { config as _dotenvConfig } from 'dotenv';
 import { mkdirSync, writeFileSync, appendFileSync, existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { resolveWorkspace } from '../../../src/workspace_default.js';
+import { recordConversation, recordSession } from '../../../src/conversation-store.js';
 
 _dotenvConfig({ path: new URL('../../../.env', import.meta.url).pathname, override: true });
 _dotenvConfig({ path: join(process.env.HOME ?? '', '.claude/channels/discord/.env'), override: false });
 
 import { fileURLToPath } from 'node:url';
+import { voiceApiKey } from '../../../src/voice-key.js';
+import { loadVoiceConfig } from '../../../src/voice-config.js';
 import { execSync, spawn } from 'node:child_process';
 import { VoiceSession, type ToolDefinition, type MainAgent } from 'bodhi-realtime-agent';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
@@ -63,7 +67,9 @@ import {
 
 // --- Config ---
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY ?? '';
+// Voice surfaces share the GEMINI_VOICE_API_KEY → GEMINI_API_KEY fallback
+// chain via voiceApiKey() (src/voice-key.ts).
+const GEMINI_API_KEY = voiceApiKey();
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN ?? '';
 const WORKSPACE_DIR = resolveWorkspace();
 const DATA_DIR = join(WORKSPACE_DIR, 'data');
@@ -74,8 +80,19 @@ const TASK_POLL_TIMEOUT_MS = 300_000;
 const OWNER_NAME = process.env.owner ?? '';
 
 const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
-const VOICE_NATIVE_AUDIO_MODEL =
-	process.env.VOICE_NATIVE_AUDIO_MODEL || 'gemini-3.1-flash-live-preview';
+// Per-skill voice config (native-audio model + googleSearch) lives in
+// skills/discord-voice/config.json. Schema + defaults: src/voice-config.ts.
+const _discordSkillDir = dirname(dirname(fileURLToPath(import.meta.url)));
+const DISCORD_VOICE_CONFIG = loadVoiceConfig(join(_discordSkillDir, 'config.json'));
+const VOICE_NATIVE_AUDIO_MODEL = DISCORD_VOICE_CONFIG.model;
+const DISCORD_VOICE_GOOGLE_SEARCH = DISCORD_VOICE_CONFIG.googleSearch;
+
+// Hung-session watchdog threshold. A Gemini Live session can silently stall —
+// audio keeps flowing in but it stops emitting turn.end, with no transport
+// close event to trigger the reconnect path. If utterances have piled up
+// since the last turn AND the user last stopped speaking longer ago than
+// this, treat the session as hung and force a reconnect. Env-overridable.
+const WATCHDOG_STALL_MS = Number(process.env.SUTANDO_WATCHDOG_STALL_MS) || 20000;
 
 // Default false (safe): non-owner speakers in the voice channel get the
 // read-only tool surface but NOT owner-tier work/file-edit/message-send.
@@ -125,18 +142,17 @@ function detachVisionFromSession(): void {
 }
 
 // --- Conversation log -------------------------------------------------------
+// discord-voice mirrors turns into conversation.sqlite (queryable) AND the
+// shared logs/conversation.log text log — the same dual-write the phone path
+// uses. conversation.log is the canonical source the reload importer rebuilds
+// the sqlite `conversation` table from, so writing it keeps discord-voice rows
+// recoverable after `import-conversation-log.py --reload`.
+const CONVERSATION_LOG = join(WORKSPACE_DIR, 'logs', 'conversation.log');
 
-const LOG_PATH = join(
-	DATA_DIR,
-	`discord-voice-${new Date().toISOString().replace(/[:.]/g, '-')}.jsonl`,
-);
-
-function logLine(role: 'user' | 'assistant' | 'system', text: string, extra: Record<string, unknown> = {}): void {
+function appendConversationLog(role: string, text: string): void {
 	try {
-		appendFileSync(
-			LOG_PATH,
-			JSON.stringify({ timestamp: new Date().toISOString(), role, text, ...extra }) + '\n',
-		);
+		mkdirSync(dirname(CONVERSATION_LOG), { recursive: true });
+		appendFileSync(CONVERSATION_LOG, `${new Date().toISOString()}|${role}|${text.replace(/\n/g, ' ')}\n`);
 	} catch {}
 }
 
@@ -287,7 +303,15 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 			'Be natural, warm, and conversational. Keep responses to 1-2 sentences.',
 			'Discord voice channels are persistent — do NOT say "goodbye" or try to hang up. Just stop speaking when you have nothing more to add.',
 			'NEVER say "I\'m back", "Welcome back", "Working on it", or "task is queued". If the conversation resumes after a pause, just continue naturally.',
-			'NEVER fabricate specific details. If you don\'t know it, use the work tool to look it up.',
+			// "Look it up" pointer — conditional on per-surface config.
+			// Search on → native Web grounding (~2-3s, in-conversation);
+			// search off → `work` tool fallback (round-trip ~8-15s).
+			// Earlier code had both a permanent "use work" line + a soft
+			// nudge; model read the imperative as imperative and the nudge
+			// as optional. One conditional line so only one path appears.
+			DISCORD_VOICE_GOOGLE_SEARCH
+				? 'NEVER fabricate specific details. If you don\'t know it, use your built-in Web search to look it up — it\'s faster than delegating, and the answer stays in the conversation. If your built-in search returns nothing useful, OR the question needs deeper-than-one-lookup research (multi-step, multiple sources, file reading), call the work tool — it routes to the core agent which can do extensive research.'
+				: 'NEVER fabricate specific details. If you don\'t know it, use the work tool to look it up.',
 			repoUrl ? `\n## Known info\nSutando GitHub repo: ${repoUrl}` : '',
 		].filter(Boolean).join('\n');
 	} else {
@@ -417,7 +441,7 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 		name: 'discord-voice',
 		instructions,
 		tools,
-		googleSearch: true,
+		googleSearch: DISCORD_VOICE_GOOGLE_SEARCH,
 		greeting: '',
 	};
 }
@@ -513,6 +537,11 @@ function subscribeUser(s: DiscordVoiceSession, userId: string): void {
 	resampler.on('end', () => {
 		s.subscribedUsers.delete(userId);
 		console.log(`${ts()} [Voice] user ${userId} stopped speaking (${chunks} chunks) — silence burst`);
+		// Watchdog bookkeeping: an utterance just finished. A healthy Gemini
+		// fires turn.end within seconds; these counters let the watchdog tell
+		// a hang apart from a normal pause.
+		(s as any).lastSpeakStopTs = Date.now();
+		(s as any).utterancesSinceTurn = ((s as any).utterancesSinceTurn || 0) + 1;
 		triggerSilenceBurst(s);
 	});
 	resampler.on('error', (e) => {
@@ -525,7 +554,9 @@ function subscribeUser(s: DiscordVoiceSession, userId: string): void {
 
 async function createVoiceSession(connection: VoiceConnection): Promise<DiscordVoiceSession> {
 	const bodhiPort = nextBodhiPort++;
-	const sessionId = `discord_voice_${Date.now()}`;
+	// Encode guild + channel into the session id so channel-level diagnostics
+	// survive into the sessions table (recordSession has no guild/channel field).
+	const sessionId = `discord_voice_${GUILD_ID}_${CHANNEL_ID}_${Date.now()}`;
 
 	// Outbound audio: queue of PCM 48k stereo buffers. When Gemini sends a
 	// chunk, push to queue. When player goes idle (or on first push), drain
@@ -592,7 +623,7 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 		host: '127.0.0.1',
 		model: google(VOICE_MODEL),
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
-		googleSearch: true,
+		googleSearch: DISCORD_VOICE_GOOGLE_SEARCH,
 		speechConfig: { voiceName: 'Aoede' },
 		// Shorten Gemini's end-of-speech silence wait so turn-end (and the
 		// reply) is detected faster. Default ~1s+; env-overridable for tuning.
@@ -645,6 +676,9 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 	// Transcript mirroring + result-queue drain
 	let lastProcessedIdx = 0;
 	session.eventBus.subscribe('turn.end', () => {
+		// Watchdog: a turn completed — clear the hang counters.
+		(s as any).lastTurnActivityTs = Date.now();
+		(s as any).utterancesSinceTurn = 0;
 		const items = session.conversationContext.items;
 		if (items.length < lastProcessedIdx) lastProcessedIdx = 0;
 		const lastText = s.transcript.length > 0 ? s.transcript[s.transcript.length - 1].text : null;
@@ -653,11 +687,15 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 			if (item.role === 'user') {
 				s.transcript.push({ role: 'user', text: item.content });
 				s.events.push({ event: `user:${item.content}`, timestamp: new Date().toISOString() });
-				logLine('user', item.content);
+				// conversation.log is the primary; write it before the sqlite
+				// mirror so a row never exists in sqlite without a log line.
+				appendConversationLog('discord-user', item.content);
+				recordConversation('discord-user', item.content, s.sessionId);
 			} else if (item.role === 'assistant') {
 				s.transcript.push({ role: 'sutando', text: item.content });
 				s.events.push({ event: `sutando:${item.content}`, timestamp: new Date().toISOString() });
-				logLine('assistant', item.content);
+				appendConversationLog('discord-agent', item.content);
+				recordConversation('discord-agent', item.content, s.sessionId);
 			}
 		}
 		lastProcessedIdx = items.length;
@@ -695,6 +733,38 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 		}, 1500);
 	};
 
+	// Hung-session watchdog. A healthy Gemini fires turn.end within seconds of
+	// the user finishing an utterance. If >=2 utterances have piled up since
+	// the last turn activity and the user last stopped speaking more than
+	// WATCHDOG_STALL_MS ago, the session has silently stalled — force a
+	// reconnect through the same path as a transport close. The >=2 guard
+	// keeps a single Gemini-ignored micro-utterance from tripping it.
+	(s as any).lastTurnActivityTs = Date.now();
+	const watchdog = setInterval(() => {
+		if (s.closing || active !== s || reconnectPending) return;
+		const stop = (s as any).lastSpeakStopTs || 0;
+		const turn = (s as any).lastTurnActivityTs || 0;
+		const pile = (s as any).utterancesSinceTurn || 0;
+		const idleMs = Date.now() - stop;
+		if (stop > turn && pile >= 2 && idleMs > WATCHDOG_STALL_MS) {
+			console.error(`${ts()} [Watchdog] Gemini session hung — ${pile} utterances / ${Math.round(idleMs / 1000)}s since last speech, no turn. Reconnecting.`);
+			reconnectPending = true;
+			setTimeout(() => {
+				reconnectPending = false;
+				if (s.closing || active !== s) return;
+				// Clear the hang condition so the watchdog doesn't immediately re-fire.
+				(s as any).lastTurnActivityTs = Date.now();
+				(s as any).utterancesSinceTurn = 0;
+				try {
+					sessionAny.handleClientConnected();
+				} catch (e) {
+					console.error(`${ts()} [Watchdog] reconnect failed:`, e);
+				}
+			}, 500);
+		}
+	}, 10000);
+	(s as any)._watchdogHandle = watchdog;
+
 	// Subscribe to anyone currently speaking, and to anyone who starts.
 	connection.receiver.speaking.on('start', (userId) => subscribeUser(s, userId));
 	// Start the constant-rate ticker that flushes audio to Gemini every 20ms.
@@ -719,6 +789,7 @@ function cleanupSession(s: DiscordVoiceSession): void {
 
 	try { clearInterval((s as any)._tickHandle); } catch {}
 	try { clearInterval((s as any)._outTickHandle); } catch {}
+	try { clearInterval((s as any)._watchdogHandle); } catch {}
 	try { s.player.stop(true); } catch {}
 	try { s.connection.destroy(); } catch {}
 
@@ -728,21 +799,16 @@ function cleanupSession(s: DiscordVoiceSession): void {
 
 	s.events.push({ event: 'session_ended', timestamp: new Date().toISOString() });
 	const durationMs = Date.now() - s.startTime;
-	const metrics = {
-		timestamp: new Date().toISOString(),
+	recordSession({
+		source: 'discord-voice',
 		sessionId: s.sessionId,
-		guildId: s.guildId,
-		channelId: s.channelId,
 		durationMs,
 		transcriptLines: s.transcript.length,
-		toolCalls: s.toolCalls,
 		toolCount: s.toolCalls.length,
 		pendingTasks: s.pendingTasks,
+		toolCalls: s.toolCalls,
 		events: s.events,
-	};
-	try {
-		appendFileSync(join(DATA_DIR, 'discord-voice-metrics.jsonl'), JSON.stringify(metrics) + '\n');
-	} catch {}
+	});
 	console.log(`${ts()} [Voice] session finalized: ${s.sessionId} (${durationMs}ms, ${s.transcript.length} turns)`);
 }
 
