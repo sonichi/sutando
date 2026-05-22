@@ -8,12 +8,13 @@
  *   4. Click "Connect" and allow microphone access
  */
 
-import { createServer } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
 import { writeFileSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readTmuxStatus } from './tmux-status.js';
 import { CHAT_HTML } from './chat-ui.js';
+import { OVERLAY_MANAGER_HTML } from './overlay-manager-ui.js';
 import { resolveWorkspace, statusReadPath } from './workspace_default.js';
 
 const HTTP_PORT = Number(process.env.CLIENT_PORT) || 8080;
@@ -3756,6 +3757,55 @@ const server = createServer((req, res) => {
 			'Cache-Control': 'no-cache, no-store, must-revalidate',
 		});
 		res.end(CHAT_HTML);
+		return;
+	}
+
+	// Overlay Manager — lists/controls the desktop overlay applications
+	// (benchmark-overlay Electron app). The page itself is static; it talks
+	// to /api/overlays/* below.
+	if (url.pathname === '/overlays') {
+		res.writeHead(200, {
+			'Content-Type': 'text/html; charset=utf-8',
+			'Cache-Control': 'no-cache, no-store, must-revalidate',
+		});
+		res.end(OVERLAY_MANAGER_HTML);
+		return;
+	}
+
+	// Proxy to the overlay app's control server. The overlay app writes its
+	// port to state/overlay-control.json; we forward same-origin requests so
+	// the browser needs no CORS or port discovery.
+	if (url.pathname === '/api/overlays' || url.pathname.startsWith('/api/overlays/')) {
+		let disc: { host?: string; port?: number } | null = null;
+		try {
+			disc = JSON.parse(readFileSync(join(STATE_DIR, 'overlay-control.json'), 'utf-8'));
+		} catch {
+			disc = null;
+		}
+		if (!disc || !disc.port) {
+			res.writeHead(503, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify({ ok: false, error: 'overlay control server not running' }));
+			return;
+		}
+		const subPath = url.pathname.replace('/api/overlays', '/overlays') + (url.search || '');
+		const proxyReq = httpRequest(
+			{
+				host: disc.host || '127.0.0.1',
+				port: disc.port,
+				path: subPath,
+				method: req.method,
+				headers: { 'Content-Type': 'application/json' },
+			},
+			(proxyRes) => {
+				res.writeHead(proxyRes.statusCode || 502, { 'Content-Type': 'application/json' });
+				proxyRes.pipe(res);
+			},
+		);
+		proxyReq.on('error', (e) => {
+			res.writeHead(502, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify({ ok: false, error: 'overlay control proxy failed: ' + e.message }));
+		});
+		req.pipe(proxyReq);
 		return;
 	}
 
