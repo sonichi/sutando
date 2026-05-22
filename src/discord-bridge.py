@@ -57,6 +57,28 @@ from util_paths import shared_personal_path  # noqa: E402
 from task_priority import default_priority_for_source  # noqa: E402
 REPO = resolve_workspace()
 
+# discord-voice "magic word" join trigger (issue: za-warudo summon). The
+# bridge stays a THIN hook — it only detects "owner + join phrase" and hands
+# off to this helper, which owns the voice-channel resolution + server launch
+# + already-running guard. Keeping the feature logic in the skill honors the
+# CLAUDE.md core/skill split (core must not bloat with feature logic). The
+# import is best-effort: if the discord-voice skill is absent, the magic word
+# simply doesn't fire and the message is processed as a normal task.
+try:
+    sys.path.insert(
+        0, str(Path(__file__).resolve().parent.parent / "skills" / "discord-voice" / "scripts")
+    )
+    from join_trigger import (  # noqa: E402
+        message_is_join_phrase as _dv_message_is_join_phrase,
+        handle_join_trigger as _dv_handle_join_trigger,
+    )
+except Exception:  # pragma: no cover - skill optional
+    def _dv_message_is_join_phrase(text):  # type: ignore
+        return False
+
+    def _dv_handle_join_trigger(message):  # type: ignore
+        return ""
+
 # Vision-frame helper — pushes image attachments into the active voice session
 # so Gemini reacts in-stream. Best-effort: import failure or unreachable
 # voice-agent leaves the regular task pipeline unchanged.
@@ -2513,6 +2535,36 @@ async def _handle_discord_message(message, force=False):
                 access_tier = "team"
         except:
             pass
+
+    # discord-voice "magic word" join trigger. THIN hook (CLAUDE.md core/skill
+    # split): the bridge only checks "is this the owner saying the join
+    # phrase"; everything else — voice-channel lookup, already-running guard,
+    # discord-voice-server launch — lives in the discord-voice skill helper.
+    # Owner-only by construction: a non-owner saying the phrase falls through
+    # to normal task handling (access_tier gate below). When it fires, the
+    # message IS the command — we send the reply and return WITHOUT writing a
+    # task file (no normal task for a join-phrase message).
+    if access_tier == "owner" and not force:
+        try:
+            is_join = _dv_message_is_join_phrase(text)
+        except Exception as e:
+            print(f"  [join-trigger] match check raised: {e}", flush=True)
+            is_join = False
+        if is_join:
+            print(f"  [join-trigger] owner @{username} said the join phrase — summoning discord-voice", flush=True)
+            seen_message_ids.add(message.id)  # don't reprocess on gateway replay
+            try:
+                reply = _dv_handle_join_trigger(message)
+            except Exception as e:
+                print(f"  [join-trigger] handler raised: {e}", flush=True)
+                reply = "Couldn't process the voice-join request — check the bridge log."
+            try:
+                if reply:
+                    for chunk in _chunk_for_discord(reply):
+                        await message.channel.send(chunk)
+            except Exception as e:
+                print(f"  [join-trigger] reply send failed: {e}", flush=True)
+            return
 
     # Dedup: skip if we've already processed this Discord message ID.
     # EXCEPTION: force=True means on_message_edit is reprocessing because the
