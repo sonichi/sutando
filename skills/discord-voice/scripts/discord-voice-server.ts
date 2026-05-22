@@ -304,6 +304,15 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 			'Discord voice channels are persistent — do NOT say "goodbye" or try to hang up. Just stop speaking when you have nothing more to add.',
 			'NEVER say "I\'m back", "Welcome back", "Working on it", or "task is queued". If the conversation resumes after a pause, just continue naturally.',
 			'NEVER fabricate specific details. If you don\'t know it, use the work tool to look it up.',
+			// When this surface has native googleSearch grounding enabled,
+			// nudge toward using it directly for current-info queries
+			// (news/scores/weather/stocks). Without this nudge the prior
+			// "use work for anything" lines bias the model toward delegation
+			// (~8-15s) over native grounding (~2-3s). Conditional on
+			// per-surface config: search:false → no nudge (capability absent).
+			DISCORD_VOICE_GOOGLE_SEARCH
+				? 'You have built-in Web grounding for current-info queries (news, scores, weather, stocks, recent events). Use it directly when the question only needs a Web lookup — it returns faster.'
+				: '',
 			repoUrl ? `\n## Known info\nSutando GitHub repo: ${repoUrl}` : '',
 		].filter(Boolean).join('\n');
 	} else {

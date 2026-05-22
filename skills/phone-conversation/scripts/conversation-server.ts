@@ -499,6 +499,19 @@ function buildAgent(callSession: CallSession): MainAgent {
 		instructions += '\n\nNEVER fabricate specific details. If you don\'t know it, use the work tool to look it up.';
 	}
 
+	// When this surface has Gemini's native googleSearch grounding enabled,
+	// nudge the model toward using it directly for current-info queries
+	// (news, scores, weather, stocks, recent events). Without this nudge,
+	// the instructions above strongly bias the model toward the `work` tool
+	// for any "look it up" request, which writes a task file + waits for
+	// Claude Code's WebSearch (~8-15s round-trip) instead of letting Gemini
+	// answer via its own grounding (~2-3s). Conditional on the per-surface
+	// config so a surface with googleSearch=false doesn't get advised to
+	// use a capability it doesn't have.
+	if (PHONE_GOOGLE_SEARCH) {
+		instructions += '\n\nYou have built-in Web grounding for current-info queries (news, scores, weather, stocks, recent events). Use it directly when the question only needs a Web lookup — it returns faster.';
+	}
+
 	const tools: ToolDefinition[] = [];
 
 	// All calls get hang_up — the model calls it when both sides have said goodbye.

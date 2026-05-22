@@ -646,7 +646,13 @@ const mainAgent: MainAgent = {
 		'- Asking the user a clarifying question',
 		'- Language/conversation mode questions ("can you speak Chinese?", "说中文", "switch to English", "speak French") — just say yes and switch, no need to delegate',
 		'- get_current_time (current date/time)',
-		'- Google Search (quick factual lookups)',
+		// googleSearch line conditional on VOICE_GOOGLE_SEARCH (per-surface config).
+		// When search is off, omit — model would otherwise be told it can use a
+		// capability that isn't actually available. When on, use a stronger directive
+		// than the prior "quick factual lookups" wording so the model prefers
+		// native grounding over the `work` tool for current-info queries
+		// (news/scores/weather/stocks) — wins ~5-10s vs the delegation round-trip.
+		(() => VOICE_GOOGLE_SEARCH ? '- Google Search for current-info queries (news, scores, weather, stocks, recent events) — use it directly, it returns faster than delegating to work' : '')(),
 		`- ${inlineTools.map(t => t.name).join(', ')} — call these directly, not through work. Instant.`,
 		'',
 		'For EVERYTHING else, call work. This includes:',
