@@ -1,15 +1,20 @@
-import { memo, useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useRef, useState, type ReactNode } from 'react';
 import { APP_COPY } from '@/const-values/app-copy';
 import { useConversation } from '@/hooks/useConversation';
 import { renderChatMarkdown } from '@/lib/chat-markdown';
 import type { TranscriptEntry } from '@/types/conversation';
 
 /**
- * Modern chat-bubble transcript. Replaces LegacyTranscript — same auto-
- * stick scrolling behavior, but every entry renders as a typed message
- * bubble (user → right purple, assistant → left neutral, system → centered
- * pill) so the conversation reads like a real chat product instead of a
- * flat "You: ... Sutando: ..." text dump.
+ * Chat-bubble transcript. Auto-stick scrolling on new entries; every
+ * entry renders as a typed message bubble (user → right inverted,
+ * assistant → left neutral, system → centered pill).
+ *
+ * The container is intentionally chrome-less (no border, no card bg) so
+ * it reads as a full-page chat thread rather than an embedded widget.
+ * It flex-1's to fill whatever vertical space the page hands it, and
+ * accepts an `emptyState` slot that ConversationPage uses to render the
+ * ChatGPT-style greeting + suggested-prompt cards when there's no
+ * conversation yet.
  */
 
 const STICK_THRESHOLD_PX = 80;
@@ -110,9 +115,10 @@ function MediaSlot({ entry }: { entry: TranscriptEntry }) {
 
 export interface ConversationStreamProps {
 	errorMessage?: string | null;
+	emptyState?: ReactNode;
 }
 
-export default function ConversationStream({ errorMessage }: ConversationStreamProps) {
+export default function ConversationStream({ errorMessage, emptyState }: ConversationStreamProps) {
 	const { entries } = useConversation();
 	const scrollerRef = useRef<HTMLDivElement | null>(null);
 	const stickyRef = useRef(true);
@@ -141,12 +147,14 @@ export default function ConversationStream({ errorMessage }: ConversationStreamP
 			ref={scrollerRef}
 			role="log"
 			aria-live="polite"
-			className="flex max-h-[56vh] min-h-[240px] flex-col gap-2.5 overflow-y-auto rounded-[20px] border border-(--border)/80 bg-(--surface)/85 p-3.5"
+			className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-1 py-4"
 		>
 			{isEmpty ? (
-				<div className="px-3 py-12 text-center text-sm text-(--text-muted)">
-					{APP_COPY.convStreamEmpty}
-				</div>
+				emptyState ?? (
+					<div className="m-auto px-3 py-12 text-center text-sm text-(--text-muted)">
+						{APP_COPY.convStreamEmpty}
+					</div>
+				)
 			) : (
 				entries.map((entry) => {
 					const showCopy = !entry.interim && entry.role !== 'system' && entry.text.length > 0;

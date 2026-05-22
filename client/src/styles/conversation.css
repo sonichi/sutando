@@ -17,8 +17,13 @@
  *      ConversationPanels card already provides the surface.
  */
 
+/* Flex column so <main> can flex-1 and let the chat stream fill the
+   space between the sticky chrome and the fixed composer. The 112px
+   bottom padding reserves room for the composer pill so the last
+   message bubble isn't hidden behind it. */
 .legacy-shell.conv-root {
-	display: block;
+	display: flex;
+	flex-direction: column;
 	align-items: stretch;
 	min-height: 100vh;
 	padding: 0 0 112px 0;
