@@ -21,6 +21,10 @@ logs/*
 !logs/.gitkeep
 state/*
 !state/.gitkeep
+# Per-user workspace configs (e.g. config/discord-voice.json). Live configs
+# carry per-user data and must never be committed from a repo-root workspace
+# install — the repo ships <skill>/config.json.example templates instead.
+config/*.json
 AGENT_LOOP.md
 PENDING.md
 pending-questions.md

@@ -41,7 +41,7 @@ _dotenvConfig({ path: join(process.env.HOME ?? '', '.claude/channels/discord/.en
 
 import { fileURLToPath } from 'node:url';
 import { voiceApiKey } from '../../../src/voice-key.js';
-import { loadVoiceConfig } from '../../../src/voice-config.js';
+import { loadVoiceConfig, resolveOwnerMode } from '../../../src/voice-config.js';
 import { execSync, spawn } from 'node:child_process';
 import { VoiceSession, type ToolDefinition, type MainAgent } from 'bodhi-realtime-agent';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
@@ -142,9 +142,23 @@ const CHANNEL_ID = getArg('channel');
 // Set owner_mode=true (skill-wide or per-channel) to inherit owner privileges
 // to every speaker — only safe in voice channels whose membership is fully
 // trusted (single-operator Lounge, not community/public). See SKILL.md.
-const _channelConfig = CHANNEL_ID ? DISCORD_VOICE_CONFIG.channels[CHANNEL_ID] : undefined;
-const TREAT_AS_OWNER =
-	_channelConfig?.owner_mode ?? DISCORD_VOICE_CONFIG.owner_mode ?? false;
+// resolveOwnerMode (src/voice-config.ts) is fail-closed: it grants ONLY on the
+// boolean literal `true`, so a hand-edited config with a string `"true"` /
+// `"false"` / null / number can't silently flip the trust boundary. It also
+// preserves precedence — a channel that explicitly sets owner_mode:false still
+// overrides a skill-wide owner_mode:true.
+const TREAT_AS_OWNER = resolveOwnerMode(DISCORD_VOICE_CONFIG, CHANNEL_ID);
+
+// Legacy env warning (issue #1016) — owner-mode used to be a coarse global
+// env flag. It's now config-driven (`owner_mode` in the workspace config).
+// If the old var is still set, warn once so the operator knows it's inert.
+if (process.env.DISCORD_VOICE_OWNER !== undefined) {
+	console.warn(
+		'[discord-voice] DISCORD_VOICE_OWNER is set but no longer takes effect — ' +
+		'owner-mode is now config-driven (`owner_mode` in the workspace config, ' +
+		'$SUTANDO_WORKSPACE/config/discord-voice.json; see SKILL.md).',
+	);
+}
 
 if (!GEMINI_API_KEY) { console.error('Error: GEMINI_API_KEY required'); process.exit(1); }
 if (!DISCORD_BOT_TOKEN) { console.error('Error: DISCORD_BOT_TOKEN required'); process.exit(1); }

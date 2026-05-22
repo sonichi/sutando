@@ -63,6 +63,40 @@ export const VOICE_CONFIG_DEFAULTS: VoiceConfig = {
 	channels: {},
 };
 
+/**
+ * Resolve the effective owner-mode for a discord-voice channel — fail-closed.
+ *
+ * The config is raw JSON spread into `VoiceConfig`, so a hand-edited file can
+ * carry a non-boolean value (string `"false"`, `null`, a number, a typo). A
+ * loose `?? false` / truthy check would treat the *string* `"false"` as
+ * truthy and grant owner tier to every speaker — a trust-boundary bug. Owner
+ * mode is therefore granted ONLY when the value is the boolean literal `true`;
+ * every other shape fails closed to `false`.
+ *
+ * Precedence (must NOT collapse to an OR of the two levels — that would break
+ * a channel's explicit opt-out of a skill-wide default):
+ *   1. If the channel entry exists AND carries an `owner_mode` key, that key
+ *      decides — `=== true` grants, present-but-not-`true` (incl. `false`)
+ *      denies. A channel-explicit `false` correctly overrides a skill default
+ *      of `true`.
+ *   2. Otherwise the skill-wide `config.owner_mode` decides (`=== true`).
+ *   3. Otherwise `false`.
+ */
+export function resolveOwnerMode(
+	config: VoiceConfig,
+	channelId?: string,
+): boolean {
+	const channelEntry =
+		channelId !== undefined ? config.channels?.[channelId] : undefined;
+	if (
+		channelEntry &&
+		Object.prototype.hasOwnProperty.call(channelEntry, 'owner_mode')
+	) {
+		return channelEntry.owner_mode === true;
+	}
+	return config.owner_mode === true;
+}
+
 export function loadVoiceConfig(configPath: string): VoiceConfig {
 	if (!existsSync(configPath)) return { ...VOICE_CONFIG_DEFAULTS, channels: {} };
 	try {
