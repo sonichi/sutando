@@ -46,7 +46,7 @@ If Phase 1 didn't surface it, run **one query per partner domain** the user may 
 search_threads query="from:DOMAIN OR from:NAMED-ADDRESS" pageSize=10
 ```
 
-**If no partner-domain file exists yet**, skip this phase — proceed straight to Phase 3. (Phase 2 only adds value when you've accumulated mappings; the skill works fine without it.) Then, if Phases 3–4 surface an email from a domain you didn't expect for the named entity, follow the "first-time setup" flow in `## Per-user partner-domain memory` below to offer to create the file.
+**If no partner-domain file exists yet**, skip this phase — proceed straight to Phase 3. (Phase 2 only adds value when you've accumulated mappings; the skill works fine without it.) When Phases 3–4 surface an email from a domain you didn't expect for the named entity, **auto-record the mapping** per `## Per-user partner-domain memory § Auto-learn on discovery` below — silently, no user confirmation.
 
 ### Phase 3 — Walk threads by participant
 
@@ -84,32 +84,42 @@ The agent should look in the user's memory directory:
 3. **If found**, parse the table and use it in Phase 2.
 4. **If not found**, skip Phase 2 and proceed with Phases 3–4. Do not error out — the skill is fully functional without this file.
 
-### First-time setup flow (offered, not required)
+### Auto-learn on discovery (no user confirmation)
 
-When the skill runs for the first time and the file doesn't exist, AND either:
-- the agent surfaces an email from a domain the user didn't name (e.g. user asked for "K12 email" and the hit came from `soulilution.com`), OR
-- the agent accumulates 2+ named-entity → domain mappings during a session,
+Whenever the skill surfaces an email from a domain the user didn't explicitly name (e.g. user asked for "K12 email" and the hit came from `soulilution.com`), **silently record the mapping** in the partner-domains file. Do **not** ask the user "want me to save this?" — that's friction. Worst case is an extra row that doesn't match anything later; the cost of recording is near-zero, the cost of asking is real.
 
-then **at the end of the reply, offer to create the file** with a concrete one-line command, e.g.:
+If the file doesn't exist yet, create it on first discovery. Use the format below.
 
-> Want me to save this mapping for next time? I can create `<resolved-memory-dir>/reference_partner_domains.md` with the {NamedEntity} → {discovered-domains} table already filled in. Reply "yes" or paste any additional entities + domains you want included.
+Implementation notes:
+- Do not chain a confirmation question into the same reply that delivers the email — just write to memory in the background and move on.
+- Don't mention the save in the reply unless the user explicitly asks "how did you find this?" — silent learning beats narrated learning.
 
-If the user says yes, the agent writes the file using the format below and adds a one-line entry in the user's `MEMORY.md` index pointing at it (per the Sutando memory-system convention). The file is then read on every future `/email-find` invocation.
+### Timestamps and pruning
+
+Every row in the partner-domains file carries two timestamps:
+
+- `first_seen` — when the mapping was first recorded
+- `last_useful` — last time the mapping helped surface an email (i.e. a Phase 2 query using this row returned a result)
+
+Each time Phase 2 runs and a domain row produces a hit, update its `last_useful` to today. Each time the file is read for any reason, also run a pruning pass: **drop any row whose `last_useful` is more than 365 days old** (or `first_seen` if it never got marked useful). Keeps the file from accumulating dead aliases.
+
+The pruning runs at most once per day per file — track via a `pruned_at` header. This keeps repeated reads cheap.
 
 ### File format
 
 ```markdown
 ---
 name: partner-domains
-description: Map of named entities (customers, vendors, collaborators) to associated email domains.
+description: Map of named entities (customers, vendors, collaborators) to associated email domains. Auto-maintained by the /email-find skill.
 metadata:
   type: reference
+  pruned_at: 2026-05-22
 ---
 
-| Named entity | Associated email domains |
-|---|---|
-| Acme Corp | `*@acmecorp.com`, `*@acme-data-ops.com`, `vendor.contact@example.com` |
-| Foo Foundation | `*@foo.org`, `programs@foo.org`, `*@foo-partner.com` |
+| Named entity | Associated email domains | first_seen | last_useful |
+|---|---|---|---|
+| Acme Corp | `*@acmecorp.com`, `*@acme-data-ops.com` | 2026-05-22 | 2026-05-22 |
+| Foo Foundation | `*@foo.org`, `programs@foo.org` | 2026-05-22 | 2026-05-22 |
 ```
 
 The agent should treat this format as a template — match whatever frontmatter / heading convention the user already uses elsewhere in their memory dir.
