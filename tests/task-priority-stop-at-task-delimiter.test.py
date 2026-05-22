@@ -98,8 +98,8 @@ def test_legacy_blank_line_separator_still_breaks():
 
 def test_multi_paragraph_task_with_priority_word_ignored():
     """An accidental case (not malicious): a multi-paragraph task body
-    that happens to contain a line starting `priority:` (e.g. \"priority:
-    customer feedback\" as a heading in the body). Pre-fix this would
+    that happens to contain a line starting `priority:` (e.g. "priority:
+    customer feedback" as a heading in the body). Pre-fix this would
     match; post-fix it's body content."""
     body = (
         "id: task-6\n"

@@ -64,22 +64,6 @@ mkdirSync(RESULT_DIR, { recursive: true });
 
 function ts(): string { return new Date().toISOString().slice(11, 23); }
 
-/** Detect a skip marker at the start of a result body (#896).
- * Mirrors the SKIP phase of src/result_markers.py:parse_markers().
- * Returns the skip reason string if matched, null otherwise.
- * Recognised skip markers (case-insensitive where noted):
- *   [no-send]           → "no-send"
- *   [REPLIED]           → "REPLIED"
- *   [deduped: task-X]   → "deduped:task-X" */
-function detectSkipMarker(text: string): string | null {
-	const t = text.trimStart();
-	if (/^\[no-send\]/i.test(t)) return 'no-send';
-	if (/^\[REPLIED\]/.test(t)) return 'REPLIED';
-	const m = /^\[deduped:\s*([^\]]+)\]/i.exec(t);
-	if (m) return `deduped:${m[1].trim()}`;
-	return null;
-}
-
 /**
  * Write a chat-path task file so the dashboard tracks chat-originated work.
  * Called by the core agent (Claude Code) when it accepts a non-trivial task from chat.
@@ -91,10 +75,6 @@ function detectSkipMarker(text: string): string | null {
 export function writeChatTask(taskDescription: string): string {
 	const taskId = `task-chat-${Date.now()}`;
 	const timestamp = new Date().toISOString();
-	// Field order: `task:` LAST so the user-supplied multi-line body
-	// can't forge header fields below it. Same shape as agent-api.py's
-	// /task endpoint after PR #982; consumers (`_isVoiceTask`,
-	// `parse_priority_from_text`) stop scanning at the first `task:`.
 	const content = [
 		`id: ${taskId}`,
 		`timestamp: ${timestamp}`,
@@ -163,14 +143,10 @@ export function _isVoiceTask(taskId: string): boolean {
 		if (!existsSync(p)) continue;
 		try {
 			const body = readFileSync(p, 'utf-8');
-			// Stop scanning at the first `task:` delimiter. The task-file
-			// format puts `task:` last on the line preceding the user-
-			// supplied multi-line task body (see agent-api.py and the
-			// /meeting handler). Without this stop, a body of
-			// `do thing\nchannel_id: local-voice` would forge a voice-
-			// task classification — the residual half of the PR #982
-			// fix Qingyun flagged. Stop-at-`task:` makes consumers
-			// honor the delimiter PR #982 already established.
+			// Stop at the first `task:` line — the task-file format puts
+			// `task:` last so the user-supplied body can't forge header fields.
+			// Without this stop, `do thing\nchannel_id: local-voice` in the
+			// body would make _isVoiceTask return true (PR #982 residual fix).
 			const headerLines: string[] = [];
 			for (const l of body.split('\n')) {
 				if (l.startsWith('task:')) break;
@@ -181,27 +157,6 @@ export function _isVoiceTask(taskId: string): boolean {
 	}
 	return false;
 }
-
-/** Belt-suspenders guard for the result-watcher's unconditional fallthrough
- * (issue #1035, follow-up to PR #1033). Returns true iff the filename is one
- * that task-bridge legitimately delivers via `onResult()`. Rejects everything
- * else — most importantly, the new `<channel-key>.task-{id}.txt` namespace
- * PR #1033 introduced for the per-channel pull path (discord-voice / phone),
- * which the per-channel scanner consumes itself.
- *
- * `proactive-*` IS allowed: per the long-standing proactive-voice rule,
- * proactive messages are spoken by the voice agent when the client is
- * connected (in parallel to discord-bridge's poll_proactive DM-delivery).
- * That delivery has no explicit handler upstream in this watcher — the
- * fallthrough IS the path — so blocking `proactive-*` here would silently
- * disable voice-spoken proactive messages.
- *
- * Exported for unit testing — the watcher's setInterval body is otherwise
- * awkward to exercise in isolation. */
-export function _shouldFallthrough(file: string): boolean {
-	return file.startsWith('task-') || file.startsWith('voice-') || file.startsWith('proactive-');
-}
-
 const _apiToken = process.env.SUTANDO_API_TOKEN || '';
 function _apiHeaders(): Record<string, string> {
 	const h: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -312,11 +267,6 @@ export const workTool: ToolDefinition = {
 		const taskId = `task-${Date.now()}`;
 		const timestamp = new Date().toISOString();
 		const ownerId = process.env.SUTANDO_DM_OWNER_ID || 'voice-local';
-		// Field order: `task:` LAST so the user-supplied (Gemini-relayed,
-		// possibly multi-line) task body can't forge header fields. Same
-		// shape as agent-api.py's /task endpoint after PR #982; consumers
-		// (`_isVoiceTask`, `parse_priority_from_text`) stop scanning at
-		// the first `task:` line.
 		const content =
 			`id: ${taskId}\n` +
 			`timestamp: ${timestamp}\n` +
@@ -472,9 +422,6 @@ export function startContextDropWatcher(onContextDrop: (content: string) => void
 					mkdirSync(TASK_DIR, { recursive: true });
 					const taskId = `task-${Date.now()}`;
 					const ownerId = process.env.SUTANDO_DM_OWNER_ID || 'voice-local';
-					// `task:` last so the (multi-line) context-drop body can't
-					// forge header fields. Same shape as the voice/chat task
-					// writers and agent-api.py's /task endpoint per PR #982.
 					writeFileSync(
 						join(TASK_DIR, `${taskId}.txt`),
 						`id: ${taskId}\n` +
@@ -678,12 +625,13 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 					setTimeout(() => archiveFile(path, 'results', `voice-${Date.now()}`), 10_000);
 					continue;
 				}
-				// Skip-marker result: agent marked this task as deduped, no-send,
-				// or already-replied. Archive silently — no Discord post, no voice
-				// narration, no timeout. Unified via detectSkipMarker() (#896).
-				const _skipReason = file.startsWith('task-') ? detectSkipMarker(result) : null;
-				if (_skipReason) {
-					console.log(`${ts()} [TaskBridge] ${taskId} has skip marker [${_skipReason}]; archiving silently`);
+				// Deduped-marker result: agent consolidated this task's reply
+				// into another task's result file. Mark this task done silently
+				// and archive — no Discord post, no voice narration, no timeout.
+				// Format: first line is "[deduped: <other-task-id>]" (rest of
+				// file optional, displayed as the result body in the UI).
+				if (file.startsWith('task-') && /^\s*\[deduped:\s*task-/i.test(result)) {
+					console.log(`${ts()} [TaskBridge] ${taskId} is deduped marker; archiving silently`);
 					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
 					_deliveredResults.add(file);
 					_pendingTasks.delete(taskId);
@@ -740,18 +688,6 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 					// Other non-voice unsent results stay queued (their bridges deliver them)
 					continue;
 				}
-				// Belt-suspenders guard (issue #1035, follow-up to PR #1033):
-				// the fallthrough below fires onResult() for any non-empty .txt
-				// when the voice client is connected. PR #1033 introduced a new
-				// filename namespace `<channel-key>.task-{id}.txt` for the
-				// per-channel pull path used by discord-voice / phone — those
-				// files are NOT meant for task-bridge to inject into voice.
-				// PR #1033's mitigation is the per-channel scanner's
-				// read-and-delete winning the race; this guard closes the
-				// race by gating the fallthrough to filenames task-bridge
-				// legitimately consumes. See _shouldFallthrough for the
-				// allowlisted prefixes.
-				if (!_shouldFallthrough(file)) continue;
 				if (result) {
 					console.log(`${ts()} [TaskBridge] Result ${file}: ${result.slice(0, 100)}`);
 					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
