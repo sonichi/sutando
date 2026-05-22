@@ -1,5 +1,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, writeFileSync, mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
 	tierFor,
 	toolAllowed,
@@ -7,20 +10,22 @@ import {
 	SKILL_TOOL_TIER,
 	mostRestrictiveTier,
 	effectiveTier,
+	loadAccessTiers,
 	type AccessTiers,
 } from '../skills/discord-voice/scripts/access-tier.js';
 
 // Synthetic ids — the logic doesn't care about the id shape.
+// owner = top-level allowFrom; team = union of groups[*].allowFrom.
 const access: AccessTiers = {
-	owner: 'owner-0001',
-	team: new Set(['owner-0001', 'peer-bot-A', 'peer-bot-B', 'collaborator-1']),
+	owner: new Set(['owner-0001']),
+	team: new Set(['peer-bot-A', 'peer-bot-B', 'collaborator-1']),
 };
 
 describe('tierFor', () => {
-	it('the owner id → owner', () => {
+	it('a top-level allowFrom id → owner', () => {
 		assert.equal(tierFor('owner-0001', access), 'owner');
 	});
-	it('an allowFrom id that is not the owner → team', () => {
+	it('a groups[*].allowFrom id (not in allowFrom) → team', () => {
 		assert.equal(tierFor('peer-bot-A', access), 'team');
 		assert.equal(tierFor('collaborator-1', access), 'team');
 	});
@@ -30,8 +35,12 @@ describe('tierFor', () => {
 	it('undefined speaker → other', () => {
 		assert.equal(tierFor(undefined, access), 'other');
 	});
-	it('with no owner configured, the owner path never matches', () => {
-		const noOwner: AccessTiers = { owner: '', team: new Set(['peer-bot-A']) };
+	it('owner precedence — an id in both owner and team resolves to owner', () => {
+		const both: AccessTiers = { owner: new Set(['x']), team: new Set(['x']) };
+		assert.equal(tierFor('x', both), 'owner');
+	});
+	it('with an empty owner set, the owner path never matches', () => {
+		const noOwner: AccessTiers = { owner: new Set(), team: new Set(['peer-bot-A']) };
 		assert.equal(tierFor('peer-bot-A', noOwner), 'team');
 		assert.equal(tierFor('anyone-else', noOwner), 'other');
 	});
@@ -107,7 +116,7 @@ describe('effectiveTier — per-turn speaker attribution', () => {
 	it('legacy DISCORD_VOICE_OWNER (treatAsOwner) overrides everything to owner', () => {
 		assert.equal(effectiveTier(['stranger-9999'], access, true), 'owner');
 		assert.equal(effectiveTier([], access, true), 'owner');
-		const noOwner: AccessTiers = { owner: '', team: new Set() };
+		const noOwner: AccessTiers = { owner: new Set(), team: new Set() };
 		assert.equal(effectiveTier(['anyone'], noOwner, true), 'owner');
 	});
 });
@@ -125,5 +134,33 @@ describe('toolNeed — full tool classification', () => {
 	});
 	it('an unclassified (inline read-only) tool → null (open to all)', () => {
 		assert.equal(toolNeed('get_current_time', ownerOnly, team), null);
+	});
+});
+
+describe('loadAccessTiers — access.json parsing (finding-3 model)', () => {
+	it('owner = top-level allowFrom; team = union of groups[*].allowFrom', () => {
+		const home = mkdtempSync(join(tmpdir(), 'acl-'));
+		mkdirSync(join(home, '.claude/channels/discord'), { recursive: true });
+		writeFileSync(
+			join(home, '.claude/channels/discord/access.json'),
+			JSON.stringify({
+				owner: 'ignored-owner-field',
+				allowFrom: ['owner-A', 'owner-B'],
+				groups: {
+					'chan-1': { allowFrom: ['team-A', 'team-B'] },
+					'chan-2': { allowFrom: ['team-B', 'team-C'] },
+				},
+			}),
+		);
+		const t = loadAccessTiers(home);
+		assert.deepEqual([...t.owner].sort(), ['owner-A', 'owner-B']);
+		assert.deepEqual([...t.team].sort(), ['team-A', 'team-B', 'team-C']);
+		// the `owner` field is NOT a tier source — only top-level allowFrom is
+		assert.equal(t.owner.has('ignored-owner-field'), false);
+	});
+	it('missing access.json → empty tiers (fail closed)', () => {
+		const t = loadAccessTiers(mkdtempSync(join(tmpdir(), 'acl-empty-')));
+		assert.equal(t.owner.size, 0);
+		assert.equal(t.team.size, 0);
 	});
 });

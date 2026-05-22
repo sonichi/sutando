@@ -61,7 +61,7 @@ DISCORD_VOICE_SERVER=1 \
 Optional env:
 - `VOICE_MODEL` / `VOICE_NATIVE_AUDIO_MODEL` — mirrors `voice-agent.ts`.
 - `SUTANDO_WORKSPACE` — workspace root for tasks/results/data/logs.
-- `DISCORD_VOICE_OWNER` — legacy fallback, only consulted when no `owner` is set in `access.json` (see **Trust boundary**). `=true` treats every speaker as owner; default `false`.
+- `DISCORD_VOICE_OWNER` — legacy fallback (see **Trust boundary**). `=true` treats every speaker as owner; default `false`.
 
 `DISCORD_VOICE_SERVER=1` flips the polymorphic `dismiss` tool (`src/meeting-tools.ts`) into "SIGTERM self" mode instead of its default Zoom AppleScript path. Without it, asking Sutando to "leave"/"dismiss" in the channel would try to leave a (non-existent) Zoom meeting.
 
@@ -69,11 +69,11 @@ Optional env:
 
 Owner-tier tools are gated **per speaker**, by Discord user id, not per channel. Each turn is attributed to the speaker who started it, and tools are gated by that speaker's tier — read from the same `~/.claude/channels/discord/access.json` the discord-bridge uses, so the two never drift:
 
-- **owner** — the `owner` field in `access.json` (one id, the instance operator). Full tool surface: `work`, `dismiss`, screen-share, file edits, message sends.
-- **team** — the rest of `allowFrom` (trusted circle: peers, collaborators). Read-only inline tools + configurable tools + `dismiss`; no `work` / file edits. (`dismiss` is intentional: a teammate can end the bot's voice session — useful when the owner isn't present to close the room; the owner can rejoin via DM.)
+- **owner** — an id in the top-level `allowFrom` of `access.json`. Full tool surface: `work`, `dismiss`, screen-share, file edits, message sends.
+- **team** — an id in any `groups[*].allowFrom` (per-channel trusted circle: peers, collaborators) that is not also owner. Read-only inline tools + configurable tools + `dismiss`; no `work` / file edits. (`dismiss` is intentional: a teammate can end the bot's voice session — useful when the owner isn't present to close the room; the owner can rejoin via DM.)
 - **other** — anyone else speaking in the channel. Read-only inline tools only (time, status, lookups).
 
-Set it up by adding `"owner": "<your-discord-user-id>"` to `access.json`. If no `owner` is configured, the gate falls back to the legacy process-global `DISCORD_VOICE_OWNER` flag.
+This is exactly the model `discord-bridge.py` uses (top-level `allowFrom` = owner, `groups[*].allowFrom` = team), so the same `access.json` is never read two ways. If `allowFrom` is empty, the gate falls back to the legacy process-global `DISCORD_VOICE_OWNER` flag.
 
 This means the bot can sit safely in a shared/multi-person voice channel: a non-owner speaker physically cannot trigger owner-tier tools — the gate runs at tool-execution time, so even if the model tries, the call is denied.
 
@@ -81,7 +81,7 @@ This means the bot can sit safely in a shared/multi-person voice channel: a non-
 
 The bot joins a voice channel when its owner DMs it "join the lounge voice channel in `<server>`" — the loop spawns the run command above as a subprocess. The task-bridge → proactive-loop → Bash pipeline handles it.
 
-**A join request is honored only when the originating task's `access_tier` is `owner`.** access_tier is set by `discord-bridge.py` from `access.json` (owner = the `owner` field; team = the rest of `allowFrom`; other = neither). A `team`- or `other`-tier "join voice" request is declined — a non-owner cannot make the bot enter a voice channel. This holds at two layers: non-owner Discord tasks are already routed to a read-only sandbox (see CLAUDE.md "Discord access control") which cannot spawn the server, and the join request itself is owner-gated on top of that.
+**A join request is honored only when the originating task's `access_tier` is `owner`.** access_tier is set by `discord-bridge.py` from `access.json` (owner = top-level `allowFrom`; team = the union of `groups[*].allowFrom`; other = neither). A `team`- or `other`-tier "join voice" request is declined — a non-owner cannot make the bot enter a voice channel. This holds at two layers: non-owner Discord tasks are already routed to a read-only sandbox (see CLAUDE.md "Discord access control") which cannot spawn the server, and the join request itself is owner-gated on top of that.
 
 ## Tools
 

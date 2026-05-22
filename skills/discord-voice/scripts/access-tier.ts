@@ -3,11 +3,14 @@
  * out of discord-voice-server.ts so it can be unit-tested without a live
  * voice session.
  *
- * Mirrors the discord-bridge access model, read from the same
- * ~/.claude/channels/discord/access.json:
- *   owner — the `owner` field (this instance's single operator)
- *   team  — the rest of `allowFrom` (trusted circle: peers, collaborators)
+ * Mirrors the discord-bridge access model exactly (discord-bridge.py), read
+ * from the same ~/.claude/channels/discord/access.json:
+ *   owner — top-level `allowFrom` (canonical owner tier — discord-bridge.py
+ *           treats top-level allowFrom as owner; access.json's `owner` field
+ *           is not the tier source)
+ *   team  — the union of `groups[*].allowFrom` (per-channel trusted circle)
  *   other — anyone else who speaks in the channel
+ * Owner takes precedence: an id in both resolves to owner.
  */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -15,25 +18,38 @@ import { join } from 'node:path';
 export type Tier = 'owner' | 'team' | 'other';
 
 export interface AccessTiers {
-	owner: string;
+	owner: Set<string>;
 	team: Set<string>;
 }
 
-/** Read access.json under the given home dir. Fail-soft → empty tiers. */
+/**
+ * Read access.json under the given home dir. Fail-soft → empty tiers.
+ * owner = top-level `allowFrom`; team = union of `groups[*].allowFrom`.
+ * Matches discord-bridge.py so the same access.json can't be read two ways.
+ */
 export function loadAccessTiers(homeDir: string): AccessTiers {
 	try {
 		const p = join(homeDir, '.claude/channels/discord/access.json');
 		const a = JSON.parse(readFileSync(p, 'utf-8'));
-		return { owner: String(a.owner ?? ''), team: new Set<string>(a.allowFrom ?? []) };
+		const owner = new Set<string>((a.allowFrom ?? []).map(String));
+		const team = new Set<string>();
+		for (const cfg of Object.values(a.groups ?? {})) {
+			if (cfg && typeof cfg === 'object') {
+				for (const id of ((cfg as { allowFrom?: unknown[] }).allowFrom ?? [])) {
+					team.add(String(id));
+				}
+			}
+		}
+		return { owner, team };
 	} catch {
-		return { owner: '', team: new Set<string>() };
+		return { owner: new Set<string>(), team: new Set<string>() };
 	}
 }
 
-/** Tier of a speaking Discord user id. */
+/** Tier of a speaking Discord user id. Owner is checked first (precedence). */
 export function tierFor(userId: string | undefined, access: AccessTiers): Tier {
 	if (!userId) return 'other';
-	if (access.owner && userId === access.owner) return 'owner';
+	if (access.owner.has(userId)) return 'owner';
 	if (access.team.has(userId)) return 'team';
 	return 'other';
 }

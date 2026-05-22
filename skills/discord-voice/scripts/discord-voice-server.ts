@@ -288,7 +288,7 @@ function delegateTask(s: DiscordVoiceSession, taskDescription: string): Promise<
 function buildAgent(s: DiscordVoiceSession): MainAgent {
 	// Declare the full owner toolset whenever an owner is configured (access.json)
 	// or the legacy flag is on; the per-speaker tier is then enforced at execute().
-	const isOwner = TREAT_AS_OWNER || !!ACCESS.owner;
+	const isOwner = TREAT_AS_OWNER || ACCESS.owner.size > 0;
 
 	let instructions: string;
 	if (isOwner) {
