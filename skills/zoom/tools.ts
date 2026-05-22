@@ -446,3 +446,12 @@ if result.stdout.strip():
 		}
 	},
 };
+
+/**
+ * Manifest entry point — `loadSkillManifestTools()` in src/inline-tools.ts
+ * dynamic-imports this module and merges `tools` into the agent tool table
+ * (#976 conformance).  The individual named exports above are kept for skills
+ * that import a tool directly to override or extend Zoom behaviour (e.g.
+ * skills/discord-voice's dismiss override).
+ */
+export const tools: ToolDefinition[] = [summonTool, dismissTool, joinZoomTool];

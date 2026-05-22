@@ -1,0 +1,5 @@
+{
+  "_comment": "TEMPLATE — do not edit in place. The live config is per-user data and lives at $SUTANDO_WORKSPACE/config/voice-agent.json (default ~/.sutando/workspace/config/voice-agent.json). On first run voice-agent copies this template there if it is missing. Edit the workspace copy, never this file. Keys: model + googleSearch are voice prefs (the switch_voice_config tool writes them at runtime). voice-agent ships with model=3.1 + googleSearch=false because the web client's code-heavy workload prefers 3.1.",
+  "model": "gemini-3.1-flash-live-preview",
+  "googleSearch": false
+}
