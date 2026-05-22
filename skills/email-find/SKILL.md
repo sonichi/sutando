@@ -1,12 +1,12 @@
 ---
 name: email-find
-description: "Locate a specific email when the obvious searches fail. Use when the owner is confident an email exists but a targeted query returned nothing."
+description: "Locate a specific email when the obvious searches fail. Use when the user is confident an email exists but a targeted query returned nothing."
 user-invocable: true
 ---
 
 # Email Find
 
-A playbook for finding a specific email through the Gmail MCP (`claude.ai Gmail`) when the obvious search query returns nothing. Optimized for the case the owner mentions a description and the agent must *not* give up easily.
+A playbook for finding a specific email through the Gmail MCP (`claude.ai Gmail`) when the obvious search query returns nothing. Optimized for the case where the user describes an email and the agent must *not* give up easily.
 
 **Usage**: `/email-find <description>`
 
@@ -14,31 +14,33 @@ ARGUMENTS: $ARGUMENTS
 
 ## Behavioral rules
 
-1. **If the owner is confident an email exists, the email exists.** Do not respond with "I can't find it" after one or two failed queries. The default failure mode is the agent's query, not the user's memory.
+1. **If the user is confident an email exists, the email exists.** Do not respond with "I can't find it" after one or two failed queries. The default failure mode is the agent's query, not the user's memory.
 
-2. **Broad before narrow.** Always run at least one query that scans the full inbox by recency before narrowing on subject or sender keywords. A reply about K-12 can land on a thread whose subject is `Re: Fwd: Highland Fleets - Contact Data` with zero K-12 / K12 tokens in it — a subject-keyword filter throws those threads away.
+2. **Broad before narrow.** Always run at least one query that scans the full inbox by recency before narrowing on subject or sender keywords. A reply about Topic-X can land on a thread whose subject names a different topic, with zero topic-X tokens in the subject — a keyword filter throws those threads away.
 
-3. **Expand sender to partners, not just the named entity.** When the owner mentions a customer or vendor by name, also search for known partner domains. Most operational replies come from data-ops partners, not the named principal contact. The current map lives in `## Partner domain map` below. Add to it as new partnerships surface.
+3. **Expand sender to partners, not just the named entity.** When the user mentions a customer / vendor / collaborator by name, also search for known associated email domains. Operational replies often come from data-ops partners, contractors, or assistants — not the named principal contact. See `## Per-user partner-domain memory` below for how this is stored per user.
 
-4. **Re-fetch threads in full.** `get_thread` may show only a subset of messages when called with `MINIMAL` format on a previously-summarized thread. If you've identified the candidate thread, fetch it again with `FULL_CONTENT` (or scan `MINIMAL` carefully — message count should match what you see in the Gmail UI). Long threads (29+ messages) are particularly prone to truncation.
+4. **Re-fetch threads in full.** `get_thread` may show only a subset of messages when called with `MINIMAL` format on a previously-summarized thread. If you've identified the candidate thread, fetch it again with `FULL_CONTENT` (or scan `MINIMAL` carefully — the message count should match what's in the Gmail web UI). Long threads (29+ messages) are particularly prone to truncation.
 
-5. **Show the search trail.** End every "found it" or "still hunting" reply with the list of queries you tried, so the owner can see what worked and what didn't.
+5. **Show the search trail.** End every "found it" or "still hunting" reply with the list of queries you tried, so the user can see what worked and what didn't.
 
 ## Workflow
+
+In the queries below, `me` is Gmail's reserved keyword for the authenticated user's primary address — works for everyone regardless of which account is connected.
 
 ### Phase 1 — Broad scan
 
 Run **one** broad query first to anchor on what's actually in the inbox in the relevant time window:
 
 ```
-search_threads query="to:vasiliy@ag2.ai newer_than:Nd" pageSize=15
+search_threads query="to:me newer_than:Nd" pageSize=15
 ```
 
-Where `N` covers the window the owner cited (default 2; cite-driven). Look at the actual returned threads — note the senders, subjects, dates. Often the email is already in the top 10 results, just with a subject you wouldn't have guessed.
+Where `N` covers the window the user cited (default 2; cite-driven). Look at the actual returned threads — note senders, subjects, dates. Often the email is already in the top 10 results, just with a subject you wouldn't have guessed.
 
 ### Phase 2 — Expand sender domain
 
-If Phase 1 didn't surface it, run **one query per partner domain** the owner may have meant. Use the partner-domain map below. For each, format:
+If Phase 1 didn't surface it, run **one query per partner domain** the user may have meant. Look up known partner domains for the named entity in `## Per-user partner-domain memory` below. For each, format:
 
 ```
 search_threads query="from:DOMAIN OR from:NAMED-ADDRESS" pageSize=10
@@ -46,13 +48,13 @@ search_threads query="from:DOMAIN OR from:NAMED-ADDRESS" pageSize=10
 
 ### Phase 3 — Walk threads by participant
 
-If Phase 2 didn't surface it, list threads where the named contact is in the recipient list (To/CC/BCC), not just the sender:
+If Phase 2 didn't surface it, list threads where the named contact appears anywhere on the message (To/CC/BCC), not just as sender:
 
 ```
 search_threads query="DOMAIN OR NAMED-ADDRESS"
 ```
 
-(`to:`, `from:`, `cc:` all match the relationship — Gmail q-syntax treats a bare email as any-position match.)
+Gmail q-syntax treats a bare email as an any-position match — covers `from:`, `to:`, and `cc:`.
 
 ### Phase 4 — Re-walk identified threads
 
@@ -60,40 +62,54 @@ If you've spotted a candidate thread (e.g. one whose subject matches a related t
 
 ### Phase 5 — Ask only after Phases 1–4
 
-If all four phases came up empty, *then* ask the owner for one of:
+If all four phases came up empty, *then* ask the user for one of:
 - Exact sender email
 - Exact subject line or a short snippet
 - Approximate timestamp (UTC or local — both work)
 
-When you ask, include the actual list of senders + subjects you saw, so the owner can spot the email and tell you which one.
+When you ask, include the actual list of senders + subjects you saw, so the user can spot the email and tell you which one.
 
-## Partner domain map
+## Per-user partner-domain memory
 
-This map grows as new partnerships surface. When the owner mentions a relationship by name, expand to all known related domains:
+This skill is generic. The mapping of "named entity → partner email domains" is per-user knowledge that lives in the user's memory, not in this skill file. The agent should:
 
-| Named entity / customer | Partner / data-ops domain(s) |
+1. **On invocation, read** the user's memory directory for any file named `reference_partner_domains.md` (or similar — also accept patterns like `partner_domains_*.md`, or check the `## Partner domains` section of `user_profile.md`).
+2. **If the named entity is in the file**, expand to all listed domains in Phase 2.
+3. **If the named entity is NOT in the file** and Phase 2 returns useful hits from a previously-unknown domain, **propose adding the mapping** at the end of the reply so future sessions inherit it.
+
+File format (suggested — agent should match whatever convention the user already has):
+
+```markdown
+---
+name: partner-domains
+description: Map of named entities (customers, vendors, collaborators) to associated email domains.
+metadata:
+  type: reference
+---
+
+| Named entity | Associated email domains |
 |---|---|
-| K12 / K-12 / K12-data | `data.ops@soulilution.com`, `maneet@soulilution.com`, `*@soulilution.com`, `Charlie@k12-data.com`, `*@k12-data.com` |
-| Highland Fleets (K12 sub-order) | same as K12 |
-| Nokia | `*@nokia.com` |
-| DNAnexus | `*@dnanexus.com` |
+| Acme Corp | `*@acmecorp.com`, `*@acme-data-ops.com`, `vendor.contact@example.com` |
+| Foo Foundation | `*@foo.org`, `programs@foo.org`, `*@foo-partner.com` |
+```
 
-When adding a row, also append it to `feedback_gmail_search_assumptions.md` so the next session inherits the knowledge.
+If the file doesn't exist and the user has accumulated 2+ partner mappings during the session, **offer to create it** at the end of the reply.
 
-## Subject-mismatch examples (do NOT subject-filter)
+## Subject-mismatch heuristic (no subject filtering in Phases 1–3)
 
-Real cases seen on this account where the obvious subject filter would have hidden the email:
+A reply about Topic-X frequently rides on an existing operational thread whose subject is about something entirely different. The most common cases:
 
-- K12 requirements reply → subject was `Re: Fwd: Highland Fleets - Contact Data` (no K12/K-12 token)
-- Civics batch 3 delivery → subject was `Re: Fwd: Highland Fleets - Contact Data` (same long thread)
+- A topic that started as a complaint/incident keeps using the incident's subject for all subsequent replies, even months later.
+- A customer's data-ops team replies to whatever was the *first* email in the relationship, ignoring topic shifts.
+- A forwarded thread (`Fwd: Fwd: ...`) carries the original subject forever.
 
-When the topic has a recent operational history with a customer, **expect the reply to ride on the historical thread, not a new subject.**
+**Implication: never subject-filter on the named entity in Phases 1–3.** Subject keywords go in Phase 5 only, after the user provides them. Trust sender / recipient / date scoping; let the subjects be whatever Gmail kept on the thread.
 
 ## Reporting
 
 After running the workflow, reply with:
 
-1. The candidate email's sender, subject, timestamp, attachment list
+1. The candidate email's sender, subject, timestamp, and attachment list
 2. Which phase found it (1–4)
 3. What queries were run in each phase (one line each)
 4. If Phase 4 was used, which thread was re-walked
@@ -107,6 +123,7 @@ If nothing was found after Phase 4, reply with:
 ## Don't
 
 - Don't conclude "not found" before completing Phases 1–4.
-- Don't subject-filter on the named entity (K12, Nokia, etc.) in Phases 1–3 — the subject often doesn't carry that token.
+- Don't subject-filter on the named entity in Phases 1–3 — the subject often doesn't carry that token.
 - Don't trust a partial `get_thread` result. Long threads truncate.
-- Don't ask the owner for clarification before showing them the broad-scan list — they can usually spot the email in 10 seconds if you put it in front of them.
+- Don't ask the user for clarification before showing them the broad-scan list — they can usually spot the email in 10 seconds if you put it in front of them.
+- Don't hardcode partner mappings in this skill. They live in user memory per `## Per-user partner-domain memory`.
