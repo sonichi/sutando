@@ -85,26 +85,15 @@ ARCHIVE_TASKS_DIR = REPO / "tasks" / "archive"
 ARCHIVE_RESULTS_DIR = REPO / "results" / "archive"
 OWNER_ACTIVITY_FILE = STATE_DIR / "last-owner-activity.json"
 
-# Allowlist for paths that may be attached to outgoing Discord messages.
-# Result text can embed `[file: /path]` / `[send: /path]` / `[attach: /path]`
-# markers; we only forward paths that resolve under one of these roots.
-# Fail-closed: a non-matching path is reported inline rather than sent.
-SEND_ALLOWED_ROOTS = (
-    str(REPO / "results"),
-    str(REPO / "notes"),
-    # Notes canonical home (private dir) — once saved by save_note, paths
-    # reference the private location. Both old and new paths allowed during
-    # the transition; the resolver picks whichever exists.
-    str(shared_personal_path("notes", REPO)),
-    str(REPO / "docs"),
-    str(Path.home() / "Desktop" / "iclr-backups"),
-    str(Path.home() / "Documents" / "sutando-launch-assets"),
-)
-SEND_ALLOWED_PREFIXES = (
-    "/tmp/sutando-",
-    "/private/tmp/sutando-",
-    "/tmp/echo-",
-    "/private/tmp/echo-",
+# Allowlist for paths attached via `[file:|send:|attach:]` markers.
+# Single source of truth in `src/send_allowlist.py` — shared with
+# `src/dm-result.py`'s REST-fallback delivery (per liususan091219
+# review on PR #1029: keeping the policy as a copy in each file will
+# drift, even with "keep in sync" comments).
+from send_allowlist import (  # noqa: E402
+    SEND_ALLOWED_PREFIXES,
+    SEND_ALLOWED_ROOTS,
+    is_path_sendable as _is_path_sendable_shared,
 )
 
 
@@ -294,27 +283,11 @@ def _split_file_markers(text: str) -> tuple[str, list[str]]:
     return clean_text, files
 
 
-def _is_path_sendable(fpath: str) -> bool:
-    """True iff `fpath` is a real file AND resolves under an allowed root.
-
-    Uses os.path.realpath to collapse symlinks / `..` segments before the
-    prefix comparison, matching the sanitizer pattern used across the
-    codebase for CodeQL py/path-injection resolution.
-    """
-    if not os.path.isfile(fpath):
-        return False
-    try:
-        real = os.path.realpath(fpath)
-    except OSError:
-        return False
-    for root in SEND_ALLOWED_ROOTS:
-        root_real = os.path.realpath(root)
-        if real == root_real or real.startswith(root_real + os.sep):
-            return True
-    for prefix in SEND_ALLOWED_PREFIXES:
-        if real.startswith(prefix):
-            return True
-    return False
+# Thin alias — actual logic lives in src/send_allowlist.py so the
+# REST-fallback delivery path (src/dm-result.py) stays in lock-step.
+# Public name kept (_is_path_sendable) so existing call sites in this
+# file don't need touching beyond the import above.
+_is_path_sendable = _is_path_sendable_shared
 
 
 def write_owner_activity(channel: str, summary: str) -> None:

@@ -38,42 +38,21 @@ REPO = resolve_workspace()
 ACCESS_JSON = Path.home() / ".claude" / "channels" / "discord" / "access.json"
 SSE_STATUS_URL = "http://localhost:8080/sse-status"
 
-# Path allowlist for `[file: ...]` markers — mirrors
-# `_is_path_sendable` in `src/discord-bridge.py` so the REST delivery
-# path applies the same exfil-protection as the WS-connected live
-# bridge. A bug in either path that lets an attacker-controlled marker
-# upload `/etc/passwd` is a real concern; keeping the policy in sync
-# avoids drift.
-_SEND_ALLOWED_ROOTS = (
-    str(REPO / "results"),
-    str(REPO / "notes"),
-    str(REPO / "docs"),
+# Path allowlist for `[file: ...]` markers — sourced from
+# `src/send_allowlist.py` so this REST-fallback path uses the SAME
+# policy as the WS-connected live bridge (`src/discord-bridge.py`).
+# Per @liususan091219 review on PR #1029: a copied allowlist will
+# drift even with a comment claiming they're in sync — the extract
+# removes that hazard at the boundary. Pre-extract, the dm-result
+# copy was already missing the personal-notes / Desktop / Documents
+# roots that discord-bridge had; the shared import fixes that drift.
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).resolve().parent))
+from send_allowlist import (  # noqa: E402
+    is_path_sendable as _is_path_sendable,
+    SEND_ALLOWED_PREFIXES as _SEND_ALLOWED_PREFIXES,
+    SEND_ALLOWED_ROOTS as _SEND_ALLOWED_ROOTS,
 )
-_SEND_ALLOWED_PREFIXES = (
-    "/tmp/sutando-",
-    "/private/tmp/sutando-",
-    "/tmp/echo-",
-    "/private/tmp/echo-",
-)
-
-
-def _is_path_sendable(fpath: str) -> bool:
-    """True iff `fpath` is a real file AND resolves under an allowed
-    root. Same shape as the canonical helper in discord-bridge.py."""
-    if not os.path.isfile(fpath):
-        return False
-    try:
-        real = os.path.realpath(fpath)
-    except OSError:
-        return False
-    for root in _SEND_ALLOWED_ROOTS:
-        root_real = os.path.realpath(root)
-        if real == root_real or real.startswith(root_real + os.sep):
-            return True
-    for prefix in _SEND_ALLOWED_PREFIXES:
-        if real.startswith(prefix):
-            return True
-    return False
 
 
 _FENCE_LINE = re.compile(r"^\s{0,3}(`{3,}|~{3,})\s*([^\s`~][^`~]*)?\s*$")
