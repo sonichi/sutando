@@ -27,7 +27,11 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { VOICE_CONFIG_DEFAULTS, type VoiceConfig } from './voice-config.js';
 import { resolveWorkspace } from './workspace_default.js';
 
-const PRESETS: Record<'search' | 'no-search', VoiceConfig> = {
+// Presets carry only the two knobs this tool switches (model + googleSearch);
+// owner_mode / channels are merged in from VOICE_CONFIG_DEFAULTS at write time.
+type VoiceConfigPreset = Pick<VoiceConfig, 'model' | 'googleSearch'>;
+
+const PRESETS: Record<'search' | 'no-search', VoiceConfigPreset> = {
 	search: { model: 'gemini-2.5-flash-native-audio-preview-12-2025', googleSearch: true },
 	'no-search': { model: 'gemini-3.1-flash-live-preview', googleSearch: false },
 };

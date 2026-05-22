@@ -1,4 +1,6 @@
 {
   "model": "gemini-2.5-flash-native-audio-preview-12-2025",
-  "googleSearch": true
+  "googleSearch": true,
+  "owner_mode": false,
+  "channels": {}
 }

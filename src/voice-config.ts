@@ -15,7 +15,12 @@
  * surface copies the template into the workspace if the live config is
  * missing. Schema:
  *
- *   { "model": "gemini-2.5-flash-native-audio-preview-12-2025", "googleSearch": true }
+ *   {
+ *     "model": "gemini-2.5-flash-native-audio-preview-12-2025",
+ *     "googleSearch": true,
+ *     "owner_mode": false,
+ *     "channels": { "<voice_channel_id>": { "owner_mode": true } }
+ *   }
  *
  * Missing file → defaults. Partial file → fill in missing keys from defaults.
  *
@@ -28,27 +33,49 @@
  * web client's code-heavy workload) ship a `.example` template carrying that
  * override. Phone inherits the default; discord-voice's template carries it
  * too, so a fresh install behaves identically.
+ *
+ * `owner_mode` / `channels` are the discord-voice trust-boundary knobs
+ * (issue #1016) — `owner_mode` is the skill-wide default and `channels[id]`
+ * is a per-voice-channel override. They replaced the coarse global env flag
+ * the skill previously used. Both default to a safe read-only posture.
  */
 
 import { readFileSync, existsSync } from 'fs';
 
+/** Per-channel override entry. Object-shaped so it stays extensible. */
+export interface VoiceChannelConfig {
+	owner_mode?: boolean;
+}
+
 export interface VoiceConfig {
 	model: string;
 	googleSearch: boolean;
+	/** Skill-wide default for owner-mode. Safe default: false (read-only). */
+	owner_mode: boolean;
+	/** Per-channel overrides, keyed by voice channel id. */
+	channels: Record<string, VoiceChannelConfig>;
 }
 
 export const VOICE_CONFIG_DEFAULTS: VoiceConfig = {
 	model: 'gemini-2.5-flash-native-audio-preview-12-2025',
 	googleSearch: true,
+	owner_mode: false,
+	channels: {},
 };
 
 export function loadVoiceConfig(configPath: string): VoiceConfig {
-	if (!existsSync(configPath)) return { ...VOICE_CONFIG_DEFAULTS };
+	if (!existsSync(configPath)) return { ...VOICE_CONFIG_DEFAULTS, channels: {} };
 	try {
 		const raw = JSON.parse(readFileSync(configPath, 'utf-8'));
-		return { ...VOICE_CONFIG_DEFAULTS, ...raw };
+		return {
+			...VOICE_CONFIG_DEFAULTS,
+			...raw,
+			// channels is a nested object — spread can't deep-merge, so take the
+			// file's map verbatim when present, else fall back to the empty default.
+			channels: raw.channels ?? {},
+		};
 	} catch (e) {
 		console.warn(`[voice-config] failed to parse ${configPath}, using defaults: ${(e as Error).message}`);
-		return { ...VOICE_CONFIG_DEFAULTS };
+		return { ...VOICE_CONFIG_DEFAULTS, channels: {} };
 	}
 }

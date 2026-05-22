@@ -61,19 +61,45 @@ DISCORD_VOICE_SERVER=1 \
 Optional env:
 - `VOICE_MODEL` / `VOICE_NATIVE_AUDIO_MODEL` — mirrors `voice-agent.ts`.
 - `SUTANDO_WORKSPACE` — workspace root for tasks/results/data/logs.
-- `DISCORD_VOICE_OWNER` — legacy fallback (see **Trust boundary**). `=true` treats every speaker as owner; default `false`.
-
 `DISCORD_VOICE_SERVER=1` flips the polymorphic `dismiss` tool (`src/meeting-tools.ts`) into "SIGTERM self" mode instead of its default Zoom AppleScript path. Without it, asking Sutando to "leave"/"dismiss" in the channel would try to leave a (non-existent) Zoom meeting.
+
+## Owner-mode config
+
+Owner-mode is set in `skills/discord-voice/config.json` (not an env var). Two keys:
+
+- `owner_mode` — skill-wide default (boolean). `false` by default.
+- `channels` — per-voice-channel override map: `{ "<voice_channel_id>": { "owner_mode": true } }`. The channel entry is an object so it stays extensible.
+
+Resolution for a given channel: `channels[<channel_id>].owner_mode` if that entry exists, else the skill-wide `owner_mode`, else `false`. A fresh `config.json` (`owner_mode: false`, `channels: {}`) runs every channel read-only.
+
+```json
+{
+  "model": "gemini-2.5-flash-native-audio-preview-12-2025",
+  "googleSearch": true,
+  "owner_mode": false,
+  "channels": {
+    "111111111111111111": { "owner_mode": true }
+  }
+}
+```
+
+## Trust boundary — read this before enabling owner-mode
+
+`owner_mode: false` is the **safe default**: non-owner speakers in the voice channel get the read-only tool surface (current time, status checks, lookups) but NOT owner-tier `work`, file edits, or message sends.
+
+`owner_mode: true` — whether set skill-wide or per-channel via `channels` — is the opt-in for **single-operator personal-use mode**: it inherits owner-tier privileges to every speaker in the channel. It has a sharp edge — anyone who can speak in the same voice channel can delegate `work`, edit files, send messages, anything the proactive loop can do. Only enable it for voice channels whose membership is fully trusted (your own Lounge, never community/public). Prefer the per-channel `channels` override over the skill-wide `owner_mode` so a trusted-channel grant doesn't leak to every channel the bot joins.
 
 ## Trust boundary — per-speaker access tiers
 
-Owner-tier tools are gated **per speaker**, by Discord user id, not per channel. Each turn is attributed to the speaker who started it, and tools are gated by that speaker's tier — read from the same `~/.claude/channels/discord/access.json` the discord-bridge uses, so the two never drift:
+Independently of `owner_mode`, owner-tier tools are gated **per speaker**, by Discord user id. Each turn is attributed to the speaker who started it, and tools are gated by that speaker's tier — read from the same `~/.claude/channels/discord/access.json` the discord-bridge uses, so the two never drift:
 
 - **owner** — an id in the top-level `allowFrom` of `access.json`. Full tool surface: `work`, `dismiss`, screen-share, file edits, message sends.
 - **team** — an id in any `groups[*].allowFrom` (per-channel trusted circle: peers, collaborators) that is not also owner. Read-only inline tools + configurable tools + `dismiss`; no `work` / file edits. (`dismiss` is intentional: a teammate can end the bot's voice session — useful when the owner isn't present to close the room; the owner can rejoin via DM.)
 - **other** — anyone else speaking in the channel. Read-only inline tools only (time, status, lookups).
 
-This is exactly the model `discord-bridge.py` uses (top-level `allowFrom` = owner, `groups[*].allowFrom` = team), so the same `access.json` is never read two ways. If `allowFrom` is empty, the gate falls back to the legacy process-global `DISCORD_VOICE_OWNER` flag.
+`owner_mode: true` and the per-speaker tiers compose: a speaker gets the owner surface when `owner_mode` is on for the channel **or** their id resolves to the owner tier.
+
+This is exactly the model `discord-bridge.py` uses (top-level `allowFrom` = owner, `groups[*].allowFrom` = team), so the same `access.json` is never read two ways. If `allowFrom` is empty, the gate falls back to the channel-wide `owner_mode` resolved from `config.json` (see **Owner-mode config** above).
 
 This means the bot can sit safely in a shared/multi-person voice channel: a non-owner speaker physically cannot trigger owner-tier tools — the gate runs at tool-execution time, so even if the model tries, the call is denied.
 

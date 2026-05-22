@@ -95,13 +95,6 @@ const DISCORD_VOICE_GOOGLE_SEARCH = DISCORD_VOICE_CONFIG.googleSearch;
 // this, treat the session as hung and force a reconnect. Env-overridable.
 const WATCHDOG_STALL_MS = Number(process.env.SUTANDO_WATCHDOG_STALL_MS) || 20000;
 
-// Default false (safe): non-owner speakers in the voice channel get the
-// read-only tool surface but NOT owner-tier work/file-edit/message-send.
-// Set DISCORD_VOICE_OWNER=true explicitly to inherit owner privileges to
-// every speaker — only safe in voice channels whose membership is fully
-// trusted (single-operator Lounge, not community/public).
-const TREAT_AS_OWNER = (process.env.DISCORD_VOICE_OWNER ?? 'false') === 'true';
-
 // --- Per-speaker access tier (owner / team / other) -------------------------
 // Tier logic lives in ./access-tier.ts (pure + unit-tested). A Gemini Live
 // session's tool list is fixed at session start, so the tier is enforced
@@ -115,6 +108,20 @@ function getArg(name: string): string | undefined {
 }
 const GUILD_ID = getArg('guild');
 const CHANNEL_ID = getArg('channel');
+
+// Owner-mode (issue #1016) — resolved from skills/discord-voice/config.json,
+// NOT an env var. Resolution order:
+//   1. config.channels[CHANNEL_ID].owner_mode  (per-channel override)
+//   2. config.owner_mode                       (skill-wide default)
+//   3. false                                   (safe default)
+// Default false (safe): non-owner speakers in the voice channel get the
+// read-only tool surface but NOT owner-tier work/file-edit/message-send.
+// Set owner_mode=true (skill-wide or per-channel) to inherit owner privileges
+// to every speaker — only safe in voice channels whose membership is fully
+// trusted (single-operator Lounge, not community/public). See SKILL.md.
+const _channelConfig = CHANNEL_ID ? DISCORD_VOICE_CONFIG.channels[CHANNEL_ID] : undefined;
+const TREAT_AS_OWNER =
+	_channelConfig?.owner_mode ?? DISCORD_VOICE_CONFIG.owner_mode ?? false;
 
 if (!GEMINI_API_KEY) { console.error('Error: GEMINI_API_KEY required'); process.exit(1); }
 if (!DISCORD_BOT_TOKEN) { console.error('Error: DISCORD_BOT_TOKEN required'); process.exit(1); }
