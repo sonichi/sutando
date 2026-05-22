@@ -61,11 +61,13 @@ def make_checks(*statuses_and_names):
 
 def write_status(workspace_dir: Path, payload: dict | None) -> None:
     """Write core-status.json into a temp WORKSPACE_DIR override; pass None
-    to skip writing the file at all. (Was REPO_DIR pre-PR #836;
-    check_core_proactive_loop now reads from WORKSPACE_DIR — core-status.json
-    is per-user runtime state, not code.)"""
+    to skip writing the file at all. (Was REPO_DIR pre-PR #836; the file
+    then moved to WORKSPACE_DIR, and post-#940 lives in WORKSPACE_DIR/state/
+    — check_core_proactive_loop reads it there.)"""
     if payload is not None:
-        (workspace_dir / "core-status.json").write_text(json.dumps(payload))
+        status_file = workspace_dir / "state" / "core-status.json"
+        status_file.parent.mkdir(parents=True, exist_ok=True)
+        status_file.write_text(json.dumps(payload))
 
 
 def write_task(tasks_dir: Path, name: str, age_sec: int) -> Path:
@@ -108,7 +110,9 @@ def case_b_status_malformed() -> list[str]:
     fails = []
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
-        (td / "core-status.json").write_text("{ this is not json")
+        status_file = td / "state" / "core-status.json"
+        status_file.parent.mkdir(parents=True, exist_ok=True)
+        status_file.write_text("{ this is not json")
         orig = hc.WORKSPACE_DIR
         try:
             hc.WORKSPACE_DIR = td
