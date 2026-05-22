@@ -118,9 +118,9 @@ mdfind "kMDItemKind == 'PDF'" -onlyin ~/Documents  # by file type in a folder
 
 **Meeting join** — join Zoom or Google Meet with computer audio:
 ```bash
-npx tsx -e "import 'dotenv/config'; import { joinZoomTool } from './src/inline-tools.ts'; joinZoomTool.execute({}, null).then(r => console.log(JSON.stringify(r)))"
+npx tsx -e "import 'dotenv/config'; import { joinZoomTool } from './skills/zoom/tools.ts'; joinZoomTool.execute({}, null).then(r => console.log(JSON.stringify(r)))"
 npx tsx -e "import 'dotenv/config'; import { joinGmeetTool } from './src/inline-tools.ts'; joinGmeetTool.execute({ meetingCode: 'abc-defg-hij' }, null).then(r => console.log(JSON.stringify(r)))"
-npx tsx -e "import 'dotenv/config'; import { summonTool } from './src/inline-tools.ts'; summonTool.execute({}, null).then(r => console.log(JSON.stringify(r)))"
+npx tsx -e "import 'dotenv/config'; import { summonTool } from './skills/zoom/tools.ts'; summonTool.execute({}, null).then(r => console.log(JSON.stringify(r)))"
 ```
 - `joinZoomTool` — Zoom desktop app + computer audio (no screen share)
 - `joinGmeetTool` — Chrome browser + computer audio + camera off

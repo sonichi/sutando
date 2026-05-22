@@ -21,13 +21,16 @@
  * ## Env
  *   DISCORD_BOT_TOKEN  — bot token (~/.claude/channels/discord/.env)
  *   GEMINI_API_KEY (or GEMINI_VOICE_API_KEY) — required; voiceApiKey()
- *   VOICE_MODEL — text/STT model; native-audio model + googleSearch live
- *                 in skills/discord-voice/config.json (see src/voice-config.ts)
- *   SUTANDO_WORKSPACE  — workspace root for tasks/results/data
+ *   VOICE_MODEL — text/STT model; native-audio model + googleSearch +
+ *                 owner_mode/channels live in the per-user config at
+ *                 $SUTANDO_WORKSPACE/config/discord-voice.json — NOT a
+ *                 committed repo file (the repo ships config.json.example
+ *                 as a template; see src/voice-config.ts for the schema)
+ *   SUTANDO_WORKSPACE  — workspace root for tasks/results/data + config
  */
 
 import { config as _dotenvConfig } from 'dotenv';
-import { mkdirSync, writeFileSync, appendFileSync, existsSync, readFileSync, unlinkSync } from 'node:fs';
+import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { resolveWorkspace } from '../../../src/workspace_default.js';
 import { recordConversation, recordSession } from '../../../src/conversation-store.js';
@@ -38,7 +41,7 @@ _dotenvConfig({ path: join(process.env.HOME ?? '', '.claude/channels/discord/.en
 
 import { fileURLToPath } from 'node:url';
 import { voiceApiKey } from '../../../src/voice-key.js';
-import { loadVoiceConfig } from '../../../src/voice-config.js';
+import { loadVoiceConfig, resolveOwnerMode } from '../../../src/voice-config.js';
 import { execSync, spawn } from 'node:child_process';
 import { VoiceSession, type ToolDefinition, type MainAgent } from 'bodhi-realtime-agent';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
@@ -73,6 +76,11 @@ import {
 const GEMINI_API_KEY = voiceApiKey();
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN ?? '';
 const WORKSPACE_DIR = resolveWorkspace();
+// Operational/diagnostic log — the [Setup]/[Voice]/[Tool]/[VoiceSession]/
+// [Dismiss] lines that otherwise only hit stdout. Mirrors discord-bridge.log
+// and voice-agent.log so discord-voice's operational history survives a
+// process exit. Tee'd from console.log/console.error below (fail-soft).
+const DISCORD_VOICE_LOG = join(WORKSPACE_DIR, 'logs', 'discord-voice.log');
 const DATA_DIR = join(WORKSPACE_DIR, 'data');
 const RESULTS_DIR = process.env.DISCORD_VOICE_RESULTS_DIR || join(WORKSPACE_DIR, 'results');
 const TASKS_DIR = join(WORKSPACE_DIR, 'tasks');
@@ -81,10 +89,29 @@ const TASK_POLL_TIMEOUT_MS = 300_000;
 const OWNER_NAME = process.env.owner ?? '';
 
 const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
-// Per-skill voice config (native-audio model + googleSearch) lives in
-// skills/discord-voice/config.json. Schema + defaults: src/voice-config.ts.
+// Per-user voice config (native-audio model + googleSearch + owner_mode +
+// channels) is data, not code: it lives in the workspace, NOT in the git repo.
+//   live config: $SUTANDO_WORKSPACE/config/discord-voice.json
+//   template:    skills/discord-voice/config.json.example (committed)
+// On first run, if the workspace config is missing, the committed .example
+// template is copied into place so the operator has a file to edit. If the
+// copy fails (or the template is gone), loadVoiceConfig falls back to its
+// built-in safe defaults. Schema + defaults: src/voice-config.ts.
 const _discordSkillDir = dirname(dirname(fileURLToPath(import.meta.url)));
-const DISCORD_VOICE_CONFIG = loadVoiceConfig(join(_discordSkillDir, 'config.json'));
+const DISCORD_VOICE_CONFIG_PATH = join(WORKSPACE_DIR, 'config', 'discord-voice.json');
+if (!existsSync(DISCORD_VOICE_CONFIG_PATH)) {
+	const _exampleConfigPath = join(_discordSkillDir, 'config.json.example');
+	try {
+		mkdirSync(dirname(DISCORD_VOICE_CONFIG_PATH), { recursive: true });
+		if (existsSync(_exampleConfigPath)) {
+			copyFileSync(_exampleConfigPath, DISCORD_VOICE_CONFIG_PATH);
+			console.log(`${new Date().toISOString().slice(11, 23)} [discord-voice] seeded config from template → ${DISCORD_VOICE_CONFIG_PATH}`);
+		}
+	} catch (e) {
+		console.warn(`${new Date().toISOString().slice(11, 23)} [discord-voice] could not seed config at ${DISCORD_VOICE_CONFIG_PATH}: ${(e as Error).message} — using built-in defaults`);
+	}
+}
+const DISCORD_VOICE_CONFIG = loadVoiceConfig(DISCORD_VOICE_CONFIG_PATH);
 const VOICE_NATIVE_AUDIO_MODEL = DISCORD_VOICE_CONFIG.model;
 const DISCORD_VOICE_GOOGLE_SEARCH = DISCORD_VOICE_CONFIG.googleSearch;
 
@@ -94,13 +121,6 @@ const DISCORD_VOICE_GOOGLE_SEARCH = DISCORD_VOICE_CONFIG.googleSearch;
 // since the last turn AND the user last stopped speaking longer ago than
 // this, treat the session as hung and force a reconnect. Env-overridable.
 const WATCHDOG_STALL_MS = Number(process.env.SUTANDO_WATCHDOG_STALL_MS) || 20000;
-
-// Default false (safe): non-owner speakers in the voice channel get the
-// read-only tool surface but NOT owner-tier work/file-edit/message-send.
-// Set DISCORD_VOICE_OWNER=true explicitly to inherit owner privileges to
-// every speaker — only safe in voice channels whose membership is fully
-// trusted (single-operator Lounge, not community/public).
-const TREAT_AS_OWNER = (process.env.DISCORD_VOICE_OWNER ?? 'false') === 'true';
 
 // --- Per-speaker access tier (owner / team / other) -------------------------
 // Tier logic lives in ./access-tier.ts (pure + unit-tested). A Gemini Live
@@ -115,6 +135,35 @@ function getArg(name: string): string | undefined {
 }
 const GUILD_ID = getArg('guild');
 const CHANNEL_ID = getArg('channel');
+
+// Owner-mode (issue #1016) — resolved from the workspace config
+// ($SUTANDO_WORKSPACE/config/discord-voice.json), NOT an env var and NOT a
+// committed repo file. Resolution order:
+//   1. config.channels[CHANNEL_ID].owner_mode  (per-channel override)
+//   2. config.owner_mode                       (skill-wide default)
+//   3. false                                   (safe default)
+// Default false (safe): non-owner speakers in the voice channel get the
+// read-only tool surface but NOT owner-tier work/file-edit/message-send.
+// Set owner_mode=true (skill-wide or per-channel) to inherit owner privileges
+// to every speaker — only safe in voice channels whose membership is fully
+// trusted (single-operator Lounge, not community/public). See SKILL.md.
+// resolveOwnerMode (src/voice-config.ts) is fail-closed: it grants ONLY on the
+// boolean literal `true`, so a hand-edited config with a string `"true"` /
+// `"false"` / null / number can't silently flip the trust boundary. It also
+// preserves precedence — a channel that explicitly sets owner_mode:false still
+// overrides a skill-wide owner_mode:true.
+const TREAT_AS_OWNER = resolveOwnerMode(DISCORD_VOICE_CONFIG, CHANNEL_ID);
+
+// Legacy env warning (issue #1016) — owner-mode used to be a coarse global
+// env flag. It's now config-driven (`owner_mode` in the workspace config).
+// If the old var is still set, warn once so the operator knows it's inert.
+if (process.env.DISCORD_VOICE_OWNER !== undefined) {
+	console.warn(
+		'[discord-voice] DISCORD_VOICE_OWNER is set but no longer takes effect — ' +
+		'owner-mode is now config-driven (`owner_mode` in the workspace config, ' +
+		'$SUTANDO_WORKSPACE/config/discord-voice.json; see SKILL.md).',
+	);
+}
 
 if (!GEMINI_API_KEY) { console.error('Error: GEMINI_API_KEY required'); process.exit(1); }
 if (!DISCORD_BOT_TOKEN) { console.error('Error: DISCORD_BOT_TOKEN required'); process.exit(1); }
@@ -161,6 +210,34 @@ function appendConversationLog(role: string, text: string): void {
 		mkdirSync(dirname(CONVERSATION_LOG), { recursive: true });
 		appendFileSync(CONVERSATION_LOG, `${new Date().toISOString()}|${role}|${text.replace(/\n/g, ' ')}\n`);
 	} catch {}
+}
+
+// --- Operational log tee ----------------------------------------------------
+// console.log/console.error still write to stdout exactly as before; each call
+// is ALSO appended (ISO-timestamped) to logs/discord-voice.log. Mirrors the
+// appendConversationLog pattern above — mkdirSync guard + fail-soft try/catch
+// so a disk/permission error degrades silently to stdout-only and can NEVER
+// crash the voice session.
+function appendOperationalLog(level: string, args: unknown[]): void {
+	try {
+		const line = args
+			.map((a) => (typeof a === 'string' ? a : a instanceof Error ? (a.stack ?? a.message) : String(a)))
+			.join(' ');
+		mkdirSync(dirname(DISCORD_VOICE_LOG), { recursive: true });
+		appendFileSync(DISCORD_VOICE_LOG, `${new Date().toISOString()} ${level} ${line}\n`);
+	} catch {}
+}
+{
+	const _origLog = console.log.bind(console);
+	const _origError = console.error.bind(console);
+	console.log = (...args: unknown[]): void => {
+		_origLog(...args);
+		appendOperationalLog('LOG', args);
+	};
+	console.error = (...args: unknown[]): void => {
+		_origError(...args);
+		appendOperationalLog('ERR', args);
+	};
 }
 
 // --- Audio conversion helpers ----------------------------------------------
