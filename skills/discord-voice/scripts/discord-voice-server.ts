@@ -76,6 +76,11 @@ import {
 const GEMINI_API_KEY = voiceApiKey();
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN ?? '';
 const WORKSPACE_DIR = resolveWorkspace();
+// Operational/diagnostic log — the [Setup]/[Voice]/[Tool]/[VoiceSession]/
+// [Dismiss] lines that otherwise only hit stdout. Mirrors discord-bridge.log
+// and voice-agent.log so discord-voice's operational history survives a
+// process exit. Tee'd from console.log/console.error below (fail-soft).
+const DISCORD_VOICE_LOG = join(WORKSPACE_DIR, 'logs', 'discord-voice.log');
 const DATA_DIR = join(WORKSPACE_DIR, 'data');
 const RESULTS_DIR = process.env.DISCORD_VOICE_RESULTS_DIR || join(WORKSPACE_DIR, 'results');
 const TASKS_DIR = join(WORKSPACE_DIR, 'tasks');
@@ -205,6 +210,34 @@ function appendConversationLog(role: string, text: string): void {
 		mkdirSync(dirname(CONVERSATION_LOG), { recursive: true });
 		appendFileSync(CONVERSATION_LOG, `${new Date().toISOString()}|${role}|${text.replace(/\n/g, ' ')}\n`);
 	} catch {}
+}
+
+// --- Operational log tee ----------------------------------------------------
+// console.log/console.error still write to stdout exactly as before; each call
+// is ALSO appended (ISO-timestamped) to logs/discord-voice.log. Mirrors the
+// appendConversationLog pattern above — mkdirSync guard + fail-soft try/catch
+// so a disk/permission error degrades silently to stdout-only and can NEVER
+// crash the voice session.
+function appendOperationalLog(level: string, args: unknown[]): void {
+	try {
+		const line = args
+			.map((a) => (typeof a === 'string' ? a : a instanceof Error ? (a.stack ?? a.message) : String(a)))
+			.join(' ');
+		mkdirSync(dirname(DISCORD_VOICE_LOG), { recursive: true });
+		appendFileSync(DISCORD_VOICE_LOG, `${new Date().toISOString()} ${level} ${line}\n`);
+	} catch {}
+}
+{
+	const _origLog = console.log.bind(console);
+	const _origError = console.error.bind(console);
+	console.log = (...args: unknown[]): void => {
+		_origLog(...args);
+		appendOperationalLog('LOG', args);
+	};
+	console.error = (...args: unknown[]): void => {
+		_origError(...args);
+		appendOperationalLog('ERR', args);
+	};
 }
 
 // --- Audio conversion helpers ----------------------------------------------
