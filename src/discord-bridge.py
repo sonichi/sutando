@@ -2751,11 +2751,13 @@ async def poll_results():
                 import re
                 reply_text = result_file.read_text().strip()
                 channel = pending_replies.pop(task_id)
-                # Anchor is consumed alongside the channel — both belong to
-                # the same in-flight task and become stale together. Use pop
-                # not del so a missing entry (crash-recovered task) doesn't
-                # raise.
-                pending_reply_anchors.pop(task_id, None)
+                # Capture anchor BEFORE pop so the auto-thread block below
+                # can use it. The previous version popped+forgot, leaving
+                # `pending_reply_anchors.get(task_id)` at line ~2810 always
+                # returning None — symptom: replies appeared as fresh
+                # messages instead of quote-replies. Caught by live test
+                # 2026-05-22 ~03:00 UTC: "it's not a quote reply".
+                source_message_anchor = pending_reply_anchors.pop(task_id, None)
                 save_pending_replies()
                 # Skip sending if already replied directly (core agent used MCP).
                 # Clean up the result AND task files so the watcher doesn't
@@ -2801,7 +2803,7 @@ async def poll_results():
                         _thread_cls = getattr(discord, 'Thread', None)
                         is_thread = _thread_cls is not None and isinstance(channel, _thread_cls)
                         if not is_thread:
-                            reply_to_id = pending_reply_anchors.get(task_id)
+                            reply_to_id = source_message_anchor
 
                     # Extract optional [channel: <channel_id>] redirect — the
                     # agent can route a DM-originated reply to a different
