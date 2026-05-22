@@ -269,6 +269,31 @@ def _chunk_for_discord(text: str, max_len: int = 1900):
         yield chunk
 
 
+# Marker regex for inline file references in result bodies. The pattern
+# requires absolute paths (`/...` or `~/...`) — the earlier relative-
+# path-allowing form resolved against the bridge's CWD, which differed
+# between launchd-managed and bare-shell runs. Three call sites in this
+# module (poll_results, poll_proactive, poll_dm_fallback channel-
+# redirect) previously re-defined this regex inline; consolidated here
+# so a future hardening only needs one edit.
+_FILE_MARKER_RE = re.compile(r'\[(?:file|send|attach):\s*((?:/|~/)[^\]:]+)\]')
+
+
+def _split_file_markers(text: str) -> tuple[str, list[str]]:
+    """Split a result body into ``(clean_text, files)``.
+
+    ``files`` is the list of paths extracted from ``[file:|send:|attach:]``
+    markers (in textual order). ``clean_text`` is the original text with
+    every marker removed and surrounding whitespace stripped.
+
+    Pure function — single source of truth for the marker pattern
+    across every send path in this bridge.
+    """
+    files = _FILE_MARKER_RE.findall(text)
+    clean_text = _FILE_MARKER_RE.sub('', text).strip()
+    return clean_text, files
+
+
 def _is_path_sendable(fpath: str) -> bool:
     """True iff `fpath` is a real file AND resolves under an allowed root.
 
@@ -2804,9 +2829,7 @@ async def poll_results():
                                 print(f"  [channel-redirect] failed to resolve channel {target_channel_id}, falling back to task source: {e}", flush=True)
 
                     # Extract file paths: [file: /path] or [send: /path]
-                    file_pattern = re.compile(r'\[(?:file|send|attach):\s*((?:/|~/)[^\]:]+)\]')
-                    files = file_pattern.findall(reply_text)
-                    clean_text = file_pattern.sub('', reply_text).strip()
+                    clean_text, files = _split_file_markers(reply_text)
 
                     # Send text — fence-aware chunker preserves triple-backtick code blocks
                     # First chunk uses message_reference (if set); subsequent chunks
@@ -2837,7 +2860,10 @@ async def poll_results():
                             await channel.send(file=discord.File(fpath))
                             print(f"  Sent file: {fpath}")
                         elif not os.path.isfile(fpath):
-                            await channel.send(f"(file not found: {fpath})")
+                            # Prose-quoted `[file:/path]` substrings extract
+                            # as markers but reference no real file. Log for
+                            # operator visibility; don't surface to the user.
+                            print(f"  [file marker, file not found — likely a prose quotation]: {fpath}", flush=True)
                         else:
                             await channel.send(f"(file not allowed: {fpath})")
                             print(f"  REJECTED file (not in allowlist): {fpath}", flush=True)
@@ -2876,6 +2902,21 @@ async def poll_proactive():
                 await asyncio.sleep(3)
                 continue
             _presenter_log_throttle = 0
+            # Channel routing: skip the entire proactive scan if this
+            # bridge is not the last-active channel. The pre-fix race
+            # between discord-bridge and telegram-bridge for the SAME
+            # proactive-*.txt files produced unpredictable cross-channel
+            # delivery — a Discord-context follow-up could land on
+            # Telegram or vice versa. See proactive_routing.py for the
+            # decision rule (last-active channel from
+            # state/last-owner-activity.json; default discord on missing
+            # state).
+            from proactive_routing import should_claim_proactive  # noqa: E402
+            if not should_claim_proactive(
+                STATE_DIR / "last-owner-activity.json", "discord"
+            ):
+                await asyncio.sleep(3)
+                continue
             for f in RESULTS_DIR.iterdir():
                 if f.name.startswith("proactive-") and f.suffix == ".txt":
                     # Claim-by-rename: atomically move the file to a
@@ -2948,9 +2989,7 @@ async def poll_proactive():
                         user = await client.fetch_user(int(owner_id))
                         dm = await user.create_dm()
                         # Extract files
-                        file_pattern = re.compile(r'\[(?:file|send|attach):\s*((?:/|~/)[^\]:]+)\]')
-                        files = file_pattern.findall(text)
-                        clean_text = file_pattern.sub('', text).strip()
+                        clean_text, files = _split_file_markers(text)
                         if clean_text:
                             for chunk in _chunk_for_discord(clean_text):
                                 await dm.send(chunk)
@@ -2969,7 +3008,8 @@ async def poll_proactive():
                             if _is_path_sendable(fpath):
                                 await dm.send(file=discord.File(fpath))
                             elif not os.path.isfile(fpath):
-                                await dm.send(f"(file not found: {fpath})")
+                                # See poll_results — log only, no user noise.
+                                print(f"  [proactive] file marker, file not found: {fpath}", flush=True)
                             else:
                                 await dm.send(f"(file not allowed: {fpath})")
                                 print(f"  [proactive] REJECTED file: {fpath}", flush=True)
@@ -3104,9 +3144,7 @@ async def poll_dm_fallback():
                             print(f"  [dm-fallback channel-redirect] failed to resolve {target_channel_id}: {e}", flush=True)
                         if target_channel:
                             # File markers (parity with poll_results 2761-2784).
-                            file_pattern = re.compile(r'\[(?:file|send|attach):\s*((?:/|~/)[^\]:]+)\]')
-                            file_list = file_pattern.findall(clean_body)
-                            text_only = file_pattern.sub('', clean_body).strip()
+                            text_only, file_list = _split_file_markers(clean_body)
                             if text_only:
                                 for chunk in _chunk_for_discord(text_only):
                                     await target_channel.send(chunk)
@@ -3126,7 +3164,8 @@ async def poll_dm_fallback():
                                     await target_channel.send(file=discord.File(fpath))
                                     print(f"  [dm-fallback channel-redirect] sent file: {fpath}", flush=True)
                                 elif not os.path.isfile(fpath):
-                                    await target_channel.send(f"(file not found: {fpath})")
+                                    # See poll_results — log only, no user noise.
+                                    print(f"  [dm-fallback channel-redirect] file marker, file not found: {fpath}", flush=True)
                             print(f"  [dm-fallback channel-redirect] sent {f.name} to channel {target_channel_id}", flush=True)
                             _task_file = TASKS_DIR / f"{_task_id}.txt"
                             if _task_file.exists():

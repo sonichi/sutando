@@ -1,0 +1,66 @@
+import { describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+// Security regression guard for `pressKeyTool` in src/inline-tools.ts.
+//
+// Pre-fix: the tool accepted an optional `app` parameter and embedded
+// it verbatim in `osascript -e 'tell application "${app}" to
+// activate'`. A value containing `"` could break out of the AppleScript
+// string literal and inject arbitrary AppleScript, which can shell out
+// via `do shell script "..."` — arbitrary code execution from a tool-
+// call argument.
+//
+// Adjacent code already had the right escape pattern:
+//   - line ~161 escapes the `key` parameter as `safeKey`
+//   - switchAppTool escapes its `app` as `safeApp`
+//
+// Only `pressKeyTool.execute`'s app-activation branch was missing the
+// escape. Pin the fix so a future refactor that re-introduces the raw
+// interpolation fails here.
+
+const SRC = readFileSync(
+	join(import.meta.dirname ?? '.', '..', 'src/inline-tools.ts'),
+	'utf-8',
+);
+
+describe('inline-tools pressKey app activation — AppleScript injection guard', () => {
+	it('does not interpolate raw `app` into the osascript tell-application command', () => {
+		assert.doesNotMatch(
+			SRC,
+			/tell application "\$\{app\}" to activate/,
+			'src/inline-tools.ts contains the raw `tell application "${app}"` pattern again — ' +
+				'a tool-call argument containing `"` would inject AppleScript and (via ' +
+				'`do shell script`) execute arbitrary commands. Escape `app` to `safeApp` first.',
+		);
+	});
+
+	it('uses safeApp (escaped) in the pressKey app-activation branch', () => {
+		const pressKeyBranch = SRC.match(/pressKeyTool[\s\S]*?Activate target app[\s\S]{0,500}/);
+		assert(pressKeyBranch, 'could not locate pressKeyTool app-activation branch');
+		assert.match(
+			pressKeyBranch[0],
+			/safeApp/,
+			'pressKeyTool must escape `app` to `safeApp` before passing to osascript ' +
+				'(see switchAppTool for the canonical pattern).',
+		);
+	});
+
+	it('the escape pattern is computed from app via .replace chain', () => {
+		assert.match(
+			SRC,
+			/safeApp\s*=\s*app\.replace\([\s\S]+?\.replace\([\s\S]+?\.replace\(/,
+			'safeApp must chain at least 3 .replace() calls (backslash, single-quote, double-quote) — see switchAppTool for canonical pattern',
+		);
+		assert.match(
+			SRC,
+			/safeApp[\s\S]+?\.replace\(\/"\/g,\s*'\\\\"'\)/,
+			'safeApp chain must include `.replace(/"/g, \'\\\\"\')` — the double-quote strip is the actual exploit-vector defense for the `tell application "X"` shape',
+		);
+	});
+
+	it('canonical escape pattern still in use in switchAppTool', () => {
+		assert.match(SRC, /switchAppTool[\s\S]+?safeApp\s*=\s*app/);
+	});
+});
