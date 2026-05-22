@@ -494,22 +494,17 @@ function buildAgent(callSession: CallSession): MainAgent {
 		instructions = instructions.filter(Boolean).join('\n');
 	}
 
-	// Grounding
+	// Grounding. The "look it up" pointer is conditional on per-surface
+	// config: native Web search when googleSearch is enabled (~2-3s, answer
+	// in conversation), `work` tool otherwise (round-trip ~8-15s). Earlier
+	// versions had a permanent "use work" line + a soft nudge toward native
+	// search — the model read the first as imperative and the nudge as
+	// optional, so it kept delegating even with search on. One conditional
+	// line so only one path is presented per config.
 	if (callSession.isOwner) {
-		instructions += '\n\nNEVER fabricate specific details. If you don\'t know it, use the work tool to look it up.';
-	}
-
-	// When this surface has Gemini's native googleSearch grounding enabled,
-	// nudge the model toward using it directly for current-info queries
-	// (news, scores, weather, stocks, recent events). Without this nudge,
-	// the instructions above strongly bias the model toward the `work` tool
-	// for any "look it up" request, which writes a task file + waits for
-	// Claude Code's WebSearch (~8-15s round-trip) instead of letting Gemini
-	// answer via its own grounding (~2-3s). Conditional on the per-surface
-	// config so a surface with googleSearch=false doesn't get advised to
-	// use a capability it doesn't have.
-	if (PHONE_GOOGLE_SEARCH) {
-		instructions += '\n\nYou have built-in Web grounding for current-info queries (news, scores, weather, stocks, recent events). Use it directly when the question only needs a Web lookup — it returns faster.';
+		instructions += PHONE_GOOGLE_SEARCH
+			? '\n\nNEVER fabricate specific details. If you don\'t know it, use your built-in Web search to look it up — it\'s faster than delegating, and the answer stays in the conversation.'
+			: '\n\nNEVER fabricate specific details. If you don\'t know it, use the work tool to look it up.';
 	}
 
 	const tools: ToolDefinition[] = [];
