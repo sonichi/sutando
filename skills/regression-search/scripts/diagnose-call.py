@@ -2,7 +2,7 @@
 """diagnose-call.py — deep diagnosis of a single call.
 
 Looks up a call by SID (full or last-N suffix), reads the transcript and any
-metrics from call-metrics.jsonl, and prints what went wrong: silences,
+metrics from data/conversation.sqlite, and prints what went wrong: silences,
 refusals, errors, repeated user requests, and hangup-style endings.
 
 Usage:
@@ -16,21 +16,24 @@ other. Closes the second half of #188.
 
 import argparse
 import json
+import os
 import re
+import sqlite3
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-# results/calls/ and data/call-metrics.jsonl are per-user runtime state —
-# live under $SUTANDO_WORKSPACE. Pre-fix this resolved to the repo checkout
-# which doesn't have either file post-#762, so `diagnose-call <sid>` always
-# printed "No call matches".
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 from workspace_default import resolve_workspace  # noqa: E402
 
-WORKSPACE = resolve_workspace()
-CALLS_FILE = WORKSPACE / "results" / "calls" / "calls.jsonl"
-METRICS_FILE = WORKSPACE / "data" / "call-metrics.jsonl"
+# conversation.sqlite is per-user runtime state — it lives under the resolved
+# workspace ($SUTANDO_WORKSPACE), the same tree the runtime writers use, not
+# the repo checkout. Honor SUTANDO_CONVERSATION_DB, matching diagnose.py and
+# the import-* scripts.
+DB_FILE = Path(os.environ.get(
+    "SUTANDO_CONVERSATION_DB",
+    resolve_workspace(migrate=False) / "data" / "conversation.sqlite"))
 
 REFUSAL_RE = re.compile(
     r"\b(i\s*can'?t|i'?m\s*not\s*able|i'?m\s*unable|unable\s*to|sorry,?\s*i\s*(can'?t|cannot))\b",
@@ -59,46 +62,106 @@ def parse_transcript(transcript: str) -> list[tuple[str, str]]:
     return turns
 
 
+def _ts_iso(ts_unix) -> str:
+    return datetime.fromtimestamp(
+        ts_unix or 0, tz=timezone.utc
+    ).isoformat().replace("+00:00", "Z")
+
+
+def _build_transcript(conn: sqlite3.Connection, session_id: str) -> str:
+    """Reconstruct a `Role: text` transcript from the conversation table."""
+    if not session_id:
+        return ""
+    rows = conn.execute(
+        "SELECT role, text FROM conversation WHERE session_id = ? ORDER BY ts_unix",
+        (session_id,),
+    ).fetchall()
+    lines = []
+    for role, text in rows:
+        r = (role or "").lower()
+        prefix = "Sutando" if r in ("assistant", "sutando", "agent", "model") else "User"
+        lines.append(f"{prefix}: {text or ''}")
+    return "\n".join(lines)
+
+
 def find_call(sid_query: str) -> Optional[dict]:
-    """Match by full SID or by suffix (12 chars is enough to disambiguate)."""
-    if not CALLS_FILE.exists():
+    """Match by full SID or by suffix (12 chars is enough to disambiguate).
+
+    Returns a dict with callSid / timestamp / transcript keys, reconstructed
+    from the sessions + conversation tables of data/conversation.sqlite.
+    """
+    if not DB_FILE.exists():
         return None
-    candidates = []
-    with CALLS_FILE.open() as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                call = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            sid = call.get("callSid", "")
+    conn = sqlite3.connect(str(DB_FILE))
+    try:
+        rows = conn.execute(
+            "SELECT ts_unix, source, session_id, call_sid FROM sessions ORDER BY ts_unix"
+        ).fetchall()
+        candidates = []
+        for ts_unix, source, session_id, call_sid in rows:
+            sid = call_sid or session_id or ""
             if sid == sid_query or sid.endswith(sid_query):
-                candidates.append(call)
-    if not candidates:
-        return None
-    if len(candidates) > 1:
-        print(f"⚠ {len(candidates)} calls match suffix '{sid_query}' — using most recent", file=sys.stderr)
-        candidates.sort(key=lambda c: c.get("timestamp", ""))
-    return candidates[-1]
+                candidates.append({
+                    "ts_unix": ts_unix,
+                    "source": source,
+                    "session_id": session_id,
+                    "callSid": sid,
+                })
+        if not candidates:
+            return None
+        if len(candidates) > 1:
+            print(f"⚠ {len(candidates)} calls match suffix '{sid_query}' — using most recent", file=sys.stderr)
+            candidates.sort(key=lambda c: c["ts_unix"] or 0)
+        chosen = candidates[-1]
+        return {
+            "callSid": chosen["callSid"],
+            "timestamp": _ts_iso(chosen["ts_unix"]),
+            "transcript": _build_transcript(conn, chosen["session_id"]),
+        }
+    finally:
+        conn.close()
 
 
 def find_metrics(call_sid: str) -> Optional[dict]:
-    if not METRICS_FILE.exists():
+    if not DB_FILE.exists():
         return None
-    with METRICS_FILE.open() as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                m = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if m.get("callSid") == call_sid:
-                return m
-    return None
+    conn = sqlite3.connect(str(DB_FILE))
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT ts_unix, source, session_id, call_sid, caller, is_owner, "
+            "is_meeting, duration_ms, transcript_lines, tool_count, pending_tasks, "
+            "tool_calls, events FROM sessions "
+            "WHERE call_sid = ? OR session_id = ? ORDER BY ts_unix",
+            (call_sid, call_sid),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    try:
+        tool_calls = json.loads(row["tool_calls"]) if row["tool_calls"] else []
+    except (json.JSONDecodeError, TypeError):
+        tool_calls = []
+    try:
+        events = json.loads(row["events"]) if row["events"] else []
+    except (json.JSONDecodeError, TypeError):
+        events = []
+    return {
+        "timestamp": _ts_iso(row["ts_unix"]),
+        "callSid": row["call_sid"] or row["session_id"],
+        "sessionId": row["session_id"],
+        "source": row["source"],
+        "caller": row["caller"],
+        "isOwner": bool(row["is_owner"]) if row["is_owner"] is not None else None,
+        "isMeeting": bool(row["is_meeting"]) if row["is_meeting"] is not None else None,
+        "durationMs": row["duration_ms"] or 0,
+        "transcriptLines": row["transcript_lines"] or 0,
+        "toolCount": row["tool_count"] or 0,
+        "pendingTasks": row["pending_tasks"] or 0,
+        "toolCalls": tool_calls,
+        "events": events,
+    }
 
 
 def analyze_turns(turns: list[tuple[str, str]]) -> dict:
@@ -159,14 +222,14 @@ def _truncate(s: str, n: int = 120) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("sid", help="Call SID (full or last 12 chars)")
-    parser.add_argument("--metrics", action="store_true", help="Also show data/call-metrics.jsonl event timeline if available")
+    parser.add_argument("--metrics", action="store_true", help="Also show data/conversation.sqlite session metrics if available")
     parser.add_argument("--json", action="store_true", help="JSON output")
     parser.add_argument("--full-transcript", action="store_true", help="Print the full transcript")
     args = parser.parse_args()
 
     call = find_call(args.sid)
     if not call:
-        print(f"No call matches '{args.sid}' in {CALLS_FILE}", file=sys.stderr)
+        print(f"No call matches '{args.sid}' in {DB_FILE}", file=sys.stderr)
         return 1
 
     sid = call.get("callSid", "")
@@ -222,7 +285,7 @@ def main() -> int:
 
     if metrics:
         print()
-        print(f"Metrics (data/call-metrics.jsonl):")
+        print(f"Metrics (data/conversation.sqlite):")
         print(f"  duration: {metrics.get('durationMs', 0) // 1000}s")
         print(f"  isOwner: {metrics.get('isOwner')}, isMeeting: {metrics.get('isMeeting')}")
         print(f"  tool calls: {metrics.get('toolCount', 0)}")
@@ -232,7 +295,7 @@ def main() -> int:
         print(f"  events: {len(metrics.get('events', []))}")
     elif args.metrics:
         print()
-        print("  (no entry in data/call-metrics.jsonl — call predates PR #223 or metrics file missing)")
+        print("  (no entry in data/conversation.sqlite — call predates PR #223 or db missing)")
 
     if args.full_transcript:
         print()

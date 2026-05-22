@@ -33,8 +33,15 @@ def load_env():
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
                     key, val = line.split("=", 1)
+                    val = val.strip()
+                    # Strip matching surrounding quotes (mirrors python-
+                    # dotenv). Without this, `GEMINI_API_KEY="abc"` in
+                    # .env stores `"abc"` (with quotes) and Gemini's
+                    # Authorization header gets a malformed key.
+                    if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                        val = val[1:-1]
                     # .env wins over stale shell env — see PR #416.
-                    os.environ[key.strip()] = val.strip()
+                    os.environ[key.strip()] = val
 
 
 def generate_image(client, args):
