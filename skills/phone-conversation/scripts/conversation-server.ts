@@ -84,6 +84,7 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '../../../src/inline-tools.js';
 import { recordSession, recordConversation } from '../../../src/conversation-store.js';
+import { resultBelongsTo } from '../../../src/result-channel-key.js';
 // Lazy vision-session handle. Only loaded if a call ever needs it — keeps the
 // phone-agent boot path free of the vision-tools.ts side-effects on cold start.
 let _setVisionSession: ((s: unknown) => void) | null = null;
@@ -298,6 +299,11 @@ interface CallSession {
 	// Observability: per-call metrics (startTime already on CallSession from #209)
 	toolCalls: { name: string; durationMs: number; timestamp: string }[];
 	events: { event: string; timestamp: string }[];
+	// Per-call channel-scan state (results/<callSid>.task-*.txt pull path).
+	channelScanHandle?: NodeJS.Timeout;
+	// Safety-net against silent unlinkSync failures — `name -> first-seen ms`,
+	// pruned at 60s/tick so it can't grow unbounded for long calls.
+	channelScanSeen?: Map<string, number>;
 }
 
 const activeCalls = new Map<string, CallSession>();
@@ -944,6 +950,69 @@ async function createCallSession(params: {
 		import('../../../skills/screen-record/scripts/narration-tee.js').then(m => m.cleanup()).catch(() => {});
 	};
 
+	// --- Per-call pull path for non-delegated task results -----------------
+	// Regular `work`-tool delegations land at `results/task-phone-*.txt` and
+	// are claimed by the per-task poll in delegateTask(). This separate scan
+	// picks up the scoped namespace `results/<callSid>.task-*.txt` — used
+	// when the core agent (or another tool) needs to deliver a result to THIS
+	// specific call without having delegated through the work tool. Existing
+	// consumers' patterns don't match the `<callSid>.` prefix, so a file in
+	// this namespace is invisible to them — only this scan and the matching
+	// discord-voice scan claim it.
+	//
+	// Scoped by callSid so different concurrent calls never cross — a
+	// parent-call result can't land in the child call's session and vice
+	// versa. Cadence is 3s (cross-surface handoffs, not turn-taking). Read-
+	// and-delete mirrors delegateTask()'s fail-soft style.
+	callSession.channelScanSeen = new Map();
+	const CHANNEL_SCAN_TTL_MS = 60_000;
+	callSession.channelScanHandle = setInterval(() => {
+		if (callSession.hangingUp || !activeCalls.has(callSession.callSid)) return;
+		// Prune entries older than the TTL so the map doesn't grow unbounded
+		// during long calls.
+		const cutoff = Date.now() - CHANNEL_SCAN_TTL_MS;
+		for (const [k, ts0] of callSession.channelScanSeen!) {
+			if (ts0 < cutoff) callSession.channelScanSeen!.delete(k);
+		}
+		let entries: string[];
+		try {
+			entries = readdirSync(RESULTS_DIR);
+		} catch {
+			return;
+		}
+		for (const name of entries) {
+			// .txt guard — never touch a writer's atomic-write temp
+			// (`<callSid>.task-X.txt.tmp`, `.sending`, `.partial`, etc).
+			// Belt-and-suspenders: `resultBelongsTo` also gates on .txt.
+			if (!name.endsWith('.txt')) continue;
+			if (callSession.channelScanSeen!.has(name)) continue;
+			if (!resultBelongsTo(name, callSession.callSid)) continue;
+			callSession.channelScanSeen!.set(name, Date.now());
+			const full = join(RESULTS_DIR, name);
+			let body: string;
+			try {
+				body = readFileSync(full, 'utf-8').trim();
+			} catch {
+				continue;
+			}
+			if (!body) {
+				try { unlinkSync(full); } catch {}
+				continue;
+			}
+			console.log(`${ts()} [ChannelScan] picked up ${name} for ${callSession.callSid} (${body.length}B)`);
+			callSession.events.push({ event: `channel_result:${name}`, timestamp: new Date().toISOString() });
+			try {
+				(callSession.voiceSession as any).transport.sendContent(
+					[{ role: 'user', text: `[Channel result]\n${body}\n\nReport this result to the caller now.` }],
+					true,
+				);
+			} catch (e) {
+				console.log(`${ts()} [ChannelScan] inject failed for ${name}: ${e}`);
+			}
+			try { unlinkSync(full); } catch {}
+		}
+	}, 3000);
+
 	return callSession;
 }
 
@@ -959,6 +1028,7 @@ function cleanupCall(callSid: string): void {
 
 	import('../../../src/browser-tools.js').then(bt => bt.onCallEnd()).catch(() => {});
 	session.cleanupNarration?.();
+	try { if (session.channelScanHandle) clearInterval(session.channelScanHandle); } catch {}
 	try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
 	try { unlinkSync('/tmp/sutando-playback-path'); } catch {}
 
