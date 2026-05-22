@@ -32,7 +32,8 @@ import { inlineTools, coreDocumentedSkills } from './inline-tools.js';
 import { setVisionSession, startVisionControlServer, stopVisionControlServer } from './vision-tools.js';
 import { clearActiveArtifact } from './artifact-cache-tools.js';
 import { injectText } from './browser-tools.js';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { VoiceSession } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
@@ -82,14 +83,13 @@ function assertGeminiKey(name: string, value: string): void {
 	}
 }
 
+import { voiceApiKey } from './voice-key.js';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY ?? '';
 assertGeminiKey('GEMINI_API_KEY', GEMINI_API_KEY);
-// Optional: separate key for the Gemini Live voice session. Lets users put voice
-// on a free-tier key (unlimited on free tier, rate-limited) while keeping text/
-// vision/STT on a paid-tier key. Falls back to GEMINI_API_KEY when unset.
-const GEMINI_VOICE_API_KEY = process.env.GEMINI_VOICE_API_KEY || GEMINI_API_KEY;
-// Only shape-check the voice key if user opted in — silent fallback to the
-// main key is the backward-compatible path.
+// Voice surfaces use the shared GEMINI_VOICE_API_KEY → GEMINI_API_KEY chain
+// via voiceApiKey() (src/voice-key.ts). The VOICE-key fallback path isolates
+// voice billing onto a paid-tier key when set; unset still works.
+const GEMINI_VOICE_API_KEY = voiceApiKey();
 if (process.env.GEMINI_VOICE_API_KEY) {
 	assertGeminiKey('GEMINI_VOICE_API_KEY', process.env.GEMINI_VOICE_API_KEY);
 }
@@ -171,17 +171,18 @@ function acquirePidLock(): void {
 
 // Model configuration — override via .env for cost/quality tuning
 const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
-const VOICE_NATIVE_AUDIO_MODEL = process.env.VOICE_NATIVE_AUDIO_MODEL || 'gemini-3.1-flash-live-preview';
+// Per-skill voice config (native-audio model + googleSearch grounding) lives
+// in voice-agent.config.json next to this file. Schema + defaults: see
+// src/voice-config.ts. voice-agent ships with model=3.1 + googleSearch=false
+// because the web client's code-heavy workload prefers 3.1 and the (key,
+// 3.1, googleSearch) combo trips a 1011 close on the VOICE key when search
+// is true. Phone + discord-voice inherit the package default (2.5+search).
+import { loadVoiceConfig } from './voice-config.js';
+const _voiceAgentDir = dirname(fileURLToPath(import.meta.url));
+const VOICE_AGENT_CONFIG = loadVoiceConfig(join(_voiceAgentDir, 'voice-agent.config.json'));
+const VOICE_NATIVE_AUDIO_MODEL = VOICE_AGENT_CONFIG.model;
+const VOICE_GOOGLE_SEARCH = VOICE_AGENT_CONFIG.googleSearch;
 const VOICE_NAME = process.env.VOICE_NAME || 'Puck';
-// Google Search grounding — MUST be false under gemini-3.1-flash-live-preview
-// native audio. Combining googleSearch: true + 3.1 native audio causes the
-// transport to reject setup with close code 1011 "exceeded your current
-// quota" (misleading error text — actual cause is the unsupported combo;
-// 2.5 silently accepted it). Verified 2026-04-09 by flipping the flag and
-// re-running setup — 3.1 connects cleanly with googleSearch=false.
-// Default true preserves existing 2.5 behavior. Set VOICE_GOOGLE_SEARCH=false
-// in .env when unpinning VOICE_NATIVE_AUDIO_MODEL to 3.1.
-const VOICE_GOOGLE_SEARCH = (process.env.VOICE_GOOGLE_SEARCH ?? 'true').toLowerCase() !== 'false';
 const CARTESIA_API_KEY = process.env.CARTESIA_API_KEY || '';
 
 // Lazy-load Cartesia TTS only when a key is set. This means Gemini-only
@@ -1443,7 +1444,7 @@ async function main() {
 	console.log(`  Session ID:    ${SESSION_ID}`);
 	console.log(`  Models:`);
 	console.log(`    Voice LLM:       ${VOICE_MODEL}`);
-	console.log(`    Native audio:    ${VOICE_NATIVE_AUDIO_MODEL}`);
+	console.log(`    Native audio:    ${VOICE_NATIVE_AUDIO_MODEL} (googleSearch=${VOICE_GOOGLE_SEARCH})`);
 	console.log(`    Voice name:      ${VOICE_NAME}`);
 	console.log(`    STT:             native Gemini Live inputAudioTranscription`);
 	console.log(`    Cartesia TTS:    ${CARTESIA_API_KEY ? 'sonic-3' : 'disabled'}`);
