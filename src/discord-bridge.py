@@ -1974,6 +1974,11 @@ def _should_welcome_first_post(message, welcome_channel_id, welcome_template_pat
 
 # Track pending replies: task_id -> channel
 pending_replies = {}
+# Track source message id per pending task so the result-sender can default
+# reply_to_id to the triggering message (visually threads the reply). Lives
+# in memory only — crash-recovery isn't critical; missing entry just means
+# the reply goes as a fresh message instead of a quote-reply.
+pending_reply_anchors: dict[str, int] = {}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -2599,12 +2604,17 @@ async def _handle_discord_message(message, force=False):
         f"task: {user_task_text}\n"
         f"source: discord\n"
         f"channel_id: {message.channel.id}\n"
+        f"source_message_id: {message.id}\n"
         f"user_id: {message.author.id}\n"
         f"access_tier: {access_tier}\n"
         f"priority: {priority}\n"
         f"{tier_instructions.get(access_tier, tier_instructions['other'])}"
     )
     pending_replies[task_id] = message.channel
+    # Track source-message-id so the result-sender can auto-attach reply_to
+    # (visually thread the reply to the triggering message). Skipped when
+    # the channel is already a Discord thread — thread context is enough.
+    pending_reply_anchors[task_id] = message.id
     save_pending_replies()
 
     # Typing indicator
@@ -2741,6 +2751,11 @@ async def poll_results():
                 import re
                 reply_text = result_file.read_text().strip()
                 channel = pending_replies.pop(task_id)
+                # Anchor is consumed alongside the channel — both belong to
+                # the same in-flight task and become stale together. Use pop
+                # not del so a missing entry (crash-recovered task) doesn't
+                # raise.
+                pending_reply_anchors.pop(task_id, None)
                 save_pending_replies()
                 # Skip sending if already replied directly (core agent used MCP).
                 # Clean up the result AND task files so the watcher doesn't
@@ -2768,6 +2783,25 @@ async def poll_results():
                     reply_to_id = int(reply_match.group(1)) if reply_match else None
                     if reply_match:
                         reply_text = reply_pattern.sub('', reply_text).strip()
+                    # Auto-thread: if the agent didn't pick an explicit
+                    # [reply: <id>], default to the triggering message so the
+                    # reply appears quoted under what it's answering. Skip
+                    # when the channel is already a Discord thread — thread
+                    # context anchors the reply implicitly, no extra quote
+                    # needed.
+                    #
+                    # getattr instead of bare `discord.Thread` so the
+                    # test-stub discord module (tests/discord-bridge-*.test.py)
+                    # — which intentionally omits Thread to keep the stub
+                    # surface small — doesn't AttributeError here. Production
+                    # discord.py always provides Thread; the getattr fallback
+                    # only matters under test, where treating "no Thread
+                    # class" as "channel isn't a thread" is correct.
+                    if reply_to_id is None:
+                        _thread_cls = getattr(discord, 'Thread', None)
+                        is_thread = _thread_cls is not None and isinstance(channel, _thread_cls)
+                        if not is_thread:
+                            reply_to_id = pending_reply_anchors.get(task_id)
 
                     # Extract optional [channel: <channel_id>] redirect — the
                     # agent can route a DM-originated reply to a different
