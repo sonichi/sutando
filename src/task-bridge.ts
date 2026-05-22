@@ -151,16 +151,22 @@ export function _isVoiceTask(taskId: string): boolean {
 
 /** Belt-suspenders guard for the result-watcher's unconditional fallthrough
  * (issue #1035, follow-up to PR #1033). Returns true iff the filename is one
- * that task-bridge legitimately consumes via `onResult()`. Rejects everything
+ * that task-bridge legitimately delivers via `onResult()`. Rejects everything
  * else — most importantly, the new `<channel-key>.task-{id}.txt` namespace
  * PR #1033 introduced for the per-channel pull path (discord-voice / phone),
- * which the per-channel scanner consumes itself. Also rejects `proactive-*`
- * (discord-bridge's poll_proactive handles those) and any unfamiliar prefix.
+ * which the per-channel scanner consumes itself.
+ *
+ * `proactive-*` IS allowed: per the long-standing proactive-voice rule,
+ * proactive messages are spoken by the voice agent when the client is
+ * connected (in parallel to discord-bridge's poll_proactive DM-delivery).
+ * That delivery has no explicit handler upstream in this watcher — the
+ * fallthrough IS the path — so blocking `proactive-*` here would silently
+ * disable voice-spoken proactive messages.
  *
  * Exported for unit testing — the watcher's setInterval body is otherwise
  * awkward to exercise in isolation. */
 export function _shouldFallthrough(file: string): boolean {
-	return file.startsWith('task-') || file.startsWith('voice-');
+	return file.startsWith('task-') || file.startsWith('voice-') || file.startsWith('proactive-');
 }
 
 const _apiToken = process.env.SUTANDO_API_TOKEN || '';

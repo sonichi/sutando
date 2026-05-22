@@ -44,10 +44,15 @@ describe('_shouldFallthrough — belt-suspenders guard for result-watcher fallth
 		assert.equal(_shouldFallthrough('some-channel.task-foo.txt'), false);
 	});
 
-	it('rejects proactive-* (discord-bridge poll_proactive handles those)', () => {
-		assert.equal(_shouldFallthrough('proactive-1234567890.txt'), false);
-		assert.equal(_shouldFallthrough('proactive-result-task-abc-1234.txt'), false);
-		assert.equal(_shouldFallthrough('proactive-timeout-task-abc-1234.txt'), false);
+	it('allows proactive-* (voice-spoken proactive delivery via the fallthrough path)', () => {
+		// Per the proactive_voice rule, proactive messages are spoken by the voice agent
+		// when the client is connected. That delivery has no explicit handler upstream in
+		// this watcher — the fallthrough IS the path — so proactive-* must pass the guard
+		// or voice-spoken proactive messages silently break. (discord-bridge's poll_proactive
+		// runs in parallel for DM-delivery; the two consumers coexist.)
+		assert.equal(_shouldFallthrough('proactive-1234567890.txt'), true);
+		assert.equal(_shouldFallthrough('proactive-result-task-abc-1234.txt'), true);
+		assert.equal(_shouldFallthrough('proactive-timeout-task-abc-1234.txt'), true);
 	});
 
 	it('rejects unknown / unfamiliar prefixes', () => {
