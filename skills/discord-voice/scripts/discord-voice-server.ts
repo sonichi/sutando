@@ -30,10 +30,11 @@
  */
 
 import { config as _dotenvConfig } from 'dotenv';
-import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, existsSync, readFileSync, unlinkSync } from 'node:fs';
+import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, existsSync, readFileSync, readdirSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { resolveWorkspace } from '../../../src/workspace_default.js';
 import { recordConversation, recordSession } from '../../../src/conversation-store.js';
+import { resultBelongsTo } from '../../../src/result-channel-key.js';
 import { type Tier, loadAccessTiers, effectiveTier, toolAllowed, toolNeed } from './access-tier.js';
 
 _dotenvConfig({ path: new URL('../../../.env', import.meta.url).pathname, override: true });
@@ -863,6 +864,63 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 	}, 10000);
 	(s as any)._watchdogHandle = watchdog;
 
+	// --- Per-channel pull path for non-delegated task results ---------------
+	// Regular `work`-tool delegations land at `results/task-discord-voice-*.txt`
+	// and are claimed by the per-task poll in delegateTask(). This separate
+	// scan picks up the new scoped namespace — `results/<CHANNEL_ID>.task-*.txt`
+	// — used when the core agent (or another tool) needs to deliver a result
+	// to THIS voice channel without having delegated through the work tool
+	// (e.g. context handoff from a different surface). Existing consumers
+	// don't match the `<channel-id>.` prefix, so a file in this namespace is
+	// invisible to them — only this scan and the matching phone scan claim it.
+	//
+	// Cadence is intentionally slower than the delegate poll (3s vs 500ms)
+	// since this path is for cross-surface handoffs, not in-conversation
+	// turn-taking. Read-and-delete mirrors delegateTask()'s fail-soft style.
+	const channelKey = CHANNEL_ID!;
+	const channelScanSeen = new Set<string>();
+	const channelScan = setInterval(() => {
+		if (s.closing || active !== s) return;
+		let entries: string[];
+		try {
+			entries = readdirSync(RESULTS_DIR);
+		} catch {
+			return;
+		}
+		for (const name of entries) {
+			if (channelScanSeen.has(name)) continue;
+			if (!resultBelongsTo(name, channelKey)) continue;
+			channelScanSeen.add(name);
+			const full = join(RESULTS_DIR, name);
+			let body: string;
+			try {
+				body = readFileSync(full, 'utf-8').trim();
+			} catch {
+				continue;
+			}
+			if (!body) {
+				try { unlinkSync(full); } catch {}
+				continue;
+			}
+			console.log(`${ts()} [ChannelScan] picked up ${name} (${body.length}B)`);
+			s.events.push({ event: `channel_result:${name}`, timestamp: new Date().toISOString() });
+			// Inject through the same path the work-tool result-queue drain
+			// uses: a role:user content event into the live Gemini transport.
+			try {
+				(s.voiceSession as any).transport.sendContent(
+					[{ role: 'user', text: `[Channel result]\n${body}\n\nReport this result to the user now.` }],
+					true,
+				);
+			} catch (e) {
+				console.log(`${ts()} [ChannelScan] inject failed for ${name}: ${e}`);
+			}
+			// Read-and-delete so the scan doesn't re-deliver and so other
+			// consumers can't pick the file up after we've claimed it.
+			try { unlinkSync(full); } catch {}
+		}
+	}, 3000);
+	(s as any)._channelScanHandle = channelScan;
+
 	// Subscribe to anyone currently speaking, and to anyone who starts.
 	connection.receiver.speaking.on('start', (userId) => {
 		// Attribute this speaker to the in-progress turn. The gate resolves
@@ -893,6 +951,7 @@ function cleanupSession(s: DiscordVoiceSession): void {
 	try { clearInterval((s as any)._tickHandle); } catch {}
 	try { clearInterval((s as any)._outTickHandle); } catch {}
 	try { clearInterval((s as any)._watchdogHandle); } catch {}
+	try { clearInterval((s as any)._channelScanHandle); } catch {}
 	try { s.player.stop(true); } catch {}
 	try { s.connection.destroy(); } catch {}
 
