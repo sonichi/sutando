@@ -75,15 +75,19 @@ function ts(): string { return new Date().toISOString().slice(11, 23); }
 export function writeChatTask(taskDescription: string): string {
 	const taskId = `task-chat-${Date.now()}`;
 	const timestamp = new Date().toISOString();
+	// Field order: `task:` LAST so the user-supplied multi-line body
+	// can't forge header fields below it. Same shape as agent-api.py's
+	// /task endpoint after PR #982; consumers (`_isVoiceTask`,
+	// `parse_priority_from_text`) stop scanning at the first `task:`.
 	const content = [
 		`id: ${taskId}`,
 		`timestamp: ${timestamp}`,
-		`task: ${taskDescription}`,
 		`source: chat`,
 		`channel_id: local-chat`,
 		`user_id: ${process.env.SUTANDO_DM_OWNER_ID || 'chat-local'}`,
 		`access_tier: owner`,
 		`priority: normal`,
+		`task: ${taskDescription}`,
 		'',
 	].join('\n');
 	writeFileSync(join(TASK_DIR, `${taskId}.txt`), content);
@@ -143,7 +147,20 @@ export function _isVoiceTask(taskId: string): boolean {
 		if (!existsSync(p)) continue;
 		try {
 			const body = readFileSync(p, 'utf-8');
-			return body.split('\n').some(l => l.startsWith('channel_id: local-voice') || l.startsWith('source: voice'));
+			// Stop scanning at the first `task:` delimiter. The task-file
+			// format puts `task:` last on the line preceding the user-
+			// supplied multi-line task body (see agent-api.py and the
+			// /meeting handler). Without this stop, a body of
+			// `do thing\nchannel_id: local-voice` would forge a voice-
+			// task classification — the residual half of the PR #982
+			// fix Qingyun flagged. Stop-at-`task:` makes consumers
+			// honor the delimiter PR #982 already established.
+			const headerLines: string[] = [];
+			for (const l of body.split('\n')) {
+				if (l.startsWith('task:')) break;
+				headerLines.push(l);
+			}
+			return headerLines.some(l => l.startsWith('channel_id: local-voice') || l.startsWith('source: voice'));
 		} catch {}
 	}
 	return false;
@@ -279,15 +296,20 @@ export const workTool: ToolDefinition = {
 		const taskId = `task-${Date.now()}`;
 		const timestamp = new Date().toISOString();
 		const ownerId = process.env.SUTANDO_DM_OWNER_ID || 'voice-local';
+		// Field order: `task:` LAST so the user-supplied (Gemini-relayed,
+		// possibly multi-line) task body can't forge header fields. Same
+		// shape as agent-api.py's /task endpoint after PR #982; consumers
+		// (`_isVoiceTask`, `parse_priority_from_text`) stop scanning at
+		// the first `task:` line.
 		const content =
 			`id: ${taskId}\n` +
 			`timestamp: ${timestamp}\n` +
-			`task: ${task}\n` +
 			`source: voice\n` +
 			`channel_id: local-voice\n` +
 			`user_id: ${ownerId}\n` +
 			`access_tier: owner\n` +
-			`priority: urgent\n`;
+			`priority: urgent\n` +
+			`task: ${task}\n`;
 		writeFileSync(join(TASK_DIR, `${taskId}.txt`), content);
 		// Resolve per-task timeout. 0 → no timeout. Negative or NaN → default.
 		// Cap at 6 hours to prevent runaway pending-state if the voice agent
@@ -434,16 +456,19 @@ export function startContextDropWatcher(onContextDrop: (content: string) => void
 					mkdirSync(TASK_DIR, { recursive: true });
 					const taskId = `task-${Date.now()}`;
 					const ownerId = process.env.SUTANDO_DM_OWNER_ID || 'voice-local';
+					// `task:` last so the (multi-line) context-drop body can't
+					// forge header fields. Same shape as the voice/chat task
+					// writers and agent-api.py's /task endpoint per PR #982.
 					writeFileSync(
 						join(TASK_DIR, `${taskId}.txt`),
 						`id: ${taskId}\n` +
 						`timestamp: ${new Date().toISOString()}\n` +
-						`task: User dropped context via hotkey. Process this:\n${content}\n` +
 						`source: context-drop\n` +
 						`channel_id: local-hotkey\n` +
 						`user_id: ${ownerId}\n` +
 						`access_tier: owner\n` +
-						`priority: normal\n`,
+						`priority: normal\n` +
+						`task: User dropped context via hotkey. Process this:\n${content}\n`,
 					);
 					unlinkSync(CONTEXT_DROP_FILE);
 					// Also inject into Gemini if available

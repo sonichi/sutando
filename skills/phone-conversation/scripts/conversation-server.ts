@@ -76,7 +76,7 @@ function personalPath(filename: string): string {
 	}
 	return filename;
 }
-import { execSync, spawn, type ChildProcess } from 'node:child_process';
+import { execSync, execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { isAllowedAudioPath } from './audio_path_guard.js';
 import { VoiceSession, type ToolDefinition, type MainAgent } from 'bodhi-realtime-agent';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -332,7 +332,15 @@ function tryFastPath(callSession: CallSession, task: string): Promise<unknown> |
 			const image = execSync('ls -t /tmp/discord-inbox/*.jpg /tmp/discord-inbox/*.png 2>/dev/null | head -1', { timeout: 3000 }).toString().trim();
 			const video = execSync('ls -t /tmp/sutando-recording-*-narrated-subtitled.mov /tmp/sutando-recording-*-narrated.mov /tmp/sutando-recording-*.mov 2>/dev/null | head -1', { timeout: 3000 }).toString().trim();
 			if (image && video) {
-				const result = execSync(`bash ~/.claude/skills/video-concat/scripts/prepend-image.sh "${image}" "${video}" 3`, { timeout: 60000 }).toString().trim();
+				// Defense-in-depth: even after discord-bridge sanitizes
+				// inbound attachment filenames, use execFileSync so the
+				// path strings are argv entries, not shell-spliced.
+				// Pre-fix: a filename like `x"; touch /tmp/pwn; #.jpg`
+				// from a Discord attachment would break out of the
+				// double-quoted shell argument and execute the injected
+				// command.
+				const scriptPath = `${process.env.HOME}/.claude/skills/video-concat/scripts/prepend-image.sh`;
+				const result = execFileSync('bash', [scriptPath, image, video, '3'], { timeout: 60000 }).toString().trim();
 				const parsed = JSON.parse(result);
 				callSession.pendingTasks++;
 				setTimeout(() => {
@@ -1491,8 +1499,20 @@ const server = createServer(async (req, res) => {
 			const dialIn = body.dialIn ?? '+12532158782';
 			const digits = body.meetingId.replace(/\D/g, '');
 			const passcode = body.passcode?.replace(/\D/g, '') ?? '';
-			const platform = (body.platform ?? 'zoom').toLowerCase(); // 'zoom' | 'meet' | 'teams'
-			const originalId = body.meetingId.trim();
+			// `platform` is user-controlled (Gemini tool argument). The
+			// pre-fix `.toLowerCase()` did NOT strip newlines, so a value
+			// like `"zoom\nchannel_id: local-voice"` would survive into
+			// the task-file template literal below and forge a
+			// `_isVoiceTask` match. Same shape as the agent-api /task
+			// injection (PR #982). Strip CR/LF at the source.
+			const platform = (body.platform ?? 'zoom').toLowerCase().replace(/[\r\n]/g, ' ').trim();
+			// Same rationale for `originalId` — it survives untouched
+			// from `body.meetingId.trim()` and lands in the multi-line
+			// `task:` field of the task-file template literal below.
+			// Multi-line meeting IDs aren't meaningful; flatten to
+			// spaces and cap to a reasonable length to bound abuse via
+			// oversized inputs.
+			const originalId = body.meetingId.trim().replace(/[\r\n]/g, ' ').slice(0, 80);
 			const connectUrl = `${WEBHOOK_BASE_URL}/twilio/connect?meeting=true&meetingId=${encodeURIComponent(originalId)}&passcode=${encodeURIComponent(passcode)}`;
 
 			let sid: string;
