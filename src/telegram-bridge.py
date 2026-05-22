@@ -88,7 +88,16 @@ if channels_env.exists():
     for line in channels_env.read_text().splitlines():
         if "=" in line and not line.startswith("#"):
             k, v = line.split("=", 1)
-            os.environ[k.strip()] = v.strip()
+            v = v.strip()
+            # Strip matching surrounding quotes — mirrors python-dotenv.
+            # Without this, `TELEGRAM_BOT_TOKEN="abc"` in .env stores
+            # the literal `"abc"` (with quotes) in os.environ; the
+            # Telegram REST URL becomes
+            # `https://api.telegram.org/bot"abc"/getUpdates` and Telegram
+            # returns 404. Quoted .env values are a common convention.
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+                v = v[1:-1]
+            os.environ[k.strip()] = v
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 if not TOKEN:
@@ -386,7 +395,11 @@ def send_reply(chat_id, text, task_id: str | None = None):
             api("sendMessage", chat_id=chat_id, text=f"(file access denied: {fpath})")
             print(f"  BLOCKED file: {fpath}")
         else:
-            api("sendMessage", chat_id=chat_id, text=f"(file not found: {fpath})")
+            # Prose-quoted `[file:/path]` substrings extract as markers
+            # but reference no actual file. Don't ship the warning to
+            # the user; log for operator visibility on real typos. Same
+            # rationale as discord-bridge:poll_results.
+            print(f"  file marker, file not found — likely a prose quotation: {fpath}", flush=True)
 
 def main():
     print(f"Telegram bridge started. Polling for messages...", flush=True)
@@ -502,8 +515,17 @@ def main():
         # Check for proactive messages to send to owner.
         # Presenter-mode: retain files (don't unlink, don't send) so they
         # flush after the talk window ends. See presenter-mode.sh contract.
+        # Channel routing: skip the proactive scan entirely if telegram
+        # is not the last-active channel. Pre-fix the discord-bridge
+        # and telegram-bridge raced for the SAME proactive-*.txt files
+        # and whichever ran first delivered, producing cross-channel
+        # surprises. See proactive_routing.py for the decision rule.
+        from proactive_routing import should_claim_proactive
         try:
-            if not presenter_mode_active():
+            if (
+                not presenter_mode_active()
+                and should_claim_proactive(OWNER_ACTIVITY_FILE, "telegram")
+            ):
                 for f in RESULTS_DIR.iterdir():
                     if f.name.startswith("proactive-") and f.suffix == ".txt":
                         # Claim-by-rename: atomic move to a `.sending`
