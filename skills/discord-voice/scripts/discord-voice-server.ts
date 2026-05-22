@@ -310,7 +310,7 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 			// nudge; model read the imperative as imperative and the nudge
 			// as optional. One conditional line so only one path appears.
 			DISCORD_VOICE_GOOGLE_SEARCH
-				? 'NEVER fabricate specific details. If you don\'t know it, use your built-in Web search to look it up — it\'s faster than delegating, and the answer stays in the conversation.'
+				? 'NEVER fabricate specific details. If you don\'t know it, use your built-in Web search to look it up — it\'s faster than delegating, and the answer stays in the conversation. If your built-in search returns nothing useful, OR the question needs deeper-than-one-lookup research (multi-step, multiple sources, file reading), call the work tool — it routes to the core agent which can do extensive research.'
 				: 'NEVER fabricate specific details. If you don\'t know it, use the work tool to look it up.',
 			repoUrl ? `\n## Known info\nSutando GitHub repo: ${repoUrl}` : '',
 		].filter(Boolean).join('\n');

@@ -503,7 +503,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 	// line so only one path is presented per config.
 	if (callSession.isOwner) {
 		instructions += PHONE_GOOGLE_SEARCH
-			? '\n\nNEVER fabricate specific details. If you don\'t know it, use your built-in Web search to look it up — it\'s faster than delegating, and the answer stays in the conversation.'
+			? '\n\nNEVER fabricate specific details. If you don\'t know it, use your built-in Web search to look it up — it\'s faster than delegating, and the answer stays in the conversation. If your built-in search returns nothing useful, OR the question needs deeper-than-one-lookup research (multi-step, multiple sources, file reading), call the work tool — it routes to the core agent which can do extensive research.'
 			: '\n\nNEVER fabricate specific details. If you don\'t know it, use the work tool to look it up.';
 	}
 
