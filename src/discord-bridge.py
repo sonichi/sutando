@@ -2837,7 +2837,10 @@ async def poll_results():
                             await channel.send(file=discord.File(fpath))
                             print(f"  Sent file: {fpath}")
                         elif not os.path.isfile(fpath):
-                            await channel.send(f"(file not found: {fpath})")
+                            # Prose-quoted `[file:/path]` substrings extract
+                            # as markers but reference no real file. Log for
+                            # operator visibility; don't surface to the user.
+                            print(f"  [file marker, file not found — likely a prose quotation]: {fpath}", flush=True)
                         else:
                             await channel.send(f"(file not allowed: {fpath})")
                             print(f"  REJECTED file (not in allowlist): {fpath}", flush=True)
@@ -2876,6 +2879,21 @@ async def poll_proactive():
                 await asyncio.sleep(3)
                 continue
             _presenter_log_throttle = 0
+            # Channel routing: skip the entire proactive scan if this
+            # bridge is not the last-active channel. The pre-fix race
+            # between discord-bridge and telegram-bridge for the SAME
+            # proactive-*.txt files produced unpredictable cross-channel
+            # delivery — a Discord-context follow-up could land on
+            # Telegram or vice versa. See proactive_routing.py for the
+            # decision rule (last-active channel from
+            # state/last-owner-activity.json; default discord on missing
+            # state).
+            from proactive_routing import should_claim_proactive  # noqa: E402
+            if not should_claim_proactive(
+                STATE_DIR / "last-owner-activity.json", "discord"
+            ):
+                await asyncio.sleep(3)
+                continue
             for f in RESULTS_DIR.iterdir():
                 if f.name.startswith("proactive-") and f.suffix == ".txt":
                     # Claim-by-rename: atomically move the file to a
@@ -2969,7 +2987,8 @@ async def poll_proactive():
                             if _is_path_sendable(fpath):
                                 await dm.send(file=discord.File(fpath))
                             elif not os.path.isfile(fpath):
-                                await dm.send(f"(file not found: {fpath})")
+                                # See poll_results — log only, no user noise.
+                                print(f"  [proactive] file marker, file not found: {fpath}", flush=True)
                             else:
                                 await dm.send(f"(file not allowed: {fpath})")
                                 print(f"  [proactive] REJECTED file: {fpath}", flush=True)
@@ -3126,7 +3145,8 @@ async def poll_dm_fallback():
                                     await target_channel.send(file=discord.File(fpath))
                                     print(f"  [dm-fallback channel-redirect] sent file: {fpath}", flush=True)
                                 elif not os.path.isfile(fpath):
-                                    await target_channel.send(f"(file not found: {fpath})")
+                                    # See poll_results — log only, no user noise.
+                                    print(f"  [dm-fallback channel-redirect] file marker, file not found: {fpath}", flush=True)
                             print(f"  [dm-fallback channel-redirect] sent {f.name} to channel {target_channel_id}", flush=True)
                             _task_file = TASKS_DIR / f"{_task_id}.txt"
                             if _task_file.exists():
