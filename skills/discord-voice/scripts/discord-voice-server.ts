@@ -30,10 +30,11 @@
  */
 
 import { config as _dotenvConfig } from 'dotenv';
-import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, existsSync, readFileSync, unlinkSync } from 'node:fs';
+import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, existsSync, readFileSync, readdirSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { resolveWorkspace } from '../../../src/workspace_default.js';
 import { recordConversation, recordSession } from '../../../src/conversation-store.js';
+import { resultBelongsTo } from '../../../src/result-channel-key.js';
 import { type Tier, loadAccessTiers, effectiveTier, toolAllowed, toolNeed } from './access-tier.js';
 
 _dotenvConfig({ path: new URL('../../../.env', import.meta.url).pathname, override: true });
@@ -76,6 +77,11 @@ import {
 const GEMINI_API_KEY = voiceApiKey();
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN ?? '';
 const WORKSPACE_DIR = resolveWorkspace();
+// Operational/diagnostic log — the [Setup]/[Voice]/[Tool]/[VoiceSession]/
+// [Dismiss] lines that otherwise only hit stdout. Mirrors discord-bridge.log
+// and voice-agent.log so discord-voice's operational history survives a
+// process exit. Tee'd from console.log/console.error below (fail-soft).
+const DISCORD_VOICE_LOG = join(WORKSPACE_DIR, 'logs', 'discord-voice.log');
 const DATA_DIR = join(WORKSPACE_DIR, 'data');
 const RESULTS_DIR = process.env.DISCORD_VOICE_RESULTS_DIR || join(WORKSPACE_DIR, 'results');
 const TASKS_DIR = join(WORKSPACE_DIR, 'tasks');
@@ -205,6 +211,34 @@ function appendConversationLog(role: string, text: string): void {
 		mkdirSync(dirname(CONVERSATION_LOG), { recursive: true });
 		appendFileSync(CONVERSATION_LOG, `${new Date().toISOString()}|${role}|${text.replace(/\n/g, ' ')}\n`);
 	} catch {}
+}
+
+// --- Operational log tee ----------------------------------------------------
+// console.log/console.error still write to stdout exactly as before; each call
+// is ALSO appended (ISO-timestamped) to logs/discord-voice.log. Mirrors the
+// appendConversationLog pattern above — mkdirSync guard + fail-soft try/catch
+// so a disk/permission error degrades silently to stdout-only and can NEVER
+// crash the voice session.
+function appendOperationalLog(level: string, args: unknown[]): void {
+	try {
+		const line = args
+			.map((a) => (typeof a === 'string' ? a : a instanceof Error ? (a.stack ?? a.message) : String(a)))
+			.join(' ');
+		mkdirSync(dirname(DISCORD_VOICE_LOG), { recursive: true });
+		appendFileSync(DISCORD_VOICE_LOG, `${new Date().toISOString()} ${level} ${line}\n`);
+	} catch {}
+}
+{
+	const _origLog = console.log.bind(console);
+	const _origError = console.error.bind(console);
+	console.log = (...args: unknown[]): void => {
+		_origLog(...args);
+		appendOperationalLog('LOG', args);
+	};
+	console.error = (...args: unknown[]): void => {
+		_origError(...args);
+		appendOperationalLog('ERR', args);
+	};
 }
 
 // --- Audio conversion helpers ----------------------------------------------
@@ -863,6 +897,78 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 	}, 10000);
 	(s as any)._watchdogHandle = watchdog;
 
+	// --- Per-channel pull path for non-delegated task results ---------------
+	// Regular `work`-tool delegations land at `results/task-discord-voice-*.txt`
+	// and are claimed by the per-task poll in delegateTask(). This separate
+	// scan picks up the new scoped namespace — `results/<CHANNEL_ID>.task-*.txt`
+	// — used when the core agent (or another tool) needs to deliver a result
+	// to THIS voice channel without having delegated through the work tool
+	// (e.g. context handoff from a different surface). Existing consumers
+	// don't match the `<channel-id>.` prefix, so a file in this namespace is
+	// invisible to them — only this scan and the matching phone scan claim it.
+	//
+	// Cadence is intentionally slower than the delegate poll (3s vs 500ms)
+	// since this path is for cross-surface handoffs, not in-conversation
+	// turn-taking. Read-and-delete mirrors delegateTask()'s fail-soft style.
+	const channelKey = CHANNEL_ID!;
+	// Safety-net against silent unlinkSync failures (the unlink below is wrapped
+	// in try/catch so a failed delete won't surface — without this map we'd
+	// re-deliver the same body every 3s). Stored as `name -> first-seen ms`
+	// and pruned at 60s/tick so the map can't grow unbounded. Map (not Set) so
+	// the prune is O(seen) per tick without a parallel structure.
+	const channelScanSeen = new Map<string, number>();
+	const CHANNEL_SCAN_TTL_MS = 60_000;
+	const channelScan = setInterval(() => {
+		if (s.closing || active !== s) return;
+		// Prune entries older than the TTL so the map doesn't grow unbounded.
+		const cutoff = Date.now() - CHANNEL_SCAN_TTL_MS;
+		for (const [k, ts0] of channelScanSeen) {
+			if (ts0 < cutoff) channelScanSeen.delete(k);
+		}
+		let entries: string[];
+		try {
+			entries = readdirSync(RESULTS_DIR);
+		} catch {
+			return;
+		}
+		for (const name of entries) {
+			// .txt guard — never touch a writer's atomic-write temp
+			// (`<key>.task-X.txt.tmp`, `.sending`, `.partial`, etc).
+			// Belt-and-suspenders: `resultBelongsTo` also gates on .txt.
+			if (!name.endsWith('.txt')) continue;
+			if (channelScanSeen.has(name)) continue;
+			if (!resultBelongsTo(name, channelKey)) continue;
+			channelScanSeen.set(name, Date.now());
+			const full = join(RESULTS_DIR, name);
+			let body: string;
+			try {
+				body = readFileSync(full, 'utf-8').trim();
+			} catch {
+				continue;
+			}
+			if (!body) {
+				try { unlinkSync(full); } catch {}
+				continue;
+			}
+			console.log(`${ts()} [ChannelScan] picked up ${name} (${body.length}B)`);
+			s.events.push({ event: `channel_result:${name}`, timestamp: new Date().toISOString() });
+			// Inject through the same path the work-tool result-queue drain
+			// uses: a role:user content event into the live Gemini transport.
+			try {
+				(s.voiceSession as any).transport.sendContent(
+					[{ role: 'user', text: `[Channel result]\n${body}\n\nReport this result to the user now.` }],
+					true,
+				);
+			} catch (e) {
+				console.log(`${ts()} [ChannelScan] inject failed for ${name}: ${e}`);
+			}
+			// Read-and-delete so the scan doesn't re-deliver and so other
+			// consumers can't pick the file up after we've claimed it.
+			try { unlinkSync(full); } catch {}
+		}
+	}, 3000);
+	(s as any)._channelScanHandle = channelScan;
+
 	// Subscribe to anyone currently speaking, and to anyone who starts.
 	connection.receiver.speaking.on('start', (userId) => {
 		// Attribute this speaker to the in-progress turn. The gate resolves
@@ -893,6 +999,7 @@ function cleanupSession(s: DiscordVoiceSession): void {
 	try { clearInterval((s as any)._tickHandle); } catch {}
 	try { clearInterval((s as any)._outTickHandle); } catch {}
 	try { clearInterval((s as any)._watchdogHandle); } catch {}
+	try { clearInterval((s as any)._channelScanHandle); } catch {}
 	try { s.player.stop(true); } catch {}
 	try { s.connection.destroy(); } catch {}
 

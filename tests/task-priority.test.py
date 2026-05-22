@@ -64,12 +64,17 @@ class TestEnumAndDefaults(unittest.TestCase):
 
 class TestParsing(unittest.TestCase):
     def test_parse_priority_from_text_finds_header(self):
+        # Field order: `task:` LAST. PR #1023 added `task:` to the
+        # break condition (closing the body-forging vector @qingyun-wu
+        # flagged on #991), so `priority:` lines AFTER `task:` are now
+        # treated as body content, not header — same convention the
+        # writer side already enforces.
         body = (
             "id: task-1\n"
             "timestamp: 2026-05-16T00:00:00Z\n"
-            "task: do something\n"
             "source: voice\n"
             "priority: urgent\n"
+            "task: do something\n"
         )
         self.assertEqual(parse_priority_from_text(body), "urgent")
 
