@@ -77,6 +77,7 @@ function personalPath(filename: string): string {
 	return filename;
 }
 import { execSync, spawn, type ChildProcess } from 'node:child_process';
+import { isAllowedAudioPath } from './audio_path_guard.js';
 import { VoiceSession, type ToolDefinition, type MainAgent } from 'bodhi-realtime-agent';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
@@ -1175,6 +1176,20 @@ async function waitForWebhook(): Promise<void> {
 // and a WebSocket endpoint for real-time audio streaming (Media Streams).
 // Claude also calls these endpoints to trigger actions (/call, /concurrent-call, /hangup).
 
+// Control endpoints (anything not under /twilio/*) drive owner-account
+// actions: originate outbound calls (/call), hang up active calls
+// (/hangup), play audio through Twilio (/play-audio), etc. The server
+// binds to 0.0.0.0 because ngrok's local-tunnel client + the Twilio
+// webhook path need it (see server.listen at the bottom). That means
+// every endpoint is LAN-reachable. /twilio/* paths validate Twilio's
+// signature; the rest had no auth at all — any caller on the LAN could
+// POST /call with an arbitrary `to` and trigger Twilio calls on the
+// owner's account (cost + caller-ID exposure + harassment vector).
+// `isLoopback` (see loopback_guard.ts) gates non-/twilio control
+// endpoints to loopback only; LAN callers get 403. /health is exempt
+// — it's read-only and useful for LAN-side liveness checks.
+import { isLoopback } from './loopback_guard.js';
+
 const server = createServer(async (req, res) => {
 	const url = new URL(req.url ?? '', `http://localhost:${PORT}`);
 	const path = url.pathname;
@@ -1182,6 +1197,15 @@ const server = createServer(async (req, res) => {
 	if (req.method === 'OPTIONS') {
 		res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' });
 		res.end(); return;
+	}
+
+	// Reject non-Twilio endpoints from non-loopback callers (see comment
+	// on `isLoopback` above).
+	if (path !== '/health' && !path.startsWith('/twilio/') && !isLoopback(req)) {
+		const remote = req.socket.remoteAddress ?? '?';
+		console.log(`${ts()} [PhoneServer] REJECTED non-loopback ${req.method} ${path} from ${remote}`);
+		json(res, 403, { error: 'control endpoints are loopback-only' });
+		return;
 	}
 
 	try {
@@ -1291,7 +1315,19 @@ const server = createServer(async (req, res) => {
 			// Stream an audio/video file's audio track through Twilio to the caller's phone
 			const body = JSON.parse(await readBody(req)) as { path: string; callSid?: string; seekSec?: number };
 			if (!body.path) { json(res, 400, { error: 'path required' }); return; }
-			if (!existsSync(body.path)) { json(res, 404, { error: 'file not found' }); return; }
+			// Path-allowlist gate (see audio_path_guard.ts for the
+			// rationale). Pre-fix this endpoint validated only
+			// `existsSync(body.path)`, so any LAN caller could have
+			// ffmpeg open any local file the server's user could read
+			// and stream the audio to whoever was on the active call.
+			// The allowlist restricts to the recording skill's
+			// `/tmp/sutando-*` convention and realpath-collapses to
+			// defeat symlink escapes.
+			if (!isAllowedAudioPath(body.path)) {
+				console.log(`${ts()} [PlayAudio] REJECTED path (not allowlisted): ${body.path}`);
+				json(res, 403, { error: 'path not allowed' });
+				return;
+			}
 			let session: CallSession | undefined;
 			if (body.callSid) {
 				session = activeCalls.get(body.callSid);

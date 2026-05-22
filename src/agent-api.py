@@ -236,6 +236,21 @@ def _is_safe_callback_url(url: str) -> tuple[bool, str]:
             for net in private_ranges:
                 if addr in net:
                     return False, f"private IP: {addr}"
+            # IPv4-mapped IPv6 bypass guard. ipaddress's cross-family `in`
+            # check returns False (an IPv6Address is never in an IPv4Network),
+            # so a hostname that resolves to e.g. `::ffff:127.0.0.1` would
+            # otherwise pass the loop above. Project the mapped IPv4 onto
+            # the IPv4 private-range checks to close the bypass. Same
+            # applies to IPv4-compatible IPv6 (`::a.b.c.d`), exposed via
+            # `IPv6Address.ipv4_mapped` for the v4-mapped form;
+            # `sixtofour` / `teredo` are public-routable tunneling and
+            # don't need this projection.
+            if isinstance(addr, ipaddress.IPv6Address):
+                v4 = addr.ipv4_mapped
+                if v4 is not None:
+                    for net in private_ranges:
+                        if isinstance(net, ipaddress.IPv4Network) and v4 in net:
+                            return False, f"private IP (via IPv4-mapped IPv6 {addr}): {v4}"
         except ValueError:
             return False, f"invalid address: {sockaddr[0]}"
     return True, "ok"

@@ -54,7 +54,16 @@ if ENV_FILE.exists():
     for line in ENV_FILE.read_text().splitlines():
         if "=" in line and not line.startswith("#"):
             key, _, val = line.partition("=")
-            os.environ[key.strip()] = val.strip()
+            val = val.strip()
+            # Strip matching surrounding quotes — mirrors python-dotenv.
+            # Without this, `X_API_KEY="abc"` in .env stores the literal
+            # string `"abc"` (with quotes) in os.environ, and the OAuth1
+            # signing path uses the quoted key verbatim, producing a 401
+            # from X. Quoted .env values are common when keys/secrets
+            # contain shell-special chars or to mark them explicitly.
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                val = val[1:-1]
+            os.environ[key.strip()] = val
 
 API_KEY = os.environ.get("X_API_KEY", "")
 API_SECRET = os.environ.get("X_API_SECRET", "")

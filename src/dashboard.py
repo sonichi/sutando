@@ -506,8 +506,23 @@ load()
 
 
 if __name__ == "__main__":
-    server = http.server.HTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"Sutando Dashboard → http://localhost:{PORT}")
+    # Default loopback-only. The dashboard exposes owner notes, recent
+    # activity, system stats, and the owner's avatar/identity — all
+    # privacy-sensitive. The pre-fix `0.0.0.0` bind made every detail
+    # readable by any device on the LAN with no auth. Set
+    # `DASHBOARD_BIND=0.0.0.0` to opt back into LAN exposure when you
+    # know you want it. Same env-override shape as `AGENT_API_BIND` in
+    # agent-api.py.
+    bind = os.environ.get("DASHBOARD_BIND", "127.0.0.1")
+    server = http.server.HTTPServer((bind, PORT), Handler)
+    print(f"Sutando Dashboard → http://{bind}:{PORT}", flush=True)
+    if bind != "127.0.0.1":
+        print(
+            f"  (LAN access enabled via DASHBOARD_BIND={bind} — "
+            f"the dashboard has NO authentication; anyone on this network "
+            f"can read your notes, activity, and identity)",
+            flush=True,
+        )
     try:
         server.serve_forever()
     except KeyboardInterrupt:

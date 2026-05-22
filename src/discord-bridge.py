@@ -269,6 +269,31 @@ def _chunk_for_discord(text: str, max_len: int = 1900):
         yield chunk
 
 
+# Marker regex for inline file references in result bodies. The pattern
+# requires absolute paths (`/...` or `~/...`) — the earlier relative-
+# path-allowing form resolved against the bridge's CWD, which differed
+# between launchd-managed and bare-shell runs. Three call sites in this
+# module (poll_results, poll_proactive, poll_dm_fallback channel-
+# redirect) previously re-defined this regex inline; consolidated here
+# so a future hardening only needs one edit.
+_FILE_MARKER_RE = re.compile(r'\[(?:file|send|attach):\s*((?:/|~/)[^\]:]+)\]')
+
+
+def _split_file_markers(text: str) -> tuple[str, list[str]]:
+    """Split a result body into ``(clean_text, files)``.
+
+    ``files`` is the list of paths extracted from ``[file:|send:|attach:]``
+    markers (in textual order). ``clean_text`` is the original text with
+    every marker removed and surrounding whitespace stripped.
+
+    Pure function — single source of truth for the marker pattern
+    across every send path in this bridge.
+    """
+    files = _FILE_MARKER_RE.findall(text)
+    clean_text = _FILE_MARKER_RE.sub('', text).strip()
+    return clean_text, files
+
+
 def _is_path_sendable(fpath: str) -> bool:
     """True iff `fpath` is a real file AND resolves under an allowed root.
 
@@ -1949,6 +1974,11 @@ def _should_welcome_first_post(message, welcome_channel_id, welcome_template_pat
 
 # Track pending replies: task_id -> channel
 pending_replies = {}
+# Track source message id per pending task so the result-sender can default
+# reply_to_id to the triggering message (visually threads the reply). Lives
+# in memory only — crash-recovery isn't critical; missing entry just means
+# the reply goes as a fresh message instead of a quote-reply.
+pending_reply_anchors: dict[str, int] = {}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -2574,12 +2604,17 @@ async def _handle_discord_message(message, force=False):
         f"task: {user_task_text}\n"
         f"source: discord\n"
         f"channel_id: {message.channel.id}\n"
+        f"source_message_id: {message.id}\n"
         f"user_id: {message.author.id}\n"
         f"access_tier: {access_tier}\n"
         f"priority: {priority}\n"
         f"{tier_instructions.get(access_tier, tier_instructions['other'])}"
     )
     pending_replies[task_id] = message.channel
+    # Track source-message-id so the result-sender can auto-attach reply_to
+    # (visually thread the reply to the triggering message). Skipped when
+    # the channel is already a Discord thread — thread context is enough.
+    pending_reply_anchors[task_id] = message.id
     save_pending_replies()
 
     # Typing indicator
@@ -2716,6 +2751,13 @@ async def poll_results():
                 import re
                 reply_text = result_file.read_text().strip()
                 channel = pending_replies.pop(task_id)
+                # Capture anchor BEFORE pop so the auto-thread block below
+                # can use it. The previous version popped+forgot, leaving
+                # `pending_reply_anchors.get(task_id)` at line ~2810 always
+                # returning None — symptom: replies appeared as fresh
+                # messages instead of quote-replies. Caught by live test
+                # 2026-05-22 ~03:00 UTC: "it's not a quote reply".
+                source_message_anchor = pending_reply_anchors.pop(task_id, None)
                 save_pending_replies()
                 # Skip sending if already replied directly (core agent used MCP).
                 # Clean up the result AND task files so the watcher doesn't
@@ -2743,6 +2785,25 @@ async def poll_results():
                     reply_to_id = int(reply_match.group(1)) if reply_match else None
                     if reply_match:
                         reply_text = reply_pattern.sub('', reply_text).strip()
+                    # Auto-thread: if the agent didn't pick an explicit
+                    # [reply: <id>], default to the triggering message so the
+                    # reply appears quoted under what it's answering. Skip
+                    # when the channel is already a Discord thread — thread
+                    # context anchors the reply implicitly, no extra quote
+                    # needed.
+                    #
+                    # getattr instead of bare `discord.Thread` so the
+                    # test-stub discord module (tests/discord-bridge-*.test.py)
+                    # — which intentionally omits Thread to keep the stub
+                    # surface small — doesn't AttributeError here. Production
+                    # discord.py always provides Thread; the getattr fallback
+                    # only matters under test, where treating "no Thread
+                    # class" as "channel isn't a thread" is correct.
+                    if reply_to_id is None:
+                        _thread_cls = getattr(discord, 'Thread', None)
+                        is_thread = _thread_cls is not None and isinstance(channel, _thread_cls)
+                        if not is_thread:
+                            reply_to_id = source_message_anchor
 
                     # Extract optional [channel: <channel_id>] redirect — the
                     # agent can route a DM-originated reply to a different
@@ -2804,9 +2865,7 @@ async def poll_results():
                                 print(f"  [channel-redirect] failed to resolve channel {target_channel_id}, falling back to task source: {e}", flush=True)
 
                     # Extract file paths: [file: /path] or [send: /path]
-                    file_pattern = re.compile(r'\[(?:file|send|attach):\s*((?:/|~/)[^\]:]+)\]')
-                    files = file_pattern.findall(reply_text)
-                    clean_text = file_pattern.sub('', reply_text).strip()
+                    clean_text, files = _split_file_markers(reply_text)
 
                     # Send text — fence-aware chunker preserves triple-backtick code blocks
                     # First chunk uses message_reference (if set); subsequent chunks
@@ -2837,7 +2896,10 @@ async def poll_results():
                             await channel.send(file=discord.File(fpath))
                             print(f"  Sent file: {fpath}")
                         elif not os.path.isfile(fpath):
-                            await channel.send(f"(file not found: {fpath})")
+                            # Prose-quoted `[file:/path]` substrings extract
+                            # as markers but reference no real file. Log for
+                            # operator visibility; don't surface to the user.
+                            print(f"  [file marker, file not found — likely a prose quotation]: {fpath}", flush=True)
                         else:
                             await channel.send(f"(file not allowed: {fpath})")
                             print(f"  REJECTED file (not in allowlist): {fpath}", flush=True)
@@ -2876,6 +2938,21 @@ async def poll_proactive():
                 await asyncio.sleep(3)
                 continue
             _presenter_log_throttle = 0
+            # Channel routing: skip the entire proactive scan if this
+            # bridge is not the last-active channel. The pre-fix race
+            # between discord-bridge and telegram-bridge for the SAME
+            # proactive-*.txt files produced unpredictable cross-channel
+            # delivery — a Discord-context follow-up could land on
+            # Telegram or vice versa. See proactive_routing.py for the
+            # decision rule (last-active channel from
+            # state/last-owner-activity.json; default discord on missing
+            # state).
+            from proactive_routing import should_claim_proactive  # noqa: E402
+            if not should_claim_proactive(
+                STATE_DIR / "last-owner-activity.json", "discord"
+            ):
+                await asyncio.sleep(3)
+                continue
             for f in RESULTS_DIR.iterdir():
                 if f.name.startswith("proactive-") and f.suffix == ".txt":
                     # Claim-by-rename: atomically move the file to a
@@ -2948,9 +3025,7 @@ async def poll_proactive():
                         user = await client.fetch_user(int(owner_id))
                         dm = await user.create_dm()
                         # Extract files
-                        file_pattern = re.compile(r'\[(?:file|send|attach):\s*((?:/|~/)[^\]:]+)\]')
-                        files = file_pattern.findall(text)
-                        clean_text = file_pattern.sub('', text).strip()
+                        clean_text, files = _split_file_markers(text)
                         if clean_text:
                             for chunk in _chunk_for_discord(clean_text):
                                 await dm.send(chunk)
@@ -2969,7 +3044,8 @@ async def poll_proactive():
                             if _is_path_sendable(fpath):
                                 await dm.send(file=discord.File(fpath))
                             elif not os.path.isfile(fpath):
-                                await dm.send(f"(file not found: {fpath})")
+                                # See poll_results — log only, no user noise.
+                                print(f"  [proactive] file marker, file not found: {fpath}", flush=True)
                             else:
                                 await dm.send(f"(file not allowed: {fpath})")
                                 print(f"  [proactive] REJECTED file: {fpath}", flush=True)
@@ -3104,9 +3180,7 @@ async def poll_dm_fallback():
                             print(f"  [dm-fallback channel-redirect] failed to resolve {target_channel_id}: {e}", flush=True)
                         if target_channel:
                             # File markers (parity with poll_results 2761-2784).
-                            file_pattern = re.compile(r'\[(?:file|send|attach):\s*((?:/|~/)[^\]:]+)\]')
-                            file_list = file_pattern.findall(clean_body)
-                            text_only = file_pattern.sub('', clean_body).strip()
+                            text_only, file_list = _split_file_markers(clean_body)
                             if text_only:
                                 for chunk in _chunk_for_discord(text_only):
                                     await target_channel.send(chunk)
@@ -3126,7 +3200,8 @@ async def poll_dm_fallback():
                                     await target_channel.send(file=discord.File(fpath))
                                     print(f"  [dm-fallback channel-redirect] sent file: {fpath}", flush=True)
                                 elif not os.path.isfile(fpath):
-                                    await target_channel.send(f"(file not found: {fpath})")
+                                    # See poll_results — log only, no user noise.
+                                    print(f"  [dm-fallback channel-redirect] file marker, file not found: {fpath}", flush=True)
                             print(f"  [dm-fallback channel-redirect] sent {f.name} to channel {target_channel_id}", flush=True)
                             _task_file = TASKS_DIR / f"{_task_id}.txt"
                             if _task_file.exists():
