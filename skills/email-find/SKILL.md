@@ -46,6 +46,8 @@ If Phase 1 didn't surface it, run **one query per partner domain** the user may 
 search_threads query="from:DOMAIN OR from:NAMED-ADDRESS" pageSize=10
 ```
 
+**If no partner-domain file exists yet**, skip this phase — proceed straight to Phase 3. (Phase 2 only adds value when you've accumulated mappings; the skill works fine without it.) Then, if Phases 3–4 surface an email from a domain you didn't expect for the named entity, follow the "first-time setup" flow in `## Per-user partner-domain memory` below to offer to create the file.
+
 ### Phase 3 — Walk threads by participant
 
 If Phase 2 didn't surface it, list threads where the named contact appears anywhere on the message (To/CC/BCC), not just as sender:
@@ -71,13 +73,30 @@ When you ask, include the actual list of senders + subjects you saw, so the user
 
 ## Per-user partner-domain memory
 
-This skill is generic. The mapping of "named entity → partner email domains" is per-user knowledge that lives in the user's memory, not in this skill file. The agent should:
+The mapping of "named entity → partner email domains" is per-user knowledge that lives in the user's memory directory, not in this skill file. The skill works without it (Phase 2 just becomes a no-op), but accumulating these mappings makes future searches much faster.
 
-1. **On invocation, read** the user's memory directory for any file named `reference_partner_domains.md` (or similar — also accept patterns like `partner_domains_*.md`, or check the `## Partner domains` section of `user_profile.md`).
-2. **If the named entity is in the file**, expand to all listed domains in Phase 2.
-3. **If the named entity is NOT in the file** and Phase 2 returns useful hits from a previously-unknown domain, **propose adding the mapping** at the end of the reply so future sessions inherit it.
+### Where the file lives
 
-File format (suggested — agent should match whatever convention the user already has):
+The agent should look in the user's memory directory:
+
+1. **Read** the env var `SUTANDO_MEMORY_DIR`. If unset, fall back to the default `~/.claude/projects/<project-id>/memory/` (the same path the Sutando memory system uses — see Sutando's CLAUDE.md for the exact resolution).
+2. **Look** for any file matching the patterns: `reference_partner_domains.md`, `partner_domains*.md`, or check whether `user_profile.md` has a `## Partner domains` section.
+3. **If found**, parse the table and use it in Phase 2.
+4. **If not found**, skip Phase 2 and proceed with Phases 3–4. Do not error out — the skill is fully functional without this file.
+
+### First-time setup flow (offered, not required)
+
+When the skill runs for the first time and the file doesn't exist, AND either:
+- the agent surfaces an email from a domain the user didn't name (e.g. user asked for "K12 email" and the hit came from `soulilution.com`), OR
+- the agent accumulates 2+ named-entity → domain mappings during a session,
+
+then **at the end of the reply, offer to create the file** with a concrete one-line command, e.g.:
+
+> Want me to save this mapping for next time? I can create `<resolved-memory-dir>/reference_partner_domains.md` with the {NamedEntity} → {discovered-domains} table already filled in. Reply "yes" or paste any additional entities + domains you want included.
+
+If the user says yes, the agent writes the file using the format below and adds a one-line entry in the user's `MEMORY.md` index pointing at it (per the Sutando memory-system convention). The file is then read on every future `/email-find` invocation.
+
+### File format
 
 ```markdown
 ---
@@ -93,7 +112,7 @@ metadata:
 | Foo Foundation | `*@foo.org`, `programs@foo.org`, `*@foo-partner.com` |
 ```
 
-If the file doesn't exist and the user has accumulated 2+ partner mappings during the session, **offer to create it** at the end of the reply.
+The agent should treat this format as a template — match whatever frontmatter / heading convention the user already uses elsewhere in their memory dir.
 
 ## Subject-mismatch heuristic (no subject filtering in Phases 1–3)
 
