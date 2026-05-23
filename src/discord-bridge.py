@@ -66,13 +66,14 @@ except Exception:  # pragma: no cover
     def _push_vision_image(path: str, source: str = "discord") -> bool:  # type: ignore
         return False
 
-# Load token from channels config
-TOKEN = ""
-channels_env = Path.home() / ".claude" / "channels" / "discord" / ".env"
-if channels_env.exists():
-    for line in channels_env.read_text().splitlines():
-        if line.startswith("DISCORD_BOT_TOKEN="):
-            TOKEN = line.split("=", 1)[1].strip()
+# Load token — env var takes precedence (allows test injection without a real .env file)
+TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
+if not TOKEN:
+    channels_env = Path.home() / ".claude" / "channels" / "discord" / ".env"
+    if channels_env.exists():
+        for line in channels_env.read_text().splitlines():
+            if line.startswith("DISCORD_BOT_TOKEN="):
+                TOKEN = line.split("=", 1)[1].strip()
 
 if not TOKEN:
     print("DISCORD_BOT_TOKEN not set in ~/.claude/channels/discord/.env")
