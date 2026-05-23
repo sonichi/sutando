@@ -63,11 +63,25 @@ Requires `SUTANDO_REPO_DIR` env or a checkout at `~/Desktop/sutando` (the same c
 
 **Without the hook** catchup still works — you just lose the last few minutes of the previous session's narrative when that session ended outside a compact. The rest (open PRs, in-flight tasks, sqlite, conversation.log, build_log) is real-time persisted and recovers regardless.
 
-## When to invoke automatically
+## Wiring for auto-invocation (operator-side, NOT in this PR)
 
-- **First action of a fresh proactive-loop session** — wire via `personal-proactive-loop` skill's on-activation block.
-- **After a `/pull-and-restart`** — services restarted, but the conversation buffer is the same; still helpful to refresh before the next loop pass.
-- **Before declaring the session "ready" after a context compaction** — the new compacted context should layer onto the catchup briefing, not replace it.
+The skill ships as the slash command only. **Auto-firing on every fresh session is the operator's choice** — this PR doesn't modify any loop or hook to call `/catchup-after-startup` for you. Wire it yourself wherever your proactive-loop / startup-orchestrator skill defines its on-activation block. Sample snippet for a personal proactive-loop SKILL.md:
+
+```markdown
+## Session-start catchup (FIRST action of a fresh session)
+
+If this is the first proactive-loop pass after a fresh session start
+(cold start, no prior context about what was happening), run
+`/catchup-after-startup` BEFORE anything else. Read the briefing into
+context, then proceed with the normal loop. Skip on subsequent passes
+within the same session.
+```
+
+Also useful to invoke manually after a `/pull-and-restart` (services restart but the conversation buffer is the same) or after a context compaction (layer the briefing onto the new compacted context).
+
+## Dependency note: sqlite section requires #1051's per-surface schema
+
+The voice/phone/discord activity section queries `voice` / `phone` / `discord_voice` tables — introduced in [sonichi/sutando#1051](https://github.com/sonichi/sutando/pull/1051). On a db that pre-dates #1051, the section prints "(sqlite query failed — db schema may pre-date #1051)" and the other 9 sections still work. If #1056 lands first, that section will be empty until #1051 merges; the rest of the briefing is unaffected.
 
 ## What it does NOT recover
 

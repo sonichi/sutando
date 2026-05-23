@@ -9,15 +9,43 @@
 #
 # Quiet on empty sections so output stays scannable.
 set -u
+set -o pipefail   # so `cmd | grep ... || say "(none)"` actually fires when cmd fails
 
-REPO="${SUTANDO_REPO_DIR:-/Users/xueqingliu/Documents/sutando/sutando}"
+# REPO: env wins, else probe common layouts for a sutando checkout
+# (CLAUDE.md + skills/ + .git signature, same heuristic session-handoff.sh
+# uses), else fall back to the convention path. Probing means a checkout
+# at $HOME/Desktop/sutando OR $HOME/Documents/sutando/sutando OR $(pwd)
+# all Just Work without per-user env. (Was a hardcoded /Users/xueqingliu/...
+# path pre-review; fixed per qingyun-wu + Mini's #1056 review.)
+if [ -n "${SUTANDO_REPO_DIR:-}" ]; then
+  REPO="$SUTANDO_REPO_DIR"
+else
+  REPO=""
+  for _cand in "$HOME/Desktop/sutando" "$HOME/Documents/sutando/sutando" "$HOME/Documents/sutando" "$HOME/sutando" "$(pwd)"; do
+    if [ -f "$_cand/CLAUDE.md" ] && [ -d "$_cand/skills" ] && [ -d "$_cand/.git" ]; then
+      REPO="$_cand"; break
+    fi
+  done
+  REPO="${REPO:-$HOME/Desktop/sutando}"   # falls through to the conventional path if probe finds nothing
+fi
 WS="${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}"
-HOURS="${CATCHUP_HOURS:-3}"
+# Hours window: positional arg wins (so /catchup-after-startup 12 works as
+# documented), env var second, default 3h. Pre-review the script only read
+# CATCHUP_HOURS — the documented `[hours]` arg was silently ignored (Mini #1).
+HOURS="${1:-${CATCHUP_HOURS:-3}}"
 
 print_section() { echo; echo "## $1"; echo; }
 say() { echo "$@"; }
 
 echo "# Catchup briefing — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# REPO sanity: misconfigured REPO would silently empty out half the
+# briefing (session-state.md / build_log.md / git log / health), which the
+# skill's empty-vs-failed contract should make visible. Loud one-liner.
+if [ ! -d "$REPO" ]; then
+  echo
+  echo "⚠ REPO not found at \`$REPO\` — REPO-rooted sections will be empty/unhelpful."
+  echo "   Set SUTANDO_REPO_DIR to your Sutando checkout to fix."
+fi
 echo
 echo "Reconstructed from disk (last ${HOURS}h window where applicable). Issue #1032 — recall half."
 
@@ -60,8 +88,11 @@ pq=""
 [ -f "$REPO/pending-questions.md" ] && pq="$REPO/pending-questions.md"
 [ -z "$pq" ] && [ -f "$WS/pending-questions.md" ] && pq="$WS/pending-questions.md"
 if [ -n "$pq" ]; then
-  # Split on '## ' headers, drop any section whose body contains a resolution
-  # marker (✅, 'RESOLVED', or 'DONE') so old-but-archived items don't dominate.
+  # Filter: skip sections whose body explicitly marks resolution. Pre-review
+  # this matched bare substrings 'DONE' and 'RESOLVED' anywhere in prose —
+  # which over-matched (e.g. "this is not done yet" → dropped, qingyun #4).
+  # Now require an anchored marker: header containing ✅/Resolved/Dismissed,
+  # or a leading ✅ at the start of any body line.
   python3 <<PYEOF
 import re
 text = open("$pq").read()
@@ -69,10 +100,15 @@ sections = re.split(r'(?m)^(?=## )', text)
 shown = 0
 for s in sections:
     if not s.strip().startswith('## '): continue
-    body = s
-    if '✅' in body or 'RESOLVED' in body or '## Resolved' in body or 'DONE' in body or '## Dismissed' in body:
+    lines = s.splitlines()
+    header = lines[0] if lines else ''
+    # Header-level resolution markers
+    if re.search(r'(✅|Resolved|Dismissed|DONE)', header):
         continue
-    print(body.rstrip())
+    # Body-level ✅ at line start = explicit resolution marker
+    if any(re.match(r'\s*✅', ln) for ln in lines[1:]):
+        continue
+    print(s.rstrip())
     print()
     shown += 1
     if shown >= 5: break
@@ -84,9 +120,16 @@ else
 fi
 
 # 6. Recent voice/phone/discord activity (sqlite, last N h)
+# Requires #1051's per-surface tables (voice/phone/discord_voice). On a db
+# that pre-dates #1051 the query returns "(sqlite query failed)" — that's
+# the expected signal that the operator's conversation-store is older.
 print_section "Recent voice/phone/discord activity (last $HOURS h)"
 if [ -f "$WS/data/conversation.sqlite" ]; then
-  sqlite3 -separator $'\t' "$WS/data/conversation.sqlite" "
+  # Mini #2: pre-fix the inline `cmd | awk || say` pattern silently emitted
+  # nothing on cmd failure because pipefail wasn't on; we set it now AND
+  # capture into a variable so an empty-result-but-success case is distinct
+  # from a failure case.
+  sql_rows=$(sqlite3 -separator $'\t' "$WS/data/conversation.sqlite" "
     SELECT datetime(ts_unix,'unixepoch','localtime') AS time,
            'voice' AS surface, kind, substr(text,1,80) AS text
     FROM voice WHERE ts_unix > strftime('%s','now')-${HOURS}*3600
@@ -97,17 +140,27 @@ if [ -f "$WS/data/conversation.sqlite" ]; then
     SELECT datetime(ts_unix,'unixepoch','localtime'), 'discord_voice', kind, substr(text,1,80)
     FROM discord_voice WHERE ts_unix > strftime('%s','now')-${HOURS}*3600
     ORDER BY 1 DESC LIMIT 20;
-  " 2>/dev/null | awk -F'\t' '{printf "  [%s] %-13s %-10s %s\n", $1, $2, $3, $4}' \
-    || say "(sqlite query failed)"
+  " 2>&1)
+  sql_rc=$?
+  if [ $sql_rc -ne 0 ]; then
+    say "(sqlite query failed — db schema may pre-date #1051: $sql_rows)"
+  elif [ -z "$sql_rows" ]; then
+    say "(none)"
+  else
+    echo "$sql_rows" | awk -F'\t' '{printf "  [%s] %-13s %-10s %s\n", $1, $2, $3, $4}'
+  fi
 else
   say "(no conversation.sqlite)"
 fi
 
 # 7. Recent conversation.log (channel-bearing chat lines, last N h)
+# With pipefail on, the whole pipeline exits non-zero if python fails;
+# capturing into a variable + checking $? after the assignment is the
+# cleanest way to distinguish empty-window from parse-failure under set -u
+# (PIPESTATUS array isn't reliably present in command-substitution subshells).
 print_section "Recent chat (logs/conversation.log, last $HOURS h)"
 if [ -f "$WS/logs/conversation.log" ]; then
-  # filter to entries within window (rough: keep last 200 lines, then python-filter)
-  tail -200 "$WS/logs/conversation.log" | python3 -c "
+  log_rows=$(tail -200 "$WS/logs/conversation.log" | python3 -c "
 import sys, datetime as dt
 cut = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=${HOURS})
 for line in sys.stdin:
@@ -117,18 +170,33 @@ for line in sys.stdin:
         t = dt.datetime.fromisoformat(parts[0].replace('Z','+00:00'))
     except: continue
     if t < cut: continue
-    print('  ' + line.rstrip())" 2>/dev/null | tail -40 \
-    || say "(parse failed)"
+    print('  ' + line.rstrip())" 2>&1 | tail -40) || log_rows="__FAIL__"
+  if [ "$log_rows" = "__FAIL__" ]; then
+    say "(parse failed)"
+  elif [ -z "$log_rows" ]; then
+    say "(none)"
+  else
+    echo "$log_rows"
+  fi
 else
   say "(no conversation.log)"
 fi
 
 # 8. Recent commits across branches
 print_section "Recent commits (this repo, last $HOURS h)"
-git -C "$REPO" log --all --since="${HOURS} hours ago" \
-  --pretty='  %h %ad  %s (%an, %D)' --date=format:'%m-%d %H:%M' 2>/dev/null \
-  | head -25 \
-  || say "(git not available)"
+if [ -d "$REPO/.git" ]; then
+  git_rows=$(git -C "$REPO" log --all --since="${HOURS} hours ago" \
+    --pretty='  %h %ad  %s (%an, %D)' --date=format:'%m-%d %H:%M' 2>&1 | head -25) || git_rows="__FAIL__"
+  if [ "$git_rows" = "__FAIL__" ]; then
+    say "(git failed)"
+  elif [ -z "$git_rows" ]; then
+    say "(none)"
+  else
+    echo "$git_rows"
+  fi
+else
+  say "(no .git at $REPO)"
+fi
 
 # 9. Build log — show the last 3 timestamped entries (## YYYY-MM-DDT…) regardless
 #    of file age, plus a note if the most-recent entry is older than 24h.
