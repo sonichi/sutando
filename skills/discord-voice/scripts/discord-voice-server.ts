@@ -33,7 +33,7 @@ import { config as _dotenvConfig } from 'dotenv';
 import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, existsSync, readFileSync, readdirSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { resolveWorkspace } from '../../../src/workspace_default.js';
-import { recordConversation, recordSession } from '../../../src/conversation-store.js';
+import { recordConversation, recordSession, recordToolCall } from '../../../src/conversation-store.js';
 import { resultBelongsTo } from '../../../src/result-channel-key.js';
 import { type Tier, loadAccessTiers, effectiveTier, toolAllowed, toolNeed } from './access-tier.js';
 
@@ -769,6 +769,7 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 				console.log(`${ts()} [Tool] result: ${toolName} (${e.status}, ${e.durationMs}ms)`);
 				s.toolCalls.push({ name: toolName, durationMs: e.durationMs, timestamp: new Date().toISOString() });
 				s.events.push({ event: `tool_result:${toolName}:${e.durationMs}ms`, timestamp: new Date().toISOString() });
+				recordToolCall('discord-voice', toolName, e.durationMs, s.sessionId);
 			},
 			onError: (e) => console.error(`${ts()} [Error] ${e.component}: ${e.error.message} (${e.severity})`),
 			onTurnLatency: (e) => {

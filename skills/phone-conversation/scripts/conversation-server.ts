@@ -83,7 +83,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '../../../src/inline-tools.js';
-import { recordSession, recordConversation } from '../../../src/conversation-store.js';
+import { recordSession, recordConversation, recordToolCall } from '../../../src/conversation-store.js';
 import { resultBelongsTo } from '../../../src/result-channel-key.js';
 // Lazy vision-session handle. Only loaded if a call ever needs it — keeps the
 // phone-agent boot path free of the vision-tools.ts side-effects on cold start.
@@ -783,6 +783,7 @@ async function createCallSession(params: {
 				console.log(`${ts()} [Tool] result: ${toolName} (${e.status}, ${e.durationMs}ms)`);
 				callSession.toolCalls.push({ name: toolName, durationMs: e.durationMs, timestamp: new Date().toISOString() });
 				callSession.events.push({ event: `tool_result:${toolName}:${e.durationMs}ms`, timestamp: new Date().toISOString() });
+				recordToolCall('phone', toolName, e.durationMs, callSession.sessionId);
 				// Log REC indicator status for recording tools
 				if (toolName === 'record_screen_with_narration' || toolName === 'screen_record' || toolName === 'open_file') {
 					const hasIndicator = existsSync('/tmp/sutando-rec-indicator.pid');
