@@ -11,6 +11,9 @@ Usage:
 Auto-refreshes every 15 seconds.
 """
 
+from __future__ import annotations
+
+
 import http.server
 import json
 import os
