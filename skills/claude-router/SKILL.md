@@ -27,6 +27,12 @@ ARGUMENTS: $ARGUMENTS
 
 If the request explicitly names `codex` or `gemini`, honor that directly.
 
+## When NOT to Use
+
+- **Interactive code review or task hand-off from this Claude Code session** → use the `/codex:*` plugin commands directly (`/codex:review`, `/codex:adversarial-review`, `/codex:rescue`, `/codex:status`). The router is for programmatic delegation from scripts, cron, and bridges — it goes through the `claude-codex` skill's bash wrapper, not the plugin.
+
+  If you don't see `/codex:*` slash-commands, install the plugin via the 4 commands documented in `skills/claude-codex/SKILL.md` ("When NOT to Use" section).
+
 ## Default Behavior
 
 - Default review-oriented prompts to Codex.

@@ -146,23 +146,49 @@ def find_metrics(call_sid: str) -> Optional[dict]:
     try:
         row = conn.execute(
             "SELECT ts_unix, source, session_id, call_sid, caller, is_owner, "
-            "is_meeting, duration_ms, transcript_lines, tool_count, pending_tasks, "
-            "tool_calls, events FROM sessions "
+            "is_meeting, duration_ms, transcript_lines, tool_count, pending_tasks "
+            "FROM sessions "
             "WHERE call_sid = ? OR session_id = ? ORDER BY ts_unix",
             (call_sid, call_sid),
         ).fetchone()
+        if not row:
+            return None
+        # Tool calls now live as surface-table rows with kind='tool_call'
+        # (per #1052 — the redundant sessions.tool_calls JSON column is gone).
+        # Rebuild the list from the matching surface table by session_id.
+        sid = row["session_id"]
+        tool_call_rows = conn.execute(
+            "SELECT ts_unix, text AS name, duration_ms FROM ("
+            "  SELECT ts_unix, text, duration_ms, session_id, kind FROM voice"
+            "  UNION ALL"
+            "  SELECT ts_unix, text, duration_ms, session_id, kind FROM phone"
+            "  UNION ALL"
+            "  SELECT ts_unix, text, duration_ms, session_id, kind FROM discord_voice"
+            ") WHERE session_id = ? AND kind = 'tool_call' ORDER BY ts_unix",
+            (sid,),
+        ).fetchall()
+        tool_calls = [
+            {
+                "name": r["name"],
+                "durationMs": r["duration_ms"],
+                "timestamp": _ts_iso(r["ts_unix"]),
+            }
+            for r in tool_call_rows
+        ]
+        # Lifecycle events now live in session_events (per #1052 — the
+        # redundant sessions.events JSON column is gone). Query by
+        # session_id OR call_sid since callers may pass either.
+        event_rows = conn.execute(
+            "SELECT ts_unix, event_name FROM session_events "
+            "WHERE session_id = ? OR call_sid = ? ORDER BY ts_unix",
+            (sid, row["call_sid"]),
+        ).fetchall()
+        events = [
+            {"event": r["event_name"], "timestamp": _ts_iso(r["ts_unix"])}
+            for r in event_rows
+        ]
     finally:
         conn.close()
-    if not row:
-        return None
-    try:
-        tool_calls = json.loads(row["tool_calls"]) if row["tool_calls"] else []
-    except (json.JSONDecodeError, TypeError):
-        tool_calls = []
-    try:
-        events = json.loads(row["events"]) if row["events"] else []
-    except (json.JSONDecodeError, TypeError):
-        events = []
     return {
         "timestamp": _ts_iso(row["ts_unix"]),
         "callSid": row["call_sid"] or row["session_id"],

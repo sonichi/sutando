@@ -762,13 +762,16 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 				console.log(`${ts()} [Tool] ${e.toolName} (${e.execution})`);
 				if (!s._toolIdMap) s._toolIdMap = new Map();
 				s._toolIdMap.set(e.toolCallId, e.toolName);
-				s.events.push({ event: `tool_call:${e.toolName}`, timestamp: new Date().toISOString() });
+				// tool_call event push removed per #1052 — canonical record is
+				// the discord_voice-table row written in onToolResult via
+				// recordToolCall().
 			},
 			onToolResult: (e) => {
 				const toolName = s._toolIdMap?.get(e.toolCallId) || 'unknown';
 				console.log(`${ts()} [Tool] result: ${toolName} (${e.status}, ${e.durationMs}ms)`);
 				s.toolCalls.push({ name: toolName, durationMs: e.durationMs, timestamp: new Date().toISOString() });
-				s.events.push({ event: `tool_result:${toolName}:${e.durationMs}ms`, timestamp: new Date().toISOString() });
+				// tool_result event push removed per #1052 — recordToolCall
+				// below is the canonical write.
 				recordToolCall('discord-voice', toolName, e.durationMs, s.sessionId);
 			},
 			onError: (e) => console.error(`${ts()} [Error] ${e.component}: ${e.error.message} (${e.severity})`),
@@ -819,14 +822,17 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 			if (item.content === lastText) continue;
 			if (item.role === 'user') {
 				s.transcript.push({ role: 'user', text: item.content });
-				s.events.push({ event: `user:${item.content}`, timestamp: new Date().toISOString() });
+				// utterance event push removed per #1052 — canonical record is
+				// the discord_voice-table row written by recordConversation
+				// below. session_events keeps only lifecycle entries to stop
+				// triple-encoding the same utterance.
 				// conversation.log is the primary; write it before the sqlite
 				// mirror so a row never exists in sqlite without a log line.
 				appendConversationLog('discord-user', item.content);
 				recordConversation('discord-user', item.content, s.sessionId);
 			} else if (item.role === 'assistant') {
 				s.transcript.push({ role: 'sutando', text: item.content });
-				s.events.push({ event: `sutando:${item.content}`, timestamp: new Date().toISOString() });
+				// utterance event push removed per #1052 — see comment above.
 				appendConversationLog('discord-agent', item.content);
 				recordConversation('discord-agent', item.content, s.sessionId);
 			}
