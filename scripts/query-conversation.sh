@@ -61,9 +61,15 @@ limit="${last:-200}"
 
 sqlite3 -separator $'\t' "$DB" "
 SELECT datetime(ts_unix, 'unixepoch', 'localtime') AS ts,
-       role,
+       kind AS role,
        substr(text, 1, 200) AS text_preview
-FROM conversation
+FROM (
+  SELECT ts_unix, kind, text, session_id FROM voice
+  UNION ALL
+  SELECT ts_unix, kind, text, session_id FROM phone
+  UNION ALL
+  SELECT ts_unix, kind, text, session_id FROM discord_voice
+)
 $where_clause
 ORDER BY ts_unix DESC
 LIMIT $limit;
