@@ -72,21 +72,30 @@ def bump_attempts(file_path: Path) -> int:
         # subscribes to `--event Created --event Renamed` for the
         # tasks/ dir, so a rename onto `tasks/<name>.txt` re-fires
         # the watcher's emit-loop → bumper runs again → another
-        # rename → another emit → infinite self-trigger loop.
+        # rename → another emit → infinite self-trigger loop. Lucy
+        # repro'd this on Studio: `attempts=1022` within 60 seconds.
         #
-        # In-place write via open(file_path, 'w') (truncate +
-        # write) only fires an Updated/Modified event, which the
-        # watcher is NOT subscribed to. The trade: we lose strict
-        # crash-atomicity (a crash MID-WRITE could leave a half-
-        # written file). Acceptable because:
+        # In-place write via open(file_path, "w") (truncate + write)
+        # only fires an Updated/Modified event, which the watcher
+        # is NOT subscribed to. The trade: we lose crash-atomicity.
+        # `open(w)` truncates first, so a crash mid-write leaves
+        # the file empty and the original content is GONE — this
+        # is a real (though tiny-window) data-loss risk for that
+        # one task, not a "delays re-processing" risk. Honest
+        # mitigations:
         #
         #   1. The bumper is small + fast — the write window is
-        #      microseconds.
-        #   2. Task-file parsers fail closed on malformed files
-        #      (no `task:` line → no claim). Half-written files
-        #      are skipped, not silently misprocessed.
-        #   3. Bridge restart re-runs the bumper before re-emit,
-        #      so a corrupted file gets one chance to be re-written.
+        #      microseconds for a ~200-byte task file.
+        #   2. Task-file parsers fail closed on malformed/empty
+        #      files (no `task:` line → no claim). The agent
+        #      skips silently rather than processing corrupted
+        #      half-data. The task is LOST, not mis-processed.
+        #
+        # The trade is worth it vs. the definite, frequent self-
+        # trigger loop — but the residual data-loss risk is real,
+        # not zero. A future watcher-side dedup (`.mjs` `seen` set
+        # already does this in the fork) would let us re-introduce
+        # atomic tmp+rename — separate PR.
         with open(file_path, "w", encoding="utf-8") as fh:
             fh.write(updated)
     except OSError as e:
