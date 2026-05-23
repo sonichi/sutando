@@ -49,8 +49,14 @@ TASKS_DIR_ABS="$(cd "$TASKS_DIR" && pwd -P)"
 
 # Initial sweep — surface any pre-existing tasks that arrived during a
 # restart gap.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 shopt -s nullglob
 for f in "$TASKS_DIR"/*.txt; do
+  # Restart-safety #4: bump the `attempts:` counter BEFORE emit.
+  # Initial-sweep emissions either reflect a fresh-on-disk task or a
+  # leftover from a prior crash; bumping conveys retry-count
+  # semantics to the agent (attempts > 1 → agent treats as retry).
+  python3 "$SCRIPT_DIR/task_bump_attempts.py" "$f" 2>/dev/null || true
   echo "TASK_FILE: $(basename "$f")"
 done
 shopt -u nullglob
@@ -85,6 +91,10 @@ fswatch \
     *.txt)
       parent="$(dirname "$path")"
       if [ "$parent" = "$TASKS_DIR_ABS" ] && [ -f "$path" ]; then
+        # Restart-safety #4: bump `attempts:` BEFORE emit. For
+        # fresh-file events this sets attempts=1; fswatch dedupe
+        # prevents same-session double-bumps from burst events.
+        python3 "$SCRIPT_DIR/task_bump_attempts.py" "$path" 2>/dev/null || true
         echo "TASK_FILE: $(basename "$path")"
       fi
       ;;
