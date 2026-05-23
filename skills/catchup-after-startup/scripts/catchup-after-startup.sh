@@ -22,7 +22,9 @@ if [ -n "${SUTANDO_REPO_DIR:-}" ]; then
 else
   REPO=""
   for _cand in "$HOME/Desktop/sutando" "$HOME/Documents/sutando/sutando" "$HOME/Documents/sutando" "$HOME/sutando" "$(pwd)"; do
-    if [ -f "$_cand/CLAUDE.md" ] && [ -d "$_cand/skills" ] && [ -d "$_cand/.git" ]; then
+    # -e not -d: in a submodule/worktree checkout `.git` is a file (gitdir
+    # pointer), not a directory, so -d would reject an otherwise-valid repo.
+    if [ -f "$_cand/CLAUDE.md" ] && [ -d "$_cand/skills" ] && [ -e "$_cand/.git" ]; then
       REPO="$_cand"; break
     fi
   done
@@ -253,15 +255,24 @@ fi
 
 # 8. Recent commits across branches
 print_section "Recent commits (this repo, last $HOURS h)"
-if [ -d "$REPO/.git" ]; then
-  git_rows=$(git -C "$REPO" log --all --since="${HOURS} hours ago" \
-    --pretty='  %h %ad  %s (%an, %D)' --date=format:'%m-%d %H:%M' 2>&1 | head -25) || git_rows="__FAIL__"
-  if [ "$git_rows" = "__FAIL__" ]; then
-    say "(git failed)"
-  elif [ -z "$git_rows" ]; then
-    say "(none)"
+# -e not -d: a submodule/worktree checkout has `.git` as a file, not a dir.
+if [ -e "$REPO/.git" ]; then
+  # Capture first, trim second. Piping `git log` straight into `head` lets
+  # head close the pipe after 25 lines, which can SIGPIPE git (exit 141) and,
+  # under `set -o pipefail`, trip a false "(git failed)" — a flaky race that
+  # bites whenever the window holds >25 commits. Capturing the full output in
+  # the `if` keeps git's real exit status as the only failure signal; the
+  # later head runs on a plain string and cannot affect it.
+  if git_rows=$(git -C "$REPO" log --all --since="${HOURS} hours ago" \
+      --pretty='  %h %ad  %s (%an, %D)' --date=format:'%m-%d %H:%M' 2>&1); then
+    git_rows=$(printf '%s\n' "$git_rows" | head -25)
+    if [ -z "$git_rows" ]; then
+      say "(none)"
+    else
+      echo "$git_rows"
+    fi
   else
-    echo "$git_rows"
+    say "(git failed)"
   fi
 else
   say "(no .git at $REPO)"
