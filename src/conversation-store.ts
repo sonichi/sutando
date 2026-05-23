@@ -152,8 +152,9 @@ function init(): void {
 			CREATE INDEX IF NOT EXISTS idx_discord_voice_session ON discord_voice(session_id, ts_unix);
 
 			-- Per-session rollup. Kept — different concern from the per-event log.
-			-- tool_calls/events JSON columns preserved for at-a-glance / cross-version
-			-- compat; the per-tool-call rows now live in the surface tables.
+			-- Per-tool-call rows live in surface tables (kind='tool_call'),
+			-- per-event rows live in session_events. The old tool_calls/events
+			-- JSON columns are dropped post-init via the migration below.
 			CREATE TABLE IF NOT EXISTS sessions (
 				ts_unix          REAL    NOT NULL,
 				source           TEXT    NOT NULL,
@@ -165,9 +166,7 @@ function init(): void {
 				duration_ms      INTEGER NOT NULL,
 				transcript_lines INTEGER,
 				tool_count       INTEGER,
-				pending_tasks    INTEGER,
-				tool_calls       TEXT,
-				events           TEXT
+				pending_tasks    INTEGER
 			);
 			CREATE INDEX IF NOT EXISTS idx_sessions_ts ON sessions(ts_unix);
 			CREATE INDEX IF NOT EXISTS idx_sessions_source_ts ON sessions(source, ts_unix);
@@ -191,6 +190,33 @@ function init(): void {
 		// `tool_calls` tables into the new per-surface tables, then drop the
 		// legacy tables. Idempotent — gated on each surface table being empty.
 		migrateLegacyIfNeeded(db);
+
+		// Drop the redundant sessions.tool_calls / sessions.events JSON
+		// columns if a pre-#1052 db still has them. The atom rows now live
+		// in surface tables (kind='tool_call') and session_events
+		// respectively; the JSON cols were triple-encoding the same data.
+		// SQLite 3.35+ supports ALTER TABLE DROP COLUMN — guard via
+		// pragma_table_info so re-running this is a no-op.
+		const sessionCols = new Set(
+			(db.prepare("PRAGMA table_info(sessions)").all() as Array<{ name: string }>)
+				.map(c => c.name),
+		);
+		if (sessionCols.has('tool_calls')) {
+			try {
+				db.exec('ALTER TABLE sessions DROP COLUMN tool_calls');
+				console.log('[conversation-store] dropped sessions.tool_calls (redundant w/ surface tables)');
+			} catch (e) {
+				console.error('[conversation-store] could not drop sessions.tool_calls:', e);
+			}
+		}
+		if (sessionCols.has('events')) {
+			try {
+				db.exec('ALTER TABLE sessions DROP COLUMN events');
+				console.log('[conversation-store] dropped sessions.events (redundant w/ session_events)');
+			} catch (e) {
+				console.error('[conversation-store] could not drop sessions.events:', e);
+			}
+		}
 
 		// Convenience views — thin wrappers that add a human-readable `time`
 		// column (local-time) and default-sort by ts_unix DESC. DROP+CREATE so
@@ -246,8 +272,8 @@ function init(): void {
 		sessionInsertStmt = db.prepare(`
 			INSERT INTO sessions (
 				ts_unix, source, session_id, call_sid, caller, is_owner, is_meeting,
-				duration_ms, transcript_lines, tool_count, pending_tasks, tool_calls, events
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				duration_ms, transcript_lines, tool_count, pending_tasks
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`);
 		eventInsertStmt = db.prepare(`
 			INSERT INTO session_events (ts_unix, source, session_id, call_sid, event_name)
@@ -459,8 +485,14 @@ export interface SessionMetrics {
 	transcriptLines?: number | null;
 	toolCount?: number | null;
 	pendingTasks?: number | null;
-	toolCalls?: unknown;     // JSON-serializable array
-	events?: unknown;        // JSON-serializable array
+	/** No longer persisted (per #1052). Surface table rows with
+	 *  kind='tool_call' are canonical; this field is accepted only for
+	 *  backwards-compat with existing callers and silently ignored. */
+	toolCalls?: unknown;
+	/** Iterated for the session_events fan-out (lifecycle events). User /
+	 *  agent / tool_call / tool_result entries are filtered out — those
+	 *  atoms live in surface tables now (per #1052). */
+	events?: unknown;
 }
 
 /** Parse a value that should be a timestamp into unix seconds, or null. */
@@ -473,10 +505,21 @@ function tsToUnix(t: unknown): number | null {
 	return null;
 }
 
+// Event names whose substance already lives in a surface table row
+// (kind='user'/'agent'/'tool_call'). Filtered out of the session_events
+// fan-out so the same atom isn't recorded twice. Defense-in-depth: the
+// 3 surface servers also stopped pushing these into their in-memory
+// events array as of #1052; this filter catches anything missed +
+// protects against external callers passing them in m.events.
+const DUPLICATE_EVENT_PREFIXES = ['user:', 'caller:', 'sutando:', 'assistant:', 'tool_call:', 'tool_result:'];
+
 /**
- * Record per-session rollup. Also fans out toolCalls into the matching
- * surface table (kind='tool_call') and events into the unified
- * session_events table. Best-effort.
+ * Record per-session rollup. Also fans out lifecycle events (session_started,
+ * session_ended, error, task_*, etc.) into the unified session_events table.
+ * Tool calls are NOT fanned out here — each surface server writes them in
+ * real time via recordToolCall() inside its onToolResult hook. Utterance
+ * events with user:/sutando: prefixes are filtered out — they duplicate
+ * surface-table user/agent rows. Best-effort.
  */
 export function recordSession(m: SessionMetrics): void {
 	init();
@@ -495,26 +538,24 @@ export function recordSession(m: SessionMetrics): void {
 			m.transcriptLines ?? null,
 			m.toolCount ?? null,
 			m.pendingTasks ?? null,
-			m.toolCalls === undefined ? null : JSON.stringify(m.toolCalls),
-			m.events === undefined ? null : JSON.stringify(m.events),
 		);
 	} catch (e) {
 		console.error('[conversation-store] session insert failed:', e);
 	}
-	// Tool-call rows are NO LONGER fanned out here — each surface server
-	// writes them in real-time via recordToolCall() inside its onToolResult
-	// hook. Doing both would dup-insert. The `sessions.tool_calls` JSON column
-	// still persists the full per-session rollup for the sessions-table view.
-	// Fan out events into the unified event log (unchanged).
+	// Fan out LIFECYCLE events into session_events. Skip duplicates of
+	// surface-table rows (user/sutando/tool_call/tool_result) — those
+	// atoms are canonical in voice/phone/discord_voice tables now.
 	if (eventInsertStmt && Array.isArray(m.events)) {
 		for (const ev of m.events as Array<Record<string, unknown>>) {
+			const name = String(ev.event ?? 'unknown');
+			if (DUPLICATE_EVENT_PREFIXES.some(p => name.startsWith(p))) continue;
 			try {
 				eventInsertStmt.run(
 					tsToUnix(ev.timestamp) ?? nowUnix,
 					m.source,
 					m.sessionId ?? null,
 					m.callSid ?? null,
-					String(ev.event ?? 'unknown'),
+					name,
 				);
 			} catch (e) {
 				console.error('[conversation-store] session_events insert failed:', e);
