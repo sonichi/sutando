@@ -23,9 +23,14 @@
 #
 # What does NOT sync (per-node, excluded via rsync --exclude):
 #   - state/, tasks/, results/, logs/
+#   - data/  (entire dir is per-node — conversation.sqlite cannot be safely
+#     rsynced while writers are live (#1040); voice-metrics.jsonl +
+#     call-metrics.jsonl are frozen archives with no new writes since #603;
+#     latency.json / scanned-calls.json are per-node metrics that don't
+#     need consolidation. Nothing remaining in data/ benefits from
+#     cross-node sync.)
 #   - .env, .env.* (different secrets per node)
 #   - core-status.json, build_log.md, contextual-chips.json
-#   - data/voice-metrics.jsonl, data/call-metrics.jsonl (frozen archives — writers removed in #603; new session rollups live in data/conversation.sqlite)
 #   - src/.discord-pending-replies.json, src/Sutando/SutandoApp
 #   - ~/.claude/projects/ (other projects' session transcripts)
 #   - ~/.claude/skills/ (installed per-node)
@@ -72,14 +77,14 @@ PEER="${SUTANDO_SYNC_PEER:-}"
 # /Users/xliu/Documents/xqq/.../sutando-agent-sonichi-test2/sutando).
 # Override with SUTANDO_MEM_LOCAL_DIR if the convention changes.
 MEM_LOCAL="${SUTANDO_MEM_LOCAL_DIR:-$HOME/.claude/projects/$(echo "$REPO_ROOT" | tr '/' '-')/memory/}"
-# Notes + data live under $SUTANDO_WORKSPACE per the workspace contract (CLAUDE.md
+# Notes live under $SUTANDO_WORKSPACE per the workspace contract (CLAUDE.md
 # "Workspace contract"); fall back to $REPO_ROOT for pre-contract installs.
+# (data/ is intentionally NOT defined here — the whole data/ dir is per-node;
+# see header "What does NOT sync" for why.)
 if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
 	NOTES_LOCAL="$SUTANDO_WORKSPACE/notes/"
-	DATA_LOCAL="$SUTANDO_WORKSPACE/data/"
 else
 	NOTES_LOCAL="$REPO_ROOT/notes/"
-	DATA_LOCAL="$REPO_ROOT/data/"
 fi
 ASSETS_LOCAL="$REPO_ROOT/assets/"
 
@@ -87,18 +92,10 @@ ASSETS_LOCAL="$REPO_ROOT/assets/"
 # need to set SUTANDO_SYNC_PEER (per owner's 2026-04-17 simplification: "only
 # sync peer is necessary, just use the same directory for both machines").
 # If your peer's sutando repo or memory dir lives at a different path, override
-# via SUTANDO_PEER_MEM_DIR / SUTANDO_PEER_NOTES_DIR / SUTANDO_PEER_DATA_DIR —
-# otherwise leave unset.
+# via SUTANDO_PEER_MEM_DIR / SUTANDO_PEER_NOTES_DIR — otherwise leave unset.
 MEM_PEER="${SUTANDO_PEER_MEM_DIR:-$MEM_LOCAL}"
 NOTES_PEER="${SUTANDO_PEER_NOTES_DIR:-$NOTES_LOCAL}"
 ASSETS_PEER="${SUTANDO_PEER_ASSETS_DIR:-$ASSETS_LOCAL}"
-# Data dir peer path: derive from NOTES_PEER (repo/notes/ → repo/data/) if no
-# explicit override. Covers subtitle-metrics.jsonl, latency.json,
-# scanned-calls.json, conversation.sqlite (slice-1 mirror; merge handled by
-# direct rsync since sqlite is single-writer-per-node), the frozen
-# voice-metrics.jsonl + call-metrics.jsonl archives, etc. Owner's 2026-04-17
-# direction: "data/* is shared".
-DATA_PEER="${SUTANDO_PEER_DATA_DIR:-${NOTES_PEER%/notes/}/data/}"
 
 # Common rsync flags:
 #   -a         archive (preserves modtime/perms — critical for conflict semantics)
@@ -224,74 +221,15 @@ say "Syncing assets/ ..."
 run rsync "${RSYNC_FLAGS[@]}" ${DRYFLAG[@]+"${DRYFLAG[@]}"} "$ASSETS_LOCAL" "$PEER:$ASSETS_PEER"
 run rsync "${RSYNC_FLAGS[@]}" ${DRYFLAG[@]+"${DRYFLAG[@]}"} "$PEER:$ASSETS_PEER" "$ASSETS_LOCAL"
 
-# 4) Data dir sync — covers all data/* files (subtitle-metrics.jsonl,
-# latency.json, scanned-calls.json, latency-tracker.py, the frozen
-# voice/call-metrics.jsonl archives, etc.). Each jsonl file needs union
-# merge (mtime-wins would drop entries written between syncs on the
-# other node); non-jsonl files fall back to rsync --update.
-#
-# As of #603, voice-agent.ts + phone conversation-server.ts no longer
-# append to voice-metrics.jsonl / call-metrics.jsonl — new session
-# rollups go to data/conversation.sqlite. The jsonl files remain on disk
-# as frozen historical archives, so the merge loop still keeps them in
-# sync across nodes (just with no new entries arriving).
-#
-# IMPORTANT — conversation.sqlite is NEVER rsynced. The live SQLite
-# database, its .sqlite-wal and .sqlite-shm sidecars are all excluded
-# from every rsync call below. Rsyncing a live SQLite db is a known
-# corruption cause: rsync can copy the .sqlite mid-write; .sqlite and
-# .sqlite-wal can land in an inconsistent state; --update (mtime-wins)
-# can overwrite a local .sqlite while the local .wal still holds
-# uncommitted pages → "2nd reference to page" / "rowid out of order"
-# B-tree damage that requires `sqlite3 .recover` to salvage. The
-# mtime-wins flow was also never a real merge of two sqlite dbs — just
-# a clobber. If cross-node consolidation of conversation.sqlite becomes
-# necessary, the right shape is `.backup`-snapshot-based sync (consistent
-# copy of a live db) plus row-level reconciliation — not naive rsync.
-#
-# Strategy:
-#   1. rsync whole peer data/ dir into a staging subdir `.peer-staging/`
-#   2. for each .jsonl in staging, run the generic jsonl merger against
-#      the same-named local file (dedup on sessionId+timestamp).
-#   3. rsync non-.jsonl files from staging to local with --update.
-#   4. rsync local data/ back to peer (non-merge files).
-#   5. push locally-merged .jsonl files back to peer explicitly.
-#   6. clean up .peer-staging/.
-say ""
-say "Syncing data/ ..."
-if [ "$DRY_RUN" = "0" ]; then
-    mkdir -p "$DATA_LOCAL"
-    STAGING="$DATA_LOCAL.peer-staging/"
-    rm -rf "$STAGING"
-    mkdir -p "$STAGING"
-    # Pull peer data/ into staging (tolerant of missing peer dir).
-    # `conversation.sqlite*` is excluded on ALL three rsync calls in this
-    # section — see the comment above for why (rsyncing a live SQLite db
-    # corrupts it; the glob covers .sqlite, .sqlite-wal, .sqlite-shm).
-    run rsync -az --exclude 'radar-topics.example.json' --exclude '.peer-staging' \
-        --exclude 'conversation.sqlite*' \
-        "$PEER:$DATA_PEER" "$STAGING"
-    # Merge each staging .jsonl into local; non-jsonl files copied via --update
-    for pf in "$STAGING"*.jsonl; do
-        [ -f "$pf" ] || continue
-        fn="$(basename "$pf")"
-        bash "$REPO_ROOT/skills/cross-node-sync/scripts/merge-voice-metrics.sh" \
-            "$DATA_LOCAL$fn" "$pf" || true
-    done
-    # Copy non-jsonl staging files into local with --update (mtime-wins).
-    # conversation.sqlite* is excluded — see comment above.
-    run rsync -az --update --exclude '*.jsonl' --exclude 'conversation.sqlite*' "$STAGING" "$DATA_LOCAL"
-    rm -rf "$STAGING"
-    # Push merged local data/ back to peer (no --delete so peer-only files
-    # survive). conversation.sqlite* is excluded — see comment above.
-    run rsync -az --update --exclude 'radar-topics.example.json' --exclude '.peer-staging' \
-        --exclude 'conversation.sqlite*' \
-        "$DATA_LOCAL" "$PEER:$DATA_PEER"
-else
-    say "[DRY] would pull $PEER:$DATA_PEER into .peer-staging/, merge each .jsonl, rsync non-jsonl, push back"
-fi
-
-say ""
+# NOTE — `data/` is intentionally NOT synced (see header "What does NOT
+# sync" for the rationale). conversation.sqlite cannot be safely rsynced
+# while writers are live (#1040: `integrity_check` damage signature
+# "2nd reference to page" / "rowid out of order"); the rest of data/ is
+# either frozen jsonl archives (#603 dropped the writers) or per-node
+# metrics. If cross-node consolidation of conversation.sqlite ever
+# becomes necessary, the right shape is `sqlite3 .backup`-snapshot
+# based sync (SQLite-safe consistent copy of a live db) plus row-level
+# reconciliation — not naive rsync.
 
 # Rebuild MEMORY.md from per-file YAML frontmatter. We exclude MEMORY.md from
 # the rsync pass (mtime-wins truncates the index — see comment near MEM rsync
