@@ -2013,7 +2013,6 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 
 
-@client.event
 def _recover_orphan_sending_files() -> int:
     """Restart-safety: rename any orphan `results/proactive-*.sending`
     files back to `*.txt` so they get re-claimed on the next poll.
