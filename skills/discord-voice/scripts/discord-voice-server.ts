@@ -463,13 +463,21 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 			},
 		});
 		// Skill-local share_screen — full sub-2s path. The voice-server
-		// directly spawns share-screen-modal.py (--full mode) which does ALL
+		// spawns share-screen-modal.py (--full mode) which does ALL
 		// 5 CGEvent clicks (Discord Share button + Entire Screen tab +
 		// thumbnail + Share button) in ~0.7s. No MCP, no task-bridge, no
 		// proactive-loop hop. Coords hard-coded in the python script —
 		// re-derive via macos-use refresh_traversal on the MCP-Chrome main
 		// PID if Discord/Chrome UI moves.
-		const SHARE_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'share-screen-modal.py');
+		//
+		// The script lives in the standalone `discord-voice-share-screen`
+		// skill (sonichi/sutando-skills repo), installed into
+		// `~/.claude/skills/discord-voice-share-screen/` via the sutando-skills
+		// install.sh. If the skill isn't installed, the spawn fails silently
+		// (stdio:ignore + child.on('error')) — share-screen is optional and
+		// requires extra setup (alt Chrome, accessibility permission); the
+		// rest of discord-voice works unaffected.
+		const SHARE_SCRIPT = join(process.env.HOME ?? '', '.claude/skills/discord-voice-share-screen/scripts/share-screen-modal.py');
 		const spawnShareScreen = (source: string, mode: 'full' | 'stop') => {
 			const flag = mode === 'stop' ? '--stop' : '--full';
 			const child = spawn('python3', [SHARE_SCRIPT, flag], { stdio: 'ignore', detached: true });
