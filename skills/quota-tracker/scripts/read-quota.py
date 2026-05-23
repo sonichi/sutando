@@ -18,7 +18,12 @@ from pathlib import Path
 # leftover quota-state.json under skills/quota-tracker/ silently shadowed the
 # fresh file and froze the dashboard for ~12h (2026-05-21). One path, one
 # source of truth — if it's missing, say so rather than read a stale copy.
-_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+# NOTE: `.resolve()` follows the ~/.claude/skills symlink into the repo, so the
+# path is <repo>/skills/quota-tracker/scripts/read-quota.py — four levels deep.
+# Three .parent landed on <repo>/skills (no src/ there), so the workspace_default
+# import silently failed (→ except below → "not found") and quota read as missing
+# regardless of where the proxy wrote. Walk up four to reach <repo>/src.
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 try:
     from workspace_default import status_read_path  # noqa: E402
