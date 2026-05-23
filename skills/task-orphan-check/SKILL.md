@@ -35,22 +35,29 @@ If no live tasks, emit "orphan-check: no live tasks, nothing to recover" and idl
 
 ### Step 2 — Classify each task
 
-For each `tasks/task-<id>.txt`:
+For each file in `tasks/`, let `<id>` be the value of the `id:` header line (e.g. `task-1779570142563`). The file is `tasks/<id>.txt`. Per-task paths below use `<id>` consistently — note `<id>` already includes the `task-` prefix; do NOT add it again.
 
 1. **Parse the header** — extract `id`, `timestamp`, `source`, `channel_id` (if Discord), `user_id`.
 
 2. **Cross-reference completion markers** (any single match = task already completed):
-   - **`<workspace>/results/task-<id>.txt`** exists → DONE (the result file is the canonical completion marker; if it exists the task was processed)
-   - **`<workspace>/results/archive/task-<id>.txt`** exists → DONE (post-archive case)
-   - **`<workspace>/results/proactive-<task-id>.txt`** OR `.sending` variant exists → DELIVERY IN PROGRESS / DONE (PR #1048's idempotency sentinel)
+   - **`<workspace>/results/<id>.txt`** exists → **DONE**. The result file is the canonical completion marker; if it exists the task was processed.
+   - **`<workspace>/results/archive/<id>.txt`** exists → **DONE** (post-archive case).
+   - **`<workspace>/results/proactive-<id>.txt`** OR `.sending` variant exists → see step 2b below for the in-progress-vs-done split.
 
-3. **Compute age**:
-   - `task_age_s = now - mtime(tasks/<id>.txt)`
-   - If <300s (5 min) → FRESH (genuinely just arrived; watcher will pick it up normally)
-   - Else → ORPHAN (no completion marker AND old enough to be from a previous session)
+   **Step 2b — `.sending` contract clarification** (per qingyun-sutando review of #1074):
+   - `results/<id>.txt` (no suffix) → task completed AND result body written. **DONE.**
+   - `results/<id>.txt.sending` → the discord-bridge picked the result up and is mid-delivery (per #1046/#1048's lifecycle). Treat as **DONE** for orphan-check purposes — the bridge already owns post-crash recovery for these via its own startup `.sending` sweep, so we don't second-guess. Read-only either way.
+   - `results/proactive-<id>.txt[.sending]` → same pattern for proactive DMs.
+
+3. **Compute age** — use the IMMUTABLE arrival time, NOT file mtime (mtime gets reset by rsync, `git checkout`, `touch`, or workspace sync, which would make a genuinely old orphan look FRESH and re-fire its side effect — exactly the bug this skill exists to prevent):
+   - Preferred: parse the header `timestamp:` ISO field → `task_age_s = now - parse(timestamp)`.
+   - Fallback: extract epoch-ms from the id (id format is `task-<epoch-ms>`) → `task_age_s = now - (epoch_ms/1000)`.
+   - Last resort only if both unparseable: `task_age_s = now - mtime(tasks/<id>.txt)`.
+   - If <300s (5 min) → FRESH (genuinely just arrived; watcher will pick it up normally).
+   - Else → ORPHAN (no completion marker AND old enough to be from a previous session).
 
 4. **Classify outcome**:
-   - **DONE** → archive the task file: `mv tasks/task-<id>.txt tasks/archive/task-<id>.txt`. Log: `done: completion marker found at <path>`.
+   - **DONE** → archive the task file: `mv tasks/<id>.txt tasks/archive/<id>.txt`. Log: `done: completion marker found at <path>`.
    - **FRESH** → leave alone. Log: `fresh: arrived <N>s ago, watcher will handle`.
    - **ORPHAN** → write a recovery result: see step 3.
 
@@ -59,17 +66,17 @@ For each `tasks/task-<id>.txt`:
 For each ORPHAN task, write a sentinel result so the bridge delivers a "needs review" note to the original sender, then archive the task file:
 
 ```
-<workspace>/results/task-<id>.txt:
+<workspace>/results/<id>.txt:
 
 Orphan recovery: this task arrived <N>m ago and was not completed before the previous session ended.
 
-Original task body preserved below — review before re-queuing if it has non-idempotent side effects (DM sent, file written, API call). To re-queue: move from tasks/archive/task-<id>.txt back to tasks/task-<id>.txt.
+Original task body preserved below — review before re-queuing if it has non-idempotent side effects (DM sent, file written, API call). To re-queue: move from tasks/archive/<id>.txt back to tasks/<id>.txt.
 
 ---
 <original task body verbatim>
 ```
 
-Then `mv tasks/task-<id>.txt tasks/archive/task-<id>.txt`. The bridge reads the result + delivers the recovery note + archives. Log: `recovered: stuck for <N>m, sentinel result written`.
+Then `mv tasks/<id>.txt tasks/archive/<id>.txt`. The bridge reads the result + delivers the recovery note + archives. Log: `recovered: stuck for <N>m, sentinel result written`.
 
 ### Step 4 — Sanity check archive directory
 
@@ -95,9 +102,24 @@ The summary lands in the conversation buffer so the agent's first turn (and oper
 - `crons.json` or any scheduler state.
 - Memory dir or `MEMORY.md`.
 
+## Known residual risk: the <5min sub-window for non-Discord surfaces
+
+A task that arrived <5 minutes before a crash, executed its side effect, then died before writing its result file has NO completion marker AND looks FRESH (age < 5min) → orphan-check leaves it for the watcher → side effect re-fires. Unavoidable without per-side-effect markers, and the `.sending` markers only close it for Discord.
+
+**Currently covered:** Discord DM delivery (PR #1048's `.sending`), file presence in `results/`.
+
+**Residual hole, in priority order:**
+- Voice agent side effects (no marker file yet).
+- Phone-call agent side effects (same).
+- Telegram delivery (Telegram bridge doesn't yet ship a `.sending` analog of #1048).
+- Generic API calls / shell mutations without their own marker file.
+
+Conservative default for the hole: any orphan without a CLEAR completion marker gets the recovery-sentinel treatment, which surfaces to the operator rather than silently re-firing. As other bridges/tools grow their own per-side-effect markers, orphan-check should learn to read them at step 2 — the marker list is intentionally a code-level data table, not buried in prose.
+
 ## What it MIGHT need in the future
 
-- **More side-effect markers**: PR #1048 ships Discord-delivery idempotency markers. As other tools/bridges get similar markers (Telegram delivery, file-write logs, API-call IDs), orphan-check should learn to read them at step 2. Listed under "What it does not cover" in step 2 above is a known gap — currently we cover Discord + result-file presence; voice / phone / Telegram side effects are harder to detect cleanly. Conservative path: any orphan without a CLEAR completion marker gets the recovery-sentinel treatment, which surfaces to the operator rather than silently re-firing.
+- **More side-effect markers** (see "Known residual risk" above): voice/phone/Telegram especially.
+- **Promote to a deterministic script** (`scripts/orphan-check.py` mirror) once the marker set + age rules are stable enough that unit tests buy more than they cost. The current SKILL-only ship trades testability for being one less code-path to maintain; flip if/when the rules grow past "marker-or-not + age-vs-5min".
 
 ## Failure modes
 
@@ -131,3 +153,4 @@ If the workload grows or we want deterministic testing, a `scripts/orphan-check.
 ## Iteration log
 
 - v0.1.0 — 2026-05-23 — initial draft. Per Chi 2026-05-23 Discord exchange about #1049 redesign ("simply ask the agent to check when starting"). Designed to be invoked from `/startup` step 2 (PR #1072). Standalone-callable for manual recovery. Replaces the attempts-counter approach (#1049 + #1066's followup) with a startup-time classification using existing side-effect markers (#1048's `.sending` files + result-file presence). No bumper, no in-band writes, no self-trigger loop.
+- v0.1.1 — 2026-05-23 — qingyun-sutando review pass. **(1)** Fixed `<id>` ambiguity — `<id>` is the value of the `id:` header (already includes `task-` prefix); paths are `results/<id>.txt` NOT `results/task-<id>.txt` (the prior wording double-prefixed and would have misclassified every completed-but-unarchived task as ORPHAN → spurious recovery notes). **(2)** Age now derives from immutable header `timestamp:` / `task-<epoch-ms>` id, NOT file mtime (mtime resets on rsync / `git checkout` / `touch` / workspace sync, making old orphans look FRESH → re-fire). **(3)** Clarified `.sending` contract via new step 2b: `<id>.txt` (no suffix) = DONE, `<id>.txt.sending` = bridge mid-delivery (treat as DONE; bridge owns its own crash recovery via #1046/#1048's startup sweep). **(4)** Named the <5min residual hole explicitly under its own section, with prioritized coverage list (voice / phone / Telegram + generic API). **(5)** Noted "promote to scripts/orphan-check.py" trigger.
