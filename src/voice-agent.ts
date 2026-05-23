@@ -951,7 +951,10 @@ async function main() {
 			},
 			onToolCall: (e) => {
 				voiceToolIdMap.set(e.toolCallId, e.toolName);
-				voiceEvents.push({ event: `tool_call:${e.toolName}`, timestamp: new Date().toISOString() });
+				// tool_call event push removed per #1052 — canonical record
+				// is the surface-table row written in onToolResult via
+				// recordToolCall(). Pushing here would duplicate in
+				// session_events.
 				console.log(`${ts()} [Tool] ${e.toolName} (${e.execution})`);
 				// Flag the web-client that a tool is in flight so the avatar
 				// can show the blue `.working` pulse and the menu bar can
@@ -971,7 +974,10 @@ async function main() {
 			onToolResult: (e) => {
 				const toolName = voiceToolIdMap.get(e.toolCallId) || 'unknown';
 				voiceToolCalls.push({ name: toolName, durationMs: e.durationMs, timestamp: new Date().toISOString() });
-				voiceEvents.push({ event: `tool_result:${toolName}:${e.durationMs}ms`, timestamp: new Date().toISOString() });
+				// tool_result event push removed per #1052 — recordToolCall
+				// below is the canonical write (surface table, kind='tool_call',
+				// duration_ms column). Pushing here would duplicate in
+				// session_events.
 				recordToolCall('voice', toolName, e.durationMs, SESSION_ID);
 				console.log(`${ts()} [Tool] result: ${toolName} (${e.status}, ${e.durationMs}ms)`);
 				// Clear the tool track; browser track takes over immediately.
@@ -1226,10 +1232,10 @@ async function main() {
 				console.log(`${ts()}   [${item.role}] ${item.content}`);
 				logConversation(item.role, item.content, SESSION_ID);
 				const evtRole = item.role === 'user' ? 'user' : 'sutando';
-				// 7s offset for user speech: Gemini STT commits transcript ~7s after
-				// the user actually spoke (measured via iPad recording comparison).
-				const evtTs = item.role === 'user' ? new Date(Date.now() - 7000).toISOString() : new Date().toISOString();
-				voiceEvents.push({ event: `${evtRole}:${item.content || ''}`, timestamp: evtTs });
+				// utterance event push removed per #1052 — canonical record is
+				// the voice-table row written by logConversation() above
+				// (kind='user'/'agent', ts_unix). session_events keeps only
+				// lifecycle entries to stop triple-encoding the same atom.
 				voiceTranscript.push({ role: evtRole, text: item.content || '' });
 				const label = item.role === 'user' ? 'User' : 'Sutando';
 				try { appendFileSync(liveTranscriptPath, `[${new Date().toLocaleTimeString('en-US', {hour12:false})}] ${label}: ${item.content}\n`); } catch {}
