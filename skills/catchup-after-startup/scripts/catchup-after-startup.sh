@@ -259,10 +259,9 @@ print_section "Recent commits (this repo, last $HOURS h)"
 if [ -e "$REPO/.git" ]; then
   # Capture first, trim second. Piping `git log` straight into `head` lets
   # head close the pipe after 25 lines, which can SIGPIPE git (exit 141) and,
-  # under `set -o pipefail`, trip a false "(git failed)" — a flaky race that
-  # bites whenever the window holds >25 commits. Capturing the full output in
-  # the `if` keeps git's real exit status as the only failure signal; the
-  # later head runs on a plain string and cannot affect it.
+  # under set -o pipefail, trip a false "(git failed)". Capturing in the `if`
+  # keeps git's real exit status as the only failure signal; head runs on a
+  # plain string and cannot affect it.
   if git_rows=$(git -C "$REPO" log --all --since="${HOURS} hours ago" \
       --pretty='  %h %ad  %s (%an, %D)' --date=format:'%m-%d %H:%M' 2>&1); then
     git_rows=$(printf '%s\n' "$git_rows" | head -25)
