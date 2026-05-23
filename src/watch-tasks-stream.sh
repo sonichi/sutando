@@ -93,15 +93,24 @@ fswatch \
   case "$path" in
     *.txt)
       bn="$(basename "$path")"
-      # Dedup: task_bump_attempts.py uses atomic rename (tmp→file) which
-      # re-triggers fswatch's Renamed filter, causing an infinite loop.
-      # Suppress re-emission of the same basename within a 3s cooldown.
+      # Dedup cooldown (kept as belt-and-suspenders for any burst/repeat
+      # fires, e.g. FSEvents coalescing the Created flag on a path).
       if [ "$bn" = "$LAST_EMIT_BN" ] && [ $(( SECONDS - LAST_EMIT_SEC )) -lt 3 ]; then
         continue
       fi
       parent="$(dirname "$path")"
       if [ "$parent" = "$TASKS_DIR_ABS" ] && [ -f "$path" ]; then
-        python3 "$SCRIPT_DIR/task_bump_attempts.py" "$path" 2>/dev/null || true
+        # Do NOT bump attempts here. Writing the task file in response to an
+        # event re-triggers this very loop: #1066 made the bump an in-place
+        # write (no more Renamed), but on macOS FSEvents coalesces flags per
+        # path, so a recently-Created file re-reports Created on ANY later
+        # change — including our in-place bump — re-matching `--event Created`.
+        # With the bump still here, an unprocessed task re-fires once per
+        # cooldown window (the residual "drip" the 3s cooldown only throttles).
+        # Removing the event-loop write removes the self-trigger SOURCE
+        # entirely → zero re-emit, no drip. The attempts counter is still set
+        # on the initial sweep above (crash-recovery retry semantics); live
+        # arrivals are fresh by definition, so they don't need it.
         echo "TASK_FILE: $bn"
         LAST_EMIT_BN="$bn"
         LAST_EMIT_SEC=$SECONDS
