@@ -202,6 +202,7 @@ function init(): void {
 			DROP VIEW IF EXISTS v_phone;
 			DROP VIEW IF EXISTS v_discord_voice;
 			DROP VIEW IF EXISTS v_sessions;
+			DROP VIEW IF EXISTS conversation;
 			CREATE VIEW v_voice AS
 				SELECT id, datetime(ts_unix,'unixepoch','localtime') AS time,
 					ts_unix, kind, text, duration_ms, session_id
@@ -219,6 +220,18 @@ function init(): void {
 					ts_unix, source, session_id, call_sid, caller, is_owner, is_meeting,
 					duration_ms, transcript_lines, tool_count, pending_tasks
 				FROM sessions ORDER BY ts_unix DESC;
+			-- Backward-compat view for pre-refactor readers that still
+			-- SELECT FROM conversation with the old role column. Surface
+			-- the union of all 3 tables under the legacy schema so external
+			-- scripts (query-conversation.sh, regression-search, any other
+			-- consumer we missed) keep working without source edits. New
+			-- code should read the surface tables directly.
+			CREATE VIEW conversation AS
+				SELECT ts_unix, kind AS role, text, session_id FROM voice
+				UNION ALL
+				SELECT ts_unix, kind AS role, text, session_id FROM phone
+				UNION ALL
+				SELECT ts_unix, kind AS role, text, session_id FROM discord_voice;
 		`);
 
 		turnStmt['voice'] = db.prepare(

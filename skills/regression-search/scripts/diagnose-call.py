@@ -69,17 +69,33 @@ def _ts_iso(ts_unix) -> str:
 
 
 def _build_transcript(conn: sqlite3.Connection, session_id: str) -> str:
-    """Reconstruct a `Role: text` transcript from the conversation table."""
+    """Reconstruct a `Role: text` transcript from the per-surface tables.
+
+    Post-#1051 (per-surface schema): utterances + tool calls live in the
+    voice / phone / discord_voice tables under the `kind` column. We union
+    all three so a session_id from any surface resolves. Tool-call rows
+    (kind='tool_call') are skipped — the transcript is human dialogue only.
+    """
     if not session_id:
         return ""
     rows = conn.execute(
-        "SELECT role, text FROM conversation WHERE session_id = ? ORDER BY ts_unix",
+        """
+        SELECT kind, text FROM (
+          SELECT ts_unix, kind, text, session_id FROM voice
+          UNION ALL
+          SELECT ts_unix, kind, text, session_id FROM phone
+          UNION ALL
+          SELECT ts_unix, kind, text, session_id FROM discord_voice
+        )
+        WHERE session_id = ? AND kind != 'tool_call'
+        ORDER BY ts_unix
+        """,
         (session_id,),
     ).fetchall()
     lines = []
-    for role, text in rows:
-        r = (role or "").lower()
-        prefix = "Sutando" if r in ("assistant", "sutando", "agent", "model") else "User"
+    for kind, text in rows:
+        k = (kind or "").lower()
+        prefix = "Sutando" if k in ("assistant", "sutando", "agent", "model") else "User"
         lines.append(f"{prefix}: {text or ''}")
     return "\n".join(lines)
 
