@@ -19,6 +19,10 @@ Each entry has:
 
 ## On Activation
 
+0. **Catchup first (fresh-session only).** Check `state/proactive-loop-started.sentinel` under `${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}/`. If absent AND the `catchup-after-startup` skill is installed (i.e. `~/.claude/skills/catchup-after-startup/` exists) → invoke `/catchup-after-startup` BEFORE the cron-scheduling work below, so the conversation buffer carries cross-restart context (last session's PRs, in-flight tasks, recent voice/discord activity, build-log tail) before any cron fires. After invocation, `mkdir -p` the workspace `state/` and `touch` the sentinel. If sentinel is present (cron-driven re-invocation within an already-running session) OR catchup skill not installed → skip step 0 silently and proceed. The sentinel is cleared by the SessionStop hook in `src/session-handoff.sh` (per `6e5c58d` in this PR) so the next fresh session re-fires catchup.
+
+   Rationale: post-#954, the CLI boots with `-- "/schedule-crons"` (not `/proactive-loop`), so this skill IS the actual startup entry — wiring catchup here means it runs synchronously at session start instead of waiting until the first `main-loop` cron fire (~5 min later) to reach `/proactive-loop`'s catchup step (which `822e630` of this PR added). Identical sentinel guard semantics across both paths, so they cooperate idempotently — whichever runs first touches the sentinel; the other skips.
+
 1. Read `skills/schedule-crons/crons.json`
 2. Check existing cron jobs with CronList
 3. For each job in the config:
