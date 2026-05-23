@@ -47,6 +47,49 @@ mkdir -p "$TASKS_DIR"
 # /private/tmp — which is the default.
 TASKS_DIR_ABS="$(cd "$TASKS_DIR" && pwd -P)"
 
+# Orphan-watcher self-defense (restart-safety #5).
+#
+# When the Monitor wrapper / shell redirect at the read end of our stdout
+# goes away (Claude session compaction, /pull-and-restart, ⌘Q, etc.) but
+# this script's subprocess survives, every subsequent `echo TASK_FILE:`
+# silently buffers in the macOS pipe (~64KB) until SIGPIPE — but
+# DM-frequency events (a few per day) never fill that buffer, so an
+# orphaned watcher can swallow tasks for days before self-dying. Repro
+# confirmed 2026-05-23 on Mac Studio + MBP: orphan window is
+# env-dependent — Studio (bash 5+) survived 100+ dead-pipe events; MBP
+# (bash 3.2) died after ~5. Neither is fast enough.
+#
+# Two layers of defense below + matching `|| exit 0` on every `echo`:
+#
+# (1) Every `echo "TASK_FILE: ..."` is appended with `|| exit 0` so any
+#     write failure (EPIPE / EBADF / closed FD) exits cleanly instead of
+#     looping forever.
+#
+# (2) Heartbeat: a 30s background loop writes a comment line `# heartbeat
+#     <ts>` to stdout. Consumers (Monitor / agent loop) ignore lines
+#     starting with `#`. If the heartbeat write fails, the heartbeat
+#     subprocess kills the watcher parent. This bounds the orphan window
+#     to ≤30s regardless of event volume — independent of pipe buffer
+#     size + env-dependent SIGPIPE handling.
+PARENT_PID=$$
+(
+  # Trap SIGPIPE explicitly: bash's default PIPE handler terminates the
+  # process before any `||` clause can run, so without this trap the
+  # heartbeat dies silently when stdout closes and the parent watcher
+  # keeps running. With the trap, EPIPE → trap fires → kill parent.
+  trap 'kill '"$PARENT_PID"' 2>/dev/null; exit 0' PIPE
+  while sleep 30; do
+    echo "# heartbeat $(date -u +%s)" || { kill "$PARENT_PID" 2>/dev/null; exit 0; }
+  done
+) &
+HEARTBEAT_PID=$!
+# Main script: same SIGPIPE handling — any `echo TASK_FILE` to a closed
+# stdout (e.g. agent loop / Monitor wrapper exits) triggers clean exit
+# instead of either zombie-running or being SIGPIPE-killed mid-emit
+# without firing the EXIT trap that cleans up the heartbeat.
+trap 'kill '"$HEARTBEAT_PID"' 2>/dev/null; exit 0' PIPE
+trap "kill $HEARTBEAT_PID 2>/dev/null; exit" INT TERM EXIT
+
 # Initial sweep — surface any pre-existing tasks that arrived during a
 # restart gap.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -57,7 +100,7 @@ for f in "$TASKS_DIR"/*.txt; do
   # leftover from a prior crash; bumping conveys retry-count
   # semantics to the agent (attempts > 1 → agent treats as retry).
   python3 "$SCRIPT_DIR/task_bump_attempts.py" "$f" 2>/dev/null || true
-  echo "TASK_FILE: $(basename "$f")"
+  echo "TASK_FILE: $(basename "$f")" || exit 0
 done
 shopt -u nullglob
 
@@ -95,7 +138,7 @@ fswatch \
         # fresh-file events this sets attempts=1; fswatch dedupe
         # prevents same-session double-bumps from burst events.
         python3 "$SCRIPT_DIR/task_bump_attempts.py" "$path" 2>/dev/null || true
-        echo "TASK_FILE: $(basename "$path")"
+        echo "TASK_FILE: $(basename "$path")" || exit 0
       fi
       ;;
   esac
