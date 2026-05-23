@@ -236,6 +236,19 @@ run rsync "${RSYNC_FLAGS[@]}" ${DRYFLAG[@]+"${DRYFLAG[@]}"} "$PEER:$ASSETS_PEER"
 # as frozen historical archives, so the merge loop still keeps them in
 # sync across nodes (just with no new entries arriving).
 #
+# IMPORTANT — conversation.sqlite is NEVER rsynced. The live SQLite
+# database, its .sqlite-wal and .sqlite-shm sidecars are all excluded
+# from every rsync call below. Rsyncing a live SQLite db is a known
+# corruption cause: rsync can copy the .sqlite mid-write; .sqlite and
+# .sqlite-wal can land in an inconsistent state; --update (mtime-wins)
+# can overwrite a local .sqlite while the local .wal still holds
+# uncommitted pages → "2nd reference to page" / "rowid out of order"
+# B-tree damage that requires `sqlite3 .recover` to salvage. The
+# mtime-wins flow was also never a real merge of two sqlite dbs — just
+# a clobber. If cross-node consolidation of conversation.sqlite becomes
+# necessary, the right shape is `.backup`-snapshot-based sync (consistent
+# copy of a live db) plus row-level reconciliation — not naive rsync.
+#
 # Strategy:
 #   1. rsync whole peer data/ dir into a staging subdir `.peer-staging/`
 #   2. for each .jsonl in staging, run the generic jsonl merger against
@@ -251,8 +264,12 @@ if [ "$DRY_RUN" = "0" ]; then
     STAGING="$DATA_LOCAL.peer-staging/"
     rm -rf "$STAGING"
     mkdir -p "$STAGING"
-    # Pull peer data/ into staging (tolerant of missing peer dir)
+    # Pull peer data/ into staging (tolerant of missing peer dir).
+    # `conversation.sqlite*` is excluded on ALL three rsync calls in this
+    # section — see the comment above for why (rsyncing a live SQLite db
+    # corrupts it; the glob covers .sqlite, .sqlite-wal, .sqlite-shm).
     run rsync -az --exclude 'radar-topics.example.json' --exclude '.peer-staging' \
+        --exclude 'conversation.sqlite*' \
         "$PEER:$DATA_PEER" "$STAGING"
     # Merge each staging .jsonl into local; non-jsonl files copied via --update
     for pf in "$STAGING"*.jsonl; do
@@ -261,11 +278,14 @@ if [ "$DRY_RUN" = "0" ]; then
         bash "$REPO_ROOT/skills/cross-node-sync/scripts/merge-voice-metrics.sh" \
             "$DATA_LOCAL$fn" "$pf" || true
     done
-    # Copy non-jsonl staging files into local with --update (mtime-wins)
-    run rsync -az --update --exclude '*.jsonl' "$STAGING" "$DATA_LOCAL"
+    # Copy non-jsonl staging files into local with --update (mtime-wins).
+    # conversation.sqlite* is excluded — see comment above.
+    run rsync -az --update --exclude '*.jsonl' --exclude 'conversation.sqlite*' "$STAGING" "$DATA_LOCAL"
     rm -rf "$STAGING"
-    # Push merged local data/ back to peer (no --delete so peer-only files survive)
+    # Push merged local data/ back to peer (no --delete so peer-only files
+    # survive). conversation.sqlite* is excluded — see comment above.
     run rsync -az --update --exclude 'radar-topics.example.json' --exclude '.peer-staging' \
+        --exclude 'conversation.sqlite*' \
         "$DATA_LOCAL" "$PEER:$DATA_PEER"
 else
     say "[DRY] would pull $PEER:$DATA_PEER into .peer-staging/, merge each .jsonl, rsync non-jsonl, push back"

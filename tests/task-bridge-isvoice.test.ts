@@ -20,17 +20,22 @@ import { _isVoiceTask } from '../src/task-bridge.js';
 const TASK_DIR = join(resolveWorkspace(), 'tasks');
 const ARCHIVE_DIR = join(TASK_DIR, 'archive');
 
+// Field order: `task:` LAST, per the writer convention enforced in PR #1023.
+// `_isVoiceTask` stops scanning at the first `task:` line (closes the body-
+// forging vector), so any header that lands AFTER `task:` is invisible to it.
+// Pre-#1023 these fixtures had `task:` first — that worked by accident with
+// the old `.some()` over all lines; post-#1023 it silently breaks the test.
 const VOICE_BODY = `id: task-isvoice-test-aaa
 timestamp: 2026-05-06T00:00:00Z
-task: hello world
 source: voice
 channel_id: local-voice
+task: hello world
 `;
 const NON_VOICE_BODY = `id: task-isvoice-test-bbb
 timestamp: 2026-05-06T00:00:00Z
-task: hello world
 source: discord
 channel_id: 1490906927675474030
+task: hello world
 `;
 
 const created: string[] = [];

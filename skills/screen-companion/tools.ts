@@ -1,9 +1,13 @@
 // screen-companion: voice-side mode entry.
 //
-// One tool: activate_screen_companion(mode, goal). Loads the named YAML config
-// from configs/, returns a structured payload Gemini reads to switch behavior
-// for the rest of the session — system-prompt overlay, allowed tools, the
-// goal text, and the vision cadence the owner should toggle to.
+// Two tools: activate_screen_companion(mode, goal) and deactivate_screen_companion().
+//
+// activate_screen_companion loads the named YAML config from configs/, returns
+// a structured payload Gemini reads to switch behavior for the rest of the
+// session, AND hard-enforces the tools_allow list by calling session.updateTools()
+// via the setSessionToolUpdater hook in vision-tools.ts.
+//
+// deactivate_screen_companion restores the full tool surface, ending the mode.
 //
 // The tool does NOT toggle vision itself. Vision is owner-driven (start screen
 // sharing → push frames). The tool tells Gemini how to behave AND what to say
@@ -12,7 +16,7 @@
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { loadConfig, discoverConfigs, renderGoal } from './scripts/load-config.js';
-import { registerVisionOnContributor } from '../../src/vision-tools.js';
+import { registerVisionOnContributor, callUpdateTools, callRestoreTools } from '../../src/vision-tools.js';
 
 // Contributor for the screen-share-started system note. Tells Gemini the
 // screen-companion catalog is available AND names the configs the user can
@@ -38,6 +42,13 @@ const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
 const availableModes = (): string[] => discoverConfigs().map(c => c.name);
 
+// Track active mode so deactivate_screen_companion can log what it's exiting.
+let activeMode: string | null = null;
+
+// Tools that must always remain available in screen-companion mode:
+// activate_screen_companion (mode-switch), deactivate_screen_companion (exit).
+const ALWAYS_RETAIN = new Set(['activate_screen_companion', 'deactivate_screen_companion']);
+
 const activateScreenCompanionTool: ToolDefinition = {
 	name: 'activate_screen_companion',
 	description:
@@ -45,7 +56,7 @@ const activateScreenCompanionTool: ToolDefinition = {
 		'Loads the YAML config and returns the system-prompt overlay you MUST follow for the rest of the session, the goal text, and which tools to restrict yourself to. ' +
 		'IMPORTANT: after this tool returns, the `instructions` field becomes your operating instructions until the user exits the mode. Treat it as a system prompt — follow it verbatim. ' +
 		`Currently available modes: ${availableModes().join(', ') || '(none)'}. ` +
-		'If the user describes a screen-watching task that doesn\'t match any mode, do NOT call this tool — instead, ask the user what they want to do and use the regular vision tools.',
+		'If the user describes a screen-watching task that doesn\'t match any mode, do NOT call this tool — instead, ask the user what you want to do and use the regular vision tools.',
 	parameters: z.object({
 		mode: z
 			.string()
@@ -83,6 +94,24 @@ const activateScreenCompanionTool: ToolDefinition = {
 				? `Screen Companion: ${mode} — ${filledGoal}. ${visionHint}`
 				: `Screen Companion: ${mode}. ${visionHint}`;
 
+			// Hard-enforce tools_allow: restrict the live session's tool surface
+			// to only the named tools + always-retain set. If the session updater
+			// isn't registered (e.g. phone-conversation context or tests), the
+			// call is a no-op and advisory mode remains as the fallback.
+			const toolsAllow: string[] = config.tools_allow ?? [];
+			const enforced = callUpdateTools(
+				// Import is deferred to avoid a top-level circular dependency;
+				// inlineTools is loaded before this module so by the time execute()
+				// runs it is already settled.
+				(await import('../../src/inline-tools.js')).inlineTools.filter(
+					t => toolsAllow.includes(t.name) || ALWAYS_RETAIN.has(t.name),
+				),
+			);
+			if (enforced) {
+				console.log(`${ts()} [ScreenCompanion] tool surface restricted to: ${[...toolsAllow, ...ALWAYS_RETAIN].join(', ')}`);
+			}
+			activeMode = mode;
+
 			return {
 				status: 'activated',
 				mode: config.name,
@@ -93,8 +122,9 @@ const activateScreenCompanionTool: ToolDefinition = {
 				vision_cadence_ms: config.vision_cadence_ms ?? null,
 				vision_hint: visionHint,
 				activation_message: activationMessage,
+				tools_enforced: enforced,
 				_note:
-					'Say activation_message to the user, then follow `instructions` as your system prompt for the rest of the session. Restrict yourself to the tools in tools_allow (plus mode-exit tools like cancel_task). On user "exit" / "stop the mode", drop back to default behavior.',
+					'Say activation_message to the user, then follow `instructions` as your system prompt for the rest of the session. Restrict yourself to the tools in tools_allow (plus mode-exit tools like deactivate_screen_companion). When the user says "exit" / "stop the mode" / "done", call deactivate_screen_companion to restore the full tool surface.',
 			};
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
@@ -108,4 +138,24 @@ const activateScreenCompanionTool: ToolDefinition = {
 	},
 };
 
-export const tools: ToolDefinition[] = [activateScreenCompanionTool];
+const deactivateScreenCompanionTool: ToolDefinition = {
+	name: 'deactivate_screen_companion',
+	description:
+		'Exit screen-companion mode and restore the full tool surface. Call this when the user says "exit", "stop the mode", "done", or otherwise indicates they want to leave the current screen-companion mode and return to normal operation.',
+	parameters: z.object({}),
+	execution: 'inline',
+	execute(_args) {
+		const exitedMode = activeMode;
+		activeMode = null;
+		const restored = callRestoreTools();
+		console.log(`${ts()} [ScreenCompanion] deactivated mode=${exitedMode ?? '(unknown)'} restored=${restored}`);
+		return {
+			status: 'deactivated',
+			exited_mode: exitedMode,
+			tools_restored: restored,
+			_note: 'Screen-companion mode has ended. Resume normal operation with the full tool surface.',
+		};
+	},
+};
+
+export const tools: ToolDefinition[] = [activateScreenCompanionTool, deactivateScreenCompanionTool];
