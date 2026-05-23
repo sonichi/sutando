@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline';" />
+    <title>System Stats</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="titlebar">
+        <span class="title">System Resources</span>
+        <div class="actions">
+          <button id="hide" title="Hide (Cmd+Shift+S)">&#x2013;</button>
+          <button id="close" title="Quit">&#x2715;</button>
+        </div>
+      </header>
+      <main id="content"></main>
+      <footer id="footer"></footer>
+    </div>
+    <script src="stats-renderer.js"></script>
+  </body>
+</html>

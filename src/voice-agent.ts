@@ -26,10 +26,10 @@
 import 'dotenv/config';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
-import { existsSync, readFileSync, readdirSync, statSync, unlinkSync, mkdirSync, appendFileSync, writeFileSync, openSync, writeSync, closeSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, openSync, writeSync, closeSync } from 'node:fs';
 import { execSync as execSyncTop } from 'node:child_process';
 import { inlineTools, coreDocumentedSkills } from './inline-tools.js';
-import { setVisionSession, startVisionControlServer, stopVisionControlServer } from './vision-tools.js';
+import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater } from './vision-tools.js';
 import { clearActiveArtifact } from './artifact-cache-tools.js';
 import { injectText } from './browser-tools.js';
 import { join, dirname } from 'node:path';
@@ -171,15 +171,34 @@ function acquirePidLock(): void {
 
 // Model configuration — override via .env for cost/quality tuning
 const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
-// Per-skill voice config (native-audio model + googleSearch grounding) lives
-// in voice-agent.config.json next to this file. Schema + defaults: see
+// Per-user voice config (native-audio model + googleSearch grounding) is
+// data, not code: it lives in the workspace, NOT in the git repo.
+//   live config: $SUTANDO_WORKSPACE/config/voice-agent.json
+//   template:    src/voice-agent.config.json.example (committed)
+// On first run, if the workspace config is missing, the committed .example
+// template is copied into place so the operator (and the switch_voice_config
+// tool) have a file to edit. If the copy fails (or the template is gone),
+// loadVoiceConfig falls back to its built-in defaults. Schema + defaults: see
 // src/voice-config.ts. voice-agent ships with model=3.1 + googleSearch=false
 // because the web client's code-heavy workload prefers 3.1 and the (key,
 // 3.1, googleSearch) combo trips a 1011 close on the VOICE key when search
-// is true. Phone + discord-voice inherit the package default (2.5+search).
+// is true. Phone inherits the package default (2.5+search).
 import { loadVoiceConfig } from './voice-config.js';
 const _voiceAgentDir = dirname(fileURLToPath(import.meta.url));
-const VOICE_AGENT_CONFIG = loadVoiceConfig(join(_voiceAgentDir, 'voice-agent.config.json'));
+const VOICE_AGENT_CONFIG_PATH = join(WORKSPACE_DIR, 'config', 'voice-agent.json');
+if (!existsSync(VOICE_AGENT_CONFIG_PATH)) {
+	const _exampleConfigPath = join(_voiceAgentDir, 'voice-agent.config.json.example');
+	try {
+		mkdirSync(dirname(VOICE_AGENT_CONFIG_PATH), { recursive: true });
+		if (existsSync(_exampleConfigPath)) {
+			copyFileSync(_exampleConfigPath, VOICE_AGENT_CONFIG_PATH);
+			console.log(`${new Date().toISOString().slice(11, 23)} [voice-agent] seeded config from template → ${VOICE_AGENT_CONFIG_PATH}`);
+		}
+	} catch (e) {
+		console.warn(`${new Date().toISOString().slice(11, 23)} [voice-agent] could not seed config at ${VOICE_AGENT_CONFIG_PATH}: ${(e as Error).message} — using built-in defaults`);
+	}
+}
+const VOICE_AGENT_CONFIG = loadVoiceConfig(VOICE_AGENT_CONFIG_PATH);
 const VOICE_NATIVE_AUDIO_MODEL = VOICE_AGENT_CONFIG.model;
 const VOICE_GOOGLE_SEARCH = VOICE_AGENT_CONFIG.googleSearch;
 const VOICE_NAME = process.env.VOICE_NAME || 'Puck';
@@ -493,6 +512,8 @@ function getPresenterStateMarker(): string {
 	return '';
 }
 
+const mainAgentTools: ToolDefinition[] = [workTool, getTaskStatus, switchModeTool, saveMeetingNoteTool, ...inlineTools];
+
 const mainAgent: MainAgent = {
 	name: 'main',
 	get greeting() {
@@ -740,7 +761,7 @@ const mainAgent: MainAgent = {
 	// enable it once we find a reliable gate signal (probably after
 	// bodhi exposes a proper "user has actually spoken" signal under
 	// native audio).
-	tools: [workTool, getTaskStatus, switchModeTool, saveMeetingNoteTool, ...inlineTools],
+	tools: mainAgentTools,
 	googleSearch: VOICE_GOOGLE_SEARCH,
 	onEnter: async () => console.log(`${ts()} [Agent] Sutando ready`),
 	// Voice-driven close — strict version. User wants to be able to
@@ -969,6 +990,10 @@ async function main() {
 	// HTTP control endpoint so the web-client Watch button can drive the
 	// same controller (proxied through web-client to stay same-origin).
 	setVisionSession(session);
+	// updateTools is on the private transport (GeminiLiveTransport), not VoiceSession.
+	// Applied on next reconnect — restricts what Gemini sees after the next transport cycle.
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	setSessionToolUpdater((tools) => (session as any).transport?.updateTools?.(tools), mainAgentTools);
 	startVisionControlServer();
 
 	// Bumped 5min into the future on every non-retryable transport close
@@ -1234,6 +1259,7 @@ async function main() {
 		console.log(`\n${ts()} Shutting down...`);
 		writeVoiceMetrics();
 		setVisionSession(null);
+		setSessionToolUpdater(null, []);
 		stopVisionControlServer();
 		await session.close('user_hangup');
 		process.exit(0);
