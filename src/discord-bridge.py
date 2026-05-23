@@ -2757,6 +2757,158 @@ async def poll_approved():
         await asyncio.sleep(3)
 
 
+# Discord gateway disconnect that outlasts the RESUME window forces
+# discord.py into a full IDENTIFY reconnect — and IDENTIFY does NOT
+# replay `MESSAGE_CREATE` events that arrived during the gap. They're
+# lost. Real incident pattern: a >75-minute disconnect strands an
+# owner DM; the next morning the bridge has no record of it.
+#
+# The fix: track the last DM message ID we observed per channel, and
+# on every `on_ready` (which fires on full reconnect), REST-fetch
+# messages since the checkpoint and replay them through
+# `_handle_discord_message`. Discord message IDs are Snowflake-
+# monotonic so `after=<id>` reliably returns only newer messages.
+DM_CHECKPOINT_FILE = REPO / "state" / "discord-dm-checkpoint.json"
+
+def _atomic_write_dm_checkpoint(data: dict) -> None:
+    """Write JSON atomically — same shape as _atomic_write_pending_replies."""
+    try:
+        DM_CHECKPOINT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = DM_CHECKPOINT_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data))
+        tmp.replace(DM_CHECKPOINT_FILE)
+    except Exception:
+        pass
+
+
+def _load_dm_checkpoint() -> dict:
+    """Read `state/discord-dm-checkpoint.json`. Maps
+    `channel_id (str) → last_processed_message_id (str)`. Returns
+    `{}` on missing/malformed file (fail-open)."""
+    try:
+        if not DM_CHECKPOINT_FILE.exists():
+            return {}
+        data = json.loads(DM_CHECKPOINT_FILE.read_text())
+        if not isinstance(data, dict):
+            return {}
+        return {
+            str(k): str(v)
+            for k, v in data.items()
+            if isinstance(v, (str, int))
+        }
+    except Exception:
+        return {}
+
+
+def _update_dm_checkpoint(channel_id: int, message_id: int) -> None:
+    """Atomically advance the per-channel checkpoint to `message_id`.
+    Only writes if the new id is strictly greater (forward-only)."""
+    current = _load_dm_checkpoint()
+    new_id_str = str(message_id)
+    channel_str = str(channel_id)
+    old_id_str = current.get(channel_str, "0")
+    try:
+        if int(new_id_str) <= int(old_id_str):
+            return
+    except (ValueError, TypeError):
+        pass
+    current[channel_str] = new_id_str
+    _atomic_write_dm_checkpoint(current)
+
+
+async def _catchup_missed_dms():
+    """Restart-safety: on full reconnect (after gateway IDENTIFY),
+    replay any DM messages that arrived during the disconnect window.
+
+    For each channel in the DM checkpoint, fetch messages with
+    `after=<last_seen_id>` via Discord REST and dispatch each one
+    through `_handle_discord_message`. Bounded at 50 messages per
+    channel per pass.
+    """
+    checkpoint = _load_dm_checkpoint()
+    if not checkpoint:
+        return
+    for channel_id_str, last_seen_str in checkpoint.items():
+        try:
+            channel = client.get_channel(int(channel_id_str))
+            if channel is None:
+                try:
+                    channel = await client.fetch_channel(int(channel_id_str))
+                except Exception as e:
+                    print(f"  [dm-catchup] could not resolve channel {channel_id_str}: {e}", flush=True)
+                    continue
+            if not isinstance(channel, discord.DMChannel):
+                continue
+            after_obj = discord.Object(id=int(last_seen_str))
+            replayed = 0
+            async for msg in channel.history(after=after_obj, limit=50, oldest_first=True):
+                # Checkpoint advancement happens inside
+                # `_handle_discord_message` for any DM.
+                try:
+                    await _handle_discord_message(msg)
+                    replayed += 1
+                except Exception as e:
+                    print(f"  [dm-catchup] replay failed for msg {msg.id}: {e}", flush=True)
+                    break
+            if replayed:
+                print(f"  [dm-catchup] replayed {replayed} missed DM(s) on channel {channel_id_str}", flush=True)
+        except Exception as e:
+            print(f"  [dm-catchup] channel {channel_id_str} failed: {e}", flush=True)
+
+
+# Delivery-idempotency sentinels. Pre-fix: if the bridge crashed
+# BETWEEN `channel.send(reply_text)` returning success and the
+# subsequent `archive_file(result_file, ...)` call, on restart the
+# result file still exists in `results/` and would be re-sent —
+# producing a duplicate. With these sentinels:
+#
+#   1. Right BEFORE the per-task send block, `_is_delivered(task_id)`
+#      checks the sentinel. If present → skip send, run archive,
+#      clear sentinel.
+#   2. Right AFTER channel.send succeeds, `_mark_delivered(task_id)`
+#      touches the sentinel.
+#   3. After archive completes, `_clear_delivered(task_id)` removes
+#      the sentinel (bounded dir growth).
+#
+# The crash-between-send-and-sentinel window remains a narrow
+# double-send vector (Discord nonce-based dedup would close that
+# tighter; deferred to follow-up).
+#
+# Scope of THIS PR: poll_results main-path only. Channel-redirect,
+# proactive, and dm-fallback paths are scoped follow-ups.
+DELIVERED_DIR = REPO / "state" / "discord-delivered"
+
+
+def _delivered_sentinel_path(task_id: str) -> Path:
+    return DELIVERED_DIR / f"{task_id}.sentinel"
+
+
+def _mark_delivered(task_id: str) -> None:
+    """Touch the delivery sentinel for `task_id`. Called immediately
+    after a successful `channel.send`."""
+    try:
+        DELIVERED_DIR.mkdir(parents=True, exist_ok=True)
+        _delivered_sentinel_path(task_id).touch()
+    except Exception as e:
+        print(f"  [delivered] sentinel write failed for {task_id}: {e}", flush=True)
+
+
+def _is_delivered(task_id: str) -> bool:
+    """True iff the sentinel for `task_id` exists."""
+    try:
+        return _delivered_sentinel_path(task_id).exists()
+    except Exception:
+        return False
+
+
+def _clear_delivered(task_id: str) -> None:
+    """Remove the sentinel — called during archive cleanup."""
+    try:
+        _delivered_sentinel_path(task_id).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 PENDING_REPLIES_FILE = REPO / "state" / "discord-pending-replies.json"
 
 def _atomic_write_pending_replies(data: dict) -> None:
@@ -2874,6 +3026,21 @@ async def poll_results():
                     task_file = TASKS_DIR / f"{task_id}.txt"
                     archive_file(task_file, "tasks", task_id)
                     continue
+
+                # Idempotency check: if the previous run already sent
+                # this reply (sentinel present) but crashed BEFORE the
+                # archive completed, skip the send + archive normally.
+                # Avoids the double-delivery vector when the bridge
+                # restarts between channel.send() returning and
+                # archive_file() finishing. See DELIVERED_DIR docstring.
+                if _is_delivered(task_id):
+                    print(f"  Skipped (already delivered per sentinel): {task_id}", flush=True)
+                    archive_file(result_file, "results", task_id)
+                    task_file = TASKS_DIR / f"{task_id}.txt"
+                    archive_file(task_file, "tasks", task_id)
+                    _clear_delivered(task_id)
+                    continue
+
                 try:
                     # Extract optional [reply: <message_id>] directive — the
                     # agent signals "this result is a reply to that message"
@@ -3005,6 +3172,13 @@ async def poll_results():
                             await channel.send(f"(file not allowed: {fpath})")
                             print(f"  REJECTED file (not in allowlist): {fpath}", flush=True)
 
+                    # Mark delivered BEFORE the archive runs. If we
+                    # crash between channel.send returning and archive,
+                    # on restart the sentinel + result-file combo
+                    # triggers the skip-block above (archive + clear,
+                    # no re-send). Without this, the result file
+                    # would re-send on restart producing a duplicate.
+                    _mark_delivered(task_id)
                     print(f"  Replied: {reply_text[:80]}...", flush=True)
                 except Exception as e:
                     print(f"  Reply failed: {e}", flush=True)
@@ -3012,6 +3186,10 @@ async def poll_results():
                 archive_file(result_file, "results", task_id)
                 task_file = TASKS_DIR / f"{task_id}.txt"
                 archive_file(task_file, "tasks", task_id)
+                # Delivery succeeded + archived — sentinel has served
+                # its purpose, remove to bound `discord-delivered/`
+                # directory growth.
+                _clear_delivered(task_id)
         await asyncio.sleep(1)
 
 
