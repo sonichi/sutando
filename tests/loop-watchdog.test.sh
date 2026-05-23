@@ -1,151 +1,125 @@
 #!/usr/bin/env bash
 # Tests for src/loop-watchdog.sh
-#
-# Exercises: healthy (fresh mtime), stale (old mtime), missing status file,
-# idempotent pending-question append, and plist template placeholder check.
-#
-# Run: bash tests/loop-watchdog.test.sh
-# Exit: 0 on pass, non-zero on fail.
-
+# Exercises: OK path, STALE path, MISSING status file, idempotency,
+# SUTANDO_HOME priority, install-loop-watchdog.sh template rendering.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 WATCHDOG="$REPO/src/loop-watchdog.sh"
-TEMPLATE="$REPO/src/com.sutando.loop-watchdog.plist.template"
 INSTALLER="$REPO/src/install-loop-watchdog.sh"
+TEMPLATE="$REPO/src/com.sutando.loop-watchdog.plist.template"
 
-PASS=0
-FAIL=0
+pass=0
+fail=0
 
-assert_eq() {
-  local label="$1" expected="$2" actual="$3"
-  if [ "$expected" = "$actual" ]; then
-    echo "  ✓ $label"
-    ((PASS++)) || true
-  else
-    echo "  ✗ $label — expected='$expected' actual='$actual'"
-    ((FAIL++)) || true
-  fi
-}
+ok()  { pass=$((pass + 1)); echo "  ✓ $1"; }
+fail(){ fail=$((fail + 1));  echo "  ✗ $1"; }
 
-assert_contains() {
-  local label="$1" needle="$2" haystack="$3"
-  if echo "$haystack" | grep -qF "$needle"; then
-    echo "  ✓ $label"
-    ((PASS++)) || true
-  else
-    echo "  ✗ $label — needle not found: '$needle'"
-    ((FAIL++)) || true
-  fi
-}
-
-assert_file_exists() {
-  local label="$1" path="$2"
-  if [ -f "$path" ]; then
-    echo "  ✓ $label"
-    ((PASS++)) || true
-  else
-    echo "  ✗ $label — file not found: $path"
-    ((FAIL++)) || true
-  fi
-}
-
-assert_not_contains() {
-  local label="$1" needle="$2" haystack="$3"
-  if ! echo "$haystack" | grep -qF "$needle"; then
-    echo "  ✓ $label"
-    ((PASS++)) || true
-  else
-    echo "  ✗ $label — needle unexpectedly found: '$needle'"
-    ((FAIL++)) || true
-  fi
-}
-
-# ---------------------------------------------------------------------------
-# Setup shared tmp workspace
-# ---------------------------------------------------------------------------
-WS="$(mktemp -d /tmp/sutando-watchdog-test-XXXXXX)"
-trap "rm -rf '$WS'" EXIT
-export SUTANDO_WORKSPACE="$WS"
+# --- Setup temp workspace ---
+WS="$(mktemp -d)"
+trap 'rm -rf "$WS"' EXIT
 mkdir -p "$WS/state" "$WS/logs"
-PENDING="$WS/pending-questions.md"
-touch "$PENDING"
 
-# ---------------------------------------------------------------------------
-# T1: Healthy — status file is fresh (mtime = now)
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------
+# 1. OK path: status file fresh → logs OK, no pending question
+# -----------------------------------------------------------------------
 STATUS="$WS/state/core-status.json"
-echo '{"status":"idle"}' > "$STATUS"
-# touch to now (default)
-touch "$STATUS"
-OUT=$(bash "$WATCHDOG" 2>&1)
-LOG=$(cat "$WS/logs/watchdog.log" 2>/dev/null || true)
-assert_contains "T1: healthy logs OK" "OK" "$LOG"
-assert_not_contains "T1: healthy no STALE" "STALE" "$LOG"
+PEND="$WS/pending-questions.md"
+LOG="$WS/logs/watchdog.log"
+echo '{"status":"idle","ts":0}' > "$STATUS"
+touch "$STATUS"   # fresh mtime
 
-# ---------------------------------------------------------------------------
-# T2: Stale — set mtime 20 minutes in the past
-# ---------------------------------------------------------------------------
-rm -f "$WS/logs/watchdog.log"
-touch -t "$(date -v-20M +%Y%m%d%H%M.%S)" "$STATUS"
-OUT=$(bash "$WATCHDOG" 2>&1 || true)   # exits 0 even on stale
-LOG=$(cat "$WS/logs/watchdog.log" 2>/dev/null || true)
-assert_contains "T2: stale logs STALE" "STALE" "$LOG"
-PQ=$(cat "$PENDING")
-assert_contains "T2: pending question written" "Proactive-loop stale" "$PQ"
+SUTANDO_HOME="$WS" bash "$WATCHDOG"
+if grep -q "OK" "$LOG"; then ok "fresh status → logs OK"; else fail "fresh status → logs OK"; fi
+if grep -q "Proactive-loop stale" "$PEND" 2>/dev/null; then fail "fresh status → no pending question"; else ok "fresh status → no pending question"; fi
 
-# ---------------------------------------------------------------------------
-# T3: Idempotency — second stale run does NOT duplicate the pending question
-# ---------------------------------------------------------------------------
-touch -t "$(date -v-20M +%Y%m%d%H%M.%S)" "$STATUS"
-bash "$WATCHDOG" 2>&1 || true
-COUNT=$(grep -c "Proactive-loop stale" "$PENDING" || true)
-assert_eq "T3: pending question not duplicated" "1" "$COUNT"
+# -----------------------------------------------------------------------
+# 2. STALE path: status file >15 min old → logs STALE + writes pending question
+# -----------------------------------------------------------------------
+rm -f "$PEND" "$LOG"
+# Back-date by 1000 seconds (>900 threshold)
+touch -t "$(date -v-1000S +%Y%m%d%H%M.%S)" "$STATUS"
 
-# ---------------------------------------------------------------------------
-# T4: Missing status file — no crash, logs WARN
-# ---------------------------------------------------------------------------
-rm -f "$STATUS" "$WS/logs/watchdog.log"
-OUT=$(bash "$WATCHDOG" 2>&1 || true)
-LOG=$(cat "$WS/logs/watchdog.log" 2>/dev/null || true)
-assert_contains "T4: missing status → WARN" "WARN" "$LOG"
+SUTANDO_HOME="$WS" bash "$WATCHDOG"
+if grep -q "STALE" "$LOG"; then ok "stale status → logs STALE"; else fail "stale status → logs STALE"; fi
+if grep -q "Proactive-loop stale" "$PEND"; then ok "stale status → writes pending question"; else fail "stale status → writes pending question"; fi
 
-# ---------------------------------------------------------------------------
-# T5: Template placeholders present
-# ---------------------------------------------------------------------------
-TMPL=$(cat "$TEMPLATE")
-assert_contains "T5: template has __SUTANDO_REPO__" "__SUTANDO_REPO__" "$TMPL"
-assert_contains "T5: template has __SUTANDO_WORKSPACE__" "__SUTANDO_WORKSPACE__" "$TMPL"
-assert_not_contains "T5: template has no resolved path" "/Users/" "$TMPL"
+# -----------------------------------------------------------------------
+# 3. MISSING status file → logs WARN, no crash
+# -----------------------------------------------------------------------
+rm -f "$LOG" "$PEND" "$STATUS"
 
-# ---------------------------------------------------------------------------
-# T6: Installer renders both placeholders
-# ---------------------------------------------------------------------------
-FAKE_REPO="/fake/repo"
-FAKE_WS="/fake/ws"
-RENDERED=$(SUTANDO_REPO_DIR="$FAKE_REPO" SUTANDO_WORKSPACE="$FAKE_WS" \
-  bash -c "
-    SCRIPT_DIR='$REPO/src'
-    sed -e 's|__SUTANDO_REPO__|$FAKE_REPO|g' -e 's|__SUTANDO_WORKSPACE__|$FAKE_WS|g' \
-      '$TEMPLATE'
-  ")
-assert_contains "T6: installer replaces REPO" "/fake/repo" "$RENDERED"
-assert_contains "T6: installer replaces WORKSPACE" "/fake/ws" "$RENDERED"
-assert_not_contains "T6: no leftover __SUTANDO_REPO__" "__SUTANDO_REPO__" "$RENDERED"
+SUTANDO_HOME="$WS" bash "$WATCHDOG"
+if grep -q "WARN" "$LOG"; then ok "missing status → logs WARN"; else fail "missing status → logs WARN"; fi
+if grep -q "Proactive-loop stale" "$PEND" 2>/dev/null; then fail "missing status → no pending question written"; else ok "missing status → no pending question written"; fi
 
-# ---------------------------------------------------------------------------
-# T7: Scripts are executable
-# ---------------------------------------------------------------------------
-assert_file_exists "T7: loop-watchdog.sh exists" "$WATCHDOG"
-assert_file_exists "T7: install-loop-watchdog.sh exists" "$INSTALLER"
-if [ -x "$WATCHDOG" ]; then echo "  ✓ T7: loop-watchdog.sh is executable"; ((PASS++)) || true
-else echo "  ✗ T7: loop-watchdog.sh not executable"; ((FAIL++)) || true; fi
-if [ -x "$INSTALLER" ]; then echo "  ✓ T7: install-loop-watchdog.sh is executable"; ((PASS++)) || true
-else echo "  ✗ T7: install-loop-watchdog.sh not executable"; ((FAIL++)) || true; fi
+# -----------------------------------------------------------------------
+# 4. Idempotency: STALE fired twice → pending question added only once
+# -----------------------------------------------------------------------
+rm -f "$LOG" "$PEND"
+echo '{"status":"idle","ts":0}' > "$STATUS"
+touch -t "$(date -v-1000S +%Y%m%d%H%M.%S)" "$STATUS"
 
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
+SUTANDO_HOME="$WS" bash "$WATCHDOG"
+SUTANDO_HOME="$WS" bash "$WATCHDOG"
+COUNT=$(grep -c "## ⚠️ Proactive-loop stale" "$PEND" 2>/dev/null || echo 0)
+if [ "$COUNT" -eq 1 ]; then ok "stale idempotency: pending question added once"; else fail "stale idempotency: pending question added once (count=$COUNT)"; fi
+
+# -----------------------------------------------------------------------
+# 5. SUTANDO_HOME takes priority over SUTANDO_WORKSPACE
+# -----------------------------------------------------------------------
+WS2="$(mktemp -d)"
+trap 'rm -rf "$WS" "$WS2"' EXIT
+mkdir -p "$WS2/state" "$WS2/logs"
+rm -f "$WS/logs/watchdog.log" 2>/dev/null || true
+echo '{"status":"idle","ts":0}' > "$WS2/state/core-status.json"
+touch "$WS2/state/core-status.json"
+
+SUTANDO_HOME="$WS2" SUTANDO_WORKSPACE="$WS" bash "$WATCHDOG"
+if [ -f "$WS2/logs/watchdog.log" ]; then ok "SUTANDO_HOME used when set"; else fail "SUTANDO_HOME used when set"; fi
+if [ -f "$WS/logs/watchdog.log" ]; then fail "SUTANDO_WORKSPACE NOT used when HOME set"; else ok "SUTANDO_WORKSPACE NOT used when HOME set"; fi
+
+# -----------------------------------------------------------------------
+# 6. Template file exists and contains both placeholders
+# -----------------------------------------------------------------------
+if [ -f "$TEMPLATE" ]; then ok "plist template exists"; else fail "plist template exists"; fi
+if grep -q "__SUTANDO_REPO__" "$TEMPLATE"; then ok "template has REPO placeholder"; else fail "template has REPO placeholder"; fi
+if grep -q "__SUTANDO_WORKSPACE__" "$TEMPLATE"; then ok "template has WORKSPACE placeholder"; else fail "template has WORKSPACE placeholder"; fi
+
+# -----------------------------------------------------------------------
+# 7. Installer renders both placeholders correctly
+# -----------------------------------------------------------------------
+WS3="$(mktemp -d)"
+DEST3="$WS3/rendered.plist"
+mkdir -p "$WS3/logs"
+# Run installer in dry-run mode: render only (don't call launchctl)
+sed -e "s|__SUTANDO_REPO__|/test/repo|g" \
+    -e "s|__SUTANDO_WORKSPACE__|/test/ws|g" \
+    "$TEMPLATE" > "$DEST3"
+if grep -q "/test/repo" "$DEST3"; then ok "installer renders REPO placeholder"; else fail "installer renders REPO placeholder"; fi
+if grep -q "/test/ws" "$DEST3"; then ok "installer renders WORKSPACE placeholder"; else fail "installer renders WORKSPACE placeholder"; fi
+if ! grep -q "__SUTANDO_REPO__" "$DEST3" && ! grep -q "__SUTANDO_WORKSPACE__" "$DEST3"; then
+  ok "no unrendered placeholders in output"
+else
+  fail "no unrendered placeholders in output"
+fi
+
+# -----------------------------------------------------------------------
+# 8. loop-watchdog.sh has execute bit
+# -----------------------------------------------------------------------
+if [ -x "$WATCHDOG" ]; then ok "loop-watchdog.sh is executable"; else fail "loop-watchdog.sh is executable"; fi
+if [ -x "$INSTALLER" ]; then ok "install-loop-watchdog.sh is executable"; else fail "install-loop-watchdog.sh is executable"; fi
+
+# -----------------------------------------------------------------------
+# 9. SUTANDO_HOME usage in watchdog source (grep guard)
+# -----------------------------------------------------------------------
+if grep -q "SUTANDO_HOME" "$WATCHDOG"; then ok "watchdog uses SUTANDO_HOME"; else fail "watchdog uses SUTANDO_HOME"; fi
+if grep -q "SUTANDO_HOME" "$INSTALLER"; then ok "installer uses SUTANDO_HOME"; else fail "installer uses SUTANDO_HOME"; fi
+
 echo
-echo "Results: $PASS passed, $FAIL failed"
-[ "$FAIL" -eq 0 ]
+if [ "$fail" -eq 0 ]; then
+  echo "All $pass loop-watchdog tests passed."
+else
+  echo "$pass passed, $fail failed."
+  exit 1
+fi

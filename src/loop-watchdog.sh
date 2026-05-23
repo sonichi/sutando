@@ -5,7 +5,7 @@
 # still firing by inspecting <workspace>/state/core-status.json mtime. Logs
 # a warning + appends a pending question if stale.
 #
-# Does NOT auto-spawn Claude. Recovery is still manual (Chi runs /proactive-loop).
+# Does NOT auto-spawn Claude. Recovery is still manual (user runs /proactive-loop).
 # This script's job is observability — turning silent death into a visible signal.
 #
 # Install (manual): see src/install-loop-watchdog.sh for the launchd path.
@@ -14,10 +14,15 @@
 
 set -euo pipefail
 
-# Workspace resolution: matches src/workspace_default.py contract — env override
-# wins, else default to ~/.sutando/workspace. Per #940, state files (incl.
-# core-status.json) live under <workspace>/state/, NOT in the repo root.
-WORKSPACE="${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}"
+# Workspace resolution: SUTANDO_HOME (set by the app bundle to
+# ~/Library/Application Support/Sutando) wins. Falls back to
+# SUTANDO_WORKSPACE, then the default ~/.sutando/workspace.
+# core-status.json always lives under <workspace>/state/.
+if [ -n "${SUTANDO_HOME:-}" ]; then
+  WORKSPACE="${SUTANDO_HOME}"
+else
+  WORKSPACE="${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}"
+fi
 WORKSPACE="${WORKSPACE/#\~/$HOME}"  # expand ~ if env value used it literally
 
 STATUS_FILE="$WORKSPACE/state/core-status.json"

@@ -2,8 +2,9 @@
 # install-loop-watchdog.sh — render + load the launchd plist for loop-watchdog
 #
 # Reads:
-#   SUTANDO_REPO_DIR — defaults to this checkout (computed from script path)
-#   SUTANDO_WORKSPACE — defaults to ~/.sutando/workspace (matches workspace_default.py)
+#   SUTANDO_REPO_DIR  — defaults to this checkout (computed from script path)
+#   SUTANDO_HOME      — app bundle workspace (preferred for state/logs)
+#   SUTANDO_WORKSPACE — fallback workspace (matches workspace_default.py)
 #
 # Renders src/com.sutando.loop-watchdog.plist.template → ~/Library/LaunchAgents/
 # with both placeholders substituted, then `launchctl bootstrap`-loads it.
@@ -16,7 +17,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DEFAULT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 REPO="${SUTANDO_REPO_DIR:-$REPO_DEFAULT}"
-WORKSPACE="${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}"
+# Workspace resolution: SUTANDO_HOME (app bundle) wins over SUTANDO_WORKSPACE,
+# then the default ~/.sutando/workspace.
+if [ -n "${SUTANDO_HOME:-}" ]; then
+  WORKSPACE="${SUTANDO_HOME}"
+else
+  WORKSPACE="${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}"
+fi
 # expand ~ in env-supplied values
 REPO="${REPO/#\~/$HOME}"
 WORKSPACE="${WORKSPACE/#\~/$HOME}"
