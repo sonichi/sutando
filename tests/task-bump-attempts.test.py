@@ -98,11 +98,38 @@ def test_missing_task_line_untouched():
 
 
 def test_no_tmp_file_left():
-    """Atomic write: tmp + rename must clean up the .tmp suffix."""
+    """Post-#1049 follow-up: the bumper writes in-place (no tmp+rename)
+    to avoid self-triggering fswatch's `Renamed` event. Pin that no
+    `.tmp` file is ever created — if a future refactor reverts to
+    tmp+rename, the self-trigger loop returns."""
     p = _make("tmp.txt", "id: task-tmp\ntask: x\n")
     bumper.bump_attempts(p)
     tmp = p.with_suffix(p.suffix + ".tmp")
-    assert not tmp.exists(), f".tmp file left on disk: {tmp}"
+    assert not tmp.exists(), (
+        f".tmp file left on disk: {tmp} — bumper must write in-place "
+        f"to avoid fswatch self-trigger loop (PR #1049 follow-up)."
+    )
+
+
+def test_bumper_uses_in_place_write_not_rename():
+    """Architectural pin: source must NOT call `.replace(file_path)`
+    or `os.rename(...file_path...)` — those trigger fswatch's
+    `Renamed` event, and the upstream `.sh` watcher (no dedup set)
+    enters an infinite self-trigger loop. In-place open+write only.
+
+    The fork's `.mjs` watcher has a `seen` set that bounds the loop
+    to one extra bump, but the upstream `.sh` has no such guard,
+    making this the load-bearing fix for that variant."""
+    src = (REPO / "src" / "task_bump_attempts.py").read_text()
+    assert ".replace(file_path)" not in src, (
+        "task_bump_attempts.py uses .replace(file_path) — this triggers "
+        "fswatch Renamed event in the upstream watcher, causing an "
+        "infinite self-trigger loop. Use in-place open+write instead."
+    )
+    assert "open(file_path" in src, (
+        "task_bump_attempts.py must use in-place open(file_path, 'w') — "
+        "rename-style writes self-trigger the watcher."
+    )
 
 
 def test_three_sequential_bumps():
@@ -171,6 +198,7 @@ def main():
         test_high_count_increment,
         test_missing_task_line_untouched,
         test_no_tmp_file_left,
+        test_bumper_uses_in_place_write_not_rename,
         test_three_sequential_bumps,
         test_missing_file_no_error,
         test_cli_invocation,
@@ -190,7 +218,7 @@ def main():
         for f in failures:
             print(f"  {f}")
         sys.exit(1)
-    print(f"All {9} attempts-counter tests passed.")
+    print(f"All {10} attempts-counter tests passed.")
 
 
 if __name__ == "__main__":

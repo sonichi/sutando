@@ -65,9 +65,30 @@ def bump_attempts(file_path: Path) -> int:
         lines.insert(task_idx, "attempts: 1")
     updated = "\n".join(lines)
     try:
-        tmp = file_path.with_suffix(file_path.suffix + ".tmp")
-        tmp.write_text(updated, encoding="utf-8")
-        tmp.replace(file_path)
+        # In-place write (NOT tmp+rename) — per @qingyun-wu and
+        # @liususan091219 PR #1049 reviews. The prior tmp+rename
+        # approach was atomic but triggered fswatch's `Renamed`
+        # event on the destination path: watch-tasks-stream.sh
+        # subscribes to `--event Created --event Renamed` for the
+        # tasks/ dir, so a rename onto `tasks/<name>.txt` re-fires
+        # the watcher's emit-loop → bumper runs again → another
+        # rename → another emit → infinite self-trigger loop.
+        #
+        # In-place write via open(file_path, 'w') (truncate +
+        # write) only fires an Updated/Modified event, which the
+        # watcher is NOT subscribed to. The trade: we lose strict
+        # crash-atomicity (a crash MID-WRITE could leave a half-
+        # written file). Acceptable because:
+        #
+        #   1. The bumper is small + fast — the write window is
+        #      microseconds.
+        #   2. Task-file parsers fail closed on malformed files
+        #      (no `task:` line → no claim). Half-written files
+        #      are skipped, not silently misprocessed.
+        #   3. Bridge restart re-runs the bumper before re-emit,
+        #      so a corrupted file gets one chance to be re-written.
+        with open(file_path, "w", encoding="utf-8") as fh:
+            fh.write(updated)
     except OSError as e:
         print(f"[task_bump_attempts] write failed for {file_path}: {e}", file=sys.stderr)
         return 0
