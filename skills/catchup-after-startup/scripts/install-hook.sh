@@ -8,15 +8,40 @@
 # of "last close", losing the most-recent session window.
 #
 # This hook makes session-handoff.sh also fire on SessionStop, closing the
-# gap. Required env: SUTANDO_REPO_DIR pointing at the Sutando checkout (so
-# the hook can locate session-handoff.sh). Default: ~/Desktop/sutando.
+# gap.
+#
+# REPO resolution: the previous version baked `${SUTANDO_REPO_DIR:-$HOME/Desktop/sutando}`
+# into the hook command verbatim, so machines without SUTANDO_REPO_DIR set
+# AND without a checkout at ~/Desktop/sutando silently no-op'd every
+# SessionStop. (Real incident 2026-05-23 on Mac Studio.) We now resolve REPO
+# at install time using the same probe heuristic as catchup-after-startup.sh
+# and bake the literal path into the hook — no runtime probe burden, and a
+# misconfig fails loudly at install instead of silently at hook fire.
 #
 # Safe to re-run — already-installed hooks are detected + skipped.
 set -euo pipefail
 
 SETTINGS="${HOME}/.claude/settings.json"
-# The hook command — points at the script that ships with Sutando.
-HOOK_CMD='bash "${SUTANDO_REPO_DIR:-$HOME/Desktop/sutando}/src/session-handoff.sh" "${TRANSCRIPT_PATH:-}"'
+
+# Resolve REPO at install time (env wins, else probe common layouts).
+if [ -n "${SUTANDO_REPO_DIR:-}" ]; then
+  REPO_FOR_HOOK="$SUTANDO_REPO_DIR"
+else
+  REPO_FOR_HOOK=""
+  for _cand in "$HOME/Desktop/sutando" "$HOME/Documents/sutando/sutando" "$HOME/Documents/sutando" "$HOME/sutando" "$(pwd)"; do
+    if [ -f "$_cand/CLAUDE.md" ] && [ -d "$_cand/skills" ] && [ -d "$_cand/.git" ]; then
+      REPO_FOR_HOOK="$_cand"; break
+    fi
+  done
+  if [ -z "$REPO_FOR_HOOK" ]; then
+    echo "error: couldn't auto-detect sutando checkout — set SUTANDO_REPO_DIR and re-run" >&2
+    echo "       (probed: \$HOME/Desktop/sutando, \$HOME/Documents/sutando/sutando, \$HOME/Documents/sutando, \$HOME/sutando, \$(pwd))" >&2
+    exit 1
+  fi
+fi
+
+# The hook command — literal resolved path, no runtime probe.
+HOOK_CMD="bash \"$REPO_FOR_HOOK/src/session-handoff.sh\" \"\${TRANSCRIPT_PATH:-}\""
 
 if [ ! -f "$SETTINGS" ]; then
   echo "error: $SETTINGS not found — Claude Code not configured on this machine?" >&2

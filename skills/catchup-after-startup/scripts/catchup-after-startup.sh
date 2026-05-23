@@ -65,6 +65,75 @@ else
   say "(no session-state.md — last session may have exited without compacting; rely on logs below)"
 fi
 
+# 1b. Previous-session transcript (Claude Code project .jsonl)
+#
+# session-state.md is a 50-line summary written by session-handoff.sh, which
+# only fires if the PreCompact / SessionStop hooks are wired AND succeed.
+# Both have failed in practice (Mac Studio 2026-05-23 incident: hook
+# pointed at a non-existent default path → session-state.md never written
+# → catchup's most useful section was empty for weeks). The Claude Code
+# project transcript .jsonl, by contrast, is ALWAYS there (Claude Code
+# writes it natively, no hooks needed) and is richer (full user/assistant
+# turns vs a summary). When session-state.md is missing or stale, this is
+# the source of truth for "what was happening last session".
+print_section "Previous-session transcript (last $HOURS h)"
+proj_slug=$(echo "$REPO" | sed 's|/|-|g')
+proj_dir="$HOME/.claude/projects/$proj_slug"
+if [ -d "$proj_dir" ]; then
+  # Most-recent .jsonl untouched in the last minute — skips the CURRENT
+  # session's transcript (which the live process is still writing to).
+  # BSD `find -mmin` requires integers; fractional silently matches zero
+  # on macOS, so +1 is the tightest portable window.
+  prev_jsonl=$(/usr/bin/find "$proj_dir" -name "*.jsonl" -mmin +1 -size +0c 2>/dev/null | xargs -I{} stat -f "%m %N" {} 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+  if [ -n "$prev_jsonl" ]; then
+    say "Source: $(basename "$prev_jsonl")"
+    python3 <<PYEOF
+import json, datetime as dt
+cut = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=${HOURS})
+turns = []
+with open("$prev_jsonl") as f:
+    for line in f:
+        try: d = json.loads(line)
+        except: continue
+        ts_s = d.get("timestamp")
+        if not ts_s: continue
+        try:
+            ts = dt.datetime.fromisoformat(ts_s.replace("Z","+00:00"))
+        except: continue
+        if ts < cut: continue
+        role = d.get("type", "")
+        if role not in ("user", "assistant"): continue
+        msg = d.get("message", {})
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            parts = []
+            for c in content:
+                if isinstance(c, dict) and c.get("type") == "text":
+                    parts.append(c.get("text", ""))
+            content = " ".join(parts)
+        content = str(content).strip()
+        if not content: continue
+        # Skip system reminders, task notifications, tool-result envelopes,
+        # interrupt markers — they're noise, not human turns.
+        if content.startswith("<"): continue
+        if content.startswith("[Request interrupted"): continue
+        if content.startswith("[{"): continue
+        turns.append((ts.strftime("%H:%M"), "user" if role=="user" else "asst", content))
+# Keep the LAST N turns in the window — those are most relevant to "what
+# was happening just before this session".
+for t, r, c in turns[-25:]:
+    snippet = c[:240].replace("\n", " ")
+    print(f"  {t} {r:4s}| {snippet}")
+if not turns:
+    print("  (no user/assistant turns in window)")
+PYEOF
+  else
+    say "(no previous-session .jsonl in $proj_dir — fresh checkout?)"
+  fi
+else
+  say "(no project transcript dir at $proj_dir)"
+fi
+
 # 2. Open PRs (mine — the shared liususan091219 identity)
 print_section "Open PRs on sonichi/sutando (liususan091219)"
 gh pr list --repo sonichi/sutando --state open --author liususan091219 \

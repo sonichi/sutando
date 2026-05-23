@@ -18,8 +18,9 @@ If an interval is provided in ARGUMENTS (e.g. "5m", "10m", "30m"), use it. Other
 
 ## On activation
 
-1. Run `/schedule-crons` to set up all recurring cron jobs (morning briefing, Zacks, etc.)
-2. Start the streaming task watcher via the `Monitor` tool — pass `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`, `description: 'Streaming task watcher'`. The script emits one `TASK_FILE: <basename>` line per new task file (initial sweep + each subsequent event). Read the named file via the Read tool when notifications arrive.
+1. **Catchup first** (fresh-session only). Check `state/proactive-loop-started.sentinel` (resolve under `${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}/`). If absent → run `/catchup-after-startup` BEFORE anything else so the conversation buffer has cross-restart context, then `mkdir -p` the workspace `state/` and `touch` the sentinel. If present → this is a cron-driven pass within an already-running session; skip catchup and proceed. The sentinel is cleared by the SessionStop hook (or explicitly via `rm state/proactive-loop-started.sentinel`) so the next fresh session re-runs catchup.
+2. Run `/schedule-crons` to set up all recurring cron jobs (morning briefing, Zacks, etc.)
+3. Start the streaming task watcher via the `Monitor` tool — pass `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`, `description: 'Streaming task watcher'`. The script emits one `TASK_FILE: <basename>` line per new task file (initial sweep + each subsequent event). Read the named file via the Read tool when notifications arrive.
 
 ## Start the loop
 
