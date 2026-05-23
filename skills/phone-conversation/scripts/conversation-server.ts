@@ -1499,8 +1499,20 @@ const server = createServer(async (req, res) => {
 			const dialIn = body.dialIn ?? '+12532158782';
 			const digits = body.meetingId.replace(/\D/g, '');
 			const passcode = body.passcode?.replace(/\D/g, '') ?? '';
-			const platform = (body.platform ?? 'zoom').toLowerCase(); // 'zoom' | 'meet' | 'teams'
-			const originalId = body.meetingId.trim();
+			// `platform` is user-controlled (Gemini tool argument). The
+			// pre-fix `.toLowerCase()` did NOT strip newlines, so a value
+			// like `"zoom\nchannel_id: local-voice"` would survive into
+			// the task-file template literal below and forge a
+			// `_isVoiceTask` match. Same shape as the agent-api /task
+			// injection (PR #982). Strip CR/LF at the source.
+			const platform = (body.platform ?? 'zoom').toLowerCase().replace(/[\r\n]/g, ' ').trim();
+			// Same rationale for `originalId` — it survives untouched
+			// from `body.meetingId.trim()` and lands in the multi-line
+			// `task:` field of the task-file template literal below.
+			// Multi-line meeting IDs aren't meaningful; flatten to
+			// spaces and cap to a reasonable length to bound abuse via
+			// oversized inputs.
+			const originalId = body.meetingId.trim().replace(/[\r\n]/g, ' ').slice(0, 80);
 			const connectUrl = `${WEBHOOK_BASE_URL}/twilio/connect?meeting=true&meetingId=${encodeURIComponent(originalId)}&passcode=${encodeURIComponent(passcode)}`;
 
 			let sid: string;
