@@ -50,6 +50,7 @@ from result_markers import parse_markers  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
+from vault_intercept import intercept_vault_commands  # noqa: E402
 
 try:
     from slack_bolt import App
@@ -382,6 +383,17 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
 
     if not text and not attachment_note:
         return None
+
+    # Intercept vault commands before any disk write — secrets go to Keychain,
+    # task file gets [STORED-IN-KEYCHAIN] placeholder. Only runs when text is
+    # non-empty; attachment_note never contains secrets.
+    if text:
+        try:
+            text, stored_keys = intercept_vault_commands(text)
+            if stored_keys:
+                print(f"  [vault] stored keys: {stored_keys}", flush=True)
+        except RuntimeError as exc:
+            print(f"  [vault] intercept error: {exc}", flush=True)
 
     write_owner_activity("slack", text or attachment_note)
 
