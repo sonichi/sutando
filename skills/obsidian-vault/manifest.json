@@ -1,0 +1,7 @@
+{
+  "name": "obsidian-vault",
+  "enabled": true,
+  "access_tier": "owner",
+  "description": "Capture notes, tasks, and thoughts into a Sutando-owned Obsidian vault at $SUTANDO_WORKSPACE/obsidian-vault. Voice-inline tool writes directly to the filesystem — Obsidian picks up changes instantly. No Obsidian plugin required.",
+  "tools": "./tools.ts"
+}

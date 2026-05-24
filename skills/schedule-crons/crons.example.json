@@ -23,5 +23,10 @@
     "name": "sync-memory",
     "cron": "*/30 * * * *",
     "prompt": "Run bash scripts/sync-memory.sh to sync memory and notes to the private memory repo (requires SUTANDO_MEMORY_REPO in .env)."
+  },
+  {
+    "name": "obsidian-dream",
+    "cron": "37 3 * * *",
+    "prompt": "Run python3 skills/obsidian-vault/scripts/dream.py for the nightly LLM-judged vault relink pass (gated by SUTANDO_OBSIDIAN_MIRROR=1 — no-op when unset). Default model: claude-opus-4-7 (override via SUTANDO_DREAM_MODEL)."
   }
 ]
