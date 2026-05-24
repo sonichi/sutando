@@ -14,9 +14,10 @@ Usage (in any bridge's message handler):
 
     from vault_intercept import intercept_vault_commands
 
-    text, stored = intercept_vault_commands(raw_message)
-    # `text` is sanitized; write it to the task file.
-    # `stored` lists the keys that were persisted (for logging).
+    result = intercept_vault_commands(raw_message)
+    # result.text  — sanitized, safe to write to disk (plaintext always gone)
+    # result.stored — keys successfully stored to Keychain
+    # result.failed — keys that failed to store (still redacted from text)
 
 Supported syntax (all case-insensitive):
     vault set KEY value
@@ -47,11 +48,14 @@ _VAULT_SET_RE = re.compile(
 
 
 class InterceptResult(NamedTuple):
-    text: str         # sanitized message text, safe to write to disk
-    stored: list[str] # keys successfully stored to Keychain
+    text: str          # sanitized message text, safe to write to disk
+    stored: list[str]  # keys successfully stored to Keychain
+    failed: list[str]  # keys that could NOT be stored (secret still redacted)
 
 
 def _store_in_keychain(key: str, value: str) -> None:
+    # Note: value is passed as an argv element — briefly visible in `ps` to
+    # the same user. Acceptable on a single-user Mac; not a multi-user safe API.
     result = subprocess.run(
         [
             "security", "add-generic-password",
@@ -78,8 +82,11 @@ def _register_key(key: str) -> None:
     except (FileNotFoundError, json.JSONDecodeError):
         manifest = {}
     manifest[key] = {"stored_at": datetime.now(timezone.utc).isoformat()}
-    with open(_MANIFEST_PATH, "w") as f:
+    # Atomic write — concurrent bridge processes won't corrupt keys.json.
+    tmp = _MANIFEST_PATH + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(manifest, f, indent=2)
+    os.replace(tmp, _MANIFEST_PATH)
 
 
 def list_vault_keys() -> list[str]:
@@ -105,23 +112,30 @@ def get_vault_key(key: str) -> str:
 def intercept_vault_commands(text: str) -> InterceptResult:
     """Detect vault-set commands in `text`, store secrets, return sanitized text.
 
-    Raises RuntimeError if a Keychain write fails (so the bridge can log and
-    optionally reply with an error rather than silently dropping the secret).
+    Fail-closed: the plaintext secret is ALWAYS redacted from the returned text,
+    even when the Keychain write fails. Failed keys are reported in result.failed
+    so the bridge can notify the user without leaking the secret.
     """
     if not text:
-        return InterceptResult(text=text, stored=[])
+        return InterceptResult(text=text, stored=[], failed=[])
 
     stored: list[str] = []
+    failed: list[str] = []
 
     def _replacer(m: re.Match) -> str:
         key = m.group(1)
-        # Groups 2/3/4 correspond to double-quoted / single-quoted / bare token.
+        # Groups 2/3/4: double-quoted / single-quoted / bare token.
         value = m.group(2) if m.group(2) is not None else (
             m.group(3) if m.group(3) is not None else m.group(4)
         )
-        _store_in_keychain(key, value)
-        stored.append(key)
-        return f"vault set {key} [STORED-IN-KEYCHAIN]"
+        try:
+            _store_in_keychain(key, value)
+            stored.append(key)
+            return f"vault set {key} [STORED-IN-KEYCHAIN]"
+        except RuntimeError:
+            # Store failed — redact anyway so plaintext never reaches disk.
+            failed.append(key)
+            return f"vault set {key} [VAULT-STORE-FAILED]"
 
     sanitized = _VAULT_SET_RE.sub(_replacer, text)
-    return InterceptResult(text=sanitized, stored=stored)
+    return InterceptResult(text=sanitized, stored=stored, failed=failed)

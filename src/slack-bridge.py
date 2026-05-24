@@ -388,12 +388,12 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     # task file gets [STORED-IN-KEYCHAIN] placeholder. Only runs when text is
     # non-empty; attachment_note never contains secrets.
     if text:
-        try:
-            text, stored_keys = intercept_vault_commands(text)
-            if stored_keys:
-                print(f"  [vault] stored keys: {stored_keys}", flush=True)
-        except RuntimeError as exc:
-            print(f"  [vault] intercept error: {exc}", flush=True)
+        vault_result = intercept_vault_commands(text)
+        text = vault_result.text
+        if vault_result.stored:
+            print(f"  [vault] stored keys: {vault_result.stored}", flush=True)
+        if vault_result.failed:
+            print(f"  [vault] store failed (still redacted): {vault_result.failed}", flush=True)
 
     write_owner_activity("slack", text or attachment_note)
 

@@ -2660,12 +2660,12 @@ async def _handle_discord_message(message, force=False):
     # Intercept vault commands before any disk write — secrets go to Keychain,
     # task file gets [STORED-IN-KEYCHAIN] placeholder.
     if text:
-        try:
-            text, stored_keys = intercept_vault_commands(text)
-            if stored_keys:
-                print(f"  [vault] stored keys: {stored_keys}", flush=True)
-        except RuntimeError as exc:
-            print(f"  [vault] intercept error: {exc}", flush=True)
+        vault_result = intercept_vault_commands(text)
+        text = vault_result.text
+        if vault_result.stored:
+            print(f"  [vault] stored keys: {vault_result.stored}", flush=True)
+        if vault_result.failed:
+            print(f"  [vault] store failed (still redacted): {vault_result.failed}", flush=True)
 
     # Inject tier-specific in-band instructions so the core agent cannot
     # accidentally process a non-owner task with full capabilities.

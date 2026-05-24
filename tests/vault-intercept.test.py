@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, call, patch
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
+import vault_intercept
 from vault_intercept import InterceptResult, intercept_vault_commands
 
 
@@ -129,18 +130,39 @@ class TestKeychainInteraction(unittest.TestCase):
 
 
 class TestErrorHandling(unittest.TestCase):
-    def test_keychain_failure_raises_runtime_error(self):
-        failed = MagicMock(returncode=1, stderr=b"errSecDuplicateItem")
-        with patch("vault_intercept.subprocess.run", return_value=failed):
-            with self.assertRaises(RuntimeError) as ctx:
-                intercept_vault_commands("vault set KEY val")
-        self.assertIn("KEY", str(ctx.exception))
+    def test_store_failure_still_redacts(self):
+        """Fail-closed: plaintext must never reach disk even when Keychain write fails."""
+        failed_proc = MagicMock(returncode=1, stderr=b"boom")
+        with patch("vault_intercept.subprocess.run", return_value=failed_proc):
+            result = intercept_vault_commands("vault set K supersecret")
+        self.assertNotIn("supersecret", result.text)
+        self.assertIn("[VAULT-STORE-FAILED]", result.text)
+        self.assertEqual(result.stored, [])
+        self.assertEqual(result.failed, ["K"])
+
+    def test_partial_failure_redacts_all(self):
+        """With N vault commands, a failure on command M must not expose 1..M-1 secrets."""
+        call_count = [0]
+        def _side_effect(cmd, **kw):
+            call_count[0] += 1
+            if call_count[0] == 2:
+                return MagicMock(returncode=1, stderr=b"fail")
+            return MagicMock(returncode=0, stdout=b"", stderr=b"")
+
+        with patch("vault_intercept.subprocess.run", side_effect=_side_effect), \
+             patch.object(vault_intercept, "_register_key"):
+            result = intercept_vault_commands("vault set A secret1\nvault set B secret2")
+        self.assertNotIn("secret1", result.text)
+        self.assertNotIn("secret2", result.text)
+        self.assertIn("A", result.stored)
+        self.assertIn("B", result.failed)
 
     def test_returns_namedtuple(self):
         result = intercept_vault_commands("no vault command here")
         self.assertIsInstance(result, InterceptResult)
         self.assertIsInstance(result.text, str)
         self.assertIsInstance(result.stored, list)
+        self.assertIsInstance(result.failed, list)
 
 
 if __name__ == "__main__":
