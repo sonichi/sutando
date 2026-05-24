@@ -57,6 +57,28 @@ from util_paths import shared_personal_path  # noqa: E402
 from task_priority import default_priority_for_source  # noqa: E402
 REPO = resolve_workspace()
 
+# discord-voice "magic word" join trigger (issue: za-warudo summon). The
+# bridge stays a THIN hook — it only detects "owner + join phrase" and hands
+# off to this helper, which owns the voice-channel resolution + server launch
+# + already-running guard. Keeping the feature logic in the skill honors the
+# CLAUDE.md core/skill split (core must not bloat with feature logic). The
+# import is best-effort: if the discord-voice skill is absent, the magic word
+# simply doesn't fire and the message is processed as a normal task.
+try:
+    sys.path.insert(
+        0, str(Path(__file__).resolve().parent.parent / "skills" / "discord-voice" / "scripts")
+    )
+    from join_trigger import (  # noqa: E402
+        message_is_join_phrase as _dv_message_is_join_phrase,
+        handle_join_trigger as _dv_handle_join_trigger,
+    )
+except Exception:  # pragma: no cover - skill optional
+    def _dv_message_is_join_phrase(text):  # type: ignore
+        return False
+
+    def _dv_handle_join_trigger(message):  # type: ignore
+        return ""
+
 # Vision-frame helper — pushes image attachments into the active voice session
 # so Gemini reacts in-stream. Best-effort: import failure or unreachable
 # voice-agent leaves the regular task pipeline unchanged.
@@ -2525,6 +2547,37 @@ async def _handle_discord_message(message, force=False):
     if len(seen_message_ids) > 10000:
         seen_message_ids.clear()
 
+    # discord-voice "magic word" join trigger. THIN hook (CLAUDE.md core/skill
+    # split): the bridge only checks "is this the owner saying the join
+    # phrase"; everything else — voice-channel lookup, already-running guard,
+    # discord-voice-server launch — lives in the discord-voice skill helper.
+    # Owner-only by construction: a non-owner saying the phrase falls through
+    # to normal task handling. When it fires, the message IS the command — we
+    # send the reply and return WITHOUT writing a task file (no normal task
+    # for a join-phrase message). Placed AFTER dedup so gateway replay can't
+    # double-fire the spawn; the helper has its own `_server_already_running`
+    # guard anyway, but cheaper to dedup at the front gate.
+    if access_tier == "owner":
+        try:
+            is_join = _dv_message_is_join_phrase(text)
+        except Exception as e:
+            print(f"  [join-trigger] match check raised: {e}", flush=True)
+            is_join = False
+        if is_join:
+            print(f"  [join-trigger] owner @{username} said the join phrase — summoning discord-voice", flush=True)
+            try:
+                reply = _dv_handle_join_trigger(message)
+            except Exception as e:
+                print(f"  [join-trigger] handler raised: {e}", flush=True)
+                reply = "Couldn't process the voice-join request — check the bridge log."
+            try:
+                if reply:
+                    for chunk in _chunk_for_discord(reply):
+                        await message.channel.send(chunk)
+            except Exception as e:
+                print(f"  [join-trigger] reply send failed: {e}", flush=True)
+            return
+
     # Deterministic tier ownership: if SUTANDO_TEAM_TIER_OWNER is configured
     # and this node's machine does NOT match, drop non-owner-tier tasks so the
     # designated owner node handles them exclusively. Owner-tier tasks are
@@ -3092,9 +3145,18 @@ async def poll_results():
                         try:
                             import outbox_log
                             ch_type = "discord_dm" if isinstance(channel, discord.DMChannel) else "discord_channel"
+                            # Human-readable label for audit: "#dev", "Chi DM",
+                            # or "DM" when the recipient name isn't available.
+                            if isinstance(channel, discord.DMChannel):
+                                _recipient = getattr(channel.recipient, "name", None)
+                                _label = f"{_recipient} DM" if _recipient else "DM"
+                            else:
+                                _ch_name = getattr(channel, "name", None)
+                                _label = f"#{_ch_name}" if _ch_name else None
                             outbox_log.append(
                                 channel_type=ch_type,
                                 recipient=str(channel.id),
+                                recipient_label=_label,
                                 body=clean_text,
                                 task_id=task_id,
                             )
@@ -3243,9 +3305,12 @@ async def poll_proactive():
                                 await dm.send(chunk)
                             try:
                                 import outbox_log
+                                _user_name = getattr(user, "name", None)
+                                _label = f"{_user_name} DM" if _user_name else None
                                 outbox_log.append(
                                     channel_type="discord_dm",
                                     recipient=str(owner_id),
+                                    recipient_label=_label,
                                     body=clean_text,
                                     task_id=f.stem,
                                 )
@@ -3398,9 +3463,12 @@ async def poll_dm_fallback():
                                     await target_channel.send(chunk)
                                 try:
                                     import outbox_log
+                                    _ch_name = getattr(target_channel, "name", None)
+                                    _label = f"#{_ch_name}" if _ch_name else None
                                     outbox_log.append(
                                         channel_type="discord_channel",
                                         recipient=str(target_channel_id),
+                                        recipient_label=_label,
                                         body=text_only,
                                         task_id=_task_id,
                                     )
