@@ -226,14 +226,6 @@ else
   echo "  ✓ agent API (already running)"
 fi
 
-# Obsidian sync is a one-shot CLI (no background process). To wire it up:
-#   - Set SUTANDO_OBSIDIAN_MIRROR=1 in .env to opt in.
-#   - Add a `python3 src/obsidian-mirror.py` entry to your crons.json at
-#     whatever cadence you want (or run on-demand).
-#   - The `run_dream` voice tool calls dream.py with --force; dream.py
-#     itself calls obsidian-mirror.py --force first so the vault is
-#     up-to-date before judging.
-
 # 5. Screen capture server (port 7845)
 # Skip when Screen Recording perm is missing — otherwise we'd start a server
 # that returns black-PNG denials, which is exactly the stale-7845 state the
