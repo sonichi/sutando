@@ -974,15 +974,14 @@ function assertUniqueToolNames(tools: ToolDefinition[]): ToolDefinition[] {
 // owner-tier tools only when the caller is the verified owner. Manifest
 // access_tier values: "owner" (default if omitted) | "any_caller".
 async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyCaller: ToolDefinition[] }> {
-	// Scan the public-repo `skills/` dir AND the optional private skills dir
+	// Scan the public-repo `skills/` dir, the per-user workspace
+	// `$SUTANDO_WORKSPACE/skills/`, AND the optional private skills dir
 	// pointed to by `$SUTANDO_MEMORY_DIR/skills/` (legacy `$SUTANDO_PRIVATE_DIR`
 	// honored via memoryDirEnv(); e.g. `~/.sutando/memory-sync/skills/`). The
 	// private dir lets users keep personal tooling with real per-file git
-	// history outside the public repo. Order: public first, then private —
-	// same-name skills loaded from private take precedence (last one wins via
-	// the dup-name guard below if any; in practice they should be uniquely
-	// named).
-	const dirsToScan: string[] = [join(REPO_ROOT, 'skills')];
+	// history outside the public repo. Order: public first, then workspace,
+	// then private — last-write-wins for same-name skills.
+	const dirsToScan: string[] = [join(REPO_ROOT, 'skills'), join(WORKSPACE_DIR, 'skills')];
 	const privateRoot = memoryDirEnv();
 	if (privateRoot) {
 		const expanded = privateRoot.replace(/^~/, process.env.HOME || '');
@@ -1046,7 +1045,7 @@ const personalAllTools = [...personalTools.owner, ...personalTools.anyCaller];
 // a tools.ts. Don't try to align them — they're correctly sync/async for
 // what each one does.
 function loadCoreDocumentedSkills(): { name: string; description: string }[] {
-	const dirsToScan: string[] = [join(REPO_ROOT, 'skills')];
+	const dirsToScan: string[] = [join(REPO_ROOT, 'skills'), join(WORKSPACE_DIR, 'skills')];
 	const privateRoot = memoryDirEnv();
 	if (privateRoot) {
 		const expanded = privateRoot.replace(/^~/, process.env.HOME || '');
