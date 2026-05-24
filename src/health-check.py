@@ -31,7 +31,6 @@ REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 from util_paths import shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
-from event_log import log_event  # noqa: E402
 
 # Workspace = runtime-state root (tasks/, results/, state/). REPO_DIR stays the
 # source-code root (src/, skills/, logs/, .env, build_log.md). Before PR #762's
@@ -860,13 +859,12 @@ def run_all_checks() -> list[dict]:
         if not env_file.exists() and not access_file.exists():
             continue
         try:
-            # Match `<proc_name>.py` anywhere in the command line, including
-            # when followed by CLI flags (e.g. `discord-bridge.py --check-new`).
-            # Removing the `$` anchor catches processes started with unsupported
-            # flags — those run as full bridge instances and cause duplicate
-            # message delivery (discovered 2026-05-27: 7 zombie bridges from
-            # proactive-loop Discord monitoring invocations).
-            result = subprocess.run(["/usr/bin/pgrep", "-f", f"{proc_name}\\.py"], capture_output=True, text=True)
+            # Anchor on the .py suffix so we don't match unrelated processes
+            # whose command line happens to contain "discord-bridge" (shell
+            # invocations, ps/grep pipelines, etc). Otherwise pgrep -f bare
+            # name produces false-positive "multiple processes" warnings
+            # that scared us into thinking the bridges were zombied today.
+            result = subprocess.run(["/usr/bin/pgrep", "-f", f"{proc_name}\\.py$"], capture_output=True, text=True)
             pids = result.stdout.strip().split("\n") if result.returncode == 0 else []
             pids = [p for p in pids if p]
         except:
@@ -981,10 +979,9 @@ def run_all_checks() -> list[dict]:
     # time the discord-bridge / owner triggers a voice session.
     checks.append(check_discord_voice())
 
-
-    # Sutando menu bar app — check either dev-built binary or installed .app.
-    # On the distributed .app path the dev binary doesn't ship; we still want
-    # the menu bar check to run so dashboard reports accurate status.
+    # Sutando menu bar app — dev-built binary OR installed .app. The fork
+    # ships as a signed .app, so on a real install only app_bin exists;
+    # dev clones have dev_bin. Check whichever is present.
     dev_bin = REPO_DIR / "src" / "Sutando" / "Sutando"
     app_bin = Path("/Applications/Sutando.app/Contents/MacOS/Sutando")
     if dev_bin.exists() or app_bin.exists():
@@ -1000,7 +997,7 @@ def run_all_checks() -> list[dict]:
         pids: list[str] = []
         try:
             result = subprocess.run(
-                ["/usr/bin/pgrep", "-f", "(Sutando|MacOS)/Sutando"],
+                ["/usr/bin/pgrep", "-f", "Sutando/Sutando"],
                 capture_output=True, text=True, timeout=5,
             )
             if result.returncode == 0:
@@ -1018,16 +1015,12 @@ def run_all_checks() -> list[dict]:
 
         if pgrep_status == "ok-running" and pids:
             check = {"name": "sutando-app", "status": "ok", "detail": f"running (⌃C/⌃V/⌃M)"}
-            # Staleness check is meaningful only in the dev workflow — the
-            # .app binary and bundled main.swift share a build mtime, so a
-            # comparison there is always equal. Skip when dev_bin missing.
-            if dev_bin.exists():
-                mark_stale_if_outdated(
-                    check,
-                    REPO_DIR / "src" / "Sutando" / "main.swift",
-                    "(Sutando|MacOS)/Sutando",
-                    binary_path=dev_bin,
-                )
+            mark_stale_if_outdated(
+                check,
+                REPO_DIR / "src" / "Sutando" / "main.swift",
+                "src/Sutando/Sutando",
+                binary_path=REPO_DIR / "src" / "Sutando" / "Sutando",
+            )
             checks.append(check)
         elif pgrep_status == "ok-stopped":
             checks.append({"name": "sutando-app", "status": "warn", "detail": "not running — hotkeys disabled"})
@@ -1230,32 +1223,6 @@ def notify_for_failures(
         pass
 
 
-def _emit_health_transition_events(checks: list) -> None:
-    """Emit health.degraded / health.recovered by diffing against the previous run.
-
-    State persisted in state/health-last-status.json as {check_name: status}.
-    Best-effort — any I/O failure is silently swallowed so the caller always proceeds.
-    """
-    state_file = WORKSPACE_DIR / "state" / "health-last-status.json"
-    try:
-        prev: dict = json.loads(state_file.read_text()) if state_file.exists() else {}
-    except Exception:
-        prev = {}
-    cur = {c["name"]: c["status"] for c in checks}
-    for name, status in cur.items():
-        was = prev.get(name)
-        ok_statuses = ("ok", "warn")
-        if status not in ok_statuses and (was is None or was in ok_statuses):
-            log_event("health.degraded", check=name, status=status)
-        elif status in ok_statuses and was is not None and was not in ok_statuses:
-            log_event("health.recovered", check=name, status=status, prev_status=was)
-    try:
-        state_file.parent.mkdir(parents=True, exist_ok=True)
-        state_file.write_text(json.dumps(cur))
-    except Exception:
-        pass
-
-
 def main():
     as_json = "--json" in sys.argv
     do_fix = "--fix" in sys.argv
@@ -1265,9 +1232,6 @@ def main():
 
     checks = run_all_checks()
     issues = [c for c in checks if c["status"] not in ("ok", "warn")]
-
-    # Emit health.degraded / health.recovered events by diffing against last run.
-    _emit_health_transition_events(checks)
 
     # Optional: macOS notification surface for the launchd-supervised path
     # (com.sutando.health-check-fallback). Notifies on the INITIAL check set
@@ -1369,35 +1333,19 @@ def main():
                                      stderr=subprocess.STDOUT, start_new_session=True)
                     print(f"  {c['name']}: {'restarted (stale code)' if c['status'] == 'stale' else 'restarted'}")
                 elif c["name"] == "sutando-app":
-                    # Two distinct failure modes:
-                    #   1. status="warn" + detail="not running …" → binary may
-                    #      already be fresh; just needs to be launched. Safe
-                    #      to auto-fix via `open` (singleton enforcement is
-                    #      not at risk because no PID exists yet).
-                    #   2. status="stale" → main.swift is newer than the
-                    #      running binary's process start time. Real fix
-                    #      needs pkill + swiftc rebuild + open; an earlier
-                    #      auto-fix path leaked duplicate instances (macOS
-                    #      doesn't enforce singleton on this bundle —
-                    #      observed 3 concurrent on 2026-04-19), so we
-                    #      defer that path to a manual rebuild + relaunch.
-                    binary = REPO_DIR / "src" / "Sutando" / "Sutando"
-                    source = REPO_DIR / "src" / "Sutando" / "main.swift"
-                    if (
-                        c.get("status") == "warn"
-                        and "not running" in (c.get("detail") or "")
-                        and binary.exists()
-                        and source.exists()
-                        and binary.stat().st_mtime >= source.stat().st_mtime
-                    ):
-                        try:
-                            subprocess.run(["/usr/bin/open", str(binary)],
-                                           check=True, timeout=5)
-                            print(f"  {c['name']}: launched (binary fresh, no rebuild needed)")
-                        except Exception as e:
-                            print(f"  {c['name']}: launch failed ({type(e).__name__}: {e}) — try `open {binary}` manually")
-                    else:
-                        print(f"  {c['name']}: not auto-fixed — needs manual rebuild + relaunch (see memory feedback_sutando_app_launch_method.md)")
+                    # Stale here means main.swift is newer than the binary's
+                    # process start time. The bare Popen below was leaking
+                    # duplicates (macOS doesn't enforce singleton on this
+                    # bundle — observed 3 concurrent on 2026-04-19) AND it
+                    # was relaunching the same stale binary, so the stale
+                    # signal kept re-firing every cron pass.
+                    #
+                    # Real fix needs (a) pkill the existing PID, (b) swiftc
+                    # rebuild if source > binary, (c) `open src/Sutando/Sutando`.
+                    # Until that lands, surface the warning instead of
+                    # pretending we fixed it. Chi rebuilds + relaunches
+                    # manually per feedback_sutando_app_launch_method.md.
+                    print(f"  {c['name']}: not auto-fixed — needs manual rebuild + relaunch (see memory feedback_sutando_app_launch_method.md)")
                 elif c["name"] == "ngrok":
                     # Read ngrok domain from .env if set, otherwise use default
                     env_path = REPO_DIR / ".env"
