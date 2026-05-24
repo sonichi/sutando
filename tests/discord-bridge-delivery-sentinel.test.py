@@ -1,47 +1,18 @@
 #!/usr/bin/env python3
-"""Regression guard for restart-safety #3: result-delivery idempotency
-sentinel.
+"""Regression guard for restart-safety #3: result-delivery idempotency sentinel.
 
-## The bug
+If the bridge crashes between channel.send() returning and archive_file()
+finishing, on restart the result file is still on disk and gets re-sent —
+duplicate delivery. The fix: touch a sentinel after send, check it before
+send on restart, clear it after archive.
 
-In `poll_results`, the bridge:
-
-  1. Pops `task_id` from `pending_replies`
-  2. Calls `channel.send(reply_text)` (Discord API)
-  3. Calls `archive_file(result_file, ...)`
-
-If the bridge crashes between step 2 (send returned success) and
-step 3 (archive completes), the result file is still on disk at
-`results/{task_id}.txt`. On restart, `poll_results` re-iterates,
-finds the result file, and re-sends — producing a duplicate
-delivery to the owner.
-
-## The fix
-
-`<DELIVERED_DIR>/<task_id>.sentinel` files mark "send returned
-success but archive not yet complete":
-
-  - Right BEFORE the per-task send block, `_is_delivered(task_id)`
-    checks the sentinel. If present, skip the send, run the archive,
-    clear the sentinel.
-  - Right AFTER `channel.send` succeeds, `_mark_delivered(task_id)`
-    touches the sentinel.
-  - After archive completes, `_clear_delivered(task_id)` removes
-    the sentinel (so the dir doesn't accumulate forever).
-
-The remaining narrow window — crash between send-success and
-sentinel-touch — produces at most one duplicate on restart. Nonce-
-based dedup via Discord's `nonce` parameter would close that
-tighter; deferred to follow-up.
-
-## What this test covers
-
-The sentinel storage (touch / check / clear) is pure file I/O and
-fully testable. The poll_results wiring is asserted via source-grep.
+Run: python3 tests/discord-bridge-delivery-sentinel.test.py
+Exit: 0 on pass, non-zero on fail.
 """
 
 import importlib.util
 import os
+import re
 import sys
 import tempfile
 import types
@@ -74,14 +45,12 @@ bridge = _load("discord_bridge", REPO / "src" / "discord-bridge.py")
 
 
 def _clear_sentinels():
-    """Remove any sentinels left from a previous test."""
     if bridge.DELIVERED_DIR.exists():
         for p in bridge.DELIVERED_DIR.iterdir():
             p.unlink()
 
 
 def test_is_delivered_false_when_no_sentinel():
-    """Default: no sentinel → False. Bridge sends normally."""
     _clear_sentinels()
     assert bridge._is_delivered("task-123") is False
 
@@ -102,8 +71,6 @@ def test_clear_delivered_removes_sentinel():
 
 
 def test_mark_creates_directory_if_missing():
-    """Defensive: DELIVERED_DIR may not exist on first-ever run.
-    `_mark_delivered` must mkdir(parents=True) before touching."""
     import shutil
     if bridge.DELIVERED_DIR.exists():
         shutil.rmtree(bridge.DELIVERED_DIR)
@@ -113,17 +80,12 @@ def test_mark_creates_directory_if_missing():
 
 
 def test_clear_idempotent():
-    """Clearing a non-existent sentinel is a no-op, not an error."""
     _clear_sentinels()
-    # Should not raise even though sentinel doesn't exist
     bridge._clear_delivered("task-never-existed")
     assert bridge._is_delivered("task-never-existed") is False
 
 
 def test_separate_tasks_independent():
-    """Sentinels are per-task; one task's sentinel doesn't affect
-    another. Critical for the case where multiple results are pending
-    and only one was crashed-during-send."""
     _clear_sentinels()
     bridge._mark_delivered("task-A")
     assert bridge._is_delivered("task-A") is True
@@ -135,16 +97,6 @@ def test_separate_tasks_independent():
 
 
 def test_poll_results_checks_sentinel_before_main_send():
-    """Architectural source-grep: the sentinel check must come BEFORE
-    the first `channel.send` call in poll_results. Pin via textual
-    position so a refactor that re-orders these (e.g. moves the
-    delivered check into the try-block AFTER send) fails loudly.
-
-    Note: poll_results has multiple `try:` blocks (heartbeat retry,
-    channel resolution, send, file-send) — we don't pin against a
-    specific `try:` line; we pin the sentinel check is BEFORE the
-    first send call."""
-    import re
     src = (REPO / "src" / "discord-bridge.py").read_text()
     poll_block = re.search(
         r"async def poll_results\(\):(.*?)(?=^async def )",
@@ -153,27 +105,16 @@ def test_poll_results_checks_sentinel_before_main_send():
     assert poll_block, "could not locate poll_results"
     body = poll_block.group(1)
     delivered_pos = body.find("_is_delivered(task_id)")
-    # Find the first channel.send AFTER the skip-block. The skip-block
-    # has `archive_file(result_file, "results", task_id)` followed by
-    # `continue`, then the sentinel check, then the try-block with
-    # the send. The first `await channel.send(` should be after both.
     skip_continue_pos = body.find("Skipped (already replied or deduped)")
     first_send_pos = body.find("await channel.send(", skip_continue_pos)
     assert delivered_pos > 0, "_is_delivered NOT called in poll_results"
     assert first_send_pos > 0, "could not locate post-skip channel.send"
     assert delivered_pos < first_send_pos, (
-        "_is_delivered check must come BEFORE the first channel.send — "
-        "otherwise the send fires before the sentinel is checked, "
-        "defeating the fix."
+        "_is_delivered check must come BEFORE the first channel.send"
     )
 
 
 def test_poll_results_marks_delivered_in_send_block():
-    """Architectural: `_mark_delivered` must be called inside the
-    main try-block (after channel.send succeeded). Pin that it
-    appears AFTER the first send call (so it's marking a real
-    delivery, not a pre-send phantom)."""
-    import re
     src = (REPO / "src" / "discord-bridge.py").read_text()
     poll_block = re.search(
         r"async def poll_results\(\):(.*?)(?=^async def )",
@@ -187,18 +128,11 @@ def test_poll_results_marks_delivered_in_send_block():
     assert mark_pos > 0, "_mark_delivered NOT called in poll_results"
     assert first_send_pos > 0
     assert mark_pos > first_send_pos, (
-        "_mark_delivered must be called AFTER the first channel.send "
-        "(post-success) — otherwise a crash between mark and send "
-        "marks a delivery that never happened, silently dropping the "
-        "message on restart."
+        "_mark_delivered must be called AFTER the first channel.send"
     )
 
 
 def test_poll_results_clears_sentinel_after_archive():
-    """Architectural: `_clear_delivered` must be called AFTER both
-    archive_file calls. Without it, sentinels accumulate forever in
-    `state/discord-delivered/`."""
-    import re
     src = (REPO / "src" / "discord-bridge.py").read_text()
     poll_block = re.search(
         r"async def poll_results\(\):(.*?)(?=^async def )",
@@ -228,11 +162,9 @@ def main():
             print(f"  ✓ {fn.__name__}")
         except AssertionError as e:
             failures.append(f"{fn.__name__}: {e}")
-            print(f"  ✗ {fn.__name__}")
+            print(f"  ✗ {fn.__name__}: {e}")
     if failures:
-        print("\nFailures:")
-        for f in failures:
-            print(f"  {f}")
+        print(f"\n{len(failures)} failure(s).")
         sys.exit(1)
     print("All delivery-sentinel tests passed.")
 

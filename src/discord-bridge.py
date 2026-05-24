@@ -109,7 +109,7 @@ SEND_ALLOWED_PREFIXES = (
 )
 
 
-from discord_chunker import _chunk_for_discord, _is_fence_open_line  # noqa: E402
+_FENCE_LINE = re.compile(r"^\s{0,3}(`{3,}|~{3,})\s*([^\s`~][^`~]*)?\s*$")
 
 # Discord-state references in task bodies that codex sandbox cannot resolve.
 # When a team/other-tier task asks the agent to look at a specific channel
@@ -141,6 +141,133 @@ def _extract_user_id_mentions(mention_strs):
         if m:
             out.append(int(m.group(1)))
     return out
+
+
+def _is_fence_open_line(line: str):
+    """Return the fence opener string if `line` is a real Markdown block-fence line.
+
+    A fence line is one whose stripped content is just a backtick/tilde run of >=3
+    optionally followed by a language/info string. Lines like `print("```")`,
+    shell heredocs, or `use ```js inline` do NOT match — they have non-fence
+    content before the fence chars on the same line.
+
+    Returns the full fence opener (e.g. "```python", "~~~", "````markdown")
+    so the chunker can reopen the SAME opener after a chunk boundary, preserving
+    the language tag and the fence-token kind/length.
+
+    Returns None if the line is not a fence line.
+    """
+    m = _FENCE_LINE.match(line)
+    if not m:
+        return None
+    return line.strip()
+
+
+def _chunk_for_discord(text: str, max_len: int = 1900):
+    """Yield Discord-safe chunks <= max_len chars, preserving Markdown code fences.
+
+    The naive `range(0, len, max_len)` chunker breaks code blocks: if a fence
+    opens before the chunk boundary and closes after, the first chunk renders as
+    a half-open code block on Discord and the second chunk leaks the literal
+    trailing backticks as plain text.
+
+    This chunker walks line-by-line, tracks fence state (the exact opener string
+    when inside a fence; None when outside). When a new line would push the
+    buffer past max_len, it closes the current fence (if open) with a matching
+    closer, yields the buffer, and reopens the SAME opener in the next chunk —
+    preserving language tags and fence-token length.
+
+    Fence detection only matches real block-fence lines (regex-anchored). Inline
+    backticks in code or prose (`print("```")`, `use ```js`) do NOT toggle state.
+
+    Single-line content longer than max_len is hard-split mid-line; fence state
+    is preserved across the split.
+    """
+    if not text:
+        return
+    fence_opener = None  # full opener string when inside a fence; None when outside
+    buf = []
+    buf_len = 0
+
+    def fence_closer(opener):
+        # Match the fence-token kind (` or ~) and use 3 of them. Discord's
+        # parser closes on >=3 matching chars, so a 3-char closer suffices
+        # even if opener was 4+ chars (the literal opener length doesn't have
+        # to match for closure, only the char kind).
+        return opener[0] * 3 if opener else "```"
+
+    def flush():
+        nonlocal buf, buf_len
+        if not buf:
+            return None
+        chunk = "\n".join(buf)
+        # If we're mid-fence at chunk boundary, close it so Discord renders cleanly
+        if fence_opener:
+            chunk = chunk + "\n" + fence_closer(fence_opener)
+        buf = []
+        buf_len = 0
+        return chunk
+
+    for line in text.split("\n"):
+        # Real fence-line detection (only at start of stripped line, not anywhere)
+        opener_on_line = _is_fence_open_line(line)
+        # If we're outside a fence and this line is a fence-open, treat as opening.
+        # If we're inside a fence and this line matches the fence-token kind,
+        # treat as closing (we don't require exact length match for close).
+
+        line_overhead = len(line) + 1  # +1 for newline
+        # Reserve space for closing fence if we'd cut mid-fence
+        reserve = (len(fence_closer(fence_opener)) + 1) if fence_opener else 0
+
+        if buf_len + line_overhead + reserve > max_len and buf:
+            chunk = flush()
+            if chunk is not None:
+                yield chunk
+            # Reopen fence in next chunk if we were inside one
+            if fence_opener:
+                buf.append(fence_opener)
+                buf_len = len(fence_opener) + 1
+
+        # Single line longer than max_len → hard-split
+        if line_overhead + reserve > max_len:
+            remaining = line
+            while len(remaining) + reserve > max_len:
+                take = max_len - reserve - buf_len - 1
+                if take <= 0:
+                    chunk = flush()
+                    if chunk is not None:
+                        yield chunk
+                    if fence_opener:
+                        buf.append(fence_opener)
+                        buf_len = len(fence_opener) + 1
+                    take = max_len - reserve - buf_len - 1
+                buf.append(remaining[:take])
+                buf_len += take + 1
+                remaining = remaining[take:]
+                chunk = flush()
+                if chunk is not None:
+                    yield chunk
+                if fence_opener:
+                    buf.append(fence_opener)
+                    buf_len = len(fence_opener) + 1
+            buf.append(remaining)
+            buf_len += len(remaining) + 1
+        else:
+            buf.append(line)
+            buf_len += line_overhead
+
+        # Update fence state AFTER placing the line (the line itself is intact)
+        if opener_on_line is not None:
+            if fence_opener is None:
+                fence_opener = opener_on_line
+            else:
+                # Fence-line at this position closes the active fence
+                # (Discord/CommonMark allows any close-fence of the same kind to close)
+                fence_opener = None
+
+    chunk = flush()
+    if chunk is not None:
+        yield chunk
 
 
 # Marker regex for inline file references in result bodies. The pattern
@@ -273,6 +400,37 @@ INBOX_DIR = Path("/tmp/discord-inbox")
 TASKS_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 INBOX_DIR.mkdir(exist_ok=True)
+
+
+def _safe_attachment_basename(filename: str) -> str:
+    """Sanitize a Discord attachment filename for safe filesystem +
+    downstream-shell use.
+
+    Discord allows arbitrary filenames (incl. spaces, quotes, semicolons,
+    backticks, `$`, `..`) and the bridge previously saved them verbatim
+    via ``INBOX_DIR / f"{ts}_{att.filename}"``. Several downstream sites
+    glob `/tmp/discord-inbox/*` and embed the resulting path in a shell
+    command (e.g. ``skills/phone-conversation/scripts/conversation-server.ts``
+    fast path: ``execSync(\\`bash .../prepend-image.sh "${image}" ...\\`)``).
+    A filename like ``x"; touch /tmp/pwn; #.jpg`` would close the quoted
+    shell argument and execute attacker-supplied commands.
+
+    Mirrors the ``_safe_id`` shape from ``src/agent-api.py``: keep
+    alphanumerics + ``._-``; replace everything else with ``_``. Also
+    strips path-traversal (``..``) and caps length to bound DoS via
+    multi-kilobyte filenames. Preserves the extension when present so
+    glob patterns like ``*.jpg`` keep matching legitimate uploads.
+    """
+    name = filename or "file"
+    dot = name.rfind(".")
+    if dot > 0 and dot >= len(name) - 9:
+        base, ext = name[:dot], name[dot + 1:]
+    else:
+        base, ext = name, ""
+    safe_base = re.sub(r"[^a-zA-Z0-9_\-.]", "_", base).strip("._") or "file"
+    safe_ext = re.sub(r"[^a-zA-Z0-9]", "", ext)[:8]
+    safe_base = safe_base[:80]
+    return f"{safe_base}.{safe_ext}" if safe_ext else safe_base
 
 # Presenter mode: when scripts/presenter-mode.sh is active, the bridge
 # must not send proactive DMs to the owner. The sentinel contains an
@@ -1884,10 +2042,6 @@ def _recover_orphan_sending_files() -> int:
             continue
         target = f.with_suffix(".txt")
         try:
-            # Don't clobber a same-named .txt that somehow re-appeared
-            # (e.g. an operator manually re-dropped the file). The
-            # atomic-claim invariant guarantees they don't normally
-            # coexist, but be defensive on startup.
             if target.exists():
                 print(
                     f"  [startup] skipping orphan recovery: {target.name} "
@@ -1899,7 +2053,6 @@ def _recover_orphan_sending_files() -> int:
             recovered += 1
             print(f"  [startup] recovered orphan {f.name} → {target.name}", flush=True)
         except FileNotFoundError:
-            # Lost the race to another process; that's fine.
             pass
         except Exception as e:
             print(f"  [startup] failed to recover {f.name}: {e}", flush=True)
@@ -1914,6 +2067,11 @@ async def on_ready():
     # Restart-safety: sweep orphan `.sending` files before the poll
     # loops start. See _recover_orphan_sending_files for rationale.
     _recover_orphan_sending_files()
+    # Restart-safety: REST-catch-up missed DMs from the disconnect
+    # window. Discord gateway IDENTIFY (post-RESUME-expiry reconnect)
+    # does NOT replay `MESSAGE_CREATE` events that arrived during the
+    # gap. See `_catchup_missed_dms` for the replay flow.
+    client.loop.create_task(_catchup_missed_dms())
     # Start polling loops
     client.loop.create_task(poll_results())
     client.loop.create_task(poll_approved())
@@ -1996,6 +2154,18 @@ async def _handle_discord_message(message, force=False):
     text = message.content or ""
     is_dm = isinstance(message.channel, discord.DMChannel)
     channel_name = getattr(message.channel, 'name', 'DM')
+
+    # Advance the DM checkpoint immediately for any DM we observe —
+    # whether or not we end up processing it as an owner task. The
+    # checkpoint's purpose is "REST-catch-up should not re-replay this
+    # ID on the next reconnect"; recording it now (before downstream
+    # filters drop the message) avoids the catch-up loop replaying
+    # the same out-of-allowlist / out-of-tier message forever.
+    if is_dm and hasattr(message, "id"):
+        try:
+            _update_dm_checkpoint(message.channel.id, message.id)
+        except Exception as e:
+            print(f"  [dm-checkpoint] update failed: {e}", flush=True)
 
     print(f"  [msg] #{channel_name} @{username}: {text[:80]} (mentions: {[str(m) for m in message.mentions]}, is_dm: {is_dm}, embeds: {len(message.embeds)}, type: {message.type}, ref: {message.reference is not None})", flush=True)
     # Debug: log message snapshots for forwarded messages
@@ -2227,7 +2397,10 @@ async def _handle_discord_message(message, force=False):
                 if embed.description: parts.append(embed.description)
             # Download snapshot attachments (forwarded images/files)
             for att in getattr(snap_msg, 'attachments', []):
-                local_path = INBOX_DIR / f"{int(time.time()*1000)}_{att.filename}"
+                # Sanitize filename — Discord lets users upload arbitrary
+                # names; raw interpolation into a downstream shell command
+                # is the RCE class closed by this PR.
+                local_path = INBOX_DIR / f"{int(time.time()*1000)}_{_safe_attachment_basename(att.filename)}"
                 try:
                     await att.save(local_path)
                     parts.append(f"[File attached: {local_path}]")
@@ -2280,7 +2453,10 @@ async def _handle_discord_message(message, force=False):
     # Handle attachments
     attachment_note = ""
     for att in message.attachments:
-        local_path = INBOX_DIR / f"{int(time.time()*1000)}_{att.filename}"
+        # Sanitize filename — see _safe_attachment_basename docstring for
+        # the RCE class this closes (downstream shell interpolation of
+        # the saved path in conversation-server.ts fast path).
+        local_path = INBOX_DIR / f"{int(time.time()*1000)}_{_safe_attachment_basename(att.filename)}"
         try:
             await att.save(local_path)
             attachment_note += f"\n[File attached: {local_path}]"
@@ -2572,12 +2748,22 @@ async def _handle_discord_message(message, force=False):
                 print(f"  [auto-react] {react_emoji} failed: {e}", flush=True)
 
     priority = default_priority_for_source("discord", access_tier)
+    # channel_name / guild_name: human-readable labels so the task-consumer can
+    # disambiguate one team channel from another without grepping numeric IDs
+    # against a memory file. DM channels have no `.name` attr; DMs have no
+    # guild. Default to "DM" for both. Newline-sanitize so a Discord name
+    # containing \n (rare but possible) can't inject a spurious metadata
+    # line into the task file's k:v shape (per qingyun review on #1077).
+    channel_name = (getattr(message.channel, "name", None) or "DM").replace("\n", " ")
+    guild_name = (message.guild.name if message.guild else "DM").replace("\n", " ")
     task_file.write_text(
         f"id: {task_id}\n"
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
         f"task: {user_task_text}\n"
         f"source: discord\n"
         f"channel_id: {message.channel.id}\n"
+        f"channel_name: {channel_name}\n"
+        f"guild_name: {guild_name}\n"
         f"source_message_id: {message.id}\n"
         f"user_id: {message.author.id}\n"
         f"access_tier: {access_tier}\n"
@@ -2743,12 +2929,7 @@ async def _catchup_missed_dms():
 #   3. After archive completes, `_clear_delivered(task_id)` removes
 #      the sentinel (bounded dir growth).
 #
-# The crash-between-send-and-sentinel window remains a narrow
-# double-send vector (Discord nonce-based dedup would close that
-# tighter; deferred to follow-up).
-#
-# Scope of THIS PR: poll_results main-path only. Channel-redirect,
-# proactive, and dm-fallback paths are scoped follow-ups.
+# Scope of THIS change: poll_results main-path only.
 DELIVERED_DIR = REPO / "state" / "discord-delivered"
 
 
