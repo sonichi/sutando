@@ -2701,12 +2701,22 @@ async def _handle_discord_message(message, force=False):
                 print(f"  [auto-react] {react_emoji} failed: {e}", flush=True)
 
     priority = default_priority_for_source("discord", access_tier)
+    # channel_name / guild_name: human-readable labels so the task-consumer can
+    # disambiguate one team channel from another without grepping numeric IDs
+    # against a memory file. DM channels have no `.name` attr; DMs have no
+    # guild. Default to "DM" for both. Newline-sanitize so a Discord name
+    # containing \n (rare but possible) can't inject a spurious metadata
+    # line into the task file's k:v shape (per qingyun review on #1077).
+    channel_name = (getattr(message.channel, "name", None) or "DM").replace("\n", " ")
+    guild_name = (message.guild.name if message.guild else "DM").replace("\n", " ")
     task_file.write_text(
         f"id: {task_id}\n"
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
         f"task: {user_task_text}\n"
         f"source: discord\n"
         f"channel_id: {message.channel.id}\n"
+        f"channel_name: {channel_name}\n"
+        f"guild_name: {guild_name}\n"
         f"source_message_id: {message.id}\n"
         f"user_id: {message.author.id}\n"
         f"access_tier: {access_tier}\n"
