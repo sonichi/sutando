@@ -31,19 +31,22 @@
 # command string are detected per-hook and not re-added.  jq + tmp+mv for
 # atomic write.
 #
+# Deprecated hooks: this script ALSO removes hooks listed in
+# `DEPRECATED_HOOKS` (substring match on the command).  Re-running the
+# installer is now a full migration tool — existing installs of an old
+# hook get auto-uninstalled on next run.  See #1083 follow-up for the
+# motivation: the watcher-kill Stop hook from #1065 stayed in everyone's
+# settings.json after #1083 dropped it from `HOOKS=(...)` because the
+# original installer was add-only.  Re-running this version of the
+# installer removes the deprecated entry without manual jq.
+#
 # Usage:
 #   bash src/install-claude-hooks.sh
 #
 # Exit codes:
-#   0 — all 3 hooks present after run (some may have been pre-existing)
+#   0 — all current hooks present + all deprecated removed after run
 #   1 — settings.json malformed / jq edit failed
 #   2 — jq missing (required for atomic edit)
-#
-# Existing installs: this script is install-only, not uninstall.  If your
-# settings.json already has the watcher-kill Stop hook from a previous
-# install, remove it manually:
-#   jq 'del(.hooks.Stop[0].hooks[] | select(.command | contains("watch-tasks-stream.pid")))' \
-#     .claude/settings.json > /tmp/s.json && mv /tmp/s.json .claude/settings.json
 
 set -u
 
@@ -55,6 +58,18 @@ HOOKS=(
   "PreCompact|cp \"\$TRANSCRIPT_PATH\" \"\$HOME/Desktop/sutando-conversations/\$(date +%Y-%m-%dT%H-%M-%S).jsonl\""
   "PreCompact|bash \$HOME/Desktop/sutando/src/session-handoff.sh \"\$TRANSCRIPT_PATH\""
   "Stop|bash \$HOME/Desktop/sutando/src/check-pending-tasks.sh"
+)
+
+# Deprecated hooks to uninstall on re-run.  Each line: "<event>|<substring>".
+# Matching uses `.command | contains(substring)` so we don't need to track
+# the exact command string an old installer wrote — just a stable token.
+# Add new entries here when removing a hook from `HOOKS=()`; entries can
+# be removed once you're confident the fleet has migrated (months later).
+DEPRECATED_HOOKS=(
+  # #1065 watcher-kill Stop hook — dropped from HOOKS by #1083 (turn-end
+  # firing killed the live Monitor watcher every turn). Cleanup-by-re-run
+  # added in #1083 follow-up.
+  "Stop|watch-tasks-stream.pid"
 )
 
 if ! command -v jq >/dev/null 2>&1; then
@@ -69,7 +84,9 @@ fi
 
 ADDED=0
 SKIPPED=0
+REMOVED=0
 
+# Phase 1: install missing current hooks.
 for entry in "${HOOKS[@]}"; do
   EVENT="${entry%%|*}"
   CMD="${entry#*|}"
@@ -93,4 +110,34 @@ for entry in "${HOOKS[@]}"; do
   ADDED=$((ADDED + 1))
 done
 
-echo "install-claude-hooks: added=$ADDED skipped=$SKIPPED → $SETTINGS"
+# Phase 2: uninstall deprecated hooks (substring match).
+# This walks every hooks group under the event, filters out any command
+# containing the substring, then rewrites the group.  Doing it per-event
+# (vs deleting the whole event key) preserves any sibling hooks the
+# operator may have added manually that aren't in our HOOKS list.
+for entry in "${DEPRECATED_HOOKS[@]}"; do
+  EVENT="${entry%%|*}"
+  SUBSTR="${entry#*|}"
+
+  # Skip if no match present — keeps re-runs silent on already-migrated installs.
+  if ! jq -e --arg event "$EVENT" --arg sub "$SUBSTR" \
+      '(.hooks // {})[$event] // [] | map(.hooks // []) | flatten | map(.command) | map(contains($sub)) | any' \
+      "$SETTINGS" >/dev/null 2>&1; then
+    continue
+  fi
+
+  TMP="$(mktemp "${SETTINGS}.XXXXXX")"
+  jq --arg event "$EVENT" --arg sub "$SUBSTR" '
+    if (.hooks // {})[$event] then
+      .hooks[$event] |= map(
+        .hooks |= map(select((.command // "") | contains($sub) | not))
+      )
+      # Drop now-empty groups so the structure stays tidy.
+      | .hooks[$event] |= map(select((.hooks // []) | length > 0))
+    else . end
+  ' "$SETTINGS" > "$TMP" || { echo "error: jq remove failed on $EVENT/$SUBSTR" >&2; rm -f "$TMP"; exit 1; }
+  mv "$TMP" "$SETTINGS"
+  REMOVED=$((REMOVED + 1))
+done
+
+echo "install-claude-hooks: added=$ADDED skipped=$SKIPPED removed=$REMOVED → $SETTINGS"
