@@ -3319,9 +3319,18 @@ async def poll_results():
                         try:
                             import outbox_log
                             ch_type = "discord_dm" if isinstance(channel, discord.DMChannel) else "discord_channel"
+                            # Human-readable label for audit: "#dev", "Chi DM",
+                            # or "DM" when the recipient name isn't available.
+                            if isinstance(channel, discord.DMChannel):
+                                _recipient = getattr(channel.recipient, "name", None)
+                                _label = f"{_recipient} DM" if _recipient else "DM"
+                            else:
+                                _ch_name = getattr(channel, "name", None)
+                                _label = f"#{_ch_name}" if _ch_name else None
                             outbox_log.append(
                                 channel_type=ch_type,
                                 recipient=str(channel.id),
+                                recipient_label=_label,
                                 body=clean_text,
                                 task_id=task_id,
                             )
@@ -3481,9 +3490,12 @@ async def poll_proactive():
                                 await dm.send(chunk)
                             try:
                                 import outbox_log
+                                _user_name = getattr(user, "name", None)
+                                _label = f"{_user_name} DM" if _user_name else None
                                 outbox_log.append(
                                     channel_type="discord_dm",
                                     recipient=str(owner_id),
+                                    recipient_label=_label,
                                     body=clean_text,
                                     task_id=f.stem,
                                 )
@@ -3636,9 +3648,12 @@ async def poll_dm_fallback():
                                     await target_channel.send(chunk)
                                 try:
                                     import outbox_log
+                                    _ch_name = getattr(target_channel, "name", None)
+                                    _label = f"#{_ch_name}" if _ch_name else None
                                     outbox_log.append(
                                         channel_type="discord_channel",
                                         recipient=str(target_channel_id),
+                                        recipient_label=_label,
                                         body=text_only,
                                         task_id=_task_id,
                                     )
