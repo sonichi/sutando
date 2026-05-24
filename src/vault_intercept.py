@@ -26,11 +26,15 @@ Supported syntax (all case-insensitive):
 Multiple commands in one message are all intercepted in a single pass.
 """
 
+import json
+import os
 import re
 import subprocess
+from datetime import datetime, timezone
 from typing import NamedTuple
 
 _ACCOUNT = "sutando"
+_MANIFEST_PATH = os.path.expanduser("~/.sutando-vault/keys.json")
 
 # Matches: vault set KEY <value>  where value is:
 #   - double-quoted string   "foo bar"
@@ -63,6 +67,39 @@ def _store_in_keychain(key: str, value: str) -> None:
             f"vault: failed to store '{key}': "
             f"{result.stderr.decode(errors='replace').strip()}"
         )
+    _register_key(key)
+
+
+def _register_key(key: str) -> None:
+    os.makedirs(os.path.dirname(_MANIFEST_PATH), exist_ok=True)
+    try:
+        with open(_MANIFEST_PATH) as f:
+            manifest = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        manifest = {}
+    manifest[key] = {"stored_at": datetime.now(timezone.utc).isoformat()}
+    with open(_MANIFEST_PATH, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+
+def list_vault_keys() -> list[str]:
+    """Return all key names stored in the vault manifest (no values)."""
+    try:
+        with open(_MANIFEST_PATH) as f:
+            return sorted(json.load(f).keys())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def get_vault_key(key: str) -> str:
+    """Retrieve a secret value from Keychain. Raises KeyError if not found."""
+    result = subprocess.run(
+        ["security", "find-generic-password", "-a", _ACCOUNT, "-s", key, "-w"],
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise KeyError(f"vault: key '{key}' not found in Keychain")
+    return result.stdout.decode().strip()
 
 
 def intercept_vault_commands(text: str) -> InterceptResult:
