@@ -20,10 +20,12 @@ off the message object the bridge already has.
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # Repo root: skills/discord-voice/scripts/join_trigger.py → up 3 → repo root.
@@ -84,10 +86,16 @@ def load_join_phrase() -> str:
 def message_is_join_phrase(text: str, join_phrase: str | None = None) -> bool:
     """True iff `text` is the join-phrase command.
 
-    Match rule (per spec): case-insensitive against the *trimmed* message —
-    either an exact match, OR the message starts with the phrase (so trailing
-    punctuation / a stray word doesn't break the summon). A bare empty string
-    never matches.
+    Match rule: case-insensitive against the *trimmed* message — either an
+    exact match, OR the message starts with the phrase followed by a
+    non-alphanumeric boundary (so trailing punctuation like "ZA WARUDO!" /
+    "za warudo, please" / "za warudo\n…" matches, while "za warudonow"
+    doesn't). A bare empty string never matches.
+
+    The boundary check prevents a short phrase like "go" from matching
+    "google ..." while still tolerating the natural exclamation marks and
+    punctuation users add. Exact-match above covers the no-trailing-content
+    case.
 
     Pure function — no I/O when `join_phrase` is supplied; tests pass it
     explicitly.
@@ -101,10 +109,12 @@ def message_is_join_phrase(text: str, join_phrase: str | None = None) -> bool:
     trimmed = text.strip().lower()
     if trimmed == phrase:
         return True
-    # "starts with the phrase" — require a word boundary so e.g. a phrase
-    # "go" wouldn't match "google ...". Exact-match above already covers the
-    # no-trailing-content case.
-    return trimmed.startswith(phrase + " ") or trimmed.startswith(phrase + "\n")
+    if trimmed.startswith(phrase):
+        next_ch = trimmed[len(phrase):len(phrase) + 1]
+        # Word-boundary: any non-alphanumeric, non-underscore character
+        # counts. Mirrors `\W` in regex.
+        return not next_ch.isalnum() and next_ch != "_"
+    return False
 
 
 def _owner_voice_channel(message):
@@ -230,13 +240,68 @@ def _spawn_voice_server(guild_id, channel_id) -> bool:
                 pass
 
 
+def _enqueue_context_prep_task(phrase: str, channel_id, channel_name: str) -> None:
+    """Drop a synthetic task that nudges the core to enrich
+    state/voice-session-context.json before the voice session's first turn.
+
+    The task body carries ONLY metadata (which phrase fired, which voice
+    channel) — NO user content, no draft text, no result snippets. The core
+    reads its own conversation state to populate `active_drafts` +
+    `last_results`; this function does not pass any of that through.
+
+    `source: system-magic-word` + `priority: urgent` so the core's queue
+    picks this ahead of normal tasks, AND so consumers can identify and
+    filter the synthetic class if needed. Body ends with `[no-send]` so the
+    bridge silently archives the result file — there's no Discord reply
+    owed; the user just sees the bridge's "On my way to …" message and the
+    voice agent's spoken greeting.
+
+    Never raises — observability shouldn't block voice from launching.
+    """
+    try:
+        ws = _resolve_workspace()
+        tasks_dir = ws / "tasks"
+        tasks_dir.mkdir(parents=True, exist_ok=True)
+        ts_ms = int(time.time() * 1000)
+        iso_now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        owner_id = os.environ.get("SUTANDO_DM_OWNER_ID", "").strip() or "owner"
+        # Body is structured so a human reader (operator tailing the log)
+        # sees the trigger info, but contains no user content.
+        body = (
+            f"[SYSTEM] Magic word '{phrase}' fired. discord-voice-server "
+            f"spawning for voice channel id={channel_id} name={channel_name}. "
+            f"Update state/voice-session-context.json: set "
+            f"pending_action.kind='joined-voice', .where='{channel_id}', "
+            f".what='joined voice via {phrase}'. Then enrich active_drafts + "
+            f"last_results from your current conversation state. "
+            f"[no-send] (no Discord reply needed)."
+        )
+        task_path = tasks_dir / f"task-{ts_ms}.txt"
+        task_path.write_text(
+            f"id: task-{ts_ms}\n"
+            f"timestamp: {iso_now}\n"
+            f"task: {body}\n"
+            f"source: system-magic-word\n"
+            f"channel_id: local-magic-word\n"
+            f"user_id: {owner_id}\n"
+            f"access_tier: owner\n"
+            f"priority: urgent\n"
+        )
+    except Exception:
+        # Synthetic task is a nice-to-have for context — never block the spawn.
+        pass
+
+
 def handle_join_trigger(message) -> str:
     """Owner said the magic word — summon discord-voice into their channel.
 
     Called by the bridge AFTER it has confirmed (a) the sender is the owner
     and (b) the trimmed message matches the join phrase. This function does
     the rest: resolve the owner's current voice channel, guard against a
-    double-launch, and spawn the server.
+    double-launch, queue a context-prep task for the core, and spawn the
+    server. The context-prep task and the spawn are concurrent — neither
+    waits on the other (per the agreed design: voice arrives immediately,
+    context lands on the next core watcher tick).
 
     Returns a short human-readable reply string for the bridge to send back
     to the originating channel. Never raises — any failure becomes a reply.
@@ -265,6 +330,12 @@ def handle_join_trigger(message) -> str:
         return f"I'm already in **{channel_name}** — see you there."
 
     if _spawn_voice_server(guild_id, channel_id):
+        # Queue context-prep AFTER successful spawn so the core only sees
+        # the synthetic task when voice is actually on the way. No await /
+        # block — voice and context-prep race; voice's first turn falls
+        # back to a greeting if the file isn't populated yet, subsequent
+        # turns read the enriched view via the `recent_context` tool.
+        _enqueue_context_prep_task(phrase, channel_id, channel_name)
         return f"On my way to **{channel_name}** — give me a few seconds to connect."
     return (
         "Couldn't launch the voice server. Check logs/discord-voice-server.log "
