@@ -23,8 +23,15 @@ Supported syntax (all case-insensitive):
     vault set KEY value
     vault set KEY "value with spaces"
     vault set KEY 'value with spaces'
+    vault set KEY `value`         (backtick-quoted — backticks stripped)
+    vault set KEY `value with spaces`  (backtick-quoted with spaces)
 
 Multiple commands in one message are all intercepted in a single pass.
+
+`redact_vault_commands(text)` is the non-storing variant: it scrubs vault-set
+patterns from text without touching the Keychain.  Use it for non-owner-tier
+messages where we want to prevent accidental secret exposure in task files but
+must not write to the owner's Keychain.
 """
 
 import json
@@ -40,9 +47,10 @@ _MANIFEST_PATH = os.path.expanduser("~/.sutando-vault/keys.json")
 # Matches: vault set KEY <value>  where value is:
 #   - double-quoted string   "foo bar"
 #   - single-quoted string   'foo bar'
+#   - backtick-quoted string `foo bar`  (Discord markdown; backticks stripped)
 #   - bare token (no spaces) foobar
 _VAULT_SET_RE = re.compile(
-    r'vault\s+set\s+(\S+)\s+(?:"([^"]*)"|\'([^\']*)\'|(\S+))',
+    r'vault\s+set\s+(\S+)\s+(?:"([^"]*)"|\'([^\']*)\'|`([^`]*)`|(\S+))',
     re.IGNORECASE,
 )
 
@@ -124,10 +132,15 @@ def intercept_vault_commands(text: str) -> InterceptResult:
 
     def _replacer(m: re.Match) -> str:
         key = m.group(1)
-        # Groups 2/3/4: double-quoted / single-quoted / bare token.
-        value = m.group(2) if m.group(2) is not None else (
-            m.group(3) if m.group(3) is not None else m.group(4)
+        # Groups 2/3/4/5: double-quoted / single-quoted / backtick / bare token.
+        value = next(
+            (g for g in (m.group(2), m.group(3), m.group(4), m.group(5)) if g is not None),
+            "",
         )
+        if not value:
+            # Reject empty value — ambiguous and almost certainly a mistake.
+            failed.append(key)
+            return f"vault set {key} [VAULT-EMPTY-VALUE]"
         try:
             _store_in_keychain(key, value)
             stored.append(key)
@@ -139,3 +152,17 @@ def intercept_vault_commands(text: str) -> InterceptResult:
 
     sanitized = _VAULT_SET_RE.sub(_replacer, text)
     return InterceptResult(text=sanitized, stored=stored, failed=failed)
+
+
+def redact_vault_commands(text: str) -> str:
+    """Scrub vault-set patterns from text WITHOUT touching the Keychain.
+
+    Use for non-owner-tier messages: prevents secrets from landing in task files
+    while ensuring the Keychain is never written by an untrusted sender.
+    """
+    if not text:
+        return text
+    return _VAULT_SET_RE.sub(
+        lambda m: f"vault set {m.group(1)} [vault: non-owner tier — ignored]",
+        text,
+    )

@@ -59,7 +59,7 @@ from util_paths import shared_personal_path  # noqa: E402
 from task_priority import default_priority_for_source  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
-from vault_intercept import intercept_vault_commands  # noqa: E402
+from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 REPO = resolve_workspace()
 
 # discord-voice "magic word" join trigger (issue: za-warudo summon). The
@@ -2657,15 +2657,20 @@ async def _handle_discord_message(message, force=False):
     task_id = f"task-{ts}"
     task_file = TASKS_DIR / f"{task_id}.txt"
 
-    # Intercept vault commands before any disk write — secrets go to Keychain,
-    # task file gets [STORED-IN-KEYCHAIN] placeholder.
+    # Intercept vault commands before any disk write.
+    # Owner-tier only: secrets go to Keychain, task file gets [STORED-IN-KEYCHAIN].
+    # Non-owner: vault patterns are redacted to prevent Keychain pollution by
+    # untrusted senders — the actual secret never reaches the task file either way.
     if text:
-        vault_result = intercept_vault_commands(text)
-        text = vault_result.text
-        if vault_result.stored:
-            print(f"  [vault] stored keys: {vault_result.stored}", flush=True)
-        if vault_result.failed:
-            print(f"  [vault] store failed (still redacted): {vault_result.failed}", flush=True)
+        if access_tier == "owner":
+            vault_result = intercept_vault_commands(text)
+            text = vault_result.text
+            if vault_result.stored:
+                print(f"  [vault] stored keys: {vault_result.stored}", flush=True)
+            if vault_result.failed:
+                print(f"  [vault] store failed (still redacted): {vault_result.failed}", flush=True)
+        else:
+            text = redact_vault_commands(text)
 
     # Inject tier-specific in-band instructions so the core agent cannot
     # accidentally process a non-owner task with full capabilities.

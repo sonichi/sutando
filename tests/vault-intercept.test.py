@@ -14,7 +14,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 import vault_intercept
-from vault_intercept import InterceptResult, intercept_vault_commands
+from vault_intercept import InterceptResult, intercept_vault_commands, redact_vault_commands
 
 
 def _mock_store(monkeypatch=None):
@@ -59,6 +59,36 @@ class TestSingleVaultSet(unittest.TestCase):
             result = intercept_vault_commands("vault set TOKEN 'my token value'")
         self.assertEqual(result.text, "vault set TOKEN [STORED-IN-KEYCHAIN]")
         self.assertEqual(result.stored, ["TOKEN"])
+
+    def test_backtick_quoted_value(self):
+        with _mock_store():
+            result = intercept_vault_commands("vault set API_KEY `my-secret-token`")
+        self.assertEqual(result.text, "vault set API_KEY [STORED-IN-KEYCHAIN]")
+        self.assertEqual(result.stored, ["API_KEY"])
+
+    def test_backtick_quoted_value_with_spaces(self):
+        with _mock_store():
+            result = intercept_vault_commands("vault set TOKEN `value with spaces`")
+        self.assertEqual(result.text, "vault set TOKEN [STORED-IN-KEYCHAIN]")
+        self.assertEqual(result.stored, ["TOKEN"])
+
+    def test_backtick_value_stored_without_backticks(self):
+        stored_value = []
+        def _capture_run(cmd, **kw):
+            if "add-generic-password" in cmd:
+                w_idx = cmd.index("-w")
+                stored_value.append(cmd[w_idx + 1])
+            return MagicMock(returncode=0)
+        with patch("vault_intercept.subprocess.run", side_effect=_capture_run), \
+             patch.object(vault_intercept, "_register_key"):
+            intercept_vault_commands("vault set K `secret`")
+        self.assertEqual(stored_value, ["secret"])  # no backticks in stored value
+
+    def test_empty_value_rejected(self):
+        result = intercept_vault_commands('vault set FOO ""')
+        self.assertIn("[VAULT-EMPTY-VALUE]", result.text)
+        self.assertEqual(result.stored, [])
+        self.assertIn("FOO", result.failed)
 
     def test_case_insensitive(self):
         with _mock_store():
@@ -129,6 +159,39 @@ class TestKeychainInteraction(unittest.TestCase):
         self.assertEqual(args[w_idx + 1], "pa$$word")
 
 
+class TestRedactVaultCommands(unittest.TestCase):
+    """redact_vault_commands — scrubs vault patterns without touching Keychain."""
+
+    def test_empty_string_unchanged(self):
+        self.assertEqual(redact_vault_commands(""), "")
+
+    def test_plain_message_unchanged(self):
+        msg = "check my calendar"
+        self.assertEqual(redact_vault_commands(msg), msg)
+
+    def test_vault_set_redacted(self):
+        result = redact_vault_commands("vault set SECRET mysecret")
+        self.assertIn("[vault: non-owner tier — ignored]", result)
+        self.assertNotIn("mysecret", result)
+
+    def test_does_not_call_subprocess(self):
+        with patch("vault_intercept.subprocess.run") as mock_run:
+            redact_vault_commands("vault set K v")
+        mock_run.assert_not_called()
+
+    def test_multiple_commands_redacted(self):
+        msg = "vault set A x\nvault set B y"
+        result = redact_vault_commands(msg)
+        self.assertEqual(result.count("[vault: non-owner tier — ignored]"), 2)
+        self.assertNotIn(" x", result)
+        self.assertNotIn(" y", result)
+
+    def test_quoted_value_redacted(self):
+        result = redact_vault_commands('vault set KEY "secret value"')
+        self.assertNotIn("secret", result)
+        self.assertIn("[vault: non-owner tier — ignored]", result)
+
+
 class TestErrorHandling(unittest.TestCase):
     def test_store_failure_still_redacts(self):
         """Fail-closed: plaintext must never reach disk even when Keychain write fails."""
@@ -173,6 +236,7 @@ if __name__ == "__main__":
         TestSingleVaultSet,
         TestMultipleVaultSets,
         TestKeychainInteraction,
+        TestRedactVaultCommands,
         TestErrorHandling,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
