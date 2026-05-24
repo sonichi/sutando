@@ -282,7 +282,7 @@ python3 skills/vault/vault.py get KEY                        # print value
 python3 skills/vault/vault.py env KEY1 KEY2 -- python3 x.py  # inject as env vars
 ```
 
-**Never ask Bassil to put secrets in .env files or hardcode them.** If an integration needs a key that isn't in the vault yet, ask Bassil to send `vault set KEY value` via Slack — the bridge will intercept it securely.
+If an integration needs a key that isn't in the vault yet, ask the user to send `vault set KEY value` via Slack or Discord — the bridge intercepts it securely before it touches disk.
 
 ## Built-in tools
 
