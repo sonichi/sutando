@@ -2536,15 +2536,28 @@ async def _handle_discord_message(message, force=False):
         except:
             pass
 
+    # Dedup: skip if we've already processed this Discord message ID.
+    # EXCEPTION: force=True means on_message_edit is reprocessing because the
+    # edit added a new mention — re-queue even though the ID is seen.
+    if message.id in seen_message_ids and not force:
+        print(f"  [dedup] skipping already-processed message {message.id} from @{username}")
+        return
+    seen_message_ids.add(message.id)
+    # Cap set size to prevent unbounded growth
+    if len(seen_message_ids) > 10000:
+        seen_message_ids.clear()
+
     # discord-voice "magic word" join trigger. THIN hook (CLAUDE.md core/skill
     # split): the bridge only checks "is this the owner saying the join
     # phrase"; everything else — voice-channel lookup, already-running guard,
     # discord-voice-server launch — lives in the discord-voice skill helper.
     # Owner-only by construction: a non-owner saying the phrase falls through
-    # to normal task handling (access_tier gate below). When it fires, the
-    # message IS the command — we send the reply and return WITHOUT writing a
-    # task file (no normal task for a join-phrase message).
-    if access_tier == "owner" and not force:
+    # to normal task handling. When it fires, the message IS the command — we
+    # send the reply and return WITHOUT writing a task file (no normal task
+    # for a join-phrase message). Placed AFTER dedup so gateway replay can't
+    # double-fire the spawn; the helper has its own `_server_already_running`
+    # guard anyway, but cheaper to dedup at the front gate.
+    if access_tier == "owner":
         try:
             is_join = _dv_message_is_join_phrase(text)
         except Exception as e:
@@ -2552,7 +2565,6 @@ async def _handle_discord_message(message, force=False):
             is_join = False
         if is_join:
             print(f"  [join-trigger] owner @{username} said the join phrase — summoning discord-voice", flush=True)
-            seen_message_ids.add(message.id)  # don't reprocess on gateway replay
             try:
                 reply = _dv_handle_join_trigger(message)
             except Exception as e:
@@ -2565,17 +2577,6 @@ async def _handle_discord_message(message, force=False):
             except Exception as e:
                 print(f"  [join-trigger] reply send failed: {e}", flush=True)
             return
-
-    # Dedup: skip if we've already processed this Discord message ID.
-    # EXCEPTION: force=True means on_message_edit is reprocessing because the
-    # edit added a new mention — re-queue even though the ID is seen.
-    if message.id in seen_message_ids and not force:
-        print(f"  [dedup] skipping already-processed message {message.id} from @{username}")
-        return
-    seen_message_ids.add(message.id)
-    # Cap set size to prevent unbounded growth
-    if len(seen_message_ids) > 10000:
-        seen_message_ids.clear()
 
     # Deterministic tier ownership: if SUTANDO_TEAM_TIER_OWNER is configured
     # and this node's machine does NOT match, drop non-owner-tier tasks so the
