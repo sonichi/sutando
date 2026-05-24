@@ -20,7 +20,12 @@ pins:
      can't silently re-add a copy.
 
 Static analysis only; no Discord API, no fixtures.
+
+Run: python3 tests/send-allowlist-shared.test.py
+Exit: 0 on pass, 1 on fail.
 """
+
+from __future__ import annotations
 
 import re
 import sys
@@ -66,21 +71,11 @@ def test_no_inline_send_allowed_roots_definitions():
     """The architectural pin: only the shared module may DEFINE the
     constants/function. Any other file with the same definitions has
     re-introduced a copy."""
-    # `discord-bridge.py` and `dm-result.py` may import + alias —
-    # that's fine. They must not redefine the literal name with an
-    # assignment to a tuple of paths.
     bad_files = []
     for path in (SRC / "discord-bridge.py", SRC / "dm-result.py"):
         src = path.read_text()
-        # An inline definition has the shape `SEND_ALLOWED_ROOTS = (`
-        # at module level — not inside a function. We check that the
-        # only occurrence of `SEND_ALLOWED_ROOTS =` (not `as`/`import`)
-        # is via aliasing the import.
         for line in src.split("\n"):
             stripped = line.strip()
-            # Allow `from send_allowlist import ... SEND_ALLOWED_ROOTS ...`
-            # and `SEND_ALLOWED_ROOTS as _SEND_ALLOWED_ROOTS,` (in
-            # `from X import (... as ...,)` blocks).
             if "SEND_ALLOWED_ROOTS" in stripped and stripped.startswith("SEND_ALLOWED_ROOTS = ("):
                 bad_files.append(f"{path.name}: inline definition: {stripped}")
             if "SEND_ALLOWED_PREFIXES" in stripped and stripped.startswith("SEND_ALLOWED_PREFIXES = ("):
@@ -98,11 +93,7 @@ def test_no_inline_is_path_sendable_function():
     bad_files = []
     for path in (SRC / "discord-bridge.py", SRC / "dm-result.py"):
         src = path.read_text()
-        # An inline definition has the shape `def is_path_sendable(`
-        # OR `def _is_path_sendable(` at module level.
         if re.search(r"^def _?is_path_sendable\(", src, re.MULTILINE):
-            # Verify it's not just a `def _is_path_sendable = ...` (alias) —
-            # `def` always starts a function definition.
             bad_files.append(
                 f"{path.name}: contains `def [_]is_path_sendable(` — "
                 f"redefining the shared function re-introduces the drift "
@@ -113,18 +104,14 @@ def test_no_inline_is_path_sendable_function():
 
 def test_send_allowlist_module_has_documented_set():
     """Defense: the shared module must contain the documented roots/
-    prefixes. A silent tightening (e.g. dropping `/tmp/echo-`) would
-    quietly break the echo skill's file delivery — make a tightening
-    update this test deliberately."""
+    prefixes. A silent tightening would break file delivery — make a
+    tightening update this test deliberately."""
     src = (SRC / "send_allowlist.py").read_text()
     must_appear = [
-        # Prefixes
         '"/tmp/sutando-"',
         '"/private/tmp/sutando-"',
         '"/tmp/echo-"',
         '"/private/tmp/echo-"',
-        # Roots — checking the path components since the literals are
-        # built via `str(_REPO / "results")` etc.
         '_REPO / "results"',
         '_REPO / "notes"',
         '_REPO / "docs"',
@@ -138,69 +125,17 @@ def test_send_allowlist_module_has_documented_set():
     )
 
 
-def test_extra_roots_env_var_support():
-    """send_allowlist.py must parse SUTANDO_SEND_ALLOWED_ROOTS env var
-    so the shared module extends the allowlist at process start."""
-    src = (SRC / "send_allowlist.py").read_text()
-    assert "SUTANDO_SEND_ALLOWED_ROOTS" in src, (
-        "send_allowlist.py missing SUTANDO_SEND_ALLOWED_ROOTS env var support."
-    )
-    assert "_EXTRA_ROOTS" in src, (
-        "send_allowlist.py missing _EXTRA_ROOTS — the computed tuple from the env var."
-    )
-    # is_path_sendable must iterate over extra roots, not just the static set
-    assert re.search(r"SEND_ALLOWED_ROOTS.*_EXTRA_ROOTS|_EXTRA_ROOTS.*SEND_ALLOWED_ROOTS", src), (
-        "is_path_sendable() in send_allowlist.py must use both SEND_ALLOWED_ROOTS "
-        "and _EXTRA_ROOTS — extra roots won't be checked otherwise."
-    )
-
-
-def test_slack_telegram_bridges_have_inline_extra_roots():
-    """slack-bridge.py and telegram-bridge.py still carry their own
-    inline `_is_path_sendable` (they don't use the shared module yet).
-    Both must have the env var extension inline too — otherwise a
-    tightening of send_allowlist.py won't reach them."""
-    for bridge_name in ("slack-bridge.py", "telegram-bridge.py"):
-        src = (SRC / bridge_name).read_text()
-        assert "SUTANDO_SEND_ALLOWED_ROOTS" in src, (
-            f"{bridge_name} missing SUTANDO_SEND_ALLOWED_ROOTS env var support. "
-            f"The inline _is_path_sendable must check the extra-roots env var."
-        )
-        assert "_extra_roots" in src, (
-            f"{bridge_name} missing _extra_roots — the computed tuple from the env var."
-        )
-
-
-def test_discord_bridge_no_inline_extra_roots():
-    """discord-bridge.py delegates entirely to send_allowlist.py via
-    the `_is_path_sendable = _is_path_sendable_shared` alias. It must
-    NOT define its own _extra_roots — that would shadow the shared
-    module's env var support and reintroduce drift."""
-    src = (SRC / "discord-bridge.py").read_text()
-    # The env var name may appear in comments — only flag assignment
-    for line in src.split("\n"):
-        stripped = line.strip()
-        if stripped.startswith("_extra_roots") and "=" in stripped:
-            raise AssertionError(
-                "discord-bridge.py defines _extra_roots inline — it should get "
-                "env var support from send_allowlist.py (via the shared alias). "
-                "Remove the inline definition."
-            )
-
-
 def main():
     failures = []
-    for fn in (
+    tests = [
         test_shared_module_exists,
         test_discord_bridge_imports_from_shared_module,
         test_dm_result_imports_from_shared_module,
         test_no_inline_send_allowed_roots_definitions,
         test_no_inline_is_path_sendable_function,
         test_send_allowlist_module_has_documented_set,
-        test_extra_roots_env_var_support,
-        test_slack_telegram_bridges_have_inline_extra_roots,
-        test_discord_bridge_no_inline_extra_roots,
-    ):
+    ]
+    for fn in tests:
         try:
             fn()
             print(f"  ✓ {fn.__name__}")

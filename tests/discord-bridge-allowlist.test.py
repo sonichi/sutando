@@ -79,10 +79,6 @@ def main() -> int:
     # must import it (otherwise the file-send sites have a dangling
     # name). Verify the import is present.
     if found_in == "send_allowlist.py":
-        # The import may use `from send_allowlist import is_path_sendable`
-        # OR `from send_allowlist import (is_path_sendable as _alias, ...)`
-        # — both shapes satisfy the contract. Use DOTALL so multi-line
-        # parenthesized imports match.
         if not re.search(
             r"from\s+send_allowlist\s+import[\s\S]*?is_path_sendable",
             src,

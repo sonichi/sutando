@@ -75,21 +75,11 @@ SEND_ALLOWED_PREFIXES: tuple[str, ...] = (
     "/private/tmp/echo-",
 )
 
-# Extend the allowlist via SUTANDO_SEND_ALLOWED_ROOTS env var
-# (colon-separated paths, ~ expanded). E.g.:
-#   SUTANDO_SEND_ALLOWED_ROOTS=~/Movies/CapCut:~/Desktop/exports
-# Paths are resolved at module-load time; restart required to pick up changes.
-_EXTRA_ROOTS: tuple[str, ...] = tuple(
-    os.path.expanduser(p)
-    for p in os.environ.get("SUTANDO_SEND_ALLOWED_ROOTS", "").split(":")
-    if p.strip()
-)
-
 
 def is_path_sendable(fpath: str) -> bool:
     """True iff `fpath` is a regular file AND its `realpath` resolves
-    under one of ``SEND_ALLOWED_ROOTS`` / ``_EXTRA_ROOTS`` or starts with
-    one of ``SEND_ALLOWED_PREFIXES``.
+    under one of ``SEND_ALLOWED_ROOTS`` or starts with one of
+    ``SEND_ALLOWED_PREFIXES``.
 
     Single source of truth for the file-attachment-delivery policy.
     Mirrors the shape used by ``_is_path_sendable`` in both call sites
@@ -106,7 +96,7 @@ def is_path_sendable(fpath: str) -> bool:
         real = os.path.realpath(fpath)
     except OSError:
         return False
-    for root in (*SEND_ALLOWED_ROOTS, *_EXTRA_ROOTS):
+    for root in SEND_ALLOWED_ROOTS:
         root_real = os.path.realpath(root)
         if real == root_real or real.startswith(root_real + os.sep):
             return True

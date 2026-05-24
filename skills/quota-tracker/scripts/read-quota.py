@@ -17,16 +17,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-# Canonical (and only) home is <workspace>/state/quota-state.json, written by
-# the credential proxy. The skill-dir / cwd fallbacks were removed: a stale
-# leftover quota-state.json under skills/quota-tracker/ silently shadowed the
-# fresh file and froze the dashboard for ~12h (2026-05-21). One path, one
-# source of truth — if it's missing, say so rather than read a stale copy.
+# Canonical home is <workspace>/state/quota-state.json, written by the
+# credential proxy. Fallback: the app-bundle proxy (built before the
+# workspace-refactor) writes to the skill dir. We accept that path when the
+# canonical one is absent — it's fresh data, not a stale leftover. The
+# stale-shadowing issue from 2026-05-21 only applies when BOTH exist; the
+# canonical always wins in that case.
 # NOTE: `.resolve()` follows the ~/.claude/skills symlink into the repo, so the
 # path is <repo>/skills/quota-tracker/scripts/read-quota.py — four levels deep.
-# Three .parent landed on <repo>/skills (no src/ there), so the workspace_default
-# import silently failed (→ except below → "not found") and quota read as missing
-# regardless of where the proxy wrote. Walk up four to reach <repo>/src.
+# Three .parent landed on <repo>/skills (no src/ there); walk up four.
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 try:
@@ -37,8 +36,13 @@ except ImportError:
     _canonical = None
     _workspace = None
 
+_skill_dir = Path(__file__).resolve().parent.parent / "quota-state.json"
+
 if _canonical is not None and _canonical.exists():
     QUOTA_FILE = _canonical
+elif _skill_dir.exists():
+    # App-bundle proxy writes here — accept as fresh data when canonical absent.
+    QUOTA_FILE = _skill_dir
 else:
     print("No quota-state.json found. Is the credential proxy running?")
     sys.exit(1)
