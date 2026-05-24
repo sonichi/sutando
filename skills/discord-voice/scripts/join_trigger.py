@@ -89,7 +89,7 @@ def message_is_join_phrase(text: str, join_phrase: str | None = None) -> bool:
     Match rule: case-insensitive against the *trimmed* message — either an
     exact match, OR the message starts with the phrase followed by a
     non-alphanumeric boundary (so trailing punctuation like "ZA WARUDO!" /
-    "za warudo, please" / "za warudo\n…" matches, while "za warudonow"
+    "za warudo, please" / "za warudo\\n…" matches, while "za warudonow"
     doesn't). A bare empty string never matches.
 
     The boundary check prevents a short phrase like "go" from matching
@@ -97,23 +97,16 @@ def message_is_join_phrase(text: str, join_phrase: str | None = None) -> bool:
     punctuation users add. Exact-match above covers the no-trailing-content
     case.
 
-    Leading `<@id>` / `<@!id>` / `<@&roleid>` Discord mentions are stripped
-    before matching — users summoning via "@Lucy za warudo" in a guild text
-    channel produce "<@1494...> za warudo" as raw content; without
-    stripping, that wouldn't startswith("za warudo").
-
     Pure function — no I/O when `join_phrase` is supplied; tests pass it
     explicitly.
     """
-    import re as _re
     if not text:
         return False
     phrase = (join_phrase if join_phrase is not None else load_join_phrase())
     phrase = (phrase or "").strip().lower()
     if not phrase:
         return False
-    stripped = _re.sub(r'^(?:\s*<@[!&]?\d+>\s*)+', '', text)
-    trimmed = stripped.strip().lower()
+    trimmed = text.strip().lower()
     if trimmed == phrase:
         return True
     if trimmed.startswith(phrase):
@@ -194,8 +187,8 @@ def _spawn_voice_server(guild_id, channel_id) -> bool:
     on a successful spawn (the subprocess was started — not that it connected).
 
     Mirrors the run command from SKILL.md:
-      env -u GEMINI_API_KEY DISCORD_VOICE_SERVER=1 \
-        npx tsx skills/discord-voice/scripts/discord-voice-server.ts \
+      env -u GEMINI_API_KEY DISCORD_VOICE_SERVER=1 \\
+        npx tsx skills/discord-voice/scripts/discord-voice-server.ts \\
         --guild <GUILD_ID> --channel <VC_ID>
 
     `GEMINI_API_KEY` is unset for the child (the voice server uses its own
@@ -278,10 +271,6 @@ def _enqueue_context_prep_task(phrase: str, channel_id, channel_name: str) -> No
         ts_ms = int(time.time() * 1000)
         iso_now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         owner_id = os.environ.get("SUTANDO_DM_OWNER_ID", "").strip() or "owner"
-        # Body instructs the core to write a SCOPED result file the voice
-        # session will pick up via the per-channel pull namespace. No user
-        # content in this body — the core fills the result file from its
-        # own conversation state.
         body = (
             f"[SYSTEM] Magic word '{phrase}' fired. discord-voice-server is "
             f"spawning for voice channel id={channel_id} name={channel_name}. "
@@ -333,7 +322,7 @@ def handle_join_trigger(message) -> str:
     if channel is None:
         return (
             f"You're not in a voice channel. Join one first, then say "
-            f"\"{phrase}\" and I'll hop in."
+            f'"{phrase}" and I\'ll hop in.'
         )
 
     channel_id = getattr(channel, "id", None)
@@ -348,11 +337,6 @@ def handle_join_trigger(message) -> str:
         return f"I'm already in **{channel_name}** — see you there."
 
     if _spawn_voice_server(guild_id, channel_id):
-        # Queue context-prep AFTER successful spawn so the core only sees
-        # the synthetic task when voice is actually on the way. No await /
-        # block — voice and context-prep race; voice's first turn falls
-        # back to a greeting if the file isn't populated yet, subsequent
-        # turns read the enriched view via the `recent_context` tool.
         _enqueue_context_prep_task(phrase, channel_id, channel_name)
         return f"On my way to **{channel_name}** — give me a few seconds to connect."
     return (
@@ -362,7 +346,6 @@ def handle_join_trigger(message) -> str:
 
 
 if __name__ == "__main__":
-    # Tiny manual smoke test for the pure matcher.
     p = load_join_phrase()
     print(f"join_phrase = {p!r}")
     for sample in (p, p.upper(), f"{p} please", f"  {p}  ", "hello", ""):

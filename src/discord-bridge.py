@@ -66,19 +66,23 @@ except Exception:  # pragma: no cover
     def _push_vision_image(path: str, source: str = "discord") -> bool:  # type: ignore
         return False
 
-# Checklist skill — renders [checklist]-tagged results as Discord buttons.
-# Best-effort: if the skill is absent the marker is stripped and the plain
-# text is posted instead (graceful degradation).
-_checklist_detector = None
-_checklist_view_builder = None
+# discord-voice join-trigger — "za warudo" magic word. Best-effort: skill
+# absent → no-op stubs so bridge boots without discord-voice installed.
 try:
     sys.path.insert(
-        0, str(Path(__file__).resolve().parent.parent / "skills" / "checklist-respond" / "scripts")
+        0,
+        str(Path(__file__).resolve().parent.parent / "skills" / "discord-voice" / "scripts"),
     )
-    import detector as _checklist_detector   # type: ignore
-    import view_builder as _checklist_view_builder  # type: ignore
-except Exception:  # pragma: no cover - skill optional
-    pass
+    from join_trigger import (  # type: ignore  # noqa: E402
+        message_is_join_phrase as _dv_message_is_join_phrase,
+        handle_join_trigger as _dv_handle_join_trigger,
+    )
+except Exception:  # pragma: no cover
+    def _dv_message_is_join_phrase(text: str) -> bool:  # type: ignore
+        return False
+
+    async def _dv_handle_join_trigger(message) -> str:  # type: ignore
+        return ""
 
 # Load token — env var takes precedence (allows test injection without a real .env file)
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
@@ -99,7 +103,6 @@ STATE_DIR = REPO / "state"
 ARCHIVE_TASKS_DIR = REPO / "tasks" / "archive"
 ARCHIVE_RESULTS_DIR = REPO / "results" / "archive"
 OWNER_ACTIVITY_FILE = STATE_DIR / "last-owner-activity.json"
-CHECKLIST_STATE_DIR = STATE_DIR / "checklists"
 
 # Allowlist for paths that may be attached to outgoing Discord messages.
 # Result text can embed `[file: /path]` / `[send: /path]` / `[attach: /path]`
@@ -2032,56 +2035,9 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 
 
-def _recover_orphan_sending_files() -> int:
-    """Restart-safety: rename any orphan `results/proactive-*.sending`
-    files back to `*.txt` so they get re-claimed on the next poll.
-    Returns the number of files recovered.
-
-    Atomic-claim-by-rename (`proactive-*.txt` → `.sending`) prevents
-    same-tick double-deliveries between concurrent poll iterations.
-    But if the bridge crashes BETWEEN the rename and the delivery,
-    the `.sending` file sits orphaned in `results/` — no poll
-    iteration ever looks at `.sending` suffixes, so the owner
-    notification is silently dropped until next manual intervention.
-
-    This function runs on startup to bring orphans back into the
-    polling stream. Idempotent: a second call sees no `.sending`
-    files and is a no-op. Fail-open: any per-file error is logged
-    but doesn't block the bridge from starting.
-    """
-    if not RESULTS_DIR.exists():
-        return 0
-    recovered = 0
-    for f in RESULTS_DIR.iterdir():
-        if not (f.name.startswith("proactive-") and f.suffix == ".sending"):
-            continue
-        target = f.with_suffix(".txt")
-        try:
-            if target.exists():
-                print(
-                    f"  [startup] skipping orphan recovery: {target.name} "
-                    f"already exists (collision with {f.name})",
-                    flush=True,
-                )
-                continue
-            f.rename(target)
-            recovered += 1
-            print(f"  [startup] recovered orphan {f.name} → {target.name}", flush=True)
-        except FileNotFoundError:
-            pass
-        except Exception as e:
-            print(f"  [startup] failed to recover {f.name}: {e}", flush=True)
-    if recovered:
-        print(f"  [startup] recovered {recovered} orphan .sending file(s)", flush=True)
-    return recovered
-
-
 @client.event
 async def on_ready():
     print(f"Discord bridge ready: {client.user}")
-    # Restart-safety: sweep orphan `.sending` files before the poll
-    # loops start. See _recover_orphan_sending_files for rationale.
-    _recover_orphan_sending_files()
     # Restart-safety: REST-catch-up missed DMs from the disconnect
     # window. Discord gateway IDENTIFY (post-RESUME-expiry reconnect)
     # does NOT replay `MESSAGE_CREATE` events that arrived during the
@@ -2145,70 +2101,6 @@ async def on_message_edit(before, after):
         return
     print(f"  [edit] owner edited DM {after.id} within {age_sec:.0f}s — reprocessing as new task", flush=True)
     await _handle_discord_message(after, force=True)
-
-
-@client.event
-async def on_interaction(interaction):
-    """Handle Discord button interactions — used by the checklist skill.
-
-    custom_id format: cl_<msg_id>_<item_id>  (set by view_builder.cid()).
-    Only allowed users (personal-bot allowlist) may click.
-    Gracefully ignores unknown custom_ids so other interaction types don't error.
-    """
-    if _checklist_view_builder is None:
-        return  # skill not installed
-    cid_str = getattr(interaction, "data", {}).get("custom_id", "") if hasattr(interaction, "data") else ""
-    if not cid_str:
-        return
-    parsed = _checklist_view_builder.parse_cid(cid_str)
-    if parsed is None:
-        return  # not a checklist button
-    msg_id, item_id = parsed
-
-    # Access control: only allowlist users may interact
-    clicker_id = str(interaction.user.id) if hasattr(interaction, "user") else ""
-    if clicker_id not in load_allowed():
-        try:
-            await interaction.response.send_message("Not authorized.", ephemeral=True)
-        except Exception:
-            pass
-        return
-
-    # Load state
-    state = _checklist_view_builder.load_state(CHECKLIST_STATE_DIR, msg_id)
-    if state is None:
-        try:
-            await interaction.response.send_message("Checklist state not found.", ephemeral=True)
-        except Exception:
-            pass
-        return
-
-    # Apply the click
-    username = getattr(interaction.user, "display_name", None) or getattr(interaction.user, "name", "?")
-    state = _checklist_view_builder.apply_click(state, item_id, clicker_id, username)
-    _checklist_view_builder.save_state(CHECKLIST_STATE_DIR, msg_id, state)
-
-    # Rebuild the view + edit the message
-    try:
-        spec_data = state.get("spec", {})
-        # Reconstruct a minimal spec-like object for view building
-        class _FakeSpec:
-            kind = spec_data.get("kind", "checklist")
-            items = [type("I", (), {"id": it["id"], "label": it["label"], "state": it.get("state","pending")})()
-                     for it in spec_data.get("items", [])]
-            preamble = spec_data.get("preamble", "")
-            original_text = spec_data.get("original_text", "")
-        new_view = _checklist_view_builder.build_view(discord, _FakeSpec(), msg_id, state.get("voters", {}))
-        preamble = _FakeSpec.preamble
-        original = _FakeSpec.original_text
-        body = f"{preamble}\n\n{original}".strip() if preamble else original
-        await interaction.response.edit_message(content=body or "…", view=new_view)
-    except Exception as e:
-        print(f"  [checklist] interaction edit failed: {e}", flush=True)
-        try:
-            await interaction.response.send_message("Update failed.", ephemeral=True)
-        except Exception:
-            pass
 
 
 async def _handle_discord_message(message, force=False):
@@ -2651,6 +2543,33 @@ async def _handle_discord_message(message, force=False):
     if len(seen_message_ids) > 10000:
         seen_message_ids.clear()
 
+    # discord-voice magic word — "za warudo" (or whatever the workspace join_phrase
+    # is set to). Short-circuits the normal task-file path: the reply goes straight
+    # back to Discord and we return early so no task file is written.
+    if access_tier == "owner":
+        try:
+            is_join = _dv_message_is_join_phrase(text)
+        except Exception as _jt_err:
+            print(f"  [join-trigger] match check raised: {_jt_err}", flush=True)
+            is_join = False
+        if is_join:
+            print(
+                f"  [join-trigger] owner @{username} said the join phrase — summoning discord-voice",
+                flush=True,
+            )
+            try:
+                reply = _dv_handle_join_trigger(message)
+            except Exception as _jt_err:
+                reply = "Couldn't process the voice-join request — check the bridge log."
+                print(f"  [join-trigger] handle_join_trigger raised: {_jt_err}", flush=True)
+            try:
+                if reply:
+                    for _chunk in _chunk_for_discord(reply):
+                        await message.channel.send(_chunk)
+            except Exception as _jt_err:
+                print(f"  [join-trigger] reply send failed: {_jt_err}", flush=True)
+            return
+
     # Deterministic tier ownership: if SUTANDO_TEAM_TIER_OWNER is configured
     # and this node's machine does NOT match, drop non-owner-tier tasks so the
     # designated owner node handles them exclusively. Owner-tier tasks are
@@ -2994,54 +2913,6 @@ async def _catchup_missed_dms():
             print(f"  [dm-catchup] channel {channel_id_str} failed: {e}", flush=True)
 
 
-# Delivery-idempotency sentinels. Pre-fix: if the bridge crashed
-# BETWEEN `channel.send(reply_text)` returning success and the
-# subsequent `archive_file(result_file, ...)` call, on restart the
-# result file still exists in `results/` and would be re-sent —
-# producing a duplicate. With these sentinels:
-#
-#   1. Right BEFORE the per-task send block, `_is_delivered(task_id)`
-#      checks the sentinel. If present → skip send, run archive,
-#      clear sentinel.
-#   2. Right AFTER channel.send succeeds, `_mark_delivered(task_id)`
-#      touches the sentinel.
-#   3. After archive completes, `_clear_delivered(task_id)` removes
-#      the sentinel (bounded dir growth).
-#
-# Scope of THIS change: poll_results main-path only.
-DELIVERED_DIR = REPO / "state" / "discord-delivered"
-
-
-def _delivered_sentinel_path(task_id: str) -> Path:
-    return DELIVERED_DIR / f"{task_id}.sentinel"
-
-
-def _mark_delivered(task_id: str) -> None:
-    """Touch the delivery sentinel for `task_id`. Called immediately
-    after a successful `channel.send`."""
-    try:
-        DELIVERED_DIR.mkdir(parents=True, exist_ok=True)
-        _delivered_sentinel_path(task_id).touch()
-    except Exception as e:
-        print(f"  [delivered] sentinel write failed for {task_id}: {e}", flush=True)
-
-
-def _is_delivered(task_id: str) -> bool:
-    """True iff the sentinel for `task_id` exists."""
-    try:
-        return _delivered_sentinel_path(task_id).exists()
-    except Exception:
-        return False
-
-
-def _clear_delivered(task_id: str) -> None:
-    """Remove the sentinel — called during archive cleanup."""
-    try:
-        _delivered_sentinel_path(task_id).unlink(missing_ok=True)
-    except Exception:
-        pass
-
-
 PENDING_REPLIES_FILE = REPO / "state" / "discord-pending-replies.json"
 
 def _atomic_write_pending_replies(data: dict) -> None:
@@ -3159,21 +3030,6 @@ async def poll_results():
                     task_file = TASKS_DIR / f"{task_id}.txt"
                     archive_file(task_file, "tasks", task_id)
                     continue
-
-                # Idempotency check: if the previous run already sent
-                # this reply (sentinel present) but crashed BEFORE the
-                # archive completed, skip the send + archive normally.
-                # Avoids the double-delivery vector when the bridge
-                # restarts between channel.send() returning and
-                # archive_file() finishing. See DELIVERED_DIR docstring.
-                if _is_delivered(task_id):
-                    print(f"  Skipped (already delivered per sentinel): {task_id}", flush=True)
-                    archive_file(result_file, "results", task_id)
-                    task_file = TASKS_DIR / f"{task_id}.txt"
-                    archive_file(task_file, "tasks", task_id)
-                    _clear_delivered(task_id)
-                    continue
-
                 try:
                     # Extract optional [reply: <message_id>] directive — the
                     # agent signals "this result is a reply to that message"
@@ -3268,49 +3124,11 @@ async def poll_results():
                     # Extract file paths: [file: /path] or [send: /path]
                     clean_text, files = _split_file_markers(reply_text)
 
-                    # Checklist rendering — if the reply contains [checklist] and the
-                    # skill is installed, post with Discord buttons instead of plain text.
-                    # State is saved to state/checklists/<msg_id>.json for interaction handling.
-                    _checklist_posted = False
-                    if _checklist_detector is not None and _checklist_view_builder is not None:
-                        checklist_spec = _checklist_detector.parse_checklist(clean_text)
-                        if checklist_spec is not None:
-                            try:
-                                ref = discord.MessageReference(message_id=reply_to_id, channel_id=channel.id, fail_if_not_exists=False) if reply_to_id else None
-                                # Post preamble + original text as message body (original text preserved)
-                                preamble = checklist_spec.preamble
-                                original = checklist_spec.original_text
-                                body = f"{preamble}\n\n{original}".strip() if preamble and original and preamble != original else (preamble or original)
-                                placeholder_view = _checklist_view_builder.build_view(discord, checklist_spec, "0", {})
-                                sent_msg = await channel.send(body[:2000] or "…", reference=ref, view=placeholder_view)
-                                # Rebuild view with real message id and save state
-                                real_msg_id = str(sent_msg.id)
-                                final_view = _checklist_view_builder.build_view(discord, checklist_spec, real_msg_id, {})
-                                state = {
-                                    "task_id": task_id,
-                                    "kind": checklist_spec.kind,
-                                    "spec": {
-                                        "kind": checklist_spec.kind,
-                                        "preamble": checklist_spec.preamble,
-                                        "original_text": checklist_spec.original_text,
-                                        "items": [{"id": it.id, "label": it.label, "state": it.state} for it in checklist_spec.items],
-                                    },
-                                    "voters": {},
-                                    "channel_id": channel.id,
-                                }
-                                _checklist_view_builder.save_state(CHECKLIST_STATE_DIR, real_msg_id, state)
-                                await sent_msg.edit(view=final_view)
-                                _checklist_posted = True
-                                print(f"  [checklist] posted {checklist_spec.kind} with {len(checklist_spec.items)} items (msg {real_msg_id})", flush=True)
-                            except Exception as e:
-                                print(f"  [checklist] render failed, falling back to plain text: {e}", flush=True)
-                                # Fall through to plain text send below
-
                     # Send text — fence-aware chunker preserves triple-backtick code blocks
                     # First chunk uses message_reference (if set); subsequent chunks
                     # are fresh — Discord allows only one reply-anchor per message,
                     # and split-chunk continuation isn't itself a reply.
-                    if clean_text and not _checklist_posted:
+                    if clean_text:
                         first = True
                         for chunk in _chunk_for_discord(clean_text):
                             ref = discord.MessageReference(message_id=reply_to_id, channel_id=channel.id, fail_if_not_exists=False) if (first and reply_to_id) else None
@@ -3319,18 +3137,9 @@ async def poll_results():
                         try:
                             import outbox_log
                             ch_type = "discord_dm" if isinstance(channel, discord.DMChannel) else "discord_channel"
-                            # Human-readable label for audit: "#dev", "Chi DM",
-                            # or "DM" when the recipient name isn't available.
-                            if isinstance(channel, discord.DMChannel):
-                                _recipient = getattr(channel.recipient, "name", None)
-                                _label = f"{_recipient} DM" if _recipient else "DM"
-                            else:
-                                _ch_name = getattr(channel, "name", None)
-                                _label = f"#{_ch_name}" if _ch_name else None
                             outbox_log.append(
                                 channel_type=ch_type,
                                 recipient=str(channel.id),
-                                recipient_label=_label,
                                 body=clean_text,
                                 task_id=task_id,
                             )
@@ -3352,13 +3161,6 @@ async def poll_results():
                             await channel.send(f"(file not allowed: {fpath})")
                             print(f"  REJECTED file (not in allowlist): {fpath}", flush=True)
 
-                    # Mark delivered BEFORE the archive runs. If we
-                    # crash between channel.send returning and archive,
-                    # on restart the sentinel + result-file combo
-                    # triggers the skip-block above (archive + clear,
-                    # no re-send). Without this, the result file
-                    # would re-send on restart producing a duplicate.
-                    _mark_delivered(task_id)
                     print(f"  Replied: {reply_text[:80]}...", flush=True)
                 except Exception as e:
                     print(f"  Reply failed: {e}", flush=True)
@@ -3366,10 +3168,6 @@ async def poll_results():
                 archive_file(result_file, "results", task_id)
                 task_file = TASKS_DIR / f"{task_id}.txt"
                 archive_file(task_file, "tasks", task_id)
-                # Delivery succeeded + archived — sentinel has served
-                # its purpose, remove to bound `discord-delivered/`
-                # directory growth.
-                _clear_delivered(task_id)
         await asyncio.sleep(1)
 
 
@@ -3490,12 +3288,9 @@ async def poll_proactive():
                                 await dm.send(chunk)
                             try:
                                 import outbox_log
-                                _user_name = getattr(user, "name", None)
-                                _label = f"{_user_name} DM" if _user_name else None
                                 outbox_log.append(
                                     channel_type="discord_dm",
                                     recipient=str(owner_id),
-                                    recipient_label=_label,
                                     body=clean_text,
                                     task_id=f.stem,
                                 )
@@ -3648,12 +3443,9 @@ async def poll_dm_fallback():
                                     await target_channel.send(chunk)
                                 try:
                                     import outbox_log
-                                    _ch_name = getattr(target_channel, "name", None)
-                                    _label = f"#{_ch_name}" if _ch_name else None
                                     outbox_log.append(
                                         channel_type="discord_channel",
                                         recipient=str(target_channel_id),
-                                        recipient_label=_label,
                                         body=text_only,
                                         task_id=_task_id,
                                     )
