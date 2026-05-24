@@ -241,20 +241,26 @@ def _spawn_voice_server(guild_id, channel_id) -> bool:
 
 
 def _enqueue_context_prep_task(phrase: str, channel_id, channel_name: str) -> None:
-    """Drop a synthetic task that nudges the core to enrich
-    state/voice-session-context.json before the voice session's first turn.
+    """Drop a synthetic task that nudges the core to write a context result
+    file targeted at the just-spawned voice session.
 
-    The task body carries ONLY metadata (which phrase fired, which voice
-    channel) — NO user content, no draft text, no result snippets. The core
-    reads its own conversation state to populate `active_drafts` +
-    `last_results`; this function does not pass any of that through.
+    Target: the per-channel pull namespace `results/<voice-channel-id>.task-
+    <core-task-id>.txt` (PR #1033 / `result_channel_key.py`). The voice
+    session's discord-voice-server scans that namespace once connected,
+    reads-and-deletes the file, and injects its body into the live Gemini
+    Live session via `transport.sendContent` — same path the work-tool
+    drain uses. The injection is NOT spoken (no audio turn), it's session
+    input the model can refer to when the user asks "what's going on?".
+
+    The synthetic task body carries ONLY metadata (which phrase fired,
+    which voice channel) — NO user content. The core agent decides what
+    `active_drafts` / `last_results` are relevant from its OWN
+    conversation state and writes them into the scoped result file; we
+    don't pass any of that through the bridge here.
 
     `source: system-magic-word` + `priority: urgent` so the core's queue
     picks this ahead of normal tasks, AND so consumers can identify and
-    filter the synthetic class if needed. Body ends with `[no-send]` so the
-    bridge silently archives the result file — there's no Discord reply
-    owed; the user just sees the bridge's "On my way to …" message and the
-    voice agent's spoken greeting.
+    filter the synthetic class if needed.
 
     Never raises — observability shouldn't block voice from launching.
     """
@@ -265,16 +271,21 @@ def _enqueue_context_prep_task(phrase: str, channel_id, channel_name: str) -> No
         ts_ms = int(time.time() * 1000)
         iso_now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         owner_id = os.environ.get("SUTANDO_DM_OWNER_ID", "").strip() or "owner"
-        # Body is structured so a human reader (operator tailing the log)
-        # sees the trigger info, but contains no user content.
+        # Body instructs the core to write a SCOPED result file the voice
+        # session will pick up via the per-channel pull namespace. No user
+        # content in this body — the core fills the result file from its
+        # own conversation state.
         body = (
-            f"[SYSTEM] Magic word '{phrase}' fired. discord-voice-server "
+            f"[SYSTEM] Magic word '{phrase}' fired. discord-voice-server is "
             f"spawning for voice channel id={channel_id} name={channel_name}. "
-            f"Update state/voice-session-context.json: set "
-            f"pending_action.kind='joined-voice', .where='{channel_id}', "
-            f".what='joined voice via {phrase}'. Then enrich active_drafts + "
-            f"last_results from your current conversation state. "
-            f"[no-send] (no Discord reply needed)."
+            f"Write a context result file at "
+            f"results/{channel_id}.task-<this-task-id>.txt (per-channel pull "
+            f"namespace) so the voice session injects it on connect. The body "
+            f"should summarize the conversation state voice may need: any "
+            f"active draft you're iterating on, the last few result subjects, "
+            f"and that voice just joined via the '{phrase}' magic word. Keep "
+            f"it 1-2 short paragraphs — voice consumes it as session input, "
+            f"not as a spoken turn. No DM reply needed."
         )
         task_path = tasks_dir / f"task-{ts_ms}.txt"
         task_path.write_text(
