@@ -7,7 +7,7 @@
     "start": "tsx src/voice-agent.ts",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test tests/*.test.ts && npm run test:py && npm run test:sh",
-    "test:py": "for f in tests/*.test.py skills/*/tests/*.test.py; do [ -f \"$f\" ] && echo \"--- $f ---\" && python3 \"$f\" || exit 1; done",
+    "test:py": "for f in tests/*.test.py skills/tests/*.test.py skills/*/tests/*.test.py; do [ -f \"$f\" ] && echo \"--- $f ---\" && python3 \"$f\" || exit 1; done",
     "test:sh": "for f in tests/*.test.sh; do echo \"--- $f ---\" && bash \"$f\" || exit 1; done"
   },
   "dependencies": {
