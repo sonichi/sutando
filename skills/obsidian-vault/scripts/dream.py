@@ -42,6 +42,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+import subprocess
+
 import anthropic
 
 DEFAULT_MODEL = os.environ.get("SUTANDO_DREAM_MODEL", "claude-opus-4-7")
@@ -336,6 +338,15 @@ def main(argv: Iterable[str]) -> int:
     if not vault.exists():
         print(f"[dream] vault missing: {vault}", file=sys.stderr)
         return 2
+    # Sweep the mirror first so the vault reflects the latest agent state
+    # before the model judges. Single cron entry covers both halves.
+    repo_root = Path(__file__).resolve().parent.parent.parent.parent
+    mirror_script = repo_root / "src" / "obsidian-mirror.py"
+    if mirror_script.exists():
+        try:
+            subprocess.run(["python3", str(mirror_script), "--force"], check=False, timeout=60)
+        except Exception as exc:
+            print(f"[dream] pre-sweep mirror failed (continuing): {exc}", flush=True)
     return run(vault, args.model, dry_run=args.dry_run)
 
 

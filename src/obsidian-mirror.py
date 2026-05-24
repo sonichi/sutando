@@ -1,8 +1,8 @@
-"""Obsidian mirror — one-way sync of agent state into the Sutando vault.
+"""Obsidian sync — one-shot sweep of agent state into the Sutando vault.
 
-Watches workspace dirs and writes/updates files under
-  $SUTANDO_WORKSPACE/obsidian-vault/Sutando/Agent/
-so the agent's activity is visible in Obsidian's graph + search.
+Does a single pass and exits. No background process, no polling.
+Run on-demand or wire into the user's own crons.json at whatever
+cadence they want.
 
 Sources mirrored (decided 2026-05-24 with owner):
   tasks/task-<id>.txt        -> Agent/Tasks/task-<id>.md      (status: pending)
@@ -12,76 +12,50 @@ Sources mirrored (decided 2026-05-24 with owner):
 
 One-way only (workspace -> vault). No reverse sync.
 
-Run standalone:  python3 src/obsidian-mirror.py
-Or via startup.sh — health-check.py picks it up by process name.
+Gated by `SUTANDO_OBSIDIAN_MIRROR` env var — exits cleanly when unset,
+unless `--force` is passed (used by the on-demand voice tool).
+
+Usage:
+  python3 src/obsidian-mirror.py            # respects opt-in env var
+  python3 src/obsidian-mirror.py --force    # explicit user run, bypass gate
+  python3 src/obsidian-mirror.py --since 1h # only sync sources modified in last hour
 """
 
 from __future__ import annotations
 
-import json
+import argparse
+import os
 import re
 import sys
-import threading
 import time
 from pathlib import Path
 from typing import Optional
-
-from watchdog.events import FileSystemEvent, FileSystemEventHandler
-from watchdog.observers import Observer
-
-import subprocess
-
-
-def _relink_async(target: Path) -> None:
-    """No-op until the LLM-based relink is built.
-
-    The previous regex-on-capitalized-tokens approach was vetoed as dumb
-    (Slack 2026-05-24): too noisy, didn't actually verify references. The
-    redesign uses LLM-judged inline references + topical similarity in
-    tiered footers — see results/task-1779617995654.txt for the pending
-    sign-off. Until that ships, mirror writes do NOT modify file content
-    beyond the raw mirroring.
-    """
-    return
 
 
 # ---- Path resolution ----
 
 def resolve_workspace() -> Path:
-    import os
     ws = os.environ.get("SUTANDO_WORKSPACE")
     if ws:
         return Path(ws).expanduser()
     return Path.home() / ".sutando" / "workspace"
 
 
-WORKSPACE = resolve_workspace()
-VAULT = WORKSPACE / "obsidian-vault"
-AGENT_DIR = VAULT / "Sutando" / "Agent"
-TASKS_DIR = AGENT_DIR / "Tasks"
-NOTES_DIR = AGENT_DIR / "Notes"
-ASKS_FILE = AGENT_DIR / "Asks.md"
-
 TASK_ID_RE = re.compile(r"^task-(.+)\.txt$")
 
 
-# ---- Helpers ----
-
-def ensure_vault() -> None:
-    """First-call vault skeleton. Cheap to repeat."""
-    (VAULT / ".obsidian").mkdir(parents=True, exist_ok=True)
-    TASKS_DIR.mkdir(parents=True, exist_ok=True)
-    NOTES_DIR.mkdir(parents=True, exist_ok=True)
+def _ensure_vault(vault: Path) -> None:
+    (vault / ".obsidian").mkdir(parents=True, exist_ok=True)
+    (vault / "Sutando" / "Agent" / "Tasks").mkdir(parents=True, exist_ok=True)
+    (vault / "Sutando" / "Agent" / "Notes").mkdir(parents=True, exist_ok=True)
 
 
-def task_id_from_path(path: Path) -> Optional[str]:
-    """`tasks/task-1234.txt` -> `task-1234` (kept whole; matches filename in vault)."""
+def _task_id_from_path(path: Path) -> Optional[str]:
     m = TASK_ID_RE.match(path.name)
     return f"task-{m.group(1)}" if m else None
 
 
-def parse_task_file(path: Path) -> dict:
-    """Tolerant parse — file is either `key: value` lines or free-form body."""
+def _parse_task_file(path: Path) -> dict:
     info: dict = {"raw": ""}
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -98,16 +72,14 @@ def parse_task_file(path: Path) -> dict:
     return info
 
 
-def write_task_mirror(task_path: Path) -> None:
-    """Create or refresh Agent/Tasks/<id>.md from the source task file."""
-    task_id = task_id_from_path(task_path)
+def _write_task_mirror(vault: Path, task_path: Path) -> bool:
+    task_id = _task_id_from_path(task_path)
     if not task_id:
-        return
-    ensure_vault()
-    info = parse_task_file(task_path)
-    mirror = TASKS_DIR / f"{task_id}.md"
+        return False
+    info = _parse_task_file(task_path)
+    mirror = vault / "Sutando" / "Agent" / "Tasks" / f"{task_id}.md"
 
-    # If a mirror already exists with a Result block, preserve it.
+    # Preserve any existing Result block (in case we re-run and only the source was modified).
     existing_result = ""
     if mirror.exists():
         try:
@@ -141,26 +113,24 @@ def write_task_mirror(task_path: Path) -> None:
         existing_result.rstrip() if existing_result else "",
         "",
     ]
-    mirror.write_text("\n".join(frontmatter) + "\n".join(body_lines) + "\n", encoding="utf-8")
-    print(f"[obsidian-mirror] task -> {mirror}", flush=True)
-    _relink_async(mirror)
+    new_content = "\n".join(frontmatter) + "\n".join(body_lines) + "\n"
+    if mirror.exists() and mirror.read_text(encoding="utf-8") == new_content:
+        return False
+    mirror.write_text(new_content, encoding="utf-8")
+    return True
 
 
-def write_result_mirror(result_path: Path) -> None:
-    """Update Agent/Tasks/<id>.md with the result body + status=completed."""
-    task_id = task_id_from_path(result_path)
+def _write_result_mirror(vault: Path, result_path: Path) -> bool:
+    task_id = _task_id_from_path(result_path)
     if not task_id:
-        return
-    ensure_vault()
-    mirror = TASKS_DIR / f"{task_id}.md"
+        return False
+    mirror = vault / "Sutando" / "Agent" / "Tasks" / f"{task_id}.md"
     try:
         result_body = result_path.read_text(encoding="utf-8", errors="replace").rstrip()
     except FileNotFoundError:
-        return
+        return False
 
     if not mirror.exists():
-        # Result landed before task was mirrored (or task file already archived).
-        # Synthesize a minimal mirror so the result is still captured.
         frontmatter = [
             "---",
             f"id: {task_id}",
@@ -179,179 +149,142 @@ def write_result_mirror(result_path: Path) -> None:
             "",
         ]
         mirror.write_text("\n".join(frontmatter) + "\n", encoding="utf-8")
-        print(f"[obsidian-mirror] result (orphan) -> {mirror}", flush=True)
-        _relink_async(mirror)
-        return
+        return True
 
-    # Splice: replace frontmatter status, drop any existing ## Result, append fresh.
     existing = mirror.read_text(encoding="utf-8")
-    existing = re.sub(r"^status:.*$", "status: completed", existing, count=1, flags=re.MULTILINE)
-    if "\n## Result\n" in existing:
-        existing = existing.split("\n## Result\n", 1)[0].rstrip() + "\n"
-    if not existing.endswith("\n"):
-        existing += "\n"
-    existing += f"\n## Result\n\n{result_body}\n"
-    mirror.write_text(existing, encoding="utf-8")
-    print(f"[obsidian-mirror] result -> {mirror}", flush=True)
-    _relink_async(mirror)
+    new = re.sub(r"^status:.*$", "status: completed", existing, count=1, flags=re.MULTILINE)
+    if "\n## Result\n" in new:
+        new = new.split("\n## Result\n", 1)[0].rstrip() + "\n"
+    if not new.endswith("\n"):
+        new += "\n"
+    new += f"\n## Result\n\n{result_body}\n"
+    if new == existing:
+        return False
+    mirror.write_text(new, encoding="utf-8")
+    return True
 
 
-def mirror_asks() -> None:
-    """Mirror pending-questions.md verbatim (debounced caller)."""
-    src = WORKSPACE / "pending-questions.md"
+def _mirror_asks(vault: Path, workspace: Path) -> bool:
+    src = workspace / "pending-questions.md"
     if not src.exists():
-        return
-    ensure_vault()
-    ASKS_FILE.write_text(src.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
-    print(f"[obsidian-mirror] asks -> {ASKS_FILE}", flush=True)
-    _relink_async(ASKS_FILE)
+        return False
+    dest = vault / "Sutando" / "Agent" / "Asks.md"
+    content = src.read_text(encoding="utf-8", errors="replace")
+    if dest.exists() and dest.read_text(encoding="utf-8") == content:
+        return False
+    dest.write_text(content, encoding="utf-8")
+    return True
 
 
-def mirror_note(note_path: Path) -> None:
+def _mirror_note(vault: Path, note_path: Path) -> bool:
     if note_path.suffix != ".md":
-        return
-    ensure_vault()
-    dest = NOTES_DIR / note_path.name
+        return False
+    dest = vault / "Sutando" / "Agent" / "Notes" / note_path.name
     try:
-        dest.write_text(note_path.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
-        print(f"[obsidian-mirror] note -> {dest}", flush=True)
-        _relink_async(dest)
+        content = note_path.read_text(encoding="utf-8", errors="replace")
     except FileNotFoundError:
-        # source vanished mid-event; ignore
-        pass
+        return False
+    if dest.exists() and dest.read_text(encoding="utf-8") == content:
+        return False
+    dest.write_text(content, encoding="utf-8")
+    return True
 
 
-# ---- Watchdog handlers ----
-
-class TasksHandler(FileSystemEventHandler):
-    def on_created(self, event: FileSystemEvent) -> None:
-        if event.is_directory:
-            return
-        write_task_mirror(Path(event.src_path))
-
-    def on_modified(self, event: FileSystemEvent) -> None:
-        if event.is_directory:
-            return
-        write_task_mirror(Path(event.src_path))
+def _within_window(path: Path, cutoff: float) -> bool:
+    try:
+        return path.stat().st_mtime >= cutoff
+    except FileNotFoundError:
+        return False
 
 
-class ResultsHandler(FileSystemEventHandler):
-    def on_created(self, event: FileSystemEvent) -> None:
-        if event.is_directory:
-            return
-        write_result_mirror(Path(event.src_path))
+def sweep(vault: Path, workspace: Path, since_seconds: Optional[int] = None) -> dict:
+    """Single pass over all source dirs. Returns counts by kind."""
+    _ensure_vault(vault)
+    cutoff = (time.time() - since_seconds) if since_seconds else 0.0
 
-    def on_modified(self, event: FileSystemEvent) -> None:
-        if event.is_directory:
-            return
-        write_result_mirror(Path(event.src_path))
+    counts = {"tasks": 0, "results": 0, "notes": 0, "asks": 0, "scanned": 0}
 
-
-class NotesHandler(FileSystemEventHandler):
-    def on_created(self, event: FileSystemEvent) -> None:
-        if event.is_directory:
-            return
-        mirror_note(Path(event.src_path))
-
-    def on_modified(self, event: FileSystemEvent) -> None:
-        if event.is_directory:
-            return
-        mirror_note(Path(event.src_path))
-
-
-class WorkspaceRootHandler(FileSystemEventHandler):
-    """Filtered to pending-questions.md only."""
-
-    _debounce_at: float = 0.0
-
-    def _maybe(self, src_path: str) -> None:
-        if Path(src_path).name != "pending-questions.md":
-            return
-        # Debounce — Obsidian + editors can fire several events per save.
-        now = time.time()
-        if now - self._debounce_at < 0.4:
-            return
-        self._debounce_at = now
-        mirror_asks()
-
-    def on_created(self, event: FileSystemEvent) -> None:
-        if not event.is_directory:
-            self._maybe(event.src_path)
-
-    def on_modified(self, event: FileSystemEvent) -> None:
-        if not event.is_directory:
-            self._maybe(event.src_path)
-
-
-# ---- Initial sync + main ----
-
-def initial_sync() -> None:
-    """Walk source dirs once at startup so the vault catches up before live watching."""
-    ensure_vault()
-    tasks_dir = WORKSPACE / "tasks"
-    results_dir = WORKSPACE / "results"
-    notes_dir = WORKSPACE / "notes"
-
+    tasks_dir = workspace / "tasks"
     if tasks_dir.exists():
         for p in sorted(tasks_dir.glob("task-*.txt")):
-            write_task_mirror(p)
+            counts["scanned"] += 1
+            if cutoff and not _within_window(p, cutoff):
+                continue
+            if _write_task_mirror(vault, p):
+                counts["tasks"] += 1
+
+    results_dir = workspace / "results"
     if results_dir.exists():
         for p in sorted(results_dir.glob("task-*.txt")):
-            write_result_mirror(p)
+            counts["scanned"] += 1
+            if cutoff and not _within_window(p, cutoff):
+                continue
+            if _write_result_mirror(vault, p):
+                counts["results"] += 1
+
+    notes_dir = workspace / "notes"
     if notes_dir.exists():
         for p in sorted(notes_dir.glob("*.md")):
-            mirror_note(p)
-    mirror_asks()
-    # Full relink pass deliberately not run — the previous regex-based
-    # relink was vetoed (Slack 2026-05-24). Waiting on the LLM-judged
-    # rebuild before reactivating any post-mirror processing.
+            counts["scanned"] += 1
+            if cutoff and not _within_window(p, cutoff):
+                continue
+            if _mirror_note(vault, p):
+                counts["notes"] += 1
+
+    asks_src = workspace / "pending-questions.md"
+    if asks_src.exists() and (not cutoff or _within_window(asks_src, cutoff)):
+        if _mirror_asks(vault, workspace):
+            counts["asks"] = 1
+
+    return counts
 
 
-def main() -> int:
-    # Opt-in gate. Mirroring agent state into a vault is invasive — only run
-    # when the user explicitly opts in via `SUTANDO_OBSIDIAN_MIRROR=1`. Default
-    # is OFF. (Feedback 2026-05-24: "must be opt in before the mirroring is
-    # forced in".) The `add_to_vault` voice tool is unaffected — that's
-    # always user-initiated.
-    import os
-    if os.environ.get("SUTANDO_OBSIDIAN_MIRROR", "").lower() not in ("1", "true", "yes", "on"):
+def _parse_since(value: str) -> int:
+    """Parse '30m', '1h', '6h', '1d' etc. → seconds. Plain number = seconds."""
+    if not value:
+        return 0
+    multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    if value[-1].lower() in multipliers:
+        return int(value[:-1]) * multipliers[value[-1].lower()]
+    return int(value)
+
+
+def main(argv) -> int:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Bypass the SUTANDO_OBSIDIAN_MIRROR opt-in gate. Use only for explicit user invocations.",
+    )
+    p.add_argument(
+        "--since",
+        default=None,
+        help="Only sync sources modified within the given window (e.g. 30m, 1h, 6h, 1d). Default: full sweep.",
+    )
+    p.add_argument("--vault", help="Override vault path.")
+    args = p.parse_args(argv)
+
+    if not args.force and os.environ.get("SUTANDO_OBSIDIAN_MIRROR", "").lower() not in ("1", "true", "yes", "on"):
         print(
-            "[obsidian-mirror] not enabled — set SUTANDO_OBSIDIAN_MIRROR=1 in .env to opt in. Exiting.",
+            "[obsidian-mirror] not enabled — set SUTANDO_OBSIDIAN_MIRROR=1 in .env to opt in, "
+            "or pass --force for an explicit one-shot run. Exiting.",
             flush=True,
         )
         return 0
-    print(f"[obsidian-mirror] workspace={WORKSPACE} vault={VAULT}", flush=True)
-    if not WORKSPACE.exists():
-        print(f"[obsidian-mirror] workspace dir missing: {WORKSPACE}", file=sys.stderr)
+
+    workspace = resolve_workspace()
+    if not workspace.exists():
+        print(f"[obsidian-mirror] workspace dir missing: {workspace}", file=sys.stderr)
         return 2
+    vault = Path(args.vault).expanduser() if args.vault else workspace / "obsidian-vault"
 
-    initial_sync()
+    since_seconds = _parse_since(args.since) if args.since else None
+    counts = sweep(vault, workspace, since_seconds=since_seconds)
 
-    observer = Observer()
-    tasks_dir = WORKSPACE / "tasks"
-    results_dir = WORKSPACE / "results"
-    notes_dir = WORKSPACE / "notes"
-
-    if tasks_dir.exists():
-        observer.schedule(TasksHandler(), str(tasks_dir), recursive=False)
-    if results_dir.exists():
-        observer.schedule(ResultsHandler(), str(results_dir), recursive=False)
-    if notes_dir.exists():
-        observer.schedule(NotesHandler(), str(notes_dir), recursive=False)
-    observer.schedule(WorkspaceRootHandler(), str(WORKSPACE), recursive=False)
-
-    observer.start()
-    print("[obsidian-mirror] watching: tasks/ results/ notes/ pending-questions.md", flush=True)
-    try:
-        while True:
-            time.sleep(60)
-    except KeyboardInterrupt:
-        print("[obsidian-mirror] shutting down", flush=True)
-    finally:
-        observer.stop()
-        observer.join()
+    summary = ", ".join(f"{k}={v}" for k, v in counts.items() if k != "scanned")
+    print(f"[obsidian-mirror] swept {counts['scanned']} sources — {summary}", flush=True)
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))

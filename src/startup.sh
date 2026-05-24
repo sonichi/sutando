@@ -226,21 +226,13 @@ else
   echo "  ✓ agent API (already running)"
 fi
 
-# 4b. Obsidian mirror — opt-in. Set SUTANDO_OBSIDIAN_MIRROR=1 in .env to
-# enable mirroring agent state (tasks/results/notes/asks) into the vault.
-# Default OFF so the integration is never forced on a user. The vault
-# capture tool (`add_to_vault`) is independent and always available.
-if [ "${SUTANDO_OBSIDIAN_MIRROR:-}" = "1" ] || [ "${SUTANDO_OBSIDIAN_MIRROR:-}" = "true" ]; then
-  if ! pgrep -f "obsidian-mirror.py" > /dev/null 2>&1; then
-    echo "  Starting obsidian mirror (SUTANDO_OBSIDIAN_MIRROR=1)..."
-    python3 src/obsidian-mirror.py > "$LOGS_DIR/obsidian-mirror.log" 2>&1 &
-    echo "  ✓ obsidian mirror"
-  else
-    echo "  ✓ obsidian mirror (already running)"
-  fi
-else
-  echo "  ⏸ obsidian mirror (opt-in — set SUTANDO_OBSIDIAN_MIRROR=1 to enable)"
-fi
+# Obsidian sync is a one-shot CLI (no background process). To wire it up:
+#   - Set SUTANDO_OBSIDIAN_MIRROR=1 in .env to opt in.
+#   - Add a `python3 src/obsidian-mirror.py` entry to your crons.json at
+#     whatever cadence you want (or run on-demand).
+#   - The `run_dream` voice tool calls dream.py with --force; dream.py
+#     itself calls obsidian-mirror.py --force first so the vault is
+#     up-to-date before judging.
 
 # 5. Screen capture server (port 7845)
 # Skip when Screen Recording perm is missing — otherwise we'd start a server

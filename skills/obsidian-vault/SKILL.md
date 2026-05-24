@@ -38,8 +38,8 @@ Open Obsidian → **File → Open vault → Open folder as vault** → pick `$SU
 
 Two automatic features are **opt-in via env var** and OFF by default:
 
-- `src/obsidian-mirror.py` — one-way watchdog mirror of `tasks/` + `results/` + `notes/` + `pending-questions.md` into `Sutando/Agent/` inside the vault.
-- Nightly `dream.py` cron — Opus-4.7-judged cross-linking (inline `(cf. [[X]])` citations + tiered `## Strongly Related` / `## Related` / `## See also` footer block).
+- `src/obsidian-mirror.py` — one-shot CLI that sweeps `tasks/` + `results/` + `notes/` + `pending-questions.md` into `Sutando/Agent/`. No background process; runs once and exits. Schedule it yourself via `crons.json` at whatever cadence you want.
+- Nightly `dream.py` cron — Opus-4.7-judged cross-linking (inline `(cf. [[X]])` citations + tiered `## Strongly Related` / `## Related` / `## See also` footer block). Sweeps the mirror first, then judges.
 
 Both are gated by `SUTANDO_OBSIDIAN_MIRROR`. To enable, add to `.env`:
 
@@ -47,9 +47,15 @@ Both are gated by `SUTANDO_OBSIDIAN_MIRROR`. To enable, add to `.env`:
 SUTANDO_OBSIDIAN_MIRROR=1
 ```
 
-Then `bash src/startup.sh` will boot the mirror. The cron-driven nightly dream will respect the same flag.
+Then either:
+- One-shot now: `python3 src/obsidian-mirror.py` (single sweep + exit).
+- Or wire into `skills/schedule-crons/crons.json` to run on a cadence (default template adds `obsidian-dream` nightly at 03:37, which sweeps + judges in one go).
 
-The on-demand voice tool `run_dream` *bypasses* the gate (it passes `--force` to `dream.py`) — explicit user invocation always wins.
+CLI flags worth knowing:
+- `python3 src/obsidian-mirror.py --force` — bypass the env gate (used by `run_dream` voice tool).
+- `python3 src/obsidian-mirror.py --since 1h` — only sync sources modified in the last hour (faster sweep for frequent crons).
+
+The on-demand voice tool `run_dream` *bypasses* the gate — explicit user invocation always wins.
 
 ## What's not in this skill (yet)
 
