@@ -85,6 +85,16 @@ if [ -f .env ]; then
   set -a; source .env; set +a
   if [ -z "$GEMINI_API_KEY" ]; then echo "  ✗ GEMINI_API_KEY not set in .env — get one at https://ai.google.dev"; missing=1; fi
 fi
+# Also load Sutando.app's App Support .env — Settings UI writes credentials
+# (Twilio, ngrok, etc.) there. Loads AFTER repo .env so repo overrides win.
+_APP_SUPPORT_ENV="$HOME/Library/Application Support/Sutando/.env"
+if [ -f "$_APP_SUPPORT_ENV" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$_APP_SUPPORT_ENV"
+  set +a
+fi
+unset _APP_SUPPORT_ENV
 if [ $missing -eq 1 ]; then echo ""; echo "Fix the above and try again."; exit 1; fi
 
 # Check macOS permissions (can't grant programmatically, just warn)
@@ -433,7 +443,7 @@ fi
 # 8. Phone conversation server + ngrok (optional — needs Twilio creds, skip with SKIP_PHONE=1)
 if [ "${SKIP_PHONE:-}" = "1" ]; then
   echo "  ~ conversation server (skipped via SKIP_PHONE)"
-elif grep -q "TWILIO_ACCOUNT_SID=" .env 2>/dev/null; then
+elif { [ -n "${TWILIO_ACCOUNT_SID:-}" ] || grep -q "TWILIO_ACCOUNT_SID=" .env 2>/dev/null; }; then
   if ! pgrep -f "conversation-server" > /dev/null 2>&1; then
     echo "  Starting conversation server..."
     npx tsx skills/phone-conversation/scripts/conversation-server.ts > /tmp/conversation-server.log 2>&1 &
@@ -487,7 +497,7 @@ echo ""
 sleep 3
 echo "Verifying services..."
 VERIFY_PORTS="9900:voice-agent 8080:web-client 7844:dashboard 7843:agent-api 7845:screen-capture"
-if [ "${SKIP_PHONE:-}" != "1" ] && grep -q "TWILIO_ACCOUNT_SID=" .env 2>/dev/null; then
+if [ "${SKIP_PHONE:-}" != "1" ] && { [ -n "${TWILIO_ACCOUNT_SID:-}" ] || grep -q "TWILIO_ACCOUNT_SID=" .env 2>/dev/null; }; then
   VERIFY_PORTS="$VERIFY_PORTS 3100:conversation-server"
 fi
 for port_name in $VERIFY_PORTS; do
