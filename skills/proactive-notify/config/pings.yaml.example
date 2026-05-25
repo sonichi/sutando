@@ -8,6 +8,13 @@ pings:
     source: google_calendar
     source_config:
       lookahead_min: 15
+      # owner_calendars: restrict to events from these calendar identifiers only.
+      # Omit to include all subscribed calendars (default — backwards-compatible).
+      # Prevents teammate personal events leaking in (#964).
+      # owner_calendars:
+      #   - khilo@live.ca      # primary calendar email
+      #   - primary             # gws alias for primary
+      #   - Bassil Khilo        # display name variant
     match:
       starts_in_min_min: 8
       starts_in_min_max: 12
