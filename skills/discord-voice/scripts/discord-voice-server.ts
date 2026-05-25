@@ -677,13 +677,27 @@ function subscribeUser(s: DiscordVoiceSession, userId: string): void {
 	const decoder = new prism.opus.Decoder({ frameSize: 960, channels: 2, rate: 48000 });
 	// Resample 48k stereo s16le → 16k mono s16le via ffmpeg (anti-aliased).
 	// -fflags nobuffer + -flush_packets 1 keep latency tight (no implicit batching).
-	const resampler = new prism.FFmpeg({
-		args: [
-			'-fflags', 'nobuffer', '-flush_packets', '1',
-			'-f', 's16le', '-ar', '48000', '-ac', '2', '-i', '-',
-			'-f', 's16le', '-ar', '16000', '-ac', '1',
-		],
-	});
+	// Wrapped in try/catch — prism.FFmpeg's constructor calls getInfo() which
+	// throws synchronously if the ffmpeg binary isn't on PATH. Without this
+	// guard the throw escapes to process.on('uncaughtException') and tears
+	// down the whole bot the first time anyone speaks (#1089-followup). With
+	// the guard we drop this user's audio stream and keep the bot online.
+	let resampler: prism.FFmpeg;
+	try {
+		resampler = new prism.FFmpeg({
+			args: [
+				'-fflags', 'nobuffer', '-flush_packets', '1',
+				'-f', 's16le', '-ar', '48000', '-ac', '2', '-i', '-',
+				'-f', 's16le', '-ar', '16000', '-ac', '1',
+			],
+		});
+	} catch (e) {
+		console.error(`${ts()} [Voice] ffmpeg not available — cannot subscribe ${userId}; bot stays online but audio is dropped:`, e);
+		s.subscribedUsers.delete(userId);
+		try { opusStream.destroy(); } catch {}
+		try { decoder.destroy(); } catch {}
+		return;
+	}
 	opusStream.pipe(decoder).pipe(resampler);
 
 	let chunks = 0;

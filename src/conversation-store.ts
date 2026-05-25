@@ -315,6 +315,14 @@ function migrateLegacyIfNeeded(d: DatabaseSync): void {
 		console.log('[conversation-store] migrating legacy conversation + tool_calls into per-surface tables');
 		d.exec('BEGIN');
 		try {
+			// All three migration INSERTs filter out NULL ts_unix rows. The
+			// surface tables declare ts_unix REAL NOT NULL, so a legacy row
+			// missing it would trip a NOT NULL constraint mid-transaction and
+			// roll the whole migration back — leaving the legacy tables in
+			// place and the bot logging the same error every restart. Rows
+			// with no timestamp can't be meaningfully recovered (no other
+			// column carries time), so dropping them on migrate is the
+			// right call.
 			if (hasConversation && voiceEmpty) {
 				// Utterances → voice. Roles that map to voice: 'user', 'assistant',
 				// 'sutando', 'core-agent', 'SESSION_END', and anything not prefixed
@@ -330,7 +338,8 @@ function migrateLegacyIfNeeded(d: DatabaseSync): void {
 					       END,
 					       text, NULL, session_id
 					FROM conversation
-					WHERE role NOT LIKE 'phone-%' AND role NOT LIKE 'discord-%'
+					WHERE ts_unix IS NOT NULL
+					  AND role NOT LIKE 'phone-%' AND role NOT LIKE 'discord-%'
 				`);
 			}
 			if (hasConversation && phoneEmpty) {
@@ -343,7 +352,7 @@ function migrateLegacyIfNeeded(d: DatabaseSync): void {
 					         ELSE substr(role, 7)
 					       END,
 					       text, NULL, session_id
-					FROM conversation WHERE role LIKE 'phone-%'
+					FROM conversation WHERE ts_unix IS NOT NULL AND role LIKE 'phone-%'
 				`);
 			}
 			if (hasConversation && discordEmpty) {
@@ -357,7 +366,7 @@ function migrateLegacyIfNeeded(d: DatabaseSync): void {
 					         ELSE substr(role, 9)
 					       END,
 					       text, NULL, session_id
-					FROM conversation WHERE role LIKE 'discord-%'
+					FROM conversation WHERE ts_unix IS NOT NULL AND role LIKE 'discord-%'
 				`);
 			}
 			if (hasToolCalls) {
