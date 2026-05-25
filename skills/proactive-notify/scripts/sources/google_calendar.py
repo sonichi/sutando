@@ -78,4 +78,12 @@ def fetch(config: dict) -> list[dict]:
             "description": "",
             "dedup_key_suffix": f"{start_str}|{title}",
         })
-    return results
+    # Dedup by (start_iso, title) — same meeting appears once per subscribed calendar (#966).
+    seen: set[str] = set()
+    deduped: list[dict] = []
+    for r in results:
+        key = r["dedup_key_suffix"]
+        if key not in seen:
+            seen.add(key)
+            deduped.append(r)
+    return deduped
