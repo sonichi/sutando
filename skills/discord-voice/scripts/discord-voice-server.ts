@@ -128,6 +128,21 @@ const ALLOWED_BOT_USER_IDS = new Set(
 		.split(',').map(s => s.trim()).filter(Boolean)
 );
 
+// Username prefixes that identify a peer SUTANDO bot (distinct from any
+// other Discord bot like a music bot or MEE6). Used by #1089 single-bot
+// enforcement to decide who to refuse-join-against / leave-when-detected.
+// Override via `SUTANDO_PEER_USERNAME_PATTERNS=Foo,Bar` if the naming
+// convention drifts. Match: `username.startsWith(pattern)`, case-sensitive.
+const SUTANDO_PEER_USERNAME_PATTERNS = (process.env.SUTANDO_PEER_USERNAME_PATTERNS ?? 'Sutando-,Sutando_,Lucy-,Lucy_,Maddy,Mini')
+	.split(',').map(s => s.trim()).filter(Boolean);
+
+// Disable #1089 single-bot enforcement (testing-only). Set to "1" to allow
+// multiple sutando peers in the same voice channel without auto-leave. Defaults
+// to enabled. NEVER set in production — bypassing defeats the defense-in-depth
+// design where each peer self-declines AND the already-present peer auto-
+// leaves if a peer joins anyway.
+const SUTANDO_PEER_ENFORCEMENT_DISABLED = process.env.SUTANDO_PEER_ENFORCEMENT_DISABLED === '1';
+
 // Hung-session watchdog threshold. A Gemini Live session can silently stall —
 // audio keeps flowing in but it stops emitting turn.end, with no transport
 // close event to trigger the reconnect path. If utterances have piled up
@@ -388,6 +403,22 @@ function delegateTask(s: DiscordVoiceSession, taskDescription: string): Promise<
 }
 
 // --- Build agent ------------------------------------------------------------
+
+// Inject a system-role message into the live Gemini Live transport.
+// Owns the `(... as any).transport.sendContent` cast in one place so future
+// bodhi-realtime-agent versions that publicize this surface only need one
+// edit. Used for Layer-2 peer-detected announcement, magic-word takeover,
+// recent_context replays, and a few other system-side nudges.
+//
+// TODO: bodhi 1.x stability — `transport.sendContent` is an internal API on
+// the VoiceSession; bodhi may rename/restructure it across minor versions.
+// Keep all call sites going through this wrapper.
+function injectSystemMessage(s: DiscordVoiceSession, text: string): void {
+	(s.voiceSession as any).transport.sendContent(
+		[{ role: 'user', text }],
+		true,
+	);
+}
 
 function buildAgent(s: DiscordVoiceSession): MainAgent {
 	// Declare the full owner toolset whenever an owner is configured (access.json)
@@ -677,13 +708,27 @@ function subscribeUser(s: DiscordVoiceSession, userId: string): void {
 	const decoder = new prism.opus.Decoder({ frameSize: 960, channels: 2, rate: 48000 });
 	// Resample 48k stereo s16le → 16k mono s16le via ffmpeg (anti-aliased).
 	// -fflags nobuffer + -flush_packets 1 keep latency tight (no implicit batching).
-	const resampler = new prism.FFmpeg({
-		args: [
-			'-fflags', 'nobuffer', '-flush_packets', '1',
-			'-f', 's16le', '-ar', '48000', '-ac', '2', '-i', '-',
-			'-f', 's16le', '-ar', '16000', '-ac', '1',
-		],
-	});
+	// Wrapped in try/catch — prism.FFmpeg's constructor calls getInfo() which
+	// throws synchronously if the ffmpeg binary isn't on PATH. Without this
+	// guard the throw escapes to process.on('uncaughtException') and tears
+	// down the whole bot the first time anyone speaks (#1089-followup). With
+	// the guard we drop this user's audio stream and keep the bot online.
+	let resampler: prism.FFmpeg;
+	try {
+		resampler = new prism.FFmpeg({
+			args: [
+				'-fflags', 'nobuffer', '-flush_packets', '1',
+				'-f', 's16le', '-ar', '48000', '-ac', '2', '-i', '-',
+				'-f', 's16le', '-ar', '16000', '-ac', '1',
+			],
+		});
+	} catch (e) {
+		console.error(`${ts()} [Voice] ffmpeg not available — cannot subscribe ${userId}; bot stays online but audio is dropped:`, e);
+		s.subscribedUsers.delete(userId);
+		try { opusStream.destroy(); } catch {}
+		try { decoder.destroy(); } catch {}
+		return;
+	}
 	opusStream.pipe(decoder).pipe(resampler);
 
 	let chunks = 0;
@@ -1111,6 +1156,48 @@ async function start(): Promise<void> {
 		console.error(`Channel ${CHANNEL_ID} is not a voice channel`);
 		process.exit(1);
 	}
+
+	// #1089 single-bot enforcement, layer 1 (cooperative pre-join check). Scan
+	// current channel members; if any sutando peer is already in, refuse to
+	// join. Each peer self-declines so multiple instances never accidentally
+	// share one voice room. Disable via SUTANDO_PEER_ENFORCEMENT_DISABLED=1
+	// for testing the layer-2 path.
+	const looksLikeSutandoPeer = (username: string, isBot: boolean, userId: string): boolean => {
+		if (!isBot) return false;
+		if (userId === client.user?.id) return false; // myself
+		return SUTANDO_PEER_USERNAME_PATTERNS.some(p => username.startsWith(p));
+	};
+	if (!SUTANDO_PEER_ENFORCEMENT_DISABLED) {
+		const members = (channel as any).members as Map<string, { user: { username: string; bot: boolean; id: string; tag: string } }>;
+		const presentPeers: string[] = [];
+		for (const [, m] of members) {
+			if (looksLikeSutandoPeer(m.user.username, m.user.bot, m.user.id)) {
+				presentPeers.push(m.user.tag);
+			}
+		}
+		if (presentPeers.length > 0) {
+			console.error(`${ts()} [Setup] #1089 refusing to join: sutando peer(s) already present: ${presentPeers.join(', ')}`);
+			// Surface the refusal to the operator — without this they just see
+			// "nothing happens" when inviting a second bot to a channel that
+			// already has one. Drop a proactive result; the discord-bridge
+			// polls results/ and DMs proactive-*.txt to the owner. Best-effort:
+			// if the write fails the process still exits cleanly and
+			// Sutando.app's checkWatcher will retry once the peer leaves.
+			try {
+				const proactivePath = join(WORKSPACE_DIR, 'results', `proactive-${Date.now()}.txt`);
+				const channelName = (channel as any).name ?? CHANNEL_ID;
+				writeFileSync(
+					proactivePath,
+					`Skipping voice join in #${channelName} — peer already present: ${presentPeers.join(', ')}. ` +
+					`Single-bot enforcement (#1089); reinvite once they leave.\n`,
+				);
+			} catch (e) {
+				console.error(`${ts()} [Setup] #1089 couldn't surface refusal to operator:`, e);
+			}
+			process.exit(0); // clean exit — operator (Sutando.app checkWatcher) will retry later when peer leaves
+		}
+	}
+
 	console.log(`${ts()} [Setup] joining voice channel #${(channel as any).name} in guild ${guild.name}`);
 
 	const connection = joinVoiceChannel({
@@ -1133,6 +1220,49 @@ async function start(): Promise<void> {
 	const session = await createVoiceSession(connection, client);
 	active = session;
 	console.log(`${ts()} [Setup] audio bridge live — speak in the channel`);
+
+	// #1089 single-bot enforcement, layer 2 (adversarial post-join watcher).
+	// If a sutando peer joins our channel despite layer 1 (race, env override,
+	// compromised peer), leave the channel after a short audible announcement.
+	//
+	// Race-window note: when two peers race in nearly-simultaneously, both
+	// observe each other via voiceStateUpdate and both exit. The watcher
+	// (Sutando.app's checkWatcher) then respawns exactly one. Cooperative-
+	// symmetric and eventually-consistent — chosen over earliest-join-wins
+	// because the respawn cost is bounded (~seconds) and the symmetric path
+	// avoids a tie-break/coordination protocol we'd otherwise have to invent.
+	if (!SUTANDO_PEER_ENFORCEMENT_DISABLED) {
+		// `client.once` (not `.on`) — once a peer is detected we exit the
+		// process anyway, so registering as a one-shot listener avoids the
+		// per-event cleanup dance and prevents handler-retention on the
+		// Client instance for the lifetime of the process.
+		client.once('voiceStateUpdate', (oldState, newState) => {
+			const justJoinedOurChannel = newState.channelId === CHANNEL_ID && oldState.channelId !== CHANNEL_ID;
+			if (!justJoinedOurChannel) return;
+			const u = newState.member?.user;
+			if (!u) return;
+			if (!looksLikeSutandoPeer(u.username, u.bot, u.id)) return;
+			console.error(`${ts()} [Setup] #1089 peer ${u.tag} joined while I was present — announcing + leaving`);
+			// Best-effort audio announcement. The text-injection goes through
+			// the Gemini Live transport so Lucy speaks before disconnecting.
+			// We don't wait for the actual TTS to complete — Gemini might
+			// reword the request — just give it a short window. Worst case
+			// (TTS no-shows) Lucy still leaves; the disconnect is the
+			// authoritative action.
+			try {
+				injectSystemMessage(
+					session,
+					`[System] Another Sutando bot (${u.tag}) just joined this voice channel. Say briefly: "I detected another Sutando bot — leaving." Then stop.`,
+				);
+			} catch (e) {
+				console.error(`${ts()} [Setup] #1089 announcement injection failed:`, e);
+			}
+			setTimeout(() => {
+				try { connection.destroy(); } catch {}
+				process.exit(0);
+			}, 3000);
+		});
+	}
 
 	connection.on(VoiceConnectionStatus.Disconnected, async () => {
 		try {
