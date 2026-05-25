@@ -310,6 +310,17 @@ def _resolve_owner_id(token):
         data = json.loads(ACCESS_JSON.read_text())
     except Exception:
         return ""
+
+    # Layer 1 (#1117): consult the explicit top-level `owner` field before
+    # the legacy tierMap → allowFrom fallback chain. `/discord:access` writes
+    # this as the canonical owner id; the fallback below is best-effort and
+    # mis-routed on Susan's Mac Studio on 2026-05-25 when `tierMap` was null
+    # and `allowFrom[0]` was a non-owner human. Mirrors the same precedence
+    # added to `src/discord-bridge.py:poll_proactive` in this PR.
+    explicit_owner = (data.get("owner") or "").strip()
+    if explicit_owner:
+        return explicit_owner
+
     allow = data.get("allowFrom") or []
     if not allow:
         return ""
