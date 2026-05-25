@@ -65,7 +65,9 @@ def fetch(config: dict) -> list[dict]:
         minutes_until = int(delta_sec // 60)
         if minutes_until < 0 or minutes_until > lookahead:
             continue
-        title = raw.get("summary") or "(untitled)"
+        title = (raw.get("summary") or "").strip()
+        if not title:
+            continue  # skip untitled holds — #967; upgrade to attendee rendering later
         results.append({
             "title": title,
             "start_iso": start_str,
