@@ -96,3 +96,19 @@
 
 **Pending push go-ahead** (new this pass):
 - `feat/cross-node-sync-config-1044` (15 tests, `a072033`)
+
+## Pass 214 (2026-05-25)
+
+**fix(watch-tasks-stream): Node .mjs closes both orphan paths (closes #1088)** (commit `8751618` on `fix/watch-tasks-orphan-1088`):
+- `src/watch-tasks-stream.mjs` (new) — Node implementation replaces fswatch bash script
+  - **Mode A (EPIPE)**: `process.stdout.on('error')` handler exits on EPIPE/EBADF; 30s heartbeat (`HEARTBEAT_INTERVAL_MS` override) forces EPIPE detection when tasks dir is quiet
+  - **Mode B (PPID reparent)**: polls `process.ppid` every 10s, exits when parent gone; also handles SIGHUP
+  - Inline `bumpAttemptsCounter()` (no external Python dep, graceful degradation)
+  - Workspace resolution: SUTANDO_WORKSPACE → ~/.sutando/workspace (no fswatch dep)
+- `src/watch-tasks-stream.sh` — updated to thin wrapper (`exec node watch-tasks-stream.mjs`)
+- 15 tests in `tests/watch-tasks-stream-orphan.test.py` — all passing (T14 validates EPIPE exits in ≤5s)
+- Issue filed by Susan Xueqing Liu; reproduces 2026-05-23 4h task-loss incident (3 owner DMs unprocessed)
+- Note: cherry-pick to merge/stando-sync conflicted (stando-sync has divergent .mjs); will resolve at merge time
+
+**Pending push go-ahead** (new this pass):
+- `fix/watch-tasks-orphan-1088` (15 tests, `8751618`)
