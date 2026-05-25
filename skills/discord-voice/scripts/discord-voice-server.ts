@@ -469,6 +469,13 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 			DISCORD_VOICE_GOOGLE_SEARCH
 				? 'NEVER fabricate specific details. If you don\'t know it, use your built-in Web search to look it up — it\'s faster than delegating, and the answer stays in the conversation. If your built-in search returns nothing useful, OR the question needs deeper-than-one-lookup research (multi-step, multiple sources, file reading), call the work tool — it routes to the core agent which can do extensive research.'
 				: 'NEVER fabricate specific details. If you don\'t know it, use the work tool to look it up.',
+			// Action-grounding guards — close the two hallucination modes observed
+			// in production (2026-05-25, Susan/Lucy report, issue #1102):
+			//   1. False narration: model verbally claims "opening X" without calling a tool.
+			//   2. Feature invention: model describes capabilities it doesn't have.
+			'NEVER say you are doing something (opening, searching, sending, etc.) unless you are simultaneously invoking the corresponding tool. Narrating an action without a tool call is always wrong.',
+			'When asked what you can do or what tools exist, describe ONLY what is listed in this prompt. If something is mentioned that you don\'t see here, say "I\'m not sure I can do that" — never invent capabilities.',
+			'When uncertain about a fact, say "I\'m not sure" or "let me look that up" rather than guess.',
 			repoUrl ? `\n## Known info\nSutando GitHub repo: ${repoUrl}` : '',
 		].filter(Boolean).join('\n');
 	} else {
