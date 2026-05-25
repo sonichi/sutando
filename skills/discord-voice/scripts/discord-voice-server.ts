@@ -116,6 +116,17 @@ const DISCORD_VOICE_CONFIG = loadVoiceConfig(DISCORD_VOICE_CONFIG_PATH);
 const VOICE_NATIVE_AUDIO_MODEL = DISCORD_VOICE_CONFIG.model;
 const DISCORD_VOICE_GOOGLE_SEARCH = DISCORD_VOICE_CONFIG.googleSearch;
 
+// Comma-separated Discord user IDs of BOT accounts whose audio SHOULD be
+// piped to Gemini despite User.bot=true. Defaults to empty — bots are auto-
+// ignored. Set this when you genuinely want a peer bot's voice processed
+// (rare; usually only for testing). Per #1096 — without this default-deny,
+// the receiver would pipe peer-bot audio to Gemini and cause attribution
+// errors like today's "the other speaker is a bot, not a human" misdiagnosis.
+const ALLOWED_BOT_USER_IDS = new Set(
+	(process.env.SUTANDO_ALLOWED_BOT_USER_IDS ?? '')
+		.split(',').map(s => s.trim()).filter(Boolean)
+);
+
 // Hung-session watchdog threshold. A Gemini Live session can silently stall —
 // audio keeps flowing in but it stops emitting turn.end, with no transport
 // close event to trigger the reconnect path. If utterances have piled up
@@ -274,6 +285,11 @@ interface DiscordVoiceSession {
 	taskResultCache?: Map<string, string>;
 	_toolIdMap?: Map<string, string>;
 	subscribedUsers: Set<string>;
+	client: Client;
+	// Cache of userId → isBot flag from User.bot. Populated lazily on first
+	// speaking.start for each speaker. Used to auto-ignore bot accounts so
+	// the receiver doesn't pipe peer-bot audio to Gemini.
+	botFlagCache: Map<string, boolean>;
 	// Every Discord user who contributed audio to the in-progress Gemini turn.
 	// Added on speaking.start, cleared on turn.end. The tier gate reads this
 	// set (not a live last-speaker pointer) so a tool call is attributed to
@@ -680,7 +696,7 @@ function subscribeUser(s: DiscordVoiceSession, userId: string): void {
 	console.log(`${ts()} [Voice] subscribed to user ${userId} (ffmpeg resample)`);
 }
 
-async function createVoiceSession(connection: VoiceConnection): Promise<DiscordVoiceSession> {
+async function createVoiceSession(connection: VoiceConnection, client: Client): Promise<DiscordVoiceSession> {
 	const bodhiPort = nextBodhiPort++;
 	// Encode guild + channel into the session id so channel-level diagnostics
 	// survive into the sessions table (recordSession has no guild/channel field).
@@ -734,6 +750,8 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 		pendingTasks: 0,
 		closing: false,
 		subscribedUsers: new Set(),
+		client,
+		botFlagCache: new Map(),
 		turnSpeakers: new Set(),
 		audioPending: [],
 		toolCalls: [],
@@ -977,10 +995,32 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 	(s as any)._channelScanHandle = channelScan;
 
 	// Subscribe to anyone currently speaking, and to anyone who starts.
-	connection.receiver.speaking.on('start', (userId) => {
+	connection.receiver.speaking.on('start', async (userId) => {
 		// Attribute this speaker to the in-progress turn. The gate resolves
 		// the turn's effective tier across the whole set (cleared on turn.end).
 		s.turnSpeakers.add(userId);
+		// Bot/human discrimination (#1096). Discord's gateway exposes `User.bot`;
+		// without this check the receiver would happily pipe peer-bot audio to
+		// Gemini, which both wastes API quota and causes attribution errors
+		// (today: a peer-bot's utterance was misattributed to the owner,
+		// triggering a misdiagnosis of "name-gate conflict from a second bot"
+		// when in fact the other account was a human). Cached per-user so we
+		// fetch once per speaker; degrades gracefully (subscribe anyway) if
+		// the fetch fails so this can never *block* an owner from being heard.
+		let isBot = s.botFlagCache.get(userId);
+		if (isBot === undefined) {
+			try {
+				const user = await s.client.users.fetch(userId);
+				isBot = !!user.bot;
+			} catch {
+				isBot = false;
+			}
+			s.botFlagCache.set(userId, isBot);
+		}
+		if (isBot && !ALLOWED_BOT_USER_IDS.has(userId)) {
+			console.log(`${ts()} [Voice] ignoring bot user ${userId} (not in SUTANDO_ALLOWED_BOT_USER_IDS)`);
+			return;
+		}
 		subscribeUser(s, userId);
 	});
 	// Start the constant-rate ticker that flushes audio to Gemini every 20ms.
@@ -1073,7 +1113,7 @@ async function start(): Promise<void> {
 	}
 	console.log(`${ts()} [Setup] voice connection ready`);
 
-	const session = await createVoiceSession(connection);
+	const session = await createVoiceSession(connection, client);
 	active = session;
 	console.log(`${ts()} [Setup] audio bridge live — speak in the channel`);
 
