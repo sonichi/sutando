@@ -445,8 +445,11 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 		tools.push({
 			name: 'work',
 			description:
-				'Do the work. Call this for action requests — sending a message, looking something up, ' +
-				'researching, editing files, generating images, video editing, scheduling. ' +
+				'Do the work. Call this for ANYTHING beyond simple greetings — questions, actions, ' +
+				'research, writing, translation, file changes, system queries, explanations, analysis. ' +
+				'CRITICAL: when asked about THIS specific project (features, commands, code, history, ' +
+				'decisions, what a tool does, how a flow works), ALWAYS call work — your built-in ' +
+				'knowledge does not include this codebase, so guessing produces hallucinations. ' +
 				'Do NOT use this for scrolling or switching apps — use the scroll and switch_app tools instead.',
 			parameters: z.object({
 				task: z.string().describe('Full description of the task to perform'),
