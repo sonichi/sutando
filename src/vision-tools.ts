@@ -338,7 +338,8 @@ export function startStreaming(
 		const info = startStream(source, fps ?? DEFAULT_FPS);
 		return { status: 'streaming', source: source.name, fps: info.fps, intervalMs: info.intervalMs, mode: 'pull' };
 	} catch (err) {
-		return { status: 'failed', error: (err as Error)?.message ?? String(err) };
+		console.error(`${ts()} [Vision] startStreaming threw: ${(err as Error)?.message ?? err}`);
+		return { status: 'failed', error: 'startStreaming failed' };
 	}
 }
 
@@ -417,7 +418,7 @@ export function submitFrame(data: Buffer, mimeType: string = 'image/jpeg'): { ok
 		return { ok: true };
 	} catch (err) {
 		console.error(`${ts()} [Vision] sendFile threw: ${(err as Error)?.message ?? err}`);
-		return { ok: false, error: (err as Error)?.message ?? String(err) };
+		return { ok: false, error: 'submitFrame failed' };
 	}
 }
 
@@ -489,7 +490,8 @@ export const sendVisionFrameTool: ToolDefinition = {
 			if (!r.ok) return { status: 'failed', error: r.error };
 			return { status: 'sent', source: source.name };
 		} catch (err) {
-			return { status: 'failed', error: (err as Error)?.message ?? String(err) };
+			console.error(`${ts()} [Vision] sendVisionFrameTool threw: ${(err as Error)?.message ?? err}`);
+			return { status: 'failed', error: 'captureAndSend failed' };
 		}
 	},
 };
@@ -532,7 +534,8 @@ export const startVisionTool: ToolDefinition = {
 			const info = startStream(source, fps ?? DEFAULT_FPS);
 			return { status: 'streaming', source: source.name, fps: info.fps, intervalMs: info.intervalMs };
 		} catch (err) {
-			return { status: 'failed', error: (err as Error)?.message ?? String(err) };
+			console.error(`${ts()} [Vision] startVisionTool threw: ${(err as Error)?.message ?? err}`);
+			return { status: 'failed', error: 'startStream failed' };
 		}
 	},
 };

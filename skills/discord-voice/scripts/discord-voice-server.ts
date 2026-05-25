@@ -35,6 +35,7 @@ import { join, dirname } from 'node:path';
 import { resolveWorkspace } from '../../../src/workspace_default.js';
 import { recordConversation, recordSession, recordToolCall } from '../../../src/conversation-store.js';
 import { resultBelongsTo } from '../../../src/result-channel-key.js';
+import { personalPath } from '../../../src/util_paths.js';
 import { type Tier, loadAccessTiers, effectiveTier, toolAllowed, toolNeed } from './access-tier.js';
 
 _dotenvConfig({ path: new URL('../../../.env', import.meta.url).pathname, override: true });
@@ -402,6 +403,15 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 		instructions = [
 			`You are Sutando, a personal AI assistant. You are in a Discord voice channel with your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''}.`,
 			'YOU are Sutando — the AI assistant. The person speaking is your OWNER, a human. Do NOT confuse yourself with them.',
+			// Per-node Stand identity — mirrors src/voice-agent.ts:606 pattern.
+			// `stand-identity.json` carries name + nameOrigin for the bot on
+			// this machine (e.g. "Echo Act IV (Mini)" on the Mac mini, "Lucy"
+			// on Susan's Mac Studio). Loading it here lets the discord-voice
+			// agent answer "who are you" with the same Stand name the core
+			// voice-agent already uses — single per-node identity contract
+			// across surfaces, no parallel env var. Silent fall-through if
+			// the file is absent (kept the generic "You are Sutando" framing).
+			(() => { try { const si = JSON.parse(readFileSync(personalPath('stand-identity.json'), 'utf-8')); return si.name ? `Your Stand name is ${si.name}. Origin: ${si.nameOrigin || 'earned through use'}. When asked your name or who you are, say "I'm Sutando — ${si.name}."` : ''; } catch { return ''; } })(),
 			'You have full capabilities — use the work tool for anything: check the screen, send emails, look things up, make calls, browse the web, or check results of previous tasks.',
 			'',
 			'## How to think',
@@ -433,10 +443,15 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 	} else {
 		instructions = [
 			'You are Sutando, an AI assistant in a Discord voice channel.',
+			// Per-node Stand identity — same load as owner-tier block above. Non-
+			// owner speakers also benefit from "this Sutando is named X" so
+			// "Hi Lucy" / "Hi Mini" doesn't get the rigid "I'm Sutando, not X"
+			// correction.
+			(() => { try { const si = JSON.parse(readFileSync(personalPath('stand-identity.json'), 'utf-8')); return si.name ? `Your Stand name is ${si.name}. When asked your name, say "I'm Sutando — ${si.name}."` : ''; } catch { return ''; } })(),
 			'Be helpful and conversational. You can answer general knowledge questions, do translations, and have conversations.',
 			'You cannot access files, control the screen, or delegate tasks.',
 			'Keep responses to 1-2 sentences.',
-		].join('\n');
+		].filter(Boolean).join('\n');
 	}
 
 	const tools: ToolDefinition[] = [];
