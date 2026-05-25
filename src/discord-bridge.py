@@ -3347,15 +3347,18 @@ async def poll_proactive():
                             access_data = {}
                         allow_list = access_data.get("allowFrom") or []
                         tier_map = access_data.get("tierMap") or {}
-                        if not allow_list:
+                        # #1117: explicit top-level `owner` wins over tierMap+allowFrom fallback.
+                        owner_id = (access_data.get("owner") or "").strip() or None
+                        if not owner_id and not allow_list:
                             print(f"  [proactive] no owner in allowFrom, skipping {f.name}")
                             f.unlink(missing_ok=True)
                             continue
                         # Preferred: the tier-tagged owner if one exists in allowFrom.
-                        owner_id = next(
-                            (uid for uid in allow_list if tier_map.get(uid) == "owner"),
-                            None,
-                        )
+                        if owner_id is None:
+                            owner_id = next(
+                                (uid for uid in allow_list if tier_map.get(uid) == "owner"),
+                                None,
+                            )
                         # Fallback: first non-bot user, list order preserved.
                         if owner_id is None:
                             for uid in allow_list:
