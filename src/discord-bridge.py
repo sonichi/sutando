@@ -57,6 +57,28 @@ from util_paths import shared_personal_path  # noqa: E402
 from task_priority import default_priority_for_source  # noqa: E402
 REPO = resolve_workspace()
 
+# discord-voice "magic word" join trigger (issue: za-warudo summon). The
+# bridge stays a THIN hook — it only detects "owner + join phrase" and hands
+# off to this helper, which owns the voice-channel resolution + server launch
+# + already-running guard. Keeping the feature logic in the skill honors the
+# CLAUDE.md core/skill split (core must not bloat with feature logic). The
+# import is best-effort: if the discord-voice skill is absent, the magic word
+# simply doesn't fire and the message is processed as a normal task.
+try:
+    sys.path.insert(
+        0, str(Path(__file__).resolve().parent.parent / "skills" / "discord-voice" / "scripts")
+    )
+    from join_trigger import (  # noqa: E402
+        message_is_join_phrase as _dv_message_is_join_phrase,
+        handle_join_trigger as _dv_handle_join_trigger,
+    )
+except Exception:  # pragma: no cover - skill optional
+    def _dv_message_is_join_phrase(text):  # type: ignore
+        return False
+
+    def _dv_handle_join_trigger(message):  # type: ignore
+        return ""
+
 # Vision-frame helper — pushes image attachments into the active voice session
 # so Gemini reacts in-stream. Best-effort: import failure or unreachable
 # voice-agent leaves the regular task pipeline unchanged.
@@ -86,26 +108,15 @@ ARCHIVE_TASKS_DIR = REPO / "tasks" / "archive"
 ARCHIVE_RESULTS_DIR = REPO / "results" / "archive"
 OWNER_ACTIVITY_FILE = STATE_DIR / "last-owner-activity.json"
 
-# Allowlist for paths that may be attached to outgoing Discord messages.
-# Result text can embed `[file: /path]` / `[send: /path]` / `[attach: /path]`
-# markers; we only forward paths that resolve under one of these roots.
-# Fail-closed: a non-matching path is reported inline rather than sent.
-SEND_ALLOWED_ROOTS = (
-    str(REPO / "results"),
-    str(REPO / "notes"),
-    # Notes canonical home (private dir) — once saved by save_note, paths
-    # reference the private location. Both old and new paths allowed during
-    # the transition; the resolver picks whichever exists.
-    str(shared_personal_path("notes", REPO)),
-    str(REPO / "docs"),
-    str(Path.home() / "Desktop" / "iclr-backups"),
-    str(Path.home() / "Documents" / "sutando-launch-assets"),
-)
-SEND_ALLOWED_PREFIXES = (
-    "/tmp/sutando-",
-    "/private/tmp/sutando-",
-    "/tmp/echo-",
-    "/private/tmp/echo-",
+# Allowlist for paths attached via `[file:|send:|attach:]` markers.
+# Single source of truth in `src/send_allowlist.py` — shared with
+# `src/dm-result.py`'s REST-fallback delivery (per liususan091219
+# review on PR #1029: keeping the policy as a copy in each file will
+# drift, even with "keep in sync" comments).
+from send_allowlist import (  # noqa: E402
+    SEND_ALLOWED_PREFIXES,
+    SEND_ALLOWED_ROOTS,
+    is_path_sendable as _is_path_sendable_shared,
 )
 
 
@@ -295,27 +306,11 @@ def _split_file_markers(text: str) -> tuple[str, list[str]]:
     return clean_text, files
 
 
-def _is_path_sendable(fpath: str) -> bool:
-    """True iff `fpath` is a real file AND resolves under an allowed root.
-
-    Uses os.path.realpath to collapse symlinks / `..` segments before the
-    prefix comparison, matching the sanitizer pattern used across the
-    codebase for CodeQL py/path-injection resolution.
-    """
-    if not os.path.isfile(fpath):
-        return False
-    try:
-        real = os.path.realpath(fpath)
-    except OSError:
-        return False
-    for root in SEND_ALLOWED_ROOTS:
-        root_real = os.path.realpath(root)
-        if real == root_real or real.startswith(root_real + os.sep):
-            return True
-    for prefix in SEND_ALLOWED_PREFIXES:
-        if real.startswith(prefix):
-            return True
-    return False
+# Thin alias — actual logic lives in src/send_allowlist.py so the
+# REST-fallback delivery path (src/dm-result.py) stays in lock-step.
+# Public name kept (_is_path_sendable) so existing call sites in this
+# file don't need touching beyond the import above.
+_is_path_sendable = _is_path_sendable_shared
 
 
 def write_owner_activity(channel: str, summary: str) -> None:
@@ -2525,6 +2520,37 @@ async def _handle_discord_message(message, force=False):
     if len(seen_message_ids) > 10000:
         seen_message_ids.clear()
 
+    # discord-voice "magic word" join trigger. THIN hook (CLAUDE.md core/skill
+    # split): the bridge only checks "is this the owner saying the join
+    # phrase"; everything else — voice-channel lookup, already-running guard,
+    # discord-voice-server launch — lives in the discord-voice skill helper.
+    # Owner-only by construction: a non-owner saying the phrase falls through
+    # to normal task handling. When it fires, the message IS the command — we
+    # send the reply and return WITHOUT writing a task file (no normal task
+    # for a join-phrase message). Placed AFTER dedup so gateway replay can't
+    # double-fire the spawn; the helper has its own `_server_already_running`
+    # guard anyway, but cheaper to dedup at the front gate.
+    if access_tier == "owner":
+        try:
+            is_join = _dv_message_is_join_phrase(text)
+        except Exception as e:
+            print(f"  [join-trigger] match check raised: {e}", flush=True)
+            is_join = False
+        if is_join:
+            print(f"  [join-trigger] owner @{username} said the join phrase — summoning discord-voice", flush=True)
+            try:
+                reply = _dv_handle_join_trigger(message)
+            except Exception as e:
+                print(f"  [join-trigger] handler raised: {e}", flush=True)
+                reply = "Couldn't process the voice-join request — check the bridge log."
+            try:
+                if reply:
+                    for chunk in _chunk_for_discord(reply):
+                        await message.channel.send(chunk)
+            except Exception as e:
+                print(f"  [join-trigger] reply send failed: {e}", flush=True)
+            return
+
     # Deterministic tier ownership: if SUTANDO_TEAM_TIER_OWNER is configured
     # and this node's machine does NOT match, drop non-owner-tier tasks so the
     # designated owner node handles them exclusively. Owner-tier tasks are
@@ -2701,12 +2727,22 @@ async def _handle_discord_message(message, force=False):
                 print(f"  [auto-react] {react_emoji} failed: {e}", flush=True)
 
     priority = default_priority_for_source("discord", access_tier)
+    # channel_name / guild_name: human-readable labels so the task-consumer can
+    # disambiguate one team channel from another without grepping numeric IDs
+    # against a memory file. DM channels have no `.name` attr; DMs have no
+    # guild. Default to "DM" for both. Newline-sanitize so a Discord name
+    # containing \n (rare but possible) can't inject a spurious metadata
+    # line into the task file's k:v shape (per qingyun review on #1077).
+    channel_name = (getattr(message.channel, "name", None) or "DM").replace("\n", " ")
+    guild_name = (message.guild.name if message.guild else "DM").replace("\n", " ")
     task_file.write_text(
         f"id: {task_id}\n"
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
         f"task: {user_task_text}\n"
         f"source: discord\n"
         f"channel_id: {message.channel.id}\n"
+        f"channel_name: {channel_name}\n"
+        f"guild_name: {guild_name}\n"
         f"source_message_id: {message.id}\n"
         f"user_id: {message.author.id}\n"
         f"access_tier: {access_tier}\n"
@@ -2858,6 +2894,59 @@ async def _catchup_missed_dms():
             print(f"  [dm-catchup] channel {channel_id_str} failed: {e}", flush=True)
 
 
+# Delivery-idempotency sentinels. Pre-fix: if the bridge crashed
+# BETWEEN `channel.send(reply_text)` returning success and the
+# subsequent `archive_file(result_file, ...)` call, on restart the
+# result file still exists in `results/` and would be re-sent —
+# producing a duplicate. With these sentinels:
+#
+#   1. Right BEFORE the per-task send block, `_is_delivered(task_id)`
+#      checks the sentinel. If present → skip send, run archive,
+#      clear sentinel.
+#   2. Right AFTER channel.send succeeds, `_mark_delivered(task_id)`
+#      touches the sentinel.
+#   3. After archive completes, `_clear_delivered(task_id)` removes
+#      the sentinel (bounded dir growth).
+#
+# The crash-between-send-and-sentinel window remains a narrow
+# double-send vector (Discord nonce-based dedup would close that
+# tighter; deferred to follow-up).
+#
+# Scope of THIS PR: poll_results main-path only. Channel-redirect,
+# proactive, and dm-fallback paths are scoped follow-ups.
+DELIVERED_DIR = REPO / "state" / "discord-delivered"
+
+
+def _delivered_sentinel_path(task_id: str) -> Path:
+    return DELIVERED_DIR / f"{task_id}.sentinel"
+
+
+def _mark_delivered(task_id: str) -> None:
+    """Touch the delivery sentinel for `task_id`. Called immediately
+    after a successful `channel.send`."""
+    try:
+        DELIVERED_DIR.mkdir(parents=True, exist_ok=True)
+        _delivered_sentinel_path(task_id).touch()
+    except Exception as e:
+        print(f"  [delivered] sentinel write failed for {task_id}: {e}", flush=True)
+
+
+def _is_delivered(task_id: str) -> bool:
+    """True iff the sentinel for `task_id` exists."""
+    try:
+        return _delivered_sentinel_path(task_id).exists()
+    except Exception:
+        return False
+
+
+def _clear_delivered(task_id: str) -> None:
+    """Remove the sentinel — called during archive cleanup."""
+    try:
+        _delivered_sentinel_path(task_id).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 PENDING_REPLIES_FILE = REPO / "state" / "discord-pending-replies.json"
 
 def _atomic_write_pending_replies(data: dict) -> None:
@@ -2975,6 +3064,21 @@ async def poll_results():
                     task_file = TASKS_DIR / f"{task_id}.txt"
                     archive_file(task_file, "tasks", task_id)
                     continue
+
+                # Idempotency check: if the previous run already sent
+                # this reply (sentinel present) but crashed BEFORE the
+                # archive completed, skip the send + archive normally.
+                # Avoids the double-delivery vector when the bridge
+                # restarts between channel.send() returning and
+                # archive_file() finishing. See DELIVERED_DIR docstring.
+                if _is_delivered(task_id):
+                    print(f"  Skipped (already delivered per sentinel): {task_id}", flush=True)
+                    archive_file(result_file, "results", task_id)
+                    task_file = TASKS_DIR / f"{task_id}.txt"
+                    archive_file(task_file, "tasks", task_id)
+                    _clear_delivered(task_id)
+                    continue
+
                 try:
                     # Extract optional [reply: <message_id>] directive — the
                     # agent signals "this result is a reply to that message"
@@ -3082,9 +3186,18 @@ async def poll_results():
                         try:
                             import outbox_log
                             ch_type = "discord_dm" if isinstance(channel, discord.DMChannel) else "discord_channel"
+                            # Human-readable label for audit: "#dev", "Chi DM",
+                            # or "DM" when the recipient name isn't available.
+                            if isinstance(channel, discord.DMChannel):
+                                _recipient = getattr(channel.recipient, "name", None)
+                                _label = f"{_recipient} DM" if _recipient else "DM"
+                            else:
+                                _ch_name = getattr(channel, "name", None)
+                                _label = f"#{_ch_name}" if _ch_name else None
                             outbox_log.append(
                                 channel_type=ch_type,
                                 recipient=str(channel.id),
+                                recipient_label=_label,
                                 body=clean_text,
                                 task_id=task_id,
                             )
@@ -3106,6 +3219,13 @@ async def poll_results():
                             await channel.send(f"(file not allowed: {fpath})")
                             print(f"  REJECTED file (not in allowlist): {fpath}", flush=True)
 
+                    # Mark delivered BEFORE the archive runs. If we
+                    # crash between channel.send returning and archive,
+                    # on restart the sentinel + result-file combo
+                    # triggers the skip-block above (archive + clear,
+                    # no re-send). Without this, the result file
+                    # would re-send on restart producing a duplicate.
+                    _mark_delivered(task_id)
                     print(f"  Replied: {reply_text[:80]}...", flush=True)
                 except Exception as e:
                     print(f"  Reply failed: {e}", flush=True)
@@ -3113,6 +3233,10 @@ async def poll_results():
                 archive_file(result_file, "results", task_id)
                 task_file = TASKS_DIR / f"{task_id}.txt"
                 archive_file(task_file, "tasks", task_id)
+                # Delivery succeeded + archived — sentinel has served
+                # its purpose, remove to bound `discord-delivered/`
+                # directory growth.
+                _clear_delivered(task_id)
         await asyncio.sleep(1)
 
 
@@ -3233,9 +3357,12 @@ async def poll_proactive():
                                 await dm.send(chunk)
                             try:
                                 import outbox_log
+                                _user_name = getattr(user, "name", None)
+                                _label = f"{_user_name} DM" if _user_name else None
                                 outbox_log.append(
                                     channel_type="discord_dm",
                                     recipient=str(owner_id),
+                                    recipient_label=_label,
                                     body=clean_text,
                                     task_id=f.stem,
                                 )
@@ -3388,9 +3515,12 @@ async def poll_dm_fallback():
                                     await target_channel.send(chunk)
                                 try:
                                     import outbox_log
+                                    _ch_name = getattr(target_channel, "name", None)
+                                    _label = f"#{_ch_name}" if _ch_name else None
                                     outbox_log.append(
                                         channel_type="discord_channel",
                                         recipient=str(target_channel_id),
+                                        recipient_label=_label,
                                         body=text_only,
                                         task_id=_task_id,
                                     )
