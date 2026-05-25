@@ -979,9 +979,12 @@ def run_all_checks() -> list[dict]:
     # time the discord-bridge / owner triggers a voice session.
     checks.append(check_discord_voice())
 
-    # Sutando menu bar app (optional — only check if binary exists)
-    sutando_bin = REPO_DIR / "src" / "Sutando" / "Sutando"
-    if sutando_bin.exists():
+    # Sutando menu bar app — check either dev-built binary or installed .app.
+    # On the distributed .app path the dev binary doesn't ship; we still want
+    # the menu bar check to run so dashboard reports accurate status.
+    dev_bin = REPO_DIR / "src" / "Sutando" / "Sutando"
+    app_bin = Path("/Applications/Sutando.app/Contents/MacOS/Sutando")
+    if dev_bin.exists() or app_bin.exists():
         # Distinguish pgrep failures (exit code != 0 and != 1) from a real
         # no-match (exit code 1). Pre-fix the bare try/except swallowed
         # subprocess errors AND empty results into a single "no pids" path,
@@ -994,7 +997,7 @@ def run_all_checks() -> list[dict]:
         pids: list[str] = []
         try:
             result = subprocess.run(
-                ["/usr/bin/pgrep", "-f", "Sutando/Sutando"],
+                ["/usr/bin/pgrep", "-f", "(Sutando|MacOS)/Sutando"],
                 capture_output=True, text=True, timeout=5,
             )
             if result.returncode == 0:
@@ -1012,12 +1015,16 @@ def run_all_checks() -> list[dict]:
 
         if pgrep_status == "ok-running" and pids:
             check = {"name": "sutando-app", "status": "ok", "detail": f"running (⌃C/⌃V/⌃M)"}
-            mark_stale_if_outdated(
-                check,
-                REPO_DIR / "src" / "Sutando" / "main.swift",
-                "src/Sutando/Sutando",
-                binary_path=REPO_DIR / "src" / "Sutando" / "Sutando",
-            )
+            # Staleness check is meaningful only in the dev workflow — the
+            # .app binary and bundled main.swift share a build mtime, so a
+            # comparison there is always equal. Skip when dev_bin missing.
+            if dev_bin.exists():
+                mark_stale_if_outdated(
+                    check,
+                    REPO_DIR / "src" / "Sutando" / "main.swift",
+                    "(Sutando|MacOS)/Sutando",
+                    binary_path=dev_bin,
+                )
             checks.append(check)
         elif pgrep_status == "ok-stopped":
             checks.append({"name": "sutando-app", "status": "warn", "detail": "not running — hotkeys disabled"})

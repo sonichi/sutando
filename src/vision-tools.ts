@@ -186,6 +186,37 @@ export function setVisionSession(session: unknown): void {
 	if (!session) stopStream();
 }
 
+// --- Tool-surface updater registry ----------------------------------------
+//
+// Lets skills call session.updateTools() without importing voice-agent.ts.
+// voice-agent registers the updater + full tool list after session creation,
+// clears it on shutdown. Skills call callUpdateTools/callRestoreTools to
+// enforce or lift a tools_allow constraint.
+
+type ToolUpdateFn = (tools: ToolDefinition[]) => void;
+let toolUpdaterFn: ToolUpdateFn | null = null;
+let fullToolSurface: ToolDefinition[] = [];
+
+/** Called by voice-agent after VoiceSession is constructed (and with null on shutdown). */
+export function setSessionToolUpdater(fn: ToolUpdateFn | null, fullTools: ToolDefinition[]): void {
+	toolUpdaterFn = fn;
+	fullToolSurface = fn ? fullTools : [];
+}
+
+/** Replace the live session's tool surface. Returns true if the updater is registered. */
+export function callUpdateTools(tools: ToolDefinition[]): boolean {
+	if (!toolUpdaterFn) return false;
+	toolUpdaterFn(tools);
+	return true;
+}
+
+/** Restore the session's tool surface to the full set registered at startup. */
+export function callRestoreTools(): boolean {
+	if (!toolUpdaterFn || fullToolSurface.length === 0) return false;
+	toolUpdaterFn(fullToolSurface);
+	return true;
+}
+
 function getSendFile(): ((b64: string, mime: string) => void) | null {
 	const t = sessionRef?.transport;
 	if (!t || !t.sendFile) return null;

@@ -29,7 +29,7 @@ import { z } from 'zod';
 import { existsSync, readFileSync, readdirSync, statSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, openSync, writeSync, closeSync } from 'node:fs';
 import { execSync as execSyncTop } from 'node:child_process';
 import { inlineTools, coreDocumentedSkills } from './inline-tools.js';
-import { setVisionSession, startVisionControlServer, stopVisionControlServer } from './vision-tools.js';
+import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater } from './vision-tools.js';
 import { clearActiveArtifact } from './artifact-cache-tools.js';
 import { injectText } from './browser-tools.js';
 import { join, dirname } from 'node:path';
@@ -39,7 +39,7 @@ import { VoiceSession } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
 import { workTool, startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
-import { recordSession } from './conversation-store.js';
+import { recordSession, recordToolCall } from './conversation-store.js';
 import { buildSutandoSystemPrompt, buildVoiceAgentContext } from './voice-context.js';
 import { classifyTransportClose, type ClassifiedClose } from './voice-error-classifier.js';
 
@@ -512,6 +512,8 @@ function getPresenterStateMarker(): string {
 	return '';
 }
 
+const mainAgentTools: ToolDefinition[] = [workTool, getTaskStatus, switchModeTool, saveMeetingNoteTool, ...inlineTools];
+
 const mainAgent: MainAgent = {
 	name: 'main',
 	get greeting() {
@@ -759,7 +761,7 @@ const mainAgent: MainAgent = {
 	// enable it once we find a reliable gate signal (probably after
 	// bodhi exposes a proper "user has actually spoken" signal under
 	// native audio).
-	tools: [workTool, getTaskStatus, switchModeTool, saveMeetingNoteTool, ...inlineTools],
+	tools: mainAgentTools,
 	googleSearch: VOICE_GOOGLE_SEARCH,
 	onEnter: async () => console.log(`${ts()} [Agent] Sutando ready`),
 	// Voice-driven close — strict version. User wants to be able to
@@ -949,7 +951,10 @@ async function main() {
 			},
 			onToolCall: (e) => {
 				voiceToolIdMap.set(e.toolCallId, e.toolName);
-				voiceEvents.push({ event: `tool_call:${e.toolName}`, timestamp: new Date().toISOString() });
+				// tool_call event push removed per #1052 — canonical record
+				// is the surface-table row written in onToolResult via
+				// recordToolCall(). Pushing here would duplicate in
+				// session_events.
 				console.log(`${ts()} [Tool] ${e.toolName} (${e.execution})`);
 				// Flag the web-client that a tool is in flight so the avatar
 				// can show the blue `.working` pulse and the menu bar can
@@ -969,7 +974,11 @@ async function main() {
 			onToolResult: (e) => {
 				const toolName = voiceToolIdMap.get(e.toolCallId) || 'unknown';
 				voiceToolCalls.push({ name: toolName, durationMs: e.durationMs, timestamp: new Date().toISOString() });
-				voiceEvents.push({ event: `tool_result:${toolName}:${e.durationMs}ms`, timestamp: new Date().toISOString() });
+				// tool_result event push removed per #1052 — recordToolCall
+				// below is the canonical write (surface table, kind='tool_call',
+				// duration_ms column). Pushing here would duplicate in
+				// session_events.
+				recordToolCall('voice', toolName, e.durationMs, SESSION_ID);
 				console.log(`${ts()} [Tool] result: ${toolName} (${e.status}, ${e.durationMs}ms)`);
 				// Clear the tool track; browser track takes over immediately.
 				fetch('http://localhost:8080/mute-state?state=idle&source=tool').catch(() => {});
@@ -988,6 +997,10 @@ async function main() {
 	// HTTP control endpoint so the web-client Watch button can drive the
 	// same controller (proxied through web-client to stay same-origin).
 	setVisionSession(session);
+	// updateTools is on the private transport (GeminiLiveTransport), not VoiceSession.
+	// Applied on next reconnect — restricts what Gemini sees after the next transport cycle.
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	setSessionToolUpdater((tools) => (session as any).transport?.updateTools?.(tools), mainAgentTools);
 	startVisionControlServer();
 
 	// Bumped 5min into the future on every non-retryable transport close
@@ -1219,10 +1232,10 @@ async function main() {
 				console.log(`${ts()}   [${item.role}] ${item.content}`);
 				logConversation(item.role, item.content, SESSION_ID);
 				const evtRole = item.role === 'user' ? 'user' : 'sutando';
-				// 7s offset for user speech: Gemini STT commits transcript ~7s after
-				// the user actually spoke (measured via iPad recording comparison).
-				const evtTs = item.role === 'user' ? new Date(Date.now() - 7000).toISOString() : new Date().toISOString();
-				voiceEvents.push({ event: `${evtRole}:${item.content || ''}`, timestamp: evtTs });
+				// utterance event push removed per #1052 — canonical record is
+				// the voice-table row written by logConversation() above
+				// (kind='user'/'agent', ts_unix). session_events keeps only
+				// lifecycle entries to stop triple-encoding the same atom.
 				voiceTranscript.push({ role: evtRole, text: item.content || '' });
 				const label = item.role === 'user' ? 'User' : 'Sutando';
 				try { appendFileSync(liveTranscriptPath, `[${new Date().toLocaleTimeString('en-US', {hour12:false})}] ${label}: ${item.content}\n`); } catch {}
@@ -1253,6 +1266,7 @@ async function main() {
 		console.log(`\n${ts()} Shutting down...`);
 		writeVoiceMetrics();
 		setVisionSession(null);
+		setSessionToolUpdater(null, []);
 		stopVisionControlServer();
 		await session.close('user_hangup');
 		process.exit(0);
@@ -1332,31 +1346,31 @@ async function main() {
 		};
 	}
 
-	// Reset per-session state on RE-connect. Bodhi's state machine fires
-	// onSessionStart only on the first ACTIVE transition (index.js:1219 —
-	// the `!this.startedAt` guard, and `startedAt` is never reset to null).
-	// Without this wrap, a user's second/third/Nth client-connect within
-	// the same process doesn't retrigger our onSessionStart hook, so
-	// metricsWritten stays true from the last flush, and the next
-	// onSessionEnd `writeVoiceMetrics()` returns early — record lost.
-	// Observed 2026-04-17 when a whole day of voice sessions missed the
-	// jsonl because MBP kept one voice-agent process alive across many
-	// client reconnects. First connect still goes through bodhi's
-	// onSessionStart (our callback resets state there); this wrap only
-	// kicks in on the 2nd+ connect. Also cancels any pending idle teardown.
-	let clientHasConnectedOnce = false;
+	// Reset per-session state on client connect when a stale flush is sitting
+	// in the buffer. Bodhi's onSessionStart only fires on the first ACTIVE
+	// transition (index.js:1219 — `!this.startedAt` guard, never reset). So:
+	//   (a) 2nd+ user-connects within one process miss the onSessionStart reset
+	//   (b) a phantom server-idle session_end can flush `metricsWritten=true`
+	//       BEFORE the first real client ever connects (observed 2026-05-22:
+	//       server starts → 60s idle → bodhi auto-ends a 0/0 phantom session →
+	//       metricsWritten=true → real user connects 30min later → next
+	//       onSessionEnd's writeVoiceMetrics returns early → record lost)
+	// Both reduce to: whenever a client connects while metricsWritten=true,
+	// the previous logical session has already been flushed, so reset for
+	// the new one. (The very first connect on a fresh process with no idle
+	// phantom has metricsWritten=false and skips the reset — onSessionStart
+	// already did it.) Also cancels any pending idle teardown.
 	const origConnect = (session as any).handleClientConnected?.bind(session);
 	if (origConnect) {
 		(session as any).handleClientConnected = () => {
 			cancelIdleTeardown();
-			if (clientHasConnectedOnce) {
+			if (metricsWritten) {
 				userTurnCount = 0; userHasInterrupted = false; sessionEnding = false;
 				voiceSessionStart = Date.now(); metricsWritten = false;
 				voiceEvents.length = 0; voiceToolCalls.length = 0; voiceTranscript.length = 0;
-				voiceEvents.push({ event: 'session_started:client_reconnect', timestamp: new Date().toISOString() });
-				console.log(`${ts()} [Session] Client reconnected — reset metrics buffer (bodhi onSessionStart guard bypass)`);
+				voiceEvents.push({ event: 'session_started:client_connect', timestamp: new Date().toISOString() });
+				console.log(`${ts()} [Session] Client connected after prior flush — reset metrics buffer`);
 			}
-			clientHasConnectedOnce = true;
 			writeVoiceState(true);
 			origConnect();
 		};

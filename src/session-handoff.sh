@@ -95,3 +95,11 @@ print(f'5h: {d[\"utilization_5h\"]:.0%} (resets in {m5}min at {r5.strftime(\"%I:
 } > "$STATE_FILE" 2>/dev/null
 
 echo "Session state saved to $STATE_FILE"
+
+# Clear the proactive-loop fresh-session sentinel so the NEXT session's first
+# /proactive-loop re-fires /catchup-after-startup. Without this, the sentinel
+# from the just-ended session persists and the next /proactive-loop's step 1
+# skips catchup, defeating the auto-fire wiring. (Paired with
+# skills/proactive-loop/SKILL.md step 1's sentinel guard.)
+SENTINEL="${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}/state/proactive-loop-started.sentinel"
+rm -f "$SENTINEL" 2>/dev/null
