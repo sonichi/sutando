@@ -4,6 +4,8 @@
 Run: python3 tests/task-priority.test.py
 Exit: 0 on pass, 1 on fail.
 """
+from __future__ import annotations
+
 import os
 import sys
 import tempfile

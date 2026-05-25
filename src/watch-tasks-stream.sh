@@ -47,16 +47,32 @@ mkdir -p "$TASKS_DIR"
 # /private/tmp — which is the default.
 TASKS_DIR_ABS="$(cd "$TASKS_DIR" && pwd -P)"
 
+# PID file for the Stop-hook cleanup path (see .claude/settings.json Stop
+# hook). When a Claude Code session ends, the Stop hook reads this file and
+# kills the watcher PID it points at, so the fswatch process doesn't outlive
+# the session and turn into an orphan. The trap below removes the file on a
+# clean exit; the Stop hook removes it after the kill on dirty exits.
+#
+# Same workspace resolution as TASKS_DIR (above): explicit env override,
+# else canonical default. Living under state/ matches the workspace contract
+# in CLAUDE.md (loose status/state files belong there).
+if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
+  STATE_DIR="${SUTANDO_WORKSPACE/#\~/$HOME}/state"
+else
+  STATE_DIR="$HOME/.sutando/workspace/state"
+fi
+mkdir -p "$STATE_DIR"
+PID_FILE="$STATE_DIR/watch-tasks-stream.pid"
+echo "$$" > "$PID_FILE"
+# Cleanup on any exit path (SIGINT, SIGTERM, normal exit) so the file
+# doesn't outlive the process on a clean shutdown. Dirty exits (SIGKILL,
+# panic) skip the trap — the Stop hook + startup reaper cover those.
+trap 'rm -f "$PID_FILE"' EXIT
+
 # Initial sweep — surface any pre-existing tasks that arrived during a
 # restart gap.
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 shopt -s nullglob
 for f in "$TASKS_DIR"/*.txt; do
-  # Restart-safety #4: bump the `attempts:` counter BEFORE emit.
-  # Initial-sweep emissions either reflect a fresh-on-disk task or a
-  # leftover from a prior crash; bumping conveys retry-count
-  # semantics to the agent (attempts > 1 → agent treats as retry).
-  python3 "$SCRIPT_DIR/task_bump_attempts.py" "$f" 2>/dev/null || true
   echo "TASK_FILE: $(basename "$f")"
 done
 shopt -u nullglob
@@ -91,10 +107,6 @@ fswatch \
     *.txt)
       parent="$(dirname "$path")"
       if [ "$parent" = "$TASKS_DIR_ABS" ] && [ -f "$path" ]; then
-        # Restart-safety #4: bump `attempts:` BEFORE emit. For
-        # fresh-file events this sets attempts=1; fswatch dedupe
-        # prevents same-session double-bumps from burst events.
-        python3 "$SCRIPT_DIR/task_bump_attempts.py" "$path" 2>/dev/null || true
         echo "TASK_FILE: $(basename "$path")"
       fi
       ;;
