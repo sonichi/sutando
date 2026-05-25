@@ -874,9 +874,21 @@ def run_all_checks() -> list[dict]:
             checks.append({"name": name, "status": "warn", "detail": "configured but not running"})
             continue
 
-        # Check 1: Multiple processes (zombie/duplicate)
+        # Check 1: Multiple processes (zombie/duplicate).
+        # Show source paths so it's clear whether these are expected
+        # app-bundle vs dev-repo coexistence or accidental duplicate spawns.
         if len(pids) > 1:
-            checks.append({"name": name, "status": "warn", "detail": f"multiple processes ({len(pids)} PIDs: {','.join(pids)})"})
+            def _pid_script(pid: str) -> str:
+                try:
+                    r = subprocess.run(["/bin/ps", "-p", pid, "-o", "command="],
+                                       capture_output=True, text=True, timeout=3)
+                    parts = r.stdout.strip().split()
+                    py_args = [p for p in parts if p.endswith(".py")]
+                    return py_args[-1] if py_args else "?"
+                except Exception:
+                    return "?"
+            pid_paths = ", ".join(f"{p}:{_pid_script(p)}" for p in pids)
+            checks.append({"name": name, "status": "warn", "detail": f"multiple processes ({len(pids)} PIDs: {pid_paths})"})
             continue
 
         # Check 2: Log file freshness — prefer logs/ (where startup.sh writes)
