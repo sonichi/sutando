@@ -38,7 +38,7 @@ from workspace_default import resolve_workspace  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 from vault_intercept import intercept_vault_commands  # noqa: E402
-REPO = resolve_workspace()
+from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402REPO = resolve_workspace()
 TASKS_DIR = REPO / "tasks"
 RESULTS_DIR = REPO / "results"
 
@@ -533,7 +533,7 @@ def main():
 
                 forward_note = extract_forward_note(msg)
 
-                print(f"  @{username}{forward_note}: {text}{attachment_note}")
+                print(f"  @{username}{forward_note}: {redact_vault_commands(text)}{attachment_note}")
 
                 # Write as task (same format as voice bridge)
                 ts = int(time.time() * 1000)
