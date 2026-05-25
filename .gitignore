@@ -49,6 +49,8 @@ tests/*
 !tests/*.test.sh
 !tests/_helpers/
 !tests/_helpers/*.ts
+!tests/migrations/
+!tests/migrations/*.py
 skills/personal-*/
 tests/security/*.md
 !tests/security/*.md.example
