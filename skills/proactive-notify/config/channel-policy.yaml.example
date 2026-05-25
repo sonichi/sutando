@@ -8,9 +8,12 @@ quiet_hours:
   timezone: "America/Los_Angeles"
 
 # Channel chosen per urgency tier when no override matches.
+# Available channels: call, sms, whatsapp, discord_dm, voice, queue
+# NOTE: sms requires A2P 10DLC registration (issue #965). Use whatsapp as a
+# drop-in replacement while registration is pending — same Twilio creds.
 default_channel:
   critical: call
-  important: sms
+  important: whatsapp   # flip to sms once A2P 10DLC approved
   fyi: queue
 
 # Overrides — first match wins. Each entry may rewrite the channel-per-urgency
