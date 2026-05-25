@@ -404,6 +404,22 @@ function delegateTask(s: DiscordVoiceSession, taskDescription: string): Promise<
 
 // --- Build agent ------------------------------------------------------------
 
+// Inject a system-role message into the live Gemini Live transport.
+// Owns the `(... as any).transport.sendContent` cast in one place so future
+// bodhi-realtime-agent versions that publicize this surface only need one
+// edit. Used for Layer-2 peer-detected announcement, magic-word takeover,
+// recent_context replays, and a few other system-side nudges.
+//
+// TODO: bodhi 1.x stability — `transport.sendContent` is an internal API on
+// the VoiceSession; bodhi may rename/restructure it across minor versions.
+// Keep all call sites going through this wrapper.
+function injectSystemMessage(s: DiscordVoiceSession, text: string): void {
+	(s.voiceSession as any).transport.sendContent(
+		[{ role: 'user', text }],
+		true,
+	);
+}
+
 function buildAgent(s: DiscordVoiceSession): MainAgent {
 	// Declare the full owner toolset whenever an owner is configured (access.json)
 	// or the legacy flag is on; the per-speaker tier is then enforced at execute().
@@ -1206,8 +1222,19 @@ async function start(): Promise<void> {
 	// #1089 single-bot enforcement, layer 2 (adversarial post-join watcher).
 	// If a sutando peer joins our channel despite layer 1 (race, env override,
 	// compromised peer), leave the channel after a short audible announcement.
+	//
+	// Race-window note: when two peers race in nearly-simultaneously, both
+	// observe each other via voiceStateUpdate and both exit. The watcher
+	// (Sutando.app's checkWatcher) then respawns exactly one. Cooperative-
+	// symmetric and eventually-consistent — chosen over earliest-join-wins
+	// because the respawn cost is bounded (~seconds) and the symmetric path
+	// avoids a tie-break/coordination protocol we'd otherwise have to invent.
 	if (!SUTANDO_PEER_ENFORCEMENT_DISABLED) {
-		client.on('voiceStateUpdate', (oldState, newState) => {
+		// `client.once` (not `.on`) — once a peer is detected we exit the
+		// process anyway, so registering as a one-shot listener avoids the
+		// per-event cleanup dance and prevents handler-retention on the
+		// Client instance for the lifetime of the process.
+		client.once('voiceStateUpdate', (oldState, newState) => {
 			const justJoinedOurChannel = newState.channelId === CHANNEL_ID && oldState.channelId !== CHANNEL_ID;
 			if (!justJoinedOurChannel) return;
 			const u = newState.member?.user;
@@ -1221,9 +1248,9 @@ async function start(): Promise<void> {
 			// (TTS no-shows) Lucy still leaves; the disconnect is the
 			// authoritative action.
 			try {
-				(session.voiceSession as any).transport.sendContent(
-					[{ role: 'user', text: `[System] Another Sutando bot (${u.tag}) just joined this voice channel. Say briefly: "I detected another Sutando bot — leaving." Then stop.` }],
-					true,
+				injectSystemMessage(
+					session,
+					`[System] Another Sutando bot (${u.tag}) just joined this voice channel. Say briefly: "I detected another Sutando bot — leaving." Then stop.`,
 				);
 			} catch (e) {
 				console.error(`${ts()} [Setup] #1089 announcement injection failed:`, e);
