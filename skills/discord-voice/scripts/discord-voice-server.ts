@@ -127,6 +127,12 @@ const ALLOWED_BOT_USER_IDS = new Set(
 		.split(',').map(s => s.trim()).filter(Boolean)
 );
 
+// Per-instance display name (e.g. "Lucy" on Mac Studio, "Maddy" on MacBook).
+// When set, the voice-agent system prompt leads with the instance name so
+// Gemini answers "who are you" with the instance name, not the generic
+// "Sutando". Empty / unset = generic-Sutando identity (backwards-compatible).
+const INSTANCE_NAME = process.env.SUTANDO_INSTANCE_NAME ?? '';
+
 // Hung-session watchdog threshold. A Gemini Live session can silently stall —
 // audio keeps flowing in but it stops emitting turn.end, with no transport
 // close event to trigger the reconnect path. If utterances have piled up
@@ -400,8 +406,12 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 			catch { return ''; }
 		})();
 		instructions = [
-			`You are Sutando, a personal AI assistant. You are in a Discord voice channel with your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''}.`,
-			'YOU are Sutando — the AI assistant. The person speaking is your OWNER, a human. Do NOT confuse yourself with them.',
+			INSTANCE_NAME
+				? `You are ${INSTANCE_NAME}, a Sutando instance — a personal AI assistant. You are in a Discord voice channel with your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''}. When the owner asks who you are, answer with "${INSTANCE_NAME}", not "Sutando".`
+				: `You are Sutando, a personal AI assistant. You are in a Discord voice channel with your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''}.`,
+			INSTANCE_NAME
+				? `YOU are ${INSTANCE_NAME} — a Sutando AI assistant. The person speaking is your OWNER, a human. Do NOT confuse yourself with them.`
+				: 'YOU are Sutando — the AI assistant. The person speaking is your OWNER, a human. Do NOT confuse yourself with them.',
 			'You have full capabilities — use the work tool for anything: check the screen, send emails, look things up, make calls, browse the web, or check results of previous tasks.',
 			'',
 			'## How to think',
@@ -432,7 +442,9 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 		].filter(Boolean).join('\n');
 	} else {
 		instructions = [
-			'You are Sutando, an AI assistant in a Discord voice channel.',
+			INSTANCE_NAME
+				? `You are ${INSTANCE_NAME}, a Sutando AI assistant in a Discord voice channel. When asked who you are, answer with "${INSTANCE_NAME}".`
+				: 'You are Sutando, an AI assistant in a Discord voice channel.',
 			'Be helpful and conversational. You can answer general knowledge questions, do translations, and have conversations.',
 			'You cannot access files, control the screen, or delegate tasks.',
 			'Keep responses to 1-2 sentences.',
