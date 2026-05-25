@@ -234,6 +234,56 @@ with tempfile.TemporaryDirectory() as td:
         fail("T12: all stale files archived", f"{len(remaining)} remaining out={proc.stdout.strip()[:80]}")
 
 # ---------------------------------------------------------------------------
+# T13 — mixed fresh+stale: only stale archived, fresh untouched
+# ---------------------------------------------------------------------------
+with tempfile.TemporaryDirectory() as td:
+    ws = Path(td)
+    results = ws / "results"
+    results.mkdir()
+    stale = results / "task-old.txt"
+    stale.write_text("old")
+    os.utime(stale, (time.time() - 48 * 3600,) * 2)
+    fresh = results / "task-new.txt"
+    fresh.write_text("new")
+    proc = run_script(ws, {"RETENTION_HOURS": "24"})
+    if not stale.exists() and fresh.exists() and proc.returncode == 0:
+        ok("T13: mixed fresh+stale — only stale moved, fresh stays")
+    else:
+        fail("T13: mixed fresh+stale", f"stale={stale.exists()} fresh={fresh.exists()}")
+
+# ---------------------------------------------------------------------------
+# T14 — RETENTION_HOURS=0 archives every .txt file regardless of age
+# ---------------------------------------------------------------------------
+with tempfile.TemporaryDirectory() as td:
+    ws = Path(td)
+    results = ws / "results"
+    results.mkdir()
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (results / name).write_text("content")
+    proc = run_script(ws, {"RETENTION_HOURS": "0"})
+    remaining = list(results.glob("*.txt"))
+    if not remaining and proc.returncode == 0:
+        ok("T14: RETENTION_HOURS=0 archives all .txt files immediately")
+    else:
+        fail("T14: RETENTION_HOURS=0", f"{len(remaining)} .txt remaining")
+
+# ---------------------------------------------------------------------------
+# T15 — .sending files are NOT archived (only .txt suffix is touched)
+# ---------------------------------------------------------------------------
+with tempfile.TemporaryDirectory() as td:
+    ws = Path(td)
+    results = ws / "results"
+    results.mkdir()
+    sending = results / "proactive-1748000000.sending"
+    sending.write_text("in-flight")
+    os.utime(sending, (time.time() - 48 * 3600,) * 2)
+    proc = run_script(ws, {"RETENTION_HOURS": "24"})
+    if sending.exists():
+        ok("T15: .sending files are not archived (only .txt suffix is in scope)")
+    else:
+        fail("T15: .sending files untouched", ".sending file was incorrectly archived")
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 print(f"\n{PASS}/{PASS+FAIL} tests passed")
