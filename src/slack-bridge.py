@@ -130,6 +130,20 @@ def write_owner_activity(channel: str, summary: str) -> None:
         print(f"  [owner-activity] write failed: {e}", flush=True)
 
 
+def find_task_file(tasks_dir: Path, task_id: str):
+    """Return the actual on-disk path for task_id.
+
+    claim_task.py (#884) renames task-{id}.txt → task-{id}.claimed-core-N.txt
+    atomically. Callers that hard-code the bare .txt path silently no-op on
+    archive because the file no longer exists under that name (#933).
+    """
+    bare = tasks_dir / f"{task_id}.txt"
+    if bare.exists():
+        return bare
+    matches = list(tasks_dir.glob(f"{task_id}.claimed-core-*.txt"))
+    return matches[0] if matches else None
+
+
 def archive_file(src: Path, kind: str, task_id: str) -> None:
     """Move src into archive/<tasks|results>/YYYY-MM/ instead of deleting.
     Matches the behavior of telegram-bridge.py / discord-bridge.py."""
@@ -591,7 +605,9 @@ def result_watcher():
                         print(f"[Slack] reply error: {e}", flush=True)
 
                 archive_file(result_file, "results", task_id)
-                archive_file(TASKS_DIR / f"{task_id}.txt", "tasks", task_id)
+                _tf = find_task_file(TASKS_DIR, task_id)
+                if _tf:
+                    archive_file(_tf, "tasks", task_id)
 
             # Proactive messages (sent to owner DM)
             if not presenter_mode_active():
