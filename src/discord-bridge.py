@@ -66,6 +66,20 @@ except Exception:  # pragma: no cover
     def _push_vision_image(path: str, source: str = "discord") -> bool:  # type: ignore
         return False
 
+# Checklist skill — renders [checklist]-tagged results as Discord buttons.
+# Best-effort: if the skill is absent the marker is stripped and the plain
+# text is posted instead (graceful degradation).
+_checklist_detector = None
+_checklist_view_builder = None
+try:
+    sys.path.insert(
+        0, str(Path(__file__).resolve().parent.parent / "skills" / "checklist-respond" / "scripts")
+    )
+    import detector as _checklist_detector   # type: ignore
+    import view_builder as _checklist_view_builder  # type: ignore
+except Exception:  # pragma: no cover - skill optional
+    pass
+
 # Load token — env var takes precedence (allows test injection without a real .env file)
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 if not TOKEN:
@@ -85,6 +99,7 @@ STATE_DIR = REPO / "state"
 ARCHIVE_TASKS_DIR = REPO / "tasks" / "archive"
 ARCHIVE_RESULTS_DIR = REPO / "results" / "archive"
 OWNER_ACTIVITY_FILE = STATE_DIR / "last-owner-activity.json"
+CHECKLIST_STATE_DIR = STATE_DIR / "checklists"
 
 # Allowlist for paths that may be attached to outgoing Discord messages.
 # Result text can embed `[file: /path]` / `[send: /path]` / `[attach: /path]`
@@ -2132,6 +2147,70 @@ async def on_message_edit(before, after):
     await _handle_discord_message(after, force=True)
 
 
+@client.event
+async def on_interaction(interaction):
+    """Handle Discord button interactions — used by the checklist skill.
+
+    custom_id format: cl_<msg_id>_<item_id>  (set by view_builder.cid()).
+    Only allowed users (personal-bot allowlist) may click.
+    Gracefully ignores unknown custom_ids so other interaction types don't error.
+    """
+    if _checklist_view_builder is None:
+        return  # skill not installed
+    cid_str = getattr(interaction, "data", {}).get("custom_id", "") if hasattr(interaction, "data") else ""
+    if not cid_str:
+        return
+    parsed = _checklist_view_builder.parse_cid(cid_str)
+    if parsed is None:
+        return  # not a checklist button
+    msg_id, item_id = parsed
+
+    # Access control: only allowlist users may interact
+    clicker_id = str(interaction.user.id) if hasattr(interaction, "user") else ""
+    if clicker_id not in load_allowed():
+        try:
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+        except Exception:
+            pass
+        return
+
+    # Load state
+    state = _checklist_view_builder.load_state(CHECKLIST_STATE_DIR, msg_id)
+    if state is None:
+        try:
+            await interaction.response.send_message("Checklist state not found.", ephemeral=True)
+        except Exception:
+            pass
+        return
+
+    # Apply the click
+    username = getattr(interaction.user, "display_name", None) or getattr(interaction.user, "name", "?")
+    state = _checklist_view_builder.apply_click(state, item_id, clicker_id, username)
+    _checklist_view_builder.save_state(CHECKLIST_STATE_DIR, msg_id, state)
+
+    # Rebuild the view + edit the message
+    try:
+        spec_data = state.get("spec", {})
+        # Reconstruct a minimal spec-like object for view building
+        class _FakeSpec:
+            kind = spec_data.get("kind", "checklist")
+            items = [type("I", (), {"id": it["id"], "label": it["label"], "state": it.get("state","pending")})()
+                     for it in spec_data.get("items", [])]
+            preamble = spec_data.get("preamble", "")
+            original_text = spec_data.get("original_text", "")
+        new_view = _checklist_view_builder.build_view(discord, _FakeSpec(), msg_id, state.get("voters", {}))
+        preamble = _FakeSpec.preamble
+        original = _FakeSpec.original_text
+        body = f"{preamble}\n\n{original}".strip() if preamble else original
+        await interaction.response.edit_message(content=body or "…", view=new_view)
+    except Exception as e:
+        print(f"  [checklist] interaction edit failed: {e}", flush=True)
+        try:
+            await interaction.response.send_message("Update failed.", ephemeral=True)
+        except Exception:
+            pass
+
+
 async def _handle_discord_message(message, force=False):
     if message.author == client.user:
         return
@@ -3189,11 +3268,49 @@ async def poll_results():
                     # Extract file paths: [file: /path] or [send: /path]
                     clean_text, files = _split_file_markers(reply_text)
 
+                    # Checklist rendering — if the reply contains [checklist] and the
+                    # skill is installed, post with Discord buttons instead of plain text.
+                    # State is saved to state/checklists/<msg_id>.json for interaction handling.
+                    _checklist_posted = False
+                    if _checklist_detector is not None and _checklist_view_builder is not None:
+                        checklist_spec = _checklist_detector.parse_checklist(clean_text)
+                        if checklist_spec is not None:
+                            try:
+                                ref = discord.MessageReference(message_id=reply_to_id, channel_id=channel.id, fail_if_not_exists=False) if reply_to_id else None
+                                # Post preamble + original text as message body (original text preserved)
+                                preamble = checklist_spec.preamble
+                                original = checklist_spec.original_text
+                                body = f"{preamble}\n\n{original}".strip() if preamble and original and preamble != original else (preamble or original)
+                                placeholder_view = _checklist_view_builder.build_view(discord, checklist_spec, "0", {})
+                                sent_msg = await channel.send(body[:2000] or "…", reference=ref, view=placeholder_view)
+                                # Rebuild view with real message id and save state
+                                real_msg_id = str(sent_msg.id)
+                                final_view = _checklist_view_builder.build_view(discord, checklist_spec, real_msg_id, {})
+                                state = {
+                                    "task_id": task_id,
+                                    "kind": checklist_spec.kind,
+                                    "spec": {
+                                        "kind": checklist_spec.kind,
+                                        "preamble": checklist_spec.preamble,
+                                        "original_text": checklist_spec.original_text,
+                                        "items": [{"id": it.id, "label": it.label, "state": it.state} for it in checklist_spec.items],
+                                    },
+                                    "voters": {},
+                                    "channel_id": channel.id,
+                                }
+                                _checklist_view_builder.save_state(CHECKLIST_STATE_DIR, real_msg_id, state)
+                                await sent_msg.edit(view=final_view)
+                                _checklist_posted = True
+                                print(f"  [checklist] posted {checklist_spec.kind} with {len(checklist_spec.items)} items (msg {real_msg_id})", flush=True)
+                            except Exception as e:
+                                print(f"  [checklist] render failed, falling back to plain text: {e}", flush=True)
+                                # Fall through to plain text send below
+
                     # Send text — fence-aware chunker preserves triple-backtick code blocks
                     # First chunk uses message_reference (if set); subsequent chunks
                     # are fresh — Discord allows only one reply-anchor per message,
                     # and split-chunk continuation isn't itself a reply.
-                    if clean_text:
+                    if clean_text and not _checklist_posted:
                         first = True
                         for chunk in _chunk_for_discord(clean_text):
                             ref = discord.MessageReference(message_id=reply_to_id, channel_id=channel.id, fail_if_not_exists=False) if (first and reply_to_id) else None
