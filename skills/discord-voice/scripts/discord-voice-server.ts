@@ -127,6 +127,21 @@ const ALLOWED_BOT_USER_IDS = new Set(
 		.split(',').map(s => s.trim()).filter(Boolean)
 );
 
+// Username prefixes that identify a peer SUTANDO bot (distinct from any
+// other Discord bot like a music bot or MEE6). Used by #1089 single-bot
+// enforcement to decide who to refuse-join-against / leave-when-detected.
+// Override via `SUTANDO_PEER_USERNAME_PATTERNS=Foo,Bar` if the naming
+// convention drifts. Match: `username.startsWith(pattern)`, case-sensitive.
+const SUTANDO_PEER_USERNAME_PATTERNS = (process.env.SUTANDO_PEER_USERNAME_PATTERNS ?? 'Sutando-,Sutando_,Lucy-,Lucy_,Maddy,Mini')
+	.split(',').map(s => s.trim()).filter(Boolean);
+
+// Disable #1089 single-bot enforcement (testing-only). Set to "1" to allow
+// multiple sutando peers in the same voice channel without auto-leave. Defaults
+// to enabled. NEVER set in production — bypassing defeats the defense-in-depth
+// design where each peer self-declines AND the already-present peer auto-
+// leaves if a peer joins anyway.
+const SUTANDO_PEER_ENFORCEMENT_DISABLED = process.env.SUTANDO_PEER_ENFORCEMENT_DISABLED === '1';
+
 // Hung-session watchdog threshold. A Gemini Live session can silently stall —
 // audio keeps flowing in but it stops emitting turn.end, with no transport
 // close event to trigger the reconnect path. If utterances have piled up
@@ -1094,6 +1109,31 @@ async function start(): Promise<void> {
 		console.error(`Channel ${CHANNEL_ID} is not a voice channel`);
 		process.exit(1);
 	}
+
+	// #1089 single-bot enforcement, layer 1 (cooperative pre-join check). Scan
+	// current channel members; if any sutando peer is already in, refuse to
+	// join. Each peer self-declines so multiple instances never accidentally
+	// share one voice room. Disable via SUTANDO_PEER_ENFORCEMENT_DISABLED=1
+	// for testing the layer-2 path.
+	const looksLikeSutandoPeer = (username: string, isBot: boolean, userId: string): boolean => {
+		if (!isBot) return false;
+		if (userId === client.user?.id) return false; // myself
+		return SUTANDO_PEER_USERNAME_PATTERNS.some(p => username.startsWith(p));
+	};
+	if (!SUTANDO_PEER_ENFORCEMENT_DISABLED) {
+		const members = (channel as any).members as Map<string, { user: { username: string; bot: boolean; id: string; tag: string } }>;
+		const presentPeers: string[] = [];
+		for (const [, m] of members) {
+			if (looksLikeSutandoPeer(m.user.username, m.user.bot, m.user.id)) {
+				presentPeers.push(m.user.tag);
+			}
+		}
+		if (presentPeers.length > 0) {
+			console.error(`${ts()} [Setup] #1089 refusing to join: sutando peer(s) already present: ${presentPeers.join(', ')}`);
+			process.exit(0); // clean exit — operator (Sutando.app checkWatcher) will retry later when peer leaves
+		}
+	}
+
 	console.log(`${ts()} [Setup] joining voice channel #${(channel as any).name} in guild ${guild.name}`);
 
 	const connection = joinVoiceChannel({
@@ -1116,6 +1156,38 @@ async function start(): Promise<void> {
 	const session = await createVoiceSession(connection, client);
 	active = session;
 	console.log(`${ts()} [Setup] audio bridge live — speak in the channel`);
+
+	// #1089 single-bot enforcement, layer 2 (adversarial post-join watcher).
+	// If a sutando peer joins our channel despite layer 1 (race, env override,
+	// compromised peer), leave the channel after a short audible announcement.
+	if (!SUTANDO_PEER_ENFORCEMENT_DISABLED) {
+		client.on('voiceStateUpdate', (oldState, newState) => {
+			const justJoinedOurChannel = newState.channelId === CHANNEL_ID && oldState.channelId !== CHANNEL_ID;
+			if (!justJoinedOurChannel) return;
+			const u = newState.member?.user;
+			if (!u) return;
+			if (!looksLikeSutandoPeer(u.username, u.bot, u.id)) return;
+			console.error(`${ts()} [Setup] #1089 peer ${u.tag} joined while I was present — announcing + leaving`);
+			// Best-effort audio announcement. The text-injection goes through
+			// the Gemini Live transport so Lucy speaks before disconnecting.
+			// We don't wait for the actual TTS to complete — Gemini might
+			// reword the request — just give it a short window. Worst case
+			// (TTS no-shows) Lucy still leaves; the disconnect is the
+			// authoritative action.
+			try {
+				(session.voiceSession as any).transport.sendContent(
+					[{ role: 'user', text: `[System] Another Sutando bot (${u.tag}) just joined this voice channel. Say briefly: "I detected another Sutando bot — leaving." Then stop.` }],
+					true,
+				);
+			} catch (e) {
+				console.error(`${ts()} [Setup] #1089 announcement injection failed:`, e);
+			}
+			setTimeout(() => {
+				try { connection.destroy(); } catch {}
+				process.exit(0);
+			}, 3000);
+		});
+	}
 
 	connection.on(VoiceConnectionStatus.Disconnected, async () => {
 		try {
