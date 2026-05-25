@@ -2244,6 +2244,29 @@ async def _handle_discord_message(message, force=False):
             except Exception as e:
                 print(f"  [thread-engage] failed to update access.json: {e}", flush=True)
 
+        # Magic-word fast path: an owner saying the join phrase MUST bypass
+        # requireMention — otherwise the magic word can't fire in any guild
+        # text channel where the bot isn't @-mentioned. Check before the
+        # requireMention skip so "za warudo" in #General (no mention) still
+        # summons the voice spawn for the owner.
+        try:
+            if str(message.author.id) in load_allowed() and _dv_message_is_join_phrase(text):
+                print(f"  [join-trigger] owner @{message.author} said the join phrase — summoning discord-voice (bypassing requireMention)", flush=True)
+                try:
+                    reply = _dv_handle_join_trigger(message)
+                except Exception as e:
+                    print(f"  [join-trigger] handler raised: {e}", flush=True)
+                    reply = "Couldn't process the voice-join request — check the bridge log."
+                try:
+                    if reply:
+                        for chunk in _chunk_for_discord(reply):
+                            await message.channel.send(chunk)
+                except Exception as e:
+                    print(f"  [join-trigger] reply send failed: {e}", flush=True)
+                return
+        except Exception as e:
+            print(f"  [join-trigger] early-path raised: {e}", flush=True)
+
         if require_mention and not bot_mentioned and not role_mentioned:
             print(f"  [skip] not mentioned (requireMention=true)", flush=True)
             return

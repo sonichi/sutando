@@ -269,7 +269,6 @@ One table, organized by capability. The only required paid piece is your Claude 
 | Health monitoring | `health-check.py` | Verified |
 | Pattern detection + user modeling | Built into Claude Code memory system | Verified |
 | System dashboard | `dashboard.py` | Verified |
-| Cross-node sync (memory + notes between Macs) | `cross-node-sync` skill | Verified |
 | Info-radar (arXiv / GitHub / HN / news monitoring) | `info-radar` skill + daily digest | Verified |
 | Menu-bar avatar states (idle/listening/speaking/working) | `src/Sutando/main.swift` + `/sse-status` | Verified |
 
