@@ -1144,6 +1144,23 @@ async function start(): Promise<void> {
 		}
 		if (presentPeers.length > 0) {
 			console.error(`${ts()} [Setup] #1089 refusing to join: sutando peer(s) already present: ${presentPeers.join(', ')}`);
+			// Surface the refusal to the operator — without this they just see
+			// "nothing happens" when inviting a second bot to a channel that
+			// already has one. Drop a proactive result; the discord-bridge
+			// polls results/ and DMs proactive-*.txt to the owner. Best-effort:
+			// if the write fails the process still exits cleanly and
+			// Sutando.app's checkWatcher will retry once the peer leaves.
+			try {
+				const proactivePath = join(WORKSPACE_DIR, 'results', `proactive-${Date.now()}.txt`);
+				const channelName = (channel as any).name ?? CHANNEL_ID;
+				writeFileSync(
+					proactivePath,
+					`Skipping voice join in #${channelName} — peer already present: ${presentPeers.join(', ')}. ` +
+					`Single-bot enforcement (#1089); reinvite once they leave.\n`,
+				);
+			} catch (e) {
+				console.error(`${ts()} [Setup] #1089 couldn't surface refusal to operator:`, e);
+			}
 			process.exit(0); // clean exit — operator (Sutando.app checkWatcher) will retry later when peer leaves
 		}
 	}
