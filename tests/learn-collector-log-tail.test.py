@@ -310,6 +310,62 @@ class TestLoadFilters(unittest.TestCase):
             self.assertEqual(filters[0][1], "custom_kind")
 
 
+class TestWorkspacePaths(unittest.TestCase):
+    """Verify both daemons route state files through resolve_workspace (#949)."""
+
+    def test_collector_state_dir_under_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "workspace"
+            ws.mkdir()
+            with unittest.mock.patch.dict(os.environ, {"SUTANDO_WORKSPACE": str(ws)}):
+                mod = _load("lc_ws", REPO / "src" / "learn-collector.py")
+            self.assertEqual(str(mod.STATE_DIR), str(ws / "state"))
+
+    def test_collector_tasks_dir_under_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "workspace"
+            ws.mkdir()
+            with unittest.mock.patch.dict(os.environ, {"SUTANDO_WORKSPACE": str(ws)}):
+                mod = _load("lc_ws2", REPO / "src" / "learn-collector.py")
+            self.assertEqual(str(mod.TASKS_DIR), str(ws / "tasks"))
+
+    def test_collector_results_archive_under_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "workspace"
+            ws.mkdir()
+            with unittest.mock.patch.dict(os.environ, {"SUTANDO_WORKSPACE": str(ws)}):
+                mod = _load("lc_ws3", REPO / "src" / "learn-collector.py")
+            self.assertEqual(str(mod.RESULTS_ARCHIVE_DIR), str(ws / "results" / "archive"))
+
+    def test_log_tail_state_dir_under_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "workspace"
+            ws.mkdir()
+            with unittest.mock.patch.dict(os.environ, {"SUTANDO_WORKSPACE": str(ws)}):
+                mod = _load("lt_ws", REPO / "src" / "learn-log-tail.py")
+            self.assertEqual(str(mod.STATE_DIR), str(ws / "state"))
+
+    def test_log_tail_logs_dir_under_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "workspace"
+            ws.mkdir()
+            with unittest.mock.patch.dict(os.environ, {"SUTANDO_WORKSPACE": str(ws)}):
+                mod = _load("lt_ws2", REPO / "src" / "learn-log-tail.py")
+            self.assertEqual(str(mod.LOGS_DIR), str(ws / "logs"))
+
+    def test_collector_state_dir_not_under_repo(self):
+        self.assertFalse(
+            str(collector.STATE_DIR).startswith(str(REPO)),
+            f"STATE_DIR {collector.STATE_DIR} should not be inside repo {REPO}",
+        )
+
+    def test_log_tail_state_dir_not_under_repo(self):
+        self.assertFalse(
+            str(log_tail.STATE_DIR).startswith(str(REPO)),
+            f"STATE_DIR {log_tail.STATE_DIR} should not be inside repo {REPO}",
+        )
+
+
 class TestDefaultFilterCoverage(unittest.TestCase):
     def test_discord_bridge_filters_defined(self):
         logs = {f[0] for f in log_tail.DEFAULT_FILTERS}
@@ -345,6 +401,7 @@ if __name__ == "__main__":
     for cls in [
         TestResolveInstance, TestEmit, TestCursorPersistence, TestScanDir,
         TestCompileFilters, TestTailLog, TestLoadFilters, TestDefaultFilterCoverage,
+        TestWorkspacePaths,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
     runner = unittest.TextTestRunner(verbosity=2)

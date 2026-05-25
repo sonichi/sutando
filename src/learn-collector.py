@@ -42,13 +42,17 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent))
+from workspace_default import resolve_workspace  # noqa: E402
+
 ROOT_ENV = os.environ.get("SUTANDO_ROOT")
 ROOT = Path(ROOT_ENV).resolve() if ROOT_ENV else Path(__file__).resolve().parents[1]
 
-STATE_DIR = ROOT / "state"
-TASKS_DIR = ROOT / "tasks"
+WORKSPACE = resolve_workspace()
+STATE_DIR = WORKSPACE / "state"
+TASKS_DIR = WORKSPACE / "tasks"
 ARCHIVE_DIR = TASKS_DIR / "archive"
-RESULTS_ARCHIVE_DIR = ROOT / "results" / "archive"
+RESULTS_ARCHIVE_DIR = WORKSPACE / "results" / "archive"
 
 POLL_INTERVAL_S = int(os.environ.get("LEARN_COLLECTOR_INTERVAL_S", "5"))
 HEARTBEAT_S = int(os.environ.get("LEARN_COLLECTOR_HEARTBEAT_S", "60"))

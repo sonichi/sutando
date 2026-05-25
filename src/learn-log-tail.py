@@ -46,11 +46,15 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent))
+from workspace_default import resolve_workspace  # noqa: E402
+
 ROOT_ENV = os.environ.get("SUTANDO_ROOT")
 ROOT = Path(ROOT_ENV).resolve() if ROOT_ENV else Path(__file__).resolve().parents[1]
 
-STATE_DIR = ROOT / "state"
-LOGS_DIR = ROOT / "logs"
+WORKSPACE = resolve_workspace()
+STATE_DIR = WORKSPACE / "state"
+LOGS_DIR = WORKSPACE / "logs"
 
 POLL_INTERVAL_S = int(os.environ.get("LEARN_LOG_TAIL_INTERVAL_S", "5"))
 EXCERPT_MAX = 250
