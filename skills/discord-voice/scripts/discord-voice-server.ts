@@ -671,8 +671,16 @@ function subscribeUser(s: DiscordVoiceSession, userId: string): void {
 	if (s.subscribedUsers.has(userId)) return;
 	s.subscribedUsers.add(userId);
 
+	// #1095 — Persistent subscription with PCM-side silence detection.
+	// The old per-utterance `EndBehaviorType.AfterSilence` ended the stream
+	// after 200ms of silence, then `speaking.on('start')` re-subscribed on the
+	// next utterance. Discord's receiver only delivers audio from the moment
+	// of subscribe — so every utterance lost ~20-100ms of leading audio (the
+	// initial /h/ of "Hi" reliably got eaten). Manual end keeps the stream
+	// open for the lifetime of the voice session; we synthesize the
+	// utterance-end signal from PCM idle instead of from the stream's `end`.
 	const opusStream = s.connection.receiver.subscribe(userId, {
-		end: { behavior: EndBehaviorType.AfterSilence, duration: 200 },
+		end: { behavior: EndBehaviorType.Manual },
 	});
 	const decoder = new prism.opus.Decoder({ frameSize: 960, channels: 2, rate: 48000 });
 	// Resample 48k stereo s16le → 16k mono s16le via ffmpeg (anti-aliased).
@@ -687,28 +695,48 @@ function subscribeUser(s: DiscordVoiceSession, userId: string): void {
 	opusStream.pipe(decoder).pipe(resampler);
 
 	let chunks = 0;
-	resampler.on('data', (pcm16Mono: Buffer) => {
-		chunks++;
-		try { (s.voiceSession as any).handleAudioFromClient(pcm16Mono); } catch {}
-		(s as any)._noteSpoken?.();
-		if (chunks === 1) console.log(`${ts()} [Voice] first chunk: ${pcm16Mono.length}B`);
-	});
-	resampler.on('end', () => {
-		s.subscribedUsers.delete(userId);
+	let inUtterance = false;
+	let silenceTimer: NodeJS.Timeout | null = null;
+	const SILENCE_END_MS = Number(process.env.SUTANDO_PCM_SILENCE_END_MS) || 200;
+	const fireUtteranceEnd = () => {
+		if (!inUtterance) return;
+		inUtterance = false;
 		console.log(`${ts()} [Voice] user ${userId} stopped speaking (${chunks} chunks) — silence burst`);
-		// Watchdog bookkeeping: an utterance just finished. A healthy Gemini
-		// fires turn.end within seconds; these counters let the watchdog tell
-		// a hang apart from a normal pause.
 		(s as any).lastSpeakStopTs = Date.now();
 		(s as any).utterancesSinceTurn = ((s as any).utterancesSinceTurn || 0) + 1;
 		triggerSilenceBurst(s);
+		chunks = 0; // reset per-utterance counter
+	};
+	resampler.on('data', (pcm16Mono: Buffer) => {
+		if (!inUtterance) {
+			inUtterance = true;
+			console.log(`${ts()} [Voice] first chunk: ${pcm16Mono.length}B`);
+		}
+		chunks++;
+		try { (s.voiceSession as any).handleAudioFromClient(pcm16Mono); } catch {}
+		(s as any)._noteSpoken?.();
+		// Reset the silence timer on every chunk; if no more chunks arrive
+		// within SILENCE_END_MS, fire utterance-end. Discord's receiver
+		// delivers no packets during silence, so absence-of-data is the
+		// signal here (replacing the old `EndBehaviorType.AfterSilence`).
+		if (silenceTimer) clearTimeout(silenceTimer);
+		silenceTimer = setTimeout(fireUtteranceEnd, SILENCE_END_MS);
+	});
+	resampler.on('end', () => {
+		// In Manual mode this fires only if the stream is explicitly destroyed
+		// (e.g. session cleanup). Treat as a final flush + unsubscribe.
+		if (silenceTimer) clearTimeout(silenceTimer);
+		fireUtteranceEnd();
+		s.subscribedUsers.delete(userId);
+		console.log(`${ts()} [Voice] receiver stream ended for ${userId} (session cleanup)`);
 	});
 	resampler.on('error', (e) => {
 		console.error(`${ts()} [Voice] resampler error for ${userId}:`, e);
+		if (silenceTimer) clearTimeout(silenceTimer);
 		s.subscribedUsers.delete(userId);
 	});
 	decoder.on('error', (e) => console.error(`${ts()} [Voice] decoder error for ${userId}:`, e));
-	console.log(`${ts()} [Voice] subscribed to user ${userId} (ffmpeg resample)`);
+	console.log(`${ts()} [Voice] subscribed to user ${userId} (ffmpeg resample, persistent)`);
 }
 
 async function createVoiceSession(connection: VoiceConnection, client: Client): Promise<DiscordVoiceSession> {
