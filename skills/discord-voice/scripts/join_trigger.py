@@ -97,16 +97,23 @@ def message_is_join_phrase(text: str, join_phrase: str | None = None) -> bool:
     punctuation users add. Exact-match above covers the no-trailing-content
     case.
 
+    Leading `<@id>` / `<@!id>` / `<@&roleid>` Discord mentions are stripped
+    before matching — users summoning via "@Lucy za warudo" in a guild text
+    channel produce "<@1494...> za warudo" as raw content; without
+    stripping, that wouldn't startswith("za warudo").
+
     Pure function — no I/O when `join_phrase` is supplied; tests pass it
     explicitly.
     """
+    import re as _re
     if not text:
         return False
     phrase = (join_phrase if join_phrase is not None else load_join_phrase())
     phrase = (phrase or "").strip().lower()
     if not phrase:
         return False
-    trimmed = text.strip().lower()
+    stripped = _re.sub(r'^(?:\s*<@[!&]?\d+>\s*)+', '', text)
+    trimmed = stripped.strip().lower()
     if trimmed == phrase:
         return True
     if trimmed.startswith(phrase):

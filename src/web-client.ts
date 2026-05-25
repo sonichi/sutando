@@ -3831,8 +3831,9 @@ const server = createServer((req, res) => {
 			res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' });
 			res.end(raw);
 		} catch (e: any) {
+			console.error('[web-client] /paidsubscriptions/data failed:', e);
 			res.writeHead(500, { 'Content-Type': 'application/json' });
-			res.end(JSON.stringify({ error: e?.message || String(e) }));
+			res.end(JSON.stringify({ error: 'failed to read subscriptions' }));
 		}
 		return;
 	}
@@ -3870,8 +3871,9 @@ const server = createServer((req, res) => {
 			res.writeHead(200, { 'Content-Type': 'application/json' });
 			res.end(JSON.stringify({ ok: true, task_id: taskId, message: 'Scan queued; the next proactive-loop pass will pick it up (~1 min). Refresh to see results.' }));
 		} catch (e: any) {
+			console.error('[web-client] /paidsubscriptions/scan failed:', e);
 			res.writeHead(500, { 'Content-Type': 'application/json' });
-			res.end(JSON.stringify({ ok: false, error: e?.message || String(e) }));
+			res.end(JSON.stringify({ ok: false, error: 'failed to enqueue scan' }));
 		}
 		return;
 	}
