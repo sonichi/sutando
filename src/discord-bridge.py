@@ -2558,8 +2558,22 @@ async def _handle_discord_message(message, force=False):
     # double-fire the spawn; the helper has its own `_server_already_running`
     # guard anyway, but cheaper to dedup at the front gate.
     if access_tier == "owner":
+        # Strip the bot's own @-mention prefix before the join-phrase check.
+        # In channels with `requireMention=true`, the owner has to write
+        # "<@BOT_ID> za warudo" to even reach this code path — but the
+        # `<@...>` prefix breaks the startswith("za warudo") match in
+        # `message_is_join_phrase`. Without this strip the magic word only
+        # ever works in DMs. Bot-own mention only — leave other user/bot
+        # mentions in text so downstream attribution still sees them.
+        bot_mention_prefix = f"<@{client.user.id}>" if client.user else ""
+        bot_mention_prefix_nick = f"<@!{client.user.id}>" if client.user else ""
+        join_text = text
+        for pfx in (bot_mention_prefix, bot_mention_prefix_nick):
+            if pfx and join_text.lstrip().startswith(pfx):
+                join_text = join_text.lstrip()[len(pfx):].lstrip()
+                break
         try:
-            is_join = _dv_message_is_join_phrase(text)
+            is_join = _dv_message_is_join_phrase(join_text)
         except Exception as e:
             print(f"  [join-trigger] match check raised: {e}", flush=True)
             is_join = False
