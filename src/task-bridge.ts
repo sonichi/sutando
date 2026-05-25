@@ -205,8 +205,11 @@ export function setTaskStatusCallback(fn: (taskId: string, status: string, text:
 export const workTool: ToolDefinition = {
 	name: 'work',
 	description:
-		'Do the work. Call this for anything beyond simple greetings — questions, actions, ' +
+		'Do the work. Call this for ANYTHING beyond simple greetings — questions, actions, ' +
 		'research, writing, translation, file changes, system queries, explanations, analysis. ' +
+		'CRITICAL: when asked about THIS specific project (features, commands, code, history, ' +
+		'decisions, what a tool does, how a flow works), ALWAYS call work — your built-in ' +
+		'knowledge does not include this codebase, so guessing produces hallucinations. ' +
 		'This is how Sutando thinks and acts. Results are spoken back when ready.',
 	parameters: z.object({
 		task: z.string().describe('Full description of the task to perform'),
