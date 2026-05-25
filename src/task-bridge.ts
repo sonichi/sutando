@@ -209,8 +209,7 @@ export const workTool: ToolDefinition = {
 		'research, writing, translation, file changes, system queries, explanations, analysis. ' +
 		'CRITICAL: when asked about THIS specific project (features, commands, code, history, ' +
 		'decisions, what a tool does, how a flow works), ALWAYS call work — your built-in ' +
-		'knowledge does not include this codebase, so guessing produces hallucinations. ' +
-		'This is how Sutando thinks and acts. Results are spoken back when ready.',
+		'knowledge does not include this codebase, so guessing produces hallucinations.',
 	parameters: z.object({
 		task: z.string().describe('Full description of the task to perform'),
 		timeout_minutes: z
