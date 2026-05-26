@@ -138,6 +138,56 @@ def test_send_allowlist_module_has_documented_set():
     )
 
 
+def test_extra_roots_env_var_support():
+    """send_allowlist.py must parse SUTANDO_SEND_ALLOWED_ROOTS env var
+    so the shared module extends the allowlist at process start."""
+    src = (SRC / "send_allowlist.py").read_text()
+    assert "SUTANDO_SEND_ALLOWED_ROOTS" in src, (
+        "send_allowlist.py missing SUTANDO_SEND_ALLOWED_ROOTS env var support."
+    )
+    assert "_EXTRA_ROOTS" in src, (
+        "send_allowlist.py missing _EXTRA_ROOTS — the computed tuple from the env var."
+    )
+    # is_path_sendable must iterate over extra roots, not just the static set
+    assert re.search(r"SEND_ALLOWED_ROOTS.*_EXTRA_ROOTS|_EXTRA_ROOTS.*SEND_ALLOWED_ROOTS", src), (
+        "is_path_sendable() in send_allowlist.py must use both SEND_ALLOWED_ROOTS "
+        "and _EXTRA_ROOTS — extra roots won't be checked otherwise."
+    )
+
+
+def test_slack_telegram_bridges_have_inline_extra_roots():
+    """slack-bridge.py and telegram-bridge.py still carry their own
+    inline `_is_path_sendable` (they don't use the shared module yet).
+    Both must have the env var extension inline too — otherwise a
+    tightening of send_allowlist.py won't reach them."""
+    for bridge_name in ("slack-bridge.py", "telegram-bridge.py"):
+        src = (SRC / bridge_name).read_text()
+        assert "SUTANDO_SEND_ALLOWED_ROOTS" in src, (
+            f"{bridge_name} missing SUTANDO_SEND_ALLOWED_ROOTS env var support. "
+            f"The inline _is_path_sendable must check the extra-roots env var."
+        )
+        assert "_extra_roots" in src, (
+            f"{bridge_name} missing _extra_roots — the computed tuple from the env var."
+        )
+
+
+def test_discord_bridge_no_inline_extra_roots():
+    """discord-bridge.py delegates entirely to send_allowlist.py via
+    the `_is_path_sendable = _is_path_sendable_shared` alias. It must
+    NOT define its own _extra_roots — that would shadow the shared
+    module's env var support and reintroduce drift."""
+    src = (SRC / "discord-bridge.py").read_text()
+    # The env var name may appear in comments — only flag assignment
+    for line in src.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("_extra_roots") and "=" in stripped:
+            raise AssertionError(
+                "discord-bridge.py defines _extra_roots inline — it should get "
+                "env var support from send_allowlist.py (via the shared alias). "
+                "Remove the inline definition."
+            )
+
+
 def main():
     failures = []
     for fn in (
@@ -147,6 +197,9 @@ def main():
         test_no_inline_send_allowed_roots_definitions,
         test_no_inline_is_path_sendable_function,
         test_send_allowlist_module_has_documented_set,
+        test_extra_roots_env_var_support,
+        test_slack_telegram_bridges_have_inline_extra_roots,
+        test_discord_bridge_no_inline_extra_roots,
     ):
         try:
             fn()
