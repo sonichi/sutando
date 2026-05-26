@@ -20,6 +20,18 @@ import { resolveWorkspace, statusPath, statusReadPath } from './workspace_defaul
 // resolveWorkspace() is the canonical TS helper introduced in #821.
 const WORKSPACE_DIR = resolveWorkspace();
 
+// Mode-gating: tools that should only be exposed when a specific mode is
+// active. Check sentinels at module-load time (not per-call) so Gemini
+// never sees the tool description in sessions where the mode is inactive.
+// Trade-off: toggling presenter-mode mid-session requires a voice-agent
+// restart to update the tool list — acceptable because presenter-mode.sh
+// already runs before the voice agent starts.
+//
+// Addresses #1171: spurious `copres_*` / `slide_control` tool_call entries
+// in voice sqlite when Gemini fires these on greetings or session-start.
+const PRESENTER_SENTINEL = join(WORKSPACE_DIR, 'state', 'presenter-mode.sentinel');
+const presenterActive = existsSync(PRESENTER_SENTINEL);
+
 // Code-adjacent paths (skills/, etc.) ship with the repo checkout, NOT the
 // workspace. Compute REPO_ROOT from this file's URL so the resolution
 // survives any cwd drift at startup. Used by the skill-loader below.
@@ -1089,7 +1101,8 @@ export const inlineTools = assertUniqueToolNames([
 	volumeTool, brightnessTool, clipboardTool,
 	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, getCoreStatusTool,
 	joinGmeetTool, lookupMeetingIdTool, callContactTool,
-	describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, slideControlTool, fullscreenTool,
+	describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, fullscreenTool,
+	...(presenterActive ? [slideControlTool] : []),
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
 	recentContextTool,
 	sendVisionFrameTool, startVisionTool, stopVisionTool,
@@ -1110,7 +1123,8 @@ export const ownerOnlyTools = [
 	pressKeyTool, scrollTool, switchTabTool, closeTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
 	clipboardTool, cancelTaskTool, toggleTasksTool,
-	joinGmeetTool, callContactTool, slideControlTool, fullscreenTool,
+	joinGmeetTool, callContactTool, fullscreenTool,
+	...(presenterActive ? [slideControlTool] : []),
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
 	recentContextTool,
 	describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool,
