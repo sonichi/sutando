@@ -1,267 +1,289 @@
-#!/usr/bin/env python3
-"""
-obsidian-mirror.py — one-shot sweep of workspace state into the Obsidian vault.
+"""Obsidian sync — one-shot sweep of agent state into the Sutando vault.
 
-Safe to run repeatedly (idempotent). Mirrors:
-  tasks/task-*.txt          → <vault>/Sutando/Agent/Tasks/<id>.md
-  results/task-*.txt        → appended as Result block in matching task note
-  notes/*.md                → <vault>/Sutando/Notes/<slug>.md
-  pending-questions.md      → <vault>/Sutando/Agent/Asks.md
+Does a single pass and exits. No background process, no polling.
+Run on-demand or wire into the user's own crons.json at whatever
+cadence they want.
 
-Opt-in gate: requires SUTANDO_OBSIDIAN_MIRROR=1 or --force.
+Sources mirrored (decided 2026-05-24 with owner):
+  tasks/task-<id>.txt        -> Agent/Tasks/task-<id>.md      (status: pending)
+  results/task-<id>.txt      -> Agent/Tasks/task-<id>.md      (update: append Result, status: completed)
+  pending-questions.md       -> Agent/Asks.md                 (verbatim)
+  notes/*.md                 -> Agent/Notes/<name>.md         (verbatim)
+
+One-way only (workspace -> vault). No reverse sync.
+
+Gated by `SUTANDO_OBSIDIAN_MIRROR` env var — exits cleanly when unset,
+unless `--force` is passed (used by the on-demand voice tool).
+
+Usage:
+  python3 src/obsidian-mirror.py            # respects opt-in env var
+  python3 src/obsidian-mirror.py --force    # explicit user run, bypass gate
+  python3 src/obsidian-mirror.py --since 1h # only sync sources modified in last hour
 """
+
+from __future__ import annotations
 
 import argparse
 import os
 import re
 import sys
-from datetime import datetime, timedelta, timezone
+import time
 from pathlib import Path
 from typing import Optional
 
 
-# ---------------------------------------------------------------------------
-# Workspace / vault resolution
-# ---------------------------------------------------------------------------
+# ---- Path resolution ----
 
 def resolve_workspace() -> Path:
-    ws = os.environ.get("SUTANDO_WORKSPACE", str(Path.home() / ".sutando" / "workspace"))
-    return Path(ws.replace("~", str(Path.home())))
+    ws = os.environ.get("SUTANDO_WORKSPACE")
+    if ws:
+        return Path(ws).expanduser()
+    return Path.home() / ".sutando" / "workspace"
 
 
-def _resolve_vault(workspace: Path) -> Path:
-    return workspace / "obsidian-vault"
+TASK_ID_RE = re.compile(r"^task-(.+)\.txt$")
 
 
 def _ensure_vault(vault: Path) -> None:
-    for sub in [
-        vault / ".obsidian",
-        vault / "Sutando" / "Notes",
-        vault / "Sutando" / "Thoughts",
-        vault / "Sutando" / "Agent" / "Tasks",
-    ]:
-        sub.mkdir(parents=True, exist_ok=True)
-
-    asks = vault / "Sutando" / "Agent" / "Asks.md"
-    if not asks.exists():
-        asks.write_text("# Pending Questions\n\n")
-
-    tasks_summary = vault / "Sutando" / "Tasks.md"
-    if not tasks_summary.exists():
-        tasks_summary.write_text("# Sutando Tasks\n\n")
+    (vault / ".obsidian").mkdir(parents=True, exist_ok=True)
+    (vault / "Sutando" / "Agent" / "Tasks").mkdir(parents=True, exist_ok=True)
+    (vault / "Sutando" / "Agent" / "Notes").mkdir(parents=True, exist_ok=True)
 
 
-# ---------------------------------------------------------------------------
-# Opt-in gate
-# ---------------------------------------------------------------------------
-
-def _opt_in_gate(force: bool) -> bool:
-    if force:
-        return True
-    if os.environ.get("SUTANDO_OBSIDIAN_MIRROR", "").strip() == "1":
-        return True
-    print(
-        "[mirror] SUTANDO_OBSIDIAN_MIRROR not set — skipping. "
-        "Set to 1 in .env or pass --force to run.",
-        file=sys.stderr,
-    )
-    return False
-
-
-# ---------------------------------------------------------------------------
-# Since filter
-# ---------------------------------------------------------------------------
-
-def _parse_since(since: Optional[str]) -> Optional[datetime]:
-    if not since:
-        return None
-    now = datetime.now(tz=timezone.utc)
-    m = re.fullmatch(r"(\d+)([smhd])", since.strip())
-    if not m:
-        raise ValueError(f"Invalid --since format: {since!r}  (use e.g. 1h, 30m, 2d)")
-    n, unit = int(m.group(1)), m.group(2)
-    delta = {"s": timedelta(seconds=n), "m": timedelta(minutes=n),
-             "h": timedelta(hours=n), "d": timedelta(days=n)}[unit]
-    return now - delta
-
-
-def _newer_than(path: Path, cutoff: Optional[datetime]) -> bool:
-    if cutoff is None:
-        return True
-    mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
-    return mtime >= cutoff
-
-
-# ---------------------------------------------------------------------------
-# Task file parsing
-# ---------------------------------------------------------------------------
-
-_TASK_ID_RE = re.compile(r"task-(\d+(?:\.\d+)?)")
+def _task_id_from_path(path: Path) -> Optional[str]:
+    m = TASK_ID_RE.match(path.name)
+    return f"task-{m.group(1)}" if m else None
 
 
 def _parse_task_file(path: Path) -> dict:
-    text = path.read_text(errors="replace")
-    m = _TASK_ID_RE.search(path.stem)
-    task_id = m.group(1) if m else path.stem
-    return {"id": task_id, "path": path, "text": text}
+    info: dict = {"raw": ""}
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return info
+    info["raw"] = text
+    for line in text.splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            k = k.strip().lower()
+            v = v.strip()
+            if k in {"id", "timestamp", "task", "source", "channel_id", "user_id", "access_tier", "priority"}:
+                info[k] = v
+    return info
 
 
-def _write_task_mirror(vault: Path, task: dict) -> Path:
-    dest = vault / "Sutando" / "Agent" / "Tasks" / f"task-{task['id']}.md"
-    # Preserve existing Result block if re-running
-    result_block = ""
-    if dest.exists():
-        existing = dest.read_text(errors="replace")
-        result_match = re.search(r"## Result\n(.*)", existing, re.DOTALL)
-        if result_match:
-            result_block = "\n\n## Result\n" + result_match.group(1).rstrip()
-
-    content = f"# Task {task['id']}\n\n{task['text'].strip()}{result_block}\n"
-    dest.write_text(content)
-    return dest
-
-
-def _write_result_mirror(vault: Path, result_path: Path, text: str) -> bool:
-    m = _TASK_ID_RE.search(result_path.stem)
-    if not m:
+def _write_task_mirror(vault: Path, task_path: Path) -> bool:
+    task_id = _task_id_from_path(task_path)
+    if not task_id:
         return False
-    task_id = m.group(1)
-    dest = vault / "Sutando" / "Agent" / "Tasks" / f"task-{task_id}.md"
-    if not dest.exists():
-        return False
+    info = _parse_task_file(task_path)
+    mirror = vault / "Sutando" / "Agent" / "Tasks" / f"{task_id}.md"
 
-    existing = dest.read_text(errors="replace")
-    if "## Result" in existing:
-        # Replace existing result block
-        new_content = re.sub(
-            r"\n\n## Result\n.*",
-            f"\n\n## Result\n{text.strip()}\n",
-            existing,
-            flags=re.DOTALL,
-        )
-    else:
-        new_content = existing.rstrip() + f"\n\n## Result\n{text.strip()}\n"
-    dest.write_text(new_content)
+    # Preserve any existing Result block (in case we re-run and only the source was modified).
+    existing_result = ""
+    if mirror.exists():
+        try:
+            existing = mirror.read_text(encoding="utf-8")
+            if "\n## Result\n" in existing:
+                existing_result = "\n## Result\n" + existing.split("\n## Result\n", 1)[1]
+        except Exception:
+            pass
+
+    status = "completed" if existing_result else "pending"
+    frontmatter = [
+        "---",
+        f"id: {task_id}",
+        f"status: {status}",
+        f"source: {info.get('source', 'unknown')}",
+        f"access_tier: {info.get('access_tier', 'owner')}",
+        f"priority: {info.get('priority', 'normal')}",
+        f"ts_source: {info.get('timestamp', '')}",
+        f"ts_mirror: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}",
+        "---",
+        "",
+    ]
+    body_lines = [
+        f"# {task_id}",
+        "",
+        "## Request",
+        "",
+        "```",
+        info["raw"].rstrip(),
+        "```",
+        existing_result.rstrip() if existing_result else "",
+        "",
+    ]
+    new_content = "\n".join(frontmatter) + "\n".join(body_lines) + "\n"
+    if mirror.exists() and mirror.read_text(encoding="utf-8") == new_content:
+        return False
+    mirror.write_text(new_content, encoding="utf-8")
     return True
 
 
-# ---------------------------------------------------------------------------
-# Mirror passes
-# ---------------------------------------------------------------------------
-
-def _mirror_tasks(workspace: Path, vault: Path, cutoff: Optional[datetime], quiet: bool) -> int:
-    tasks_dir = workspace / "tasks"
-    if not tasks_dir.exists():
-        return 0
-    count = 0
-    for p in sorted(tasks_dir.glob("task-*.txt")):
-        if not _newer_than(p, cutoff):
-            continue
-        task = _parse_task_file(p)
-        dest = _write_task_mirror(vault, task)
-        if not quiet:
-            print(f"  [task] {p.name} → {dest.relative_to(vault)}", flush=True)
-        count += 1
-    return count
-
-
-def _mirror_results(workspace: Path, vault: Path, cutoff: Optional[datetime], quiet: bool) -> int:
-    results_dir = workspace / "results"
-    if not results_dir.exists():
-        return 0
-    count = 0
-    for p in sorted(results_dir.glob("task-*.txt")):
-        if not _newer_than(p, cutoff):
-            continue
-        try:
-            text = p.read_text(errors="replace")
-            ok = _write_result_mirror(vault, p, text)
-            if ok:
-                if not quiet:
-                    print(f"  [result] {p.name} → appended", flush=True)
-                count += 1
-        except OSError:
-            pass
-    return count
-
-
-def _mirror_notes(workspace: Path, vault: Path, cutoff: Optional[datetime], quiet: bool) -> int:
-    notes_dir = workspace / "notes"
-    if not notes_dir.exists():
-        # Try repo-relative notes/
-        repo = Path(__file__).resolve().parent.parent
-        notes_dir = repo / "notes"
-    if not notes_dir.exists():
-        return 0
-    count = 0
-    dest_dir = vault / "Sutando" / "Notes"
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    for p in sorted(notes_dir.glob("*.md")):
-        if not _newer_than(p, cutoff):
-            continue
-        dest = dest_dir / p.name
-        dest.write_text(p.read_text(errors="replace"))
-        if not quiet:
-            print(f"  [note] {p.name} → {dest.relative_to(vault)}", flush=True)
-        count += 1
-    return count
-
-
-def _mirror_pending_questions(workspace: Path, vault: Path, quiet: bool) -> None:
-    # Try workspace first, then repo root
-    candidates = [
-        workspace / "pending-questions.md",
-        Path(__file__).resolve().parent.parent / "pending-questions.md",
-    ]
-    src = next((p for p in candidates if p.exists()), None)
-    if not src:
-        return
-    dest = vault / "Sutando" / "Agent" / "Asks.md"
-    dest.write_text(src.read_text(errors="replace"))
-    if not quiet:
-        print(f"  [asks] pending-questions.md → {dest.relative_to(vault)}", flush=True)
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Mirror workspace state into Obsidian vault")
-    parser.add_argument("--force", action="store_true", help="bypass SUTANDO_OBSIDIAN_MIRROR gate")
-    parser.add_argument("--since", metavar="DURATION", help="only mirror items newer than this (e.g. 1h, 30m)")
-    parser.add_argument("--quiet", action="store_true", help="suppress per-file output")
-    args = parser.parse_args()
-
-    if not _opt_in_gate(args.force):
-        sys.exit(0)
-
+def _write_result_mirror(vault: Path, result_path: Path) -> bool:
+    task_id = _task_id_from_path(result_path)
+    if not task_id:
+        return False
+    mirror = vault / "Sutando" / "Agent" / "Tasks" / f"{task_id}.md"
     try:
-        cutoff = _parse_since(args.since)
-    except ValueError as e:
-        print(f"[mirror] {e}", file=sys.stderr)
-        sys.exit(1)
+        result_body = result_path.read_text(encoding="utf-8", errors="replace").rstrip()
+    except FileNotFoundError:
+        return False
+
+    if not mirror.exists():
+        # Use the same trailing format as the update path so a second call is
+        # idempotent: update path produces "...\n\n## Result\n\n{body}\n" (single
+        # trailing newline), but the old list had a trailing "" which produced
+        # "\n\n" — causing the second call to always rewrite. Issue #1149-companion.
+        header = "\n".join([
+            "---",
+            f"id: {task_id}",
+            "status: completed",
+            "source: unknown",
+            f"ts_mirror: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}",
+            "---",
+            "",
+            f"# {task_id}",
+            "",
+            "_(Task source file not seen — result captured below.)_",
+        ])
+        mirror.write_text(header + f"\n\n## Result\n\n{result_body}\n", encoding="utf-8")
+        return True
+
+    existing = mirror.read_text(encoding="utf-8")
+    new = re.sub(r"^status:.*$", "status: completed", existing, count=1, flags=re.MULTILINE)
+    if "\n## Result\n" in new:
+        new = new.split("\n## Result\n", 1)[0].rstrip() + "\n"
+    if not new.endswith("\n"):
+        new += "\n"
+    new += f"\n## Result\n\n{result_body}\n"
+    if new == existing:
+        return False
+    mirror.write_text(new, encoding="utf-8")
+    return True
+
+
+def _mirror_asks(vault: Path, workspace: Path) -> bool:
+    src = workspace / "pending-questions.md"
+    if not src.exists():
+        return False
+    dest = vault / "Sutando" / "Agent" / "Asks.md"
+    content = src.read_text(encoding="utf-8", errors="replace")
+    if dest.exists() and dest.read_text(encoding="utf-8") == content:
+        return False
+    dest.write_text(content, encoding="utf-8")
+    return True
+
+
+def _mirror_note(vault: Path, note_path: Path) -> bool:
+    if note_path.suffix != ".md":
+        return False
+    dest = vault / "Sutando" / "Agent" / "Notes" / note_path.name
+    try:
+        content = note_path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return False
+    if dest.exists() and dest.read_text(encoding="utf-8") == content:
+        return False
+    dest.write_text(content, encoding="utf-8")
+    return True
+
+
+def _within_window(path: Path, cutoff: float) -> bool:
+    try:
+        return path.stat().st_mtime >= cutoff
+    except FileNotFoundError:
+        return False
+
+
+def sweep(vault: Path, workspace: Path, since_seconds: Optional[int] = None) -> dict:
+    """Single pass over all source dirs. Returns counts by kind."""
+    _ensure_vault(vault)
+    cutoff = (time.time() - since_seconds) if since_seconds else 0.0
+
+    counts = {"tasks": 0, "results": 0, "notes": 0, "asks": 0, "scanned": 0}
+
+    tasks_dir = workspace / "tasks"
+    if tasks_dir.exists():
+        for p in sorted(tasks_dir.glob("task-*.txt")):
+            counts["scanned"] += 1
+            if cutoff and not _within_window(p, cutoff):
+                continue
+            if _write_task_mirror(vault, p):
+                counts["tasks"] += 1
+
+    results_dir = workspace / "results"
+    if results_dir.exists():
+        for p in sorted(results_dir.glob("task-*.txt")):
+            counts["scanned"] += 1
+            if cutoff and not _within_window(p, cutoff):
+                continue
+            if _write_result_mirror(vault, p):
+                counts["results"] += 1
+
+    notes_dir = workspace / "notes"
+    if notes_dir.exists():
+        for p in sorted(notes_dir.glob("*.md")):
+            counts["scanned"] += 1
+            if cutoff and not _within_window(p, cutoff):
+                continue
+            if _mirror_note(vault, p):
+                counts["notes"] += 1
+
+    asks_src = workspace / "pending-questions.md"
+    if asks_src.exists() and (not cutoff or _within_window(asks_src, cutoff)):
+        if _mirror_asks(vault, workspace):
+            counts["asks"] = 1
+
+    return counts
+
+
+def _parse_since(value: str) -> int:
+    """Parse '30m', '1h', '6h', '1d' etc. → seconds. Plain number = seconds."""
+    if not value:
+        return 0
+    multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    if value[-1].lower() in multipliers:
+        return int(value[:-1]) * multipliers[value[-1].lower()]
+    return int(value)
+
+
+def main(argv) -> int:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Bypass the SUTANDO_OBSIDIAN_MIRROR opt-in gate. Use only for explicit user invocations.",
+    )
+    p.add_argument(
+        "--since",
+        default=None,
+        help="Only sync sources modified within the given window (e.g. 30m, 1h, 6h, 1d). Default: full sweep.",
+    )
+    p.add_argument("--vault", help="Override vault path.")
+    args = p.parse_args(argv)
+
+    if not args.force and os.environ.get("SUTANDO_OBSIDIAN_MIRROR", "").lower() not in ("1", "true", "yes", "on"):
+        print(
+            "[obsidian-mirror] not enabled — set SUTANDO_OBSIDIAN_MIRROR=1 in .env to opt in, "
+            "or pass --force for an explicit one-shot run. Exiting.",
+            flush=True,
+        )
+        return 0
 
     workspace = resolve_workspace()
-    vault = _resolve_vault(workspace)
-    _ensure_vault(vault)
+    if not workspace.exists():
+        print(f"[obsidian-mirror] workspace dir missing: {workspace}", file=sys.stderr)
+        return 2
+    vault = Path(args.vault).expanduser() if args.vault else workspace / "obsidian-vault"
 
-    if not args.quiet:
-        print(f"[mirror] workspace: {workspace}", flush=True)
-        print(f"[mirror] vault:     {vault}", flush=True)
-        if cutoff:
-            print(f"[mirror] since:     {cutoff.isoformat()}", flush=True)
+    since_seconds = _parse_since(args.since) if args.since else None
+    counts = sweep(vault, workspace, since_seconds=since_seconds)
 
-    tasks = _mirror_tasks(workspace, vault, cutoff, args.quiet)
-    results = _mirror_results(workspace, vault, cutoff, args.quiet)
-    notes = _mirror_notes(workspace, vault, cutoff, args.quiet)
-    _mirror_pending_questions(workspace, vault, args.quiet)
-
-    print(
-        f"[mirror] done — {tasks} tasks, {results} results, {notes} notes mirrored",
-        flush=True,
-    )
+    summary = ", ".join(f"{k}={v}" for k, v in counts.items() if k != "scanned")
+    print(f"[obsidian-mirror] swept {counts['scanned']} sources — {summary}", flush=True)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main(sys.argv[1:]))
