@@ -595,5 +595,98 @@ class TestResolveWorkspaceRunsNewMigrators(unittest.TestCase):
         self.assertFalse((self.workspace / "conversation.log").exists())
 
 
+class TestPostMigrationDisableBehavior(unittest.TestCase):
+    """Positive assertions on the post-#1169 contract: resolve_workspace()
+    leaves legacy sources untouched, emits the notice once when called with
+    migrate=True, and stays fully pure (no scan, no stderr) with migrate=False.
+
+    These replace the auto-dispatch tests above. The skipped ones are kept
+    for one release as ratchet documentation; this class is the canonical
+    assertion of the new behavior."""
+
+    def setUp(self):
+        self._saved_env = os.environ.get("SUTANDO_WORKSPACE")
+        if "SUTANDO_WORKSPACE" in os.environ:
+            del os.environ["SUTANDO_WORKSPACE"]
+        self.tmpdir = tempfile.mkdtemp()
+        self.workspace = Path(self.tmpdir) / "ws"
+        self.workspace.mkdir()
+        self.legacy = Path(self.tmpdir) / "legacy"
+        self.legacy.mkdir()
+        (self.legacy / "notes").mkdir()
+        (self.legacy / "notes" / "x.md").write_text("a real note\n")
+        (self.legacy / "build_log.md").write_text("# build log\n")
+        (self.legacy / "conversation.log").write_text("a turn\n")
+        os.environ["SUTANDO_WORKSPACE"] = str(self.workspace)
+        # Reset the module-level notice guard between tests so each can
+        # observe the once-per-process behavior independently.
+        workspace_default._AUTO_MIGRATE_NOTICE_PRINTED = False
+
+    def tearDown(self):
+        if self._saved_env is not None:
+            os.environ["SUTANDO_WORKSPACE"] = self._saved_env
+        elif "SUTANDO_WORKSPACE" in os.environ:
+            del os.environ["SUTANDO_WORKSPACE"]
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        workspace_default._AUTO_MIGRATE_NOTICE_PRINTED = False
+
+    def test_legacy_sources_untouched_with_migrate_true(self):
+        """resolve_workspace(migrate=True) must NOT move any legacy file."""
+        with patch.object(workspace_default, "_legacy_repo_root", return_value=self.legacy):
+            ws = resolve_workspace(migrate=True)
+        self.assertEqual(ws, self.workspace)
+        # Legacy files unchanged
+        self.assertTrue((self.legacy / "notes" / "x.md").is_file())
+        self.assertTrue((self.legacy / "build_log.md").is_file())
+        self.assertTrue((self.legacy / "conversation.log").is_file())
+        # And nothing was moved INTO the workspace
+        self.assertFalse((self.workspace / "notes").exists())
+        self.assertFalse((self.workspace / "build_log.md").exists())
+        self.assertFalse((self.workspace / "logs" / "conversation.log").exists())
+
+    def test_notice_fires_once_then_silences(self):
+        """The legacy-state stderr notice must fire exactly once per process."""
+        from io import StringIO
+        with patch.object(workspace_default, "_legacy_repo_root", return_value=self.legacy):
+            buf = StringIO()
+            with patch.object(sys, "stderr", buf):
+                resolve_workspace(migrate=True)
+            first = buf.getvalue()
+            buf = StringIO()
+            with patch.object(sys, "stderr", buf):
+                resolve_workspace(migrate=True)
+            second = buf.getvalue()
+        self.assertIn("legacy state detected", first)
+        self.assertIn("#1169", first)
+        self.assertIn("sutando-migrate.sh", first)
+        self.assertEqual("", second, "notice fired more than once")
+
+    def test_migrate_false_stays_pure(self):
+        """migrate=False must skip the scan + stderr entirely. No I/O on legacy."""
+        from io import StringIO
+        with patch.object(workspace_default, "_legacy_repo_root") as mock_repo:
+            buf = StringIO()
+            with patch.object(sys, "stderr", buf):
+                ws = resolve_workspace(migrate=False)
+            self.assertEqual(ws, self.workspace)
+            # _legacy_repo_root() must NOT be called when migrate=False
+            mock_repo.assert_not_called()
+            # No stderr output
+            self.assertEqual("", buf.getvalue())
+        # Legacy files unchanged
+        self.assertTrue((self.legacy / "notes" / "x.md").is_file())
+
+    def test_no_notice_when_no_legacy_state(self):
+        """Clean install: notice must not fire when there's nothing to migrate."""
+        from io import StringIO
+        empty = Path(self.tmpdir) / "empty"
+        empty.mkdir()
+        with patch.object(workspace_default, "_legacy_repo_root", return_value=empty):
+            buf = StringIO()
+            with patch.object(sys, "stderr", buf):
+                resolve_workspace(migrate=True)
+            self.assertEqual("", buf.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -409,8 +409,11 @@ def resolve_workspace(migrate: bool = True) -> Path:
     pointing them at the CLI.
 
     The `migrate` keyword is kept for backwards compatibility with
-    callers that previously passed `migrate=False`; it is now a
-    no-op. Pass it either way.
+    callers that previously passed `migrate=False`. Passing
+    `migrate=False` ALSO skips the legacy-state stderr notice — the
+    function stays pure (no scan, no I/O on the legacy root, no
+    stderr output beyond the relative-path warning). Pass
+    `migrate=True` (the default) to let the one-time notice fire.
     """
     global _AUTO_MIGRATE_NOTICE_PRINTED
 
@@ -440,8 +443,10 @@ def resolve_workspace(migrate: bool = True) -> Path:
 
     # One-time notice if legacy-state evidence exists, pointing at the
     # explicit CLI (to land in a follow-up PR). Process-local guard so we
-    # don't spam every poll loop.
-    if not _AUTO_MIGRATE_NOTICE_PRINTED:
+    # don't spam every poll loop. `migrate=False` keeps the function pure
+    # — useful for callers that just want a path string and have no
+    # interest in side-effects (e.g. test fixtures, status probes).
+    if migrate and not _AUTO_MIGRATE_NOTICE_PRINTED:
         _AUTO_MIGRATE_NOTICE_PRINTED = True
         try:
             repo = _legacy_repo_root()

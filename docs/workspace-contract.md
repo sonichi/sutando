@@ -105,7 +105,9 @@ If your loop / cron / scripts polled `<repo>/tasks/` directly before #762 (and a
 - Any component still reading from `<repo>/tasks/` via a relative path won't see them.
 - Result: new tasks never reach the loop. Observed 2026-05-16 — 7 owner DMs orphaned over 19 minutes before the divergence was caught.
 
-**Preferred fix:** restart the bridge and sutando-app. The migration code from #762 (`_migrate_from_legacy`) auto-moves `<repo>/{tasks,results,state}` → `~/.sutando/workspace/{tasks,results,state}` on first new-default run. After migration, both sides agree on the canonical default and no env var is needed.
+**Preferred fix (post-#1170):** run `bash scripts/sutando-migrate.sh --dry-run` to preview, then `--commit` to relocate `<repo>/{tasks,results,state,notes,build_log.md,conversation.log,…}` into `~/.sutando/workspace/`. The CLI is the only auto-mover post-#1169 (option B); the old `_migrate_from_legacy` auto-fire was removed because it ran destructively on every `resolve_workspace()` call and bit synced workspaces via symlink-following iterdir(). After migration, both sides agree on the canonical default and no env var is needed.
+
+> **Historical note:** before #1170 (2026-05-26) the Python and bash twins of these migrators ran automatically on every `resolve_workspace()` call / `init.sh --auto` startup. That auto-fire is gone; both code paths now only emit a one-time stderr notice when legacy state is detected and route users to the CLI above. The `sutando-migrate.sh` CLI itself ships in a follow-up PR — until then, `mv` the listed paths manually.
 
 **Stop-gap (if migration won't run):** pin `SUTANDO_WORKSPACE` in `.env` at the repo root and restart the bridges:
 
