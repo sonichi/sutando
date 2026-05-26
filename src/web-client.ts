@@ -3741,8 +3741,9 @@ const server = createServer((req, res) => {
 				res.writeHead(200, { 'Content-Type': 'application/json' });
 				res.end(JSON.stringify({ ok: true }));
 			} catch (e) {
+				console.error('[web-client] /note-viewing parse failed:', e);
 				res.writeHead(400, { 'Content-Type': 'application/json' });
-				res.end(JSON.stringify({ error: e instanceof Error ? e.message : 'parse failed' }));
+				res.end(JSON.stringify({ error: 'note-viewing parse failed' }));
 			}
 		});
 		return;
@@ -3802,8 +3803,9 @@ const server = createServer((req, res) => {
 			},
 		);
 		proxyReq.on('error', (e) => {
+			console.error('[web-client] overlay control proxy failed:', e);
 			res.writeHead(502, { 'Content-Type': 'application/json' });
-			res.end(JSON.stringify({ ok: false, error: 'overlay control proxy failed: ' + e.message }));
+			res.end(JSON.stringify({ ok: false, error: 'overlay control proxy failed' }));
 		});
 		req.pipe(proxyReq);
 		return;
@@ -3819,8 +3821,9 @@ const server = createServer((req, res) => {
 			res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
 			res.end(renderSubscriptionsHtml(raw));
 		} catch (e: any) {
+			console.error('[web-client] /paidsubscriptions render failed:', e);
 			res.writeHead(500, { 'Content-Type': 'text/plain' });
-			res.end('Error reading subscriptions: ' + (e?.message || String(e)));
+			res.end('Error reading subscriptions');
 		}
 		return;
 	}
