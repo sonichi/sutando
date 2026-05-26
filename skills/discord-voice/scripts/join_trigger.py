@@ -189,7 +189,9 @@ def _server_already_running(channel_id) -> bool:
     return False
 
 
-def _spawn_voice_server(guild_id, channel_id) -> bool:
+def _spawn_voice_server(
+    guild_id, channel_id, reply_channel_id=None, reply_user_id=None
+) -> bool:
     """Launch discord-voice-server.ts detached for guild+channel. Returns True
     on a successful spawn (the subprocess was started — not that it connected).
 
@@ -202,6 +204,10 @@ def _spawn_voice_server(guild_id, channel_id) -> bool:
     GEMINI_VOICE_API_KEY path) — matches the documented invocation. Detached
     via start_new_session so it survives the bridge restarting; stdout/stderr
     go to the workspace log so it isn't lost.
+
+    `reply_channel_id` and `reply_user_id`: when set, the server sends any
+    startup refusal (e.g. single-bot peer enforcement) to that text channel
+    instead of writing a proactive-*.txt file. Closes #1120.
     """
     if not _DISCORD_VOICE_SERVER.exists():
         return False
@@ -225,6 +231,10 @@ def _spawn_voice_server(guild_id, channel_id) -> bool:
         "--channel",
         str(channel_id),
     ]
+    if reply_channel_id is not None:
+        argv += ["--reply-channel", str(reply_channel_id)]
+    if reply_user_id is not None:
+        argv += ["--reply-user", str(reply_user_id)]
     try:
         subprocess.Popen(
             argv,
@@ -347,7 +357,13 @@ def handle_join_trigger(message) -> str:
     if _server_already_running(channel_id):
         return f"I'm already in **{channel_name}** — see you there."
 
-    if _spawn_voice_server(guild_id, channel_id):
+    # Thread the originating text channel + user so the voice server can reply
+    # there on startup refusals (e.g. peer enforcement) instead of writing to
+    # results/proactive-*.txt which DMs the owner via the bridge's poll loop.
+    reply_channel_id = getattr(getattr(message, "channel", None), "id", None)
+    reply_user_id = getattr(getattr(message, "author", None), "id", None)
+
+    if _spawn_voice_server(guild_id, channel_id, reply_channel_id, reply_user_id):
         # Queue context-prep AFTER successful spawn so the core only sees
         # the synthetic task when voice is actually on the way. No await /
         # block — voice and context-prep race; voice's first turn falls
