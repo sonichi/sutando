@@ -150,6 +150,48 @@ const SUTANDO_PEER_ENFORCEMENT_DISABLED = process.env.SUTANDO_PEER_ENFORCEMENT_D
 // this, treat the session as hung and force a reconnect. Env-overridable.
 const WATCHDOG_STALL_MS = Number(process.env.SUTANDO_WATCHDOG_STALL_MS) || 20000;
 
+// --- Meeting mode (issue #1105) -----------------------------------------------
+// Mirrors voice-agent.ts meetingActive — audio output is suppressed in meeting
+// mode while Gemini keeps transcribing. Persists across Gemini reconnects.
+//
+// Control surface:
+//   state/voice-mode.request  — written by Sutando.app menu-bar toggle (same as voice-agent)
+//   state/voice-mode.txt      — current mode sentinel (read by Sutando.app for badge)
+//
+// Auto-mode: when SUTANDO_VOICE_AUTO_MEETING_AFTER_SEC is set and non-zero,
+// discord-voice automatically flips to meeting mode after that many seconds of
+// user silence. Any user speech exits auto-meeting-mode immediately.
+const VOICE_MODE_TXT = join(WORKSPACE_DIR, 'state', 'voice-mode.txt');
+const VOICE_MODE_REQUEST = join(WORKSPACE_DIR, 'state', 'voice-mode.request');
+const AUTO_MEETING_SEC = Number(process.env.SUTANDO_VOICE_AUTO_MEETING_AFTER_SEC || 0);
+const AUTO_MEETING_MS = AUTO_MEETING_SEC > 0 ? AUTO_MEETING_SEC * 1_000 : 0;
+
+let meetingMode = false;
+
+function writeMeetingModeSentinel(): void {
+	try {
+		mkdirSync(join(WORKSPACE_DIR, 'state'), { recursive: true });
+		writeFileSync(VOICE_MODE_TXT, meetingMode ? 'meeting' : 'active');
+	} catch {}
+}
+
+function applyModeRequest(): void {
+	try {
+		const req = readFileSync(VOICE_MODE_REQUEST, 'utf-8').trim().toLowerCase();
+		unlinkSync(VOICE_MODE_REQUEST);
+		const want = req === 'meeting';
+		if (meetingMode === want) return;
+		meetingMode = want;
+		writeMeetingModeSentinel();
+		console.log(`[Meeting] mode → ${want ? 'meeting' : 'active'} (external request)`);
+	} catch { /* no request file — normal */ }
+}
+
+// Read initial state from voice-mode.txt (shared with voice-agent when both are running)
+try { meetingMode = readFileSync(VOICE_MODE_TXT, 'utf-8').trim() === 'meeting'; } catch {}
+// Poll for mode-request file from Sutando.app menu-bar toggle
+setInterval(applyModeRequest, 1_000);
+
 // --- Per-speaker access tier (owner / team / other) -------------------------
 // Tier logic lives in ./access-tier.ts (pure + unit-tested). A Gemini Live
 // session's tool list is fixed at session start, so the tier is enforced
@@ -871,6 +913,8 @@ async function createVoiceSession(connection: VoiceConnection, client: Client): 
 	let outChunks = 0;
 	sessionAny.handleAudioOutput = (data: string) => {
 		sessionAny.notificationQueue?.markAudioReceived?.();
+		// Meeting mode: suppress audio output; Gemini keeps transcribing.
+		if (meetingMode) return;
 		try {
 			const pcm24Mono = Buffer.from(data, 'base64');
 			const pcm48Stereo = upsample24MonoTo48Stereo(pcm24Mono);
@@ -896,10 +940,12 @@ async function createVoiceSession(connection: VoiceConnection, client: Client): 
 		const items = session.conversationContext.items;
 		if (items.length < lastProcessedIdx) lastProcessedIdx = 0;
 		const lastText = s.transcript.length > 0 ? s.transcript[s.transcript.length - 1].text : null;
+		let latestUserText = '';
 		for (const item of items.slice(lastProcessedIdx)) {
 			if (item.content === lastText) continue;
 			if (item.role === 'user') {
 				s.transcript.push({ role: 'user', text: item.content });
+				latestUserText = item.content;
 				// utterance event push removed per #1052 — canonical record is
 				// the discord_voice-table row written by recordConversation
 				// below. session_events keeps only lifecycle entries to stop
@@ -916,6 +962,17 @@ async function createVoiceSession(connection: VoiceConnection, client: Client): 
 			}
 		}
 		lastProcessedIdx = items.length;
+
+		// Auto-meeting wake-word: any user turn containing the bot's name exits
+		// meeting mode so the bot can respond. Names are case-insensitive.
+		if (AUTO_MEETING_MS > 0 && meetingMode && latestUserText) {
+			const wake = /\b(sutando|lucy)\b/i;
+			if (wake.test(latestUserText)) {
+				meetingMode = false;
+				writeMeetingModeSentinel();
+				console.log(`${ts()} [Meeting] wake-word exit — user addressed the bot`);
+			}
+		}
 
 		if (s.resultQueue.length > 0) {
 			const queued = s.resultQueue.splice(0);
@@ -1082,7 +1139,30 @@ async function createVoiceSession(connection: VoiceConnection, client: Client): 
 			return;
 		}
 		subscribeUser(s, userId);
+		// Auto-meeting: any user speech resets the idle clock and exits meeting mode.
+		(s as any).lastUserAudioTs = Date.now();
+		if (AUTO_MEETING_MS > 0 && meetingMode) {
+			meetingMode = false;
+			writeMeetingModeSentinel();
+			console.log(`${ts()} [Meeting] auto-exit — user started speaking`);
+		}
 	});
+
+	// Auto-meeting idle watchdog: flip to meeting mode after SUTANDO_VOICE_AUTO_MEETING_AFTER_SEC
+	// seconds of no user speech. Disabled when env var is unset (default).
+	if (AUTO_MEETING_MS > 0) {
+		const autoMeetingWatch = setInterval(() => {
+			if (s.closing) { clearInterval(autoMeetingWatch); return; }
+			const last = (s as any).lastUserAudioTs as number || 0;
+			if (!meetingMode && last > 0 && Date.now() - last > AUTO_MEETING_MS) {
+				meetingMode = true;
+				writeMeetingModeSentinel();
+				console.log(`${ts()} [Meeting] auto-enter — ${AUTO_MEETING_SEC}s of user silence`);
+			}
+		}, 5_000);
+		(s as any)._autoMeetingHandle = autoMeetingWatch;
+	}
+
 	// Start the constant-rate ticker that flushes audio to Gemini every 20ms.
 	startAudioTicker(s);
 
@@ -1107,6 +1187,7 @@ function cleanupSession(s: DiscordVoiceSession): void {
 	try { clearInterval((s as any)._outTickHandle); } catch {}
 	try { clearInterval((s as any)._watchdogHandle); } catch {}
 	try { clearInterval((s as any)._channelScanHandle); } catch {}
+	try { clearInterval((s as any)._autoMeetingHandle); } catch {}
 	try { s.player.stop(true); } catch {}
 	try { s.connection.destroy(); } catch {}
 
