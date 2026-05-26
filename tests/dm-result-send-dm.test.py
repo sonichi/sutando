@@ -96,14 +96,20 @@ def _restore_transport(original):
 
 
 def _with_access_json(content, fn):
+    # Also blank out discord_config.load_config so the real workspace
+    # discord-config.json (which may have `owner` set) doesn't override
+    # the access_data-driven resolution paths under test.
     original = dm.ACCESS_JSON
+    original_load_config = dm.discord_config.load_config
     tmp = Path(tempfile.mkdtemp(prefix="sutando-dm-test-")) / "access.json"
     tmp.write_text(json.dumps(content))
     dm.ACCESS_JSON = tmp
+    dm.discord_config.load_config = lambda: {}
     try:
         fn()
     finally:
         dm.ACCESS_JSON = original
+        dm.discord_config.load_config = original_load_config
         tmp.unlink()
         tmp.parent.rmdir()
 
