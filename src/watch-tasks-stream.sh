@@ -69,6 +69,17 @@ echo "$$" > "$PID_FILE"
 # panic) skip the trap — the Stop hook + startup reaper cover those.
 trap 'rm -f "$PID_FILE"' EXIT
 
+# Mode B fix: PPID watchdog — exit when parent shell is gone to prevent
+# PPID=1 orphan. Reproducer: 2026-05-23 4h task-drop where fswatch was
+# alive but had no consumer; every event was silently swallowed. Stop hook
+# covers clean exits; this covers SIGKILL / Monitor wrapper teardown without
+# SIGTERM delivery.
+# $PPID captured before the subshell so it refers to the Monitor wrapper PID
+# (inside the subshell $PPID would be this script's PID instead).
+_PARENT_PID=${PPID}
+( while kill -0 "${_PARENT_PID}" 2>/dev/null; do sleep 5; done
+  kill "$$" 2>/dev/null ) &
+
 # Initial sweep — surface any pre-existing tasks that arrived during a
 # restart gap.
 shopt -s nullglob
@@ -107,7 +118,10 @@ fswatch \
     *.txt)
       parent="$(dirname "$path")"
       if [ "$parent" = "$TASKS_DIR_ABS" ] && [ -f "$path" ]; then
-        echo "TASK_FILE: $(basename "$path")"
+        # Mode A fix: printf returns non-zero on EPIPE immediately (unlike
+        # echo, which buffers into the kernel pipe until ~100 events fill it).
+        # exit 0 on broken pipe — consumer is gone, watcher should stop.
+        printf 'TASK_FILE: %s\n' "$(basename "$path")" || exit 0
       fi
       ;;
   esac
