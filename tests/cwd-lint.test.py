@@ -1,228 +1,144 @@
 #!/usr/bin/env python3
-"""Tests for scripts/lint-cwd-writes.py (issue #863 — ban bare cwd() outside resolvers)."""
+"""Lint: ban process.cwd() / Path.cwd() / os.getcwd() outside canonical resolvers.
 
-import importlib.util
-import subprocess
+Prevents re-introducing the workspace-vs-repo bug class that the 2026-05-18
+audit (PRs #815, #821, #832 … #859) closed across ~28 sites.
+
+Closes (tracks) issue #863.
+
+Run: python3 tests/cwd-lint.test.py
+Exit: 0 on pass, 1 on fail.
+"""
+import re
 import sys
-import tempfile
+import unittest
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).parent.parent
-SCRIPT = REPO_ROOT / "scripts" / "lint-cwd-writes.py"
+ROOT = Path(__file__).resolve().parent.parent
+SRC = ROOT / "src"
 
-spec = importlib.util.spec_from_file_location("lint_cwd", SCRIPT)
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
+# Python files: Path.cwd() and os.getcwd() are only allowed in these files.
+PY_ALLOWLIST = {"workspace_default.py", "util_paths.py"}
+# Matches `Path.cwd()` or `os.getcwd()` as actual code.
+# Comments are stripped by _code_only() before this regex runs.
+_PY_CWD_RE = re.compile(r"(?:Path\.cwd\(\)|os\.getcwd\(\))")
+_PY_COMMENT_RE = re.compile(r"#.*$")
 
-check_py = mod.check_py
-check_ts = mod.check_ts
-
-PASS = 0
-FAIL = 0
-
-def ok(label):
-    global PASS
-    PASS += 1
-    print(f"PASS  {label}")
-
-def fail(label, detail=""):
-    global FAIL
-    FAIL += 1
-    print(f"FAIL  {label}" + (f": {detail}" if detail else ""))
+# TypeScript files: process.cwd() is only allowed in these files.
+TS_ALLOWLIST = {"workspace_default.ts", "util_paths.ts"}
+_TS_CWD_RE = re.compile(r"process\.cwd\(\)")
+_TS_LINE_COMMENT_RE = re.compile(r"//.*$")
 
 
-# ---------------------------------------------------------------------------
-# T1 — script exists
-# ---------------------------------------------------------------------------
-if SCRIPT.exists():
-    ok("T1: lint script exists at scripts/lint-cwd-writes.py")
-else:
-    fail("T1: lint script exists at scripts/lint-cwd-writes.py")
+def _code_only(line: str, comment_re: re.Pattern) -> str:
+    """Strip trailing line comment, return the code portion."""
+    return comment_re.sub("", line)
 
-# ---------------------------------------------------------------------------
-# T2 — detects Path.cwd() in Python file
-# ---------------------------------------------------------------------------
-with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False,
-                                  dir=REPO_ROOT / "src") as tf:
-    tf.write("from pathlib import Path\ncwd = Path.cwd()\n")
-    viol_py = Path(tf.name)
-try:
-    hits = check_py(viol_py)
-    if hits and hits[0][0] == 2:
-        ok("T2: check_py detects Path.cwd() at correct line")
-    else:
-        fail("T2: check_py detects Path.cwd() at correct line", f"hits={hits}")
-finally:
-    viol_py.unlink(missing_ok=True)
 
-# ---------------------------------------------------------------------------
-# T3 — detects os.getcwd() in Python file
-# ---------------------------------------------------------------------------
-with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False,
-                                  dir=REPO_ROOT / "src") as tf:
-    tf.write("import os\np = os.getcwd()\n")
-    viol_py2 = Path(tf.name)
-try:
-    hits = check_py(viol_py2)
-    if hits and hits[0][0] == 2:
-        ok("T3: check_py detects os.getcwd()")
-    else:
-        fail("T3: check_py detects os.getcwd()", f"hits={hits}")
-finally:
-    viol_py2.unlink(missing_ok=True)
+def _scan_python() -> list[tuple[str, int, str]]:
+    """Return (relpath, lineno, line) for Python CWD violations."""
+    violations: list[tuple[str, int, str]] = []
+    for py_file in sorted(SRC.glob("*.py")):
+        if py_file.name in PY_ALLOWLIST:
+            continue
+        for lineno, raw_line in enumerate(py_file.read_text(errors="replace").splitlines(), 1):
+            code = _code_only(raw_line, _PY_COMMENT_RE)
+            if _PY_CWD_RE.search(code):
+                violations.append((f"src/{py_file.name}", lineno, raw_line.strip()))
+    return violations
 
-# ---------------------------------------------------------------------------
-# T4 — ignores Path.cwd() in a Python comment
-# ---------------------------------------------------------------------------
-with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False,
-                                  dir=REPO_ROOT / "src") as tf:
-    tf.write("# Previously used Path.cwd() here — now uses resolve_workspace()\n")
-    comment_py = Path(tf.name)
-try:
-    hits = check_py(comment_py)
-    if not hits:
-        ok("T4: check_py ignores Path.cwd() in a comment line")
-    else:
-        fail("T4: check_py ignores Path.cwd() in a comment line", f"hits={hits}")
-finally:
-    comment_py.unlink(missing_ok=True)
 
-# ---------------------------------------------------------------------------
-# T5 — allows Path.cwd() in workspace_default.py (canonical resolver)
-# ---------------------------------------------------------------------------
-workspace_py = REPO_ROOT / "src" / "workspace_default.py"
-if workspace_py.exists():
-    hits = check_py(workspace_py)
-    if not hits:
-        ok("T5: check_py allows Path.cwd() in src/workspace_default.py")
-    else:
-        fail("T5: check_py allows Path.cwd() in src/workspace_default.py",
-             f"{len(hits)} violation(s) flagged in allowed file")
-else:
-    ok("T5: workspace_default.py not present — skip (no violations possible)")
+def _scan_typescript() -> list[tuple[str, int, str]]:
+    """Return (relpath, lineno, line) for TypeScript CWD violations."""
+    violations: list[tuple[str, int, str]] = []
+    for ts_file in sorted(SRC.glob("*.ts")):
+        if ts_file.name in TS_ALLOWLIST:
+            continue
+        for lineno, raw_line in enumerate(ts_file.read_text(errors="replace").splitlines(), 1):
+            code = _code_only(raw_line, _TS_LINE_COMMENT_RE)
+            if _TS_CWD_RE.search(code):
+                violations.append((f"src/{ts_file.name}", lineno, raw_line.strip()))
+    return violations
 
-# ---------------------------------------------------------------------------
-# T6 — detects process.cwd() in TS file
-# ---------------------------------------------------------------------------
-with tempfile.NamedTemporaryFile(suffix=".ts", mode="w", delete=False,
-                                  dir=REPO_ROOT / "src") as tf:
-    tf.write("const d = process.cwd();\n")
-    viol_ts = Path(tf.name)
-try:
-    hits = check_ts(viol_ts)
-    if hits and hits[0][0] == 1:
-        ok("T6: check_ts detects process.cwd() in TS file")
-    else:
-        fail("T6: check_ts detects process.cwd() in TS file", f"hits={hits}")
-finally:
-    viol_ts.unlink(missing_ok=True)
 
-# ---------------------------------------------------------------------------
-# T7 — ignores process.cwd() in a TS comment
-# ---------------------------------------------------------------------------
-with tempfile.NamedTemporaryFile(suffix=".ts", mode="w", delete=False,
-                                  dir=REPO_ROOT / "src") as tf:
-    tf.write("// was: process.cwd() — now uses resolveWorkspace()\n")
-    comment_ts = Path(tf.name)
-try:
-    hits = check_ts(comment_ts)
-    if not hits:
-        ok("T7: check_ts ignores process.cwd() in a TS comment line")
-    else:
-        fail("T7: check_ts ignores process.cwd() in a TS comment line", f"hits={hits}")
-finally:
-    comment_ts.unlink(missing_ok=True)
+class TestCwdLintPython(unittest.TestCase):
+    def test_no_path_cwd_in_python_src(self):
+        violations = _scan_python()
+        if violations:
+            lines = "\n".join(f"  {f}:{n}: {l}" for f, n, l in violations)
+            self.fail(
+                f"Path.cwd() / os.getcwd() found outside allowlist "
+                f"({', '.join(PY_ALLOWLIST)}):\n{lines}\n"
+                "Route workspace data through resolve_workspace() instead. See issue #863."
+            )
 
-# ---------------------------------------------------------------------------
-# T8 — allows process.cwd() in workspace_default.ts
-# ---------------------------------------------------------------------------
-workspace_ts = REPO_ROOT / "src" / "workspace_default.ts"
-if workspace_ts.exists():
-    hits = check_ts(workspace_ts)
-    if not hits:
-        ok("T8: check_ts allows process.cwd() in src/workspace_default.ts")
-    else:
-        fail("T8: check_ts allows process.cwd() in src/workspace_default.ts",
-             f"{len(hits)} violation(s) flagged in allowed file")
-else:
-    ok("T8: workspace_default.ts not present — skip")
+    def test_allowlist_files_exist(self):
+        for name in PY_ALLOWLIST:
+            self.assertTrue((SRC / name).exists(), f"Allowlisted file not found: src/{name}")
 
-# ---------------------------------------------------------------------------
-# T9 — allows process.cwd() in approved inline-tools.ts
-# ---------------------------------------------------------------------------
-inline_ts = REPO_ROOT / "src" / "inline-tools.ts"
-if inline_ts.exists():
-    hits = check_ts(inline_ts)
-    if not hits:
-        ok("T9: check_ts allows process.cwd() in approved src/inline-tools.ts")
-    else:
-        fail("T9: check_ts allows process.cwd() in approved src/inline-tools.ts",
-             f"{len(hits)} violation(s)")
-else:
-    ok("T9: inline-tools.ts not present — skip")
+    def test_workspace_default_py_uses_cwd(self):
+        text = (SRC / "workspace_default.py").read_text()
+        self.assertIn("cwd", text.lower(),
+                      "workspace_default.py should reference cwd (sanity check that allowlist is meaningful)")
 
-# ---------------------------------------------------------------------------
-# T10 — CLI exits 0 for clean src/ directory
-# ---------------------------------------------------------------------------
-proc = subprocess.run(
-    [sys.executable, str(SCRIPT)],
-    capture_output=True, text=True, cwd=str(REPO_ROOT)
-)
-if proc.returncode == 0:
-    ok("T10: CLI exits 0 — all src/ files currently clean")
-else:
-    fail("T10: CLI exits 0 — all src/ files currently clean",
-         proc.stdout.strip()[:200])
+    def test_scan_returns_list(self):
+        result = _scan_python()
+        self.assertIsInstance(result, list)
 
-# ---------------------------------------------------------------------------
-# T11 — CLI exits 1 for a violating file
-# ---------------------------------------------------------------------------
-with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False,
-                                  dir=REPO_ROOT / "src") as tf:
-    tf.write("import os\nbase = os.getcwd()\n")
-    viol3 = Path(tf.name)
-try:
-    proc2 = subprocess.run(
-        [sys.executable, str(SCRIPT), str(viol3)],
-        capture_output=True, text=True, cwd=str(REPO_ROOT)
-    )
-    if proc2.returncode == 1:
-        ok("T11: CLI exits 1 for a file with os.getcwd() outside allowed paths")
-    else:
-        fail("T11: CLI exits 1 for a violating file", f"rc={proc2.returncode}")
-finally:
-    viol3.unlink(missing_ok=True)
 
-# ---------------------------------------------------------------------------
-# T12 — script has module docstring
-# ---------------------------------------------------------------------------
-content = SCRIPT.read_text()
-lines = content.splitlines()
-body = "\n".join(l for l in lines if not l.startswith("#!")).lstrip()
-if body.startswith('"""') or body.startswith("'''"):
-    ok("T12: lint script has module docstring")
-else:
-    fail("T12: lint script has module docstring")
+class TestCwdLintTypeScript(unittest.TestCase):
+    def test_no_process_cwd_in_typescript_src(self):
+        violations = _scan_typescript()
+        if violations:
+            lines = "\n".join(f"  {f}:{n}: {l}" for f, n, l in violations)
+            self.fail(
+                f"process.cwd() found outside allowlist "
+                f"({', '.join(TS_ALLOWLIST)}):\n{lines}\n"
+                "Route workspace data through resolveWorkspace() instead. See issue #863."
+            )
 
-# ---------------------------------------------------------------------------
-# T13 — ignores process.cwd() in inline trailing TS comment
-# ---------------------------------------------------------------------------
-with tempfile.NamedTemporaryFile(suffix=".ts", mode="w", delete=False,
-                                  dir=REPO_ROOT / "src") as tf:
-    tf.write("const ws = resolveWorkspace(); // previously process.cwd()\n")
-    trailing_ts = Path(tf.name)
-try:
-    hits = check_ts(trailing_ts)
-    if not hits:
-        ok("T13: check_ts ignores process.cwd() in trailing inline comment")
-    else:
-        fail("T13: check_ts ignores process.cwd() in trailing inline comment", f"hits={hits}")
-finally:
-    trailing_ts.unlink(missing_ok=True)
+    def test_allowlist_files_exist(self):
+        for name in TS_ALLOWLIST:
+            self.assertTrue((SRC / name).exists(), f"Allowlisted file not found: src/{name}")
 
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
-print(f"\n{PASS}/{PASS+FAIL} tests passed")
+    def test_workspace_default_ts_uses_cwd(self):
+        ts_path = SRC / "workspace_default.ts"
+        self.assertTrue(ts_path.exists())
+        text = ts_path.read_text()
+        self.assertIn("cwd", text.lower(),
+                      "workspace_default.ts should reference cwd (sanity check that allowlist is meaningful)")
+
+    def test_scan_returns_list(self):
+        result = _scan_typescript()
+        self.assertIsInstance(result, list)
+
+
+class TestCwdLintCommentStrip(unittest.TestCase):
+    def test_python_comment_stripped_before_check(self):
+        # A comment containing Path.cwd() should NOT be flagged
+        line = "    # resolves relative to Path.cwd() which is wrong"
+        code = _code_only(line, _PY_COMMENT_RE)
+        self.assertFalse(_PY_CWD_RE.search(code),
+                         "Comment-only CWD reference should not be flagged")
+
+    def test_python_real_code_not_stripped(self):
+        line = "    target = Path.cwd() / 'workspace'"
+        code = _code_only(line, _PY_COMMENT_RE)
+        self.assertTrue(_PY_CWD_RE.search(code),
+                        "Actual Path.cwd() call should be flagged")
+
+    def test_typescript_comment_stripped_before_check(self):
+        line = "    // Old code used process.cwd() here"
+        code = _code_only(line, _TS_LINE_COMMENT_RE)
+        self.assertFalse(_TS_CWD_RE.search(code),
+                         "Comment-only CWD reference should not be flagged")
+
+    def test_typescript_real_code_not_stripped(self):
+        line = "    const ws = process.cwd();"
+        code = _code_only(line, _TS_LINE_COMMENT_RE)
+        self.assertTrue(_TS_CWD_RE.search(code),
+                        "Actual process.cwd() call should be flagged")
+
+
 if __name__ == "__main__":
-    pass
+    unittest.main(verbosity=2)
