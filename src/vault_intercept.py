@@ -49,9 +49,13 @@ _MANIFEST_PATH = os.path.expanduser("~/.sutando-vault/keys.json")
 #   - single-quoted string   'foo bar'
 #   - backtick-quoted string `foo bar`  (Discord markdown; backticks stripped)
 #   - bare token (no spaces) foobar
+#
+# Anchored to start-of-line (or after a newline) to prevent conversational
+# false-positives like "the vault set command works" from storing garbage.
+# The (?:\s|$) tail avoids partial-token corruption on bare values.
 _VAULT_SET_RE = re.compile(
-    r'vault\s+set\s+(\S+)\s+(?:"([^"]*)"|\'([^\']*)\'|`([^`]*)`|(\S+))',
-    re.IGNORECASE,
+    r'(?:^|\n)\s*vault\s+set\s+(\S+)\s+(?:"([^"]*)"|\'([^\']*)\'|`([^`]*)`|(\S+))(?:\s|$)',
+    re.IGNORECASE | re.MULTILINE,
 )
 
 
