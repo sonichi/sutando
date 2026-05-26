@@ -236,7 +236,7 @@ Keep each step conversational and brief — this is spoken, not read. Focus on w
 
 ## Built-in tools
 
-For the per-tool bash recipes (Calendar, Screen capture, Notes, Email, Contacts, iMessage, WhatsApp, X, Reminders, macOS GUI control, Browser automation, File search, Meeting join, Phone calls, App launcher, Context drop + shortcuts), see [`docs/built-in-tools.md`](docs/built-in-tools.md). Moved out of CLAUDE.md to keep the per-session context budget tight — reach for it on demand rather than carrying it on every turn.
+**When the user asks for a capability you don't see in this file (email, calendar, iMessage, X, screen capture, browser automation, phone calls, reminders, contacts, file search, etc.), check [`docs/built-in-tools.md`](docs/built-in-tools.md) BEFORE refusing or trying to invent a tool.** That file is the catalog of what Sutando can directly do — bash recipes for every built-in capability. Reach for it on demand rather than carrying it on every turn.
 
 ## Learn from demonstration
 
