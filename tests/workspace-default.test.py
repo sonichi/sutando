@@ -274,6 +274,12 @@ class TestInRepoNotesMigration(unittest.TestCase):
         self.assertTrue(moved_1)
         self.assertFalse(moved_2)  # second run finds in-repo notes/ empty (file moved)
 
+    @unittest.skip(
+        "#1169: auto-migration disabled from resolve_workspace(). "
+        "_migrate_inrepo_notes function itself is still tested directly "
+        "above; the auto-dispatch is now opt-in via the sutando-migrate CLI "
+        "(follow-up PR)."
+    )
     def test_resolve_workspace_runs_inrepo_notes_migration_when_env_set(self):
         # End-to-end: resolve_workspace called with env-set workspace, in-repo
         # has notes, migration runs on the way through.
@@ -350,6 +356,12 @@ class TestInRepoBuildLogMigration(unittest.TestCase):
         # Workspace still has the FIRST content (second run skipped via sentinel).
         self.assertEqual((self.workspace / "build_log.md").read_text(), "once")
 
+    @unittest.skip(
+        "#1169: auto-migration disabled from resolve_workspace(). "
+        "_migrate_inrepo_build_log function itself is still tested directly "
+        "above; the auto-dispatch is now opt-in via the sutando-migrate CLI "
+        "(follow-up PR)."
+    )
     def test_resolve_workspace_runs_build_log_migration_when_env_set(self):
         (self.repo_root / "build_log.md").write_text("e2e content")
         with patch.object(workspace_default, "_legacy_repo_root", return_value=self.repo_root):
@@ -358,6 +370,12 @@ class TestInRepoBuildLogMigration(unittest.TestCase):
         self.assertTrue((self.workspace / "build_log.md").exists())
         self.assertFalse((self.repo_root / "build_log.md").exists())
 
+    @unittest.skip(
+        "#1169: auto-migration disabled from resolve_workspace(). "
+        "_migrate_from_legacy + _migrate_inrepo_build_log are still tested "
+        "directly above; the env-unset auto-dispatch is now opt-in via "
+        "sutando-migrate CLI (follow-up PR)."
+    )
     def test_legacy_install_env_unset_build_log_migrates_after_dirs(self):
         """Corner case Mini flagged in PR #859 review:
           - Legacy install: repo has tasks/, results/, state/ with content
@@ -558,6 +576,12 @@ class TestResolveWorkspaceRunsNewMigrators(unittest.TestCase):
             del os.environ["SUTANDO_WORKSPACE"]
         shutil.rmtree(self.workspace, ignore_errors=True)
 
+    @unittest.skip(
+        "#1169: auto-migration disabled from resolve_workspace(). "
+        "_migrate_root_status + _migrate_conversation_log are still tested "
+        "directly above; the auto-dispatch is now opt-in via the "
+        "sutando-migrate CLI (follow-up PR)."
+    )
     def test_env_set_resolve_runs_status_and_convlog_migration(self):
         (self.workspace / "core-status.json").write_text('{"status":"idle"}')
         (self.workspace / "conversation.log").write_text("a turn\n")
