@@ -71,9 +71,11 @@ trap 'rm -f "$PID_FILE"' EXIT
 
 # Initial sweep — surface any pre-existing tasks that arrived during a
 # restart gap.
+# printf || exit 0: if Monitor's read end is already gone when we start,
+# the first write fails with EPIPE and we exit immediately (#1088 Mode A).
 shopt -s nullglob
 for f in "$TASKS_DIR"/*.txt; do
-  echo "TASK_FILE: $(basename "$f")"
+  printf 'TASK_FILE: %s\n' "$(basename "$f")" || exit 0
 done
 shopt -u nullglob
 
@@ -97,6 +99,12 @@ shopt -u nullglob
 #    rename — including the source path AFTER the file has moved out.
 #    `[ -f "$path" ]` filters those rename-OUT-of-watched-dir events.
 #    Caught 2026-05-03 #1 (PR #572).
+#
+# printf || exit 0: unlike `echo`, `printf` propagates EPIPE immediately
+# at the first failed kernel write, not after the kernel pipe buffer fills
+# (~100 events, ~64KB). When Monitor's read end closes (consumer exits or
+# session ends), the next event write exits immediately instead of silently
+# buffering for hours — fixes the 2026-05-23 4h DM-loss incident (#1088).
 fswatch \
   -l 0.5 \
   --event Created \
@@ -107,7 +115,7 @@ fswatch \
     *.txt)
       parent="$(dirname "$path")"
       if [ "$parent" = "$TASKS_DIR_ABS" ] && [ -f "$path" ]; then
-        echo "TASK_FILE: $(basename "$path")"
+        printf 'TASK_FILE: %s\n' "$(basename "$path")" || exit 0
       fi
       ;;
   esac
