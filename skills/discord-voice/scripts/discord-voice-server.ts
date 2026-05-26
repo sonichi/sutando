@@ -1187,17 +1187,26 @@ async function start(): Promise<void> {
 				`Single-bot enforcement (#1089); reinvite once they leave.`;
 			const REPLY_CHANNEL_ID = getArg('reply-channel');
 			const REPLY_USER_ID = getArg('reply-user');
+			// Track whether the channel-reply was actually delivered. If not — for ANY
+			// reason: arg absent, fetch threw, channel isn't text-capable, send threw —
+			// fall back to proactive-*.txt so the operator still sees the refusal.
+			// (Per @bassilkhilo-ag2's #1132 review: prior shape logged "falling back to
+			// proactive-*.txt" on catch but didn't actually write it, silently dropping
+			// the #1089 refusal when the channel send failed.)
+			let channelReplyDelivered = false;
 			if (REPLY_CHANNEL_ID) {
 				try {
 					const replyCh = await client.channels.fetch(REPLY_CHANNEL_ID);
 					if (replyCh && 'send' in replyCh) {
 						const mention = REPLY_USER_ID ? `<@${REPLY_USER_ID}> ` : '';
 						await (replyCh as any).send(mention + refusalText);
+						channelReplyDelivered = true;
 					}
 				} catch (e) {
-					console.error(`${ts()} [Setup] #1120 channel-reply failed; falling back to proactive-*.txt:`, e);
+					console.error(`${ts()} [Setup] #1120 channel-reply failed:`, e);
 				}
-			} else {
+			}
+			if (!channelReplyDelivered) {
 				try {
 					const proactivePath = join(WORKSPACE_DIR, 'results', `proactive-${Date.now()}.txt`);
 					writeFileSync(proactivePath, refusalText + '\n');
