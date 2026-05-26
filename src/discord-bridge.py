@@ -53,9 +53,33 @@ except ModuleNotFoundError:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
+import discord_config  # noqa: E402  — Sutando workspace-local discord config (#1147)
 from util_paths import shared_personal_path  # noqa: E402
 from task_priority import default_priority_for_source  # noqa: E402
+from result_markers import parse_markers  # noqa: E402  — unified marker parser (#896)
 REPO = resolve_workspace()
+
+# discord-voice "magic word" join trigger (issue: za-warudo summon). The
+# bridge stays a THIN hook — it only detects "owner + join phrase" and hands
+# off to this helper, which owns the voice-channel resolution + server launch
+# + already-running guard. Keeping the feature logic in the skill honors the
+# CLAUDE.md core/skill split (core must not bloat with feature logic). The
+# import is best-effort: if the discord-voice skill is absent, the magic word
+# simply doesn't fire and the message is processed as a normal task.
+try:
+    sys.path.insert(
+        0, str(Path(__file__).resolve().parent.parent / "skills" / "discord-voice" / "scripts")
+    )
+    from join_trigger import (  # noqa: E402
+        message_is_join_phrase as _dv_message_is_join_phrase,
+        handle_join_trigger as _dv_handle_join_trigger,
+    )
+except Exception:  # pragma: no cover - skill optional
+    def _dv_message_is_join_phrase(text):  # type: ignore
+        return False
+
+    def _dv_handle_join_trigger(message):  # type: ignore
+        return ""
 
 # Vision-frame helper — pushes image attachments into the active voice session
 # so Gemini reacts in-stream. Best-effort: import failure or unreachable
@@ -65,24 +89,6 @@ try:
 except Exception:  # pragma: no cover
     def _push_vision_image(path: str, source: str = "discord") -> bool:  # type: ignore
         return False
-
-# discord-voice join-trigger — "za warudo" magic word. Best-effort: skill
-# absent → no-op stubs so bridge boots without discord-voice installed.
-try:
-    sys.path.insert(
-        0,
-        str(Path(__file__).resolve().parent.parent / "skills" / "discord-voice" / "scripts"),
-    )
-    from join_trigger import (  # type: ignore  # noqa: E402
-        message_is_join_phrase as _dv_message_is_join_phrase,
-        handle_join_trigger as _dv_handle_join_trigger,
-    )
-except Exception:  # pragma: no cover
-    def _dv_message_is_join_phrase(text: str) -> bool:  # type: ignore
-        return False
-
-    async def _dv_handle_join_trigger(message) -> str:  # type: ignore
-        return ""
 
 # Load token — env var takes precedence (allows test injection without a real .env file)
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
@@ -2011,6 +2017,19 @@ client = discord.Client(intents=intents)
 @client.event
 async def on_ready():
     print(f"Discord bridge ready: {client.user}")
+    # #1147: auto-seed workspace `state/discord-config.json` from the legacy
+    # access.json heuristic on first boot. Idempotent (no-op if file
+    # exists). Emits a WARN to stderr if the seed had to fall back to
+    # `allowFrom[0]` so the operator catches a mis-seed before it routes
+    # the first proactive DM to the wrong user.
+    try:
+        _initial_access = json.loads(ACCESS_FILE.read_text())
+    except Exception:
+        _initial_access = {}
+    try:
+        discord_config.auto_seed_if_missing(_initial_access)
+    except Exception as _seed_exc:
+        print(f"  [discord-config] auto-seed failed (non-fatal): {_seed_exc}")
     # Restart-safety: REST-catch-up missed DMs from the disconnect
     # window. Discord gateway IDENTIFY (post-RESUME-expiry reconnect)
     # does NOT replay `MESSAGE_CREATE` events that arrived during the
@@ -2239,6 +2258,29 @@ async def _handle_discord_message(message, force=False):
                     print(f"  [thread-engage] added thread {thread_id_str} (parent {parent_id_str}) to access.json with {thread_entry}", flush=True)
             except Exception as e:
                 print(f"  [thread-engage] failed to update access.json: {e}", flush=True)
+
+        # Magic-word fast path: an owner saying the join phrase MUST bypass
+        # requireMention — otherwise the magic word can't fire in any guild
+        # text channel where the bot isn't @-mentioned. Check before the
+        # requireMention skip so "za warudo" in #General (no mention) still
+        # summons the voice spawn for the owner.
+        try:
+            if str(message.author.id) in load_allowed() and _dv_message_is_join_phrase(text):
+                print(f"  [join-trigger] owner @{message.author} said the join phrase — summoning discord-voice (bypassing requireMention)", flush=True)
+                try:
+                    reply = _dv_handle_join_trigger(message)
+                except Exception as e:
+                    print(f"  [join-trigger] handler raised: {e}", flush=True)
+                    reply = "Couldn't process the voice-join request — check the bridge log."
+                try:
+                    if reply:
+                        for chunk in _chunk_for_discord(reply):
+                            await message.channel.send(chunk)
+                except Exception as e:
+                    print(f"  [join-trigger] reply send failed: {e}", flush=True)
+                return
+        except Exception as e:
+            print(f"  [join-trigger] early-path raised: {e}", flush=True)
 
         if require_mention and not bot_mentioned and not role_mentioned:
             print(f"  [skip] not mentioned (requireMention=true)", flush=True)
@@ -2516,31 +2558,35 @@ async def _handle_discord_message(message, force=False):
     if len(seen_message_ids) > 10000:
         seen_message_ids.clear()
 
-    # discord-voice magic word — "za warudo" (or whatever the workspace join_phrase
-    # is set to). Short-circuits the normal task-file path: the reply goes straight
-    # back to Discord and we return early so no task file is written.
+    # discord-voice "magic word" join trigger. THIN hook (CLAUDE.md core/skill
+    # split): the bridge only checks "is this the owner saying the join
+    # phrase"; everything else — voice-channel lookup, already-running guard,
+    # discord-voice-server launch — lives in the discord-voice skill helper.
+    # Owner-only by construction: a non-owner saying the phrase falls through
+    # to normal task handling. When it fires, the message IS the command — we
+    # send the reply and return WITHOUT writing a task file (no normal task
+    # for a join-phrase message). Placed AFTER dedup so gateway replay can't
+    # double-fire the spawn; the helper has its own `_server_already_running`
+    # guard anyway, but cheaper to dedup at the front gate.
     if access_tier == "owner":
         try:
             is_join = _dv_message_is_join_phrase(text)
-        except Exception as _jt_err:
-            print(f"  [join-trigger] match check raised: {_jt_err}", flush=True)
+        except Exception as e:
+            print(f"  [join-trigger] match check raised: {e}", flush=True)
             is_join = False
         if is_join:
-            print(
-                f"  [join-trigger] owner @{username} said the join phrase — summoning discord-voice",
-                flush=True,
-            )
+            print(f"  [join-trigger] owner @{username} said the join phrase — summoning discord-voice", flush=True)
             try:
                 reply = _dv_handle_join_trigger(message)
-            except Exception as _jt_err:
+            except Exception as e:
+                print(f"  [join-trigger] handler raised: {e}", flush=True)
                 reply = "Couldn't process the voice-join request — check the bridge log."
-                print(f"  [join-trigger] handle_join_trigger raised: {_jt_err}", flush=True)
             try:
                 if reply:
-                    for _chunk in _chunk_for_discord(reply):
-                        await message.channel.send(_chunk)
-            except Exception as _jt_err:
-                print(f"  [join-trigger] reply send failed: {_jt_err}", flush=True)
+                    for chunk in _chunk_for_discord(reply):
+                        await message.channel.send(chunk)
+            except Exception as e:
+                print(f"  [join-trigger] reply send failed: {e}", flush=True)
             return
 
     # Deterministic tier ownership: if SUTANDO_TEAM_TIER_OWNER is configured
@@ -2886,6 +2932,59 @@ async def _catchup_missed_dms():
             print(f"  [dm-catchup] channel {channel_id_str} failed: {e}", flush=True)
 
 
+# Delivery-idempotency sentinels. Pre-fix: if the bridge crashed
+# BETWEEN `channel.send(reply_text)` returning success and the
+# subsequent `archive_file(result_file, ...)` call, on restart the
+# result file still exists in `results/` and would be re-sent —
+# producing a duplicate. With these sentinels:
+#
+#   1. Right BEFORE the per-task send block, `_is_delivered(task_id)`
+#      checks the sentinel. If present → skip send, run archive,
+#      clear sentinel.
+#   2. Right AFTER channel.send succeeds, `_mark_delivered(task_id)`
+#      touches the sentinel.
+#   3. After archive completes, `_clear_delivered(task_id)` removes
+#      the sentinel (bounded dir growth).
+#
+# The crash-between-send-and-sentinel window remains a narrow
+# double-send vector (Discord nonce-based dedup would close that
+# tighter; deferred to follow-up).
+#
+# Scope of THIS PR: poll_results main-path only. Channel-redirect,
+# proactive, and dm-fallback paths are scoped follow-ups.
+DELIVERED_DIR = REPO / "state" / "discord-delivered"
+
+
+def _delivered_sentinel_path(task_id: str) -> Path:
+    return DELIVERED_DIR / f"{task_id}.sentinel"
+
+
+def _mark_delivered(task_id: str) -> None:
+    """Touch the delivery sentinel for `task_id`. Called immediately
+    after a successful `channel.send`."""
+    try:
+        DELIVERED_DIR.mkdir(parents=True, exist_ok=True)
+        _delivered_sentinel_path(task_id).touch()
+    except Exception as e:
+        print(f"  [delivered] sentinel write failed for {task_id}: {e}", flush=True)
+
+
+def _is_delivered(task_id: str) -> bool:
+    """True iff the sentinel for `task_id` exists."""
+    try:
+        return _delivered_sentinel_path(task_id).exists()
+    except Exception:
+        return False
+
+
+def _clear_delivered(task_id: str) -> None:
+    """Remove the sentinel — called during archive cleanup."""
+    try:
+        _delivered_sentinel_path(task_id).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 PENDING_REPLIES_FILE = REPO / "state" / "discord-pending-replies.json"
 
 def _atomic_write_pending_replies(data: dict) -> None:
@@ -2989,20 +3088,38 @@ async def poll_results():
                 # 2026-05-22 ~03:00 UTC: "it's not a quote reply".
                 source_message_anchor = pending_reply_anchors.pop(task_id, None)
                 save_pending_replies()
-                # Skip sending if already replied directly (core agent used MCP).
-                # Clean up the result AND task files so the watcher doesn't
-                # re-fire infinitely on the leftover task. Observed 2026-04-17:
-                # `[no-send]` tasks persisted in tasks/ because `continue`
-                # skipped the cleanup block at the bottom of this loop.
-                if reply_text.startswith('[no-send]') or reply_text.startswith('[REPLIED]') or reply_text.startswith('[deduped:'):
+                # Parse result-body markers through the unified parser (#896 — mirrors
+                # slack-bridge + telegram-bridge). parse_markers() recognises skip
+                # ([no-send]/[REPLIED]/[deduped:]), redirect ([channel:]), and attach
+                # ([file:|send:|attach:]) markers in one pass; the returned .body has
+                # all markers stripped, ready to send.
+                _pr = parse_markers(reply_text)
+                _skip = next((a for a in _pr.actions if a.kind == "skip"), None)
+                if _skip:
                     # `[deduped: <id>]` = agent consolidated this task's reply
                     # into another task's result. Silent archive, no Discord
                     # post — same UX as [no-send] / [REPLIED].
-                    print(f"  Skipped (already replied or deduped): {task_id}")
+                    print(f"  Skipped ({_skip.value}): {task_id}")
                     archive_file(result_file, "results", task_id)
                     task_file = TASKS_DIR / f"{task_id}.txt"
                     archive_file(task_file, "tasks", task_id)
                     continue
+                reply_text = _pr.body
+
+                # Idempotency check: if the previous run already sent
+                # this reply (sentinel present) but crashed BEFORE the
+                # archive completed, skip the send + archive normally.
+                # Avoids the double-delivery vector when the bridge
+                # restarts between channel.send() returning and
+                # archive_file() finishing. See DELIVERED_DIR docstring.
+                if _is_delivered(task_id):
+                    print(f"  Skipped (already delivered per sentinel): {task_id}", flush=True)
+                    archive_file(result_file, "results", task_id)
+                    task_file = TASKS_DIR / f"{task_id}.txt"
+                    archive_file(task_file, "tasks", task_id)
+                    _clear_delivered(task_id)
+                    continue
+
                 try:
                     # Extract optional [reply: <message_id>] directive — the
                     # agent signals "this result is a reply to that message"
@@ -3035,27 +3152,14 @@ async def poll_results():
                         if not is_thread:
                             reply_to_id = source_message_anchor
 
-                    # Extract optional [channel: <channel_id>] redirect — the
-                    # agent can route a DM-originated reply to a different
-                    # channel (e.g. respond from a DM task by posting in
-                    # #general). Without this, the bridge always replies to
-                    # the task-source channel. Falls back to the original
-                    # channel on resolution failure (don't drop the reply).
-                    #
-                    # Authorization: owner tier only. The bridge already gates
-                    # inbound tasks by tier (lines ~2326+) and the access_tier
-                    # field is written into every task file (line ~2534). A
-                    # sandboxed team/other-tier result that names a channel
-                    # the requester can't reach must NOT be honored — that
-                    # would let a non-owner redirect into the owner's private
-                    # spaces. We read the tier back from the task file rather
-                    # than threading it through pending_replies so the gate
+                    # Extract optional [channel: <channel_id>] redirect from parse_markers()
+                    # result (already computed above). Authorization: owner tier only —
+                    # sandboxed team/other-tier results must not redirect into the owner's
+                    # private spaces. Tier is read back from the task file so the gate
                     # survives a bridge restart.
-                    channel_pattern = re.compile(r'\[channel:\s*(\d{17,20})\]')
-                    channel_match = channel_pattern.search(reply_text)
-                    if channel_match:
-                        target_channel_id = int(channel_match.group(1))
-                        reply_text = channel_pattern.sub('', reply_text).strip()
+                    _redir = next((a for a in _pr.actions if a.kind == "redirect"), None)
+                    if _redir:
+                        target_channel_id = int(_redir.value)
                         task_tier = "other"
                         try:
                             task_body = (TASKS_DIR / f"{task_id}.txt").read_text()
@@ -3094,8 +3198,10 @@ async def poll_results():
                             except Exception as e:
                                 print(f"  [channel-redirect] failed to resolve channel {target_channel_id}, falling back to task source: {e}", flush=True)
 
-                    # Extract file paths: [file: /path] or [send: /path]
-                    clean_text, files = _split_file_markers(reply_text)
+                    # Extract file paths from parse_markers() attach actions.
+                    # _pr.body already has all [file:|send:|attach:] markers stripped.
+                    clean_text = _pr.body
+                    files = [a.value for a in _pr.actions if a.kind == "attach"]
 
                     # Send text — fence-aware chunker preserves triple-backtick code blocks
                     # First chunk uses message_reference (if set); subsequent chunks
@@ -3110,9 +3216,18 @@ async def poll_results():
                         try:
                             import outbox_log
                             ch_type = "discord_dm" if isinstance(channel, discord.DMChannel) else "discord_channel"
+                            # Human-readable label for audit: "#dev", "Chi DM",
+                            # or "DM" when the recipient name isn't available.
+                            if isinstance(channel, discord.DMChannel):
+                                _recipient = getattr(channel.recipient, "name", None)
+                                _label = f"{_recipient} DM" if _recipient else "DM"
+                            else:
+                                _ch_name = getattr(channel, "name", None)
+                                _label = f"#{_ch_name}" if _ch_name else None
                             outbox_log.append(
                                 channel_type=ch_type,
                                 recipient=str(channel.id),
+                                recipient_label=_label,
                                 body=clean_text,
                                 task_id=task_id,
                             )
@@ -3134,6 +3249,13 @@ async def poll_results():
                             await channel.send(f"(file not allowed: {fpath})")
                             print(f"  REJECTED file (not in allowlist): {fpath}", flush=True)
 
+                    # Mark delivered BEFORE the archive runs. If we
+                    # crash between channel.send returning and archive,
+                    # on restart the sentinel + result-file combo
+                    # triggers the skip-block above (archive + clear,
+                    # no re-send). Without this, the result file
+                    # would re-send on restart producing a duplicate.
+                    _mark_delivered(task_id)
                     print(f"  Replied: {reply_text[:80]}...", flush=True)
                 except Exception as e:
                     print(f"  Reply failed: {e}", flush=True)
@@ -3141,6 +3263,10 @@ async def poll_results():
                 archive_file(result_file, "results", task_id)
                 task_file = TASKS_DIR / f"{task_id}.txt"
                 archive_file(task_file, "tasks", task_id)
+                # Delivery succeeded + archived — sentinel has served
+                # its purpose, remove to bound `discord-delivered/`
+                # directory growth.
+                _clear_delivered(task_id)
         await asyncio.sleep(1)
 
 
@@ -3205,48 +3331,39 @@ async def poll_proactive():
                     if not text:
                         f.unlink(missing_ok=True)
                         continue
-                    # Resolve the DM recipient. Priority (mirrors
-                    # src/dm-result.py:_resolve_owner_id, modulo the
-                    # async/event-loop shape):
-                    #   1. $SUTANDO_DM_OWNER_ID env override.
-                    #   2. tierMap[uid] == "owner" — the unique tier-tagged
-                    #      owner from access.json.
-                    #   3. First non-bot user from allowFrom IN LIST ORDER.
+                    # Resolve the DM recipient via discord_config.resolve_owner_id
+                    # (#1147). The helper consults — in order — the env override,
+                    # workspace `state/discord-config.json` (Sutando's owned config
+                    # for `owner` and `tierMap`), and legacy plugin `access.json`
+                    # extensions. Step 6 (first non-bot user from `allowFrom`) is
+                    # left to this caller because it requires `client.fetch_user`
+                    # — keeping the helper pure-Python lets dm-result.py share the
+                    # same resolution chain without dragging in discord.py.
                     #
-                    # Pre-fix used `load_allowed()` which returns a SET, so
-                    # iteration was insertion/hash-ordered — on 2026-05-18
-                    # this picked a team-tier user (msze_) over the
-                    # owner-tier user (qingyunwu) because the set yielded
-                    # msze_ first. allowFrom is a *list* in access.json with
-                    # a meaningful first-entry-wins convention; preserving
-                    # that order fixes the routing.
-                    owner_id = os.environ.get("SUTANDO_DM_OWNER_ID", "").strip() or None
-                    if not owner_id:
-                        try:
-                            access_data = json.loads(ACCESS_FILE.read_text())
-                        except Exception:
-                            access_data = {}
-                        allow_list = access_data.get("allowFrom") or []
-                        tier_map = access_data.get("tierMap") or {}
-                        if not allow_list:
-                            print(f"  [proactive] no owner in allowFrom, skipping {f.name}")
-                            f.unlink(missing_ok=True)
-                            continue
-                        # Preferred: the tier-tagged owner if one exists in allowFrom.
-                        owner_id = next(
-                            (uid for uid in allow_list if tier_map.get(uid) == "owner"),
-                            None,
-                        )
-                        # Fallback: first non-bot user, list order preserved.
-                        if owner_id is None:
-                            for uid in allow_list:
-                                try:
-                                    u = await client.fetch_user(int(uid))
-                                    if not u.bot:
-                                        owner_id = str(uid)
-                                        break
-                                except Exception:
-                                    continue
+                    # The drift class that bit us with #846's tierMap (only one of
+                    # the bridge/dm-result sites got the read) is fixed by funneling
+                    # both through `resolve_owner_id`.
+                    try:
+                        access_data = json.loads(ACCESS_FILE.read_text())
+                    except Exception:
+                        access_data = {}
+                    allow_list = access_data.get("allowFrom") or []
+                    owner_id = discord_config.resolve_owner_id(access_data)
+                    if owner_id is None:
+                        # Step 6: walk allowFrom skipping bot accounts.
+                        # Pre-#1147 this used `load_allowed()` which returns a SET
+                        # — on 2026-05-18 that picked a team-tier user over the
+                        # owner-tier one because set iteration is insertion/hash-
+                        # ordered. List iteration preserves the meaningful
+                        # first-entry-wins convention.
+                        for uid in allow_list:
+                            try:
+                                u = await client.fetch_user(int(uid))
+                                if not u.bot:
+                                    owner_id = str(uid)
+                                    break
+                            except Exception:
+                                continue
                     if owner_id is None:
                         print(f"  [proactive] no human user in allowFrom, skipping {f.name}")
                         f.unlink(missing_ok=True)
@@ -3254,16 +3371,94 @@ async def poll_proactive():
                     try:
                         user = await client.fetch_user(int(owner_id))
                         dm = await user.create_dm()
-                        # Extract files
-                        clean_text, files = _split_file_markers(text)
+                        # Parse result-body markers through the unified parser (#896).
+                        # parse_markers() handles [no-send]/[REPLIED]/[deduped:] (skip),
+                        # [channel:] (redirect), and [file:|send:|attach:] (attach) in
+                        # one pass. Proactive files are written by the core agent so
+                        # no tier gate on redirect (unlike _poll_dm_fallback).
+                        #
+                        # Failure model for redirect (per owner directive 2026-05-26):
+                        #   Success → marker stripped + posted to target channel, quiet.
+                        #   Failure → literal `[channel:]` left in DM + WARN log. The
+                        #   leaked marker is the operator's signal; silent strip would hide.
+                        _pr_pro = parse_markers(text)
+                        _skip_pro = next((a for a in _pr_pro.actions if a.kind == "skip"), None)
+                        if _skip_pro:
+                            print(f"  [proactive] skipped ({_skip_pro.value}): {f.name}", flush=True)
+                            f.unlink(missing_ok=True)
+                            continue
+                        clean_text = _pr_pro.body
+                        files = [a.value for a in _pr_pro.actions if a.kind == "attach"]
+                        _pro_redir = next((a for a in _pr_pro.actions if a.kind == "redirect"), None)
+                        if _pro_redir:
+                            _target_id = int(_pro_redir.value)
+                            _redirect_text = clean_text  # parse_markers already stripped the marker
+                            _target_ch = None
+                            try:
+                                _target_ch = client.get_channel(_target_id)
+                                if _target_ch is None:
+                                    _target_ch = await client.fetch_channel(_target_id)
+                            except Exception as _exc:
+                                print(
+                                    f"  [proactive channel-redirect] failed to resolve "
+                                    f"{_target_id}: {_exc} — keeping literal marker in DM",
+                                    flush=True,
+                                )
+                            if _target_ch is not None and hasattr(_target_ch, 'send'):
+                                try:
+                                    if _redirect_text:
+                                        for chunk in _chunk_for_discord(_redirect_text):
+                                            await _target_ch.send(chunk)
+                                    for fpath in files:
+                                        fpath = os.path.expanduser(fpath.strip())
+                                        if _is_path_sendable(fpath):
+                                            await _target_ch.send(file=discord.File(fpath))
+                                        elif not os.path.isfile(fpath):
+                                            print(
+                                                f"  [proactive channel-redirect] file marker, "
+                                                f"file not found: {fpath}",
+                                                flush=True,
+                                            )
+                                    try:
+                                        import outbox_log
+                                        _ch_name = getattr(_target_ch, "name", None)
+                                        _label = f"#{_ch_name}" if _ch_name else None
+                                        outbox_log.append(
+                                            channel_type="discord_channel",
+                                            recipient=str(_target_id),
+                                            recipient_label=_label,
+                                            body=_redirect_text,
+                                            task_id=f.stem,
+                                        )
+                                    except Exception:
+                                        pass
+                                    print(
+                                        f"  [proactive channel-redirect] sent {f.name} "
+                                        f"to channel {_target_id}",
+                                        flush=True,
+                                    )
+                                    f.unlink(missing_ok=True)
+                                    continue
+                                except Exception as _exc:
+                                    print(
+                                        f"  [proactive channel-redirect] send to {_target_id} "
+                                        f"failed: {_exc} — keeping literal marker in DM",
+                                        flush=True,
+                                    )
+                            # Fall through to DM with marker INTACT — the
+                            # visible `[channel: <id>]` is the loud-failure
+                            # signal. Don't strip it here.
                         if clean_text:
                             for chunk in _chunk_for_discord(clean_text):
                                 await dm.send(chunk)
                             try:
                                 import outbox_log
+                                _user_name = getattr(user, "name", None)
+                                _label = f"{_user_name} DM" if _user_name else None
                                 outbox_log.append(
                                     channel_type="discord_dm",
                                     recipient=str(owner_id),
+                                    recipient_label=_label,
                                     body=clean_text,
                                     task_id=f.stem,
                                 )
@@ -3360,8 +3555,13 @@ async def poll_dm_fallback():
                     _peek = f.read_text(encoding="utf-8", errors="replace").lstrip()
                 except OSError:
                     _peek = ""
-                if _peek.startswith('[no-send]') or _peek.startswith('[REPLIED]') or _peek.startswith('[deduped:'):
-                    print(f"  [dm-fallback] skipped (suppression marker): {f.name}", flush=True)
+                # Parse result-body markers through the unified parser (#896).
+                # Handles skip ([no-send]/[REPLIED]/[deduped:]) and redirect
+                # ([channel:]) + attach ([file:|send:|attach:]) in one pass.
+                _pr_fb = parse_markers(_peek)
+                _skip_fb = next((a for a in _pr_fb.actions if a.kind == "skip"), None)
+                if _skip_fb:
+                    print(f"  [dm-fallback] skipped ({_skip_fb.value}): {f.name}", flush=True)
                     _task_id = f.stem
                     _task_file = TASKS_DIR / f"{_task_id}.txt"
                     if _task_file.exists():
@@ -3369,17 +3569,16 @@ async def poll_dm_fallback():
                     archive_file(f, "results", _task_id)
                     continue
 
-                # Honor [channel: <id>] redirect (parity with poll_results
-                # lines ~2702-2759). Without this, a voice- or cron-originated
-                # result that includes the redirect marker would either
-                # (a) leak the literal `[channel: <id>]` string into the
-                # owner's DM via dm-result.py, or (b) lose the redirect intent
-                # entirely. Both modes break the marker's contract.
-                channel_pattern = re.compile(r'\[channel:\s*(\d{17,20})\]')
-                channel_match = channel_pattern.search(_peek)
-                if channel_match:
-                    target_channel_id = int(channel_match.group(1))
-                    clean_body = channel_pattern.sub('', _peek).strip()
+                # Honor [channel: <id>] redirect (parity with poll_results). Without
+                # this, voice- or cron-originated results that include [channel:]
+                # would either leak the literal marker into the DM or lose redirect
+                # intent entirely. Tier gate: default "other" on missing task file —
+                # voice tasks don't write access_tier, so channel-redirect requires
+                # the voice-agent to explicitly set `access_tier: owner` in the file.
+                _redir_fb = next((a for a in _pr_fb.actions if a.kind == "redirect"), None)
+                if _redir_fb:
+                    target_channel_id = int(_redir_fb.value)
+                    clean_body = _pr_fb.body  # parse_markers already stripped the marker
                     _task_id = f.stem
                     # Tier read from task file. Default "other" on missing /
                     # unreadable: voice- and cron-originated tasks don't write
@@ -3409,16 +3608,20 @@ async def poll_dm_fallback():
                             target_channel = None
                             print(f"  [dm-fallback channel-redirect] failed to resolve {target_channel_id}: {e}", flush=True)
                         if target_channel:
-                            # File markers (parity with poll_results 2761-2784).
-                            text_only, file_list = _split_file_markers(clean_body)
+                            # File attach markers from parse_markers() (#896 parity with poll_results).
+                            text_only = clean_body  # _pr_fb.body already has file markers stripped
+                            file_list = [a.value for a in _pr_fb.actions if a.kind == "attach"]
                             if text_only:
                                 for chunk in _chunk_for_discord(text_only):
                                     await target_channel.send(chunk)
                                 try:
                                     import outbox_log
+                                    _ch_name = getattr(target_channel, "name", None)
+                                    _label = f"#{_ch_name}" if _ch_name else None
                                     outbox_log.append(
                                         channel_type="discord_channel",
                                         recipient=str(target_channel_id),
+                                        recipient_label=_label,
                                         body=text_only,
                                         task_id=_task_id,
                                     )

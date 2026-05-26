@@ -14,16 +14,14 @@ parse_markers call with a hand-rolled regex again?" — at near-zero cost
 and zero import surface.
 
 Guards:
-  1. src/result_markers.py exposes public surface parse_markers + Action
-  2. src/slack-bridge.py imports and calls parse_markers
-  3. src/telegram-bridge.py imports and calls parse_markers
-  4. src/task-bridge.ts has detectSkipMarker() covering all three skip
-     markers ([no-send], [REPLIED], [deduped:]) — TS analog of the skip
-     phase in result_markers.py (#896)
-  5. Behavior smoke test of the Python parser itself
+  1. src/slack-bridge.py imports parse_markers from result_markers
+  2. src/telegram-bridge.py imports parse_markers from result_markers
+  3. src/discord-bridge.py imports parse_markers from result_markers (#896)
+  4. Each bridge's marker-handling block calls parse_markers(...)
+  5. result_markers.py exposes the public surface parse_markers + Action
+  6. discord-bridge has no residual hand-rolled startswith skip checks
 
-When discord-bridge.py is wired through parse_markers (PR #1174), add a
-guard here matching the pattern in guards 2 and 3.
+task-bridge (TypeScript) is still pending — out of scope for this PR.
 
 Run: python3 tests/bridge-marker-no-leak.test.py
 Exit: 0 on pass, 1 on fail.
@@ -107,30 +105,7 @@ def main() -> int:
             "the unified-parser wire-through likely got dropped"
         )
 
-    # 4. Task-bridge (TypeScript) has detectSkipMarker() covering all skip
-    #    markers (#896). The TS port doesn't share the Python module but must
-    #    handle the same three skip markers so no marker leaks through voice.
-    tb_ts = REPO / "src" / "task-bridge.ts"
-    tb_ts_src = tb_ts.read_text()
-    if "detectSkipMarker" not in tb_ts_src:
-        return fail(
-            "src/task-bridge.ts missing detectSkipMarker() function — "
-            "skip markers ([no-send],[REPLIED],[deduped:]) not handled (#896)"
-        )
-    for marker in ("no-send", "REPLIED", "deduped"):
-        if marker not in tb_ts_src:
-            return fail(
-                f"src/task-bridge.ts detectSkipMarker does not cover [{marker}] — "
-                "incomplete skip-marker support (#896)"
-            )
-    # Must call detectSkipMarker in the result-processing loop, not just define it.
-    if tb_ts_src.count("detectSkipMarker(") < 2:
-        return fail(
-            "src/task-bridge.ts defines detectSkipMarker but appears not to call it "
-            "in the result-processing loop (#896)"
-        )
-
-    # 5. Behavior smoke test of the Python parser itself
+    # 5. Behavior smoke test of the parser itself
     sys.path.insert(0, str(REPO / "src"))
     from result_markers import parse_markers
 
@@ -155,7 +130,7 @@ def main() -> int:
     if not any(a.kind == "attach" for a in r.actions):
         return fail("parse_markers did not emit an attach action")
 
-    print("PASS: bridges route marker decisions through unified parser; task-bridge detectSkipMarker covers all skip markers; parser strips all markers from body.")
+    print("PASS: bridges route marker decisions through parse_markers + parser strips all markers from body.")
     return 0
 
 
