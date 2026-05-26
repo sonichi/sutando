@@ -3378,6 +3378,89 @@ async def poll_proactive():
                         dm = await user.create_dm()
                         # Extract files
                         clean_text, files = _split_file_markers(text)
+
+                        # #1147 follow-up — owner-greenlit 2026-05-26 DM
+                        # ("yes" greenlight in DM):
+                        #
+                        # Honor `[channel: <id>]` redirect for proactive
+                        # files. Unlike `_poll_dm_fallback` (which gates
+                        # the redirect on task_tier=="owner" because team-
+                        # tier task content is untrusted), proactive files
+                        # are written by the core agent — no untrusted-
+                        # input source — so the tier gate doesn't apply.
+                        #
+                        # Failure model per owner principle "fail loudly,
+                        # succeed quietly":
+                        #   - Success (channel resolves + send works) →
+                        #     marker stripped + posted to target channel,
+                        #     no DM. Quiet.
+                        #   - Failure (channel unknown / permission denied
+                        #     / network) → leave the literal `[channel:
+                        #     <id>]` text in the DM AND emit a WARN log.
+                        #     The leaked marker is the failure signal the
+                        #     operator needs to detect the misroute (per
+                        #     the 2026-05-26 catch — silently stripping
+                        #     would have hidden the bug).
+                        _channel_redirect_re = re.compile(r'\[channel:\s*(\d{17,20})\]')
+                        _channel_match = _channel_redirect_re.search(clean_text)
+                        if _channel_match:
+                            _target_id = int(_channel_match.group(1))
+                            _redirect_text = _channel_redirect_re.sub('', clean_text).strip()
+                            _target_ch = None
+                            try:
+                                _target_ch = client.get_channel(_target_id)
+                                if _target_ch is None:
+                                    _target_ch = await client.fetch_channel(_target_id)
+                            except Exception as _exc:
+                                print(
+                                    f"  [proactive channel-redirect] failed to resolve "
+                                    f"{_target_id}: {_exc} — keeping literal marker in DM",
+                                    flush=True,
+                                )
+                            if _target_ch is not None and hasattr(_target_ch, 'send'):
+                                try:
+                                    if _redirect_text:
+                                        for chunk in _chunk_for_discord(_redirect_text):
+                                            await _target_ch.send(chunk)
+                                    for fpath in files:
+                                        fpath = os.path.expanduser(fpath.strip())
+                                        if _is_path_sendable(fpath):
+                                            await _target_ch.send(file=discord.File(fpath))
+                                        elif not os.path.isfile(fpath):
+                                            print(
+                                                f"  [proactive channel-redirect] file marker, "
+                                                f"file not found: {fpath}",
+                                                flush=True,
+                                            )
+                                    try:
+                                        import outbox_log
+                                        _ch_name = getattr(_target_ch, "name", None)
+                                        _label = f"#{_ch_name}" if _ch_name else None
+                                        outbox_log.append(
+                                            channel_type="discord_channel",
+                                            recipient=str(_target_id),
+                                            recipient_label=_label,
+                                            body=_redirect_text,
+                                            task_id=f.stem,
+                                        )
+                                    except Exception:
+                                        pass
+                                    print(
+                                        f"  [proactive channel-redirect] sent {f.name} "
+                                        f"to channel {_target_id}",
+                                        flush=True,
+                                    )
+                                    f.unlink(missing_ok=True)
+                                    continue
+                                except Exception as _exc:
+                                    print(
+                                        f"  [proactive channel-redirect] send to {_target_id} "
+                                        f"failed: {_exc} — keeping literal marker in DM",
+                                        flush=True,
+                                    )
+                            # Fall through to DM with marker INTACT — the
+                            # visible `[channel: <id>]` is the loud-failure
+                            # signal. Don't strip it here.
                         if clean_text:
                             for chunk in _chunk_for_discord(clean_text):
                                 await dm.send(chunk)
