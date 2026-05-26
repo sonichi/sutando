@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Structural cross-check that every bridge routes its result-marker decisions
-through `src/result_markers.py:parse_markers` (#873). This is the
+through `src/result_markers.py:parse_markers` (#873, #896). This is the
 no-leak invariant guard: as long as each bridge calls the unified parser,
 the per-bridge implementations can't drift back to hand-rolled startswith
 checks that miss markers and ship them as literal text.
@@ -16,12 +16,12 @@ and zero import surface.
 Guards:
   1. src/slack-bridge.py imports parse_markers from result_markers
   2. src/telegram-bridge.py imports parse_markers from result_markers
-  3. Each bridge's marker-handling block calls parse_markers(...)
-  4. result_markers.py exposes the public surface parse_markers + Action
+  3. src/discord-bridge.py imports parse_markers from result_markers (#896)
+  4. Each bridge's marker-handling block calls parse_markers(...)
+  5. result_markers.py exposes the public surface parse_markers + Action
+  6. discord-bridge has no residual hand-rolled startswith skip checks
 
-Discord and task-bridge are NOT yet wired through the unified parser in
-this PR (intentional — landing slack + telegram first as the high-impact
-bug fixes). When they're refactored in a follow-up, add their guards here.
+task-bridge (TypeScript) is still pending — out of scope for this PR.
 
 Run: python3 tests/bridge-marker-no-leak.test.py
 Exit: 0 on pass, 1 on fail.
@@ -66,7 +66,30 @@ def main() -> int:
             "through parse_markers() per #873"
         )
 
-    # 3. Telegram bridge wires the parser
+    # 3. Discord bridge wires the parser (#896)
+    db = REPO / "src" / "discord-bridge.py"
+    db_src = db.read_text()
+    if "from result_markers import parse_markers" not in db_src:
+        return fail("src/discord-bridge.py must import parse_markers from result_markers (#896)")
+    if "parse_markers(" not in db_src:
+        return fail("src/discord-bridge.py must call parse_markers(...) somewhere (#896)")
+    # Regression guard: hand-rolled skip-marker startswith checks must be gone.
+    hand_rolled = [
+        "startswith('[no-send]')",
+        'startswith("[no-send]")',
+        "startswith('[REPLIED]')",
+        'startswith("[REPLIED]")',
+        "startswith('[deduped:')",
+        'startswith("[deduped:")',
+    ]
+    for pattern in hand_rolled:
+        if pattern in db_src:
+            return fail(
+                f"src/discord-bridge.py still contains hand-rolled marker check: {pattern!r}. "
+                "Route through parse_markers() per #896."
+            )
+
+    # 4. Telegram bridge wires the parser
     tb = REPO / "src" / "telegram-bridge.py"
     tb_src = tb.read_text()
     if "from result_markers import parse_markers" not in tb_src:
@@ -82,7 +105,7 @@ def main() -> int:
             "the unified-parser wire-through likely got dropped"
         )
 
-    # 4. Behavior smoke test of the parser itself
+    # 5. Behavior smoke test of the parser itself
     sys.path.insert(0, str(REPO / "src"))
     from result_markers import parse_markers
 
