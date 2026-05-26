@@ -64,6 +64,22 @@ mkdirSync(RESULT_DIR, { recursive: true });
 
 function ts(): string { return new Date().toISOString().slice(11, 23); }
 
+/** Detect a skip marker at the start of a result body (#896).
+ * Mirrors the SKIP phase of src/result_markers.py:parse_markers().
+ * Returns the skip reason string if matched, null otherwise.
+ * Recognised skip markers (case-insensitive where noted):
+ *   [no-send]           → "no-send"
+ *   [REPLIED]           → "REPLIED"
+ *   [deduped: task-X]   → "deduped:task-X" */
+function detectSkipMarker(text: string): string | null {
+	const t = text.trimStart();
+	if (/^\[no-send\]/i.test(t)) return 'no-send';
+	if (/^\[REPLIED\]/.test(t)) return 'REPLIED';
+	const m = /^\[deduped:\s*([^\]]+)\]/i.exec(t);
+	if (m) return `deduped:${m[1].trim()}`;
+	return null;
+}
+
 /**
  * Write a chat-path task file so the dashboard tracks chat-originated work.
  * Called by the core agent (Claude Code) when it accepts a non-trivial task from chat.
@@ -625,13 +641,12 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 					setTimeout(() => archiveFile(path, 'results', `voice-${Date.now()}`), 10_000);
 					continue;
 				}
-				// Deduped-marker result: agent consolidated this task's reply
-				// into another task's result file. Mark this task done silently
-				// and archive — no Discord post, no voice narration, no timeout.
-				// Format: first line is "[deduped: <other-task-id>]" (rest of
-				// file optional, displayed as the result body in the UI).
-				if (file.startsWith('task-') && /^\s*\[deduped:\s*task-/i.test(result)) {
-					console.log(`${ts()} [TaskBridge] ${taskId} is deduped marker; archiving silently`);
+				// Skip-marker result: agent marked this task as deduped, no-send,
+				// or already-replied. Archive silently — no Discord post, no voice
+				// narration, no timeout. Unified via detectSkipMarker() (#896).
+				const _skipReason = file.startsWith('task-') ? detectSkipMarker(result) : null;
+				if (_skipReason) {
+					console.log(`${ts()} [TaskBridge] ${taskId} has skip marker [${_skipReason}]; archiving silently`);
 					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
 					_deliveredResults.add(file);
 					_pendingTasks.delete(taskId);
