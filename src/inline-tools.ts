@@ -987,8 +987,10 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 		const expanded = privateRoot.replace(/^~/, process.env.HOME || '');
 		dirsToScan.push(join(expanded, 'skills'));
 	}
-	const owner: ToolDefinition[] = [];
-	const anyCaller: ToolDefinition[] = [];
+	// Maps from skill directory name → tools. Later dirs (workspace, private)
+	// overwrite earlier ones (repo) — last-write-wins for same-name skills.
+	const ownerBySkill = new Map<string, ToolDefinition[]>();
+	const anyCallerBySkill = new Map<string, ToolDefinition[]>();
 	for (const skillsDir of dirsToScan) {
 		if (!existsSync(skillsDir)) continue;
 		let dirs: string[];
@@ -1018,7 +1020,7 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 				// @ts-ignore — dynamic relative import resolved at runtime by tsx
 				const mod = await import(toolsPath);
 				if (Array.isArray(mod.tools)) {
-					(tier === 'any_caller' ? anyCaller : owner).push(...mod.tools);
+					(tier === 'any_caller' ? anyCallerBySkill : ownerBySkill).set(dirName, mod.tools);
 					console.log(`[skill-loader] loaded ${mod.tools.length} tool(s) from ${manifest.name || dirName} [tier=${tier}] (${skillsDir})`);
 				}
 			} catch (err) {
@@ -1026,6 +1028,8 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 			}
 		}
 	}
+	const owner = Array.from(ownerBySkill.values()).flat();
+	const anyCaller = Array.from(anyCallerBySkill.values()).flat();
 	return { owner, anyCaller };
 }
 const personalTools = await loadSkillManifestTools();
