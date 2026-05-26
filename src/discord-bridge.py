@@ -366,6 +366,24 @@ def archive_file(src: "Path", kind: str, task_id: str) -> None:
             pass
 
 
+def archive_task_by_id(task_id: str) -> None:
+    """Archive any task file for task_id — bare or claimed (.claimed-core-N.txt).
+    claim_task.py renames task-X.txt → task-X.txt.claimed-core-N.txt before
+    processing; after delivery the bare-path archive_file() call silently
+    no-ops because src no longer exists. This glob sweep catches both shapes
+    so no claim files strand in tasks/ after multi-core pool delivery (#933)."""
+    import glob
+    import shutil
+    dest_dir = archive_path("tasks", task_id).parent
+    for match in glob.glob(str(TASKS_DIR / f"{task_id}*.txt")):
+        try:
+            shutil.move(match, str(dest_dir / Path(match).name))
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print(f"  archive_task_by_id({task_id}) failed for {match}: {e}", flush=True)
+
+
 def notify_agent_api_task_done(task_id: str, result: str) -> None:
     """POST to agent-api /task-done so web UI flips status without waiting
     for its next /tasks/active poll. Best-effort; silent on failure (web UI
@@ -3098,8 +3116,7 @@ async def poll_results():
                     # post — same UX as [no-send] / [REPLIED].
                     print(f"  Skipped (already replied or deduped): {task_id}")
                     archive_file(result_file, "results", task_id)
-                    task_file = TASKS_DIR / f"{task_id}.txt"
-                    archive_file(task_file, "tasks", task_id)
+                    archive_task_by_id(task_id)
                     continue
 
                 # Idempotency check: if the previous run already sent
@@ -3111,8 +3128,7 @@ async def poll_results():
                 if _is_delivered(task_id):
                     print(f"  Skipped (already delivered per sentinel): {task_id}", flush=True)
                     archive_file(result_file, "results", task_id)
-                    task_file = TASKS_DIR / f"{task_id}.txt"
-                    archive_file(task_file, "tasks", task_id)
+                    archive_task_by_id(task_id)
                     _clear_delivered(task_id)
                     continue
 
@@ -3268,8 +3284,7 @@ async def poll_results():
                     print(f"  Reply failed: {e}", flush=True)
                 # Archive (not delete) so we can mine patterns later.
                 archive_file(result_file, "results", task_id)
-                task_file = TASKS_DIR / f"{task_id}.txt"
-                archive_file(task_file, "tasks", task_id)
+                archive_task_by_id(task_id)
                 # Delivery succeeded + archived — sentinel has served
                 # its purpose, remove to bound `discord-delivered/`
                 # directory growth.
@@ -3544,9 +3559,7 @@ async def poll_dm_fallback():
                     # Archive matching task file so audit_orphan_tasks sees
                     # the task as processed (even if drop-without-reply).
                     _task_id = f.stem
-                    _task_file = TASKS_DIR / f"{_task_id}.txt"
-                    if _task_file.exists():
-                        archive_file(_task_file, "tasks", _task_id)
+                    archive_task_by_id(_task_id)
                     continue
                 # Stop retrying after 24h. Without this cap, a permanent
                 # failure (bad channel ID, bot removed from DM, etc.)
@@ -3557,9 +3570,7 @@ async def poll_dm_fallback():
                     print(f"  [dm-fallback] dropping stale {f.name} (age={int(age)}s)", flush=True)
                     f.unlink(missing_ok=True)
                     _task_id = f.stem
-                    _task_file = TASKS_DIR / f"{_task_id}.txt"
-                    if _task_file.exists():
-                        archive_file(_task_file, "tasks", _task_id)
+                    archive_task_by_id(_task_id)
                     continue
                 # Honor result-body suppression markers (parity with the
                 # main reply path at line ~2660). Without this, results
@@ -3573,9 +3584,7 @@ async def poll_dm_fallback():
                 if _peek.startswith('[no-send]') or _peek.startswith('[REPLIED]') or _peek.startswith('[deduped:'):
                     print(f"  [dm-fallback] skipped (suppression marker): {f.name}", flush=True)
                     _task_id = f.stem
-                    _task_file = TASKS_DIR / f"{_task_id}.txt"
-                    if _task_file.exists():
-                        archive_file(_task_file, "tasks", _task_id)
+                    archive_task_by_id(_task_id)
                     archive_file(f, "results", _task_id)
                     continue
 
@@ -3646,9 +3655,7 @@ async def poll_dm_fallback():
                                     # See poll_results — log only, no user noise.
                                     print(f"  [dm-fallback channel-redirect] file marker, file not found: {fpath}", flush=True)
                             print(f"  [dm-fallback channel-redirect] sent {f.name} to channel {target_channel_id}", flush=True)
-                            _task_file = TASKS_DIR / f"{_task_id}.txt"
-                            if _task_file.exists():
-                                archive_file(_task_file, "tasks", _task_id)
+                            archive_task_by_id(_task_id)
                             archive_file(f, "results", _task_id)
                             continue
                         # Unresolved → fall through to DM, but strip marker
@@ -3717,9 +3724,7 @@ async def poll_dm_fallback():
                     except OSError:
                         _result_text = ""
                     archive_file(f, "results", _task_id)
-                    _task_file = TASKS_DIR / f"{_task_id}.txt"
-                    if _task_file.exists():
-                        archive_file(_task_file, "tasks", _task_id)
+                    archive_task_by_id(_task_id)
                     if _result_text and _task_id.startswith("task-"):
                         # urlopen is blocking — run in thread so we don't stall
                         # the asyncio event loop for up to 2s per dm-fallback.

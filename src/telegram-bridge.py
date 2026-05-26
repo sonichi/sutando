@@ -187,6 +187,23 @@ def archive_file(src: "Path", kind: str, task_id: str) -> None:
         except Exception:
             pass
 
+def archive_task_by_id(task_id: str) -> None:
+    """Archive any task file for task_id — bare or claimed (.claimed-core-N.txt)."""
+    import glob
+    import shutil
+    from datetime import datetime
+    ym = datetime.now().strftime("%Y-%m")
+    dest_dir = ARCHIVE_TASKS_DIR / ym
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for match in glob.glob(str(TASKS_DIR / f"{task_id}*.txt")):
+        try:
+            shutil.move(match, str(dest_dir / Path(match).name))
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print(f"[Telegram] archive_task_by_id({task_id}) failed for {match}: {e}")
+
+
 # Presenter mode: silence proactive DMs during ICLR/talk windows. Sentinel
 # is written by scripts/presenter-mode.sh with an ISO-8601 expiry. Matches
 # the check in src/check-pending-questions.py and src/discord-bridge.py.
@@ -587,8 +604,7 @@ def main():
                 if any(a.kind == "skip" for a in parsed.actions):
                     print(f"  Skipped (marker): {task_id}", flush=True)
                     archive_file(result_file, "results", task_id)
-                    task_file = TASKS_DIR / f"{task_id}.txt"
-                    archive_file(task_file, "tasks", task_id)
+                    archive_task_by_id(task_id)
                     continue
                 try:
                     send_reply(chat_id, reply_text, task_id=task_id)
@@ -597,8 +613,7 @@ def main():
                     print(f"[Telegram] Reply error: {e}", flush=True)
                 # Archive (not delete) so we can mine patterns later.
                 archive_file(result_file, "results", task_id)
-                task_file = TASKS_DIR / f"{task_id}.txt"
-                archive_file(task_file, "tasks", task_id)
+                archive_task_by_id(task_id)
 
         time.sleep(1)
 
