@@ -169,19 +169,54 @@ def presenter_mode_active() -> bool:
 
 ACCESS_FILE = Path.home() / ".claude" / "channels" / "slack" / "access.json"
 
+# Mtime-based access-config cache (issue #894). Both load_allowed() and
+# load_tier_map() read the same file — we re-parse only when the file's
+# mtime changes so the I/O cost is amortized across the daemon's lifetime.
+_access_cache: dict = {}
+_access_cache_lock = threading.Lock()
+
+
+def _load_access_json() -> tuple:
+    """Return (allowed_set_or_None, tier_map_dict) from access.json.
+
+    Re-reads the file only when its mtime changes; returns cached values
+    on every other call. `allowed` is None when the file is absent (TOFU-
+    eligible), set() when explicitly empty, or a populated set. `tier_map`
+    is always a dict (empty when the key is absent or the file is missing).
+    """
+    global _access_cache
+    try:
+        exists = ACCESS_FILE.exists()
+        mtime: object = ACCESS_FILE.stat().st_mtime if exists else None
+    except OSError:
+        exists, mtime = False, None
+
+    with _access_cache_lock:
+        if _access_cache.get("_mtime") == mtime:
+            return _access_cache["allowed"], _access_cache["tier_map"]
+
+        if not exists:
+            allowed = None
+            tier_map: dict = {}
+        else:
+            try:
+                data = json.loads(ACCESS_FILE.read_text())
+                allowed = set(data.get("allowFrom", []))
+                tier_map = data.get("tierMap") or {}
+            except (json.JSONDecodeError, OSError):
+                allowed = set()
+                tier_map = {}
+
+        _access_cache = {"_mtime": mtime, "allowed": allowed, "tier_map": tier_map}
+        return allowed, tier_map
+
 
 def load_allowed():
     """Return set of allowed Slack user IDs, or None if access.json missing.
 
     None vs empty-set: file-missing means never-configured (TOFU-eligible);
     empty allowFrom means admin explicitly locked it down (no TOFU)."""
-    try:
-        data = json.loads(ACCESS_FILE.read_text())
-        return set(data.get("allowFrom", []))
-    except FileNotFoundError:
-        return None
-    except Exception:
-        return set()
+    return _load_access_json()[0]
 
 
 def load_tier_map() -> dict:
@@ -189,11 +224,7 @@ def load_tier_map() -> dict:
     empty dict if missing. Recognized tiers: "owner", "team", "other".
     Unmapped users default to "owner" — preserves the pre-tierMap behavior
     where every entry in `allowFrom` was treated as owner-tier."""
-    try:
-        data = json.loads(ACCESS_FILE.read_text())
-        return data.get("tierMap") or {}
-    except Exception:
-        return {}
+    return _load_access_json()[1]
 
 
 def tofu_onboard(user_id: str, username: str | None) -> set:

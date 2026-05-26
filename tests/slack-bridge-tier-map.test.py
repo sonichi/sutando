@@ -197,6 +197,46 @@ def main() -> int:
         _resolve_tier("Uteam", tm_multi),
         "team",
     )
+
+    # --- Mtime-based cache tests (issue #894) ---
+    # load_allowed() and load_tier_map() both delegate to _load_access_json(),
+    # which caches the parsed result by file mtime so repeated calls within a
+    # burst don't re-read the file on every _write_task invocation.
+
+    import time as _time
+
+    load_allowed = mod.load_allowed
+
+    # Case 12: second call without file change returns same object (cache hit).
+    _write_access(mod, {"allowFrom": ["Ucached"], "tierMap": {"Ucached": "owner"}})
+    tm_first = load_tier_map()
+    tm_second = load_tier_map()
+    expect("repeated call same mtime → identical object", tm_first is tm_second, True)
+
+    # Case 13: load_allowed() cache hit — same object.
+    al_first = load_allowed()
+    al_second = load_allowed()
+    expect("load_allowed same mtime → identical object", al_first is al_second, True)
+
+    # Case 14: mtime bump invalidates cache → new value returned.
+    # Use os.utime to advance mtime without waiting a full second.
+    import os as _os
+    new_payload = {"allowFrom": ["Ucached", "Unew"], "tierMap": {"Ucached": "owner", "Unew": "team"}}
+    mod.ACCESS_FILE.write_text(json.dumps(new_payload))
+    future_mtime = _time.time() + 1  # 1 s ahead guarantees a different mtime
+    _os.utime(mod.ACCESS_FILE, (future_mtime, future_mtime))
+    tm_after = load_tier_map()
+    expect("mtime bump → cache miss, new tier_map", tm_after.get("Unew"), "team")
+
+    # Case 15: file deleted → None for allowed (TOFU-eligible), {} for tier_map.
+    # The prior call cached mtime=T; deleting the file makes stat() raise
+    # OSError → mtime=None ≠ T → natural cache miss; no need to clear cache.
+    mod.ACCESS_FILE.unlink(missing_ok=True)
+    al_deleted = load_allowed()
+    tm_deleted = load_tier_map()
+    expect("deleted file → load_allowed returns None", al_deleted, None)
+    expect("deleted file → load_tier_map returns {}", tm_deleted, {})
+
     print(f"Results: {passes} passed, {fails} failed")
     return 0 if fails == 0 else 1
 

@@ -46,17 +46,29 @@ def main() -> int:
 
     src = BRIDGE.read_text()
 
-    # 1. load_allowed returns None on FileNotFoundError
+    # 1. load_allowed returns None when ACCESS_FILE is missing.
+    #    The None vs empty-set distinction is load-bearing for TOFU onboarding.
+    #    Originally enforced in load_allowed() itself; after #894 the None path
+    #    lives in the shared _load_access_json() helper — check both shapes.
     load_match = re.search(
-        r"def load_allowed\(\):\s*\n([\s\S]{0,1500}?)(?=\n\ndef |\Z)",
+        r"def load_allowed\(\)[^:]*:\s*\n([\s\S]{0,1500}?)(?=\n\ndef |\Z)",
         src,
     )
     if not load_match:
         return fail("`load_allowed` function not found")
     block = load_match.group(1)
-    if not re.search(r"except\s+FileNotFoundError:\s*\n\s+return\s+None", block):
-        return fail("load_allowed must `return None` on FileNotFoundError "
+    # Shape A (pre-#894): function catches FileNotFoundError and returns None
+    has_shape_a = bool(re.search(r"except\s+FileNotFoundError:\s*\n\s+return\s+None", block))
+    # Shape B (post-#894): function delegates to a helper that sets allowed=None
+    has_shape_b = bool(re.search(r"_load_access_json\(\)", block))
+    if not has_shape_a and not has_shape_b:
+        return fail("load_allowed must either return None on FileNotFoundError directly "
+                    "or delegate to _load_access_json() which handles the None case "
                     "(TOFU relies on None vs empty-set distinction)", block)
+    # For shape B, verify the helper actually produces None on missing file.
+    if has_shape_b and not re.search(r"allowed\s*=\s*None", src):
+        return fail("_load_access_json() must set allowed=None when file is absent "
+                    "(TOFU relies on None vs empty-set distinction)", src)
 
     # 2. tofu_onboard exists with race-guard + 0o600 chmod
     tofu_match = re.search(
