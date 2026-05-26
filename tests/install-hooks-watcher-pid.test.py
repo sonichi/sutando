@@ -130,7 +130,7 @@ def main() -> None:
 
     # 9. Empty groups dropped after removal (structure stays tidy)
     expect(
-        "length > 0" in hooks or "length > 0" in hooks,
+        "select(" in hooks and "length > 0" in hooks,
         "install-claude-hooks.sh: must drop now-empty hook groups after deprecated entry removal",
     )
 
