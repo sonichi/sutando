@@ -12,6 +12,8 @@ Notifies on the first sight of any listing matching criteria.json:
 - SMS via Twilio REST (TWILIO_* + OWNER_NUMBER from .env)
 - Telegram via results/proactive-{ts}.txt (telegram-bridge picks it up)
 """
+from __future__ import annotations
+
 import argparse
 import collections
 import datetime as dt

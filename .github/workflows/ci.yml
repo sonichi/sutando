@@ -21,6 +21,11 @@ jobs:
       - name: UTC timestamp check
         run: python3 scripts/check-utc-z-strftime.py
 
+      # Catches PEP-604 X|Y union annotations without __future__.annotations
+      # (Python 3.9 incompatible). Issue #961 / #960.
+      - name: Python 3.9 union annotation check
+        run: python3 scripts/check-py39-union-annotations.py
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
