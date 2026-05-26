@@ -21,6 +21,11 @@ jobs:
       - name: UTC timestamp check
         run: python3 scripts/check-utc-z-strftime.py
 
+      # Ban process.cwd() / Path.cwd() / os.getcwd() outside canonical
+      # workspace resolvers in src/ (closes #863).
+      - name: cwd() lint
+        run: python3 scripts/check-no-cwd-writes.py
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
