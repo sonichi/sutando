@@ -30,12 +30,10 @@ _SRC = REPO / "src"
 # -----------------------------------------------------------------------
 # Module loader
 # -----------------------------------------------------------------------
-_WS = tempfile.mkdtemp(prefix="sutando-test-vision-")
-os.environ["SUTANDO_WORKSPACE"] = _WS
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-for _n in ("vision_push", "workspace_default", "util_paths"):
+for _n in ("vision_push",):
     sys.modules.pop(_n, None)
 
 # Override VISION_PORT to something that is definitely not running

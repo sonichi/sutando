@@ -19,7 +19,6 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -29,14 +28,12 @@ _SRC = REPO / "src"
 # -----------------------------------------------------------------------
 # Module loader
 # -----------------------------------------------------------------------
-_WS = tempfile.mkdtemp(prefix="sutando-test-sccap-")
-os.environ["SUTANDO_WORKSPACE"] = _WS
 # Ensure notify is enabled so debounce logic actually runs
 os.environ["SUTANDO_CAPTURE_NOTIFY"] = "1"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-for _n in ("screen_capture_server", "screen-capture-server", "workspace_default", "util_paths"):
+for _n in ("screen_capture_server", "screen-capture-server"):
     sys.modules.pop(_n, None)
 
 _spec = importlib.util.spec_from_file_location(
