@@ -62,13 +62,25 @@ export function memoryDirEnv(): string | undefined {
 	return undefined;
 }
 
+/**
+ * Return the stable host identifier for per-machine Memory paths.
+ *
+ * Priority:
+ *   1. `$SUTANDO_HOST_LABEL` — explicit override (useful when the Mac has
+ *      been renamed in System Settings and the hostname keeps changing).
+ *   2. `hostname()` short form — the default pre-#871 behavior.
+ */
+export function hostLabel(): string {
+	return process.env.SUTANDO_HOST_LABEL || hostname().split('.')[0];
+}
+
 /** Per-machine resolver. */
 export function personalPath(filename: string, workspace?: string): string {
 	const ws = workspace ?? resolveWorkspace();
 	const privateRoot = memoryDirEnv();
 	if (privateRoot) {
 		const root = expandHome(privateRoot);
-		const host = hostname().split('.')[0];
+		const host = hostLabel();
 		const candidate = join(root, `machine-${host}`, filename);
 		if (existsSync(candidate)) return candidate;
 	}
@@ -83,7 +95,7 @@ export function personalPath(filename: string, workspace?: string): string {
 	// check fails gracefully.
 	if (privateRoot) {
 		const root = expandHome(privateRoot);
-		const host = hostname().split('.')[0];
+		const host = hostLabel();
 		return join(root, `machine-${host}`, filename);
 	}
 	if (filename === 'stand-avatar.png') return join(ws, 'assets', filename);

@@ -80,13 +80,23 @@ def _workspace_root() -> Path:
         return Path.home() / ".sutando" / "workspace"
 
 
+def host_label() -> str:
+    """Return the stable host identifier for per-machine Memory paths.
+
+    Priority:
+      1. `$SUTANDO_HOST_LABEL` — explicit override (useful when the Mac has
+         been renamed in System Settings and the hostname keeps changing).
+      2. `socket.gethostname()` short form — the default pre-#871 behavior.
+    """
+    return os.environ.get("SUTANDO_HOST_LABEL") or socket.gethostname().split(".")[0]
+
+
 def _private_machine_dir() -> Path | None:
     root = _memory_dir_env()
     if not root:
         return None
     expanded = os.path.expanduser(root)
-    host = socket.gethostname().split(".")[0]
-    return Path(expanded) / f"machine-{host}"
+    return Path(expanded) / f"machine-{host_label()}"
 
 
 def personal_path(filename: str, workspace: Path | None = None) -> Path:
