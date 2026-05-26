@@ -20,6 +20,12 @@ import { resolveWorkspace, statusPath, statusReadPath } from './workspace_defaul
 // resolveWorkspace() is the canonical TS helper introduced in #821.
 const WORKSPACE_DIR = resolveWorkspace();
 
+// Gate slide-control exposure on presenter-mode sentinel (#1171).
+// Checked once at module load — voice-agent must restart for the gate to flip.
+// The presenter-mode.sh workflow always runs before the voice agent, so the
+// contract holds: no spurious copres_next_anchor/slide_control firings on greetings.
+const PRESENTER_ACTIVE = existsSync(join(WORKSPACE_DIR, 'state', 'presenter-mode.sentinel'));
+
 // Code-adjacent paths (skills/, etc.) ship with the repo checkout, NOT the
 // workspace. Compute REPO_ROOT from this file's URL so the resolution
 // survives any cwd drift at startup. Used by the skill-loader below.
@@ -1089,7 +1095,8 @@ export const inlineTools = assertUniqueToolNames([
 	volumeTool, brightnessTool, clipboardTool,
 	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, getCoreStatusTool,
 	joinGmeetTool, lookupMeetingIdTool, callContactTool,
-	describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, slideControlTool, fullscreenTool,
+	describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, fullscreenTool,
+	...(PRESENTER_ACTIVE ? [slideControlTool] : []),
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
 	recentContextTool,
 	sendVisionFrameTool, startVisionTool, stopVisionTool,
@@ -1110,7 +1117,8 @@ export const ownerOnlyTools = [
 	pressKeyTool, scrollTool, switchTabTool, closeTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
 	clipboardTool, cancelTaskTool, toggleTasksTool,
-	joinGmeetTool, callContactTool, slideControlTool, fullscreenTool,
+	joinGmeetTool, callContactTool, fullscreenTool,
+	...(PRESENTER_ACTIVE ? [slideControlTool] : []),
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
 	recentContextTool,
 	describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool,
