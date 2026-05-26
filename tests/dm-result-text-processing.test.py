@@ -237,14 +237,13 @@ if all(len(c) <= 100 for c in chunks) and len(total_content) == 250:
 else:
     fail("T19: long word chunking", f"chunks lengths={[len(c) for c in chunks]}, total={len(total_content)}")
 
-# T20 — single-char max_len edge case: each chunk is 1 char
-chunks = list(_chunk_for_discord("abc", 1))
-# Should not crash; content preserved
+# T20 — minimum-realistic max_len=2: each char gets its own chunk
+chunks = list(_chunk_for_discord("abc", 2))
 total_content = "".join(c.strip() for c in chunks)
-try:
-    ok(f"T20: max_len=1 handled without crash ({len(chunks)} chunks, content chars preserved)")
-except Exception as e:
-    fail("T20: max_len=1 no crash", f"raised {e}")
+if all(len(c) <= 2 for c in chunks) and total_content == "abc":
+    ok(f"T20: max_len=2 splits to {len(chunks)} chunks, all ≤2 chars, content preserved")
+else:
+    fail("T20: max_len=2 chunking", f"chunks={chunks!r}, total={total_content!r}")
 
 # -----------------------------------------------------------------------
 # Summary
