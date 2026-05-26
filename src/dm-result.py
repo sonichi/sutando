@@ -34,6 +34,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
+import discord_config  # noqa: E402  — workspace-local Sutando discord config (#1147)
 REPO = resolve_workspace()
 ACCESS_JSON = Path.home() / ".claude" / "channels" / "discord" / "access.json"
 SSE_STATUS_URL = "http://localhost:8080/sse-status"
@@ -290,59 +291,42 @@ def _send_message_with_files(channel_id: str, token: str, content: str,
 def _resolve_owner_id(token):
     """Return the Discord user ID for the human owner.
 
-    Priority order:
-      1. $SUTANDO_DM_OWNER_ID env var.
-      2. First non-bot ID in ~/.claude/channels/discord/access.json →
-         allowFrom. "Non-bot" is decided by querying GET /users/{id} and
-         reading the `bot` field — allowFrom often contains multiple bots
-         (MacBook bot, Mac Mini bot) plus the human owner, and we only
-         want to DM the human.
+    Delegates the config-driven resolution chain to
+    `discord_config.resolve_owner_id` (#1147) so this fallback delivery
+    path and the live bridge (`discord-bridge.py:_poll_dm_fallback`)
+    agree on a single owner. Drift between the two sites was the failure
+    mode #846 created; the shared helper prevents it from recurring.
 
-    Set SUTANDO_DM_OWNER_ID in .env if you want to skip the per-id
-    /users lookup (saves 1 API call per dm-result invocation)."""
-    env_override = os.environ.get("SUTANDO_DM_OWNER_ID", "").strip()
-    if env_override:
-        return env_override
+    The bot-filtering step (walk `allowFrom`, skip Discord bot accounts)
+    stays here because it requires `GET /users/{id}` REST calls. Keeping
+    the helper pure-Python lets both callers (this sync REST path and
+    the bridge's async discord.py path) share the same chain.
 
+    Set SUTANDO_DM_OWNER_ID in .env to skip even the helper's lookup
+    (saves 1 API call per dm-result invocation); the env var is honored
+    inside the helper as the first resolution step."""
     if not ACCESS_JSON.exists():
-        return ""
+        # No plugin access.json — still try the helper for env override
+        # or workspace-config `owner` field.
+        owner = discord_config.resolve_owner_id({})
+        return owner or ""
     try:
         data = json.loads(ACCESS_JSON.read_text())
     except Exception:
-        return ""
+        data = {}
 
-    # Layer 1 (#1117): consult the explicit top-level `owner` field before
-    # the legacy tierMap → allowFrom fallback chain. `/discord:access` writes
-    # this as the canonical owner id; the fallback below is best-effort and
-    # mis-routed on Susan's Mac Studio on 2026-05-25 when `tierMap` was null
-    # and `allowFrom[0]` was a non-owner human. Mirrors the same precedence
-    # added to `src/discord-bridge.py:poll_proactive` in this PR.
-    explicit_owner = (data.get("owner") or "").strip()
-    if explicit_owner:
-        return explicit_owner
+    owner = discord_config.resolve_owner_id(data)
+    if owner:
+        return owner
 
     allow = data.get("allowFrom") or []
     if not allow:
         return ""
 
-    # Honor the explicit `tierMap[uid] == "owner"` admin tag IF the
-    # tagged user is still in allowFrom. Mirrors the same precedence
-    # used by `src/discord-bridge.py:poll_proactive` so the fallback
-    # delivery path and the live bridge agree on who the owner is —
-    # drift here would re-introduce the misroute class the bridge
-    # already fixed. Defensive: a stale tier-tag for a removed user
-    # must not resolve a delisted owner.
-    tier_map = data.get("tierMap") or {}
-    tier_owner = next(
-        (uid for uid in allow if tier_map.get(uid) == "owner"),
-        None,
-    )
-    if tier_owner is not None:
-        return str(tier_owner)
-
-    # Query each user's is-bot flag. The first human wins. If lookups all
-    # fail (rate limit, network, bad token), fall through to allow[0] as
-    # a degraded default so send_dm() can produce an honest error later.
+    # Step 6: bot-filtered walk of allowFrom. Helper intentionally omits
+    # this step (REST-bound). The first non-bot wins. If lookups all fail
+    # (rate limit, network, bad token), fall through to allow[0] as a
+    # degraded default so send_dm() produces an honest error later.
     for uid in allow:
         try:
             user = _discord_api("GET", f"/users/{uid}", token)
