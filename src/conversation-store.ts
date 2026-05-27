@@ -218,6 +218,38 @@ function init(): void {
 			}
 		}
 
+		// UNIQUE INDEX migration (closes #941 Part 2).
+		// Guards re-runs of import scripts from inserting duplicate rows.
+		// Uses natural-key tuples that represent one logical event.
+		// If the DB already has duplicates (pre-migration state), CREATE UNIQUE
+		// INDEX will throw — catch and log: run scripts/dedup-conversation-store.py
+		// first, then restart to retry.
+		const uniqueIndexes: [string, string][] = [
+			['voice',          'ts_unix, session_id, kind, text'],
+			['phone',          'ts_unix, session_id, kind, text'],
+			['discord_voice',  'ts_unix, session_id, kind, text'],
+			['sessions',       'ts_unix, source, session_id'],
+			['session_events', 'ts_unix, source, session_id, event_name'],
+		];
+		for (const [table, cols] of uniqueIndexes) {
+			const idxName = `idx_${table}_unique`;
+			const alreadyExists = (
+				db.prepare(
+					"SELECT name FROM sqlite_master WHERE type='index' AND name=?",
+				).get(idxName) as { name: string } | undefined
+			);
+			if (alreadyExists) continue;
+			try {
+				db.exec(`CREATE UNIQUE INDEX ${idxName} ON ${table}(${cols})`);
+			} catch (e) {
+				console.error(
+					`[conversation-store] could not add UNIQUE INDEX on ${table} — ` +
+					'run scripts/dedup-conversation-store.py --commit first, then restart.',
+					e,
+				);
+			}
+		}
+
 		// Convenience views — thin wrappers that add a human-readable `time`
 		// column (local-time) and default-sort by ts_unix DESC. DROP+CREATE so
 		// definitions stay in lock-step with the surface tables and any
