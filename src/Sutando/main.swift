@@ -614,6 +614,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     return (name, mtime)
                 }
                 .sorted { $0.1 > $1.1 }
+            // Archive hotkey-sourced results that have passed the 10-min display
+            // window. Without this, context-drop results accumulate indefinitely
+            // because no bridge holds source == "hotkey" (issue #969).
+            let archiveDir = resultsDir + "/archive-" + {
+                let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd"; return df.string(from: Date())
+            }()
+            let tasksDir = workspace + "/tasks"
+            for (name, mtime) in taskResults where Date().timeIntervalSince(mtime) >= 600 {
+                let resultPath = resultsDir + "/" + name
+                let taskPath = tasksDir + "/" + name
+                // Only archive if the originating task was a hotkey drop.
+                if let taskBody = try? String(contentsOfFile: taskPath, encoding: .utf8),
+                   taskBody.contains("source: hotkey") {
+                    try? FileManager.default.createDirectory(atPath: archiveDir, withIntermediateDirectories: true)
+                    let dst = archiveDir + "/" + name
+                    try? FileManager.default.moveItem(atPath: resultPath, toPath: dst)
+                }
+            }
             if let latest = taskResults.first {
                 // Only show if it landed in the last 10 minutes — older
                 // results are no longer "unread" by reasonable definition.
@@ -1825,6 +1843,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let taskContent = """
         id: task-\(ts)
         timestamp: \(ISO8601DateFormatter().string(from: Date()))
+        source: hotkey
+        access_tier: owner
         task: User dropped context via hotkey. Process this:
         \(content)
         """
