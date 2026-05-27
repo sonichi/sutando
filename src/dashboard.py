@@ -32,6 +32,7 @@ REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from util_paths import personal_path, shared_personal_path  # noqa: E402
+import outbox_log  # noqa: E402
 WORKSPACE_DIR = resolve_workspace()
 PORT = 7844
 
@@ -165,6 +166,63 @@ def get_system_stats() -> dict:
         "uptime": datetime.now().strftime("%H:%M"),
         "quota": get_quota_status(),
     }
+
+
+_CHANNEL_LABELS: dict[str, str] = {
+    "discord_dm": "discord-dm",
+    "discord_channel": "discord-ch",
+    "slack_dm": "slack-dm",
+    "slack_channel": "slack-ch",
+    "telegram": "telegram",
+    "email": "email",
+    "whatsapp": "whatsapp",
+    "x_twitter": "x/twitter",
+    "imessage": "imessage",
+}
+
+
+def get_outbox(limit: int = 20) -> list[dict]:
+    """Return the most-recent `limit` outbox entries, newest-first."""
+    entries = outbox_log.read_recent(limit=limit)
+    return list(reversed(entries))
+
+
+def render_outbox_card(entries: list[dict]) -> str:
+    if not entries:
+        return '<div class="card full"><h2>Outbox</h2><span style="color:#333;font-size:12px">No outbound messages logged yet.</span></div>'
+    rows = ""
+    for e in entries:
+        iso = e.get("iso_ts", "")
+        time_str = iso[11:16] if len(iso) >= 16 else iso  # HH:MM
+        ch = e.get("channel_type", "?")
+        label = _CHANNEL_LABELS.get(ch, ch)
+        recipient = e.get("recipient_label") or e.get("recipient", "?")
+        # Truncate long recipients (phone numbers, long IDs).
+        if len(recipient) > 28:
+            recipient = recipient[:26] + ".."
+        preview = e.get("body_preview", "")
+        if len(preview) > 60:
+            preview = preview[:58] + ".."
+        rows += (
+            f'<tr style="border-bottom:1px solid #1a1a2a">'
+            f'<td style="padding:4px 6px;color:#444;white-space:nowrap">{time_str}</td>'
+            f'<td style="padding:4px 6px;color:#4a8aaa;white-space:nowrap">{label}</td>'
+            f'<td style="padding:4px 6px;color:#888;white-space:nowrap">{recipient}</td>'
+            f'<td style="padding:4px 6px;color:#aaa">{preview}</td>'
+            f'</tr>\n'
+        )
+    return (
+        '<div class="card full"><h2>Outbox</h2>'
+        '<table style="width:100%;font-size:11px;border-collapse:collapse">'
+        '<tr style="color:#555;text-align:left">'
+        '<th style="padding:4px 6px">Time</th>'
+        '<th style="padding:4px 6px">Channel</th>'
+        '<th style="padding:4px 6px">Recipient</th>'
+        '<th style="padding:4px 6px">Preview</th>'
+        '</tr>'
+        + rows
+        + '</table></div>'
+    )
 
 
 HTML = """<!DOCTYPE html>
@@ -330,6 +388,9 @@ def render_dashboard() -> str:
 <div style="margin:4px 0"><kbd style="background:#222;color:#aaa;padding:2px 6px;border-radius:3px;font-family:monospace">⌃V</kbd> Toggle voice</div>
 <div style="margin:4px 0"><kbd style="background:#222;color:#aaa;padding:2px 6px;border-radius:3px;font-family:monospace">⌃M</kbd> Toggle mute</div>
 </div></div>""")
+
+    # Outbox
+    cards.append(render_outbox_card(get_outbox()))
 
     # Quick links
     cards.append(f"""<div class="card full">
