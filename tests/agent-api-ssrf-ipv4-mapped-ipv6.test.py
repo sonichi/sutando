@@ -2,19 +2,20 @@
 """Security regression guard: `_is_safe_callback_url` must reject IPv4-mapped
 IPv6 hostnames that point at private IPv4 ranges.
 
-The function loops over `getaddrinfo` results and checks each
-`ipaddress.ip_address(...)` against a list of private networks
-(127.0.0.0/8, 10.0.0.0/8, fc00::/7, etc.). For IPv4-mapped IPv6
-addresses like `::ffff:127.0.0.1`, the loop returns False:
+Bug found while reviewing `src/agent-api.py:_is_safe_callback_url` after the
+recent fix sweep. The function loops over `getaddrinfo` results and checks
+each `ipaddress.ip_address(...)` against a list of private networks
+(127.0.0.0/8, 10.0.0.0/8, fc00::/7, etc.). For IPv4-mapped IPv6 addresses
+like `::ffff:127.0.0.1`, the loop returns False:
 
     >>> ipaddress.ip_address('::ffff:127.0.0.1') in ipaddress.ip_network('127.0.0.0/8')
     False  # cross-family `in` always returns False
 
-So a webhook URL of `https://[::ffff:127.0.0.1]/exfil` would pass the
-SSRF check even though it resolves to localhost. Practical exploit is
-TLS-gated (no public cert covers IPv6 IP literals), but defense-in-
-depth says the validator should catch it — the function's docstring
-explicitly claims to block "Hostnames that resolve to private IPs."
+So a webhook URL of `https://[::ffff:127.0.0.1]/exfil` would pass the SSRF
+check even though it resolves to localhost. Practical exploit is TLS-gated
+(no public cert covers IPv6 IP literals), but defense-in-depth says the
+validator should catch it — the function's docstring explicitly claims to
+block "Hostnames that resolve to private IPs."
 
 The fix projects `IPv6Address.ipv4_mapped` onto the IPv4 private-range
 checks. This test pins:
@@ -48,7 +49,13 @@ api = _load("agent_api", REPO / "src" / "agent-api.py")
 
 
 def _stub_getaddrinfo(addr_str: str, family: int):
+    """Build a stub `getaddrinfo` that always returns `addr_str` under
+    `family`, irrespective of the hostname asked. Lets each case
+    deterministically simulate what would happen if DNS returned that
+    address."""
+
     def fake(_host, _port, _af=None, _sock=None, *args, **kwargs):
+        # Match the (family, socktype, proto, canonname, sockaddr) shape.
         if family == socket.AF_INET6:
             return [(family, socket.SOCK_STREAM, 0, "", (addr_str, 0, 0, 0))]
         return [(family, socket.SOCK_STREAM, 0, "", (addr_str, 0))]
@@ -63,6 +70,11 @@ def _with_stub(addr_str: str, family: int, fn):
         fn()
     finally:
         api.socket.getaddrinfo = original
+
+
+# -----------------------------------------------------------------------
+# Cases
+# -----------------------------------------------------------------------
 
 
 def test_ipv4_mapped_ipv6_loopback_is_blocked():
@@ -83,7 +95,9 @@ def test_ipv4_mapped_ipv6_loopback_is_blocked():
 
 
 def test_ipv4_mapped_ipv6_rfc1918_is_blocked():
-    """Same bypass class for RFC1918 (10.0.0.0/8) targets."""
+    """Same bypass class for RFC1918 (10.0.0.0/8) targets. An attacker who
+    points DNS at `::ffff:10.0.0.5` to reach an internal service must be
+    blocked too — pin the general projection works, not just loopback."""
     def run():
         safe, reason = api._is_safe_callback_url("https://example.test/")
         assert safe is False, (
@@ -96,7 +110,8 @@ def test_ipv4_mapped_ipv6_rfc1918_is_blocked():
 
 
 def test_plain_ipv4_loopback_still_blocked():
-    """Backwards-compat: no regression on plain-IPv4 loopback check."""
+    """Backwards-compat: the new IPv4-mapped path must NOT regress the
+    existing plain-IPv4 loopback check."""
     def run():
         safe, reason = api._is_safe_callback_url("https://example.test/")
         assert safe is False
@@ -106,7 +121,9 @@ def test_plain_ipv4_loopback_still_blocked():
 
 
 def test_plain_ipv6_loopback_still_blocked():
-    """Backwards-compat: `::1` rejected by existing `::1/128` range."""
+    """Backwards-compat: `::1` is rejected by the existing `::1/128`
+    range — verify the fix didn't accidentally short-circuit non-mapped
+    IPv6."""
     def run():
         safe, reason = api._is_safe_callback_url("https://example.test/")
         assert safe is False
@@ -117,8 +134,8 @@ def test_plain_ipv6_loopback_still_blocked():
 
 def test_public_ipv6_still_passes():
     """Backwards-compat: a public IPv6 (Cloudflare DNS 2606:4700:4700::1111)
-    must still pass. Defends against an over-zealous fix that rejects
-    all IPv6 by accident."""
+    must still pass. Defends against an over-zealous fix that rejects all
+    IPv6 by accident."""
     def run():
         safe, reason = api._is_safe_callback_url("https://example.test/")
         assert safe is True, f"public IPv6 rejected: {reason}"
