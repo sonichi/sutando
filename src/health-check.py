@@ -485,13 +485,15 @@ def check_voice_transport(voice_check: dict) -> dict:
         # 1011-after-GoAway as a fail, the probe reports a false
         # positive every time voice sits idle for 10+ minutes.
         most_recent_abnormal: Optional[str] = None
+        most_recent_abnormal_lineno: int = -1  # relative to banner_idx
         abnormal_recovered = False
         goaway_before_close = False  # GoAway seen since the last setup/close
-        for line in lines[banner_idx:]:
+        for rel_i, line in enumerate(lines[banner_idx:]):
             if "Gemini setup complete" in line or "LLM transport connected and setup complete" in line:
                 if most_recent_abnormal is not None:
                     abnormal_recovered = True
                     most_recent_abnormal = None
+                    most_recent_abnormal_lineno = -1
                 goaway_before_close = False
             elif "GoAway from Gemini" in line:
                 goaway_before_close = True
@@ -501,21 +503,36 @@ def check_voice_transport(voice_check: dict) -> dict:
                     continue
                 if m_code in VOICE_TRANSPORT_HEALTHY_CLOSE_CODES:
                     most_recent_abnormal = None
+                    most_recent_abnormal_lineno = -1
                     goaway_before_close = False
                 elif goaway_before_close:
                     # Idle timeout path — Google warned, then closed. Not an error.
                     most_recent_abnormal = None
+                    most_recent_abnormal_lineno = -1
                     goaway_before_close = False
                 else:
                     most_recent_abnormal = line
+                    most_recent_abnormal_lineno = rel_i
                     abnormal_recovered = False
         if most_recent_abnormal is not None:
             reason = _extract_close_reason(most_recent_abnormal) or "unknown"
             code = _extract_close_code(most_recent_abnormal) or "?"
-            # code=1006 is an abnormal network close (often a DNS blip). If DNS
-            # resolves now the transport will self-recover on next client connect
-            # — downgrade to warn so the dashboard isn't stuck on red.
-            if code == "1006":
+            # Count [Health] state=CONNECTING lines after the abnormal close.
+            # The health ticker fires every ~30s; >20 consecutive CONNECTING
+            # lines = stuck for >10 min and bodhi won't self-recover.
+            connecting_after = sum(
+                1 for ln in lines[banner_idx + most_recent_abnormal_lineno + 1:]
+                if "[Health] state=CONNECTING" in ln
+            ) if most_recent_abnormal_lineno >= 0 else 0
+            if connecting_after > 20:
+                elapsed_min = connecting_after * 30 // 60
+                check["status"] = "fail"
+                check["detail"] = f"stuck CONNECTING ~{elapsed_min}min after code={code} transport close — needs kickstart"
+                check["_stuck_connecting"] = True
+            elif code == "1006":
+                # code=1006 is an abnormal network close (often a DNS blip). If DNS
+                # resolves now the transport will self-recover on next client connect
+                # — downgrade to warn so the dashboard isn't stuck on red.
                 try:
                     socket.getaddrinfo("generativelanguage.googleapis.com", 443)
                     check["status"] = "warn"
@@ -1383,6 +1400,9 @@ def main():
                     subprocess.run([ts_bin, "funnel", "--bg", "3100"],
                                    capture_output=True, timeout=10)
                     print(f"  {c['name']}: restarted")
+                elif c["name"] == "voice-transport" and c.get("_stuck_connecting"):
+                    result = fix_launchd("com.sutando.voice-agent")
+                    print(f"  voice-agent (stuck CONNECTING): {result}")
                 elif c["name"] == "conversation-server":
                     # If stale, kill old PIDs first so the new process doesn't
                     # bind-fail or end up alongside a still-running zombie.
