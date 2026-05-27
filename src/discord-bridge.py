@@ -56,6 +56,7 @@ from workspace_default import resolve_workspace  # noqa: E402
 import discord_config  # noqa: E402  — Sutando workspace-local discord config (#1147)
 from util_paths import shared_personal_path  # noqa: E402
 from task_priority import default_priority_for_source  # noqa: E402
+from result_markers import parse_markers  # noqa: E402  — unified marker parser (#896)
 REPO = resolve_workspace()
 
 # discord-voice "magic word" join trigger (issue: za-warudo summon). The
@@ -3283,19 +3284,22 @@ async def poll_results():
                 # 2026-05-22 ~03:00 UTC: "it's not a quote reply".
                 source_message_anchor = pending_reply_anchors.pop(task_id, None)
                 save_pending_replies()
-                # Skip sending if already replied directly (core agent used MCP).
-                # Clean up the result AND task files so the watcher doesn't
-                # re-fire infinitely on the leftover task. Observed 2026-04-17:
-                # `[no-send]` tasks persisted in tasks/ because `continue`
-                # skipped the cleanup block at the bottom of this loop.
-                if reply_text.startswith('[no-send]') or reply_text.startswith('[REPLIED]') or reply_text.startswith('[deduped:'):
+                # Parse result-body markers through the unified parser (#896 — mirrors
+                # slack-bridge + telegram-bridge). parse_markers() recognises skip
+                # ([no-send]/[REPLIED]/[deduped:]), redirect ([channel:]), and attach
+                # ([file:|send:|attach:]) markers in one pass; the returned .body has
+                # all markers stripped, ready to send.
+                _pr = parse_markers(reply_text)
+                _skip = next((a for a in _pr.actions if a.kind == "skip"), None)
+                if _skip:
                     # `[deduped: <id>]` = agent consolidated this task's reply
                     # into another task's result. Silent archive, no Discord
                     # post — same UX as [no-send] / [REPLIED].
-                    print(f"  Skipped (already replied or deduped): {task_id}")
+                    print(f"  Skipped ({_skip.value}): {task_id}")
                     archive_file(result_file, "results", task_id)
                     archive_task_by_id(task_id)
                     continue
+                reply_text = _pr.body
 
                 # Idempotency check: if the previous run already sent
                 # this reply (sentinel present) but crashed BEFORE the
@@ -3342,27 +3346,14 @@ async def poll_results():
                         if not is_thread:
                             reply_to_id = source_message_anchor
 
-                    # Extract optional [channel: <channel_id>] redirect — the
-                    # agent can route a DM-originated reply to a different
-                    # channel (e.g. respond from a DM task by posting in
-                    # #general). Without this, the bridge always replies to
-                    # the task-source channel. Falls back to the original
-                    # channel on resolution failure (don't drop the reply).
-                    #
-                    # Authorization: owner tier only. The bridge already gates
-                    # inbound tasks by tier (lines ~2326+) and the access_tier
-                    # field is written into every task file (line ~2534). A
-                    # sandboxed team/other-tier result that names a channel
-                    # the requester can't reach must NOT be honored — that
-                    # would let a non-owner redirect into the owner's private
-                    # spaces. We read the tier back from the task file rather
-                    # than threading it through pending_replies so the gate
+                    # Extract optional [channel: <channel_id>] redirect from parse_markers()
+                    # result (already computed above). Authorization: owner tier only —
+                    # sandboxed team/other-tier results must not redirect into the owner's
+                    # private spaces. Tier is read back from the task file so the gate
                     # survives a bridge restart.
-                    channel_pattern = re.compile(r'\[channel:\s*(\d{17,20})\]')
-                    channel_match = channel_pattern.search(reply_text)
-                    if channel_match:
-                        target_channel_id = int(channel_match.group(1))
-                        reply_text = channel_pattern.sub('', reply_text).strip()
+                    _redir = next((a for a in _pr.actions if a.kind == "redirect"), None)
+                    if _redir:
+                        target_channel_id = int(_redir.value)
                         task_tier = "other"
                         try:
                             _tf_read = find_task_file(TASKS_DIR, task_id)
@@ -3402,8 +3393,10 @@ async def poll_results():
                             except Exception as e:
                                 print(f"  [channel-redirect] failed to resolve channel {target_channel_id}, falling back to task source: {e}", flush=True)
 
-                    # Extract file paths: [file: /path] or [send: /path]
-                    clean_text, files = _split_file_markers(reply_text)
+                    # Extract file paths from parse_markers() attach actions.
+                    # _pr.body already has all [file:|send:|attach:] markers stripped.
+                    clean_text = _pr.body
+                    files = [a.value for a in _pr.actions if a.kind == "attach"]
 
                     # Checklist rendering — if the reply contains [checklist] and the
                     # skill is installed, post with Discord buttons instead of plain text.
@@ -3610,36 +3603,28 @@ async def poll_proactive():
                     try:
                         user = await client.fetch_user(int(owner_id))
                         dm = await user.create_dm()
-                        # Extract files
-                        clean_text, files = _split_file_markers(text)
-
-                        # #1147 follow-up — owner-greenlit 2026-05-26 DM
-                        # ("yes" greenlight in DM):
+                        # Parse result-body markers through the unified parser (#896).
+                        # parse_markers() handles [no-send]/[REPLIED]/[deduped:] (skip),
+                        # [channel:] (redirect), and [file:|send:|attach:] (attach) in
+                        # one pass. Proactive files are written by the core agent so
+                        # no tier gate on redirect (unlike _poll_dm_fallback).
                         #
-                        # Honor `[channel: <id>]` redirect for proactive
-                        # files. Unlike `_poll_dm_fallback` (which gates
-                        # the redirect on task_tier=="owner" because team-
-                        # tier task content is untrusted), proactive files
-                        # are written by the core agent — no untrusted-
-                        # input source — so the tier gate doesn't apply.
-                        #
-                        # Failure model per owner principle "fail loudly,
-                        # succeed quietly":
-                        #   - Success (channel resolves + send works) →
-                        #     marker stripped + posted to target channel,
-                        #     no DM. Quiet.
-                        #   - Failure (channel unknown / permission denied
-                        #     / network) → leave the literal `[channel:
-                        #     <id>]` text in the DM AND emit a WARN log.
-                        #     The leaked marker is the failure signal the
-                        #     operator needs to detect the misroute (per
-                        #     the 2026-05-26 catch — silently stripping
-                        #     would have hidden the bug).
-                        _channel_redirect_re = re.compile(r'\[channel:\s*(\d{17,20})\]')
-                        _channel_match = _channel_redirect_re.search(clean_text)
-                        if _channel_match:
-                            _target_id = int(_channel_match.group(1))
-                            _redirect_text = _channel_redirect_re.sub('', clean_text).strip()
+                        # Failure model for redirect (per owner directive 2026-05-26):
+                        #   Success → marker stripped + posted to target channel, quiet.
+                        #   Failure → literal `[channel:]` left in DM + WARN log. The
+                        #   leaked marker is the operator's signal; silent strip would hide.
+                        _pr_pro = parse_markers(text)
+                        _skip_pro = next((a for a in _pr_pro.actions if a.kind == "skip"), None)
+                        if _skip_pro:
+                            print(f"  [proactive] skipped ({_skip_pro.value}): {f.name}", flush=True)
+                            f.unlink(missing_ok=True)
+                            continue
+                        clean_text = _pr_pro.body
+                        files = [a.value for a in _pr_pro.actions if a.kind == "attach"]
+                        _pro_redir = next((a for a in _pr_pro.actions if a.kind == "redirect"), None)
+                        if _pro_redir:
+                            _target_id = int(_pro_redir.value)
+                            _redirect_text = clean_text  # parse_markers already stripped the marker
                             _target_ch = None
                             try:
                                 _target_ch = client.get_channel(_target_id)
@@ -3798,24 +3783,28 @@ async def poll_dm_fallback():
                     _peek = f.read_text(encoding="utf-8", errors="replace").lstrip()
                 except OSError:
                     _peek = ""
-                if _peek.startswith('[no-send]') or _peek.startswith('[REPLIED]') or _peek.startswith('[deduped:'):
-                    print(f"  [dm-fallback] skipped (suppression marker): {f.name}", flush=True)
+                # Parse result-body markers through the unified parser (#896).
+                # Handles skip ([no-send]/[REPLIED]/[deduped:]) and redirect
+                # ([channel:]) + attach ([file:|send:|attach:]) in one pass.
+                _pr_fb = parse_markers(_peek)
+                _skip_fb = next((a for a in _pr_fb.actions if a.kind == "skip"), None)
+                if _skip_fb:
+                    print(f"  [dm-fallback] skipped ({_skip_fb.value}): {f.name}", flush=True)
                     _task_id = f.stem
                     archive_task_by_id(_task_id)
                     archive_file(f, "results", _task_id)
                     continue
 
-                # Honor [channel: <id>] redirect (parity with poll_results
-                # lines ~2702-2759). Without this, a voice- or cron-originated
-                # result that includes the redirect marker would either
-                # (a) leak the literal `[channel: <id>]` string into the
-                # owner's DM via dm-result.py, or (b) lose the redirect intent
-                # entirely. Both modes break the marker's contract.
-                channel_pattern = re.compile(r'\[channel:\s*(\d{17,20})\]')
-                channel_match = channel_pattern.search(_peek)
-                if channel_match:
-                    target_channel_id = int(channel_match.group(1))
-                    clean_body = channel_pattern.sub('', _peek).strip()
+                # Honor [channel: <id>] redirect (parity with poll_results). Without
+                # this, voice- or cron-originated results that include [channel:]
+                # would either leak the literal marker into the DM or lose redirect
+                # intent entirely. Tier gate: default "other" on missing task file —
+                # voice tasks don't write access_tier, so channel-redirect requires
+                # the voice-agent to explicitly set `access_tier: owner` in the file.
+                _redir_fb = next((a for a in _pr_fb.actions if a.kind == "redirect"), None)
+                if _redir_fb:
+                    target_channel_id = int(_redir_fb.value)
+                    clean_body = _pr_fb.body  # parse_markers already stripped the marker
                     _task_id = f.stem
                     # Tier read from task file. Default "other" on missing /
                     # unreadable: voice- and cron-originated tasks don't write
@@ -3846,8 +3835,9 @@ async def poll_dm_fallback():
                             target_channel = None
                             print(f"  [dm-fallback channel-redirect] failed to resolve {target_channel_id}: {e}", flush=True)
                         if target_channel:
-                            # File markers (parity with poll_results 2761-2784).
-                            text_only, file_list = _split_file_markers(clean_body)
+                            # File attach markers from parse_markers() (#896 parity with poll_results).
+                            text_only = clean_body  # _pr_fb.body already has file markers stripped
+                            file_list = [a.value for a in _pr_fb.actions if a.kind == "attach"]
                             if text_only:
                                 for chunk in _chunk_for_discord(text_only):
                                     await target_channel.send(chunk)
