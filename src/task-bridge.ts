@@ -166,6 +166,43 @@ export function _isVoiceTask(taskId: string): boolean {
 	return false;
 }
 
+/** Returns true if the task file has `source: hotkey` or `source: context-drop`
+ * (Sutando.app hotkey-drop and CLI context-drop paths — both have no external
+ * bridge consumer; task-bridge is solely responsible for archiving their results
+ * after Claude processes them). Closes #969.
+ * Exported for unit testing. */
+export function _isHotkeyTask(taskId: string): boolean {
+	const candidates: string[] = [
+		join(TASK_DIR, `${taskId}.txt`),
+		join(TASK_DIR, 'processed', `${taskId}.txt`),
+		join(TASK_DIR, 'archive', `${taskId}.txt`),
+	];
+	const archiveRoot = join(TASK_DIR, 'archive');
+	if (existsSync(archiveRoot)) {
+		try {
+			for (const entry of readdirSync(archiveRoot)) {
+				if (!/^\d{4}-\d{2}$/.test(entry)) continue;
+				candidates.push(join(archiveRoot, entry, `${taskId}.txt`));
+			}
+		} catch {}
+	}
+	for (const p of candidates) {
+		if (!existsSync(p)) continue;
+		try {
+			const body = readFileSync(p, 'utf-8');
+			const headerLines: string[] = [];
+			for (const l of body.split('\n')) {
+				if (l.startsWith('task:')) break;
+				headerLines.push(l);
+			}
+			return headerLines.some(
+				l => l.startsWith('source: hotkey') || l.startsWith('source: context-drop'),
+			);
+		} catch {}
+	}
+	return false;
+}
+
 /** Belt-suspenders guard for the result-watcher's unconditional fallthrough
  * (issue #1035, follow-up to PR #1033). Returns true iff the filename is one
  * that task-bridge legitimately delivers via `onResult()`. Rejects everything
@@ -716,6 +753,22 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 						_deliveredResults.add(file);
 						_pendingTasks.delete(taskId);
 						console.log(`${ts()} [TaskBridge] Chat task archived (no client): ${taskId}`);
+						setTimeout(() => {
+							archiveFile(path, 'results', taskId);
+							const taskFile = join(TASK_DIR, `${taskId}.txt`);
+							if (existsSync(taskFile)) archiveFile(taskFile, 'tasks', taskId);
+						}, 10_000);
+					}
+					// Hotkey / context-drop tasks (source: hotkey, source: context-drop)
+					// have no external bridge consumer — archive their results directly
+					// when the voice client is offline, same as task-chat-* above.
+					// Closes #969: without this, hotkey results accumulate in results/
+					// until next boot (archive-stale-results.py has multi-day retention).
+					if (file.startsWith('task-') && _isHotkeyTask(taskId)) {
+						_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
+						_deliveredResults.add(file);
+						_pendingTasks.delete(taskId);
+						console.log(`${ts()} [TaskBridge] Hotkey/context-drop task archived (no client): ${taskId}`);
 						setTimeout(() => {
 							archiveFile(path, 'results', taskId);
 							const taskFile = join(TASK_DIR, `${taskId}.txt`);
