@@ -1,59 +1,30 @@
 #!/usr/bin/env python3
-"""Unit tests for _chunk_for_discord — covers MacBook PR #563 review findings.
+"""Unit tests for `_chunk_for_discord` — covers MacBook PR #563 review findings.
 
-Both src/discord-bridge.py and src/dm-result.py carry copies of the chunker;
-test both. Loads via importlib because filenames contain hyphens.
+Pre-extraction this file loaded `src/discord-bridge.py` AND `src/dm-result.py`
+via importlib and ran the same 7 cases against EACH copy of the chunker,
+specifically because both files carried a copy and the test was the only
+thing keeping them honest (they had nonetheless already drifted on the
+long-line hard-split branch — see `src/discord_chunker.py` docstring).
+
+Post-extraction the chunker lives in `src/discord_chunker.py` and both
+bridge / dm-result import from it. The test loads it once.
 """
 
-import importlib.util
-import os
 import sys
-import types
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "src"))
 
-# discord-bridge.py module-load has two side effects that fail in clean CI:
-#   1. `import discord` + `discord.Intents.default()` + `discord.Client(...)`
-#      — discord.py isn't installed on Ubuntu CI runners.
-#   2. Reads DISCORD_BOT_TOKEN from ~/.claude/channels/discord/.env and
-#      `exit(1)` if missing — that path doesn't exist in CI.
-#
-# Bypass both so the test can reach `_chunk_for_discord` (pure string ops,
-# no discord runtime dependency). Locally with the real discord installed
-# and a real token, both bypasses no-op.
-try:
-    import discord  # noqa: F401
-except ImportError:
-    stub = types.ModuleType("discord")
-    stub.Intents = type("Intents", (), {"default": staticmethod(lambda: type("I", (), {"message_content": False})())})
-    stub.Client = type("Client", (), {"__init__": lambda self, **kw: None, "event": staticmethod(lambda fn: fn)})
-    stub.File = type("File", (), {})
-    stub.Message = type("Message", (), {})
-    sys.modules["discord"] = stub
-
-# discord-bridge.py reads DISCORD_BOT_TOKEN from a file path, not os.environ.
-# Materialize a fake .env at the expected path if absent (CI runners don't
-# have it; locally it already exists, setdefault-style logic preserves the
-# real one).
-_channels_env = Path.home() / ".claude" / "channels" / "discord" / ".env"
-if not _channels_env.exists():
-    _channels_env.parent.mkdir(parents=True, exist_ok=True)
-    _channels_env.write_text("DISCORD_BOT_TOKEN=test-token-not-real\n")
+# Plain import — `discord_chunker.py` has no underscore-in-filename
+# obstacle and no module-load side effects (no discord runtime, no token
+# file read). The previous importlib + stub-discord + materialize-.env
+# bootstrap from this file is no longer needed.
+import discord_chunker  # noqa: E402
 
 
-def _load(name: str, path: Path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    m = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(m)
-    return m
-
-
-bridge = _load("dbridge", REPO / "src" / "discord-bridge.py")
-dm = _load("dm_result", REPO / "src" / "dm-result.py")
-
-
-def _run_against(mod, label):
+def _run_cases(mod, label):
     # Test 1: empty/short
     assert list(mod._chunk_for_discord("")) == []
     assert list(mod._chunk_for_discord("hi")) == ["hi"]
@@ -122,8 +93,7 @@ def _run_against(mod, label):
 
 
 def main():
-    _run_against(bridge, "discord-bridge.py")
-    _run_against(dm, "dm-result.py")
+    _run_cases(discord_chunker, "discord_chunker")
     print("All chunker tests passed.")
 
 
