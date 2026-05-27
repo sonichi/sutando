@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template — install via `bash src/install-loop-watchdog.sh`.
+  The installer renders __SUTANDO_REPO__ and __SUTANDO_WORKSPACE__ from
+  the env / defaults and writes the resolved file to
+  ~/Library/LaunchAgents/. Do NOT load this template directly with
+  launchctl — it has placeholders, not paths.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.sutando.loop-watchdog</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__SUTANDO_REPO__/src/loop-watchdog.sh</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>900</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>__SUTANDO_WORKSPACE__/logs/watchdog.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>__SUTANDO_WORKSPACE__/logs/watchdog.stderr.log</string>
+</dict>
+</plist>
