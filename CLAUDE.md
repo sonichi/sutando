@@ -201,8 +201,10 @@ Tasks arrive from multiple channels via the same file bridge:
 - `[file: /path]` / `[send: /path]` / `[attach: /path]` — Discord bridge extracts and attaches the file alongside the text body.
 
 **Per-channel pull namespace** — `results/<channel-key>.task-{id}.txt`. The DEFAULT result filename remains `results/task-{id}.txt` for every task — keep using it unless you specifically need to push a result to a non-delegating consumer. Use the scoped form ONLY when a result needs to be claimed by a pull-side voice surface that didn't delegate the work:
-- discord-voice → channel key is the Discord voice channel id
-- phone → channel key is the Twilio call SID (per-call unique)
+- discord-voice → key built via `discordVoiceKey(vcId)` → `dvoice-<safe(vc-id)>`
+- phone → key built via `phoneCallKey(callSid)` → `phone-<safe(call-sid)>`
+
+**Always go through the typed key constructor** (`discordVoiceKey` / `phoneCallKey` in TS, `discord_voice_key` / `phone_call_key` in Python) — both the writer and the scanning consumer must agree on the prefix. The per-consumer prefix is code-enforced (single helper, single source of truth) so cross-consumer namespace collisions are impossible regardless of what ID format a future consumer adopts.
 
 Existing consumers (`discord-bridge.py`, `telegram-bridge.py`, `slack-bridge.py`, `task-bridge.ts`, `agent-api.py`) all key off the legacy `task-{id}.txt` shape — specific tracked task_id or `task-*` glob — so a `<key>.task-{id}.txt` filename slides past them. The matching scan inside `skills/discord-voice/scripts/discord-voice-server.ts` and `skills/phone-conversation/scripts/conversation-server.ts` reads-and-deletes the file, then injects its body into the live Gemini session via the same `transport.sendContent` path the work-tool result drain uses. Helper: `src/result-channel-key.ts` (TS) / `src/result_channel_key.py` (Python).
 

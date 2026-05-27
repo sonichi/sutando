@@ -84,7 +84,7 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '../../../src/inline-tools.js';
 import { recordSession, recordConversation, recordToolCall } from '../../../src/conversation-store.js';
-import { resultBelongsTo } from '../../../src/result-channel-key.js';
+import { resultBelongsTo, phoneCallKey } from '../../../src/result-channel-key.js';
 // Lazy vision-session handle. Only loaded if a call ever needs it — keeps the
 // phone-agent boot path free of the vision-tools.ts side-effects on cold start.
 let _setVisionSession: ((s: unknown) => void) | null = null;
@@ -1031,7 +1031,9 @@ async function createCallSession(params: {
 			// Belt-and-suspenders: `resultBelongsTo` also gates on .txt.
 			if (!name.endsWith('.txt')) continue;
 			if (callSession.channelScanSeen!.has(name)) continue;
-			if (!resultBelongsTo(name, callSession.callSid)) continue;
+			// Typed key constructor — keeps writer + consumer in sync on
+			// the `phone-` prefix; prevents cross-consumer namespace collisions.
+			if (!resultBelongsTo(name, phoneCallKey(callSession.callSid))) continue;
 			callSession.channelScanSeen!.set(name, Date.now());
 			const full = join(RESULTS_DIR, name);
 			let body: string;
