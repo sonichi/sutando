@@ -120,6 +120,20 @@ def _process_ping(spec: dict, pings_fired: dict[str, str], presence_snap, policy
         return [{"ping": name, "status": "error", "reason": f"unknown source: {source_name}"}]
     candidates = source_mod.fetch(spec.get("source_config") or {})
 
+    # Cross-calendar dedup: the same event may appear on multiple subscribed
+    # calendars. Collapse to one candidate per (start_iso, title) before match
+    # so the owner gets one notification per meeting, not one per calendar
+    # subscription. Items with no dedup_key_suffix pass through unchanged.
+    _seen_suffixes: set[str] = set()
+    deduped: list[dict] = []
+    for c in candidates:
+        suffix = c.get("dedup_key_suffix", "")
+        if not suffix or suffix not in _seen_suffixes:
+            deduped.append(c)
+            if suffix:
+                _seen_suffixes.add(suffix)
+    candidates = deduped
+
     results = []
     for item in candidates:
         if not _matches(item, spec.get("match") or {}):
