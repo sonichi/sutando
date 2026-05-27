@@ -74,6 +74,26 @@ BEARER_TOKEN = os.environ.get("X_BEARER_TOKEN", "")
 UPLOAD_URL = "https://upload.twitter.com/1.1/media/upload.json"
 TWEET_URL = "https://api.twitter.com/2/tweets"
 
+# outbox_log is in src/ — lazy-loaded so standalone/offline usage (search,
+# read) doesn't fail when src/ isn't on sys.path. Never raises on failure
+# so the post path itself is never blocked by observability code.
+_outbox_log = None
+
+
+def _get_outbox_log():
+    global _outbox_log
+    if _outbox_log is None:
+        try:
+            _repo_root = Path(__file__).resolve().parent.parent.parent
+            _src = str(_repo_root / "src")
+            if _src not in sys.path:
+                sys.path.insert(0, _src)
+            import outbox_log as _ol
+            _outbox_log = _ol
+        except Exception:
+            pass
+    return _outbox_log
+
 
 def get_auth():
     _require_requests()
@@ -193,6 +213,13 @@ def post_tweet(text, media_id=None, reply_to=None, auth=None):
         data = resp.json()["data"]
         tweet_id = data["id"]
         print(f"Posted! https://x.com/i/status/{tweet_id}")
+        ol = _get_outbox_log()
+        if ol:
+            ol.append(
+                channel_type="x_twitter",
+                recipient="broadcast",
+                body=text,
+            )
         return tweet_id
     else:
         print(f"Error {resp.status_code}: {resp.text}")
