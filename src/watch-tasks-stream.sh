@@ -97,6 +97,14 @@ shopt -u nullglob
 #    rename — including the source path AFTER the file has moved out.
 #    `[ -f "$path" ]` filters those rename-OUT-of-watched-dir events.
 #    Caught 2026-05-03 #1 (PR #572).
+#
+# 3. Cooldown dedup: atomic rename (tmp→file) re-triggers the Renamed
+#    filter, which would re-emit the same TASK_FILE line within milliseconds.
+#    Suppress re-emission of the same basename within a 3s window.
+#    Caught 2026-05-23 #3 (PR #1070).
+LAST_EMIT_BN=""
+LAST_EMIT_SEC=$SECONDS
+
 fswatch \
   -l 0.5 \
   --event Created \
@@ -105,9 +113,15 @@ fswatch \
 | while IFS= read -r path; do
   case "$path" in
     *.txt)
+      bn="$(basename "$path")"
       parent="$(dirname "$path")"
       if [ "$parent" = "$TASKS_DIR_ABS" ] && [ -f "$path" ]; then
-        echo "TASK_FILE: $(basename "$path")"
+        if [ "$bn" = "$LAST_EMIT_BN" ] && [ $(( SECONDS - LAST_EMIT_SEC )) -lt 3 ]; then
+          continue
+        fi
+        echo "TASK_FILE: $bn"
+        LAST_EMIT_BN="$bn"
+        LAST_EMIT_SEC=$SECONDS
       fi
       ;;
   esac
