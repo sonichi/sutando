@@ -1,18 +1,29 @@
 import { describe, it, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { resolveWorkspace } from '../src/workspace_default.js';
-import { workTool } from '../src/task-bridge.js';
+import { tmpdir } from 'node:os';
 
 // Integration test for PR #460's unified task-file schema. Every voice /
 // work-tool task should emit the same set of fields the Discord bridge
 // emits, so downstream consumers (Claude Code session, access-tier
 // sandboxing) can treat all tasks uniformly.
 
-// Task dir is wherever the bridge writes — `resolveWorkspace()/tasks/`. Was
-// `<REPO_ROOT>/tasks/` pre-#821, when the bridge fell back to repo root.
-const TASK_DIR = join(resolveWorkspace(), 'tasks');
+// task-bridge.ts resolves TASK_DIR and OWNER_ACTIVITY_FILE at module-load
+// time from $SUTANDO_WORKSPACE. Point the workspace at a throwaway tmpdir
+// BEFORE importing it — otherwise workTool.execute() writes fixture task
+// files into the *live* workspace tasks/ dir (the stream watcher then emits
+// spurious TASK_FILE events) and overwrites state/last-owner-activity.json
+// with fixture text ("second", "default fallback", …), which the proactive
+// loop's skip-condition (b) misreads as a genuine owner-activity signal.
+// Static `import` is hoisted, so the redirect must precede a dynamic import.
+const PRIOR_WS = process.env.SUTANDO_WORKSPACE;
+const TMP_WS = mkdtempSync(join(tmpdir(), 'sutando-taskfmt-'));
+process.env.SUTANDO_WORKSPACE = TMP_WS;
+
+const { workTool } = await import('../src/task-bridge.js');
+
+const TASK_DIR = join(TMP_WS, 'tasks');
 
 function listTaskFiles(): string[] {
 	if (!existsSync(TASK_DIR)) return [];
@@ -44,6 +55,11 @@ describe('task-bridge workTool — PR #460 unified format', () => {
 		const final = new Set(listTaskFiles());
 		const leaked: string[] = [];
 		for (const f of final) if (!baselineFiles.has(f)) leaked.push(f);
+		// Drop the throwaway workspace and restore the env before asserting,
+		// so a leak-check failure can't strand the tmpdir or the override.
+		rmSync(TMP_WS, { recursive: true, force: true });
+		if (PRIOR_WS === undefined) delete process.env.SUTANDO_WORKSPACE;
+		else process.env.SUTANDO_WORKSPACE = PRIOR_WS;
 		assert.deepEqual(leaked, [], 'test leaked task files: ' + leaked.join(', '));
 	});
 
