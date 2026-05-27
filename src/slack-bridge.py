@@ -178,6 +178,23 @@ def archive_file(src: Path, kind: str, task_id: str) -> None:
             pass
 
 
+def archive_task_by_id(task_id: str) -> None:
+    """Archive any task file for task_id — bare or claimed (.claimed-core-N.txt)."""
+    import glob
+    import shutil
+    from datetime import datetime
+    ym = datetime.now().strftime("%Y-%m")
+    dest_dir = ARCHIVE_TASKS_DIR / ym
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for match in glob.glob(str(TASKS_DIR / f"{task_id}*.txt")):
+        try:
+            shutil.move(match, str(dest_dir / Path(match).name))
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print(f"[Slack] archive_task_by_id({task_id}) failed for {match}: {e}", flush=True)
+
+
 PRESENTER_SENTINEL = REPO / "state" / "presenter-mode.sentinel"
 
 
@@ -618,9 +635,7 @@ def result_watcher():
                         print(f"[Slack] reply error: {e}", flush=True)
 
                 archive_file(result_file, "results", task_id)
-                _tf = find_task_file(TASKS_DIR, task_id)
-                if _tf:
-                    archive_file(_tf, "tasks", task_id)
+                archive_task_by_id(task_id)
 
             # Proactive messages (sent to owner DM)
             if not presenter_mode_active():
