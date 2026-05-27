@@ -125,6 +125,23 @@ const TASK_POLL_INTERVAL_MS = 500;
 const TASK_TIMEOUT_MS = 120_000;
 const OWNER_NAME = process.env.owner ?? '';
 const OWNER_NUMBER = process.env.OWNER_NUMBER ?? '';
+const OWNER_TZ = process.env.OWNER_TZ ?? 'America/Los_Angeles';
+
+// Build a date-context string injected into the system prompt at session-open
+// so Gemini resolves date-relative phrases ("tomorrow", "this Friday") against
+// the owner's local clock, not UTC or server-local. Without this, US-Pacific
+// owners get an off-by-one whenever a call lands after ~5pm PT (UTC midnight
+// rollover): the model says "tomorrow = May 28" when owner-local says May 27.
+// See sonichi/sutando#1243.
+function ownerLocalDateContext(now: Date = new Date()): string {
+	const tz = OWNER_TZ;
+	const today = now.toLocaleDateString('en-CA', { timeZone: tz }); // YYYY-MM-DD
+	const dayName = now.toLocaleDateString('en-US', { timeZone: tz, weekday: 'long' });
+	const timeStr = now.toLocaleTimeString('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit' });
+	const tomorrow = new Date(now.getTime() + 86_400_000).toLocaleDateString('en-CA', { timeZone: tz });
+	const yesterday = new Date(now.getTime() - 86_400_000).toLocaleDateString('en-CA', { timeZone: tz });
+	return `Owner-local time: ${dayName}, ${today}, ${timeStr} (${tz}). Tomorrow = ${tomorrow}. Yesterday = ${yesterday}. When the owner says "today", "tomorrow", "yesterday", "this week", etc., resolve against THESE owner-local dates — never against UTC or server-local time. Pass absolute YYYY-MM-DD values to tools (not relative phrases).`;
+}
 
 // Model configuration — text/STT model still env-driven; the native-audio
 // model + googleSearch grounding are per-user config: data, not code, so they
@@ -517,6 +534,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 				'',
 				'## Known info',
 				(() => { try { const url = execSync('git remote get-url origin', { timeout: 2_000 }).toString().trim().replace(/\.git$/, ''); return `Sutando GitHub repo: ${url}`; } catch { return ''; } })(),
+				ownerLocalDateContext(),
 				'',
 				'## Style',
 				'Be natural, warm, and conversational. Keep responses to 1-2 sentences.',
