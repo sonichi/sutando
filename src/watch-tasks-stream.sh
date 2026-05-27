@@ -63,11 +63,27 @@ else
 fi
 mkdir -p "$STATE_DIR"
 PID_FILE="$STATE_DIR/watch-tasks-stream.pid"
-echo "$$" > "$PID_FILE"
-# Cleanup on any exit path (SIGINT, SIGTERM, normal exit) so the file
-# doesn't outlive the process on a clean shutdown. Dirty exits (SIGKILL,
-# panic) skip the trap — the Stop hook + startup reaper cover those.
-trap 'rm -f "$PID_FILE"' EXIT
+# PID file tracks fswatch itself (not this bash wrapper) so Stop hook /
+# startup reaper kill fswatch directly. When fswatch exits, the while-read
+# loop sees EOF on the FIFO and exits cleanly without requiring a second kill.
+# (The old design stored $$, leaving fswatch as an orphan after the wrapper
+# died — Mode B from issue #1088.)
+_FIFO="$(mktemp -u "${TMPDIR:-/tmp}/watch-tasks-XXXXXX")"
+mkfifo "$_FIFO"
+
+fswatch \
+  -l 0.5 \
+  --event Created \
+  --event Renamed \
+  "$TASKS_DIR" 2>/dev/null \
+> "$_FIFO" &
+FSWATCH_PID=$!
+
+echo "$FSWATCH_PID" > "$PID_FILE"
+# Cleanup: kill fswatch, remove PID file and FIFO. Fires on SIGINT/SIGTERM
+# and on normal exit. SIGKILL skips the trap — Stop hook / startup reaper
+# read the PID file and kill fswatch on the next session start.
+trap 'kill "$FSWATCH_PID" 2>/dev/null; rm -f "$PID_FILE" "$_FIFO"' EXIT INT TERM
 
 # Initial sweep — surface any pre-existing tasks that arrived during a
 # restart gap.
@@ -77,38 +93,30 @@ for f in "$TASKS_DIR"/*.txt; do
 done
 shopt -u nullglob
 
-# Stream subsequent events. -l 0.5 = 500ms latency batch (fswatch coalesces
-# burst events). --event Created --event Renamed catches new file
-# appearance whether it lands as a fresh write or a rename-into-place.
+# Read fswatch events from the FIFO. Two filters applied before emit:
 #
-# TWO filters before emit:
+# 1. Parent-dir match: macOS FSEvents is recursive even without -r; a
+#    rename from tasks/X.txt → tasks/archive/.../X.txt fires events for
+#    BOTH paths. We only want direct children of $TASKS_DIR. (PR #572 #2)
 #
-# 1. Parent-dir match: the macOS FSEvents monitor (fswatch's default) is
-#    recursive even without `-r`, so a rename from `tasks/X.txt` to
-#    `tasks/archive/.../X.txt` fires events for BOTH the source AND the
-#    destination — and the destination path is in a subdir we don't care
-#    about. We only want events for files that landed AS A DIRECT CHILD
-#    of $TASKS_DIR. `dirname "$path"` against the absolute watched dir
-#    catches this. Caught 2026-05-03 #2: archives in tasks/archive/2026-05/
-#    were re-firing TASK_FILE: <name> with a different path but the same
-#    basename, making the agent re-process every just-archived task.
+# 2. Existence check: fswatch fires Renamed on both source AND dest; the
+#    source event arrives AFTER the file has moved out, so -f skips it.
+#    (PR #572 #1)
 #
-# 2. Existence check: fswatch fires Renamed events on BOTH ends of a
-#    rename — including the source path AFTER the file has moved out.
-#    `[ -f "$path" ]` filters those rename-OUT-of-watched-dir events.
-#    Caught 2026-05-03 #1 (PR #572).
-fswatch \
-  -l 0.5 \
-  --event Created \
-  --event Renamed \
-  "$TASKS_DIR" 2>/dev/null \
-| while IFS= read -r path; do
+# Mode A fix (issue #1088): printf || exit 0 dies on EPIPE immediately
+# instead of buffering ~64KB (~100 events) before detecting the dead reader.
+# The old `echo` silently queued events into the kernel pipe buffer; real
+# DM traffic (few events/day) meant the buffer took days to fill, so events
+# arrived on disk but the agent never received TASK_FILE notifications.
+while IFS= read -r path; do
   case "$path" in
     *.txt)
       parent="$(dirname "$path")"
       if [ "$parent" = "$TASKS_DIR_ABS" ] && [ -f "$path" ]; then
-        echo "TASK_FILE: $(basename "$path")"
+        printf 'TASK_FILE: %s\n' "$(basename "$path")" || exit 0
       fi
       ;;
   esac
-done
+done < "$_FIFO"
+
+wait "$FSWATCH_PID" 2>/dev/null
