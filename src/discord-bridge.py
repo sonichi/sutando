@@ -2529,10 +2529,9 @@ async def _handle_discord_message(message, force=False):
 
     # Determine access tier
     access_tier = "other"
+    is_bot_sender = bool(getattr(message.author, "bot", False))
     if sender_id in allowed:
         access_tier = "owner"
-        # Record owner activity for status-aware-pivot in proactive loop
-        write_owner_activity("discord", text)
     else:
         # Check if team member (from channel allowlists)
         try:
@@ -2545,6 +2544,23 @@ async def _handle_discord_message(message, force=False):
                 access_tier = "team"
         except:
             pass
+
+    # Defensive filter: cross-fleet bot accounts that landed in `allowFrom`
+    # (intentionally or by accident) should never run with owner-tier — they
+    # can only ever speak as peers in shared channels. Per #ep013 2026-05-27
+    # bot-flood post-mortem (Mini + qingyun-sutando coord): Mini's bot
+    # user_id was added to MacBook's Discord global allowFrom, so his
+    # 22-task orphan-recovery flood arrived as owner-tier (full
+    # capabilities) instead of team-tier (sandboxed). Bridge-side
+    # downgrade prevents recurrence regardless of allowFrom hygiene.
+    if is_bot_sender and access_tier == "owner":
+        print(f"  [bot-sender-downgrade] @{username} (id={sender_id}) is a bot in allowFrom; downgrading owner→team")
+        access_tier = "team"
+
+    # Record owner activity AFTER the bot-downgrade so bot pings can't
+    # falsely trigger status-aware-pivot's "owner is active" branch.
+    if access_tier == "owner":
+        write_owner_activity("discord", text)
 
     # Dedup: skip if we've already processed this Discord message ID.
     # EXCEPTION: force=True means on_message_edit is reprocessing because the
