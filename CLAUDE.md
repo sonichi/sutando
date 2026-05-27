@@ -153,6 +153,22 @@ To allow additional senders after onboarding: add their numeric Telegram user ID
 
 Telegram tasks include an `access_tier` field set by the bridge (same tiers as Discord).
 
+## Slack access control
+
+Slack tasks include an `access_tier` field set by the bridge:
+- **owner**: Full access — process normally with all capabilities.
+- **team**: Delegate to sandboxed agent (`codex exec --sandbox read-only`). No system mutations.
+- **other**: Delegate to sandboxed agent. Information only — answer questions about Sutando.
+
+Tier resolution uses `tierMap` in `~/.claude/channels/slack/access.json`:
+- `tierMap` absent → every `allowFrom` user defaults to `"owner"` (preserves pre-tierMap behavior).
+- `tierMap` present, uid missing → degrades to `"other"` (fail-safe — prevents silent escalation when operator forgets to add a tierMap line).
+- `tierMap` present, uid present → use the mapped tier.
+
+Non-owner tasks are processed via the sandboxed path — never with full core agent capabilities.
+
+**In-band enforcement** matches Discord: non-owner task files include a `===SUTANDO SYSTEM INSTRUCTIONS===` block injected by the bridge. Follow those instructions verbatim; they specify the exact `codex exec --sandbox read-only` command and constrain what you're allowed to do with the result.
+
 ## Discord access control
 
 Discord tasks include an `access_tier` field set by the bridge:
