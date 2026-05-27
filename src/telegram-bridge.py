@@ -100,7 +100,8 @@ if channels_env.exists():
             # the literal `"abc"` (with quotes) in os.environ; the
             # Telegram REST URL becomes
             # `https://api.telegram.org/bot"abc"/getUpdates` and Telegram
-            # returns 404. Quoted .env values are a common convention.
+            # rejects with 404. Quoted .env values are a common
+            # convention.
             if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
                 v = v[1:-1]
             os.environ[k.strip()] = v
