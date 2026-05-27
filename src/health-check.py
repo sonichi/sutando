@@ -1327,36 +1327,41 @@ def main():
                     result = fix_launchd(c["name"])
                     print(f"  {c['name']}: {result}")
                 elif c["name"] in ("telegram-bridge", "discord-bridge"):
-                    # If stale (process older than source code), kill old PID first
-                    # so the new process doesn't conflict with a still-running zombie.
-                    if c["status"] == "stale":
-                        try:
-                            # Anchor to `\.py$` to match the detect path at
-                            # line ~277. Without this, a bare `pgrep -f
-                            # discord-bridge` also catches grep pipelines
-                            # and shell invocations whose command line
-                            # contains the bridge name, and we'd kill them
-                            # instead of (or in addition to) the real
-                            # bridge process. PR #243 fixed the detect
-                            # side; this keeps the kill side consistent.
-                            old_pids = subprocess.run(
-                                ["/usr/bin/pgrep", "-f", f"{c['name']}\\.py$"], capture_output=True, text=True
-                            ).stdout.strip().split("\n")
-                            for pid in old_pids:
-                                if pid:
-                                    subprocess.run(["/bin/kill", pid], check=False)
-                            import time as _t; _t.sleep(1)
-                        except Exception:
-                            pass
-                    # Use sys.executable to avoid launchd's minimal PATH
-                    # resolving `python3` to /usr/bin/python3 (3.9), which
-                    # doesn't have the homebrew site-packages (discord,
-                    # dotenv, etc.) — restart would crash on import.
-                    # Log path uses logs/ (post-PR #251 refactor).
-                    subprocess.Popen([sys.executable, str(REPO_DIR / "src" / f"{c['name']}.py")],
-                                     stdout=open(str(WORKSPACE_DIR / "logs" / f"{c['name']}.log"), "a"),
-                                     stderr=subprocess.STDOUT, start_new_session=True)
-                    print(f"  {c['name']}: {'restarted (stale code)' if c['status'] == 'stale' else 'restarted'}")
+                    # LoginFailure means the token is bad — restarting won't help
+                    # and would create a duplicate alongside the launchd-managed one.
+                    if "LoginFailure" in c.get("detail", "") or "token invalid" in c.get("detail", ""):
+                        print(f"  {c['name']}: token invalid — regenerate at discord.com/developers/applications (no restart)")
+                    else:
+                        # If stale (process older than source code), kill old PID first
+                        # so the new process doesn't conflict with a still-running zombie.
+                        if c["status"] == "stale":
+                            try:
+                                # Anchor to `\.py$` to match the detect path at
+                                # line ~277. Without this, a bare `pgrep -f
+                                # discord-bridge` also catches grep pipelines
+                                # and shell invocations whose command line
+                                # contains the bridge name, and we'd kill them
+                                # instead of (or in addition to) the real
+                                # bridge process. PR #243 fixed the detect
+                                # side; this keeps the kill side consistent.
+                                old_pids = subprocess.run(
+                                    ["/usr/bin/pgrep", "-f", f"{c['name']}\\.py$"], capture_output=True, text=True
+                                ).stdout.strip().split("\n")
+                                for pid in old_pids:
+                                    if pid:
+                                        subprocess.run(["/bin/kill", pid], check=False)
+                                import time as _t; _t.sleep(1)
+                            except Exception:
+                                pass
+                        # Use sys.executable to avoid launchd's minimal PATH
+                        # resolving `python3` to /usr/bin/python3 (3.9), which
+                        # doesn't have the homebrew site-packages (discord,
+                        # dotenv, etc.) — restart would crash on import.
+                        # Log path uses logs/ (post-PR #251 refactor).
+                        subprocess.Popen([sys.executable, str(REPO_DIR / "src" / f"{c['name']}.py")],
+                                         stdout=open(str(WORKSPACE_DIR / "logs" / f"{c['name']}.log"), "a"),
+                                         stderr=subprocess.STDOUT, start_new_session=True)
+                        print(f"  {c['name']}: {'restarted (stale code)' if c['status'] == 'stale' else 'restarted'}")
                 elif c["name"] == "sutando-app":
                     # Stale here means main.swift is newer than the binary's
                     # process start time. The bare Popen below was leaking
