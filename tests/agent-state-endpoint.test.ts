@@ -73,6 +73,13 @@ describe('/sse-status + /mute-state — agent state plumbing (PR #418)', () => {
 				// 'ignore' prevents the pipe buffer from filling in CI (stdout isn't drained),
 				// which would block the child and cause the /sse-status poll to time out.
 				stdio: 'ignore',
+				// detached: true creates a new process group for the entire subtree
+				// (npm → tsx → node). Without this, child.kill() only kills the npm
+				// wrapper — tsx and the actual node web-client survive, keeping the
+				// port bound and corrupting the next test run (observed: stale PID
+				// with deleted workspace → core-status ENOENT → stale:true → tmux
+				// scrape sees sutando-core active → every test gets state:'working').
+				detached: true,
 			}
 		);
 		// Wait up to 20s for server to start listening. CI cold-start on `npx tsx`
@@ -89,17 +96,20 @@ describe('/sse-status + /mute-state — agent state plumbing (PR #418)', () => {
 	});
 
 	after(async () => {
-		// Hang-safe teardown: SIGTERM, wait up to 2s, SIGKILL fallback. Without
-		// awaiting exit, the live child-process handle keeps node --test alive
-		// past the CI job timeout (observed: 9m43s hangs after #423 merged).
-		if (child && !child.killed) {
+		// Hang-safe teardown: SIGTERM the process GROUP, wait up to 2s, SIGKILL
+		// group fallback. Without group-kill, only the npm wrapper exits and the
+		// tsx/node children keep the port bound — causing the next test run to
+		// silently connect to a stale server (see detached: true comment above).
+		// Without awaiting exit, the live child-process handle keeps node --test
+		// alive past the CI job timeout (observed: 9m43s hangs after #423 merged).
+		if (child?.pid && !child.killed) {
 			await new Promise<void>((resolve) => {
 				const hardKill = setTimeout(() => {
-					try { child.kill('SIGKILL'); } catch { /* already dead */ }
+					try { process.kill(-child.pid!, 'SIGKILL'); } catch { /* already dead */ }
 					resolve();
 				}, 2_000);
 				child.once('exit', () => { clearTimeout(hardKill); resolve(); });
-				child.kill('SIGTERM');
+				try { process.kill(-child.pid!, 'SIGTERM'); } catch { resolve(); }
 			});
 		}
 		// Remove the per-test-process workspace temp dir wholesale.
