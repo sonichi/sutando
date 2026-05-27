@@ -971,6 +971,27 @@ def run_all_checks() -> list[dict]:
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             pass
 
+        # Check 6: Log-content health for known failure modes.
+        # discord-bridge: LoginFailure means the token is revoked/invalid.
+        #   Always overrides — there is no point restarting with stale code
+        #   if the token is bad; the token fix is the only path forward.
+        # slack-bridge: "60s elapsed" hint means Socket Mode connected but
+        #   events aren't routing (Slack app Event Subscriptions disabled).
+        #   Only overrides "ok" — stale/dead-inode are higher priority.
+        if log_file.exists() and name in ("discord-bridge", "slack-bridge"):
+            try:
+                tail = log_file.read_text(errors="replace").splitlines()[-60:]
+                if name == "discord-bridge":
+                    if any("LoginFailure" in ln or "Improper token" in ln for ln in tail):
+                        status = "fail"
+                        detail = "token invalid (LoginFailure) — regenerate at discord.com/developers/applications"
+                elif name == "slack-bridge" and status == "ok":
+                    if any("60s elapsed with zero events" in ln for ln in tail):
+                        status = "warn"
+                        detail = "connected but events not arriving — enable Event Subscriptions at api.slack.com/apps"
+            except OSError:
+                pass
+
         checks.append({"name": name, "status": status, "detail": detail})
 
     # Discord voice server — on-demand process (launched per voice session,
