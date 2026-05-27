@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Tests for the SUTANDO_PRIVATE_DIR -> SUTANDO_MEMORY_DIR rename (#870).
+"""Tests for the SUTANDO_PRIVATE_DIR -> SUTANDO_MEMORY_DIR rename (#870)
+and the SUTANDO_HOST_LABEL stable-identity override (#871).
 
 Verifies:
   1. SUTANDO_MEMORY_DIR is honored as the canonical env var.
@@ -7,6 +8,9 @@ Verifies:
   3. SUTANDO_MEMORY_DIR wins when both are set.
   4. A deprecation warning is emitted on every read of the legacy alias.
   5. Neither set -> None (no warning).
+  6. SUTANDO_HOST_LABEL overrides hostname() in _private_machine_dir().
+  7. host_label() returns SUTANDO_HOST_LABEL when set.
+  8. host_label() falls back to hostname short-form when unset.
 
 Run: python3 tests/util-paths-memory-dir.test.py
 Exit: 0 on pass, 1 on fail.
@@ -26,12 +30,13 @@ sys.path.insert(0, str(ROOT / "src"))
 from util_paths import (  # noqa: E402
     _memory_dir_env,
     _private_machine_dir,
+    host_label,
     shared_personal_path,
 )
 
 
 def clear_env():
-    for k in ("SUTANDO_MEMORY_DIR", "SUTANDO_PRIVATE_DIR"):
+    for k in ("SUTANDO_MEMORY_DIR", "SUTANDO_PRIVATE_DIR", "SUTANDO_HOST_LABEL"):
         os.environ.pop(k, None)
 
 
@@ -129,6 +134,51 @@ class SharedPersonalPathTests(unittest.TestCase):
         with redirect_stderr(io.StringIO()):
             p = shared_personal_path("MEMORY.md", workspace=Path("/tmp/ws"))
         self.assertEqual(p, Path("/tmp/legacy-mem/MEMORY.md"))
+
+
+class HostLabelTests(unittest.TestCase):
+    """SUTANDO_HOST_LABEL stable-identity override (#871)."""
+
+    def setUp(self):
+        clear_env()
+        import importlib
+        import util_paths as _up
+        importlib.reload(_up)
+
+    def tearDown(self):
+        clear_env()
+        import importlib
+        import util_paths as _up
+        importlib.reload(_up)
+
+    def test_host_label_default_is_hostname(self):
+        expected = socket.gethostname().split(".")[0]
+        self.assertEqual(host_label(), expected)
+
+    def test_host_label_env_override(self):
+        os.environ["SUTANDO_HOST_LABEL"] = "my-stable-mac"
+        import importlib
+        import util_paths as _up
+        importlib.reload(_up)
+        self.assertEqual(_up.host_label(), "my-stable-mac")
+
+    def test_private_machine_dir_uses_host_label(self):
+        os.environ["SUTANDO_MEMORY_DIR"] = "/tmp/memdir"
+        os.environ["SUTANDO_HOST_LABEL"] = "lab-mini"
+        import importlib
+        import util_paths as _up
+        importlib.reload(_up)
+        with redirect_stderr(io.StringIO()):
+            p = _up._private_machine_dir()
+        self.assertEqual(p, Path("/tmp/memdir/machine-lab-mini"))
+
+    def test_private_machine_dir_default_hostname_unchanged(self):
+        os.environ["SUTANDO_MEMORY_DIR"] = "/tmp/memdir"
+        # No SUTANDO_HOST_LABEL set — should use actual hostname
+        host = socket.gethostname().split(".")[0]
+        with redirect_stderr(io.StringIO()):
+            p = _private_machine_dir()
+        self.assertEqual(p, Path(f"/tmp/memdir/machine-{host}"))
 
 
 if __name__ == "__main__":
