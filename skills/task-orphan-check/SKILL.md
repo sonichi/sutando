@@ -37,7 +37,7 @@ If no live tasks, emit "orphan-check: no live tasks, nothing to recover" and idl
 
 For each file in `tasks/`, let `<id>` be the value of the `id:` header line (e.g. `task-1779570142563`). The file is `tasks/<id>.txt`. Per-task paths below use `<id>` consistently — note `<id>` already includes the `task-` prefix; do NOT add it again.
 
-1. **Parse the header** — extract `id`, `timestamp`, `source`, `channel_id` (if Discord), `user_id`.
+1. **Parse the header** — extract `id`, `timestamp`, `source`, `channel_id` (if Discord), `user_id`, `access_tier` (`owner` / `team` / `other`; default to `owner` if the field is absent — pre-tier task files predate the field and were authored by the owner).
 
 2. **Cross-reference completion markers** (any single match = task already completed):
    - **`<workspace>/results/<id>.txt`** exists → **DONE**. The result file is the canonical completion marker; if it exists the task was processed.
@@ -61,22 +61,49 @@ For each file in `tasks/`, let `<id>` be the value of the `id:` header line (e.g
    - **FRESH** → leave alone. Log: `fresh: arrived <N>s ago, watcher will handle`.
    - **ORPHAN** → write a recovery result: see step 3.
 
-### Step 3 — Recover orphan tasks
+### Step 3 — Recover orphan tasks (tier-aware)
 
-For each ORPHAN task, write a sentinel result so the bridge delivers a "needs review" note to the original sender, then archive the task file:
+ORPHAN handling depends on `access_tier` and `source` because the right "surface to operator" varies by who's listening and where. The flat per-task sentinel that v0.1.1 used was the wrong default for high-volume team-tier orphans whose conversation threads had moved on — see `feedback_orphan_check_tier_classify_before_sentinel` for the 2026-05-26 post-mortem (22-message blast across 5 channels, 13 of them into one active episode thread).
 
-```
-<workspace>/results/<id>.txt:
+**Decision table — apply per orphan, first match wins:**
 
-Orphan recovery: this task arrived <N>m ago and was not completed before the previous session ended.
+| `source` | `access_tier` | Action |
+|----------|---------------|--------|
+| `voice` / `phone` (any tier) | any | **Silent archive.** Text recovery to a voice/phone surface is the wrong shape; the conversation has hung up or moved on. `mv tasks/<id>.txt tasks/archive/<id>.txt`. No result write. Log: `archived-silent: voice/phone source`. |
+| any | `team` / `other` (any non-`owner`) | **`[no-send]` archive.** The peer/team thread continued without us; a 90-min-late "Orphan recovery" note is clutter. Write `printf '[no-send]\n' > results/<id>.txt`; the bridge archives on that marker without delivering anything. Log: `archived-no-send: <tier> tier`. |
+| `discord` / `telegram` / `slack` / `chat` / unknown | `owner` | **Defer; aggregate in step 3b.** Append `<id>` to an in-pass `owner_orphans` list. Do NOT write a per-task result. Do NOT archive yet — leave the task file in `tasks/` so step 3b consumes it. Log: `deferred-owner: queued for consolidated DM`. |
 
-Original task body preserved below — review before re-queuing if it has non-idempotent side effects (DM sent, file written, API call). To re-queue: move from tasks/archive/<id>.txt back to tasks/<id>.txt.
+#### Step 3b — Aggregate owner-tier orphans into ONE proactive DM
 
----
-<original task body verbatim>
-```
+Run once at the end of the orphan pass, after every orphan has been classified by the table above. If `owner_orphans` is empty, skip.
 
-Then `mv tasks/<id>.txt tasks/archive/<id>.txt`. The bridge reads the result + delivers the recovery note + archives. Log: `recovered: stuck for <N>m, sentinel result written`.
+Otherwise:
+
+1. `ts=$(date +%s)`. Group `owner_orphans` by `channel_name`; compute per-channel counts.
+2. Write `<workspace>/results/proactive-orphan-recovery-${ts}.txt`:
+
+   ```
+   Orphan recovery — N stale owner-tier tasks from a prior session (oldest <Nm>, newest <Nm>, no completion markers).
+
+   By channel: <ch1> (<x>), <ch2> (<y>), DM (<z>), ...
+
+   Previews (most-recent first, first ~100 chars of `task:` body):
+   - task-<id> [<channel>, <Nm ago>]: <preview>
+   - ...
+
+   To re-queue an individual task: `mv $SUTANDO_WORKSPACE/tasks/archive/task-<id>.txt $SUTANDO_WORKSPACE/tasks/`
+   If none still matter: no action needed — they're already archived.
+   ```
+
+3. For each `<id>` in `owner_orphans`: `mv tasks/<id>.txt tasks/archive/<id>.txt`.
+
+The bridge routes `proactive-*` to the owner's DM (single delivery), not back to each origin channel. Log: `aggregated-owner: <N> orphans → 1 proactive DM`.
+
+#### Step 3c — Bomb-guard (defense in depth)
+
+After step 3 + 3b, tally result-writes-by-channel (count only deliveries, i.e. excluding `[no-send]` and the single aggregated proactive DM, both of which produce no per-channel post). If any single `channel_id` would still receive >5 deliveries this pass — possible if e.g. >5 voice/phone orphans existed and a future tier ever bypasses the silent-archive rule — collapse them into ONE summary post per channel by replacing those result files with a single channel-scoped sentinel.
+
+Today the table above leaves zero per-channel posts (voice silent, team `[no-send]`, owner aggregated), so the guard is a no-op in normal operation. It exists so the next person who adds a 4th branch can't accidentally re-create the v0.1.1 noise-bomb.
 
 ### Step 4 — Sanity check archive directory
 
@@ -154,3 +181,4 @@ If the workload grows or we want deterministic testing, a `scripts/orphan-check.
 
 - v0.1.0 — 2026-05-23 — initial draft. Per Chi 2026-05-23 Discord exchange about #1049 redesign ("simply ask the agent to check when starting"). Designed to be invoked from `/startup` step 2 (PR #1072). Standalone-callable for manual recovery. Replaces the attempts-counter approach (#1049 + #1066's followup) with a startup-time classification using existing side-effect markers (#1048's `.sending` files + result-file presence). No bumper, no in-band writes, no self-trigger loop.
 - v0.1.1 — 2026-05-23 — qingyun-sutando review pass. **(1)** Fixed `<id>` ambiguity — `<id>` is the value of the `id:` header (already includes `task-` prefix); paths are `results/<id>.txt` NOT `results/task-<id>.txt` (the prior wording double-prefixed and would have misclassified every completed-but-unarchived task as ORPHAN → spurious recovery notes). **(2)** Age now derives from immutable header `timestamp:` / `task-<epoch-ms>` id, NOT file mtime (mtime resets on rsync / `git checkout` / `touch` / workspace sync, making old orphans look FRESH → re-fire). **(3)** Clarified `.sending` contract via new step 2b: `<id>.txt` (no suffix) = DONE, `<id>.txt.sending` = bridge mid-delivery (treat as DONE; bridge owns its own crash recovery via #1046/#1048's startup sweep). **(4)** Named the <5min residual hole explicitly under its own section, with prioritized coverage list (voice / phone / Telegram + generic API). **(5)** Noted "promote to scripts/orphan-check.py" trigger.
+- v0.1.2 — 2026-05-26 — tier-aware orphan recovery. Step 2.1 now parses `access_tier:` (default `owner` for legacy task files lacking the field). Step 3 rewritten as a decision table branching on `source` + `access_tier`: voice/phone → silent archive; team/other → `[no-send]` archive; owner discord/telegram/slack/chat → defer to new step 3b (consolidated proactive DM aggregating all owner-tier orphans this pass into ONE `proactive-orphan-recovery-<ts>.txt` instead of N per-channel sentinels). New step 3c bomb-guard collapses any future >5-deliveries-to-one-channel into a single summary post (no-op today; defense for future branch additions). Triggered by 2026-05-26 noise-bomb post-mortem (`feedback_orphan_check_tier_classify_before_sentinel`): v0.1.1 sentinel-blasted 22 stale tasks across #ep013 (13), #talk (4), voice channels (4), and DM (1) — wrong default for high-volume team-tier orphans whose threads had moved on, and wrong shape (N per-channel posts) for owner-tier ones. Sibling work on cross-fleet bridges (qingyun-sutando MacBook branch) adds defensive bot-user_id tier-filter so peer bots' stale tasks don't tier as `owner` via allowFrom inheritance — that's the upstream cause of the same skill running on a sibling fleet seeing 21/22 of one fleet's orphans as `owner` rather than `team`.
