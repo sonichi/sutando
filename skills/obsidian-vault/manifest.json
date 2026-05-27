@@ -1,0 +1,7 @@
+{
+  "name": "obsidian-vault",
+  "enabled": true,
+  "access_tier": "owner",
+  "description": "Mirror Sutando workspace into an Obsidian vault. Adds add_to_vault and run_dream voice tools.",
+  "tools": "./tools.ts"
+}

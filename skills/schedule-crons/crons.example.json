@@ -37,6 +37,8 @@
   {
     "name": "proactive-notify-runner",
     "cron": "*/3 * * * *",
-    "prompt": "Run python3 skills/proactive-notify/scripts/runner.py --once to fire any due Pings to the owner. Default is dry-run; pass --live to deliver."
-  }
+    "prompt": "Run python3 skills/proactive-notify/scripts/runner.py --once to fire any due Pings to the owner. Default is dry-run; pass --live to deliver.",
+      "name": "obsidian-dream",
+    "cron": "37 3 * * *",
+    "prompt": "Run python3 skills/obsidian-vault/scripts/dream.py to perform nightly LLM cross-linking of Obsidian vault notes. Requires SUTANDO_OBSIDIAN_MIRROR=1 or passes --force."  }
 ]
