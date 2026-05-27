@@ -14,7 +14,7 @@ import { join } from 'node:path';
 //
 // Adjacent code already had the right escape pattern:
 //   - line ~161 escapes the `key` parameter as `safeKey`
-//   - switchAppTool escapes its `app` as `safeApp`
+//   - switchAppTool around line ~214 escapes its `app` as `safeApp`
 //
 // Only `pressKeyTool.execute`'s app-activation branch was missing the
 // escape. Pin the fix so a future refactor that re-introduces the raw
@@ -27,6 +27,9 @@ const SRC = readFileSync(
 
 describe('inline-tools pressKey app activation — AppleScript injection guard', () => {
 	it('does not interpolate raw `app` into the osascript tell-application command', () => {
+		// The raw pattern is `tell application "${app}"` (no escape pass).
+		// The fixed pattern uses `safeApp` after a 3-step strip
+		// (backslash, single quote, double quote).
 		assert.doesNotMatch(
 			SRC,
 			/tell application "\$\{app\}" to activate/,
@@ -37,6 +40,10 @@ describe('inline-tools pressKey app activation — AppleScript injection guard',
 	});
 
 	it('uses safeApp (escaped) in the pressKey app-activation branch', () => {
+		// The fixed branch should embed `safeApp`, not `app`, in the
+		// tell-application command. We don't pin the exact escape lines
+		// (those are widely-used in this file) — we pin that the
+		// pressKey branch references safeApp.
 		const pressKeyBranch = SRC.match(/pressKeyTool[\s\S]*?Activate target app[\s\S]{0,500}/);
 		assert(pressKeyBranch, 'could not locate pressKeyTool app-activation branch');
 		assert.match(
@@ -48,11 +55,17 @@ describe('inline-tools pressKey app activation — AppleScript injection guard',
 	});
 
 	it('the escape pattern is computed from app via .replace chain', () => {
+		// Defensive: a partial escape (e.g. only single-quote) would
+		// still allow `"` injection — exactly what happened pre-fix.
+		// We pin that `safeApp` is computed via `app.replace(...)` and
+		// includes a strip for `"` (the actual exploit vector here).
 		assert.match(
 			SRC,
 			/safeApp\s*=\s*app\.replace\([\s\S]+?\.replace\([\s\S]+?\.replace\(/,
 			'safeApp must chain at least 3 .replace() calls (backslash, single-quote, double-quote) — see switchAppTool for canonical pattern',
 		);
+		// And that the chain ends with a strip for `"` (`\\"` in the
+		// regex matches the literal characters `\` then `"`).
 		assert.match(
 			SRC,
 			/safeApp[\s\S]+?\.replace\(\/"\/g,\s*'\\\\"'\)/,
@@ -61,6 +74,8 @@ describe('inline-tools pressKey app activation — AppleScript injection guard',
 	});
 
 	it('canonical escape pattern still in use in switchAppTool', () => {
+		// Reference assertion — pins that the canonical pattern hasn't
+		// been silently changed elsewhere; pressKey now matches it.
 		assert.match(SRC, /switchAppTool[\s\S]+?safeApp\s*=\s*app/);
 	});
 });
