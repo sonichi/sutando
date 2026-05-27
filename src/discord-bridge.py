@@ -367,8 +367,14 @@ def find_task_file(tasks_dir: "Path", task_id: str):
 def archive_file(src: "Path", kind: str, task_id: str) -> None:
     """Move src into the archive. Silent on failure — archive is for later
     analysis, not critical path. Chi's 2026-04-18 ask: "instead of deleting
-    we should archive the tasks. It can be useful for self-improving"."""
+    we should archive the tasks. It can be useful for self-improving".
+    For tasks, also handles .claimed-core-N.txt renamed variants (issue #933)."""
     try:
+        if not src.exists() and kind == "tasks":
+            # claim_task may have renamed task-{id}.txt to task-{id}.claimed-core-N.txt
+            claimed = sorted(src.parent.glob(f"{task_id}*.txt"))
+            if claimed:
+                src = claimed[0]
         if src.exists():
             import shutil
             shutil.move(str(src), str(archive_path(kind, task_id)))

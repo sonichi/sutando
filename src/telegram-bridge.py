@@ -189,11 +189,18 @@ def find_task_file(tasks_dir: "Path", task_id: str):
 
 def archive_file(src: "Path", kind: str, task_id: str) -> None:
     """Move src into archive/<tasks|results>/YYYY-MM/ instead of deleting.
+    For tasks, also handles .claimed-core-N.txt renamed variants (issue #933).
     Silent on failure. Chi's ask 2026-04-18: archive tasks + results for
     later pattern-mining / self-improvement analysis."""
     try:
         if not src.exists():
-            return
+            if kind != "tasks":
+                return
+            # claim_task may have renamed task-{id}.txt to task-{id}.claimed-core-N.txt
+            claimed = sorted(src.parent.glob(f"{task_id}*.txt"))
+            if not claimed:
+                return
+            src = claimed[0]
         from datetime import datetime
         import shutil
         ym = datetime.now().strftime("%Y-%m")
