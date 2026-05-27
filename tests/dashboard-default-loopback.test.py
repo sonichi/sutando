@@ -23,7 +23,9 @@ big warning so they remember the dashboard has no auth.
 
 This test is source-grep + architectural assertion. We don't bind a
 real server in the test (would conflict with a running dashboard on
-the same machine) — we verify the source has the right shape.
+the same machine) — we verify the source has the right shape so a
+future refactor that drops the default-loopback or the LAN-warning
+fails here.
 """
 
 import re
@@ -35,7 +37,12 @@ SRC = (REPO / "src" / "dashboard.py").read_text()
 
 
 def test_default_bind_is_loopback_not_zero_zero():
-    """The bare `0.0.0.0` bind that pre-fix existed must be gone."""
+    """The bare `0.0.0.0` bind that pre-fix existed at the bottom of
+    dashboard.py must be gone. A grep for it in the `if __name__ ==
+    "__main__":` block catches a future refactor that flips the
+    default back to LAN."""
+    # The literal `("0.0.0.0", PORT)` shape (or any 0.0.0.0 with PORT
+    # in the HTTPServer constructor) is what we don't want.
     bad = re.search(r'HTTPServer\(\s*\(\s*["\']0\.0\.0\.0["\']\s*,', SRC)
     assert bad is None, (
         "dashboard.py binds to 0.0.0.0 unconditionally — the dashboard "
@@ -53,19 +60,24 @@ def test_uses_dashboard_bind_env_with_loopback_default():
         SRC,
     ), (
         "dashboard.py must read the bind address from DASHBOARD_BIND with "
-        "a default of 127.0.0.1."
+        "a default of 127.0.0.1. Either the env var name changed or the "
+        "default changed away from loopback."
     )
 
 
 def test_warns_when_lan_exposure_is_enabled():
-    """LAN-bind warning must remain so the auth gap is visible."""
+    """If the user opts into LAN exposure (DASHBOARD_BIND != 127.0.0.1),
+    the startup banner must surface the warning that the dashboard has
+    no auth. Catches a refactor that drops the warning."""
     assert re.search(r"if\s+bind\s*!=\s*['\"]127\.0\.0\.1['\"]", SRC), (
         "dashboard.py must include `if bind != \"127.0.0.1\":` to surface "
-        "the LAN-exposure warning."
+        "the LAN-exposure warning. The warning is the only signal the "
+        "operator gets that the dashboard has no auth — silently "
+        "binding to LAN is the bug we're fixing."
     )
     assert "NO authentication" in SRC, (
         "dashboard.py must include the explicit 'NO authentication' "
-        "string in the LAN-bind warning."
+        "string in the LAN-bind warning so it can't be overlooked."
     )
 
 
