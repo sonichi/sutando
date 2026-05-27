@@ -419,19 +419,10 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 			// Cache result so duplicate requests get instant replay
 			if (!callSession.taskResultCache) callSession.taskResultCache = new Map();
 			callSession.taskResultCache.set(taskDescription, result);
-			// Anti-hallucination wrapping. See sonichi/sutando#1244 — Gemini
-			// was filling silence with plausible-sounding fabrications when
-			// the work tool returned empty/sparse content. Two layers:
-			// (1) a RESULT_EMPTY sentinel on truly-empty results so the model
-			// has an explicit "say nothing" signal instead of an empty string
-			// it can pattern-fill; (2) an explicit "items present verbatim"
-			// guardrail on every result.
-			const isEmpty = result.length === 0;
-			const injectedText = isEmpty
-				? `[Task result for "${taskDescription}"]\nRESULT_EMPTY — the tool returned no items.\n\nTell the caller plainly that there is nothing to report (e.g. "nothing scheduled", "your inbox is empty", "no matches"). Do NOT invent, guess, or extrapolate any items. Use only the literal RESULT_EMPTY signal.`
-				: `[Task result for "${taskDescription}"]\n${result}\n\nReport this result to the caller now. Only reference items that appear verbatim in the result above — do NOT invent, fabricate, or extrapolate items that aren't there.`;
 			// Queue result — will be injected on next turn.end to avoid interrupting speech
-			callSession.resultQueue.push({ text: injectedText });
+			callSession.resultQueue.push({
+				text: `[Task result for "${taskDescription}"]\n${result}\n\nReport this result to the caller now.`,
+			});
 			return;
 		}
 		if (Date.now() - startTime > POLL_TIMEOUT_MS) {
@@ -544,13 +535,6 @@ function buildAgent(callSession: CallSession): MainAgent {
 				'## Known info',
 				(() => { try { const url = execSync('git remote get-url origin', { timeout: 2_000 }).toString().trim().replace(/\.git$/, ''); return `Sutando GitHub repo: ${url}`; } catch { return ''; } })(),
 				ownerLocalDateContext(),
-				// Session-level anti-hallucination backstop (cherry-picked from
-				// bassilkhilo-ag2's parallel PR #1249). Pre-warms the model
-				// with the constraint at session-open so the rule is in scope
-				// BEFORE any result-injection wrapper lands. Combined with the
-				// per-result wrapper below at conversation-server.ts:405, the
-				// model gets the rule twice: at boot and at delivery.
-				'TOOL RESULT TRUTHFULNESS: When a work task result is empty or says nothing was found, you MUST say "nothing scheduled" or "nothing found" — never invent, guess, or fill with plausible-sounding calendar events, emails, or other items. Fabricated events mislead the owner and are worse than silence.',
 				'',
 				'## Style',
 				'Be natural, warm, and conversational. Keep responses to 1-2 sentences.',
