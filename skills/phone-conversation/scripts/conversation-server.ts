@@ -126,7 +126,11 @@ const TASKS_DIR = join(WORKSPACE_DIR, 'tasks');
 // tasks + results aren't left behind in tasks/ or results/ forever (#1235).
 // Same audit-trail rationale Chi quoted on 2026-04-18 ("instead of deleting
 // we should archive the tasks. It can be useful for self-improving"). Silent
-// on failure; falls back to unlink so the system never leaves stale files.
+// on failure; falls back to unlink if renameSync throws for ANY reason
+// (ENOENT race / permission / disk-full) so we never leave stale files.
+// (Note: tasks/ → tasks/archive/ is same-filesystem by construction; EXDEV
+// won't fire — calling out renameSync-failed-for-any-reason rather than
+// implying cross-device portability per liususan091219's #1237 review.)
 function archivePhoneFile(srcPath: string, kind: 'tasks' | 'results', taskId: string): void {
 	try {
 		if (!existsSync(srcPath)) return;
@@ -426,6 +430,13 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 		if (callSession.hangingUp || !activeCalls.has(callSession.callSid)) {
 			clearInterval(poll);
 			callSession.pendingTasks = Math.max(0, callSession.pendingTasks - 1);
+			// Call ended before the result came back — archive the task file
+			// anyway so it doesn't linger in tasks/. The result-watcher in
+			// task-bridge.ts will pick up + archive `results/<task_id>.txt`
+			// independently if the core finishes the work later.
+			// (Per VasiliyRad's review on #1237 — closes the leak in the
+			// hang-up / call-not-active branch.)
+			archivePhoneFile(taskPath, 'tasks', taskId);
 			return;
 		}
 		if (existsSync(resultPath)) {
@@ -462,7 +473,10 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 			console.log(`${ts()} [Task] timeout for ${taskId}`);
 			// Archive the task file even on timeout — the work may still complete
 			// async on the core side, but the call's polling window is closed.
-			// Keep the audit trail and prevent indefinite accumulation.
+			// Don't archive the result file here: if it eventually lands, the
+			// canonical result-watcher in src/task-bridge.ts will archive it
+			// via its own archiveFile() call. (Per liususan091219's #1237
+			// review — avoids redundant result-archive logic here.)
 			archivePhoneFile(taskPath, 'tasks', taskId);
 			try {
 				(callSession.voiceSession as any).transport.sendContent([

@@ -77,18 +77,19 @@ describe('conversation-server phone-task archiving (#1235)', () => {
 		);
 	});
 
-	it('timeout branch archives the task file (≥2 archivePhoneFile(taskPath,…) call-sites total)', () => {
-		// The result-consume branch + the POLL_TIMEOUT branch each archive
-		// the task file. Counting at least two call-sites for the
-		// archivePhoneFile(taskPath, "tasks", taskId) shape catches the case
-		// where the timeout branch was dropped. (A tighter regex against the
-		// exact `[Task] timeout` log message is brittle to logging-text
-		// changes; counting call-sites is more durable.)
+	it('all 3 poll-exit branches archive the task file (≥3 archivePhoneFile(taskPath,…) call-sites)', () => {
+		// Three poll-exit paths each archive the task file:
+		//   (A) result-consume — result arrives in time
+		//   (B) hang-up / call-not-active early return (VasiliyRad's #1237 review)
+		//   (C) POLL_TIMEOUT — call's polling window closes first
+		// All three must call archivePhoneFile(taskPath, "tasks", taskId) so
+		// no exit path leaks the task file. Counting call-sites is more durable
+		// than per-branch regex matching against logging text.
 		const re = /archivePhoneFile\(\s*taskPath\s*,\s*['"]tasks['"]\s*,\s*taskId\s*\)/g;
 		const matches = SRC.match(re) ?? [];
 		assert.ok(
-			matches.length >= 2,
-			`Expected ≥2 archivePhoneFile(taskPath, "tasks", taskId) call-sites (result-consume + POLL_TIMEOUT), found ${matches.length}. POLL_TIMEOUT branch likely missing — otherwise long-running tasks that exceed POLL_TIMEOUT_MS leave the task file in tasks/ forever.`,
+			matches.length >= 3,
+			`Expected ≥3 archivePhoneFile(taskPath, "tasks", taskId) call-sites (result-consume + hang-up early-return + POLL_TIMEOUT), found ${matches.length}. A poll-exit branch is missing — tasks will leak on that path.`,
 		);
 	});
 });
