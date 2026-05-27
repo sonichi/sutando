@@ -47,7 +47,7 @@
 import { config as _dotenvConfig } from 'dotenv';
 _dotenvConfig({ path: new URL('../../../.env', import.meta.url).pathname, override: true });
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, unlinkSync, existsSync, readFileSync, readdirSync, symlinkSync } from 'node:fs';
+import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, unlinkSync, existsSync, readFileSync, readdirSync, renameSync, symlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { voiceApiKey } from '../../../src/voice-key.js';
@@ -121,6 +121,25 @@ const PORT = Number(process.env.PHONE_PORT) || 3100;
 const WORKSPACE_DIR = resolveWorkspace();
 const RESULTS_DIR = process.env.PHONE_RESULTS_DIR || join(WORKSPACE_DIR, 'results');
 const TASKS_DIR = join(WORKSPACE_DIR, 'tasks');
+
+// Archive helper — matches src/task-bridge.ts:archiveFile() pattern so phone
+// tasks + results aren't left behind in tasks/ or results/ forever (#1235).
+// Same audit-trail rationale Chi quoted on 2026-04-18 ("instead of deleting
+// we should archive the tasks. It can be useful for self-improving"). Silent
+// on failure; falls back to unlink so the system never leaves stale files.
+function archivePhoneFile(srcPath: string, kind: 'tasks' | 'results', taskId: string): void {
+	try {
+		if (!existsSync(srcPath)) return;
+		const ym = new Date().toISOString().slice(0, 7); // YYYY-MM
+		const baseDir = kind === 'tasks' ? TASKS_DIR : RESULTS_DIR;
+		const destDir = join(baseDir, 'archive', ym);
+		mkdirSync(destDir, { recursive: true });
+		renameSync(srcPath, join(destDir, `${taskId}.txt`));
+	} catch {
+		try { unlinkSync(srcPath); } catch { /* ignore */ }
+	}
+}
+
 const TASK_POLL_INTERVAL_MS = 500;
 const TASK_TIMEOUT_MS = 120_000;
 const OWNER_NAME = process.env.owner ?? '';
@@ -415,7 +434,10 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 			const result = readFileSync(resultPath, 'utf-8').trim();
 			console.log(`${ts()} [Task] result for ${taskId} (${Date.now() - startTime}ms): ${result.slice(0, 200)}`);
 			callSession.events.push({ event: `task_result:${taskId}:${Date.now() - startTime}ms`, timestamp: new Date().toISOString() });
-			try { unlinkSync(resultPath); } catch {}
+			// Archive both the result + task files so phone surfaces match the
+			// task-bridge.ts archiveFile() audit-trail pattern (#1235).
+			archivePhoneFile(resultPath, 'results', taskId);
+			archivePhoneFile(taskPath, 'tasks', taskId);
 			// Cache result so duplicate requests get instant replay
 			if (!callSession.taskResultCache) callSession.taskResultCache = new Map();
 			callSession.taskResultCache.set(taskDescription, result);
@@ -438,6 +460,10 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 			clearInterval(poll);
 			callSession.pendingTasks = Math.max(0, callSession.pendingTasks - 1);
 			console.log(`${ts()} [Task] timeout for ${taskId}`);
+			// Archive the task file even on timeout — the work may still complete
+			// async on the core side, but the call's polling window is closed.
+			// Keep the audit trail and prevent indefinite accumulation.
+			archivePhoneFile(taskPath, 'tasks', taskId);
 			try {
 				(callSession.voiceSession as any).transport.sendContent([
 					{ role: 'user', text: `[Task "${taskDescription}" timed out — still being worked on. Let the caller know.]` },
