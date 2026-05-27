@@ -67,13 +67,31 @@ echo "$$" > "$PID_FILE"
 # Cleanup on any exit path (SIGINT, SIGTERM, normal exit) so the file
 # doesn't outlive the process on a clean shutdown. Dirty exits (SIGKILL,
 # panic) skip the trap — the Stop hook + startup reaper cover those.
-trap 'rm -f "$PID_FILE"' EXIT
+# ORPHAN_GUARD_PID is set below; guard may not be spawned yet when the
+# trap fires on very early exit, so coerce to empty if unset (-).
+trap 'rm -f "$PID_FILE"; kill "${ORPHAN_GUARD_PID:-}" 2>/dev/null' EXIT INT TERM
+
+# Mode-B orphan guard (#1088): exit if this watcher is reparented to launchd
+# (PPID=1), which happens when the parent shell exits without SIGTERMing us.
+# Polls every 10 s — cheap stat, catches the PPID=1 case that Mode-A's
+# printf-EPIPE path misses (pipe may still be live even when parent is gone).
+# Uses $$ to name the *main* script's PID (bash passes $$ unchanged into
+# subshells; $BASHPID would give the subshell's own PID).
+(
+  while sleep 10; do
+    ppid="$(ps -o ppid= -p $$ 2>/dev/null | tr -d ' ')"
+    [ "$ppid" = "1" ] && kill "$$" && break
+  done
+) &
+ORPHAN_GUARD_PID=$!
 
 # Initial sweep — surface any pre-existing tasks that arrived during a
 # restart gap.
 shopt -s nullglob
 for f in "$TASKS_DIR"/*.txt; do
-  echo "TASK_FILE: $(basename "$f")"
+  # Mode-A EPIPE guard: printf returns non-zero immediately on broken pipe;
+  # break the loop rather than waiting for kernel buffer to fill (~100 events).
+  printf 'TASK_FILE: %s\n' "$(basename "$f")" || break
 done
 shopt -u nullglob
 
@@ -107,7 +125,10 @@ fswatch \
     *.txt)
       parent="$(dirname "$path")"
       if [ "$parent" = "$TASKS_DIR_ABS" ] && [ -f "$path" ]; then
-        echo "TASK_FILE: $(basename "$path")"
+        # Mode-A EPIPE guard (#1088): printf returns non-zero at the first
+        # failed kernel write — exits the pipeline subshell immediately
+        # rather than buffering ~100 events before the write finally fails.
+        printf 'TASK_FILE: %s\n' "$(basename "$path")" || exit 0
       fi
       ;;
   esac
