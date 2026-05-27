@@ -980,6 +980,7 @@ def run_all_checks() -> list[dict]:
     # time the discord-bridge / owner triggers a voice session.
     checks.append(check_discord_voice())
 
+
     # Sutando menu bar app — check either dev-built binary or installed .app.
     # On the distributed .app path the dev binary doesn't ship; we still want
     # the menu bar check to run so dashboard reports accurate status.
