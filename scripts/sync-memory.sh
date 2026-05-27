@@ -145,7 +145,21 @@ fi
 # back via `find … | head -1` to whichever sibling memory dir landed first
 # (alphabetical). Bug silently skipped real memory writes for 5+ weeks
 # before being caught. See docs/workspace-contract.md.
-MEMORY_DIR="$HOME/.claude/projects/$(echo "$SCRIPT_PARENT" | sed 's|/|-|g')/memory"
+#
+# Explicit override (SUTANDO_MEMORY_DIR): the SCRIPT_PARENT heuristic assumes the
+# memory was created under the SAME checkout that now runs this script. That
+# breaks on MULTI-CHECKOUT installs — e.g. the agent + its memory live under
+# `~/Documents/github/sutando` (old checkout's project key), but a cron invokes
+# this script from a different checkout (`…/sutando-plus/sutando`), whose project
+# key has an empty/absent memory dir → falls through to the unreliable
+# `find … | head -1`. Honoring an explicit SUTANDO_MEMORY_DIR lets such installs
+# point at the real dir. Unset = identical to prior behavior (backward-compatible);
+# additive, so it composes with whatever invocation/deployment layout you choose.
+if [ -n "${SUTANDO_MEMORY_DIR:-}" ]; then
+  MEMORY_DIR="${SUTANDO_MEMORY_DIR/#\~/$HOME}"
+else
+  MEMORY_DIR="$HOME/.claude/projects/$(echo "$SCRIPT_PARENT" | sed 's|/|-|g')/memory"
+fi
 NOTES_DIR="$REPO_DIR/notes"
 LOG="/tmp/sync-memory.log"
 LOCK_DIR="/tmp/sync-memory.lock.d"
