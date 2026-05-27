@@ -89,6 +89,12 @@ SEND_ALLOWED_PREFIXES = (
     "/tmp/echo-",
     "/private/tmp/echo-",
 )
+# Extend via SUTANDO_SEND_ALLOWED_ROOTS (colon-separated, ~ expanded)
+_extra_roots: tuple[str, ...] = tuple(
+    os.path.expanduser(p)
+    for p in os.environ.get("SUTANDO_SEND_ALLOWED_ROOTS", "").split(":")
+    if p.strip()
+)
 
 
 def _is_path_sendable(fpath: str) -> bool:
@@ -104,7 +110,7 @@ def _is_path_sendable(fpath: str) -> bool:
         real = os.path.realpath(fpath)
     except OSError:
         return False
-    for root in SEND_ALLOWED_ROOTS:
+    for root in (*SEND_ALLOWED_ROOTS, *_extra_roots):
         root_real = os.path.realpath(root)
         if real == root_real or real.startswith(root_real + os.sep):
             return True
