@@ -278,6 +278,17 @@ def _enqueue_context_prep_task(phrase: str, channel_id, channel_name: str) -> No
         ts_ms = int(time.time() * 1000)
         iso_now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         owner_id = os.environ.get("SUTANDO_DM_OWNER_ID", "").strip() or "owner"
+        # Per-channel pull key for the consumer-side scan in
+        # discord-voice-server.ts. Routed through the typed constructor so the
+        # writer and consumer always agree on the `dvoice-` prefix (PR #1090).
+        try:
+            sys.path.insert(0, str(_REPO_ROOT / "src"))
+            from result_channel_key import discord_voice_key  # type: ignore
+            scoped_key = discord_voice_key(str(channel_id))
+        except Exception:
+            # Fallback mirrors the constructor's contract — if the import fails
+            # the writer still produces the same shape the consumer scans for.
+            scoped_key = f"dvoice-{channel_id}"
         # Body instructs the core to write a SCOPED result file the voice
         # session will pick up via the per-channel pull namespace. No user
         # content in this body — the core fills the result file from its
@@ -286,13 +297,14 @@ def _enqueue_context_prep_task(phrase: str, channel_id, channel_name: str) -> No
             f"[SYSTEM] Magic word '{phrase}' fired. discord-voice-server is "
             f"spawning for voice channel id={channel_id} name={channel_name}. "
             f"Write a context result file at "
-            f"results/{channel_id}.task-<this-task-id>.txt (per-channel pull "
-            f"namespace) so the voice session injects it on connect. The body "
-            f"should summarize the conversation state voice may need: any "
-            f"active draft you're iterating on, the last few result subjects, "
-            f"and that voice just joined via the '{phrase}' magic word. Keep "
-            f"it 1-2 short paragraphs — voice consumes it as session input, "
-            f"not as a spoken turn. No DM reply needed."
+            f"results/{scoped_key}.task-<this-task-id>.txt (per-channel pull "
+            f"namespace; key built via `discord_voice_key()`) so the voice "
+            f"session injects it on connect. The body should summarize the "
+            f"conversation state voice may need: any active draft you're "
+            f"iterating on, the last few result subjects, and that voice just "
+            f"joined via the '{phrase}' magic word. Keep it 1-2 short "
+            f"paragraphs — voice consumes it as session input, not as a "
+            f"spoken turn. No DM reply needed."
         )
         task_path = tasks_dir / f"task-{ts_ms}.txt"
         task_path.write_text(
