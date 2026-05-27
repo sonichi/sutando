@@ -47,7 +47,7 @@
 import { config as _dotenvConfig } from 'dotenv';
 _dotenvConfig({ path: new URL('../../../.env', import.meta.url).pathname, override: true });
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, unlinkSync, existsSync, readFileSync, readdirSync, symlinkSync } from 'node:fs';
+import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, unlinkSync, existsSync, readFileSync, readdirSync, symlinkSync, renameSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { voiceApiKey } from '../../../src/voice-key.js';
@@ -123,6 +123,20 @@ const RESULTS_DIR = process.env.PHONE_RESULTS_DIR || join(WORKSPACE_DIR, 'result
 const TASKS_DIR = join(WORKSPACE_DIR, 'tasks');
 const TASK_POLL_INTERVAL_MS = 500;
 const TASK_TIMEOUT_MS = 120_000;
+
+/** Move a phone task file to tasks/archive/YYYY-MM/ (mirrors task-bridge archiveFile).
+ *  Falls back to unlink so stale files never accumulate in tasks/. */
+function archivePhoneTask(taskPath: string, taskId: string): void {
+	try {
+		if (!existsSync(taskPath)) return;
+		const ym = new Date().toISOString().slice(0, 7);
+		const destDir = join(TASKS_DIR, 'archive', ym);
+		mkdirSync(destDir, { recursive: true });
+		renameSync(taskPath, join(destDir, `${taskId}.txt`));
+	} catch {
+		try { unlinkSync(taskPath); } catch {}
+	}
+}
 const OWNER_NAME = process.env.owner ?? '';
 const OWNER_NUMBER = process.env.OWNER_NUMBER ?? '';
 
@@ -399,6 +413,7 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 			console.log(`${ts()} [Task] result for ${taskId} (${Date.now() - startTime}ms): ${result.slice(0, 200)}`);
 			callSession.events.push({ event: `task_result:${taskId}:${Date.now() - startTime}ms`, timestamp: new Date().toISOString() });
 			try { unlinkSync(resultPath); } catch {}
+			archivePhoneTask(taskPath, taskId);
 			// Cache result so duplicate requests get instant replay
 			if (!callSession.taskResultCache) callSession.taskResultCache = new Map();
 			callSession.taskResultCache.set(taskDescription, result);
@@ -412,6 +427,7 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 			clearInterval(poll);
 			callSession.pendingTasks = Math.max(0, callSession.pendingTasks - 1);
 			console.log(`${ts()} [Task] timeout for ${taskId}`);
+			archivePhoneTask(taskPath, taskId);
 			try {
 				(callSession.voiceSession as any).transport.sendContent([
 					{ role: 'user', text: `[Task "${taskDescription}" timed out — still being worked on. Let the caller know.]` },
