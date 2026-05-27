@@ -349,6 +349,21 @@ def archive_path(kind: str, task_id: str) -> "Path":
     return month_dir / f"{task_id}.txt"
 
 
+def find_task_file(tasks_dir: "Path", task_id: str):
+    """Return the actual on-disk path for task_id.
+
+    claim_task.py (#884) renames task-{id}.txt → task-{id}.claimed-core-N.txt
+    atomically. Callers that hard-code the bare .txt path silently no-op on
+    archive because the file no longer exists under that name (#933).
+    """
+    from pathlib import Path as _Path
+    bare = _Path(tasks_dir) / f"{task_id}.txt"
+    if bare.exists():
+        return bare
+    matches = list(_Path(tasks_dir).glob(f"{task_id}.claimed-core-*.txt"))
+    return matches[0] if matches else None
+
+
 def archive_file(src: "Path", kind: str, task_id: str) -> None:
     """Move src into the archive. Silent on failure — archive is for later
     analysis, not critical path. Chi's 2026-04-18 ask: "instead of deleting
@@ -3098,8 +3113,9 @@ async def poll_results():
                     # post — same UX as [no-send] / [REPLIED].
                     print(f"  Skipped (already replied or deduped): {task_id}")
                     archive_file(result_file, "results", task_id)
-                    task_file = TASKS_DIR / f"{task_id}.txt"
-                    archive_file(task_file, "tasks", task_id)
+                    _tf = find_task_file(TASKS_DIR, task_id)
+                    if _tf:
+                        archive_file(_tf, "tasks", task_id)
                     continue
 
                 # Idempotency check: if the previous run already sent
@@ -3171,7 +3187,8 @@ async def poll_results():
                         reply_text = channel_pattern.sub('', reply_text).strip()
                         task_tier = "other"
                         try:
-                            task_body = (TASKS_DIR / f"{task_id}.txt").read_text()
+                            _tf_read = find_task_file(TASKS_DIR, task_id)
+                            task_body = _tf_read.read_text() if _tf_read else ""
                             for ln in task_body.splitlines():
                                 if ln.startswith("access_tier:"):
                                     task_tier = ln.split(":", 1)[1].strip() or "other"
@@ -3268,8 +3285,9 @@ async def poll_results():
                     print(f"  Reply failed: {e}", flush=True)
                 # Archive (not delete) so we can mine patterns later.
                 archive_file(result_file, "results", task_id)
-                task_file = TASKS_DIR / f"{task_id}.txt"
-                archive_file(task_file, "tasks", task_id)
+                _tf = find_task_file(TASKS_DIR, task_id)
+                if _tf:
+                    archive_file(_tf, "tasks", task_id)
                 # Delivery succeeded + archived — sentinel has served
                 # its purpose, remove to bound `discord-delivered/`
                 # directory growth.
@@ -3544,9 +3562,9 @@ async def poll_dm_fallback():
                     # Archive matching task file so audit_orphan_tasks sees
                     # the task as processed (even if drop-without-reply).
                     _task_id = f.stem
-                    _task_file = TASKS_DIR / f"{_task_id}.txt"
-                    if _task_file.exists():
-                        archive_file(_task_file, "tasks", _task_id)
+                    _tf = find_task_file(TASKS_DIR, _task_id)
+                    if _tf:
+                        archive_file(_tf, "tasks", _task_id)
                     continue
                 # Stop retrying after 24h. Without this cap, a permanent
                 # failure (bad channel ID, bot removed from DM, etc.)
@@ -3557,9 +3575,9 @@ async def poll_dm_fallback():
                     print(f"  [dm-fallback] dropping stale {f.name} (age={int(age)}s)", flush=True)
                     f.unlink(missing_ok=True)
                     _task_id = f.stem
-                    _task_file = TASKS_DIR / f"{_task_id}.txt"
-                    if _task_file.exists():
-                        archive_file(_task_file, "tasks", _task_id)
+                    _tf = find_task_file(TASKS_DIR, _task_id)
+                    if _tf:
+                        archive_file(_tf, "tasks", _task_id)
                     continue
                 # Honor result-body suppression markers (parity with the
                 # main reply path at line ~2660). Without this, results
@@ -3573,9 +3591,9 @@ async def poll_dm_fallback():
                 if _peek.startswith('[no-send]') or _peek.startswith('[REPLIED]') or _peek.startswith('[deduped:'):
                     print(f"  [dm-fallback] skipped (suppression marker): {f.name}", flush=True)
                     _task_id = f.stem
-                    _task_file = TASKS_DIR / f"{_task_id}.txt"
-                    if _task_file.exists():
-                        archive_file(_task_file, "tasks", _task_id)
+                    _tf = find_task_file(TASKS_DIR, _task_id)
+                    if _tf:
+                        archive_file(_tf, "tasks", _task_id)
                     archive_file(f, "results", _task_id)
                     continue
 
@@ -3602,7 +3620,8 @@ async def poll_dm_fallback():
                     # task file (the same shape Discord uses).
                     task_tier = "other"
                     try:
-                        task_body = (TASKS_DIR / f"{_task_id}.txt").read_text()
+                        _tf_read = find_task_file(TASKS_DIR, _task_id)
+                        task_body = _tf_read.read_text() if _tf_read else ""
                         for ln in task_body.splitlines():
                             if ln.startswith("access_tier:"):
                                 task_tier = ln.split(":", 1)[1].strip() or "other"
@@ -3646,9 +3665,9 @@ async def poll_dm_fallback():
                                     # See poll_results — log only, no user noise.
                                     print(f"  [dm-fallback channel-redirect] file marker, file not found: {fpath}", flush=True)
                             print(f"  [dm-fallback channel-redirect] sent {f.name} to channel {target_channel_id}", flush=True)
-                            _task_file = TASKS_DIR / f"{_task_id}.txt"
-                            if _task_file.exists():
-                                archive_file(_task_file, "tasks", _task_id)
+                            _tf = find_task_file(TASKS_DIR, _task_id)
+                            if _tf:
+                                archive_file(_tf, "tasks", _task_id)
                             archive_file(f, "results", _task_id)
                             continue
                         # Unresolved → fall through to DM, but strip marker
@@ -3717,9 +3736,9 @@ async def poll_dm_fallback():
                     except OSError:
                         _result_text = ""
                     archive_file(f, "results", _task_id)
-                    _task_file = TASKS_DIR / f"{_task_id}.txt"
-                    if _task_file.exists():
-                        archive_file(_task_file, "tasks", _task_id)
+                    _tf = find_task_file(TASKS_DIR, _task_id)
+                    if _tf:
+                        archive_file(_tf, "tasks", _task_id)
                     if _result_text and _task_id.startswith("task-"):
                         # urlopen is blocking — run in thread so we don't stall
                         # the asyncio event loop for up to 2s per dm-fallback.

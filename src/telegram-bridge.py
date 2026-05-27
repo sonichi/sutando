@@ -172,6 +172,21 @@ def write_owner_activity(channel: str, summary: str) -> None:
         print(f"  [owner-activity] write failed: {e}")
 
 
+def find_task_file(tasks_dir: "Path", task_id: str):
+    """Return the actual on-disk path for task_id.
+
+    claim_task.py (#884) renames task-{id}.txt → task-{id}.claimed-core-N.txt
+    atomically. Callers that hard-code the bare .txt path silently no-op on
+    archive because the file no longer exists under that name (#933).
+    """
+    from pathlib import Path as _Path
+    bare = _Path(tasks_dir) / f"{task_id}.txt"
+    if bare.exists():
+        return bare
+    matches = list(_Path(tasks_dir).glob(f"{task_id}.claimed-core-*.txt"))
+    return matches[0] if matches else None
+
+
 def archive_file(src: "Path", kind: str, task_id: str) -> None:
     """Move src into archive/<tasks|results>/YYYY-MM/ instead of deleting.
     Silent on failure. Chi's ask 2026-04-18: archive tasks + results for
@@ -595,8 +610,9 @@ def main():
                 if any(a.kind == "skip" for a in parsed.actions):
                     print(f"  Skipped (marker): {task_id}", flush=True)
                     archive_file(result_file, "results", task_id)
-                    task_file = TASKS_DIR / f"{task_id}.txt"
-                    archive_file(task_file, "tasks", task_id)
+                    _tf = find_task_file(TASKS_DIR, task_id)
+                    if _tf:
+                        archive_file(_tf, "tasks", task_id)
                     continue
                 try:
                     send_reply(chat_id, reply_text, task_id=task_id)
@@ -605,8 +621,9 @@ def main():
                     print(f"[Telegram] Reply error: {e}", flush=True)
                 # Archive (not delete) so we can mine patterns later.
                 archive_file(result_file, "results", task_id)
-                task_file = TASKS_DIR / f"{task_id}.txt"
-                archive_file(task_file, "tasks", task_id)
+                _tf = find_task_file(TASKS_DIR, task_id)
+                if _tf:
+                    archive_file(_tf, "tasks", task_id)
 
         time.sleep(1)
 
