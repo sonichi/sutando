@@ -3770,4 +3770,6 @@ if __name__ == "__main__":
     if len(sys.argv) >= 4 and sys.argv[1] == "send":
         _send_via_rest(sys.argv[2], " ".join(sys.argv[3:]))
     else:
+        from single_instance import acquire  # noqa: E402
+        acquire("discord-bridge")
         client.run(TOKEN, log_handler=None)

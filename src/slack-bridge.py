@@ -671,6 +671,8 @@ def _no_events_hint_thread():
 
 
 def main():
+    from single_instance import acquire  # noqa: E402
+    acquire("slack-bridge")
     print("Slack bridge started. Socket Mode connecting...", flush=True)
     threading.Thread(target=result_watcher, name="slack-result-watcher", daemon=True).start()
     threading.Thread(target=_no_events_hint_thread, name="slack-no-events-hint", daemon=True).start()

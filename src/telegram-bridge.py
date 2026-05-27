@@ -408,6 +408,8 @@ def send_reply(chat_id, text, task_id: str | None = None):
             print(f"  file marker, file not found — likely a prose quotation: {fpath}", flush=True)
 
 def main():
+    from single_instance import acquire  # noqa: E402
+    acquire("telegram-bridge")
     print(f"Telegram bridge started. Polling for messages...", flush=True)
     offset = None
     allowed = load_allowed()
