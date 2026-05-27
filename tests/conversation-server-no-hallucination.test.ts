@@ -59,4 +59,20 @@ describe('conversation-server — anti-hallucination on work-tool results (sonic
 			'result injection must continue to use callSession.resultQueue.push so the existing turn-end drain logic still fires.',
 		);
 	});
+
+	it('pre-warms the system prompt with TOOL RESULT TRUTHFULNESS clause', () => {
+		// Cherry-picked from bassilkhilo-ag2's parallel PR #1249 — session-level
+		// backstop so the constraint is in scope BEFORE the per-result wrapper
+		// lands. Defense in depth: model gets the rule at boot + at delivery.
+		assert.match(
+			SRC,
+			/TOOL RESULT TRUTHFULNESS/,
+			'system prompt must include a TOOL RESULT TRUTHFULNESS clause as session-level anti-hallucination backstop.',
+		);
+		assert.match(
+			SRC,
+			/TOOL RESULT TRUTHFULNESS[\s\S]{0,400}?Fabricated events mislead the owner/,
+			'TOOL RESULT TRUTHFULNESS clause must include the rationale (fabricated events mislead owner) so the model understands the priority.',
+		);
+	});
 });

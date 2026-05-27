@@ -544,6 +544,13 @@ function buildAgent(callSession: CallSession): MainAgent {
 				'## Known info',
 				(() => { try { const url = execSync('git remote get-url origin', { timeout: 2_000 }).toString().trim().replace(/\.git$/, ''); return `Sutando GitHub repo: ${url}`; } catch { return ''; } })(),
 				ownerLocalDateContext(),
+				// Session-level anti-hallucination backstop (cherry-picked from
+				// bassilkhilo-ag2's parallel PR #1249). Pre-warms the model
+				// with the constraint at session-open so the rule is in scope
+				// BEFORE any result-injection wrapper lands. Combined with the
+				// per-result wrapper below at conversation-server.ts:405, the
+				// model gets the rule twice: at boot and at delivery.
+				'TOOL RESULT TRUTHFULNESS: When a work task result is empty or says nothing was found, you MUST say "nothing scheduled" or "nothing found" — never invent, guess, or fill with plausible-sounding calendar events, emails, or other items. Fabricated events mislead the owner and are worse than silence.',
 				'',
 				'## Style',
 				'Be natural, warm, and conversational. Keep responses to 1-2 sentences.',
