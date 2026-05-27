@@ -1,0 +1,18 @@
+# proactive-notify ping registry.
+# Each entry declares a trigger that may produce a Ping for the owner.
+# Runner walks this list every cron tick, applies match filters, dedups
+# via state/fired.json, and routes via channel-policy.yaml.
+
+pings:
+  - name: meeting-soon
+    source: google_calendar
+    source_config:
+      lookahead_min: 15
+    match:
+      starts_in_min_min: 8
+      starts_in_min_max: 12
+      exclude_titles_matching: "(?i)^(rest|focus|ooo|out of office|home|wfh|lunch break)$"
+      exclude_description_tag: "[no-reminder]"
+    urgency: important
+    voice_natural: true
+    body_template: 'Meeting in {minutes_until} min: "{title}" at {start_local}.'
