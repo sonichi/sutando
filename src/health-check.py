@@ -512,8 +512,20 @@ def check_voice_transport(voice_check: dict) -> dict:
         if most_recent_abnormal is not None:
             reason = _extract_close_reason(most_recent_abnormal) or "unknown"
             code = _extract_close_code(most_recent_abnormal) or "?"
-            check["status"] = "fail"
-            check["detail"] = f"unrecovered transport close: code={code} reason={reason[:80]}"
+            # code=1006 is an abnormal network close (often a DNS blip). If DNS
+            # resolves now the transport will self-recover on next client connect
+            # — downgrade to warn so the dashboard isn't stuck on red.
+            if code == "1006":
+                try:
+                    socket.getaddrinfo("generativelanguage.googleapis.com", 443)
+                    check["status"] = "warn"
+                    check["detail"] = "transient network drop (code=1006, DNS ok now — will recover on next connect)"
+                except OSError:
+                    check["status"] = "fail"
+                    check["detail"] = "network drop code=1006 and DNS still failing"
+            else:
+                check["status"] = "fail"
+                check["detail"] = f"unrecovered transport close: code={code} reason={reason[:80]}"
         elif abnormal_recovered:
             check["detail"] = "transport recovered after earlier error"
     except OSError as e:
