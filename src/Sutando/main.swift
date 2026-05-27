@@ -1113,14 +1113,65 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return "\(modSymbols)\(key)"
     }
 
+    /// Build a character→virtual-keycode map for the CURRENTLY ACTIVE keyboard
+    /// layout. Carbon's `RegisterEventHotKey` is keycode-based, and `kVK_ANSI_*`
+    /// codes are physical QWERTY/ANSI positions — so a hotkey configured as "S"
+    /// binds to the physical QWERTY-S key regardless of the user's layout. On a
+    /// Dvorak layout that physical key types "O", so the default ⌃S "drop
+    /// screenshot" actually fires on what the user presses as ⌃O (reported by a
+    /// Dvorak user, 2026-05-22). Translating each keycode through the live layout
+    /// lets a config letter bind to the key that actually TYPES that letter.
+    /// Returns [:] on any failure so callers fall back to the static
+    /// `keyNameToCode` map (legacy QWERTY-position behavior).
+    ///
+    /// Note: the map reflects the layout active at registration time. Switching
+    /// layouts at runtime does not re-bind until hotkeys are re-registered; a
+    /// runtime re-registration on `kTISNotifySelectedKeyboardInputSourceChanged`
+    /// is a possible follow-up.
+    private func currentLayoutKeyCodeMap() -> [String: Int] {
+        guard let source = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
+              let rawLayoutData = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) else {
+            return [:]
+        }
+        let layoutData = unsafeBitCast(rawLayoutData, to: CFData.self)
+        guard let bytes = CFDataGetBytePtr(layoutData) else { return [:] }
+        let kbdType = UInt32(LMGetKbdType())
+        return bytes.withMemoryRebound(to: UCKeyboardLayout.self, capacity: 1) { keyLayout -> [String: Int] in
+            var map: [String: Int] = [:]
+            for code in 0..<128 {
+                var deadKeyState: UInt32 = 0
+                var length = 0
+                var chars = [UniChar](repeating: 0, count: 4)
+                let status = UCKeyTranslate(
+                    keyLayout, UInt16(code), UInt16(kUCKeyActionDown), 0, kbdType,
+                    OptionBits(kUCKeyTranslateNoDeadKeysBit), &deadKeyState,
+                    chars.count, &length, &chars)
+                guard status == noErr, length == 1 else { continue }
+                let ch = String(utf16CodeUnits: chars, count: length).uppercased()
+                // Only map single A–Z letters; first writer wins (lowest keycode).
+                guard ch.count == 1, let scalar = ch.unicodeScalars.first,
+                      scalar.value >= 65, scalar.value <= 90, map[ch] == nil else { continue }
+                map[ch] = code
+            }
+            return map
+        }
+    }
+
     func registerHotKey() {
         let hotkeys = loadHotkeyConfig()
+        // Resolve config letters through the ACTIVE keyboard layout so "S" binds
+        // to the key that types "S" — not the physical QWERTY-S position. Empty
+        // on failure → fall back to the static QWERTY map (legacy behavior).
+        // See currentLayoutKeyCodeMap() for the Dvorak rationale.
+        let layoutMap = currentLayoutKeyCodeMap()
+        logToFile("registerHotKey: live layout map has \(layoutMap.count) letters")
         var statuses: [String] = []
         for (idx, hk) in hotkeys.enumerated() {
-            guard let keyCode = AppDelegate.keyNameToCode[hk.key] else {
+            guard let keyCode = layoutMap[hk.key] ?? AppDelegate.keyNameToCode[hk.key] else {
                 logToFile("registerHotKey: unknown key '\(hk.key)' for action=\(hk.action)")
                 continue
             }
+            logToFile("registerHotKey: \(hk.action) key=\(hk.key) → keyCode=\(keyCode) (\(layoutMap[hk.key] != nil ? "layout" : "static"))")
             let id = UInt32(idx + 1)
             var hotKeyID = EventHotKeyID()
             hotKeyID.signature = OSType(0x5355_5444) // "SUTD"
