@@ -469,7 +469,11 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 			DISCORD_VOICE_GOOGLE_SEARCH
 				? 'NEVER fabricate specific details. If you don\'t know it, use your built-in Web search to look it up — it\'s faster than delegating, and the answer stays in the conversation. If your built-in search returns nothing useful, OR the question needs deeper-than-one-lookup research (multi-step, multiple sources, file reading), call the work tool — it routes to the core agent which can do extensive research.'
 				: 'NEVER fabricate specific details. If you don\'t know it, use the work tool to look it up.',
-			repoUrl ? `\n## Known info\nSutando GitHub repo: ${repoUrl}` : '',
+				// Action-grounding guards — closes #1102 (tool-narration + capability hallucination)
+				'ACTION GROUNDING: When you say you are doing something (e.g. "opening", "searching", "sending"), you MUST invoke the corresponding tool. Do NOT narrate actions you did not perform.',
+				'CAPABILITY GROUNDING: When asked what tools or commands exist, list ONLY those documented in this prompt. If a capability not documented here is mentioned, say you\'re not sure rather than invent.',
+				'UNCERTAINTY: When uncertain about a fact, say "I don\'t know" or "I can look it up" — never guess.',
+				repoUrl ? `\n## Known info\nSutando GitHub repo: ${repoUrl}` : '',
 		].filter(Boolean).join('\n');
 	} else {
 		instructions = [
