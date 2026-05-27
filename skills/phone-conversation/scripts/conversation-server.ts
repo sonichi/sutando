@@ -402,9 +402,12 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 			// Cache result so duplicate requests get instant replay
 			if (!callSession.taskResultCache) callSession.taskResultCache = new Map();
 			callSession.taskResultCache.set(taskDescription, result);
-			// Queue result — will be injected on next turn.end to avoid interrupting speech
+			// Queue result — will be injected on next turn.end to avoid interrupting speech.
+			// Empty results must be labelled so the model reports "nothing found" rather
+			// than filling the silence with confabulated events. See sonichi/sutando#1244.
+			const resultBody = result || '[RESULT_EMPTY: the task returned no data]';
 			callSession.resultQueue.push({
-				text: `[Task result for "${taskDescription}"]\n${result}\n\nReport this result to the caller now.`,
+				text: `[Task result for "${taskDescription}"]\n${resultBody}\n\nReport this result to the caller. ONLY read back items that appear verbatim in the result above. If the result is empty or says nothing found, say "nothing scheduled" / "nothing found" — do NOT invent or mention any events, emails, meetings, or items that are not explicitly listed in the result.`,
 			});
 			return;
 		}
@@ -517,6 +520,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 				'',
 				'## Known info',
 				(() => { try { const url = execSync('git remote get-url origin', { timeout: 2_000 }).toString().trim().replace(/\.git$/, ''); return `Sutando GitHub repo: ${url}`; } catch { return ''; } })(),
+				'TOOL RESULT TRUTHFULNESS: When a work task result is empty or says nothing was found, you MUST say "nothing scheduled" or "nothing found" — never invent, guess, or fill with plausible-sounding calendar events, emails, or other items. Fabricated events mislead the owner and are worse than silence.',
 				'',
 				'## Style',
 				'Be natural, warm, and conversational. Keep responses to 1-2 sentences.',
