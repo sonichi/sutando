@@ -31,6 +31,7 @@ REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 from util_paths import shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
+from event_log import log_event  # noqa: E402
 
 # Workspace = runtime-state root (tasks/, results/, state/). REPO_DIR stays the
 # source-code root (src/, skills/, logs/, .env, build_log.md). Before PR #762's
@@ -1229,6 +1230,32 @@ def notify_for_failures(
         pass
 
 
+def _emit_health_transition_events(checks: list) -> None:
+    """Emit health.degraded / health.recovered by diffing against the previous run.
+
+    State persisted in state/health-last-status.json as {check_name: status}.
+    Best-effort — any I/O failure is silently swallowed so the caller always proceeds.
+    """
+    state_file = WORKSPACE_DIR / "state" / "health-last-status.json"
+    try:
+        prev: dict = json.loads(state_file.read_text()) if state_file.exists() else {}
+    except Exception:
+        prev = {}
+    cur = {c["name"]: c["status"] for c in checks}
+    for name, status in cur.items():
+        was = prev.get(name)
+        ok_statuses = ("ok", "warn")
+        if status not in ok_statuses and (was is None or was in ok_statuses):
+            log_event("health.degraded", check=name, status=status)
+        elif status in ok_statuses and was is not None and was not in ok_statuses:
+            log_event("health.recovered", check=name, status=status, prev_status=was)
+    try:
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(json.dumps(cur))
+    except Exception:
+        pass
+
+
 def main():
     as_json = "--json" in sys.argv
     do_fix = "--fix" in sys.argv
@@ -1238,6 +1265,9 @@ def main():
 
     checks = run_all_checks()
     issues = [c for c in checks if c["status"] not in ("ok", "warn")]
+
+    # Emit health.degraded / health.recovered events by diffing against last run.
+    _emit_health_transition_events(checks)
 
     # Optional: macOS notification surface for the launchd-supervised path
     # (com.sutando.health-check-fallback). Notifies on the INITIAL check set
