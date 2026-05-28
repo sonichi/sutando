@@ -48,6 +48,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from task_priority import default_priority_for_source  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
+from task_archive import find_task_file  # noqa: E402
 
 try:
     from slack_bolt import App
@@ -591,7 +592,7 @@ def result_watcher():
                         print(f"[Slack] reply error: {e}", flush=True)
 
                 archive_file(result_file, "results", task_id)
-                archive_file(TASKS_DIR / f"{task_id}.txt", "tasks", task_id)
+                archive_file(find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt", "tasks", task_id)
 
             # Proactive messages (sent to owner DM)
             if not presenter_mode_active():
