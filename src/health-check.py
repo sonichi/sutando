@@ -879,15 +879,11 @@ def run_all_checks() -> list[dict]:
             checks.append({"name": name, "status": "warn", "detail": f"multiple processes ({len(pids)} PIDs: {','.join(pids)})"})
             continue
 
-        # Check 2: Log file freshness — prefer logs/ (where startup.sh writes)
-        # and fall back to src/ for legacy. The src/ default was silently a
-        # no-op since 2026-04 when startup.sh was changed to write logs/<name>.log,
-        # so log-stale warnings never fired (caught 2026-05-05 when Mini's
-        # logs/discord-bridge.log was 36h stale but health-check stayed "ok").
+        # Check 2: Log file freshness. startup.sh writes logs/<name>.log under
+        # $SUTANDO_WORKSPACE. (Pre-2026-04 a src/ fallback existed; dropped here
+        # since the src/ path has been a silent no-op for every service since.)
         import time
         log_file = WORKSPACE_DIR / "logs" / f"{name}.log"
-        if not log_file.exists():
-            log_file = REPO_DIR / "src" / f"{name}.log"
         detail = "running"
         status = "ok"
         if log_file.exists():
