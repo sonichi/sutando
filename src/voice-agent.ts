@@ -272,8 +272,8 @@ let meetingActive = false;
 // Presenter mode is tracked separately by the iclr-highlight server on :7877.
 function writeVoiceModeSentinel() {
 	try {
-		mkdirSync('state', { recursive: true });
-		writeFileSync('state/voice-mode.txt', meetingActive ? 'meeting' : 'active');
+		mkdirSync(join(WORKSPACE_DIR, 'state'), { recursive: true });
+		writeFileSync(join(WORKSPACE_DIR, 'state', 'voice-mode.txt'), meetingActive ? 'meeting' : 'active');
 	} catch {}
 }
 
@@ -283,8 +283,9 @@ function writeVoiceModeSentinel() {
 // apply so requests don't re-fire.
 function applyModeRequest() {
 	try {
-		const req = readFileSync('state/voice-mode.request', 'utf-8').trim().toLowerCase();
-		unlinkSync('state/voice-mode.request');
+		const reqPath = join(WORKSPACE_DIR, 'state', 'voice-mode.request');
+		const req = readFileSync(reqPath, 'utf-8').trim().toLowerCase();
+		unlinkSync(reqPath);
 		const want = req === 'meeting';
 		if (meetingActive === want) return; // no-op if already in that mode
 		meetingActive = want;

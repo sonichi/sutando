@@ -34,7 +34,7 @@ import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, existsSync, rea
 import { join, dirname } from 'node:path';
 import { resolveWorkspace } from '../../../src/workspace_default.js';
 import { recordConversation, recordSession, recordToolCall } from '../../../src/conversation-store.js';
-import { resultBelongsTo } from '../../../src/result-channel-key.js';
+import { resultBelongsTo, discordVoiceKey } from '../../../src/result-channel-key.js';
 import { personalPath } from '../../../src/util_paths.js';
 import { type Tier, loadAccessTiers, effectiveTier, toolAllowed, toolNeed } from './access-tier.js';
 
@@ -995,7 +995,9 @@ async function createVoiceSession(connection: VoiceConnection, client: Client): 
 	// Cadence is intentionally slower than the delegate poll (3s vs 500ms)
 	// since this path is for cross-surface handoffs, not in-conversation
 	// turn-taking. Read-and-delete mirrors delegateTask()'s fail-soft style.
-	const channelKey = CHANNEL_ID!;
+	// Typed key constructor — keeps writer + consumer in sync on the
+	// `dvoice-` prefix; prevents cross-consumer namespace collisions.
+	const channelKey = discordVoiceKey(CHANNEL_ID!);
 	// Safety-net against silent unlinkSync failures (the unlink below is wrapped
 	// in try/catch so a failed delete won't surface — without this map we'd
 	// re-deliver the same body every 3s). Stored as `name -> first-seen ms`
