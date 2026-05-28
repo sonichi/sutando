@@ -225,6 +225,10 @@ def load_tier_map() -> dict:
     empty dict if missing. Recognized tiers: "owner", "team", "other".
     Unmapped users default to "owner" — preserves the pre-tierMap behavior
     where every entry in `allowFrom` was treated as owner-tier."""
+    with _access_cache_lock:
+        cached = _access_cache
+    if cached is not None:
+        return cached.get("tierMap") or {}
     try:
         data = json.loads(ACCESS_FILE.read_text())
         _update_access_cache(data)
