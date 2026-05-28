@@ -89,7 +89,13 @@ def get_weather() -> str:
 
 
 def get_calendar_events() -> list[dict]:
-    """Get today's calendar events via AppleScript."""
+    """Get today's calendar events via AppleScript.
+
+    Respects MORNING_BRIEFING_SKIP_CALENDARS (comma-separated list of
+    calendar names to exclude, e.g. "Home,Wedding,Birthdays"). Useful for
+    filtering out subscribed shared calendars that clutter the briefing
+    (closes #964). Case-insensitive match on calendar name.
+    """
     today = datetime.now().strftime("%Y-%m-%d")
     script = f'''
 set theDate to date "{today}"
@@ -97,6 +103,7 @@ set endDate to theDate + (24 * 60 * 60)
 set output to ""
 tell application "Calendar"
     repeat with cal in every calendar
+        set calName to name of cal
         set evts to (every event of cal whose start date >= theDate and start date < endDate)
         repeat with ev in evts
             set evTitle to summary of ev
@@ -111,7 +118,7 @@ tell application "Calendar"
             if h = 0 then set h to 12
             set mStr to m as text
             if m < 10 then set mStr to "0" & mStr
-            set output to output & h & ":" & mStr & ampm & " " & evTitle & "\\n"
+            set output to output & calName & "\\t" & h & ":" & mStr & ampm & " " & evTitle & "\\n"
         end repeat
     end repeat
 end tell
@@ -120,11 +127,36 @@ return output
     result = _run_applescript(script, timeout=10)
     if not result:
         return []
+    import os as _os
+    skip_cals_raw = _os.environ.get("MORNING_BRIEFING_SKIP_CALENDARS", "")
+    skip_cals = {c.strip().lower() for c in skip_cals_raw.split(",") if c.strip()}
+    # Dedup by (time_str, title) — cross-calendar duplication (#966).
+    seen: set[str] = set()
     events = []
     for line in result.splitlines():
         line = line.strip()
-        if line:
-            events.append({"raw": line})
+        if not line:
+            continue
+        # New format: "CalendarName\t10:30am Title"
+        if "\t" in line:
+            cal_name, _, event_str = line.partition("\t")
+        else:
+            cal_name, event_str = "", line
+        # Filter by calendar skip-list (closes #964).
+        if cal_name.lower() in skip_cals:
+            continue
+        event_str = event_str.strip()
+        # Skip untitled events (closes #967): drop if nothing follows the
+        # time token (AppleScript returns "10:30am " with empty title).
+        parts = event_str.split(" ", 1)
+        if len(parts) < 2 or not parts[1].strip():
+            continue
+        # Dedup cross-calendar events with identical time+title (#966).
+        key = event_str.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        events.append({"raw": event_str, "calendar": cal_name})
     return events
 
 
