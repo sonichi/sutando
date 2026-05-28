@@ -175,13 +175,19 @@ ACCESS_FILE = Path.home() / ".claude" / "channels" / "slack" / "access.json"
 # between bridge events; without this cache the bridge re-TOFUs on the
 # next inbound message, wiping tierMap / manually-added allowFrom entries).
 _access_cache: dict | None = None
+_access_cache_mtime: float = 0.0
 _access_cache_lock = threading.Lock()
 
 
 def _update_access_cache(data: dict) -> None:
-    global _access_cache
+    global _access_cache, _access_cache_mtime
+    try:
+        mtime = ACCESS_FILE.stat().st_mtime
+    except OSError:
+        mtime = 0.0
     with _access_cache_lock:
         _access_cache = data
+        _access_cache_mtime = mtime
 
 
 def _restore_access_from_cache() -> bool:
@@ -227,8 +233,13 @@ def load_tier_map() -> dict:
     where every entry in `allowFrom` was treated as owner-tier."""
     with _access_cache_lock:
         cached = _access_cache
+        cached_mtime = _access_cache_mtime
     if cached is not None:
-        return cached.get("tierMap") or {}
+        try:
+            if ACCESS_FILE.stat().st_mtime == cached_mtime:
+                return cached.get("tierMap") or {}
+        except OSError:
+            pass  # file deleted — fall through to re-read (will return {})
     try:
         data = json.loads(ACCESS_FILE.read_text())
         _update_access_cache(data)
