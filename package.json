@@ -17,7 +17,7 @@
     "@google/genai": "^1.49.0",
     "@types/ws": "^8.18.1",
     "ai": "^6.0.149",
-    "bodhi-realtime-agent": "github:weslien/bodhi_realtime_agent#d3a962b",
+    "bodhi-realtime-agent": "git+https://github.com/weslien/bodhi_realtime_agent.git#ad45c59",
     "discord.js": "^14.26.4",
     "dotenv": "^17.4.1",
     "libsodium-wrappers": "^0.8.4",
