@@ -209,10 +209,21 @@ else
   export ANTHROPIC_BASE_URL=http://localhost:7846
 fi
 
-# 1. Voice agent (Gemini Live on port 9900)
+# 1. Voice agent (port 9900)
+#
+# VOICE_BACKEND selects the realtime transport:
+#   gemini       (default) — Gemini Live, uses GEMINI_API_KEY / GEMINI_VOICE_API_KEY
+#   gpt-realtime           — Azure-hosted GPT Realtime, uses AZURE_OPENAI_API_KEY +
+#                            AZURE_OPENAI_ENDPOINT (see .env / .env.example)
+# Both run through the same voice-agent.ts on :9900; only the transport differs.
+VOICE_BACKEND_NORMALIZED="$(printf '%s' "${VOICE_BACKEND:-gemini}" | tr '[:upper:]' '[:lower:]')"
 if ! lsof -i :9900 > /dev/null 2>&1; then
-  echo "  Starting voice agent (port 9900)..."
-  npx tsx src/voice-agent.ts > "$LOGS_DIR/voice-agent.log" 2>&1 &
+  if [ "$VOICE_BACKEND_NORMALIZED" = gpt-realtime ]; then
+    echo "  Starting voice agent (Azure GPT Realtime, port 9900)..."
+  else
+    echo "  Starting voice agent (Gemini Live, port 9900)..."
+  fi
+  VOICE_BACKEND="$VOICE_BACKEND_NORMALIZED" npx tsx src/voice-agent.ts > "$LOGS_DIR/voice-agent.log" 2>&1 &
   echo "  ✓ voice agent"
 else
   echo "  ✓ voice agent (already running)"

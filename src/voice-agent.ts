@@ -37,6 +37,7 @@ import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { VoiceSession } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
+import { buildAzureRealtimeTransport } from './voice-backends/azure-realtime.js';
 function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
 import { workTool, startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
 import { recordSession, recordToolCall } from './conversation-store.js';
@@ -231,6 +232,11 @@ if (CARTESIA_API_KEY) {
 // their own key or routing to `createGoogleGenerativeAI({apiKey:GEMINI_API_KEY})`.
 const google = createGoogleGenerativeAI({ apiKey: GEMINI_VOICE_API_KEY });
 let sessionRef: VoiceSession | null = null;
+
+// Voice backend selector. Default 'gemini' = Gemini Live (unchanged). Set
+// VOICE_BACKEND=gpt-realtime to route the session through the Azure-hosted
+// GPT Realtime transport instead (see src/voice-backends/azure-realtime.ts).
+const VOICE_BACKEND = (process.env.VOICE_BACKEND || 'gemini').toLowerCase();
 
 function ts(): string { return new Date().toISOString().slice(11, 23); }
 
@@ -936,6 +942,11 @@ async function main() {
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
 		speechConfig: { voiceName: VOICE_NAME },
 		inputAudioTranscription: true,
+		// When VOICE_BACKEND=gpt-realtime, override Gemini Live with the
+		// Azure-hosted GPT Realtime transport. The apiKey/geminiModel/
+		// speechConfig fields above are ignored when `transport` is set
+		// (per bodhi's VoiceSessionConfig contract).
+		...(VOICE_BACKEND === 'gpt-realtime' ? { transport: buildAzureRealtimeTransport() } : {}),
 		hooks: {
 			onSessionStart: (e) => {
 				userTurnCount = 0; userHasInterrupted = false; sessionEnding = false;
