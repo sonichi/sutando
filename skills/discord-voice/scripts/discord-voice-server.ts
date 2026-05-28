@@ -30,7 +30,8 @@
  */
 
 import { config as _dotenvConfig } from 'dotenv';
-import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, existsSync, readFileSync, readdirSync, unlinkSync } from 'node:fs';
+import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, createWriteStream, existsSync, readFileSync, readdirSync, unlinkSync } from 'node:fs';
+import type { WriteStream } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { resolveWorkspace } from '../../../src/workspace_default.js';
 import { recordConversation, recordSession, recordToolCall } from '../../../src/conversation-store.js';
@@ -217,6 +218,13 @@ if (!GUILD_ID || !CHANNEL_ID) {
 mkdirSync(DATA_DIR, { recursive: true });
 mkdirSync(RESULTS_DIR, { recursive: true });
 mkdirSync(TASKS_DIR, { recursive: true });
+mkdirSync(dirname(DISCORD_VOICE_LOG), { recursive: true });
+
+let _opLogStream: WriteStream | null = null;
+try {
+	_opLogStream = createWriteStream(DISCORD_VOICE_LOG, { flags: 'a' });
+	_opLogStream.on('error', () => { _opLogStream = null; });
+} catch {}
 
 const ts = () => new Date().toISOString().slice(11, 23);
 const google = createGoogleGenerativeAI({ apiKey: GEMINI_API_KEY });
@@ -265,8 +273,7 @@ function appendOperationalLog(level: string, args: unknown[]): void {
 		const line = args
 			.map((a) => (typeof a === 'string' ? a : a instanceof Error ? (a.stack ?? a.message) : String(a)))
 			.join(' ');
-		mkdirSync(dirname(DISCORD_VOICE_LOG), { recursive: true });
-		appendFileSync(DISCORD_VOICE_LOG, `${new Date().toISOString()} ${level} ${line}\n`);
+		_opLogStream?.write(`${new Date().toISOString()} ${level} ${line}\n`);
 	} catch {}
 }
 {
