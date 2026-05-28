@@ -78,7 +78,7 @@ TMUX_SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 _tmux_wake() {
   # Poke the idle CLI session so it processes the new task without waiting
   # for the next 5-min proactive-loop cron tick (sutando-skills#27).
-  tmux -S "$TMUX_SOCK" send-keys -t "$TMUX_SESSION" 'process new task' Enter 2>/dev/null || true
+  tmux -S "$TMUX_SOCK" send-keys -t "$TMUX_SESSION" '[watcher-ping]' Enter 2>/dev/null || true
 }
 
 # Initial sweep — surface any pre-existing tasks that arrived during a
