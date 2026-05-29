@@ -1,6 +1,6 @@
 # Pointer Teacher — Design
 
-Bring Clicky's embodied "learn by doing" mechanism into Sutando: an on-screen guide that watches the user's real screen, talks, and **flies a marker to the thing it's teaching**. Domain vocabulary: [`CONTEXT.md`](../CONTEXT.md). Pointer-brain decision: [ADR-0001](./adr/0001-pointer-teacher-brain.md). Empirical findings memory: `project_pointer_teacher_ax_findings.md`.
+Bring Clicky's embodied "learn by doing" mechanism into Sutando: an on-screen guide that watches the user's real screen, talks, and **flies a marker to the thing it's teaching**. Domain vocabulary: [`CONTEXT.md`](../skills/pointer-teacher-tracer/CONTEXT.md). Pointer-brain decision: [ADR-0001](./adr/0001-pointer-teacher-brain.md). Empirical findings memory: `project_pointer_teacher_ax_findings.md`.
 
 ## 1. What we are bringing (and why)
 
