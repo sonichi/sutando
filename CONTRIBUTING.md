@@ -118,7 +118,7 @@ A Sutando bot (or any LLM agent) can crank out PRs much faster than a maintainer
 
 Concrete norms:
 
-- **Cap your in-flight PRs.** Default soft cap: 5 open per author at a time. If you're at the cap, land or close before opening more.
+- **Cap your in-flight PRs.** Land or close existing ones before opening more — don't let the queue balloon faster than maintainers can review.
 - **Always read the bot's diff before pushing.** "I trust the agent" is not enough — agents miss conventions, hallucinate referenced files (see item 1), and sometimes regenerate unrelated areas.
 - **No "drive-by" repo-wide refactors.** If the agent suggests one, open ONE small PR with the proposal first, get sign-off, then expand.
 - **Take responsibility for what your bot ships.** PRs authored by a bot you operate are *your* PRs — your CLA, your review feedback to address, your closes-link to file.
