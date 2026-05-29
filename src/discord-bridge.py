@@ -56,6 +56,8 @@ from workspace_default import resolve_workspace  # noqa: E402
 import discord_config  # noqa: E402  — Sutando workspace-local discord config (#1147)
 from util_paths import shared_personal_path  # noqa: E402
 from task_priority import default_priority_for_source  # noqa: E402
+from task_archive import find_task_file  # noqa: E402
+from result_markers import parse_markers  # noqa: E402
 REPO = resolve_workspace()
 
 # discord-voice "magic word" join trigger (issue: za-warudo summon). The
@@ -2013,6 +2015,55 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 
 
+def _recover_orphan_sending_files() -> int:
+    """Restart-safety: rename any orphan `results/proactive-*.sending`
+    files back to `*.txt` so they get re-claimed on the next poll.
+    Returns the number of files recovered.
+
+    Atomic-claim-by-rename (`proactive-*.txt` → `.sending`) prevents
+    same-tick double-deliveries between concurrent poll iterations.
+    But if the bridge crashes BETWEEN the rename and the delivery,
+    the `.sending` file sits orphaned in `results/` — no poll
+    iteration ever looks at `.sending` suffixes, so the owner
+    notification is silently dropped until next manual intervention.
+
+    This function runs on startup to bring orphans back into the
+    polling stream. Idempotent: a second call sees no `.sending`
+    files and is a no-op. Fail-open: any per-file error is logged
+    but doesn't block the bridge from starting.
+    """
+    if not RESULTS_DIR.exists():
+        return 0
+    recovered = 0
+    for f in RESULTS_DIR.iterdir():
+        if not (f.name.startswith("proactive-") and f.suffix == ".sending"):
+            continue
+        target = f.with_suffix(".txt")
+        try:
+            # Don't clobber a same-named .txt that somehow re-appeared
+            # (e.g. an operator manually re-dropped the file). The
+            # atomic-claim invariant guarantees they don't normally
+            # coexist, but be defensive on startup.
+            if target.exists():
+                print(
+                    f"  [startup] skipping orphan recovery: {target.name} "
+                    f"already exists (collision with {f.name})",
+                    flush=True,
+                )
+                continue
+            f.rename(target)
+            recovered += 1
+            print(f"  [startup] recovered orphan {f.name} → {target.name}", flush=True)
+        except FileNotFoundError:
+            # Lost the race to another process; that's fine.
+            pass
+        except Exception as e:
+            print(f"  [startup] failed to recover {f.name}: {e}", flush=True)
+    if recovered:
+        print(f"  [startup] recovered {recovered} orphan .sending file(s)", flush=True)
+    return recovered
+
+
 @client.event
 async def on_ready():
     print(f"Discord bridge ready: {client.user}")
@@ -2029,6 +2080,9 @@ async def on_ready():
         discord_config.auto_seed_if_missing(_initial_access)
     except Exception as _seed_exc:
         print(f"  [discord-config] auto-seed failed (non-fatal): {_seed_exc}")
+    # Restart-safety: sweep orphan `.sending` files before the poll
+    # loops start. See _recover_orphan_sending_files for rationale.
+    _recover_orphan_sending_files()
     # Restart-safety: REST-catch-up missed DMs from the disconnect
     # window. Discord gateway IDENTIFY (post-RESUME-expiry reconnect)
     # does NOT replay `MESSAGE_CREATE` events that arrived during the
@@ -3092,15 +3146,17 @@ async def poll_results():
                 # re-fire infinitely on the leftover task. Observed 2026-04-17:
                 # `[no-send]` tasks persisted in tasks/ because `continue`
                 # skipped the cleanup block at the bottom of this loop.
-                if reply_text.startswith('[no-send]') or reply_text.startswith('[REPLIED]') or reply_text.startswith('[deduped:'):
-                    # `[deduped: <id>]` = agent consolidated this task's reply
-                    # into another task's result. Silent archive, no Discord
-                    # post — same UX as [no-send] / [REPLIED].
+                _parsed = parse_markers(reply_text)
+                if any(a.kind == "skip" for a in _parsed.actions):
+                    # [no-send] / [REPLIED] / [deduped:] — silent archive.
                     print(f"  Skipped (already replied or deduped): {task_id}")
                     archive_file(result_file, "results", task_id)
-                    task_file = TASKS_DIR / f"{task_id}.txt"
+                    task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
                     archive_file(task_file, "tasks", task_id)
                     continue
+                # Strip all protocol markers from working text (channel, file,
+                # etc.) so downstream handling operates on clean content.
+                reply_text = _parsed.body
 
                 # Idempotency check: if the previous run already sent
                 # this reply (sentinel present) but crashed BEFORE the
@@ -3111,7 +3167,7 @@ async def poll_results():
                 if _is_delivered(task_id):
                     print(f"  Skipped (already delivered per sentinel): {task_id}", flush=True)
                     archive_file(result_file, "results", task_id)
-                    task_file = TASKS_DIR / f"{task_id}.txt"
+                    task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
                     archive_file(task_file, "tasks", task_id)
                     _clear_delivered(task_id)
                     continue
@@ -3164,11 +3220,13 @@ async def poll_results():
                     # spaces. We read the tier back from the task file rather
                     # than threading it through pending_replies so the gate
                     # survives a bridge restart.
-                    channel_pattern = re.compile(r'\[channel:\s*(\d{17,20})\]')
-                    channel_match = channel_pattern.search(reply_text)
-                    if channel_match:
-                        target_channel_id = int(channel_match.group(1))
-                        reply_text = channel_pattern.sub('', reply_text).strip()
+                    #
+                    # The [channel:] marker is already stripped from reply_text
+                    # by parse_markers() above; we extract the target from
+                    # _parsed.actions to avoid a second regex pass.
+                    _redirect_action = next((a for a in _parsed.actions if a.kind == "redirect"), None)
+                    if _redirect_action:
+                        target_channel_id = int(_redirect_action.value)
                         task_tier = "other"
                         try:
                             task_body = (TASKS_DIR / f"{task_id}.txt").read_text()
@@ -3207,8 +3265,9 @@ async def poll_results():
                             except Exception as e:
                                 print(f"  [channel-redirect] failed to resolve channel {target_channel_id}, falling back to task source: {e}", flush=True)
 
-                    # Extract file paths: [file: /path] or [send: /path]
-                    clean_text, files = _split_file_markers(reply_text)
+                    # File paths extracted by parse_markers() above; body already clean.
+                    clean_text = reply_text
+                    files = [a.value for a in _parsed.actions if a.kind == "attach"]
 
                     # Send text — fence-aware chunker preserves triple-backtick code blocks
                     # First chunk uses message_reference (if set); subsequent chunks
@@ -3378,8 +3437,12 @@ async def poll_proactive():
                     try:
                         user = await client.fetch_user(int(owner_id))
                         dm = await user.create_dm()
-                        # Extract files
-                        clean_text, files = _split_file_markers(text)
+                        # Parse protocol markers (skip / redirect / attach).
+                        # parse_markers strips all markers from .body and
+                        # surfaces them as typed actions — no hand-rolled regex.
+                        _pp = parse_markers(text)
+                        clean_text = _pp.body
+                        files = [a.value for a in _pp.actions if a.kind == "attach"]
 
                         # #1147 follow-up — owner-greenlit 2026-05-26 DM
                         # ("yes" greenlight in DM):
@@ -3403,11 +3466,10 @@ async def poll_proactive():
                         #     operator needs to detect the misroute (per
                         #     the 2026-05-26 catch — silently stripping
                         #     would have hidden the bug).
-                        _channel_redirect_re = re.compile(r'\[channel:\s*(\d{17,20})\]')
-                        _channel_match = _channel_redirect_re.search(clean_text)
-                        if _channel_match:
-                            _target_id = int(_channel_match.group(1))
-                            _redirect_text = _channel_redirect_re.sub('', clean_text).strip()
+                        _redirect_proactive = next((a for a in _pp.actions if a.kind == "redirect"), None)
+                        if _redirect_proactive:
+                            _target_id = int(_redirect_proactive.value)
+                            _redirect_text = clean_text  # already stripped by parse_markers
                             _target_ch = None
                             try:
                                 _target_ch = client.get_channel(_target_id)
@@ -3544,8 +3606,8 @@ async def poll_dm_fallback():
                     # Archive matching task file so audit_orphan_tasks sees
                     # the task as processed (even if drop-without-reply).
                     _task_id = f.stem
-                    _task_file = TASKS_DIR / f"{_task_id}.txt"
-                    if _task_file.exists():
+                    _task_file = find_task_file(TASKS_DIR, _task_id)
+                    if _task_file:
                         archive_file(_task_file, "tasks", _task_id)
                     continue
                 # Stop retrying after 24h. Without this cap, a permanent
@@ -3557,8 +3619,8 @@ async def poll_dm_fallback():
                     print(f"  [dm-fallback] dropping stale {f.name} (age={int(age)}s)", flush=True)
                     f.unlink(missing_ok=True)
                     _task_id = f.stem
-                    _task_file = TASKS_DIR / f"{_task_id}.txt"
-                    if _task_file.exists():
+                    _task_file = find_task_file(TASKS_DIR, _task_id)
+                    if _task_file:
                         archive_file(_task_file, "tasks", _task_id)
                     continue
                 # Honor result-body suppression markers (parity with the
@@ -3570,11 +3632,12 @@ async def poll_dm_fallback():
                     _peek = f.read_text(encoding="utf-8", errors="replace").lstrip()
                 except OSError:
                     _peek = ""
-                if _peek.startswith('[no-send]') or _peek.startswith('[REPLIED]') or _peek.startswith('[deduped:'):
+                _parsed_fb = parse_markers(_peek)
+                if any(a.kind == "skip" for a in _parsed_fb.actions):
                     print(f"  [dm-fallback] skipped (suppression marker): {f.name}", flush=True)
                     _task_id = f.stem
-                    _task_file = TASKS_DIR / f"{_task_id}.txt"
-                    if _task_file.exists():
+                    _task_file = find_task_file(TASKS_DIR, _task_id)
+                    if _task_file:
                         archive_file(_task_file, "tasks", _task_id)
                     archive_file(f, "results", _task_id)
                     continue
@@ -3585,11 +3648,10 @@ async def poll_dm_fallback():
                 # (a) leak the literal `[channel: <id>]` string into the
                 # owner's DM via dm-result.py, or (b) lose the redirect intent
                 # entirely. Both modes break the marker's contract.
-                channel_pattern = re.compile(r'\[channel:\s*(\d{17,20})\]')
-                channel_match = channel_pattern.search(_peek)
-                if channel_match:
-                    target_channel_id = int(channel_match.group(1))
-                    clean_body = channel_pattern.sub('', _peek).strip()
+                _redirect_fb = next((a for a in _parsed_fb.actions if a.kind == "redirect"), None)
+                if _redirect_fb:
+                    target_channel_id = int(_redirect_fb.value)
+                    clean_body = _parsed_fb.body  # already stripped by parse_markers
                     _task_id = f.stem
                     # Tier read from task file. Default "other" on missing /
                     # unreadable: voice- and cron-originated tasks don't write
@@ -3620,7 +3682,8 @@ async def poll_dm_fallback():
                             print(f"  [dm-fallback channel-redirect] failed to resolve {target_channel_id}: {e}", flush=True)
                         if target_channel:
                             # File markers (parity with poll_results 2761-2784).
-                            text_only, file_list = _split_file_markers(clean_body)
+                            text_only = clean_body  # _parsed_fb.body already stripped
+                            file_list = [a.value for a in _parsed_fb.actions if a.kind == "attach"]
                             if text_only:
                                 for chunk in _chunk_for_discord(text_only):
                                     await target_channel.send(chunk)
@@ -3717,8 +3780,8 @@ async def poll_dm_fallback():
                     except OSError:
                         _result_text = ""
                     archive_file(f, "results", _task_id)
-                    _task_file = TASKS_DIR / f"{_task_id}.txt"
-                    if _task_file.exists():
+                    _task_file = find_task_file(TASKS_DIR, _task_id)
+                    if _task_file:
                         archive_file(_task_file, "tasks", _task_id)
                     if _result_text and _task_id.startswith("task-"):
                         # urlopen is blocking — run in thread so we don't stall

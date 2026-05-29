@@ -485,13 +485,15 @@ def check_voice_transport(voice_check: dict) -> dict:
         # 1011-after-GoAway as a fail, the probe reports a false
         # positive every time voice sits idle for 10+ minutes.
         most_recent_abnormal: Optional[str] = None
+        most_recent_abnormal_lineno: int = -1  # relative to banner_idx
         abnormal_recovered = False
         goaway_before_close = False  # GoAway seen since the last setup/close
-        for line in lines[banner_idx:]:
+        for rel_i, line in enumerate(lines[banner_idx:]):
             if "Gemini setup complete" in line or "LLM transport connected and setup complete" in line:
                 if most_recent_abnormal is not None:
                     abnormal_recovered = True
                     most_recent_abnormal = None
+                    most_recent_abnormal_lineno = -1
                 goaway_before_close = False
             elif "GoAway from Gemini" in line:
                 goaway_before_close = True
@@ -501,19 +503,46 @@ def check_voice_transport(voice_check: dict) -> dict:
                     continue
                 if m_code in VOICE_TRANSPORT_HEALTHY_CLOSE_CODES:
                     most_recent_abnormal = None
+                    most_recent_abnormal_lineno = -1
                     goaway_before_close = False
                 elif goaway_before_close:
                     # Idle timeout path — Google warned, then closed. Not an error.
                     most_recent_abnormal = None
+                    most_recent_abnormal_lineno = -1
                     goaway_before_close = False
                 else:
                     most_recent_abnormal = line
+                    most_recent_abnormal_lineno = rel_i
                     abnormal_recovered = False
         if most_recent_abnormal is not None:
             reason = _extract_close_reason(most_recent_abnormal) or "unknown"
             code = _extract_close_code(most_recent_abnormal) or "?"
-            check["status"] = "fail"
-            check["detail"] = f"unrecovered transport close: code={code} reason={reason[:80]}"
+            # Count [Health] state=CONNECTING lines after the abnormal close.
+            # The health ticker fires every ~30s; >20 consecutive CONNECTING
+            # lines = stuck for >10 min and bodhi won't self-recover.
+            connecting_after = sum(
+                1 for ln in lines[banner_idx + most_recent_abnormal_lineno + 1:]
+                if "[Health] state=CONNECTING" in ln
+            ) if most_recent_abnormal_lineno >= 0 else 0
+            if connecting_after > 20:
+                elapsed_min = connecting_after * 30 // 60
+                check["status"] = "fail"
+                check["detail"] = f"stuck CONNECTING ~{elapsed_min}min after code={code} transport close — needs kickstart"
+                check["_stuck_connecting"] = True
+            elif code == "1006":
+                # code=1006 is an abnormal network close (often a DNS blip). If DNS
+                # resolves now the transport will self-recover on next client connect
+                # — downgrade to warn so the dashboard isn't stuck on red.
+                try:
+                    socket.getaddrinfo("generativelanguage.googleapis.com", 443)
+                    check["status"] = "warn"
+                    check["detail"] = "transient network drop (code=1006, DNS ok now — will recover on next connect)"
+                except OSError:
+                    check["status"] = "fail"
+                    check["detail"] = "network drop code=1006 and DNS still failing"
+            else:
+                check["status"] = "fail"
+                check["detail"] = f"unrecovered transport close: code={code} reason={reason[:80]}"
         elif abnormal_recovered:
             check["detail"] = "transport recovered after earlier error"
     except OSError as e:
@@ -736,6 +765,34 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> 
     return {"name": name, "status": "ok", "detail": f"{len(files)} task(s), oldest {oldest_age}s"}
 
 
+def check_notes_split_brain() -> "dict | None":
+    """Detect notes/ split-brain (#1266): overlapping .md files in both
+    <repo>/notes/ and <workspace>/notes/ — fires only when the two paths differ."""
+    repo_notes = REPO_DIR / "notes"
+    ws_notes = Path(shared_personal_path("notes", WORKSPACE_DIR))
+    if repo_notes.resolve() == ws_notes.resolve():
+        return None
+    if not repo_notes.exists() or not ws_notes.exists():
+        return None
+    repo_files = {p.name for p in repo_notes.glob("*.md")}
+    ws_files = {p.name for p in ws_notes.glob("*.md")}
+    overlap = repo_files & ws_files
+    if not overlap:
+        return None
+    examples = ", ".join(sorted(overlap)[:3])
+    tail = f" … and {len(overlap) - 3} more" if len(overlap) > 3 else ""
+    return {
+        "name": "notes-split-brain",
+        "status": "warn",
+        "detail": (
+            f"{len(overlap)} .md file(s) duplicated across <repo>/notes/ and <workspace>/notes/ "
+            f"— edits to one side are invisible to the other. "
+            f"Run scripts/sutando-migrate.sh to consolidate. "
+            f"Overlap: {examples}{tail}"
+        ),
+    }
+
+
 def run_all_checks() -> list[dict]:
     checks = []
 
@@ -784,6 +841,11 @@ def run_all_checks() -> list[dict]:
     # ~/.sutando/workspace/notes rather than <repo>/notes — the notes/
     # .gitkeep was removed from the repo in #793's workspace migration.
     checks.append(check_directory(Path(shared_personal_path("notes", WORKSPACE_DIR)), "notes-dir"))
+
+    # Notes split-brain: both <repo>/notes/ and <workspace>/notes/ with overlapping files (#1266)
+    _notes_sb = check_notes_split_brain()
+    if _notes_sb:
+        checks.append(_notes_sb)
 
     # Memory sync
     checks.append(check_memory_sync())
@@ -970,6 +1032,27 @@ def run_all_checks() -> list[dict]:
                         break
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             pass
+
+        # Check 6: Log-content health for known failure modes.
+        # discord-bridge: LoginFailure means the token is revoked/invalid.
+        #   Always overrides — there is no point restarting with stale code
+        #   if the token is bad; the token fix is the only path forward.
+        # slack-bridge: "60s elapsed" hint means Socket Mode connected but
+        #   events aren't routing (Slack app Event Subscriptions disabled).
+        #   Only overrides "ok" — stale/dead-inode are higher priority.
+        if log_file.exists() and name in ("discord-bridge", "slack-bridge"):
+            try:
+                tail = log_file.read_text(errors="replace").splitlines()[-60:]
+                if name == "discord-bridge":
+                    if any("LoginFailure" in ln or "Improper token" in ln for ln in tail):
+                        status = "fail"
+                        detail = "token invalid (LoginFailure) — regenerate at discord.com/developers/applications"
+                elif name == "slack-bridge" and status == "ok":
+                    if any("60s elapsed with zero events" in ln for ln in tail):
+                        status = "warn"
+                        detail = "connected but events not arriving — enable Event Subscriptions at api.slack.com/apps"
+            except OSError:
+                pass
 
         checks.append({"name": name, "status": status, "detail": detail})
 
@@ -1306,50 +1389,71 @@ def main():
                     result = fix_launchd(c["name"])
                     print(f"  {c['name']}: {result}")
                 elif c["name"] in ("telegram-bridge", "discord-bridge"):
-                    # If stale (process older than source code), kill old PID first
-                    # so the new process doesn't conflict with a still-running zombie.
-                    if c["status"] == "stale":
-                        try:
-                            # Anchor to `\.py$` to match the detect path at
-                            # line ~277. Without this, a bare `pgrep -f
-                            # discord-bridge` also catches grep pipelines
-                            # and shell invocations whose command line
-                            # contains the bridge name, and we'd kill them
-                            # instead of (or in addition to) the real
-                            # bridge process. PR #243 fixed the detect
-                            # side; this keeps the kill side consistent.
-                            old_pids = subprocess.run(
-                                ["/usr/bin/pgrep", "-f", f"{c['name']}\\.py$"], capture_output=True, text=True
-                            ).stdout.strip().split("\n")
-                            for pid in old_pids:
-                                if pid:
-                                    subprocess.run(["/bin/kill", pid], check=False)
-                            import time as _t; _t.sleep(1)
-                        except Exception:
-                            pass
-                    # Use sys.executable to avoid launchd's minimal PATH
-                    # resolving `python3` to /usr/bin/python3 (3.9), which
-                    # doesn't have the homebrew site-packages (discord,
-                    # dotenv, etc.) — restart would crash on import.
-                    # Log path uses logs/ (post-PR #251 refactor).
-                    subprocess.Popen([sys.executable, str(REPO_DIR / "src" / f"{c['name']}.py")],
-                                     stdout=open(str(WORKSPACE_DIR / "logs" / f"{c['name']}.log"), "a"),
-                                     stderr=subprocess.STDOUT, start_new_session=True)
-                    print(f"  {c['name']}: {'restarted (stale code)' if c['status'] == 'stale' else 'restarted'}")
+                    # LoginFailure means the token is bad — restarting won't help
+                    # and would create a duplicate alongside the launchd-managed one.
+                    if "LoginFailure" in c.get("detail", "") or "token invalid" in c.get("detail", ""):
+                        print(f"  {c['name']}: token invalid — regenerate at discord.com/developers/applications (no restart)")
+                    else:
+                        # If stale (process older than source code), kill old PID first
+                        # so the new process doesn't conflict with a still-running zombie.
+                        if c["status"] == "stale":
+                            try:
+                                # Anchor to `\.py$` to match the detect path at
+                                # line ~277. Without this, a bare `pgrep -f
+                                # discord-bridge` also catches grep pipelines
+                                # and shell invocations whose command line
+                                # contains the bridge name, and we'd kill them
+                                # instead of (or in addition to) the real
+                                # bridge process. PR #243 fixed the detect
+                                # side; this keeps the kill side consistent.
+                                old_pids = subprocess.run(
+                                    ["/usr/bin/pgrep", "-f", f"{c['name']}\\.py$"], capture_output=True, text=True
+                                ).stdout.strip().split("\n")
+                                for pid in old_pids:
+                                    if pid:
+                                        subprocess.run(["/bin/kill", pid], check=False)
+                                import time as _t; _t.sleep(1)
+                            except Exception:
+                                pass
+                        # Use sys.executable to avoid launchd's minimal PATH
+                        # resolving `python3` to /usr/bin/python3 (3.9), which
+                        # doesn't have the homebrew site-packages (discord,
+                        # dotenv, etc.) — restart would crash on import.
+                        # Log path uses logs/ (post-PR #251 refactor).
+                        subprocess.Popen([sys.executable, str(REPO_DIR / "src" / f"{c['name']}.py")],
+                                         stdout=open(str(WORKSPACE_DIR / "logs" / f"{c['name']}.log"), "a"),
+                                         stderr=subprocess.STDOUT, start_new_session=True)
+                        print(f"  {c['name']}: {'restarted (stale code)' if c['status'] == 'stale' else 'restarted'}")
                 elif c["name"] == "sutando-app":
-                    # Stale here means main.swift is newer than the binary's
-                    # process start time. The bare Popen below was leaking
-                    # duplicates (macOS doesn't enforce singleton on this
-                    # bundle — observed 3 concurrent on 2026-04-19) AND it
-                    # was relaunching the same stale binary, so the stale
-                    # signal kept re-firing every cron pass.
-                    #
-                    # Real fix needs (a) pkill the existing PID, (b) swiftc
-                    # rebuild if source > binary, (c) `open src/Sutando/Sutando`.
-                    # Until that lands, surface the warning instead of
-                    # pretending we fixed it. Chi rebuilds + relaunches
-                    # manually per feedback_sutando_app_launch_method.md.
-                    print(f"  {c['name']}: not auto-fixed — needs manual rebuild + relaunch (see memory feedback_sutando_app_launch_method.md)")
+                    # Two distinct failure modes:
+                    #   1. status="warn" + detail="not running …" → binary may
+                    #      already be fresh; just needs to be launched. Safe
+                    #      to auto-fix via `open` (singleton enforcement is
+                    #      not at risk because no PID exists yet).
+                    #   2. status="stale" → main.swift is newer than the
+                    #      running binary's process start time. Real fix
+                    #      needs pkill + swiftc rebuild + open; an earlier
+                    #      auto-fix path leaked duplicate instances (macOS
+                    #      doesn't enforce singleton on this bundle —
+                    #      observed 3 concurrent on 2026-04-19), so we
+                    #      defer that path to a manual rebuild + relaunch.
+                    binary = REPO_DIR / "src" / "Sutando" / "Sutando"
+                    source = REPO_DIR / "src" / "Sutando" / "main.swift"
+                    if (
+                        c.get("status") == "warn"
+                        and "not running" in (c.get("detail") or "")
+                        and binary.exists()
+                        and source.exists()
+                        and binary.stat().st_mtime >= source.stat().st_mtime
+                    ):
+                        try:
+                            subprocess.run(["/usr/bin/open", str(binary)],
+                                           check=True, timeout=5)
+                            print(f"  {c['name']}: launched (binary fresh, no rebuild needed)")
+                        except Exception as e:
+                            print(f"  {c['name']}: launch failed ({type(e).__name__}: {e}) — try `open {binary}` manually")
+                    else:
+                        print(f"  {c['name']}: not auto-fixed — needs manual rebuild + relaunch (see memory feedback_sutando_app_launch_method.md)")
                 elif c["name"] == "ngrok":
                     # Read ngrok domain from .env if set, otherwise use default
                     env_path = REPO_DIR / ".env"
@@ -1371,6 +1475,9 @@ def main():
                     subprocess.run([ts_bin, "funnel", "--bg", "3100"],
                                    capture_output=True, timeout=10)
                     print(f"  {c['name']}: restarted")
+                elif c["name"] == "voice-transport" and c.get("_stuck_connecting"):
+                    result = fix_launchd("com.sutando.voice-agent")
+                    print(f"  voice-agent (stuck CONNECTING): {result}")
                 elif c["name"] == "conversation-server":
                     # If stale, kill old PIDs first so the new process doesn't
                     # bind-fail or end up alongside a still-running zombie.
