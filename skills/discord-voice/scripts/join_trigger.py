@@ -189,7 +189,7 @@ def _server_already_running(channel_id) -> bool:
     return False
 
 
-def _spawn_voice_server(guild_id, channel_id) -> bool:
+def _spawn_voice_server(guild_id, channel_id, reply_channel_id=None, reply_user_id=None) -> bool:
     """Launch discord-voice-server.ts detached for guild+channel. Returns True
     on a successful spawn (the subprocess was started — not that it connected).
 
@@ -197,6 +197,13 @@ def _spawn_voice_server(guild_id, channel_id) -> bool:
       env -u GEMINI_API_KEY DISCORD_VOICE_SERVER=1 \
         npx tsx skills/discord-voice/scripts/discord-voice-server.ts \
         --guild <GUILD_ID> --channel <VC_ID>
+
+    Optional `reply_channel_id` + `reply_user_id` (#1120): when provided, the
+    spawned voice-server uses them to post the Layer-1 refusal message back
+    to the originating text-channel (mentioning the inviting user), instead
+    of writing a proactive-*.txt that falls back to owner-DM. "Reply where
+    invited" — feedback Susan gave when the refusal DM mis-landed on a
+    non-owner due to access.json ordering.
 
     `GEMINI_API_KEY` is unset for the child (the voice server uses its own
     GEMINI_VOICE_API_KEY path) — matches the documented invocation. Detached
@@ -225,6 +232,10 @@ def _spawn_voice_server(guild_id, channel_id) -> bool:
         "--channel",
         str(channel_id),
     ]
+    if reply_channel_id is not None:
+        argv.extend(["--reply-channel", str(reply_channel_id)])
+    if reply_user_id is not None:
+        argv.extend(["--reply-user", str(reply_user_id)])
     try:
         subprocess.Popen(
             argv,
@@ -278,6 +289,17 @@ def _enqueue_context_prep_task(phrase: str, channel_id, channel_name: str) -> No
         ts_ms = int(time.time() * 1000)
         iso_now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         owner_id = os.environ.get("SUTANDO_DM_OWNER_ID", "").strip() or "owner"
+        # Per-channel pull key for the consumer-side scan in
+        # discord-voice-server.ts. Routed through the typed constructor so the
+        # writer and consumer always agree on the `dvoice-` prefix (PR #1090).
+        try:
+            sys.path.insert(0, str(_REPO_ROOT / "src"))
+            from result_channel_key import discord_voice_key  # type: ignore
+            scoped_key = discord_voice_key(str(channel_id))
+        except Exception:
+            # Fallback mirrors the constructor's contract — if the import fails
+            # the writer still produces the same shape the consumer scans for.
+            scoped_key = f"dvoice-{channel_id}"
         # Body instructs the core to write a SCOPED result file the voice
         # session will pick up via the per-channel pull namespace. No user
         # content in this body — the core fills the result file from its
@@ -286,13 +308,14 @@ def _enqueue_context_prep_task(phrase: str, channel_id, channel_name: str) -> No
             f"[SYSTEM] Magic word '{phrase}' fired. discord-voice-server is "
             f"spawning for voice channel id={channel_id} name={channel_name}. "
             f"Write a context result file at "
-            f"results/{channel_id}.task-<this-task-id>.txt (per-channel pull "
-            f"namespace) so the voice session injects it on connect. The body "
-            f"should summarize the conversation state voice may need: any "
-            f"active draft you're iterating on, the last few result subjects, "
-            f"and that voice just joined via the '{phrase}' magic word. Keep "
-            f"it 1-2 short paragraphs — voice consumes it as session input, "
-            f"not as a spoken turn. No DM reply needed."
+            f"results/{scoped_key}.task-<this-task-id>.txt (per-channel pull "
+            f"namespace; key built via `discord_voice_key()`) so the voice "
+            f"session injects it on connect. The body should summarize the "
+            f"conversation state voice may need: any active draft you're "
+            f"iterating on, the last few result subjects, and that voice just "
+            f"joined via the '{phrase}' magic word. Keep it 1-2 short "
+            f"paragraphs — voice consumes it as session input, not as a "
+            f"spoken turn. No DM reply needed."
         )
         task_path = tasks_dir / f"task-{ts_ms}.txt"
         task_path.write_text(
@@ -347,7 +370,14 @@ def handle_join_trigger(message) -> str:
     if _server_already_running(channel_id):
         return f"I'm already in **{channel_name}** — see you there."
 
-    if _spawn_voice_server(guild_id, channel_id):
+    # #1120: pass the originating channel + user so the spawned voice-server
+    # can route Layer-1 refusal messages back where invited (mentioning the
+    # inviter) instead of falling back to owner-DM via proactive-*.txt.
+    # Safe to pass None for either if the message lacks them.
+    reply_channel_id = getattr(getattr(message, "channel", None), "id", None)
+    reply_user_id = getattr(getattr(message, "author", None), "id", None)
+
+    if _spawn_voice_server(guild_id, channel_id, reply_channel_id, reply_user_id):
         # Queue context-prep AFTER successful spawn so the core only sees
         # the synthetic task when voice is actually on the way. No await /
         # block — voice and context-prep race; voice's first turn falls
