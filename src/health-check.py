@@ -736,6 +736,34 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> 
     return {"name": name, "status": "ok", "detail": f"{len(files)} task(s), oldest {oldest_age}s"}
 
 
+def check_notes_split_brain() -> "dict | None":
+    """Detect notes/ split-brain (#1266): overlapping .md files in both
+    <repo>/notes/ and <workspace>/notes/ — fires only when the two paths differ."""
+    repo_notes = REPO_DIR / "notes"
+    ws_notes = Path(shared_personal_path("notes", WORKSPACE_DIR))
+    if repo_notes.resolve() == ws_notes.resolve():
+        return None
+    if not repo_notes.exists() or not ws_notes.exists():
+        return None
+    repo_files = {p.name for p in repo_notes.glob("*.md")}
+    ws_files = {p.name for p in ws_notes.glob("*.md")}
+    overlap = repo_files & ws_files
+    if not overlap:
+        return None
+    examples = ", ".join(sorted(overlap)[:3])
+    tail = f" … and {len(overlap) - 3} more" if len(overlap) > 3 else ""
+    return {
+        "name": "notes-split-brain",
+        "status": "warn",
+        "detail": (
+            f"{len(overlap)} .md file(s) duplicated across <repo>/notes/ and <workspace>/notes/ "
+            f"— edits to one side are invisible to the other. "
+            f"Run scripts/sutando-migrate.sh to consolidate. "
+            f"Overlap: {examples}{tail}"
+        ),
+    }
+
+
 def run_all_checks() -> list[dict]:
     checks = []
 
@@ -784,6 +812,11 @@ def run_all_checks() -> list[dict]:
     # ~/.sutando/workspace/notes rather than <repo>/notes — the notes/
     # .gitkeep was removed from the repo in #793's workspace migration.
     checks.append(check_directory(Path(shared_personal_path("notes", WORKSPACE_DIR)), "notes-dir"))
+
+    # Notes split-brain: both <repo>/notes/ and <workspace>/notes/ with overlapping files (#1266)
+    _notes_sb = check_notes_split_brain()
+    if _notes_sb:
+        checks.append(_notes_sb)
 
     # Memory sync
     checks.append(check_memory_sync())
