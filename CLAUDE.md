@@ -37,6 +37,19 @@ Before creating a PR, check `gh pr list --state open` for an existing PR on the 
 
 Never commit directly to main. Always work on a feature branch.
 
+### Before opening any PR or issue
+
+Read `CONTRIBUTING.md` and follow its "Before opening any PR or issue" section. The short checklist:
+
+- Search existing open + recently-closed PRs/issues for duplicates (`gh pr list --search "closes #N"`)
+- Confirm your git author email is GH-mapped — not `*.local` (macOS hostname auto-fill) or `noreply@anthropic.com` (Claude Code default). CLA-Assistant silently leaves the check PENDING on unmappable emails.
+- Single concern per PR; no bundled refactors
+- Confirm the bug exists on `upstream/main` before adding a fix
+- Respect the V1-workspace hold list (`workspace_default.{py,ts}`, `sync-memory.sh`, `claude_home_path`, `agent-registry` paths)
+- After `update-branch`, CLA-Assistant may not auto-rerun — try `@cla-assistant check` comment or close+reopen if stuck
+
+Skill-PR destination: a skill is **coupled** (PR to `sonichi/sutando`) if it imports from `src/` or another skill, modifies main-repo files, or is tightly bound to a feature there (e.g. `skills/phone-conversation/`). A skill is **standalone** (PR to `sonichi/sutando-skills`) if it ships its own scripts/binaries, reads files but doesn't import main-repo modules, and works against any checkout. If unsure, ask in #design.
+
 ## Workspace contract
 
 Sutando's file state lives in three concentric spaces — **Code** (`$SUTANDO_REPO_DIR`, the git checkout), **State** (`$SUTANDO_WORKSPACE`, per-user runtime), **Memory** (`$SUTANDO_MEMORY_DIR`, user-content synced across the fleet — legacy alias `$SUTANDO_PRIVATE_DIR` honored for one release per #870). See [`docs/workspace-design.md`](docs/workspace-design.md) for the 3-space mental model + "Quick decision: which space?" flowchart when adding new code or data.
