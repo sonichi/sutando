@@ -1,5 +1,15 @@
 # Known Issues
 
+## Workspace contract migration in progress
+
+The 3-space workspace contract (Code / Workspace / Memory — see [`docs/workspace-design.md`](docs/workspace-design.md)) is in the middle of a transition. Some existing scripts and skills still write per-user state into the repo (`<repo>/tasks/`, `<repo>/results/`, `<repo>/state/`, `<repo>/logs/`, `<repo>/data/`, etc.) instead of `$SUTANDO_WORKSPACE/`.
+
+**Effect for users**: depending on how a script was invoked, runtime state may end up in either location. On a workspace-pinned install, state written to the repo path is invisible to readers that look in `$SUTANDO_WORKSPACE`. Symptoms include sentinels that never trigger, scans that miss live data, or reply-context that doesn't reach the bot.
+
+**Status**: A migration CLI (`scripts/sutando-migrate.sh`) is queued in PR #1271 to move existing repo-anchored state into the workspace. Per-site fixes for individual scripts are tracked in PRs #1272–#1334 (filed but held in draft until the V1 contract is finalized). The path-resolution audit (`workspace-contract-audit` skill) catches new violations at PR time.
+
+If you hit a path-resolution oddity, check whether your script is reading from the repo vs `$SUTANDO_WORKSPACE` and report the file/line in an issue.
+
 ## Task status flickers in web UI after API restart
 
 **Symptom:** Tasks briefly show as "working" then "done" then "working" again in the web client task list after the agent API is restarted.
