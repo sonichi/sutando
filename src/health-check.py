@@ -1337,19 +1337,35 @@ def main():
                                      stderr=subprocess.STDOUT, start_new_session=True)
                     print(f"  {c['name']}: {'restarted (stale code)' if c['status'] == 'stale' else 'restarted'}")
                 elif c["name"] == "sutando-app":
-                    # Stale here means main.swift is newer than the binary's
-                    # process start time. The bare Popen below was leaking
-                    # duplicates (macOS doesn't enforce singleton on this
-                    # bundle — observed 3 concurrent on 2026-04-19) AND it
-                    # was relaunching the same stale binary, so the stale
-                    # signal kept re-firing every cron pass.
-                    #
-                    # Real fix needs (a) pkill the existing PID, (b) swiftc
-                    # rebuild if source > binary, (c) `open src/Sutando/Sutando`.
-                    # Until that lands, surface the warning instead of
-                    # pretending we fixed it. Chi rebuilds + relaunches
-                    # manually per feedback_sutando_app_launch_method.md.
-                    print(f"  {c['name']}: not auto-fixed — needs manual rebuild + relaunch (see memory feedback_sutando_app_launch_method.md)")
+                    # Two distinct failure modes:
+                    #   1. status="warn" + detail="not running …" → binary may
+                    #      already be fresh; just needs to be launched. Safe
+                    #      to auto-fix via `open` (singleton enforcement is
+                    #      not at risk because no PID exists yet).
+                    #   2. status="stale" → main.swift is newer than the
+                    #      running binary's process start time. Real fix
+                    #      needs pkill + swiftc rebuild + open; an earlier
+                    #      auto-fix path leaked duplicate instances (macOS
+                    #      doesn't enforce singleton on this bundle —
+                    #      observed 3 concurrent on 2026-04-19), so we
+                    #      defer that path to a manual rebuild + relaunch.
+                    binary = REPO_DIR / "src" / "Sutando" / "Sutando"
+                    source = REPO_DIR / "src" / "Sutando" / "main.swift"
+                    if (
+                        c.get("status") == "warn"
+                        and "not running" in (c.get("detail") or "")
+                        and binary.exists()
+                        and source.exists()
+                        and binary.stat().st_mtime >= source.stat().st_mtime
+                    ):
+                        try:
+                            subprocess.run(["/usr/bin/open", str(binary)],
+                                           check=True, timeout=5)
+                            print(f"  {c['name']}: launched (binary fresh, no rebuild needed)")
+                        except Exception as e:
+                            print(f"  {c['name']}: launch failed ({type(e).__name__}: {e}) — try `open {binary}` manually")
+                    else:
+                        print(f"  {c['name']}: not auto-fixed — needs manual rebuild + relaunch (see memory feedback_sutando_app_launch_method.md)")
                 elif c["name"] == "ngrok":
                     # Read ngrok domain from .env if set, otherwise use default
                     env_path = REPO_DIR / ".env"

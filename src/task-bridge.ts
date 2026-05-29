@@ -722,6 +722,29 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 							if (existsSync(taskFile)) archiveFile(taskFile, 'tasks', taskId);
 						}, 10_000);
 					}
+					// Context-drop tasks: Sutando.app writes `source: context-drop` (no bridge
+					// handles delivery). Archive them directly so they don't pile up indefinitely.
+					// Companion fix: Sutando.app main.swift writeTask() must include this field.
+					// Issue: https://github.com/sonichi/sutando/issues/969
+					if (taskId.startsWith('task-')) {
+						const ctxTaskFile = join(TASK_DIR, `${taskId}.txt`);
+						if (existsSync(ctxTaskFile)) {
+							try {
+								const taskBody = readFileSync(ctxTaskFile, 'utf-8');
+								if (/^source:\s*context-drop/m.test(taskBody)) {
+									_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
+									_deliveredResults.add(file);
+									_pendingTasks.delete(taskId);
+									console.log(`${ts()} [TaskBridge] Context-drop task archived (no client): ${taskId}`);
+									setTimeout(() => {
+										archiveFile(path, 'results', taskId);
+										if (existsSync(ctxTaskFile)) archiveFile(ctxTaskFile, 'tasks', taskId);
+									}, 10_000);
+									continue;
+								}
+							} catch {}
+						}
+					}
 					// Other non-voice unsent results stay queued (their bridges deliver them)
 					continue;
 				}
