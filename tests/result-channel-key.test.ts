@@ -18,6 +18,8 @@ import {
 	resultFilename,
 	parseResultFilename,
 	resultBelongsTo,
+	discordVoiceKey,
+	phoneCallKey,
 } from '../src/result-channel-key.js';
 
 describe('sanitizeKey', () => {
@@ -206,4 +208,44 @@ describe('existing consumers do NOT match the scoped namespace', () => {
 	// process will read-and-delete the scoped file before voice-agent's
 	// 2s poll claims it. See PR body's verification section for the full
 	// trade-off discussion.
+});
+
+// Per-consumer prefixes — writer + consumer MUST go through the same typed
+// function so the keys agree. Prevents cross-consumer namespace collisions
+// when a future consumer ID format overlaps with an existing one.
+describe('typed key constructors', () => {
+	it('discordVoiceKey prefixes with `dvoice-`', () => {
+		assert.equal(discordVoiceKey('1485653767402553457'), 'dvoice-1485653767402553457');
+	});
+
+	it('phoneCallKey prefixes with `phone-`', () => {
+		assert.equal(phoneCallKey('CA1234abcd'), 'phone-CA1234abcd');
+	});
+
+	it('typed keys sanitize input', () => {
+		assert.equal(discordVoiceKey('a/b'), 'dvoice-a-b');
+		assert.equal(phoneCallKey('../etc'), 'phone----etc');
+	});
+
+	it('typed keys fall back on empty / falsy input', () => {
+		assert.equal(discordVoiceKey(null), 'dvoice-unknown');
+		assert.equal(discordVoiceKey(''), 'dvoice-unknown');
+		assert.equal(discordVoiceKey(undefined), 'dvoice-unknown');
+		assert.equal(phoneCallKey(null), 'phone-unknown');
+	});
+
+	it('typed keys round-trip through resultFilename + resultBelongsTo', () => {
+		const key = discordVoiceKey('1485653767402553457');
+		const fname = resultFilename(key, 'task-1700000000');
+		assert.equal(fname, 'dvoice-1485653767402553457.task-1700000000.txt');
+		assert.equal(resultBelongsTo(fname, key), true);
+	});
+
+	it('typed keys cannot collide across consumers (even if IDs match)', () => {
+		// Hypothetical collision: a future consumer ID happens to look like a
+		// Discord VC snowflake. Without prefixes the keys would be equal; with
+		// prefixes they remain distinct.
+		const sameId = 'CA1234abcd';
+		assert.notEqual(discordVoiceKey(sameId), phoneCallKey(sameId));
+	});
 });

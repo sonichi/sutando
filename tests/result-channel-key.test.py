@@ -20,6 +20,8 @@ from result_channel_key import (  # noqa: E402
     result_filename,
     parse_result_filename,
     result_belongs_to,
+    discord_voice_key,
+    phone_call_key,
 )
 
 
@@ -192,6 +194,47 @@ class TestExistingConsumersDoNotMatch(unittest.TestCase):
     def test_task_bridge_chat_guard(self):
         # task-bridge.ts: taskId.startsWith('task-chat-')
         self.assertFalse(self.SCOPED_BASE.startswith("task-chat-"))
+
+
+class TestTypedKeyConstructors(unittest.TestCase):
+    """Per-consumer prefixes — writer + consumer MUST go through the same
+    typed function so the keys agree. Prevents cross-consumer namespace
+    collisions when a future consumer ID format overlaps with an existing one."""
+
+    def test_discord_voice_key_prefixes_dvoice(self):
+        self.assertEqual(
+            discord_voice_key("1485653767402553457"),
+            "dvoice-1485653767402553457",
+        )
+
+    def test_phone_call_key_prefixes_phone(self):
+        self.assertEqual(phone_call_key("CA1234abcd"), "phone-CA1234abcd")
+
+    def test_typed_keys_sanitize_input(self):
+        self.assertEqual(discord_voice_key("a/b"), "dvoice-a-b")
+        self.assertEqual(phone_call_key("../etc"), "phone----etc")
+
+    def test_typed_keys_fallback_on_empty(self):
+        self.assertEqual(discord_voice_key(None), "dvoice-unknown")
+        self.assertEqual(discord_voice_key(""), "dvoice-unknown")
+        self.assertEqual(phone_call_key(None), "phone-unknown")
+
+    def test_typed_keys_round_trip_through_result_filename(self):
+        key = discord_voice_key("1485653767402553457")
+        fname = result_filename(key, "task-1700000000")
+        self.assertEqual(fname, "dvoice-1485653767402553457.task-1700000000.txt")
+        self.assertTrue(result_belongs_to(fname, key))
+
+    def test_typed_keys_dont_collide_across_consumers(self):
+        # Hypothetical collision: a future consumer takes a Twilio-shaped ID
+        # but the discord-voice consumer also wraps a VC ID that happens to
+        # match. Without prefixes the keys would be equal; with prefixes they
+        # remain distinct.
+        same_id = "CA1234abcd"
+        self.assertNotEqual(
+            discord_voice_key(same_id),
+            phone_call_key(same_id),
+        )
 
 
 if __name__ == "__main__":

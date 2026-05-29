@@ -83,3 +83,21 @@ def result_belongs_to(filename: str, channel_key: str) -> bool:
     if not task_id.startswith("task-"):
         return False
     return key == sanitize_key(channel_key)
+
+
+# ── Typed channel-key constructors ────────────────────────────────────────
+# Per-consumer prefixes make key-namespace collisions impossible across
+# future consumer types: a hypothetical new pull surface whose ID format
+# happens to be pure digits (like a Discord VC snowflake) cannot accidentally
+# claim a ``dvoice-*`` filename. Writer and consumer MUST go through the same
+# constructor so the keys agree. Keep symmetric with ``src/result-channel-key.ts``.
+
+
+def discord_voice_key(vc_id: Optional[str]) -> str:
+    """Channel key for the discord-voice consumer. Wraps a Discord voice-channel id."""
+    return f"dvoice-{sanitize_key(vc_id)}"
+
+
+def phone_call_key(call_sid: Optional[str]) -> str:
+    """Channel key for the phone-conversation consumer. Wraps a Twilio call SID."""
+    return f"phone-{sanitize_key(call_sid)}"
