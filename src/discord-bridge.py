@@ -53,6 +53,7 @@ except ModuleNotFoundError:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
+from single_instance import acquire as _single_instance_acquire  # noqa: E402
 import discord_config  # noqa: E402  — Sutando workspace-local discord config (#1147)
 from util_paths import shared_personal_path  # noqa: E402
 from task_priority import default_priority_for_source  # noqa: E402
@@ -3833,4 +3834,5 @@ if __name__ == "__main__":
     if len(sys.argv) >= 4 and sys.argv[1] == "send":
         _send_via_rest(sys.argv[2], " ".join(sys.argv[3:]))
     else:
+        _single_instance_acquire("discord-bridge")
         client.run(TOKEN, log_handler=None)

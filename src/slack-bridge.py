@@ -49,6 +49,7 @@ from task_priority import default_priority_for_source  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
+from single_instance import acquire as _single_instance_acquire  # noqa: E402
 
 try:
     from slack_bolt import App
@@ -771,6 +772,7 @@ def _recover_orphan_sending_files() -> int:
     return recovered
 
 def main():
+    _single_instance_acquire("slack-bridge")
     print("Slack bridge started. Socket Mode connecting...", flush=True)
     _recover_orphan_sending_files()
     # Prime the in-memory access cache so tofu_onboard() can detect external
