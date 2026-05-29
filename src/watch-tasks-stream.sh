@@ -94,7 +94,7 @@ shopt -u nullglob
 # parent shell exits the watcher reparents to launchd (PPID=1) and runs
 # indefinitely with no consumer, silently dropping every event.
 cleanup() { kill 0 2>/dev/null; }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT HUP INT TERM
 
 # Stream subsequent events. -l 0.5 = 500ms latency batch (fswatch coalesces
 # burst events). --event Created --event Renamed catches new file
