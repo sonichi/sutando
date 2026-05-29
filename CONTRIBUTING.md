@@ -31,7 +31,7 @@ bash src/startup.sh
 
 **Bonus (highly valued):**
 - A validation script under `scripts/test-*.sh` that reproduces the bug programmatically
-- Before/after commit hashes if you can identify when it regressed
+- A commit hash for the suspected origin (helpful for both regressions and bugs that have been there since the code was written)
 - The specific tool call or function that failed (check voice-agent.log for `[Tool]` entries)
 
 See [issue #1339](https://github.com/sonichi/sutando/issues/1339) for a recent worked example combining all three.
