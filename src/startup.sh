@@ -171,6 +171,10 @@ if [ -f "$WATCHER_PID_FILE" ]; then
   rm -f "$WATCHER_PID_FILE"
 fi
 
+# Legacy repo-root tasks/results/data still created for back-compat with
+# scripts that haven't migrated yet; safe no-op once everything's switched.
+mkdir -p tasks results data
+
 # Archive stale results/*.txt (>24h) BEFORE any service starts iterating
 # results/. Prevents the 2026-04-15 DM-flood class of incidents where a
 # freshly-restarted task-bridge or discord-bridge poll loop sees a backlog
