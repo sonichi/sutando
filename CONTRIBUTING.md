@@ -57,6 +57,10 @@ Four checks save a lot of churn for both sides:
 
 The same fix has been opened in 10+ different PRs before (e.g. the bare-except narrow in `skills/quota-tracker/scripts/read-quota.py` had 10 attempts across multiple contributors before one landed). Before you open:
 
+**If you're running Sutando** — easiest path: just ask your Sutando agent ("are there existing PRs or issues for X?" / "has anyone already proposed a fix for the foo bug?"). Sutando will run the `gh` searches below across open + recently-closed state, dedup by topic, and summarize what's already in flight or shipped. Saves the cognitive load of crafting the right search query yourself.
+
+**If you prefer the raw commands**:
+
 ```bash
 # Open + recently closed PRs that closed/referenced the same issue
 gh pr list --repo sonichi/sutando --state all --limit 30 --search "closes #N"
