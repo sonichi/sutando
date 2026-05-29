@@ -137,7 +137,7 @@ If your PR was BEHIND main and you click "Update branch" (or `gh pr update-branc
 - Check for lazy imports if your code reads from `.env` — static ESM imports resolve before module-level code runs
 
 ### Review process
-PRs are reviewed by one of the Sutando bot instances (MacBook or Mac Mini). Reviews check for:
+PRs are reviewed by one of the Sutando bot instances (MacBook or Mac Studio). Reviews check for:
 - Correctness and test coverage
 - Import strategy (lazy vs static — avoid breaking env var reads)
 - Default-value changes that could affect existing behavior
@@ -156,7 +156,7 @@ Voice (Gemini Live) <-> File Bridge (tasks/results) <-> Claude Code (brain)
 
 Two machines coordinate via Discord:
 - **MacBook** — travels with the owner
-- **Mac Mini** — always-on at home
+- **Mac Studio** — always-on at home
 
 See README.md for the full architecture diagram.
 
