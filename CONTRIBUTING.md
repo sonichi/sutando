@@ -121,7 +121,7 @@ If unsure, ask in #design before opening.
 
 ### 6. After `update-branch`, CLA-Assistant may not auto-rerun
 
-If your PR was BEHIND main and you click "Update branch" (or `gh pr update-branch`), the new HEAD commit may show `license/cla` PENDING and never resolve. Known issue. Workarounds (in order):
+If your PR was BEHIND main and you click "Update branch" (or `gh pr update-branch`), the new HEAD commit may show `license/cla` PENDING and never resolve. Known issue. In most cases `.github/workflows/cla-recheck-on-push.yml` will auto-fire the recheck comment for you on every push, but if the workflow is disabled or fails, the manual workarounds are (in order):
 
 1. Wait — sometimes the bot catches up in ~10 minutes
 2. Comment `@cla-assistant check` on the PR
