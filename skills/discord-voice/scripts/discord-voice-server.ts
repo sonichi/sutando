@@ -90,6 +90,20 @@ const TASK_POLL_INTERVAL_MS = 500;
 const TASK_POLL_TIMEOUT_MS = 300_000;
 const OWNER_NAME = process.env.owner ?? '';
 
+// Meeting mode — suppresses bot audio output while keeping transcription + sqlite running.
+// Mirrors src/voice-agent.ts `meetingActive` behaviour for the discord-voice surface.
+// Manual: poll state/voice-mode.txt (same file the menu-bar app + voice-agent write).
+// Auto:   flip after SUTANDO_VOICE_AUTO_MEETING_AFTER_SEC with no user audio (default 180s).
+const VOICE_MODE_FILE = join(WORKSPACE_DIR, 'state', 'voice-mode.txt');
+const AUTO_MEETING_TIMEOUT_MS = parseInt(process.env.SUTANDO_VOICE_AUTO_MEETING_AFTER_SEC || '180', 10) * 1000;
+// Wake phrases that exit meeting mode when user speaks them (case-insensitive).
+const WAKE_PHRASES = ['active mode', 'sutando active', 'lucy active', 'wake up', 'stop meeting mode',
+	...(OWNER_NAME ? [`${OWNER_NAME} active`] : [])];
+function _isWakePhrase(text: string): boolean {
+	const lower = text.toLowerCase();
+	return WAKE_PHRASES.some(p => lower.includes(p));
+}
+
 const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
 // Per-user voice config (native-audio model + googleSearch + owner_mode +
 // channels) is data, not code: it lives in the workspace, NOT in the git repo.
@@ -314,6 +328,8 @@ interface DiscordVoiceSession {
 	audioPending: Buffer[];
 	toolCalls: { name: string; durationMs: number; timestamp: string }[];
 	events: { event: string; timestamp: string }[];
+	meetingMode: boolean;
+	lastUserAudioAt: number;
 }
 
 // Effective tier of the in-progress turn — the gate owner/team tools check.
@@ -698,6 +714,7 @@ function subscribeUser(s: DiscordVoiceSession, userId: string): void {
 		chunks++;
 		try { (s.voiceSession as any).handleAudioFromClient(pcm16Mono); } catch {}
 		(s as any)._noteSpoken?.();
+		s.lastUserAudioAt = Date.now();
 		if (chunks === 1) console.log(`${ts()} [Voice] first chunk: ${pcm16Mono.length}B`);
 	});
 	resampler.on('end', () => {
@@ -778,6 +795,8 @@ async function createVoiceSession(connection: VoiceConnection, client: Client): 
 		audioPending: [],
 		toolCalls: [],
 		events: [{ event: 'session_started', timestamp: new Date().toISOString() }],
+		meetingMode: false,
+		lastUserAudioAt: Date.now(),
 	};
 
 	const agent = buildAgent(s);
@@ -836,15 +855,44 @@ async function createVoiceSession(connection: VoiceConnection, client: Client): 
 		try {
 			const pcm24Mono = Buffer.from(data, 'base64');
 			const pcm48Stereo = upsample24MonoTo48Stereo(pcm24Mono);
-			pushAudio(pcm48Stereo);
-			outChunks++;
-			if (outChunks === 1 || outChunks % 50 === 0) {
-				console.log(`${ts()} [Audio] outbound chunks: ${outChunks} (last=${pcm48Stereo.length}B)`);
+			// In meeting mode, suppress audio output — keep transcription + sqlite running.
+			if (!s.meetingMode) {
+				pushAudio(pcm48Stereo);
+				outChunks++;
+				if (outChunks === 1 || outChunks % 50 === 0) {
+					console.log(`${ts()} [Audio] outbound chunks: ${outChunks} (last=${pcm48Stereo.length}B)`);
+				}
 			}
 		} catch (err) {
 			console.error(`${ts()} [Audio] outbound convert failed:`, err);
 		}
 	};
+
+	// --- Meeting mode: manual poll + auto-idle ---
+	// Manual: read state/voice-mode.txt every 2s (same file Sutando.app + voice-agent write).
+	// Auto:   flip to meeting mode after AUTO_MEETING_TIMEOUT_MS with no user audio.
+	// Both timers are cleared in finalizeSession() via the closing flag check.
+	const voiceModePoll = setInterval(() => {
+		if (s.closing) { clearInterval(voiceModePoll); return; }
+		try {
+			const mode = readFileSync(VOICE_MODE_FILE, 'utf-8').trim();
+			const want = mode === 'meeting';
+			if (want !== s.meetingMode) {
+				s.meetingMode = want;
+				console.log(`${ts()} [Meeting] voice-mode.txt → ${mode} (meetingMode=${s.meetingMode})`);
+			}
+		} catch { /* file absent = active mode */ }
+	}, 2_000);
+
+	// AUTO_MEETING_TIMEOUT_MS === 0 means auto-meeting is disabled.
+	const autoMeetingTimer = AUTO_MEETING_TIMEOUT_MS > 0 ? setInterval(() => {
+		if (s.closing) { clearInterval(autoMeetingTimer!); return; }
+		if (!s.meetingMode && Date.now() - s.lastUserAudioAt > AUTO_MEETING_TIMEOUT_MS) {
+			s.meetingMode = true;
+			console.log(`${ts()} [Meeting] auto-meeting triggered — no user audio for ${AUTO_MEETING_TIMEOUT_MS / 1000}s`);
+			try { writeFileSync(VOICE_MODE_FILE, 'meeting'); } catch {}
+		}
+	}, 10_000) : null;
 
 	// Transcript mirroring + result-queue drain
 	let lastProcessedIdx = 0;
@@ -862,6 +910,12 @@ async function createVoiceSession(connection: VoiceConnection, client: Client): 
 			if (item.content === lastText) continue;
 			if (item.role === 'user') {
 				s.transcript.push({ role: 'user', text: item.content });
+				// Wake-phrase detection: exit meeting mode when user speaks a wake phrase.
+				if (s.meetingMode && _isWakePhrase(item.content)) {
+					s.meetingMode = false;
+					console.log(`${ts()} [Meeting] wake-phrase detected — exiting meeting mode: "${item.content.slice(0, 60)}"`);
+					try { writeFileSync(VOICE_MODE_FILE, 'active'); } catch {}
+				}
 				// utterance event push removed per #1052 — canonical record is
 				// the discord_voice-table row written by recordConversation
 				// below. session_events keeps only lifecycle entries to stop

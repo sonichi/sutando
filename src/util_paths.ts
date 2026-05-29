@@ -68,7 +68,7 @@ export function personalPath(filename: string, workspace?: string): string {
 	const privateRoot = memoryDirEnv();
 	if (privateRoot) {
 		const root = expandHome(privateRoot);
-		const host = hostname().split('.')[0];
+		const host = (process.env.SUTANDO_HOST_LABEL || hostname()).split('.')[0];
 		const candidate = join(root, `machine-${host}`, filename);
 		if (existsSync(candidate)) return candidate;
 	}
@@ -83,7 +83,7 @@ export function personalPath(filename: string, workspace?: string): string {
 	// check fails gracefully.
 	if (privateRoot) {
 		const root = expandHome(privateRoot);
-		const host = hostname().split('.')[0];
+		const host = (process.env.SUTANDO_HOST_LABEL || hostname()).split('.')[0];
 		return join(root, `machine-${host}`, filename);
 	}
 	if (filename === 'stand-avatar.png') return join(ws, 'assets', filename);
