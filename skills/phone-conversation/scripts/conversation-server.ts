@@ -572,6 +572,12 @@ function buildAgent(callSession: CallSession): MainAgent {
 		instructions += PHONE_GOOGLE_SEARCH
 			? '\n\nNEVER fabricate specific details. If you don\'t know it, use your built-in Web search to look it up — it\'s faster than delegating, and the answer stays in the conversation. If your built-in search returns nothing useful, OR the question needs deeper-than-one-lookup research (multi-step, multiple sources, file reading), call the work tool — it routes to the core agent which can do extensive research.'
 			: '\n\nNEVER fabricate specific details. If you don\'t know it, use the work tool to look it up.';
+		// Anti-hallucination guards (closes #1102). Mirrors the discord-voice block.
+		instructions += '\n\n## Anti-hallucination guards (closes #1102)';
+		instructions += '\n- NEVER narrate a tool call you have NOT actually made. Do not say "I\'m opening the repository", "Let me check the screen", "I\'m searching for that" unless you have already called the corresponding tool in this turn.';
+		instructions += '\n- NEVER invent capabilities. The work tool delegates to a core agent — its scope is described in the work tool\'s description. Do NOT claim za-warudo or any other phrase enables features outside the tools listed.';
+		instructions += '\n- For questions about THIS specific project (features, commands, code, what a phrase means in the codebase), ALWAYS call work. Your built-in knowledge does not include this codebase, so synthesizing from it produces hallucinations. Say "I don\'t know — let me check" or call work, never guess.';
+		instructions += '\n- Between work calls, do NOT fill silence with synthesized prose from built-in knowledge. A short "Let me check" is fine; a paragraph of confabulated detail is not.';
 	}
 
 	const tools: ToolDefinition[] = [];
