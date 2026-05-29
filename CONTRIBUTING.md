@@ -51,7 +51,7 @@ See existing skills for examples. Install with `bash skills/install.sh`.
 
 ## Before opening any PR or issue
 
-Four checks save a lot of churn for both sides:
+Five checks save a lot of churn for both sides:
 
 ### 1. Search for existing PRs / issues first
 
@@ -111,6 +111,17 @@ git show upstream/main:path/to/file.py | grep -n "the buggy line"
 ```
 
 If the bug is already fixed upstream, the PR is unnecessary. Save yourself + reviewer time.
+
+### 5. If your bot is contributing on your behalf, supervise it
+
+A Sutando bot (or any LLM agent) can crank out PRs much faster than a maintainer can review them. Easy way to flood the queue with 50–100+ PRs in a day — most either duplicate each other, address bugs already fixed upstream, or fix something tiny that should have been bundled. Even when individually correct, the volume burns the review channel and pushes real-user issues out of the queue.
+
+Concrete norms:
+
+- **Cap your in-flight PRs.** Default soft cap: 5 open per author at a time. If you're at the cap, land or close before opening more.
+- **Always read the bot's diff before pushing.** "I trust the agent" is not enough — agents miss conventions, hallucinate referenced files (see item 1), and sometimes regenerate unrelated areas.
+- **No "drive-by" repo-wide refactors.** If the agent suggests one, open ONE small PR with the proposal first, get sign-off, then expand.
+- **Take responsibility for what your bot ships.** PRs authored by a bot you operate are *your* PRs — your CLA, your review feedback to address, your closes-link to file.
 
 ## Pull requests
 
