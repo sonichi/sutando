@@ -189,7 +189,7 @@ def _server_already_running(channel_id) -> bool:
     return False
 
 
-def _spawn_voice_server(guild_id, channel_id) -> bool:
+def _spawn_voice_server(guild_id, channel_id, reply_channel_id=None, reply_user_id=None) -> bool:
     """Launch discord-voice-server.ts detached for guild+channel. Returns True
     on a successful spawn (the subprocess was started — not that it connected).
 
@@ -197,6 +197,13 @@ def _spawn_voice_server(guild_id, channel_id) -> bool:
       env -u GEMINI_API_KEY DISCORD_VOICE_SERVER=1 \
         npx tsx skills/discord-voice/scripts/discord-voice-server.ts \
         --guild <GUILD_ID> --channel <VC_ID>
+
+    Optional `reply_channel_id` + `reply_user_id` (#1120): when provided, the
+    spawned voice-server uses them to post the Layer-1 refusal message back
+    to the originating text-channel (mentioning the inviting user), instead
+    of writing a proactive-*.txt that falls back to owner-DM. "Reply where
+    invited" — feedback Susan gave when the refusal DM mis-landed on a
+    non-owner due to access.json ordering.
 
     `GEMINI_API_KEY` is unset for the child (the voice server uses its own
     GEMINI_VOICE_API_KEY path) — matches the documented invocation. Detached
@@ -225,6 +232,10 @@ def _spawn_voice_server(guild_id, channel_id) -> bool:
         "--channel",
         str(channel_id),
     ]
+    if reply_channel_id is not None:
+        argv.extend(["--reply-channel", str(reply_channel_id)])
+    if reply_user_id is not None:
+        argv.extend(["--reply-user", str(reply_user_id)])
     try:
         subprocess.Popen(
             argv,
@@ -359,7 +370,14 @@ def handle_join_trigger(message) -> str:
     if _server_already_running(channel_id):
         return f"I'm already in **{channel_name}** — see you there."
 
-    if _spawn_voice_server(guild_id, channel_id):
+    # #1120: pass the originating channel + user so the spawned voice-server
+    # can route Layer-1 refusal messages back where invited (mentioning the
+    # inviter) instead of falling back to owner-DM via proactive-*.txt.
+    # Safe to pass None for either if the message lacks them.
+    reply_channel_id = getattr(getattr(message, "channel", None), "id", None)
+    reply_user_id = getattr(getattr(message, "author", None), "id", None)
+
+    if _spawn_voice_server(guild_id, channel_id, reply_channel_id, reply_user_id):
         # Queue context-prep AFTER successful spawn so the core only sees
         # the synthetic task when voice is actually on the way. No await /
         # block — voice and context-prep race; voice's first turn falls
