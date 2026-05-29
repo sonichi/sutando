@@ -49,6 +49,85 @@ See existing skills for examples. Install with `bash skills/install.sh`.
 - **web-client.ts**: The entire web UI is an inline HTML template literal. Do NOT use TypeScript-only syntax (like `as Type` casts) inside the embedded `<script>` block — the browser runs it as plain JS.
 - All scripts should work from a fresh clone with minimal setup
 
+## Before opening any PR or issue
+
+Six checks save a lot of churn for both sides:
+
+### 1. Search for existing PRs / issues first
+
+The same fix has been opened in 10+ different PRs before (e.g. the bare-except narrow in `skills/quota-tracker/scripts/read-quota.py` had 10 attempts across multiple contributors before one landed). Before you open:
+
+```bash
+# Open + recently closed PRs that closed/referenced the same issue
+gh pr list --repo sonichi/sutando --state all --limit 30 --search "closes #N"
+
+# Open issues with related keywords
+gh issue list --repo sonichi/sutando --state open --search "your-keyword"
+```
+
+If someone else's PR is already in flight and CLA-blocked or just stale, prefer pinging them or rebasing their branch over opening a parallel one.
+
+### 2. CLA + git author email
+
+CLA-Assistant maps your commits to a GitHub user via the author email. Two pitfalls trip almost every new contributor:
+
+```bash
+# Check your most recent commit's author email
+git log -1 --format='%ae'
+
+# If it shows something like:
+#   user@Hostname.local                ← macOS hostname auto-fill
+#   noreply@anthropic.com              ← Claude Code default for bot commits
+# CLA-Assistant CANNOT map it to your GitHub account → check stays PENDING forever.
+
+# Fix it before pushing:
+git config user.email YOUR_GH_MAPPED_EMAIL
+git commit --amend --reset-author --no-edit   # rewrites only the latest commit
+# or for a fuller rewrite:
+git rebase -i origin/main   # mark each as 'edit', then --reset-author + continue
+```
+
+If you're running a Sutando bot that commits on your behalf, set the bot's `git config user.email` to your CLA-signed email locally (don't share the keychain — just configure git).
+
+### 3. Single concern per PR
+
+A PR that fixes "X" should not also bundle "while I was here, I cleaned up Y / refactored Z / added a new feature W". Split those:
+
+- One concern → one PR → one closes-link
+- Mixing concerns triples the review burden, increases revert blast radius, and makes merge conflicts harder
+- "Drive-by" cleanup that happens to land in the same hunk is fine; net-new scope is not
+
+### 4. Confirm the bug exists on `upstream/main`
+
+Before adding a fix:
+
+```bash
+git fetch upstream main
+git show upstream/main:path/to/file.py | grep -n "the buggy line"
+```
+
+If the bug is already fixed upstream, the PR is unnecessary. Save yourself + reviewer time.
+
+### 5. Respect the V1-workspace hold list
+
+The V1 workspace contract migration (3-space Code / Workspace / Memory model) is in design. PRs that touch the following are currently held — please don't open new ones in these areas until the contract is finalized:
+
+- `src/workspace_default.py` / `src/workspace_default.ts` resolution logic
+- `scripts/sync-memory.sh` path probing (`SUTANDO_MEMORY_DIR` / `SUTANDO_PRIVATE_DIR`)
+- new `claude_home_path()` helpers or similar path-derivation utilities
+- migration scaffolding in `skills/agent-registry/` paths
+
+If unsure, ask in #design before opening.
+
+### 6. After `update-branch`, CLA-Assistant may not auto-rerun
+
+If your PR was BEHIND main and you click "Update branch" (or `gh pr update-branch`), the new HEAD commit may show `license/cla` PENDING and never resolve. Known issue. Workarounds (in order):
+
+1. Wait — sometimes the bot catches up in ~10 minutes
+2. Comment `recheck` on the PR
+3. Close and reopen the PR (forces a `pull_request.reopened` webhook)
+4. Ask a maintainer to admin-merge if you've verified the underlying CLA is signed
+
 ## Pull requests
 
 - Keep PRs focused — one feature or fix per PR
