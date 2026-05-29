@@ -48,6 +48,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from task_priority import default_priority_for_source  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
+from task_archive import find_task_file  # noqa: E402
 
 try:
     from slack_bolt import App
@@ -169,6 +170,47 @@ def presenter_mode_active() -> bool:
 
 ACCESS_FILE = Path.home() / ".claude" / "channels" / "slack" / "access.json"
 
+# In-memory mirror of access.json. Updated on every successful read.
+# Used by tofu_onboard() to detect and recover from external deletions
+# (#899: Sutando.app Settings or another process can delete the file
+# between bridge events; without this cache the bridge re-TOFUs on the
+# next inbound message, wiping tierMap / manually-added allowFrom entries).
+_access_cache: dict | None = None
+_access_cache_mtime: float = 0.0
+_access_cache_lock = threading.Lock()
+
+
+def _update_access_cache(data: dict) -> None:
+    global _access_cache, _access_cache_mtime
+    try:
+        mtime = ACCESS_FILE.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    with _access_cache_lock:
+        _access_cache = data
+        _access_cache_mtime = mtime
+
+
+def _restore_access_from_cache() -> bool:
+    """Write _access_cache back to ACCESS_FILE. Returns True if restored."""
+    with _access_cache_lock:
+        cached = _access_cache
+    if not cached or not cached.get("tofuOwner"):
+        return False
+    try:
+        ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        ACCESS_FILE.write_text(json.dumps(cached, indent=2) + "\n")
+        os.chmod(ACCESS_FILE, 0o600)
+        print(
+            "  [access] restored access.json from in-memory cache "
+            "(external deletion detected — #899)",
+            flush=True,
+        )
+        return True
+    except Exception as e:
+        print(f"  [access] cache restore failed: {e}", flush=True)
+        return False
+
 
 def load_allowed():
     """Return set of allowed Slack user IDs, or None if access.json missing.
@@ -177,6 +219,7 @@ def load_allowed():
     empty allowFrom means admin explicitly locked it down (no TOFU)."""
     try:
         data = json.loads(ACCESS_FILE.read_text())
+        _update_access_cache(data)
         return set(data.get("allowFrom", []))
     except FileNotFoundError:
         return None
@@ -189,17 +232,35 @@ def load_tier_map() -> dict:
     empty dict if missing. Recognized tiers: "owner", "team", "other".
     Unmapped users default to "owner" — preserves the pre-tierMap behavior
     where every entry in `allowFrom` was treated as owner-tier."""
+    with _access_cache_lock:
+        cached = _access_cache
+        cached_mtime = _access_cache_mtime
+    if cached is not None:
+        try:
+            if ACCESS_FILE.stat().st_mtime == cached_mtime:
+                return cached.get("tierMap") or {}
+        except OSError:
+            pass  # file deleted — fall through to re-read (will return {})
     try:
         data = json.loads(ACCESS_FILE.read_text())
+        _update_access_cache(data)
         return data.get("tierMap") or {}
     except Exception:
         return {}
 
 
 def tofu_onboard(user_id: str, username: str | None) -> set:
-    """First-time auto-onboard — same contract as telegram-bridge.py."""
+    """First-time auto-onboard — same contract as telegram-bridge.py.
+
+    Before running TOFU, check for external file deletion (#899): if the
+    file is missing but _access_cache holds a valid prior state, restore
+    from cache instead of wiping tierMap / allowFrom with a fresh TOFU."""
     if ACCESS_FILE.exists():
         return load_allowed() or set()
+    # File is missing. Was it externally deleted after a prior onboarding?
+    if _restore_access_from_cache():
+        return load_allowed() or set()
+    # Genuine first-time TOFU.
     ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "allowFrom": [user_id],
@@ -209,6 +270,7 @@ def tofu_onboard(user_id: str, username: str | None) -> set:
     }
     ACCESS_FILE.write_text(json.dumps(payload, indent=2) + "\n")
     os.chmod(ACCESS_FILE, 0o600)
+    _update_access_cache(payload)
     print(
         f"  TOFU: auto-onboarded @{username} (id={user_id}) as owner — wrote {ACCESS_FILE}",
         flush=True,
@@ -591,7 +653,7 @@ def result_watcher():
                         print(f"[Slack] reply error: {e}", flush=True)
 
                 archive_file(result_file, "results", task_id)
-                archive_file(TASKS_DIR / f"{task_id}.txt", "tasks", task_id)
+                archive_file(find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt", "tasks", task_id)
 
             # Proactive messages (sent to owner DM)
             if not presenter_mode_active():
@@ -711,6 +773,9 @@ def _recover_orphan_sending_files() -> int:
 def main():
     print("Slack bridge started. Socket Mode connecting...", flush=True)
     _recover_orphan_sending_files()
+    # Prime the in-memory access cache so tofu_onboard() can detect external
+    # deletions even on the very first inbound message after a restart (#899).
+    load_allowed()
     threading.Thread(target=result_watcher, name="slack-result-watcher", daemon=True).start()
     threading.Thread(target=_no_events_hint_thread, name="slack-no-events-hint", daemon=True).start()
     handler = SocketModeHandler(app, APP_TOKEN)
