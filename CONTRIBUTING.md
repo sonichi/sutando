@@ -34,6 +34,14 @@ bash src/startup.sh
 - Before/after commit hashes if you can identify when it regressed
 - The specific tool call or function that failed (check voice-agent.log for `[Tool]` entries)
 
+Concrete example — [issue #1339](https://github.com/sonichi/sutando/issues/1339) (discord-bridge false-positive `bot_mentioned` on reply-target auto-attribution):
+
+- **POC script**: 60-line Python `dataclasses` mock of `discord.Message` + `mentions` + `reference.resolved.author`, with 3 test cases (no-reply / reply-without-explicit-@ / reply-with-explicit-@). Demonstrates buggy vs fixed `bot_mentioned` check, no Discord auth needed. Runnable as `python3 /tmp/test_reply_mention.py` → `All 3 tests pass — Test 2 demonstrates the bug + the fix.`
+- **Regression commit**: pinned via `git log -L` on the affected block — commit `2e5abb5` (`Expand reply context to all messages, not just this bot's`, direct-pushed 2026-04-14) removed the `if ref_msg.author.id == client.user.id` guard that previously gated this code path.
+- **Specific function**: `bot_mentioned = client.user in message.mentions` at `src/discord-bridge.py:2256`. False-positive triggered because Discord auto-includes `referenced_message.author` in `message.mentions`.
+
+The maintainer can run the POC, confirm the regression commit, and read exactly which line to fix — without first having to reproduce the live Discord scenario or guess at which file to look in.
+
 ### Add a skill
 Skills are modular capabilities in `skills/`. Each skill has:
 - `SKILL.md` — description and usage instructions
