@@ -1774,6 +1774,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let taskContent = """
         id: task-\(ts)
         timestamp: \(ISO8601DateFormatter().string(from: Date()))
+        source: context-drop
         task: User dropped context via hotkey. Process this:
         \(content)
         """
