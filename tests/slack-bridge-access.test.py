@@ -59,8 +59,11 @@ def main() -> int:
                     "(TOFU relies on None vs empty-set distinction)", block)
 
     # 2. tofu_onboard exists with race-guard + 0o600 chmod
+    # Budget bumped 2000 → 4000: cache-restore block added in #899 fix
+    # (PR #1292) pushes tofu_onboard + surrounding module-level code past
+    # the 2000-char \ndef boundary.
     tofu_match = re.search(
-        r"def tofu_onboard\([^)]*\)[^:]*:\s*\n([\s\S]{0,2000}?)(?=\n\ndef |\Z)",
+        r"def tofu_onboard\([^)]*\)[^:]*:\s*\n([\s\S]{0,4000}?)(?=\n\ndef |\Z)",
         src,
     )
     if not tofu_match:
