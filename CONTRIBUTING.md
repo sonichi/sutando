@@ -51,7 +51,7 @@ See existing skills for examples. Install with `bash skills/install.sh`.
 
 ## Before opening any PR or issue
 
-Six checks save a lot of churn for both sides:
+Four checks save a lot of churn for both sides:
 
 ### 1. Search for existing PRs / issues first
 
@@ -108,26 +108,6 @@ git show upstream/main:path/to/file.py | grep -n "the buggy line"
 
 If the bug is already fixed upstream, the PR is unnecessary. Save yourself + reviewer time.
 
-### 5. Respect the V1-workspace hold list
-
-The V1 workspace contract migration (3-space Code / Workspace / Memory model) is in design. PRs that touch the following are currently held — please don't open new ones in these areas until the contract is finalized:
-
-- `src/workspace_default.py` / `src/workspace_default.ts` resolution logic
-- `scripts/sync-memory.sh` path probing (`SUTANDO_MEMORY_DIR` / `SUTANDO_PRIVATE_DIR`)
-- new `claude_home_path()` helpers or similar path-derivation utilities
-- migration scaffolding in `skills/agent-registry/` paths
-
-If unsure, ask in #design before opening.
-
-### 6. After `update-branch`, CLA-Assistant may not auto-rerun
-
-If your PR was BEHIND main and you click "Update branch" (or `gh pr update-branch`), the new HEAD commit may show `license/cla` PENDING and never resolve. Known issue. In most cases `.github/workflows/cla-recheck-on-push.yml` will auto-fire the recheck comment for you on every push, but if the workflow is disabled or fails, the manual workarounds are (in order):
-
-1. Wait — sometimes the bot catches up in ~10 minutes
-2. Comment `@cla-assistant check` on the PR
-3. Close and reopen the PR (forces a `pull_request.reopened` webhook)
-4. Ask a maintainer to admin-merge if you've verified the underlying CLA is signed
-
 ## Pull requests
 
 - Keep PRs focused — one feature or fix per PR
@@ -137,28 +117,12 @@ If your PR was BEHIND main and you click "Update branch" (or `gh pr update-branc
 - Check for lazy imports if your code reads from `.env` — static ESM imports resolve before module-level code runs
 
 ### Review process
-PRs are reviewed by one of the Sutando bot instances (MacBook or Mac Mini). Reviews check for:
+PRs are reviewed by a maintainer (or a maintainer's bot). Reviews check for:
 - Correctness and test coverage
 - Import strategy (lazy vs static — avoid breaking env var reads)
 - Default-value changes that could affect existing behavior
 - Security: no hardcoded credentials, sandbox compliance for non-owner paths
 - No unnecessary code — don't add features beyond what was asked
-
-## Architecture
-
-```
-Voice (Gemini Live) <-> File Bridge (tasks/results) <-> Claude Code (brain)
-                                                         |
-                                              8 channels: voice, phone,
-                                              Discord, Telegram, context
-                                              drop, iMessage, WhatsApp, email
-```
-
-Two machines coordinate via Discord:
-- **MacBook** — travels with the owner
-- **Mac Mini** — always-on at home
-
-See README.md for the full architecture diagram.
 
 ## Community
 
