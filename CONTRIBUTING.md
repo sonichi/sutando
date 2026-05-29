@@ -124,7 +124,7 @@ If unsure, ask in #design before opening.
 If your PR was BEHIND main and you click "Update branch" (or `gh pr update-branch`), the new HEAD commit may show `license/cla` PENDING and never resolve. Known issue. Workarounds (in order):
 
 1. Wait — sometimes the bot catches up in ~10 minutes
-2. Comment `recheck` on the PR
+2. Comment `@cla-assistant check` on the PR
 3. Close and reopen the PR (forces a `pull_request.reopened` webhook)
 4. Ask a maintainer to admin-merge if you've verified the underlying CLA is signed
 

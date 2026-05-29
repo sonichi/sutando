@@ -46,9 +46,9 @@ Read `CONTRIBUTING.md` and follow its "Before opening any PR or issue" section. 
 - Single concern per PR; no bundled refactors
 - Confirm the bug exists on `upstream/main` before adding a fix
 - Respect the V1-workspace hold list (`workspace_default.{py,ts}`, `sync-memory.sh`, `claude_home_path`, `agent-registry` paths)
-- After `update-branch`, CLA-Assistant may not auto-rerun — try `recheck` comment or close+reopen if stuck
+- After `update-branch`, CLA-Assistant may not auto-rerun — try `@cla-assistant check` comment or close+reopen if stuck
 
-Skill-PR destination: new audit-style or standalone skills go to **`sonichi/sutando-skills`**, not `sonichi/sutando`. See `feedback_check_skill_pr_destination.md` for the coupled-vs-standalone distinction.
+Skill-PR destination: a skill is **coupled** (PR to `sonichi/sutando`) if it imports from `src/` or another skill, modifies main-repo files, or is tightly bound to a feature there (e.g. `skills/phone-conversation/`). A skill is **standalone** (PR to `sonichi/sutando-skills`) if it ships its own scripts/binaries, reads files but doesn't import main-repo modules, and works against any checkout. If unsure, ask in #design.
 
 ## Workspace contract
 
