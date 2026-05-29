@@ -68,16 +68,15 @@ def main() -> int:
         return fail("couldn't locate `async def poll_proactive(...)` in discord-bridge.py") or 1
 
     # Guard 1: the function parses [channel:] markers somewhere.
-    if "[channel:" not in func:
+    # Accept either the original inline-regex approach (pre-#896: \d{17,20} literal in
+    # the function body) OR the unified-parser approach (post-#896: parse_markers() call
+    # which moves the regex into result_markers.py). Both represent correct parsing.
+    _uses_inline_regex = "\\d{17,20}" in func
+    _uses_parse_markers = "parse_markers(" in func
+    if not _uses_inline_regex and not _uses_parse_markers:
         fail(
-            "_poll_proactive lacks [channel:] marker handling — proactive files "
-            "with the redirect marker will send the literal text to owner DM",
-            func,
-        )
-    # The regex compile or pattern match must be present.
-    if "channel:" not in func or "\\d{17,20}" not in func:
-        fail(
-            "_poll_proactive doesn't parse the [channel: <id>] regex shape (17–20 digit channel id)",
+            "_poll_proactive doesn't parse [channel:] markers — "
+            "expected either inline \\d{17,20} regex or parse_markers() call (closes #896)",
             func,
         )
 
