@@ -31,7 +31,7 @@ from util_paths import (  # noqa: E402
 
 
 def clear_env():
-    for k in ("SUTANDO_MEMORY_DIR", "SUTANDO_PRIVATE_DIR"):
+    for k in ("SUTANDO_MEMORY_DIR", "SUTANDO_PRIVATE_DIR", "SUTANDO_HOST_LABEL"):
         os.environ.pop(k, None)
 
 
@@ -108,6 +108,38 @@ class PrivateMachineDirTests(unittest.TestCase):
         with redirect_stderr(io.StringIO()):
             p = _private_machine_dir()
         self.assertEqual(p, Path(f"/tmp/legacy-dir/machine-{host}"))
+
+
+class HostLabelTests(unittest.TestCase):
+    """SUTANDO_HOST_LABEL overrides hostname for machine-<host> dir (#871)."""
+
+    def setUp(self):
+        clear_env()
+
+    def tearDown(self):
+        clear_env()
+
+    def test_host_label_used_when_set(self):
+        os.environ["SUTANDO_MEMORY_DIR"] = "/tmp/memdir"
+        os.environ["SUTANDO_HOST_LABEL"] = "my-stable-mac"
+        with redirect_stderr(io.StringIO()):
+            p = _private_machine_dir()
+        self.assertEqual(p, Path("/tmp/memdir/machine-my-stable-mac"))
+
+    def test_hostname_used_when_label_unset(self):
+        os.environ["SUTANDO_MEMORY_DIR"] = "/tmp/memdir"
+        host = socket.gethostname().split(".")[0]
+        with redirect_stderr(io.StringIO()):
+            p = _private_machine_dir()
+        self.assertEqual(p, Path(f"/tmp/memdir/machine-{host}"))
+
+    def test_empty_label_falls_back_to_hostname(self):
+        os.environ["SUTANDO_MEMORY_DIR"] = "/tmp/memdir"
+        os.environ["SUTANDO_HOST_LABEL"] = ""
+        host = socket.gethostname().split(".")[0]
+        with redirect_stderr(io.StringIO()):
+            p = _private_machine_dir()
+        self.assertEqual(p, Path(f"/tmp/memdir/machine-{host}"))
 
 
 class SharedPersonalPathTests(unittest.TestCase):
