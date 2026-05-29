@@ -28,7 +28,7 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 try:
     from workspace_default import status_read_path  # noqa: E402
     _canonical = status_read_path("quota-state.json")
-except Exception:
+except ImportError:
     _canonical = None
 
 if _canonical is not None and _canonical.exists():
