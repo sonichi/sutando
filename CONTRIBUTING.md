@@ -105,7 +105,7 @@ For more detail (verification phases for fix PRs, sign trailers, sonichi-fix POC
 
 ## If a bot is contributing on your behalf
 
-**Do not flood the repo.** A bot can crank out PRs faster than a maintainer can review them — it's easy to dump 50–100+ PRs in a day, most of which duplicate each other, fix things already merged upstream, or split work that should have been bundled. Even when each PR is individually correct, the volume buries real-user issues and burns the review channel. Concrete rules:
+**Do not flood the repo.** A bot can crank out PRs faster than a maintainer can review them — it's easy to dump 50–100+ PRs in a day. Even when each PR is individually correct, the volume buries real-user issues and burns the review channel. Concrete rules:
 
 - **Cap your in-flight PRs.** Land or close existing ones before opening more. If a maintainer hasn't reviewed your last 3 PRs yet, do not open a 4th.
 - **Read the diff before pushing.** "I trust the agent" is not enough — bots miss conventions, hallucinate referenced files, and sometimes regenerate unrelated areas. Skim every change.
