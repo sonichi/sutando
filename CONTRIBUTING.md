@@ -55,11 +55,18 @@ See existing skills for examples. Install with `bash skills/install.sh`.
 
 The goal of this phase is to confirm the PR is necessary at all. In rough order of "what kills the PR earliest":
 
-1. Is there already an open or recently-closed PR / issue covering this? Respect what's in flight rather than racing.
+1. Is there already an open or recently-closed PR / issue covering this? Search both open and recently-closed state — duplicate PRs are the #1 source of churn here. The same fix has been opened in 10+ different PRs before. Check with:
+
+   ```bash
+   gh pr list --repo sonichi/sutando --state all --limit 30 --search "your-keyword"
+   gh issue list --repo sonichi/sutando --state open --search "your-keyword"
+   ```
+
+   If someone else's PR is already in flight (CLA-blocked or just stale), prefer pinging them or pushing onto their branch over opening a parallel one.
 2. **Is the problem real?** For a bug-fix, reproduce the bug yourself end-to-end (**manual verify**) — or, if you can't repro locally, ask a maintainer's bot to verify (**bot verify**). For a feature, confirm the user need is real (issue with use case, owner ask, etc.). Don't open a PR for a problem that doesn't exist.
 3. For a bug-fix: is the bug still on `upstream/main`? (`git show upstream/main:path | grep buggy-line`) — don't fix something that's already gone.
-4. Is this a single concern? One bug or one feature — split if you find yourself bundling.
-5. Does an existing helper or pattern cover your case? Use it instead of introducing a parallel abstraction.
+4. Is this a single concern? **One bug or one feature per PR.** If you're tempted to bundle several features into one PR ("while I'm here I'll also add Y, Z"), split them up front — open one PR per concern, each with its own closes-link. Mixing concerns triples the review burden, increases revert blast radius, and slows merge. "Drive-by" cleanup that happens to land in the same hunk is fine; net-new scope is not.
+5. Does an existing helper or pattern cover your case? Grep for prior art before introducing a parallel abstraction. (Concrete example: workspace-path resolution lives in `src/workspace_default.py` / `workspace_default.ts` — don't re-derive `Path(__file__).parent.parent` in a new script. Task-bridge IPC lives in `tasks/` ↔ `results/` — don't add a side channel.)
 
 ## The PR body should answer
 
@@ -84,8 +91,18 @@ The goal of this phase is to provide evidence the maintainer can verify quickly.
    The reviewer should not have to re-derive that your change works.
 2. Check the CLA status — CLA-Assistant runs on PR open and flags any commits whose author email isn't mapped to a CLA-signed GitHub account. **A failing CLA check blocks merge**, no matter how green everything else is. Fix with `git config user.email YOUR_GH_MAPPED_EMAIL && git commit --amend --reset-author --no-edit && git push --force-with-lease`. (`git log -1 --format='%ae'` to check what's there now.)
 3. Address every substantive review-thread comment before merge: fixed in a subsequent commit, replied with rationale for declining, or explicitly deferred to a follow-up issue.
+4. **If the PR ended up large, split it post-hoc.** If during review it becomes clear the diff covers more than one concern (a fix + a refactor, two unrelated features, etc.), close this PR and re-open it as N smaller PRs rather than negotiating reviewer patience. Easier than rebasing later; easier to revert one piece at a time.
 
-(For reviewer-side norms — don't pile on duplicates, formal APPROVE event vs "LGTM" comment, evidence-first claim verification — see the `review-pr` skill rather than this checklist.)
+## Reviewing PRs
+
+If you're reviewing someone else's PR (including a bot's), keep the comment thread useful:
+
+- **Don't add noise.** If another reviewer already said the same thing, or you have nothing substantive to add, stay silent. A "LGTM" comment under an existing APPROVE doesn't help anyone — it just buries real feedback. (One concrete reminder: if you find yourself typing the third "lgtm" in a row, delete it.)
+- **APPROVE / REQUEST_CHANGES is a formal GitHub action.** A Discord "👍" or a `gh pr comment` saying "approved" does NOT register as a review — use `POST /repos/.../pulls/N/reviews` (or `gh pr review --approve`) so the state is recorded.
+- **Be evidence-first.** When you claim something is broken, point at the commit, file, line, repro, or failing test. If you didn't verify, say so explicitly ("not verified — flagging for author to check").
+- **Distinguish blockers from nits.** Mark each comment so the author knows what's gating merge vs what's deferrable.
+
+For more detail (verification phases for fix PRs, sign trailers, sonichi-fix POC mechanics), see the `review-pr` skill if it's installed.
 
 ## If a bot is contributing on your behalf
 
