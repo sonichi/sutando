@@ -66,7 +66,6 @@ The goal of this phase is to confirm the PR is necessary at all. In rough order 
 2. **Is the problem real?** For a bug-fix, reproduce the bug yourself end-to-end (**manual verify**) — or, if you can't repro locally, ask a maintainer's bot to verify (**bot verify**). For a feature, confirm the user need is real (issue with use case, owner ask, etc.). Don't open a PR for a problem that doesn't exist.
 3. For a bug-fix: is the bug still on `upstream/main`? (`git show upstream/main:path | grep buggy-line`) — don't fix something that's already gone.
 4. Is this a single concern? **One bug or one feature per PR.** If you're tempted to bundle several features into one PR ("while I'm here I'll also add Y, Z"), split them up front — open one PR per concern, each with its own closes-link. Mixing concerns triples the review burden, increases revert blast radius, and slows merge. "Drive-by" cleanup that happens to land in the same hunk is fine; net-new scope is not.
-5. Does an existing helper or pattern cover your case? Grep for prior art before introducing a parallel abstraction. (Concrete example: workspace-path resolution lives in `src/workspace_default.py` / `workspace_default.ts` — don't re-derive `Path(__file__).parent.parent` in a new script. Task-bridge IPC lives in `tasks/` ↔ `results/` — don't add a side channel.)
 
 ## The PR body should answer
 
