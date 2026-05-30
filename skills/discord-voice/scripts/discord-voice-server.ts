@@ -34,6 +34,7 @@ import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, createWriteStre
 import type { WriteStream } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { resolveWorkspace } from '../../../src/workspace_default.js';
+import { archiveFile } from '../../../src/task-archive.js';
 import { recordConversation, recordSession, recordToolCall } from '../../../src/conversation-store.js';
 import { resultBelongsTo, discordVoiceKey } from '../../../src/result-channel-key.js';
 import { personalPath } from '../../../src/util_paths.js';
@@ -398,7 +399,11 @@ function delegateTask(s: DiscordVoiceSession, taskDescription: string): Promise<
 			const result = readFileSync(resultPath, 'utf-8').trim();
 			console.log(`${ts()} [Task] result ${taskId} (${Date.now() - startTime}ms): ${result.slice(0, 200)}`);
 			s.events.push({ event: `task_result:${taskId}:${Date.now() - startTime}ms`, timestamp: new Date().toISOString() });
-			try { unlinkSync(resultPath); } catch {}
+			// Archive instead of unlink — routes through the shared
+			// task-archive helper (#1335 sub-PR-1) so discord-voice tasks
+			// land in the same <workspace>/results/archive/YYYY-MM/ bin as
+			// every other surface's tasks (closes the same class as #1235).
+			archiveFile(resultPath, 'results', taskId, WORKSPACE_DIR);
 			if (!s.taskResultCache) s.taskResultCache = new Map();
 			s.taskResultCache.set(taskDescription, result);
 			s.resultQueue.push({

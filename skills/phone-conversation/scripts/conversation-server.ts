@@ -54,6 +54,7 @@ import { voiceApiKey } from '../../../src/voice-key.js';
 import { loadVoiceConfig } from '../../../src/voice-config.js';
 import { hostname } from 'node:os';
 import { resolveWorkspace } from '../../../src/workspace_default.js';
+import { archiveFile } from '../../../src/task-archive.js';
 
 // Personal-asset path resolver — twin of util_paths.py / voice-agent.ts:personalPath.
 // Reads $SUTANDO_MEMORY_DIR (canonical post-#870), honors legacy $SUTANDO_PRIVATE_DIR
@@ -415,7 +416,11 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 			const result = readFileSync(resultPath, 'utf-8').trim();
 			console.log(`${ts()} [Task] result for ${taskId} (${Date.now() - startTime}ms): ${result.slice(0, 200)}`);
 			callSession.events.push({ event: `task_result:${taskId}:${Date.now() - startTime}ms`, timestamp: new Date().toISOString() });
-			try { unlinkSync(resultPath); } catch {}
+			// Archive instead of unlink — closes #1235 by routing through
+			// the shared task-archive helper (#1335 sub-PR-1) so phone tasks
+			// land in the same <workspace>/results/archive/YYYY-MM/ bin as
+			// every other surface's tasks.
+			archiveFile(resultPath, 'results', taskId, WORKSPACE_DIR);
 			// Cache result so duplicate requests get instant replay
 			if (!callSession.taskResultCache) callSession.taskResultCache = new Map();
 			callSession.taskResultCache.set(taskDescription, result);
