@@ -50,12 +50,16 @@ _MANIFEST_PATH = os.path.expanduser("~/.sutando-vault/keys.json")
 #   - backtick-quoted string `foo bar`  (Discord markdown; backticks stripped)
 #   - bare token (no spaces) foobar
 #
-# Anchored to start-of-line (or after a newline) to prevent conversational
-# false-positives like "the vault set command works" from storing garbage.
-# The (?:\s|$) tail avoids partial-token corruption on bare values.
+# Loose regex — finds candidate `vault set KEY VALUE` matches anywhere in
+# the text (including mid-prose). FP prevention is delegated to detect-secrets
+# (see _replacer): a candidate is only acted on if the VALUE is recognized as
+# a known secret pattern. This trades the regex line-anchor approach for
+# pattern-based validation, eliminating both:
+#   - FP: "the vault set command works fine" → "works" is not a secret → skip
+#   - FN: "hey vault set APOLLO_KEY sk-..." mid-prose → "sk-..." is OpenAI → store
 _VAULT_SET_RE = re.compile(
-    r'(?:^|\n)\s*vault\s+set\s+(\S+)\s+(?:"([^"]*)"|\'([^\']*)\'|`([^`]*)`|(\S+))(?:\s|$)',
-    re.IGNORECASE | re.MULTILINE,
+    r'\bvault\s+set\s+(\S+)\s+(?:"([^"]*)"|\'([^\']*)\'|`([^`]*)`|(\S+))(?=\s|$|[.,!?;])',
+    re.IGNORECASE,
 )
 
 
@@ -145,6 +149,17 @@ def intercept_vault_commands(text: str) -> InterceptResult:
             # Reject empty value — ambiguous and almost certainly a mistake.
             failed.append(key)
             return f"vault set {key} [VAULT-EMPTY-VALUE]"
+        # FP guard: validate the VALUE field is actually a known secret pattern
+        # via detect-secrets. This filters out prose matches like
+        # "the vault set command works fine" where regex would otherwise capture
+        # key="command", value="works" — "works" is not a known secret → skip.
+        # Quoted values bypass the guard (user explicitly delimited the value).
+        is_quoted = m.group(2) is not None or m.group(3) is not None or m.group(4) is not None
+        if not is_quoted:
+            from secret_scanner import scan_secrets
+            if not scan_secrets(value):
+                # Not a known secret pattern — assume this is prose, leave it alone.
+                return m.group(0)
         try:
             _store_in_keychain(key, value)
             stored.append(key)

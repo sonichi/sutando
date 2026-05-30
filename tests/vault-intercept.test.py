@@ -44,7 +44,8 @@ class TestNoVaultCommands(unittest.TestCase):
 class TestSingleVaultSet(unittest.TestCase):
     def test_bare_value(self):
         with _mock_store():
-            result = intercept_vault_commands("vault set MY_KEY mypassword123")
+            value = "sk-" + "a"*20 + "T3BlbkFJ" + "b"*20
+            result = intercept_vault_commands(f"vault set MY_KEY {value}")
         self.assertEqual(result.text, "vault set MY_KEY [STORED-IN-KEYCHAIN]")
         self.assertEqual(result.stored, ["MY_KEY"])
 
@@ -92,56 +93,65 @@ class TestSingleVaultSet(unittest.TestCase):
 
     def test_case_insensitive(self):
         with _mock_store():
-            result = intercept_vault_commands("VAULT SET FOO bar")
+            value = "sk-" + "a"*20 + "T3BlbkFJ" + "b"*20
+            result = intercept_vault_commands(f"VAULT SET FOO {value}")
         # Replacement normalizes to lowercase 'vault set'; secret is sanitized.
         self.assertEqual(result.text, "vault set FOO [STORED-IN-KEYCHAIN]")
         self.assertEqual(result.stored, ["FOO"])
 
     def test_surrounded_by_prose(self):
         with _mock_store():
+            value = "sk-" + "a"*20 + "T3BlbkFJ" + "b"*20
             result = intercept_vault_commands(
-                "hey set this: vault set APOLLO_KEY abc123 and use it for the integration"
+                f"hey set this: vault set APOLLO_KEY {value} and use it for the integration"
             )
         self.assertIn("[STORED-IN-KEYCHAIN]", result.text)
-        self.assertNotIn("abc123", result.text)
+        self.assertNotIn(value, result.text)
         self.assertEqual(result.stored, ["APOLLO_KEY"])
 
 
 class TestMultipleVaultSets(unittest.TestCase):
     def test_two_commands(self):
-        msg = "vault set KEY1 val1\nvault set KEY2 val2"
+        v1 = "sk-" + "a"*20 + "T3BlbkFJ" + "b"*20
+        v2 = "ghp_" + "x" * 36
+        msg = f"vault set KEY1 {v1}\nvault set KEY2 {v2}"
         with _mock_store():
             result = intercept_vault_commands(msg)
-        self.assertNotIn("val1", result.text)
-        self.assertNotIn("val2", result.text)
+        self.assertNotIn(v1, result.text)
+        self.assertNotIn(v2, result.text)
         self.assertEqual(sorted(result.stored), ["KEY1", "KEY2"])
         self.assertEqual(result.text.count("[STORED-IN-KEYCHAIN]"), 2)
 
     def test_three_commands_inline(self):
-        msg = "vault set A x vault set B y vault set C z"
+        v1 = "sk-" + "a"*20 + "T3BlbkFJ" + "b"*20
+        v2 = "ghp_" + "x" * 36
+        v3 = "AKIA" + "B"*16  # AWS Access Key shape
+        msg = f"vault set A {v1} vault set B {v2} vault set C {v3}"
         with _mock_store():
             result = intercept_vault_commands(msg)
         self.assertEqual(sorted(result.stored), ["A", "B", "C"])
-        self.assertNotIn(" x ", result.text)
-        self.assertNotIn(" y ", result.text)
-        self.assertNotIn(" z ", result.text)
+        self.assertNotIn(v1, result.text)
+        self.assertNotIn(v2, result.text)
+        self.assertNotIn(v3, result.text)
 
 
 class TestKeychainInteraction(unittest.TestCase):
     def test_calls_security_add_generic_password(self):
         with patch("vault_intercept.subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
-            intercept_vault_commands("vault set MYKEY supersecret")
+            value = "sk-" + "a"*20 + "T3BlbkFJ" + "b"*20
+            intercept_vault_commands(f"vault set MYKEY {value}")
         mock_run.assert_called_once()
         args = mock_run.call_args[0][0]
         self.assertIn("security", args)
         self.assertIn("add-generic-password", args)
         self.assertIn("MYKEY", args)
-        self.assertIn("supersecret", args)
+        self.assertIn(value, args)
         self.assertIn("-U", args)   # update flag must be present
 
     def test_account_is_sutando(self):
         with patch("vault_intercept.subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
-            intercept_vault_commands("vault set K v")
+            value = "sk-" + "a"*20 + "T3BlbkFJ" + "b"*20
+            intercept_vault_commands(f"vault set K {value}")
         args = mock_run.call_args[0][0]
         idx = args.index("-a")
         self.assertEqual(args[idx + 1], "sutando")
@@ -195,10 +205,11 @@ class TestRedactVaultCommands(unittest.TestCase):
 class TestErrorHandling(unittest.TestCase):
     def test_store_failure_still_redacts(self):
         """Fail-closed: plaintext must never reach disk even when Keychain write fails."""
+        value = "sk-" + "a"*20 + "T3BlbkFJ" + "b"*20
         failed_proc = MagicMock(returncode=1, stderr=b"boom")
         with patch("vault_intercept.subprocess.run", return_value=failed_proc):
-            result = intercept_vault_commands("vault set K supersecret")
-        self.assertNotIn("supersecret", result.text)
+            result = intercept_vault_commands(f"vault set K {value}")
+        self.assertNotIn(value, result.text)
         self.assertIn("[VAULT-STORE-FAILED]", result.text)
         self.assertEqual(result.stored, [])
         self.assertEqual(result.failed, ["K"])
@@ -212,11 +223,13 @@ class TestErrorHandling(unittest.TestCase):
                 return MagicMock(returncode=1, stderr=b"fail")
             return MagicMock(returncode=0, stdout=b"", stderr=b"")
 
+        v1 = "sk-" + "a"*20 + "T3BlbkFJ" + "b"*20
+        v2 = "ghp_" + "x" * 36
         with patch("vault_intercept.subprocess.run", side_effect=_side_effect), \
              patch.object(vault_intercept, "_register_key"):
-            result = intercept_vault_commands("vault set A secret1\nvault set B secret2")
-        self.assertNotIn("secret1", result.text)
-        self.assertNotIn("secret2", result.text)
+            result = intercept_vault_commands(f"vault set A {v1}\nvault set B {v2}")
+        self.assertNotIn(v1, result.text)
+        self.assertNotIn(v2, result.text)
         self.assertIn("A", result.stored)
         self.assertIn("B", result.failed)
 
