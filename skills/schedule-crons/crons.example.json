@@ -7,7 +7,7 @@
   {
     "name": "morning-briefing",
     "cron": "57 6 * * *",
-    "prompt_skill": "morning-briefing"
+    "prompt": "Run python3 src/morning-briefing.py to deliver the daily morning briefing (weather, calendar, reminders, overnight Discord, pending questions, health). Speak the result if voice is connected, send as Discord DM otherwise."
   },
   {
     "name": "daily-insight",
@@ -23,5 +23,10 @@
     "name": "sync-memory",
     "cron": "*/30 * * * *",
     "prompt": "Run bash scripts/sync-memory.sh to sync memory and notes to the private memory repo (requires SUTANDO_MEMORY_REPO in .env)."
+  },
+  {
+    "name": "learned-skills-scan",
+    "cron": "30 7 * * *",
+    "prompt": "Run python3 src/detect-learned-skills.py to scan recent task archives for repeated workflow patterns and propose candidate learned skills. Gated on state/learned-skills-enabled.sentinel (toggled from Settings → Skills → Behavior); the script exits early when the gate is off."
   }
 ]

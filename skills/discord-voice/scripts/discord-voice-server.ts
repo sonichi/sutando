@@ -30,7 +30,8 @@
  */
 
 import { config as _dotenvConfig } from 'dotenv';
-import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, existsSync, readFileSync, readdirSync, unlinkSync } from 'node:fs';
+import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, createWriteStream, existsSync, readFileSync, readdirSync, unlinkSync } from 'node:fs';
+import type { WriteStream } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { resolveWorkspace } from '../../../src/workspace_default.js';
 import { recordConversation, recordSession, recordToolCall } from '../../../src/conversation-store.js';
@@ -89,6 +90,20 @@ const TASKS_DIR = join(WORKSPACE_DIR, 'tasks');
 const TASK_POLL_INTERVAL_MS = 500;
 const TASK_POLL_TIMEOUT_MS = 300_000;
 const OWNER_NAME = process.env.owner ?? '';
+
+// Meeting mode — suppresses bot audio output while keeping transcription + sqlite running.
+// Mirrors src/voice-agent.ts `meetingActive` behaviour for the discord-voice surface.
+// Manual: poll state/voice-mode.txt (same file the menu-bar app + voice-agent write).
+// Auto:   flip after SUTANDO_VOICE_AUTO_MEETING_AFTER_SEC with no user audio (default 180s).
+const VOICE_MODE_FILE = join(WORKSPACE_DIR, 'state', 'voice-mode.txt');
+const AUTO_MEETING_TIMEOUT_MS = parseInt(process.env.SUTANDO_VOICE_AUTO_MEETING_AFTER_SEC || '180', 10) * 1000;
+// Wake phrases that exit meeting mode when user speaks them (case-insensitive).
+const WAKE_PHRASES = ['active mode', 'sutando active', 'lucy active', 'wake up', 'stop meeting mode',
+	...(OWNER_NAME ? [`${OWNER_NAME} active`] : [])];
+function _isWakePhrase(text: string): boolean {
+	const lower = text.toLowerCase();
+	return WAKE_PHRASES.some(p => lower.includes(p));
+}
 
 const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
 // Per-user voice config (native-audio model + googleSearch + owner_mode +
@@ -203,6 +218,13 @@ if (!GUILD_ID || !CHANNEL_ID) {
 mkdirSync(DATA_DIR, { recursive: true });
 mkdirSync(RESULTS_DIR, { recursive: true });
 mkdirSync(TASKS_DIR, { recursive: true });
+mkdirSync(dirname(DISCORD_VOICE_LOG), { recursive: true });
+
+let _opLogStream: WriteStream | null = null;
+try {
+	_opLogStream = createWriteStream(DISCORD_VOICE_LOG, { flags: 'a' });
+	_opLogStream.on('error', () => { _opLogStream = null; });
+} catch {}
 
 const ts = () => new Date().toISOString().slice(11, 23);
 const google = createGoogleGenerativeAI({ apiKey: GEMINI_API_KEY });
@@ -251,8 +273,7 @@ function appendOperationalLog(level: string, args: unknown[]): void {
 		const line = args
 			.map((a) => (typeof a === 'string' ? a : a instanceof Error ? (a.stack ?? a.message) : String(a)))
 			.join(' ');
-		mkdirSync(dirname(DISCORD_VOICE_LOG), { recursive: true });
-		appendFileSync(DISCORD_VOICE_LOG, `${new Date().toISOString()} ${level} ${line}\n`);
+		_opLogStream?.write(`${new Date().toISOString()} ${level} ${line}\n`);
 	} catch {}
 }
 {
@@ -314,6 +335,8 @@ interface DiscordVoiceSession {
 	audioPending: Buffer[];
 	toolCalls: { name: string; durationMs: number; timestamp: string }[];
 	events: { event: string; timestamp: string }[];
+	meetingMode: boolean;
+	lastUserAudioAt: number;
 }
 
 // Effective tier of the in-progress turn — the gate owner/team tools check.
@@ -524,62 +547,24 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 				return { status: 'left_discord_voice' };
 			},
 		});
-		// Skill-local share_screen — full sub-2s path. The voice-server
-		// directly spawns share-screen-modal.py (--full mode) which does ALL
-		// 5 CGEvent clicks (Discord Share button + Entire Screen tab +
-		// thumbnail + Share button) in ~0.7s. No MCP, no task-bridge, no
-		// proactive-loop hop. Coords hard-coded in the python script —
-		// re-derive via macos-use refresh_traversal on the MCP-Chrome main
-		// PID if Discord/Chrome UI moves.
-		const SHARE_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'share-screen-modal.py');
-		const spawnShareScreen = (source: string, mode: 'full' | 'stop') => {
-			const flag = mode === 'stop' ? '--stop' : '--full';
-			const child = spawn('python3', [SHARE_SCRIPT, flag], { stdio: 'ignore', detached: true });
-			child.on('error', (err) => console.log(`${ts()} [ShareScreen ${source}] spawn error:`, err));
-			child.unref();
-			console.log(`${ts()} [ShareScreen ${source} ${flag}] spawned PID ${child.pid}`);
-			return { status: mode === 'stop' ? 'stop_share_clicked' : 'share_screen_clicked',
-			         message: mode === 'stop' ? 'Stop-share click fired.' : 'Picker drive fired (sub-1s).' };
-		};
+		// Upstream sutando does NOT ship a screen-share implementation — it lives
+		// in the operator's private repo. Without an explicit `share_screen` tool
+		// that always returns unavailable, Gemini may silently route a "share my
+		// screen" utterance to a sibling tool (switch_tab / core summon → Zoom.app)
+		// — wrong behavior, no signal to the user. This stub guarantees a clean
+		// unavailability reply.
 		tools.push({
 			name: 'share_screen',
 			description:
-				'STRONG MATCH for any "share screen" / "share my screen" / "screen share" / "show my screen" / "屏幕共享" / "分享屏幕" / "把屏幕分享" utterance — in a Discord voice channel this is ALWAYS this tool. ' +
-				'Shares the owner\'s screen (Entire Screen mode, picker handled automatically by the proactive loop). ' +
-				'Call again to re-share even if already shared (user wants a fresh share). ' +
-				'DO NOT route share-screen utterances to switch_tab (that\'s for Chrome tab navigation) OR to summon / join_zoom (those open the Zoom desktop app — wrong app, user is in Discord). ' +
-				'To stop, use stop_share_screen tool (NOT dismiss — dismiss leaves the whole voice session).',
+				'Reply that screen share is NOT available in this build of sutando. ' +
+				'Match for any "share screen" / "share my screen" / "screen share" / "屏幕共享" / "分享屏幕" utterance. ' +
+				'In this (upstream) build the share-screen implementation is not installed; the tool always returns unavailable so the user gets an explicit message instead of a silent no-op.',
 			parameters: z.object({}),
 			execution: 'inline',
-			pendingMessage: 'Setting up screen share.',
-			async execute() { return spawnShareScreen('share_screen', 'full'); },
-		});
-		// Skill-local override: the core `summon` tool opens Zoom.app — wrong
-		// behavior when the user is in a Discord voice channel saying "summon"
-		// or "share my screen". Redirect those utterances to share_screen.
-		tools.push({
-			name: 'summon',
-			description:
-				'In a Discord voice channel context, "summon" / "share my screen" / "start zoom" / "let me see your screen" / "show me your screen" all mean: share the Discord screen via share_screen. ' +
-				'Call share_screen directly instead of this tool whenever possible. ' +
-				'This override exists only because the core summon tool would otherwise open Zoom.app — wrong app when the user is in Discord.',
-			parameters: z.object({}),
-			execution: 'inline',
-			async execute() { return spawnShareScreen('summon→share_screen', 'full'); },
-		});
-		// Skill-local stop_share_screen — same fast path. Single CGEvent
-		// click on the Discord voice-strip button at (338, 809) which
-		// morphs to "Stop Streaming" when a share is active.
-		tools.push({
-			name: 'stop_share_screen',
-			description:
-				'STRONG MATCH for any "stop share" / "stop sharing" / "stop screen share" / "unshare" / "停止分享" / "停止共享" / "别分享了" utterance. ' +
-				'Stops the active Discord screen share by clicking the Stop Streaming button. Voice channel stays connected. ' +
-				'No-op if not currently sharing.',
-			parameters: z.object({}),
-			execution: 'inline',
-			pendingMessage: 'Stopping screen share.',
-			async execute() { return spawnShareScreen('stop_share_screen', 'stop'); },
+			async execute() {
+				return { status: 'unavailable',
+				         message: 'Screen share is not available in this build of sutando — the share-screen implementation lives in the operator\'s private repo and is not installed. Tell the user briefly that screen share is unavailable in this version.' };
+			},
 		});
 		const seen = new Set(tools.map(t => t.name));
 		for (const t of inlineTools) {
@@ -736,6 +721,7 @@ function subscribeUser(s: DiscordVoiceSession, userId: string): void {
 		chunks++;
 		try { (s.voiceSession as any).handleAudioFromClient(pcm16Mono); } catch {}
 		(s as any)._noteSpoken?.();
+		s.lastUserAudioAt = Date.now();
 		if (chunks === 1) console.log(`${ts()} [Voice] first chunk: ${pcm16Mono.length}B`);
 	});
 	resampler.on('end', () => {
@@ -816,6 +802,8 @@ async function createVoiceSession(connection: VoiceConnection, client: Client): 
 		audioPending: [],
 		toolCalls: [],
 		events: [{ event: 'session_started', timestamp: new Date().toISOString() }],
+		meetingMode: false,
+		lastUserAudioAt: Date.now(),
 	};
 
 	const agent = buildAgent(s);
@@ -874,15 +862,44 @@ async function createVoiceSession(connection: VoiceConnection, client: Client): 
 		try {
 			const pcm24Mono = Buffer.from(data, 'base64');
 			const pcm48Stereo = upsample24MonoTo48Stereo(pcm24Mono);
-			pushAudio(pcm48Stereo);
-			outChunks++;
-			if (outChunks === 1 || outChunks % 50 === 0) {
-				console.log(`${ts()} [Audio] outbound chunks: ${outChunks} (last=${pcm48Stereo.length}B)`);
+			// In meeting mode, suppress audio output — keep transcription + sqlite running.
+			if (!s.meetingMode) {
+				pushAudio(pcm48Stereo);
+				outChunks++;
+				if (outChunks === 1 || outChunks % 50 === 0) {
+					console.log(`${ts()} [Audio] outbound chunks: ${outChunks} (last=${pcm48Stereo.length}B)`);
+				}
 			}
 		} catch (err) {
 			console.error(`${ts()} [Audio] outbound convert failed:`, err);
 		}
 	};
+
+	// --- Meeting mode: manual poll + auto-idle ---
+	// Manual: read state/voice-mode.txt every 2s (same file Sutando.app + voice-agent write).
+	// Auto:   flip to meeting mode after AUTO_MEETING_TIMEOUT_MS with no user audio.
+	// Both timers are cleared in finalizeSession() via the closing flag check.
+	const voiceModePoll = setInterval(() => {
+		if (s.closing) { clearInterval(voiceModePoll); return; }
+		try {
+			const mode = readFileSync(VOICE_MODE_FILE, 'utf-8').trim();
+			const want = mode === 'meeting';
+			if (want !== s.meetingMode) {
+				s.meetingMode = want;
+				console.log(`${ts()} [Meeting] voice-mode.txt → ${mode} (meetingMode=${s.meetingMode})`);
+			}
+		} catch { /* file absent = active mode */ }
+	}, 2_000);
+
+	// AUTO_MEETING_TIMEOUT_MS === 0 means auto-meeting is disabled.
+	const autoMeetingTimer = AUTO_MEETING_TIMEOUT_MS > 0 ? setInterval(() => {
+		if (s.closing) { clearInterval(autoMeetingTimer!); return; }
+		if (!s.meetingMode && Date.now() - s.lastUserAudioAt > AUTO_MEETING_TIMEOUT_MS) {
+			s.meetingMode = true;
+			console.log(`${ts()} [Meeting] auto-meeting triggered — no user audio for ${AUTO_MEETING_TIMEOUT_MS / 1000}s`);
+			try { writeFileSync(VOICE_MODE_FILE, 'meeting'); } catch {}
+		}
+	}, 10_000) : null;
 
 	// Transcript mirroring + result-queue drain
 	let lastProcessedIdx = 0;
@@ -900,6 +917,12 @@ async function createVoiceSession(connection: VoiceConnection, client: Client): 
 			if (item.content === lastText) continue;
 			if (item.role === 'user') {
 				s.transcript.push({ role: 'user', text: item.content });
+				// Wake-phrase detection: exit meeting mode when user speaks a wake phrase.
+				if (s.meetingMode && _isWakePhrase(item.content)) {
+					s.meetingMode = false;
+					console.log(`${ts()} [Meeting] wake-phrase detected — exiting meeting mode: "${item.content.slice(0, 60)}"`);
+					try { writeFileSync(VOICE_MODE_FILE, 'active'); } catch {}
+				}
 				// utterance event push removed per #1052 — canonical record is
 				// the discord_voice-table row written by recordConversation
 				// below. session_events keeps only lifecycle entries to stop
@@ -1177,22 +1200,44 @@ async function start(): Promise<void> {
 		}
 		if (presentPeers.length > 0) {
 			console.error(`${ts()} [Setup] #1089 refusing to join: sutando peer(s) already present: ${presentPeers.join(', ')}`);
-			// Surface the refusal to the operator — without this they just see
-			// "nothing happens" when inviting a second bot to a channel that
-			// already has one. Drop a proactive result; the discord-bridge
-			// polls results/ and DMs proactive-*.txt to the owner. Best-effort:
-			// if the write fails the process still exits cleanly and
-			// Sutando.app's checkWatcher will retry once the peer leaves.
-			try {
-				const proactivePath = join(WORKSPACE_DIR, 'results', `proactive-${Date.now()}.txt`);
-				const channelName = (channel as any).name ?? CHANNEL_ID;
-				writeFileSync(
-					proactivePath,
-					`Skipping voice join in #${channelName} — peer already present: ${presentPeers.join(', ')}. ` +
-					`Single-bot enforcement (#1089); reinvite once they leave.\n`,
-				);
-			} catch (e) {
-				console.error(`${ts()} [Setup] #1089 couldn't surface refusal to operator:`, e);
+			// #1120: if the spawner threaded --reply-channel and --reply-user
+			// through, post the refusal in that channel (mentioning the
+			// inviter) — "reply where invited" instead of falling back to
+			// owner-DM. The previous proactive-*.txt path stays as fallback
+			// only when those args are absent (out-of-band spawns, manual
+			// testing).
+			const channelName = (channel as any).name ?? CHANNEL_ID;
+			const refusalText =
+				`Skipping voice join in #${channelName} — peer already present: ${presentPeers.join(', ')}. ` +
+				`Single-bot enforcement (#1089); reinvite once they leave.`;
+			const REPLY_CHANNEL_ID = getArg('reply-channel');
+			const REPLY_USER_ID = getArg('reply-user');
+			// Track whether the channel-reply was actually delivered. If not — for ANY
+			// reason: arg absent, fetch threw, channel isn't text-capable, send threw —
+			// fall back to proactive-*.txt so the operator still sees the refusal.
+			// (Per @bassilkhilo-ag2's #1132 review: prior shape logged "falling back to
+			// proactive-*.txt" on catch but didn't actually write it, silently dropping
+			// the #1089 refusal when the channel send failed.)
+			let channelReplyDelivered = false;
+			if (REPLY_CHANNEL_ID) {
+				try {
+					const replyCh = await client.channels.fetch(REPLY_CHANNEL_ID);
+					if (replyCh && 'send' in replyCh) {
+						const mention = REPLY_USER_ID ? `<@${REPLY_USER_ID}> ` : '';
+						await (replyCh as any).send(mention + refusalText);
+						channelReplyDelivered = true;
+					}
+				} catch (e) {
+					console.error(`${ts()} [Setup] #1120 channel-reply failed:`, e);
+				}
+			}
+			if (!channelReplyDelivered) {
+				try {
+					const proactivePath = join(WORKSPACE_DIR, 'results', `proactive-${Date.now()}.txt`);
+					writeFileSync(proactivePath, refusalText + '\n');
+				} catch (e) {
+					console.error(`${ts()} [Setup] #1089 couldn't surface refusal to operator:`, e);
+				}
 			}
 			process.exit(0); // clean exit — operator (Sutando.app checkWatcher) will retry later when peer leaves
 		}
