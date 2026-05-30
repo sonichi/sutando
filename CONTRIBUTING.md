@@ -63,7 +63,7 @@ The goal of this phase is to confirm the PR is necessary at all. In rough order 
    ```
 
    If someone else's PR is already in flight (CLA-blocked or just stale), prefer pinging them or pushing onto their branch over opening a parallel one.
-2. **Is the problem real?** For a bug-fix, reproduce the bug yourself end-to-end (**manual verify**) — or, if you can't repro locally, ask a maintainer's bot to verify (**bot verify**). For a feature, confirm the user need is real (issue with use case, owner ask, etc.). Don't open a PR for a problem that doesn't exist.
+2. **Is the problem real?** For a bug-fix, **manually verify** — a human actually runs the failing path end-to-end. If you can't repro locally, ask a maintainer's bot to produce **scripted evidence the maintainer can inspect** (test output, repro logs) — that's "bot verification". Bot verification is *evidence*, not a substitute for manual testing when the change is user-visible, integration-heavy, or weakly covered by tests. For a feature, confirm the user need is real (issue with use case, owner ask, etc.). Don't open a PR for a problem that doesn't exist.
 3. For a bug-fix: is the bug still on `upstream/main`? (`git show upstream/main:path | grep buggy-line`) — don't fix something that's already gone.
 4. Is this a single concern? **One bug or one feature per PR.** If you're tempted to bundle several features into one PR ("while I'm here I'll also add Y, Z"), split them up front — open one PR per concern, each with its own closes-link. Mixing concerns triples the review burden, increases revert blast radius, and slows merge. "Drive-by" cleanup that happens to land in the same hunk is fine; net-new scope is not.
 
@@ -96,7 +96,7 @@ The goal of this phase is to provide evidence the maintainer can verify quickly.
 
 If you're reviewing someone else's PR (including a bot's), keep the comment thread useful:
 
-- **Don't add noise.** If another reviewer already said the same thing, or you have nothing substantive to add, stay silent. A "LGTM" comment under an existing APPROVE doesn't help anyone — it just buries real feedback. (One concrete reminder: if you find yourself typing the third "lgtm" in a row, delete it.)
+- **Prefer to add evidence, not noise.** If you have nothing new to add — no new evidence, no fresh angle, no concrete suggestion — stay silent. A "LGTM" comment under an existing APPROVE just buries real feedback. (A second reviewer surfacing *new* evidence on a point another reviewer raised is fine; a third "lgtm" in a row is not.)
 - **APPROVE / REQUEST_CHANGES is a formal GitHub action.** A Discord "👍" or a `gh pr comment` saying "approved" does NOT register as a review — use `POST /repos/.../pulls/N/reviews` (or `gh pr review --approve`) so the state is recorded.
 - **Be evidence-first.** When you claim something is broken, point at the commit, file, line, repro, or failing test. If you didn't verify, say so explicitly ("not verified — flagging for author to check").
 - **Distinguish blockers from nits.** Mark each comment so the author knows what's gating merge vs what's deferrable.
