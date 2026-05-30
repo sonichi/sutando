@@ -4,7 +4,9 @@ One-shot importer: conversation.log (text) → conversation.sqlite (table `conve
 
 Format expected per line: `<ISO ts>|<role>|<text>`
 
-Idempotency: by default, INSERT every line — re-running duplicates rows.
+Idempotency: once the UNIQUE INDEX exists (run dedup-conversation-store.py
+first if needed), INSERT OR IGNORE silently skips already-imported rows so
+re-running is safe. Without the index, re-running still duplicates rows.
 Pass --reload to TRUNCATE the table first and reimport from scratch.
 Pass --dry-run to count rows without writing.
 
@@ -106,6 +108,16 @@ def ensure_schema(db: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_conversation_role_ts ON conversation(role, ts_unix);
         CREATE INDEX IF NOT EXISTS idx_conversation_session ON conversation(session_id, ts_unix);
     """)
+    # Best-effort UNIQUE INDEX — fails silently if duplicates exist (run
+    # scripts/dedup-conversation-store.py first to clear them, then re-run
+    # this import to get the idempotency guard).
+    try:
+        db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "idx_conversation_unique ON conversation(ts_unix, role, text, COALESCE(session_id,''))"
+        )
+    except Exception:
+        pass
 
 
 def main() -> int:
@@ -160,7 +172,7 @@ def main() -> int:
         print(f"parsed: {parsed} rows  (skipped unparseable: {skipped})")
         print(f"roles:  {sorted(role_counts.items(), key=lambda x: -x[1])}")
         db.executemany(
-            "INSERT INTO conversation (ts_unix, role, text, session_id) VALUES (?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO conversation (ts_unix, role, text, session_id) VALUES (?, ?, ?, ?)",
             rows,
         )
         db.execute("COMMIT")

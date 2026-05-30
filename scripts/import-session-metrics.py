@@ -118,6 +118,19 @@ def ensure_schema(db: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_session_events_name_ts ON session_events(event_name, ts_unix);
         CREATE INDEX IF NOT EXISTS idx_session_events_session ON session_events(session_id, ts_unix);
     """)
+    # Best-effort UNIQUE INDEXes — fail silently if duplicates exist (run
+    # scripts/dedup-conversation-store.py first, then re-import for full
+    # idempotency via INSERT OR IGNORE).
+    for stmt in (
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_unique "
+        "ON sessions(ts_unix, source, COALESCE(session_id,''), COALESCE(call_sid,''))",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_session_events_unique "
+        "ON session_events(ts_unix, source, COALESCE(session_id,''), COALESCE(call_sid,''), event_name)",
+    ):
+        try:
+            db.execute(stmt)
+        except Exception:
+            pass
 
 
 def import_file(db: sqlite3.Connection, path: Path, source_hint: str) -> tuple[int, int, int]:
@@ -140,7 +153,7 @@ def import_file(db: sqlite3.Connection, path: Path, source_hint: str) -> tuple[i
             session_id = m.get("sessionId")
             call_sid = m.get("callSid")
             db.execute(
-                "INSERT INTO sessions (ts_unix, source, session_id, call_sid, caller, is_owner, is_meeting, "
+                "INSERT OR IGNORE INTO sessions (ts_unix, source, session_id, call_sid, caller, is_owner, is_meeting, "
                 "duration_ms, transcript_lines, tool_count, pending_tasks, tool_calls, events) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
@@ -176,7 +189,7 @@ def import_file(db: sqlite3.Connection, path: Path, source_hint: str) -> tuple[i
                 n_t += 1
             for ev in m.get("events") or []:
                 db.execute(
-                    "INSERT INTO session_events (ts_unix, source, session_id, call_sid, event_name) "
+                    "INSERT OR IGNORE INTO session_events (ts_unix, source, session_id, call_sid, event_name) "
                     "VALUES (?, ?, ?, ?, ?)",
                     (
                         iso_to_unix(ev.get("timestamp")) or ts_unix,
