@@ -20,6 +20,10 @@ import { resolveWorkspace, statusPath, statusReadPath } from './workspace_defaul
 // resolveWorkspace() is the canonical TS helper introduced in #821.
 const WORKSPACE_DIR = resolveWorkspace();
 
+// Gate slide-control + fullscreen on presenter-mode.sentinel.
+// Issue #1171: registering these globally causes Gemini to fire them on greetings.
+const _presenterActive = existsSync(join(WORKSPACE_DIR, 'state', 'presenter-mode.sentinel'));
+
 // Code-adjacent paths (skills/, etc.) ship with the repo checkout, NOT the
 // workspace. Compute REPO_ROOT from this file's URL so the resolution
 // survives any cwd drift at startup. Used by the skill-loader below.
@@ -1089,7 +1093,7 @@ export const inlineTools = assertUniqueToolNames([
 	volumeTool, brightnessTool, clipboardTool,
 	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, getCoreStatusTool,
 	joinGmeetTool, lookupMeetingIdTool, callContactTool,
-	describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, slideControlTool, fullscreenTool,
+	describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, ...(_presenterActive ? [slideControlTool, fullscreenTool] : []),
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
 	recentContextTool,
 	sendVisionFrameTool, startVisionTool, stopVisionTool,
@@ -1110,7 +1114,7 @@ export const ownerOnlyTools = [
 	pressKeyTool, scrollTool, switchTabTool, closeTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
 	clipboardTool, cancelTaskTool, toggleTasksTool,
-	joinGmeetTool, callContactTool, slideControlTool, fullscreenTool,
+	joinGmeetTool, callContactTool, ...(_presenterActive ? [slideControlTool, fullscreenTool] : []),
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
 	recentContextTool,
 	describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool,

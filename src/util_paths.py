@@ -85,7 +85,7 @@ def _private_machine_dir() -> Path | None:
     if not root:
         return None
     expanded = os.path.expanduser(root)
-    host = socket.gethostname().split(".")[0]
+    host = os.environ.get("SUTANDO_HOST_LABEL") or socket.gethostname().split(".")[0]
     return Path(expanded) / f"machine-{host}"
 
 
