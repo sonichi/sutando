@@ -35,6 +35,7 @@ from result_markers import parse_markers  # noqa: E402
 
 from workspace_default import resolve_workspace  # noqa: E402
 from task_archive import find_task_file, archive_file as _archive_file_shared  # noqa: E402
+from proactive_delivery import recover_orphan_sending_files as _recover_orphan_sending_files_shared  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 REPO = resolve_workspace()
 TASKS_DIR = REPO / "tasks"
@@ -391,37 +392,11 @@ def send_reply(chat_id, text, task_id: str | None = None):
             print(f"  file marker, file not found — likely a prose quotation: {fpath}", flush=True)
 
 def _recover_orphan_sending_files() -> int:
-    """Restart-safety: rename any orphan `results/proactive-*.sending`
-    files back to `*.txt` so they get re-claimed on the next poll.
-
-    Mirrors `_recover_orphan_sending_files` in discord-bridge.py.
-    See that docstring for the bug class this closes.
-    """
-    if not RESULTS_DIR.exists():
-        return 0
-    recovered = 0
-    for f in RESULTS_DIR.iterdir():
-        if not (f.name.startswith("proactive-") and f.suffix == ".sending"):
-            continue
-        target = f.with_suffix(".txt")
-        try:
-            if target.exists():
-                print(
-                    f"  [startup] skipping orphan recovery: {target.name} "
-                    f"already exists (collision with {f.name})",
-                    flush=True,
-                )
-                continue
-            f.rename(target)
-            recovered += 1
-            print(f"  [startup] recovered orphan {f.name} → {target.name}", flush=True)
-        except FileNotFoundError:
-            pass
-        except Exception as e:
-            print(f"  [startup] failed to recover {f.name}: {e}", flush=True)
-    if recovered:
-        print(f"  [startup] recovered {recovered} orphan .sending file(s)", flush=True)
-    return recovered
+    """Thin wrapper that pins ``results_dir`` to this surface's
+    ``RESULTS_DIR`` and delegates to the shared helper in
+    ``src/proactive_delivery.py``. See ``docs/bridge-helpers-design.md``
+    § proactive-delivery sweep for the contract (#1335 sub-PR-2)."""
+    return _recover_orphan_sending_files_shared(RESULTS_DIR)
 
 
 def main():
