@@ -16,12 +16,9 @@ and zero import surface.
 Guards:
   1. src/slack-bridge.py imports parse_markers from result_markers
   2. src/telegram-bridge.py imports parse_markers from result_markers
-  3. Each bridge's marker-handling block calls parse_markers(...)
-  4. result_markers.py exposes the public surface parse_markers + Action
-
-Discord and task-bridge are NOT yet wired through the unified parser in
-this PR (intentional — landing slack + telegram first as the high-impact
-bug fixes). When they're refactored in a follow-up, add their guards here.
+  3. src/discord-bridge.py imports parse_markers from result_markers (#896)
+  4. Each bridge's marker-handling block calls parse_markers(...)
+  5. result_markers.py exposes the public surface parse_markers + Action
 
 Run: python3 tests/bridge-marker-no-leak.test.py
 Exit: 0 on pass, 1 on fail.
@@ -81,6 +78,21 @@ def main() -> int:
             "src/telegram-bridge.py does not reference 'deduped' anywhere — "
             "the unified-parser wire-through likely got dropped"
         )
+
+    # 3b. Discord bridge wires the parser (#896)
+    db = REPO / "src" / "discord-bridge.py"
+    db_src = db.read_text()
+    if "from result_markers import parse_markers" not in db_src:
+        return fail("src/discord-bridge.py must import parse_markers from result_markers (#896)")
+    if "parse_markers(" not in db_src:
+        return fail("src/discord-bridge.py must call parse_markers(...) somewhere (#896)")
+    # No hand-rolled startswith skip-detection should remain in the send paths
+    for hand_rolled in (".startswith('[no-send]')", ".startswith('[REPLIED]')", ".startswith('[deduped:')"):
+        if hand_rolled in db_src:
+            return fail(
+                f"src/discord-bridge.py still has hand-rolled skip check {hand_rolled!r} — "
+                "must route through parse_markers() per #896"
+            )
 
     # 4. Behavior smoke test of the parser itself
     sys.path.insert(0, str(REPO / "src"))

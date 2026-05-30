@@ -87,11 +87,12 @@ def get_waiting_questions():
         if not title:
             continue
         status_m = re.search(r'\*\*Status:\*\*\s*(.+)', body)
-        if not status_m:
-            continue
-        status = status_m.group(1).strip().lower()
-        if status.startswith('unanswered') or status.startswith('waiting'):
-            questions.append({"id": title[:40], "title": title})
+        if status_m:
+            status = status_m.group(1).strip().lower()
+            if not (status.startswith('unanswered') or status.startswith('waiting')):
+                continue  # explicitly resolved/done/answered — skip
+        # No status field, or status is unanswered/waiting → notify
+        questions.append({"id": title[:40], "title": title})
     return questions
 
 

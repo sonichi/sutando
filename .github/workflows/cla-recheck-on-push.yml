@@ -1,0 +1,32 @@
+name: cla-recheck-on-push
+
+# CLA-Assistant doesn't re-evaluate license/cla on push events — only on
+# pull_request.opened / reopened / synchronize-with-a-comment-trigger. When a
+# contributor pushes a fix after their first sign, or a maintainer clicks
+# "Update branch", the check stays PENDING until someone manually comments
+# `@cla-assistant check`. That blocks the PR on contributor availability,
+# which we don't want. This workflow fires the recheck comment automatically
+# on every push to an open PR, so the bot re-runs without human action.
+#
+# See CONTRIBUTING.md §6 "After update-branch, CLA-Assistant may not auto-rerun".
+
+on:
+  pull_request_target:
+    types: [synchronize]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  recheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: '@cla-assistant check'
+            });

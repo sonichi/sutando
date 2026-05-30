@@ -14,11 +14,12 @@ import assert from 'node:assert/strict';
  *   5. Neither set -> undefined (no warning).
  */
 
-import { memoryDirEnv } from '../src/util_paths.js';
+import { memoryDirEnv, personalPath } from '../src/util_paths.js';
 
 function clearEnv() {
 	delete process.env.SUTANDO_MEMORY_DIR;
 	delete process.env.SUTANDO_PRIVATE_DIR;
+	delete process.env.SUTANDO_HOST_LABEL;
 }
 
 function captureWarn<T>(fn: () => T): { value: T; warnings: string[] } {
@@ -74,7 +75,7 @@ describe('memoryDirEnv (#870 rename)', () => {
 		clearEnv();
 	});
 
-	it('emits the deprecation warning on EVERY read, not just first', () => {
+	it('emits the deprecation warning on EVERY read, not just first (#870 regression guard)', () => {
 		// Regression guard: cron / launchd environments miss startup-only
 		// warnings, so the alias must warn loudly every time it's resolved.
 		clearEnv();
@@ -86,6 +87,36 @@ describe('memoryDirEnv (#870 rename)', () => {
 		});
 		assert.equal(warnings.length, 3);
 		for (const w of warnings) assert.match(w, /DEPRECATION/);
+		clearEnv();
+	});
+});
+
+describe('personalPath SUTANDO_HOST_LABEL (#871)', () => {
+	it('uses SUTANDO_HOST_LABEL when set', () => {
+		clearEnv();
+		process.env.SUTANDO_MEMORY_DIR = '/tmp/nonexistent-memdir-871';
+		process.env.SUTANDO_HOST_LABEL = 'my-stable-mac';
+		const p = personalPath('stand-identity.json', '/tmp/nonexistent-ws-871');
+		assert.match(p, /machine-my-stable-mac/);
+		clearEnv();
+	});
+
+	it('falls back to hostname when SUTANDO_HOST_LABEL is unset', () => {
+		clearEnv();
+		process.env.SUTANDO_MEMORY_DIR = '/tmp/nonexistent-memdir-871';
+		const p = personalPath('stand-identity.json', '/tmp/nonexistent-ws-871');
+		// Hostname cannot contain "my-stable-mac" — just verify the label is absent.
+		assert.doesNotMatch(p, /machine-my-stable-mac/);
+		assert.match(p, /machine-/);
+		clearEnv();
+	});
+
+	it('falls back to hostname when SUTANDO_HOST_LABEL is empty string', () => {
+		clearEnv();
+		process.env.SUTANDO_MEMORY_DIR = '/tmp/nonexistent-memdir-871';
+		process.env.SUTANDO_HOST_LABEL = '';
+		const p = personalPath('stand-identity.json', '/tmp/nonexistent-ws-871');
+		assert.doesNotMatch(p, /machine-$/);  // not machine- with empty suffix
 		clearEnv();
 	});
 });
