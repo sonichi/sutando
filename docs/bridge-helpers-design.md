@@ -86,9 +86,9 @@ sweep_orphan_sending_files(proactive_dir: Path, surface: str, instance: str) -> 
 - Instance identifier format (hostname or SUTANDO_HOST_LABEL).
 - Failure mode on rename collision.
 
-### 3. result markers — `src/result_markers.py` + `src/result-markers.ts`
+### 3. result markers — `src/result_markers.py` (and TS counterpart, TODO)
 
-**Status:** TODO. Marker parsing currently scattered across `src/discord-bridge.py:~3093-3251`, `src/telegram-bridge.py:~368-398` + `:~582-584`, `src/task-bridge.ts:~668-670`. Each surface re-parses with its own regex/prefix logic. Schema change = N-site edit.
+**Status:** **Python side already shipped in #873** — `src/result_markers.py` exists with `parse_markers()`. `discord-bridge.py`, `slack-bridge.py`, and `telegram-bridge.py` already `from result_markers import parse_markers`. TypeScript-side equivalent (`src/result-markers.ts`) for `task-bridge.ts` and the two voice surfaces (`phone-conversation`, `discord-voice`) is TODO if/when those surfaces need the same parse-time discipline.
 
 **Contract:**
 
