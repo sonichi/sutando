@@ -167,8 +167,20 @@ if [ -n "${AVAIL_GB:-}" ]; then
     fi
 fi
 
-# 8) memory-sync age
-SYNC_HEAD="$HOME/.sutando-memory-sync/.git/FETCH_HEAD"
+# 8) memory-sync age — resolve memory dir per the workspace contract:
+# $SUTANDO_MEMORY_DIR (canonical, since #870) → $SUTANDO_PRIVATE_DIR (legacy
+# alias) → default $HOME/.sutando/memory-sync. Fall back to the pre-migration
+# $HOME/.sutando-memory-sync only when no nested dir exists yet (older hosts
+# that haven't moved over).
+MEMORY_DIR="${SUTANDO_MEMORY_DIR:-${SUTANDO_PRIVATE_DIR:-}}"
+if [ -z "$MEMORY_DIR" ]; then
+    if [ -d "$HOME/.sutando/memory-sync" ]; then
+        MEMORY_DIR="$HOME/.sutando/memory-sync"
+    else
+        MEMORY_DIR="$HOME/.sutando-memory-sync"
+    fi
+fi
+SYNC_HEAD="$MEMORY_DIR/.git/FETCH_HEAD"
 if [ -f "$SYNC_HEAD" ]; then
     age_sec=$(($(date +%s) - $(stat_mtime "$SYNC_HEAD")))
     age_h=$((age_sec / 3600))
