@@ -4,14 +4,14 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { resolveWorkspace } from './workspace_default.js';
+import { claudeHomePath } from './util_paths.js';
 
 function defaultMemoryDir(): string {
     const repo = resolve(join(import.meta.dirname, '..'));
     const slug = repo.replace(/\//g, '-');
-    return join(homedir(), '.claude', 'projects', slug, 'memory');
+    return claudeHomePath('projects', slug, 'memory');
 }
 
 const MEMORY_DIR = process.env.SUTANDO_MEMORY_DIR || defaultMemoryDir();

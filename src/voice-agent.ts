@@ -43,7 +43,7 @@ import { recordSession, recordToolCall } from './conversation-store.js';
 import { buildSutandoSystemPrompt, buildVoiceAgentContext } from './voice-context.js';
 import { classifyTransportClose, type ClassifiedClose } from './voice-error-classifier.js';
 
-import { personalPath, sharedPersonalPath, memoryDirEnv } from './util_paths.js';
+import { personalPath, sharedPersonalPath, memoryDirEnv, claudeHomePath } from './util_paths.js';
 
 // Cartesia is loaded dynamically at the bottom of the config section so
 // the `@cartesia/cartesia-js` package is only required when the user has
@@ -844,7 +844,7 @@ const mainAgent: MainAgent = {
 // dir should never block voice startup.
 function bootstrapMemoryDir(): void {
 	const slug = '-' + WORKSPACE_DIR.replace(/\/$/, '').split('/').filter(Boolean).join('-');
-	const memDir = process.env.SUTANDO_MEMORY_DIR || join(homedir(), '.claude', 'projects', slug, 'memory');
+	const memDir = process.env.SUTANDO_MEMORY_DIR || claudeHomePath('projects', slug, 'memory');
 	try {
 		mkdirSync(memDir, { recursive: true });
 		const indexPath = join(memDir, 'MEMORY.md');
