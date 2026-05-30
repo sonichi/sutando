@@ -39,13 +39,6 @@ https://github.com/user-attachments/assets/a86ec34e-3b26-4011-824c-d2d124753c25
 
 [@sutando-ai channel](https://www.youtube.com/@sutando-ai) · [Sutando WIRE playlist](https://www.youtube.com/playlist?list=PLoEaHbP1bU5FDWAyeLDL9J9i7Iblp3_m_)
 
-**Recent capability proofs:**
-- [An AI agent caught a bug humans missed — phantom voice sessions, found via anomaly detection](https://youtu.be/FeLfufsMJpY)
-- [42 Days of Sutando — a fleet-growth visualization](https://youtu.be/t2SQqR07T3c)
-- [The AI agent that presented live](https://youtu.be/tisE8YjmLdU)
-- [9-year-old planned her birthday party with AI agent — by voice](https://youtu.be/YuhWklKBP2Q)
-- [When one AI agent can't fix itself, it asks another — same owner or different](https://youtu.be/k_aNNEN_GAc)
-
 ---
 
 ## What can you do with it?
