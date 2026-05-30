@@ -4,10 +4,12 @@
  */
 
 import { execSync, execFileSync } from 'node:child_process';
-import { writeFileSync, unlinkSync, readFileSync, existsSync } from 'node:fs';
+import { writeFileSync, unlinkSync, readFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
+import { join } from 'node:path';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { demoStateRef } from './recording-state.js';
+import { resolveWorkspace } from './workspace_default.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -435,6 +437,155 @@ export const clickTool: ToolDefinition = {
 			return { error: 'Provide either x,y coordinates or a shortcut' };
 		} catch (err) {
 			return { error: `click failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
+// --- Point at (Pointer Teacher) ---
+
+// gemini-3-flash-preview with Gemini's NATIVE point format and thinking
+// disabled was proven by the Pointer Teacher grill POCs to land 1–3 px on real
+// UI targets in VSCode. On the same screenshot, gemini-3.1-flash-lite was
+// 108 px off and Clicky's raw-pixel `[POINT:x,y]` prompt was 23–69 px off.
+// See docs/adr/0001-pointer-teacher-brain.md. Do NOT swap the model or the
+// prompt format without re-running that POC — both choices are load-bearing.
+const POINTER_MODEL = process.env.POINTER_MODEL || 'gemini-3-flash-preview';
+// IPC: Sutando.app watches <workspace>/state via DispatchSource and flies the
+// bezier pointer to whatever lands here. Go through resolveWorkspace() so we
+// agree with the Swift side's `AppDelegate.workspace` (added in #837) — not
+// process.cwd(), which silently bifurcates when SUTANDO_WORKSPACE points
+// anywhere other than the launch CWD (closes #934).
+const POINTER_STATE_DIR = join(resolveWorkspace(), 'state');
+const POINTER_CMD_PATH = join(POINTER_STATE_DIR, 'pointer-cmd.json');
+
+// Atomic publish to the pointer IPC file. The temp name is unique per call
+// (pid + ms + random) — a fixed per-process name lets two overlapping point_at
+// calls clobber each other's write/rename (Codex review, high). The rename is
+// atomic and the Swift side's monotonic `ts` guard decides which command wins,
+// so no lock is needed.
+function publishPointerCmd(cmd: Record<string, unknown>): void {
+	mkdirSync(POINTER_STATE_DIR, { recursive: true });
+	const tmpCmd = `${POINTER_CMD_PATH}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 9)}.tmp`;
+	writeFileSync(tmpCmd, JSON.stringify(cmd));
+	renameSync(tmpCmd, POINTER_CMD_PATH);
+}
+
+export const pointAtTool: ToolDefinition = {
+	name: 'point_at',
+	description:
+		'Physically point at something on the user\'s screen — flies an on-screen marker to it and gives you what to say. This is the embodied "show me where" / teaching gesture: use it whenever the user asks where something is or how to do something in the app in front of them ("where do I commit?", "show me the search", "point at the deploy button", "teach me — where do I start?"). Captures the main display, locates the target, and animates a pointer there. After it returns you MUST speak the returned `say` sentence aloud.',
+	parameters: z.object({
+		query: z.string().describe('What to point at, in plain words — a control, icon, menu, or region. E.g. "the commit button", "the Source Control icon", "where do I run the app".'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { query } = args as { query: string };
+		// Free-tier eligible voice key preferred (the POC proved gemini-3-flash-preview
+		// works on it); falls back to the paid key. Same precedence as describe_screen.
+		const apiKey = process.env.GEMINI_VOICE_API_KEY || process.env.GEMINI_API_KEY;
+		if (!apiKey) return { error: 'point_at unavailable (no GEMINI_VOICE_API_KEY or GEMINI_API_KEY)' };
+		if (!query?.trim()) return { error: 'point_at needs a query (what to point at)' };
+		try {
+			// 0. Clear any overlay still on screen from a previous point_at
+			// before screenshotting. The :7845 server shells out to
+			// `screencapture`, which grabs the raw framebuffer and ignores
+			// NSWindow.sharingType — so the only way to keep a stale pointer
+			// out of the shot (and out of the model's input, which would bias
+			// the next target) is to tell the Swift overlay to hide, then give
+			// the dir-watcher → main-thread orderOut a moment to land before we
+			// capture (Codex review, high). ~250ms is negligible against the
+			// ~8s capture + ~60s model budget below.
+			publishPointerCmd({ hide: true, ts: Date.now() / 1000 });
+			await new Promise(r => setTimeout(r, 250));
+			// 1. capture the main display (single-display scope guard) via :7845.
+			// Timeout-bounded — point_at is on the sub-second inline lane and must
+			// never hang it if the capture server is wedged.
+			const capRes = await fetch('http://localhost:7845/capture?display=1', { signal: AbortSignal.timeout(8_000) });
+			if (!capRes.ok) return { error: `point_at capture HTTP ${capRes.status}` };
+			const cap = await capRes.json() as { status: string; path?: string; error?: string };
+			if (cap.status !== 'ok' || !cap.path) return { error: `point_at capture failed: ${cap.error || 'unknown'}` };
+			// Downscale; sips -Z preserves aspect, so 0–1 normalized coords map
+			// straight onto the display with no extra transform (open item #2).
+			// Per-invocation temp path + success flag so a failed sips can never
+			// feed a stale screenshot from a previous call into the model.
+			const small = `/tmp/pointer-shot-${process.pid}-${Date.now()}.jpg`;
+			let resized = false;
+			try {
+				execFileSync('sips', ['-s', 'format', 'jpeg', '-Z', '1568', cap.path, '--out', small], { timeout: 4_000, stdio: 'ignore' });
+				resized = existsSync(small);
+			} catch { /* fall back to the full-size capture below */ }
+			const imgPath = resized ? small : cap.path;
+			const imageData = readFileSync(imgPath).toString('base64');
+			if (resized) { try { unlinkSync(small); } catch { /* best-effort cleanup */ } }
+
+			// 2. resolve the Target via Gemini's native point format (thinking off)
+			const prompt =
+				`Point to ${query}. Return ONLY minified JSON, no prose, no code fence: ` +
+				`{"point":[y,x],"label":"<3 words>","say":"<one friendly spoken sentence ` +
+				`(max 20 words) telling me where it is and what to do>"}. ` +
+				`point is [y, x] normalized to 0-1000 over the whole image.`;
+			const res = await fetch(
+				`https://generativelanguage.googleapis.com/v1beta/models/${POINTER_MODEL}:generateContent?key=${apiKey}`,
+				{
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({
+						contents: [{ parts: [{ text: prompt }, { inlineData: { mimeType: 'image/jpeg', data: imageData } }] }],
+						// thinkingBudget:0 is required — gemini-3-flash-preview is a
+						// thinking model and burns the token budget reasoning instead
+						// of answering, truncating the point. Proven in the POC.
+						generationConfig: { temperature: 0, maxOutputTokens: 1200, thinkingConfig: { thinkingBudget: 0 } },
+					}),
+					signal: AbortSignal.timeout(60_000),
+				},
+			);
+			const data = await res.json().catch(() => null) as any;
+			if (!res.ok) {
+				return { error: `point_at model HTTP ${res.status}: ${data?.error?.message || JSON.stringify(data)?.slice(0, 160) || 'no body'}` };
+			}
+			if (!data?.candidates?.[0]) {
+				const reason = data?.promptFeedback?.blockReason || data?.error?.message || JSON.stringify(data).slice(0, 160);
+				return { error: `point_at model error: ${reason}` };
+			}
+			const txt = (data.candidates[0].content?.parts?.[0]?.text ?? '').trim();
+			const cleaned = txt.replace(/^```(?:json)?|```$/gm, '').trim();
+			let y: number, x: number, label = query, say = '';
+			try {
+				const obj = JSON.parse(cleaned);
+				y = Number(obj.point[0]); x = Number(obj.point[1]);
+				label = obj.label || query; say = obj.say || '';
+			} catch {
+				// Fallback: pull the first [y, x] pair out of a noisier reply.
+				const m = cleaned.match(/\[\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*\]/);
+				if (!m) return { error: `point_at unparseable reply: ${txt.slice(0, 160)}` };
+				y = Number(m[1]); x = Number(m[2]);
+			}
+			// Reject garbage before it reaches the overlay — a NaN/out-of-range
+			// point would otherwise fly the marker off-screen or be silently
+			// dropped by the Swift side while we still report success.
+			if (![x, y].every(n => Number.isFinite(n) && n >= 0 && n <= 1000)) {
+				return { error: `point_at got an out-of-range point [${y}, ${x}] for "${query}"` };
+			}
+
+			// 3. hand the Target to the Swift overlay (runs in the real GUI session).
+			// Atomic publish via the shared helper (unique sibling temp →
+			// rename), so the dir-watcher never reads a half-written JSON and
+			// concurrent calls can't collide.
+			const cmd = {
+				nx: Math.round((x / 1000) * 1e5) / 1e5,
+				ny: Math.round((y / 1000) * 1e5) / 1e5,
+				label, say, ts: Date.now() / 1000,
+			};
+			publishPointerCmd(cmd);
+			console.log(`${ts()} [PointAt] "${query}" -> nx=${cmd.nx} ny=${cmd.ny} label="${label}"`);
+			return {
+				status: 'pointing',
+				label,
+				say,
+				instruction: 'A pointer is now flying to the target on the user\'s screen. Speak the `say` sentence aloud to the user NOW, then keep teaching.',
+			};
+		} catch (err) {
+			return { error: `point_at failed: ${err instanceof Error ? err.message : err}` };
 		}
 	},
 };

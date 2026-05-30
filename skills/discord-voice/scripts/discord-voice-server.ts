@@ -20,20 +20,31 @@
  *
  * ## Env
  *   DISCORD_BOT_TOKEN  — bot token (~/.claude/channels/discord/.env)
- *   GEMINI_API_KEY     — required
- *   VOICE_MODEL / VOICE_NATIVE_AUDIO_MODEL — mirrors voice-agent.ts
- *   SUTANDO_WORKSPACE  — workspace root for tasks/results/data
+ *   GEMINI_API_KEY (or GEMINI_VOICE_API_KEY) — required; voiceApiKey()
+ *   VOICE_MODEL — text/STT model; native-audio model + googleSearch +
+ *                 owner_mode/channels live in the per-user config at
+ *                 $SUTANDO_WORKSPACE/config/discord-voice.json — NOT a
+ *                 committed repo file (the repo ships config.json.example
+ *                 as a template; see src/voice-config.ts for the schema)
+ *   SUTANDO_WORKSPACE  — workspace root for tasks/results/data + config
  */
 
 import { config as _dotenvConfig } from 'dotenv';
-import { mkdirSync, writeFileSync, appendFileSync, existsSync, readFileSync, unlinkSync } from 'node:fs';
+import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, createWriteStream, existsSync, readFileSync, readdirSync, unlinkSync } from 'node:fs';
+import type { WriteStream } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { resolveWorkspace } from '../../../src/workspace_default.js';
+import { recordConversation, recordSession, recordToolCall } from '../../../src/conversation-store.js';
+import { resultBelongsTo, discordVoiceKey } from '../../../src/result-channel-key.js';
+import { personalPath } from '../../../src/util_paths.js';
+import { type Tier, loadAccessTiers, effectiveTier, toolAllowed, toolNeed } from './access-tier.js';
 
 _dotenvConfig({ path: new URL('../../../.env', import.meta.url).pathname, override: true });
 _dotenvConfig({ path: join(process.env.HOME ?? '', '.claude/channels/discord/.env'), override: false });
 
 import { fileURLToPath } from 'node:url';
+import { voiceApiKey } from '../../../src/voice-key.js';
+import { loadVoiceConfig, resolveOwnerMode } from '../../../src/voice-config.js';
 import { execSync, spawn } from 'node:child_process';
 import { VoiceSession, type ToolDefinition, type MainAgent } from 'bodhi-realtime-agent';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
@@ -63,9 +74,16 @@ import {
 
 // --- Config ---
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY ?? '';
+// Voice surfaces share the GEMINI_VOICE_API_KEY → GEMINI_API_KEY fallback
+// chain via voiceApiKey() (src/voice-key.ts).
+const GEMINI_API_KEY = voiceApiKey();
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN ?? '';
 const WORKSPACE_DIR = resolveWorkspace();
+// Operational/diagnostic log — the [Setup]/[Voice]/[Tool]/[VoiceSession]/
+// [Dismiss] lines that otherwise only hit stdout. Mirrors discord-bridge.log
+// and voice-agent.log so discord-voice's operational history survives a
+// process exit. Tee'd from console.log/console.error below (fail-soft).
+const DISCORD_VOICE_LOG = join(WORKSPACE_DIR, 'logs', 'discord-voice.log');
 const DATA_DIR = join(WORKSPACE_DIR, 'data');
 const RESULTS_DIR = process.env.DISCORD_VOICE_RESULTS_DIR || join(WORKSPACE_DIR, 'results');
 const TASKS_DIR = join(WORKSPACE_DIR, 'tasks');
@@ -73,11 +91,85 @@ const TASK_POLL_INTERVAL_MS = 500;
 const TASK_POLL_TIMEOUT_MS = 300_000;
 const OWNER_NAME = process.env.owner ?? '';
 
-const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
-const VOICE_NATIVE_AUDIO_MODEL =
-	process.env.VOICE_NATIVE_AUDIO_MODEL || 'gemini-3.1-flash-live-preview';
+// Meeting mode — suppresses bot audio output while keeping transcription + sqlite running.
+// Mirrors src/voice-agent.ts `meetingActive` behaviour for the discord-voice surface.
+// Manual: poll state/voice-mode.txt (same file the menu-bar app + voice-agent write).
+// Auto:   flip after SUTANDO_VOICE_AUTO_MEETING_AFTER_SEC with no user audio (default 180s).
+const VOICE_MODE_FILE = join(WORKSPACE_DIR, 'state', 'voice-mode.txt');
+const AUTO_MEETING_TIMEOUT_MS = parseInt(process.env.SUTANDO_VOICE_AUTO_MEETING_AFTER_SEC || '180', 10) * 1000;
+// Wake phrases that exit meeting mode when user speaks them (case-insensitive).
+const WAKE_PHRASES = ['active mode', 'sutando active', 'lucy active', 'wake up', 'stop meeting mode',
+	...(OWNER_NAME ? [`${OWNER_NAME} active`] : [])];
+function _isWakePhrase(text: string): boolean {
+	const lower = text.toLowerCase();
+	return WAKE_PHRASES.some(p => lower.includes(p));
+}
 
-const TREAT_AS_OWNER = (process.env.DISCORD_VOICE_OWNER ?? 'true') !== 'false';
+const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
+// Per-user voice config (native-audio model + googleSearch + owner_mode +
+// channels) is data, not code: it lives in the workspace, NOT in the git repo.
+//   live config: $SUTANDO_WORKSPACE/config/discord-voice.json
+//   template:    skills/discord-voice/config.json.example (committed)
+// On first run, if the workspace config is missing, the committed .example
+// template is copied into place so the operator has a file to edit. If the
+// copy fails (or the template is gone), loadVoiceConfig falls back to its
+// built-in safe defaults. Schema + defaults: src/voice-config.ts.
+const _discordSkillDir = dirname(dirname(fileURLToPath(import.meta.url)));
+const DISCORD_VOICE_CONFIG_PATH = join(WORKSPACE_DIR, 'config', 'discord-voice.json');
+if (!existsSync(DISCORD_VOICE_CONFIG_PATH)) {
+	const _exampleConfigPath = join(_discordSkillDir, 'config.json.example');
+	try {
+		mkdirSync(dirname(DISCORD_VOICE_CONFIG_PATH), { recursive: true });
+		if (existsSync(_exampleConfigPath)) {
+			copyFileSync(_exampleConfigPath, DISCORD_VOICE_CONFIG_PATH);
+			console.log(`${new Date().toISOString().slice(11, 23)} [discord-voice] seeded config from template → ${DISCORD_VOICE_CONFIG_PATH}`);
+		}
+	} catch (e) {
+		console.warn(`${new Date().toISOString().slice(11, 23)} [discord-voice] could not seed config at ${DISCORD_VOICE_CONFIG_PATH}: ${(e as Error).message} — using built-in defaults`);
+	}
+}
+const DISCORD_VOICE_CONFIG = loadVoiceConfig(DISCORD_VOICE_CONFIG_PATH);
+const VOICE_NATIVE_AUDIO_MODEL = DISCORD_VOICE_CONFIG.model;
+const DISCORD_VOICE_GOOGLE_SEARCH = DISCORD_VOICE_CONFIG.googleSearch;
+
+// Comma-separated Discord user IDs of BOT accounts whose audio SHOULD be
+// piped to Gemini despite User.bot=true. Defaults to empty — bots are auto-
+// ignored. Set this when you genuinely want a peer bot's voice processed
+// (rare; usually only for testing). Per #1096 — without this default-deny,
+// the receiver would pipe peer-bot audio to Gemini and cause attribution
+// errors like today's "the other speaker is a bot, not a human" misdiagnosis.
+const ALLOWED_BOT_USER_IDS = new Set(
+	(process.env.SUTANDO_ALLOWED_BOT_USER_IDS ?? '')
+		.split(',').map(s => s.trim()).filter(Boolean)
+);
+
+// Username prefixes that identify a peer SUTANDO bot (distinct from any
+// other Discord bot like a music bot or MEE6). Used by #1089 single-bot
+// enforcement to decide who to refuse-join-against / leave-when-detected.
+// Override via `SUTANDO_PEER_USERNAME_PATTERNS=Foo,Bar` if the naming
+// convention drifts. Match: `username.startsWith(pattern)`, case-sensitive.
+const SUTANDO_PEER_USERNAME_PATTERNS = (process.env.SUTANDO_PEER_USERNAME_PATTERNS ?? 'Sutando-,Sutando_,Lucy-,Lucy_,Maddy,Mini')
+	.split(',').map(s => s.trim()).filter(Boolean);
+
+// Disable #1089 single-bot enforcement (testing-only). Set to "1" to allow
+// multiple sutando peers in the same voice channel without auto-leave. Defaults
+// to enabled. NEVER set in production — bypassing defeats the defense-in-depth
+// design where each peer self-declines AND the already-present peer auto-
+// leaves if a peer joins anyway.
+const SUTANDO_PEER_ENFORCEMENT_DISABLED = process.env.SUTANDO_PEER_ENFORCEMENT_DISABLED === '1';
+
+// Hung-session watchdog threshold. A Gemini Live session can silently stall —
+// audio keeps flowing in but it stops emitting turn.end, with no transport
+// close event to trigger the reconnect path. If utterances have piled up
+// since the last turn AND the user last stopped speaking longer ago than
+// this, treat the session as hung and force a reconnect. Env-overridable.
+const WATCHDOG_STALL_MS = Number(process.env.SUTANDO_WATCHDOG_STALL_MS) || 20000;
+
+// --- Per-speaker access tier (owner / team / other) -------------------------
+// Tier logic lives in ./access-tier.ts (pure + unit-tested). A Gemini Live
+// session's tool list is fixed at session start, so the tier is enforced
+// per-turn at tool execute() time, keyed off the last speaker.
+const ACCESS = loadAccessTiers(process.env.HOME ?? '');
 
 // CLI: --guild <id> --channel <voice_channel_id>
 function getArg(name: string): string | undefined {
@@ -86,6 +178,35 @@ function getArg(name: string): string | undefined {
 }
 const GUILD_ID = getArg('guild');
 const CHANNEL_ID = getArg('channel');
+
+// Owner-mode (issue #1016) — resolved from the workspace config
+// ($SUTANDO_WORKSPACE/config/discord-voice.json), NOT an env var and NOT a
+// committed repo file. Resolution order:
+//   1. config.channels[CHANNEL_ID].owner_mode  (per-channel override)
+//   2. config.owner_mode                       (skill-wide default)
+//   3. false                                   (safe default)
+// Default false (safe): non-owner speakers in the voice channel get the
+// read-only tool surface but NOT owner-tier work/file-edit/message-send.
+// Set owner_mode=true (skill-wide or per-channel) to inherit owner privileges
+// to every speaker — only safe in voice channels whose membership is fully
+// trusted (single-operator Lounge, not community/public). See SKILL.md.
+// resolveOwnerMode (src/voice-config.ts) is fail-closed: it grants ONLY on the
+// boolean literal `true`, so a hand-edited config with a string `"true"` /
+// `"false"` / null / number can't silently flip the trust boundary. It also
+// preserves precedence — a channel that explicitly sets owner_mode:false still
+// overrides a skill-wide owner_mode:true.
+const TREAT_AS_OWNER = resolveOwnerMode(DISCORD_VOICE_CONFIG, CHANNEL_ID);
+
+// Legacy env warning (issue #1016) — owner-mode used to be a coarse global
+// env flag. It's now config-driven (`owner_mode` in the workspace config).
+// If the old var is still set, warn once so the operator knows it's inert.
+if (process.env.DISCORD_VOICE_OWNER !== undefined) {
+	console.warn(
+		'[discord-voice] DISCORD_VOICE_OWNER is set but no longer takes effect — ' +
+		'owner-mode is now config-driven (`owner_mode` in the workspace config, ' +
+		'$SUTANDO_WORKSPACE/config/discord-voice.json; see SKILL.md).',
+	);
+}
 
 if (!GEMINI_API_KEY) { console.error('Error: GEMINI_API_KEY required'); process.exit(1); }
 if (!DISCORD_BOT_TOKEN) { console.error('Error: DISCORD_BOT_TOKEN required'); process.exit(1); }
@@ -97,6 +218,13 @@ if (!GUILD_ID || !CHANNEL_ID) {
 mkdirSync(DATA_DIR, { recursive: true });
 mkdirSync(RESULTS_DIR, { recursive: true });
 mkdirSync(TASKS_DIR, { recursive: true });
+mkdirSync(dirname(DISCORD_VOICE_LOG), { recursive: true });
+
+let _opLogStream: WriteStream | null = null;
+try {
+	_opLogStream = createWriteStream(DISCORD_VOICE_LOG, { flags: 'a' });
+	_opLogStream.on('error', () => { _opLogStream = null; });
+} catch {}
 
 const ts = () => new Date().toISOString().slice(11, 23);
 const google = createGoogleGenerativeAI({ apiKey: GEMINI_API_KEY });
@@ -120,19 +248,45 @@ function detachVisionFromSession(): void {
 }
 
 // --- Conversation log -------------------------------------------------------
+// discord-voice mirrors turns into conversation.sqlite (queryable) AND the
+// shared logs/conversation.log text log — the same dual-write the phone path
+// uses. conversation.log is the canonical source the reload importer rebuilds
+// the sqlite `conversation` table from, so writing it keeps discord-voice rows
+// recoverable after `import-conversation-log.py --reload`.
+const CONVERSATION_LOG = join(WORKSPACE_DIR, 'logs', 'conversation.log');
 
-const LOG_PATH = join(
-	DATA_DIR,
-	`discord-voice-${new Date().toISOString().replace(/[:.]/g, '-')}.jsonl`,
-);
-
-function logLine(role: 'user' | 'assistant' | 'system', text: string, extra: Record<string, unknown> = {}): void {
+function appendConversationLog(role: string, text: string): void {
 	try {
-		appendFileSync(
-			LOG_PATH,
-			JSON.stringify({ timestamp: new Date().toISOString(), role, text, ...extra }) + '\n',
-		);
+		mkdirSync(dirname(CONVERSATION_LOG), { recursive: true });
+		appendFileSync(CONVERSATION_LOG, `${new Date().toISOString()}|${role}|${text.replace(/\n/g, ' ')}\n`);
 	} catch {}
+}
+
+// --- Operational log tee ----------------------------------------------------
+// console.log/console.error still write to stdout exactly as before; each call
+// is ALSO appended (ISO-timestamped) to logs/discord-voice.log. Mirrors the
+// appendConversationLog pattern above — mkdirSync guard + fail-soft try/catch
+// so a disk/permission error degrades silently to stdout-only and can NEVER
+// crash the voice session.
+function appendOperationalLog(level: string, args: unknown[]): void {
+	try {
+		const line = args
+			.map((a) => (typeof a === 'string' ? a : a instanceof Error ? (a.stack ?? a.message) : String(a)))
+			.join(' ');
+		_opLogStream?.write(`${new Date().toISOString()} ${level} ${line}\n`);
+	} catch {}
+}
+{
+	const _origLog = console.log.bind(console);
+	const _origError = console.error.bind(console);
+	console.log = (...args: unknown[]): void => {
+		_origLog(...args);
+		appendOperationalLog('LOG', args);
+	};
+	console.error = (...args: unknown[]): void => {
+		_origError(...args);
+		appendOperationalLog('ERR', args);
+	};
 }
 
 // --- Audio conversion helpers ----------------------------------------------
@@ -168,9 +322,29 @@ interface DiscordVoiceSession {
 	taskResultCache?: Map<string, string>;
 	_toolIdMap?: Map<string, string>;
 	subscribedUsers: Set<string>;
+	client: Client;
+	// Cache of userId → isBot flag from User.bot. Populated lazily on first
+	// speaking.start for each speaker. Used to auto-ignore bot accounts so
+	// the receiver doesn't pipe peer-bot audio to Gemini.
+	botFlagCache: Map<string, boolean>;
+	// Every Discord user who contributed audio to the in-progress Gemini turn.
+	// Added on speaking.start, cleared on turn.end. The tier gate reads this
+	// set (not a live last-speaker pointer) so a tool call is attributed to
+	// the turn that produced it, not to whoever spoke most recently.
+	turnSpeakers: Set<string>;
 	audioPending: Buffer[];
 	toolCalls: { name: string; durationMs: number; timestamp: string }[];
 	events: { event: string; timestamp: string }[];
+	meetingMode: boolean;
+	lastUserAudioAt: number;
+}
+
+// Effective tier of the in-progress turn — the gate owner/team tools check.
+// Resolves across every speaker who contributed audio to this turn, failing
+// closed to the least-privileged among them (see effectiveTier). TREAT_AS_OWNER
+// (legacy DISCORD_VOICE_OWNER) overrides to owner.
+function currentTier(s: DiscordVoiceSession): Tier {
+	return effectiveTier(s.turnSpeakers, ACCESS, TREAT_AS_OWNER);
 }
 
 let active: DiscordVoiceSession | null = null;
@@ -205,7 +379,7 @@ function delegateTask(s: DiscordVoiceSession, taskDescription: string): Promise<
 		`source: discord-voice\n` +
 		`guild: ${s.guildId}\n` +
 		`channel: ${s.channelId}\n` +
-		`access_tier: ${TREAT_AS_OWNER ? 'owner' : 'other'}\n` +
+		`access_tier: ${currentTier(s)}\n` +
 		`task: ${taskDescription}\n` +
 		`hint: Check ~/.claude/skills/ for a matching skill before using raw commands.\n` +
 		`transcript:\n${fullTranscript}\n`;
@@ -253,8 +427,26 @@ function delegateTask(s: DiscordVoiceSession, taskDescription: string): Promise<
 
 // --- Build agent ------------------------------------------------------------
 
+// Inject a system-role message into the live Gemini Live transport.
+// Owns the `(... as any).transport.sendContent` cast in one place so future
+// bodhi-realtime-agent versions that publicize this surface only need one
+// edit. Used for Layer-2 peer-detected announcement, magic-word takeover,
+// recent_context replays, and a few other system-side nudges.
+//
+// TODO: bodhi 1.x stability — `transport.sendContent` is an internal API on
+// the VoiceSession; bodhi may rename/restructure it across minor versions.
+// Keep all call sites going through this wrapper.
+function injectSystemMessage(s: DiscordVoiceSession, text: string): void {
+	(s.voiceSession as any).transport.sendContent(
+		[{ role: 'user', text }],
+		true,
+	);
+}
+
 function buildAgent(s: DiscordVoiceSession): MainAgent {
-	const isOwner = TREAT_AS_OWNER;
+	// Declare the full owner toolset whenever an owner is configured (access.json)
+	// or the legacy flag is on; the per-speaker tier is then enforced at execute().
+	const isOwner = TREAT_AS_OWNER || ACCESS.owner.size > 0;
 
 	let instructions: string;
 	if (isOwner) {
@@ -265,6 +457,15 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 		instructions = [
 			`You are Sutando, a personal AI assistant. You are in a Discord voice channel with your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''}.`,
 			'YOU are Sutando — the AI assistant. The person speaking is your OWNER, a human. Do NOT confuse yourself with them.',
+			// Per-node Stand identity — mirrors src/voice-agent.ts:606 pattern.
+			// `stand-identity.json` carries name + nameOrigin for the bot on
+			// this machine (e.g. "Echo Act IV (Mini)" on the Mac mini, "Lucy"
+			// on Susan's Mac Studio). Loading it here lets the discord-voice
+			// agent answer "who are you" with the same Stand name the core
+			// voice-agent already uses — single per-node identity contract
+			// across surfaces, no parallel env var. Silent fall-through if
+			// the file is absent (kept the generic "You are Sutando" framing).
+			(() => { try { const si = JSON.parse(readFileSync(personalPath('stand-identity.json'), 'utf-8')); return si.name ? `Your Stand name is ${si.name}. Origin: ${si.nameOrigin || 'earned through use'}. When asked your name or who you are, say "I'm Sutando — ${si.name}."` : ''; } catch { return ''; } })(),
 			'You have full capabilities — use the work tool for anything: check the screen, send emails, look things up, make calls, browse the web, or check results of previous tasks.',
 			'',
 			'## How to think',
@@ -282,16 +483,29 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 			'Be natural, warm, and conversational. Keep responses to 1-2 sentences.',
 			'Discord voice channels are persistent — do NOT say "goodbye" or try to hang up. Just stop speaking when you have nothing more to add.',
 			'NEVER say "I\'m back", "Welcome back", "Working on it", or "task is queued". If the conversation resumes after a pause, just continue naturally.',
-			'NEVER fabricate specific details. If you don\'t know it, use the work tool to look it up.',
+			// "Look it up" pointer — conditional on per-surface config.
+			// Search on → native Web grounding (~2-3s, in-conversation);
+			// search off → `work` tool fallback (round-trip ~8-15s).
+			// Earlier code had both a permanent "use work" line + a soft
+			// nudge; model read the imperative as imperative and the nudge
+			// as optional. One conditional line so only one path appears.
+			DISCORD_VOICE_GOOGLE_SEARCH
+				? 'NEVER fabricate specific details. If you don\'t know it, use your built-in Web search to look it up — it\'s faster than delegating, and the answer stays in the conversation. If your built-in search returns nothing useful, OR the question needs deeper-than-one-lookup research (multi-step, multiple sources, file reading), call the work tool — it routes to the core agent which can do extensive research.'
+				: 'NEVER fabricate specific details. If you don\'t know it, use the work tool to look it up.',
 			repoUrl ? `\n## Known info\nSutando GitHub repo: ${repoUrl}` : '',
 		].filter(Boolean).join('\n');
 	} else {
 		instructions = [
 			'You are Sutando, an AI assistant in a Discord voice channel.',
+			// Per-node Stand identity — same load as owner-tier block above. Non-
+			// owner speakers also benefit from "this Sutando is named X" so
+			// "Hi Lucy" / "Hi Mini" doesn't get the rigid "I'm Sutando, not X"
+			// correction.
+			(() => { try { const si = JSON.parse(readFileSync(personalPath('stand-identity.json'), 'utf-8')); return si.name ? `Your Stand name is ${si.name}. When asked your name, say "I'm Sutando — ${si.name}."` : ''; } catch { return ''; } })(),
 			'Be helpful and conversational. You can answer general knowledge questions, do translations, and have conversations.',
 			'You cannot access files, control the screen, or delegate tasks.',
 			'Keep responses to 1-2 sentences.',
-		].join('\n');
+		].filter(Boolean).join('\n');
 	}
 
 	const tools: ToolDefinition[] = [];
@@ -333,62 +547,24 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 				return { status: 'left_discord_voice' };
 			},
 		});
-		// Skill-local share_screen — full sub-2s path. The voice-server
-		// directly spawns share-screen-modal.py (--full mode) which does ALL
-		// 5 CGEvent clicks (Discord Share button + Entire Screen tab +
-		// thumbnail + Share button) in ~0.7s. No MCP, no task-bridge, no
-		// proactive-loop hop. Coords hard-coded in the python script —
-		// re-derive via macos-use refresh_traversal on the MCP-Chrome main
-		// PID if Discord/Chrome UI moves.
-		const SHARE_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'share-screen-modal.py');
-		const spawnShareScreen = (source: string, mode: 'full' | 'stop') => {
-			const flag = mode === 'stop' ? '--stop' : '--full';
-			const child = spawn('python3', [SHARE_SCRIPT, flag], { stdio: 'ignore', detached: true });
-			child.on('error', (err) => console.log(`${ts()} [ShareScreen ${source}] spawn error:`, err));
-			child.unref();
-			console.log(`${ts()} [ShareScreen ${source} ${flag}] spawned PID ${child.pid}`);
-			return { status: mode === 'stop' ? 'stop_share_clicked' : 'share_screen_clicked',
-			         message: mode === 'stop' ? 'Stop-share click fired.' : 'Picker drive fired (sub-1s).' };
-		};
+		// Upstream sutando does NOT ship a screen-share implementation — it lives
+		// in the operator's private repo. Without an explicit `share_screen` tool
+		// that always returns unavailable, Gemini may silently route a "share my
+		// screen" utterance to a sibling tool (switch_tab / core summon → Zoom.app)
+		// — wrong behavior, no signal to the user. This stub guarantees a clean
+		// unavailability reply.
 		tools.push({
 			name: 'share_screen',
 			description:
-				'STRONG MATCH for any "share screen" / "share my screen" / "screen share" / "show my screen" / "屏幕共享" / "分享屏幕" / "把屏幕分享" utterance — in a Discord voice channel this is ALWAYS this tool. ' +
-				'Shares the owner\'s screen (Entire Screen mode, picker handled automatically by the proactive loop). ' +
-				'Call again to re-share even if already shared (user wants a fresh share). ' +
-				'DO NOT route share-screen utterances to switch_tab (that\'s for Chrome tab navigation) OR to summon / join_zoom (those open the Zoom desktop app — wrong app, user is in Discord). ' +
-				'To stop, use stop_share_screen tool (NOT dismiss — dismiss leaves the whole voice session).',
+				'Reply that screen share is NOT available in this build of sutando. ' +
+				'Match for any "share screen" / "share my screen" / "screen share" / "屏幕共享" / "分享屏幕" utterance. ' +
+				'In this (upstream) build the share-screen implementation is not installed; the tool always returns unavailable so the user gets an explicit message instead of a silent no-op.',
 			parameters: z.object({}),
 			execution: 'inline',
-			pendingMessage: 'Setting up screen share.',
-			async execute() { return spawnShareScreen('share_screen', 'full'); },
-		});
-		// Skill-local override: the core `summon` tool opens Zoom.app — wrong
-		// behavior when the user is in a Discord voice channel saying "summon"
-		// or "share my screen". Redirect those utterances to share_screen.
-		tools.push({
-			name: 'summon',
-			description:
-				'In a Discord voice channel context, "summon" / "share my screen" / "start zoom" / "let me see your screen" / "show me your screen" all mean: share the Discord screen via share_screen. ' +
-				'Call share_screen directly instead of this tool whenever possible. ' +
-				'This override exists only because the core summon tool would otherwise open Zoom.app — wrong app when the user is in Discord.',
-			parameters: z.object({}),
-			execution: 'inline',
-			async execute() { return spawnShareScreen('summon→share_screen', 'full'); },
-		});
-		// Skill-local stop_share_screen — same fast path. Single CGEvent
-		// click on the Discord voice-strip button at (338, 809) which
-		// morphs to "Stop Streaming" when a share is active.
-		tools.push({
-			name: 'stop_share_screen',
-			description:
-				'STRONG MATCH for any "stop share" / "stop sharing" / "stop screen share" / "unshare" / "停止分享" / "停止共享" / "别分享了" utterance. ' +
-				'Stops the active Discord screen share by clicking the Stop Streaming button. Voice channel stays connected. ' +
-				'No-op if not currently sharing.',
-			parameters: z.object({}),
-			execution: 'inline',
-			pendingMessage: 'Stopping screen share.',
-			async execute() { return spawnShareScreen('stop_share_screen', 'stop'); },
+			async execute() {
+				return { status: 'unavailable',
+				         message: 'Screen share is not available in this build of sutando — the share-screen implementation lives in the operator\'s private repo and is not installed. Tell the user briefly that screen share is unavailable in this version.' };
+			},
 		});
 		const seen = new Set(tools.map(t => t.name));
 		for (const t of inlineTools) {
@@ -408,11 +584,39 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 		});
 	}
 
+	// Per-speaker tier gate. The Gemini session's tool list is fixed at start,
+	// so enforce the tier at execute() time, keyed off the last speaker.
+	// toolNeed() classifies each tool (see access-tier.ts):
+	//   owner-only — work, screen-share tools, ownerOnlyTools
+	//   owner+team — configurableTools + dismiss (a teammate may end the
+	//                session — owner can rejoin via DM)
+	//   open       — inlineTools + get_task_status (read-only surface)
+	const ownerOnlyNames = new Set<string>(ownerOnlyTools.map(t => t.name));
+	const teamNames = new Set<string>(configurableTools.map(t => t.name));
+	for (let i = 0; i < tools.length; i++) {
+		const t = tools[i];
+		const need: Tier | null = toolNeed(t.name, ownerOnlyNames, teamNames);
+		if (!need) continue;
+		const inner = t.execute.bind(t);
+		tools[i] = {
+			...t,
+			execute: async (args: any) => {
+				const tier = currentTier(s);
+				const ok = toolAllowed(need, tier);
+				if (!ok) {
+					console.log(`${ts()} [Tier] '${t.name}' denied — speaker tier=${tier}, needs ${need}`);
+					return { status: 'denied', message: `That needs ${need}-tier access; the current speaker is ${tier}-tier.` };
+				}
+				return inner(args);
+			},
+		};
+	}
+
 	return {
 		name: 'discord-voice',
 		instructions,
 		tools,
-		googleSearch: true,
+		googleSearch: DISCORD_VOICE_GOOGLE_SEARCH,
 		greeting: '',
 	};
 }
@@ -489,13 +693,27 @@ function subscribeUser(s: DiscordVoiceSession, userId: string): void {
 	const decoder = new prism.opus.Decoder({ frameSize: 960, channels: 2, rate: 48000 });
 	// Resample 48k stereo s16le → 16k mono s16le via ffmpeg (anti-aliased).
 	// -fflags nobuffer + -flush_packets 1 keep latency tight (no implicit batching).
-	const resampler = new prism.FFmpeg({
-		args: [
-			'-fflags', 'nobuffer', '-flush_packets', '1',
-			'-f', 's16le', '-ar', '48000', '-ac', '2', '-i', '-',
-			'-f', 's16le', '-ar', '16000', '-ac', '1',
-		],
-	});
+	// Wrapped in try/catch — prism.FFmpeg's constructor calls getInfo() which
+	// throws synchronously if the ffmpeg binary isn't on PATH. Without this
+	// guard the throw escapes to process.on('uncaughtException') and tears
+	// down the whole bot the first time anyone speaks (#1089-followup). With
+	// the guard we drop this user's audio stream and keep the bot online.
+	let resampler: prism.FFmpeg;
+	try {
+		resampler = new prism.FFmpeg({
+			args: [
+				'-fflags', 'nobuffer', '-flush_packets', '1',
+				'-f', 's16le', '-ar', '48000', '-ac', '2', '-i', '-',
+				'-f', 's16le', '-ar', '16000', '-ac', '1',
+			],
+		});
+	} catch (e) {
+		console.error(`${ts()} [Voice] ffmpeg not available — cannot subscribe ${userId}; bot stays online but audio is dropped:`, e);
+		s.subscribedUsers.delete(userId);
+		try { opusStream.destroy(); } catch {}
+		try { decoder.destroy(); } catch {}
+		return;
+	}
 	opusStream.pipe(decoder).pipe(resampler);
 
 	let chunks = 0;
@@ -503,11 +721,17 @@ function subscribeUser(s: DiscordVoiceSession, userId: string): void {
 		chunks++;
 		try { (s.voiceSession as any).handleAudioFromClient(pcm16Mono); } catch {}
 		(s as any)._noteSpoken?.();
+		s.lastUserAudioAt = Date.now();
 		if (chunks === 1) console.log(`${ts()} [Voice] first chunk: ${pcm16Mono.length}B`);
 	});
 	resampler.on('end', () => {
 		s.subscribedUsers.delete(userId);
 		console.log(`${ts()} [Voice] user ${userId} stopped speaking (${chunks} chunks) — silence burst`);
+		// Watchdog bookkeeping: an utterance just finished. A healthy Gemini
+		// fires turn.end within seconds; these counters let the watchdog tell
+		// a hang apart from a normal pause.
+		(s as any).lastSpeakStopTs = Date.now();
+		(s as any).utterancesSinceTurn = ((s as any).utterancesSinceTurn || 0) + 1;
 		triggerSilenceBurst(s);
 	});
 	resampler.on('error', (e) => {
@@ -518,9 +742,11 @@ function subscribeUser(s: DiscordVoiceSession, userId: string): void {
 	console.log(`${ts()} [Voice] subscribed to user ${userId} (ffmpeg resample)`);
 }
 
-async function createVoiceSession(connection: VoiceConnection): Promise<DiscordVoiceSession> {
+async function createVoiceSession(connection: VoiceConnection, client: Client): Promise<DiscordVoiceSession> {
 	const bodhiPort = nextBodhiPort++;
-	const sessionId = `discord_voice_${Date.now()}`;
+	// Encode guild + channel into the session id so channel-level diagnostics
+	// survive into the sessions table (recordSession has no guild/channel field).
+	const sessionId = `discord_voice_${GUILD_ID}_${CHANNEL_ID}_${Date.now()}`;
 
 	// Outbound audio: queue of PCM 48k stereo buffers. When Gemini sends a
 	// chunk, push to queue. When player goes idle (or on first push), drain
@@ -570,9 +796,14 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 		pendingTasks: 0,
 		closing: false,
 		subscribedUsers: new Set(),
+		client,
+		botFlagCache: new Map(),
+		turnSpeakers: new Set(),
 		audioPending: [],
 		toolCalls: [],
 		events: [{ event: 'session_started', timestamp: new Date().toISOString() }],
+		meetingMode: false,
+		lastUserAudioAt: Date.now(),
 	};
 
 	const agent = buildAgent(s);
@@ -587,22 +818,32 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 		host: '127.0.0.1',
 		model: google(VOICE_MODEL),
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
-		googleSearch: true,
+		googleSearch: DISCORD_VOICE_GOOGLE_SEARCH,
 		speechConfig: { voiceName: 'Aoede' },
+		// Shorten Gemini's end-of-speech silence wait so turn-end (and the
+		// reply) is detected faster. Default ~1s+; env-overridable for tuning.
+		vadConfig: { silenceDurationMs: Number(process.env.SUTANDO_VAD_SILENCE_MS) || 500 },
 		hooks: {
 			onToolCall: (e) => {
 				console.log(`${ts()} [Tool] ${e.toolName} (${e.execution})`);
 				if (!s._toolIdMap) s._toolIdMap = new Map();
 				s._toolIdMap.set(e.toolCallId, e.toolName);
-				s.events.push({ event: `tool_call:${e.toolName}`, timestamp: new Date().toISOString() });
+				// tool_call event push removed per #1052 — canonical record is
+				// the discord_voice-table row written in onToolResult via
+				// recordToolCall().
 			},
 			onToolResult: (e) => {
 				const toolName = s._toolIdMap?.get(e.toolCallId) || 'unknown';
 				console.log(`${ts()} [Tool] result: ${toolName} (${e.status}, ${e.durationMs}ms)`);
 				s.toolCalls.push({ name: toolName, durationMs: e.durationMs, timestamp: new Date().toISOString() });
-				s.events.push({ event: `tool_result:${toolName}:${e.durationMs}ms`, timestamp: new Date().toISOString() });
+				// tool_result event push removed per #1052 — recordToolCall
+				// below is the canonical write.
+				recordToolCall('discord-voice', toolName, e.durationMs, s.sessionId);
 			},
 			onError: (e) => console.error(`${ts()} [Error] ${e.component}: ${e.error.message} (${e.severity})`),
+			onTurnLatency: (e) => {
+				console.log(`${ts()} [Latency] turn=${e.turnId} ${JSON.stringify(e.segments)}`);
+			},
 		},
 	});
 
@@ -621,19 +862,54 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 		try {
 			const pcm24Mono = Buffer.from(data, 'base64');
 			const pcm48Stereo = upsample24MonoTo48Stereo(pcm24Mono);
-			pushAudio(pcm48Stereo);
-			outChunks++;
-			if (outChunks === 1 || outChunks % 50 === 0) {
-				console.log(`${ts()} [Audio] outbound chunks: ${outChunks} (last=${pcm48Stereo.length}B)`);
+			// In meeting mode, suppress audio output — keep transcription + sqlite running.
+			if (!s.meetingMode) {
+				pushAudio(pcm48Stereo);
+				outChunks++;
+				if (outChunks === 1 || outChunks % 50 === 0) {
+					console.log(`${ts()} [Audio] outbound chunks: ${outChunks} (last=${pcm48Stereo.length}B)`);
+				}
 			}
 		} catch (err) {
 			console.error(`${ts()} [Audio] outbound convert failed:`, err);
 		}
 	};
 
+	// --- Meeting mode: manual poll + auto-idle ---
+	// Manual: read state/voice-mode.txt every 2s (same file Sutando.app + voice-agent write).
+	// Auto:   flip to meeting mode after AUTO_MEETING_TIMEOUT_MS with no user audio.
+	// Both timers are cleared in finalizeSession() via the closing flag check.
+	const voiceModePoll = setInterval(() => {
+		if (s.closing) { clearInterval(voiceModePoll); return; }
+		try {
+			const mode = readFileSync(VOICE_MODE_FILE, 'utf-8').trim();
+			const want = mode === 'meeting';
+			if (want !== s.meetingMode) {
+				s.meetingMode = want;
+				console.log(`${ts()} [Meeting] voice-mode.txt → ${mode} (meetingMode=${s.meetingMode})`);
+			}
+		} catch { /* file absent = active mode */ }
+	}, 2_000);
+
+	// AUTO_MEETING_TIMEOUT_MS === 0 means auto-meeting is disabled.
+	const autoMeetingTimer = AUTO_MEETING_TIMEOUT_MS > 0 ? setInterval(() => {
+		if (s.closing) { clearInterval(autoMeetingTimer!); return; }
+		if (!s.meetingMode && Date.now() - s.lastUserAudioAt > AUTO_MEETING_TIMEOUT_MS) {
+			s.meetingMode = true;
+			console.log(`${ts()} [Meeting] auto-meeting triggered — no user audio for ${AUTO_MEETING_TIMEOUT_MS / 1000}s`);
+			try { writeFileSync(VOICE_MODE_FILE, 'meeting'); } catch {}
+		}
+	}, 10_000) : null;
+
 	// Transcript mirroring + result-queue drain
 	let lastProcessedIdx = 0;
 	session.eventBus.subscribe('turn.end', () => {
+		// Watchdog: a turn completed — clear the hang counters.
+		(s as any).lastTurnActivityTs = Date.now();
+		(s as any).utterancesSinceTurn = 0;
+		// Tier gate: the turn is over — its speaker attribution no longer
+		// applies. The next turn re-accumulates speakers from speaking.start.
+		s.turnSpeakers.clear();
 		const items = session.conversationContext.items;
 		if (items.length < lastProcessedIdx) lastProcessedIdx = 0;
 		const lastText = s.transcript.length > 0 ? s.transcript[s.transcript.length - 1].text : null;
@@ -641,12 +917,25 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 			if (item.content === lastText) continue;
 			if (item.role === 'user') {
 				s.transcript.push({ role: 'user', text: item.content });
-				s.events.push({ event: `user:${item.content}`, timestamp: new Date().toISOString() });
-				logLine('user', item.content);
+				// Wake-phrase detection: exit meeting mode when user speaks a wake phrase.
+				if (s.meetingMode && _isWakePhrase(item.content)) {
+					s.meetingMode = false;
+					console.log(`${ts()} [Meeting] wake-phrase detected — exiting meeting mode: "${item.content.slice(0, 60)}"`);
+					try { writeFileSync(VOICE_MODE_FILE, 'active'); } catch {}
+				}
+				// utterance event push removed per #1052 — canonical record is
+				// the discord_voice-table row written by recordConversation
+				// below. session_events keeps only lifecycle entries to stop
+				// triple-encoding the same utterance.
+				// conversation.log is the primary; write it before the sqlite
+				// mirror so a row never exists in sqlite without a log line.
+				appendConversationLog('discord-user', item.content);
+				recordConversation('discord-user', item.content, s.sessionId);
 			} else if (item.role === 'assistant') {
 				s.transcript.push({ role: 'sutando', text: item.content });
-				s.events.push({ event: `sutando:${item.content}`, timestamp: new Date().toISOString() });
-				logLine('assistant', item.content);
+				// utterance event push removed per #1052 — see comment above.
+				appendConversationLog('discord-agent', item.content);
+				recordConversation('discord-agent', item.content, s.sessionId);
 			}
 		}
 		lastProcessedIdx = items.length;
@@ -684,8 +973,141 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 		}, 1500);
 	};
 
+	// Hung-session watchdog. A healthy Gemini fires turn.end within seconds of
+	// the user finishing an utterance. If >=2 utterances have piled up since
+	// the last turn activity and the user last stopped speaking more than
+	// WATCHDOG_STALL_MS ago, the session has silently stalled — force a
+	// reconnect through the same path as a transport close. The >=2 guard
+	// keeps a single Gemini-ignored micro-utterance from tripping it.
+	(s as any).lastTurnActivityTs = Date.now();
+	const watchdog = setInterval(() => {
+		if (s.closing || active !== s || reconnectPending) return;
+		const stop = (s as any).lastSpeakStopTs || 0;
+		const turn = (s as any).lastTurnActivityTs || 0;
+		const pile = (s as any).utterancesSinceTurn || 0;
+		const idleMs = Date.now() - stop;
+		if (stop > turn && pile >= 2 && idleMs > WATCHDOG_STALL_MS) {
+			console.error(`${ts()} [Watchdog] Gemini session hung — ${pile} utterances / ${Math.round(idleMs / 1000)}s since last speech, no turn. Reconnecting.`);
+			reconnectPending = true;
+			setTimeout(() => {
+				reconnectPending = false;
+				if (s.closing || active !== s) return;
+				// Clear the hang condition so the watchdog doesn't immediately re-fire.
+				(s as any).lastTurnActivityTs = Date.now();
+				(s as any).utterancesSinceTurn = 0;
+				try {
+					sessionAny.handleClientConnected();
+				} catch (e) {
+					console.error(`${ts()} [Watchdog] reconnect failed:`, e);
+				}
+			}, 500);
+		}
+	}, 10000);
+	(s as any)._watchdogHandle = watchdog;
+
+	// --- Per-channel pull path for non-delegated task results ---------------
+	// Regular `work`-tool delegations land at `results/task-discord-voice-*.txt`
+	// and are claimed by the per-task poll in delegateTask(). This separate
+	// scan picks up the new scoped namespace — `results/<CHANNEL_ID>.task-*.txt`
+	// — used when the core agent (or another tool) needs to deliver a result
+	// to THIS voice channel without having delegated through the work tool
+	// (e.g. context handoff from a different surface). Existing consumers
+	// don't match the `<channel-id>.` prefix, so a file in this namespace is
+	// invisible to them — only this scan and the matching phone scan claim it.
+	//
+	// Cadence is intentionally slower than the delegate poll (3s vs 500ms)
+	// since this path is for cross-surface handoffs, not in-conversation
+	// turn-taking. Read-and-delete mirrors delegateTask()'s fail-soft style.
+	// Typed key constructor — keeps writer + consumer in sync on the
+	// `dvoice-` prefix; prevents cross-consumer namespace collisions.
+	const channelKey = discordVoiceKey(CHANNEL_ID!);
+	// Safety-net against silent unlinkSync failures (the unlink below is wrapped
+	// in try/catch so a failed delete won't surface — without this map we'd
+	// re-deliver the same body every 3s). Stored as `name -> first-seen ms`
+	// and pruned at 60s/tick so the map can't grow unbounded. Map (not Set) so
+	// the prune is O(seen) per tick without a parallel structure.
+	const channelScanSeen = new Map<string, number>();
+	const CHANNEL_SCAN_TTL_MS = 60_000;
+	const channelScan = setInterval(() => {
+		if (s.closing || active !== s) return;
+		// Prune entries older than the TTL so the map doesn't grow unbounded.
+		const cutoff = Date.now() - CHANNEL_SCAN_TTL_MS;
+		for (const [k, ts0] of channelScanSeen) {
+			if (ts0 < cutoff) channelScanSeen.delete(k);
+		}
+		let entries: string[];
+		try {
+			entries = readdirSync(RESULTS_DIR);
+		} catch {
+			return;
+		}
+		for (const name of entries) {
+			// .txt guard — never touch a writer's atomic-write temp
+			// (`<key>.task-X.txt.tmp`, `.sending`, `.partial`, etc).
+			// Belt-and-suspenders: `resultBelongsTo` also gates on .txt.
+			if (!name.endsWith('.txt')) continue;
+			if (channelScanSeen.has(name)) continue;
+			if (!resultBelongsTo(name, channelKey)) continue;
+			channelScanSeen.set(name, Date.now());
+			const full = join(RESULTS_DIR, name);
+			let body: string;
+			try {
+				body = readFileSync(full, 'utf-8').trim();
+			} catch {
+				continue;
+			}
+			if (!body) {
+				try { unlinkSync(full); } catch {}
+				continue;
+			}
+			console.log(`${ts()} [ChannelScan] picked up ${name} (${body.length}B)`);
+			s.events.push({ event: `channel_result:${name}`, timestamp: new Date().toISOString() });
+			// Inject through the same path the work-tool result-queue drain
+			// uses: a role:user content event into the live Gemini transport.
+			try {
+				(s.voiceSession as any).transport.sendContent(
+					[{ role: 'user', text: `[Channel result]\n${body}\n\nReport this result to the user now.` }],
+					true,
+				);
+			} catch (e) {
+				console.log(`${ts()} [ChannelScan] inject failed for ${name}: ${e}`);
+			}
+			// Read-and-delete so the scan doesn't re-deliver and so other
+			// consumers can't pick the file up after we've claimed it.
+			try { unlinkSync(full); } catch {}
+		}
+	}, 3000);
+	(s as any)._channelScanHandle = channelScan;
+
 	// Subscribe to anyone currently speaking, and to anyone who starts.
-	connection.receiver.speaking.on('start', (userId) => subscribeUser(s, userId));
+	connection.receiver.speaking.on('start', async (userId) => {
+		// Attribute this speaker to the in-progress turn. The gate resolves
+		// the turn's effective tier across the whole set (cleared on turn.end).
+		s.turnSpeakers.add(userId);
+		// Bot/human discrimination (#1096). Discord's gateway exposes `User.bot`;
+		// without this check the receiver would happily pipe peer-bot audio to
+		// Gemini, which both wastes API quota and causes attribution errors
+		// (today: a peer-bot's utterance was misattributed to the owner,
+		// triggering a misdiagnosis of "name-gate conflict from a second bot"
+		// when in fact the other account was a human). Cached per-user so we
+		// fetch once per speaker; degrades gracefully (subscribe anyway) if
+		// the fetch fails so this can never *block* an owner from being heard.
+		let isBot = s.botFlagCache.get(userId);
+		if (isBot === undefined) {
+			try {
+				const user = await s.client.users.fetch(userId);
+				isBot = !!user.bot;
+			} catch {
+				isBot = false;
+			}
+			s.botFlagCache.set(userId, isBot);
+		}
+		if (isBot && !ALLOWED_BOT_USER_IDS.has(userId)) {
+			console.log(`${ts()} [Voice] ignoring bot user ${userId} (not in SUTANDO_ALLOWED_BOT_USER_IDS)`);
+			return;
+		}
+		subscribeUser(s, userId);
+	});
 	// Start the constant-rate ticker that flushes audio to Gemini every 20ms.
 	startAudioTicker(s);
 
@@ -708,6 +1130,8 @@ function cleanupSession(s: DiscordVoiceSession): void {
 
 	try { clearInterval((s as any)._tickHandle); } catch {}
 	try { clearInterval((s as any)._outTickHandle); } catch {}
+	try { clearInterval((s as any)._watchdogHandle); } catch {}
+	try { clearInterval((s as any)._channelScanHandle); } catch {}
 	try { s.player.stop(true); } catch {}
 	try { s.connection.destroy(); } catch {}
 
@@ -717,21 +1141,16 @@ function cleanupSession(s: DiscordVoiceSession): void {
 
 	s.events.push({ event: 'session_ended', timestamp: new Date().toISOString() });
 	const durationMs = Date.now() - s.startTime;
-	const metrics = {
-		timestamp: new Date().toISOString(),
+	recordSession({
+		source: 'discord-voice',
 		sessionId: s.sessionId,
-		guildId: s.guildId,
-		channelId: s.channelId,
 		durationMs,
 		transcriptLines: s.transcript.length,
-		toolCalls: s.toolCalls,
 		toolCount: s.toolCalls.length,
 		pendingTasks: s.pendingTasks,
+		toolCalls: s.toolCalls,
 		events: s.events,
-	};
-	try {
-		appendFileSync(join(DATA_DIR, 'discord-voice-metrics.jsonl'), JSON.stringify(metrics) + '\n');
-	} catch {}
+	});
 	console.log(`${ts()} [Voice] session finalized: ${s.sessionId} (${durationMs}ms, ${s.transcript.length} turns)`);
 }
 
@@ -760,6 +1179,70 @@ async function start(): Promise<void> {
 		console.error(`Channel ${CHANNEL_ID} is not a voice channel`);
 		process.exit(1);
 	}
+
+	// #1089 single-bot enforcement, layer 1 (cooperative pre-join check). Scan
+	// current channel members; if any sutando peer is already in, refuse to
+	// join. Each peer self-declines so multiple instances never accidentally
+	// share one voice room. Disable via SUTANDO_PEER_ENFORCEMENT_DISABLED=1
+	// for testing the layer-2 path.
+	const looksLikeSutandoPeer = (username: string, isBot: boolean, userId: string): boolean => {
+		if (!isBot) return false;
+		if (userId === client.user?.id) return false; // myself
+		return SUTANDO_PEER_USERNAME_PATTERNS.some(p => username.startsWith(p));
+	};
+	if (!SUTANDO_PEER_ENFORCEMENT_DISABLED) {
+		const members = (channel as any).members as Map<string, { user: { username: string; bot: boolean; id: string; tag: string } }>;
+		const presentPeers: string[] = [];
+		for (const [, m] of members) {
+			if (looksLikeSutandoPeer(m.user.username, m.user.bot, m.user.id)) {
+				presentPeers.push(m.user.tag);
+			}
+		}
+		if (presentPeers.length > 0) {
+			console.error(`${ts()} [Setup] #1089 refusing to join: sutando peer(s) already present: ${presentPeers.join(', ')}`);
+			// #1120: if the spawner threaded --reply-channel and --reply-user
+			// through, post the refusal in that channel (mentioning the
+			// inviter) — "reply where invited" instead of falling back to
+			// owner-DM. The previous proactive-*.txt path stays as fallback
+			// only when those args are absent (out-of-band spawns, manual
+			// testing).
+			const channelName = (channel as any).name ?? CHANNEL_ID;
+			const refusalText =
+				`Skipping voice join in #${channelName} — peer already present: ${presentPeers.join(', ')}. ` +
+				`Single-bot enforcement (#1089); reinvite once they leave.`;
+			const REPLY_CHANNEL_ID = getArg('reply-channel');
+			const REPLY_USER_ID = getArg('reply-user');
+			// Track whether the channel-reply was actually delivered. If not — for ANY
+			// reason: arg absent, fetch threw, channel isn't text-capable, send threw —
+			// fall back to proactive-*.txt so the operator still sees the refusal.
+			// (Per @bassilkhilo-ag2's #1132 review: prior shape logged "falling back to
+			// proactive-*.txt" on catch but didn't actually write it, silently dropping
+			// the #1089 refusal when the channel send failed.)
+			let channelReplyDelivered = false;
+			if (REPLY_CHANNEL_ID) {
+				try {
+					const replyCh = await client.channels.fetch(REPLY_CHANNEL_ID);
+					if (replyCh && 'send' in replyCh) {
+						const mention = REPLY_USER_ID ? `<@${REPLY_USER_ID}> ` : '';
+						await (replyCh as any).send(mention + refusalText);
+						channelReplyDelivered = true;
+					}
+				} catch (e) {
+					console.error(`${ts()} [Setup] #1120 channel-reply failed:`, e);
+				}
+			}
+			if (!channelReplyDelivered) {
+				try {
+					const proactivePath = join(WORKSPACE_DIR, 'results', `proactive-${Date.now()}.txt`);
+					writeFileSync(proactivePath, refusalText + '\n');
+				} catch (e) {
+					console.error(`${ts()} [Setup] #1089 couldn't surface refusal to operator:`, e);
+				}
+			}
+			process.exit(0); // clean exit — operator (Sutando.app checkWatcher) will retry later when peer leaves
+		}
+	}
+
 	console.log(`${ts()} [Setup] joining voice channel #${(channel as any).name} in guild ${guild.name}`);
 
 	const connection = joinVoiceChannel({
@@ -779,9 +1262,52 @@ async function start(): Promise<void> {
 	}
 	console.log(`${ts()} [Setup] voice connection ready`);
 
-	const session = await createVoiceSession(connection);
+	const session = await createVoiceSession(connection, client);
 	active = session;
 	console.log(`${ts()} [Setup] audio bridge live — speak in the channel`);
+
+	// #1089 single-bot enforcement, layer 2 (adversarial post-join watcher).
+	// If a sutando peer joins our channel despite layer 1 (race, env override,
+	// compromised peer), leave the channel after a short audible announcement.
+	//
+	// Race-window note: when two peers race in nearly-simultaneously, both
+	// observe each other via voiceStateUpdate and both exit. The watcher
+	// (Sutando.app's checkWatcher) then respawns exactly one. Cooperative-
+	// symmetric and eventually-consistent — chosen over earliest-join-wins
+	// because the respawn cost is bounded (~seconds) and the symmetric path
+	// avoids a tie-break/coordination protocol we'd otherwise have to invent.
+	if (!SUTANDO_PEER_ENFORCEMENT_DISABLED) {
+		// `client.once` (not `.on`) — once a peer is detected we exit the
+		// process anyway, so registering as a one-shot listener avoids the
+		// per-event cleanup dance and prevents handler-retention on the
+		// Client instance for the lifetime of the process.
+		client.once('voiceStateUpdate', (oldState, newState) => {
+			const justJoinedOurChannel = newState.channelId === CHANNEL_ID && oldState.channelId !== CHANNEL_ID;
+			if (!justJoinedOurChannel) return;
+			const u = newState.member?.user;
+			if (!u) return;
+			if (!looksLikeSutandoPeer(u.username, u.bot, u.id)) return;
+			console.error(`${ts()} [Setup] #1089 peer ${u.tag} joined while I was present — announcing + leaving`);
+			// Best-effort audio announcement. The text-injection goes through
+			// the Gemini Live transport so Lucy speaks before disconnecting.
+			// We don't wait for the actual TTS to complete — Gemini might
+			// reword the request — just give it a short window. Worst case
+			// (TTS no-shows) Lucy still leaves; the disconnect is the
+			// authoritative action.
+			try {
+				injectSystemMessage(
+					session,
+					`[System] Another Sutando bot (${u.tag}) just joined this voice channel. Say briefly: "I detected another Sutando bot — leaving." Then stop.`,
+				);
+			} catch (e) {
+				console.error(`${ts()} [Setup] #1089 announcement injection failed:`, e);
+			}
+			setTimeout(() => {
+				try { connection.destroy(); } catch {}
+				process.exit(0);
+			}, 3000);
+		});
+	}
 
 	connection.on(VoiceConnectionStatus.Disconnected, async () => {
 		try {

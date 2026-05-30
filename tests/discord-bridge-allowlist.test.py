@@ -35,6 +35,7 @@ import sys
 
 REPO = Path(__file__).resolve().parent.parent
 BRIDGE = REPO / "src" / "discord-bridge.py"
+ALLOWLIST_MODULE = REPO / "src" / "send_allowlist.py"
 
 
 def fail(msg: str, context: str = "") -> int:
@@ -51,14 +52,45 @@ def main() -> int:
 
     src = BRIDGE.read_text()
 
-    # 1. Helper defined
-    helper_match = re.search(
-        r"def _is_path_sendable\(fpath:\s*str\)\s*->\s*bool:\s*\n([\s\S]{0,2000}?)(?=\n\ndef |\n\n[A-Z]|\Z)",
-        src,
+    # 1. Helper defined. The canonical implementation may live either
+    # inline in discord-bridge.py (legacy) or in src/send_allowlist.py
+    # (post-refactor, PR #1029) — both shapes satisfy the contract. We
+    # scan both sources and use whichever has the function definition.
+    HELPER_RE = re.compile(
+        r"def (?:_)?is_path_sendable\(fpath:\s*str\)\s*->\s*bool:\s*\n([\s\S]{0,2000}?)(?=\n\ndef |\n\n[A-Z]|\Z)",
     )
-    if not helper_match:
-        return fail("`_is_path_sendable` function not found")
-    helper_body = helper_match.group(1)
+    helper_body = None
+    found_in = None
+    for candidate_src, label in (
+        (src, "discord-bridge.py"),
+        (ALLOWLIST_MODULE.read_text() if ALLOWLIST_MODULE.exists() else "", "send_allowlist.py"),
+    ):
+        m = HELPER_RE.search(candidate_src)
+        if m:
+            helper_body = m.group(1)
+            found_in = label
+            break
+    if helper_body is None:
+        return fail(
+            "`_is_path_sendable` / `is_path_sendable` function not found in either "
+            "src/discord-bridge.py or src/send_allowlist.py"
+        )
+    # If the implementation lives in send_allowlist.py, discord-bridge
+    # must import it (otherwise the file-send sites have a dangling
+    # name). Verify the import is present.
+    if found_in == "send_allowlist.py":
+        # The import may use `from send_allowlist import is_path_sendable`
+        # OR `from send_allowlist import (is_path_sendable as _alias, ...)`
+        # — both shapes satisfy the contract. Use DOTALL so multi-line
+        # parenthesized imports match.
+        if not re.search(
+            r"from\s+send_allowlist\s+import[\s\S]*?is_path_sendable",
+            src,
+        ):
+            return fail(
+                "send_allowlist.py defines is_path_sendable but discord-bridge.py "
+                "does not import it — the gate sites would reference an undefined name."
+            )
 
     # 2. realpath used (CodeQL sanitizer pattern)
     if "os.path.realpath" not in helper_body:

@@ -6,7 +6,7 @@
  */
 
 import { execSync, execFileSync } from 'node:child_process';
-import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync, statSync } from 'node:fs';
+import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync, statSync, mkdirSync } from 'node:fs';
 import { join, extname, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
@@ -20,6 +20,10 @@ import { resolveWorkspace, statusPath, statusReadPath } from './workspace_defaul
 // resolveWorkspace() is the canonical TS helper introduced in #821.
 const WORKSPACE_DIR = resolveWorkspace();
 
+// Gate slide-control + fullscreen on presenter-mode.sentinel.
+// Issue #1171: registering these globally causes Gemini to fire them on greetings.
+const _presenterActive = existsSync(join(WORKSPACE_DIR, 'state', 'presenter-mode.sentinel'));
+
 // Code-adjacent paths (skills/, etc.) ship with the repo checkout, NOT the
 // workspace. Compute REPO_ROOT from this file's URL so the resolution
 // survives any cwd drift at startup. Used by the skill-loader below.
@@ -29,7 +33,7 @@ const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
 // Re-export recording/screen/browser tools from browser-tools
 export { describeScreenTool, clickTool, scrollAndDescribeTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool } from './browser-tools.js';
-import { describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool } from './browser-tools.js';
+import { describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool } from './browser-tools.js';
 
 // Vision: one-shot frame + start/stop live screen-to-Gemini video.
 export { sendVisionFrameTool, startVisionTool, stopVisionTool } from './vision-tools.js';
@@ -37,6 +41,8 @@ import { sendVisionFrameTool, startVisionTool, stopVisionTool } from './vision-t
 
 // Active artifact cache — load a file once, query repeatedly without task-bridge round-trips.
 export { setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool, clearActiveArtifact } from './artifact-cache-tools.js';
+export { switchVoiceConfigTool } from './voice-config-switch.js';
+import { switchVoiceConfigTool } from './voice-config-switch.js';
 import { setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool } from './artifact-cache-tools.js';
 
 // --- File-open tool (moved out of recording-tools — generic file open, optionally fullscreen) ---
@@ -143,9 +149,11 @@ export const openFileTool: ToolDefinition = {
 	},
 };
 
-// Re-export Zoom tools from skill
-export { summonTool, dismissTool, joinZoomTool } from '../skills/zoom/tools.js';
-import { summonTool, dismissTool, joinZoomTool } from '../skills/zoom/tools.js';
+// Zoom tools (summon, dismiss, join_zoom) are NOT imported here — they live in
+// the manifest-loaded skill `skills/zoom/` (manifest.json + tools.ts) and reach
+// `inlineTools` / `ownerOnlyTools` via the loadSkillManifestTools() path below
+// (#976 conformance). Core no longer has a compile-time dependency on the skill,
+// so it is genuinely optional.
 // Re-export remaining meeting tools
 export { joinGmeetTool, lookupMeetingIdTool, callContactTool } from './meeting-tools.js';
 import { joinGmeetTool, lookupMeetingIdTool, callContactTool } from './meeting-tools.js';
@@ -166,9 +174,16 @@ export const pressKeyTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { key, modifiers = [], app } = args as { key: string; modifiers?: string[]; app?: string };
-		// Activate target app if specified
+		// Activate target app if specified. Escape `app` before embedding
+		// in the AppleScript string literal — without this, a value like
+		// `"; do shell script "rm -rf ~"; tell application "Finder` would
+		// break out of `tell application "..."` and run arbitrary
+		// AppleScript (and AppleScript can `do shell script`, so this is
+		// arbitrary code execution from a tool-call argument). Same
+		// escape pattern as `safeKey` below and `safeApp` in switchAppTool.
 		if (app) {
-			try { execSync(`osascript -e 'tell application "${app}" to activate'`, { timeout: 3_000 }); await new Promise(r => setTimeout(r, 300)); } catch {}
+			const safeApp = app.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
+			try { execSync(`osascript -e 'tell application "${safeApp}" to activate'`, { timeout: 3_000 }); await new Promise(r => setTimeout(r, 300)); } catch {}
 		}
 		const keyMap: Record<string, number> = {
 			'enter': 36, 'return': 36, 'escape': 53, 'esc': 53, 'tab': 48,
@@ -838,6 +853,10 @@ export const saveNoteTool: ToolDefinition = {
 		const tagList = tags ? tags.split(',').map(t => t.trim()) : ['personal'];
 		const md = `---\ntitle: ${title}\ndate: ${date}\ntags: [${tagList.join(', ')}]\n---\n\n${content}\n`;
 		try {
+			// NOTES_DIR resolves against the workspace, which may not have a
+			// notes/ subdir yet on a fresh install — create it before writing
+			// so the first save_note never fails with ENOENT.
+			mkdirSync(NOTES_DIR, { recursive: true });
 			writeFileSync(join(NOTES_DIR, `${slug}.md`), md);
 			return { status: 'saved', title, slug, path: `notes/${slug}.md` };
 		} catch (e) { return { error: String(e) }; }
@@ -959,15 +978,14 @@ function assertUniqueToolNames(tools: ToolDefinition[]): ToolDefinition[] {
 // owner-tier tools only when the caller is the verified owner. Manifest
 // access_tier values: "owner" (default if omitted) | "any_caller".
 async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyCaller: ToolDefinition[] }> {
-	// Scan the public-repo `skills/` dir AND the optional private skills dir
+	// Scan the public-repo `skills/` dir, the per-user workspace
+	// `$SUTANDO_WORKSPACE/skills/`, AND the optional private skills dir
 	// pointed to by `$SUTANDO_MEMORY_DIR/skills/` (legacy `$SUTANDO_PRIVATE_DIR`
 	// honored via memoryDirEnv(); e.g. `~/.sutando/memory-sync/skills/`). The
 	// private dir lets users keep personal tooling with real per-file git
-	// history outside the public repo. Order: public first, then private —
-	// same-name skills loaded from private take precedence (last one wins via
-	// the dup-name guard below if any; in practice they should be uniquely
-	// named).
-	const dirsToScan: string[] = [join(REPO_ROOT, 'skills')];
+	// history outside the public repo. Order: public first, then workspace,
+	// then private — last-write-wins for same-name skills.
+	const dirsToScan: string[] = [join(REPO_ROOT, 'skills'), join(WORKSPACE_DIR, 'skills')];
 	const privateRoot = memoryDirEnv();
 	if (privateRoot) {
 		const expanded = privateRoot.replace(/^~/, process.env.HOME || '');
@@ -1031,7 +1049,7 @@ const personalAllTools = [...personalTools.owner, ...personalTools.anyCaller];
 // a tools.ts. Don't try to align them — they're correctly sync/async for
 // what each one does.
 function loadCoreDocumentedSkills(): { name: string; description: string }[] {
-	const dirsToScan: string[] = [join(REPO_ROOT, 'skills')];
+	const dirsToScan: string[] = [join(REPO_ROOT, 'skills'), join(WORKSPACE_DIR, 'skills')];
 	const privateRoot = memoryDirEnv();
 	if (privateRoot) {
 		const expanded = privateRoot.replace(/^~/, process.env.HOME || '');
@@ -1073,13 +1091,14 @@ export const inlineTools = assertUniqueToolNames([
 	pressKeyTool, scrollTool, switchTabTool, closeTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
 	volumeTool, brightnessTool, clipboardTool,
-	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, getCoreStatusTool, summonTool, dismissTool,
-	joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool,
-	describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, slideControlTool, fullscreenTool,
+	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, getCoreStatusTool,
+	joinGmeetTool, lookupMeetingIdTool, callContactTool,
+	describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, ...(_presenterActive ? [slideControlTool, fullscreenTool] : []),
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
 	recentContextTool,
 	sendVisionFrameTool, startVisionTool, stopVisionTool,
 	setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool,
+	switchVoiceConfigTool,
 	...personalAllTools ]);
 
 /** Tools available to any caller (including unverified) */
@@ -1094,13 +1113,14 @@ export const ownerOnlyTools = [
 	volumeTool, brightnessTool,
 	pressKeyTool, scrollTool, switchTabTool, closeTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
-	clipboardTool, cancelTaskTool, toggleTasksTool, summonTool, dismissTool,
-	joinZoomTool, joinGmeetTool, callContactTool, slideControlTool, fullscreenTool,
+	clipboardTool, cancelTaskTool, toggleTasksTool,
+	joinGmeetTool, callContactTool, ...(_presenterActive ? [slideControlTool, fullscreenTool] : []),
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
 	recentContextTool,
-	describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool,
+	describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool,
 	sendVisionFrameTool, startVisionTool, stopVisionTool,
 	setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool,
+	switchVoiceConfigTool,
 	...personalTools.owner,
 ];
 

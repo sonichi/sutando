@@ -21,6 +21,10 @@ logs/*
 !logs/.gitkeep
 state/*
 !state/.gitkeep
+# Per-user workspace configs (e.g. config/discord-voice.json). Live configs
+# carry per-user data and must never be committed from a repo-root workspace
+# install — the repo ships <skill>/config.json.example templates instead.
+config/*.json
 AGENT_LOOP.md
 PENDING.md
 pending-questions.md
@@ -49,6 +53,15 @@ skills/personal-*/
 tests/security/*.md
 !tests/security/*.md.example
 skills/schedule-crons/crons.json
+# voice-agent + phone-conversation configs are per-user data (model/grounding
+# prefs the operator tunes) and live in $SUTANDO_WORKSPACE/config/. The repo
+# ships only the *.example templates — never commit a live config here.
+src/voice-agent.config.json
+skills/phone-conversation/config.json
+# discord-voice config is per-user data (Discord channel ids, owner-mode) and
+# lives in $SUTANDO_WORKSPACE/config/discord-voice.json. The repo ships only
+# config.json.example as a template — never commit a live config.json here.
+skills/discord-voice/config.json
 src/Sutando/Sutando
 # NativeMic.swift was removed in PR #329 and keeps getting re-added by
 # search-and-replace sweeps that leave a stale copy in the working tree
@@ -66,6 +79,8 @@ contextual-chips.json
 .agent/
 .massgen/
 .env.bak
+.env.bak*
+.env.*.bak
 .last-pq-notify
 
 # Task archive — created by the watcher when moving processed tasks.

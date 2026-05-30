@@ -40,13 +40,19 @@ import Foundation
 // NSWorkspace.shared.frontmostApplication returns nil from processes not
 // attached to the GUI WindowServer session (LSUIElement agents, launchd
 // daemons). CGWindowListCopyWindowInfo works from any process context — it
-// queries the window server directly. kCGWindowOwnerName + OwnerPID don't
-// require Screen Recording permission; only kCGWindowName does.
+// queries the window server directly.
+//
+// We deliberately read ONLY kCGWindowOwnerName + kCGWindowOwnerPID — those
+// don't require any TCC grant. kCGWindowName (the window title) DOES
+// require Screen Recording permission, and since ax-read is rebuilt via
+// `swift build` (ad-hoc signed, hash changes every build), that grant
+// would orphan and re-prompt on every rebuild. The window title is fetched
+// via the AX path (kAXTitleAttribute) below instead — only needs
+// Accessibility permission, which is granted once to Sutando.app.
 
 struct FrontmostInfo {
     let name: String
     let pid: pid_t
-    let windowName: String
 }
 
 func frontmostFromCGWindowList() -> FrontmostInfo? {
@@ -61,8 +67,7 @@ func frontmostFromCGWindowList() -> FrontmostInfo? {
               let pidNum = window[kCGWindowOwnerPID as String] as? Int else {
             continue
         }
-        let winName = (window[kCGWindowName as String] as? String) ?? ""
-        return FrontmostInfo(name: name, pid: pid_t(pidNum), windowName: winName)
+        return FrontmostInfo(name: name, pid: pid_t(pidNum))
     }
     return nil
 }
@@ -128,13 +133,12 @@ var windowTitle: String
 if let f = frontInfo {
     appName = f.name
     pid = f.pid
-    windowTitle = f.windowName
 } else {
     let frontmostApp = NSWorkspace.shared.frontmostApplication
     appName = frontmostApp?.localizedName ?? ""
     pid = frontmostApp?.processIdentifier ?? -1
-    windowTitle = ""
 }
+windowTitle = ""
 
 if pid < 0 {
     emit(["path": "none"])
@@ -143,16 +147,15 @@ if pid < 0 {
 
 let appRef = AXUIElementCreateApplication(pid)
 
-// AX window title (more reliable than kCGWindowName, which needs Screen Recording).
-if windowTitle.isEmpty {
-    var focusedWindow: AnyObject?
-    if AXUIElementCopyAttributeValue(appRef, kAXFocusedWindowAttribute as CFString, &focusedWindow) == .success,
-       let win = focusedWindow {
-        var titleValue: AnyObject?
-        if AXUIElementCopyAttributeValue(win as! AXUIElement, kAXTitleAttribute as CFString, &titleValue) == .success,
-           let t = titleValue as? String {
-            windowTitle = t
-        }
+// AX window title — kAXTitleAttribute needs only Accessibility permission,
+// not Screen Recording. This is the sole source of the title.
+var focusedWindow: AnyObject?
+if AXUIElementCopyAttributeValue(appRef, kAXFocusedWindowAttribute as CFString, &focusedWindow) == .success,
+   let win = focusedWindow {
+    var titleValue: AnyObject?
+    if AXUIElementCopyAttributeValue(win as! AXUIElement, kAXTitleAttribute as CFString, &titleValue) == .success,
+       let t = titleValue as? String {
+        windowTitle = t
     }
 }
 

@@ -117,16 +117,26 @@ describe('init.sh --auto (Tier 1: placeholder files)', () => {
 		assert.match(body, /"label":"x"/);
 	});
 
-	it('sweeps a legacy workspace-root status file into state/', () => {
-		// An install from before the state/ relocation has core-status.json at
-		// the workspace root. migrate_root_status_to_state moves it into state/
-		// before the create_file_if_missing seed runs, so the real data wins.
+	// #1169 / #1170 (2026-05-26): auto-migration removed from tier1(). The
+	// legacy_state_notice helper now only PRINTS to stderr; nothing is moved.
+	// Asserting the new behavior here: legacy file STAYS put, state/ seed
+	// also exists (separate create_file_if_missing path), and the notice
+	// fires once.
+	it('leaves a legacy workspace-root status file untouched, emits notice once (#1169)', () => {
 		mkdirSync(workspace, { recursive: true });
 		writeFileSync(join(workspace, 'core-status.json'), '{"status":"running","step":"legacy","ts":1}');
-		runInit(scratch, '--auto');
-		assert.equal(existsSync(join(workspace, 'core-status.json')), false, 'root copy should be moved');
-		const body = readFileSync(join(workspace, 'state', 'core-status.json'), 'utf-8');
-		assert.match(body, /"step":"legacy"/, 'migrated file keeps its content');
+		const result = runInit(scratch, '--auto');
+		// Legacy file NOT moved
+		assert.equal(existsSync(join(workspace, 'core-status.json')), true, 'root copy stays put (#1170: auto-migration disabled)');
+		const legacy = readFileSync(join(workspace, 'core-status.json'), 'utf-8');
+		assert.match(legacy, /"step":"legacy"/, 'legacy file content unchanged');
+		// state/ seed still happens via create_file_if_missing (separate path)
+		assert.equal(existsSync(join(workspace, 'state', 'core-status.json')), true, 'state/ seed file created');
+		// Notice fired on stderr — points at the CLI
+		assert.match(result.stderr, /legacy state detected/i, 'legacy_state_notice fires on first run');
+		assert.match(result.stderr, /sutando-migrate\.sh/, 'notice references the CLI');
+		// Sentinel written so second run silences the notice
+		assert.equal(existsSync(join(workspace, '.legacy-notice-printed')), true, 'notice sentinel written');
 	});
 });
 

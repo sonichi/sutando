@@ -6,6 +6,13 @@ Works alongside the voice task bridge. Runs as a background daemon.
 Usage: python3 src/telegram-bridge.py
 """
 
+# startup.sh launches this via bare `python3`, which is /usr/bin/python3 (3.9)
+# on stock macOS. PEP-604 unions (`str | None`) are evaluated at def-time on
+# 3.9 and raise TypeError, crashing the bridge on import. Lazy annotations
+# (PEP 563) make every annotation in this file a string — never evaluated —
+# so 3.9 is safe. Must precede all other imports.
+from __future__ import annotations
+
 import json
 import os
 import sys
@@ -27,6 +34,8 @@ from task_priority import default_priority_for_source  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
 
 from workspace_default import resolve_workspace  # noqa: E402
+from task_archive import find_task_file  # noqa: E402
+from single_instance import acquire as _single_instance_acquire  # noqa: E402
 REPO = resolve_workspace()
 TASKS_DIR = REPO / "tasks"
 RESULTS_DIR = REPO / "results"
@@ -81,7 +90,16 @@ if channels_env.exists():
     for line in channels_env.read_text().splitlines():
         if "=" in line and not line.startswith("#"):
             k, v = line.split("=", 1)
-            os.environ[k.strip()] = v.strip()
+            v = v.strip()
+            # Strip matching surrounding quotes — mirrors python-dotenv.
+            # Without this, `TELEGRAM_BOT_TOKEN="abc"` in .env stores
+            # the literal `"abc"` (with quotes) in os.environ; the
+            # Telegram REST URL becomes
+            # `https://api.telegram.org/bot"abc"/getUpdates` and Telegram
+            # returns 404. Quoted .env values are a common convention.
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+                v = v[1:-1]
+            os.environ[k.strip()] = v
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 if not TOKEN:
@@ -210,6 +228,43 @@ def load_allowed():
         return None
     except Exception:
         return set()
+
+
+def _resolve_proactive_owner_id(env_override: str | None, access_data: dict) -> str | None:
+    """Resolve the recipient for a proactive owner-notification.
+
+    Priority order:
+      1. ``$SUTANDO_DM_OWNER_ID`` env override.
+      2. ``tierMap[uid] == "owner"`` — the unique tier-tagged owner from
+         ``access.json``. Wins over `tofuOwner` because tier tags are an
+         explicit admin signal.
+      3. ``tofuOwner`` field — recorded by :func:`tofu_onboard` on first
+         install. Telegram-specific. Only honored if `tofuOwner` is
+         still present in ``allowFrom`` — admins who explicitly removed
+         it have signaled they no longer want it treated as the owner.
+      4. First entry in ``allowFrom`` IN LIST ORDER. The list-order
+         convention is meaningful: admins put the human owner first.
+
+    Returns ``None`` when ``allowFrom`` is empty.
+
+    Pure function — no I/O — so it's unit-testable in isolation.
+    """
+    if env_override:
+        return env_override
+    allow_list = access_data.get("allowFrom") or []
+    if not allow_list:
+        return None
+    tier_map = access_data.get("tierMap") or {}
+    tier_owner = next(
+        (uid for uid in allow_list if tier_map.get(uid) == "owner"),
+        None,
+    )
+    if tier_owner is not None:
+        return str(tier_owner)
+    tofu_owner = access_data.get("tofuOwner")
+    if tofu_owner is not None and tofu_owner in allow_list:
+        return str(tofu_owner)
+    return str(allow_list[0])
 
 
 def tofu_onboard(sender_id, username):
@@ -342,10 +397,52 @@ def send_reply(chat_id, text, task_id: str | None = None):
             api("sendMessage", chat_id=chat_id, text=f"(file access denied: {fpath})")
             print(f"  BLOCKED file: {fpath}")
         else:
-            api("sendMessage", chat_id=chat_id, text=f"(file not found: {fpath})")
+            # Prose-quoted `[file:/path]` substrings extract as markers
+            # but reference no actual file. Don't ship the warning to
+            # the user; log for operator visibility on real typos. Same
+            # rationale as discord-bridge:poll_results.
+            print(f"  file marker, file not found — likely a prose quotation: {fpath}", flush=True)
+
+def _recover_orphan_sending_files() -> int:
+    """Restart-safety: rename any orphan `results/proactive-*.sending`
+    files back to `*.txt` so they get re-claimed on the next poll.
+
+    Mirrors `_recover_orphan_sending_files` in discord-bridge.py.
+    See that docstring for the bug class this closes.
+    """
+    if not RESULTS_DIR.exists():
+        return 0
+    recovered = 0
+    for f in RESULTS_DIR.iterdir():
+        if not (f.name.startswith("proactive-") and f.suffix == ".sending"):
+            continue
+        target = f.with_suffix(".txt")
+        try:
+            if target.exists():
+                print(
+                    f"  [startup] skipping orphan recovery: {target.name} "
+                    f"already exists (collision with {f.name})",
+                    flush=True,
+                )
+                continue
+            f.rename(target)
+            recovered += 1
+            print(f"  [startup] recovered orphan {f.name} → {target.name}", flush=True)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print(f"  [startup] failed to recover {f.name}: {e}", flush=True)
+    if recovered:
+        print(f"  [startup] recovered {recovered} orphan .sending file(s)", flush=True)
+    return recovered
+
 
 def main():
+    _single_instance_acquire("telegram-bridge")
     print(f"Telegram bridge started. Polling for messages...", flush=True)
+    # Restart-safety: sweep orphan `.sending` files before the poll
+    # loop starts. See _recover_orphan_sending_files for rationale.
+    _recover_orphan_sending_files()
     offset = None
     allowed = load_allowed()
     pending_replies = {}  # task_id -> chat_id
@@ -458,8 +555,17 @@ def main():
         # Check for proactive messages to send to owner.
         # Presenter-mode: retain files (don't unlink, don't send) so they
         # flush after the talk window ends. See presenter-mode.sh contract.
+        # Channel routing: skip the proactive scan entirely if telegram
+        # is not the last-active channel. Pre-fix the discord-bridge
+        # and telegram-bridge raced for the SAME proactive-*.txt files
+        # and whichever ran first delivered, producing cross-channel
+        # surprises. See proactive_routing.py for the decision rule.
+        from proactive_routing import should_claim_proactive
         try:
-            if not presenter_mode_active():
+            if (
+                not presenter_mode_active()
+                and should_claim_proactive(OWNER_ACTIVITY_FILE, "telegram")
+            ):
                 for f in RESULTS_DIR.iterdir():
                     if f.name.startswith("proactive-") and f.suffix == ".txt":
                         # Claim-by-rename: atomic move to a `.sending`
@@ -478,14 +584,30 @@ def main():
                         if not text:
                             f.unlink(missing_ok=True)
                             continue
-                        owner_ids = load_allowed()
-                        if owner_ids:
-                            owner_id = next(iter(owner_ids))
-                            try:
-                                send_reply(int(owner_id), text)
-                                print(f"  [proactive] sent to {owner_id}: {text[:80]}")
-                            except Exception as e:
-                                print(f"  [proactive] failed: {e}")
+                        # Pre-fix used `next(iter(load_allowed()))`,
+                        # which iterates a `set` — hash-slot order, not
+                        # list order. With multiple users in allowFrom
+                        # (e.g. admin adds a second sender via
+                        # `/telegram:access allow`), proactive
+                        # owner-notifications could route to the wrong
+                        # user. Mirrors the same fix shape used by
+                        # discord-bridge's poll_proactive; full priority
+                        # chain documented on _resolve_proactive_owner_id.
+                        env_override = os.environ.get("SUTANDO_DM_OWNER_ID", "").strip()
+                        try:
+                            access_data = json.loads(ACCESS_FILE.read_text())
+                        except Exception:
+                            access_data = {}
+                        owner_id = _resolve_proactive_owner_id(env_override, access_data)
+                        if owner_id is None:
+                            print(f"  [proactive] no owner in allowFrom, skipping {f.name}")
+                            f.unlink(missing_ok=True)
+                            continue
+                        try:
+                            send_reply(int(owner_id), text)
+                            print(f"  [proactive] sent to {owner_id}: {text[:80]}")
+                        except Exception as e:
+                            print(f"  [proactive] failed: {e}")
                         f.unlink(missing_ok=True)
         except Exception as e:
             print(f"  [proactive] poll error: {e}")
@@ -505,7 +627,7 @@ def main():
                 if any(a.kind == "skip" for a in parsed.actions):
                     print(f"  Skipped (marker): {task_id}", flush=True)
                     archive_file(result_file, "results", task_id)
-                    task_file = TASKS_DIR / f"{task_id}.txt"
+                    task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
                     archive_file(task_file, "tasks", task_id)
                     continue
                 try:

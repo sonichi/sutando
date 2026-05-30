@@ -11,6 +11,9 @@ Usage:
 Auto-refreshes every 15 seconds.
 """
 
+from __future__ import annotations
+
+
 import http.server
 import json
 import os
@@ -53,6 +56,15 @@ def _resolve_note_path(raw_slug: str):
     if not note_file_str.startswith(notes_real + os.sep):
         return None
     return Path(note_file_str)
+
+
+def get_outbox(limit: int = 10) -> list[dict]:
+    """Return recent outbox entries for the dashboard card."""
+    try:
+        import outbox_log
+        return outbox_log.read_recent(limit)
+    except Exception:
+        return []
 
 
 def get_health() -> list[dict]:
@@ -121,15 +133,13 @@ def get_score() -> str:
 def get_quota_status() -> dict:
     """Read quota state from quota-state.json (written by credential proxy).
 
-    Quota state IS runtime state; canonical home is <workspace>/state/.
-    status_read_path prefers state/quota-state.json and falls back to the
-    legacy workspace-root path for one release. The skill-dir path is
-    preserved as a last-resort fallback until older credential-proxy
-    installs roll over.
+    Quota state IS runtime state; the canonical (and only) home is
+    <workspace>/state/quota-state.json. The skill-dir fallback was removed:
+    a stale leftover copy under skills/quota-tracker/ silently shadowed the
+    fresh file and froze this dashboard's quota panel for ~12h (2026-05-21).
+    One path, one source of truth.
     """
     quota_file = status_read_path("quota-state.json", WORKSPACE_DIR)
-    if not quota_file.exists():
-        quota_file = REPO_DIR / "skills" / "quota-tracker" / "quota-state.json"
     if not quota_file.exists():
         return {"available": True}
     try:
@@ -315,8 +325,33 @@ def render_dashboard() -> str:
     if matrix_html:
         cards.append(f'<div class="card full"><h2>Capabilities Matrix</h2>{matrix_html}</div>')
 
+    # Outbox (recent outbound messages)
+    outbox = get_outbox(10)
+    if outbox:
+        _channel_icon = {
+            "discord_dm": "💬", "discord_channel": "📢",
+            "slack_dm": "💬", "slack_channel": "📢",
+            "telegram": "✈️", "imessage": "💬", "whatsapp": "📱",
+            "email": "📧", "x": "𝕏",
+        }
+        outbox_html = ""
+        for e in reversed(outbox):
+            icon = _channel_icon.get(e.get("channel_type", ""), "→")
+            ts_str = e.get("iso_ts", "")[:16].replace("T", " ")
+            label = e.get("recipient_label") or e.get("recipient", "?")[:20]
+            preview = e.get("body_preview", "")[:80]
+            outbox_html += (
+                f'<div class="activity-item">'
+                f'<span class="activity-time">{ts_str} {icon} {label}</span> '
+                f'<span class="activity-title" style="color:#666">{preview}</span>'
+                f'</div>\n'
+            )
+        cards.append(f'<div class="card full"><h2>Outbox</h2>{outbox_html}</div>')
+
     # Keyboard shortcuts
-    sutando_running = subprocess.run(["/usr/bin/pgrep", "-f", "src/Sutando/Sutando"], capture_output=True).returncode == 0
+    # Match both the dev-built binary (`<repo>/src/Sutando/Sutando`) and the
+    # distributed .app (`/Applications/Sutando.app/Contents/MacOS/Sutando`).
+    sutando_running = subprocess.run(["/usr/bin/pgrep", "-f", "(Sutando|MacOS)/Sutando"], capture_output=True).returncode == 0
     shortcut_status = '<span class="ok">✓</span> Sutando app running' if sutando_running else '<span class="bad">✗</span> Sutando app not running'
     cards.append(f"""<div class="card">
 <h2>Keyboard Shortcuts</h2>
@@ -508,8 +543,23 @@ load()
 
 
 if __name__ == "__main__":
-    server = http.server.HTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"Sutando Dashboard → http://localhost:{PORT}")
+    # Default loopback-only. The dashboard exposes owner notes, recent
+    # activity, system stats, and the owner's avatar/identity — all
+    # privacy-sensitive. The pre-fix `0.0.0.0` bind made every detail
+    # readable by any device on the LAN with no auth. Set
+    # `DASHBOARD_BIND=0.0.0.0` to opt back into LAN exposure when you
+    # know you want it. Same env-override shape as `AGENT_API_BIND` in
+    # agent-api.py.
+    bind = os.environ.get("DASHBOARD_BIND", "127.0.0.1")
+    server = http.server.HTTPServer((bind, PORT), Handler)
+    print(f"Sutando Dashboard → http://{bind}:{PORT}", flush=True)
+    if bind != "127.0.0.1":
+        print(
+            f"  (LAN access enabled via DASHBOARD_BIND={bind} — "
+            f"the dashboard has NO authentication; anyone on this network "
+            f"can read your notes, activity, and identity)",
+            flush=True,
+        )
     try:
         server.serve_forever()
     except KeyboardInterrupt:

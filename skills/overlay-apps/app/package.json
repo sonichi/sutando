@@ -1,0 +1,16 @@
+{
+  "name": "benchmark-overlay",
+  "version": "0.1.0",
+  "description": "Always-on-top desktop overlay showing live coding-agent and AI benchmark leaderboards",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "license": "MIT",
+  "dependencies": {
+    "js-yaml": "^4.1.0"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0"
+  }
+}
