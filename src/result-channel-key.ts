@@ -79,3 +79,20 @@ export function resultBelongsTo(filename: string, channelKey: string): boolean {
 	if (!taskId.startsWith('task-')) return false;
 	return key === sanitizeKey(channelKey);
 }
+
+// ── Typed channel-key constructors ────────────────────────────────────────
+// Per-consumer prefixes make key-namespace collisions impossible across
+// future consumer types: a hypothetical new pull surface whose ID format
+// happens to be pure digits (like a Discord VC snowflake) cannot accidentally
+// claim a `dvoice-*` filename. Writer and consumer MUST go through the same
+// constructor so the keys agree. Keep symmetric with `src/result_channel_key.py`.
+
+/** Channel key for the discord-voice consumer. Wraps a Discord voice-channel id. */
+export function discordVoiceKey(vcId: string | null | undefined): string {
+	return `dvoice-${sanitizeKey(vcId)}`;
+}
+
+/** Channel key for the phone-conversation consumer. Wraps a Twilio call SID. */
+export function phoneCallKey(callSid: string | null | undefined): string {
+	return `phone-${sanitizeKey(callSid)}`;
+}

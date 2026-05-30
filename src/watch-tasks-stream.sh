@@ -47,13 +47,54 @@ mkdir -p "$TASKS_DIR"
 # /private/tmp — which is the default.
 TASKS_DIR_ABS="$(cd "$TASKS_DIR" && pwd -P)"
 
+# PID file for the Stop-hook cleanup path (see .claude/settings.json Stop
+# hook). When a Claude Code session ends, the Stop hook reads this file and
+# kills the watcher PID it points at, so the fswatch process doesn't outlive
+# the session and turn into an orphan. The trap below removes the file on a
+# clean exit; the Stop hook removes it after the kill on dirty exits.
+#
+# Same workspace resolution as TASKS_DIR (above): explicit env override,
+# else canonical default. Living under state/ matches the workspace contract
+# in CLAUDE.md (loose status/state files belong there).
+if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
+  STATE_DIR="${SUTANDO_WORKSPACE/#\~/$HOME}/state"
+else
+  STATE_DIR="$HOME/.sutando/workspace/state"
+fi
+mkdir -p "$STATE_DIR"
+PID_FILE="$STATE_DIR/watch-tasks-stream.pid"
+echo "$$" > "$PID_FILE"
+# Cleanup on any exit path (SIGINT, SIGTERM, normal exit) so the file
+# doesn't outlive the process on a clean shutdown. Dirty exits (SIGKILL,
+# panic) skip the trap — the Stop hook + startup reaper cover those.
+trap 'rm -f "$PID_FILE"' EXIT
+
+# tmux socket for the wakeup signal. Sutando.app creates the CLI session via
+# this socket. If the socket doesn't exist (different setup), wakeup is a
+# silent no-op thanks to 2>/dev/null || true.
+TMUX_SOCK="${SUTANDO_TMUX_SOCK:-/tmp/sutando-tmux.sock}"
+TMUX_SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
+
+_tmux_wake() {
+  # Poke the idle CLI session so it processes the new task without waiting
+  # for the next 5-min proactive-loop cron tick (sutando-skills#27).
+  tmux -S "$TMUX_SOCK" send-keys -t "$TMUX_SESSION" '[watcher-ping]' Enter 2>/dev/null || true
+}
+
 # Initial sweep — surface any pre-existing tasks that arrived during a
 # restart gap.
 shopt -s nullglob
 for f in "$TASKS_DIR"/*.txt; do
-  echo "TASK_FILE: $(basename "$f")"
+  printf 'TASK_FILE: %s\n' "$(basename "$f")" || exit 0
+  _tmux_wake
 done
 shopt -u nullglob
+
+# Clean up fswatch on exit (Mode B fix — #1088). Without this, when the
+# parent shell exits the watcher reparents to launchd (PPID=1) and runs
+# indefinitely with no consumer, silently dropping every event.
+cleanup() { kill 0 2>/dev/null; }
+trap cleanup EXIT HUP INT TERM
 
 # Stream subsequent events. -l 0.5 = 500ms latency batch (fswatch coalesces
 # burst events). --event Created --event Renamed catches new file
@@ -75,6 +116,10 @@ shopt -u nullglob
 #    rename — including the source path AFTER the file has moved out.
 #    `[ -f "$path" ]` filters those rename-OUT-of-watched-dir events.
 #    Caught 2026-05-03 #1 (PR #572).
+#
+# Mode A fix (#1088): `|| exit 0` on printf — if the consumer pipe is
+# dead, the first failed write exits immediately instead of silently
+# buffering ~100 events into the kernel pipe buffer.
 fswatch \
   -l 0.5 \
   --event Created \
@@ -85,7 +130,8 @@ fswatch \
     *.txt)
       parent="$(dirname "$path")"
       if [ "$parent" = "$TASKS_DIR_ABS" ] && [ -f "$path" ]; then
-        echo "TASK_FILE: $(basename "$path")"
+        printf 'TASK_FILE: %s\n' "$(basename "$path")" || exit 0
+        _tmux_wake
       fi
       ;;
   esac

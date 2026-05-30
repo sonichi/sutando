@@ -47,6 +47,7 @@ mkdir -p "$OUT"
 # #769 review obs 4. Dual-path was added so pre-#762 installs don't
 # silently lose cold-review-log access; safe to remove after every node
 # has resolved its workspace at least once.
+WS="${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}"
 if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
 	NOTES_DIR="$SUTANDO_WORKSPACE/notes"
 else
@@ -97,8 +98,10 @@ if [ -n "$GH" ]; then
 fi
 
 # 3) Build log tail + pending questions + cold-review log (small files, copy whole)
-tail -150 "$REPO/build_log.md" > "$OUT/build_log-tail.md" 2>/dev/null || true
-cp "$REPO/pending-questions.md" "$OUT/pending-questions.md" 2>/dev/null || true
+_bl="${WS}/build_log.md"; [ -f "$_bl" ] || _bl="${REPO}/build_log.md"
+tail -150 "$_bl" > "$OUT/build_log-tail.md" 2>/dev/null || true
+_pq="${WS}/pending-questions.md"; [ -f "$_pq" ] || _pq="${REPO}/pending-questions.md"
+cp "$_pq" "$OUT/pending-questions.md" 2>/dev/null || true
 cp "$NOTES_DIR/cold-review-log.md" "$OUT/cold-review-log.md" 2>/dev/null || true
 
 # 4) Voice-agent log — filter to window, grep for signal lines, keep it bounded.

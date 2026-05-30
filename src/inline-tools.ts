@@ -20,6 +20,10 @@ import { resolveWorkspace, statusPath, statusReadPath } from './workspace_defaul
 // resolveWorkspace() is the canonical TS helper introduced in #821.
 const WORKSPACE_DIR = resolveWorkspace();
 
+// Gate slide-control + fullscreen on presenter-mode.sentinel.
+// Issue #1171: registering these globally causes Gemini to fire them on greetings.
+const _presenterActive = existsSync(join(WORKSPACE_DIR, 'state', 'presenter-mode.sentinel'));
+
 // Code-adjacent paths (skills/, etc.) ship with the repo checkout, NOT the
 // workspace. Compute REPO_ROOT from this file's URL so the resolution
 // survives any cwd drift at startup. Used by the skill-loader below.
@@ -974,15 +978,14 @@ function assertUniqueToolNames(tools: ToolDefinition[]): ToolDefinition[] {
 // owner-tier tools only when the caller is the verified owner. Manifest
 // access_tier values: "owner" (default if omitted) | "any_caller".
 async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyCaller: ToolDefinition[] }> {
-	// Scan the public-repo `skills/` dir AND the optional private skills dir
+	// Scan the public-repo `skills/` dir, the per-user workspace
+	// `$SUTANDO_WORKSPACE/skills/`, AND the optional private skills dir
 	// pointed to by `$SUTANDO_MEMORY_DIR/skills/` (legacy `$SUTANDO_PRIVATE_DIR`
 	// honored via memoryDirEnv(); e.g. `~/.sutando/memory-sync/skills/`). The
 	// private dir lets users keep personal tooling with real per-file git
-	// history outside the public repo. Order: public first, then private —
-	// same-name skills loaded from private take precedence (last one wins via
-	// the dup-name guard below if any; in practice they should be uniquely
-	// named).
-	const dirsToScan: string[] = [join(REPO_ROOT, 'skills')];
+	// history outside the public repo. Order: public first, then workspace,
+	// then private — last-write-wins for same-name skills.
+	const dirsToScan: string[] = [join(REPO_ROOT, 'skills'), join(WORKSPACE_DIR, 'skills')];
 	const privateRoot = memoryDirEnv();
 	if (privateRoot) {
 		const expanded = privateRoot.replace(/^~/, process.env.HOME || '');
@@ -1046,7 +1049,7 @@ const personalAllTools = [...personalTools.owner, ...personalTools.anyCaller];
 // a tools.ts. Don't try to align them — they're correctly sync/async for
 // what each one does.
 function loadCoreDocumentedSkills(): { name: string; description: string }[] {
-	const dirsToScan: string[] = [join(REPO_ROOT, 'skills')];
+	const dirsToScan: string[] = [join(REPO_ROOT, 'skills'), join(WORKSPACE_DIR, 'skills')];
 	const privateRoot = memoryDirEnv();
 	if (privateRoot) {
 		const expanded = privateRoot.replace(/^~/, process.env.HOME || '');
@@ -1090,7 +1093,7 @@ export const inlineTools = assertUniqueToolNames([
 	volumeTool, brightnessTool, clipboardTool,
 	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, getCoreStatusTool,
 	joinGmeetTool, lookupMeetingIdTool, callContactTool,
-	describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, slideControlTool, fullscreenTool,
+	describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, ...(_presenterActive ? [slideControlTool, fullscreenTool] : []),
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
 	recentContextTool,
 	sendVisionFrameTool, startVisionTool, stopVisionTool,
@@ -1111,7 +1114,7 @@ export const ownerOnlyTools = [
 	pressKeyTool, scrollTool, switchTabTool, closeTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
 	clipboardTool, cancelTaskTool, toggleTasksTool,
-	joinGmeetTool, callContactTool, slideControlTool, fullscreenTool,
+	joinGmeetTool, callContactTool, ...(_presenterActive ? [slideControlTool, fullscreenTool] : []),
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
 	recentContextTool,
 	describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool,

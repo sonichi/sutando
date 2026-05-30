@@ -11,6 +11,9 @@ Usage:
 Auto-refreshes every 15 seconds.
 """
 
+from __future__ import annotations
+
+
 import http.server
 import json
 import os
@@ -53,6 +56,15 @@ def _resolve_note_path(raw_slug: str):
     if not note_file_str.startswith(notes_real + os.sep):
         return None
     return Path(note_file_str)
+
+
+def get_outbox(limit: int = 10) -> list[dict]:
+    """Return recent outbox entries for the dashboard card."""
+    try:
+        import outbox_log
+        return outbox_log.read_recent(limit)
+    except Exception:
+        return []
 
 
 def get_health() -> list[dict]:
@@ -313,8 +325,33 @@ def render_dashboard() -> str:
     if matrix_html:
         cards.append(f'<div class="card full"><h2>Capabilities Matrix</h2>{matrix_html}</div>')
 
+    # Outbox (recent outbound messages)
+    outbox = get_outbox(10)
+    if outbox:
+        _channel_icon = {
+            "discord_dm": "💬", "discord_channel": "📢",
+            "slack_dm": "💬", "slack_channel": "📢",
+            "telegram": "✈️", "imessage": "💬", "whatsapp": "📱",
+            "email": "📧", "x": "𝕏",
+        }
+        outbox_html = ""
+        for e in reversed(outbox):
+            icon = _channel_icon.get(e.get("channel_type", ""), "→")
+            ts_str = e.get("iso_ts", "")[:16].replace("T", " ")
+            label = e.get("recipient_label") or e.get("recipient", "?")[:20]
+            preview = e.get("body_preview", "")[:80]
+            outbox_html += (
+                f'<div class="activity-item">'
+                f'<span class="activity-time">{ts_str} {icon} {label}</span> '
+                f'<span class="activity-title" style="color:#666">{preview}</span>'
+                f'</div>\n'
+            )
+        cards.append(f'<div class="card full"><h2>Outbox</h2>{outbox_html}</div>')
+
     # Keyboard shortcuts
-    sutando_running = subprocess.run(["/usr/bin/pgrep", "-f", "src/Sutando/Sutando"], capture_output=True).returncode == 0
+    # Match both the dev-built binary (`<repo>/src/Sutando/Sutando`) and the
+    # distributed .app (`/Applications/Sutando.app/Contents/MacOS/Sutando`).
+    sutando_running = subprocess.run(["/usr/bin/pgrep", "-f", "(Sutando|MacOS)/Sutando"], capture_output=True).returncode == 0
     shortcut_status = '<span class="ok">✓</span> Sutando app running' if sutando_running else '<span class="bad">✗</span> Sutando app not running'
     cards.append(f"""<div class="card">
 <h2>Keyboard Shortcuts</h2>

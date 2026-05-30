@@ -83,8 +83,8 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '../../../src/inline-tools.js';
-import { recordSession, recordConversation } from '../../../src/conversation-store.js';
-import { resultBelongsTo } from '../../../src/result-channel-key.js';
+import { recordSession, recordConversation, recordToolCall } from '../../../src/conversation-store.js';
+import { resultBelongsTo, phoneCallKey } from '../../../src/result-channel-key.js';
 // Lazy vision-session handle. Only loaded if a call ever needs it — keeps the
 // phone-agent boot path free of the vision-tools.ts side-effects on cold start.
 let _setVisionSession: ((s: unknown) => void) | null = null;
@@ -125,6 +125,23 @@ const TASK_POLL_INTERVAL_MS = 500;
 const TASK_TIMEOUT_MS = 120_000;
 const OWNER_NAME = process.env.owner ?? '';
 const OWNER_NUMBER = process.env.OWNER_NUMBER ?? '';
+const OWNER_TZ = process.env.OWNER_TZ ?? 'America/Los_Angeles';
+
+// Build a date-context string injected into the system prompt at session-open
+// so Gemini resolves date-relative phrases ("tomorrow", "this Friday") against
+// the owner's local clock, not UTC or server-local. Without this, US-Pacific
+// owners get an off-by-one whenever a call lands after ~5pm PT (UTC midnight
+// rollover): the model says "tomorrow = May 28" when owner-local says May 27.
+// See sonichi/sutando#1243.
+function ownerLocalDateContext(now: Date = new Date()): string {
+	const tz = OWNER_TZ;
+	const today = now.toLocaleDateString('en-CA', { timeZone: tz }); // YYYY-MM-DD
+	const dayName = now.toLocaleDateString('en-US', { timeZone: tz, weekday: 'long' });
+	const timeStr = now.toLocaleTimeString('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit' });
+	const tomorrow = new Date(now.getTime() + 86_400_000).toLocaleDateString('en-CA', { timeZone: tz });
+	const yesterday = new Date(now.getTime() - 86_400_000).toLocaleDateString('en-CA', { timeZone: tz });
+	return `Owner-local time: ${dayName}, ${today}, ${timeStr} (${tz}). Tomorrow = ${tomorrow}. Yesterday = ${yesterday}. When the owner says "today", "tomorrow", "yesterday", "this week", etc., resolve against THESE owner-local dates — never against UTC or server-local time. Pass absolute YYYY-MM-DD values to tools (not relative phrases).`;
+}
 
 // Model configuration — text/STT model still env-driven; the native-audio
 // model + googleSearch grounding are per-user config: data, not code, so they
@@ -402,10 +419,19 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 			// Cache result so duplicate requests get instant replay
 			if (!callSession.taskResultCache) callSession.taskResultCache = new Map();
 			callSession.taskResultCache.set(taskDescription, result);
+			// Anti-hallucination wrapping. See sonichi/sutando#1244 — Gemini
+			// was filling silence with plausible-sounding fabrications when
+			// the work tool returned empty/sparse content. Two layers:
+			// (1) a RESULT_EMPTY sentinel on truly-empty results so the model
+			// has an explicit "say nothing" signal instead of an empty string
+			// it can pattern-fill; (2) an explicit "items present verbatim"
+			// guardrail on every result.
+			const isEmpty = result.length === 0;
+			const injectedText = isEmpty
+				? `[Task result for "${taskDescription}"]\nRESULT_EMPTY — the tool returned no items.\n\nTell the caller plainly that there is nothing to report (e.g. "nothing scheduled", "your inbox is empty", "no matches"). Do NOT invent, guess, or extrapolate any items. Use only the literal RESULT_EMPTY signal.`
+				: `[Task result for "${taskDescription}"]\n${result}\n\nReport this result to the caller now. Only reference items that appear verbatim in the result above — do NOT invent, fabricate, or extrapolate items that aren't there.`;
 			// Queue result — will be injected on next turn.end to avoid interrupting speech
-			callSession.resultQueue.push({
-				text: `[Task result for "${taskDescription}"]\n${result}\n\nReport this result to the caller now.`,
-			});
+			callSession.resultQueue.push({ text: injectedText });
 			return;
 		}
 		if (Date.now() - startTime > POLL_TIMEOUT_MS) {
@@ -517,6 +543,14 @@ function buildAgent(callSession: CallSession): MainAgent {
 				'',
 				'## Known info',
 				(() => { try { const url = execSync('git remote get-url origin', { timeout: 2_000 }).toString().trim().replace(/\.git$/, ''); return `Sutando GitHub repo: ${url}`; } catch { return ''; } })(),
+				ownerLocalDateContext(),
+				// Session-level anti-hallucination backstop (cherry-picked from
+				// bassilkhilo-ag2's parallel PR #1249). Pre-warms the model
+				// with the constraint at session-open so the rule is in scope
+				// BEFORE any result-injection wrapper lands. Combined with the
+				// per-result wrapper below at conversation-server.ts:405, the
+				// model gets the rule twice: at boot and at delivery.
+				'TOOL RESULT TRUTHFULNESS: When a work task result is empty or says nothing was found, you MUST say "nothing scheduled" or "nothing found" — never invent, guess, or fill with plausible-sounding calendar events, emails, or other items. Fabricated events mislead the owner and are worse than silence.',
 				'',
 				'## Style',
 				'Be natural, warm, and conversational. Keep responses to 1-2 sentences.',
@@ -775,14 +809,17 @@ async function createCallSession(params: {
 				// bodhi's onToolResult only provides toolCallId, not toolName.
 				if (!callSession._toolIdMap) callSession._toolIdMap = new Map();
 				callSession._toolIdMap.set(e.toolCallId, e.toolName);
-				callSession.events.push({ event: `tool_call:${e.toolName}`, timestamp: new Date().toISOString() });
+				// tool_call event push removed per #1052 — canonical record is
+				// the phone-table row written in onToolResult via recordToolCall().
 			},
 			onToolResult: (e) => {
 				// Resolve tool name from the map since e.toolName is undefined in onToolResult
 				const toolName = callSession._toolIdMap?.get(e.toolCallId) || 'unknown';
 				console.log(`${ts()} [Tool] result: ${toolName} (${e.status}, ${e.durationMs}ms)`);
 				callSession.toolCalls.push({ name: toolName, durationMs: e.durationMs, timestamp: new Date().toISOString() });
-				callSession.events.push({ event: `tool_result:${toolName}:${e.durationMs}ms`, timestamp: new Date().toISOString() });
+				// tool_result event push removed per #1052 — recordToolCall
+				// below is the canonical write (phone table, kind='tool_call').
+				recordToolCall('phone', toolName, e.durationMs, callSession.sessionId);
 				// Log REC indicator status for recording tools
 				if (toolName === 'record_screen_with_narration' || toolName === 'screen_record' || toolName === 'open_file') {
 					const hasIndicator = existsSync('/tmp/sutando-rec-indicator.pid');
@@ -875,14 +912,14 @@ async function createCallSession(params: {
 			if (item.content === lastTranscriptText) continue;
 			if (item.role === 'user') {
 				callSession.transcript.push({ role: 'caller', text: item.content });
-				// 12s offset: Gemini STT commits transcript ~12s after the caller actually spoke
-				// (measured via iPad recording comparison on 2026-04-09). Without this, caller
-				// timestamps appear after Sutando's responses in the observability timeline.
-				callSession.events.push({ event: `caller:${item.content}`, timestamp: new Date(Date.now() - 12000).toISOString() });
+				// caller event push removed per #1052 — canonical record is
+				// the phone-table row written via recordConversation (called
+				// elsewhere in this server). session_events keeps only
+				// lifecycle entries to stop triple-encoding utterances.
 				try { appendFileSync(`/tmp/sutando-live-transcript-${callSession.callSid}.txt`, `[${new Date(Date.now() - 12000).toLocaleTimeString('en-US', {hour12:false})}] Caller: ${item.content}\n`); } catch {}
 			} else if (item.role === 'assistant') {
 				callSession.transcript.push({ role: 'sutando', text: item.content });
-				callSession.events.push({ event: `sutando:${item.content}`, timestamp: new Date().toISOString() });
+				// sutando event push removed per #1052 — see comment above.
 				try { appendFileSync(`/tmp/sutando-live-transcript-${callSession.callSid}.txt`, `[${new Date().toLocaleTimeString('en-US', {hour12:false})}] Sutando: ${item.content}\n`); } catch {}
 			}
 		}
@@ -994,7 +1031,9 @@ async function createCallSession(params: {
 			// Belt-and-suspenders: `resultBelongsTo` also gates on .txt.
 			if (!name.endsWith('.txt')) continue;
 			if (callSession.channelScanSeen!.has(name)) continue;
-			if (!resultBelongsTo(name, callSession.callSid)) continue;
+			// Typed key constructor — keeps writer + consumer in sync on
+			// the `phone-` prefix; prevents cross-consumer namespace collisions.
+			if (!resultBelongsTo(name, phoneCallKey(callSession.callSid))) continue;
 			callSession.channelScanSeen!.set(name, Date.now());
 			const full = join(RESULTS_DIR, name);
 			let body: string;
@@ -1499,8 +1538,20 @@ const server = createServer(async (req, res) => {
 			const dialIn = body.dialIn ?? '+12532158782';
 			const digits = body.meetingId.replace(/\D/g, '');
 			const passcode = body.passcode?.replace(/\D/g, '') ?? '';
-			const platform = (body.platform ?? 'zoom').toLowerCase(); // 'zoom' | 'meet' | 'teams'
-			const originalId = body.meetingId.trim();
+			// `platform` is user-controlled (Gemini tool argument). The
+			// pre-fix `.toLowerCase()` did NOT strip newlines, so a value
+			// like `"zoom\nchannel_id: local-voice"` would survive into
+			// the task-file template literal below and forge a
+			// `_isVoiceTask` match. Same shape as the agent-api /task
+			// injection (PR #982). Strip CR/LF at the source.
+			const platform = (body.platform ?? 'zoom').toLowerCase().replace(/[\r\n]/g, ' ').trim();
+			// Same rationale for `originalId` — it survives untouched
+			// from `body.meetingId.trim()` and lands in the multi-line
+			// `task:` field of the task-file template literal below.
+			// Multi-line meeting IDs aren't meaningful; flatten to
+			// spaces and cap to a reasonable length to bound abuse via
+			// oversized inputs.
+			const originalId = body.meetingId.trim().replace(/[\r\n]/g, ' ').slice(0, 80);
 			const connectUrl = `${WEBHOOK_BASE_URL}/twilio/connect?meeting=true&meetingId=${encodeURIComponent(originalId)}&passcode=${encodeURIComponent(passcode)}`;
 
 			let sid: string;

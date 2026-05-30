@@ -405,6 +405,18 @@ if git diff --quiet && git diff --cached --quiet && [ -z "$(git ls-files --other
     echo "No changes to sync."
 else
     git add -A
+    # Mass-deletion tripwire: refuse to push a commit that removes a large number
+    # of files unless explicitly forced. A stale/divergent sync script or a bad
+    # rsync can wipe the shared memory repo; this backstop catches the staged
+    # deletions before they are pushed (incident 2026-05-30).
+    DELETED=$(git diff --cached --name-only --diff-filter=D | wc -l | tr -d ' ')
+    MAX_DELETE="${SUTANDO_SYNC_MAX_DELETE:-50}"
+    if [ "$DELETED" -gt "$MAX_DELETE" ] && [ "${SUTANDO_FORCE_SYNC:-0}" != "1" ]; then
+        log "ABORT: sync would delete $DELETED files (>$MAX_DELETE). Refusing to push. Set SUTANDO_FORCE_SYNC=1 to override."
+        echo "Sync aborted: would delete $DELETED files (mass-deletion tripwire). Set SUTANDO_FORCE_SYNC=1 to override." >&2
+        git reset -q
+        exit 1
+    fi
     git commit -m "Sync $(hostname) $(date +%Y-%m-%dT%H:%M)" 2>&1 | tee -a "$LOG" >/dev/null
     if git push 2>&1 | tee -a "$LOG" >/dev/null; then
         log "Pushed changes"
