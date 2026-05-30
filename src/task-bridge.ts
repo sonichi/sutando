@@ -14,6 +14,7 @@ import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from './workspace_default.js';
 import { recordConversation, recordSessionBoundary } from './conversation-store.js';
+import { archiveFile as archiveFileImpl } from './task-archive.js';
 
 const REPO_DIR = resolveWorkspace();
 const TASK_DIR = join(REPO_DIR, 'tasks');
@@ -43,19 +44,12 @@ function writeOwnerActivity(channel: string, summary: string): void {
 }
 
 /** Archive a task/result file into archive/<kind>/YYYY-MM/ instead of
- * deleting. Chi's 2026-04-18 ask: "instead of deleting we should archive
- * the tasks. It can be useful for self-improving". Silent on failure;
- * fall back to unlink so the system never leaves stale files behind. */
+ * deleting. Thin wrapper that pins `base` to this surface's REPO_DIR
+ * and delegates to the shared `archiveFile` in `./task-archive.js`. The
+ * shared impl is the canonical one — see `docs/bridge-helpers-design.md`
+ * § task-archive helper for the cross-language contract. */
 function archiveFile(srcPath: string, kind: 'tasks' | 'results', taskId: string): void {
-	try {
-		if (!existsSync(srcPath)) return;
-		const ym = new Date().toISOString().slice(0, 7); // YYYY-MM
-		const destDir = join(REPO_DIR, kind, 'archive', ym);
-		mkdirSync(destDir, { recursive: true });
-		renameSync(srcPath, join(destDir, `${taskId}.txt`));
-	} catch (err) {
-		try { unlinkSync(srcPath); } catch { /* ignore */ }
-	}
+	archiveFileImpl(srcPath, kind, taskId, REPO_DIR);
 }
 
 // Ensure dirs exist

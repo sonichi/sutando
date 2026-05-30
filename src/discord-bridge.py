@@ -57,7 +57,7 @@ from single_instance import acquire as _single_instance_acquire  # noqa: E402
 import discord_config  # noqa: E402  — Sutando workspace-local discord config (#1147)
 from util_paths import shared_personal_path  # noqa: E402
 from task_priority import default_priority_for_source  # noqa: E402
-from task_archive import find_task_file  # noqa: E402
+from task_archive import find_task_file, archive_file as _archive_file_shared  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
 REPO = resolve_workspace()
 
@@ -353,20 +353,12 @@ def archive_path(kind: str, task_id: str) -> "Path":
 
 
 def archive_file(src: "Path", kind: str, task_id: str) -> None:
-    """Move src into the archive. Silent on failure — archive is for later
-    analysis, not critical path. Chi's 2026-04-18 ask: "instead of deleting
-    we should archive the tasks. It can be useful for self-improving"."""
-    try:
-        if src.exists():
-            import shutil
-            shutil.move(str(src), str(archive_path(kind, task_id)))
-    except Exception as e:
-        print(f"  archive_file({kind}, {task_id}) failed: {e}", flush=True)
-        # Fall back to unlink so we don't leave stale files.
-        try:
-            src.unlink(missing_ok=True)
-        except Exception:
-            pass
+    """Move src into the archive. Thin wrapper that pins ``base`` to this
+    surface's ``REPO`` and delegates to the shared helper in
+    ``src/task_archive.py``. The shared impl is the canonical one — see
+    ``docs/bridge-helpers-design.md`` § task-archive helper for the
+    cross-language contract."""
+    _archive_file_shared(src, kind, task_id, base=REPO)
 
 
 def notify_agent_api_task_done(task_id: str, result: str) -> None:

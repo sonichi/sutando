@@ -34,7 +34,7 @@ from task_priority import default_priority_for_source  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
 
 from workspace_default import resolve_workspace  # noqa: E402
-from task_archive import find_task_file  # noqa: E402
+from task_archive import find_task_file, archive_file as _archive_file_shared  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 REPO = resolve_workspace()
 TASKS_DIR = REPO / "tasks"
@@ -170,24 +170,11 @@ def write_owner_activity(channel: str, summary: str) -> None:
 
 def archive_file(src: "Path", kind: str, task_id: str) -> None:
     """Move src into archive/<tasks|results>/YYYY-MM/ instead of deleting.
-    Silent on failure. Chi's ask 2026-04-18: archive tasks + results for
-    later pattern-mining / self-improvement analysis."""
-    try:
-        if not src.exists():
-            return
-        from datetime import datetime
-        import shutil
-        ym = datetime.now().strftime("%Y-%m")
-        base = ARCHIVE_TASKS_DIR if kind == "tasks" else ARCHIVE_RESULTS_DIR
-        dest_dir = base / ym
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(src), str(dest_dir / f"{task_id}.txt"))
-    except Exception as e:
-        print(f"[Telegram] archive_file({kind}, {task_id}) failed: {e}")
-        try:
-            src.unlink(missing_ok=True)
-        except Exception:
-            pass
+    Thin wrapper that pins ``base`` to this surface's ``REPO`` and
+    delegates to the shared helper in ``src/task_archive.py``. See
+    ``docs/bridge-helpers-design.md`` § task-archive helper for the
+    cross-language contract."""
+    _archive_file_shared(src, kind, task_id, base=REPO)
 
 # Presenter mode: silence proactive DMs during ICLR/talk windows. Sentinel
 # is written by scripts/presenter-mode.sh with an ISO-8601 expiry. Matches
