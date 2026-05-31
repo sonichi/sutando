@@ -152,7 +152,7 @@ const deactivateScreenCompanionTool: ToolDefinition = {
 		'Exit screen-companion mode and restore the full tool surface. Call this when the user says "exit", "stop the mode", "done", or otherwise indicates they want to leave the current screen-companion mode and return to normal operation.',
 	parameters: z.object({}),
 	execution: 'inline',
-	execute(_args) {
+	async execute(_args) {
 		const exitedMode = activeMode;
 		activeMode = null;
 		const restored = callRestoreTools();
