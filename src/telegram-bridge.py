@@ -34,6 +34,8 @@ from task_priority import default_priority_for_source  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
 
 from workspace_default import resolve_workspace  # noqa: E402
+from task_archive import find_task_file  # noqa: E402
+from single_instance import acquire as _single_instance_acquire  # noqa: E402
 REPO = resolve_workspace()
 TASKS_DIR = REPO / "tasks"
 RESULTS_DIR = REPO / "results"
@@ -436,6 +438,7 @@ def _recover_orphan_sending_files() -> int:
 
 
 def main():
+    _single_instance_acquire("telegram-bridge")
     print(f"Telegram bridge started. Polling for messages...", flush=True)
     # Restart-safety: sweep orphan `.sending` files before the poll
     # loop starts. See _recover_orphan_sending_files for rationale.
@@ -563,8 +566,17 @@ def main():
                 not presenter_mode_active()
                 and should_claim_proactive(OWNER_ACTIVITY_FILE, "telegram")
             ):
+                # discord-bridge.poll_dm_fallback handles briefing-/insight-/
+                # friction-*.txt via FALLBACK_PREFIXES; telegram-bridge only
+                # matched `proactive-`, so morning-briefing output (which
+                # writes `results/briefing-{date}.txt` per the skill
+                # contract) was silently archived without reaching Telegram.
+                # Treat the same prefixes as proactive-equivalent so
+                # cron-originated results land in the owner's DM regardless
+                # of which bridge is the active channel.
+                PROACTIVE_PREFIXES = ("proactive-", "briefing-", "insight-", "friction-")
                 for f in RESULTS_DIR.iterdir():
-                    if f.name.startswith("proactive-") and f.suffix == ".txt":
+                    if any(f.name.startswith(p) for p in PROACTIVE_PREFIXES) and f.suffix == ".txt":
                         # Claim-by-rename: atomic move to a `.sending`
                         # suffix before reading, so a concurrent poll
                         # (same bridge, or a race with discord-bridge)
@@ -624,7 +636,7 @@ def main():
                 if any(a.kind == "skip" for a in parsed.actions):
                     print(f"  Skipped (marker): {task_id}", flush=True)
                     archive_file(result_file, "results", task_id)
-                    task_file = TASKS_DIR / f"{task_id}.txt"
+                    task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
                     archive_file(task_file, "tasks", task_id)
                     continue
                 try:

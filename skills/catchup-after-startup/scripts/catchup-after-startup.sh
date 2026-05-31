@@ -282,8 +282,8 @@ fi
 #    of file age, plus a note if the most-recent entry is older than 24h.
 print_section "build_log.md (last 3 entries)"
 bl=""
-[ -f "$REPO/build_log.md" ] && bl="$REPO/build_log.md"
-[ -z "$bl" ] && [ -f "$WS/build_log.md" ] && bl="$WS/build_log.md"
+[ -f "$WS/build_log.md" ] && bl="$WS/build_log.md"
+[ -z "$bl" ] && [ -f "$REPO/build_log.md" ] && bl="$REPO/build_log.md"
 if [ -n "$bl" ]; then
   python3 <<PYEOF
 import re, os, time
