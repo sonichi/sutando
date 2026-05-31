@@ -103,11 +103,11 @@ def get_activity(max_items: int = 10) -> list[dict]:
                 from datetime import datetime
                 dt = datetime.strptime(date_str.strip()[:19], '%Y-%m-%d %H:%M:%S')
                 time_str = dt.strftime('%b %d %H:%M')
-            except:
+            except Exception:
                 time_str = date_str[:16]
             entries.append({'time': time_str, 'title': msg.strip(), 'body': sha})
         return entries
-    except:
+    except Exception:
         return []
 
 

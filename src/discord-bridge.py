@@ -509,14 +509,14 @@ def load_allowed():
     try:
         data = json.loads(ACCESS_FILE.read_text())
         return set(data.get("allowFrom", []))
-    except:
+    except Exception:
         return set()  # empty = allow all DMs during pairing
 
 def load_policy():
     try:
         data = json.loads(ACCESS_FILE.read_text())
         return data.get("dmPolicy", "pairing")
-    except:
+    except Exception:
         return "pairing"
 
 def load_channel_config(channel_id):
@@ -530,7 +530,7 @@ def load_channel_config(channel_id):
                 return (False, None)  # no mention required, all allowed
             return (cfg.get("requireMention", True), set(cfg.get("allowFrom", [])))
         return None  # not configured
-    except:
+    except Exception:
         return None
 
 def load_channel_allowed(channel_id):
@@ -2403,7 +2403,7 @@ async def _handle_discord_message(message, force=False):
         import random, string
         try:
             access = json.loads(ACCESS_FILE.read_text())
-        except:
+        except Exception:
             access = {"dmPolicy": "pairing", "allowFrom": [], "pending": {}}
         code = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
         pending = access.get("pending", {})
@@ -2598,7 +2598,7 @@ async def _handle_discord_message(message, force=False):
                     team_ids.update(ch_cfg.get("allowFrom", []))
             if sender_id in team_ids:
                 access_tier = "team"
-        except:
+        except Exception:
             pass
 
     # Dedup: skip if we've already processed this Discord message ID.
@@ -2867,7 +2867,7 @@ def save_to_allowlist(sender_id):
     """Add sender to access.json allowFrom."""
     try:
         data = json.loads(ACCESS_FILE.read_text())
-    except:
+    except Exception:
         data = {"dmPolicy": "pairing", "allowFrom": [], "groups": {}, "pending": {}}
 
     if sender_id not in data.get("allowFrom", []):

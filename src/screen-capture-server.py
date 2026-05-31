@@ -124,7 +124,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             paths.append(p)
                         else:
                             try: os.unlink(p)
-                            except: pass
+                            except Exception: pass
                             break  # no more displays
                     path = paths[0] if paths else f"{DIR}/screen-{ts}.{ext}"
                 else:
