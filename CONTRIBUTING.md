@@ -26,7 +26,7 @@ bash src/startup.sh
 1. **What happened** — describe the issue clearly
 2. **Steps to reproduce** — numbered steps someone else can follow
 3. **Expected behavior** — what should have happened
-4. **Logs** — paste relevant lines from `logs/*.log`
+4. **Logs** — paste relevant lines from `$SUTANDO_WORKSPACE/logs/*.log` (defaults to `~/.sutando/workspace/logs/`; the old `<repo>/logs/` path was moved to the workspace per the workspace contract — `src/startup.sh` now writes to `$WORKSPACE/logs/`)
 5. **Environment** — macOS version, Node.js version, Claude Code version
 
 **Bonus (highly valued):**
@@ -51,95 +51,66 @@ See existing skills for examples. Install with `bash skills/install.sh`.
 - **web-client.ts**: The entire web UI is an inline HTML template literal. Do NOT use TypeScript-only syntax (like `as Type` casts) inside the embedded `<script>` block — the browser runs it as plain JS.
 - All scripts should work from a fresh clone with minimal setup
 
-## Before opening any PR or issue
+## Before starting a PR
 
-Five checks save a lot of churn for both sides:
+The goal of this phase is to confirm the PR is necessary at all. In rough order of "what kills the PR earliest":
 
-### 1. Search for existing PRs / issues first
+1. Is there already an open or recently-closed PR / issue covering this? Search both open and recently-closed state — duplicate PRs are the #1 source of churn here. The same fix has been opened in 10+ different PRs before. Check with:
 
-The same fix has been opened in 10+ different PRs before (e.g. the bare-except narrow in `skills/quota-tracker/scripts/read-quota.py` had 10 attempts across multiple contributors before one landed). Before you open:
+   ```bash
+   gh pr list --repo sonichi/sutando --state all --limit 30 --search "your-keyword"
+   gh issue list --repo sonichi/sutando --state open --search "your-keyword"
+   ```
 
-**If you're running Sutando** — easiest path: just ask your Sutando agent ("are there existing PRs or issues for X?" / "has anyone already proposed a fix for the foo bug?"). Sutando will run the `gh` searches below across open + recently-closed state, dedup by topic, and summarize what's already in flight or shipped. Saves the cognitive load of crafting the right search query yourself.
+   If someone else's PR is already in flight (CLA-blocked or just stale), prefer pinging them or pushing onto their branch over opening a parallel one.
+2. **Is the problem real?** For a bug-fix, **manually verify** — a human actually runs the failing path end-to-end. If you can't repro locally, ask a maintainer's bot to produce **scripted evidence the maintainer can inspect** (test output, repro logs) — that's "bot verification". Bot verification is *evidence*, not a substitute for manual testing when the change is user-visible, integration-heavy, or weakly covered by tests. For a feature, confirm the user need is real (issue with use case, owner ask, etc.). Don't open a PR for a problem that doesn't exist.
+3. For a bug-fix: is the bug still on `upstream/main`? (`git show upstream/main:path | grep buggy-line`) — don't fix something that's already gone.
+4. Is this a single concern? **One bug or one feature per PR.** If you're tempted to bundle several features into one PR ("while I'm here I'll also add Y, Z"), split them up front — open one PR per concern, each with its own closes-link. Mixing concerns triples the review burden, increases revert blast radius, and slows merge. "Drive-by" cleanup that happens to land in the same hunk is fine; net-new scope is not.
 
-**If you prefer the raw commands**:
+## The PR body should answer
 
-```bash
-# Open + recently closed PRs that closed/referenced the same issue
-gh pr list --repo sonichi/sutando --state all --limit 30 --search "closes #N"
+In the order a reviewer reads them. Say "N/A" if a question doesn't apply, so the reviewer doesn't wonder whether you forgot it.
 
-# Open issues with related keywords
-gh issue list --repo sonichi/sutando --state open --search "your-keyword"
-```
+- What changed, and why?
+- What files / sections should reviewers look at first?
+- What user behavior or bug does this prove?
+- What tests did you run? Include commands and results.
+- For bug-fixes: failing-before / passing-after evidence (commit + test command).
+- What edge cases or non-happy paths did you check?
+- Any migrations, config, permissions, rollback, or deployment risks?
+- Any known gaps or follow-up work?
 
-If someone else's PR is already in flight and CLA-blocked or just stale, prefer pinging them or rebasing their branch over opening a parallel one.
+## After opening the PR
 
-### 2. CLA + git author email
+The goal of this phase is to provide evidence the maintainer can verify quickly. In order of what happens next:
 
-CLA-Assistant maps your commits to a GitHub user via the author email. Two pitfalls trip almost every new contributor:
+1. **Provide verification evidence in the PR body** — both flavors when applicable:
+   - **Manual verify**: a command you ran + the before/after observed behavior. ("I ran `bash scripts/repro.sh` against the unpatched code and got X; with the patch I got Y.")
+   - **Bot verify (tests)**: the test you ran (or added) + the pass/fail outcome, ideally **fails-before / passes-after** for bug-fixes. ("`pytest tests/foo.py::test_repro` fails at `2e79ec7` and passes at HEAD.")
+   The reviewer should not have to re-derive that your change works.
+2. Check the CLA status — CLA-Assistant runs on PR open and flags any commits whose author email isn't mapped to a CLA-signed GitHub account. **A failing CLA check blocks merge**, no matter how green everything else is. Fix with `git config user.email YOUR_GH_MAPPED_EMAIL && git commit --amend --reset-author --no-edit && git push --force-with-lease`. (`git log -1 --format='%ae'` to check what's there now.)
+3. Address every substantive review-thread comment before merge: fixed in a subsequent commit, replied with rationale for declining, or explicitly deferred to a follow-up issue.
+4. **If the PR ended up large, split it post-hoc.** If during review it becomes clear the diff covers more than one concern (a fix + a refactor, two unrelated features, etc.), close this PR and re-open it as N smaller PRs rather than negotiating reviewer patience. Easier than rebasing later; easier to revert one piece at a time.
 
-```bash
-# Check your most recent commit's author email
-git log -1 --format='%ae'
+## Reviewing PRs
 
-# If it shows something like:
-#   user@Hostname.local                ← macOS hostname auto-fill
-#   noreply@anthropic.com              ← Claude Code default for bot commits
-# CLA-Assistant CANNOT map it to your GitHub account → check stays PENDING forever.
+If you're reviewing someone else's PR (including a bot's), keep the comment thread useful:
 
-# Fix it before pushing:
-git config user.email YOUR_GH_MAPPED_EMAIL
-git commit --amend --reset-author --no-edit   # rewrites only the latest commit
-# or for a fuller rewrite:
-git rebase -i origin/main   # mark each as 'edit', then --reset-author + continue
-```
+- **Prefer to add evidence, not noise.** If you have nothing new to add — no new evidence, no fresh angle, no concrete suggestion — stay silent. A "LGTM" comment under an existing APPROVE just buries real feedback. (A second reviewer surfacing *new* evidence on a point another reviewer raised is fine; a third "lgtm" in a row is not.)
+- **APPROVE / REQUEST_CHANGES is a formal GitHub action.** A Discord "👍" or a `gh pr comment` saying "approved" does NOT register as a review — use `POST /repos/.../pulls/N/reviews` (or `gh pr review --approve`) so the state is recorded.
+- **Be evidence-first.** When you claim something is broken, point at the commit, file, line, repro, or failing test. If you didn't verify, say so explicitly ("not verified — flagging for author to check").
+- **Distinguish blockers from nits.** Mark each comment so the author knows what's gating merge vs what's deferrable.
 
-If you're running a Sutando bot that commits on your behalf, set the bot's `git config user.email` to your CLA-signed email locally (don't share the keychain — just configure git).
+For more detail (verification phases for fix PRs, sign trailers, sonichi-fix POC mechanics), see the `review-pr` skill if it's installed.
 
-### 3. Single concern per PR
+## If a bot is contributing on your behalf
 
-A PR that fixes "X" should not also bundle "while I was here, I cleaned up Y / refactored Z / added a new feature W". Split those:
+**Do not flood the repo.** A bot can crank out PRs faster than a maintainer can review them — it's easy to dump 50–100+ PRs in a day. Even when each PR is individually correct, the volume buries real-user issues and burns the review channel. Concrete rules:
 
-- One concern → one PR → one closes-link
-- Mixing concerns triples the review burden, increases revert blast radius, and makes merge conflicts harder
-- "Drive-by" cleanup that happens to land in the same hunk is fine; net-new scope is not
-
-### 4. Confirm the bug exists on `upstream/main`
-
-Before adding a fix:
-
-```bash
-git fetch upstream main
-git show upstream/main:path/to/file.py | grep -n "the buggy line"
-```
-
-If the bug is already fixed upstream, the PR is unnecessary. Save yourself + reviewer time.
-
-### 5. If your bot is contributing on your behalf, supervise it
-
-A Sutando bot (or any LLM agent) can crank out PRs much faster than a maintainer can review them. Easy way to flood the queue with 50–100+ PRs in a day — most either duplicate each other, address bugs already fixed upstream, or fix something tiny that should have been bundled. Even when individually correct, the volume burns the review channel and pushes real-user issues out of the queue.
-
-Concrete norms:
-
-- **Cap your in-flight PRs.** Land or close existing ones before opening more — don't let the queue balloon faster than maintainers can review.
-- **Always read the bot's diff before pushing.** "I trust the agent" is not enough — agents miss conventions, hallucinate referenced files (see item 1), and sometimes regenerate unrelated areas.
+- **Cap your in-flight PRs.** Land or close existing ones before opening more. If a maintainer hasn't reviewed your last 3 PRs yet, do not open a 4th.
+- **Read the diff before pushing.** "I trust the agent" is not enough — bots miss conventions, hallucinate referenced files, and sometimes regenerate unrelated areas. Skim every change.
 - **No "drive-by" repo-wide refactors.** If the agent suggests one, open ONE small PR with the proposal first, get sign-off, then expand.
-- **Take responsibility for what your bot ships.** PRs authored by a bot you operate are *your* PRs — your CLA, your review feedback to address, your closes-link to file.
-
-## Pull requests
-
-- Keep PRs focused — one feature or fix per PR
-- Test your changes locally before submitting
-- Update README.md if you add user-facing features
-- Run `npx tsc --noEmit` to verify TypeScript compiles
-- Check for lazy imports if your code reads from `.env` — static ESM imports resolve before module-level code runs
-
-### Review process
-PRs are reviewed by a maintainer (or a maintainer's bot). Reviews check for:
-- Correctness and test coverage
-- Import strategy (lazy vs static — avoid breaking env var reads)
-- Default-value changes that could affect existing behavior
-- Security: no hardcoded credentials, sandbox compliance for non-owner paths
-- No unnecessary code — don't add features beyond what was asked
+- **Take responsibility for what your bot ships.** Its PRs are *your* PRs — your CLA, your review feedback to address, your closes-link to file. If a maintainer closes the PR as duplicate / not-planned / scope-drift, that's data — diagnose the root cause before re-filing.
 
 ## Community
 

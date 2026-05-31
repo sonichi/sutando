@@ -2827,6 +2827,15 @@ async def _handle_discord_message(message, force=False):
     # line into the task file's k:v shape (per qingyun review on #1077).
     channel_name = (getattr(message.channel, "name", None) or "DM").replace("\n", " ")
     guild_name = (message.guild.name if message.guild else "DM").replace("\n", " ")
+    # When this message is a reply, emit the parent's id so the core agent can
+    # re-fetch the full original on demand rather than relying on the lossy
+    # 400-char `[Replying to ...]` snippet. Mirrors how the official Claude
+    # Discord plugin works (reference by message_id + fetch).
+    parent_msg_line = (
+        f"parent_message_id: {message.reference.message_id}\n"
+        if getattr(message, "reference", None) and message.reference.message_id
+        else ""
+    )
     task_file.write_text(
         f"id: {task_id}\n"
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
@@ -2836,6 +2845,7 @@ async def _handle_discord_message(message, force=False):
         f"channel_name: {channel_name}\n"
         f"guild_name: {guild_name}\n"
         f"source_message_id: {message.id}\n"
+        f"{parent_msg_line}"
         f"user_id: {message.author.id}\n"
         f"access_tier: {access_tier}\n"
         f"priority: {priority}\n"

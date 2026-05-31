@@ -8,6 +8,13 @@ name: cla-recheck-on-push
 # which we don't want. This workflow fires the recheck comment automatically
 # on every push to an open PR, so the bot re-runs without human action.
 #
+# Dedup: before posting a fresh `@cla-assistant check` comment, delete any
+# prior comments authored by `github-actions[bot]` whose body is exactly that
+# trigger. CLA-Assistant fires on `issue_comment.created`, so a freshly-posted
+# comment still re-triggers — we just stop the pile-up across N force-pushes
+# (incident 2026-05-30: PR #1348 accumulated 30+ identical recheck comments
+# after 8 force-pushes during iteration).
+#
 # See CONTRIBUTING.md §6 "After update-branch, CLA-Assistant may not auto-rerun".
 
 on:
@@ -16,6 +23,7 @@ on:
 
 permissions:
   pull-requests: write
+  issues: write
 
 jobs:
   recheck:
@@ -24,9 +32,34 @@ jobs:
       - uses: actions/github-script@v7
         with:
           script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issue_number = context.payload.pull_request.number;
+            const TRIGGER_BODY = '@cla-assistant check';
+
+            // Delete prior workflow-authored CLA-recheck comments to avoid pile-up.
+            // Paginate so PRs with >100 comments are handled correctly.
+            const priors = await github.paginate(
+              github.rest.issues.listComments,
+              { owner, repo, issue_number, per_page: 100 }
+            );
+            const stale = priors.filter(c =>
+              c.user.login === 'github-actions[bot]' &&
+              (c.body || '').trim() === TRIGGER_BODY
+            );
+            for (const c of stale) {
+              try {
+                await github.rest.issues.deleteComment({
+                  owner, repo, comment_id: c.id
+                });
+              } catch (err) {
+                // Tolerate concurrent-delete / not-found — best-effort cleanup.
+                core.warning(`could not delete comment ${c.id}: ${err.message}`);
+              }
+            }
+
+            // Post the fresh recheck trigger. cla-assistant.io listens to
+            // issue_comment.created and re-runs license/cla on receipt.
             await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.payload.pull_request.number,
-              body: '@cla-assistant check'
+              owner, repo, issue_number, body: TRIGGER_BODY
             });
