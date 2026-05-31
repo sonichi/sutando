@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Idempotently install the SessionStop hook that pairs with /catchup.
+# Idempotently install the SessionEnd hook that pairs with /catchup.
 #
 # /catchup reads from session-state.md to know what the previous session was
 # doing. That file is written by `src/session-handoff.sh` — currently triggered
@@ -7,13 +7,13 @@
 # without a compaction in between, the file stays at "last compact" instead
 # of "last close", losing the most-recent session window.
 #
-# This hook makes session-handoff.sh also fire on SessionStop, closing the
+# This hook makes session-handoff.sh also fire on SessionEnd, closing the
 # gap.
 #
 # REPO resolution: the previous version baked `${SUTANDO_REPO_DIR:-$HOME/Desktop/sutando}`
 # into the hook command verbatim, so machines without SUTANDO_REPO_DIR set
 # AND without a checkout at ~/Desktop/sutando silently no-op'd every
-# SessionStop. (Real incident 2026-05-23 on Mac Studio.) We now resolve REPO
+# SessionEnd. (Real incident 2026-05-23 on Mac Studio.) We now resolve REPO
 # at install time using the same probe heuristic as catchup-after-startup.sh
 # and bake the literal path into the hook — no runtime probe burden, and a
 # misconfig fails loudly at install instead of silently at hook fire.
@@ -54,7 +54,7 @@ p = "$SETTINGS"
 cmd = '''$HOOK_CMD'''
 s = json.load(open(p))
 hooks = s.setdefault('hooks', {})
-ss = hooks.setdefault('SessionStop', [])
+ss = hooks.setdefault('SessionEnd', [])
 
 # Match the existing shape: list of {hooks: [{type:command, command:...}]} groups.
 # We add a single group with our one command, unless an equivalent already exists.
@@ -66,10 +66,10 @@ def has_cmd(groups, cmd):
     return False
 
 if has_cmd(ss, cmd):
-    print("SessionStop hook already installed — no changes")
+    print("SessionEnd hook already installed — no changes")
 else:
     ss.append({'hooks': [{'type': 'command', 'command': cmd}]})
     json.dump(s, open(p, 'w'), indent=2)
-    print("installed SessionStop hook → " + p)
+    print("installed SessionEnd hook → " + p)
     print("hook command:", cmd)
 PYEOF
