@@ -81,6 +81,10 @@ case "$cmd" in
             "$TEMPLATE" > "$DEST"
         bootout_if_loaded
         launchctl bootstrap "$DOMAIN" "$DEST"
+        # If Sutando.app was already running before install, the launchd-spawned
+        # instance exits cleanly via singleton-detection; kickstart forces
+        # launchd to take ownership so KeepAlive applies. Idempotent.
+        launchctl kickstart "$SERVICE" >/dev/null 2>&1 || true
         echo "  Loaded via $SERVICE"
         echo
         echo "Sutando.app is now launchd-supervised."
@@ -106,6 +110,7 @@ case "$cmd" in
             echo "  (no plist on disk; nothing to remove)"
         fi
         echo "Done."
+        echo "  Note: this also terminated the running Sutando.app. Run \`open Sutando.app\` to relaunch unmanaged."
         ;;
     --status|status)
         echo "Service: $SERVICE"
