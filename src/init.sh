@@ -23,6 +23,20 @@ if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
   WORKSPACE="${SUTANDO_WORKSPACE/#\~/$HOME}"
 else
   WORKSPACE="$HOME/.sutando/workspace"
+  # Surface the silent-fallback bug class (see PR #1367/#1368): if .env
+  # defines SUTANDO_WORKSPACE but this process never got it (e.g. init.sh
+  # invoked by a bootstrap path that skips startup.sh's .env-source), the
+  # fallback lands in ~/.sutando/workspace/ while the rest of the fleet
+  # uses the override → split-brain. One stderr line per init.sh run
+  # makes the miss visible. We do NOT auto-honor the .env value here —
+  # only surface the mismatch.
+  if [ -f "$REPO/.env" ]; then
+    _env_val=$(grep -E '^SUTANDO_WORKSPACE=' "$REPO/.env" 2>/dev/null | head -1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'\$//" -e "s|^~|$HOME|")
+    if [ -n "$_env_val" ] && [ "$_env_val" != "$WORKSPACE" ]; then
+      echo "workspace: SUTANDO_WORKSPACE is unset in process env, falling back to $WORKSPACE. NOTE: .env declares SUTANDO_WORKSPACE='$_env_val' which is NOT being honored here — source .env or export the var before this process to avoid split-brain with other services." >&2
+    fi
+    unset _env_val
+  fi
 fi
 
 case "$MODE" in
