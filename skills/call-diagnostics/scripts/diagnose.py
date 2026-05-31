@@ -113,8 +113,11 @@ def _load_from_sqlite(call_sid=None, last_n=1):
             d["sessionId"] = d.pop("session_id") or d["callSid"]
             d["isOwner"] = bool(d.pop("is_owner")) if d.get("is_owner") is not None else None
             d["isMeeting"] = bool(d.pop("is_meeting")) if d.get("is_meeting") is not None else None
-            source = d.get("source") or "phone"
-            d["events"] = _load_session_events(db, d["sessionId"], d["callSid"])
+            # Normalize source for surface-table lookup: recordSession() stores
+            # discord voice as `discord-voice` (hyphen) but the per-source table
+            # is `discord_voice` (underscore). (#1357 review — Echo)
+            source = (d.get("source") or "phone").replace("-", "_")
+            d["events"] = _load_session_events(db, source, d["sessionId"], d["callSid"])
             d["toolCalls"] = _load_session_tool_calls(db, source, d["sessionId"], d["callSid"])
             out.append(d)
         db.close()
@@ -127,28 +130,53 @@ def _load_from_sqlite(call_sid=None, last_n=1):
         return None
 
 
-def _load_session_events(db, session_id, call_sid):
-    """Fetch ordered events for a session from `session_events`.
+def _load_session_events(db, source, session_id, call_sid):
+    """Ordered events for a session, in the legacy jsonl `events` shape
+    ({timestamp, event}). Combines two sources:
 
-    Returns a list of {timestamp, event} dicts matching the legacy jsonl
-    `events` shape. Joins on session_id when present, falling back to
-    call_sid (older rows may have one populated and not the other)."""
+      1. lifecycle events from `session_events` (event_name), and
+      2. reconstructed turn events from the per-source surface table
+         (`phone`/`voice`/`discord_voice`): `user` -> `caller:<text>`,
+         `agent` -> `sutando:<text>`, `tool_call` -> `tool_call:<name>`.
+
+    (2) is required because `session_events` deliberately omits the
+    user/agent/tool_call rows (conversation-store.ts) — but diagnose()'s
+    detectors key off exactly those `caller:` / `sutando:` / `tool_call:`
+    prefixes, so without the surface-table reconstruction every detector is
+    blind (#1357 review — Echo). Surface tables key on `session_id`, which for
+    phone holds the call_sid; we match either."""
+    rows = []
     try:
         cur = db.execute(
-            "SELECT ts_unix, event_name FROM session_events "
-            "WHERE session_id = ? OR call_sid = ? "
-            "ORDER BY ts_unix ASC",
+            "SELECT ts_unix, event_name AS detail FROM session_events "
+            "WHERE session_id = ? OR call_sid = ?",
             (session_id, call_sid),
         )
-        return [
-            {
-                "timestamp": datetime.fromtimestamp(row["ts_unix"]).isoformat() + "Z",
-                "event": row["event_name"],
-            }
-            for row in cur.fetchall()
-        ]
+        rows.extend((r["ts_unix"], r["detail"]) for r in cur.fetchall())
     except Exception:
-        return []
+        pass
+    table = {"phone": "phone", "voice": "voice", "discord_voice": "discord_voice"}.get(source)
+    if table:
+        prefix = {"user": "caller:", "agent": "sutando:", "tool_call": "tool_call:"}
+        try:
+            cur = db.execute(
+                f"SELECT ts_unix, kind, text FROM {table} "
+                "WHERE kind IN ('user','agent','tool_call') "
+                "AND (session_id = ? OR session_id = ?) "
+                "ORDER BY ts_unix ASC",
+                (session_id, call_sid),
+            )
+            for r in cur.fetchall():
+                pre = prefix.get(r["kind"])
+                if pre is not None:
+                    rows.append((r["ts_unix"], pre + (r["text"] or "")))
+        except Exception:
+            pass
+    rows.sort(key=lambda x: x[0])
+    return [
+        {"timestamp": datetime.fromtimestamp(ts).isoformat() + "Z", "event": detail}
+        for ts, detail in rows
+    ]
 
 
 def _load_session_tool_calls(db, source, session_id, call_sid):
@@ -165,23 +193,16 @@ def _load_session_tool_calls(db, source, session_id, call_sid):
     if table is None:
         return []
     try:
+        # Surface tables key the per-turn rows on `session_id`, which for phone
+        # holds the call_sid; match either so phone calls (session_id null on the
+        # sessions row) still line up. (#1357 review — Echo)
         cur = db.execute(
             f"SELECT ts_unix, text, duration_ms FROM {table} "
-            "WHERE kind = 'tool_call' AND session_id = ? "
+            "WHERE kind = 'tool_call' AND (session_id = ? OR session_id = ?) "
             "ORDER BY ts_unix ASC",
-            (session_id,),
+            (session_id, call_sid),
         )
         rows = cur.fetchall()
-        if not rows and call_sid and call_sid != session_id:
-            # Some older rows key only on call_sid in the session_id column
-            # via the bridge — try the call_sid as a fallback before giving up.
-            cur = db.execute(
-                f"SELECT ts_unix, text, duration_ms FROM {table} "
-                "WHERE kind = 'tool_call' AND session_id = ? "
-                "ORDER BY ts_unix ASC",
-                (call_sid,),
-            )
-            rows = cur.fetchall()
         return [
             {
                 "timestamp": datetime.fromtimestamp(row["ts_unix"]).isoformat() + "Z",
