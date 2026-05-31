@@ -42,7 +42,7 @@ Sections that come up empty print a short "(none)" rather than getting dropped, 
 
 Catchup reads `session-state.md` to learn what the previous session was doing at the moment it ended. Out of the box, that file is written **only** by the `PreCompact` hook in `src/session-handoff.sh` — so if the previous session exited via ⌘Q (or crashed) without a compaction in between, the file is stale: it reflects the last compact, not the last close. The most-recent N-minute window is then invisible to the next session's catchup.
 
-Closing that gap = adding a **SessionStop** hook that fires the same `session-handoff.sh`. After install, `session-state.md` always reflects the latest close (compact OR clean exit), and catchup gets a freshest possible briefing.
+Closing that gap = adding a **SessionEnd** hook that fires the same `session-handoff.sh`. After install, `session-state.md` always reflects the latest close (compact OR clean exit), and catchup gets a freshest possible briefing.
 
 ```bash
 bash ~/.claude/skills/catchup-after-startup/scripts/install-hook.sh
@@ -51,7 +51,7 @@ bash ~/.claude/skills/catchup-after-startup/scripts/install-hook.sh
 The installer is idempotent — safe to re-run. It edits `~/.claude/settings.json` and adds:
 
 ```json
-"SessionStop": [{
+"SessionEnd": [{
   "hooks": [{
     "type": "command",
     "command": "bash \"${SUTANDO_REPO_DIR:-$HOME/Desktop/sutando}/src/session-handoff.sh\" \"${TRANSCRIPT_PATH:-}\""
@@ -85,7 +85,7 @@ The voice/phone/discord activity section queries `voice` / `phone` / `discord_vo
 
 ## What it does NOT recover
 
-- **In-flight reasoning that never hit disk** during the previous session ("I was about to do X but hadn't said it yet"). Out of scope without a finer-grained checkpoint mechanism. Mitigated by the SessionStop hook (separate followup) which forces a session-handoff snapshot on clean exit, not just PreCompact.
+- **In-flight reasoning that never hit disk** during the previous session ("I was about to do X but hadn't said it yet"). Out of scope without a finer-grained checkpoint mechanism. Mitigated by the SessionEnd hook (separate followup) which forces a session-handoff snapshot on clean exit, not just PreCompact.
 - **The model's working memory / vibe / rapport.** Catchup gives data, not feel.
 - **Events from before the time window.** Widen with `/catchup-after-startup 24` or `/catchup-after-startup 168` (a week).
 

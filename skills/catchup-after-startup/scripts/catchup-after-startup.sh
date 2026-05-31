@@ -70,7 +70,7 @@ fi
 # 1b. Previous-session transcript (Claude Code project .jsonl)
 #
 # session-state.md is a 50-line summary written by session-handoff.sh, which
-# only fires if the PreCompact / SessionStop hooks are wired AND succeed.
+# only fires if the PreCompact / SessionEnd hooks are wired AND succeed.
 # Both have failed in practice (Mac Studio 2026-05-23 incident: hook
 # pointed at a non-existent default path → session-state.md never written
 # → catchup's most useful section was empty for weeks). The Claude Code
