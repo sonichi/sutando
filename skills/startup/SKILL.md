@@ -51,7 +51,7 @@ touch "${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}/state/proactive-loop-start
 
 **Why immediately after step 1, not at step 4 (the end):** `/schedule-crons` step 0 re-checks the sentinel and re-runs `/catchup-after-startup` if it's absent. If we delay the touch to step 4, the sentinel is missing when `/schedule-crons` runs → catchup fires a SECOND time on every fresh start. Per qingyun-sutando review on #1072 (2026-05-23 22:18Z). The touch is between step 1 and step 2 so that `/task-orphan-check` (step 2) and `/schedule-crons` (step 3) both see the same touched-sentinel state — symmetric.
 
-The sentinel is cleared by the `SessionStop` hook in `src/session-handoff.sh` so the next fresh session re-runs catchup. Symmetric with the existing logic in `/catchup-after-startup`'s install-hook.
+The sentinel is cleared by the `SessionEnd` hook in `src/session-handoff.sh` so the next fresh session re-runs catchup. Symmetric with the existing logic in `/catchup-after-startup`'s install-hook.
 
 ### Step 2 — Task orphan check (optional, sentinel-guarded)
 
