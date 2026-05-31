@@ -62,6 +62,12 @@ SEND_ALLOWED_ROOTS: tuple[str, ...] = (
     str(_REPO / "docs"),
     str(Path.home() / "Desktop" / "iclr-backups"),
     str(Path.home() / "Documents" / "sutando-launch-assets"),
+    # Sutando-skills sync: skill-produced renders + assets (e.g.
+    # make-wire-episode workspace mp4s) so bots can attach them via
+    # [file:] without copying to results/notes first. Whole tree is
+    # under owner control (git-synced repo + local-only workspace);
+    # no secrets here.
+    str(Path.home() / ".sutando-skills-sync"),
 )
 
 # Prefix forms — files whose realpath starts with any of these strings
