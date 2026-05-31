@@ -66,7 +66,17 @@ HALLUCINATION_PHRASES = [
 
 def _load_from_sqlite(call_sid=None, last_n=1):
     """Query sessions table from conversation.sqlite. Returns dicts matching
-    the legacy jsonl shape (callSid/sessionId/timestamp/events/toolCalls)."""
+    the legacy jsonl shape (callSid/sessionId/timestamp/events/toolCalls).
+
+    Issue #1357 fix (2026-05-31): the previous SELECT referenced columns
+    `tool_calls`, `events` that don't exist on the current `sessions` schema
+    (a schema rev that never landed). Events live in the `session_events`
+    table joined by `session_id`; tool-call aggregation is reconstructed
+    from per-source transcript tables (`phone` / `voice` / `discord_voice`)
+    where `kind='tool_call'` rows carry the tool name in `text` and the
+    duration in `duration_ms`. Mini's "minimum diff" suggestion from the
+    issue — keeps the downstream detector contract unchanged.
+    """
     if not SQLITE_PATH.exists():
         return None
     try:
@@ -74,7 +84,7 @@ def _load_from_sqlite(call_sid=None, last_n=1):
         db.row_factory = sqlite3.Row
         sql = (
             "SELECT ts_unix, source, session_id, call_sid, caller, is_owner, is_meeting, "
-            "duration_ms, transcript_lines, tool_count, pending_tasks, tool_calls, events "
+            "duration_ms, transcript_lines, tool_count, pending_tasks "
             "FROM sessions "
         )
         params = []
@@ -91,7 +101,6 @@ def _load_from_sqlite(call_sid=None, last_n=1):
         if not call_sid and last_n:
             sql = "SELECT * FROM (" + sql + f") ORDER BY ts_unix DESC LIMIT {int(last_n)}"
         rows = db.execute(sql, params).fetchall()
-        db.close()
         out = []
         for r in rows:
             d = dict(r)
@@ -104,9 +113,11 @@ def _load_from_sqlite(call_sid=None, last_n=1):
             d["sessionId"] = d.pop("session_id") or d["callSid"]
             d["isOwner"] = bool(d.pop("is_owner")) if d.get("is_owner") is not None else None
             d["isMeeting"] = bool(d.pop("is_meeting")) if d.get("is_meeting") is not None else None
-            d["toolCalls"] = json.loads(d.pop("tool_calls")) if d.get("tool_calls") else []
-            d["events"] = json.loads(d.pop("events")) if d.get("events") else []
+            source = d.get("source") or "phone"
+            d["events"] = _load_session_events(db, d["sessionId"], d["callSid"])
+            d["toolCalls"] = _load_session_tool_calls(db, source, d["sessionId"], d["callSid"])
             out.append(d)
+        db.close()
         out.sort(key=lambda c: c.get("timestamp", ""))
         if call_sid:
             return out
@@ -114,6 +125,73 @@ def _load_from_sqlite(call_sid=None, last_n=1):
     except Exception as e:
         print(f"  sqlite load failed: {e}", file=sys.stderr)
         return None
+
+
+def _load_session_events(db, session_id, call_sid):
+    """Fetch ordered events for a session from `session_events`.
+
+    Returns a list of {timestamp, event} dicts matching the legacy jsonl
+    `events` shape. Joins on session_id when present, falling back to
+    call_sid (older rows may have one populated and not the other)."""
+    try:
+        cur = db.execute(
+            "SELECT ts_unix, event_name FROM session_events "
+            "WHERE session_id = ? OR call_sid = ? "
+            "ORDER BY ts_unix ASC",
+            (session_id, call_sid),
+        )
+        return [
+            {
+                "timestamp": datetime.fromtimestamp(row["ts_unix"]).isoformat() + "Z",
+                "event": row["event_name"],
+            }
+            for row in cur.fetchall()
+        ]
+    except Exception:
+        return []
+
+
+def _load_session_tool_calls(db, source, session_id, call_sid):
+    """Fetch ordered tool_call rows for a session from the source-specific
+    transcript table (`phone` / `voice` / `discord_voice`).
+
+    Each row has `kind='tool_call'`, the tool name in `text`, and duration
+    in `duration_ms`. Returns a list of {timestamp, name, durationMs} dicts
+    matching the legacy jsonl `toolCalls` shape."""
+    # Only these source tables carry per-turn rows including tool_call kind.
+    # If the source is unrecognized, return empty rather than risking a SQL
+    # injection on the table name.
+    table = {"phone": "phone", "voice": "voice", "discord_voice": "discord_voice"}.get(source)
+    if table is None:
+        return []
+    try:
+        cur = db.execute(
+            f"SELECT ts_unix, text, duration_ms FROM {table} "
+            "WHERE kind = 'tool_call' AND session_id = ? "
+            "ORDER BY ts_unix ASC",
+            (session_id,),
+        )
+        rows = cur.fetchall()
+        if not rows and call_sid and call_sid != session_id:
+            # Some older rows key only on call_sid in the session_id column
+            # via the bridge — try the call_sid as a fallback before giving up.
+            cur = db.execute(
+                f"SELECT ts_unix, text, duration_ms FROM {table} "
+                "WHERE kind = 'tool_call' AND session_id = ? "
+                "ORDER BY ts_unix ASC",
+                (call_sid,),
+            )
+            rows = cur.fetchall()
+        return [
+            {
+                "timestamp": datetime.fromtimestamp(row["ts_unix"]).isoformat() + "Z",
+                "name": row["text"] or "(unknown)",
+                "durationMs": row["duration_ms"] or 0,
+            }
+            for row in rows
+        ]
+    except Exception:
+        return []
 
 
 def load_calls(call_sid=None, last_n=1):
