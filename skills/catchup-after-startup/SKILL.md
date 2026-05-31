@@ -61,6 +61,26 @@ The installer is idempotent — safe to re-run. It edits `~/.claude/settings.jso
 
 Requires `SUTANDO_REPO_DIR` env or a checkout at `~/Desktop/sutando` (the same convention `session-handoff.sh` uses for auto-detect).
 
+### Migrating from a pre-#1366 install (`SessionStop` → `SessionEnd`)
+
+Before [#1366](https://github.com/sonichi/sutando/pull/1366) `install-hook.sh` registered the hook under the event name `SessionStop` — which Claude Code silently no-op'd (`Unknown hook event 'SessionStop' was ignored`). If you installed before that PR merged, your `~/.claude/settings.json` still carries the dead key.
+
+Re-run the installer:
+
+```bash
+bash ~/.claude/skills/catchup-after-startup/scripts/install-hook.sh
+```
+
+It now detects any stale `SessionStop` entry whose command references `session-handoff.sh`, removes it, and adds a fresh `SessionEnd` entry pointing at the current resolved repo. Output will include `migrated N stale session-handoff.sh hook(s) from SessionStop → SessionEnd`. The migration is conservative — unrelated `SessionStop` hooks (if any) are left in place.
+
+Verify:
+
+```bash
+python3 -c 'import json; s=json.load(open("'"$HOME"'/.claude/settings.json")); h=s.get("hooks",{}); print("SessionEnd:", json.dumps(h.get("SessionEnd"), indent=2)); print("SessionStop:", json.dumps(h.get("SessionStop")))'
+```
+
+`SessionEnd` should list the `session-handoff.sh` command; `SessionStop` should be absent or contain only unrelated hooks.
+
 **Without the hook** catchup still works — you just lose the last few minutes of the previous session's narrative when that session ended outside a compact. The rest (open PRs, in-flight tasks, sqlite, conversation.log, build_log) is real-time persisted and recovers regardless.
 
 ## Wiring for auto-invocation (operator-side, NOT in this PR)

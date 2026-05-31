@@ -54,6 +54,33 @@ p = "$SETTINGS"
 cmd = '''$HOOK_CMD'''
 s = json.load(open(p))
 hooks = s.setdefault('hooks', {})
+
+# Migration (PR #1366 followup): pre-rename installs registered the hook under
+# the invalid event name 'SessionStop' — Claude Code silently no-op'd them
+# ("Unknown hook event 'SessionStop' was ignored"). Detect any stale
+# SessionStop entry whose command references session-handoff.sh and drop it;
+# the install path below adds a fresh SessionEnd entry with the current
+# resolved REPO. Conservative: leaves unrelated SessionStop hooks alone.
+ss_old = hooks.get('SessionStop', [])
+migrated = 0
+ss_old_clean = []
+for g in ss_old:
+    other_hooks = []
+    for h in (g.get('hooks') or []):
+        c = (h.get('command') or '') if h.get('type') == 'command' else ''
+        if 'session-handoff.sh' in c:
+            migrated += 1
+        else:
+            other_hooks.append(h)
+    if other_hooks:
+        ss_old_clean.append({'hooks': other_hooks})
+if migrated:
+    if ss_old_clean:
+        hooks['SessionStop'] = ss_old_clean
+    else:
+        hooks.pop('SessionStop', None)
+    print(f"migrated {migrated} stale session-handoff.sh hook(s) from SessionStop → SessionEnd")
+
 ss = hooks.setdefault('SessionEnd', [])
 
 # Match the existing shape: list of {hooks: [{type:command, command:...}]} groups.
@@ -65,8 +92,11 @@ def has_cmd(groups, cmd):
                 return True
     return False
 
-if has_cmd(ss, cmd):
+if has_cmd(ss, cmd) and not migrated:
     print("SessionEnd hook already installed — no changes")
+elif has_cmd(ss, cmd):
+    json.dump(s, open(p, 'w'), indent=2)
+    print("SessionEnd hook already present; settings.json rewritten to drop the stale SessionStop entry")
 else:
     ss.append({'hooks': [{'type': 'command', 'command': cmd}]})
     json.dump(s, open(p, 'w'), indent=2)
