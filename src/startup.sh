@@ -29,6 +29,28 @@ export SUTANDO_ROOT="$REPO"
 git -C "$REPO" config --unset committer.name 2>/dev/null || true
 git -C "$REPO" config --unset committer.email 2>/dev/null || true
 
+# Fail-fast .env validation BEFORE init.sh. Two reasons must both hold:
+#  1) init.sh resolves the workspace via `${SUTANDO_WORKSPACE/#~/$HOME}` with
+#     fallback to `~/.sutando/workspace/`. If .env carries a SUTANDO_WORKSPACE=
+#     override and we haven't sourced .env yet, init.sh seeds dirs and files
+#     in the wrong location, leaving orphan ~/.sutando/workspace/ skeletons
+#     on first-time installs (hosts without a separate .zshenv export).
+#  2) If .env is missing or required keys are unset, the whole startup is
+#     going to bail anyway — better to exit cleanly here than to run init.sh
+#     + the dependency install + the perms checks first and then bail.
+missing=0
+if [ ! -f .env ]; then
+  echo "  ✗ .env not found — cp .env.example .env and add your keys"
+  missing=1
+else
+  set -a; source .env; set +a
+  if [ -z "$GEMINI_API_KEY" ]; then
+    echo "  ✗ GEMINI_API_KEY not set in .env — get one at https://ai.google.dev"
+    missing=1
+  fi
+fi
+if [ $missing -eq 1 ]; then echo ""; echo "Fix the above and try again."; exit 1; fi
+
 # Auto-bootstrap: create-if-missing files and dirs that the agent + skills
 # expect to exist (logs, state, tasks, results, notes, contextual-chips.json,
 # pending-questions.md, build_log.md, crons.json, …). Idempotent — safe to
@@ -60,7 +82,9 @@ if [ ! -d node_modules ]; then
   fi
 fi
 
-# Check prerequisites
+# Check CLI prerequisites. (.env + required keys were already validated
+# above before init.sh; node/npx/python3/claude/fswatch are checked here
+# because they're not needed for init.sh's bootstrap step.)
 missing=0
 if ! command -v node > /dev/null 2>&1; then echo "  ✗ node not found — brew install node"; missing=1; fi
 if ! command -v npx > /dev/null 2>&1; then echo "  ✗ npx not found — comes with node"; missing=1; fi
@@ -79,12 +103,7 @@ if ! command -v fswatch > /dev/null 2>&1; then
     echo "  ✗ fswatch not found — brew install fswatch"; missing=1
   fi
 fi
-if [ ! -f .env ]; then echo "  ✗ .env not found — cp .env.example .env and add your keys"; missing=1; fi
-# Load .env and check required keys
-if [ -f .env ]; then
-  set -a; source .env; set +a
-  if [ -z "$GEMINI_API_KEY" ]; then echo "  ✗ GEMINI_API_KEY not set in .env — get one at https://ai.google.dev"; missing=1; fi
-fi
+
 if [ $missing -eq 1 ]; then echo ""; echo "Fix the above and try again."; exit 1; fi
 
 # Check macOS permissions (can't grant programmatically, just warn)
