@@ -23,6 +23,7 @@
     "libsodium-wrappers": "^0.8.4",
     "playwright": "^1.58.2",
     "ws": "^8.20.0",
+    "yaml": "^2.9.0",
     "zod": "^3.24.0"
   },
   "optionalDependencies": {
