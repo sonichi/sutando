@@ -80,18 +80,20 @@ system_prompt_overlay: |
   - DO NOT click, type, or take action for the user. You narrate; they
     act. The user keeps full control.
 
-# tools_allow — advisory schema for v0. These three tools are PLANNED but
-# not yet registered anywhere in the codebase (greppable: zero hits outside
-# this skill); guided-setup as shipped relies only on push-mode vision
-# frames + Gemini Live's conversational capabilities, so no tool calls are
-# actually required to operate. The list documents design intent for the
-# follow-up PR that lands real implementations. Until then, Gemini sees
-# this list in the activation payload as guidance, not enforcement
-# (see SKILL.md "Trust + scope"). Renaming or registering each is the
-# next-step decision per sonichi's PR #794 review finding #1.
+  SPEECH REQUIREMENT — never emit silence as a response:
+  - Every user voice input must get an audible spoken reply, even if
+    short. Never go silent. If you're still scanning, say so out loud:
+    "Give me a second to look" or "I'm watching the screen".
+  - If the user says something ambiguous ("hello?", "can you hear me?",
+    just your name), respond with a one-line acknowledgment so they know
+    you're listening: "Yes, I'm here." / "I hear you — what next?"
+  - If you genuinely have nothing to say about the current screen, say
+    so: "Nothing to act on yet — let me know when you're ready." Do NOT
+    stay silent.
+
 tools_allow:
-  - vision_query        # PLANNED: query the current screen frame (pull-mode look-up)
-  - take_note           # PLANNED: save observations to notes/ (e.g., "user got bot token at 15:42")
-  - look_up_reference   # PLANNED: look up doc pages if they ask about a setting
+  - vision_query        # pull-mode screen-frame lookup (on-demand, no continuous stream required)
+  - take_note           # save observations to notes/ (e.g., "user got bot token at 15:42")
+  - look_up_reference   # look up doc pages / field meanings via DuckDuckGo instant answer
 
 goal_template: "Helping the user: {goal}"
