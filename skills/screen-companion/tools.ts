@@ -55,7 +55,7 @@ let activeMode: string | null = null;
 
 // Tools that must always remain available in screen-companion mode:
 // activate_screen_companion (mode-switch), deactivate_screen_companion (exit).
-const ALWAYS_RETAIN = new Set(['activate_screen_companion', 'deactivate_screen_companion']);
+const ALWAYS_RETAIN = new Set(['activate_screen_companion', 'deactivate_screen_companion', 'switch_mode']);
 
 const activateScreenCompanionTool: ToolDefinition = {
 	name: 'activate_screen_companion',
@@ -225,7 +225,7 @@ const takeNoteTool: ToolDefinition = {
 		title: z.string().optional().describe('Short title for the note. Auto-generated from content if omitted.'),
 	}),
 	execution: 'inline',
-	execute(args) {
+	async execute(args) {
 		const { content, title } = (args ?? {}) as { content: string; title?: string };
 		const date = new Date();
 		const dateStr = date.toISOString().slice(0, 10);
