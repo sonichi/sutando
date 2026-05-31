@@ -36,6 +36,15 @@ WS="${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}"
 # CATCHUP_HOURS — the documented `[hours]` arg was silently ignored (Mini #1).
 HOURS="${1:-${CATCHUP_HOURS:-3}}"
 
+# Self-heal any stale SessionStop hooks in ~/.claude/settings.json (PR #1366
+# follow-up). SessionStop is silently no-op'd by Claude Code — every entry
+# under it is dead regardless of what command it invokes — so the migration
+# is a universal key-rename. Runs on every catchup invocation so users don't
+# need to re-run install-hook.sh after the rename event. Idempotent + quiet
+# when nothing to migrate. The same script is also called from install-hook.sh.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+python3 "$HERE/migrate-settings-hooks.py" "$HOME/.claude/settings.json" 2>&1 | sed 's/^/  /' >&2 || true
+
 print_section() { echo; echo "## $1"; echo; }
 say() { echo "$@"; }
 
