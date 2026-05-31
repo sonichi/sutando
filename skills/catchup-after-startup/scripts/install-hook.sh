@@ -18,9 +18,18 @@
 # and bake the literal path into the hook — no runtime probe burden, and a
 # misconfig fails loudly at install instead of silently at hook fire.
 #
+# Pre-rename installs (before #1366) registered the hook under the invalid
+# event name "SessionStop", which Claude Code silently no-ops. The universal
+# key-rename migration lives in migrate-settings-hooks.py — we call it first
+# so every stale SessionStop entry (not just our own) graduates to
+# SessionEnd before we install. catchup-after-startup.sh also calls the same
+# script so the rename self-heals on every fresh session, without the user
+# having to re-run this installer.
+#
 # Safe to re-run — already-installed hooks are detected + skipped.
 set -euo pipefail
 
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SETTINGS="${HOME}/.claude/settings.json"
 
 # Resolve REPO at install time (env wins, else probe common layouts).
@@ -48,8 +57,13 @@ if [ ! -f "$SETTINGS" ]; then
   exit 1
 fi
 
+# Universal SessionStop -> SessionEnd migration (idempotent; quiet if nothing to do).
+# Lives in its own script so catchup-after-startup.sh can auto-call it on every
+# fresh session — see migrate-settings-hooks.py.
+python3 "$HERE/migrate-settings-hooks.py" "$SETTINGS"
+
 python3 <<PYEOF
-import json, sys
+import json, os
 p = "$SETTINGS"
 cmd = '''$HOOK_CMD'''
 s = json.load(open(p))
@@ -65,11 +79,19 @@ def has_cmd(groups, cmd):
                 return True
     return False
 
+# Atomic write — sibling tmp + rename. settings.json is read by every Claude
+# Code session; a half-written file breaks every shell. Mini's #1374 review catch.
+def atomic_write(path, content):
+    tmp = path + ".tmp"
+    with open(tmp, 'w') as f:
+        f.write(content)
+    os.replace(tmp, path)
+
 if has_cmd(ss, cmd):
     print("SessionEnd hook already installed — no changes")
 else:
     ss.append({'hooks': [{'type': 'command', 'command': cmd}]})
-    json.dump(s, open(p, 'w'), indent=2)
+    atomic_write(p, json.dumps(s, indent=2))
     print("installed SessionEnd hook → " + p)
     print("hook command:", cmd)
 PYEOF
