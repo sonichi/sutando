@@ -22,7 +22,9 @@ https://github.com/user-attachments/assets/a86ec34e-3b26-4011-824c-d2d124753c25
 
 ⭐ **If Sutando is useful to you, [star this repo](https://github.com/sonichi/sutando) — it's how other people find it.**
 
-📺 [Watch the vision talk at UC Berkeley →](https://youtu.be/c39fJ2WAj6A?t=7719) — the idea behind Sutando, before it existed.
+| [![Vision talk at UC Berkeley](https://img.youtube.com/vi/c39fJ2WAj6A/mqdefault.jpg)](https://youtu.be/c39fJ2WAj6A?t=7719) | [![The AI agent that presented live](https://img.youtube.com/vi/tisE8YjmLdU/mqdefault.jpg)](https://youtu.be/tisE8YjmLdU) |
+|:---:|:---:|
+| 📺 [Vision talk at UC Berkeley](https://youtu.be/c39fJ2WAj6A?t=7719) — the idea behind Sutando | 🤖 [The AI agent that presented live](https://youtu.be/tisE8YjmLdU) — agentic presentation |
 
 ---
 
