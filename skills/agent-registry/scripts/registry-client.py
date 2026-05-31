@@ -30,14 +30,10 @@ import urllib.request
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SERVICE = os.path.join(SCRIPT_DIR, "registry-service.py")
-
-
-def resolve_workspace():
-    env = os.environ.get("SUTANDO_WORKSPACE")
-    if env:
-        return os.path.abspath(os.path.expanduser(env))
-    return os.path.expanduser("~/.sutando/workspace")
-
+# Shared workspace resolver — handles SessionStart-hook env-miss by falling
+# back to grep of repo .env. See _workspace_resolve.py for the rationale.
+sys.path.insert(0, SCRIPT_DIR)
+from _workspace_resolve import resolve_workspace  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 DISCOVERY_PATH = os.path.join(WORKSPACE, "state", "agent-registry.json")
