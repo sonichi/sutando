@@ -27,6 +27,19 @@ import sys
 from pathlib import Path
 
 
+def _atomic_write(path: Path, content: str) -> None:
+    """Write to a sibling tmp file then os.replace — same-fs atomic on POSIX.
+
+    `~/.claude/settings.json` is read by every Claude Code session for hook
+    config, allowed-tools, etc.; a half-written file breaks every subsequent
+    shell. Crash-during-write becomes "tmp file may be left behind" instead
+    of "settings.json corrupted." Mini's #1374 review catch.
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(content)
+    os.replace(tmp, path)
+
+
 def migrate(settings_path: Path) -> int:
     if not settings_path.exists():
         return 0
@@ -51,7 +64,7 @@ def migrate(settings_path: Path) -> int:
         # isn't a migration event.
         if had_key:
             s["hooks"] = hooks
-            settings_path.write_text(json.dumps(s, indent=2) + "\n")
+            _atomic_write(settings_path, json.dumps(s, indent=2) + "\n")
         return 0
 
     # Ensure SessionEnd exists as a list (handles explicit null).
@@ -88,7 +101,7 @@ def migrate(settings_path: Path) -> int:
             se.append({"hooks": new_hooks})
 
     s["hooks"] = hooks
-    settings_path.write_text(json.dumps(s, indent=2) + "\n")
+    _atomic_write(settings_path, json.dumps(s, indent=2) + "\n")
 
     parts = [f"migrated {moved} SessionStop hook(s) -> SessionEnd"]
     if duplicates:

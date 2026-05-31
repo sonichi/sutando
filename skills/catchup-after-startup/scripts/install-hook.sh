@@ -63,7 +63,7 @@ fi
 python3 "$HERE/migrate-settings-hooks.py" "$SETTINGS"
 
 python3 <<PYEOF
-import json
+import json, os
 p = "$SETTINGS"
 cmd = '''$HOOK_CMD'''
 s = json.load(open(p))
@@ -79,11 +79,19 @@ def has_cmd(groups, cmd):
                 return True
     return False
 
+# Atomic write — sibling tmp + rename. settings.json is read by every Claude
+# Code session; a half-written file breaks every shell. Mini's #1374 review catch.
+def atomic_write(path, content):
+    tmp = path + ".tmp"
+    with open(tmp, 'w') as f:
+        f.write(content)
+    os.replace(tmp, path)
+
 if has_cmd(ss, cmd):
     print("SessionEnd hook already installed — no changes")
 else:
     ss.append({'hooks': [{'type': 'command', 'command': cmd}]})
-    json.dump(s, open(p, 'w'), indent=2)
+    atomic_write(p, json.dumps(s, indent=2))
     print("installed SessionEnd hook → " + p)
     print("hook command:", cmd)
 PYEOF
