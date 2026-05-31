@@ -2,14 +2,14 @@
  * Screen Companion — config loader (shared between activate.ts CLI and
  * the inline tool `activate_guided_setup`).
  *
- * YAML parsing: native via the 'yaml' npm package. (Earlier python3 shell
- * approach broke when no PyYAML was on PATH; the npm dep eliminates that.)
+ * YAML parsing: spawn python3 (avoids adding js-yaml as an npm dep —
+ * same pattern as src/oc-profile-catalog.ts).
  */
 
-import { readFileSync, readdirSync, existsSync } from 'node:fs';
+import { readdirSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parse as parseYamlString } from 'yaml';
+import { spawnSync } from 'node:child_process';
 
 const SKILL_DIR = join(dirname(fileURLToPath(import.meta.url)), '..');
 const CONFIGS_DIR = join(SKILL_DIR, 'configs');
@@ -30,20 +30,29 @@ export interface ScreenCompanionConfig {
 	goal_template?: string;
 }
 
-// YAML parsing: native via the 'yaml' npm package. Earlier versions
-// shelled out to python3 with PyYAML, which broke on fresh macOS installs
-// where neither /usr/bin/python3 nor /opt/homebrew/bin/python3 had PyYAML
-// installed. The 'yaml' npm dep is small, dependency-free at runtime, and
-// removes the PATH-resolution gotcha (LaunchAgent's PATH preferred
-// Homebrew Python, which lacks PyYAML).
+// LaunchAgent's PATH (`/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`) finds
+// Homebrew's python3 first, which has no PyYAML — `import yaml` fails at
+// runtime when activation is triggered from voice. Try a list of common
+// python3 binaries and pick the first one that can import yaml. macOS's
+// `/usr/bin/python3` ships PyYAML by default, so the system Python is the
+// usual winner here.
+const PYTHON_CANDIDATES = ['/usr/bin/python3', '/opt/homebrew/bin/python3', 'python3'];
+const YAML_SCRIPT = 'import sys, json, yaml; print(json.dumps(yaml.safe_load(open(sys.argv[1]))))';
 
 export function parseYaml(path: string): unknown {
-	try {
-		const text = readFileSync(path, 'utf-8');
-		return parseYamlString(text);
-	} catch (e) {
-		throw new Error(`YAML parse failed for ${path}: ${(e as Error).message}`);
+	const errors: string[] = [];
+	for (const py of PYTHON_CANDIDATES) {
+		const result = spawnSync(py, ['-c', YAML_SCRIPT, path], { encoding: 'utf-8' });
+		if (result.error) {
+			errors.push(`${py}: ${result.error.message}`);
+			continue;
+		}
+		if (result.status === 0) return JSON.parse(result.stdout);
+		errors.push(`${py}: ${result.stderr.trim().split('\n').pop()}`);
 	}
+	throw new Error(
+		`YAML parse failed for ${path}: no python3 with PyYAML found. Tried: ${errors.join('; ')}`,
+	);
 }
 
 export function validateConfig(raw: unknown, path: string): ScreenCompanionConfig {

@@ -14,17 +14,9 @@
 // to the owner about screen sharing if vision isn't already streaming.
 
 import { z } from 'zod';
-import { writeFileSync, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { loadConfig, discoverConfigs, renderGoal } from './scripts/load-config.js';
-import { registerVisionOnContributor, callUpdateTools, callRestoreTools, captureSendFrame } from '../../src/vision-tools.js';
-
-function resolveWorkspace(): string {
-	const env = process.env.SUTANDO_WORKSPACE;
-	if (env) return env.replace(/^~/, process.env.HOME ?? '');
-	return join(process.env.HOME ?? '', '.sutando', 'workspace');
-}
+import { registerVisionOnContributor, callUpdateTools, callRestoreTools } from '../../src/vision-tools.js';
 
 // Contributor for the screen-share-started system note. Tells Gemini the
 // screen-companion catalog is available AND names the configs the user can
@@ -55,7 +47,7 @@ let activeMode: string | null = null;
 
 // Tools that must always remain available in screen-companion mode:
 // activate_screen_companion (mode-switch), deactivate_screen_companion (exit).
-const ALWAYS_RETAIN = new Set(['activate_screen_companion', 'deactivate_screen_companion', 'switch_mode']);
+const ALWAYS_RETAIN = new Set(['activate_screen_companion', 'deactivate_screen_companion']);
 
 const activateScreenCompanionTool: ToolDefinition = {
 	name: 'activate_screen_companion',
@@ -166,142 +158,4 @@ const deactivateScreenCompanionTool: ToolDefinition = {
 	},
 };
 
-// --- vision_query -----------------------------------------------------------
-//
-// Pull-mode screen-frame lookup. Captures the current screen and sends it to
-// Gemini as vision input, then returns a prompt for Gemini to answer. Does NOT
-// require push-mode to be running — designed for modes where the user calls it
-// on demand rather than streaming continuously.
-
-const visionQueryTool: ToolDefinition = {
-	name: 'vision_query',
-	description:
-		'Capture the current screen and look at it to answer a specific question. ' +
-		'Use in pull-mode screen-companion sessions when you need to check what\'s on screen without streaming continuously. ' +
-		'Pass question= to frame what you\'re looking for (e.g. "Is the bot token field visible?"). ' +
-		'The frame is sent to your vision context — answer based on what you see.',
-	parameters: z.object({
-		question: z
-			.string()
-			.optional()
-			.describe('What to look for or answer from the current screen. E.g. "Is the OAuth2 scope list visible?" or "What does the error message say?"'),
-	}),
-	execution: 'inline',
-	async execute(args) {
-		const { question } = (args ?? {}) as { question?: string };
-		const r = await captureSendFrame('screen');
-		if (!r.ok) {
-			return {
-				status: 'failed',
-				error: r.error,
-				hint: 'Screen-capture server may not be running. Start it with `bash src/startup.sh`.',
-			};
-		}
-		return {
-			status: 'frame_sent',
-			source: r.source,
-			question: question ?? null,
-			_note: question
-				? `Frame is in your vision context. Answer: ${question}`
-				: 'Frame is in your vision context. Describe what you see and continue the conversation.',
-		};
-	},
-};
-
-// --- take_note --------------------------------------------------------------
-//
-// Save an observation to notes/ with screen-companion frontmatter tag.
-// Uses the workspace notes dir (same as save_note inline tool).
-
-const takeNoteTool: ToolDefinition = {
-	name: 'take_note',
-	description:
-		'Save an observation or note during a screen-companion session. ' +
-		'Use when the user says "remember this", "note that", or when you observe something worth keeping ' +
-		'(e.g. "user got the bot token at 15:42"). ' +
-		'Saves to notes/ with a screen-companion tag and ISO timestamp.',
-	parameters: z.object({
-		content: z.string().describe('The observation or note to save. Plain text, 1–3 sentences.'),
-		title: z.string().optional().describe('Short title for the note. Auto-generated from content if omitted.'),
-	}),
-	execution: 'inline',
-	async execute(args) {
-		const { content, title } = (args ?? {}) as { content: string; title?: string };
-		const date = new Date();
-		const dateStr = date.toISOString().slice(0, 10);
-		const timeStr = date.toISOString().slice(0, 19).replace('T', ' ');
-		const autoTitle = title ?? content.slice(0, 60).replace(/[^a-zA-Z0-9 ]/g, '').trim();
-		const slug = `sc-${date.toISOString().slice(0, 16).replace(/[T:]/g, '-')}-${autoTitle.toLowerCase().slice(0, 30).replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '')}`;
-		const md = `---\ntitle: "${autoTitle}"\ndate: ${dateStr}\ntags: [screen-companion, observation]\n---\n\n*Recorded at ${timeStr}*\n\n${content}\n`;
-		try {
-			const notesDir = join(resolveWorkspace(), 'notes');
-			mkdirSync(notesDir, { recursive: true });
-			writeFileSync(join(notesDir, `${slug}.md`), md);
-			return { status: 'saved', title: autoTitle, slug, path: `notes/${slug}.md` };
-		} catch (e) {
-			return { status: 'failed', error: String(e) };
-		}
-	},
-};
-
-// --- look_up_reference ------------------------------------------------------
-//
-// Look up documentation or reference material for a setting/API/UI element.
-// v1: web search via DuckDuckGo Instant Answer API (no key required), then
-// fall back to fetching the top result URL. Returns a short summary.
-
-const lookUpReferenceTool: ToolDefinition = {
-	name: 'look_up_reference',
-	description:
-		'Look up documentation or reference material for a setting, API field, or UI element the user is confused about. ' +
-		'Use when the user asks what a field means, what value to enter, or what a permission does. ' +
-		'E.g. "What is the \'Bot Token Type\' field in Discord?", "What OAuth scopes do I need for reading DMs?". ' +
-		'Returns a short authoritative summary.',
-	parameters: z.object({
-		query: z.string().describe('The question or term to look up. Be specific: include the product name and context. E.g. "Discord bot token type field meaning".'),
-	}),
-	execution: 'inline',
-	async execute(args) {
-		const { query } = (args ?? {}) as { query: string };
-		try {
-			// DuckDuckGo Instant Answer API — no key, returns JSON with Abstract field
-			const ddgUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
-			const ddgRes = await fetch(ddgUrl, { headers: { 'User-Agent': 'Sutando/1.0' }, signal: AbortSignal.timeout(8_000) });
-			const ddg = await ddgRes.json() as { Abstract?: string; AbstractURL?: string; RelatedTopics?: Array<{ Text?: string; FirstURL?: string }> };
-
-			if (ddg.Abstract && ddg.Abstract.length > 20) {
-				return {
-					status: 'found',
-					summary: ddg.Abstract,
-					source_url: ddg.AbstractURL ?? null,
-					query,
-				};
-			}
-
-			// Fallback: use top RelatedTopic text
-			const related = ddg.RelatedTopics?.find(t => t.Text && t.Text.length > 20);
-			if (related?.Text) {
-				return {
-					status: 'found',
-					summary: related.Text,
-					source_url: related.FirstURL ?? null,
-					query,
-				};
-			}
-
-			return {
-				status: 'not_found',
-				query,
-				hint: `No instant answer found. Suggest the user search "${query}" in their browser, or ask them to read the relevant field label aloud so you can explain from context.`,
-			};
-		} catch (err) {
-			return {
-				status: 'failed',
-				error: (err as Error)?.message ?? String(err),
-				hint: 'Reference lookup failed (network or API error). Explain from context or ask the user to read the field aloud.',
-			};
-		}
-	},
-};
-
-export const tools: ToolDefinition[] = [activateScreenCompanionTool, deactivateScreenCompanionTool, visionQueryTool, takeNoteTool, lookUpReferenceTool];
+export const tools: ToolDefinition[] = [activateScreenCompanionTool, deactivateScreenCompanionTool];

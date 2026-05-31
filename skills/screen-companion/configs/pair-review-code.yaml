@@ -75,16 +75,6 @@ system_prompt_overlay: |
   - Speculate about code you can't see on screen.
   - Run any git or gh commands unprompted.
 
-  SPEECH REQUIREMENT — never emit silence as a response:
-  - Every user voice input must get an audible spoken reply, even if
-    short. Never go silent. If you're still scanning, say so out loud:
-    "Give me a second to look" or "I'm watching the screen".
-  - If the user says something ambiguous ("hello?", "can you hear me?",
-    just your name), respond with a one-line acknowledgment so they know
-    you're listening: "Yes, I'm here." / "I hear you — what next?"
-  - If you genuinely have nothing to say about the current screen, say
-    so: "Nothing concerning on this view so far." Do NOT stay silent.
-
 goal_template: "Reviewing: {goal}"
 
 # tools_allow — advisory (PLANNED, not yet registered). See guided-setup.yaml

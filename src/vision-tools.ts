@@ -430,20 +430,6 @@ async function captureAndSend(source: VisionSource): Promise<{ ok: boolean; erro
 	return { ok: true };
 }
 
-/** Capture a single frame from `sourceName` (default 'screen') and send it to
- *  the active Gemini Live session as vision input. Pull-mode one-shot — does
- *  not require push mode to be running. Returns `{ ok: false }` if no session
- *  is connected or the source is unknown. */
-export async function captureSendFrame(sourceName?: string): Promise<{ ok: boolean; source?: string; error?: string }> {
-	try {
-		const source = resolveSource(sourceName);
-		const r = await captureAndSend(source);
-		return r.ok ? { ok: true, source: source.name } : r;
-	} catch (err) {
-		return { ok: false, error: (err as Error)?.message ?? String(err) };
-	}
-}
-
 async function tick(): Promise<void> {
 	if (inFlight || !activeSource) return; // skip overlap — slow camera or slow disk
 	inFlight = true;
