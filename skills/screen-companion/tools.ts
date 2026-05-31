@@ -18,7 +18,7 @@ import { writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { loadConfig, discoverConfigs, renderGoal } from './scripts/load-config.js';
-import { registerVisionOnContributor, callUpdateTools, callRestoreTools, captureSendFrame } from '../../src/vision-tools.js';
+import { registerVisionOnContributor, callUpdateTools, callRestoreTools, captureSendFrame, getFullToolSurface } from '../../src/vision-tools.js';
 
 function resolveWorkspace(): string {
 	const env = process.env.SUTANDO_WORKSPACE;
@@ -55,7 +55,12 @@ let activeMode: string | null = null;
 
 // Tools that must always remain available in screen-companion mode:
 // activate_screen_companion (mode-switch), deactivate_screen_companion (exit).
-const ALWAYS_RETAIN = new Set(['activate_screen_companion', 'deactivate_screen_companion', 'switch_mode']);
+// `work` (task delegation) and `switch_mode` are NOT inlineTools — they are
+// prepended into the session surface as mainAgentTools (see voice-agent.ts).
+// They must be named here AND the restriction below must filter the full
+// session surface (not inlineTools alone), or they get dropped and become
+// uncallable inside any screen-companion mode (see #1375).
+const ALWAYS_RETAIN = new Set(['activate_screen_companion', 'deactivate_screen_companion', 'switch_mode', 'work']);
 
 const activateScreenCompanionTool: ToolDefinition = {
 	name: 'activate_screen_companion',
@@ -107,11 +112,21 @@ const activateScreenCompanionTool: ToolDefinition = {
 			// isn't registered (e.g. phone-conversation context or tests), the
 			// call is a no-op and advisory mode remains as the fallback.
 			const toolsAllow: string[] = config.tools_allow ?? [];
-			const enforced = callUpdateTools(
+			// Filter the FULL session surface (work / switch_mode / … + inlineTools),
+			// NOT inlineTools alone — otherwise the non-inline mainAgentTools are
+			// dropped and become uncallable in-mode (#1375). getFullToolSurface() is
+			// populated by voice-agent at startup; fall back to inlineTools when the
+			// updater isn't registered (phone-conversation context / tests), matching
+			// the prior behavior.
+			const fullSurface = getFullToolSurface();
+			const restrictSource = fullSurface.length > 0
+				? fullSurface
 				// Import is deferred to avoid a top-level circular dependency;
 				// inlineTools is loaded before this module so by the time execute()
 				// runs it is already settled.
-				(await import('../../src/inline-tools.js')).inlineTools.filter(
+				: (await import('../../src/inline-tools.js')).inlineTools;
+			const enforced = callUpdateTools(
+				restrictSource.filter(
 					t => toolsAllow.includes(t.name) || ALWAYS_RETAIN.has(t.name),
 				),
 			);

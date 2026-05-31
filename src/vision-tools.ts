@@ -217,6 +217,17 @@ export function callRestoreTools(): boolean {
 	return true;
 }
 
+/**
+ * The full tool surface registered at startup (e.g. voice-agent's
+ * `mainAgentTools` = workTool + switchModeTool + … + inlineTools). Empty until
+ * setSessionToolUpdater() runs. Skills that need to RESTRICT the surface should
+ * filter THIS, not `inlineTools` alone — otherwise the non-inline mainAgentTools
+ * (work, switch_mode, …) are silently dropped and become uncallable in-mode.
+ */
+export function getFullToolSurface(): ToolDefinition[] {
+	return fullToolSurface;
+}
+
 function getSendFile(): ((b64: string, mime: string) => void) | null {
 	const t = sessionRef?.transport;
 	if (!t || !t.sendFile) return null;
