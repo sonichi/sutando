@@ -158,7 +158,7 @@ def age_days(published_at: str) -> int:
     return (datetime.now(timezone.utc) - dt).days
 
 
-YT_ID_RE = re.compile(r"(?:youtu\.be/|youtube\.com/watch\?v=)([A-Za-z0-9_-]{11})")
+YT_ID_RE = re.compile(r"(?:youtu\.be/|youtube\.com/(?:watch\?v=|embed/))([A-Za-z0-9_-]{11})")
 
 
 def readme_excluded_ids(readme_text: str) -> set:
