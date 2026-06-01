@@ -2,8 +2,9 @@
 """Submit a use-case to the public sonichi/sutando repo (OSS channel).
 
 Pipeline: validate title framing -> idempotency checks -> open labeled issue
-on sonichi/sutando -> fresh clone -> branch -> write community-use-cases/
-<slug>.md -> commit (CLA identity rules) -> push -> PR. Both halves can be
+on sonichi/sutando -> fresh clone -> branch -> write
+docs/community-use-cases/<slug>.md -> commit (CLA identity rules) -> push ->
+PR. Both halves can be
 opted out via --issue-only / --pr-only.
 
 Reuses REJECT_PATTERNS / validate_title / suggest_reframes from the internal
@@ -169,7 +170,7 @@ def render_pr_file(
     x_url: str | None, linkedin_url: str | None,
     contact: str | None, submitted_at: str,
 ) -> str:
-    """Render the community-use-cases/<slug>.md file body."""
+    """Render the docs/community-use-cases/<slug>.md file body."""
     lines = ["---"]
     lines.append(f'slug: "{_yaml_escape(slug)}"')
     lines.append(f'title: "{_yaml_escape(title)}"')
@@ -301,7 +302,7 @@ def main():
         print("--- ISSUE BODY ---")
         print(issue_body)
         print("--- END ISSUE BODY ---")
-        print(f"--- PR FILE (community-use-cases/{slug}.md) ---")
+        print(f"--- PR FILE (docs/community-use-cases/{slug}.md) ---")
         print(pr_file_text)
         print("--- END PR FILE ---")
         on_fleet = is_chi_fleet()
@@ -353,15 +354,15 @@ def main():
 
         run(["git", "-C", str(clone_dir), "checkout", "-b", branch])
 
-        target_dir = clone_dir / "community-use-cases"
+        target_dir = clone_dir / "docs" / "community-use-cases"
         target_dir.mkdir(parents=True, exist_ok=True)
         target_file = target_dir / f"{slug}.md"
         if target_file.exists():
-            die(f"existing-slug: community-use-cases/{slug}.md already on main")
+            die(f"existing-slug: docs/community-use-cases/{slug}.md already on main")
         target_file.write_text(pr_file_text)
         print(f"wrote {target_file.relative_to(clone_dir)}")
 
-        run(["git", "-C", str(clone_dir), "add", f"community-use-cases/{slug}.md"])
+        run(["git", "-C", str(clone_dir), "add", f"docs/community-use-cases/{slug}.md"])
         run(["git", "-C", str(clone_dir), "commit", "-m",
              f"feat(community-use-cases): submit {slug}"])
         run(["git", "-C", str(clone_dir), "push", "-u", "origin", branch])
