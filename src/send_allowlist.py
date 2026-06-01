@@ -76,14 +76,19 @@ SEND_ALLOWED_PREFIXES: tuple[str, ...] = (
 )
 
 
-def is_path_sendable(fpath: str) -> bool:
+def is_path_sendable(fpath: str, extra_roots: tuple[str, ...] = ()) -> bool:
     """True iff `fpath` is a regular file AND its `realpath` resolves
-    under one of ``SEND_ALLOWED_ROOTS`` or starts with one of
-    ``SEND_ALLOWED_PREFIXES``.
+    under one of ``SEND_ALLOWED_ROOTS`` (+ any surface-specific
+    ``extra_roots``) or starts with one of ``SEND_ALLOWED_PREFIXES``.
 
     Single source of truth for the file-attachment-delivery policy.
     Mirrors the shape used by ``_is_path_sendable`` in both call sites
     pre-extract.
+
+    ``extra_roots`` lets a surface inherit the canonical base policy while
+    adding its own root (e.g. slack-bridge's ``INBOX_DIR``) without
+    re-implementing the predicate and silently drifting from the base —
+    the divergence this module exists to prevent.
 
     A non-existent path, a symlink to outside the allowlist (caught by
     realpath collapse), or a path that simply doesn't match any
@@ -96,7 +101,7 @@ def is_path_sendable(fpath: str) -> bool:
         real = os.path.realpath(fpath)
     except OSError:
         return False
-    for root in SEND_ALLOWED_ROOTS:
+    for root in (*SEND_ALLOWED_ROOTS, *extra_roots):
         root_real = os.path.realpath(root)
         if real == root_real or real.startswith(root_real + os.sep):
             return True

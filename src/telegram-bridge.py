@@ -40,37 +40,13 @@ REPO = resolve_workspace()
 TASKS_DIR = REPO / "tasks"
 RESULTS_DIR = REPO / "results"
 
-# Allowlist for paths that may be sent via Telegram [file: /path] markers.
-# Mirrors _is_path_sendable() in discord-bridge.py.
-SEND_ALLOWED_ROOTS = (
-    str(REPO / "results"),
-    str(REPO / "notes"),
-    str(REPO / "docs"),
-)
-SEND_ALLOWED_PREFIXES = (
-    "/tmp/sutando-",
-    "/private/tmp/sutando-",
-    "/tmp/echo-",
-    "/private/tmp/echo-",
-)
-
-
-def _is_path_sendable(fpath: str) -> bool:
-    """True iff `fpath` is a real file AND resolves under an allowed root."""
-    if not os.path.isfile(fpath):
-        return False
-    try:
-        real = os.path.realpath(fpath)
-    except OSError:
-        return False
-    for root in SEND_ALLOWED_ROOTS:
-        root_real = os.path.realpath(root)
-        if real == root_real or real.startswith(root_real + os.sep):
-            return True
-    for prefix in SEND_ALLOWED_PREFIXES:
-        if real.startswith(prefix):
-            return True
-    return False
+# Allowlist for paths sendable via Telegram [file: /path] markers. Use the
+# single source of truth in src/send_allowlist.py (shared with discord-bridge +
+# dm-result) instead of a local tuple. The previous hand-rolled list silently
+# dropped attachments from the private-notes dir, ~/Desktop/iclr-backups, and
+# ~/Documents/sutando-launch-assets that Discord could send — the exact
+# divergence send_allowlist.py exists to prevent.
+from send_allowlist import is_path_sendable as _is_path_sendable  # noqa: E402
 
 
 # --- Config loading (independent of _is_path_sendable above) ---

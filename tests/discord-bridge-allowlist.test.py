@@ -56,8 +56,12 @@ def main() -> int:
     # inline in discord-bridge.py (legacy) or in src/send_allowlist.py
     # (post-refactor, PR #1029) — both shapes satisfy the contract. We
     # scan both sources and use whichever has the function definition.
+    # `fpath: str` may be followed by additional optional params (e.g.
+    # `extra_roots` added so slack-bridge can inherit the base policy + its
+    # INBOX_DIR — see src/send_allowlist.py). Tolerate any same-line params
+    # after `fpath: str` so the canonical signature still matches.
     HELPER_RE = re.compile(
-        r"def (?:_)?is_path_sendable\(fpath:\s*str\)\s*->\s*bool:\s*\n([\s\S]{0,2000}?)(?=\n\ndef |\n\n[A-Z]|\Z)",
+        r"def (?:_)?is_path_sendable\(fpath:\s*str[^\n]*?\)\s*->\s*bool:\s*\n([\s\S]{0,2000}?)(?=\n\ndef |\n\n[A-Z]|\Z)",
     )
     helper_body = None
     found_in = None
