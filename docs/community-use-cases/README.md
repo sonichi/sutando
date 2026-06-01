@@ -14,7 +14,7 @@ promotes it directly or asks for a small reframe.
 
 ### 2. Pull request (structured, gets you credit on merge)
 
-Add a file to `community-use-cases/<slug>.md` matching the schema
+Add a file to `docs/community-use-cases/<slug>.md` matching the schema
 below. CLA-Assistant gates the PR (one-time signature). On merge, a
 sync job picks up the entry and stages a PR against the showcase site.
 
@@ -25,11 +25,11 @@ sync job picks up the entry and stages a PR against the showcase site.
 slug: your-ai-does-laundry          # lowercased, dashed
 title: "Your AI does your laundry while you're at work"
 summary: "One sentence that reads on the tile + detail page."
-videoUrl: /community-use-cases/videos/your-ai-does-laundry.mp4  # optional
+videoUrl: /docs/community-use-cases/videos/your-ai-does-laundry.mp4  # optional
 youtubeId: ABCDEFG1234               # optional
 xUrl: https://x.com/you/status/...   # optional
 linkedinUrl: https://www.linkedin.com/...  # optional
-thumbnail: /community-use-cases/thumbnails/your-ai-does-laundry.jpg
+thumbnail: /docs/community-use-cases/thumbnails/your-ai-does-laundry.jpg
 contact: "@yourhandle (or email)"    # optional; we credit you on the page
 submitted_at: 2026-05-17T07:50:00Z
 ---
@@ -40,9 +40,9 @@ else this is useful for. Outcome-first language ("books the table",
 voice").
 ```
 
-Drop the thumbnail at `community-use-cases/thumbnails/<slug>.jpg`
+Drop the thumbnail at `docs/community-use-cases/thumbnails/<slug>.jpg`
 (any image format works; we'll re-encode if needed). Drop a self-hosted
-video (if you have one) at `community-use-cases/videos/<slug>.mp4`.
+video (if you have one) at `docs/community-use-cases/videos/<slug>.mp4`.
 Skip the video and just link YouTube/X if you'd rather.
 
 ## Framing — what we look for
