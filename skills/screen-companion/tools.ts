@@ -18,7 +18,7 @@ import { writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { loadConfig, discoverConfigs, renderGoal } from './scripts/load-config.js';
-import { registerVisionOnContributor, callUpdateTools, callRestoreTools, captureSendFrame } from '../../src/vision-tools.js';
+import { registerVisionOnContributor, callUpdateTools, callRestoreTools, captureSendFrame, getFullToolSurface } from '../../src/vision-tools.js';
 
 function resolveWorkspace(): string {
 	const env = process.env.SUTANDO_WORKSPACE;
@@ -55,7 +55,12 @@ let activeMode: string | null = null;
 
 // Tools that must always remain available in screen-companion mode:
 // activate_screen_companion (mode-switch), deactivate_screen_companion (exit).
-const ALWAYS_RETAIN = new Set(['activate_screen_companion', 'deactivate_screen_companion', 'switch_mode']);
+// `work` (task delegation) and `switch_mode` are NOT inlineTools — they are
+// prepended into the session surface as mainAgentTools (see voice-agent.ts).
+// They must be named here AND the restriction below must filter the full
+// session surface (not inlineTools alone), or they get dropped and become
+// uncallable inside any screen-companion mode (see #1375).
+const ALWAYS_RETAIN = new Set(['activate_screen_companion', 'deactivate_screen_companion', 'switch_mode', 'work']);
 
 const activateScreenCompanionTool: ToolDefinition = {
 	name: 'activate_screen_companion',
@@ -107,11 +112,21 @@ const activateScreenCompanionTool: ToolDefinition = {
 			// isn't registered (e.g. phone-conversation context or tests), the
 			// call is a no-op and advisory mode remains as the fallback.
 			const toolsAllow: string[] = config.tools_allow ?? [];
-			const enforced = callUpdateTools(
+			// Filter the FULL session surface (work / switch_mode / … + inlineTools),
+			// NOT inlineTools alone — otherwise the non-inline mainAgentTools are
+			// dropped and become uncallable in-mode (#1375). getFullToolSurface() is
+			// populated by voice-agent at startup; fall back to inlineTools when the
+			// updater isn't registered (phone-conversation context / tests), matching
+			// the prior behavior.
+			const fullSurface = getFullToolSurface();
+			const restrictSource = fullSurface.length > 0
+				? fullSurface
 				// Import is deferred to avoid a top-level circular dependency;
 				// inlineTools is loaded before this module so by the time execute()
 				// runs it is already settled.
-				(await import('../../src/inline-tools.js')).inlineTools.filter(
+				: (await import('../../src/inline-tools.js')).inlineTools;
+			const enforced = callUpdateTools(
+				restrictSource.filter(
 					t => toolsAllow.includes(t.name) || ALWAYS_RETAIN.has(t.name),
 				),
 			);
@@ -126,13 +141,19 @@ const activateScreenCompanionTool: ToolDefinition = {
 				goal: filledGoal ?? null,
 				instructions: config.system_prompt_overlay,
 				tools_allow: config.tools_allow,
+				// The tools actually reachable this mode = tools_allow PLUS the
+				// always-retained capabilities (work / switch_mode / mode controls).
+				// The restriction filter above keeps ALWAYS_RETAIN regardless of
+				// tools_allow, so expose the effective set to avoid the activation
+				// note contradicting a config overlay that says to call `work`.
+				effective_tools: [...new Set([...(config.tools_allow ?? []), ...ALWAYS_RETAIN])],
 				vision_mode: config.vision_mode,
 				vision_cadence_ms: config.vision_cadence_ms ?? null,
 				vision_hint: visionHint,
 				activation_message: activationMessage,
 				tools_enforced: enforced,
 				_note:
-					'Say activation_message to the user, then follow `instructions` as your system prompt for the rest of the session. Restrict yourself to the tools in tools_allow (plus mode-exit tools like deactivate_screen_companion). When the user says "exit" / "stop the mode" / "done", call deactivate_screen_companion to restore the full tool surface.',
+					'Say activation_message to the user, then follow `instructions` as your system prompt for the rest of the session. Your callable tools for this mode are listed in `effective_tools` — that is `tools_allow` PLUS the always-retained capabilities: `work` (task delegation, available even when not in tools_allow), `switch_mode`, and the activate/deactivate mode controls. When the user says "exit" / "stop the mode" / "done", call deactivate_screen_companion to restore the full tool surface.',
 			};
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
