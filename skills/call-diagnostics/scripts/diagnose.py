@@ -157,19 +157,31 @@ def _load_session_events(db, source, session_id, call_sid):
         pass
     table = {"phone": "phone", "voice": "voice", "discord_voice": "discord_voice"}.get(source)
     if table:
-        prefix = {"user": "caller:", "agent": "sutando:", "tool_call": "tool_call:"}
         try:
             cur = db.execute(
-                f"SELECT ts_unix, kind, text FROM {table} "
+                f"SELECT ts_unix, kind, text, duration_ms FROM {table} "
                 "WHERE kind IN ('user','agent','tool_call') "
                 "AND (session_id = ? OR session_id = ?) "
                 "ORDER BY ts_unix ASC",
                 (session_id, call_sid),
             )
             for r in cur.fetchall():
-                pre = prefix.get(r["kind"])
-                if pre is not None:
-                    rows.append((r["ts_unix"], pre + (r["text"] or "")))
+                kind, text = r["kind"], (r["text"] or "")
+                if kind == "user":
+                    rows.append((r["ts_unix"], "caller:" + text))
+                elif kind == "agent":
+                    rows.append((r["ts_unix"], "sutando:" + text))
+                elif kind == "tool_call":
+                    # Surface rows are written at tool *result* time (recordToolCall
+                    # on onToolResult) and carry duration_ms. Detectors read
+                    # `tool_call:` as execution START and look for `tool_result:` to
+                    # suppress hallucination warnings — so synthesize both from
+                    # (ts_unix, duration_ms): tool_call: at start, tool_result: at end
+                    # (#1357 review — Echo).
+                    end_ts = r["ts_unix"]
+                    start_ts = end_ts - (r["duration_ms"] or 0) / 1000.0
+                    rows.append((start_ts, "tool_call:" + text))
+                    rows.append((end_ts, "tool_result:" + text))
         except Exception:
             pass
     rows.sort(key=lambda x: x[0])

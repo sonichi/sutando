@@ -956,6 +956,12 @@ async function createCallSession(params: {
 			if (item.content === lastTranscriptText) continue;
 			if (item.role === 'user') {
 				callSession.transcript.push({ role: 'caller', text: item.content });
+					// Real-time sqlite mirror so the phone table gets a per-utterance
+					// timestamp (was batch-written at cleanup -> every phone row had the
+					// end-of-call ts, breaking diagnose.py's timeline ordering; #1357 review
+					// -- Echo). The dedup guard above (item.content === lastTranscriptText)
+					// prevents double-writes across reconnects.
+					recordConversation('phone-caller', item.content, callSession.callSid);
 				// caller event push removed per #1052 — canonical record is
 				// the phone-table row written via recordConversation (called
 				// elsewhere in this server). session_events keeps only
@@ -963,6 +969,7 @@ async function createCallSession(params: {
 				try { appendFileSync(`/tmp/sutando-live-transcript-${callSession.callSid}.txt`, `[${new Date(Date.now() - 12000).toLocaleTimeString('en-US', {hour12:false})}] Caller: ${item.content}\n`); } catch {}
 			} else if (item.role === 'assistant') {
 				callSession.transcript.push({ role: 'sutando', text: item.content });
+					recordConversation('phone-agent', item.content, callSession.callSid);
 				// sutando event push removed per #1052 — see comment above.
 				try { appendFileSync(`/tmp/sutando-live-transcript-${callSession.callSid}.txt`, `[${new Date().toLocaleTimeString('en-US', {hour12:false})}] Sutando: ${item.content}\n`); } catch {}
 			}
@@ -1167,7 +1174,8 @@ function cleanupCall(callSid: string): void {
 			const text = `[${callType}] ${t.text.replace(/\n/g, ' ').slice(0, 200)}`;
 			const line = `${new Date().toISOString()}|${role}|${text}\n`;
 			try { appendFileSync(logPath, line); } catch { /* best effort */ }
-			recordConversation(role, text, callSid); // #603 sqlite mirror
+			// recordConversation moved to the real-time turn handler (#1357 review -- Echo);
+			// cleanup only mirrors to conversation.log to avoid duplicate phone-table rows.
 		}
 	}
 	console.log(`${ts()} [Phone] call finalized: ${callSid}`);
