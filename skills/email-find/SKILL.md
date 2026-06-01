@@ -101,7 +101,7 @@ metadata:
 | Foo Foundation | `foo.org`, `programs@foo.org` |
 ```
 
-Store **bare domains** (e.g. `acmecorp.com`) — Phase 2 uses them verbatim in `from:DOMAIN`. Specific addresses (e.g. `programs@foo.org`) are fine alongside bare domains. No timestamp bookkeeping: a stale row only costs one extra Phase-2 query in fanout, and hand-maintained `first_seen` / `last_useful` / `pruned_at` would be applied inconsistently turn-to-turn (Qingyun's point — heavy protocol for low payoff). Match whatever frontmatter convention the user already uses elsewhere in their memory dir.
+Store **bare domains** (e.g. `acmecorp.com`) — Phase 2 uses them verbatim in `from:DOMAIN`. Specific addresses (e.g. `programs@foo.org`) are fine alongside bare domains. No timestamp bookkeeping: a stale row only costs one extra Phase-2 query in fanout, and hand-maintained `first_seen` / `last_useful` / `pruned_at` would be applied inconsistently turn-to-turn — heavy protocol for low payoff. Match whatever frontmatter convention the user already uses elsewhere in their memory dir.
 
 ## Subject-mismatch heuristic (no subject filtering in Phases 1–3)
 
