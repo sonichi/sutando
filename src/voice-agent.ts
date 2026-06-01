@@ -718,6 +718,7 @@ const mainAgent: MainAgent = {
 		'- If you KNOW the answer from your instructions or context, answer directly. Only delegate to work for questions you genuinely cannot answer.',
 		'- DEICTIC SCREEN REFERENCES: When the user uses a deictic word ("this", "that", "it", "this part", "fix this", "what does this say") without obvious conversational antecedent, FIRST call read_selection to capture what they\'re pointing at on screen. Then act on the returned selection/window context. Only ask a clarifying question if read_selection returns empty AND no prior conversation context resolves the reference. Default to read_selection over "which one do you mean?" — the user is usually pointing.',
 		'- MISSING CONTEXT: When the user references something you don\'t have context for ("the draft", "what we discussed", "type that", "send what I asked for"), ALWAYS delegate to work. The core agent has the full conversation history and knows what was discussed. Never guess or ask the user to repeat — just call work.',
+		'- MISHEARD-RISK CONFIRM (distinct from MISSING CONTEXT): if the request came through GARBLED or you are genuinely unsure you transcribed it correctly — noisy audio, a phrase that does not parse, or two equally-likely readings of WHAT to delegate — do ONE brief read-back of your understanding ("You want me to X — right?") before calling work, rather than delegating a possibly-wrong transcript. Keep it to a single short confirm. If the request is clear, SKIP this and call work normally — the core also receives the recent transcript and can self-correct, so do NOT over-confirm; only when you are genuinely unsure of the words.',
 		(() => meetingActive
 			? '- IN MEETING MODE: When addressed by name, answer DIRECTLY from what you heard in the meeting. Do NOT call work — the core agent cannot hear the meeting audio and has no context. You are the one who listened. Summarize discussions, decisions, and action items from your own memory of the conversation.'
 			: '- When in doubt, call work.'
@@ -1262,6 +1263,18 @@ async function main() {
 		userHasInterrupted = true;
 		console.log(`${ts()} [VoiceSession] user interrupt detected — userHasInterrupted=true`);
 	});
+
+	// Audio-duck relay: flag the slide server (localhost:7877) when Sutando is
+	// producing audio, so the deck ducks the active slide video under the
+	// narration. turn.start → speaking on; turn.end / turn.interrupted → off.
+	// Fire-and-forget; failures are harmless (deck just won't duck). Decouples
+	// ducking from Gemini tool-call timing entirely. (Observe-talk feature.)
+	const _duck = (mode: 'on' | 'off') => {
+		try { fetch(`http://localhost:7877/speaking/${mode}`, { method: 'POST' }).catch(() => {}); } catch {}
+	};
+	session.eventBus.subscribe('turn.start', () => _duck('on'));
+	session.eventBus.subscribe('turn.end', () => _duck('off'));
+	session.eventBus.subscribe('turn.interrupted', () => _duck('off'));
 
 	const shutdown = async () => {
 		console.log(`\n${ts()} Shutting down...`);

@@ -42,7 +42,7 @@ Sections that come up empty print a short "(none)" rather than getting dropped, 
 
 Catchup reads `session-state.md` to learn what the previous session was doing at the moment it ended. Out of the box, that file is written **only** by the `PreCompact` hook in `src/session-handoff.sh` — so if the previous session exited via ⌘Q (or crashed) without a compaction in between, the file is stale: it reflects the last compact, not the last close. The most-recent N-minute window is then invisible to the next session's catchup.
 
-Closing that gap = adding a **SessionStop** hook that fires the same `session-handoff.sh`. After install, `session-state.md` always reflects the latest close (compact OR clean exit), and catchup gets a freshest possible briefing.
+Closing that gap = adding a **SessionEnd** hook that fires the same `session-handoff.sh`. After install, `session-state.md` always reflects the latest close (compact OR clean exit), and catchup gets a freshest possible briefing.
 
 ```bash
 bash ~/.claude/skills/catchup-after-startup/scripts/install-hook.sh
@@ -51,7 +51,7 @@ bash ~/.claude/skills/catchup-after-startup/scripts/install-hook.sh
 The installer is idempotent — safe to re-run. It edits `~/.claude/settings.json` and adds:
 
 ```json
-"SessionStop": [{
+"SessionEnd": [{
   "hooks": [{
     "type": "command",
     "command": "bash \"${SUTANDO_REPO_DIR:-$HOME/Desktop/sutando}/src/session-handoff.sh\" \"${TRANSCRIPT_PATH:-}\""
@@ -60,6 +60,32 @@ The installer is idempotent — safe to re-run. It edits `~/.claude/settings.jso
 ```
 
 Requires `SUTANDO_REPO_DIR` env or a checkout at `~/Desktop/sutando` (the same convention `session-handoff.sh` uses for auto-detect).
+
+### Migrating from a pre-#1366 install (`SessionStop` → `SessionEnd`)
+
+Before [#1366](https://github.com/sonichi/sutando/pull/1366) `install-hook.sh` registered the hook under the event name `SessionStop` — which Claude Code silently no-op'd (`Unknown hook event 'SessionStop' was ignored`). If you installed before that PR merged, your `~/.claude/settings.json` still carries the dead key, and any *other* hooks you (or other skills) registered under `SessionStop` are equally dead, regardless of the command they invoke.
+
+**No action needed in normal use.** The migration auto-runs every time `/catchup-after-startup` fires — i.e. every fresh session bootstrap that goes through `/schedule-crons` or `/proactive-loop` step 1. It's a universal key-rename: every entry under `SessionStop` is moved to `SessionEnd` and the `SessionStop` key is dropped. Dedup is built-in (a command already present in `SessionEnd` is not re-added).
+
+If you'd rather migrate by hand without waiting for the next session:
+
+```bash
+python3 ~/.claude/skills/catchup-after-startup/scripts/migrate-settings-hooks.py
+```
+
+Or re-run the installer (which calls the migration + then ensures the `session-handoff.sh` `SessionEnd` entry is present):
+
+```bash
+bash ~/.claude/skills/catchup-after-startup/scripts/install-hook.sh
+```
+
+Verify:
+
+```bash
+python3 -c 'import json; s=json.load(open("'"$HOME"'/.claude/settings.json")); h=s.get("hooks",{}); print("SessionEnd:", json.dumps(h.get("SessionEnd"), indent=2)); print("SessionStop key present:", "SessionStop" in h)'
+```
+
+`SessionEnd` should list every previously-stale command (including `session-handoff.sh`); `SessionStop key present` should print `False`.
 
 **Without the hook** catchup still works — you just lose the last few minutes of the previous session's narrative when that session ended outside a compact. The rest (open PRs, in-flight tasks, sqlite, conversation.log, build_log) is real-time persisted and recovers regardless.
 
@@ -85,7 +111,7 @@ The voice/phone/discord activity section queries `voice` / `phone` / `discord_vo
 
 ## What it does NOT recover
 
-- **In-flight reasoning that never hit disk** during the previous session ("I was about to do X but hadn't said it yet"). Out of scope without a finer-grained checkpoint mechanism. Mitigated by the SessionStop hook (separate followup) which forces a session-handoff snapshot on clean exit, not just PreCompact.
+- **In-flight reasoning that never hit disk** during the previous session ("I was about to do X but hadn't said it yet"). Out of scope without a finer-grained checkpoint mechanism. Mitigated by the SessionEnd hook (separate followup) which forces a session-handoff snapshot on clean exit, not just PreCompact.
 - **The model's working memory / vibe / rapport.** Catchup gives data, not feel.
 - **Events from before the time window.** Widen with `/catchup-after-startup 24` or `/catchup-after-startup 168` (a week).
 

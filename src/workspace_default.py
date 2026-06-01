@@ -374,6 +374,37 @@ def _migrate_conversation_log(workspace: Path) -> bool:
 
 
 _AUTO_MIGRATE_NOTICE_PRINTED = False
+_FALLBACK_WARN_PRINTED = False
+
+
+def _grep_env_for_workspace() -> str | None:
+    """Best-effort: read `SUTANDO_WORKSPACE=` from the repo's .env file.
+
+    Walks up from this module's resolved path to find the nearest `.env`,
+    then scans for a `SUTANDO_WORKSPACE=` line. Returns the (tilde-expanded)
+    value or None on any failure — never raises. Used only to enrich the
+    fallback-warn message below; resolution itself does NOT consume this
+    value, so a user who genuinely wants the default still gets it.
+    """
+    try:
+        cur = Path(__file__).resolve()
+        for _ in range(5):
+            cur = cur.parent
+            if cur == cur.parent:  # filesystem root
+                return None
+            env_file = cur / ".env"
+            if env_file.is_file():
+                for line in env_file.read_text().splitlines():
+                    s = line.strip()
+                    if s.startswith("SUTANDO_WORKSPACE="):
+                        val = s.split("=", 1)[1].strip()
+                        if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                            val = val[1:-1]
+                        return str(Path(val).expanduser()) if val else None
+                return None
+    except Exception:
+        pass
+    return None
 
 
 def resolve_workspace(migrate: bool = True) -> Path:
@@ -440,6 +471,27 @@ def resolve_workspace(migrate: bool = True) -> Path:
             target = anchored
     else:
         target = default_workspace_dir()
+        # Surface the silent-fallback bug class (see PR #1367/#1368): if .env
+        # defines SUTANDO_WORKSPACE but the process never got it (e.g. a
+        # SessionStart hook, launchd service, or any process that didn't
+        # `source .env`), the caller silently lands in `~/.sutando/workspace/`
+        # while the rest of the fleet uses the override → split-brain. One
+        # stderr line per process makes the miss visible. We do NOT auto-honor
+        # the .env value here — that's a behavior change and lives in callers
+        # that opt into it (e.g. skills/agent-registry/scripts/_workspace_resolve.py).
+        global _FALLBACK_WARN_PRINTED
+        if not _FALLBACK_WARN_PRINTED:
+            _FALLBACK_WARN_PRINTED = True
+            env_file_val = _grep_env_for_workspace()
+            if env_file_val and env_file_val != str(target):
+                print(
+                    f"workspace: SUTANDO_WORKSPACE is unset in process env, "
+                    f"falling back to {target}. NOTE: .env declares "
+                    f"SUTANDO_WORKSPACE={env_file_val!r} which is NOT being "
+                    f"honored here — `source .env` or export the var before "
+                    f"this process to avoid split-brain with other services.",
+                    file=sys.stderr,
+                )
 
     # One-time notice if legacy-state evidence exists, pointing at the
     # explicit CLI (to land in a follow-up PR). Process-local guard so we

@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Sutando — menu-bar app launchd job (template).
+
+  Role: OS-level supervisor for the Sutando.app menu-bar process. Without
+  this, a crash requires manual `open Sutando.app` to recover. With it,
+  launchd restarts the app within ~10s of a crash, and RunAtLoad ensures
+  it starts automatically at login.
+
+  Restart policy: KeepAlive Crashed=true / SuccessfulExit=false means
+  launchd restarts when the app exits non-zero (crash, OOM, etc.) but
+  NOT when it exits cleanly (user quit via menu bar, `startup.sh`
+  pkill during a controlled restart). This preserves the operator's
+  ability to "just quit" without triggering an immediate relaunch.
+
+  ThrottleInterval=10 caps crash-restart frequency at once per 10s so
+  a spinning crash-loop doesn't hammer the system.
+
+  Installed by `bash src/install-sutando-app-launchd.sh` after the
+  installer substitutes __REPO__, __HOME__, and __WORKSPACE__ with
+  actual paths. Do NOT load this template directly.
+
+  TCC note: launchd spawns the binary at __REPO__/src/Sutando/Sutando.app/
+  Contents/MacOS/Sutando. macOS resolves the parent bundle for TCC
+  purposes via the binary's enclosing .app — Accessibility and Screen
+  Recording grants are scoped to the bundle ID (com.sutando.Sutando),
+  not the launch method, so they survive launchd-managed restarts as
+  long as the code signature is unchanged. Do NOT change the binary's
+  code signing identity after install — that orphans TCC grants.
+  See feedback_codesign_change_orphans_tcc_grant.md.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.sutando.menubar</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__REPO__/src/Sutando/Sutando.app/Contents/MacOS/Sutando</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <!-- Restart on crash (non-zero exit from signal or OOM). -->
+        <key>Crashed</key>
+        <true/>
+        <!-- Restart on any non-successful exit. Together with Crashed this
+             means: restart whenever the process exits non-zero. -->
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Pass workspace location so the app writes tasks/results/logs
+             under ~/.sutando/workspace/ rather than the repo root. -->
+        <key>SUTANDO_WORKSPACE</key>
+        <string>__WORKSPACE__</string>
+        <key>SUTANDO_REPO_DIR</key>
+        <string>__REPO__</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__WORKSPACE__/logs/sutando-app-stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__WORKSPACE__/logs/sutando-app-stderr.log</string>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>

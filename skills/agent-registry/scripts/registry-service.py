@@ -41,14 +41,11 @@ PRUNE_SECS = 3600    # stopped/stale rows older than this are deleted
 
 STARTED_AT = time.time()
 
-
-def resolve_workspace():
-    """Resolve the Sutando workspace per the workspace contract (CLAUDE.md)."""
-    env = os.environ.get("SUTANDO_WORKSPACE")
-    if env:
-        return os.path.abspath(os.path.expanduser(env))
-    return os.path.expanduser("~/.sutando/workspace")
-
+# Shared workspace resolver. See _workspace_resolve.py for the SessionStart-
+# hook env-miss case that motivates the .env-grep fallback. Both this script
+# and registry-client.py import from the same module so they stay in lock-step.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _workspace_resolve import resolve_workspace  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 DB_PATH = os.path.join(WORKSPACE, "data", "agent-registry.db")
