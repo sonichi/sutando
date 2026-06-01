@@ -673,7 +673,11 @@ export const slideControlTool: ToolDefinition = {
 	name: 'slide_control',
 	description:
 		'Control presentation slides. Use when user says "next slide", "previous slide", "go back", "go to slide 3". ' +
-		'Sends arrow keys to the frontmost browser window.',
+		'Mutates the active slide via DOM (Chrome execute javascript) — works regardless of which element has focus, ' +
+		'so it is safe to call even when a textarea or contenteditable on the deck has focus (e.g. live-edit demos). ' +
+		'PREFER this over press_key("leftarrow"/"rightarrow"/"space") for slide navigation: arrow / space keystrokes ' +
+		'get captured by focused editables (cursor moves within the field) and may be suppressed by deck-side ' +
+		'focus-guard handlers — slide_control sidesteps both.',
 	parameters: z.object({
 		action: z.enum(['next', 'previous', 'goto']).describe('Navigation action'),
 		slideNumber: z.number().optional().describe('Slide number for goto action'),
