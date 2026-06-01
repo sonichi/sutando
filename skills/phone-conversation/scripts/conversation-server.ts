@@ -859,7 +859,11 @@ async function createCallSession(params: {
 				callSession.toolCalls.push({ name: toolName, durationMs: e.durationMs, timestamp: new Date().toISOString() });
 				// tool_result event push removed per #1052 — recordToolCall
 				// below is the canonical write (phone table, kind='tool_call').
-				recordToolCall('phone', toolName, e.durationMs, callSession.sessionId);
+				// Phone tool_call rows must key on callSid (same as recordConversation
+				// at the user/agent write below) — CallSession has no `sessionId` field,
+				// so the old `callSession.sessionId` wrote NULL and diagnose.py's
+				// `session_id OR call_sid` loader could never join them (Echo, #1357 review).
+				recordToolCall('phone', toolName, e.durationMs, callSession.callSid);
 				// Log REC indicator status for recording tools
 				if (toolName === 'record_screen_with_narration' || toolName === 'screen_record' || toolName === 'open_file') {
 					const hasIndicator = existsSync('/tmp/sutando-rec-indicator.pid');
