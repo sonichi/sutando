@@ -4,7 +4,7 @@ OSS-facing channel to share a Sutando use case with the community.
 
 Opens a GitHub issue on [`sonichi/sutando`](https://github.com/sonichi/sutando)
 (label `use-case-submission`) and a PR adding
-`community-use-cases/<slug>.md`. Both happen by default; flags `--issue-only`
+`docs/community-use-cases/<slug>.md`. Both happen by default; flags `--issue-only`
 and `--pr-only` opt out of one or the other.
 
 This is the public counterpart to the internal `add-use-case` skill, which
@@ -46,7 +46,7 @@ python3 scripts/submit_use_case.py --dry-run --title "..." --summary "..." \
 ```
 
 Prints the rendered issue body + the rendered
-`community-use-cases/<slug>.md` to stdout. No clone, no gh calls.
+`docs/community-use-cases/<slug>.md` to stdout. No clone, no gh calls.
 
 ## Idempotency
 
