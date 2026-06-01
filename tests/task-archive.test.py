@@ -74,8 +74,8 @@ class TestArchiveFile(unittest.TestCase):
         self.addCleanup(self._td.cleanup)
 
     def _archive_dir(self, kind: str) -> Path:
-        from datetime import datetime
-        ym = datetime.now().strftime("%Y-%m")
+        from datetime import datetime, timezone
+        ym = datetime.now(timezone.utc).strftime("%Y-%m")
         return self.base / kind / "archive" / ym
 
     def test_moves_task_file(self) -> None:

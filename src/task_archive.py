@@ -29,7 +29,7 @@ Usage::
 from __future__ import annotations
 
 import shutil
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -69,7 +69,7 @@ def archive_file(
     try:
         if not src.exists():
             return
-        ym = datetime.now().strftime("%Y-%m")
+        ym = datetime.now(timezone.utc).strftime("%Y-%m")
         dest_dir = base / kind / "archive" / ym
         dest_dir.mkdir(parents=True, exist_ok=True)
         shutil.move(str(src), str(dest_dir / f"{task_id}.txt"))
