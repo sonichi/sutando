@@ -1,6 +1,6 @@
 ---
 name: submit-use-case
-description: "OSS-facing channel to share a Sutando use case with the community. Opens a labeled GitHub issue on sonichi/sutando and (CLA-gated) a PR adding community-use-cases/<slug>.md. Validates outcome-framed titles with the same checker as add-use-case. Default: both; flags --issue-only / --pr-only opt out."
+description: "OSS-facing channel to share a Sutando use case with the community. Opens a labeled GitHub issue on sonichi/sutando and (CLA-gated) a PR adding docs/community-use-cases/<slug>.md. Validates outcome-framed titles with the same checker as add-use-case. Default: both; flags --issue-only / --pr-only opt out."
 user-invocable: true
 ---
 
@@ -30,7 +30,7 @@ python3 "$SKILL_DIR/scripts/submit_use_case.py" \
 ```
 
 `--dry-run` runs the framing check and prints both the rendered issue body
-and the rendered `community-use-cases/<slug>.md` file to stdout. No clone, no
+and the rendered `docs/community-use-cases/<slug>.md` file to stdout. No clone, no
 gh calls.
 
 ## What the skill does
@@ -52,7 +52,7 @@ gh calls.
 5. **Open a PR** (unless `--issue-only`).
    - Fresh clone: `gh repo clone sonichi/sutando /tmp/sutando-submit-use-case-{ts}/`
    - Branch: `community-use-case/<slug>` from `main`
-   - File: `community-use-cases/<slug>.md` — YAML frontmatter mirroring the
+   - File: `docs/community-use-cases/<slug>.md` — YAML frontmatter mirroring the
      agent-universe `UseCase` shape so the sync script can later promote it.
    - Identity: **only** set repo-local `user.email` / `user.name` to
      `4250911+sonichi@users.noreply.github.com` / `Chi Wang` when the runner
@@ -63,7 +63,7 @@ gh calls.
    - Commit, push, `gh pr create`. PR body cross-links the issue if one was opened.
 6. **Return** both URLs to stdout (issue URL, then PR URL, last two lines).
 
-## File schema (`community-use-cases/<slug>.md`)
+## File schema (`docs/community-use-cases/<slug>.md`)
 
 ```yaml
 ---
