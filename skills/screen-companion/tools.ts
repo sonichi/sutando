@@ -141,13 +141,19 @@ const activateScreenCompanionTool: ToolDefinition = {
 				goal: filledGoal ?? null,
 				instructions: config.system_prompt_overlay,
 				tools_allow: config.tools_allow,
+				// The tools actually reachable this mode = tools_allow PLUS the
+				// always-retained capabilities (work / switch_mode / mode controls).
+				// The restriction filter above keeps ALWAYS_RETAIN regardless of
+				// tools_allow, so expose the effective set to avoid the activation
+				// note contradicting a config overlay that says to call `work`.
+				effective_tools: [...new Set([...(config.tools_allow ?? []), ...ALWAYS_RETAIN])],
 				vision_mode: config.vision_mode,
 				vision_cadence_ms: config.vision_cadence_ms ?? null,
 				vision_hint: visionHint,
 				activation_message: activationMessage,
 				tools_enforced: enforced,
 				_note:
-					'Say activation_message to the user, then follow `instructions` as your system prompt for the rest of the session. Restrict yourself to the tools in tools_allow (plus mode-exit tools like deactivate_screen_companion). When the user says "exit" / "stop the mode" / "done", call deactivate_screen_companion to restore the full tool surface.',
+					'Say activation_message to the user, then follow `instructions` as your system prompt for the rest of the session. Your callable tools for this mode are listed in `effective_tools` — that is `tools_allow` PLUS the always-retained capabilities: `work` (task delegation, available even when not in tools_allow), `switch_mode`, and the activate/deactivate mode controls. When the user says "exit" / "stop the mode" / "done", call deactivate_screen_companion to restore the full tool surface.',
 			};
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
