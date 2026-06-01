@@ -2,20 +2,18 @@
 """Regenerate the Sutando WIRE list in README.md from the YouTube playlist.
 
 The README has a `<!-- wire-list:start -->` / `<!-- wire-list:end -->` marker
-pair around the WIRE episode list. This script fetches the playlist via
-YouTube Data API v3, ranks videos by recency + likes, dedups so a video
-appears in at most one slot, and substitutes the rendered list back into
-README atomically.
+pair around the WIRE episode list. This script resolves the channel that owns
+the seed playlist, fetches every public upload on that channel via YouTube
+Data API v3, ranks videos by recency + likes, dedups so a video appears in at
+most one slot, and substitutes the rendered list back into README atomically.
 
 Slots produced (5 total):
 - 2 newest episodes (by `publishedAt`, descending)
-- 2 hero episodes (highest `likeCount`, excluding videos already in newest,
-  and >= 30 days old to avoid rotation-lag double-listing)
-- 1 "Earlier episodes →" playlist link
+- 3 hero episodes (highest `likeCount`, excluding videos already in newest,
+  and >= 7 days old to avoid rotation-lag double-listing)
 
-If fewer than 4 unique videos qualify (e.g. very early channel state),
-the script falls back gracefully — emits whatever slots it can fill plus
-the playlist link.
+If fewer than 5 unique videos qualify (e.g. very early channel state),
+the script falls back gracefully — emits whatever slots it can fill.
 
 Env:
 - YOUTUBE_API_KEY (required) — Google Cloud Console API key with YouTube
@@ -35,6 +33,7 @@ Exit codes:
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.request
 import urllib.parse
@@ -46,14 +45,13 @@ README = REPO / "README.md"
 PLAYLIST_ID = os.environ.get(
     "PLAYLIST_ID", "PLoEaHbP1bU5FDWAyeLDL9J9i7Iblp3_m_"
 )
-PLAYLIST_URL = f"https://www.youtube.com/playlist?list={PLAYLIST_ID}"
 
 START_MARKER = "<!-- wire-list:start"  # prefix match; full line may include note
 END_MARKER = "<!-- wire-list:end -->"
 
 NEWEST_SLOTS = 2
-HERO_SLOTS = 2
-HERO_MIN_AGE_DAYS = 30
+HERO_SLOTS = 3
+HERO_MIN_AGE_DAYS = 7
 API_BASE = "https://www.googleapis.com/youtube/v3"
 
 
@@ -65,6 +63,35 @@ def api_get(path: str, params: dict) -> dict:
     url = f"{API_BASE}/{path}?{urllib.parse.urlencode(params)}"
     with urllib.request.urlopen(url, timeout=20) as resp:
         return json.load(resp)
+
+
+def resolve_uploads_playlist(seed_playlist_id: str) -> str:
+    """Find the channel that owns seed_playlist_id, return its uploads playlist.
+
+    Channel-wide sourcing: instead of the curated WIRE playlist, source from
+    every public upload on the channel. We learn the channelId from any one
+    video in the seed playlist, then read the channel's
+    contentDetails.relatedPlaylists.uploads (the auto-maintained "all uploads"
+    playlist).
+    """
+    data = api_get(
+        "playlistItems",
+        {"part": "contentDetails", "playlistId": seed_playlist_id, "maxResults": 1},
+    )
+    items = data.get("items", [])
+    if not items:
+        raise RuntimeError("seed playlist empty; cannot resolve channel")
+    video_id = items[0]["contentDetails"]["videoId"]
+    vdata = api_get("videos", {"part": "snippet", "id": video_id})
+    vitems = vdata.get("items", [])
+    if not vitems:
+        raise RuntimeError("seed video not found; cannot resolve channel")
+    channel_id = vitems[0]["snippet"]["channelId"]
+    cdata = api_get("channels", {"part": "contentDetails", "id": channel_id})
+    citems = cdata.get("items", [])
+    if not citems:
+        raise RuntimeError(f"channel {channel_id} not found")
+    return citems[0]["contentDetails"]["relatedPlaylists"]["uploads"]
 
 
 def fetch_playlist_videos(playlist_id: str) -> list[dict]:
@@ -131,14 +158,38 @@ def age_days(published_at: str) -> int:
     return (datetime.now(timezone.utc) - dt).days
 
 
-def render_block(videos: list[dict]) -> str:
+YT_ID_RE = re.compile(r"(?:youtu\.be/|youtube\.com/(?:watch\?v=|embed/))([A-Za-z0-9_-]{11})")
+
+
+def readme_excluded_ids(readme_text: str) -> set:
+    """Video IDs already linked elsewhere in README, outside the wire-list block.
+
+    Channel-wide sourcing can surface a video that's already featured above or
+    below the markers — the embedded demo (README intro) or a "Recent
+    capability proofs" link. Those must not be re-listed in the WIRE block.
+    The block between START/END markers is sliced out so we don't exclude the
+    very videos we're about to render.
+    """
+    start = readme_text.find(START_MARKER)
+    end = readme_text.find(END_MARKER)
+    if start >= 0 and end >= 0:
+        outside = readme_text[:start] + readme_text[end:]
+    else:
+        outside = readme_text
+    return set(YT_ID_RE.findall(outside))
+
+
+def render_block(videos: list[dict], exclude_ids: set = frozenset()) -> str:
     """Build the markdown block — newest N, hero N, playlist link.
 
     Caller is responsible for passing only `public` videos; `videos` here
-    is already post-filter. When hero candidates fall short of HERO_SLOTS
+    is already post-filter. `exclude_ids` drops videos already linked
+    elsewhere in README (embedded demo, capability proofs) so the WIRE block
+    never duplicates them. When hero candidates fall short of HERO_SLOTS
     (small/young channel state), fill from the oldest remaining public
     videos so the total stays at NEWEST_SLOTS + HERO_SLOTS where possible.
     """
+    videos = [v for v in videos if v["videoId"] not in exclude_ids]
     by_date = sorted(videos, key=lambda v: v["publishedAt"], reverse=True)
     newest = by_date[:NEWEST_SLOTS]
     used_ids = {v["videoId"] for v in newest}
@@ -160,12 +211,10 @@ def render_block(videos: list[dict]) -> str:
         fallback.sort(key=lambda v: v.get("likeCount", 0), reverse=True)
         hero.extend(fallback[: HERO_SLOTS - len(hero)])
 
-    lines = []
-    for v in newest + hero:
-        lines.append(
-            f'- [{v["title"]}](https://youtu.be/{v["videoId"]})'
-        )
-    lines.append(f"- [Earlier episodes →]({PLAYLIST_URL})")
+    lines = [
+        f'- [{v["title"]}](https://youtu.be/{v["videoId"]})'
+        for v in newest + hero
+    ]
     return "\n".join(lines)
 
 
@@ -196,9 +245,10 @@ def main():
     )
     args = ap.parse_args()
 
-    items = fetch_playlist_videos(PLAYLIST_ID)
+    uploads_playlist = resolve_uploads_playlist(PLAYLIST_ID)
+    items = fetch_playlist_videos(uploads_playlist)
     if not items:
-        print("ERR: playlist returned no items", file=sys.stderr)
+        print("ERR: channel uploads returned no items", file=sys.stderr)
         sys.exit(1)
     stats = fetch_video_stats([v["videoId"] for v in items])
     for v in items:
@@ -226,13 +276,14 @@ def main():
             f"  skipped {skipped} non-public video(s)", file=sys.stderr
         )
 
-    new_block = render_block(public_items)
+    current = README.read_text()
+    exclude_ids = readme_excluded_ids(current)
+    new_block = render_block(public_items, exclude_ids)
 
     if args.dry_run:
         print(new_block)
         return
 
-    current = README.read_text()
     new_readme = splice(current, new_block)
     if new_readme == current:
         print("README unchanged")
