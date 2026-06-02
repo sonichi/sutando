@@ -998,16 +998,37 @@ commit_one() {
             local src_mt src_sz
             src_mt="$(stat -f %m "$src_file" 2>/dev/null || stat -c %Y "$src_file")"
             src_sz="$(stat -f %z "$src_file" 2>/dev/null || stat -c %s "$src_file")"
+            # Mini #design 2026-06-02 08:10Z: an `{ ... } > tmp && mv ...`
+            # compound on a single line is NOT covered by `set -e` for its
+            # left-side failure — the compound returns non-zero but execution
+            # falls through to the next statement (which echo'd "appended").
+            # If commit_one()'s caller treats that echo as success and proceeds
+            # to delete the source, a half-written append becomes data-lossy.
+            # Fix: split into separate commands so each failure path either
+            # returns explicitly or trips the script's `set -e`. Atomicity is
+            # still preserved (tmp file is dropped on failure; dest is untouched
+            # until mv succeeds).
+            local _tmp="$dst_path.append.$$"
+            local _redirect_rc=0
             if [ -e "$dst_path" ]; then
-                # Append with divider header. Concat in canonical order; the
-                # tmp+mv pattern is atomic and preserves dest if append fails.
+                # Append with divider header. Concat in canonical order.
                 {
                     cat "$dst_path"
                     echo ""
                     echo "=== migrated from source $tag (mtime $src_mt, size ${src_sz}B) ==="
                     echo ""
                     cat "$src_file"
-                } > "$dst_path.append.$$" && mv -f "$dst_path.append.$$" "$dst_path"
+                } > "$_tmp" || _redirect_rc=$?
+                if [ "$_redirect_rc" -ne 0 ]; then
+                    rm -f "$_tmp"
+                    echo "append-failed-redirect" >&2
+                    return 1
+                fi
+                mv -f "$_tmp" "$dst_path" || {
+                    rm -f "$_tmp"
+                    echo "append-failed-mv" >&2
+                    return 1
+                }
                 echo "appended"
             else
                 # First write — include header so future appends slot in cleanly.
@@ -1015,7 +1036,17 @@ commit_one() {
                     echo "=== migrated from source $tag (mtime $src_mt, size ${src_sz}B) ==="
                     echo ""
                     cat "$src_file"
-                } > "$dst_path.append.$$" && mv -f "$dst_path.append.$$" "$dst_path"
+                } > "$_tmp" || _redirect_rc=$?
+                if [ "$_redirect_rc" -ne 0 ]; then
+                    rm -f "$_tmp"
+                    echo "append-failed-redirect" >&2
+                    return 1
+                fi
+                mv -f "$_tmp" "$dst_path" || {
+                    rm -f "$_tmp"
+                    echo "append-failed-mv" >&2
+                    return 1
+                }
                 echo "appended-fresh"
             fi
             return 0
