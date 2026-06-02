@@ -841,7 +841,7 @@ const mainAgent: MainAgent = {
 // proactively write user_profile / feedback / project / reference files
 // without first having to remember to mkdir. Honours $SUTANDO_MEMORY_DIR
 // when set; otherwise uses the Claude Code default
-// (~/.claude/projects/-{slug}/memory). Failure-silent: a missing memory
+// ($CLAUDE_CONFIG_DIR/projects/-{slug}/memory). Failure-silent: a missing memory
 // dir should never block voice startup.
 function bootstrapMemoryDir(): void {
 	const slug = '-' + WORKSPACE_DIR.replace(/\/$/, '').split('/').filter(Boolean).join('-');

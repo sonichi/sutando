@@ -9,12 +9,12 @@ Checks http://localhost:8080/sse-status for voiceConnected.
 If voice is connected, does nothing (voice agent will speak the result).
 If voice is disconnected, sends the result to the owner's Discord DM.
 
-Requires DISCORD_BOT_TOKEN in .env (or in ~/.claude/channels/discord/.env)
+Requires DISCORD_BOT_TOKEN in .env (or in $CLAUDE_CONFIG_DIR/channels/discord/.env)
 and the Discord bridge running.
 
 Owner resolution:
     1. $SUTANDO_DM_OWNER_ID env var (explicit override).
-    2. First non-bot user in ~/.claude/channels/discord/access.json → allowFrom.
+    2. First non-bot user in $CLAUDE_CONFIG_DIR/channels/discord/access.json → allowFrom.
 The bot's own user ID is discovered via Discord's GET /users/@me so that
 multi-owner allowFrom lists still resolve to the human.
 

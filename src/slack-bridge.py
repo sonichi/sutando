@@ -17,7 +17,7 @@ Bot scopes (OAuth & Permissions):
     users:read
 
 Access list (TOFU onboarding, same schema as telegram):
-    ~/.claude/channels/slack/access.json
+    $CLAUDE_CONFIG_DIR/channels/slack/access.json
         {"allowFrom": ["U0123..."], "tofuOwner": "U0123...", ...}
 
 File round-trip:

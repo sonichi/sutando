@@ -42,7 +42,7 @@ Discord channel audio out
 ## Setup
 
 1. **Register a Discord bot account** at the [Discord developer portal](https://discord.com/developers/applications). Give it the `bot` scope with `applications.commands` + the voice perms (`Connect`, `Speak`, `Use Voice Activity`).
-2. **Add the bot token** to `~/.claude/channels/discord/.env`:
+2. **Add the bot token** to `$CLAUDE_CONFIG_DIR/channels/discord/.env`:
    ```
    DISCORD_BOT_TOKEN=...
    ```
@@ -103,7 +103,7 @@ Resolution for a given channel: `channels[<channel_id>].owner_mode` if that entr
 
 ## Trust boundary — per-speaker access tiers
 
-Independently of `owner_mode`, owner-tier tools are gated **per speaker**, by Discord user id. Each turn is attributed to the speaker who started it, and tools are gated by that speaker's tier — read from the same `~/.claude/channels/discord/access.json` the discord-bridge uses, so the two never drift:
+Independently of `owner_mode`, owner-tier tools are gated **per speaker**, by Discord user id. Each turn is attributed to the speaker who started it, and tools are gated by that speaker's tier — read from the same `$CLAUDE_CONFIG_DIR/channels/discord/access.json` the discord-bridge uses, so the two never drift:
 
 - **owner** — an id in the top-level `allowFrom` of `access.json`. Full tool surface: `work`, `dismiss`, screen-share, file edits, message sends.
 - **team** — an id in any `groups[*].allowFrom` (per-channel trusted circle: peers, collaborators) that is not also owner. Read-only inline tools + configurable tools + `dismiss`; no `work` / file edits. (`dismiss` is intentional: a teammate can end the bot's voice session — useful when the owner isn't present to close the room; the owner can rejoin via DM.)

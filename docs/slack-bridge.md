@@ -36,7 +36,7 @@ pipeline as voice / Discord / Telegram.
 
 ## Local config
 
-Create `~/.claude/channels/slack/.env`:
+Create `$CLAUDE_CONFIG_DIR/channels/slack/.env`:
 
 ```sh
 SLACK_BOT_TOKEN=xoxb-...
@@ -55,7 +55,7 @@ pip3 install slack_bolt
 automatically. On first DM after the bridge starts, the sender is
 auto-enrolled as owner — same trust-on-first-use flow Telegram uses (see
 `CLAUDE.md` → "Telegram access control"). The access list lives at
-`~/.claude/channels/slack/access.json`.
+`$CLAUDE_CONFIG_DIR/channels/slack/access.json` (same resolution as the `.env` path above).
 
 To allow additional senders later, add their Slack user IDs to `allowFrom`
 in that file.
@@ -127,7 +127,7 @@ check these in order:
 3. **Event Subscriptions disabled** — the `Enable Events` toggle defaults
    to OFF. Even with Socket Mode running, no events flow until this is
    on. Bridge log will show only "Socket Mode connecting…" with no
-   subsequent activity, and `~/.claude/channels/slack/access.json` will
+   subsequent activity, and `$CLAUDE_CONFIG_DIR/channels/slack/access.json` will
    never be created.
 
 4. **Save Changes button greyed out** — when Event Subscriptions has

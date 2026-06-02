@@ -134,7 +134,7 @@ npx tsx -e "import 'dotenv/config'; import { summonTool } from './skills/zoom/to
 - Look up contacts and calendar for numbers/PINs before calling
 - The voice agent delegates "call X" and "join my meeting" requests to core via `work`
 
-**Local skills** — check `$CLAUDE_CONFIG_DIR/skills/` for user-installed skills (video processing, etc.). The path resolves to `~/.claude/skills/` for vanilla `claude`, or `<workspace>/.claude-sutando/skills/` when the `claude-sutando` shell function is in use. Always prefer a local skill over raw commands when one exists for the task.
+**Local skills** — check `$CLAUDE_CONFIG_DIR/skills/` for user-installed skills (video processing, etc.). Always prefer a local skill over raw commands when one exists for the task.
 
 **App launcher** — open any macOS app:
 ```bash

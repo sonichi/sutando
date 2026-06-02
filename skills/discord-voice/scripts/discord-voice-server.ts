@@ -19,7 +19,7 @@
  *   tsx discord-voice-server.ts --guild <id> --channel <voice_channel_id>
  *
  * ## Env
- *   DISCORD_BOT_TOKEN  — bot token (~/.claude/channels/discord/.env)
+ *   DISCORD_BOT_TOKEN  — bot token ($CLAUDE_CONFIG_DIR/channels/discord/.env)
  *   GEMINI_API_KEY (or GEMINI_VOICE_API_KEY) — required; voiceApiKey()
  *   VOICE_MODEL — text/STT model; native-audio model + googleSearch +
  *                 owner_mode/channels live in the per-user config at
@@ -381,7 +381,7 @@ function delegateTask(s: DiscordVoiceSession, taskDescription: string): Promise<
 		`channel: ${s.channelId}\n` +
 		`access_tier: ${currentTier(s)}\n` +
 		`task: ${taskDescription}\n` +
-		`hint: Check ~/.claude/skills/ for a matching skill before using raw commands.\n` +
+		`hint: Check ${process.env.CLAUDE_CONFIG_DIR ? `${process.env.CLAUDE_CONFIG_DIR}/skills/` : '~/.claude/skills/'} for a matching skill before using raw commands.\n` +
 		`transcript:\n${fullTranscript}\n`;
 	writeFileSync(taskPath, content);
 

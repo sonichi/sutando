@@ -4,7 +4,7 @@
  * voice session.
  *
  * Mirrors the discord-bridge access model exactly (discord-bridge.py), read
- * from the same ~/.claude/channels/discord/access.json:
+ * from the same $CLAUDE_CONFIG_DIR/channels/discord/access.json:
  *   owner — top-level `allowFrom` (canonical owner tier — discord-bridge.py
  *           treats top-level allowFrom as owner; access.json's `owner` field
  *           is not the tier source)

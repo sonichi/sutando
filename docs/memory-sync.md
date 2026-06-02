@@ -38,7 +38,7 @@ Repeat the same steps on every machine in the fleet. All clone the same `SUTANDO
 
 | Source | Synced to | Notes |
 |---|---|---|
-| `$CLAUDE_CONFIG_DIR/projects/<workspace-hash>/memory/*.md` | `~/.sutando/memory-sync/memory/` | Claude Code auto-memory files. Append-only is safest. Source resolves to `~/.claude/projects/...` for vanilla `claude` or `<workspace>/.claude-sutando/projects/...` for the `claude-sutando` shell function. |
+| `$CLAUDE_CONFIG_DIR/projects/<workspace-hash>/memory/*.md` | `~/.sutando/memory-sync/memory/` | Claude Code auto-memory files. Append-only is safest. |
 | `<sutando workspace>/notes/` | `~/.sutando/memory-sync/notes/` | Long-form notes. Symlink pattern recommended (see below). |
 
 ## What does NOT get synced

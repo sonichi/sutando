@@ -255,7 +255,8 @@ export const workTool: ToolDefinition = {
 				const image = execSync('ls -t /tmp/discord-inbox/*.jpg /tmp/discord-inbox/*.png 2>/dev/null | head -1', { timeout: 3000 }).toString().trim();
 				const video = execSync('ls -t /tmp/sutando-recording-*-narrated-subtitled.mov /tmp/sutando-recording-*-narrated.mov /tmp/sutando-recording-*.mov 2>/dev/null | head -1', { timeout: 3000 }).toString().trim();
 				if (image && video) {
-					const result = execSync(`bash ~/.claude/skills/video-concat/scripts/prepend-image.sh "${image}" "${video}" 3`, { timeout: 60000 }).toString().trim();
+					const claudeCfgDir = process.env.CLAUDE_CONFIG_DIR || `${process.env.HOME}/.claude`;
+					const result = execSync(`bash "${claudeCfgDir}/skills/video-concat/scripts/prepend-image.sh" "${image}" "${video}" 3`, { timeout: 60000 }).toString().trim();
 					const parsed = JSON.parse(result);
 					return { status: 'done', result: `Video with image prepended: ${parsed.output} (${parsed.size_mb}MB)` };
 				}

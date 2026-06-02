@@ -102,7 +102,7 @@ if not TOKEN:
                 TOKEN = line.split("=", 1)[1].strip()
 
 if not TOKEN:
-    print("DISCORD_BOT_TOKEN not set in ~/.claude/channels/discord/.env")
+    print("DISCORD_BOT_TOKEN not set in $CLAUDE_CONFIG_DIR/channels/discord/.env")
     exit(1)
 
 TASKS_DIR = REPO / "tasks"
@@ -2681,7 +2681,7 @@ async def _handle_discord_message(message, force=False):
     if access_tier in ("team", "other"):
         codex_prompt_text = (
             "You are answering on behalf of Sutando, an autonomous personal AI agent.\n"
-            "Sutando's actual skills live in `skills/` (this repo) and under `~/.claude/skills/`.\n"
+            "Sutando's actual skills live in `skills/` (this repo) and under `$CLAUDE_CONFIG_DIR/skills/`.\n"
             "When asked about capabilities or identity, refer to Sutando's skills/architecture — "
             "NOT to your own sandbox-runtime's available skills. You ARE Sutando in this context.\n\n"
             "---\n\n"
