@@ -199,6 +199,18 @@ fi
 mkdir -p "$WORKSPACE/logs" "$WORKSPACE/tasks" "$WORKSPACE/results" "$WORKSPACE/data" "$WORKSPACE/state"
 LOGS_DIR="$WORKSPACE/logs"
 
+# Offer to set up the `claude-sutando` shell alias once per host. The helper
+# resolves CLAUDE_CONFIG_DIR via `bash scripts/sutando-config.sh claude-sutando-config-dir`
+# (driven by `claude_sutando_config_dir.subdir` in sutando.config.json; default
+# `.claude-sutando` under workspace), drift-detects an existing alias, and
+# either appends or in-place rewrites the rc file. --auto guards via a
+# per-host sentinel at $WORKSPACE/state/.shell-setup-prompted-<hostname> so
+# this never re-pesters after the user's initial yes/no.
+# Failures are non-fatal — startup.sh continues regardless.
+if [ -x "$REPO/scripts/sutando-shell-setup.sh" ]; then
+  bash "$REPO/scripts/sutando-shell-setup.sh" --auto || true
+fi
+
 # Reap any stale watch-tasks-stream watcher from a prior session. The
 # in-session Stop hook (.claude/settings.json) handles clean shutdown, but
 # a hard crash (SIGKILL, panic, force-quit, power loss) skips it and leaves
