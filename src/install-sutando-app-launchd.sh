@@ -36,13 +36,14 @@ SERVICE="$DOMAIN/$LABEL"
 
 # Resolve runtime workspace via the M0 helper (PR #1395). Defaults to
 # <repo>/workspace/; honors $SUTANDO_WORKSPACE as legacy escape hatch.
-WORKSPACE="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)"
-if [ -z "$WORKSPACE" ]; then
-  if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
-    WORKSPACE="${SUTANDO_WORKSPACE/#\~/$HOME}"
-  else
-    WORKSPACE="$HOME/.sutando/workspace"
-  fi
+# Fail loud if neither path resolves.
+if [ -f "$REPO/scripts/sutando-config.sh" ]; then
+  WORKSPACE="$(bash "$REPO/scripts/sutando-config.sh" workspace)"
+elif [ -n "${SUTANDO_WORKSPACE:-}" ]; then
+  WORKSPACE="${SUTANDO_WORKSPACE/#\~/$HOME}"
+else
+  echo "install-sutando-app-launchd: cannot resolve workspace — neither $REPO/scripts/sutando-config.sh exists nor \$SUTANDO_WORKSPACE is set." >&2
+  exit 1
 fi
 
 APP_BINARY="$REPO/src/Sutando/Sutando.app/Contents/MacOS/Sutando"

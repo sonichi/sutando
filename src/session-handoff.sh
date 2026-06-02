@@ -22,11 +22,18 @@ export PATH="/opt/homebrew/bin:$HOME/.nvm/versions/node/v24.14.1/bin:$PATH"
 STATE_FILE="$REPO/session-state.md"
 TRANSCRIPT="$1"  # Passed by PreCompact hook as $TRANSCRIPT_PATH
 
-# Workspace resolves via the M0 helper (scripts/sutando-config.sh). Falls back
-# to the legacy default only if the helper isn't available — defensive guard,
-# not the primary path. See workspace-revamp M0 (PR #1395).
-WORKSPACE_DIR=$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)
-[ -z "$WORKSPACE_DIR" ] && WORKSPACE_DIR="${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}"
+# Workspace resolves via the M0 helper (scripts/sutando-config.sh). Honors
+# $SUTANDO_WORKSPACE as a legacy fallback for non-checkout installs where
+# the helper isn't present. Fail-loud if neither resolves — refuses to write
+# to a hardcoded legacy default. See workspace-revamp M0 (PR #1395).
+if [ -f "$REPO/scripts/sutando-config.sh" ]; then
+  WORKSPACE_DIR="$(bash "$REPO/scripts/sutando-config.sh" workspace)"
+elif [ -n "${SUTANDO_WORKSPACE:-}" ]; then
+  WORKSPACE_DIR="${SUTANDO_WORKSPACE/#\~/$HOME}"
+else
+  echo "session-handoff: cannot resolve workspace — neither $REPO/scripts/sutando-config.sh exists nor \$SUTANDO_WORKSPACE is set." >&2
+  exit 1
+fi
 
 # Build state from available signals
 {

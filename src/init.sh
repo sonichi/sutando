@@ -13,21 +13,30 @@ set -e
 REPO="${SUTANDO_REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
 MODE="${1:-full}"
 
+# Validate mode BEFORE workspace resolution so a usage error doesn't get
+# masked by a workspace-resolution failure (which would surface a less
+# actionable message for the caller).
+case "$MODE" in
+  --auto|--preflight|--full|full) ;;
+  *) echo "Usage: bash src/init.sh [--auto | --preflight]"; exit 2;;
+esac
+
 # Resolve runtime workspace via the M0 helper (scripts/sutando-config.sh).
 # Post-M0 (PR #1395): default = <repo>/workspace/; $SUTANDO_WORKSPACE remains
-# honored as legacy escape hatch. Runtime state files (logs, state, tasks,
-# results, notes, data, pending-questions.md, …) live here; loose status .json
-# files (core-status.json, voice-state.json, …) live under state/. Repo stays
-# for the code + skills + the schedule-crons.json copy below.
-WORKSPACE="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)"
-if [ -z "$WORKSPACE" ]; then
-  # Defensive fallback only if the helper isn't reachable (e.g. partial checkout
-  # or pre-M0 install). Honors the same env override the helper would.
-  if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
-    WORKSPACE="${SUTANDO_WORKSPACE/#\~/$HOME}"
-  else
-    WORKSPACE="$HOME/.sutando/workspace"
-  fi
+# honored as legacy escape hatch (via the helper or as a fallback here for
+# non-checkout installs). Runtime state files (logs, state, tasks, results,
+# notes, data, pending-questions.md, …) live here; loose status .json files
+# (core-status.json, voice-state.json, …) live under state/. Repo stays for
+# the code + skills + the schedule-crons.json copy below.
+# Fail loudly if neither path resolves — refuses to silently write to a
+# hardcoded legacy default (which would re-introduce the M1 split-brain class).
+if [ -f "$REPO/scripts/sutando-config.sh" ]; then
+  WORKSPACE="$(bash "$REPO/scripts/sutando-config.sh" workspace)"
+elif [ -n "${SUTANDO_WORKSPACE:-}" ]; then
+  WORKSPACE="${SUTANDO_WORKSPACE/#\~/$HOME}"
+else
+  echo "init.sh: cannot resolve workspace — neither $REPO/scripts/sutando-config.sh exists nor \$SUTANDO_WORKSPACE is set." >&2
+  exit 1
 fi
 
 # Surface the silent-fallback bug class (see PR #1367/#1368): if .env defines
@@ -43,11 +52,6 @@ if [ -f "$REPO/.env" ]; then
   fi
   unset _env_val
 fi
-
-case "$MODE" in
-  --auto|--preflight|--full|full) ;;
-  *) echo "Usage: bash src/init.sh [--auto | --preflight]"; exit 2;;
-esac
 
 log() {
   # Quiet under --auto unless we're actually creating something
