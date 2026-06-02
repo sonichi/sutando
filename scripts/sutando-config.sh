@@ -65,6 +65,18 @@ print(resolve_vault().get('remote_url', ''), end='')
 "
     ;;
 
+  claude-sutando-config-dir)
+    # M2 — print the absolute CLAUDE_CONFIG_DIR target used by the
+    # `claude-sutando` shell alias. Always a sub-folder of resolve_workspace()
+    # (the loader enforces; absolute paths and `..` escapes rejected).
+    python3 -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import resolve_claude_sutando_config_dir
+print(resolve_claude_sutando_config_dir(), end='')
+"
+    ;;
+
   dump)
     python3 -m src.sutando_config
     ;;

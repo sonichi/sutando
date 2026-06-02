@@ -35,6 +35,7 @@ from sutando_config import (  # noqa: E402
     _strip_comments,
     detect_env_workspace_in_dotenv,
     load_config,
+    resolve_claude_sutando_config_dir,
     resolve_vault,
     resolve_workspace,
 )
@@ -265,6 +266,75 @@ class TestSutandoConfig(unittest.TestCase):
         self.assertEqual(vault["interval_seconds"], 600)
 
     # ------------------------------------------------------------------ #
+    #  9. resolve_claude_sutando_config_dir() — M2 alias target          #
+    # ------------------------------------------------------------------ #
+
+    def test_claude_sutando_config_dir_default(self):
+        _write_config(self.repo, "sutando.config.json", {})
+        ccd = resolve_claude_sutando_config_dir(repo_root=self.repo)
+        ws = resolve_workspace(repo_root=self.repo)
+        # Default subdir is `.claude-sutando` under workspace.
+        self.assertEqual(ccd, (ws / ".claude-sutando").resolve())
+
+    def test_claude_sutando_config_dir_subdir_override(self):
+        _write_config(self.repo, "sutando.config.json", {
+            "claude_sutando_config_dir": {"subdir": "my-claude-state"},
+        })
+        ccd = resolve_claude_sutando_config_dir(repo_root=self.repo)
+        ws = resolve_workspace(repo_root=self.repo)
+        self.assertEqual(ccd, (ws / "my-claude-state").resolve())
+
+    def test_claude_sutando_config_dir_rejects_absolute(self):
+        _write_config(self.repo, "sutando.config.json", {
+            "claude_sutando_config_dir": {"subdir": "/etc/claude-state"},
+        })
+        with self.assertRaises(ValueError) as cm:
+            resolve_claude_sutando_config_dir(repo_root=self.repo)
+        self.assertIn("workspace-sub-folder invariant", str(cm.exception))
+
+    def test_claude_sutando_config_dir_rejects_parent_escape(self):
+        _write_config(self.repo, "sutando.config.json", {
+            "claude_sutando_config_dir": {"subdir": "../escape"},
+        })
+        with self.assertRaises(ValueError) as cm:
+            resolve_claude_sutando_config_dir(repo_root=self.repo)
+        self.assertIn("workspace-sub-folder invariant", str(cm.exception))
+
+    def test_claude_sutando_config_dir_rejects_deep_parent_escape(self):
+        # Even a `..` segment mid-path should be caught (not just at the start).
+        _write_config(self.repo, "sutando.config.json", {
+            "claude_sutando_config_dir": {"subdir": "ok/../../../etc"},
+        })
+        with self.assertRaises(ValueError) as cm:
+            resolve_claude_sutando_config_dir(repo_root=self.repo)
+        self.assertIn("workspace-sub-folder invariant", str(cm.exception))
+
+    def test_claude_sutando_config_dir_honors_env_workspace_override(self):
+        # Owner-raised: if user sets $SUTANDO_WORKSPACE to a custom path,
+        # the returned ccd path must be `<custom>/.claude-sutando` (string-prefix
+        # consistent with resolve_workspace's return value, not the symlink-
+        # canonicalized form). Regression test: pre-fix code returned
+        # `/private/tmp/.../.claude-sutando` on macOS when env pointed to /tmp.
+        with tempfile.TemporaryDirectory() as ws_dir:
+            old_env = os.environ.get("SUTANDO_WORKSPACE")
+            os.environ["SUTANDO_WORKSPACE"] = ws_dir
+            try:
+                _write_config(self.repo, "sutando.config.json", {})
+                _reset_cache_for_tests()
+                ws = resolve_workspace(repo_root=self.repo)
+                ccd = resolve_claude_sutando_config_dir(repo_root=self.repo)
+                # The exact behavior the owner asked about:
+                self.assertEqual(str(ccd), str(ws / ".claude-sutando"))
+                # And the string-prefix invariant the caller relies on:
+                self.assertTrue(str(ccd).startswith(str(ws)))
+            finally:
+                if old_env is None:
+                    del os.environ["SUTANDO_WORKSPACE"]
+                else:
+                    os.environ["SUTANDO_WORKSPACE"] = old_env
+                _reset_cache_for_tests()
+
+    # ------------------------------------------------------------------ #
     #  Bonus: detect_env_workspace_in_dotenv()                            #
     # ------------------------------------------------------------------ #
 
@@ -373,6 +443,7 @@ class TestSutandoConfig(unittest.TestCase):
     def test_known_keys_only_does_not_warn(self):
         _write_config(self.repo, "sutando.config.json", {
             "workspace": {"path": "/ws"},
+            "claude_sutando_config_dir": {"subdir": ".claude-sutando"},
             "vault": {"enabled": False},
         })
         import io
@@ -383,7 +454,12 @@ class TestSutandoConfig(unittest.TestCase):
             load_config(repo_root=self.repo)
         finally:
             sys.stderr = saved_stderr
+        # Regression guard: claude_sutando_config_dir must be in the known-keys
+        # set, otherwise users adding the (documented) override block trigger
+        # the misleading "unknown key — loader will ignore" warn even though
+        # the loader DOES read it. Caught 2026-06-02 in commit 1 review.
         self.assertNotIn("does not read", buf.getvalue())
+        self.assertNotIn("claude_sutando_config_dir", buf.getvalue())
 
     def test_expand_vars_walks_nested_structures(self):
         out = _expand_vars({"path": "${REPO_DIR}/ws",

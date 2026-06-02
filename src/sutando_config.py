@@ -47,7 +47,7 @@ _LOCAL_FILENAME = "sutando.config.local.json"
 # to teach IDEs strictness for autocomplete; the loader itself stays
 # lenient (warn-only) so users with experimental or scratch keys don't
 # break. Per Mini's review #8 on PR #1395.
-_KNOWN_TOP_LEVEL_KEYS = {"workspace", "vault"}
+_KNOWN_TOP_LEVEL_KEYS = {"workspace", "claude_sutando_config_dir", "vault"}
 
 
 def _find_repo_root(start: Optional[Path] = None) -> Optional[Path]:
@@ -365,6 +365,59 @@ def resolve_vault(repo_root: Optional[Path] = None) -> Dict[str, Any]:
     vault["sync"] = sync
     vault.setdefault("interval_seconds", 1800)
     return vault
+
+
+_DEFAULT_CLAUDE_SUTANDO_SUBDIR = ".claude-sutando"
+
+
+def resolve_claude_sutando_config_dir(repo_root: Optional[Path] = None) -> Path:
+    """Resolve the CLAUDE_CONFIG_DIR target for the `claude-sutando` shell alias.
+
+    The path is always a sub-folder of `resolve_workspace()` — the M2 vault sync
+    engine relies on this invariant to include the Claude config tree via a single
+    workspace-relative glob. Absolute paths and `..` escapes in the config are
+    rejected at load (schema pattern) AND asserted again here (defense in depth).
+
+    Resolution order:
+      1. `claude_sutando_config_dir.subdir` in sutando.config.{local,}.json
+      2. Default: `.claude-sutando`
+
+    Returns the absolute Path. Does NOT create the directory — callers (e.g.
+    `scripts/sutando-shell-setup.sh`) are responsible for mkdir as part of the
+    alias-setup flow.
+    """
+    cfg = load_config(repo_root)
+    block = dict(cfg.get("claude_sutando_config_dir") or {})
+    subdir = block.get("subdir") or _DEFAULT_CLAUDE_SUTANDO_SUBDIR
+
+    # Defense in depth: re-validate the invariants the schema already enforces
+    # at load time, in case config bypassed validation or was hand-edited.
+    if not subdir or subdir.startswith("/") or ".." in Path(subdir).parts:
+        raise ValueError(
+            f"claude_sutando_config_dir.subdir={subdir!r} violates the "
+            f"workspace-sub-folder invariant — must be a non-absolute, "
+            f"non-escaping relative path (M2 sync coherence depends on this)."
+        )
+
+    workspace = resolve_workspace(repo_root)
+    final = workspace / subdir
+
+    # Final-path check — resolve() follows symlinks, so the CANONICAL form of
+    # the result must still be inside the CANONICAL form of the workspace tree.
+    # We use .resolve() ONLY for this invariant check; the returned path stays
+    # in its un-canonicalized form so callers get a string prefix consistent
+    # with resolve_workspace() (e.g. on macOS, `/tmp/...` doesn't become
+    # `/private/tmp/...` just because we passed through .resolve()).
+    try:
+        final.resolve().relative_to(workspace.resolve())
+    except ValueError:
+        raise ValueError(
+            f"claude_sutando_config_dir.subdir={subdir!r} resolves outside "
+            f"the workspace ({final.resolve()} not under {workspace.resolve()}). "
+            f"Likely a symlink escape; reject."
+        )
+
+    return final
 
 
 def detect_env_workspace_in_dotenv(repo_root: Optional[Path] = None) -> Optional[str]:

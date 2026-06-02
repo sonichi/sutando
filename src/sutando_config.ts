@@ -16,7 +16,7 @@
  * No external deps — stdlib only.
  */
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, parse, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -34,7 +34,7 @@ const LOCAL_FILENAME = 'sutando.config.local.json';
  * stays lenient (warn-only) so experimental/scratch keys don't break.
  * Per Mini's review #8 on PR #1395.
  */
-const KNOWN_TOP_LEVEL_KEYS = new Set(['workspace', 'vault']);
+const KNOWN_TOP_LEVEL_KEYS = new Set(['workspace', 'claude_sutando_config_dir', 'vault']);
 
 /**
  * Walk upward from `start` until we find a directory containing
@@ -312,6 +312,66 @@ export function resolveVault(repoRoot?: string): VaultConfig {
 		},
 		interval_seconds: typeof vault.interval_seconds === 'number' ? vault.interval_seconds : 1800,
 	};
+}
+
+const DEFAULT_CLAUDE_SUTANDO_SUBDIR = '.claude-sutando';
+
+/**
+ * Resolve the CLAUDE_CONFIG_DIR target for the `claude-sutando` shell alias.
+ *
+ * The path is always a sub-folder of `resolveWorkspace()` — the M2 vault sync
+ * engine relies on this invariant to include the Claude config tree via a
+ * single workspace-relative glob. Absolute paths and `..` escapes in config
+ * are rejected at load (schema pattern) AND asserted again here (defense in
+ * depth, catches symlink escapes the regex misses).
+ *
+ * Does NOT create the directory — callers (e.g. `scripts/sutando-shell-setup.sh`)
+ * are responsible for mkdir as part of the alias-setup flow.
+ *
+ * @throws if the subdir violates the workspace-sub-folder invariant.
+ */
+export function resolveClaudeSutandoConfigDir(repoRoot?: string): string {
+	const cfg = loadConfig(repoRoot);
+	const block = (cfg.claude_sutando_config_dir as { [k: string]: Json } | undefined) ?? {};
+	const subdir = (typeof block.subdir === 'string' ? block.subdir : '') || DEFAULT_CLAUDE_SUTANDO_SUBDIR;
+
+	// Defense in depth: re-validate the invariants the schema enforces at load
+	// time, in case config bypassed validation or was hand-edited.
+	if (!subdir || subdir.startsWith('/') || subdir.split(/[\\/]/).includes('..')) {
+		throw new Error(
+			`claude_sutando_config_dir.subdir=${JSON.stringify(subdir)} violates the ` +
+				`workspace-sub-folder invariant — must be a non-absolute, non-escaping relative ` +
+				`path (M2 sync coherence depends on this).`,
+		);
+	}
+
+	const workspace = resolveWorkspace(repoRoot);
+	const final = join(workspace, subdir);
+
+	// Final-path check — realpath follows symlinks, so the CANONICAL form of the
+	// result must still be inside the CANONICAL form of the workspace tree. We
+	// use realpath ONLY for this invariant check; the returned path stays in its
+	// un-canonicalized form so callers get a string prefix consistent with
+	// resolveWorkspace() (e.g. on macOS, `/tmp/...` doesn't become `/private/tmp/...`
+	// just because we passed through realpath).
+	try {
+		const finalReal = realpathSync.native ? realpathSync.native(final) : final;
+		const workspaceReal = realpathSync.native ? realpathSync.native(workspace) : workspace;
+		const sep = workspaceReal.endsWith('/') ? '' : '/';
+		if (finalReal !== workspaceReal && !finalReal.startsWith(workspaceReal + sep)) {
+			throw new Error(
+				`claude_sutando_config_dir.subdir=${JSON.stringify(subdir)} resolves outside ` +
+					`the workspace (${finalReal} not under ${workspaceReal}). Likely a symlink escape; reject.`,
+			);
+		}
+	} catch (err) {
+		// realpath throws if the path doesn't exist yet (first-run); that's fine —
+		// the un-canonicalized form is still string-prefix safe since we never
+		// dereferenced symlinks in this branch. Surface non-existence as no-op.
+		if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+	}
+
+	return final;
 }
 
 /**

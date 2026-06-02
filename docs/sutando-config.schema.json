@@ -18,6 +18,20 @@
         }
       }
     },
+    "claude_sutando_config_dir": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Where the Sutando-scoped Claude Code config lives — set via the `claude-sutando` shell function as CLAUDE_CONFIG_DIR. Constrained to a workspace sub-folder so the M2 vault sync engine can include it via a single workspace-relative glob; if the path escapes the workspace, sync coherence breaks.",
+      "properties": {
+        "subdir": {
+          "type": "string",
+          "minLength": 1,
+          "default": ".claude-sutando",
+          "pattern": "^(?!.*\\.\\.)(?!/)[^/].*$",
+          "description": "Sub-folder of <workspace> for CLAUDE_CONFIG_DIR. MUST be a relative sub-path of the workspace — absolute paths (leading `/`) and `..` parent-directory escapes are rejected. The loader additionally asserts the resolved final path stays under workspace (defense in depth)."
+        }
+      }
+    },
     "vault": {
       "type": "object",
       "additionalProperties": false,
