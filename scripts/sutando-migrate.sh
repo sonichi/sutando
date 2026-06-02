@@ -91,6 +91,20 @@ WORKSPACE_SURFACE_DIRS=(
     "email-drafts"
     "agent-inbox"
 )
+
+# Per `feedback_per_source_surface_lists` 2026-06-02: dirs in Mini's #7
+# defensive set that EXIST at the sutando repo root as CODE (not workspace
+# data). Source A walks must SKIP these — otherwise migration would treat
+# `<repo>/docs/`, `<repo>/agents/`, etc. as workspace surface, migrate them
+# into `<workspace>/`, and `--delete-source` would delete the repo's own
+# documentation. Caught after owner's repo-root cleanup wiped `<repo>/docs/`
+# (recovered via git checkout HEAD -- docs/).
+SOURCE_A_EXCLUDE=(
+    "agents"
+    "docs"
+    "email-drafts"
+    "agent-inbox"
+)
 WORKSPACE_SURFACE_FILES=(
     "build_log.md"
     "conversation.log"
@@ -383,8 +397,18 @@ scan_source() {
     # roots; user-custom content like experiments/ obsidian-vault/ should be
     # quarantined per Lucy #design + owner direction 2026-06-02).
     local -a walk_paths=()
-    local sd sf
+    local sd sf _ex_a
     for sd in "${WORKSPACE_SURFACE_DIRS[@]}"; do
+        # Per feedback_per_source_surface_lists: Source A is the sutando
+        # repo, not a workspace. Skip dirs in SOURCE_A_EXCLUDE so we don't
+        # migrate repo code (e.g. <repo>/docs/) as workspace surface.
+        if [ "$tag" = "A" ]; then
+            local _skip_a=0
+            for _ex_a in "${SOURCE_A_EXCLUDE[@]}"; do
+                [ "$sd" = "$_ex_a" ] && _skip_a=1 && break
+            done
+            [ "$_skip_a" = "1" ] && continue
+        fi
         [ -d "$src/$sd" ] && walk_paths+=("$src/$sd")
     done
     for sf in "${WORKSPACE_SURFACE_FILES[@]}"; do
@@ -1036,8 +1060,18 @@ commit_source() {
 
     # Reuse the same walk-list logic as scan_source (including B+C quarantine).
     local -a walk_paths=()
-    local sd sf
+    local sd sf _ex_a
     for sd in "${WORKSPACE_SURFACE_DIRS[@]}"; do
+        # Per feedback_per_source_surface_lists: Source A is the sutando
+        # repo, not a workspace. Skip dirs in SOURCE_A_EXCLUDE so we don't
+        # migrate repo code (e.g. <repo>/docs/) as workspace surface.
+        if [ "$tag" = "A" ]; then
+            local _skip_a=0
+            for _ex_a in "${SOURCE_A_EXCLUDE[@]}"; do
+                [ "$sd" = "$_ex_a" ] && _skip_a=1 && break
+            done
+            [ "$_skip_a" = "1" ] && continue
+        fi
         [ -d "$src/$sd" ] && walk_paths+=("$src/$sd")
     done
     for sf in "${WORKSPACE_SURFACE_FILES[@]}"; do
