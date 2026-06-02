@@ -197,6 +197,13 @@ def claude_home_path(*subpath: str) -> Path:
     install, that's where settings, sessions, channels, skills, and memory
     actually live post-migrate. The CLAUDE_HOME hatch still works for tests
     that need a non-default but non-workspace location.
+
+    Companion env var: $SOURCE_CLAUDE_CONFIG_DIR (defaults to ~/.claude) is
+    used by migration scripts (sutando-shell-setup.sh --migrate, src/migrate.sh)
+    to refer to the READ-FROM source — i.e., where vanilla claude state lives
+    historically. claude_home_path() does NOT consult it; this helper is for
+    RUNTIME path resolution. Migration code uses SOURCE_CLAUDE_CONFIG_DIR
+    directly to keep the read-side / write-side distinction visible.
     """
     ccd_env = os.environ.get("CLAUDE_CONFIG_DIR")
     home_env = os.environ.get("CLAUDE_HOME")

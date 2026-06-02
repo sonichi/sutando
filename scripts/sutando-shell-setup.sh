@@ -324,9 +324,14 @@ EOF
     # Excludes:
     # - debug/, plugins/*/cache/, statsig/ — transient / regeneratable
     # - projects/<other-slug>/ — handled by the include/exclude pair below
-    SOURCE_DIR="$HOME/.claude"
+    # SOURCE_CLAUDE_CONFIG_DIR = where the migration READS FROM (vanilla claude's
+    # historical state location). Defaults to ~/.claude; override for CI / custom
+    # installs / staging fixtures (e.g. SOURCE_CLAUDE_CONFIG_DIR=/tmp/seed-state).
+    # Companion to CLAUDE_CONFIG_DIR (the destination where Sutando writes to).
+    SOURCE_DIR="${SOURCE_CLAUDE_CONFIG_DIR:-$HOME/.claude}"
     if [ ! -d "$SOURCE_DIR" ]; then
       echo "sutando-shell-setup --migrate: source $SOURCE_DIR doesn't exist; nothing to copy" >&2
+      echo "  (set SOURCE_CLAUDE_CONFIG_DIR to override the migration source location)" >&2
       exit 1
     fi
     if ! command -v rsync >/dev/null 2>&1; then
