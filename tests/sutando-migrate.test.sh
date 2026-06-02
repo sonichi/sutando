@@ -85,11 +85,9 @@ RUN_MIGRATE scan --source A,B,C 2>&1 \
 
 echo
 echo "==== TEST: commit ===="
-RUN_MIGRATE commit --source A,B,C 2>&1 \
-    | grep -E "Committing source|copied:|identical:|kept-dest:|sidecar:|skipped:|sentinel:|backup|COMMIT" \
-    | head -40
-# Capture the INITIAL backup id so rollback test can use a known pre-commit state.
-INITIAL_BACKUP_ID="$(ls "$DEST/state/migration-backup-"*.tar.gz 2>/dev/null | head -1 | sed -E 's@.*migration-backup-(.+)\.tar\.gz@\1@')"
+COMMIT_OUT="$(RUN_MIGRATE commit --source A,B,C 2>&1)"
+echo "$COMMIT_OUT" | grep -E "Committing source|copied:|identical:|kept-dest:|sidecar:|skipped:|sentinel:|backup|COMMIT" | head -40
+INITIAL_BACKUP_ID="$(echo "$COMMIT_OUT" | grep -E "^sutando-migrate: backup" | head -1 | sed -E 's@.*migration-backup-(.+)\.tar\.gz.*@\1@')"
 
 echo
 echo "==== ASSERTIONS ===="
@@ -160,7 +158,7 @@ fi
 # After commit C→A→B, A wins canonical, C goes to sidecar prior-from-A,
 # B is the oldest+dest-loser → sidecar legacy-B.
 side_a="$(ls "$DEST/notes/divergent.md.legacy-prior-from-A-"* 2>/dev/null | head -1)"
-side_b="$(ls "$DEST/notes/divergent.md.legacy-B-"* 2>/dev/null | head -1)"
+side_b="$(ls "$DEST/notes/divergent.md.legacy-B-"*-p* 2>/dev/null | head -1)"
 if [ -z "$side_a" ] || [ -z "$side_b" ]; then
     echo "  FAIL: 3-way collision: missing one of the sidecars (prior-from-A=$side_a, legacy-B=$side_b)"
     fail=1
@@ -230,6 +228,25 @@ else
     fail=1
 fi
 
+# 10. Rollback FIRST (before --delete-source mutates dest state). Use INITIAL_BACKUP_ID.
+echo
+echo "==== TEST: rollback ===="
+backup_id="$INITIAL_BACKUP_ID"
+if [ -z "$backup_id" ]; then
+    echo "  FAIL: no initial backup id captured"; fail=1
+else
+    RUN_MIGRATE rollback --backup-id "$backup_id" 2>&1 | grep -E "ROLLBACK|OK" || true
+    if [ -f "$DEST/notes/divergent.md" ] || [ -f "$DEST/legacy/A/build_log.md" ]; then
+        echo "  FAIL: rollback did not restore (artifacts remain)"; fail=1
+    else
+        echo "  OK: rollback restored dest to pre-commit state"
+    fi
+fi
+
+# Re-commit so --delete-source has something to delete from.
+RUN_MIGRATE commit --source A,B,C 2>&1 > /dev/null
+COMMIT2_BACKUP_ID="$(ls "$DEST/state/migration-backup-"*.tar.gz | sort -r | head -1 | sed -E 's@.*migration-backup-(.+)\.tar\.gz@\1@')"
+
 # 9b. --delete-source: requires --backup-id (Mini's polish). Without it, refuses.
 echo
 echo "==== TEST: --delete-source requires --backup-id ===="
@@ -244,8 +261,7 @@ fi
 # 9c. --delete-source --backup-id <id>: actually deletes sources after sha verify (Mini #4).
 echo
 echo "==== TEST: --delete-source actually removes sources ===="
-backup_id_pre="$(ls "$DEST/state/migration-backup-"*.tar.gz 2>/dev/null | head -1 | sed -E 's@.*migration-backup-(.+)\.tar\.gz@\1@' || true)"
-out2="$(RUN_MIGRATE commit --source A,B,C --delete-source --backup-id "$backup_id_pre" 2>&1 || true)"
+out2="$(RUN_MIGRATE commit --source A,B,C --delete-source --backup-id "$COMMIT2_BACKUP_ID" 2>&1 || true)"
 if echo "$out2" | grep -q "deleted:"; then
     # Pick a known-sidecared source file that sha-matches dest:
     # state/contextual-chips.json was newest-mtime'd; A's version landed at dest.
@@ -258,22 +274,6 @@ if echo "$out2" | grep -q "deleted:"; then
 else
     echo "  FAIL: --delete-source did not print 'deleted:' counter; output: $(echo "$out2" | tail -5)"
     fail=1
-fi
-
-# 10. Rollback: get backup id from dest
-echo
-echo "==== TEST: rollback ===="
-backup_id="$INITIAL_BACKUP_ID"
-if [ -z "$backup_id" ]; then
-    echo "  FAIL: no backup tarball found"; fail=1
-else
-    RUN_MIGRATE rollback --backup-id "$backup_id" 2>&1 | grep -E "ROLLBACK|OK"
-    # Dest should now be back to empty state (no notes/divergent.md etc.)
-    if [ -f "$DEST/notes/divergent.md" ] || [ -f "$DEST/legacy/A/build_log.md" ]; then
-        echo "  FAIL: rollback did not restore (artifacts remain)"; fail=1
-    else
-        echo "  OK: rollback restored dest to pre-commit state"
-    fi
 fi
 
 echo

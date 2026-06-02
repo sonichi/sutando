@@ -624,12 +624,18 @@ banner "sources detected:"
 [ -n "$B_REAL_OK" ] && banner "  B (~/.sutando/workspace/):     $B_REAL_OK"
 [ -n "$C_REAL_OK" ] && banner "  C (SUTANDO_WORKSPACE env):     $C_REAL_OK"
 [ -z "$A_REAL_OK$B_REAL_OK$C_REAL_OK" ] && {
-    if [ "$JSON" = "1" ]; then
-        echo '{"dest":"'"$DEST_REAL"'","sources":{},"totals":{"unique_relpaths":0,"collisions":0,"identical_content":0,"genuine_conflicts":0,"by_class":{}},"notable_collisions":[]}'
-    else
-        echo "  (none — nothing to migrate; dest=$DEST_REAL is the only locus)"
-    fi
-    exit 0
+    # Rollback and verify don't need sources — they operate on dest alone.
+    case "$MODE" in
+        rollback|verify) ;;
+        *)
+            if [ "$JSON" = "1" ]; then
+                echo '{"dest":"'"$DEST_REAL"'","sources":{},"totals":{"unique_relpaths":0,"collisions":0,"identical_content":0,"genuine_conflicts":0,"by_class":{}},"notable_collisions":[]}'
+            else
+                echo "  (none — nothing to migrate; dest=$DEST_REAL is the only locus)"
+            fi
+            exit 0
+            ;;
+    esac
 }
 banner ""
 
@@ -743,7 +749,11 @@ report_cross_source() {
 BACKUP_ID=""
 
 backup_dest() {
-    BACKUP_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+    # Per-second ts collision possible when two commits happen in same second
+    # (test idempotency re-run + initial commit are the typical case). Append
+    # PID + random so each backup_dest call gets a unique BACKUP_ID. Without
+    # this, the second commit's tar would overwrite the first AND include it.
+    BACKUP_ID="$(date -u +%Y%m%dT%H%M%SZ)-p$$r$RANDOM"
     local backup_path="$DEST_REAL/state/migration-backup-$BACKUP_ID.tar.gz"
     mkdir -p "$DEST_REAL/state"
     # Backup only the workspace surface (avoid backing up the backup-in-progress).
@@ -756,7 +766,18 @@ backup_dest() {
         [ -e "$DEST_REAL/$sf" ] && surface+=("$sf")
     done
     if [ ${#surface[@]} -gt 0 ]; then
-        ( cd "$DEST_REAL" && tar -czf "$backup_path" "${surface[@]}" 2>/dev/null )
+        [ "${SUTANDO_MIGRATE_DEBUG:-0}" = "1" ] && echo "[debug] backup_dest surface: ${surface[*]}" >&2
+        # Tar to a system temp location (OUTSIDE dest/state/) to avoid the
+        # self-reference where tarring state/ also includes the partial
+        # backup tarball being written. Move atomically into state/ at end.
+        # Mini's intermittent test-failure trail led to this — exclude didn't
+        # work reliably across BSD/GNU tar.
+        local tmp_backup
+        tmp_backup="$(mktemp -t sutando-mig-backup.XXXXXX).tar.gz"
+        ( cd "$DEST_REAL" && tar -czf "$tmp_backup" "${surface[@]}" 2>/dev/null )
+        # Now delete the migration-backup-*.tar.gz entries from the tar so
+        # restoring doesn't repopulate them. Easier: just mv to final spot.
+        mv "$tmp_backup" "$backup_path"
         echo "sutando-migrate: backup → $backup_path"
     else
         # Empty dest — write an empty marker so rollback still has a known id
@@ -821,12 +842,15 @@ commit_one() {
                 fi
                 # Genuine collision: write loser as sidecar, keep dest as primary
                 # only if dest is newer. If src is newer, swap.
-                # Per Mini #design 2026-06-02 blocker #3: 3-way collisions
-                # overwrite the .legacy-DEST sidecar when a 3rd source replaces
-                # dest. Use timestamped + source-tagged sidecar names so each
-                # collision is preserved uniquely.
+                # Per Mini #design 2026-06-02 blocker #3 + flaky-test re-fix:
+                # uniqueness needs both per-second timestamp AND a serial counter
+                # (`date +%s` resolution is too coarse when commit_one fires
+                # multiple times within same second across sources).
+                # SIDECAR_SERIAL counter would live in subshell because
+                # commit_one's echo is captured via $(); use $RANDOM (per-call
+                # entropy from /dev/urandom-seeded bash PRNG) + $$ (pid) instead.
                 local ts_suffix
-                ts_suffix="$(date -u +%Y%m%dT%H%M%SZ)"
+                ts_suffix="$(date -u +%Y%m%dT%H%M%SZ)-p$$r$RANDOM"
                 if [ "$src_mt" -gt "$dst_mt" ]; then
                     # dest's content (whatever was there) goes to a sidecar.
                     # Name it .legacy-prior-<src_tag>-<ts> to convey "this is
@@ -988,14 +1012,27 @@ commit_one() {
 
 commit_source() {
     local tag="$1" src="$2"
+    local SENTINEL_PRESENT=0
+    any_source_sentinel "$tag" && SENTINEL_PRESENT=1
 
-    if any_source_sentinel "$tag" && [ "$FORCE" = "0" ] && [ "$DELETE_SOURCE" = "0" ]; then
-        echo "sutando-migrate: source $tag has prior migration sentinel — skip (use --force)"
-        return 0
+    # Mini #design 2026-06-02 new blocker #2: --delete-source must NOT re-run
+    # the commit walk when a sentinel exists (would duplicate appends + extra
+    # sidecars). Two-phase pattern: phase 1 does commit walk + writes sentinel;
+    # phase 2 (--delete-source --backup-id) skips commit walk + only does the
+    # delete walk against the existing dest landing.
+    local DO_COMMIT_WALK=1
+    if [ "$SENTINEL_PRESENT" = "1" ] && [ "$FORCE" = "0" ]; then
+        if [ "$DELETE_SOURCE" = "1" ]; then
+            DO_COMMIT_WALK=0  # phase 2 mode: skip commit, just delete
+            echo "--- Phase 2: --delete-source against source $tag (sentinel present; skip commit walk) ---"
+        else
+            echo "sutando-migrate: source $tag has prior migration sentinel — skip (use --force)"
+            return 0
+        fi
     fi
 
     echo
-    echo "--- Committing source $tag ($src) ---"
+    [ "$DO_COMMIT_WALK" = "1" ] && echo "--- Committing source $tag ($src) ---"
 
     # Reuse the same walk-list logic as scan_source (including B+C quarantine).
     local -a walk_paths=()
@@ -1031,6 +1068,11 @@ commit_source() {
     [ ${#walk_paths[@]} -eq 0 ] && { echo "  (nothing on surface; skip)"; return 0; }
 
     local n_copied=0 n_kept=0 n_skipped=0 n_sidecar=0 n_rehomed=0 n_identical=0 n_quarantined=0 n_other=0
+    # Phase 2 mode skips the commit walk entirely.
+    if [ "$DO_COMMIT_WALK" = "0" ]; then
+        # Skip ahead to the delete block (it walks walk_paths independently).
+        :
+    else
     local file rel cls outcome
     while IFS= read -r -d '' file; do
         rel="${file#"$src"/}"
@@ -1039,6 +1081,21 @@ commit_source() {
             state/migration-backup-*.tar.gz) continue ;;
             .DS_Store|*/.DS_Store|.gitkeep|*/.gitkeep) n_skipped=$((n_skipped+1)); continue ;;
         esac
+        # Mini #design 2026-06-02 new-blocker #4: recursive quarantine excludes.
+        # A custom dir like experiments/node_modules/ should be skipped even
+        # though experiments/ matched the quarantine catchall at top level.
+        # Walk rel segments and skip if ANY matches QUARANTINE_EXCLUDES.
+        local _skip_recursive=0
+        local _seg
+        IFS='/' read -ra _segs <<<"$rel"
+        for _seg in "${_segs[@]}"; do
+            for _ex in "${QUARANTINE_EXCLUDES[@]}"; do
+                [ "$_seg" = "$_ex" ] && { _skip_recursive=1; break 2; }
+            done
+        done
+        if [ "$_skip_recursive" = "1" ]; then
+            n_skipped=$((n_skipped+1)); continue
+        fi
         cls="$(classify "$rel")"
         outcome="$(commit_one "$file" "$rel" "$tag" "$cls")"
         case "$outcome" in
@@ -1059,16 +1116,19 @@ commit_source() {
         esac
     done < <(find "${walk_paths[@]}" -type f -print0 2>/dev/null)
 
-    echo "  copied:      $n_copied"
-    echo "  identical:   $n_identical (drop-dup, no real conflict)"
-    echo "  kept-dest:   $n_kept"
-    echo "  sidecar:     $n_sidecar"
-    [ "$n_quarantined" -gt 0 ] && echo "  quarantined: $n_quarantined (to <dest>/legacy/$tag/quarantine/)"
-    echo "  skipped:     $n_skipped"
-    [ "$n_other" -gt 0 ] && echo "  other:       $n_other"
+    fi  # DO_COMMIT_WALK guard
+    if [ "$DO_COMMIT_WALK" = "1" ]; then
+        echo "  copied:      $n_copied"
+        echo "  identical:   $n_identical (drop-dup, no real conflict)"
+        echo "  kept-dest:   $n_kept"
+        echo "  sidecar:     $n_sidecar"
+        [ "$n_quarantined" -gt 0 ] && echo "  quarantined: $n_quarantined (to <dest>/legacy/$tag/quarantine/)"
+        echo "  skipped:     $n_skipped"
+        [ "$n_other" -gt 0 ] && echo "  other:       $n_other"
 
-    touch "$(source_sentinel "$tag")"
-    echo "  sentinel:    $(source_sentinel "$tag")"
+        touch "$(source_sentinel "$tag")"
+        echo "  sentinel:    $(source_sentinel "$tag")"
+    fi
 
     # Per Mini #design 2026-06-02 blocker #4: --delete-source must actually
     # delete sources after sha verification. The two-phase pattern means
@@ -1088,8 +1148,11 @@ commit_source() {
             local cls_d
             cls_d="$(classify "$rel_d")"
             # In-flight + ephemeral classes were never copied; don't delete.
+            # Per Mini new-blocker #3: quarantine IS copied (to
+            # <dest>/legacy/<tag>/quarantine/<rel>) — must be considered
+            # for sha-verified deletion alongside other classes.
             case "$cls_d" in
-                skip-ephemeral|skip-unknown|inflight-guard|quarantine-unknown)
+                skip-ephemeral|skip-unknown|inflight-guard)
                     continue ;;
             esac
             # Find any dest landing whose content matches.
@@ -1102,10 +1165,12 @@ commit_source() {
                     matched="$cand"; break
                 fi
             done
-            # Also check timestamped sidecar globs at canonical-rel.
+            # Per Mini new-blocker #1: any legacy-* sidecar (any tag) might
+            # hold this source's content (dest-prior naming uses overwriting
+            # source's tag, not original). Walk all and sha-compare.
             if [ -z "$matched" ]; then
                 local g
-                for g in "$DEST_REAL/$rel_d.legacy-$tag-"* "$DEST_REAL/$rel_d.legacy-prior-from-$tag-"*; do
+                for g in "$DEST_REAL/$rel_d.legacy-"*; do
                     if [ -f "$g" ] && sha_match "$file" "$g"; then
                         matched="$g"; break
                     fi
@@ -1199,12 +1264,13 @@ verify_main() {
     while IFS=$'\t' read -r rel tag cls mt sz; do
         [ "$tag" = "DEST" ] && continue
         case "$cls" in
-            skip-ephemeral|skip-unknown|inflight-guard|quarantine-unknown)
-                # These classes intentionally don't land at a stable dest path;
-                # in-flight-guard is age-dependent; quarantine is content-preserved
-                # under legacy/<tag>/quarantine/ which we verify separately below.
+            skip-ephemeral|skip-unknown|inflight-guard)
                 pass=$((pass+1)); continue ;;
         esac
+        # Per Mini #design 2026-06-02 new-blocker #3: quarantine MUST be
+        # sha-verified at its dest landing, not pass-no-check. The walk below
+        # checks dst_quarantine (=$DEST_REAL/legacy/$tag/quarantine/$rel) via
+        # the standard cands loop.
         local src_root
         src_root="$(src_path_for_tag "$tag")"
         [ -z "$src_root" ] && { pass=$((pass+1)); continue; }
@@ -1219,15 +1285,19 @@ verify_main() {
         local dst_canonical="$DEST_REAL/$rel"
         local dst_sidecar_legacy="$DEST_REAL/legacy/$tag/$rel"
         local dst_quarantine="$DEST_REAL/legacy/$tag/quarantine/$rel"
-        # Per Mini #3 fix: timestamped+tagged sidecars at <path>.legacy-<tag>-<ts>
-        # or <path>.legacy-prior-from-<tag>-<ts>. Use a glob to match any.
+        # Per Mini #design 2026-06-02 new-blocker #1: dest-prior sidecars are
+        # named after the OVERWRITING source, not the original-content source.
+        # E.g. C's content might be at <path>.legacy-prior-from-A-<ts> (because
+        # A overwrote it). Looking only at legacy-$tag-* / legacy-prior-from-$tag-*
+        # for source C would miss C's content there. Walk ALL legacy-*-* sidecars
+        # and sha-compare to find the source's content regardless of tag.
         local landed=""
         local cands=()
         for c in "$dst_canonical" "$dst_sidecar_legacy" "$dst_quarantine"; do
             cands+=("$c")
         done
-        # Expand timestamped-sidecar globs for both src-loser and dest-prior cases.
-        for g in "$dst_canonical.legacy-$tag-"* "$dst_canonical.legacy-prior-from-$tag-"*; do
+        # All possible legacy-* sidecars at canonical-rel (any source tag).
+        for g in "$dst_canonical.legacy-"*; do
             [ -f "$g" ] && cands+=("$g")
         done
         for cand in "${cands[@]}"; do
@@ -1258,6 +1328,9 @@ verify_main() {
 }
 
 rollback_main() {
+    # Disable set -e for rollback's cleanup walks — they tolerate per-file
+    # failures (rm of non-existent files, grep no-match, tar of empty).
+    set +e
     [ -z "$ROLLBACK_ID" ] && {
         echo "rollback: --backup-id <id> required. Available backups:" >&2
         ls -1 "$DEST_REAL/state/migration-backup-"*.tar.gz 2>/dev/null | sed -E 's@.*migration-backup-(.+)\.tar\.gz@  \1@' >&2
@@ -1269,35 +1342,51 @@ rollback_main() {
         exit 2
     }
     echo "sutando-migrate: ROLLBACK from $backup_path"
-    # Clear sentinels for that backup id (idempotency)
-    rm -f "$DEST_REAL/state/.migrated-from-"*"-$ROLLBACK_ID" 2>/dev/null
+    # Clear sentinels for that backup id (idempotency).
+    # Note: glob may match zero files; suppress set -e via || true.
+    rm -f "$DEST_REAL/state/.migrated-from-"*"-$ROLLBACK_ID" 2>/dev/null || true
     # Untar into dest. BSD tar (macOS) overwrites by default; GNU tar (Linux)
     # also overwrites by default. Workspace surface only — never touches
     # state/migration-backup-*.tar.gz files (they're outside the tar).
-    ( cd "$DEST_REAL" && tar -xzf "$backup_path" ) || {
-        echo "rollback: extract failed" >&2
-        exit 1
-    }
+    # Empty backup (0-byte) means dest was empty at backup time; skip extract +
+    # rely solely on the cleanup walk below to restore to empty state.
+    if [ -s "$backup_path" ]; then
+        ( cd "$DEST_REAL" && tar -xzf "$backup_path" ) || {
+            echo "rollback: extract failed" >&2
+            exit 1
+        }
+    else
+        echo "rollback: empty backup (dest was bootstrap-only at backup time); skipping extract"
+    fi
     # Clean files added since backup that are NOT in the backup tarball.
     # Read tarball entries → reference set → find dest's surface files not in set → delete.
     local tar_listing
     tar_listing="$(mktemp -t sutando-rollback.XXXXXX)"
-    tar -tzf "$backup_path" 2>/dev/null > "$tar_listing"
-    local sd; for sd in "${WORKSPACE_SURFACE_DIRS[@]}" "${WORKSPACE_SURFACE_FILES[@]}"; do
+    if [ -s "$backup_path" ]; then
+        tar -tzf "$backup_path" 2>/dev/null > "$tar_listing" || true
+    else
+        : > "$tar_listing"  # empty backup: nothing to preserve, everything is "added since"
+    fi
+    [ "${SUTANDO_MIGRATE_DEBUG:-0}" = "1" ] && echo "[debug] tar_listing size=$(wc -l < "$tar_listing") backup_path size=$(stat -f %z "$backup_path")" >&2
+    local sd
+    [ "${SUTANDO_MIGRATE_DEBUG:-0}" = "1" ] && echo "[debug] rollback walk: DEST_REAL=$DEST_REAL" >&2
+    for sd in "${WORKSPACE_SURFACE_DIRS[@]}" "${WORKSPACE_SURFACE_FILES[@]}"; do
         [ ! -e "$DEST_REAL/$sd" ] && continue
-        find "$DEST_REAL/$sd" -type f 2>/dev/null | while IFS= read -r f; do
+        [ "${SUTANDO_MIGRATE_DEBUG:-0}" = "1" ] && echo "[debug] rollback walking $DEST_REAL/$sd" >&2
+        while IFS= read -r f; do
             local rel="${f#"$DEST_REAL"/}"
             # If this rel is NOT in the tar listing, it was added after backup → remove
             if ! grep -q "^${rel}$" "$tar_listing" 2>/dev/null; then
+                [ "${SUTANDO_MIGRATE_DEBUG:-0}" = "1" ] && echo "[debug] rollback rm $rel" >&2
                 rm -f "$f"
             fi
-        done
+        done < <(find "$DEST_REAL/$sd" -type f 2>/dev/null)
     done
-    rm -f "$tar_listing"
+    rm -f "$tar_listing" || true
     # Drop sentinels matching this backup id
-    rm -f "$DEST_REAL/state/.migrated-from-"*"-$ROLLBACK_ID" 2>/dev/null
+    rm -f "$DEST_REAL/state/.migrated-from-"*"-$ROLLBACK_ID" 2>/dev/null || true
     # Drop legacy/<src-tag>/ sidecars (only the script ever writes there)
-    rm -rf "$DEST_REAL/legacy" 2>/dev/null
+    rm -rf "$DEST_REAL/legacy" 2>/dev/null || true
     echo "rollback: OK — dest restored to backup $ROLLBACK_ID"
 }
 
