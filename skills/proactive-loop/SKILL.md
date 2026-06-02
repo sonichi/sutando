@@ -47,7 +47,7 @@ Each pass, in order:
 
 0. **Signal loop start.** Write `{"status":"running","step":"Starting pass...","ts":DATE_NOW}` to `$WORKSPACE/state/core-status.json` (with `WORKSPACE` resolved as above). The session cwd is the repo, so a bare `core-status.json` lands in `<repo>/` where no reader looks (`health-check.py` and the web UI resolve `<workspace>/state/core-status.json` via `status_read_path`). Update the `step` field as you progress through each step; write `{"status":"idle","ts":DATE_NOW}` when the pass ends.
 
-0.5. **Check quota.** Run `python3 ~/.claude/skills/quota-tracker/scripts/read-quota.py`. Note remaining % and exact reset time.
+0.5. **Check quota.** Run `python3 $CLAUDE_CONFIG_DIR/skills/quota-tracker/scripts/read-quota.py`. Note remaining % and exact reset time.
    - **Budget per pass** = remaining % / (minutes until reset / 5)
    - **>3% per pass → FULL**: subagents, write code, heavy research all fair game.
    - **1-3% per pass → MEDIUM**: code fixes, monitoring, no subagents.
