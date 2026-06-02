@@ -19,6 +19,7 @@ import { join, resolve } from 'node:path';
 
 import {
 	detectEnvWorkspaceInDotenv,
+	findRepoRoot,
 	loadConfig,
 	resetCacheForTests,
 	resolveVault,
@@ -174,14 +175,22 @@ describe('sutando_config loader', () => {
 	//  5. Malformed JSON → Error naming the file                          //
 	// ------------------------------------------------------------------ //
 
-	it('malformed JSON throws with file path in message', () => {
+	it('malformed JSON throws with file path + position info', () => {
 		writeConfig(repo, 'sutando.config.json', '{ this is not JSON }');
 		try {
 			assert.throws(
 				() => loadConfig(repo),
 				(err: unknown) => {
 					const msg = err instanceof Error ? err.message : String(err);
-					return msg.includes('sutando.config.json') && /failed to parse/i.test(msg);
+					// File name + parse marker + V8's position/line/column detail.
+					// Mini's review #2 on #1397: without the position-detail check the
+					// test would pass even if the loader stripped useful debugging
+					// info from the JSON.parse exception message.
+					return (
+						msg.includes('sutando.config.json') &&
+						/failed to parse/i.test(msg) &&
+						/position\s+\d+|line\s+\d+|column\s+\d+/i.test(msg)
+					);
 				},
 			);
 		} finally {
@@ -329,6 +338,59 @@ describe('sutando_config loader', () => {
 		try {
 			assert.equal(detectEnvWorkspaceInDotenv(repo), '/quoted/path');
 		} finally {
+			restoreEnvAndRepo();
+		}
+	});
+
+	// ------------------------------------------------------------------ //
+	//  Mini follow-up: SUTANDO_DEBUG strict "1" gating                    //
+	// ------------------------------------------------------------------ //
+
+	it('debug log fires only on SUTANDO_DEBUG="1", not "0" / "false" / unset / ""', () => {
+		// Need a `start` path outside the repo so findRepoRoot fails (the
+		// only branch that emits). Use a deep path under tmp.
+		const nowhere = join(repo, 'deep', 'nested', 'leaf');
+		mkdirSync(nowhere, { recursive: true });
+		const cases: Array<[string | undefined, boolean]> = [
+			[undefined, false], // unset
+			['0', false],
+			['false', false],
+			['', false],
+			['1', true],
+		];
+		const savedDebug = process.env.SUTANDO_DEBUG;
+		try {
+			for (const [envVal, expectEmit] of cases) {
+				const writes: string[] = [];
+				const origWrite = process.stderr.write.bind(process.stderr);
+				process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+					writes.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString());
+					return true;
+				}) as typeof process.stderr.write;
+				try {
+					if (envVal === undefined) delete process.env.SUTANDO_DEBUG;
+					else process.env.SUTANDO_DEBUG = envVal;
+					findRepoRoot(nowhere);
+					const combined = writes.join('');
+					if (expectEmit) {
+						assert.ok(
+							combined.includes('did not find sutando.config.json'),
+							`expected stderr on SUTANDO_DEBUG=${JSON.stringify(envVal)}, got ${JSON.stringify(combined)}`,
+						);
+					} else {
+						assert.equal(
+							combined,
+							'',
+							`expected silent on SUTANDO_DEBUG=${JSON.stringify(envVal)}, got ${JSON.stringify(combined)}`,
+						);
+					}
+				} finally {
+					process.stderr.write = origWrite;
+				}
+			}
+		} finally {
+			if (savedDebug === undefined) delete process.env.SUTANDO_DEBUG;
+			else process.env.SUTANDO_DEBUG = savedDebug;
 			restoreEnvAndRepo();
 		}
 	});

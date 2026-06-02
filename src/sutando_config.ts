@@ -47,7 +47,8 @@ const KNOWN_TOP_LEVEL_KEYS = new Set(['workspace', 'vault']);
  * Sutando using the baked-in default" without strace, per Mini's review #3
  * on PR #1395.
  */
-function findRepoRoot(start?: string): string | undefined {
+/** @internal Exported for tests; production callers go through loadConfig. */
+export function findRepoRoot(start?: string): string | undefined {
 	const initial = resolve(start ?? dirname(fileURLToPath(import.meta.url)));
 	let cur = initial;
 	for (let i = 0; i < 6; i++) {
@@ -56,7 +57,11 @@ function findRepoRoot(start?: string): string | undefined {
 		if (parent === cur) break;
 		cur = parent;
 	}
-	if (process.env.SUTANDO_DEBUG) {
+	// Strict equality to "1" so SUTANDO_DEBUG=0 / "false" / "" don't accidentally
+	// turn on the diagnostic. Mini called this out in the #1397 review — env
+	// truthiness in JS treats any non-empty string as truthy, which would
+	// silently emit on common "disable" values.
+	if (process.env.SUTANDO_DEBUG === '1') {
 		process.stderr.write(
 			`sutando config: findRepoRoot walked 6 hops from ${initial} ` +
 				`and did not find ${CONFIG_FILENAME}; falling back to baked-in default.\n`,

@@ -73,7 +73,11 @@ def _find_repo_root(start: Optional[Path] = None) -> Optional[Path]:
         if cur == cur.parent:  # filesystem root
             break
         cur = cur.parent
-    if os.environ.get("SUTANDO_DEBUG"):
+    # Strict equality to "1" so SUTANDO_DEBUG=0 / "false" / "" don't accidentally
+    # turn on the diagnostic. Mini called this out in the #1397 review — env
+    # truthiness in Python treats any non-empty string as truthy, which would
+    # silently emit on common "disable" values.
+    if os.environ.get("SUTANDO_DEBUG") == "1":
         print(
             f"sutando config: _find_repo_root walked 6 hops from {initial} "
             f"and did not find {_CONFIG_FILENAME}; falling back to baked-in default.",

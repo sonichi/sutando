@@ -312,6 +312,44 @@ class TestSutandoConfig(unittest.TestCase):
     #  Mini #8: warn on unknown top-level keys                            #
     # ------------------------------------------------------------------ #
 
+    # ------------------------------------------------------------------ #
+    #  Mini follow-up: SUTANDO_DEBUG strict "1" gating                    #
+    # ------------------------------------------------------------------ #
+
+    def test_debug_log_strict_equals_one(self):
+        """SUTANDO_DEBUG must equal exactly "1" to emit the find-repo-root
+        diagnostic — otherwise "0" / "false" / "" would silently emit, which
+        is Mini's review point on the #1397 follow-up loop.
+        """
+        from sutando_config import _find_repo_root
+        nowhere = self.repo / "deep" / "nested" / "leaf"
+        nowhere.mkdir(parents=True)
+        import io
+        for env_val, expect_emit in [
+            (None, False),       # unset
+            ("0", False),        # disabled (Mini's bug-class call)
+            ("false", False),    # disabled
+            ("", False),         # empty
+            ("1", True),         # enabled
+        ]:
+            with self.subTest(env_val=env_val):
+                if env_val is None:
+                    os.environ.pop("SUTANDO_DEBUG", None)
+                else:
+                    os.environ["SUTANDO_DEBUG"] = env_val
+                buf = io.StringIO()
+                saved_stderr = sys.stderr
+                sys.stderr = buf
+                try:
+                    _find_repo_root(start=nowhere)
+                finally:
+                    sys.stderr = saved_stderr
+                    os.environ.pop("SUTANDO_DEBUG", None)
+                if expect_emit:
+                    self.assertIn("did not find sutando.config.json", buf.getvalue())
+                else:
+                    self.assertEqual(buf.getvalue(), "", f"emitted on SUTANDO_DEBUG={env_val!r}")
+
     def test_unknown_top_level_keys_warn_on_load(self):
         _write_config(self.repo, "sutando.config.json", {
             "workspace": {"path": "/ws"},
