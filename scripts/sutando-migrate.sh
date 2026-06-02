@@ -398,11 +398,20 @@ scan_source() {
     # quarantined per Lucy #design + owner direction 2026-06-02).
     local -a walk_paths=()
     local sd sf _ex_a
+    # Per feedback_per_source_surface_lists 2026-06-02: detect whether THIS
+    # source path IS a sutando repo checkout (by content, not by tag) — if
+    # so, skip dirs that exist as repo code rather than workspace data
+    # (docs/, agents/, etc.). Detection: presence of `src/sutando_config.py`
+    # (or the same-shape sutando-config.sh) at source root. Owner clarified
+    # 2026-06-02 07:29: "We should only EXCLUDE them when they are in the
+    # sutando repo root." A custom workspace path that happens to live
+    # inside a sutando checkout should ALSO get the exclude.
+    local IS_SUTANDO_REPO=0
+    if [ -f "$src/src/sutando_config.py" ] || [ -f "$src/scripts/sutando-config.sh" ]; then
+        IS_SUTANDO_REPO=1
+    fi
     for sd in "${WORKSPACE_SURFACE_DIRS[@]}"; do
-        # Per feedback_per_source_surface_lists: Source A is the sutando
-        # repo, not a workspace. Skip dirs in SOURCE_A_EXCLUDE so we don't
-        # migrate repo code (e.g. <repo>/docs/) as workspace surface.
-        if [ "$tag" = "A" ]; then
+        if [ "$IS_SUTANDO_REPO" = "1" ]; then
             local _skip_a=0
             for _ex_a in "${SOURCE_A_EXCLUDE[@]}"; do
                 [ "$sd" = "$_ex_a" ] && _skip_a=1 && break
@@ -1061,11 +1070,20 @@ commit_source() {
     # Reuse the same walk-list logic as scan_source (including B+C quarantine).
     local -a walk_paths=()
     local sd sf _ex_a
+    # Per feedback_per_source_surface_lists 2026-06-02: detect whether THIS
+    # source path IS a sutando repo checkout (by content, not by tag) — if
+    # so, skip dirs that exist as repo code rather than workspace data
+    # (docs/, agents/, etc.). Detection: presence of `src/sutando_config.py`
+    # (or the same-shape sutando-config.sh) at source root. Owner clarified
+    # 2026-06-02 07:29: "We should only EXCLUDE them when they are in the
+    # sutando repo root." A custom workspace path that happens to live
+    # inside a sutando checkout should ALSO get the exclude.
+    local IS_SUTANDO_REPO=0
+    if [ -f "$src/src/sutando_config.py" ] || [ -f "$src/scripts/sutando-config.sh" ]; then
+        IS_SUTANDO_REPO=1
+    fi
     for sd in "${WORKSPACE_SURFACE_DIRS[@]}"; do
-        # Per feedback_per_source_surface_lists: Source A is the sutando
-        # repo, not a workspace. Skip dirs in SOURCE_A_EXCLUDE so we don't
-        # migrate repo code (e.g. <repo>/docs/) as workspace surface.
-        if [ "$tag" = "A" ]; then
+        if [ "$IS_SUTANDO_REPO" = "1" ]; then
             local _skip_a=0
             for _ex_a in "${SOURCE_A_EXCLUDE[@]}"; do
                 [ "$sd" = "$_ex_a" ] && _skip_a=1 && break
