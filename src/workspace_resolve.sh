@@ -18,14 +18,19 @@
 #   3. Fail loud with exit 1 + diagnostic. Refuses to silently write to a
 #      hardcoded legacy default.
 #
-# Caller contract: must export $REPO before sourcing or calling. The function
-# exports WORKSPACE on success.
+# Self-locating: looks for scripts/sutando-config.sh relative to THIS file's
+# own location (${BASH_SOURCE[0]}), NOT $REPO. This makes the function
+# cross-checkout safe — callers can be invoked with $SUTANDO_REPO_DIR pointed
+# at a different checkout (e.g. submodule pin) without breaking helper
+# resolution. Caught by E2E pass against PR #1399 — see commit log.
 
 resolve_workspace_or_die() {
-  local helper="${REPO:?resolve_workspace_or_die: \$REPO not set}/scripts/sutando-config.sh"
+  local _wr_dir
+  _wr_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local helper="$_wr_dir/../scripts/sutando-config.sh"
   if [ -f "$helper" ]; then
     if ! WORKSPACE="$(bash "$helper" workspace)"; then
-      echo "${0##*/}: ${helper##*/} workspace exited non-zero." >&2
+      echo "${0##*/}: scripts/sutando-config.sh workspace exited non-zero." >&2
       exit 1
     fi
   elif [ -n "${SUTANDO_WORKSPACE:-}" ]; then

@@ -12,7 +12,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readdirSync, rmSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync, mkdirSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -93,6 +93,25 @@ describe('sutando-config.sh wrapper', () => {
 			assert.ok(existsSync(join(ws, d)), `bootstrap did not create "${d}"`);
 		}
 
+		// Snapshot directory state for strict idempotency comparison.
+		// Sorted top-level + recursive-mtimes — if the second run mutates
+		// anything (creates extras, touches mtimes, etc.) the snapshot diverges.
+		const snapshot = (root: string) => {
+			const out: Record<string, number> = {};
+			const walk = (p: string) => {
+				const stat = statSync(p);
+				out[p.slice(root.length)] = stat.mtimeMs;
+				if (stat.isDirectory()) {
+					for (const child of readdirSync(p).sort()) {
+						walk(join(p, child));
+					}
+				}
+			};
+			walk(root);
+			return out;
+		};
+		const before = snapshot(ws);
+
 		// Second run — must be a no-op (idempotent)
 		const second = spawnSync('bash', [SCRIPT, 'bootstrap'], {
 			env: { ...process.env, SUTANDO_WORKSPACE: ws },
@@ -102,5 +121,17 @@ describe('sutando-config.sh wrapper', () => {
 		for (const d of subdirsOut) {
 			assert.ok(existsSync(join(ws, d)), `bootstrap idempotency broken: "${d}" missing after second run`);
 		}
+
+		// Strict idempotency: top-level dir set must be IDENTICAL across runs.
+		// `mkdir -p` is a no-op on existing dirs so mtimes stay frozen — if
+		// anything else mutates, the snapshot diverges. (Mini's PR #1399 catch:
+		// the prior test only checked "dirs exist after," not "nothing extra
+		// was created or touched.")
+		const after = snapshot(ws);
+		assert.deepEqual(
+			Object.keys(after).sort(),
+			Object.keys(before).sort(),
+			'bootstrap second run mutated the workspace dir set',
+		);
 	});
 });

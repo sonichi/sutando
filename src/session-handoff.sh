@@ -27,16 +27,25 @@ TRANSCRIPT="$1"  # Passed by PreCompact hook as $TRANSCRIPT_PATH
 # (including empty-string returns — important because this script does NOT
 # use `set -e`). See workspace-revamp M0 (PR #1395) + Mini's PR #1399 review.
 # Defensive fallback for non-checkout installs where the helper isn't present.
-if [ -f "$REPO/src/workspace_resolve.sh" ]; then
+# Helper resolution: prefer $REPO/src/, fall back to script-sibling (cross-
+# checkout safety). Critical for session-handoff specifically because its
+# REPO resolution above prefers $SUTANDO_REPO_DIR over script-parent, and
+# that env can point to a sibling checkout (e.g. sutando-plus submodule pin)
+# that hasn't yet pulled this newly-added file. Caught by E2E pass against
+# PR #1399.
+__HELPER="$REPO/src/workspace_resolve.sh"
+[ -f "$__HELPER" ] || __HELPER="$(cd "$(dirname "$0")" && pwd)/workspace_resolve.sh"
+if [ -f "$__HELPER" ]; then
   # shellcheck source=workspace_resolve.sh
-  source "$REPO/src/workspace_resolve.sh"
+  source "$__HELPER"
   resolve_workspace_or_die
 elif [ -n "${SUTANDO_WORKSPACE:-}" ]; then
   WORKSPACE="${SUTANDO_WORKSPACE/#\~/$HOME}"
 else
-  echo "session-handoff: cannot resolve workspace — neither $REPO/src/workspace_resolve.sh exists nor \$SUTANDO_WORKSPACE is set." >&2
+  echo "session-handoff: cannot resolve workspace — workspace_resolve.sh not found at \$REPO/src/ or alongside this script, and \$SUTANDO_WORKSPACE is not set." >&2
   exit 1
 fi
+unset __HELPER
 if [ -z "${WORKSPACE:-}" ]; then
   echo "session-handoff: workspace resolved to empty string. Refusing to derive paths under /." >&2
   exit 1

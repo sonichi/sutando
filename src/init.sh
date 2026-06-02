@@ -29,16 +29,24 @@ esac
 # minimized test fixture). Runtime state files (logs, state, tasks, results,
 # notes, data, pending-questions.md, …) live under the workspace; loose
 # status .json files (core-status.json, voice-state.json, …) live under state/.
-if [ -f "$REPO/src/workspace_resolve.sh" ]; then
+# Helper lives at $REPO/src/workspace_resolve.sh in normal layout. Fall back
+# to script-sibling for cross-checkout safety: when $SUTANDO_REPO_DIR points
+# to a different checkout (e.g. owner's sutando-plus submodule pin) that
+# doesn't yet contain this newly-added file, the script-local copy is
+# always reachable. Caught by an E2E pass against PR #1399 before merge.
+__HELPER="$REPO/src/workspace_resolve.sh"
+[ -f "$__HELPER" ] || __HELPER="$(cd "$(dirname "$0")" && pwd)/workspace_resolve.sh"
+if [ -f "$__HELPER" ]; then
   # shellcheck source=workspace_resolve.sh
-  source "$REPO/src/workspace_resolve.sh"
+  source "$__HELPER"
   resolve_workspace_or_die
 elif [ -n "${SUTANDO_WORKSPACE:-}" ]; then
   WORKSPACE="${SUTANDO_WORKSPACE/#\~/$HOME}"
 else
-  echo "init.sh: cannot resolve workspace — neither $REPO/src/workspace_resolve.sh exists nor \$SUTANDO_WORKSPACE is set." >&2
+  echo "init.sh: cannot resolve workspace — workspace_resolve.sh not found at \$REPO/src/ or alongside this script, and \$SUTANDO_WORKSPACE is not set." >&2
   exit 1
 fi
+unset __HELPER
 
 # Surface the silent-fallback bug class (see PR #1367/#1368): if .env defines
 # SUTANDO_WORKSPACE but this process never got it (e.g. init.sh invoked by a
