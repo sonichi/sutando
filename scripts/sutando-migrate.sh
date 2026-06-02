@@ -367,7 +367,7 @@ scan_source() {
     # NOTE on portability: --base is not portable; we use absolute paths only.
     # Walk every non-ignored regular file under src.
     local file rel cls dest_path collision_kind="" size mtime_iso
-    local n_structural=0 n_append=0 n_newest=0 n_rehome=0 n_skip=0 n_inflight=0 n_collision=0 n_unknown=0
+    local n_structural=0 n_append=0 n_newest=0 n_rehome=0 n_skip=0 n_inflight=0 n_collision=0 n_unknown=0 n_quarantine=0
     local bytes_total=0
 
     REPORT_LINES+=("")
@@ -528,6 +528,15 @@ scan_source() {
                 # Target is <dest>/state/<basename>
                 n_rehome=$((n_rehome+1))
                 ;;
+            rehome-narrative-log|rehome-dated-snapshot)
+                # Same bucket as rehome-state for display purposes (loose root file → canonical sub-path)
+                n_rehome=$((n_rehome+1))
+                ;;
+            quarantine-unknown)
+                # Catchall for user content under non-canonical relpaths (Source B/C only).
+                # Counted separately so users see the quarantine footprint in scan output.
+                n_quarantine=$((n_quarantine+1))
+                ;;
             collision-keep-both)
                 dest_path="$DEST/$rel"
                 if [ -e "$dest_path" ]; then
@@ -559,6 +568,7 @@ scan_source() {
     REPORT_LINES+=("    append-merge (build_log/conv.log):    $n_append")
     REPORT_LINES+=("    newest-mtime (snapshots):             $n_newest")
     REPORT_LINES+=("    re-home      (loose JSON → state/):   $n_rehome")
+    REPORT_LINES+=("    quarantine   (non-canonical → legacy/<src>/quarantine/): $n_quarantine")
     REPORT_LINES+=("    in-flight-skip (<${INFLIGHT_GUARD_SEC}s old):       $n_inflight")
     REPORT_LINES+=("    skip-ephemeral / .DS_Store / .gitkeep:$n_skip")
     REPORT_LINES+=("    unknown (no rule matched, will skip): $n_unknown")
@@ -618,7 +628,12 @@ done
 # the destination regardless of whatever $SUTANDO_WORKSPACE the user has set
 # today — migration MOVES data INTO the new default. Use `--respect-env` to
 # honor env (e.g. for users whose dest is intentionally an env-overridden path).
-if [ "${RESPECT_ENV:-0}" = "1" ]; then
+# TEST hook: SUTANDO_MIGRATE_DEST overrides for E2E fixtures (symmetric with
+# SUTANDO_MIGRATE_SRC_{A,B,C}). Takes precedence over both the resolver and
+# --respect-env so test fixtures can pin DEST without cloning the whole repo.
+if [ -n "${SUTANDO_MIGRATE_DEST:-}" ]; then
+    DEST="$SUTANDO_MIGRATE_DEST"
+elif [ "${RESPECT_ENV:-0}" = "1" ]; then
     DEST="$(bash "$HELPER" workspace 2>/dev/null)"
 else
     DEST="$(env -u SUTANDO_WORKSPACE bash "$HELPER" workspace 2>/dev/null)"
@@ -922,19 +937,19 @@ commit_one() {
             fi
             return 0
             ;;
-        rehome-state|rehome-dated-snapshot|rehome-narrative-log)
+        rehome-state|rehome-dated-snapshot)
             # Per Mini's #design 2026-06-02 04:54Z (state JSONs) + earlier
-            # workspace audit (dated snapshots + conversation.log):
+            # workspace audit (dated snapshots):
             #   rehome-state          → state/<base> OR state/auth/<base>
             #                           (cloud-auth/device → auth/; per-host durable;
             #                           CLAUDE.md should declare state/auth/ excluded
             #                           from transient-state cleanup)
             #   rehome-dated-snapshot → notes/archive/<base>
             #                           (pending-questions-resolved-archive-*.md etc)
-            #   rehome-narrative-log  → logs/workspace-narrative.log
-            #                           (root conversation.log → logs/. Renamed to
-            #                           dodge the existing per-pid logs/conversation.log
-            #                           collision. Owner-Q flagged; filename can change.)
+            # Both are SNAPSHOT classes — newest-mtime is the right strategy
+            # (newest = most accurate; older is stale-by-definition). Narrative
+            # logs are a separate class (rehome-narrative-log) since they are
+            # APPEND-ONLY ACCUMULATORS where newest-mtime is data-lossy.
             local base="$(basename "$rel")"
             case "$cls" in
                 rehome-state)
@@ -946,11 +961,8 @@ commit_one() {
                 rehome-dated-snapshot)
                     dst_path="$DEST_REAL/notes/archive/$base"
                     ;;
-                rehome-narrative-log)
-                    dst_path="$DEST_REAL/logs/workspace-narrative.log"
-                    ;;
             esac
-            # Common per-mtime swap, identical-drop, or write-fresh.
+            # Per-mtime swap, identical-drop, or write-fresh.
             if [ -e "$dst_path" ]; then
                 local src_mt dst_mt
                 src_mt="$(stat -f %m "$src_file" 2>/dev/null || stat -c %Y "$src_file")"
@@ -966,19 +978,45 @@ commit_one() {
                 echo "rehomed"
             fi
             return 0
+            ;;
+        rehome-narrative-log)
+            # APPEND-ONLY ACCUMULATOR (per-host voice-agent transcript history).
+            # Pre-fix (2026-06-02) this shared the rehome-state/dated-snapshot
+            # newest-mtime path, which silently dropped the larger file when
+            # the newer one was smaller. Data-loss bug caught on owner's MBP:
+            # Source A had 261K of voice-transcript history (mtime May 17);
+            # Source C had a 2K phone-call snippet (mtime May 20, newer);
+            # newest-mtime kept C's 2K and discarded A's 261K. Same failure
+            # class as `state/*.json|newest-mtime` we previously carved out for
+            # per-host state (#design 2026-06-02). General rule baked in here:
+            # snapshot → newest-mtime; append-only/accumulator → append.
+            # Strategy: concat each source's content to the canonical dest
+            # with a divider header carrying src-tag + mtime + size so the
+            # downstream reader can split if needed.
+            dst_path="$DEST_REAL/logs/workspace-narrative.log"
+            mkdir -p "$(dirname "$dst_path")"
+            local src_mt src_sz
+            src_mt="$(stat -f %m "$src_file" 2>/dev/null || stat -c %Y "$src_file")"
+            src_sz="$(stat -f %z "$src_file" 2>/dev/null || stat -c %s "$src_file")"
             if [ -e "$dst_path" ]; then
-                local src_mt dst_mt
-                src_mt="$(stat -f %m "$src_file" 2>/dev/null || stat -c %Y "$src_file")"
-                dst_mt="$(stat -f %m "$dst_path" 2>/dev/null || stat -c %Y "$dst_path")"
-                if [ "$src_mt" -gt "$dst_mt" ]; then
-                    copy_preserving_mtime "$src_file" "$dst_path"
-                    echo "rehomed-newer"
-                else
-                    echo "rehomed-skip-older"
-                fi
+                # Append with divider header. Concat in canonical order; the
+                # tmp+mv pattern is atomic and preserves dest if append fails.
+                {
+                    cat "$dst_path"
+                    echo ""
+                    echo "=== migrated from source $tag (mtime $src_mt, size ${src_sz}B) ==="
+                    echo ""
+                    cat "$src_file"
+                } > "$dst_path.append.$$" && mv -f "$dst_path.append.$$" "$dst_path"
+                echo "appended"
             else
-                copy_preserving_mtime "$src_file" "$dst_path"
-                echo "rehomed"
+                # First write — include header so future appends slot in cleanly.
+                {
+                    echo "=== migrated from source $tag (mtime $src_mt, size ${src_sz}B) ==="
+                    echo ""
+                    cat "$src_file"
+                } > "$dst_path.append.$$" && mv -f "$dst_path.append.$$" "$dst_path"
+                echo "appended-fresh"
             fi
             return 0
             ;;
