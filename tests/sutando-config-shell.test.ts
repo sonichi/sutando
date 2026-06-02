@@ -122,16 +122,18 @@ describe('sutando-config.sh wrapper', () => {
 			assert.ok(existsSync(join(ws, d)), `bootstrap idempotency broken: "${d}" missing after second run`);
 		}
 
-		// Strict idempotency: top-level dir set must be IDENTICAL across runs.
-		// `mkdir -p` is a no-op on existing dirs so mtimes stay frozen — if
-		// anything else mutates, the snapshot diverges. (Mini's PR #1399 catch:
-		// the prior test only checked "dirs exist after," not "nothing extra
-		// was created or touched.")
+		// Strict idempotency: the FULL snapshot (paths + mtimes) must be
+		// identical across runs. `mkdir -p` is a no-op on existing dirs so
+		// mtimes stay frozen — if `bootstrap` touches anything (creates an
+		// extra path, chmods, writes a marker), the deep-equal diverges.
+		// (Mini + Sutando-Pro PR #1399 round-3 catch: the prior assertion
+		// only compared Object.keys, throwing away the mtime values the
+		// snapshot collected — claim/code mismatch with the comment above.)
 		const after = snapshot(ws);
 		assert.deepEqual(
-			Object.keys(after).sort(),
-			Object.keys(before).sort(),
-			'bootstrap second run mutated the workspace dir set',
+			after,
+			before,
+			'bootstrap second run mutated the workspace (path set or mtime changed)',
 		);
 	});
 });
