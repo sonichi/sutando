@@ -1011,6 +1011,21 @@ commit_one() {
             local _tmp="$dst_path.append.$$"
             local _redirect_rc=0
             if [ -e "$dst_path" ]; then
+                # Idempotency guard (Lucy #1407, folded into #1406 2026-06-02):
+                # if THIS source's divider marker is already present in the
+                # canonical narrative log, skip re-appending. Cheap single-line
+                # grep -qF check via the source-tag-specific header substring.
+                # Without this, re-running `commit` against the same surviving
+                # source (e.g. accidentally, or after an aborted --delete-source)
+                # would re-append the same source content again, growing
+                # workspace-narrative.log linearly with each commit. The
+                # divider header includes mtime + size but the tag substring
+                # alone is sufficient — only one append per source-tag should
+                # ever land in the canonical log.
+                if grep -qF "migrated from source $tag " "$dst_path" 2>/dev/null; then
+                    echo "append-skip-idempotent"
+                    return 0
+                fi
                 # Append with divider header. Concat in canonical order.
                 {
                     cat "$dst_path"
