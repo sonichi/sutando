@@ -33,14 +33,26 @@ const LOCAL_FILENAME = 'sutando.config.local.json';
  * `sutando.config.json`. Returns undefined if not found within 6 hops.
  * Anchors on the config file rather than `.git/` so app bundles + symlinked
  * installs still resolve correctly.
+ *
+ * Emits a one-line stderr diagnostic on miss (gated by `SUTANDO_DEBUG=1` to
+ * keep happy-path noise out of normal runs). Helps users diagnose "why is
+ * Sutando using the baked-in default" without strace, per Mini's review #3
+ * on PR #1395.
  */
 function findRepoRoot(start?: string): string | undefined {
-	let cur = resolve(start ?? dirname(fileURLToPath(import.meta.url)));
+	const initial = resolve(start ?? dirname(fileURLToPath(import.meta.url)));
+	let cur = initial;
 	for (let i = 0; i < 6; i++) {
 		if (existsSync(join(cur, CONFIG_FILENAME))) return cur;
 		const parent = dirname(cur);
-		if (parent === cur) return undefined;
+		if (parent === cur) break;
 		cur = parent;
+	}
+	if (process.env.SUTANDO_DEBUG) {
+		process.stderr.write(
+			`sutando config: findRepoRoot walked 6 hops from ${initial} ` +
+				`and did not find ${CONFIG_FILENAME}; falling back to baked-in default.\n`,
+		);
 	}
 	return undefined;
 }

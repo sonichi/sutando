@@ -52,14 +52,26 @@ def _find_repo_root(start: Optional[Path] = None) -> Optional[Path]:
       - app bundles + symlinked installs may lack `.git/` in the resolved path
       - users running outside a git checkout (CI, tarball install) still get
         a working loader as long as the config sits beside it
+
+    Emits a one-line stderr diagnostic on miss (gated by `SUTANDO_DEBUG=1` to
+    keep happy-path noise out of normal runs). Helps users diagnose "why is
+    Sutando using the baked-in default" without strace, per Mini's review #3
+    on PR #1395.
     """
-    cur = (start or Path(__file__).resolve().parent).resolve()
+    initial = (start or Path(__file__).resolve().parent).resolve()
+    cur = initial
     for _ in range(6):
         if (cur / _CONFIG_FILENAME).is_file():
             return cur
         if cur == cur.parent:  # filesystem root
-            return None
+            break
         cur = cur.parent
+    if os.environ.get("SUTANDO_DEBUG"):
+        print(
+            f"sutando config: _find_repo_root walked 6 hops from {initial} "
+            f"and did not find {_CONFIG_FILENAME}; falling back to baked-in default.",
+            file=sys.stderr,
+        )
     return None
 
 
