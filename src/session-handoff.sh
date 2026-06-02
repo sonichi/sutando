@@ -22,18 +22,26 @@ export PATH="/opt/homebrew/bin:$HOME/.nvm/versions/node/v24.14.1/bin:$PATH"
 STATE_FILE="$REPO/session-state.md"
 TRANSCRIPT="$1"  # Passed by PreCompact hook as $TRANSCRIPT_PATH
 
-# Workspace resolves via the M0 helper (scripts/sutando-config.sh). Honors
-# $SUTANDO_WORKSPACE as a legacy fallback for non-checkout installs where
-# the helper isn't present. Fail-loud if neither resolves — refuses to write
-# to a hardcoded legacy default. See workspace-revamp M0 (PR #1395).
-if [ -f "$REPO/scripts/sutando-config.sh" ]; then
-  WORKSPACE_DIR="$(bash "$REPO/scripts/sutando-config.sh" workspace)"
+# Workspace resolves via the shared post-M0 helper (src/workspace_resolve.sh).
+# Exports $WORKSPACE on success; exits non-zero with a diagnostic on failure
+# (including empty-string returns — important because this script does NOT
+# use `set -e`). See workspace-revamp M0 (PR #1395) + Mini's PR #1399 review.
+# Defensive fallback for non-checkout installs where the helper isn't present.
+if [ -f "$REPO/src/workspace_resolve.sh" ]; then
+  # shellcheck source=workspace_resolve.sh
+  source "$REPO/src/workspace_resolve.sh"
+  resolve_workspace_or_die
 elif [ -n "${SUTANDO_WORKSPACE:-}" ]; then
-  WORKSPACE_DIR="${SUTANDO_WORKSPACE/#\~/$HOME}"
+  WORKSPACE="${SUTANDO_WORKSPACE/#\~/$HOME}"
 else
-  echo "session-handoff: cannot resolve workspace — neither $REPO/scripts/sutando-config.sh exists nor \$SUTANDO_WORKSPACE is set." >&2
+  echo "session-handoff: cannot resolve workspace — neither $REPO/src/workspace_resolve.sh exists nor \$SUTANDO_WORKSPACE is set." >&2
   exit 1
 fi
+if [ -z "${WORKSPACE:-}" ]; then
+  echo "session-handoff: workspace resolved to empty string. Refusing to derive paths under /." >&2
+  exit 1
+fi
+WORKSPACE_DIR="$WORKSPACE"  # historical local name retained for the rest of this file
 
 # Build state from available signals
 {
@@ -79,7 +87,7 @@ print(personal_path('pending-questions.md', Path('$REPO')))
 
   # Tasks in flight
   echo "## Tasks"
-  ls "$REPO/tasks/"*.txt 2>/dev/null | head -5 || echo "None pending"
+  ls "$WORKSPACE_DIR/tasks/"*.txt 2>/dev/null | head -5 || echo "None pending"
   echo ""
 
   # Quota (with reset times)

@@ -34,15 +34,17 @@ DEST="$HOME/Library/LaunchAgents/$LABEL.plist"
 DOMAIN="gui/$(id -u)"
 SERVICE="$DOMAIN/$LABEL"
 
-# Resolve runtime workspace via the M0 helper (PR #1395). Defaults to
-# <repo>/workspace/; honors $SUTANDO_WORKSPACE as legacy escape hatch.
-# Fail loud if neither path resolves.
-if [ -f "$REPO/scripts/sutando-config.sh" ]; then
-  WORKSPACE="$(bash "$REPO/scripts/sutando-config.sh" workspace)"
+# Resolve runtime workspace via the shared post-M0 helper (PR #1395, single
+# source at src/workspace_resolve.sh). Defensive fallback for non-checkout
+# installs where the helper file isn't reachable.
+if [ -f "$REPO/src/workspace_resolve.sh" ]; then
+  # shellcheck source=workspace_resolve.sh
+  source "$REPO/src/workspace_resolve.sh"
+  resolve_workspace_or_die
 elif [ -n "${SUTANDO_WORKSPACE:-}" ]; then
   WORKSPACE="${SUTANDO_WORKSPACE/#\~/$HOME}"
 else
-  echo "install-sutando-app-launchd: cannot resolve workspace — neither $REPO/scripts/sutando-config.sh exists nor \$SUTANDO_WORKSPACE is set." >&2
+  echo "${0##*/}: cannot resolve workspace — neither $REPO/src/workspace_resolve.sh exists nor \$SUTANDO_WORKSPACE is set." >&2
   exit 1
 fi
 

@@ -21,21 +21,22 @@ case "$MODE" in
   *) echo "Usage: bash src/init.sh [--auto | --preflight]"; exit 2;;
 esac
 
-# Resolve runtime workspace via the M0 helper (scripts/sutando-config.sh).
-# Post-M0 (PR #1395): default = <repo>/workspace/; $SUTANDO_WORKSPACE remains
-# honored as legacy escape hatch (via the helper or as a fallback here for
-# non-checkout installs). Runtime state files (logs, state, tasks, results,
-# notes, data, pending-questions.md, …) live here; loose status .json files
-# (core-status.json, voice-state.json, …) live under state/. Repo stays for
-# the code + skills + the schedule-crons.json copy below.
-# Fail loudly if neither path resolves — refuses to silently write to a
-# hardcoded legacy default (which would re-introduce the M1 split-brain class).
-if [ -f "$REPO/scripts/sutando-config.sh" ]; then
-  WORKSPACE="$(bash "$REPO/scripts/sutando-config.sh" workspace)"
+# Resolve runtime workspace via the shared post-M0 helper (PR #1395).
+# Single source for the resolution pattern lives in src/workspace_resolve.sh
+# — replaces the previously-duplicated 3-way block in 5 scripts (Lucy's #1399
+# review nit). Defensive fallback to the env var for the rare case where the
+# helper file isn't reachable (non-checkout / extracted-tarball install /
+# minimized test fixture). Runtime state files (logs, state, tasks, results,
+# notes, data, pending-questions.md, …) live under the workspace; loose
+# status .json files (core-status.json, voice-state.json, …) live under state/.
+if [ -f "$REPO/src/workspace_resolve.sh" ]; then
+  # shellcheck source=workspace_resolve.sh
+  source "$REPO/src/workspace_resolve.sh"
+  resolve_workspace_or_die
 elif [ -n "${SUTANDO_WORKSPACE:-}" ]; then
   WORKSPACE="${SUTANDO_WORKSPACE/#\~/$HOME}"
 else
-  echo "init.sh: cannot resolve workspace — neither $REPO/scripts/sutando-config.sh exists nor \$SUTANDO_WORKSPACE is set." >&2
+  echo "init.sh: cannot resolve workspace — neither $REPO/src/workspace_resolve.sh exists nor \$SUTANDO_WORKSPACE is set." >&2
   exit 1
 fi
 
@@ -237,15 +238,22 @@ tier1() {
   # below points users at the CLI when legacy state is detected.
   legacy_state_notice
 
-  # Directories
-  create_dir_if_missing "logs"
-  create_dir_if_missing "state"
-  create_dir_if_missing "tasks"
-  create_dir_if_missing "results"
-  create_dir_if_missing "results/archive"
-  create_dir_if_missing "results/calls"
-  create_dir_if_missing "notes"
-  create_dir_if_missing "data"
+  # Directories — canonical list lives in `scripts/sutando-config.sh subdirs`
+  # so the layout is a single source of truth across init.sh tier1 +
+  # `bootstrap` subcommand + docs. Falls back to the historical hardcoded
+  # set if the helper isn't reachable (non-checkout install). Convergent
+  # feedback from Mini + Lucy on PR #1399.
+  if [ -f "$REPO/scripts/sutando-config.sh" ]; then
+    while IFS= read -r _d; do
+      [ -n "$_d" ] && create_dir_if_missing "$_d"
+    done < <(bash "$REPO/scripts/sutando-config.sh" subdirs)
+    unset _d
+  else
+    for _d in logs state tasks results results/archive results/calls notes data; do
+      create_dir_if_missing "$_d"
+    done
+    unset _d
+  fi
 
   # Files — placeholders only, content added by the agent later.
   # build_log.md lives under $SUTANDO_WORKSPACE per workspace contract; seeded

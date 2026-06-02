@@ -18,7 +18,7 @@ If an interval is provided in ARGUMENTS (e.g. "5m", "10m", "30m"), use it. Other
 
 ## On activation
 
-1. **Catchup first** (fresh-session only). Check `state/proactive-loop-started.sentinel` (resolve under `${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}/`). If absent → run `/catchup-after-startup` BEFORE anything else so the conversation buffer has cross-restart context, then `mkdir -p` the workspace `state/` and `touch` the sentinel. If present → this is a cron-driven pass within an already-running session; skip catchup and proceed. The sentinel is cleared by the SessionEnd hook (or explicitly via `rm state/proactive-loop-started.sentinel`) so the next fresh session re-runs catchup.
+1. **Catchup first** (fresh-session only). Resolve `WORKSPACE="$(bash scripts/sutando-config.sh workspace)"` (M0 helper, PR #1395), then check `"$WORKSPACE/state/proactive-loop-started.sentinel"`. If absent → run `/catchup-after-startup` BEFORE anything else so the conversation buffer has cross-restart context, then `mkdir -p "$WORKSPACE/state"` and `touch "$WORKSPACE/state/proactive-loop-started.sentinel"`. If present → this is a cron-driven pass within an already-running session; skip catchup and proceed. The sentinel is cleared by the SessionEnd hook (`src/session-handoff.sh`, which now resolves via the same helper) or explicitly via `rm "$WORKSPACE/state/proactive-loop-started.sentinel"` so the next fresh session re-runs catchup. **Important:** the prior `${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}` form is no longer correct post-M0 (would write/check the legacy default while the handoff clears the M0 default → catchup silently skipped); always use the helper here.
 2. Run `/schedule-crons` to set up all recurring cron jobs (morning briefing, Zacks, etc.)
 3. Start the streaming task watcher via the `Monitor` tool — pass `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`, `description: 'Streaming task watcher'`. The script emits one `TASK_FILE: <basename>` line per new task file (initial sweep + each subsequent event). Read the named file via the Read tool when notifications arrive.
 
@@ -32,11 +32,14 @@ Otherwise, use `/loop <interval>` with this prompt:
 
 You are Sutando — a personal AI agent running as this Claude Code session.
 
-**Workspace path resolution (post-M0, PR #1395):** all workspace-relative paths in this skill resolve via the M0 helper. At the top of each shell invocation that writes workspace files, set:
+**Workspace path resolution (post-M0, PR #1395):** all workspace-relative paths in this skill resolve via the M0 helper. **Resolve once per pass** and reuse the variable — don't re-spawn the python subprocess per read or write:
 ```bash
 WORKSPACE="$(bash scripts/sutando-config.sh workspace)"
+# ...all subsequent reads and writes use "$WORKSPACE/<path>" — quote it.
+echo "$payload" > "$WORKSPACE/state/core-status.json"
+cat "$WORKSPACE/build_log.md"
 ```
-This resolves to `<repo>/workspace/` by default; honors `$SUTANDO_WORKSPACE` as legacy escape hatch. Never hardcode `~/.sutando/workspace/` or use the bare relative path (bash CWD is the repo, not the workspace).
+This resolves to `<repo>/workspace/` by default; honors `$SUTANDO_WORKSPACE` as legacy escape hatch. Never hardcode `~/.sutando/workspace/`, never use a bare relative path (bash CWD is the repo, not the workspace), and always quote `"$WORKSPACE/..."` so spaces in the workspace path don't tokenize.
 
 **Build log:** `$WORKSPACE/build_log.md`
 
