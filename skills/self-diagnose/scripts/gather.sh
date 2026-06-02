@@ -145,8 +145,9 @@ fi
 find "$REPO/results" -maxdepth 1 -type f -name "*.txt" -mmin "-$((SECONDS_AGO/60))" 2>/dev/null | head -20 > "$OUT/results-recent-paths.txt" || true
 
 # 8) Quota state
-if [ -f "$HOME/.claude/skills/quota-tracker/scripts/read-quota.py" ]; then
-	python3 "$HOME/.claude/skills/quota-tracker/scripts/read-quota.py" 2>&1 | head -10 > "$OUT/quota.txt" || true
+_QUOTA_SCRIPT="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/quota-tracker/scripts/read-quota.py"
+if [ -f "$_QUOTA_SCRIPT" ]; then
+	python3 "$_QUOTA_SCRIPT" 2>&1 | head -10 > "$OUT/quota.txt" || true
 fi
 
 # Print size summary to stderr and path to stdout

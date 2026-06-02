@@ -70,8 +70,9 @@ case "$cmd" in
             echo "ERROR: template not found: $TEMPLATE" >&2
             exit 1
         fi
-        if [ ! -f "$HOME/.claude/skills/quota-tracker/scripts/credential-proxy.ts" ]; then
-            echo "ERROR: quota-tracker skill not found at ~/.claude/skills/quota-tracker/" >&2
+        _PROXY_SCRIPT="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/quota-tracker/scripts/credential-proxy.ts"
+        if [ ! -f "$_PROXY_SCRIPT" ]; then
+            echo "ERROR: quota-tracker skill not found at $_PROXY_SCRIPT" >&2
             echo "  Install it first — credential-proxy.ts is the proxy target." >&2
             exit 1
         fi

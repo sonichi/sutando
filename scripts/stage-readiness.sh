@@ -142,7 +142,7 @@ else
 fi
 
 # 6) quota
-QUOTA_OUT=$(python3 "$HOME/.claude/skills/quota-tracker/scripts/read-quota.py" 2>/dev/null || echo "")
+QUOTA_OUT=$(python3 "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/quota-tracker/scripts/read-quota.py" 2>/dev/null || echo "")
 REM=$(echo "$QUOTA_OUT" | grep -oE '[0-9]+% remaining' | head -1 | grep -oE '[0-9]+')
 if [ -n "${REM:-}" ]; then
     if [ "$REM" -ge 10 ]; then

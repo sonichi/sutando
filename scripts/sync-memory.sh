@@ -145,7 +145,7 @@ fi
 # back via `find … | head -1` to whichever sibling memory dir landed first
 # (alphabetical). Bug silently skipped real memory writes for 5+ weeks
 # before being caught. See docs/workspace-contract.md.
-MEMORY_DIR="$HOME/.claude/projects/$(echo "$SCRIPT_PARENT" | sed 's|/|-|g')/memory"
+MEMORY_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$(echo "$SCRIPT_PARENT" | sed 's|/|-|g')/memory"
 NOTES_DIR="$REPO_DIR/notes"
 LOG="/tmp/sync-memory.log"
 LOCK_DIR="/tmp/sync-memory.lock.d"
@@ -179,7 +179,7 @@ fi
 
 # Auto-detect memory dir (may vary by machine)
 if [ ! -d "$MEMORY_DIR" ]; then
-    MEMORY_DIR=$(find "$HOME/.claude/projects" -name "memory" -type d 2>/dev/null | head -1)
+    MEMORY_DIR=$(find "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects" -name "memory" -type d 2>/dev/null | head -1)
 fi
 
 if [ ! -d "$SYNC_DIR" ]; then

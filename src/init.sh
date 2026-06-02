@@ -324,12 +324,13 @@ preflight() {
   done
 
   # External channel envs — Discord / Telegram bot tokens live outside the repo .env
+  _CHAN_BASE="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/channels"
   optional_total=$((optional_total + 1))
-  if [ -f "$HOME/.claude/channels/discord/.env" ] && grep -qE '^DISCORD_BOT_TOKEN=.+' "$HOME/.claude/channels/discord/.env"; then
+  if [ -f "$_CHAN_BASE/discord/.env" ] && grep -qE '^DISCORD_BOT_TOKEN=.+' "$_CHAN_BASE/discord/.env"; then
     optional_ok=$((optional_ok + 1))
   fi
   optional_total=$((optional_total + 1))
-  if [ -f "$HOME/.claude/channels/telegram/.env" ] && grep -qE '^TELEGRAM_BOT_TOKEN=.+' "$HOME/.claude/channels/telegram/.env"; then
+  if [ -f "$_CHAN_BASE/telegram/.env" ] && grep -qE '^TELEGRAM_BOT_TOKEN=.+' "$_CHAN_BASE/telegram/.env"; then
     optional_ok=$((optional_ok + 1))
   fi
 
