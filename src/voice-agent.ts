@@ -1424,6 +1424,35 @@ async function main() {
 			} catch { /* test-only */ }
 		}, 250);
 	}
+	// Wire output sanitizer: intercept model-spoken transcript to detect and suppress
+	// hallucinated [System: …] / [Silence] directives (issue #1410 / #1356 class).
+	// In native-audio mode, Gemini sends audio + transcript concurrently. Suppressing
+	// _suppressAudio on detection cuts off remaining audio chunks in the same turn;
+	// earlier chunks already sent are not recalled. This is best-effort detection +
+	// partial mitigation — fix #1 from issue #1410.
+	(() => {
+		const transport = (session as any).transport;
+		if (!transport) return;
+		const FABRICATED_OUTPUT_RE = /^\s*(\[System:|System:|Silence\.?|\[Silence\.?\]|<ctrl\d+>)/i;
+		const origOnOutputTranscription = transport.onOutputTranscription?.bind(transport);
+		transport.onOutputTranscription = (text: string) => {
+			if (FABRICATED_OUTPUT_RE.test(text.trim())) {
+				console.error(`${ts()} [OutputSanitizer] BLOCKED fabricated directive spoken aloud: ${text.slice(0, 120)}`);
+				// Best-effort: suppress remaining audio chunks in this turn.
+				if ('_suppressAudio' in transport) transport._suppressAudio = true;
+				return; // skip transcript storage for fabricated output
+			}
+			origOnOutputTranscription?.(text);
+		};
+		// Reset _suppressAudio at turn boundaries so the next turn is unaffected.
+		session.eventBus.subscribe('turn.end', () => {
+			if (transport && '_suppressAudio' in transport) transport._suppressAudio = false;
+		});
+		session.eventBus.subscribe('turn.interrupted', () => {
+			if (transport && '_suppressAudio' in transport) transport._suppressAudio = false;
+		});
+		console.log(`${ts()} [OutputSanitizer] wired into transport.onOutputTranscription`);
+	})();
 
 	// Wire narration-tee: capture Gemini's outbound audio for screen recordings
 	try {
