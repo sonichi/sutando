@@ -33,10 +33,11 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from util_paths import claude_home_path  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 import discord_config  # noqa: E402  — workspace-local Sutando discord config (#1147)
 REPO = resolve_workspace()
-ACCESS_JSON = Path.home() / ".claude" / "channels" / "discord" / "access.json"
+ACCESS_JSON = claude_home_path("channels", "discord", "access.json")
 SSE_STATUS_URL = "http://localhost:8080/sse-status"
 
 # Path allowlist for `[file: ...]` markers — sourced from
@@ -183,7 +184,7 @@ def voice_connected() -> bool:
 def _load_token() -> str:
     """Read DISCORD_BOT_TOKEN from the first env file that has it."""
     for env_path in [
-        Path.home() / ".claude" / "channels" / "discord" / ".env",
+        claude_home_path("channels", "discord", ".env"),
         REPO / ".env",
     ]:
         if not env_path.exists():

@@ -179,17 +179,33 @@ def shared_personal_path(filename: str, workspace: Path | None = None) -> Path:
 # ---------------------------------------------------------------------------
 
 def claude_home_path(*subpath: str) -> Path:
-    """Resolve a path under Claude Code's per-user home (`~/.claude/`).
+    """Resolve a path under Claude Code's per-user home (`~/.claude/` by default).
 
     Pass subpath components positionally, e.g.:
         claude_home_path("channels", "discord", "access.json")
         claude_home_path("projects", project_slug, "memory", "MEMORY.md")
         claude_home_path("skills", skill_name)
 
-    Override the base with `$CLAUDE_HOME` for tests + alt-host installs.
+    Resolution order:
+      1. $CLAUDE_CONFIG_DIR (M2 workspace-scoped path; set by the
+         `claude-sutando` shell function + start-cli.sh — when present,
+         bridges + memory readers see the workspace's .claude-sutando/).
+      2. $CLAUDE_HOME (legacy alt-host override, kept for tests).
+      3. ~/.claude/ (default — vanilla `claude` users).
+
+    The CLAUDE_CONFIG_DIR check goes first because for a claude-sutando
+    install, that's where settings, sessions, channels, skills, and memory
+    actually live post-migrate. The CLAUDE_HOME hatch still works for tests
+    that need a non-default but non-workspace location.
     """
-    base_env = os.environ.get("CLAUDE_HOME")
-    base = Path(os.path.expanduser(base_env)) if base_env else (Path.home() / ".claude")
+    ccd_env = os.environ.get("CLAUDE_CONFIG_DIR")
+    home_env = os.environ.get("CLAUDE_HOME")
+    if ccd_env:
+        base = Path(os.path.expanduser(ccd_env))
+    elif home_env:
+        base = Path(os.path.expanduser(home_env))
+    else:
+        base = Path.home() / ".claude"
     if not subpath:
         return base
     return base.joinpath(*subpath)

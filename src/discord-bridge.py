@@ -55,7 +55,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 import discord_config  # noqa: E402  — Sutando workspace-local discord config (#1147)
-from util_paths import shared_personal_path  # noqa: E402
+from util_paths import claude_home_path, shared_personal_path  # noqa: E402
 from task_priority import default_priority_for_source  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
@@ -95,7 +95,7 @@ except Exception:  # pragma: no cover
 # Load token — env var takes precedence (allows test injection without a real .env file)
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 if not TOKEN:
-    channels_env = Path.home() / ".claude" / "channels" / "discord" / ".env"
+    channels_env = claude_home_path("channels", "discord", ".env")
     if channels_env.exists():
         for line in channels_env.read_text().splitlines():
             if line.startswith("DISCORD_BOT_TOKEN="):
@@ -504,7 +504,7 @@ seen_message_ids = set()  # Discord message IDs already processed
 
 
 # Load access config
-ACCESS_FILE = Path.home() / ".claude" / "channels" / "discord" / "access.json"
+ACCESS_FILE = claude_home_path("channels", "discord", "access.json")
 def load_allowed():
     try:
         data = json.loads(ACCESS_FILE.read_text())

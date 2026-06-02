@@ -29,7 +29,7 @@ from typing import Optional
 
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
-from util_paths import shared_personal_path  # noqa: E402
+from util_paths import claude_home_path, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 
 # Workspace = runtime-state root (tasks/, results/, state/). REPO_DIR stays the
@@ -910,7 +910,7 @@ def run_all_checks() -> list[dict]:
 
     # Messaging bridges (optional — only check if configured and not skipped)
     skip_telegram = (env_path.exists() and "SKIP_TELEGRAM=1" in env_path.read_text()) or os.environ.get("SKIP_TELEGRAM") == "1"
-    channels_dir = Path.home() / ".claude" / "channels"
+    channels_dir = claude_home_path("channels")
     for name, proc_name in [("telegram-bridge", "telegram-bridge"), ("discord-bridge", "discord-bridge")]:
         channel_name = name.replace("-bridge", "")
         if channel_name == "telegram" and skip_telegram:
