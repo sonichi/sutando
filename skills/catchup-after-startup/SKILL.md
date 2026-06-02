@@ -45,10 +45,10 @@ Catchup reads `session-state.md` to learn what the previous session was doing at
 Closing that gap = adding a **SessionEnd** hook that fires the same `session-handoff.sh`. After install, `session-state.md` always reflects the latest close (compact OR clean exit), and catchup gets a freshest possible briefing.
 
 ```bash
-bash ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/catchup-after-startup/scripts/install-hook.sh
+bash $(bash scripts/sutando-config.sh claude-sutando-config-dir)/skills/catchup-after-startup/scripts/install-hook.sh
 ```
 
-The installer is idempotent — safe to re-run. It edits `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json` and adds:
+The installer is idempotent — safe to re-run. It edits `$(bash scripts/sutando-config.sh claude-sutando-config-dir)/settings.json` and adds:
 
 ```json
 "SessionEnd": [{
@@ -63,20 +63,20 @@ Requires `SUTANDO_REPO_DIR` env or a checkout at `~/Desktop/sutando` (the same c
 
 ### Migrating from a pre-#1366 install (`SessionStop` → `SessionEnd`)
 
-Before [#1366](https://github.com/sonichi/sutando/pull/1366) `install-hook.sh` registered the hook under the event name `SessionStop` — which Claude Code silently no-op'd (`Unknown hook event 'SessionStop' was ignored`). If you installed before that PR merged, your `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json` still carries the dead key, and any *other* hooks you (or other skills) registered under `SessionStop` are equally dead, regardless of the command they invoke.
+Before [#1366](https://github.com/sonichi/sutando/pull/1366) `install-hook.sh` registered the hook under the event name `SessionStop` — which Claude Code silently no-op'd (`Unknown hook event 'SessionStop' was ignored`). If you installed before that PR merged, your `$(bash scripts/sutando-config.sh claude-sutando-config-dir)/settings.json` still carries the dead key, and any *other* hooks you (or other skills) registered under `SessionStop` are equally dead, regardless of the command they invoke.
 
 **No action needed in normal use.** The migration auto-runs every time `/catchup-after-startup` fires — i.e. every fresh session bootstrap that goes through `/schedule-crons` or `/proactive-loop` step 1. It's a universal key-rename: every entry under `SessionStop` is moved to `SessionEnd` and the `SessionStop` key is dropped. Dedup is built-in (a command already present in `SessionEnd` is not re-added).
 
 If you'd rather migrate by hand without waiting for the next session:
 
 ```bash
-python3 ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/catchup-after-startup/scripts/migrate-settings-hooks.py
+python3 $(bash scripts/sutando-config.sh claude-sutando-config-dir)/skills/catchup-after-startup/scripts/migrate-settings-hooks.py
 ```
 
 Or re-run the installer (which calls the migration + then ensures the `session-handoff.sh` `SessionEnd` entry is present):
 
 ```bash
-bash ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/catchup-after-startup/scripts/install-hook.sh
+bash $(bash scripts/sutando-config.sh claude-sutando-config-dir)/skills/catchup-after-startup/scripts/install-hook.sh
 ```
 
 Verify:

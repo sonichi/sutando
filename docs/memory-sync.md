@@ -38,7 +38,7 @@ Repeat the same steps on every machine in the fleet. All clone the same `SUTANDO
 
 | Source | Synced to | Notes |
 |---|---|---|
-| `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/<workspace-hash>/memory/*.md` | `~/.sutando/memory-sync/memory/` | Claude Code auto-memory files. Append-only is safest. Source resolves to `~/.claude/projects/...` for vanilla `claude` or `<workspace>/.claude-sutando/projects/...` for the `claude-sutando` shell function. |
+| `$CLAUDE_CONFIG_DIR/projects/<workspace-hash>/memory/*.md` | `~/.sutando/memory-sync/memory/` | Claude Code auto-memory files. Append-only is safest. Source resolves to `~/.claude/projects/...` for vanilla `claude` or `<workspace>/.claude-sutando/projects/...` for the `claude-sutando` shell function. |
 | `<sutando workspace>/notes/` | `~/.sutando/memory-sync/notes/` | Long-form notes. Symlink pattern recommended (see below). |
 
 ## What does NOT get synced
@@ -74,7 +74,7 @@ mv ~/Desktop/sutando/notes ~/Desktop/sutando/notes.legacy-backup
 ln -s ~/.sutando/memory-sync/notes ~/Desktop/sutando/notes
 ```
 
-Memory files (`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/.../memory/`) can't be symlinked the same way because Claude Code creates new files in that directory at runtime; let the script's `cp_if_newer` handle them.
+Memory files (`$CLAUDE_CONFIG_DIR/projects/.../memory/`) can't be symlinked the same way because Claude Code creates new files in that directory at runtime; let the script's `cp_if_newer` handle them.
 
 ## Troubleshooting
 

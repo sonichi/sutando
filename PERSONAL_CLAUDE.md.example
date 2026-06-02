@@ -34,7 +34,7 @@
 #
 # ### Maintenance / hygiene
 # - Examples:
-#   - Curate memory files under `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/<your-project>/memory/` (resolves to `~/.claude/projects/...` for vanilla `claude` or `<workspace>/.claude-sutando/projects/...` for `claude-sutando` users)
+#   - Curate memory files under `$CLAUDE_CONFIG_DIR/projects/<your-project>/memory/` (resolves to `~/.claude/projects/...` for vanilla `claude` or `<workspace>/.claude-sutando/projects/...` for `claude-sutando` users)
 #   - Resolve any `pending-questions.md` items the bot can handle without you
 #
 # ### Outreach & content
