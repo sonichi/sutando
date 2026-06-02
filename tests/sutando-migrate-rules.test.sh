@@ -74,8 +74,15 @@ assert_class "results/random-file.txt" "skip-unknown" || fail=1
 assert_class "state/cores/Qingyuns-MacBook-Pro.alive" "skip-ephemeral" || fail=1
 assert_class "state/auth/cloud-auth.json" "structural" || fail=1
 assert_class "state/auth/device.json" "structural" || fail=1
-assert_class "state/contextual-chips.json" "newest-mtime" || fail=1
-assert_class "state/voice-state.json" "newest-mtime" || fail=1
+# Per Lucy #design 2026-06-02: per-host status JSONs at state/ are now carved
+# out to structural (was newest-mtime; multi-host scan would have dropped a host's data).
+assert_class "state/contextual-chips.json" "structural" || fail=1
+assert_class "state/voice-state.json" "structural" || fail=1
+assert_class "state/core-status.json" "structural" || fail=1
+assert_class "state/quota-state.json" "structural" || fail=1
+assert_class "state/dynamic-content.json" "structural" || fail=1
+# Other state/*.json (not in the per-host carve-out list) still hit newest-mtime
+assert_class "state/random-other.json" "newest-mtime" || fail=1
 assert_class "state/loop-paused-until.sentinel" "structural" || fail=1
 
 # notes/ + logs/ + data/ + config/
@@ -101,13 +108,16 @@ assert_class "agent-inbox/processed/x.json" "structural" || fail=1
 # across sources, wrong for per-host identity.
 assert_class "state/auth/cloud-auth.json" "structural" || fail=1
 
-# Edge: path without any rule match
+# Edge: path without any explicit rule match — falls to the catchall
+# `*|quarantine-unknown` (added per Lucy #design + owner direction 2026-06-02).
+# This is the new correct behavior: user content is preserved under
+# legacy/<src-tag>/quarantine/, not silently skipped.
 out="$(bash "$MIGRATE" explain "totally-novel-root-file.xyz" 2>/dev/null)"
-if ! echo "$out" | grep -q "class: unknown"; then
-    echo "  FAIL: novel root file should fall through to 'unknown' (got: $(echo "$out" | grep '^class:'))"
+if ! echo "$out" | grep -q "class:  quarantine-unknown"; then
+    echo "  FAIL: novel root file should match quarantine-unknown catchall (got: $(echo "$out" | grep '^class:'))"
     fail=1
 else
-    echo "  OK: novel root file → unknown (skipped at commit)"
+    echo "  OK: novel root file → quarantine-unknown (preserved under <dest>/legacy/<src-tag>/quarantine/)"
 fi
 
 echo

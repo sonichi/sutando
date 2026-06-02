@@ -62,7 +62,7 @@ Summarize end-state to owner:
 - Sources preserved at original paths (per `workspace_m1_no_auto_commit`)
 - Backup-id for rollback (`bash scripts/sutando-migrate.sh rollback --backup-id <id>`)
 - Phase-2 cleanup reminder (`--delete-source` after ~7d observation)
-- Re-run `python3 src/health-check.py` to confirm the legacy-state-detected warning no longer fires (the surface count it's checking should now show 0 in the legacy locations)
+- Re-run `python3 src/health-check.py` and note: the legacy-state-detected warning WILL still fire — that's expected. The default `commit` preserves sources (matches `workspace_m1_no_auto_commit` + the (b)-style reader-fallback contract). The warning only clears after the two-phase phase 2 (`commit --delete-source --backup-id <id>` after ~7d observing no source-side writes). Mention this to owner: nag-clearance is intentional follow-up, not an unfixed bug.
 
 Write a build_log entry summarizing what migrated.
 

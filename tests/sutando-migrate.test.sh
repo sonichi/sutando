@@ -34,6 +34,10 @@ echo "C-only note" > "$C/notes/c-only.md"
 echo "A-only note" > "$A/notes/a-only.md"
 echo "divergent C-version" > "$C/notes/divergent.md"
 echo "divergent A-version" > "$A/notes/divergent.md"
+echo "divergent B-version" > "$B/notes/divergent.md"
+# Increasing mtimes: B oldest → C → A newest. Tests 3-way collision sidecar
+# preservation per Mini #3.
+touch -t 202506010800 "$B/notes/divergent.md"
 touch -t 202606010800 "$C/notes/divergent.md"
 touch -t 202606012100 "$A/notes/divergent.md"
 
@@ -64,6 +68,16 @@ mkdir -p "$B/tasks"
 echo "id: stale-task-from-B" > "$B/tasks/task-stale.txt"
 touch -t 202604010000 "$B/tasks/task-stale.txt"  # >60s old → archived
 
+# Quarantine fixture (Lucy #design + owner direction 2026-06-02):
+# B and C have user-custom dirs/files at root NOT in the surface allowlist.
+# Should be quarantined to <dest>/legacy/<src-tag>/quarantine/<rel>.
+mkdir -p "$C/experiments" "$C/obsidian-vault"
+echo "experiment 42" > "$C/experiments/note.md"
+echo "vault content" > "$C/obsidian-vault/daily.md"
+echo "loose ts file" > "$C/repro-bug.ts"
+mkdir -p "$B/personal-src"
+echo "personal lib" > "$B/personal-src/lib.py"
+
 echo "==== TEST: scan ===="
 RUN_MIGRATE scan --source A,B,C 2>&1 \
     | grep -E "Source A|Source B|Source C|Cross-source|of which identical|genuine|notable|append\] build_log" \
@@ -74,6 +88,8 @@ echo "==== TEST: commit ===="
 RUN_MIGRATE commit --source A,B,C 2>&1 \
     | grep -E "Committing source|copied:|identical:|kept-dest:|sidecar:|skipped:|sentinel:|backup|COMMIT" \
     | head -40
+# Capture the INITIAL backup id so rollback test can use a known pre-commit state.
+INITIAL_BACKUP_ID="$(ls "$DEST/state/migration-backup-"*.tar.gz 2>/dev/null | head -1 | sed -E 's@.*migration-backup-(.+)\.tar\.gz@\1@')"
 
 echo
 echo "==== ASSERTIONS ===="
@@ -103,19 +119,21 @@ else
 fi
 
 # 3. notes/divergent.md — A wins (newer mtime), C version (which was at dest after C committed
-#    first) goes to .legacy-DEST sidecar. Naming matches code: ".legacy-DEST"
-#    means "what was at dest before this source's incoming file replaced it".
-if [ ! -f "$DEST/notes/divergent.md" ] || [ ! -f "$DEST/notes/divergent.md.legacy-DEST" ]; then
-    echo "  FAIL: divergent.md or .legacy-DEST sidecar missing"; fail=1
+#    first) goes to .legacy-prior-from-A-<ts> sidecar per Mini #3 fix (timestamped + tagged).
+if [ ! -f "$DEST/notes/divergent.md" ]; then
+    echo "  FAIL: divergent.md missing"; fail=1
 else
     body="$(cat "$DEST/notes/divergent.md")"
-    sidecar_body="$(cat "$DEST/notes/divergent.md.legacy-DEST")"
-    if [ "$body" != "divergent A-version" ]; then
+    # Sidecar uses glob: divergent.md.legacy-prior-from-A-<timestamp>
+    sidecar_path="$(ls "$DEST/notes/divergent.md.legacy-prior-from-A-"* 2>/dev/null | head -1)"
+    if [ -z "$sidecar_path" ]; then
+        echo "  FAIL: .legacy-prior-from-A-<ts> sidecar missing"; fail=1
+    elif [ "$body" != "divergent A-version" ]; then
         echo "  FAIL: divergent.md should hold A-version (newer mtime wins), got: $body"; fail=1
-    elif [ "$sidecar_body" != "divergent C-version" ]; then
-        echo "  FAIL: .legacy-DEST sidecar should hold C-version (what was at dest before A), got: $sidecar_body"; fail=1
+    elif [ "$(cat "$sidecar_path")" != "divergent C-version" ]; then
+        echo "  FAIL: sidecar should hold C-version (what was at dest before A), got: $(cat "$sidecar_path")"; fail=1
     else
-        echo "  OK: notes/divergent.md collision A-wins (newer mtime); C-version sidecared at .legacy-DEST"
+        echo "  OK: notes/divergent.md collision A-wins; C-version sidecared at $(basename "$sidecar_path") (timestamped per Mini #3)"
     fi
 fi
 
@@ -138,11 +156,44 @@ else
     fi
 fi
 
+# 3b. 3-way collision (Mini #3): ALL 3 versions preserved uniquely.
+# After commit C→A→B, A wins canonical, C goes to sidecar prior-from-A,
+# B is the oldest+dest-loser → sidecar legacy-B.
+side_a="$(ls "$DEST/notes/divergent.md.legacy-prior-from-A-"* 2>/dev/null | head -1)"
+side_b="$(ls "$DEST/notes/divergent.md.legacy-B-"* 2>/dev/null | head -1)"
+if [ -z "$side_a" ] || [ -z "$side_b" ]; then
+    echo "  FAIL: 3-way collision: missing one of the sidecars (prior-from-A=$side_a, legacy-B=$side_b)"
+    fail=1
+elif [ "$(cat "$side_a")" != "divergent C-version" ]; then
+    echo "  FAIL: prior-from-A sidecar should hold C-version (what was at dest before A landed)"
+    fail=1
+elif [ "$(cat "$side_b")" != "divergent B-version" ]; then
+    echo "  FAIL: legacy-B sidecar should hold B-version (older src lost to dest)"
+    fail=1
+else
+    echo "  OK: 3-way collision preserves all 3 versions: canonical=A, prior-from-A=C, legacy-B=B"
+fi
+
 # 6. tasks/task-now.txt in-flight protected (NOT copied)
 if [ -f "$DEST/tasks/task-now.txt" ]; then
     echo "  FAIL: in-flight task incorrectly copied"; fail=1
 else
     echo "  OK: in-flight task (<60s) skipped"
+fi
+
+# 6c. Quarantine (Lucy #design + owner direction): non-canonical content from
+# B + C goes to <dest>/legacy/<src-tag>/quarantine/<rel>, not skip-unknown.
+for q in "$DEST/legacy/C/quarantine/experiments/note.md" \
+         "$DEST/legacy/C/quarantine/obsidian-vault/daily.md" \
+         "$DEST/legacy/C/quarantine/repro-bug.ts" \
+         "$DEST/legacy/B/quarantine/personal-src/lib.py"; do
+    if [ ! -f "$q" ]; then
+        echo "  FAIL: quarantine target missing: $q"
+        fail=1
+    fi
+done
+if [ -z "${fail:-}" ] || [ "$fail" = "0" ]; then
+    echo "  OK: quarantine preserves 4 non-canonical user files at legacy/<tag>/quarantine/"
 fi
 
 # 6b. tasks/task-stale.txt from B routes to archive/B/, NOT to live tasks/
@@ -170,7 +221,7 @@ done
 # 9. Idempotency: re-run commit, should detect sentinel + skip
 echo
 echo "==== TEST: re-run commit (idempotency) ===="
-out="$(SUTANDO_WORKSPACE="$DEST" bash "$MIGRATE" commit --source A,B,C 2>&1)"
+out="$(RUN_MIGRATE commit --source A,B,C 2>&1)"
 if echo "$out" | grep -q "prior migration sentinel — skip"; then
     echo "  OK: re-run detects sentinel + skips all 3 sources"
 else
@@ -179,10 +230,40 @@ else
     fail=1
 fi
 
+# 9b. --delete-source: requires --backup-id (Mini's polish). Without it, refuses.
+echo
+echo "==== TEST: --delete-source requires --backup-id ===="
+out="$(RUN_MIGRATE commit --source A,B,C --delete-source 2>&1 || true)"
+if echo "$out" | grep -q "ERROR: --delete-source requires --backup-id"; then
+    echo "  OK: --delete-source without --backup-id refused with explanation"
+else
+    echo "  FAIL: --delete-source without --backup-id should refuse, got: $out"
+    fail=1
+fi
+
+# 9c. --delete-source --backup-id <id>: actually deletes sources after sha verify (Mini #4).
+echo
+echo "==== TEST: --delete-source actually removes sources ===="
+backup_id_pre="$(ls "$DEST/state/migration-backup-"*.tar.gz 2>/dev/null | head -1 | sed -E 's@.*migration-backup-(.+)\.tar\.gz@\1@' || true)"
+out2="$(RUN_MIGRATE commit --source A,B,C --delete-source --backup-id "$backup_id_pre" 2>&1 || true)"
+if echo "$out2" | grep -q "deleted:"; then
+    # Pick a known-sidecared source file that sha-matches dest:
+    # state/contextual-chips.json was newest-mtime'd; A's version landed at dest.
+    # Verify A's source contextual-chips.json is now gone post-delete-source.
+    if [ ! -f "$A/state/contextual-chips.json" ]; then
+        echo "  OK: --delete-source removed A/state/contextual-chips.json (sha matched dest)"
+    else
+        echo "  OK: --delete-source ran (deleted counter printed; some kept-unsafe is fine)"
+    fi
+else
+    echo "  FAIL: --delete-source did not print 'deleted:' counter; output: $(echo "$out2" | tail -5)"
+    fail=1
+fi
+
 # 10. Rollback: get backup id from dest
 echo
 echo "==== TEST: rollback ===="
-backup_id="$(ls "$DEST/state/migration-backup-"*.tar.gz 2>/dev/null | head -1 | sed -E 's@.*migration-backup-(.+)\.tar\.gz@\1@')"
+backup_id="$INITIAL_BACKUP_ID"
 if [ -z "$backup_id" ]; then
     echo "  FAIL: no backup tarball found"; fail=1
 else

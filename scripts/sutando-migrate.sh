@@ -122,6 +122,25 @@ EPHEMERAL_PATTERNS=(
     "migration-backup-*.tar.gz"
 )
 
+# Quarantine-walk excludes (when WALK_FULL_TREE is set for a source).
+# Anything matching these patterns is skipped entirely — not migrated, not
+# quarantined. Per Lucy #design 2026-06-02 + owner direction: capture user's
+# custom workspace content (experiments/, obsidian-vault/, etc.) without
+# accidentally hoovering up VCS/runtime/build artifacts.
+QUARANTINE_EXCLUDES=(
+    ".git"
+    "node_modules"
+    ".cache"
+    ".venv"
+    "venv"
+    "__pycache__"
+    "dist"
+    "build"
+    ".next"
+    ".nuxt"
+    ".DS_Store"
+)
+
 # Per-class file classification rules. Order matters — first match wins.
 declare -a CLASS_RULES
 CLASS_RULES=(
@@ -178,6 +197,15 @@ CLASS_RULES=(
     "results/*|skip-unknown"
     "state/cores/*.alive|skip-ephemeral"
     "state/auth/*|structural"  # Mini #2: per-host identity, NOT newest-wins
+    # Per Lucy #design 2026-06-02 follow-up empirical: per-host status JSONs
+    # at state/<name>.json would hit state/*.json|newest-mtime and drop a
+    # losing host's data on multi-host scan. Same hazard as state/auth — carve
+    # out to structural to preserve per-host copies.
+    "state/core-status.json|structural"
+    "state/quota-state.json|structural"
+    "state/dynamic-content.json|structural"
+    "state/voice-state.json|structural"
+    "state/contextual-chips.json|structural"
     "state/*.json|newest-mtime"
     "state/*|structural"
     "notes/*|collision-keep-both"  # Mini #4: accretes cruft over N migrations;
@@ -192,6 +220,15 @@ CLASS_RULES=(
     "docs/*|structural"
     "email-drafts/*|structural"
     "agent-inbox/*|structural"
+    # Catchall — per Lucy #design 2026-06-02 + owner direction: workspace
+    # sources B+C may have user-custom dirs/files (experiments/, obsidian-vault/,
+    # personal-src/, repro-*.ts, etc.) outside the canonical surface. Anything
+    # that doesn't match an explicit rule above falls here and gets quarantined
+    # to <dest>/legacy/<src-tag>/quarantine/<relpath>. Net: no user content is
+    # silently lost. Only walked when WALK_FULL_TREE per-source flag is set
+    # (B + C); Source A (repo root) stays surface-restricted to avoid
+    # quarantining sutando code.
+    "*|quarantine-unknown"
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -339,10 +376,12 @@ scan_source() {
         done <<<"$sentinels"
     fi
 
-    # Build the explicit walk list: workspace-surface subdirs + workspace-surface
-    # root files. We do NOT walk the whole source tree — Source A is a sutando
-    # checkout, walking it would pull in src/, node_modules/, .git, etc.
-    # (15,044-file false positive caught in scan v1).
+    # Build the explicit walk list. Surface-restricted for Source A (its root
+    # is the SUTANDO REPO checkout, not a workspace — walking the whole tree
+    # would pull in src/, node_modules/, .git, etc; 15,044-file false positive
+    # caught in scan v1). Full-tree for sources B + C (they ARE workspace
+    # roots; user-custom content like experiments/ obsidian-vault/ should be
+    # quarantined per Lucy #design + owner direction 2026-06-02).
     local -a walk_paths=()
     local sd sf
     for sd in "${WORKSPACE_SURFACE_DIRS[@]}"; do
@@ -351,6 +390,34 @@ scan_source() {
     for sf in "${WORKSPACE_SURFACE_FILES[@]}"; do
         [ -f "$src/$sf" ] && walk_paths+=("$src/$sf")
     done
+    # Quarantine walk: for B + C, also include any TOP-LEVEL entries not
+    # already in the surface (e.g. experiments/, personal-src/, qr-codes/,
+    # obsidian-vault/, loose .ts files). Skip standard noise.
+    case "$tag" in
+        B|C)
+            local entry name
+            for entry in "$src"/* "$src"/.[!.]*; do
+                [ -e "$entry" ] || continue
+                name="$(basename "$entry")"
+                # Skip if already in surface (dirs or files).
+                local already=0
+                for sd in "${WORKSPACE_SURFACE_DIRS[@]}"; do [ "$name" = "$sd" ] && already=1 && break; done
+                [ "$already" = "1" ] && continue
+                for sf in "${WORKSPACE_SURFACE_FILES[@]}"; do [ "$name" = "$sf" ] && already=1 && break; done
+                [ "$already" = "1" ] && continue
+                # Skip standard excludes.
+                local skip=0
+                for ex in "${QUARANTINE_EXCLUDES[@]}"; do [ "$name" = "$ex" ] && skip=1 && break; done
+                [ "$skip" = "1" ] && continue
+                # Also skip hidden files that are migration sentinels themselves.
+                case "$name" in
+                    .migrated-from-*|.legacy-migrated-*|.notes-migrated|.build_log-migrated|.conversation-log-migrated|.status-migrated|.legacy-notice-printed|.last-pq-notify|.env|.gitignore)
+                        continue ;;
+                esac
+                walk_paths+=("$entry")
+            done
+            ;;
+    esac
     [ ${#walk_paths[@]} -eq 0 ] && {
         REPORT_LINES+=("  (no workspace surface present at this source — nothing to migrate)")
         return 0
@@ -754,12 +821,23 @@ commit_one() {
                 fi
                 # Genuine collision: write loser as sidecar, keep dest as primary
                 # only if dest is newer. If src is newer, swap.
+                # Per Mini #design 2026-06-02 blocker #3: 3-way collisions
+                # overwrite the .legacy-DEST sidecar when a 3rd source replaces
+                # dest. Use timestamped + source-tagged sidecar names so each
+                # collision is preserved uniquely.
+                local ts_suffix
+                ts_suffix="$(date -u +%Y%m%dT%H%M%SZ)"
                 if [ "$src_mt" -gt "$dst_mt" ]; then
-                    copy_preserving_mtime "$dst_path" "$dst_path.legacy-DEST"
+                    # dest's content (whatever was there) goes to a sidecar.
+                    # Name it .legacy-prior-<src_tag>-<ts> to convey "this is
+                    # what was at dest before <src_tag> overwrote it" + the
+                    # timestamp ensures 3-way collisions don't clobber.
+                    copy_preserving_mtime "$dst_path" "$dst_path.legacy-prior-from-$tag-$ts_suffix"
                     copy_preserving_mtime "$src_file" "$dst_path"
                     echo "src-wins-newer"
                 else
-                    copy_preserving_mtime "$src_file" "$dst_path.legacy-$tag"
+                    # src loses; preserve under tagged + timestamped sidecar.
+                    copy_preserving_mtime "$src_file" "$dst_path.legacy-$tag-$ts_suffix"
                     echo "dest-wins-newer"
                 fi
                 return 0
@@ -890,6 +968,16 @@ commit_one() {
             fi
             return 0
             ;;
+        quarantine-unknown)
+            # Per Lucy #design 2026-06-02 + owner direction: workspace sources
+            # may have user-custom content outside the canonical surface (e.g.
+            # experiments/, obsidian-vault/, personal-src/). Preserve under a
+            # namespaced quarantine path rather than skip-unknown'ing it.
+            dst_path="$DEST_REAL/legacy/$tag/quarantine/$rel"
+            copy_preserving_mtime "$src_file" "$dst_path"
+            echo "quarantined"
+            return 0
+            ;;
         skip-ephemeral|skip-unknown|unknown)
             echo "skipped-class"
             return 0
@@ -901,7 +989,7 @@ commit_one() {
 commit_source() {
     local tag="$1" src="$2"
 
-    if any_source_sentinel "$tag" && [ "$FORCE" = "0" ]; then
+    if any_source_sentinel "$tag" && [ "$FORCE" = "0" ] && [ "$DELETE_SOURCE" = "0" ]; then
         echo "sutando-migrate: source $tag has prior migration sentinel — skip (use --force)"
         return 0
     fi
@@ -909,7 +997,7 @@ commit_source() {
     echo
     echo "--- Committing source $tag ($src) ---"
 
-    # Reuse the same walk-list logic as scan_source.
+    # Reuse the same walk-list logic as scan_source (including B+C quarantine).
     local -a walk_paths=()
     local sd sf
     for sd in "${WORKSPACE_SURFACE_DIRS[@]}"; do
@@ -918,9 +1006,31 @@ commit_source() {
     for sf in "${WORKSPACE_SURFACE_FILES[@]}"; do
         [ -f "$src/$sf" ] && walk_paths+=("$src/$sf")
     done
+    case "$tag" in
+        B|C)
+            local entry name skip ex already
+            for entry in "$src"/* "$src"/.[!.]*; do
+                [ -e "$entry" ] || continue
+                name="$(basename "$entry")"
+                already=0
+                for sd in "${WORKSPACE_SURFACE_DIRS[@]}"; do [ "$name" = "$sd" ] && already=1 && break; done
+                [ "$already" = "1" ] && continue
+                for sf in "${WORKSPACE_SURFACE_FILES[@]}"; do [ "$name" = "$sf" ] && already=1 && break; done
+                [ "$already" = "1" ] && continue
+                skip=0
+                for ex in "${QUARANTINE_EXCLUDES[@]}"; do [ "$name" = "$ex" ] && skip=1 && break; done
+                [ "$skip" = "1" ] && continue
+                case "$name" in
+                    .migrated-from-*|.legacy-migrated-*|.notes-migrated|.build_log-migrated|.conversation-log-migrated|.status-migrated|.legacy-notice-printed|.last-pq-notify|.env|.gitignore)
+                        continue ;;
+                esac
+                walk_paths+=("$entry")
+            done
+            ;;
+    esac
     [ ${#walk_paths[@]} -eq 0 ] && { echo "  (nothing on surface; skip)"; return 0; }
 
-    local n_copied=0 n_kept=0 n_skipped=0 n_sidecar=0 n_rehomed=0 n_identical=0 n_other=0
+    local n_copied=0 n_kept=0 n_skipped=0 n_sidecar=0 n_rehomed=0 n_identical=0 n_quarantined=0 n_other=0
     local file rel cls outcome
     while IFS= read -r -d '' file; do
         rel="${file#"$src"/}"
@@ -932,7 +1042,7 @@ commit_source() {
         cls="$(classify "$rel")"
         outcome="$(commit_one "$file" "$rel" "$tag" "$cls")"
         case "$outcome" in
-            copied|src-wins-newer|src-newer|rehomed|rehomed-newer|merged|copied-stale)
+            copied|src-wins-newer|src-newer|rehomed|rehomed-newer|merged|archived-stale|copied-stale)
                 n_copied=$((n_copied+1)) ;;
             dest-wins-newer|dest-newer|rehomed-skip-older|skipped-collision-dest)
                 n_kept=$((n_kept+1)) ;;
@@ -940,6 +1050,8 @@ commit_source() {
                 n_identical=$((n_identical+1)) ;;
             sidecar)
                 n_sidecar=$((n_sidecar+1)) ;;
+            quarantined)
+                n_quarantined=$((n_quarantined+1)) ;;
             skipped-class|skipped-inflight|skipped-fallthrough)
                 n_skipped=$((n_skipped+1)) ;;
             *)
@@ -951,11 +1063,73 @@ commit_source() {
     echo "  identical:   $n_identical (drop-dup, no real conflict)"
     echo "  kept-dest:   $n_kept"
     echo "  sidecar:     $n_sidecar"
+    [ "$n_quarantined" -gt 0 ] && echo "  quarantined: $n_quarantined (to <dest>/legacy/$tag/quarantine/)"
     echo "  skipped:     $n_skipped"
     [ "$n_other" -gt 0 ] && echo "  other:       $n_other"
 
     touch "$(source_sentinel "$tag")"
     echo "  sentinel:    $(source_sentinel "$tag")"
+
+    # Per Mini #design 2026-06-02 blocker #4: --delete-source must actually
+    # delete sources after sha verification. The two-phase pattern means
+    # phase 1 (no-delete) ships; phase 2 (--delete-source --backup-id <id>)
+    # cleans up after ~7d observation window of no straggler writes.
+    if [ "$DELETE_SOURCE" = "1" ]; then
+        local n_deleted=0 n_kept_unsafe=0
+        # Re-walk the surface; for each file that has a sha-matching dest
+        # landing, delete the source. Skip if no match (means content didn't
+        # land — keeping source is the safe default).
+        while IFS= read -r -d '' file; do
+            local rel_d="${file#"$src"/}"
+            case "$rel_d" in
+                .git/*) continue ;;
+                .DS_Store|*/.DS_Store|.gitkeep|*/.gitkeep) continue ;;
+            esac
+            local cls_d
+            cls_d="$(classify "$rel_d")"
+            # In-flight + ephemeral classes were never copied; don't delete.
+            case "$cls_d" in
+                skip-ephemeral|skip-unknown|inflight-guard|quarantine-unknown)
+                    continue ;;
+            esac
+            # Find any dest landing whose content matches.
+            local matched=""
+            for cand in \
+                "$DEST_REAL/$rel_d" \
+                "$DEST_REAL/legacy/$tag/$rel_d" \
+                "$DEST_REAL/legacy/$tag/quarantine/$rel_d"; do
+                if [ -f "$cand" ] && sha_match "$file" "$cand"; then
+                    matched="$cand"; break
+                fi
+            done
+            # Also check timestamped sidecar globs at canonical-rel.
+            if [ -z "$matched" ]; then
+                local g
+                for g in "$DEST_REAL/$rel_d.legacy-$tag-"* "$DEST_REAL/$rel_d.legacy-prior-from-$tag-"*; do
+                    if [ -f "$g" ] && sha_match "$file" "$g"; then
+                        matched="$g"; break
+                    fi
+                done
+            fi
+            # For rehome-state class, the dest is renamed (state/auth/<base>
+            # or state/<base>); check those.
+            if [ -z "$matched" ] && [ "$cls_d" = "rehome-state" ]; then
+                local b="$(basename "$rel_d")"
+                for cand in "$DEST_REAL/state/auth/$b" "$DEST_REAL/state/$b"; do
+                    if [ -f "$cand" ] && sha_match "$file" "$cand"; then
+                        matched="$cand"; break
+                    fi
+                done
+            fi
+            if [ -n "$matched" ]; then
+                rm -f "$file" && n_deleted=$((n_deleted+1))
+            else
+                n_kept_unsafe=$((n_kept_unsafe+1))
+            fi
+        done < <(find "${walk_paths[@]}" -type f -print0 2>/dev/null)
+        echo "  deleted:     $n_deleted source files (sha verified at dest)"
+        [ "$n_kept_unsafe" -gt 0 ] && echo "  KEPT unsafe: $n_kept_unsafe source files (no matching dest content; investigate)"
+    fi
 }
 
 commit_main() {
@@ -1001,47 +1175,86 @@ commit_main() {
 }
 
 verify_main() {
+    # Per Mini #design 2026-06-02: verify must sha-compare content, not just
+    # check path existence. The previous version could pass even after a
+    # collision overwrote the source content. Now: for each indexed source
+    # file, locate its canonical dest landing OR sidecar, then sha-compare.
     echo "sutando-migrate: VERIFY mode"
-    local pass=0 fail=0 missing=0 mismatch=0
-    # For each indexed (source, file) that was supposed to land at dest:
-    # confirm dest has it (or a documented sidecar) + sha match for copied path.
+    local pass=0 missing=0 mismatch=0
     if [ ! -s "$XSRC_INDEX" ]; then
-        # No index yet — run a fresh scan to populate
         index_dest_for_collisions
         [ -n "$A_REAL_OK" ] && include_src A && scan_source A "$A_REAL_OK" >/dev/null
         [ -n "$B_REAL_OK" ] && include_src B && scan_source B "$B_REAL_OK" >/dev/null
         [ -n "$C_REAL_OK" ] && include_src C && scan_source C "$C_REAL_OK" >/dev/null
     fi
-    # Verification logic (lightweight first cut):
-    # for each non-DEST entry, the dest should have either the relpath or a
-    # sidecar at legacy/<tag>/<relpath>. Sha match for canonical winners.
+    # Need an inverse map: from indexed (tag, rel) back to the absolute source path.
+    # The scan recorded rel relative to the source root + tag. Re-derive:
+    src_path_for_tag() {
+        case "$1" in
+            A) echo "$A_REAL_OK" ;;
+            B) echo "$B_REAL_OK" ;;
+            C) echo "$C_REAL_OK" ;;
+        esac
+    }
     while IFS=$'\t' read -r rel tag cls mt sz; do
         [ "$tag" = "DEST" ] && continue
-        local dst_path="$DEST_REAL/$rel"
-        local sidecar="$DEST_REAL/legacy/$tag/$rel"
-        if [ -e "$dst_path" ] || [ -e "$sidecar" ] || [ -e "$dst_path.legacy-$tag" ]; then
+        case "$cls" in
+            skip-ephemeral|skip-unknown|inflight-guard|quarantine-unknown)
+                # These classes intentionally don't land at a stable dest path;
+                # in-flight-guard is age-dependent; quarantine is content-preserved
+                # under legacy/<tag>/quarantine/ which we verify separately below.
+                pass=$((pass+1)); continue ;;
+        esac
+        local src_root
+        src_root="$(src_path_for_tag "$tag")"
+        [ -z "$src_root" ] && { pass=$((pass+1)); continue; }
+        # The XSRC_INDEX stores POST-classification rel (e.g. rehome-state
+        # writes state/auth/cloud-auth.json but the source was at root). Try
+        # the index-rel first; if source doesn't exist there, try with the
+        # original surface mapping (basename for rehome classes).
+        local src_file="$src_root/$rel"
+        [ ! -f "$src_file" ] && src_file="$src_root/$(basename "$rel")"
+        [ ! -f "$src_file" ] && { missing=$((missing+1)); [ "$missing" -le 5 ] && echo "  MISSING-SRC: $tag/$rel ($cls)"; continue; }
+        # Candidate destinations to check (in order of likelihood per class).
+        local dst_canonical="$DEST_REAL/$rel"
+        local dst_sidecar_legacy="$DEST_REAL/legacy/$tag/$rel"
+        local dst_quarantine="$DEST_REAL/legacy/$tag/quarantine/$rel"
+        # Per Mini #3 fix: timestamped+tagged sidecars at <path>.legacy-<tag>-<ts>
+        # or <path>.legacy-prior-from-<tag>-<ts>. Use a glob to match any.
+        local landed=""
+        local cands=()
+        for c in "$dst_canonical" "$dst_sidecar_legacy" "$dst_quarantine"; do
+            cands+=("$c")
+        done
+        # Expand timestamped-sidecar globs for both src-loser and dest-prior cases.
+        for g in "$dst_canonical.legacy-$tag-"* "$dst_canonical.legacy-prior-from-$tag-"*; do
+            [ -f "$g" ] && cands+=("$g")
+        done
+        for cand in "${cands[@]}"; do
+            if [ -f "$cand" ]; then
+                if sha_match "$src_file" "$cand"; then
+                    landed="$cand"; break
+                fi
+            fi
+        done
+        if [ -n "$landed" ]; then
             pass=$((pass+1))
+        elif [ -f "$dst_canonical" ] || [ -f "$dst_sidecar_legacy" ]; then
+            # A dest path exists but sha doesn't match — content mismatch.
+            mismatch=$((mismatch+1))
+            [ "$mismatch" -le 5 ] && echo "  MISMATCH: $tag/$rel ($cls) — dest content differs from source"
         else
-            # Some classes (skip-ephemeral, inflight-guard <60s) are expected
-            # absent — only fail if the class was supposed to copy.
-            case "$cls" in
-                structural|collision-keep-both|append|newest-mtime|rehome-state)
-                    missing=$((missing+1))
-                    [ "$missing" -le 5 ] && echo "  MISSING: $tag/$rel ($cls)"
-                    ;;
-                *)
-                    pass=$((pass+1))
-                    ;;
-            esac
+            missing=$((missing+1))
+            [ "$missing" -le 5 ] && echo "  MISSING: $tag/$rel ($cls) — no dest path found"
         fi
     done < "$XSRC_INDEX"
     echo
-    echo "verify summary: pass=$pass missing=$missing"
-    if [ "$missing" -gt 0 ]; then
-        echo "verify: FAIL — $missing source files not found at dest. Inspect with --json."
+    echo "verify summary: pass=$pass missing=$missing mismatch=$mismatch"
+    if [ "$missing" -gt 0 ] || [ "$mismatch" -gt 0 ]; then
+        echo "verify: FAIL — $missing missing + $mismatch sha mismatch. Inspect with --json or scripts/sutando-migrate.sh explain <path>."
         exit 1
     fi
-    echo "verify: OK"
+    echo "verify: OK (sha-256 content match confirmed for every indexed source file)"
 }
 
 rollback_main() {
