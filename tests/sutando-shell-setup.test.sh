@@ -246,10 +246,32 @@ test_commit_idempotent() {
 # 9. --migrate with source ~/.claude → rsyncs to <ccd>, source unchanged
 # ----------------------------------------------------------------------
 test_migrate_copies_state() {
-  # Seed ~/.claude with content.
-  mkdir -p "$HOME/.claude/projects/foo"
-  echo "session content" > "$HOME/.claude/projects/foo/session.jsonl"
+  # Seed ~/.claude with FOUR project slug variants to exercise the filesystem-
+  # disambiguating filter end to end:
+  #   (a) THIS project's exact slug                       → should migrate
+  #   (b) subdir variant whose decoded path EXISTS in repo → should migrate
+  #   (c) sibling-prefix whose decoded path doesn't exist  → should NOT migrate
+  #   (d) totally unrelated project                        → should NOT migrate
+  #
+  # `workspace` is a real subdir of this repo (the M0 default), so the
+  # decoded path /<repo>/workspace exists → (b) is a true subdir. `plus` is
+  # NOT a subdir of this repo, so the decoded path doesn't exist → (c) is
+  # correctly recognized as a sibling repo and excluded.
+  this_slug="$(printf '%s' "$REPO" | tr '/' '-')"
+  subdir_slug="${this_slug}-workspace"
+  sibling_slug="${this_slug}-plus"
+  unrelated_slug="-Users-someone-elses-project"
+  mkdir -p "$HOME/.claude/projects/${this_slug}"
+  mkdir -p "$HOME/.claude/projects/${subdir_slug}"
+  mkdir -p "$HOME/.claude/projects/${sibling_slug}"
+  mkdir -p "$HOME/.claude/projects/${unrelated_slug}"
+  echo "this session"      > "$HOME/.claude/projects/${this_slug}/session.jsonl"
+  echo "subdir session"    > "$HOME/.claude/projects/${subdir_slug}/session.jsonl"
+  echo "sibling session"   > "$HOME/.claude/projects/${sibling_slug}/session.jsonl"
+  echo "unrelated session" > "$HOME/.claude/projects/${unrelated_slug}/session.jsonl"
   echo '{"k":"v"}' > "$HOME/.claude/settings.json"
+  mkdir -p "$HOME/.claude/skills/my-skill"
+  echo "skill content" > "$HOME/.claude/skills/my-skill/SKILL.md"
 
   # Resolve target dir up front (where rsync should land). Discard stderr —
   # the loader's legacy-env-var warn would otherwise pollute the captured path.
@@ -259,15 +281,37 @@ test_migrate_copies_state() {
   bash "$HELPER" --migrate </dev/null >/dev/null 2>&1; rc=$?
   assert_eq "$rc" "0" "exit code" || return 1
 
-  # Target has the content.
-  [ -f "$ccd/projects/foo/session.jsonl" ] \
-    || { echo "  FAIL: missing migrated session.jsonl at $ccd/projects/foo/"; return 1; }
-  [ -f "$ccd/settings.json" ] \
-    || { echo "  FAIL: missing migrated settings.json at $ccd/"; return 1; }
+  # MUST migrate: THIS project's exact slug.
+  [ -f "$ccd/projects/${this_slug}/session.jsonl" ] \
+    || { echo "  FAIL: missing migrated session at $ccd/projects/${this_slug}/"; return 1; }
 
-  # Source unchanged.
-  [ -f "$HOME/.claude/projects/foo/session.jsonl" ] \
-    || { echo "  FAIL: source session.jsonl unexpectedly deleted"; return 1; }
+  # MUST migrate: subdir variant (decoded path /<repo>/workspace exists).
+  [ -f "$ccd/projects/${subdir_slug}/session.jsonl" ] \
+    || { echo "  FAIL: true subdir variant ${subdir_slug} NOT migrated (fs check broken)"; return 1; }
+
+  # MUST NOT migrate: sibling-prefix (decoded path /<repo>/plus doesn't exist).
+  if [ -e "$ccd/projects/${sibling_slug}" ]; then
+    echo "  FAIL: sibling-with-prefix ${sibling_slug} migrated despite no /<repo>/plus dir — fs disambiguation broken"
+    return 1
+  fi
+
+  # MUST NOT migrate: unrelated cwd.
+  if [ -e "$ccd/projects/${unrelated_slug}" ]; then
+    echo "  FAIL: unrelated project leaked into target"
+    return 1
+  fi
+
+  # Non-projects stuff migrates regardless.
+  [ -f "$ccd/settings.json" ] \
+    || { echo "  FAIL: missing migrated settings.json"; return 1; }
+  [ -f "$ccd/skills/my-skill/SKILL.md" ] \
+    || { echo "  FAIL: missing migrated skill"; return 1; }
+
+  # Source unchanged (non-destructive).
+  [ -f "$HOME/.claude/projects/${this_slug}/session.jsonl" ] \
+    || { echo "  FAIL: source this-slug session unexpectedly deleted"; return 1; }
+  [ -f "$HOME/.claude/projects/${sibling_slug}/session.jsonl" ] \
+    || { echo "  FAIL: source sibling-slug session unexpectedly deleted"; return 1; }
 }
 
 # ----------------------------------------------------------------------

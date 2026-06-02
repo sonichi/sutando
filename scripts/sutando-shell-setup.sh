@@ -316,10 +316,14 @@ EOF
     # original tree. Idempotent: rsync -a only re-copies changed files based
     # on mtime+size. Run again anytime to top up.
     #
+    # Scope: copy EVERYTHING except `projects/*` — and within projects/, ONLY
+    # this checkout's slug. Other projects/ subdirs are owner's transcripts
+    # from OTHER claude-code work, irrelevant to this workspace. Saves disk +
+    # keeps the new tree clean.
+    #
     # Excludes:
-    # - debug/ — transient debug logs, large + no cross-session value
-    # - plugins/*/cache/ — re-fetched on demand
-    # - statsig/ — Anthropic telemetry stash, regenerates
+    # - debug/, plugins/*/cache/, statsig/ — transient / regeneratable
+    # - projects/<other-slug>/ — handled by the include/exclude pair below
     SOURCE_DIR="$HOME/.claude"
     if [ ! -d "$SOURCE_DIR" ]; then
       echo "sutando-shell-setup --migrate: source $SOURCE_DIR doesn't exist; nothing to copy" >&2
@@ -332,10 +336,66 @@ EOF
 
     mkdir -p "$CLAUDE_DIR"
 
+    # Compute this checkout's project slug. Claude Code's encoding rule:
+    # replace `/` with `-` in the absolute cwd. So /Users/x/repo becomes
+    # -Users-x-repo.
+    THIS_PROJECT_SLUG="$(printf '%s' "$REPO_ROOT" | tr '/' '-')"
+
+    # Build the include set by enumerating candidate slugs in ~/.claude/projects/
+    # and confirming each one against the filesystem. For a slug starting with
+    # `${THIS_PROJECT_SLUG}-`, the remainder decodes back to a path:
+    #   `--` → `/-`  (the encoded leading-dash dir name)
+    #   `-`  → `/`   (path separator)
+    # We then check if `${REPO_ROOT}/${decoded}` is a real directory under
+    # this checkout — if yes, it's a TRUE SUBDIR variant (the user cd'd into
+    # a subdir and ran claude there); if no, it's a sibling repo with a
+    # similar name (`sutando-plus`, `sutando-v07`, etc.) and we skip it.
+    #
+    # The exact slug is always included regardless of filesystem state.
+    INCLUDE_SLUGS=("$THIS_PROJECT_SLUG")
+    if [ -d "$SOURCE_DIR/projects" ]; then
+      for entry in "$SOURCE_DIR/projects/"*; do
+        [ -d "$entry" ] || continue
+        slug="$(basename "$entry")"
+        case "$slug" in
+          "$THIS_PROJECT_SLUG")
+            continue  # already in the set
+            ;;
+          "${THIS_PROJECT_SLUG}-"*)
+            suffix="${slug#${THIS_PROJECT_SLUG}-}"
+            # Decode: `--` → `/-` first (preserves leading-dash dirnames),
+            # then remaining `-` → `/` (path separators).
+            decoded="$(printf '%s' "$suffix" | sed 's|--|/-|g; s|-|/|g')"
+            if [ -d "$REPO_ROOT/$decoded" ]; then
+              INCLUDE_SLUGS+=("$slug")
+            fi
+            ;;
+        esac
+      done
+    fi
+
+    # Build rsync filter list. Include each confirmed slug + its contents,
+    # then exclude all other projects/*. Filter ordering matters — rsync uses
+    # first-match semantics so includes must precede the matching exclude.
+    RSYNC_FILTERS=(--include='projects/')
+    for s in "${INCLUDE_SLUGS[@]}"; do
+      RSYNC_FILTERS+=(--include="projects/$s/" --include="projects/$s/***")
+    done
+    RSYNC_FILTERS+=(
+      --exclude='projects/*'
+      --exclude='debug/'
+      --exclude='plugins/*/cache/'
+      --exclude='statsig/'
+    )
+
     echo "sutando-shell-setup --migrate"
-    echo "  Source : $SOURCE_DIR"
-    echo "  Target : $CLAUDE_DIR"
-    echo "  Mode   : non-destructive copy (source preserved)"
+    echo "  Source           : $SOURCE_DIR"
+    echo "  Target           : $CLAUDE_DIR"
+    echo "  Mode             : non-destructive copy (source preserved)"
+    echo "  Project scope    : ${#INCLUDE_SLUGS[@]} confirmed project slug(s) — exact + sub-folder variants:"
+    for s in "${INCLUDE_SLUGS[@]}"; do
+      echo "                     • $s"
+    done
     echo
 
     # Dry-run preview first so user sees what would change. Stage to a tmpfile
@@ -343,9 +403,7 @@ EOF
     # propagates SIGPIPE when head closes early, surfacing as exit 141/255.
     _preview_tmp="$(mktemp -t sutando-shell-setup-preview.XXXXXX)"
     rsync -a --dry-run --itemize-changes \
-      --exclude='debug/' \
-      --exclude='plugins/*/cache/' \
-      --exclude='statsig/' \
+      "${RSYNC_FILTERS[@]}" \
       "$SOURCE_DIR/" "$CLAUDE_DIR/" > "$_preview_tmp"
     head -50 "$_preview_tmp"
     rm -f "$_preview_tmp"
@@ -375,15 +433,13 @@ EOF
     # `--stats` (legacy form, works on macOS's stock rsync 2.6.9 from 2006)
     # instead of `--info=stats1` (rsync 3.1+, brew/Linux). Same end result.
     rsync -a --stats \
-      --exclude='debug/' \
-      --exclude='plugins/*/cache/' \
-      --exclude='statsig/' \
+      "${RSYNC_FILTERS[@]}" \
       "$SOURCE_DIR/" "$CLAUDE_DIR/"
 
     echo
     echo "sutando-shell-setup --migrate: done."
     echo "  ${SOURCE_DIR} is unchanged. To prune later, verify the new tree works first, then:"
-    echo "    rm -rf '${SOURCE_DIR}/projects/'  # (or any subset you no longer need)"
+    echo "    rm -rf '${SOURCE_DIR}/projects/${THIS_PROJECT_SLUG}/'  # only this project's slug"
     exit 0
     ;;
 esac
