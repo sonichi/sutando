@@ -165,12 +165,12 @@ in #design 2026-06-02.
 
 ## Memory
 
-Full memory index: $SUTANDO_MEMORY_DIR (default: ~/.claude/projects/.../memory)/MEMORY.md
+Full memory index: $SUTANDO_MEMORY_DIR (default: $CLAUDE_CONFIG_DIR/projects/.../memory, i.e. <workspace>/.claude-sutando/projects/.../memory when claude-sutando is in use; ~/.claude/projects/.../memory otherwise)/MEMORY.md
 
 Key files:
-- User profile: $SUTANDO_MEMORY_DIR (default: ~/.claude/projects/.../memory)/user_profile.md
-- Feedback (response style): $SUTANDO_MEMORY_DIR (default: ~/.claude/projects/.../memory)/feedback_response_style.md
-- Feedback (operating principle): $SUTANDO_MEMORY_DIR (default: ~/.claude/projects/.../memory)/feedback_minimal_cost_max_value.md
+- User profile: $SUTANDO_MEMORY_DIR (default: $CLAUDE_CONFIG_DIR/projects/.../memory, i.e. <workspace>/.claude-sutando/projects/.../memory when claude-sutando is in use; ~/.claude/projects/.../memory otherwise)/user_profile.md
+- Feedback (response style): $SUTANDO_MEMORY_DIR (default: $CLAUDE_CONFIG_DIR/projects/.../memory, i.e. <workspace>/.claude-sutando/projects/.../memory when claude-sutando is in use; ~/.claude/projects/.../memory otherwise)/feedback_response_style.md
+- Feedback (operating principle): $SUTANDO_MEMORY_DIR (default: $CLAUDE_CONFIG_DIR/projects/.../memory, i.e. <workspace>/.claude-sutando/projects/.../memory when claude-sutando is in use; ~/.claude/projects/.../memory otherwise)/feedback_minimal_cost_max_value.md
 - Build log (what's built, what's next): build_log.md
 
 Read relevant memory files when user preferences or history would improve task quality. Write new memory when you learn something durable about the user or the project.
@@ -293,8 +293,8 @@ When the user says "learn this", "remember my preference", "I always do it this 
 
 1. **Extract the durable fact.** What is the user teaching? A preference, a workflow, a style choice, a correction?
 2. **Classify it:**
-   - *Preference* → update `$SUTANDO_MEMORY_DIR (default: ~/.claude/projects/.../memory)/user_profile.md` (add to "Observed additions")
-   - *Feedback/correction* → create or update a feedback memory file in `$SUTANDO_MEMORY_DIR (default: ~/.claude/projects/.../memory)/feedback_*.md`
+   - *Preference* → update `$SUTANDO_MEMORY_DIR (default: $CLAUDE_CONFIG_DIR/projects/.../memory, i.e. <workspace>/.claude-sutando/projects/.../memory when claude-sutando is in use; ~/.claude/projects/.../memory otherwise)/user_profile.md` (add to "Observed additions")
+   - *Feedback/correction* → create or update a feedback memory file in `$SUTANDO_MEMORY_DIR (default: $CLAUDE_CONFIG_DIR/projects/.../memory, i.e. <workspace>/.claude-sutando/projects/.../memory when claude-sutando is in use; ~/.claude/projects/.../memory otherwise)/feedback_*.md`
    - *Process/workflow* → save as a note in `notes/` with tag `[workflow, learned]`
 3. **Update the memory index** `MEMORY.md` if a new file was created.
 4. **Confirm briefly** what was learned: "Got it — I'll [do X] from now on."
@@ -318,4 +318,4 @@ This also starts the screen capture server (needs terminal for Screen Recording 
 
 ## Skills
 
-Use skills installed in ~/.claude/skills/ when available. Prefer existing skills over writing new code from scratch.
+Use skills installed in `$CLAUDE_CONFIG_DIR/skills/` when available (defaults to `~/.claude/skills/` if claude-sutando isn't in use; the new path is `<workspace>/.claude-sutando/skills/` for instances using the workspace-scoped config dir). Prefer existing skills over writing new code from scratch.

@@ -152,7 +152,7 @@ This starts all services (voice agent, phone conversation server, web client, da
 > - **It's local.** Sutando runs entirely on your Mac. No remote control plane, no third party with write access.
 > - **You control the audience.** 3-tier access gating means owner / verified / unverified callers get different capability bands on phone, Discord, and Telegram. Set `VERIFIED_CALLERS` in `.env` before going live.
 > - **Actions are auditable.** Every Claude Code invocation lands in `build_log.md`, every task in `tasks/` + `results/`, every shell call in the service logs (`logs/*.log`). Use `tail -f build_log.md` while it works to watch in real time.
-> - **Hooks are your brake pedal.** `git-rules-guard.sh` (see `~/.claude/hooks`) pops a Discord approval DM for any public write (push / PR / issue comment) regardless of transport. Reject with 👎 to block.
+> - **Hooks are your brake pedal.** `git-rules-guard.sh` (see `$CLAUDE_CONFIG_DIR/hooks` — typically `~/.claude/hooks`, or `<workspace>/.claude-sutando/hooks` for claude-sutando users) pops a Discord approval DM for any public write (push / PR / issue comment) regardless of transport. Reject with 👎 to block.
 >
 > Keep the Claude Code terminal window reachable — quota-exhaustion or an unrecognized CLI prompt can leave the core agent waiting for you to respond.
 
@@ -195,7 +195,7 @@ Exiting `startup.sh` alone does NOT stop background services. Always use `restar
 **Uninstalling:**
 1. Stop all services: `bash src/restart.sh && pkill -x Sutando`
 2. Remove the repo: `rm -rf ~/Desktop/sutando` (or wherever you cloned it)
-3. Remove config: `rm -rf ~/.claude/projects/*sutando*`
+3. Remove config: `rm -rf $CLAUDE_CONFIG_DIR/projects/*sutando*` (resolves to `~/.claude/projects/*sutando*` for vanilla `claude`, or `<workspace>/.claude-sutando/projects/*sutando*` if the `claude-sutando` shell function is in use)
 4. Remove npm packages (optional): the repo uses local `node_modules/` — deleted with the repo
 5. Remove any tools you installed during setup (e.g. `imsg`, `wacli`) via the package manager you used to install them.
 6. If you installed the OS-supervised health checks: `bash src/install-health-check-launchd.sh --uninstall` (idempotent — no-op if not installed).
