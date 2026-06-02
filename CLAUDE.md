@@ -51,7 +51,7 @@ Skill-PR destination: a skill is **coupled** (PR to `sonichi/sutando`) if it imp
 
 ## Workspace contract
 
-Sutando's file state lives in three concentric spaces — **Code** (`$SUTANDO_REPO_DIR`, the git checkout), **State** (`$SUTANDO_WORKSPACE`, per-user runtime), **Memory** (`$SUTANDO_MEMORY_DIR`, user-content synced across the fleet — legacy alias `$SUTANDO_PRIVATE_DIR` honored for one release per #870). See [`docs/workspace-design.md`](docs/workspace-design.md) for the 3-space mental model + "Quick decision: which space?" flowchart when adding new code or data.
+Sutando's file state lives in two concentric spaces (with the repo as the inferred container): **State** (the workspace — resolved via `bash scripts/sutando-config.sh workspace`; default `<repo>/workspace/`) and **Memory** (`$SUTANDO_MEMORY_DIR`, user-content synced across the fleet — legacy alias `$SUTANDO_PRIVATE_DIR` honored for one release per #870). The code itself (`<repo>/src/`, `<repo>/scripts/`, `<repo>/skills/`) is just "where this checkout is" — inferred, not configured. See [`docs/workspace-design.md`](docs/workspace-design.md) for the mental model + "Quick decision: which space?" flowchart when adding new code or data.
 
 All per-user mutable state — `tasks/`, `results/`, `state/`, `data/`, `logs/`, `notes/`, `build_log.md`, `pending-questions.md`, etc. — lives under a single **workspace** directory. Loose status/state `.json` files (`core-status.json`, `voice-state.json`, `contextual-chips.json`, `dynamic-content.json`, `quota-state.json`) live under `state/`; the workspace root holds only the top-level directories. Code, skills source, and repo configuration stay in the repo root (separate concern).
 
@@ -73,7 +73,7 @@ If `PERSONAL_CLAUDE.md` exists in the workspace root, read and follow it. It con
 
 ## Work Status
 
-Signal your work status to the workspace `core-status.json` so the web UI and `health-check.py` can display it. Write the **absolute** workspace path: the session cwd is the repo, so a bare `state/core-status.json` lands in `<repo>/state/` — where no reader looks. Readers resolve `$SUTANDO_WORKSPACE/state/core-status.json` via `status_read_path` (`src/workspace_default.py`).
+Signal your work status to the workspace `core-status.json` so the web UI and `health-check.py` can display it. Write the **absolute** workspace path: the session cwd is the repo, so a bare `state/core-status.json` lands in `<repo>/state/` — where no reader looks. Readers resolve `<workspace>/state/core-status.json` via `status_read_path` (`src/workspace_default.py`), where `<workspace>` = the M0 canonical (`<repo>/workspace/` by default; env-overridable as the legacy escape).
 
 ```bash
 CORE_STATUS="$(bash scripts/sutando-config.sh workspace)/state/core-status.json"
@@ -120,7 +120,7 @@ This ensures the dashboard, result-watcher, and timeout logic work the same rega
 
 ## Core liveness signal
 
-Each running sutando-core writes `$SUTANDO_WORKSPACE/state/cores/<hostname>.alive`
+Each running sutando-core writes `<workspace>/state/cores/<hostname>.alive`
 every 30 seconds (started by `src/startup.sh` as a background process; source
 at `src/core_heartbeat.py`). The file is per-host so multiple cores on
 different machines coexist; mtime is the cross-host "is this core alive?"
@@ -136,6 +136,22 @@ This is foundation for the lease-based multi-core scheduler — workers consult
 the alive directory to know who's available before assigning a claim. For
 single-machine use today it also gives `health-check.py` and the dashboard a
 cleaner liveness probe than scanning `pgrep -f claude`.
+
+## Durable per-host install state: `state/auth/`
+
+`<workspace>/state/auth/` holds **per-host install/identity state**
+that survives across upgrades and MUST NOT be wiped by transient-state cleanup
+jobs (or by clear-on-restart logic that targets `state/*.json` generically).
+Current contents:
+- `cloud-auth.json` — per-host cloud-side auth credentials
+- `device.json` — per-host device identity (UUID + provisioning metadata)
+
+Both are placed via M1 Part 2 (`scripts/sutando-migrate.sh`); pre-M1 they
+were loose at workspace root, mistreated as transient JSON snapshots and
+sometimes wiped. Treat `state/auth/` like `state/cores/<hostname>.alive` —
+per-host, structural, never overwritten by newest-mtime resolution across
+sources. Codex + Mini confirmed the destination + the exemption from cleanup
+in #design 2026-06-02.
 
 ## Memory
 
