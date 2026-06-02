@@ -11,6 +11,14 @@
 #   bash scripts/sutando-config.sh vault-enabled # print "true" or "false"
 #   bash scripts/sutando-config.sh vault-url     # print vault remote_url (may be empty)
 #   bash scripts/sutando-config.sh dump          # print full merged config as JSON
+#   bash scripts/sutando-config.sh subdirs       # print canonical workspace subdir list (one per line)
+#   bash scripts/sutando-config.sh bootstrap     # mkdir -p the canonical subdirs in the resolved workspace
+#
+# `bootstrap` is the idempotent setup step for the in-repo workspace introduced
+# in M0 (PR #1395). startup.sh runs this transitively via init.sh --auto, but
+# any context that doesn't go through startup.sh (e.g. a workspace path change
+# without service restart, a fresh clone where the user pokes at workspace/
+# directly) can call this to ensure the canonical layout exists.
 #
 # Stdout is the value (no trailing newline for scalar getters); stderr
 # carries any warnings from the loader (legacy env, .env drift). Returns
@@ -61,8 +69,30 @@ print(resolve_vault().get('remote_url', ''), end='')
     python3 -m src.sutando_config
     ;;
 
+  subdirs)
+    # Canonical workspace subdir list. Single source of truth — keep in sync
+    # with src/init.sh tier1's create_dir_if_missing calls AND with
+    # docs/workspace-config.md's layout section. If you add a subdir here,
+    # also document it (and consider whether init.sh / sutando-migrate.sh
+    # need to mention it).
+    printf 'state\ntasks\nresults\nresults/archive\nresults/calls\nnotes\nlogs\ndata\nconfig\ntelegram-inbox\n'
+    ;;
+
+  bootstrap)
+    # Resolve workspace, then mkdir -p the canonical subdirs. Idempotent.
+    # M1 (post-M0): ensures the in-repo workspace has the expected layout
+    # for any path resolved by the loader, regardless of whether startup.sh
+    # / init.sh have run since the path was set.
+    ws="$(bash "$0" workspace)"
+    if [ -z "$ws" ]; then echo "bootstrap: workspace path empty — config error" >&2; exit 1; fi
+    bash "$0" subdirs | while IFS= read -r d; do
+      mkdir -p "$ws/$d"
+    done
+    echo "workspace bootstrapped: $ws" >&2
+    ;;
+
   *)
-    echo "usage: $0 {workspace|vault-enabled|vault-url|dump}" >&2
+    echo "usage: $0 {workspace|vault-enabled|vault-url|dump|subdirs|bootstrap}" >&2
     exit 2
     ;;
 esac

@@ -46,14 +46,17 @@ DEST="$HOME/Library/LaunchAgents/$LABEL.plist"
 DOMAIN="gui/$(id -u)"
 SERVICE="$DOMAIN/$LABEL"
 
-# Resolve runtime workspace — launchd job writes its log under
-# $WORKSPACE/logs/ instead of the repo-root legacy path (per PR #911's
-# workspace-vs-repo split). Same resolution shape as src/startup.sh +
-# workspace_default.py.
-if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
-  WORKSPACE="${SUTANDO_WORKSPACE/#\~/$HOME}"
-else
-  WORKSPACE="$HOME/.sutando/workspace"
+# Resolve runtime workspace via the M0 helper (PR #1395). Defaults to
+# <repo>/workspace/; honors $SUTANDO_WORKSPACE as legacy escape hatch.
+# Launchd job writes its log under $WORKSPACE/logs/ instead of the repo-root
+# legacy path (per PR #911's workspace-vs-repo split).
+WORKSPACE="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)"
+if [ -z "$WORKSPACE" ]; then
+  if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
+    WORKSPACE="${SUTANDO_WORKSPACE/#\~/$HOME}"
+  else
+    WORKSPACE="$HOME/.sutando/workspace"
+  fi
 fi
 
 cmd="${1:-install}"

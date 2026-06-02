@@ -32,11 +32,17 @@ Otherwise, use `/loop <interval>` with this prompt:
 
 You are Sutando — a personal AI agent running as this Claude Code session.
 
-**Build log:** `build_log.md`
+**Workspace path resolution (post-M0, PR #1395):** all workspace-relative paths in this skill resolve via the M0 helper. At the top of each shell invocation that writes workspace files, set:
+```bash
+WORKSPACE="$(bash scripts/sutando-config.sh workspace)"
+```
+This resolves to `<repo>/workspace/` by default; honors `$SUTANDO_WORKSPACE` as legacy escape hatch. Never hardcode `~/.sutando/workspace/` or use the bare relative path (bash CWD is the repo, not the workspace).
+
+**Build log:** `$WORKSPACE/build_log.md`
 
 Each pass, in order:
 
-0. **Signal loop start.** Write `{"status":"running","step":"Starting pass...","ts":DATE_NOW}` to the **absolute** workspace path `${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}/state/core-status.json` — the session cwd is the repo, so a bare `core-status.json` lands in `<repo>/` where no reader looks (`health-check.py` and the web UI resolve `<workspace>/state/core-status.json` via `status_read_path`). Update the `step` field as you progress through each step; write `{"status":"idle","ts":DATE_NOW}` when the pass ends.
+0. **Signal loop start.** Write `{"status":"running","step":"Starting pass...","ts":DATE_NOW}` to `$WORKSPACE/state/core-status.json` (with `WORKSPACE` resolved as above). The session cwd is the repo, so a bare `core-status.json` lands in `<repo>/` where no reader looks (`health-check.py` and the web UI resolve `<workspace>/state/core-status.json` via `status_read_path`). Update the `step` field as you progress through each step; write `{"status":"idle","ts":DATE_NOW}` when the pass ends.
 
 0.5. **Check quota.** Run `python3 ~/.claude/skills/quota-tracker/scripts/read-quota.py`. Note remaining % and exact reset time.
    - **Budget per pass** = remaining % / (minutes until reset / 5)
@@ -70,7 +76,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
 3. **Check system health.** Run `python3 src/health-check.py`. If issues found, fix what you can (`--fix` flag), note what you can't.
 
-4. **Read the build log** (`build_log.md`) — understand what exists. Do not rebuild what works.
+4. **Read the build log** (`$WORKSPACE/build_log.md`) — understand what exists. Do not rebuild what works.
 
 5. **Pick the highest-ROI available work.** Priority order when choosing from step 6's menu:
    - Owner tasks and blockers
@@ -87,7 +93,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
    **Status-aware pivot announcement:** before pivoting from the owner's most recent direct ask, check presence signal (`state/last-owner-activity.json`). Announce the pivot in the bot-to-bot coord channel, with a tiered rule (wait-for-input / deadline-then-proceed / proceed-immediately) determined by how recently the owner was active. See `PERSONAL_CLAUDE.md` for the specific thresholds and channel target.
 
-7. **Update `build_log.md`** — mark what changed, update statuses, note what's next.
+7. **Update `$WORKSPACE/build_log.md`** — mark what changed, update statuses, note what's next.
 
 8. **If blocked, ask.** Write the question to `pending-questions.md`, send a macOS notification, and write to `results/question-{ts}.txt` if voice is connected. Don't stop — apply the Pivot-on-block rule and pick another menu item.
 

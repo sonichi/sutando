@@ -34,11 +34,15 @@ DEST="$HOME/Library/LaunchAgents/$LABEL.plist"
 DOMAIN="gui/$(id -u)"
 SERVICE="$DOMAIN/$LABEL"
 
-# Resolve runtime workspace (mirrors workspace_default.py / startup.sh).
-if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
-  WORKSPACE="${SUTANDO_WORKSPACE/#\~/$HOME}"
-else
-  WORKSPACE="$HOME/.sutando/workspace"
+# Resolve runtime workspace via the M0 helper (PR #1395). Defaults to
+# <repo>/workspace/; honors $SUTANDO_WORKSPACE as legacy escape hatch.
+WORKSPACE="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)"
+if [ -z "$WORKSPACE" ]; then
+  if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
+    WORKSPACE="${SUTANDO_WORKSPACE/#\~/$HOME}"
+  else
+    WORKSPACE="$HOME/.sutando/workspace"
+  fi
 fi
 
 APP_BINARY="$REPO/src/Sutando/Sutando.app/Contents/MacOS/Sutando"
