@@ -53,15 +53,20 @@ class TestWorkspaceDefault(unittest.TestCase):
         self.assertEqual(resolve_workspace(migrate=False), Path.home() / "custom-ws")
 
     def test_resolve_falls_back_to_default_when_env_unset(self):
-        self.assertEqual(resolve_workspace(migrate=False), default_workspace_dir())
+        # Post-M0: fallback is the in-repo workspace path (<repo>/workspace),
+        # not the legacy ~/.sutando/workspace/. The legacy default lives on as
+        # default_workspace_dir() (a fallback for installs outside a checkout),
+        # but the canonical resolution targets the in-repo default for normal
+        # git-clone installs.
+        self.assertEqual(resolve_workspace(migrate=False), ROOT / "workspace")
 
     def test_resolve_falls_back_when_env_empty_string(self):
         os.environ["SUTANDO_WORKSPACE"] = ""
-        self.assertEqual(resolve_workspace(migrate=False), default_workspace_dir())
+        self.assertEqual(resolve_workspace(migrate=False), ROOT / "workspace")
 
     def test_resolve_falls_back_when_env_whitespace_only(self):
         os.environ["SUTANDO_WORKSPACE"] = "   "
-        self.assertEqual(resolve_workspace(migrate=False), default_workspace_dir())
+        self.assertEqual(resolve_workspace(migrate=False), ROOT / "workspace")
 
     def test_resolve_never_returns_repo_root(self):
         """Anti-regression: the historical fallback was the script's repo root
