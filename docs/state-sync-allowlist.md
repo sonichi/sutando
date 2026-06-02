@@ -19,7 +19,9 @@ The straightforward fix — sync the whole workspace — breaks the "rebuildable
 
 ## Proposal
 
-Add `$SUTANDO_WORKSPACE/state/.sync-allowlist` — a newline-delimited list of subpaths under `state/` that get synced across the fleet. Default (file missing) → nothing in State syncs. Existing single-machine installs are unaffected.
+Add `<workspace>/state/.sync-allowlist` — a newline-delimited list of subpaths under `state/` that get synced across the fleet. Default (file missing) → nothing in State syncs. Existing single-machine installs are unaffected.
+
+> `<workspace>` resolves via `bash scripts/sutando-config.sh workspace` (M0 helper, PR #1395). Defaults to `<repo>/workspace/`; honors `$SUTANDO_WORKSPACE` as a legacy escape hatch internally. Bare references to `$SUTANDO_WORKSPACE` below (as a shell variable to `rm -rf` or similar) keep the env-var form intentionally — those are commands the user would type, not path literals.
 
 Example file:
 
@@ -34,7 +36,7 @@ The sync runs as a sibling script (`scripts/sync-fleet-state.sh`) that the exist
 
 | Property | Value |
 |---|---|
-| **Path** | `$SUTANDO_WORKSPACE/state/.sync-allowlist` |
+| **Path** | `<workspace>/state/.sync-allowlist` |
 | **Encoding** | UTF-8, newline-delimited |
 | **Comments** | `#`-prefixed line, full-line only (no trailing comments) |
 | **Empty lines** | Ignored |
@@ -105,7 +107,7 @@ This is the rough shape for when code actually lands; not part of this PR.
 ### `scripts/sync-fleet-state.sh`
 
 ```text
-1. Read $SUTANDO_WORKSPACE/state/.sync-allowlist. If missing, exit 0 — sync is opt-out by default.
+1. Read <workspace>/state/.sync-allowlist. If missing, exit 0 — sync is opt-out by default.
 2. For each entry, rsync (or git-add) the subpath into the same private memory-sync repo's `fleet/` subdir.
 3. Conflict policy: rsync mtime-wins for v1 (same as memory-sync). Filename collisions in claim files mean a race — let the protocol handle it on the next read.
 4. Hook into the existing scripts/sync-memory.sh cron, after the memory sync runs.

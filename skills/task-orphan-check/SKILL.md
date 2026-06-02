@@ -114,7 +114,7 @@ Otherwise:
    - ...
    [If truncated by step 3c: "+<N-20> more — see tasks/archive/ for the full list."]
 
-   To re-queue an individual task: `mv $SUTANDO_WORKSPACE/tasks/archive/task-<id>.txt $SUTANDO_WORKSPACE/tasks/`
+   To re-queue an individual task: `mv "$(bash scripts/sutando-config.sh workspace)/tasks/archive/task-<id>.txt" "$(bash scripts/sutando-config.sh workspace)/tasks/"` (M0 helper resolves to `<workspace>/tasks/...` — `<repo>/workspace/tasks/...` by default).
    The archived file retains its original body (incl. system-instructions block for non-owner tasks), so re-queueing preserves sandboxing.
    If none still matter: no action needed — they're already archived.
    ```

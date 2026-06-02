@@ -42,6 +42,16 @@ PATTERN_ENV='(process\.env|process\.env\[)["'\'']?SUTANDO_WORKSPACE|os\.environ(
 PATTERN_HARDCODED_HOME='\.sutando/workspace'
 PATTERN_REPO_WALK='Path\(__file__\)\.resolve\(\)\.parent\.parent'
 
+# Doc-notation pattern (markdown + SKILL.md only). Flags the legacy
+# env-var-as-path form `$SUTANDO_WORKSPACE/<anything>` in user-facing
+# docs — the canonical form post-M0 is `<workspace>/path` with the
+# workspace resolution helper documented inline. Bare mentions of the
+# env var (e.g. "set $SUTANDO_WORKSPACE to...") aren't flagged — the
+# `/` suffix is the discriminator that picks "path literal" out of
+# "env-var-as-name". See workspace/results/task-1780443422880.txt for
+# the root-cause analysis that motivated this rule (rec a).
+PATTERN_DOC_ENV_PATH='\$SUTANDO_WORKSPACE/'
+
 # Allowed files — these may legitimately reference the patterns above
 # because they implement the resolution contract, are tests that need to
 # set up sys.path / env state before exercising the loader, OR are bash
@@ -52,14 +62,21 @@ PATTERN_REPO_WALK='Path\(__file__\)\.resolve\(\)\.parent\.parent'
 # new contributors should still go through the wrapper.
 ALLOWED='^(src/sutando_config\.(py|ts)|src/workspace_default\.(py|ts)|src/startup\.sh|src/watch-tasks-stream\.sh|scripts/lint-workspace-resolution\.sh|scripts/install-git-hooks\.sh|scripts/sutando-config\.sh|scripts/sync-memory\.sh|scripts/sutando-migrate\.sh|scripts/sweep-stranded-claims\.sh|skills/catchup-after-startup/scripts/catchup-after-startup\.sh|skills/overlay-apps/scripts/launch\.sh|skills/self-diagnose/scripts/gather\.sh|tests/[^/]+\.(test\.)?(py|ts))$'
 
+# Allowed .md files — legitimate uses of `$SUTANDO_WORKSPACE/path` in
+# prose, e.g. the workspace contract docs that DESCRIBE the legacy form
+# as part of the resolution order, the migration script docs that talk
+# about pre-M0 sources, and CHANGELOG/KNOWN_ISSUES that record history.
+# Anywhere else, prose paths should use `<workspace>/...` notation.
+ALLOWED_DOC='^(docs/workspace-(config|design|contract)\.md|CHANGELOG\.md|KNOWN_ISSUES\.md|CLAUDE\.md|skills/sutando-migrate/SKILL\.md)$'
+
 # Pick which files to scan.
 if [[ "$mode" == "--diff" ]]; then
   base="${BASE_REF:-origin/main}"
   # Added or modified files vs base.
   files="$(git diff --name-only --diff-filter=AM "$base"...HEAD)"
 else
-  # All tracked files of relevant types.
-  files="$(git ls-files -- '*.py' '*.ts' '*.tsx' '*.sh' '*.bash')"
+  # All tracked files of relevant types — code (.py/.ts/.tsx/.sh/.bash) + docs (.md).
+  files="$(git ls-files -- '*.py' '*.ts' '*.tsx' '*.sh' '*.bash' '*.md')"
 fi
 
 if [[ -z "$files" ]]; then
@@ -70,8 +87,30 @@ fi
 offenders=""
 
 for f in $files; do
-  # Skip non-existing (file deleted in this diff) + non-text + allowed files.
+  # Skip non-existing (file deleted in this diff) + non-text.
   [[ -f "$f" ]] || continue
+
+  # Markdown branch: scan for legacy `$SUTANDO_WORKSPACE/path` notation.
+  # Docs got the lint treatment in rec (a) of task-1780443422880 — `.md`
+  # files were the silent backlog the original code-only lint missed.
+  if [[ "$f" =~ \.md$ ]]; then
+    if grep -E -q "$ALLOWED_DOC" <<< "$f"; then continue; fi
+    if [[ "$mode" == "--diff" ]]; then
+      added="$(git diff "$base"...HEAD -- "$f" | grep -E '^\+[^+]' || true)"
+      if grep -E -q "$PATTERN_DOC_ENV_PATH" <<< "$added"; then
+        hits="$(grep -E -n "$PATTERN_DOC_ENV_PATH" <<< "$added" | head -3 || true)"
+        offenders+="  • $f (doc)"$'\n'"$hits"$'\n'
+      fi
+    else
+      if grep -E -l "$PATTERN_DOC_ENV_PATH" "$f" >/dev/null 2>&1; then
+        hits="$(grep -E -n "$PATTERN_DOC_ENV_PATH" "$f" | head -3 || true)"
+        offenders+="  • $f (doc)"$'\n'"$hits"$'\n'
+      fi
+    fi
+    continue
+  fi
+
+  # Code branch (the original lint).
   [[ "$f" =~ \.(py|ts|tsx|sh|bash)$ ]] || continue
   if grep -E -q "$ALLOWED" <<< "$f"; then continue; fi
 
@@ -102,6 +141,8 @@ if [[ -n "$offenders" ]]; then
   echo "All resolution MUST go through src/sutando_config.{py,ts}."
   echo "  Python: from src.sutando_config import resolve_workspace"
   echo "  TS:     import { resolveWorkspace } from './sutando_config.js'"
+  echo "  Shell:  bash scripts/sutando-config.sh workspace"
+  echo "  Docs:   use <workspace>/path notation (NOT \$SUTANDO_WORKSPACE/path)"
   if [[ "$mode" == "--diff" ]]; then
     exit 1
   fi

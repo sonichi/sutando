@@ -108,7 +108,7 @@ session start
 
 If `/startup` is invoked when the sentinel already exists (someone manually typed it mid-session), the sub-skills will skip their first-time-only work and the result is effectively a re-confirm of state. Safe; the operator may see "(skipped — sentinel present)" notes from each sub-skill.
 
-To force a full re-startup: `rm $SUTANDO_WORKSPACE/state/proactive-loop-started.sentinel` then `/startup`.
+To force a full re-startup: `rm "$(bash scripts/sutando-config.sh workspace)/state/proactive-loop-started.sentinel"` then `/startup` (resolves to `<workspace>/state/...` via the M0 helper — `<repo>/workspace/state/...` by default).
 
 ## What lives elsewhere
 

@@ -281,10 +281,18 @@ def resolve_workspace(repo_root: Optional[Path] = None) -> Path:
     if env_val:
         if not _LEGACY_ENV_WARN_PRINTED:
             _LEGACY_ENV_WARN_PRINTED = True
+            # The warning intentionally OMITS the env value. Embedding a path
+            # in the message string makes the warning "path-shaped": a caller
+            # that mishandles stderr (`$(... 2>&1)` then `mkdir -p "$captured"`)
+            # would build a nested folder tree because bash tokenizes the `/`
+            # chars inside the value. Discovered 2026-06-02 — rogue folder at
+            # <repo>/sutando config: $SUTANDO_WORKSPACE is set ('/var/folders/.../...,
+            # full diagnosis in workspace/results/task-1780442649943.txt.
+            # Users debugging the value can `echo $SUTANDO_WORKSPACE`.
             print(
-                f"sutando config: $SUTANDO_WORKSPACE is set ({env_val!r}); honoring "
-                f"as legacy escape hatch. To silence, move the value into "
-                f"`sutando.config.local.json` under `workspace.path` and unset the env.",
+                "sutando config: $SUTANDO_WORKSPACE is set; honoring "
+                "as legacy escape hatch. To silence, move the value into "
+                "sutando.config.local.json under workspace.path and unset the env.",
                 file=sys.stderr,
             )
         # Preserve the pre-cutover semantic: only resolve when the env value
@@ -295,10 +303,12 @@ def resolve_workspace(repo_root: Optional[Path] = None) -> Path:
         target = Path(env_val).expanduser()
         if not target.is_absolute():
             anchored = (Path.cwd() / target).resolve()
+            # Same path-shape risk as the main `is set` warning above —
+            # values omitted. Users debugging can `echo $SUTANDO_WORKSPACE`
+            # and `pwd` to reconstruct what got anchored to where.
             print(
-                f"sutando config: $SUTANDO_WORKSPACE={env_val!r} is relative — "
-                f"anchored to {anchored} (CWD-dependent; set an absolute path to "
-                f"avoid cross-process drift).",
+                "sutando config: $SUTANDO_WORKSPACE is relative — "
+                "anchored to CWD (cross-process drift; set an absolute path).",
                 file=sys.stderr,
             )
             return anchored
@@ -328,12 +338,15 @@ def resolve_workspace(repo_root: Optional[Path] = None) -> Path:
         _DOTENV_DRIFT_WARN_PRINTED = True
         dotenv_val = detect_env_workspace_in_dotenv(repo_root)
         if dotenv_val and Path(dotenv_val).resolve() != resolved:
+            # Same path-shape risk — values omitted. Users debugging can
+            # `grep SUTANDO_WORKSPACE .env` and `bash scripts/sutando-config.sh
+            # workspace` to compare.
             print(
-                f"sutando config: .env declares SUTANDO_WORKSPACE={dotenv_val!r}, but "
-                f"resolved workspace is {resolved} (config-driven). The .env line is "
-                f"NOT honored by the new loader — move the value to "
-                f"`sutando.config.local.json` under `workspace.path` and delete the .env "
-                f"line, or `source .env` before launching processes that need the override.",
+                "sutando config: .env declares SUTANDO_WORKSPACE but the resolved "
+                "workspace differs (config-driven). The .env line is NOT honored by "
+                "the new loader — move the value to sutando.config.local.json under "
+                "workspace.path and delete the .env line, or `source .env` before "
+                "launching processes that need the override.",
                 file=sys.stderr,
             )
 

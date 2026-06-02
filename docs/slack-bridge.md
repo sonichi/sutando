@@ -79,7 +79,7 @@ markers".
 Both directions work:
 
 - **Inbound** — any files attached to a DM or @mention are downloaded into
-  `$SUTANDO_WORKSPACE/slack-inbox/` and the local path is surfaced in the
+  `<workspace>/slack-inbox/` and the local path is surfaced in the
   task body as `[File attached: /path]`. Slack file URLs require the bot
   token in an Authorization header (they're not public), so the bridge
   handles that internally.
@@ -87,10 +87,14 @@ Both directions work:
   or `[attach: /path]` markers. Paths are allowlist-gated via
   `_is_path_sendable()` (same `os.path.realpath` + `startswith` sanitizer
   the telegram / discord bridges use — fail-closed by default; allowed
-  roots are `$SUTANDO_WORKSPACE/{results,notes,docs}`,
-  `$SUTANDO_WORKSPACE/slack-inbox/`, and `/tmp/sutando-*`). Uploads go
-  through `files_upload_v2` (the modern endpoint; `files.upload` is
-  deprecated as of 2025).
+  roots are `<workspace>/{results,notes,docs}` and `<workspace>/slack-inbox/`;
+  allowed prefixes are `/tmp/sutando-*`, `/private/tmp/sutando-*`,
+  `/tmp/echo-*`, `/private/tmp/echo-*`). Uploads go through `files_upload_v2`
+  (the modern endpoint; `files.upload` is deprecated as of 2025).
+
+> `<workspace>` resolves via `bash scripts/sutando-config.sh workspace`
+> (M0 helper, PR #1395). Defaults to `<repo>/workspace/`; honors
+> `$SUTANDO_WORKSPACE` as a legacy escape hatch internally.
 
 ## What's NOT supported
 

@@ -230,9 +230,13 @@ if [ -f "$WATCHER_PID_FILE" ]; then
   rm -f "$WATCHER_PID_FILE"
 fi
 
-# Legacy repo-root tasks/results/data still created for back-compat with
-# scripts that haven't migrated yet; safe no-op once everything's switched.
-mkdir -p tasks results data
+# Post-M0: repo-root tasks/results/data are NOT created. Pre-M0 this block
+# ran `mkdir -p tasks results data` as back-compat for unmigrated scripts —
+# but with everything routed through $WORKSPACE/{tasks,results,data} via the
+# M0 helper, those empty repo-root dirs were just noise that polluted
+# `git status` after every startup. If a stale script still writes to a bare
+# relative path, that's a bug to fix in the script (grep `mkdir.*\btasks\b`
+# under src/ + scripts/ + skills/), not a reason to keep this here.
 
 # Archive stale results/*.txt (>24h) BEFORE any service starts iterating
 # results/. Prevents the 2026-04-15 DM-flood class of incidents where a
