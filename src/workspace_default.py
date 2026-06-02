@@ -436,11 +436,16 @@ def resolve_workspace(migrate: bool = True) -> Path:
     """
     global _AUTO_MIGRATE_NOTICE_PRINTED
 
-    # Delegate the actual resolution to the new loader. Local import keeps
-    # the module-level import graph clean and makes the dependency obvious
-    # at the only call site that needs it. Plain `import` (no `from .`)
-    # because callers typically add `src/` to sys.path and load both modules
-    # as flat top-level (see scripts/*.py for the pattern).
+    # Delegate the actual resolution to the new loader. Defensive sys.path
+    # extension keeps us working under tests that load this module via
+    # `importlib.util.spec_from_file_location` (see
+    # tests/workspace-default-relative-env.test.py) without first adding
+    # `src/` to sys.path — that loader bypasses the normal import machinery,
+    # so a plain `import sutando_config` would otherwise fail to find the
+    # sibling module.
+    src_dir = str(Path(__file__).resolve().parent)
+    if src_dir not in sys.path:
+        sys.path.insert(0, src_dir)
     import sutando_config  # type: ignore[import-untyped]
     target = sutando_config.resolve_workspace()
 

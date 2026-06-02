@@ -29,6 +29,14 @@ const CONFIG_FILENAME = 'sutando.config.json';
 const LOCAL_FILENAME = 'sutando.config.local.json';
 
 /**
+ * Known top-level keys the loader understands. The matching JSON Schema
+ * declares `additionalProperties: false` for IDE strictness; the loader
+ * stays lenient (warn-only) so experimental/scratch keys don't break.
+ * Per Mini's review #8 on PR #1395.
+ */
+const KNOWN_TOP_LEVEL_KEYS = new Set(['workspace', 'vault']);
+
+/**
  * Walk upward from `start` until we find a directory containing
  * `sutando.config.json`. Returns undefined if not found within 6 hops.
  * Anchors on the config file rather than `.git/` so app bundles + symlinked
@@ -158,6 +166,7 @@ let _cache: { [k: string]: Json } | undefined;
 let _cacheRepoRoot: string | undefined;
 let _legacyEnvWarnPrinted = false;
 let _dotenvDriftWarnPrinted = false;
+let _unknownKeysWarnPrinted = false;
 
 /** Test-only: clear the per-process cache. */
 export function resetCacheForTests(): void {
@@ -165,6 +174,22 @@ export function resetCacheForTests(): void {
 	_cacheRepoRoot = undefined;
 	_legacyEnvWarnPrinted = false;
 	_dotenvDriftWarnPrinted = false;
+	_unknownKeysWarnPrinted = false;
+}
+
+function warnUnknownTopLevelKeys(cfg: { [k: string]: Json }, path: string): void {
+	if (_unknownKeysWarnPrinted) return;
+	const extras = Object.keys(cfg)
+		.filter((k) => !KNOWN_TOP_LEVEL_KEYS.has(k))
+		.sort();
+	if (extras.length === 0) return;
+	_unknownKeysWarnPrinted = true;
+	process.stderr.write(
+		`sutando config: ${path} has top-level keys the loader does not read: ` +
+			`${extras.map((k) => `'${k}'`).join(', ')}. Known keys: ` +
+			`${[...KNOWN_TOP_LEVEL_KEYS].sort().join(', ')}. Typo? Or experimental key — ` +
+			`the loader will ignore it either way.\n`,
+	);
 }
 
 /**
@@ -192,6 +217,7 @@ export function loadConfig(repoRoot?: string): { [k: string]: Json } {
 	const expanded = expandVars(merged, root) as { [k: string]: Json };
 	_cache = expanded;
 	_cacheRepoRoot = root;
+	warnUnknownTopLevelKeys(expanded, join(root, CONFIG_FILENAME));
 	return expanded;
 }
 

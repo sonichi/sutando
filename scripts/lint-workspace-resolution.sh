@@ -43,8 +43,14 @@ PATTERN_HARDCODED_HOME='\.sutando/workspace'
 PATTERN_REPO_WALK='Path\(__file__\)\.resolve\(\)\.parent\.parent'
 
 # Allowed files — these may legitimately reference the patterns above
-# because they implement the resolution contract.
-ALLOWED='^(src/sutando_config\.(py|ts)|src/workspace_default\.(py|ts)|scripts/lint-workspace-resolution\.sh|scripts/install-git-hooks\.sh)$'
+# because they implement the resolution contract, are tests that need to
+# set up sys.path / env state before exercising the loader, OR are bash
+# scripts that retain the legacy fallback idiom
+# `WS="${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}"` as a defensive
+# branch when the wrapper script isn't reachable (e.g. non-checkout
+# installs). The fallback path is documented in each script's comments;
+# new contributors should still go through the wrapper.
+ALLOWED='^(src/sutando_config\.(py|ts)|src/workspace_default\.(py|ts)|src/startup\.sh|src/watch-tasks-stream\.sh|scripts/lint-workspace-resolution\.sh|scripts/install-git-hooks\.sh|scripts/sutando-config\.sh|scripts/sync-memory\.sh|scripts/sweep-stranded-claims\.sh|skills/catchup-after-startup/scripts/catchup-after-startup\.sh|skills/overlay-apps/scripts/launch\.sh|skills/self-diagnose/scripts/gather\.sh|tests/[^/]+\.(test\.)?(py|ts))$'
 
 # Pick which files to scan.
 if [[ "$mode" == "--diff" ]]; then

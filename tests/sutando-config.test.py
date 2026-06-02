@@ -308,6 +308,45 @@ class TestSutandoConfig(unittest.TestCase):
         self.assertEqual(out["a"], [9])  # array replaced
         self.assertEqual(out["b"], {"x": 1, "y": 99, "z": 100})  # dict merged
 
+    # ------------------------------------------------------------------ #
+    #  Mini #8: warn on unknown top-level keys                            #
+    # ------------------------------------------------------------------ #
+
+    def test_unknown_top_level_keys_warn_on_load(self):
+        _write_config(self.repo, "sutando.config.json", {
+            "workspace": {"path": "/ws"},
+            "vault": {"enabled": False},
+            "workspce": "typo of workspace",  # noqa: SC2001 — intentional typo
+        })
+        import io
+        buf = io.StringIO()
+        saved_stderr = sys.stderr
+        sys.stderr = buf
+        try:
+            cfg = load_config(repo_root=self.repo)
+        finally:
+            sys.stderr = saved_stderr
+        # Loader keeps the unknown key in the parsed config (lenient policy),
+        # but emits a one-line warning so the user sees the typo.
+        self.assertIn("workspce", cfg)
+        self.assertIn("workspce", buf.getvalue())
+        self.assertIn("Known keys", buf.getvalue())
+
+    def test_known_keys_only_does_not_warn(self):
+        _write_config(self.repo, "sutando.config.json", {
+            "workspace": {"path": "/ws"},
+            "vault": {"enabled": False},
+        })
+        import io
+        buf = io.StringIO()
+        saved_stderr = sys.stderr
+        sys.stderr = buf
+        try:
+            load_config(repo_root=self.repo)
+        finally:
+            sys.stderr = saved_stderr
+        self.assertNotIn("does not read", buf.getvalue())
+
     def test_expand_vars_walks_nested_structures(self):
         out = _expand_vars({"path": "${REPO_DIR}/ws",
                             "list": ["${REPO_DIR}/a", {"k": "${REPO_DIR}/b"}],

@@ -333,6 +333,55 @@ describe('sutando_config loader', () => {
 		}
 	});
 
+	// ------------------------------------------------------------------ //
+	//  Mini #8: warn on unknown top-level keys                            //
+	// ------------------------------------------------------------------ //
+
+	it('unknown top-level keys warn on load', () => {
+		writeConfig(repo, 'sutando.config.json', {
+			workspace: { path: '/ws' },
+			vault: { enabled: false },
+			workspce: 'typo of workspace',
+		});
+		const writes: string[] = [];
+		const origWrite = process.stderr.write.bind(process.stderr);
+		process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+			writes.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString());
+			return true;
+		}) as typeof process.stderr.write;
+		try {
+			const cfg = loadConfig(repo);
+			assert.ok('workspce' in cfg);
+			const combined = writes.join('');
+			assert.ok(combined.includes('workspce'), 'stderr should mention the unknown key');
+			assert.ok(combined.includes('Known keys'), 'stderr should list the known keys');
+		} finally {
+			process.stderr.write = origWrite;
+			restoreEnvAndRepo();
+		}
+	});
+
+	it('known keys only does not warn', () => {
+		writeConfig(repo, 'sutando.config.json', {
+			workspace: { path: '/ws' },
+			vault: { enabled: false },
+		});
+		const writes: string[] = [];
+		const origWrite = process.stderr.write.bind(process.stderr);
+		process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+			writes.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString());
+			return true;
+		}) as typeof process.stderr.write;
+		try {
+			loadConfig(repo);
+			const combined = writes.join('');
+			assert.ok(!combined.includes('does not read'), 'stderr should be silent on the happy path');
+		} finally {
+			process.stderr.write = origWrite;
+			restoreEnvAndRepo();
+		}
+	});
+
 	it('detectEnvWorkspaceInDotenv returns undefined when absent', () => {
 		writeConfig(repo, 'sutando.config.json', {});
 		writeFileSync(join(repo, '.env'), 'OTHER_VAR=foo\n', 'utf8');
