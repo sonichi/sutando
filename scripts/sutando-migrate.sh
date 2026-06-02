@@ -102,6 +102,16 @@ WORKSPACE_SURFACE_FILES=(
     "contextual-chips.json"
     "voice-state.json"
     "core-status.json"
+    # Per Lucy #design 2026-06-02: contract-defined personal-override file
+    # ("if PERSONAL_CLAUDE.md exists in workspace root, read+follow it").
+    # Previously missing from the surface → would skip-unknown → user's
+    # personal rules silently lost on migration. Now class-handled.
+    "PERSONAL_CLAUDE.md"
+    # Per Lucy #design 2026-06-02: additional per-host status JSONs that
+    # were unruled. Adding as surface so they don't skip-unknown.
+    "quota-state.json"
+    "dynamic-content.json"
+    "stand-identity.json"
 )
 
 # In-flight ephemeral patterns (skipped with warning if matched + age < guard)
@@ -126,6 +136,18 @@ CLASS_RULES=(
     "conversation.log|rehome-narrative-log"
     "context-drop.txt|append"
     "pending-questions.md|append"
+    # Per Lucy #design 2026-06-02 — contract-defined personal override.
+    # Singleton-canonical: newest-mtime is the right strategy (one user,
+    # one PERSONAL_CLAUDE; cross-host divergence means whichever the user
+    # edited most recently wins).
+    "PERSONAL_CLAUDE.md|newest-mtime"
+    # Per Lucy #design 2026-06-02 — per-host state files at root (pre-M0
+    # layout) shouldn't migrate as newest-wins (would drop a host's data
+    # if multi-host scan). Re-home to state/ via rehome-state class +
+    # commit-time collision-keep-both for per-host preservation.
+    "quota-state.json|rehome-state"
+    "dynamic-content.json|rehome-state"
+    "stand-identity.json|rehome-state"
     # ^ per Mini #1: file ACCUMULATES owner questions across hosts;
     # newest-mtime silently drops a host's unique entries. Migrate via append
     # (commit-side dedupe-per-line still TODO; Strategy C sidecar by default).
