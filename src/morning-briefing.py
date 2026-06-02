@@ -210,6 +210,11 @@ def get_pending_questions() -> list[str]:
     if not pq.exists():
         return []
     content = pq.read_text()
+    # Only the active region counts. Resolved questions live below a
+    # top-level "# Resolved" divider (audit trail), not deleted — without
+    # this cut the briefing speaks every resolved entry as still-pending.
+    # No-op when there is no such divider.
+    content = re.split(r'^#\s+Resolved\b', content, maxsplit=1, flags=re.MULTILINE)[0]
     questions = []
     for section in re.split(r'^## ', content, flags=re.MULTILINE)[1:]:
         title = section.partition('\n')[0].strip()
