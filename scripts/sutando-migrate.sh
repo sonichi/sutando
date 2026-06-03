@@ -1073,13 +1073,34 @@ commit_one() {
                 dst_path="$DEST_REAL/$rel"
                 mkdir -p "$(dirname "$dst_path")"
                 if [ -e "$dst_path" ]; then
+                    # IMPORTANT: split the compound-redirect + mv + echo "merged"
+                    # into separate statements with explicit error returns. The
+                    # prior `{ ... } > tmp && mv ... ` followed by `echo "merged"`
+                    # was data-lossy under any write failure (per
+                    # feedback_bash_and_compound_breaks_set_e): set -e does NOT
+                    # exit on a failed left-of-&& redirect, so we'd reach
+                    # `echo "merged"` even when the write to tmp failed (disk
+                    # full, permission denied, broken pipe) → false-success
+                    # signal + dest unchanged. Mirrors the pattern the
+                    # append-fresh blocks above already use (PR #1406 fix).
+                    local _merge_rc=0
                     {
                         cat "$dst_path"
                         echo ""
                         echo "=== migrated from source $tag at $BACKUP_ID ==="
                         echo ""
                         cat "$src_file"
-                    } > "$dst_path.merge.$$" && mv -f "$dst_path.merge.$$" "$dst_path"
+                    } > "$dst_path.merge.$$" || _merge_rc=$?
+                    if [ "$_merge_rc" -ne 0 ]; then
+                        rm -f "$dst_path.merge.$$"
+                        echo "merge-append-failed-redirect" >&2
+                        return 1
+                    fi
+                    mv -f "$dst_path.merge.$$" "$dst_path" || {
+                        rm -f "$dst_path.merge.$$"
+                        echo "merge-append-failed-mv" >&2
+                        return 1
+                    }
                     echo "merged"
                 else
                     copy_preserving_mtime "$src_file" "$dst_path"
