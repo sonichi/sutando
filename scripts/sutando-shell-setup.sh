@@ -196,15 +196,25 @@ user_defined_function_present() {
 # files under CLAUDE_DIR. Shared by --migrate (post-rsync) and --repair-paths
 # (standalone re-pin without rsync — useful when the workspace moves).
 #
-# Why an allowlist instead of recursive sed:
+# Why an allowlist (+globbed patterns) instead of recursive sed:
 #   - The migrated tree contains immutable history (`projects/*/*.jsonl`,
 #     `history.jsonl`), per-migration backups (`*.before-migrate.*`), shell
 #     snapshots (`shell-snapshots/`), and edit-history blobs (`file-history/`).
 #     Rewriting THOSE would corrupt frozen-truth records.
-#   - The list below is the audited set of files claude-code reads at runtime
-#     to make decisions (hooks, plugin manifests, slash-commands with literal
-#     paths). A new file with embedded paths gets caught by the next allowlist
-#     update — known maintenance load, not silent-corruption risk.
+#   - The set below is the audited set of files claude-code reads at runtime
+#     to make decisions (hooks, plugin manifests, slash-commands, skill
+#     bodies/scripts with literal paths). Two layers:
+#       (a) Explicit-file list — files we know exist by name at runtime.
+#       (b) Globbed-by-pattern  — commands/*.md and skills/**/* for files
+#           whose existence depends on what the user has installed. Each
+#           candidate is filtered through `grep -q source_dir` before sed
+#           fires, so absent paths just no-op rather than churn empty files.
+#
+# Issue #1416 (Mini PR #1415 review #2): expanded from a 4-file explicit
+# allowlist to (a)+(b) so user-installed slash-commands + third-party skills
+# with hardcoded ~/.claude paths don't slip through. Still allowlist-shaped
+# (vs full recursive sed) — keeps the contract grep'able and avoids touching
+# the immutable surfaces above.
 #
 # Idempotency: rewriting destpath → destpath is a no-op, so this is safe to
 # run repeatedly. Uses `|` as the sed delimiter so the `/` in paths doesn't
@@ -214,18 +224,36 @@ user_defined_function_present() {
 # stock sed and GNU sed. We delete the .bak immediately after.
 _rewrite_runtime_paths() {
   local source_dir="${SOURCE_CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+  # Layer (a) — known-by-name runtime files.
   local runtime_files=(
     "$CLAUDE_DIR/settings.json"
     "$CLAUDE_DIR/plugins/installed_plugins.json"
     "$CLAUDE_DIR/plugins/known_marketplaces.json"
-    "$CLAUDE_DIR/commands/openacp:handoff.md"
   )
+  # Layer (b) — globbed patterns. Enumerate to absolute paths and append.
+  # Commands: every .md file under commands/ (slash-command bodies may
+  # embed literal hook/bash paths — openacp:handoff.md was the original
+  # known case; this covers any future commands the user installs).
+  if [ -d "$CLAUDE_DIR/commands" ]; then
+    while IFS= read -r f; do
+      runtime_files+=("$f")
+    done < <(find "$CLAUDE_DIR/commands" -maxdepth 1 -type f -name '*.md' 2>/dev/null)
+  fi
+  # Skills: SKILL.md (the prompt) + any scripts/ folder shell/python/ts/js.
+  # Skip plugins/cache/ (vendored plugin source; already covered by
+  # known_marketplaces.json + installed_plugins.json rewriting).
+  if [ -d "$CLAUDE_DIR/skills" ]; then
+    while IFS= read -r f; do
+      runtime_files+=("$f")
+    done < <(find "$CLAUDE_DIR/skills" -type f \( -name 'SKILL.md' -o -name '*.sh' -o -name '*.py' -o -name '*.ts' -o -name '*.js' \) 2>/dev/null)
+  fi
   local sed_script="s|${source_dir}/|${CLAUDE_DIR}/|g"
   local rewrote=0 unchanged=0 missing=0
   echo
   echo "  Re-pinning hardcoded paths:"
-  echo "    source : ${source_dir}/"
-  echo "    target : ${CLAUDE_DIR}/"
+  echo "    source    : ${source_dir}/"
+  echo "    target    : ${CLAUDE_DIR}/"
+  echo "    candidates: ${#runtime_files[@]} files (explicit + commands/*.md + skills/**/{SKILL.md,scripts})"
   local f
   for f in "${runtime_files[@]}"; do
     if [ ! -f "$f" ]; then
