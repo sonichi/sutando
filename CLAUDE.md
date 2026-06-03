@@ -93,8 +93,9 @@ When you accept a non-trivial commitment from the user via **chat** (direct text
 
 **How:**
 ```bash
+WORKSPACE="$(bash scripts/sutando-config.sh workspace)"
 local _ts="$(date +%s)"
-cat > "tasks/task-chat-${_ts}.txt" << EOF
+cat > "$WORKSPACE/tasks/task-chat-${_ts}.txt" << EOF
 id: task-chat-${_ts}
 timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 task: <concise description of what you're doing>
@@ -109,9 +110,9 @@ EOF
 **Priority field**: `urgent` (voice/phone, sub-second latency target) | `normal` (chat/owner DM, default) | `low` (cron, health-check, non-owner DMs). When more than one task is pending, the consumer processes highest-priority first; tie-breaker is mtime FIFO. Defaults per source are encoded in `src/task_priority.py:default_priority_for_source`.
 
 **When done:**
-Write a result file using the same task ID:
+Write a result file using the same task ID (re-use the `WORKSPACE` from above):
 ```bash
-cat > "results/task-chat-${_ts}.txt" << EOF
+cat > "$WORKSPACE/results/task-chat-${_ts}.txt" << EOF
 <result summary>
 EOF
 ```
