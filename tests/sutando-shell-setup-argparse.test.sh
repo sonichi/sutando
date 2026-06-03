@@ -240,6 +240,56 @@ assert_rc "[brace] old-pattern brace-overall rc=0 even with cat-dst fail (proves
 rm -rf "$TMP"
 
 # ----------------------------------------------------------------------
+# Import-UX tests: --import/--migrate alias, deprecation warning, exclude
+# policy (post-this-PR work).
+# ----------------------------------------------------------------------
+
+echo ""
+echo "Import-UX (--import / --migrate alias / weight-reduction excludes):"
+
+# (a) --import is the canonical flag — invocation should NOT print
+#     deprecation warning.
+out=$(bash "$SETUP" --import 2>&1 </dev/null) || true
+if printf '%s' "$out" | grep -qF -- "--migrate is deprecated"; then
+  assert_fail "--import does NOT print deprecation warning" "found warning in output"
+else
+  assert_pass "--import does NOT print deprecation warning"
+fi
+
+# (b) --migrate works (still routes through) AND prints the deprecation warning
+out=$(bash "$SETUP" --migrate 2>&1 </dev/null) || true
+assert_contains "--migrate prints deprecation warning" "$out" "--migrate is deprecated"
+assert_contains "--migrate routes to --import flow (header line)" "$out" "sutando-shell-setup --migrate"
+
+# (c) INVOKED_AS echoes back what the user typed — --migrate user sees
+#     '--migrate' in status, --import user sees '--import'.
+out=$(bash "$SETUP" --import 2>&1 </dev/null) || true
+assert_contains "--import echoes --import in status line" "$out" "sutando-shell-setup --import"
+
+# (d) Weight-reduction excludes are present in the rsync-filter
+#     declaration block (grep the source, not the runtime, since the dry-run
+#     preview is truncated to 50 lines and may not show every filter).
+filters_block=$(sed -n "/RSYNC_FILTERS+=(/,/^    )/p" "$SETUP")
+for excl in "shell-snapshots/" "history.jsonl" "file-history/"; do
+  if printf '%s' "$filters_block" | grep -qF -- "--exclude='$excl'"; then
+    assert_pass "exclude '$excl' present in RSYNC_FILTERS"
+  else
+    assert_fail "exclude '$excl' missing from RSYNC_FILTERS" "see scripts/sutando-shell-setup.sh"
+  fi
+done
+
+# (e) channels/*/*.env + channels/*/access.json.bak* are NOT in the
+#     exclude list (the (B) copy + warn shift). The pre-fix versions had
+#     these as excludes; reverting them is the core of this PR.
+for not_excl in "channels/*/*.env" "channels/*/access.json.bak"; do
+  if printf '%s' "$filters_block" | grep -qF -- "--exclude='$not_excl"; then
+    assert_fail "exclude '$not_excl' should be ABSENT (copy + warn policy)" "see filter block"
+  else
+    assert_pass "exclude '$not_excl' absent (copy + warn policy)"
+  fi
+done
+
+# ----------------------------------------------------------------------
 # Summary
 # ----------------------------------------------------------------------
 
