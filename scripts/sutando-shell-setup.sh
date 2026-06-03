@@ -633,12 +633,15 @@ EOF
       --exclude='debug/'
       --exclude='plugins/*/cache/'
       --exclude='statsig/'
-      # Secret-safety (Mini PR #1415 review #4): channel bot tokens are
-      # host-specific and shouldn't propagate via this copy. They'd also land
-      # in the M2 vault-sync include set without an explicit opt-out, leaking
-      # tokens to remote vault. Same logic for stale auth backups.
-      --exclude='channels/*/*.env'
-      --exclude='channels/*/access.json.bak*'
+      # NOTE: channels/*/*.env (bot tokens) + channels/*/access.json.bak*
+      # are intentionally COPIED in this version. Owner directive 2026-06-03
+      # (PR #1424 import-UX thread): option (B) "copy + warn" — bridges work
+      # immediately post-import, user gets an explicit vault-sync warning
+      # at end-of-import flagging the secret files that were copied. The
+      # earlier exclude (Mini PR #1415 review #4) was the secret-safety
+      # baseline; this is the user-experience layer on top, accepting the
+      # vault-sync coordination burden in exchange for zero-friction
+      # bridges. See the post-rsync warning block below.
       # Runtime artifacts that won't survive a rehome anyway.
       --exclude='*.sock'
       --exclude='*.pid'
@@ -702,19 +705,28 @@ EOF
     echo "sutando-shell-setup $INVOKED_AS: done."
     echo "  ${SOURCE_DIR} is unchanged. To prune later, verify the new tree works first, then:"
     echo "    rm -rf '${SOURCE_DIR}/projects/${THIS_PROJECT_SLUG}/'  # only this project's slug"
-    # Mini PR #1415 review #4: channels/*/*.env were intentionally NOT copied
-    # (host-specific tokens). Tell the user how to manually rehome them if they
-    # want the bridges working from the new location.
-    if compgen -G "${SOURCE_DIR}/channels/*/*.env" > /dev/null 2>&1; then
+    # Vault-sync warning (option (B) from the import-UX thread 2026-06-03):
+    # bot tokens + auth backups were copied this time (no exclude). The
+    # bridges will work immediately, but the M2 vault sync engine — when
+    # it lands — will include these files in the synced bundle unless the
+    # user adds an exclude. Surface the exact paths so the user can add
+    # them to their vault sync exclude policy.
+    if compgen -G "${CLAUDE_DIR}/channels/*/*.env" > /dev/null 2>&1; then
       echo
-      echo "  ⚠ Channel bot tokens (channels/*/*.env) NOT copied — they're host-specific."
-      echo "    If you want bridges to work from the new CLAUDE_CONFIG_DIR, manually rehome:"
-      echo "      for env in '${SOURCE_DIR}/channels/'*/.env; do"
-      echo "        ch=\"\$(basename \"\$(dirname \"\$env\")\")\""
-      echo "        mkdir -p '${CLAUDE_DIR}/channels/'\"\$ch\""
-      echo "        cp \"\$env\" '${CLAUDE_DIR}/channels/'\"\$ch\"/.env"
-      echo "      done"
-      echo "    Each .env is mode 600. Manual cp preserves mode."
+      echo "  ⚠ Imported host-specific secrets — review before vault sync:"
+      for env in "${CLAUDE_DIR}/channels/"*/*.env; do
+        [ -f "$env" ] && echo "      ${env#${CLAUDE_DIR}/}  (mode $(stat -f '%Mp%Lp' "$env" 2>/dev/null || stat -c '%a' "$env" 2>/dev/null))"
+      done
+      if compgen -G "${CLAUDE_DIR}/channels/*/access.json.bak*" > /dev/null 2>&1; then
+        for bak in "${CLAUDE_DIR}/channels/"*/access.json.bak*; do
+          [ -f "$bak" ] && echo "      ${bak#${CLAUDE_DIR}/}"
+        done
+      fi
+      echo
+      echo "    These files contain bot tokens / stale auth state and are host-coupled."
+      echo "    If you sync this workspace to a remote (M2 vault), add an exclude rule"
+      echo "    for channels/*/*.env + channels/*/access.json.bak* in your sync policy"
+      echo "    BEFORE the next sync to avoid leaking secrets remotely."
     fi
     exit 0
     ;;
