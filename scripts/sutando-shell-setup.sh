@@ -17,11 +17,12 @@
 # load-bearing for sync coherence.
 #
 # Usage:
-#   bash scripts/sutando-shell-setup.sh           # dry-run: print proposed line + target rc
-#   bash scripts/sutando-shell-setup.sh --commit  # append to rc file (idempotent)
-#   bash scripts/sutando-shell-setup.sh --auto    # one-shot prompt path used by startup.sh
-#   bash scripts/sutando-shell-setup.sh --check   # exit 0 if alias present + path matches; 1 otherwise
-#   bash scripts/sutando-shell-setup.sh --migrate # rsync ~/.claude → <workspace>/.claude-sutando (idempotent, non-destructive)
+#   bash scripts/sutando-shell-setup.sh                # dry-run: print proposed line + target rc
+#   bash scripts/sutando-shell-setup.sh --commit       # append to rc file (idempotent)
+#   bash scripts/sutando-shell-setup.sh --auto         # one-shot prompt path used by startup.sh
+#   bash scripts/sutando-shell-setup.sh --check        # exit 0 if alias present + path matches; 1 otherwise
+#   bash scripts/sutando-shell-setup.sh --migrate      # rsync ~/.claude → <workspace>/.claude-sutando (idempotent, non-destructive)
+#   bash scripts/sutando-shell-setup.sh --repair-paths # re-pin hardcoded SOURCE_DIR paths in runtime files to CLAUDE_DIR (idempotent)
 #
 # Idempotency: --commit grep-guards on the alias key `^alias claude-sutando=`,
 # not the body. If the workspace path changes (config edit or repo relocate),
@@ -46,6 +47,7 @@ for arg in "$@"; do
     --auto)    MODE="auto"; break ;;
     --check)   MODE="check"; break ;;
     --migrate) MODE="migrate"; break ;;
+    --repair-paths) MODE="repair-paths"; break ;;
     --help|-h)
       sed -n '1,40p' "$0" | grep -E '^#' | sed 's/^# *//'
       exit 0
@@ -162,6 +164,59 @@ managed_block_current() {
 # Used by --check / --commit to migrate users who set up before this version.
 legacy_alias_present() {
   [ -f "$RC_FILE" ] && grep -qE '^alias claude-sutando=' "$RC_FILE"
+}
+
+# Helper: rewrite hardcoded SOURCE_DIR/ → CLAUDE_DIR/ in runtime-critical
+# files under CLAUDE_DIR. Shared by --migrate (post-rsync) and --repair-paths
+# (standalone re-pin without rsync — useful when the workspace moves).
+#
+# Why an allowlist instead of recursive sed:
+#   - The migrated tree contains immutable history (`projects/*/*.jsonl`,
+#     `history.jsonl`), per-migration backups (`*.before-migrate.*`), shell
+#     snapshots (`shell-snapshots/`), and edit-history blobs (`file-history/`).
+#     Rewriting THOSE would corrupt frozen-truth records.
+#   - The list below is the audited set of files claude-code reads at runtime
+#     to make decisions (hooks, plugin manifests, slash-commands with literal
+#     paths). A new file with embedded paths gets caught by the next allowlist
+#     update — known maintenance load, not silent-corruption risk.
+#
+# Idempotency: rewriting destpath → destpath is a no-op, so this is safe to
+# run repeatedly. Uses `|` as the sed delimiter so the `/` in paths doesn't
+# need escaping; macOS user paths never contain `|`.
+#
+# BSD-sed compatibility: the `-i.bak <expr> file` form works on both macOS
+# stock sed and GNU sed. We delete the .bak immediately after.
+_rewrite_runtime_paths() {
+  local source_dir="${SOURCE_CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+  local runtime_files=(
+    "$CLAUDE_DIR/settings.json"
+    "$CLAUDE_DIR/plugins/installed_plugins.json"
+    "$CLAUDE_DIR/plugins/known_marketplaces.json"
+    "$CLAUDE_DIR/commands/openacp:handoff.md"
+  )
+  local sed_script="s|${source_dir}/|${CLAUDE_DIR}/|g"
+  local rewrote=0 unchanged=0 missing=0
+  echo
+  echo "  Re-pinning hardcoded paths:"
+  echo "    source : ${source_dir}/"
+  echo "    target : ${CLAUDE_DIR}/"
+  local f
+  for f in "${runtime_files[@]}"; do
+    if [ ! -f "$f" ]; then
+      echo "    (skip — not present)  ${f#${CLAUDE_DIR}/}"
+      missing=$((missing + 1))
+      continue
+    fi
+    if grep -q "${source_dir}/" "$f" 2>/dev/null; then
+      sed -i.bak "$sed_script" "$f" && rm -f "$f.bak"
+      echo "    rewrote               ${f#${CLAUDE_DIR}/}"
+      rewrote=$((rewrote + 1))
+    else
+      echo "    (unchanged)           ${f#${CLAUDE_DIR}/}"
+      unchanged=$((unchanged + 1))
+    fi
+  done
+  echo "  Summary: ${rewrote} rewrote, ${unchanged} unchanged, ${missing} not-present"
 }
 
 case "$MODE" in
@@ -441,10 +496,37 @@ EOF
       "${RSYNC_FILTERS[@]}" \
       "$SOURCE_DIR/" "$CLAUDE_DIR/"
 
+    # Post-copy: rewrite hardcoded SOURCE_DIR → CLAUDE_DIR in runtime files.
+    # Without this, copied settings.json / plugin manifests / slash-commands
+    # still point at the legacy path, and silently break the moment legacy
+    # ~/.claude is pruned. See _rewrite_runtime_paths() for scope + rationale.
+    _rewrite_runtime_paths
+
     echo
     echo "sutando-shell-setup --migrate: done."
     echo "  ${SOURCE_DIR} is unchanged. To prune later, verify the new tree works first, then:"
     echo "    rm -rf '${SOURCE_DIR}/projects/${THIS_PROJECT_SLUG}/'  # only this project's slug"
+    exit 0
+    ;;
+
+  repair-paths)
+    # Standalone path re-pin. Runs ONLY the sed pass — no rsync, no project
+    # discovery, no preview/confirm. Use case: workspace moved (mv / rename /
+    # config-driven relocate) and previously-rewritten paths in the migrated
+    # tree are now stale. Re-running --migrate would be heavy (full rsync from
+    # ~/.claude) and unnecessary if no source-side changes have happened.
+    #
+    # Also useful immediately after upgrading to a version of this script that
+    # adds the rewrite pass — re-pins a previously-migrated tree without a
+    # fresh rsync.
+    if [ ! -d "$CLAUDE_DIR" ]; then
+      echo "sutando-shell-setup --repair-paths: target $CLAUDE_DIR doesn't exist; run --migrate first" >&2
+      exit 1
+    fi
+    echo "sutando-shell-setup --repair-paths"
+    _rewrite_runtime_paths
+    echo
+    echo "sutando-shell-setup --repair-paths: done."
     exit 0
     ;;
 esac
