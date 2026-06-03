@@ -119,25 +119,49 @@ export function sharedPersonalPath(filename: string, workspace?: string): string
 // rather than a re-architecture. ANY new read/write into the Claude Code home
 // directory should go through this helper.
 //
-// Resolution: prefer $CLAUDE_HOME if set (override / testing), else
-// `~/.claude/`. Does NOT create the dir.
+// Resolution (3-tier, prefer most specific):
+//   1. $CLAUDE_CONFIG_DIR  — Claude Code's canonical env var (string present
+//      in the `claude` binary). Set by `claude-sutando` shell function +
+//      scripts/start-cli.sh + src/startup.sh so every workspace gets its own
+//      .claude-sutando/ tree instead of sharing global ~/.claude/.
+//   2. $CLAUDE_HOME        — deprecated legacy override (kept for one release
+//      so pre-M0 callers / test fixtures don't break instantly). Emits a
+//      one-shot warning to stderr on first read.
+//   3. ~/.claude/          — final fallback.
+// Does NOT create the dir.
 // ---------------------------------------------------------------------------
 
+let _claudeHomeDeprecationWarned = false;
+
 /**
- * Resolve a path under Claude Code's per-user home (`~/.claude/`).
+ * Resolve a path under Claude Code's per-user config dir.
  *
  * Pass subpath components as separate args:
  *   claudeHomePath('channels', 'discord', 'access.json')
  *   claudeHomePath('projects', projectSlug, 'memory', 'MEMORY.md')
  *   claudeHomePath('skills', skillName)
  *
- * Override the base with `$CLAUDE_HOME` for tests + alt-host installs.
+ * Prefers `$CLAUDE_CONFIG_DIR` (Claude Code canonical). Falls back to
+ * deprecated `$CLAUDE_HOME` then `~/.claude/`. See Mini PR #1415 review #5
+ * for the original-env-var-mismatch that motivated this.
  */
 export function claudeHomePath(...subpath: string[]): string {
-	const baseEnv = process.env.CLAUDE_HOME;
-	const base = baseEnv
-		? expandHome(baseEnv)
-		: join(process.env.HOME || '', '.claude');
+	const ccd = process.env.CLAUDE_CONFIG_DIR;
+	const home = process.env.CLAUDE_HOME;
+	let base: string;
+	if (ccd) {
+		base = expandHome(ccd);
+	} else if (home) {
+		if (!_claudeHomeDeprecationWarned) {
+			_claudeHomeDeprecationWarned = true;
+			console.warn(
+				'[util_paths] $CLAUDE_HOME is deprecated; set $CLAUDE_CONFIG_DIR instead (will be removed next release).',
+			);
+		}
+		base = expandHome(home);
+	} else {
+		base = join(process.env.HOME || '', '.claude');
+	}
 	if (subpath.length === 0) return base;
 	return join(base, ...subpath);
 }
