@@ -81,6 +81,36 @@ fi
 echo
 echo "Reconstructed from disk (last ${HOURS}h window where applicable). Issue #1032 — recall half."
 
+# 0. Relay notes from prior session(s) — READ FIRST per skills/relay/SKILL.md.
+# Mirrors the tasks/ + archive/ consumption pattern: read each unprocessed
+# relay-*.md in mtime order (oldest first), print verbatim, then mv to
+# processed/. The atomic per-file mv prevents two concurrent catchups from
+# both consuming the same file.
+print_section "📡 Relay notes from prior session (workspace/relay/)"
+mkdir -p "$WS/relay/processed" 2>/dev/null
+# Use find for mtime-ordered enumeration; portable across macOS BSD find
+# and GNU find. Filter to regular files in $WS/relay/ (not processed/).
+_relay_files="$(find "$WS/relay" -maxdepth 1 -type f -name 'relay-*.md' 2>/dev/null | sort)"
+if [ -n "$_relay_files" ]; then
+  _count=0
+  echo "$_relay_files" | while IFS= read -r _relay; do
+    [ -f "$_relay" ] || continue
+    _count=$((_count + 1))
+    _basename="$(basename "$_relay")"
+    echo
+    echo "### $_basename"
+    echo
+    cat "$_relay"
+    echo
+    # Archive: move to processed/. If mv fails (rare — permission, cross-fs),
+    # leave the file and report stderr so the next catchup retries.
+    mv "$_relay" "$WS/relay/processed/$_basename" 2>/dev/null || \
+      echo "  ⚠ failed to archive $_basename to processed/; will retry next catchup" >&2
+  done
+else
+  echo "  (no unprocessed relay notes — consider invoking /relay before ending sessions going forward)"
+fi
+
 # 1. Last session checkpoint
 print_section "Last session checkpoint (session-state.md)"
 if [ -f "$REPO/session-state.md" ]; then
