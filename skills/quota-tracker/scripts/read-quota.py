@@ -16,6 +16,11 @@ Burn-rate tracking (closes #1087):
   outside the 2min–2h window.
 """
 
+# PEP 604 unions (`Path | None`) below are evaluated at import/def time, which
+# raises TypeError on Python 3.9 (the system python3 on some hosts). Defer all
+# annotation evaluation so the module imports cleanly on 3.9+.
+from __future__ import annotations
+
 import json
 import sys
 import time
