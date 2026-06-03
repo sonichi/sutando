@@ -24,6 +24,9 @@
 #   bash scripts/sutando-shell-setup.sh --migrate      # rsync ~/.claude → <workspace>/.claude-sutando (idempotent, non-destructive)
 #   bash scripts/sutando-shell-setup.sh --repair-paths # re-pin hardcoded SOURCE_DIR paths in runtime files to CLAUDE_DIR (idempotent)
 #
+# Modifier flags (can combine with any MODE-setting flag):
+#   --force  # override the "user-defined claude-sutando() function detected" guard in --commit
+#
 # Idempotency: --commit grep-guards on the alias key `^alias claude-sutando=`,
 # not the body. If the workspace path changes (config edit or repo relocate),
 # re-running --commit cleanly REPLACES the line with the new resolved path.
@@ -39,10 +42,13 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MODE="dry-run"
+FORCE=0
 
-# Parse args (one-shot; multiple flags are ignored — first wins).
+# Parse args. `--force` is a modifier (consumed separately, does NOT set
+# MODE); the first MODE-setting flag wins per existing convention.
 for arg in "$@"; do
   case "$arg" in
+    --force)   FORCE=1 ;;
     --commit)  MODE="commit"; break ;;
     --auto)    MODE="auto"; break ;;
     --check)   MODE="check"; break ;;
@@ -164,6 +170,26 @@ managed_block_current() {
 # Used by --check / --commit to migrate users who set up before this version.
 legacy_alias_present() {
   [ -f "$RC_FILE" ] && grep -qE '^alias claude-sutando=' "$RC_FILE"
+}
+
+# Helper: detect a user-defined `claude-sutando()` function OUTSIDE our
+# managed marker block. Set up because --commit otherwise appends the
+# managed block alongside any pre-existing function, and bash's
+# last-definition-wins makes the user's function dead code with no warning
+# (Mini PR #1415 review #6 → issue #1418). Awk strips the managed block
+# first, then greps the remainder for a function definition.
+#
+# Match shape: `claude-sutando()` or `claude-sutando ()` at start of line.
+# Doesn't catch `function claude-sutando { ... }` (less common); add if it
+# bites someone. Doesn't catch one-liner `claude-sutando() { … }` — same
+# regex matches the prefix anyway.
+user_defined_function_present() {
+  [ -f "$RC_FILE" ] || return 1
+  awk -v b="$MARKER_BEGIN" -v e="$MARKER_END" '
+    $0 == b { inblk=1; next }
+    $0 == e { inblk=0; next }
+    !inblk { print }
+  ' "$RC_FILE" | grep -qE '^claude-sutando[[:space:]]*\(\)'
 }
 
 # Helper: rewrite hardcoded SOURCE_DIR/ → CLAUDE_DIR/ in runtime-critical
@@ -308,6 +334,25 @@ EOF
     # mkdir THIS checkout's target so first `claude-sutando` here works cleanly.
     # Function resolves per-cwd at runtime, but bootstrapping this one is helpful.
     mkdir -p "$CLAUDE_DIR"
+
+    # Mini PR #1415 review #6 → issue #1418: refuse if a user-defined
+    # `claude-sutando()` function exists OUTSIDE our managed block. Without
+    # this guard, --commit appends our managed block alongside the user's
+    # function — bash's last-definition-wins makes their function dead code
+    # silently. `--force` overrides for users who explicitly want our block
+    # to win.
+    if user_defined_function_present && [ "$FORCE" != "1" ]; then
+      echo "sutando-shell-setup: refusing to overwrite — $RC_FILE already contains a user-defined" >&2
+      echo "  \`claude-sutando()\` function outside the managed marker block." >&2
+      echo "  Adding our managed block here would make your function dead code" >&2
+      echo "  (last definition wins in bash; the managed block goes after)." >&2
+      echo "" >&2
+      echo "  Options:" >&2
+      echo "    1. Remove your existing claude-sutando() definition from $RC_FILE, then re-run." >&2
+      echo "    2. Pass --force to commit the managed block anyway (your function will be shadowed)." >&2
+      echo "    3. Leave as-is if your function does what you want; --commit isn't required." >&2
+      exit 1
+    fi
 
     # Apply (idempotent): handles four states.
     #   1. Managed block present + current → no-op
