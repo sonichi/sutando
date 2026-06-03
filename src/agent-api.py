@@ -313,7 +313,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 try:
                     data = _json.loads(status_file.read_text())
                     self.send_json(200, data)
-                except:
+                except Exception:
                     self.send_json(200, {"status": "idle"})
             else:
                 self.send_json(200, {"status": "idle"})
@@ -673,7 +673,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 data = json.loads(body)
                 voice_desired_state = data.get("state", "disconnected")
                 self.send_json(200, {"state": voice_desired_state})
-            except:
+            except Exception:
                 self.send_json(400, {"error": "invalid"})
             return
 
@@ -692,7 +692,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 else:
                     task_history[tid] = {"status": "done", "text": result[:80], "time": datetime.now().timestamp(), "result": result}
                 self.send_json(200, {"ok": True})
-            except:
+            except Exception:
                 self.send_json(400, {"error": "invalid"})
             return
 

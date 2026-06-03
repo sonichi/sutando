@@ -63,6 +63,32 @@ if [ -z "${OLD_PID}" ]; then
   echo "WARN  no LISTEN process on :${PORT} before kickstart — may be normal if voice-agent was down"
 fi
 
+# --- 1a. clear stale pid file ---
+# The voice-agent writes a pid file on startup and exits if it already exists.
+# If a previous kickstart killed the LaunchAgent wrapper but left the node
+# worker alive (orphaned), the new instance sees the pid file and exits with
+# "already running" — a silent no-op from the LaunchAgent's perspective.
+# Remove the file and force-kill any lingering workers before kickstart so the
+# new instance can start cleanly.
+WORKSPACE="${SUTANDO_WORKSPACE:-${HOME}/.sutando/workspace}"
+WORKSPACE="${WORKSPACE/#\~/${HOME}}"
+PID_FILE="${WORKSPACE}/.voice-agent.pid"
+if [ -f "${PID_FILE}" ]; then
+  STALE_PID="$(cat "${PID_FILE}" 2>/dev/null || true)"
+  echo "INFO  removing stale pid file ${PID_FILE} (had pid=${STALE_PID:-unknown})"
+  if [ -n "${STALE_PID}" ] && kill -0 "${STALE_PID}" 2>/dev/null; then
+    STALE_ARGS="$(ps -p "${STALE_PID}" -o args= 2>/dev/null || true)"
+    if echo "${STALE_ARGS}" | grep -q "voice-agent.ts"; then
+      echo "INFO  killing stale pid ${STALE_PID} (voice-agent confirmed)"
+      kill "${STALE_PID}" 2>/dev/null || true
+      sleep 1
+    else
+      echo "WARN  stale pid ${STALE_PID} does not look like voice-agent — skipping kill"
+    fi
+  fi
+  rm -f "${PID_FILE}"
+fi
+
 # --- 2. kickstart ---
 echo "kickstart ${SERVICE} (old listener pid: ${OLD_PID:-none})"
 if ! launchctl kickstart -k "${SERVICE}" 2>&1; then
