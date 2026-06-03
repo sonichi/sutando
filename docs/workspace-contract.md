@@ -1,6 +1,14 @@
 # Workspace Contract
 
-> **Note:** For the current setup, see [`workspace-config.md`](workspace-config.md) — workspace now defaults to `<repo>/workspace/` and is configured via `sutando.config.local.json`. The principle below still holds: code lives in the repo, runtime state lives in the workspace; only the default location moved.
+> ⚠️ **Stale examples — read with care.** The principle below (code in repo, runtime state in workspace) is current. But the **specific examples + the `WORKSPACE_DIR` resolution recipe** in this doc are pre-M0 and recommend `${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}` shell snippets that no longer match the canonical resolver (per PR #1395). Treat this file as historical context.
+>
+> **For the current contract, use:**
+> - **Shell:** `WORKSPACE="$(bash scripts/sutando-config.sh workspace)"` then `"$WORKSPACE/..."`.
+> - **Python:** `from workspace_default import resolve_workspace; ws = resolve_workspace()`.
+> - **TypeScript:** `import { resolveWorkspace } from './workspace_default.js'; const ws = resolveWorkspace()`.
+> - **Default location:** `<repo>/workspace/` (M0 in-repo). `$SUTANDO_WORKSPACE` is honored as a legacy escape hatch with a one-time deprecation warning.
+> - **Config:** see [`workspace-config.md`](workspace-config.md) for `sutando.config.local.json`.
+> - **Mental model:** see [`workspace-design.md`](workspace-design.md) for the 2-space framing (State + Memory).
 
 Every file Sutando reads or writes lives in one of two locations. Knowing which is which prevents an entire class of split-brain bugs.
 
@@ -15,7 +23,7 @@ This is the strong form of the split. If you find yourself typing `REPO_DIR / "<
 | Concept | Path on this machine | What lives here | Use it when |
 |---|---|---|---|
 | **Source tree (`REPO_DIR`)** | wherever you cloned the repo (e.g. `~/Documents/github/sutando`) | `src/`, `skills/`, `scripts/`, `docs/`, `tests/`, `CLAUDE.md`, `package.json` — anything that's in git and is part of the codebase. | Exec'ing a source script. Running `git -C` against the tree. Reading a checked-in file (docs, sample config, source). |
-| **Workspace (`WORKSPACE_DIR`)** | `$SUTANDO_WORKSPACE` (if set) or `~/.sutando/workspace/` (canonical default) | Per-user mutable runtime state: `tasks/`, `results/`, `state/`, `data/`, `logs/`, `notes/`, `build_log.md`, `pending-questions.md`, anything else the running agent generates or accumulates. Loose status `.json` files (`core-status.json`, `voice-state.json`, `contextual-chips.json`, `dynamic-content.json`, `quota-state.json`) live under `state/` — use the `status_path` / `statusPath` helpers. | Always, unless one of the three "use REPO_DIR" cases above applies. |
+| **Workspace (`WORKSPACE_DIR`)** | **Post-M0:** `<repo>/workspace/` (default), resolved via `bash scripts/sutando-config.sh workspace`. `$SUTANDO_WORKSPACE` honored as legacy escape hatch. *(Pre-M0 default was `~/.sutando/workspace/`.)* | Per-user mutable runtime state: `tasks/`, `results/`, `state/`, `data/`, `logs/`, `notes/`, `build_log.md`, `pending-questions.md`, anything else the running agent generates or accumulates. Loose status `.json` files (`core-status.json`, `voice-state.json`, `contextual-chips.json`, `dynamic-content.json`, `quota-state.json`) live under `state/` — use the `status_path` / `statusPath` helpers. | Always, unless one of the three "use REPO_DIR" cases above applies. |
 
 The two paths **can** be the same (default for fresh installs without `SUTANDO_WORKSPACE`), but designing for them as separate is the right structural shape — multiple Sutando nodes on one machine, separate-from-code workspace, OSS readers running the engine without polluting their own git tree.
 
@@ -65,7 +73,7 @@ const REPO_DIR = new URL('..', import.meta.url).pathname;  // adjust depth
 
 ```bash
 # Workspace state (tasks/, results/, etc.)
-TASKS_DIR="${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}/tasks"
+TASKS_DIR="$(bash scripts/sutando-config.sh workspace)/tasks"   # post-M0 canonical; helper handles legacy escape hatch internally
 
 # Source tree — derive from script location, not from $SUTANDO_WORKSPACE
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
