@@ -929,7 +929,7 @@ def run_all_checks() -> list[dict]:
             result = subprocess.run(["/usr/bin/pgrep", "-f", f"{proc_name}\\.py$"], capture_output=True, text=True)
             pids = result.stdout.strip().split("\n") if result.returncode == 0 else []
             pids = [p for p in pids if p]
-        except:
+        except Exception:
             pids = []
 
         if not pids:
@@ -1217,7 +1217,7 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
     ts_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
     bullet_lines = [f"- {c['name']}: {c['status']} ({c['detail']})" for c in failures]
     body = (
-        f"id: task-health-{int(time.time())}\n"
+        f"id: task-health-{now_ms}\n"
         f"timestamp: {ts_iso}\n"
         f"task: Health check found issues. Decide whether to restart, DM owner, or treat as transient:\n"
         + "\n".join(bullet_lines) + "\n"
@@ -1226,7 +1226,7 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
         f"access_tier: owner\n"
         f"priority: low\n"
     )
-    task_path = tasks_dir / f"task-health-{int(time.time())}.txt"
+    task_path = tasks_dir / f"task-health-{now_ms}.txt"
     task_path.write_text(body)
 
     # Update history. Prune entries older than 24h to bound file size.
