@@ -71,14 +71,20 @@ fi
 # Remove the file and force-kill any lingering workers before kickstart so the
 # new instance can start cleanly.
 WORKSPACE="${SUTANDO_WORKSPACE:-${HOME}/.sutando/workspace}"
+WORKSPACE="${WORKSPACE/#\~/${HOME}}"
 PID_FILE="${WORKSPACE}/.voice-agent.pid"
 if [ -f "${PID_FILE}" ]; then
   STALE_PID="$(cat "${PID_FILE}" 2>/dev/null || true)"
   echo "INFO  removing stale pid file ${PID_FILE} (had pid=${STALE_PID:-unknown})"
   if [ -n "${STALE_PID}" ] && kill -0 "${STALE_PID}" 2>/dev/null; then
-    echo "INFO  killing stale pid ${STALE_PID}"
-    kill "${STALE_PID}" 2>/dev/null || true
-    sleep 1
+    STALE_ARGS="$(ps -p "${STALE_PID}" -o args= 2>/dev/null || true)"
+    if echo "${STALE_ARGS}" | grep -q "voice-agent.ts"; then
+      echo "INFO  killing stale pid ${STALE_PID} (voice-agent confirmed)"
+      kill "${STALE_PID}" 2>/dev/null || true
+      sleep 1
+    else
+      echo "WARN  stale pid ${STALE_PID} does not look like voice-agent — skipping kill"
+    fi
   fi
   rm -f "${PID_FILE}"
 fi
