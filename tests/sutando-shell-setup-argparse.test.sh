@@ -158,6 +158,81 @@ test_detect "[NEG] similar but diff name"      "miss"     "claude-other() { echo
 test_detect "[NEG] function kw, diff name"     "miss"     "function claude-other { echo hi; }"
 
 # ----------------------------------------------------------------------
+# Brace-internal RC capture pattern test (Mini PR #1424 review #1)
+# ----------------------------------------------------------------------
+#
+# This validates the FIX PATTERN used in scripts/sutando-migrate.sh for
+# --merge-append + the two append blocks, not those functions directly
+# (they're deeply nested in move_file_local() and hard to call in
+# isolation). Proves the bitmask `||`-per-command pattern catches
+# inner-step failures that brace-overall `||` would silently swallow.
+
+echo ""
+echo "Brace-internal RC capture (Mini #1) tests:"
+
+# (a) All-pass case: every command in the brace succeeds → mask stays 0.
+TMP="$(mktemp -d -t bracerc-test.XXXXXX)"
+echo "src" > "$TMP/src"
+echo "dst" > "$TMP/dst"
+_err=0
+{
+    cat "$TMP/dst"      || _err=$((_err|1))
+    echo ""             || _err=$((_err|2))
+    echo "==="          || _err=$((_err|4))
+    echo ""             || _err=$((_err|8))
+    cat "$TMP/src"      || _err=$((_err|16))
+} > "$TMP/out" 2>/dev/null
+assert_rc "[brace] happy path → mask=0" "0" "$_err"
+rm -rf "$TMP"
+
+# (b) Early-cat fail: cat-dst missing, later cat-src OK. Brace-overall
+#     exit would be 0 (last command). Bitmask should be 1.
+TMP="$(mktemp -d -t bracerc-test.XXXXXX)"
+echo "src" > "$TMP/src"
+# Intentionally do NOT create $TMP/dst
+_err=0
+{
+    cat "$TMP/dst"      || _err=$((_err|1))
+    echo ""             || _err=$((_err|2))
+    echo "==="          || _err=$((_err|4))
+    echo ""             || _err=$((_err|8))
+    cat "$TMP/src"      || _err=$((_err|16))
+} > "$TMP/out" 2>/dev/null
+assert_rc "[brace] cat-dst fail, cat-src OK → mask=1 (the gap Mini caught)" "1" "$_err"
+rm -rf "$TMP"
+
+# (c) Both cats fail: mask = 1 | 16 = 17.
+TMP="$(mktemp -d -t bracerc-test.XXXXXX)"
+# Intentionally do NOT create either dst or src
+_err=0
+{
+    cat "$TMP/dst"      || _err=$((_err|1))
+    echo ""             || _err=$((_err|2))
+    echo "==="          || _err=$((_err|4))
+    echo ""             || _err=$((_err|8))
+    cat "$TMP/src"      || _err=$((_err|16))
+} > "$TMP/out" 2>/dev/null
+assert_rc "[brace] both cats fail → mask=17 (1|16)" "17" "$_err"
+rm -rf "$TMP"
+
+# (d) Brace-overall comparison: prove the OLD pattern (without per-command
+#     capture) would have returned 0 for case (b). This is the regression
+#     the per-command capture pattern prevents.
+TMP="$(mktemp -d -t bracerc-test.XXXXXX)"
+echo "src" > "$TMP/src"
+# Intentionally do NOT create $TMP/dst
+{
+    cat "$TMP/dst"     # no || capture — relies on brace-overall exit
+    echo ""
+    echo "==="
+    echo ""
+    cat "$TMP/src"
+} > "$TMP/out" 2>/dev/null
+brace_overall_rc=$?
+assert_rc "[brace] old-pattern brace-overall rc=0 even with cat-dst fail (proves the gap)" "0" "$brace_overall_rc"
+rm -rf "$TMP"
+
+# ----------------------------------------------------------------------
 # Summary
 # ----------------------------------------------------------------------
 
