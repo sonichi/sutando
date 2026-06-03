@@ -726,23 +726,29 @@ EOF
     # Enumerate both patterns explicitly: `channels/*/.env` (dotfile form,
     # the standard bot-token shape) + `channels/*/*.env` (any other .env
     # variant like relay-client.env).
+    # Redirect to stderr (Lucy PR #1429 review nit): the vault-sync warning
+    # is the highest-stakes line in this script (data-loss / secret-leak
+    # prevention), and the source-missing / rsync-missing errors above
+    # already go to stderr. Parity dictates this warning should too — and
+    # it ensures the warning is visible even if the user pipes stdout
+    # somewhere (e.g. `sutando-shell-setup --import > install.log`).
     _secrets_found=0
     for env in "${CLAUDE_DIR}/channels/"*/.env "${CLAUDE_DIR}/channels/"*/*.env "${CLAUDE_DIR}/channels/"*/access.json.bak*; do
       [ -f "$env" ] || continue
       if [ "$_secrets_found" = "0" ]; then
-        echo
-        echo "  ⚠ Imported host-specific secrets — review before vault sync:"
+        echo >&2
+        echo "  ⚠ Imported host-specific secrets — review before vault sync:" >&2
         _secrets_found=1
       fi
       _mode="$(stat -f '%Mp%Lp' "$env" 2>/dev/null || stat -c '%a' "$env" 2>/dev/null || echo '?')"
-      echo "      ${env#${CLAUDE_DIR}/}  (mode $_mode)"
+      echo "      ${env#${CLAUDE_DIR}/}  (mode $_mode)" >&2
     done
     if [ "$_secrets_found" = "1" ]; then
-      echo
-      echo "    These files contain bot tokens / stale auth state and are host-coupled."
-      echo "    If you sync this workspace to a remote (M2 vault), add an exclude rule"
-      echo "    for channels/*/.env + channels/*/*.env + channels/*/access.json.bak*"
-      echo "    in your sync policy BEFORE the next sync to avoid leaking secrets remotely."
+      echo >&2
+      echo "    These files contain bot tokens / stale auth state and are host-coupled." >&2
+      echo "    If you sync this workspace to a remote (M2 vault), add an exclude rule" >&2
+      echo "    for channels/*/.env + channels/*/*.env + channels/*/access.json.bak*" >&2
+      echo "    in your sync policy BEFORE the next sync to avoid leaking secrets remotely." >&2
     fi
     exit 0
     ;;
