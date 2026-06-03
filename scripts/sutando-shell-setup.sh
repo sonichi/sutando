@@ -711,22 +711,30 @@ EOF
     # it lands — will include these files in the synced bundle unless the
     # user adds an exclude. Surface the exact paths so the user can add
     # them to their vault sync exclude policy.
-    if compgen -G "${CLAUDE_DIR}/channels/*/*.env" > /dev/null 2>&1; then
-      echo
-      echo "  ⚠ Imported host-specific secrets — review before vault sync:"
-      for env in "${CLAUDE_DIR}/channels/"*/*.env; do
-        [ -f "$env" ] && echo "      ${env#${CLAUDE_DIR}/}  (mode $(stat -f '%Mp%Lp' "$env" 2>/dev/null || stat -c '%a' "$env" 2>/dev/null))"
-      done
-      if compgen -G "${CLAUDE_DIR}/channels/*/access.json.bak*" > /dev/null 2>&1; then
-        for bak in "${CLAUDE_DIR}/channels/"*/access.json.bak*; do
-          [ -f "$bak" ] && echo "      ${bak#${CLAUDE_DIR}/}"
-        done
+    #
+    # Glob note: bash's `*` does NOT match dot-prefixed names by default
+    # (unlike rsync's `*` which does). So `channels/*/*.env` would catch
+    # `relay-client.env` but MISS the canonical `channels/discord/.env`.
+    # Enumerate both patterns explicitly: `channels/*/.env` (dotfile form,
+    # the standard bot-token shape) + `channels/*/*.env` (any other .env
+    # variant like relay-client.env).
+    _secrets_found=0
+    for env in "${CLAUDE_DIR}/channels/"*/.env "${CLAUDE_DIR}/channels/"*/*.env "${CLAUDE_DIR}/channels/"*/access.json.bak*; do
+      [ -f "$env" ] || continue
+      if [ "$_secrets_found" = "0" ]; then
+        echo
+        echo "  ⚠ Imported host-specific secrets — review before vault sync:"
+        _secrets_found=1
       fi
+      _mode="$(stat -f '%Mp%Lp' "$env" 2>/dev/null || stat -c '%a' "$env" 2>/dev/null || echo '?')"
+      echo "      ${env#${CLAUDE_DIR}/}  (mode $_mode)"
+    done
+    if [ "$_secrets_found" = "1" ]; then
       echo
       echo "    These files contain bot tokens / stale auth state and are host-coupled."
       echo "    If you sync this workspace to a remote (M2 vault), add an exclude rule"
-      echo "    for channels/*/*.env + channels/*/access.json.bak* in your sync policy"
-      echo "    BEFORE the next sync to avoid leaking secrets remotely."
+      echo "    for channels/*/.env + channels/*/*.env + channels/*/access.json.bak*"
+      echo "    in your sync policy BEFORE the next sync to avoid leaking secrets remotely."
     fi
     exit 0
     ;;
