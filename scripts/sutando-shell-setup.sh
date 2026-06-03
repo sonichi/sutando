@@ -273,9 +273,36 @@ _rewrite_runtime_paths() {
   # workspace-move scenarios. When set, rewrite BOTH source_dir → CLAUDE_DIR
   # (the default) AND from_dir → CLAUDE_DIR (the move-from). Two passes per
   # file so a file containing both old strings ends up fully re-pinned.
+  #
+  # Validation (Mini PR #1424 review #2): a typo or empty value would be
+  # catastrophic. `--from=/` builds `s|/|$CLAUDE_DIR/|g` which rewrites
+  # EVERY slash in every candidate file. Reject before sed:
+  #   - empty / "/" / root-ish paths
+  #   - paths that don't end in /.claude or /.claude-sutando (the only
+  #     two shapes we ever rehome from)
+  #   - paths that don't exist on disk (typo guard)
   local from_sed_script=""
   if [ -n "$FROM_DIR" ]; then
-    from_sed_script="s|${FROM_DIR%/}/|${CLAUDE_DIR}/|g"
+    local _from_norm="${FROM_DIR%/}"
+    if [ -z "$_from_norm" ] || [ "$_from_norm" = "" ]; then
+      echo "--from= cannot be empty or root" >&2
+      return 1
+    fi
+    case "$_from_norm" in
+      */.claude|*/.claude-sutando|*/.claude.*)
+        : ;;  # accepted shapes
+      *)
+        echo "--from=$FROM_DIR rejected — must end in /.claude or /.claude-sutando" >&2
+        echo "  (guard against typos: --from=/ would rewrite every slash in every candidate file)" >&2
+        return 1
+        ;;
+    esac
+    if [ ! -d "$_from_norm" ]; then
+      echo "--from=$FROM_DIR rejected — directory does not exist" >&2
+      echo "  (guard against typos: silent no-op vs explicit failure)" >&2
+      return 1
+    fi
+    from_sed_script="s|${_from_norm}/|${CLAUDE_DIR}/|g"
   fi
   echo
   echo "  Re-pinning hardcoded paths:"
