@@ -25,7 +25,12 @@
 #   bash scripts/sutando-shell-setup.sh --repair-paths # re-pin hardcoded SOURCE_DIR paths in runtime files to CLAUDE_DIR (idempotent)
 #
 # Modifier flags (can combine with any MODE-setting flag):
-#   --force  # override the "user-defined claude-sutando() function detected" guard in --commit
+#   --force         # override the "user-defined claude-sutando() function detected" guard in --commit
+#   --from=<PATH>   # for --migrate / --repair-paths: ALSO rewrite this OLD claude-config-dir
+#                   # location (in addition to the default SOURCE_CLAUDE_CONFIG_DIR / ~/.claude).
+#                   # Use when the workspace was moved: previously-rewritten paths point at the
+#                   # old workspace's .claude-sutando; --from re-pins them to the current target.
+#                   # Note: uses `=`-joined form (--from=/path), not space-separated.
 #
 # Idempotency: --commit grep-guards on the alias key `^alias claude-sutando=`,
 # not the body. If the workspace path changes (config edit or repo relocate),
@@ -43,12 +48,18 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MODE="dry-run"
 FORCE=0
+FROM_DIR=""
 
-# Parse args. `--force` is a modifier (consumed separately, does NOT set
-# MODE); the first MODE-setting flag wins per existing convention.
+# Parse args. `--force` + `--from=PATH` are modifiers (consumed separately,
+# do NOT set MODE); the first MODE-setting flag wins per existing convention.
+# `--from` uses the `=`-joined form (`--from=/some/path`) to keep the for-loop
+# parser simple — supports both --migrate and --repair-paths scenarios where
+# the user wants to rewrite an OLD claude-config-dir (workspace move) rather
+# than just the source ~/.claude (the default).
 for arg in "$@"; do
   case "$arg" in
     --force)   FORCE=1 ;;
+    --from=*)  FROM_DIR="${arg#--from=}" ;;
     --commit)  MODE="commit"; break ;;
     --auto)    MODE="auto"; break ;;
     --check)   MODE="check"; break ;;
@@ -249,9 +260,20 @@ _rewrite_runtime_paths() {
   fi
   local sed_script="s|${source_dir}/|${CLAUDE_DIR}/|g"
   local rewrote=0 unchanged=0 missing=0
+  # Mini PR #1415 review #3 → issue #1417: support --from=<old-path> for
+  # workspace-move scenarios. When set, rewrite BOTH source_dir → CLAUDE_DIR
+  # (the default) AND from_dir → CLAUDE_DIR (the move-from). Two passes per
+  # file so a file containing both old strings ends up fully re-pinned.
+  local from_sed_script=""
+  if [ -n "$FROM_DIR" ]; then
+    from_sed_script="s|${FROM_DIR%/}/|${CLAUDE_DIR}/|g"
+  fi
   echo
   echo "  Re-pinning hardcoded paths:"
   echo "    source    : ${source_dir}/"
+  if [ -n "$FROM_DIR" ]; then
+    echo "    move-from : ${FROM_DIR%/}/  (also re-pinned to target)"
+  fi
   echo "    target    : ${CLAUDE_DIR}/"
   echo "    candidates: ${#runtime_files[@]} files (explicit + commands/*.md + skills/**/{SKILL.md,scripts})"
   local f
@@ -261,8 +283,16 @@ _rewrite_runtime_paths() {
       missing=$((missing + 1))
       continue
     fi
+    local touched=0
     if grep -q "${source_dir}/" "$f" 2>/dev/null; then
       sed -i.bak "$sed_script" "$f" && rm -f "$f.bak"
+      touched=1
+    fi
+    if [ -n "$from_sed_script" ] && grep -q "${FROM_DIR%/}/" "$f" 2>/dev/null; then
+      sed -i.bak "$from_sed_script" "$f" && rm -f "$f.bak"
+      touched=1
+    fi
+    if [ $touched -eq 1 ]; then
       echo "    rewrote               ${f#${CLAUDE_DIR}/}"
       rewrote=$((rewrote + 1))
     else
