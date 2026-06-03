@@ -14,6 +14,32 @@ cd "$REPO"
 # $SUTANDO_ROOT.
 export SUTANDO_ROOT="$REPO"
 
+# Export workspace-scoped CLAUDE_CONFIG_DIR before services launch. Without it,
+# init.sh + the bridge-launcher blocks below (L~262 proxy, L~429 telegram,
+# L~449 discord, L~473 slack) probe `${CLAUDE_CONFIG_DIR:-$HOME/.claude}` and
+# fall back to legacy `~/.claude/` when the env var is unset — meaning bridges
+# read tokens / access lists from the pre-migration location even after a
+# successful `claude-sutando --migrate`. Mirrors scripts/start-cli.sh:38-51
+# (Sutando.app's tmux-wrapped CLI launcher) — same machine-spawn pattern.
+#
+# Defense in depth (matches start-cli):
+#   - Helper missing → silent fallback (legacy install).
+#   - Helper present + config valid → export.
+#   - Helper present + config invalid → refuse to start (don't scatter state).
+if [ -x "$REPO/scripts/sutando-config.sh" ]; then
+  _ccd_err="$(mktemp -t startup-ccd.XXXXXX)"
+  if _ccd="$(bash "$REPO/scripts/sutando-config.sh" claude-sutando-config-dir 2>"$_ccd_err")"; then
+    mkdir -p "$_ccd"
+    export CLAUDE_CONFIG_DIR="$_ccd"
+  else
+    echo "startup: claude_sutando_config_dir invalid — refusing to start" >&2
+    cat "$_ccd_err" >&2
+    rm -f "$_ccd_err"
+    exit 1
+  fi
+  rm -f "$_ccd_err"
+fi
+
 # Git committer attribution: REMOVED (2026-05-21). This block used to set
 # committer.name/committer.email from stand-identity.json so `git log %cn`
 # showed which fleet host crafted a commit. But git 2.31+ honors committer.*
