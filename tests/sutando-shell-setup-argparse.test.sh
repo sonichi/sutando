@@ -218,9 +218,15 @@ rm -rf "$TMP"
 # (d) Brace-overall comparison: prove the OLD pattern (without per-command
 #     capture) would have returned 0 for case (b). This is the regression
 #     the per-command capture pattern prevents.
+#
+# Wrap in `set +e` / `set -e` because the brace fails (first cat misses)
+# and the script's top-level `set -e` would otherwise propagate the exit
+# up. We WANT to capture the brace's rc into a variable — that requires
+# tolerating a non-zero rc temporarily.
 TMP="$(mktemp -d -t bracerc-test.XXXXXX)"
 echo "src" > "$TMP/src"
 # Intentionally do NOT create $TMP/dst
+set +e
 {
     cat "$TMP/dst"     # no || capture — relies on brace-overall exit
     echo ""
@@ -229,6 +235,7 @@ echo "src" > "$TMP/src"
     cat "$TMP/src"
 } > "$TMP/out" 2>/dev/null
 brace_overall_rc=$?
+set -e
 assert_rc "[brace] old-pattern brace-overall rc=0 even with cat-dst fail (proves the gap)" "0" "$brace_overall_rc"
 rm -rf "$TMP"
 
