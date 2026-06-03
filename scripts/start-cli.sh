@@ -21,6 +21,21 @@ cd "$REPO"
 TMUX_SOCKET="/tmp/sutando-tmux.sock"
 SESSION="sutando-core"
 
+# Optional context-window pin (graceful-degradation hook for the 1M
+# usage-credit-gate wedge — see src/health-check.py recover_core_if_wedged).
+# When SUTANDO_CORE_MODEL is set we pass it through as `--model`; otherwise we
+# add NO flag, so the core inherits the user's global model (e.g. `opus[1m]`
+# from ~/.claude/settings.json) and 1M stays the default — we never disable it.
+# health-check's --recover-core escalation only sets SUTANDO_CORE_MODEL=opus
+# AFTER a 1M restart fails to hold, so a re-wedging core falls back to standard
+# 200K context (no gate) and keeps working instead of looping. The
+# ${arr[@]+...} guard keeps an empty array safe on bash 3.2 even under `set -u`
+# (mirrors the empty-array care in PR #1391).
+MODEL_ARGS=()
+if [ -n "${SUTANDO_CORE_MODEL:-}" ]; then
+  MODEL_ARGS=(--model "$SUTANDO_CORE_MODEL")
+fi
+
 # --restart: kill any existing session before starting fresh. Without this,
 # the script's "already running → attach" path returns and the old session
 # keeps running.
@@ -66,7 +81,7 @@ fi
 if ! command -v tmux > /dev/null 2>&1; then
   echo "  ⚠ tmux not found — running without tmux wrapper"
   echo "    (Sutando.app's watcher-auto-restart won't work; brew install tmux to enable)"
-  exec claude --name "$SESSION" --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
+  exec claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
     -- "/schedule-crons"
 fi
 
@@ -104,11 +119,11 @@ tmux -S "$TMUX_SOCKET" bind -n WheelDownPane send-keys -M 2>/dev/null || true
 #     start detached so we don't hang, server keeps running.
 if [ -t 1 ]; then
   exec tmux -S "$TMUX_SOCKET" new-session -A -s "$SESSION" \
-    claude --name "$SESSION" --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
+    claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
     -- "/schedule-crons"
 else
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" \
-    claude --name "$SESSION" --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
+    claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
     -- "/schedule-crons"
   echo "Started $SESSION detached. Attach via Open Core CLI in menu bar, or:"
   echo "  tmux -S $TMUX_SOCKET attach -t $SESSION"

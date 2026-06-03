@@ -189,6 +189,54 @@ def case_h_history_pruned_after_24h() -> list[str]:
     return fails
 
 
+def case_i_token_read_prefers_channel_env() -> list[str]:
+    """Regression: the watchdog read SLACK_BOT_TOKEN from $REPO/.env only, but
+    the bridge keeps it in ~/.claude/channels/slack/.env (startup.sh sources
+    exactly that). On a standard install $REPO/.env has no token, so creds
+    resolved to None and the DM silently no-op'd — the watchdog looked
+    installed but never fired. Token resolution must check the channel .env
+    first, then fall back to $REPO/.env.
+
+    Redirects HOME (Path.home() honors $HOME on POSIX) and hc.REPO_DIR so the
+    real path-resolution code runs against temp files."""
+    import os
+    fails = []
+    saved_home = os.environ.get("HOME")
+    saved_repo = hc.REPO_DIR
+    saved_env_token = os.environ.pop("SLACK_BOT_TOKEN", None)  # force the file path
+    try:
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as repo:
+            os.environ["HOME"] = home
+            hc.REPO_DIR = Path(repo)
+            chan = Path(home) / ".claude" / "channels" / "slack"
+            chan.mkdir(parents=True, exist_ok=True)
+            (Path(repo) / ".env").write_text("SLACK_BOT_TOKEN=xoxb-from-repo\n")
+            (chan / ".env").write_text('SLACK_BOT_TOKEN="xoxb-from-channel"\n')
+
+            tok = hc._slack_token_from_env_file()
+            if tok != "xoxb-from-channel":
+                fails.append(f"i) channel .env should win, got {tok!r}")
+
+            # Remove the channel token → must fall back to $REPO/.env.
+            (chan / ".env").write_text("OTHER=1\n")
+            tok2 = hc._slack_token_from_env_file()
+            if tok2 != "xoxb-from-repo":
+                fails.append(f"i) fallback to $REPO/.env failed, got {tok2!r}")
+
+            # Neither present → empty string (no crash).
+            (Path(repo) / ".env").write_text("OTHER=2\n")
+            tok3 = hc._slack_token_from_env_file()
+            if tok3 != "":
+                fails.append(f"i) absent token should be '', got {tok3!r}")
+    finally:
+        if saved_home is not None:
+            os.environ["HOME"] = saved_home
+        if saved_env_token is not None:
+            os.environ["SLACK_BOT_TOKEN"] = saved_env_token
+        hc.REPO_DIR = saved_repo
+    return fails
+
+
 def main() -> int:
     cases = [
         ("a", case_a_all_ok_no_send),
@@ -199,6 +247,7 @@ def main() -> int:
         ("f", case_f_different_set_sends),
         ("g", case_g_failed_send_not_recorded),
         ("h", case_h_history_pruned_after_24h),
+        ("i", case_i_token_read_prefers_channel_env),
     ]
     all_failures = []
     for label, fn in cases:
