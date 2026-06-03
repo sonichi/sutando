@@ -82,30 +82,59 @@ echo
 echo "Reconstructed from disk (last ${HOURS}h window where applicable). Issue #1032 — recall half."
 
 # 0. Relay notes from prior session(s) — READ FIRST per skills/relay/SKILL.md.
-# Mirrors the tasks/ + archive/ consumption pattern: read each unprocessed
-# relay-*.md in mtime order (oldest first), print verbatim, then mv to
-# processed/. The atomic per-file mv prevents two concurrent catchups from
-# both consuming the same file.
+#
+# Mirrors the tasks/ + processed/ drain pattern, but with the consume order
+# inverted so it's actually atomic. Per Lucy's #1430 review (2026-06-03
+# 06:42Z): a `list → read → mv` flow is TOCTOU-racy under two concurrent
+# catchups — both list, both read the same file, both attempt the mv (only
+# one wins). The READ duplicates even though the mv is atomic.
+#
+# Claim-by-mv FIRST is the race-safe pattern: each catchup attempts the
+# mv; only the process whose `mv` succeeds (file still existed at the
+# source path) reads the moved copy. The loser's mv fails silently
+# (concurrent catchup already consumed it — that's expected, not an
+# error). `mv` within one filesystem is the atomic primitive (single
+# rename(2) syscall), not the read.
+#
+# The find/sort enumeration is by NAME (epoch in `relay-{epoch}.md`),
+# which gives chronological creation order. We don't sort by mtime here
+# because /relay's --append flag updates mtime but keeps the original
+# filename — mtime-sort would shuffle an appended note to "newest"
+# position; name-sort preserves the original creation order so the
+# narrative thread reads naturally oldest-first.
 print_section "📡 Relay notes from prior session (workspace/relay/)"
 mkdir -p "$WS/relay/processed" 2>/dev/null
-# Use find for mtime-ordered enumeration; portable across macOS BSD find
-# and GNU find. Filter to regular files in $WS/relay/ (not processed/).
 _relay_files="$(find "$WS/relay" -maxdepth 1 -type f -name 'relay-*.md' 2>/dev/null | sort)"
 if [ -n "$_relay_files" ]; then
   _count=0
+  _now=$(date +%s)
   echo "$_relay_files" | while IFS= read -r _relay; do
-    [ -f "$_relay" ] || continue
-    _count=$((_count + 1))
+    [ -f "$_relay" ] || continue   # cheap pre-check; mv below is the authoritative claim
     _basename="$(basename "$_relay")"
+    _archived="$WS/relay/processed/$_basename"
+    # Atomic claim: only the catchup whose `mv` succeeds reads the file.
+    # Lost-race vs genuine error are indistinguishable here, but neither
+    # case warrants stderr noise on every fire — a truly-stuck file (perm,
+    # cross-fs) stays in place and the next catchup will retry it.
+    mv "$_relay" "$_archived" 2>/dev/null || continue
+    _count=$((_count + 1))
+    # Surface the note's age so a stale narrative (e.g. a relay note that
+    # sat undrained for 3 days because no catchup fired) doesn't get taken
+    # as current context. Per Lucy's #1430 yellow minor on stale-note guard.
+    _mtime=$(stat -f %m "$_archived" 2>/dev/null || stat -c %Y "$_archived" 2>/dev/null || echo "$_now")
+    _age_min=$(( (_now - _mtime) / 60 ))
+    if [ "$_age_min" -lt 60 ]; then
+      _age_label="${_age_min}m ago"
+    elif [ "$_age_min" -lt 1440 ]; then
+      _age_label="$(( _age_min / 60 ))h ago"
+    else
+      _age_label="$(( _age_min / 1440 ))d ago — likely stale"
+    fi
     echo
-    echo "### $_basename"
+    echo "### $_basename _(written $_age_label)_"
     echo
-    cat "$_relay"
+    cat "$_archived"
     echo
-    # Archive: move to processed/. If mv fails (rare — permission, cross-fs),
-    # leave the file and report stderr so the next catchup retries.
-    mv "$_relay" "$WS/relay/processed/$_basename" 2>/dev/null || \
-      echo "  ⚠ failed to archive $_basename to processed/; will retry next catchup" >&2
   done
 else
   echo "  (no unprocessed relay notes — consider invoking /relay before ending sessions going forward)"

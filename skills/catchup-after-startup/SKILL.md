@@ -46,13 +46,15 @@ workspace/relay/
 **Catchup-after-startup MUST:**
 
 1. `mkdir -p "$WORKSPACE/relay/processed"` (idempotent — handles first-ever invocation).
-2. List `"$WORKSPACE/relay/"relay-*.md` in mtime order (oldest first). Skip the `processed/` subdirectory.
+2. List `"$WORKSPACE/relay/"relay-*.md` in **filename order** (epoch in the filename → chronological creation order). Skip the `processed/` subdirectory. Note: we sort by filename, NOT mtime, because `/relay --append` updates the mtime of an existing note while keeping the original filename — mtime-sort would shuffle an appended note to the end (newest), whereas name-sort preserves the original creation thread oldest-first.
 3. For each unprocessed file, in order:
-   - Print it verbatim under a "📡 Relay note from prior session" header, before any of the structured sections (1-10) below.
-   - `mv` it to `"$WORKSPACE/relay/processed/$(basename "$file")"` after reading. This mirrors the result-watcher drain pattern (read → archive → leave processed/ as the audit trail).
-4. If no unprocessed relay files exist, print "(no relay notes from prior session — consider invoking /relay before ending sessions going forward)" under the same header and proceed to section 1.
+   - **Claim-by-mv FIRST.** Attempt `mv "$file" "$WORKSPACE/relay/processed/$(basename "$file")"`. If the mv succeeds, this catchup invocation has won the claim on this file; proceed to step (b). If the mv fails (file no longer at the source path — a concurrent catchup already consumed it), `continue` silently. `mv` within one filesystem is a single `rename(2)` syscall and is the atomic primitive here; do NOT condition the print step on the file being present at the source path (that's the TOCTOU race).
+   - **Then read the moved file.** `cat "$WORKSPACE/relay/processed/$(basename "$file")"` under a "📡 Relay note from prior session" header that includes the file's mtime as a human-readable age (e.g. `_(written 2h ago)_`), before any of the structured sections (1-10) below. The age annotation is a stale-note guard — a relay note that sat undrained for 3 days because no catchup fired shouldn't get taken as current context.
+4. If no unprocessed relay files exist (none surviving the claim-by-mv loop), print "(no relay notes from prior session — consider invoking /relay before ending sessions going forward)" under the same header and proceed to section 1.
 
-The relay-read step is INSIDE catchup's bash script (`scripts/catchup-after-startup.sh`) for atomicity — the read + archive happen in one pass so two concurrent catchups can't both consume the same file.
+The atomicity guarantee comes from the `mv` claim being the FIRST action per file, not the LAST — `mv` is the rename(2) syscall, which the kernel guarantees is atomic for paths on the same filesystem. The pre-mv `[ -f "$file" ]` existence check in the impl is a cheap fast-path; the authoritative race-loss signal is the mv's non-zero exit status. Two concurrent catchups can race the same file's mv, but exactly one will win — the loser sees the file already moved and continues. This mirrors the same atomic-claim pattern the result-watcher drain already uses on `task-*.txt`.
+
+**Phase 2 caveat — cross-host fleet sync.** Syncing *unprocessed* `relay-*.md` (i.e. the source-path directory, not just `processed/`) across multiple cores via memory-sync would reintroduce a cross-host consume race: two cores' catchups could each claim the same file locally before the sync converges. Phase 1 is single-host only (relay folder lives under the per-host workspace) so this doesn't bite. If/when fleet sync of pending relay notes lands, the cross-host claim needs a different primitive (advisory lock file, per-host ownership tag in the note, or push-only-to-`processed/` semantics) — flagged here so Phase 2 doesn't accidentally lose the atomicity guarantee.
 
 ## Steps
 
