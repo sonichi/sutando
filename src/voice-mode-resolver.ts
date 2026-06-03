@@ -1,14 +1,29 @@
 // Unified base-mode resolver for the voice agent (issue #1410, supersedes
-// partial fixes #1412 + #1413). Reads all mode-state substrates once per call
-// and returns a canonical mode descriptor.
+// partial fixes #1412 + #1413). Reads the independent mode-state substrates
+// once per call and returns a canonical mode descriptor.
 //
 // Multi-substrate state divergence is the root cause of the
 // `[System: Produce ZERO audio. Call NO tools.]` fabrication tokens that
 // gemini-3.1-flash-live-preview emits as spoken output at session connect.
-// Mode lives in 4 places — in-memory `meetingActive`, on-disk `voice-mode.txt`,
-// presenter HTTP server `:7877/presenter`, screen-companion `activeMode` — and
-// without an explicit base-mode declaration the model infers meeting-mode
+// Without an explicit base-mode declaration, the model infers meeting-mode
 // silence from co-present-flavored context.
+//
+// Substrate inventory + read/write contract:
+//   1. `meetingActive` (in-memory, voice-agent.ts) — READ here, source of
+//      truth for the meeting/active axis. Mutated by switch_mode, by
+//      applyModeRequest poll, and by Zoom auto-detect at startup.
+//   2. presenter HTTP server `:7877/presenter` — READ here, source of truth
+//      for the presenter axis (independent from meeting/active).
+//   3. `voice-mode.txt` on disk — NOT READ here. It is the WRITE-ONLY
+//      output mirror of `meetingActive`, written by writeVoiceModeSentinel()
+//      whenever meetingActive changes. Downstream consumers (web-client,
+//      Sutando.app menu-bar, discord-voice-server) read it. Reading it here
+//      would re-read our own output — same source as #1, one hop later.
+//   4. `activeMode` in skills/screen-companion/tools.ts — NOT READ here.
+//      Orthogonal sub-mode that overlays the base; not a base mode itself.
+//      Base axis is {active, meeting, presenter}; sub-mode axis is
+//      {none, guided-setup, pair-debug, ...}. Conflating the two would
+//      lose information.
 //
 // This module is pure (no side effects on import) so it can be unit-tested
 // without booting the voice agent.
