@@ -84,6 +84,12 @@ def get_waiting_questions():
     if not PQ_FILE.exists():
         return []
     content = PQ_FILE.read_text()
+    # Only the active region counts. Resolved questions are kept below a
+    # top-level "# Resolved" divider (audit trail), not deleted — without
+    # this cut the heading-agnostic split below sweeps the whole file and
+    # every resolved entry is miscounted as pending, re-notifying the owner
+    # about already-answered questions. No-op when there is no such divider.
+    content = re.split(r'^#\s+Resolved\b', content, maxsplit=1, flags=re.MULTILINE)[0]
     questions = []
     # Walk each ## section; a section is waiting if its body contains
     # `Status: unanswered` or `Status: Waiting`, OR has no Status field
