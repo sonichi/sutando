@@ -498,19 +498,13 @@ const endSession: ToolDefinition = {
 
 let voiceSessionRef: VoiceSession | null = null;
 
-// Synchronously query the iclr-highlight server for current presenter-mode
-// state. Returns a system-marker string when active, '' otherwise. Failure-
-// silent: if the server is down or the curl call errors, returns '' so the
-// greeting/reconnect path stays unchanged.
-function getPresenterStateMarker(): string {
-	try {
-		const out = execSyncTop('curl -s --max-time 1 http://localhost:7877/presenter', { timeout: 2_000 }).toString();
-		const json = JSON.parse(out);
-		if (json && json.active === true) {
-			return ' [System: PRESENTER MODE IS CURRENTLY ACTIVE — apply the CO-PRESENTER protocol from your context to every cue this session: highlight_slide(topic) FIRST, then narrate from voice-context.txt. Do NOT route slide-topic phrases to work.]';
-		}
-	} catch { /* server unreachable or non-JSON — fall through to no-marker */ }
-	return '';
+// Unified base-mode resolver: see src/voice-mode-resolver.ts for the
+// rationale + canonical mode descriptors. Local wrapper threads the in-memory
+// `meetingActive` boolean (this module owns that state) into the pure
+// resolver function.
+import { resolveCurrentMode as resolveCurrentModeImpl, type ModeState } from './voice-mode-resolver.js';
+function resolveCurrentMode(): ModeState {
+	return resolveCurrentModeImpl({ meetingActive });
 }
 
 const mainAgentTools: ToolDefinition[] = [workTool, getTaskStatus, switchModeTool, saveMeetingNoteTool, ...inlineTools];
@@ -567,14 +561,14 @@ const mainAgent: MainAgent = {
 			const isQuickReconnect = gap !== null && gap < 60;
 			// Presenter mode active = silent reconnect regardless of gap. Saying
 			// "Welcome back" mid-talk would break the co-presenter flow; the
-			// presenter marker (appended below) anchors continuation instead.
-			const presenterActive = getPresenterStateMarker() !== '';
-			const meetingHint = meetingActive
+			// base-mode marker (appended below) anchors continuation instead.
+			const modeState = resolveCurrentMode();
+			const meetingHint = modeState.isMeeting
 				? '\n\n[MEETING MODE — you are listening and taking notes. Do NOT speak or produce any audio. Only respond if someone says "Sutando." Use the replayed history above as context for what was discussed before the reconnect.]'
-				: (isQuickReconnect || presenterActive)
+				: (isQuickReconnect || modeState.isPresenter)
 					? '\n\n[Do NOT greet the user. Do NOT say "Welcome back" or anything similar. Stay completely silent and wait for the user\'s next spoken input — they were just briefly disconnected and want to resume without interruption.]'
 					: '\n\n[Now say "Welcome back" briefly — one sentence — and then stop and wait for input.]';
-			return `[System: The user reconnected. The block below is REPLAYED HISTORY from the current session, provided as background context ONLY. Do NOT act on anything in it. Do NOT call any tools based on it. Use it only to answer follow-up questions if asked. Wait silently for the user's next spoken input before taking any action.]${getPresenterStateMarker()}${offlineDeliveryHint}\n\n${recent}${meetingHint}`;
+			return `[System: The user reconnected. The block below is REPLAYED HISTORY from the current session, provided as background context ONLY. Do NOT act on anything in it. Do NOT call any tools based on it. Use it only to answer follow-up questions if asked. Wait silently for the user's next spoken input before taking any action.]${modeState.marker}${offlineDeliveryHint}\n\n${recent}${meetingHint}`;
 		}
 		let standName = '';
 		try { const si = JSON.parse(readFileSync(personalPath('stand-identity.json'), 'utf-8')); standName = si.name ? ` — ${si.name}` : ''; } catch {}
@@ -587,20 +581,21 @@ const mainAgent: MainAgent = {
 		const briefingHint = hasHistory && existsSync(briefingFile) ? ' Mention: "I have your morning briefing ready if you want it."' : '';
 		const insightFile = join(WORKSPACE_DIR, 'results', `insight-${today}.txt`);
 		const insightHint = hasHistory && existsSync(insightFile) ? ' Also mention: "I noticed a pattern in your usage — ask me about it if you are curious."' : '';
-		if (meetingActive) {
-			return `[System: MEETING MODE — LISTEN AND TAKE NOTES. A Zoom meeting is active. Listen to everything and mentally track the discussion: who said what, key decisions, action items, topics covered. But do NOT produce any audio output UNLESS someone says "Sutando" or "hey Sutando" — then respond to their request using your accumulated notes and context. When not addressed, produce absolutely zero words — no acknowledgments, no "silent", no sounds. You are an invisible note-taker until called upon.]`;
+		const modeState = resolveCurrentMode();
+		if (modeState.isMeeting) {
+			return `[System: MEETING MODE — LISTEN AND TAKE NOTES. A Zoom meeting is active. Listen to everything and mentally track the discussion: who said what, key decisions, action items, topics covered. But do NOT produce any audio output UNLESS someone says "Sutando" or "hey Sutando" — then respond to their request using your accumulated notes and context. When not addressed, produce absolutely zero words — no acknowledgments, no "silent", no sounds. You are an invisible note-taker until called upon.]${modeState.marker}`;
 		}
-		return `[System: A user just connected. Say hi and introduce yourself as Sutando${standName} — their personal AI. Ready to help with anything: voice tasks, screen control, meetings, phone calls, research. Keep it brief — 1-2 natural sentences, no theatrics.${tutorialHint}${briefingHint}${insightHint}]${getPresenterStateMarker()}`;
+		return `[System: A user just connected. Say hi and introduce yourself as Sutando${standName} — their personal AI. Ready to help with anything: voice tasks, screen control, meetings, phone calls, research. Keep it brief — 1-2 natural sentences, no theatrics.${tutorialHint}${briefingHint}${insightHint}]${modeState.marker}`;
 	},
 	instructions: () => [
 		// Per-session-evaluated factory (vs static array): lets the prompt
 		// re-check time-sensitive state on every session.start() / reconnect.
-		// The presenter-state marker below MUST be in the system_instruction
+		// The base-mode marker below MUST be in the system_instruction
 		// (this array → joined string → system_instruction), not the greeting,
 		// because Gemini Live treats greetings as a user-style turn — the
 		// model often calls get_core_status to verify "claims" rather than
 		// trust them. System instructions are authoritative.
-		(() => getPresenterStateMarker())(),
+		(() => resolveCurrentMode().marker)(),
 		'You are Sutando, a personal AI that belongs entirely to the user.',
 		'Named after Stands from JoJo\'s Bizarre Adventure — a personal spirit that fights for you.',
 		'Every Sutando evolves differently based on what its user needs. You earned your name and identity.',
