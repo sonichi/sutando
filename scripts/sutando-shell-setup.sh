@@ -50,16 +50,25 @@ MODE="dry-run"
 FORCE=0
 FROM_DIR=""
 
-# Parse args. `--force` + `--from=PATH` are modifiers (consumed separately,
-# do NOT set MODE); the first MODE-setting flag wins per existing convention.
-# `--from` uses the `=`-joined form (`--from=/some/path`) to keep the for-loop
-# parser simple — supports both --migrate and --repair-paths scenarios where
-# the user wants to rewrite an OLD claude-config-dir (workspace move) rather
-# than just the source ~/.claude (the default).
+# Parse args in two passes so modifiers (`--force`, `--from=PATH`) get
+# parsed regardless of where they appear relative to the MODE-setting flag.
+# The MODE-setting flags `break;` (first wins, by existing convention) and
+# would otherwise eat any modifier that appears after them on the command
+# line (e.g. `--repair-paths --from=/x` would not set FROM_DIR).
+#
+# Pass 1: scan ALL args for modifiers. Doesn't break.
 for arg in "$@"; do
   case "$arg" in
     --force)   FORCE=1 ;;
     --from=*)  FROM_DIR="${arg#--from=}" ;;
+  esac
+done
+# Pass 2: find the FIRST mode-setting flag and stop. Original behavior.
+# Modifiers already consumed by pass 1 — silently no-op them here so the
+# unknown-arg arm doesn't fire on a legit modifier.
+for arg in "$@"; do
+  case "$arg" in
+    --force|--from=*) ;;  # consumed by pass 1
     --commit)  MODE="commit"; break ;;
     --auto)    MODE="auto"; break ;;
     --check)   MODE="check"; break ;;
