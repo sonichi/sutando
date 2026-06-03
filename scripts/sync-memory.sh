@@ -205,18 +205,35 @@ fi
 # The same convention is documented in this script's pre-2026-05-11 history
 # ("notes/ bidirectional rsync removed: both nodes now symlink").
 # Workspace resolution goes through the canonical loader (M0 cutover).
+#
+# Helper lookup uses SCRIPT_PARENT (this script's own repo root), NOT
+# $REPO_DIR. They're equal on healthy single-checkout hosts but differ when
+# $SUTANDO_REPO_DIR is set to point at another checkout — most commonly
+# a sutando-plus submodule pin that lags main and is missing the helper
+# entirely. In that case, conditioning the lookup on REPO_DIR false-negatives
+# (helper "not found" at the pin path even though it exists right beside
+# this script) and silently falls through to the L213 legacy default
+# (~/.sutando/workspace/), which is wrong on M0 hosts. Caught 2026-06-03
+# on MBP where SUTANDO_REPO_DIR pointed at the pre-M0 submodule pin and
+# sync-memory was reading the legacy workspace instead of the in-repo one.
+# Anchoring the lookup to SCRIPT_PARENT means it works regardless of
+# REPO_DIR drift — the helper and this script ship in the same commit.
+#
 # Fallback retains the legacy inline default for the rare case where the
-# wrapper isn't present (e.g. extracted-archive install).
-if [ -f "$REPO_DIR/scripts/sutando-config.sh" ]; then
-    WS_DIR="$(bash "$REPO_DIR/scripts/sutando-config.sh" workspace)"
+# wrapper isn't present (e.g. extracted-archive install where SCRIPT_PARENT
+# itself lost the helper).
+if [ -f "$SCRIPT_PARENT/scripts/sutando-config.sh" ]; then
+    WS_DIR="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" workspace)"
 else
     WS_DIR="${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}"
 fi
-# Disambiguation guard: if a host has SUTANDO_WORKSPACE pointing at a public-repo
-# checkout (legacy semantic), the symlink-bootstrap below would point at
-# `<repo>/notes` not the workspace `notes/`. Detect via `.git` presence + skip.
+# Disambiguation guard: if WS_DIR points at a public-repo checkout (a
+# legacy-shaped SUTANDO_WORKSPACE value, or — on truly broken installs —
+# a SCRIPT_PARENT that's a public repo not a workspace), the symlink
+# bootstrap below would write a symlink at `<repo>/notes` not the
+# workspace `notes/`. Detect via `.git` presence at WS_DIR + skip.
 if [ -d "$WS_DIR/.git" ]; then
-    log "skipping workspace-symlink bootstrap: SUTANDO_WORKSPACE='$WS_DIR' looks like a public-repo checkout, not a workspace. Set SUTANDO_WORKSPACE=$HOME/.sutando/workspace per CLAUDE.md and re-run."
+    log "skipping workspace-symlink bootstrap: '$WS_DIR' looks like a public-repo checkout (.git/ present), not a workspace. Run 'bash $SCRIPT_PARENT/scripts/sutando-config.sh workspace' to see the canonical workspace path; unset SUTANDO_WORKSPACE to use the in-repo default."
     WS_DIR=""
 fi
 if [ -n "$WS_DIR" ]; then
