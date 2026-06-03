@@ -21,12 +21,18 @@
 #   bash scripts/sutando-shell-setup.sh --commit       # append to rc file (idempotent)
 #   bash scripts/sutando-shell-setup.sh --auto         # one-shot prompt path used by startup.sh
 #   bash scripts/sutando-shell-setup.sh --check        # exit 0 if alias present + path matches; 1 otherwise
-#   bash scripts/sutando-shell-setup.sh --migrate      # rsync ~/.claude → <workspace>/.claude-sutando (idempotent, non-destructive)
+#   bash scripts/sutando-shell-setup.sh --import       # rsync ~/.claude → <workspace>/.claude-sutando (idempotent, non-destructive)
 #   bash scripts/sutando-shell-setup.sh --repair-paths # re-pin hardcoded SOURCE_DIR paths in runtime files to CLAUDE_DIR (idempotent)
+#
+# Deprecated aliases (kept for one release):
+#   --migrate      # alias for --import; emits a stderr deprecation warning. Per
+#                  # `feedback_import_not_migrate`: "import" describes the
+#                  # actual non-destructive-copy semantic; "migrate" implied a
+#                  # one-way structural change.
 #
 # Modifier flags (can combine with any MODE-setting flag):
 #   --force         # override the "user-defined claude-sutando() function detected" guard in --commit
-#   --from=<PATH>   # for --migrate / --repair-paths: ALSO rewrite this OLD claude-config-dir
+#   --from=<PATH>   # for --import / --repair-paths: ALSO rewrite this OLD claude-config-dir
 #                   # location (in addition to the default SOURCE_CLAUDE_CONFIG_DIR / ~/.claude).
 #                   # Use when the workspace was moved: previously-rewritten paths point at the
 #                   # old workspace's .claude-sutando; --from re-pins them to the current target.
@@ -49,6 +55,14 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MODE="dry-run"
 FORCE=0
 FROM_DIR=""
+# INVOKED_AS — the literal flag the user passed for the MODE-setting choice.
+# Used in status messages so they echo back what the user typed (e.g. when
+# `--migrate` is the deprecated alias, we still say "sutando-shell-setup
+# --migrate: done." rather than the canonical name they didn't use).
+INVOKED_AS=""
+# Deprecation tracking — set when a deprecated alias was used so the case-arm
+# can print a single stderr warning on top of the normal flow.
+DEPRECATED_FLAG_MIGRATE=0
 
 # Parse args in two passes so modifiers (`--force`, `--from=PATH`) get
 # parsed regardless of where they appear relative to the MODE-setting flag.
@@ -69,11 +83,14 @@ done
 for arg in "$@"; do
   case "$arg" in
     --force|--from=*) ;;  # consumed by pass 1
-    --commit)  MODE="commit"; break ;;
-    --auto)    MODE="auto"; break ;;
-    --check)   MODE="check"; break ;;
-    --migrate) MODE="migrate"; break ;;
-    --repair-paths) MODE="repair-paths"; break ;;
+    --commit)  MODE="commit"; INVOKED_AS="--commit"; break ;;
+    --auto)    MODE="auto"; INVOKED_AS="--auto"; break ;;
+    --check)   MODE="check"; INVOKED_AS="--check"; break ;;
+    --import)  MODE="import"; INVOKED_AS="--import"; break ;;
+    # Deprecated 1-release alias for --import (per `feedback_import_not_migrate`).
+    # Routes to the same case-arm + sets the deprecation-warning flag.
+    --migrate) MODE="import"; INVOKED_AS="--migrate"; DEPRECATED_FLAG_MIGRATE=1; break ;;
+    --repair-paths) MODE="repair-paths"; INVOKED_AS="--repair-paths"; break ;;
     --help|-h)
       sed -n '1,40p' "$0" | grep -E '^#' | sed 's/^# *//'
       exit 0
@@ -83,7 +100,7 @@ for arg in "$@"; do
 done
 
 # Resolve THIS repo's target path via the config loader. Used for --check
-# (smoke-test that THIS checkout resolves cleanly) and for --migrate. The
+# (smoke-test that THIS checkout resolves cleanly) and for --import. The
 # function we install below does its own per-invocation resolve based on the
 # caller's cwd, so this CLAUDE_DIR isn't baked into the rc file — multiple
 # Sutando checkouts on the same machine each map to their own .claude-sutando.
@@ -222,7 +239,7 @@ user_defined_function_present() {
 }
 
 # Helper: rewrite hardcoded SOURCE_DIR/ → CLAUDE_DIR/ in runtime-critical
-# files under CLAUDE_DIR. Shared by --migrate (post-rsync) and --repair-paths
+# files under CLAUDE_DIR. Shared by --import (post-rsync) and --repair-paths
 # (standalone re-pin without rsync — useful when the workspace moves).
 #
 # Why an allowlist (+globbed patterns) instead of recursive sed:
@@ -526,7 +543,16 @@ EOF
     exit 0
     ;;
 
-  migrate)
+  import)
+    # Deprecation warning for the legacy alias --migrate. Per
+    # `feedback_import_not_migrate`: the rename happened because "migrate"
+    # implied a one-way structural change; the actual semantic is a
+    # non-destructive copy with source preserved (= "import"). Keep the
+    # alias working for one release; users get a single stderr nudge.
+    if [ "$DEPRECATED_FLAG_MIGRATE" = "1" ]; then
+      echo "⚠ --migrate is deprecated, use --import instead. (Behavior is identical.)" >&2
+      echo "  The --migrate alias will be removed in a future release." >&2
+    fi
     # Mirror ~/.claude → $CLAUDE_DIR via rsync. Non-destructive: source stays
     # intact so manual `claude` (without the alias) keeps working against the
     # original tree. Idempotent: rsync -a only re-copies changed files based
@@ -546,12 +572,12 @@ EOF
     # Companion to CLAUDE_CONFIG_DIR (the destination where Sutando writes to).
     SOURCE_DIR="${SOURCE_CLAUDE_CONFIG_DIR:-$HOME/.claude}"
     if [ ! -d "$SOURCE_DIR" ]; then
-      echo "sutando-shell-setup --migrate: source $SOURCE_DIR doesn't exist; nothing to copy" >&2
+      echo "sutando-shell-setup $INVOKED_AS: source $SOURCE_DIR doesn't exist; nothing to copy" >&2
       echo "  (set SOURCE_CLAUDE_CONFIG_DIR to override the migration source location)" >&2
       exit 1
     fi
     if ! command -v rsync >/dev/null 2>&1; then
-      echo "sutando-shell-setup --migrate: rsync not found on PATH; install it or copy manually" >&2
+      echo "sutando-shell-setup $INVOKED_AS: rsync not found on PATH; install it or copy manually" >&2
       exit 1
     fi
 
@@ -618,7 +644,7 @@ EOF
       --exclude='*.pid'
     )
 
-    echo "sutando-shell-setup --migrate"
+    echo "sutando-shell-setup $INVOKED_AS"
     echo "  Source           : $SOURCE_DIR"
     echo "  Target           : $CLAUDE_DIR"
     echo "  Mode             : non-destructive copy (source preserved)"
@@ -656,7 +682,7 @@ EOF
     # which fails on macOS's stock bash 3.2).
     reply_lc="$(printf '%s' "$reply" | tr '[:upper:]' '[:lower:]')"
     if [ "$reply_lc" != "y" ]; then
-      echo "sutando-shell-setup --migrate: aborted by user"
+      echo "sutando-shell-setup $INVOKED_AS: aborted by user"
       exit 2
     fi
 
@@ -673,7 +699,7 @@ EOF
     _rewrite_runtime_paths
 
     echo
-    echo "sutando-shell-setup --migrate: done."
+    echo "sutando-shell-setup $INVOKED_AS: done."
     echo "  ${SOURCE_DIR} is unchanged. To prune later, verify the new tree works first, then:"
     echo "    rm -rf '${SOURCE_DIR}/projects/${THIS_PROJECT_SLUG}/'  # only this project's slug"
     # Mini PR #1415 review #4: channels/*/*.env were intentionally NOT copied
@@ -697,14 +723,14 @@ EOF
     # Standalone path re-pin. Runs ONLY the sed pass — no rsync, no project
     # discovery, no preview/confirm. Use case: workspace moved (mv / rename /
     # config-driven relocate) and previously-rewritten paths in the migrated
-    # tree are now stale. Re-running --migrate would be heavy (full rsync from
+    # tree are now stale. Re-running --import would be heavy (full rsync from
     # ~/.claude) and unnecessary if no source-side changes have happened.
     #
     # Also useful immediately after upgrading to a version of this script that
     # adds the rewrite pass — re-pins a previously-migrated tree without a
     # fresh rsync.
     if [ ! -d "$CLAUDE_DIR" ]; then
-      echo "sutando-shell-setup --repair-paths: target $CLAUDE_DIR doesn't exist; run --migrate first" >&2
+      echo "sutando-shell-setup --repair-paths: target $CLAUDE_DIR doesn't exist; run --import first" >&2
       exit 1
     fi
     echo "sutando-shell-setup --repair-paths"
