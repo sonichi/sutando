@@ -192,24 +192,33 @@ legacy_alias_present() {
   [ -f "$RC_FILE" ] && grep -qE '^alias claude-sutando=' "$RC_FILE"
 }
 
-# Helper: detect a user-defined `claude-sutando()` function OUTSIDE our
+# Helper: detect a user-defined `claude-sutando` function OUTSIDE our
 # managed marker block. Set up because --commit otherwise appends the
 # managed block alongside any pre-existing function, and bash's
 # last-definition-wins makes the user's function dead code with no warning
-# (Mini PR #1415 review #6 → issue #1418). Awk strips the managed block
-# first, then greps the remainder for a function definition.
+# (Mini PR #1415 review #6 → issue #1418).
 #
-# Match shape: `claude-sutando()` or `claude-sutando ()` at start of line.
-# Doesn't catch `function claude-sutando { ... }` (less common); add if it
-# bites someone. Doesn't catch one-liner `claude-sutando() { … }` — same
-# regex matches the prefix anyway.
+# Per Mini PR #1424 review #3: regex expanded to catch all common
+# function-definition shapes, including the `function NAME { ... }`
+# syntax and leading-whitespace variants:
+#   - `claude-sutando()`              (POSIX function, column 0)
+#   - `  claude-sutando()`            (leading whitespace — common in
+#                                       rc-files with conditional blocks)
+#   - `claude-sutando ()`             (space before parens)
+#   - `function claude-sutando`       (keyword form, no parens)
+#   - `function claude-sutando {`     (keyword form, brace on same line)
+#   - `function claude-sutando () {`  (keyword form + parens)
+#   - leading-whitespace variants of any of the above
+#
+# Awk strips the managed block first so we don't false-positive on our
+# own injected function. Grep alternation covers both shapes.
 user_defined_function_present() {
   [ -f "$RC_FILE" ] || return 1
   awk -v b="$MARKER_BEGIN" -v e="$MARKER_END" '
     $0 == b { inblk=1; next }
     $0 == e { inblk=0; next }
     !inblk { print }
-  ' "$RC_FILE" | grep -qE '^claude-sutando[[:space:]]*\(\)'
+  ' "$RC_FILE" | grep -qE '^[[:space:]]*(claude-sutando[[:space:]]*\(\)|function[[:space:]]+claude-sutando([[:space:]]|\(|\{|$))'
 }
 
 # Helper: rewrite hardcoded SOURCE_DIR/ → CLAUDE_DIR/ in runtime-critical
@@ -430,22 +439,35 @@ EOF
     mkdir -p "$CLAUDE_DIR"
 
     # Mini PR #1415 review #6 → issue #1418: refuse if a user-defined
-    # `claude-sutando()` function exists OUTSIDE our managed block. Without
+    # `claude-sutando` function exists OUTSIDE our managed block. Without
     # this guard, --commit appends our managed block alongside the user's
     # function — bash's last-definition-wins makes their function dead code
     # silently. `--force` overrides for users who explicitly want our block
-    # to win.
-    if user_defined_function_present && [ "$FORCE" != "1" ]; then
-      echo "sutando-shell-setup: refusing to overwrite — $RC_FILE already contains a user-defined" >&2
-      echo "  \`claude-sutando()\` function outside the managed marker block." >&2
-      echo "  Adding our managed block here would make your function dead code" >&2
-      echo "  (last definition wins in bash; the managed block goes after)." >&2
-      echo "" >&2
-      echo "  Options:" >&2
-      echo "    1. Remove your existing claude-sutando() definition from $RC_FILE, then re-run." >&2
-      echo "    2. Pass --force to commit the managed block anyway (your function will be shadowed)." >&2
-      echo "    3. Leave as-is if your function does what you want; --commit isn't required." >&2
-      exit 1
+    # to win — BUT prints an explicit "OVERWRITING" warning so a user who
+    # passed --force without thinking about the consequence sees what's
+    # about to happen (Mini PR #1424 review #3).
+    if user_defined_function_present; then
+      if [ "$FORCE" != "1" ]; then
+        echo "sutando-shell-setup: refusing to overwrite — $RC_FILE already contains a user-defined" >&2
+        echo "  \`claude-sutando\` function outside the managed marker block." >&2
+        echo "  Adding our managed block here would make your function dead code" >&2
+        echo "  (last definition wins in bash; the managed block goes after)." >&2
+        echo "" >&2
+        echo "  Options:" >&2
+        echo "    1. Remove your existing claude-sutando definition from $RC_FILE, then re-run." >&2
+        echo "    2. Pass --force to commit the managed block anyway (your function will be shadowed)." >&2
+        echo "    3. Leave as-is if your function does what you want; --commit isn't required." >&2
+        exit 1
+      else
+        # --force was passed. Print an explicit overwrite warning so the
+        # consequence is on-screen, not buried in a man-page.
+        echo "sutando-shell-setup: ⚠ --force — OVERWRITING user-defined claude-sutando function" >&2
+        echo "  in $RC_FILE. Your function will be DEAD CODE after this commit (the managed" >&2
+        echo "  block is appended after yours; bash's last-definition-wins resolves to ours)." >&2
+        echo "  If this wasn't intended: Ctrl+C now, remove --force, and read the refusal" >&2
+        echo "  message for the 3 options. Continuing in 2s if no interrupt..." >&2
+        sleep 2 2>/dev/null || true
+      fi
     fi
 
     # Apply (idempotent): handles four states.
