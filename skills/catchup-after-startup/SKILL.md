@@ -18,6 +18,7 @@ Optional first arg is an hour window for time-bounded sections (default 3). `/ca
 
 ## What it pulls together
 
+0. **Relay notes from prior session(s)** — `workspace/relay/relay-*.md` (written by `/relay`). **Read FIRST** because the narrative continuity encodes intent + judgment the structured snapshot below can't carry. See the §Relay-note read-and-archive flow below for details.
 1. **Last session checkpoint** — `session-state.md` (written by `src/session-handoff.sh` on context compaction)
 2. **Open PRs** — `gh pr list --author liususan091219 --state open`
 3. **In-flight tasks** — `workspace/tasks/task-*.txt`
@@ -31,12 +32,34 @@ Optional first arg is an hour window for time-bounded sections (default 3). `/ca
 
 Sections that come up empty print a short "(none)" rather than getting dropped, so it's obvious whether nothing happened vs whether the lookup failed.
 
+## Relay-note read-and-archive flow
+
+The relay folder layout (mirrors `workspace/tasks/` + `workspace/results/`):
+
+```
+workspace/relay/
+├── relay-{epoch}.md       # pending — written by /relay during prior session(s)
+└── processed/
+    └── relay-{epoch}.md   # archived after this catchup invocation reads them
+```
+
+**Catchup-after-startup MUST:**
+
+1. `mkdir -p "$WORKSPACE/relay/processed"` (idempotent — handles first-ever invocation).
+2. List `"$WORKSPACE/relay/"relay-*.md` in mtime order (oldest first). Skip the `processed/` subdirectory.
+3. For each unprocessed file, in order:
+   - Print it verbatim under a "📡 Relay note from prior session" header, before any of the structured sections (1-10) below.
+   - `mv` it to `"$WORKSPACE/relay/processed/$(basename "$file")"` after reading. This mirrors the result-watcher drain pattern (read → archive → leave processed/ as the audit trail).
+4. If no unprocessed relay files exist, print "(no relay notes from prior session — consider invoking /relay before ending sessions going forward)" under the same header and proceed to section 1.
+
+The relay-read step is INSIDE catchup's bash script (`scripts/catchup-after-startup.sh`) for atomicity — the read + archive happen in one pass so two concurrent catchups can't both consume the same file.
+
 ## Steps
 
 1. Run `bash scripts/catchup-after-startup.sh [hours]`. Defaults to a 3-hour window via `CATCHUP_HOURS=3`.
-2. Read the output into the conversation context. Do NOT discard sections silently — they shape decisions made next (which PR to push, which task is stale, which channel the conversation was in).
+2. Read the output into the conversation context. Do NOT discard sections silently — they shape decisions made next (which PR to push, which task is stale, which channel the conversation was in). **Read the relay note FIRST and treat it as the narrative ground truth before validating against the structured snapshot.**
 3. If the user's first prompt references something the catchup briefing doesn't cover (e.g. "what happened yesterday"), widen the window: `/catchup-after-startup 24` and re-read.
-4. Cite specific recovered items as the basis for the next action (e.g. "Per the briefing, PR #1051 is open with a review from qingyun — addressing first.").
+4. Cite specific recovered items as the basis for the next action (e.g. "Per the relay note, PR #1051 was just merged and the next step is X — addressing that first.").
 
 ## Setup (one-time, recommended)
 
