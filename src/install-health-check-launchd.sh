@@ -13,10 +13,12 @@
 #     ~/Library/LaunchAgents/com.sutando.health-check-fallback.plist
 #   - Loads it via `launchctl bootstrap gui/$UID` (the modern Sequoia idiom).
 #   - Result: macOS runs `python3 src/health-check.py --emit-task
-#     --notify-on-fail --quiet` every 5min, independent of any other Sutando
-#     process. Failures surface as tasks (for the agent to act on) AND as
-#     macOS notifications (so the human sees them even if all of Sutando is
-#     dead).
+#     --notify-on-fail --notify-slack --quiet` every 5min, independent of any
+#     other Sutando process. Failures surface as tasks (for the agent to act
+#     on), macOS notifications (so the human sees them even if all of Sutando
+#     is dead), AND a direct Slack DM to the owner (remote-visible self-report
+#     for outages — fires even when the core loop is wedged). The Slack DM
+#     no-ops if no token / owner is configured.
 #
 # What the user sees first time they install:
 #   - One macOS "Background Item Added" notification banner (Apple's own UX,
@@ -125,6 +127,7 @@ case "$cmd" in
         echo
         echo "Sutando — Health Check (fallback) is now running every 5min."
         echo "  • Failures fire macOS notifications + write tasks/task-health-*.txt"
+        echo "  • Plus a Slack DM to the owner if SLACK_BOT_TOKEN (.env) + access.json are set"
         echo "  • View status:  bash $0 --status"
         echo "  • Uninstall:    bash $0 --uninstall"
         echo "  • Disable temporarily: System Settings → General → Login Items"

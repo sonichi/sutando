@@ -280,10 +280,20 @@ def tofu_onboard(user_id: str, username: str | None) -> set:
 
 
 # Track which Slack channel/thread to reply into for each task we wrote.
-# Keyed by task_id; value is {channel, thread_ts} so we can reply in-thread
-# for @mentions and at top-level for DMs.
+# Keyed by task_id; value is {channel, thread_ts, submitted_at, timed_out}
+# so we can reply in-thread for @mentions and at top-level for DMs, and so
+# the result_watcher can detect tasks the core never answered.
 pending_replies: dict[str, dict] = {}
 pending_replies_lock = threading.Lock()
+
+# Per-task timeout. Mirrors task-bridge.ts's DEFAULT_TASK_TIMEOUT_MS (10 min):
+# if the core session wedges (e.g. hits the 1M-context usage-credit gate and
+# loops on the API error), no result file is ever written and the Slack user
+# gets silence. After this many seconds we post a one-time "still working /
+# may have hit a limit" reply so the failure is visible instead of silent.
+# The pending entry is KEPT after notifying, so if the core later recovers and
+# writes a result, the real answer still gets delivered. 0 disables.
+TASK_TIMEOUT_SEC = int(os.environ.get("SLACK_TASK_TIMEOUT_SEC", "600"))
 
 # Username cache — users.info is rate-limited (Tier 4 = 100/min). One
 # cache lookup per known user saves a network hop on every DM. Cache
@@ -443,7 +453,12 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         f"priority: {priority}\n"
     )
     with pending_replies_lock:
-        pending_replies[task_id] = {"channel": channel, "thread_ts": thread_ts}
+        pending_replies[task_id] = {
+            "channel": channel,
+            "thread_ts": thread_ts,
+            "submitted_at": time.time(),
+            "timed_out": False,
+        }
 
     global _event_count
     with _event_count_lock:
@@ -620,12 +635,53 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
                 pass
 
 
+def _check_task_timeouts() -> None:
+    """Post a one-time reply for tasks the core never answered in time.
+
+    Without this, a wedged core session (e.g. stuck looping on the
+    1M-context usage-credit API error) leaves the Slack task orphaned in
+    pending_replies forever — the user just sees silence. We mark the entry
+    `timed_out` (so we notify at most once) but DO NOT pop it: if the core
+    later recovers and writes results/<task_id>.txt, the normal reply path
+    still delivers the real answer.
+    """
+    if TASK_TIMEOUT_SEC <= 0:
+        return
+    now = time.time()
+    to_notify = []
+    with pending_replies_lock:
+        for task_id, info in pending_replies.items():
+            if info.get("timed_out"):
+                continue
+            if now - info.get("submitted_at", now) > TASK_TIMEOUT_SEC:
+                info["timed_out"] = True
+                to_notify.append((task_id, info["channel"], info.get("thread_ts")))
+    if not to_notify:
+        return
+    mins = TASK_TIMEOUT_SEC // 60
+    msg = (
+        f":hourglass_flowing_sand: Still working on this — it's been over "
+        f"{mins} min with no result. The core session may have hit a context "
+        f"or usage-credit limit (check the Sutando CLI / `/usage-credits`). "
+        f"I'll still post the answer here if it finishes."
+    )
+    for task_id, channel, thread_ts in to_notify:
+        try:
+            _send_reply(channel, thread_ts, msg, task_id=task_id)
+            print(f"  [timeout] notified Slack for {task_id} after {TASK_TIMEOUT_SEC}s", flush=True)
+        except Exception as e:
+            print(f"[Slack] timeout notify failed for {task_id}: {e}", flush=True)
+
+
 def result_watcher():
     """Background thread: polls results/ for replies + proactive messages."""
     heartbeat_file = REPO / "state" / "slack-bridge.heartbeat"
     last_heartbeat = 0.0
     while True:
         try:
+            # Surface tasks the core never answered (timeout → visible reply).
+            _check_task_timeouts()
+
             # Replies to pending tasks
             with pending_replies_lock:
                 pending_ids = list(pending_replies.keys())

@@ -8,6 +8,7 @@ Usage:
   python3 src/health-check.py --fix            # attempt to fix issues
   python3 src/health-check.py --emit-task      # write tasks/task-health-*.txt on failure
   python3 src/health-check.py --notify-on-fail # macOS notification on failure
+  python3 src/health-check.py --notify-slack   # DM the owner on Slack on failure (remote, core-independent)
 
 Checks:
   - macOS TCC Documents-folder access (when repo is under ~/Documents)
@@ -24,6 +25,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -1310,11 +1312,173 @@ def notify_for_failures(
         pass
 
 
+def _slack_failures(checks: list[dict]) -> list[dict]:
+    """Failures worth a remote owner DM.
+
+    Same hard-failure statuses as notify_for_failures, but drops benign
+    on-demand `warn`s (e.g. discord-voice / conversation-server "not running
+    (on-demand)") — those are the steady state for per-session processes and
+    would spam the owner's DM every cooldown window. The signals that matter
+    for a remote watchdog (stuck core-proactive-loop, task-queue pileup, a
+    bridge that's actually down) all survive this filter.
+    """
+    out = []
+    for c in checks:
+        st = c["status"]
+        if st in ("down", "missing", "not_loaded", "fail", "stale"):
+            out.append(c)
+        elif st == "warn" and "on-demand" not in (c.get("detail") or ""):
+            out.append(c)
+    return out
+
+
+def _slack_token_from_env_file() -> str:
+    """Read SLACK_BOT_TOKEN from $REPO/.env. The launchd-supervised fallback
+    runs with a minimal environment (no sourced .env), so $SLACK_BOT_TOKEN is
+    usually absent there — but the bridge keeps it in .env. Reading the file
+    directly keeps the watchdog self-sufficient without putting the secret in
+    the world-readable LaunchAgents plist. Returns "" if absent/unreadable."""
+    env_path = REPO_DIR / ".env"
+    try:
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("SLACK_BOT_TOKEN="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return ""
+
+
+def _slack_owner_creds() -> "tuple[str, str] | None":
+    """Return (bot_token, owner_user_id) for a direct Slack DM, or None.
+
+    Token from $SLACK_BOT_TOKEN (same one the slack bridge uses), falling back
+    to $REPO/.env for the minimal-env launchd path; owner from
+    ~/.claude/channels/slack/access.json (`tofuOwner`, else first `allowFrom`).
+    Both must be present — otherwise there's no one to DM.
+    """
+    token = os.environ.get("SLACK_BOT_TOKEN", "").strip() or _slack_token_from_env_file()
+    if not token:
+        return None
+    access = Path.home() / ".claude" / "channels" / "slack" / "access.json"
+    try:
+        data = json.loads(access.read_text())
+    except Exception:
+        return None
+    owner = data.get("tofuOwner")
+    if not owner:
+        allow = data.get("allowFrom") or []
+        owner = allow[0] if allow else None
+    if not owner:
+        return None
+    return token, owner
+
+
+def _slack_api(token: str, method: str, payload: dict) -> dict:
+    """Minimal Slack Web API POST via urllib (no slack_bolt dependency, so
+    this works in the launchd-supervised fallback even if the bridge venv
+    isn't on the path). Returns the parsed JSON response."""
+    req = urllib.request.Request(
+        f"https://slack.com/api/{method}",
+        data=json.dumps(payload).encode(),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read())
+
+
+def _default_slack_sender(text: str) -> bool:
+    """Open a DM to the owner and post `text`. Returns True on success."""
+    creds = _slack_owner_creds()
+    if not creds:
+        return False
+    token, owner = creds
+    try:
+        opened = _slack_api(token, "conversations.open", {"users": owner})
+        if not opened.get("ok"):
+            return False
+        channel = opened["channel"]["id"]
+        posted = _slack_api(token, "chat.postMessage", {"channel": channel, "text": text})
+        return bool(posted.get("ok"))
+    except Exception:
+        return False
+
+
+def notify_slack_for_failures(
+    checks: list[dict],
+    state_file: Optional[Path] = None,
+    sender=None,
+) -> None:
+    """DM the owner on Slack when health checks fail — a remote-visible
+    surface that does NOT depend on the core agent being alive.
+
+    This is the watchdog the owner asked for: when the core session wedges
+    (e.g. loops on the 1M-context usage-credit API error), `core-heartbeat`
+    keeps beating from its own background process, so `_any_core_alive()`
+    stays True and `emit_task_for_failures` stays silent — but the
+    `core-proactive-loop` check flips to `warn` and this DMs Slack anyway.
+    Deliberately NOT gated on core liveness, for exactly that reason.
+
+    Same dedup contract as notify_for_failures (per-failure-set hash, 1h
+    cooldown) but a separate state file so the Slack and macOS surfaces never
+    suppress each other. The dedup hash is recorded only on a SUCCESSFUL send,
+    so a transient Slack/API outage doesn't silence the alert for an hour.
+    `sender` is injected by tests to avoid real API calls.
+    """
+    failures = _slack_failures(checks)
+    if not failures:
+        return
+
+    if state_file is None:
+        state_file = WORKSPACE_DIR / "state" / "health-last-slacked.json"
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    set_key = "|".join(sorted(c["name"] for c in failures))
+    hash_key = hashlib.sha256(set_key.encode()).hexdigest()[:16]
+    now_ms = int(time.time() * 1000)
+    cooldown_ms = 3600 * 1000  # 1h — matches the macOS + emit-task surfaces
+
+    history: dict = {}
+    try:
+        if state_file.exists():
+            history = json.loads(state_file.read_text())
+    except Exception:
+        history = {}
+
+    if now_ms - history.get(hash_key, 0) < cooldown_ms:
+        return
+
+    lines = [f"• {c['name']}: {c['status']} ({c['detail']})" for c in failures[:5]]
+    extra = f"\n…(+{len(failures) - 5} more)" if len(failures) > 5 else ""
+    text = (
+        f":rotating_light: *Sutando health check* — {len(failures)} issue(s):\n"
+        + "\n".join(lines)
+        + extra
+    )
+
+    send = sender or _default_slack_sender
+    if not send(text):
+        # Send failed — don't record dedup, so the next tick retries.
+        return
+
+    history[hash_key] = now_ms
+    cutoff = now_ms - (24 * 3600 * 1000)
+    history = {k: v for k, v in history.items() if v >= cutoff}
+    try:
+        state_file.write_text(json.dumps(history))
+    except Exception:
+        pass
+
+
 def main():
     as_json = "--json" in sys.argv
     do_fix = "--fix" in sys.argv
     do_emit = "--emit-task" in sys.argv
     do_notify = "--notify-on-fail" in sys.argv
+    do_notify_slack = "--notify-slack" in sys.argv
     quiet = "--quiet" in sys.argv or "-q" in sys.argv
 
     checks = run_all_checks()
@@ -1328,6 +1492,14 @@ def main():
     # can suppress the other.
     if do_notify:
         notify_for_failures(checks)
+
+    # Optional: remote Slack DM surface. Unlike --notify-on-fail (local
+    # macOS notification) and --emit-task (needs a live core to read the
+    # task), this reaches the owner off-machine and fires even when the core
+    # session is wedged but its heartbeat process still ticks. Intended for
+    # the launchd-supervised fallback invocation so outages self-report.
+    if do_notify_slack:
+        notify_slack_for_failures(checks)
 
     # Emit-task: when NOT running --fix, the initial check IS the residual,
     # so emit here BEFORE the early-exit paths (--json return, --quiet
