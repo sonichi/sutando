@@ -30,6 +30,11 @@ import urllib.request
 from pathlib import Path
 from typing import Optional
 
+try:
+    import fcntl  # POSIX file locking for the recovery critical section
+except ImportError:  # non-POSIX (e.g. Windows) — the lock degrades to a no-op
+    fcntl = None
+
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 from util_paths import shared_personal_path  # noqa: E402
@@ -1514,13 +1519,23 @@ def notify_slack_for_failures(
 #   - Fires only on a CONFIRMED, SUSTAINED wedge: core process alive AND the
 #     oldest queued task older than RECOVER_WEDGE_SEC AND the core didn't just
 #     boot — observed on two passes ≥ RECOVER_CONFIRM_SEC apart. Never a blip.
-#   - RECOVER_COOLDOWN_SEC between restarts.
+#   - Identity + progress gating (so a legitimately long-running single task is
+#     not killed mid-work): the SAME oldest task must persist across the window
+#     (a draining queue surfaces a different oldest each pass → resets) AND
+#     core-status.json must not advance (a core making progress isn't wedged).
+#     Residual: a long single task that NEVER updates its status is still
+#     indistinguishable from a wedge by external signals — bounded by the
+#     cooldown + give-up cap, and such tasks should heartbeat core-status.json.
+#   - RECOVER_COOLDOWN_SEC between restarts; an exclusive flock on the state
+#     file serializes the decision so a manual + launchd run can't double-fire.
 #   - Hard cap of RECOVER_MAX_PER_HOUR; past that it DMs "giving up" and stops,
 #     so a pathological wedge can't become a restart loop.
 #   - Graceful degradation: the FIRST restart of an episode keeps 1M; if the
 #     wedge recurs (the 1M restart didn't hold), the next restart pins
 #     SUTANDO_CORE_MODEL=opus (standard 200K) so the agent keeps WORKING.
-#   - DMs the owner before each restart, so recovery is never itself silent.
+#   - DMs the owner before each restart and records whether the DM succeeded
+#     (last_restart_dm_sent) + logs failures, so a restart is never invisible
+#     even if Slack is down — recovery still proceeds (recovery > notification).
 #
 # All side-effecting collaborators are injectable so the escalation / cooldown
 # / give-up logic is unit-tested without real restarts or Slack calls. Only
@@ -1534,14 +1549,22 @@ RECOVER_COOLDOWN_SEC = int(os.environ.get("SUTANDO_RECOVER_COOLDOWN_SEC", "1800"
 RECOVER_MAX_PER_HOUR = int(os.environ.get("SUTANDO_RECOVER_MAX_PER_HOUR", "3"))
 
 
-def _oldest_pending_task_age(now: float, tasks_dir: Optional[Path] = None) -> "int | None":
-    """Age in seconds of the oldest top-level tasks/*.txt, or None if the queue
-    is empty. Mirrors check_task_queue's globbing (top-level only; archive/
-    excluded). This is the precise wedge signal for recovery: a healthy core
-    drains a task in seconds-to-minutes, so a task sitting for RECOVER_WEDGE_SEC
-    while the core process is alive means the core is stuck — regardless of what
-    core-status.json last said (check_core_proactive_loop misses a wedge that
-    happens while status reads 'idle', because it only flags 'running')."""
+def _oldest_pending_task(now: float, tasks_dir: Optional[Path] = None) -> "tuple[str, int] | None":
+    """(identity, age_seconds) of the oldest top-level tasks/*.txt, or None if
+    the queue is empty. Mirrors check_task_queue's globbing (top-level only;
+    archive/ excluded). This is the precise wedge signal for recovery: a healthy
+    core drains a task in seconds-to-minutes, so a task sitting for
+    RECOVER_WEDGE_SEC while the core process is alive means the core is stuck —
+    regardless of what core-status.json last said (check_core_proactive_loop
+    misses a wedge that happens while status reads 'idle', because it only flags
+    'running').
+
+    The identity is `"<name>|<int(mtime)>"`. Recovery requires the SAME identity
+    to persist across the confirm window before restarting (PR #1428 review,
+    blocker 3): if the oldest task changes (a task drained → a different oldest)
+    or its mtime moves (the file was rewritten/reprocessed), the queue is
+    draining, not wedged, and the observation resets — so a busy-but-healthy
+    backlog never triggers a restart."""
     if tasks_dir is None:
         tasks_dir = WORKSPACE_DIR / "tasks"
     try:
@@ -1551,10 +1574,29 @@ def _oldest_pending_task_age(now: float, tasks_dir: Optional[Path] = None) -> "i
     if not files:
         return None
     try:
-        oldest = min(f.stat().st_mtime for f in files)
+        oldest = min(files, key=lambda p: p.stat().st_mtime)
+        mtime = oldest.stat().st_mtime
     except OSError:
         return None
-    return int(now - oldest)
+    return (f"{oldest.name}|{int(mtime)}", int(now - mtime))
+
+
+def _core_status_ts(workspace: Optional[Path] = None) -> "float | None":
+    """Current core-status.json `ts`, or None if unavailable. Used as a
+    progress signal: a core actively working (even a long single task that
+    periodically updates status per CLAUDE.md) advances this; a core looping on
+    the usage-credit API error cannot complete a turn to update it. If it
+    advances across the confirm window, recovery treats the core as making
+    progress and resets — so legitimately long work isn't restarted out from
+    under itself (PR #1428 review, blocker 3)."""
+    if workspace is None:
+        workspace = WORKSPACE_DIR
+    try:
+        data = json.loads(status_read_path("core-status.json", workspace).read_text())
+        ts = data.get("ts")
+        return ts if isinstance(ts, (int, float)) else None
+    except Exception:
+        return None
 
 
 def _core_started_within(seconds: float, workspace: Optional[Path] = None, now: Optional[float] = None) -> bool:
@@ -1613,7 +1655,8 @@ def recover_core_if_wedged(
     state_file: Optional[Path] = None,
     now: Optional[float] = None,
     alive_fn=None,
-    oldest_age_fn=None,
+    oldest_task_fn=None,
+    status_ts_fn=None,
     just_booted_fn=None,
     restart_fn=None,
     sender=None,
@@ -1622,106 +1665,173 @@ def recover_core_if_wedged(
     describing the action taken (for tests / observability), or None when no
     action was warranted. See the module comment above for the guard rationale.
     All side-effecting collaborators are injectable for tests.
+
+    The whole load→decide→restart→save sequence runs under an exclusive,
+    non-blocking flock on `<state_file>.lock` (PR #1428 review, suggestion):
+    a manual `--recover-core` from the CLI and the launchd job firing in the
+    same window must not both clear the cooldown and issue duplicate restarts.
+    A second concurrent invocation returns {"action": "locked"} and no-ops.
     """
     if now is None:
         now = time.time()
     if state_file is None:
         state_file = WORKSPACE_DIR / "state" / "core-recovery.json"
     alive_fn = alive_fn or _any_core_alive
-    oldest_age_fn = oldest_age_fn or (lambda: _oldest_pending_task_age(now))
+    oldest_task_fn = oldest_task_fn or (lambda: _oldest_pending_task(now))
+    status_ts_fn = status_ts_fn or _core_status_ts
     just_booted_fn = just_booted_fn or (lambda: _core_started_within(RECOVER_WEDGE_SEC, now=now))
     restart_fn = restart_fn or _default_core_restart
     send = sender or _default_slack_sender
 
     try:
-        state = json.loads(state_file.read_text()) if state_file.exists() else {}
+        state_file.parent.mkdir(parents=True, exist_ok=True)
     except Exception:
-        state = {}
-    if not isinstance(state, dict):
-        state = {}
+        pass
 
-    def _save():
+    # Serialize the critical section (suggestion: no concurrent double-restart).
+    lock_path = state_file.with_name(state_file.name + ".lock")
+    lock_fh = None
+    if fcntl is not None:
         try:
-            state_file.parent.mkdir(parents=True, exist_ok=True)
-            state_file.write_text(json.dumps(state))
+            lock_fh = open(lock_path, "w")
+            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            # Another recovery invocation holds the lock — skip this pass.
+            if lock_fh is not None:
+                lock_fh.close()
+            return {"action": "locked"}
+
+    try:
+        try:
+            state = json.loads(state_file.read_text()) if state_file.exists() else {}
         except Exception:
-            pass
+            state = {}
+        if not isinstance(state, dict):
+            state = {}
 
-    oldest_age = oldest_age_fn()
-    wedged = (
-        alive_fn()
-        and oldest_age is not None
-        and oldest_age > RECOVER_WEDGE_SEC
-        and not just_booted_fn()
-    )
+        def _save():
+            try:
+                state_file.write_text(json.dumps(state))
+            except Exception:
+                pass
 
-    if not wedged:
-        # Healthy (or no queued work / core down / just booted). Clear the
-        # in-progress wedge observation so a future wedge starts its
-        # confirmation window fresh. last_restart / history are preserved.
-        if state.get("wedge_first_seen"):
+        def _reset_observation():
             state["wedge_first_seen"] = 0
-            _save()
-        return None
+            state["wedge_task"] = None
+            state["wedge_status_ts"] = None
 
-    # Confirmation window: require the wedge to persist across passes so a
-    # single anomalous read (clock skew, a half-written file) can't trigger.
-    first_seen = state.get("wedge_first_seen") or 0
-    if not first_seen:
-        state["wedge_first_seen"] = now
+        oldest = oldest_task_fn()                    # (identity, age) | None
+        cur_key = oldest[0] if oldest else None
+        oldest_age = oldest[1] if oldest else None
+        status_ts = status_ts_fn()
+        wedged = (
+            alive_fn()
+            and oldest is not None
+            and oldest_age > RECOVER_WEDGE_SEC
+            and not just_booted_fn()
+        )
+
+        if not wedged:
+            # Healthy / no queued work / core down / just booted. Clear any
+            # in-progress observation so a future wedge starts fresh.
+            # last_restart / history are preserved (cooldown + give-up survive).
+            if state.get("wedge_first_seen") or state.get("wedge_task") is not None:
+                _reset_observation()
+                _save()
+            return None
+
+        # Identity + progress gating (blocker 3): age alone can't tell a wedge
+        # from a legitimately long single task. Reset the confirmation window if
+        # EITHER the oldest task changed (queue draining → a different oldest, or
+        # the file was rewritten → new mtime) OR the core advanced core-status.json
+        # (it's making progress, not looping). Only a SAME-task, NO-progress
+        # streak across the window is treated as a real wedge.
+        prev_key = state.get("wedge_task")
+        prev_status_ts = state.get("wedge_status_ts")
+        first_seen = state.get("wedge_first_seen") or 0
+        progressed = (
+            isinstance(prev_status_ts, (int, float))
+            and isinstance(status_ts, (int, float))
+            and status_ts > prev_status_ts
+        )
+        if (not first_seen) or prev_key != cur_key or progressed:
+            state["wedge_first_seen"] = now
+            state["wedge_task"] = cur_key
+            state["wedge_status_ts"] = status_ts
+            _save()
+            return {"action": "observed", "oldest_age": oldest_age, "task": cur_key}
+
+        if now - first_seen < RECOVER_CONFIRM_SEC:
+            return {"action": "confirming", "oldest_age": oldest_age, "for": int(now - first_seen)}
+
+        # Cooldown between restarts.
+        last_restart = state.get("last_restart") or 0
+        if last_restart and now - last_restart < RECOVER_COOLDOWN_SEC:
+            return {"action": "cooldown", "oldest_age": oldest_age, "since_restart": int(now - last_restart)}
+
+        # Give-up cap: prune restart history to the trailing hour.
+        history = [t for t in (state.get("restart_history") or []) if isinstance(t, (int, float)) and now - t < 3600]
+        if len(history) >= RECOVER_MAX_PER_HOUR:
+            # DM once per give-up episode. Record gave_up_at only on a SUCCESSFUL
+            # send so a Slack outage doesn't silence the give-up alert for an hour.
+            if not state.get("gave_up_at") or now - state["gave_up_at"] > 3600:
+                if send(
+                    ":octagonal_sign: *Sutando core auto-recovery gave up* — restarted "
+                    f"{len(history)}× in the last hour and the core is still wedged "
+                    f"(oldest task stuck {oldest_age // 60} min). Needs manual attention: "
+                    "check the CLI / `/usage-credits`."
+                ):
+                    state["gave_up_at"] = now
+                    _save()
+                else:
+                    print("[recover-core] WARNING: give-up DM to owner failed", flush=True)
+            return {"action": "gave_up", "restarts_last_hour": len(history)}
+
+        # Escalation: the FIRST restart in the trailing hour keeps 1M; if we're
+        # wedged again after a prior restart, that restart didn't hold — degrade
+        # to standard 200K context so the agent keeps working instead of re-wedging.
+        standard_context = len(history) >= 1
+        mode = "standard" if standard_context else "1m"
+        ctx_note = (
+            "in standard 200K context (the 1M restart didn't hold)" if standard_context
+            else "keeping 1M context"
+        )
+        # DM the owner BEFORE restarting. Capture the result (blocker 2): if the
+        # DM fails we still restart (recovery > notification — don't leave the
+        # core wedged because Slack is down), but we record dm_sent=False and log
+        # to stderr/launchd so the restart is never invisible.
+        dm_ok = send(
+            f":hourglass: *Sutando core wedged* — oldest task stuck {oldest_age // 60} min "
+            f"while the core process is alive (likely the 1M usage-credit gate or a "
+            f"stalled turn). Auto-restarting {ctx_note}. Queued tasks are preserved."
+        )
+        if not dm_ok:
+            print(f"[recover-core] WARNING: wedge-restart DM failed; restarting anyway (mode={mode})", flush=True)
+
+        if not restart_fn(standard_context):
+            # Restart launch failed — don't burn a cooldown/history slot, and
+            # keep the observation so we stay confirmed and retry next pass.
+            return {"action": "restart_failed", "mode": mode, "dm_sent": dm_ok}
+
+        history.append(now)
+        state["restart_history"] = history
+        state["last_restart"] = now
+        state["last_restart_mode"] = mode
+        state["last_restart_dm_sent"] = dm_ok
+        _reset_observation()  # re-observe after the restart settles
+        state.pop("gave_up_at", None)
         _save()
-        return {"action": "observed", "oldest_age": oldest_age}
-    if now - first_seen < RECOVER_CONFIRM_SEC:
-        return {"action": "confirming", "oldest_age": oldest_age, "for": int(now - first_seen)}
-
-    # Cooldown between restarts.
-    last_restart = state.get("last_restart") or 0
-    if last_restart and now - last_restart < RECOVER_COOLDOWN_SEC:
-        return {"action": "cooldown", "oldest_age": oldest_age, "since_restart": int(now - last_restart)}
-
-    # Give-up cap: prune restart history to the trailing hour.
-    history = [t for t in (state.get("restart_history") or []) if isinstance(t, (int, float)) and now - t < 3600]
-    if len(history) >= RECOVER_MAX_PER_HOUR:
-        # DM once per give-up episode (deduped via gave_up_at).
-        if not state.get("gave_up_at") or now - state["gave_up_at"] > 3600:
-            send(
-                ":octagonal_sign: *Sutando core auto-recovery gave up* — restarted "
-                f"{len(history)}× in the last hour and the core is still wedged "
-                f"(oldest task stuck {oldest_age // 60} min). Needs manual attention: "
-                "check the CLI / `/usage-credits`."
-            )
-            state["gave_up_at"] = now
-            _save()
-        return {"action": "gave_up", "restarts_last_hour": len(history)}
-
-    # Escalation: the FIRST restart in the trailing hour keeps 1M; if we're
-    # wedged again after a prior restart, that restart didn't hold — degrade to
-    # standard 200K context so the agent keeps working instead of re-wedging.
-    standard_context = len(history) >= 1
-    mode = "standard" if standard_context else "1m"
-    ctx_note = (
-        "in standard 200K context (the 1M restart didn't hold)" if standard_context
-        else "keeping 1M context"
-    )
-    send(
-        f":hourglass: *Sutando core wedged* — oldest task stuck {oldest_age // 60} min "
-        f"while the core process is alive (likely the 1M usage-credit gate or a "
-        f"stalled turn). Auto-restarting {ctx_note}. Queued tasks are preserved."
-    )
-
-    if not restart_fn(standard_context):
-        # Restart launch failed — don't burn a cooldown/history slot, and keep
-        # wedge_first_seen so we stay confirmed and retry on the next pass.
-        return {"action": "restart_failed", "mode": mode}
-
-    history.append(now)
-    state["restart_history"] = history
-    state["last_restart"] = now
-    state["last_restart_mode"] = mode
-    state["wedge_first_seen"] = 0  # re-observe after the restart settles
-    state.pop("gave_up_at", None)
-    _save()
-    return {"action": "restarted", "mode": mode, "oldest_age": oldest_age, "restarts_last_hour": len(history)}
+        return {
+            "action": "restarted", "mode": mode, "oldest_age": oldest_age,
+            "restarts_last_hour": len(history), "dm_sent": dm_ok,
+        }
+    finally:
+        if lock_fh is not None:
+            try:
+                fcntl.flock(lock_fh, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            lock_fh.close()
 
 
 def main():

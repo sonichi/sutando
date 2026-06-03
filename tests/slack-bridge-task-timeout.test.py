@@ -114,6 +114,34 @@ class TestCheckTaskTimeouts(unittest.TestCase):
         self.mod._check_task_timeouts()
         self.assertEqual(self.calls, [])
 
+    def test_send_failure_retries(self):
+        """Regression (PR #1428 review, blocker 1): a failed _send_reply must
+        NOT mark the task timed_out, or one Slack hiccup silences the warning
+        forever — recreating the silent no-op this watchdog exists to fix."""
+        self._seed("task-old", 700)
+
+        def boom(channel, thread_ts, text, task_id=None):
+            raise RuntimeError("slack 500")
+
+        self.mod._send_reply = boom
+        self.mod._check_task_timeouts()
+        with self.mod.pending_replies_lock:
+            self.assertFalse(
+                self.mod.pending_replies["task-old"]["timed_out"],
+                "a failed send must leave timed_out unset so the next pass retries",
+            )
+
+        # Next pass with a working sender must retry and then mark it sent.
+        self.mod._send_reply = (
+            lambda channel, thread_ts, text, task_id=None: self.calls.append(
+                {"task_id": task_id, "channel": channel, "text": text}
+            )
+        )
+        self.mod._check_task_timeouts()
+        self.assertEqual([c["task_id"] for c in self.calls], ["task-old"])
+        with self.mod.pending_replies_lock:
+            self.assertTrue(self.mod.pending_replies["task-old"]["timed_out"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

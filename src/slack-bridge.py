@@ -654,7 +654,13 @@ def _check_task_timeouts() -> None:
             if info.get("timed_out"):
                 continue
             if now - info.get("submitted_at", now) > TASK_TIMEOUT_SEC:
-                info["timed_out"] = True
+                # Collect only — do NOT set timed_out here. Marking before the
+                # send means a single Slack API hiccup (which raises below and
+                # is merely logged) leaves the flag True forever, so the next
+                # pass's `if info.get("timed_out"): continue` skips it and the
+                # user never sees the warning — recreating the exact silent
+                # no-op this watchdog exists to prevent. Mark only AFTER a
+                # successful send. (Per @sonichi PR #1428 review, blocker 1.)
                 to_notify.append((task_id, info["channel"], info.get("thread_ts")))
     if not to_notify:
         return
@@ -668,9 +674,18 @@ def _check_task_timeouts() -> None:
     for task_id, channel, thread_ts in to_notify:
         try:
             _send_reply(channel, thread_ts, msg, task_id=task_id)
-            print(f"  [timeout] notified Slack for {task_id} after {TASK_TIMEOUT_SEC}s", flush=True)
         except Exception as e:
+            # Send failed — leave timed_out unset so the next pass retries.
             print(f"[Slack] timeout notify failed for {task_id}: {e}", flush=True)
+            continue
+        # Notified once, successfully. Mark so we don't repeat. The entry may
+        # have been popped by result_watcher if a real result landed meanwhile
+        # — guard with get() so we don't resurrect a delivered task.
+        with pending_replies_lock:
+            entry = pending_replies.get(task_id)
+            if entry is not None:
+                entry["timed_out"] = True
+        print(f"  [timeout] notified Slack for {task_id} after {TASK_TIMEOUT_SEC}s", flush=True)
 
 
 def result_watcher():
