@@ -645,6 +645,14 @@ EOF
       # Runtime artifacts that won't survive a rehome anyway.
       --exclude='*.sock'
       --exclude='*.pid'
+      # Weight-reduction excludes (owner directive 2026-06-03, PR #1424
+      # import-UX thread). These are heavy claude-code state artifacts that
+      # have NO Sutando dependency and either auto-regenerate or are
+      # rarely-used past-session data. Saves ~150 MB / 3700+ files on a
+      # typical owner profile.
+      --exclude='shell-snapshots/'   # zsh snapshots, auto-regen per invocation
+      --exclude='history.jsonl'      # per-session command history, rebuilds
+      --exclude='file-history/'      # 102 MB / 3618 files; past-session edit-undo blobs
     )
 
     echo "sutando-shell-setup $INVOKED_AS"
