@@ -45,8 +45,9 @@ Skip if: the `proactive-loop-started.sentinel` is already present (indicates thi
 Immediately after `/catchup-after-startup` returns (and BEFORE step 3 invokes `/schedule-crons`), ensure the sentinel exists:
 
 ```bash
-mkdir -p "${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}/state"
-touch "${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}/state/proactive-loop-started.sentinel"
+WORKSPACE="$(bash scripts/sutando-config.sh workspace)"
+mkdir -p "$WORKSPACE/state"
+touch "$WORKSPACE/state/proactive-loop-started.sentinel"
 ```
 
 **Why immediately after step 1, not at step 4 (the end):** `/schedule-crons` step 0 re-checks the sentinel and re-runs `/catchup-after-startup` if it's absent. If we delay the touch to step 4, the sentinel is missing when `/schedule-crons` runs → catchup fires a SECOND time on every fresh start. Per qingyun-sutando review on #1072 (2026-05-23 22:18Z). The touch is between step 1 and step 2 so that `/task-orphan-check` (step 2) and `/schedule-crons` (step 3) both see the same touched-sentinel state — symmetric.

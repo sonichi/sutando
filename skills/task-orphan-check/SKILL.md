@@ -27,7 +27,7 @@ The procedure below is non-LLM where possible — mechanical file checks + side-
 ### Step 1 — List live tasks
 
 ```bash
-WS="${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}"
+WS="$(bash scripts/sutando-config.sh workspace)"
 ls "$WS/tasks/"task-*.txt 2>/dev/null | head -200
 ```
 
