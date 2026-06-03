@@ -98,6 +98,20 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
 7. **Update `$WORKSPACE/build_log.md`** — mark what changed, update statuses, note what's next.
 
+   **Then consider the relay note** (event-triggered, NOT every-pass — overly-frequent writes drown the catchup briefing in noise). Ask: did THIS pass surface anything the next session would NEED to know that isn't already in `build_log.md` or `pending-questions.md`? Typical relay-worthy events:
+   - A PR opened, merged, or got a meaningful review reply
+   - A pending question resolved (owner picked an option)
+   - A design decision reached that hasn't shipped yet ("we'll do X tomorrow")
+   - A blocker lifted (waiting → unblocked) or a new blocker surfaced
+   - A new memory filed that changes how I'll work going forward
+   - Something I learned that's NOT facts but JUDGMENT ("the load-bearing concern is X")
+
+   **If yes:** write/append to `$WORKSPACE/relay/relay-<ts>.md` per the `/relay` protocol. The note is consumed by the NEXT session's catchup. Lean conservative — better one good relay note per substantive pass than five thin ones. If the latest unprocessed `relay-*.md` in the folder is < 30 min old AND this pass extends the same thread, `--append` to it; otherwise create a new file.
+
+   **If no:** no write. Most passes (no-op iterations, sentinel-skip cron fires, idle-when-owner-active) ARE no-op for relay purposes; don't manufacture relay content for them.
+
+   This bakes the auto-trigger into the existing build_log update step rather than a separate auto-refresh subsystem. Event-triggered, not time-triggered — fires only on natural beat points where something worth relaying actually happened.
+
 8. **If blocked, ask.** Write the question to `pending-questions.md`, send a macOS notification, and write to `results/question-{ts}.txt` if voice is connected. Don't stop — apply the Pivot-on-block rule and pick another menu item.
 
 9. **Ensure the streaming watcher is running.** If no `fswatch` process on `tasks/` (check via `pgrep -f watch-tasks`), restart it with the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`. When notifications arrive (`TASK_FILE: <basename>`), Read the named file. Each event represents one new task — process all queued tasks before continuing.
