@@ -41,7 +41,7 @@ Edit `crons.json` to add/remove jobs. No need to change this skill file. The pro
 
 ### Defer non-loop crons when owner tasks are queued
 
-Wrap any non-`main-loop` cron's `prompt` body with `scripts/cron-gate.sh` so the cron defers when `<workspace>/tasks/` has any `task-*.txt` pending. Pattern:
+Wrap **sub-daily** non-`main-loop` cron `prompt` bodies (e.g. `*/N`, `*/30`, hourly) with `scripts/cron-gate.sh` so the cron defers when `<workspace>/tasks/` has any `task-*.txt` pending. The next natural tick (≤ a few minutes later for `*/30`, ≤ an hour for hourly) covers a deferred fire. Pattern:
 
 ```json
 {
@@ -53,4 +53,12 @@ Wrap any non-`main-loop` cron's `prompt` body with `scripts/cron-gate.sh` so the
 
 `cron-gate.sh <reason> <command...>` either `exec`s the command (queue empty) or prints `cron-gate: owner tasks queued — deferring <reason>` and exits 0. See `crons.example.json` for canonical wrapped forms.
 
-**Do NOT gate `main-loop`** — `/proactive-loop` IS the owner-task handler; gating it would deadlock the queue.
+**When to gate (decision rule):**
+
+| Cron cadence | Gate? | Why |
+| --- | --- | --- |
+| `main-loop` (`/proactive-loop`) | **NEVER** | `/proactive-loop` IS the owner-task handler; gating would deadlock. |
+| Sub-daily (`*/N`, `*/30`, hourly) | **YES** | A skip is recovered by the next natural tick within minutes-hours. |
+| Daily / less-frequent (`X Y * * *`) | **NO** | A skip = function is gone until next day (briefing missed, etc.). M1's no-inline-fire rule already kills the avalanche on registration — gating dailies is over-broad. |
+
+Lucy caught this on PR #1437 (2026-06-03): gating daily crons (morning-briefing 06:57, daily-insight 06:50, obsidian-dream 03:37, learned-skills-scan 07:30) means one queued task at briefing time loses the briefing for the entire day. Pinning the gate to sub-daily crons preserves the defense-in-depth where it matters without the missed-day risk.

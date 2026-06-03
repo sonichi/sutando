@@ -7,31 +7,31 @@
   {
     "name": "morning-briefing",
     "cron": "57 6 * * *",
-    "prompt": "Run: bash scripts/cron-gate.sh morning-briefing python3 src/morning-briefing.py — cron-gate defers when owner tasks are queued; otherwise the briefing (weather, calendar, reminders, overnight Discord, pending questions, health) runs and is spoken if voice is connected, otherwise sent as Discord DM."
+    "prompt": "Run python3 src/morning-briefing.py to deliver the daily morning briefing (weather, calendar, reminders, overnight Discord, pending questions, health). Speak the result if voice is connected, send as Discord DM otherwise."
   },
   {
     "name": "daily-insight",
     "cron": "50 6 * * *",
-    "prompt": "Run: bash scripts/cron-gate.sh daily-insight python3 src/daily-insight.py — generates today's behavioral insight (deferred if owner work is queued). If the wrapped command produces output, include it in the next morning briefing."
+    "prompt": "Run python3 src/daily-insight.py to generate today's behavioral insight. If it produces output, include it in the morning briefing."
   },
   {
     "name": "pending-questions",
     "cron": "*/30 * * * *",
-    "prompt": "Run: bash scripts/cron-gate.sh pending-questions python3 src/check-pending-questions.py — notifies about unanswered pending questions (deferred when owner tasks are queued)."
+    "prompt": "Run: bash scripts/cron-gate.sh pending-questions python3 src/check-pending-questions.py — notifies about unanswered pending questions (deferred when owner tasks are queued; next */30 retry covers a skipped fire)."
   },
   {
     "name": "sync-memory",
     "cron": "*/30 * * * *",
-    "prompt": "Run: bash scripts/cron-gate.sh sync-memory bash scripts/sync-memory.sh — syncs memory and notes to the private memory repo (requires SUTANDO_MEMORY_REPO in .env; deferred when owner tasks are queued)."
+    "prompt": "Run: bash scripts/cron-gate.sh sync-memory bash scripts/sync-memory.sh — syncs memory and notes to the private memory repo (requires SUTANDO_MEMORY_REPO in .env; deferred when owner tasks are queued; next */30 retry covers a skipped fire)."
   },
   {
     "name": "obsidian-dream",
     "cron": "37 3 * * *",
-    "prompt": "Run: bash scripts/cron-gate.sh obsidian-dream python3 skills/obsidian-vault/scripts/dream.py — nightly LLM-judged vault relink pass (gated by SUTANDO_OBSIDIAN_MIRROR=1 — no-op when unset; deferred when owner tasks are queued). Default model: claude-opus-4-7 (override via SUTANDO_DREAM_MODEL)."
+    "prompt": "Run python3 skills/obsidian-vault/scripts/dream.py for the nightly LLM-judged vault relink pass (gated by SUTANDO_OBSIDIAN_MIRROR=1 — no-op when unset). Default model: claude-opus-4-7 (override via SUTANDO_DREAM_MODEL)."
   },
   {
     "name": "learned-skills-scan",
     "cron": "30 7 * * *",
-    "prompt": "Run: bash scripts/cron-gate.sh learned-skills-scan python3 src/detect-learned-skills.py — scans recent task archives for repeated workflow patterns and proposes candidate learned skills (gated on state/learned-skills-enabled.sentinel, toggled from Settings → Skills → Behavior; the script exits early when the gate is off; cron-gate also defers when owner tasks are queued)."
+    "prompt": "Run python3 src/detect-learned-skills.py to scan recent task archives for repeated workflow patterns and propose candidate learned skills. Gated on state/learned-skills-enabled.sentinel (toggled from Settings → Skills → Behavior); the script exits early when the gate is off."
   }
 ]
