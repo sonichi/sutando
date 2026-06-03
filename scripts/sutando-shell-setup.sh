@@ -446,6 +446,15 @@ EOF
       --exclude='debug/'
       --exclude='plugins/*/cache/'
       --exclude='statsig/'
+      # Secret-safety (Mini PR #1415 review #4): channel bot tokens are
+      # host-specific and shouldn't propagate via this copy. They'd also land
+      # in the M2 vault-sync include set without an explicit opt-out, leaking
+      # tokens to remote vault. Same logic for stale auth backups.
+      --exclude='channels/*/*.env'
+      --exclude='channels/*/access.json.bak*'
+      # Runtime artifacts that won't survive a rehome anyway.
+      --exclude='*.sock'
+      --exclude='*.pid'
     )
 
     echo "sutando-shell-setup --migrate"
@@ -506,6 +515,20 @@ EOF
     echo "sutando-shell-setup --migrate: done."
     echo "  ${SOURCE_DIR} is unchanged. To prune later, verify the new tree works first, then:"
     echo "    rm -rf '${SOURCE_DIR}/projects/${THIS_PROJECT_SLUG}/'  # only this project's slug"
+    # Mini PR #1415 review #4: channels/*/*.env were intentionally NOT copied
+    # (host-specific tokens). Tell the user how to manually rehome them if they
+    # want the bridges working from the new location.
+    if compgen -G "${SOURCE_DIR}/channels/*/*.env" > /dev/null 2>&1; then
+      echo
+      echo "  ⚠ Channel bot tokens (channels/*/*.env) NOT copied — they're host-specific."
+      echo "    If you want bridges to work from the new CLAUDE_CONFIG_DIR, manually rehome:"
+      echo "      for env in '${SOURCE_DIR}/channels/'*/.env; do"
+      echo "        ch=\"\$(basename \"\$(dirname \"\$env\")\")\""
+      echo "        mkdir -p '${CLAUDE_DIR}/channels/'\"\$ch\""
+      echo "        cp \"\$env\" '${CLAUDE_DIR}/channels/'\"\$ch\"/.env"
+      echo "      done"
+      echo "    Each .env is mode 600. Manual cp preserves mode."
+    fi
     exit 0
     ;;
 
