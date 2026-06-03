@@ -1074,26 +1074,30 @@ commit_one() {
                 mkdir -p "$(dirname "$dst_path")"
                 if [ -e "$dst_path" ]; then
                     # IMPORTANT: split the compound-redirect + mv + echo "merged"
-                    # into separate statements with explicit error returns. The
-                    # prior `{ ... } > tmp && mv ... ` followed by `echo "merged"`
-                    # was data-lossy under any write failure (per
-                    # feedback_bash_and_compound_breaks_set_e): set -e does NOT
-                    # exit on a failed left-of-&& redirect, so we'd reach
-                    # `echo "merged"` even when the write to tmp failed (disk
-                    # full, permission denied, broken pipe) → false-success
-                    # signal + dest unchanged. Mirrors the pattern the
-                    # append-fresh blocks above already use (PR #1406 fix).
-                    local _merge_rc=0
+                    # into separate statements with explicit error returns.
+                    # Per `feedback_bash_and_compound_breaks_set_e` + Mini's
+                    # PR #1424 review #1: capture RC PER-COMMAND inside the
+                    # brace group, not just the brace's overall exit. A brace
+                    # group's exit code = the last command's exit; an early
+                    # `cat "$dst_path"` failure (e.g. file disappeared between
+                    # check + read, permission flip) gets silently swallowed
+                    # if the later `cat "$src_file"` returns 0. That would
+                    # commit a PARTIAL merge (dst_path content missing) +
+                    # print "merged" — invisible data loss.
+                    #
+                    # Bitmask captures which step(s) failed for stderr triage:
+                    #   1=cat-dst  2=hdr-blank  4=hdr-line  8=trailer-blank  16=cat-src
+                    local _err=0
                     {
-                        cat "$dst_path"
-                        echo ""
-                        echo "=== migrated from source $tag at $BACKUP_ID ==="
-                        echo ""
-                        cat "$src_file"
-                    } > "$dst_path.merge.$$" || _merge_rc=$?
-                    if [ "$_merge_rc" -ne 0 ]; then
+                        cat "$dst_path"                                || _err=$((_err|1))
+                        echo ""                                        || _err=$((_err|2))
+                        echo "=== migrated from source $tag at $BACKUP_ID ===" || _err=$((_err|4))
+                        echo ""                                        || _err=$((_err|8))
+                        cat "$src_file"                                || _err=$((_err|16))
+                    } > "$dst_path.merge.$$"
+                    if [ "$_err" -ne 0 ]; then
                         rm -f "$dst_path.merge.$$"
-                        echo "merge-append-failed-redirect" >&2
+                        echo "merge-append-failed-inner $_err" >&2
                         return 1
                     fi
                     mv -f "$dst_path.merge.$$" "$dst_path" || {
