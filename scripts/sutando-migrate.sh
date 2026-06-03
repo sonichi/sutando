@@ -1027,16 +1027,22 @@ commit_one() {
                     return 0
                 fi
                 # Append with divider header. Concat in canonical order.
+                # Per-command RC capture (same template as --merge-append block
+                # below). Brace-overall exit only catches the last command's
+                # failure; per-command bitmask catches earlier-step failures
+                # (e.g. cat-dst disappearing mid-merge).
+                # Bitmask: 1=cat-dst  2=hdr-blank  4=hdr-line  8=trailer-blank  16=cat-src
+                local _aerr=0
                 {
-                    cat "$dst_path"
-                    echo ""
-                    echo "=== migrated from source $tag (mtime $src_mt, size ${src_sz}B) ==="
-                    echo ""
-                    cat "$src_file"
-                } > "$_tmp" || _redirect_rc=$?
-                if [ "$_redirect_rc" -ne 0 ]; then
+                    cat "$dst_path"                                                          || _aerr=$((_aerr|1))
+                    echo ""                                                                  || _aerr=$((_aerr|2))
+                    echo "=== migrated from source $tag (mtime $src_mt, size ${src_sz}B) ===" || _aerr=$((_aerr|4))
+                    echo ""                                                                  || _aerr=$((_aerr|8))
+                    cat "$src_file"                                                          || _aerr=$((_aerr|16))
+                } > "$_tmp"
+                if [ "$_aerr" -ne 0 ]; then
                     rm -f "$_tmp"
-                    echo "append-failed-redirect" >&2
+                    echo "append-failed-inner $_aerr" >&2
                     return 1
                 fi
                 mv -f "$_tmp" "$dst_path" || {
@@ -1047,19 +1053,22 @@ commit_one() {
                 echo "appended"
             else
                 # First write — include header so future appends slot in cleanly.
+                # Per-command RC capture; bitmask 4=hdr-line  8=trailer-blank  16=cat-src
+                # (no cat-dst since dst doesn't exist yet).
+                local _afferr=0
                 {
-                    echo "=== migrated from source $tag (mtime $src_mt, size ${src_sz}B) ==="
-                    echo ""
-                    cat "$src_file"
-                } > "$_tmp" || _redirect_rc=$?
-                if [ "$_redirect_rc" -ne 0 ]; then
+                    echo "=== migrated from source $tag (mtime $src_mt, size ${src_sz}B) ===" || _afferr=$((_afferr|4))
+                    echo ""                                                                  || _afferr=$((_afferr|8))
+                    cat "$src_file"                                                          || _afferr=$((_afferr|16))
+                } > "$_tmp"
+                if [ "$_afferr" -ne 0 ]; then
                     rm -f "$_tmp"
-                    echo "append-failed-redirect" >&2
+                    echo "append-fresh-failed-inner $_afferr" >&2
                     return 1
                 fi
                 mv -f "$_tmp" "$dst_path" || {
                     rm -f "$_tmp"
-                    echo "append-failed-mv" >&2
+                    echo "append-fresh-failed-mv" >&2
                     return 1
                 }
                 echo "appended-fresh"
