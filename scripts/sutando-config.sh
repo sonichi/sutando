@@ -65,6 +65,32 @@ print(resolve_vault().get('remote_url', ''), end='')
 "
     ;;
 
+  vault-sync-include)
+    # PR-3: print sync.include paths one-per-line. Consumed by
+    # sync-workspace.sh::_compose_gitignore_content to drive the carrier-set
+    # whitelist. Schema in sutando_config.py::resolve_vault.
+    python3 -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import resolve_vault
+for p in resolve_vault().get('sync', {}).get('include', []):
+    print(p)
+"
+    ;;
+
+  vault-sync-exclude)
+    # PR-3: print sync.exclude paths one-per-line. Explicit denies emitted
+    # AFTER the include whitelist (gitignore last-match wins), so user can
+    # carve out subpaths from an otherwise-included directory.
+    python3 -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import resolve_vault
+for p in resolve_vault().get('sync', {}).get('exclude', []):
+    print(p)
+"
+    ;;
+
   claude-sutando-config-dir)
     # M2 — print the absolute CLAUDE_CONFIG_DIR target used by the
     # `claude-sutando` shell alias. Always a sub-folder of resolve_workspace()
@@ -104,7 +130,7 @@ print(resolve_claude_sutando_config_dir(), end='')
     ;;
 
   *)
-    echo "usage: $0 {workspace|vault-enabled|vault-url|dump|subdirs|bootstrap}" >&2
+    echo "usage: $0 {workspace|vault-enabled|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|dump|subdirs|bootstrap}" >&2
     exit 2
     ;;
 esac

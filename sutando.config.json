@@ -8,21 +8,11 @@
     "sync": {
       "include": [
         "notes/",
-        "skills/",
-        "tasks/archive/",
-        "state/cores/"
+        "pending-questions.md",
+        "build_log.md",
+        ".claude-sutando/projects/*/memory/"
       ],
-      "exclude": [
-        "tasks/",
-        "results/",
-        "state/core-status.json",
-        "state/quota-state.json",
-        "state/voice-state.json",
-        "voice-state.json",
-        "*.heartbeat",
-        "logs/",
-        "tmp/"
-      ]
+      "exclude": []
     },
     "interval_seconds": 1800
   }

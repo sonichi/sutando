@@ -77,8 +77,22 @@ git init -q "$FIXTURE_REPO"
 cp "$REPO/scripts/sync-workspace.sh" "$FIXTURE_REPO/scripts/"
 cp "$REPO/scripts/sutando-config.sh" "$FIXTURE_REPO/scripts/"
 cp "$REPO/src/sutando_config.py" "$FIXTURE_REPO/src/"
-cat > "$FIXTURE_REPO/sutando.config.json" <<JSON
-{"workspace": {"path": "\${REPO_DIR}/workspace"}, "vault": {"enabled": false}}
+cat > "$FIXTURE_REPO/sutando.config.json" <<'JSON'
+{
+  "workspace": {"path": "${REPO_DIR}/workspace"},
+  "vault": {
+    "enabled": false,
+    "sync": {
+      "include": [
+        "notes/",
+        "pending-questions.md",
+        "build_log.md",
+        ".claude-sutando/projects/*/memory/"
+      ],
+      "exclude": []
+    }
+  }
+}
 JSON
 
 FIXTURE_WS_RAW="$TEST_ROOT/workspace"
@@ -717,6 +731,160 @@ case "$out_fallthru" in
 esac
 
 rm -f "$FIXTURE_REPO/.env"
+
+# ============================================================================
+echo
+echo "==== Test 20: vault.sync.include from config drives .gitignore (PR-3) ===="
+# Verify that what ends up in .gitignore comes from sutando.config.json's
+# vault.sync.include (not a hardcoded list). Semantics: local config REPLACES
+# tracked default's sync.include array (standard JSON merge; arrays don't
+# concat). Users who want to keep defaults + add their own path must include
+# the defaults explicitly. PR-3 design.
+
+# Reset workspace state so --init can re-run cleanly
+rm -rf "$FIXTURE_WS"
+mkdir -p "$FIXTURE_WS"
+
+# Write a config-local with defaults PLUS one custom path (REPLACE semantics)
+cat > "$FIXTURE_REPO/sutando.config.local.json" <<'JSON'
+{
+  "vault": {
+    "sync": {
+      "include": [
+        "notes/",
+        "pending-questions.md",
+        "build_log.md",
+        ".claude-sutando/projects/*/memory/",
+        "custom-dir/"
+      ]
+    }
+  }
+}
+JSON
+
+# --init will regenerate .gitignore from config
+run_sync --init 2>&1 | head -5 >/dev/null || true
+
+# All paths present (use grep — case-pattern with whitespace is too strict)
+all_present=1
+for needle in "!notes/" "!pending-questions.md" "!build_log.md" "!.claude-sutando/projects/" "!custom-dir/"; do
+  grep -qF "$needle" "$FIXTURE_WS/.gitignore" || all_present=0
+done
+if [ "$all_present" = "1" ]; then
+  echo "  OK: defaults + custom include all emitted to .gitignore"; pass=$((pass+1))
+else
+  echo "  FAIL: some include paths missing"; grep -E "^!" "$FIXTURE_WS/.gitignore" | head -10; fail=$((fail+1))
+fi
+
+# Custom include from local config appears
+if grep -qF "!custom-dir/" "$FIXTURE_WS/.gitignore"; then
+  echo "  OK: custom include 'custom-dir/' from sutando.config.local.json present"; pass=$((pass+1))
+else
+  echo "  FAIL: custom include NOT in .gitignore"; fail=$((fail+1))
+fi
+
+# Reset config-local
+echo '{}' > "$FIXTURE_REPO/sutando.config.local.json"
+
+# ============================================================================
+echo
+echo "==== Test 21: vault.sync.exclude carves out from include (PR-3) ===="
+# An exclude should override an otherwise-included parent. Write include for
+# `data/` + exclude for `data/secret/` → `data/secret/` gitignored,
+# `data/foo.md` visible to git. Use `git check-ignore` to ask git directly
+# (untracked-vs-ignored is clearer than parsing `git status` output).
+
+cat > "$FIXTURE_REPO/sutando.config.local.json" <<'JSON'
+{
+  "vault": {
+    "sync": {
+      "include": ["data/"],
+      "exclude": ["data/secret/"]
+    }
+  }
+}
+JSON
+
+rm -rf "$FIXTURE_WS"
+mkdir -p "$FIXTURE_WS"
+run_sync --init 2>&1 | head -5 >/dev/null || true
+
+GI="$FIXTURE_WS/.gitignore"
+if grep -qF "!data/" "$GI" && grep -qE "^data/secret/" "$GI"; then
+  echo "  OK: include + exclude both emitted to .gitignore"; pass=$((pass+1))
+else
+  echo "  FAIL: include/exclude combination missing"; grep -E "^!?data" "$GI" | head; fail=$((fail+1))
+fi
+
+# Create test files
+mkdir -p "$FIXTURE_WS/data/secret"
+echo "ok" > "$FIXTURE_WS/data/foo.md"
+echo "shh" > "$FIXTURE_WS/data/secret/key.txt"
+
+# Ask git directly which files are ignored. Exit 0 = ignored, 1 = NOT ignored.
+cd "$FIXTURE_WS"
+if git check-ignore -q data/foo.md 2>/dev/null; then
+  foo_ignored=1
+else
+  foo_ignored=0
+fi
+if git check-ignore -q data/secret/key.txt 2>/dev/null; then
+  secret_ignored=1
+else
+  secret_ignored=0
+fi
+cd - >/dev/null
+
+if [ "$foo_ignored" = "0" ]; then
+  echo "  OK: data/foo.md NOT ignored (visible to git)"; pass=$((pass+1))
+else
+  echo "  FAIL: data/foo.md was ignored — exclude carve-out blocked the include"; fail=$((fail+1))
+fi
+
+if [ "$secret_ignored" = "1" ]; then
+  echo "  OK: data/secret/key.txt IS ignored (exclude carved it out)"; pass=$((pass+1))
+else
+  echo "  FAIL: data/secret/key.txt NOT ignored — exclude didn't carve out"; fail=$((fail+1))
+fi
+
+rm -rf "$FIXTURE_WS/data"
+echo '{}' > "$FIXTURE_REPO/sutando.config.local.json"
+
+# ============================================================================
+echo
+echo "==== Test 22: ancestor-chain un-ignore for nested include path (PR-3) ===="
+# Verify _emit_include_lines emits the FULL ancestor chain — gitignore can't
+# include a child whose ancestor is excluded by `*`. For include `a/b/c/`,
+# expect `!a/`, `!a/b/`, `!a/b/c/`, `!a/b/c/**`.
+
+cat > "$FIXTURE_REPO/sutando.config.local.json" <<'JSON'
+{
+  "vault": {
+    "sync": {
+      "include": ["a/b/c/"]
+    }
+  }
+}
+JSON
+
+rm -rf "$FIXTURE_WS"
+mkdir -p "$FIXTURE_WS"
+run_sync --init 2>&1 | head -5 >/dev/null || true
+
+GI="$FIXTURE_WS/.gitignore"
+chain_ok=1
+for needle in "!a/" "!a/b/" "!a/b/c/" "!a/b/c/**"; do
+  grep -qF "$needle" "$GI" || chain_ok=0
+done
+
+if [ "$chain_ok" = "1" ]; then
+  echo "  OK: ancestor chain emitted for nested include (!a/, !a/b/, !a/b/c/, !a/b/c/**)"; pass=$((pass+1))
+else
+  echo "  FAIL: ancestor chain incomplete for a/b/c/:"; grep -E "^!a" "$GI" | head; fail=$((fail+1))
+fi
+
+# Reset
+echo '{}' > "$FIXTURE_REPO/sutando.config.local.json"
 
 # ============================================================================
 echo
