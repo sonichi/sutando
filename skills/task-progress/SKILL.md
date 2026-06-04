@@ -4,9 +4,29 @@ Sends mid-task progress updates to the channel a task came from (Slack, Discord,
 
 ## Critical rule — notify BEFORE any work begins
 
-**Call notify.py as the FIRST action after reading a non-trivial task — before any tool calls,
-web searches, code reads, or analysis.** The user's first signal that you received their message
-must be the notification, not the final result arriving minutes later after silence.
+**Call notify.py as the FIRST action after reading a task — before transcription, web searches,
+code reads, or any other tool call.** The user's first signal that you received their message
+must be the notification, not silence followed by a result minutes later.
+
+### Voice message tasks (most common failure case)
+
+When a task contains a voice attachment (`[File attached: ...]`), notify BEFORE calling the
+transcription script. Transcription takes 10–30 seconds — the user should not wait in silence.
+
+Wrong order:
+1. Read task (sees voice attachment)
+2. Call transcribe.py ← 20s of silence
+3. Process transcript
+4. Return result ← user waited 60+ seconds with no signal
+
+Correct order:
+1. Read task (sees voice attachment)
+2. **Notify: "Got your voice message, give me a moment."** ← user knows within seconds
+3. Call transcribe.py
+4. Process — if research needed, notify again before starting
+5. Return result
+
+### All other tasks
 
 Wrong order:
 1. Read task

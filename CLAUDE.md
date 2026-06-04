@@ -206,7 +206,11 @@ On each proactive loop pass, check `pending-questions.md` for unanswered items a
 **Call notify BEFORE doing any work** — the notification must be the first thing the user sees
 after sending a task, not silence followed by a result minutes later.
 
-Correct sequence:
+**Voice message tasks:** notify BEFORE calling the transcription script. Transcription takes
+10–30 seconds — the user should never wait in silence while you transcribe.
+- See `[File attached: ...]` in task → notify "Got your voice message, give me a moment." → THEN transcribe
+
+**All other tasks:** correct sequence:
 1. Read task file
 2. **Call notify immediately** (before any web searches, file reads, or analysis)
 3. Do the work
