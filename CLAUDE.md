@@ -201,6 +201,22 @@ When you need user input on a decision or are blocked:
 
 On each proactive loop pass, check `pending-questions.md` for unanswered items and surface them when the user is available.
 
+## Task progress notifications
+
+When starting any non-trivial task (code changes, skill builds, PRs, research, file edits — anything likely to take more than ~2 minutes), use the `task-progress` skill to notify the user on the channel the task came from:
+
+```bash
+python3 ~/.claude/skills/task-progress/scripts/notify.py \
+  --source <source> --channel-id <channel_id> \
+  --message "On it — looks like a few minutes. I'll keep you posted."
+```
+
+Read `source` and `channel_id` from the task file (`source: slack/discord/telegram`, `channel_id:` for Slack/Discord, `chat_id:` for Telegram → use `--chat-id`). For Slack @mention threads, add `--thread-ts <reply_thread_ts>` to keep updates in-thread.
+
+Send a second update at meaningful checkpoints (e.g. "Done writing the skill — running tests now.").
+
+The script is fail-open — always continue the task regardless of exit code. Simple lookups or one-line answers don't need a notification.
+
 ## Workspace layout
 
 - Vision + docs: `README.md` (this directory)
