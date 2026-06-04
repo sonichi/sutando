@@ -275,6 +275,115 @@ cd - >/dev/null
 
 # ============================================================================
 echo
+echo "==== Test 9: .gitignore overwrite warning (Pro #1445 review fix #3) ===="
+# Modify the .gitignore in place, then run --init without --force-gitignore.
+# Expected: refuse + print diff.
+echo "# my custom user edit" >> "$FIXTURE_WS/.gitignore"
+out_overwrite=$(run_sync --init 2>&1 || true)
+case "$out_overwrite" in
+  *"Refusing to overwrite"*)
+    echo "  OK: --init refuses to overwrite user-edited .gitignore"; pass=$((pass+1)) ;;
+  *) echo "  FAIL: --init silently overwrote user-edited .gitignore: $out_overwrite"; fail=$((fail+1)) ;;
+esac
+# Verify the user's edit survived
+if grep -q "my custom user edit" "$FIXTURE_WS/.gitignore"; then
+  echo "  OK: user's custom .gitignore line preserved (not overwritten)"; pass=$((pass+1))
+else
+  echo "  FAIL: user's custom .gitignore line was lost"; fail=$((fail+1))
+fi
+
+# Now with --force-gitignore → should overwrite
+out_force=$(env "${COMMON_ENV[@]}" bash "$SYNC" --init --force-gitignore 2>&1 || true)
+if grep -q "my custom user edit" "$FIXTURE_WS/.gitignore"; then
+  echo "  FAIL: --force-gitignore didn't overwrite (user edit still there)"; fail=$((fail+1))
+else
+  echo "  OK: --force-gitignore did overwrite"; pass=$((pass+1))
+fi
+
+# ============================================================================
+echo
+echo "==== Test 10: pull-side mass-deletion tripwire (Pro #1445 review fix #2) ===="
+# Setup: host 1 has many notes pushed. Peer creates a branch, deletes them all,
+# pushes. Host 1 --pull-only should detect the mass-delete via merge + reset.
+
+# First, make sure host 1 has the 60 notes pushed (they were committed in Test 8
+# but the tripwire reset prevented push; let's force-push them now via SUTANDO_FORCE_SYNC).
+cd "$FIXTURE_WS"
+for i in $(seq 1 60); do echo "n$i" > "notes/note-$i.md"; done
+SUTANDO_FORCE_SYNC=1 env "${COMMON_ENV[@]}" bash "$SYNC" --push-only 2>&1 | head -3
+cd - >/dev/null
+
+# Peer: clone, delete all 60 notes, push to host/peerhost2
+PEER2_WS="$TEST_ROOT/peer2-workspace"
+git clone -q "$FIXTURE_VAULT" "$PEER2_WS" 2>/dev/null
+(
+    cd "$PEER2_WS"
+    git checkout -B "host/peerhost2" "origin/host/${HOST}" >/dev/null 2>&1
+    rm -f notes/note-*.md
+    git add -A
+    git -c user.email=peer2@test -c user.name=peer2 commit -q -m "peer2 deletes all notes" >/dev/null 2>&1
+    git push -q origin "host/peerhost2" 2>/dev/null
+)
+
+# Host 1: pull → should detect mass-delete + reset
+PRE_NOTE_COUNT=$(ls "$FIXTURE_WS/notes/note-"*.md 2>/dev/null | wc -l | tr -d ' ')
+out_pull_trip=$(run_sync --pull-only 2>&1 || true)
+case "$out_pull_trip" in
+  *"REFUSING pull"*|*"tripwire"*|*"deleted"*)
+    echo "  OK: pull-side tripwire fired on peer mass-deletion"; pass=$((pass+1)) ;;
+  *) echo "  FAIL: pull-side tripwire did NOT fire on peer's 60-file deletion: $out_pull_trip"; fail=$((fail+1)) ;;
+esac
+
+POST_NOTE_COUNT=$(ls "$FIXTURE_WS/notes/note-"*.md 2>/dev/null | wc -l | tr -d ' ')
+if [ "$POST_NOTE_COUNT" -ge "$PRE_NOTE_COUNT" ]; then
+  echo "  OK: working tree restored after tripwire (had $PRE_NOTE_COUNT, now $POST_NOTE_COUNT)"; pass=$((pass+1))
+else
+  echo "  FAIL: tripwire didn't restore working tree ($PRE_NOTE_COUNT → $POST_NOTE_COUNT)"; fail=$((fail+1))
+fi
+
+# ============================================================================
+echo
+echo "==== Test 11: --dry-run for --migrate-from-legacy (Pro #1445 review fix #1) ===="
+# Setup a fake legacy ~/.sutando/memory-sync/-style clone with notes + memory
+LEGACY_FIXTURE="$TEST_ROOT/fake-legacy-memory-sync"
+git init -q "$LEGACY_FIXTURE"
+mkdir -p "$LEGACY_FIXTURE/notes" "$LEGACY_FIXTURE/memory"
+echo "legacy note" > "$LEGACY_FIXTURE/notes/legacy-note.md"
+echo "legacy memory" > "$LEGACY_FIXTURE/memory/feedback_legacy.md"
+echo "legacy pending" > "$LEGACY_FIXTURE/pending-questions.md"
+echo "legacy build" > "$LEGACY_FIXTURE/build_log.md"
+(cd "$LEGACY_FIXTURE" && git add -A && git -c user.email=test@test -c user.name=test commit -q -m "legacy fixture")
+
+# Snapshot workspace state pre-migrate
+PRE_NOTES_COUNT=$(find "$FIXTURE_WS/notes" -type f 2>/dev/null | wc -l | tr -d ' ')
+PRE_LEGACY_NOTE_EXISTS="$([ -f "$FIXTURE_WS/notes/legacy-note.md" ] && echo yes || echo no)"
+
+# Run --dry-run; should NOT mutate fs
+out_dryrun=$(SUTANDO_MEMORY_SYNC_DIR="$LEGACY_FIXTURE" \
+             env "${COMMON_ENV[@]}" bash "$SYNC" --migrate-from-legacy --dry-run 2>&1 || true)
+case "$out_dryrun" in
+  *"DRY-RUN"*)
+    echo "  OK: --dry-run output contains DRY-RUN markers"; pass=$((pass+1)) ;;
+  *) echo "  FAIL: --dry-run didn't produce DRY-RUN markers: $out_dryrun"; fail=$((fail+1)) ;;
+esac
+
+# Verify legacy note was NOT copied to workspace
+if [ -f "$FIXTURE_WS/notes/legacy-note.md" ] && [ "$PRE_LEGACY_NOTE_EXISTS" = "no" ]; then
+  echo "  FAIL: --dry-run copied legacy-note.md anyway"; fail=$((fail+1))
+else
+  echo "  OK: --dry-run did NOT copy legacy-note.md"; pass=$((pass+1))
+fi
+
+# Note count unchanged
+POST_NOTES_COUNT=$(find "$FIXTURE_WS/notes" -type f 2>/dev/null | wc -l | tr -d ' ')
+if [ "$POST_NOTES_COUNT" = "$PRE_NOTES_COUNT" ]; then
+  echo "  OK: --dry-run kept workspace notes count unchanged ($PRE_NOTES_COUNT → $POST_NOTES_COUNT)"; pass=$((pass+1))
+else
+  echo "  FAIL: --dry-run changed notes count ($PRE_NOTES_COUNT → $POST_NOTES_COUNT)"; fail=$((fail+1))
+fi
+
+# ============================================================================
+echo
 echo "===================="
 echo "Total: $((pass+fail)) — pass: $pass, fail: $fail"
 exit $fail
