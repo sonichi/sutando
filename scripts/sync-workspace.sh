@@ -189,6 +189,19 @@ die() {
     exit "${2:-1}"
 }
 
+# Host identity (used for `host/<host>` branch name + commit messages).
+# SUTANDO_HOST_OVERRIDE is a TEST-ONLY shim — set per-invocation so the
+# hermetic multi-host test can simulate two hosts from a single machine
+# (sutando-workspace.test.sh Test 23, Codex P1.3 reproducer). Not for
+# production use.
+_host() {
+    if [ -n "${SUTANDO_HOST_OVERRIDE:-}" ]; then
+        printf '%s\n' "$SUTANDO_HOST_OVERRIDE"
+    else
+        hostname | sed 's/\..*//'
+    fi
+}
+
 # --------------------------------------------------------------------------- #
 # Section 3 — Lock (atomic mkdir, POSIX, no flock dependency)                  #
 # --------------------------------------------------------------------------- #
@@ -381,7 +394,7 @@ _init_impl() {
         echo "DRY-RUN: would init workspace as git repo at $WORKSPACE_DIR" >&2
         echo "DRY-RUN: would set git remote origin = $VAULT_URL" >&2
         echo "DRY-RUN: would (re)generate .gitignore" >&2
-        echo "DRY-RUN: would stage + commit + push to refs/heads/host/$(hostname | sed 's/\..*//')" >&2
+        echo "DRY-RUN: would stage + commit + push to refs/heads/host/$(_host)" >&2
         # Still call generate_gitignore — its own dry-run logic will print the diff (no write)
         generate_gitignore || true
         return 0
@@ -420,11 +433,11 @@ _init_impl() {
     if git diff --cached --quiet; then
         log "_init_impl: nothing to commit on init (already-initialized re-run, or empty workspace)"
     else
-        git commit -q -m "Initial workspace-vault sync: bootstrap host=$(hostname)"
+        git commit -q -m "Initial workspace-vault sync: bootstrap host=${SUTANDO_HOST_OVERRIDE:-$(hostname)}"
         log "_init_impl: initial commit created"
 
         local host
-        host="$(hostname | sed 's/\..*//')"
+        host="$(_host)"
         if git push origin "HEAD:refs/heads/host/${host}" 2>&1 | tee -a "$LOG" >/dev/null; then
             log "_init_impl: pushed to origin host/${host}"
             echo "sync-workspace: initialized + pushed to host/${host}"
@@ -461,7 +474,7 @@ _pull_only_impl() {
 
     # Ensure we're on the host branch (idempotent)
     local host current_branch
-    host="$(hostname | sed 's/\..*//')"
+    host="$(_host)"
     current_branch="host/${host}"
     if [ "$(git symbolic-ref --short HEAD 2>/dev/null)" != "$current_branch" ]; then
         if git show-ref --quiet "refs/remotes/origin/${current_branch}"; then
@@ -488,8 +501,21 @@ _pull_only_impl() {
     local merged=0
     for peer in $peers; do
         [ "$peer" = "origin/${current_branch}" ] && continue
+        # P1.3 fix (Codex review on #1454): when two hosts each ran `--init`
+        # independently against the same vault, their initial commits have NO
+        # common ancestor. `git merge` then errors with "refusing to merge
+        # unrelated histories" — Codex repro'd against two fresh vault clones.
+        # Detect the no-merge-base case and pass `--allow-unrelated-histories`
+        # so the first cross-host merge roots both lineages. After that, the
+        # shared root exists and the flag becomes a no-op on subsequent peers.
+        local -a merge_args=(--no-edit)
+        if ! git merge-base HEAD "$peer" >/dev/null 2>&1; then
+            log "_pull_only_impl: $peer has unrelated history with HEAD; using --allow-unrelated-histories"
+            echo "sync-workspace: $peer has unrelated history with HEAD; merging with --allow-unrelated-histories" >&2
+            merge_args+=(--allow-unrelated-histories)
+        fi
         log "_pull_only_impl: merging $peer into $current_branch"
-        if git merge --no-edit "$peer" 2>&1 | tee -a "$LOG" >/dev/null; then
+        if git merge "${merge_args[@]}" "$peer" 2>&1 | tee -a "$LOG" >/dev/null; then
             merged=$((merged + 1))
         else
             log "_pull_only_impl: conflict merging $peer; resolving via --ours (use-local fallback)"
@@ -565,7 +591,7 @@ _push_only_impl() {
     [ -d ".git" ] || die "push-only: $WORKSPACE_DIR is not a git repo; run --init first"
 
     if [ "$DRY_RUN" = "1" ]; then
-        echo "DRY-RUN: would stage + commit + push to refs/heads/host/$(hostname | sed 's/\..*//')" >&2
+        echo "DRY-RUN: would stage + commit + push to refs/heads/host/$(_host)" >&2
         return 0
     fi
 
@@ -589,10 +615,10 @@ _push_only_impl() {
         return 1
     fi
 
-    git commit -q -m "Sync $(hostname) $(date +%Y-%m-%dT%H:%M)"
+    git commit -q -m "Sync ${SUTANDO_HOST_OVERRIDE:-$(hostname)} $(date +%Y-%m-%dT%H:%M)"
 
     local host
-    host="$(hostname | sed 's/\..*//')"
+    host="$(_host)"
     if git push origin "HEAD:refs/heads/host/${host}" 2>&1 | tee -a "$LOG" >/dev/null; then
         log "_push_only_impl: pushed to origin host/${host}"
         echo "sync-workspace: pushed to host/${host}"
@@ -730,7 +756,7 @@ _migrate_from_legacy_impl() {
 
     # 3. pending-questions.md (prefer machine-<host>/pending-questions.md if present)
     local host
-    host="$(hostname | sed 's/\..*//')"
+    host="$(_host)"
     local pq_src
     if [ -f "$legacy_dir/machine-${host}/pending-questions.md" ]; then
         pq_src="$legacy_dir/machine-${host}/pending-questions.md"

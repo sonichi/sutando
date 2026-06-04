@@ -888,6 +888,121 @@ echo '{}' > "$FIXTURE_REPO/sutando.config.local.json"
 
 # ============================================================================
 echo
+echo "==== Test 23: --pull-only handles unrelated histories across fresh hosts (Codex P1.3) ===="
+# Two hosts that each run `--init` from scratch against the SAME bare vault
+# produce TWO unrelated initial commits — no common ancestor. Pre-fix, the
+# first cross-host `git merge` died with "refusing to merge unrelated
+# histories" and `--pull-only` silently "succeeded" with 0 peers merged.
+# This test sets up that exact topology and verifies the second host's
+# pull-only succeeds AND surfaces the peer's content into the local
+# workspace.
+TEST23_VAULT="$TEST_ROOT/vault-23.git"
+git init -q --bare "$TEST23_VAULT"
+
+# Host A: fresh workspace + --init against the shared vault
+HOSTA_WS="$TEST_ROOT/hostA-ws"
+HOSTA_REPO="$TEST_ROOT/hostA-repo"
+mkdir -p "$HOSTA_WS" "$HOSTA_REPO/scripts" "$HOSTA_REPO/src"
+touch "$HOSTA_REPO/CLAUDE.md"
+git init -q "$HOSTA_REPO"
+cp "$REPO/scripts/sync-workspace.sh" "$HOSTA_REPO/scripts/"
+cp "$REPO/scripts/sutando-config.sh" "$HOSTA_REPO/scripts/"
+cp "$REPO/src/sutando_config.py" "$HOSTA_REPO/src/"
+cp "$FIXTURE_REPO/sutando.config.json" "$HOSTA_REPO/"
+HOSTA_SLUG=$(printf '%s' "$HOSTA_REPO" | sed 's|/|-|g')
+mkdir -p "$HOSTA_WS/.claude-sutando/projects/${HOSTA_SLUG}/memory"
+mkdir -p "$HOSTA_WS/notes"
+echo "from hostA" > "$HOSTA_WS/.claude-sutando/projects/${HOSTA_SLUG}/memory/feedback_hostA.md"
+echo "hostA note" > "$HOSTA_WS/notes/hostA-note.md"
+
+# Run --init on host A — hostname is the same across both hosts (same machine
+# running the test), so we override HOST per-invocation via the
+# SUTANDO_HOST_OVERRIDE test-only shim in the script.
+env -i HOME="$HOME" PATH="$PATH" \
+    SUTANDO_REPO_DIR="$HOSTA_REPO" \
+    SUTANDO_WORKSPACE="$HOSTA_WS" \
+    SUTANDO_TEST_MODE=1 \
+    SUTANDO_HOST_OVERRIDE=hostA \
+    bash "$HOSTA_REPO/scripts/sync-workspace.sh" --vault-url "$TEST23_VAULT" --init 2>&1 | tail -3 >/dev/null
+
+# Host B: ALSO fresh, ALSO --init, ALSO pushes to the SAME vault — but with
+# a DIFFERENT hostname → different host branch, independent root commit.
+HOSTB_WS="$TEST_ROOT/hostB-ws"
+HOSTB_REPO="$TEST_ROOT/hostB-repo"
+mkdir -p "$HOSTB_WS" "$HOSTB_REPO/scripts" "$HOSTB_REPO/src"
+touch "$HOSTB_REPO/CLAUDE.md"
+git init -q "$HOSTB_REPO"
+cp "$REPO/scripts/sync-workspace.sh" "$HOSTB_REPO/scripts/"
+cp "$REPO/scripts/sutando-config.sh" "$HOSTB_REPO/scripts/"
+cp "$REPO/src/sutando_config.py" "$HOSTB_REPO/src/"
+cp "$FIXTURE_REPO/sutando.config.json" "$HOSTB_REPO/"
+HOSTB_SLUG=$(printf '%s' "$HOSTB_REPO" | sed 's|/|-|g')
+mkdir -p "$HOSTB_WS/.claude-sutando/projects/${HOSTB_SLUG}/memory"
+mkdir -p "$HOSTB_WS/notes"
+echo "from hostB" > "$HOSTB_WS/.claude-sutando/projects/${HOSTB_SLUG}/memory/feedback_hostB.md"
+echo "hostB note" > "$HOSTB_WS/notes/hostB-note.md"
+
+env -i HOME="$HOME" PATH="$PATH" \
+    SUTANDO_REPO_DIR="$HOSTB_REPO" \
+    SUTANDO_WORKSPACE="$HOSTB_WS" \
+    SUTANDO_TEST_MODE=1 \
+    SUTANDO_HOST_OVERRIDE=hostB \
+    bash "$HOSTB_REPO/scripts/sync-workspace.sh" --vault-url "$TEST23_VAULT" --init 2>&1 | tail -3 >/dev/null
+
+# Verify two unrelated host branches exist in the vault
+HOSTA_SHA=$(git --git-dir="$TEST23_VAULT" rev-parse refs/heads/host/hostA 2>/dev/null || echo "")
+HOSTB_SHA=$(git --git-dir="$TEST23_VAULT" rev-parse refs/heads/host/hostB 2>/dev/null || echo "")
+if [ -n "$HOSTA_SHA" ] && [ -n "$HOSTB_SHA" ]; then
+  echo "  OK: host/hostA and host/hostB both pushed to vault"; pass=$((pass+1))
+else
+  echo "  FAIL: one or both host branches missing from vault (A=$HOSTA_SHA B=$HOSTB_SHA)"; fail=$((fail+1))
+fi
+
+# Confirm unrelated histories (the pre-condition that triggered the bug)
+MERGE_BASE=$(git --git-dir="$TEST23_VAULT" merge-base "$HOSTA_SHA" "$HOSTB_SHA" 2>/dev/null || echo "")
+if [ -z "$MERGE_BASE" ]; then
+  echo "  OK: hostA and hostB have NO common ancestor (unrelated histories — bug pre-condition)"; pass=$((pass+1))
+else
+  echo "  FAIL: hostA and hostB share ancestor $MERGE_BASE — test setup wrong"; fail=$((fail+1))
+fi
+
+# Now run --pull-only on host B → should merge hostA in via --allow-unrelated-histories
+PULL_OUT=$(env -i HOME="$HOME" PATH="$PATH" \
+    SUTANDO_REPO_DIR="$HOSTB_REPO" \
+    SUTANDO_WORKSPACE="$HOSTB_WS" \
+    SUTANDO_TEST_MODE=1 \
+    SUTANDO_HOST_OVERRIDE=hostB \
+    bash "$HOSTB_REPO/scripts/sync-workspace.sh" --vault-url "$TEST23_VAULT" --pull-only 2>&1)
+
+# Verify hostA's content surfaced into hostB's workspace
+HOSTA_VISIBLE_FILE="$HOSTB_WS/.claude-sutando/projects/${HOSTA_SLUG}/memory/feedback_hostA.md"
+assert_file_exists "hostA's memory file visible in hostB workspace after pull-only" "$HOSTA_VISIBLE_FILE"
+HOSTA_VISIBLE_NOTE="$HOSTB_WS/notes/hostA-note.md"
+assert_file_exists "hostA's note visible in hostB workspace after pull-only" "$HOSTA_VISIBLE_NOTE"
+
+# Verify hostB's OWN content still present (merge didn't wipe local)
+HOSTB_OWN_FILE="$HOSTB_WS/.claude-sutando/projects/${HOSTB_SLUG}/memory/feedback_hostB.md"
+assert_file_exists "hostB's own memory still present after pull-only" "$HOSTB_OWN_FILE"
+
+# Verify hostB's local git head is now a merge commit with 2 parents
+cd "$HOSTB_WS"
+PARENT_COUNT=$(git cat-file -p HEAD 2>/dev/null | grep -c "^parent " || echo 0)
+if [ "$PARENT_COUNT" -ge 2 ]; then
+  echo "  OK: hostB HEAD is a merge commit (2+ parents)"; pass=$((pass+1))
+else
+  echo "  FAIL: hostB HEAD has $PARENT_COUNT parents — expected merge commit"; fail=$((fail+1))
+fi
+cd "$REPO"
+
+# Confirm the new --allow-unrelated-histories log line fired (visible in stderr)
+if echo "$PULL_OUT" | grep -q "unrelated history"; then
+  echo "  OK: --pull-only logged 'unrelated history' detection"; pass=$((pass+1))
+else
+  echo "  FAIL: --pull-only did not log unrelated-history detection; output: $PULL_OUT"; fail=$((fail+1))
+fi
+
+# ============================================================================
+echo
 echo "===================="
 echo "Total: $((pass+fail)) — pass: $pass, fail: $fail"
 exit $fail
