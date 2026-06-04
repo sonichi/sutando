@@ -1,4 +1,4 @@
-"""Tests for skills/vault/vault.py and the extended vault_intercept helpers."""
+"""Tests for skills/secret-vault/secret-vault.py and the extended vault_intercept helpers."""
 import json
 import os
 import subprocess

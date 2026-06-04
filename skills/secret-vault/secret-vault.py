@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""vault — manage secrets stored in macOS Keychain via Sutando's vault.
+"""secret-vault — manage secrets stored in macOS Keychain via Sutando's secret vault.
 
 Subcommands:
   list                    Show all stored key names (no values)
@@ -7,9 +7,9 @@ Subcommands:
   env KEY [KEY...] -- CMD Run CMD with vault keys injected as environment variables
 
 Examples:
-  vault.py list
-  vault.py get OPENAI_API_KEY
-  vault.py env OPENAI_API_KEY STRIPE_KEY -- python3 my_script.py
+  secret-vault.py list
+  secret-vault.py get OPENAI_API_KEY
+  secret-vault.py env OPENAI_API_KEY STRIPE_KEY -- python3 my_script.py
 """
 
 import os

@@ -42,7 +42,7 @@ from datetime import datetime, timezone
 from typing import NamedTuple
 
 _ACCOUNT = "sutando"
-_MANIFEST_PATH = os.path.expanduser("~/.sutando-vault/keys.json")
+_MANIFEST_PATH = os.path.expanduser("~/.sutando-secret-vault/keys.json")
 
 # Matches: vault set KEY <value>  where value is:
 #   - double-quoted string   "foo bar"
