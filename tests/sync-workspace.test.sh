@@ -96,7 +96,6 @@ COMMON_ENV=(
   SUTANDO_REPO_DIR="$FIXTURE_REPO"
   SUTANDO_WORKSPACE="$FIXTURE_WS"
   SUTANDO_TEST_MODE=1
-  SUTANDO_VAULT="$FIXTURE_VAULT"
 )
 
 SYNC="$FIXTURE_REPO/scripts/sync-workspace.sh"
@@ -107,8 +106,9 @@ HOST_BRANCH="refs/heads/host/${HOST}"
 LOCAL_SLUG=$(printf '%s' "$FIXTURE_REPO" | sed 's|/|-|g')
 LOCAL_MEM_DIR="$FIXTURE_WS/.claude-sutando/projects/${LOCAL_SLUG}/memory"
 
+# PR-2: SUTANDO_VAULT env var removed; tests pass vault via --vault-url flag.
 run_sync() {
-  env "${COMMON_ENV[@]}" bash "$SYNC" "$@"
+  env "${COMMON_ENV[@]}" bash "$SYNC" --vault-url "$FIXTURE_VAULT" "$@"
 }
 
 # ============================================================================
@@ -293,7 +293,7 @@ else
 fi
 
 # Now with --force-gitignore → should overwrite
-out_force=$(env "${COMMON_ENV[@]}" bash "$SYNC" --init --force-gitignore 2>&1 || true)
+out_force=$(env "${COMMON_ENV[@]}" bash "$SYNC" --vault-url "$FIXTURE_VAULT" --init --force-gitignore 2>&1 || true)
 if grep -q "my custom user edit" "$FIXTURE_WS/.gitignore"; then
   echo "  FAIL: --force-gitignore didn't overwrite (user edit still there)"; fail=$((fail+1))
 else
@@ -310,7 +310,7 @@ echo "==== Test 10: pull-side mass-deletion tripwire (Pro #1445 review fix #2) =
 # but the tripwire reset prevented push; let's force-push them now via SUTANDO_FORCE_SYNC).
 cd "$FIXTURE_WS"
 for i in $(seq 1 60); do echo "n$i" > "notes/note-$i.md"; done
-SUTANDO_FORCE_SYNC=1 env "${COMMON_ENV[@]}" bash "$SYNC" --push-only 2>&1 | head -3
+SUTANDO_FORCE_SYNC=1 env "${COMMON_ENV[@]}" bash "$SYNC" --vault-url "$FIXTURE_VAULT" --push-only 2>&1 | head -3
 cd - >/dev/null
 
 # Peer: clone, delete all 60 notes, push to host/peerhost2
@@ -362,7 +362,7 @@ PRE_LEGACY_NOTE_EXISTS="$([ -f "$FIXTURE_WS/notes/legacy-note.md" ] && echo yes 
 
 # Run --dry-run; should NOT mutate fs
 out_dryrun=$(SUTANDO_MEMORY_SYNC_DIR="$LEGACY_FIXTURE" \
-             env "${COMMON_ENV[@]}" bash "$SYNC" --migrate-from-legacy --dry-run 2>&1 || true)
+             env "${COMMON_ENV[@]}" bash "$SYNC" --vault-url "$FIXTURE_VAULT" --migrate-from-legacy --dry-run 2>&1 || true)
 case "$out_dryrun" in
   *"DRY-RUN"*)
     echo "  OK: --dry-run output contains DRY-RUN markers"; pass=$((pass+1)) ;;
@@ -395,7 +395,7 @@ echo "==== Test 12: pull-side delete-AND-add bypass (Mini #1445 v3 Medium fix) =
 # Reset host 1 to have the 60 notes pushed
 cd "$FIXTURE_WS"
 for i in $(seq 1 60); do echo "n$i" > "notes/note-$i.md"; done
-SUTANDO_FORCE_SYNC=1 env "${COMMON_ENV[@]}" bash "$SYNC" --push-only 2>&1 | head -3
+SUTANDO_FORCE_SYNC=1 env "${COMMON_ENV[@]}" bash "$SYNC" --vault-url "$FIXTURE_VAULT" --push-only 2>&1 | head -3
 cd - >/dev/null
 
 # Peer3: clone, delete all 60 notes, add 60 NEW files (net zero), push
@@ -465,17 +465,14 @@ fi
 
 # ============================================================================
 echo
-echo "==== Test 13: .env without SUTANDO_VAULT falls through to legacy (Mini #1445 v4 Medium) ===="
-# Setup: write .env with ONLY SUTANDO_MEMORY_REPO (legacy alias), no
-# SUTANDO_VAULT entry. Run --status WITHOUT SUTANDO_VAULT in env. Pre-fix,
-# the `grep '^SUTANDO_VAULT=' | head -1 | ...` pipeline returned nonzero
-# under set -euo pipefail and the script exited before the legacy-alias
-# fallback could run.
+echo "==== Test 13: .env SUTANDO_MEMORY_REPO legacy alias (PR-2 — deprecated but honored) ===="
+# PR-2 dropped SUTANDO_VAULT env-var support. The .env legacy alias
+# SUTANDO_MEMORY_REPO is still warn-and-honored for one release. Test:
+# write .env with SUTANDO_MEMORY_REPO + no --vault-url + no config field →
+# script resolves vault from .env legacy + prints deprecation warning.
 
-# Write .env with only the legacy alias
 echo "SUTANDO_MEMORY_REPO=$FIXTURE_VAULT" > "$FIXTURE_REPO/.env"
 
-# Run --status WITHOUT SUTANDO_VAULT in env
 out_legacy_alias=$(env \
     SUTANDO_REPO_DIR="$FIXTURE_REPO" \
     SUTANDO_WORKSPACE="$FIXTURE_WS" \
@@ -484,59 +481,188 @@ out_legacy_alias=$(env \
 legacy_exit=$(printf '%s' "$out_legacy_alias" | sed -n 's/^EXIT=//p' | tail -1)
 
 if [ "$legacy_exit" = "0" ]; then
-  echo "  OK: --status exits 0 when .env has only SUTANDO_MEMORY_REPO (no SUTANDO_VAULT)"; pass=$((pass+1))
+  echo "  OK: --status exits 0 with only SUTANDO_MEMORY_REPO in .env"; pass=$((pass+1))
 else
-  echo "  FAIL: --status exited $legacy_exit on legacy-alias .env (set-e tripped on grep): $out_legacy_alias"; fail=$((fail+1))
+  echo "  FAIL: --status exited $legacy_exit on legacy-alias .env: $out_legacy_alias"; fail=$((fail+1))
 fi
 
 case "$out_legacy_alias" in
-  *"SUTANDO_MEMORY_REPO"*)
+  *"SUTANDO_MEMORY_REPO is deprecated"*)
     echo "  OK: legacy-alias deprecation warning surfaced"; pass=$((pass+1)) ;;
   *) echo "  FAIL: legacy-alias deprecation warning missing: $out_legacy_alias"; fail=$((fail+1)) ;;
 esac
 
-# Cleanup so subsequent test runs aren't sticky
+case "$out_legacy_alias" in
+  *"$FIXTURE_VAULT"*)
+    echo "  OK: vault URL resolved from .env legacy alias"; pass=$((pass+1)) ;;
+  *) echo "  FAIL: vault URL not resolved from legacy .env: $out_legacy_alias"; fail=$((fail+1)) ;;
+esac
+
 rm -f "$FIXTURE_REPO/.env"
 
 # ============================================================================
 echo
-echo "==== Test 14: canonical .env with SUTANDO_VAULT entry (Mini #1445 v6 gap) ===="
-# Mirror of Test 13 but for the CANONICAL key (SUTANDO_VAULT=) rather than
-# the legacy alias. Test 13 covers the missing-key fallback path; this covers
-# the happy path via .env (vs Test 1-12 which set SUTANDO_VAULT via process env).
+echo "==== Test 14: --vault-url CLI flag (PR-2 — canonical explicit) ===="
+# Run --status WITHOUT any .env, WITHOUT SUTANDO_VAULT (removed in PR-2),
+# WITHOUT vault.remote_url in config — only --vault-url flag. Should resolve.
 
-echo "SUTANDO_VAULT=$FIXTURE_VAULT" > "$FIXTURE_REPO/.env"
+out_flag=$(env \
+    SUTANDO_REPO_DIR="$FIXTURE_REPO" \
+    SUTANDO_WORKSPACE="$FIXTURE_WS" \
+    SUTANDO_TEST_MODE=1 \
+    bash "$SYNC" --vault-url "$FIXTURE_VAULT" --status 2>&1; echo "EXIT=$?")
+flag_exit=$(printf '%s' "$out_flag" | sed -n 's/^EXIT=//p' | tail -1)
 
-out_canon=$(env \
+if [ "$flag_exit" = "0" ]; then
+  echo "  OK: --status exits 0 with --vault-url flag"; pass=$((pass+1))
+else
+  echo "  FAIL: --status exited $flag_exit on --vault-url: $out_flag"; fail=$((fail+1))
+fi
+
+case "$out_flag" in
+  *"$FIXTURE_VAULT"*)
+    echo "  OK: vault URL resolved from --vault-url flag"; pass=$((pass+1)) ;;
+  *) echo "  FAIL: vault URL not resolved from flag: $out_flag"; fail=$((fail+1)) ;;
+esac
+
+# Flag must NOT trigger legacy-alias deprecation warning
+case "$out_flag" in
+  *"SUTANDO_MEMORY_REPO is deprecated"*)
+    echo "  FAIL: --vault-url spuriously triggered legacy-alias warning"; fail=$((fail+1)) ;;
+  *)
+    echo "  OK: --vault-url does NOT trigger legacy-alias warning"; pass=$((pass+1)) ;;
+esac
+
+# ============================================================================
+echo
+echo "==== Test 15: vault.remote_url from sutando.config.local.json (PR-2 — canonical config) ===="
+# Write vault.remote_url into sutando.config.local.json + run with NO --vault-url
+# flag + NO .env → should resolve via config file (the recommended path).
+
+cat > "$FIXTURE_REPO/sutando.config.local.json" <<JSON
+{"vault": {"remote_url": "$FIXTURE_VAULT"}}
+JSON
+
+out_config=$(env \
     SUTANDO_REPO_DIR="$FIXTURE_REPO" \
     SUTANDO_WORKSPACE="$FIXTURE_WS" \
     SUTANDO_TEST_MODE=1 \
     bash "$SYNC" --status 2>&1; echo "EXIT=$?")
-canon_exit=$(printf '%s' "$out_canon" | sed -n 's/^EXIT=//p' | tail -1)
+config_exit=$(printf '%s' "$out_config" | sed -n 's/^EXIT=//p' | tail -1)
 
-if [ "$canon_exit" = "0" ]; then
-  echo "  OK: --status exits 0 with canonical SUTANDO_VAULT in .env"; pass=$((pass+1))
+if [ "$config_exit" = "0" ]; then
+  echo "  OK: --status exits 0 with vault.remote_url from local config"; pass=$((pass+1))
 else
-  echo "  FAIL: --status exited $canon_exit on canonical .env: $out_canon"; fail=$((fail+1))
+  echo "  FAIL: --status exited $config_exit on config-driven vault: $out_config"; fail=$((fail+1))
 fi
 
-# Canonical key MUST NOT trigger the legacy-alias deprecation warning
-case "$out_canon" in
-  *"please rename to SUTANDO_VAULT"*|*"SUTANDO_MEMORY_REPO is set"*)
-    echo "  FAIL: canonical .env spuriously triggered legacy-alias warning"; fail=$((fail+1)) ;;
-  *)
-    echo "  OK: canonical .env does NOT trigger legacy-alias warning"; pass=$((pass+1)) ;;
+case "$out_config" in
+  *"$FIXTURE_VAULT"*)
+    echo "  OK: vault URL resolved from sutando.config.local.json"; pass=$((pass+1)) ;;
+  *) echo "  FAIL: vault URL not resolved from config: $out_config"; fail=$((fail+1)) ;;
 esac
 
-# Vault URL resolved correctly from .env. Match by path-string presence rather
-# than `VAULT_URL: $val` to tolerate the column-aligned status output.
-case "$out_canon" in
-  *"$FIXTURE_VAULT"*)
-    echo "  OK: --status surfaced VAULT_URL from .env"; pass=$((pass+1)) ;;
-  *) echo "  FAIL: VAULT_URL not surfaced from canonical .env: $out_canon"; fail=$((fail+1)) ;;
+# Config-driven path must NOT trigger legacy deprecation warning
+case "$out_config" in
+  *"SUTANDO_MEMORY_REPO is deprecated"*)
+    echo "  FAIL: config-driven path spuriously triggered legacy warning"; fail=$((fail+1)) ;;
+  *)
+    echo "  OK: config-driven path does NOT trigger legacy warning"; pass=$((pass+1)) ;;
 esac
+
+# Cleanup: restore original empty local config
+echo '{}' > "$FIXTURE_REPO/sutando.config.local.json"
+
+# ============================================================================
+echo
+echo "==== Test 16: SUTANDO_VAULT env var is NO LONGER honored (PR-2 — removed) ===="
+# Pre-PR-2, SUTANDO_VAULT was the canonical env var. PR-2 removed it because
+# config-file + --vault-url cover both canonical and override cases. Setting
+# the env var alone (no flag, no config, no .env) should NOT resolve vault.
+
+out_removed=$(env \
+    SUTANDO_REPO_DIR="$FIXTURE_REPO" \
+    SUTANDO_WORKSPACE="$FIXTURE_WS" \
+    SUTANDO_TEST_MODE=1 \
+    SUTANDO_VAULT="$FIXTURE_VAULT" \
+    bash "$SYNC" --status 2>&1; echo "EXIT=$?")
+
+# Status should still exit 0 (it doesn't require vault to be resolved),
+# but VAULT_URL must NOT match $FIXTURE_VAULT
+case "$out_removed" in
+  *"$FIXTURE_VAULT"*)
+    echo "  FAIL: SUTANDO_VAULT env var was still honored (should be removed)"; fail=$((fail+1)) ;;
+  *)
+    echo "  OK: SUTANDO_VAULT env var ignored as expected"; pass=$((pass+1)) ;;
+esac
+
+# ============================================================================
+echo
+echo "==== Test 17: --vault-url priority over legacy .env (PR-2) ===="
+# Set BOTH --vault-url AND .env SUTANDO_MEMORY_REPO. Flag must win.
+
+OTHER_VAULT="$TEST_ROOT/other-vault.git"
+git init -q --bare "$OTHER_VAULT"
+echo "SUTANDO_MEMORY_REPO=$OTHER_VAULT" > "$FIXTURE_REPO/.env"
+
+out_pri=$(env \
+    SUTANDO_REPO_DIR="$FIXTURE_REPO" \
+    SUTANDO_WORKSPACE="$FIXTURE_WS" \
+    SUTANDO_TEST_MODE=1 \
+    bash "$SYNC" --vault-url "$FIXTURE_VAULT" --status 2>&1)
+
+# Flag value must be present
+case "$out_pri" in
+  *"$FIXTURE_VAULT"*)
+    echo "  OK: --vault-url wins over .env legacy"; pass=$((pass+1)) ;;
+  *) echo "  FAIL: --vault-url did not win over .env: $out_pri"; fail=$((fail+1)) ;;
+esac
+
+# .env value must NOT be the resolved vault (flag wins). Check that the
+# OTHER_VAULT path doesn't appear in the VAULT_URL line specifically — it may
+# appear elsewhere in status output but not as the resolved value.
+if printf '%s' "$out_pri" | grep -E "^VAULT_URL:" | grep -qF "$OTHER_VAULT"; then
+  echo "  FAIL: .env value used as VAULT_URL despite --vault-url flag"; fail=$((fail+1))
+else
+  echo "  OK: .env legacy value NOT picked when --vault-url present"; pass=$((pass+1))
+fi
 
 rm -f "$FIXTURE_REPO/.env"
+
+# ============================================================================
+echo
+echo "==== Test 18: sync-memory.sh deprecation banner (PR-2) ===="
+# sync-memory.sh stays functional but emits a one-line deprecation banner
+# pointing at sync-workspace.sh.
+
+# Copy the (real, modified) sync-memory.sh into the fixture
+cp "$REPO/scripts/sync-memory.sh" "$FIXTURE_REPO/scripts/"
+SYNC_MEM="$FIXTURE_REPO/scripts/sync-memory.sh"
+
+# Invoke with a flag that triggers early exit (e.g. SUTANDO_MEMORY_REPO unset
+# → script bails). We just want to see if the banner emits.
+out_banner=$(env \
+    SUTANDO_REPO_DIR="$FIXTURE_REPO" \
+    SUTANDO_WORKSPACE="$FIXTURE_WS" \
+    bash "$SYNC_MEM" 2>&1 || true)
+
+case "$out_banner" in
+  *"DEPRECATED"*"sync-workspace.sh"*)
+    echo "  OK: sync-memory.sh prints deprecation banner pointing at sync-workspace.sh"; pass=$((pass+1)) ;;
+  *) echo "  FAIL: sync-memory.sh missing deprecation banner: $out_banner" | head -5; fail=$((fail+1)) ;;
+esac
+
+# Suppress flag should silence it
+out_silent=$(env \
+    SUTANDO_REPO_DIR="$FIXTURE_REPO" \
+    SUTANDO_WORKSPACE="$FIXTURE_WS" \
+    SUTANDO_SYNC_MEMORY_SUPPRESS_DEPRECATION=1 \
+    bash "$SYNC_MEM" 2>&1 || true)
+
+case "$out_silent" in
+  *"DEPRECATED"*) echo "  FAIL: SUPPRESS flag did not silence deprecation banner"; fail=$((fail+1)) ;;
+  *) echo "  OK: SUTANDO_SYNC_MEMORY_SUPPRESS_DEPRECATION=1 silences banner"; pass=$((pass+1)) ;;
+esac
 
 # ============================================================================
 echo

@@ -1,5 +1,15 @@
 # Memory + notes sync across machines
 
+> **Update (PR-2, issue #1445 followup, 2026-06-04):** the canonical sync path is now `scripts/sync-workspace.sh` — workspace IS the git repo + per-host branch topology + 4-tier safety. The `scripts/sync-memory.sh` documented below is the legacy rsync-to-`~/.sutando/memory-sync/` flow; it still works (and emits a one-line deprecation banner on each invocation) but will be removed in PR-2.1 after dogfooding the new path. To migrate:
+>
+> 1. `bash scripts/sync-workspace.sh --init` once per machine — converts the workspace into a git repo
+> 2. Move vault URL from `.env` (`SUTANDO_MEMORY_REPO=...`) into `sutando.config.local.json` under `vault.remote_url`, OR pass `--vault-url <url>` per invocation
+> 3. Replace the cron entry calling `sync-memory.sh` with one calling `sync-workspace.sh` (see `skills/schedule-crons/crons.example.json` for the new entry)
+>
+> The rest of this doc covers the legacy script. Switch to `tests/sync-workspace.test.sh` + PR #1445 for the new architecture.
+
+---
+
 Sutando supports running the same agent identity across multiple machines (e.g. Mac mini + MacBook + Mac Studio). Each machine runs its own Claude Code session; a shared private git repo keeps the agent's memory and long-form notes consistent between them.
 
 The mechanism is intentionally minimal: a single shell script (`scripts/sync-memory.sh`) that's invoked on a cron tick. It pulls everyone's latest writes, copies this machine's local edits into the shared repo, commits with the hostname, and pushes.

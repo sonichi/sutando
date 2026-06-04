@@ -20,9 +20,9 @@
     "prompt": "Run: bash scripts/cron-gate.sh pending-questions python3 src/check-pending-questions.py — notifies about unanswered pending questions (deferred when owner tasks are queued; next */30 retry covers a skipped fire)."
   },
   {
-    "name": "sync-memory",
+    "name": "sync-workspace",
     "cron": "*/30 * * * *",
-    "prompt": "Run: bash scripts/cron-gate.sh sync-memory bash scripts/sync-memory.sh — syncs memory and notes to the private memory repo (requires SUTANDO_MEMORY_REPO in .env; deferred when owner tasks are queued; next */30 retry covers a skipped fire)."
+    "prompt": "Run: bash scripts/cron-gate.sh sync-workspace bash scripts/sync-workspace.sh — syncs workspace (memory + notes + state/cores) to the private vault via per-host branch (requires vault.remote_url in sutando.config.local.json, or --vault-url flag; deferred when owner tasks are queued; next */30 retry covers a skipped fire). Replaces the legacy sync-memory entry (which used rsync to a separate ~/.sutando/memory-sync/ clone); sync-memory.sh still works during the transition but emits a deprecation banner."
   },
   {
     "name": "obsidian-dream",

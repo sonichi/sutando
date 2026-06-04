@@ -32,6 +32,24 @@
 #
 # Run: bash scripts/sync-memory.sh
 
+# --- PR-2 deprecation banner ---
+# As of PR-2 (issue #1445 followup, 2026-06-04), the canonical sync path is
+# `scripts/sync-workspace.sh` (workspace IS the git repo + branch-per-host
+# topology + 4-tier safety). This script's rsync-to-~/.sutando/memory-sync/
+# architecture remains supported during the transition window but will be
+# removed in PR-2.1 after observed dogfooding.
+#
+# Migration recipe:
+#   1. bash scripts/sync-workspace.sh --init   # convert workspace into a git repo
+#   2. Update your cron/launchd to call sync-workspace.sh instead of sync-memory.sh
+#   3. Move vault URL from .env (SUTANDO_MEMORY_REPO) to sutando.config.local.json
+#      under `vault.remote_url`
+#
+# Suppress this banner by setting SUTANDO_SYNC_MEMORY_SUPPRESS_DEPRECATION=1.
+if [ "${SUTANDO_SYNC_MEMORY_SUPPRESS_DEPRECATION:-0}" != "1" ]; then
+    echo "sync-memory: DEPRECATED — prefer scripts/sync-workspace.sh (see header for migration recipe; set SUTANDO_SYNC_MEMORY_SUPPRESS_DEPRECATION=1 to silence)." >&2
+fi
+
 # If SUTANDO_MEMORY_SYNC_DIR is not set, try to auto-detect: if the script
 # lives inside an existing memory-sync clone, use that. Otherwise default
 # to ~/.sutando/memory-sync/. The auto-detect handles both the new convention

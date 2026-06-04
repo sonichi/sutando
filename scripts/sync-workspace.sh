@@ -41,6 +41,16 @@
 # Env vars:
 #   SUTANDO_VAULT             — git URL of the private vault repo (REQUIRED)
 #                               Legacy alias: SUTANDO_MEMORY_REPO (honored one release)
+# Vault URL resolution (PR-2 — issue #1445 followup):
+#   1. --vault-url <url> CLI flag (tests, one-shot overrides; canonical for explicit)
+#   2. sutando.config.local.json → vault.remote_url (per-clone canonical)
+#   3. sutando.config.json → vault.remote_url (tracked default)
+#   4. .env SUTANDO_MEMORY_REPO (deprecated legacy alias; warn-and-honor for one release)
+#
+# Note: SUTANDO_VAULT env var (introduced in PR-1 = #1445) is REMOVED in PR-2.
+# Brand new, no users to deprecate; CLI flag + config-file is the canonical surface.
+#
+# Other env vars:
 #   SUTANDO_REPO_DIR          — path to sutando code checkout. Auto-detected from script path.
 #   NO_COLOR                  — suppress ANSI escapes in warnings (no-color.org)
 #   SUTANDO_SYNC_MAX_DELETE   — mass-deletion absolute tripwire (default 50)
@@ -56,19 +66,36 @@ set -euo pipefail
 
 DRY_RUN=0            # --dry-run: skip mutating ops, print "would: ..." instead
 FORCE_GITIGNORE=0    # --force-gitignore: overwrite existing .gitignore without warning
+VAULT_URL_FLAG=""    # --vault-url <url>: explicit vault URL override (PR-2)
 
-# Parse global flags out of $@ (leaves only the subcommand + its args).
+# Parse global flags out of $@ (leaves only the subcommand + its args). Two-arg
+# flags (`--vault-url <url>`) supported via _consume_next state; equals-form
+# (`--vault-url=<url>`) supported via prefix match.
 _args=()
+_consume_next=""
 for _arg in "$@"; do
+    if [ -n "$_consume_next" ]; then
+        case "$_consume_next" in
+            vault-url) VAULT_URL_FLAG="$_arg" ;;
+        esac
+        _consume_next=""
+        continue
+    fi
     case "$_arg" in
         --dry-run)         DRY_RUN=1 ;;
         --force-gitignore) FORCE_GITIGNORE=1 ;;
+        --vault-url)       _consume_next="vault-url" ;;
+        --vault-url=*)     VAULT_URL_FLAG="${_arg#--vault-url=}" ;;
         *)                 _args+=("$_arg") ;;
     esac
 done
+if [ -n "$_consume_next" ]; then
+    echo "sync-workspace: --$_consume_next requires a value" >&2
+    exit 2
+fi
 # Reset $@ to non-flag args
 set -- "${_args[@]:-}"
-unset _args
+unset _args _consume_next
 
 # --------------------------------------------------------------------------- #
 # Section 1 — Bootstrap (paths, env, config)                                   #
@@ -118,22 +145,27 @@ if [ -z "$WORKSPACE_DIR" ] || [ ! -d "$WORKSPACE_DIR" ]; then
     exit 1
 fi
 
-# Vault URL: SUTANDO_VAULT canonical; SUTANDO_MEMORY_REPO honored as legacy alias.
-VAULT_URL="${SUTANDO_VAULT:-${SUTANDO_MEMORY_REPO:-}}"
-if [ -n "${SUTANDO_MEMORY_REPO:-}" ] && [ -z "${SUTANDO_VAULT:-}" ]; then
-    echo "sync-workspace: SUTANDO_MEMORY_REPO is set; please rename to SUTANDO_VAULT (legacy alias honored this release)." >&2
+# Resolve vault URL via the PR-2 priority chain. The `.env` file was already
+# `set -a; . .env; set +a`-loaded above, so SUTANDO_MEMORY_REPO appears as an
+# env var if set in .env — no need to re-grep the file (eliminates the
+# var=$(grep | head | ...) set-e trap class entirely; see Mini #1445 v4 Medium).
+VAULT_URL=""
+
+# Priority 1: --vault-url CLI flag (explicit)
+if [ -n "$VAULT_URL_FLAG" ]; then
+    VAULT_URL="$VAULT_URL_FLAG"
 fi
-# Load from .env if still empty. NB: `grep ... | head -1 | ...` exits nonzero
-# when grep finds no match (e.g. .env without SUTANDO_VAULT), which under
-# `set -euo pipefail` propagates through pipefail and exits the script before
-# the SUTANDO_MEMORY_REPO fallback can run — `var=$(...)` assignment does NOT
-# exempt set -e from the subshell's failure. Trailing `|| true` on each
-# pipeline restores the intended fall-through semantics. Mini #1445 v4 Medium.
-if [ -z "$VAULT_URL" ] && [ -f "$REPO_DIR/.env" ]; then
-    VAULT_URL=$(grep -E '^SUTANDO_VAULT=' "$REPO_DIR/.env" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true)
-    if [ -z "$VAULT_URL" ]; then
-        VAULT_URL=$(grep -E '^SUTANDO_MEMORY_REPO=' "$REPO_DIR/.env" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true)
-    fi
+
+# Priority 2+3: sutando.config.{local,base}.json → vault.remote_url
+# (loader merges local + base + applies ${REPO_DIR} substitution)
+if [ -z "$VAULT_URL" ] && [ -f "$SCRIPT_PARENT/scripts/sutando-config.sh" ]; then
+    VAULT_URL="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" vault-url 2>/dev/null || true)"
+fi
+
+# Priority 4: legacy .env SUTANDO_MEMORY_REPO (warn-and-honor for one release)
+if [ -z "$VAULT_URL" ] && [ -n "${SUTANDO_MEMORY_REPO:-}" ]; then
+    VAULT_URL="$SUTANDO_MEMORY_REPO"
+    echo "sync-workspace: SUTANDO_MEMORY_REPO is deprecated; move vault URL to sutando.config.local.json under vault.remote_url." >&2
 fi
 
 # --------------------------------------------------------------------------- #
