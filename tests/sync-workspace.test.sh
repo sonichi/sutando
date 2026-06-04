@@ -666,6 +666,60 @@ esac
 
 # ============================================================================
 echo
+echo "==== Test 19: graceful fall-through when sutando-config.sh vault-url returns empty (Pro #1446) ===="
+# Pro's hold flag: "is sutando-config.sh vault-url implemented, or does the
+# helper silently return empty and fall through to deprecated .env?"
+# This test stages the explicit fall-through path:
+#   - config has NO vault.remote_url (helper returns empty)
+#   - NO --vault-url flag
+#   - .env HAS SUTANDO_MEMORY_REPO
+# Expected: script resolves URL via .env legacy + emits deprecation warning.
+# Proves the silent-no-op DOES gracefully degrade (config helper empty → .env
+# fallback fires, not a crash, not a loop).
+
+# Verify the helper itself returns empty when no remote_url in config
+helper_out="$(SUTANDO_REPO_DIR="$FIXTURE_REPO" \
+              SUTANDO_WORKSPACE="$FIXTURE_WS" \
+              SUTANDO_TEST_MODE=1 \
+              bash "$FIXTURE_REPO/scripts/sutando-config.sh" vault-url 2>/dev/null)"
+if [ -z "$helper_out" ]; then
+  echo "  OK: sutando-config.sh vault-url returns empty when config has no remote_url"; pass=$((pass+1))
+else
+  echo "  FAIL: helper returned non-empty for config-without-remote_url: $helper_out"; fail=$((fail+1))
+fi
+
+# Stage the fall-through path: config empty + .env has legacy alias
+echo "SUTANDO_MEMORY_REPO=$FIXTURE_VAULT" > "$FIXTURE_REPO/.env"
+
+out_fallthru=$(env \
+    SUTANDO_REPO_DIR="$FIXTURE_REPO" \
+    SUTANDO_WORKSPACE="$FIXTURE_WS" \
+    SUTANDO_TEST_MODE=1 \
+    bash "$SYNC" --status 2>&1; echo "EXIT=$?")
+fallthru_exit=$(printf '%s' "$out_fallthru" | sed -n 's/^EXIT=//p' | tail -1)
+
+if [ "$fallthru_exit" = "0" ]; then
+  echo "  OK: --status exits 0 with empty config + legacy .env (graceful fall-through)"; pass=$((pass+1))
+else
+  echo "  FAIL: --status crashed/exited $fallthru_exit on fall-through: $out_fallthru"; fail=$((fail+1))
+fi
+
+case "$out_fallthru" in
+  *"SUTANDO_MEMORY_REPO is deprecated"*)
+    echo "  OK: deprecation warning fired (correct fall-through path used)"; pass=$((pass+1)) ;;
+  *) echo "  FAIL: no deprecation warning on fall-through — config-path might be silently winning"; fail=$((fail+1)) ;;
+esac
+
+case "$out_fallthru" in
+  *"$FIXTURE_VAULT"*)
+    echo "  OK: vault URL resolved via .env legacy after empty config"; pass=$((pass+1)) ;;
+  *) echo "  FAIL: vault URL not resolved at all: $out_fallthru"; fail=$((fail+1)) ;;
+esac
+
+rm -f "$FIXTURE_REPO/.env"
+
+# ============================================================================
+echo
 echo "===================="
 echo "Total: $((pass+fail)) — pass: $pass, fail: $fail"
 exit $fail
