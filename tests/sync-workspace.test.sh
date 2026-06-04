@@ -417,6 +417,9 @@ case "$out_bypass" in
   *) echo "  FAIL: delete-and-add bypass succeeded — tripwire missed: $out_bypass"; fail=$((fail+1)) ;;
 esac
 
+# Snapshot HEAD before pull was attempted (from earlier in test setup)
+PRE_BYPASS_SHA=$(cd "$FIXTURE_WS" && git rev-parse HEAD 2>/dev/null)
+
 # Verify host 1's note-*.md files survived
 RESTORED_COUNT=$(ls "$FIXTURE_WS/notes/note-"*.md 2>/dev/null | wc -l | tr -d ' ')
 if [ "$RESTORED_COUNT" -ge 60 ]; then
@@ -424,6 +427,69 @@ if [ "$RESTORED_COUNT" -ge 60 ]; then
 else
   echo "  FAIL: notes were lost ($RESTORED_COUNT remain, expected ≥60)"; fail=$((fail+1))
 fi
+
+# Mini #1445 v4 test gap: assert peer's replacement-*.md files NOT present
+# NB: `find` (not `ls`) — ls of non-matching glob exits 2 + pipefail trips set-e
+REPLACEMENT_COUNT=$(find "$FIXTURE_WS/notes" -maxdepth 1 -name 'replacement-*.md' 2>/dev/null | wc -l | tr -d ' ')
+if [ "$REPLACEMENT_COUNT" = "0" ]; then
+  echo "  OK: peer's replacement-*.md NOT pulled in (rolled back)"; pass=$((pass+1))
+else
+  echo "  FAIL: $REPLACEMENT_COUNT replacement-*.md files leaked into workspace"; fail=$((fail+1))
+fi
+
+# Mini #1445 v4 test gap: assert HEAD restored to pre-pull SHA
+# (run --pull-only again to confirm tripwire still fires + leaves HEAD clean)
+PRE_HEAD2=$(cd "$FIXTURE_WS" && git rev-parse HEAD 2>/dev/null)
+run_sync --pull-only 2>&1 >/dev/null || true
+POST_HEAD2=$(cd "$FIXTURE_WS" && git rev-parse HEAD 2>/dev/null)
+if [ "$PRE_HEAD2" = "$POST_HEAD2" ]; then
+  echo "  OK: HEAD unchanged across repeated tripwire pulls ($PRE_HEAD2)"; pass=$((pass+1))
+else
+  echo "  FAIL: HEAD drifted across pulls ($PRE_HEAD2 → $POST_HEAD2)"; fail=$((fail+1))
+fi
+
+# Mini #1445 v4 test gap: assert git status is clean (no leftover staged/unmerged)
+WS_STATUS=$(cd "$FIXTURE_WS" && git status --porcelain 2>/dev/null)
+if [ -z "$WS_STATUS" ]; then
+  echo "  OK: git status clean after tripwire (no leftover staged/unmerged paths)"; pass=$((pass+1))
+else
+  echo "  FAIL: git status not clean after tripwire:"; printf '%s\n' "$WS_STATUS" | head -5; fail=$((fail+1))
+fi
+
+# ============================================================================
+echo
+echo "==== Test 13: .env without SUTANDO_VAULT falls through to legacy (Mini #1445 v4 Medium) ===="
+# Setup: write .env with ONLY SUTANDO_MEMORY_REPO (legacy alias), no
+# SUTANDO_VAULT entry. Run --status WITHOUT SUTANDO_VAULT in env. Pre-fix,
+# the `grep '^SUTANDO_VAULT=' | head -1 | ...` pipeline returned nonzero
+# under set -euo pipefail and the script exited before the legacy-alias
+# fallback could run.
+
+# Write .env with only the legacy alias
+echo "SUTANDO_MEMORY_REPO=$FIXTURE_VAULT" > "$FIXTURE_REPO/.env"
+
+# Run --status WITHOUT SUTANDO_VAULT in env
+out_legacy_alias=$(env \
+    SUTANDO_REPO_DIR="$FIXTURE_REPO" \
+    SUTANDO_WORKSPACE="$FIXTURE_WS" \
+    SUTANDO_TEST_MODE=1 \
+    bash "$SYNC" --status 2>&1; echo "EXIT=$?")
+legacy_exit=$(printf '%s' "$out_legacy_alias" | sed -n 's/^EXIT=//p' | tail -1)
+
+if [ "$legacy_exit" = "0" ]; then
+  echo "  OK: --status exits 0 when .env has only SUTANDO_MEMORY_REPO (no SUTANDO_VAULT)"; pass=$((pass+1))
+else
+  echo "  FAIL: --status exited $legacy_exit on legacy-alias .env (set-e tripped on grep): $out_legacy_alias"; fail=$((fail+1))
+fi
+
+case "$out_legacy_alias" in
+  *"SUTANDO_MEMORY_REPO"*)
+    echo "  OK: legacy-alias deprecation warning surfaced"; pass=$((pass+1)) ;;
+  *) echo "  FAIL: legacy-alias deprecation warning missing: $out_legacy_alias"; fail=$((fail+1)) ;;
+esac
+
+# Cleanup so subsequent test runs aren't sticky
+rm -f "$FIXTURE_REPO/.env"
 
 # ============================================================================
 echo

@@ -123,11 +123,16 @@ VAULT_URL="${SUTANDO_VAULT:-${SUTANDO_MEMORY_REPO:-}}"
 if [ -n "${SUTANDO_MEMORY_REPO:-}" ] && [ -z "${SUTANDO_VAULT:-}" ]; then
     echo "sync-workspace: SUTANDO_MEMORY_REPO is set; please rename to SUTANDO_VAULT (legacy alias honored this release)." >&2
 fi
-# Load from .env if still empty.
+# Load from .env if still empty. NB: `grep ... | head -1 | ...` exits nonzero
+# when grep finds no match (e.g. .env without SUTANDO_VAULT), which under
+# `set -euo pipefail` propagates through pipefail and exits the script before
+# the SUTANDO_MEMORY_REPO fallback can run — `var=$(...)` assignment does NOT
+# exempt set -e from the subshell's failure. Trailing `|| true` on each
+# pipeline restores the intended fall-through semantics. Mini #1445 v4 Medium.
 if [ -z "$VAULT_URL" ] && [ -f "$REPO_DIR/.env" ]; then
-    VAULT_URL=$(grep -E '^SUTANDO_VAULT=' "$REPO_DIR/.env" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'")
+    VAULT_URL=$(grep -E '^SUTANDO_VAULT=' "$REPO_DIR/.env" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true)
     if [ -z "$VAULT_URL" ]; then
-        VAULT_URL=$(grep -E '^SUTANDO_MEMORY_REPO=' "$REPO_DIR/.env" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'")
+        VAULT_URL=$(grep -E '^SUTANDO_MEMORY_REPO=' "$REPO_DIR/.env" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true)
     fi
 fi
 
@@ -427,7 +432,10 @@ _pull_only_impl() {
     max_delete="${SUTANDO_SYNC_MAX_DELETE:-50}"
     max_pct="${SUTANDO_SYNC_MAX_DELETE_PCT:-50}"
     if [ -n "$pre_pull_sha" ]; then
-        deleted_via_merge=$(git diff --name-only --diff-filter=D "$pre_pull_sha" HEAD 2>/dev/null | wc -l | tr -d ' ')
+        # `-M` enables rename detection (default 50% similarity) so legitimate
+        # file moves count as rename, not delete+add — they don't trip the
+        # tripwire. Mini #1445 v4 Low.
+        deleted_via_merge=$(git diff -M --name-only --diff-filter=D "$pre_pull_sha" HEAD 2>/dev/null | wc -l | tr -d ' ')
     else
         deleted_via_merge=0
     fi
@@ -482,7 +490,9 @@ _push_only_impl() {
 
     # Mass-deletion tripwire (carried over from sync-memory.sh)
     local deleted max_delete
-    deleted=$(git diff --cached --name-only --diff-filter=D | wc -l | tr -d ' ')
+    # `-M` for rename detection: legitimate moves (refactor) don't count as
+    # deletions. Mirrors pull-side tripwire fix. Mini #1445 v4 Low.
+    deleted=$(git diff -M --cached --name-only --diff-filter=D | wc -l | tr -d ' ')
     max_delete="${SUTANDO_SYNC_MAX_DELETE:-50}"
     if [ "$deleted" -gt "$max_delete" ] && [ "${SUTANDO_FORCE_SYNC:-0}" != "1" ]; then
         log "_push_only_impl: ABORT — would delete $deleted files (>$max_delete tripwire)"
