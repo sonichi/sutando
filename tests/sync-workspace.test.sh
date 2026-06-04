@@ -326,7 +326,9 @@ git clone -q "$FIXTURE_VAULT" "$PEER2_WS" 2>/dev/null
 )
 
 # Host 1: pull → should detect mass-delete + reset
-PRE_NOTE_COUNT=$(ls "$FIXTURE_WS/notes/note-"*.md 2>/dev/null | wc -l | tr -d ' ')
+# `find` (not `ls`) so a degenerate fixture (zero matches) reports a clean
+# FAIL instead of aborting under set -euo pipefail. Mini #1445 v6.
+PRE_NOTE_COUNT=$(find "$FIXTURE_WS/notes" -maxdepth 1 -name 'note-*.md' 2>/dev/null | wc -l | tr -d ' ')
 out_pull_trip=$(run_sync --pull-only 2>&1 || true)
 case "$out_pull_trip" in
   *"REFUSING pull"*|*"tripwire"*|*"deleted"*)
@@ -334,7 +336,7 @@ case "$out_pull_trip" in
   *) echo "  FAIL: pull-side tripwire did NOT fire on peer's 60-file deletion: $out_pull_trip"; fail=$((fail+1)) ;;
 esac
 
-POST_NOTE_COUNT=$(ls "$FIXTURE_WS/notes/note-"*.md 2>/dev/null | wc -l | tr -d ' ')
+POST_NOTE_COUNT=$(find "$FIXTURE_WS/notes" -maxdepth 1 -name 'note-*.md' 2>/dev/null | wc -l | tr -d ' ')
 if [ "$POST_NOTE_COUNT" -ge "$PRE_NOTE_COUNT" ]; then
   echo "  OK: working tree restored after tripwire (had $PRE_NOTE_COUNT, now $POST_NOTE_COUNT)"; pass=$((pass+1))
 else
@@ -421,7 +423,7 @@ esac
 PRE_BYPASS_SHA=$(cd "$FIXTURE_WS" && git rev-parse HEAD 2>/dev/null)
 
 # Verify host 1's note-*.md files survived
-RESTORED_COUNT=$(ls "$FIXTURE_WS/notes/note-"*.md 2>/dev/null | wc -l | tr -d ' ')
+RESTORED_COUNT=$(find "$FIXTURE_WS/notes" -maxdepth 1 -name 'note-*.md' 2>/dev/null | wc -l | tr -d ' ')
 if [ "$RESTORED_COUNT" -ge 60 ]; then
   echo "  OK: original notes restored after bypass-attempt tripwire ($RESTORED_COUNT files)"; pass=$((pass+1))
 else
@@ -437,15 +439,20 @@ else
   echo "  FAIL: $REPLACEMENT_COUNT replacement-*.md files leaked into workspace"; fail=$((fail+1))
 fi
 
-# Mini #1445 v4 test gap: assert HEAD restored to pre-pull SHA
-# (run --pull-only again to confirm tripwire still fires + leaves HEAD clean)
+# Mini #1445 v4+v6 test gap: assert HEAD restored to pre-pull SHA across
+# N=10 repeated pull attempts (proves idempotency, not just one re-fire).
 PRE_HEAD2=$(cd "$FIXTURE_WS" && git rev-parse HEAD 2>/dev/null)
-run_sync --pull-only 2>&1 >/dev/null || true
-POST_HEAD2=$(cd "$FIXTURE_WS" && git rev-parse HEAD 2>/dev/null)
-if [ "$PRE_HEAD2" = "$POST_HEAD2" ]; then
-  echo "  OK: HEAD unchanged across repeated tripwire pulls ($PRE_HEAD2)"; pass=$((pass+1))
+N_ITER=10
+drift_count=0
+for i in $(seq 1 "$N_ITER"); do
+    run_sync --pull-only >/dev/null 2>&1 || true
+    cur_head=$(cd "$FIXTURE_WS" && git rev-parse HEAD 2>/dev/null)
+    [ "$cur_head" = "$PRE_HEAD2" ] || drift_count=$((drift_count + 1))
+done
+if [ "$drift_count" = "0" ]; then
+  echo "  OK: HEAD unchanged across $N_ITER repeated tripwire pulls ($PRE_HEAD2)"; pass=$((pass+1))
 else
-  echo "  FAIL: HEAD drifted across pulls ($PRE_HEAD2 → $POST_HEAD2)"; fail=$((fail+1))
+  echo "  FAIL: HEAD drifted in $drift_count of $N_ITER pulls"; fail=$((fail+1))
 fi
 
 # Mini #1445 v4 test gap: assert git status is clean (no leftover staged/unmerged)
@@ -489,6 +496,46 @@ case "$out_legacy_alias" in
 esac
 
 # Cleanup so subsequent test runs aren't sticky
+rm -f "$FIXTURE_REPO/.env"
+
+# ============================================================================
+echo
+echo "==== Test 14: canonical .env with SUTANDO_VAULT entry (Mini #1445 v6 gap) ===="
+# Mirror of Test 13 but for the CANONICAL key (SUTANDO_VAULT=) rather than
+# the legacy alias. Test 13 covers the missing-key fallback path; this covers
+# the happy path via .env (vs Test 1-12 which set SUTANDO_VAULT via process env).
+
+echo "SUTANDO_VAULT=$FIXTURE_VAULT" > "$FIXTURE_REPO/.env"
+
+out_canon=$(env \
+    SUTANDO_REPO_DIR="$FIXTURE_REPO" \
+    SUTANDO_WORKSPACE="$FIXTURE_WS" \
+    SUTANDO_TEST_MODE=1 \
+    bash "$SYNC" --status 2>&1; echo "EXIT=$?")
+canon_exit=$(printf '%s' "$out_canon" | sed -n 's/^EXIT=//p' | tail -1)
+
+if [ "$canon_exit" = "0" ]; then
+  echo "  OK: --status exits 0 with canonical SUTANDO_VAULT in .env"; pass=$((pass+1))
+else
+  echo "  FAIL: --status exited $canon_exit on canonical .env: $out_canon"; fail=$((fail+1))
+fi
+
+# Canonical key MUST NOT trigger the legacy-alias deprecation warning
+case "$out_canon" in
+  *"please rename to SUTANDO_VAULT"*|*"SUTANDO_MEMORY_REPO is set"*)
+    echo "  FAIL: canonical .env spuriously triggered legacy-alias warning"; fail=$((fail+1)) ;;
+  *)
+    echo "  OK: canonical .env does NOT trigger legacy-alias warning"; pass=$((pass+1)) ;;
+esac
+
+# Vault URL resolved correctly from .env. Match by path-string presence rather
+# than `VAULT_URL: $val` to tolerate the column-aligned status output.
+case "$out_canon" in
+  *"$FIXTURE_VAULT"*)
+    echo "  OK: --status surfaced VAULT_URL from .env"; pass=$((pass+1)) ;;
+  *) echo "  FAIL: VAULT_URL not surfaced from canonical .env: $out_canon"; fail=$((fail+1)) ;;
+esac
+
 rm -f "$FIXTURE_REPO/.env"
 
 # ============================================================================
