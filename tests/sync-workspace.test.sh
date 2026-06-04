@@ -1,17 +1,13 @@
 #!/usr/bin/env bash
-# Integration tests for scripts/sync-workspace.sh — PR-1 (Phase 4).
+# Integration tests for scripts/sync-workspace.sh — PR-1 (Phase 4, post 05:13Z simplification).
 #
-# Sets up an isolated fixture workspace + a local bare repo as the vault,
-# then exercises --init / --push-only / --pull-only / mass-deletion-tripwire
-# / migration. Hermetic: never touches the operator's real workspace or vault.
+# Post-simplification design (owner directive 05:11Z + 05:15Z): no canonical_id
+# translation layer; each host's Claude Code memory dir is tracked under its
+# OWN slug at `.claude-sutando/projects/<local_slug>/memory/`. After pull,
+# peer slug subdirs are visible-not-merged. Only the `memory/` subdir within
+# each slug is tracked — transcripts + file_history stay gitignored.
 #
-# Test isolation strategy:
-#   - SUTANDO_WORKSPACE + SUTANDO_TEST_MODE=1 → M0 helper honors the env
-#     (the v0.8 escape hatch added in #1440 for exactly this purpose)
-#   - SUTANDO_REPO_DIR → fake sutando-checkout with CLAUDE.md+skills+.git
-#     (so the script's auto-detect picks up the fixture, and local_slug
-#     derives from the fixture path not the real repo)
-#   - SUTANDO_VAULT → local bare repo URL (no network)
+# Hermetic: never touches the operator's real workspace or vault.
 #
 # Run: bash tests/sync-workspace.test.sh
 
@@ -56,9 +52,24 @@ assert_contains() {
     echo "  FAIL: $desc — '$needle' not in haystack"; fail=$((fail+1))
   fi
 }
+assert_not_in_vault() {
+  local desc="$1" branch="$2" path="$3"
+  if git --git-dir="$FIXTURE_VAULT" show "${branch}:${path}" >/dev/null 2>&1; then
+    echo "  FAIL: $desc — '$path' SHOULD NOT be in vault $branch but IS"; fail=$((fail+1))
+  else
+    echo "  OK: $desc"; pass=$((pass+1))
+  fi
+}
+assert_in_vault() {
+  local desc="$1" branch="$2" path="$3"
+  if git --git-dir="$FIXTURE_VAULT" show "${branch}:${path}" >/dev/null 2>&1; then
+    echo "  OK: $desc"; pass=$((pass+1))
+  else
+    echo "  FAIL: $desc — '$path' NOT in vault $branch"; fail=$((fail+1))
+  fi
+}
 
 # ---- Fixture setup ----
-# Fake sutando-checkout (gives the script a REPO_DIR with the M0 helper)
 FIXTURE_REPO="$TEST_ROOT/sutando"
 mkdir -p "$FIXTURE_REPO/scripts" "$FIXTURE_REPO/src" "$FIXTURE_REPO/skills"
 touch "$FIXTURE_REPO/CLAUDE.md"
@@ -66,15 +77,10 @@ git init -q "$FIXTURE_REPO"
 cp "$REPO/scripts/sync-workspace.sh" "$FIXTURE_REPO/scripts/"
 cp "$REPO/scripts/sutando-config.sh" "$FIXTURE_REPO/scripts/"
 cp "$REPO/src/sutando_config.py" "$FIXTURE_REPO/src/"
-# Minimal sutando.config.json so the loader doesn't error
 cat > "$FIXTURE_REPO/sutando.config.json" <<JSON
 {"workspace": {"path": "\${REPO_DIR}/workspace"}, "vault": {"enabled": false}}
 JSON
 
-# Fixture workspace — realpath'd to match what the script outputs on macOS
-# (where /var/folders/... → /private/var/folders/... via the standard tmpdir
-# symlink). Use the realpath form in assertions so the test runs on both
-# macOS and Linux without divergence.
 FIXTURE_WS_RAW="$TEST_ROOT/workspace"
 mkdir -p "$FIXTURE_WS_RAW"
 if command -v realpath >/dev/null 2>&1; then
@@ -83,11 +89,9 @@ else
   FIXTURE_WS="$FIXTURE_WS_RAW"
 fi
 
-# Bare repo as the vault (local, no network)
 FIXTURE_VAULT="$TEST_ROOT/vault.git"
 git init -q --bare "$FIXTURE_VAULT"
 
-# Common env for invocations
 COMMON_ENV=(
   SUTANDO_REPO_DIR="$FIXTURE_REPO"
   SUTANDO_WORKSPACE="$FIXTURE_WS"
@@ -96,13 +100,19 @@ COMMON_ENV=(
 )
 
 SYNC="$FIXTURE_REPO/scripts/sync-workspace.sh"
+HOST=$(hostname | sed 's/\..*//')
+HOST_BRANCH="refs/heads/host/${HOST}"
+
+# local_slug = REPO_DIR with / replaced by - (mirror script + Claude Code)
+LOCAL_SLUG=$(printf '%s' "$FIXTURE_REPO" | sed 's|/|-|g')
+LOCAL_MEM_DIR="$FIXTURE_WS/.claude-sutando/projects/${LOCAL_SLUG}/memory"
 
 run_sync() {
   env "${COMMON_ENV[@]}" bash "$SYNC" "$@"
 }
 
 # ============================================================================
-echo "==== Test 1: --status before init (env resolution + map.json absent) ===="
+echo "==== Test 1: --status before init ===="
 out_status=$(run_sync --status 2>&1)
 case "$out_status" in
   *"WORKSPACE_DIR: $FIXTURE_WS"*)
@@ -115,36 +125,51 @@ case "$out_status" in
   *) echo "  FAIL: --status VAULT_URL missing"; fail=$((fail+1)) ;;
 esac
 case "$out_status" in
-  *"canonical_id:  "*)
-    echo "  OK: --status shows canonical_id"; pass=$((pass+1)) ;;
-  *) echo "  FAIL: --status canonical_id missing"; fail=$((fail+1)) ;;
+  *"NOT a git repo"*)
+    echo "  OK: --status reports not-yet-a-git-repo before init"; pass=$((pass+1)) ;;
+  *) echo "  FAIL: --status didn't note workspace isn't a git repo: $out_status"; fail=$((fail+1)) ;;
+esac
+# Verify the OLD translation-layer fields are GONE from --status
+case "$out_status" in
+  *"canonical_id"*|*"projects.map.json"*)
+    echo "  FAIL: --status still mentions removed translation-layer fields: $out_status"; fail=$((fail+1)) ;;
+  *) echo "  OK: --status no longer mentions canonical_id / projects.map.json"; pass=$((pass+1)) ;;
 esac
 
 # ============================================================================
 echo
-echo "==== Test 2: --init creates .gitignore, projects.map.json, canonical memory dir, first commit + push ===="
+echo "==== Test 2: --init creates .gitignore + .git + first push ===="
 run_sync --init 2>&1 | head -10
 
-assert_dir_exists ".git exists in workspace"        "$FIXTURE_WS/.git"
-assert_file_exists ".gitignore created"             "$FIXTURE_WS/.gitignore"
-assert_file_exists "projects.map.json created"      "$FIXTURE_WS/.sutando-vault/projects.map.json"
-
-# canonical_id = sha256-8 of vault URL (mirror script's derivation)
-CANONICAL=$(printf '%s' "$FIXTURE_VAULT" | shasum -a 256 | cut -c1-8)
-assert_dir_exists "canonical memory dir created"    "$FIXTURE_WS/.claude-sutando/projects/${CANONICAL}/memory"
+assert_dir_exists ".git exists in workspace"  "$FIXTURE_WS/.git"
+assert_file_exists ".gitignore created"       "$FIXTURE_WS/.gitignore"
 
 # .gitignore content sanity
-assert_contains ".gitignore whitelists notes/"  "!notes/"  "$FIXTURE_WS/.gitignore"
-assert_contains ".gitignore whitelists canonical memory mirror"  "$CANONICAL"  "$FIXTURE_WS/.gitignore"
-assert_contains ".gitignore hard-denies .env"   ".env*"    "$FIXTURE_WS/.gitignore"
+assert_contains ".gitignore whitelists notes/"           "!notes/"                                 "$FIXTURE_WS/.gitignore"
+assert_contains ".gitignore tracks memory subdirs"        "!.claude-sutando/projects/*/memory/"     "$FIXTURE_WS/.gitignore"
+assert_contains ".gitignore tracks memory contents"       "!.claude-sutando/projects/*/memory/**"   "$FIXTURE_WS/.gitignore"
+assert_contains ".gitignore hard-denies .env"             ".env*"                                   "$FIXTURE_WS/.gitignore"
+
+# Verify the OLD canonical-specific pattern is GONE
+if grep -qE 'projects/[a-f0-9]{8}/memory' "$FIXTURE_WS/.gitignore"; then
+  echo "  FAIL: .gitignore still has canonical-id-specific pattern"; fail=$((fail+1))
+else
+  echo "  OK: .gitignore no longer has canonical-id-specific pattern"; pass=$((pass+1))
+fi
+
+# .sutando-vault/projects.map.json should NOT be created
+if [ -f "$FIXTURE_WS/.sutando-vault/projects.map.json" ]; then
+  echo "  FAIL: .sutando-vault/projects.map.json should NOT be created (translation layer removed)"; fail=$((fail+1))
+else
+  echo "  OK: .sutando-vault/projects.map.json correctly NOT created"; pass=$((pass+1))
+fi
 
 # Vault remote configured
 REMOTE_URL=$(cd "$FIXTURE_WS" && git remote get-url origin)
 assert_eq "git remote origin = vault"  "$FIXTURE_VAULT"  "$REMOTE_URL"
 
 # host/<hostname> branch exists in bare repo
-HOST=$(hostname | sed 's/\..*//')
-if git --git-dir="$FIXTURE_VAULT" rev-parse "refs/heads/host/${HOST}" >/dev/null 2>&1; then
+if git --git-dir="$FIXTURE_VAULT" rev-parse "$HOST_BRANCH" >/dev/null 2>&1; then
   echo "  OK: host/${HOST} branch pushed to vault"; pass=$((pass+1))
 else
   echo "  FAIL: host/${HOST} branch NOT in vault"; fail=$((fail+1))
@@ -152,12 +177,12 @@ fi
 
 # ============================================================================
 echo
-echo "==== Test 3: idempotent re-init (no error, no duplicate work) ===="
+echo "==== Test 3: idempotent re-init ===="
 out_reinit=$(run_sync --init 2>&1)
 if echo "$out_reinit" | grep -q "already a git repo"; then
   echo "  OK: re-init detects existing repo"; pass=$((pass+1))
 else
-  echo "  INFO: re-init output: $out_reinit"  # not strictly required
+  echo "  INFO: re-init output: $out_reinit"
 fi
 
 # ============================================================================
@@ -171,59 +196,65 @@ esac
 
 # ============================================================================
 echo
-echo "==== Test 5: translation layer — write to local-slug, push, verify in canonical + vault ===="
-# local_slug = REPO_DIR with / replaced by - (mirror the script's derivation)
-LOCAL_SLUG_DIR="$FIXTURE_WS/.claude-sutando/projects/$(printf '%s' "$FIXTURE_REPO" | sed 's|/|-|g')/memory"
-mkdir -p "$LOCAL_SLUG_DIR"
-echo "test memory content from $HOST" > "$LOCAL_SLUG_DIR/feedback_test.md"
+echo "==== Test 5: write memory to local-slug, push, verify in vault under SAME slug (no translation) ===="
+mkdir -p "$LOCAL_MEM_DIR"
+echo "test memory content from $HOST" > "$LOCAL_MEM_DIR/feedback_test.md"
 
 run_sync --push-only 2>&1 | head -5
 
-CANONICAL_MEM="$FIXTURE_WS/.claude-sutando/projects/${CANONICAL}/memory/feedback_test.md"
-assert_file_exists "memory copied local-slug → canonical" "$CANONICAL_MEM"
-
-# Verify it's in the vault remote
-if git --git-dir="$FIXTURE_VAULT" show "refs/heads/host/${HOST}:.claude-sutando/projects/${CANONICAL}/memory/feedback_test.md" >/dev/null 2>&1; then
-  echo "  OK: feedback_test.md present in vault host/${HOST} branch"; pass=$((pass+1))
-else
-  echo "  FAIL: feedback_test.md NOT in vault"; fail=$((fail+1))
-fi
+# Memory file should appear in vault under the local_slug path (NOT under any canonical)
+assert_in_vault "feedback_test.md present in vault under local_slug path" \
+                "$HOST_BRANCH" \
+                ".claude-sutando/projects/${LOCAL_SLUG}/memory/feedback_test.md"
 
 # ============================================================================
 echo
-echo "==== Test 6: --pull-only — simulate peer write, pull, verify canonical → local-slug ===="
-# Simulate a peer host by cloning the bare repo to a second workspace,
-# basing the peer branch off host 1's existing branch (bare repo has no
-# default HEAD → checkout the existing host branch explicitly first).
+echo "==== Test 6: write a fake transcript to local-slug — must NOT be pushed (only memory/ tracked) ===="
+mkdir -p "$FIXTURE_WS/.claude-sutando/projects/${LOCAL_SLUG}/transcripts"
+echo "this is a fake transcript line" > "$FIXTURE_WS/.claude-sutando/projects/${LOCAL_SLUG}/transcripts/session-1.jsonl"
+
+# Run sync — transcript should be ignored by .gitignore
+run_sync --push-only 2>&1 | head -3
+
+assert_not_in_vault "transcript file NOT pushed (gitignored — only memory/ tracked)" \
+                    "$HOST_BRANCH" \
+                    ".claude-sutando/projects/${LOCAL_SLUG}/transcripts/session-1.jsonl"
+
+# ============================================================================
+echo
+echo "==== Test 7: peer host pushes to its own slug, pull, verify peer slug visible ===="
 PEER_WS="$TEST_ROOT/peer-workspace"
 git clone -q "$FIXTURE_VAULT" "$PEER_WS" 2>/dev/null
+PEER_SLUG="-Users-peer-sutando"
 (
     cd "$PEER_WS"
     git checkout -B "host/peerhost" "origin/host/${HOST}" >/dev/null 2>&1
-    mkdir -p ".claude-sutando/projects/${CANONICAL}/memory"
-    echo "from peer" > ".claude-sutando/projects/${CANONICAL}/memory/feedback_peer.md"
+    mkdir -p ".claude-sutando/projects/${PEER_SLUG}/memory"
+    echo "from peer" > ".claude-sutando/projects/${PEER_SLUG}/memory/feedback_peer.md"
     git add -A
     git -c user.email=peer@test -c user.name=peer commit -q -m "peer write" >/dev/null 2>&1
     git push -q origin "host/peerhost" 2>/dev/null
 )
 
-# Now pull on host 1
+# Pull on host 1
 run_sync --pull-only 2>&1 | head -5
 
-# Verify the peer's write landed in our local-slug
-LOCAL_PEER_FILE="$LOCAL_SLUG_DIR/feedback_peer.md"
-assert_file_exists "peer's memory copied canonical → local-slug" "$LOCAL_PEER_FILE"
+# Verify peer's slug subdir is visible in host 1's workspace
+PEER_MEM_FILE="$FIXTURE_WS/.claude-sutando/projects/${PEER_SLUG}/memory/feedback_peer.md"
+assert_file_exists "peer's memory visible in host 1's workspace under peer slug" "$PEER_MEM_FILE"
+
+# Verify host 1's OWN memory still present (peer pull didn't clobber it)
+assert_file_exists "host 1's own memory still present after pull" \
+                   "$LOCAL_MEM_DIR/feedback_test.md"
 
 # ============================================================================
 echo
-echo "==== Test 7: mass-deletion tripwire ===="
-# Stage a deletion of >50 files to trigger the tripwire. Create then delete them.
+echo "==== Test 8: mass-deletion tripwire ===="
 cd "$FIXTURE_WS"
 mkdir -p notes
 for i in $(seq 1 60); do echo "n$i" > "notes/note-$i.md"; done
 git add notes/
 git -c user.email=test@test -c user.name=test commit -q -m "60 notes"
-# Delete them all
 rm -f notes/note-*.md
 cd - >/dev/null
 
@@ -234,7 +265,6 @@ case "$out_tripwire" in
   *) echo "  FAIL: tripwire didn't fire on 60 deletions: $out_tripwire"; fail=$((fail+1)) ;;
 esac
 
-# Verify nothing was actually pushed (working tree reset)
 cd "$FIXTURE_WS"
 if [ -z "$(git diff --cached --name-only)" ]; then
   echo "  OK: tripwire reset staged changes"; pass=$((pass+1))
@@ -242,9 +272,6 @@ else
   echo "  FAIL: tripwire didn't reset staged changes"; fail=$((fail+1))
 fi
 cd - >/dev/null
-
-# Restore for any further tests
-for i in $(seq 1 60); do echo "n$i" > "$FIXTURE_WS/notes/note-$i.md"; done
 
 # ============================================================================
 echo

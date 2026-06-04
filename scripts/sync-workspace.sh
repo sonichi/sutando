@@ -1,8 +1,9 @@
 #!/bin/bash
 # sync-workspace.sh — Bidirectional sync of the Sutando workspace to a private vault repo.
 #
-# Replaces scripts/sync-memory.sh. The fundamental architecture shift (per
-# 2026-06-04 #design discussion):
+# Replaces scripts/sync-memory.sh. Architecture per 2026-06-04 #design + the
+# 05:11Z simplification (owner: "remove the Memory translation layer. Keep
+# do simple pull"):
 #
 #   OLD (sync-memory.sh): workspace is a regular dir; sync via rsync to a
 #   separate vault clone at ~/.sutando/memory-sync/. Two file trees on disk,
@@ -10,38 +11,37 @@
 #
 #   NEW (sync-workspace.sh): the workspace ITSELF is a git repo, with the
 #   vault as its remote. Selective tracking via .gitignore exposes only the
-#   carrier set (notes/, build_log/<hostname>.md, pending-questions.md, the
-#   per-project memory mirror). Sync = vanilla git push/pull on the workspace.
+#   carrier set. Sync = vanilla git push/pull on the workspace — no in-script
+#   translation layer, no canonical-id mapping, no projects.map.json.
 #
 # Branch-per-host topology: each host pushes only to its own branch
 # `host/<hostname>`; pulls all peers via fetch + merge. Conflicts use 3-way
 # merge first, `git checkout --ours` fallback on unresolvable conflicts.
 #
-# Memory translation layer: Claude Code derives its per-project memory dir
-# from the local cwd path slug (e.g. `-Users-qingyunwu-Documents-github-sutando`)
-# which differs per host. To merge memory across hosts we maintain a
-# canonical_id (sha256-8 of vault remote URL) and a tracked
-# projects.map.json mapping local_slug → canonical_id. Before push, copy
-# local-slug/memory/ → canonical_id/memory/. After pull, copy back.
+# Per-host Claude Code memory dirs (`.claude-sutando/projects/<local_slug>/`)
+# are each tracked independently. Hosts see peers' subdirs after pull but
+# memory is NOT auto-merged across slugs — peer memory is visible-not-merged.
+# Operator/agent can browse peer subdirs manually if curious. This is the
+# simplification (versus the earlier canonical-id translation-layer design).
 #
 # User-configurable carrier set: vault.sync.{include, exclude} in
 # sutando.config.{json,local.json}. Include adds to default; exclude
-# subtracts (rsync semantics, exclude wins on conflict).
+# subtracts (rsync semantics, exclude wins on conflict). Currently
+# defaults-only (config-merge tracked for follow-up).
 #
 # Usage:
-#   bash scripts/sync-workspace.sh                # default: pull + translate + push
-#   bash scripts/sync-workspace.sh --pull-only    # pull peers + canonical → local-slug
-#   bash scripts/sync-workspace.sh --push-only    # local-slug → canonical + push
-#   bash scripts/sync-workspace.sh --init         # one-time init: git init + setup vault remote + map.json bootstrap
+#   bash scripts/sync-workspace.sh                # default: pull + push (one tick)
+#   bash scripts/sync-workspace.sh --pull-only    # fetch + merge peers, no push
+#   bash scripts/sync-workspace.sh --push-only    # commit + push to own host branch
+#   bash scripts/sync-workspace.sh --init         # one-time init: git init + setup vault remote
 #   bash scripts/sync-workspace.sh --migrate-from-legacy  # move ~/.sutando/memory-sync/ → workspace-as-git-repo
-#   bash scripts/sync-workspace.sh --status       # show sync status
+#   bash scripts/sync-workspace.sh --status       # show sync state
 #   bash scripts/sync-workspace.sh --help         # show this usage
 #
 # Env vars:
 #   SUTANDO_VAULT             — git URL of the private vault repo (REQUIRED)
 #                               Legacy alias: SUTANDO_MEMORY_REPO (honored one release)
 #   SUTANDO_REPO_DIR          — path to sutando code checkout. Auto-detected from script path.
-#   SUTANDO_VAULT_PROJECT_ID  — override canonical_id; default = sha256-8 of vault URL
 #   NO_COLOR                  — suppress ANSI escapes in warnings (no-color.org)
 #   SUTANDO_SYNC_MAX_DELETE   — mass-deletion tripwire threshold (default 50)
 #   SUTANDO_FORCE_SYNC        — bypass mass-deletion tripwire (set =1)
@@ -59,8 +59,7 @@ unset _self
 SCRIPT_PARENT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Load .env from the sutando workspace early — non-interactive shells (cron,
-# launchd) don't run user shell startup. Without this the script exits 0
-# silently with "VAULT not set" on cron paths.
+# launchd) don't run user shell startup.
 if [ -f "$SCRIPT_PARENT/.env" ]; then
     set -a
     # shellcheck disable=SC1091
@@ -154,144 +153,36 @@ acquire_lock() {
 }
 
 # --------------------------------------------------------------------------- #
-# Section 4 — Canonical ID + projects.map.json                                 #
+# Section 4 — .gitignore generation                                             #
 # --------------------------------------------------------------------------- #
-
-# Derive canonical_id from vault URL. Stable across hosts (same URL → same id);
-# neutral on usernames + paths (no privacy leak from filesystem layout).
-canonical_id() {
-    if [ -n "${SUTANDO_VAULT_PROJECT_ID:-}" ]; then
-        printf '%s' "$SUTANDO_VAULT_PROJECT_ID"
-        return 0
-    fi
-    if [ -z "$VAULT_URL" ]; then
-        die "canonical_id: SUTANDO_VAULT not set and no override (SUTANDO_VAULT_PROJECT_ID)."
-    fi
-    printf '%s' "$VAULT_URL" | shasum -a 256 | cut -c1-8
-}
-
-# Compute Claude Code's per-project local slug for this host's repo cwd.
-# Claude Code derives this from the absolute path: `/Users/foo/sutando` →
-# `-Users-foo-sutando` (slashes replaced with dashes).
-local_slug() {
-    printf '%s' "$REPO_DIR" | sed 's|/|-|g'
-}
-
-# Projects.map.json — per-host map of {<local_slug>: <canonical_id>}. Lives
-# inside the workspace so it can be tracked + cross-host-debuggable.
-PROJECTS_MAP_PATH() {
-    printf '%s/.sutando-vault/projects.map.json' "$WORKSPACE_DIR"
-}
-
-# Ensure projects.map.json exists + this host's entry is present.
-ensure_projects_map_entry() {
-    local map_path
-    map_path="$(PROJECTS_MAP_PATH)"
-    mkdir -p "$(dirname "$map_path")"
-    local slug canonical
-    slug="$(local_slug)"
-    canonical="$(canonical_id)"
-
-    if [ ! -f "$map_path" ]; then
-        printf '{\n  "%s": "%s"\n}\n' "$slug" "$canonical" > "$map_path"
-        log "ensure_projects_map_entry: created $map_path with {$slug: $canonical}"
-        return 0
-    fi
-
-    # Check if this host's slug is already mapped — if so, no-op.
-    if python3 -c "
-import json, sys
-with open('$map_path') as f: m = json.load(f)
-sys.exit(0 if m.get('$slug') == '$canonical' else 1)
-" 2>/dev/null; then
-        return 0
-    fi
-
-    # Add/update this host's entry.
-    python3 -c "
-import json
-with open('$map_path') as f: m = json.load(f)
-m['$slug'] = '$canonical'
-with open('$map_path', 'w') as f: json.dump(m, f, indent=2, sort_keys=True)
-"
-    log "ensure_projects_map_entry: added {$slug: $canonical} to $map_path"
-}
-
-# --------------------------------------------------------------------------- #
-# Section 5 — .gitignore template (Phase 2 fills generation logic)             #
-# --------------------------------------------------------------------------- #
-
-# Default carrier set (what TO sync) — appears as `!path` un-ignore rules.
-# Per the 2026-06-04 #design crystallization: notes/, pending-questions.md,
-# build_log/<hostname>.md (per-host split), the per-project memory mirror.
-# Archive paths (tasks/archive/, results/archive/) are opt-in via config.
-DEFAULT_CARRIER_INCLUDES=(
-    "!notes/"
-    "!notes/**"
-    "!pending-questions.md"
-    "!build_log/"
-    "!build_log/**"
-    "!.claude-sutando/projects/<CANONICAL_ID>/memory/"
-    "!.claude-sutando/projects/<CANONICAL_ID>/memory/**"
-    "!projects.map.json"
-)
-
-# Default exclusions (what NOT to sync, baseline). Per-host runtime state,
-# credentials, caches.
-DEFAULT_GITIGNORE_LINES=(
-    "# Generated by sync-workspace.sh — do not edit by hand."
-    "# Source of truth: scripts/sync-workspace.sh::DEFAULT_CARRIER_INCLUDES + DEFAULT_GITIGNORE_LINES"
-    "# User customization: vault.sync.{include,exclude} in sutando.config.local.json"
-    ""
-    "# Baseline: ignore EVERYTHING by default; then un-ignore the carrier set below."
-    "*"
-    ""
-    "# Per-host runtime state — never synced (also explicit-deny for safety)"
-    "state/"
-    "tasks/"
-    "results/"
-    "logs/"
-    "data/"
-    "*.heartbeat"
-    "*.alive"
-    "*.sentinel"
-    "*.pid"
-    ""
-    "# Local credentials (never synced)"
-    ".env*"
-    ""
-    "# Carrier set (un-ignore selectively)"
-)
 
 # Write .gitignore to $WORKSPACE_DIR. Whitelist mode: ignore everything by
-# default, un-ignore the carrier set. Each carrier path also un-ignores its
-# ancestor dirs (gitignore requirement: can't re-include a child if parent
-# is excluded).
+# default, un-ignore the carrier set. Each carrier path's ancestor dirs must
+# also be un-ignored (gitignore requirement: can't re-include a child if the
+# parent is excluded).
 #
-# Phase 2 baseline: hardcoded DEFAULT carrier set, no user config merge yet
-# (config merge follow-up tracked for Phase 4 or sibling PR — keeps Phase 2
-# scope focused on the core workspace-as-git-repo plumbing).
+# Per-host Claude Code memory dirs (`.claude-sutando/projects/<slug>/`) are
+# all tracked. Different hosts have different slugs (Claude Code derives from
+# cwd path) — each writes only to its own slug subdir. After sync, all hosts
+# see all peers' subdirs but memory is NOT auto-merged across slugs.
 #
-# Side effects: writes $WORKSPACE_DIR/.gitignore. Idempotent: same output
-# every call for the same canonical_id. Does NOT preserve user edits in the
-# file — operators should put per-host overrides in sutando.config.local.json
-# (Phase 4) rather than hand-editing the generated .gitignore.
+# Side effects: writes $WORKSPACE_DIR/.gitignore. Idempotent. Does NOT
+# preserve user edits — operators should use sutando.config.local.json
+# overrides (follow-up) rather than hand-editing.
 generate_gitignore() {
-    local canonical gitignore_path
-    canonical="$(canonical_id)"
+    local gitignore_path
     gitignore_path="$WORKSPACE_DIR/.gitignore"
     {
         echo "# Generated by sync-workspace.sh — do not edit by hand."
         echo "# Source: scripts/sync-workspace.sh::generate_gitignore"
-        echo "# Carrier set (what gets synced to vault) is defined here + by"
-        echo "# vault.sync.{include,exclude} in sutando.config.local.json (Phase 4)."
+        echo "# Carrier set is defined here + by vault.sync.{include,exclude} in"
+        echo "# sutando.config.local.json (config merge tracked for follow-up)."
         echo ""
         echo "# Whitelist mode: ignore everything by default, un-ignore the carrier set."
         echo "*"
         echo ""
         echo "# Always-tracked metadata"
         echo "!.gitignore"
-        echo "!projects.map.json"
         echo ""
         echo "# Default carrier set — top-level dirs + files"
         echo "!notes/"
@@ -300,18 +191,15 @@ generate_gitignore() {
         echo "!build_log/"
         echo "!build_log/**"
         echo ""
-        echo "# Per-project Claude Code memory (canonical-id mirror only;"
-        echo "# host-specific slugs stay gitignored). The intermediate dirs"
-        echo "# must each be un-ignored or git stops at the parent."
+        echo "# Per-host Claude Code project dirs — track ONLY the memory/ subdir"
+        echo "# within each slug. Transcripts, file_history, caches, etc. stay"
+        echo "# ignored (can be large and per-host). Each host writes only to its"
+        echo "# own slug; peer slugs' memory/ visible after pull but not auto-merged."
         echo "!.claude-sutando/"
         echo "!.claude-sutando/projects/"
-        echo "!.claude-sutando/projects/${canonical}/"
-        echo "!.claude-sutando/projects/${canonical}/memory/"
-        echo "!.claude-sutando/projects/${canonical}/memory/**"
-        echo ""
-        echo "# vault metadata"
-        echo "!.sutando-vault/"
-        echo "!.sutando-vault/projects.map.json"
+        echo "!.claude-sutando/projects/*/"
+        echo "!.claude-sutando/projects/*/memory/"
+        echo "!.claude-sutando/projects/*/memory/**"
         echo ""
         echo "# Hard-deny credentials regardless of carrier set"
         echo ".env*"
@@ -320,12 +208,12 @@ generate_gitignore() {
         echo "*.sentinel"
         echo "*.pid"
     } > "$gitignore_path"
-    log "generate_gitignore: wrote $gitignore_path (canonical=$canonical)"
+    log "generate_gitignore: wrote $gitignore_path"
     return 0
 }
 
 # --------------------------------------------------------------------------- #
-# Section 6 — Subcommand stubs (Phase 1 scaffold; Phase 2+ fills bodies)       #
+# Section 5 — Subcommand bodies                                                #
 # --------------------------------------------------------------------------- #
 
 cmd_init() {
@@ -365,20 +253,12 @@ _init_impl() {
     # 3. Generate .gitignore (will overwrite — operators should config-override, not hand-edit)
     generate_gitignore
 
-    # 4. Bootstrap projects.map.json + this host's entry
-    ensure_projects_map_entry
-
-    # 5. Create canonical_id memory dir (will be populated by translation later)
-    local canonical
-    canonical="$(canonical_id)"
-    mkdir -p ".claude-sutando/projects/${canonical}/memory"
-
-    # 6. Initial commit + push to host branch
-    git add .gitignore .sutando-vault/projects.map.json ".claude-sutando/projects/${canonical}/" 2>/dev/null || true
+    # 4. Initial commit + push to host branch
+    git add -A 2>/dev/null || true
     if git diff --cached --quiet; then
-        log "_init_impl: nothing to commit on init (already-initialized re-run)"
+        log "_init_impl: nothing to commit on init (already-initialized re-run, or empty workspace)"
     else
-        git commit -q -m "Initial workspace-vault sync: bootstrap canonical=${canonical} host=$(hostname)"
+        git commit -q -m "Initial workspace-vault sync: bootstrap host=$(hostname)"
         log "_init_impl: initial commit created"
 
         local host
@@ -395,52 +275,10 @@ _init_impl() {
     return 0
 }
 
-# --- Translation layer (Phase 2) ---
-# Memory bridge: bidirectional copy between Claude Code's auto-derived
-# local-slug dir (gitignored, per-host) and the canonical-id mirror (tracked,
-# shared across hosts via vault sync).
-#
-# Symmetric copy uses `cp -a path/. target/` so we copy CONTENTS (not the dir
-# itself); preserves metadata; creates target if missing.
-
-copy_localslug_to_canonical() {
-    local canonical local_dir canonical_dir
-    canonical="$(canonical_id)"
-    local_dir="$WORKSPACE_DIR/.claude-sutando/projects/$(local_slug)/memory"
-    canonical_dir="$WORKSPACE_DIR/.claude-sutando/projects/${canonical}/memory"
-
-    if [ ! -d "$local_dir" ]; then
-        log "copy_localslug_to_canonical: $local_dir doesn't exist (no Claude Code memory yet on this host); skipping"
-        return 0
-    fi
-    mkdir -p "$canonical_dir"
-    cp -a "$local_dir"/. "$canonical_dir"/ 2>/dev/null || true
-    log "copy_localslug_to_canonical: $local_dir → $canonical_dir"
-}
-
-copy_canonical_to_localslug() {
-    local canonical local_dir canonical_dir
-    canonical="$(canonical_id)"
-    local_dir="$WORKSPACE_DIR/.claude-sutando/projects/$(local_slug)/memory"
-    canonical_dir="$WORKSPACE_DIR/.claude-sutando/projects/${canonical}/memory"
-
-    if [ ! -d "$canonical_dir" ]; then
-        log "copy_canonical_to_localslug: $canonical_dir doesn't exist yet (vault empty?); skipping"
-        return 0
-    fi
-    mkdir -p "$local_dir"
-    cp -a "$canonical_dir"/. "$local_dir"/ 2>/dev/null || true
-    log "copy_canonical_to_localslug: $canonical_dir → $local_dir"
-}
-
-# --- Pull-side (Phase 2) ---
-# Fetch all peer branches, merge into local host/<hostname> branch with 3-way
-# auto-merge first. On unresolvable conflict, use-local fallback via
-# `git checkout --ours`. Pull ordering: oldest peer push first (minimizes
+# Pull-side: fetch all peer branches, merge into local host/<hostname> branch
+# with 3-way auto-merge first. On unresolvable conflict, use-local fallback
+# via `git checkout --ours`. Pull ordering: oldest peer push first (minimizes
 # per-step merge diff under the use-local-on-conflict rule).
-#
-# After merge: copy canonical → local-slug so Claude Code on this host sees
-# peers' memory writes.
 
 cmd_pull_only() {
     acquire_lock
@@ -459,7 +297,6 @@ _pull_only_impl() {
     host="$(hostname | sed 's/\..*//')"
     current_branch="host/${host}"
     if [ "$(git symbolic-ref --short HEAD 2>/dev/null)" != "$current_branch" ]; then
-        # Create from origin/<branch> if remote-tracking exists, else from current HEAD
         if git show-ref --quiet "refs/remotes/origin/${current_branch}"; then
             git checkout -B "$current_branch" "origin/${current_branch}" 2>&1 | tee -a "$LOG" >/dev/null
         else
@@ -474,7 +311,6 @@ _pull_only_impl() {
 
     local merged=0
     for peer in $peers; do
-        # Skip self
         [ "$peer" = "origin/${current_branch}" ] && continue
         log "_pull_only_impl: merging $peer into $current_branch"
         if git merge --no-edit "$peer" 2>&1 | tee -a "$LOG" >/dev/null; then
@@ -491,18 +327,12 @@ _pull_only_impl() {
     done
 
     log "_pull_only_impl: merged $merged peer branch(es)"
-
-    # Translate canonical → local-slug so Claude Code on this host sees peers' memory
-    copy_canonical_to_localslug
-
     echo "sync-workspace: pull-only complete (merged $merged peer branches)"
     return 0
 }
 
-# --- Push-side (Phase 2) ---
-# Copy local-slug → canonical so this host's memory writes propagate up.
-# Stage everything, mass-deletion tripwire (preserved from sync-memory.sh),
-# commit if anything changed, push to origin/host/<hostname> only.
+# Push-side: stage all changes (gitignore filters to carrier set), mass-deletion
+# tripwire, commit if anything changed, push to origin/host/<hostname>.
 
 cmd_push_only() {
     acquire_lock
@@ -512,10 +342,6 @@ cmd_push_only() {
 _push_only_impl() {
     cd "$WORKSPACE_DIR" || die "push-only: cannot cd to $WORKSPACE_DIR"
     [ -d ".git" ] || die "push-only: $WORKSPACE_DIR is not a git repo; run --init first"
-
-    # Translate this host's writes UP to the canonical mirror
-    copy_localslug_to_canonical
-    ensure_projects_map_entry
 
     git add -A
     if git diff --cached --quiet; then
@@ -550,8 +376,7 @@ _push_only_impl() {
     fi
 }
 
-# --- Default: bidirectional one tick ---
-# Pull peers first (so own commits build on latest peer state), then push.
+# Default: pull peers first (so own commits build on latest peer state), then push.
 
 cmd_default_bidirectional() {
     acquire_lock
@@ -560,21 +385,18 @@ cmd_default_bidirectional() {
 }
 
 cmd_status() {
-    log "cmd_status: stub — Phase 2 implements: show last sync, current branch, peer branches, projects.map.json contents"
     echo "WORKSPACE_DIR: $WORKSPACE_DIR"
     echo "REPO_DIR:      $REPO_DIR"
     echo "VAULT_URL:     ${VAULT_URL:-<unset>}"
-    if [ -n "$VAULT_URL" ]; then
-        echo "canonical_id:  $(canonical_id)"
-    fi
-    echo "local_slug:    $(local_slug)"
-    local map_path
-    map_path="$(PROJECTS_MAP_PATH)"
-    if [ -f "$map_path" ]; then
-        echo "projects.map.json: $map_path"
-        cat "$map_path"
+    if [ -d "$WORKSPACE_DIR/.git" ]; then
+        cd "$WORKSPACE_DIR" || return 1
+        local current_branch
+        current_branch="$(git symbolic-ref --short HEAD 2>/dev/null || echo "<detached>")"
+        echo "current branch: $current_branch"
+        echo "remote branches:"
+        git for-each-ref --format='  %(refname:short) (last push: %(committerdate:relative))' refs/remotes/origin/host/ 2>/dev/null | head -20
     else
-        echo "projects.map.json: <not yet bootstrapped — run --init>"
+        echo "git status: workspace is NOT a git repo (run --init)"
     fi
     return 0
 }
@@ -584,24 +406,22 @@ cmd_migrate_from_legacy() {
     _migrate_from_legacy_impl
 }
 
-# Phase 3: one-time migration from the legacy ~/.sutando/memory-sync/ git
-# repo to the new workspace-as-git-repo model. Steps:
+# One-time migration from the legacy ~/.sutando/memory-sync/ git repo to the
+# new workspace-as-git-repo model. Steps:
 #
 #   1. Detect legacy clone at $HOME/.sutando/memory-sync/ (or
 #      $SUTANDO_MEMORY_SYNC_DIR if set)
 #   2. Curated copy of legacy content into workspace's tracked paths:
-#      - legacy/notes/ → workspace/notes/  (skip if workspace/notes is a
-#        symlink into the legacy repo — workspace already points at it)
-#      - legacy/memory/*.md → workspace/.claude-sutando/projects/<canonical>/memory/
+#      - legacy/notes/ → workspace/notes/
+#      - legacy/memory/*.md → workspace/.claude-sutando/projects/<local_slug>/memory/
+#        (uses this host's Claude Code-derived slug — `-<REPO_DIR-with-slashes-replaced>`)
 #      - legacy/pending-questions.md → workspace/pending-questions.md
-#      - legacy/build_log.md → workspace/build_log/<hostname>.md (split per
-#        the per-host design)
+#      - legacy/build_log.md → workspace/build_log/<hostname>.md (per-host split)
 #   3. Call _init_impl to git-init the workspace + push to vault
-#   4. Print a "next steps" recipe for the operator (don't delete legacy yet;
-#      they verify the migration landed cleanly first)
+#   4. Print operator-supervised next-steps recipe
 #
 # Safe-by-default: never deletes the legacy dir; never overwrites existing
-# workspace files (cp with -n). Operator deletes legacy manually after
+# workspace files (cp -n everywhere). Operator deletes legacy manually after
 # verifying.
 
 _migrate_from_legacy_impl() {
@@ -620,17 +440,16 @@ _migrate_from_legacy_impl() {
     log "_migrate_from_legacy_impl: starting migration from $legacy_dir → $WORKSPACE_DIR"
     echo "sync-workspace migrate: copying from $legacy_dir into $WORKSPACE_DIR" >&2
 
-    local canonical
-    canonical="$(canonical_id)"
+    # Local slug derivation: matches Claude Code's auto-derived slug
+    # (REPO_DIR with / replaced by -).
+    local local_slug
+    local_slug="$(printf '%s' "$REPO_DIR" | sed 's|/|-|g')"
 
-    # Workspace-resident target dirs (ensure they exist)
     mkdir -p "$WORKSPACE_DIR/notes" \
              "$WORKSPACE_DIR/build_log" \
-             "$WORKSPACE_DIR/.claude-sutando/projects/${canonical}/memory"
+             "$WORKSPACE_DIR/.claude-sutando/projects/${local_slug}/memory"
 
-    # 1. notes/ — handle symlink case (workspace/notes is already a symlink
-    # into legacy; nothing to copy, just unlink + create as a real dir for
-    # the new model to take over).
+    # 1. notes/ — handle symlink case
     if [ -L "$WORKSPACE_DIR/notes" ]; then
         local symlink_target
         symlink_target="$(readlink "$WORKSPACE_DIR/notes")"
@@ -640,21 +459,20 @@ _migrate_from_legacy_impl() {
     fi
     if [ -d "$legacy_dir/notes" ]; then
         cp -an "$legacy_dir/notes"/. "$WORKSPACE_DIR/notes"/ 2>/dev/null || true
-        log "_migrate_from_legacy_impl: copied $legacy_dir/notes/ → $WORKSPACE_DIR/notes/ (cp -n; existing files preserved)"
+        log "_migrate_from_legacy_impl: copied $legacy_dir/notes/ → $WORKSPACE_DIR/notes/ (cp -n)"
     fi
 
-    # 2. memory/*.md → canonical-id memory dir
+    # 2. memory/*.md → this host's local slug memory dir
     if [ -d "$legacy_dir/memory" ]; then
         local copied=0
         for f in "$legacy_dir/memory"/*.md; do
             [ -f "$f" ] || continue
-            cp -n "$f" "$WORKSPACE_DIR/.claude-sutando/projects/${canonical}/memory/" 2>/dev/null && copied=$((copied+1))
+            cp -n "$f" "$WORKSPACE_DIR/.claude-sutando/projects/${local_slug}/memory/" 2>/dev/null && copied=$((copied+1))
         done
-        log "_migrate_from_legacy_impl: copied $copied memory file(s) → canonical=${canonical}"
+        log "_migrate_from_legacy_impl: copied $copied memory file(s) → local_slug=${local_slug}"
     fi
 
-    # 3. pending-questions.md (curated machine-<hostname>/pending-questions.md takes precedence
-    # if present, else top-level)
+    # 3. pending-questions.md (prefer machine-<host>/pending-questions.md if present)
     local host
     host="$(hostname | sed 's/\..*//')"
     local pq_src
@@ -670,7 +488,7 @@ _migrate_from_legacy_impl() {
             && log "_migrate_from_legacy_impl: copied $pq_src → workspace/pending-questions.md"
     fi
 
-    # 4. build_log.md → build_log/<hostname>.md (per-host split per design)
+    # 4. build_log.md → build_log/<hostname>.md (per-host split)
     local bl_src
     if [ -f "$legacy_dir/machine-${host}/build_log.md" ]; then
         bl_src="$legacy_dir/machine-${host}/build_log.md"
@@ -684,11 +502,11 @@ _migrate_from_legacy_impl() {
             && log "_migrate_from_legacy_impl: copied $bl_src → workspace/build_log/${host}.md"
     fi
 
-    # 5. Run init impl to set up the workspace-as-git-repo + first push
+    # 5. Hand off to _init_impl for git init + first push
     log "_migrate_from_legacy_impl: handing off to _init_impl for git init + first push"
     _init_impl
 
-    # 6. Print next steps for the operator
+    # 6. Operator-facing next steps
     cat <<EOF >&2
 
 sync-workspace migrate: complete.
@@ -696,7 +514,7 @@ sync-workspace migrate: complete.
 Next steps (operator-supervised):
   1. Verify the new workspace has the expected content:
        ls $WORKSPACE_DIR/notes/ | head
-       ls $WORKSPACE_DIR/.claude-sutando/projects/${canonical}/memory/ | head
+       ls $WORKSPACE_DIR/.claude-sutando/projects/${local_slug}/memory/ | head
   2. Confirm the first push landed in your $VAULT_URL repo (web UI).
   3. Run a normal sync to verify push + pull work end-to-end:
        bash scripts/sync-workspace.sh
@@ -716,7 +534,7 @@ cmd_help() {
 }
 
 # --------------------------------------------------------------------------- #
-# Section 7 — Subcommand dispatch                                              #
+# Section 6 — Subcommand dispatch                                              #
 # --------------------------------------------------------------------------- #
 
 cmd="${1:-default}"
