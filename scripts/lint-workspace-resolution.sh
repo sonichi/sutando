@@ -60,7 +60,7 @@ PATTERN_DOC_ENV_PATH='\$SUTANDO_WORKSPACE/'
 # branch when the wrapper script isn't reachable (e.g. non-checkout
 # installs). The fallback path is documented in each script's comments;
 # new contributors should still go through the wrapper.
-ALLOWED='^(src/sutando_config\.(py|ts)|src/workspace_default\.(py|ts)|src/startup\.sh|src/watch-tasks-stream\.sh|scripts/lint-workspace-resolution\.sh|scripts/install-git-hooks\.sh|scripts/sutando-config\.sh|scripts/sync-memory\.sh|scripts/sutando-migrate\.sh|scripts/sweep-stranded-claims\.sh|skills/catchup-after-startup/scripts/catchup-after-startup\.sh|skills/overlay-apps/scripts/launch\.sh|skills/self-diagnose/scripts/gather\.sh|tests/[^/]+\.(test\.)?(py|ts))$'
+ALLOWED='^(src/sutando_config\.(py|ts)|src/workspace_default\.(py|ts)|src/startup\.sh|src/watch-tasks-stream\.sh|src/migration_safety_helpers\.sh|scripts/lint-workspace-resolution\.sh|scripts/install-git-hooks\.sh|scripts/sutando-config\.sh|scripts/sync-memory\.sh|scripts/sutando-migrate\.sh|scripts/sweep-stranded-claims\.sh|skills/catchup-after-startup/scripts/catchup-after-startup\.sh|skills/overlay-apps/scripts/launch\.sh|skills/self-diagnose/scripts/gather\.sh|tests/[^/]+\.(test\.)?(py|ts|sh))$'
 
 # Allowed .md files — legitimate uses of `$SUTANDO_WORKSPACE/path` in
 # prose, e.g. the workspace contract docs that DESCRIBE the legacy form
