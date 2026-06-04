@@ -28,13 +28,16 @@ _realpath() {
 }
 
 _same_inode() {
-  # Cross-platform inode equality: stat -f %i (macOS BSD) / -c %i (Linux GNU).
-  # Use -L on both so symlinks are followed to their target's inode (BSD stat's
-  # default is lstat-semantics; -L flips it to stat-semantics, matching GNU).
-  # This is the symlink-equivalent case the B1 guard needs to detect.
+  # Cross-platform device:inode equality: stat -f '%d:%i' (macOS BSD) /
+  # -c '%d:%i' (Linux GNU). Use -L on both so symlinks are followed to their
+  # target (BSD stat's default is lstat-semantics; -L flips it to stat-
+  # semantics, matching GNU). Per Mini's PR #1440 v1 review (2026-06-04
+  # 02:30Z): comparing inode alone false-positives across unrelated file
+  # systems that happen to reuse the same inode number — the device id is
+  # what makes the pair globally unique.
   local a b
-  a=$(stat -L -f %i "$1" 2>/dev/null || stat -L -c %i "$1" 2>/dev/null)
-  b=$(stat -L -f %i "$2" 2>/dev/null || stat -L -c %i "$2" 2>/dev/null)
+  a=$(stat -L -f '%d:%i' "$1" 2>/dev/null || stat -L -c '%d:%i' "$1" 2>/dev/null)
+  b=$(stat -L -f '%d:%i' "$2" 2>/dev/null || stat -L -c '%d:%i' "$2" 2>/dev/null)
   [ -n "$a" ] && [ -n "$b" ] && [ "$a" = "$b" ]
 }
 
@@ -44,10 +47,30 @@ _is_unsafe_for_migration() {
   # Per PR #1440 review B3 (Mini): a malformed $SUTANDO_WORKSPACE pointing at
   # /, $HOME, repo root, or a path with surviving `..` after normalization
   # would otherwise be compressed-and-deleted on a "successful" migration.
+  #
+  # Expanded per Mini's v1 review (2026-06-04 02:30Z):
+  #   - /tmp and /private/tmp exact (subdirs like mktemp targets stay safe)
+  #   - $HOME/Documents/*, $HOME/Desktop/*, $HOME/Downloads/* descendants
+  #     (the prior pass only denied the exact dirs, leaving `~/Documents/foo`
+  #     fair game — that's the user's code repos / personal docs)
+  #   - $HOME/.sutando exact + subpaths, EXCEPT $HOME/.sutando/workspace
+  #     (that subpath IS the known legacy auto-migration source — we want
+  #     to be able to relocate it; everything else under .sutando is the
+  #     installer's per-host state)
+  #   - $HOME/.claude exact + subpaths
+  #   - $HOME/.config exact + subpaths
   local p="$1"
   local real
   real="$(_realpath "$p")"
   [ -z "$real" ] && return 0  # cannot resolve → unsafe
+
+  # Allow exception: the known legacy default (intended migration source).
+  # Checked FIRST so the subsequent $HOME/.sutando deny doesn't shadow it.
+  case "$real" in
+    "$HOME/.sutando/workspace"|"$HOME/.sutando/workspace/"*)
+      return 1 ;;  # explicitly safe — this is the auto-migration source
+  esac
+
   case "$real" in
     /|/usr|/usr/*|/etc|/etc/*|/var|/var/*|/bin|/bin/*|/sbin|/sbin/*|/System|/System/*|/Library|/Library/*|/Applications|/Applications/*)
       return 0 ;;
@@ -55,7 +78,20 @@ _is_unsafe_for_migration() {
     # there. Include the resolved forms so the deny matches either spelling.
     /private/etc|/private/etc/*|/private/var|/private/var/*)
       return 0 ;;
-    "$HOME"|"$HOME/Documents"|"$HOME/Desktop"|"$HOME/Downloads")
+    # Exact /tmp + /private/tmp deny (operator typo'd workspace path); mktemp
+    # subdirs (`/tmp/foo`) remain safe targets.
+    /tmp|/private/tmp)
+      return 0 ;;
+    "$HOME"|"$HOME/Documents"|"$HOME/Documents/"*|"$HOME/Desktop"|"$HOME/Desktop/"*|"$HOME/Downloads"|"$HOME/Downloads/"*)
+      return 0 ;;
+    # $HOME dotfile dirs — destructive for user installs of other tools, even
+    # if SUTANDO_WORKSPACE was set there by mistake. .sutando/workspace already
+    # excluded above.
+    "$HOME/.sutando"|"$HOME/.sutando/"*)
+      return 0 ;;
+    "$HOME/.claude"|"$HOME/.claude/"*)
+      return 0 ;;
+    "$HOME/.config"|"$HOME/.config/"*)
       return 0 ;;
     "$REPO"|"$REPO/"*)
       return 0 ;;

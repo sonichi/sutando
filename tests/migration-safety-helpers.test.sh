@@ -96,6 +96,59 @@ ln -s "$HOME" "$TEST_DIR/sneaky-home-symlink"
 assert_true "symlink to \$HOME is unsafe (realpath resolves)" \
   _is_unsafe_for_migration "$TEST_DIR/sneaky-home-symlink"
 
+# ---- PR #1440 v1 — Mini review (2026-06-04 02:30Z) deny-list expansion -----
+# /tmp + /private/tmp exact deny (subdirs remain safe; mktemp targets work).
+# NOTE: the function returns "unsafe" for non-existent paths (realpath empty)
+# as a defensive default, so safe-case tests must use EXISTING paths.
+mkdir -p "$TEST_DIR/safe-subdir-of-tmp"
+assert_true  "/tmp (exact) is unsafe"               _is_unsafe_for_migration "/tmp"
+assert_true  "/private/tmp (exact) is unsafe"       _is_unsafe_for_migration "/private/tmp"
+assert_false "/tmp/<existing-subdir> is safe"       _is_unsafe_for_migration "$TEST_DIR/safe-subdir-of-tmp"
+# (TEST_DIR is /tmp/sutando-helpers-test-$$ so this exercises the subdir-allow case)
+
+# $HOME/Documents/* descendants — exact-only deny would leave these vulnerable.
+# These are non-existent paths under the real $HOME; deny applies regardless.
+assert_true "\$HOME/Documents/foo descendant is unsafe" \
+  _is_unsafe_for_migration "$HOME/Documents/foo-test-$$"
+assert_true "\$HOME/Desktop/foo descendant is unsafe" \
+  _is_unsafe_for_migration "$HOME/Desktop/foo-test-$$"
+assert_true "\$HOME/Downloads/foo descendant is unsafe" \
+  _is_unsafe_for_migration "$HOME/Downloads/foo-test-$$"
+
+# $HOME/.sutando deny + .sutando/workspace allow exception. Use a fake $HOME
+# to avoid touching the real ~/.sutando/ tree (the test must mkdir the allow-
+# case paths because the function rejects non-existent paths as unsafe).
+# IMPORTANT: realpath the fake-home so HOME matches the realpath'd subpaths
+# (on macOS /tmp -> /private/tmp; case-pattern uses literal $HOME, so an
+# unsymlinked literal HOME won't match realpath'd /private/tmp/... paths).
+# On real systems $HOME is /Users/... so this collision doesn't arise.
+FAKE_HOME_RAW="$TEST_DIR/fake-home"
+mkdir -p "$FAKE_HOME_RAW"
+FAKE_HOME="$(_realpath "$FAKE_HOME_RAW")"
+mkdir -p "$FAKE_HOME/.sutando/workspace/sub" \
+         "$FAKE_HOME/.sutando/notworkspace" \
+         "$FAKE_HOME/.claude/sub" \
+         "$FAKE_HOME/.config/sub"
+REAL_HOME="$HOME"
+HOME="$FAKE_HOME"
+assert_true  "fake \$HOME/.sutando (exact) is unsafe" \
+  _is_unsafe_for_migration "$HOME/.sutando"
+assert_true  "fake \$HOME/.sutando/notworkspace is unsafe" \
+  _is_unsafe_for_migration "$HOME/.sutando/notworkspace"
+assert_false "fake \$HOME/.sutando/workspace is SAFE (legacy default, intentional migration source)" \
+  _is_unsafe_for_migration "$HOME/.sutando/workspace"
+assert_false "fake \$HOME/.sutando/workspace/sub is SAFE (subpath of legacy default)" \
+  _is_unsafe_for_migration "$HOME/.sutando/workspace/sub"
+assert_true  "fake \$HOME/.claude (exact) is unsafe" \
+  _is_unsafe_for_migration "$HOME/.claude"
+assert_true  "fake \$HOME/.claude/sub is unsafe" \
+  _is_unsafe_for_migration "$HOME/.claude/sub"
+assert_true  "fake \$HOME/.config (exact) is unsafe" \
+  _is_unsafe_for_migration "$HOME/.config"
+assert_true  "fake \$HOME/.config/sub is unsafe" \
+  _is_unsafe_for_migration "$HOME/.config/sub"
+HOME="$REAL_HOME"
+
 echo
 echo "==== _color_warn (NO_COLOR + TTY) ===="
 # Test in a non-TTY (default in test runs): always plain, regardless of NO_COLOR.
