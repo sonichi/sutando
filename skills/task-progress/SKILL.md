@@ -2,38 +2,67 @@
 
 Sends mid-task progress updates to the channel a task came from (Slack, Discord, or Telegram).
 
-Use this whenever a task will take more than ~2 minutes so the user knows you're working on it
-and isn't left wondering if you received their message.
+## Critical rule — notify BEFORE any work begins
 
-## When to use
+**Call notify.py as the FIRST action after reading a non-trivial task — before any tool calls,
+web searches, code reads, or analysis.** The user's first signal that you received their message
+must be the notification, not the final result arriving minutes later after silence.
 
-**Always** call notify at task-start when the task is non-trivial (research, code changes, PRs,
-anything estimated at >2 minutes). Send a progress update mid-task if the work has natural
-checkpoints (e.g. "Done with X, moving to Y").
+Wrong order:
+1. Read task
+2. Do research (WebSearch, WebFetch, file reads, analysis...)
+3. ← user waits 2 min with no signal
+4. Notify "on it"
+5. Return result
 
-Rule of thumb:
-- Simple lookup / quick answer → no notification needed
-- Code change, skill build, PR, research report → notify on start + on key milestones
+Correct order:
+1. Read task
+2. **Notify immediately** ← user knows you got it within seconds
+3. Do research / work
+4. Notify at key checkpoints
+5. Return result
+
+## When to notify
+
+Notify at task-start when any of these apply:
+- Research questions (web search, reading files, looking things up)
+- Code changes (editing, writing, testing)
+- PRs (opening, reviewing, updating)
+- Multi-step analysis (GTM strategy, architecture review, brainstorming)
+- Anything that will take more than ~60 seconds before the result appears
+
+No notification needed for:
+- A factual answer you can give immediately from memory
+- A one-sentence reply
+
+**When in doubt, notify.** A false positive (notifying for a 30-second task) is far less
+annoying than silence for 2 minutes on a research task.
 
 ## How to use
 
-Read the task file to get `source` and `channel_id` (or `chat_id` for Telegram), then call:
+Read the task file to get `source` and `channel_id` (or `chat_id` for Telegram), then call
+**immediately after reading the task**:
 
 ```bash
 python3 ~/.claude/skills/task-progress/scripts/notify.py \
   --source slack \
   --channel-id D0B5L7X2TK2 \
-  --message "On it — this looks like a few minutes of work. I'll update you as I go."
+  --message "On it — looking into that now. Back in a minute."
+```
+
+For research tasks, be specific about what you're doing:
+```bash
+  --message "Researching Trigify setup time now — back in a minute."
 ```
 
 For a Slack @mention (threaded reply), add `--thread-ts <ts>` to keep the update in-thread.
 
-Mid-task update example:
+Mid-task checkpoint update:
 ```bash
 python3 ~/.claude/skills/task-progress/scripts/notify.py \
   --source slack \
   --channel-id D0B5L7X2TK2 \
-  --message "Done writing the skill — running tests now."
+  --message "Done with the research — writing up the summary now."
 ```
 
 ### Field mapping from task files

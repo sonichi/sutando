@@ -203,19 +203,31 @@ On each proactive loop pass, check `pending-questions.md` for unanswered items a
 
 ## Task progress notifications
 
-When starting any non-trivial task (code changes, skill builds, PRs, research, file edits — anything likely to take more than ~2 minutes), use the `task-progress` skill to notify the user on the channel the task came from:
+**Call notify BEFORE doing any work** — the notification must be the first thing the user sees
+after sending a task, not silence followed by a result minutes later.
+
+Correct sequence:
+1. Read task file
+2. **Call notify immediately** (before any web searches, file reads, or analysis)
+3. Do the work
+4. Send a checkpoint update at natural milestones
+5. Return result
+
+Use the `task-progress` skill for any task involving research, code changes, PRs, multi-step
+analysis, or anything likely to take more than ~60 seconds:
 
 ```bash
 python3 ~/.claude/skills/task-progress/scripts/notify.py \
   --source <source> --channel-id <channel_id> \
-  --message "On it — looks like a few minutes. I'll keep you posted."
+  --message "On it — looking into that now. Back in a minute."
 ```
 
 Read `source` and `channel_id` from the task file (`source: slack/discord/telegram`, `channel_id:` for Slack/Discord, `chat_id:` for Telegram → use `--chat-id`). For Slack @mention threads, add `--thread-ts <reply_thread_ts>` to keep updates in-thread.
 
-Send a second update at meaningful checkpoints (e.g. "Done writing the skill — running tests now.").
+Send a second update at meaningful checkpoints (e.g. "Done with the research — writing up now.").
 
-The script is fail-open — always continue the task regardless of exit code. Simple lookups or one-line answers don't need a notification.
+The script is fail-open — always continue the task regardless of exit code. Only skip for
+immediate one-sentence answers that require no tool calls.
 
 ## Workspace layout
 
