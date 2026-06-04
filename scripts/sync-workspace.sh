@@ -581,8 +581,132 @@ cmd_status() {
 
 cmd_migrate_from_legacy() {
     acquire_lock
-    log "cmd_migrate_from_legacy: stub — Phase 3 implements: rsync ~/.sutando/memory-sync/{notes,memory,build_log.md,pending-questions.md,...} → workspace + git init + initial push"
-    echo "sync-workspace --migrate-from-legacy: not yet implemented (Phase 3)" >&2
+    _migrate_from_legacy_impl
+}
+
+# Phase 3: one-time migration from the legacy ~/.sutando/memory-sync/ git
+# repo to the new workspace-as-git-repo model. Steps:
+#
+#   1. Detect legacy clone at $HOME/.sutando/memory-sync/ (or
+#      $SUTANDO_MEMORY_SYNC_DIR if set)
+#   2. Curated copy of legacy content into workspace's tracked paths:
+#      - legacy/notes/ → workspace/notes/  (skip if workspace/notes is a
+#        symlink into the legacy repo — workspace already points at it)
+#      - legacy/memory/*.md → workspace/.claude-sutando/projects/<canonical>/memory/
+#      - legacy/pending-questions.md → workspace/pending-questions.md
+#      - legacy/build_log.md → workspace/build_log/<hostname>.md (split per
+#        the per-host design)
+#   3. Call _init_impl to git-init the workspace + push to vault
+#   4. Print a "next steps" recipe for the operator (don't delete legacy yet;
+#      they verify the migration landed cleanly first)
+#
+# Safe-by-default: never deletes the legacy dir; never overwrites existing
+# workspace files (cp with -n). Operator deletes legacy manually after
+# verifying.
+
+_migrate_from_legacy_impl() {
+    [ -z "$VAULT_URL" ] && die "migrate: SUTANDO_VAULT not set in env or .env"
+
+    local legacy_dir
+    legacy_dir="${SUTANDO_MEMORY_SYNC_DIR:-$HOME/.sutando/memory-sync}"
+
+    if [ ! -d "$legacy_dir" ]; then
+        die "migrate: legacy clone not found at $legacy_dir; nothing to migrate"
+    fi
+    if [ ! -d "$legacy_dir/.git" ]; then
+        die "migrate: $legacy_dir exists but is not a git repo; expected a clone of the old memory-sync"
+    fi
+
+    log "_migrate_from_legacy_impl: starting migration from $legacy_dir → $WORKSPACE_DIR"
+    echo "sync-workspace migrate: copying from $legacy_dir into $WORKSPACE_DIR" >&2
+
+    local canonical
+    canonical="$(canonical_id)"
+
+    # Workspace-resident target dirs (ensure they exist)
+    mkdir -p "$WORKSPACE_DIR/notes" \
+             "$WORKSPACE_DIR/build_log" \
+             "$WORKSPACE_DIR/.claude-sutando/projects/${canonical}/memory"
+
+    # 1. notes/ — handle symlink case (workspace/notes is already a symlink
+    # into legacy; nothing to copy, just unlink + create as a real dir for
+    # the new model to take over).
+    if [ -L "$WORKSPACE_DIR/notes" ]; then
+        local symlink_target
+        symlink_target="$(readlink "$WORKSPACE_DIR/notes")"
+        log "_migrate_from_legacy_impl: workspace/notes is a symlink → $symlink_target; removing + copying content"
+        rm "$WORKSPACE_DIR/notes"
+        mkdir -p "$WORKSPACE_DIR/notes"
+    fi
+    if [ -d "$legacy_dir/notes" ]; then
+        cp -an "$legacy_dir/notes"/. "$WORKSPACE_DIR/notes"/ 2>/dev/null || true
+        log "_migrate_from_legacy_impl: copied $legacy_dir/notes/ → $WORKSPACE_DIR/notes/ (cp -n; existing files preserved)"
+    fi
+
+    # 2. memory/*.md → canonical-id memory dir
+    if [ -d "$legacy_dir/memory" ]; then
+        local copied=0
+        for f in "$legacy_dir/memory"/*.md; do
+            [ -f "$f" ] || continue
+            cp -n "$f" "$WORKSPACE_DIR/.claude-sutando/projects/${canonical}/memory/" 2>/dev/null && copied=$((copied+1))
+        done
+        log "_migrate_from_legacy_impl: copied $copied memory file(s) → canonical=${canonical}"
+    fi
+
+    # 3. pending-questions.md (curated machine-<hostname>/pending-questions.md takes precedence
+    # if present, else top-level)
+    local host
+    host="$(hostname | sed 's/\..*//')"
+    local pq_src
+    if [ -f "$legacy_dir/machine-${host}/pending-questions.md" ]; then
+        pq_src="$legacy_dir/machine-${host}/pending-questions.md"
+    elif [ -f "$legacy_dir/pending-questions.md" ]; then
+        pq_src="$legacy_dir/pending-questions.md"
+    else
+        pq_src=""
+    fi
+    if [ -n "$pq_src" ]; then
+        cp -n "$pq_src" "$WORKSPACE_DIR/pending-questions.md" 2>/dev/null \
+            && log "_migrate_from_legacy_impl: copied $pq_src → workspace/pending-questions.md"
+    fi
+
+    # 4. build_log.md → build_log/<hostname>.md (per-host split per design)
+    local bl_src
+    if [ -f "$legacy_dir/machine-${host}/build_log.md" ]; then
+        bl_src="$legacy_dir/machine-${host}/build_log.md"
+    elif [ -f "$legacy_dir/build_log.md" ]; then
+        bl_src="$legacy_dir/build_log.md"
+    else
+        bl_src=""
+    fi
+    if [ -n "$bl_src" ]; then
+        cp -n "$bl_src" "$WORKSPACE_DIR/build_log/${host}.md" 2>/dev/null \
+            && log "_migrate_from_legacy_impl: copied $bl_src → workspace/build_log/${host}.md"
+    fi
+
+    # 5. Run init impl to set up the workspace-as-git-repo + first push
+    log "_migrate_from_legacy_impl: handing off to _init_impl for git init + first push"
+    _init_impl
+
+    # 6. Print next steps for the operator
+    cat <<EOF >&2
+
+sync-workspace migrate: complete.
+
+Next steps (operator-supervised):
+  1. Verify the new workspace has the expected content:
+       ls $WORKSPACE_DIR/notes/ | head
+       ls $WORKSPACE_DIR/.claude-sutando/projects/${canonical}/memory/ | head
+  2. Confirm the first push landed in your $VAULT_URL repo (web UI).
+  3. Run a normal sync to verify push + pull work end-to-end:
+       bash scripts/sync-workspace.sh
+  4. Once you're satisfied, you can delete the legacy clone:
+       rm -rf $legacy_dir
+     (Optional — keeping it around as a backup costs ~minor disk only.)
+  5. Update your crons to invoke 'sync-workspace.sh' instead of 'sync-memory.sh'
+     (PR-1 keeps sync-memory.sh untouched; PR-2 will add a backward-compat shim
+     that auto-redirects).
+EOF
     return 0
 }
 
