@@ -401,6 +401,28 @@ RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 INBOX_DIR.mkdir(exist_ok=True)
 
 
+def _transcribe_via_skill(local_path: str) -> str | None:
+    """Call skills/audio-transcribe/scripts/transcribe.py. Returns transcript or None.
+
+    Optional — if the skill is absent the caller falls back to [File attached:].
+    Errors are swallowed; transcription failure must never block task delivery.
+    """
+    import subprocess
+    skill_script = Path(__file__).parent.parent / "skills" / "audio-transcribe" / "scripts" / "transcribe.py"
+    if not skill_script.exists():
+        return None
+    try:
+        result = subprocess.run(
+            [sys.executable, str(skill_script), local_path],
+            capture_output=True, text=True, timeout=25,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() or None
+    except Exception as e:
+        print(f"  [stt] skill call failed for {os.path.basename(local_path)}: {e}", flush=True)
+    return None
+
+
 def _safe_attachment_basename(filename: str) -> str:
     """Sanitize a Discord attachment filename for safe filesystem +
     downstream-shell use.
@@ -2499,7 +2521,11 @@ async def _handle_discord_message(message, force=False):
         local_path = INBOX_DIR / f"{int(time.time()*1000)}_{_safe_attachment_basename(att.filename)}"
         try:
             await att.save(local_path)
-            attachment_note += f"\n[File attached: {local_path}]"
+            transcript = _transcribe_via_skill(str(local_path))
+            if transcript:
+                attachment_note += f"\n[Voice transcript: {transcript}]"
+            else:
+                attachment_note += f"\n[File attached: {local_path}]"
             # If voice is connected and the attachment is an image, also push
             # it as a vision frame so Gemini sees it in-stream (in addition
             # to the file-attached task pipeline).
