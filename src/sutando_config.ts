@@ -282,13 +282,18 @@ export function resolveWorkspace(repoRoot?: string): string {
 
 	if (envVal && !_legacyEnvWarnPrinted) {
 		_legacyEnvWarnPrinted = true;
+		// PR #1440 B4: drop the literal `'${envVal}'` interpolation (parity with
+		// Python's c58270d safety pass). Embedding /-bearing path values in
+		// stderr was the trigger for the caller-side `mkdir -p "$captured"`
+		// regression that created a rogue folder tree from a tokenized warning.
 		process.stderr.write(
 			_colorWarn(
-				`sutando config: $SUTANDO_WORKSPACE='${envVal}' is set but NO LONGER HONORED ` +
+				`sutando config: $SUTANDO_WORKSPACE is set but NO LONGER HONORED ` +
 					`(removed in v0.8). The workspace now resolves from sutando.config.{json,local.json} ` +
 					`or the {repoRoot}/workspace baked-in default. If you have existing workspace data at ` +
-					`'${envVal}', run \`bash scripts/sutando-migrate.sh --dry-run\` to preview a relocation, ` +
-					`then \`--commit\`. Unset $SUTANDO_WORKSPACE in your shell + .env to silence this warning.`,
+					`the env-pointed path, run \`bash scripts/sutando-migrate.sh --dry-run\` to preview a ` +
+					`relocation, then \`--commit\`. Unset $SUTANDO_WORKSPACE in your shell + .env to silence ` +
+					`this warning.`,
 			) + '\n',
 		);
 	}
@@ -313,10 +318,13 @@ export function resolveWorkspace(repoRoot?: string): string {
 		_dotenvDriftWarnPrinted = true;
 		const dotenvVal = detectEnvWorkspaceInDotenv(repoRoot);
 		if (dotenvVal) {
+			// PR #1440 B4: drop literal `'${dotenvVal}'` and `${resolved}` path
+			// interpolations (parity with Python's c58270d safety pass).
 			process.stderr.write(
 				_colorWarn(
-					`sutando config: .env declares SUTANDO_WORKSPACE='${dotenvVal}' but the env var is no ` +
-						`longer honored (removed in v0.8). Resolved workspace is ${resolved} (config-driven). ` +
+					`sutando config: .env declares SUTANDO_WORKSPACE but the env var is no longer honored ` +
+						`(removed in v0.8). The resolved workspace is config-driven ` +
+						`(sutando.config.{json,local.json} or {repoRoot}/workspace default). ` +
 						`Delete the .env line and, if needed, move the value to \`sutando.config.local.json\` ` +
 						`under \`workspace.path\`.`,
 				) + '\n',

@@ -55,12 +55,17 @@ unset __HELPER
 if [ -f "$REPO/.env" ]; then
   _env_val=$(grep -E '^SUTANDO_WORKSPACE=' "$REPO/.env" 2>/dev/null | head -1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'\$//" -e "s|^~|$HOME|")
   if [ -n "$_env_val" ]; then
-    if [ -t 2 ]; then
-      printf '\033[1;31m%s\033[0m\n' \
-        "workspace: .env declares SUTANDO_WORKSPACE='$_env_val' but the env var is no longer honored (removed in v0.8). Delete the .env line, and if needed move the value to sutando.config.local.json under workspace.path. The M0 helper resolves to '$WORKSPACE'." >&2
+    # PR #1440 B4: honor NO_COLOR; drop literal path values from the warning
+    # text (parity with Python's c58270d safety pass — a caller-side `2>&1`
+    # capture followed by `mkdir -p "$captured"` previously tokenized embedded
+    # / chars into a rogue folder tree).
+    _msg="workspace: .env declares SUTANDO_WORKSPACE but the env var is no longer honored (removed in v0.8). Delete the .env line, and if needed move the value to sutando.config.local.json under workspace.path."
+    if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+      printf '\033[1;31m%s\033[0m\n' "$_msg" >&2
     else
-      echo "workspace: .env declares SUTANDO_WORKSPACE='$_env_val' but the env var is no longer honored (removed in v0.8). Delete the .env line, and if needed move the value to sutando.config.local.json under workspace.path. The M0 helper resolves to '$WORKSPACE'." >&2
+      printf '%s\n' "$_msg" >&2
     fi
+    unset _msg
   fi
   unset _env_val
 fi

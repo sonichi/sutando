@@ -77,6 +77,13 @@ else
 fi
 if [ $missing -eq 1 ]; then echo ""; echo "Fix the above and try again."; exit 1; fi
 
+# v0.8 auto-migration helpers (PR #1440 safety hardening — Mini review).
+# Sourced from a sibling file so the four guard functions (_realpath,
+# _same_inode, _is_unsafe_for_migration, _color_warn) can be unit-tested
+# without driving the full startup sequence. See tests/migration-safety-helpers.test.sh.
+# shellcheck source=migration_safety_helpers.sh
+source "$REPO/src/migration_safety_helpers.sh"
+
 # v0.8 auto-migration: $SUTANDO_WORKSPACE is no longer honored by the resolver.
 # If still set (shell rc, .env, launchd plist), detect any data at the env-
 # pointed path and relocate to the new default before services start.
@@ -86,10 +93,16 @@ if [ $missing -eq 1 ]; then echo ""; echo "Fix the above and try again."; exit 1
 # state/auth/ specifically because that subtree is exempt from transient-state
 # cleanup (per CLAUDE.md "Durable per-host install state").
 #
+# Safety layers (PR #1440 review — Mini):
+#   B1: realpath + inode equality guard — skip if env == resolved workspace.
+#   B2: archive BEFORE migrate, so the tarball is a true pre-migration snapshot.
+#   B3: deny-list check — refuse rm -rf if env points at /, $HOME, repo, etc.
+#   B4: NO_COLOR honored in the red banner (see _color_warn above).
+#
 # Failure mode: if sutando-migrate.sh --commit exits non-zero (collision that
 # can't be auto-resolved, etc.), startup ABORTS — refusing to proceed with
 # split state. Operator runs `bash scripts/sutando-migrate.sh --dry-run` to
-# diagnose.
+# diagnose. The pre-migration archive is preserved for recovery.
 if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
   _ws_legacy="${SUTANDO_WORKSPACE/#\~/$HOME}"
   _ws_new="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null || true)"
@@ -97,42 +110,59 @@ if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
 
   if [ -n "$_ws_new" ] && [ ! -f "$_migrate_sentinel" ] \
      && [ -d "$_ws_legacy" ] && [ -n "$(ls -A "$_ws_legacy" 2>/dev/null)" ]; then
-    # Red banner so the operator notices the one-shot relocation.
-    if [ -t 2 ]; then
-      printf '\033[1;31m📦 sutando v0.8 auto-migration: $SUTANDO_WORKSPACE points at %s with data; relocating to %s (one-shot).\033[0m\n' \
-        "$_ws_legacy" "$_ws_new" >&2
-    else
-      printf 'sutando v0.8 auto-migration: $SUTANDO_WORKSPACE points at %s with data; relocating to %s (one-shot).\n' \
-        "$_ws_legacy" "$_ws_new" >&2
-    fi
 
-    if bash "$REPO/scripts/sutando-migrate.sh" --commit; then
-      mkdir -p "$(dirname "$_migrate_sentinel")"
-      printf 'migrated_from=%s\nmigrated_at=%s\nhostname=%s\n' \
-        "$_ws_legacy" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(hostname)" \
-        > "$_migrate_sentinel"
-      echo "✅ auto-migration complete — data moved into $_ws_new/" >&2
+    _legacy_real="$(_realpath "$_ws_legacy")"
+    _new_real="$(_realpath "$_ws_new")"
 
-      # Compress the original folder in place + replace the directory with the
-      # tarball. Two goals (per owner directive 2026-06-03 18:36Z):
-      #   1) Preserve the original data as a recovery archive — `tar -xzf` to
-      #      restore.
-      #   2) Replace the directory with a single file so any stale process /
-      #      cron / launchd job still referencing the env-pointed path hits
-      #      ENOENT instead of silently writing to a divergent dir.
-      _legacy_archive="${_ws_legacy%/}-pre-v0.8-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
-      if tar -czf "$_legacy_archive" -C "$(dirname "$_ws_legacy")" "$(basename "$_ws_legacy")" 2>/dev/null; then
-        rm -rf "$_ws_legacy"
-        echo "📦 archived → $_legacy_archive" >&2
-        echo "   to restore: tar -xzf '$_legacy_archive' -C $(dirname "$_ws_legacy")" >&2
-      else
-        echo "⚠️  archive of $_ws_legacy failed — leaving in place. Old processes may still write there." >&2
-      fi
-    else
-      echo "❌ auto-migration failed — refusing to start with split state." >&2
-      echo "   Diagnose: bash scripts/sutando-migrate.sh --dry-run" >&2
-      echo "   Inspect:  ls -la $_ws_legacy $_ws_new" >&2
+    if [ -n "$_legacy_real" ] && [ -n "$_new_real" ] && [ "$_legacy_real" = "$_new_real" ]; then
+      # B1: realpath equality — env points at the resolved workspace. No-op.
+      echo "ℹ️  \$SUTANDO_WORKSPACE already points at the resolved workspace — no migration needed." >&2
+    elif _same_inode "$_ws_legacy" "$_ws_new"; then
+      # B1: same inode (symlink-equivalent) — no-op.
+      echo "ℹ️  \$SUTANDO_WORKSPACE is symlink-equivalent to the resolved workspace — no migration needed." >&2
+    elif _is_unsafe_for_migration "$_ws_legacy"; then
+      # B3: deny-list — refuse to touch unsafe paths.
+      echo "❌ refusing to auto-migrate \$SUTANDO_WORKSPACE — the path matches the deny-list" >&2
+      echo "   (denies: /, system dirs, \$HOME and top-level subdirs, repo root, paths with '..')." >&2
+      echo "   Likely a malformed \$SUTANDO_WORKSPACE in your shell/.env. Inspect + fix manually, then restart." >&2
       exit 1
+    else
+      _color_warn "📦 sutando v0.8 auto-migration: \$SUTANDO_WORKSPACE points at $_ws_legacy with data; relocating to $_ws_new (one-shot)."
+
+      # B2: archive BEFORE migrate. Captures the pre-migration state so the
+      # tarball is a genuine recovery snapshot. If --commit moves data first,
+      # the tarball would only catch the residual / empty post-migrate dir.
+      _legacy_archive="${_ws_legacy%/}-pre-v0.8-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
+      if ! tar -czf "$_legacy_archive" -C "$(dirname "$_ws_legacy")" "$(basename "$_ws_legacy")" 2>/dev/null; then
+        echo "❌ pre-migration archive of $_ws_legacy failed — aborting auto-migration." >&2
+        echo "   Without a recovery snapshot, refusing the destructive migrate-and-delete." >&2
+        exit 1
+      fi
+      echo "📦 pre-migration snapshot → $_legacy_archive" >&2
+
+      if bash "$REPO/scripts/sutando-migrate.sh" --commit; then
+        mkdir -p "$(dirname "$_migrate_sentinel")"
+        printf 'migrated_from=%s\nmigrated_at=%s\nhostname=%s\narchive=%s\n' \
+          "$_ws_legacy" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(hostname)" "$_legacy_archive" \
+          > "$_migrate_sentinel"
+        echo "✅ auto-migration complete — data moved into $_ws_new/" >&2
+
+        # B3 second layer: re-verify deny-list before destructive rm. If
+        # _ws_legacy somehow mutated between the initial check and now
+        # (symlink swapped, env var rewritten), refuse rm + preserve archive.
+        if _is_unsafe_for_migration "$_ws_legacy"; then
+          echo "⚠️  refusing rm -rf on $_ws_legacy (failed deny-list re-check). Recovery archive preserved." >&2
+        else
+          rm -rf "$_ws_legacy"
+          echo "🗑  removed legacy directory" >&2
+          echo "   to restore: tar -xzf '$_legacy_archive' -C $(dirname "$_ws_legacy")" >&2
+        fi
+      else
+        echo "❌ auto-migration failed — refusing to start with split state." >&2
+        echo "   Recovery archive preserved at $_legacy_archive" >&2
+        echo "   Diagnose: bash scripts/sutando-migrate.sh --dry-run" >&2
+        exit 1
+      fi
     fi
   fi
 
