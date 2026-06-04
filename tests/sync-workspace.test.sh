@@ -384,6 +384,49 @@ fi
 
 # ============================================================================
 echo
+echo "==== Test 12: pull-side delete-AND-add bypass (Mini #1445 v3 Medium fix) ===="
+# Setup: host 1 has 60 notes pushed (from Test 10 cleanup). Peer's branch deletes
+# all 60 + adds 60 new files → net tracked-file count is unchanged, but actual
+# deletions = 60. Pre-fix tripwire (which used pre_count - post_count = 0) would
+# bypass; post-fix tripwire counts actual diff-D deletions and fires.
+
+# Reset host 1 to have the 60 notes pushed
+cd "$FIXTURE_WS"
+for i in $(seq 1 60); do echo "n$i" > "notes/note-$i.md"; done
+SUTANDO_FORCE_SYNC=1 env "${COMMON_ENV[@]}" bash "$SYNC" --push-only 2>&1 | head -3
+cd - >/dev/null
+
+# Peer3: clone, delete all 60 notes, add 60 NEW files (net zero), push
+PEER3_WS="$TEST_ROOT/peer3-workspace"
+git clone -q "$FIXTURE_VAULT" "$PEER3_WS" 2>/dev/null
+(
+    cd "$PEER3_WS"
+    git checkout -B "host/peerhost3" "origin/host/${HOST}" >/dev/null 2>&1
+    rm -f notes/note-*.md
+    for i in $(seq 1 60); do echo "n$i" > "notes/replacement-$i.md"; done
+    git add -A
+    git -c user.email=peer3@test -c user.name=peer3 commit -q -m "peer3 deletes 60 + adds 60 (net zero)" >/dev/null 2>&1
+    git push -q origin "host/peerhost3" 2>/dev/null
+)
+
+# Host 1: pull — should detect actual 60-file deletion + reset (NOT bypass on net=0)
+out_bypass=$(run_sync --pull-only 2>&1 || true)
+case "$out_bypass" in
+  *"REFUSING pull"*|*"deleted 60"*|*"tripwire"*)
+    echo "  OK: actual-deletion-count tripwire fired on delete-and-add bypass attempt"; pass=$((pass+1)) ;;
+  *) echo "  FAIL: delete-and-add bypass succeeded — tripwire missed: $out_bypass"; fail=$((fail+1)) ;;
+esac
+
+# Verify host 1's note-*.md files survived
+RESTORED_COUNT=$(ls "$FIXTURE_WS/notes/note-"*.md 2>/dev/null | wc -l | tr -d ' ')
+if [ "$RESTORED_COUNT" -ge 60 ]; then
+  echo "  OK: original notes restored after bypass-attempt tripwire ($RESTORED_COUNT files)"; pass=$((pass+1))
+else
+  echo "  FAIL: notes were lost ($RESTORED_COUNT remain, expected ≥60)"; fail=$((fail+1))
+fi
+
+# ============================================================================
+echo
 echo "===================="
 echo "Total: $((pass+fail)) — pass: $pass, fail: $fail"
 exit $fail

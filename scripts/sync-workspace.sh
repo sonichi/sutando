@@ -43,7 +43,9 @@
 #                               Legacy alias: SUTANDO_MEMORY_REPO (honored one release)
 #   SUTANDO_REPO_DIR          — path to sutando code checkout. Auto-detected from script path.
 #   NO_COLOR                  — suppress ANSI escapes in warnings (no-color.org)
-#   SUTANDO_SYNC_MAX_DELETE   — mass-deletion tripwire threshold (default 50)
+#   SUTANDO_SYNC_MAX_DELETE   — mass-deletion absolute tripwire (default 50)
+#   SUTANDO_SYNC_MAX_DELETE_PCT — mass-deletion percentage tripwire (default 50;
+#                                  catches small-workspace catastrophic deletes)
 #   SUTANDO_FORCE_SYNC        — bypass mass-deletion tripwire (set =1)
 
 set -euo pipefail
@@ -245,7 +247,10 @@ generate_gitignore() {
             color_warn "Refusing to overwrite (operator-authored content may block carrier-set paths)."
             echo "" >&2
             echo "Diff (existing → would-be-generated):" >&2
-            diff -u "$gitignore_path" "$tmp_path" 2>&1 | head -40 >&2
+            # NB: `diff` exits 1 when files differ + `head -40` may SIGPIPE on
+            # long output → with `set -euo pipefail` the pipeline exits nonzero,
+            # tripping set -e before tmp_path cleanup. Mini #1445 v3 Medium fix.
+            diff -u "$gitignore_path" "$tmp_path" 2>&1 | head -40 >&2 || true
             echo "" >&2
             echo "To overwrite anyway: pass --force-gitignore" >&2
             echo "(Or merge desired changes into the existing file by hand.)" >&2
@@ -396,8 +401,14 @@ _pull_only_impl() {
         else
             log "_pull_only_impl: conflict merging $peer; resolving via --ours (use-local fallback)"
             for f in $(git diff --name-only --diff-filter=U); do
-                git checkout --ours -- "$f"
-                git add "$f"
+                # `--ours` fails on DD-conflicts (both sides deleted) — the file
+                # isn't on our side either. Fall back to `git rm` so the merge
+                # can complete cleanly. Surfaced by Mini #1445 v3 Test 12.
+                if git checkout --ours -- "$f" 2>/dev/null; then
+                    git add "$f"
+                else
+                    git rm -f -- "$f" 2>/dev/null || true
+                fi
             done
             git -c core.editor=true commit --no-edit 2>/dev/null || true
             merged=$((merged + 1))
@@ -407,17 +418,37 @@ _pull_only_impl() {
     log "_pull_only_impl: merged $merged peer branch(es)"
 
     # Pull-side mass-deletion tripwire — catches deletions that landed via
-    # git merge rather than staged rm. Compare tracked-file count drop.
-    local post_pull_count max_delete deleted_via_merge
-    post_pull_count="$(git ls-files | wc -l | tr -d ' ')"
+    # git merge rather than staged rm. Mini #1445 v3 Medium fix: count ACTUAL
+    # deletions in the merge diff, not (pre_count - post_count) net change —
+    # otherwise a "delete 60 / add 60" merge bypasses with net=0. Also adds a
+    # percentage threshold so catastrophic small-workspace cases (e.g. 20-of-30
+    # deletions) still trip below the absolute 50-file default.
+    local max_delete max_pct deleted_via_merge tripped tripped_reason
     max_delete="${SUTANDO_SYNC_MAX_DELETE:-50}"
-    deleted_via_merge=$((pre_pull_count - post_pull_count))
-    if [ "$deleted_via_merge" -gt "$max_delete" ] && [ "${SUTANDO_FORCE_SYNC:-0}" != "1" ]; then
-        log "_pull_only_impl: ABORT — pull deleted $deleted_via_merge files (pre=$pre_pull_count post=$post_pull_count >tripwire $max_delete); resetting to $pre_pull_sha"
+    max_pct="${SUTANDO_SYNC_MAX_DELETE_PCT:-50}"
+    if [ -n "$pre_pull_sha" ]; then
+        deleted_via_merge=$(git diff --name-only --diff-filter=D "$pre_pull_sha" HEAD 2>/dev/null | wc -l | tr -d ' ')
+    else
+        deleted_via_merge=0
+    fi
+    tripped=0
+    tripped_reason=""
+    if [ "$deleted_via_merge" -gt "$max_delete" ]; then
+        tripped=1
+        tripped_reason="deleted $deleted_via_merge files (>SUTANDO_SYNC_MAX_DELETE=$max_delete)"
+    elif [ "$pre_pull_count" -gt 0 ] && [ "$deleted_via_merge" -gt 0 ]; then
+        local pct=$(( deleted_via_merge * 100 / pre_pull_count ))
+        if [ "$pct" -ge "$max_pct" ]; then
+            tripped=1
+            tripped_reason="deleted $deleted_via_merge of $pre_pull_count files (${pct}% >=SUTANDO_SYNC_MAX_DELETE_PCT=$max_pct%)"
+        fi
+    fi
+    if [ "$tripped" = "1" ] && [ "${SUTANDO_FORCE_SYNC:-0}" != "1" ]; then
+        log "_pull_only_impl: ABORT — pull $tripped_reason; resetting to $pre_pull_sha"
         if [ -n "$pre_pull_sha" ]; then
             git reset --hard "$pre_pull_sha" 2>&1 | tee -a "$LOG" >/dev/null
         fi
-        echo "sync-workspace: REFUSING pull — peer branch(es) deleted $deleted_via_merge files (>SUTANDO_SYNC_MAX_DELETE=$max_delete). Reset to pre-pull state. Set SUTANDO_FORCE_SYNC=1 to override." >&2
+        echo "sync-workspace: REFUSING pull — peer $tripped_reason. Reset to pre-pull state. Set SUTANDO_FORCE_SYNC=1 to override." >&2
         return 1
     fi
 
@@ -493,7 +524,7 @@ cmd_status() {
         current_branch="$(git symbolic-ref --short HEAD 2>/dev/null || echo "<detached>")"
         echo "current branch: $current_branch"
         echo "remote branches:"
-        git for-each-ref --format='  %(refname:short) (last push: %(committerdate:relative))' refs/remotes/origin/host/ 2>/dev/null | head -20
+        git for-each-ref --format='  %(refname:short) (last push: %(committerdate:relative))' refs/remotes/origin/host/ 2>/dev/null | head -20 || true
     else
         echo "git status: workspace is NOT a git repo (run --init)"
     fi
@@ -656,7 +687,7 @@ EOF
 }
 
 cmd_help() {
-    sed -n 's/^# \?//;1,/^$/ {/^$/q;p;}' "$0" | head -50
+    sed -n 's/^# \?//;1,/^$/ {/^$/q;p;}' "$0" | head -50 || true
     return 0
 }
 
