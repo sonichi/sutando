@@ -1255,6 +1255,69 @@ def check_gateway_bridge() -> "dict | None":
     return {"name": "gateway-bridge", "status": "ok", "detail": "running"}
 
 
+def check_skill_symlinks() -> dict:
+    """Detect skills in the OSS repo checkout that are not symlinked into
+    ~/.claude/skills/. A missing symlink means Claude Code never loads the
+    skill — it's silently invisible until manually linked (bug d920b18b).
+
+    Scans REPO_DIR/skills/ for directories and checks for a matching entry
+    in ~/.claude/skills/. Reports unlinked skills as 'warn'; in --fix mode,
+    creates the missing symlinks automatically.
+    """
+    name = "skill-symlinks"
+    skills_src = REPO_DIR / "skills"
+    skills_dst = Path.home() / ".claude" / "skills"
+
+    if not skills_src.exists():
+        return {"name": name, "status": "ok", "detail": "skills/ dir not found — skipped"}
+    if not skills_dst.exists():
+        return {"name": name, "status": "ok", "detail": "~/.claude/skills/ not found — skipped"}
+
+    unlinked: list[str] = []
+    for skill_dir in sorted(skills_src.iterdir()):
+        if not skill_dir.is_dir():
+            continue
+        skill_name = skill_dir.name
+        dst = skills_dst / skill_name
+        if not dst.exists() and not dst.is_symlink():
+            unlinked.append(skill_name)
+
+    if not unlinked:
+        return {"name": name, "status": "ok", "detail": f"all {sum(1 for d in skills_src.iterdir() if d.is_dir())} skills linked"}
+
+    return {
+        "name": name,
+        "status": "warn",
+        "detail": f"{len(unlinked)} unlinked skill(s): {', '.join(unlinked[:5])}{'...' if len(unlinked) > 5 else ''}",
+        "_unlinked": unlinked,
+        "_skills_src": str(skills_src),
+        "_skills_dst": str(skills_dst),
+    }
+
+
+def fix_skill_symlinks(check: dict) -> dict:
+    """Create missing symlinks for unlinked skills (--fix handler)."""
+    unlinked = check.get("_unlinked", [])
+    skills_src = Path(check.get("_skills_src", ""))
+    skills_dst = Path(check.get("_skills_dst", ""))
+    created: list[str] = []
+    errors: list[str] = []
+    for skill_name in unlinked:
+        src = skills_src / skill_name
+        dst = skills_dst / skill_name
+        try:
+            dst.symlink_to(src)
+            created.append(skill_name)
+        except Exception as e:
+            errors.append(f"{skill_name}: {e}")
+    result = f"linked {len(created)}"
+    if created:
+        result += f" ({', '.join(created)})"
+    if errors:
+        result += f"; errors: {'; '.join(errors)}"
+    return {"name": "skill-symlinks", "status": "ok" if not errors else "warn", "detail": result}
+
+
 def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> dict:
     """Detect a task-queue pileup — tasks/ directory growing without
     being drained. Independent of which watcher / loop is dying: the queue
@@ -1795,6 +1858,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_core_proactive_loop(threshold_sec=loop_stale_sec))
     checks.append(check_core_supervisor())
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
+    checks.append(check_skill_symlinks())
 
     return checks
 
@@ -2631,6 +2695,12 @@ def main():
         if do_fix:
             print()
             print("Attempting fixes...")
+            # skill-symlinks is "warn" (excluded from issues) but auto-fixable —
+            # handle it separately from the issues loop.
+            for c in checks:
+                if c["name"] == "skill-symlinks" and c.get("_unlinked"):
+                    result = fix_skill_symlinks(c)
+                    print(f"  {c['name']}: {result['detail']}")
             for c in issues:
                 if c["name"].startswith("com.sutando."):
                     result = fix_launchd(c["name"])
