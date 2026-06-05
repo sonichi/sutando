@@ -96,14 +96,24 @@ def _restore_transport(original):
 
 
 def _with_access_json(content, fn):
+    """Patch dm.ACCESS_JSON and discord_config.load_config for isolation.
+
+    The real discord-config.json at $SUTANDO_WORKSPACE/state/discord-config.json
+    may have an `owner` field set, which bleeds into resolve_owner_id() step 2
+    and overrides the tierMap / allowFrom under test. Patch load_config → {}
+    so only the access_data fixture drives resolution.
+    """
     original = dm.ACCESS_JSON
+    original_load_config = dm.discord_config.load_config
     tmp = Path(tempfile.mkdtemp(prefix="sutando-dm-test-")) / "access.json"
     tmp.write_text(json.dumps(content))
     dm.ACCESS_JSON = tmp
+    dm.discord_config.load_config = lambda: {}
     try:
         fn()
     finally:
         dm.ACCESS_JSON = original
+        dm.discord_config.load_config = original_load_config
         tmp.unlink()
         tmp.parent.rmdir()
 
