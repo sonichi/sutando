@@ -568,6 +568,96 @@ _init_impl() {
     return 0
 }
 
+# wsId migration (#1459 follow-up): retire pre-wsId flat `host/<host>` branches.
+# Before #1459 each host pushed to a flat branch `host/<host>`. Post-#1459 the
+# branch is nested: `host/<host>/<wsId>`. A leftover flat branch — local OR on
+# the vault — is a leaf ref that DIRECTORY/FILE-conflicts with the nested ref:
+# git cannot create `refs/{heads,remotes/origin}/host/<host>/<wsId>` while a ref
+# named `.../host/<host>` exists ("cannot lock ref ... exists"). Left unhandled
+# this stranded the pull-side `checkout -B` (whose error used to be swallowed by
+# `... 2>&1 | tee >/dev/null`), so the script ran on the WRONG branch and
+# reported success while pushing nothing. This helper carries the flat branch's
+# history into the wsId branch and removes the flat ref (local + remote +
+# remote-tracking) so the wsId scheme can take over. Idempotent: a no-op once no
+# flat ref remains. Run BEFORE the checkout/fetch-merge in _pull_only_impl.
+_migrate_flat_branch() {
+    local host flat_branch wsid_branch
+    host="$(_host)"
+    flat_branch="host/${host}"
+    wsid_branch="host/$(_host_ws_segment)"
+    # Defensive: only meaningful while flat != nested (always true post-wsId).
+    [ "$flat_branch" = "$wsid_branch" ] && return 0
+
+    # --- local flat branch ---
+    if git show-ref --quiet "refs/heads/${flat_branch}"; then
+        local flat_sha
+        flat_sha="$(git rev-parse "refs/heads/${flat_branch}")"
+        log "_migrate_flat_branch: local flat $flat_branch ($flat_sha) -> $wsid_branch"
+        echo "sync-workspace: migrating local flat branch $flat_branch -> $wsid_branch (wsId migration)" >&2
+        # Move HEAD off the flat branch so it can be deleted.
+        if [ "$(git symbolic-ref --short HEAD 2>/dev/null)" = "$flat_branch" ]; then
+            git checkout --detach --quiet >>"$LOG" 2>&1 \
+                || die "wsId migration: failed to detach HEAD off $flat_branch"
+        fi
+        # Decide whether the wsId branch needs seeding BEFORE we delete the flat
+        # branch (don't clobber an existing wsId branch — it already carries this
+        # content or newer).
+        local _need_seed=0
+        git show-ref --quiet "refs/heads/${wsid_branch}" || _need_seed=1
+        # Delete the flat branch FIRST: it is a leaf ref that D/F-conflicts with
+        # the nested `host/<host>/<wsId>` ref, so the wsId branch cannot be
+        # created while it exists. flat_sha (captured above) preserves its tip.
+        git branch -D "$flat_branch" >>"$LOG" 2>&1 || true
+        if [ "$_need_seed" -eq 1 ]; then
+            git branch "$wsid_branch" "$flat_sha" >>"$LOG" 2>&1 \
+                || die "wsId migration: failed to seed $wsid_branch from $flat_branch"
+        fi
+    fi
+
+    # --- remote flat branch (and its stale remote-tracking ref) ---
+    if git show-ref --quiet "refs/remotes/origin/${flat_branch}"; then
+        local remote_flat_sha
+        remote_flat_sha="$(git rev-parse "refs/remotes/origin/${flat_branch}")"
+        # Only retire the remote flat branch once its content is preserved in our
+        # wsId branch (ancestor check) — never drop unmerged history. If it isn't
+        # contained yet, warn and leave it for the operator (rather than the
+        # pre-fix behavior of silently colliding).
+        if git show-ref --quiet "refs/heads/${wsid_branch}" \
+           && git merge-base --is-ancestor "$remote_flat_sha" "refs/heads/${wsid_branch}"; then
+            echo "sync-workspace: retiring vault flat branch $flat_branch (superseded by $wsid_branch)" >&2
+            # Delete the remote flat branch BEFORE pushing the nested wsId branch:
+            # git refuses to create refs/heads/host/<host>/<wsId> on the vault
+            # while the leaf ref refs/heads/host/<host> exists — even inside an
+            # `--atomic` push (the loose-ref backend D/F-checks before completing
+            # the delete). Content is already preserved in our local wsId branch
+            # (ancestor check above), so the brief window where the vault has
+            # neither ref is safe: the push below re-establishes it immediately,
+            # and on failure the content stays local for the next sync to re-push.
+            git push origin --delete "$flat_branch" >>"$LOG" 2>&1 \
+                || log "_migrate_flat_branch: remote delete of $flat_branch failed (already gone?)"
+            # Drop the local remote-tracking ref so it neither D/F-conflicts with
+            # the nested tracking ref on the next fetch nor gets merged as a bogus
+            # "peer" in the loop below.
+            git update-ref -d "refs/remotes/origin/${flat_branch}" >>"$LOG" 2>&1 || true
+            # Push the wsId branch now so this host's content stays visible to
+            # peers. We cannot defer to the bidirectional push step — it skips a
+            # clean tree (nothing-to-commit gate), so on a no-change pass the
+            # nested branch would never land.
+            local _mp_rc=0
+            git push origin "refs/heads/${wsid_branch}:refs/heads/${wsid_branch}" >>"$LOG" 2>&1 || _mp_rc=$?
+            if [ "$_mp_rc" -eq 0 ]; then
+                log "_migrate_flat_branch: retired remote flat $flat_branch, pushed $wsid_branch"
+            else
+                log "_migrate_flat_branch: push of $wsid_branch failed (exit $_mp_rc) after retiring flat; content is local, next sync re-pushes"
+                echo "sync-workspace: WARNING — retired vault flat branch but $wsid_branch push failed; content safe locally, will retry next sync (see $LOG)" >&2
+            fi
+        else
+            log "_migrate_flat_branch: NOT deleting remote flat origin/$flat_branch — content not yet in $wsid_branch"
+            echo "sync-workspace: vault flat branch $flat_branch not retired — its history isn't in $wsid_branch yet; resolve manually" >&2
+        fi
+    fi
+}
+
 # Pull-side: fetch all peer branches, merge into local host/<hostname> branch
 # with 3-way auto-merge first. On unresolvable conflict, use-local fallback
 # via `git checkout --ours`. Pull ordering: oldest peer push first (minimizes
@@ -590,6 +680,10 @@ _pull_only_impl() {
     log "_pull_only_impl: fetching all peer branches"
     git fetch --all --quiet 2>&1 | tee -a "$LOG" >/dev/null
 
+    # Retire any pre-#1459 flat `host/<host>` branch before the checkout below,
+    # which would otherwise D/F-conflict with the nested wsId ref.
+    _migrate_flat_branch
+
     # Ensure we're on the host-and-workspace branch (idempotent). Post-wsId
     # the branch is `host/<hostname>/<wsId>` so two workspaces on the same
     # host land in distinct refs.
@@ -597,11 +691,19 @@ _pull_only_impl() {
     host_ws_seg="$(_host_ws_segment)"
     current_branch="host/${host_ws_seg}"
     if [ "$(git symbolic-ref --short HEAD 2>/dev/null)" != "$current_branch" ]; then
+        # NOTE: capture the real checkout exit status the set-e-safe way
+        # (`|| rc=$?`, not `cmd; rc=$?` which set -e would short-circuit, nor a
+        # `| tee` pipe whose $? reflects tee, not git). The pre-fix `| tee
+        # >/dev/null` form SWALLOWED a failed checkout (e.g. a D/F conflict from
+        # a stale flat branch), leaving HEAD on the wrong branch while the run
+        # reported success and pushed nothing. Fail loudly instead.
+        local _co_rc=0
         if git show-ref --quiet "refs/remotes/origin/${current_branch}"; then
-            git checkout -B "$current_branch" "origin/${current_branch}" 2>&1 | tee -a "$LOG" >/dev/null
+            git checkout -B "$current_branch" "origin/${current_branch}" >>"$LOG" 2>&1 || _co_rc=$?
         else
-            git checkout -B "$current_branch" 2>&1 | tee -a "$LOG" >/dev/null
+            git checkout -B "$current_branch" >>"$LOG" 2>&1 || _co_rc=$?
         fi
+        [ "$_co_rc" -eq 0 ] || die "pull-only: failed to switch to $current_branch (git checkout exit $_co_rc); see $LOG"
     fi
 
     # Pro #1445 review fix #2: snapshot pre-pull state for the mass-deletion

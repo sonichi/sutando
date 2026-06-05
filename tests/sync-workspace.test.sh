@@ -1160,6 +1160,87 @@ esac
 
 # ============================================================================
 echo
+echo "==== Test 27: pre-wsId flat branch migrates to wsId scheme (no D/F collision) ===="
+# Regression for the #1459 follow-up. A leftover flat `host/<host>` branch
+# (local + on the vault) is a leaf ref that D/F-conflicts with the nested
+# `host/<host>/<wsId>` ref. Pre-fix the pull-side `checkout -B` failed silently
+# (error swallowed by `| tee >/dev/null`), stranding HEAD on the flat branch and
+# pushing nothing while reporting success. The migration helper must: carry flat
+# history into the wsId branch, push the wsId branch to the vault, retire the
+# flat branch (local + remote), and leave HEAD on the wsId branch.
+T27_VAULT="$TEST_ROOT/vault-27.git"
+git init -q --bare "$T27_VAULT"
+
+T27_WS="$TEST_ROOT/ws-27"
+T27_REPO="$TEST_ROOT/ws-27-repo"
+mkdir -p "$T27_WS/notes" "$T27_REPO/scripts" "$T27_REPO/src"
+touch "$T27_REPO/CLAUDE.md"
+git init -q "$T27_REPO"
+cp "$REPO/scripts/sync-workspace.sh" "$T27_REPO/scripts/"
+cp "$REPO/scripts/sutando-config.sh" "$T27_REPO/scripts/"
+cp "$REPO/src/sutando_config.py" "$T27_REPO/src/"
+cp "$FIXTURE_REPO/sutando.config.json" "$T27_REPO/"
+
+# Simulate the PRE-wsId on-disk + vault state: a flat `host/mighost` branch.
+echo "pre-wsId content" > "$T27_WS/notes/legacy-note.md"
+(
+  cd "$T27_WS"
+  git init -q
+  git symbolic-ref HEAD refs/heads/host/mighost     # begin directly on the flat branch
+  git remote add origin "$T27_VAULT"
+  printf '*\n!notes/\n!notes/**\n' > .gitignore
+  git add -A
+  git -c user.email=t27@test -c user.name=t27 commit -q -m "legacy flat-branch commit"
+  git push -q origin refs/heads/host/mighost:refs/heads/host/mighost
+)
+
+# Sanity: vault starts with the flat branch.
+if git --git-dir="$T27_VAULT" rev-parse refs/heads/host/mighost >/dev/null 2>&1; then
+  echo "  OK: vault starts with flat branch host/mighost"; pass=$((pass+1))
+else
+  echo "  FAIL: test setup — flat branch not in vault"; fail=$((fail+1))
+fi
+
+# Run the NEW sync (default bidirectional). Migration should fire.
+T27_OUT=$(env -i HOME="$HOME" PATH="$PATH" \
+    SUTANDO_REPO_DIR="$T27_REPO" \
+    SUTANDO_WORKSPACE="$T27_WS" \
+    SUTANDO_TEST_MODE=1 \
+    SUTANDO_HOST_OVERRIDE=mighost \
+    SUTANDO_WS_ID_OVERRIDE=t27mig \
+    bash "$T27_REPO/scripts/sync-workspace.sh" --vault-url "$T27_VAULT" 2>&1)
+
+if echo "$T27_OUT" | grep -q "migrating local flat branch host/mighost"; then
+  echo "  OK: migration message surfaced"; pass=$((pass+1))
+else
+  echo "  FAIL: no migration message. Output: $T27_OUT"; fail=$((fail+1))
+fi
+
+# Vault flat branch retired.
+if ! git --git-dir="$T27_VAULT" rev-parse refs/heads/host/mighost >/dev/null 2>&1; then
+  echo "  OK: vault flat branch host/mighost retired"; pass=$((pass+1))
+else
+  echo "  FAIL: vault flat branch host/mighost still present"; fail=$((fail+1))
+fi
+
+# Vault wsId branch present, carrying the migrated content.
+if git --git-dir="$T27_VAULT" cat-file -e refs/heads/host/mighost/t27mig:notes/legacy-note.md 2>/dev/null; then
+  echo "  OK: vault wsId branch host/mighost/t27mig carries migrated content"; pass=$((pass+1))
+else
+  echo "  FAIL: wsId branch missing or content not migrated"; fail=$((fail+1))
+fi
+
+# Local HEAD on the wsId branch; flat branch gone locally.
+T27_HEAD=$(cd "$T27_WS" && git symbolic-ref --short HEAD 2>/dev/null || echo "")
+assert_eq "local HEAD on wsId branch after migration" "host/mighost/t27mig" "$T27_HEAD"
+if ( cd "$T27_WS" && ! git show-ref --quiet refs/heads/host/mighost ); then
+  echo "  OK: local flat branch host/mighost deleted"; pass=$((pass+1))
+else
+  echo "  FAIL: local flat branch host/mighost still present"; fail=$((fail+1))
+fi
+
+# ============================================================================
+echo
 echo "===================="
 echo "Total: $((pass+fail)) — pass: $pass, fail: $fail"
 exit $fail
