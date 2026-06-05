@@ -43,6 +43,10 @@ check(
     'skill_hints = ""' in slack_src and 'access_tier == "owner"' in slack_src,
 )
 check(
+    "slack: skill injection guarded by skill file existence check",
+    "_notify_py.exists()" in slack_src and "_transcribe_py.exists()" in slack_src,
+)
+check(
     "slack: notify command uses task-progress skill",
     "task-progress/scripts/notify.py" in slack_src,
 )
@@ -61,8 +65,8 @@ check(
 )
 check(
     "slack: non-owner tasks do not get skill hints",
-    # The skill_hints block is guarded by access_tier == "owner"
-    re.search(r'if access_tier == .owner.:\s.*skill_hints', slack_src, re.DOTALL) is not None,
+    # guard: access_tier == "owner" AND skill exists
+    re.search(r'access_tier == .owner. and \(', slack_src) is not None,
 )
 
 # ---------------------------------------------------------------------------
@@ -74,6 +78,10 @@ discord_src = DISCORD_BRIDGE.read_text()
 check(
     "discord: skill hints block defined for owner tasks",
     'discord_skill_hints = ""' in discord_src and 'access_tier == "owner"' in discord_src,
+)
+check(
+    "discord: skill injection guarded by skill file existence check",
+    "_notify_py.exists()" in discord_src and "_transcribe_py.exists()" in discord_src,
 )
 check(
     "discord: notify command uses task-progress skill",
@@ -106,6 +114,10 @@ telegram_src = TELEGRAM_BRIDGE.read_text()
 check(
     "telegram: skill hints block defined",
     "tg_skill_hints" in telegram_src,
+)
+check(
+    "telegram: skill injection guarded by skill file existence check",
+    "_notify_py.exists()" in telegram_src and "_transcribe_py.exists()" in telegram_src,
 )
 check(
     "telegram: notify command uses task-progress skill",
