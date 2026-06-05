@@ -545,8 +545,13 @@ _init_impl() {
     if [ "$_do_commit" = "0" ]; then
         log "_init_impl: nothing to commit on init (already-initialized re-run, or empty workspace)"
     else
+        # Commit message includes path=<workspace_path> so a peer host
+        # browsing the vault can map `host/<host>/<wsId>` back to a local
+        # folder via `git log host/<host>/<wsId>` without an extra metadata
+        # file. The path is the absolute workspace directory on the host
+        # that initialized this branch.
         # shellcheck disable=SC2086  # intentional word-split on $_empty_flag
-        git commit -q $_empty_flag -m "Initial workspace-vault sync: bootstrap host=${SUTANDO_HOST_OVERRIDE:-$(hostname)}"
+        git commit -q $_empty_flag -m "Initial workspace-vault sync: bootstrap host=${SUTANDO_HOST_OVERRIDE:-$(hostname)} path=${WORKSPACE_DIR}"
         log "_init_impl: initial commit created"
 
         local host_ws_seg
@@ -732,7 +737,9 @@ _push_only_impl() {
         return 1
     fi
 
-    git commit -q -m "Sync ${SUTANDO_HOST_OVERRIDE:-$(hostname)} $(date +%Y-%m-%dT%H:%M)"
+    # Same path= suffix as _init_impl — see comment there. Cross-host
+    # wsId → folder discovery works from `git log host/<host>/<wsId>`.
+    git commit -q -m "Sync ${SUTANDO_HOST_OVERRIDE:-$(hostname)} $(date +%Y-%m-%dT%H:%M) path=${WORKSPACE_DIR}"
 
     local host_ws_seg
     host_ws_seg="$(_host_ws_segment)"
@@ -760,9 +767,13 @@ cmd_status() {
     echo "REPO_DIR:      $REPO_DIR"
     echo "VAULT_URL:     ${VAULT_URL:-<unset>}"
     # Surface the wsId only if it exists — don't generate just for status.
+    # Pair it with the local workspace path on the same line so the
+    # wsId↔folder mapping is visually unambiguous for the operator.
     local ws_id_file="$WORKSPACE_DIR/.sutando-vault/ws-id"
     if [ -f "$ws_id_file" ]; then
-        echo "WS_ID:         $(tr -d '[:space:]' < "$ws_id_file")"
+        local _ws_id_val
+        _ws_id_val="$(tr -d '[:space:]' < "$ws_id_file")"
+        echo "WS_ID:         ${_ws_id_val}  ← this id identifies workspace ${WORKSPACE_DIR}"
     elif [ -d "$WORKSPACE_DIR/.git" ]; then
         # Legacy: workspace was --init'd before the wsId scheme landed. Push
         # path goes to host/<hostname> instead of host/<hostname>/<wsId>.

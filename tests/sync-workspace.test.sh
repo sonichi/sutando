@@ -1107,6 +1107,59 @@ fi
 
 # ============================================================================
 echo
+echo "==== Test 25: --status pairs WS_ID with local workspace path (wsId↔folder discovery) ===="
+# After --init, --status output should include a line that pairs the WS_ID
+# with the workspace's absolute path on the local host. This is the
+# same-host discovery half of the wsId UX work.
+
+rm -rf "$FIXTURE_WS"
+mkdir -p "$FIXTURE_WS"
+rm -rf "$FIXTURE_VAULT" && git init -q --bare "$FIXTURE_VAULT"
+run_sync --init 2>&1 | head -3 >/dev/null || true
+
+status_out=$(run_sync --status 2>&1 || true)
+if echo "$status_out" | grep -E '^WS_ID:' | grep -q "$FIXTURE_WS"; then
+  echo "  OK: --status WS_ID line pairs the wsId with its local workspace path"; pass=$((pass+1))
+else
+  echo "  FAIL: --status WS_ID line missing local workspace path; output: $status_out"; fail=$((fail+1))
+fi
+
+# ============================================================================
+echo
+echo "==== Test 26: commit messages carry path= for cross-host wsId↔folder discovery ===="
+# Both init and push commit messages should include `path=<workspace_path>`
+# so a peer host browsing the vault can map host/<host>/<wsId> back to a
+# local folder via `git log host/<host>/<wsId>`.
+
+rm -rf "$FIXTURE_WS"
+mkdir -p "$FIXTURE_WS"
+rm -rf "$FIXTURE_VAULT" && git init -q --bare "$FIXTURE_VAULT"
+run_sync --init 2>&1 | head -3 >/dev/null || true
+
+# Verify the init bootstrap commit carries path=
+init_msg=$(git --git-dir="$FIXTURE_VAULT" log -1 --pretty=%s "$HOST_BRANCH" 2>/dev/null || echo "")
+case "$init_msg" in
+  *"path=$FIXTURE_WS"*)
+    echo "  OK: init commit message includes path=$FIXTURE_WS"; pass=$((pass+1)) ;;
+  *)
+    echo "  FAIL: init commit missing path=; msg: $init_msg"; fail=$((fail+1)) ;;
+esac
+
+# Trigger a push by writing a tracked-path file, then verify the push commit
+mkdir -p "$FIXTURE_WS/notes"
+echo "n" > "$FIXTURE_WS/notes/push-msg-test.md"
+run_sync --push-only 2>&1 | head -3 >/dev/null || true
+
+push_msg=$(git --git-dir="$FIXTURE_VAULT" log -1 --pretty=%s "$HOST_BRANCH" 2>/dev/null || echo "")
+case "$push_msg" in
+  *"path=$FIXTURE_WS"*)
+    echo "  OK: push commit message includes path=$FIXTURE_WS"; pass=$((pass+1)) ;;
+  *)
+    echo "  FAIL: push commit missing path=; msg: $push_msg"; fail=$((fail+1)) ;;
+esac
+
+# ============================================================================
+echo
 echo "===================="
 echo "Total: $((pass+fail)) — pass: $pass, fail: $fail"
 exit $fail
