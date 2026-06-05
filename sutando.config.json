@@ -12,7 +12,10 @@
         "build_log.md",
         ".claude-sutando/projects/*/memory/"
       ],
-      "exclude": []
+      "exclude": [
+        "tasks/",
+        "results/"
+      ]
     },
     "interval_seconds": 1800
   }

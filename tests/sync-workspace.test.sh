@@ -156,23 +156,44 @@ esac
 
 # ============================================================================
 echo
-echo "==== Test 2: --init creates .gitignore + .git + first push ===="
+echo "==== Test 2: --init creates .git/info/exclude + .git + first push ===="
 run_sync --init 2>&1 | head -10
 
 assert_dir_exists ".git exists in workspace"  "$FIXTURE_WS/.git"
-assert_file_exists ".gitignore created"       "$FIXTURE_WS/.gitignore"
+assert_file_exists ".git/info/exclude created"  "$FIXTURE_WS/.git/info/exclude"
 
-# .gitignore content sanity
-assert_contains ".gitignore whitelists notes/"           "!notes/"                                 "$FIXTURE_WS/.gitignore"
-assert_contains ".gitignore tracks memory subdirs"        "!.claude-sutando/projects/*/memory/"     "$FIXTURE_WS/.gitignore"
-assert_contains ".gitignore tracks memory contents"       "!.claude-sutando/projects/*/memory/**"   "$FIXTURE_WS/.gitignore"
-assert_contains ".gitignore hard-denies .env"             ".env*"                                   "$FIXTURE_WS/.gitignore"
+# Post-leak-fix: carrier-set whitelist (deny-all + un-ignore allowlist +
+# hard-deny credentials) lives at .git/info/exclude — inside .git/ which
+# the OUTER sutando repo treats as opaque. Identical un-ignore (`!notes/`)
+# rules in .git/info/exclude cannot leak across the inner/outer boundary
+# the way an in-tree workspace/.gitignore did (2026-06-04 leak repro).
+EXCLUDE_FILE="$FIXTURE_WS/.git/info/exclude"
+
+# No in-tree workspace/.gitignore — that file was the leak source. Sync
+# engine deletes it on init if a legacy one exists.
+if [ -f "$FIXTURE_WS/.gitignore" ]; then
+  echo "  FAIL: workspace/.gitignore exists — option (6) requires rules in .git/info/exclude only"; fail=$((fail+1))
+else
+  echo "  OK: no in-tree workspace/.gitignore (leak source removed)"; pass=$((pass+1))
+fi
+
+# Exclude file declares deny-all + un-ignore allowlist.
+if grep -qE '^\*$' "$EXCLUDE_FILE"; then
+  echo "  OK: .git/info/exclude declares deny-all (\`*\`) at top level"; pass=$((pass+1))
+else
+  echo "  FAIL: .git/info/exclude missing top-level \`*\` deny-all"; fail=$((fail+1))
+fi
+if grep -qE '^!notes/' "$EXCLUDE_FILE"; then
+  echo "  OK: .git/info/exclude un-ignores carrier set (e.g. !notes/)"; pass=$((pass+1))
+else
+  echo "  FAIL: .git/info/exclude missing carrier-set un-ignore rules"; fail=$((fail+1))
+fi
 
 # Verify the OLD canonical-specific pattern is GONE
-if grep -qE 'projects/[a-f0-9]{8}/memory' "$FIXTURE_WS/.gitignore"; then
-  echo "  FAIL: .gitignore still has canonical-id-specific pattern"; fail=$((fail+1))
+if grep -qE 'projects/[a-f0-9]{8}/memory' "$EXCLUDE_FILE"; then
+  echo "  FAIL: .git/info/exclude still has canonical-id-specific pattern"; fail=$((fail+1))
 else
-  echo "  OK: .gitignore no longer has canonical-id-specific pattern"; pass=$((pass+1))
+  echo "  OK: .git/info/exclude has no canonical-id-specific pattern"; pass=$((pass+1))
 fi
 
 # .sutando-vault/projects.map.json should NOT be created
@@ -293,26 +314,29 @@ cd - >/dev/null
 
 # ============================================================================
 echo
-echo "==== Test 9: .gitignore overwrite warning (Pro #1445 review fix #3) ===="
-# Modify the .gitignore in place, then run --init without --force-gitignore.
-# Expected: refuse + print diff.
-echo "# my custom user edit" >> "$FIXTURE_WS/.gitignore"
+echo "==== Test 9: .git/info/exclude overwrite warning (Pro #1445 review fix #3) ===="
+# Modify .git/info/exclude in place with a non-comment line, then run
+# --init without --force-gitignore. Expected: refuse + print diff.
+# (Stock-comments-only exclude file is auto-overwritten without prompt;
+# the warning fires only when an operator added real content.)
+echo "my-custom-rule.txt" >> "$FIXTURE_WS/.git/info/exclude"
 out_overwrite=$(run_sync --init 2>&1 || true)
 case "$out_overwrite" in
   *"Refusing to overwrite"*)
-    echo "  OK: --init refuses to overwrite user-edited .gitignore"; pass=$((pass+1)) ;;
-  *) echo "  FAIL: --init silently overwrote user-edited .gitignore: $out_overwrite"; fail=$((fail+1)) ;;
+    echo "  OK: --init refuses to overwrite user-edited .git/info/exclude"; pass=$((pass+1)) ;;
+  *) echo "  FAIL: --init silently overwrote user-edited .git/info/exclude: $out_overwrite"; fail=$((fail+1)) ;;
 esac
 # Verify the user's edit survived
-if grep -q "my custom user edit" "$FIXTURE_WS/.gitignore"; then
-  echo "  OK: user's custom .gitignore line preserved (not overwritten)"; pass=$((pass+1))
+if grep -q "my-custom-rule.txt" "$FIXTURE_WS/.git/info/exclude"; then
+  echo "  OK: user's custom exclude line preserved (not overwritten)"; pass=$((pass+1))
 else
-  echo "  FAIL: user's custom .gitignore line was lost"; fail=$((fail+1))
+  echo "  FAIL: user's custom exclude line was lost"; fail=$((fail+1))
 fi
 
-# Now with --force-gitignore → should overwrite
+# Now with --force-gitignore → should overwrite (flag retains its name
+# for back-compat with the pre-(6) in-tree .gitignore world).
 out_force=$(env "${COMMON_ENV[@]}" bash "$SYNC" --vault-url "$FIXTURE_VAULT" --init --force-gitignore 2>&1 || true)
-if grep -q "my custom user edit" "$FIXTURE_WS/.gitignore"; then
+if grep -q "my-custom-rule.txt" "$FIXTURE_WS/.git/info/exclude"; then
   echo "  FAIL: --force-gitignore didn't overwrite (user edit still there)"; fail=$((fail+1))
 else
   echo "  OK: --force-gitignore did overwrite"; pass=$((pass+1))
@@ -738,18 +762,15 @@ rm -f "$FIXTURE_REPO/.env"
 
 # ============================================================================
 echo
-echo "==== Test 20: vault.sync.include from config drives .gitignore (PR-3) ===="
-# Verify that what ends up in .gitignore comes from sutando.config.json's
-# vault.sync.include (not a hardcoded list). Semantics: local config REPLACES
-# tracked default's sync.include array (standard JSON merge; arrays don't
-# concat). Users who want to keep defaults + add their own path must include
-# the defaults explicitly. PR-3 design.
+echo "==== Test 20: vault.sync.include from config drives carrier set (PR-3 + leak fix) ===="
+# Post-leak-fix: vault.sync.include drives the un-ignore allowlist baked
+# into .git/info/exclude (per-clone, opaque to outer sutando repo). Verify
+# behavior end-to-end: files under each include path get pushed to vault.
 
-# Reset workspace state so --init can re-run cleanly
 rm -rf "$FIXTURE_WS"
 mkdir -p "$FIXTURE_WS"
+rm -rf "$FIXTURE_VAULT" && git init -q --bare "$FIXTURE_VAULT"
 
-# Write a config-local with defaults PLUS one custom path (REPLACE semantics)
 cat > "$FIXTURE_REPO/sutando.config.local.json" <<'JSON'
 {
   "vault": {
@@ -766,37 +787,42 @@ cat > "$FIXTURE_REPO/sutando.config.local.json" <<'JSON'
 }
 JSON
 
-# --init will regenerate .gitignore from config
+# Create files under each include path
+mkdir -p "$FIXTURE_WS/notes" "$FIXTURE_WS/custom-dir"
+echo "n" > "$FIXTURE_WS/notes/n.md"
+echo "c" > "$FIXTURE_WS/custom-dir/c.md"
+echo "bl" > "$FIXTURE_WS/build_log.md"
+echo "pq" > "$FIXTURE_WS/pending-questions.md"
+
 run_sync --init 2>&1 | head -5 >/dev/null || true
 
-# All paths present (use grep — case-pattern with whitespace is too strict)
-all_present=1
-for needle in "!notes/" "!pending-questions.md" "!build_log.md" "!.claude-sutando/projects/" "!custom-dir/"; do
-  grep -qF "$needle" "$FIXTURE_WS/.gitignore" || all_present=0
+# All carrier-path files must be in the vault under the host branch
+all_in_vault=1
+for path in "notes/n.md" "custom-dir/c.md" "build_log.md" "pending-questions.md"; do
+  git --git-dir="$FIXTURE_VAULT" show "${HOST_BRANCH}:${path}" >/dev/null 2>&1 || all_in_vault=0
 done
-if [ "$all_present" = "1" ]; then
-  echo "  OK: defaults + custom include all emitted to .gitignore"; pass=$((pass+1))
+if [ "$all_in_vault" = "1" ]; then
+  echo "  OK: defaults + custom include all pushed to vault"; pass=$((pass+1))
 else
-  echo "  FAIL: some include paths missing"; grep -E "^!" "$FIXTURE_WS/.gitignore" | head -10; fail=$((fail+1))
+  echo "  FAIL: some carrier files missing from vault"; fail=$((fail+1))
 fi
 
-# Custom include from local config appears
-if grep -qF "!custom-dir/" "$FIXTURE_WS/.gitignore"; then
-  echo "  OK: custom include 'custom-dir/' from sutando.config.local.json present"; pass=$((pass+1))
+if git --git-dir="$FIXTURE_VAULT" show "${HOST_BRANCH}:custom-dir/c.md" >/dev/null 2>&1; then
+  echo "  OK: custom include 'custom-dir/' from sutando.config.local.json pushed"; pass=$((pass+1))
 else
-  echo "  FAIL: custom include NOT in .gitignore"; fail=$((fail+1))
+  echo "  FAIL: custom include NOT pushed"; fail=$((fail+1))
 fi
 
-# Reset config-local
+rm -rf "$FIXTURE_WS/notes" "$FIXTURE_WS/custom-dir" "$FIXTURE_WS/build_log.md" "$FIXTURE_WS/pending-questions.md"
 echo '{}' > "$FIXTURE_REPO/sutando.config.local.json"
 
 # ============================================================================
 echo
-echo "==== Test 21: vault.sync.exclude carves out from include (PR-3) ===="
-# An exclude should override an otherwise-included parent. Write include for
-# `data/` + exclude for `data/secret/` → `data/secret/` gitignored,
-# `data/foo.md` visible to git. Use `git check-ignore` to ask git directly
-# (untracked-vs-ignored is clearer than parsing `git status` output).
+echo "==== Test 21: vault.sync.exclude carves out from include (PR-3 + leak fix) ===="
+# Post-leak-fix: exclude is emitted into .git/info/exclude AFTER the
+# include un-ignores so gitignore last-match wins on the carve-out path.
+# Verify behavioral end: data/foo.md IS in vault, while data/secret/key.txt
+# is NOT.
 
 cat > "$FIXTURE_REPO/sutando.config.local.json" <<'JSON'
 {
@@ -810,45 +836,23 @@ cat > "$FIXTURE_REPO/sutando.config.local.json" <<'JSON'
 JSON
 
 rm -rf "$FIXTURE_WS"
-mkdir -p "$FIXTURE_WS"
-run_sync --init 2>&1 | head -5 >/dev/null || true
-
-GI="$FIXTURE_WS/.gitignore"
-if grep -qF "!data/" "$GI" && grep -qE "^data/secret/" "$GI"; then
-  echo "  OK: include + exclude both emitted to .gitignore"; pass=$((pass+1))
-else
-  echo "  FAIL: include/exclude combination missing"; grep -E "^!?data" "$GI" | head; fail=$((fail+1))
-fi
-
-# Create test files
+rm -rf "$FIXTURE_VAULT" && git init -q --bare "$FIXTURE_VAULT"
 mkdir -p "$FIXTURE_WS/data/secret"
 echo "ok" > "$FIXTURE_WS/data/foo.md"
 echo "shh" > "$FIXTURE_WS/data/secret/key.txt"
 
-# Ask git directly which files are ignored. Exit 0 = ignored, 1 = NOT ignored.
-cd "$FIXTURE_WS"
-if git check-ignore -q data/foo.md 2>/dev/null; then
-  foo_ignored=1
-else
-  foo_ignored=0
-fi
-if git check-ignore -q data/secret/key.txt 2>/dev/null; then
-  secret_ignored=1
-else
-  secret_ignored=0
-fi
-cd - >/dev/null
+run_sync --init 2>&1 | head -5 >/dev/null || true
 
-if [ "$foo_ignored" = "0" ]; then
-  echo "  OK: data/foo.md NOT ignored (visible to git)"; pass=$((pass+1))
+if git --git-dir="$FIXTURE_VAULT" show "${HOST_BRANCH}:data/foo.md" >/dev/null 2>&1; then
+  echo "  OK: data/foo.md pushed (included via 'data/')"; pass=$((pass+1))
 else
-  echo "  FAIL: data/foo.md was ignored — exclude carve-out blocked the include"; fail=$((fail+1))
+  echo "  FAIL: data/foo.md NOT pushed"; fail=$((fail+1))
 fi
 
-if [ "$secret_ignored" = "1" ]; then
-  echo "  OK: data/secret/key.txt IS ignored (exclude carved it out)"; pass=$((pass+1))
+if git --git-dir="$FIXTURE_VAULT" show "${HOST_BRANCH}:data/secret/key.txt" >/dev/null 2>&1; then
+  echo "  FAIL: data/secret/key.txt was pushed (exclude didn't carve out)"; fail=$((fail+1))
 else
-  echo "  FAIL: data/secret/key.txt NOT ignored — exclude didn't carve out"; fail=$((fail+1))
+  echo "  OK: data/secret/key.txt NOT pushed (exclude carved it out)"; pass=$((pass+1))
 fi
 
 rm -rf "$FIXTURE_WS/data"
@@ -856,10 +860,11 @@ echo '{}' > "$FIXTURE_REPO/sutando.config.local.json"
 
 # ============================================================================
 echo
-echo "==== Test 22: ancestor-chain un-ignore for nested include path (PR-3) ===="
-# Verify _emit_include_lines emits the FULL ancestor chain — gitignore can't
-# include a child whose ancestor is excluded by `*`. For include `a/b/c/`,
-# expect `!a/`, `!a/b/`, `!a/b/c/`, `!a/b/c/**`.
+echo "==== Test 22: nested include path is tracked end-to-end (PR-3 + leak fix) ===="
+# Post-leak-fix: ancestor-chain un-ignore rules live in .git/info/exclude
+# (opaque to outer sutando repo) so a nested include like `a/b/c/` walks
+# its ancestors safely. Verify behavioral end: a deeply-nested include
+# results in tracked files in the vault.
 
 cat > "$FIXTURE_REPO/sutando.config.local.json" <<'JSON'
 {
@@ -872,22 +877,19 @@ cat > "$FIXTURE_REPO/sutando.config.local.json" <<'JSON'
 JSON
 
 rm -rf "$FIXTURE_WS"
-mkdir -p "$FIXTURE_WS"
+rm -rf "$FIXTURE_VAULT" && git init -q --bare "$FIXTURE_VAULT"
+mkdir -p "$FIXTURE_WS/a/b/c"
+echo "nested" > "$FIXTURE_WS/a/b/c/leaf.md"
+
 run_sync --init 2>&1 | head -5 >/dev/null || true
 
-GI="$FIXTURE_WS/.gitignore"
-chain_ok=1
-for needle in "!a/" "!a/b/" "!a/b/c/" "!a/b/c/**"; do
-  grep -qF "$needle" "$GI" || chain_ok=0
-done
-
-if [ "$chain_ok" = "1" ]; then
-  echo "  OK: ancestor chain emitted for nested include (!a/, !a/b/, !a/b/c/, !a/b/c/**)"; pass=$((pass+1))
+if git --git-dir="$FIXTURE_VAULT" show "${HOST_BRANCH}:a/b/c/leaf.md" >/dev/null 2>&1; then
+  echo '  OK: nested a/b/c/leaf.md pushed (ancestor-chain un-ignore in .git/info/exclude)'; pass=$((pass+1))
 else
-  echo "  FAIL: ancestor chain incomplete for a/b/c/:"; grep -E "^!a" "$GI" | head; fail=$((fail+1))
+  echo "  FAIL: nested file NOT pushed"; fail=$((fail+1))
 fi
 
-# Reset
+rm -rf "$FIXTURE_WS/a"
 echo '{}' > "$FIXTURE_REPO/sutando.config.local.json"
 
 # ============================================================================
