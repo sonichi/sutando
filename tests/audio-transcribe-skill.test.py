@@ -203,5 +203,51 @@ class TestBridgeHelperTelegram(unittest.TestCase):
         self.assertEqual(result, "telegram voice note text")
 
 
+class TestBridgeHelperSymlinkResolve(unittest.TestCase):
+    """Regression guard for the Path.resolve() fix (a50d9c05).
+
+    When a bridge is invoked via an app-bundle src/ symlink, Path(__file__)
+    returns the symlink path, not the real file. Without .resolve(), parent.parent
+    points into the temp symlink dir — the skill is never found and the helper
+    silently returns None. This test reproduces that scenario with a real symlink.
+    """
+
+    def _build_symlink_ns(self, bridge_name: str, symlink_path: str) -> dict:
+        """Extract the helper source and exec it with __file__ pointing at a symlink."""
+        bridge_path = REPO / "src" / f"{bridge_name}-bridge.py"
+        src = bridge_path.read_text()
+        lines = src.splitlines()
+        start = next(i for i, l in enumerate(lines) if "_transcribe_via_skill" in l and "def " in l)
+        end = start + 1
+        while end < len(lines) and (lines[end].startswith("    ") or lines[end] == ""):
+            end += 1
+        func_src = "\n".join(lines[start:end])
+        ns: dict = {"Path": Path, "os": os, "sys": sys, "__file__": symlink_path}
+        exec(func_src, ns)  # noqa: S102
+        return ns
+
+    def test_resolve_finds_skill_through_symlink(self):
+        """With .resolve(), the helper finds the skill even when invoked via symlink."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create a symlink to slack-bridge.py inside a temp dir
+            symlink = Path(tmpdir) / "slack-bridge.py"
+            symlink.symlink_to(REPO / "src" / "slack-bridge.py")
+
+            ns = self._build_symlink_ns("slack", str(symlink))
+            helper = ns["_transcribe_via_skill"]
+
+            # The skill script must be discovered at the real repo location.
+            mock_result = MagicMock(returncode=0, stdout="resolved\n")
+            with patch("subprocess.run", return_value=mock_result) as mock_run:
+                result = helper("/tmp/voice.m4a")
+
+            # If resolve() works: subprocess.run is called (skill found) → "resolved"
+            # If resolve() is absent: Path(symlink).parent.parent != REPO → skill absent → None
+            self.assertEqual(result, "resolved",
+                "Path.resolve() missing — helper returned None when invoked via symlink")
+            self.assertTrue(mock_run.called, "subprocess.run never called — skill path not resolved")
+
+
 if __name__ == "__main__":
     unittest.main()
