@@ -110,11 +110,15 @@ COMMON_ENV=(
   SUTANDO_REPO_DIR="$FIXTURE_REPO"
   SUTANDO_WORKSPACE="$FIXTURE_WS"
   SUTANDO_TEST_MODE=1
+  SUTANDO_WS_ID_OVERRIDE=t01ws1
 )
 
 SYNC="$FIXTURE_REPO/scripts/sync-workspace.sh"
 HOST=$(hostname | sed 's/\..*//')
-HOST_BRANCH="refs/heads/host/${HOST}"
+# Post-wsId branch shape (`host/<hostname>/<wsId>`). WS_ID matches the override
+# set in COMMON_ENV above, so test assertions know the exact ref.
+WS_ID=t01ws1
+HOST_BRANCH="refs/heads/host/${HOST}/${WS_ID}"
 
 # local_slug = REPO_DIR with / replaced by - (mirror script + Claude Code)
 LOCAL_SLUG=$(printf '%s' "$FIXTURE_REPO" | sed 's|/|-|g')
@@ -184,9 +188,9 @@ assert_eq "git remote origin = vault"  "$FIXTURE_VAULT"  "$REMOTE_URL"
 
 # host/<hostname> branch exists in bare repo
 if git --git-dir="$FIXTURE_VAULT" rev-parse "$HOST_BRANCH" >/dev/null 2>&1; then
-  echo "  OK: host/${HOST} branch pushed to vault"; pass=$((pass+1))
+  echo "  OK: host/${HOST}/${WS_ID} branch pushed to vault"; pass=$((pass+1))
 else
-  echo "  FAIL: host/${HOST} branch NOT in vault"; fail=$((fail+1))
+  echo "  FAIL: host/${HOST}/${WS_ID} branch NOT in vault"; fail=$((fail+1))
 fi
 
 # ============================================================================
@@ -242,7 +246,7 @@ git clone -q "$FIXTURE_VAULT" "$PEER_WS" 2>/dev/null
 PEER_SLUG="-Users-peer-sutando"
 (
     cd "$PEER_WS"
-    git checkout -B "host/peerhost" "origin/host/${HOST}" >/dev/null 2>&1
+    git checkout -B "host/peerhost" "origin/host/${HOST}/${WS_ID}" >/dev/null 2>&1
     mkdir -p ".claude-sutando/projects/${PEER_SLUG}/memory"
     echo "from peer" > ".claude-sutando/projects/${PEER_SLUG}/memory/feedback_peer.md"
     git add -A
@@ -332,7 +336,7 @@ PEER2_WS="$TEST_ROOT/peer2-workspace"
 git clone -q "$FIXTURE_VAULT" "$PEER2_WS" 2>/dev/null
 (
     cd "$PEER2_WS"
-    git checkout -B "host/peerhost2" "origin/host/${HOST}" >/dev/null 2>&1
+    git checkout -B "host/peerhost2" "origin/host/${HOST}/${WS_ID}" >/dev/null 2>&1
     rm -f notes/note-*.md
     git add -A
     git -c user.email=peer2@test -c user.name=peer2 commit -q -m "peer2 deletes all notes" >/dev/null 2>&1
@@ -417,7 +421,7 @@ PEER3_WS="$TEST_ROOT/peer3-workspace"
 git clone -q "$FIXTURE_VAULT" "$PEER3_WS" 2>/dev/null
 (
     cd "$PEER3_WS"
-    git checkout -B "host/peerhost3" "origin/host/${HOST}" >/dev/null 2>&1
+    git checkout -B "host/peerhost3" "origin/host/${HOST}/${WS_ID}" >/dev/null 2>&1
     rm -f notes/note-*.md
     for i in $(seq 1 60); do echo "n$i" > "notes/replacement-$i.md"; done
     git add -A
@@ -888,6 +892,101 @@ echo '{}' > "$FIXTURE_REPO/sutando.config.local.json"
 
 # ============================================================================
 echo
+echo "==== Test 24: two workspaces on same host → distinct branches (wsId scheme) ===="
+# When two Sutando installs run on the same machine (same hostname) but
+# different workspaces (different paths), they MUST push to distinct
+# vault branches. Before wsId: both would clobber `host/<hostname>`.
+# After wsId: `host/<hostname>/<wsIdA>` vs `host/<hostname>/<wsIdB>`.
+TEST24_VAULT="$TEST_ROOT/vault-24.git"
+git init -q --bare "$TEST24_VAULT"
+
+# Workspace A
+WSA_WS="$TEST_ROOT/ws-A"
+WSA_REPO="$TEST_ROOT/ws-A-repo"
+mkdir -p "$WSA_WS" "$WSA_REPO/scripts" "$WSA_REPO/src"
+touch "$WSA_REPO/CLAUDE.md"
+git init -q "$WSA_REPO"
+cp "$REPO/scripts/sync-workspace.sh" "$WSA_REPO/scripts/"
+cp "$REPO/scripts/sutando-config.sh" "$WSA_REPO/scripts/"
+cp "$REPO/src/sutando_config.py" "$WSA_REPO/src/"
+cp "$FIXTURE_REPO/sutando.config.json" "$WSA_REPO/"
+WSA_SLUG=$(printf '%s' "$WSA_REPO" | sed 's|/|-|g')
+mkdir -p "$WSA_WS/.claude-sutando/projects/${WSA_SLUG}/memory"
+mkdir -p "$WSA_WS/notes"
+echo "from workspace A" > "$WSA_WS/.claude-sutando/projects/${WSA_SLUG}/memory/feedback_wsA.md"
+
+env -i HOME="$HOME" PATH="$PATH" \
+    SUTANDO_REPO_DIR="$WSA_REPO" \
+    SUTANDO_WORKSPACE="$WSA_WS" \
+    SUTANDO_TEST_MODE=1 \
+    SUTANDO_HOST_OVERRIDE=samehost \
+    SUTANDO_WS_ID_OVERRIDE=t24wsa \
+    bash "$WSA_REPO/scripts/sync-workspace.sh" --vault-url "$TEST24_VAULT" --init 2>&1 | tail -3 >/dev/null
+
+# Workspace B — SAME host (samehost) but different workspace path → different wsId
+WSB_WS="$TEST_ROOT/ws-B"
+WSB_REPO="$TEST_ROOT/ws-B-repo"
+mkdir -p "$WSB_WS" "$WSB_REPO/scripts" "$WSB_REPO/src"
+touch "$WSB_REPO/CLAUDE.md"
+git init -q "$WSB_REPO"
+cp "$REPO/scripts/sync-workspace.sh" "$WSB_REPO/scripts/"
+cp "$REPO/scripts/sutando-config.sh" "$WSB_REPO/scripts/"
+cp "$REPO/src/sutando_config.py" "$WSB_REPO/src/"
+cp "$FIXTURE_REPO/sutando.config.json" "$WSB_REPO/"
+WSB_SLUG=$(printf '%s' "$WSB_REPO" | sed 's|/|-|g')
+mkdir -p "$WSB_WS/.claude-sutando/projects/${WSB_SLUG}/memory"
+mkdir -p "$WSB_WS/notes"
+echo "from workspace B" > "$WSB_WS/.claude-sutando/projects/${WSB_SLUG}/memory/feedback_wsB.md"
+
+env -i HOME="$HOME" PATH="$PATH" \
+    SUTANDO_REPO_DIR="$WSB_REPO" \
+    SUTANDO_WORKSPACE="$WSB_WS" \
+    SUTANDO_TEST_MODE=1 \
+    SUTANDO_HOST_OVERRIDE=samehost \
+    SUTANDO_WS_ID_OVERRIDE=t24wsb \
+    bash "$WSB_REPO/scripts/sync-workspace.sh" --vault-url "$TEST24_VAULT" --init 2>&1 | tail -3 >/dev/null
+
+# Both branches present in vault, side-by-side
+WSA_SHA=$(git --git-dir="$TEST24_VAULT" rev-parse refs/heads/host/samehost/t24wsa 2>/dev/null || echo "")
+WSB_SHA=$(git --git-dir="$TEST24_VAULT" rev-parse refs/heads/host/samehost/t24wsb 2>/dev/null || echo "")
+if [ -n "$WSA_SHA" ] && [ -n "$WSB_SHA" ]; then
+  echo "  OK: host/samehost/t24wsa AND host/samehost/t24wsb both present in vault"; pass=$((pass+1))
+else
+  echo "  FAIL: branches missing (A=$WSA_SHA B=$WSB_SHA)"; fail=$((fail+1))
+fi
+
+# WSA's content NOT in WSB's branch, and vice-versa (siloed)
+if git --git-dir="$TEST24_VAULT" cat-file -e "refs/heads/host/samehost/t24wsa:.claude-sutando/projects/${WSA_SLUG}/memory/feedback_wsA.md" 2>/dev/null \
+   && ! git --git-dir="$TEST24_VAULT" cat-file -e "refs/heads/host/samehost/t24wsa:.claude-sutando/projects/${WSB_SLUG}/memory/feedback_wsB.md" 2>/dev/null; then
+  echo "  OK: wsA branch contains wsA's content and NOT wsB's"; pass=$((pass+1))
+else
+  echo "  FAIL: wsA branch siloing broken"; fail=$((fail+1))
+fi
+
+# Persistence: re-run --init on wsA without override → reads existing wsId from file
+WSA_PERSISTED_ID=$(tr -d '[:space:]' < "$WSA_WS/.sutando-vault/ws-id" 2>/dev/null || echo "")
+if [ "$WSA_PERSISTED_ID" = "t24wsa" ]; then
+  echo "  OK: wsId t24wsa persisted to $WSA_WS/.sutando-vault/ws-id"; pass=$((pass+1))
+else
+  echo "  FAIL: wsId not persisted (got '$WSA_PERSISTED_ID', expected 't24wsa')"; fail=$((fail+1))
+fi
+
+# Re-run --init on wsA WITHOUT override → must NOT regenerate, reads persisted
+RERUN_OUT=$(env -i HOME="$HOME" PATH="$PATH" \
+    SUTANDO_REPO_DIR="$WSA_REPO" \
+    SUTANDO_WORKSPACE="$WSA_WS" \
+    SUTANDO_TEST_MODE=1 \
+    SUTANDO_HOST_OVERRIDE=samehost \
+    bash "$WSA_REPO/scripts/sync-workspace.sh" --vault-url "$TEST24_VAULT" --status 2>&1)
+case "$RERUN_OUT" in
+  *"WS_ID:         t24wsa"*)
+    echo "  OK: --status reads persisted wsId without regenerating"; pass=$((pass+1)) ;;
+  *)
+    echo "  FAIL: --status did not surface persisted wsId. Output: $RERUN_OUT"; fail=$((fail+1)) ;;
+esac
+
+# ============================================================================
+echo
 echo "==== Test 23: --pull-only handles unrelated histories across fresh hosts (Codex P1.3) ===="
 # Two hosts that each run `--init` from scratch against the SAME bare vault
 # produce TWO unrelated initial commits — no common ancestor. Pre-fix, the
@@ -923,6 +1022,7 @@ env -i HOME="$HOME" PATH="$PATH" \
     SUTANDO_WORKSPACE="$HOSTA_WS" \
     SUTANDO_TEST_MODE=1 \
     SUTANDO_HOST_OVERRIDE=hostA \
+    SUTANDO_WS_ID_OVERRIDE=t23wsa \
     bash "$HOSTA_REPO/scripts/sync-workspace.sh" --vault-url "$TEST23_VAULT" --init 2>&1 | tail -3 >/dev/null
 
 # Host B: ALSO fresh, ALSO --init, ALSO pushes to the SAME vault — but with
@@ -947,13 +1047,14 @@ env -i HOME="$HOME" PATH="$PATH" \
     SUTANDO_WORKSPACE="$HOSTB_WS" \
     SUTANDO_TEST_MODE=1 \
     SUTANDO_HOST_OVERRIDE=hostB \
+    SUTANDO_WS_ID_OVERRIDE=t23wsb \
     bash "$HOSTB_REPO/scripts/sync-workspace.sh" --vault-url "$TEST23_VAULT" --init 2>&1 | tail -3 >/dev/null
 
-# Verify two unrelated host branches exist in the vault
-HOSTA_SHA=$(git --git-dir="$TEST23_VAULT" rev-parse refs/heads/host/hostA 2>/dev/null || echo "")
-HOSTB_SHA=$(git --git-dir="$TEST23_VAULT" rev-parse refs/heads/host/hostB 2>/dev/null || echo "")
+# Verify two unrelated host branches exist in the vault (post-wsId shape)
+HOSTA_SHA=$(git --git-dir="$TEST23_VAULT" rev-parse refs/heads/host/hostA/t23wsa 2>/dev/null || echo "")
+HOSTB_SHA=$(git --git-dir="$TEST23_VAULT" rev-parse refs/heads/host/hostB/t23wsb 2>/dev/null || echo "")
 if [ -n "$HOSTA_SHA" ] && [ -n "$HOSTB_SHA" ]; then
-  echo "  OK: host/hostA and host/hostB both pushed to vault"; pass=$((pass+1))
+  echo "  OK: host/hostA/t23wsa and host/hostB/t23wsb both pushed to vault"; pass=$((pass+1))
 else
   echo "  FAIL: one or both host branches missing from vault (A=$HOSTA_SHA B=$HOSTB_SHA)"; fail=$((fail+1))
 fi
@@ -972,6 +1073,7 @@ PULL_OUT=$(env -i HOME="$HOME" PATH="$PATH" \
     SUTANDO_WORKSPACE="$HOSTB_WS" \
     SUTANDO_TEST_MODE=1 \
     SUTANDO_HOST_OVERRIDE=hostB \
+    SUTANDO_WS_ID_OVERRIDE=t23wsb \
     bash "$HOSTB_REPO/scripts/sync-workspace.sh" --vault-url "$TEST23_VAULT" --pull-only 2>&1)
 
 # Verify hostA's content surfaced into hostB's workspace

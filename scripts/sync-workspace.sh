@@ -15,7 +15,7 @@
 #   translation layer, no canonical-id mapping, no projects.map.json.
 #
 # Branch-per-host topology: each host pushes only to its own branch
-# `host/<hostname>`; pulls all peers via fetch + merge. Conflicts use 3-way
+# `host/<hostname>/<wsId>`; pulls all peers via fetch + merge. Conflicts use 3-way
 # merge first, `git checkout --ours` fallback on unresolvable conflicts.
 #
 # Per-host Claude Code memory dirs (`.claude-sutando/projects/<local_slug>/`)
@@ -200,6 +200,60 @@ _host() {
     else
         hostname | sed 's/\..*//'
     fi
+}
+
+# Workspace identity (used for `host/<host>/<wsId>` branch name).
+# Persisted at <workspace>/.sutando-vault/ws-id — 6-char lowercase hex,
+# generated on first --init and reused thereafter. Decouples branch identity
+# from hostname so the same host can run multiple workspaces (different
+# checkouts) without their vault branches colliding. The wsId travels WITH the
+# workspace, so moving the same workspace to a different host keeps pushing
+# to the same wsId branch under the new hostname subdirectory — that reflects
+# "workspace is the identity" rather than "host is the identity."
+#
+# SUTANDO_WS_ID_OVERRIDE is a TEST-ONLY shim (sibling of SUTANDO_HOST_OVERRIDE)
+# so the hermetic multi-workspace test can pin two known wsIds. Not for prod.
+_ws_id() {
+    local ws_id_file="$WORKSPACE_DIR/.sutando-vault/ws-id"
+    # File wins when present — guarantees stable identity across invocations
+    # and across env-var noise.
+    if [ -f "$ws_id_file" ]; then
+        tr -d '[:space:]' < "$ws_id_file"
+        printf '\n'
+        return 0
+    fi
+    # No existing file: figure out what wsId to materialize.
+    local new_id
+    if [ -n "${SUTANDO_WS_ID_OVERRIDE:-}" ]; then
+        # Test-only shim pins the wsId to a known value and PERSISTS it so
+        # subsequent invocations (e.g. a follow-up --status without the env)
+        # read the same value from disk. That matches the production
+        # "generate-then-persist" contract — override just supplies the seed
+        # rather than letting /dev/urandom pick.
+        new_id="$SUTANDO_WS_ID_OVERRIDE"
+    else
+        # Generate fresh: 6 lowercase hex chars (24 bits = 16M permutations;
+        # collision probability negligible for any plausible host's number
+        # of workspaces).
+        new_id="$(LC_ALL=C tr -dc 'a-f0-9' </dev/urandom 2>/dev/null | head -c 6)"
+        if [ -z "$new_id" ]; then
+            # Fallback when /dev/urandom is unavailable (some CI sandboxes).
+            new_id="$(date +%s%N 2>/dev/null | LC_ALL=C tr -dc 'a-f0-9' | tail -c 6)"
+            [ -z "$new_id" ] && new_id="$(printf '%06x' $$)"
+        fi
+    fi
+    mkdir -p "$(dirname "$ws_id_file")"
+    printf '%s\n' "$new_id" > "$ws_id_file"
+    log "_ws_id: generated fresh wsId $new_id for workspace $WORKSPACE_DIR"
+    printf '%s\n' "$new_id"
+}
+
+# Composite host-and-workspace branch name segment. Joined with `/` so the
+# resulting refspec `host/<hostname>/<wsId>` forms git's natural ref-tree
+# hierarchy — e.g. `git for-each-ref refs/remotes/origin/host/<hostname>/`
+# enumerates all workspaces on that one host.
+_host_ws_segment() {
+    printf '%s/%s\n' "$(_host)" "$(_ws_id)"
 }
 
 # --------------------------------------------------------------------------- #
@@ -394,7 +448,7 @@ _init_impl() {
         echo "DRY-RUN: would init workspace as git repo at $WORKSPACE_DIR" >&2
         echo "DRY-RUN: would set git remote origin = $VAULT_URL" >&2
         echo "DRY-RUN: would (re)generate .gitignore" >&2
-        echo "DRY-RUN: would stage + commit + push to refs/heads/host/$(_host)" >&2
+        echo "DRY-RUN: would stage + commit + push to refs/heads/host/$(_host_ws_segment)" >&2
         # Still call generate_gitignore — its own dry-run logic will print the diff (no write)
         generate_gitignore || true
         return 0
@@ -436,11 +490,11 @@ _init_impl() {
         git commit -q -m "Initial workspace-vault sync: bootstrap host=${SUTANDO_HOST_OVERRIDE:-$(hostname)}"
         log "_init_impl: initial commit created"
 
-        local host
-        host="$(_host)"
-        if git push origin "HEAD:refs/heads/host/${host}" 2>&1 | tee -a "$LOG" >/dev/null; then
-            log "_init_impl: pushed to origin host/${host}"
-            echo "sync-workspace: initialized + pushed to host/${host}"
+        local host_ws_seg
+        host_ws_seg="$(_host_ws_segment)"
+        if git push origin "HEAD:refs/heads/host/${host_ws_seg}" 2>&1 | tee -a "$LOG" >/dev/null; then
+            log "_init_impl: pushed to origin host/${host_ws_seg}"
+            echo "sync-workspace: initialized + pushed to host/${host_ws_seg}"
         else
             log "_init_impl: push failed (may need to set up tracking on first push)"
             echo "sync-workspace: initialized but push failed; check $LOG" >&2
@@ -472,10 +526,12 @@ _pull_only_impl() {
     log "_pull_only_impl: fetching all peer branches"
     git fetch --all --quiet 2>&1 | tee -a "$LOG" >/dev/null
 
-    # Ensure we're on the host branch (idempotent)
-    local host current_branch
-    host="$(_host)"
-    current_branch="host/${host}"
+    # Ensure we're on the host-and-workspace branch (idempotent). Post-wsId
+    # the branch is `host/<hostname>/<wsId>` so two workspaces on the same
+    # host land in distinct refs.
+    local host_ws_seg current_branch
+    host_ws_seg="$(_host_ws_segment)"
+    current_branch="host/${host_ws_seg}"
     if [ "$(git symbolic-ref --short HEAD 2>/dev/null)" != "$current_branch" ]; then
         if git show-ref --quiet "refs/remotes/origin/${current_branch}"; then
             git checkout -B "$current_branch" "origin/${current_branch}" 2>&1 | tee -a "$LOG" >/dev/null
@@ -617,11 +673,11 @@ _push_only_impl() {
 
     git commit -q -m "Sync ${SUTANDO_HOST_OVERRIDE:-$(hostname)} $(date +%Y-%m-%dT%H:%M)"
 
-    local host
-    host="$(_host)"
-    if git push origin "HEAD:refs/heads/host/${host}" 2>&1 | tee -a "$LOG" >/dev/null; then
-        log "_push_only_impl: pushed to origin host/${host}"
-        echo "sync-workspace: pushed to host/${host}"
+    local host_ws_seg
+    host_ws_seg="$(_host_ws_segment)"
+    if git push origin "HEAD:refs/heads/host/${host_ws_seg}" 2>&1 | tee -a "$LOG" >/dev/null; then
+        log "_push_only_impl: pushed to origin host/${host_ws_seg}"
+        echo "sync-workspace: pushed to host/${host_ws_seg}"
         return 0
     else
         log "_push_only_impl: push failed"
@@ -642,6 +698,15 @@ cmd_status() {
     echo "WORKSPACE_DIR: $WORKSPACE_DIR"
     echo "REPO_DIR:      $REPO_DIR"
     echo "VAULT_URL:     ${VAULT_URL:-<unset>}"
+    # Surface the wsId only if it exists — don't generate just for status.
+    local ws_id_file="$WORKSPACE_DIR/.sutando-vault/ws-id"
+    if [ -f "$ws_id_file" ]; then
+        echo "WS_ID:         $(tr -d '[:space:]' < "$ws_id_file")"
+    elif [ -d "$WORKSPACE_DIR/.git" ]; then
+        # Legacy: workspace was --init'd before the wsId scheme landed. Push
+        # path goes to host/<hostname> instead of host/<hostname>/<wsId>.
+        echo "WS_ID:         <legacy — pre-wsId init; next --init or --push-only will create + migrate to new host/<host>/<wsId> branch>"
+    fi
     if [ -d "$WORKSPACE_DIR/.git" ]; then
         cd "$WORKSPACE_DIR" || return 1
         local current_branch
