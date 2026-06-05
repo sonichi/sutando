@@ -1,0 +1,3 @@
+# Run artifacts (per-day results + promoted baseline) are local, not committed.
+results/voice-test/
+!results/.gitkeep
