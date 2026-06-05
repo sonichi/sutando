@@ -539,6 +539,32 @@ def main():
                 task_id = f"task-{ts}"
                 task_file = TASKS_DIR / f"{task_id}.txt"
                 priority = default_priority_for_source("telegram", "owner")
+
+                # Inject skill instructions so the agent follows notify-before-work
+                # and transcription protocol even after conversation compaction.
+                has_audio_attach = attachment_note and any(
+                    attachment_note.lower().find(ext) != -1
+                    for ext in (".m4a", ".mp3", ".ogg", ".opus", ".oga", ".wav", ".webm", ".aac")
+                )
+                notify_cmd = (
+                    f"python3 ~/.claude/skills/task-progress/scripts/notify.py"
+                    f" --source telegram --chat-id {chat_id}"
+                )
+                if has_audio_attach:
+                    attached_path = attachment_note.split("[File attached: ")[-1].rstrip("]").split("\n")[0]
+                    tg_skill_hints = (
+                        f"\n===SKILL INSTRUCTIONS (follow before any other action)===\n"
+                        f'1. NOTIFY FIRST: {notify_cmd} --message "Got your voice message, give me a moment."\n'
+                        f"2. TRANSCRIBE: python3 ~/.claude/skills/audio-transcribe/scripts/transcribe.py '{attached_path}'\n"
+                        f"3. Process transcript and write result to results/{task_id}.txt\n"
+                    )
+                else:
+                    tg_skill_hints = (
+                        f"\n===SKILL INSTRUCTIONS (follow before any other action)===\n"
+                        f'1. NOTIFY FIRST (if task takes >60s): {notify_cmd} --message "On it — back in a moment."\n'
+                        f"2. Process and write result to results/{task_id}.txt\n"
+                    )
+
                 task_file.write_text(
                     f"id: {task_id}\n"
                     f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
@@ -546,6 +572,7 @@ def main():
                     f"source: telegram\n"
                     f"chat_id: {chat_id}\n"
                     f"priority: {priority}\n"
+                    f"{tg_skill_hints}"
                 )
                 pending_replies[task_id] = chat_id
 

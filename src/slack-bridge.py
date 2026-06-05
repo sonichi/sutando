@@ -442,6 +442,34 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     task_id = f"task-{ts}"
     task_file = TASKS_DIR / f"{task_id}.txt"
     priority = default_priority_for_source("slack", access_tier)
+
+    # Inject skill instructions so the agent follows the notify-before-work and
+    # transcription protocol even after conversation compaction wipes context.
+    # Only injected for owner tasks — non-owner tasks follow the sandboxed path.
+    skill_hints = ""
+    if access_tier == "owner":
+        notify_cmd = (
+            f"python3 ~/.claude/skills/task-progress/scripts/notify.py"
+            f" --source slack --channel-id {channel}"
+            f' --message "On it — back in a moment."'
+        )
+        hints_lines = [
+            "===SKILL INSTRUCTIONS (follow before any other action)===",
+            f"1. NOTIFY FIRST: {notify_cmd}",
+        ]
+        if attachment_lines:
+            for ap in attachment_lines:
+                # Extract path from "[File attached: /path]"
+                attached_path = ap.replace("[File attached: ", "").rstrip("]")
+                hints_lines.append(
+                    f'   Update notify message to: --message "Got your voice message, give me a moment."'
+                )
+                hints_lines.append(
+                    f"2. TRANSCRIBE: python3 ~/.claude/skills/audio-transcribe/scripts/transcribe.py '{attached_path}'"
+                )
+        hints_lines.append("3. Then process and write result to results/{task_id}.txt")
+        skill_hints = "\n" + "\n".join(hints_lines) + "\n"
+
     task_file.write_text(
         f"id: {task_id}\n"
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
@@ -451,6 +479,7 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         f"user_id: {user_id}\n"
         f"access_tier: {access_tier}\n"
         f"priority: {priority}\n"
+        f"{skill_hints}"
     )
     with pending_replies_lock:
         pending_replies[task_id] = {
