@@ -10,6 +10,14 @@
 #   timeout_s     max wait for the subject to begin replying before no-response
 #   soft          true = excluded from the hard pass gate (allowed to be flaky early)
 #   depends_on    (optional) id of a test that must run immediately before (for context tests)
+#   effect        (optional, action tests) real side-effect verification:
+#                   fire_after_s    — when the effect should occur (e.g. timer duration)
+#                   listen_window_s — how long to listen for it firing
+#                   expected        — what the firing should sound like (judged)
+#                 --quick rewrites fire_after_s to 30s for a fast smoke run.
+#
+# v1 config (owner 2026-06-05): manual trigger; report to owner only; STT = Gemini
+# (Sutando standard); action tests verify the real effect, not just the words.
 
 suite: core-v1
 version: 1
@@ -56,6 +64,10 @@ tests:
     expected: "A spoken confirmation that a two-minute timer is set (a confirmation, not a question)."
     primary: completion
     timeout_s: 10
+    effect:
+      fire_after_s: 120
+      listen_window_s: 15
+      expected: "The timer actually fires ~2 minutes later — an audible alarm or a spoken 'time's up' / timer-done announcement."
 
   - id: weather
     category: action

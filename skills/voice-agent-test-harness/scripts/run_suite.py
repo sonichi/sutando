@@ -56,9 +56,10 @@ _CANNED = {
 }
 
 
-def _run_one_live(case: dict) -> dict:
+def _run_one_live(case: dict, quick: bool = False) -> dict:
     import audio
     import score
+    import time
     prompt = audio.speak(case["prompt"])
     reply = audio.listen(timeout_s=case.get("timeout_s", 8))
     lat = audio.latency_ms(prompt, reply)
@@ -66,7 +67,28 @@ def _run_one_live(case: dict) -> dict:
     if reply.onset_at is None:
         return _row(case, lat, None, None, "", no_response=True)
     j = score.judge(case["prompt"], case["expected"], tr)
-    return _row(case, lat, j.accuracy, j.clarity, j.rationale)
+    row = _row(case, lat, j.accuracy, j.clarity, j.rationale, transcript=tr.text)
+
+    # Real side-effect verification for action tests (e.g. the timer actually fires).
+    effect = case.get("effect")
+    if effect and j.accuracy != "fail":
+        fire_after = 30 if quick else float(effect.get("fire_after_s", 30))
+        window = float(effect.get("listen_window_s", 15))
+        # wait until shortly before the effect is due, then listen through it.
+        time.sleep(max(0, fire_after - 2))
+        fired = audio.listen(timeout_s=window + 2)
+        ftr = score.transcribe(fired.wav_path)
+        if fired.onset_at is None:
+            row["effect_verified"] = False
+            row["effect_note"] = "no sound at expected fire time"
+            row["accuracy"] = "partial"   # confirmed verbally but effect not observed
+        else:
+            fj = score.judge("Did the timer fire?", effect["expected"], ftr)
+            row["effect_verified"] = (fj.accuracy == "pass")
+            row["effect_note"] = ftr.text
+            if not row["effect_verified"]:
+                row["accuracy"] = "partial"
+    return row
 
 
 def _run_one_dry(case: dict) -> dict:
@@ -77,7 +99,7 @@ def _run_one_dry(case: dict) -> dict:
     return _row(case, lat, "pass", clarity, "dry-run canned")
 
 
-def _row(case, lat, accuracy, clarity, rationale, no_response=False) -> dict:
+def _row(case, lat, accuracy, clarity, rationale, no_response=False, transcript="") -> dict:
     return {
         "id": case["id"],
         "category": case.get("category"),
@@ -86,6 +108,7 @@ def _row(case, lat, accuracy, clarity, rationale, no_response=False) -> dict:
         "accuracy": accuracy,
         "clarity": clarity,
         "rationale": rationale,
+        "transcript": transcript,
         "no_response": no_response,
     }
 
@@ -104,7 +127,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true", help="no audio/model; canned data")
     ap.add_argument("--only", help="run a single test id")
-    ap.add_argument("--deliver", action="store_true", help="send the Telegram report")
+    ap.add_argument("--deliver", action="store_true", help="send the owner report")
+    ap.add_argument("--quick", action="store_true", help="shorten long effect waits to 30s")
     ap.add_argument("--date", default=time.strftime("%Y-%m-%d"))
     args = ap.parse_args()
 
@@ -122,8 +146,10 @@ def main() -> int:
             rp.deliver(f"🎙️ Voice suite — {args.date}\nSKIPPED: {reason}")
         return 0
 
-    runner = _run_one_dry if args.dry_run else _run_one_live
-    rows = [runner(t) for t in tests]
+    if args.dry_run:
+        rows = [_run_one_dry(t) for t in tests]
+    else:
+        rows = [_run_one_live(t, quick=args.quick) for t in tests]
 
     run = {
         "suite": cfg.get("suite"),

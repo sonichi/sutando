@@ -164,13 +164,15 @@ skills/voice-agent-test-harness/
   results/.gitkeep      # run artifacts (gitignored)
 ```
 
-**Integration points left as stubs in this draft** (the parts that need real device/audio wiring, called out with `TODO(voice)`):
+**v1 — implemented and component-tested** (macOS):
 
-- `audio.py` TTS playback — reuse the existing `gemini-tts` / `openai-tts` skill.
-- `audio.py` mic capture + onset — `sounddevice`/`ffmpeg` capture + RMS threshold; this is the one genuinely new piece of hardware plumbing.
-- `score.py` STT — Whisper (local) or hosted; returns transcript + confidence.
+- `audio.py` TTS — `gemini-tts` skill → mp3 → `afplay`; `say` offline fallback.
+- `audio.py` mic capture + onset — `ffmpeg` avfoundation capture to wav + numpy RMS-window onset/endpoint detection. Calibration gate confirms the mic path is live before a run.
+- `score.py` STT + judge — Gemini REST `generateContent` (Sutando-standard provider), stdlib `urllib`, no extra deps.
 
-Everything else — test schema, scoring rubric, aggregation, baseline diff, Telegram report — is real in the skeleton so the *shape* is reviewable now.
+Each prober-side component is validated independently (TTS synth, mic calibrate/capture, onset on silence, real Gemini STT + judge on a known phrase). The only thing that needs the second machine is the subject actually speaking a reply — the full closed loop runs when both laptops are in the room. Schema, scoring, aggregation, baseline diff, and reporting also run headless via `--dry-run`.
+
+**Latency caveat:** `ffmpeg` device-open adds a ~constant offset to every measured latency; it cancels in the baseline diff (compared to the previous green run on the same machine), so day-over-day deltas are clean even though absolute numbers carry the offset.
 
 ---
 
@@ -182,9 +184,9 @@ Everything else — test schema, scoring rubric, aggregation, baseline diff, Tel
 
 ---
 
-## Open questions for review
+## Resolved decisions (owner, 2026-06-05)
 
-1. Test cadence/time — daily at a fixed hour both laptops are guaranteed awake & co-located? (Precondition gate handles "not ready," but a good default time reduces skips.)
-2. Who receives the report — owner only, or a devs channel/group? (`report.py` routing.)
-3. Is verbal-confirmation-only acceptable for action tests in v1, or do you want true side-effect verification (e.g. the timer actually fired) before we call an action test "pass"?
-4. STT choice — local Whisper (private, slower) vs hosted (faster, sends audio out)?
+1. **Cadence** — **manual trigger** for v1 (`run_suite.py`); automatic daily scheduling is a future improvement.
+2. **Report recipient** — **owner only** (results bridge → owner Telegram).
+3. **Action tests** — **real side-effect verification.** The timer test waits the full duration and listens for the alarm actually firing; verbal confirmation alone downgrades the result to `partial`, not `pass`.
+4. **STT** — **Sutando's standard provider: Gemini** (`score.py` → Gemini REST with the shared `GEMINI_API_KEY`). No separate Whisper dependency.
