@@ -35,7 +35,9 @@ from sutando_config import (  # noqa: E402
     _strip_comments,
     detect_env_workspace_in_dotenv,
     load_config,
+    find_core_config_dir,
     resolve_claude_sutando_config_dir,
+    resolve_core_config_dirs,
     resolve_vault,
     resolve_workspace,
 )
@@ -471,6 +473,136 @@ class TestSutandoConfig(unittest.TestCase):
         # the loader DOES read it. Caught 2026-06-02 in commit 1 review.
         self.assertNotIn("does not read", buf.getvalue())
         self.assertNotIn("claude_sutando_config_dir", buf.getvalue())
+
+    # ------------------------------------------------------------------ #
+    #  10. core_config_dirs — v0.9 per-runtime env override surface       #
+    # ------------------------------------------------------------------ #
+
+    def test_core_config_dirs_synthesized_default_when_field_absent(self):
+        # No `core_config_dirs` in config → loader synthesizes a single
+        # claude-default entry so callers always get a usable list.
+        _write_config(self.repo, "sutando.config.json", {})
+        entries = resolve_core_config_dirs(repo_root=self.repo)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["id"], "claude-default")
+        self.assertEqual(entries[0]["type"], "claude")
+        self.assertEqual(entries[0]["env_name"], "CLAUDE_CONFIG_DIR")
+        self.assertTrue(entries[0]["synced"])
+        ws = resolve_workspace(repo_root=self.repo)
+        self.assertEqual(entries[0]["value"], str(ws / ".claude-sutando"))
+
+    def test_core_config_dirs_workspace_dir_token_expands(self):
+        # ${WORKSPACE_DIR} should expand to the resolved workspace.
+        _write_config(self.repo, "sutando.config.json", {
+            "core_config_dirs": [{
+                "id": "main",
+                "type": "claude",
+                "env_name": "CLAUDE_CONFIG_DIR",
+                "synced": True,
+                "value": "${WORKSPACE_DIR}/state/cc",
+            }],
+        })
+        entries = resolve_core_config_dirs(repo_root=self.repo)
+        ws = resolve_workspace(repo_root=self.repo)
+        self.assertEqual(entries[0]["value"], str(ws / "state/cc"))
+
+    def test_core_config_dirs_synced_true_rejects_outside_workspace(self):
+        # synced=true means M2 sync must be able to track this tree. A value
+        # outside the workspace would silently break that, so the loader
+        # rejects with a clear error.
+        _write_config(self.repo, "sutando.config.json", {
+            "core_config_dirs": [{
+                "id": "main",
+                "type": "claude",
+                "env_name": "CLAUDE_CONFIG_DIR",
+                "synced": True,
+                "value": "/etc/claude-state",  # outside the workspace
+            }],
+        })
+        with self.assertRaises(ValueError) as cm:
+            resolve_core_config_dirs(repo_root=self.repo)
+        self.assertIn("synced=true", str(cm.exception))
+        self.assertIn("not under workspace", str(cm.exception))
+
+    def test_core_config_dirs_synced_false_allows_outside_workspace(self):
+        # synced=false is the explicit opt-out — wrapper sets the env var,
+        # user knows M2 sync skip this tree, no warning.
+        _write_config(self.repo, "sutando.config.json", {
+            "core_config_dirs": [{
+                "id": "local-only",
+                "type": "claude",
+                "env_name": "CLAUDE_CONFIG_DIR",
+                "synced": False,
+                "value": "/etc/claude-state",
+            }],
+        })
+        entries = resolve_core_config_dirs(repo_root=self.repo)
+        self.assertEqual(entries[0]["value"], "/etc/claude-state")
+        self.assertFalse(entries[0]["synced"])
+
+    def test_core_config_dirs_duplicate_id_raises(self):
+        _write_config(self.repo, "sutando.config.json", {
+            "core_config_dirs": [
+                {"id": "main", "type": "claude",
+                 "env_name": "CLAUDE_CONFIG_DIR", "synced": True,
+                 "value": "${WORKSPACE_DIR}/.claude-sutando"},
+                {"id": "main", "type": "codex",
+                 "env_name": "CODEX_CONFIG_DIR", "synced": False,
+                 "value": "/tmp/codex"},
+            ],
+        })
+        with self.assertRaises(ValueError) as cm:
+            resolve_core_config_dirs(repo_root=self.repo)
+        self.assertIn("duplicate id", str(cm.exception))
+
+    def test_find_core_config_dir_picks_first_type_match(self):
+        _write_config(self.repo, "sutando.config.json", {
+            "core_config_dirs": [
+                {"id": "alt", "type": "codex",
+                 "env_name": "CODEX_CONFIG_DIR", "synced": False,
+                 "value": "/tmp/codex"},
+                {"id": "main", "type": "claude",
+                 "env_name": "CLAUDE_CONFIG_DIR", "synced": True,
+                 "value": "${WORKSPACE_DIR}/.claude-sutando"},
+            ],
+        })
+        entry = find_core_config_dir(type_="claude", repo_root=self.repo)
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["id"], "main")
+        # By-id selection independent of type:
+        codex = find_core_config_dir(type_="claude", id_="alt", repo_root=self.repo)
+        self.assertIsNotNone(codex)
+        self.assertEqual(codex["env_name"], "CODEX_CONFIG_DIR")
+
+    def test_resolve_claude_sutando_config_dir_prefers_core_config_dirs(self):
+        # When both old and new fields are set, the new schema wins. The
+        # legacy field's deprecation path is exercised by a different test.
+        _write_config(self.repo, "sutando.config.json", {
+            "core_config_dirs": [{
+                "id": "main", "type": "claude",
+                "env_name": "CLAUDE_CONFIG_DIR", "synced": True,
+                "value": "${WORKSPACE_DIR}/state/new-path",
+            }],
+            "claude_sutando_config_dir": {"subdir": "legacy-subdir"},
+        })
+        ccd = resolve_claude_sutando_config_dir(repo_root=self.repo)
+        ws = resolve_workspace(repo_root=self.repo)
+        # New schema chosen; legacy subdir ignored.
+        self.assertEqual(str(ccd), str(ws / "state/new-path"))
+
+    def test_resolve_claude_sutando_config_dir_legacy_subdir_still_honored(self):
+        # When only the legacy field is set (no core_config_dirs), the loader
+        # honors it for one release with a deprecation warning.
+        _write_config(self.repo, "sutando.config.json", {
+            "claude_sutando_config_dir": {"subdir": "my-legacy-claude"},
+        })
+        ccd = resolve_claude_sutando_config_dir(repo_root=self.repo)
+        ws = resolve_workspace(repo_root=self.repo)
+        # .resolve() because the legacy path goes through workspace / subdir
+        # without ${WORKSPACE_DIR} expansion semantics.
+        self.assertEqual(ccd, (ws / "my-legacy-claude").resolve())
+
+    # ------------------------------------------------------------------ #
 
     def test_expand_vars_walks_nested_structures(self):
         out = _expand_vars({"path": "${REPO_DIR}/ws",

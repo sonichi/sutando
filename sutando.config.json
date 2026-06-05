@@ -2,6 +2,15 @@
   "workspace": {
     "path": "${REPO_DIR}/workspace"
   },
+  "core_config_dirs": [
+    {
+      "id": "claude-default",
+      "type": "claude",
+      "env_name": "CLAUDE_CONFIG_DIR",
+      "synced": true,
+      "value": "${WORKSPACE_DIR}/.claude-sutando"
+    }
+  ],
   "vault": {
     "enabled": false,
     "remote_url": "",

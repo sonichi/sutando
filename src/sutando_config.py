@@ -50,7 +50,12 @@ _LOCAL_FILENAME = "sutando.config.local.json"
 # to teach IDEs strictness for autocomplete; the loader itself stays
 # lenient (warn-only) so users with experimental or scratch keys don't
 # break. Per Mini's review #8 on PR #1395.
-_KNOWN_TOP_LEVEL_KEYS = {"workspace", "claude_sutando_config_dir", "vault"}
+_KNOWN_TOP_LEVEL_KEYS = {
+    "workspace",
+    "claude_sutando_config_dir",
+    "core_config_dirs",
+    "vault",
+}
 
 
 def _find_repo_root(start: Optional[Path] = None) -> Optional[Path]:
@@ -399,24 +404,56 @@ def resolve_vault(repo_root: Optional[Path] = None) -> Dict[str, Any]:
 _DEFAULT_CLAUDE_SUTANDO_SUBDIR = ".claude-sutando"
 
 
+_LEGACY_CLAUDE_SUBDIR_WARN_PRINTED = False
+
+
 def resolve_claude_sutando_config_dir(repo_root: Optional[Path] = None) -> Path:
     """Resolve the CLAUDE_CONFIG_DIR target for the `claude-sutando` shell alias.
 
-    The path is always a sub-folder of `resolve_workspace()` — the M2 vault sync
-    engine relies on this invariant to include the Claude config tree via a single
-    workspace-relative glob. Absolute paths and `..` escapes in the config are
-    rejected at load (schema pattern) AND asserted again here (defense in depth).
+    Resolution order (v0.9):
+      1. `core_config_dirs[type=claude].value` (canonical — new in v0.9). When
+         `synced=true` (default) the value must be under workspace; that
+         invariant is asserted in `resolve_core_config_dirs`.
+      2. `claude_sutando_config_dir.subdir` (LEGACY — one-release deprecation
+         warning). Resolved as `<workspace>/<subdir>`; same constraints as
+         before.
+      3. Baked-in default: `<workspace>/.claude-sutando`.
 
-    Resolution order:
-      1. `claude_sutando_config_dir.subdir` in sutando.config.{local,}.json
-      2. Default: `.claude-sutando`
+    The returned path stays in its un-canonicalized form so callers get a
+    string prefix consistent with `resolve_workspace()` (e.g. on macOS,
+    `/tmp/...` doesn't become `/private/tmp/...` from a stray `.resolve()`).
 
-    Returns the absolute Path. Does NOT create the directory — callers (e.g.
+    Does NOT create the directory; callers (e.g.
     `scripts/sutando-shell-setup.sh`) are responsible for mkdir as part of the
     alias-setup flow.
     """
+    global _LEGACY_CLAUDE_SUBDIR_WARN_PRINTED
+
     cfg = load_config(repo_root)
+
+    # Priority 1: new `core_config_dirs` schema. find_core_config_dir returns
+    # an entry with ${WORKSPACE_DIR}-expanded value AND the synced=true
+    # workspace-relative invariant already validated.
+    if "core_config_dirs" in cfg:
+        entry = find_core_config_dir(type_="claude", repo_root=repo_root)
+        if entry is not None:
+            return Path(entry["value"])
+
+    # Priority 2: legacy `claude_sutando_config_dir.subdir` — one-release
+    # deprecation. Print a stderr nag pointing at the new field.
     block = dict(cfg.get("claude_sutando_config_dir") or {})
+    if block.get("subdir") and not _LEGACY_CLAUDE_SUBDIR_WARN_PRINTED:
+        _LEGACY_CLAUDE_SUBDIR_WARN_PRINTED = True
+        print(
+            _color_warn(
+                "sutando config: `claude_sutando_config_dir.subdir` is deprecated. "
+                "Migrate to `core_config_dirs` (a list of `{id, type, env_name, "
+                "synced, value}` entries) — set `value` to "
+                "`${WORKSPACE_DIR}/<your-subdir>` to preserve current behavior. "
+                "The legacy field will be honored for one release."
+            ),
+            file=sys.stderr,
+        )
     subdir = block.get("subdir") or _DEFAULT_CLAUDE_SUTANDO_SUBDIR
 
     # Defense in depth: re-validate the invariants the schema already enforces
@@ -447,6 +484,149 @@ def resolve_claude_sutando_config_dir(repo_root: Optional[Path] = None) -> Path:
         )
 
     return final
+
+
+# --------------------------------------------------------------------------- #
+#  core_config_dirs (per-runtime CLAUDE_CONFIG_DIR-style env override surface) #
+# --------------------------------------------------------------------------- #
+
+
+_DEFAULT_CORE_CONFIG_DIRS_ENTRY = {
+    "id": "claude-default",
+    "type": "claude",
+    "env_name": "CLAUDE_CONFIG_DIR",
+    "synced": True,
+    "value": "${WORKSPACE_DIR}/.claude-sutando",
+}
+
+
+def _expand_workspace_var(value: str, workspace: Path) -> str:
+    """Expand `${WORKSPACE_DIR}` in the given string against the resolved
+    workspace path. Mirrors `_expand_vars`'s `${REPO_DIR}` treatment but is
+    applied lazily — `${WORKSPACE_DIR}` cannot be resolved at top-level config
+    load time because the workspace path itself is read from config (chicken/
+    egg). Field-level accessors that consume the value call this helper.
+    """
+    return value.replace("${WORKSPACE_DIR}", str(workspace))
+
+
+def resolve_core_config_dirs(repo_root: Optional[Path] = None) -> list:
+    """Resolve the `core_config_dirs` list — per-runtime env override surface.
+
+    Schema (each entry):
+      - `id` (str): unique key within the list (e.g. "claude-default").
+      - `type` (str): runtime tag (e.g. "claude", "codex"). Wrappers select by type.
+      - `env_name` (str): env var name to set (e.g. "CLAUDE_CONFIG_DIR").
+      - `synced` (bool): if true, value MUST resolve under the workspace —
+        the M2 sync engine includes `<workspace>/.claude-sutando/projects/*/memory/`
+        in the carrier, so a `synced: true` value outside the workspace would
+        silently break fleet sync. Loader rejects that combination with a clear
+        error. `synced: false` means "I know this isn't synced; that's
+        intentional" — wrapper sets the env var with no complaint.
+      - `value` (str): absolute path. `${WORKSPACE_DIR}` and `${REPO_DIR}` are
+        expanded. Trailing slashes ignored.
+
+    Defaults: if `core_config_dirs` is absent from the merged config, a single
+    `claude-default` entry is synthesized that mirrors the pre-this-PR
+    behavior (CLAUDE_CONFIG_DIR pointing at `<workspace>/.claude-sutando`,
+    synced=true).
+
+    Returns the list with `${WORKSPACE_DIR}` already expanded in `value`.
+    Raises `ValueError` on invariant violations (synced=true + non-workspace
+    value, duplicate ids, missing required keys).
+    """
+    cfg = load_config(repo_root)
+    raw = cfg.get("core_config_dirs")
+    workspace = resolve_workspace(repo_root)
+
+    if raw is None:
+        # Synthesize the default entry so callers always see a usable list.
+        entries = [dict(_DEFAULT_CORE_CONFIG_DIRS_ENTRY)]
+    elif isinstance(raw, list):
+        entries = [dict(e) if isinstance(e, dict) else e for e in raw]
+    else:
+        raise ValueError(
+            f"core_config_dirs must be a list of objects; got {type(raw).__name__}"
+        )
+
+    seen_ids: set = set()
+    out: list = []
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"core_config_dirs[{i}] must be an object; got {type(entry).__name__}"
+            )
+        # Apply default field values so user-shorthand entries (just type+value)
+        # work. Missing required keys after defaults → error.
+        merged_entry = {**_DEFAULT_CORE_CONFIG_DIRS_ENTRY, **entry}
+        for required in ("id", "type", "env_name", "value"):
+            if not merged_entry.get(required):
+                raise ValueError(
+                    f"core_config_dirs[{i}] missing required key {required!r}"
+                )
+        if merged_entry["id"] in seen_ids:
+            raise ValueError(
+                f"core_config_dirs has duplicate id {merged_entry['id']!r}"
+            )
+        seen_ids.add(merged_entry["id"])
+
+        # Coerce synced to bool — JSON allows true/false; defend against string
+        # forms in case a user typed it as "true".
+        merged_entry["synced"] = bool(merged_entry.get("synced", True))
+
+        # Expand ${WORKSPACE_DIR} in value (note: ${REPO_DIR} was already
+        # expanded at load time by _expand_vars).
+        expanded_value = _expand_workspace_var(str(merged_entry["value"]), workspace)
+        expanded_value = str(Path(expanded_value).expanduser())
+        merged_entry["value"] = expanded_value
+
+        # synced=true invariant: the resolved value must be under the workspace
+        # so M2 sync includes the memory tree. Reject mismatch with a clear
+        # error so the user encodes their intent in config (synced=false to
+        # opt out) instead of debugging silent sync misses later.
+        if merged_entry["synced"]:
+            try:
+                Path(expanded_value).resolve().relative_to(workspace.resolve())
+            except ValueError:
+                raise ValueError(
+                    f"core_config_dirs[{merged_entry['id']!r}] has synced=true "
+                    f"but value={expanded_value!r} is not under workspace "
+                    f"{workspace!s}. The M2 sync engine only tracks paths under "
+                    f"the workspace — set synced=false if this is intentional, "
+                    f"or move value under the workspace."
+                )
+
+        out.append(merged_entry)
+
+    return out
+
+
+def find_core_config_dir(
+    type_: str = "claude",
+    id_: Optional[str] = None,
+    repo_root: Optional[Path] = None,
+) -> Optional[Dict[str, Any]]:
+    """Locate a single `core_config_dirs` entry by type (and optionally id).
+
+    Selection rules:
+      1. If `id_` is given, return the exact-id match (or None).
+      2. Otherwise, return the FIRST entry whose `type` matches.
+      3. Return None if no entry matches.
+
+    Wrappers (e.g. `claude-sutando`) call this with `type_="claude"` to find
+    the right env-var/value pair to apply per invocation. The returned dict
+    has `${WORKSPACE_DIR}` already expanded in `value`.
+    """
+    entries = resolve_core_config_dirs(repo_root)
+    if id_ is not None:
+        for e in entries:
+            if e.get("id") == id_:
+                return e
+        return None
+    for e in entries:
+        if e.get("type") == type_:
+            return e
+    return None
 
 
 def detect_env_workspace_in_dotenv(repo_root: Optional[Path] = None) -> Optional[str]:

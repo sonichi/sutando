@@ -145,10 +145,23 @@ claude-sutando() {
     echo "claude-sutando: $repo_root is not a Sutando checkout (missing scripts/sutando-config.sh)" >&2
     return 1
   fi
-  local ccd
-  ccd="$(bash "$repo_root/scripts/sutando-config.sh" claude-sutando-config-dir)" || return 1
+  # v0.9 — read env var NAME and VALUE from core_config_dirs (per-runtime
+  # surface, type=claude entry). Honors user-set `env_name` so the wrapper
+  # could in principle target a non-CLAUDE_CONFIG_DIR var; for Claude
+  # specifically that name doesn't change in practice. Loader has already
+  # validated `synced=true` entries are workspace-relative — if the user set
+  # `synced: false`, they've explicitly opted out of M2 sync coverage for
+  # this memory tree (no warning, by design).
+  local env_name ccd
+  env_name="$(bash "$repo_root/scripts/sutando-config.sh" core-config-dir-env-name claude)"
+  ccd="$(bash "$repo_root/scripts/sutando-config.sh" core-config-dir-value claude)" || return 1
+  [ -z "$env_name" ] && env_name="CLAUDE_CONFIG_DIR"
+  [ -z "$ccd" ] && {
+    echo "claude-sutando: failed to resolve CLAUDE_CONFIG_DIR via core_config_dirs (config missing or invalid)" >&2
+    return 1
+  }
   mkdir -p "$ccd"
-  CLAUDE_CONFIG_DIR="$ccd" command claude "$@"
+  env "$env_name=$ccd" command claude "$@"
 }
 EOF_FUNC
 

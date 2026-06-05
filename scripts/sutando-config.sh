@@ -92,14 +92,61 @@ for p in resolve_vault().get('sync', {}).get('exclude', []):
     ;;
 
   claude-sutando-config-dir)
-    # M2 — print the absolute CLAUDE_CONFIG_DIR target used by the
-    # `claude-sutando` shell alias. Always a sub-folder of resolve_workspace()
-    # (the loader enforces; absolute paths and `..` escapes rejected).
+    # Print the absolute CLAUDE_CONFIG_DIR target used by the `claude-sutando`
+    # shell alias. v0.9 resolution: `core_config_dirs[type=claude].value` →
+    # legacy `claude_sutando_config_dir.subdir` (deprecation-warned) →
+    # `<workspace>/.claude-sutando` baked default. `synced=true` entries are
+    # validated to be under the workspace at load time.
     python3 -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_claude_sutando_config_dir
 print(resolve_claude_sutando_config_dir(), end='')
+"
+    ;;
+
+  core-config-dir-env-name)
+    # v0.9 — print the env var name of the matching core_config_dirs entry.
+    # Optional second arg picks by id or type; defaults to first type=claude.
+    # Example: `bash sutando-config.sh core-config-dir-env-name` → CLAUDE_CONFIG_DIR
+    _selector="${2:-claude}"
+    python3 -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import find_core_config_dir
+entry = find_core_config_dir(type_='$_selector') or find_core_config_dir(id_='$_selector')
+if entry is None:
+    sys.exit(0)
+print(entry['env_name'], end='')
+"
+    ;;
+
+  core-config-dir-value)
+    # v0.9 — print the resolved value (absolute path) of the matching
+    # core_config_dirs entry. Selector semantics identical to
+    # core-config-dir-env-name.
+    _selector="${2:-claude}"
+    python3 -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import find_core_config_dir
+entry = find_core_config_dir(type_='$_selector') or find_core_config_dir(id_='$_selector')
+if entry is None:
+    sys.exit(0)
+print(entry['value'], end='')
+"
+    ;;
+
+  core-config-dirs)
+    # v0.9 — print all resolved core_config_dirs entries as JSON (one object
+    # per line — JSON Lines). For tooling that wants to enumerate without
+    # parsing the full merged config.
+    python3 -c "
+import json, sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import resolve_core_config_dirs
+for entry in resolve_core_config_dirs():
+    print(json.dumps(entry))
 "
     ;;
 
@@ -130,7 +177,7 @@ print(resolve_claude_sutando_config_dir(), end='')
     ;;
 
   *)
-    echo "usage: $0 {workspace|vault-enabled|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|dump|subdirs|bootstrap}" >&2
+    echo "usage: $0 {workspace|vault-enabled|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|core-config-dir-env-name [type|id]|core-config-dir-value [type|id]|core-config-dirs|dump|subdirs|bootstrap}" >&2
     exit 2
     ;;
 esac
