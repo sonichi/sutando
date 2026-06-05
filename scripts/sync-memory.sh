@@ -37,7 +37,7 @@
 # to ~/.sutando/memory-sync/. The auto-detect handles both the new convention
 # (~/.sutando/memory-sync/) and the legacy convention (~/.sutando-memory-sync/)
 # so a sync clone with this script copied in keeps working through the move.
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SCRIPT_PARENT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Load .env from the sutando workspace early — non-interactive shells (cron,
