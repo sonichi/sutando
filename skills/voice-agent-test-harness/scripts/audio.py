@@ -87,9 +87,14 @@ def _frames(wav_path: str) -> np.ndarray:
 
 
 def _onset(samples: np.ndarray, onset_rms: float, win_ms: int = 30,
-           guard_ms: int = 200, min_run: int = 4) -> tuple[int, int, float]:
+           guard_ms: int = 200, min_run: int = 4,
+           skip_samples: int = 0) -> tuple[int, int, float]:
     """Return (onset_idx, end_idx, peak_rms) over RMS windows. onset_idx == -1 if
     no SUSTAINED energy crosses the threshold after the guard window.
+
+    skip_samples blanks an EXACT leading span — prompt_and_listen passes the
+    end-of-playback offset so the prompt audio captured on the same continuous
+    recording is masked precisely, instead of guessing with a fixed guard.
 
     guard_ms skips the very start of the recording so the prober's own playback
     REVERB TAIL isn't mistaken for the subject's reply. listen() now records only
@@ -107,7 +112,8 @@ def _onset(samples: np.ndarray, onset_rms: float, win_ms: int = 30,
     rms = np.sqrt((samples[: n * win].reshape(n, win) ** 2).mean(axis=1))
     peak = float(rms.max()) if n else 0.0
     loud = rms > onset_rms
-    loud[: min(int(guard_ms / win_ms), n)] = False   # ignore prober echo tail
+    blank = max(min(int(guard_ms / win_ms), n), min(skip_samples // win, n))
+    loud[:blank] = False   # ignore prober playback / echo tail
     onset, run = -1, 0
     for i in range(n):
         run = run + 1 if loud[i] else 0
@@ -152,6 +158,80 @@ def listen(timeout_s: float, onset_rms: float = 0.012) -> CapturedReply:
     b = min(len(samples), end_i + pad)
     _write_wav(wav, samples[a:b])
     return CapturedReply(
+        onset_at=rec_start + onset_i / SR,
+        ended_at=rec_start + end_i / SR,
+        wav_path=wav,
+        peak_rms=peak,
+    )
+
+
+def _audio_dur(path: str, default: float = 8.0) -> float:
+    """Best-effort duration (seconds) of an audio file via macOS afinfo."""
+    try:
+        out = subprocess.run(["afinfo", path], capture_output=True, text=True,
+                             timeout=10).stdout
+        for line in out.splitlines():
+            if "estimated duration" in line:
+                return float(line.split(":")[1].strip().split()[0])
+    except Exception:
+        pass
+    return default
+
+
+def prompt_and_listen(text: str, timeout_s: float, onset_rms: float = 0.010,
+                      warmup_s: float = 0.35, settle_s: float = 0.12,
+                      ) -> tuple[SpokenPrompt, CapturedReply]:
+    """Speak `text` and capture the reply on a SINGLE continuous recording that
+    starts BEFORE playback. The old path played the prompt, THEN spawned the
+    recorder — a ~100-400ms capture-open gap in which a fast reply's opening
+    ("Working on it…") was never recorded, yielding a false no-response
+    (owner-caught 2026-06-06). Here the mic is already running when playback
+    ends, so a reply that begins the instant the prompt stops is captured in
+    full. We then mask EXACTLY up to end-of-playback (known precisely) plus a
+    short speaker-decay settle, and detect the subject's onset after that.
+
+    Returns (prompt, reply) so latency_ms(prompt, reply) still works — and the
+    latency is now honest (onset relative to true end-of-playback)."""
+    WORKDIR.mkdir(parents=True, exist_ok=True)
+    ms = int(time.time() * 1000)
+    out = WORKDIR / f"prompt-{ms}.mp3"
+    started = time.time()
+    used_tts = True
+    try:
+        subprocess.run(["bash", str(TTS), "--out", str(out), "--", text],
+                       check=True, capture_output=True, timeout=30)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        used_tts = False
+    tts_dur = _audio_dur(str(out)) if used_tts else 6.0
+    raw = str(WORKDIR / f"_raw-{ms}.wav")
+    total = warmup_s + tts_dur + float(timeout_s) + 0.5
+    rec_start = time.time()
+    proc = subprocess.Popen(
+        [REC, "-q", "-r", str(SR), "-c", "1", "-b", "16", raw,
+         "trim", "0", f"{total:.2f}"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    time.sleep(warmup_s)              # let CoreAudio actually open before playback
+    if used_tts:
+        _afplay(str(out))            # blocks for the prompt's duration
+    else:
+        subprocess.run(["say", text], check=True)
+    play_end = time.time()
+    prompt = SpokenPrompt(text=text, started_at=started, ended_at=play_end)
+    proc.wait()                      # rec self-stops at `total`
+    samples = _frames(raw)
+    skip = int((play_end - rec_start + settle_s) * SR)
+    onset_i, end_i, peak = _onset(samples, onset_rms, skip_samples=skip)
+    wav = str(WORKDIR / f"reply-{ms}.wav")
+    if onset_i < 0:
+        _write_wav(wav, samples[min(skip, len(samples)):])   # post-playback span only
+        return prompt, CapturedReply(onset_at=None, ended_at=None,
+                                     wav_path=wav, peak_rms=peak)
+    pad = int(0.15 * SR)
+    a = max(0, onset_i - pad)
+    b = min(len(samples), end_i + pad)
+    _write_wav(wav, samples[a:b])
+    return prompt, CapturedReply(
         onset_at=rec_start + onset_i / SR,
         ended_at=rec_start + end_i / SR,
         wav_path=wav,

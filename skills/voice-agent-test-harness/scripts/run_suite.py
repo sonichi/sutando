@@ -81,8 +81,9 @@ def _run_steps(case: dict, quick: bool = False) -> dict:
     for i, step in enumerate(case["steps"]):
         say = step["say"]
         spoken = say if case.get("wake_word") else "Sutando, " + say
-        audio.speak(spoken)
-        reply = audio.listen(timeout_s=step.get("timeout_s", 14))
+        # Continuous-capture (record across playback) so a fast reply that begins
+        # the instant the prompt ends isn't clipped by capture-open latency.
+        _, reply = audio.prompt_and_listen(spoken, step.get("timeout_s", 14))
         if reply.onset_at is None:
             step_rows.append({"step": i, "say": say, "accuracy": None,
                               "no_response": True, "transcript": ""})
@@ -114,12 +115,14 @@ def _run_one_live(case: dict, quick: bool = False) -> dict:
     # prompt it is a false-activation test: utter a line NOT addressed to the
     # subject (no wake word), then confirm it stays quiet. Pass = silent.
     if case.get("expect_silence"):
-        if case.get("prompt"):
-            spoken = case["prompt"] if case.get("wake_word") else "Sutando, " + case["prompt"]
-            audio.speak(spoken)
         window = min(float(case.get("timeout_s", 30)), 30.0) if quick \
             else float(case.get("timeout_s", 30))
-        heard = audio.listen(timeout_s=window)
+        if case.get("prompt"):
+            spoken = case["prompt"] if case.get("wake_word") else "Sutando, " + case["prompt"]
+            # false-wake: continuous capture so a stray reply isn't missed either
+            _, heard = audio.prompt_and_listen(spoken, window)
+        else:
+            heard = audio.listen(timeout_s=window)
         if heard.onset_at is None:
             msg = ("Correctly did not respond to un-addressed speech."
                    if case.get("prompt") else f"Stayed silent for ~{window:.0f}s (correct).")
@@ -131,8 +134,7 @@ def _run_one_live(case: dict, quick: bool = False) -> dict:
     # Wake the subject every turn — a normal Sutando session needs the wake word
     # at the very start of each utterance (owner-confirmed 2026-06-05).
     spoken = case["prompt"] if case.get("wake_word") else "Sutando, " + case["prompt"]
-    prompt = audio.speak(spoken)
-    reply = audio.listen(timeout_s=case.get("timeout_s", 8))
+    prompt, reply = audio.prompt_and_listen(spoken, case.get("timeout_s", 8))
     lat = audio.latency_ms(prompt, reply)
     tr = score.transcribe(reply.wav_path)
     if reply.onset_at is None:
