@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -33,7 +34,10 @@ CASES_PATH = HERE.parent / "test_cases.yaml"
 def load_cases() -> dict:
     if yaml is None:
         raise SystemExit("pyyaml required: pip install pyyaml")
-    return yaml.safe_load(CASES_PATH.read_text())
+    # VTH_CASES lets you point the runner at any case file (e.g. an exploratory
+    # probe set) without touching the committed regression suite.
+    path = Path(os.environ["VTH_CASES"]) if os.environ.get("VTH_CASES") else CASES_PATH
+    return yaml.safe_load(path.read_text())
 
 
 # ---- canned data for --dry-run (illustrative, not real measurements) ----
@@ -66,10 +70,45 @@ def _safe_live(case: dict, quick: bool = False) -> dict:
                     f"runner error: {type(e).__name__}", no_response=True)
 
 
+def _run_steps(case: dict, quick: bool = False) -> dict:
+    """Multi-turn workflow test: speak each step in sequence within ONE voice
+    session (so state carries across turns), judge each against its `expect`, and
+    roll up. The final step is typically cleanup (delete the branch/doc) — tracked
+    separately because 'did it tidy up after itself' is the real success signal."""
+    import audio
+    import score
+    step_rows = []
+    for i, step in enumerate(case["steps"]):
+        say = step["say"]
+        spoken = say if case.get("wake_word") else "Sutando, " + say
+        audio.speak(spoken)
+        reply = audio.listen(timeout_s=step.get("timeout_s", 14))
+        if reply.onset_at is None:
+            step_rows.append({"step": i, "say": say, "accuracy": None,
+                              "no_response": True, "transcript": ""})
+            continue
+        tr = score.transcribe(reply.wav_path)
+        j = score.judge(say, step["expect"], tr, reply.wav_path)
+        step_rows.append({"step": i, "say": say, "accuracy": j.accuracy,
+                          "clarity": j.clarity, "rationale": j.rationale,
+                          "transcript": tr.text})
+    passed = sum(1 for s in step_rows if s.get("accuracy") == "pass")
+    n = len(step_rows) or 1
+    last_ok = bool(step_rows) and step_rows[-1].get("accuracy") == "pass"
+    overall = "pass" if passed == len(step_rows) else ("partial" if passed >= (n + 1) // 2 else "fail")
+    row = _row(case, None, overall, None,
+               f"{passed}/{len(step_rows)} steps passed; cleanup {'ok' if last_ok else 'missed'}")
+    row["steps"] = step_rows
+    return row
+
+
 def _run_one_live(case: dict, quick: bool = False) -> dict:
     import audio
     import score
     import time
+    # Multi-turn workflow (PR flow, doc flow, …) — a sequence of dependent turns.
+    if case.get("steps"):
+        return _run_steps(case, quick)
     # Silence / false-wake test: the subject must NOT respond. With no prompt this
     # is the idle-silence test (don't speak unprompted over a long wait). With a
     # prompt it is a false-activation test: utter a line NOT addressed to the
@@ -162,6 +201,9 @@ def main() -> int:
     ap.add_argument("--deliver", action="store_true", help="send the owner report")
     ap.add_argument("--quick", action="store_true", help="shorten long effect waits to 30s")
     ap.add_argument("--date", default=time.strftime("%Y-%m-%d"))
+    ap.add_argument("--confirm", type=int, default=0,
+                    help="re-run each failing/no-response probe N more times; flags a "
+                         "confirmed_defect only when it fails the majority (noise filter)")
     args = ap.parse_args()
 
     cfg = load_cases()
@@ -182,6 +224,26 @@ def main() -> int:
         rows = [_run_one_dry(t) for t in tests]
     else:
         rows = [_safe_live(t, quick=args.quick) for t in tests]
+        # Noise filter: re-run each suspicious (fail/partial/no-response) probe a
+        # few more times. A real defect fails consistently; a room-noise fluke
+        # passes on retry. confirmed_defect = failed the majority of attempts.
+        if args.confirm:
+            by_id = {t["id"]: t for t in tests}
+            for row in rows:
+                suspect = row.get("accuracy") in ("fail", "partial") or row.get("no_response")
+                case = by_id.get(row.get("id"))
+                if not (suspect and case):
+                    continue
+                first = "no_response" if row.get("no_response") else row.get("accuracy")
+                outcomes = [first]
+                for _ in range(args.confirm):
+                    r2 = _safe_live(case, quick=args.quick)
+                    outcomes.append("no_response" if r2.get("no_response") else r2.get("accuracy"))
+                bad = sum(1 for o in outcomes if o in ("fail", "partial", "no_response", None))
+                row["confirm_outcomes"] = outcomes
+                row["confirmed_defect"] = bad > len(outcomes) / 2
+                print(f"  [confirm] {row.get('id')}: {outcomes} -> "
+                      f"{'CONFIRMED defect' if row['confirmed_defect'] else 'likely noise'}", flush=True)
 
     run = {
         "suite": cfg.get("suite"),
