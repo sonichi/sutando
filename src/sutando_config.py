@@ -438,20 +438,20 @@ def resolve_claude_sutando_config_dir(repo_root: Optional[Path] = None) -> Path:
         entry = find_core_config_dir(type_="claude", repo_root=repo_root)
         if entry is not None:
             # When BOTH the new field AND legacy `claude_sutando_config_dir.subdir`
-            # are set, the new field wins silently — warn loudly so the user
-            # knows the legacy config is dead weight (per Mini's PR #1470
-            # review, 2026-06-05). Reuses the one-time nag flag.
+            # are set, that's a CONFIG ERROR — simultaneous presence means the
+            # user has stale config dead-weighting alongside the new schema, and
+            # the legacy block would be silently ignored. Hard-fail rather than
+            # warn (per Chi's directive 2026-06-06 on PR #1470: "simultaneous
+            # presence is a config error that should surface loudly"). The
+            # user must remove `claude_sutando_config_dir` to proceed.
             legacy_subdir = (cfg.get("claude_sutando_config_dir") or {}).get("subdir")
-            if legacy_subdir and not _LEGACY_CLAUDE_SUBDIR_WARN_PRINTED:
-                _LEGACY_CLAUDE_SUBDIR_WARN_PRINTED = True
-                print(
-                    _color_warn(
-                        "sutando config: both `core_config_dirs[type=claude]` AND legacy "
-                        "`claude_sutando_config_dir.subdir` are set. The new field wins; "
-                        "the legacy field is being IGNORED. Remove `claude_sutando_config_dir` "
-                        "from your config to silence this warning."
-                    ),
-                    file=sys.stderr,
+            if legacy_subdir:
+                raise ValueError(
+                    "sutando config: both `core_config_dirs[type=claude]` AND legacy "
+                    "`claude_sutando_config_dir.subdir` are set. This is a config "
+                    "error — only one may be active at a time. The legacy field is "
+                    "deprecated; remove `claude_sutando_config_dir` from your config "
+                    "to proceed with the new `core_config_dirs` schema."
                 )
             return Path(entry["value"])
 

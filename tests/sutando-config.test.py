@@ -575,19 +575,19 @@ class TestSutandoConfig(unittest.TestCase):
         self.assertEqual(codex["env_name"], "CODEX_CONFIG_DIR")
 
     def test_resolve_claude_sutando_config_dir_prefers_core_config_dirs(self):
-        # When both old and new fields are set, the new schema wins. The
-        # legacy field's deprecation path is exercised by a different test.
+        # When the new schema is set (legacy field absent), the new schema
+        # wins. The legacy field's deprecation path is exercised by a
+        # different test. Both-set is now a hard-fail per Chi's directive
+        # 2026-06-06 — covered by `test_raises_when_both_set` below.
         _write_config(self.repo, "sutando.config.json", {
             "core_config_dirs": [{
                 "id": "main", "type": "claude",
                 "env_name": "CLAUDE_CONFIG_DIR", "synced": True,
                 "value": "${WORKSPACE_DIR}/state/new-path",
             }],
-            "claude_sutando_config_dir": {"subdir": "legacy-subdir"},
         })
         ccd = resolve_claude_sutando_config_dir(repo_root=self.repo)
         ws = resolve_workspace(repo_root=self.repo)
-        # New schema chosen; legacy subdir ignored.
         self.assertEqual(str(ccd), str(ws / "state/new-path"))
 
     def test_resolve_claude_sutando_config_dir_legacy_subdir_still_honored(self):
@@ -602,20 +602,13 @@ class TestSutandoConfig(unittest.TestCase):
         # without ${WORKSPACE_DIR} expansion semantics.
         self.assertEqual(ccd, (ws / "my-legacy-claude").resolve())
 
-    def test_resolve_claude_sutando_config_dir_warns_when_both_set(self):
-        # Mini's blocker fix (PR #1470 review, 2026-06-05): when BOTH the new
-        # `core_config_dirs[type=claude]` AND legacy `claude_sutando_config_dir.subdir`
-        # are set, the new field wins — and the user MUST see a loud warning
-        # so they know to remove the dead legacy config. Without this, stale
-        # config persists silently.
-        import io
-        import contextlib
-        import sutando_config
-
-        # Reset the one-time nag flag so the warn fires deterministically in
-        # this test (other tests may have already tripped it).
-        sutando_config._LEGACY_CLAUDE_SUBDIR_WARN_PRINTED = False
-
+    def test_resolve_claude_sutando_config_dir_raises_when_both_set(self):
+        # Per Chi's directive 2026-06-06 on PR #1470: when BOTH the new
+        # `core_config_dirs[type=claude]` AND legacy
+        # `claude_sutando_config_dir.subdir` are set, that's a config error
+        # and must hard-fail (NOT warn). Simultaneous presence means the
+        # legacy block would be silently ignored — the user MUST be forced
+        # to remove the dead config before the resolver returns a path.
         _write_config(self.repo, "sutando.config.json", {
             "core_config_dirs": [{
                 "id": "main", "type": "claude",
@@ -624,29 +617,26 @@ class TestSutandoConfig(unittest.TestCase):
             }],
             "claude_sutando_config_dir": {"subdir": "legacy-subdir"},
         })
-        stderr_buf = io.StringIO()
-        with contextlib.redirect_stderr(stderr_buf):
-            ccd = resolve_claude_sutando_config_dir(repo_root=self.repo)
-        ws = resolve_workspace(repo_root=self.repo)
-        # New schema still wins (semantic unchanged from earlier test).
-        self.assertEqual(str(ccd), str(ws / "state/new-path"))
-        # But the warn MUST fire — keywords from the message body.
-        stderr_text = stderr_buf.getvalue()
-        self.assertIn("both", stderr_text.lower(),
-                      f"expected 'both' in warn; got: {stderr_text!r}")
-        self.assertIn("claude_sutando_config_dir", stderr_text,
-                      f"expected legacy field name in warn; got: {stderr_text!r}")
-        self.assertIn("IGNORED", stderr_text,
-                      f"expected 'IGNORED' to convey that legacy is dead; got: {stderr_text!r}")
+        with self.assertRaises(ValueError) as ctx:
+            resolve_claude_sutando_config_dir(repo_root=self.repo)
+        msg = str(ctx.exception)
+        # Error must clearly name both fields + identify it as a config error
+        # so the user can find what to remove.
+        self.assertIn("both", msg.lower(),
+                      f"expected 'both' in error; got: {msg!r}")
+        self.assertIn("core_config_dirs", msg,
+                      f"expected new field name in error; got: {msg!r}")
+        self.assertIn("claude_sutando_config_dir", msg,
+                      f"expected legacy field name in error; got: {msg!r}")
+        self.assertIn("config error", msg.lower(),
+                      f"expected 'config error' to surface the class; got: {msg!r}")
 
-    def test_resolve_claude_sutando_config_dir_no_warn_when_only_new_set(self):
-        # Symmetric guard: when ONLY the new field is set (no legacy), the
-        # warn must NOT fire. Otherwise users on the new path get noise.
+    def test_resolve_claude_sutando_config_dir_no_error_when_only_new_set(self):
+        # Symmetric guard: when ONLY the new field is set (no legacy block),
+        # resolution succeeds silently. Otherwise users on the clean new
+        # path would hit the hard-fail erroneously.
         import io
         import contextlib
-        import sutando_config
-
-        sutando_config._LEGACY_CLAUDE_SUBDIR_WARN_PRINTED = False
 
         _write_config(self.repo, "sutando.config.json", {
             "core_config_dirs": [{
