@@ -72,12 +72,18 @@ grep -q "Estimated copy time:" "$MIGRATE" || { echo "  FAIL: ETA line template m
 grep -q 'Proceed with copy? \[y/N\]' "$MIGRATE" || { echo "  FAIL: confirm prompt template missing"; fail=1; }
 
 # ── Test 5: progress reporter line shape in commit_source
-grep -q 'printf "  \\\[%d/%d\\\] %s (%s) → %s\\\\n"' "$MIGRATE" \
-    || grep -q '\\\[%d/%d\\\] %s' "$MIGRATE" \
-    || grep -q '\[%d/%d\] %s' "$MIGRATE" \
-    || { echo "  FAIL: per-file progress line format missing from commit_source"; fail=1; }
+# Single load-bearing assertion: the literal `[%d/%d]` substring must appear
+# in the migrate script. If the printf format changes upstream, this fails
+# loudly rather than silently passing on a looser fallback pattern (Mini's
+# nit on the original triple-fallback grep, 2026-06-06).
+grep -qF '[%d/%d]' "$MIGRATE" \
+    || { echo "  FAIL: per-file progress format '[%d/%d]' missing from commit_source"; fail=1; }
+# The PROGRESS_N increment must precede the printf — grep for the literal
+# accounting line so a refactor that moves the increment doesn't silently
+# break the denominator.
+grep -q 'PROGRESS_N=$((PROGRESS_N + 1))' "$MIGRATE" \
+    || { echo "  FAIL: 'PROGRESS_N=\$((PROGRESS_N + 1))' accounting missing"; fail=1; }
 grep -q "PROGRESS_TOTAL" "$MIGRATE" || { echo "  FAIL: PROGRESS_TOTAL variable missing"; fail=1; }
-grep -q "PROGRESS_N" "$MIGRATE" || { echo "  FAIL: PROGRESS_N counter missing"; fail=1; }
 
 # ── Test 6: abort-propagation guard at the preflight_summary call site
 # Critical: `exit N` inside $(preflight_summary) subshell doesn't propagate

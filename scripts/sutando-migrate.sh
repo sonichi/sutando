@@ -1516,9 +1516,14 @@ commit_main() {
     # below, a user typing "n" at the confirm prompt would see "Aborted"
     # but then backup_dest + commit_source would run anyway (data-equivalent
     # bug: the user said no, the script does it). Catch the abort here.
+    # Preflight runs whenever there's a copy walk. The phase-2 delete-only
+    # path (--delete-source --backup-id) is the only invocation that skips
+    # the copy walk → skip preflight there too. Mini's polish at L1378
+    # already hard-errors on `--delete-source` without `--backup-id`, so
+    # the bare DELETE_SOURCE=0 check is sufficient.
     PROGRESS_N=0
     PROGRESS_TOTAL=0
-    if [ "$DELETE_SOURCE" = "0" ] || [ -z "$ROLLBACK_ID" ]; then
+    if [ "$DELETE_SOURCE" = "0" ]; then
         PROGRESS_TOTAL="$(preflight_summary)" || exit $?
     fi
 
