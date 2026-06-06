@@ -25,7 +25,7 @@
 #   re-home              loose root *.json (cloud-auth, device, contextual-chips,
 #                        voice-state, core-status) → <dest>/state/
 #   skip-ephemeral       *.alive, tasks/task-*.txt + results/task-*.txt <60s old,
-#                        migration-backup-*.tar.gz, .gitkeep, .DS_Store
+#                        migration-backup-*.tar*, .gitkeep, .DS_Store
 #   skip-vcs             .git/  (handled by separate sync-rehome script if
 #                        sync is in use; otherwise orphaned in source)
 #
@@ -134,7 +134,7 @@ EPHEMERAL_PATTERNS=(
     "*.alive"
     ".DS_Store"
     ".gitkeep"
-    "migration-backup-*.tar.gz"
+    "migration-backup-*.tar*"
 )
 
 # Quarantine-walk excludes (when WALK_FULL_TREE is set for a source).
@@ -463,7 +463,7 @@ scan_source() {
         rel="${file#"$src"/}"
         case "$rel" in
             .git/*) continue ;;
-            state/migration-backup-*.tar.gz) n_skip=$((n_skip+1)); continue ;;
+            state/migration-backup-*.tar*) n_skip=$((n_skip+1)); continue ;;
             .DS_Store|*/.DS_Store) n_skip=$((n_skip+1)); continue ;;
             .gitkeep|*/.gitkeep) n_skip=$((n_skip+1)); continue ;;
         esac
@@ -721,7 +721,7 @@ index_dest_for_collisions() {
         local rel="${file#"$DEST_REAL"/}"
         case "$rel" in
             .git/*|*/.git/*) continue ;;
-            state/migration-backup-*.tar.gz) continue ;;
+            state/migration-backup-*.tar*) continue ;;
             .DS_Store|*/.DS_Store|.gitkeep|*/.gitkeep) continue ;;
         esac
         local cls
@@ -805,15 +805,42 @@ report_cross_source() {
 # Stable backup id for this commit invocation (also serves as sentinel suffix)
 BACKUP_ID=""
 
+# Default media exclusions for the pre-migration backup. Addresses Lucy's
+# Maddy v0.8 report (2026-06-06 Bug #3): a 34GB workspace with 32GB of
+# `notes/asset-library` mp4 video caused `tar -czf` to grind for 30+ min
+# trying to compress already-compressed media. Two-pronged fix:
+#
+# 1. Default-exclude common media extensions + the `notes/asset-library/`
+#    convention. Configurable via `SUTANDO_MIGRATE_BACKUP_EXCLUDE` (extra
+#    space-separated patterns, layered ON TOP of these defaults).
+#
+# 2. Skip gzip (`tar -cf` instead of `-czf`) when total backup payload
+#    exceeds `SUTANDO_MIGRATE_BACKUP_GZIP_THRESHOLD_MB` (default 5000 =
+#    5GB). gzip on incompressible media is pure CPU waste; uncompressed
+#    tar is ~100x faster on a 30GB+ media-heavy workspace.
+#
+# Users can opt out of all of this via SUTANDO_MIGRATE_NO_EXCLUDE=1
+# (matches the existing `--no-confirm`/`--no-claude-import` opt-out style).
+_BACKUP_DEFAULT_EXCLUDES=(
+    "notes/asset-library"
+    "*.mp4" "*.mov" "*.mkv" "*.avi" "*.webm"
+    "*.zip" "*.tar" "*.tar.gz" "*.tgz" "*.gz"
+    "*.iso" "*.dmg"
+)
+
 backup_dest() {
     # Per-second ts collision possible when two commits happen in same second
     # (test idempotency re-run + initial commit are the typical case). Append
     # PID + random so each backup_dest call gets a unique BACKUP_ID. Without
     # this, the second commit's tar would overwrite the first AND include it.
     BACKUP_ID="$(date -u +%Y%m%dT%H%M%SZ)-p$$r$RANDOM"
-    local backup_path="$DEST_REAL/state/migration-backup-$BACKUP_ID.tar.gz"
-    mkdir -p "$DEST_REAL/state"
-    # Backup only the workspace surface (avoid backing up the backup-in-progress).
+    local _ext="tar.gz"
+    local _tar_compress_flag="z"
+
+    # Per-Bug #3 pre-flight: estimate total surface bytes. If above the
+    # gzip threshold, drop gzip — compressing incompressible media is
+    # pure CPU waste (Maddy: tar -czf on 32GB mp4 froze 30+ min).
+    local _gzip_threshold_mb="${SUTANDO_MIGRATE_BACKUP_GZIP_THRESHOLD_MB:-5000}"
     local -a surface=()
     local sd sf
     for sd in "${WORKSPACE_SURFACE_DIRS[@]}"; do
@@ -822,17 +849,56 @@ backup_dest() {
     for sf in "${WORKSPACE_SURFACE_FILES[@]}"; do
         [ -e "$DEST_REAL/$sf" ] && surface+=("$sf")
     done
+
+    # Quick surface size estimate via du. macOS BSD du differs from GNU,
+    # but `du -sk` works on both (KB blocks). Sum the surface entries.
+    local _surface_kb=0
     if [ ${#surface[@]} -gt 0 ]; then
-        [ "${SUTANDO_MIGRATE_DEBUG:-0}" = "1" ] && echo "[debug] backup_dest surface: ${surface[*]}" >&2
+        local _entry _kb
+        for _entry in "${surface[@]}"; do
+            _kb="$(du -sk "$DEST_REAL/$_entry" 2>/dev/null | awk '{print $1+0}')"
+            _surface_kb=$((_surface_kb + _kb))
+        done
+    fi
+    local _surface_mb=$((_surface_kb / 1024))
+
+    # Decide compression based on size + the threshold.
+    if [ "$_surface_mb" -gt "$_gzip_threshold_mb" ]; then
+        _ext="tar"
+        _tar_compress_flag=""
+        echo "sutando-migrate: backup payload ~${_surface_mb}MB > ${_gzip_threshold_mb}MB threshold; skipping gzip (uncompressed tar — pre-migration backup of media-heavy workspace)" >&2
+    fi
+
+    local backup_path="$DEST_REAL/state/migration-backup-$BACKUP_ID.$_ext"
+    mkdir -p "$DEST_REAL/state"
+
+    # Build the exclude args. Layer:
+    #   1. Default media excludes (above) — applied unless SUTANDO_MIGRATE_NO_EXCLUDE=1
+    #   2. User-provided extra patterns via SUTANDO_MIGRATE_BACKUP_EXCLUDE
+    local -a _tar_excludes=()
+    if [ "${SUTANDO_MIGRATE_NO_EXCLUDE:-0}" != "1" ]; then
+        local _excl
+        for _excl in "${_BACKUP_DEFAULT_EXCLUDES[@]}"; do
+            _tar_excludes+=(--exclude="$_excl")
+        done
+    fi
+    if [ -n "${SUTANDO_MIGRATE_BACKUP_EXCLUDE:-}" ]; then
+        for _excl in ${SUTANDO_MIGRATE_BACKUP_EXCLUDE}; do
+            _tar_excludes+=(--exclude="$_excl")
+        done
+    fi
+
+    if [ ${#surface[@]} -gt 0 ]; then
+        [ "${SUTANDO_MIGRATE_DEBUG:-0}" = "1" ] && echo "[debug] backup_dest surface: ${surface[*]} (excludes: ${_tar_excludes[*]})" >&2
         # Tar to a system temp location (OUTSIDE dest/state/) to avoid the
         # self-reference where tarring state/ also includes the partial
         # backup tarball being written. Move atomically into state/ at end.
         # Mini's intermittent test-failure trail led to this — exclude didn't
         # work reliably across BSD/GNU tar.
         local tmp_backup
-        tmp_backup="$(mktemp -t sutando-mig-backup.XXXXXX).tar.gz"
-        ( cd "$DEST_REAL" && tar -czf "$tmp_backup" "${surface[@]}" 2>/dev/null )
-        # Now delete the migration-backup-*.tar.gz entries from the tar so
+        tmp_backup="$(mktemp -t sutando-mig-backup.XXXXXX).$_ext"
+        ( cd "$DEST_REAL" && tar "-c${_tar_compress_flag}f" "$tmp_backup" "${_tar_excludes[@]+"${_tar_excludes[@]}"}" "${surface[@]}" 2>/dev/null )
+        # Now delete the migration-backup-*.tar.* entries from the tar so
         # restoring doesn't repopulate them. Easier: just mv to final spot.
         mv "$tmp_backup" "$backup_path"
         echo "sutando-migrate: backup → $backup_path"
@@ -1357,7 +1423,7 @@ commit_source() {
         rel="${file#"$src"/}"
         case "$rel" in
             .git/*) continue ;;
-            state/migration-backup-*.tar.gz) continue ;;
+            state/migration-backup-*.tar*) continue ;;
             .DS_Store|*/.DS_Store|.gitkeep|*/.gitkeep) n_skipped=$((n_skipped+1)); continue ;;
         esac
         # Mini #design 2026-06-02 new-blocker #4: recursive quarantine excludes.
@@ -1500,7 +1566,8 @@ commit_main() {
         echo "  If you want to commit + delete in one step on a fresh state, run --commit first (no-delete)," >&2
         echo "  observe ~7d for straggler writers, then re-run with --commit --delete-source --backup-id <id-from-step-1>." >&2
         echo "  Available backups:" >&2
-        ls -1 "$DEST_REAL/state/migration-backup-"*.tar.gz 2>/dev/null | sed -E 's@.*migration-backup-(.+)\.tar\.gz@    \1@' >&2 || echo "    (none)" >&2
+        ls -1 "$DEST_REAL/state/migration-backup-"*.tar 2>/dev/null "$DEST_REAL/state/migration-backup-"*.tar.gz 2>/dev/null \
+            | sed -E 's@.*migration-backup-(.+)\.tar(\.gz)?$@    \1@' >&2 || echo "    (none)" >&2
         exit 2
     fi
 
@@ -1742,25 +1809,36 @@ rollback_main() {
     set +e
     [ -z "$ROLLBACK_ID" ] && {
         echo "rollback: --backup-id <id> required. Available backups:" >&2
-        ls -1 "$DEST_REAL/state/migration-backup-"*.tar.gz 2>/dev/null | sed -E 's@.*migration-backup-(.+)\.tar\.gz@  \1@' >&2
+        # Bug #3 (2026-06-06): backups can be .tar.gz OR .tar (uncompressed
+        # for media-heavy workspaces). List both shapes.
+        ls -1 "$DEST_REAL/state/migration-backup-"*.tar 2>/dev/null "$DEST_REAL/state/migration-backup-"*.tar.gz 2>/dev/null \
+            | sed -E 's@.*migration-backup-(.+)\.tar(\.gz)?$@  \1@' >&2
         exit 2
     }
-    local backup_path="$DEST_REAL/state/migration-backup-$ROLLBACK_ID.tar.gz"
-    [ ! -f "$backup_path" ] && {
-        echo "rollback: backup $backup_path not found" >&2
+    # Backup file may be .tar.gz (default) or .tar (uncompressed — for
+    # media-heavy workspaces post-Bug #3). Check both, prefer the existing one.
+    local backup_path=""
+    if [ -f "$DEST_REAL/state/migration-backup-$ROLLBACK_ID.tar.gz" ]; then
+        backup_path="$DEST_REAL/state/migration-backup-$ROLLBACK_ID.tar.gz"
+    elif [ -f "$DEST_REAL/state/migration-backup-$ROLLBACK_ID.tar" ]; then
+        backup_path="$DEST_REAL/state/migration-backup-$ROLLBACK_ID.tar"
+    else
+        echo "rollback: backup migration-backup-$ROLLBACK_ID.tar(.gz)? not found" >&2
         exit 2
-    }
+    fi
     echo "sutando-migrate: ROLLBACK from $backup_path"
     # Clear sentinels for that backup id (idempotency).
     # Note: glob may match zero files; suppress set -e via || true.
     rm -f "$DEST_REAL/state/.migrated-from-"*"-$ROLLBACK_ID" 2>/dev/null || true
     # Untar into dest. BSD tar (macOS) overwrites by default; GNU tar (Linux)
     # also overwrites by default. Workspace surface only — never touches
-    # state/migration-backup-*.tar.gz files (they're outside the tar).
+    # state/migration-backup-*.tar.* files (they're outside the tar).
     # Empty backup (0-byte) means dest was empty at backup time; skip extract +
     # rely solely on the cleanup walk below to restore to empty state.
+    # Auto-detect gz vs not — tar -xf works on both gzipped and plain tarballs
+    # on both BSD and GNU implementations (uses magic-byte detection).
     if [ -s "$backup_path" ]; then
-        ( cd "$DEST_REAL" && tar -xzf "$backup_path" ) || {
+        ( cd "$DEST_REAL" && tar -xf "$backup_path" ) || {
             echo "rollback: extract failed" >&2
             exit 1
         }
