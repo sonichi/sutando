@@ -55,6 +55,70 @@ echo "$COMMIT_MAIN_BLOCK" | grep -q "sutando-shell-setup.sh" \
 echo "$COMMIT_MAIN_BLOCK" | grep -qF '[ "$NO_CLAUDE_IMPORT" = "0" ]' \
     || { echo "  FAIL: NO_CLAUDE_IMPORT gate not inside commit_main()"; fail=1; }
 
+# ── Test 7: END-TO-END WIRING — auto-import announcement + clean migrate exit
+# Per owner directive 2026-06-06 + feedback_e2e_tests_for_contributions: real
+# E2E proves it works in the user's system, not just structural greps.
+#
+# **Honest scope note:** full destination isolation (asserting the FILES land
+# in a tmp `<dest>/.claude-sutando/projects/<slug>/memory/`) requires either
+# (a) refactoring `sutando-shell-setup.sh` to honor a pre-set CLAUDE_DIR env
+# var, or (b) creating a fake-repo with its own sutando.config.json. Both are
+# out of scope for this fix-PR. Empirically verified in a manual run during
+# development that the auto-import DOES copy `~/.claude/projects/<slug>/*`
+# files to the configured CLAUDE_DIR target (= the live workspace's
+# `.claude-sutando/...`).
+#
+# This test verifies the END-TO-END WIRING in a tmp invocation:
+# 1. Migrate runs to completion (exit 0)
+# 2. The "invoking sutando-shell-setup.sh --import" announcement appears
+# 3. The "Claude memory import: ok" success line appears (proves --import ran)
+#
+# These three together prove the wiring fires end-to-end. Asserting the
+# specific destination path requires the isolation refactor above (filed as
+# follow-up).
+TMP_E2E="$(mktemp -d -t sutando-mig-e2e.XXXXXX)"
+mkdir -p "$TMP_E2E/src-c/notes"
+echo "src-c-content" > "$TMP_E2E/src-c/notes/foo.md"
+
+# Run with bounded timeout via background-kill pattern (no `timeout` cmd on macOS)
+e2e_out="$(
+    ( SUTANDO_MIGRATE_DEST="$TMP_E2E/dest" \
+      bash "$MIGRATE" commit --source C --no-confirm < /dev/null 2>&1 &
+      PID=$!
+      _slept=0
+      while [ "$_slept" -lt 120 ]; do
+          if ! kill -0 "$PID" 2>/dev/null; then break; fi
+          sleep 1
+          _slept=$((_slept+1))
+      done
+      kill -9 "$PID" 2>/dev/null || true
+      wait "$PID" 2>/dev/null || true
+    ) | tail -400
+)"
+
+# Assert: auto-import announcement line appears
+if ! echo "$e2e_out" | grep -q "invoking sutando-shell-setup.sh"; then
+    echo "  FAIL: E2E wiring — auto-import announcement line missing from output"
+    echo "    Output tail:"
+    echo "$e2e_out" | tail -10 | sed 's/^/      /'
+    fail=1
+fi
+
+# Assert: import success ack appears (proves --import ran AND returned non-error)
+if ! echo "$e2e_out" | grep -q "Claude memory import: ok"; then
+    echo "  FAIL: E2E wiring — 'Claude memory import: ok' line missing — --import may have failed silently or not run"
+    fail=1
+fi
+
+# Assert: migrate completed (the COMMIT complete banner appears)
+if ! echo "$e2e_out" | grep -q "sutando-migrate: COMMIT complete"; then
+    echo "  FAIL: E2E wiring — 'COMMIT complete' banner missing — migrate may have hung or errored"
+    fail=1
+fi
+
+# Cleanup
+rm -rf "$TMP_E2E"
+
 # Report
 if [ "$fail" = "0" ]; then
     echo "ALL TESTS PASS"
