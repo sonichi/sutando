@@ -27,6 +27,11 @@ TTS = REPO / "skills" / "gemini-tts" / "scripts" / "synthesize.sh"
 WORKDIR = SKILL / "results" / "audio"
 SR = 16000                                          # capture sample rate
 AUDIO_DEVICE = os.environ.get("VTH_AUDIO_DEVICE", ":0")  # avfoundation: no video, audio dev 0
+# Recorder: sox `rec`. ffmpeg's avfoundation input drops ~75% of mic samples on
+# this Mac (it captured ~1s for an 8s request, 2026-06-06), which truncated every
+# reply and made the whole suite score 0. sox/CoreAudio records the full duration.
+REC = next((p for p in ("/opt/homebrew/bin/rec", "/usr/local/bin/rec", "rec")
+            if os.path.sep not in p or os.path.exists(p)), "rec")
 
 
 @dataclass
@@ -65,11 +70,12 @@ def speak(text: str) -> SpokenPrompt:
 
 
 def record_window(seconds: float, wav_path: str) -> None:
-    """Capture `seconds` of mic audio (mono, 16k) to wav via ffmpeg avfoundation."""
+    """Capture `seconds` of mic audio (mono, SR Hz) to wav via sox `rec`
+    (CoreAudio). Reliable full-duration capture — see REC note above."""
     Path(wav_path).parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(
-        ["ffmpeg", "-y", "-f", "avfoundation", "-i", AUDIO_DEVICE,
-         "-t", f"{seconds:.2f}", "-ac", "1", "-ar", str(SR), wav_path],
+        [REC, "-q", "-r", str(SR), "-c", "1", "-b", "16", wav_path,
+         "trim", "0", f"{seconds:.2f}"],
         check=True, capture_output=True,
     )
 
@@ -80,31 +86,66 @@ def _frames(wav_path: str) -> np.ndarray:
     return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
 
 
-def _onset(samples: np.ndarray, onset_rms: float, win_ms: int = 30) -> tuple[int, int, float]:
+def _onset(samples: np.ndarray, onset_rms: float, win_ms: int = 30,
+           guard_ms: int = 600, min_run: int = 4) -> tuple[int, int, float]:
     """Return (onset_idx, end_idx, peak_rms) over RMS windows. onset_idx == -1 if
-    nothing crossed the threshold."""
+    no SUSTAINED energy crosses the threshold after the guard window.
+
+    guard_ms skips the start of the recording so the prober's own playback
+    echo/reverb tail isn't mistaken for the subject's reply — that bug produced
+    impossible sub-second latencies (p50 120ms, 2026-06-05). min_run requires
+    several consecutive loud windows so a single transient blip doesn't count."""
     win = max(1, int(SR * win_ms / 1000))
     n = len(samples) // win
     if n == 0:
         return -1, -1, 0.0
     rms = np.sqrt((samples[: n * win].reshape(n, win) ** 2).mean(axis=1))
     peak = float(rms.max()) if n else 0.0
-    loud = np.where(rms > onset_rms)[0]
-    if loud.size == 0:
+    loud = rms > onset_rms
+    loud[: min(int(guard_ms / win_ms), n)] = False   # ignore prober echo tail
+    onset, run = -1, 0
+    for i in range(n):
+        run = run + 1 if loud[i] else 0
+        if run >= min_run:
+            onset = i - min_run + 1
+            break
+    if onset < 0:
         return -1, -1, peak
-    return int(loud[0] * win), int((loud[-1] + 1) * win), peak
+    tail = np.where(loud[onset:])[0]
+    end = onset + int(tail[-1]) + 1 if tail.size else onset + 1
+    return int(onset * win), int(end * win), peak
 
 
-def listen(timeout_s: float, onset_rms: float = 0.02) -> CapturedReply:
-    """Record up to `timeout_s` and detect the subject's reply onset/end."""
+def _write_wav(path: str, samples: np.ndarray) -> None:
+    pcm = (np.clip(samples, -1.0, 1.0) * 32767.0).astype(np.int16)
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SR)
+        w.writeframes(pcm.tobytes())
+
+
+def listen(timeout_s: float, onset_rms: float = 0.012) -> CapturedReply:
+    """Record up to `timeout_s`, detect the subject's reply, and return a clip
+    TRIMMED to the detected speech span (+150ms pad). Sending only the speech to
+    STT/judge — instead of a mostly-silent window — stops the model from
+    answering the instruction instead of transcribing, and gives the audio judge
+    a clean signal. The 600ms echo-guard in _onset keeps the prober's own
+    playback tail from registering as the reply (2026-06-05/06)."""
     WORKDIR.mkdir(parents=True, exist_ok=True)
-    wav = str(WORKDIR / f"reply-{int(time.time()*1000)}.wav")
+    raw = str(WORKDIR / f"_raw-{int(time.time()*1000)}.wav")
     rec_start = time.time()
-    record_window(timeout_s, wav)
-    samples = _frames(wav)
+    record_window(timeout_s, raw)
+    samples = _frames(raw)
     onset_i, end_i, peak = _onset(samples, onset_rms)
+    wav = str(WORKDIR / f"reply-{int(rec_start*1000)}.wav")
     if onset_i < 0:
+        _write_wav(wav, samples)
         return CapturedReply(onset_at=None, ended_at=None, wav_path=wav, peak_rms=peak)
+    pad = int(0.15 * SR)
+    a = max(0, onset_i - pad)
+    b = min(len(samples), end_i + pad)
+    _write_wav(wav, samples[a:b])
     return CapturedReply(
         onset_at=rec_start + onset_i / SR,
         ended_at=rec_start + end_i / SR,

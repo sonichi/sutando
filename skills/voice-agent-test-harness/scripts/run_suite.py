@@ -56,17 +56,30 @@ _CANNED = {
 }
 
 
+def _safe_live(case: dict, quick: bool = False) -> dict:
+    """Never let one test's exception (network timeout, etc.) kill the whole
+    suite — record it as a failed test and keep going."""
+    try:
+        return _run_one_live(case, quick=quick)
+    except Exception as e:
+        return _row(case, None, "fail", None,
+                    f"runner error: {type(e).__name__}", no_response=True)
+
+
 def _run_one_live(case: dict, quick: bool = False) -> dict:
     import audio
     import score
     import time
-    prompt = audio.speak(case["prompt"])
+    # Wake the subject every turn — a normal Sutando session needs the wake word
+    # at the very start of each utterance (owner-confirmed 2026-06-05).
+    spoken = case["prompt"] if case.get("wake_word") else "Sutando, " + case["prompt"]
+    prompt = audio.speak(spoken)
     reply = audio.listen(timeout_s=case.get("timeout_s", 8))
     lat = audio.latency_ms(prompt, reply)
     tr = score.transcribe(reply.wav_path)
     if reply.onset_at is None:
         return _row(case, lat, None, None, "", no_response=True)
-    j = score.judge(case["prompt"], case["expected"], tr)
+    j = score.judge(case["prompt"], case["expected"], tr, reply.wav_path)
     row = _row(case, lat, j.accuracy, j.clarity, j.rationale, transcript=tr.text)
 
     # Real side-effect verification for action tests (e.g. the timer actually fires).
@@ -149,7 +162,7 @@ def main() -> int:
     if args.dry_run:
         rows = [_run_one_dry(t) for t in tests]
     else:
-        rows = [_run_one_live(t, quick=args.quick) for t in tests]
+        rows = [_safe_live(t, quick=args.quick) for t in tests]
 
     run = {
         "suite": cfg.get("suite"),

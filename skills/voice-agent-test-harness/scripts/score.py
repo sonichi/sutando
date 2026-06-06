@@ -23,9 +23,11 @@ _REPO = Path(__file__).resolve().parents[3]
 _WS = Path(os.environ.get("SUTANDO_WORKSPACE", Path.home() / ".sutando" / "workspace"))
 
 _JUDGE_SYSTEM = """You are grading a voice assistant's spoken reply.
-You receive the prompt it was given, what a correct reply should contain, and a
-transcript of what it actually said. Grade only meaning and intelligibility —
-NOT exact wording (the assistant may phrase things differently run-to-run).
+You receive the prompt it was given, what a correct reply should contain, an STT
+transcript (which may be imperfect or truncated), and — when available — the
+ACTUAL AUDIO of the reply. When audio is present, trust what you HEAR over the
+transcript. Grade only meaning and intelligibility — NOT exact wording (the
+assistant may phrase things differently run-to-run).
 
 Return STRICT JSON only:
 {"accuracy": "pass"|"partial"|"fail", "clarity": 1-5, "rationale": "<one sentence>"}
@@ -92,22 +94,53 @@ def transcribe(wav_path: str | None) -> Transcript:
         text = _post(STT_MODEL, parts).strip()
     except Exception:
         return Transcript(text="", confidence=0.0)
+    # On near-silent/echo-only audio the model ignores it and answers the text
+    # instruction instead of transcribing ("provide the audio", "I'm ready",
+    # echoing the prompt). Treat those as no-speech rather than a bogus reply.
+    if _STT_DECLINE.search(text):
+        return Transcript(text="", confidence=0.0)
     return Transcript(text=text, confidence=1.0 if text else 0.0)
 
 
-def _call_judge(prompt: str, expected: str, transcript: Transcript) -> dict:
+_STT_DECLINE = re.compile(
+    r"provide the audio|please (provide|share|attach)|i'?m ready|no (audio|speech|sound)|"
+    r"cannot (transcribe|hear)|transcription of the spoken|didn'?t (hear|catch)|"
+    r"there (is|was) no",
+    re.I,
+)
+
+
+def _call_judge(prompt: str, expected: str, transcript: Transcript,
+                wav_path: str | None = None) -> dict:
     user = (f"PROMPT: {prompt}\nEXPECTED: {expected}\n"
-            f"TRANSCRIPT: {transcript.text or '(no speech detected)'}")
-    raw = _post(JUDGE_MODEL, [{"text": _JUDGE_SYSTEM + "\n\n" + user}])
+            f"TRANSCRIPT (STT — may be imperfect/truncated; judge the AUDIO over "
+            f"this): {transcript.text or '(none)'}")
+    parts: list[dict] = [{"text": _JUDGE_SYSTEM + "\n\n" + user}]
+    # Audio-native judging: give the model the actual spoken reply so it can
+    # assess correctness + delivery the STT text would miss (owner feedback
+    # 2026-06-06: don't rely on speech-to-text alone).
+    if wav_path and Path(wav_path).exists():
+        clip = base64.b64encode(Path(wav_path).read_bytes()).decode()
+        parts.append({"inline_data": {"mime_type": "audio/wav", "data": clip}})
+    try:
+        raw = _post(JUDGE_MODEL, parts)
+    except Exception:
+        # Network hiccup / slow audio payload — fall back to text-only (lighter),
+        # and never let one judge call crash the whole suite.
+        try:
+            raw = _post(JUDGE_MODEL, [parts[0]])
+        except Exception:
+            return {}
     m = re.search(r"\{.*\}", raw, re.S)
     return json.loads(m.group(0)) if m else {}
 
 
-def judge(prompt: str, expected: str, transcript: Transcript) -> Judgement:
+def judge(prompt: str, expected: str, transcript: Transcript,
+          wav_path: str | None = None) -> Judgement:
     """Score one reply; re-judge once on a `fail` to absorb judge noise."""
-    verdict = _coerce(_call_judge(prompt, expected, transcript))
+    verdict = _coerce(_call_judge(prompt, expected, transcript, wav_path))
     if verdict.is_fail():
-        second = _coerce(_call_judge(prompt, expected, transcript))
+        second = _coerce(_call_judge(prompt, expected, transcript, wav_path))
         if not second.is_fail():
             return second
     return verdict
