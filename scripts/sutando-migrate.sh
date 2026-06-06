@@ -587,6 +587,7 @@ MERGE_APPEND=0
 DELETE_SOURCE=0
 FORCE=0
 ROLLBACK_ID=""
+NO_CONFIRM=0
 
 EXPLAIN_PATH=""
 while [ $# -gt 0 ]; do
@@ -613,6 +614,7 @@ while [ $# -gt 0 ]; do
         --force) FORCE=1; shift ;;
         --respect-env) RESPECT_ENV=1; shift ;;
         --backup-id) ROLLBACK_ID="$2"; shift 2 ;;
+        --no-confirm|--yes|-y) NO_CONFIRM=1; shift ;;  # skip pre-flight prompt (for CI / scripted runs)
         --help|-h)
             sed -n '1,80p' "${BASH_SOURCE[0]}"
             exit 0
@@ -856,6 +858,103 @@ copy_preserving_mtime() {
     # Atomic: cp -p to sibling tmp then mv. -p preserves mtime + mode.
     local tmp="$dst.tmp.$$"
     cp -p "$src" "$tmp" && mv -f "$tmp" "$dst"
+}
+
+# Human-readable byte size: 1234 → "1.2 KB", 5242880 → "5.0 MB", etc.
+humanize_bytes() {
+    local b="$1"
+    [ -z "$b" ] && { echo "0 B"; return; }
+    awk -v b="$b" 'BEGIN{
+        split("B KB MB GB TB", u);
+        for (i=1; i<=5 && b>=1024; i++) b/=1024;
+        if (i==1) printf "%d %s", b, u[i]; else printf "%.1f %s", b, u[i];
+    }'
+}
+
+# Format seconds as "Nm Ms" or "Nh Mm" for human-readable durations.
+format_duration() {
+    local s="$1"
+    [ -z "$s" ] || [ "$s" -lt 1 ] && { echo "<1s"; return; }
+    if [ "$s" -lt 60 ]; then printf "%ds" "$s"
+    elif [ "$s" -lt 3600 ]; then printf "%dm %ds" $((s/60)) $((s%60))
+    else printf "%dh %dm" $((s/3600)) $(((s%3600)/60))
+    fi
+}
+
+# Pre-flight scan: count files + bytes across enabled sources, print summary,
+# emit estimated copy time, and (unless --no-confirm or non-TTY) prompt the
+# operator to confirm before any destructive write happens.
+#
+# Owner ask 2026-06-05: large-workspace migrations felt opaque — the user
+# waited a long time with no signal whether things were progressing. The
+# fix is two-pronged: (1) tell them upfront how big the job is, and (2)
+# emit per-file progress lines during the copy itself (see commit_source).
+#
+# Populates PROGRESS_TOTAL (set in commit_main) by side effect via echo to
+# stdout — the caller captures the count via $(...).
+preflight_summary() {
+    local _total_files=0 _total_bytes=0
+    local _per_source_lines=""
+    local tag src files bytes
+    for tag in A B C; do
+        case "$tag" in
+            A) src="$A_REAL_OK" ;;
+            B) src="$B_REAL_OK" ;;
+            C) src="$C_REAL_OK" ;;
+        esac
+        [ -z "$src" ] && continue
+        include_src "$tag" || continue
+        # Walk the same surface as commit_source — but conservatively (just
+        # count everything; quarantine + skip rules apply later). Overcount
+        # is acceptable; this is an estimate, not an audit.
+        files="$(find "$src" -type f 2>/dev/null | wc -l | tr -d ' ')"
+        bytes="$(find "$src" -type f -print0 2>/dev/null | xargs -0 stat -f '%z' 2>/dev/null \
+                 | awk '{s+=$1} END {print s+0}')"
+        # Linux fallback (BSD stat differs):
+        if [ -z "$bytes" ] || [ "$bytes" = "0" ]; then
+            bytes="$(find "$src" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1} END {print s+0}')"
+        fi
+        _total_files=$((_total_files + files))
+        _total_bytes=$((_total_bytes + bytes))
+        _per_source_lines+="  $tag ($src): $files files, $(humanize_bytes "$bytes")"$'\n'
+    done
+
+    # Rough ETA: 200 MB/s sustained APFS local. Conservative; SSD-bound media
+    # workloads land here. Spinning disks would be slower; cloud/network
+    # mounts unpredictable — caller should sanity-check the estimate.
+    local _bytes_per_sec=$((200 * 1024 * 1024))
+    local _eta_sec=$((_total_bytes / _bytes_per_sec))
+    [ "$_eta_sec" -lt 1 ] && _eta_sec=1
+
+    {
+        echo "sutando-migrate: pre-flight scan"
+        printf "%s" "$_per_source_lines"
+        echo "  TOTAL: $_total_files files, $(humanize_bytes "$_total_bytes")"
+        echo "  Estimated copy time: ~$(format_duration "$_eta_sec") at ~200 MB/s sustained (rough)"
+        echo
+    } >&2
+
+    # Confirm prompt — skipped on --no-confirm or when stdin is not a TTY
+    # (non-interactive runs: CI, cron, scripted batch).
+    if [ "$NO_CONFIRM" = "0" ] && [ -t 0 ]; then
+        printf "  Proceed with copy? [y/N]: " >&2
+        local _answer
+        read -r _answer
+        case "$_answer" in
+            y|Y|yes|YES) ;;
+            *)
+                echo "  Aborted by operator." >&2
+                exit 3
+                ;;
+        esac
+        echo >&2
+    elif [ "$NO_CONFIRM" = "0" ] && [ ! -t 0 ]; then
+        echo "  (non-interactive stdin; skipping confirm — pass --no-confirm to suppress this message)" >&2
+        echo >&2
+    fi
+
+    # Output total file count for the caller to capture (PROGRESS_TOTAL).
+    echo "$_total_files"
 }
 
 # SHA-256 verify (macOS shasum / Linux sha256sum). Returns 0 if hashes match.
@@ -1273,6 +1372,22 @@ commit_source() {
         fi
         cls="$(classify "$rel")"
         outcome="$(commit_one "$file" "$rel" "$tag" "$cls")"
+        # Per-file progress on stderr — visible feedback during the copy walk
+        # so long migrations don't feel like a hang. Skipped when PROGRESS_TOTAL
+        # is 0 (delete-source phase-2 path; pre-flight didn't run).
+        if [ "$PROGRESS_TOTAL" -gt 0 ]; then
+            PROGRESS_N=$((PROGRESS_N + 1))
+            _fsize="$(stat -f %z "$file" 2>/dev/null || stat -c %s "$file" 2>/dev/null || echo 0)"
+            printf "  [%d/%d] %s (%s) → %s\n" \
+                "$PROGRESS_N" "$PROGRESS_TOTAL" "${rel:0:60}" \
+                "$(humanize_bytes "$_fsize")" "$outcome" >&2
+            # Every 20 files: aggregate progress + ETA refinement
+            if [ $((PROGRESS_N % 20)) -eq 0 ] && [ "$PROGRESS_N" -lt "$PROGRESS_TOTAL" ]; then
+                _pct=$((PROGRESS_N * 100 / PROGRESS_TOTAL))
+                printf "  ─── progress: %d/%d (%d%%) ───\n" \
+                    "$PROGRESS_N" "$PROGRESS_TOTAL" "$_pct" >&2
+            fi
+        fi
         case "$outcome" in
             copied|src-wins-newer|src-newer|rehomed|rehomed-newer|merged|archived-stale|copied-stale)
                 n_copied=$((n_copied+1)) ;;
@@ -1389,6 +1504,16 @@ commit_main() {
     echo "  append:     $([ "$MERGE_APPEND" = "1" ] && echo "merge (Strategy B)" || echo "sidecar (Strategy C — default)")"
     echo "  delete src: $([ "$DELETE_SOURCE" = "1" ] && echo "yes (backup-id=$ROLLBACK_ID)" || echo "no — sources preserved (default; matches workspace_m1_no_auto_commit)")"
     echo
+
+    # Pre-flight scan: tell the operator how big the job is + estimated time +
+    # ask y/N before any destructive write. Skipped on phase-2 delete-only runs
+    # (no copy walk happens) and on explicit --no-confirm + non-TTY stdin.
+    # Captures total file count for progress-bar denominator.
+    PROGRESS_N=0
+    PROGRESS_TOTAL=0
+    if [ "$DELETE_SOURCE" = "0" ] || [ -z "$ROLLBACK_ID" ]; then
+        PROGRESS_TOTAL="$(preflight_summary)"
+    fi
 
     backup_dest
     echo
