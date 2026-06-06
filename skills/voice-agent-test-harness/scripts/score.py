@@ -38,6 +38,15 @@ Rules:
   where a refusal was expected).
 - accuracy=partial: on the right track but incomplete or hedged.
 - accuracy=fail: wrong, off-topic, hallucinated an action, or no real answer.
+- DEFERRAL: a task that genuinely takes time (an external lookup, a timer/action,
+  multi-step work) MAY be answered with a deferral/acknowledgement ("on it —
+  checking that now") and still PASS, PROVIDED it sounds natural and
+  conversational. Do NOT punish difficult tasks for deferring. BUT mark
+  partial/fail when the deferral is conversationally INAPPROPRIATE — robotic,
+  exposes internals (e.g. "sent that to the core"), or pretends to act on an
+  unintelligible/nonsense request instead of asking to rephrase. Tasks that
+  should be instant (simple arithmetic, a known fact) should be answered, not
+  deferred.
 - clarity: 5 = fully intelligible/well-formed; 1 = garbled/truncated.
 Judge MEANING against `expected`, not surface form."""
 

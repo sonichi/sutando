@@ -30,6 +30,14 @@ tests:
     primary: latency
     timeout_s: 6
 
+  - id: version
+    category: qa
+    prompt: "What version are you running?"
+    expected: "States a version/build identifier. Recorded in the report as the tested build; any clear version answer passes."
+    primary: accuracy
+    timeout_s: 8
+    soft: true
+
   - id: arithmetic
     category: qa
     prompt: "What's seventeen times four?"
