@@ -59,6 +59,14 @@ tests:
     primary: accuracy
     timeout_s: 8
 
+  - id: repeat-slowly
+    category: clarity
+    prompt: "Can you repeat that last answer, slowly?"
+    expected: "Repeats its prior reply (Paris / the capital of France) again, noticeably slower and more deliberately."
+    primary: clarity
+    timeout_s: 10
+    soft: true
+
   - id: unit-convert
     category: computation
     prompt: "How many ounces are in two pounds?"
@@ -145,8 +153,6 @@ tests:
     primary: accuracy
     timeout_s: 10
 
-  # --- conversational-discipline tests (owner 2026-06-06); soft = flaky-early, not gating yet ---
-
   - id: silence
     category: robustness
     prompt: ""
@@ -158,19 +164,10 @@ tests:
 
   - id: long-input
     category: robustness
-    prompt: "I need help drafting an email to my landlord. It should say the kitchen faucet has been leaking for about a week, that I've put a bucket under it to catch the water, and that I'd like someone to come fix it before the weekend if possible — keep the tone polite but firm."
-    expected: "Lets the entire request finish WITHOUT interrupting or jumping in early, then responds to the COMPLETE task (the full email), not just the first sentence."
+    prompt: "I need help drafting an email to my landlord. It should say the kitchen faucet has been leaking for about a week, that I've put a bucket under it to catch the water, and that the drip is getting worse at night. Mention that I'm worried about water damage to the cabinet underneath, and that I already tried tightening the handle myself but it didn't help. Ask if they can send a plumber before the weekend if at all possible, and add that I'm happy to be home any afternoon this week to let them in. Keep the tone polite but firm, and end by thanking them for their help."
+    expected: "Lets the ENTIRE request finish WITHOUT interrupting or jumping in early, then responds to the COMPLETE task (the full email with all the points), not just the first sentence."
     primary: completion
     timeout_s: 12
-    soft: true
-
-  - id: repeat-slowly
-    category: clarity
-    depends_on: world-fact
-    prompt: "Can you repeat that last answer, slowly?"
-    expected: "Repeats its prior reply (the capital of France) again, noticeably slower / more deliberately — does the thing asked."
-    primary: clarity
-    timeout_s: 10
     soft: true
 
   - id: dual-request
@@ -183,8 +180,8 @@ tests:
 
   - id: precise-request
     category: clarity
-    prompt: "Just say the single word acknowledged, and nothing else."
-    expected: "Says exactly 'acknowledged' (or very close) with no extra questions, chit-chat, or distracting follow-ups."
+    prompt: "I'm going to give you a precise instruction. Please reply with only one word, and that word should be acknowledged. Do not add anything else."
+    expected: "Replies with just the word 'acknowledged' (or very close), with no extra questions, chit-chat, or distracting follow-ups."
     primary: clarity
     timeout_s: 8
     soft: true
