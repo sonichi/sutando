@@ -1509,10 +1509,17 @@ commit_main() {
     # ask y/N before any destructive write. Skipped on phase-2 delete-only runs
     # (no copy walk happens) and on explicit --no-confirm + non-TTY stdin.
     # Captures total file count for progress-bar denominator.
+    #
+    # CRITICAL: `exit N` inside the $(preflight_summary) subshell does NOT
+    # propagate to this parent — bash captures stdout + exit code into $? but
+    # does NOT abort the calling script. Without the explicit `|| exit $?`
+    # below, a user typing "n" at the confirm prompt would see "Aborted"
+    # but then backup_dest + commit_source would run anyway (data-equivalent
+    # bug: the user said no, the script does it). Catch the abort here.
     PROGRESS_N=0
     PROGRESS_TOTAL=0
     if [ "$DELETE_SOURCE" = "0" ] || [ -z "$ROLLBACK_ID" ]; then
-        PROGRESS_TOTAL="$(preflight_summary)"
+        PROGRESS_TOTAL="$(preflight_summary)" || exit $?
     fi
 
     backup_dest

@@ -79,6 +79,33 @@ grep -q 'printf "  \\\[%d/%d\\\] %s (%s) → %s\\\\n"' "$MIGRATE" \
 grep -q "PROGRESS_TOTAL" "$MIGRATE" || { echo "  FAIL: PROGRESS_TOTAL variable missing"; fail=1; }
 grep -q "PROGRESS_N" "$MIGRATE" || { echo "  FAIL: PROGRESS_N counter missing"; fail=1; }
 
+# ── Test 6: abort-propagation guard at the preflight_summary call site
+# Critical: `exit N` inside $(preflight_summary) subshell doesn't propagate
+# to the parent script — bash captures stdout + exit code in $? but the
+# parent continues. Without the `|| exit $?` guard, a user typing "n" at
+# the confirm prompt would see "Aborted" but backup_dest + commit_source
+# would run anyway. Caught in self-cold-review 2026-06-06.
+grep -q 'PROGRESS_TOTAL="\$(preflight_summary)" || exit \$?' "$MIGRATE" \
+    || { echo "  FAIL: abort-propagation guard '|| exit \$?' missing on preflight_summary call site"; fail=1; }
+
+# ── Test 7: synthetic end-to-end abort behavior with stub preflight
+# Verify the guard pattern actually works: if the captured-subshell exits N,
+# the parent script also exits N AND the line after the assignment is NOT
+# reached. `|| true` on this line absorbs the non-zero so `set -e` doesn't
+# trip before we inspect $?.
+abort_test_result="$(bash -c '
+    fake_preflight() { echo "100"; exit 3; }
+    PROGRESS_TOTAL=0
+    PROGRESS_TOTAL="$(fake_preflight)" || exit $?
+    echo "REACHED_AFTER_FAKE_EXIT"
+' 2>&1)" && abort_test_code=0 || abort_test_code=$?
+if [ "$abort_test_code" = "3" ] && [ "$abort_test_result" = "" ]; then
+    :  # pass
+else
+    echo "  FAIL: abort-propagation pattern broken: code=$abort_test_code out=[$abort_test_result] (expected code=3 out=empty)"
+    fail=1
+fi
+
 # ── Report
 if [ "$fail" = "0" ]; then
     echo "ALL TESTS PASS"
