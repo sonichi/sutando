@@ -2013,16 +2013,25 @@ pending_reply_anchors: dict[str, int] = {}
 
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = True  # required for list_channel_members
+# GUILD_MEMBERS privileged intent — only enable when confirmed active in
+# Discord Developer Portal (Bot → Privileged Gateway Intents). Without this
+# toggle the bridge raises PrivilegedIntentsRequired on startup and won't
+# connect. Gated behind env var so bridge boots safely without the flag.
+if os.environ.get("DISCORD_GUILD_MEMBERS_INTENT", "").lower() in ("1", "true", "yes"):
+    intents.members = True
 client = discord.Client(intents=intents)
 
 
 async def list_channel_members(channel_id: int) -> list[dict]:
-    """Return members who can see a channel, using GUILD_MEMBERS intent.
+    """Return members who can see a channel.
 
-    Requires GUILD_MEMBERS privileged intent enabled in Discord Dev Portal.
-    Returns list of {id, name, display_name, is_bot} dicts.
+    Requires GUILD_MEMBERS privileged intent enabled in Discord Dev Portal
+    AND DISCORD_GUILD_MEMBERS_INTENT=1 in the bridge environment.
+    Returns list of {id, name, display_name, is_bot} dicts, or empty list
+    if the intent is unavailable.
     """
+    if not intents.members:
+        return []
     channel = client.get_channel(channel_id)
     if channel is None:
         try:
@@ -2033,15 +2042,22 @@ async def list_channel_members(channel_id: int) -> list[dict]:
     if guild is None:
         return []
     members = []
-    async for member in guild.fetch_members(limit=1000):
-        perms = channel.permissions_for(member)
-        if perms.view_channel:
-            members.append({
-                "id": str(member.id),
-                "name": member.name,
-                "display_name": member.display_name,
-                "is_bot": member.bot,
-            })
+    try:
+        async for member in guild.fetch_members(limit=1000):
+            try:
+                perms = channel.permissions_for(member)
+                if perms.view_channel:
+                    members.append({
+                        "id": str(member.id),
+                        "name": member.name,
+                        "display_name": member.display_name,
+                        "is_bot": member.bot,
+                    })
+            except Exception:
+                continue  # skip members whose permissions can't be resolved
+    except Exception as e:
+        print(f"  [list_channel_members] fetch_members failed for guild {guild.id}: {e}", flush=True)
+        return []
     return members
 
 
