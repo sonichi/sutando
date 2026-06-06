@@ -2013,7 +2013,36 @@ pending_reply_anchors: dict[str, int] = {}
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True  # required for list_channel_members
 client = discord.Client(intents=intents)
+
+
+async def list_channel_members(channel_id: int) -> list[dict]:
+    """Return members who can see a channel, using GUILD_MEMBERS intent.
+
+    Requires GUILD_MEMBERS privileged intent enabled in Discord Dev Portal.
+    Returns list of {id, name, display_name, is_bot} dicts.
+    """
+    channel = client.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(channel_id)
+        except Exception:
+            return []
+    guild = getattr(channel, "guild", None)
+    if guild is None:
+        return []
+    members = []
+    async for member in guild.fetch_members(limit=1000):
+        perms = channel.permissions_for(member)
+        if perms.view_channel:
+            members.append({
+                "id": str(member.id),
+                "name": member.name,
+                "display_name": member.display_name,
+                "is_bot": member.bot,
+            })
+    return members
 
 
 def _recover_orphan_sending_files() -> int:
