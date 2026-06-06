@@ -70,17 +70,25 @@ def _run_one_live(case: dict, quick: bool = False) -> dict:
     import audio
     import score
     import time
-    # Silence test: the prober says nothing; the subject must NOT speak unprompted
-    # during the wait. Pass = stayed silent; fail = talked on its own.
+    # Silence / false-wake test: the subject must NOT respond. With no prompt this
+    # is the idle-silence test (don't speak unprompted over a long wait). With a
+    # prompt it is a false-activation test: utter a line NOT addressed to the
+    # subject (no wake word), then confirm it stays quiet. Pass = silent.
     if case.get("expect_silence"):
+        if case.get("prompt"):
+            spoken = case["prompt"] if case.get("wake_word") else "Sutando, " + case["prompt"]
+            audio.speak(spoken)
         window = min(float(case.get("timeout_s", 30)), 30.0) if quick \
             else float(case.get("timeout_s", 30))
         heard = audio.listen(timeout_s=window)
         if heard.onset_at is None:
-            return _row(case, None, "pass", 5, f"Stayed silent for ~{window:.0f}s (correct).")
+            msg = ("Correctly did not respond to un-addressed speech."
+                   if case.get("prompt") else f"Stayed silent for ~{window:.0f}s (correct).")
+            return _row(case, None, "pass", 5, msg)
         tr = score.transcribe(heard.wav_path)
         return _row(case, None, "fail", 1,
-                    f"Spoke unprompted during the wait: '{tr.text[:60]}'", transcript=tr.text)
+                    f"Responded when it should have stayed silent: '{tr.text[:60]}'",
+                    transcript=tr.text)
     # Wake the subject every turn — a normal Sutando session needs the wake word
     # at the very start of each utterance (owner-confirmed 2026-06-05).
     spoken = case["prompt"] if case.get("wake_word") else "Sutando, " + case["prompt"]
