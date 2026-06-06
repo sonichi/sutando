@@ -50,13 +50,34 @@ if [ -x "$REPO/scripts/sutando-config.sh" ]; then
     mkdir -p "$_ccd"
     # Auth-carry (v0.8 cold-start fix). Seed credentials + onboarding state from
     # $HOME/.claude/ so a cold `claude` core doesn't dead-end at the login wall
-    # before reaching /schedule-crons. Idempotent — only copies when the
-    # per-runtime dir lacks the file. Without this, the watcher never starts on
-    # a fresh node (see Lucy's #design 2026-06-06 17:12Z heads-up, Bug 1).
+    # (.credentials.json) or trust-folder prompt (.claude.json) before reaching
+    # /schedule-crons. Idempotent — only copies when the per-runtime dir lacks
+    # the file. Without this, the watcher never starts on a fresh node (see
+    # Lucy's #design 2026-06-06 17:12Z heads-up, Bug 1).
+    #
+    # Single-tenant assumption (Pro 21:18Z + Lucy 21:25Z reviews on PR #1496):
+    # this whole-file copy binds the per-runtime dir to whatever account
+    # $HOME/.claude owns — .claude.json carries `oauthAccount`, `userID`, the
+    # `projects` map (per-dir history + MCP approval state), and `mcpServers`.
+    # Fine for the current single-user-Mac reality. If per-runtime ever means
+    # per-account, narrow this carry to onboarding flags only.
+    #
+    # Sync caveat: if CLAUDE_CONFIG_DIR lives under workspace/ and
+    # workspace-sync is on, .claude.json propagates across the fleet. Trust
+    # entries keyed by absolute checkout path don't collide between hosts.
+    # Followup: consider narrowing CLAUDE_CONFIG_DIR to a per-host non-synced
+    # subdir.
     for _seed in .credentials.json .claude.json; do
       if [ ! -f "$_ccd/$_seed" ] && [ -f "$HOME/.claude/$_seed" ]; then
-        cp "$HOME/.claude/$_seed" "$_ccd/$_seed"
-        [ "$_seed" = ".credentials.json" ] && chmod 600 "$_ccd/$_seed"
+        # Mini 21:23Z: defensive log on cp failure (read-only target, disk full).
+        # Lucy 21:25Z: log on success too so a stale-source case (expired creds
+        # carried forward + masked by the idempotent guard) is diagnosable.
+        if cp "$HOME/.claude/$_seed" "$_ccd/$_seed" 2>/dev/null; then
+          [ "$_seed" = ".credentials.json" ] && chmod 600 "$_ccd/$_seed"
+          echo "  ~ auth-carry: seeded $_seed from \$HOME/.claude/"
+        else
+          echo "  ~ auth-carry: cp failed for $_seed (check target perms + disk)"
+        fi
       fi
     done
     export CLAUDE_CONFIG_DIR="$_ccd"
@@ -615,17 +636,18 @@ if _DC_ENV="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/channels/discord/.env"; [ -f "$_
   done
   # Fallback (v0.8 cold-start fix). If none of the probed candidates had
   # discord.py importable (PATH stripped by launchctl, conda shim shadowing
-  # homebrew, etc.) but plain `python3` is on PATH, hand the bridge to it
-  # anyway. If discord.py is truly missing, the bridge surfaces a clean
-  # ImportError in its log on first invocation — much better diagnostic than
-  # a silent skip masquerading as "discord-bridge offline" (Lucy's #design
-  # 2026-06-06 17:12Z heads-up, Bug 2).
-  if [ -z "$PYTHON_WITH_DISCORD" ] && command -v python3 >/dev/null 2>&1; then
+  # homebrew, etc.) the original loop fell through silently. Per Lucy's
+  # PR #1496 review: probe PATH `python3` for `import discord` before
+  # falling back to it — avoids handing the bridge a guaranteed-fail
+  # interpreter that would crash-loop on every boot. If THAT probe also
+  # fails, keep the labeled skip with the pip-install hint (names the
+  # missing dep + fix at the startup console).
+  if [ -z "$PYTHON_WITH_DISCORD" ] && command -v python3 >/dev/null 2>&1 && python3 -c "import discord" 2>/dev/null; then
     PYTHON_WITH_DISCORD="python3"
-    echo "  ~ discord bridge falling back to PATH python3 (no probed interp had discord.py)"
+    echo "  ~ discord bridge using PATH python3 (no probed interp matched; PATH python3 has discord.py)"
   fi
   if [ -z "$PYTHON_WITH_DISCORD" ]; then
-    echo "  ~ discord bridge (no python3 on PATH — run: /opt/homebrew/bin/pip3 install discord.py)"
+    echo "  ~ discord bridge (no python with discord.py — run: /opt/homebrew/bin/pip3 install discord.py)"
   elif ! pgrep -f "discord-bridge" > /dev/null 2>&1; then
     echo "  Starting Discord bridge with $PYTHON_WITH_DISCORD..."
     "$PYTHON_WITH_DISCORD" src/discord-bridge.py > "$LOGS_DIR/discord-bridge.log" 2>&1 &
