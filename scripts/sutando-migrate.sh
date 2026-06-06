@@ -588,6 +588,7 @@ DELETE_SOURCE=0
 FORCE=0
 ROLLBACK_ID=""
 NO_CONFIRM=0
+NO_CLAUDE_IMPORT=0
 
 EXPLAIN_PATH=""
 while [ $# -gt 0 ]; do
@@ -615,6 +616,7 @@ while [ $# -gt 0 ]; do
         --respect-env) RESPECT_ENV=1; shift ;;
         --backup-id) ROLLBACK_ID="$2"; shift 2 ;;
         --no-confirm|--yes|-y) NO_CONFIRM=1; shift ;;  # skip pre-flight prompt (for CI / scripted runs)
+        --no-claude-import) NO_CLAUDE_IMPORT=1; shift ;;  # skip auto-invocation of sutando-shell-setup.sh --import after commit (advanced; see Lucy's Maddy report 2026-06-06)
         --help|-h)
             sed -n '1,80p' "${BASH_SOURCE[0]}"
             exit 0
@@ -1539,6 +1541,39 @@ commit_main() {
     # sutando-plus/scripts/sutando-migrate-sync.sh — runs AFTER this commit
     # succeeds, only relevant to sutando-plus users who have a vault remote at
     # the customized source location.
+
+    # Auto-invoke Claude memory import — fixes Lucy's Maddy migration report
+    # 2026-06-06: previously sutando-migrate set up the M2 directories but did
+    # NOT copy `~/.claude/projects/<slug>/*` into `<workspace>/.claude-sutando/
+    # projects/<slug>/*`. Users assumed migrate moved their Claude Code memory;
+    # it didn't, leaving the real ~517-file memory at the legacy `~/.claude/`
+    # location and a 181-byte stub at the new location. Now `commit_main` ends
+    # with the same `--import` rsync that worked for owner's setup (when run
+    # manually). Idempotent — rsync skips files already up-to-date at dest, so
+    # re-running migrate is safe. Opt out with `--no-claude-import` for tests
+    # or advanced users with custom claude-config-dir layouts.
+    #
+    # Skipped on phase-2 delete-only runs (DELETE_SOURCE=1 with $ROLLBACK_ID
+    # set means the copy walk was already done in an earlier pass).
+    if [ "$NO_CLAUDE_IMPORT" = "0" ] && [ "$DELETE_SOURCE" = "0" ]; then
+        local _import_script="$(dirname "$0")/sutando-shell-setup.sh"
+        if [ -x "$_import_script" ] || [ -f "$_import_script" ]; then
+            echo
+            echo "sutando-migrate: invoking sutando-shell-setup.sh --import to copy Claude memory ..."
+            if bash "$_import_script" --import; then
+                echo "  Claude memory import: ok"
+            else
+                local _rc=$?
+                # Don't hard-fail the migrate on import failure — the per-file
+                # workspace migration completed successfully; the user can
+                # re-run `--import` manually. Surface the failure so they know
+                # to address it.
+                echo "  Claude memory import: FAILED (rc=$_rc) — re-run manually: bash scripts/sutando-shell-setup.sh --import" >&2
+            fi
+        else
+            echo "  Claude memory import: skipped (scripts/sutando-shell-setup.sh not found at expected path; run --import manually after migrate)"
+        fi
+    fi
 
     echo
     echo "sutando-migrate: COMMIT complete. Verify with: bash scripts/sutando-migrate.sh verify"
