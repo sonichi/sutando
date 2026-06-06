@@ -87,14 +87,19 @@ def _frames(wav_path: str) -> np.ndarray:
 
 
 def _onset(samples: np.ndarray, onset_rms: float, win_ms: int = 30,
-           guard_ms: int = 600, min_run: int = 4) -> tuple[int, int, float]:
+           guard_ms: int = 200, min_run: int = 4) -> tuple[int, int, float]:
     """Return (onset_idx, end_idx, peak_rms) over RMS windows. onset_idx == -1 if
     no SUSTAINED energy crosses the threshold after the guard window.
 
-    guard_ms skips the start of the recording so the prober's own playback
-    echo/reverb tail isn't mistaken for the subject's reply — that bug produced
-    impossible sub-second latencies (p50 120ms, 2026-06-05). min_run requires
-    several consecutive loud windows so a single transient blip doesn't count."""
+    guard_ms skips the very start of the recording so the prober's own playback
+    REVERB TAIL isn't mistaken for the subject's reply. listen() now records only
+    AFTER speak() has fully finished playing (sequential, not overlapped), so the
+    guard only needs to cover the room's decay + sox/CoreAudio spawn settling —
+    ~200ms. The old 600ms value (from when capture overlapped playback, 2026-06-05)
+    blanked the first 600ms of the reply window and ATE fast acknowledgements like
+    "Working on it…" that voice agents emit within ~300-900ms — a false no-response
+    (owner-caught 2026-06-06). min_run still requires several consecutive loud
+    windows so a single transient blip doesn't count."""
     win = max(1, int(SR * win_ms / 1000))
     n = len(samples) // win
     if n == 0:
