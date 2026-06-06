@@ -1,20 +1,33 @@
-"""Fleet roster — canonical name→Discord ID lookup for Sutando agents.
+"""Fleet roster — canonical name→Discord ID resolution for Sutando agents.
 
-Source of truth: FLEET_ROSTER_PATH env var, or workspace/data/fleet-roster.json
-(path is configurable to survive workspace-revamp migration).
+## Design
 
-Static name→ID lookup only. Live channel-membership queries ("is X in channel Y?")
-require the discord-bridge list_channel_members() function.
+The **code** (this file) ships with ZERO IDs. It is safe to share, review,
+and commit to a public repo because it contains only resolution logic.
 
-Per Air's review (2026-06-06): the data file home is intentionally deferred until
-the workspace revamp (#1454, #1449) lands — path is read from env var so it migrates
-without code changes.
+The **data** (name→ID map) lives in a private per-host file, never committed:
+  ~/.claude/fleet-roster.local.json
 
-Usage:
+Each fleet host installs its own roster file. The bot's own Discord ID is
+derived live via /users/@me and never written to disk.
+
+## Privacy invariant
+
+IDs never appear in any committed source or memory-synced file.
+  - fleet_roster.py: NO IDs
+  - fleet-roster.local.json: per-host, gitignored, outside memory-sync
+  - access.json: raw numbers, no names (already private)
+
+## Usage
+
     from fleet_roster import mention, get_member
 
-    mention("pro")           # → "<@1509329143110565888>"
-    get_member("mini")       # → {"id": "...", "channels": [...], "role": "agent", "guild": "..."}
+    mention("pro")                          # → "<@id>" (reads private roster)
+    mention("pro", platform="ag2.space")    # → "@pro" (future cutover)
+
+    # Channel-verified mention (live Discord query at post-time):
+    import asyncio
+    asyncio.run(mention_verified("pro", channel_id=CHANNEL_ID))
 """
 from __future__ import annotations
 
@@ -23,43 +36,41 @@ import os
 from pathlib import Path
 from typing import Optional
 
-# Default roster — updated by data/fleet-roster.json when available.
-# IDs confirmed by Mini on 2026-06-06 (Echo Act IV fleet).
-_BUILTIN_ROSTER: dict[str, dict] = {
-    "air":   {"id": "1485364006297534584", "role": "agent", "name": "sutando"},
-    "mini":  {"id": "1490412828065267872", "role": "agent", "name": "Sutando-Mini"},
-    "pro":   {"id": "1509329143110565888", "role": "agent", "name": "Echo Act IV Pro"},
-    "lucy":  {"id": "1494435872949665953", "role": "agent", "name": "Lucy-Studio-Susan"},
-}
-
-# Path is configurable via FLEET_ROSTER_PATH env var so it survives workspace migration.
-# Default falls back to workspace/data/ but can be overridden without code changes.
+# Private per-host roster file — NOT committed, NOT memory-synced.
+# Install on each host: ~/.claude/fleet-roster.local.json
+# Format: {"air": {"id": "...", "role": "agent"}, ...}
 _ROSTER_PATH = Path(
     os.environ.get(
         "FLEET_ROSTER_PATH",
-        str(
-            Path(os.environ.get("SUTANDO_WORKSPACE", str(Path.home() / ".sutando" / "workspace")))
-            / "data" / "fleet-roster.json"
-        )
+        str(Path.home() / ".claude" / "fleet-roster.local.json")
     )
 )
 
 
 def _load_roster() -> dict[str, dict]:
-    """Load roster from data/fleet-roster.json, falling back to builtin."""
+    """Load roster from private local file. Raises FileNotFoundError if missing."""
+    if not _ROSTER_PATH.exists():
+        raise FileNotFoundError(
+            f"Fleet roster not found at {_ROSTER_PATH}. "
+            "Create it with your fleet's name→ID map. "
+            "See skills/fleet-roster/SKILL.md for format. "
+            "This file is private — never commit or memory-sync it."
+        )
     try:
-        if _ROSTER_PATH.exists():
-            data = json.loads(_ROSTER_PATH.read_text())
-            if isinstance(data, dict):
-                return {k.lower(): v for k, v in data.items()}
-    except Exception:
-        pass
-    return _BUILTIN_ROSTER
+        data = json.loads(_ROSTER_PATH.read_text())
+        if not isinstance(data, dict):
+            raise ValueError("roster must be a JSON object")
+        return {k.lower(): v for k, v in data.items()}
+    except Exception as e:
+        raise RuntimeError(f"Failed to load fleet roster from {_ROSTER_PATH}: {e}")
 
 
 def get_member(name: str) -> Optional[dict]:
     """Return member record for canonical name, or None if not found."""
-    roster = _load_roster()
+    try:
+        roster = _load_roster()
+    except FileNotFoundError:
+        return None
     return roster.get(name.lower())
 
 
@@ -67,14 +78,15 @@ def mention(name: str, platform: str = "discord") -> str:
     """Return platform-specific @-mention string for canonical name.
 
     platform: "discord" (default) or "ag2.space" (future cutover).
-    Raises ValueError if name not in roster — fail loudly rather than
-    sending a broken mention silently.
+    Raises FileNotFoundError if roster not installed.
+    Raises ValueError if name not in roster.
     """
-    member = get_member(name)
+    roster = _load_roster()
+    member = roster.get(name.lower())
     if member is None:
         raise ValueError(
             f"Unknown fleet member '{name}'. "
-            f"Known: {list(_load_roster().keys())}. "
+            f"Known: {list(roster.keys())}. "
             f"Update {_ROSTER_PATH} to add new members."
         )
     if platform == "discord":
@@ -89,56 +101,41 @@ def mention(name: str, platform: str = "discord") -> str:
 async def mention_verified(name: str, channel_id: int, platform: str = "discord") -> str:
     """Return mention string, verified against live channel membership at call time.
 
-    Calls discord-bridge list_channel_members() to confirm the member is actually
-    in the target channel before returning the mention. This is the load-bearing
-    check that prevents posting mentions to channels where the target bot can't see.
+    Calls discord-bridge list_channel_members() to confirm the member is
+    in the target channel before returning the mention. This prevents posting
+    mentions to channels where the target bot cannot see.
 
-    IMPORTANT: requires discord-bridge client to be running and GUILD_MEMBERS intent
-    enabled. If list_channel_members() returns empty (intent missing or bot not in
-    guild), raises ValueError to avoid false-negative refusals. Caller must handle
-    the guild-intent bootstrap separately.
+    Dependency direction: skill → discord-bridge, never reverse.
 
-    Dependency direction: skill → discord-bridge. Never call this from core.
+    Falls back to unverified mention (with warning) if:
+    - GUILD_MEMBERS intent unavailable (empty member list)
+    - Bridge unavailable
+    This avoids trading the drift bug for a refusal bug.
     """
-    # Import at call time to avoid circular import; discord-bridge is a peer
     import importlib.util
-    import sys
+    import warnings
+
     bridge_path = Path(__file__).parents[3] / "src" / "discord-bridge.py"
     if not bridge_path.exists():
-        raise RuntimeError(
-            f"discord-bridge.py not found at {bridge_path}. "
-            "mention_verified() requires the discord-bridge to be present."
-        )
+        warnings.warn(f"discord-bridge.py not found at {bridge_path}; using unverified mention")
+        return mention(name, platform)
 
-    # Call list_channel_members from the running bridge via direct import
-    spec = importlib.util.spec_from_file_location("discord_bridge", bridge_path)
-    if spec is None:
-        raise RuntimeError("Could not load discord-bridge spec")
-    bridge = importlib.util.module_from_spec(spec)
-
-    member = get_member(name)
+    member = _load_roster().get(name.lower())
     if member is None:
         raise ValueError(f"Unknown fleet member '{name}'.")
 
     try:
+        spec = importlib.util.spec_from_file_location("discord_bridge", bridge_path)
+        bridge = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(bridge)  # type: ignore
         members = await bridge.list_channel_members(channel_id)
     except Exception as e:
-        # If the query fails, fall back to unverified mention with a warning
-        # rather than refusing (trades refusal bug for drift bug — choose drift)
-        import warnings
-        warnings.warn(
-            f"list_channel_members failed ({e}); falling back to unverified mention. "
-            "Verify GUILD_MEMBERS intent is enabled."
-        )
+        warnings.warn(f"list_channel_members failed ({e}); using unverified mention")
         return mention(name, platform)
 
     if not members:
-        # Empty result = intent missing or no members visible.
-        # Fall back rather than false-negative.
-        import warnings
         warnings.warn(
-            f"list_channel_members returned empty for channel {channel_id}. "
+            f"list_channel_members returned empty for channel {channel_id}; "
             "GUILD_MEMBERS intent may not be enabled. Using unverified mention."
         )
         return mention(name, platform)
@@ -146,8 +143,7 @@ async def mention_verified(name: str, channel_id: int, platform: str = "discord"
     member_ids = {m["id"] for m in members}
     if member["id"] not in member_ids:
         raise ValueError(
-            f"Fleet member '{name}' (id {member['id']}) is not in channel {channel_id}. "
-            "Cannot post a mention they cannot see."
+            f"Fleet member '{name}' (id {member['id']}) is not in channel {channel_id}."
         )
 
     return mention(name, platform)
