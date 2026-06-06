@@ -125,8 +125,10 @@ rm -rf "$TMP_E2E"
 # the same-slug rsync leaves files at the wrong slug. Bridge detects + copies.
 grep -q "Claude memory bridge" "$MIGRATE" \
     || { echo "  FAIL: slug-rename bridge announcement missing from migrate"; fail=1; }
+grep -qF 'cp -a "$_populated_dir/memory/"*.md' "$MIGRATE" \
+    || { echo "  FAIL: bridge cp command pattern (cp -a) missing"; fail=1; }
 grep -qF 'cp -an "$_populated_dir/memory/"*.md' "$MIGRATE" \
-    || { echo "  FAIL: bridge cp command pattern missing"; fail=1; }
+    && { echo "  FAIL: bridge still uses 'cp -an' — should be 'cp -a' (clobber stub by design per Lucy + Chi 2026-06-06)"; fail=1; }
 
 # ── Test 9: E2E slug-rename bridge — pre-populate stub + populated, verify bridge
 # Creates a tmp `.claude-sutando/projects/` layout with:
@@ -144,6 +146,9 @@ mkdir -p "$TMP_BRIDGE/dest/.claude-sutando/projects/${BASE_SLUG}-workspace/memor
 echo "memory-1" > "$TMP_BRIDGE/dest/.claude-sutando/projects/${BASE_SLUG}/memory/test-1.md"
 echo "memory-2" > "$TMP_BRIDGE/dest/.claude-sutando/projects/${BASE_SLUG}/memory/test-2.md"
 echo "memory-3" > "$TMP_BRIDGE/dest/.claude-sutando/projects/${BASE_SLUG}/memory/test-3.md"
+# REAL MEMORY.md at the populated source (simulates Lucy's ~73KB index)
+echo "REAL-MEMORY-INDEX-content" > "$TMP_BRIDGE/dest/.claude-sutando/projects/${BASE_SLUG}/memory/MEMORY.md"
+# Stub MEMORY.md at the variant — Claude wrote this on first read post-migration
 echo "# stub" > "$TMP_BRIDGE/dest/.claude-sutando/projects/${BASE_SLUG}-workspace/memory/MEMORY.md"
 
 bridge_out="$(
@@ -175,9 +180,22 @@ for f in test-1.md test-2.md test-3.md; do
     fi
 done
 
-if [ ! -f "$TMP_BRIDGE/dest/.claude-sutando/projects/${BASE_SLUG}-workspace/memory/MEMORY.md" ]; then
-    echo "  FAIL: stub MEMORY.md was clobbered by bridge — cp -an semantics broken"
+# Per Lucy + Chi 2026-06-06: the bridge MUST clobber the stub MEMORY.md
+# with the populated source's real MEMORY.md. cp -an left the stub in
+# place, hiding the real index from Claude.
+variant_mem_md="$TMP_BRIDGE/dest/.claude-sutando/projects/${BASE_SLUG}-workspace/memory/MEMORY.md"
+if [ ! -f "$variant_mem_md" ]; then
+    echo "  FAIL: MEMORY.md missing at variant slug after bridge"
     fail=1
+else
+    actual_content="$(cat "$variant_mem_md")"
+    if [ "$actual_content" = "# stub" ]; then
+        echo "  FAIL: variant MEMORY.md still contains '# stub' — bridge cp -a did not clobber (regression to cp -an semantics)"
+        fail=1
+    elif [ "$actual_content" != "REAL-MEMORY-INDEX-content" ]; then
+        echo "  FAIL: variant MEMORY.md content unexpected: '$actual_content'"
+        fail=1
+    fi
 fi
 
 rm -rf "$TMP_BRIDGE"

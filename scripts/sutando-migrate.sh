@@ -1612,9 +1612,18 @@ commit_main() {
                         local _variant_slug
                         _variant_slug="$(basename "$_variant_dir")"
                         echo "  Claude memory bridge: $_base_slug → $_variant_slug ($_populated_count files; stub had $_variant_count)"
-                        # cp -an: archive mode + don't overwrite existing.
-                        # Idempotent re-runs leave already-bridged files alone.
-                        cp -an "$_populated_dir/memory/"*.md "$_variant_dir/memory/" 2>/dev/null || true
+                        # `cp -a` (NO -n) — clobber the stub by design. Per
+                        # Lucy + Chi (Maddy v0.8 validation 2026-06-06):
+                        # the gate condition `_variant_count<2` already
+                        # restricts to confirmed stubs (typically just a
+                        # 181-byte placeholder MEMORY.md Claude wrote on
+                        # first read). `cp -an` left that stub in place,
+                        # so the user's ~73KB real MEMORY.md (the memory
+                        # INDEX) never made it across — silent data-loss-
+                        # equivalent for the index file. Dropping `-n`
+                        # makes the populated source authoritative for ALL
+                        # files at the variant slug.
+                        cp -a "$_populated_dir/memory/"*.md "$_variant_dir/memory/" 2>/dev/null || true
                         _bridged_count=$((_bridged_count+1))
                     fi
                 done
