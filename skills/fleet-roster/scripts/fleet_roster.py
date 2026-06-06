@@ -37,12 +37,20 @@ from pathlib import Path
 from typing import Optional
 
 # Private per-host roster file — NOT committed, NOT memory-synced.
-# Install on each host: ~/.claude/fleet-roster.local.json
-# Format: {"air": {"id": "...", "role": "agent"}, ...}
+# Default: $SUTANDO_MEMORY_DIR/fleet-roster.local.json (resolves at runtime
+# so it follows the Memory-space path after the workspace-revamp migration).
+# Override via FLEET_ROSTER_PATH env var.
+#
+# The data file is DEFERRED until the Memory-space migration settles (#1449,
+# #1454, #1490). Ship the code now; install the file after migration lands.
+_MEMORY_DIR = os.environ.get(
+    "SUTANDO_MEMORY_DIR",
+    str(Path.home() / ".claude" / "projects")  # last-resort fallback only
+)
 _ROSTER_PATH = Path(
     os.environ.get(
         "FLEET_ROSTER_PATH",
-        str(Path.home() / ".claude" / "fleet-roster.local.json")
+        str(Path(_MEMORY_DIR) / "fleet-roster.local.json")
     )
 )
 
