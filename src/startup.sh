@@ -48,6 +48,17 @@ if [ -x "$REPO/scripts/sutando-config.sh" ]; then
   _ccd_err="$(mktemp -t startup-ccd.XXXXXX)"
   if _ccd="$(bash "$REPO/scripts/sutando-config.sh" claude-sutando-config-dir 2>"$_ccd_err")"; then
     mkdir -p "$_ccd"
+    # Auth-carry (v0.8 cold-start fix). Seed credentials + onboarding state from
+    # $HOME/.claude/ so a cold `claude` core doesn't dead-end at the login wall
+    # before reaching /schedule-crons. Idempotent — only copies when the
+    # per-runtime dir lacks the file. Without this, the watcher never starts on
+    # a fresh node (see Lucy's #design 2026-06-06 17:12Z heads-up, Bug 1).
+    for _seed in .credentials.json .claude.json; do
+      if [ ! -f "$_ccd/$_seed" ] && [ -f "$HOME/.claude/$_seed" ]; then
+        cp "$HOME/.claude/$_seed" "$_ccd/$_seed"
+        [ "$_seed" = ".credentials.json" ] && chmod 600 "$_ccd/$_seed"
+      fi
+    done
     export CLAUDE_CONFIG_DIR="$_ccd"
   else
     echo "startup: claude_sutando_config_dir invalid — refusing to start" >&2
@@ -602,8 +613,19 @@ if _DC_ENV="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/channels/discord/.env"; [ -f "$_
       break
     fi
   done
+  # Fallback (v0.8 cold-start fix). If none of the probed candidates had
+  # discord.py importable (PATH stripped by launchctl, conda shim shadowing
+  # homebrew, etc.) but plain `python3` is on PATH, hand the bridge to it
+  # anyway. If discord.py is truly missing, the bridge surfaces a clean
+  # ImportError in its log on first invocation — much better diagnostic than
+  # a silent skip masquerading as "discord-bridge offline" (Lucy's #design
+  # 2026-06-06 17:12Z heads-up, Bug 2).
+  if [ -z "$PYTHON_WITH_DISCORD" ] && command -v python3 >/dev/null 2>&1; then
+    PYTHON_WITH_DISCORD="python3"
+    echo "  ~ discord bridge falling back to PATH python3 (no probed interp had discord.py)"
+  fi
   if [ -z "$PYTHON_WITH_DISCORD" ]; then
-    echo "  ~ discord bridge (no python with discord.py — run: /opt/homebrew/bin/pip3 install discord.py)"
+    echo "  ~ discord bridge (no python3 on PATH — run: /opt/homebrew/bin/pip3 install discord.py)"
   elif ! pgrep -f "discord-bridge" > /dev/null 2>&1; then
     echo "  Starting Discord bridge with $PYTHON_WITH_DISCORD..."
     "$PYTHON_WITH_DISCORD" src/discord-bridge.py > "$LOGS_DIR/discord-bridge.log" 2>&1 &
