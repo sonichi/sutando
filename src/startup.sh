@@ -7,6 +7,24 @@ set -e
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
 
+# Belt-and-suspenders startup log → always recoverable from /tmp (Lucy's Bug #5
+# from Maddy v0.8 migration report, 2026-06-06 #design). The footgun: operator
+# runs `nohup bash src/startup.sh > $SUTANDO_WORKSPACE/logs/startup-<ts>.log 2>&1 &`
+# over SSH. Mid-run the v0.8 auto-migration `rm -rf`'s the legacy workspace dir
+# the redirect was pointing at → log vanishes mid-write, postmortem impossible.
+#
+# Fix: also tee stdout + stderr to /tmp/sutando-startup-<ts>.log so a copy
+# survives regardless of what the operator pointed their own redirect at. The
+# tee path is announced early so operators always know where to look.
+#
+# Opt out with SUTANDO_STARTUP_NO_LOG=1 (e.g. when running inside a test
+# harness that handles its own output capture).
+if [ "${SUTANDO_STARTUP_NO_LOG:-0}" != "1" ]; then
+  _STARTUP_LOG="/tmp/sutando-startup-$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
+  echo "📓 startup log → $_STARTUP_LOG" >&2
+  exec > >(tee -a "$_STARTUP_LOG") 2> >(tee -a "$_STARTUP_LOG" >&2)
+fi
+
 # Export workspace root so child processes (skills, gather scripts, etc.) can
 # resolve "the Sutando workspace" without walking dirname-relative paths that
 # break when the script is invoked via a userSettings hardlink. Picked up by
