@@ -437,6 +437,22 @@ def resolve_claude_sutando_config_dir(repo_root: Optional[Path] = None) -> Path:
     if "core_config_dirs" in cfg:
         entry = find_core_config_dir(type_="claude", repo_root=repo_root)
         if entry is not None:
+            # When BOTH the new field AND legacy `claude_sutando_config_dir.subdir`
+            # are set, the new field wins silently — warn loudly so the user
+            # knows the legacy config is dead weight (per Mini's PR #1470
+            # review, 2026-06-05). Reuses the one-time nag flag.
+            legacy_subdir = (cfg.get("claude_sutando_config_dir") or {}).get("subdir")
+            if legacy_subdir and not _LEGACY_CLAUDE_SUBDIR_WARN_PRINTED:
+                _LEGACY_CLAUDE_SUBDIR_WARN_PRINTED = True
+                print(
+                    _color_warn(
+                        "sutando config: both `core_config_dirs[type=claude]` AND legacy "
+                        "`claude_sutando_config_dir.subdir` are set. The new field wins; "
+                        "the legacy field is being IGNORED. Remove `claude_sutando_config_dir` "
+                        "from your config to silence this warning."
+                    ),
+                    file=sys.stderr,
+                )
             return Path(entry["value"])
 
     # Priority 2: legacy `claude_sutando_config_dir.subdir` — one-release
@@ -531,6 +547,12 @@ def resolve_core_config_dirs(repo_root: Optional[Path] = None) -> list:
     behavior (CLAUDE_CONFIG_DIR pointing at `<workspace>/.claude-sutando`,
     synced=true).
 
+    **Opt-out:** to disable env-var setting entirely (no `CLAUDE_CONFIG_DIR`
+    surface, no default synthesis), set `core_config_dirs: []` explicitly in
+    your config. An empty list is honored as "no entries" and wrappers see an
+    empty result. Deleting the key falls through to default synthesis above
+    (NOT the same as opt-out).
+
     Returns the list with `${WORKSPACE_DIR}` already expanded in `value`.
     Raises `ValueError` on invariant violations (synced=true + non-workspace
     value, duplicate ids, missing required keys).
@@ -616,6 +638,12 @@ def find_core_config_dir(
     Wrappers (e.g. `claude-sutando`) call this with `type_="claude"` to find
     the right env-var/value pair to apply per invocation. The returned dict
     has `${WORKSPACE_DIR}` already expanded in `value`.
+
+    **Multi-entry-per-type disambiguation:** when more than one entry shares
+    a `type` (e.g. `claude-personal` + `claude-work`), this function returns
+    whichever appears FIRST in the config — which is brittle if config order
+    is incidental. Pass `id_` explicitly to disambiguate in that case (e.g.
+    `find_core_config_dir(type_="claude", id_="claude-work")`).
     """
     entries = resolve_core_config_dirs(repo_root)
     if id_ is not None:

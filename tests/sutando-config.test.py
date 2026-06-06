@@ -602,6 +602,70 @@ class TestSutandoConfig(unittest.TestCase):
         # without ${WORKSPACE_DIR} expansion semantics.
         self.assertEqual(ccd, (ws / "my-legacy-claude").resolve())
 
+    def test_resolve_claude_sutando_config_dir_warns_when_both_set(self):
+        # Mini's blocker fix (PR #1470 review, 2026-06-05): when BOTH the new
+        # `core_config_dirs[type=claude]` AND legacy `claude_sutando_config_dir.subdir`
+        # are set, the new field wins — and the user MUST see a loud warning
+        # so they know to remove the dead legacy config. Without this, stale
+        # config persists silently.
+        import io
+        import contextlib
+        import sutando_config
+
+        # Reset the one-time nag flag so the warn fires deterministically in
+        # this test (other tests may have already tripped it).
+        sutando_config._LEGACY_CLAUDE_SUBDIR_WARN_PRINTED = False
+
+        _write_config(self.repo, "sutando.config.json", {
+            "core_config_dirs": [{
+                "id": "main", "type": "claude",
+                "env_name": "CLAUDE_CONFIG_DIR", "synced": True,
+                "value": "${WORKSPACE_DIR}/state/new-path",
+            }],
+            "claude_sutando_config_dir": {"subdir": "legacy-subdir"},
+        })
+        stderr_buf = io.StringIO()
+        with contextlib.redirect_stderr(stderr_buf):
+            ccd = resolve_claude_sutando_config_dir(repo_root=self.repo)
+        ws = resolve_workspace(repo_root=self.repo)
+        # New schema still wins (semantic unchanged from earlier test).
+        self.assertEqual(str(ccd), str(ws / "state/new-path"))
+        # But the warn MUST fire — keywords from the message body.
+        stderr_text = stderr_buf.getvalue()
+        self.assertIn("both", stderr_text.lower(),
+                      f"expected 'both' in warn; got: {stderr_text!r}")
+        self.assertIn("claude_sutando_config_dir", stderr_text,
+                      f"expected legacy field name in warn; got: {stderr_text!r}")
+        self.assertIn("IGNORED", stderr_text,
+                      f"expected 'IGNORED' to convey that legacy is dead; got: {stderr_text!r}")
+
+    def test_resolve_claude_sutando_config_dir_no_warn_when_only_new_set(self):
+        # Symmetric guard: when ONLY the new field is set (no legacy), the
+        # warn must NOT fire. Otherwise users on the new path get noise.
+        import io
+        import contextlib
+        import sutando_config
+
+        sutando_config._LEGACY_CLAUDE_SUBDIR_WARN_PRINTED = False
+
+        _write_config(self.repo, "sutando.config.json", {
+            "core_config_dirs": [{
+                "id": "main", "type": "claude",
+                "env_name": "CLAUDE_CONFIG_DIR", "synced": True,
+                "value": "${WORKSPACE_DIR}/state/new-path",
+            }],
+            # NO claude_sutando_config_dir block at all
+        })
+        stderr_buf = io.StringIO()
+        with contextlib.redirect_stderr(stderr_buf):
+            ccd = resolve_claude_sutando_config_dir(repo_root=self.repo)
+        ws = resolve_workspace(repo_root=self.repo)
+        self.assertEqual(str(ccd), str(ws / "state/new-path"))
+        # Stderr should be silent — no both-set warn, no legacy deprecation warn.
+        stderr_text = stderr_buf.getvalue()
+        self.assertEqual(stderr_text, "",
+                         f"expected silent stderr on new-only path; got: {stderr_text!r}")
+
     # ------------------------------------------------------------------ #
 
     def test_expand_vars_walks_nested_structures(self):
