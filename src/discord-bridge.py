@@ -2284,7 +2284,20 @@ async def _handle_discord_message(message, force=False):
         #    {requireMention: False} with no allowFrom (no restriction). A
         #    thread under an open parent must not be MORE restrictive.
         #  - missing parent_cfg → engager-only [author_id] (safe default).
-        if bot_mentioned and isinstance(message.channel, discord.Thread):
+        # Ungated 2026-06-06 (was `if bot_mentioned and ...`): the bot_mentioned
+        # gate left a gap where any thread's FIRST message that did NOT mention
+        # the bot was silently dropped (the thread never landed in access.json,
+        # so the next load_channel_config saw `thread_id_str not in groups` and
+        # the bridge gave it no allowFrom). Hit live 2026-05-25 on the ep013
+        # thread when Chi's "start from news candidate" message at 13:38Z went
+        # unprocessed for ~2h until Chi explicitly @-mentioned the bot. I/O cost
+        # of ungating is bounded: only the FIRST message per thread incurs the
+        # read+write; subsequent messages hit the `thread_id_str not in
+        # access_groups` early-out and proceed unchanged. After first message
+        # the thread is permanently seeded, so cost amortizes to zero. Tracked
+        # in pending-questions.md (2026-05-17 entry + 2026-05-25 + 2026-06-02
+        # updates).
+        if isinstance(message.channel, discord.Thread):
             try:
                 access_data = json.loads(ACCESS_FILE.read_text())
                 access_groups = access_data.setdefault('groups', {})
