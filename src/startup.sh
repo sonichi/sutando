@@ -108,7 +108,19 @@ if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
   _ws_new="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null || true)"
   _migrate_sentinel="${_ws_new}/state/auth/migrated-from-env.txt"
 
+  # Bug #2 fix (Lucy's Maddy report 2026-06-06): also honor sutando-migrate.sh's
+  # OWN per-source sentinels (`state/.migrated-from-<tag>-<backup_id>`) — created
+  # when the operator runs `sutando-migrate --commit` manually instead of letting
+  # startup.sh auto-trigger it. Without this, manual-migrate flows leave SUTANDO_WORKSPACE
+  # set + legacy dir non-empty (migrate copies but doesn't rm legacy — only startup
+  # does that), so each boot re-fires the auto-migration loop.
+  _migrate_script_sentinels_present=0
+  if [ -n "$_ws_new" ] && ls "$_ws_new"/state/.migrated-from-* >/dev/null 2>&1; then
+    _migrate_script_sentinels_present=1
+  fi
+
   if [ -n "$_ws_new" ] && [ ! -f "$_migrate_sentinel" ] \
+     && [ "$_migrate_script_sentinels_present" = "0" ] \
      && [ -d "$_ws_legacy" ] && [ -n "$(ls -A "$_ws_legacy" 2>/dev/null)" ]; then
 
     _legacy_real="$(_realpath "$_ws_legacy")"
