@@ -908,12 +908,15 @@ preflight_summary() {
         # count everything; quarantine + skip rules apply later). Overcount
         # is acceptable; this is an estimate, not an audit.
         files="$(find "$src" -type f 2>/dev/null | wc -l | tr -d ' ')"
-        bytes="$(find "$src" -type f -print0 2>/dev/null | xargs -0 stat -f '%z' 2>/dev/null \
-                 | awk '{s+=$1} END {print s+0}')"
-        # Linux fallback (BSD stat differs):
-        if [ -z "$bytes" ] || [ "$bytes" = "0" ]; then
-            bytes="$(find "$src" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1} END {print s+0}')"
-        fi
+        case "$(uname -s)" in
+            Darwin)
+                bytes="$(find "$src" -type f -print0 2>/dev/null | xargs -0 stat -f '%z' 2>/dev/null \
+                         | awk '{s+=$1} END {print s+0}')"
+                ;;
+            Linux|*)
+                bytes="$(find "$src" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1} END {print s+0}')"
+                ;;
+        esac
         _total_files=$((_total_files + files))
         _total_bytes=$((_total_bytes + bytes))
         _per_source_lines+="  $tag ($src): $files files, $(humanize_bytes "$bytes")"$'\n'

@@ -112,6 +112,17 @@ else
     fail=1
 fi
 
+# ── Test 8: byte-count uses uname-s branch (not BSD stat -f '%z' on Linux)
+# The fix for #1474 replaces the stat -f '%z' + Linux fallback heuristic
+# with an explicit uname -s branch. Verify the script contains the branch
+# and does NOT contain the old fallback pattern.
+grep -q "case.*uname -s" "$MIGRATE" || { echo "  FAIL: uname -s branch missing from preflight byte-count"; fail=1; }
+grep -q 'Darwin)' "$MIGRATE" || { echo "  FAIL: Darwin) branch missing"; fail=1; }
+grep -q 'Linux|\*)' "$MIGRATE" || { echo "  FAIL: Linux|*) branch missing"; fail=1; }
+# The old heuristic-based fallback should be gone
+grep -q 'Linux fallback.*BSD stat' "$MIGRATE" && { echo "  FAIL: old Linux-fallback comment still present (should be removed)"; fail=1; }
+grep -q '\[ -z "\$bytes" \]' "$MIGRATE" && { echo "  FAIL: old fallback trigger '[ -z \$bytes ]' still present"; fail=1; }
+
 # ── Report
 if [ "$fail" = "0" ]; then
     echo "ALL TESTS PASS"
