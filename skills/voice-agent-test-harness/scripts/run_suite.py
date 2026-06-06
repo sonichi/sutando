@@ -70,6 +70,17 @@ def _run_one_live(case: dict, quick: bool = False) -> dict:
     import audio
     import score
     import time
+    # Silence test: the prober says nothing; the subject must NOT speak unprompted
+    # during the wait. Pass = stayed silent; fail = talked on its own.
+    if case.get("expect_silence"):
+        window = min(float(case.get("timeout_s", 30)), 30.0) if quick \
+            else float(case.get("timeout_s", 30))
+        heard = audio.listen(timeout_s=window)
+        if heard.onset_at is None:
+            return _row(case, None, "pass", 5, f"Stayed silent for ~{window:.0f}s (correct).")
+        tr = score.transcribe(heard.wav_path)
+        return _row(case, None, "fail", 1,
+                    f"Spoke unprompted during the wait: '{tr.text[:60]}'", transcript=tr.text)
     # Wake the subject every turn — a normal Sutando session needs the wake word
     # at the very start of each utterance (owner-confirmed 2026-06-05).
     spoken = case["prompt"] if case.get("wake_word") else "Sutando, " + case["prompt"]

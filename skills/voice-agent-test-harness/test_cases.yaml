@@ -32,8 +32,8 @@ tests:
 
   - id: version
     category: qa
-    prompt: "What version are you running?"
-    expected: "States a version/build identifier. Recorded in the report as the tested build; any clear version answer passes."
+    prompt: "What version of Sutando are you running?"
+    expected: "States the Sutando product/build version. Answering with the underlying model (e.g. Claude) version instead is a fail. Recorded in the report as the tested build."
     primary: accuracy
     timeout_s: 8
     soft: true
@@ -144,3 +144,47 @@ tests:
     expected: "Wakes on the wake word, then answers 4 (four)."
     primary: accuracy
     timeout_s: 10
+
+  # --- conversational-discipline tests (owner 2026-06-06); soft = flaky-early, not gating yet ---
+
+  - id: silence
+    category: robustness
+    prompt: ""
+    expect_silence: true
+    expected: "Stays completely silent through a multi-minute wait — no unprompted speech."
+    primary: completion
+    timeout_s: 180
+    soft: true
+
+  - id: long-input
+    category: robustness
+    prompt: "I need help drafting an email to my landlord. It should say the kitchen faucet has been leaking for about a week, that I've put a bucket under it to catch the water, and that I'd like someone to come fix it before the weekend if possible — keep the tone polite but firm."
+    expected: "Lets the entire request finish WITHOUT interrupting or jumping in early, then responds to the COMPLETE task (the full email), not just the first sentence."
+    primary: completion
+    timeout_s: 12
+    soft: true
+
+  - id: repeat-slowly
+    category: clarity
+    depends_on: world-fact
+    prompt: "Can you repeat that last answer, slowly?"
+    expected: "Repeats its prior reply (the capital of France) again, noticeably slower / more deliberately — does the thing asked."
+    primary: clarity
+    timeout_s: 10
+    soft: true
+
+  - id: dual-request
+    category: reasoning
+    prompt: "What's the capital of Japan, and what's ten plus fifteen?"
+    expected: "Answers BOTH parts in one reply: Tokyo, and 25 (twenty-five)."
+    primary: accuracy
+    timeout_s: 10
+    soft: true
+
+  - id: precise-request
+    category: clarity
+    prompt: "Just say the single word acknowledged, and nothing else."
+    expected: "Says exactly 'acknowledged' (or very close) with no extra questions, chit-chat, or distracting follow-ups."
+    primary: clarity
+    timeout_s: 8
+    soft: true
