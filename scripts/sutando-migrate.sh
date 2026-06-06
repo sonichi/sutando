@@ -826,6 +826,12 @@ _BACKUP_DEFAULT_EXCLUDES=(
     "*.mp4" "*.mov" "*.mkv" "*.avi" "*.webm"
     "*.zip" "*.tar" "*.tar.gz" "*.tgz" "*.gz"
     "*.iso" "*.dmg"
+    # node_modules + .git: cheap defense for nested dirs under surface paths.
+    # Maddy had ~497MB node_modules under notes/asset-library (remotion deps).
+    # If a surface dir like `notes/some-project/` ever contains either, tar
+    # would catch it. 100% regenerable (npm install) / preserved in source repo.
+    "node_modules"
+    ".git"
 )
 
 backup_dest() {

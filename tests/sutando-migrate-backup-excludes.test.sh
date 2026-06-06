@@ -26,6 +26,10 @@ grep -qF '"*.mov"' "$MIGRATE" \
     || { echo "  FAIL: *.mov not in default excludes"; fail=1; }
 grep -qF '"notes/asset-library"' "$MIGRATE" \
     || { echo "  FAIL: notes/asset-library not in default excludes"; fail=1; }
+grep -qF '"node_modules"' "$MIGRATE" \
+    || { echo "  FAIL: node_modules not in default excludes (Lucy + Chi + Mini 2026-06-06)"; fail=1; }
+grep -qF '".git"' "$MIGRATE" \
+    || { echo "  FAIL: .git not in default excludes (Mini 2026-06-06)"; fail=1; }
 
 # Test 2: structural — threshold env var + size estimate logic
 grep -qF 'SUTANDO_MIGRATE_BACKUP_GZIP_THRESHOLD_MB' "$MIGRATE" \
