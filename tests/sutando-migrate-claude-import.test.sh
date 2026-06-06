@@ -119,6 +119,69 @@ fi
 # Cleanup
 rm -rf "$TMP_E2E"
 
+# ── Test 8: slug-rename bridge code present (structural)
+# Lucy's #design follow-up 2026-06-06: `--import` rsyncs same-slug, but if
+# the Claude invocation CWD shifted between pre/post-M0 the slug differs and
+# the same-slug rsync leaves files at the wrong slug. Bridge detects + copies.
+grep -q "Claude memory bridge" "$MIGRATE" \
+    || { echo "  FAIL: slug-rename bridge announcement missing from migrate"; fail=1; }
+grep -qF 'cp -an "$_populated_dir/memory/"*.md' "$MIGRATE" \
+    || { echo "  FAIL: bridge cp command pattern missing"; fail=1; }
+
+# ── Test 9: E2E slug-rename bridge — pre-populate stub + populated, verify bridge
+# Creates a tmp `.claude-sutando/projects/` layout with:
+#   <base-slug>/memory/ — 3 .md files (the "populated")
+#   <base-slug>-workspace/memory/MEMORY.md — 181-byte stub (Claude reads from here post-M0)
+# Then runs the migrate (with --no-claude-import to skip the actual --import since
+# we're testing the bridge in isolation) and asserts the 3 files appear at the
+# stub's location after.
+TMP_BRIDGE="$(mktemp -d -t sutando-mig-bridge.XXXXXX)"
+mkdir -p "$TMP_BRIDGE/src-c/notes"
+echo "src" > "$TMP_BRIDGE/src-c/notes/foo.md"
+BASE_SLUG="-tmp-fake-slug"
+mkdir -p "$TMP_BRIDGE/dest/.claude-sutando/projects/${BASE_SLUG}/memory"
+mkdir -p "$TMP_BRIDGE/dest/.claude-sutando/projects/${BASE_SLUG}-workspace/memory"
+echo "memory-1" > "$TMP_BRIDGE/dest/.claude-sutando/projects/${BASE_SLUG}/memory/test-1.md"
+echo "memory-2" > "$TMP_BRIDGE/dest/.claude-sutando/projects/${BASE_SLUG}/memory/test-2.md"
+echo "memory-3" > "$TMP_BRIDGE/dest/.claude-sutando/projects/${BASE_SLUG}/memory/test-3.md"
+echo "# stub" > "$TMP_BRIDGE/dest/.claude-sutando/projects/${BASE_SLUG}-workspace/memory/MEMORY.md"
+
+bridge_out="$(
+    ( SUTANDO_MIGRATE_DEST="$TMP_BRIDGE/dest" \
+      bash "$MIGRATE" commit --source C --no-confirm --no-claude-import < /dev/null 2>&1 &
+      PID=$!
+      _slept=0
+      while [ "$_slept" -lt 120 ]; do
+          if ! kill -0 "$PID" 2>/dev/null; then break; fi
+          sleep 1
+          _slept=$((_slept+1))
+      done
+      kill -9 "$PID" 2>/dev/null || true
+      wait "$PID" 2>/dev/null || true
+    ) | tail -400
+)"
+
+if ! echo "$bridge_out" | grep -q "Claude memory bridge: ${BASE_SLUG} → ${BASE_SLUG}-workspace"; then
+    echo "  FAIL: slug-rename bridge announcement missing for ${BASE_SLUG} → ${BASE_SLUG}-workspace"
+    echo "    Output tail:"
+    echo "$bridge_out" | tail -20 | sed 's/^/      /'
+    fail=1
+fi
+
+for f in test-1.md test-2.md test-3.md; do
+    if [ ! -f "$TMP_BRIDGE/dest/.claude-sutando/projects/${BASE_SLUG}-workspace/memory/$f" ]; then
+        echo "  FAIL: slug-rename bridge — $f not copied to workspace-suffix slug"
+        fail=1
+    fi
+done
+
+if [ ! -f "$TMP_BRIDGE/dest/.claude-sutando/projects/${BASE_SLUG}-workspace/memory/MEMORY.md" ]; then
+    echo "  FAIL: stub MEMORY.md was clobbered by bridge — cp -an semantics broken"
+    fail=1
+fi
+
+rm -rf "$TMP_BRIDGE"
+
 # Report
 if [ "$fail" = "0" ]; then
     echo "ALL TESTS PASS"

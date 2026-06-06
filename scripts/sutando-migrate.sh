@@ -1575,6 +1575,56 @@ commit_main() {
         fi
     fi
 
+    # Slug-rename bridge — runs independently of the --import call above so
+    # the test (and production --no-claude-import users) still get the bridge.
+    # Skipped only on phase-2 delete-only runs (no copy walk happened).
+    if [ "$DELETE_SOURCE" = "0" ]; then
+        # Addresses Lucy's #design follow-up 2026-06-06:
+        # `--import` rsyncs same-slug, but if the user's invocation CWD
+        # changed between pre-M0 (CWD=<repo>) and post-M0 (CWD=<workspace>),
+        # the slug Claude reads from gains a `-workspace` suffix (or similar
+        # subdir-derived suffix). The same-slug rsync leaves files at the OLD
+        # slug while Claude looks at the NEW slug → stub-only at the read
+        # path.
+        #
+        # Symptomatic detection: scan `<dest>/.claude-sutando/projects/` for
+        # populated-vs-stub mismatches sharing a slug prefix. If
+        # `<base-slug>/memory/` is populated AND `<base-slug>-<suffix>/memory/`
+        # is a stub (≤1 .md file), bridge by `cp -an` populated → stub.
+        # This is symptom-driven (no hardcoded `-workspace` suffix) and
+        # handles any subdir-derived slug variant.
+        local _claude_dir="$DEST_REAL/.claude-sutando"
+        local _projects_dir="$_claude_dir/projects"
+        if [ -d "$_projects_dir" ]; then
+            local _bridged_count=0
+            local _populated_dir _base_slug _populated_count _variant_dir _variant_count
+            for _populated_dir in "$_projects_dir"/*; do
+                [ -d "$_populated_dir/memory" ] || continue
+                _base_slug="$(basename "$_populated_dir")"
+                _populated_count="$(find "$_populated_dir/memory" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
+                # Skip stubs themselves
+                [ "$_populated_count" -lt 2 ] && continue
+                # Find variant slugs sharing the prefix
+                for _variant_dir in "$_projects_dir/${_base_slug}-"*; do
+                    [ -d "$_variant_dir/memory" ] || continue
+                    _variant_count="$(find "$_variant_dir/memory" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
+                    if [ "$_variant_count" -lt 2 ]; then
+                        local _variant_slug
+                        _variant_slug="$(basename "$_variant_dir")"
+                        echo "  Claude memory bridge: $_base_slug → $_variant_slug ($_populated_count files; stub had $_variant_count)"
+                        # cp -an: archive mode + don't overwrite existing.
+                        # Idempotent re-runs leave already-bridged files alone.
+                        cp -an "$_populated_dir/memory/"*.md "$_variant_dir/memory/" 2>/dev/null || true
+                        _bridged_count=$((_bridged_count+1))
+                    fi
+                done
+            done
+            if [ "$_bridged_count" -eq 0 ]; then
+                echo "  Claude memory bridge: no stub-vs-populated mismatches detected (Claude reads same slug as source)"
+            fi
+        fi
+    fi  # DELETE_SOURCE gate for slug-rename bridge
+
     echo
     echo "sutando-migrate: COMMIT complete. Verify with: bash scripts/sutando-migrate.sh verify"
     echo "  rollback: bash scripts/sutando-migrate.sh rollback --backup-id $BACKUP_ID"
