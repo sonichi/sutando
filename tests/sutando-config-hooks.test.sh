@@ -129,6 +129,37 @@ report "$?" "migration-notice: manifest-registered hook NOT flagged as dropped"
 unset CLAUDE_CONFIG_DIR
 rm -rf "$T12"
 
+# Test 15: partial manifest still recognizes ALL hardcoded fallback substrings
+# (regression guard for liususan091219's review on PR #1505: previous logic
+# returned ONLY manifest entries when manifest was non-empty, so a host where
+# only catchup-install had run would have migration-notice false-positively
+# flag the project hooks as "dropped third-party".)
+T15="$(mktemp -d)"
+export CLAUDE_CONFIG_DIR="$T15"
+# Manifest with ONLY catchup-session-end (simulating partial-install host).
+bash "$SCRIPT" write-manifest "catchup-session-end" "src/session-handoff.sh" "skills/catchup-after-startup/scripts/install-hook.sh" >/dev/null 2>&1
+# Build an old.json with a hardcoded-list hook + a real third-party hook.
+cat > "$T15/old.json" << 'EOJ'
+{
+  "hooks": {
+    "Stop": [
+      {"hooks": [{"type": "command", "command": "bash /repo/src/check-pending-tasks.sh"}]},
+      {"hooks": [{"type": "command", "command": "bash $HOME/.claude/hooks/random-corp-thing.sh"}]}
+    ]
+  }
+}
+EOJ
+echo '{}' > "$T15/new.json"
+notice15="$(bash "$SCRIPT" migration-notice "$T15/old.json" "$T15/new.json" 2>&1)"
+# check-pending-tasks.sh IS in the hardcoded fallback — must NOT be flagged as dropped.
+echo "$notice15" | grep -qv "check-pending-tasks.sh"
+report "$?" "migration-notice: partial-manifest preserves hardcoded fallback recognition"
+# random-corp-thing.sh IS NOT in either list — MUST be flagged.
+echo "$notice15" | grep -q "random-corp-thing.sh"
+report "$?" "migration-notice: partial-manifest still flags real third-party"
+unset CLAUDE_CONFIG_DIR
+rm -rf "$T15"
+
 rm -rf "$T"
 echo
 echo "Results: $pass passed, $fail failed"

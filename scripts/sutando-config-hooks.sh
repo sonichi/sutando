@@ -79,29 +79,33 @@ _sutando_hook_manifest() {
 }
 
 _known_sutando_substrings() {
-  # Read from the manifest first; fall back to the hardcoded list if the manifest
-  # is absent or unreadable. Manifest is written by install-claude-hooks.sh and
-  # skills/catchup-after-startup/scripts/install-hook.sh on each install run.
+  # Merge the manifest's registered substrings with the hardcoded fallback list,
+  # deduped. Manifest is written by install-claude-hooks.sh and
+  # skills/catchup-after-startup/scripts/install-hook.sh on each install run —
+  # but a host where only some installers have run yet (e.g. catchup but not
+  # project hooks) would have an incomplete manifest. Merging with the
+  # hardcoded fallback ensures the full known-Sutando set is always recognized,
+  # so migration-notice never false-positively flags a real Sutando hook as
+  # "dropped third-party" on partial-install hosts.
   # See: https://github.com/sonichi/sutando/issues/1502
   local manifest; manifest="$(_sutando_hook_manifest)"
+  local from_manifest=""
   if [ -f "$manifest" ]; then
-    local from_manifest
     from_manifest="$(jq -r '.sutando_owned_hooks // [] | .[].command_substring' "$manifest" 2>/dev/null || true)"
-    if [ -n "$from_manifest" ]; then
-      echo "$from_manifest"
-      return
-    fi
-    # Manifest exists but produced no output (empty list or jq error) — fall through.
   fi
   # Hardcoded fallback: the 5 stable substrings known at #1500 ship time.
-  # New installers should write to the manifest rather than extending this list.
-  cat <<EOF
+  # New installers should write to the manifest in addition (not instead of)
+  # the hardcoded list. The merge dedupes so manifest + hardcoded overlap is fine.
+  {
+    [ -n "$from_manifest" ] && echo "$from_manifest"
+    cat <<EOF
 src/session-handoff.sh
 src/check-pending-tasks.sh
 src/watch-tasks-stream.sh
 sutando/src/
 sutando-plus/scripts/sync-workspace.sh
 EOF
+  } | awk 'NF && !seen[$0]++'
 }
 
 # _write_hook_manifest <id> <command_substring> <installed_by>
