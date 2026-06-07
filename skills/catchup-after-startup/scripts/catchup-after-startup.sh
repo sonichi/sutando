@@ -55,7 +55,7 @@ HOURS="${1:-${CATCHUP_HOURS:-3}}"
 # need to re-run install-hook.sh after the rename event. Idempotent + quiet
 # when nothing to migrate. The same script is also called from install-hook.sh.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-python3 "$HERE/migrate-settings-hooks.py" "$(bash "$REPO/scripts/sutando-config.sh" claude-home-path settings.json)" 2>&1 | sed 's/^/  /' >&2 || true
+python3 "$HERE/migrate-settings-hooks.py" "$(bash "$(cd "$HERE/../../.." && pwd)/scripts/sutando-config.sh" claude-home-path settings.json)" 2>&1 | sed 's/^/  /' >&2 || true
 
 print_section() { echo; echo "## $1"; echo; }
 say() { echo "$@"; }
@@ -160,7 +160,7 @@ fi
 # the source of truth for "what was happening last session".
 print_section "Previous-session transcript (last $HOURS h)"
 proj_slug=$(echo "$REPO" | sed 's|/|-|g')
-proj_dir="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path "projects/$proj_slug")"
+proj_dir="$(bash "$(cd "$HERE/../../.." && pwd)/scripts/sutando-config.sh" claude-home-path "projects/$proj_slug")"
 if [ -d "$proj_dir" ]; then
   # Most-recent .jsonl untouched in the last minute — skips the CURRENT
   # session's transcript (which the live process is still writing to).
