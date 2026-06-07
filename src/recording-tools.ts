@@ -3,7 +3,7 @@
  * Extracted from browser-tools.ts for readability.
  */
 
-import { execSync, execFileSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync, readFileSync, readlinkSync, existsSync, statSync } from 'node:fs';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
@@ -24,7 +24,9 @@ function findFfmpegWithSubtitles(): string | null {
 	const candidates = ['ffmpeg', '/opt/homebrew/bin/ffmpeg', '/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg'];
 	for (const bin of candidates) {
 		try {
-			if (execSync(`${bin} -filters 2>&1`, { timeout: 5_000 }).toString().includes('subtitles')) {
+			// execFileSync argv array — bin is from env or hardcoded candidates, not user input (fixes #1451)
+			const filterOut = execFileSync(bin, ['-filters'], { timeout: 5_000, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
+			if (filterOut.includes('subtitles')) {
 				_cachedSubtitleFfmpeg = bin;
 				console.log(`${ts()} [ffmpeg] subtitle filter found in: ${bin}`);
 				return bin;
@@ -70,7 +72,7 @@ export const recordingState = { muted: false };
 
 /** Stop any active screen recording */
 export function stopActiveRecording(): void {
-	try { execSync('python3 skills/screen-record/scripts/record.py stop', { timeout: 5_000 }); } catch {}
+	try { execFileSync('python3', ['skills/screen-record/scripts/record.py', 'stop'], { timeout: 5_000 }); } catch {}
 }
 
 /** Check if a recording is currently active */
@@ -254,7 +256,7 @@ function isReadableFile(path: string): boolean {
 
 function findRecording(version?: 'raw' | 'narrated' | 'subtitled'): string | null {
 	try {
-		const files = execSync('ls -t /tmp/sutando-recording-*.mov 2>/dev/null | grep -v narrated | grep -v subtitled | head -1', { timeout: 3_000 }).toString().trim();
+		const files = execFileSync('/bin/sh', ['-c', 'ls -t /tmp/sutando-recording-*.mov 2>/dev/null | grep -v narrated | grep -v subtitled | head -1'], { timeout: 3_000 }).toString().trim();
 		if (files && isReadableFile(files)) {
 			if (version === 'raw') return files;
 			const narrated = files.replace('.mov', '-narrated.mov');
@@ -343,13 +345,13 @@ export function scrollDown(pixels: number = 600) {
 	const js = `(function(){var best=document.scrollingElement||document.documentElement,bw=0;document.querySelectorAll('*').forEach(function(el){var d=el.scrollHeight-el.clientHeight;if(d>50&&el.clientHeight>200){var w=el.getBoundingClientRect().width;if(w>bw){best=el;bw=w}}});best.scrollBy(0,${pixels})})()`;
 	const tmpScroll = `/tmp/sutando-scroll-rec-${Date.now()}.scpt`;
 	writeFileSync(tmpScroll, `tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`);
-	execSync(`osascript ${tmpScroll}`, { timeout: 5_000 });
+	execFileSync('/usr/bin/osascript', [tmpScroll], { timeout: 5_000 });
 	try { unlinkSync(tmpScroll); } catch {}
 	// Repaint trigger: Chrome defers visual repaints during Zoom screen share.
 	// CGEvent scroll wheel events force a repaint through the OS input pipeline
 	// without stealing focus (unlike keyboard fallback which breaks narration).
 	try {
-		execSync(`swift src/scroll-wheel.swift 1`, { timeout: 3_000 });
+		execFileSync('swift', ['src/scroll-wheel.swift', '1'], { timeout: 3_000 });
 	} catch { /* best-effort — scroll already happened via JS */ }
 }
 
@@ -385,9 +387,9 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			demoStateRef.value = 'recording';
 
 			// Scroll to top and wait for it to take effect
-			execSync(`osascript -e 'tell application "Google Chrome" to activate' -e 'delay 0.3' -e 'tell application "System Events" to key code 126 using command down'`, { timeout: 5_000 });
+			execFileSync('/usr/bin/osascript', ['-e', 'tell application "Google Chrome" to activate', '-e', 'delay 0.3', '-e', 'tell application "System Events" to key code 126 using command down'], { timeout: 5_000 });
 			// Also use JS scroll as backup (keyboard may not work if Chrome isn't focused)
-			try { execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "window.scrollTo(0,0)"'`, { timeout: 3_000 }); } catch {}
+			try { execFileSync('/usr/bin/osascript', ['-e', 'tell application "Google Chrome" to tell active tab of front window to execute javascript "window.scrollTo(0,0)"'], { timeout: 3_000 }); } catch {}
 			await new Promise(r => setTimeout(r, 500)); // let scroll settle
 
 			// Capture + describe FIRST, then start recording.
@@ -396,7 +398,7 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			const captureData = await captureRes.json() as { status: string; path?: string };
 			const firstDesc = captureData.path ? await describeScreenshot(captureData.path) : '';
 			try { unlinkSync(LIVE_TRANSCRIPT_SRT_PATH); } catch {}
-			const startRaw = execSync('python3 skills/screen-record/scripts/record.py start', { timeout: 10_000 }).toString().trim();
+			const startRaw = execFileSync('python3', ['skills/screen-record/scripts/record.py', 'start'], { timeout: 10_000 }).toString().trim();
 			let recordingPath = '';
 			try { recordingPath = JSON.parse(startRaw).path || ''; } catch {}
 			const narratedPath = recordingPath ? recordingPath.replace('.mov', '-narrated.mov') : '';
@@ -421,7 +423,7 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			// Description pushes happen via the narration controller at a separate cadence.
 			let pageHeight = 5000;
 			try {
-				pageHeight = parseInt(execSync(`osascript -e 'tell application "Google Chrome" to tell active tab of front window to execute javascript "document.body.scrollHeight - window.innerHeight"'`, { timeout: 3_000 }).toString().trim()) || 5000;
+				pageHeight = parseInt(execFileSync('/usr/bin/osascript', ['-e', 'tell application "Google Chrome" to tell active tab of front window to execute javascript "document.body.scrollHeight - window.innerHeight"'], { timeout: 3_000 }).toString().trim()) || 5000;
 			} catch {}
 			const viewportHeight = 900;
 			writeFileSync('/tmp/sutando-scroll-info.json', JSON.stringify({ pageHeight, viewportHeight, duration_seconds }));
@@ -438,7 +440,7 @@ export const scrollAndDescribeTool: ToolDefinition = {
 				scrollPausedRef.value = false;
 				let stopResult: any = {};
 				try {
-					const raw = execSync('python3 skills/screen-record/scripts/record.py stop', { timeout: 10_000 }).toString().trim();
+					const raw = execFileSync('python3', ['skills/screen-record/scripts/record.py', 'stop'], { timeout: 10_000 }).toString().trim();
 					stopResult = JSON.parse(raw);
 				} catch {}
 				// Explicitly flush narration-tee (it normally triggers on next audio chunk,
@@ -512,18 +514,18 @@ async function startPlayback(seekSec: number = 0): Promise<{ status: string; pat
 	if (!recPath) return { status: 'error', error: 'No video to play. Open a video first with open_video.' };
 	let alreadyOpen = false;
 	try {
-		const c = execSync(`osascript -e 'tell application "QuickTime Player" to count of documents'`, { timeout: 2_000 }).toString().trim();
+		const c = execFileSync('/usr/bin/osascript', ['-e', 'tell application "QuickTime Player" to count of documents'], { timeout: 2_000 }).toString().trim();
 		alreadyOpen = parseInt(c) > 0;
 	} catch {}
 	if (!alreadyOpen) {
-		execSync(`open "${recPath}"`, { timeout: 5_000 });
+		execFileSync('open', [recPath], { timeout: 5_000 });
 		for (let i = 0; i < 10; i++) {
-			try { const c = execSync(`osascript -e 'tell application "QuickTime Player" to count of documents'`, { timeout: 2_000 }).toString().trim(); if (parseInt(c) > 0) break; } catch {}
+			try { const c = execFileSync('/usr/bin/osascript', ['-e', 'tell application "QuickTime Player" to count of documents'], { timeout: 2_000 }).toString().trim(); if (parseInt(c) > 0) break; } catch {}
 			await new Promise(r => setTimeout(r, 300));
 		}
 	}
 	if (seekSec === 0) {
-		try { execSync(`osascript -e 'tell application "QuickTime Player"' -e 'set d to document 1' -e 'set current time of d to 0' -e 'end tell'`, { timeout: 3_000 }); } catch {}
+		try { execFileSync('/usr/bin/osascript', ['-e', 'tell application "QuickTime Player"', '-e', 'set d to document 1', '-e', 'set current time of d to 0', '-e', 'end tell'], { timeout: 3_000 }); } catch {}
 	}
 	try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
 	fetch(`http://localhost:${process.env.PHONE_PORT || '3100'}/play-audio`, {
@@ -531,7 +533,7 @@ async function startPlayback(seekSec: number = 0): Promise<{ status: string; pat
 		body: JSON.stringify({ path: recPath, seekSec }),
 	}).catch(() => {});
 	await new Promise(r => setTimeout(r, 300));
-	try { execSync(`osascript -e 'tell application "QuickTime Player"' -e 'activate' -e 'play document 1' -e 'end tell'`, { timeout: 5_000 }); } catch {}
+	try { execFileSync('/usr/bin/osascript', ['-e', 'tell application "QuickTime Player"', '-e', 'activate', '-e', 'play document 1', '-e', 'end tell'], { timeout: 5_000 }); } catch {}
 	return { status: 'playing', path: recPath, instruction: 'Video is playing. Say NOTHING.' };
 }
 
@@ -566,11 +568,11 @@ export const resumeVideoTool: ToolDefinition = {
 		try {
 			try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
 			lastResumeTime = Date.now();
-			try { execSync(`osascript -e 'tell application "QuickTime Player"' -e 'activate' -e 'play document 1' -e 'end tell'`, { timeout: 5_000 }); } catch {}
+			try { execFileSync('/usr/bin/osascript', ['-e', 'tell application "QuickTime Player"', '-e', 'activate', '-e', 'play document 1', '-e', 'end tell'], { timeout: 5_000 }); } catch {}
 			// Restart audio stream to phone at current position
 			let seekSec = 0;
 			try {
-				seekSec = parseFloat(execSync(`osascript -e 'tell application "QuickTime Player" to get current time of document 1'`, { timeout: 3_000 }).toString().trim()) || 0;
+				seekSec = parseFloat(execFileSync('/usr/bin/osascript', ['-e', 'tell application "QuickTime Player" to get current time of document 1'], { timeout: 3_000 }).toString().trim()) || 0;
 			} catch {}
 			let recPath = '';
 			try { recPath = findRecording() || ''; } catch {}
@@ -623,7 +625,7 @@ export const pauseVideoTool: ToolDefinition = {
 			return { status: 'playing', instruction: 'Video is still playing. Only pause when user explicitly says "pause" or "stop".' };
 		}
 		try { writeFileSync('/tmp/sutando-playback-pause', '1'); } catch {}
-		try { execSync(`osascript -e 'tell application "QuickTime Player"' -e 'if (count of documents) > 0 then' -e 'pause document 1' -e 'end if' -e 'end tell'`, { timeout: 5_000 }); } catch {}
+		try { execFileSync('/usr/bin/osascript', ['-e', 'tell application "QuickTime Player"', '-e', 'if (count of documents) > 0 then', '-e', 'pause document 1', '-e', 'end if', '-e', 'end tell'], { timeout: 5_000 }); } catch {}
 		return { status: 'paused', instruction: 'Paused. When user says play/resume, call play_video.' };
 	},
 };
@@ -636,7 +638,7 @@ export const closeVideoTool: ToolDefinition = {
 	execution: 'inline',
 	async execute() {
 		console.log(`${ts()} [CloseVideo] called`);
-		try { execSync(`osascript -e 'tell application "QuickTime Player"' -e 'activate' -e 'end tell' -e 'delay 0.3' -e 'tell application "System Events" to keystroke "w" using command down'`, { timeout: 5_000 }); } catch {}
+		try { execFileSync('/usr/bin/osascript', ['-e', 'tell application "QuickTime Player"', '-e', 'activate', '-e', 'end tell', '-e', 'delay 0.3', '-e', 'tell application "System Events" to keystroke "w" using command down'], { timeout: 5_000 }); } catch {}
 		try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
 		try { unlinkSync('/tmp/sutando-playback-path'); } catch {}
 		return { status: 'closed' };
@@ -676,7 +678,7 @@ export const screenRecordTool: ToolDefinition = {
 		}
 		lastScreenRecordCall = now;
 		try {
-			const result = execSync(`python3 skills/screen-record/scripts/record.py ${action}`, { timeout: 10_000 }).toString().trim();
+			const result = execFileSync('python3', ['skills/screen-record/scripts/record.py', action], { timeout: 10_000 }).toString().trim();
 			// Auto-stop timer — cap at 60s regardless of what Gemini requests
 			if (action === 'start') {
 				demoStateRef.value = 'recording';
@@ -693,7 +695,7 @@ export const screenRecordTool: ToolDefinition = {
 				const capped = Math.min(duration_seconds || 20, 60);
 				setTimeout(() => {
 					try {
-						const stopResult = execSync('python3 skills/screen-record/scripts/record.py stop', { timeout: 10_000 }).toString().trim();
+						const stopResult = execFileSync('python3', ['skills/screen-record/scripts/record.py', 'stop'], { timeout: 10_000 }).toString().trim();
 						const stopParsed = JSON.parse(stopResult);
 						if (stopParsed.path && stopParsed.exists) {
 							const narrated = stopParsed.path.replace('.mov', '-narrated.mov');
