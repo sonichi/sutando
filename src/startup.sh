@@ -80,6 +80,54 @@ if [ -x "$REPO/scripts/sutando-config.sh" ]; then
         fi
       fi
     done
+    # Env-token persist (Issue #1499, owner pick 02:42Z 2026-06-07 = Option A).
+    # If `.credentials.json` is STILL absent after the auth-carry above AND a
+    # known token env var is set, write the token to `.credentials.json` in
+    # Claude Code's expected `claudeAiOauth` format so the next restart finds
+    # auth on disk and doesn't dead-end at the login wall. Closes Lucy's
+    # Maddy-reproduced gap: env-token-authed nodes never write the file
+    # themselves, so the copy-only auth-carry above has nothing to copy.
+    #
+    # Mode 600 + parent-dir 700 = de-facto OAuth-on-disk standard (gh CLI,
+    # kubectl). Per Sutando-Mini's #design 2026-06-07 weigh-in.
+    #
+    # Trade-off (documented in Issue #1499): token now on disk. Operators who
+    # chose env-only specifically for off-disk security can opt out via
+    # `SUTANDO_NO_PERSIST_TOKEN=1`.
+    #
+    # Schema (Claude Code's own format):
+    #   {"claudeAiOauth": {"accessToken": "<token>"}}
+    # We intentionally omit refreshToken + expiresAt — env-tokens don't have
+    # a refresh flow (operator-managed rotation) and omitting expiresAt is
+    # a valid claude-code config (treated as "no expiry tracking on disk").
+    if [ ! -f "$_ccd/.credentials.json" ] && [ "${SUTANDO_NO_PERSIST_TOKEN:-0}" != "1" ]; then
+      _env_token=""
+      for _var in CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN; do
+        eval "_val=\${$_var:-}"
+        if [ -n "$_val" ]; then
+          _env_token="$_val"
+          _env_var_used="$_var"
+          break
+        fi
+      done
+      if [ -n "$_env_token" ]; then
+        # python3 -c is the most portable jq-free way to write a tiny JSON
+        # without shell-quoting hazards on the token value. Env vars
+        # prefixed to the command (not appended as args) per POSIX.
+        if _p="$_ccd/.credentials.json" _t="$_env_token" python3 -c "
+import json,os
+p=os.environ['_p']
+t=os.environ['_t']
+json.dump({'claudeAiOauth':{'accessToken':t}}, open(p,'w'))
+" 2>/dev/null; then
+          chmod 600 "$_ccd/.credentials.json"
+          echo "  ~ env-token-persist: wrote .credentials.json from \$$_env_var_used (mode 600)"
+        else
+          echo "  ~ env-token-persist: write failed (check target perms + python3 on PATH)"
+        fi
+        unset _env_token
+      fi
+    fi
     export CLAUDE_CONFIG_DIR="$_ccd"
   else
     echo "startup: claude_sutando_config_dir invalid — refusing to start" >&2
