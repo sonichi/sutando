@@ -13,7 +13,7 @@ bash skills/install.sh
 
 Or manually:
 ```bash
-ln -s /path/to/sutando/skills/macos-tools ~/.claude/skills/macos-tools
+ln -s /path/to/sutando/skills/macos-tools "$CLAUDE_CONFIG_DIR/skills/macos-tools"
 ```
 
 ## What's included

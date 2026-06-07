@@ -1418,7 +1418,7 @@ def _slack_token_from_env_file() -> str:
     the world-readable LaunchAgents plist. Returns "" if absent/unreadable.
 
     Order matters: the slack bridge's canonical token location is
-    ~/.claude/channels/slack/.env (startup.sh sources exactly that file before
+    $CLAUDE_CONFIG_DIR/channels/slack/.env (startup.sh sources exactly that file before
     launching the bridge — see src/startup.sh). The original implementation
     only checked $REPO/.env, where the token does NOT live on a standard
     install — so the watchdog DM silently no-op'd (creds=None) and the owner
@@ -1448,7 +1448,7 @@ def _slack_owner_creds() -> "tuple[str, str] | None":
     Token from $SLACK_BOT_TOKEN (same one the slack bridge uses), falling back
     to the on-disk .env files (channel .env first, then $REPO/.env) for the
     minimal-env launchd path; owner from
-    ~/.claude/channels/slack/access.json (`tofuOwner`, else first `allowFrom`).
+    $CLAUDE_CONFIG_DIR/channels/slack/access.json (`tofuOwner`, else first `allowFrom`).
     Both must be present — otherwise there's no one to DM.
     """
     token = os.environ.get("SLACK_BOT_TOKEN", "").strip() or _slack_token_from_env_file()
