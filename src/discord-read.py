@@ -15,8 +15,10 @@ import urllib.request
 import urllib.parse
 from pathlib import Path
 
-CLAUDE_CONFIG = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
-_env = CLAUDE_CONFIG / "channels" / "discord" / ".env"
+sys.path.insert(0, str(Path(__file__).parent))
+from util_paths import claude_home_path  # noqa: E402
+
+_env = claude_home_path("channels", "discord", ".env")
 for line in (_env.read_text().splitlines() if _env.exists() else []):
     k, _, v = line.partition("=")
     if k.strip() == "DISCORD_BOT_TOKEN" and v.strip():
@@ -24,7 +26,7 @@ for line in (_env.read_text().splitlines() if _env.exists() else []):
 
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 if not TOKEN:
-    print("Requires DISCORD_BOT_TOKEN in ~/.claude/channels/discord/.env", file=sys.stderr)
+    print(f"Requires DISCORD_BOT_TOKEN in {_env}", file=sys.stderr)
     sys.exit(1)
 
 import argparse
