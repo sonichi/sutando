@@ -590,6 +590,7 @@ ROLLBACK_ID=""
 NO_CONFIRM=0
 NO_CLAUDE_IMPORT=0
 NO_HOOK_BRIDGE=0
+NO_CHANNEL_BRIDGE=0
 
 EXPLAIN_PATH=""
 while [ $# -gt 0 ]; do
@@ -619,6 +620,7 @@ while [ $# -gt 0 ]; do
         --no-confirm|--yes|-y) NO_CONFIRM=1; shift ;;  # skip pre-flight prompt (for CI / scripted runs)
         --no-claude-import) NO_CLAUDE_IMPORT=1; shift ;;  # skip auto-invocation of sutando-shell-setup.sh --import after commit (advanced; see Lucy's Maddy report 2026-06-06)
         --no-hook-bridge) NO_HOOK_BRIDGE=1; shift ;;  # skip auto-invocation of sutando-config-hooks.sh (Option D from #design 2026-06-07; see scripts/sutando-config-hooks.sh header)
+        --no-channel-bridge) NO_CHANNEL_BRIDGE=1; shift ;;  # skip auto-copy of $SOURCE_CLAUDE_CONFIG_DIR/channels/ → $CLAUDE_CONFIG_DIR/channels/ (Option A+ from #design 2026-06-07)
         --help|-h)
             sed -n '1,80p' "${BASH_SOURCE[0]}"
             exit 0
@@ -1737,6 +1739,51 @@ commit_main() {
             fi
         else
             echo "  hook bridge: skipped (scripts/sutando-config-hooks.sh not found at expected path; run manually after migrate)"
+        fi
+    fi
+
+    # Channel bridge — Option A+ from owner's #design 2026-06-07 design discussion.
+    # Copy $SOURCE_CLAUDE_CONFIG_DIR/channels/ (Sutando bridge access lists +
+    # .env tokens for discord/telegram/slack) into the per-runtime
+    # $CLAUDE_CONFIG_DIR/channels/ so bridges resolve to the workspace-scoped
+    # location after migration. Pre-#1454 the silent ~/.claude/channels/
+    # fallback in claude_home_path() made this "just work" — but a boot path
+    # that forgot to set CLAUDE_CONFIG_DIR would silently fall back, and the
+    # /channels/ symlink became load-bearing (Lucy in #design 2026-06-07 16:19Z).
+    # This bridge moves the channels store onto CCD so a CCD-set boot path is
+    # self-contained.
+    # Idempotent: skip if dest already populated. Honors $SOURCE_CLAUDE_CONFIG_DIR
+    # for the read-from location (defaults to ~/.claude/ — matches the legacy
+    # claude_home_path() fallback). Opt out with --no-channel-bridge.
+    if [ "$NO_CHANNEL_BRIDGE" = "0" ] && [ "$DELETE_SOURCE" = "0" ]; then
+        local _new_ccd_ch; _new_ccd_ch="$(bash "$(dirname "$0")/sutando-config.sh" claude-sutando-config-dir 2>/dev/null || true)"
+        local _src_channels="${SOURCE_CLAUDE_CONFIG_DIR:-$HOME/.claude}/channels"
+        local _dst_channels="${_new_ccd_ch}/channels"
+        if [ -z "$_new_ccd_ch" ]; then
+            echo "  channel bridge: skipped (couldn't resolve claude-sutando-config-dir; check sutando.config.local.json)" >&2
+        elif [ ! -d "$_src_channels" ]; then
+            echo "  channel bridge: skipped (no source $_src_channels — nothing to migrate)"
+        else
+            # Detect src/dst pointing at the same physical path (legacy symlink
+            # $SOURCE_CLAUDE_CONFIG_DIR/channels -> $CCD/channels). Without this
+            # check, cp -a would try to copy a directory into itself.
+            local _src_real _dst_real
+            _src_real="$(cd "$_src_channels" 2>/dev/null && pwd -P || echo "$_src_channels")"
+            _dst_real="$(cd "$_dst_channels" 2>/dev/null && pwd -P || echo "$_dst_channels")"
+            if [ "$_src_real" = "$_dst_real" ]; then
+                echo "  channel bridge: skipped (source and dest resolve to same path: $_src_real — already migrated or symlinked through)"
+            elif [ -d "$_dst_channels" ] && [ -n "$(ls -A "$_dst_channels" 2>/dev/null)" ]; then
+                echo "  channel bridge: skipped ($_dst_channels already populated — idempotent)"
+            else
+                echo
+                echo "sutando-migrate: bridging channels (Sutando bridge access lists + .env tokens) ..."
+                mkdir -p "$_dst_channels"
+                if cp -a "$_src_channels/." "$_dst_channels/" 2>/dev/null; then
+                    echo "  channel bridge: copied $_src_channels → $_dst_channels"
+                else
+                    echo "  channel bridge: copy failed (rc=$?) — re-run manually: cp -a \"$_src_channels/.\" \"$_dst_channels/\"" >&2
+                fi
+            fi
         fi
     fi
 

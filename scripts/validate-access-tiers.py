@@ -29,7 +29,22 @@ import os
 import sys
 from pathlib import Path
 
-DEFAULT_PATH = Path.home() / ".claude" / "channels" / "discord" / "access.json"
+
+def _default_access_path() -> Path:
+    """Mirror src/util_paths.py:claude_home_path() resolution order without
+    importing it (this script lives under scripts/ and is invoked by ops/CI
+    that may not have src/ on PYTHONPATH). Resolution: $CLAUDE_CONFIG_DIR
+    → $CLAUDE_HOME → ~/.claude/. Tracks the same migration semantics as
+    bridges: post-#1454 the bridges' access.json lives under CCD."""
+    base = (
+        os.environ.get("CLAUDE_CONFIG_DIR")
+        or os.environ.get("CLAUDE_HOME")
+        or str(Path.home() / ".claude")
+    )
+    return Path(os.path.expanduser(base)) / "channels" / "discord" / "access.json"
+
+
+DEFAULT_PATH = _default_access_path()
 
 
 def violations(data: dict, bot_ids: set[str]) -> list[str]:

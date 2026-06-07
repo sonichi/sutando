@@ -213,7 +213,40 @@ def claude_home_path(*subpath: str) -> Path:
     elif home_env:
         base = Path(os.path.expanduser(home_env))
     else:
+        _emit_claude_home_fallback_banner_once()
         base = Path.home() / ".claude"
     if not subpath:
         return base
     return base.joinpath(*subpath)
+
+
+# ---------------------------------------------------------------------------
+# Fallback-banner gate — fires ONCE per process when claude_home_path() lands
+# on the ~/.claude/ default because neither $CLAUDE_CONFIG_DIR nor $CLAUDE_HOME
+# was set. Owner directive #design 2026-06-07 (Option A+ for channels migration):
+# the silent ~/.claude/ fallback was load-bearing for any boot path that forgot
+# to set CCD; the banner makes that miswiring visible without forcing a hard
+# error in the deprecation window. Banner is suppressible via
+# $SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER=1 for tests / scripts that intentionally
+# exercise the ~/.claude/ path.
+# ---------------------------------------------------------------------------
+
+_CLAUDE_HOME_FALLBACK_BANNER_FIRED = False
+
+
+def _emit_claude_home_fallback_banner_once() -> None:
+    global _CLAUDE_HOME_FALLBACK_BANNER_FIRED
+    if _CLAUDE_HOME_FALLBACK_BANNER_FIRED:
+        return
+    if os.environ.get("SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER") == "1":
+        _CLAUDE_HOME_FALLBACK_BANNER_FIRED = True
+        return
+    _CLAUDE_HOME_FALLBACK_BANNER_FIRED = True
+    print(
+        "claude_home_path: $CLAUDE_CONFIG_DIR not set — falling back to ~/.claude/. "
+        "Set CLAUDE_CONFIG_DIR before starting Sutando services (the `claude-sutando` "
+        "shell function and src/startup.sh set it; ad-hoc launches must too) so "
+        "channels/skills/hooks/sessions resolve to the workspace-scoped per-runtime "
+        "location post-#1454. Suppress with SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER=1.",
+        file=sys.stderr,
+    )
