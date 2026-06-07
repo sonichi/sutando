@@ -42,7 +42,7 @@ Never commit directly to main. Always work on a feature branch.
 Read `CONTRIBUTING.md` and follow its "Before opening any PR or issue" section. The short checklist:
 
 - Search existing open + recently-closed PRs/issues for duplicates (`gh pr list --search "closes #N"`)
-- Confirm your git author email is GH-mapped — not `*.local` (macOS hostname auto-fill) or `noreply@anthropic.com` (Codex default). CLA-Assistant silently leaves the check PENDING on unmappable emails.
+- Confirm your git author email is GH-mapped — not `*.local` (macOS hostname auto-fill) or `noreply@anthropic.com`. CLA-Assistant silently leaves the check PENDING on unmappable emails.
 - Single concern per PR; no bundled refactors
 - Confirm the bug exists on `upstream/main` before adding a fix
 - After `update-branch`, CLA-Assistant may not auto-rerun — try `@cla-assistant check` comment or close+reopen if stuck
@@ -136,7 +136,7 @@ Payload schema:
 This is foundation for the lease-based multi-core scheduler — workers consult
 the alive directory to know who's available before assigning a claim. For
 single-machine use today it also gives `health-check.py` and the dashboard a
-cleaner liveness probe than scanning `pgrep -f Codex`.
+cleaner liveness probe than scanning `pgrep -f codex`.
 
 ## Durable per-host install state: `state/auth/`
 

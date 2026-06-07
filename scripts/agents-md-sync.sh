@@ -31,9 +31,9 @@ tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
 
 sed \
-  -e 's/Claude Code default/Codex default/g' \
+  -e 's/ (Claude Code default)//g' \
   -e 's/Claude Code/Codex/g' \
-  -e 's/pgrep -f claude/pgrep -f Codex/g' \
+  -e 's/pgrep -f claude/pgrep -f codex/g' \
   -e 's/CLAUDE\.md/AGENTS.md/g' \
   "$src" > "$tmp"
 
