@@ -29,7 +29,7 @@ export interface AccessTiers {
  */
 export function loadAccessTiers(homeDir: string): AccessTiers {
 	try {
-		const p = join(homeDir, '.claude/channels/discord/access.json');
+		const p = join(process.env.CLAUDE_CONFIG_DIR ?? join(homeDir, '.claude'), 'channels/discord/access.json');
 		const a = JSON.parse(readFileSync(p, 'utf-8'));
 		const owner = new Set<string>((a.allowFrom ?? []).map(String));
 		const team = new Set<string>();
