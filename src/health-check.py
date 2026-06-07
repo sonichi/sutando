@@ -1355,7 +1355,7 @@ def _slack_token_from_env_file() -> str:
     $REPO/.env for hosts that keep it there instead.
     """
     candidates = [
-        Path.home() / ".claude" / "channels" / "slack" / ".env",
+        claude_home_path("channels", "slack", ".env"),
         REPO_DIR / ".env",
     ]
     for env_path in candidates:
@@ -1383,7 +1383,7 @@ def _slack_owner_creds() -> "tuple[str, str] | None":
     token = os.environ.get("SLACK_BOT_TOKEN", "").strip() or _slack_token_from_env_file()
     if not token:
         return None
-    access = Path.home() / ".claude" / "channels" / "slack" / "access.json"
+    access = claude_home_path("channels", "slack", "access.json")
     try:
         data = json.loads(access.read_text())
     except Exception:

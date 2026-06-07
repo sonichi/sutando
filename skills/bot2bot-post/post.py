@@ -29,8 +29,9 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
-ACCESS_JSON = Path.home() / ".claude" / "channels" / "discord" / "access.json"
-ENV_FILE = Path.home() / ".claude" / "channels" / "discord" / ".env"
+_claude_config = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
+ACCESS_JSON = _claude_config / "channels" / "discord" / "access.json"
+ENV_FILE = _claude_config / "channels" / "discord" / ".env"
 VALID_KINDS = {"claim", "blocked", "done", "ping", "opinion"}
 
 
