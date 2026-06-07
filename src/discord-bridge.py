@@ -2836,10 +2836,34 @@ async def _handle_discord_message(message, force=False):
         if getattr(message, "reference", None) and message.reference.message_id
         else ""
     )
+
+    # For DM channels (owner only), fetch recent message history so the agent
+    # has conversation context across session restarts. Issue: discord-dm-history
+    history_text = ""
+    if is_dm and access_tier == "owner":
+        try:
+            history_messages = []
+            async for hist_msg in message.channel.history(limit=15, before=message):
+                # Skip bot messages to reduce noise
+                if hist_msg.author.bot:
+                    continue
+                # Format: [timestamp] Author: content
+                ts = hist_msg.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+                author = "Owner" if hist_msg.author.id == message.author.id else hist_msg.author.name
+                content = hist_msg.content or "[no text]"
+                history_messages.append(f"[{ts}] {author}: {content}")
+
+            if history_messages:
+                # Reverse so oldest is first (chronological order)
+                history_messages.reverse()
+                history_text = "\n\n--- Recent conversation history (last 15 messages) ---\n" + "\n".join(history_messages) + "\n--- End of history ---\n"
+        except Exception as e:
+            print(f"  [history] Failed to fetch message history: {e}", flush=True)
+
     task_file.write_text(
         f"id: {task_id}\n"
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
-        f"task: {user_task_text}\n"
+        f"task: {user_task_text}{history_text}\n"
         f"source: discord\n"
         f"channel_id: {message.channel.id}\n"
         f"channel_name: {channel_name}\n"
