@@ -170,4 +170,4 @@ The three migration symptoms below were observed pre-v0.3.0 and all shipped fixe
 
 - [`docs/workspace-config.md`](workspace-config.md) — how the workspace path itself is resolved (different concern from sync)
 - [`docs/workspace-contract.md`](workspace-contract.md) — the workspace data contract
-- [`docs/release-process.md`](release-process.md) — when the next-version cuts that deprecate `sync-memory.sh` will land
+- [`docs/release-process.md`](release-process.md) — release timeline for `sync-memory.sh` removal (deprecated v0.3.0, removed v0.4.0)
