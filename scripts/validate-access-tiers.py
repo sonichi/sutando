@@ -29,7 +29,10 @@ import os
 import sys
 from pathlib import Path
 
-DEFAULT_PATH = Path.home() / ".claude" / "channels" / "discord" / "access.json"
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+from util_paths import claude_home_path  # noqa: E402
+
+DEFAULT_PATH = claude_home_path("channels", "discord", "access.json")
 
 
 def violations(data: dict, bot_ids: set[str]) -> list[str]:

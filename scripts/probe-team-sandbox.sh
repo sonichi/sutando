@@ -9,7 +9,7 @@
 #
 # Use before shipping changes to:
 #   - src/discord-bridge.py (tier classification / injection block)
-#   - ~/.claude/channels/discord/access.json
+#   - $CLAUDE_CONFIG_DIR/channels/discord/access.json (or ~/.claude/channels/... fallback)
 #   - any codex version bump
 #
 # Full validation log context: notes/team-tier-sandbox-validation.md
