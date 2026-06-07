@@ -163,7 +163,10 @@ The three migration symptoms below were observed pre-v0.3.0 and all shipped fixe
 - **`Another sync already in progress, exiting.`** — A previous cron tick is still running. The script self-clears stale locks after 10 minutes; if you see this repeatedly, check `/tmp/sync-workspace.log` for the previous tick's error.
 - **`refusing to push to non-host branch '...'`** — Someone manually `git checkout`-ed a feature branch in the workspace clone. Switch back to your `host/<host>/<wsId>` branch.
 - **Push fails with auth error** — Check that your machine has push access to the vault repo (`gh auth status` if you use the GitHub CLI). Read-only clones won't push.
-- **Push fails with macOS Keychain error `-25308` over SSH or plain cron** — `gh auth` stores the GitHub token in macOS Keychain, which is bound to a GUI session by default. Plain SSH sessions / system-level crontabs can't unlock it. **Fix:** run sync from a launchd plist scoped to your user GUI session (not system-level crontab), or unlock the keychain explicitly in the cron wrapper (`security unlock-keychain` — requires interactive password setup, not recommended for automation).
+- **Push fails with macOS Keychain error `-25308` over SSH or plain cron** — `gh auth` stores the GitHub token in macOS Keychain, which is bound to a GUI session by default. Plain SSH sessions / system-level crontabs can't unlock it. Three fixes (pick one):
+  1. **SSH remote URL** *(recommended for headless/SSH)*: configure the vault with `git@github.com:user/vault.git` instead of HTTPS — SSH uses key-based auth, no Keychain involved. Switch with `git -C ~/.sutando/workspace remote set-url origin git@github.com:user/vault.git`.
+  2. **`GH_TOKEN` in `.env`**: add `GH_TOKEN=<personal-access-token>` to `~/.sutando/workspace/.env`. git and `gh` respect this env var without touching Keychain.
+  3. **launchd plist** *(existing workaround)*: run sync from a launchd plist scoped to your user GUI session (not system-level crontab), or unlock the keychain explicitly in the cron wrapper (`security unlock-keychain` — requires interactive password setup, not recommended for automation).
 - **Merge conflicts on every tick** — Two hosts editing the same file in tight loops. Use append-only patterns or coordinate edits.
 
 ## Related
