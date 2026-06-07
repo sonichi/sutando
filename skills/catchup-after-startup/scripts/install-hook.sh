@@ -30,7 +30,9 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SETTINGS="${HOME}/.claude/settings.json"
+# Resolve settings.json via the M0 claude-home-path helper so $CLAUDE_CONFIG_DIR
+# is honored (claude-sutando users get the workspace-scoped settings file).
+SETTINGS="$(bash "$(cd "$HERE/../../.." && pwd)/scripts/sutando-config.sh" claude-home-path settings.json)"
 
 # Resolve REPO at install time (env wins, else probe common layouts).
 if [ -n "${SUTANDO_REPO_DIR:-}" ]; then

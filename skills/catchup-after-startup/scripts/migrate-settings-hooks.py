@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Migrate stale SessionStop hooks -> SessionEnd in ~/.claude/settings.json.
+"""Migrate stale SessionStop hooks -> SessionEnd in the Claude Code settings.json.
 
 SessionStop is not a valid Claude Code hook event — Claude Code silently
 no-ops it ("Unknown hook event 'SessionStop' was ignored"). Any entry
@@ -17,7 +17,11 @@ self-heals without requiring users to re-run install-hook.sh.
 Usage:
   python3 migrate-settings-hooks.py [path/to/settings.json]
 
-Default path is $HOME/.claude/settings.json.
+Default path resolves via $CLAUDE_CONFIG_DIR / $CLAUDE_HOME / ~/.claude
+(same precedence as src/util_paths.py:claude_home_path), so claude-sutando
+users with a workspace-scoped CCD operate on the right file. Callers
+should still pass an explicit path when one is known (install-hook.sh and
+catchup-after-startup.sh both do).
 """
 from __future__ import annotations
 
@@ -30,9 +34,9 @@ from pathlib import Path
 def _atomic_write(path: Path, content: str) -> None:
     """Write to a sibling tmp file then os.replace — same-fs atomic on POSIX.
 
-    `~/.claude/settings.json` is read by every Claude Code session for hook
-    config, allowed-tools, etc.; a half-written file breaks every subsequent
-    shell. Crash-during-write becomes "tmp file may be left behind" instead
+    Claude Code's settings.json is read by every session for hook config,
+    allowed-tools, etc.; a half-written file breaks every subsequent shell.
+    Crash-during-write becomes "tmp file may be left behind" instead
     of "settings.json corrupted." Mini's #1374 review catch.
     """
     tmp = path.with_name(path.name + ".tmp")
@@ -111,8 +115,19 @@ def migrate(settings_path: Path) -> int:
     return moved
 
 
+def _default_settings_path() -> Path:
+    """Resolve settings.json honoring $CLAUDE_CONFIG_DIR → $CLAUDE_HOME → ~/.claude.
+
+    Mirrors src/util_paths.py:claude_home_path. Kept inline (no util_paths
+    import) so this script stays drop-in runnable from $CLAUDE_CONFIG_DIR/skills/
+    after install, where src/ isn't on sys.path.
+    """
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.environ.get("CLAUDE_HOME") or "~/.claude"
+    return Path(os.path.expanduser(base)) / "settings.json"
+
+
 def main(argv: list[str]) -> int:
-    path = Path(argv[1]) if len(argv) > 1 else Path(os.path.expanduser("~/.claude/settings.json"))
+    path = Path(argv[1]) if len(argv) > 1 else _default_settings_path()
     migrate(path)
     return 0
 
