@@ -2844,12 +2844,15 @@ async def _handle_discord_message(message, force=False):
         try:
             history_messages = []
             async for hist_msg in message.channel.history(limit=15, before=message):
-                # Skip bot messages to reduce noise
-                if hist_msg.author.bot:
-                    continue
                 # Format: [timestamp] Author: content
+                # Include all messages (bot + owner) for full conversation context
                 ts = hist_msg.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
-                author = "Owner" if hist_msg.author.id == message.author.id else hist_msg.author.name
+                if hist_msg.author.bot:
+                    author = "Assistant"
+                elif hist_msg.author.id == message.author.id:
+                    author = "Owner"
+                else:
+                    author = hist_msg.author.name
                 content = hist_msg.content or "[no text]"
                 history_messages.append(f"[{ts}] {author}: {content}")
 
