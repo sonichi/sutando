@@ -40,7 +40,7 @@ import { personalPath } from '../../../src/util_paths.js';
 import { type Tier, loadAccessTiers, effectiveTier, toolAllowed, toolNeed } from './access-tier.js';
 
 _dotenvConfig({ path: new URL('../../../.env', import.meta.url).pathname, override: true });
-_dotenvConfig({ path: join(process.env.HOME ?? '', '.claude/channels/discord/.env'), override: false });
+_dotenvConfig({ path: join(process.env.CLAUDE_CONFIG_DIR ?? join(process.env.HOME ?? '', '.claude'), 'channels/discord/.env'), override: false });
 
 import { fileURLToPath } from 'node:url';
 import { voiceApiKey } from '../../../src/voice-key.js';
