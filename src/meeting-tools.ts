@@ -3,7 +3,7 @@
  * Zoom tools (summon, dismiss, join_zoom) live in skills/zoom/tools.ts.
  */
 
-import { execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 
@@ -30,8 +30,8 @@ export const joinGmeetTool: ToolDefinition = {
 		const meetUrl = `https://meet.google.com/${code}`;
 
 		try {
-			// Open in Chrome
-			execSync(`open -a "Google Chrome" "${meetUrl}"`, { timeout: 10_000 });
+			// Open in Chrome — execFileSync argv array bypasses shell (fixes #1451)
+			execFileSync('open', ['-a', 'Google Chrome', meetUrl], { timeout: 10_000 });
 			console.log(`${ts()} [join_gmeet] Opened ${meetUrl} in Chrome`);
 
 			// Wait for page to load
@@ -39,7 +39,7 @@ export const joinGmeetTool: ToolDefinition = {
 
 			// Focus the Meet tab and disable camera on preview screen
 			try {
-				execSync(`osascript -e '
+				execFileSync('/usr/bin/osascript', ['-e', `
 					tell application "Google Chrome"
 						set windowList to every window
 						repeat with w in windowList
@@ -56,23 +56,23 @@ export const joinGmeetTool: ToolDefinition = {
 							end repeat
 						end repeat
 					end tell
-				'`, { timeout: 5_000 });
+				`], { timeout: 5_000 });
 			} catch {}
 
 			// Disable camera by clicking the camera toggle button on the preview
 			// The button is in the center-bottom of the preview area
 			await new Promise(r => setTimeout(r, 1000));
 			try {
-				execSync(`/usr/bin/python3 -c "
+				execFileSync('/usr/bin/python3', ['-c', `
 import Quartz, subprocess, time
 
 # Get Chrome window position and size
 result = subprocess.run(['osascript', '-e', '''
-tell application \\\"System Events\\\"
-    tell process \\\"Google Chrome\\\"
+tell application "System Events"
+    tell process "Google Chrome"
         set winPos to position of front window
         set winSize to size of front window
-        return (item 1 of winPos as text) & \\\",\\\" & (item 2 of winPos as text) & \\\",\\\" & (item 1 of winSize as text) & \\\",\\\" & (item 2 of winSize as text)
+        return (item 1 of winPos as text) & "," & (item 2 of winPos as text) & "," & (item 1 of winSize as text) & "," & (item 2 of winSize as text)
     end tell
 end tell
 '''], capture_output=True, text=True, timeout=5)
@@ -90,48 +90,33 @@ if result.stdout.strip():
     evt = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventLeftMouseUp, (cx, cy), 0)
     Quartz.CGEventPost(Quartz.kCGHIDEventTap, evt)
     print(f'Clicked camera at ({cx},{cy})')
-"`, { timeout: 10_000 });
+`], { timeout: 10_000 });
 				console.log(`${ts()} [join_gmeet] Camera button clicked`);
 			} catch { console.log(`${ts()} [join_gmeet] Could not click camera button`); }
 
 			await new Promise(r => setTimeout(r, 500));
 
 			// Click Join now button
+			const joinBtnScript = `tell application "Google Chrome"
+				tell active tab of front window
+					execute javascript "
+						const btns = document.querySelectorAll(\\"button\\");
+						for (const b of btns) {
+							if (b.textContent.includes(\\"Join now\\") || b.textContent.includes(\\"Ask to join\\")) {
+								b.click();
+								\\"clicked\\";
+							}
+						}
+					"
+				end tell
+			end tell`;
 			try {
-				execSync(`osascript -e '
-					tell application "Google Chrome"
-						tell active tab of front window
-							execute javascript "
-								const btns = document.querySelectorAll(\\\"button\\\");
-								for (const b of btns) {
-									if (b.textContent.includes(\\\"Join now\\\") || b.textContent.includes(\\\"Ask to join\\\")) {
-										b.click();
-										\\\"clicked\\\";
-									}
-								}
-							"
-						end tell
-					end tell
-				'`, { timeout: 10_000 });
+				execFileSync('/usr/bin/osascript', ['-e', joinBtnScript], { timeout: 10_000 });
 				console.log(`${ts()} [join_gmeet] Clicked Join button`);
 			} catch {
 				await new Promise(r => setTimeout(r, 3000));
 				try {
-					execSync(`osascript -e '
-						tell application "Google Chrome"
-							tell active tab of front window
-								execute javascript "
-									const btns = document.querySelectorAll(\\\"button\\\");
-									for (const b of btns) {
-										if (b.textContent.includes(\\\"Join now\\\") || b.textContent.includes(\\\"Ask to join\\\")) {
-											b.click();
-											\\\"clicked\\\";
-										}
-									}
-								"
-							end tell
-						end tell
-					'`, { timeout: 10_000 });
+					execFileSync('/usr/bin/osascript', ['-e', joinBtnScript], { timeout: 10_000 });
 				} catch {}
 			}
 
@@ -178,11 +163,12 @@ export const callContactTool: ToolDefinition = {
 		const { name, message } = args as { name: string; message?: string };
 		try {
 			// Ensure Contacts.app is running
-			execSync('open -ga Contacts', { timeout: 5_000 });
+			execFileSync('open', ['-ga', 'Contacts'], { timeout: 5_000 });
 
 			// Search contacts via AppleScript — use first name for fuzzy matching
 			// (voice transcription often garbles last names, e.g. "Gmeets" vs "GMeet")
 			const firstName = name.split(/\s+/)[0];
+			// Only AppleScript escaping needed now — execFileSync bypasses shell interpretation
 			const safeName = firstName.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 			const script = `tell application "Contacts"
 	set output to ""
@@ -198,7 +184,7 @@ export const callContactTool: ToolDefinition = {
 	end repeat
 	return output
 end tell`;
-			const raw = execSync(`osascript -e '${script.replace(/'/g, "'\\''")}'`, { timeout: 15_000 }).toString().trim();
+			const raw = execFileSync('/usr/bin/osascript', ['-e', script], { timeout: 15_000 }).toString().trim();
 
 			// Parse results
 			const contacts: { name: string; phones: string[] }[] = [];
