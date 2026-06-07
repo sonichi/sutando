@@ -403,13 +403,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     lines = section.strip().split('\n')
                     title = lines[0].strip()
                     body = '\n'.join(lines[1:])
-                    # Skip preamble (sections without question metadata)
-                    if '**Status:**' not in body and '**Options:**' not in body:
+                    # Skip preamble before first ## header (contains the file title).
+                    if i == 0 or title.startswith('#'):
                         continue
-                    # Skip resolved/answered questions
+                    # Skip sections already marked resolved in title — free-form format
+                    # (post-#1265: no **Status:** markers; [RESOLVED ...] prefix instead).
+                    if title.startswith('[RESOLVED') or title.startswith('RESOLVED'):
+                        continue
+                    # Skip resolved/answered questions (structured format — optional marker)
                     if re.search(r'\*\*Status:\*\*\s*(resolved|answered|done|complete)', body, re.IGNORECASE):
                         continue
-                    # Extract question text — use body before first metadata field
+                    # Extract question text — use body before first metadata field (if any)
                     q_text = re.split(r'\*\*(?:Status|Options|Asked|Question):\*\*', body)[0].strip()
                     q_text = q_text if q_text else title
                     q = {"id": f"Q{i}", "text": title, "detail": q_text}
