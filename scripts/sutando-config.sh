@@ -105,6 +105,49 @@ print(resolve_claude_sutando_config_dir(), end='')
 "
     ;;
 
+  claude-home-path)
+    # Resolve a path under Claude Code's per-user home, mirroring
+    # `src/util_paths.py:claude_home_path()` for shell scripts. Use this
+    # instead of the inline `${CLAUDE_CONFIG_DIR:-$HOME/.claude}` anti-pattern
+    # so the deprecation-banner-on-fallback (added in #1534 for Python)
+    # also fires from bash callers when CLAUDE_CONFIG_DIR is unset.
+    #
+    # Resolution order (matches src/util_paths.py:claude_home_path):
+    #   1. $CLAUDE_CONFIG_DIR (per-runtime, workspace-scoped post-migrate)
+    #   2. $CLAUDE_HOME (legacy alt-host override, kept for tests)
+    #   3. ~/.claude/ (default — vanilla `claude` users; banner fires)
+    #
+    # Usage:
+    #   bash scripts/sutando-config.sh claude-home-path                            # base only
+    #   bash scripts/sutando-config.sh claude-home-path channels discord .env     # joined sub-path
+    #   bash scripts/sutando-config.sh claude-home-path skills quota-tracker/scripts/read-quota.py
+    #
+    # Banner suppression: SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER=1
+    if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+      _chp_base="$CLAUDE_CONFIG_DIR"
+    elif [ -n "${CLAUDE_HOME:-}" ]; then
+      _chp_base="$CLAUDE_HOME"
+    else
+      _chp_base="$HOME/.claude"
+      if [ "${SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER:-0}" != "1" ]; then
+        echo "claude-home-path: \$CLAUDE_CONFIG_DIR not set — falling back to ~/.claude/. Set CLAUDE_CONFIG_DIR before starting Sutando services (the \`claude-sutando\` shell function and src/startup.sh set it; ad-hoc launches must too) so channels/skills/hooks/sessions resolve to the workspace-scoped per-runtime location post-#1454. Suppress with SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER=1." >&2
+      fi
+    fi
+    # Expand leading ~ if present (covers e.g. CLAUDE_HOME=~/.claude-alt).
+    _chp_base="${_chp_base/#\~/$HOME}"
+    # Drop the subcommand from "$@" so remaining args are sub-path components.
+    shift
+    if [ "$#" -eq 0 ]; then
+      printf '%s' "$_chp_base"
+    else
+      _chp_joined="$_chp_base"
+      for _p in "$@"; do
+        _chp_joined="$_chp_joined/$_p"
+      done
+      printf '%s' "$_chp_joined"
+    fi
+    ;;
+
   core-config-dir-env-name)
     # v0.9 — print the env var name of the matching core_config_dirs entry.
     # Optional second arg picks by id or type; defaults to first type=claude.

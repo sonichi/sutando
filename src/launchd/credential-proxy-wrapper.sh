@@ -14,7 +14,7 @@ set -euo pipefail
 # launchd plist exports it (claude-sutando installs); otherwise falls back to
 # ~/.claude. launchd itself doesn't inherit shell env, so this fallback is the
 # vanilla-claude default unless the plist's EnvironmentVariables sets it.
-PROXY_SCRIPT="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/quota-tracker/scripts/credential-proxy.ts"
+PROXY_SCRIPT="$(bash "$(cd "$(dirname "$0")/../.." && pwd)/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
 
 # Resolve npx — launchd doesn't inherit the user's shell PATH.
 resolve_npx() {

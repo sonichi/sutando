@@ -1,0 +1,36 @@
+name: lint-claude-home-path
+
+# CI lint: refuse PRs that introduce NEW inline `${CLAUDE_CONFIG_DIR:-$HOME/.claude}`.
+#
+# All shell-side Claude home path resolution MUST go through the M0 helper:
+#   $(bash scripts/sutando-config.sh claude-home-path [subpath...])
+#
+# This workflow runs `scripts/lint-claude-home-path.sh --diff`, which scans
+# only ADDED lines in the PR — legacy offenders are migrated as part of the
+# sweep that introduces this lint and not flagged here.
+#
+# Companion to `lint-workspace-resolution.yml`. Together they enforce that
+# all path resolution goes through the documented helpers.
+
+on:
+  pull_request:
+    branches: [main, staging-workspace-revamp]
+  push:
+    branches: [main, staging-workspace-revamp]
+
+jobs:
+  lint-claude-home-path:
+    name: refuse new inline CLAUDE_CONFIG_DIR fallback
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    steps:
+      - name: Checkout (with full history for base-ref diff)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run lint in --diff mode
+        env:
+          BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || 'HEAD~1' }}
+        run: bash scripts/lint-claude-home-path.sh --diff

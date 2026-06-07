@@ -67,7 +67,7 @@ if [ -f .env ]; then
   else
     warn "Twilio not configured (optional — phone features disabled)"
   fi
-  _CHAN_BASE="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/channels"
+  _CHAN_BASE="$(bash "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/sutando-config.sh" claude-home-path channels)"
   if [ -f "$_CHAN_BASE/telegram/.env" ]; then
     pass "Telegram bot configured"
   else

@@ -332,7 +332,7 @@ preflight() {
   done
 
   # External channel envs — Discord / Telegram bot tokens live outside the repo .env
-  _CHAN_BASE="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/channels"
+  _CHAN_BASE="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels)"
   optional_total=$((optional_total + 1))
   if [ -f "$_CHAN_BASE/discord/.env" ] && grep -qE '^DISCORD_BOT_TOKEN=.+' "$_CHAN_BASE/discord/.env"; then
     optional_ok=$((optional_ok + 1))

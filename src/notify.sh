@@ -14,7 +14,7 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 TS=$(date +%s%3N)
 
 # Load tokens from channel configs
-CLAUDE_CFG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+CLAUDE_CFG_DIR="$(bash "$REPO_DIR/scripts/sutando-config.sh" claude-home-path)"
 DISCORD_TOKEN=$(grep DISCORD_BOT_TOKEN "$CLAUDE_CFG_DIR/channels/discord/.env" 2>/dev/null | cut -d= -f2-)
 DISCORD_USER_ID=$(python3 -c "import json; print(json.load(open('$CLAUDE_CFG_DIR/channels/discord/access.json')).get('allowFrom',[''])[0])" 2>/dev/null)
 
