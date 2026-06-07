@@ -45,9 +45,9 @@ Wrap **sub-daily** non-`main-loop` cron `prompt` bodies (e.g. `*/N`, `*/30`, hou
 
 ```json
 {
-  "name": "sync-memory",
+  "name": "sync-workspace",
   "cron": "*/30 * * * *",
-  "prompt": "Run: bash scripts/cron-gate.sh sync-memory bash scripts/sync-memory.sh — <human-readable description>."
+  "prompt": "Run: bash scripts/cron-gate.sh sync-workspace bash scripts/sync-workspace.sh — <human-readable description>."
 }
 ```
 

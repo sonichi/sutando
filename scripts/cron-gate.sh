@@ -8,11 +8,11 @@
 # Usage:
 #   bash scripts/cron-gate.sh <reason> <command...>
 #
-#   - <reason>: short label printed in the deferral message (e.g. "sync-memory")
+#   - <reason>: short label printed in the deferral message (e.g. "sync-workspace")
 #   - <command...>: the actual command to run if the queue is empty
 #
 # Example crons.example.json entry:
-#   "prompt": "Run: bash scripts/cron-gate.sh sync-memory bash scripts/sync-memory.sh"
+#   "prompt": "Run: bash scripts/cron-gate.sh sync-workspace bash scripts/sync-workspace.sh"
 #
 # Exit codes:
 #   0 — either deferred (queue non-empty) OR the wrapped command exited 0
