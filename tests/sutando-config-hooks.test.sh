@@ -74,6 +74,26 @@ bash "$SCRIPT" detect-missing "$T/does-not-exist.json" >/dev/null 2>&1
 bash "$SCRIPT" bogus-subcommand >/dev/null 2>&1
 [ "$?" = "3" ]; report "$?" "invalid subcommand exits 3"
 
+# Test 9: malformed JSON in detect-missing — explicit error + exit 1
+# (per Mini's PR #1500 review — previously this silently fell through)
+echo 'not valid json {{{' > "$T/malformed.json"
+err_out="$(bash "$SCRIPT" detect-missing "$T/malformed.json" 2>&1)"
+rc="$?"
+[ "$rc" = "1" ] && echo "$err_out" | grep -q "not valid JSON"
+report "$?" "detect-missing emits explicit error + exit 1 on malformed JSON"
+
+# Test 10: malformed JSON in install — refuses to edit
+err_out2="$(bash "$SCRIPT" install "$T/malformed.json" 2>&1)"
+rc2="$?"
+[ "$rc2" = "1" ] && echo "$err_out2" | grep -q "not valid JSON"
+report "$?" "install refuses to edit malformed JSON (exit 1)"
+
+# Test 11: malformed JSON in migration-notice — skip cleanly, exit 0
+err_out3="$(bash "$SCRIPT" migration-notice "$T/malformed.json" "$T/new.json" 2>&1)"
+rc3="$?"
+[ "$rc3" = "0" ] && echo "$err_out3" | grep -q "malformed"
+report "$?" "migration-notice skips malformed input cleanly (exit 0 + warn)"
+
 rm -rf "$T"
 echo
 echo "Results: $pass passed, $fail failed"

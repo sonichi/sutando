@@ -84,6 +84,20 @@ sutando-plus/scripts/sync-workspace.sh
 EOF
 }
 
+_validate_json() {
+  # Per Mini's PR #1500 review: previously the script silently `|| true`'d past
+  # malformed JSON, hiding real corruption (manual edits gone wrong, partial
+  # writes). This validator gives a clean error message instead.
+  local file="$1"
+  if ! jq empty "$file" 2>/dev/null; then
+    echo "error: $file is not valid JSON — fix or back up + re-init" >&2
+    echo "  diagnostic:" >&2
+    jq empty "$file" 2>&1 | sed 's/^/    /' >&2 || true
+    return 1
+  fi
+  return 0
+}
+
 cmd_detect_missing() {
   local settings="${1:-}"
   if [ -z "$settings" ]; then
@@ -94,6 +108,9 @@ cmd_detect_missing() {
     echo "detect-missing: $settings — file not found" >&2
     echo "  (treating as missing all Sutando hooks)" >&2
     exit 1
+  fi
+  if ! _validate_json "$settings"; then
+    return 1
   fi
   local want_cmd; want_cmd="$(_catchup_hook_command)"
   # Check SessionEnd entries for the catchup hook (the one we auto-install).
@@ -130,6 +147,12 @@ cmd_install() {
 
   mkdir -p "$(dirname "$settings")"
   [ -f "$settings" ] || echo '{}' > "$settings"
+  # Validate JSON before any jq edit — per Mini's PR #1500 review, malformed
+  # input would previously cause `mv tmp settings` to silently overwrite with
+  # a partial state.
+  if ! _validate_json "$settings"; then
+    exit 1
+  fi
 
   if [ "$with_catchup" = "1" ]; then
     local cmd; cmd="$(_catchup_hook_command)"
@@ -190,6 +213,18 @@ cmd_migration_notice() {
   fi
   if [ ! -f "$old" ]; then
     # No old settings.json — nothing to drop.
+    return 0
+  fi
+  # Per Mini's PR #1500 review: validate input JSON instead of silently
+  # `|| true`'ing through malformed files. Warn-but-continue here (vs hard
+  # error in detect/install) since migration-notice is informational and
+  # malformed input simply means "we can't compute the diff cleanly."
+  if ! _validate_json "$old"; then
+    echo "  (migration-notice: skipping — old settings.json malformed)" >&2
+    return 0
+  fi
+  if [ -f "$new" ] && ! _validate_json "$new"; then
+    echo "  (migration-notice: skipping — new settings.json malformed)" >&2
     return 0
   fi
   # Build comparable command strings: <event>|<command>.
