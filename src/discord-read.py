@@ -6,7 +6,10 @@ Exits after printing — never starts a persistent bot connection.
 Usage:
     python3 src/discord-read.py <channel_id> [--limit N] [--after MSG_ID]
 
-Requires DISCORD_BOT_TOKEN in ~/.claude/channels/discord/.env or env var.
+Requires DISCORD_BOT_TOKEN in $CLAUDE_CONFIG_DIR/channels/discord/.env
+(resolved via src/util_paths.py:claude_home_path; falls back to
+~/.claude/channels/discord/.env if neither CLAUDE_CONFIG_DIR nor CLAUDE_HOME
+is set) or set DISCORD_BOT_TOKEN directly as an env var.
 """
 import json
 import os
