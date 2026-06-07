@@ -122,6 +122,13 @@ json.dump({'claudeAiOauth':{'accessToken':t}}, open(p,'w'))
 " 2>/dev/null; then
           chmod 600 "$_ccd/.credentials.json"
           echo "  ~ env-token-persist: wrote .credentials.json from \$$_env_var_used (mode 600)"
+          # Sidecar provenance file (#1504) — never read by Claude Code.
+          # Records how this credentials file was produced for audit/migration tools.
+          _p="$_ccd/.credentials.source.json" _v="$_env_var_used" python3 -c "
+import json,os,datetime
+p=os.environ['_p']; v=os.environ['_v']
+json.dump({'source':'env','env_var':v,'carried_at':datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),'persist_block_version':1},open(p,'w'))
+" 2>/dev/null && chmod 600 "$_ccd/.credentials.source.json" || true
         else
           echo "  ~ env-token-persist: write failed (check target perms + python3 on PATH)"
         fi
