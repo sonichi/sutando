@@ -238,7 +238,7 @@ def _migrate_inrepo_build_log(workspace: Path) -> bool:
     runtime artifact and belongs in the workspace, not the repo. Historic
     placement at the repo root polluted `git status` and split-brained
     dashboard.py / health-check.py (which already read from workspace) vs
-    voice-context.ts / sync-memory.sh (which still wrote to repo). This
+    voice-context.ts / sync-memory.sh (legacy; now sync-workspace.sh). This
     migration fixes the split.
 
     Non-destructive on collision (skip if workspace already has build_log.md),

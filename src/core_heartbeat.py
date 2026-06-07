@@ -57,7 +57,7 @@ CORES_DIR = WORKSPACE / "state" / "cores"
 
 
 def _hostname() -> str:
-    """Short hostname without domain. Mirrors what sync-memory.sh uses for
+    """Short hostname without domain. Mirrors what sync-workspace.sh uses for
     machine-<host>/ dirs, so the .alive file is recognizable across the
     fleet's other state files."""
     return socket.gethostname().split(".")[0]
