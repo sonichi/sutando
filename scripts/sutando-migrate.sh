@@ -589,6 +589,7 @@ FORCE=0
 ROLLBACK_ID=""
 NO_CONFIRM=0
 NO_CLAUDE_IMPORT=0
+NO_HOOK_BRIDGE=0
 
 EXPLAIN_PATH=""
 while [ $# -gt 0 ]; do
@@ -617,6 +618,7 @@ while [ $# -gt 0 ]; do
         --backup-id) ROLLBACK_ID="$2"; shift 2 ;;
         --no-confirm|--yes|-y) NO_CONFIRM=1; shift ;;  # skip pre-flight prompt (for CI / scripted runs)
         --no-claude-import) NO_CLAUDE_IMPORT=1; shift ;;  # skip auto-invocation of sutando-shell-setup.sh --import after commit (advanced; see Lucy's Maddy report 2026-06-06)
+        --no-hook-bridge) NO_HOOK_BRIDGE=1; shift ;;  # skip auto-invocation of sutando-config-hooks.sh (Option D from #design 2026-06-07; see scripts/sutando-config-hooks.sh header)
         --help|-h)
             sed -n '1,80p' "${BASH_SOURCE[0]}"
             exit 0
@@ -1709,6 +1711,34 @@ commit_main() {
             fi
         fi
     fi  # DELETE_SOURCE gate for slug-rename bridge
+
+    # Hook bridge — Option D from owner's #design 2026-06-07 design discussion.
+    # Auto-re-install Sutando-owned hooks into the per-runtime CLAUDE_CONFIG_DIR/settings.json
+    # and print a notice listing any third-party hooks that referenced
+    # ~/.claude/hooks/... paths (which can't move automatically). See
+    # scripts/sutando-config-hooks.sh header for the full rationale.
+    # Opt out with --no-hook-bridge.
+    if [ "$NO_HOOK_BRIDGE" = "0" ] && [ "$DELETE_SOURCE" = "0" ]; then
+        local _hook_helper="$(dirname "$0")/sutando-config-hooks.sh"
+        local _new_ccd; _new_ccd="$(bash "$(dirname "$0")/sutando-config.sh" claude-sutando-config-dir 2>/dev/null || true)"
+        local _new_settings="${_new_ccd}/settings.json"
+        local _old_settings="$HOME/.claude/settings.json"
+        if [ -x "$_hook_helper" ] || [ -f "$_hook_helper" ]; then
+            if [ -n "$_new_ccd" ]; then
+                echo
+                echo "sutando-migrate: bridging hooks via sutando-config-hooks.sh ..."
+                # Idempotent install of catchup hook; project hooks are repo-level (already in repo's .claude/settings.json).
+                bash "$_hook_helper" install "$_new_settings" --with-catchup-hook || \
+                    echo "  hook install: failed (rc=$?) — re-run manually: bash scripts/sutando-config-hooks.sh install \"$_new_settings\"" >&2
+                # Show dropped third-party hooks (non-Sutando) the user needs to re-add.
+                bash "$_hook_helper" migration-notice "$_old_settings" "$_new_settings" || true
+            else
+                echo "  hook bridge: skipped (couldn't resolve claude-sutando-config-dir; check sutando.config.local.json)" >&2
+            fi
+        else
+            echo "  hook bridge: skipped (scripts/sutando-config-hooks.sh not found at expected path; run manually after migrate)"
+        fi
+    fi
 
     echo
     echo "sutando-migrate: COMMIT complete. Verify with: bash scripts/sutando-migrate.sh verify"

@@ -1,0 +1,258 @@
+#!/bin/bash
+# sutando-config-hooks.sh — hook helper for the per-runtime CLAUDE_CONFIG_DIR
+# migration (Option D from #design 2026-06-07 design discussion).
+#
+# Background: when Sutando migrates a user from `~/.claude/` to a per-runtime
+# `$CLAUDE_CONFIG_DIR` (typically `<workspace>/.claude-sutando/`), hooks that
+# reference literal `~/.claude/hooks/...` paths in their `command:` strings
+# can't move cleanly. Owner's design (Option D, 01:38Z): drop those hooks at
+# migration time and (i) auto-re-install Sutando-owned hooks pointing at the
+# correct workspace paths, and (ii) print a notice listing dropped non-Sutando
+# entries so the user can re-add manually.
+#
+# This script is parametric on the target settings.json path — unlike the two
+# existing installers (`src/install-claude-hooks.sh` writes to repo's
+# `.claude/settings.json`; `skills/catchup-after-startup/scripts/install-hook.sh`
+# writes to `~/.claude/settings.json`), this one can target any settings.json,
+# making it suitable for `$CLAUDE_CONFIG_DIR/settings.json` post-migration.
+#
+# Subcommands:
+#   detect-missing <settings.json>
+#       Returns 0 if all known Sutando hooks are present, 1 if any missing.
+#       Prints a list of missing hooks to stderr.
+#
+#   install <settings.json> [--with-catchup-hook] [--with-project-hooks]
+#       Idempotent re-install of Sutando hook entries. Default: catchup hook
+#       only (the SessionEnd → session-handoff.sh entry from #1056). Add
+#       --with-project-hooks to also install the PreCompact + Stop entries
+#       from src/install-claude-hooks.sh.
+#
+#   migration-notice <old-settings.json> <new-settings.json>
+#       Diff hook command strings between old and new. Print user-facing notice
+#       listing entries that were dropped during migration (i.e. were in old
+#       but not new), filtered to non-Sutando ones — those need manual re-add.
+#
+# Usage examples:
+#   bash scripts/sutando-config-hooks.sh detect-missing "$CLAUDE_CONFIG_DIR/settings.json"
+#   bash scripts/sutando-config-hooks.sh install "$CLAUDE_CONFIG_DIR/settings.json"
+#   bash scripts/sutando-config-hooks.sh migration-notice ~/.claude/settings.json "$CLAUDE_CONFIG_DIR/settings.json"
+#
+# Exit codes:
+#   0 — success
+#   1 — operation failed (missing hooks for detect; jq edit failed for install)
+#   2 — jq missing
+#   3 — invalid args
+
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "error: jq is required" >&2
+  exit 2
+fi
+
+# Sutando-owned hook commands (canonical forms — must match what the existing
+# installers write, so detect-missing recognizes them). The catchup hook
+# resolves SUTANDO_REPO_DIR/src/session-handoff.sh; the project hooks live in
+# project-level .claude/settings.json (NOT user-level), so they're not part of
+# this migration's scope unless --with-project-hooks is set.
+#
+# Per `feedback_claude_code_hook_scoping`: catchup hook is USER-level (fires
+# everywhere), project hooks are PROJECT-level (fire only when Claude runs in
+# this repo). The migration target is USER-level CLAUDE_CONFIG_DIR.
+
+_catchup_hook_command() {
+  # Mirror skills/catchup-after-startup/scripts/install-hook.sh logic.
+  if [ -n "${SUTANDO_REPO_DIR:-}" ]; then
+    echo "bash \"$SUTANDO_REPO_DIR/src/session-handoff.sh\" \"\${TRANSCRIPT_PATH:-}\""
+  else
+    echo "bash \"$REPO_DIR/src/session-handoff.sh\" \"\${TRANSCRIPT_PATH:-}\""
+  fi
+}
+
+_known_sutando_substrings() {
+  # Stable substrings identifying Sutando-owned hooks in any settings.json,
+  # used by migration-notice to filter what NOT to flag. Match on command
+  # contains. Order doesn't matter.
+  cat <<EOF
+src/session-handoff.sh
+src/check-pending-tasks.sh
+src/watch-tasks-stream.sh
+sutando/src/
+sutando-plus/scripts/sync-workspace.sh
+EOF
+}
+
+cmd_detect_missing() {
+  local settings="${1:-}"
+  if [ -z "$settings" ]; then
+    echo "usage: detect-missing <settings.json>" >&2
+    exit 3
+  fi
+  if [ ! -f "$settings" ]; then
+    echo "detect-missing: $settings — file not found" >&2
+    echo "  (treating as missing all Sutando hooks)" >&2
+    exit 1
+  fi
+  local want_cmd; want_cmd="$(_catchup_hook_command)"
+  # Check SessionEnd entries for the catchup hook (the one we auto-install).
+  local found
+  found="$(jq --arg cmd "$want_cmd" '
+    [.hooks.SessionEnd // [] | .[] | .hooks // [] | .[] | select(.type=="command" and .command==$cmd)] | length
+  ' "$settings" 2>/dev/null || echo 0)"
+  if [ "${found:-0}" -ge 1 ]; then
+    echo "detect-missing: ok — catchup hook present"
+    return 0
+  else
+    echo "detect-missing: MISSING — SessionEnd catchup hook not found in $settings" >&2
+    echo "  expected command: $want_cmd" >&2
+    return 1
+  fi
+}
+
+cmd_install() {
+  local settings="${1:-}"; shift || true
+  if [ -z "$settings" ]; then
+    echo "usage: install <settings.json> [--with-catchup-hook] [--with-project-hooks]" >&2
+    exit 3
+  fi
+  local with_catchup=1  # default on
+  local with_project=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --with-catchup-hook) with_catchup=1; shift ;;
+      --no-catchup-hook) with_catchup=0; shift ;;
+      --with-project-hooks) with_project=1; shift ;;
+      *) echo "install: unknown flag $1" >&2; exit 3 ;;
+    esac
+  done
+
+  mkdir -p "$(dirname "$settings")"
+  [ -f "$settings" ] || echo '{}' > "$settings"
+
+  if [ "$with_catchup" = "1" ]; then
+    local cmd; cmd="$(_catchup_hook_command)"
+    # Idempotent jq edit: skip if an equivalent command already exists.
+    local exists
+    exists="$(jq --arg cmd "$cmd" '
+      [.hooks.SessionEnd // [] | .[] | .hooks // [] | .[] | select(.type=="command" and .command==$cmd)] | length
+    ' "$settings")"
+    if [ "${exists:-0}" -ge 1 ]; then
+      echo "install: SessionEnd catchup hook already present — skipping"
+    else
+      local tmp; tmp="$(mktemp)"
+      jq --arg cmd "$cmd" '
+        .hooks //= {} | .hooks.SessionEnd //= [] | .hooks.SessionEnd += [{
+          "hooks": [{"type": "command", "command": $cmd}]
+        }]
+      ' "$settings" > "$tmp"
+      mv "$tmp" "$settings"
+      echo "install: added SessionEnd catchup hook → $settings"
+    fi
+  fi
+
+  if [ "$with_project" = "1" ]; then
+    # Project hooks installation. These belong in REPO/.claude/settings.json,
+    # not user-level settings.json. The flag exists for callers that want
+    # one-stop install of both classes; for migration use, default-off.
+    local pre1="cp \"\$TRANSCRIPT_PATH\" \"\$HOME/Desktop/sutando-conversations/\$(date +%Y-%m-%dT%H-%M-%S).jsonl\""
+    local pre2="bash \"$REPO_DIR/src/session-handoff.sh\" \"\$TRANSCRIPT_PATH\""
+    local stop1="bash \"$REPO_DIR/src/check-pending-tasks.sh\""
+    for spec in "PreCompact|$pre1" "PreCompact|$pre2" "Stop|$stop1"; do
+      local event="${spec%%|*}"
+      local cmd="${spec#*|}"
+      local exists
+      exists="$(jq --arg ev "$event" --arg cmd "$cmd" '
+        [.hooks[$ev] // [] | .[] | .hooks // [] | .[] | select(.type=="command" and .command==$cmd)] | length
+      ' "$settings")"
+      if [ "${exists:-0}" -ge 1 ]; then
+        echo "install: $event project hook already present — skipping"
+      else
+        local tmp; tmp="$(mktemp)"
+        jq --arg ev "$event" --arg cmd "$cmd" '
+          .hooks //= {} | .hooks[$ev] //= [] | .hooks[$ev] += [{
+            "hooks": [{"type": "command", "command": $cmd}]
+          }]
+        ' "$settings" > "$tmp"
+        mv "$tmp" "$settings"
+        echo "install: added $event project hook → $settings"
+      fi
+    done
+  fi
+}
+
+cmd_migration_notice() {
+  local old="${1:-}"; local new="${2:-}"
+  if [ -z "$old" ] || [ -z "$new" ]; then
+    echo "usage: migration-notice <old-settings.json> <new-settings.json>" >&2
+    exit 3
+  fi
+  if [ ! -f "$old" ]; then
+    # No old settings.json — nothing to drop.
+    return 0
+  fi
+  # Build comparable command strings: <event>|<command>.
+  local _flatten_jq='
+    [(.hooks // {}) | to_entries[] | .key as $ev | (.value // [] | .[] | .hooks // [] | .[] | select(.type=="command") | "\($ev)|\(.command)")] | sort | .[]
+  '
+  local _tmp_old _tmp_new
+  _tmp_old="$(mktemp)"; _tmp_new="$(mktemp)"
+  jq -r "$_flatten_jq" "$old" > "$_tmp_old" 2>/dev/null || true
+  if [ -f "$new" ]; then
+    jq -r "$_flatten_jq" "$new" > "$_tmp_new" 2>/dev/null || true
+  else
+    : > "$_tmp_new"
+  fi
+  # Lines in old but not new = dropped.
+  local _tmp_dropped; _tmp_dropped="$(mktemp)"
+  comm -23 "$_tmp_old" "$_tmp_new" > "$_tmp_dropped" || true
+
+  # Filter out Sutando-owned hooks (we know those got migrated by the install
+  # subcommand or are simply re-installable from canonical sources).
+  local _tmp_third; _tmp_third="$(mktemp)"
+  local sutando_pat; sutando_pat="$(_known_sutando_substrings | paste -sd '|' -)"
+  grep -vE "$sutando_pat" "$_tmp_dropped" > "$_tmp_third" || true
+
+  if [ -s "$_tmp_third" ]; then
+    echo
+    echo "~ Hooks dropped during migration (literal ~/.claude/ paths or third-party scripts can't move to workspace automatically):"
+    while IFS='|' read -r ev cmd; do
+      [ -z "$ev" ] && continue
+      # Truncate long commands for display.
+      local disp="$cmd"
+      [ "${#disp}" -gt 120 ] && disp="${disp:0:117}..."
+      echo "    - $ev: $disp"
+    done < "$_tmp_third"
+    echo "  Re-add manually by editing $new under \"hooks\" — match the existing entry shape."
+    echo "  For Sutando-owned hooks (auto-restored): no action needed."
+  fi
+
+  rm -f "$_tmp_old" "$_tmp_new" "$_tmp_dropped" "$_tmp_third"
+}
+
+# Main dispatch
+MODE="${1:-}"; shift || true
+case "$MODE" in
+  detect-missing) cmd_detect_missing "$@" ;;
+  install) cmd_install "$@" ;;
+  migration-notice) cmd_migration_notice "$@" ;;
+  ""|--help|-h|help)
+    cat <<EOF
+sutando-config-hooks.sh — hook helper for per-runtime CLAUDE_CONFIG_DIR migration
+
+Subcommands:
+  detect-missing <settings.json>
+  install <settings.json> [--with-catchup-hook] [--with-project-hooks]
+  migration-notice <old-settings.json> <new-settings.json>
+
+See file header for design context (Option D from #design 2026-06-07).
+EOF
+    [ "$MODE" = "" ] && exit 3 || exit 0
+    ;;
+  *)
+    echo "sutando-config-hooks: unknown subcommand: $MODE" >&2
+    echo "Try: bash $0 --help" >&2
+    exit 3
+    ;;
+esac
