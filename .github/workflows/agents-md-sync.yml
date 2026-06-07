@@ -1,0 +1,22 @@
+name: AGENTS.md sync check
+on:
+  pull_request:
+    paths:
+      - CLAUDE.md
+      - AGENTS.md
+      - scripts/agents-md-sync.sh
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Regenerate AGENTS.md
+        run: bash scripts/agents-md-sync.sh
+      - name: Check if AGENTS.md is in sync
+        run: |
+          if ! git diff --exit-code AGENTS.md; then
+            echo "❌ AGENTS.md is out of sync with CLAUDE.md"
+            echo "Run: bash scripts/agents-md-sync.sh && git add AGENTS.md"
+            exit 1
+          fi
+          echo "✅ AGENTS.md is in sync"
