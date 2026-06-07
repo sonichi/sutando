@@ -94,6 +94,41 @@ rc3="$?"
 [ "$rc3" = "0" ] && echo "$err_out3" | grep -q "malformed"
 report "$?" "migration-notice skips malformed input cleanly (exit 0 + warn)"
 
+# Test 12: write-manifest + show-manifest round-trip
+T12="$(mktemp -d)"
+export CLAUDE_CONFIG_DIR="$T12"
+bash "$SCRIPT" write-manifest "test-id" "src/custom-hook.sh" "src/installer.sh" >/dev/null 2>&1
+manifest_content="$(bash "$SCRIPT" show-manifest 2>/dev/null)"
+echo "$manifest_content" | jq -e '.sutando_owned_hooks | length >= 1' >/dev/null 2>&1
+report "$?" "write-manifest creates manifest with 1 entry"
+
+# Test 13: write-manifest is idempotent (same id twice → still 1 entry)
+bash "$SCRIPT" write-manifest "test-id" "src/custom-hook.sh" "src/installer.sh" >/dev/null 2>&1
+entry_count="$(bash "$SCRIPT" show-manifest 2>/dev/null | jq '.sutando_owned_hooks | length' 2>/dev/null || echo 0)"
+[ "$entry_count" = "1" ]; report "$?" "write-manifest is idempotent (same id → count stays at 1)"
+
+# Test 14: migration-notice uses manifest substrings when manifest exists
+# Custom hook in manifest (not in hardcoded list) should be filtered out
+bash "$SCRIPT" write-manifest "custom-corp-hook" "src/custom-hook.sh" "src/installer.sh" >/dev/null 2>&1
+cat > "$T12/old.json" << 'EOJ'
+{
+  "hooks": {
+    "SessionEnd": [
+      {"hooks": [{"type": "command", "command": "bash /repo/src/custom-hook.sh --arg"}]},
+      {"hooks": [{"type": "command", "command": "bash $HOME/.claude/hooks/unknown-third-party.sh"}]}
+    ]
+  }
+}
+EOJ
+echo '{}' > "$T12/new.json"
+notice14="$(bash "$SCRIPT" migration-notice "$T12/old.json" "$T12/new.json" 2>&1)"
+echo "$notice14" | grep -q "unknown-third-party.sh"
+report "$?" "migration-notice: manifest-registered hook flags unknown third-party"
+echo "$notice14" | grep -qv "custom-hook.sh"
+report "$?" "migration-notice: manifest-registered hook NOT flagged as dropped"
+unset CLAUDE_CONFIG_DIR
+rm -rf "$T12"
+
 rm -rf "$T"
 echo
 echo "Results: $pass passed, $fail failed"
