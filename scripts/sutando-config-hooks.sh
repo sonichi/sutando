@@ -71,10 +71,30 @@ _catchup_hook_command() {
   fi
 }
 
+_sutando_hook_manifest() {
+  # Path to the manifest that installers write and _known_sutando_substrings reads.
+  # Defaults to ~/.claude/sutando-hook-manifest.json (user-level config dir).
+  # Override by setting CLAUDE_CONFIG_DIR before running this script.
+  echo "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sutando-hook-manifest.json"
+}
+
 _known_sutando_substrings() {
-  # Stable substrings identifying Sutando-owned hooks in any settings.json,
-  # used by migration-notice to filter what NOT to flag. Match on command
-  # contains. Order doesn't matter.
+  # Read from the manifest first; fall back to the hardcoded list if the manifest
+  # is absent or unreadable. Manifest is written by install-claude-hooks.sh and
+  # skills/catchup-after-startup/scripts/install-hook.sh on each install run.
+  # See: https://github.com/sonichi/sutando/issues/1502
+  local manifest; manifest="$(_sutando_hook_manifest)"
+  if [ -f "$manifest" ]; then
+    local from_manifest
+    from_manifest="$(jq -r '.sutando_owned_hooks // [] | .[].command_substring' "$manifest" 2>/dev/null || true)"
+    if [ -n "$from_manifest" ]; then
+      echo "$from_manifest"
+      return
+    fi
+    # Manifest exists but produced no output (empty list or jq error) — fall through.
+  fi
+  # Hardcoded fallback: the 5 stable substrings known at #1500 ship time.
+  # New installers should write to the manifest rather than extending this list.
   cat <<EOF
 src/session-handoff.sh
 src/check-pending-tasks.sh
@@ -82,6 +102,30 @@ src/watch-tasks-stream.sh
 sutando/src/
 sutando-plus/scripts/sync-workspace.sh
 EOF
+}
+
+# _write_hook_manifest <id> <command_substring> <installed_by>
+# Idempotent: no-op if <id> is already present in the manifest.
+# Called by install-claude-hooks.sh and install-hook.sh after installing each hook.
+_write_hook_manifest() {
+  local id="$1" substring="$2" installed_by="$3"
+  local manifest; manifest="$(_sutando_hook_manifest)"
+  mkdir -p "$(dirname "$manifest")"
+  [ -f "$manifest" ] || printf '{"version":1,"sutando_owned_hooks":[]}\n' > "$manifest"
+  # Validate before edit (don't clobber a corrupt manifest with a worse one).
+  if ! jq empty "$manifest" 2>/dev/null; then
+    echo "  [manifest] $manifest is not valid JSON — skipping write (run jq-check to diagnose)" >&2
+    return 1
+  fi
+  # Idempotent: skip if id already present.
+  if jq -e --arg id "$id" '.sutando_owned_hooks // [] | map(.id == $id) | any' "$manifest" >/dev/null 2>&1; then
+    return 0
+  fi
+  local tmp; tmp="$(mktemp)"
+  jq --arg id "$id" --arg sub "$substring" --arg by "$installed_by" \
+    '.sutando_owned_hooks //= [] | .sutando_owned_hooks += [{"id":$id,"command_substring":$sub,"installed_by":$by}]' \
+    "$manifest" > "$tmp" && mv "$tmp" "$manifest"
+  echo "  [manifest] registered hook $id → $manifest"
 }
 
 _validate_json() {
@@ -272,6 +316,11 @@ case "$MODE" in
   detect-missing) cmd_detect_missing "$@" ;;
   install) cmd_install "$@" ;;
   migration-notice) cmd_migration_notice "$@" ;;
+  write-manifest) _write_hook_manifest "$@" ;;
+  show-manifest)
+    manifest="$(_sutando_hook_manifest)"
+    if [ -f "$manifest" ]; then cat "$manifest"; else echo "(manifest not found at $manifest)"; fi
+    ;;
   ""|--help|-h|help)
     cat <<EOF
 sutando-config-hooks.sh — hook helper for per-runtime CLAUDE_CONFIG_DIR migration
@@ -280,8 +329,11 @@ Subcommands:
   detect-missing <settings.json>
   install <settings.json> [--with-catchup-hook] [--with-project-hooks]
   migration-notice <old-settings.json> <new-settings.json>
+  write-manifest <id> <command_substring> <installed_by>
+  show-manifest
 
 See file header for design context (Option D from #design 2026-06-07).
+See https://github.com/sonichi/sutando/issues/1502 for manifest design.
 EOF
     [ "$MODE" = "" ] && exit 3 || exit 0
     ;;

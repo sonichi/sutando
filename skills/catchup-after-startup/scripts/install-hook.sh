@@ -63,7 +63,8 @@ fi
 python3 "$HERE/migrate-settings-hooks.py" "$SETTINGS"
 
 python3 <<PYEOF
-import json, os
+import json, os, pathlib
+
 p = "$SETTINGS"
 cmd = '''$HOOK_CMD'''
 s = json.load(open(p))
@@ -94,4 +95,22 @@ else:
     atomic_write(p, json.dumps(s, indent=2))
     print("installed SessionEnd hook → " + p)
     print("hook command:", cmd)
+
+# Register in the sutando-hook-manifest so migration-notice can identify this
+# hook without relying on the hardcoded substring list. (#1502)
+manifest = pathlib.Path(os.environ.get("CLAUDE_CONFIG_DIR", str(pathlib.Path.home() / ".claude"))) / "sutando-hook-manifest.json"
+manifest.parent.mkdir(parents=True, exist_ok=True)
+if not manifest.exists():
+    manifest.write_text('{"version":1,"sutando_owned_hooks":[]}\n')
+try:
+    data = json.loads(manifest.read_text())
+    owned = data.setdefault("sutando_owned_hooks", [])
+    entry_id = "catchup-session-end"
+    if not any(e.get("id") == entry_id for e in owned):
+        owned.append({"id": entry_id, "command_substring": "src/session-handoff.sh",
+                      "installed_by": "skills/catchup-after-startup/scripts/install-hook.sh"})
+        atomic_write(str(manifest), json.dumps(data, indent=2))
+        print(f"  [manifest] registered {entry_id} → {manifest}")
+except Exception as e:
+    print(f"  [manifest] write skipped ({e})")
 PYEOF

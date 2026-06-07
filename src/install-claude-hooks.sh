@@ -141,3 +141,12 @@ for entry in "${DEPRECATED_HOOKS[@]}"; do
 done
 
 echo "install-claude-hooks: added=$ADDED skipped=$SKIPPED removed=$REMOVED → $SETTINGS"
+
+# Register hooks in the sutando-hook-manifest so migration-notice can identify
+# them without relying on the hardcoded substring list. (#1502)
+HOOKS_SCRIPT="$REPO_DIR/scripts/sutando-config-hooks.sh"
+if [ -f "$HOOKS_SCRIPT" ]; then
+  bash "$HOOKS_SCRIPT" write-manifest "project-pre-compact-handoff" "src/session-handoff.sh" "src/install-claude-hooks.sh" 2>/dev/null || true
+  bash "$HOOKS_SCRIPT" write-manifest "project-pre-compact-archive" "sutando-conversations/" "src/install-claude-hooks.sh" 2>/dev/null || true
+  bash "$HOOKS_SCRIPT" write-manifest "project-stop-pending-tasks" "src/check-pending-tasks.sh" "src/install-claude-hooks.sh" 2>/dev/null || true
+fi
