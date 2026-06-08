@@ -26,7 +26,6 @@ SKILL = Path(__file__).resolve().parents[1]
 TTS = REPO / "skills" / "gemini-tts" / "scripts" / "synthesize.sh"
 WORKDIR = SKILL / "results" / "audio"
 SR = 16000                                          # capture sample rate
-AUDIO_DEVICE = os.environ.get("VTH_AUDIO_DEVICE", ":0")  # avfoundation: no video, audio dev 0
 # Recorder: sox `rec`. ffmpeg's avfoundation input drops ~75% of mic samples on
 # this Mac (it captured ~1s for an 8s request, 2026-06-06), which truncated every
 # reply and made the whole suite score 0. sox/CoreAudio records the full duration.
