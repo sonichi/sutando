@@ -167,12 +167,12 @@ skills/voice-agent-test-harness/
 **v1 — implemented and component-tested** (macOS):
 
 - `audio.py` TTS — `gemini-tts` skill → mp3 → `afplay`; `say` offline fallback.
-- `audio.py` mic capture + onset — `ffmpeg` avfoundation capture to wav + numpy RMS-window onset/endpoint detection. Calibration gate confirms the mic path is live before a run.
+- `audio.py` mic capture + onset — `sox` `rec` (CoreAudio) capture to wav + numpy RMS-window onset/endpoint detection. Calibration gate confirms the mic path is live before a run. (`ffmpeg` avfoundation was dropped — it truncated ~75% of mic samples on macOS; see the REC note in `audio.py`.)
 - `score.py` STT + judge — Gemini REST `generateContent` (Sutando-standard provider), stdlib `urllib`, no extra deps.
 
 Each prober-side component is validated independently (TTS synth, mic calibrate/capture, onset on silence, real Gemini STT + judge on a known phrase). The only thing that needs the second machine is the subject actually speaking a reply — the full closed loop runs when both laptops are in the room. Schema, scoring, aggregation, baseline diff, and reporting also run headless via `--dry-run`.
 
-**Latency caveat:** `ffmpeg` device-open adds a ~constant offset to every measured latency; it cancels in the baseline diff (compared to the previous green run on the same machine), so day-over-day deltas are clean even though absolute numbers carry the offset.
+**Latency caveat:** `sox`/CoreAudio device-open adds a ~constant offset to every measured latency; it cancels in the baseline diff (compared to the previous green run on the same machine), so day-over-day deltas are clean even though absolute numbers carry the offset.
 
 ---
 

@@ -2,10 +2,10 @@
 
 The ONLY transport-coupled module. Same-room speaker->mic:
   speak()     -> gemini-tts (mp3) played via afplay; `say` fallback.
-  listen()    -> ffmpeg avfoundation mic capture to wav + RMS voice-onset.
+  listen()    -> sox `rec` (CoreAudio) mic capture to wav + RMS voice-onset.
   calibrate() -> 1s ambient capture; confirms the mic produces usable signal.
 
-Latency note: ffmpeg takes ~constant time to open the input device, which adds a
+Latency note: sox/CoreAudio takes ~constant time to open the input device, which adds a
 fixed offset to every measured latency. It cancels in the baseline diff (we
 compare to the previous green run on the same machine), so absolute numbers carry
 that offset but day-over-day deltas do not.
