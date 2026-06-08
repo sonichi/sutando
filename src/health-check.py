@@ -694,34 +694,52 @@ def check_battery() -> dict:
     return {"name": name, "status": "ok", "detail": "power state unknown"}
 
 def check_memory() -> dict:
-    """Warn when system memory is critically low — OOM kills crash mid-task. Issue #1485."""
+    """Warn/fail on real macOS memory pressure, not raw 'unused' pages. Issue #1485.
+
+    The original probe read `top`'s "PhysMem: ... N unused" figure and failed
+    when it dipped below a MB threshold. But macOS deliberately keeps unused
+    pages low — it spends free RAM on the file cache and compressed memory — so
+    "unused" routinely sits near zero on a perfectly healthy machine. That
+    produced recurring false FAILs (e.g. "82M free — critically low" while
+    `memory_pressure` reported 44% free and swap usage was 0), which in turn
+    spawned owner-facing health tasks for a non-issue.
+
+    OOM kills happen under sustained pressure with swap thrashing, so the real
+    OOM-proximity signals on macOS are (a) the kernel pressure level —
+    `kern.memorystatus_vm_pressure_level`: 1=normal, 2=warning, 4=critical —
+    and (b) how much swap is actually in use. Gate warn/fail on those.
+    """
     name = "memory"
-    warn_mb = int(os.environ.get("SUTANDO_MEMORY_WARN_FREE_MB", "500"))
-    fail_mb = int(os.environ.get("SUTANDO_MEMORY_FAIL_FREE_MB", "200"))
-    try:
-        result = subprocess.run(
-            ["top", "-l", "1", "-s", "0", "-n", "0"],
-            capture_output=True, text=True, timeout=10
-        )
-        output = result.stdout
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return {"name": name, "status": "ok", "detail": "top not available (non-macOS or VM)"}
-
+    swap_warn_mb = int(os.environ.get("SUTANDO_MEMORY_SWAP_WARN_MB", "512"))
+    swap_fail_mb = int(os.environ.get("SUTANDO_MEMORY_SWAP_FAIL_MB", "2048"))
     import re as _re
-    m = _re.search(r'PhysMem:.+?(\d+)([MGT])\s+unused', output)
-    if not m:
-        return {"name": name, "status": "ok", "detail": "memory info unavailable"}
 
-    val, unit = int(m.group(1)), m.group(2)
-    free_mb = val * 1024 if unit == "G" else (val * 1024 if unit == "T" else val)
+    try:
+        level = int(subprocess.run(
+            ["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
+            capture_output=True, text=True, timeout=5).stdout.strip())
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError, ValueError):
+        return {"name": name, "status": "ok", "detail": "pressure level unavailable (non-macOS or VM)"}
 
-    if free_mb <= fail_mb:
+    # Swap actually in use is the strongest OOM-proximity signal.
+    swap_used_mb = 0.0
+    try:
+        swap_out = subprocess.run(
+            ["sysctl", "-n", "vm.swapusage"],
+            capture_output=True, text=True, timeout=5).stdout
+        sm = _re.search(r'used\s*=\s*([\d.]+)([MG])', swap_out)
+        if sm:
+            swap_used_mb = float(sm.group(1)) * (1024 if sm.group(2) == "G" else 1)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+    if level >= 4 or swap_used_mb >= swap_fail_mb:
         return {"name": name, "status": "fail",
-                "detail": f"{free_mb}M free — critically low (threshold {fail_mb}M)"}
-    if free_mb <= warn_mb:
+                "detail": f"critical memory pressure (level {level}, swap {swap_used_mb:.0f}M in use)"}
+    if swap_used_mb >= swap_warn_mb:
         return {"name": name, "status": "warn",
-                "detail": f"{free_mb}M free — low (threshold {warn_mb}M)"}
-    return {"name": name, "status": "ok", "detail": f"{free_mb}M free"}
+                "detail": f"swapping under pressure (level {level}, swap {swap_used_mb:.0f}M in use)"}
+    return {"name": name, "status": "ok", "detail": f"pressure normal (level {level}, swap {swap_used_mb:.0f}M)"}
 
 
 # Stuck-loop / dead-watcher detection
