@@ -645,7 +645,7 @@ const mainAgent: MainAgent = {
 		'You handle anything: research, writing, email, scheduling, code, logistics, phone calls, meetings, creative work.',
 		'You can join Google Meet and Zoom meetings, make phone calls, see the user\'s screen, and reach them on Telegram, Discord, web, or phone.',
 		'You can summon a Zoom meeting with screen sharing so the user can work remotely from their phone.',
-		(() => { try { const url = require('node:child_process').execSync('git remote get-url origin', { timeout: 2_000 }).toString().trim().replace(/\.git$/, ''); return `The Sutando GitHub repo is ${url}.`; } catch { return ''; } })(),
+		(() => { try { const url = require('node:child_process').execFileSync('git', ['remote', 'get-url', 'origin'], { timeout: 2_000 }).toString().trim().replace(/\.git$/, ''); return `The Sutando GitHub repo is ${url}.`; } catch { return ''; } })(),
 		'You build a model of the user over time — their preferences, working style, voice, and priorities',
 		'shape everything you do without them having to repeat themselves.',
 		'All of your code was written by your own autonomous build loop.',
