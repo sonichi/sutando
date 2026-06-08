@@ -181,10 +181,15 @@ CLASS_RULES=(
     # commit-time collision-keep-both for per-host preservation.
     "quota-state.json|rehome-state"
     "dynamic-content.json|rehome-state"
-    "stand-identity.json|rehome-state"
-    # ^ per Mini #1: file ACCUMULATES owner questions across hosts;
-    # newest-mtime silently drops a host's unique entries. Migrate via append
-    # (commit-side dedupe-per-line still TODO; Strategy C sidecar by default).
+    # stand-identity.json is a personalPath (per-machine) file, NOT a state file.
+    # Its reader personal_path()/personalPath() resolves
+    # $SUTANDO_MEMORY_DIR/machine-<host>/<file> then falls back to
+    # <workspace>/<file> (root) — it NEVER looks in state/. Classifying it
+    # rehome-state (→ state/) homed it at a path the reader can't see, so
+    # voice/discord-voice lost the Stand name and fell back to "Sutando" (#1540).
+    # Treat it like the sibling personal-override root file PERSONAL_CLAUDE.md
+    # above: keep at workspace root via newest-mtime so personalPath resolves it.
+    "stand-identity.json|newest-mtime"
     "pending-questions-resolved-archive-*.md|rehome-dated-snapshot"
     "session-state.md|newest-mtime"
     "cloud-auth.json|rehome-state"
