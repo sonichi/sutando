@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -366,7 +367,6 @@ def send_file(chat_id, file_path, caption=""):
         return {"ok": False}
 
 def send_reply(chat_id, text, task_id: str | None = None):
-    import re
     # Extract file paths: [file: /path/to/file] or [send: /path/to/file]
     file_pattern = re.compile(r'\[(?:file|send|attach):\s*([^\]]+)\]')
     files = file_pattern.findall(text)
@@ -577,6 +577,17 @@ def main():
                 PROACTIVE_PREFIXES = ("proactive-", "briefing-", "insight-", "friction-")
                 for f in RESULTS_DIR.iterdir():
                     if any(f.name.startswith(p) for p in PROACTIVE_PREFIXES) and f.suffix == ".txt":
+                        # Peek before claiming: skip Discord-targeted proactive files.
+                        # [channel: <17-20 digit snowflake>] is a Discord-only marker;
+                        # claiming it here sends the literal text to Telegram DM instead
+                        # of leaving it for discord-bridge. (#1401)
+                        try:
+                            peek = f.read_text(errors="ignore").lstrip()
+                        except OSError:
+                            continue
+                        if peek.startswith("[channel:") and \
+                                re.match(r'\[channel:\s*\d{17,20}\]', peek):
+                            continue
                         # Claim-by-rename: atomic move to a `.sending`
                         # suffix before reading, so a concurrent poll
                         # (same bridge, or a race with discord-bridge)
