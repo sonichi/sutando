@@ -34,10 +34,28 @@ If you only run Sutando on one machine, you don't need this.
    ```
    First run sets the workspace tree up as a git working copy, points at the configured remote, and pushes whatever's locally on disk as the initial commit on the per-host branch.
 
-4. **Add a cron entry** to run every 10–30 minutes:
-   ```cron
-   */15 * * * * cd /path/to/sutando && bash scripts/sync-workspace.sh
+4. **Schedule the recurring sync.** Use the installer — it picks the right
+   scheduler per OS (a per-user **LaunchAgent** on macOS, a **crontab** line on
+   Linux) and defaults to every 15 min:
+   ```bash
+   bash scripts/install-workspace-sync.sh                 # install (idempotent)
+   bash scripts/install-workspace-sync.sh --interval 600  # custom seconds
+   bash scripts/install-workspace-sync.sh --status        # check it's loaded
+   bash scripts/install-workspace-sync.sh --uninstall
    ```
+
+   > **macOS: prefer launchd, not a hand-written crontab.** The cron spool
+   > (`/var/at/tabs`) is TCC-protected — editing a crontab requires the
+   > controlling **terminal app** to have **Full Disk Access**, or `crontab`
+   > fails with `Operation not permitted` (the spool is root-owned and gated on
+   > the *responsible app*, not euid, so even setuid-root `crontab` is blocked).
+   > The installer's LaunchAgent needs no FDA, and — running in the `gui/<uid>`
+   > domain — also unlocks the login Keychain, sidestepping the `-25308` error
+   > (see Troubleshooting). To wire it by hand instead, a plain cron line works
+   > on Linux (and on macOS *if* your terminal has FDA):
+   > ```cron
+   > */15 * * * * cd /path/to/sutando && bash scripts/sync-workspace.sh
+   > ```
 
 Repeat the same steps on every machine in the fleet. All clone the same `vault.remote_url`. Each machine pushes to its own branch named `host/<hostname>/<wsId>` (per [#1459](https://github.com/sonichi/sutando/pull/1459)); the merge across branches happens on next pull.
 
@@ -166,7 +184,7 @@ The three migration symptoms below were observed pre-v0.3.0 and all shipped fixe
 - **Push fails with macOS Keychain error `-25308` over SSH or plain cron** — `gh auth` stores the GitHub token in macOS Keychain, which is bound to a GUI session by default. Plain SSH sessions / system-level crontabs can't unlock it. Three fixes (pick one):
   1. **SSH remote URL** *(recommended for headless/SSH)*: configure the vault with `git@github.com:user/vault.git` instead of HTTPS — SSH uses key-based auth, no Keychain involved. Switch with `git -C "$(bash scripts/sutando-config.sh workspace)" remote set-url origin git@github.com:user/vault.git`.
   2. **`GH_TOKEN` in `.env`**: add `GH_TOKEN=<personal-access-token>` to `<workspace>/.env` (resolve `<workspace>` via `bash scripts/sutando-config.sh workspace`). git and `gh` respect this env var without touching Keychain. *Note:* the M2 sync engine carries the workspace tree cross-host, so a `GH_TOKEN` in `<workspace>/.env` propagates to every fleet machine; that's typically desired for headless sync hosts, but worth being aware of for multi-host operators.
-  3. **launchd plist** *(existing workaround)*: run sync from a launchd plist scoped to your user GUI session (not system-level crontab), or unlock the keychain explicitly in the cron wrapper (`security unlock-keychain` — requires interactive password setup, not recommended for automation).
+  3. **launchd plist** *(recommended on macOS)*: run sync from a launchd plist scoped to your user GUI session (not system-level crontab) — `bash scripts/install-workspace-sync.sh` does exactly this for you. The `gui/<uid>` domain unlocks the login Keychain, and it also avoids the separate Full-Disk-Access wall that blocks `crontab` edits (see step 4 of Setup). Hand-rolled alternative: unlock the keychain in a cron wrapper (`security unlock-keychain` — requires interactive password setup, not recommended for automation).
 - **Merge conflicts on every tick** — Two hosts editing the same file in tight loops. Use append-only patterns or coordinate edits.
 
 ## Related
