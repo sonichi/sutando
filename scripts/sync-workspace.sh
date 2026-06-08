@@ -414,9 +414,23 @@ generate_exclude() {
 
     # Migration: an in-tree .gitignore is the leak source — drop it. The
     # rules now live in .git/info/exclude (per-clone, opaque to outer).
+    #
+    # If it is TRACKED — an older host committed it to the vault, and its own
+    # `!.gitignore` rule self-tracks it — a plain `rm -f` deletes only the
+    # local copy: the file is re-materialized on the next peer pull/merge, so
+    # the inner/outer leak (workspace content showing in the OUTER repo's
+    # status; see the boundary note above) recurs forever. `git rm` instead, so
+    # the untrack is committed and propagates through the vault history — the
+    # file then disappears from every device on its next pull. Fall back to
+    # `rm -f` when untracked (fresh local cruft, or pre-first-commit --init).
     if [ -f "$legacy_gitignore" ] && [ "$DRY_RUN" != "1" ]; then
-        rm -f "$legacy_gitignore"
-        log "generate_exclude: removed legacy in-tree $legacy_gitignore (rules moved to .git/info/exclude)"
+        if git -C "$WORKSPACE_DIR" ls-files --error-unmatch .gitignore >/dev/null 2>&1; then
+            git -C "$WORKSPACE_DIR" rm -q -f .gitignore
+            log "generate_exclude: git-rm'd TRACKED in-tree $legacy_gitignore (untrack propagates via vault; rules live in .git/info/exclude)"
+        else
+            rm -f "$legacy_gitignore"
+            log "generate_exclude: removed untracked in-tree $legacy_gitignore (rules moved to .git/info/exclude)"
+        fi
     fi
 
     if [ ! -d "$WORKSPACE_DIR/.git/info" ]; then
