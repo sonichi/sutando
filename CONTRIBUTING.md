@@ -75,6 +75,7 @@ In the order a reviewer reads them. Say "N/A" if a question doesn't apply, so th
 - What files / sections should reviewers look at first?
 - What user behavior or bug does this prove?
 - What tests did you run? Include commands and results.
+- **For voice / phone / audio PRs: include a manual test result.** A `voice-agent.log` excerpt showing the live turn/`[Tool]` flow, or a voice recording demonstrating the change. Voice paths are weakly covered by unit tests, so a maintainer needs observable evidence the live session behaves — not just that the code compiles.
 - For bug-fixes: failing-before / passing-after evidence (commit + test command).
 - What edge cases or non-happy paths did you check?
 - Any migrations, config, permissions, rollback, or deployment risks?
