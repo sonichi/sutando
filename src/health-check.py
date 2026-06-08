@@ -51,10 +51,20 @@ from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 WORKSPACE_DIR = resolve_workspace()
 
 def _default_memory_dir() -> str:
-    """Auto-detect Claude Code memory dir from repo path."""
+    """Claude Code memory dir under the workspace claude-home.
+
+    Mirrors how Claude Code itself resolves memory: <claude-home>/projects/
+    <slug>/memory. Pre-#1454 this hardcoded ~/.claude/projects/<slug>/memory,
+    which ignored the workspace-scoped CLAUDE_CONFIG_DIR — so on a migrated
+    install the probe read an empty/stale ~/.claude path instead of the
+    workspace memory dir (where Claude Code actually writes and the vault
+    syncs), which forced a SUTANDO_MEMORY_DIR override to compensate.
+    claude_home_path() honors CLAUDE_CONFIG_DIR, falling back to ~/.claude
+    only when it is unset (preserving the old path for ad-hoc launches).
+    """
     repo = Path(__file__).parent.parent.resolve()
     slug = str(repo).replace("/", "-")
-    return str(Path.home() / ".claude" / "projects" / slug / "memory")
+    return str(Path(claude_home_path()) / "projects" / slug / "memory")
 
 MEMORY_DIR = Path(os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir()))
 
