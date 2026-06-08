@@ -419,7 +419,12 @@ generate_exclude() {
         log "generate_exclude: removed legacy in-tree $legacy_gitignore (rules moved to .git/info/exclude)"
     fi
 
-    if [ ! -d "$WORKSPACE_DIR/.git/info" ]; then
+    # NB: do NOT mkdir in --dry-run. Creating `.git/info` when no real repo
+    # exists leaves a STUB `.git/` (a lone `info/`, no HEAD/objects). A later
+    # `_init_impl` then sees `.git` present, skips `git init`, and git walks UP
+    # to a parent repo's worktree (e.g. a submodule) — hijacking it. A dry-run
+    # must never mutate state. (See the toplevel-isolation guard in _init_impl.)
+    if [ "$DRY_RUN" != "1" ] && [ ! -d "$WORKSPACE_DIR/.git/info" ]; then
         mkdir -p "$WORKSPACE_DIR/.git/info"
     fi
 
@@ -520,13 +525,31 @@ _init_impl() {
         return 0
     fi
 
-    # 1. git init if not already a repo
-    if [ ! -d "$WORKSPACE_DIR/.git" ]; then
+    # 1. git init if not already a *valid, isolated* repo.
+    #
+    # A bare `-d .git` check is insufficient. A stub `.git/` (e.g. a lone
+    # `.git/info/` left by a prior `--dry-run`, a half-finished init, or a
+    # backup restore) passes `-d` but is NOT a real repo. git then walks UP to
+    # the nearest parent repo's worktree — e.g. when the workspace lives inside
+    # a git SUBMODULE — and every subsequent remote/add/commit/push silently
+    # hijacks that parent (rewrites its origin, commits its whole tree, pushes
+    # it to the vault). Decide by the resolved toplevel: this is "already a
+    # repo" ONLY if git resolves THIS dir as its own toplevel.
+    local _top
+    _top="$(git -C "$WORKSPACE_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+    if [ -n "$_top" ] && [ "$_top" -ef "$WORKSPACE_DIR" ]; then
+        log "_init_impl: $WORKSPACE_DIR is already a git repo"
+    else
         git init -q
         log "_init_impl: git init done in $WORKSPACE_DIR"
         echo "sync-workspace: git init done in $WORKSPACE_DIR" >&2
-    else
-        log "_init_impl: $WORKSPACE_DIR is already a git repo"
+        # Fail-safe: confirm the fresh repo isolated (git did NOT climb out to
+        # a parent worktree). If it still resolves elsewhere, refuse rather
+        # than operate on — and corrupt — a parent repo.
+        _top="$(git -C "$WORKSPACE_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+        if ! { [ -n "$_top" ] && [ "$_top" -ef "$WORKSPACE_DIR" ]; }; then
+            die "init: $WORKSPACE_DIR did not isolate as its own git repo (git resolved toplevel: ${_top:-<none>}). Refusing — remote/commit/push would leak into a parent repo. If the workspace is nested inside another git repo (e.g. a submodule), run 'git -C \"$WORKSPACE_DIR\" init' manually, verify 'git -C \"$WORKSPACE_DIR\" rev-parse --absolute-git-dir' points at \$WORKSPACE_DIR/.git, then re-run --init."
+        fi
     fi
 
     # 2. Set vault remote (idempotent — replace if URL changed)
