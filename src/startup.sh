@@ -434,6 +434,20 @@ fi
 mkdir -p "$WORKSPACE/logs" "$WORKSPACE/tasks" "$WORKSPACE/results" "$WORKSPACE/data" "$WORKSPACE/state"
 LOGS_DIR="$WORKSPACE/logs"
 
+# Self-heal: stand-identity.json was misclassified `rehome-state` by pre-#1540
+# `sutando-migrate.sh`, which put it at `<workspace>/state/stand-identity.json`.
+# Its reader (`personal_path()` / `personalPath()`) resolves
+# `$SUTANDO_MEMORY_DIR/machine-<host>/<file>` → `<workspace>/<file>` ROOT —
+# never `state/`. Affected hosts lost their Stand name (fell back to "Sutando")
+# silently. #1540 fixed the migration tool; this one-shot mv un-strands hosts
+# that already ran the old migration. Idempotent + safe: only fires when state/
+# has the file AND root does not, so subsequent boots and unaffected hosts
+# (never ran old migrate, or have a configured Stand name at root) are no-op.
+if [ -f "$WORKSPACE/state/stand-identity.json" ] && [ ! -e "$WORKSPACE/stand-identity.json" ]; then
+  mv "$WORKSPACE/state/stand-identity.json" "$WORKSPACE/stand-identity.json"
+  echo "[startup] self-heal: moved stand-identity.json from state/ → workspace root (pre-#1540 migrate followup)" >&2
+fi
+
 # Offer to set up the `claude-sutando` shell alias once per host. The helper
 # resolves CLAUDE_CONFIG_DIR via `bash scripts/sutando-config.sh claude-sutando-config-dir`
 # (driven by `claude_sutando_config_dir.subdir` in sutando.config.json; default
