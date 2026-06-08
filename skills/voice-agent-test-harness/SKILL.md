@@ -4,7 +4,20 @@ Drive a fixed suite of spoken tests against a voice agent ("subject") from a co-
 
 **Design:** [docs/voice-agent-test-framework.md](../../docs/voice-agent-test-framework.md)
 
-> **v1 (macOS).** Real audio path: TTS via `gemini-tts` + `afplay`, mic capture via `ffmpeg` avfoundation, voice-onset via numpy RMS, STT + judge via Gemini (Sutando-standard, `GEMINI_API_KEY`). Manual trigger; reports to owner only. Each prober-side component is tested; the full closed loop needs the second laptop speaking.
+> **v1 (macOS).** Real audio path: TTS via `gemini-tts` + `afplay`, mic capture via `sox` `rec` (CoreAudio), voice-onset via numpy RMS, STT + judge via Gemini (Sutando-standard, `GEMINI_API_KEY`). Manual trigger; reports to owner only. Each prober-side component is tested; the full closed loop needs the second laptop speaking.
+
+## What runs end-to-end today
+
+So that a half-SKIPPED suite is never mistaken for "mostly fine," here is exactly what executes through the real acoustic path now versus what is stubbed or excluded. A captured live run is committed at [`examples/run-2026-06-06.json`](examples/run-2026-06-06.json).
+
+| Capability | Status today |
+|---|---|
+| Single-answer suite (`test_cases.yaml`, `core-v1`) — speak → capture → onset → Gemini STT → judge → score | ✅ **Wired.** Every row runs end-to-end on real audio; `pass` / `fail` / `partial` / `no_response` are all measured outcomes, not stubs. |
+| Latency / clarity / accuracy scoring + baseline diff + Telegram roll-up | ✅ **Wired** — computed on real captured turns. |
+| `timer` action test — real side-effect verify (waits, listens for the alarm) | ✅ **Wired.** |
+| Multi-turn workflow turns (`workflow_cases.yaml`, e.g. the developer code-change flow) | ⚠️ **Partial.** The spoken handling is captured and judged; remote side effects (branch/test/cleanup) are **not observable from the prober**, so these score wording only. |
+| Gmail / CRM workflow turns | ⛔ **Excluded** — unfinished test setup; omitted from results, not reported as failures. |
+| Daily auto-scheduling | ⛔ **Not wired** — manual trigger only. |
 
 ## How to try it (two laptops, same room)
 
