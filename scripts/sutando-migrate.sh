@@ -1811,15 +1811,20 @@ commit_main() {
             for _c in "$HOME/.sutando/workspace/.env" \
                       "${SUTANDO_WORKSPACE:+${SUTANDO_WORKSPACE/#\~/$HOME}/.env}" \
                       "$HOME/.sutando/.env"; do
-                [ -n "$_c" ] && [ -f "$_c" ] && grep -q '^GEMINI_API_KEY=.\+' "$_c" 2>/dev/null && { _legacy_env="$_c"; break; }
+                # `|| :` keeps the AND-list (and the loop) at status 0 under `set -e`
+                # when a candidate is absent.
+                [ -n "$_c" ] && [ -f "$_c" ] && grep -q '^GEMINI_API_KEY=.\+' "$_c" 2>/dev/null && { _legacy_env="$_c"; break; } || :
             done
             # Fallback: newest .env carrying the key anywhere under ~/.sutando.
+            # `|| true` — the find/grep/head pipeline returns non-zero when
+            # ~/.sutando is absent or nothing matches; without it `set -euo
+            # pipefail` would abort the whole commit (CI has no ~/.sutando).
             if [ -z "$_legacy_env" ]; then
                 _legacy_env="$(find "$HOME/.sutando" -maxdepth 4 -name .env -type f 2>/dev/null \
-                    -exec grep -l '^GEMINI_API_KEY=.\+' {} \; | xargs -r ls -t 2>/dev/null | head -1)"
+                    -exec grep -l '^GEMINI_API_KEY=.\+' {} \; | xargs -r ls -t 2>/dev/null | head -1 || true)"
             fi
             if [ -n "$_legacy_env" ]; then
-                [ -f "$_repo_env" ] && cp "$_repo_env" "$_repo_env.bak-$BACKUP_ID"
+                { [ -f "$_repo_env" ] && cp "$_repo_env" "$_repo_env.bak-$BACKUP_ID"; } || :
                 # Strip any stale `SUTANDO_WORKSPACE=` so the adopted secrets can't
                 # re-point this clone back at the old workspace (also silences the
                 # v0.8 deprecation nag). All other keys carry over verbatim.
