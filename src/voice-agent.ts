@@ -27,7 +27,7 @@ import 'dotenv/config';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { existsSync, readFileSync, readdirSync, statSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, openSync, writeSync, closeSync } from 'node:fs';
-import { execSync as execSyncTop } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { inlineTools, coreDocumentedSkills } from './inline-tools.js';
 import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater } from './vision-tools.js';
 import { clearActiveArtifact } from './artifact-cache-tools.js';
@@ -299,9 +299,9 @@ setInterval(applyModeRequest, 1_000);
 
 // Detect active meeting on startup — sync so it runs before first greeting
 try {
-	const zoomRunning = execSyncTop('pgrep -f "zoom.us" 2>/dev/null', { encoding: 'utf-8' }).trim();
+	const zoomRunning = execFileSync('/usr/bin/pgrep', ['-f', 'zoom.us'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
 	if (zoomRunning) {
-		const inMeeting = execSyncTop(`osascript -e 'tell application "System Events" to tell process "zoom.us" to count of windows' 2>/dev/null`, { encoding: 'utf-8' }).trim();
+		const inMeeting = execFileSync('osascript', ['-e', 'tell application "System Events" to tell process "zoom.us" to count of windows'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
 		if (parseInt(inMeeting) >= 2) {
 			meetingActive = true;
 			console.log(`${new Date().toLocaleTimeString()} [Meeting] Detected active Zoom meeting on startup`);
@@ -1051,14 +1051,13 @@ async function main() {
 				console.error(`${ts()} [VoiceFailure] proactive write failed: ${(e as Error)?.message ?? e}`);
 			}
 			// OS notification — visible even if no browser tab is open.
-			// Sanitize the message for the AppleScript string literal: drop
-			// double-quotes and backslashes so the shell command can't break.
+			// execFileSync avoids the shell entirely, so no sanitization of
+			// single-quotes or other shell metacharacters is needed. The
+			// double-quote stripping below protects the AppleScript string
+			// literal itself (not the shell).
 			try {
 				const safe = c.userMessage.replace(/["\\]/g, '');
-				execSyncTop(
-					`osascript -e 'display notification "${safe}" with title "Sutando — voice offline"'`,
-					{ stdio: 'ignore' } as any,
-				);
+				execFileSync('osascript', ['-e', `display notification "${safe}" with title "Sutando — voice offline"`], { stdio: 'ignore' });
 			} catch {}
 		};
 		transport.onClose = (code?: number, reason?: string) => {
