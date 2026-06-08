@@ -732,6 +732,17 @@ def result_watcher():
                 for f in list(RESULTS_DIR.iterdir()):
                     if not (f.name.startswith("proactive-") and f.suffix == ".txt"):
                         continue
+                    # Peek before claiming: skip Discord-targeted proactive files.
+                    # [channel: <17-20 digit snowflake>] is a Discord-only marker;
+                    # claiming it here dumps the literal text to Slack DM instead.
+                    # Leave it for discord-bridge to claim. (#1401)
+                    try:
+                        peek = f.read_text(errors="ignore").lstrip()
+                    except OSError:
+                        continue
+                    if peek.startswith("[channel:") and \
+                            re.match(r'\[channel:\s*\d{17,20}\]', peek):
+                        continue
                     claim = f.with_suffix(".sending")
                     try:
                         f.rename(claim)
