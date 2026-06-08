@@ -1,11 +1,13 @@
 // #1389 / PR #1409 — vision_query mode handling.
 //
-// Confirms the four-way return-shape contract:
-//   - mode='selection' with selection present → selection_read, no frame capture
-//   - mode='selection' with no selection      → no_selection, no frame capture
-//   - mode='frame'                            → frame_captured, no selection probe
-//   - mode='both' (default) with selection    → selection_and_frame
-//   - mode='both' with no selection           → frame_captured (fall-through)
+// Confirms the return-shape contract for the four modes (mode is REQUIRED — no default):
+//   - mode='selection' with selection present          → selection_read, no frame capture
+//   - mode='selection' with no selection               → no_selection, no frame capture
+//   - mode='frame'                                      → frame_captured, no selection probe
+//   - mode='selection-or-frame' with selection present → selection_read, no frame capture
+//   - mode='selection-or-frame' with no selection      → frame_captured (fall-through)
+//   - mode='both' with selection present               → selection_and_frame
+//   - mode='both' with no selection                    → frame_captured (fall-through)
 //
 // Uses the _setVisionQueryDeps test seam to stub the readSelection +
 // captureSendFrame side-effects — keeps the test hermetic on machines without
@@ -93,14 +95,48 @@ test(
 );
 
 test(
-	'mode="both" (default) with selection present → selection_and_frame',
+	'mode="selection-or-frame" with selection present → selection_read, no frame capture',
+	withDeps(
+		{
+			readSelection: () => ({ text: 'highlighted phrase', source: 'ax_selection' }),
+			captureSendFrame: async () => {
+				throw new Error('frame capture should NOT run when selection-or-frame has a selection');
+			},
+		},
+		async () => {
+			const r = (await visionQuery!.execute({ mode: 'selection-or-frame', question: 'what does this say?' } as any, ctx)) as any;
+			assert.equal(r.status, 'selection_read');
+			assert.equal(r.text, 'highlighted phrase');
+			assert.equal(r.source, 'ax_selection');
+			assert.equal(r.question, 'what does this say?');
+		},
+	),
+);
+
+test(
+	'mode="selection-or-frame" with no selection → falls through to frame_captured',
+	withDeps(
+		{
+			readSelection: () => null,
+			captureSendFrame: async () => ({ ok: true, source: 'screen' }),
+		},
+		async () => {
+			const r = (await visionQuery!.execute({ mode: 'selection-or-frame' } as any, ctx)) as any;
+			assert.equal(r.status, 'frame_captured');
+			assert.equal(r.source, 'screen');
+		},
+	),
+);
+
+test(
+	'mode="both" with selection present → selection_and_frame',
 	withDeps(
 		{
 			readSelection: () => ({ text: 'quoted sentence', source: 'chrome_js_selection' }),
 			captureSendFrame: async () => ({ ok: true, source: 'screen' }),
 		},
 		async () => {
-			const r = (await visionQuery!.execute({ question: 'what is this?' } as any, ctx)) as any;
+			const r = (await visionQuery!.execute({ mode: 'both', question: 'what is this?' } as any, ctx)) as any;
 			assert.equal(r.status, 'selection_and_frame');
 			assert.deepEqual(r.selection, { text: 'quoted sentence', source: 'chrome_js_selection' });
 			assert.equal(r.frame_status, 'ok');

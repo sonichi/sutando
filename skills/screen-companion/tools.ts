@@ -220,10 +220,11 @@ export function _resetVisionQueryDeps(): void {
 const visionQueryTool: ToolDefinition = {
 	name: 'vision_query',
 	description:
-		'Read what\'s on screen. Three modes — pick based on the question: ' +
-		'mode="selection" for exact word/quote questions ("what does this sentence say?"); ' +
-		'mode="frame" for layout/visual-context questions ("is the dialog open?"); ' +
-		'mode="both" (default) when either or both might be useful — tries selection first, then also captures a frame. ' +
+		'Read what\'s on screen. A mode is REQUIRED — pick based on the question: ' +
+		'mode="selection" for exact word/quote questions ("what does this sentence say?") — reads the text selection only, no frame; ' +
+		'mode="frame" for layout/visual-context questions ("is the dialog open?") — screen capture only, no selection probe; ' +
+		'mode="selection-or-frame" when you want the exact selected text if the user has highlighted something, otherwise fall back to a frame — captures a frame ONLY when there is no selection; ' +
+		'mode="both" when both might help — reads the selection AND also captures a frame (frame-only fallback if no selection). ' +
 		'Pass question= to frame what you\'re looking for. ' +
 		'Use in pull-mode screen-companion sessions when you need to check what\'s on screen without streaming continuously.',
 	parameters: z.object({
@@ -232,20 +233,18 @@ const visionQueryTool: ToolDefinition = {
 			.optional()
 			.describe('What to look for or answer from the current screen. E.g. "Is the OAuth2 scope list visible?" or "What does the error message say?"'),
 		mode: z
-			.enum(['selection', 'frame', 'both'])
-			.optional()
-			.default('both')
-			.describe('What to read: "selection" (text selection only), "frame" (screen capture only), or "both" (default — selection-first, then frame).'),
+			.enum(['selection', 'frame', 'selection-or-frame', 'both'])
+			.describe('Required. What to read: "selection" (text selection only), "frame" (screen capture only), "selection-or-frame" (selection if present, else frame), or "both" (selection AND frame).'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { question, mode = 'both' } = (args ?? {}) as {
+		const { question, mode } = (args ?? {}) as {
 			question?: string;
-			mode?: 'selection' | 'frame' | 'both';
+			mode: 'selection' | 'frame' | 'selection-or-frame' | 'both';
 		};
 
-		const wantSelection = mode === 'selection' || mode === 'both';
-		const wantFrame = mode === 'frame' || mode === 'both';
+		const wantSelection = mode === 'selection' || mode === 'both' || mode === 'selection-or-frame';
+		const wantFrame = mode === 'frame' || mode === 'both' || mode === 'selection-or-frame';
 
 		const selection = wantSelection ? _readSelection() : null;
 
@@ -258,6 +257,21 @@ const visionQueryTool: ToolDefinition = {
 					_note: 'No text selection found. Ask the user to select the text first, or call vision_query again with mode="frame" if you want a screen capture instead.',
 				};
 			}
+			return {
+				status: 'selection_read',
+				text: selection.text,
+				source: selection.source,
+				question: question ?? null,
+				_note: question
+					? `Selected text read via ${selection.source} (exact, not frame-eyeballing). Answer: ${question}`
+					: `Selected text read via ${selection.source}. Describe or quote the selection as relevant.`,
+			};
+		}
+
+		// mode='selection-or-frame' with selection present — return selection only,
+		// no frame (the original #1389 conditional-frame behavior: frame captured
+		// ONLY when there is no selection).
+		if (mode === 'selection-or-frame' && selection) {
 			return {
 				status: 'selection_read',
 				text: selection.text,
@@ -285,7 +299,8 @@ const visionQueryTool: ToolDefinition = {
 			};
 		}
 
-		// mode='frame', or mode='both' with no selection — capture a frame only.
+		// mode='frame', or mode='both'/'selection-or-frame' with no selection —
+		// capture a frame only.
 		if (wantFrame) {
 			const r = await _captureSendFrame('screen');
 			if (!r.ok) {
@@ -295,12 +310,13 @@ const visionQueryTool: ToolDefinition = {
 					hint: 'Screen-capture server may not be running. Start it with `bash src/startup.sh`.',
 				};
 			}
+			const fellThrough = mode === 'both' || mode === 'selection-or-frame';
 			return {
 				status: 'frame_captured',
 				source: r.source,
 				question: question ?? null,
 				_note: question
-					? (mode === 'both'
+					? (fellThrough
 						? `No selection found; frame is in your vision context. Answer: ${question}`
 						: `Frame is in your vision context. Answer: ${question}`)
 					: 'Frame is in your vision context. Describe what you see.',
