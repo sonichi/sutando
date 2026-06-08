@@ -14,11 +14,11 @@
 // to the owner about screen sharing if vision isn't already streaming.
 
 import { z } from 'zod';
-import { execSync } from 'node:child_process';
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { loadConfig, discoverConfigs, renderGoal } from './scripts/load-config.js';
+import { readSelection as defaultReadSelection, type SelectionResult } from './scripts/read-selection.js';
 import { registerVisionOnContributor, callUpdateTools, callRestoreTools, captureSendFrame, getFullToolSurface } from '../../src/vision-tools.js';
 
 function resolveWorkspace(): string {
@@ -190,96 +190,125 @@ const deactivateScreenCompanionTool: ToolDefinition = {
 
 // --- vision_query -----------------------------------------------------------
 //
-// Pull-mode screen-frame lookup. Captures the current screen and sends it to
-// Gemini as vision input, then returns a prompt for Gemini to answer. Does NOT
-// require push-mode to be running — designed for modes where the user calls it
-// on demand rather than streaming continuously.
+// Pull-mode screen lookup with three modes:
+//   - 'selection': read the user's text selection (AX or Chrome JS). Exact
+//     word/quote questions — no frame capture.
+//   - 'frame':     capture & send the current screen to vision. Layout /
+//     visual-context questions — no selection probe.
+//   - 'both' (default): try selection first; if present, ALSO capture a frame
+//     and return a combined result. If no selection, fall through to frame.
+//
+// Selection probes live in scripts/read-selection.ts (issue #1389, PR #1409).
+// Captured frames flow through vision-tools.captureSendFrame to the active
+// Gemini Live session. Designed for pull-mode (configs that don't stream).
+
+// Injection seams for tests — production code uses the imported defaults.
+let _readSelection: () => SelectionResult | null = defaultReadSelection;
+let _captureSendFrame: typeof captureSendFrame = captureSendFrame;
+export function _setVisionQueryDeps(deps: {
+	readSelection?: () => SelectionResult | null;
+	captureSendFrame?: typeof captureSendFrame;
+}): void {
+	if (deps.readSelection) _readSelection = deps.readSelection;
+	if (deps.captureSendFrame) _captureSendFrame = deps.captureSendFrame;
+}
+export function _resetVisionQueryDeps(): void {
+	_readSelection = defaultReadSelection;
+	_captureSendFrame = captureSendFrame;
+}
 
 const visionQueryTool: ToolDefinition = {
 	name: 'vision_query',
 	description:
-		'Capture the current screen and look at it to answer a specific question. ' +
-		'Use in pull-mode screen-companion sessions when you need to check what\'s on screen without streaming continuously. ' +
-		'Pass question= to frame what you\'re looking for (e.g. "Is the bot token field visible?"). ' +
-		'The frame is sent to your vision context — answer based on what you see.',
+		'Read what\'s on screen. Three modes — pick based on the question: ' +
+		'mode="selection" for exact word/quote questions ("what does this sentence say?"); ' +
+		'mode="frame" for layout/visual-context questions ("is the dialog open?"); ' +
+		'mode="both" (default) when either or both might be useful — tries selection first, then also captures a frame. ' +
+		'Pass question= to frame what you\'re looking for. ' +
+		'Use in pull-mode screen-companion sessions when you need to check what\'s on screen without streaming continuously.',
 	parameters: z.object({
 		question: z
 			.string()
 			.optional()
 			.describe('What to look for or answer from the current screen. E.g. "Is the OAuth2 scope list visible?" or "What does the error message say?"'),
+		mode: z
+			.enum(['selection', 'frame', 'both'])
+			.optional()
+			.default('both')
+			.describe('What to read: "selection" (text selection only), "frame" (screen capture only), or "both" (default — selection-first, then frame).'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { question } = (args ?? {}) as { question?: string };
+		const { question, mode = 'both' } = (args ?? {}) as {
+			question?: string;
+			mode?: 'selection' | 'frame' | 'both';
+		};
 
-		// Selection-first path (issue #1389): exact text beats frame-eyeballing.
-		// Try AX selected text (native apps), then Chrome JS (browser content).
-		// Fall through to vision only when there is no selection.
-		// Timeout 800ms per probe (Mini #1409 review: 3s × 2 = 6s worst-case is too
-		// slow for an inline voice tool; 800ms keeps total probe budget ≤ 1.6s).
-		let selectedText: string | null = null;
-		let selectionSource: 'ax_selection' | 'chrome_js_selection' | null = null;
-		try {
-			const ax = execSync(
-				`osascript -e 'try
-  tell application "System Events" to tell (first process whose frontmost is true)
-    return value of attribute "AXSelectedText" of (first UI element whose AXFocused is true)
-  end tell
-on error
-  return ""
-end try'`,
-				{ encoding: 'utf-8', timeout: 800 }
-			).trim();
-			if (ax) { selectedText = ax; selectionSource = 'ax_selection'; }
-		} catch (err) {
-			const e = err as NodeJS.ErrnoException;
-			if (e.signal === 'SIGTERM' || e.code === 'ETIMEDOUT') {
-				console.error(`[vision_query] AX probe timed out — AX permission may be denied`);
+		const wantSelection = mode === 'selection' || mode === 'both';
+		const wantFrame = mode === 'frame' || mode === 'both';
+
+		const selection = wantSelection ? _readSelection() : null;
+
+		// mode='selection' — only selection, no frame fallback.
+		if (mode === 'selection') {
+			if (!selection) {
+				return {
+					status: 'no_selection',
+					question: question ?? null,
+					_note: 'No text selection found. Ask the user to select the text first, or call vision_query again with mode="frame" if you want a screen capture instead.',
+				};
 			}
-		}
-
-		if (!selectedText) {
-			try {
-				const js = execSync(
-					`osascript -e 'try
-  tell application "Google Chrome" to tell active tab of front window to execute javascript "window.getSelection().toString()"
-on error
-  return ""
-end try'`,
-					{ encoding: 'utf-8', timeout: 800 }
-				).trim();
-				if (js) { selectedText = js; selectionSource = 'chrome_js_selection'; }
-			} catch { /* Chrome not front, JS disabled, or no selection */ }
-		}
-
-		if (selectedText && selectionSource) {
 			return {
 				status: 'selection_read',
-				text: selectedText,
-				source: selectionSource,
+				text: selection.text,
+				source: selection.source,
+				question: question ?? null,
 				_note: question
-					? `Selected text read via ${selectionSource} (exact, not frame-eyeballing). Answer: ${question}`
-					: `Selected text read via ${selectionSource}. Describe or quote the selection as relevant.`,
+					? `Selected text read via ${selection.source} (exact, not frame-eyeballing). Answer: ${question}`
+					: `Selected text read via ${selection.source}. Describe or quote the selection as relevant.`,
 			};
 		}
 
-		// No selection — fall back to screen frame capture.
-		const r = await captureSendFrame('screen');
-		if (!r.ok) {
+		// mode='both' with selection present — return BOTH selection and frame.
+		if (mode === 'both' && selection) {
+			const r = await _captureSendFrame('screen');
 			return {
-				status: 'failed',
-				error: r.error,
-				hint: 'Screen-capture server may not be running. Start it with `bash src/startup.sh`.',
+				status: 'selection_and_frame',
+				selection: { text: selection.text, source: selection.source },
+				frame_status: r.ok ? 'ok' : 'failed',
+				frame_source: r.ok ? r.source : null,
+				frame_error: r.ok ? null : (r.error ?? null),
+				question: question ?? null,
+				_note: question
+					? `Selected text read via ${selection.source}; frame also in your vision context. Answer: ${question}`
+					: `Selected text read via ${selection.source}; frame also in your vision context. Quote the selection and describe the surrounding context as relevant.`,
 			};
 		}
-		return {
-			status: 'frame_sent',
-			source: r.source,
-			question: question ?? null,
-			_note: question
-				? `No selection found; frame is in your vision context. Answer: ${question}`
-				: 'No selection found; frame is in your vision context. Describe what you see.',
-		};
+
+		// mode='frame', or mode='both' with no selection — capture a frame only.
+		if (wantFrame) {
+			const r = await _captureSendFrame('screen');
+			if (!r.ok) {
+				return {
+					status: 'failed',
+					error: r.error,
+					hint: 'Screen-capture server may not be running. Start it with `bash src/startup.sh`.',
+				};
+			}
+			return {
+				status: 'frame_captured',
+				source: r.source,
+				question: question ?? null,
+				_note: question
+					? (mode === 'both'
+						? `No selection found; frame is in your vision context. Answer: ${question}`
+						: `Frame is in your vision context. Answer: ${question}`)
+					: 'Frame is in your vision context. Describe what you see.',
+			};
+		}
+
+		// Unreachable in practice — exhaustive guard for the mode enum.
+		return { status: 'no_op', question: question ?? null };
 	},
 };
 
