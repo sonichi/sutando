@@ -895,8 +895,45 @@ _push_only_impl() {
     git add -A
     if git diff --cached --quiet; then
         log "_push_only_impl: nothing to commit"
-        echo "sync-workspace: nothing to push (clean working tree)"
-        return 0
+        # A clean tree does NOT mean "done": a prior push may have failed (auth
+        # blip, network, the recovered-from case during first --init) leaving a
+        # local commit that the remote never received. Without this, a transient
+        # push failure leaves the host branch silently stale until the NEXT
+        # content change happens to create a fresh commit.
+        #
+        # Check the remote AUTHORITATIVELY with ls-remote rather than the local
+        # remote-tracking ref: a fetch without --prune leaves a stale
+        # refs/remotes/origin/... ref after the remote branch is gone, which
+        # would falsely read as "up to date" and skip the recovery push.
+        local host_ws_seg local_sha remote_out ls_rc remote_sha
+        host_ws_seg="$(_host_ws_segment)"
+        local_sha="$(git rev-parse HEAD 2>/dev/null || echo "")"
+        remote_out="$(git ls-remote --heads origin "host/${host_ws_seg}" 2>/dev/null)"; ls_rc=$?
+        remote_sha="$(printf '%s\n' "$remote_out" | awk 'NR==1{print $1}')"
+        if [ -z "$local_sha" ]; then
+            echo "sync-workspace: nothing to push (no local commit yet)"
+            return 0
+        fi
+        if [ "$ls_rc" -ne 0 ]; then
+            # Couldn't reach the remote to verify — don't thrash a push that
+            # would also fail; report softly and let the next tick retry.
+            echo "sync-workspace: nothing to push (clean tree; could not reach remote to verify)"
+            return 0
+        fi
+        if [ "$remote_sha" = "$local_sha" ]; then
+            echo "sync-workspace: nothing to push (clean working tree, remote up to date)"
+            return 0
+        fi
+        # ls-remote succeeded but the host branch is missing or behind HEAD →
+        # the local commit was never (fully) pushed. Push it now.
+        if git push origin "HEAD:refs/heads/host/${host_ws_seg}" 2>&1 | tee -a "$LOG" >/dev/null; then
+            log "_push_only_impl: pushed previously-unpushed commit(s) to host/${host_ws_seg}"
+            echo "sync-workspace: pushed previously-unpushed commit(s) to host/${host_ws_seg}"
+            return 0
+        fi
+        log "_push_only_impl: push of unpushed commit(s) failed"
+        echo "sync-workspace: push failed (clean tree, unpushed commit); check $LOG" >&2
+        return 1
     fi
 
     # Mass-deletion tripwire (carried over from sync-memory.sh)

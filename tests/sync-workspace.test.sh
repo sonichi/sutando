@@ -1241,6 +1241,38 @@ fi
 
 # ============================================================================
 echo
+echo "==== Test 28: clean tree re-pushes a commit the remote never received (push-retry gap) ===="
+# Regression: a failed/lost initial push left the host branch stale because
+# _push_only_impl returned early on a clean tree without checking whether the
+# remote actually has HEAD. Authoritative ls-remote check now recovers it.
+T28_ROOT="$TEST_ROOT/t28"; mkdir -p "$T28_ROOT"
+T28_VAULT="$T28_ROOT/vault.git"; git init -q --bare "$T28_VAULT"
+T28_WS="$T28_ROOT/ws"; mkdir -p "$T28_WS/notes"; echo "n" > "$T28_WS/notes/t28.md"
+t28_env=(SUTANDO_REPO_DIR="$FIXTURE_REPO" SUTANDO_WORKSPACE="$T28_WS" SUTANDO_TEST_MODE=1 SUTANDO_WS_ID_OVERRIDE=t28ws SUTANDO_HOST_OVERRIDE=t28host)
+T28_BR="refs/heads/host/t28host/t28ws"
+env "${t28_env[@]}" bash "$SYNC" --vault-url "$T28_VAULT" --init >/dev/null 2>&1
+# Simulate a lost / never-completed push: branch gone from the vault, tree clean.
+git --git-dir="$T28_VAULT" update-ref -d "$T28_BR" 2>/dev/null
+t28_out=$(env "${t28_env[@]}" bash "$SYNC" --vault-url "$T28_VAULT" --push-only 2>&1)
+if git --git-dir="$T28_VAULT" show-ref --quiet "$T28_BR"; then
+  echo "  OK: clean-tree --push-only restored the unpushed branch to the vault"; pass=$((pass+1))
+else
+  echo "  FAIL: branch not restored; push-only output: $t28_out"; fail=$((fail+1))
+fi
+case "$t28_out" in
+  *"previously-unpushed"*) echo "  OK: push-only reported the recovery push"; pass=$((pass+1)) ;;
+  *) echo "  FAIL: no recovery-push message: $t28_out"; fail=$((fail+1)) ;;
+esac
+# A subsequent clean tick, remote now up to date, must stay a no-op (not re-push forever).
+t28_noop=$(env "${t28_env[@]}" bash "$SYNC" --vault-url "$T28_VAULT" --push-only 2>&1)
+case "$t28_noop" in
+  *"remote up to date"*) echo "  OK: subsequent clean tick is a no-op (remote up to date)"; pass=$((pass+1)) ;;
+  *"previously-unpushed"*) echo "  FAIL: re-pushed when remote already up to date: $t28_noop"; fail=$((fail+1)) ;;
+  *) echo "  FAIL: unexpected no-op output: $t28_noop"; fail=$((fail+1)) ;;
+esac
+
+# ============================================================================
+echo
 echo "===================="
 echo "Total: $((pass+fail)) — pass: $pass, fail: $fail"
 exit $fail
