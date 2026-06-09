@@ -462,15 +462,18 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     # Inject skill instructions so the agent follows the notify-before-work and
     # transcription protocol even after conversation compaction wipes context.
     # Only injected for owner tasks when the referenced skills are installed.
-    _notify_py = Path(os.path.expanduser("~/.claude/skills/task-progress/scripts/notify.py"))
-    _transcribe_py = Path(os.path.expanduser("~/.claude/skills/audio-transcribe/scripts/transcribe.py"))
+    # CCD-resolved (PR #1525 pattern): never hardcode ~/.claude — nodes may relocate
+    # the config dir via $CLAUDE_CONFIG_DIR.
+    _claude_config = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
+    _notify_py = _claude_config / "skills/task-progress/scripts/notify.py"
+    _transcribe_py = _claude_config / "skills/audio-transcribe/scripts/transcribe.py"
     skill_hints = ""
     if access_tier == "owner" and (_notify_py.exists() or _transcribe_py.exists()):
         hints_lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
         step = 1
         if _notify_py.exists():
             notify_cmd = (
-                f"python3 ~/.claude/skills/task-progress/scripts/notify.py"
+                f"python3 {_notify_py}"
                 f" --source slack --channel-id {channel}"
                 f' --message "On it — back in a moment."'
             )
@@ -484,7 +487,7 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
                         f'   Update notify message to: --message "Got your voice message, give me a moment."'
                     )
                 hints_lines.append(
-                    f"{step}. TRANSCRIBE: python3 ~/.claude/skills/audio-transcribe/scripts/transcribe.py '{attached_path}'"
+                    f"{step}. TRANSCRIBE: python3 {_transcribe_py} '{attached_path}'"
                 )
                 step += 1
         hints_lines.append(f"{step}. Then process and write result to results/{task_id}.txt")
