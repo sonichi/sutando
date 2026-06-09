@@ -45,7 +45,7 @@ _dotenvConfig({ path: join(process.env.HOME ?? '', '.claude/channels/discord/.en
 import { fileURLToPath } from 'node:url';
 import { voiceApiKey } from '../../../src/voice-key.js';
 import { loadVoiceConfig, resolveOwnerMode } from '../../../src/voice-config.js';
-import { execSync, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { VoiceSession, type ToolDefinition, type MainAgent } from 'bodhi-realtime-agent';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
@@ -450,10 +450,12 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 
 	let instructions: string;
 	if (isOwner) {
-		const repoUrl = (() => {
-			try { return execSync('git remote get-url origin', { timeout: 2_000 }).toString().trim().replace(/\.git$/, ''); }
-			catch { return ''; }
-		})();
+		// Canonical Sutando repo. Was `git remote get-url origin`, but `origin` is
+		// the per-instance PRIVATE mirror/fork (e.g. liususan091219/sutando-private)
+		// → the model was told the wrong repo and opened the private fork for "open
+		// the sutando repo / PR N". Hardcode the canonical public repo (env-
+		// overridable) so the prompt never resolves to a remote-derived guess.
+		const repoUrl = process.env.SUTANDO_GH_REPO_URL || 'https://github.com/sonichi/sutando';
 		instructions = [
 			`You are Sutando, a personal AI assistant. You are in a Discord voice channel with your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''}.`,
 			'YOU are Sutando — the AI assistant. The person speaking is your OWNER, a human. Do NOT confuse yourself with them.',
