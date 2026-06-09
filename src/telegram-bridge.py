@@ -37,8 +37,8 @@ from result_markers import parse_markers  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
-from vault_intercept import intercept_vault_commands  # noqa: E402
-from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402REPO = resolve_workspace()
+from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
+REPO = resolve_workspace()
 TASKS_DIR = REPO / "tasks"
 RESULTS_DIR = REPO / "results"
 

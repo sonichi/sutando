@@ -277,9 +277,9 @@ api_key = get_vault_key("OPENAI_API_KEY")  # raises KeyError if not found
 
 **CLI (for subprocesses):**
 ```bash
-python3 skills/vault/vault.py list                           # list stored key names
-python3 skills/vault/vault.py get KEY                        # print value
-python3 skills/vault/vault.py env KEY1 KEY2 -- python3 x.py  # inject as env vars
+python3 skills/secret-vault/secret-vault.py list                           # list stored key names
+python3 skills/secret-vault/secret-vault.py get KEY                        # print value
+python3 skills/secret-vault/secret-vault.py env KEY1 KEY2 -- python3 x.py  # inject as env vars
 ```
 
 If an integration needs a key that isn't in the vault yet, ask the user to send `vault set KEY value` via Slack or Discord — the bridge intercepts it securely before it touches disk.
