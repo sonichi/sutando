@@ -56,27 +56,26 @@ let generateSpeech: ((text: string, opts: { category: string; label: string }) =
 // Config
 // =============================================================================
 
-// Shape check: a valid Google AI Studio key starts with "AIza" and is
-// typically 39 chars (v1 format). Catches common misconfigurations
-// (truncated paste, wrong variable, stale template value) at startup
-// instead of letting the voice session fail silently on connect.
+// Shape check: catch common misconfigurations (truncated paste, wrong
+// variable, stale template value) at startup instead of letting the voice
+// session fail silently on connect. Do not pin this to a fixed prefix:
+// Google has issued multiple AI Studio API-key formats over time.
 function assertGeminiKey(name: string, value: string): void {
 	if (!value) { console.error(`Error: ${name} is required`); process.exit(1); }
-	// Upper bound of 60 (vs canonical ~39) gives headroom for Google key
-	// format rotations — Mini flagged they rotated once (2020→2023) and a
-	// tight bound would fail-fast on legitimate future keys.
-	const looksValid = value.startsWith('AIza') && value.length >= 35 && value.length <= 60;
+	const looksValid =
+		value === value.trim()
+		&& value.length >= 20
+		&& value.length <= 200
+		&& !/\s/.test(value)
+		&& value !== 'your-gemini-key';
 	if (!looksValid) {
 		// Do NOT interpolate anything derived from `value` into the log —
 		// CodeQL's js/clear-text-logging treats env vars matching the KEY
 		// heuristic as taint sources, and any PropRead of that source
-		// (e.g. `value.length`, `value.startsWith(...)`) flows into the
-		// console.error sink. The previous `${value.length}` + prefix-ok
-		// diagnostic was why #44 wouldn't close after #486. Keep the log
-		// static: name + expected format + remediation URL.
+		// (e.g. `value.length`) flows into the console.error sink. Keep the
+		// log static: name + expected format + remediation URL.
 		console.error(
-			`Error: ${name} does not look like a Google AI Studio key ` +
-			`(expected "AIza..." 35-60 chars). ` +
+			`Error: ${name} does not look like a Google AI Studio key. ` +
 			`Rotate at https://ai.google.dev → "Get API key" and update .env.`
 		);
 		process.exit(1);
