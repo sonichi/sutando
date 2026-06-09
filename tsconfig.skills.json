@@ -3,5 +3,8 @@
   "compilerOptions": {
     "noEmit": true
   },
-  "include": ["skills/*/scripts/**/*.ts", "src"]
+  "include": [
+    "skills/**/*.ts",
+    "src"
+  ]
 }
