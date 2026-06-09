@@ -5,6 +5,8 @@ Same file-based architecture as the Telegram and voice bridges.
 
 Usage: python3 src/discord-bridge.py
 """
+from __future__ import annotations
+
 
 import asyncio
 import json
