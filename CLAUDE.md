@@ -221,7 +221,7 @@ Use the `task-progress` skill for any task involving research, code changes, PRs
 analysis, or anything likely to take more than ~60 seconds:
 
 ```bash
-python3 ~/.claude/skills/task-progress/scripts/notify.py \
+python3 $CLAUDE_CONFIG_DIR/skills/task-progress/scripts/notify.py \
   --source <source> --channel-id <channel_id> \
   --message "On it — looking into that now. Back in a minute."
 ```

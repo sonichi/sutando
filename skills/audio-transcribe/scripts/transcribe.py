@@ -32,6 +32,10 @@ _AUDIO_MIME: dict[str, str] = {
 }
 
 
+def _claude_config() -> Path:
+    """CCD-resolved config dir (PR #1525 pattern) — never hardcode ~/.claude."""
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
+
 def _api_key() -> str:
     """Resolve GEMINI_API_KEY from env, then workspace .env, then bridge .envs."""
     for var in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
@@ -44,9 +48,9 @@ def _api_key() -> str:
         workspace = str(Path.home() / ".sutando" / "workspace")
     candidates = [
         Path(workspace) / ".env",
-        Path.home() / ".claude" / "channels" / "slack" / ".env",
-        Path.home() / ".claude" / "channels" / "discord" / ".env",
-        Path.home() / ".claude" / "channels" / "telegram" / ".env",
+        _claude_config() / "channels" / "slack" / ".env",
+        _claude_config() / "channels" / "discord" / ".env",
+        _claude_config() / "channels" / "telegram" / ".env",
     ]
     for env_path in candidates:
         try:

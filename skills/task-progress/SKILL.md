@@ -64,7 +64,7 @@ Read the task file to get `source` and `channel_id` (or `chat_id` for Telegram),
 **immediately after reading the task**:
 
 ```bash
-python3 ~/.claude/skills/task-progress/scripts/notify.py \
+python3 $CLAUDE_CONFIG_DIR/skills/task-progress/scripts/notify.py \
   --source slack \
   --channel-id D0B5L7X2TK2 \
   --message "On it — looking into that now. Back in a minute."
@@ -79,7 +79,7 @@ For a Slack @mention (threaded reply), add `--thread-ts <ts>` to keep the update
 
 Mid-task checkpoint update:
 ```bash
-python3 ~/.claude/skills/task-progress/scripts/notify.py \
+python3 $CLAUDE_CONFIG_DIR/skills/task-progress/scripts/notify.py \
   --source slack \
   --channel-id D0B5L7X2TK2 \
   --message "Done with the research — writing up the summary now."
@@ -97,9 +97,9 @@ Optional for Slack @mentions: `reply_thread_ts:` → `--thread-ts`
 
 ## Supported channels
 
-- **Slack** — `chat.postMessage`, token from `~/.claude/channels/slack/.env` (`SLACK_BOT_TOKEN`)
-- **Discord** — REST v10 messages, token from `~/.claude/channels/discord/.env` (`DISCORD_BOT_TOKEN`)
-- **Telegram** — `sendMessage`, token from `~/.claude/channels/telegram/.env` (`TELEGRAM_BOT_TOKEN`)
+- **Slack** — `chat.postMessage`, token from `$CLAUDE_CONFIG_DIR/channels/slack/.env` (`SLACK_BOT_TOKEN`)
+- **Discord** — REST v10 messages, token from `$CLAUDE_CONFIG_DIR/channels/discord/.env` (`DISCORD_BOT_TOKEN`)
+- **Telegram** — `sendMessage`, token from `$CLAUDE_CONFIG_DIR/channels/telegram/.env` (`TELEGRAM_BOT_TOKEN`)
 
 ## Fail-open
 

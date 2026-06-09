@@ -28,9 +28,9 @@ a file was sent.
 
 1. `GEMINI_API_KEY` or `GOOGLE_API_KEY` in the process environment
 2. `$SUTANDO_WORKSPACE/.env` (default: `~/.sutando/workspace/.env`)
-3. `~/.claude/channels/slack/.env`
-4. `~/.claude/channels/discord/.env`
-5. `~/.claude/channels/telegram/.env`
+3. `$CLAUDE_CONFIG_DIR/channels/slack/.env`
+4. `$CLAUDE_CONFIG_DIR/channels/discord/.env`
+5. `$CLAUDE_CONFIG_DIR/channels/telegram/.env`
 
 ## Bridge integration
 
