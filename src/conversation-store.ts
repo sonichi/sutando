@@ -469,6 +469,12 @@ export interface SpeakerMeta {
 	speakerName?: string;      // display name (nickname || username)
 	speakerType?: 'human' | 'agent';
 	spoken?: boolean;          // false = generated but name-gate suppressed (no audio played)
+	// Override the row timestamp (epoch SECONDS). Default is Date.now() at write time.
+	// Needed for per-speaker STT (#1427, Susan 2026-06-09): a user utterance is WRITTEN
+	// ~3s after it was spoken (STT latency), so stamping it at write time sorts it AFTER
+	// the tool_call it actually preceded ("记录反了"). Pass the speech-end time so the
+	// recorded order matches reality.
+	tsUnix?: number;
 }
 
 /** Record a conversation turn. Source is derived from `role` (`phone-*` →
@@ -484,7 +490,7 @@ export function recordConversation(role: string, text: string, sessionId?: strin
 	try {
 		if (source === 'discord-voice') {
 			stmt.run(
-				Date.now() / 1000, kindFromRole(role), text, null, sessionId ?? null,
+				meta?.tsUnix ?? Date.now() / 1000, kindFromRole(role), text, null, sessionId ?? null,
 				meta?.speakerId ?? null,
 				meta?.speakerName ?? null,
 				meta?.speakerType ?? null,

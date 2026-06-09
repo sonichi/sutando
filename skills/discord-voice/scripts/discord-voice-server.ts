@@ -1338,6 +1338,11 @@ function pcm16ToWav(pcm: Buffer, sampleRate = 16000): Buffer {
 // the audio pipeline, never throws into it. Mirrors describeScreenshot's REST
 // generateContent pattern (src/browser-tools.ts).
 async function transcribeAndRecordUtterance(s: DiscordVoiceSession, userId: string, pcm: Buffer): Promise<void> {
+	// Speech-end time, captured at entry (this fn is invoked from resampler.on('end'),
+	// i.e. the moment the utterance ended). STT below takes ~3s, so we stamp the recorded
+	// row with THIS time, not the post-STT write time — otherwise the utterance sorts AFTER
+	// the tool_call it preceded ("记录反了", Susan 2026-06-09).
+	const _utteranceTsUnix = Date.now() / 1000;
 	// Prefer the GENERAL (paid) key for this background recording STT so it does
 	// NOT compete with — and exhaust — the live voice session's free voice key.
 	// One STT call per utterance per speaker blew GEMINI_VOICE_API_KEY's free-tier
@@ -1458,6 +1463,7 @@ async function transcribeAndRecordUtterance(s: DiscordVoiceSession, userId: stri
 			speakerName: spk?.name,
 			speakerType: 'human',
 			spoken: true,
+			tsUnix: _utteranceTsUnix,  // speech-end time, not post-STT write time (fixes 记录反了)
 		});
 		console.log(`${ts()} [STT] recorded ${userId} (${spk?.name ?? '?'}): "${transcript.slice(0, 60)}"`);
 	} catch (err) {
