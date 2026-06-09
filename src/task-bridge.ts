@@ -9,7 +9,8 @@
  */
 
 import { writeFileSync, readFileSync, existsSync, unlinkSync, mkdirSync, readdirSync, appendFileSync, renameSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { homedir } from 'node:os';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from './workspace_default.js';
@@ -251,11 +252,14 @@ export const workTool: ToolDefinition = {
 		const concatMatch = /\b(prepend|concatenat|concat|image.*video|video.*image)\b/i.test(task);
 		if (concatMatch) {
 			try {
-				const { execSync } = await import('node:child_process');
-				const image = execSync('ls -t /tmp/discord-inbox/*.jpg /tmp/discord-inbox/*.png 2>/dev/null | head -1', { timeout: 3000 }).toString().trim();
-				const video = execSync('ls -t /tmp/sutando-recording-*-narrated-subtitled.mov /tmp/sutando-recording-*-narrated.mov /tmp/sutando-recording-*.mov 2>/dev/null | head -1', { timeout: 3000 }).toString().trim();
+				const { execFileSync } = await import('node:child_process');
+				// ls globs need shell for wildcard expansion — command strings are static literals (fixes #1451)
+				const image = execFileSync('/bin/sh', ['-c', 'ls -t /tmp/discord-inbox/*.jpg /tmp/discord-inbox/*.png 2>/dev/null | head -1'], { timeout: 3000 }).toString().trim();
+				const video = execFileSync('/bin/sh', ['-c', 'ls -t /tmp/sutando-recording-*-narrated-subtitled.mov /tmp/sutando-recording-*-narrated.mov /tmp/sutando-recording-*.mov 2>/dev/null | head -1'], { timeout: 3000 }).toString().trim();
 				if (image && video) {
-					const result = execSync(`bash ~/.claude/skills/video-concat/scripts/prepend-image.sh "${image}" "${video}" 3`, { timeout: 60000 }).toString().trim();
+					// execFileSync argv array bypasses shell — image/video paths are separate args, no interpolation (fixes #1451)
+					const scriptPath = resolve(join(homedir(), '.claude/skills/video-concat/scripts/prepend-image.sh'));
+					const result = execFileSync('bash', [scriptPath, image, video, '3'], { timeout: 60000 }).toString().trim();
 					const parsed = JSON.parse(result);
 					return { status: 'done', result: `Video with image prepended: ${parsed.output} (${parsed.size_mb}MB)` };
 				}
@@ -265,8 +269,9 @@ export const workTool: ToolDefinition = {
 		// Check if the watcher (Claude Code brain) is running
 		let watcherOnline = false;
 		try {
-			const { execSync } = await import('node:child_process');
-			const watcherRunning = execSync('pgrep -f "watch-tasks" 2>/dev/null', { encoding: 'utf-8' }).trim();
+			const { execFileSync } = await import('node:child_process');
+			// execFileSync argv array — no shell interpolation (fixes #1451)
+			const watcherRunning = execFileSync('pgrep', ['-f', 'watch-tasks'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
 			watcherOnline = !!watcherRunning;
 		} catch {
 			// pgrep returns exit code 1 if no match

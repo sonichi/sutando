@@ -28,7 +28,7 @@
 // This module is pure (no side effects on import) so it can be unit-tested
 // without booting the voice agent.
 
-import { execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 
 export type BaseMode = 'active' | 'meeting' | 'presenter';
 
@@ -53,7 +53,7 @@ export interface ModeState {
  */
 export function isPresenterActiveDefault(): boolean {
 	try {
-		const out = execSync('curl -s --max-time 1 http://localhost:7877/presenter', { timeout: 2_000 }).toString();
+		const out = execFileSync('curl', ['-s', '--max-time', '1', 'http://localhost:7877/presenter'], { timeout: 2_000 }).toString();
 		const json = JSON.parse(out);
 		return json && json.active === true;
 	} catch {

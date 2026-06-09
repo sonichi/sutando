@@ -701,11 +701,12 @@ export const slideControlTool: ToolDefinition = {
 	async execute(args) {
 		const { action, slideNumber } = args as { action: 'next' | 'previous' | 'goto'; slideNumber?: number };
 		try {
-			// All slide navigation uses DOM manipulation for reliability.
-			// IMPORTANT: address slides by VISUAL POSITION (1-indexed) — querySelectorAll('.slide')[N-1] —
-			// NOT by id="s"+N. The deck's slide IDs are non-contiguous (s1, s1b, s2, s2b, s3, s4, s5, s6,
-			// s65, s7, s8 — 11 slides where the visual-7th is s5, not s7). Using id="s"+N silently misroutes
-			// every "go to slide N" cue once any inter-slide (s1b/s2b/s65) is present.
+			// All slide navigation uses DOM manipulation for reliability, and is
+			// LAYOUT-AGNOSTIC: it addresses slides by VISUAL POSITION (1-indexed) via the
+			// deck's live querySelectorAll('.slide') order — never by id="s"+N. The deck
+			// owns its own id-map; slide IDs are non-contiguous and deck-specific, so
+			// id-based addressing would silently misroute "go to slide N" cues. Reading the
+			// live .slide DOM keeps this tool correct across any deck with no per-deck edits.
 			let js: string;
 			if (action === 'goto' && slideNumber) {
 				js = `var ss=document.querySelectorAll(\\".slide\\");for(var j=0;j<ss.length;j++){ss[j].classList.remove(\\"active\\")};var idx=${slideNumber}-1;if(idx>=0&&idx<ss.length){ss[idx].classList.add(\\"active\\");document.getElementById(\\"cur\\").textContent=String(${slideNumber})}`;

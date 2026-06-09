@@ -59,6 +59,7 @@ from util_paths import shared_personal_path  # noqa: E402
 from task_priority import default_priority_for_source  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
+from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 REPO = resolve_workspace()
 
 # discord-voice "magic word" join trigger (issue: za-warudo summon). The
@@ -539,6 +540,27 @@ def load_channel_allowed(channel_id):
     if cfg is None:
         return None
     return cfg[1]
+
+def _should_notify_owner_on_seed(sender_id, owner_ids):
+    """True iff a thread auto-seed should @-mention the owner.
+
+    Fires only when a NON-OWNER seeds the thread: an auto-opened thread can
+    otherwise quietly accumulate sandboxed (non-owner) replies the owner never
+    sees, because the @-mention is what reaches the owner's Discord client even
+    when they aren't following the thread. Owner-seeded threads need no ping —
+    the owner is already there. False when there is no owner to mention.
+    """
+    owners = {str(o) for o in (owner_ids or [])}
+    return bool(owners) and str(sender_id) not in owners
+
+def _format_seed_notice(owner_id, author_mention, parent_label, thread_id_str):
+    """Inline notice posted to a freshly auto-seeded thread. Pure (no I/O)."""
+    return (
+        f"<@{owner_id}> 🌱 Auto-seeded this thread to access.json "
+        f"(first message from {author_mention}, parent {parent_label}). "
+        f"Tier still resolves by sender identity — non-owners stay sandboxed. "
+        f"`/discord:access group rm {thread_id_str}` to undo."
+    )
 
 def load_channel_auto_react(channel_id):
     """Return list of emoji strings to auto-react with on each new message in this
@@ -2184,7 +2206,7 @@ async def _handle_discord_message(message, force=False):
         except Exception as e:
             print(f"  [dm-checkpoint] update failed: {e}", flush=True)
 
-    print(f"  [msg] #{channel_name} @{username}: {text[:80]} (mentions: {[str(m) for m in message.mentions]}, is_dm: {is_dm}, embeds: {len(message.embeds)}, type: {message.type}, ref: {message.reference is not None})", flush=True)
+    print(f"  [msg] #{channel_name} @{username}: {redact_vault_commands(text)[:80]} (mentions: {[str(m) for m in message.mentions]}, is_dm: {is_dm}, embeds: {len(message.embeds)}, type: {message.type}, ref: {message.reference is not None})", flush=True)
     # Debug: log message snapshots for forwarded messages
     if hasattr(message, 'message_snapshots') and message.message_snapshots:
         print(f"  [debug] message_snapshots: {message.message_snapshots}", flush=True)
@@ -2284,7 +2306,20 @@ async def _handle_discord_message(message, force=False):
         #    {requireMention: False} with no allowFrom (no restriction). A
         #    thread under an open parent must not be MORE restrictive.
         #  - missing parent_cfg → engager-only [author_id] (safe default).
-        if bot_mentioned and isinstance(message.channel, discord.Thread):
+        # Ungated 2026-06-06 (was `if bot_mentioned and ...`): the bot_mentioned
+        # gate left a gap where any thread's FIRST message that did NOT mention
+        # the bot was silently dropped (the thread never landed in access.json,
+        # so the next load_channel_config saw `thread_id_str not in groups` and
+        # the bridge gave it no allowFrom). Hit live 2026-05-25 on the ep013
+        # thread when Chi's "start from news candidate" message at 13:38Z went
+        # unprocessed for ~2h until Chi explicitly @-mentioned the bot. I/O cost
+        # of ungating is bounded: only the FIRST message per thread incurs the
+        # read+write; subsequent messages hit the `thread_id_str not in
+        # access_groups` early-out and proceed unchanged. After first message
+        # the thread is permanently seeded, so cost amortizes to zero. Tracked
+        # in pending-questions.md (2026-05-17 entry + 2026-05-25 + 2026-06-02
+        # updates).
+        if isinstance(message.channel, discord.Thread):
             try:
                 access_data = json.loads(ACCESS_FILE.read_text())
                 access_groups = access_data.setdefault('groups', {})
@@ -2310,6 +2345,18 @@ async def _handle_discord_message(message, force=False):
                     tmp_path.write_text(json.dumps(access_data, indent=2))
                     os.replace(tmp_path, ACCESS_FILE)
                     print(f"  [thread-engage] added thread {thread_id_str} (parent {parent_id_str}) to access.json with {thread_entry}", flush=True)
+                    # Owner-visibility ping (one-shot, first seed only): when a
+                    # non-owner seeds the thread, @-mention the owner inline so an
+                    # auto-opened thread can't silently accumulate sandboxed replies
+                    # the owner never sees (#1498 slip-risk).
+                    owner_ids = access_data.get('allowFrom', [])
+                    if _should_notify_owner_on_seed(message.author.id, owner_ids):
+                        try:
+                            parent_label = f"#{message.channel.parent.name}" if message.channel.parent else str(parent_id_str)
+                            await message.channel.send(
+                                _format_seed_notice(owner_ids[0], message.author.mention, parent_label, thread_id_str))
+                        except Exception as e:
+                            print(f"  [thread-engage] owner-notice send failed: {e}", flush=True)
             except Exception as e:
                 print(f"  [thread-engage] failed to update access.json: {e}", flush=True)
 
@@ -2655,6 +2702,21 @@ async def _handle_discord_message(message, force=False):
     ts = int(time.time() * 1000)
     task_id = f"task-{ts}"
     task_file = TASKS_DIR / f"{task_id}.txt"
+
+    # Intercept vault commands before any disk write.
+    # Owner-tier only: secrets go to Keychain, task file gets [STORED-IN-KEYCHAIN].
+    # Non-owner: vault patterns are redacted to prevent Keychain pollution by
+    # untrusted senders — the actual secret never reaches the task file either way.
+    if text:
+        if access_tier == "owner":
+            vault_result = intercept_vault_commands(text)
+            text = vault_result.text
+            if vault_result.stored:
+                print(f"  [vault] stored keys: {vault_result.stored}", flush=True)
+            if vault_result.failed:
+                print(f"  [vault] store failed (still redacted): {vault_result.failed}", flush=True)
+        else:
+            text = redact_vault_commands(text)
 
     # Inject tier-specific in-band instructions so the core agent cannot
     # accidentally process a non-owner task with full capabilities.

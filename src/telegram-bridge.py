@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -36,6 +37,7 @@ from result_markers import parse_markers  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
+from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 REPO = resolve_workspace()
 TASKS_DIR = REPO / "tasks"
 RESULTS_DIR = REPO / "results"
@@ -366,7 +368,6 @@ def send_file(chat_id, file_path, caption=""):
         return {"ok": False}
 
 def send_reply(chat_id, text, task_id: str | None = None):
-    import re
     # Extract file paths: [file: /path/to/file] or [send: /path/to/file]
     file_pattern = re.compile(r'\[(?:file|send|attach):\s*([^\]]+)\]')
     files = file_pattern.findall(text)
@@ -532,13 +533,23 @@ def main():
 
                 forward_note = extract_forward_note(msg)
 
-                print(f"  @{username}{forward_note}: {text}{attachment_note}")
+                print(f"  @{username}{forward_note}: {redact_vault_commands(text)}{attachment_note}")
 
                 # Write as task (same format as voice bridge)
                 ts = int(time.time() * 1000)
                 task_id = f"task-{ts}"
                 task_file = TASKS_DIR / f"{task_id}.txt"
                 priority = default_priority_for_source("telegram", "owner")
+
+                # Intercept vault commands before disk write — Telegram treats
+                # all senders as owner-tier (allowlist-gated bot token).
+                if text:
+                    vault_result = intercept_vault_commands(text)
+                    text = vault_result.text
+                    if vault_result.stored:
+                        print(f"  [vault] stored keys: {vault_result.stored}", flush=True)
+                    if vault_result.failed:
+                        print(f"  [vault] store failed (still redacted): {vault_result.failed}", flush=True)
 
                 # Inject skill instructions so the agent follows notify-before-work
                 # and transcription protocol even after conversation compaction.
@@ -609,6 +620,17 @@ def main():
                 PROACTIVE_PREFIXES = ("proactive-", "briefing-", "insight-", "friction-")
                 for f in RESULTS_DIR.iterdir():
                     if any(f.name.startswith(p) for p in PROACTIVE_PREFIXES) and f.suffix == ".txt":
+                        # Peek before claiming: skip Discord-targeted proactive files.
+                        # [channel: <17-20 digit snowflake>] is a Discord-only marker;
+                        # claiming it here sends the literal text to Telegram DM instead
+                        # of leaving it for discord-bridge. (#1401)
+                        try:
+                            peek = f.read_text(errors="ignore").lstrip()
+                        except OSError:
+                            continue
+                        if peek.startswith("[channel:") and \
+                                re.match(r'\[channel:\s*\d{17,20}\]', peek):
+                            continue
                         # Claim-by-rename: atomic move to a `.sending`
                         # suffix before reading, so a concurrent poll
                         # (same bridge, or a race with discord-bridge)
