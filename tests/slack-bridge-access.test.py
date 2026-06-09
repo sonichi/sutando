@@ -79,12 +79,14 @@ def main() -> int:
     # 3. _write_task fails closed on unknown sender. Budget bumped 2000 →
     # 4000 in 98e188b (file-attachment + thread_ts moved in), then →
     # 6000 in the tierMap PR (tier resolution + in-band system-instruction
-    # block for non-owner tiers added another ~1.5k chars). The check that
+    # block for non-owner tiers added another ~1.5k chars), then →
+    # 8000 in the secret-vault PR (vault interception block grew the body
+    # to ~6.3k). The check that
     # actually matters runs against the FIRST ~200 chars of the body
     # (the `user_id not in allowed` gate); the budget only needs to be
     # large enough to terminate at the next `\ndef ` boundary.
     write_match = re.search(
-        r"def _write_task\([^)]*\)[^:]*:\s*\n([\s\S]{0,6000}?)(?=\n\ndef |\Z)",
+        r"def _write_task\([^)]*\)[^:]*:\s*\n([\s\S]{0,8000}?)(?=\n\ndef |\Z)",
         src,
     )
     if not write_match:

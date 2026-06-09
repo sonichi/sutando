@@ -9,10 +9,20 @@ from unittest.mock import MagicMock, call, mock_open, patch
 
 # Ensure src/ is on path for vault_intercept
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "skills", "vault"))
 
 import vault_intercept
-import vault as vault_cli
+
+# skills/secret-vault/secret-vault.py (renamed from skills/vault/vault.py) has a
+# hyphenated filename, so it can't be imported by name. Load it via importlib and
+# register under "vault" so the patch("vault.*") strings below keep resolving.
+import importlib.util
+_SV_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "skills", "secret-vault", "secret-vault.py"
+)
+_spec = importlib.util.spec_from_file_location("vault", _SV_PATH)
+vault_cli = importlib.util.module_from_spec(_spec)
+sys.modules["vault"] = vault_cli
+_spec.loader.exec_module(vault_cli)
 
 
 # ---------------------------------------------------------------------------
