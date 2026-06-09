@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -36,6 +37,7 @@ from result_markers import parse_markers  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
+from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 REPO = resolve_workspace()
 TASKS_DIR = REPO / "tasks"
 RESULTS_DIR = REPO / "results"
@@ -388,7 +390,6 @@ def send_file(chat_id, file_path, caption=""):
         return {"ok": False}
 
 def send_reply(chat_id, text, task_id: str | None = None):
-    import re
     # Extract file paths: [file: /path/to/file] or [send: /path/to/file]
     file_pattern = re.compile(r'\[(?:file|send|attach):\s*([^\]]+)\]')
     files = file_pattern.findall(text)
@@ -558,13 +559,54 @@ def main():
 
                 forward_note = extract_forward_note(msg)
 
-                print(f"  @{username}{forward_note}: {text}{attachment_note}")
+                print(f"  @{username}{forward_note}: {redact_vault_commands(text)}{attachment_note}")
 
                 # Write as task (same format as voice bridge)
                 ts = int(time.time() * 1000)
                 task_id = f"task-{ts}"
                 task_file = TASKS_DIR / f"{task_id}.txt"
                 priority = default_priority_for_source("telegram", "owner")
+
+                # Intercept vault commands before disk write — Telegram treats
+                # all senders as owner-tier (allowlist-gated bot token).
+                if text:
+                    vault_result = intercept_vault_commands(text)
+                    text = vault_result.text
+                    if vault_result.stored:
+                        print(f"  [vault] stored keys: {vault_result.stored}", flush=True)
+                    if vault_result.failed:
+                        print(f"  [vault] store failed (still redacted): {vault_result.failed}", flush=True)
+
+                # Inject skill instructions so the agent follows notify-before-work
+                # and transcription protocol even after conversation compaction.
+                # Only injected when the referenced skills are installed on this node.
+                _notify_py = Path(os.path.expanduser("~/.claude/skills/task-progress/scripts/notify.py"))
+                _transcribe_py = Path(os.path.expanduser("~/.claude/skills/audio-transcribe/scripts/transcribe.py"))
+                has_audio_attach = attachment_note and any(
+                    attachment_note.lower().find(ext) != -1
+                    for ext in (".m4a", ".mp3", ".ogg", ".opus", ".oga", ".wav", ".webm", ".aac")
+                )
+                tg_skill_hints = ""
+                if _notify_py.exists() or _transcribe_py.exists():
+                    lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
+                    step = 1
+                    if _notify_py.exists():
+                        notify_cmd = (
+                            f"python3 ~/.claude/skills/task-progress/scripts/notify.py"
+                            f" --source telegram --chat-id {chat_id}"
+                        )
+                        if has_audio_attach:
+                            lines.append(f'{step}. NOTIFY FIRST: {notify_cmd} --message "Got your voice message, give me a moment."')
+                        else:
+                            lines.append(f'{step}. NOTIFY FIRST (if task takes >60s): {notify_cmd} --message "On it — back in a moment."')
+                        step += 1
+                    if has_audio_attach and _transcribe_py.exists():
+                        attached_path = attachment_note.split("[File attached: ")[-1].rstrip("]").split("\n")[0]
+                        lines.append(f"{step}. TRANSCRIBE: python3 ~/.claude/skills/audio-transcribe/scripts/transcribe.py '{attached_path}'")
+                        step += 1
+                    lines.append(f"{step}. Process transcript and write result to results/{task_id}.txt")
+                    tg_skill_hints = "\n" + "\n".join(lines) + "\n"
+
                 task_file.write_text(
                     f"id: {task_id}\n"
                     f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
@@ -572,6 +614,7 @@ def main():
                     f"source: telegram\n"
                     f"chat_id: {chat_id}\n"
                     f"priority: {priority}\n"
+                    f"{tg_skill_hints}"
                 )
                 pending_replies[task_id] = chat_id
 
@@ -603,6 +646,17 @@ def main():
                 PROACTIVE_PREFIXES = ("proactive-", "briefing-", "insight-", "friction-")
                 for f in RESULTS_DIR.iterdir():
                     if any(f.name.startswith(p) for p in PROACTIVE_PREFIXES) and f.suffix == ".txt":
+                        # Peek before claiming: skip Discord-targeted proactive files.
+                        # [channel: <17-20 digit snowflake>] is a Discord-only marker;
+                        # claiming it here sends the literal text to Telegram DM instead
+                        # of leaving it for discord-bridge. (#1401)
+                        try:
+                            peek = f.read_text(errors="ignore").lstrip()
+                        except OSError:
+                            continue
+                        if peek.startswith("[channel:") and \
+                                re.match(r'\[channel:\s*\d{17,20}\]', peek):
+                            continue
                         # Claim-by-rename: atomic move to a `.sending`
                         # suffix before reading, so a concurrent poll
                         # (same bridge, or a race with discord-bridge)
