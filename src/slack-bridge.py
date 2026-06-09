@@ -50,6 +50,7 @@ from result_markers import parse_markers  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
+from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 
 try:
     from slack_bolt import App
@@ -417,6 +418,21 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         # Unknown tier value in config → degrade safely to "other" rather
         # than treating as owner.
         access_tier = "other"
+
+    # Intercept vault commands before any disk write — must happen AFTER
+    # access_tier is resolved so untrusted senders cannot write to Keychain.
+    # Owner-tier: secrets go to Keychain, task file gets [STORED-IN-KEYCHAIN].
+    # Non-owner: patterns redacted, Keychain untouched.
+    if text:
+        if access_tier == "owner":
+            vault_result = intercept_vault_commands(text)
+            text = vault_result.text
+            if vault_result.stored:
+                print(f"  [vault] stored keys: {vault_result.stored}", flush=True)
+            if vault_result.failed:
+                print(f"  [vault] store failed (still redacted): {vault_result.failed}", flush=True)
+        else:
+            text = redact_vault_commands(text)
 
     # Prepend an in-band system instruction for non-owner tiers so the
     # core agent cannot accidentally process a downgraded task with full

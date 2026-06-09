@@ -37,6 +37,7 @@ from result_markers import parse_markers  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
+from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 REPO = resolve_workspace()
 TASKS_DIR = REPO / "tasks"
 RESULTS_DIR = REPO / "results"
@@ -532,13 +533,24 @@ def main():
 
                 forward_note = extract_forward_note(msg)
 
-                print(f"  @{username}{forward_note}: {text}{attachment_note}")
+                print(f"  @{username}{forward_note}: {redact_vault_commands(text)}{attachment_note}")
 
                 # Write as task (same format as voice bridge)
                 ts = int(time.time() * 1000)
                 task_id = f"task-{ts}"
                 task_file = TASKS_DIR / f"{task_id}.txt"
                 priority = default_priority_for_source("telegram", "owner")
+
+                # Intercept vault commands before disk write — Telegram treats
+                # all senders as owner-tier (allowlist-gated bot token).
+                if text:
+                    vault_result = intercept_vault_commands(text)
+                    text = vault_result.text
+                    if vault_result.stored:
+                        print(f"  [vault] stored keys: {vault_result.stored}", flush=True)
+                    if vault_result.failed:
+                        print(f"  [vault] store failed (still redacted): {vault_result.failed}", flush=True)
+
                 task_file.write_text(
                     f"id: {task_id}\n"
                     f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"

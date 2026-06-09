@@ -262,6 +262,28 @@ When the user says "tutorial", "walk me through", or "show me what you can do" (
 
 Keep each step conversational and brief — this is spoken, not read. Focus on what to say/try, skip setup details unless asked.
 
+## Vault — secure secret storage
+
+Secrets passed via Slack/Discord (`vault set KEY VALUE`) are intercepted by the bridge and stored in macOS Keychain. They never touch a file on disk.
+
+**When writing any integration that needs an API key, token, or password — always use vault:**
+
+```python
+from vault_intercept import get_vault_key, list_vault_keys
+
+keys = list_vault_keys()  # returns list of stored key names
+api_key = get_vault_key("OPENAI_API_KEY")  # raises KeyError if not found
+```
+
+**CLI (for subprocesses):**
+```bash
+python3 skills/secret-vault/secret-vault.py list                           # list stored key names
+python3 skills/secret-vault/secret-vault.py get KEY                        # print value
+python3 skills/secret-vault/secret-vault.py env KEY1 KEY2 -- python3 x.py  # inject as env vars
+```
+
+If an integration needs a key that isn't in the vault yet, ask the user to send `vault set KEY value` via Slack or Discord — the bridge intercepts it securely before it touches disk.
+
 ## Built-in tools
 
 **When the user asks for a capability not visible in this file (email, calendar, iMessage, X, screen capture, browser automation, phone calls, etc.), check [`docs/built-in-tools.md`](docs/built-in-tools.md) BEFORE refusing or trying to invent a tool.** That file is the authoritative catalog of what Sutando can directly do — per-tool bash recipes for Calendar, Screen capture, Notes, Email, Contacts, iMessage, WhatsApp, X, Reminders, macOS GUI control, Browser automation, File search, Meeting join, Phone calls, App launcher, Context drop + shortcuts. Kept out of CLAUDE.md to save per-session context budget.
