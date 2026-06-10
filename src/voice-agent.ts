@@ -37,7 +37,7 @@ import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { VoiceSession } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
-import { buildAzureRealtimeTransport } from './voice-backends/azure-realtime.js';
+
 function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
 import { workTool, startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
 import { recordSession, recordToolCall } from './conversation-store.js';
@@ -45,6 +45,44 @@ import { buildSutandoSystemPrompt, buildVoiceAgentContext } from './voice-contex
 import { classifyTransportClose, type ClassifiedClose } from './voice-error-classifier.js';
 
 import { personalPath, sharedPersonalPath, memoryDirEnv } from './util_paths.js';
+
+/**
+ * Build Azure Realtime transport via dynamic import.
+ * Only loads the Azure deps when VOICE_BACKEND=gpt-realtime.
+ */
+async function buildAzureRealtimeTransport() {
+	const { buildAzureRealtimeTransport: buildTransport } = await import('./voice-backends/azure-realtime.js');
+	return buildTransport();
+}
+
+/**
+ * Build VoiceSession config with conditional Azure transport.
+ */
+async function buildVoiceSessionConfig(mainAgent: MainAgent) {
+	const baseConfig = {
+		sessionId: SESSION_ID,
+		userId: 'user',
+		apiKey: GEMINI_VOICE_API_KEY,
+		agents: [mainAgent],
+		initialAgent: 'main' as const,
+		port: PORT,
+		host: HOST,
+		model: google(VOICE_MODEL),
+		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
+		speechConfig: { voiceName: VOICE_NAME },
+		inputAudioTranscription: true,
+	};
+
+	if (VOICE_BACKEND === 'gpt-realtime') {
+		const azureTransport = await buildAzureRealtimeTransport();
+		return {
+			...baseConfig,
+			transport: azureTransport,
+		};
+	}
+
+	return baseConfig;
+}
 
 // Cartesia is loaded dynamically at the bottom of the config section so
 // the `@cartesia/cartesia-js` package is only required when the user has
@@ -930,23 +968,9 @@ async function main() {
 		}
 	}
 
+	const sessionConfig = await buildVoiceSessionConfig(mainAgent);
 	const session = new VoiceSession({
-		sessionId: SESSION_ID,
-		userId: 'user',
-		apiKey: GEMINI_VOICE_API_KEY,
-		agents: [mainAgent],
-		initialAgent: 'main',
-		port: PORT,
-		host: HOST,
-		model: google(VOICE_MODEL),
-		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
-		speechConfig: { voiceName: VOICE_NAME },
-		inputAudioTranscription: true,
-		// When VOICE_BACKEND=gpt-realtime, override Gemini Live with the
-		// Azure-hosted GPT Realtime transport. The apiKey/geminiModel/
-		// speechConfig fields above are ignored when `transport` is set
-		// (per bodhi's VoiceSessionConfig contract).
-		...(VOICE_BACKEND === 'gpt-realtime' ? { transport: buildAzureRealtimeTransport() } : {}),
+		...sessionConfig,
 		hooks: {
 			onSessionStart: (e) => {
 				userTurnCount = 0; userHasInterrupted = false; sessionEnding = false;

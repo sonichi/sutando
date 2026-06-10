@@ -43,9 +43,24 @@ export function buildAzureRealtimeTransport(): LLMTransport {
 		);
 	}
 	console.log(`${ts()} [voice-backend] Azure GPT Realtime: deployment=${AZURE_REALTIME_DEPLOYMENT} endpoint=${AZURE_OPENAI_ENDPOINT}`);
+	
+	// Legacy protocol warning for operators
+	console.warn(`${ts()} [voice-backend] Azure transport using legacy protocol until bodhi upstream supports session.type`);
+	
+	const azureClient = new AzureOpenAI({
+		apiKey: AZURE_OPENAI_KEY,
+		endpoint: AZURE_OPENAI_ENDPOINT,
+		apiVersion: AZURE_REALTIME_API_VERSION,
+		deployment: AZURE_REALTIME_DEPLOYMENT,
+	});
+	
+	// Use a unique symbol to ensure this transport's patch doesn't conflict with others
+	const originalCreate = OpenAIRealtimeWS.create;
+	const patchSymbol = Symbol('azureRealtimePatch');
+	
 	// Construct bodhi's transport with a placeholder key so its internal
 	// fields exist (config, voice, lastAssistantItemId, ...), then swap the
-	// OpenAI client + WS factory to route through Azure.
+	// OpenAI client to route through Azure.
 	// `protocolVersion: 'legacy'` is passed via a cast so this compiles against
 	// bodhi releases that don't yet expose the field in their config type (see
 	// module header CAVEAT — the legacy path must land upstream in bodhi).
@@ -55,25 +70,25 @@ export function buildAzureRealtimeTransport(): LLMTransport {
 		voice: AZURE_REALTIME_VOICE,
 		protocolVersion: 'legacy',
 	} as unknown as ConstructorParameters<typeof OpenAIRealtimeTransport>[0]);
-	const azureClient = new AzureOpenAI({
-		apiKey: AZURE_OPENAI_KEY,
-		endpoint: AZURE_OPENAI_ENDPOINT,
-		apiVersion: AZURE_REALTIME_API_VERSION,
-		deployment: AZURE_REALTIME_DEPLOYMENT,
-	});
-	// Surgically replace the transport's internal OpenAI client (typed
-	// private) with the Azure-flavored one.
+	
+	// Replace the internal client with our Azure instance
 	(transport as unknown as { client: unknown }).client = azureClient;
-	// bodhi's transport calls the static OpenAIRealtimeWS.create; redirect the
-	// first invocation through .azure(), then restore the original so any
-	// non-Azure path keeps working.
-	const originalCreate = OpenAIRealtimeWS.create;
-	let patched = false;
-	(OpenAIRealtimeWS as unknown as { create: typeof OpenAIRealtimeWS.create }).create = async function patchedCreate(client, props) {
-		if (patched) return originalCreate.call(OpenAIRealtimeWS, client, props);
-		patched = true;
-		(OpenAIRealtimeWS as unknown as { create: typeof OpenAIRealtimeWS.create }).create = originalCreate;
-		return OpenAIRealtimeWS.azure(azureClient, { deploymentName: AZURE_REALTIME_DEPLOYMENT });
+	
+	// Patch OpenAIRealtimeWS.create to route the FIRST call for this transport
+	// through Azure, then restore. Using a symbol helps avoid conflicts.
+	let patchApplied = false;
+	(OpenAIRealtimeWS as any)[patchSymbol] = async function azurePatch(client: any, props: any) {
+		if (!patchApplied) {
+			patchApplied = true;
+			// Restore the original immediately
+			(OpenAIRealtimeWS as unknown as { create: typeof OpenAIRealtimeWS.create }).create = originalCreate;
+			return OpenAIRealtimeWS.azure(azureClient, { deploymentName: AZURE_REALTIME_DEPLOYMENT });
+		}
+		return originalCreate.call(OpenAIRealtimeWS, client, props);
 	};
+	
+	// Apply the patch
+	(OpenAIRealtimeWS as unknown as { create: typeof OpenAIRealtimeWS.create }).create = (OpenAIRealtimeWS as any)[patchSymbol];
+	
 	return transport as unknown as LLMTransport;
 }

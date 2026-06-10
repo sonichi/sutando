@@ -16,8 +16,20 @@ AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.com
 # Optional overrides:
 AZURE_REALTIME_DEPLOYMENT=gpt-realtime          # your deployment name
 AZURE_REALTIME_API_VERSION=2025-04-01-preview   # first version to accept session.type
-AZURE_REALTIME_VOICE=alloy
+AZURE_REALTIME_VOICE=alloy                      # see voice options below
 ```
+
+### Voice Options
+
+Available voices for `AZURE_REALTIME_VOICE` (default: `alloy`):
+- `alloy` - Default voice, balanced tone
+- `echo` - Warm, conversational 
+- `fable` - Expressive, dramatic
+- `onyx` - Deep, authoritative
+- `nova` - Bright, energetic
+- `shimmer` - Soft, gentle
+
+**Note**: Azure OpenAI voice options may differ slightly from OpenAI's offerings depending on your deployment and region. Consult your Azure OpenAI service documentation for the complete list of voices available to your specific deployment.
 
 `bash src/startup.sh` then launches the voice agent on `:9900` against Azure
 instead of Gemini. The browser UI is unchanged.
