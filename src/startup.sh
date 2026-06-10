@@ -228,7 +228,30 @@ else
   export ANTHROPIC_BASE_URL=http://localhost:7846
 fi
 
+# A port can LISTEN while the service never responds (single-threaded server
+# blocked on a silent connection, hung event loop). The lsof guards below only
+# check LISTEN, so a wedged service is "already running" forever — exactly how
+# the dashboard stayed unreachable for hours and voice-agent for 26h
+# (2026-06-10). Probe with a real HTTP request before each guard; on timeout,
+# kill the listener so the normal start path takes over. Any response byte
+# counts as alive (a 404 or a WS handshake rejection is fine — curl exits 28
+# only when nothing came back before the deadline). Probe path matches
+# health-check.py's check_port: a cheap unknown path, NOT "/" (dashboard's "/"
+# runs health-check.py as a subprocess — probing it from here would recurse).
+reap_wedged_listener() {
+  local port="$1" name="$2" rc=0
+  lsof -i :"$port" -sTCP:LISTEN > /dev/null 2>&1 || return 0
+  curl -s -o /dev/null -m 10 "http://127.0.0.1:$port/__liveness_probe__" || rc=$?
+  if [ "$rc" -eq 28 ]; then
+    echo "  ⚠ $name (port $port) listening but unresponsive — killing wedged listener"
+    lsof -ti :"$port" -sTCP:LISTEN | xargs kill 2>/dev/null || true
+    sleep 1
+  fi
+  return 0
+}
+
 # 1. Voice agent (Gemini Live on port 9900)
+reap_wedged_listener 9900 voice-agent
 if ! lsof -i :9900 > /dev/null 2>&1; then
   echo "  Starting voice agent (port 9900)..."
   npx tsx src/voice-agent.ts > "$LOGS_DIR/voice-agent.log" 2>&1 &
@@ -238,6 +261,7 @@ else
 fi
 
 # 2. Web client (port 8080)
+reap_wedged_listener 8080 web-client
 if ! lsof -i :8080 > /dev/null 2>&1; then
   echo "  Starting web client (port 8080)..."
   npx tsx src/web-client.ts > "$LOGS_DIR/web-client.log" 2>&1 &
@@ -247,6 +271,7 @@ else
 fi
 
 # 3. Dashboard (port 7844)
+reap_wedged_listener 7844 dashboard
 if ! lsof -i :7844 > /dev/null 2>&1; then
   echo "  Starting dashboard (port 7844)..."
   python3 src/dashboard.py > "$LOGS_DIR/dashboard.log" 2>&1 &
@@ -256,6 +281,7 @@ else
 fi
 
 # 4. Agent API (port 7843)
+reap_wedged_listener 7843 agent-api
 if ! lsof -i :7843 > /dev/null 2>&1; then
   echo "  Starting agent API (port 7843)..."
   python3 src/agent-api.py > "$LOGS_DIR/agent-api.log" 2>&1 &
@@ -268,6 +294,7 @@ fi
 # Skip when Screen Recording perm is missing — otherwise we'd start a server
 # that returns black-PNG denials, which is exactly the stale-7845 state the
 # permcheck above warns about.
+reap_wedged_listener 7845 screen-capture
 if ! lsof -i :7845 > /dev/null 2>&1; then
   if [ "$PERM_OK" -eq 1 ]; then
     echo "  Starting screen capture (port 7845)..."
