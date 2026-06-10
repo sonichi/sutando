@@ -757,12 +757,19 @@ def check_memory() -> dict:
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         pass
 
-    if level >= 4 or swap_used_mb >= swap_fail_mb:
+    # Swap-in-use is sticky on macOS: pages swapped out during a past pressure
+    # event stay counted until touched again, so high swap with a *normal*
+    # kernel pressure level is residue, not active thrash. Fail only when the
+    # kernel itself signals pressure; swap corroborates, it doesn't convict.
+    if level >= 4 or (level >= 2 and swap_used_mb >= swap_fail_mb):
         return {"name": name, "status": "fail",
                 "detail": f"critical memory pressure (level {level}, swap {swap_used_mb:.0f}M in use)"}
+    if level >= 2:
+        return {"name": name, "status": "warn",
+                "detail": f"memory pressure elevated (level {level}, swap {swap_used_mb:.0f}M in use)"}
     if swap_used_mb >= swap_warn_mb:
         return {"name": name, "status": "warn",
-                "detail": f"swapping under pressure (level {level}, swap {swap_used_mb:.0f}M in use)"}
+                "detail": f"swap {swap_used_mb:.0f}M in use but kernel pressure normal (level {level}) — likely residue from a past pressure event"}
     return {"name": name, "status": "ok", "detail": f"pressure normal (level {level}, swap {swap_used_mb:.0f}M)"}
 
 
