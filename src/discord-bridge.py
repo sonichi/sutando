@@ -3404,15 +3404,24 @@ async def poll_results():
                     if _redirect_action:
                         target_channel_id = int(_redirect_action.value)
                         task_tier = "other"
-                        try:
-                            task_body = (TASKS_DIR / f"{task_id}.txt").read_text()
+                        # The core agent may have already moved the processed
+                        # task into tasks/archive/ before we pick up the result
+                        # (2026-06-10: an owner [channel:] forward was dropped
+                        # because the gate read tier from a path that no longer
+                        # existed and failed safe to "other"). Check both.
+                        for _tier_path in (
+                            TASKS_DIR / f"{task_id}.txt",
+                            TASKS_DIR / "archive" / f"{task_id}.txt",
+                        ):
+                            try:
+                                task_body = _tier_path.read_text()
+                            except Exception:
+                                continue
                             for ln in task_body.splitlines():
                                 if ln.startswith("access_tier:"):
                                     task_tier = ln.split(":", 1)[1].strip() or "other"
                                     break
-                        except Exception:
-                            # Missing/unreadable task file → treat as non-owner.
-                            task_tier = "other"
+                            break  # first readable file wins; missing both → "other"
                         if task_tier != "owner":
                             print(
                                 f"  [channel-redirect] dropped — tier '{task_tier}' is not owner "
