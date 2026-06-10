@@ -1,0 +1,59 @@
+# Multi-step agentic workflow tests — does the agent drive a dependent multi-turn
+# task over voice and clean up after itself? Run with:
+#   VTH_CASES=skills/voice-agent-test-harness/workflow_cases.yaml python3 scripts/run_suite.py --quick
+# Each step is judged on the immediate spoken response (did it understand + act on
+# the step). Remote side-effects aren't observable from the prober, so the signal
+# is "did it appropriately handle each step and finish the task" — not git/file state.
+suite: workflow
+version: 1
+
+tests:
+  # --- developer flow: branch -> code -> test -> confirm -> delete ---
+  - id: wf-pr
+    category: workflow
+    soft: true
+    steps:
+      - {say: "I want to make a small code change. First, create a new git branch called voice test demo.", expect: "Acknowledges and creates/switches to a new branch (voice-test-demo or similar).", timeout_s: 18}
+      - {say: "Now add a small Python function that returns the sum of two numbers.", expect: "Acknowledges and adds an add/sum function.", timeout_s: 18}
+      - {say: "Add a unit test for that function.", expect: "Acknowledges and adds a unit test for it.", timeout_s: 18}
+      - {say: "Run the tests and tell me whether they pass.", expect: "Runs the tests and reports a pass/fail result, not a vague deferral.", timeout_s: 20}
+      - {say: "Great. Now delete that branch to clean up.", expect: "Confirms it deleted the voice-test-demo branch — completes cleanup.", timeout_s: 16}
+
+  # --- document flow: create -> section -> summarize -> delete ---
+  - id: wf-doc
+    category: workflow
+    soft: true
+    steps:
+      - {say: "Let's draft a document. Create a new doc about our third quarter planning.", expect: "Acknowledges and creates a document about Q3 planning.", timeout_s: 16}
+      - {say: "Add a section that lists three goals for the quarter.", expect: "Acknowledges and adds a goals section with three items.", timeout_s: 16}
+      - {say: "Now summarize the whole document in one sentence.", expect: "Gives a one-sentence summary of the document.", timeout_s: 16}
+      - {say: "Thanks. Now delete that document to clean up.", expect: "Confirms it deleted the document — completes cleanup.", timeout_s: 16}
+
+  # --- busy startup CEO: inbox + calendar triage ---
+  - id: wf-ceo-inbox
+    category: workflow
+    soft: true
+    steps:
+      - {say: "Give me a quick summary of my unread emails.", expect: "Summarizes unread email (or says the inbox is clear) — does not stall.", timeout_s: 18}
+      - {say: "Draft a short reply to the most urgent one.", expect: "Drafts a reply to the most urgent message and offers to send/edit.", timeout_s: 18}
+      - {say: "What's on my calendar today?", expect: "Lists today's meetings (or says the day is open).", timeout_s: 16}
+      - {say: "Move my three PM meeting to tomorrow.", expect: "Confirms it rescheduled the 3 PM to tomorrow, or asks the one needed detail.", timeout_s: 18}
+
+  # --- busy startup CEO: board-meeting prep ---
+  - id: wf-ceo-brief
+    category: workflow
+    soft: true
+    steps:
+      - {say: "Help me prep for my board meeting. Pull together our key metrics for the quarter.", expect: "Gathers/summarizes key metrics, or asks which metrics matter — engages the task.", timeout_s: 20}
+      - {say: "Now draft three talking points from that.", expect: "Produces three concise talking points.", timeout_s: 18}
+      - {say: "Put that in a doc and share it with my cofounder.", expect: "Confirms it created a doc and shared it (or asks the cofounder's contact).", timeout_s: 18}
+
+  # --- GTM / sales: prospect outreach ---
+  - id: wf-sales-prospect
+    category: workflow
+    soft: true
+    steps:
+      - {say: "Research the company Acme Corp for me — what do they do and how big are they?", expect: "Returns a brief company profile or asks a clarifying detail — engages, doesn't stall.", timeout_s: 20}
+      - {say: "Draft a cold outreach email to their VP of Sales.", expect: "Drafts a tailored cold outreach email to a VP of Sales.", timeout_s: 18}
+      - {say: "Log this as a new lead in my CRM.", expect: "Confirms it logged the lead (or asks which CRM/fields).", timeout_s: 16}
+      - {say: "And set a follow-up reminder for Friday.", expect: "Confirms a follow-up reminder for Friday — completes the sequence.", timeout_s: 16}

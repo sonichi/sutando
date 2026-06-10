@@ -50,6 +50,7 @@ from result_markers import parse_markers  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
+from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 
 try:
     from slack_bolt import App
@@ -256,10 +257,20 @@ def tofu_onboard(user_id: str, username: str | None) -> set:
 
 
 # Track which Slack channel/thread to reply into for each task we wrote.
-# Keyed by task_id; value is {channel, thread_ts} so we can reply in-thread
-# for @mentions and at top-level for DMs.
+# Keyed by task_id; value is {channel, thread_ts, submitted_at, timed_out}
+# so we can reply in-thread for @mentions and at top-level for DMs, and so
+# the result_watcher can detect tasks the core never answered.
 pending_replies: dict[str, dict] = {}
 pending_replies_lock = threading.Lock()
+
+# Per-task timeout. Mirrors task-bridge.ts's DEFAULT_TASK_TIMEOUT_MS (10 min):
+# if the core session wedges (e.g. hits the 1M-context usage-credit gate and
+# loops on the API error), no result file is ever written and the Slack user
+# gets silence. After this many seconds we post a one-time "still working /
+# may have hit a limit" reply so the failure is visible instead of silent.
+# The pending entry is KEPT after notifying, so if the core later recovers and
+# writes a result, the real answer still gets delivered. 0 disables.
+TASK_TIMEOUT_SEC = int(os.environ.get("SLACK_TASK_TIMEOUT_SEC", "600"))
 
 # Username cache — users.info is rate-limited (Tier 4 = 100/min). One
 # cache lookup per known user saves a network hop on every DM. Cache
@@ -307,6 +318,29 @@ def _download_slack_file(file_dict: dict) -> str | None:
         return None
 
 
+def _transcribe_via_skill(local_path: str) -> str | None:
+    """Call skills/audio-transcribe/scripts/transcribe.py. Returns transcript or None.
+
+    The skill is optional — if it is absent the bridge falls back to the plain
+    [File attached:] line unchanged. Any error from the subprocess is swallowed;
+    transcription failure must never block task delivery.
+    """
+    import subprocess
+    skill_script = Path(__file__).parent.parent / "skills" / "audio-transcribe" / "scripts" / "transcribe.py"
+    if not skill_script.exists():
+        return None
+    try:
+        result = subprocess.run(
+            [sys.executable, str(skill_script), local_path],
+            capture_output=True, text=True, timeout=25,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() or None
+    except Exception as e:
+        print(f"  [stt] skill call failed for {os.path.basename(local_path)}: {e}", flush=True)
+    return None
+
+
 def _write_task(event: dict, prefix: str, text: str, username: str | None) -> str | None:
     """Write a task file from a Slack event. Returns task_id or None if skipped."""
     user_id = event.get("user")
@@ -343,7 +377,11 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     for file_dict in event.get("files") or []:
         local_path = _download_slack_file(file_dict)
         if local_path:
-            attachment_lines.append(f"[File attached: {local_path}]")
+            transcript = _transcribe_via_skill(local_path)
+            if transcript:
+                attachment_lines.append(f"[Voice transcript: {transcript}]")
+            else:
+                attachment_lines.append(f"[File attached: {local_path}]")
     attachment_note = ("\n" + "\n".join(attachment_lines)) if attachment_lines else ""
 
     if not text and not attachment_note:
@@ -384,6 +422,21 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         # than treating as owner.
         access_tier = "other"
 
+    # Intercept vault commands before any disk write — must happen AFTER
+    # access_tier is resolved so untrusted senders cannot write to Keychain.
+    # Owner-tier: secrets go to Keychain, task file gets [STORED-IN-KEYCHAIN].
+    # Non-owner: patterns redacted, Keychain untouched.
+    if text:
+        if access_tier == "owner":
+            vault_result = intercept_vault_commands(text)
+            text = vault_result.text
+            if vault_result.stored:
+                print(f"  [vault] stored keys: {vault_result.stored}", flush=True)
+            if vault_result.failed:
+                print(f"  [vault] store failed (still redacted): {vault_result.failed}", flush=True)
+        else:
+            text = redact_vault_commands(text)
+
     # Prepend an in-band system instruction for non-owner tiers so the
     # core agent cannot accidentally process a downgraded task with full
     # capabilities. Mirrors the Discord bridge's tier-specific instruction
@@ -408,6 +461,41 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     task_id = f"task-{ts}"
     task_file = TASKS_DIR / f"{task_id}.txt"
     priority = default_priority_for_source("slack", access_tier)
+
+    # Inject skill instructions so the agent follows the notify-before-work and
+    # transcription protocol even after conversation compaction wipes context.
+    # Only injected for owner tasks when the referenced skills are installed.
+    # CCD-resolved (PR #1525 pattern): never hardcode ~/.claude — nodes may relocate
+    # the config dir via $CLAUDE_CONFIG_DIR.
+    _claude_config = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
+    _notify_py = _claude_config / "skills/task-progress/scripts/notify.py"
+    _transcribe_py = _claude_config / "skills/audio-transcribe/scripts/transcribe.py"
+    skill_hints = ""
+    if access_tier == "owner" and (_notify_py.exists() or _transcribe_py.exists()):
+        hints_lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
+        step = 1
+        if _notify_py.exists():
+            notify_cmd = (
+                f"python3 {_notify_py}"
+                f" --source slack --channel-id {channel}"
+                f' --message "On it — back in a moment."'
+            )
+            hints_lines.append(f"{step}. NOTIFY FIRST: {notify_cmd}")
+            step += 1
+        if attachment_lines and _transcribe_py.exists():
+            for ap in attachment_lines:
+                attached_path = ap.replace("[File attached: ", "").rstrip("]")
+                if _notify_py.exists():
+                    hints_lines.append(
+                        f'   Update notify message to: --message "Got your voice message, give me a moment."'
+                    )
+                hints_lines.append(
+                    f"{step}. TRANSCRIBE: python3 {_transcribe_py} '{attached_path}'"
+                )
+                step += 1
+        hints_lines.append(f"{step}. Then process and write result to results/{task_id}.txt")
+        skill_hints = "\n" + "\n".join(hints_lines) + "\n"
+
     task_file.write_text(
         f"id: {task_id}\n"
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
@@ -417,9 +505,15 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         f"user_id: {user_id}\n"
         f"access_tier: {access_tier}\n"
         f"priority: {priority}\n"
+        f"{skill_hints}"
     )
     with pending_replies_lock:
-        pending_replies[task_id] = {"channel": channel, "thread_ts": thread_ts}
+        pending_replies[task_id] = {
+            "channel": channel,
+            "thread_ts": thread_ts,
+            "submitted_at": time.time(),
+            "timed_out": False,
+        }
 
     global _event_count
     with _event_count_lock:
@@ -596,12 +690,68 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
                 pass
 
 
+def _check_task_timeouts() -> None:
+    """Post a one-time reply for tasks the core never answered in time.
+
+    Without this, a wedged core session (e.g. stuck looping on the
+    1M-context usage-credit API error) leaves the Slack task orphaned in
+    pending_replies forever — the user just sees silence. We mark the entry
+    `timed_out` (so we notify at most once) but DO NOT pop it: if the core
+    later recovers and writes results/<task_id>.txt, the normal reply path
+    still delivers the real answer.
+    """
+    if TASK_TIMEOUT_SEC <= 0:
+        return
+    now = time.time()
+    to_notify = []
+    with pending_replies_lock:
+        for task_id, info in pending_replies.items():
+            if info.get("timed_out"):
+                continue
+            if now - info.get("submitted_at", now) > TASK_TIMEOUT_SEC:
+                # Collect only — do NOT set timed_out here. Marking before the
+                # send means a single Slack API hiccup (which raises below and
+                # is merely logged) leaves the flag True forever, so the next
+                # pass's `if info.get("timed_out"): continue` skips it and the
+                # user never sees the warning — recreating the exact silent
+                # no-op this watchdog exists to prevent. Mark only AFTER a
+                # successful send. (Per @sonichi PR #1428 review, blocker 1.)
+                to_notify.append((task_id, info["channel"], info.get("thread_ts")))
+    if not to_notify:
+        return
+    mins = TASK_TIMEOUT_SEC // 60
+    msg = (
+        f":hourglass_flowing_sand: Still working on this — it's been over "
+        f"{mins} min with no result. The core session may have hit a context "
+        f"or usage-credit limit (check the Sutando CLI / `/usage-credits`). "
+        f"I'll still post the answer here if it finishes."
+    )
+    for task_id, channel, thread_ts in to_notify:
+        try:
+            _send_reply(channel, thread_ts, msg, task_id=task_id)
+        except Exception as e:
+            # Send failed — leave timed_out unset so the next pass retries.
+            print(f"[Slack] timeout notify failed for {task_id}: {e}", flush=True)
+            continue
+        # Notified once, successfully. Mark so we don't repeat. The entry may
+        # have been popped by result_watcher if a real result landed meanwhile
+        # — guard with get() so we don't resurrect a delivered task.
+        with pending_replies_lock:
+            entry = pending_replies.get(task_id)
+            if entry is not None:
+                entry["timed_out"] = True
+        print(f"  [timeout] notified Slack for {task_id} after {TASK_TIMEOUT_SEC}s", flush=True)
+
+
 def result_watcher():
     """Background thread: polls results/ for replies + proactive messages."""
     heartbeat_file = REPO / "state" / "slack-bridge.heartbeat"
     last_heartbeat = 0.0
     while True:
         try:
+            # Surface tasks the core never answered (timeout → visible reply).
+            _check_task_timeouts()
+
             # Replies to pending tasks
             with pending_replies_lock:
                 pending_ids = list(pending_replies.keys())
@@ -636,6 +786,17 @@ def result_watcher():
             if not presenter_mode_active():
                 for f in list(RESULTS_DIR.iterdir()):
                     if not (f.name.startswith("proactive-") and f.suffix == ".txt"):
+                        continue
+                    # Peek before claiming: skip Discord-targeted proactive files.
+                    # [channel: <17-20 digit snowflake>] is a Discord-only marker;
+                    # claiming it here dumps the literal text to Slack DM instead.
+                    # Leave it for discord-bridge to claim. (#1401)
+                    try:
+                        peek = f.read_text(errors="ignore").lstrip()
+                    except OSError:
+                        continue
+                    if peek.startswith("[channel:") and \
+                            re.match(r'\[channel:\s*\d{17,20}\]', peek):
                         continue
                     claim = f.with_suffix(".sending")
                     try:

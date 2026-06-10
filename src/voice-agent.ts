@@ -27,7 +27,7 @@ import 'dotenv/config';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { existsSync, readFileSync, readdirSync, statSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, openSync, writeSync, closeSync } from 'node:fs';
-import { execSync as execSyncTop } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { inlineTools, coreDocumentedSkills } from './inline-tools.js';
 import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater } from './vision-tools.js';
 import { clearActiveArtifact } from './artifact-cache-tools.js';
@@ -56,27 +56,26 @@ let generateSpeech: ((text: string, opts: { category: string; label: string }) =
 // Config
 // =============================================================================
 
-// Shape check: a valid Google AI Studio key starts with "AIza" and is
-// typically 39 chars (v1 format). Catches common misconfigurations
-// (truncated paste, wrong variable, stale template value) at startup
-// instead of letting the voice session fail silently on connect.
+// Shape check: catch common misconfigurations (truncated paste, wrong
+// variable, stale template value) at startup instead of letting the voice
+// session fail silently on connect. Do not pin this to a fixed prefix:
+// Google has issued multiple AI Studio API-key formats over time.
 function assertGeminiKey(name: string, value: string): void {
 	if (!value) { console.error(`Error: ${name} is required`); process.exit(1); }
-	// Upper bound of 60 (vs canonical ~39) gives headroom for Google key
-	// format rotations — Mini flagged they rotated once (2020→2023) and a
-	// tight bound would fail-fast on legitimate future keys.
-	const looksValid = value.startsWith('AIza') && value.length >= 35 && value.length <= 60;
+	const looksValid =
+		value === value.trim()
+		&& value.length >= 20
+		&& value.length <= 200
+		&& !/\s/.test(value)
+		&& value !== 'your-gemini-key';
 	if (!looksValid) {
 		// Do NOT interpolate anything derived from `value` into the log —
 		// CodeQL's js/clear-text-logging treats env vars matching the KEY
 		// heuristic as taint sources, and any PropRead of that source
-		// (e.g. `value.length`, `value.startsWith(...)`) flows into the
-		// console.error sink. The previous `${value.length}` + prefix-ok
-		// diagnostic was why #44 wouldn't close after #486. Keep the log
-		// static: name + expected format + remediation URL.
+		// (e.g. `value.length`) flows into the console.error sink. Keep the
+		// log static: name + expected format + remediation URL.
 		console.error(
-			`Error: ${name} does not look like a Google AI Studio key ` +
-			`(expected "AIza..." 35-60 chars). ` +
+			`Error: ${name} does not look like a Google AI Studio key. ` +
 			`Rotate at https://ai.google.dev → "Get API key" and update .env.`
 		);
 		process.exit(1);
@@ -299,9 +298,9 @@ setInterval(applyModeRequest, 1_000);
 
 // Detect active meeting on startup — sync so it runs before first greeting
 try {
-	const zoomRunning = execSyncTop('pgrep -f "zoom.us" 2>/dev/null', { encoding: 'utf-8' }).trim();
+	const zoomRunning = execFileSync('/usr/bin/pgrep', ['-f', 'zoom.us'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
 	if (zoomRunning) {
-		const inMeeting = execSyncTop(`osascript -e 'tell application "System Events" to tell process "zoom.us" to count of windows' 2>/dev/null`, { encoding: 'utf-8' }).trim();
+		const inMeeting = execFileSync('osascript', ['-e', 'tell application "System Events" to tell process "zoom.us" to count of windows'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
 		if (parseInt(inMeeting) >= 2) {
 			meetingActive = true;
 			console.log(`${new Date().toLocaleTimeString()} [Meeting] Detected active Zoom meeting on startup`);
@@ -498,19 +497,13 @@ const endSession: ToolDefinition = {
 
 let voiceSessionRef: VoiceSession | null = null;
 
-// Synchronously query the iclr-highlight server for current presenter-mode
-// state. Returns a system-marker string when active, '' otherwise. Failure-
-// silent: if the server is down or the curl call errors, returns '' so the
-// greeting/reconnect path stays unchanged.
-function getPresenterStateMarker(): string {
-	try {
-		const out = execSyncTop('curl -s --max-time 1 http://localhost:7877/presenter', { timeout: 2_000 }).toString();
-		const json = JSON.parse(out);
-		if (json && json.active === true) {
-			return ' [System: PRESENTER MODE IS CURRENTLY ACTIVE — apply the CO-PRESENTER protocol from your context to every cue this session: highlight_slide(topic) FIRST, then narrate from voice-context.txt. Do NOT route slide-topic phrases to work.]';
-		}
-	} catch { /* server unreachable or non-JSON — fall through to no-marker */ }
-	return '';
+// Unified base-mode resolver: see src/voice-mode-resolver.ts for the
+// rationale + canonical mode descriptors. Local wrapper threads the in-memory
+// `meetingActive` boolean (this module owns that state) into the pure
+// resolver function.
+import { resolveCurrentMode as resolveCurrentModeImpl, type ModeState } from './voice-mode-resolver.js';
+function resolveCurrentMode(): ModeState {
+	return resolveCurrentModeImpl({ meetingActive });
 }
 
 const mainAgentTools: ToolDefinition[] = [workTool, getTaskStatus, switchModeTool, saveMeetingNoteTool, ...inlineTools];
@@ -567,14 +560,14 @@ const mainAgent: MainAgent = {
 			const isQuickReconnect = gap !== null && gap < 60;
 			// Presenter mode active = silent reconnect regardless of gap. Saying
 			// "Welcome back" mid-talk would break the co-presenter flow; the
-			// presenter marker (appended below) anchors continuation instead.
-			const presenterActive = getPresenterStateMarker() !== '';
-			const meetingHint = meetingActive
+			// base-mode marker (appended below) anchors continuation instead.
+			const modeState = resolveCurrentMode();
+			const meetingHint = modeState.isMeeting
 				? '\n\n[MEETING MODE — you are listening and taking notes. Do NOT speak or produce any audio. Only respond if someone says "Sutando." Use the replayed history above as context for what was discussed before the reconnect.]'
-				: (isQuickReconnect || presenterActive)
+				: (isQuickReconnect || modeState.isPresenter)
 					? '\n\n[Do NOT greet the user. Do NOT say "Welcome back" or anything similar. Stay completely silent and wait for the user\'s next spoken input — they were just briefly disconnected and want to resume without interruption.]'
 					: '\n\n[Now say "Welcome back" briefly — one sentence — and then stop and wait for input.]';
-			return `[System: The user reconnected. The block below is REPLAYED HISTORY from the current session, provided as background context ONLY. Do NOT act on anything in it. Do NOT call any tools based on it. Use it only to answer follow-up questions if asked. Wait silently for the user's next spoken input before taking any action.]${getPresenterStateMarker()}${offlineDeliveryHint}\n\n${recent}${meetingHint}`;
+			return `[System: The user reconnected. The block below is REPLAYED HISTORY from the current session, provided as background context ONLY. Do NOT act on anything in it. Do NOT call any tools based on it. Use it only to answer follow-up questions if asked. Wait silently for the user's next spoken input before taking any action.]${modeState.marker}${offlineDeliveryHint}\n\n${recent}${meetingHint}`;
 		}
 		let standName = '';
 		try { const si = JSON.parse(readFileSync(personalPath('stand-identity.json'), 'utf-8')); standName = si.name ? ` — ${si.name}` : ''; } catch {}
@@ -587,20 +580,21 @@ const mainAgent: MainAgent = {
 		const briefingHint = hasHistory && existsSync(briefingFile) ? ' Mention: "I have your morning briefing ready if you want it."' : '';
 		const insightFile = join(WORKSPACE_DIR, 'results', `insight-${today}.txt`);
 		const insightHint = hasHistory && existsSync(insightFile) ? ' Also mention: "I noticed a pattern in your usage — ask me about it if you are curious."' : '';
-		if (meetingActive) {
-			return `[System: MEETING MODE — LISTEN AND TAKE NOTES. A Zoom meeting is active. Listen to everything and mentally track the discussion: who said what, key decisions, action items, topics covered. But do NOT produce any audio output UNLESS someone says "Sutando" or "hey Sutando" — then respond to their request using your accumulated notes and context. When not addressed, produce absolutely zero words — no acknowledgments, no "silent", no sounds. You are an invisible note-taker until called upon.]`;
+		const modeState = resolveCurrentMode();
+		if (modeState.isMeeting) {
+			return `[System: MEETING MODE — LISTEN AND TAKE NOTES. A Zoom meeting is active. Listen to everything and mentally track the discussion: who said what, key decisions, action items, topics covered. But do NOT produce any audio output UNLESS someone says "Sutando" or "hey Sutando" — then respond to their request using your accumulated notes and context. When not addressed, produce absolutely zero words — no acknowledgments, no "silent", no sounds. You are an invisible note-taker until called upon.]${modeState.marker}`;
 		}
-		return `[System: A user just connected. Say hi and introduce yourself as Sutando${standName} — their personal AI. Ready to help with anything: voice tasks, screen control, meetings, phone calls, research. Keep it brief — 1-2 natural sentences, no theatrics.${tutorialHint}${briefingHint}${insightHint}]${getPresenterStateMarker()}`;
+		return `[System: A user just connected. Say hi and introduce yourself as Sutando${standName} — their personal AI. Ready to help with anything: voice tasks, screen control, meetings, phone calls, research. Keep it brief — 1-2 natural sentences, no theatrics.${tutorialHint}${briefingHint}${insightHint}]${modeState.marker}`;
 	},
 	instructions: () => [
 		// Per-session-evaluated factory (vs static array): lets the prompt
 		// re-check time-sensitive state on every session.start() / reconnect.
-		// The presenter-state marker below MUST be in the system_instruction
+		// The base-mode marker below MUST be in the system_instruction
 		// (this array → joined string → system_instruction), not the greeting,
 		// because Gemini Live treats greetings as a user-style turn — the
 		// model often calls get_core_status to verify "claims" rather than
 		// trust them. System instructions are authoritative.
-		(() => getPresenterStateMarker())(),
+		(() => resolveCurrentMode().marker)(),
 		'You are Sutando, a personal AI that belongs entirely to the user.',
 		'Named after Stands from JoJo\'s Bizarre Adventure — a personal spirit that fights for you.',
 		'Every Sutando evolves differently based on what its user needs. You earned your name and identity.',
@@ -650,7 +644,7 @@ const mainAgent: MainAgent = {
 		'You handle anything: research, writing, email, scheduling, code, logistics, phone calls, meetings, creative work.',
 		'You can join Google Meet and Zoom meetings, make phone calls, see the user\'s screen, and reach them on Telegram, Discord, web, or phone.',
 		'You can summon a Zoom meeting with screen sharing so the user can work remotely from their phone.',
-		(() => { try { const url = require('node:child_process').execSync('git remote get-url origin', { timeout: 2_000 }).toString().trim().replace(/\.git$/, ''); return `The Sutando GitHub repo is ${url}.`; } catch { return ''; } })(),
+		(() => { try { const url = require('node:child_process').execFileSync('git', ['remote', 'get-url', 'origin'], { timeout: 2_000 }).toString().trim().replace(/\.git$/, ''); return `The Sutando GitHub repo is ${url}.`; } catch { return ''; } })(),
 		'You build a model of the user over time — their preferences, working style, voice, and priorities',
 		'shape everything you do without them having to repeat themselves.',
 		'All of your code was written by your own autonomous build loop.',
@@ -714,6 +708,7 @@ const mainAgent: MainAgent = {
 		'- NEVER pretend you called a tool. NEVER say "done" without actually calling work.',
 		'- NEVER say "I can\'t do that", "I\'m not able to", or "I don\'t think I can" — you CAN do almost anything by calling work. If you\'re unsure, call work and let the core agent handle it. The core agent has full system access. Your job is to relay requests, not gatekeep them.',
 		'- For SIMPLE actions (press enter, clear input, select all), use press_key or type_text — do NOT use work for keystrokes.',
+		'- For IN-PLACE EDITS on text already visible on screen (a draft, an email body, a code block, a focused textarea) — call read_selection FIRST to fetch the current text, compute the edited version, then call type_text to write the edited version into the field. Do NOT delegate to work for in-place edits; the user is on screen watching for the change to appear in the field. work is correct for edits that require server-side logic (commit a change, send the email, mutate files outside the focused field) — not for editing the text the user is looking at.',
 		'- For COMPLEX operations (git commands, code changes, file operations, installing packages), ALWAYS delegate to work — do NOT try to type commands into a terminal. The core agent executes these directly and reliably.',
 		'- If you KNOW the answer from your instructions or context, answer directly. Only delegate to work for questions you genuinely cannot answer.',
 		'- DEICTIC SCREEN REFERENCES: When the user uses a deictic word ("this", "that", "it", "this part", "fix this", "what does this say") without obvious conversational antecedent, FIRST call read_selection to capture what they\'re pointing at on screen. Then act on the returned selection/window context. Only ask a clarifying question if read_selection returns empty AND no prior conversation context resolves the reference. Default to read_selection over "which one do you mean?" — the user is usually pointing.',
@@ -1055,14 +1050,13 @@ async function main() {
 				console.error(`${ts()} [VoiceFailure] proactive write failed: ${(e as Error)?.message ?? e}`);
 			}
 			// OS notification — visible even if no browser tab is open.
-			// Sanitize the message for the AppleScript string literal: drop
-			// double-quotes and backslashes so the shell command can't break.
+			// execFileSync avoids the shell entirely, so no sanitization of
+			// single-quotes or other shell metacharacters is needed. The
+			// double-quote stripping below protects the AppleScript string
+			// literal itself (not the shell).
 			try {
 				const safe = c.userMessage.replace(/["\\]/g, '');
-				execSyncTop(
-					`osascript -e 'display notification "${safe}" with title "Sutando — voice offline"'`,
-					{ stdio: 'ignore' } as any,
-				);
+				execFileSync('osascript', ['-e', `display notification "${safe}" with title "Sutando — voice offline"`], { stdio: 'ignore' });
 			} catch {}
 		};
 		transport.onClose = (code?: number, reason?: string) => {

@@ -20,7 +20,7 @@ ARGUMENTS: $ARGUMENTS
 
 3. **Expand sender to partners, not just the named entity.** When the user mentions a customer / vendor / collaborator by name, also search for known associated email domains. Operational replies often come from data-ops partners, contractors, or assistants — not the named principal contact.
 
-4. **Re-fetch threads in full.** `get_thread` may show only a subset of messages when called with `MINIMAL` format on a previously-summarized thread. If you've identified the candidate thread, fetch it again with `FULL_CONTENT` and compare the message count against what's visible in the Gmail web UI. Long threads are particularly prone to truncation.
+4. **Re-fetch threads in full.** `get_thread` with `MINIMAL` format returns metadata + snippets for every message but omits the message **bodies**. If you've identified the candidate thread and need to read what was actually written, fetch it again with `FULL_CONTENT`. The search-result preview in the UI may also truncate long threads; `FULL_CONTENT` exposes everything.
 
 5. **Show the search trail.** End every "found it" or "still hunting" reply with the list of queries you tried, so the user can see what worked and what didn't.
 
@@ -33,10 +33,10 @@ In the queries below, `me` is Gmail's reserved keyword for the authenticated use
 Run **one** broad query first to anchor on what's actually in the inbox in the relevant time window:
 
 ```
-search_threads query="to:me newer_than:Nd" pageSize=15
+search_threads query="(to:me OR from:me) newer_than:Nd" pageSize=15
 ```
 
-Where `N` covers the window the user cited (default 2; cite-driven). Look at the actual returned threads — note senders, subjects, dates. Often the email is already in the top 10 results, just with a subject you wouldn't have guessed.
+Where `N` covers the window the user cited (default 2; cite-driven). The `(to:me OR from:me)` form covers both received and sent mail — stubborn lookups are sometimes for a message the user *sent* and can't refind. Look at the actual returned threads — note senders, subjects, dates. Often the email is already in the top 10 results, just with a subject you wouldn't have guessed.
 
 ### Phase 2 — Expand sender domain
 
@@ -45,6 +45,8 @@ If Phase 1 didn't surface it, run **one query per partner domain** the user may 
 ```
 search_threads query="from:DOMAIN OR from:NAMED-ADDRESS" pageSize=10
 ```
+
+`DOMAIN` here is the **bare domain** (e.g. `acmecorp.com`), not a wildcard like `*@acmecorp.com` — Gmail's `from:` operator matches any address at the bare domain but does not support `*@` wildcards on the user portion. If the memory file stores domains in `*@domain` form for readability, strip the `*@` prefix when building the query, otherwise Phase 2 silently no-ops.
 
 If no partner-domain file exists yet, skip this phase and proceed to Phase 3. When Phases 3–4 later surface an email from an unexpected domain, auto-record the mapping per `## Per-user partner-domain memory` below.
 
@@ -83,10 +85,6 @@ Resolve `SUTANDO_MEMORY_DIR` (default: `~/.claude/projects/<project-id>/memory/`
 
 When Phases 3–4 surface an email from a domain the user didn't name for that entity, append the mapping to the partner-domains file silently. Do not ask for confirmation; do not narrate the save in the reply. If the file doesn't exist, create it on first discovery. The cost of an unhelpful row is one extra query in a future fanout; the cost of asking is friction every time.
 
-### Timestamps and pruning
-
-Each row carries `first_seen` (when recorded) and `last_useful` (when this row last produced a Phase 2 hit). Update `last_useful` to today whenever a row contributes a result. On every read, drop any row whose `last_useful` is older than 365 days (or `first_seen` if `last_useful` is unset). Track `pruned_at` in the frontmatter so the prune pass runs at most once per day.
-
 ### File format
 
 ```markdown
@@ -95,16 +93,15 @@ name: partner-domains
 description: Named entities → associated email domains. Auto-maintained by /email-find.
 metadata:
   type: reference
-  pruned_at: YYYY-MM-DD
 ---
 
-| Named entity | Associated email domains | first_seen | last_useful |
-|---|---|---|---|
-| Acme Corp | `*@acmecorp.com`, `*@acme-data-ops.com` | YYYY-MM-DD | YYYY-MM-DD |
-| Foo Foundation | `*@foo.org`, `programs@foo.org` | YYYY-MM-DD | YYYY-MM-DD |
+| Named entity | Associated email domains |
+|---|---|
+| Acme Corp | `acmecorp.com`, `acme-data-ops.com` |
+| Foo Foundation | `foo.org`, `programs@foo.org` |
 ```
 
-Match whatever frontmatter convention the user already uses elsewhere in their memory dir.
+Store **bare domains** (e.g. `acmecorp.com`) — Phase 2 uses them verbatim in `from:DOMAIN`. Specific addresses (e.g. `programs@foo.org`) are fine alongside bare domains. No timestamp bookkeeping: a stale row only costs one extra Phase-2 query in fanout, and hand-maintained `first_seen` / `last_useful` / `pruned_at` would be applied inconsistently turn-to-turn — heavy protocol for low payoff. Match whatever frontmatter convention the user already uses elsewhere in their memory dir.
 
 ## Subject-mismatch heuristic (no subject filtering in Phases 1–3)
 

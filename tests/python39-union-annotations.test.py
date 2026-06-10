@@ -17,9 +17,11 @@ the future import. The bridge crashed silently on every Mac running stock python
 
 This test is the CI gate that prevents the same class of regression.
 
-Scan scope: `src/*.py` (primary). Skills and tests are excluded — they're not launched
-by `startup.sh` directly and the scan would produce too much noise from third-party
-vendored code.
+Scan scope: `src/*.py` + `skills/**/*.py`. Tests and third-party vendored code
+(__pycache__, node_modules) are excluded. Skills are included because cron-path
+scripts in skills/ can also crash on Python 3.9 hosts — #1385 fixed two such
+instances in quota-tracker and deal-finder; this broader scope prevents the
+class from recurring (closes #1386).
 
 Run: python3 tests/python39-union-annotations.test.py
 Exit: 0 on pass, 1 on fail.
@@ -32,6 +34,9 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SRC = REPO / "src"
+SKILLS = REPO / "skills"
+
+_EXCLUDE = ("/__pycache__/", "/node_modules/", "/personal-")
 
 
 def _contains_bitor(node: ast.expr) -> bool:
@@ -98,8 +103,9 @@ def check_file(path: Path) -> str | None:
 
 def test_no_bare_union_annotations() -> None:
     failures = []
-    for path in sorted(SRC.glob("*.py")):
-        if "/__pycache__/" in str(path):
+    paths = list(SRC.glob("*.py")) + list(SKILLS.rglob("*.py") if SKILLS.exists() else [])
+    for path in sorted(paths):
+        if any(ex in str(path) for ex in _EXCLUDE):
             continue
         msg = check_file(path)
         if msg:

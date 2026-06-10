@@ -120,9 +120,13 @@ PROMPT="${PROMPT_ARGS[*]-}"
 cmd=(gemini --prompt "$PROMPT" --approval-mode "$APPROVAL_MODE" --output-format "$OUTPUT_FORMAT")
 [[ -n "$MODEL" ]] && cmd+=(--model "$MODEL")
 [[ "$USE_SANDBOX" -eq 1 ]] && cmd+=(--sandbox)
-for dir in "${INCLUDE_DIRS[@]}"; do
-  cmd+=(--include-directories "$dir")
-done
+# bash 3.2 (macOS default) treats an empty array as "unbound" under `set -u`,
+# so guard on the element count before expanding INCLUDE_DIRS.
+if [[ ${#INCLUDE_DIRS[@]} -gt 0 ]]; then
+  for dir in "${INCLUDE_DIRS[@]}"; do
+    cmd+=(--include-directories "$dir")
+  done
+fi
 
 (
   cd "$WORKDIR"

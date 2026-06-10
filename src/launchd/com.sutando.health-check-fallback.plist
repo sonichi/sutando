@@ -21,8 +21,20 @@
 
   Behavior:
     - Fires every 300s (StartInterval).
-    - Runs `python3 src/health-check.py --emit-task --notify-on-fail --quiet`.
-    - Surfaces failures as tasks/task-health-*.txt AND macOS notifications.
+    - Runs `python3 src/health-check.py --emit-task --notify-on-fail
+      --notify-slack --recover-core --quiet`.
+    - Surfaces failures as tasks/task-health-*.txt, macOS notifications, AND
+      a direct Slack DM to the owner (remote-visible; fires even when the core
+      session is wedged but its heartbeat process still ticks). The Slack DM
+      no-ops cleanly if SLACK_BOT_TOKEN (channel .env / $REPO/.env / env) or the
+      owner id in ~/.claude/channels/slack/access.json is missing.
+    - --recover-core: when the core is alive-but-wedged (heartbeat ticking but
+      the task queue isn't draining — the 2026-06-02 1M usage-credit-gate loop
+      signature), auto-restarts it via scripts/start-cli.sh --restart. Heavily
+      guarded (sustained-wedge confirm window, 30min cooldown, 3/hr give-up cap)
+      and a clean no-op when the core is healthy. Keeps 1M on the first restart;
+      degrades to standard 200K only if the wedge recurs. Runs here, in launchd's
+      own process — never from inside the core session it would kill.
     - ThrottleInterval=60 prevents crash-loop thrash.
     - Exit-only job (KeepAlive omitted) — launchd waits StartInterval, fires
       again, no zombie process between runs.
@@ -40,6 +52,8 @@
         <string>__REPO__/src/health-check.py</string>
         <string>--emit-task</string>
         <string>--notify-on-fail</string>
+        <string>--notify-slack</string>
+        <string>--recover-core</string>
         <string>--quiet</string>
     </array>
 

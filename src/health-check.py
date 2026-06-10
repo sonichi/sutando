@@ -8,6 +8,8 @@ Usage:
   python3 src/health-check.py --fix            # attempt to fix issues
   python3 src/health-check.py --emit-task      # write tasks/task-health-*.txt on failure
   python3 src/health-check.py --notify-on-fail # macOS notification on failure
+  python3 src/health-check.py --notify-slack   # DM the owner on Slack on failure (remote, core-independent)
+  python3 src/health-check.py --recover-core   # auto-restart the core when alive-but-wedged (guarded)
 
 Checks:
   - macOS TCC Documents-folder access (when repo is under ~/Documents)
@@ -24,8 +26,14 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 from typing import Optional
+
+try:
+    import fcntl  # POSIX file locking for the recovery critical section
+except ImportError:  # non-POSIX (e.g. Windows) — the lock degrades to a no-op
+    fcntl = None
 
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
@@ -929,7 +937,7 @@ def run_all_checks() -> list[dict]:
             result = subprocess.run(["/usr/bin/pgrep", "-f", f"{proc_name}\\.py$"], capture_output=True, text=True)
             pids = result.stdout.strip().split("\n") if result.returncode == 0 else []
             pids = [p for p in pids if p]
-        except:
+        except Exception:
             pids = []
 
         if not pids:
@@ -1217,7 +1225,7 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
     ts_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
     bullet_lines = [f"- {c['name']}: {c['status']} ({c['detail']})" for c in failures]
     body = (
-        f"id: task-health-{int(time.time())}\n"
+        f"id: task-health-{now_ms}\n"
         f"timestamp: {ts_iso}\n"
         f"task: Health check found issues. Decide whether to restart, DM owner, or treat as transient:\n"
         + "\n".join(bullet_lines) + "\n"
@@ -1226,7 +1234,7 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
         f"access_tier: owner\n"
         f"priority: low\n"
     )
-    task_path = tasks_dir / f"task-health-{int(time.time())}.txt"
+    task_path = tasks_dir / f"task-health-{now_ms}.txt"
     task_path.write_text(body)
 
     # Update history. Prune entries older than 24h to bound file size.
@@ -1310,11 +1318,529 @@ def notify_for_failures(
         pass
 
 
+def _slack_failures(checks: list[dict]) -> list[dict]:
+    """Failures worth a remote owner DM.
+
+    Same hard-failure statuses as notify_for_failures, but drops benign
+    on-demand `warn`s (e.g. discord-voice / conversation-server "not running
+    (on-demand)") — those are the steady state for per-session processes and
+    would spam the owner's DM every cooldown window. The signals that matter
+    for a remote watchdog (stuck core-proactive-loop, task-queue pileup, a
+    bridge that's actually down) all survive this filter.
+    """
+    out = []
+    for c in checks:
+        st = c["status"]
+        if st in ("down", "missing", "not_loaded", "fail", "stale"):
+            out.append(c)
+        elif st == "warn" and "on-demand" not in (c.get("detail") or ""):
+            out.append(c)
+    return out
+
+
+def _slack_token_from_env_file() -> str:
+    """Read SLACK_BOT_TOKEN from disk. The launchd-supervised fallback runs
+    with a minimal environment (no sourced .env), so $SLACK_BOT_TOKEN is
+    usually absent there — but the token persists on disk. Reading the file
+    directly keeps the watchdog self-sufficient without putting the secret in
+    the world-readable LaunchAgents plist. Returns "" if absent/unreadable.
+
+    Order matters: the slack bridge's canonical token location is
+    ~/.claude/channels/slack/.env (startup.sh sources exactly that file before
+    launching the bridge — see src/startup.sh). The original implementation
+    only checked $REPO/.env, where the token does NOT live on a standard
+    install — so the watchdog DM silently no-op'd (creds=None) and the owner
+    got no alert at all. Check the channel .env first, then fall back to
+    $REPO/.env for hosts that keep it there instead.
+    """
+    candidates = [
+        Path.home() / ".claude" / "channels" / "slack" / ".env",
+        REPO_DIR / ".env",
+    ]
+    for env_path in candidates:
+        try:
+            for line in env_path.read_text().splitlines():
+                line = line.strip()
+                if line.startswith("SLACK_BOT_TOKEN="):
+                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if val:
+                        return val
+        except Exception:
+            continue
+    return ""
+
+
+def _slack_owner_creds() -> "tuple[str, str] | None":
+    """Return (bot_token, owner_user_id) for a direct Slack DM, or None.
+
+    Token from $SLACK_BOT_TOKEN (same one the slack bridge uses), falling back
+    to the on-disk .env files (channel .env first, then $REPO/.env) for the
+    minimal-env launchd path; owner from
+    ~/.claude/channels/slack/access.json (`tofuOwner`, else first `allowFrom`).
+    Both must be present — otherwise there's no one to DM.
+    """
+    token = os.environ.get("SLACK_BOT_TOKEN", "").strip() or _slack_token_from_env_file()
+    if not token:
+        return None
+    access = Path.home() / ".claude" / "channels" / "slack" / "access.json"
+    try:
+        data = json.loads(access.read_text())
+    except Exception:
+        return None
+    owner = data.get("tofuOwner")
+    if not owner:
+        allow = data.get("allowFrom") or []
+        owner = allow[0] if allow else None
+    if not owner:
+        return None
+    return token, owner
+
+
+def _slack_api(token: str, method: str, payload: dict) -> dict:
+    """Minimal Slack Web API POST via urllib (no slack_bolt dependency, so
+    this works in the launchd-supervised fallback even if the bridge venv
+    isn't on the path). Returns the parsed JSON response."""
+    req = urllib.request.Request(
+        f"https://slack.com/api/{method}",
+        data=json.dumps(payload).encode(),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read())
+
+
+def _default_slack_sender(text: str) -> bool:
+    """Open a DM to the owner and post `text`. Returns True on success."""
+    creds = _slack_owner_creds()
+    if not creds:
+        return False
+    token, owner = creds
+    try:
+        opened = _slack_api(token, "conversations.open", {"users": owner})
+        if not opened.get("ok"):
+            return False
+        channel = opened["channel"]["id"]
+        posted = _slack_api(token, "chat.postMessage", {"channel": channel, "text": text})
+        return bool(posted.get("ok"))
+    except Exception:
+        return False
+
+
+def notify_slack_for_failures(
+    checks: list[dict],
+    state_file: Optional[Path] = None,
+    sender=None,
+) -> None:
+    """DM the owner on Slack when health checks fail — a remote-visible
+    surface that does NOT depend on the core agent being alive.
+
+    This is the watchdog the owner asked for: when the core session wedges
+    (e.g. loops on the 1M-context usage-credit API error), `core-heartbeat`
+    keeps beating from its own background process, so `_any_core_alive()`
+    stays True and `emit_task_for_failures` stays silent — but the
+    `core-proactive-loop` check flips to `warn` and this DMs Slack anyway.
+    Deliberately NOT gated on core liveness, for exactly that reason.
+
+    Same dedup contract as notify_for_failures (per-failure-set hash, 1h
+    cooldown) but a separate state file so the Slack and macOS surfaces never
+    suppress each other. The dedup hash is recorded only on a SUCCESSFUL send,
+    so a transient Slack/API outage doesn't silence the alert for an hour.
+    `sender` is injected by tests to avoid real API calls.
+    """
+    failures = _slack_failures(checks)
+    if not failures:
+        return
+
+    if state_file is None:
+        state_file = WORKSPACE_DIR / "state" / "health-last-slacked.json"
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    set_key = "|".join(sorted(c["name"] for c in failures))
+    hash_key = hashlib.sha256(set_key.encode()).hexdigest()[:16]
+    now_ms = int(time.time() * 1000)
+    cooldown_ms = 3600 * 1000  # 1h — matches the macOS + emit-task surfaces
+
+    history: dict = {}
+    try:
+        if state_file.exists():
+            history = json.loads(state_file.read_text())
+    except Exception:
+        history = {}
+
+    if now_ms - history.get(hash_key, 0) < cooldown_ms:
+        return
+
+    lines = [f"• {c['name']}: {c['status']} ({c['detail']})" for c in failures[:5]]
+    extra = f"\n…(+{len(failures) - 5} more)" if len(failures) > 5 else ""
+    text = (
+        f":rotating_light: *Sutando health check* — {len(failures)} issue(s):\n"
+        + "\n".join(lines)
+        + extra
+    )
+
+    send = sender or _default_slack_sender
+    if not send(text):
+        # Send failed — don't record dedup, so the next tick retries.
+        return
+
+    history[hash_key] = now_ms
+    cutoff = now_ms - (24 * 3600 * 1000)
+    history = {k: v for k, v in history.items() if v >= cutoff}
+    try:
+        state_file.write_text(json.dumps(history))
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Core wedge auto-recovery (--recover-core)
+# ---------------------------------------------------------------------------
+#
+# The 2026-06-02 outage: the core session crossed into 1M extended context,
+# hit the interactive `/usage-credits` gate — which CANNOT be pre-authorized
+# for an unattended agent (it's a per-session, account-side toggle, no
+# settings key / env var / CLI flag exists) — and then looped on the API
+# error. core_heartbeat.py runs as its own process, so the core still "looked
+# alive" while no task ever drained. --notify-slack makes that VISIBLE; this
+# makes it SELF-HEALING.
+#
+# Recovery action is the one mechanism we already own and trust:
+# `scripts/start-cli.sh --restart`. A restarted session starts fresh under the
+# standard context boundary; because the /usage-credits enable persists
+# ACCOUNT-WIDE once a human sets it (and on Max/Team plans 1M is included with
+# no gate at all), the restarted core keeps 1M and re-clears the gate by
+# itself. Queued task files survive a restart (the bridge is file-based), so
+# no work is lost. 1M therefore stays the DEFAULT — we never disable it.
+#
+# Heavily guarded, because auto-restarting a 24/7 agent is consequential:
+#   - Fires only on a CONFIRMED, SUSTAINED wedge: core process alive AND the
+#     oldest queued task older than RECOVER_WEDGE_SEC AND the core didn't just
+#     boot — observed on two passes ≥ RECOVER_CONFIRM_SEC apart. Never a blip.
+#   - Identity + progress gating (so a legitimately long-running single task is
+#     not killed mid-work): the SAME oldest task must persist across the window
+#     (a draining queue surfaces a different oldest each pass → resets) AND
+#     core-status.json must not advance (a core making progress isn't wedged).
+#     Residual: a long single task that NEVER updates its status is still
+#     indistinguishable from a wedge by external signals — bounded by the
+#     cooldown + give-up cap, and such tasks should heartbeat core-status.json.
+#   - RECOVER_COOLDOWN_SEC between restarts; an exclusive flock on the state
+#     file serializes the decision so a manual + launchd run can't double-fire.
+#   - Hard cap of RECOVER_MAX_PER_HOUR; past that it DMs "giving up" and stops,
+#     so a pathological wedge can't become a restart loop.
+#   - Graceful degradation: the FIRST restart of an episode keeps 1M; if the
+#     wedge recurs (the 1M restart didn't hold), the next restart pins
+#     SUTANDO_CORE_MODEL=opus (standard 200K) so the agent keeps WORKING.
+#   - DMs the owner before each restart and records whether the DM succeeded
+#     (last_restart_dm_sent) + logs failures, so a restart is never invisible
+#     even if Slack is down — recovery still proceeds (recovery > notification).
+#
+# All side-effecting collaborators are injectable so the escalation / cooldown
+# / give-up logic is unit-tested without real restarts or Slack calls. Only
+# wired into the launchd fallback job (its own process, outside the core), and
+# start-cli.sh has its own from-inside-core guard — two independent guarantees
+# the recovery never runs from within the session it would kill.
+
+RECOVER_WEDGE_SEC = int(os.environ.get("SUTANDO_RECOVER_WEDGE_SEC", "600"))        # task stuck this long = wedged
+RECOVER_CONFIRM_SEC = int(os.environ.get("SUTANDO_RECOVER_CONFIRM_SEC", "120"))    # wedge must persist across passes
+RECOVER_COOLDOWN_SEC = int(os.environ.get("SUTANDO_RECOVER_COOLDOWN_SEC", "1800")) # min gap between restarts
+RECOVER_MAX_PER_HOUR = int(os.environ.get("SUTANDO_RECOVER_MAX_PER_HOUR", "3"))
+
+
+def _oldest_pending_task(now: float, tasks_dir: Optional[Path] = None) -> "tuple[str, int] | None":
+    """(identity, age_seconds) of the oldest top-level tasks/*.txt, or None if
+    the queue is empty. Mirrors check_task_queue's globbing (top-level only;
+    archive/ excluded). This is the precise wedge signal for recovery: a healthy
+    core drains a task in seconds-to-minutes, so a task sitting for
+    RECOVER_WEDGE_SEC while the core process is alive means the core is stuck —
+    regardless of what core-status.json last said (check_core_proactive_loop
+    misses a wedge that happens while status reads 'idle', because it only flags
+    'running').
+
+    The identity is `"<name>|<int(mtime)>"`. Recovery requires the SAME identity
+    to persist across the confirm window before restarting (PR #1428 review,
+    blocker 3): if the oldest task changes (a task drained → a different oldest)
+    or its mtime moves (the file was rewritten/reprocessed), the queue is
+    draining, not wedged, and the observation resets — so a busy-but-healthy
+    backlog never triggers a restart."""
+    if tasks_dir is None:
+        tasks_dir = WORKSPACE_DIR / "tasks"
+    try:
+        files = [p for p in tasks_dir.glob("*.txt") if p.is_file()]
+    except OSError:
+        return None
+    if not files:
+        return None
+    try:
+        oldest = min(files, key=lambda p: p.stat().st_mtime)
+        mtime = oldest.stat().st_mtime
+    except OSError:
+        return None
+    return (f"{oldest.name}|{int(mtime)}", int(now - mtime))
+
+
+def _core_status_ts(workspace: Optional[Path] = None) -> "float | None":
+    """Current core-status.json `ts`, or None if unavailable. Used as a
+    progress signal: a core actively working (even a long single task that
+    periodically updates status per CLAUDE.md) advances this; a core looping on
+    the usage-credit API error cannot complete a turn to update it. If it
+    advances across the confirm window, recovery treats the core as making
+    progress and resets — so legitimately long work isn't restarted out from
+    under itself (PR #1428 review, blocker 3)."""
+    if workspace is None:
+        workspace = WORKSPACE_DIR
+    try:
+        data = json.loads(status_read_path("core-status.json", workspace).read_text())
+        ts = data.get("ts")
+        return ts if isinstance(ts, (int, float)) else None
+    except Exception:
+        return None
+
+
+def _core_started_within(seconds: float, workspace: Optional[Path] = None, now: Optional[float] = None) -> bool:
+    """True if the freshest LIVE core heartbeat reports started_at within the
+    last `seconds`. Guards against restarting a core that only just booted and
+    hasn't had time to drain the queue yet (its tasks look 'old' but it's
+    catching up, not wedged)."""
+    if workspace is None:
+        workspace = WORKSPACE_DIR
+    if now is None:
+        now = time.time()
+    cores_dir = workspace / "state" / "cores"
+    if not cores_dir.is_dir():
+        return False
+    youngest_start = None
+    for alive_file in cores_dir.glob("*.alive"):
+        try:
+            if now - alive_file.stat().st_mtime >= 90.0:
+                continue  # stale heartbeat — not a live core
+            data = json.loads(alive_file.read_text())
+        except (OSError, ValueError):
+            continue
+        started = data.get("started_at")
+        if isinstance(started, (int, float)):
+            if youngest_start is None or started > youngest_start:
+                youngest_start = started
+    if youngest_start is None:
+        return False
+    return (now - youngest_start) < seconds
+
+
+def _default_core_restart(standard_context: bool) -> bool:
+    """Run scripts/start-cli.sh --restart out-of-process. When standard_context
+    is True, pin SUTANDO_CORE_MODEL=opus so the restarted core runs in the
+    standard 200K window (graceful degradation). Returns True if the restart
+    command exited 0."""
+    script = REPO_DIR / "scripts" / "start-cli.sh"
+    if not script.exists():
+        return False
+    env = dict(os.environ)
+    # launchd's minimal PATH won't find homebrew tmux; start-cli.sh needs it.
+    env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + env.get("PATH", "/usr/bin:/bin")
+    if standard_context:
+        env["SUTANDO_CORE_MODEL"] = "opus"
+    try:
+        proc = subprocess.run(
+            ["/bin/bash", str(script), "--restart"],
+            env=env, capture_output=True, text=True, timeout=120,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def recover_core_if_wedged(
+    state_file: Optional[Path] = None,
+    now: Optional[float] = None,
+    alive_fn=None,
+    oldest_task_fn=None,
+    status_ts_fn=None,
+    just_booted_fn=None,
+    restart_fn=None,
+    sender=None,
+) -> "dict | None":
+    """Auto-restart the core when it is alive-but-wedged. Returns a dict
+    describing the action taken (for tests / observability), or None when no
+    action was warranted. See the module comment above for the guard rationale.
+    All side-effecting collaborators are injectable for tests.
+
+    The whole load→decide→restart→save sequence runs under an exclusive,
+    non-blocking flock on `<state_file>.lock` (PR #1428 review, suggestion):
+    a manual `--recover-core` from the CLI and the launchd job firing in the
+    same window must not both clear the cooldown and issue duplicate restarts.
+    A second concurrent invocation returns {"action": "locked"} and no-ops.
+    """
+    if now is None:
+        now = time.time()
+    if state_file is None:
+        state_file = WORKSPACE_DIR / "state" / "core-recovery.json"
+    alive_fn = alive_fn or _any_core_alive
+    oldest_task_fn = oldest_task_fn or (lambda: _oldest_pending_task(now))
+    status_ts_fn = status_ts_fn or _core_status_ts
+    just_booted_fn = just_booted_fn or (lambda: _core_started_within(RECOVER_WEDGE_SEC, now=now))
+    restart_fn = restart_fn or _default_core_restart
+    send = sender or _default_slack_sender
+
+    try:
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    # Serialize the critical section (suggestion: no concurrent double-restart).
+    lock_path = state_file.with_name(state_file.name + ".lock")
+    lock_fh = None
+    if fcntl is not None:
+        try:
+            lock_fh = open(lock_path, "w")
+            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            # Another recovery invocation holds the lock — skip this pass.
+            if lock_fh is not None:
+                lock_fh.close()
+            return {"action": "locked"}
+
+    try:
+        try:
+            state = json.loads(state_file.read_text()) if state_file.exists() else {}
+        except Exception:
+            state = {}
+        if not isinstance(state, dict):
+            state = {}
+
+        def _save():
+            try:
+                state_file.write_text(json.dumps(state))
+            except Exception:
+                pass
+
+        def _reset_observation():
+            state["wedge_first_seen"] = 0
+            state["wedge_task"] = None
+            state["wedge_status_ts"] = None
+
+        oldest = oldest_task_fn()                    # (identity, age) | None
+        cur_key = oldest[0] if oldest else None
+        oldest_age = oldest[1] if oldest else None
+        status_ts = status_ts_fn()
+        wedged = (
+            alive_fn()
+            and oldest is not None
+            and oldest_age > RECOVER_WEDGE_SEC
+            and not just_booted_fn()
+        )
+
+        if not wedged:
+            # Healthy / no queued work / core down / just booted. Clear any
+            # in-progress observation so a future wedge starts fresh.
+            # last_restart / history are preserved (cooldown + give-up survive).
+            if state.get("wedge_first_seen") or state.get("wedge_task") is not None:
+                _reset_observation()
+                _save()
+            return None
+
+        # Identity + progress gating (blocker 3): age alone can't tell a wedge
+        # from a legitimately long single task. Reset the confirmation window if
+        # EITHER the oldest task changed (queue draining → a different oldest, or
+        # the file was rewritten → new mtime) OR the core advanced core-status.json
+        # (it's making progress, not looping). Only a SAME-task, NO-progress
+        # streak across the window is treated as a real wedge.
+        prev_key = state.get("wedge_task")
+        prev_status_ts = state.get("wedge_status_ts")
+        first_seen = state.get("wedge_first_seen") or 0
+        progressed = (
+            isinstance(prev_status_ts, (int, float))
+            and isinstance(status_ts, (int, float))
+            and status_ts > prev_status_ts
+        )
+        if (not first_seen) or prev_key != cur_key or progressed:
+            state["wedge_first_seen"] = now
+            state["wedge_task"] = cur_key
+            state["wedge_status_ts"] = status_ts
+            _save()
+            return {"action": "observed", "oldest_age": oldest_age, "task": cur_key}
+
+        if now - first_seen < RECOVER_CONFIRM_SEC:
+            return {"action": "confirming", "oldest_age": oldest_age, "for": int(now - first_seen)}
+
+        # Cooldown between restarts.
+        last_restart = state.get("last_restart") or 0
+        if last_restart and now - last_restart < RECOVER_COOLDOWN_SEC:
+            return {"action": "cooldown", "oldest_age": oldest_age, "since_restart": int(now - last_restart)}
+
+        # Give-up cap: prune restart history to the trailing hour.
+        history = [t for t in (state.get("restart_history") or []) if isinstance(t, (int, float)) and now - t < 3600]
+        if len(history) >= RECOVER_MAX_PER_HOUR:
+            # DM once per give-up episode. Record gave_up_at only on a SUCCESSFUL
+            # send so a Slack outage doesn't silence the give-up alert for an hour.
+            if not state.get("gave_up_at") or now - state["gave_up_at"] > 3600:
+                if send(
+                    ":octagonal_sign: *Sutando core auto-recovery gave up* — restarted "
+                    f"{len(history)}× in the last hour and the core is still wedged "
+                    f"(oldest task stuck {oldest_age // 60} min). Needs manual attention: "
+                    "check the CLI / `/usage-credits`."
+                ):
+                    state["gave_up_at"] = now
+                    _save()
+                else:
+                    print("[recover-core] WARNING: give-up DM to owner failed", flush=True)
+            return {"action": "gave_up", "restarts_last_hour": len(history)}
+
+        # Escalation: the FIRST restart in the trailing hour keeps 1M; if we're
+        # wedged again after a prior restart, that restart didn't hold — degrade
+        # to standard 200K context so the agent keeps working instead of re-wedging.
+        standard_context = len(history) >= 1
+        mode = "standard" if standard_context else "1m"
+        ctx_note = (
+            "in standard 200K context (the 1M restart didn't hold)" if standard_context
+            else "keeping 1M context"
+        )
+        # DM the owner BEFORE restarting. Capture the result (blocker 2): if the
+        # DM fails we still restart (recovery > notification — don't leave the
+        # core wedged because Slack is down), but we record dm_sent=False and log
+        # to stderr/launchd so the restart is never invisible.
+        dm_ok = send(
+            f":hourglass: *Sutando core wedged* — oldest task stuck {oldest_age // 60} min "
+            f"while the core process is alive (likely the 1M usage-credit gate or a "
+            f"stalled turn). Auto-restarting {ctx_note}. Queued tasks are preserved."
+        )
+        if not dm_ok:
+            print(f"[recover-core] WARNING: wedge-restart DM failed; restarting anyway (mode={mode})", flush=True)
+
+        if not restart_fn(standard_context):
+            # Restart launch failed — don't burn a cooldown/history slot, and
+            # keep the observation so we stay confirmed and retry next pass.
+            return {"action": "restart_failed", "mode": mode, "dm_sent": dm_ok}
+
+        history.append(now)
+        state["restart_history"] = history
+        state["last_restart"] = now
+        state["last_restart_mode"] = mode
+        state["last_restart_dm_sent"] = dm_ok
+        _reset_observation()  # re-observe after the restart settles
+        state.pop("gave_up_at", None)
+        _save()
+        return {
+            "action": "restarted", "mode": mode, "oldest_age": oldest_age,
+            "restarts_last_hour": len(history), "dm_sent": dm_ok,
+        }
+    finally:
+        if lock_fh is not None:
+            try:
+                fcntl.flock(lock_fh, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            lock_fh.close()
+
+
 def main():
     as_json = "--json" in sys.argv
     do_fix = "--fix" in sys.argv
     do_emit = "--emit-task" in sys.argv
     do_notify = "--notify-on-fail" in sys.argv
+    do_notify_slack = "--notify-slack" in sys.argv
+    do_recover = "--recover-core" in sys.argv
     quiet = "--quiet" in sys.argv or "-q" in sys.argv
 
     checks = run_all_checks()
@@ -1328,6 +1854,23 @@ def main():
     # can suppress the other.
     if do_notify:
         notify_for_failures(checks)
+
+    # Optional: remote Slack DM surface. Unlike --notify-on-fail (local
+    # macOS notification) and --emit-task (needs a live core to read the
+    # task), this reaches the owner off-machine and fires even when the core
+    # session is wedged but its heartbeat process still ticks. Intended for
+    # the launchd-supervised fallback invocation so outages self-report.
+    if do_notify_slack:
+        notify_slack_for_failures(checks)
+
+    # Optional: auto-recover a wedged core (alive-but-stuck) by restarting it.
+    # Independent of the checks list — keys off the queue-drain + heartbeat
+    # signals directly (see recover_core_if_wedged). Intended for the
+    # launchd-supervised fallback so the core self-heals from the 1M-gate wedge
+    # without waiting for a human. Heavily guarded (confirm window, cooldown,
+    # give-up cap); a no-op when the core is healthy.
+    if do_recover:
+        recover_core_if_wedged()
 
     # Emit-task: when NOT running --fix, the initial check IS the residual,
     # so emit here BEFORE the early-exit paths (--json return, --quiet
