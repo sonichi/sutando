@@ -2057,7 +2057,11 @@ async function createVoiceSession(connection: VoiceConnection, client: Client): 
 				// utterance — not only while meetingEntered. decideForTurn only
 				// (no meetingMode flipping on this path).
 				if (!VOICE_CONTROLLER && s.gate && !s.meetingEntered && ((s as any)._humanCount ?? 1) >= 2) {
-					decideForTurn(s.gate, item.content);
+					// forceGate=true (#1600 M3): the group regime must re-acquire the
+					// addressed bit even with no SUTANDO_PEER_NAMES configured, else
+					// decideForTurn's no-peer early-return skips the update and a
+					// reconnect-cleared gate stays muted — the bare-name "叫不醒".
+					decideForTurn(s.gate, item.content, true);
 				}
 				if (!VOICE_CONTROLLER && s.gate && s.meetingEntered) {
 					const addressed = decideForTurn(s.gate, item.content) !== 'drop';

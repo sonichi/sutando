@@ -135,6 +135,50 @@ export function createGate(cfg: GateConfig): GateState {
 	};
 }
 
+// CJK address/imperative verbs — a Chinese summons names the bot then issues a
+// request ("露西帮我看下屏幕" = Lucy, help me look at the screen). These are the
+// CJK analogue of ADDRESS_VERBS: a mention verb like 说 (said) is deliberately
+// EXCLUDED so "露西说的那个" (the thing Lucy said) is NOT treated as a summons.
+const CJK_ADDRESS_VERBS = [
+	'帮', '给', '打开', '看', '查', '告诉', '搜', '读', '念', '设置', '播放',
+	'放', '调', '找', '显示', '截', '复制', '粘贴', '开', '关', '解释', '翻译',
+	'记', '存', '发', '回答', '听', '过来', '醒',
+];
+
+/**
+ * Bare-name / CJK-imperative summons (#1600 M2). The greet/comma/verb matchers
+ * in isAddressedBy MISS the single most common live call pattern — a bare name
+ * with nothing after it ("Lucy" / "Lucy." / "Loosey") and a Chinese name +
+ * imperative ("露西帮我看下屏幕"). Both are unambiguous summons yet matched
+ * NEITHER isAddressedBy NOR isWakePhrase, so after a reconnect cleared the
+ * sticky addressed bit the group-active gate stayed muted ("叫不醒"). This is
+ * OR-ed into the addressing decision (decideForTurn), NOT into isWakePhrase —
+ * a bare name ANSWERS one turn but does not flip meeting→active (that still
+ * needs a deliberate wake phrase), preserving the no-false-wake property.
+ *
+ * Safe against passing mentions: rule (1) fires ONLY when the WHOLE normalized
+ * utterance IS the name ("I told Lucy" → "i told lucy" ≠ "lucy" → no match);
+ * rule (2) fires only on a CJK name at the very start immediately followed by
+ * an imperative verb (mention verbs like 说 are excluded).
+ */
+export function isBareSummons(text: string, names: string[]): boolean {
+	if (!text || names.length === 0) return false;
+	const norm = normalizeSpoken(text);
+	if (!norm) return false;
+	for (const raw of names) {
+		const n = normalizeSpoken(raw);
+		if (!n) continue;
+		// (1) bare standalone name — the entire utterance is just the name.
+		if (norm === n) return true;
+		// (2) CJK name at the start + (optional space) + an imperative/request verb.
+		if (/[一-鿿]/.test(n) && norm.startsWith(n)) {
+			const rest = norm.slice(n.length).trimStart();
+			if (rest && CJK_ADDRESS_VERBS.some(v => rest.startsWith(v))) return true;
+		}
+	}
+	return false;
+}
+
 /**
  * Detect an explicit "standby / go quiet" command. Standby phrases are bare
  * command words ("standby", "待命"), not name-addressed imperatives, so this is
@@ -165,16 +209,22 @@ export function isStandby(text: string, standbyVariants: string[]): boolean {
  * and (via createGate) starts silent. Legacy mode keeps the old "no peer →
  * always allow" shortcut so non-meeting single-bot deployments are unchanged.
  */
-export function decideForTurn(state: GateState, userText: string): Decision {
+export function decideForTurn(state: GateState, userText: string, forceGate = false): Decision {
 	// Standby: explicit "go silent but stay" — re-silences until next name cue.
 	if (isStandby(userText, state.standbyVariants)) {
 		state.lastAddressedToMe = false;
 		return 'drop';
 	}
 	// Legacy single-bot (no peers, not meeting mode): gate disabled, allow all.
-	if (!state.cfg.meetingMode && state.otherVariants.length === 0) return 'allow';
-	const haveMyName = isAddressedBy(userText, state.nameVariants);
-	const haveOtherName = state.otherVariants.length > 0 && isAddressedBy(userText, state.otherVariants);
+	// forceGate overrides this — the population-aware group regime (#1600 M3)
+	// needs real addressing gating even with no peer instances configured, so it
+	// can re-acquire the sticky addressed bit after a reconnect cleared it
+	// (otherwise this early-return would skip the lastAddressedToMe update and
+	// the group-active gate would stay muted = "叫不醒").
+	if (!forceGate && !state.cfg.meetingMode && state.otherVariants.length === 0) return 'allow';
+	const haveMyName = isAddressedBy(userText, state.nameVariants) || isBareSummons(userText, state.nameVariants);
+	const haveOtherName = state.otherVariants.length > 0
+		&& (isAddressedBy(userText, state.otherVariants) || isBareSummons(userText, state.otherVariants));
 	if (haveMyName) state.lastAddressedToMe = true;
 	else if (haveOtherName) state.lastAddressedToMe = false;
 	return state.lastAddressedToMe ? 'allow' : 'drop';
