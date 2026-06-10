@@ -3422,7 +3422,22 @@ async def poll_results():
                         first = True
                         for chunk in _chunk_for_discord(clean_text):
                             ref = discord.MessageReference(message_id=reply_to_id, channel_id=channel.id, fail_if_not_exists=False) if (first and reply_to_id) else None
-                            await channel.send(chunk, reference=ref)
+                            try:
+                                await channel.send(chunk, reference=ref)
+                            except Exception as e:
+                                # Replying to a *system* message (e.g. the
+                                # thread_created stub a new thread leaves in
+                                # the parent channel) is rejected with 50035
+                                # "Cannot reply to a system message" even with
+                                # fail_if_not_exists=False (observed 2026-06-10:
+                                # an owner reply was dropped entirely). The
+                                # content matters more than the quote anchor —
+                                # retry once as a fresh message.
+                                _http_exc = getattr(discord, "HTTPException", None)
+                                if ref is None or _http_exc is None or not isinstance(e, _http_exc):
+                                    raise
+                                print(f"  [reply-anchor] reference send failed ({e}); retrying without reference", flush=True)
+                                await channel.send(chunk)
                             first = False
                         try:
                             import outbox_log
