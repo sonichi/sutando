@@ -928,7 +928,7 @@ function showChromeSttInterim(text) {
     $('transcript').appendChild(currentUserEl);
   }
   currentUserEl.textContent = text;
-  $('transcript').scrollTop = $('transcript').scrollHeight;
+  scrollTranscript();
 }
 
 function startChromeStt() {
@@ -944,6 +944,22 @@ function stopChromeStt() {
 let currentUserEl = null;
 let currentAssistantEl = null;
 let serverUserTextReceived = false;  // blocks Chrome STT overwrites after server sends
+
+// Stick-to-bottom autoscroll: follow new content only while the user is at the
+// bottom. A manual scroll-up to read history must not be yanked back down by
+// streaming updates. force=true (the user's own typed message) always jumps.
+let transcriptPinned = true;
+let transcriptScrollHooked = false;
+function scrollTranscript(force) {
+  const t = $('transcript');
+  if (!transcriptScrollHooked) {
+    transcriptScrollHooked = true;
+    t.addEventListener('scroll', () => {
+      transcriptPinned = t.scrollHeight - t.scrollTop - t.clientHeight < 40;
+    });
+  }
+  if (force || transcriptPinned) t.scrollTop = t.scrollHeight;
+}
 
 function addCopyBtn(el) {
   const btn = document.createElement('span');
@@ -989,7 +1005,7 @@ function handleTranscript(role, text, partial) {
     currentAssistantEl.textContent = text;
     if (!partial) { addCopyBtn(currentAssistantEl); currentAssistantEl = null; }
   }
-  $('transcript').scrollTop = $('transcript').scrollHeight;
+  scrollTranscript();
 }
 
 function addSystem(text, isHtml) {
@@ -998,7 +1014,7 @@ function addSystem(text, isHtml) {
   if (isHtml) { el.innerHTML = text; } else { el.textContent = text; }
   addCopyBtn(el);
   $('transcript').appendChild(el);
-  $('transcript').scrollTop = $('transcript').scrollHeight;
+  scrollTranscript();
 }
 
 // ─── Debug log ────────────────────────────────────────────
@@ -1772,7 +1788,7 @@ function connectWs() {
             dlLink.textContent = 'Download image';
             imgEl.appendChild(dlLink);
             $('transcript').appendChild(imgEl);
-            $('transcript').scrollTop = $('transcript').scrollHeight;
+            scrollTranscript();
             dbg('Image received via gui.update: ' + (guiData.description || '').slice(0, 50), 'event');
           } else if (guiData?.type === 'video' && guiData.base64) {
             const vidEl = document.createElement('div');
@@ -1803,7 +1819,7 @@ function connectWs() {
             dlLink.textContent = 'Download video';
             vidEl.appendChild(dlLink);
             $('transcript').appendChild(vidEl);
-            $('transcript').scrollTop = $('transcript').scrollHeight;
+            scrollTranscript();
             dbg('Video received via gui.update: ' + (guiData.description || '').slice(0, 50), 'event');
           } else {
             addSystem('[gui] ' + JSON.stringify(guiData));
@@ -1832,7 +1848,7 @@ function connectWs() {
           dlLink2.textContent = 'Download image';
           imgEl.appendChild(dlLink2);
           $('transcript').appendChild(imgEl);
-          $('transcript').scrollTop = $('transcript').scrollHeight;
+          scrollTranscript();
           dbg('Image received: ' + (msg.data.description || '').slice(0, 50), 'event');
         } else if (msg.type === 'speech_speed') {
           const speeds = { slow: 0.85, normal: 1.0, fast: 1.2 };
@@ -2484,7 +2500,7 @@ function sendText() {
   el.className = 't-entry t-user';
   el.textContent = text;
   $('transcript').appendChild(el);
-  $('transcript').scrollTop = $('transcript').scrollHeight;
+  scrollTranscript(true);
   input.value = '';
 
   if (ws && ws.readyState === WebSocket.OPEN) {
@@ -2525,7 +2541,7 @@ function sendText() {
                 }
                 addCopyBtn(re);
                 $('transcript').appendChild(re);
-                $('transcript').scrollTop = $('transcript').scrollHeight;
+                scrollTranscript();
               }
             }).catch(() => {});
           }, 2000);
