@@ -386,6 +386,11 @@ def render_dashboard() -> str:
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
+    # Drop connections that go silent (e.g. browser speculative preconnects
+    # that open TCP and never send a request line). Without this, readline()
+    # in handle_one_request blocks forever holding a server thread.
+    timeout = 30
+
     def log_message(self, fmt, *args): pass
 
     def end_headers(self):
@@ -556,7 +561,11 @@ if __name__ == "__main__":
     # know you want it. Same env-override shape as `AGENT_API_BIND` in
     # agent-api.py.
     bind = os.environ.get("DASHBOARD_BIND", "127.0.0.1")
-    server = http.server.HTTPServer((bind, PORT), Handler)
+    # ThreadingHTTPServer: the single-threaded HTTPServer wedged whenever one
+    # client held a connection without completing a request — every later
+    # request (and the dashboard UI) hung on a port that still looked open
+    # to startup.sh's lsof guard (2026-06-08/10 incidents).
+    server = http.server.ThreadingHTTPServer((bind, PORT), Handler)
     print(f"Sutando Dashboard → http://{bind}:{PORT}", flush=True)
     if bind != "127.0.0.1":
         print(
