@@ -201,6 +201,38 @@ When you need user input on a decision or are blocked:
 
 On each proactive loop pass, check `pending-questions.md` for unanswered items and surface them when the user is available.
 
+## Task progress notifications
+
+**Call notify BEFORE doing any work** — the notification must be the first thing the user sees
+after sending a task, not silence followed by a result minutes later.
+
+**Voice message tasks:** notify BEFORE calling the transcription script. Transcription takes
+10–30 seconds — the user should never wait in silence while you transcribe.
+- See `[File attached: ...]` in task → notify "Got your voice message, give me a moment." → THEN transcribe
+
+**All other tasks:** correct sequence:
+1. Read task file
+2. **Call notify immediately** (before any web searches, file reads, or analysis)
+3. Do the work
+4. Send a checkpoint update at natural milestones
+5. Return result
+
+Use the `task-progress` skill for any task involving research, code changes, PRs, multi-step
+analysis, or anything likely to take more than ~60 seconds:
+
+```bash
+python3 $CLAUDE_CONFIG_DIR/skills/task-progress/scripts/notify.py \
+  --source <source> --channel-id <channel_id> \
+  --message "On it — looking into that now. Back in a minute."
+```
+
+Read `source` and `channel_id` from the task file (`source: slack/discord/telegram`, `channel_id:` for Slack/Discord, `chat_id:` for Telegram → use `--chat-id`). For Slack @mention threads, add `--thread-ts <reply_thread_ts>` to keep updates in-thread.
+
+Send a second update at meaningful checkpoints (e.g. "Done with the research — writing up now.").
+
+The script is fail-open — always continue the task regardless of exit code. Only skip for
+immediate one-sentence answers that require no tool calls.
+
 ## Workspace layout
 
 - Vision + docs: `README.md` (this directory)

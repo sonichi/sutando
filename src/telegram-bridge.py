@@ -313,6 +313,28 @@ def api(method, **params):
 INBOX_DIR = REPO / "telegram-inbox"
 INBOX_DIR.mkdir(exist_ok=True)
 
+def _transcribe_via_skill(local_path: str) -> str | None:
+    """Call skills/audio-transcribe/scripts/transcribe.py. Returns transcript or None.
+
+    Optional — if the skill is absent the caller falls back to [Voice note attached:].
+    Errors are swallowed; transcription failure must never block task delivery.
+    """
+    import subprocess
+    skill_script = Path(__file__).parent.parent / "skills" / "audio-transcribe" / "scripts" / "transcribe.py"
+    if not skill_script.exists():
+        return None
+    try:
+        result = subprocess.run(
+            [sys.executable, str(skill_script), local_path],
+            capture_output=True, text=True, timeout=25,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() or None
+    except Exception as e:
+        print(f"  [stt] skill call failed for {os.path.basename(local_path)}: {e}", flush=True)
+    return None
+
+
 def download_file(file_id, name_hint="file"):
     """Download a file from Telegram and save locally."""
     result = api("getFile", file_id=file_id)
@@ -526,7 +548,11 @@ def main():
                     file_id = msg["voice"]["file_id"]
                     local_path = download_file(file_id, "voice.ogg")
                     if local_path:
-                        attachment_note = f"\n[Voice note attached: {local_path}]"
+                        transcript = _transcribe_via_skill(local_path)
+                        if transcript:
+                            attachment_note = f"\n[Voice transcript: {transcript}]"
+                        else:
+                            attachment_note = f"\n[Voice note attached: {local_path}]"
 
                 if not text and not attachment_note:
                     continue
@@ -551,6 +577,39 @@ def main():
                     if vault_result.failed:
                         print(f"  [vault] store failed (still redacted): {vault_result.failed}", flush=True)
 
+                # Inject skill instructions so the agent follows notify-before-work
+                # and transcription protocol even after conversation compaction.
+                # Only injected when the referenced skills are installed on this node.
+                # CCD-resolved (PR #1525 pattern): never hardcode ~/.claude — nodes may relocate
+                # the config dir via $CLAUDE_CONFIG_DIR.
+                _claude_config = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
+                _notify_py = _claude_config / "skills/task-progress/scripts/notify.py"
+                _transcribe_py = _claude_config / "skills/audio-transcribe/scripts/transcribe.py"
+                has_audio_attach = attachment_note and any(
+                    attachment_note.lower().find(ext) != -1
+                    for ext in (".m4a", ".mp3", ".ogg", ".opus", ".oga", ".wav", ".webm", ".aac")
+                )
+                tg_skill_hints = ""
+                if _notify_py.exists() or _transcribe_py.exists():
+                    lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
+                    step = 1
+                    if _notify_py.exists():
+                        notify_cmd = (
+                            f"python3 {_notify_py}"
+                            f" --source telegram --chat-id {chat_id}"
+                        )
+                        if has_audio_attach:
+                            lines.append(f'{step}. NOTIFY FIRST: {notify_cmd} --message "Got your voice message, give me a moment."')
+                        else:
+                            lines.append(f'{step}. NOTIFY FIRST (if task takes >60s): {notify_cmd} --message "On it — back in a moment."')
+                        step += 1
+                    if has_audio_attach and _transcribe_py.exists():
+                        attached_path = attachment_note.split("[File attached: ")[-1].rstrip("]").split("\n")[0]
+                        lines.append(f"{step}. TRANSCRIBE: python3 {_transcribe_py} '{attached_path}'")
+                        step += 1
+                    lines.append(f"{step}. Process transcript and write result to results/{task_id}.txt")
+                    tg_skill_hints = "\n" + "\n".join(lines) + "\n"
+
                 task_file.write_text(
                     f"id: {task_id}\n"
                     f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
@@ -558,6 +617,7 @@ def main():
                     f"source: telegram\n"
                     f"chat_id: {chat_id}\n"
                     f"priority: {priority}\n"
+                    f"{tg_skill_hints}"
                 )
                 pending_replies[task_id] = chat_id
 

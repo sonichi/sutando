@@ -342,6 +342,29 @@ def _download_slack_file(file_dict: dict) -> str | None:
         return None
 
 
+def _transcribe_via_skill(local_path: str) -> str | None:
+    """Call skills/audio-transcribe/scripts/transcribe.py. Returns transcript or None.
+
+    The skill is optional — if it is absent the bridge falls back to the plain
+    [File attached:] line unchanged. Any error from the subprocess is swallowed;
+    transcription failure must never block task delivery.
+    """
+    import subprocess
+    skill_script = Path(__file__).parent.parent / "skills" / "audio-transcribe" / "scripts" / "transcribe.py"
+    if not skill_script.exists():
+        return None
+    try:
+        result = subprocess.run(
+            [sys.executable, str(skill_script), local_path],
+            capture_output=True, text=True, timeout=25,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() or None
+    except Exception as e:
+        print(f"  [stt] skill call failed for {os.path.basename(local_path)}: {e}", flush=True)
+    return None
+
+
 def _write_task(event: dict, prefix: str, text: str, username: str | None) -> str | None:
     """Write a task file from a Slack event. Returns task_id or None if skipped."""
     user_id = event.get("user")
@@ -378,7 +401,11 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     for file_dict in event.get("files") or []:
         local_path = _download_slack_file(file_dict)
         if local_path:
-            attachment_lines.append(f"[File attached: {local_path}]")
+            transcript = _transcribe_via_skill(local_path)
+            if transcript:
+                attachment_lines.append(f"[Voice transcript: {transcript}]")
+            else:
+                attachment_lines.append(f"[File attached: {local_path}]")
     attachment_note = ("\n" + "\n".join(attachment_lines)) if attachment_lines else ""
 
     if not text and not attachment_note:
@@ -458,6 +485,41 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     task_id = f"task-{ts}"
     task_file = TASKS_DIR / f"{task_id}.txt"
     priority = default_priority_for_source("slack", access_tier)
+
+    # Inject skill instructions so the agent follows the notify-before-work and
+    # transcription protocol even after conversation compaction wipes context.
+    # Only injected for owner tasks when the referenced skills are installed.
+    # CCD-resolved (PR #1525 pattern): never hardcode ~/.claude — nodes may relocate
+    # the config dir via $CLAUDE_CONFIG_DIR.
+    _claude_config = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
+    _notify_py = _claude_config / "skills/task-progress/scripts/notify.py"
+    _transcribe_py = _claude_config / "skills/audio-transcribe/scripts/transcribe.py"
+    skill_hints = ""
+    if access_tier == "owner" and (_notify_py.exists() or _transcribe_py.exists()):
+        hints_lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
+        step = 1
+        if _notify_py.exists():
+            notify_cmd = (
+                f"python3 {_notify_py}"
+                f" --source slack --channel-id {channel}"
+                f' --message "On it — back in a moment."'
+            )
+            hints_lines.append(f"{step}. NOTIFY FIRST: {notify_cmd}")
+            step += 1
+        if attachment_lines and _transcribe_py.exists():
+            for ap in attachment_lines:
+                attached_path = ap.replace("[File attached: ", "").rstrip("]")
+                if _notify_py.exists():
+                    hints_lines.append(
+                        f'   Update notify message to: --message "Got your voice message, give me a moment."'
+                    )
+                hints_lines.append(
+                    f"{step}. TRANSCRIBE: python3 {_transcribe_py} '{attached_path}'"
+                )
+                step += 1
+        hints_lines.append(f"{step}. Then process and write result to results/{task_id}.txt")
+        skill_hints = "\n" + "\n".join(hints_lines) + "\n"
+
     task_file.write_text(
         f"id: {task_id}\n"
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
@@ -467,6 +529,7 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         f"user_id: {user_id}\n"
         f"access_tier: {access_tier}\n"
         f"priority: {priority}\n"
+        f"{skill_hints}"
     )
     with pending_replies_lock:
         pending_replies[task_id] = {

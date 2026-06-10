@@ -5,6 +5,8 @@ Same file-based architecture as the Telegram and voice bridges.
 
 Usage: python3 src/discord-bridge.py
 """
+from __future__ import annotations
+
 
 import asyncio
 import json
@@ -400,6 +402,28 @@ INBOX_DIR = Path("/tmp/discord-inbox")
 TASKS_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 INBOX_DIR.mkdir(exist_ok=True)
+
+
+def _transcribe_via_skill(local_path: str) -> str | None:
+    """Call skills/audio-transcribe/scripts/transcribe.py. Returns transcript or None.
+
+    Optional — if the skill is absent the caller falls back to [File attached:].
+    Errors are swallowed; transcription failure must never block task delivery.
+    """
+    import subprocess
+    skill_script = Path(__file__).parent.parent / "skills" / "audio-transcribe" / "scripts" / "transcribe.py"
+    if not skill_script.exists():
+        return None
+    try:
+        result = subprocess.run(
+            [sys.executable, str(skill_script), local_path],
+            capture_output=True, text=True, timeout=25,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() or None
+    except Exception as e:
+        print(f"  [stt] skill call failed for {os.path.basename(local_path)}: {e}", flush=True)
+    return None
 
 
 def _safe_attachment_basename(filename: str) -> str:
@@ -2546,7 +2570,11 @@ async def _handle_discord_message(message, force=False):
         local_path = INBOX_DIR / f"{int(time.time()*1000)}_{_safe_attachment_basename(att.filename)}"
         try:
             await att.save(local_path)
-            attachment_note += f"\n[File attached: {local_path}]"
+            transcript = _transcribe_via_skill(str(local_path))
+            if transcript:
+                attachment_note += f"\n[Voice transcript: {transcript}]"
+            else:
+                attachment_note += f"\n[File attached: {local_path}]"
             # If voice is connected and the attachment is an image, also push
             # it as a vision frame so Gemini sees it in-stream (in addition
             # to the file-attached task pipeline).
@@ -2743,7 +2771,7 @@ async def _handle_discord_message(message, force=False):
     if access_tier in ("team", "other"):
         codex_prompt_text = (
             "You are answering on behalf of Sutando, an autonomous personal AI agent.\n"
-            "Sutando's actual skills live in `skills/` (this repo) and under `~/.claude/skills/`.\n"
+            "Sutando's actual skills live in `skills/` (this repo) and under `$CLAUDE_CONFIG_DIR/skills/`.\n"
             "When asked about capabilities or identity, refer to Sutando's skills/architecture — "
             "NOT to your own sandbox-runtime's available skills. You ARE Sutando in this context.\n\n"
             "---\n\n"
@@ -2898,6 +2926,40 @@ async def _handle_discord_message(message, force=False):
         if getattr(message, "reference", None) and message.reference.message_id
         else ""
     )
+    # Inject skill instructions for owner tasks so the agent follows the
+    # notify-before-work and transcription protocol after compaction.
+    # Only injected when the referenced skills are installed on this node.
+    # CCD-resolved (PR #1525 pattern): never hardcode ~/.claude — nodes may relocate
+    # the config dir via $CLAUDE_CONFIG_DIR.
+    _claude_config = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
+    _notify_py = _claude_config / "skills/task-progress/scripts/notify.py"
+    _transcribe_py = _claude_config / "skills/audio-transcribe/scripts/transcribe.py"
+    discord_skill_hints = ""
+    if access_tier == "owner" and (_notify_py.exists() or _transcribe_py.exists()):
+        channel_id_str = str(message.channel.id)
+        has_audio = "[File attached:" in attachment_note and any(
+            attachment_note.lower().find(ext) != -1
+            for ext in (".m4a", ".mp3", ".ogg", ".opus", ".wav", ".webm", ".aac")
+        )
+        lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
+        step = 1
+        if _notify_py.exists():
+            notify_cmd = (
+                f"python3 {_notify_py}"
+                f" --source discord --channel-id {channel_id_str}"
+            )
+            if has_audio:
+                lines.append(f'{step}. NOTIFY FIRST: {notify_cmd} --message "Got your voice message, give me a moment."')
+            else:
+                lines.append(f'{step}. NOTIFY FIRST (if task takes >60s): {notify_cmd} --message "On it — back in a moment."')
+            step += 1
+        if has_audio and _transcribe_py.exists():
+            attached_path = attachment_note.split("[File attached: ")[-1].rstrip("]").split("\n")[0]
+            lines.append(f"{step}. TRANSCRIBE: python3 {_transcribe_py} '{attached_path}'")
+            step += 1
+        lines.append(f"{step}. Process transcript and write result to results/{task_id}.txt")
+        discord_skill_hints = "\n" + "\n".join(lines) + "\n"
+
     task_file.write_text(
         f"id: {task_id}\n"
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
@@ -2912,6 +2974,7 @@ async def _handle_discord_message(message, force=False):
         f"access_tier: {access_tier}\n"
         f"priority: {priority}\n"
         f"{tier_instructions.get(access_tier, tier_instructions['other'])}"
+        f"{discord_skill_hints}"
     )
     pending_replies[task_id] = message.channel
     # Track source-message-id so the result-sender can auto-attach reply_to
