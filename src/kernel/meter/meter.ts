@@ -42,6 +42,36 @@ function fsyncEnabled(): boolean {
 	return v === '1' || v === 'true' || v === 'yes' || v === 'on';
 }
 
+/** Durable append of a FULLY-FORMED usage record to the daily ledger — the
+ *  durability point (O_APPEND, single write per line; fsync behind
+ *  SUTANDO_METERING_FSYNC). Never throws. Used by `record()` and by the
+ *  collector, which receives already-stamped records from source normalizers
+ *  (CC-derived `usage_id`/`trace_id`) and must NOT re-stamp them. */
+export function writeLedger(rec: UsageRecord): void {
+	try {
+		const path = ledgerPath(rec.ts * 1000);
+		mkdirSync(dirname(path), { recursive: true });
+		const line = JSON.stringify(rec) + '\n';
+		if (fsyncEnabled()) {
+			const fd = openSync(path, 'a');
+			try {
+				writeSync(fd, line);
+				fsyncSync(fd);
+			} finally {
+				closeSync(fd);
+			}
+		} else {
+			appendFileSync(path, line, { flag: 'a' });
+		}
+	} catch (e) {
+		try {
+			process.stderr.write(`[meter] FAILED to record usage ${rec.usage_id} (${rec.meter}): ${(e as Error).message}\n`);
+		} catch {
+			/* best-effort */
+		}
+	}
+}
+
 export function record(input: UsageRecordInput): UsageRecord {
 	// tenant_id defaults from config when the caller doesn't specify (BYOK → null).
 	let tenantId = input.tenant_id;
@@ -71,28 +101,7 @@ export function record(input: UsageRecordInput): UsageRecord {
 	if (input.source_file !== undefined) rec.source_file = input.source_file;
 
 	// --- durability point: synchronous append BEFORE the advisory emit ---
-	try {
-		const path = ledgerPath(rec.ts * 1000);
-		mkdirSync(dirname(path), { recursive: true });
-		const line = JSON.stringify(rec) + '\n';
-		if (fsyncEnabled()) {
-			const fd = openSync(path, 'a');
-			try {
-				writeSync(fd, line);
-				fsyncSync(fd);
-			} finally {
-				closeSync(fd);
-			}
-		} else {
-			appendFileSync(path, line, { flag: 'a' });
-		}
-	} catch (e) {
-		try {
-			process.stderr.write(`[meter] FAILED to record usage ${rec.usage_id} (${rec.meter}): ${(e as Error).message}\n`);
-		} catch {
-			/* best-effort */
-		}
-	}
+	writeLedger(rec);
 
 	// --- advisory obs event so usage shows inline in traces (the ledger bills) ---
 	try {
