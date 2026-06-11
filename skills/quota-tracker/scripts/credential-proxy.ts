@@ -13,14 +13,14 @@
  */
 
 import { createServer, request as httpRequest, type RequestOptions } from 'node:http';
-import { request as httpsRequest } from 'node:https';
+import { request as httpsRequest, type RequestOptions as HttpsRequestOptions } from 'node:https';
 import { execSync } from 'node:child_process';
 import { writeFileSync, readFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { statusPath } from '../../../src/workspace_default.js';
 
-const PORT = 7846;
-const UPSTREAM = 'https://api.anthropic.com';
+const PORT = Number(process.env.CREDENTIAL_PROXY_PORT) || 7846;
+const UPSTREAM = process.env.CREDENTIAL_PROXY_UPSTREAM || 'https://api.anthropic.com';
 // Quota state is per-user runtime state — canonical home is <workspace>/state/.
 // Historically written into the skill dir; readers (dashboard.py, read-quota.py)
 // keep the skill-dir path as a last-resort fallback for one release.
@@ -73,13 +73,16 @@ function updateQuotaState(headers: Record<string, string>): void {
 	} catch { /* best effort */ }
 }
 
-// Verify token exists at startup
-const initToken = getOAuthToken();
-if (!initToken) {
-	console.error('No OAuth token found in macOS keychain. Is Claude Code logged in?');
-	process.exit(1);
+// Verify token exists at startup (skippable for tests via CREDENTIAL_PROXY_SKIP_OAUTH=1)
+const SKIP_OAUTH = process.env.CREDENTIAL_PROXY_SKIP_OAUTH === '1';
+if (!SKIP_OAUTH) {
+	const initToken = getOAuthToken();
+	if (!initToken) {
+		console.error('No OAuth token found in macOS keychain. Is Claude Code logged in?');
+		process.exit(1);
+	}
+	console.log(`${ts()} [Proxy] OAuth token loaded from keychain (will re-read on each request)`);
 }
-console.log(`${ts()} [Proxy] OAuth token loaded from keychain (will re-read on each request)`);
 
 const upstreamUrl = new URL(UPSTREAM);
 
@@ -88,14 +91,6 @@ const server = createServer((req, res) => {
 	req.on('data', (c) => chunks.push(c));
 	req.on('end', () => {
 		const body = Buffer.concat(chunks);
-
-		// Read token fresh from keychain each request (tokens get refreshed by active sessions)
-		const oauthToken = getOAuthToken();
-		if (!oauthToken) {
-			res.writeHead(502);
-			res.end('No OAuth token in keychain');
-			return;
-		}
 
 		const headers: Record<string, string | number | string[] | undefined> = {
 			...(req.headers as Record<string, string>),
@@ -108,10 +103,19 @@ const server = createServer((req, res) => {
 		delete headers['keep-alive'];
 		delete headers['transfer-encoding'];
 
-		// Inject OAuth token for auth requests
-		if (headers['authorization']) {
-			delete headers['authorization'];
-			headers['authorization'] = `Bearer ${oauthToken}`;
+		if (!SKIP_OAUTH) {
+			// Read token fresh from keychain each request (tokens get refreshed by active sessions)
+			const oauthToken = getOAuthToken();
+			if (!oauthToken) {
+				res.writeHead(502);
+				res.end('No OAuth token in keychain');
+				return;
+			}
+			// Inject OAuth token for auth requests
+			if (headers['authorization']) {
+				delete headers['authorization'];
+				headers['authorization'] = `Bearer ${oauthToken}`;
+			}
 		}
 
 		// IDLE_TIMEOUT_MS: how long a streaming response can go silent before we
@@ -119,12 +123,17 @@ const server = createServer((req, res) => {
 		// normal slow-streaming responses (large completions) are never cut off —
 		// only truly stalled connections time out.  30 s is generous for any real
 		// network blip; the Anthropic API keeps chunks coming at least that fast.
-		const IDLE_TIMEOUT_MS = 30_000;
+		// Override via CREDENTIAL_PROXY_IDLE_TIMEOUT_MS for tests.
+		const IDLE_TIMEOUT_MS = Number(process.env.CREDENTIAL_PROXY_IDLE_TIMEOUT_MS) || 30_000;
 
-		const upstream = httpsRequest(
+		const isHttps = upstreamUrl.protocol === 'https:';
+		const makeRequest = isHttps ? httpsRequest : httpRequest;
+		const upstreamPort = upstreamUrl.port ? Number(upstreamUrl.port) : (isHttps ? 443 : 80);
+
+		const upstream = makeRequest(
 			{
 				hostname: upstreamUrl.hostname,
-				port: 443,
+				port: upstreamPort,
 				path: req.url,
 				method: req.method,
 				headers,
@@ -169,6 +178,10 @@ const server = createServer((req, res) => {
 			if (!res.headersSent) {
 				res.writeHead(err.message.includes('timeout') ? 504 : 502);
 				res.end(err.message.includes('timeout') ? 'Gateway Timeout' : 'Bad Gateway');
+			} else {
+				// Headers already forwarded — can't change status, but must close
+				// the client connection so it doesn't hang indefinitely.
+				res.destroy();
 			}
 		});
 
