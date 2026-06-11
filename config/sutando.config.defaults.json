@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "voice": {
+    "provider": "gemini-live",
+    "model": null
+  },
+  "telephony": {
+    "provider": "twilio"
+  },
+  "stt": {
+    "provider": "gemini"
+  },
+  "tts": {
+    "provider": "gemini"
+  },
+  "observability": {
+    "sinks": [
+      { "type": "jsonl-file" }
+    ]
+  },
+  "tenant": {
+    "id": null,
+    "mode": "byok"
+  },
+  "metering": {
+    "enabled": false,
+    "endpoint": null,
+    "batchMax": 100
+  },
+  "send": {
+    "allowedRoots": []
+  }
+}
