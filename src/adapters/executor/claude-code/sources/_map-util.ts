@@ -18,6 +18,10 @@ export function num(v: unknown): number | undefined {
 	return typeof v === 'number' ? v : undefined;
 }
 
+export function str(v: unknown): string | undefined {
+	return typeof v === 'string' ? v : undefined;
+}
+
 /** Capture a value but cap large strings/objects so huge tool I/O can't bloat
  *  events. Raise via SUTANDO_IO_CAP. */
 const IO_CAP = Number(process.env.SUTANDO_IO_CAP) || 16384;

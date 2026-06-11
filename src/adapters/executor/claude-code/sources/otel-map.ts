@@ -15,7 +15,7 @@ import {
 	traceIdFromSession,
 	usageIdFromRequest,
 } from './ids.js';
-import { CORE_SOURCE, baseEvent, clean, num, tsBucket, tsOf } from './_map-util.js';
+import { CORE_SOURCE, baseEvent, clean, num, str, tsBucket, tsOf } from './_map-util.js';
 
 const TOKEN_SLOT: Record<string, string> = {
 	input: 'input_tokens',
@@ -82,7 +82,7 @@ function mapMetric(m: OtelMetricRecord, ctx: MapContext): MapResult {
 			unit: 'usd',
 			provider: 'anthropic',
 			provider_ref: requestId ?? null,
-			attrs: clean({ _cc_source: 'otel-metric', model: a.model, cost_usd: m.value }),
+			attrs: clean({ _cc_source: 'otel-metric', model: str(a.model), cost_usd: m.value }),
 		};
 		return { events: [], usage: [usage] };
 	}
@@ -191,7 +191,7 @@ function mapSpan(s: OtelSpanRecord, ctx: MapContext): MapResult {
 				provider_ref: requestId ?? null,
 				attrs: clean({
 					_cc_source: 'otel-span',
-					model: a.model,
+					model: str(a.model),
 					input_tokens: input,
 					output_tokens: output,
 					cache_read: num(a.cache_read_tokens),
