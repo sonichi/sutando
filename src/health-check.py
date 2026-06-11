@@ -320,6 +320,13 @@ def _filter_pids_this_checkout(pids: list) -> list:
     (covers relative-path launches like `npm exec tsx src/voice-agent.ts`).
     Fail-open: a PID whose argv AND cwd both can't be determined is kept, so
     a probe failure can't hide a real stale deploy.
+
+    Scope note (review #1650): fail-open covers only the both-probes-failed
+    case. A PID with a readable argv that matches neither repo form, and no
+    matching cwd, is DROPPED — i.e. the guarantee is "keep ours + keep
+    undeterminable", not "keep everything that isn't provably foreign". Fine
+    while services launch with explicit paths or repo-cwd; revisit if a
+    launcher ever rewrites argv and cwd both.
     """
     repo_forms = {str(REPO_DIR), str(REPO_DIR.resolve())}  # /tmp vs /private/tmp etc.
     kept = []
