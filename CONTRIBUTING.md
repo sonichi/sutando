@@ -75,6 +75,47 @@ In the order a reviewer reads them. Say "N/A" if a question doesn't apply, so th
 - What files / sections should reviewers look at first?
 - What user behavior or bug does this prove?
 - What tests did you run? Include commands and results.
+- **For voice / phone / audio PRs: include a manual test result.** A transcript excerpt (from `data/conversation.sqlite`) showing the live turn/`[Tool]` flow, or a voice recording demonstrating the change. Voice paths are weakly covered by unit tests, so a maintainer needs observable evidence the live session behaves — not just that the code compiles. See the gold-standard example below.
+
+  <details>
+  <summary><strong>Gold-standard voice test-evidence (real example)</strong> — how to pull the log + a complete excerpt + a video example</summary>
+
+  Two accepted evidence forms. The strongest PRs include the transcript excerpt; a recording can stand alone for hard-to-transcribe UX changes.
+
+  **1. How to get the transcript log.** Every live voice/phone/discord-voice turn is logged to `data/conversation.sqlite` (tables `voice`, `phone`, `discord_voice`). Pull the session you just exercised:
+
+  ```bash
+  DB="$(bash scripts/sutando-config.sh workspace)/data/conversation.sqlite"
+  # find your most recent session id
+  sqlite3 "$DB" "SELECT DISTINCT session_id FROM discord_voice ORDER BY ts_unix DESC LIMIT 5;"
+  # dump that session's turns in order (swap discord_voice → voice / phone for other surfaces)
+  sqlite3 -header -column "$DB" \
+    "SELECT datetime(ts_unix,'unixepoch') ts, kind, speaker_name, text
+     FROM discord_voice WHERE session_id='<SESSION_ID>' ORDER BY ts_unix;"
+  ```
+
+  Paste the rows that prove the change (don't fabricate — these are real captured turns). For a bug-fix, capture the **same scenario** on the unpatched build and on the patch, and show both — that's what makes it before/after.
+
+  **2. Complete example excerpt** (real `discord_voice` session, owner reading to the agent — note the `tool_call` rows interleaved with transcribed turns, which is the live `[Tool]` flow a reviewer is looking for):
+
+  ```
+  ts                   kind       speaker_name  text
+  2026-06-08 00:31:45  user       susanliu_     Oh, hi, Maddy, can you hear me?
+  2026-06-08 00:31:49  agent      Maddy         Yes, I can hear you perfectly. What's up?
+  2026-06-08 00:31:53  user       susanliu_     Okay, uh, are you Maddy?
+  2026-06-08 00:31:56  agent      Maddy         I'm Sutando - Maddy.
+  2026-06-08 00:32:11  user       susanliu_     Okay, so what are we working on right now?
+  2026-06-08 00:32:11  tool_call                get_core_status
+  2026-06-08 00:32:14  agent      Maddy         The core agent is currently working on a restart and test for the meeting-buddy…
+  2026-06-08 00:32:38  user       susanliu_     Okay, thank you.
+  2026-06-08 00:32:41  tool_call                dismiss
+  2026-06-08 00:32:42  user       susanliu_     You can log off, bye.
+  ```
+
+  For a richer before/after example (owner-verified `vision_query` reads across three screen-companion modes), see the owner-verification review on [#1409](https://github.com/sonichi/sutando/pull/1409#pullrequestreview-4414966586).
+
+  **3. Video example** (the recording form). A short screen/voice recording demonstrating the live behavior — attach it directly to the PR (GitHub hosts `.mp4`/`.mov` drops) or link an unlisted upload. Reference recording: [all-by-voice demo](https://youtu.be/NC0kdpLulUY).
+  </details>
 - For bug-fixes: failing-before / passing-after evidence (commit + test command).
 - What edge cases or non-happy paths did you check?
 - Any migrations, config, permissions, rollback, or deployment risks?
