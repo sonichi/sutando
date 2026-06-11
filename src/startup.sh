@@ -228,6 +228,34 @@ else
   export ANTHROPIC_BASE_URL=http://localhost:7846
 fi
 
+# 0b. Obs collector (OPTIONAL — opt-in via SUTANDO_OBS_COLLECTOR=1).
+# The single, source-agnostic local collector: it receives Claude Code hooks
+# (and, later, voice / filewatcher / bridge events) on /ingest/<source>,
+# normalizes them into the one event schema, and writes the durable JSONL floor
+# at <workspace>/logs/events-*.jsonl (the visualizer tails that). Off by default
+# — it's an observability/dev tool, not required for the agent to run.
+#
+# When enabled we also point the core's hooks at it (SUTANDO_OBS_ENDPOINT) UNLESS
+# an endpoint is already set — e.g. a remote upstream collector — so the "always
+# set hooks, only export when told where" contract still holds.
+if [ "${SUTANDO_OBS_COLLECTOR:-}" = "1" ]; then
+  OBS_PORT="${SUTANDO_OBS_PORT:-4000}"
+  if ! lsof -i :"$OBS_PORT" > /dev/null 2>&1; then
+    echo "  Starting obs collector (port $OBS_PORT)..."
+    SUTANDO_WORKSPACE="$WORKSPACE" SUTANDO_OBS_PORT="$OBS_PORT" \
+      npx tsx "$REPO/src/boot/collector.ts" > "$LOGS_DIR/collector.log" 2>&1 &
+    echo "  ✓ obs collector"
+  else
+    echo "  ✓ obs collector (already running on $OBS_PORT)"
+  fi
+  # Wire the core's hooks to the local collector unless an endpoint is already set.
+  if [ -z "${SUTANDO_OBS_ENDPOINT:-}" ]; then
+    export SUTANDO_OBS_ENDPOINT="http://localhost:$OBS_PORT"
+  fi
+else
+  echo "  ~ obs collector (disabled — set SUTANDO_OBS_COLLECTOR=1 to enable)"
+fi
+
 # 1. Voice agent (Gemini Live on port 9900)
 if ! lsof -i :9900 > /dev/null 2>&1; then
   echo "  Starting voice agent (port 9900)..."
@@ -508,6 +536,9 @@ echo "Verifying services..."
 VERIFY_PORTS="9900:voice-agent 8080:web-client 7844:dashboard 7843:agent-api 7845:screen-capture"
 if [ "${SKIP_PHONE:-}" != "1" ] && grep -q "TWILIO_ACCOUNT_SID=" .env 2>/dev/null; then
   VERIFY_PORTS="$VERIFY_PORTS 3100:conversation-server"
+fi
+if [ "${SUTANDO_OBS_COLLECTOR:-}" = "1" ]; then
+  VERIFY_PORTS="$VERIFY_PORTS ${SUTANDO_OBS_PORT:-4000}:collector"
 fi
 for port_name in $VERIFY_PORTS; do
   port="${port_name%%:*}"
