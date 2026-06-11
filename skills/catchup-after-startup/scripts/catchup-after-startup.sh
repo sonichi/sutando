@@ -11,24 +11,40 @@
 set -u
 set -o pipefail   # so `cmd | grep ... || say "(none)"` actually fires when cmd fails
 
-# REPO: env wins, else probe common layouts for a sutando checkout
-# (CLAUDE.md + skills/ + .git signature, same heuristic session-handoff.sh
-# uses), else fall back to the convention path. Probing means a checkout
-# at $HOME/Desktop/sutando OR $HOME/Documents/sutando/sutando OR $(pwd)
-# all Just Work without per-user env. (Was a hardcoded /Users/xueqingliu/...
-# path pre-review; fixed per qingyun-wu + Mini's #1056 review.)
-if [ -n "${SUTANDO_REPO_DIR:-}" ]; then
+# REPO: env wins IF it actually points at a checkout, else probe. A set-but-
+# stale SUTANDO_REPO_DIR is a real failure mode: long-lived parents (tmux
+# server, launchd, Sutando.app) cache the env across a repo move, and trusting
+# it blindly empties every REPO-rooted section of the briefing (observed
+# 2026-06-11 after a ~/Documents → ~/dev move). Validity check = CLAUDE.md +
+# skills/ + .git signature, same heuristic session-handoff.sh uses.
+# -e not -d for .git: in a submodule/worktree checkout `.git` is a file
+# (gitdir pointer), not a directory, so -d would reject a valid repo.
+_repo_ok() { [ -f "$1/CLAUDE.md" ] && [ -d "$1/skills" ] && [ -e "$1/.git" ]; }
+
+# The script's own resolved location is the strongest candidate: it lives at
+# <repo>/skills/catchup-after-startup/scripts/, and `pwd -P` resolves the
+# ~/.claude/skills symlink hop, so this is correct by construction whenever
+# the script runs from any checkout — no env needed. (Probing also covers
+# $HOME/Desktop/sutando, $HOME/Documents layouts, $(pwd) per qingyun-wu +
+# Mini's #1056 review; was a hardcoded /Users/xueqingliu/... path before.)
+_self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P || true)"
+_self_repo="${_self_dir%/skills/catchup-after-startup/scripts}"
+
+if [ -n "${SUTANDO_REPO_DIR:-}" ] && _repo_ok "$SUTANDO_REPO_DIR"; then
   REPO="$SUTANDO_REPO_DIR"
 else
+  if [ -n "${SUTANDO_REPO_DIR:-}" ]; then
+    echo "⚠ SUTANDO_REPO_DIR=\`$SUTANDO_REPO_DIR\` doesn't look like a Sutando checkout (stale after a repo move?) — probing instead." >&2
+  fi
   REPO=""
-  for _cand in "$HOME/Desktop/sutando" "$HOME/Documents/sutando/sutando" "$HOME/Documents/sutando" "$HOME/sutando" "$(pwd)"; do
-    # -e not -d: in a submodule/worktree checkout `.git` is a file (gitdir
-    # pointer), not a directory, so -d would reject an otherwise-valid repo.
-    if [ -f "$_cand/CLAUDE.md" ] && [ -d "$_cand/skills" ] && [ -e "$_cand/.git" ]; then
+  for _cand in "$_self_repo" "$HOME/Desktop/sutando" "$HOME/Documents/sutando/sutando" "$HOME/Documents/sutando" "$HOME/sutando" "$(pwd)"; do
+    if [ -n "$_cand" ] && _repo_ok "$_cand"; then
       REPO="$_cand"; break
     fi
   done
-  REPO="${REPO:-$HOME/Desktop/sutando}"   # falls through to the conventional path if probe finds nothing
+  # Nothing probed: keep the old behavior (env value if set, else convention
+  # path) so the downstream "REPO not found" warning names a real attempt.
+  REPO="${REPO:-${SUTANDO_REPO_DIR:-$HOME/Desktop/sutando}}"
 fi
 WS="${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}"
 # Hours window: positional arg wins (so /catchup-after-startup 12 works as
