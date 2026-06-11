@@ -60,6 +60,24 @@ else
   echo "obs hooks: registered (no export endpoint set — capture is a no-op until observability.export or SUTANDO_OBS_ENDPOINT is set)"
 fi
 
+# ---- obs metering (CC native OTel token + cost) -----------------------------
+# Hooks give obs events but carry NO tokens. Claude Code's OTel
+# `claude_code.token.usage` / `cost.usage` metrics are the authoritative usage
+# source, so when an export endpoint is set we also turn on CC telemetry and
+# point its OTLP exporter at the collector (which serves /v1/metrics). Enable
+# ONLY metrics — logs/traces stay off so hooks remain the sole obs source (no
+# duplicate events). JSON OTLP so the collector parses it without protobuf.
+# Gated on the same endpoint; honors any pre-set OTEL_* so a real OTel backend
+# isn't overridden.
+if [ -n "$OBS_ENDPOINT" ] && [ -z "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" ]; then
+  export CLAUDE_CODE_ENABLE_TELEMETRY=1
+  export OTEL_METRICS_EXPORTER=otlp
+  export OTEL_EXPORTER_OTLP_PROTOCOL=http/json
+  export OTEL_EXPORTER_OTLP_ENDPOINT="$OBS_ENDPOINT"
+  export OTEL_METRIC_EXPORT_INTERVAL="${OTEL_METRIC_EXPORT_INTERVAL:-10000}" # ms; 10s (CC default 60s)
+  echo "obs metering: → $OBS_ENDPOINT/v1/metrics (CC OTel token+cost, every ${OTEL_METRIC_EXPORT_INTERVAL}ms)"
+fi
+
 # --restart: kill any existing session before starting fresh. Without this,
 # the script's "already running → attach" path returns and the old session
 # keeps running.

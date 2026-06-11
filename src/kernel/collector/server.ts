@@ -8,13 +8,17 @@
  *                           array, or {events,usage}) — for in-process emitters
  *                           that map locally but ship here for durable store +
  *                           forward.
+ *   POST /v1/metrics        OTLP/HTTP metrics — routed to the `otlpSource`
+ *                           normalizer (CC's native OTel exporter posts here).
+ *                           /v1/logs and /v1/traces are accepted + dropped so
+ *                           the exporter never sees an error.
  *   GET  /health            { ok, sources, ingested }
  *
- * Source-agnostic: it knows nothing about Claude Code. The composition root
- * (`src/boot/collector.ts`) builds the Collector, registers the available
- * normalizers, and calls `serveCollector()`. Never fails an emitter — a bad body
- * or a normalizer miss is swallowed (204), because the emitter (a tool hook) must
- * not block or error on the agent's hot path.
+ * Protocol-aware but normalizer-agnostic: the `/v1/*` paths are the OTLP
+ * standard (not Claude-specific); WHICH normalizer they route to is injected by
+ * the composition root (`src/boot/collector.ts`) via `otlpSource`. Never fails an
+ * emitter — a bad body or a normalizer miss is swallowed, because the emitter (a
+ * tool hook / the OTel SDK) must not block or error on the agent's hot path.
  */
 
 import { createServer, type Server } from 'node:http';
@@ -49,24 +53,34 @@ function splitFormed(parsed: unknown): { events: ObsEvent[]; usage: UsageRecord[
 	return { events, usage };
 }
 
-export function serveCollector(collector: Collector, opts?: { port?: number }): Server {
+/** Read a capped request body, then hand the parsed JSON (or null on bad JSON)
+ *  to `done`. */
+function readJsonBody(req: import('node:http').IncomingMessage, done: (parsed: unknown | null) => void): void {
+	let body = '';
+	req.on('data', (c) => {
+		body += c;
+		if (body.length > MAX_BODY) req.destroy();
+	});
+	req.on('end', () => {
+		try {
+			done(JSON.parse(body));
+		} catch {
+			done(null);
+		}
+	});
+}
+
+export function serveCollector(collector: Collector, opts?: { port?: number; otlpSource?: string }): Server {
 	let ingested = 0;
 	const port = opts?.port ?? (Number(process.env.SUTANDO_OBS_PORT) || 4000);
+	const otlpSource = opts?.otlpSource;
 
 	const server = createServer((req, res) => {
 		const url = req.url ?? '/';
 
 		if (req.method === 'POST' && url.startsWith('/ingest')) {
-			let body = '';
-			req.on('data', (c) => {
-				body += c;
-				if (body.length > MAX_BODY) req.destroy();
-			});
-			req.on('end', () => {
-				let parsed: unknown;
-				try {
-					parsed = JSON.parse(body);
-				} catch {
+			readJsonBody(req, (parsed) => {
+				if (parsed === null) {
 					res.writeHead(400, { 'content-type': 'text/plain' }).end('bad json');
 					return;
 				}
@@ -87,6 +101,24 @@ export function serveCollector(collector: Collector, opts?: { port?: number }): 
 					/* never fail the emitter on a mapping/write error */
 				}
 				res.writeHead(204).end();
+			});
+			return;
+		}
+
+		// OTLP/HTTP standard paths. /v1/metrics → the configured otlpSource;
+		// /v1/logs and /v1/traces are accepted + dropped (we enable only metric
+		// export). Always reply 200 {} so the OTel SDK exporter sees success.
+		if (req.method === 'POST' && url.startsWith('/v1/')) {
+			readJsonBody(req, (parsed) => {
+				try {
+					if (url.startsWith('/v1/metrics') && otlpSource && parsed !== null) {
+						const stat = collector.ingest(otlpSource, parsed);
+						ingested += stat.events + stat.usage;
+					}
+				} catch {
+					/* never fail the OTel exporter */
+				}
+				res.writeHead(200, { 'content-type': 'application/json' }).end('{}');
 			});
 			return;
 		}
