@@ -74,6 +74,30 @@ def check_port(port: int, name: str) -> dict:
         return {"name": name, "status": "error", "detail": str(e)}
 
 
+def check_web_client() -> dict:
+    """Port 8080 + response identity.
+
+    An occupancy-only probe reports "ok" when an unrelated process has
+    claimed 8080 (e.g. another project's dev server) while the real web
+    client never started — startup.sh skips it as "already running" and
+    the owner sees a 404 with health green. Verify the responder actually
+    serves the Sutando UI before calling it ok.
+    """
+    base = check_port(8080, "web-client")
+    if base["status"] != "ok":
+        return base
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:8080/", timeout=3) as r:
+            body = r.read(4096).decode("utf-8", "replace")
+    except Exception as e:
+        return {"name": "web-client", "status": "warn",
+                "detail": f"port 8080 open but identity probe failed: {e}"}
+    if "<title>Sutando Web UI</title>" not in body:
+        return {"name": "web-client", "status": "down",
+                "detail": "port 8080 held by a NON-Sutando process — free it (lsof -nP -iTCP:8080 -sTCP:LISTEN) and re-run startup.sh"}
+    return base
+
+
 def check_launchd(label: str) -> dict:
     """Check if a launchd job is loaded and running."""
     try:
@@ -813,7 +837,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_voice_transport(voice_check))
     checks.append(check_bodhi_dist())
 
-    web_check = check_port(8080, "web-client")
+    web_check = check_web_client()
     if web_check["status"] == "ok":
         mark_stale_if_outdated(web_check, REPO_DIR / "src" / "web-client.ts", "web-client.ts")
     checks.append(web_check)

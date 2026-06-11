@@ -242,8 +242,14 @@ if ! lsof -i :8080 > /dev/null 2>&1; then
   echo "  Starting web client (port 8080)..."
   npx tsx src/web-client.ts > "$LOGS_DIR/web-client.log" 2>&1 &
   echo "  ✓ web client"
-else
+elif curl -s -m 3 http://127.0.0.1:8080/ | grep -q "<title>Sutando Web UI</title>"; then
   echo "  ✓ web client (already running)"
+else
+  # Occupied ≠ ours: an unrelated process (e.g. another project's dev
+  # server) on 8080 used to be reported as "already running" while the
+  # real client never started and the UI 404'd.
+  echo "  ⚠ port 8080 is held by a NON-Sutando process — web client NOT started."
+  echo "    Free the port (lsof -nP -iTCP:8080 -sTCP:LISTEN) and re-run startup.sh."
 fi
 
 # 3. Dashboard (port 7844)
