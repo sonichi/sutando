@@ -114,6 +114,13 @@ const server = createServer((req, res) => {
 			headers['authorization'] = `Bearer ${oauthToken}`;
 		}
 
+		// IDLE_TIMEOUT_MS: how long a streaming response can go silent before we
+		// treat the connection as hung and abort. Resets on every incoming chunk so
+		// normal slow-streaming responses (large completions) are never cut off —
+		// only truly stalled connections time out.  30 s is generous for any real
+		// network blip; the Anthropic API keeps chunks coming at least that fast.
+		const IDLE_TIMEOUT_MS = 30_000;
+
 		const upstream = httpsRequest(
 			{
 				hostname: upstreamUrl.hostname,
@@ -121,6 +128,7 @@ const server = createServer((req, res) => {
 				path: req.url,
 				method: req.method,
 				headers,
+				timeout: IDLE_TIMEOUT_MS,
 			} as RequestOptions,
 			(upRes) => {
 				// Extract rate limit headers
@@ -136,15 +144,31 @@ const server = createServer((req, res) => {
 				}
 
 				res.writeHead(upRes.statusCode!, upRes.headers);
+
+				// Reset the idle timeout on every incoming chunk so a legitimately
+				// slow streaming response (large completion) is never aborted.
+				let idleTimer = setTimeout(() => upstream.destroy(new Error('idle timeout')), IDLE_TIMEOUT_MS);
+				upRes.on('data', () => {
+					clearTimeout(idleTimer);
+					idleTimer = setTimeout(() => upstream.destroy(new Error('idle timeout')), IDLE_TIMEOUT_MS);
+				});
+				upRes.on('end', () => clearTimeout(idleTimer));
+				upRes.on('error', () => clearTimeout(idleTimer));
+
 				upRes.pipe(res);
 			},
 		);
 
+		// timeout fires when the socket stalls before the response headers arrive.
+		upstream.on('timeout', () => {
+			upstream.destroy(new Error('connect/headers timeout'));
+		});
+
 		upstream.on('error', (err) => {
 			console.error(`${ts()} [Proxy] Upstream error:`, err.message);
 			if (!res.headersSent) {
-				res.writeHead(502);
-				res.end('Bad Gateway');
+				res.writeHead(err.message.includes('timeout') ? 504 : 502);
+				res.end(err.message.includes('timeout') ? 'Gateway Timeout' : 'Bad Gateway');
 			}
 		});
 
