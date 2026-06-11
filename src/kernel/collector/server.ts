@@ -54,8 +54,8 @@ function splitFormed(parsed: unknown): { events: ObsEvent[]; usage: UsageRecord[
 }
 
 /** Read a capped request body, then hand the parsed JSON (or null on bad JSON)
- *  to `done`. */
-function readJsonBody(req: import('node:http').IncomingMessage, done: (parsed: unknown | null) => void): void {
+ *  plus the raw byte length to `done`. */
+function readJsonBody(req: import('node:http').IncomingMessage, done: (parsed: unknown | null, bytes: number) => void): void {
 	let body = '';
 	req.on('data', (c) => {
 		body += c;
@@ -63,9 +63,9 @@ function readJsonBody(req: import('node:http').IncomingMessage, done: (parsed: u
 	});
 	req.on('end', () => {
 		try {
-			done(JSON.parse(body));
+			done(JSON.parse(body), body.length);
 		} catch {
-			done(null);
+			done(null, body.length);
 		}
 	});
 }
@@ -109,11 +109,22 @@ export function serveCollector(collector: Collector, opts?: { port?: number; otl
 		// /v1/logs and /v1/traces are accepted + dropped (we enable only metric
 		// export). Always reply 200 {} so the OTel SDK exporter sees success.
 		if (req.method === 'POST' && url.startsWith('/v1/')) {
-			readJsonBody(req, (parsed) => {
+			const ctype = String(req.headers['content-type'] ?? '');
+			readJsonBody(req, (parsed, bytes) => {
 				try {
-					if (url.startsWith('/v1/metrics') && otlpSource && parsed !== null) {
-						const stat = collector.ingest(otlpSource, parsed);
-						ingested += stat.events + stat.usage;
+					if (url.startsWith('/v1/metrics') && otlpSource) {
+						if (parsed === null) {
+							// almost always means the exporter is sending protobuf, which
+							// this JSON decoder can't read — the #1 "no metering" cause.
+							process.stderr.write(
+								`[collector] /v1/metrics: ${bytes}B body not JSON (content-type: ${ctype || 'none'}); ` +
+									`set OTEL_EXPORTER_OTLP_PROTOCOL=http/json on the core if the exporter sends protobuf\n`,
+							);
+						} else {
+							const stat = collector.ingest(otlpSource, parsed);
+							ingested += stat.events + stat.usage;
+							process.stderr.write(`[collector] /v1/metrics: ${bytes}B → +${stat.usage} usage, +${stat.events} obs\n`);
+						}
 					}
 				} catch {
 					/* never fail the OTel exporter */
