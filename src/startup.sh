@@ -142,13 +142,34 @@ else
   echo "  ✓ Screen Recording"
 fi
 
-# Check Accessibility (needed for context drop shortcut)
-if ! osascript -e 'tell application "System Events" to get name of first process whose frontmost is true' > /dev/null 2>&1; then
+# Check Accessibility (needed for context drop shortcut).
+# Probe runs in the background with a 10s bound: under launchd (e.g. a
+# RunAtLoad login boot agent) this osascript call can block INDEFINITELY on
+# the AppleEvents TCC consent gate — observed 2026-06-11 hanging a login-time
+# startup for 3+ minutes until the probe was killed by hand. A granted (or
+# explicitly denied) context answers in <1s, so the bound only bites where
+# the hang would. On timeout we treat it as not-granted; the consent dialog,
+# if macOS showed one, stays on screen for the user to answer once.
+AX_OK=0
+osascript -e 'tell application "System Events" to get name of first process whose frontmost is true' > /dev/null 2>&1 &
+AX_PROBE_PID=$!
+for _ in $(seq 1 50); do
+  kill -0 "$AX_PROBE_PID" 2>/dev/null || break
+  sleep 0.2
+done
+if kill -0 "$AX_PROBE_PID" 2>/dev/null; then
+  # Still blocked after 10s — the TCC consent gate. The brace group's stderr
+  # redirect swallows bash's async "Terminated: 15" job notice.
+  { kill "$AX_PROBE_PID" 2>/dev/null || true; wait "$AX_PROBE_PID" 2>/dev/null || true; } 2>/dev/null
+else
+  if wait "$AX_PROBE_PID" 2>/dev/null; then AX_OK=1; fi
+fi
+if [ "$AX_OK" -eq 1 ]; then
+  echo "  ✓ Accessibility"
+else
   echo "  ⚠ Accessibility not granted"
   echo "    → System Settings → Privacy & Security → Accessibility"
   echo "    → Add Terminal.app or Shortcuts.app"
-else
-  echo "  ✓ Accessibility"
 fi
 echo ""
 
