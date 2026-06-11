@@ -70,12 +70,16 @@ apply_tmux_defaults() {
   command -v tmux > /dev/null 2>&1 || return 0
   tmux -S "$TMUX_SOCKET" start-server 2>/dev/null || true
   tmux -S "$TMUX_SOCKET" set-option -g mouse on 2>/dev/null || true
-  # Wheel-scroll fix for alternate-screen TUIs (Claude Code, vim, etc.):
-  # `mouse on` alone doesn't help because Claude Code consumes wheel events
-  # in alternate-screen mode before tmux can enter copy-mode. Force
-  # copy-mode on WheelUp when the pane runs an alt-screen app; WheelDown
-  # passes through so normal scrolling still works. Fixes sutando-plus#46.
-  tmux -S "$TMUX_SOCKET" bind -n WheelUpPane if-shell -F -t = '#{alternate_on}' 'copy-mode -e; send-keys -M' 'send-keys -M' 2>/dev/null || true
+  # Wheel-scroll fix (sutando-plus#46, re-broken 2026-06-11): predicate on
+  # mouse_any_flag, NOT alternate_on. Claude Code 2.1.150 stopped using the
+  # alternate screen, so the old alt-screen predicate forwarded wheel events
+  # to an app that never requested mouse input — they were silently dropped
+  # and scrollback became unreachable. mouse_any_flag asks the question we
+  # actually care about: does the pane app WANT mouse events? If yes (vim
+  # with mouse=a, future Claude Code versions), forward them; if no, enter
+  # copy-mode so WheelUp always reaches tmux scrollback regardless of the
+  # app's screen mode. WheelDown passes through so normal scrolling works.
+  tmux -S "$TMUX_SOCKET" bind -n WheelUpPane if-shell -F -t = '#{mouse_any_flag}' 'send-keys -M' 'copy-mode -e; send-keys -M' 2>/dev/null || true
   tmux -S "$TMUX_SOCKET" bind -n WheelDownPane send-keys -M 2>/dev/null || true
 }
 
