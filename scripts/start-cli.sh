@@ -36,6 +36,30 @@ if [ -n "${SUTANDO_CORE_MODEL:-}" ]; then
   MODEL_ARGS=(--model "$SUTANDO_CORE_MODEL")
 fi
 
+# ---- obs hooks (ALWAYS injected; export gated by config) --------------------
+# Register Claude Code hooks on every launch via `--settings` (merges with the
+# user's settings at highest precedence, per-session — no persistent file edit).
+# The hook command (obs-hook.sh) only ships a payload when an endpoint is
+# configured, so the contract is "always set the hooks, only export when told
+# where". Endpoint: $SUTANDO_OBS_ENDPOINT wins, else `observability.export` from
+# config/sutando.config.defaults.json. Exported so the hook — which runs in the
+# session's inherited env — resolves it at hook-time.
+OBS_ENDPOINT="${SUTANDO_OBS_ENDPOINT:-}"
+if [ -z "$OBS_ENDPOINT" ] && [ -f "$REPO/config/sutando.config.defaults.json" ] && command -v node > /dev/null 2>&1; then
+  OBS_ENDPOINT="$(SUTANDO_CFG="$REPO/config/sutando.config.defaults.json" node -e 'try{const c=require(process.env.SUTANDO_CFG);process.stdout.write((c.observability&&c.observability.export)||"")}catch(e){}' 2>/dev/null || true)"
+fi
+export SUTANDO_OBS_ENDPOINT="$OBS_ENDPOINT"
+
+OBS_HOOK="bash $REPO/src/adapters/executor/claude-code/hooks/obs-hook.sh"
+_h="{\"hooks\":[{\"type\":\"command\",\"command\":\"$OBS_HOOK\"}]}"                 # lifecycle events
+_t="{\"matcher\":\"*\",\"hooks\":[{\"type\":\"command\",\"command\":\"$OBS_HOOK\"}]}" # tool events (matched)
+HOOKS_JSON="{\"hooks\":{\"UserPromptSubmit\":[$_h],\"UserPromptExpansion\":[$_h],\"MessageDisplay\":[$_h],\"PreToolUse\":[$_t],\"PostToolUse\":[$_t],\"Stop\":[$_h],\"SessionStart\":[$_h],\"SessionEnd\":[$_h],\"PreCompact\":[$_h],\"Notification\":[$_h]}}"
+if [ -n "$OBS_ENDPOINT" ]; then
+  echo "obs hooks: → $OBS_ENDPOINT/ingest/claude-code-hooks (collector)"
+else
+  echo "obs hooks: registered (no export endpoint set — capture is a no-op until observability.export or SUTANDO_OBS_ENDPOINT is set)"
+fi
+
 # --restart: kill any existing session before starting fresh. Without this,
 # the script's "already running → attach" path returns and the old session
 # keeps running.
@@ -82,6 +106,7 @@ if ! command -v tmux > /dev/null 2>&1; then
   echo "  ⚠ tmux not found — running without tmux wrapper"
   echo "    (Sutando.app's watcher-auto-restart won't work; brew install tmux to enable)"
   exec claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
+    --settings "$HOOKS_JSON" \
     -- "/schedule-crons"
 fi
 
@@ -120,10 +145,12 @@ tmux -S "$TMUX_SOCKET" bind -n WheelDownPane send-keys -M 2>/dev/null || true
 if [ -t 1 ]; then
   exec tmux -S "$TMUX_SOCKET" new-session -A -s "$SESSION" \
     claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
+    --settings "$HOOKS_JSON" \
     -- "/schedule-crons"
 else
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" \
     claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
+    --settings "$HOOKS_JSON" \
     -- "/schedule-crons"
   echo "Started $SESSION detached. Attach via Open Core CLI in menu bar, or:"
   echo "  tmux -S $TMUX_SOCKET attach -t $SESSION"

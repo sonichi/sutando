@@ -16,7 +16,8 @@
   "observability": {
     "sinks": [
       { "type": "jsonl-file" }
-    ]
+    ],
+    "export": null
   },
   "tenant": {
     "id": null,

@@ -56,24 +56,9 @@ export type OtelRecord =
 	| { signal: 'log'; log: OtelLogRecord }
 	| { signal: 'span'; span: OtelSpanRecord };
 
-/** A hook payload. Always carries the common keys; event-specific keys vary. */
-export interface HookPayload {
-	hook_event_name: string;
-	session_id?: string;
-	transcript_path?: string;
-	cwd?: string;
-	permission_mode?: string;
-	tool_name?: string;
-	tool_input?: Record<string, unknown>;
-	tool_output?: unknown;
-	error?: string;
-	source?: string; // SessionStart
-	model?: string;
-	end_reason?: string; // SessionEnd
-	trigger?: string; // PreCompact
-	notification_type?: string; // Notification
-	[k: string]: unknown;
-}
+// Hook payloads now have a strict, discriminated home: `cc-hooks.ts`
+// (ClaudeCodeHook + decodeClaudeCodeHook). The old loose `HookPayload` flat
+// interface was removed in favor of that per-event union.
 
 /** One parsed line of the `~/.claude/.../<session>.jsonl` transcript. */
 export interface TranscriptLine {
