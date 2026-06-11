@@ -18,6 +18,7 @@
 
 import { Collector } from '../kernel/collector/collector.js';
 import { serveCollector } from '../kernel/collector/server.js';
+import { resolveWorkspace } from '../workspace_default.js';
 import { ClaudeCodeHookNormalizer } from '../adapters/executor/claude-code/sources/hook-normalizer.js';
 import { ClaudeCodeOtelNormalizer, CC_OTEL_SOURCE } from '../adapters/executor/claude-code/sources/otel-normalizer.js';
 
@@ -33,7 +34,7 @@ const port = Number(process.env.SUTANDO_OBS_PORT) || 4000;
 // to a normalizer is composition, not kernel policy).
 serveCollector(collector, { port, otlpSource: CC_OTEL_SOURCE });
 
-const ws = process.env.SUTANDO_WORKSPACE ?? '~/.sutando/workspace';
+const ws = resolveWorkspace();
 console.log('collector — one local ingestion point for all sources');
 console.log(`  sources:   ${collector.sources().join(', ') || '(none registered)'}`);
 console.log(`  listening: http://localhost:${port}/ingest/<source>  ·  OTLP http://localhost:${port}/v1/metrics`);
