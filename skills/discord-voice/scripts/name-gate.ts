@@ -44,7 +44,6 @@ export const ADDRESS_VERBS =
  *   - "hi/hey/hello/yo/okay/ok NAME" or "hi, NAME" (greet + name)
  *   - "NAME," or "NAME?" (comma/question-tag — definite address marker)
  *   - "NAME VERB" at sentence start (imperative)
- *   - NAME alone (bare utterance — the single most common summon, #1600 M2)
  * Returns false on plain mentions like "thanks NAME" or "NAME's answer".
  */
 export function isAddressedBy(text: string, names: string[]): boolean {
@@ -59,11 +58,7 @@ export function isAddressedBy(text: string, names: string[]): boolean {
 		const commaTag = new RegExp(`\\b${escape(n)}\\s*[,?]`, 'i');
 		// "NAME VERB" at sentence start (optional preceding . ! ?)
 		const verbed = new RegExp(`(^|[.!?]\\s*)${escape(n)}\\s+${ADDRESS_VERBS}\\b`, 'i');
-		// Bare name: entire utterance is just the name (optionally trailing . ! ?)
-		// — the #1 summon pattern in the 2026-06-10 live session (66 instances,
-		// zero matched). "Lucy" alone is unambiguously an address, not a mention.
-		const bareName = new RegExp(`^${escape(n)}[.!?]*$`, 'i');
-		if (greet.test(lc) || commaTag.test(lc) || verbed.test(lc) || bareName.test(lc.trim())) return true;
+		if (greet.test(lc) || commaTag.test(lc) || verbed.test(lc)) return true;
 	}
 	return false;
 }
