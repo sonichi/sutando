@@ -164,9 +164,17 @@ describe('voice-core e2e', () => {
 			prompts.ACTIVE_ENTER_INSTRUCTION,
 			'Back to active mode. You can speak and use all tools normally.',
 		);
-		assert.ok(prompts.RULE_MEETING_ACTIVE.startsWith('⚠️ MEETING MODE IS CURRENTLY ACTIVE. You are an invisible note-taker.'));
-		assert.ok(prompts.RULE_MEETING_ACTIVE.endsWith('call switch_mode("active") and save_meeting_note(summary).'));
+		assert.equal(
+			prompts.RULE_MEETING_ACTIVE,
+			'⚠️ MEETING MODE IS CURRENTLY ACTIVE. You are an invisible note-taker. Listen to all audio and track: speakers, topics, decisions, action items. Produce ZERO audio output unless someone says "Sutando" or "hey Sutando." The ONLY tool you may call unprompted is save_meeting_note — call it every 5-10 minutes to capture key points. Do NOT call work or other tools unless explicitly addressed. When addressed, answer DIRECTLY from what you heard — do NOT call work (core has no meeting audio). "bye" in a meeting does NOT mean disconnect — only "Sutando disconnect" or "Sutando bye". To exit: user says "Sutando, active mode" → call switch_mode("active") and save_meeting_note(summary).',
+		);
 		assert.equal(prompts.RULE_WHEN_IN_DOUBT, '- When in doubt, call work.');
-		assert.ok(prompts.SWITCH_MODE_DESCRIPTION.includes('Call switch_mode("meeting") when user says "take notes", "be silent", "meeting mode", "passive mode", or joins a meeting.'));
+		assert.equal(
+			prompts.SWITCH_MODE_DESCRIPTION,
+			'Switch between active mode and meeting mode. '
+			+ 'Call switch_mode("meeting") when user says "take notes", "be silent", "meeting mode", "passive mode", or joins a meeting. '
+			+ 'Call switch_mode("active") when user says "I need you", "come back", "active mode", or the meeting ends. '
+			+ 'In meeting mode: listen to everything and track discussion internally, but produce ZERO audio output and do NOT call any other tools — unless explicitly addressed by name ("Sutando" or "hey Sutando").',
+		);
 	});
 });
