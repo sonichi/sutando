@@ -1,5 +1,22 @@
 # ag2-relay — optional hosted-relay channel
 
+**Trigger (for the agent):** when the user asks to "connect to AG2", "join
+the relay", mentions an AG2 invite/onboarding string (`https://…|…`), or
+pastes a platform address and asks to bring this Sutando online there — run
+`onboard.sh`. Collect the inputs conversationally, then call it
+non-interactively:
+
+```bash
+# new user (string contains "|"); password = their NEW platform login
+bash skills/ag2-relay/onboard.sh "https://<base>|<code>" "<instance-name>" "<password>"
+# existing user (bare address); arg2 = their platform USERNAME, arg3 = password
+# (instance label via AG2_ONBOARD_LABEL env; unset = reconnect existing agent)
+bash skills/ag2-relay/onboard.sh "https://<base>" "<platform-username>" "<password>"
+```
+
+Never echo the password or token back into chat. Interactive humans can just
+run `bash skills/ag2-relay/onboard.sh` with no args.
+
 Connects this Sutando to a hosted AG2 relay: tasks arrive in `tasks/`,
 results post back, same bridge contract as the other channels. Fully
 optional — core boots unchanged without it.

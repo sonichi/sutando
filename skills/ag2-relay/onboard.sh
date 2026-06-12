@@ -10,14 +10,23 @@ if [ -n "${AG2_REMOTE_TOKEN:-}" ] || grep -q "^AG2_REMOTE_TOKEN=" .env 2>/dev/nu
   echo "already configured (.env has AG2_REMOTE_TOKEN) — remove it to re-onboard"
   exit 0
 fi
+
+# Non-interactive mode (agent-driven trigger): all inputs as arguments.
+#   onboard.sh "<string>" "<instance-name>" ["<password>"]
+# - new user (string contains "|"): password required (their NEW platform login)
+# - existing user (bare address): password = their EXISTING platform password,
+#   instance-name empty = reconnect to their existing agent
+_ARG_IN="${1:-}"; _ARG_NAME="${2:-}"; _ARG_PASS="${3:-${AG2_ONBOARD_PASSWORD:-}}"
 # AG2 onboarding: no AG2_REMOTE_TOKEN and we're interactive -> offer to
 # connect right here. ONE prompt, the input shape picks the journey:
 #   "https://<base>|<code>"  -> new user: redeem invite (creates account+agent)
 #   "https://<base>"         -> existing user: log in, claim/reconnect agent
 # The address travels in the pasted string — nothing service-specific lives
 # in this repo. Non-interactive runs skip silently; failure never blocks.
-  printf '  AG2 onboarding string or platform address (Enter to skip): '
-  read -r _AG2_IN || _AG2_IN=""
+  if [ -n "$_ARG_IN" ]; then _AG2_IN="$_ARG_IN"; else
+    printf '  AG2 onboarding string or platform address (Enter to skip): '
+    read -r _AG2_IN || _AG2_IN=""
+  fi
   _AG2_RESP=""
   _AG2_BASE=""
   if [ -n "$_AG2_IN" ] && [[ "$_AG2_IN" == *"|"* ]]; then
@@ -26,21 +35,32 @@ fi
     _FUN_A=(swift quiet lucky cosmic mellow brave nimble sunny)
     _FUN_B=(falcon otter lynx comet willow ember harbor sparrow)
     _FUN_NAME="${_FUN_A[$((RANDOM % 8))]}-${_FUN_B[$((RANDOM % 8))]}"
-    printf '  Name this Sutando instance [Enter = %s]: ' "$_FUN_NAME"
-    read -r _AG2_USER || _AG2_USER=""
-    _AG2_USER="${_AG2_USER:-$_FUN_NAME}"
-    printf '  Choose a password for your NEW platform login (min 8 chars): '
-    read -rs _AG2_PASS; echo
+    if [ -n "$_ARG_NAME" ] || [ -n "$_ARG_PASS" ]; then
+      _AG2_USER="${_ARG_NAME:-$_FUN_NAME}"; _AG2_PASS="$_ARG_PASS"
+    else
+      printf '  Name this Sutando instance [Enter = %s]: ' "$_FUN_NAME"
+      read -r _AG2_USER || _AG2_USER=""
+      _AG2_USER="${_AG2_USER:-$_FUN_NAME}"
+      printf '  Choose a password for your NEW platform login (min 8 chars): '
+      read -rs _AG2_PASS; echo
+    fi
     _AG2_RESP=$(curl -sf -X POST "$_AG2_BASE/redeem" -H 'content-type: application/json' \
       -d "{\"invite\": \"$_AG2_CODE\", \"username\": \"$_AG2_USER\", \"password\": \"$_AG2_PASS\"}" 2>/dev/null) || _AG2_RESP=""
   elif [ -n "$_AG2_IN" ]; then
     # Existing-user journey: validate platform credentials, then claim (or
     # reconnect to) their agent — no new account, no new password.
     _AG2_BASE="${_AG2_IN%/}"
-    printf '  Platform username: '
-    read -r _AG2_USER || _AG2_USER=""
-    printf '  Platform password: '
-    read -rs _AG2_PASS; echo
+    if [ -n "$_ARG_PASS" ]; then
+      _AG2_USER="${_ARG_NAME:?existing-account mode needs <instance-or-username> arg}"
+      # In arg mode arg2 is the PLATFORM USERNAME for login; instance naming
+      # then uses AG2_ONBOARD_LABEL if set.
+      _AG2_PASS="$_ARG_PASS"
+    else
+      printf '  Platform username: '
+      read -r _AG2_USER || _AG2_USER=""
+      printf '  Platform password: '
+      read -rs _AG2_PASS; echo
+    fi
     _AG2_SESS=$(curl -sf -X POST "$_AG2_BASE/user-login" -H 'content-type: application/json' \
       -d "{\"username\": \"$_AG2_USER\", \"password\": \"$_AG2_PASS\"}" 2>/dev/null \
       | python3 -c 'import json,sys
@@ -50,8 +70,12 @@ except Exception: print("")' 2>/dev/null)
       # Name THIS instance (becomes the agent label) — Enter reconnects to
       # the user's existing agent instead (action=list; first-timers
       # auto-create server-side).
-      printf '  Name this Sutando instance [Enter = reconnect existing]: '
-      read -r _AG2_LABEL || _AG2_LABEL=""
+      if [ -n "$_ARG_IN" ]; then
+        _AG2_LABEL="${AG2_ONBOARD_LABEL:-}"
+      else
+        printf '  Name this Sutando instance [Enter = reconnect existing]: '
+        read -r _AG2_LABEL || _AG2_LABEL=""
+      fi
       if [ -n "$_AG2_LABEL" ]; then
         _AG2_RESP=$(curl -sf -X POST "$_AG2_BASE/claim-agent" -H 'content-type: application/json' \
           -d "{\"user_session_token\": \"$_AG2_SESS\", \"action\": \"create\", \"label\": \"$_AG2_LABEL\", \"auto_spawn\": false}" 2>/dev/null) || _AG2_RESP=""
