@@ -1035,11 +1035,17 @@ def run_all_checks() -> list[dict]:
         # not in effect because nobody restarted the bridge after merge).
         try:
             src_file = REPO_DIR / "src" / f"{name}.py"
-            if src_file.exists() and pids:
+            # Same cross-checkout guard as mark_stale_if_outdated: only a
+            # process belonging to THIS checkout is ours to judge stale.
+            # Deliberately scoped to the staleness comparison — checks 1-3/5/6
+            # keep the unfiltered pids so "running"/heartbeat/inode semantics
+            # for a bridge launched from another clone are unchanged.
+            own_pids = _filter_pids_this_checkout(pids) if pids else []
+            if src_file.exists() and own_pids:
                 src_mtime = src_file.stat().st_mtime
                 # Use ps to get process start time as Unix epoch
                 ps_out = subprocess.run(
-                    ["/bin/ps", "-o", "lstart=", "-p", pids[0]],
+                    ["/bin/ps", "-o", "lstart=", "-p", own_pids[0]],
                     capture_output=True, text=True, timeout=5
                 ).stdout.strip()
                 if ps_out:
