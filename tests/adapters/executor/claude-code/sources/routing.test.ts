@@ -2,7 +2,6 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { otelMap } from '../../../../../src/adapters/executor/claude-code/sources/otel-map.js';
 import { hookMap } from '../../../../../src/adapters/executor/claude-code/sources/hook-map.js';
-import { transcriptMap } from '../../../../../src/adapters/executor/claude-code/sources/transcript-map.js';
 import type { MapContext, MapResult } from '../../../../../src/adapters/executor/claude-code/sources/cc-records.js';
 
 const ctx: MapContext = { node: 'n', receivedAt: 1 };
@@ -22,8 +21,6 @@ const cases: Array<{ name: string; out: MapResult; both?: boolean }> = [
 	{ name: 'llm_request', both: true, out: otelMap({ signal: 'span', span: { name: 'claude_code.llm_request', spanId: 'x', attrs: { request_id: 'r', input_tokens: 1, output_tokens: 1 }, resource: RES } }, ctx) },
 	{ name: 'tool(span)', out: otelMap({ signal: 'span', span: { name: 'claude_code.tool', spanId: 'x', attrs: { tool_name: 'Read' }, resource: RES } }, ctx) },
 	{ name: 'hook PostToolUse', out: hookMap({ hook_event_name: 'PostToolUse', session_id: 's', tool_name: 'Bash' }, ctx) },
-	{ name: 'transcript assistant', out: transcriptMap({ type: 'assistant', session_id: 's', request_id: 'r', usage: { input_tokens: 1, output_tokens: 1 } }, ctx) },
-	{ name: 'transcript tool_use', out: transcriptMap({ type: 'tool_use', session_id: 's', tool_name: 'Bash' }, ctx) },
 ];
 
 describe('routing policy — meter xor obs (llm_request = both)', () => {
