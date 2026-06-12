@@ -45,6 +45,7 @@
     "./util-paths": "./src/util_paths.ts",
     "./voice-key": "./src/voice-key.ts",
     "./voice-config": "./src/voice-config.ts",
-    "./inline-tools": "./src/inline-tools.ts"
+    "./inline-tools": "./src/inline-tools.ts",
+    "./vision-tools": "./src/vision-tools.ts"
   }
 }
