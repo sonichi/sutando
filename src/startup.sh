@@ -411,7 +411,7 @@ if [ -z "${AG2_REMOTE_TOKEN:-}" ] && [ -t 0 ]; then
     _FUN_A=(swift quiet lucky cosmic mellow brave nimble sunny)
     _FUN_B=(falcon otter lynx comet willow ember harbor sparrow)
     _FUN_NAME="${_FUN_A[$((RANDOM % 8))]}-${_FUN_B[$((RANDOM % 8))]}"
-    printf '  Agent username [Enter = %s]: ' "$_FUN_NAME"
+    printf '  Name this Sutando instance [Enter = %s]: ' "$_FUN_NAME"
     read -r _AG2_USER || _AG2_USER=""
     _AG2_USER="${_AG2_USER:-$_FUN_NAME}"
     printf '  Choose a password for your NEW platform login (min 8 chars): '
@@ -432,10 +432,18 @@ if [ -z "${AG2_REMOTE_TOKEN:-}" ] && [ -t 0 ]; then
 try: print(json.load(sys.stdin).get("user_session_token") or "")
 except Exception: print("")' 2>/dev/null)
     if [ -n "$_AG2_SESS" ]; then
-      # action=list reconnects a returning user to their existing agent;
-      # first-timers fall through server-side to auto-create one.
-      _AG2_RESP=$(curl -sf -X POST "$_AG2_BASE/claim-agent" -H 'content-type: application/json' \
-        -d "{\"user_session_token\": \"$_AG2_SESS\", \"action\": \"list\", \"auto_spawn\": false}" 2>/dev/null) || _AG2_RESP=""
+      # Name THIS instance (becomes the agent label) — Enter reconnects to
+      # the user's existing agent instead (action=list; first-timers
+      # auto-create server-side).
+      printf '  Name this Sutando instance [Enter = reconnect existing]: '
+      read -r _AG2_LABEL || _AG2_LABEL=""
+      if [ -n "$_AG2_LABEL" ]; then
+        _AG2_RESP=$(curl -sf -X POST "$_AG2_BASE/claim-agent" -H 'content-type: application/json' \
+          -d "{\"user_session_token\": \"$_AG2_SESS\", \"action\": \"create\", \"label\": \"$_AG2_LABEL\", \"auto_spawn\": false}" 2>/dev/null) || _AG2_RESP=""
+      else
+        _AG2_RESP=$(curl -sf -X POST "$_AG2_BASE/claim-agent" -H 'content-type: application/json' \
+          -d "{\"user_session_token\": \"$_AG2_SESS\", \"action\": \"list\", \"auto_spawn\": false}" 2>/dev/null) || _AG2_RESP=""
+      fi
     else
       echo "  ✗ login failed (bad credentials or rate limit) — continuing without"
     fi
