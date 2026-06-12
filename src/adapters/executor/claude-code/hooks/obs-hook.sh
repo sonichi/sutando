@@ -7,10 +7,10 @@
 # Claude-Code normalizer maps it. Other sources (voice, filewatcher, bridges)
 # post to their own `/ingest/<source>` on the SAME collector.
 #
-# The hook is ALWAYS registered (start-cli.sh injects it on every session), but
-# this script does nothing unless $SUTANDO_OBS_ENDPOINT is set — so capture is
-# opt-in via config (`observability.export`), per the "always set hooks, only
-# export when told where" contract.
+# start-cli.sh registers the hook only when an export endpoint is configured
+# (no endpoint → no --settings → this script never runs). This stdin-drain +
+# no-op guard stays as defense-in-depth: if the hook IS registered but the
+# endpoint is unset at hook-time, it does nothing rather than erroring.
 #
 # Must stay THIN: it runs on every tool call, so it never blocks (curl is capped
 # at 1s) and never fails the agent (errors swallowed, always exit 0). The
