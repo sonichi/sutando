@@ -47,9 +47,10 @@ export {
 } from './prompts.js';
 
 export {
-	type WatchdogInputs,
-	DEFAULT_WATCHDOG_THRESHOLD_MS,
-	shouldWatchdogReconnect,
+	type SessionHangInputs,
+	DEFAULT_WATCHDOG_STALL_MS,
+	DEFAULT_WATCHDOG_HUNG_TURN_MS,
+	isSessionHung,
 } from './session-resilience.js';
 
 export {

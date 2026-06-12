@@ -37,7 +37,7 @@ import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { VoiceSession } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
-import { createModeState, makeSwitchModeTool, makeSaveMeetingNoteTool } from './voice-core/index.js';
+import { createModeState, makeSwitchModeTool, makeSaveMeetingNoteTool, RULE_MEETING_ACTIVE, RULE_MEETING_AVAILABLE, RULE_MEETING_ANSWER_DIRECT, RULE_WHEN_IN_DOUBT } from './voice-core/index.js';
 function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
 import { workTool, startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
 import { recordSession, recordToolCall } from './conversation-store.js';
@@ -650,10 +650,7 @@ const mainAgent: MainAgent = {
 		] : []),
 		'',
 		'CRITICAL RULES:',
-		(() => modeState.isMeeting()
-			? '⚠️ MEETING MODE IS CURRENTLY ACTIVE. You are an invisible note-taker. Listen to all audio and track: speakers, topics, decisions, action items. Produce ZERO audio output unless someone says "Sutando" or "hey Sutando." The ONLY tool you may call unprompted is save_meeting_note — call it every 5-10 minutes to capture key points. Do NOT call work or other tools unless explicitly addressed. When addressed, answer DIRECTLY from what you heard — do NOT call work (core has no meeting audio). "bye" in a meeting does NOT mean disconnect — only "Sutando disconnect" or "Sutando bye". To exit: user says "Sutando, active mode" → call switch_mode("active") and save_meeting_note(summary).'
-			: '- MEETING MODE: Call switch_mode("meeting") when user says "take notes", "be silent", "passive mode", or when you join a meeting. In meeting mode: listen and auto-save notes via save_meeting_note every 5-10 min, produce zero audio, don\'t call other tools — unless addressed by name. Call switch_mode("active") to resume.'
-		)(),
+		(() => modeState.isMeeting() ? RULE_MEETING_ACTIVE : RULE_MEETING_AVAILABLE)(),
 		'- PRESENTER MODE: Call presenter_mode("on") when user says "presenter mode on", "going live", "starting the talk", "the talk starts", or "I am on stage". Call presenter_mode("off") when user says "presenter mode off", "talk is done", "stop presenting", or "done presenting". Do NOT route these phrases to work — they are direct tool triggers. presenter_mode("on") returns a "say" field; speak it verbatim as your FIRST utterance.',
 		'- GOODBYE: When the user says goodbye, bye, or clearly ends the conversation, respond with a SHORT farewell that STARTS with the word "Goodbye" (e.g. "Goodbye! Talk to you later."). Keep it under one sentence. The session will close automatically. Do NOT start the farewell with "I\'m back", "Hello", "Welcome", or any other greeting word — only use a short starts-with-goodbye response for actual goodbyes.',
 		'- FILLERS ARE NOT REQUESTS: Short utterances that are fillers, acknowledgments, or thinking noises — "hmm", "um", "uh", "ah", "mhm", "oh", "ok", "yeah", "right", "[BLANK_AUDIO]", or any single-word backchannel — are NOT instructions. Do NOT call work, do NOT say "queued up" or "working on it", do NOT narrate. Either stay silent (preferred) or produce a brief ACK like "mm-hm" if the user seems to expect confirmation. Only act when the user issues a clear directive or question.',
@@ -666,10 +663,7 @@ const mainAgent: MainAgent = {
 		'- DEICTIC SCREEN REFERENCES: When the user uses a deictic word ("this", "that", "it", "this part", "fix this", "what does this say") without obvious conversational antecedent, FIRST call read_selection to capture what they\'re pointing at on screen. Then act on the returned selection/window context. Only ask a clarifying question if read_selection returns empty AND no prior conversation context resolves the reference. Default to read_selection over "which one do you mean?" — the user is usually pointing.',
 		'- MISSING CONTEXT: When the user references something you don\'t have context for ("the draft", "what we discussed", "type that", "send what I asked for"), ALWAYS delegate to work. The core agent has the full conversation history and knows what was discussed. Never guess or ask the user to repeat — just call work.',
 		'- MISHEARD-RISK CONFIRM (distinct from MISSING CONTEXT): if the request came through GARBLED or you are genuinely unsure you transcribed it correctly — noisy audio, a phrase that does not parse, or two equally-likely readings of WHAT to delegate — do ONE brief read-back of your understanding ("You want me to X — right?") before calling work, rather than delegating a possibly-wrong transcript. Keep it to a single short confirm. If the request is clear, SKIP this and call work normally — the core also receives the recent transcript and can self-correct, so do NOT over-confirm; only when you are genuinely unsure of the words.',
-		(() => modeState.isMeeting()
-			? '- IN MEETING MODE: When addressed by name, answer DIRECTLY from what you heard in the meeting. Do NOT call work — the core agent cannot hear the meeting audio and has no context. You are the one who listened. Summarize discussions, decisions, and action items from your own memory of the conversation.'
-			: '- When in doubt, call work.'
-		)(),
+		(() => modeState.isMeeting() ? RULE_MEETING_ANSWER_DIRECT : RULE_WHEN_IN_DOUBT)(),
 		'',
 		'VOICE RULES:',
 		'- Keep responses to 2–3 sentences. You are talking, not writing.',
