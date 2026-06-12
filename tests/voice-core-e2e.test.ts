@@ -35,8 +35,8 @@ const {
 after(() => { try { rmSync(tmp, { recursive: true, force: true }); } catch {} });
 
 describe('voice-core e2e', () => {
-	it('exposes API version 1', () => {
-		assert.equal(VOICE_CORE_API_VERSION, 1);
+	it('exposes API version 2 (v2 = + session-recovery, 2026-06-12)', () => {
+		assert.equal(VOICE_CORE_API_VERSION, 2);
 	});
 
 	it('switch_mode flips state, mirrors sentinel, returns tuned instructions', async () => {
@@ -176,5 +176,21 @@ describe('voice-core e2e', () => {
 			+ 'Call switch_mode("active") when user says "I need you", "come back", "active mode", or the meeting ends. '
 			+ 'In meeting mode: listen to everything and track discussion internally, but produce ZERO audio output and do NOT call any other tools — unless explicitly addressed by name ("Sutando" or "hey Sutando").',
 		);
+	});
+
+	it('session-recovery: reconnect policy (v2 surface item 6)', async () => {
+		const { reconnectGreeting, shouldRestoreActiveOnReconnect } = await import('../src/voice-core/session-recovery.js');
+		// meeting wins over everything — stay the silent note-taker
+		assert.equal(reconnectGreeting({ isMeeting: true, isPresenter: false, quickReconnect: true }), 'meeting-notes');
+		// quick blip or presenter → no greeting (never interrupt a talk)
+		assert.equal(reconnectGreeting({ isMeeting: false, isPresenter: true, quickReconnect: false }), 'silent');
+		assert.equal(reconnectGreeting({ isMeeting: false, isPresenter: false, quickReconnect: true }), 'silent');
+		// normal away-and-back → brief welcome
+		assert.equal(reconnectGreeting({ isMeeting: false, isPresenter: false, quickReconnect: false }), 'greet');
+		// provenance-aware restore (#1427/#1600): auto/stale mute recovers,
+		// deliberate stand-by persists, active needs no restore
+		assert.equal(shouldRestoreActiveOnReconnect(true, false), true);
+		assert.equal(shouldRestoreActiveOnReconnect(true, true), false);
+		assert.equal(shouldRestoreActiveOnReconnect(false, false), false);
 	});
 });
