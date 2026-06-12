@@ -6,7 +6,7 @@
 //      this repo as a commit-pinned git dependency and imports
 //      'sutando/voice-core' via the package.json exports map)
 //
-// SHARED SURFACE (fixed at these 6 items — Mini amendment #5; growing it
+// SHARED SURFACE (fixed at these 7 items — Mini amendment #5; growing it
 // requires bumping VOICE_CORE_API_VERSION and updating the plugin's contract
 // test):
 //   1. mode state machine + resolver            (mode-state.ts)
@@ -14,13 +14,17 @@
 //   3. mode/meeting prompt strings               (prompts.ts)
 //   4. session-resilience watchdog predicate     (session-resilience.ts)
 //   5. recording API + surface-table registration (recording.ts)
-//   6. this version constant
+//   6. reconnect-recovery policy                 (session-recovery.ts)
+//   7. this version constant
 //
 // Plugins MUST assert the version at startup and fail loudly on skew:
 //   if (VOICE_CORE_API_VERSION !== EXPECTED) throw new Error(
 //     'voice-core API skew — re-pin sutando and re-run the contract test');
 
-export const VOICE_CORE_API_VERSION = 1;
+// v2 (2026-06-12): + session-recovery (reconnectGreeting,
+// shouldRestoreActiveOnReconnect — Susan's #susan ruling: reconnect policy
+// lives upstream once; surfaces keep their own provenance state).
+export const VOICE_CORE_API_VERSION = 2;
 
 export {
 	type BaseMode,
@@ -62,3 +66,10 @@ export {
 	sourceFromRole,
 	kindFromRole,
 } from './recording.js';
+
+export {
+	type ReconnectGreetingInputs,
+	type ReconnectGreeting,
+	reconnectGreeting,
+	shouldRestoreActiveOnReconnect,
+} from './session-recovery.js';

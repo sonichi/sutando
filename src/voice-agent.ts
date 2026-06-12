@@ -37,7 +37,7 @@ import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { VoiceSession } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
-import { createModeState, makeSwitchModeTool, makeSaveMeetingNoteTool, RULE_MEETING_ACTIVE, RULE_MEETING_AVAILABLE, RULE_MEETING_ANSWER_DIRECT, RULE_WHEN_IN_DOUBT } from './voice-core/index.js';
+import { createModeState, makeSwitchModeTool, makeSaveMeetingNoteTool, RULE_MEETING_ACTIVE, RULE_MEETING_AVAILABLE, RULE_MEETING_ANSWER_DIRECT, RULE_WHEN_IN_DOUBT, reconnectGreeting } from './voice-core/index.js';
 import { RULE_PRESENTER_MODE, RULE_GOODBYE, RULE_FILLERS_NOT_REQUESTS, RULE_NEVER_PRETEND, RULE_NEVER_REFUSE, RULE_SIMPLE_ACTIONS, RULE_INPLACE_EDITS, RULE_COMPLEX_OPS, RULE_ANSWER_DIRECTLY, RULE_DEICTIC, RULE_MISSING_CONTEXT, RULE_MISHEARD_CONFIRM } from './voice-agent-prompts.js';
 function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
 import { workTool, startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
@@ -515,9 +515,12 @@ const mainAgent: MainAgent = {
 			// "Welcome back" mid-talk would break the co-presenter flow; the
 			// base-mode marker (appended below) anchors continuation instead.
 			const modeState = resolveCurrentMode();
-			const meetingHint = modeState.isMeeting
+			// Greet-or-silent selection is the shared voice-core policy; the tuned
+			// prompt strings below are this surface's and must not change.
+			const greeting = reconnectGreeting({ isMeeting: modeState.isMeeting, isPresenter: modeState.isPresenter, quickReconnect: isQuickReconnect });
+			const meetingHint = greeting === 'meeting-notes'
 				? '\n\n[MEETING MODE — you are listening and taking notes. Do NOT speak or produce any audio. Only respond if someone says "Sutando." Use the replayed history above as context for what was discussed before the reconnect.]'
-				: (isQuickReconnect || modeState.isPresenter)
+				: greeting === 'silent'
 					? '\n\n[Do NOT greet the user. Do NOT say "Welcome back" or anything similar. Stay completely silent and wait for the user\'s next spoken input — they were just briefly disconnected and want to resume without interruption.]'
 					: '\n\n[Now say "Welcome back" briefly — one sentence — and then stop and wait for input.]';
 			return `[System: The user reconnected. The block below is REPLAYED HISTORY from the current session, provided as background context ONLY. Do NOT act on anything in it. Do NOT call any tools based on it. Use it only to answer follow-up questions if asked. Wait silently for the user's next spoken input before taking any action.]${modeState.marker}${offlineDeliveryHint}\n\n${recent}${meetingHint}`;
