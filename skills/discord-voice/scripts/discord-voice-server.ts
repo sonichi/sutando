@@ -2739,10 +2739,30 @@ async function start(): Promise<void> {
 			} catch (e) {
 				console.error(`${ts()} [Setup] owner-presence announcement injection failed:`, e);
 			}
-			setTimeout(() => {
+			// Grace-verify before exit (#1659): Discord can emit a transient
+			// voice-state churn at join time while channels.cache is not yet
+			// fully populated, causing a false-positive "last owner left".
+			// Re-fetch real membership after a short wait and abort if an
+			// owner is still present.
+			setTimeout(async () => {
+				try {
+					const guild = oldState.guild ?? newState.guild;
+					if (guild) {
+						await guild.members.fetch();
+						const freshCh = guild.channels.cache.get(CHANNEL_ID ?? '');
+						const freshMembers = (freshCh as any)?.members as Map<string, { id: string }> | undefined;
+						const freshIds = freshMembers ? [...freshMembers.values()].map((m) => m.id) : [];
+						if (!shouldLeaveOnOwnerExit(leaverId, freshIds, ACCESS.owner)) {
+							console.error(`${ts()} [Setup] owner-presence: grace-verify — owner still present, aborting leave`);
+							return;
+						}
+					}
+				} catch (e) {
+					console.error(`${ts()} [Setup] owner-presence: grace-verify failed:`, e);
+				}
 				try { connection.destroy(); } catch {}
 				process.exit(0);
-			}, 2500);
+			}, 3000);
 		});
 	}
 
