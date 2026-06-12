@@ -466,8 +466,10 @@ except Exception: print("")' 2>/dev/null)
       export "$_AG2_KEY=$_AG2_VAL"
       # Persist the agent identity too (owner ask 2026-06-13) — quoted, since
       # matrix ids contain ':' and tools sourcing .env should get clean values.
+      # Bare localpart only (owner 2026-06-13): "@" and the homeserver are
+      # composed in code — keeps service specifics out of .env entirely.
       _AG2_AGENT=$(printf '%s' "$_AG2_RESP" | python3 -c 'import json,sys
-try: print(json.load(sys.stdin).get("agent_id") or "")
+try: print((json.load(sys.stdin).get("agent_id") or "").lstrip("@").split(":", 1)[0])
 except Exception: print("")' 2>/dev/null)
       if [ -n "$_AG2_AGENT" ]; then
         printf "AG2_AGENT_NAME='%s'\n" "$_AG2_AGENT" >> .env
