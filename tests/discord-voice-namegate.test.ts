@@ -28,9 +28,23 @@ test('isAddressedBy: comma/question tag addresses', () => {
 test('isAddressedBy: imperative verb at clause start addresses', () => {
 	assert.equal(isAddressedBy(`${SELF} check the PR`, [SELF]), true);
 });
+test('isAddressedBy: bare name addresses — #1600 M2 (66/66 live misses)', () => {
+	// The single most common summon pattern in the 2026-06-10 live session
+	// (66 bare "Lucy" / "Lucy." utterances, 0 matched pre-fix).
+	assert.equal(isAddressedBy(SELF, [SELF]), true, 'bare name must address');
+	assert.equal(isAddressedBy(`${SELF}.`, [SELF]), true, 'name + period must address');
+	assert.equal(isAddressedBy(`${SELF}!`, [SELF]), true, 'name + exclamation must address');
+	// Leading/trailing whitespace (common in ASR output) must not break it
+	assert.equal(isAddressedBy(`  ${SELF}  `, [SELF]), true, 'whitespace-padded bare name must address');
+	// Alias variant (e.g. "Loosey" → alias for "Lucy")
+	const alias = SELF + 'ey';
+	assert.equal(isAddressedBy(alias, [alias]), true, 'bare alias must address');
+});
 test('isAddressedBy: plain mention does NOT address', () => {
 	assert.equal(isAddressedBy(`thanks ${SELF}`, [SELF]), false);
 	assert.equal(isAddressedBy(`${SELF}'s answer was good`, [SELF]), false);
+	// Multi-word utterance containing only the name is still not a bare-name summon
+	assert.equal(isAddressedBy(`thank you ${SELF}`, [SELF]), false);
 });
 test('isAddressedBy: empty names / empty text never matches', () => {
 	assert.equal(isAddressedBy(`${SELF}, hi`, []), false);
