@@ -32,6 +32,8 @@ One prompt; what you paste picks the journey:
   platform account + agent + token; you choose a password for the platform).
 - `https://<base>` — existing user: log in with your platform credentials,
   then name this instance (Enter reconnects to your existing agent).
+- `https://<base>` + no account yet — request access (email/name/reason);
+  once the operator approves you'll receive an invite to finish with.
 
 On success it writes `AG2_REMOTE_TOKEN` + `AG2_AGENT_NAME` (bare localpart)
 to the repo `.env` (quoted) and saves a private summary — including your own

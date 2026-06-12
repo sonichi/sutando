@@ -47,9 +47,30 @@ _ARG_IN="${1:-}"; _ARG_NAME="${2:-}"; _ARG_PASS="${3:-${AG2_ONBOARD_PASSWORD:-}}
     _AG2_RESP=$(curl -sf -X POST "$_AG2_BASE/redeem" -H 'content-type: application/json' \
       -d "{\"invite\": \"$_AG2_CODE\", \"username\": \"$_AG2_USER\", \"password\": \"$_AG2_PASS\"}" 2>/dev/null) || _AG2_RESP=""
   elif [ -n "$_AG2_IN" ]; then
+    _AG2_BASE="${_AG2_IN%/}"
+    # Bare address: existing-account login, or request access (no invite yet).
+    printf '  Do you already have a platform account? (y/N): '
+    read -r _AG2_HAS || _AG2_HAS=""
+    if [ "$_AG2_HAS" != "y" ] && [ "$_AG2_HAS" != "Y" ]; then
+      # Request-access journey: records an application; the operator approves
+      # and you receive an invite to finish onboarding.
+      printf '  Your email (for the invite): '
+      read -r _AG2_EMAIL || _AG2_EMAIL=""
+      printf '  Your name: '
+      read -r _AG2_NAME || _AG2_NAME=""
+      printf '  One line on why / who invited you: '
+      read -r _AG2_WHY || _AG2_WHY=""
+      _AG2_APPLY=$(curl -sf -X POST "$_AG2_BASE/apply" -H 'content-type: application/json' \
+        -d "{\"email\": \"$_AG2_EMAIL\", \"name\": \"$_AG2_NAME\", \"reason\": \"$_AG2_WHY\"}" 2>/dev/null) || _AG2_APPLY=""
+      if [ -n "$_AG2_APPLY" ]; then
+        echo "  ✓ request submitted — once approved you'll receive an invite; rerun this script with it"
+      else
+        echo "  ✗ request failed (network or rate limit) — try again later"
+      fi
+      exit 0
+    fi
     # Existing-user journey: validate platform credentials, then claim (or
     # reconnect to) their agent — no new account, no new password.
-    _AG2_BASE="${_AG2_IN%/}"
     if [ -n "$_ARG_PASS" ]; then
       _AG2_USER="${_ARG_NAME:?existing-account mode needs <instance-or-username> arg}"
       # In arg mode arg2 is the PLATFORM USERNAME for login; instance naming
