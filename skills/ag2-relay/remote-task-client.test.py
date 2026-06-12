@@ -105,7 +105,8 @@ def main() -> int:
     content = tfile.read_text() if tfile.exists() else ""
     check("task: hello from relay" in content, "task body serialized")
     check("source: remote-relay" in content, "source field carried")
-    check("access_tier: owner" in content, "access_tier carried")
+    check("access_tier: team" in content and "access_tier: owner" not in content,
+          "access_tier CLAMPED to local default (wire said owner — never trusted)")
 
     # 2. idempotent: re-writing the same task doesn't duplicate / error
     before = content

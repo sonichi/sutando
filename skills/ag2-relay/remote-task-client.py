@@ -42,7 +42,9 @@ import urllib.request
 from pathlib import Path
 
 # resolve_workspace lives alongside this file in src/.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# Coupled-skill import: this skill ships in the main repo, so use the
+# canonical src/ helper rather than a vendored copy (avoids silent drift).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
 from workspace_default import resolve_workspace  # noqa: E402
 
 WS = resolve_workspace()
@@ -70,7 +72,16 @@ PROVIDER = os.environ.get("REMOTE_TASK_PROVIDER") or "remote"
 POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
 
 _TASK_FIELDS = ("id", "timestamp", "task", "source", "channel_id",
-                "source_message_id", "user_id", "access_tier", "priority")
+                "source_message_id", "user_id", "priority")
+
+# Trust tier is a LOCAL decision (review 2026-06-13): the relay is outside
+# this machine's trust boundary, so its access_tier claim is ignored. The
+# tier written to every task file comes from AG2_REMOTE_TIER in .env —
+# default "team" (sandboxed processing). Operators who own their relay can
+# explicitly set AG2_REMOTE_TIER=owner.
+LOCAL_TIER = (os.environ.get("AG2_REMOTE_TIER") or "team").strip().lower()
+if LOCAL_TIER not in ("owner", "team", "other"):
+    LOCAL_TIER = "team"
 
 
 def _log(msg: str) -> None:
@@ -103,6 +114,7 @@ def _write_task(task: dict) -> str | None:
         return tid
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
     lines = []
+    lines.append(f"access_tier: {LOCAL_TIER}")
     for f in _TASK_FIELDS:
         if f == "source":
             lines.append(f"source: {task.get('source') or PROVIDER}")

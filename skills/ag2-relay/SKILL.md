@@ -47,6 +47,14 @@ Where to get an invite/address: ask your relay operator.
 set (silent pgrep-guarded block; re-running startup is also the restart
 path). Manual run: `python3 skills/ag2-relay/remote-task-client.py`.
 
+## Trust tier
+
+Tasks from the relay are processed at the tier in `AG2_REMOTE_TIER`
+(default `team` — sandboxed). The relay's own tier claims are ignored: it
+sits outside this machine's trust boundary. Only set `AG2_REMOTE_TIER=owner`
+if you operate the relay yourself and accept that it can submit
+full-capability tasks to this machine.
+
 ## Disconnect
 
 Remove the `AG2_REMOTE_TOKEN` line from `.env` and restart — the agent goes
