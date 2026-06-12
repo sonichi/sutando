@@ -92,7 +92,7 @@ def main() -> int:
 
     # import the hyphenated module by path (env must be set first — module reads
     # config + resolves workspace at import time)
-    spec = importlib.util.spec_from_file_location("rtc", REPO / "src" / "remote-task-client.py")
+    spec = importlib.util.spec_from_file_location("rtc", Path(__file__).resolve().parent / "remote-task-client.py")
     rtc = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(rtc)
 

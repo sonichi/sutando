@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# onboard.sh — connect THIS Sutando instance to a hosted AG2 relay.
+# Run once, interactively:  bash skills/ag2-relay/onboard.sh
+# Writes AG2_REMOTE_TOKEN + AG2_AGENT_NAME to the repo .env (quoted), then
+# startup.sh auto-starts the client on every boot. See SKILL.md.
+set -uo pipefail
+cd "$(dirname "$0")/../.."   # repo root — .env lives here
+
+if [ -n "${AG2_REMOTE_TOKEN:-}" ] || grep -q "^AG2_REMOTE_TOKEN=" .env 2>/dev/null; then
+  echo "already configured (.env has AG2_REMOTE_TOKEN) — remove it to re-onboard"
+  exit 0
+fi
+# AG2 onboarding: no AG2_REMOTE_TOKEN and we're interactive -> offer to
+# connect right here. ONE prompt, the input shape picks the journey:
+#   "https://<base>|<code>"  -> new user: redeem invite (creates account+agent)
+#   "https://<base>"         -> existing user: log in, claim/reconnect agent
+# The address travels in the pasted string — nothing service-specific lives
+# in this repo. Non-interactive runs skip silently; failure never blocks.
+  printf '  AG2 onboarding string or platform address (Enter to skip): '
+  read -r _AG2_IN || _AG2_IN=""
+  _AG2_RESP=""
+  _AG2_BASE=""
+  if [ -n "$_AG2_IN" ] && [[ "$_AG2_IN" == *"|"* ]]; then
+    # New-user journey: invite redeem (account + agent + token in one shot).
+    _AG2_BASE="${_AG2_IN%%|*}"; _AG2_CODE="${_AG2_IN#*|}"
+    _FUN_A=(swift quiet lucky cosmic mellow brave nimble sunny)
+    _FUN_B=(falcon otter lynx comet willow ember harbor sparrow)
+    _FUN_NAME="${_FUN_A[$((RANDOM % 8))]}-${_FUN_B[$((RANDOM % 8))]}"
+    printf '  Name this Sutando instance [Enter = %s]: ' "$_FUN_NAME"
+    read -r _AG2_USER || _AG2_USER=""
+    _AG2_USER="${_AG2_USER:-$_FUN_NAME}"
+    printf '  Choose a password for your NEW platform login (min 8 chars): '
+    read -rs _AG2_PASS; echo
+    _AG2_RESP=$(curl -sf -X POST "$_AG2_BASE/redeem" -H 'content-type: application/json' \
+      -d "{\"invite\": \"$_AG2_CODE\", \"username\": \"$_AG2_USER\", \"password\": \"$_AG2_PASS\"}" 2>/dev/null) || _AG2_RESP=""
+  elif [ -n "$_AG2_IN" ]; then
+    # Existing-user journey: validate platform credentials, then claim (or
+    # reconnect to) their agent — no new account, no new password.
+    _AG2_BASE="${_AG2_IN%/}"
+    printf '  Platform username: '
+    read -r _AG2_USER || _AG2_USER=""
+    printf '  Platform password: '
+    read -rs _AG2_PASS; echo
+    _AG2_SESS=$(curl -sf -X POST "$_AG2_BASE/user-login" -H 'content-type: application/json' \
+      -d "{\"username\": \"$_AG2_USER\", \"password\": \"$_AG2_PASS\"}" 2>/dev/null \
+      | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("user_session_token") or "")
+except Exception: print("")' 2>/dev/null)
+    if [ -n "$_AG2_SESS" ]; then
+      # Name THIS instance (becomes the agent label) — Enter reconnects to
+      # the user's existing agent instead (action=list; first-timers
+      # auto-create server-side).
+      printf '  Name this Sutando instance [Enter = reconnect existing]: '
+      read -r _AG2_LABEL || _AG2_LABEL=""
+      if [ -n "$_AG2_LABEL" ]; then
+        _AG2_RESP=$(curl -sf -X POST "$_AG2_BASE/claim-agent" -H 'content-type: application/json' \
+          -d "{\"user_session_token\": \"$_AG2_SESS\", \"action\": \"create\", \"label\": \"$_AG2_LABEL\", \"auto_spawn\": false}" 2>/dev/null) || _AG2_RESP=""
+      else
+        _AG2_RESP=$(curl -sf -X POST "$_AG2_BASE/claim-agent" -H 'content-type: application/json' \
+          -d "{\"user_session_token\": \"$_AG2_SESS\", \"action\": \"list\", \"auto_spawn\": false}" 2>/dev/null) || _AG2_RESP=""
+      fi
+    else
+      echo "  ✗ login failed (bad credentials or rate limit) — continuing without"
+    fi
+  fi
+  if [ -n "$_AG2_RESP" ]; then
+    _AG2_ENVLINE=$(printf '%s' "$_AG2_RESP" | python3 -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+    line = d.get("env_line")
+    if not line and d.get("relay_url") and (d.get("relay_token") or d.get("bearer")):
+        line = "AG2_REMOTE_TOKEN=%s|%s" % (d["relay_url"], d.get("relay_token") or d.get("bearer"))
+    print(line or "")
+except Exception: print("")' 2>/dev/null)
+    if [ -n "$_AG2_ENVLINE" ]; then
+      # Single-quote the value in .env — the combined token contains a pipe
+      # character, which a shell source-of-.env would otherwise run as a
+      # command ("command not found", empty token, dead client — 2026-06-13).
+      _AG2_KEY="${_AG2_ENVLINE%%=*}"; _AG2_VAL="${_AG2_ENVLINE#*=}"
+      printf "\n%s='%s'\n" "$_AG2_KEY" "$_AG2_VAL" >> .env
+      export "$_AG2_KEY=$_AG2_VAL"
+      # Persist the agent identity too (owner ask 2026-06-13) — quoted, since
+      # matrix ids contain ':' and tools sourcing .env should get clean values.
+      # Bare localpart only (owner 2026-06-13): "@" and the homeserver are
+      # composed in code — keeps service specifics out of .env entirely.
+      _AG2_AGENT=$(printf '%s' "$_AG2_RESP" | python3 -c 'import json,sys
+try: print((json.load(sys.stdin).get("agent_id") or "").lstrip("@").split(":", 1)[0])
+except Exception: print("")' 2>/dev/null)
+      if [ -n "$_AG2_AGENT" ]; then
+        printf "AG2_AGENT_NAME='%s'\n" "$_AG2_AGENT" >> .env
+        export "AG2_AGENT_NAME=$_AG2_AGENT"
+      fi
+      # Persist the summary — it scrolled off-screen on the first live test.
+      _AG2_SUMMARY="ag2-onboarding.txt"
+      printf '%s' "$_AG2_RESP" | python3 -c 'import json,sys
+d = json.load(sys.stdin)
+out = ["AG2 onboarding — keep this file private (it lists your invite codes)", ""]
+if d.get("agent_id"): out.append("your agent:   " + d["agent_id"])
+if d.get("matrix_id"): out.append("your account: " + d["matrix_id"])
+codes = d.get("invite_codes") or []
+if codes:
+    out.append("")
+    out.append("single-use invite codes for friends:")
+    out += ["  " + sys.argv[1] + "|" + c for c in codes]
+print("\n".join(out))' "$_AG2_BASE" > "$_AG2_SUMMARY" 2>/dev/null || true
+      echo "  ✓ onboarded — token saved to .env; details in $_AG2_SUMMARY"
+      sed 's/^/    /' "$_AG2_SUMMARY" 2>/dev/null || true
+    else
+      echo "  ✗ onboarding failed (invalid/used invite, taken username, or network) — continuing without"
+    fi
+  fi
+
+echo "now run:  bash src/startup.sh"
