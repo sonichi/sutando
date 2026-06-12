@@ -70,9 +70,13 @@ function readJsonBody(req: import('node:http').IncomingMessage, done: (parsed: u
 	});
 }
 
-export function serveCollector(collector: Collector, opts?: { port?: number; otlpSource?: string }): Server {
+export function serveCollector(collector: Collector, opts?: { port?: number; host?: string; otlpSource?: string }): Server {
 	let ingested = 0;
 	const port = opts?.port ?? (Number(process.env.SUTANDO_OBS_PORT) || 4000);
+	// Localhost-by-default, opt into LAN exposure explicitly — same env-override
+	// shape as DASHBOARD_BIND / AGENT_API_BIND. The collector carries full prompt
+	// text + tool inputs and has no auth, so it must not bind 0.0.0.0 by default.
+	const host = opts?.host ?? process.env.SUTANDO_OBS_BIND ?? '127.0.0.1';
 	const otlpSource = opts?.otlpSource;
 
 	const server = createServer((req, res) => {
@@ -144,6 +148,12 @@ export function serveCollector(collector: Collector, opts?: { port?: number; otl
 		res.writeHead(404).end();
 	});
 
-	server.listen(port);
+	server.listen(port, host);
+	if (host !== '127.0.0.1' && host !== 'localhost') {
+		process.stderr.write(
+			`[collector] LAN exposure enabled via SUTANDO_OBS_BIND=${host} — the collector has NO ` +
+				`authentication; anyone on this network can POST to /ingest and read every prompt + tool input it relays\n`,
+		);
+	}
 	return server;
 }
