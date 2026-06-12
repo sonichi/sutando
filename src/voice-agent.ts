@@ -37,6 +37,7 @@ import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { VoiceSession } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
+import { createModeState, makeSwitchModeTool, makeSaveMeetingNoteTool } from './voice-core/index.js';
 function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
 import { workTool, startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
 import { recordSession, recordToolCall } from './conversation-store.js';
@@ -267,15 +268,13 @@ function getPendingToolCalls(toolName?: string) {
 // =============================================================================
 // Meeting mode state — persists across Gemini reconnects
 // =============================================================================
-let meetingActive = false;
-// Sentinel for the 3-mode indicator (menu-bar + web-badge read this).
-// Presenter mode is tracked separately by the iclr-highlight server on :7877.
-function writeVoiceModeSentinel() {
-	try {
-		mkdirSync(join(WORKSPACE_DIR, 'state'), { recursive: true });
-		writeFileSync(join(WORKSPACE_DIR, 'state', 'voice-mode.txt'), meetingActive ? 'meeting' : 'active');
-	} catch {}
-}
+// Owned by voice-core's ModeStateHandle (two-repo refactor #1427): the
+// in-memory meeting axis + the voice-mode.txt sentinel mirror for the 3-mode
+// indicator (menu-bar + web-badge read it). Presenter mode is tracked
+// separately by the iclr-highlight server on :7877. This surface keeps the
+// historical voice-mode.txt path; the discord-voice plugin uses its own
+// per-session sentinel (shared definition, independent live state).
+const modeState = createModeState({ sentinelPath: join(WORKSPACE_DIR, 'state', 'voice-mode.txt') });
 
 // Poll state/voice-mode.request every 1s — external controllers (Swift
 // menu-bar clickable items) write "active" or "meeting" to ask voice-agent
@@ -287,9 +286,8 @@ function applyModeRequest() {
 		const req = readFileSync(reqPath, 'utf-8').trim().toLowerCase();
 		unlinkSync(reqPath);
 		const want = req === 'meeting';
-		if (meetingActive === want) return; // no-op if already in that mode
-		meetingActive = want;
-		writeVoiceModeSentinel();
+		if (modeState.isMeeting() === want) return; // no-op if already in that mode
+		modeState.setMeeting(want);
 		console.log(`${ts()} [Meeting] External request applied: mode=${want ? 'meeting' : 'active'}`);
 	} catch {
 		// no request file or delete failed — both are fine (silent poll)
@@ -303,84 +301,39 @@ try {
 	if (zoomRunning) {
 		const inMeeting = execFileSync('osascript', ['-e', 'tell application "System Events" to tell process "zoom.us" to count of windows'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
 		if (parseInt(inMeeting) >= 2) {
-			meetingActive = true;
+			modeState.setMeeting(true);
 			console.log(`${new Date().toLocaleTimeString()} [Meeting] Detected active Zoom meeting on startup`);
 		}
 	}
 } catch { /* no zoom */ }
 
 // Write the initial voice-mode sentinel AFTER the Zoom auto-detect — so
-// the on-disk state matches the in-memory `meetingActive` decision (was
+// the on-disk state matches the in-memory meeting decision (was
 // previously written before the auto-detect, leaving voice-mode.txt
 // stuck on "active" even when Zoom was detected as active).
-writeVoiceModeSentinel();
+modeState.writeSentinel();
 
 // =============================================================================
 // Tools
 // =============================================================================
 
-const switchModeTool: ToolDefinition = {
-	name: 'switch_mode',
-	description:
-		'Switch between active mode and meeting mode. ' +
-		'Call switch_mode("meeting") when user says "take notes", "be silent", "meeting mode", "passive mode", or joins a meeting. ' +
-		'Call switch_mode("active") when user says "I need you", "come back", "active mode", or the meeting ends. ' +
-		'In meeting mode: listen to everything and track discussion internally, but produce ZERO audio output and do NOT call any other tools — unless explicitly addressed by name ("Sutando" or "hey Sutando").',
-	parameters: z.object({
-		mode: z.enum(['active', 'meeting']).describe('"meeting" = silent note-taker, "active" = normal assistant'),
-	}),
-	execution: 'inline',
-	async execute(args) {
-		const { mode } = args as { mode: 'active' | 'meeting' };
-		meetingActive = mode === 'meeting';
-		// Sync the on-disk sentinel so menu-bar consumers (Sutando.app
-		// pollVoiceMode + web-client /voice-mode endpoint) reflect the
-		// switch immediately. Without this, voice-triggered switch_mode
-		// flips meetingActive in-memory but voice-mode.txt stays stale,
-		// causing the menu radio to lag + the next applyModeRequest from
-		// Sutando.app to early-return as a no-op (`meetingActive === want`).
-		writeVoiceModeSentinel();
-		console.log(`${ts()} [Meeting] Mode switched to: ${mode}`);
-		if (mode === 'meeting') {
-			return { status: 'meeting_mode', instruction: 'You are now in meeting mode. Listen and track the discussion internally. Produce ZERO audio output unless someone says "Sutando." The ONLY tool you may call unprompted is save_meeting_note — call it every 5-10 minutes to capture key decisions, action items, and discussion points. When you exit meeting mode, call save_meeting_note with type "summary" for a final recap. Do not call work or any other tools unless explicitly addressed.' };
-		}
-		return { status: 'active_mode', instruction: 'Back to active mode. You can speak and use all tools normally.' };
-	},
-};
+// switch_mode — built from the voice-core factory (single shared definition;
+// the discord-voice plugin builds its own instance with a per-session
+// sentinel). state.setMeeting() inside the factory mirrors voice-mode.txt so
+// menu-bar consumers (Sutando.app pollVoiceMode + web-client /voice-mode
+// endpoint) reflect the switch immediately and applyModeRequest stays
+// consistent (`modeState.isMeeting() === want` no-op check).
+const switchModeTool: ToolDefinition = makeSwitchModeTool({
+	state: modeState,
+	log: (msg) => console.log(`${ts()} ${msg}`),
+});
 
-const saveMeetingNoteTool: ToolDefinition = {
-	name: 'save_meeting_note',
-	description:
-		'Save a meeting observation, decision, or action item to notes. ' +
-		'Use this ONLY in meeting mode to periodically capture key points. ' +
-		'Call every 5-10 minutes during a meeting, or when a significant decision/action item is discussed. ' +
-		'Also call when exiting meeting mode to save a final summary.',
-	parameters: z.object({
-		content: z.string().describe('The meeting note: decisions, action items, key discussion points, or a summary. Include speaker names when known.'),
-		type: z.enum(['point', 'summary']).optional().describe('"point" for individual observations (default), "summary" for end-of-meeting summary'),
-	}),
-	execution: 'inline',
-	async execute(args) {
-		const { content, type } = args as { content: string; type?: 'point' | 'summary' };
-		const today = new Date().toISOString().slice(0, 10);
-		const time = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' });
-		const notePath = sharedPersonalPath(`notes/meeting-${today}.md`, WORKSPACE_DIR);
-		const isSummary = type === 'summary';
-
-		if (!existsSync(notePath)) {
-			// Create new meeting note file with frontmatter
-			const header = `---\ntitle: Meeting notes — ${today}\ndate: ${today}\ntags: [meeting, notes]\n---\n\n`;
-			writeFileSync(notePath, header);
-		}
-
-		const entry = isSummary
-			? `\n## Summary (${time})\n${content}\n`
-			: `\n- **[${time}]** ${content}`;
-		appendFileSync(notePath, entry);
-		console.log(`${ts()} [MeetingNote] ${isSummary ? 'Summary' : 'Point'} saved to ${notePath}`);
-		return { status: 'saved', path: notePath, type: isSummary ? 'summary' : 'point' };
-	},
-};
+// save_meeting_note — voice-core factory; this surface writes to the shared
+// personal notes dir (the discord-voice plugin configures its own note home).
+const saveMeetingNoteTool: ToolDefinition = makeSaveMeetingNoteTool({
+	notePathFor: (today) => sharedPersonalPath(`notes/meeting-${today}.md`, WORKSPACE_DIR),
+	log: (msg) => console.log(`${ts()} ${msg}`),
+});
 
 const getTaskStatus: ToolDefinition = {
 	name: 'get_task_status',
@@ -498,13 +451,12 @@ const endSession: ToolDefinition = {
 
 let voiceSessionRef: VoiceSession | null = null;
 
-// Unified base-mode resolver: see src/voice-mode-resolver.ts for the
-// rationale + canonical mode descriptors. Local wrapper threads the in-memory
-// `meetingActive` boolean (this module owns that state) into the pure
-// resolver function.
-import { resolveCurrentMode as resolveCurrentModeImpl, type ModeState } from './voice-mode-resolver.js';
+// Unified base-mode resolver: see src/voice-core/mode-state.ts for the
+// rationale + canonical mode descriptors. Local wrapper threads the meeting
+// axis (owned by voice-core's modeState handle above) into the pure resolver.
+import { resolveCurrentMode as resolveCurrentModeImpl, type ModeState } from './voice-core/index.js';
 function resolveCurrentMode(): ModeState {
-	return resolveCurrentModeImpl({ meetingActive });
+	return resolveCurrentModeImpl({ meetingActive: modeState.isMeeting() });
 }
 
 const mainAgentTools: ToolDefinition[] = [workTool, getTaskStatus, switchModeTool, saveMeetingNoteTool, ...inlineTools];
@@ -699,7 +651,7 @@ const mainAgent: MainAgent = {
 		] : []),
 		'',
 		'CRITICAL RULES:',
-		(() => meetingActive
+		(() => modeState.isMeeting()
 			? '⚠️ MEETING MODE IS CURRENTLY ACTIVE. You are an invisible note-taker. Listen to all audio and track: speakers, topics, decisions, action items. Produce ZERO audio output unless someone says "Sutando" or "hey Sutando." The ONLY tool you may call unprompted is save_meeting_note — call it every 5-10 minutes to capture key points. Do NOT call work or other tools unless explicitly addressed. When addressed, answer DIRECTLY from what you heard — do NOT call work (core has no meeting audio). "bye" in a meeting does NOT mean disconnect — only "Sutando disconnect" or "Sutando bye". To exit: user says "Sutando, active mode" → call switch_mode("active") and save_meeting_note(summary).'
 			: '- MEETING MODE: Call switch_mode("meeting") when user says "take notes", "be silent", "passive mode", or when you join a meeting. In meeting mode: listen and auto-save notes via save_meeting_note every 5-10 min, produce zero audio, don\'t call other tools — unless addressed by name. Call switch_mode("active") to resume.'
 		)(),
@@ -715,7 +667,7 @@ const mainAgent: MainAgent = {
 		'- DEICTIC SCREEN REFERENCES: When the user uses a deictic word ("this", "that", "it", "this part", "fix this", "what does this say") without obvious conversational antecedent, FIRST call read_selection to capture what they\'re pointing at on screen. Then act on the returned selection/window context. Only ask a clarifying question if read_selection returns empty AND no prior conversation context resolves the reference. Default to read_selection over "which one do you mean?" — the user is usually pointing.',
 		'- MISSING CONTEXT: When the user references something you don\'t have context for ("the draft", "what we discussed", "type that", "send what I asked for"), ALWAYS delegate to work. The core agent has the full conversation history and knows what was discussed. Never guess or ask the user to repeat — just call work.',
 		'- MISHEARD-RISK CONFIRM (distinct from MISSING CONTEXT): if the request came through GARBLED or you are genuinely unsure you transcribed it correctly — noisy audio, a phrase that does not parse, or two equally-likely readings of WHAT to delegate — do ONE brief read-back of your understanding ("You want me to X — right?") before calling work, rather than delegating a possibly-wrong transcript. Keep it to a single short confirm. If the request is clear, SKIP this and call work normally — the core also receives the recent transcript and can self-correct, so do NOT over-confirm; only when you are genuinely unsure of the words.',
-		(() => meetingActive
+		(() => modeState.isMeeting()
 			? '- IN MEETING MODE: When addressed by name, answer DIRECTLY from what you heard in the meeting. Do NOT call work — the core agent cannot hear the meeting audio and has no context. You are the one who listened. Summarize discussions, decisions, and action items from your own memory of the conversation.'
 			: '- When in doubt, call work.'
 		)(),
@@ -985,10 +937,10 @@ async function main() {
 				fetch(`http://localhost:8080/mute-state?state=working&source=tool&label=${encodeURIComponent(e.toolName)}`).catch(() => {});
 				// Auto-switch meeting mode on join/dismiss
 				if (['summon', 'join_zoom', 'join_gmeet'].includes(e.toolName)) {
-					meetingActive = true;
+					modeState.setMeeting(true);
 					console.log(`${ts()} [Meeting] Auto-activated by ${e.toolName}`);
 				} else if (e.toolName === 'dismiss') {
-					meetingActive = false;
+					modeState.setMeeting(false);
 					console.log(`${ts()} [Meeting] Ended by dismiss`);
 				}
 			},
