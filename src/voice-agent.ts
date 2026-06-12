@@ -38,6 +38,7 @@ import { homedir } from 'node:os';
 import { VoiceSession } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 import { createModeState, makeSwitchModeTool, makeSaveMeetingNoteTool, RULE_MEETING_ACTIVE, RULE_MEETING_AVAILABLE, RULE_MEETING_ANSWER_DIRECT, RULE_WHEN_IN_DOUBT } from './voice-core/index.js';
+import { RULE_PRESENTER_MODE, RULE_GOODBYE, RULE_FILLERS_NOT_REQUESTS, RULE_NEVER_PRETEND, RULE_NEVER_REFUSE, RULE_SIMPLE_ACTIONS, RULE_INPLACE_EDITS, RULE_COMPLEX_OPS, RULE_ANSWER_DIRECTLY, RULE_DEICTIC, RULE_MISSING_CONTEXT, RULE_MISHEARD_CONFIRM } from './voice-agent-prompts.js';
 function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
 import { workTool, startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
 import { recordSession, recordToolCall } from './conversation-store.js';
@@ -651,18 +652,18 @@ const mainAgent: MainAgent = {
 		'',
 		'CRITICAL RULES:',
 		(() => modeState.isMeeting() ? RULE_MEETING_ACTIVE : RULE_MEETING_AVAILABLE)(),
-		'- PRESENTER MODE: Call presenter_mode("on") when user says "presenter mode on", "going live", "starting the talk", "the talk starts", or "I am on stage". Call presenter_mode("off") when user says "presenter mode off", "talk is done", "stop presenting", or "done presenting". Do NOT route these phrases to work — they are direct tool triggers. presenter_mode("on") returns a "say" field; speak it verbatim as your FIRST utterance.',
-		'- GOODBYE: When the user says goodbye, bye, or clearly ends the conversation, respond with a SHORT farewell that STARTS with the word "Goodbye" (e.g. "Goodbye! Talk to you later."). Keep it under one sentence. The session will close automatically. Do NOT start the farewell with "I\'m back", "Hello", "Welcome", or any other greeting word — only use a short starts-with-goodbye response for actual goodbyes.',
-		'- FILLERS ARE NOT REQUESTS: Short utterances that are fillers, acknowledgments, or thinking noises — "hmm", "um", "uh", "ah", "mhm", "oh", "ok", "yeah", "right", "[BLANK_AUDIO]", or any single-word backchannel — are NOT instructions. Do NOT call work, do NOT say "queued up" or "working on it", do NOT narrate. Either stay silent (preferred) or produce a brief ACK like "mm-hm" if the user seems to expect confirmation. Only act when the user issues a clear directive or question.',
-		'- NEVER pretend you called a tool. NEVER say "done" without actually calling work.',
-		'- NEVER say "I can\'t do that", "I\'m not able to", or "I don\'t think I can" — you CAN do almost anything by calling work. If you\'re unsure, call work and let the core agent handle it. The core agent has full system access. Your job is to relay requests, not gatekeep them.',
-		'- For SIMPLE actions (press enter, clear input, select all), use press_key or type_text — do NOT use work for keystrokes.',
-		'- For IN-PLACE EDITS on text already visible on screen (a draft, an email body, a code block, a focused textarea) — call read_selection FIRST to fetch the current text, compute the edited version, then call type_text to write the edited version into the field. Do NOT delegate to work for in-place edits; the user is on screen watching for the change to appear in the field. work is correct for edits that require server-side logic (commit a change, send the email, mutate files outside the focused field) — not for editing the text the user is looking at.',
-		'- For COMPLEX operations (git commands, code changes, file operations, installing packages), ALWAYS delegate to work — do NOT try to type commands into a terminal. The core agent executes these directly and reliably.',
-		'- If you KNOW the answer from your instructions or context, answer directly. Only delegate to work for questions you genuinely cannot answer.',
-		'- DEICTIC SCREEN REFERENCES: When the user uses a deictic word ("this", "that", "it", "this part", "fix this", "what does this say") without obvious conversational antecedent, FIRST call read_selection to capture what they\'re pointing at on screen. Then act on the returned selection/window context. Only ask a clarifying question if read_selection returns empty AND no prior conversation context resolves the reference. Default to read_selection over "which one do you mean?" — the user is usually pointing.',
-		'- MISSING CONTEXT: When the user references something you don\'t have context for ("the draft", "what we discussed", "type that", "send what I asked for"), ALWAYS delegate to work. The core agent has the full conversation history and knows what was discussed. Never guess or ask the user to repeat — just call work.',
-		'- MISHEARD-RISK CONFIRM (distinct from MISSING CONTEXT): if the request came through GARBLED or you are genuinely unsure you transcribed it correctly — noisy audio, a phrase that does not parse, or two equally-likely readings of WHAT to delegate — do ONE brief read-back of your understanding ("You want me to X — right?") before calling work, rather than delegating a possibly-wrong transcript. Keep it to a single short confirm. If the request is clear, SKIP this and call work normally — the core also receives the recent transcript and can self-correct, so do NOT over-confirm; only when you are genuinely unsure of the words.',
+		RULE_PRESENTER_MODE,
+		RULE_GOODBYE,
+		RULE_FILLERS_NOT_REQUESTS,
+		RULE_NEVER_PRETEND,
+		RULE_NEVER_REFUSE,
+		RULE_SIMPLE_ACTIONS,
+		RULE_INPLACE_EDITS,
+		RULE_COMPLEX_OPS,
+		RULE_ANSWER_DIRECTLY,
+		RULE_DEICTIC,
+		RULE_MISSING_CONTEXT,
+		RULE_MISHEARD_CONFIRM,
 		(() => modeState.isMeeting() ? RULE_MEETING_ANSWER_DIRECT : RULE_WHEN_IN_DOUBT)(),
 		'',
 		'VOICE RULES:',
