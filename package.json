@@ -36,5 +36,9 @@
   },
   "engines": {
     "node": ">=22.5.0"
+  },
+  "exports": {
+    "./voice-core": "./src/voice-core/index.ts",
+    "./voice-core/*": "./src/voice-core/*"
   }
 }

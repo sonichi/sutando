@@ -82,6 +82,27 @@ export function kindFromRole(role: string): string {
 	return role;
 }
 
+// =============================================================================
+// Plugin surface-table registration (voice-core recording API, issue #1427
+// two-repo refactor). External voice-surface plugins (e.g. the sutando-meeting
+// discord-voice skill) own their table DDL but record through this engine.
+// registerSurfaceTable lets a plugin ensure its tables/indexes exist at
+// startup WITHOUT the engine hardcoding plugin names (manifest principle).
+// DDL must be idempotent (CREATE ... IF NOT EXISTS). Fail-open like the rest
+// of the store — a broken plugin table must never take down host recording.
+// =============================================================================
+export function registerSurfaceTable(ddl: string): boolean {
+	init();
+	if (!db) return false;
+	try {
+		db.exec(ddl);
+		return true;
+	} catch (e) {
+		console.error('[conversation-store] registerSurfaceTable failed:', e);
+		return false;
+	}
+}
+
 function init(): void {
 	if (db || initFailed) return;
 	try {
