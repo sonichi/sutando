@@ -394,6 +394,20 @@ else
   echo "  ~ telegram bridge (no token — optional)"
 fi
 
+# AG2 remote relay client. One env var is the whole config:
+# AG2_REMOTE_TOKEN (the onboarding string carries the relay URL).
+if [ -n "${AG2_REMOTE_TOKEN:-}" ]; then
+  if ! pgrep -f "remote-task-client" > /dev/null 2>&1; then
+    echo "  Starting AG2 relay client..."
+    python3 src/remote-task-client.py > "$LOGS_DIR/remote-task-client.log" 2>&1 &
+    echo "  ✓ ag2 relay client"
+  else
+    echo "  ✓ ag2 relay client (already running)"
+  fi
+else
+  echo "  ~ ag2 relay client (no AG2_REMOTE_TOKEN — optional)"
+fi
+
 # 7. Discord bridge (optional — needs DISCORD_BOT_TOKEN + discord.py)
 #
 # `python3` on $PATH is unpredictable across installs (miniconda, system,
