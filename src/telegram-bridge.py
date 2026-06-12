@@ -415,7 +415,7 @@ def send_reply(chat_id, text, task_id: str | None = None):
         fpath = fpath.strip()
         if _is_path_sendable(fpath):
             send_file(chat_id, fpath)
-            print(f"  Sent file: {fpath}")
+            print(f"  Sent file: {fpath}", flush=True)
         elif os.path.isfile(fpath):
             api("sendMessage", chat_id=chat_id, text=f"(file access denied: {fpath})")
             print(f"  BLOCKED file: {fpath}")
@@ -711,10 +711,10 @@ def main():
                 reply_text = result_file.read_text().strip()
                 chat_id = pending_replies.pop(task_id)
                 # Parse markers via the unified module (#873). Telegram
-                # honors [no-send] / [REPLIED] / [deduped: <id>] as skip
-                # and strips file markers from the text it sends. It
-                # ignores [channel:] redirects (no concept in Telegram —
-                # the marker is silently dropped from body, not leaked).
+                # honors [no-send] / [REPLIED] / [deduped: <id>] as skip,
+                # sends attached files, and silently drops [channel:] redirects
+                # (no concept in Telegram). Pass parsed.body so NO marker ever
+                # leaks as literal text in the user's DM (#1381).
                 parsed = parse_markers(reply_text)
                 if any(a.kind == "skip" for a in parsed.actions):
                     print(f"  Skipped (marker): {task_id}", flush=True)
@@ -723,8 +723,21 @@ def main():
                     archive_file(task_file, "tasks", task_id)
                     continue
                 try:
-                    send_reply(chat_id, reply_text, task_id=task_id)
-                    print(f"  Replied to {chat_id}: {reply_text[:80]}...", flush=True)
+                    # Use parsed.body — all markers stripped — so [channel:] etc. never leak.
+                    # File attachments are in parsed.actions; send_reply() won't re-find them.
+                    send_reply(chat_id, parsed.body, task_id=task_id)
+                    for action in parsed.actions:
+                        if action.kind == "attach":
+                            fpath = action.value.strip()
+                            if _is_path_sendable(fpath):
+                                send_file(chat_id, fpath)
+                                print(f"  Sent file: {fpath}", flush=True)
+                            elif os.path.isfile(fpath):
+                                api("sendMessage", chat_id=chat_id, text=f"(file access denied: {fpath})")
+                                print(f"  BLOCKED file: {fpath}")
+                            else:
+                                print(f"  file marker, file not found — likely a prose quotation: {fpath}", flush=True)
+                    print(f"  Replied to {chat_id}: {parsed.body[:80]}...", flush=True)
                 except Exception as e:
                     print(f"[Telegram] Reply error: {e}", flush=True)
                 # Archive (not delete) so we can mine patterns later.
