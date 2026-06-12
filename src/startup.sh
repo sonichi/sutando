@@ -416,8 +416,12 @@ if [ -z "${AG2_REMOTE_TOKEN:-}" ] && [ -t 0 ]; then
 try: print(json.load(sys.stdin).get("env_line") or "")
 except Exception: print("")' 2>/dev/null)
     if [ -n "$_AG2_ENVLINE" ]; then
-      printf '\n%s\n' "$_AG2_ENVLINE" >> .env
-      export "$_AG2_ENVLINE"
+      # Single-quote the value in .env — the combined token contains a pipe
+      # character, which a shell source-of-.env would otherwise run as a
+      # command ("command not found", empty token, dead client — 2026-06-13).
+      _AG2_KEY="${_AG2_ENVLINE%%=*}"; _AG2_VAL="${_AG2_ENVLINE#*=}"
+      printf "\n%s='%s'\n" "$_AG2_KEY" "$_AG2_VAL" >> .env
+      export "$_AG2_KEY=$_AG2_VAL"
       echo "  ✓ onboarded — saved to .env"
       printf '%s' "$_AG2_RESP" | python3 -c 'import json,sys
 d=json.load(sys.stdin)
