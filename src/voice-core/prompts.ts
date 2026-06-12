@@ -55,3 +55,17 @@ export const RULE_MEETING_ANSWER_DIRECT =
 /** Default fall-through rule when not in meeting mode (verbatim). */
 export const RULE_WHEN_IN_DOUBT =
 	'- When in doubt, call work.';
+
+/**
+ * The mode-conditional CRITICAL-RULES pair for a surface's system
+ * instruction (Susan 2026-06-12: surfaces REUSE the selection, never
+ * re-implement it). Extracted from voice-agent.ts's inline ternaries —
+ * strings and selection both unchanged; both voice-agent and the
+ * discord-voice plugin call this instead of duplicating the conditional.
+ */
+export function modeCriticalRules(isMeeting: boolean): [string, string] {
+	return [
+		isMeeting ? RULE_MEETING_ACTIVE : RULE_MEETING_AVAILABLE,
+		isMeeting ? RULE_MEETING_ANSWER_DIRECT : RULE_WHEN_IN_DOUBT,
+	];
+}
