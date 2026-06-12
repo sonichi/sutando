@@ -53,17 +53,24 @@ export SUTANDO_OBS_ENDPOINT="$OBS_ENDPOINT"
 
 # Inject --settings (and thus the per-event hooks) only when an endpoint exists.
 # The ${arr[@]+...} guard keeps the empty array safe on bash 3.2 under `set -u`
-# (same pattern as MODEL_ARGS above).
+# (same pattern as MODEL_ARGS above). The settings JSON is built by a node helper,
+# NOT shell string interpolation: hand-rolled interpolation broke when $REPO held
+# a space (split the command) or a `"` (broke the JSON). The helper POSIX
+# single-quotes the path inside the command and JSON-escapes the payload. Its 10
+# event keys are all valid CC hook events (code.claude.com/docs/en/hooks.md).
 SETTINGS_ARGS=()
-if [ -n "$OBS_ENDPOINT" ]; then
-  OBS_HOOK="bash $REPO/src/adapters/executor/claude-code/hooks/obs-hook.sh"
-  _h="{\"hooks\":[{\"type\":\"command\",\"command\":\"$OBS_HOOK\"}]}"                 # lifecycle events
-  _t="{\"matcher\":\"*\",\"hooks\":[{\"type\":\"command\",\"command\":\"$OBS_HOOK\"}]}" # tool events (matched)
-  HOOKS_JSON="{\"hooks\":{\"UserPromptSubmit\":[$_h],\"UserPromptExpansion\":[$_h],\"MessageDisplay\":[$_h],\"PreToolUse\":[$_t],\"PostToolUse\":[$_t],\"Stop\":[$_h],\"SessionStart\":[$_h],\"SessionEnd\":[$_h],\"PreCompact\":[$_h],\"Notification\":[$_h]}}"
-  SETTINGS_ARGS=(--settings "$HOOKS_JSON")
-  echo "obs hooks: → $OBS_ENDPOINT/ingest/claude-code-hooks (collector)"
-else
+if [ -z "$OBS_ENDPOINT" ]; then
   echo "obs hooks: not registered (no export endpoint — set observability.export or SUTANDO_OBS_ENDPOINT to enable capture)"
+elif ! command -v node > /dev/null 2>&1; then
+  echo "obs hooks: node unavailable — cannot safely build --settings JSON; capture disabled this session" >&2
+else
+  HOOKS_JSON="$(node "$REPO/src/adapters/executor/claude-code/hooks/build-hook-settings.mjs" "$REPO/src/adapters/executor/claude-code/hooks/obs-hook.sh")"
+  if [ -n "$HOOKS_JSON" ]; then
+    SETTINGS_ARGS=(--settings "$HOOKS_JSON")
+    echo "obs hooks: → $OBS_ENDPOINT/ingest/claude-code-hooks (collector)"
+  else
+    echo "obs hooks: settings build failed — capture disabled this session" >&2
+  fi
 fi
 
 # ---- obs metering (CC native OTel token + cost) -----------------------------
