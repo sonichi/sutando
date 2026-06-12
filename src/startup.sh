@@ -394,6 +394,46 @@ else
   echo "  ~ telegram bridge (no token — optional)"
 fi
 
+# AG2 onboarding (request-and-approve / invite): no AG2_REMOTE_TOKEN yet and
+# we're interactive -> offer to redeem an invite right here. The invite string
+# carries the service address ("https://<base>|<code>"), so nothing
+# service-specific lives in this repo. Non-interactive runs skip silently.
+if [ -z "${AG2_REMOTE_TOKEN:-}" ] && [ -t 0 ]; then
+  printf '  AG2 invite string (https://...|code — Enter to skip): '
+  read -r _AG2_INVITE || _AG2_INVITE=""
+  if [ -n "$_AG2_INVITE" ] && [[ "$_AG2_INVITE" == *"|"* ]]; then
+    _AG2_BASE="${_AG2_INVITE%%|*}"; _AG2_CODE="${_AG2_INVITE#*|}"
+    _FUN_A=(swift quiet lucky cosmic mellow brave nimble sunny)
+    _FUN_B=(falcon otter lynx comet willow ember harbor sparrow)
+    _FUN_NAME="${_FUN_A[$((RANDOM % 8))]}-${_FUN_B[$((RANDOM % 8))]}"
+    printf '  Agent username [Enter = %s]: ' "$_FUN_NAME"
+    read -r _AG2_USER || _AG2_USER=""
+    _AG2_USER="${_AG2_USER:-$_FUN_NAME}"
+    printf '  Password for your platform login (min 8 chars): '
+    read -rs _AG2_PASS; echo
+    _AG2_RESP=$(curl -sf -X POST "$_AG2_BASE/redeem" -H 'content-type: application/json'       -d "{\"invite\": \"$_AG2_CODE\", \"username\": \"$_AG2_USER\", \"password\": \"$_AG2_PASS\"}" 2>/dev/null) || _AG2_RESP=""
+    _AG2_ENVLINE=$(printf '%s' "$_AG2_RESP" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("env_line") or "")
+except Exception: print("")' 2>/dev/null)
+    if [ -n "$_AG2_ENVLINE" ]; then
+      printf '\n%s\n' "$_AG2_ENVLINE" >> .env
+      export "$_AG2_ENVLINE"
+      echo "  ✓ onboarded — saved to .env"
+      printf '%s' "$_AG2_RESP" | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+print("    your agent:", d.get("agent_id",""))
+print("    your account:", d.get("matrix_id",""), "(log in with the password you just set)")
+codes=d.get("invite_codes") or []
+if codes:
+    print("    invite codes for friends (single-use):")
+    base=sys.argv[1]
+    [print("      " + base + "|" + c) for c in codes]' "$_AG2_BASE" 2>/dev/null || true
+    else
+      echo "  ✗ onboarding failed (invalid/used invite, taken username, or network) — continuing without"
+    fi
+  fi
+fi
+
 # AG2 remote relay client. One env var is the whole config:
 # AG2_REMOTE_TOKEN (the onboarding string carries the relay URL).
 if [ -n "${AG2_REMOTE_TOKEN:-}" ]; then
