@@ -456,6 +456,15 @@ except Exception: print("")' 2>/dev/null)
       _AG2_KEY="${_AG2_ENVLINE%%=*}"; _AG2_VAL="${_AG2_ENVLINE#*=}"
       printf "\n%s='%s'\n" "$_AG2_KEY" "$_AG2_VAL" >> .env
       export "$_AG2_KEY=$_AG2_VAL"
+      # Persist the agent identity too (owner ask 2026-06-13) — quoted, since
+      # matrix ids contain ':' and tools sourcing .env should get clean values.
+      _AG2_AGENT=$(printf '%s' "$_AG2_RESP" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("agent_id") or "")
+except Exception: print("")' 2>/dev/null)
+      if [ -n "$_AG2_AGENT" ]; then
+        printf "AG2_AGENT_NAME='%s'\n" "$_AG2_AGENT" >> .env
+        export "AG2_AGENT_NAME=$_AG2_AGENT"
+      fi
       # Persist the summary — it scrolled off-screen on the first live test.
       _AG2_SUMMARY="ag2-onboarding.txt"
       printf '%s' "$_AG2_RESP" | python3 -c 'import json,sys
