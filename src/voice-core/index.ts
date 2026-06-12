@@ -23,7 +23,11 @@
 
 // v2 (2026-06-12): + session-recovery (reconnectGreeting,
 // shouldRestoreActiveOnReconnect — Susan's #susan ruling: reconnect policy
-// lives upstream once; surfaces keep their own provenance state).
+// lives upstream once; surfaces keep their own provenance state) and
+// + modeCriticalRules in prompts (item 3 selector — surfaces REUSE the
+// mode-conditional rule selection instead of re-implementing the ternary;
+// same Susan ruling, applied to the meeting-rule remediation). v2 is
+// unreleased — both additions ship in the same pin.
 export const VOICE_CORE_API_VERSION = 2;
 
 export {
@@ -48,6 +52,7 @@ export {
 	RULE_MEETING_AVAILABLE,
 	RULE_MEETING_ANSWER_DIRECT,
 	RULE_WHEN_IN_DOUBT,
+	modeCriticalRules,
 } from './prompts.js';
 
 export {

@@ -178,6 +178,12 @@ describe('voice-core e2e', () => {
 		);
 	});
 
+	it('modeCriticalRules: shared mode-conditional selection (v2, item 3 selector)', async () => {
+		const p = await import('../src/voice-core/prompts.js');
+		assert.deepEqual(p.modeCriticalRules(true), [p.RULE_MEETING_ACTIVE, p.RULE_MEETING_ANSWER_DIRECT]);
+		assert.deepEqual(p.modeCriticalRules(false), [p.RULE_MEETING_AVAILABLE, p.RULE_WHEN_IN_DOUBT]);
+	});
+
 	it('session-recovery: reconnect policy (v2 surface item 6)', async () => {
 		const { reconnectGreeting, shouldRestoreActiveOnReconnect } = await import('../src/voice-core/session-recovery.js');
 		// meeting wins over everything — stay the silent note-taker

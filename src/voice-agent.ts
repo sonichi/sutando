@@ -37,7 +37,7 @@ import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { VoiceSession } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
-import { createModeState, makeSwitchModeTool, makeSaveMeetingNoteTool, RULE_MEETING_ACTIVE, RULE_MEETING_AVAILABLE, RULE_MEETING_ANSWER_DIRECT, RULE_WHEN_IN_DOUBT, reconnectGreeting } from './voice-core/index.js';
+import { createModeState, makeSwitchModeTool, makeSaveMeetingNoteTool, modeCriticalRules, reconnectGreeting } from './voice-core/index.js';
 import { RULE_PRESENTER_MODE, RULE_GOODBYE, RULE_FILLERS_NOT_REQUESTS, RULE_NEVER_PRETEND, RULE_NEVER_REFUSE, RULE_SIMPLE_ACTIONS, RULE_INPLACE_EDITS, RULE_COMPLEX_OPS, RULE_ANSWER_DIRECTLY, RULE_DEICTIC, RULE_MISSING_CONTEXT, RULE_MISHEARD_CONFIRM } from './voice-agent-prompts.js';
 function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
 import { workTool, startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
@@ -655,7 +655,7 @@ const mainAgent: MainAgent = {
 		] : []),
 		'',
 		'CRITICAL RULES:',
-		(() => modeState.isMeeting() ? RULE_MEETING_ACTIVE : RULE_MEETING_AVAILABLE)(),
+		modeCriticalRules(modeState.isMeeting())[0],
 		RULE_PRESENTER_MODE,
 		RULE_GOODBYE,
 		RULE_FILLERS_NOT_REQUESTS,
@@ -668,7 +668,7 @@ const mainAgent: MainAgent = {
 		RULE_DEICTIC,
 		RULE_MISSING_CONTEXT,
 		RULE_MISHEARD_CONFIRM,
-		(() => modeState.isMeeting() ? RULE_MEETING_ANSWER_DIRECT : RULE_WHEN_IN_DOUBT)(),
+		modeCriticalRules(modeState.isMeeting())[1],
 		'',
 		'VOICE RULES:',
 		'- Keep responses to 2–3 sentences. You are talking, not writing.',
