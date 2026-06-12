@@ -394,26 +394,60 @@ else
   echo "  ~ telegram bridge (no token — optional)"
 fi
 
-# AG2 onboarding (request-and-approve / invite): no AG2_REMOTE_TOKEN yet and
-# we're interactive -> offer to redeem an invite right here. The invite string
-# carries the service address ("https://<base>|<code>"), so nothing
-# service-specific lives in this repo. Non-interactive runs skip silently.
+# AG2 onboarding: no AG2_REMOTE_TOKEN and we're interactive -> offer to
+# connect right here. ONE prompt, the input shape picks the journey:
+#   "https://<base>|<code>"  -> new user: redeem invite (creates account+agent)
+#   "https://<base>"         -> existing user: log in, claim/reconnect agent
+# The address travels in the pasted string — nothing service-specific lives
+# in this repo. Non-interactive runs skip silently; failure never blocks.
 if [ -z "${AG2_REMOTE_TOKEN:-}" ] && [ -t 0 ]; then
-  printf '  AG2 invite string (https://...|code — Enter to skip): '
-  read -r _AG2_INVITE || _AG2_INVITE=""
-  if [ -n "$_AG2_INVITE" ] && [[ "$_AG2_INVITE" == *"|"* ]]; then
-    _AG2_BASE="${_AG2_INVITE%%|*}"; _AG2_CODE="${_AG2_INVITE#*|}"
+  printf '  AG2 onboarding string or platform address (Enter to skip): '
+  read -r _AG2_IN || _AG2_IN=""
+  _AG2_RESP=""
+  _AG2_BASE=""
+  if [ -n "$_AG2_IN" ] && [[ "$_AG2_IN" == *"|"* ]]; then
+    # New-user journey: invite redeem (account + agent + token in one shot).
+    _AG2_BASE="${_AG2_IN%%|*}"; _AG2_CODE="${_AG2_IN#*|}"
     _FUN_A=(swift quiet lucky cosmic mellow brave nimble sunny)
     _FUN_B=(falcon otter lynx comet willow ember harbor sparrow)
     _FUN_NAME="${_FUN_A[$((RANDOM % 8))]}-${_FUN_B[$((RANDOM % 8))]}"
     printf '  Agent username [Enter = %s]: ' "$_FUN_NAME"
     read -r _AG2_USER || _AG2_USER=""
     _AG2_USER="${_AG2_USER:-$_FUN_NAME}"
-    printf '  Password for your platform login (min 8 chars): '
+    printf '  Choose a password for your NEW platform login (min 8 chars): '
     read -rs _AG2_PASS; echo
-    _AG2_RESP=$(curl -sf -X POST "$_AG2_BASE/redeem" -H 'content-type: application/json'       -d "{\"invite\": \"$_AG2_CODE\", \"username\": \"$_AG2_USER\", \"password\": \"$_AG2_PASS\"}" 2>/dev/null) || _AG2_RESP=""
+    _AG2_RESP=$(curl -sf -X POST "$_AG2_BASE/redeem" -H 'content-type: application/json' \
+      -d "{\"invite\": \"$_AG2_CODE\", \"username\": \"$_AG2_USER\", \"password\": \"$_AG2_PASS\"}" 2>/dev/null) || _AG2_RESP=""
+  elif [ -n "$_AG2_IN" ]; then
+    # Existing-user journey: validate platform credentials, then claim (or
+    # reconnect to) their agent — no new account, no new password.
+    _AG2_BASE="${_AG2_IN%/}"
+    printf '  Platform username: '
+    read -r _AG2_USER || _AG2_USER=""
+    printf '  Platform password: '
+    read -rs _AG2_PASS; echo
+    _AG2_SESS=$(curl -sf -X POST "$_AG2_BASE/user-login" -H 'content-type: application/json' \
+      -d "{\"username\": \"$_AG2_USER\", \"password\": \"$_AG2_PASS\"}" 2>/dev/null \
+      | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("user_session_token") or "")
+except Exception: print("")' 2>/dev/null)
+    if [ -n "$_AG2_SESS" ]; then
+      # action=list reconnects a returning user to their existing agent;
+      # first-timers fall through server-side to auto-create one.
+      _AG2_RESP=$(curl -sf -X POST "$_AG2_BASE/claim-agent" -H 'content-type: application/json' \
+        -d "{\"user_session_token\": \"$_AG2_SESS\", \"action\": \"list\", \"auto_spawn\": false}" 2>/dev/null) || _AG2_RESP=""
+    else
+      echo "  ✗ login failed (bad credentials or rate limit) — continuing without"
+    fi
+  fi
+  if [ -n "$_AG2_RESP" ]; then
     _AG2_ENVLINE=$(printf '%s' "$_AG2_RESP" | python3 -c 'import json,sys
-try: print(json.load(sys.stdin).get("env_line") or "")
+try:
+    d = json.load(sys.stdin)
+    line = d.get("env_line")
+    if not line and d.get("relay_url") and (d.get("relay_token") or d.get("bearer")):
+        line = "AG2_REMOTE_TOKEN=%s|%s" % (d["relay_url"], d.get("relay_token") or d.get("bearer"))
+    print(line or "")
 except Exception: print("")' 2>/dev/null)
     if [ -n "$_AG2_ENVLINE" ]; then
       # Single-quote the value in .env — the combined token contains a pipe
@@ -422,16 +456,21 @@ except Exception: print("")' 2>/dev/null)
       _AG2_KEY="${_AG2_ENVLINE%%=*}"; _AG2_VAL="${_AG2_ENVLINE#*=}"
       printf "\n%s='%s'\n" "$_AG2_KEY" "$_AG2_VAL" >> .env
       export "$_AG2_KEY=$_AG2_VAL"
-      echo "  ✓ onboarded — saved to .env"
+      # Persist the summary — it scrolled off-screen on the first live test.
+      _AG2_SUMMARY="ag2-onboarding.txt"
       printf '%s' "$_AG2_RESP" | python3 -c 'import json,sys
-d=json.load(sys.stdin)
-print("    your agent:", d.get("agent_id",""))
-print("    your account:", d.get("matrix_id",""), "(log in with the password you just set)")
-codes=d.get("invite_codes") or []
+d = json.load(sys.stdin)
+out = ["AG2 onboarding — keep this file private (it lists your invite codes)", ""]
+if d.get("agent_id"): out.append("your agent:   " + d["agent_id"])
+if d.get("matrix_id"): out.append("your account: " + d["matrix_id"])
+codes = d.get("invite_codes") or []
 if codes:
-    print("    invite codes for friends (single-use):")
-    base=sys.argv[1]
-    [print("      " + base + "|" + c) for c in codes]' "$_AG2_BASE" 2>/dev/null || true
+    out.append("")
+    out.append("single-use invite codes for friends:")
+    out += ["  " + sys.argv[1] + "|" + c for c in codes]
+print("\n".join(out))' "$_AG2_BASE" > "$_AG2_SUMMARY" 2>/dev/null || true
+      echo "  ✓ onboarded — token saved to .env; details in $_AG2_SUMMARY"
+      sed 's/^/    /' "$_AG2_SUMMARY" 2>/dev/null || true
     else
       echo "  ✗ onboarding failed (invalid/used invite, taken username, or network) — continuing without"
     fi
