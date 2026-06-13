@@ -48,6 +48,33 @@ _ARG_IN="${1:-}"; _ARG_NAME="${2:-}"; _ARG_PASS="${3:-${AG2_ONBOARD_PASSWORD:-}}
       -d "$(printf '%s\0%s\0%s' "$_AG2_CODE" "$_AG2_USER" "$_AG2_PASS" | python3 -c 'import json,sys; v=sys.stdin.read().split(chr(0)); print(json.dumps({"invite": v[0], "username": v[1], "password": v[2]}))')" 2>/dev/null) || _AG2_RESP=""
   elif [ -n "$_AG2_IN" ]; then
     _AG2_BASE="${_AG2_IN%/}"
+    # North-star (device-authorization flow): open a browser to log in — no
+    # credentials typed in the terminal. Interactive human path only; the
+    # agent-driven CLI path (password supplied as arg) skips straight to login.
+    if [ -z "$_ARG_PASS" ] && [ -t 0 ]; then
+      _DS=$(curl -sf -X POST "$_AG2_BASE/connect/start" -H 'content-type: application/json' -d '{}' 2>/dev/null)
+      _DC=$(printf '%s' "$_DS" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("device_code",""))' 2>/dev/null)
+      _VU=$(printf '%s' "$_DS" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("verify_url",""))' 2>/dev/null)
+      if [ -n "$_DC" ] && [ -n "$_VU" ]; then
+        echo "  Opening your browser to log in:"
+        echo "    $_VU"
+        { command -v open >/dev/null 2>&1 && open "$_VU"; } 2>/dev/null \
+          || { command -v xdg-open >/dev/null 2>&1 && xdg-open "$_VU"; } 2>/dev/null \
+          || echo "  (couldn't auto-open — paste that URL into a browser)"
+        printf '  Waiting for you to finish logging in'
+        _DEADLINE=$(( $(date +%s) + 900 ))
+        while [ "$(date +%s)" -lt "$_DEADLINE" ]; do
+          _PR=$(curl -sf -X POST "$_AG2_BASE/connect/poll" -H 'content-type: application/json' \
+            -d "$(printf '%s' "$_DC" | python3 -c 'import json,sys;print(json.dumps({"device_code":sys.stdin.read()}))')" 2>/dev/null)
+          if printf '%s' "$_PR" | python3 -c 'import json,sys;sys.exit(0 if json.load(sys.stdin).get("bearer") else 1)' 2>/dev/null; then
+            _AG2_RESP="$_PR"; echo " - done."; break
+          fi
+          printf '.'; sleep 3
+        done
+        [ -n "$_AG2_RESP" ] || { echo; echo "  (browser login didn't complete — you can type credentials instead)"; }
+      fi
+    fi
+    if [ -z "$_AG2_RESP" ]; then
     # Bare address: existing-account login, or request access (no invite yet).
     printf '  Do you already have a platform account? (y/N): '
     read -r _AG2_HAS || _AG2_HAS=""
@@ -106,6 +133,7 @@ except Exception: print("")' 2>/dev/null)
       fi
     else
       echo "  ✗ login failed (bad credentials or rate limit) — continuing without"
+    fi
     fi
   fi
   if [ -n "$_AG2_RESP" ]; then

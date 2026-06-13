@@ -30,8 +30,10 @@ bash skills/ag2-relay/onboard.sh
 One prompt; what you paste picks the journey:
 - `https://<base>|<code>` — new user: redeems the invite (creates your
   platform account + agent + token; you choose a password for the platform).
-- `https://<base>` — existing user: log in with your platform credentials,
-  then name this instance (Enter reconnects to your existing agent).
+- `https://<base>` — existing user, **interactive human**: opens a browser
+  to log in (device-authorization flow — no password typed in the terminal),
+  polls until you finish, writes the token. Falls back to CLI username/password
+  if no browser/tty.
 - `https://<base>` + no account yet — request access (email/name/reason);
   once the operator approves you'll receive an invite to finish with.
 
