@@ -707,6 +707,30 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 					}, 5_000);
 					continue;
 				}
+				// Skip markers: [no-send] / [REPLIED] — archive silently with no voice narration.
+				// These are set by the core agent when delivery already happened via another path
+				// (e.g. Discord bridge already replied) or the result should be suppressed entirely.
+				// Parity with Python bridges: discord-bridge.py and telegram-bridge.py both honor
+				// these via parse_markers(); task-bridge.ts must too (issue #1381).
+				if (file.startsWith('task-') && /^\s*\[(?:no-send|REPLIED)\]/i.test(result)) {
+					console.log(`${ts()} [TaskBridge] ${taskId} has skip marker; archiving silently`);
+					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
+					_deliveredResults.add(file);
+					_pendingTasks.delete(taskId);
+					try {
+						fetch('http://localhost:7843/task-done', {
+							method: 'POST',
+							headers: _apiHeaders(),
+							body: JSON.stringify({ taskId, result }),
+						}).catch(() => {});
+					} catch {}
+					setTimeout(() => {
+						archiveFile(path, 'results', taskId);
+						const taskFile = join(TASK_DIR, `${taskId}.txt`);
+						if (existsSync(taskFile)) archiveFile(taskFile, 'tasks', taskId);
+					}, 5_000);
+					continue;
+				}
 				// Voice client offline → forward voice-task results to Discord DM
 				// via a proactive-result-*.txt file (poll_proactive in
 				// discord-bridge.py picks it up and DMs the owner). Skips files
