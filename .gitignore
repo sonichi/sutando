@@ -107,3 +107,5 @@ sutando.config.local.json
 # clones for a zero-config first run.
 workspace/*
 !workspace/.gitkeep
+# AG2 onboarding summary — private (invite codes + ids)
+ag2-onboarding.txt
