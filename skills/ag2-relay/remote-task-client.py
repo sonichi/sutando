@@ -94,6 +94,10 @@ def _req(method: str, path: str, payload: dict | None = None, timeout: int = 35)
     req = urllib.request.Request(f"{URL}{path}", data=data, method=method)
     req.add_header("Authorization", f"Bearer {TOKEN}")
     req.add_header("Accept", "application/json")
+    # CloudFlare bot-fight (error 1010) rejects python-urllib's default
+    # User-Agent with a 403; send an explicit client UA so the relay's edge
+    # lets the long-poll through. (Same fix the other relay callers carry.)
+    req.add_header("User-Agent", "sutando-relay-client/1.0")
     if data is not None:
         req.add_header("Content-Type", "application/json")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
