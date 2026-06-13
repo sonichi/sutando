@@ -76,8 +76,32 @@ def test_gate_ungated_on_bot_mentioned():
         "auto-seed gate not found in expected form `if isinstance(message.channel, discord.Thread):`"
 
 
+def test_seed_refreshes_require_mention_gate():
+    """After seeding, the local require_mention gate must be refreshed.
+
+    require_mention is computed by load_channel_config BEFORE the seed
+    exists, so without an in-place refresh the seeding message itself is
+    still dropped at the `if require_mention and not bot_mentioned` gate —
+    the ep013 first-message drop was only half-fixed by the ungate (thread
+    seeded, triggering message lost). Guard: a require_mention reassignment
+    referencing thread_entry must appear between the atomic access.json
+    write and the requireMention skip gate.
+    """
+    src = _src()
+    write_idx = src.find("os.replace(tmp_path, ACCESS_FILE)")
+    assert write_idx != -1, "atomic access.json write marker missing"
+    gate_idx = src.find("if require_mention and not bot_mentioned", write_idx)
+    assert gate_idx != -1, "requireMention skip gate missing after seed block"
+    refresh = re.compile(r"require_mention\s*=\s*require_mention\s+and\s+.*thread_entry")
+    assert refresh.search(src[write_idx:gate_idx]), \
+        "REGRESSION: seed block no longer refreshes require_mention — " \
+        "the seeding message itself will be dropped at the requireMention " \
+        "gate unless it @-mentions the bot (half-fixed ep013 drop class)."
+
+
 def main():
-    tests = [test_auto_seed_block_exists, test_gate_ungated_on_bot_mentioned]
+    tests = [test_auto_seed_block_exists, test_gate_ungated_on_bot_mentioned,
+             test_seed_refreshes_require_mention_gate]
     passed, failed = 0, 0
     for t in tests:
         try:

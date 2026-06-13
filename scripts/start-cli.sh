@@ -58,9 +58,35 @@ if [ "$1" = "--restart" ]; then
   fi
 fi
 
+# Sutando-friendly tmux defaults (mouse scrollback + alt-screen wheel fix).
+# Defined as a function so it runs on EVERY invocation — including the
+# "already running → attach" path below. 2026-06-11: Chi's scroll broke
+# again because the live server (started 2026-05-30) somehow lacked these
+# options even though #688/#1304 predate it; rather than depend on the
+# session-creation path alone, re-apply on every start/attach/restart so
+# any rerun of this script heals the server. Idempotent: re-applying to an
+# already-configured server is a no-op.
+apply_tmux_defaults() {
+  command -v tmux > /dev/null 2>&1 || return 0
+  tmux -S "$TMUX_SOCKET" start-server 2>/dev/null || true
+  tmux -S "$TMUX_SOCKET" set-option -g mouse on 2>/dev/null || true
+  # Wheel-scroll fix (sutando-plus#46, re-broken 2026-06-11): predicate on
+  # mouse_any_flag, NOT alternate_on. Claude Code 2.1.150 stopped using the
+  # alternate screen, so the old alt-screen predicate forwarded wheel events
+  # to an app that never requested mouse input — they were silently dropped
+  # and scrollback became unreachable. mouse_any_flag asks the question we
+  # actually care about: does the pane app WANT mouse events? If yes (vim
+  # with mouse=a, future Claude Code versions), forward them; if no, enter
+  # copy-mode so WheelUp always reaches tmux scrollback regardless of the
+  # app's screen mode. WheelDown passes through so normal scrolling works.
+  tmux -S "$TMUX_SOCKET" bind -n WheelUpPane if-shell -F -t = '#{mouse_any_flag}' 'send-keys -M' 'copy-mode -e; send-keys -M' 2>/dev/null || true
+  tmux -S "$TMUX_SOCKET" bind -n WheelDownPane send-keys -M 2>/dev/null || true
+}
+
 # Already running — attach if interactive, else exit cleanly. This branch
 # also catches the !--restart path so re-running the script is idempotent.
 if pgrep -f "claude.*--name.*$SESSION" > /dev/null 2>&1; then
+  apply_tmux_defaults
   if [ -t 1 ] && command -v tmux > /dev/null 2>&1; then
     echo "Attaching to existing $SESSION (Ctrl-b d to detach)..."
     exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
@@ -90,27 +116,13 @@ fi
 # same tmux server as the user shell (per #PR_444 watcher-auto-restart).
 #
 # Sutando-friendly tmux defaults — applied to the server before the session
-# attaches. `mouse on` lets users two-finger scrollback in the Claude Code
-# pane (the default behavior, where Up-arrow goes to readline history and
-# you can't easily review prior agent output, is confusing for new installs).
+# attaches (see apply_tmux_defaults above for the full rationale).
 #
 # Tradeoff: `mouse on` intercepts native Cmd+drag text selection in the pane.
 # To copy text the macOS-native way, hold Option while dragging (Terminal.app,
 # iTerm2, Ghostty all honor Option-drag as a tmux-bypass). Documenting here
 # so future readers don't think this is a regression.
-#
-# Idempotent: re-running it on an already-configured server is a no-op.
-tmux -S "$TMUX_SOCKET" start-server 2>/dev/null || true
-tmux -S "$TMUX_SOCKET" set-option -g mouse on 2>/dev/null || true
-# Wheel-scroll fix for alternate-screen TUIs (Claude Code, vim, etc.):
-# `mouse on` alone doesn't help because Claude Code consumes wheel events in
-# alternate-screen mode before tmux can enter copy-mode. These two bindings
-# force copy-mode on WheelUp when the pane is running an alternate-screen app
-# so the user gets tmux scrollback instead of a no-op.
-# WheelDown is passed through so normal (non-alt-screen) scrolling still works.
-# Fixes sutando-plus#46.
-tmux -S "$TMUX_SOCKET" bind -n WheelUpPane if-shell -F -t = '#{alternate_on}' 'copy-mode -e; send-keys -M' 'send-keys -M' 2>/dev/null || true
-tmux -S "$TMUX_SOCKET" bind -n WheelDownPane send-keys -M 2>/dev/null || true
+apply_tmux_defaults
 #
 # Branch on whether we have a TTY:
 #   - TTY (user running from terminal): exec attach so the user sees the

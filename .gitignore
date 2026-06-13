@@ -94,3 +94,6 @@ voice-state.json
 
 # Single-instance lock written by src/voice-agent.ts (acquirePidLock).
 .voice-agent.pid
+
+# AG2 onboarding summary — private (invite codes + ids)
+ag2-onboarding.txt

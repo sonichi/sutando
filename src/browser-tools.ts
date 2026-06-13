@@ -422,15 +422,12 @@ export const clickTool: ToolDefinition = {
 				const cmd = modifiers
 					? `tell application "System Events" to keystroke ${keyCode} using {${modifiers}}`
 					: `tell application "System Events" to keystroke ${keyCode}`;
-				execSync(`osascript -e '${cmd}'`, { timeout: 5_000 });
+				execFileSync('osascript', ['-e', cmd], { timeout: 5_000 });
 				console.log(`${ts()} [Click] shortcut: ${shortcut}`);
 				return { status: 'pressed', shortcut };
 			}
 			if (x != null && y != null) {
-				execSync(`osascript -e '
-					tell application "System Events"
-						click at {${Math.round(x)}, ${Math.round(y)}}
-					end tell'`, { timeout: 5_000 });
+				execFileSync('osascript', ['-e', `tell application "System Events"\n\tclick at {${Math.round(x)}, ${Math.round(y)}}\nend tell`], { timeout: 5_000 });
 				console.log(`${ts()} [Click] at (${x}, ${y})`);
 				return { status: 'clicked', x, y };
 			}
