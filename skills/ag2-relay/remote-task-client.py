@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -84,6 +85,24 @@ if LOCAL_TIER not in ("owner", "team", "other"):
     LOCAL_TIER = "team"
 
 
+# Blocker (review 2026-06-13): the relay is untrusted, so a task `id` flows
+# into filesystem paths (task write + result read-back/POST). Reject anything
+# that isn't a plain slug — kills path traversal in both directions.
+_TID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+def _valid_tid(tid: str) -> bool:
+    return bool(_TID_RE.fullmatch(tid)) and tid not in (".", "..")
+
+
+def _one_line(value) -> str:
+    """Header-safe single-line value: CR/LF stripped so a relay-controlled
+    field can't inject extra `key: value` lines (e.g. forge a second
+    access_tier). Applied to every field — task content is single-line in
+    practice and a stray newline only ever indicates an injection attempt."""
+    return str(value).replace("\r", " ").replace("\n", " ")
+
+
 def _log(msg: str) -> None:
     print(f"[remote-task-client] {msg}", flush=True)
 
@@ -112,18 +131,24 @@ def _write_task(task: dict) -> str | None:
     if not tid:
         _log("dropping task with no id")
         return None
+    if not _valid_tid(tid):
+        _log(f"dropping task with unsafe id {tid!r}")
+        return None
     dest = TASKS_DIR / f"{tid}.txt"
     # Idempotent: don't re-write a task already queued, claimed, or archived.
     if dest.exists() or any(TASKS_DIR.glob(f"{tid}.claimed-*")):
         return tid
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
     lines = []
-    lines.append(f"access_tier: {LOCAL_TIER}")
     for f in _TASK_FIELDS:
         if f == "source":
-            lines.append(f"source: {task.get('source') or PROVIDER}")
+            lines.append(f"source: {_one_line(task.get('source') or PROVIDER)}")
         elif f in task and task[f] not in (None, ""):
-            lines.append(f"{f}: {task[f]}")
+            lines.append(f"{f}: {_one_line(task[f])}")
+    # access_tier is a LOCAL decision and written LAST so it wins even under a
+    # last-occurrence parser; every other field is newline-stripped so none can
+    # forge an earlier one either.
+    lines.append(f"access_tier: {LOCAL_TIER}")
     tmp = dest.with_suffix(".txt.tmp")
     tmp.write_text("\n".join(lines) + "\n")
     tmp.rename(dest)  # atomic publish so the watcher never sees a partial file
@@ -166,10 +191,23 @@ def _post_ready_results(inflight: set[str]) -> None:
     """For each in-flight task, if its result file exists, POST it + archive."""
     changed = False
     for tid in list(inflight):
+        if not _valid_tid(tid):  # defense-in-depth: never read an unsafe path
+            inflight.discard(tid); changed = True
+            continue
         rfile = RESULTS_DIR / f"{tid}.txt"
         if not rfile.exists():
             continue
         body = rfile.read_text().strip()
+        # Result-body protocol markers are a local bridge concern — never ship
+        # them to the relay. [no-send]/[deduped:] mean "no user-facing reply":
+        # archive without POSTing (match the other bridges' semantics).
+        low = body.lower()
+        if low.startswith("[no-send]") or low.startswith("[deduped:"):
+            _archive_result(rfile, tid)
+            inflight.discard(tid)
+            changed = True
+            _log(f"archived {tid} (marker, not sent)")
+            continue
         try:
             _req("POST", "/v1/results", {"id": tid, "body": body})
         except urllib.error.HTTPError as e:

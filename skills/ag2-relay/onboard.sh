@@ -45,7 +45,7 @@ _ARG_IN="${1:-}"; _ARG_NAME="${2:-}"; _ARG_PASS="${3:-${AG2_ONBOARD_PASSWORD:-}}
       read -rs _AG2_PASS; echo
     fi
     _AG2_RESP=$(curl -sf -X POST "$_AG2_BASE/redeem" -H 'content-type: application/json' \
-      -d "$(python3 -c 'import json,sys; print(json.dumps({"invite": sys.argv[1], "username": sys.argv[2], "password": sys.argv[3]}))' "$_AG2_CODE" "$_AG2_USER" "$_AG2_PASS")" 2>/dev/null) || _AG2_RESP=""
+      -d "$(printf '%s\0%s\0%s' "$_AG2_CODE" "$_AG2_USER" "$_AG2_PASS" | python3 -c 'import json,sys; v=sys.stdin.read().split(chr(0)); print(json.dumps({"invite": v[0], "username": v[1], "password": v[2]}))')" 2>/dev/null) || _AG2_RESP=""
   elif [ -n "$_AG2_IN" ]; then
     _AG2_BASE="${_AG2_IN%/}"
     # Bare address: existing-account login, or request access (no invite yet).
@@ -61,7 +61,7 @@ _ARG_IN="${1:-}"; _ARG_NAME="${2:-}"; _ARG_PASS="${3:-${AG2_ONBOARD_PASSWORD:-}}
       printf '  One line on why / who invited you: '
       read -r _AG2_WHY || _AG2_WHY=""
       _AG2_APPLY=$(curl -sf -X POST "$_AG2_BASE/apply" -H 'content-type: application/json' \
-        -d "$(python3 -c 'import json,sys; print(json.dumps({"email": sys.argv[1], "name": sys.argv[2], "reason": sys.argv[3]}))' "$_AG2_EMAIL" "$_AG2_NAME" "$_AG2_WHY")" 2>/dev/null) || _AG2_APPLY=""
+        -d "$(printf '%s\0%s\0%s' "$_AG2_EMAIL" "$_AG2_NAME" "$_AG2_WHY" | python3 -c 'import json,sys; v=sys.stdin.read().split(chr(0)); print(json.dumps({"email": v[0], "name": v[1], "reason": v[2]}))')" 2>/dev/null) || _AG2_APPLY=""
       if [ -n "$_AG2_APPLY" ]; then
         echo "  ✓ request submitted — once approved you'll receive an invite; rerun this script with it"
       else
@@ -83,7 +83,7 @@ _ARG_IN="${1:-}"; _ARG_NAME="${2:-}"; _ARG_PASS="${3:-${AG2_ONBOARD_PASSWORD:-}}
       read -rs _AG2_PASS; echo
     fi
     _AG2_SESS=$(curl -sf -X POST "$_AG2_BASE/user-login" -H 'content-type: application/json' \
-      -d "$(python3 -c 'import json,sys; print(json.dumps({"username": sys.argv[1], "password": sys.argv[2]}))' "$_AG2_USER" "$_AG2_PASS")" 2>/dev/null \
+      -d "$(printf '%s\0%s' "$_AG2_USER" "$_AG2_PASS" | python3 -c 'import json,sys; v=sys.stdin.read().split(chr(0)); print(json.dumps({"username": v[0], "password": v[1]}))')" 2>/dev/null \
       | python3 -c 'import json,sys
 try: print(json.load(sys.stdin).get("user_session_token") or "")
 except Exception: print("")' 2>/dev/null)
@@ -99,10 +99,10 @@ except Exception: print("")' 2>/dev/null)
       fi
       if [ -n "$_AG2_LABEL" ]; then
         _AG2_RESP=$(curl -sf -X POST "$_AG2_BASE/claim-agent" -H 'content-type: application/json' \
-          -d "$(python3 -c 'import json,sys; print(json.dumps({"user_session_token": sys.argv[1], "action": "create", "label": sys.argv[2], "auto_spawn": False}))' "$_AG2_SESS" "$_AG2_LABEL")" 2>/dev/null) || _AG2_RESP=""
+          -d "$(printf '%s\0%s' "$_AG2_SESS" "$_AG2_LABEL" | python3 -c 'import json,sys; v=sys.stdin.read().split(chr(0)); print(json.dumps({"user_session_token": v[0], "action": "create", "label": v[1], "auto_spawn": False}))')" 2>/dev/null) || _AG2_RESP=""
       else
         _AG2_RESP=$(curl -sf -X POST "$_AG2_BASE/claim-agent" -H 'content-type: application/json' \
-          -d "$(python3 -c 'import json,sys; print(json.dumps({"user_session_token": sys.argv[1], "action": "list", "auto_spawn": False}))' "$_AG2_SESS")" 2>/dev/null) || _AG2_RESP=""
+          -d "$(printf '%s' "$_AG2_SESS" | python3 -c 'import json,sys; print(json.dumps({"user_session_token": sys.stdin.read(), "action": "list", "auto_spawn": False}))')" 2>/dev/null) || _AG2_RESP=""
       fi
     else
       echo "  ✗ login failed (bad credentials or rate limit) — continuing without"

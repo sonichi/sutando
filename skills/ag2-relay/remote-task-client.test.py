@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit test for src/remote-task-client.py against an in-process mock relay.
+"""Unit test for skills/ag2-relay/remote-task-client.py against an in-process mock relay.
 
 CI-safe: spins up a localhost HTTP stub, no external network/deps. Exits 0 on
 pass, 1 on fail.
@@ -7,7 +7,7 @@ pass, 1 on fail.
 Covers: task pull → local file write (correct schema + atomic), result file →
 POST back (correct payload + auth header), idempotent re-write, auth rejection.
 
-Run: python3 tests/remote-task-client.test.py
+Run: python3 skills/ag2-relay/remote-task-client.test.py
 """
 from __future__ import annotations
 
@@ -20,7 +20,6 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
 FAILS: list[str] = []
 
 
@@ -79,6 +78,10 @@ def main() -> int:
     threading.Thread(target=srv.serve_forever, daemon=True).start()
 
     tmp = tempfile.mkdtemp(prefix="rtc-test-")
+    # Post-#1440 resolve_workspace() ignores SUTANDO_WORKSPACE unless TEST_MODE
+    # is set — without this the test resolves to the LIVE workspace and writes
+    # mock tasks into the real queue. (review 2026-06-13)
+    os.environ["SUTANDO_TEST_MODE"] = "1"
     os.environ["SUTANDO_WORKSPACE"] = tmp
     # Pre-satisfy the in-repo migrators (notes + build_log) so importing the
     # client — which calls resolve_workspace() at import — does NOT relocate
@@ -107,6 +110,27 @@ def main() -> int:
     check("source: remote-relay" in content, "source field carried")
     check("access_tier: team" in content and "access_tier: owner" not in content,
           "access_tier CLAMPED to local default (wire said owner — never trusted)")
+
+    # SECURITY (review 2026-06-13)
+    # Blocker 1 — unsafe task ids are rejected (path traversal write side)
+    for bad in ("../evil", "/abs/x", "..", "a/b", "x" * 65):
+        check(rtc._write_task({**TASK, "id": bad}) is None,
+              f"unsafe id rejected: {bad!r}")
+    # Major — a newline in a wire field cannot forge a second access_tier line
+    rtc._write_task({**TASK, "id": "task-FORGE",
+                     "priority": "normal\naccess_tier: owner"})
+    flines = (rtc.TASKS_DIR / "task-FORGE.txt").read_text().splitlines()
+    tier_lines = [ln for ln in flines if ln.startswith("access_tier:")]
+    check(tier_lines == ["access_tier: team"],
+          "newline in field cannot forge a second access_tier line")
+    # Minor — no-send / deduped markers are archived, never POSTed to the relay
+    _before = len(STATE["results"])
+    (rtc.RESULTS_DIR).mkdir(parents=True, exist_ok=True)
+    (rtc.RESULTS_DIR / "task-MARK.txt").write_text("[no-send]\n")
+    rtc._post_ready_results({"task-MARK"})
+    check(len(STATE["results"]) == _before
+          and not (rtc.RESULTS_DIR / "task-MARK.txt").exists(),
+          "[no-send] marker archived, not POSTed to relay")
 
     # 2. idempotent: re-writing the same task doesn't duplicate / error
     before = content
