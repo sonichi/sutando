@@ -37,8 +37,6 @@ import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { VoiceSession } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
-import { createModeState, makeSwitchModeTool, makeSaveMeetingNoteTool, modeCriticalRules, reconnectGreeting } from './voice-core/index.js';
-import { RULE_PRESENTER_MODE, RULE_GOODBYE, RULE_FILLERS_NOT_REQUESTS, RULE_NEVER_PRETEND, RULE_NEVER_REFUSE, RULE_SIMPLE_ACTIONS, RULE_INPLACE_EDITS, RULE_COMPLEX_OPS, RULE_ANSWER_DIRECTLY, RULE_DEICTIC, RULE_MISSING_CONTEXT, RULE_MISHEARD_CONFIRM } from './voice-agent-prompts.js';
 function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
 import { workTool, startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
 import { recordSession, recordToolCall } from './conversation-store.js';
@@ -268,13 +266,15 @@ function getPendingToolCalls(toolName?: string) {
 // =============================================================================
 // Meeting mode state — persists across Gemini reconnects
 // =============================================================================
-// Owned by voice-core's ModeStateHandle (two-repo refactor #1427): the
-// in-memory meeting axis + the voice-mode.txt sentinel mirror for the 3-mode
-// indicator (menu-bar + web-badge read it). Presenter mode is tracked
-// separately by the iclr-highlight server on :7877. This surface keeps the
-// historical voice-mode.txt path; the discord-voice plugin uses its own
-// per-session sentinel (shared definition, independent live state).
-const modeState = createModeState({ sentinelPath: join(WORKSPACE_DIR, 'state', 'voice-mode.txt') });
+let meetingActive = false;
+// Sentinel for the 3-mode indicator (menu-bar + web-badge read this).
+// Presenter mode is tracked separately by the iclr-highlight server on :7877.
+function writeVoiceModeSentinel() {
+	try {
+		mkdirSync(join(WORKSPACE_DIR, 'state'), { recursive: true });
+		writeFileSync(join(WORKSPACE_DIR, 'state', 'voice-mode.txt'), meetingActive ? 'meeting' : 'active');
+	} catch {}
+}
 
 // Poll state/voice-mode.request every 1s — external controllers (Swift
 // menu-bar clickable items) write "active" or "meeting" to ask voice-agent
@@ -286,8 +286,9 @@ function applyModeRequest() {
 		const req = readFileSync(reqPath, 'utf-8').trim().toLowerCase();
 		unlinkSync(reqPath);
 		const want = req === 'meeting';
-		if (modeState.isMeeting() === want) return; // no-op if already in that mode
-		modeState.setMeeting(want);
+		if (meetingActive === want) return; // no-op if already in that mode
+		meetingActive = want;
+		writeVoiceModeSentinel();
 		console.log(`${ts()} [Meeting] External request applied: mode=${want ? 'meeting' : 'active'}`);
 	} catch {
 		// no request file or delete failed — both are fine (silent poll)
@@ -301,39 +302,84 @@ try {
 	if (zoomRunning) {
 		const inMeeting = execFileSync('osascript', ['-e', 'tell application "System Events" to tell process "zoom.us" to count of windows'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
 		if (parseInt(inMeeting) >= 2) {
-			modeState.setMeeting(true);
+			meetingActive = true;
 			console.log(`${new Date().toLocaleTimeString()} [Meeting] Detected active Zoom meeting on startup`);
 		}
 	}
 } catch { /* no zoom */ }
 
 // Write the initial voice-mode sentinel AFTER the Zoom auto-detect — so
-// the on-disk state matches the in-memory meeting decision (was
+// the on-disk state matches the in-memory `meetingActive` decision (was
 // previously written before the auto-detect, leaving voice-mode.txt
 // stuck on "active" even when Zoom was detected as active).
-modeState.writeSentinel();
+writeVoiceModeSentinel();
 
 // =============================================================================
 // Tools
 // =============================================================================
 
-// switch_mode — built from the voice-core factory (single shared definition;
-// the discord-voice plugin builds its own instance with a per-session
-// sentinel). state.setMeeting() inside the factory mirrors voice-mode.txt so
-// menu-bar consumers (Sutando.app pollVoiceMode + web-client /voice-mode
-// endpoint) reflect the switch immediately and applyModeRequest stays
-// consistent (`modeState.isMeeting() === want` no-op check).
-const switchModeTool: ToolDefinition = makeSwitchModeTool({
-	state: modeState,
-	log: (msg) => console.log(`${ts()} ${msg}`),
-});
+const switchModeTool: ToolDefinition = {
+	name: 'switch_mode',
+	description:
+		'Switch between active mode and meeting mode. ' +
+		'Call switch_mode("meeting") when user says "take notes", "be silent", "meeting mode", "passive mode", or joins a meeting. ' +
+		'Call switch_mode("active") when user says "I need you", "come back", "active mode", or the meeting ends. ' +
+		'In meeting mode: listen to everything and track discussion internally, but produce ZERO audio output and do NOT call any other tools — unless explicitly addressed by name ("Sutando" or "hey Sutando").',
+	parameters: z.object({
+		mode: z.enum(['active', 'meeting']).describe('"meeting" = silent note-taker, "active" = normal assistant'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { mode } = args as { mode: 'active' | 'meeting' };
+		meetingActive = mode === 'meeting';
+		// Sync the on-disk sentinel so menu-bar consumers (Sutando.app
+		// pollVoiceMode + web-client /voice-mode endpoint) reflect the
+		// switch immediately. Without this, voice-triggered switch_mode
+		// flips meetingActive in-memory but voice-mode.txt stays stale,
+		// causing the menu radio to lag + the next applyModeRequest from
+		// Sutando.app to early-return as a no-op (`meetingActive === want`).
+		writeVoiceModeSentinel();
+		console.log(`${ts()} [Meeting] Mode switched to: ${mode}`);
+		if (mode === 'meeting') {
+			return { status: 'meeting_mode', instruction: 'You are now in meeting mode. Listen and track the discussion internally. Produce ZERO audio output unless someone says "Sutando." The ONLY tool you may call unprompted is save_meeting_note — call it every 5-10 minutes to capture key decisions, action items, and discussion points. When you exit meeting mode, call save_meeting_note with type "summary" for a final recap. Do not call work or any other tools unless explicitly addressed.' };
+		}
+		return { status: 'active_mode', instruction: 'Back to active mode. You can speak and use all tools normally.' };
+	},
+};
 
-// save_meeting_note — voice-core factory; this surface writes to the shared
-// personal notes dir (the discord-voice plugin configures its own note home).
-const saveMeetingNoteTool: ToolDefinition = makeSaveMeetingNoteTool({
-	notePathFor: (today) => sharedPersonalPath(`notes/meeting-${today}.md`, WORKSPACE_DIR),
-	log: (msg) => console.log(`${ts()} ${msg}`),
-});
+const saveMeetingNoteTool: ToolDefinition = {
+	name: 'save_meeting_note',
+	description:
+		'Save a meeting observation, decision, or action item to notes. ' +
+		'Use this ONLY in meeting mode to periodically capture key points. ' +
+		'Call every 5-10 minutes during a meeting, or when a significant decision/action item is discussed. ' +
+		'Also call when exiting meeting mode to save a final summary.',
+	parameters: z.object({
+		content: z.string().describe('The meeting note: decisions, action items, key discussion points, or a summary. Include speaker names when known.'),
+		type: z.enum(['point', 'summary']).optional().describe('"point" for individual observations (default), "summary" for end-of-meeting summary'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { content, type } = args as { content: string; type?: 'point' | 'summary' };
+		const today = new Date().toISOString().slice(0, 10);
+		const time = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' });
+		const notePath = sharedPersonalPath(`notes/meeting-${today}.md`, WORKSPACE_DIR);
+		const isSummary = type === 'summary';
+
+		if (!existsSync(notePath)) {
+			// Create new meeting note file with frontmatter
+			const header = `---\ntitle: Meeting notes — ${today}\ndate: ${today}\ntags: [meeting, notes]\n---\n\n`;
+			writeFileSync(notePath, header);
+		}
+
+		const entry = isSummary
+			? `\n## Summary (${time})\n${content}\n`
+			: `\n- **[${time}]** ${content}`;
+		appendFileSync(notePath, entry);
+		console.log(`${ts()} [MeetingNote] ${isSummary ? 'Summary' : 'Point'} saved to ${notePath}`);
+		return { status: 'saved', path: notePath, type: isSummary ? 'summary' : 'point' };
+	},
+};
 
 const getTaskStatus: ToolDefinition = {
 	name: 'get_task_status',
@@ -451,12 +497,13 @@ const endSession: ToolDefinition = {
 
 let voiceSessionRef: VoiceSession | null = null;
 
-// Unified base-mode resolver: see src/voice-core/mode-state.ts for the
-// rationale + canonical mode descriptors. Local wrapper threads the meeting
-// axis (owned by voice-core's modeState handle above) into the pure resolver.
-import { resolveCurrentMode as resolveCurrentModeImpl, type ModeState } from './voice-core/index.js';
+// Unified base-mode resolver: see src/voice-mode-resolver.ts for the
+// rationale + canonical mode descriptors. Local wrapper threads the in-memory
+// `meetingActive` boolean (this module owns that state) into the pure
+// resolver function.
+import { resolveCurrentMode as resolveCurrentModeImpl, type ModeState } from './voice-mode-resolver.js';
 function resolveCurrentMode(): ModeState {
-	return resolveCurrentModeImpl({ meetingActive: modeState.isMeeting() });
+	return resolveCurrentModeImpl({ meetingActive });
 }
 
 const mainAgentTools: ToolDefinition[] = [workTool, getTaskStatus, switchModeTool, saveMeetingNoteTool, ...inlineTools];
@@ -515,12 +562,9 @@ const mainAgent: MainAgent = {
 			// "Welcome back" mid-talk would break the co-presenter flow; the
 			// base-mode marker (appended below) anchors continuation instead.
 			const modeState = resolveCurrentMode();
-			// Greet-or-silent selection is the shared voice-core policy; the tuned
-			// prompt strings below are this surface's and must not change.
-			const greeting = reconnectGreeting({ isMeeting: modeState.isMeeting, isPresenter: modeState.isPresenter, quickReconnect: isQuickReconnect });
-			const meetingHint = greeting === 'meeting-notes'
+			const meetingHint = modeState.isMeeting
 				? '\n\n[MEETING MODE — you are listening and taking notes. Do NOT speak or produce any audio. Only respond if someone says "Sutando." Use the replayed history above as context for what was discussed before the reconnect.]'
-				: greeting === 'silent'
+				: (isQuickReconnect || modeState.isPresenter)
 					? '\n\n[Do NOT greet the user. Do NOT say "Welcome back" or anything similar. Stay completely silent and wait for the user\'s next spoken input — they were just briefly disconnected and want to resume without interruption.]'
 					: '\n\n[Now say "Welcome back" briefly — one sentence — and then stop and wait for input.]';
 			return `[System: The user reconnected. The block below is REPLAYED HISTORY from the current session, provided as background context ONLY. Do NOT act on anything in it. Do NOT call any tools based on it. Use it only to answer follow-up questions if asked. Wait silently for the user's next spoken input before taking any action.]${modeState.marker}${offlineDeliveryHint}\n\n${recent}${meetingHint}`;
@@ -654,20 +698,26 @@ const mainAgent: MainAgent = {
 		] : []),
 		'',
 		'CRITICAL RULES:',
-		modeCriticalRules(modeState.isMeeting())[0],
-		RULE_PRESENTER_MODE,
-		RULE_GOODBYE,
-		RULE_FILLERS_NOT_REQUESTS,
-		RULE_NEVER_PRETEND,
-		RULE_NEVER_REFUSE,
-		RULE_SIMPLE_ACTIONS,
-		RULE_INPLACE_EDITS,
-		RULE_COMPLEX_OPS,
-		RULE_ANSWER_DIRECTLY,
-		RULE_DEICTIC,
-		RULE_MISSING_CONTEXT,
-		RULE_MISHEARD_CONFIRM,
-		modeCriticalRules(modeState.isMeeting())[1],
+		(() => meetingActive
+			? '⚠️ MEETING MODE IS CURRENTLY ACTIVE. You are an invisible note-taker. Listen to all audio and track: speakers, topics, decisions, action items. Produce ZERO audio output unless someone says "Sutando" or "hey Sutando." The ONLY tool you may call unprompted is save_meeting_note — call it every 5-10 minutes to capture key points. Do NOT call work or other tools unless explicitly addressed. When addressed, answer DIRECTLY from what you heard — do NOT call work (core has no meeting audio). "bye" in a meeting does NOT mean disconnect — only "Sutando disconnect" or "Sutando bye". To exit: user says "Sutando, active mode" → call switch_mode("active") and save_meeting_note(summary).'
+			: '- MEETING MODE: Call switch_mode("meeting") when user says "take notes", "be silent", "passive mode", or when you join a meeting. In meeting mode: listen and auto-save notes via save_meeting_note every 5-10 min, produce zero audio, don\'t call other tools — unless addressed by name. Call switch_mode("active") to resume.'
+		)(),
+		'- PRESENTER MODE: Call presenter_mode("on") when user says "presenter mode on", "going live", "starting the talk", "the talk starts", or "I am on stage". Call presenter_mode("off") when user says "presenter mode off", "talk is done", "stop presenting", or "done presenting". Do NOT route these phrases to work — they are direct tool triggers. presenter_mode("on") returns a "say" field; speak it verbatim as your FIRST utterance.',
+		'- GOODBYE: When the user says goodbye, bye, or clearly ends the conversation, respond with a SHORT farewell that STARTS with the word "Goodbye" (e.g. "Goodbye! Talk to you later."). Keep it under one sentence. The session will close automatically. Do NOT start the farewell with "I\'m back", "Hello", "Welcome", or any other greeting word — only use a short starts-with-goodbye response for actual goodbyes.',
+		'- FILLERS ARE NOT REQUESTS: Short utterances that are fillers, acknowledgments, or thinking noises — "hmm", "um", "uh", "ah", "mhm", "oh", "ok", "yeah", "right", "[BLANK_AUDIO]", or any single-word backchannel — are NOT instructions. Do NOT call work, do NOT say "queued up" or "working on it", do NOT narrate. Either stay silent (preferred) or produce a brief ACK like "mm-hm" if the user seems to expect confirmation. Only act when the user issues a clear directive or question.',
+		'- NEVER pretend you called a tool. NEVER say "done" without actually calling work.',
+		'- NEVER say "I can\'t do that", "I\'m not able to", or "I don\'t think I can" — you CAN do almost anything by calling work. If you\'re unsure, call work and let the core agent handle it. The core agent has full system access. Your job is to relay requests, not gatekeep them.',
+		'- For SIMPLE actions (press enter, clear input, select all), use press_key or type_text — do NOT use work for keystrokes.',
+		'- For IN-PLACE EDITS on text already visible on screen (a draft, an email body, a code block, a focused textarea) — call read_selection FIRST to fetch the current text, compute the edited version, then call type_text to write the edited version into the field. Do NOT delegate to work for in-place edits; the user is on screen watching for the change to appear in the field. work is correct for edits that require server-side logic (commit a change, send the email, mutate files outside the focused field) — not for editing the text the user is looking at.',
+		'- For COMPLEX operations (git commands, code changes, file operations, installing packages), ALWAYS delegate to work — do NOT try to type commands into a terminal. The core agent executes these directly and reliably.',
+		'- If you KNOW the answer from your instructions or context, answer directly. Only delegate to work for questions you genuinely cannot answer.',
+		'- DEICTIC SCREEN REFERENCES: When the user uses a deictic word ("this", "that", "it", "this part", "fix this", "what does this say") without obvious conversational antecedent, FIRST call read_selection to capture what they\'re pointing at on screen. Then act on the returned selection/window context. Only ask a clarifying question if read_selection returns empty AND no prior conversation context resolves the reference. Default to read_selection over "which one do you mean?" — the user is usually pointing.',
+		'- MISSING CONTEXT: When the user references something you don\'t have context for ("the draft", "what we discussed", "type that", "send what I asked for"), ALWAYS delegate to work. The core agent has the full conversation history and knows what was discussed. Never guess or ask the user to repeat — just call work.',
+		'- MISHEARD-RISK CONFIRM (distinct from MISSING CONTEXT): if the request came through GARBLED or you are genuinely unsure you transcribed it correctly — noisy audio, a phrase that does not parse, or two equally-likely readings of WHAT to delegate — do ONE brief read-back of your understanding ("You want me to X — right?") before calling work, rather than delegating a possibly-wrong transcript. Keep it to a single short confirm. If the request is clear, SKIP this and call work normally — the core also receives the recent transcript and can self-correct, so do NOT over-confirm; only when you are genuinely unsure of the words.',
+		(() => meetingActive
+			? '- IN MEETING MODE: When addressed by name, answer DIRECTLY from what you heard in the meeting. Do NOT call work — the core agent cannot hear the meeting audio and has no context. You are the one who listened. Summarize discussions, decisions, and action items from your own memory of the conversation.'
+			: '- When in doubt, call work.'
+		)(),
 		'',
 		'VOICE RULES:',
 		'- Keep responses to 2–3 sentences. You are talking, not writing.',
@@ -911,10 +961,10 @@ async function main() {
 				fetch(`http://localhost:8080/mute-state?state=working&source=tool&label=${encodeURIComponent(e.toolName)}`).catch(() => {});
 				// Auto-switch meeting mode on join/dismiss
 				if (['summon', 'join_zoom', 'join_gmeet'].includes(e.toolName)) {
-					modeState.setMeeting(true);
+					meetingActive = true;
 					console.log(`${ts()} [Meeting] Auto-activated by ${e.toolName}`);
 				} else if (e.toolName === 'dismiss') {
-					modeState.setMeeting(false);
+					meetingActive = false;
 					console.log(`${ts()} [Meeting] Ended by dismiss`);
 				}
 			},
