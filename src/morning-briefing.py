@@ -39,15 +39,22 @@ WEATHER_CODES = {
 }
 
 
-def _run_applescript(script: str, timeout: int = 8) -> str | None:
+def _run_applescript(script: str, timeout: int = 8) -> tuple[str | None, str]:
+    """Run an AppleScript and return (stdout, stderr).
+
+    Returns (output_text, "") on success, (None, error_text) on failure.
+    Callers that only need the output can ignore the second element.
+    """
     try:
         r = subprocess.run(
             ["osascript", "-e", script],
             capture_output=True, text=True, timeout=timeout
         )
-        return r.stdout.strip() if r.returncode == 0 else None
+        if r.returncode == 0:
+            return r.stdout.strip(), ""
+        return None, r.stderr.strip()
     except (subprocess.TimeoutExpired, OSError):
-        return None
+        return None, ""
 
 
 def get_weather() -> str:
@@ -55,7 +62,7 @@ def get_weather() -> str:
     try:
         # Default to SF; override via TZ if possible
         lat, lon = 37.77, -122.42
-        tz_result = _run_applescript(
+        tz_result, _ = _run_applescript(
             'do shell script "defaults read /Library/Preferences/com.apple.timezone"',
             timeout=3
         )
@@ -96,9 +103,11 @@ def get_calendar_events() -> list[dict]:
     filtering out subscribed shared calendars that clutter the briefing
     (closes #964). Case-insensitive match on calendar name.
     """
-    today = datetime.now().strftime("%Y-%m-%d")
-    script = f'''
-set theDate to date "{today}"
+    script = '''
+set theDate to (current date)
+set hours of theDate to 0
+set minutes of theDate to 0
+set seconds of theDate to 0
 set endDate to theDate + (24 * 60 * 60)
 set output to ""
 tell application "Calendar"
@@ -124,8 +133,16 @@ tell application "Calendar"
 end tell
 return output
 '''
-    result = _run_applescript(script, timeout=10)
-    if not result:
+    result, err = _run_applescript(script, timeout=10)
+    if result is None:
+        if err:
+            print(f"  calendar: AppleScript error — {err}", file=sys.stderr)
+            if "-1743" in err:
+                print(
+                    "  calendar: Automation permission needed. "
+                    "System Settings → Privacy & Security → Automation → grant Calendar access.",
+                    file=sys.stderr,
+                )
         return []
     import os as _os
     skip_cals_raw = _os.environ.get("MORNING_BRIEFING_SKIP_CALENDARS", "")
