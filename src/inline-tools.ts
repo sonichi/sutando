@@ -1006,7 +1006,16 @@ function assertUniqueToolNames(tools: ToolDefinition[]): ToolDefinition[] {
 // Split by manifest `access_tier` so phone-conversation can include
 // owner-tier tools only when the caller is the verified owner. Manifest
 // access_tier values: "owner" (default if omitted) | "any_caller".
-async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyCaller: ToolDefinition[] }> {
+// SkillSetup: an OPTIONAL lifecycle hook a skill's tools.ts may export. Core
+// calls it once per voice session (after the session exists) with {session,
+// injectText} so the skill can register session-lifecycle handlers (e.g. a
+// turn.end driver) without importing core. Generic — any skill can use it; core
+// stays ignorant of what the skill does with the session. (Added 2026-06-11 for
+// the talk-highlight auto-advance driver; see voice-agent session-setup loop.)
+export type SkillSetupCtx = { session: unknown; injectText: (session: unknown, text: string) => void };
+export type SkillSetup = (ctx: SkillSetupCtx) => void;
+
+async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyCaller: ToolDefinition[]; setups: SkillSetup[] }> {
 	// Scan the public-repo `skills/` dir, the per-user workspace
 	// `$SUTANDO_WORKSPACE/skills/`, AND the optional private skills dir
 	// pointed to by `$SUTANDO_MEMORY_DIR/skills/` (legacy `$SUTANDO_PRIVATE_DIR`
@@ -1038,6 +1047,7 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 	} catch { /* siblings root unreadable — skip */ }
 	const owner: ToolDefinition[] = [];
 	const anyCaller: ToolDefinition[] = [];
+	const setups: SkillSetup[] = [];
 	for (const skillsDir of dirsToScan) {
 		if (!existsSync(skillsDir)) continue;
 		let dirs: string[];
@@ -1070,6 +1080,10 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 					(tier === 'any_caller' ? anyCaller : owner).push(...mod.tools);
 					console.log(`[skill-loader] loaded ${mod.tools.length} tool(s) from ${manifest.name || dirName} [tier=${tier}] (${skillsDir})`);
 				}
+				if (typeof mod.setup === 'function') {
+					setups.push(mod.setup as SkillSetup);
+					console.log(`[skill-loader] registered setup() hook from ${manifest.name || dirName}`);
+				}
 			} catch (err) {
 				console.warn(`[skill-loader] failed to import ${dirName}/${manifest.tools} from ${skillsDir}:`, err instanceof Error ? err.message : err);
 			}
@@ -1086,7 +1100,7 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 		for (const t of arr) byName.set(t.name, t);
 		return [...byName.values()];
 	};
-	return { owner: dedupeByName(owner), anyCaller: dedupeByName(anyCaller) };
+	return { owner: dedupeByName(owner), anyCaller: dedupeByName(anyCaller), setups };
 }
 const personalTools = await loadSkillManifestTools();
 // Also dedupe across the owner+anyCaller union (a tool declared in both tiers).
@@ -1102,6 +1116,10 @@ const personalAllTools = (() => {
 export const envDependentToolNames: ReadonlySet<string> = new Set([
 	...personalAllTools.map(t => t.name), 'slide_control', 'fullscreen',
 ]);
+// Lifecycle hooks exported by personal skills (e.g. talk-highlight auto-advance).
+// voice-agent invokes each once per session with {session, injectText}. Empty
+// when no skill exports setup(). See SkillSetup type above.
+export const personalSkillSetups: SkillSetup[] = personalTools.setups;
 
 // Manifest-driven discovery of skills that core (not voice-inline) runs.
 // When a manifest has `documented_for_core: true` and a `core_description`,

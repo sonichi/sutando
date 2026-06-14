@@ -32,7 +32,7 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, openSync, writeSync, closeSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { inlineTools } from './inline-tools.js';
+import { inlineTools, personalSkillSetups } from './inline-tools.js';
 import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater } from './vision-tools.js';
 import { clearActiveArtifact } from './artifact-cache-tools.js';
 import { injectText } from './browser-tools.js';
@@ -974,6 +974,17 @@ async function main() {
 		userHasInterrupted = true;
 		console.log(`${ts()} [VoiceSession] user interrupt detected — userHasInterrupted=true`);
 	});
+
+	// Generic skill-lifecycle hook: give each personal skill that exported a
+	// setup() the live session + injectText so it can register session handlers
+	// (e.g. talk-highlight's turn.end auto-advance driver) WITHOUT importing core.
+	// Core stays ignorant of what the skill does; talk-specific logic lives in the
+	// skill. Empty when no skill exports setup(). Each call is guarded so a buggy
+	// skill setup can't break session bootstrap. (Added 2026-06-11.)
+	for (const skillSetup of personalSkillSetups) {
+		try { skillSetup({ session, injectText }); }
+		catch (err) { console.error(`${ts()} [skill-setup] hook threw:`, err instanceof Error ? err.message : err); }
+	}
 
 	// Audio-duck relay: flag the slide server (localhost:7877) when Sutando is
 	// producing audio, so the deck ducks the active slide video under the
