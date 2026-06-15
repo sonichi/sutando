@@ -352,3 +352,5 @@ This also starts the screen capture server (needs terminal for Screen Recording 
 ## Skills
 
 Use skills installed in ~/.claude/skills/ when available. Prefer existing skills over writing new code from scratch.
+
+**Skill manifests.** Skills come in two shapes: most are invoked via the slash-command surface (`/skill-name`) or as standalone scripts; a subset are **manifest-loaded** — a `manifest.json` (+ optional `tools.ts`) that contributes inline tools directly into the voice/phone agent tool table at startup (`loadSkillManifestTools()` in `src/inline-tools.ts`). See [`skills/MANIFEST.md`](skills/MANIFEST.md) for the manifest schema, how tools are loaded and who consumes them, and how to add one. Current manifest-loaded skills carry a per-skill `manifest.json` (e.g. `skills/zoom/`, `skills/screen-companion/`, `skills/gws-gmail-voice/`, `skills/obsidian-vault/`).
