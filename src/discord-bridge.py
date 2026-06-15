@@ -2467,8 +2467,18 @@ async def _handle_discord_message(message, force=False):
                 # channel set to `true` — open to all, skip access check
                 channel_authorized = True
             elif len(ch_allowed) > 0 and sender_id not in ch_allowed:
-                print(f"  [skip] @{username} (id={sender_id}) not in channel allowlist", flush=True)
-                return
+                if sender_id in allowed:
+                    # Global owner/allowlisted sender — exempt from the
+                    # per-channel allowlist. The global `allowFrom` is a
+                    # superset grant; a channel's `allowFrom` narrows *who
+                    # else* gets in, it must not exclude a globally-authorized
+                    # owner. Without this, creating a channel entry whose
+                    # allowFrom omits the owner silently locks the owner out
+                    # of their own channel (observed 2026-06-15).
+                    channel_authorized = True
+                else:
+                    print(f"  [skip] @{username} (id={sender_id}) not in channel allowlist", flush=True)
+                    return
             else:
                 # sender is in ch_allowed (or ch_allowed is empty + requireMention)
                 channel_authorized = True
