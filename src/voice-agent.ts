@@ -40,6 +40,7 @@ import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
 import { workTool, startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
 import { recordSession, recordToolCall } from './conversation-store.js';
+import { recordVoiceSession } from './realtime-usage.js';
 import { buildSutandoSystemPrompt, buildVoiceAgentContext } from './voice-context.js';
 import { classifyTransportClose, type ClassifiedClose } from './voice-error-classifier.js';
 
@@ -918,6 +919,17 @@ async function main() {
 		} catch (err) {
 			console.log(`${ts()} [Observability] Failed to write metrics: ${err}`);
 		}
+		// Spine usage: durable billable ledger line + a `usage.recorded` obs event
+		// (meter.record does both). Kept in its own try, independent of the sqlite
+		// path above, so a sqlite failure never drops billable usage.
+		try {
+			recordVoiceSession({
+				sessionId: SESSION_ID,
+				durationMs: Date.now() - voiceSessionStart,
+				model: VOICE_NATIVE_AUDIO_MODEL,
+				toolCalls: voiceToolCalls.length,
+			});
+		} catch { /* record() is structurally non-throwing; belt-and-suspenders */ }
 	}
 
 	const session = new VoiceSession({

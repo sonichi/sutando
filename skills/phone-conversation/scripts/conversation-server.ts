@@ -84,6 +84,7 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '../../../src/inline-tools.js';
 import { recordSession, recordConversation, recordToolCall } from '../../../src/conversation-store.js';
+import { recordPhoneCall } from '../../../src/realtime-usage.js';
 import { resultBelongsTo, phoneCallKey } from '../../../src/result-channel-key.js';
 // Lazy vision-session handle. Only loaded if a call ever needs it — keeps the
 // phone-agent boot path free of the vision-tools.ts side-effects on cold start.
@@ -1195,6 +1196,20 @@ function cleanupCall(callSid: string): void {
 		toolCalls: session.toolCalls,
 		events: session.events,
 	});
+
+	// Spine usage: telephony (twilio) + in-call realtime model (gemini-live) legs,
+	// each a durable ledger line + a `usage.recorded` obs event (meter.record does
+	// both). Own try so a meter hiccup never disturbs cleanup.
+	try {
+		recordPhoneCall({
+			callSid,
+			durationMs,
+			model: VOICE_MODEL,
+			isOwner: session.isOwner,
+			isMeeting: session.isMeeting,
+			toolCalls: session.toolCalls.length,
+		});
+	} catch { /* record() is structurally non-throwing; belt-and-suspenders */ }
 
 	// Auto-scan the latest call for issues (async, best effort)
 	try {
