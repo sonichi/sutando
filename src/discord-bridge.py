@@ -2621,6 +2621,27 @@ async def _handle_discord_message(message, force=False):
                         f"\n\n[Replying to {ref_author} "
                         f"({ref_msg.created_at.strftime('%Y-%m-%d %H:%M')}): {snippet}]"
                     )
+                # Also download attachments that live on the replied-to
+                # message. Without this, a file shared on a parent message
+                # and then acted on via an @-mention *reply* is silently
+                # dropped — only the reply's own (often empty) attachment
+                # set was scanned above. Same save + sanitized-basename +
+                # image-vision pattern as the primary loop.
+                for att in getattr(ref_msg, "attachments", []):
+                    p_path = INBOX_DIR / f"{int(time.time()*1000)}_{_safe_attachment_basename(att.filename)}"
+                    try:
+                        await att.save(p_path)
+                        attachment_note += f"\n[File attached (from replied-to message): {p_path}]"
+                        try:
+                            ct = (getattr(att, "content_type", "") or "").lower()
+                            if ct.startswith("image/") or str(p_path).lower().endswith(
+                                (".jpg", ".jpeg", ".png", ".webp", ".gif")
+                            ):
+                                _push_vision_image(str(p_path), source="discord")
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        print(f"  [reply-context] parent attachment download failed: {e}", flush=True)
         except Exception as e:
             print(f"  [reply-context] fetch failed: {e}", flush=True)
 
