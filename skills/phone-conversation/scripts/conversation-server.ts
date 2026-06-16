@@ -84,7 +84,7 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '../../../src/inline-tools.js';
 import { recordSession, recordConversation, recordToolCall } from '../../../src/conversation-store.js';
-import { startPhoneTicker, type PhoneTickerHandle } from '../../../src/realtime-usage.js';
+import { startPhoneTicker, type PhoneTickerHandle } from '../../../src/observability/realtime.js';
 import { resultBelongsTo, phoneCallKey } from '../../../src/result-channel-key.js';
 // Lazy vision-session handle. Only loaded if a call ever needs it — keeps the
 // phone-agent boot path free of the vision-tools.ts side-effects on cold start.

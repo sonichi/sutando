@@ -3,11 +3,11 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ledgerPath } from '../src/observability/meter.js';
-import { resetSinks, registerSink } from '../src/observability/obs.js';
-import type { ObsEvent } from '../src/observability/events.js';
-import type { Sink } from '../src/observability/sink.js';
-import { recordVoiceSession, recordPhoneCall, startVoiceTicker, startPhoneTicker, advisoryCostUsd, durationSeconds } from '../src/realtime-usage.js';
+import { ledgerPath } from '../../src/observability/meter.js';
+import { resetSinks, registerSink } from '../../src/observability/obs.js';
+import type { ObsEvent } from '../../src/observability/events.js';
+import type { Sink } from '../../src/observability/sink.js';
+import { recordVoiceSession, recordPhoneCall, startVoiceTicker, startPhoneTicker, advisoryCostUsd, durationSeconds } from '../../src/observability/realtime.js';
 
 const ENV = ['SUTANDO_WORKSPACE', 'SUTANDO_TENANT_ID', 'SUTANDO_TENANT_MODE', 'SUTANDO_METERING_FSYNC'];
 let saved: Record<string, string | undefined>;
