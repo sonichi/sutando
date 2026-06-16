@@ -2368,6 +2368,15 @@ async def _handle_discord_message(message, force=False):
                     tmp_path = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + '.tmp')
                     tmp_path.write_text(json.dumps(access_data, indent=2))
                     os.replace(tmp_path, ACCESS_FILE)
+                    # Refresh the gate for THIS message. require_mention was
+                    # computed by load_channel_config before the seed existed,
+                    # so without this the seeding message itself is still
+                    # dropped at the requireMention gate below unless it
+                    # happened to @-mention the bot — the ep013-class
+                    # first-message drop was only half-fixed by the 2026-06-06
+                    # ungate (thread seeded, triggering message lost). Widen
+                    # only: never flip an already-False gate back to True.
+                    require_mention = require_mention and bool(thread_entry.get('requireMention', True))
                     print(f"  [thread-engage] added thread {thread_id_str} (parent {parent_id_str}) to access.json with {thread_entry}", flush=True)
                     # Owner-visibility ping (one-shot, first seed only): when a
                     # non-owner seeds the thread, @-mention the owner inline so an
