@@ -36,6 +36,57 @@ if [ -n "${SUTANDO_CORE_MODEL:-}" ]; then
   MODEL_ARGS=(--model "$SUTANDO_CORE_MODEL")
 fi
 
+# ---- obs hooks (registered ONLY when an export endpoint is set) -------------
+# Register Claude Code hooks via `--settings` (merges with the user's settings
+# at highest precedence, per-session — no persistent file edit) ONLY when an
+# endpoint is configured. With no endpoint we inject no --settings at all, so
+# PreToolUse/PostToolUse never fork obs-hook.sh on the tool-call hot path —
+# capture is truly zero-cost (not just a no-op fork) when off. The endpoint comes
+# from $SUTANDO_OBS_ENDPOINT (exported so the hook — which runs in the session's
+# inherited env — resolves it at hook-time).
+OBS_ENDPOINT="${SUTANDO_OBS_ENDPOINT:-}"
+export SUTANDO_OBS_ENDPOINT="$OBS_ENDPOINT"
+
+# Inject --settings (and thus the per-event hooks) only when an endpoint exists.
+# The ${arr[@]+...} guard keeps the empty array safe on bash 3.2 under `set -u`
+# (same pattern as MODEL_ARGS above). The settings JSON is built by a node helper,
+# NOT shell string interpolation: hand-rolled interpolation broke when $REPO held
+# a space (split the command) or a `"` (broke the JSON). The helper POSIX
+# single-quotes the path inside the command and JSON-escapes the payload. Its 10
+# event keys are all valid CC hook events (code.claude.com/docs/en/hooks.md).
+SETTINGS_ARGS=()
+if [ -z "$OBS_ENDPOINT" ]; then
+  echo "obs hooks: not registered (no export endpoint — set SUTANDO_OBS_ENDPOINT to enable capture)"
+elif ! command -v node > /dev/null 2>&1; then
+  echo "obs hooks: node unavailable — cannot safely build --settings JSON; capture disabled this session" >&2
+else
+  HOOKS_JSON="$(node "$REPO/src/observability/claude/hooks/build-hook-settings.mjs" "$REPO/src/observability/claude/hooks/obs-hook.sh")"
+  if [ -n "$HOOKS_JSON" ]; then
+    SETTINGS_ARGS=(--settings "$HOOKS_JSON")
+    echo "obs hooks: → $OBS_ENDPOINT/ingest/claude-code-hooks (collector)"
+  else
+    echo "obs hooks: settings build failed — capture disabled this session" >&2
+  fi
+fi
+
+# ---- obs metering (CC native OTel token + cost) -----------------------------
+# Hooks give obs events but carry NO tokens. Claude Code's OTel
+# `claude_code.token.usage` / `cost.usage` metrics are the authoritative usage
+# source, so when an export endpoint is set we also turn on CC telemetry and
+# point its OTLP exporter at the collector (which serves /v1/metrics). Enable
+# ONLY metrics — logs/traces stay off so hooks remain the sole obs source (no
+# duplicate events). JSON OTLP so the collector parses it without protobuf.
+# Gated on the same endpoint; honors any pre-set OTEL_* so a real OTel backend
+# isn't overridden.
+if [ -n "$OBS_ENDPOINT" ] && [ -z "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" ]; then
+  export CLAUDE_CODE_ENABLE_TELEMETRY=1
+  export OTEL_METRICS_EXPORTER=otlp
+  export OTEL_EXPORTER_OTLP_PROTOCOL=http/json
+  export OTEL_EXPORTER_OTLP_ENDPOINT="$OBS_ENDPOINT"
+  export OTEL_METRIC_EXPORT_INTERVAL="${OTEL_METRIC_EXPORT_INTERVAL:-10000}" # ms; 10s (CC default 60s)
+  echo "obs metering: → $OBS_ENDPOINT/v1/metrics (CC OTel token+cost, every ${OTEL_METRIC_EXPORT_INTERVAL}ms)"
+fi
+
 # --restart: kill any existing session before starting fresh. Without this,
 # the script's "already running → attach" path returns and the old session
 # keeps running.
@@ -108,6 +159,7 @@ if ! command -v tmux > /dev/null 2>&1; then
   echo "  ⚠ tmux not found — running without tmux wrapper"
   echo "    (Sutando.app's watcher-auto-restart won't work; brew install tmux to enable)"
   exec claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
+    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
     -- "/schedule-crons"
 fi
 
@@ -132,10 +184,12 @@ apply_tmux_defaults
 if [ -t 1 ]; then
   exec tmux -S "$TMUX_SOCKET" new-session -A -s "$SESSION" \
     claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
+    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
     -- "/schedule-crons"
 else
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" \
     claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
+    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
     -- "/schedule-crons"
   echo "Started $SESSION detached. Attach via Open Core CLI in menu bar, or:"
   echo "  tmux -S $TMUX_SOCKET attach -t $SESSION"
