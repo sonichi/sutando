@@ -64,7 +64,7 @@ if [ -z "$OBS_ENDPOINT" ]; then
 elif ! command -v node > /dev/null 2>&1; then
   echo "obs hooks: node unavailable — cannot safely build --settings JSON; capture disabled this session" >&2
 else
-  HOOKS_JSON="$(node "$REPO/src/adapters/executor/claude-code/hooks/build-hook-settings.mjs" "$REPO/src/adapters/executor/claude-code/hooks/obs-hook.sh")"
+  HOOKS_JSON="$(node "$REPO/src/observability/claude/hooks/build-hook-settings.mjs" "$REPO/src/observability/claude/hooks/obs-hook.sh")"
   if [ -n "$HOOKS_JSON" ]; then
     SETTINGS_ARGS=(--settings "$HOOKS_JSON")
     echo "obs hooks: → $OBS_ENDPOINT/ingest/claude-code-hooks (collector)"

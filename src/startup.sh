@@ -243,7 +243,7 @@ if [ "${SUTANDO_OBS_COLLECTOR:-}" = "1" ]; then
   if ! lsof -i :"$OBS_PORT" > /dev/null 2>&1; then
     echo "  Starting obs collector (port $OBS_PORT)..."
     SUTANDO_WORKSPACE="$WORKSPACE" SUTANDO_OBS_PORT="$OBS_PORT" \
-      npx tsx "$REPO/src/boot/collector.ts" > "$LOGS_DIR/collector.log" 2>&1 &
+      npx tsx "$REPO/src/observability/boot.ts" > "$LOGS_DIR/collector.log" 2>&1 &
     echo "  ✓ obs collector"
   else
     echo "  ✓ obs collector (already running on $OBS_PORT)"
@@ -306,6 +306,19 @@ if ! lsof -i :7845 > /dev/null 2>&1; then
   fi
 else
   echo "  ✓ screen capture (already running)"
+fi
+
+# 5a-bis. Portfolio + research dashboard (port 8899) — idempotent self-guard.
+# Serves the research webapp with the live (read-only) portfolio panel and keeps
+# its snapshot fresh via a background refresher daemon. No-op if not initialised.
+if [ -d "$REPO/skills/portfolio-research" ]; then
+  if [ ! -d "${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}/research/portfolio/webapp" ]; then
+    bash "$REPO/skills/portfolio-research/scripts/init-evergreen-webapp.sh" \
+      > "$LOGS_DIR/portfolio-dashboard.log" 2>&1 || true
+  fi
+  bash "$REPO/skills/portfolio-research/scripts/serve-dashboard.sh" \
+    >> "$LOGS_DIR/portfolio-dashboard.log" 2>&1 || true
+  echo "  ✓ portfolio dashboard (port 8899)"
 fi
 
 # 5b. Sutando context drop app (global hotkey ⌃C)
@@ -413,8 +426,20 @@ if [ "${SKIP_TELEGRAM:-}" = "1" ]; then
 elif [ -f "$HOME/.claude/channels/telegram/.env" ] && grep -q "TELEGRAM_BOT_TOKEN=" "$HOME/.claude/channels/telegram/.env" 2>/dev/null; then
   if ! pgrep -f "telegram-bridge" > /dev/null 2>&1; then
     echo "  Starting Telegram bridge..."
-    python3 src/telegram-bridge.py > "$LOGS_DIR/telegram-bridge.log" 2>&1 &
-    echo "  ✓ telegram bridge"
+    # Pick an interpreter that can actually verify TLS. A cert-less framework
+    # python (e.g. /Library/Frameworks/.../3.13 without certifi) resolves first
+    # on some PATHs and then fails EVERY Telegram long-poll with
+    # CERTIFICATE_VERIFY_FAILED — silently dropping all messages (cost us ~10h
+    # on 2026-06-15, caught only by a stale-heartbeat health warning).
+    _tg_tls_ok() { "$1" -c 'import urllib.request as u; u.urlopen("https://api.telegram.org",timeout=8)' >/dev/null 2>&1; }
+    TGPY="python3"
+    if ! _tg_tls_ok "$TGPY"; then
+      for _c in "$(pyenv which python3 2>/dev/null)" python3.12 python3.11; do
+        [ -n "$_c" ] && command -v "$_c" >/dev/null 2>&1 && _tg_tls_ok "$_c" && TGPY="$_c" && break
+      done
+    fi
+    "$TGPY" src/telegram-bridge.py > "$LOGS_DIR/telegram-bridge.log" 2>&1 &
+    echo "  ✓ telegram bridge ($TGPY)"
   else
     echo "  ✓ telegram bridge (already running)"
   fi
