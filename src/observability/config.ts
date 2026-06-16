@@ -7,8 +7,7 @@
  * later concern; this slice ships the minimum the obs/meter seam needs.
  *
  * Resolution order (each layer overlays the previous, field by field):
- *   1. shipped defaults — repo `config/sutando.config.defaults.json`
- *      (falls back to OBSERVABILITY_DEFAULTS if the file is missing/unparseable)
+ *   1. in-code OBSERVABILITY_DEFAULTS — the floor
  *   2. environment knobs — SUTANDO_TENANT_ID / SUTANDO_TENANT_MODE /
  *      SUTANDO_METERING_ENABLED / SUTANDO_METERING_ENDPOINT
  *   3. workspace override — `<workspace>/config/observability.json` (machine-local; wins)
@@ -19,8 +18,7 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 import { resolveWorkspace } from '../workspace_default.js';
 
 export interface SinkConfig {
@@ -53,19 +51,13 @@ export interface ObservabilityConfig {
 	tenant: TenantSection;
 }
 
-/** In-code defaults — kept byte-equivalent to config/sutando.config.defaults.json
- *  (a test asserts they match, so they cannot drift). Used as the fallback when
- *  the shipped file can't be read. */
+/** In-code defaults — the floor that the env knobs and workspace override layer
+ *  onto. */
 export const OBSERVABILITY_DEFAULTS: ObservabilityConfig = {
 	observability: { sinks: [{ type: 'jsonl-file' }], sampling: { trace: 1.0 } },
 	metering: { enabled: false, endpoint: null, batchMax: 100 },
 	tenant: { id: null, mode: 'byok' },
 };
-
-function defaultsFilePath(): string {
-	// src/observability/config.ts → repo root is two dirs up.
-	return join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'config', 'sutando.config.defaults.json');
-}
 
 function isTrueish(v: string): boolean {
 	return ['1', 'true', 'yes', 'on'].includes(v.trim().toLowerCase());
@@ -106,10 +98,8 @@ function readJsonFile(path: string): Record<string, unknown> | null {
 }
 
 export function loadObservabilityConfig(opts?: { workspace?: string }): ObservabilityConfig {
-	// 1. shipped defaults (file overlays the in-code const; const is the floor)
+	// 1. in-code defaults (the floor)
 	let cfg = structuredClone(OBSERVABILITY_DEFAULTS);
-	const fileRaw = readJsonFile(defaultsFilePath());
-	if (fileRaw) cfg = overlay(cfg, fileRaw);
 
 	// 2. environment knobs
 	const tenantId = process.env.SUTANDO_TENANT_ID?.trim();

@@ -2,7 +2,7 @@
 
 The loader reads already-populated ``os.environ`` (it does NOT re-parse .env --
 that's the bridges' job, PR #416), so this tests precedence, truthy parsing,
-malformed-override fallback, and defaults/const drift.
+and malformed-override fallback.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ class ObservabilityConfigTest(unittest.TestCase):
     def test_defaults_only(self) -> None:
         self.assertEqual(cfgmod.load_observability_config(self.ws), cfgmod.OBSERVABILITY_DEFAULTS)
 
-    def test_env_beats_defaults_file(self) -> None:
+    def test_env_beats_defaults(self) -> None:
         os.environ["SUTANDO_TENANT_ID"] = "acct_123"
         os.environ["SUTANDO_TENANT_MODE"] = "managed"
         os.environ["SUTANDO_METERING_ENABLED"] = "true"

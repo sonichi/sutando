@@ -41,14 +41,10 @@ fi
 # at highest precedence, per-session — no persistent file edit) ONLY when an
 # endpoint is configured. With no endpoint we inject no --settings at all, so
 # PreToolUse/PostToolUse never fork obs-hook.sh on the tool-call hot path —
-# capture is truly zero-cost (not just a no-op fork) when off. Endpoint:
-# $SUTANDO_OBS_ENDPOINT wins, else `observability.export` from
-# config/sutando.config.defaults.json. Exported so the hook — which runs in the
-# session's inherited env — resolves it at hook-time.
+# capture is truly zero-cost (not just a no-op fork) when off. The endpoint comes
+# from $SUTANDO_OBS_ENDPOINT (exported so the hook — which runs in the session's
+# inherited env — resolves it at hook-time).
 OBS_ENDPOINT="${SUTANDO_OBS_ENDPOINT:-}"
-if [ -z "$OBS_ENDPOINT" ] && [ -f "$REPO/config/sutando.config.defaults.json" ] && command -v node > /dev/null 2>&1; then
-  OBS_ENDPOINT="$(SUTANDO_CFG="$REPO/config/sutando.config.defaults.json" node -e 'try{const c=require(process.env.SUTANDO_CFG);process.stdout.write((c.observability&&c.observability.export)||"")}catch(e){}' 2>/dev/null || true)"
-fi
 export SUTANDO_OBS_ENDPOINT="$OBS_ENDPOINT"
 
 # Inject --settings (and thus the per-event hooks) only when an endpoint exists.
@@ -60,7 +56,7 @@ export SUTANDO_OBS_ENDPOINT="$OBS_ENDPOINT"
 # event keys are all valid CC hook events (code.claude.com/docs/en/hooks.md).
 SETTINGS_ARGS=()
 if [ -z "$OBS_ENDPOINT" ]; then
-  echo "obs hooks: not registered (no export endpoint — set observability.export or SUTANDO_OBS_ENDPOINT to enable capture)"
+  echo "obs hooks: not registered (no export endpoint — set SUTANDO_OBS_ENDPOINT to enable capture)"
 elif ! command -v node > /dev/null 2>&1; then
   echo "obs hooks: node unavailable — cannot safely build --settings JSON; capture disabled this session" >&2
 else

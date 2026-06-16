@@ -6,8 +6,7 @@ full Spine-C config. Returns a plain ``dict`` mirroring the JSON structure
 ``observability-config.ts`` and consistent with how obs/meter pass dicts.
 
 Resolution order (each layer overlays the previous, field by field):
-  1. shipped defaults -- repo ``config/sutando.config.defaults.json``
-     (falls back to OBSERVABILITY_DEFAULTS if missing/unparseable)
+  1. in-code OBSERVABILITY_DEFAULTS -- the floor
   2. environment knobs -- SUTANDO_TENANT_ID / SUTANDO_TENANT_MODE /
      SUTANDO_METERING_ENABLED / SUTANDO_METERING_ENDPOINT
   3. workspace override -- ``<workspace>/config/observability.json`` (machine-local; wins)
@@ -27,9 +26,7 @@ from workspace_default import resolve_workspace
 
 __all__ = ["OBSERVABILITY_DEFAULTS", "load_observability_config"]
 
-# In-code defaults -- kept equal to config/sutando.config.defaults.json's three
-# blocks (a test asserts this so they cannot drift). Fallback when the file
-# can't be read.
+# In-code defaults -- the floor the env knobs and workspace override layer onto.
 OBSERVABILITY_DEFAULTS: dict[str, Any] = {
     "observability": {"sinks": [{"type": "jsonl-file"}], "sampling": {"trace": 1.0}},
     "metering": {"enabled": False, "endpoint": None, "batchMax": 100},
@@ -37,11 +34,6 @@ OBSERVABILITY_DEFAULTS: dict[str, Any] = {
 }
 
 _TRUEISH = {"1", "true", "yes", "on"}
-
-
-def _defaults_file_path() -> Path:
-    # src/observability/config.py -> repo root is two dirs up.
-    return Path(__file__).resolve().parents[2] / "config" / "sutando.config.defaults.json"
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -84,11 +76,8 @@ def _overlay(base: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def load_observability_config(workspace: Path | None = None) -> dict[str, Any]:
-    # 1. shipped defaults (file overlays the in-code const)
+    # 1. in-code defaults (the floor)
     cfg = copy.deepcopy(OBSERVABILITY_DEFAULTS)
-    file_raw = _read_json(_defaults_file_path())
-    if file_raw:
-        cfg = _overlay(cfg, file_raw)
 
     # 2. environment knobs
     tenant_id = os.environ.get("SUTANDO_TENANT_ID", "").strip()

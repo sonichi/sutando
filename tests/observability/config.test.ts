@@ -34,7 +34,7 @@ describe('kernel/config/observability-config', () => {
 		assert.deepEqual(loadObservabilityConfig({ workspace: ws }), OBSERVABILITY_DEFAULTS);
 	});
 
-	it('env knobs beat the defaults file', () => {
+	it('env knobs beat the in-code defaults', () => {
 		process.env.SUTANDO_TENANT_ID = 'acct_123';
 		process.env.SUTANDO_TENANT_MODE = 'managed';
 		process.env.SUTANDO_METERING_ENABLED = 'true';
@@ -72,11 +72,5 @@ describe('kernel/config/observability-config', () => {
 		writeFileSync(join(ws, 'config', 'observability.json'), '{ not valid json');
 		const cfg = loadObservabilityConfig({ workspace: ws });
 		assert.deepEqual(cfg, OBSERVABILITY_DEFAULTS);
-	});
-
-	it('the shipped defaults file matches the in-code const (no drift)', () => {
-		// defaults-only load reads the real config/sutando.config.defaults.json;
-		// equality to the const proves the file did not diverge.
-		assert.deepEqual(loadObservabilityConfig({ workspace: ws }), OBSERVABILITY_DEFAULTS);
 	});
 });
