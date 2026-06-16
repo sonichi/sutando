@@ -40,7 +40,7 @@ import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
 import { workTool, startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
 import { recordSession, recordToolCall } from './conversation-store.js';
-import { recordVoiceSession } from './realtime-usage.js';
+import { startVoiceTicker, type VoiceTickerHandle } from './realtime-usage.js';
 import { buildSutandoSystemPrompt, buildVoiceAgentContext } from './voice-context.js';
 import { classifyTransportClose, type ClassifiedClose } from './voice-error-classifier.js';
 
@@ -870,6 +870,7 @@ async function main() {
 	const voiceToolIdMap = new Map<string, string>();
 	let voiceSessionStart = Date.now();
 	let metricsWritten = false;
+	let voiceTicker: VoiceTickerHandle | null = null;
 
 	// Authoritative voice-connection state. web-client reads this file
 	// instead of caching the browser's one-shot POST, so a web-client
@@ -919,17 +920,10 @@ async function main() {
 		} catch (err) {
 			console.log(`${ts()} [Observability] Failed to write metrics: ${err}`);
 		}
-		// Spine usage: durable billable ledger line + a `usage.recorded` obs event
-		// (meter.record does both). Kept in its own try, independent of the sqlite
-		// path above, so a sqlite failure never drops billable usage.
-		try {
-			recordVoiceSession({
-				sessionId: SESSION_ID,
-				durationMs: Date.now() - voiceSessionStart,
-				model: VOICE_NATIVE_AUDIO_MODEL,
-				toolCalls: voiceToolCalls.length,
-			});
-		} catch { /* record() is structurally non-throwing; belt-and-suspenders */ }
+		// Spine usage: flush the final partial bucket. The ticker has been emitting
+		// increments every USAGE_TICK_MS while the session ran; stop() emits the
+		// remainder and clears the interval. Independent of the sqlite path above.
+		try { voiceTicker?.stop(); voiceTicker = null; } catch {}
 	}
 
 	const session = new VoiceSession({
@@ -950,6 +944,13 @@ async function main() {
 				voiceSessionStart = Date.now(); metricsWritten = false;
 				voiceEvents.length = 0; voiceToolCalls.length = 0; voiceTranscript.length = 0;
 				voiceEvents.push({ event: 'session_started', timestamp: new Date().toISOString() });
+				// Stop any lingering ticker from the previous session, then start fresh.
+				voiceTicker?.stop();
+				voiceTicker = startVoiceTicker({
+					sessionId: SESSION_ID,
+					model: VOICE_NATIVE_AUDIO_MODEL,
+					toolCallsGetter: () => voiceToolCalls.length,
+				});
 				console.log(`${ts()} [Session] Started: ${e.sessionId}`);
 			},
 			onSessionEnd: (e) => {
