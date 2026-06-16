@@ -75,9 +75,21 @@ trap 'rm -f "$PID_FILE"' EXIT
 TMUX_SOCK="${SUTANDO_TMUX_SOCK:-/tmp/sutando-tmux.sock}"
 TMUX_SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 
+# Wake helper, kept but NOT called on the task paths below. Under the only
+# launch path that exists — Claude Code's `Monitor` tool (CLAUDE.md, the
+# schedule-crons / proactive-loop / startup skills, and the menu-app restart) —
+# Monitor re-invokes the session on each stdout line, which wakes an IDLE
+# session on its own (controlled test 2026-06-13: synthetic task processed in
+# ~30s with no poke — see reference_monitor_notification_wakes_idle_session).
+# So calling this per task only duplicated the wake and spammed the CLI input
+# line on a restart sweep (Chi saw 7-in-a-row, 2026-06-13). The calls were
+# removed in #1679. The helper stays for a future setup that runs this watcher
+# WITHOUT a Monitor consuming stdout (a bare background process in a tmux
+# session) — wire it back into the loops below if you build that path.
+# shellcheck disable=SC2317  # defined-but-unreferenced is intentional
 _tmux_wake() {
   # Poke the idle CLI session so it processes the new task without waiting
-  # for the next 5-min proactive-loop cron tick (sutando-skills#27).
+  # for the next 5-min proactive-loop cron tick (sutando-skills#27 / #1289).
   tmux -S "$TMUX_SOCK" send-keys -t "$TMUX_SESSION" '[watcher-ping]' Enter 2>/dev/null || true
 }
 
@@ -86,7 +98,6 @@ _tmux_wake() {
 shopt -s nullglob
 for f in "$TASKS_DIR"/*.txt; do
   printf 'TASK_FILE: %s\n' "$(basename "$f")" || exit 0
-  _tmux_wake
 done
 shopt -u nullglob
 
@@ -131,7 +142,6 @@ fswatch \
       parent="$(dirname "$path")"
       if [ "$parent" = "$TASKS_DIR_ABS" ] && [ -f "$path" ]; then
         printf 'TASK_FILE: %s\n' "$(basename "$path")" || exit 0
-        _tmux_wake
       fi
       ;;
   esac
