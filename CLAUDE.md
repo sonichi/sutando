@@ -17,6 +17,7 @@ Be concise and direct. Prefer action over explanation. Default to the smallest a
 - **Core services** (`src/`, `skills/phone-conversation/`) are general-purpose infrastructure. They provide generic capabilities (audio streaming, task bridge, tool execution) but must NOT contain feature-specific logic.
 - **Skills** (`skills/`) contain feature-specific logic. Each skill is self-contained and optional — core services work without any skill installed. When implementing new capabilities, start as a skill.
 - **Inline tools** are only for tools that need instant response from Gemini. Prefer skill scripts for complex logic. Only promote to inline if the user says the skill approach is too slow.
+- **Skill config goes in the skill's `manifest.json` `config` block — NOT ad-hoc env vars.** A channel id, feature flag, or toggle is *declared* in `skills/<name>/manifest.json` (the source of truth + default); scripts read it with precedence `CLI arg > env override > manifest config > other config file`, never bare-`os.environ` as the primary source. See [`skills/MANIFEST.md`](skills/MANIFEST.md) for the convention. Don't invent an undocumented env var (Chi 2026-06-16).
 - When refactoring, do NOT change prompts or tool behavior. Prompts are tuned through testing and must be preserved exactly.
 
 ### Where does new code belong? (decision guide — issue #222)
@@ -352,3 +353,5 @@ This also starts the screen capture server (needs terminal for Screen Recording 
 ## Skills
 
 Use skills installed in ~/.claude/skills/ when available. Prefer existing skills over writing new code from scratch.
+
+**Skill manifests.** Skills come in two shapes: most are invoked via the slash-command surface (`/skill-name`) or as standalone scripts; a subset are **manifest-loaded** — a `manifest.json` (+ optional `tools.ts`) that contributes inline tools directly into the voice/phone agent tool table at startup (`loadSkillManifestTools()` in `src/inline-tools.ts`). See [`skills/MANIFEST.md`](skills/MANIFEST.md) for the manifest schema, how tools are loaded and who consumes them, and how to add one. Current manifest-loaded skills carry a per-skill `manifest.json` (e.g. `skills/zoom/`, `skills/screen-companion/`, `skills/gws-gmail-voice/`, `skills/obsidian-vault/`).

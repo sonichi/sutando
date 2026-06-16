@@ -69,6 +69,20 @@ The two-directory scan lets a user keep personal tools (per-talk highlight maps,
 
 Order: public first, then private. If a private skill shares a tool name with a public one, the unique-name assertion fails at startup — by design, the loader does not silently shadow.
 
+## Config-only manifests (non-tools skills)
+
+A skill that contributes **no** runtime tools may still ship a `manifest.json` purely to **declare config** — omit `tools` and the loader applies `config → process.env` (setdefault) then skips the tools import (step 2 above). This is how a pipeline skill keeps its channel ids / feature flags / toggles out of ad-hoc `os.environ[...]` literals and in one declared place (the `config` block is the source of truth + default).
+
+Precedent: `skills/wire-monitor/manifest.json` (`WIRE_REPORT_CHANNEL`) and `skills/wire-newsroom/manifest.json` (`WIRE_PUBLISH_CHANNEL`, `WIRE_AUTO_PACKAGE`). Their `description` notes "manifest present to DECLARE config per this convention."
+
+How a **pipeline script** (a Python/bash stage that runs *outside* the voice-agent process, so it doesn't inherit the loader's `process.env`) reads a declared value, most specific first:
+
+```
+CLI arg  >  env override  >  manifest.json config[key]  >  another config file (e.g. sources.yaml)  >  a per-host state/<key> file
+```
+
+Read the manifest directly when needed — e.g. `publish-wire-episode.py:manifest_config()` reads `skills/wire-newsroom/manifest.json` `config[key]`; `wire-monitor` uses `${ENV:-$(cat state/wire-report-channel)}`. Never wire a bare invented `os.environ[...]` as the *primary* source.
+
 ## Currently active manifest skills
 
 Run `grep -l '"enabled": true' skills/*/manifest.json "$SUTANDO_MEMORY_DIR/skills"/*/manifest.json` for the live list (legacy users may need `$SUTANDO_PRIVATE_DIR` in place of the new var).
