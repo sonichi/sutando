@@ -539,7 +539,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 		const isInbound = !callSession.purpose;
 		// Load Stand identity (voice-context.txt excluded — can confuse phone identity)
 		const standId = (() => { try { const si = JSON.parse(readFileSync(personalPath('stand-identity.json'), 'utf-8')); return si.name ? `Your Stand name is ${si.name}. When asked your name, say "I'm Sutando — ${si.name}."` : ''; } catch { return ''; } })();
-		instructions = [
+		const instructionParts: string[] = [
 			'You are Sutando, a personal AI assistant.',
 			standId,
 			// Identity & greeting — based on owner vs verified vs unverified
@@ -560,7 +560,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 
 		// Owner-only sections
 		if (callSession.isOwner) {
-			instructions.push(
+			instructionParts.push(
 				'',
 				'## How to think',
 				'Before acting, gather what you need. Before delegating, give them what they need.',
@@ -598,7 +598,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 			);
 		}
 
-		instructions = instructions.filter(Boolean).join('\n');
+		instructions = instructionParts.filter(Boolean).join('\n');
 	}
 
 	// Grounding. The "look it up" pointer is conditional on per-surface
@@ -840,7 +840,6 @@ async function createCallSession(params: {
 		host: '127.0.0.1',
 		model: google(VOICE_MODEL),
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
-		googleSearch: PHONE_GOOGLE_SEARCH,
 		speechConfig: { voiceName: 'Aoede' },
 		hooks: {
 			onToolCall: (e) => {
@@ -1571,7 +1570,6 @@ const server = createServer(async (req, res) => {
 				json(res, 200, { status: 'not_playing' });
 			}
 			return;
-			json(res, 200, { status: 'streaming', path: body.path, callSid: session.callSid });
 
 		} else if (path === '/meeting' && req.method === 'POST') {
 			await waitForWebhook();
@@ -1873,7 +1871,6 @@ wss.on('connection', (ws: WebSocket) => {
 									seekSec = parseFloat(pos) || 0;
 								} catch {}
 								// Start ffmpeg from that position
-								if (activePlaybackProc) activePlaybackProc.kill('SIGTERM');
 								const ffmpegProc = spawn('ffmpeg', ['-re', '-ss', String(seekSec), '-i', recPath, '-f', 's16le', '-ar', '24000', '-ac', '1', '-v', 'quiet', 'pipe:1']);
 								activePlaybackProc = ffmpegProc;
 								const ws2 = callSession.twilioWs;
