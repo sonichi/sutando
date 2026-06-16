@@ -29,11 +29,12 @@ const COUNTER_KIND: Record<string, string> = {
 	'claude_code.commit.count': 'cc.git.commit',
 	'claude_code.pull_request.count': 'cc.git.pr',
 	'claude_code.session.count': 'cc.session.count',
-	'claude_code.active_time.total': 'cc.active_time',
 	'claude_code.code_edit_tool.decision': 'cc.tool.decision',
 };
 
 function mapMetric(m: OtelMetricRecord, ctx: MapContext): MapResult {
+	// CC active-session time is intentionally NOT metered (owner: we don't time CC) — drop it.
+	if (m.name === 'claude_code.active_time.total') return { events: [], usage: [] };
 	const res = m.resource;
 	const ts = tsOf(m.ts, ctx);
 	const sessionId = res?.['session.id'];
