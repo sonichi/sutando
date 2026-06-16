@@ -6,6 +6,7 @@
   "scripts": {
     "start": "tsx src/voice-agent.ts",
     "typecheck": "tsc --noEmit",
+    "typecheck:skills": "tsc -p tsconfig.skills.json",
     "test": "tsx --test tests/*.test.ts && npm run test:py",
     "test:py": "for f in tests/*.test.py; do echo \"--- $f ---\" && python3 \"$f\" || exit 1; done"
   },

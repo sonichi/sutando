@@ -269,6 +269,14 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
         pids = [p for p in pids if p]
         if not pids:
             return
+        # pgrep -f matches the same service launched from ANY clone on this
+        # machine. Comparing our src mtime against a foreign clone's process
+        # start produces a perpetual "stale — restart needed" whenever two
+        # checkouts coexist (e.g. a staging clone alongside the live one).
+        # Only processes that belong to THIS checkout are ours to judge.
+        pids = _filter_pids_this_checkout(pids)
+        if not pids:
+            return
         ps_out = subprocess.run(
             ["/bin/ps", "-o", "lstart=", "-p", ",".join(pids)],
             capture_output=True, text=True, timeout=5
@@ -303,6 +311,50 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
             check["detail"] = f"running but code is {int((src_mtime - proc_start) / 60)} min newer than process — restart needed"
     except (subprocess.TimeoutExpired, OSError):
         pass
+
+
+def _filter_pids_this_checkout(pids: list) -> list:
+    """Keep only PIDs whose process belongs to THIS checkout: REPO_DIR appears
+    in the argv (path-boundary match, so a sibling clone whose path is a
+    prefix/suffix doesn't match), or the process cwd is inside REPO_DIR
+    (covers relative-path launches like `npm exec tsx src/voice-agent.ts`).
+    Fail-open: a PID whose argv AND cwd both can't be determined is kept, so
+    a probe failure can't hide a real stale deploy.
+
+    Scope note (review #1650): fail-open covers only the both-probes-failed
+    case. A PID with a readable argv that matches neither repo form, and no
+    matching cwd, is DROPPED — i.e. the guarantee is "keep ours + keep
+    undeterminable", not "keep everything that isn't provably foreign". Fine
+    while services launch with explicit paths or repo-cwd; revisit if a
+    launcher ever rewrites argv and cwd both.
+    """
+    repo_forms = {str(REPO_DIR), str(REPO_DIR.resolve())}  # /tmp vs /private/tmp etc.
+    kept = []
+    for pid in pids:
+        try:
+            argv = subprocess.run(
+                ["/bin/ps", "-o", "command=", "-p", pid],
+                capture_output=True, text=True, timeout=5
+            ).stdout.strip()
+        except (subprocess.TimeoutExpired, OSError):
+            argv = ""
+        if any(f"{repo}/" in argv for repo in repo_forms):
+            kept.append(pid)
+            continue
+        try:
+            lsof_out = subprocess.run(
+                ["/usr/sbin/lsof", "-a", "-p", pid, "-d", "cwd", "-Fn"],
+                capture_output=True, text=True, timeout=5
+            ).stdout
+            cwd = next((ln[1:] for ln in lsof_out.splitlines() if ln.startswith("n")), "")
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            cwd = ""
+        if cwd:
+            if any(cwd == repo or cwd.startswith(f"{repo}/") for repo in repo_forms):
+                kept.append(pid)
+        elif not argv:
+            kept.append(pid)  # neither probe answered — fail open
+    return kept
 
 
 def _file_unchanged_since(src_file: Path, proc_start: float) -> bool:

@@ -72,8 +72,9 @@ def voice_client_connected():
 
 
 def get_waiting_questions():
-    """Parse pending-questions.md — matches both legacy `## Q1 — Title` and
-    the current `## Title` / `- **Status:** unanswered` format.
+    """Parse pending-questions.md — matches the legacy `## Q1 — Title` and
+    `## Title` / `- **Status:** unanswered` section formats AND the free-form
+    `- **[label, ts]** ...` bullet format the proactive-loop writes in practice.
 
     If a section has no explicit **Status:** marker, it is treated as
     unanswered (the free-form prose format used in practice never writes
@@ -107,6 +108,19 @@ def get_waiting_questions():
                 continue  # explicitly resolved/done/answered — skip
         # No status field, or status is unanswered/waiting → notify
         questions.append({"id": title[:40], "title": title})
+
+    # Also recognize the free-form bullet format the proactive-loop and skills
+    # actually append in: `- **[label, timestamp]** ...`. The `## `-section walk
+    # above misses these entirely (real pending-questions.md carries 0 `## `
+    # headings, only bullets), which silently zeroed the count and suppressed
+    # every notification. Bullets follow the same "no Status field ⇒ unanswered"
+    # convention as prose sections (resolved items are deleted, not marked).
+    seen = {q["title"] for q in questions}
+    for m in re.finditer(r'^\s*-\s+\*\*\[(.+?)\]', content, flags=re.MULTILINE):
+        title = m.group(1).strip()
+        if title and title not in seen:
+            seen.add(title)
+            questions.append({"id": title[:40], "title": title})
     return questions
 
 
