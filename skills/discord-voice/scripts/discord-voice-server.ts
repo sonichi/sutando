@@ -600,14 +600,14 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 		const inner = t.execute.bind(t);
 		tools[i] = {
 			...t,
-			execute: async (args: any) => {
+			execute: async (args: any, ctx: any) => {
 				const tier = currentTier(s);
 				const ok = toolAllowed(need, tier);
 				if (!ok) {
 					console.log(`${ts()} [Tier] '${t.name}' denied — speaker tier=${tier}, needs ${need}`);
 					return { status: 'denied', message: `That needs ${need}-tier access; the current speaker is ${tier}-tier.` };
 				}
-				return inner(args);
+				return inner(args, ctx);
 			},
 		};
 	}
@@ -833,7 +833,6 @@ async function createVoiceSession(connection: VoiceConnection, client: Client): 
 		host: '127.0.0.1',
 		model: google(VOICE_MODEL),
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
-		googleSearch: DISCORD_VOICE_GOOGLE_SEARCH,
 		speechConfig: { voiceName: 'Aoede' },
 		// NOTE: turn-end is governed by Gemini Live's built-in automatic VAD plus
 		// the post-utterance silence burst (see SILENCE_BURST_FRAMES). The bundled

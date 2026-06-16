@@ -2631,6 +2631,27 @@ async def _handle_discord_message(message, force=False):
                         f"\n\n[Replying to {ref_author} "
                         f"({ref_msg.created_at.strftime('%Y-%m-%d %H:%M')}): {snippet}]"
                     )
+                # Also download attachments that live on the replied-to
+                # message. Without this, a file shared on a parent message
+                # and then acted on via an @-mention *reply* is silently
+                # dropped — only the reply's own (often empty) attachment
+                # set was scanned above. Same save + sanitized-basename +
+                # image-vision pattern as the primary loop.
+                for att in getattr(ref_msg, "attachments", []):
+                    p_path = INBOX_DIR / f"{int(time.time()*1000)}_{_safe_attachment_basename(att.filename)}"
+                    try:
+                        await att.save(p_path)
+                        attachment_note += f"\n[File attached (from replied-to message): {p_path}]"
+                        try:
+                            ct = (getattr(att, "content_type", "") or "").lower()
+                            if ct.startswith("image/") or str(p_path).lower().endswith(
+                                (".jpg", ".jpeg", ".png", ".webp", ".gif")
+                            ):
+                                _push_vision_image(str(p_path), source="discord")
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        print(f"  [reply-context] parent attachment download failed: {e}", flush=True)
         except Exception as e:
             print(f"  [reply-context] fetch failed: {e}", flush=True)
 
@@ -3432,7 +3453,22 @@ async def poll_results():
                         first = True
                         for chunk in _chunk_for_discord(clean_text):
                             ref = discord.MessageReference(message_id=reply_to_id, channel_id=channel.id, fail_if_not_exists=False) if (first and reply_to_id) else None
-                            await channel.send(chunk, reference=ref)
+                            try:
+                                await channel.send(chunk, reference=ref)
+                            except Exception as e:
+                                # Replying to a *system* message (e.g. the
+                                # thread_created stub a new thread leaves in
+                                # the parent channel) is rejected with 50035
+                                # "Cannot reply to a system message" even with
+                                # fail_if_not_exists=False (observed 2026-06-10:
+                                # an owner reply was dropped entirely). The
+                                # content matters more than the quote anchor —
+                                # retry once as a fresh message.
+                                _http_exc = getattr(discord, "HTTPException", None)
+                                if ref is None or _http_exc is None or not isinstance(e, _http_exc):
+                                    raise
+                                print(f"  [reply-anchor] reference send failed ({e}); retrying without reference", flush=True)
+                                await channel.send(chunk)
                             first = False
                         try:
                             import outbox_log
