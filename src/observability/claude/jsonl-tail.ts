@@ -23,14 +23,15 @@
 
 import { readdirSync, statSync, openSync, readSync, closeSync, appendFileSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
-import { claudeHomePath, resolveWorkspace } from '../../util_paths.ts';
-import { JsonlFileSink } from '../sink.ts';
-import { ledgerPath } from '../meter.ts';
-import { nodeId } from '../node.ts';
-import type { ObsEvent } from '../events.ts';
-import type { UsageRecord } from '../usage.ts';
+import { claudeHomePath } from '../../util_paths.js';
+import { resolveWorkspace } from '../../workspace_default.js';
+import { JsonlFileSink } from '../sink.js';
+import { ledgerPath } from '../meter.js';
+import { nodeId } from '../node.js';
+import type { ObsEvent, AccessTier } from '../events.js';
+import type { UsageRecord } from '../usage.js';
 
-const ACTOR = { user_id: 'core', channel: 'claude-code', access_tier: 'owner', tenant_id: null };
+const ACTOR = { user_id: 'core', channel: 'claude-code', access_tier: 'owner' as AccessTier, tenant_id: null };
 const sink = new JsonlFileSink();
 
 function arg(flag: string): string | undefined {
