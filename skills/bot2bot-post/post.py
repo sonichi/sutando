@@ -2,23 +2,28 @@
 """Post a coordination message from this bot to the #bot2bot channel.
 
 Usage:
-    python3 skills/bot2bot-post/post.py <kind> <text>
+    python3 skills/bot2bot-post/post.py [--to <peer|id>] <kind> <text>
     python3 skills/bot2bot-post/post.py claim "refactor X, ETA 20m"
-    python3 skills/bot2bot-post/post.py blocked "Twilio credentials expired"
+    python3 skills/bot2bot-post/post.py --to pro ping "your take on the WIRE topic?"
+    python3 skills/bot2bot-post/post.py --to lucy opinion "disagreement axis below"
     python3 skills/bot2bot-post/post.py done "shipped PR #472"
-    python3 skills/bot2bot-post/post.py ping "need your take on the IV halo"
 
 Kinds: claim | blocked | done | ping | opinion
+Peers (for --to): a name from ~/.claude/channels/discord/peers.json, or a raw numeric id
 
 The target channel ID is read from `~/.claude/channels/discord/access.json`:
 entries tagged with `{"role": "bot2bot", ...}` in `groups` are candidates. We
 pick the first such channel. If none is tagged, we fall back to the first
 group whose value is just `true` (legacy convention), or error out.
 
-The other bot's user ID is read from the same file's `allowFrom` list,
-excluding this bot (identified via Discord GET /users/@me). The resulting
-`<@id>` mention is prepended so the receiving bot's bridge will process it
-as a task (discord-bridge.py line 244 exception).
+Recipient targeting: pass `--to <peer|id>` to @-mention a specific peer. This
+is the correct way when more than one peer exists — the old auto-resolve below
+assumes a SINGLE other bot and silently mis-fires otherwise (it mentioned Mini
+for a post addressed to Pro, 2026-06-06). Without `--to`, the other bot's user
+ID is read from the bot2bot CHANNEL's `allowFrom`, excluding this bot
+(identified via Discord GET /users/@me) — fine only while exactly one peer is
+allowlisted there. The resulting `<@id>` mention is prepended so the receiving
+bot's bridge will process it as a task (discord-bridge.py line 244 exception).
 
 Requires DISCORD_BOT_TOKEN in ~/.claude/channels/discord/.env.
 """
@@ -29,8 +34,24 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
-ACCESS_JSON = Path.home() / ".claude" / "channels" / "discord" / "access.json"
-ENV_FILE = Path.home() / ".claude" / "channels" / "discord" / ".env"
+# Claude Code per-user home. Mirrors src/util_paths.py `claude_home_path()`
+# (the workspace-revamp resolver). Resolution order, per that branch:
+#   1. $CLAUDE_CONFIG_DIR — M2 workspace-scoped path (set by claude-sutando /
+#      start-cli.sh so bridges see the workspace's .claude-sutando/)
+#   2. $CLAUDE_HOME — legacy alt-host override, kept for tests
+#   3. ~/.claude — vanilla default
+# Replicated inline (not imported) so this standalone skill stays dependency-free.
+def _claude_home() -> Path:
+    for env in ("CLAUDE_CONFIG_DIR", "CLAUDE_HOME"):
+        v = os.environ.get(env)
+        if v:
+            return Path(os.path.expanduser(v))
+    return Path.home() / ".claude"
+
+
+_DISCORD_DIR = _claude_home() / "channels" / "discord"
+ACCESS_JSON = _DISCORD_DIR / "access.json"
+ENV_FILE = _DISCORD_DIR / ".env"
 VALID_KINDS = {"claim", "blocked", "done", "ping", "opinion"}
 
 
@@ -136,12 +157,58 @@ def post(channel_id: str, text: str, token: str):
         sys.exit(f"ERROR: Discord API {e.code}: {e.read().decode()}")
 
 
+# Peer roster lives in per-host config, NOT hardcoded here: this script is
+# shared repo code, so baking one fleet's Discord IDs in would couple it to a
+# single roster (and the IDs already live in the bot2bot channel's allowFrom).
+# Format: { "<name>": "<discord-user-id>", ... } at the path below. Absent file
+# → empty roster (raw numeric --to still works; no-name --to auto-resolves off
+# allowFrom). SELF is never listed — it's resolved per-host via GET /users/@me.
+PEERS_CONFIG_PATH = str(_DISCORD_DIR / "peers.json")
+
+
+def load_peer_roster() -> dict:
+    """Load {name: id} from PEERS_CONFIG_PATH. Empty dict if missing/malformed."""
+    try:
+        with open(PEERS_CONFIG_PATH) as f:
+            data = json.load(f)
+        return {str(k).lower(): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    except (FileNotFoundError, OSError, ValueError):
+        return {}
+
+
+def resolve_to_target(value: str) -> str:
+    """Resolve a --to value (a roster name or a raw numeric ID) to a user ID."""
+    v = value.strip().lstrip("@")
+    if v.isdigit():
+        return v
+    roster = load_peer_roster()
+    key = v.lower()
+    if key in roster:
+        return roster[key]
+    known = ", ".join(sorted(roster)) if roster else f"none configured in {PEERS_CONFIG_PATH}"
+    sys.exit(
+        f"ERROR: --to {value!r} is neither a numeric ID nor a known peer ({known})"
+    )
+
+
 def main():
-    if len(sys.argv) < 3:
+    argv = sys.argv[1:]
+    # Optional explicit recipient: --to <name|id>. When given, the @-mention
+    # targets exactly that peer instead of guessing the sole other bot in the
+    # channel's allowlist (the old behavior mis-fired when >1 peer existed).
+    to_target = None
+    if "--to" in argv:
+        i = argv.index("--to")
+        if i + 1 >= len(argv):
+            sys.exit("ERROR: --to requires a value (peer name or numeric ID)")
+        to_target = argv[i + 1]
+        del argv[i : i + 2]
+
+    if len(argv) < 2:
         print(__doc__, file=sys.stderr)
         sys.exit(1)
-    kind = sys.argv[1]
-    text = " ".join(sys.argv[2:])
+    kind = argv[0]
+    text = " ".join(argv[1:])
     if kind not in VALID_KINDS:
         sys.exit(f"ERROR: kind must be one of {sorted(VALID_KINDS)}, got {kind!r}")
 
@@ -149,7 +216,13 @@ def main():
     access = load_access()
     channel_id = resolve_bot2bot_channel(access)
     self_id = get_self_id(token)
-    other_id = resolve_other_bot(access, self_id, channel_id)
+
+    if to_target is not None:
+        other_id = resolve_to_target(to_target)
+        if other_id == self_id:
+            sys.exit("ERROR: --to resolves to this bot itself; pick a peer")
+    else:
+        other_id = resolve_other_bot(access, self_id, channel_id)
 
     prefix = f"<@{other_id}> " if other_id else ""
     message = f"{prefix}{kind}: {text}"
