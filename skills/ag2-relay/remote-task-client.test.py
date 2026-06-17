@@ -144,6 +144,9 @@ def main() -> int:
               and h.get("inflight") == 2
               and "task-ack" in h.get("capabilities", []),
               "heartbeat payload correct")
+        check("result-skip-markers" in h.get("capabilities", [])
+              and "result-markers" not in h.get("capabilities", []),
+              "heartbeat advertises only local skip-marker handling")
 
     # Backwards compatibility: old relays that only implement pull/results can
     # 404 optional protocol extensions; the client disables them and continues.

@@ -174,7 +174,7 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
             "provider": PROVIDER,
             "tier": LOCAL_TIER,
             "inflight": len(inflight),
-            "capabilities": ["task-ack", "heartbeat", "result-markers"],
+            "capabilities": ["task-ack", "heartbeat", "result-skip-markers"],
         }, timeout=10)
         return True
     except urllib.error.HTTPError as e:
