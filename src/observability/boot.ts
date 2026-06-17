@@ -43,9 +43,10 @@ console.log('collector — one local ingestion point for all sources');
 console.log(`  sources:   ${collector.sources().join(', ') || '(none registered)'}`);
 console.log(`  listening: http://localhost:${port}/ingest/<source>  ·  OTLP http://localhost:${port}/v1/metrics`);
 console.log(`  writing:   ${ws}/logs/events-*.jsonl  +  ${ws}/data/usage/usage-*.jsonl  (metering ledger)`);
+const headerCount = Object.keys(metering.headers ?? {}).length;
 console.log(
 	metering.enabled && metering.endpoint
-		? `  exporting: usage → ${metering.endpoint}  (metering.enabled)`
+		? `  exporting: usage → ${metering.endpoint}  (metering.enabled${headerCount ? `, ${headerCount} custom header(s)` : ''})`
 		: '  exporting: off  (set SUTANDO_METERING_ENABLED=1 + SUTANDO_METERING_ENDPOINT=<url> to forward usage upstream)',
 );
 

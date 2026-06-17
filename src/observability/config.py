@@ -29,7 +29,7 @@ __all__ = ["OBSERVABILITY_DEFAULTS", "load_observability_config"]
 # In-code defaults -- the floor the env knobs and workspace override layer onto.
 OBSERVABILITY_DEFAULTS: dict[str, Any] = {
     "observability": {"sinks": [{"type": "jsonl-file"}], "sampling": {"trace": 1.0}},
-    "metering": {"enabled": False, "endpoint": None, "batchMax": 100},
+    "metering": {"enabled": False, "endpoint": None, "batchMax": 100, "headers": None},
     "tenant": {"id": None, "mode": "byok"},
 }
 
@@ -67,6 +67,7 @@ def _overlay(base: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any]:
             "enabled": meter.get("enabled", base["metering"]["enabled"]),
             "endpoint": meter.get("endpoint", base["metering"]["endpoint"]),
             "batchMax": meter.get("batchMax", base["metering"]["batchMax"]),
+            "headers": meter.get("headers", base["metering"]["headers"]),
         },
         "tenant": {
             "id": tenant.get("id", base["tenant"]["id"]),
@@ -92,6 +93,17 @@ def load_observability_config(workspace: Path | None = None) -> dict[str, Any]:
     met_endpoint = os.environ.get("SUTANDO_METERING_ENDPOINT", "").strip()
     if met_endpoint:
         cfg["metering"]["endpoint"] = met_endpoint
+    met_headers = os.environ.get("SUTANDO_METERING_HEADERS", "").strip()
+    if met_headers:
+        try:
+            parsed = json.loads(met_headers)
+            if isinstance(parsed, dict):
+                cfg["metering"]["headers"] = parsed
+        except ValueError:
+            print(
+                "[observability-config] SUTANDO_METERING_HEADERS is not valid JSON, ignoring",
+                file=sys.stderr,
+            )
 
     # 3. workspace override (machine-local; wins, per the documented order)
     ws = workspace if workspace is not None else resolve_workspace(migrate=False)

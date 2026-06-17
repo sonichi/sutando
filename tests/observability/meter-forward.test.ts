@@ -25,13 +25,14 @@ function rec(usage_id: string): UsageRecord {
 
 const ON: MeteringSection = { enabled: true, endpoint: 'http://127.0.0.1:9999/usage', batchMax: 3 };
 
-/** Stub fetch that records each POST and replies with the queued ok/err verdicts. */
+/** Stub fetch that records each POST (incl. headers) and replies with the
+ *  queued ok/err verdicts. */
 function stubFetch(verdicts: boolean[] = []) {
-	const posts: { url: string; usageIds: string[] }[] = [];
+	const posts: { url: string; usageIds: string[]; headers: Record<string, string> }[] = [];
 	let i = 0;
 	const impl: FetchLike = async (url, init) => {
 		const body = JSON.parse(String(init.body)) as { usage: UsageRecord[] };
-		posts.push({ url, usageIds: body.usage.map((u) => u.usage_id) });
+		posts.push({ url, usageIds: body.usage.map((u) => u.usage_id), headers: (init.headers ?? {}) as Record<string, string> });
 		const ok = i < verdicts.length ? verdicts[i] : true;
 		i++;
 		return { ok };
@@ -101,6 +102,71 @@ describe('HttpMeterForwarder', () => {
 		f.forward(rec('a'));
 		await f.stop();
 		assert.deepEqual(posts.map((p) => p.usageIds), [['a']]);
+	});
+});
+
+describe('HttpMeterForwarder — headers (auth tokens)', () => {
+	it('always sends content-type json', async () => {
+		const { impl, posts } = stubFetch();
+		const f = meterForwarderFromConfig(ON, { fetchImpl: impl })!;
+		f.forward(rec('a'));
+		await f.flush();
+		assert.equal(posts[0].headers['content-type'], 'application/json');
+	});
+
+	it('sends static metering.headers (e.g. a service token) on every POST', async () => {
+		const { impl, posts } = stubFetch();
+		const cfg: MeteringSection = { ...ON, headers: { Authorization: 'Bearer static-tok', 'X-Tenant': 't1' } };
+		const f = meterForwarderFromConfig(cfg, { fetchImpl: impl })!;
+		f.forward(rec('a'));
+		await f.flush();
+		assert.equal(posts[0].headers.Authorization, 'Bearer static-tok');
+		assert.equal(posts[0].headers['X-Tenant'], 't1');
+	});
+
+	it('injected opts.headers override config headers', async () => {
+		const { impl, posts } = stubFetch();
+		const cfg: MeteringSection = { ...ON, headers: { Authorization: 'Bearer from-config' } };
+		const f = meterForwarderFromConfig(cfg, { fetchImpl: impl, headers: { Authorization: 'Bearer injected' } })!;
+		f.forward(rec('a'));
+		await f.flush();
+		assert.equal(posts[0].headers.Authorization, 'Bearer injected');
+	});
+
+	it('headersProvider supplies a fresh token per flush (rotating) and wins', async () => {
+		const { impl, posts } = stubFetch();
+		let n = 0;
+		const f = meterForwarderFromConfig(ON, {
+			fetchImpl: impl,
+			headers: { Authorization: 'Bearer static' },
+			headersProvider: () => ({ Authorization: `Bearer rotating-${++n}` }),
+		})!;
+		f.forward(rec('a'));
+		await f.flush();
+		f.forward(rec('b'));
+		await f.flush();
+		assert.deepEqual(posts.map((p) => p.headers.Authorization), ['Bearer rotating-1', 'Bearer rotating-2']);
+	});
+
+	it('a throwing headersProvider never throws out — batch is requeued + retried', async () => {
+		const { impl, posts } = stubFetch();
+		let fail = true;
+		const f = meterForwarderFromConfig(ON, {
+			fetchImpl: impl,
+			headersProvider: () => {
+				if (fail) {
+					fail = false;
+					throw new Error('token mint failed');
+				}
+				return { Authorization: 'Bearer ok' };
+			},
+		})!;
+		f.forward(rec('a'));
+		await f.flush(); // provider throws → no POST, requeue
+		assert.equal(posts.length, 0);
+		await f.flush(); // provider ok → POST goes out
+		assert.deepEqual(posts.map((p) => p.usageIds), [['a']]);
+		assert.equal(posts[0].headers.Authorization, 'Bearer ok');
 	});
 });
 

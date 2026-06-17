@@ -9,11 +9,13 @@
  * may be another collector OR a custom receiver (e.g. a cloud shipper) with no
  * shape translation.
  *
- * Best-effort, never-throws, and provider-agnostic: it carries NO auth or
- * cloud-contract specifics — authentication, the upstream API shape, and the
- * durable cursor/exactly-once shipper are the receiver's concern (still
- * post-parity; see meter.ts). The local ledger stays the source of truth, so a
- * dropped batch never loses billing data — it's reconcilable from the ledger.
+ * Best-effort, never-throws, and provider-agnostic: it carries NO hard-coded
+ * cloud-contract specifics. Auth is the deployment's job — supply it via
+ * `metering.headers` (static, e.g. `{ "Authorization": "Bearer …" }`) or, for a
+ * rotating token, inject a `headersProvider` evaluated per flush. The upstream
+ * API shape and the durable cursor/exactly-once shipper remain the receiver's
+ * concern (still post-parity; see meter.ts). The local ledger stays the source
+ * of truth, so a dropped batch never loses billing data — it's reconcilable.
  * On a transient failure the batch is re-queued at the head and retried; the
  * receiver dedups on `usage_id`, so an at-least-once re-POST is safe.
  *
@@ -45,6 +47,11 @@ export interface MeterForwarder {
 /** Minimal fetch shape — the global `fetch` satisfies it; tests inject a stub. */
 export type FetchLike = (url: string, init: RequestInit) => Promise<{ ok: boolean }>;
 
+/** Supplies fresh headers per flush — for a rotating auth token the static
+ *  `metering.headers` can't express. Merged last (wins). Never call into the
+ *  collector's hot path; resolve from a cached/in-memory token. */
+export type HeadersProvider = () => Record<string, string> | Promise<Record<string, string>>;
+
 class HttpMeterForwarder implements MeterForwarder {
 	private queue: UsageRecord[] = [];
 	private timer: ReturnType<typeof setTimeout> | null = null;
@@ -56,7 +63,17 @@ class HttpMeterForwarder implements MeterForwarder {
 		private readonly batchMax: number,
 		private readonly flushMs: number,
 		private readonly fetchImpl: FetchLike,
+		private readonly staticHeaders: Record<string, string> = {},
+		private readonly headersProvider?: HeadersProvider,
 	) {}
+
+	/** content-type floor < static (config/injected) headers < per-flush dynamic
+	 *  headers (auth token). A provider that throws bubbles to flush()'s catch →
+	 *  the batch is re-queued and retried, never lost. */
+	private async buildHeaders(): Promise<Record<string, string>> {
+		const dynamic = this.headersProvider ? await this.headersProvider() : undefined;
+		return { 'content-type': 'application/json', ...this.staticHeaders, ...(dynamic ?? {}) };
+	}
 
 	forward(rec: UsageRecord): void {
 		if (this.stopped) return;
@@ -73,7 +90,7 @@ class HttpMeterForwarder implements MeterForwarder {
 		try {
 			const res = await this.fetchImpl(this.endpoint, {
 				method: 'POST',
-				headers: { 'content-type': 'application/json' },
+				headers: await this.buildHeaders(),
 				body: JSON.stringify({ usage: batch }),
 			});
 			if (!res.ok) this.requeue(batch); // non-2xx → retry next flush
@@ -112,18 +129,31 @@ class HttpMeterForwarder implements MeterForwarder {
 }
 
 /** Build a forwarder from a metering config block, or `null` when export is off
- *  (disabled or no endpoint). `opts` is for tests (inject fetch / flush cadence). */
+ *  (disabled or no endpoint).
+ *
+ *  Headers sent on every POST merge in this order (later wins): the
+ *  `content-type` floor, `metering.headers` (config), `opts.headers` (injected
+ *  static), then `opts.headersProvider()` (per-flush dynamic, e.g. a rotating
+ *  auth token). `opts.fetchImpl` / `opts.flushMs` are test seams. */
 export function meterForwarderFromConfig(
 	cfg: MeteringSection,
-	opts?: { fetchImpl?: FetchLike; flushMs?: number },
+	opts?: {
+		fetchImpl?: FetchLike;
+		flushMs?: number;
+		headers?: Record<string, string>;
+		headersProvider?: HeadersProvider;
+	},
 ): MeterForwarder | null {
 	if (!cfg.enabled || !cfg.endpoint) return null;
 	const batchMax = cfg.batchMax > 0 ? cfg.batchMax : 100;
+	const staticHeaders = { ...(cfg.headers ?? {}), ...(opts?.headers ?? {}) };
 	return new HttpMeterForwarder(
 		cfg.endpoint,
 		batchMax,
 		opts?.flushMs ?? METER_FORWARD_FLUSH_MS,
 		opts?.fetchImpl ?? (fetch as FetchLike),
+		staticHeaders,
+		opts?.headersProvider,
 	);
 }
 
