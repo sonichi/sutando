@@ -6,9 +6,13 @@
  * the `Normalizer` registered for that source, which maps it into the universal
  * ObsEvent/UsageRecord schema, then the collector writes every result through
  * the SAME sink-set (events) + usage ledger. That uniform write path is what
- * keeps heterogeneous sources consistent AND what later forwards upstream: the
- * sink-set is resolved from `observability.sinks`, so adding a forward sink fans
- * every normalized event out to an upstream collector with zero changes here.
+ * keeps heterogeneous sources consistent AND what forwards upstream: events fan
+ * out via the `observability.sinks` set (adding a forward sink ships them to an
+ * upstream collector), and usage records additionally fan out via the
+ * `usageForwarder` — the metering EXPORT seam, resolved from `metering.endpoint`
+ * (see meter-forward.ts), which POSTs the billable records upstream. Both are
+ * best-effort second hops over the durable local floor (sinks' jsonl + the
+ * meter ledger); neither is on by default.
  *
  * Writes go DIRECTLY through the sink-set (not `obs.emit`) so source-derived
  * ids/traces survive and nothing is sampled away — these events were already
@@ -23,6 +27,7 @@ import { nodeId } from '../node.js';
 import { sinkFromConfig, type Sink } from '../sink.js';
 import { loadObservabilityConfig } from '../config.js';
 import { writeLedger } from '../meter.js';
+import { defaultMeterForwarder, type MeterForwarder } from '../meter-forward.js';
 import type { ObsEvent } from '../events.js';
 import type { UsageRecord } from '../usage.js';
 import type { Normalizer, NormalizeResult } from './normalizer.js';
@@ -60,12 +65,21 @@ export class Collector {
 	private readonly normalizers = new Map<string, Normalizer>();
 	private readonly sinks: Sink[];
 	private readonly usageWriter: (u: UsageRecord) => void;
+	private readonly usageForwarder: MeterForwarder | null;
 
 	/** `sinks` defaults to the configured obs sink-set (jsonl-file floor + any
-	 *  forward sink); `usageWriter` defaults to the durable meter ledger append. */
-	constructor(opts?: { sinks?: Sink[]; usageWriter?: (u: UsageRecord) => void }) {
+	 *  forward sink); `usageWriter` defaults to the durable meter ledger append;
+	 *  `usageForwarder` defaults to the config-resolved metering export (`null`
+	 *  when export is off). Pass `usageForwarder: null` to force it off (tests). */
+	constructor(opts?: {
+		sinks?: Sink[];
+		usageWriter?: (u: UsageRecord) => void;
+		usageForwarder?: MeterForwarder | null;
+	}) {
 		this.sinks = opts?.sinks ?? defaultSinks();
 		this.usageWriter = opts?.usageWriter ?? writeLedger;
+		this.usageForwarder =
+			opts && 'usageForwarder' in opts ? (opts.usageForwarder ?? null) : defaultMeterForwarder();
 	}
 
 	register(n: Normalizer): this {
@@ -102,11 +116,22 @@ export class Collector {
 		for (const e of res.events) this.writeEvent(e);
 		for (const u of res.usage) {
 			try {
-				this.usageWriter(u);
+				this.usageWriter(u); // durable local floor (ledger)
 			} catch {
 				/* never throw out of the collector */
 			}
+			try {
+				this.usageForwarder?.forward(u); // optional upstream export
+			} catch {
+				/* forward is best-effort — the ledger is the source of truth */
+			}
 		}
+	}
+
+	/** Flush + stop the upstream usage forwarder so the final partial batch isn't
+	 *  stranded on shutdown. No-op when metering export is off. */
+	async stop(): Promise<void> {
+		await this.usageForwarder?.stop();
 	}
 
 	private writeEvent(e: ObsEvent): void {
