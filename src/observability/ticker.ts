@@ -46,6 +46,9 @@ export function startTicker<T>(
 		try { onTick(now - lastMs, lastMs); } catch { /* non-throwing by contract; belt-and-suspenders */ }
 		lastMs = now;
 	}, intervalMs);
+	// Defense-in-depth: a leaked ticker (caller forgot stop()) must not keep the
+	// Node process alive on its own. unref() lets the event loop exit anyway.
+	timer.unref?.();
 	return {
 		stop: () => {
 			if (stopped) return undefined;

@@ -904,6 +904,12 @@ async function main() {
 	writeVoiceState(false);
 
 	function writeVoiceMetrics() {
+		// Spine usage: flush the final partial bucket and clear the interval FIRST,
+		// before the metricsWritten guard. stop() is idempotent (voiceTicker→null),
+		// so a double-flush never double-emits — but doing it before the guard means
+		// a leaked ticker can NEVER keep firing past a flush (otherwise it would emit
+		// phantom voice.seconds every USAGE_TICK_MS during the post-session idle gap).
+		try { voiceTicker?.stop(); voiceTicker = null; } catch {}
 		if (metricsWritten) return;
 		metricsWritten = true;
 		try {
@@ -920,10 +926,21 @@ async function main() {
 		} catch (err) {
 			console.log(`${ts()} [Observability] Failed to write metrics: ${err}`);
 		}
-		// Spine usage: flush the final partial bucket. The ticker has been emitting
-		// increments every USAGE_TICK_MS while the session ran; stop() emits the
-		// remainder and clears the interval. Independent of the sqlite path above.
-		try { voiceTicker?.stop(); voiceTicker = null; } catch {}
+	}
+
+	// Start (or restart) the realtime usage ticker for a fresh logical session.
+	// Called from BOTH session-reset points: bodhi's onSessionStart (first ACTIVE
+	// transition) AND handleClientConnected's reconnect-reset (bodhi's
+	// onSessionStart never re-fires — see the #1372 note below — so without this
+	// every 2nd+ session in one process would run with no ticker and emit zero
+	// usage). Stops any lingering ticker first (no-op if already flushed to null).
+	function startVoiceUsageTicker() {
+		voiceTicker?.stop();
+		voiceTicker = startVoiceTicker({
+			sessionId: SESSION_ID,
+			model: VOICE_NATIVE_AUDIO_MODEL,
+			toolCallsGetter: () => voiceToolCalls.length,
+		});
 	}
 
 	const session = new VoiceSession({
@@ -944,13 +961,7 @@ async function main() {
 				voiceSessionStart = Date.now(); metricsWritten = false;
 				voiceEvents.length = 0; voiceToolCalls.length = 0; voiceTranscript.length = 0;
 				voiceEvents.push({ event: 'session_started', timestamp: new Date().toISOString() });
-				// Stop any lingering ticker from the previous session, then start fresh.
-				voiceTicker?.stop();
-				voiceTicker = startVoiceTicker({
-					sessionId: SESSION_ID,
-					model: VOICE_NATIVE_AUDIO_MODEL,
-					toolCallsGetter: () => voiceToolCalls.length,
-				});
+				startVoiceUsageTicker();
 				console.log(`${ts()} [Session] Started: ${e.sessionId}`);
 			},
 			onSessionEnd: (e) => {
@@ -1390,6 +1401,9 @@ async function main() {
 				voiceSessionStart = Date.now(); metricsWritten = false;
 				voiceEvents.length = 0; voiceToolCalls.length = 0; voiceTranscript.length = 0;
 				voiceEvents.push({ event: 'session_started:client_connect', timestamp: new Date().toISOString() });
+				// bodhi's onSessionStart won't re-fire (#1372 above), so start the
+				// usage ticker here too — otherwise this reconnect session emits no usage.
+				startVoiceUsageTicker();
 				console.log(`${ts()} [Session] Client connected after prior flush — reset metrics buffer`);
 			}
 			writeVoiceState(true);
