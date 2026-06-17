@@ -13,6 +13,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
 	sanitizeKey,
 	resultFilename,
@@ -247,5 +248,55 @@ describe('typed key constructors', () => {
 		// prefixes they remain distinct.
 		const sameId = 'CA1234abcd';
 		assert.notEqual(discordVoiceKey(sameId), phoneCallKey(sameId));
+	});
+});
+
+// ── Cross-language parity ──────────────────────────────────────────────────
+// The SAME shared fixture the Python twin (tests/result-channel-key.test.py)
+// loads. One input/output table, asserted in both languages, so the TS impl
+// (src/result-channel-key.ts) and the Python impl (src/result_channel_key.py)
+// can never silently drift. Change an impl → the matching row fails in the
+// OTHER language's test too. (Lucy's flag on PR #1595.)
+describe('cross-language parity fixture', () => {
+	const fixture = JSON.parse(
+		readFileSync(new URL('./fixtures/result-channel-key.parity.json', import.meta.url), 'utf8'),
+	) as Record<string, any[]>;
+
+	it('sanitizeKey matches the shared fixture', () => {
+		for (const c of fixture.sanitizeKey) {
+			assert.equal(sanitizeKey(c.in), c.out, `sanitizeKey(${JSON.stringify(c.in)})`);
+		}
+	});
+
+	it('resultFilename matches the shared fixture', () => {
+		for (const c of fixture.resultFilename) {
+			assert.equal(resultFilename(c.channelKey, c.taskId), c.out, JSON.stringify(c));
+		}
+	});
+
+	it('parseResultFilename matches the shared fixture', () => {
+		for (const c of fixture.parseResultFilename) {
+			const [key, taskId] = parseResultFilename(c.in);
+			assert.equal(key, c.key, `key for ${c.in}`);
+			assert.equal(taskId, c.taskId, `taskId for ${c.in}`);
+		}
+	});
+
+	it('resultBelongsTo matches the shared fixture', () => {
+		for (const c of fixture.resultBelongsTo) {
+			assert.equal(resultBelongsTo(c.filename, c.channelKey), c.out, JSON.stringify(c));
+		}
+	});
+
+	it('discordVoiceKey matches the shared fixture', () => {
+		for (const c of fixture.discordVoiceKey) {
+			assert.equal(discordVoiceKey(c.in), c.out, JSON.stringify(c));
+		}
+	});
+
+	it('phoneCallKey matches the shared fixture', () => {
+		for (const c of fixture.phoneCallKey) {
+			assert.equal(phoneCallKey(c.in), c.out, JSON.stringify(c));
+		}
 	});
 });

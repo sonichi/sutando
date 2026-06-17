@@ -8,6 +8,7 @@ Run: python3 tests/result-channel-key.test.py
 Exit code: 0 on pass, 1 on fail.
 """
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -235,6 +236,50 @@ class TestTypedKeyConstructors(unittest.TestCase):
             discord_voice_key(same_id),
             phone_call_key(same_id),
         )
+
+
+class TestCrossLanguageParityFixture(unittest.TestCase):
+    """Asserts the SAME shared fixture the TS twin loads
+    (tests/result-channel-key.test.ts) — one input/output table, asserted in
+    both languages, so the Python impl (src/result_channel_key.py) and the TS
+    impl (src/result-channel-key.ts) can never silently drift. Change an impl →
+    the matching row fails in the OTHER language's test too. (Lucy on #1595.)
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        path = REPO / "tests" / "fixtures" / "result-channel-key.parity.json"
+        cls.fx = json.loads(path.read_text())
+
+    def test_sanitize_key(self):
+        for c in self.fx["sanitizeKey"]:
+            self.assertEqual(sanitize_key(c["in"]), c["out"], f"sanitize_key({c['in']!r})")
+
+    def test_result_filename(self):
+        for c in self.fx["resultFilename"]:
+            self.assertEqual(
+                result_filename(c["channelKey"], c["taskId"]), c["out"], repr(c)
+            )
+
+    def test_parse_result_filename(self):
+        for c in self.fx["parseResultFilename"]:
+            key, task_id = parse_result_filename(c["in"])
+            self.assertEqual(key, c["key"], f"key for {c['in']}")
+            self.assertEqual(task_id, c["taskId"], f"taskId for {c['in']}")
+
+    def test_result_belongs_to(self):
+        for c in self.fx["resultBelongsTo"]:
+            self.assertEqual(
+                result_belongs_to(c["filename"], c["channelKey"]), c["out"], repr(c)
+            )
+
+    def test_discord_voice_key(self):
+        for c in self.fx["discordVoiceKey"]:
+            self.assertEqual(discord_voice_key(c["in"]), c["out"], repr(c))
+
+    def test_phone_call_key(self):
+        for c in self.fx["phoneCallKey"]:
+            self.assertEqual(phone_call_key(c["in"]), c["out"], repr(c))
 
 
 if __name__ == "__main__":
