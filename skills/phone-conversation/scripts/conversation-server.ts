@@ -84,7 +84,7 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '../../../src/inline-tools.js';
 import { recordSession, recordConversation, recordToolCall } from '../../../src/conversation-store.js';
-import { startPhoneTicker, type PhoneTickerHandle } from '../../../src/observability/realtime.js';
+import { startPhoneTicker, type TickerControl } from '../../../src/observability/realtime.js';
 import { resultBelongsTo, phoneCallKey } from '../../../src/result-channel-key.js';
 // Lazy vision-session handle. Only loaded if a call ever needs it — keeps the
 // phone-agent boot path free of the vision-tools.ts side-effects on cold start.
@@ -341,7 +341,7 @@ interface CallSession {
 	toolCalls: { name: string; durationMs: number; timestamp: string }[];
 	events: { event: string; timestamp: string }[];
 	// Realtime usage ticker — emits voice+phone seconds incrementally while live.
-	usageTicker?: PhoneTickerHandle;
+	usageTicker?: TickerControl;
 	// Per-call channel-scan state (results/<callSid>.task-*.txt pull path).
 	channelScanHandle?: NodeJS.Timeout;
 	// Safety-net against silent unlinkSync failures — `name -> first-seen ms`,

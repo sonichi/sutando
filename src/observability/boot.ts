@@ -21,12 +21,13 @@ import { serveCollector } from './collector/server.js';
 import { resolveWorkspace } from '../workspace_default.js';
 import { ClaudeCodeHookNormalizer } from './claude/hook-normalizer.js';
 import { ClaudeCodeOtelNormalizer, CC_OTEL_SOURCE } from './claude/otel-normalizer.js';
+import { RealtimeNormalizer } from './realtime-normalizer.js';
 
 const collector = new Collector()
 	.register(new ClaudeCodeHookNormalizer()) // obs events  (hooks → /ingest/claude-code-hooks)
-	.register(new ClaudeCodeOtelNormalizer()); // token+cost metering (OTLP → /v1/metrics)
+	.register(new ClaudeCodeOtelNormalizer()) // token+cost metering (OTLP → /v1/metrics)
+	.register(new RealtimeNormalizer()); // voice + phone seconds (voice-agent/phone → /ingest/realtime)
 // Next sources plug in the SAME collector — one ingestion point, many normalizers:
-//   .register(new VoiceAgentNormalizer())
 //   .register(new FileWatcherNormalizer())
 
 const port = Number(process.env.SUTANDO_OBS_PORT) || 4000;

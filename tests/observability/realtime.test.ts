@@ -1,46 +1,14 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { ledgerPath } from '../../src/observability/meter.js';
-import { resetSinks, registerSink } from '../../src/observability/obs.js';
 import type { ObsEvent } from '../../src/observability/events.js';
+import type { UsageRecord } from '../../src/observability/usage.js';
 import type { Sink } from '../../src/observability/sink.js';
-import { recordVoiceSession, recordPhoneCall, startVoiceTicker, startPhoneTicker, advisoryCostUsd, durationSeconds } from '../../src/observability/realtime.js';
+import { Collector } from '../../src/observability/collector/collector.js';
+import { RealtimeNormalizer, REALTIME_SOURCE } from '../../src/observability/realtime-normalizer.js';
+import { mapRealtime, advisoryCostUsd, durationSeconds } from '../../src/observability/realtime-map.js';
+import { sendVoiceUsage, startVoiceTicker, startPhoneTicker } from '../../src/observability/realtime.js';
 
-const ENV = ['SUTANDO_WORKSPACE', 'SUTANDO_TENANT_ID', 'SUTANDO_TENANT_MODE', 'SUTANDO_METERING_FSYNC'];
-let saved: Record<string, string | undefined>;
-let ws: string;
-let cap: { type: string; events: ObsEvent[]; write(ev: ObsEvent): void };
-
-beforeEach(() => {
-	saved = {};
-	for (const k of ENV) {
-		saved[k] = process.env[k];
-		delete process.env[k];
-	}
-	ws = mkdtempSync(join(tmpdir(), 'realtime-usage-'));
-	process.env.SUTANDO_WORKSPACE = ws;
-	resetSinks();
-	cap = { type: 'capture', events: [], write(ev) { this.events.push(ev); } };
-	registerSink(cap as Sink);
-});
-
-afterEach(() => {
-	for (const k of ENV) {
-		if (saved[k] === undefined) delete process.env[k];
-		else process.env[k] = saved[k];
-	}
-	rmSync(ws, { recursive: true, force: true });
-	resetSinks();
-});
-
-function ledgerLines(ts: number): string[] {
-	const path = ledgerPath(ts * 1000, ws);
-	if (!existsSync(path)) return [];
-	return readFileSync(path, 'utf-8').split('\n').filter((l) => l.length > 0);
-}
+const CTX = { node: 'test-node', receivedAt: 1_700_000_000 };
 
 describe('helpers', () => {
 	it('durationSeconds floors at 0 and rounds', () => {
@@ -55,138 +23,192 @@ describe('helpers', () => {
 	});
 });
 
-describe('recordVoiceSession', () => {
-	it('writes a voice.seconds ledger line AND emits a usage.recorded event', () => {
-		const rec = recordVoiceSession({ sessionId: 'session_42', durationMs: 90_000, model: 'gemini-3-flash-live', toolCalls: 3 });
-		assert.ok(rec);
-		assert.equal(rec!.meter, 'voice.seconds');
-		assert.equal(rec!.quantity, 90);
-		assert.equal(rec!.unit, 'seconds');
-		assert.equal(rec!.provider, 'gemini-live');
-		assert.equal(rec!.source, 'voice-agent');
-		assert.equal(rec!.provider_ref, 'session_42');
-		assert.equal(rec!.usage_id, 'voice.seconds:session_42'); // stable, dedup-friendly
-		assert.equal(rec!.attrs.model, 'gemini-3-flash-live');
-		assert.equal(rec!.attrs.tool_calls, 3);
-		assert.equal(rec!.attrs.cost_usd, undefined); // realtime model: no advisory rate yet
+describe('mapRealtime — voice', () => {
+	it('one voice.session → 1 usage record + 1 usage.recorded event, trace derived from session id', () => {
+		const { events, usage } = mapRealtime(
+			{ kind: 'voice.session', sessionId: 'session_42', durationMs: 90_000, model: 'gemini-3-flash-live', toolCalls: 3 },
+			CTX,
+		);
+		assert.equal(usage.length, 1);
+		assert.equal(events.length, 1);
+		const rec = usage[0];
+		assert.equal(rec.meter, 'voice.seconds');
+		assert.equal(rec.quantity, 90);
+		assert.equal(rec.unit, 'seconds');
+		assert.equal(rec.provider, 'gemini-live');
+		assert.equal(rec.source, 'voice-agent');
+		assert.equal(rec.provider_ref, 'session_42');
+		assert.equal(rec.usage_id, 'voice.seconds:session_42'); // one-shot → no bucket suffix
+		assert.equal(rec.trace_id, 'voice-sess:session_42'); // derived, not minted
+		assert.equal(rec.tenant_id, null);
+		assert.equal(rec.attrs.model, 'gemini-3-flash-live');
+		assert.equal(rec.attrs.tool_calls, 3);
+		assert.equal(rec.attrs.cost_usd, undefined); // realtime model: no advisory rate
 
-		// emitted like an event
-		const adv = cap.events.find((e) => e.kind === 'usage.recorded');
-		assert.ok(adv, 'expected a usage.recorded obs event');
-		assert.equal(adv!.source, 'voice-agent');
-		assert.equal((adv!.data as Record<string, unknown>).meter, 'voice.seconds');
-		assert.equal((adv!.data as Record<string, unknown>).usage_id, 'voice.seconds:session_42');
-
-		// durable ledger
-		const lines = ledgerLines(rec!.ts);
-		assert.equal(lines.length, 1);
-		assert.deepEqual(JSON.parse(lines[0]), rec);
+		const adv = events[0];
+		assert.equal(adv.kind, 'usage.recorded');
+		assert.equal(adv.source, 'voice-agent');
+		assert.equal(adv.trace_id, rec.trace_id); // ledger ↔ event correlate
+		assert.equal((adv.data as Record<string, unknown>).usage_id, 'voice.seconds:session_42');
+		assert.equal(adv.node, 'test-node');
 	});
 
-	it('skips a zero-length session (no record, no event)', () => {
-		const rec = recordVoiceSession({ sessionId: 's0', durationMs: 200, model: 'm' });
-		assert.equal(rec, null);
-		assert.equal(cap.events.filter((e) => e.kind === 'usage.recorded').length, 0);
+	it('bucketStartMs → bucket-keyed usage_id (incremental tick)', () => {
+		const { usage } = mapRealtime(
+			{ kind: 'voice.session', sessionId: 's1', durationMs: 30_000, model: 'm', bucketStartMs: 1_700_000_000_000 },
+			CTX,
+		);
+		assert.equal(usage[0].usage_id, 'voice.seconds:s1:b1700000000');
+	});
+
+	it('zero-length session → dropped', () => {
+		assert.deepEqual(mapRealtime({ kind: 'voice.session', sessionId: 's0', durationMs: 200, model: 'm' }, CTX), { events: [], usage: [] });
 	});
 });
 
-describe('recordPhoneCall', () => {
-	it('emits BOTH a twilio telephony leg and a gemini-live model leg, keyed by Call SID', () => {
-		const recs = recordPhoneCall({ callSid: 'CA123', durationMs: 120_000, model: 'gemini-2.5-flash', isOwner: true, isMeeting: false, toolCalls: 2 });
-		assert.equal(recs.length, 2);
+describe('mapRealtime — phone', () => {
+	it('one phone.call → twilio + gemini-live legs sharing trace + Call SID', () => {
+		const { events, usage } = mapRealtime(
+			{ kind: 'phone.call', callSid: 'CA123', durationMs: 120_000, model: 'gemini-2.5-flash', isOwner: true, isMeeting: false, toolCalls: 2 },
+			CTX,
+		);
+		assert.equal(usage.length, 2);
+		assert.equal(events.length, 2);
 
-		const tel = recs.find((r) => r.meter === 'phone.seconds')!;
+		const tel = usage.find((r) => r.meter === 'phone.seconds')!;
 		assert.equal(tel.provider, 'twilio');
 		assert.equal(tel.source, 'phone');
 		assert.equal(tel.quantity, 120);
-		assert.equal(tel.provider_ref, 'CA123');
 		assert.equal(tel.usage_id, 'phone.seconds:CA123');
 		assert.equal(tel.attrs.cost_usd, 0.017); // 2 min @ $0.0085/min
 		assert.equal(tel.attrs.is_owner, true);
 
-		const model = recs.find((r) => r.meter === 'voice.seconds')!;
+		const model = usage.find((r) => r.meter === 'voice.seconds')!;
 		assert.equal(model.provider, 'gemini-live');
-		assert.equal(model.provider_ref, 'CA123');
 		assert.equal(model.usage_id, 'voice.seconds:CA123');
 		assert.equal(model.attrs.model, 'gemini-2.5-flash');
 		assert.equal(model.attrs.cost_usd, undefined);
 
-		// both emitted as events + both on the ledger
-		assert.equal(cap.events.filter((e) => e.kind === 'usage.recorded').length, 2);
-		assert.equal(ledgerLines(tel.ts).length, 2);
+		// both legs share ONE trace (joined by Call SID)
+		assert.equal(tel.trace_id, 'phone-call:CA123');
+		assert.equal(model.trace_id, 'phone-call:CA123');
 	});
 
-	it('non-owner caller → public access tier on the actor', () => {
-		const [tel] = recordPhoneCall({ callSid: 'CA9', durationMs: 30_000, model: 'm', isOwner: false });
-		assert.equal(tel.actor.access_tier, 'public');
-		assert.equal(tel.actor.user_id, 'caller');
-		assert.equal(tel.actor.channel, 'phone');
-	});
-
-	it('skips a zero-length call', () => {
-		assert.deepEqual(recordPhoneCall({ callSid: 'CA0', durationMs: 0, model: 'm' }), []);
+	it('non-owner caller → public access tier', () => {
+		const { usage } = mapRealtime({ kind: 'phone.call', callSid: 'CA9', durationMs: 30_000, model: 'm', isOwner: false }, CTX);
+		assert.equal(usage[0].actor.access_tier, 'public');
+		assert.equal(usage[0].actor.user_id, 'caller');
+		assert.equal(usage[0].actor.channel, 'phone');
 	});
 });
 
-describe('startVoiceTicker', () => {
-	it('stop() emits the final partial bucket with a bucket-keyed usage_id', () => {
-		// fake clock: start=0, stop=45s later
-		let fakeNow = 1_000_000_000_000;
-		const ticker = startVoiceTicker({ sessionId: 'sess_tick', model: 'gemini-3-flash-live' }, 60_000, () => fakeNow);
+describe('RealtimeNormalizer.decode', () => {
+	const n = new RealtimeNormalizer();
+	it('accepts well-formed voice + phone payloads', () => {
+		assert.ok(n.decode({ kind: 'voice.session', sessionId: 's', durationMs: 1000, model: 'm' }));
+		assert.ok(n.decode({ kind: 'phone.call', callSid: 'CA', durationMs: 1000, model: 'm' }));
+	});
+	it('rejects junk / missing required fields', () => {
+		assert.equal(n.decode(null), null);
+		assert.equal(n.decode('nope'), null);
+		assert.equal(n.decode({ kind: 'voice.session', durationMs: 1000, model: 'm' }), null); // no sessionId
+		assert.equal(n.decode({ kind: 'phone.call', callSid: 'CA', model: 'm' }), null); // no durationMs
+		assert.equal(n.decode({ kind: 'other', sessionId: 's', durationMs: 1, model: 'm' }), null);
+	});
+});
+
+describe('collector end-to-end (the real write path)', () => {
+	it('ingest("realtime", payload) routes through the normalizer to sinks + ledger', () => {
+		const events: ObsEvent[] = [];
+		const usage: UsageRecord[] = [];
+		const sink: Sink = { type: 'capture', write: (e) => events.push(e) };
+		const collector = new Collector({ sinks: [sink], usageWriter: (u) => usage.push(u) });
+		collector.register(new RealtimeNormalizer());
+
+		const stat = collector.ingest(REALTIME_SOURCE, {
+			kind: 'phone.call',
+			callSid: 'CAe2e',
+			durationMs: 60_000,
+			model: 'gemini-2.5-flash',
+			isOwner: true,
+		});
+
+		assert.equal(stat.ok, true);
+		assert.equal(stat.usage, 2); // phone.seconds + voice.seconds
+		assert.equal(stat.events, 2); // two usage.recorded events
+		assert.equal(usage.length, 2);
+		assert.equal(events.length, 2);
+		assert.deepEqual(
+			usage.map((u) => u.meter).sort(),
+			['phone.seconds', 'voice.seconds'],
+		);
+	});
+});
+
+describe('client → collector POST', () => {
+	const realFetch = globalThis.fetch;
+	let calls: { url: string; body: unknown }[];
+
+	beforeEach(() => {
+		calls = [];
+		process.env.SUTANDO_OBS_ENDPOINT = 'http://localhost:4000';
+		// @ts-expect-error test stub
+		globalThis.fetch = (url: string, init?: { body?: string }) => {
+			calls.push({ url, body: init?.body ? JSON.parse(init.body) : undefined });
+			return Promise.resolve({ ok: true });
+		};
+	});
+
+	afterEach(() => {
+		globalThis.fetch = realFetch;
+		delete process.env.SUTANDO_OBS_ENDPOINT;
+	});
+
+	it('sendVoiceUsage POSTs a voice.session payload to /ingest/realtime', () => {
+		sendVoiceUsage({ sessionId: 's1', durationMs: 42_000, model: 'm', toolCalls: 1 });
+		assert.equal(calls.length, 1);
+		assert.equal(calls[0].url, 'http://localhost:4000/ingest/realtime');
+		assert.deepEqual(calls[0].body, { kind: 'voice.session', sessionId: 's1', durationMs: 42_000, model: 'm', toolCalls: 1 });
+	});
+
+	it('voice ticker stop() POSTs the final bucket with elapsed duration + bucketStartMs', () => {
+		let fakeNow = 1_700_000_000_000;
+		const ticker = startVoiceTicker({ sessionId: 's2', model: 'm', toolCallsGetter: () => 5 }, 60_000, () => fakeNow);
 		fakeNow += 45_000;
-		const rec = ticker.stop();
-		assert.ok(rec, 'stop() should emit a record for the partial bucket');
-		assert.equal(rec!.meter, 'voice.seconds');
-		assert.equal(rec!.quantity, 45);
-		assert.equal(rec!.source, 'voice-agent');
-		assert.ok(rec!.usage_id.startsWith('voice.seconds:sess_tick:b'), 'usage_id must include bucket timestamp');
-		assert.ok(cap.events.some((e) => e.kind === 'usage.recorded'));
+		ticker.stop();
+		assert.equal(calls.length, 1);
+		const b = calls[0].body as Record<string, unknown>;
+		assert.equal(b.kind, 'voice.session');
+		assert.equal(b.durationMs, 45_000);
+		assert.equal(b.bucketStartMs, 1_700_000_000_000);
+		assert.equal(b.toolCalls, 5);
 	});
 
-	it('stop() is idempotent — second call returns null without double-write', () => {
-		let fakeNow = 1_000_000_000_000;
-		const ticker = startVoiceTicker({ sessionId: 'sess_idem', model: 'm' }, 60_000, () => fakeNow);
+	it('voice ticker stop() is idempotent — second stop POSTs nothing more', () => {
+		let fakeNow = 1_700_000_000_000;
+		const ticker = startVoiceTicker({ sessionId: 's3', model: 'm' }, 60_000, () => fakeNow);
 		fakeNow += 10_000;
 		ticker.stop();
 		fakeNow += 10_000;
-		const second = ticker.stop();
-		assert.equal(second, null);
-		assert.equal(cap.events.filter((e) => e.kind === 'usage.recorded').length, 1);
+		ticker.stop();
+		assert.equal(calls.length, 1);
 	});
 
-	it('toolCallsGetter is sampled at flush time', () => {
-		let count = 0;
-		let fakeNow = 1_000_000_000_000;
-		const ticker = startVoiceTicker({ sessionId: 'sess_tc', model: 'm', toolCallsGetter: () => count }, 60_000, () => fakeNow);
-		count = 7;
-		fakeNow += 20_000;
-		const rec = ticker.stop();
-		assert.equal(rec!.attrs.tool_calls, 7);
-	});
-});
-
-describe('startPhoneTicker', () => {
-	it('stop() emits both phone.seconds and voice.seconds with bucket-keyed usage_ids', () => {
-		let fakeNow = 1_000_000_000_000;
-		const ticker = startPhoneTicker({ callSid: 'CA_tick', model: 'gemini-2.5-flash', isOwner: true }, 60_000, () => fakeNow);
+	it('phone ticker stop() POSTs one phone.call payload (both legs derived collector-side)', () => {
+		let fakeNow = 1_700_000_000_000;
+		const ticker = startPhoneTicker({ callSid: 'CAx', model: 'm', isOwner: true }, 60_000, () => fakeNow);
 		fakeNow += 90_000;
-		const recs = ticker.stop();
-		assert.equal(recs.length, 2);
-		const tel = recs.find((r) => r.meter === 'phone.seconds')!;
-		const model = recs.find((r) => r.meter === 'voice.seconds')!;
-		assert.equal(tel.quantity, 90);
-		assert.ok(tel.usage_id.startsWith('phone.seconds:CA_tick:b'));
-		assert.ok(model.usage_id.startsWith('voice.seconds:CA_tick:b'));
-		assert.equal(cap.events.filter((e) => e.kind === 'usage.recorded').length, 2);
+		ticker.stop();
+		assert.equal(calls.length, 1);
+		const b = calls[0].body as Record<string, unknown>;
+		assert.equal(b.kind, 'phone.call');
+		assert.equal(b.callSid, 'CAx');
+		assert.equal(b.durationMs, 90_000);
 	});
 
-	it('stop() is idempotent — second call returns [] without double-write', () => {
-		let fakeNow = 1_000_000_000_000;
-		const ticker = startPhoneTicker({ callSid: 'CA_idem', model: 'm' }, 60_000, () => fakeNow);
-		fakeNow += 30_000;
-		ticker.stop();
-		fakeNow += 30_000;
-		assert.deepEqual(ticker.stop(), []);
-		assert.equal(cap.events.filter((e) => e.kind === 'usage.recorded').length, 2); // only from first stop
+	it('no endpoint configured → no POST (capture off)', () => {
+		delete process.env.SUTANDO_OBS_ENDPOINT;
+		sendVoiceUsage({ sessionId: 's', durationMs: 5000, model: 'm' });
+		assert.equal(calls.length, 0);
 	});
 });
