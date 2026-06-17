@@ -565,6 +565,22 @@ def load_channel_allowed(channel_id):
         return None
     return cfg[1]
 
+def load_channel_context_blacklist(channel_id):
+    """Context-source BLACKLIST: ids this channel must NOT pull context from, via
+    `contextNotFrom` in access.json (mirrors allowFrom's per-channel shape). Same axis-style as
+    allowFrom (who may send) but for INFORMATION FLOW (which channels' content may be pulled into
+    a reply here). Entries may be CHANNEL ids or GUILD ids (a guild id blocks every channel in
+    that guild). Returns a set of id strings (empty if unconfigured). Used to gate the
+    Discord-state prefetch so e.g. #dev can be barred from pulling a private guild's content."""
+    try:
+        data = json.loads(ACCESS_FILE.read_text())
+        grp = data.get("groups", {}).get(str(channel_id))
+        if isinstance(grp, dict):
+            return {str(c) for c in (grp.get("contextNotFrom") or [])}
+    except Exception:
+        pass
+    return set()
+
 def _should_notify_owner_on_seed(sender_id, owner_ids):
     """True iff a thread auto-seed should @-mention the owner.
 
@@ -1066,7 +1082,7 @@ async def _fetch_discord_channel_messages(channel_id, n=_PREFETCH_MAX_MESSAGES_P
     return formatted
 
 
-async def _prefetch_discord_state_refs(user_task_text):
+async def _prefetch_discord_state_refs(user_task_text, origin_channel_id=None):
     """For every `<#channel_id>` reference in `user_task_text`, attempt to fetch
     the channel's recent messages via the bot's REST client and produce a
     prepended context block. Returns the enriched task body (context block +
@@ -1101,8 +1117,25 @@ async def _prefetch_discord_state_refs(user_task_text):
             continue
         seen.add(r)
         ordered_refs.append(r)
+    # Context-source BLACKLIST gate: drop any referenced channel the CURRENT channel is
+    # forbidden to pull context from (contextNotFrom in access.json). GUILD-AWARE: a
+    # contextNotFrom entry may be a CHANNEL id OR a GUILD id — a guild id blocks every channel in
+    # that guild (incl. future ones), so e.g. #dev's contextNotFrom = ["<private guild id>"]
+    # bars pulling any channel in that guild without enumerating each.
+    _ctx_blacklist = load_channel_context_blacklist(origin_channel_id) if origin_channel_id else set()
     blocks = []
     for ref in ordered_refs:
+        if _ctx_blacklist:
+            _ref_guild = ""
+            try:
+                _rc = client.get_channel(int(ref)) or await asyncio.wait_for(
+                    client.fetch_channel(int(ref)), timeout=_PREFETCH_PER_REF_TIMEOUT_S)
+                _ref_guild = str(getattr(getattr(_rc, "guild", None), "id", "") or "")
+            except Exception:
+                _ref_guild = ""
+            if str(ref) in _ctx_blacklist or (_ref_guild and _ref_guild in _ctx_blacklist):
+                print(f"  [discord-state-prefetch] ref <#{ref}> (guild {_ref_guild or '?'}) blocked by contextNotFrom for channel {origin_channel_id} — skipping", flush=True)
+                continue
         formatted = await _fetch_discord_channel_messages(ref)
         if formatted is None:
             # Failure (perms / NotFound / timeout / wrong type). Fail-closed:
@@ -2844,7 +2877,7 @@ async def _handle_discord_message(message, force=False):
     already_escalated = False
     if access_tier in ("team", "other"):
         try:
-            enriched = await _prefetch_discord_state_refs(user_task_text)
+            enriched = await _prefetch_discord_state_refs(user_task_text, message.channel.id)
         except Exception as e:
             print(f"  [discord-state-prefetch] outer guard caught: {e}; falling through to silent-escalate", flush=True)
             enriched = None
