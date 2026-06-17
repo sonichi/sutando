@@ -45,6 +45,12 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      # skills/*/scripts TS was previously invisible to tsc (tsconfig include
+      # was src-only) — dead options like vadConfig/googleSearch on session
+      # configs and broken imports slipped through to runtime. Issue #1586.
+      - name: Typecheck skills
+        run: npm run typecheck:skills
+
       - name: Run tests
         run: npm test
         if: hashFiles('tests/**/*.test.ts') != ''
