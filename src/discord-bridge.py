@@ -2875,7 +2875,11 @@ async def _handle_discord_message(message, force=False):
     # Order matters: the proactive path can ANSWER the user's question; the
     # fallback path just declines silently. Try answering first.
     already_escalated = False
-    if access_tier in ("team", "other"):
+    # Context-build gate (Susan 2026-06-17): the contextNotFrom skip must apply WHENEVER context
+    # is built — for ALL tiers, owner included — not just team/other. So the prefetch (which
+    # skips any channel in this channel's contextNotFrom) runs for everyone. The silent-escalate
+    # fallback below stays non-owner-only (owner tasks just proceed to normal handling).
+    if True:
         try:
             enriched = await _prefetch_discord_state_refs(user_task_text, message.channel.id)
         except Exception as e:
@@ -2890,7 +2894,12 @@ async def _handle_discord_message(message, force=False):
             # here would reintroduce the nested-escape pathology codex's
             # stdin parser hangs on. Per MacBook's #644 v2 review 2026-05-10.
             Path(prompt_path).write_text(user_task_text)
-        else:
+        elif access_tier in ("team", "other"):
+            # Silent-escalate stays NON-OWNER-only. The prefetch above now runs
+            # for all tiers (so the contextNotFrom gate applies to owner too),
+            # but an owner task with no enrichable refs must just proceed to
+            # normal handling — not get silently escalated/declined. Only the
+            # non-owner tiers fall back to the PR #639 escalate path.
             try:
                 already_escalated = await _silent_escalate_for_discord_state(message, user_task_text)
             except Exception as e:
