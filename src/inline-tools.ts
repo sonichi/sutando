@@ -32,8 +32,8 @@ const REPO_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
 // Re-export recording/screen/browser tools from browser-tools
-export { describeScreenTool, clickTool, scrollAndDescribeTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool, openGithubUrlTool } from './browser-tools.js';
-import { describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool, openGithubUrlTool } from './browser-tools.js';
+export { describeScreenTool, clickTool, scrollAndDescribeTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool } from './browser-tools.js';
+import { describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool } from './browser-tools.js';
 
 // Vision: one-shot frame + start/stop live screen-to-Gemini video.
 export { sendVisionFrameTool, startVisionTool, stopVisionTool, joinDiscordScreenTool } from './vision-tools.js';
@@ -1124,7 +1124,7 @@ export const coreDocumentedSkills = loadCoreDocumentedSkills();
 
 export const inlineTools = assertUniqueToolNames([
 	joinDiscordScreenTool,
-	pressKeyTool, scrollTool, switchTabTool, closeTabTool, openUrlTool, openGithubUrlTool,
+	pressKeyTool, scrollTool, switchTabTool, closeTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
 	volumeTool, brightnessTool, clipboardTool,
 	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, getCoreStatusTool,
@@ -1148,7 +1148,7 @@ export const anyCallerTools = [
 export const ownerOnlyTools = [
 	joinDiscordScreenTool,
 	volumeTool, brightnessTool,
-	pressKeyTool, scrollTool, switchTabTool, closeTabTool, openUrlTool, openGithubUrlTool,
+	pressKeyTool, scrollTool, switchTabTool, closeTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
 	clipboardTool, cancelTaskTool, toggleTasksTool,
 	joinGmeetTool, callContactTool, ...(_presenterActive ? [slideControlTool, fullscreenTool] : []),
