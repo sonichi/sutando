@@ -109,8 +109,10 @@ function phoneActor(isOwner?: boolean): Actor {
 	};
 }
 
-function bucketSuffix(bucketStartMs?: number): string {
-	return bucketStartMs === undefined ? '' : `:b${Math.floor(bucketStartMs / 1000)}`;
+/** Per-emission usage_id suffix: `:b<sec>` for a tick, else `:t<ms>` — so repeated
+ *  one-shots for one session don't collapse onto a single id. */
+function uniqueSuffix(bucketStartMs: number | undefined, ts: number): string {
+	return bucketStartMs === undefined ? `:t${Math.round(ts * 1000)}` : `:b${Math.floor(bucketStartMs / 1000)}`;
 }
 
 function makeRecord(f: Omit<UsageRecord, 'schema' | 'tenant_id'>): UsageRecord {
@@ -161,7 +163,7 @@ export function mapRealtime(p: RawRealtimeUsage, ctx: RealtimeMapContext): Realt
 	if (p.kind === 'voice.session') {
 		const provider = p.provider ?? 'gemini-live';
 		const rec = makeRecord({
-			usage_id: `voice.seconds:${p.sessionId}${bucketSuffix(p.bucketStartMs)}`,
+			usage_id: `voice.seconds:${p.sessionId}${uniqueSuffix(p.bucketStartMs, ts)}`,
 			ts,
 			trace_id: `voice-sess:${p.sessionId}`,
 			actor: VOICE_ACTOR,
@@ -180,7 +182,7 @@ export function mapRealtime(p: RawRealtimeUsage, ctx: RealtimeMapContext): Realt
 	const trace = `phone-call:${p.callSid}`;
 	const actor = phoneActor(p.isOwner);
 	const modelProvider = p.modelProvider ?? 'gemini-live';
-	const suffix = bucketSuffix(p.bucketStartMs);
+	const suffix = uniqueSuffix(p.bucketStartMs, ts);
 	const telephony = makeRecord({
 		usage_id: `phone.seconds:${p.callSid}${suffix}`,
 		ts,
