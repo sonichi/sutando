@@ -37,7 +37,7 @@ except ImportError:  # non-POSIX (e.g. Windows) — the lock degrades to a no-op
 
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
-from util_paths import claude_home_path, shared_personal_path  # noqa: E402
+from util_paths import claude_home_path, personal_path, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 
 # Workspace = runtime-state root (tasks/, results/, state/). REPO_DIR stays the
@@ -1283,6 +1283,31 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> 
     return {"name": name, "status": "ok", "detail": f"{len(files)} task(s), oldest {oldest_age}s"}
 
 
+def check_stand_identity() -> dict:
+    """Verify stand-identity.json is reachable via the canonical reader path.
+
+    Catches hosts where the v0.8 migration misclassified stand-identity.json
+    as rehome-state (→ workspace/state/) while personal_path() only looks in
+    $SUTANDO_MEMORY_DIR/machine-<host>/ and <workspace>/. Symptom is silent
+    fallback to the literal "Sutando" name — no crash, wrong display name.
+    Layer 2 of #1543's prevention plan.
+    """
+    name = "stand-identity"
+    si = personal_path("stand-identity.json")
+    if si.exists():
+        return {"name": name, "status": "ok", "detail": str(si)}
+    return {
+        "name": name,
+        "status": "warn",
+        "detail": (
+            "stand-identity.json not found at any reader path — Stand will "
+            "fall back to default name 'Sutando'. If you ran the v0.8 migrate "
+            "before #1540, check workspace/state/ for a misplaced copy and "
+            "move it to the private machine dir or workspace root."
+        ),
+    }
+
+
 def check_notes_split_brain() -> "dict | None":
     """Detect notes/ split-brain (#1266): overlapping .md files in both
     <repo>/notes/ and <workspace>/notes/ — fires only when the two paths differ."""
@@ -1503,6 +1528,9 @@ def run_all_checks() -> list[dict]:
 
     # Migration/reader path-contract drift (#1543)
     checks.append(check_migrate_reader_contract())
+
+    # Stand identity — silent fallback if misclassified by v0.8 migration (#1543 layer 2)
+    checks.append(check_stand_identity())
 
     # Phone conversation server (optional — only check if Twilio configured and not skipped)
     env_path = _resolve_dotenv()  # pragma: no cover — call-site in untested mega-function
