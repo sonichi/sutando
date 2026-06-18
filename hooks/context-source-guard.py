@@ -26,10 +26,17 @@ env-overridable (SUTANDO_DISCORD_ACCESS_FILE / SUTANDO_DISCORD_ENV_FILE) for tes
 """
 import sys, json, os, re, time, urllib.request
 
+# Resolve the Claude config dir via $CLAUDE_CONFIG_DIR (set by Claude Code),
+# matching read_discord_channel.py/discord-bridge's claude_home_path — NOT a
+# hardcoded ~/.claude. On a relocated install the hardcode read a DIFFERENT,
+# stale access.json than the bridge writes, so a configured contextNotFrom was
+# invisible to the hook → it silently failed OPEN (the one component you least
+# want failing open). Flagged by Sutando-Pro on PR #1698, 2026-06-18.
+_CFG = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
 ACCESS_FILE = os.environ.get("SUTANDO_DISCORD_ACCESS_FILE",
-                             os.path.expanduser("~/.claude/channels/discord/access.json"))
+                             os.path.join(_CFG, "channels", "discord", "access.json"))
 ENV_FILE = os.environ.get("SUTANDO_DISCORD_ENV_FILE",
-                          os.path.expanduser("~/.claude/channels/discord/.env"))
+                          os.path.join(_CFG, "channels", "discord", ".env"))
 WS = os.path.expanduser(
     os.environ.get("SUTANDO_WORKSPACE", "~/.sutando/workspace").replace("~", os.path.expanduser("~"))
 )
