@@ -9,7 +9,7 @@
  * Resolution order (each layer overlays the previous, field by field):
  *   1. in-code OBSERVABILITY_DEFAULTS — the floor
  *   2. environment knobs — SUTANDO_TENANT_ID / SUTANDO_TENANT_MODE /
- *      SUTANDO_METERING_ENABLED / SUTANDO_METERING_ENDPOINT
+ *      SUTANDO_METERING_ENABLED / SUTANDO_METERING_ENDPOINT / SUTANDO_METERING_HEADERS
  *   3. workspace override — `<workspace>/config/observability.json` (machine-local; wins)
  *
  * Mirrors the `loadVoiceConfig` idiom (src/voice-config.ts): overlay over

@@ -8,7 +8,13 @@ import {
 	OBSERVABILITY_DEFAULTS,
 } from '../../src/observability/config.js';
 
-const KNOBS = ['SUTANDO_TENANT_ID', 'SUTANDO_TENANT_MODE', 'SUTANDO_METERING_ENABLED', 'SUTANDO_METERING_ENDPOINT'];
+const KNOBS = [
+	'SUTANDO_TENANT_ID',
+	'SUTANDO_TENANT_MODE',
+	'SUTANDO_METERING_ENABLED',
+	'SUTANDO_METERING_ENDPOINT',
+	'SUTANDO_METERING_HEADERS',
+];
 let saved: Record<string, string | undefined>;
 let ws: string;
 
