@@ -38,7 +38,7 @@ describe('mapRealtime — voice', () => {
 		assert.equal(rec.provider, 'gemini-live');
 		assert.equal(rec.source, 'voice-agent');
 		assert.equal(rec.provider_ref, 'session_42');
-		assert.equal(rec.usage_id, 'voice.seconds:session_42'); // one-shot → no bucket suffix
+		assert.equal(rec.usage_id, 'voice.seconds:session_42:t1700000000000'); // one-shot → ts-keyed suffix (unique per emission)
 		assert.equal(rec.trace_id, 'voice-sess:session_42'); // derived, not minted
 		assert.equal(rec.tenant_id, null);
 		assert.equal(rec.attrs.model, 'gemini-3-flash-live');
@@ -49,7 +49,7 @@ describe('mapRealtime — voice', () => {
 		assert.equal(adv.kind, 'usage.recorded');
 		assert.equal(adv.source, 'voice-agent');
 		assert.equal(adv.trace_id, rec.trace_id); // ledger ↔ event correlate
-		assert.equal((adv.data as Record<string, unknown>).usage_id, 'voice.seconds:session_42');
+		assert.equal((adv.data as Record<string, unknown>).usage_id, 'voice.seconds:session_42:t1700000000000');
 		assert.equal(adv.node, 'test-node');
 	});
 
@@ -79,13 +79,13 @@ describe('mapRealtime — phone', () => {
 		assert.equal(tel.provider, 'twilio');
 		assert.equal(tel.source, 'phone');
 		assert.equal(tel.quantity, 120);
-		assert.equal(tel.usage_id, 'phone.seconds:CA123');
+		assert.equal(tel.usage_id, 'phone.seconds:CA123:t1700000000000');
 		assert.equal(tel.attrs.cost_usd, 0.017); // 2 min @ $0.0085/min
 		assert.equal(tel.attrs.is_owner, true);
 
 		const model = usage.find((r) => r.meter === 'voice.seconds')!;
 		assert.equal(model.provider, 'gemini-live');
-		assert.equal(model.usage_id, 'voice.seconds:CA123');
+		assert.equal(model.usage_id, 'voice.seconds:CA123:t1700000000000');
 		assert.equal(model.attrs.model, 'gemini-2.5-flash');
 		assert.equal(model.attrs.cost_usd, undefined);
 

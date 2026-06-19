@@ -35,6 +35,16 @@ export const METER_FORWARD_FLUSH_MS = 5_000;
  *  and the ledger still holds every record. */
 const QUEUE_CAP = 5_000;
 
+/** Per-meter counts for the log, e.g. `voice.seconds×1, claude.tokens×40`. */
+function summarizeMeters(batch: UsageRecord[]): string {
+	const counts: Record<string, number> = {};
+	for (const r of batch) counts[r.meter] = (counts[r.meter] ?? 0) + 1;
+	return Object.entries(counts)
+		.sort((a, b) => b[1] - a[1])
+		.map(([m, n]) => `${m}×${n}`)
+		.join(', ');
+}
+
 export interface MeterForwarder {
 	/** Enqueue a record for upstream export. Best-effort; never throws. */
 	forward(rec: UsageRecord): void;
@@ -45,7 +55,7 @@ export interface MeterForwarder {
 }
 
 /** Minimal fetch shape — the global `fetch` satisfies it; tests inject a stub. */
-export type FetchLike = (url: string, init: RequestInit) => Promise<{ ok: boolean }>;
+export type FetchLike = (url: string, init: RequestInit) => Promise<{ ok: boolean; status?: number }>;
 
 /** Supplies fresh headers per flush — for a rotating auth token the static
  *  `metering.headers` can't express. Merged last (wins). Never call into the
@@ -57,6 +67,9 @@ class HttpMeterForwarder implements MeterForwarder {
 	private timer: ReturnType<typeof setTimeout> | null = null;
 	private flushing = false;
 	private stopped = false;
+	private okTotal = 0;
+	private failStreak = 0;
+	private loggedLive = false;
 
 	constructor(
 		private readonly endpoint: string,
@@ -93,8 +106,29 @@ class HttpMeterForwarder implements MeterForwarder {
 				headers: await this.buildHeaders(),
 				body: JSON.stringify({ usage: batch }),
 			});
-			if (!res.ok) this.requeue(batch); // non-2xx → retry next flush
-		} catch {
+			if (res.ok) {
+				this.okTotal += batch.length;
+				if (!this.loggedLive) {
+					this.loggedLive = true;
+					console.log(`[meter-forward] export live → ${this.endpoint} (${batch.length} record(s): ${summarizeMeters(batch)})`);
+				} else if (this.failStreak > 0) {
+					console.log(`[meter-forward] export recovered → ${this.endpoint} after ${this.failStreak} failed flush(es)`);
+				}
+				this.failStreak = 0;
+			} else {
+				// non-2xx → log (first + ~once/min) and requeue for retry.
+				this.failStreak++;
+				if (this.failStreak === 1 || this.failStreak % 12 === 0) {
+					console.warn(`[meter-forward] upstream REJECTED batch: HTTP ${res.status ?? '?'} → ${this.endpoint}; re-queued ${batch.length} record(s): ${summarizeMeters(batch)} (failure #${this.failStreak})`);
+				}
+				this.requeue(batch);
+			}
+		} catch (err) {
+			this.failStreak++;
+			if (this.failStreak === 1 || this.failStreak % 12 === 0) {
+				const msg = err instanceof Error ? err.message : String(err);
+				console.warn(`[meter-forward] upstream POST FAILED: ${msg} → ${this.endpoint}; re-queued ${batch.length} record(s): ${summarizeMeters(batch)} (failure #${this.failStreak})`);
+			}
 			this.requeue(batch); // network down → keep for the next attempt
 		} finally {
 			this.flushing = false;
