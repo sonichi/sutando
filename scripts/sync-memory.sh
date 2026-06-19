@@ -367,6 +367,21 @@ if [ -f "$REPO_DIR/skills/schedule-crons/crons.json" ]; then
         "$MACHINE_DIR/crons.json"
 fi
 
+# Channel access-control allowlists (per-host, painful to recreate: the Discord
+# access.json holds the owner/team/other tierMap + allowFrom). Backed up so a
+# rebuilt host can restore its channel onboarding. SECURITY: we glob ONLY
+# `*/access.json` — never `.env`. The bot tokens in channels/<ch>/.env stay
+# local (Keychain/vault) and must NOT reach the repo. Keep this glob exact.
+CHANNELS_SRC="${CLAUDE_HOME:-$HOME/.claude}/channels"
+if [ -d "$CHANNELS_SRC" ]; then
+    for _acc in "$CHANNELS_SRC"/*/access.json; do
+        [ -f "$_acc" ] || continue
+        _ch="$(basename "$(dirname "$_acc")")"
+        mkdir -p "$MACHINE_DIR/channels/$_ch"
+        copy_if_newer "$_acc" "$MACHINE_DIR/channels/$_ch/access.json"
+    done
+fi
+
 # Personal skill dirs (gitignored `skills/personal-*/`) — one rsync PER skill
 # dir to preserve per-skill subdirectories. A flat union (rsync with multiple
 # sources to one dest) would clobber same-named files (manifest.json, README.md)
