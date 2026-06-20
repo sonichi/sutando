@@ -36,8 +36,8 @@ export { describeScreenTool, clickTool, scrollAndDescribeTool, playVideoTool, pa
 import { describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool } from './browser-tools.js';
 
 // Vision: one-shot frame + start/stop live screen-to-Gemini video.
-export { sendVisionFrameTool, startVisionTool, stopVisionTool, joinDiscordScreenTool } from './vision-tools.js';
-import { sendVisionFrameTool, startVisionTool, stopVisionTool, joinDiscordScreenTool } from './vision-tools.js';
+export { sendVisionFrameTool, startVisionTool, stopVisionTool } from './vision-tools.js';
+import { sendVisionFrameTool, startVisionTool, stopVisionTool } from './vision-tools.js';
 
 // Active artifact cache — load a file once, query repeatedly without task-bridge round-trips.
 export { setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool, clearActiveArtifact } from './artifact-cache-tools.js';
@@ -1118,7 +1118,6 @@ function loadCoreDocumentedSkills(): { name: string; description: string }[] {
 export const coreDocumentedSkills = loadCoreDocumentedSkills();
 
 export const inlineTools = assertUniqueToolNames([
-	joinDiscordScreenTool,
 	pressKeyTool, scrollTool, switchTabTool, closeTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
 	volumeTool, brightnessTool, clipboardTool,
@@ -1141,7 +1140,6 @@ export const anyCallerTools = [
 
 /** Owner-only tools (require isOwner) */
 export const ownerOnlyTools = [
-	joinDiscordScreenTool,
 	volumeTool, brightnessTool,
 	pressKeyTool, scrollTool, switchTabTool, closeTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,

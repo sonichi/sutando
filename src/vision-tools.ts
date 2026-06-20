@@ -617,35 +617,9 @@ export const startVisionTool: ToolDefinition = {
 	},
 };
 
-// "join screen" in a Discord voice channel = stream THIS machine's screen into
-// the live session (frames flow to the model), same machinery as start_vision /
-// the legacy magic-word screen push. A dedicated tool keeps the model from grabbing the
-// Zoom skill's join_zoom/summon for a screen request (#1427).
-export const joinDiscordScreenTool: ToolDefinition = {
-	name: 'join_discord_screen',
-	description:
-		'Share / stream YOUR screen into the current Discord voice session so you (the model) see it live. ' +
-		'Use for "join screen", "join the screen", "share screen", "看屏幕", "加入屏幕", "分享屏幕". ' +
-		'This is the Discord screen — for ANY screen request in a Discord voice channel, ALWAYS use this; NEVER join_zoom or summon (those are Zoom).',
-	parameters: z.object({}),
-	execution: 'inline',
-	async execute() {
-		if (!getSendFile()) {
-			return { status: 'failed', error: 'No active voice session — screen streaming requires a connected session.' };
-		}
-		if (pushMode) {
-			return { status: 'streaming', source: `push:${pushSourceName || 'unknown'}`, mode: 'push', note: 'Screen already streaming (push mode).' };
-		}
-		try {
-			const source = resolveSource('screen');
-			const info = startStream(source, DEFAULT_FPS);
-			return { status: 'streaming', source: source.name, fps: info.fps, intervalMs: info.intervalMs };
-		} catch (err) {
-			console.error(`${ts()} [Vision] joinDiscordScreenTool threw: ${(err as Error)?.message ?? err}`);
-			return { status: 'failed', error: 'screen stream failed' };
-		}
-	},
-};
+// The discord-voice screen-share tool moved to its plugin (manifest-loaded) so
+// the host keeps zero discord-voice footprint (#1720). It is a thin wrapper over
+// the exported startStreaming() primitive below.
 
 export const stopVisionTool: ToolDefinition = {
 	name: 'stop_vision',

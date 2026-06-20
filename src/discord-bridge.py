@@ -2470,10 +2470,11 @@ async def _handle_discord_message(message, force=False):
 
         # Text/magic-word screen-push REMOVED (#1427, owner 2026-06-05). Screen
         # sharing in a voice session is owned entirely by the voice-invoked
-        # join_discord_screen tool (src/vision-tools.ts) — typed phrases no longer
-        # start screen-push; only voice does. The old setScreenPush consumer was
-        # already gone, so this typed path was an orphan that still posted a
-        # "Screen-push on" message (fired on every bot in the channel).
+        # screen-share tool that the discord-voice plugin contributes — typed
+        # phrases no longer start screen-push; only voice does. The old
+        # setScreenPush consumer was already gone, so this typed path was an
+        # orphan that still posted a "Screen-push on" message (fired on every
+        # bot in the channel).
 
         # Magic-word fast path: an owner saying the join phrase MUST bypass
         # requireMention — otherwise the magic word can't fire in any guild
