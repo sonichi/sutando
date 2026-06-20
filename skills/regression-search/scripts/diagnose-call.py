@@ -14,6 +14,8 @@ Companion to find-regression.py — find candidates with one, drill in with the
 other. Closes the second half of #188.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
