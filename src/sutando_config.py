@@ -55,6 +55,7 @@ _KNOWN_TOP_LEVEL_KEYS = {
     "claude_sutando_config_dir",
     "core_config_dirs",
     "vault",
+    "migrate",
 }
 
 

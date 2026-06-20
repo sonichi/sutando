@@ -441,6 +441,24 @@ else
   echo "  FAIL: --dry-run changed notes count ($PRE_NOTES_COUNT → $POST_NOTES_COUNT)"; fail=$((fail+1))
 fi
 
+# I1: per-host destinations are hostname-qualified under hosts/<host>/.
+if grep -qE 'hosts/[^/]+/build_log\.md' <<<"$out_dryrun"; then
+  echo "  OK: --migrate targets hosts/<host>/build_log.md (I1, per-host)"; pass=$((pass+1))
+else
+  echo "  FAIL: --migrate build_log not targeted at hosts/<host>/ (I1): $out_dryrun"; fail=$((fail+1))
+fi
+if grep -qE 'hosts/[^/]+/pending-questions\.md' <<<"$out_dryrun"; then
+  echo "  OK: --migrate targets hosts/<host>/pending-questions.md (I1, per-host)"; pass=$((pass+1))
+else
+  echo "  FAIL: --migrate pending-questions not targeted at hosts/<host>/ (I1): $out_dryrun"; fail=$((fail+1))
+fi
+# Old interim layout must be gone — no build_log/<host>.md dir-split, no root pending-questions.
+if grep -qE 'build_log/[^/]+\.md' <<<"$out_dryrun"; then
+  echo "  FAIL: --migrate still uses interim build_log/<host>.md layout (I1 regression)"; fail=$((fail+1))
+else
+  echo "  OK: --migrate no longer uses interim build_log/<host>.md layout (I1)"; pass=$((pass+1))
+fi
+
 # ============================================================================
 echo
 echo "==== Test 12: pull-side delete-AND-add bypass (Mini #1445 v3 Medium fix) ===="
