@@ -84,6 +84,7 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '../../../src/inline-tools.js';
 import { recordSession, recordConversation, recordToolCall } from '../../../src/conversation-store.js';
+import { startPhoneTicker, type TickerControl } from '../../../src/observability/realtime.js';
 import { resultBelongsTo, phoneCallKey } from '../../../src/result-channel-key.js';
 // Lazy vision-session handle. Only loaded if a call ever needs it — keeps the
 // phone-agent boot path free of the vision-tools.ts side-effects on cold start.
@@ -339,6 +340,8 @@ interface CallSession {
 	// Observability: per-call metrics (startTime already on CallSession from #209)
 	toolCalls: { name: string; durationMs: number; timestamp: string }[];
 	events: { event: string; timestamp: string }[];
+	// Realtime usage ticker — emits voice+phone seconds incrementally while live.
+	usageTicker?: TickerControl;
 	// Per-call channel-scan state (results/<callSid>.task-*.txt pull path).
 	channelScanHandle?: NodeJS.Timeout;
 	// Safety-net against silent unlinkSync failures — `name -> first-seen ms`,
@@ -814,6 +817,13 @@ async function createCallSession(params: {
 		resultQueue: [],
 		toolCalls: [],
 		events: [{ event: 'call_started', timestamp: new Date().toISOString() }],
+		usageTicker: startPhoneTicker({
+			callSid: params.callSid,
+			model: VOICE_MODEL,
+			isOwner: params.isOwner,
+			isMeeting: params.isMeeting,
+			toolCallsGetter: () => callSession.toolCalls.length,
+		}),
 	};
 
 	// Start live transcript file
@@ -1195,6 +1205,11 @@ function cleanupCall(callSid: string): void {
 		toolCalls: session.toolCalls,
 		events: session.events,
 	});
+
+	// Spine usage: flush the final partial bucket for both Twilio + Gemini-Live
+	// axes. The ticker has been emitting increments every USAGE_TICK_MS while the
+	// call ran; stop() emits the remainder and clears the interval.
+	try { session.usageTicker?.stop(); } catch {}
 
 	// Auto-scan the latest call for issues (async, best effort)
 	try {
