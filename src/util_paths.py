@@ -81,29 +81,53 @@ def _workspace_root() -> Path:
         return Path.home() / ".sutando" / "workspace"
 
 
+def _host_label() -> str:
+    r"""Per-host directory label: `$SUTANDO_HOST_LABEL` or short hostname.
+
+    Single source of truth for the per-host segment so the legacy
+    `machine-<host>/` (memory-dir) and new `hosts/<host>/` (workspace)
+    conventions stay in lockstep. Matches `_host()` in sync-workspace.sh
+    and the crons-path host derivation (`hostname | sed 's/\..*//'`)."""
+    return os.environ.get("SUTANDO_HOST_LABEL") or socket.gethostname().split(".")[0]
+
+
 def _private_machine_dir() -> Path | None:
     root = _memory_dir_env()
     if not root:
         return None
     expanded = os.path.expanduser(root)
-    host = os.environ.get("SUTANDO_HOST_LABEL") or socket.gethostname().split(".")[0]
-    return Path(expanded) / f"machine-{host}"
+    return Path(expanded) / f"machine-{_host_label()}"
 
 
 def personal_path(filename: str, workspace: Path | None = None) -> Path:
     """Resolve a personal-asset path.
 
-    Order: `$SUTANDO_MEMORY_DIR/machine-<host>/<filename>` → `<workspace>/<filename>`.
+    Order: `<workspace>/hosts/<host>/<filename>` (new per-host home, #1717)
+    → `$SUTANDO_MEMORY_DIR/machine-<host>/<filename>` (legacy memory-dir
+    per-host) → `<workspace>/<filename>`.
     (Legacy `$SUTANDO_PRIVATE_DIR` is honored as a fallback with a
     deprecation warning — see `_memory_dir_env()`.)
     For files known to live under `assets/` in the public workspace
     (currently `stand-avatar.png`), also tries `<workspace>/assets/<filename>`
     before falling back to `<workspace>/<filename>`.
 
+    The `hosts/<host>/` probe is read-side only and purely additive: when no
+    such file exists, resolution is identical to the pre-#1717 behavior. This
+    is the reader half of the per-host relocation — without it, moving a
+    per-host file into `hosts/<host>/` would silently strand readers on the
+    workspace-root fallback (the H4 regression).
+
     Returns the FIRST existing path. If none exist, returns the preferred
     private-dir path so the caller's `.exists()` check fails gracefully.
     """
     ws = workspace if workspace is not None else _workspace_root()
+
+    # New per-host canonical home (workspace-as-git-repo, #1717). Probed first
+    # so relocated files are found; absent → falls through to legacy order.
+    host_dir = ws / "hosts" / _host_label()
+    p = host_dir / filename
+    if p.exists():
+        return p
 
     private = _private_machine_dir()
     if private is not None:
