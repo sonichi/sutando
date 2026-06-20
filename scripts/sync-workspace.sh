@@ -392,6 +392,22 @@ _compose_exclude_content() {
     echo "*.alive"
     echo "*.sentinel"
     echo "*.pid"
+    # Secret material — name-pattern deny (M3). The deny list above caught
+    # transient state + .env*; it did NOT cover SSH private keys or
+    # cert/key material, which would be carried if they ever landed in a
+    # synced path. These are gitignore-style globs composed into
+    # .git/info/exclude. Public keys (*.pub) are intentionally NOT denied.
+    echo "id_rsa"
+    echo "id_dsa"
+    echo "id_ecdsa"
+    echo "id_ed25519"
+    echo "*.pem"
+    echo "*.key"
+    echo "*.p12"
+    echo "*.pfx"
+    echo "*.ppk"
+    echo "*.keystore"
+    echo "*.jks"
 }
 
 # Write `<workspace>/.git/info/exclude` from the composed content. Also
