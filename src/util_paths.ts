@@ -62,14 +62,37 @@ export function memoryDirEnv(): string | undefined {
 	return undefined;
 }
 
+/**
+ * Per-host directory label: `$SUTANDO_HOST_LABEL` or short hostname.
+ *
+ * Single source of truth for the per-host segment so the legacy
+ * `machine-<host>/` (memory-dir) and new `hosts/<host>/` (workspace)
+ * conventions stay in lockstep. Matches `_host()` in sync-workspace.sh:
+ * an explicit label is an override and is used RAW; only the auto-detected
+ * hostname has its mDNS/domain suffix stripped. (A dotted label like
+ * "a.b" must NOT be split — splitting it would strand the reader, the very
+ * class this PR fixes. Mirrors `_host_label()` in util_paths.py.)
+ */
+function hostLabel(): string {
+	const label = process.env.SUTANDO_HOST_LABEL;
+	if (label) return label;
+	return hostname().split('.')[0];
+}
+
 /** Per-machine resolver. */
 export function personalPath(filename: string, workspace?: string): string {
 	const ws = workspace ?? resolveWorkspace();
+	// New per-host canonical home (workspace-as-git-repo, #1717). Probed first
+	// so relocated files are found; absent → falls through to the legacy order
+	// (identical to pre-#1717 behavior). Reader half of the per-host
+	// relocation — without it, moving a per-host file into `hosts/<host>/`
+	// would silently strand readers on the workspace-root fallback (H4).
+	const hostCandidate = join(ws, 'hosts', hostLabel(), filename);
+	if (existsSync(hostCandidate)) return hostCandidate;
 	const privateRoot = memoryDirEnv();
 	if (privateRoot) {
 		const root = expandHome(privateRoot);
-		const host = (process.env.SUTANDO_HOST_LABEL || hostname()).split('.')[0];
-		const candidate = join(root, `machine-${host}`, filename);
+		const candidate = join(root, `machine-${hostLabel()}`, filename);
 		if (existsSync(candidate)) return candidate;
 	}
 	// stand-avatar.png lives under assets/ in the public workspace.
@@ -83,8 +106,7 @@ export function personalPath(filename: string, workspace?: string): string {
 	// check fails gracefully.
 	if (privateRoot) {
 		const root = expandHome(privateRoot);
-		const host = (process.env.SUTANDO_HOST_LABEL || hostname()).split('.')[0];
-		return join(root, `machine-${host}`, filename);
+		return join(root, `machine-${hostLabel()}`, filename);
 	}
 	if (filename === 'stand-avatar.png') return join(ws, 'assets', filename);
 	return wsPath;
