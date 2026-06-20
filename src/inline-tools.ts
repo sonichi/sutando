@@ -7,7 +7,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync, statSync, mkdirSync } from 'node:fs';
-import { join, extname, dirname } from 'node:path';
+import { join, extname, dirname, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
@@ -1006,6 +1006,22 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 		const expanded = privateRoot.replace(/^~/, process.env.HOME || '');
 		dirsToScan.push(join(expanded, 'skills'));
 	}
+	// External plugin checkouts: an optional voice-surface plugin can live
+	// ENTIRELY in its own sibling repo, so this host keeps no in-repo copy and
+	// names no plugin. Mirrors src/discord-bridge.py's hook loader — scan
+	// $SUTANDO_EXTERNAL_PLUGIN_DIRS (os.pathsep-separated) + every sibling
+	// checkout's skills/. The dedupe-by-name below makes a stray duplicate safe.
+	for (const d of (process.env.SUTANDO_EXTERNAL_PLUGIN_DIRS || '').split(delimiter)) {
+		if (d.trim()) dirsToScan.push(join(d.trim(), 'skills'));
+	}
+	try {
+		const siblingsRoot = dirname(REPO_ROOT); // dir holding sibling checkouts
+		const ownSkills = join(REPO_ROOT, 'skills');
+		for (const sib of readdirSync(siblingsRoot)) {
+			const sibSkills = join(siblingsRoot, sib, 'skills');
+			if (sibSkills !== ownSkills && existsSync(sibSkills)) dirsToScan.push(sibSkills);
+		}
+	} catch { /* siblings root unreadable — skip */ }
 	const owner: ToolDefinition[] = [];
 	const anyCaller: ToolDefinition[] = [];
 	for (const skillsDir of dirsToScan) {
