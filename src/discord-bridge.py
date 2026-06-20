@@ -2059,7 +2059,52 @@ pending_reply_anchors: dict[str, int] = {}
 
 intents = discord.Intents.default()
 intents.message_content = True
+# GUILD_MEMBERS privileged intent — only enable when confirmed active in
+# Discord Developer Portal (Bot → Privileged Gateway Intents). Without this
+# toggle the bridge raises PrivilegedIntentsRequired on startup and won't
+# connect. Gated behind env var so bridge boots safely without the flag.
+if os.environ.get("DISCORD_GUILD_MEMBERS_INTENT", "").lower() in ("1", "true", "yes"):
+    intents.members = True
 client = discord.Client(intents=intents)
+
+
+async def list_channel_members(channel_id: int) -> list[dict]:
+    """Return members who can see a channel.
+
+    Requires GUILD_MEMBERS privileged intent enabled in Discord Dev Portal
+    AND DISCORD_GUILD_MEMBERS_INTENT=1 in the bridge environment.
+    Returns list of {id, name, display_name, is_bot} dicts, or empty list
+    if the intent is unavailable.
+    """
+    if not intents.members:
+        return []
+    channel = client.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(channel_id)
+        except Exception:
+            return []
+    guild = getattr(channel, "guild", None)
+    if guild is None:
+        return []
+    members = []
+    try:
+        async for member in guild.fetch_members(limit=1000):
+            try:
+                perms = channel.permissions_for(member)
+                if perms.view_channel:
+                    members.append({
+                        "id": str(member.id),
+                        "name": member.name,
+                        "display_name": member.display_name,
+                        "is_bot": member.bot,
+                    })
+            except Exception:
+                continue  # skip members whose permissions can't be resolved
+    except Exception as e:
+        print(f"  [list_channel_members] fetch_members failed for guild {guild.id}: {e}", flush=True)
+        return []
+    return members
 
 
 def _recover_orphan_sending_files() -> int:
@@ -2467,8 +2512,18 @@ async def _handle_discord_message(message, force=False):
                 # channel set to `true` — open to all, skip access check
                 channel_authorized = True
             elif len(ch_allowed) > 0 and sender_id not in ch_allowed:
-                print(f"  [skip] @{username} (id={sender_id}) not in channel allowlist", flush=True)
-                return
+                if sender_id in allowed:
+                    # Global owner/allowlisted sender — exempt from the
+                    # per-channel allowlist. The global `allowFrom` is a
+                    # superset grant; a channel's `allowFrom` narrows *who
+                    # else* gets in, it must not exclude a globally-authorized
+                    # owner. Without this, creating a channel entry whose
+                    # allowFrom omits the owner silently locks the owner out
+                    # of their own channel (observed 2026-06-15).
+                    channel_authorized = True
+                else:
+                    print(f"  [skip] @{username} (id={sender_id}) not in channel allowlist", flush=True)
+                    return
             else:
                 # sender is in ch_allowed (or ch_allowed is empty + requireMention)
                 channel_authorized = True
@@ -2621,6 +2676,27 @@ async def _handle_discord_message(message, force=False):
                         f"\n\n[Replying to {ref_author} "
                         f"({ref_msg.created_at.strftime('%Y-%m-%d %H:%M')}): {snippet}]"
                     )
+                # Also download attachments that live on the replied-to
+                # message. Without this, a file shared on a parent message
+                # and then acted on via an @-mention *reply* is silently
+                # dropped — only the reply's own (often empty) attachment
+                # set was scanned above. Same save + sanitized-basename +
+                # image-vision pattern as the primary loop.
+                for att in getattr(ref_msg, "attachments", []):
+                    p_path = INBOX_DIR / f"{int(time.time()*1000)}_{_safe_attachment_basename(att.filename)}"
+                    try:
+                        await att.save(p_path)
+                        attachment_note += f"\n[File attached (from replied-to message): {p_path}]"
+                        try:
+                            ct = (getattr(att, "content_type", "") or "").lower()
+                            if ct.startswith("image/") or str(p_path).lower().endswith(
+                                (".jpg", ".jpeg", ".png", ".webp", ".gif")
+                            ):
+                                _push_vision_image(str(p_path), source="discord")
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        print(f"  [reply-context] parent attachment download failed: {e}", flush=True)
         except Exception as e:
             print(f"  [reply-context] fetch failed: {e}", flush=True)
 
@@ -3422,7 +3498,22 @@ async def poll_results():
                         first = True
                         for chunk in _chunk_for_discord(clean_text):
                             ref = discord.MessageReference(message_id=reply_to_id, channel_id=channel.id, fail_if_not_exists=False) if (first and reply_to_id) else None
-                            await channel.send(chunk, reference=ref)
+                            try:
+                                await channel.send(chunk, reference=ref)
+                            except Exception as e:
+                                # Replying to a *system* message (e.g. the
+                                # thread_created stub a new thread leaves in
+                                # the parent channel) is rejected with 50035
+                                # "Cannot reply to a system message" even with
+                                # fail_if_not_exists=False (observed 2026-06-10:
+                                # an owner reply was dropped entirely). The
+                                # content matters more than the quote anchor —
+                                # retry once as a fresh message.
+                                _http_exc = getattr(discord, "HTTPException", None)
+                                if ref is None or _http_exc is None or not isinstance(e, _http_exc):
+                                    raise
+                                print(f"  [reply-anchor] reference send failed ({e}); retrying without reference", flush=True)
+                                await channel.send(chunk)
                             first = False
                         try:
                             import outbox_log

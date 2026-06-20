@@ -5,7 +5,7 @@
  * Add new tools here and they auto-appear in both voice and phone agents.
  */
 
-import { execSync, execFileSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync, statSync, mkdirSync } from 'node:fs';
 import { join, extname, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -182,8 +182,8 @@ export const pressKeyTool: ToolDefinition = {
 		// arbitrary code execution from a tool-call argument). Same
 		// escape pattern as `safeKey` below and `safeApp` in switchAppTool.
 		if (app) {
-			const safeApp = app.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
-			try { execSync(`osascript -e 'tell application "${safeApp}" to activate'`, { timeout: 3_000 }); await new Promise(r => setTimeout(r, 300)); } catch {}
+			const safeApp = app.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+			try { execFileSync('osascript', ['-e', `tell application "${safeApp}" to activate`], { timeout: 3_000 }); await new Promise(r => setTimeout(r, 300)); } catch {}
 		}
 		const keyMap: Record<string, number> = {
 			'enter': 36, 'return': 36, 'escape': 53, 'esc': 53, 'tab': 48,
@@ -201,17 +201,17 @@ export const pressKeyTool: ToolDefinition = {
 		if (keyCode === undefined) {
 			// Use keystroke for unknown keys
 			const modStr = modifiers.length ? ` using {${modifiers.map(m => m + ' down').join(', ')}}` : '';
-			// Escape single quotes for shell context (same pattern as switchAppTool).
-			const safeKey = key.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
+			// Escape for AppleScript string literal — no shell layer needed with execFileSync.
+			const safeKey = key.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 			try {
-				execSync(`osascript -e 'tell application "System Events" to keystroke "${safeKey}"${modStr}'`, { timeout: 3_000 });
+				execFileSync('osascript', ['-e', `tell application "System Events" to keystroke "${safeKey}"${modStr}`], { timeout: 3_000 });
 			} catch (err) {
 				return { error: `press_key failed: ${err instanceof Error ? err.message : err}` };
 			}
 		} else {
 			const modStr = modifiers.length ? ` using {${modifiers.map(m => m + ' down').join(', ')}}` : '';
 			try {
-				execSync(`osascript -e 'tell application "System Events" to key code ${keyCode}${modStr}'`, { timeout: 3_000 });
+				execFileSync('osascript', ['-e', `tell application "System Events" to key code ${keyCode}${modStr}`], { timeout: 3_000 });
 			} catch (err) {
 				return { error: `press_key failed: ${err instanceof Error ? err.message : err}` };
 			}
@@ -254,11 +254,14 @@ export const switchAppTool: ToolDefinition = {
 	async execute(args) {
 		let { app } = args as { app: string };
 		app = APP_ALIASES[app.toLowerCase()] ?? app;
-		// Escape backslashes first, then quotes — prevents shell injection via osascript
-		const safeApp = app.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
-		const processName = (PROCESS_NAMES[app] ?? app).replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
+		// Escape for AppleScript string literals — no shell layer needed with execFileSync.
+		const safeApp = app.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+		const processName = (PROCESS_NAMES[app] ?? app).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 		try {
-			execSync(`osascript -e 'tell application "${safeApp}" to activate' -e 'tell application "System Events" to set frontmost of process "${processName}" to true'`, { timeout: 10_000 });
+			execFileSync('osascript', [
+				'-e', `tell application "${safeApp}" to activate`,
+				'-e', `tell application "System Events" to set frontmost of process "${processName}" to true`,
+			], { timeout: 10_000 });
 			console.log(`${ts()} [SwitchApp] activated: ${app}`);
 			return { status: 'switched', app };
 		} catch (err) {
@@ -344,24 +347,24 @@ export const typeTextTool: ToolDefinition = {
 				// pbcopy still mangled bytes in launchd context).
 				const utf8Env = { ...process.env, LANG: 'en_US.UTF-8', LC_ALL: 'en_US.UTF-8' };
 				let savedClipboard = '';
-				try { savedClipboard = execSync('pbpaste', { encoding: 'utf-8', timeout: 2_000, env: utf8Env }); } catch {}
+				try { savedClipboard = execFileSync('pbpaste', [], { encoding: 'utf-8', timeout: 2_000, env: utf8Env }); } catch {}
 				// Convert literal \n to actual newlines
 				const pasteText = text.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
-				execSync('pbcopy', { input: pasteText, encoding: 'utf-8', timeout: 2_000, env: utf8Env });
+				execFileSync('pbcopy', [], { input: pasteText, encoding: 'utf-8', timeout: 2_000, env: utf8Env });
 				// replace_all: emit Cmd+A first so the subsequent Cmd+V replaces the
 				// entire field content (closes the selection-state ambiguity that
 				// 'replace' default had — relied on caller to have selected).
 				// append: collapse selection to its end via Right-arrow before Cmd+V.
 				// at_caret (default): paste at current caret / replace current selection per macOS Cmd+V semantics.
 				if (mode === 'replace_all') {
-					execSync(`osascript -e 'tell application "System Events" to keystroke "a" using command down'`, { timeout: 3_000, env: utf8Env });
+					execFileSync('osascript', ['-e', 'tell application "System Events" to keystroke "a" using command down'], { timeout: 3_000, env: utf8Env });
 				} else if (mode === 'append') {
-					execSync(`osascript -e 'tell application "System Events" to key code 124'`, { timeout: 3_000, env: utf8Env });
+					execFileSync('osascript', ['-e', 'tell application "System Events" to key code 124'], { timeout: 3_000, env: utf8Env });
 				}
-				execSync(`osascript -e 'tell application "System Events" to keystroke "v" using command down'`, { timeout: 5_000, env: utf8Env });
-				execSync('sleep 0.3');
+				execFileSync('osascript', ['-e', 'tell application "System Events" to keystroke "v" using command down'], { timeout: 5_000, env: utf8Env });
+				execFileSync('sleep', ['0.3']);
 				if (savedClipboard) {
-					execSync('pbcopy', { input: savedClipboard, encoding: 'utf-8', timeout: 2_000, env: utf8Env });
+					execFileSync('pbcopy', [], { input: savedClipboard, encoding: 'utf-8', timeout: 2_000, env: utf8Env });
 				}
 				console.log(`${ts()} [TypeText] pasted (multi-line, mode=${mode}): ${text.slice(0, 40)}...`);
 				return { status: 'typed', text };
@@ -370,20 +373,18 @@ export const typeTextTool: ToolDefinition = {
 			}
 		}
 		// Single-line short text: use keystroke
-		// Escape backslash for AppleScript, single-quote for shell, double-quote for AppleScript.
-		// Same three-step chain as switchAppTool — missing single-quote escape allowed
-		// shell breakout via text containing apostrophes.
-		const safeText = text.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
+		// Escape for AppleScript string literal only — no shell layer needed with execFileSync.
+		const safeText = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 		try {
 			// replace_all: Cmd+A first so the keystroke replaces the entire field.
 			// append: collapse selection to its end via Right-arrow before typing.
 			// at_caret (default): keystroke at caret / replaces current selection per System Events behavior.
 			if (mode === 'replace_all') {
-				execSync(`osascript -e 'tell application "System Events" to keystroke "a" using command down'`, { timeout: 3_000 });
+				execFileSync('osascript', ['-e', 'tell application "System Events" to keystroke "a" using command down'], { timeout: 3_000 });
 			} else if (mode === 'append') {
-				execSync(`osascript -e 'tell application "System Events" to key code 124'`, { timeout: 3_000 });
+				execFileSync('osascript', ['-e', 'tell application "System Events" to key code 124'], { timeout: 3_000 });
 			}
-			execSync(`osascript -e 'tell application "System Events" to keystroke "${safeText}"'`, { timeout: 5_000 });
+			execFileSync('osascript', ['-e', `tell application "System Events" to keystroke "${safeText}"`], { timeout: 5_000 });
 			console.log(`${ts()} [TypeText] typed (mode=${mode}): ${text.slice(0, 40)}`);
 			return { status: 'typed', text };
 		} catch (err) {
@@ -405,19 +406,19 @@ export const volumeTool: ToolDefinition = {
 		const { level, mute } = args as { level?: number; mute?: boolean };
 		try {
 			if (mute === true) {
-				execSync(`osascript -e 'set volume with output muted'`, { timeout: 5_000 });
+				execFileSync('osascript', ['-e', 'set volume with output muted'], { timeout: 5_000 });
 				console.log(`${ts()} [Volume] muted`);
 				return { status: 'muted' };
 			}
 			if (mute === false) {
-				execSync(`osascript -e 'set volume without output muted'`, { timeout: 5_000 });
+				execFileSync('osascript', ['-e', 'set volume without output muted'], { timeout: 5_000 });
 				console.log(`${ts()} [Volume] unmuted`);
 				return { status: 'unmuted' };
 			}
 			if (level !== undefined) {
 				// Gemini sometimes passes 0-1 instead of 0-100 — normalize
 				const normalizedLevel = level <= 1 && level > 0 ? Math.round(level * 100) : Math.round(level);
-				execSync(`osascript -e 'set volume output volume ${normalizedLevel}'`, { timeout: 5_000 });
+				execFileSync('osascript', ['-e', `set volume output volume ${normalizedLevel}`], { timeout: 5_000 });
 				console.log(`${ts()} [Volume] set to ${normalizedLevel}%`);
 				return { status: 'set', level: normalizedLevel };
 			}
@@ -442,7 +443,7 @@ export const brightnessTool: ToolDefinition = {
 		if (level <= 1 && level > 0) level = Math.round(level * 100);
 		const bLevel = (level / 100).toFixed(2);
 		try {
-			execSync(`brightness ${bLevel}`, { timeout: 5_000 });
+			execFileSync('brightness', [bLevel], { timeout: 5_000 });
 			console.log(`${ts()} [Brightness] set to ${level}%`);
 			return { status: 'set', level };
 		} catch {
@@ -450,8 +451,8 @@ export const brightnessTool: ToolDefinition = {
 			try {
 				const steps = Math.round(level / 100 * 16);
 				// Reset to 0 then go up
-				for (let i = 0; i < 16; i++) execSync(`osascript -e 'tell application "System Events" to key code 107'`, { timeout: 1_000 }); // brightness down
-				for (let i = 0; i < steps; i++) execSync(`osascript -e 'tell application "System Events" to key code 113'`, { timeout: 1_000 }); // brightness up
+				for (let i = 0; i < 16; i++) execFileSync('osascript', ['-e', 'tell application "System Events" to key code 107'], { timeout: 1_000 }); // brightness down
+				for (let i = 0; i < steps; i++) execFileSync('osascript', ['-e', 'tell application "System Events" to key code 113'], { timeout: 1_000 }); // brightness up
 				console.log(`${ts()} [Brightness] set to ~${level}% via key codes`);
 				return { status: 'set', level, method: 'key_codes' };
 			} catch (err) {
@@ -474,18 +475,12 @@ export const clipboardTool: ToolDefinition = {
 		const { action, text } = args as { action: 'read' | 'write'; text?: string };
 		try {
 			if (action === 'read') {
-				const content = execSync(`pbpaste`, { timeout: 5_000 }).toString();
+				const content = execFileSync('pbpaste', [], { encoding: 'utf-8', timeout: 5_000 });
 				console.log(`${ts()} [Clipboard] read: ${content.slice(0, 40)}`);
 				return { status: 'read', content };
 			} else {
 				if (!text) return { error: 'No text provided to write' };
-				// Write to temp file then pipe to pbcopy — avoids shell injection via
-				// echo "$(cmd)" since JSON.stringify wraps in double-quotes which don't
-				// prevent $() substitution in bash.
-				const tmpPb = `/tmp/sutando-clipboard-${Date.now()}.txt`;
-				writeFileSync(tmpPb, text);
-				execSync(`pbcopy < "${tmpPb}"`, { timeout: 5_000 });
-				try { unlinkSync(tmpPb); } catch {}
+				execFileSync('pbcopy', [], { input: text, timeout: 5_000 });
 				console.log(`${ts()} [Clipboard] wrote: ${text.slice(0, 40)}`);
 				return { status: 'written', text };
 			}
@@ -614,7 +609,7 @@ export const toggleTasksTool: ToolDefinition = {
 		const actionStr = taskIndex ? `${action}:${taskIndex}` : action;
 		const js = `document.body.dataset.taskAction = \\\"${actionStr}\\\"; \\\"done\\\"`;
 		try {
-			execSync(`osascript -e 'tell application "Google Chrome"
+			execFileSync('osascript', ['-e', `tell application "Google Chrome"
 				repeat with w in windows
 					repeat with t in tabs of w
 						if URL of t contains "localhost:8080" then
@@ -624,7 +619,7 @@ export const toggleTasksTool: ToolDefinition = {
 					end repeat
 				end repeat
 				return "not found"
-			end tell'`, { timeout: 5_000 });
+			end tell`], { timeout: 5_000 });
 			console.log(`${ts()} [ToggleTasks] ${actionStr}`);
 			return { status: action === 'collapse' ? 'collapsed' : 'expanded' };
 		} catch (err) {
@@ -726,7 +721,7 @@ export const slideControlTool: ToolDefinition = {
 		end repeat
 	end repeat
 end tell`;
-			execSync(`osascript -e '${script}'`, { timeout: 15_000 });
+			execFileSync('osascript', ['-e', script], { timeout: 15_000 });
 			console.log(`${ts()} [Slides] ${action}${slideNumber ? ` → slide ${slideNumber}` : ''}`);
 			return { status: 'done', action, slideNumber };
 		} catch (err) {
