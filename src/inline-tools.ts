@@ -1049,7 +1049,7 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 	// scan order). The SAME skill present in two scanned dirs, or two skills
 	// declaring the same tool name (e.g. summon/dismiss/copres_*), otherwise yields
 	// duplicate names → assertUniqueToolNames(inlineTools) throws at module load →
-	// Gemini 3.1 Live closes with 1011 at setup → voice/discord-voice can't start.
+	// Gemini 3.1 Live closes with 1011 at setup → voice / plugin surfaces can't start.
 	// See reference_gemini_1011_tool_name_conflict.
 	const dedupeByName = (arr: ToolDefinition[]): ToolDefinition[] => {
 		const byName = new Map<string, ToolDefinition>();

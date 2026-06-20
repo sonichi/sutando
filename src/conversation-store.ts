@@ -1,12 +1,12 @@
 /**
  * SQLite mirror of conversation.log — per-surface tables.
  *
- * Schema split: each voice surface (voice-agent / phone / discord-voice)
- * gets its own table. Each surface table holds BOTH utterances AND tool
- * calls in one chronological stream — no separate mixed `conversation`
- * table, no separate `tool_calls` table.
+ * Schema split: each voice surface (voice-agent's `voice`, the phone skill's
+ * `phone`, and any plugin-registered surface) gets its own table. Each surface
+ * table holds BOTH utterances AND tool calls in one chronological stream — no
+ * separate mixed `conversation` table, no separate `tool_calls` table.
  *
- *   voice / phone / discord_voice:
+ *   voice / phone / <plugin-surface>:
  *     id          INTEGER PRIMARY KEY  -- insertion order (canonical)
  *     ts_unix     REAL NOT NULL        -- emit time
  *     kind        TEXT NOT NULL        -- user | agent | peer | tool_call |
@@ -51,9 +51,8 @@ type Source = string;
 // ---------------------------------------------------------------------------
 // Surface registry (#1427 two-repo refactor, round ④). The engine knows only
 // the HOST surfaces it ships (voice-agent's `voice`, the phone-conversation
-// skill's `phone`). Plugin surfaces (e.g. the sutando-meeting discord-voice
-// plugin) register themselves at startup via registerSurfaceTable — the
-// engine never names a plugin. Each entry: which table a source writes to,
+// skill's `phone`). Plugin surfaces register themselves at startup via
+// registerSurfaceTable — the engine never names a plugin. Each entry: which table a source writes to,
 // which role prefix routes to it, and the insert column list (derived from
 // the table's actual schema at registration, so surfaces with extra columns
 // — speaker attribution etc. — get them persisted without the engine
@@ -103,9 +102,8 @@ export function kindFromRole(role: string): string {
 
 // =============================================================================
 // Plugin surface-table registration (voice-core recording API, issue #1427
-// two-repo refactor). External voice-surface plugins (e.g. the sutando-meeting
-// discord-voice plugin) own their table DDL AND their routing registration —
-// the engine never hardcodes a plugin name (manifest principle). DDL must be
+// two-repo refactor). External plugins own their table DDL AND their routing
+// registration — the engine never hardcodes a plugin name (manifest principle). DDL must be
 // idempotent (CREATE ... IF NOT EXISTS). Fail-open like the rest of the
 // store — a broken plugin table must never take down host recording.
 //
@@ -656,7 +654,7 @@ export function recordToolCall(
 }
 
 export interface SessionMetrics {
-	source: 'voice' | 'phone' | 'discord-voice' | string;
+	source: 'voice' | 'phone' | string;
 	sessionId?: string | null;
 	callSid?: string | null;
 	caller?: string | null;

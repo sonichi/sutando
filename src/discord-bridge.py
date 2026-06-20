@@ -67,8 +67,8 @@ REPO = resolve_workspace()
 # Generic plugin message-hook loader. The bridge stays a THIN, plugin-AGNOSTIC
 # host: it names no specific plugin. At startup it scans plugin directories for a
 # manifest.json declaring a `message_hook`, imports the named module, and binds
-# its match/handle callables. A plugin (e.g. an external voice-surface living in
-# a sibling repo) registers a "this text triggers me -> handle it" hook without
+# its match/handle callables. A plugin (e.g. one living in a sibling repo)
+# registers a "this text triggers me -> handle it" hook without
 # the bridge hardcoding anything about it. Best-effort: a missing/disabled plugin
 # contributes no hook and messages flow as normal tasks. Honors the CLAUDE.md
 # core/skill split (no feature logic in core).
@@ -2470,7 +2470,7 @@ async def _handle_discord_message(message, force=False):
 
         # Text/magic-word screen-push REMOVED (#1427, owner 2026-06-05). Screen
         # sharing in a voice session is owned entirely by the voice-invoked
-        # screen-share tool that the discord-voice plugin contributes — typed
+        # screen-share tool that an external plugin contributes — typed
         # phrases no longer start screen-push; only voice does. The old
         # setScreenPush consumer was already gone, so this typed path was an
         # orphan that still posted a "Screen-push on" message (fired on every
@@ -2807,10 +2807,10 @@ async def _handle_discord_message(message, force=False):
     if len(seen_message_ids) > 10000:
         seen_message_ids.clear()
 
-    # discord-voice "magic word" join trigger. THIN hook (CLAUDE.md core/skill
+    # Plugin "magic word" join trigger. THIN hook (CLAUDE.md core/skill
     # split): the bridge only checks "is this the owner saying the join
     # phrase"; everything else — voice-channel lookup, already-running guard,
-    # discord-voice-server launch — lives in the discord-voice skill helper.
+    # plugin-server launch — lives in the plugin's skill helper.
     # Owner-only by construction: a non-owner saying the phrase falls through
     # to normal task handling. When it fires, the message IS the command — we
     # send the reply and return WITHOUT writing a task file (no normal task

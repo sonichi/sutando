@@ -1078,8 +1078,9 @@ def run_all_checks() -> list[dict]:
 
         checks.append({"name": name, "status": status, "detail": detail})
 
-    # (The discord-voice probe moved with its plugin in #1427 round ④ — the
-    # plugin manifest declares a health_probe; the host checks host services.)
+    # (External plugin probes moved out with their plugins in #1427 round ④ —
+    # a plugin manifest declares its own health_probe; the host checks host
+    # services only.)
 
     # Sutando menu bar app — check either dev-built binary or installed .app.
     # On the distributed .app path the dev binary doesn't ship; we still want
@@ -1333,7 +1334,7 @@ def _slack_failures(checks: list[dict]) -> list[dict]:
     """Failures worth a remote owner DM.
 
     Same hard-failure statuses as notify_for_failures, but drops benign
-    on-demand `warn`s (e.g. discord-voice / conversation-server "not running
+    on-demand `warn`s (e.g. a plugin server / conversation-server "not running
     (on-demand)") — those are the steady state for per-session processes and
     would spam the owner's DM every cooldown window. The signals that matter
     for a remote watchdog (stuck core-proactive-loop, task-queue pileup, a

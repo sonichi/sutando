@@ -617,9 +617,9 @@ export const startVisionTool: ToolDefinition = {
 	},
 };
 
-// The discord-voice screen-share tool moved to its plugin (manifest-loaded) so
-// the host keeps zero discord-voice footprint (#1720). It is a thin wrapper over
-// the exported startStreaming() primitive below.
+// A plugin-contributed screen-share tool (manifest-loaded) is a thin wrapper
+// over the exported startStreaming() primitive below; the host keeps no
+// plugin-specific footprint here (#1720).
 
 export const stopVisionTool: ToolDefinition = {
 	name: 'stop_vision',
