@@ -21,6 +21,12 @@ jobs:
       - name: UTC timestamp check
         run: python3 scripts/check-utc-z-strftime.py
 
+      # Fails if vault.sync.include carries a per-host-prone path without a
+      # hostname qualifier (would collapse across hosts on pull-merge).
+      # See docs/workspace-per-host-paths.md.
+      - name: Per-host carried-path lint
+        run: bash scripts/lint-vault-sync-paths.sh
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
