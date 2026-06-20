@@ -85,17 +85,15 @@ def suggest_reframes(title: str) -> list[str]:
 def is_chi_fleet() -> bool:
     """Detect whether the runner is on Chi's Sutando fleet.
 
-    Two signals (either suffices):
-      1. /Users/wangchi/.sutando/workspace/ exists (canonical fleet workspace)
-      2. SUTANDO_FLEET_OWNER env var equals 'chi'
+    Signal: the SUTANDO_FLEET_OWNER env var equals 'chi' — set in fleet-local,
+    gitignored config, NEVER hardcoded in this public repo (a hardcoded
+    /Users/<name>/ path would leak a personal username into the OSS code).
 
-    Default behavior off-fleet: DON'T touch git config. OSS contributors must
-    sign the CLA under their own identity — that's the whole point of the
-    CLA-Assistant channel.
+    Off-fleet (or the var unset) → return False: DON'T touch git config. OSS
+    contributors must sign the CLA under their own identity — that's the whole
+    point of the CLA-Assistant channel.
     """
-    if os.environ.get("SUTANDO_FLEET_OWNER", "").lower() == "chi":
-        return True
-    return Path("/Users/wangchi/.sutando/workspace").exists()
+    return os.environ.get("SUTANDO_FLEET_OWNER", "").lower() == "chi"
 
 
 # --- idempotency probes -----------------------------------------------------
