@@ -36,6 +36,57 @@ if [ -n "${SUTANDO_CORE_MODEL:-}" ]; then
   MODEL_ARGS=(--model "$SUTANDO_CORE_MODEL")
 fi
 
+# ---- obs hooks (registered ONLY when an export endpoint is set) -------------
+# Register Claude Code hooks via `--settings` (merges with the user's settings
+# at highest precedence, per-session — no persistent file edit) ONLY when an
+# endpoint is configured. With no endpoint we inject no --settings at all, so
+# PreToolUse/PostToolUse never fork obs-hook.sh on the tool-call hot path —
+# capture is truly zero-cost (not just a no-op fork) when off. The endpoint comes
+# from $SUTANDO_OBS_ENDPOINT (exported so the hook — which runs in the session's
+# inherited env — resolves it at hook-time).
+OBS_ENDPOINT="${SUTANDO_OBS_ENDPOINT:-}"
+export SUTANDO_OBS_ENDPOINT="$OBS_ENDPOINT"
+
+# Inject --settings (and thus the per-event hooks) only when an endpoint exists.
+# The ${arr[@]+...} guard keeps the empty array safe on bash 3.2 under `set -u`
+# (same pattern as MODEL_ARGS above). The settings JSON is built by a node helper,
+# NOT shell string interpolation: hand-rolled interpolation broke when $REPO held
+# a space (split the command) or a `"` (broke the JSON). The helper POSIX
+# single-quotes the path inside the command and JSON-escapes the payload. Its 10
+# event keys are all valid CC hook events (code.claude.com/docs/en/hooks.md).
+SETTINGS_ARGS=()
+if [ -z "$OBS_ENDPOINT" ]; then
+  echo "obs hooks: not registered (no export endpoint — set SUTANDO_OBS_ENDPOINT to enable capture)"
+elif ! command -v node > /dev/null 2>&1; then
+  echo "obs hooks: node unavailable — cannot safely build --settings JSON; capture disabled this session" >&2
+else
+  HOOKS_JSON="$(node "$REPO/src/observability/claude/hooks/build-hook-settings.mjs" "$REPO/src/observability/claude/hooks/obs-hook.sh")"
+  if [ -n "$HOOKS_JSON" ]; then
+    SETTINGS_ARGS=(--settings "$HOOKS_JSON")
+    echo "obs hooks: → $OBS_ENDPOINT/ingest/claude-code-hooks (collector)"
+  else
+    echo "obs hooks: settings build failed — capture disabled this session" >&2
+  fi
+fi
+
+# ---- obs metering (CC native OTel token + cost) -----------------------------
+# Hooks give obs events but carry NO tokens. Claude Code's OTel
+# `claude_code.token.usage` / `cost.usage` metrics are the authoritative usage
+# source, so when an export endpoint is set we also turn on CC telemetry and
+# point its OTLP exporter at the collector (which serves /v1/metrics). Enable
+# ONLY metrics — logs/traces stay off so hooks remain the sole obs source (no
+# duplicate events). JSON OTLP so the collector parses it without protobuf.
+# Gated on the same endpoint; honors any pre-set OTEL_* so a real OTel backend
+# isn't overridden.
+if [ -n "$OBS_ENDPOINT" ] && [ -z "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" ]; then
+  export CLAUDE_CODE_ENABLE_TELEMETRY=1
+  export OTEL_METRICS_EXPORTER=otlp
+  export OTEL_EXPORTER_OTLP_PROTOCOL=http/json
+  export OTEL_EXPORTER_OTLP_ENDPOINT="$OBS_ENDPOINT"
+  export OTEL_METRIC_EXPORT_INTERVAL="${OTEL_METRIC_EXPORT_INTERVAL:-10000}" # ms; 10s (CC default 60s)
+  echo "obs metering: → $OBS_ENDPOINT/v1/metrics (CC OTel token+cost, every ${OTEL_METRIC_EXPORT_INTERVAL}ms)"
+fi
+
 # --restart: kill any existing session before starting fresh. Without this,
 # the script's "already running → attach" path returns and the old session
 # keeps running.
@@ -58,9 +109,35 @@ if [ "$1" = "--restart" ]; then
   fi
 fi
 
+# Sutando-friendly tmux defaults (mouse scrollback + alt-screen wheel fix).
+# Defined as a function so it runs on EVERY invocation — including the
+# "already running → attach" path below. 2026-06-11: Chi's scroll broke
+# again because the live server (started 2026-05-30) somehow lacked these
+# options even though #688/#1304 predate it; rather than depend on the
+# session-creation path alone, re-apply on every start/attach/restart so
+# any rerun of this script heals the server. Idempotent: re-applying to an
+# already-configured server is a no-op.
+apply_tmux_defaults() {
+  command -v tmux > /dev/null 2>&1 || return 0
+  tmux -S "$TMUX_SOCKET" start-server 2>/dev/null || true
+  tmux -S "$TMUX_SOCKET" set-option -g mouse on 2>/dev/null || true
+  # Wheel-scroll fix (sutando-plus#46, re-broken 2026-06-11): predicate on
+  # mouse_any_flag, NOT alternate_on. Claude Code 2.1.150 stopped using the
+  # alternate screen, so the old alt-screen predicate forwarded wheel events
+  # to an app that never requested mouse input — they were silently dropped
+  # and scrollback became unreachable. mouse_any_flag asks the question we
+  # actually care about: does the pane app WANT mouse events? If yes (vim
+  # with mouse=a, future Claude Code versions), forward them; if no, enter
+  # copy-mode so WheelUp always reaches tmux scrollback regardless of the
+  # app's screen mode. WheelDown passes through so normal scrolling works.
+  tmux -S "$TMUX_SOCKET" bind -n WheelUpPane if-shell -F -t = '#{mouse_any_flag}' 'send-keys -M' 'copy-mode -e; send-keys -M' 2>/dev/null || true
+  tmux -S "$TMUX_SOCKET" bind -n WheelDownPane send-keys -M 2>/dev/null || true
+}
+
 # Already running — attach if interactive, else exit cleanly. This branch
 # also catches the !--restart path so re-running the script is idempotent.
 if pgrep -f "claude.*--name.*$SESSION" > /dev/null 2>&1; then
+  apply_tmux_defaults
   if [ -t 1 ] && command -v tmux > /dev/null 2>&1; then
     echo "Attaching to existing $SESSION (Ctrl-b d to detach)..."
     exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
@@ -82,6 +159,7 @@ if ! command -v tmux > /dev/null 2>&1; then
   echo "  ⚠ tmux not found — running without tmux wrapper"
   echo "    (Sutando.app's watcher-auto-restart won't work; brew install tmux to enable)"
   exec claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
+    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
     -- "/schedule-crons"
 fi
 
@@ -90,27 +168,13 @@ fi
 # same tmux server as the user shell (per #PR_444 watcher-auto-restart).
 #
 # Sutando-friendly tmux defaults — applied to the server before the session
-# attaches. `mouse on` lets users two-finger scrollback in the Claude Code
-# pane (the default behavior, where Up-arrow goes to readline history and
-# you can't easily review prior agent output, is confusing for new installs).
+# attaches (see apply_tmux_defaults above for the full rationale).
 #
 # Tradeoff: `mouse on` intercepts native Cmd+drag text selection in the pane.
 # To copy text the macOS-native way, hold Option while dragging (Terminal.app,
 # iTerm2, Ghostty all honor Option-drag as a tmux-bypass). Documenting here
 # so future readers don't think this is a regression.
-#
-# Idempotent: re-running it on an already-configured server is a no-op.
-tmux -S "$TMUX_SOCKET" start-server 2>/dev/null || true
-tmux -S "$TMUX_SOCKET" set-option -g mouse on 2>/dev/null || true
-# Wheel-scroll fix for alternate-screen TUIs (Claude Code, vim, etc.):
-# `mouse on` alone doesn't help because Claude Code consumes wheel events in
-# alternate-screen mode before tmux can enter copy-mode. These two bindings
-# force copy-mode on WheelUp when the pane is running an alternate-screen app
-# so the user gets tmux scrollback instead of a no-op.
-# WheelDown is passed through so normal (non-alt-screen) scrolling still works.
-# Fixes sutando-plus#46.
-tmux -S "$TMUX_SOCKET" bind -n WheelUpPane if-shell -F -t = '#{alternate_on}' 'copy-mode -e; send-keys -M' 'send-keys -M' 2>/dev/null || true
-tmux -S "$TMUX_SOCKET" bind -n WheelDownPane send-keys -M 2>/dev/null || true
+apply_tmux_defaults
 #
 # Branch on whether we have a TTY:
 #   - TTY (user running from terminal): exec attach so the user sees the
@@ -120,10 +184,12 @@ tmux -S "$TMUX_SOCKET" bind -n WheelDownPane send-keys -M 2>/dev/null || true
 if [ -t 1 ]; then
   exec tmux -S "$TMUX_SOCKET" new-session -A -s "$SESSION" \
     claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
+    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
     -- "/schedule-crons"
 else
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" \
     claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
+    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
     -- "/schedule-crons"
   echo "Started $SESSION detached. Attach via Open Core CLI in menu bar, or:"
   echo "  tmux -S $TMUX_SOCKET attach -t $SESSION"

@@ -84,6 +84,7 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '../../../src/inline-tools.js';
 import { recordSession, recordConversation, recordToolCall } from '../../../src/conversation-store.js';
+import { startPhoneTicker, type TickerControl } from '../../../src/observability/realtime.js';
 import { resultBelongsTo, phoneCallKey } from '../../../src/result-channel-key.js';
 // Lazy vision-session handle. Only loaded if a call ever needs it — keeps the
 // phone-agent boot path free of the vision-tools.ts side-effects on cold start.
@@ -339,6 +340,8 @@ interface CallSession {
 	// Observability: per-call metrics (startTime already on CallSession from #209)
 	toolCalls: { name: string; durationMs: number; timestamp: string }[];
 	events: { event: string; timestamp: string }[];
+	// Realtime usage ticker — emits voice+phone seconds incrementally while live.
+	usageTicker?: TickerControl;
 	// Per-call channel-scan state (results/<callSid>.task-*.txt pull path).
 	channelScanHandle?: NodeJS.Timeout;
 	// Safety-net against silent unlinkSync failures — `name -> first-seen ms`,
@@ -539,7 +542,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 		const isInbound = !callSession.purpose;
 		// Load Stand identity (voice-context.txt excluded — can confuse phone identity)
 		const standId = (() => { try { const si = JSON.parse(readFileSync(personalPath('stand-identity.json'), 'utf-8')); return si.name ? `Your Stand name is ${si.name}. When asked your name, say "I'm Sutando — ${si.name}."` : ''; } catch { return ''; } })();
-		instructions = [
+		const instructionParts: string[] = [
 			'You are Sutando, a personal AI assistant.',
 			standId,
 			// Identity & greeting — based on owner vs verified vs unverified
@@ -560,7 +563,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 
 		// Owner-only sections
 		if (callSession.isOwner) {
-			instructions.push(
+			instructionParts.push(
 				'',
 				'## How to think',
 				'Before acting, gather what you need. Before delegating, give them what they need.',
@@ -598,7 +601,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 			);
 		}
 
-		instructions = instructions.filter(Boolean).join('\n');
+		instructions = instructionParts.filter(Boolean).join('\n');
 	}
 
 	// Grounding. The "look it up" pointer is conditional on per-surface
@@ -814,6 +817,13 @@ async function createCallSession(params: {
 		resultQueue: [],
 		toolCalls: [],
 		events: [{ event: 'call_started', timestamp: new Date().toISOString() }],
+		usageTicker: startPhoneTicker({
+			callSid: params.callSid,
+			model: VOICE_MODEL,
+			isOwner: params.isOwner,
+			isMeeting: params.isMeeting,
+			toolCallsGetter: () => callSession.toolCalls.length,
+		}),
 	};
 
 	// Start live transcript file
@@ -840,7 +850,6 @@ async function createCallSession(params: {
 		host: '127.0.0.1',
 		model: google(VOICE_MODEL),
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
-		googleSearch: PHONE_GOOGLE_SEARCH,
 		speechConfig: { voiceName: 'Aoede' },
 		hooks: {
 			onToolCall: (e) => {
@@ -1196,6 +1205,11 @@ function cleanupCall(callSid: string): void {
 		toolCalls: session.toolCalls,
 		events: session.events,
 	});
+
+	// Spine usage: flush the final partial bucket for both Twilio + Gemini-Live
+	// axes. The ticker has been emitting increments every USAGE_TICK_MS while the
+	// call ran; stop() emits the remainder and clears the interval.
+	try { session.usageTicker?.stop(); } catch {}
 
 	// Auto-scan the latest call for issues (async, best effort)
 	try {
@@ -1571,7 +1585,6 @@ const server = createServer(async (req, res) => {
 				json(res, 200, { status: 'not_playing' });
 			}
 			return;
-			json(res, 200, { status: 'streaming', path: body.path, callSid: session.callSid });
 
 		} else if (path === '/meeting' && req.method === 'POST') {
 			await waitForWebhook();
@@ -1873,7 +1886,6 @@ wss.on('connection', (ws: WebSocket) => {
 									seekSec = parseFloat(pos) || 0;
 								} catch {}
 								// Start ffmpeg from that position
-								if (activePlaybackProc) activePlaybackProc.kill('SIGTERM');
 								const ffmpegProc = spawn('ffmpeg', ['-re', '-ss', String(seekSec), '-i', recPath, '-f', 's16le', '-ar', '24000', '-ac', '1', '-v', 'quiet', 'pipe:1']);
 								activePlaybackProc = ffmpegProc;
 								const ws2 = callSession.twilioWs;

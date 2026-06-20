@@ -1,0 +1,6 @@
+# Run artifacts (per-day results, promoted baseline, captured audio) are local.
+results/voice-test/
+results/audio/
+!results/.gitkeep
+__pycache__/
+*.pyc

@@ -35,16 +35,29 @@ jobs:
       - name: Install dependencies (clean)
         run: npm ci
 
+      # Python test deps. Most tests are stdlib-only; secret-scanner needs
+      # detect-secrets (requirements.txt). Must run BEFORE `npm test`: the
+      # `test` script chains `npm run test:py`, so Python tests execute
+      # inside the "Run tests" step, not only in the standalone step below.
+      - name: Install Python test deps
+        run: python3 -m pip install -r requirements.txt
+
       - name: Typecheck
         run: npm run typecheck
+
+      # skills/*/scripts TS was previously invisible to tsc (tsconfig include
+      # was src-only) — dead options like vadConfig/googleSearch on session
+      # configs and broken imports slipped through to runtime. Issue #1586.
+      - name: Typecheck skills
+        run: npm run typecheck:skills
 
       - name: Run tests
         run: npm test
         if: hashFiles('tests/**/*.test.ts') != ''
 
-      # Run standalone Python tests (*.test.py) — stdlib-only, no deps needed.
+      # Run standalone Python tests (*.test.py).
       # Covers telegram-bridge TOFU tri-state, slack-bridge tier-map, discord-bridge
-      # access tiers, result-markers, and more. See #897.
+      # access tiers, result-markers, secret-scanner, and more. See #897.
       #
       # Quiet mode: suppress PASS lines (only FAIL + summary shown) to keep CI
       # log compact across 32+ test files. Non-zero exit on any failure.

@@ -37,6 +37,7 @@ from result_markers import parse_markers  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
+from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 REPO = resolve_workspace()
 TASKS_DIR = REPO / "tasks"
 RESULTS_DIR = REPO / "results"
@@ -312,6 +313,28 @@ def api(method, **params):
 INBOX_DIR = REPO / "telegram-inbox"
 INBOX_DIR.mkdir(exist_ok=True)
 
+def _transcribe_via_skill(local_path: str) -> str | None:
+    """Call skills/audio-transcribe/scripts/transcribe.py. Returns transcript or None.
+
+    Optional — if the skill is absent the caller falls back to [Voice note attached:].
+    Errors are swallowed; transcription failure must never block task delivery.
+    """
+    import subprocess
+    skill_script = Path(__file__).parent.parent / "skills" / "audio-transcribe" / "scripts" / "transcribe.py"
+    if not skill_script.exists():
+        return None
+    try:
+        result = subprocess.run(
+            [sys.executable, str(skill_script), local_path],
+            capture_output=True, text=True, timeout=25,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() or None
+    except Exception as e:
+        print(f"  [stt] skill call failed for {os.path.basename(local_path)}: {e}", flush=True)
+    return None
+
+
 def download_file(file_id, name_hint="file"):
     """Download a file from Telegram and save locally."""
     result = api("getFile", file_id=file_id)
@@ -392,7 +415,7 @@ def send_reply(chat_id, text, task_id: str | None = None):
         fpath = fpath.strip()
         if _is_path_sendable(fpath):
             send_file(chat_id, fpath)
-            print(f"  Sent file: {fpath}")
+            print(f"  Sent file: {fpath}", flush=True)
         elif os.path.isfile(fpath):
             api("sendMessage", chat_id=chat_id, text=f"(file access denied: {fpath})")
             print(f"  BLOCKED file: {fpath}")
@@ -525,20 +548,68 @@ def main():
                     file_id = msg["voice"]["file_id"]
                     local_path = download_file(file_id, "voice.ogg")
                     if local_path:
-                        attachment_note = f"\n[Voice note attached: {local_path}]"
+                        transcript = _transcribe_via_skill(local_path)
+                        if transcript:
+                            attachment_note = f"\n[Voice transcript: {transcript}]"
+                        else:
+                            attachment_note = f"\n[Voice note attached: {local_path}]"
 
                 if not text and not attachment_note:
                     continue
 
                 forward_note = extract_forward_note(msg)
 
-                print(f"  @{username}{forward_note}: {text}{attachment_note}")
+                print(f"  @{username}{forward_note}: {redact_vault_commands(text)}{attachment_note}")
 
                 # Write as task (same format as voice bridge)
                 ts = int(time.time() * 1000)
                 task_id = f"task-{ts}"
                 task_file = TASKS_DIR / f"{task_id}.txt"
                 priority = default_priority_for_source("telegram", "owner")
+
+                # Intercept vault commands before disk write — Telegram treats
+                # all senders as owner-tier (allowlist-gated bot token).
+                if text:
+                    vault_result = intercept_vault_commands(text)
+                    text = vault_result.text
+                    if vault_result.stored:
+                        print(f"  [vault] stored keys: {vault_result.stored}", flush=True)
+                    if vault_result.failed:
+                        print(f"  [vault] store failed (still redacted): {vault_result.failed}", flush=True)
+
+                # Inject skill instructions so the agent follows notify-before-work
+                # and transcription protocol even after conversation compaction.
+                # Only injected when the referenced skills are installed on this node.
+                # CCD-resolved (PR #1525 pattern): never hardcode ~/.claude — nodes may relocate
+                # the config dir via $CLAUDE_CONFIG_DIR.
+                _claude_config = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
+                _notify_py = _claude_config / "skills/task-progress/scripts/notify.py"
+                _transcribe_py = _claude_config / "skills/audio-transcribe/scripts/transcribe.py"
+                has_audio_attach = attachment_note and any(
+                    attachment_note.lower().find(ext) != -1
+                    for ext in (".m4a", ".mp3", ".ogg", ".opus", ".oga", ".wav", ".webm", ".aac")
+                )
+                tg_skill_hints = ""
+                if _notify_py.exists() or _transcribe_py.exists():
+                    lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
+                    step = 1
+                    if _notify_py.exists():
+                        notify_cmd = (
+                            f"python3 {_notify_py}"
+                            f" --source telegram --chat-id {chat_id}"
+                        )
+                        if has_audio_attach:
+                            lines.append(f'{step}. NOTIFY FIRST: {notify_cmd} --message "Got your voice message, give me a moment."')
+                        else:
+                            lines.append(f'{step}. NOTIFY FIRST (if task takes >60s): {notify_cmd} --message "On it — back in a moment."')
+                        step += 1
+                    if has_audio_attach and _transcribe_py.exists():
+                        attached_path = attachment_note.split("[File attached: ")[-1].rstrip("]").split("\n")[0]
+                        lines.append(f"{step}. TRANSCRIBE: python3 {_transcribe_py} '{attached_path}'")
+                        step += 1
+                    lines.append(f"{step}. Process transcript and write result to results/{task_id}.txt")
+                    tg_skill_hints = "\n" + "\n".join(lines) + "\n"
+
                 task_file.write_text(
                     f"id: {task_id}\n"
                     f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
@@ -546,6 +617,7 @@ def main():
                     f"source: telegram\n"
                     f"chat_id: {chat_id}\n"
                     f"priority: {priority}\n"
+                    f"{tg_skill_hints}"
                 )
                 pending_replies[task_id] = chat_id
 
@@ -639,10 +711,10 @@ def main():
                 reply_text = result_file.read_text().strip()
                 chat_id = pending_replies.pop(task_id)
                 # Parse markers via the unified module (#873). Telegram
-                # honors [no-send] / [REPLIED] / [deduped: <id>] as skip
-                # and strips file markers from the text it sends. It
-                # ignores [channel:] redirects (no concept in Telegram —
-                # the marker is silently dropped from body, not leaked).
+                # honors [no-send] / [REPLIED] / [deduped: <id>] as skip,
+                # sends attached files, and silently drops [channel:] redirects
+                # (no concept in Telegram). Pass parsed.body so NO marker ever
+                # leaks as literal text in the user's DM (#1381).
                 parsed = parse_markers(reply_text)
                 if any(a.kind == "skip" for a in parsed.actions):
                     print(f"  Skipped (marker): {task_id}", flush=True)
@@ -651,8 +723,21 @@ def main():
                     archive_file(task_file, "tasks", task_id)
                     continue
                 try:
-                    send_reply(chat_id, reply_text, task_id=task_id)
-                    print(f"  Replied to {chat_id}: {reply_text[:80]}...", flush=True)
+                    # Use parsed.body — all markers stripped — so [channel:] etc. never leak.
+                    # File attachments are in parsed.actions; send_reply() won't re-find them.
+                    send_reply(chat_id, parsed.body, task_id=task_id)
+                    for action in parsed.actions:
+                        if action.kind == "attach":
+                            fpath = action.value.strip()
+                            if _is_path_sendable(fpath):
+                                send_file(chat_id, fpath)
+                                print(f"  Sent file: {fpath}", flush=True)
+                            elif os.path.isfile(fpath):
+                                api("sendMessage", chat_id=chat_id, text=f"(file access denied: {fpath})")
+                                print(f"  BLOCKED file: {fpath}")
+                            else:
+                                print(f"  file marker, file not found — likely a prose quotation: {fpath}", flush=True)
+                    print(f"  Replied to {chat_id}: {parsed.body[:80]}...", flush=True)
                 except Exception as e:
                     print(f"[Telegram] Reply error: {e}", flush=True)
                 # Archive (not delete) so we can mine patterns later.

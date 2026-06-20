@@ -54,12 +54,11 @@ gh calls.
    - Branch: `community-use-case/<slug>` from `main`
    - File: `docs/community-use-cases/<slug>.md` — YAML frontmatter mirroring the
      agent-universe `UseCase` shape so the sync script can later promote it.
-   - Identity: **only** set repo-local `user.email` / `user.name` to
-     `4250911+sonichi@users.noreply.github.com` / `Chi Wang` when the runner
-     is on Chi's fleet (detected via `/Users/wangchi/.sutando/workspace/`
-     existing OR env `SUTANDO_FLEET_OWNER=chi`). For OSS submitters the
-     script leaves git config alone so their own identity flows through —
-     that's the whole point of CLA-Assistant signing.
+   - Identity: the script **never overrides** git config — the commit is
+     attributed to the runner's existing `user.name` / `user.email`, so the CLA
+     signs under whoever they already are (that's the whole point of CLA-Assistant
+     signing). It prints the identity before committing and aborts if it's unset,
+     so attribution can't silently go out wrong.
    - Commit, push, `gh pr create`. PR body cross-links the issue if one was opened.
 6. **Return** both URLs to stdout (issue URL, then PR URL, last two lines).
 
@@ -99,14 +98,16 @@ community submissions).
 - Existing issue with the same `title` (case-insensitive, open state) aborts.
 - `--dry-run` skips all remote checks and only prints rendered output.
 
-## Why we don't auto-set git identity for OSS submitters
+## Why we never override git identity
 
 CLA-Assistant signs the contributor under the email of the commit author.
-For OSS contributors that MUST be their own email — that's the whole point
-of the CLA channel. If we overwrote it with Chi's `noreply` address, every
-external PR would be wrongly attributed and the CLA would be signed under
-the wrong identity. The Chi-fleet override exists only so the same script
-works for internal demo submissions without an extra step.
+That MUST be the runner's own email — overwriting it would wrongly attribute
+the PR and sign the CLA under the wrong identity. So the script never sets
+`user.email` / `user.name`: it commits under whatever the runner already has
+configured (the maintainer's machine already carries the project identity in
+its global git config; contributors carry their own). It surfaces the identity
+before committing and aborts if unset, rather than guessing or silently using
+the wrong author.
 
 ## Dependencies
 

@@ -25,6 +25,10 @@ state/*
 # carry per-user data and must never be committed from a repo-root workspace
 # install — the repo ships <skill>/config.json.example templates instead.
 config/*.json
+# ...except the shipped, in-repo defaults (Spine C source). These are CODE that
+# ships with the repo, not per-user data — they MUST be tracked.
+!config/sutando.config.defaults.json
+!config/sutando.config.schema.json
 AGENT_LOOP.md
 PENDING.md
 pending-questions.md
@@ -44,6 +48,10 @@ docs/youtube/
 core-status.json
 dynamic-content.json
 tests/*
+# Re-include nested test subdirectories so the tests/ tree can mirror src/
+# (tests/kernel/, tests/adapters/, tests/policy/, …) — the companion to the
+# recursive runner glob. Without this, relocated tests are silently untracked.
+!tests/*/
 !tests/*.test.ts
 !tests/*.test.py
 !tests/*.test.sh
@@ -94,3 +102,6 @@ voice-state.json
 
 # Single-instance lock written by src/voice-agent.ts (acquirePidLock).
 .voice-agent.pid
+
+# AG2 onboarding summary — private (invite codes + ids)
+ag2-onboarding.txt

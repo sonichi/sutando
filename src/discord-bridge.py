@@ -5,6 +5,8 @@ Same file-based architecture as the Telegram and voice bridges.
 
 Usage: python3 src/discord-bridge.py
 """
+from __future__ import annotations
+
 
 import asyncio
 import json
@@ -59,6 +61,7 @@ from util_paths import shared_personal_path  # noqa: E402
 from task_priority import default_priority_for_source  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
+from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 REPO = resolve_workspace()
 
 # discord-voice "magic word" join trigger (issue: za-warudo summon). The
@@ -401,6 +404,28 @@ RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 INBOX_DIR.mkdir(exist_ok=True)
 
 
+def _transcribe_via_skill(local_path: str) -> str | None:
+    """Call skills/audio-transcribe/scripts/transcribe.py. Returns transcript or None.
+
+    Optional — if the skill is absent the caller falls back to [File attached:].
+    Errors are swallowed; transcription failure must never block task delivery.
+    """
+    import subprocess
+    skill_script = Path(__file__).parent.parent / "skills" / "audio-transcribe" / "scripts" / "transcribe.py"
+    if not skill_script.exists():
+        return None
+    try:
+        result = subprocess.run(
+            [sys.executable, str(skill_script), local_path],
+            capture_output=True, text=True, timeout=25,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() or None
+    except Exception as e:
+        print(f"  [stt] skill call failed for {os.path.basename(local_path)}: {e}", flush=True)
+    return None
+
+
 def _safe_attachment_basename(filename: str) -> str:
     """Sanitize a Discord attachment filename for safe filesystem +
     downstream-shell use.
@@ -539,6 +564,27 @@ def load_channel_allowed(channel_id):
     if cfg is None:
         return None
     return cfg[1]
+
+def _should_notify_owner_on_seed(sender_id, owner_ids):
+    """True iff a thread auto-seed should @-mention the owner.
+
+    Fires only when a NON-OWNER seeds the thread: an auto-opened thread can
+    otherwise quietly accumulate sandboxed (non-owner) replies the owner never
+    sees, because the @-mention is what reaches the owner's Discord client even
+    when they aren't following the thread. Owner-seeded threads need no ping —
+    the owner is already there. False when there is no owner to mention.
+    """
+    owners = {str(o) for o in (owner_ids or [])}
+    return bool(owners) and str(sender_id) not in owners
+
+def _format_seed_notice(owner_id, author_mention, parent_label, thread_id_str):
+    """Inline notice posted to a freshly auto-seeded thread. Pure (no I/O)."""
+    return (
+        f"<@{owner_id}> 🌱 Auto-seeded this thread to access.json "
+        f"(first message from {author_mention}, parent {parent_label}). "
+        f"Tier still resolves by sender identity — non-owners stay sandboxed. "
+        f"`/discord:access group rm {thread_id_str}` to undo."
+    )
 
 def load_channel_auto_react(channel_id):
     """Return list of emoji strings to auto-react with on each new message in this
@@ -2184,7 +2230,7 @@ async def _handle_discord_message(message, force=False):
         except Exception as e:
             print(f"  [dm-checkpoint] update failed: {e}", flush=True)
 
-    print(f"  [msg] #{channel_name} @{username}: {text[:80]} (mentions: {[str(m) for m in message.mentions]}, is_dm: {is_dm}, embeds: {len(message.embeds)}, type: {message.type}, ref: {message.reference is not None})", flush=True)
+    print(f"  [msg] #{channel_name} @{username}: {redact_vault_commands(text)[:80]} (mentions: {[str(m) for m in message.mentions]}, is_dm: {is_dm}, embeds: {len(message.embeds)}, type: {message.type}, ref: {message.reference is not None})", flush=True)
     # Debug: log message snapshots for forwarded messages
     if hasattr(message, 'message_snapshots') and message.message_snapshots:
         print(f"  [debug] message_snapshots: {message.message_snapshots}", flush=True)
@@ -2284,7 +2330,20 @@ async def _handle_discord_message(message, force=False):
         #    {requireMention: False} with no allowFrom (no restriction). A
         #    thread under an open parent must not be MORE restrictive.
         #  - missing parent_cfg → engager-only [author_id] (safe default).
-        if bot_mentioned and isinstance(message.channel, discord.Thread):
+        # Ungated 2026-06-06 (was `if bot_mentioned and ...`): the bot_mentioned
+        # gate left a gap where any thread's FIRST message that did NOT mention
+        # the bot was silently dropped (the thread never landed in access.json,
+        # so the next load_channel_config saw `thread_id_str not in groups` and
+        # the bridge gave it no allowFrom). Hit live 2026-05-25 on the ep013
+        # thread when Chi's "start from news candidate" message at 13:38Z went
+        # unprocessed for ~2h until Chi explicitly @-mentioned the bot. I/O cost
+        # of ungating is bounded: only the FIRST message per thread incurs the
+        # read+write; subsequent messages hit the `thread_id_str not in
+        # access_groups` early-out and proceed unchanged. After first message
+        # the thread is permanently seeded, so cost amortizes to zero. Tracked
+        # in pending-questions.md (2026-05-17 entry + 2026-05-25 + 2026-06-02
+        # updates).
+        if isinstance(message.channel, discord.Thread):
             try:
                 access_data = json.loads(ACCESS_FILE.read_text())
                 access_groups = access_data.setdefault('groups', {})
@@ -2309,7 +2368,28 @@ async def _handle_discord_message(message, force=False):
                     tmp_path = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + '.tmp')
                     tmp_path.write_text(json.dumps(access_data, indent=2))
                     os.replace(tmp_path, ACCESS_FILE)
+                    # Refresh the gate for THIS message. require_mention was
+                    # computed by load_channel_config before the seed existed,
+                    # so without this the seeding message itself is still
+                    # dropped at the requireMention gate below unless it
+                    # happened to @-mention the bot — the ep013-class
+                    # first-message drop was only half-fixed by the 2026-06-06
+                    # ungate (thread seeded, triggering message lost). Widen
+                    # only: never flip an already-False gate back to True.
+                    require_mention = require_mention and bool(thread_entry.get('requireMention', True))
                     print(f"  [thread-engage] added thread {thread_id_str} (parent {parent_id_str}) to access.json with {thread_entry}", flush=True)
+                    # Owner-visibility ping (one-shot, first seed only): when a
+                    # non-owner seeds the thread, @-mention the owner inline so an
+                    # auto-opened thread can't silently accumulate sandboxed replies
+                    # the owner never sees (#1498 slip-risk).
+                    owner_ids = access_data.get('allowFrom', [])
+                    if _should_notify_owner_on_seed(message.author.id, owner_ids):
+                        try:
+                            parent_label = f"#{message.channel.parent.name}" if message.channel.parent else str(parent_id_str)
+                            await message.channel.send(
+                                _format_seed_notice(owner_ids[0], message.author.mention, parent_label, thread_id_str))
+                        except Exception as e:
+                            print(f"  [thread-engage] owner-notice send failed: {e}", flush=True)
             except Exception as e:
                 print(f"  [thread-engage] failed to update access.json: {e}", flush=True)
 
@@ -2387,8 +2467,18 @@ async def _handle_discord_message(message, force=False):
                 # channel set to `true` — open to all, skip access check
                 channel_authorized = True
             elif len(ch_allowed) > 0 and sender_id not in ch_allowed:
-                print(f"  [skip] @{username} (id={sender_id}) not in channel allowlist", flush=True)
-                return
+                if sender_id in allowed:
+                    # Global owner/allowlisted sender — exempt from the
+                    # per-channel allowlist. The global `allowFrom` is a
+                    # superset grant; a channel's `allowFrom` narrows *who
+                    # else* gets in, it must not exclude a globally-authorized
+                    # owner. Without this, creating a channel entry whose
+                    # allowFrom omits the owner silently locks the owner out
+                    # of their own channel (observed 2026-06-15).
+                    channel_authorized = True
+                else:
+                    print(f"  [skip] @{username} (id={sender_id}) not in channel allowlist", flush=True)
+                    return
             else:
                 # sender is in ch_allowed (or ch_allowed is empty + requireMention)
                 channel_authorized = True
@@ -2499,7 +2589,11 @@ async def _handle_discord_message(message, force=False):
         local_path = INBOX_DIR / f"{int(time.time()*1000)}_{_safe_attachment_basename(att.filename)}"
         try:
             await att.save(local_path)
-            attachment_note += f"\n[File attached: {local_path}]"
+            transcript = _transcribe_via_skill(str(local_path))
+            if transcript:
+                attachment_note += f"\n[Voice transcript: {transcript}]"
+            else:
+                attachment_note += f"\n[File attached: {local_path}]"
             # If voice is connected and the attachment is an image, also push
             # it as a vision frame so Gemini sees it in-stream (in addition
             # to the file-attached task pipeline).
@@ -2537,6 +2631,27 @@ async def _handle_discord_message(message, force=False):
                         f"\n\n[Replying to {ref_author} "
                         f"({ref_msg.created_at.strftime('%Y-%m-%d %H:%M')}): {snippet}]"
                     )
+                # Also download attachments that live on the replied-to
+                # message. Without this, a file shared on a parent message
+                # and then acted on via an @-mention *reply* is silently
+                # dropped — only the reply's own (often empty) attachment
+                # set was scanned above. Same save + sanitized-basename +
+                # image-vision pattern as the primary loop.
+                for att in getattr(ref_msg, "attachments", []):
+                    p_path = INBOX_DIR / f"{int(time.time()*1000)}_{_safe_attachment_basename(att.filename)}"
+                    try:
+                        await att.save(p_path)
+                        attachment_note += f"\n[File attached (from replied-to message): {p_path}]"
+                        try:
+                            ct = (getattr(att, "content_type", "") or "").lower()
+                            if ct.startswith("image/") or str(p_path).lower().endswith(
+                                (".jpg", ".jpeg", ".png", ".webp", ".gif")
+                            ):
+                                _push_vision_image(str(p_path), source="discord")
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        print(f"  [reply-context] parent attachment download failed: {e}", flush=True)
         except Exception as e:
             print(f"  [reply-context] fetch failed: {e}", flush=True)
 
@@ -2656,6 +2771,21 @@ async def _handle_discord_message(message, force=False):
     task_id = f"task-{ts}"
     task_file = TASKS_DIR / f"{task_id}.txt"
 
+    # Intercept vault commands before any disk write.
+    # Owner-tier only: secrets go to Keychain, task file gets [STORED-IN-KEYCHAIN].
+    # Non-owner: vault patterns are redacted to prevent Keychain pollution by
+    # untrusted senders — the actual secret never reaches the task file either way.
+    if text:
+        if access_tier == "owner":
+            vault_result = intercept_vault_commands(text)
+            text = vault_result.text
+            if vault_result.stored:
+                print(f"  [vault] stored keys: {vault_result.stored}", flush=True)
+            if vault_result.failed:
+                print(f"  [vault] store failed (still redacted): {vault_result.failed}", flush=True)
+        else:
+            text = redact_vault_commands(text)
+
     # Inject tier-specific in-band instructions so the core agent cannot
     # accidentally process a non-owner task with full capabilities.
     # See CLAUDE.md "Discord access control" section for the policy.
@@ -2681,7 +2811,7 @@ async def _handle_discord_message(message, force=False):
     if access_tier in ("team", "other"):
         codex_prompt_text = (
             "You are answering on behalf of Sutando, an autonomous personal AI agent.\n"
-            "Sutando's actual skills live in `skills/` (this repo) and under `~/.claude/skills/`.\n"
+            "Sutando's actual skills live in `skills/` (this repo) and under `$CLAUDE_CONFIG_DIR/skills/`.\n"
             "When asked about capabilities or identity, refer to Sutando's skills/architecture — "
             "NOT to your own sandbox-runtime's available skills. You ARE Sutando in this context.\n\n"
             "---\n\n"
@@ -2836,6 +2966,40 @@ async def _handle_discord_message(message, force=False):
         if getattr(message, "reference", None) and message.reference.message_id
         else ""
     )
+    # Inject skill instructions for owner tasks so the agent follows the
+    # notify-before-work and transcription protocol after compaction.
+    # Only injected when the referenced skills are installed on this node.
+    # CCD-resolved (PR #1525 pattern): never hardcode ~/.claude — nodes may relocate
+    # the config dir via $CLAUDE_CONFIG_DIR.
+    _claude_config = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
+    _notify_py = _claude_config / "skills/task-progress/scripts/notify.py"
+    _transcribe_py = _claude_config / "skills/audio-transcribe/scripts/transcribe.py"
+    discord_skill_hints = ""
+    if access_tier == "owner" and (_notify_py.exists() or _transcribe_py.exists()):
+        channel_id_str = str(message.channel.id)
+        has_audio = "[File attached:" in attachment_note and any(
+            attachment_note.lower().find(ext) != -1
+            for ext in (".m4a", ".mp3", ".ogg", ".opus", ".wav", ".webm", ".aac")
+        )
+        lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
+        step = 1
+        if _notify_py.exists():
+            notify_cmd = (
+                f"python3 {_notify_py}"
+                f" --source discord --channel-id {channel_id_str}"
+            )
+            if has_audio:
+                lines.append(f'{step}. NOTIFY FIRST: {notify_cmd} --message "Got your voice message, give me a moment."')
+            else:
+                lines.append(f'{step}. NOTIFY FIRST (if task takes >60s): {notify_cmd} --message "On it — back in a moment."')
+            step += 1
+        if has_audio and _transcribe_py.exists():
+            attached_path = attachment_note.split("[File attached: ")[-1].rstrip("]").split("\n")[0]
+            lines.append(f"{step}. TRANSCRIBE: python3 {_transcribe_py} '{attached_path}'")
+            step += 1
+        lines.append(f"{step}. Process transcript and write result to results/{task_id}.txt")
+        discord_skill_hints = "\n" + "\n".join(lines) + "\n"
+
     task_file.write_text(
         f"id: {task_id}\n"
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
@@ -2850,6 +3014,7 @@ async def _handle_discord_message(message, force=False):
         f"access_tier: {access_tier}\n"
         f"priority: {priority}\n"
         f"{tier_instructions.get(access_tier, tier_instructions['other'])}"
+        f"{discord_skill_hints}"
     )
     pending_replies[task_id] = message.channel
     # Track source-message-id so the result-sender can auto-attach reply_to
@@ -3288,7 +3453,22 @@ async def poll_results():
                         first = True
                         for chunk in _chunk_for_discord(clean_text):
                             ref = discord.MessageReference(message_id=reply_to_id, channel_id=channel.id, fail_if_not_exists=False) if (first and reply_to_id) else None
-                            await channel.send(chunk, reference=ref)
+                            try:
+                                await channel.send(chunk, reference=ref)
+                            except Exception as e:
+                                # Replying to a *system* message (e.g. the
+                                # thread_created stub a new thread leaves in
+                                # the parent channel) is rejected with 50035
+                                # "Cannot reply to a system message" even with
+                                # fail_if_not_exists=False (observed 2026-06-10:
+                                # an owner reply was dropped entirely). The
+                                # content matters more than the quote anchor —
+                                # retry once as a fresh message.
+                                _http_exc = getattr(discord, "HTTPException", None)
+                                if ref is None or _http_exc is None or not isinstance(e, _http_exc):
+                                    raise
+                                print(f"  [reply-anchor] reference send failed ({e}); retrying without reference", flush=True)
+                                await channel.send(chunk)
                             first = False
                         try:
                             import outbox_log

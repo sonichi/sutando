@@ -43,7 +43,9 @@ def _launch_argv(model_env: "str | None") -> list[str]:
         pgrep.chmod(0o755)
 
         env = {
-            "PATH": f"{bind}:/usr/bin:/bin",   # no tmux, no brew → fallback path
+            # /usr/bin excluded intentionally: tmux lives there on Ubuntu CI
+            # and the test targets the no-tmux fallback exec path.
+            "PATH": f"{bind}:/bin",
             "HOME": str(td),
             "ARGS_FILE": str(args_file),
         }
