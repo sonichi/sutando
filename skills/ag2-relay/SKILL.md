@@ -49,6 +49,22 @@ Where to get an invite/address: ask your relay operator.
 set (silent pgrep-guarded block; re-running startup is also the restart
 path). Manual run: `python3 skills/ag2-relay/remote-task-client.py`.
 
+## Relay Protocol
+
+The local client intentionally speaks a tiny provider-agnostic protocol. The
+hosted relay owns platform details such as Matrix rooms, Discord channels,
+Telegram chats, attachments, rate limits, and reply routing.
+
+```text
+GET  /v1/tasks?wait=<seconds>        # long-poll for standard Sutando tasks
+POST /v1/tasks/<task-id>/ack         # task is safely queued locally
+POST /v1/results                     # result body for a task id
+POST /v1/heartbeat                   # online/tier/in-flight status
+```
+
+`ack` and `heartbeat` are best-effort extensions: if an older relay returns
+404/405, the client keeps using the original pull/result protocol.
+
 ## Trust tier
 
 Tasks from the relay are processed at the tier in `AG2_REMOTE_TIER`
