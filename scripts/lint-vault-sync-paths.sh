@@ -33,7 +33,7 @@ PER_HOST_PRONE=(
   "device.json"
   "cloud-auth.json"
   "state/cores"        # <hostname>.alive liveness
-  "crons.json"         # a bare crons.json is per-host config; carry crons/<hostname>.json
+  "crons.json"         # a bare crons.json is per-host config; carry it under hosts/<hostname>/crons.json
 )
 
 # A carried entry is "hostname-qualified" if it contains an explicit host token

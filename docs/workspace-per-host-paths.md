@@ -38,9 +38,12 @@ include them.
    ignores everything not listed). This is how channel configs stay per-host
    today.
 2. **Hostname-qualify it.** If it should be synced/backed-up per host, give it a
-   path that expands to one file per host — `crons/<hostname>.json`,
-   `build_log/<hostname>.md`. Each host owns its file; pulls bring peers' files
-   in side-by-side, never merging.
+   path that expands to one file per host. The canonical home is the
+   `hosts/<hostname>/` per-host subtree (see
+   [`workspace-hosts-convention.md`](workspace-hosts-convention.md)) — e.g.
+   `hosts/<hostname>/crons.json`, carried by the `hosts/*/` glob — but any
+   qualified pattern works (`build_log/<hostname>.md`). Each host owns its file;
+   pulls bring peers' files in side-by-side, never merging.
 
 Use the host slug the sync layer uses: `hostname | sed 's/\..*//'`.
 
@@ -56,7 +59,7 @@ carrier addition from silently reintroducing the collapse.
 
 | Path in `vault.sync.include` | Verdict |
 | --- | --- |
-| `crons/<hostname>.json` | ✅ hostname-qualified |
+| `hosts/*/` (carries `hosts/<hostname>/crons.json`) | ✅ glob expands per host |
 | `build_log/<hostname>.md` | ✅ hostname-qualified |
 | `.claude-sutando/projects/*/memory/` | ✅ glob expands per slug |
 | `crons.json` | ❌ bare per-host file → collapses on pull-merge |

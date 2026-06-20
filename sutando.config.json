@@ -19,7 +19,6 @@
         "notes/",
         "pending-questions.md",
         "build_log.md",
-        "crons/*.json",
         ".claude-sutando/projects/*/memory/"
       ],
       "exclude": [
