@@ -61,6 +61,7 @@ from util_paths import shared_personal_path  # noqa: E402
 from task_priority import default_priority_for_source  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
+import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 REPO = resolve_workspace()
 
@@ -2089,10 +2090,62 @@ pending_replies = {}
 # in memory only — crash-recovery isn't critical; missing entry just means
 # the reply goes as a fresh message instead of a quote-reply.
 pending_reply_anchors: dict[str, int] = {}
+# Track access_tier per pending task so the progress-streamer (poll_progress,
+# behind SUTANDO_PROGRESS_STREAM) only narrates OWNER tasks — non-owner tasks
+# run in a codex sandbox that never updates core-status.json, and we must not
+# leak processing state for an untrusted sender. In-memory only and NOT restored
+# on restart; poll_progress fail-closes (skips streaming) when a task_id is
+# absent here, so a recovered task is never streamed without a known owner tier.
+pending_task_tiers: dict[str, str] = {}
 
 intents = discord.Intents.default()
 intents.message_content = True
+# GUILD_MEMBERS privileged intent — only enable when confirmed active in
+# Discord Developer Portal (Bot → Privileged Gateway Intents). Without this
+# toggle the bridge raises PrivilegedIntentsRequired on startup and won't
+# connect. Gated behind env var so bridge boots safely without the flag.
+if os.environ.get("DISCORD_GUILD_MEMBERS_INTENT", "").lower() in ("1", "true", "yes"):
+    intents.members = True
 client = discord.Client(intents=intents)
+
+
+async def list_channel_members(channel_id: int) -> list[dict]:
+    """Return members who can see a channel.
+
+    Requires GUILD_MEMBERS privileged intent enabled in Discord Dev Portal
+    AND DISCORD_GUILD_MEMBERS_INTENT=1 in the bridge environment.
+    Returns list of {id, name, display_name, is_bot} dicts, or empty list
+    if the intent is unavailable.
+    """
+    if not intents.members:
+        return []
+    channel = client.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(channel_id)
+        except Exception:
+            return []
+    guild = getattr(channel, "guild", None)
+    if guild is None:
+        return []
+    members = []
+    try:
+        async for member in guild.fetch_members(limit=1000):
+            try:
+                perms = channel.permissions_for(member)
+                if perms.view_channel:
+                    members.append({
+                        "id": str(member.id),
+                        "name": member.name,
+                        "display_name": member.display_name,
+                        "is_bot": member.bot,
+                    })
+            except Exception:
+                continue  # skip members whose permissions can't be resolved
+    except Exception as e:
+        print(f"  [list_channel_members] fetch_members failed for guild {guild.id}: {e}", flush=True)
+        return []
+    return members
 
 
 def _recover_orphan_sending_files() -> int:
@@ -2170,6 +2223,7 @@ async def on_ready():
     client.loop.create_task(_catchup_missed_dms())
     # Start polling loops
     client.loop.create_task(poll_results())
+    client.loop.create_task(poll_progress())
     client.loop.create_task(poll_approved())
     client.loop.create_task(poll_proactive())
     client.loop.create_task(poll_dm_fallback())
@@ -3059,6 +3113,7 @@ async def _handle_discord_message(message, force=False):
         f"{discord_skill_hints}"
     )
     pending_replies[task_id] = message.channel
+    pending_task_tiers[task_id] = access_tier
     # Track source-message-id so the result-sender can auto-attach reply_to
     # (visually thread the reply to the triggering message). Skipped when
     # the channel is already a Discord thread — thread context is enough.
@@ -3358,6 +3413,10 @@ async def poll_results():
                 # messages instead of quote-replies. Caught by live test
                 # 2026-05-22 ~03:00 UTC: "it's not a quote reply".
                 source_message_anchor = pending_reply_anchors.pop(task_id, None)
+                # Clear the progress-streamer's tier map here (NOT only in
+                # poll_progress) so it's bounded even when the feature flag is
+                # OFF — otherwise this dict would leak one entry per task.
+                pending_task_tiers.pop(task_id, None)
                 save_pending_replies()
                 # Skip sending if already replied directly (core agent used MCP).
                 # Clean up the result AND task files so the watcher doesn't
@@ -3567,6 +3626,142 @@ async def poll_results():
                 # directory growth.
                 _clear_delivered(task_id)
         await asyncio.sleep(1)
+
+
+# In-memory placeholder registry for the progress-streamer:
+#   task_id -> {"msg": discord.Message, "first": float(created_epoch_s), "last_edit": float}
+_progress_msgs: dict = {}
+
+
+async def poll_progress():
+    """Hermes-style streaming tool output (2026-06-05).
+
+    Opt-in (``SUTANDO_PROGRESS_STREAM=1``, default OFF): for an OWNER task that
+    is still running past a threshold, post a single "⏳ working…" placeholder
+    to the originating channel and edit it in place with the core's live
+    ``core-status.step`` — so the user sees liveness instead of silence on a
+    long task. When the result lands, ``poll_results`` sends the real reply and
+    this loop deletes its placeholder.
+
+    Fully self-contained and side-effect-free when the flag is off: the loop
+    returns immediately, touching nothing. All policy/rendering lives in the
+    pure, unit-tested ``progress_stream`` module; this function is only the
+    async I/O driver. Every Discord call is wrapped — a transient API error
+    must never break the loop or leak an exception into the gateway.
+    """
+    if not progress_stream.stream_enabled():
+        return  # feature off → never loops; zero overhead, zero risk
+    while True:
+        try:
+            now = time.time()
+            for task_id, channel in list(pending_replies.items()):
+                # "Done" = a result file exists (final reply pending/sent) or
+                # the delivery sentinel is set. Either way, stop narrating.
+                done = (RESULTS_DIR / f"{task_id}.txt").exists() or _is_delivered(task_id)
+                info = _progress_msgs.get(task_id)
+                if info is not None:
+                    # Terminal marker: we already gave up on this task (it ran
+                    # past MAX_PLACEHOLDER_AGE_S without a result). Do NOT
+                    # re-post — just wait for the GC to drop it when the task
+                    # finally leaves pending_replies. Without this, the expiry
+                    # branch would delete-then-immediately-repost every tick:
+                    # an endless spam loop for a stuck task (red-team #1).
+                    if info.get("expired"):
+                        continue
+                    elapsed = now - info["first"]
+                    if done:
+                        try:
+                            await info["msg"].delete()
+                        except Exception:
+                            # Transient delete failure (5xx / rate-limit): keep
+                            # the entry and retry next tick so the placeholder
+                            # isn't orphaned (gemini #2). Bounded so a
+                            # permanently-undeletable message can't pin it.
+                            info["del_attempts"] = info.get("del_attempts", 0) + 1
+                            if info["del_attempts"] < 5:
+                                continue
+                        _progress_msgs.pop(task_id, None)
+                        continue
+                    if progress_stream.placeholder_expired(elapsed):
+                        try:
+                            await info["msg"].delete()
+                        except Exception:
+                            pass
+                        _progress_msgs[task_id] = {"expired": True}  # terminal
+                        continue
+                    if progress_stream.should_edit(now, info["last_edit"]):
+                        step = progress_stream.current_step(
+                            progress_stream.read_core_status(STATE_DIR)
+                        )
+                        try:
+                            await info["msg"].edit(
+                                content=progress_stream.format_progress(step, elapsed)
+                            )
+                            info["last_edit"] = now
+                        except Exception:
+                            # Edit failed (deleted/rate-limited) — mark terminal
+                            # so we stop hammering it AND don't re-post.
+                            _progress_msgs[task_id] = {"expired": True}
+                    continue
+                # No placeholder yet.
+                if done:
+                    continue  # finished before the threshold → never narrate
+                # Fail-CLOSED on unknown tier. pending_task_tiers is in-memory
+                # only and is NOT restored on bridge restart, while
+                # pending_replies IS reloaded from disk — so a recovered task
+                # has no tier here. should_stream_task(None) returns True
+                # (legacy owner), which would leak processing state for a
+                # recovered NON-owner task. Requiring a present, owner-tier
+                # entry closes that hole (red-team #2).
+                if task_id not in pending_task_tiers:
+                    continue
+                if not progress_stream.should_stream_task(pending_task_tiers.get(task_id)):
+                    continue  # non-owner → no placeholder, no leak
+                try:
+                    created = int(task_id.split("-")[1]) / 1000.0
+                except (ValueError, IndexError):
+                    created = now
+                elapsed = now - created
+                if progress_stream.should_post_placeholder(elapsed):
+                    step = progress_stream.current_step(
+                        progress_stream.read_core_status(STATE_DIR)
+                    )
+                    try:
+                        msg = await channel.send(
+                            progress_stream.format_progress(step, elapsed)
+                        )
+                        _progress_msgs[task_id] = {
+                            "msg": msg,
+                            "first": created,
+                            "last_edit": now,
+                        }
+                    except Exception:
+                        # Send failed (Forbidden / rate-limit). Mark terminal so
+                        # we do NOT re-attempt the send every tick — otherwise a
+                        # task in a channel we can't post to would hammer the API
+                        # forever (gemini #1). GC drops it when the task ends.
+                        _progress_msgs[task_id] = {"expired": True}
+            # GC: drop placeholders whose task is no longer pending (delivered
+            # + archived → cleared from pending_replies) so none orphan.
+            for task_id in list(_progress_msgs.keys()):
+                if task_id not in pending_replies:
+                    entry = _progress_msgs.get(task_id) or {}
+                    msg = entry.get("msg")  # absent for terminal {"expired": True}
+                    if msg is not None:
+                        try:
+                            await msg.delete()
+                        except Exception:
+                            # Retry transient delete failures next tick rather
+                            # than forgetting (and orphaning) the message
+                            # (gemini #2). Bounded.
+                            entry["del_attempts"] = entry.get("del_attempts", 0) + 1
+                            if entry["del_attempts"] < 5:
+                                continue
+                    _progress_msgs.pop(task_id, None)
+                    pending_task_tiers.pop(task_id, None)
+        except Exception as e:
+            print(f"  [progress] poll_progress tick error: {e}", flush=True)
+        await asyncio.sleep(3)
 
 
 async def poll_proactive():
