@@ -361,6 +361,18 @@ for f in "${MACHINE_FILES[@]}"; do
     copy_if_newer "$src" "$MACHINE_DIR/$(basename "$f")"
 done
 
+# Claude Code per-host settings.json (enabled plugins, permission mode, hooks,
+# theme). Per-host + painful to recreate on a rebuild, and carries NO secrets
+# (tokens live in channels/<ch>/.env / Keychain, never here). Sibling to the
+# channel access.json backup — closes the second "unbacked per-host config"
+# gap so a rebuilt host restores its plugin/hook/permission config. Sourced
+# from the Claude Code config dir (CLAUDE_CONFIG_DIR canonical; CLAUDE_HOME
+# legacy; ~/.claude fallback) to work on both new and pre-migration hosts.
+SETTINGS_SRC="${CLAUDE_CONFIG_DIR:-${CLAUDE_HOME:-$HOME/.claude}}/settings.json"
+if [ -f "$SETTINGS_SRC" ]; then
+    copy_if_newer "$SETTINGS_SRC" "$MACHINE_DIR/settings.json"
+fi
+
 # Personal cron schedule (nested path)
 if [ -f "$REPO_DIR/skills/schedule-crons/crons.json" ]; then
     copy_if_newer "$REPO_DIR/skills/schedule-crons/crons.json" \
