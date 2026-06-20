@@ -258,7 +258,7 @@ One table, organized by capability. The only required paid piece is your Claude 
 | Inbound call handling | `phone-conversation/` | Verified (needs Twilio) |
 | Telegram messaging | `telegram-bridge.py` | Verified (text + photos + files + voice) |
 | Discord messaging | `discord-bridge.py` | Verified (DMs + channel @mentions + files) |
-| Discord voice channel | external plugin (consumes `src/voice-core/`, #1427 two-repo split) | Verified (2-way voice + screen share) |
+| Discord voice channel | external plugin (`sutando-meeting` repo, #1427 two-repo split) | Verified (2-way voice + screen share) |
 | Cross-device task submission | `agent-api.py` | Verified |
 | Health monitoring | `health-check.py` | Verified |
 | Pattern detection + user modeling | Built into Claude Code memory system | Verified |
