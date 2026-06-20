@@ -37,7 +37,7 @@ describe('_shouldFallthrough — belt-suspenders guard for result-watcher fallth
 
 	it('REJECTS the PR #1033 per-channel-pull namespace (the bug this guard closes)', () => {
 		// Discord voice channel id (17-20 digits)
-		assert.equal(_shouldFallthrough('1485653767402553457.task-1234567890.txt'), false);
+		assert.equal(_shouldFallthrough('1234567890123456789.task-1234567890.txt'), false);
 		// Twilio call SID (per-call unique)
 		assert.equal(_shouldFallthrough('CAabcdef0123456789abcdef0123456789.task-foo.txt'), false);
 		// Generic channel-key prefix

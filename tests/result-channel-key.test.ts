@@ -23,7 +23,7 @@ import {
 
 describe('sanitizeKey', () => {
 	it('passes through filename-safe input', () => {
-		assert.equal(sanitizeKey('1485653767402553457'), '1485653767402553457');
+		assert.equal(sanitizeKey('1234567890123456789'), '1234567890123456789');
 		assert.equal(sanitizeKey('CA1234abcd'), 'CA1234abcd');
 		assert.equal(sanitizeKey('local-voice'), 'local-voice');
 		assert.equal(sanitizeKey('foo_bar-baz'), 'foo_bar-baz');
@@ -49,8 +49,8 @@ describe('sanitizeKey', () => {
 describe('resultFilename', () => {
 	it('builds <key>.<task-id>.txt', () => {
 		assert.equal(
-			resultFilename('1485653767402553457', 'task-plugin-voice-1700000000'),
-			'1485653767402553457.task-plugin-voice-1700000000.txt',
+			resultFilename('1234567890123456789', 'task-plugin-voice-1700000000'),
+			'1234567890123456789.task-plugin-voice-1700000000.txt',
 		);
 		assert.equal(
 			resultFilename('CA1234abcd', 'task-phone-1700000000'),
@@ -62,8 +62,8 @@ describe('resultFilename', () => {
 describe('parseResultFilename', () => {
 	it('splits the scoped form', () => {
 		assert.deepEqual(
-			parseResultFilename('1485653767402553457.task-plugin-voice-1700000000.txt'),
-			['1485653767402553457', 'task-plugin-voice-1700000000'],
+			parseResultFilename('1234567890123456789.task-plugin-voice-1700000000.txt'),
+			['1234567890123456789', 'task-plugin-voice-1700000000'],
 		);
 		assert.deepEqual(
 			parseResultFilename('CA1234abcd.task-phone-1700000000'),
@@ -91,7 +91,7 @@ describe('parseResultFilename', () => {
 describe('resultBelongsTo', () => {
 	it('claims the scoped form for a matching key', () => {
 		assert.equal(
-			resultBelongsTo('1485653767402553457.task-foo.txt', '1485653767402553457'),
+			resultBelongsTo('1234567890123456789.task-foo.txt', '1234567890123456789'),
 			true,
 		);
 		assert.equal(resultBelongsTo('CA123.task-phone-1.txt', 'CA123'), true);
@@ -99,20 +99,20 @@ describe('resultBelongsTo', () => {
 
 	it('rejects a different channel key', () => {
 		assert.equal(
-			resultBelongsTo('1485653767402553457.task-foo.txt', '9999999999'),
+			resultBelongsTo('1234567890123456789.task-foo.txt', '9999999999'),
 			false,
 		);
 	});
 
 	it('rejects the legacy flat form (owned by delegating consumer, not by scan)', () => {
-		assert.equal(resultBelongsTo('task-1700000000.txt', '1485653767402553457'), false);
+		assert.equal(resultBelongsTo('task-1700000000.txt', '1234567890123456789'), false);
 		assert.equal(resultBelongsTo('task-plugin-voice-1700000000.txt', 'local-voice'), false);
 	});
 
 	it('rejects non-task files', () => {
 		assert.equal(resultBelongsTo('voice-1700000000.txt', 'local-voice'), false);
 		assert.equal(resultBelongsTo('proactive-1700000000.txt', 'anything'), false);
-		assert.equal(resultBelongsTo('1485653767402553457.proactive-foo.txt', '1485653767402553457'), false);
+		assert.equal(resultBelongsTo('1234567890123456789.proactive-foo.txt', '1234567890123456789'), false);
 	});
 
 	// Partial-write race: a writer's atomic-write temp file (`<key>.task-X.txt.tmp`,
@@ -120,18 +120,18 @@ describe('resultBelongsTo', () => {
 	// half-written body and orphan the rename target. The scan loops also gate on
 	// `.endsWith('.txt')`, but lock the invariant at the helper too.
 	it('rejects atomic-write temp suffixes (partial-write race)', () => {
-		const KEY = '1485653767402553457';
+		const KEY = '1234567890123456789';
 		const tempSuffixes = [
-			'1485653767402553457.task-plugin-voice-1700000000.txt.tmp',
-			'1485653767402553457.task-plugin-voice-1700000000.txt.partial',
-			'1485653767402553457.task-plugin-voice-1700000000.txt.sending',
-			'1485653767402553457.task-plugin-voice-1700000000.txt.swp',
-			'1485653767402553457.task-plugin-voice-1700000000.txt.lock',
-			'1485653767402553457.task-plugin-voice-1700000000.txt~',
-			'1485653767402553457.task-plugin-voice-1700000000.sending',
-			'1485653767402553457.task-plugin-voice-1700000000.tmp',
-			'1485653767402553457.task-plugin-voice-1700000000.partial',
-			'.1485653767402553457.task-plugin-voice-1700000000.txt', // dotfile prefix (vim swap, atomic-write idioms)
+			'1234567890123456789.task-plugin-voice-1700000000.txt.tmp',
+			'1234567890123456789.task-plugin-voice-1700000000.txt.partial',
+			'1234567890123456789.task-plugin-voice-1700000000.txt.sending',
+			'1234567890123456789.task-plugin-voice-1700000000.txt.swp',
+			'1234567890123456789.task-plugin-voice-1700000000.txt.lock',
+			'1234567890123456789.task-plugin-voice-1700000000.txt~',
+			'1234567890123456789.task-plugin-voice-1700000000.sending',
+			'1234567890123456789.task-plugin-voice-1700000000.tmp',
+			'1234567890123456789.task-plugin-voice-1700000000.partial',
+			'.1234567890123456789.task-plugin-voice-1700000000.txt', // dotfile prefix (vim swap, atomic-write idioms)
 		];
 		for (const f of tempSuffixes) {
 			assert.equal(
@@ -147,8 +147,8 @@ describe('resultBelongsTo', () => {
 	it('still matches the canonical .txt form', () => {
 		assert.equal(
 			resultBelongsTo(
-				'1485653767402553457.task-plugin-voice-1700000000.txt',
-				'1485653767402553457',
+				'1234567890123456789.task-plugin-voice-1700000000.txt',
+				'1234567890123456789',
 			),
 			true,
 		);
@@ -161,8 +161,8 @@ describe('resultBelongsTo', () => {
 // new namespace has leaked into a consumer's path and we've broken the
 // blast-radius guarantee.
 describe('existing consumers do NOT match the scoped namespace', () => {
-	const SCOPED = '1485653767402553457.task-plugin-voice-1700000000.txt';
-	const SCOPED_BASE = '1485653767402553457.task-plugin-voice-1700000000';
+	const SCOPED = '1234567890123456789.task-plugin-voice-1700000000.txt';
+	const SCOPED_BASE = '1234567890123456789.task-plugin-voice-1700000000';
 
 	it('discord-bridge / telegram-bridge / slack-bridge pending_replies lookup', () => {
 		// All three bridges do: result_file = RESULTS_DIR / f"{task_id}.txt"

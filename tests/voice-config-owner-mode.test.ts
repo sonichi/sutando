@@ -26,7 +26,7 @@ function cfg(partial: Partial<VoiceConfig> & Record<string, unknown>): VoiceConf
 	} as VoiceConfig;
 }
 
-const CH = '1485653767402553457';
+const CH = '1234567890123456789';
 
 test('boolean true at skill level → owner', () => {
 	assert.equal(resolveOwnerMode(cfg({ owner_mode: true })), true);

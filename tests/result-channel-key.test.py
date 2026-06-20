@@ -26,7 +26,7 @@ from result_channel_key import (  # noqa: E402
 
 class TestSanitizeKey(unittest.TestCase):
     def test_passes_safe_input(self):
-        self.assertEqual(sanitize_key("1485653767402553457"), "1485653767402553457")
+        self.assertEqual(sanitize_key("1234567890123456789"), "1234567890123456789")
         self.assertEqual(sanitize_key("CA1234abcd"), "CA1234abcd")
         self.assertEqual(sanitize_key("local-voice"), "local-voice")
         self.assertEqual(sanitize_key("foo_bar-baz"), "foo_bar-baz")
@@ -48,8 +48,8 @@ class TestSanitizeKey(unittest.TestCase):
 class TestResultFilename(unittest.TestCase):
     def test_builds_scoped_form(self):
         self.assertEqual(
-            result_filename("1485653767402553457", "task-plugin-voice-1700000000"),
-            "1485653767402553457.task-plugin-voice-1700000000.txt",
+            result_filename("1234567890123456789", "task-plugin-voice-1700000000"),
+            "1234567890123456789.task-plugin-voice-1700000000.txt",
         )
         self.assertEqual(
             result_filename("CA1234abcd", "task-phone-1700000000"),
@@ -60,8 +60,8 @@ class TestResultFilename(unittest.TestCase):
 class TestParseResultFilename(unittest.TestCase):
     def test_splits_scoped_form(self):
         self.assertEqual(
-            parse_result_filename("1485653767402553457.task-plugin-voice-1700000000.txt"),
-            ("1485653767402553457", "task-plugin-voice-1700000000"),
+            parse_result_filename("1234567890123456789.task-plugin-voice-1700000000.txt"),
+            ("1234567890123456789", "task-plugin-voice-1700000000"),
         )
         self.assertEqual(
             parse_result_filename("CA1234abcd.task-phone-1700000000"),
@@ -91,7 +91,7 @@ class TestResultBelongsTo(unittest.TestCase):
     def test_claims_scoped_match(self):
         self.assertTrue(
             result_belongs_to(
-                "1485653767402553457.task-foo.txt", "1485653767402553457"
+                "1234567890123456789.task-foo.txt", "1234567890123456789"
             )
         )
         self.assertTrue(result_belongs_to("CA123.task-phone-1.txt", "CA123"))
@@ -99,12 +99,12 @@ class TestResultBelongsTo(unittest.TestCase):
     def test_rejects_different_key(self):
         self.assertFalse(
             result_belongs_to(
-                "1485653767402553457.task-foo.txt", "9999999999"
+                "1234567890123456789.task-foo.txt", "9999999999"
             )
         )
 
     def test_rejects_legacy_flat(self):
-        self.assertFalse(result_belongs_to("task-1700000000.txt", "1485653767402553457"))
+        self.assertFalse(result_belongs_to("task-1700000000.txt", "1234567890123456789"))
         self.assertFalse(
             result_belongs_to("task-plugin-voice-1700000000.txt", "local-voice")
         )
@@ -115,7 +115,7 @@ class TestResultBelongsTo(unittest.TestCase):
         # Scoped form whose payload isn't a task-* file.
         self.assertFalse(
             result_belongs_to(
-                "1485653767402553457.proactive-foo.txt", "1485653767402553457"
+                "1234567890123456789.proactive-foo.txt", "1234567890123456789"
             )
         )
 
@@ -125,19 +125,19 @@ class TestResultBelongsTo(unittest.TestCase):
         NEVER match — picking it up would inject a half-written body and
         orphan the rename target. The scan loops also gate on
         ``endswith('.txt')``, but lock the invariant at the helper too."""
-        key = "1485653767402553457"
+        key = "1234567890123456789"
         temp_suffixes = [
-            "1485653767402553457.task-plugin-voice-1700000000.txt.tmp",
-            "1485653767402553457.task-plugin-voice-1700000000.txt.partial",
-            "1485653767402553457.task-plugin-voice-1700000000.txt.sending",
-            "1485653767402553457.task-plugin-voice-1700000000.txt.swp",
-            "1485653767402553457.task-plugin-voice-1700000000.txt.lock",
-            "1485653767402553457.task-plugin-voice-1700000000.txt~",
-            "1485653767402553457.task-plugin-voice-1700000000.sending",
-            "1485653767402553457.task-plugin-voice-1700000000.tmp",
-            "1485653767402553457.task-plugin-voice-1700000000.partial",
+            "1234567890123456789.task-plugin-voice-1700000000.txt.tmp",
+            "1234567890123456789.task-plugin-voice-1700000000.txt.partial",
+            "1234567890123456789.task-plugin-voice-1700000000.txt.sending",
+            "1234567890123456789.task-plugin-voice-1700000000.txt.swp",
+            "1234567890123456789.task-plugin-voice-1700000000.txt.lock",
+            "1234567890123456789.task-plugin-voice-1700000000.txt~",
+            "1234567890123456789.task-plugin-voice-1700000000.sending",
+            "1234567890123456789.task-plugin-voice-1700000000.tmp",
+            "1234567890123456789.task-plugin-voice-1700000000.partial",
             # dotfile prefix (vim swap, atomic-write idioms)
-            ".1485653767402553457.task-plugin-voice-1700000000.txt",
+            ".1234567890123456789.task-plugin-voice-1700000000.txt",
         ]
         for f in temp_suffixes:
             self.assertFalse(
@@ -150,8 +150,8 @@ class TestResultBelongsTo(unittest.TestCase):
         temp-suffix rejection didn't accidentally over-reject."""
         self.assertTrue(
             result_belongs_to(
-                "1485653767402553457.task-plugin-voice-1700000000.txt",
-                "1485653767402553457",
+                "1234567890123456789.task-plugin-voice-1700000000.txt",
+                "1234567890123456789",
             )
         )
 
@@ -162,8 +162,8 @@ class TestExistingConsumersDoNotMatch(unittest.TestCase):
     glob / startswith). Replay each consumer's actual pattern to lock
     that in."""
 
-    SCOPED = "1485653767402553457.task-plugin-voice-1700000000.txt"
-    SCOPED_BASE = "1485653767402553457.task-plugin-voice-1700000000"
+    SCOPED = "1234567890123456789.task-plugin-voice-1700000000.txt"
+    SCOPED_BASE = "1234567890123456789.task-plugin-voice-1700000000"
 
     def test_pending_replies_lookup(self):
         # discord/telegram/slack bridges: result_file = RESULTS_DIR / f"{task_id}.txt"
