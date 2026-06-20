@@ -1111,8 +1111,11 @@ cmd_migrate_from_legacy() {
 #      - legacy/notes/ → workspace/notes/
 #      - legacy/memory/*.md → workspace/.claude-sutando/projects/<local_slug>/memory/
 #        (uses this host's Claude Code-derived slug — `-<REPO_DIR-with-slashes-replaced>`)
-#      - legacy/pending-questions.md → workspace/pending-questions.md
-#      - legacy/build_log.md → workspace/build_log/<hostname>.md (per-host split)
+#      - legacy/pending-questions.md → workspace/hosts/<hostname>/pending-questions.md
+#      - legacy/build_log.md → workspace/hosts/<hostname>/build_log.md
+#        (both per-host, hostname-qualified per the hosts/<hostname>/ convention
+#        — owner decision 2026-06-20 "F1: per host"; matches what the
+#        personal_path/personalPath readers probe first, #1718)
 #   3. Call _init_impl to git-init the workspace + push to vault
 #   4. Print operator-supervised next-steps recipe
 #
@@ -1145,6 +1148,11 @@ _migrate_from_legacy_impl() {
     local local_slug
     local_slug="$(printf '%s' "$REPO_DIR" | sed 's|/|-|g')"
 
+    # Per-host segment for hostname-qualified destinations (build_log,
+    # pending-questions). Computed once; matches `_host()` + the reader probe.
+    local host
+    host="$(_host)"
+
     # Wrapper: run a command OR print "DRY-RUN: would ..." prefix. Per Pro
     # review fix #1 (--dry-run safety for the destructive migration path).
     _do() {
@@ -1156,7 +1164,7 @@ _migrate_from_legacy_impl() {
     }
 
     _do mkdir -p "$WORKSPACE_DIR/notes" \
-                "$WORKSPACE_DIR/build_log" \
+                "$WORKSPACE_DIR/hosts/${host}" \
                 "$WORKSPACE_DIR/.claude-sutando/projects/${local_slug}/memory"
 
     # 1. notes/ — handle symlink case
@@ -1196,9 +1204,8 @@ _migrate_from_legacy_impl() {
         fi
     fi
 
-    # 3. pending-questions.md (prefer machine-<host>/pending-questions.md if present)
-    local host
-    host="$(_host)"
+    # 3. pending-questions.md → hosts/<host>/ (per-host; prefer the legacy
+    #    machine-<host>/ copy if present, else the legacy root copy).
     local pq_src
     if [ -f "$legacy_dir/machine-${host}/pending-questions.md" ]; then
         pq_src="$legacy_dir/machine-${host}/pending-questions.md"
@@ -1208,11 +1215,11 @@ _migrate_from_legacy_impl() {
         pq_src=""
     fi
     if [ -n "$pq_src" ]; then
-        _do cp -n "$pq_src" "$WORKSPACE_DIR/pending-questions.md"
-        [ "$DRY_RUN" != "1" ] && log "_migrate_from_legacy_impl: copied $pq_src → workspace/pending-questions.md"
+        _do cp -n "$pq_src" "$WORKSPACE_DIR/hosts/${host}/pending-questions.md"
+        [ "$DRY_RUN" != "1" ] && log "_migrate_from_legacy_impl: copied $pq_src → workspace/hosts/${host}/pending-questions.md"
     fi
 
-    # 4. build_log.md → build_log/<hostname>.md (per-host split)
+    # 4. build_log.md → hosts/<host>/build_log.md (per-host, hostname-qualified)
     local bl_src
     if [ -f "$legacy_dir/machine-${host}/build_log.md" ]; then
         bl_src="$legacy_dir/machine-${host}/build_log.md"
@@ -1222,8 +1229,8 @@ _migrate_from_legacy_impl() {
         bl_src=""
     fi
     if [ -n "$bl_src" ]; then
-        _do cp -n "$bl_src" "$WORKSPACE_DIR/build_log/${host}.md"
-        [ "$DRY_RUN" != "1" ] && log "_migrate_from_legacy_impl: copied $bl_src → workspace/build_log/${host}.md"
+        _do cp -n "$bl_src" "$WORKSPACE_DIR/hosts/${host}/build_log.md"
+        [ "$DRY_RUN" != "1" ] && log "_migrate_from_legacy_impl: copied $bl_src → workspace/hosts/${host}/build_log.md"
     fi
 
     # 5. Hand off to _init_impl for git init + first push (DRY_RUN propagates)
@@ -1239,6 +1246,7 @@ Next steps (operator-supervised):
   1. Verify the new workspace has the expected content:
        ls $WORKSPACE_DIR/notes/ | head
        ls $WORKSPACE_DIR/.claude-sutando/projects/${local_slug}/memory/ | head
+       ls $WORKSPACE_DIR/hosts/${host}/   # build_log.md + pending-questions.md (per-host)
   2. Confirm the first push landed in your $VAULT_URL repo (web UI).
   3. Run a normal sync to verify push + pull work end-to-end:
        bash scripts/sync-workspace.sh
