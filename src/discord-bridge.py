@@ -64,46 +64,102 @@ from result_markers import parse_markers  # noqa: E402
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 REPO = resolve_workspace()
 
-# discord-voice "magic word" join trigger (issue: za-warudo summon). The
-# bridge stays a THIN hook — it only detects "owner + join phrase" and hands
-# off to this helper, which owns the voice-channel resolution + server launch
-# + already-running guard. Keeping the feature logic in the skill honors the
-# CLAUDE.md core/skill split (core must not bloat with feature logic). The
-# import is best-effort: if the discord-voice skill is absent, the magic word
-# simply doesn't fire and the message is processed as a normal task.
-# Resolve the discord-voice skill scripts dir. Post-#1427 round 4 the skill's home is
-# the sutando-meeting plugin repo, NOT this (main) checkout -- the in-repo copy was
-# deleted. The old hardcoded parent.parent/skills/discord-voice/scripts path therefore no
-# longer contains join_trigger.py, so the best-effort import silently failed and the magic
-# word "za warudo" became a dead no-op. Try, in order: explicit env override, the sibling
-# sutando-meeting checkout, then the legacy in-repo path. First candidate that actually
-# contains join_trigger.py wins.
-_dv_candidates = []
-_dv_env_dir = os.environ.get("SUTANDO_DISCORD_VOICE_SCRIPTS_DIR")
-if _dv_env_dir:
-    _dv_candidates.append(Path(_dv_env_dir))
-_dv_siblings_root = Path(__file__).resolve().parent.parent.parent
-_dv_candidates.append(_dv_siblings_root / "sutando-meeting" / "skills" / "discord-voice" / "scripts")
-_dv_candidates.append(Path(__file__).resolve().parent.parent / "skills" / "discord-voice" / "scripts")
-_dv_loaded = False
-for _dv_cand in _dv_candidates:
-    if (_dv_cand / "join_trigger.py").exists():
-        sys.path.insert(0, str(_dv_cand))
+# Generic plugin message-hook loader. The bridge stays a THIN, plugin-AGNOSTIC
+# host: it names no specific plugin. At startup it scans plugin directories for a
+# manifest.json declaring a `message_hook`, imports the named module, and binds
+# its match/handle callables. A plugin (e.g. an external voice-surface living in
+# a sibling repo) registers a "this text triggers me -> handle it" hook without
+# the bridge hardcoding anything about it. Best-effort: a missing/disabled plugin
+# contributes no hook and messages flow as normal tasks. Honors the CLAUDE.md
+# core/skill split (no feature logic in core).
+#
+# manifest.json shape:
+#   "message_hook": {"module": "scripts/foo.py", "matches": "fn_a", "handle": "fn_b"}
+# where matches(text)->bool and handle(message, self_user_id)->str.
+#
+# Search dirs: $SUTANDO_EXTERNAL_PLUGIN_DIRS (os.pathsep-separated), each sibling
+# checkout's skills/ (../<repo>/skills), the in-repo skills/, the workspace skills/.
+def _load_plugin_message_hooks():
+    hooks = []
+    here = Path(__file__).resolve()
+    search = []
+    for d in os.environ.get("SUTANDO_EXTERNAL_PLUGIN_DIRS", "").split(os.pathsep):
+        if d.strip():
+            search.append(Path(d.strip()))
+    siblings_root = here.parent.parent.parent  # dir that holds sibling checkouts
+    try:
+        if siblings_root.is_dir():
+            for sib in sorted(siblings_root.iterdir()):
+                if (sib / "skills").is_dir():
+                    search.append(sib / "skills")
+    except Exception:
+        pass
+    search.append(here.parent.parent / "skills")
+    try:
+        search.append(Path(str(REPO)) / "skills")
+    except Exception:
+        pass
+    seen_modules, seen_dirs = set(), set()
+    for base in search:
         try:
-            from join_trigger import (  # noqa: E402
-                message_is_join_phrase as _dv_message_is_join_phrase,
-                handle_join_trigger as _dv_handle_join_trigger,
-            )
-            _dv_loaded = True
-            break
-        except Exception:  # pragma: no cover - skill optional
+            if not base.is_dir() or str(base) in seen_dirs:
+                continue
+        except Exception:
             continue
-if not _dv_loaded:  # pragma: no cover - skill optional
-    def _dv_message_is_join_phrase(text):  # type: ignore
-        return False
+        seen_dirs.add(str(base))
+        for sub in sorted(base.iterdir()):
+            mf = sub / "manifest.json"
+            if not mf.is_file():
+                continue
+            try:
+                manifest = json.loads(mf.read_text())
+            except Exception:
+                continue
+            if not manifest.get("enabled", False):
+                continue
+            spec = manifest.get("message_hook")
+            if not isinstance(spec, dict):
+                continue
+            mod_rel, matches_name, handle_name = spec.get("module"), spec.get("matches"), spec.get("handle")
+            if not (mod_rel and matches_name and handle_name):
+                continue
+            mod_path = (sub / mod_rel).resolve()
+            if not mod_path.is_file() or str(mod_path) in seen_modules:
+                continue
+            try:
+                sys.path.insert(0, str(mod_path.parent))
+                mod = __import__(mod_path.stem)
+                matches = getattr(mod, matches_name, None)
+                handle = getattr(mod, handle_name, None)
+                if callable(matches) and callable(handle):
+                    seen_modules.add(str(mod_path))
+                    name = manifest.get("name", sub.name)
+                    hooks.append((name, matches, handle))
+                    print(f"  [plugin-hook] loaded message-hook from '{name}' ({mod_path.name})", flush=True)
+            except Exception as e:  # pragma: no cover - plugin optional
+                print(f"  [plugin-hook] failed to load {mod_path}: {e}", flush=True)
+    return hooks
 
-    def _dv_handle_join_trigger(message, self_user_id=None):  # type: ignore
-        return ""
+
+_PLUGIN_MSG_HOOKS = _load_plugin_message_hooks()
+
+
+def _plugin_message_reply(text, message, self_user_id=None):
+    """If any plugin's message-hook matches `text`, run its handler and return
+    (True, reply). Generic — no plugin is named here. (False, "") if none match."""
+    for name, matches, handle in _PLUGIN_MSG_HOOKS:
+        try:
+            if not matches(text):
+                continue
+        except Exception as e:
+            print(f"  [plugin-hook:{name}] match raised: {e}", flush=True)
+            continue
+        try:
+            return True, (handle(message, self_user_id) or "")
+        except Exception as e:
+            print(f"  [plugin-hook:{name}] handler raised: {e}", flush=True)
+            return True, "Couldn't process the request — check the bridge log."
+    return False, ""
 
 # Vision-frame helper — pushes image attachments into the active voice session
 # so Gemini reacts in-stream. Best-effort: import failure or unreachable
@@ -2425,22 +2481,19 @@ async def _handle_discord_message(message, force=False):
         # requireMention skip so "za warudo" in #General (no mention) still
         # summons the voice spawn for the owner.
         try:
-            if str(message.author.id) in load_allowed() and _dv_message_is_join_phrase(text):
-                print(f"  [join-trigger] owner @{message.author} said the join phrase — summoning discord-voice (bypassing requireMention)", flush=True)
-                try:
-                    reply = _dv_handle_join_trigger(message, getattr(client.user, "id", None))
-                except Exception as e:
-                    print(f"  [join-trigger] handler raised: {e}", flush=True)
-                    reply = "Couldn't process the voice-join request — check the bridge log."
-                try:
-                    if reply:
-                        for chunk in _chunk_for_discord(reply):
-                            await message.channel.send(chunk)
-                except Exception as e:
-                    print(f"  [join-trigger] reply send failed: {e}", flush=True)
-                return
+            if str(message.author.id) in load_allowed():
+                _hook_matched, reply = _plugin_message_reply(text, message, getattr(client.user, "id", None))
+                if _hook_matched:
+                    print(f"  [plugin-hook] owner @{message.author} matched a plugin message-hook — handling (bypassing requireMention)", flush=True)
+                    try:
+                        if reply:
+                            for chunk in _chunk_for_discord(reply):
+                                await message.channel.send(chunk)
+                    except Exception as e:
+                        print(f"  [plugin-hook] reply send failed: {e}", flush=True)
+                    return
         except Exception as e:
-            print(f"  [join-trigger] early-path raised: {e}", flush=True)
+            print(f"  [plugin-hook] early-path raised: {e}", flush=True)
 
         if require_mention and not bot_mentioned and not role_mentioned:
             print(f"  [skip] not mentioned (requireMention=true)", flush=True)
@@ -2764,24 +2817,15 @@ async def _handle_discord_message(message, force=False):
     # double-fire the spawn; the helper has its own `_server_already_running`
     # guard anyway, but cheaper to dedup at the front gate.
     if access_tier == "owner":
-        try:
-            is_join = _dv_message_is_join_phrase(text)
-        except Exception as e:
-            print(f"  [join-trigger] match check raised: {e}", flush=True)
-            is_join = False
-        if is_join:
-            print(f"  [join-trigger] owner @{username} said the join phrase — summoning discord-voice", flush=True)
-            try:
-                reply = _dv_handle_join_trigger(message, getattr(client.user, "id", None))
-            except Exception as e:
-                print(f"  [join-trigger] handler raised: {e}", flush=True)
-                reply = "Couldn't process the voice-join request — check the bridge log."
+        _hook_matched, reply = _plugin_message_reply(text, message, getattr(client.user, "id", None))
+        if _hook_matched:
+            print(f"  [plugin-hook] owner @{username} matched a plugin message-hook — handling", flush=True)
             try:
                 if reply:
                     for chunk in _chunk_for_discord(reply):
                         await message.channel.send(chunk)
             except Exception as e:
-                print(f"  [join-trigger] reply send failed: {e}", flush=True)
+                print(f"  [plugin-hook] reply send failed: {e}", flush=True)
             return
 
     # Deterministic tier ownership: if SUTANDO_TEAM_TIER_OWNER is configured
