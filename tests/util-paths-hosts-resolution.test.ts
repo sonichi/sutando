@@ -107,4 +107,22 @@ describe('personalPath hosts/<host>/ resolution (#1717 / H4)', () => {
 			clearEnv();
 		}
 	});
+
+	it('uses a dotted SUTANDO_HOST_LABEL raw (not split) — parity with PY', () => {
+		// Mini #1718 review note 1: an explicit label is an override, used
+		// verbatim. A dotted label must resolve hosts/a.b/, not hosts/a/.
+		clearEnv();
+		process.env.SUTANDO_HOST_LABEL = 'a.b';
+		const ws = mkdtempSync(join(tmpdir(), 'sut-hosts-'));
+		try {
+			const hostDir = join(ws, 'hosts', 'a.b');
+			mkdirSync(hostDir, { recursive: true });
+			writeFileSync(join(hostDir, 'f.json'), 'x');
+			const p = personalPath('f.json', ws);
+			assert.equal(p, join(hostDir, 'f.json'));
+		} finally {
+			rmSync(ws, { recursive: true, force: true });
+			clearEnv();
+		}
+	});
 });

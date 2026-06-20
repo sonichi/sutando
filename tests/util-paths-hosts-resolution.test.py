@@ -90,6 +90,12 @@ class HostsResolutionTests(unittest.TestCase):
     def test_host_label_drives_hosts_segment(self):
         self.assertEqual(_host_label(), "test-host")
 
+    def test_dotted_host_label_used_raw(self):
+        # An explicit label is an override → used verbatim, NOT split on '.'.
+        # Parity guard with TS hostLabel() (Mini #1718 review note 1).
+        os.environ["SUTANDO_HOST_LABEL"] = "a.b"
+        self.assertEqual(_host_label(), "a.b")
+
 
 if __name__ == "__main__":
     unittest.main()

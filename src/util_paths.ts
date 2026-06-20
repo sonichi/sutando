@@ -67,10 +67,16 @@ export function memoryDirEnv(): string | undefined {
  *
  * Single source of truth for the per-host segment so the legacy
  * `machine-<host>/` (memory-dir) and new `hosts/<host>/` (workspace)
- * conventions stay in lockstep. Matches `_host()` in sync-workspace.sh.
+ * conventions stay in lockstep. Matches `_host()` in sync-workspace.sh:
+ * an explicit label is an override and is used RAW; only the auto-detected
+ * hostname has its mDNS/domain suffix stripped. (A dotted label like
+ * "a.b" must NOT be split — splitting it would strand the reader, the very
+ * class this PR fixes. Mirrors `_host_label()` in util_paths.py.)
  */
 function hostLabel(): string {
-	return (process.env.SUTANDO_HOST_LABEL || hostname()).split('.')[0];
+	const label = process.env.SUTANDO_HOST_LABEL;
+	if (label) return label;
+	return hostname().split('.')[0];
 }
 
 /** Per-machine resolver. */
