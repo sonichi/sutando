@@ -49,8 +49,8 @@ describe('sanitizeKey', () => {
 describe('resultFilename', () => {
 	it('builds <key>.<task-id>.txt', () => {
 		assert.equal(
-			resultFilename('1485653767402553457', 'task-discord-voice-1700000000'),
-			'1485653767402553457.task-discord-voice-1700000000.txt',
+			resultFilename('1485653767402553457', 'task-plugin-voice-1700000000'),
+			'1485653767402553457.task-plugin-voice-1700000000.txt',
 		);
 		assert.equal(
 			resultFilename('CA1234abcd', 'task-phone-1700000000'),
@@ -62,8 +62,8 @@ describe('resultFilename', () => {
 describe('parseResultFilename', () => {
 	it('splits the scoped form', () => {
 		assert.deepEqual(
-			parseResultFilename('1485653767402553457.task-discord-voice-1700000000.txt'),
-			['1485653767402553457', 'task-discord-voice-1700000000'],
+			parseResultFilename('1485653767402553457.task-plugin-voice-1700000000.txt'),
+			['1485653767402553457', 'task-plugin-voice-1700000000'],
 		);
 		assert.deepEqual(
 			parseResultFilename('CA1234abcd.task-phone-1700000000'),
@@ -73,9 +73,9 @@ describe('parseResultFilename', () => {
 
 	it('returns [null, base] for the legacy flat form', () => {
 		assert.deepEqual(parseResultFilename('task-1700000000.txt'), [null, 'task-1700000000']);
-		assert.deepEqual(parseResultFilename('task-discord-voice-1700000000.txt'), [
+		assert.deepEqual(parseResultFilename('task-plugin-voice-1700000000.txt'), [
 			null,
-			'task-discord-voice-1700000000',
+			'task-plugin-voice-1700000000',
 		]);
 	});
 
@@ -106,7 +106,7 @@ describe('resultBelongsTo', () => {
 
 	it('rejects the legacy flat form (owned by delegating consumer, not by scan)', () => {
 		assert.equal(resultBelongsTo('task-1700000000.txt', '1485653767402553457'), false);
-		assert.equal(resultBelongsTo('task-discord-voice-1700000000.txt', 'local-voice'), false);
+		assert.equal(resultBelongsTo('task-plugin-voice-1700000000.txt', 'local-voice'), false);
 	});
 
 	it('rejects non-task files', () => {
@@ -122,16 +122,16 @@ describe('resultBelongsTo', () => {
 	it('rejects atomic-write temp suffixes (partial-write race)', () => {
 		const KEY = '1485653767402553457';
 		const tempSuffixes = [
-			'1485653767402553457.task-discord-voice-1700000000.txt.tmp',
-			'1485653767402553457.task-discord-voice-1700000000.txt.partial',
-			'1485653767402553457.task-discord-voice-1700000000.txt.sending',
-			'1485653767402553457.task-discord-voice-1700000000.txt.swp',
-			'1485653767402553457.task-discord-voice-1700000000.txt.lock',
-			'1485653767402553457.task-discord-voice-1700000000.txt~',
-			'1485653767402553457.task-discord-voice-1700000000.sending',
-			'1485653767402553457.task-discord-voice-1700000000.tmp',
-			'1485653767402553457.task-discord-voice-1700000000.partial',
-			'.1485653767402553457.task-discord-voice-1700000000.txt', // dotfile prefix (vim swap, atomic-write idioms)
+			'1485653767402553457.task-plugin-voice-1700000000.txt.tmp',
+			'1485653767402553457.task-plugin-voice-1700000000.txt.partial',
+			'1485653767402553457.task-plugin-voice-1700000000.txt.sending',
+			'1485653767402553457.task-plugin-voice-1700000000.txt.swp',
+			'1485653767402553457.task-plugin-voice-1700000000.txt.lock',
+			'1485653767402553457.task-plugin-voice-1700000000.txt~',
+			'1485653767402553457.task-plugin-voice-1700000000.sending',
+			'1485653767402553457.task-plugin-voice-1700000000.tmp',
+			'1485653767402553457.task-plugin-voice-1700000000.partial',
+			'.1485653767402553457.task-plugin-voice-1700000000.txt', // dotfile prefix (vim swap, atomic-write idioms)
 		];
 		for (const f of tempSuffixes) {
 			assert.equal(
@@ -147,7 +147,7 @@ describe('resultBelongsTo', () => {
 	it('still matches the canonical .txt form', () => {
 		assert.equal(
 			resultBelongsTo(
-				'1485653767402553457.task-discord-voice-1700000000.txt',
+				'1485653767402553457.task-plugin-voice-1700000000.txt',
 				'1485653767402553457',
 			),
 			true,
@@ -161,8 +161,8 @@ describe('resultBelongsTo', () => {
 // new namespace has leaked into a consumer's path and we've broken the
 // blast-radius guarantee.
 describe('existing consumers do NOT match the scoped namespace', () => {
-	const SCOPED = '1485653767402553457.task-discord-voice-1700000000.txt';
-	const SCOPED_BASE = '1485653767402553457.task-discord-voice-1700000000';
+	const SCOPED = '1485653767402553457.task-plugin-voice-1700000000.txt';
+	const SCOPED_BASE = '1485653767402553457.task-plugin-voice-1700000000';
 
 	it('discord-bridge / telegram-bridge / slack-bridge pending_replies lookup', () => {
 		// All three bridges do: result_file = RESULTS_DIR / f"{task_id}.txt"
@@ -172,7 +172,7 @@ describe('existing consumers do NOT match the scoped namespace', () => {
 		// Equivalent to: no pending_replies key matches SCOPED.
 		const pending: Record<string, boolean> = {
 			'task-1700000001': true,
-			'task-discord-voice-1700000000': true, // a hypothetical tracked id
+			'task-plugin-voice-1700000000': true, // a hypothetical tracked id
 		};
 		// The bridge would look up `${task_id}.txt`; SCOPED doesn't equal any
 		// `${tracked}.txt`.

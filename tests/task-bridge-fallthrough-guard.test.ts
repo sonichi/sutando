@@ -5,7 +5,7 @@ import { _shouldFallthrough } from '../src/task-bridge.js';
 // Regression for issue #1035 (follow-up to PR #1033, per-channel pull path).
 //
 // PR #1033 introduced a new filename namespace `<channel-key>.task-{id}.txt`
-// in results/ for the discord-voice + phone pull path. The new-namespace
+// in results/ for the phone + plugin-surface pull path. The new-namespace
 // files are NOT meant to reach task-bridge's `onResult()` — the per-channel
 // scanner inside the voice surfaces consumes them via read-and-delete.
 //

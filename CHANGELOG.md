@@ -23,7 +23,6 @@ First tagged release. Engine is stable for single-machine installs; multi-machin
 - Discord bridge: DM + channel @mention routing, access tiers, file attachments ([#1077], [#1078], [#1148])
 - Slack bridge: Socket Mode, access tiers, TOFU, outbox log ([many PRs])
 - Phone conversation: Twilio WS audio + task bridge for inbound/outbound calls ([many PRs])
-- `discord-voice` skill: join voice channels, per-speaker tiers, meeting mode, za-warudo magic word ([#1080], [#1311])
 
 **Task pipeline**
 - Multi-source task routing: voice, Discord, Telegram, phone, chat-path, context-drop — unified `tasks/` file bridge with access-tier enforcement ([many PRs])
@@ -53,7 +52,6 @@ First tagged release. Engine is stable for single-machine installs; multi-machin
 
 - Context-drop tasks (Sutando.app hotkey) now archive correctly when no bridge consumer is present ([#969])
 - `check-pending-questions.py`: free-form sections without a `**Status:**` marker are now treated as unanswered ([#1326])
-- Discord-voice: reply refusals to the originating text channel instead of always DMing owner ([#1120])
 - Watch-tasks: EPIPE-buffer + PPID=1 orphan leaks closed ([#1088])
 - Proactive `[channel:]` redirect for loud-failure when target channel is unreachable ([#1147 follow-up])
 

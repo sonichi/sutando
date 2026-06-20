@@ -48,8 +48,8 @@ class TestSanitizeKey(unittest.TestCase):
 class TestResultFilename(unittest.TestCase):
     def test_builds_scoped_form(self):
         self.assertEqual(
-            result_filename("1485653767402553457", "task-discord-voice-1700000000"),
-            "1485653767402553457.task-discord-voice-1700000000.txt",
+            result_filename("1485653767402553457", "task-plugin-voice-1700000000"),
+            "1485653767402553457.task-plugin-voice-1700000000.txt",
         )
         self.assertEqual(
             result_filename("CA1234abcd", "task-phone-1700000000"),
@@ -60,8 +60,8 @@ class TestResultFilename(unittest.TestCase):
 class TestParseResultFilename(unittest.TestCase):
     def test_splits_scoped_form(self):
         self.assertEqual(
-            parse_result_filename("1485653767402553457.task-discord-voice-1700000000.txt"),
-            ("1485653767402553457", "task-discord-voice-1700000000"),
+            parse_result_filename("1485653767402553457.task-plugin-voice-1700000000.txt"),
+            ("1485653767402553457", "task-plugin-voice-1700000000"),
         )
         self.assertEqual(
             parse_result_filename("CA1234abcd.task-phone-1700000000"),
@@ -73,8 +73,8 @@ class TestParseResultFilename(unittest.TestCase):
             parse_result_filename("task-1700000000.txt"), (None, "task-1700000000")
         )
         self.assertEqual(
-            parse_result_filename("task-discord-voice-1700000000.txt"),
-            (None, "task-discord-voice-1700000000"),
+            parse_result_filename("task-plugin-voice-1700000000.txt"),
+            (None, "task-plugin-voice-1700000000"),
         )
 
     def test_returns_none_for_non_task(self):
@@ -106,7 +106,7 @@ class TestResultBelongsTo(unittest.TestCase):
     def test_rejects_legacy_flat(self):
         self.assertFalse(result_belongs_to("task-1700000000.txt", "1485653767402553457"))
         self.assertFalse(
-            result_belongs_to("task-discord-voice-1700000000.txt", "local-voice")
+            result_belongs_to("task-plugin-voice-1700000000.txt", "local-voice")
         )
 
     def test_rejects_non_task(self):
@@ -127,17 +127,17 @@ class TestResultBelongsTo(unittest.TestCase):
         ``endswith('.txt')``, but lock the invariant at the helper too."""
         key = "1485653767402553457"
         temp_suffixes = [
-            "1485653767402553457.task-discord-voice-1700000000.txt.tmp",
-            "1485653767402553457.task-discord-voice-1700000000.txt.partial",
-            "1485653767402553457.task-discord-voice-1700000000.txt.sending",
-            "1485653767402553457.task-discord-voice-1700000000.txt.swp",
-            "1485653767402553457.task-discord-voice-1700000000.txt.lock",
-            "1485653767402553457.task-discord-voice-1700000000.txt~",
-            "1485653767402553457.task-discord-voice-1700000000.sending",
-            "1485653767402553457.task-discord-voice-1700000000.tmp",
-            "1485653767402553457.task-discord-voice-1700000000.partial",
+            "1485653767402553457.task-plugin-voice-1700000000.txt.tmp",
+            "1485653767402553457.task-plugin-voice-1700000000.txt.partial",
+            "1485653767402553457.task-plugin-voice-1700000000.txt.sending",
+            "1485653767402553457.task-plugin-voice-1700000000.txt.swp",
+            "1485653767402553457.task-plugin-voice-1700000000.txt.lock",
+            "1485653767402553457.task-plugin-voice-1700000000.txt~",
+            "1485653767402553457.task-plugin-voice-1700000000.sending",
+            "1485653767402553457.task-plugin-voice-1700000000.tmp",
+            "1485653767402553457.task-plugin-voice-1700000000.partial",
             # dotfile prefix (vim swap, atomic-write idioms)
-            ".1485653767402553457.task-discord-voice-1700000000.txt",
+            ".1485653767402553457.task-plugin-voice-1700000000.txt",
         ]
         for f in temp_suffixes:
             self.assertFalse(
@@ -150,7 +150,7 @@ class TestResultBelongsTo(unittest.TestCase):
         temp-suffix rejection didn't accidentally over-reject."""
         self.assertTrue(
             result_belongs_to(
-                "1485653767402553457.task-discord-voice-1700000000.txt",
+                "1485653767402553457.task-plugin-voice-1700000000.txt",
                 "1485653767402553457",
             )
         )
@@ -162,14 +162,14 @@ class TestExistingConsumersDoNotMatch(unittest.TestCase):
     glob / startswith). Replay each consumer's actual pattern to lock
     that in."""
 
-    SCOPED = "1485653767402553457.task-discord-voice-1700000000.txt"
-    SCOPED_BASE = "1485653767402553457.task-discord-voice-1700000000"
+    SCOPED = "1485653767402553457.task-plugin-voice-1700000000.txt"
+    SCOPED_BASE = "1485653767402553457.task-plugin-voice-1700000000"
 
     def test_pending_replies_lookup(self):
         # discord/telegram/slack bridges: result_file = RESULTS_DIR / f"{task_id}.txt"
         # where task_id is an id THEY tracked. A scoped filename's task_id
         # is the full prefixed string, which is never a tracked id.
-        tracked_ids = ["task-1700000001", "task-discord-voice-1700000000"]
+        tracked_ids = ["task-1700000001", "task-plugin-voice-1700000000"]
         for tid in tracked_ids:
             self.assertNotEqual(
                 f"{tid}.txt",

@@ -23,7 +23,7 @@ Optional first arg is an hour window for time-bounded sections (default 3). `/ca
 3. **In-flight tasks** — `workspace/tasks/task-*.txt`
 4. **Recent results** — `workspace/results/` mtime within window
 5. **Pending questions** — `pending-questions.md` tail
-6. **Recent voice / phone / discord activity** — last N h from `data/conversation.sqlite` (voice + phone + discord_voice tables, post-#1051 schema)
+6. **Recent voice / phone activity** — last N h from `data/conversation.sqlite` (per-surface tables, discovered dynamically, post-#1051 schema)
 7. **Recent chat** — `logs/conversation.log` last N h
 8. **Recent commits** — `git log --all --since=Nh`
 9. **build_log.md tail** — most recent prose entries from the proactive loop
@@ -107,7 +107,7 @@ Also useful to invoke manually after a `/pull-and-restart` (services restart but
 
 ## Dependency note: sqlite section requires #1051's per-surface schema
 
-The voice/phone/discord activity section queries `voice` / `phone` / `discord_voice` tables — introduced in [sonichi/sutando#1051](https://github.com/sonichi/sutando/pull/1051). On a db that pre-dates #1051, the section prints "(sqlite query failed — db schema may pre-date #1051)" and the other 9 sections still work. If #1056 lands first, that section will be empty until #1051 merges; the rest of the briefing is unaffected.
+The voice/phone activity section queries the per-surface transcript tables (discovered dynamically) — introduced in [sonichi/sutando#1051](https://github.com/sonichi/sutando/pull/1051). On a db that pre-dates #1051, the section prints "(sqlite query failed — db schema may pre-date #1051)" and the other 9 sections still work. If #1056 lands first, that section will be empty until #1051 merges; the rest of the briefing is unaffected.
 
 ## What it does NOT recover
 

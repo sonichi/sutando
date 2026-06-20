@@ -1062,8 +1062,8 @@ async function createCallSession(params: {
 	// when the core agent (or another tool) needs to deliver a result to THIS
 	// specific call without having delegated through the work tool. Existing
 	// consumers' patterns don't match the `<callSid>.` prefix, so a file in
-	// this namespace is invisible to them — only this scan and the matching
-	// discord-voice scan claim it.
+	// this namespace is invisible to them — only this scan and other
+	// pull-side plugin scans claim it.
 	//
 	// Scoped by callSid so different concurrent calls never cross — a
 	// parent-call result can't land in the child call's session and vice

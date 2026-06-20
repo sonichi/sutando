@@ -199,29 +199,33 @@ else
   say "(no pending-questions.md found)"
 fi
 
-# 6. Recent voice/phone/discord activity (sqlite, last N h)
-# Requires #1051's per-surface tables (voice/phone/discord_voice). On a db
-# that pre-dates #1051 the query returns "(sqlite query failed)" — that's
-# the expected signal that the operator's conversation-store is older.
-print_section "Recent voice/phone/discord activity (last $HOURS h)"
+# 6. Recent voice/phone activity (sqlite, last N h)
+# Requires #1051's per-surface tables. The surface tables (voice/phone + any
+# plugin-registered surface) are discovered dynamically so this section names no
+# specific plugin. On a db that pre-dates #1051 the query returns
+# "(sqlite query failed)" — the expected signal that the store is older.
+print_section "Recent voice/phone activity (last $HOURS h)"
 if [ -f "$WS/data/conversation.sqlite" ]; then
-  # Mini #2: pre-fix the inline `cmd | awk || say` pattern silently emitted
-  # nothing on cmd failure because pipefail wasn't on; we set it now AND
-  # capture into a variable so an empty-result-but-success case is distinct
-  # from a failure case.
-  sql_rows=$(sqlite3 -separator $'\t' "$WS/data/conversation.sqlite" "
-    SELECT datetime(ts_unix,'unixepoch','localtime') AS time,
-           'voice' AS surface, kind, substr(text,1,80) AS text
-    FROM voice WHERE ts_unix > strftime('%s','now')-${HOURS}*3600
-    UNION ALL
-    SELECT datetime(ts_unix,'unixepoch','localtime'), 'phone', kind, substr(text,1,80)
-    FROM phone WHERE ts_unix > strftime('%s','now')-${HOURS}*3600
-    UNION ALL
-    SELECT datetime(ts_unix,'unixepoch','localtime'), 'discord_voice', kind, substr(text,1,80)
-    FROM discord_voice WHERE ts_unix > strftime('%s','now')-${HOURS}*3600
-    ORDER BY 1 DESC LIMIT 20;
-  " 2>&1)
-  sql_rc=$?
+  # Discover per-surface transcript tables (ts_unix/kind/text/session_id schema,
+  # excluding rollup/legacy tables) and UNION them, each labelled by its name.
+  surface_tables=$(sqlite3 "$WS/data/conversation.sqlite" "
+    SELECT m.name FROM sqlite_master m WHERE m.type='table'
+      AND m.name NOT IN ('sessions','session_events','conversation','tool_calls')
+      AND (SELECT COUNT(*) FROM pragma_table_info(m.name) ti
+           WHERE ti.name IN ('ts_unix','kind','text','session_id')) = 4;" 2>/dev/null)
+  union_sql=""
+  for t in $surface_tables; do
+    [ -n "$union_sql" ] && union_sql="$union_sql UNION ALL "
+    union_sql="$union_sql SELECT datetime(ts_unix,'unixepoch','localtime'), '$t', kind, substr(text,1,80) FROM $t WHERE ts_unix > strftime('%s','now')-${HOURS}*3600"
+  done
+  # Mini #2: capture into a variable so empty-success is distinct from failure.
+  if [ -z "$union_sql" ]; then
+    sql_rows=""; sql_rc=0
+  else
+    sql_rows=$(sqlite3 -separator $'\t' "$WS/data/conversation.sqlite" "
+      SELECT * FROM ( $union_sql ) ORDER BY 1 DESC LIMIT 20;" 2>&1)
+    sql_rc=$?
+  fi
   if [ $sql_rc -ne 0 ]; then
     say "(sqlite query failed — db schema may pre-date #1051: $sql_rows)"
   elif [ -z "$sql_rows" ]; then
