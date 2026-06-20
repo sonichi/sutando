@@ -15,8 +15,8 @@ set -o pipefail   # so `cmd | grep ... || say "(none)"` actually fires when cmd 
 # (CLAUDE.md + skills/ + .git signature, same heuristic session-handoff.sh
 # uses), else fall back to the convention path. Probing means a checkout
 # at $HOME/Desktop/sutando OR $HOME/Documents/sutando/sutando OR $(pwd)
-# all Just Work without per-user env. (Was a hardcoded /Users/xueqingliu/...
-# path pre-review; fixed per qingyun-wu + Mini's #1056 review.)
+# all Just Work without per-user env. (Was a hardcoded /Users/<name>/...
+# path pre-review; fixed in the #1056 review.)
 if [ -n "${SUTANDO_REPO_DIR:-}" ]; then
   REPO="$SUTANDO_REPO_DIR"
 else
