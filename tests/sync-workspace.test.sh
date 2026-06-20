@@ -189,6 +189,21 @@ else
   echo "  FAIL: .git/info/exclude missing carrier-set un-ignore rules"; fail=$((fail+1))
 fi
 
+# M3: secret material hard-deny (SSH private keys + cert/key extensions).
+for _deny in "id_rsa" "id_ed25519" "*.pem" "*.key" "*.p12"; do
+  if grep -qxF "$_deny" "$EXCLUDE_FILE"; then
+    echo "  OK: .git/info/exclude hard-denies secret pattern '$_deny' (M3)"; pass=$((pass+1))
+  else
+    echo "  FAIL: .git/info/exclude missing secret deny '$_deny' (M3)"; fail=$((fail+1))
+  fi
+done
+# Public keys must remain syncable — *.pub is NOT denied.
+if grep -qxF '*.pub' "$EXCLUDE_FILE"; then
+  echo "  FAIL: .git/info/exclude wrongly denies *.pub (public keys should sync)"; fail=$((fail+1))
+else
+  echo "  OK: .git/info/exclude does not deny *.pub (public keys still sync)"; pass=$((pass+1))
+fi
+
 # Verify the OLD canonical-specific pattern is GONE
 if grep -qE 'projects/[a-f0-9]{8}/memory' "$EXCLUDE_FILE"; then
   echo "  FAIL: .git/info/exclude still has canonical-id-specific pattern"; fail=$((fail+1))
