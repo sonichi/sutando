@@ -71,19 +71,38 @@ REPO = resolve_workspace()
 # CLAUDE.md core/skill split (core must not bloat with feature logic). The
 # import is best-effort: if the discord-voice skill is absent, the magic word
 # simply doesn't fire and the message is processed as a normal task.
-try:
-    sys.path.insert(
-        0, str(Path(__file__).resolve().parent.parent / "skills" / "discord-voice" / "scripts")
-    )
-    from join_trigger import (  # noqa: E402
-        message_is_join_phrase as _dv_message_is_join_phrase,
-        handle_join_trigger as _dv_handle_join_trigger,
-    )
-except Exception:  # pragma: no cover - skill optional
+# Resolve the discord-voice skill scripts dir. Post-#1427 round 4 the skill's home is
+# the sutando-meeting plugin repo, NOT this (main) checkout -- the in-repo copy was
+# deleted. The old hardcoded parent.parent/skills/discord-voice/scripts path therefore no
+# longer contains join_trigger.py, so the best-effort import silently failed and the magic
+# word "za warudo" became a dead no-op. Try, in order: explicit env override, the sibling
+# sutando-meeting checkout, then the legacy in-repo path. First candidate that actually
+# contains join_trigger.py wins.
+_dv_candidates = []
+_dv_env_dir = os.environ.get("SUTANDO_DISCORD_VOICE_SCRIPTS_DIR")
+if _dv_env_dir:
+    _dv_candidates.append(Path(_dv_env_dir))
+_dv_siblings_root = Path(__file__).resolve().parent.parent.parent
+_dv_candidates.append(_dv_siblings_root / "sutando-meeting" / "skills" / "discord-voice" / "scripts")
+_dv_candidates.append(Path(__file__).resolve().parent.parent / "skills" / "discord-voice" / "scripts")
+_dv_loaded = False
+for _dv_cand in _dv_candidates:
+    if (_dv_cand / "join_trigger.py").exists():
+        sys.path.insert(0, str(_dv_cand))
+        try:
+            from join_trigger import (  # noqa: E402
+                message_is_join_phrase as _dv_message_is_join_phrase,
+                handle_join_trigger as _dv_handle_join_trigger,
+            )
+            _dv_loaded = True
+            break
+        except Exception:  # pragma: no cover - skill optional
+            continue
+if not _dv_loaded:  # pragma: no cover - skill optional
     def _dv_message_is_join_phrase(text):  # type: ignore
         return False
 
-    def _dv_handle_join_trigger(message):  # type: ignore
+    def _dv_handle_join_trigger(message, self_user_id=None):  # type: ignore
         return ""
 
 # Vision-frame helper — pushes image attachments into the active voice session
@@ -2393,6 +2412,13 @@ async def _handle_discord_message(message, force=False):
             except Exception as e:
                 print(f"  [thread-engage] failed to update access.json: {e}", flush=True)
 
+        # Text/magic-word screen-push REMOVED (#1427, owner 2026-06-05). Screen
+        # sharing in a voice session is owned entirely by the voice-invoked
+        # join_discord_screen tool (src/vision-tools.ts) — typed phrases no longer
+        # start screen-push; only voice does. The old setScreenPush consumer was
+        # already gone, so this typed path was an orphan that still posted a
+        # "Screen-push on" message (fired on every bot in the channel).
+
         # Magic-word fast path: an owner saying the join phrase MUST bypass
         # requireMention — otherwise the magic word can't fire in any guild
         # text channel where the bot isn't @-mentioned. Check before the
@@ -2402,7 +2428,7 @@ async def _handle_discord_message(message, force=False):
             if str(message.author.id) in load_allowed() and _dv_message_is_join_phrase(text):
                 print(f"  [join-trigger] owner @{message.author} said the join phrase — summoning discord-voice (bypassing requireMention)", flush=True)
                 try:
-                    reply = _dv_handle_join_trigger(message)
+                    reply = _dv_handle_join_trigger(message, getattr(client.user, "id", None))
                 except Exception as e:
                     print(f"  [join-trigger] handler raised: {e}", flush=True)
                     reply = "Couldn't process the voice-join request — check the bridge log."
@@ -2746,7 +2772,7 @@ async def _handle_discord_message(message, force=False):
         if is_join:
             print(f"  [join-trigger] owner @{username} said the join phrase — summoning discord-voice", flush=True)
             try:
-                reply = _dv_handle_join_trigger(message)
+                reply = _dv_handle_join_trigger(message, getattr(client.user, "id", None))
             except Exception as e:
                 print(f"  [join-trigger] handler raised: {e}", flush=True)
                 reply = "Couldn't process the voice-join request — check the bridge log."
