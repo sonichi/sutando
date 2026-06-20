@@ -91,6 +91,32 @@ for p in resolve_vault().get('sync', {}).get('exclude', []):
 "
     ;;
 
+  migrate-stale-hosts)
+    # Print migrate.stale_hosts (one per line) — per-clone machine-<host> dirs
+    # the legacy import should DROP. Lives in sutando.config.local.json (gitignored,
+    # per-clone), NOT .env: this is config, not a secret. Default empty.
+    python3 -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import load_config
+for h in load_config().get('migrate', {}).get('stale_hosts', []):
+    print(h)
+"
+    ;;
+
+  migrate-skip-skills)
+    # Print migrate.skip_skills (one per line) — per-clone host-only skill names
+    # the legacy import should NOT salvage to shared (stale/superseded). Same
+    # gitignored per-clone config home as migrate-stale-hosts. Default empty.
+    python3 -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import load_config
+for s in load_config().get('migrate', {}).get('skip_skills', []):
+    print(s)
+"
+    ;;
+
   claude-sutando-config-dir)
     # Print the absolute CLAUDE_CONFIG_DIR target used by the `claude-sutando`
     # shell alias. v0.9 resolution: `core_config_dirs[type=claude].value` →

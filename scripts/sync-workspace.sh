@@ -1167,26 +1167,37 @@ _migrate_from_legacy_impl() {
                 "$WORKSPACE_DIR/hosts/${host}" \
                 "$WORKSPACE_DIR/.claude-sutando/projects/${local_slug}/memory"
 
-    # 1. notes/ — handle symlink case
+    # Full import mapping (owner directive 2026-06-20 "include everything that
+    # should be"). Shared content → shared paths; per-host content → hosts/<host>/;
+    # stale hosts dropped (unique skills salvaged first); bulky regenerable media
+    # excluded from git (stays archived in the legacy repo); skills are SHARED.
+    # Stale/defunct machine-<host> dirs to DROP (their unique skills are
+    # salvaged into shared skills/ BEFORE they're skipped below). Per-clone /
+    # owner-specific — read from the gitignored clone CONFIG
+    # (sutando.config.local.json → migrate.stale_hosts), NOT committed to this
+    # (public) repo and NOT from .env (this is config, not a secret). Default
+    # empty (drop nothing).
+    local STALE_HOSTS
+    STALE_HOSTS="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" migrate-stale-hosts 2>/dev/null | tr '\n' ' ')"
+
+    # ---- SHARED: notes/ (text only; EXCLUDE bulky regenerable media) ----
     if [ -L "$WORKSPACE_DIR/notes" ]; then
-        local symlink_target
-        symlink_target="$(readlink "$WORKSPACE_DIR/notes")"
-        log "_migrate_from_legacy_impl: workspace/notes is a symlink → $symlink_target; removing + copying content"
+        log "_migrate_from_legacy_impl: workspace/notes is a symlink → $(readlink "$WORKSPACE_DIR/notes"); removing + copying content"
         _do rm "$WORKSPACE_DIR/notes"
         _do mkdir -p "$WORKSPACE_DIR/notes"
     fi
     if [ -d "$legacy_dir/notes" ]; then
         if [ "$DRY_RUN" = "1" ]; then
             local n_notes
-            n_notes=$(find "$legacy_dir/notes" -type f 2>/dev/null | wc -l | tr -d ' ')
-            echo "DRY-RUN: would: cp -an $legacy_dir/notes/. $WORKSPACE_DIR/notes/  (${n_notes} files)" >&2
+            n_notes=$(find "$legacy_dir/notes" -type f -not -path "$legacy_dir/notes/generated/*" -not -path "$legacy_dir/notes/media/*" 2>/dev/null | wc -l | tr -d ' ')
+            echo "DRY-RUN: would: rsync notes/ (EXCL generated/ + media/) → workspace/notes/  (${n_notes} text files; ~2.65 GB media left archived in legacy)" >&2
         else
-            cp -an "$legacy_dir/notes"/. "$WORKSPACE_DIR/notes"/ 2>/dev/null || true
-            log "_migrate_from_legacy_impl: copied $legacy_dir/notes/ → $WORKSPACE_DIR/notes/ (cp -n)"
+            rsync -a --exclude='generated/' --exclude='media/' "$legacy_dir/notes"/ "$WORKSPACE_DIR/notes"/ 2>/dev/null || true
+            log "_migrate_from_legacy_impl: rsynced notes/ (excl generated,media) → workspace/notes/"
         fi
     fi
 
-    # 2. memory/*.md → this host's local slug memory dir
+    # ---- SHARED: memory/*.md → this host's local-slug core-memory dir ----
     if [ -d "$legacy_dir/memory" ]; then
         local copied=0 would_copy=0
         for f in "$legacy_dir/memory"/*.md; do
@@ -1204,8 +1215,59 @@ _migrate_from_legacy_impl() {
         fi
     fi
 
-    # 3. pending-questions.md → hosts/<host>/ (per-host; prefer the legacy
-    #    machine-<host>/ copy if present, else the legacy root copy).
+    # ---- SHARED: misc top-level dirs verbatim ----
+    local shared_dir
+    for shared_dir in papers talk-slides voice-contexts assets; do
+        [ -d "$legacy_dir/$shared_dir" ] || continue
+        if [ "$DRY_RUN" = "1" ]; then
+            echo "DRY-RUN: would: cp -an $shared_dir/ → workspace/$shared_dir/  ($(find "$legacy_dir/$shared_dir" -type f 2>/dev/null | wc -l | tr -d ' ') files)" >&2
+        else
+            _do mkdir -p "$WORKSPACE_DIR/$shared_dir"
+            cp -an "$legacy_dir/$shared_dir"/. "$WORKSPACE_DIR/$shared_dir"/ 2>/dev/null || true
+            log "_migrate_from_legacy_impl: copied $shared_dir/ → workspace/$shared_dir/"
+        fi
+    done
+
+    # ---- SHARED: skills/ (canonical) + salvage host-only skills ----
+    # skills are SHARED (verified vs git: vault-root skills/ = canonical). Copy
+    # it, then promote any skill that lives ONLY under machine-*/skills/ (a
+    # host-only orphan, incl on stale hosts) into shared so nothing is lost.
+    if [ -d "$legacy_dir/skills" ]; then
+        if [ "$DRY_RUN" = "1" ]; then
+            echo "DRY-RUN: would: cp -an skills/ → workspace/skills/  ($(ls -1 "$legacy_dir/skills" 2>/dev/null | wc -l | tr -d ' ') skills, shared canonical)" >&2
+        else
+            _do mkdir -p "$WORKSPACE_DIR/skills"
+            cp -an "$legacy_dir/skills"/. "$WORKSPACE_DIR/skills"/ 2>/dev/null || true
+        fi
+        # Host-only orphan skills to NOT promote to shared (stale/superseded).
+        # They stay retrievable in the legacy archive. Per-clone / owner-specific
+        # — read from the gitignored clone CONFIG (sutando.config.local.json →
+        # migrate.skip_skills), NOT committed to this (public) repo and NOT from
+        # .env (config, not a secret). Default empty (salvage all host-only).
+        local SALVAGE_SKIP
+        SALVAGE_SKIP="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" migrate-skip-skills 2>/dev/null | tr '\n' ' ')"
+        local ms sk b
+        for ms in "$legacy_dir"/machine-*/skills; do
+            [ -d "$ms" ] || continue
+            for sk in "$ms"/*; do
+                [ -e "$sk" ] || continue
+                b="$(basename "$sk")"
+                [ -e "$legacy_dir/skills/$b" ] && continue   # already in shared
+                case " $SALVAGE_SKIP " in
+                    *" $b "*)
+                        [ "$DRY_RUN" = "1" ] && echo "DRY-RUN: would: SKIP stale host-only skill '$b' (superseded; left in legacy archive)" >&2
+                        continue ;;
+                esac
+                if [ "$DRY_RUN" = "1" ]; then
+                    echo "DRY-RUN: would: SALVAGE host-only skill '$b' (from ${ms#"$legacy_dir"/}) → workspace/skills/$b" >&2
+                else
+                    cp -an "$sk" "$WORKSPACE_DIR/skills/" 2>/dev/null || true
+                fi
+            done
+        done
+    fi
+
+    # ---- PER-HOST: this host's pending-questions + build_log → hosts/<host>/ ----
     local pq_src
     if [ -f "$legacy_dir/machine-${host}/pending-questions.md" ]; then
         pq_src="$legacy_dir/machine-${host}/pending-questions.md"
@@ -1218,8 +1280,6 @@ _migrate_from_legacy_impl() {
         _do cp -n "$pq_src" "$WORKSPACE_DIR/hosts/${host}/pending-questions.md"
         [ "$DRY_RUN" != "1" ] && log "_migrate_from_legacy_impl: copied $pq_src → workspace/hosts/${host}/pending-questions.md"
     fi
-
-    # 4. build_log.md → hosts/<host>/build_log.md (per-host, hostname-qualified)
     local bl_src
     if [ -f "$legacy_dir/machine-${host}/build_log.md" ]; then
         bl_src="$legacy_dir/machine-${host}/build_log.md"
@@ -1233,6 +1293,33 @@ _migrate_from_legacy_impl() {
         [ "$DRY_RUN" != "1" ] && log "_migrate_from_legacy_impl: copied $bl_src → workspace/hosts/${host}/build_log.md"
     fi
 
+    # ---- PER-HOST: peer machines' full subtree (EXCEPT skills/) → hosts/<peer>/ ----
+    # Each non-stale machine-<peer>/ (config: build_log, crons.json,
+    # PERSONAL_CLAUDE, stand-identity, data/, notes/, tab-aliases, voice-context,
+    # channels/access.json, settings.json) → hosts/<peer>/. skills/ excluded
+    # (handled as shared above). This host (no machine-<host> in the repo) is
+    # handled via the legacy-root pq/bl above; its access/settings come from the
+    # live ~/.claude post-migration (not present in the legacy clone).
+    local md mname peer
+    for md in "$legacy_dir"/machine-*; do
+        [ -d "$md" ] || continue
+        mname="$(basename "$md")"
+        case " $STALE_HOSTS " in
+            *" $mname "*)
+                [ "$DRY_RUN" = "1" ] && echo "DRY-RUN: would: DROP stale $mname (unique skills already salvaged to shared)" >&2
+                continue ;;
+        esac
+        peer="${mname#machine-}"
+        [ "$peer" = "$host" ] && continue   # this host handled above
+        if [ "$DRY_RUN" = "1" ]; then
+            echo "DRY-RUN: would: rsync $mname/ (EXCL skills/) → hosts/$peer/  ($(find "$md" -type f -not -path "$md/skills/*" 2>/dev/null | wc -l | tr -d ' ') files)" >&2
+        else
+            _do mkdir -p "$WORKSPACE_DIR/hosts/$peer"
+            rsync -a --exclude='skills/' "$md"/ "$WORKSPACE_DIR/hosts/$peer"/ 2>/dev/null || true
+            log "_migrate_from_legacy_impl: rsynced $mname/ (excl skills) → hosts/$peer/"
+        fi
+    done
+
     # 5. Hand off to _init_impl for git init + first push (DRY_RUN propagates)
     log "_migrate_from_legacy_impl: handing off to _init_impl for git init + first push"
     _init_impl
@@ -1244,9 +1331,10 @@ sync-workspace migrate: complete.
 
 Next steps (operator-supervised):
   1. Verify the new workspace has the expected content:
-       ls $WORKSPACE_DIR/notes/ | head
+       ls $WORKSPACE_DIR/notes/ | head            # text only (generated/+media/ left in legacy)
        ls $WORKSPACE_DIR/.claude-sutando/projects/${local_slug}/memory/ | head
-       ls $WORKSPACE_DIR/hosts/${host}/   # build_log.md + pending-questions.md (per-host)
+       ls $WORKSPACE_DIR/skills/                   # shared canonical + salvaged host-only skills
+       ls $WORKSPACE_DIR/hosts/                    # per-host: this host + peers (machine-<peer>/ minus skills/)
   2. Confirm the first push landed in your $VAULT_URL repo (web UI).
   3. Run a normal sync to verify push + pull work end-to-end:
        bash scripts/sync-workspace.sh
