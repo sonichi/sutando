@@ -19,7 +19,7 @@ Usage:
 """
 from __future__ import annotations
 
-import argparse, datetime, json, os, re, shutil, subprocess, sys, time
+import argparse, datetime, json, re, shutil, subprocess, sys, time
 from pathlib import Path
 
 REPO = "sonichi/sutando"
