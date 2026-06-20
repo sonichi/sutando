@@ -18,7 +18,6 @@ import {
 	resultFilename,
 	parseResultFilename,
 	resultBelongsTo,
-	discordVoiceKey,
 	phoneCallKey,
 } from '../src/result-channel-key.js';
 
@@ -203,8 +202,8 @@ describe('existing consumers do NOT match the scoped namespace', () => {
 	// Note: task-bridge.ts has an UNCONDITIONAL fallthrough at line 682
 	// (`if (result) { ... onResult(result) ... }`) that fires for any
 	// non-empty .txt file when the voice client is connected. The narrow
-	// design accepts this: voice-agent and discord-voice / phone are
-	// different surfaces, and in practice the active discord-voice / phone
+	// design accepts this: voice-agent and the pull-side plugin / phone are
+	// different surfaces, and in practice the active pull-side / phone
 	// process will read-and-delete the scoped file before voice-agent's
 	// 2s poll claims it. See PR body's verification section for the full
 	// trade-off discussion.
@@ -214,38 +213,22 @@ describe('existing consumers do NOT match the scoped namespace', () => {
 // function so the keys agree. Prevents cross-consumer namespace collisions
 // when a future consumer ID format overlaps with an existing one.
 describe('typed key constructors', () => {
-	it('discordVoiceKey prefixes with `dvoice-`', () => {
-		assert.equal(discordVoiceKey('1485653767402553457'), 'dvoice-1485653767402553457');
-	});
-
 	it('phoneCallKey prefixes with `phone-`', () => {
 		assert.equal(phoneCallKey('CA1234abcd'), 'phone-CA1234abcd');
 	});
 
 	it('typed keys sanitize input', () => {
-		assert.equal(discordVoiceKey('a/b'), 'dvoice-a-b');
 		assert.equal(phoneCallKey('../etc'), 'phone----etc');
 	});
 
 	it('typed keys fall back on empty / falsy input', () => {
-		assert.equal(discordVoiceKey(null), 'dvoice-unknown');
-		assert.equal(discordVoiceKey(''), 'dvoice-unknown');
-		assert.equal(discordVoiceKey(undefined), 'dvoice-unknown');
 		assert.equal(phoneCallKey(null), 'phone-unknown');
 	});
 
 	it('typed keys round-trip through resultFilename + resultBelongsTo', () => {
-		const key = discordVoiceKey('1485653767402553457');
+		const key = phoneCallKey('CA1234abcd');
 		const fname = resultFilename(key, 'task-1700000000');
-		assert.equal(fname, 'dvoice-1485653767402553457.task-1700000000.txt');
+		assert.equal(fname, 'phone-CA1234abcd.task-1700000000.txt');
 		assert.equal(resultBelongsTo(fname, key), true);
-	});
-
-	it('typed keys cannot collide across consumers (even if IDs match)', () => {
-		// Hypothetical collision: a future consumer ID happens to look like a
-		// Discord VC snowflake. Without prefixes the keys would be equal; with
-		// prefixes they remain distinct.
-		const sameId = 'CA1234abcd';
-		assert.notEqual(discordVoiceKey(sameId), phoneCallKey(sameId));
 	});
 });

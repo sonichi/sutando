@@ -17,9 +17,10 @@
  *
  * Public API is unchanged: `recordConversation(role, text, sessionId)` and
  * `recordSession(metrics)` keep the same signatures. Internally,
- * recordConversation routes by role-prefix (`phone-*` → phone, `discord-*`
- * → discord_voice, otherwise voice) and recordSession's tool-call fan-out
- * routes by `source` instead of writing to a standalone `tool_calls` table.
+ * recordConversation routes by role-prefix (`phone-*` → phone, a plugin's
+ * registered prefix → its surface table, otherwise voice) and recordSession's
+ * tool-call fan-out routes by `source` instead of writing to a standalone
+ * `tool_calls` table.
  *
  * Migration: on first init, if a surface table is empty and the old
  * `conversation` / `tool_calls` tables have rows, the matching rows are
@@ -36,7 +37,6 @@
  *     from './conversation-store.js';
  *   recordConversation('user', 'hello');            // → voice table
  *   recordConversation('phone-caller', 'hi');       // → phone table
- *   recordConversation('discord-user', 'hey');      // → discord_voice table
  */
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
@@ -89,14 +89,14 @@ export function sourceFromRole(role: string): Source {
 }
 
 /** Normalize the legacy role string to the per-surface `kind` taxonomy.
- *  user-side roles → 'user'; agent-side → 'agent'; discord-peer → 'peer';
+ *  user-side roles → 'user'; agent-side → 'agent'; '*-peer' → 'peer';
  *  anything else (SESSION_END, core-agent, system event names) passes
  *  through verbatim so callers can record arbitrary kinds. */
 export function kindFromRole(role: string): string {
 	if (role === 'user' || role.endsWith('-user') || role.endsWith('-caller')) return 'user';
 	if (role === 'assistant' || role === 'sutando'
 		|| role.endsWith('-agent') || role.endsWith('-assistant')) return 'agent';
-	if (role === 'discord-peer') return 'peer';
+	if (role.endsWith('-peer')) return 'peer';
 	return role;
 }
 
@@ -207,27 +207,6 @@ function init(): void {
 		db.exec('PRAGMA journal_mode = WAL');
 		db.exec('PRAGMA busy_timeout = 1000');
 
-		// Defensive: an older `discord_voice` table (e.g. from a multi-instance
-		// branch using `discord-voice-store.ts`) used a `role` column instead
-		// of the new `kind` column. CREATE TABLE IF NOT EXISTS would skip the
-		// new schema and we'd write to mismatched columns. Rename any pre-
-		// existing legacy-schema table out of the way so the new CREATE runs.
-		try {
-			const old = db.prepare(
-				"SELECT name FROM sqlite_master WHERE type='table' AND name='discord_voice'",
-			).get();
-			if (old) {
-				const cols = db.prepare("PRAGMA table_info(discord_voice)").all() as Array<{ name: string }>;
-				const hasKind = cols.some(c => c.name === 'kind');
-				if (!hasKind) {
-					db.exec('ALTER TABLE discord_voice RENAME TO discord_voice_legacy');
-					console.log('[conversation-store] renamed legacy discord_voice → discord_voice_legacy (different schema)');
-				}
-			}
-		} catch (e) {
-			console.error('[conversation-store] legacy-schema detect failed:', e);
-		}
-
 		db.exec(`
 			-- Per-surface event tables. Identical schema; one per voice surface.
 			-- Holds utterances + tool calls in one chronological stream — id is
@@ -256,7 +235,7 @@ function init(): void {
 			CREATE INDEX IF NOT EXISTS idx_phone_kind_ts ON phone(kind, ts_unix);
 			CREATE INDEX IF NOT EXISTS idx_phone_session ON phone(session_id, ts_unix);
 
-			-- (discord_voice and any other plugin surface tables are NOT created
+			-- (plugin surface tables are NOT created
 			-- here — the owning plugin registers its own DDL + routing at startup
 			-- via registerSurfaceTable. Round ④ of #1427: engine names no plugin.)
 
@@ -372,32 +351,12 @@ function migrateLegacyIfNeeded(d: DatabaseSync): void {
 		).get();
 		if (!hasConversation && !hasToolCalls) return; // nothing to migrate
 
-		// NOTE on plugin tables in this LEGACY migration: `discord_voice` appears
-		// below as a *historical data destination* (existing deployments hold
-		// real rows under that name), not as live engine wiring — the live
-		// routing/DDL for plugin surfaces comes only from registerSurfaceTable.
-		// On a DB that has legacy discord rows but no plugin installed yet, we
-		// create the minimal table here so the data is preserved either way.
-		const tableExists = (name: string) => !!d.prepare(
-			"SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-		).get(name);
-		if (!tableExists('discord_voice')) {
-			const hasLegacyDiscordRows =
-				(hasConversation && (d.prepare("SELECT count(*) AS c FROM conversation WHERE role LIKE 'discord-%'").get() as { c: number }).c > 0)
-				|| (hasToolCalls && (d.prepare("SELECT count(*) AS c FROM tool_calls WHERE source='discord-voice'").get() as { c: number }).c > 0)
-				|| tableExists('discord_voice_legacy');
-			if (hasLegacyDiscordRows) {
-				d.exec(`CREATE TABLE IF NOT EXISTS discord_voice (
-					id INTEGER PRIMARY KEY, ts_unix REAL NOT NULL, kind TEXT NOT NULL,
-					text TEXT, duration_ms INTEGER, session_id TEXT
-				);`);
-			}
-		}
+		// Live routing/DDL for plugin surfaces comes only from registerSurfaceTable;
+		// this LEGACY migration covers the host surfaces (voice, phone) — any
+		// plugin surface owns its own table DDL and any historical backfill.
 		const voiceEmpty = (d.prepare('SELECT count(*) AS c FROM voice').get() as { c: number }).c === 0;
 		const phoneEmpty = (d.prepare('SELECT count(*) AS c FROM phone').get() as { c: number }).c === 0;
-		const discordEmpty = !tableExists('discord_voice')
-			|| (d.prepare('SELECT count(*) AS c FROM discord_voice').get() as { c: number }).c === 0;
-		if (!voiceEmpty && !phoneEmpty && !discordEmpty) {
+		if (!voiceEmpty && !phoneEmpty) {
 			// All surface tables already populated — nothing to backfill.
 			// Drop legacy tables if they're still around.
 			if (hasConversation) d.exec('DROP TABLE IF EXISTS conversation');
@@ -419,8 +378,8 @@ function migrateLegacyIfNeeded(d: DatabaseSync): void {
 			if (hasConversation && voiceEmpty) {
 				// Utterances → voice. Roles that map to voice: 'user', 'assistant',
 				// 'sutando', 'core-agent', 'SESSION_END', and anything not prefixed
-				// 'phone-' / 'discord-'. kind normalization: user/assistant/sutando
-				// → user/agent, others passthrough.
+				// 'phone-'. kind normalization: user/assistant/sutando → user/agent,
+				// others passthrough.
 				d.exec(`
 					INSERT INTO voice (ts_unix, kind, text, duration_ms, session_id)
 					SELECT ts_unix,
@@ -432,7 +391,7 @@ function migrateLegacyIfNeeded(d: DatabaseSync): void {
 					       text, NULL, session_id
 					FROM conversation
 					WHERE ts_unix IS NOT NULL
-					  AND role NOT LIKE 'phone-%' AND role NOT LIKE 'discord-%'
+					  AND role NOT LIKE 'phone-%'
 				`);
 			}
 			if (hasConversation && phoneEmpty) {
@@ -446,20 +405,6 @@ function migrateLegacyIfNeeded(d: DatabaseSync): void {
 					       END,
 					       text, NULL, session_id
 					FROM conversation WHERE ts_unix IS NOT NULL AND role LIKE 'phone-%'
-				`);
-			}
-			if (hasConversation && discordEmpty && tableExists('discord_voice')) {
-				d.exec(`
-					INSERT INTO discord_voice (ts_unix, kind, text, duration_ms, session_id)
-					SELECT ts_unix,
-					       CASE
-					         WHEN role='discord-user'  THEN 'user'
-					         WHEN role='discord-agent' THEN 'agent'
-					         WHEN role='discord-peer'  THEN 'peer'
-					         ELSE substr(role, 9)
-					       END,
-					       text, NULL, session_id
-					FROM conversation WHERE ts_unix IS NOT NULL AND role LIKE 'discord-%'
 				`);
 			}
 			if (hasToolCalls) {
@@ -477,47 +422,6 @@ function migrateLegacyIfNeeded(d: DatabaseSync): void {
 					SELECT ts_unix, 'tool_call', name, duration_ms, session_id
 					FROM tool_calls WHERE source='phone'
 				`);
-				if (tableExists('discord_voice')) d.exec(`
-					INSERT INTO discord_voice (ts_unix, kind, text, duration_ms, session_id)
-					SELECT ts_unix, 'tool_call', name, duration_ms, session_id
-					FROM tool_calls WHERE source='discord-voice'
-				`);
-				// Also backfill discord-voice tool calls from sessions.tool_calls JSON —
-				// discord-voice historically never wrote to the tool_calls table; its
-				// per-call data lives only in the sessions JSON column. Use json_each
-				// to expand.
-				if (tableExists('discord_voice')) d.exec(`
-					INSERT INTO discord_voice (ts_unix, kind, text, duration_ms, session_id)
-					SELECT CAST(strftime('%s', json_extract(je.value,'$.timestamp')) AS REAL),
-					       'tool_call',
-					       json_extract(je.value,'$.name'),
-					       json_extract(je.value,'$.durationMs'),
-					       s.session_id
-					FROM sessions s, json_each(s.tool_calls) je
-					WHERE s.source='discord-voice'
-					  AND s.tool_calls IS NOT NULL
-					  AND s.tool_calls != '[]'
-				`);
-			}
-			// If a legacy `discord_voice` table was renamed aside (different
-			// schema from an older multi-instance branch), backfill its rows.
-			const legacy = d.prepare(
-				"SELECT name FROM sqlite_master WHERE type='table' AND name='discord_voice_legacy'",
-			).get();
-			if (legacy) {
-				d.exec(`
-					INSERT INTO discord_voice (ts_unix, kind, text, duration_ms, session_id)
-					SELECT ts_unix,
-					       CASE
-					         WHEN role='discord-user'  THEN 'user'
-					         WHEN role='discord-agent' THEN 'agent'
-					         WHEN role='discord-peer'  THEN 'peer'
-					         ELSE role
-					       END,
-					       text, NULL, session_id
-					FROM discord_voice_legacy
-				`);
-				d.exec('DROP TABLE IF EXISTS discord_voice_legacy');
 			}
 			// Drop legacy tables — they're fully migrated.
 			if (hasConversation) d.exec('DROP TABLE IF EXISTS conversation');
@@ -533,9 +437,9 @@ function migrateLegacyIfNeeded(d: DatabaseSync): void {
 	}
 }
 
-/** Speaker attribution for a discord_voice turn (#1427 meeting-buddy). */
+/** Speaker attribution for a multi-party plugin-surface turn (#1427 meeting-buddy). */
 export interface SpeakerMeta {
-	speakerId?: string;        // discord user id of the turn's speaker
+	speakerId?: string;        // platform user id of the turn's speaker
 	speakerName?: string;      // display name (nickname || username)
 	speakerType?: 'human' | 'agent';
 	spoken?: boolean;          // false = generated but name-gate suppressed (no audio played)
@@ -608,7 +512,7 @@ export function recordSessionBoundary(reason: string = 'user_goodbye', sessionId
  * Record an arbitrary audit/event kind into an EXPLICIT surface table.
  * Needed because recordConversation routes by role prefix (sourceFromRole),
  * so a custom kind like 'speak_decision' would silently fall through to the
- * `voice` table — invisible to the discord_voice audits it exists for
+ * `voice` table — invisible to the plugin-surface audits it exists for
  * (#1427 regime_switch / speak_decision / mode_switch_regime rows). The
  * kind string is stored verbatim; mirrors recordToolCall's explicit-source
  * pattern.
@@ -723,7 +627,7 @@ export function recordSession(m: SessionMetrics): void {
 	}
 	// Fan out LIFECYCLE events into session_events. Skip duplicates of
 	// surface-table rows (user/sutando/tool_call/tool_result) — those
-	// atoms are canonical in voice/phone/discord_voice tables now.
+	// atoms are canonical in the per-surface tables now.
 	if (eventInsertStmt && Array.isArray(m.events)) {
 		for (const ev of m.events as Array<Record<string, unknown>>) {
 			const name = String(ev.event ?? 'unknown');
