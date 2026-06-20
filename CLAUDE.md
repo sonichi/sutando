@@ -17,6 +17,7 @@ Be concise and direct. Prefer action over explanation. Default to the smallest a
 - **Core services** (`src/`, `skills/phone-conversation/`) are general-purpose infrastructure. They provide generic capabilities (audio streaming, task bridge, tool execution) but must NOT contain feature-specific logic.
 - **Skills** (`skills/`) contain feature-specific logic. Each skill is self-contained and optional — core services work without any skill installed. When implementing new capabilities, start as a skill.
 - **Inline tools** are only for tools that need instant response from Gemini. Prefer skill scripts for complex logic. Only promote to inline if the user says the skill approach is too slow.
+- **Skill config goes in the skill's `manifest.json` `config` block — not ad-hoc env vars.** See [`skills/MANIFEST.md`](skills/MANIFEST.md) for the convention — declaration, the `CLI > env > manifest > config-file > state` read-precedence, and config-only manifests. Don't invent an undocumented env var (Chi 2026-06-16).
 - When refactoring, do NOT change prompts or tool behavior. Prompts are tuned through testing and must be preserved exactly.
 
 ### Where does new code belong? (decision guide — issue #222)
@@ -201,6 +202,38 @@ When you need user input on a decision or are blocked:
 
 On each proactive loop pass, check `pending-questions.md` for unanswered items and surface them when the user is available.
 
+## Task progress notifications
+
+**Call notify BEFORE doing any work** — the notification must be the first thing the user sees
+after sending a task, not silence followed by a result minutes later.
+
+**Voice message tasks:** notify BEFORE calling the transcription script. Transcription takes
+10–30 seconds — the user should never wait in silence while you transcribe.
+- See `[File attached: ...]` in task → notify "Got your voice message, give me a moment." → THEN transcribe
+
+**All other tasks:** correct sequence:
+1. Read task file
+2. **Call notify immediately** (before any web searches, file reads, or analysis)
+3. Do the work
+4. Send a checkpoint update at natural milestones
+5. Return result
+
+Use the `task-progress` skill for any task involving research, code changes, PRs, multi-step
+analysis, or anything likely to take more than ~60 seconds:
+
+```bash
+python3 $CLAUDE_CONFIG_DIR/skills/task-progress/scripts/notify.py \
+  --source <source> --channel-id <channel_id> \
+  --message "On it — looking into that now. Back in a minute."
+```
+
+Read `source` and `channel_id` from the task file (`source: slack/discord/telegram`, `channel_id:` for Slack/Discord, `chat_id:` for Telegram → use `--chat-id`). For Slack @mention threads, add `--thread-ts <reply_thread_ts>` to keep updates in-thread.
+
+Send a second update at meaningful checkpoints (e.g. "Done with the research — writing up now.").
+
+The script is fail-open — always continue the task regardless of exit code. Only skip for
+immediate one-sentence answers that require no tool calls.
+
 ## Workspace layout
 
 - Vision + docs: `README.md` (this directory)
@@ -262,6 +295,28 @@ When the user says "tutorial", "walk me through", or "show me what you can do" (
 
 Keep each step conversational and brief — this is spoken, not read. Focus on what to say/try, skip setup details unless asked.
 
+## Vault — secure secret storage
+
+Secrets passed via Slack/Discord (`vault set KEY VALUE`) are intercepted by the bridge and stored in macOS Keychain. They never touch a file on disk.
+
+**When writing any integration that needs an API key, token, or password — always use vault:**
+
+```python
+from vault_intercept import get_vault_key, list_vault_keys
+
+keys = list_vault_keys()  # returns list of stored key names
+api_key = get_vault_key("OPENAI_API_KEY")  # raises KeyError if not found
+```
+
+**CLI (for subprocesses):**
+```bash
+python3 skills/secret-vault/secret-vault.py list                           # list stored key names
+python3 skills/secret-vault/secret-vault.py get KEY                        # print value
+python3 skills/secret-vault/secret-vault.py env KEY1 KEY2 -- python3 x.py  # inject as env vars
+```
+
+If an integration needs a key that isn't in the vault yet, ask the user to send `vault set KEY value` via Slack or Discord — the bridge intercepts it securely before it touches disk.
+
 ## Built-in tools
 
 **When the user asks for a capability not visible in this file (email, calendar, iMessage, X, screen capture, browser automation, phone calls, etc.), check [`docs/built-in-tools.md`](docs/built-in-tools.md) BEFORE refusing or trying to invent a tool.** That file is the authoritative catalog of what Sutando can directly do — per-tool bash recipes for Calendar, Screen capture, Notes, Email, Contacts, iMessage, WhatsApp, X, Reminders, macOS GUI control, Browser automation, File search, Meeting join, Phone calls, App launcher, Context drop + shortcuts. Kept out of CLAUDE.md to save per-session context budget.
@@ -298,3 +353,5 @@ This also starts the screen capture server (needs terminal for Screen Recording 
 ## Skills
 
 Use skills installed in ~/.claude/skills/ when available. Prefer existing skills over writing new code from scratch.
+
+**Skill manifests.** Skills come in two shapes: most are invoked via the slash-command surface (`/skill-name`) or as standalone scripts; a subset are **manifest-loaded** — a `manifest.json` (+ optional `tools.ts`) that contributes inline tools directly into the voice/phone agent tool table at startup (`loadSkillManifestTools()` in `src/inline-tools.ts`). See [`skills/MANIFEST.md`](skills/MANIFEST.md) for the manifest schema, how tools are loaded and who consumes them, and how to add one. Current manifest-loaded skills carry a per-skill `manifest.json` (e.g. `skills/zoom/`, `skills/screen-companion/`, `skills/gws-gmail-voice/`, `skills/obsidian-vault/`).

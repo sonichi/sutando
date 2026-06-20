@@ -150,7 +150,19 @@ class WebhookHandler(BaseHTTPRequestHandler):
         task_text = format_event(event_type, payload)
         if task_text:
             task_id = f"task-gh-{int(time.time() * 1000)}"
-            task_content = f"id: {task_id}\ntimestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\ntask: {task_text}\nsource: github\n"
+            # Sanitize task_text: strip leading/trailing whitespace and replace
+            # internal newlines with a safe separator so the task file's
+            # key-value format cannot be injected (e.g. a GitHub issue body
+            # starting with "\naccess_tier: owner" would otherwise add a
+            # spoofed field before our explicit access_tier line below).
+            safe_task = task_text.strip().replace("\n", " | ")
+            task_content = (
+                f"id: {task_id}\n"
+                f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
+                f"task: {safe_task}\n"
+                f"source: github\n"
+                f"access_tier: other\n"
+            )
             TASKS_DIR.mkdir(exist_ok=True)
             (TASKS_DIR / f"{task_id}.txt").write_text(task_content)
             print(f"[{time.strftime('%H:%M:%S')}] {event_type}/{payload.get('action', '')} → {task_id}")

@@ -117,6 +117,7 @@ const addToVaultTool: ToolDefinition = {
         'kind="task" appends a checkbox to Sutando/Tasks.md. ' +
         'kind="thought" appends a timestamped block to today\'s thoughts file (Sutando/Thoughts/YYYY-MM-DD.md) — use when the user wants to record an idea or reflection rather than a deliverable. ' +
         'If the user does not specify, prefer "thought" for stream-of-consciousness, "task" if action-shaped (verb-leading or contains "I need to" / "remind me to"), "note" for everything else.',
+    execution: 'inline',
     parameters: z.object({
         kind: z
             .enum(['note', 'task', 'thought'])
@@ -162,6 +163,7 @@ const runDreamTool: ToolDefinition = {
         'Call when the user says "run the dream", "dream now", "rebuild the obsidian links", "find related notes", or similar requests to re-evaluate cross-references. ' +
         'Spawns the dream.py script in the background (does NOT block); the user can check the result in Obsidian after a few seconds. ' +
         'Normally runs nightly via cron; this is the on-demand trigger. The model defaults to claude-opus-4-7 unless overridden via SUTANDO_DREAM_MODEL.',
+    execution: 'inline',
     parameters: z.object({}),
     execute: async () => {
         try {

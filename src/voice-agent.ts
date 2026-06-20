@@ -27,7 +27,7 @@ import 'dotenv/config';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { existsSync, readFileSync, readdirSync, statSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, openSync, writeSync, closeSync } from 'node:fs';
-import { execSync as execSyncTop } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { inlineTools, coreDocumentedSkills } from './inline-tools.js';
 import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater } from './vision-tools.js';
 import { clearActiveArtifact } from './artifact-cache-tools.js';
@@ -40,6 +40,7 @@ import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
 import { workTool, startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
 import { recordSession, recordToolCall } from './conversation-store.js';
+import { startVoiceTicker, type TickerControl } from './observability/realtime.js';
 import { buildSutandoSystemPrompt, buildVoiceAgentContext } from './voice-context.js';
 import { classifyTransportClose, type ClassifiedClose } from './voice-error-classifier.js';
 
@@ -56,27 +57,26 @@ let generateSpeech: ((text: string, opts: { category: string; label: string }) =
 // Config
 // =============================================================================
 
-// Shape check: a valid Google AI Studio key starts with "AIza" and is
-// typically 39 chars (v1 format). Catches common misconfigurations
-// (truncated paste, wrong variable, stale template value) at startup
-// instead of letting the voice session fail silently on connect.
+// Shape check: catch common misconfigurations (truncated paste, wrong
+// variable, stale template value) at startup instead of letting the voice
+// session fail silently on connect. Do not pin this to a fixed prefix:
+// Google has issued multiple AI Studio API-key formats over time.
 function assertGeminiKey(name: string, value: string): void {
 	if (!value) { console.error(`Error: ${name} is required`); process.exit(1); }
-	// Upper bound of 60 (vs canonical ~39) gives headroom for Google key
-	// format rotations — Mini flagged they rotated once (2020→2023) and a
-	// tight bound would fail-fast on legitimate future keys.
-	const looksValid = value.startsWith('AIza') && value.length >= 35 && value.length <= 60;
+	const looksValid =
+		value === value.trim()
+		&& value.length >= 20
+		&& value.length <= 200
+		&& !/\s/.test(value)
+		&& value !== 'your-gemini-key';
 	if (!looksValid) {
 		// Do NOT interpolate anything derived from `value` into the log —
 		// CodeQL's js/clear-text-logging treats env vars matching the KEY
 		// heuristic as taint sources, and any PropRead of that source
-		// (e.g. `value.length`, `value.startsWith(...)`) flows into the
-		// console.error sink. The previous `${value.length}` + prefix-ok
-		// diagnostic was why #44 wouldn't close after #486. Keep the log
-		// static: name + expected format + remediation URL.
+		// (e.g. `value.length`) flows into the console.error sink. Keep the
+		// log static: name + expected format + remediation URL.
 		console.error(
-			`Error: ${name} does not look like a Google AI Studio key ` +
-			`(expected "AIza..." 35-60 chars). ` +
+			`Error: ${name} does not look like a Google AI Studio key. ` +
 			`Rotate at https://ai.google.dev → "Get API key" and update .env.`
 		);
 		process.exit(1);
@@ -299,9 +299,9 @@ setInterval(applyModeRequest, 1_000);
 
 // Detect active meeting on startup — sync so it runs before first greeting
 try {
-	const zoomRunning = execSyncTop('pgrep -f "zoom.us" 2>/dev/null', { encoding: 'utf-8' }).trim();
+	const zoomRunning = execFileSync('/usr/bin/pgrep', ['-f', 'zoom.us'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
 	if (zoomRunning) {
-		const inMeeting = execSyncTop(`osascript -e 'tell application "System Events" to tell process "zoom.us" to count of windows' 2>/dev/null`, { encoding: 'utf-8' }).trim();
+		const inMeeting = execFileSync('osascript', ['-e', 'tell application "System Events" to tell process "zoom.us" to count of windows'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
 		if (parseInt(inMeeting) >= 2) {
 			meetingActive = true;
 			console.log(`${new Date().toLocaleTimeString()} [Meeting] Detected active Zoom meeting on startup`);
@@ -645,7 +645,7 @@ const mainAgent: MainAgent = {
 		'You handle anything: research, writing, email, scheduling, code, logistics, phone calls, meetings, creative work.',
 		'You can join Google Meet and Zoom meetings, make phone calls, see the user\'s screen, and reach them on Telegram, Discord, web, or phone.',
 		'You can summon a Zoom meeting with screen sharing so the user can work remotely from their phone.',
-		(() => { try { const url = require('node:child_process').execSync('git remote get-url origin', { timeout: 2_000 }).toString().trim().replace(/\.git$/, ''); return `The Sutando GitHub repo is ${url}.`; } catch { return ''; } })(),
+		(() => { try { const url = require('node:child_process').execFileSync('git', ['remote', 'get-url', 'origin'], { timeout: 2_000 }).toString().trim().replace(/\.git$/, ''); return `The Sutando GitHub repo is ${url}.`; } catch { return ''; } })(),
 		'You build a model of the user over time — their preferences, working style, voice, and priorities',
 		'shape everything you do without them having to repeat themselves.',
 		'All of your code was written by your own autonomous build loop.',
@@ -870,6 +870,7 @@ async function main() {
 	const voiceToolIdMap = new Map<string, string>();
 	let voiceSessionStart = Date.now();
 	let metricsWritten = false;
+	let voiceTicker: TickerControl | null = null;
 
 	// Authoritative voice-connection state. web-client reads this file
 	// instead of caching the browser's one-shot POST, so a web-client
@@ -903,6 +904,12 @@ async function main() {
 	writeVoiceState(false);
 
 	function writeVoiceMetrics() {
+		// Spine usage: flush the final partial bucket and clear the interval FIRST,
+		// before the metricsWritten guard. stop() is idempotent (voiceTicker→null),
+		// so a double-flush never double-emits — but doing it before the guard means
+		// a leaked ticker can NEVER keep firing past a flush (otherwise it would emit
+		// phantom voice.seconds every USAGE_TICK_MS during the post-session idle gap).
+		try { voiceTicker?.stop(); voiceTicker = null; } catch {}
 		if (metricsWritten) return;
 		metricsWritten = true;
 		try {
@@ -919,6 +926,21 @@ async function main() {
 		} catch (err) {
 			console.log(`${ts()} [Observability] Failed to write metrics: ${err}`);
 		}
+	}
+
+	// Start (or restart) the realtime usage ticker for a fresh logical session.
+	// Called from BOTH session-reset points: bodhi's onSessionStart (first ACTIVE
+	// transition) AND handleClientConnected's reconnect-reset (bodhi's
+	// onSessionStart never re-fires — see the #1372 note below — so without this
+	// every 2nd+ session in one process would run with no ticker and emit zero
+	// usage). Stops any lingering ticker first (no-op if already flushed to null).
+	function startVoiceUsageTicker() {
+		voiceTicker?.stop();
+		voiceTicker = startVoiceTicker({
+			sessionId: SESSION_ID,
+			model: VOICE_NATIVE_AUDIO_MODEL,
+			toolCallsGetter: () => voiceToolCalls.length,
+		});
 	}
 
 	const session = new VoiceSession({
@@ -939,6 +961,7 @@ async function main() {
 				voiceSessionStart = Date.now(); metricsWritten = false;
 				voiceEvents.length = 0; voiceToolCalls.length = 0; voiceTranscript.length = 0;
 				voiceEvents.push({ event: 'session_started', timestamp: new Date().toISOString() });
+				startVoiceUsageTicker();
 				console.log(`${ts()} [Session] Started: ${e.sessionId}`);
 			},
 			onSessionEnd: (e) => {
@@ -1051,14 +1074,13 @@ async function main() {
 				console.error(`${ts()} [VoiceFailure] proactive write failed: ${(e as Error)?.message ?? e}`);
 			}
 			// OS notification — visible even if no browser tab is open.
-			// Sanitize the message for the AppleScript string literal: drop
-			// double-quotes and backslashes so the shell command can't break.
+			// execFileSync avoids the shell entirely, so no sanitization of
+			// single-quotes or other shell metacharacters is needed. The
+			// double-quote stripping below protects the AppleScript string
+			// literal itself (not the shell).
 			try {
 				const safe = c.userMessage.replace(/["\\]/g, '');
-				execSyncTop(
-					`osascript -e 'display notification "${safe}" with title "Sutando — voice offline"'`,
-					{ stdio: 'ignore' } as any,
-				);
+				execFileSync('osascript', ['-e', `display notification "${safe}" with title "Sutando — voice offline"`], { stdio: 'ignore' });
 			} catch {}
 		};
 		transport.onClose = (code?: number, reason?: string) => {
@@ -1379,6 +1401,9 @@ async function main() {
 				voiceSessionStart = Date.now(); metricsWritten = false;
 				voiceEvents.length = 0; voiceToolCalls.length = 0; voiceTranscript.length = 0;
 				voiceEvents.push({ event: 'session_started:client_connect', timestamp: new Date().toISOString() });
+				// bodhi's onSessionStart won't re-fire (#1372 above), so start the
+				// usage ticker here too — otherwise this reconnect session emits no usage.
+				startVoiceUsageTicker();
 				console.log(`${ts()} [Session] Client connected after prior flush — reset metrics buffer`);
 			}
 			writeVoiceState(true);

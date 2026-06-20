@@ -600,14 +600,14 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 		const inner = t.execute.bind(t);
 		tools[i] = {
 			...t,
-			execute: async (args: any) => {
+			execute: async (args: any, ctx: any) => {
 				const tier = currentTier(s);
 				const ok = toolAllowed(need, tier);
 				if (!ok) {
 					console.log(`${ts()} [Tier] '${t.name}' denied — speaker tier=${tier}, needs ${need}`);
 					return { status: 'denied', message: `That needs ${need}-tier access; the current speaker is ${tier}-tier.` };
 				}
-				return inner(args);
+				return inner(args, ctx);
 			},
 		};
 	}
@@ -628,7 +628,12 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 // so after each utterance we send a brief silence burst to nudge Gemini's
 // VAD past its silenceDurationMs threshold without flooding the WS.
 const SILENCE_20MS_16K_MONO = Buffer.alloc(640); // 320 samples × 2 bytes
-const SILENCE_BURST_FRAMES = 75; // ~1500ms — overshoot Gemini's silenceDurationMs default
+// Length of the post-utterance silence burst, in 20ms frames. Must stay ABOVE
+// Gemini Live's automatic end-of-speech silence window (~1s default) so the
+// burst reliably marks turn-end — but no longer than needed, since every extra
+// frame is added latency before the reply. Default 50 (~1000ms); env-tunable.
+// (Was 75/~1500ms before the 2026-06-09 no-turn-hang fix — see below.)
+const SILENCE_BURST_FRAMES = Number(process.env.SUTANDO_DISCORD_SILENCE_BURST_FRAMES) || 50;
 
 function triggerSilenceBurst(s: DiscordVoiceSession): void {
 	// In-flight guard so overlapping speakers (userA ends → burst starts;
@@ -659,9 +664,11 @@ function triggerSilenceBurst(s: DiscordVoiceSession): void {
 //
 // FIX: only send silence in a short BURST after Discord's
 // EndBehaviorType.AfterSilence fires (i.e. user stopped speaking). The burst
-// is ~1500ms (SILENCE_BURST_FRAMES = 75 frames × 20ms) — set high to overshoot
-// Gemini Live's silenceDurationMs (~1s default) reliably even on a flaky WS,
-// while still terminating instead of flooding silence forever.
+// is ~1000ms (SILENCE_BURST_FRAMES = 50 frames × 20ms by default) — kept just
+// above Gemini Live's silenceDurationMs (~1s default) so it reliably marks
+// turn-end without adding needless latency, and it terminates instead of
+// flooding silence forever. Both the burst length and the upstream
+// AfterSilence window (see subscribeUser) are env-tunable.
 //
 // `triggerSilenceBurst(s)` is called from decoder.on('end') in subscribeUser.
 function startAudioTicker(s: DiscordVoiceSession): void {
@@ -687,8 +694,16 @@ function subscribeUser(s: DiscordVoiceSession, userId: string): void {
 	if (s.subscribedUsers.has(userId)) return;
 	s.subscribedUsers.add(userId);
 
+	// AfterSilence ends the opus sub-stream once the user pauses for this long.
+	// 200ms (the old value) is SHORTER than the natural gaps between words and
+	// phrases, so one spoken sentence fragmented into 5–6 "utterances" — each
+	// firing a silence burst, which interleaved real-speech↔injected-silence
+	// and starved Gemini's auto-VAD into never marking turn-end (the recurring
+	// "[Watchdog] Gemini session hung — no turn" failure). 800ms coalesces
+	// intra-sentence gaps into a single utterance. Env-tunable. (Fix 2026-06-09.)
+	const endSilenceMs = Number(process.env.SUTANDO_DISCORD_END_SILENCE_MS) || 800;
 	const opusStream = s.connection.receiver.subscribe(userId, {
-		end: { behavior: EndBehaviorType.AfterSilence, duration: 200 },
+		end: { behavior: EndBehaviorType.AfterSilence, duration: endSilenceMs },
 	});
 	const decoder = new prism.opus.Decoder({ frameSize: 960, channels: 2, rate: 48000 });
 	// Resample 48k stereo s16le → 16k mono s16le via ffmpeg (anti-aliased).
@@ -818,11 +833,14 @@ async function createVoiceSession(connection: VoiceConnection, client: Client): 
 		host: '127.0.0.1',
 		model: google(VOICE_MODEL),
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
-		googleSearch: DISCORD_VOICE_GOOGLE_SEARCH,
 		speechConfig: { voiceName: 'Aoede' },
-		// Shorten Gemini's end-of-speech silence wait so turn-end (and the
-		// reply) is detected faster. Default ~1s+; env-overridable for tuning.
-		vadConfig: { silenceDurationMs: Number(process.env.SUTANDO_VAD_SILENCE_MS) || 500 },
+		// NOTE: turn-end is governed by Gemini Live's built-in automatic VAD plus
+		// the post-utterance silence burst (see SILENCE_BURST_FRAMES). The bundled
+		// bodhi-realtime-agent build exposes no server-VAD tuning hook, so an
+		// earlier `vadConfig: { silenceDurationMs }` option here was silently
+		// ignored — removed 2026-06-09 to stop implying VAD is tuned. Real
+		// server-VAD tuning needs the newer Bodhi framework (realtimeInputConfig
+		// .automaticActivityDetection); tracked as the Tier-2 upgrade.
 		hooks: {
 			onToolCall: (e) => {
 				console.log(`${ts()} [Tool] ${e.toolName} (${e.execution})`);

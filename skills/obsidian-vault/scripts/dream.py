@@ -44,7 +44,13 @@ from typing import Iterable
 
 import subprocess
 
-import anthropic
+# NOTE: `anthropic` is imported lazily inside run() (the only runtime use site),
+# not at module top. Importing it here makes `dream.py` raise ModuleNotFoundError
+# on hosts without the package whenever the script is invoked — even when the
+# SUTANDO_OBSIDIAN_MIRROR opt-in gate (checked in main()) is OFF and the script
+# should be a clean no-op. The type annotation `anthropic.Anthropic` in
+# judge_pair()'s signature stays valid without a top-level import because
+# `from __future__ import annotations` (above) defers all annotations to strings.
 
 DEFAULT_MODEL = os.environ.get("SUTANDO_DREAM_MODEL", "claude-opus-4-7")
 MAX_TOKENS = 1024
@@ -267,6 +273,8 @@ def run(vault: Path, model: str, dry_run: bool = False) -> int:
         return 0
     pairs = candidate_pairs(notes)
     print(f"[dream] {len(notes)} eligible notes, {len(pairs)} candidate pairs, model={model}", flush=True)
+
+    import anthropic  # lazy: only needed past the opt-in gate (see top-of-file note)
 
     client = anthropic.Anthropic()
     # accumulators per-note: stem -> {tier_label: [(other_stem, rationale)]}

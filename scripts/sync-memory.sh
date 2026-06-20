@@ -37,7 +37,7 @@
 # to ~/.sutando/memory-sync/. The auto-detect handles both the new convention
 # (~/.sutando/memory-sync/) and the legacy convention (~/.sutando-memory-sync/)
 # so a sync clone with this script copied in keeps working through the move.
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SCRIPT_PARENT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Load .env from the sutando workspace early — non-interactive shells (cron,
@@ -361,10 +361,37 @@ for f in "${MACHINE_FILES[@]}"; do
     copy_if_newer "$src" "$MACHINE_DIR/$(basename "$f")"
 done
 
+# Claude Code per-host settings.json (enabled plugins, permission mode, hooks,
+# theme). Per-host + painful to recreate on a rebuild, and carries NO secrets
+# (tokens live in channels/<ch>/.env / Keychain, never here). Sibling to the
+# channel access.json backup — closes the second "unbacked per-host config"
+# gap so a rebuilt host restores its plugin/hook/permission config. Sourced
+# from the Claude Code config dir (CLAUDE_CONFIG_DIR canonical; CLAUDE_HOME
+# legacy; ~/.claude fallback) to work on both new and pre-migration hosts.
+SETTINGS_SRC="${CLAUDE_CONFIG_DIR:-${CLAUDE_HOME:-$HOME/.claude}}/settings.json"
+if [ -f "$SETTINGS_SRC" ]; then
+    copy_if_newer "$SETTINGS_SRC" "$MACHINE_DIR/settings.json"
+fi
+
 # Personal cron schedule (nested path)
 if [ -f "$REPO_DIR/skills/schedule-crons/crons.json" ]; then
     copy_if_newer "$REPO_DIR/skills/schedule-crons/crons.json" \
         "$MACHINE_DIR/crons.json"
+fi
+
+# Channel access-control allowlists (per-host, painful to recreate: the Discord
+# access.json holds the owner/team/other tierMap + allowFrom). Backed up so a
+# rebuilt host can restore its channel onboarding. SECURITY: we glob ONLY
+# `*/access.json` — never `.env`. The bot tokens in channels/<ch>/.env stay
+# local (Keychain/vault) and must NOT reach the repo. Keep this glob exact.
+CHANNELS_SRC="${CLAUDE_HOME:-$HOME/.claude}/channels"
+if [ -d "$CHANNELS_SRC" ]; then
+    for _acc in "$CHANNELS_SRC"/*/access.json; do
+        [ -f "$_acc" ] || continue
+        _ch="$(basename "$(dirname "$_acc")")"
+        mkdir -p "$MACHINE_DIR/channels/$_ch"
+        copy_if_newer "$_acc" "$MACHINE_DIR/channels/$_ch/access.json"
+    done
 fi
 
 # Personal skill dirs (gitignored `skills/personal-*/`) — one rsync PER skill

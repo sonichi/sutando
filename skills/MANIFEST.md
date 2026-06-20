@@ -69,6 +69,20 @@ The two-directory scan lets a user keep personal tools (per-talk highlight maps,
 
 Order: public first, then private. If a private skill shares a tool name with a public one, the unique-name assertion fails at startup — by design, the loader does not silently shadow.
 
+## Config-only manifests (non-tools skills)
+
+A skill that contributes **no** runtime tools may still ship a `manifest.json` purely to **declare config** — omit `tools` and the loader applies `config → process.env` (setdefault) then skips the tools import (step 2 above). This is how a pipeline skill keeps its channel ids / feature flags / toggles out of ad-hoc `os.environ[...]` literals and in one declared place (the `config` block is the source of truth + default).
+
+Precedent: `skills/wire-monitor/manifest.json` (`WIRE_REPORT_CHANNEL`) and `skills/wire-newsroom/manifest.json` (`WIRE_PUBLISH_CHANNEL`, `WIRE_AUTO_PACKAGE`). Their `description` notes "manifest present to DECLARE config per this convention."
+
+How a **pipeline script** (a Python/bash stage that runs *outside* the voice-agent process, so it doesn't inherit the loader's `process.env`) reads a declared value, most specific first:
+
+```
+CLI arg  >  env override  >  manifest.json config[key]  >  another config file (e.g. sources.yaml)  >  a per-host state/<key> file
+```
+
+Read the manifest directly when needed — e.g. `publish-wire-episode.py:manifest_config()` reads `skills/wire-newsroom/manifest.json` `config[key]`; `wire-monitor` uses `${ENV:-$(cat state/wire-report-channel)}`. Never wire a bare invented `os.environ[...]` as the *primary* source.
+
 ## Currently active manifest skills
 
 Run `grep -l '"enabled": true' skills/*/manifest.json "$SUTANDO_MEMORY_DIR/skills"/*/manifest.json` for the live list (legacy users may need `$SUTANDO_PRIVATE_DIR` in place of the new var).
@@ -78,7 +92,7 @@ As of 2026-05-03, the public repo has no manifest-loaded tools shipping by defau
 | Skill | Tools contributed | Notes |
 |---|---|---|
 | `voice-context` | `set_voice_context`, `list_voice_contexts` | Switches the active per-talk voice script via `$SUTANDO_MEMORY_DIR/voice-contexts/active` (legacy `$SUTANDO_PRIVATE_DIR` honored). Restarts voice-agent on switch so the new context loads. |
-| `talk-highlight` | `highlight_slide`, `presenter_mode`, `fullscreen_presenter`, `set_active_slides` | Drives on-stage slide highlights during live talks via the local highlight server (`localhost:7877`). `highlight_slide` glows a topic key and dims siblings; `presenter_mode` toggles the session-level talk flag; `fullscreen_presenter` switches the slide window into fullscreen; `set_active_slides` swaps the deck pointer (`talk-slides/active`) so the same server can drive different decks across a session. |
+| `talk-highlight` | `highlight_slide`, `presenter_mode`, `set_active_slides` | Drives on-stage slide highlights during live talks via the local highlight server (`localhost:7877`). `highlight_slide` glows a topic key and dims siblings; `presenter_mode` toggles the session-level talk flag; `set_active_slides` swaps the deck pointer (`talk-slides/active`) so the same server can drive different decks across a session. (A fourth tool, `fullscreen_presenter`, is defined in the skill but deregistered since 2026-04-25 — core's generic `fullscreen` now auto-branches deck-vs-video, and the overlap confused tool routing; the function is kept for easy re-enable but is not loaded.) |
 | `personal-deictic` | `read_selection` | Reads the macOS selected text + cursor via the `ax-read` Swift binary; foundation for "this/that" deictic edits. |
 | `personal-talk-prep` | (none — script-only skill, invoked via `/personal-talk-prep`) | Listed for completeness; no manifest tools. |
 

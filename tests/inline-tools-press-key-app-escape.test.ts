@@ -47,16 +47,28 @@ describe('inline-tools pressKey app activation — AppleScript injection guard',
 		);
 	});
 
-	it('the escape pattern is computed from app via .replace chain', () => {
-		assert.match(
-			SRC,
-			/safeApp\s*=\s*app\.replace\([\s\S]+?\.replace\([\s\S]+?\.replace\(/,
-			'safeApp must chain at least 3 .replace() calls (backslash, single-quote, double-quote) — see switchAppTool for canonical pattern',
-		);
+	it('the escape pattern is computed from app via .replace chain (AppleScript-only, no shell layer)', () => {
+		// execFileSync bypasses the shell — only AppleScript string literal escaping needed:
+		// backslash and double-quote. Single-quote shell escaping is explicitly NOT required.
 		assert.match(
 			SRC,
 			/safeApp[\s\S]+?\.replace\(\/"\/g,\s*'\\\\"'\)/,
-			'safeApp chain must include `.replace(/"/g, \'\\\\"\')` — the double-quote strip is the actual exploit-vector defense for the `tell application "X"` shape',
+			'safeApp chain must include `.replace(/"/g, \'\\\\"\')` — the double-quote strip is the AppleScript string literal defense for the `tell application "X"` shape',
+		);
+	});
+
+	it('uses execFileSync (not execSync) for osascript calls — no shell layer', () => {
+		// execFileSync passes the AppleScript string as a direct argument to the osascript
+		// binary, bypassing the shell entirely. This is safer than execSync which spawns a
+		// shell and requires shell-level string escaping on top of AppleScript escaping.
+		assert.ok(
+			!SRC.includes("execSync(`osascript") && !SRC.includes('execSync(`osascript'),
+			'inline-tools.ts must not use execSync for osascript — use execFileSync instead',
+		);
+		assert.match(
+			SRC,
+			/execFileSync\('osascript'/,
+			'inline-tools.ts must use execFileSync for osascript calls',
 		);
 	});
 
