@@ -61,8 +61,7 @@ the contributor's own email — that's how the CLA channel works.
 - **OSS contributors** (default): the script does NOT touch your `git
   config`. The CLA gets signed under your real identity. Just make sure your
   `gh` auth and `git config user.email` match the email you want on file.
-- **Chi's fleet** (auto-detected via `/Users/wangchi/.sutando/workspace/` or
-  env `SUTANDO_FLEET_OWNER=chi`): the script sets repo-local
+- **Chi's fleet** (detected via env `SUTANDO_FLEET_OWNER=chi`): the script sets repo-local
   `user.email=4250911+sonichi@users.noreply.github.com` and `user.name=Chi
   Wang` inside the fresh clone so internal demo submissions don't need an
   extra config step.

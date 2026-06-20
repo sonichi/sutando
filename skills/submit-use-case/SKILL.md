@@ -56,8 +56,7 @@ gh calls.
      agent-universe `UseCase` shape so the sync script can later promote it.
    - Identity: **only** set repo-local `user.email` / `user.name` to
      `4250911+sonichi@users.noreply.github.com` / `Chi Wang` when the runner
-     is on Chi's fleet (detected via `/Users/wangchi/.sutando/workspace/`
-     existing OR env `SUTANDO_FLEET_OWNER=chi`). For OSS submitters the
+     is on Chi's fleet (detected via env `SUTANDO_FLEET_OWNER=chi`). For OSS submitters the
      script leaves git config alone so their own identity flows through —
      that's the whole point of CLA-Assistant signing.
    - Commit, push, `gh pr create`. PR body cross-links the issue if one was opened.
