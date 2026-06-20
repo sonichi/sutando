@@ -19,6 +19,42 @@ settings.json, personal skills, avatar. On a rebuild they're gone.
 
 This convention restores the per-host namespace, the revamp way.
 
+## Data model: shared vs per-host
+
+The workspace holds two data classes, and the whole design falls out of keeping
+them separate:
+
+- **Shared data** — core memory (`projects/*/memory/`), `notes/`, `build_log.md`,
+  `pending-questions.md`. Every host reads *and* writes it; all hosts converge to
+  the same content. Synced by the `vault.sync.include` whitelist and **converged
+  via the 3-way merge** `sync-workspace.sh` already does. Two hosts touching the
+  same shared file is an ordinary git merge (a true conflict only if the same
+  lines change concurrently).
+- **Per-host data** — everything under `hosts/<hostname>/` (see table below).
+  **Single-writer:** only the owning host writes its own subtree. Disjoint paths
+  → merging host branches never collides.
+
+## The layered design
+
+Five orthogonal layers, **no shared branch** (each host keeps its own
+`host/<hostname>/<wsId>` ref — push isolation, zero contention):
+
+1. **branch-per-host** — the sync/isolation ref. Each host pushes only its own
+   branch; peers arrive via fetch + 3-way merge.
+2. **`hosts/<hostname>/`** — the per-host namespace. Hostname-qualified, so
+   single-writer and collision-free on pull.
+3. **shared paths, merged** — shared data stays at its shared paths and converges
+   through the existing 3-way merge. Not relocated under `hosts/`.
+4. **sparse-checkout (working-tree view)** — each host *cones* its checkout to
+   shared paths + its own `hosts/<hostname>/`, so peers' subtrees don't clutter
+   the working tree or get edited by accident. **Sparse is a view, not a
+   write-guard** — it controls what materializes, not what a buggy writer can
+   commit. It's ergonomics; the actual guarantee is layers 2 + 5. Optional: a
+   host that never needs peers' subtrees locally barely needs it.
+5. **lint** (`scripts/lint-vault-sync-paths.sh`, #1716) — the enforcement layer.
+   Fails CI if a per-host file is carried outside a hostname-qualified path, so
+   the single-writer invariant can't silently regress.
+
 ## The convention
 
 A single per-host subtree under the workspace:
