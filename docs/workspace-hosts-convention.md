@@ -129,6 +129,29 @@ models today).
    `hosts/<hostname>/`) lands as separate single-concern PRs, one per file class,
    so each is testable in isolation.
 
+## `$CLAUDE_CONFIG_DIR` breakdown
+
+`$CLAUDE_CONFIG_DIR` resolves to `<workspace>/.claude-sutando/` — **inside the
+workspace**, so the same sync machinery reaches it. Sync granularity is
+**per-path via the `vault.sync.include` whitelist**, not all-or-nothing, so the
+three classes coexist under it:
+
+| Path under `$CLAUDE_CONFIG_DIR` | Class | How it syncs |
+| --- | --- | --- |
+| `projects/*/memory/` | **shared** | whitelisted, synced **in place**, merges across hosts ✅ today |
+| `channels/<svc>/access.json`, `settings.json` | **per-host** | per-host by **omission** today (not whitelisted) → kept local, **no backup**. Fix: back up to `hosts/<hostname>/channels/.../access.json` |
+| `channels/<svc>/.env`, tokens | **secret** | hard-denied (`.env*`) — never synced, anywhere |
+
+**The fixed-path constraint (why per-host config is backup-copy, not move):**
+per-host files under `$CLAUDE_CONFIG_DIR` are read by running code from a **fixed
+path** (`$CLAUDE_CONFIG_DIR/channels/discord/access.json`). They cannot sync
+*in place* — every host's copy would collide on the pull-merge. So per-host
+config is **mirrored** into `hosts/<hostname>/…` (carried by `hosts/*/`,
+collision-free), the **live file stays** at its fixed `$CLAUDE_CONFIG_DIR` path,
+and a fresh host **restores from the backup**. Shared files (`memory/`) sync in
+place as before. This is exactly what the per-component relocation PRs (Migration
+step 3) implement.
+
 ## Enforcement
 
 - `vault.sync.include` carries `hosts/*/` (this PR).
