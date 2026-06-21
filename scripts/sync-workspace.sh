@@ -578,7 +578,8 @@ _refuse_staged_secrets() {
 # Non-fatal by construction: every step tolerates failure and the function
 # returns 0, so a snapshot hiccup can never block the push.
 _snapshot_per_host_config() {
-    local _cfg="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+    local _cfg
+    _cfg="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" claude-home-path)" || return 0
     local _host_dir="$WORKSPACE_DIR/hosts/$(_host)"
     mkdir -p "$_host_dir" 2>/dev/null || return 0
 
