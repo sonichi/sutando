@@ -37,6 +37,7 @@ from result_markers import parse_markers  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
+import progress_stream  # noqa: E402  (opt-in owner progress streaming, SUTANDO_PROGRESS_STREAM=1)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 REPO = resolve_workspace()
 TASKS_DIR = REPO / "tasks"
@@ -460,6 +461,100 @@ def _recover_orphan_sending_files() -> int:
     return recovered
 
 
+# --- Opt-in owner progress streaming (Telegram parity with Discord PR #97) ---
+# While a long OWNER task runs, post a `⏳ <step> (Ns)` placeholder and edit it
+# in place from core-status.step, deleting it when the result lands. Reuses the
+# pure policy in progress_stream.py (same thresholds/gates as the Discord bridge).
+# OFF unless SUTANDO_PROGRESS_STREAM=1. Best-effort: any Telegram API error is
+# swallowed so the real result still delivers.
+_progress_msgs: dict = {}        # task_id -> {message_id, chat_id, first, last_edit, last_text} | {"expired": True}
+pending_task_tiers: dict = {}    # task_id -> access_tier; in-memory ONLY → fail-closed on restart
+
+
+def _clear_progress(task_id: str) -> None:
+    """Delete a task's progress placeholder (if any) and drop its tracking.
+    Called when the result is delivered/skipped/given-up so the placeholder
+    doesn't linger next to the real reply."""
+    pending_task_tiers.pop(task_id, None)
+    info = _progress_msgs.pop(task_id, None)
+    if info and info.get("message_id") and info.get("chat_id") is not None:
+        try:
+            api("deleteMessage", chat_id=info["chat_id"], message_id=info["message_id"])
+        except Exception:
+            pass
+
+
+def poll_progress(pending_replies: dict) -> None:
+    """One pass of the progress streamer; called once per main-loop tick.
+    No-op unless SUTANDO_PROGRESS_STREAM=1."""
+    if not progress_stream.stream_enabled():
+        return
+    now = time.time()
+    for task_id, chat_id in list(pending_replies.items()):
+        done = (RESULTS_DIR / f"{task_id}.txt").exists()
+        info = _progress_msgs.get(task_id)
+        if info is not None:
+            if info.get("expired"):
+                continue
+            if done:
+                # Result arrived → remove placeholder; real reply delivers via the loop below.
+                _clear_progress(task_id)
+                continue
+            elapsed = now - info["first"]
+            if progress_stream.placeholder_expired(elapsed):
+                try:
+                    api("deleteMessage", chat_id=chat_id, message_id=info["message_id"])
+                except Exception:
+                    pass
+                _progress_msgs[task_id] = {"expired": True}  # terminal — never re-post
+                continue
+            if progress_stream.should_edit(now, info["last_edit"]):
+                step = progress_stream.current_step(progress_stream.read_core_status(STATE_DIR))
+                text = progress_stream.format_progress(step, elapsed)
+                if text != info.get("last_text"):
+                    try:
+                        api("editMessageText", chat_id=chat_id, message_id=info["message_id"], text=text)
+                    except Exception:
+                        pass
+                    info["last_text"] = text
+                info["last_edit"] = now
+            continue
+        # No placeholder yet for this task.
+        if done:
+            continue  # finished before the threshold — stay silent
+        if task_id not in pending_task_tiers:
+            continue  # tier unknown (e.g. post-restart recovery) → fail-closed, don't stream
+        if not progress_stream.should_stream_task(pending_task_tiers.get(task_id)):
+            continue  # non-owner tier → no placeholder
+        try:
+            created = int(task_id.split("-")[1]) / 1000.0
+        except (ValueError, IndexError):
+            created = now
+        if progress_stream.should_post_placeholder(now - created):
+            step = progress_stream.current_step(progress_stream.read_core_status(STATE_DIR))
+            text = progress_stream.format_progress(step, now - created)
+            resp = api("sendMessage", chat_id=chat_id, text=text)
+            mid = (resp or {}).get("result", {}).get("message_id")
+            if mid:
+                _progress_msgs[task_id] = {
+                    "message_id": mid, "chat_id": chat_id,
+                    "first": created, "last_edit": now, "last_text": text,
+                }
+            else:
+                # Send failed (chat blocked, rate-limited, …). Mark terminal so we
+                # don't re-hammer the API every tick for the rest of the task.
+                _progress_msgs[task_id] = {"expired": True}
+    # GC: drop tracking for tasks no longer pending (delivered through another path).
+    # Sweep BOTH dicts independently — a fast task can have a tier but never a
+    # placeholder, so keying GC only off _progress_msgs would leak its tier.
+    for tid in list(_progress_msgs.keys()):
+        if tid not in pending_replies:
+            _progress_msgs.pop(tid, None)
+    for tid in list(pending_task_tiers.keys()):
+        if tid not in pending_replies:
+            pending_task_tiers.pop(tid, None)
+
+
 def main():
     _single_instance_acquire("telegram-bridge")
     print(f"Telegram bridge started. Polling for messages...", flush=True)
@@ -620,6 +715,7 @@ def main():
                     f"{tg_skill_hints}"
                 )
                 pending_replies[task_id] = chat_id
+                pending_task_tiers[task_id] = "owner"  # telegram is owner-only (allowlist-gated); enables progress streaming
 
                 # Send typing indicator
                 api("sendChatAction", chat_id=chat_id, action="typing")
@@ -704,6 +800,12 @@ def main():
         except Exception as e:
             print(f"  [proactive] poll error: {e}")
 
+        # Opt-in: stream live progress for long owner tasks (no-op unless enabled).
+        try:
+            poll_progress(pending_replies)
+        except Exception as e:
+            print(f"[Telegram] poll_progress error: {e}", flush=True)
+
         # Check for results to send back
         for task_id in list(pending_replies.keys()):
             result_file = RESULTS_DIR / f"{task_id}.txt"
@@ -718,6 +820,7 @@ def main():
                 parsed = parse_markers(reply_text)
                 if any(a.kind == "skip" for a in parsed.actions):
                     print(f"  Skipped (marker): {task_id}", flush=True)
+                    _clear_progress(task_id)  # remove any progress placeholder + tier tracking
                     archive_file(result_file, "results", task_id)
                     task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
                     archive_file(task_file, "tasks", task_id)
@@ -740,9 +843,10 @@ def main():
                     print(f"  Replied to {chat_id}: {parsed.body[:80]}...", flush=True)
                 except Exception as e:
                     print(f"[Telegram] Reply error: {e}", flush=True)
+                _clear_progress(task_id)  # remove any progress placeholder + tier tracking
                 # Archive (not delete) so we can mine patterns later.
                 archive_file(result_file, "results", task_id)
-                task_file = TASKS_DIR / f"{task_id}.txt"
+                task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
                 archive_file(task_file, "tasks", task_id)
 
         time.sleep(1)

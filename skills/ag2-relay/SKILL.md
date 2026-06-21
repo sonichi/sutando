@@ -77,3 +77,11 @@ full-capability tasks to this machine.
 
 Remove the `AG2_REMOTE_TOKEN` line from `.env` and restart — the agent goes
 offline. Tokens are identity credentials: never commit or share them.
+
+## Server contract (device flow)
+
+The browser device-flow needs the relay to expose `POST /connect/start`
+(mint device_code + verify_url), `POST /connect/complete` (the login page
+binds the agent after auth), `POST /connect/poll` (this client retrieves the
+token), and serve the `/connect-page` login page. If those aren't deployed,
+`onboard.sh` falls back to the credential prompt automatically.
