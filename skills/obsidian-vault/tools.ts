@@ -77,7 +77,10 @@ async function writeNote(root: string, title: string | undefined, body: string):
     const file = join(root, 'Sutando', 'Notes', `${slugify(baseTitle)}-${isoCompact(now)}.md`);
     const frontmatter = [
         '---',
-        `title: ${baseTitle.replace(/"/g, '\\"')}`,
+        // double-quoted YAML scalar: escape backslash FIRST, then quote, so
+        // titles with `\`, `"`, or `:` can't break/inject the frontmatter
+        // (CodeQL js/incomplete-sanitization — backslash was unescaped).
+        `title: "${baseTitle.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`,
         `created: ${now.toISOString()}`,
         'source: sutando',
         '---',
