@@ -72,13 +72,41 @@ MEMORY_DIR = Path(os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir()))
 # Checks
 # ---------------------------------------------------------------------------
 
-def check_port(port: int, name: str) -> dict:
-    """Check if a port is listening."""
+def check_port(port: int, name: str, probe: bool = False) -> dict:
+    """Check if a port is listening, optionally probing for a live response.
+
+    A wedged server can keep its listen socket open while never answering
+    (2026-06-10: voice-agent accepted TCP for 26h with a dead event loop, so
+    the dashboard's WS connect hung forever). With probe=True, send a minimal
+    HTTP GET and require *any* response bytes — a healthy HTTP server replies
+    with a status line and a healthy WS server replies 400/426 to a plain GET,
+    while a wedged one sends nothing.
+    """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(2)
             result = s.connect_ex(("127.0.0.1", port))
             up = result == 0
+            if up and probe:
+                try:
+                    # 10s: dashboard.py takes ~3.5s to first byte (collects
+                    # data via subprocesses before responding). Wedged servers
+                    # never send anything, so the verdict is still decisive.
+                    s.settimeout(10)
+                    # Probe an unknown path, NOT "/": dashboard's "/" collects
+                    # data including a health-check.py subprocess — probing it
+                    # from health-check recursed (probe → render → health-check
+                    # → probe …) and amplified into a request storm. A 404 is
+                    # still response bytes, which is all liveness needs.
+                    s.sendall(f"GET /__liveness_probe__ HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n".encode())
+                    if not s.recv(1):
+                        raise TimeoutError("no response bytes")
+                except Exception:
+                    return {
+                        "name": name,
+                        "status": "wedged",
+                        "detail": f"port {port} listening but unresponsive — restart needed",
+                    }
         return {"name": name, "status": "ok" if up else "down", "detail": f"port {port}"}
     except Exception as e:
         return {"name": name, "status": "error", "detail": str(e)}
@@ -935,7 +963,7 @@ def run_all_checks() -> list[dict]:
     checks = []
 
     # Core services (required)
-    voice_check = check_port(9900, "voice-agent")
+    voice_check = check_port(9900, "voice-agent", probe=True)
     if voice_check["status"] == "ok":
         mark_stale_if_outdated(voice_check, REPO_DIR / "src" / "voice-agent.ts", "voice-agent.ts")
     checks.append(voice_check)
@@ -943,17 +971,19 @@ def run_all_checks() -> list[dict]:
     checks.append(check_voice_transport(voice_check))
     checks.append(check_bodhi_dist())
 
-    web_check = check_port(8080, "web-client")
+    web_check = check_port(8080, "web-client", probe=True)
     if web_check["status"] == "ok":
         mark_stale_if_outdated(web_check, REPO_DIR / "src" / "web-client.ts", "web-client.ts")
     checks.append(web_check)
 
     # Optional services (downgrade missing to warning, not failure)
     for port, name in [(7843, "agent-api"), (7844, "dashboard"), (7845, "screen-capture")]:
-        c = check_port(port, name)
-        if c["status"] != "ok":
+        c = check_port(port, name, probe=True)
+        if c["status"] == "down":
             c["status"] = "warn"
             c["detail"] = "not running (optional)"
+        # "wedged" is NOT downgraded: listening-but-dead is worse than down —
+        # startup.sh's lsof guard sees the port as occupied and won't restart it.
         checks.append(c)
 
     # macOS TCC — must come before critical-file checks so if TCC is blocking
