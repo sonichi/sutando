@@ -190,9 +190,14 @@ def get_reminders() -> list[str]:
         if r.returncode != 0:
             return []
         items = []
+        # reminders.py prints the human-readable sentinel "No reminders."
+        # (exit 0) when the due-today list is empty — skip it so the empty
+        # state doesn't get counted as a single reminder and rendered as
+        # "Reminders due: No reminders.".
+        empty_sentinels = {"no reminders.", "no reminders"}
         for line in r.stdout.splitlines():
             line = line.strip()
-            if line and not line.startswith("#"):
+            if line and not line.startswith("#") and line.lower() not in empty_sentinels:
                 items.append(line)
         return items[:5]
     except (subprocess.TimeoutExpired, OSError):
