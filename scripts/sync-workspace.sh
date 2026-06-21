@@ -562,6 +562,43 @@ _refuse_staged_secrets() {
     return 0
 }
 
+# Snapshot the per-host config that LIVES at $CLAUDE_CONFIG_DIR into
+# <workspace>/hosts/<host>/ so it's carried by the hosts/*/ vault glob and
+# survives a rebuild. settings.json and channel access.json are owned by Claude
+# Code / the bridges at $CLAUDE_CONFIG_DIR — they can't be relocated, so they're
+# *backed up* here (the live readers keep reading $CLAUDE_CONFIG_DIR; hosts/<host>/
+# is a pure backup → no read/write skew).
+#
+# NOT snapshotted: PERSONAL_CLAUDE.md / stand-identity.json / tab-aliases.json —
+# those follow the RELOCATION model (migrator one-time move + personal_path /
+# CLAUDE.md readers that prefer hosts/<host>/). Snapshotting them would make the
+# reader prefer a stale snapshot over the live root file.
+#
+# Secret-safe: copies ONLY access.json, never the sibling .env (bot tokens).
+# Non-fatal by construction: every step tolerates failure and the function
+# returns 0, so a snapshot hiccup can never block the push.
+_snapshot_per_host_config() {
+    local _cfg
+    _cfg="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" claude-home-path)" || return 0
+    local _host_dir="$WORKSPACE_DIR/hosts/$(_host)"
+    mkdir -p "$_host_dir" 2>/dev/null || return 0
+
+    if [ -f "$_cfg/settings.json" ]; then
+        cp -p "$_cfg/settings.json" "$_host_dir/settings.json" 2>/dev/null || true
+    fi
+
+    # Channel access.json only (allowlists / TOFU / tier-maps). Never the
+    # sibling .env — that's a hard-denied secret.
+    local _ch _svc
+    for _ch in "$_cfg"/channels/*/access.json; do
+        [ -f "$_ch" ] || continue
+        _svc="$(basename "$(dirname "$_ch")")"
+        mkdir -p "$_host_dir/channels/$_svc" 2>/dev/null || continue
+        cp -p "$_ch" "$_host_dir/channels/$_svc/access.json" 2>/dev/null || true
+    done
+    return 0
+}
+
 # Guard against running push/pull on a workspace that has a `.git` directory
 # but was never properly sync-initialized. Without this, a stray `.git` (from
 # a half-completed prior init, a backup restore, or operator-`git init` for
@@ -993,6 +1030,10 @@ _push_only_impl() {
     # rationale + the 2026-06-04 leak fix that motivated moving it there).
     # Heal rules + untrack newly-excluded BEFORE staging; sweep staged
     # credential-shaped paths AFTER (see the two functions' rationale).
+    # Back up per-host config ($CLAUDE_CONFIG_DIR settings.json + channel
+    # access.json) into hosts/<host>/ before staging, so it's carried + survives
+    # a rebuild. Non-fatal: never blocks the push.
+    _snapshot_per_host_config || color_warn "sync-workspace: per-host config snapshot failed (non-fatal); push continues"
     _enforce_carrier_set_pre
     git add -A
     _refuse_staged_secrets
