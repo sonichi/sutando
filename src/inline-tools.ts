@@ -7,7 +7,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync, statSync, mkdirSync } from 'node:fs';
-import { join, extname, dirname } from 'node:path';
+import { join, extname, dirname, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
@@ -1006,6 +1006,22 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 		const expanded = privateRoot.replace(/^~/, process.env.HOME || '');
 		dirsToScan.push(join(expanded, 'skills'));
 	}
+	// External plugin checkouts: an optional voice-surface plugin can live
+	// ENTIRELY in its own sibling repo, so this host keeps no in-repo copy and
+	// names no plugin. Mirrors src/discord-bridge.py's hook loader — scan
+	// $SUTANDO_EXTERNAL_PLUGIN_DIRS (os.pathsep-separated) + every sibling
+	// checkout's skills/. The dedupe-by-name below makes a stray duplicate safe.
+	for (const d of (process.env.SUTANDO_EXTERNAL_PLUGIN_DIRS || '').split(delimiter)) {
+		if (d.trim()) dirsToScan.push(join(d.trim(), 'skills'));
+	}
+	try {
+		const siblingsRoot = dirname(REPO_ROOT); // dir holding sibling checkouts
+		const ownSkills = join(REPO_ROOT, 'skills');
+		for (const sib of readdirSync(siblingsRoot)) {
+			const sibSkills = join(siblingsRoot, sib, 'skills');
+			if (sibSkills !== ownSkills && existsSync(sibSkills)) dirsToScan.push(sibSkills);
+		}
+	} catch { /* siblings root unreadable — skip */ }
 	const owner: ToolDefinition[] = [];
 	const anyCaller: ToolDefinition[] = [];
 	for (const skillsDir of dirsToScan) {
@@ -1045,10 +1061,25 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 			}
 		}
 	}
-	return { owner, anyCaller };
+	// Dedupe by tool name (last-write-wins, matching the public→workspace→private
+	// scan order). The SAME skill present in two scanned dirs, or two skills
+	// declaring the same tool name (e.g. summon/dismiss/copres_*), otherwise yields
+	// duplicate names → assertUniqueToolNames(inlineTools) throws at module load →
+	// Gemini 3.1 Live closes with 1011 at setup → voice / plugin surfaces can't start.
+	// See reference_gemini_1011_tool_name_conflict.
+	const dedupeByName = (arr: ToolDefinition[]): ToolDefinition[] => {
+		const byName = new Map<string, ToolDefinition>();
+		for (const t of arr) byName.set(t.name, t);
+		return [...byName.values()];
+	};
+	return { owner: dedupeByName(owner), anyCaller: dedupeByName(anyCaller) };
 }
 const personalTools = await loadSkillManifestTools();
-const personalAllTools = [...personalTools.owner, ...personalTools.anyCaller];
+// Also dedupe across the owner+anyCaller union (a tool declared in both tiers).
+const personalAllTools = (() => {
+	const seen = new Set<string>();
+	return [...personalTools.owner, ...personalTools.anyCaller].filter(t => (seen.has(t.name) ? false : (seen.add(t.name), true)));
+})();
 
 // Manifest-driven discovery of skills that core (not voice-inline) runs.
 // When a manifest has `documented_for_core: true` and a `core_description`,

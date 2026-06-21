@@ -171,7 +171,7 @@ export function _isVoiceTask(taskId: string): boolean {
  * (issue #1035, follow-up to PR #1033). Returns true iff the filename is one
  * that task-bridge legitimately delivers via `onResult()`. Rejects everything
  * else — most importantly, the new `<channel-key>.task-{id}.txt` namespace
- * PR #1033 introduced for the per-channel pull path (discord-voice / phone),
+ * PR #1033 introduced for the per-channel pull path (phone / plugin surfaces),
  * which the per-channel scanner consumes itself.
  *
  * `proactive-*` IS allowed: per the long-standing proactive-voice rule,
@@ -797,7 +797,7 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 				// the fallthrough below fires onResult() for any non-empty .txt
 				// when the voice client is connected. PR #1033 introduced a new
 				// filename namespace `<channel-key>.task-{id}.txt` for the
-				// per-channel pull path used by discord-voice / phone — those
+				// per-channel pull path used by phone / plugin surfaces — those
 				// files are NOT meant for task-bridge to inject into voice.
 				// PR #1033's mitigation is the per-channel scanner's
 				// read-and-delete winning the race; this guard closes the

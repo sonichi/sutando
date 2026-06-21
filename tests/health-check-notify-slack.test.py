@@ -76,7 +76,7 @@ def case_b_on_demand_only_no_send() -> list[str]:
         state = Path(td) / "slack.json"
         hc.notify_slack_for_failures(
             make_checks(
-                ("warn", "discord-voice", "not running (on-demand)"),
+                ("warn", "plugin-server", "not running (on-demand)"),
                 ("warn", "conversation-server", "not running (on-demand)"),
             ),
             state_file=state, sender=send,
@@ -90,7 +90,7 @@ def case_c_filter_keeps_actionable() -> list[str]:
     fails = []
     checks = make_checks(
         ("warn", "core-proactive-loop", "running for 900s on 'triage' — last heartbeat > 600s ago"),
-        ("warn", "discord-voice", "not running (on-demand)"),
+        ("warn", "plugin-server", "not running (on-demand)"),
         ("warn", "task-queue", "5 tasks queued, oldest 700s — watcher or core may be stuck"),
         ("down", "voice-agent", "port 9900"),
         ("ok", "web-client", "port 3100"),

@@ -17,7 +17,7 @@
 //   3. `voice-mode.txt` on disk — NOT READ here. It is the WRITE-ONLY
 //      output mirror of `meetingActive`, written by writeVoiceModeSentinel()
 //      whenever meetingActive changes. Downstream consumers (web-client,
-//      Sutando.app menu-bar, discord-voice-server) read it. Reading it here
+//      Sutando.app menu-bar, plugin voice servers) read it. Reading it here
 //      would re-read our own output — same source as #1, one hop later.
 //   4. `activeMode` in skills/screen-companion/tools.ts — NOT READ here.
 //      Orthogonal sub-mode that overlays the base; not a base mode itself.

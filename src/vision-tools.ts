@@ -242,6 +242,21 @@ let ticker: NodeJS.Timeout | null = null;
 let activeSource: VisionSource | null = null;
 let inFlight = false;
 let frameCount = 0;
+// Consecutive-failure backoff (2026-06-10): when screencapture keeps failing
+// (permission lost, display asleep, source gone) tick() used to log a frame
+// error EVERY interval — 1-2/s, hundreds of lines (observed 23:08 tonight) —
+// while uselessly re-shelling the broken command. Count consecutive failures:
+// log only the 1st + a periodic heartbeat, and auto-stop the stream after the
+// threshold so a dead source self-cleans instead of spamming forever.
+let consecutiveFrameErrors = 0;
+// Note: parse THEN validate — `Number(env || 30)` would coerce the string
+// first, so SUTANDO_VISION_FAIL_STOP=0 → threshold 0 (stop on first transient
+// failure) and ="abc" → NaN (never stop). Guard with isFinite + >0. (Maddy
+// review of 4b7f967c, 2026-06-10.)
+const VISION_FAIL_STOP_THRESHOLD = (() => {
+	const t = Number(process.env.SUTANDO_VISION_FAIL_STOP);
+	return Number.isFinite(t) && t > 0 ? t : 30;
+})();
 let startedAt = 0;
 // Push mode: the web-client owns capture (via getDisplayMedia, so the user
 // gets the native "Chrome Tab / Window / Entire Screen" picker) and POSTs
@@ -460,12 +475,49 @@ async function tick(): Promise<void> {
 	inFlight = true;
 	try {
 		const r = await captureAndSend(activeSource);
-		if (r.ok) frameCount++;
-		else console.error(`${ts()} [Vision] tick skipped: ${r.error}`);
+		if (r.ok) {
+			frameCount++;
+			if (consecutiveFrameErrors > 0) {
+				console.log(`${ts()} [Vision] frame capture recovered after ${consecutiveFrameErrors} failure(s)`);
+				consecutiveFrameErrors = 0;
+			}
+		} else {
+			noteFrameFailure(r.error ?? 'tick skipped');
+		}
 	} catch (err) {
-		console.error(`${ts()} [Vision] frame error: ${(err as Error)?.message ?? err}`);
+		noteFrameFailure((err as Error)?.message ?? String(err));
 	} finally {
 		inFlight = false;
+	}
+}
+
+// Rate-limited failure logging + auto-stop. Log the 1st failure and then only
+// every 10th (heartbeat), never per-tick; stop the stream entirely once a
+// source has been failing continuously past the threshold (the screen-share is
+// effectively dead — capturing a broken source is just CPU + log noise).
+function noteFrameFailure(msg: string): void {
+	consecutiveFrameErrors++;
+	if (consecutiveFrameErrors === 1 || consecutiveFrameErrors % 10 === 0) {
+		console.error(`${ts()} [Vision] frame error (${consecutiveFrameErrors} consecutive): ${msg}`);
+	}
+	if (consecutiveFrameErrors >= VISION_FAIL_STOP_THRESHOLD) {
+		console.error(`${ts()} [Vision] ${consecutiveFrameErrors} consecutive frame errors — stopping stream (source unavailable: ${msg})`);
+		stopStream();
+		consecutiveFrameErrors = 0;
+		// Tell the live session vision died, IN-BAND (Maddy review note #2,
+		// 2026-06-10): without this the agent keeps believing it can see the
+		// screen and may answer "what's on screen" from a stale/empty frame.
+		// transport.sendContent is the same drain path the work-tool results
+		// use, so the notice lands as a normal user turn.
+		try {
+			const t = sessionRef?.transport;
+			if (t?.sendContent) {
+				t.sendContent([{ role: 'user', text: '[System: the screen share / camera feed stopped — you can no longer see it. If the user asks what you see, tell them the view dropped and ask them to re-share; do not answer from a previous frame.]' }], true);
+				console.log(`${ts()} [Vision] notified session that the feed dropped`);
+			}
+		} catch (e) {
+			console.error(`${ts()} [Vision] failed to notify session of feed drop: ${(e as Error)?.message ?? e}`);
+		}
 	}
 }
 
@@ -564,6 +616,10 @@ export const startVisionTool: ToolDefinition = {
 		}
 	},
 };
+
+// A plugin-contributed screen-share tool (manifest-loaded) is a thin wrapper
+// over the exported startStreaming() primitive below; the host keeps no
+// plugin-specific footprint here (#1720).
 
 export const stopVisionTool: ToolDefinition = {
 	name: 'stop_vision',
