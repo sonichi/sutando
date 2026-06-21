@@ -21,6 +21,7 @@ from urllib.error import URLError
 
 sys.path.insert(0, str(Path(__file__).parent))
 from workspace_default import resolve_workspace  # noqa: E402
+from util_paths import personal_path  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 RESULTS_DIR = WORKSPACE / "results"
@@ -228,7 +229,7 @@ def get_overnight_discord() -> list[str]:
 
 def get_pending_questions() -> list[str]:
     """Return unanswered questions from pending-questions.md."""
-    pq = WORKSPACE / "pending-questions.md"
+    pq = personal_path("pending-questions.md", WORKSPACE)
     if not pq.exists():
         return []
     content = pq.read_text()
