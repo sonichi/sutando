@@ -3405,14 +3405,26 @@ async def poll_results():
                         target_channel_id = int(_redirect_action.value)
                         task_tier = "other"
                         # The core agent may have already moved the processed
-                        # task into tasks/archive/ before we pick up the result
+                        # task out of the live dir before we pick up the result
                         # (2026-06-10: an owner [channel:] forward was dropped
                         # because the gate read tier from a path that no longer
-                        # existed and failed safe to "other"). Check both.
-                        for _tier_path in (
+                        # existed and failed safe to "other"). A processed task
+                        # can be in four places — mirror _isVoiceTask's set
+                        # (task-bridge.ts): live, processed/, legacy flat
+                        # archive/, and the active month-partitioned
+                        # archive/YYYY-MM/ (qingyun review, #1710).
+                        _tier_candidates = [
                             TASKS_DIR / f"{task_id}.txt",
-                            TASKS_DIR / "archive" / f"{task_id}.txt",
-                        ):
+                            TASKS_DIR / "processed" / f"{task_id}.txt",
+                        ]
+                        if ARCHIVE_TASKS_DIR.is_dir():
+                            _tier_candidates.append(ARCHIVE_TASKS_DIR / f"{task_id}.txt")
+                            _tier_candidates += [
+                                m / f"{task_id}.txt"
+                                for m in sorted(ARCHIVE_TASKS_DIR.iterdir())
+                                if m.is_dir() and re.fullmatch(r"\d{4}-\d{2}", m.name)
+                            ]
+                        for _tier_path in _tier_candidates:
                             try:
                                 task_body = _tier_path.read_text()
                             except Exception:
@@ -3421,7 +3433,7 @@ async def poll_results():
                                 if ln.startswith("access_tier:"):
                                     task_tier = ln.split(":", 1)[1].strip() or "other"
                                     break
-                            break  # first readable file wins; missing both → "other"
+                            break  # first readable file wins; missing all → "other"
                         if task_tier != "owner":
                             print(
                                 f"  [channel-redirect] dropped — tier '{task_tier}' is not owner "
