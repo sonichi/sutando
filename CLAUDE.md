@@ -70,7 +70,7 @@ For full details on resolution order, overrides, and the protection layers (pre-
 
 ## Personal overrides
 
-If `PERSONAL_CLAUDE.md` exists in the workspace root, read and follow it. It contains user-specific rules, preferences, and configuration that override or extend these shared instructions.
+If `PERSONAL_CLAUDE.md` exists, read and follow it. It contains user-specific rules, preferences, and configuration that override or extend these shared instructions. Resolve it **per-host first**: prefer `<workspace>/hosts/<hostname>/PERSONAL_CLAUDE.md` (where `<hostname>` = `hostname | sed 's/\..*//'`, matching the `hosts/<hostname>/` per-host convention), and fall back to the workspace root if the per-host file does not exist. The per-host location is the canonical home (it's carried + backed up under the `hosts/*/` vault glob); the workspace-root fallback preserves pre-`hosts/` behavior.
 
 ## Work Status
 
