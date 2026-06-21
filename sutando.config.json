@@ -18,7 +18,6 @@
       "include": [
         "notes/",
         "pending-questions.md",
-        "build_log.md",
         "hosts/*/",
         ".claude-sutando/projects/*/memory/"
       ],
