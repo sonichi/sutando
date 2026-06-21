@@ -40,6 +40,7 @@ from typing import Optional
 # reinvented-fallback bug class as core_heartbeat.py (fixed alongside).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
+from util_paths import personal_path  # noqa: E402
 
 
 TASK_ID_RE = re.compile(r"^task-(.+)\.txt$")
@@ -166,7 +167,7 @@ def _write_result_mirror(vault: Path, result_path: Path) -> bool:
 
 
 def _mirror_asks(vault: Path, workspace: Path) -> bool:
-    src = workspace / "pending-questions.md"
+    src = personal_path("pending-questions.md", workspace)
     if not src.exists():
         return False
     dest = vault / "Sutando" / "Agent" / "Asks.md"
@@ -232,7 +233,7 @@ def sweep(vault: Path, workspace: Path, since_seconds: Optional[int] = None) -> 
             if _mirror_note(vault, p):
                 counts["notes"] += 1
 
-    asks_src = workspace / "pending-questions.md"
+    asks_src = personal_path("pending-questions.md", workspace)
     if asks_src.exists() and (not cutoff or _within_window(asks_src, cutoff)):
         if _mirror_asks(vault, workspace):
             counts["asks"] = 1
