@@ -169,6 +169,51 @@ def check_memory_sync() -> dict:
     return {"name": name, "status": "ok", "detail": "initialized, never fetched"}
 
 
+def check_host_subtrees() -> dict:
+    """Surface per-host subtrees (hosts/<host>/) that have stopped syncing.
+
+    Under the hosts/<hostname>/ convention each host writes only its own
+    subtree, so the newest file mtime in a subtree is that host's last sync. A
+    subtree not updated in SUTANDO_STALE_HOST_DAYS days means that host went
+    quiet (crashed, decommissioned, or sync broke) — surface it rather than
+    letting it silently rot (a gap in both the old machine-<host>/ model and the
+    new one until now). Read-only.
+    """
+    name = "host-subtrees"
+    hosts_dir = WORKSPACE_DIR / "hosts"
+    if not hosts_dir.is_dir():
+        return {"name": name, "status": "ok", "detail": "no hosts/ subtree yet"}
+    try:
+        stale_days = float(os.environ.get("SUTANDO_STALE_HOST_DAYS", "7"))
+    except ValueError:
+        stale_days = 7.0
+    subtrees = [d for d in sorted(hosts_dir.iterdir()) if d.is_dir()]
+    if not subtrees:
+        return {"name": name, "status": "ok", "detail": "hosts/ present, no host subtrees"}
+    now = time.time()
+    stale, fresh = [], 0
+    for d in subtrees:
+        newest = 0.0
+        for f in d.rglob("*"):
+            try:
+                if f.is_file():
+                    newest = max(newest, f.stat().st_mtime)
+            except OSError:
+                continue
+        if newest == 0.0:
+            continue  # empty subtree — nothing to age
+        age_d = (now - newest) / 86400
+        if age_d > stale_days:
+            stale.append(f"{d.name} ({age_d:.0f}d)")
+        else:
+            fresh += 1
+    if stale:
+        return {"name": name, "status": "warn",
+                "detail": f"{len(stale)} host subtree(s) stale (>{stale_days:.0f}d): "
+                          f"{', '.join(stale)} — host stopped syncing?"}
+    return {"name": name, "status": "ok", "detail": f"{fresh} host subtree(s), all synced <{stale_days:.0f}d"}
+
+
 def check_tcc_documents_access() -> dict:
     """Detect macOS TCC denial of Documents-folder access (issue #709).
 
@@ -988,6 +1033,9 @@ def run_all_checks() -> list[dict]:
 
     # Memory sync
     checks.append(check_memory_sync())
+
+    # Per-host subtree freshness (hosts/<host>/ stopped syncing?)
+    checks.append(check_host_subtrees())
 
     # Phone conversation server (optional — only check if Twilio configured and not skipped)
     env_path = REPO_DIR / ".env"
