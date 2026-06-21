@@ -189,7 +189,6 @@ That would lose tasks that legitimately arrived in the gap between previous sess
 
 - **#1048 (merged)** — VasiliyRad's Discord delivery-idempotency sentinel. The `.sending` files orphan-check reads at step 2 come from this PR. Keeps.
 - **#1049 (merged)** — VasiliyRad's attempts-counter. Becomes redundant with this skill. Recommend revert: drop `task_bump_attempts.py`, remove watcher's bump-on-emit hook, drop the `attempts:` field from task file format (back-compat: agents can ignore the field if present in older task files).
-- **#1056 (merged)** — Lucy's catchup-after-startup. Complementary: catchup READS state (briefing); orphan-check MUTATES state (archives + recovers). Both fire from `/startup` step 1 and step 2 respectively.
 - **#1066 (still open as of skill draft)** — VasiliyRad's bumper in-place-write fix. Becomes moot if #1049 is reverted. Recommend close as "superseded by /task-orphan-check."
 - **#1072 (this PR's sibling)** — `/startup` skill. Invokes `/task-orphan-check` as step 2 if installed.
 

@@ -22,11 +22,6 @@
 # kill), which runs at every session start.  See the original #1061 /
 # #1063 / #1065 thread for the orphan-watcher background.
 #
-# Note: Lucy's #1056 ships a SEPARATE installer for the SessionEnd hook
-# (skills/catchup-after-startup/scripts/install-hook.sh).  Those events
-# don't overlap with this script's PreCompact + Stop entries, so the two
-# installers are independent.  Run both on a fresh Mac.
-#
 # Idempotent: re-running is safe.  Existing hook entries with the same
 # command string are detected per-hook and not re-added.  jq + tmp+mv for
 # atomic write.
