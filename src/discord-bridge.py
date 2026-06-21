@@ -61,30 +61,106 @@ from util_paths import shared_personal_path  # noqa: E402
 from task_priority import default_priority_for_source  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
+import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 REPO = resolve_workspace()
 
-# discord-voice "magic word" join trigger (issue: za-warudo summon). The
-# bridge stays a THIN hook — it only detects "owner + join phrase" and hands
-# off to this helper, which owns the voice-channel resolution + server launch
-# + already-running guard. Keeping the feature logic in the skill honors the
-# CLAUDE.md core/skill split (core must not bloat with feature logic). The
-# import is best-effort: if the discord-voice skill is absent, the magic word
-# simply doesn't fire and the message is processed as a normal task.
-try:
-    sys.path.insert(
-        0, str(Path(__file__).resolve().parent.parent / "skills" / "discord-voice" / "scripts")
-    )
-    from join_trigger import (  # noqa: E402
-        message_is_join_phrase as _dv_message_is_join_phrase,
-        handle_join_trigger as _dv_handle_join_trigger,
-    )
-except Exception:  # pragma: no cover - skill optional
-    def _dv_message_is_join_phrase(text):  # type: ignore
-        return False
+# Generic plugin message-hook loader. The bridge stays a THIN, plugin-AGNOSTIC
+# host: it names no specific plugin. At startup it scans plugin directories for a
+# manifest.json declaring a `message_hook`, imports the named module, and binds
+# its match/handle callables. A plugin (e.g. one living in a sibling repo)
+# registers a "this text triggers me -> handle it" hook without
+# the bridge hardcoding anything about it. Best-effort: a missing/disabled plugin
+# contributes no hook and messages flow as normal tasks. Honors the CLAUDE.md
+# core/skill split (no feature logic in core).
+#
+# manifest.json shape:
+#   "message_hook": {"module": "scripts/foo.py", "matches": "fn_a", "handle": "fn_b"}
+# where matches(text)->bool and handle(message, self_user_id)->str.
+#
+# Search dirs: $SUTANDO_EXTERNAL_PLUGIN_DIRS (os.pathsep-separated), each sibling
+# checkout's skills/ (../<repo>/skills), the in-repo skills/, the workspace skills/.
+def _load_plugin_message_hooks():
+    hooks = []
+    here = Path(__file__).resolve()
+    search = []
+    for d in os.environ.get("SUTANDO_EXTERNAL_PLUGIN_DIRS", "").split(os.pathsep):
+        if d.strip():
+            search.append(Path(d.strip()))
+    siblings_root = here.parent.parent.parent  # dir that holds sibling checkouts
+    try:
+        if siblings_root.is_dir():
+            for sib in sorted(siblings_root.iterdir()):
+                if (sib / "skills").is_dir():
+                    search.append(sib / "skills")
+    except Exception:
+        pass
+    search.append(here.parent.parent / "skills")
+    try:
+        search.append(Path(str(REPO)) / "skills")
+    except Exception:
+        pass
+    seen_modules, seen_dirs = set(), set()
+    for base in search:
+        try:
+            if not base.is_dir() or str(base) in seen_dirs:
+                continue
+        except Exception:
+            continue
+        seen_dirs.add(str(base))
+        for sub in sorted(base.iterdir()):
+            mf = sub / "manifest.json"
+            if not mf.is_file():
+                continue
+            try:
+                manifest = json.loads(mf.read_text())
+            except Exception:
+                continue
+            if not manifest.get("enabled", False):
+                continue
+            spec = manifest.get("message_hook")
+            if not isinstance(spec, dict):
+                continue
+            mod_rel, matches_name, handle_name = spec.get("module"), spec.get("matches"), spec.get("handle")
+            if not (mod_rel and matches_name and handle_name):
+                continue
+            mod_path = (sub / mod_rel).resolve()
+            if not mod_path.is_file() or str(mod_path) in seen_modules:
+                continue
+            try:
+                sys.path.insert(0, str(mod_path.parent))
+                mod = __import__(mod_path.stem)
+                matches = getattr(mod, matches_name, None)
+                handle = getattr(mod, handle_name, None)
+                if callable(matches) and callable(handle):
+                    seen_modules.add(str(mod_path))
+                    name = manifest.get("name", sub.name)
+                    hooks.append((name, matches, handle))
+                    print(f"  [plugin-hook] loaded message-hook from '{name}' ({mod_path.name})", flush=True)
+            except Exception as e:  # pragma: no cover - plugin optional
+                print(f"  [plugin-hook] failed to load {mod_path}: {e}", flush=True)
+    return hooks
 
-    def _dv_handle_join_trigger(message):  # type: ignore
-        return ""
+
+_PLUGIN_MSG_HOOKS = _load_plugin_message_hooks()
+
+
+def _plugin_message_reply(text, message, self_user_id=None):
+    """If any plugin's message-hook matches `text`, run its handler and return
+    (True, reply). Generic — no plugin is named here. (False, "") if none match."""
+    for name, matches, handle in _PLUGIN_MSG_HOOKS:
+        try:
+            if not matches(text):
+                continue
+        except Exception as e:
+            print(f"  [plugin-hook:{name}] match raised: {e}", flush=True)
+            continue
+        try:
+            return True, (handle(message, self_user_id) or "")
+        except Exception as e:
+            print(f"  [plugin-hook:{name}] handler raised: {e}", flush=True)
+            return True, "Couldn't process the request — check the bridge log."
+    return False, ""
 
 # Vision-frame helper — pushes image attachments into the active voice session
 # so Gemini reacts in-stream. Best-effort: import failure or unreachable
@@ -564,6 +640,22 @@ def load_channel_allowed(channel_id):
     if cfg is None:
         return None
     return cfg[1]
+
+def load_channel_context_blacklist(channel_id):
+    """Context-source BLACKLIST: ids this channel must NOT pull context from, via
+    `contextNotFrom` in access.json (mirrors allowFrom's per-channel shape). Same axis-style as
+    allowFrom (who may send) but for INFORMATION FLOW (which channels' content may be pulled into
+    a reply here). Entries may be CHANNEL ids or GUILD ids (a guild id blocks every channel in
+    that guild). Returns a set of id strings (empty if unconfigured). Used to gate the
+    Discord-state prefetch so e.g. #dev can be barred from pulling a private guild's content."""
+    try:
+        data = json.loads(ACCESS_FILE.read_text())
+        grp = data.get("groups", {}).get(str(channel_id))
+        if isinstance(grp, dict):
+            return {str(c) for c in (grp.get("contextNotFrom") or [])}
+    except Exception:
+        pass
+    return set()
 
 def _should_notify_owner_on_seed(sender_id, owner_ids):
     """True iff a thread auto-seed should @-mention the owner.
@@ -1066,7 +1158,7 @@ async def _fetch_discord_channel_messages(channel_id, n=_PREFETCH_MAX_MESSAGES_P
     return formatted
 
 
-async def _prefetch_discord_state_refs(user_task_text):
+async def _prefetch_discord_state_refs(user_task_text, origin_channel_id=None):
     """For every `<#channel_id>` reference in `user_task_text`, attempt to fetch
     the channel's recent messages via the bot's REST client and produce a
     prepended context block. Returns the enriched task body (context block +
@@ -1101,8 +1193,25 @@ async def _prefetch_discord_state_refs(user_task_text):
             continue
         seen.add(r)
         ordered_refs.append(r)
+    # Context-source BLACKLIST gate: drop any referenced channel the CURRENT channel is
+    # forbidden to pull context from (contextNotFrom in access.json). GUILD-AWARE: a
+    # contextNotFrom entry may be a CHANNEL id OR a GUILD id — a guild id blocks every channel in
+    # that guild (incl. future ones), so e.g. #dev's contextNotFrom = ["<private guild id>"]
+    # bars pulling any channel in that guild without enumerating each.
+    _ctx_blacklist = load_channel_context_blacklist(origin_channel_id) if origin_channel_id else set()
     blocks = []
     for ref in ordered_refs:
+        if _ctx_blacklist:
+            _ref_guild = ""
+            try:
+                _rc = client.get_channel(int(ref)) or await asyncio.wait_for(
+                    client.fetch_channel(int(ref)), timeout=_PREFETCH_PER_REF_TIMEOUT_S)
+                _ref_guild = str(getattr(getattr(_rc, "guild", None), "id", "") or "")
+            except Exception:
+                _ref_guild = ""
+            if str(ref) in _ctx_blacklist or (_ref_guild and _ref_guild in _ctx_blacklist):
+                print(f"  [discord-state-prefetch] ref <#{ref}> (guild {_ref_guild or '?'}) blocked by contextNotFrom for channel {origin_channel_id} — skipping", flush=True)
+                continue
         formatted = await _fetch_discord_channel_messages(ref)
         if formatted is None:
             # Failure (perms / NotFound / timeout / wrong type). Fail-closed:
@@ -2056,10 +2165,62 @@ pending_replies = {}
 # in memory only — crash-recovery isn't critical; missing entry just means
 # the reply goes as a fresh message instead of a quote-reply.
 pending_reply_anchors: dict[str, int] = {}
+# Track access_tier per pending task so the progress-streamer (poll_progress,
+# behind SUTANDO_PROGRESS_STREAM) only narrates OWNER tasks — non-owner tasks
+# run in a codex sandbox that never updates core-status.json, and we must not
+# leak processing state for an untrusted sender. In-memory only and NOT restored
+# on restart; poll_progress fail-closes (skips streaming) when a task_id is
+# absent here, so a recovered task is never streamed without a known owner tier.
+pending_task_tiers: dict[str, str] = {}
 
 intents = discord.Intents.default()
 intents.message_content = True
+# GUILD_MEMBERS privileged intent — only enable when confirmed active in
+# Discord Developer Portal (Bot → Privileged Gateway Intents). Without this
+# toggle the bridge raises PrivilegedIntentsRequired on startup and won't
+# connect. Gated behind env var so bridge boots safely without the flag.
+if os.environ.get("DISCORD_GUILD_MEMBERS_INTENT", "").lower() in ("1", "true", "yes"):
+    intents.members = True
 client = discord.Client(intents=intents)
+
+
+async def list_channel_members(channel_id: int) -> list[dict]:
+    """Return members who can see a channel.
+
+    Requires GUILD_MEMBERS privileged intent enabled in Discord Dev Portal
+    AND DISCORD_GUILD_MEMBERS_INTENT=1 in the bridge environment.
+    Returns list of {id, name, display_name, is_bot} dicts, or empty list
+    if the intent is unavailable.
+    """
+    if not intents.members:
+        return []
+    channel = client.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(channel_id)
+        except Exception:
+            return []
+    guild = getattr(channel, "guild", None)
+    if guild is None:
+        return []
+    members = []
+    try:
+        async for member in guild.fetch_members(limit=1000):
+            try:
+                perms = channel.permissions_for(member)
+                if perms.view_channel:
+                    members.append({
+                        "id": str(member.id),
+                        "name": member.name,
+                        "display_name": member.display_name,
+                        "is_bot": member.bot,
+                    })
+            except Exception:
+                continue  # skip members whose permissions can't be resolved
+    except Exception as e:
+        print(f"  [list_channel_members] fetch_members failed for guild {guild.id}: {e}", flush=True)
+        return []
+    return members
 
 
 def _recover_orphan_sending_files() -> int:
@@ -2137,6 +2298,7 @@ async def on_ready():
     client.loop.create_task(_catchup_missed_dms())
     # Start polling loops
     client.loop.create_task(poll_results())
+    client.loop.create_task(poll_progress())
     client.loop.create_task(poll_approved())
     client.loop.create_task(poll_proactive())
     client.loop.create_task(poll_dm_fallback())
@@ -2393,28 +2555,33 @@ async def _handle_discord_message(message, force=False):
             except Exception as e:
                 print(f"  [thread-engage] failed to update access.json: {e}", flush=True)
 
+        # Text/magic-word screen-push REMOVED (#1427, owner 2026-06-05). Screen
+        # sharing in a voice session is owned entirely by the voice-invoked
+        # screen-share tool that an external plugin contributes — typed
+        # phrases no longer start screen-push; only voice does. The old
+        # setScreenPush consumer was already gone, so this typed path was an
+        # orphan that still posted a "Screen-push on" message (fired on every
+        # bot in the channel).
+
         # Magic-word fast path: an owner saying the join phrase MUST bypass
         # requireMention — otherwise the magic word can't fire in any guild
         # text channel where the bot isn't @-mentioned. Check before the
         # requireMention skip so "za warudo" in #General (no mention) still
         # summons the voice spawn for the owner.
         try:
-            if str(message.author.id) in load_allowed() and _dv_message_is_join_phrase(text):
-                print(f"  [join-trigger] owner @{message.author} said the join phrase — summoning discord-voice (bypassing requireMention)", flush=True)
-                try:
-                    reply = _dv_handle_join_trigger(message)
-                except Exception as e:
-                    print(f"  [join-trigger] handler raised: {e}", flush=True)
-                    reply = "Couldn't process the voice-join request — check the bridge log."
-                try:
-                    if reply:
-                        for chunk in _chunk_for_discord(reply):
-                            await message.channel.send(chunk)
-                except Exception as e:
-                    print(f"  [join-trigger] reply send failed: {e}", flush=True)
-                return
+            if str(message.author.id) in load_allowed():
+                _hook_matched, reply = _plugin_message_reply(text, message, getattr(client.user, "id", None))
+                if _hook_matched:
+                    print(f"  [plugin-hook] owner @{message.author} matched a plugin message-hook — handling (bypassing requireMention)", flush=True)
+                    try:
+                        if reply:
+                            for chunk in _chunk_for_discord(reply):
+                                await message.channel.send(chunk)
+                    except Exception as e:
+                        print(f"  [plugin-hook] reply send failed: {e}", flush=True)
+                    return
         except Exception as e:
-            print(f"  [join-trigger] early-path raised: {e}", flush=True)
+            print(f"  [plugin-hook] early-path raised: {e}", flush=True)
 
         if require_mention and not bot_mentioned and not role_mentioned:
             print(f"  [skip] not mentioned (requireMention=true)", flush=True)
@@ -2727,10 +2894,10 @@ async def _handle_discord_message(message, force=False):
     if len(seen_message_ids) > 10000:
         seen_message_ids.clear()
 
-    # discord-voice "magic word" join trigger. THIN hook (CLAUDE.md core/skill
+    # Plugin "magic word" join trigger. THIN hook (CLAUDE.md core/skill
     # split): the bridge only checks "is this the owner saying the join
     # phrase"; everything else — voice-channel lookup, already-running guard,
-    # discord-voice-server launch — lives in the discord-voice skill helper.
+    # plugin-server launch — lives in the plugin's skill helper.
     # Owner-only by construction: a non-owner saying the phrase falls through
     # to normal task handling. When it fires, the message IS the command — we
     # send the reply and return WITHOUT writing a task file (no normal task
@@ -2738,24 +2905,15 @@ async def _handle_discord_message(message, force=False):
     # double-fire the spawn; the helper has its own `_server_already_running`
     # guard anyway, but cheaper to dedup at the front gate.
     if access_tier == "owner":
-        try:
-            is_join = _dv_message_is_join_phrase(text)
-        except Exception as e:
-            print(f"  [join-trigger] match check raised: {e}", flush=True)
-            is_join = False
-        if is_join:
-            print(f"  [join-trigger] owner @{username} said the join phrase — summoning discord-voice", flush=True)
-            try:
-                reply = _dv_handle_join_trigger(message)
-            except Exception as e:
-                print(f"  [join-trigger] handler raised: {e}", flush=True)
-                reply = "Couldn't process the voice-join request — check the bridge log."
+        _hook_matched, reply = _plugin_message_reply(text, message, getattr(client.user, "id", None))
+        if _hook_matched:
+            print(f"  [plugin-hook] owner @{username} matched a plugin message-hook — handling", flush=True)
             try:
                 if reply:
                     for chunk in _chunk_for_discord(reply):
                         await message.channel.send(chunk)
             except Exception as e:
-                print(f"  [join-trigger] reply send failed: {e}", flush=True)
+                print(f"  [plugin-hook] reply send failed: {e}", flush=True)
             return
 
     # Deterministic tier ownership: if SUTANDO_TEAM_TIER_OWNER is configured
@@ -2842,9 +3000,13 @@ async def _handle_discord_message(message, force=False):
     # Order matters: the proactive path can ANSWER the user's question; the
     # fallback path just declines silently. Try answering first.
     already_escalated = False
-    if access_tier in ("team", "other"):
+    # Context-build gate (Susan 2026-06-17): the contextNotFrom skip must apply WHENEVER context
+    # is built — for ALL tiers, owner included — not just team/other. So the prefetch (which
+    # skips any channel in this channel's contextNotFrom) runs for everyone. The silent-escalate
+    # fallback below stays non-owner-only (owner tasks just proceed to normal handling).
+    if True:
         try:
-            enriched = await _prefetch_discord_state_refs(user_task_text)
+            enriched = await _prefetch_discord_state_refs(user_task_text, message.channel.id)
         except Exception as e:
             print(f"  [discord-state-prefetch] outer guard caught: {e}; falling through to silent-escalate", flush=True)
             enriched = None
@@ -2857,7 +3019,12 @@ async def _handle_discord_message(message, force=False):
             # here would reintroduce the nested-escape pathology codex's
             # stdin parser hangs on. Per MacBook's #644 v2 review 2026-05-10.
             Path(prompt_path).write_text(user_task_text)
-        else:
+        elif access_tier in ("team", "other"):
+            # Silent-escalate stays NON-OWNER-only. The prefetch above now runs
+            # for all tiers (so the contextNotFrom gate applies to owner too),
+            # but an owner task with no enrichable refs must just proceed to
+            # normal handling — not get silently escalated/declined. Only the
+            # non-owner tiers fall back to the PR #639 escalate path.
             try:
                 already_escalated = await _silent_escalate_for_discord_state(message, user_task_text)
             except Exception as e:
@@ -3017,6 +3184,7 @@ async def _handle_discord_message(message, force=False):
         f"{discord_skill_hints}"
     )
     pending_replies[task_id] = message.channel
+    pending_task_tiers[task_id] = access_tier
     # Track source-message-id so the result-sender can auto-attach reply_to
     # (visually thread the reply to the triggering message). Skipped when
     # the channel is already a Discord thread — thread context is enough.
@@ -3316,6 +3484,10 @@ async def poll_results():
                 # messages instead of quote-replies. Caught by live test
                 # 2026-05-22 ~03:00 UTC: "it's not a quote reply".
                 source_message_anchor = pending_reply_anchors.pop(task_id, None)
+                # Clear the progress-streamer's tier map here (NOT only in
+                # poll_progress) so it's bounded even when the feature flag is
+                # OFF — otherwise this dict would leak one entry per task.
+                pending_task_tiers.pop(task_id, None)
                 save_pending_replies()
                 # Skip sending if already replied directly (core agent used MCP).
                 # Clean up the result AND task files so the watcher doesn't
@@ -3525,6 +3697,142 @@ async def poll_results():
                 # directory growth.
                 _clear_delivered(task_id)
         await asyncio.sleep(1)
+
+
+# In-memory placeholder registry for the progress-streamer:
+#   task_id -> {"msg": discord.Message, "first": float(created_epoch_s), "last_edit": float}
+_progress_msgs: dict = {}
+
+
+async def poll_progress():
+    """Hermes-style streaming tool output (2026-06-05).
+
+    Opt-in (``SUTANDO_PROGRESS_STREAM=1``, default OFF): for an OWNER task that
+    is still running past a threshold, post a single "⏳ working…" placeholder
+    to the originating channel and edit it in place with the core's live
+    ``core-status.step`` — so the user sees liveness instead of silence on a
+    long task. When the result lands, ``poll_results`` sends the real reply and
+    this loop deletes its placeholder.
+
+    Fully self-contained and side-effect-free when the flag is off: the loop
+    returns immediately, touching nothing. All policy/rendering lives in the
+    pure, unit-tested ``progress_stream`` module; this function is only the
+    async I/O driver. Every Discord call is wrapped — a transient API error
+    must never break the loop or leak an exception into the gateway.
+    """
+    if not progress_stream.stream_enabled():
+        return  # feature off → never loops; zero overhead, zero risk
+    while True:
+        try:
+            now = time.time()
+            for task_id, channel in list(pending_replies.items()):
+                # "Done" = a result file exists (final reply pending/sent) or
+                # the delivery sentinel is set. Either way, stop narrating.
+                done = (RESULTS_DIR / f"{task_id}.txt").exists() or _is_delivered(task_id)
+                info = _progress_msgs.get(task_id)
+                if info is not None:
+                    # Terminal marker: we already gave up on this task (it ran
+                    # past MAX_PLACEHOLDER_AGE_S without a result). Do NOT
+                    # re-post — just wait for the GC to drop it when the task
+                    # finally leaves pending_replies. Without this, the expiry
+                    # branch would delete-then-immediately-repost every tick:
+                    # an endless spam loop for a stuck task (red-team #1).
+                    if info.get("expired"):
+                        continue
+                    elapsed = now - info["first"]
+                    if done:
+                        try:
+                            await info["msg"].delete()
+                        except Exception:
+                            # Transient delete failure (5xx / rate-limit): keep
+                            # the entry and retry next tick so the placeholder
+                            # isn't orphaned (gemini #2). Bounded so a
+                            # permanently-undeletable message can't pin it.
+                            info["del_attempts"] = info.get("del_attempts", 0) + 1
+                            if info["del_attempts"] < 5:
+                                continue
+                        _progress_msgs.pop(task_id, None)
+                        continue
+                    if progress_stream.placeholder_expired(elapsed):
+                        try:
+                            await info["msg"].delete()
+                        except Exception:
+                            pass
+                        _progress_msgs[task_id] = {"expired": True}  # terminal
+                        continue
+                    if progress_stream.should_edit(now, info["last_edit"]):
+                        step = progress_stream.current_step(
+                            progress_stream.read_core_status(STATE_DIR)
+                        )
+                        try:
+                            await info["msg"].edit(
+                                content=progress_stream.format_progress(step, elapsed)
+                            )
+                            info["last_edit"] = now
+                        except Exception:
+                            # Edit failed (deleted/rate-limited) — mark terminal
+                            # so we stop hammering it AND don't re-post.
+                            _progress_msgs[task_id] = {"expired": True}
+                    continue
+                # No placeholder yet.
+                if done:
+                    continue  # finished before the threshold → never narrate
+                # Fail-CLOSED on unknown tier. pending_task_tiers is in-memory
+                # only and is NOT restored on bridge restart, while
+                # pending_replies IS reloaded from disk — so a recovered task
+                # has no tier here. should_stream_task(None) returns True
+                # (legacy owner), which would leak processing state for a
+                # recovered NON-owner task. Requiring a present, owner-tier
+                # entry closes that hole (red-team #2).
+                if task_id not in pending_task_tiers:
+                    continue
+                if not progress_stream.should_stream_task(pending_task_tiers.get(task_id)):
+                    continue  # non-owner → no placeholder, no leak
+                try:
+                    created = int(task_id.split("-")[1]) / 1000.0
+                except (ValueError, IndexError):
+                    created = now
+                elapsed = now - created
+                if progress_stream.should_post_placeholder(elapsed):
+                    step = progress_stream.current_step(
+                        progress_stream.read_core_status(STATE_DIR)
+                    )
+                    try:
+                        msg = await channel.send(
+                            progress_stream.format_progress(step, elapsed)
+                        )
+                        _progress_msgs[task_id] = {
+                            "msg": msg,
+                            "first": created,
+                            "last_edit": now,
+                        }
+                    except Exception:
+                        # Send failed (Forbidden / rate-limit). Mark terminal so
+                        # we do NOT re-attempt the send every tick — otherwise a
+                        # task in a channel we can't post to would hammer the API
+                        # forever (gemini #1). GC drops it when the task ends.
+                        _progress_msgs[task_id] = {"expired": True}
+            # GC: drop placeholders whose task is no longer pending (delivered
+            # + archived → cleared from pending_replies) so none orphan.
+            for task_id in list(_progress_msgs.keys()):
+                if task_id not in pending_replies:
+                    entry = _progress_msgs.get(task_id) or {}
+                    msg = entry.get("msg")  # absent for terminal {"expired": True}
+                    if msg is not None:
+                        try:
+                            await msg.delete()
+                        except Exception:
+                            # Retry transient delete failures next tick rather
+                            # than forgetting (and orphaning) the message
+                            # (gemini #2). Bounded.
+                            entry["del_attempts"] = entry.get("del_attempts", 0) + 1
+                            if entry["del_attempts"] < 5:
+                                continue
+                    _progress_msgs.pop(task_id, None)
+                    pending_task_tiers.pop(task_id, None)
+        except Exception as e:
+            print(f"  [progress] poll_progress tick error: {e}", flush=True)
+        await asyncio.sleep(3)
 
 
 async def poll_proactive():

@@ -45,7 +45,14 @@ export const scrollTool: ToolDefinition = {
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { direction, amount, target } = args as { direction: 'down' | 'up' | 'top' | 'bottom'; amount?: 'small' | 'medium' | 'large'; target?: string };
+		const { direction, amount, target: _rawTarget } = args as { direction: 'down' | 'up' | 'top' | 'bottom'; amount?: 'small' | 'medium' | 'large'; target?: string };
+		// "window"/"page"/"main" etc. mean the MAIN page, not a CSS selector. The model
+		// habitually passes target:"window" (2026-06-09 live test): the selector branch
+		// matched nothing, its <500px-wide fallback skipped GitHub's full-width scroller,
+		// and every scroll silently no-oped while still reporting success. Normalize
+		// main-ish targets to "no target" so they take the robust multi-candidate path.
+		const target = _rawTarget && /^(window|page|main|screen|browser|content|body|document|whole page|the page)$/i.test(_rawTarget.trim())
+			? undefined : _rawTarget;
 		const px = amount === 'small' ? 150 : amount === 'large' ? 800 : 400;
 		try {
 			// Check which app is frontmost
@@ -56,31 +63,67 @@ export const scrollTool: ToolDefinition = {
 			const isChrome = frontApp === 'Google Chrome';
 			console.log(`${ts()} [Scroll] frontApp=${frontApp} direction=${direction} isChrome=${isChrome}`);
 
+			let _scrollMoved: boolean | null = null;  // null = couldn't determine (no AppleEvent result)
 			if (isChrome && !target) {
-				// Chrome: use JS scroll + keyboard fallback (for screen share repaint)
-				const scrollFn = (cmd: string) =>
-					`(function(){var best=document.scrollingElement||document.documentElement,bw=0;document.querySelectorAll('*').forEach(function(el){var d=el.scrollHeight-el.clientHeight;if(d>50&&el.clientHeight>200){var w=el.getBoundingClientRect().width;if(w>bw){best=el;bw=w}}});var e=best;${cmd}})()`;
-				let js: string;
-				if (direction === 'top') js = scrollFn('e.scrollTop=0');
-				else if (direction === 'bottom') js = scrollFn('e.scrollTop=e.scrollHeight');
-				else js = scrollFn(`e.scrollBy(0,${direction === 'down' ? px : -px})`);
+				// Chrome: try EACH scrollable element (widest first) until one ACTUALLY
+				// MOVES, then fall back to window scroll. The old code scrolled only the
+				// single widest element — if that element was already maxed (after a prior
+				// scroll, or a short sub-container), nothing moved yet the tool still
+				// reported success (Susan 2026-06-09: "first scroll worked, second didn't —
+				// I wanted it to keep scrolling to my comment"). The JS RETURNS whether
+				// anything moved, so a real no-op is visible (logged + in the result) and
+				// the keyboard fallback below still fires for screen-share repaint.
+				const op = direction === 'top' ? 'e.scrollTop=0'
+					: direction === 'bottom' ? 'e.scrollTop=e.scrollHeight'
+					: `e.scrollBy(0,${direction === 'down' ? px : -px})`;
+				const winOp = direction === 'top' ? 'window.scrollTo(0,0)'
+					: direction === 'bottom' ? 'window.scrollTo(0,document.body.scrollHeight)'
+					: `window.scrollBy(0,${direction === 'down' ? px : -px})`;
+				const js = `(function(){`
+					+ `var list=[];document.querySelectorAll('*').forEach(function(el){var d=el.scrollHeight-el.clientHeight;if(d>50&&el.clientHeight>200)list.push(el)});`
+					+ `list.sort(function(a,b){return b.getBoundingClientRect().width-a.getBoundingClientRect().width});`
+					+ `var se=document.scrollingElement||document.documentElement;if(list.indexOf(se)<0)list.push(se);`
+					+ `var moved=null,info=null;for(var i=0;i<list.length;i++){var e=list[i];var b4=e.scrollTop;${op};if(e.scrollTop!==b4){moved=e;info={tag:e.tagName,cls:(e.className&&e.className.toString?e.className.toString().slice(0,40):''),b4:b4,aft:e.scrollTop};break}}`
+					+ `var wy0=window.scrollY;if(!moved){${winOp}}var wy1=window.scrollY;`
+					+ `return JSON.stringify({moved:!!moved||wy1!==wy0,via:moved?'el':'window',cands:list.length,info:info,wy0:wy0,wy1:wy1});})()`;
 				const tmpScroll = `/tmp/sutando-scroll-${Date.now()}.scpt`;
 				writeFileSync(tmpScroll, `tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`);
-				execSync(`osascript ${tmpScroll}`, { timeout: 5_000 });
+				let _out = '';
+				try { _out = execSync(`osascript ${tmpScroll}`, { timeout: 5_000 }).toString().trim(); }
+				catch (e) { console.log(`${ts()} [Scroll] osascript error: ${e instanceof Error ? e.message : e}`); }
 				try { unlinkSync(tmpScroll); } catch {}
+				if (_out) {
+					try {
+						const d = JSON.parse(_out);
+						_scrollMoved = !!d.moved;
+						const inf = d.info ? `${d.info.tag}.${d.info.cls} ${d.info.b4}->${d.info.aft}` : `window ${d.wy0}->${d.wy1}`;
+						console.log(`${ts()} [Scroll] moved=${d.moved} via=${d.via} cands=${d.cands} ${inf}`);
+						if (!d.moved) console.log(`${ts()} [Scroll] *** NO MOVEMENT — ${d.cands} scrollable(s), none moved + window at ${direction} limit`);
+					} catch { console.log(`${ts()} [Scroll] unparseable out: ${_out.slice(0, 80)}`); }
+				} else { console.log(`${ts()} [Scroll] osascript returned EMPTY (AppleEvent denied/dropped or no front Chrome window)`); }
 			} else if (isChrome && target) {
-				// Chrome with target selector
+				// Chrome with target selector. Same observability contract as the
+				// no-target path (2026-06-09): report whether anything ACTUALLY moved —
+				// this branch used to scroll-or-not in total silence and always claim
+				// success, which made "scroll is broken" undiagnosable from the log.
 				const targetSelector = target.match(/side|nav|history|menu/i) ? 'nav' : target.match(/code/i) ? 'pre,code' : target;
 				const scrollFn = (cmd: string) =>
-					`(function(){var sel='${targetSelector}';var e=null;document.querySelectorAll(sel).forEach(function(el){if(!e&&el.scrollHeight-el.clientHeight>50)e=el});if(!e){var best=null,bh=0;document.querySelectorAll('*').forEach(function(el){var d=el.scrollHeight-el.clientHeight;if(d>50&&el.clientHeight>100&&el.getBoundingClientRect().width<500){if(d>bh){best=el;bh=d}}});e=best}if(e){${cmd}}})()`;
+					`(function(){var sel='${targetSelector}';var e=null;try{document.querySelectorAll(sel).forEach(function(el){if(!e&&el.scrollHeight-el.clientHeight>50)e=el})}catch(_){}if(!e){var best=null,bh=0;document.querySelectorAll('*').forEach(function(el){var d=el.scrollHeight-el.clientHeight;if(d>50&&el.clientHeight>100&&el.getBoundingClientRect().width<500){if(d>bh){best=el;bh=d}}});e=best}if(!e)return JSON.stringify({found:false,moved:false});var b4=e.scrollTop;${cmd};return JSON.stringify({found:true,moved:e.scrollTop!==b4,b4:b4,aft:e.scrollTop});})()`;
 				let js: string;
 				if (direction === 'top') js = scrollFn('e.scrollTop=0');
 				else if (direction === 'bottom') js = scrollFn('e.scrollTop=e.scrollHeight');
 				else js = scrollFn(`e.scrollBy(0,${direction === 'down' ? px : -px})`);
 				const tmpScroll = `/tmp/sutando-scroll-${Date.now()}.scpt`;
 				writeFileSync(tmpScroll, `tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`);
-				execSync(`osascript ${tmpScroll}`, { timeout: 5_000 });
+				let _out = '';
+				try { _out = execSync(`osascript ${tmpScroll}`, { timeout: 5_000 }).toString().trim(); }
+				catch (e) { console.log(`${ts()} [Scroll] osascript error (target branch): ${e instanceof Error ? e.message : e}`); }
 				try { unlinkSync(tmpScroll); } catch {}
+				try {
+					const d = JSON.parse(_out);
+					_scrollMoved = !!d.moved;
+					console.log(`${ts()} [Scroll] target="${target}" sel="${targetSelector}" found=${d.found} moved=${d.moved} ${d.found ? `${d.b4}->${d.aft}` : ''}`);
+				} catch { console.log(`${ts()} [Scroll] target="${target}" out unparseable/empty: ${_out.slice(0, 80)}`); }
 			}
 
 			// Keyboard scroll on the frontmost app (works in any app, no focus steal)
@@ -90,7 +133,14 @@ export const scrollTool: ToolDefinition = {
 			} catch { /* keyboard fallback is best-effort */ }
 
 			console.log(`${ts()} [Scroll] ${direction} (app: ${frontApp})`);
-			return { status: 'scrolled', direction, app: frontApp };
+			// Honest result: if the JS pass found nothing moved (page already at the
+			// direction's limit), say so instead of falsely claiming a scroll — so the
+			// model can tell the user "looks like we're at the bottom" rather than insist.
+			if (_scrollMoved === false) {
+				return { status: 'at_limit', direction, app: frontApp, moved: false,
+				         message: `Nothing scrolled — the page appears to be at the ${direction === 'down' ? 'bottom' : direction === 'up' ? 'top' : direction}. Tell the user it can't scroll further that way.` };
+			}
+			return { status: 'scrolled', direction, app: frontApp, moved: _scrollMoved };
 		} catch (err) {
 			return { error: `Scroll failed: ${err instanceof Error ? err.message : err}` };
 		}
@@ -607,3 +657,4 @@ export {
 	onCallEnd,
 	startRecordingNarration,
 } from './recording-tools.js';
+

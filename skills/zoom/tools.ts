@@ -3,8 +3,8 @@
  *
  * Extracted from src/meeting-tools.ts (issue #786).  Core services import
  * these via src/inline-tools.ts re-export; they can also be imported
- * directly by skills that override or extend Zoom behaviour (see
- * skills/discord-voice for the dismiss-override pattern).
+ * directly by skills that override or extend Zoom behaviour (an external
+ * plugin since #1427 uses the dismiss-override pattern).
  */
 
 import { execSync, execFileSync } from 'node:child_process';
@@ -464,6 +464,6 @@ if result.stdout.strip():
  * dynamic-imports this module and merges `tools` into the agent tool table
  * (#976 conformance).  The individual named exports above are kept for skills
  * that import a tool directly to override or extend Zoom behaviour (e.g.
- * skills/discord-voice's dismiss override).
+ * an external plugin's dismiss override).
  */
 export const tools: ToolDefinition[] = [summonTool, dismissTool, joinZoomTool];
