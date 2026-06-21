@@ -231,10 +231,10 @@ Slack uses TOFU onboarding for owner enrollment: the first DM to the bot auto-en
 When you need user input on a decision or are blocked:
 1. If the voice client is connected — ask via voice (write to `results/question-{ts}.txt`)
 2. Send a macOS notification: `osascript -e 'display notification "message" with title "Sutando"'`
-3. Save the question to `pending-questions.md` for later
+3. Save the question to the **per-host** `pending-questions.md` — `<workspace>/hosts/<hostname>/pending-questions.md` (`<hostname>` = `hostname | sed 's/\..*//'`). It's per-host (F1): each host owns its own file, carried by the `hosts/*/` vault glob, and `personal_path("pending-questions.md")` resolves there (so the code readers — check-pending-questions, dashboard, agent-api, friction-detector, session-handoff — agree with this write location).
 4. Continue working on other things — don't block
 
-On each proactive loop pass, check `pending-questions.md` for unanswered items and surface them when the user is available.
+On each proactive loop pass, check the per-host `pending-questions.md` (`<workspace>/hosts/<hostname>/pending-questions.md`) for unanswered items and surface them when the user is available.
 
 ## Task progress notifications
 
