@@ -24,12 +24,14 @@ This convention restores the per-host namespace, the revamp way.
 The workspace holds two data classes, and the whole design falls out of keeping
 them separate:
 
-- **Shared data** — core memory (`projects/*/memory/`), `notes/`, `build_log.md`,
-  `pending-questions.md`. Every host reads *and* writes it; all hosts converge to
-  the same content. Synced by the `vault.sync.include` whitelist and **converged
-  via the 3-way merge** `sync-workspace.sh` already does. Two hosts touching the
-  same shared file is an ordinary git merge (a true conflict only if the same
-  lines change concurrently).
+- **Shared data** — core memory (`projects/*/memory/`), `notes/`. Every host
+  reads *and* writes it; all hosts converge to the same content. Synced by the
+  `vault.sync.include` whitelist and **converged via the 3-way merge**
+  `sync-workspace.sh` already does. Two hosts touching the same shared file is an
+  ordinary git merge (a true conflict only if the same lines change
+  concurrently). (`build_log.md` and `pending-questions.md` were reclassified
+  **per-host** per the F1 design decision — owner override of an earlier "shared"
+  call — and now live under `hosts/<hostname>/`; see the table below.)
 - **Per-host data** — everything under `hosts/<hostname>/` (see table below).
   **Single-writer:** only the owning host writes its own subtree. Disjoint paths
   → merging host branches never collides.
@@ -85,15 +87,40 @@ Per-host **config that should survive a rebuild** (the backup hole):
 | tab-aliases.json | machine-<host>/ | hosts/<hostname>/tab-aliases.json |
 | channel access.json (allowlist/tierMap/TOFU) | machine-<host>/channels/ (Mini's #1715) | hosts/<hostname>/channels/<ch>/access.json |
 | settings.json snapshot | (unbacked) | hosts/<hostname>/settings.json |
-| crons | `crons/<hostname>.json` (#1716) | already hostname-qualified; may fold to hosts/<hostname>/crons.json later — both pass the lint |
+| crons | `crons/<hostname>.json` (#1716) | `hosts/<hostname>/crons.json` — **wired** in `schedule-crons/SKILL.md` (self-heals from the interim/legacy path) |
+| build_log.md | machine-<host>/ (per-host) | `hosts/<hostname>/build_log.md` — F1 per-host decision; migrator (#1721) emits it; *loop write-side still emits workspace-root, relocation deferred* |
+| pending-questions.md | machine-local (per-host) | `hosts/<hostname>/pending-questions.md` — reader wired via `personal_path` (#1718) + migrator (#1721) |
+
+### Wiring status (implemented vs deferred)
+
+The `hosts/<hostname>/` paths above are the **target** layout. The table is the
+intent; not every component writes there yet. As of #1716–#1721:
+
+- **Wired going-forward:** `crons.json` (read+write, `schedule-crons/SKILL.md`),
+  `pending-questions.md` (read via `personal_path`, #1718).
+- **Migrator one-time copy only:** `PERSONAL_CLAUDE.md`, `stand-identity.json`,
+  `tab-aliases.json`, channel `access.json`, `settings.json`, and `build_log.md`'s
+  loop-writer. `--migrate-from-legacy` (#1721) copies these into
+  `hosts/<hostname>/` **once**, but the owning components do **not yet write
+  there going forward** — that per-component write-wiring lands as separate
+  single-concern PRs. Until then, edits to these files revert to their old paths
+  and aren't backed up under the `hosts/*/` carrier.
+- **Reader caveat:** `PERSONAL_CLAUDE.md` is currently read from the **workspace
+  root** (per `CLAUDE.md`), not via `personal_path` — so relocating it to
+  `hosts/<hostname>/` also requires updating the reader, else the move isn't seen.
+- **Fresh-adopter caveat:** the migrator hard-requires a legacy
+  `~/.sutando/memory-sync` clone and exits if absent — so a host set up *fresh*
+  from this branch (no legacy clone) gets no per-host config established by it.
+  Establishing per-host config without a legacy clone is a separate follow-on.
 
 ## What does NOT live there
 
 - **Secrets / tokens** — `.env`, `*.env`, keychain material. Hard-denied
   (`.env*`) regardless of carrier. They never sync, here or anywhere.
-- **Shared, mergeable data** — core memory (`projects/*/memory/`), `notes/`,
-  `pending-questions.md`. These are *meant* to merge across hosts; they keep
-  their shared paths.
+- **Shared, mergeable data** — core memory (`projects/*/memory/`), `notes/`.
+  These are *meant* to merge across hosts; they keep their shared paths.
+  (`pending-questions.md` and `build_log.md` are **per-host**, not shared — see
+  the table above — per the F1 decision.)
 - **Transient runtime state** — `*.alive`, `*.sentinel`, `*.pid`. Hard-denied.
 - **Per-host identity that must NOT propagate at all** — `state/auth/`
   (`device.json`, `cloud-auth.json`). These stay excluded (a device's identity
