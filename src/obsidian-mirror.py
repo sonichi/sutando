@@ -35,8 +35,8 @@ from typing import Optional
 # ---- Path resolution ----
 # Use the shared helper (same precedence as the rest of Sutando:
 # sutando.config.local.json override, else <repo>/workspace/). This used to
-# inline the pre-v0.8 fallback ($SUTANDO_WORKSPACE else ~/.sutando/workspace),
-# which would mirror tasks/notes from the legacy root post-M0 — same
+# inline the pre-v0.8 env-var-else-home-default fallback the resolver no
+# longer honors, which would mirror tasks/notes from the legacy root post-M0 — same
 # reinvented-fallback bug class as core_heartbeat.py (fixed alongside).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
