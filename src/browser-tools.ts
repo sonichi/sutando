@@ -269,7 +269,12 @@ export const closeTabTool: ToolDefinition = {
 // URL so callers/users still see exactly what they tried to open. Per
 // Susan's PR #919 review: regex strip is safer than `new URL()`-based
 // redaction since the failure path is often an unparseable URL.
-const redactQuery = (u: string): string => JSON.stringify(u.replace(/\?.*$/, '?…'));
+const redactQuery = (u: string): string => {
+	// split on the first '?' instead of /\?.*$/ — linear, no polynomial
+	// backtracking on inputs with many '?' (CodeQL js/polynomial-redos).
+	const i = u.indexOf('?');
+	return JSON.stringify(i === -1 ? u : u.slice(0, i + 1) + '…');
+};
 
 export const openUrlTool: ToolDefinition = {
 	name: 'open_url',
