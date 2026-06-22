@@ -24,7 +24,9 @@ export const joinGmeetTool: ToolDefinition = {
 	async execute(args) {
 		const { meetingCode } = args as { meetingCode: string };
 		// Extract code from URL or use as-is
-		const code = meetingCode.replace(/^https?:\/\/meet\.google\.com\//, '').replace(/\?.*$/, '').trim();
+		// strip the query string by splitting on '?' (linear; avoids the
+		// polynomial-backtracking /\?.*$/ regex — CodeQL js/polynomial-redos)
+		const code = meetingCode.replace(/^https?:\/\/meet\.google\.com\//, '').split('?')[0].trim();
 		if (!code) return { error: 'Invalid meeting code' };
 
 		const meetUrl = `https://meet.google.com/${code}`;
