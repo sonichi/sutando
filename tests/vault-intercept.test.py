@@ -99,6 +99,46 @@ class TestSingleVaultSet(unittest.TestCase):
         self.assertEqual(result.text, "vault set FOO [STORED-IN-KEYCHAIN]")
         self.assertEqual(result.stored, ["FOO"])
 
+    # --- `=` separator (2026-06-22 leak: `vault set KEY=VALUE` was uncaught) ---
+    def test_equals_separator_bare(self):
+        with _mock_store():
+            value = "sk-" + "a"*20 + "T3BlbkFJ" + "b"*20
+            result = intercept_vault_commands(f"vault set MY_KEY={value}")
+        self.assertEqual(result.text, "vault set MY_KEY [STORED-IN-KEYCHAIN]")
+        self.assertEqual(result.stored, ["MY_KEY"])
+
+    def test_equals_separator_with_spaces(self):
+        with _mock_store():
+            value = "sk-" + "a"*20 + "T3BlbkFJ" + "b"*20
+            result = intercept_vault_commands(f"vault set MY_KEY = {value}")
+        self.assertEqual(result.text, "vault set MY_KEY [STORED-IN-KEYCHAIN]")
+        self.assertEqual(result.stored, ["MY_KEY"])
+
+    def test_equals_separator_quoted_value(self):
+        with _mock_store():
+            result = intercept_vault_commands('vault set API_KEY="secret value here"')
+        self.assertEqual(result.text, "vault set API_KEY [STORED-IN-KEYCHAIN]")
+        self.assertEqual(result.stored, ["API_KEY"])
+
+    def test_equals_first_only_value_keeps_rest(self):
+        # Only the FIRST `=` is the separator; `=` inside the value is kept.
+        stored_value = []
+        def _capture_run(cmd, **kw):
+            if "add-generic-password" in cmd:
+                stored_value.append(cmd[cmd.index("-w") + 1])
+            return MagicMock(returncode=0)
+        with patch("vault_intercept.subprocess.run", side_effect=_capture_run), \
+             patch.object(vault_intercept, "_register_key"):
+            intercept_vault_commands('vault set TOK="ab=cd=="')
+        self.assertEqual(stored_value, ["ab=cd=="])
+
+    def test_space_form_still_intercepts(self):
+        # Regression: the original space-separated form is unaffected.
+        with _mock_store():
+            value = "sk-" + "a"*20 + "T3BlbkFJ" + "b"*20
+            result = intercept_vault_commands(f"vault set MY_KEY {value}")
+        self.assertEqual(result.stored, ["MY_KEY"])
+
     def test_surrounded_by_prose(self):
         with _mock_store():
             value = "sk-" + "a"*20 + "T3BlbkFJ" + "b"*20
