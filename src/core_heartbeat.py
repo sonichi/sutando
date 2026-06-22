@@ -60,10 +60,18 @@ CORES_DIR = WORKSPACE / "state" / "cores"
 
 
 def _hostname() -> str:
-    """Short hostname without domain. Mirrors what sync-workspace.sh uses for
-    machine-<host>/ dirs, so the .alive file is recognizable across the
-    fleet's other state files."""
-    return socket.gethostname().split(".")[0]
+    """Per-host label for the `.alive` filename. Delegates to
+    `util_paths._host_label()` — the single source of truth (honors
+    `$SUTANDO_HOST_LABEL`, else short hostname) — so the heartbeat label stays
+    in lockstep with the `hosts/<host>/` per-host dir and survives DHCP
+    hostname drift (a node whose `hostname` is a DHCP/Comcast name that flaps
+    would otherwise write two divergent `<label>.alive` files). Falls back to
+    the raw short hostname if util_paths is unavailable."""
+    try:
+        from util_paths import _host_label
+        return _host_label()
+    except Exception:
+        return socket.gethostname().split(".")[0]
 
 
 def _alive_path() -> Path:

@@ -894,11 +894,22 @@ async function send(){
 </script></body></html>"""
 
 
+def _resolve_local_ip() -> str:
+    """Best-effort LAN IP for the startup log line. An unresolvable hostname
+    (e.g. a DHCP-assigned name not in DNS/hosts) must NOT crash startup —
+    `socket.gethostbyname(socket.gethostname())` raises gaierror in that case.
+    The value is informational only, so fall back to loopback."""
+    import socket
+    try:
+        return socket.gethostbyname(socket.gethostname())
+    except OSError:
+        return "127.0.0.1"
+
+
 if __name__ == "__main__":
     bind = os.environ.get("AGENT_API_BIND", "127.0.0.1")
     server = http.server.HTTPServer((bind, PORT), Handler)
-    import socket
-    local_ip = socket.gethostbyname(socket.gethostname())
+    local_ip = _resolve_local_ip()
     print(f"Sutando Agent API → http://{bind}:{PORT}")
     print(f"  POST /task  — submit a task")
     print(f"  GET  /status — health + capabilities")
