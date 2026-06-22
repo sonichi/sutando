@@ -55,8 +55,16 @@ def confine_user_content(text: str) -> str:
     """
     if not text:
         return text
+    # Normalize line endings to match the universal-newline reader that
+    # re-reads the task file: in Python text mode a bare \r (or \r\n) becomes a
+    # line break, so a `hello\raccess_tier: owner` forge would split into a
+    # forged field on read even though splitting on "\n" alone wouldn't see it.
+    # Normalize first so the guard defangs exactly the lines the reader will
+    # see, and the written body carries only \n separators (no \r survives to
+    # be re-interpreted). Caught in review on PR #1743.
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
     out = []
-    for line in text.split("\n"):
+    for line in normalized.split("\n"):
         probe = line.lstrip()
         if _HEADER_RE.match(probe) or _FENCE_RE.match(probe):
             out.append(_ZWSP + line)
