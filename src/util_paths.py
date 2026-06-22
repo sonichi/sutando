@@ -20,6 +20,7 @@ Usage:
 from __future__ import annotations
 import os
 import socket
+import subprocess
 import sys
 from pathlib import Path
 
@@ -82,13 +83,36 @@ def _workspace_root() -> Path:
 
 
 def _host_label() -> str:
-    r"""Per-host directory label: `$SUTANDO_HOST_LABEL` or short hostname.
+    r"""Per-host directory label. Precedence:
+      1. `$SUTANDO_HOST_LABEL` (or legacy `$SUTANDO_HOST_OVERRIDE`)
+      2. macOS `scutil --get LocalHostName` (the stable Bonjour name)
+      3. short `hostname`
+
+    Why scutil before hostname: on DHCP networks `hostname` can drift (e.g. a
+    Comcast residential lease returns `Chis-MBP.hsd1.wa.comcast.net` →
+    `Chis-MBP`), while the Bonjour LocalHostName (`Chis-MacBook-Pro`) is stable.
+    A drifting `hostname` splits per-host paths — two `hosts/<label>/` dirs,
+    phantom `state/cores/<label>.alive`, and `personal_path()` falling back to
+    the workspace root (2026-06-22 incident). `scutil` is macOS-only; on Linux
+    it's absent and we fall through to `hostname`.
 
     Single source of truth for the per-host segment so the legacy
     `machine-<host>/` (memory-dir) and new `hosts/<host>/` (workspace)
-    conventions stay in lockstep. Matches `_host()` in sync-workspace.sh
-    and the crons-path host derivation (`hostname | sed 's/\..*//'`)."""
-    return os.environ.get("SUTANDO_HOST_LABEL") or socket.gethostname().split(".")[0]
+    conventions stay in lockstep. Kept in lockstep with `_host()` in
+    sync-workspace.sh (same precedence)."""
+    env = os.environ.get("SUTANDO_HOST_LABEL") or os.environ.get("SUTANDO_HOST_OVERRIDE")
+    if env:
+        return env
+    try:
+        out = subprocess.run(
+            ["scutil", "--get", "LocalHostName"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return socket.gethostname().split(".")[0]
 
 
 def _private_machine_dir() -> Path | None:
