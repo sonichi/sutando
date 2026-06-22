@@ -856,6 +856,27 @@ function initRemoteToggle() {
       });
     } catch {}
   });
+  _sseSource.addEventListener('gui-command', (e) => {
+    try {
+      var cmd = JSON.parse(String(e.data || '{}'));
+      if (cmd.command === 'clear_tasks_history') {
+        var keepN = typeof cmd.keep === 'number' ? cmd.keep : 0;
+        try {
+          var raw = localStorage.getItem('sutando-taskmap-v1');
+          if (raw) {
+            var m = JSON.parse(raw);
+            var entries = Object.entries(m).sort(function(a, b) {
+              return new Date(a[1].time).getTime() - new Date(b[1].time).getTime();
+            });
+            var toRemove = Math.max(0, entries.length - keepN);
+            entries.slice(0, toRemove).forEach(function(pair) { delete m[pair[0]]; });
+            localStorage.setItem('sutando-taskmap-v1', JSON.stringify(m));
+          }
+        } catch {}
+        renderTasks();
+      }
+    } catch {}
+  });
   _sseSource.onerror = () => setTimeout(() => initRemoteToggle(), 5000);
 }
 initRemoteToggle();
@@ -3878,6 +3899,29 @@ const server = createServer((req, res) => {
 			res.writeHead(500, { 'Content-Type': 'application/json' });
 			res.end(JSON.stringify({ ok: false, error: 'failed to enqueue scan' }));
 		}
+		return;
+	}
+
+	// Broadcast a gui-command SSE event to all connected browser tabs.
+	// POST /gui/command  body: { "command": "clear_tasks_history", "keep": 50 }
+	if (url.pathname === '/gui/command' && req.method === 'POST') {
+		const chunks: Buffer[] = [];
+		req.on('data', (c: Buffer) => chunks.push(c));
+		req.on('end', () => {
+			try {
+				const body = JSON.parse(Buffer.concat(chunks).toString() || '{}');
+				const event = `event: gui-command\ndata: ${JSON.stringify(body)}\n\n`;
+				let sent = 0;
+				for (const client of sseClients) {
+					try { client.write(event); sent++; } catch {}
+				}
+				res.writeHead(200, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify({ ok: true, clients: sent }));
+			} catch (e: any) {
+				res.writeHead(400, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify({ ok: false, error: String(e?.message) }));
+			}
+		});
 		return;
 	}
 
