@@ -46,6 +46,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from task_priority import default_priority_for_source  # noqa: E402
+
+# Observability: emit channel.slack.<in|out> into the local obs spine
+# (src/observability). Guarded so a missing module never crashes the bridge.
+try:
+    from observability.channel import emit_channel as _emit_channel  # noqa: E402
+except Exception:  # pragma: no cover — best-effort telemetry
+    def _emit_channel(*_a, **_k):  # type: ignore
+        return None
 from result_markers import parse_markers  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path  # noqa: E402
@@ -552,6 +560,18 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         _event_count += 1
 
     print(f"  Wrote {task_id} from {prefix} @{username}", flush=True)
+    # Observability: one inbound accepted-message event.
+    _emit_channel(
+        "slack", "in",
+        user_id=str(user_id or ""),
+        channel_id=str(channel),
+        access_tier=access_tier,
+        data={
+            "task_id": task_id,
+            "is_dm": str(channel).startswith("D"),
+            "is_thread": bool(thread_ts),
+        },
+    )
     return task_id
 
 
@@ -720,6 +740,18 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
                 )
             except Exception:
                 pass
+
+    # Observability: one delivered-reply event.
+    _emit_channel(
+        "slack", "out",
+        channel_id=str(channel),
+        data={
+            "task_id": task_id,
+            "is_dm": str(channel).startswith("D"),
+            "is_thread": bool(thread_ts),
+            "file_count": len(file_paths),
+        },
+    )
 
 
 def _check_task_timeouts() -> None:

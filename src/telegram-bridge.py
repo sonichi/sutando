@@ -32,6 +32,14 @@ except Exception:  # pragma: no cover — bridge must keep running
     def _push_vision_image(path: str, source: str = "telegram") -> bool:  # type: ignore
         return False
 from task_priority import default_priority_for_source  # noqa: E402
+
+# Observability: emit channel.telegram.<in|out> into the local obs spine
+# (src/observability). Guarded so a missing module never crashes the bridge.
+try:
+    from observability.channel import emit_channel as _emit_channel  # noqa: E402
+except Exception:  # pragma: no cover — best-effort telemetry
+    def _emit_channel(*_a, **_k):  # type: ignore
+        return None
 from result_markers import parse_markers  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path  # noqa: E402
@@ -429,6 +437,19 @@ def send_reply(chat_id, text, task_id: str | None = None):
             # rationale as discord-bridge:poll_results.
             print(f"  file marker, file not found — likely a prose quotation: {fpath}", flush=True)
 
+    # Observability: one delivered-reply event.
+    if clean_text or files:
+        _emit_channel(
+            "telegram", "out",
+            user_id=str(chat_id),
+            channel_id=str(chat_id),
+            data={
+                "task_id": task_id,
+                "text_chunks": (len(clean_text) // 4000 + 1) if clean_text else 0,
+                "file_count": len(files),
+            },
+        )
+
 def _recover_orphan_sending_files() -> int:
     """Restart-safety: rename any orphan `results/proactive-*.sending`
     files back to `*.txt` so they get re-claimed on the next poll.
@@ -718,6 +739,14 @@ def main():
                 )
                 pending_replies[task_id] = chat_id
                 pending_task_tiers[task_id] = "owner"  # telegram is owner-only (allowlist-gated); enables progress streaming
+                # Observability: one inbound accepted-message event.
+                _emit_channel(
+                    "telegram", "in",
+                    user_id=str(chat_id),
+                    channel_id=str(chat_id),
+                    access_tier="owner",
+                    data={"task_id": task_id, "has_attachment": bool(attachment_note)},
+                )
 
                 # Send typing indicator
                 api("sendChatAction", chat_id=chat_id, action="typing")
