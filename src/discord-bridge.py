@@ -61,6 +61,7 @@ from util_paths import channel_access_path, claude_home_path, shared_personal_pa
 from task_priority import default_priority_for_source  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
+from task_body_guard import confine_user_content  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 REPO = resolve_workspace()
@@ -2947,7 +2948,14 @@ async def _handle_discord_message(message, force=False):
     # Inject tier-specific in-band instructions so the core agent cannot
     # accidentally process a non-owner task with full capabilities.
     # See CLAUDE.md "Discord access control" section for the policy.
-    user_task_text = f"[Discord @{username}] {text}{attachment_note}{reply_context}"
+    # Confine all user-derived content (message text + quoted reply context) so
+    # a newline can't forge a trusted task-file field (`access_tier: owner`) or
+    # a `===SUTANDO SYSTEM INSTRUCTIONS===` fence. The `[Discord @user]` prefix
+    # and bridge-generated attachment note can't match a header/fence, so it's
+    # safe to confine the whole assembled string. See task_body_guard.py.
+    user_task_text = confine_user_content(
+        f"[Discord @{username}] {text}{attachment_note}{reply_context}"
+    )
     # Write task text to a /tmp file and reference via `"$(cat ...)"` heredoc
     # form instead of shlex.quote'ing it inline. Reason: codex's stdin parser
     # hangs 7-20min on nested-quote escapes (`'"'"'` style) that arise when

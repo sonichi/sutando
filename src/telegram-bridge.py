@@ -33,6 +33,7 @@ except Exception:  # pragma: no cover — bridge must keep running
         return False
 from task_priority import default_priority_for_source  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
+from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path  # noqa: E402
 
 from workspace_default import resolve_workspace  # noqa: E402
@@ -709,7 +710,7 @@ def main():
                 task_file.write_text(
                     f"id: {task_id}\n"
                     f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
-                    f"task: [Telegram @{username}{forward_note}] {text}{attachment_note}\n"
+                    f"task: {confine_user_content(f'[Telegram @{username}{forward_note}] {text}{attachment_note}')}\n"
                     f"source: telegram\n"
                     f"chat_id: {chat_id}\n"
                     f"priority: {priority}\n"
