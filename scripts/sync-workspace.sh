@@ -205,8 +205,17 @@ _host() {
     local env="${SUTANDO_HOST_LABEL:-${SUTANDO_HOST_OVERRIDE:-}}"
     if [ -n "$env" ]; then
         printf '%s\n' "$env"
-    elif command -v scutil >/dev/null 2>&1 && scutil --get LocalHostName >/dev/null 2>&1; then
-        scutil --get LocalHostName
+        return
+    fi
+    # Capture scutil ONCE and guard exit-0-but-empty output (parity with the
+    # py side's non-empty `.strip()` check) — an empty LocalHostName must not
+    # win over the hostname fallback.
+    local lhn=""
+    if command -v scutil >/dev/null 2>&1; then
+        lhn="$(scutil --get LocalHostName 2>/dev/null)"
+    fi
+    if [ -n "$lhn" ]; then
+        printf '%s\n' "$lhn"
     else
         hostname | sed 's/\..*//'
     fi
