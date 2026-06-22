@@ -60,7 +60,7 @@ import discord_config  # noqa: E402  — Sutando workspace-local discord config 
 from util_paths import channel_access_path, claude_home_path, shared_personal_path  # noqa: E402
 from task_priority import default_priority_for_source  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
-from result_markers import parse_markers  # noqa: E402
+from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
@@ -3503,8 +3503,60 @@ async def poll_results():
                 # `[no-send]` tasks persisted in tasks/ because `continue`
                 # skipped the cleanup block at the bottom of this loop.
                 _parsed = parse_markers(reply_text)
-                if any(a.kind == "skip" for a in _parsed.actions):
-                    # [no-send] / [REPLIED] / [deduped:] — silent archive.
+                _skip = next((a for a in _parsed.actions if a.kind == "skip"), None)
+                if _skip is not None:
+                    # [no-send] / [REPLIED] / [deduped:] — normally a silent
+                    # archive. GUARD: dedup is per-channel only. A
+                    # `[deduped: task-X]` whose holder X came from a DIFFERENT
+                    # channel is invalid (it would leave the asking channel
+                    # silent). Reject it and RE-QUEUE the original task with a
+                    # trusted ===SYSTEM=== note so the core re-answers it in its
+                    # own channel. Loop guard: a task that comes back
+                    # cross-channel-deduped a SECOND time is not re-queued again
+                    # — notify in-channel instead (owner-directed).
+                    if _skip.value == "deduped" and _skip.extra:
+                        try:
+                            _holder_file = find_task_file(TASKS_DIR, _skip.extra)
+                            _holder_text = _holder_file.read_text() if _holder_file else None
+                            _target = dedup_cross_channel_target(channel.id, _holder_text)
+                            if _target:
+                                _orig_file = find_task_file(TASKS_DIR, task_id)
+                                _orig_text = _orig_file.read_text() if _orig_file else None
+                                _count = dedup_requeue_count(_orig_text)
+                                if _count >= 1:
+                                    # Second time — don't loop; flag it.
+                                    print(
+                                        f"  [dedup] cross-channel retry failed for {task_id} "
+                                        f"(holder {_skip.extra} in #{_target}) — notifying",
+                                        flush=True,
+                                    )
+                                    await channel.send(
+                                        f"⚠️ Couldn't auto-correct a cross-channel dedup for "
+                                        f"`{task_id}` (folded into `{_skip.extra}` in <#{_target}>) "
+                                        f"even after a re-queue — flagging instead of looping. "
+                                        f"This needs a direct answer here."
+                                    )
+                                else:
+                                    # First time — reject + re-queue for an
+                                    # in-channel answer.
+                                    _new_id = f"task-{int(time.time() * 1000)}"
+                                    _requeued = build_requeued_task(
+                                        _orig_text or "", _new_id, _count + 1,
+                                        channel.id, _skip.extra,
+                                    )
+                                    (TASKS_DIR / f"{_new_id}.txt").write_text(_requeued)
+                                    # Route the re-answer back to THIS channel.
+                                    pending_replies[_new_id] = channel
+                                    save_pending_replies()
+                                    print(
+                                        f"  [dedup] cross-channel reject: {task_id} (#{channel.id}) "
+                                        f"folded into {_skip.extra} (#{_target}) — re-queued as "
+                                        f"{_new_id} for in-channel answer",
+                                        flush=True,
+                                    )
+                        except Exception as e:
+                            # Best-effort; never block the archive of this result.
+                            print(f"  [dedup] cross-channel reject/requeue failed: {e}", flush=True)
                     print(f"  Skipped (already replied or deduped): {task_id}")
                     archive_file(result_file, "results", task_id)
                     task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
