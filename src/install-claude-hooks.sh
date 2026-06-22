@@ -7,10 +7,18 @@
 # `~/.claude/settings.json` — they only fire when Claude runs in this project
 # context, not in unrelated sessions.
 #
-# Hooks installed (3):
+# Hooks installed (4):
 #   PreCompact  → cp $TRANSCRIPT_PATH ~/Desktop/sutando-conversations/...
 #   PreCompact  → bash src/session-handoff.sh "$TRANSCRIPT_PATH"
+#   SessionEnd  → bash src/session-handoff.sh "$TRANSCRIPT_PATH"
 #   Stop        → bash src/check-pending-tasks.sh
+#
+# The SessionEnd → session-handoff.sh hook fires session-state.md on a clean
+# exit (⌘Q / crash) too, not just on PreCompact — so the last session's tail
+# isn't lost when no compaction happened before close. It was previously
+# installed (user-level) by catchup-after-startup's install-hook.sh; that skill
+# was removed (#1737-equivalent), so the install moves here, at the correct
+# PROJECT-level scope (per feedback_claude_code_hook_scoping).
 #
 # Historical note: a 4th hook (`Stop` → watcher-cleanup PID kill, the #1065
 # fix) was removed 2026-05-24.  Claude Code's `Stop` event fires on
@@ -52,6 +60,7 @@ SETTINGS="$REPO_DIR/.claude/settings.json"
 HOOKS=(
   "PreCompact|cp \"\$TRANSCRIPT_PATH\" \"\$HOME/Desktop/sutando-conversations/\$(date +%Y-%m-%dT%H-%M-%S).jsonl\""
   "PreCompact|bash \$HOME/Desktop/sutando/src/session-handoff.sh \"\$TRANSCRIPT_PATH\""
+  "SessionEnd|bash \$HOME/Desktop/sutando/src/session-handoff.sh \"\$TRANSCRIPT_PATH\""
   "Stop|bash \$HOME/Desktop/sutando/src/check-pending-tasks.sh"
 )
 
