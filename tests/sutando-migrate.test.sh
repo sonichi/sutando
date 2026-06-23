@@ -55,12 +55,16 @@ mkdir -p "$C/tasks"
 echo "id: live-task" > "$C/tasks/task-now.txt"  # mtime = now → inflight
 
 # --- Run scan + commit with E2E source hooks ---
+# Use SUTANDO_MIGRATE_DEST (not SUTANDO_WORKSPACE) — SUTANDO_WORKSPACE has been
+# deprecated since v0.8/M0 and is no longer honored by sutando-config.sh workspace
+# resolution. SUTANDO_MIGRATE_DEST is the proper test hook that bypasses the
+# resolver entirely (line ~651 in sutando-migrate.sh).
 RUN_MIGRATE() {
     SUTANDO_MIGRATE_SRC_A="$A" \
     SUTANDO_MIGRATE_SRC_B="$B" \
     SUTANDO_MIGRATE_SRC_C="$C" \
-    SUTANDO_WORKSPACE="$DEST" \
-        bash "$MIGRATE" --respect-env "$@"
+    SUTANDO_MIGRATE_DEST="$DEST" \
+        bash "$MIGRATE" "$@"
 }
 
 # Also add a stale task to source B for archive-routing assertion
@@ -87,7 +91,7 @@ echo
 echo "==== TEST: commit ===="
 COMMIT_OUT="$(RUN_MIGRATE commit --source A,B,C 2>&1)"
 echo "$COMMIT_OUT" | grep -E "Committing source|copied:|identical:|kept-dest:|sidecar:|skipped:|sentinel:|backup|COMMIT" | head -40
-INITIAL_BACKUP_ID="$(echo "$COMMIT_OUT" | grep -E "^sutando-migrate: backup" | head -1 | sed -E 's@.*migration-backup-(.+)\.tar\.gz.*@\1@')"
+INITIAL_BACKUP_ID="$(echo "$COMMIT_OUT" | grep -E "migration-backup-.*\.tar\.gz" | head -1 | sed -E 's@.*migration-backup-(.+)\.tar\.gz.*@\1@')"
 
 echo
 echo "==== ASSERTIONS ===="

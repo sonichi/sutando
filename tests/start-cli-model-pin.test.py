@@ -48,6 +48,7 @@ def _launch_argv(model_env: "str | None") -> list[str]:
             "PATH": f"{bind}:/bin",
             "HOME": str(td),
             "ARGS_FILE": str(args_file),
+            "SUTANDO_CORE_AUTH_PREFLIGHT": "0",
         }
         if model_env is not None:
             env["SUTANDO_CORE_MODEL"] = model_env
