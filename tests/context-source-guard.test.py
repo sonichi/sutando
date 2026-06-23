@@ -3,8 +3,8 @@
 channel reads (hooks/context-source-guard.py).
 
 Drives the real hook via stdin (the way Claude Code invokes it). Fully self-
-contained: a fixture access.json + a temp workspace are pointed at via env
-(SUTANDO_DISCORD_ACCESS_FILE / SUTANDO_WORKSPACE), and the guild cache is seeded
+contained: a fixture access.json + a temp state dir are pointed at via env
+(SUTANDO_DISCORD_ACCESS_FILE / SUTANDO_DISCORD_STATE_DIR), and the guild cache is seeded
 so no live Discord is touched. All ids are FICTITIOUS. Run:
   python3 tests/context-source-guard.test.py
 """
@@ -30,7 +30,7 @@ STATE_DIR.mkdir(parents=True, exist_ok=True)
 acc = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
 json.dump({"groups": {PUBLIC_CH: {"contextNotFrom": [PRIVATE_GUILD]}}}, acc); acc.close()
 
-ENV = {**os.environ, "SUTANDO_WORKSPACE": WS, "SUTANDO_DISCORD_ACCESS_FILE": acc.name}
+ENV = {**os.environ, "SUTANDO_DISCORD_STATE_DIR": str(STATE_DIR), "SUTANDO_DISCORD_ACCESS_FILE": acc.name}
 ENV.pop("DISCORD_BOT_TOKEN", None)  # force offline (cache-only) guild resolution
 
 

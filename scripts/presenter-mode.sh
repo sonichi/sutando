@@ -24,9 +24,15 @@
 
 set -euo pipefail
 
-REPO="$(cd "$(dirname "$0")/.." && pwd)"
-SENTINEL="$REPO/state/presenter-mode.sentinel"
-mkdir -p "$REPO/state"
+# Resolve workspace via the canonical helper so the sentinel lands in
+# the same place Python consumers (discord-bridge, telegram-bridge,
+# slack-bridge, check-pending-questions) read from. Before this fix
+# the script used the git-repo root ($0/../), which is a different
+# directory from resolve_workspace() → <repo>/workspace/ (M0 default).
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+WORKSPACE="$(bash "$SCRIPT_DIR/sutando-config.sh" workspace)"
+SENTINEL="$WORKSPACE/state/presenter-mode.sentinel"
+mkdir -p "$WORKSPACE/state"
 
 cmd="${1:-status}"
 

@@ -38,17 +38,12 @@ ACCESS_FILE = os.environ.get("SUTANDO_DISCORD_ACCESS_FILE",
 ENV_FILE = os.environ.get("SUTANDO_DISCORD_ENV_FILE",
                           os.path.join(_CFG, "channels", "discord", ".env"))
 # Hook state (active-serving-channel + guild cache) is session-scoped and only
-# read/written by this hook — store under CLAUDE_CONFIG_DIR/state/ rather than
-# the deprecated ~/.sutando/workspace default. SUTANDO_WORKSPACE still accepted
-# as an override for test isolation (tests seed the guild cache there).
-_ws_env = os.environ.get("SUTANDO_WORKSPACE", "")
+# read/written by this hook — store under CLAUDE_CONFIG_DIR/state/. The env var
+# SUTANDO_DISCORD_STATE_DIR is accepted as a direct state-dir override for test
+# isolation (tests seed the guild cache there).
 _STATE_DIR = (
-    os.path.join(
-        os.path.expanduser(_ws_env.replace("~", os.path.expanduser("~"))),
-        "state",
-    )
-    if _ws_env
-    else os.path.join(_CFG, "state")
+    os.environ.get("SUTANDO_DISCORD_STATE_DIR")
+    or os.path.join(_CFG, "state")
 )
 STATE = os.path.join(_STATE_DIR, "active-serving-channel.json")
 API = "https://discord.com/api/v10"
