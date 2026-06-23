@@ -3511,7 +3511,10 @@ async def poll_results():
                 # Clear the progress-streamer's tier map here (NOT only in
                 # poll_progress) so it's bounded even when the feature flag is
                 # OFF — otherwise this dict would leak one entry per task.
-                pending_task_tiers.pop(task_id, None)
+                # Capture the tier BEFORE the pop so the outbound obs event
+                # below labels actor.access_tier correctly (a later .get()
+                # would always read "owner" once popped here).
+                _task_tier = pending_task_tiers.pop(task_id, None) or "owner"
                 save_pending_replies()
                 # Skip sending if already replied directly (core agent used MCP).
                 # Clean up the result AND task files so the watcher doesn't
@@ -3787,7 +3790,7 @@ async def poll_results():
                     _emit_channel(
                         "discord", "out",
                         channel_id=str(getattr(channel, "id", "")),
-                        access_tier=pending_task_tiers.get(task_id, "owner"),
+                        access_tier=_task_tier,
                         data={
                             "task_id": task_id,
                             "is_dm": isinstance(channel, discord.DMChannel),
