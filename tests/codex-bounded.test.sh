@@ -33,5 +33,33 @@ pgrep -f "sleep 30" >/dev/null 2>&1 && stray=STRAY || stray=none
 check "no stray sleep left running" none "$stray"
 rm -f "$MARK"
 
+# --- stall watchdog (--stall) ---
+
+# 5. a SILENT command (no output) is killed as STALLED → exit 125, promptly
+t0=$(date +%s)
+bash "$RUNNER" --stall 2 --max 60 -- bash -c 'sleep 30' >/dev/null 2>&1; rc=$?
+t1=$(date +%s)
+check "silent cmd killed as stalled → exit 125" 125 "$rc"
+[ $(( t1 - t0 )) -lt 12 ] && el=ok || el=slow
+check "stalled cmd returned promptly (<12s)" ok "$el"
+
+# 6. a command that keeps emitting output is NOT killed (stays under stall window)
+#    prints every 1s for ~6s with a 3s stall window → survives → forwards exit 0
+bash "$RUNNER" --stall 3 --max 60 -- bash -c 'for i in 1 2 3 4 5 6; do echo tick; sleep 1; done' >/dev/null 2>&1
+check "progressing cmd not killed → exit 0" 0 "$?"
+
+# 7. --max backstop fires even when output never stalls → exit 124
+#    continuous output (no stall) but exceeds the 3s absolute cap
+t0=$(date +%s)
+bash "$RUNNER" --stall 30 --max 3 -- bash -c 'while true; do echo tick; sleep 0.5; done' >/dev/null 2>&1; rc=$?
+t1=$(date +%s)
+check "continuous cmd hits --max cap → exit 124" 124 "$rc"
+[ $(( t1 - t0 )) -lt 10 ] && el=ok || el=slow
+check "--max cap returned promptly (<10s)" ok "$el"
+
+# 8. back-compat: bare positional integer still means a pure --max deadline (exit 124)
+bash "$RUNNER" 2 -- bash -c 'sleep 30' >/dev/null 2>&1
+check "positional deadline back-compat → exit 124" 124 "$?"
+
 [ "$fail" -eq 0 ] && echo PASS || echo FAILED
 exit $fail
