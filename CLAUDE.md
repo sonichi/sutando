@@ -350,7 +350,7 @@ python3 skills/secret-vault/secret-vault.py env KEY1 KEY2 -- python3 x.py  # inj
 
 If an integration needs a key that isn't in the vault yet, ask the user to send `vault set KEY value` via Slack or Discord — the bridge intercepts it securely before it touches disk.
 
-**`[VAULT-NEEDS-DETECT-SECRETS]` placeholder.** The vault interceptor validates *unquoted* values with `detect-secrets` (the `vault set` regex is deliberately loose and matches mid-prose, so the scanner is the false-positive backstop). On a host where `detect-secrets` isn't installed, an unquoted `vault set` is **refused** (not stored) and the value is replaced with `[VAULT-NEEDS-DETECT-SECRETS]` in the task. When you read a task whose body contains this placeholder: install the dep (`python3 -m pip install detect-secrets`), confirm `python3 -c "import detect_secrets"` succeeds, then tell the owner in the originating channel that their `vault set` was refused (couldn't validate without the dep) and to re-send it — now it'll store. The install is idempotent, so a repeat is a harmless no-op (no dedup needed). Never echo or ask for the secret value. Quoted values (`vault set KEY "value"`) bypass the scanner and store even without the dep, so suggest quoting as the immediate workaround.
+**`[VAULT-NEEDS-DETECT-SECRETS]` placeholder.** When a task body contains this, an unquoted `vault set` was refused because `detect-secrets` isn't installed on the host. Act: `pip install detect-secrets`, then tell the owner (in the originating channel) to re-send — or to quote the value as an immediate workaround. Never echo the secret. (Why it refuses rather than stores: `src/vault_intercept.py`.)
 
 ## Built-in tools
 
