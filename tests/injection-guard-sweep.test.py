@@ -117,6 +117,32 @@ for _fb, _fname in (
     )
 
 # ---------------------------------------------------------------------------
+# github-webhook.py: access_tier: other MUST appear before task: (security-critical)
+# External GitHub events are untrusted — owner-tier processing must be impossible
+# even if confine_user_content is somehow bypassed.
+# ---------------------------------------------------------------------------
+
+_gh = _src("src/github-webhook.py")
+# Find the task_content block
+_gh_tc_start = _gh.find("task_content = (")
+_gh_tc_end = _gh.find(").write_text(", _gh_tc_start) if _gh_tc_start > 0 else -1
+_gh_tc_block = _gh[_gh_tc_start:_gh_tc_end + 30] if _gh_tc_start > 0 and _gh_tc_end > 0 else ""
+_check(
+    "github-webhook: access_tier: other present in task_content",
+    '"access_tier: other' in _gh_tc_block or "'access_tier: other'" in _gh_tc_block
+    or "access_tier: other" in _gh_tc_block,
+    "github-webhook.py task_content must set access_tier: other — external GitHub "
+    "events must NEVER be elevated to owner-tier processing",
+)
+_check(
+    "github-webhook: access_tier: other appears before task: in task_content",
+    "access_tier" in _gh_tc_block and "task:" in _gh_tc_block
+    and _gh_tc_block.index("access_tier") < _gh_tc_block.index('"task:'),
+    "github-webhook.py: access_tier: other must precede task: in task_content "
+    "(belt-and-suspenders: a ZWSP bypass won't let injected content raise the tier)",
+)
+
+# ---------------------------------------------------------------------------
 # Python ag2-relay: uses _one_line() as structural equivalent
 # (collapses newlines → prevents line-based injection; no ZWSP needed)
 # ---------------------------------------------------------------------------
@@ -240,6 +266,6 @@ _check(
 # ---------------------------------------------------------------------------
 
 _total = _passed + _failed
-print(f"injection-guard-sweep: {_passed}/{_total} passed"  # expected 29/29
+print(f"injection-guard-sweep: {_passed}/{_total} passed"  # expected 31/31
       + ("" if _failed == 0 else f" — {_failed} FAILED"))
 sys.exit(0 if _failed == 0 else 1)
