@@ -49,6 +49,8 @@ setup_sandbox() {
   BIN_STUB="$SANDBOX/bin"
   export HOME="$SANDBOX/home"
   export SUTANDO_WORKSPACE="$SANDBOX/workspace"
+  export SUTANDO_CORE_AUTH_PREFLIGHT=0
+  unset CLAUDE_CONFIG_DIR CLAUDE_BIN
 
   mkdir -p "$REPO_FAKE/scripts" "$REPO_FAKE/src" "$BIN_STUB" \
            "$HOME" "$SUTANDO_WORKSPACE/state"
@@ -170,8 +172,9 @@ test_valid_config_exports_env() {
     echo "  FAIL: CLAUDE_CONFIG_DIR not in claude's env"
     cleanup_sandbox; return 1
   fi
-  # Must point at SUTANDO_WORKSPACE/.claude-sutando.
-  expected="CLAUDE_CONFIG_DIR=$SUTANDO_WORKSPACE/.claude-sutando"
+  # Must point at REPO_FAKE/workspace/.claude-sutando (config says ${REPO_DIR}/workspace;
+  # use pwd -P to get the canonical path so /var → /private/var on macOS doesn't bite).
+  expected="CLAUDE_CONFIG_DIR=$(cd "$REPO_FAKE/workspace" && pwd -P)/.claude-sutando"
   if [ "$ccd_in_env" != "$expected" ]; then
     echo "  FAIL: CLAUDE_CONFIG_DIR mismatch"
     echo "    expected : $expected"
