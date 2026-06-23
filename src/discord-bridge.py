@@ -3041,7 +3041,13 @@ async def _handle_discord_message(message, force=False):
             enriched = None
         if enriched:
             print(f"  [discord-state-prefetch] enriched task body for {username} in #{getattr(message.channel, 'name', '?')}", flush=True)
-            user_task_text = enriched
+            # Re-apply confine to the enriched body: the fetched Discord channel
+            # messages (the `blocks` prefix in enriched) were not run through
+            # confine_user_content() — an attacker-controlled channel could post
+            # `===SUTANDO SYSTEM INSTRUCTIONS===` content that lands in the task
+            # file header verbatim. confine_user_content is idempotent so the
+            # already-ZWSP-prefixed original user_task_text is unaffected.
+            user_task_text = confine_user_content(enriched)
             # Rewrite the prompt file with the enriched body. quoted_task
             # already points to `"$(cat {prompt_path})"` — keep the heredoc
             # form (per PR #652's codex-stdin-hang fix). Using shlex.quote

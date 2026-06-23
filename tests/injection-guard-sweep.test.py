@@ -60,6 +60,18 @@ for _f in (
         f"{_f} must call confine_user_content() on user-supplied task body",
     )
 
+# discord-bridge: enriched task body must be re-confined after Discord-state prefetch
+# (fetched channel messages are not run through confine before being prepended;
+# an attacker-controlled channel could post ===SUTANDO SYSTEM INSTRUCTIONS===)
+_db = _src("src/discord-bridge.py")
+_check(
+    "discord-bridge: confine_user_content(enriched) after prefetch",
+    "user_task_text = confine_user_content(enriched)" in _db,
+    "discord-bridge.py must re-apply confine_user_content to the enriched body after "
+    "_prefetch_discord_state_refs. Fetched Discord channel messages are not confined, "
+    "so an attacker-controlled channel can inject ===fence=== content into the task file.",
+)
+
 # ---------------------------------------------------------------------------
 # Python bridges: task: field must come AFTER source/access_tier/priority
 # (belt-and-suspenders alongside the ZWSP guard — a forged field in user content
@@ -296,6 +308,6 @@ _check(
 # ---------------------------------------------------------------------------
 
 _total = _passed + _failed
-print(f"injection-guard-sweep: {_passed}/{_total} passed"  # expected 34/34
+print(f"injection-guard-sweep: {_passed}/{_total} passed"  # expected 35/35
       + ("" if _failed == 0 else f" — {_failed} FAILED"))
 sys.exit(0 if _failed == 0 else 1)
