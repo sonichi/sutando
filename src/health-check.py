@@ -72,7 +72,7 @@ MEMORY_DIR = Path(os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir()))
 # Checks
 # ---------------------------------------------------------------------------
 
-def check_port(port: int, name: str, probe: bool = False) -> dict:
+def check_port(port: int, name: str, probe: bool = False, timeout: float = 2) -> dict:
     """Check if a port is listening, optionally probing for a live response.
 
     A wedged server can keep its listen socket open while never answering
@@ -84,7 +84,7 @@ def check_port(port: int, name: str, probe: bool = False) -> dict:
     """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(2)
+            s.settimeout(timeout)
             result = s.connect_ex(("127.0.0.1", port))
             up = result == 0
             if up and probe:
@@ -716,6 +716,14 @@ def check_voice_transport(voice_check: dict) -> dict:
                 check["status"] = "fail"
                 check["detail"] = f"stuck CONNECTING ~{elapsed_min}min after code={code} transport close — needs kickstart"
                 check["_stuck_connecting"] = True
+            elif code == "1008":
+                # code=1008 "The operation was aborted." — Gemini Live forces a
+                # disconnect and the voice agent reconnects within ~30s. Health
+                # probes sometimes fire inside that window and see a close with
+                # no subsequent setup-complete yet. Downgrade to warn so the
+                # dashboard doesn't stay red through a normal self-healing cycle.
+                check["status"] = "warn"
+                check["detail"] = "transport cycling (code=1008 — Gemini aborted; voice self-recovers within ~30s)"
             elif code == "1006":
                 # code=1006 is an abnormal network close (often a DNS blip). If DNS
                 # resolves now the transport will self-recover on next client connect
@@ -1053,7 +1061,7 @@ def run_all_checks() -> list[dict]:
 
     # Optional services (downgrade missing to warning, not failure)
     for port, name in [(7843, "agent-api"), (7844, "dashboard"), (7845, "screen-capture")]:
-        c = check_port(port, name, probe=True)
+        c = check_port(port, name, probe=True, timeout=5)
         if c["status"] == "down":
             c["status"] = "warn"
             c["detail"] = "not running (optional)"
