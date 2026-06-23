@@ -1079,10 +1079,12 @@ def run_all_checks() -> list[dict]:
     checks.append(check_tcc_documents_access())
 
     # Critical files
+    # .env may live at repo root (startup.sh default) or workspace root (workspace contract).
+    _env_path = REPO_DIR / ".env" if (REPO_DIR / ".env").exists() else WORKSPACE_DIR / ".env"
     for name, path in [
         ("CLAUDE.md", REPO_DIR / "CLAUDE.md"),
         ("build_log.md", WORKSPACE_DIR / "build_log.md"),
-        (".env", REPO_DIR / ".env"),
+        (".env", _env_path),
     ]:
         checks.append(check_file(path, name))
 
@@ -1111,7 +1113,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_host_subtrees())
 
     # Phone conversation server (optional — only check if Twilio configured and not skipped)
-    env_path = REPO_DIR / ".env"
+    env_path = _env_path
     if env_path.exists():
         env_content = env_path.read_text()
         has_twilio = "TWILIO_ACCOUNT_SID=" in env_content and not env_content.split("TWILIO_ACCOUNT_SID=")[1].startswith("\n")
