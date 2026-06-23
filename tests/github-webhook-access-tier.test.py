@@ -83,12 +83,13 @@ def _test_access_tier_other():
         task_id = f"task-gh-test-{int(time.time() * 1000)}"
         from task_body_guard import confine_user_content
         safe_task = confine_user_content(task_text.strip())
+        # task: is last (defense-in-depth): source: and access_tier: come before
         content = (
             f"id: {task_id}\n"
             f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
-            f"task: {safe_task}\n"
             f"source: github\n"
             f"access_tier: other\n"
+            f"task: {safe_task}\n"
         )
         task_file = _mod.TASKS_DIR / f"{task_id}.txt"
         task_file.write_text(content)
@@ -196,6 +197,15 @@ def _test_structural_uses_confine():
         "no-replace-newline-pipe",
         'replace("\\n", " | ")' not in src,
         "old replace-newline-with-pipe sanitization must be removed",
+    )
+    # task: must come AFTER source: and access_tier: (defense-in-depth field order)
+    src_pos = src.find('"source: github\\n"')
+    tier_pos = src.find('"access_tier: other\\n"')
+    task_pos = src.find('"task: {safe_task}\\n"')
+    _check(
+        "task-field-is-last",
+        src_pos > 0 and tier_pos > 0 and task_pos > 0 and task_pos > tier_pos > src_pos,
+        f"task: must be last (after source: and access_tier:) — src={src_pos}, tier={tier_pos}, task={task_pos}",
     )
 
 

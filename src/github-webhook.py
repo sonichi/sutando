@@ -158,12 +158,16 @@ class WebhookHandler(BaseHTTPRequestHandler):
             # prior approach only stripped \n, leaving bare \r intact — Python
             # text-mode re-splits \r into a new line on read, enabling a forge.
             safe_task = confine_user_content(task_text.strip())
+            # task: is last so the (multi-line) GitHub body can't forge the
+            # trusted fields below it even if confine_user_content is bypassed.
+            # access_tier: other is security-critical — external events must
+            # never be elevated to owner-tier processing.
             task_content = (
                 f"id: {task_id}\n"
                 f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
-                f"task: {safe_task}\n"
                 f"source: github\n"
                 f"access_tier: other\n"
+                f"task: {safe_task}\n"
             )
             TASKS_DIR.mkdir(exist_ok=True)
             (TASKS_DIR / f"{task_id}.txt").write_text(task_content)
