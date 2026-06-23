@@ -350,8 +350,6 @@ python3 skills/secret-vault/secret-vault.py env KEY1 KEY2 -- python3 x.py  # inj
 
 If an integration needs a key that isn't in the vault yet, ask the user to send `vault set KEY value` via Slack or Discord — the bridge intercepts it securely before it touches disk.
 
-**`[VAULT-NEEDS-DETECT-SECRETS]` placeholder.** When a task body contains this, an unquoted `vault set` was refused because `detect-secrets` isn't installed on the host. Act: `pip install detect-secrets`, then tell the owner (in the originating channel) to re-send — or to quote the value as an immediate workaround. Never echo the secret. (Why it refuses rather than stores: `src/vault_intercept.py`.)
-
 ## Built-in tools
 
 **When the user asks for a capability not visible in this file (email, calendar, iMessage, X, screen capture, browser automation, phone calls, etc.), check [`docs/built-in-tools.md`](docs/built-in-tools.md) BEFORE refusing or trying to invent a tool.** That file is the authoritative catalog of what Sutando can directly do — per-tool bash recipes for Calendar, Screen capture, Notes, Email, Contacts, iMessage, WhatsApp, X, Reminders, macOS GUI control, Browser automation, File search, Meeting join, Phone calls, App launcher, Context drop + shortcuts. Kept out of CLAUDE.md to save per-session context budget.

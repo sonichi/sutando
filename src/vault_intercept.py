@@ -172,12 +172,13 @@ def intercept_vault_commands(text: str) -> InterceptResult:
                 # detect-secrets. Without it we can't tell a real secret from prose,
                 # so storing unconditionally would store every "vault set X Y" mention
                 # as junk AND redact legitimate text. Fail safe: refuse to store and
-                # mark the value with a placeholder the core agent recognizes (see
-                # CLAUDE.md "Vault" → core installs detect-secrets, then asks the owner
-                # to re-send). Quoted values never reach here — they took the is_quoted
-                # branch and store directly. No bridge-side pip-install (that would be
-                # env mutation inside a message handler) and no separate task: the
-                # refusal rides the normal task to core with channel context intact.
+                # leave a SELF-DOCUMENTING placeholder in the task. The instruction
+                # lives in the placeholder itself (co-located with the event) rather
+                # than in always-loaded CLAUDE.md — zero permanent context cost, and
+                # the agent reading the task sees exactly what to do. Quoted values
+                # never reach here (is_quoted branch stores directly). No bridge-side
+                # pip-install (env mutation in a message handler) and no separate task:
+                # the refusal rides the normal task to core, channel context intact.
                 print(
                     f"vault: detect-secrets not installed — refused unquoted "
                     f"`vault set {key}` (can't validate). Core will install the dep; "
@@ -185,7 +186,13 @@ def intercept_vault_commands(text: str) -> InterceptResult:
                     flush=True,
                 )
                 failed.append(key)
-                return f"vault set {key} [VAULT-NEEDS-DETECT-SECRETS]"
+                return (
+                    f"vault set {key} [vault: REFUSED — detect-secrets not installed, "
+                    f"can't validate an unquoted value. AGENT: run "
+                    f"'python3 -m pip install detect-secrets', then tell the owner to "
+                    f"re-send this vault set (or quote the value next time). Never echo "
+                    f"or ask for the value.]"
+                )
             if not scan_secrets(value):
                 # Not a known secret pattern — assume this is prose, leave it alone.
                 return m.group(0)
