@@ -161,10 +161,11 @@ def test_sms_task_field_is_last():
     assert sms_start > 0, "handle_twilio_sms not found"
     sms_block = SRC[sms_start:sms_start + 1200]
     src_pos = sms_block.find('"source: twilio_sms\\n"')
-    from_pos = sms_block.find('"from: {sender}\\n"')
-    task_pos = sms_block.find('"task: SMS from {sender}:')
+    from_pos = sms_block.find('"from: {safe_sender}\\n"')
+    task_pos = sms_block.find('"task: SMS from {safe_sender}:')
     assert src_pos > 0 and from_pos > 0 and task_pos > 0, (
-        f"SMS field templates not found: source={src_pos}, from={from_pos}, task={task_pos}"
+        f"SMS field templates not found: source={src_pos}, from={from_pos}, task={task_pos}. "
+        "If sender variable was renamed, update these patterns."
     )
     assert task_pos > from_pos, (
         f"SMS task: must come after from: (task={task_pos}, from={from_pos})"
@@ -177,10 +178,11 @@ def test_voicemail_task_field_is_last():
     assert vm_start > 0, "handle_twilio_transcription not found"
     vm_block = SRC[vm_start:vm_start + 1200]
     src_pos = vm_block.find('"source: twilio_voicemail\\n"')
-    from_pos = vm_block.find('"from: {caller}\\n"')
-    task_pos = vm_block.find('"task: Voicemail from {caller}:')
+    from_pos = vm_block.find('"from: {safe_caller}\\n"')
+    task_pos = vm_block.find('"task: Voicemail from {safe_caller}:')
     assert src_pos > 0 and from_pos > 0 and task_pos > 0, (
-        f"voicemail field templates not found: source={src_pos}, from={from_pos}, task={task_pos}"
+        f"voicemail field templates not found: source={src_pos}, from={from_pos}, task={task_pos}. "
+        "If caller variable was renamed, update these patterns."
     )
     assert task_pos > from_pos, (
         f"voicemail task: must come after from: (task={task_pos}, from={from_pos})"
@@ -219,10 +221,11 @@ def test_voice_task_field_is_last():
     assert voice_start > 0, "handle_twilio_voice not found"
     voice_block = SRC[voice_start:voice_start + 1200]
     src_pos = voice_block.find('"source: twilio_voice\\n"')
-    from_pos = voice_block.find('"from: {caller}\\n"')
+    from_pos = voice_block.find('"from: {safe_caller}\\n"')
     task_pos = voice_block.find('"task: Incoming phone call from')
     assert src_pos > 0 and from_pos > 0 and task_pos > 0, (
-        f"voice field templates not found: source={src_pos}, from={from_pos}, task={task_pos}"
+        f"voice field templates not found: source={src_pos}, from={from_pos}, task={task_pos}. "
+        "If caller variable was renamed, update these patterns."
     )
     assert task_pos > from_pos > src_pos, (
         f"voice task: must be last (source={src_pos}, from={from_pos}, task={task_pos})"
