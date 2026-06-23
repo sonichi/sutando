@@ -35,6 +35,23 @@ _SOURCE = {
     "whatsapp": "whatsapp-bridge",
 }
 
+# The bridges' access-control vocabulary (owner/team/other) onto the obs schema's
+# AccessTier (events.ts: owner/team/public/unknown). "other" is the bridges' name
+# for the schema's "public" (non-owner external); anything unrecognized — incl.
+# the fail-safe sentinel — is "unknown", never "owner". Keeps every emitted
+# channel event in-schema for downstream TS consumers.
+_TIER_TO_SCHEMA = {
+    "owner": "owner",
+    "team": "team",
+    "other": "public",
+    "public": "public",
+    "unknown": "unknown",
+}
+
+
+def _normalize_tier(tier: str) -> str:
+    return _TIER_TO_SCHEMA.get(tier, "unknown")
+
 
 def emit_channel(
     surface: str,
@@ -55,7 +72,7 @@ def emit_channel(
             "actor": {
                 "user_id": str(user_id),
                 "channel": surface,
-                "access_tier": access_tier,
+                "access_tier": _normalize_tier(access_tier),
             },
             "kind": f"channel.{surface}.{direction}",
             "outcome": outcome,

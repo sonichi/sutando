@@ -400,16 +400,30 @@ def send_file(chat_id, file_path, caption=""):
         print(f"  Send file failed: {e}")
         return {"ok": False}
 
-def send_reply(chat_id, text, task_id: str | None = None, access_tier: str = "unknown", extra_files: int = 0):
+def send_reply(chat_id, text, task_id: str | None = None) -> dict:
+    """Send a reply's text + any [file:]-marked attachments.
+
+    Returns a delivery summary ``{"text_chunks", "files_sent", "ok"}`` so the
+    caller can emit ONE accurate channel.telegram.out event. api()/send_file()
+    swallow HTTP errors (return {"ok": False} / None), so success can't be
+    assumed — we consult their return values. The task-reply path passes a
+    marker-stripped body and sends parsed.actions attachments itself, then folds
+    those into the same event (so file-only replies still report a delivery and
+    the count/outcome stay accurate)."""
     # Extract file paths: [file: /path/to/file] or [send: /path/to/file]
     file_pattern = re.compile(r'\[(?:file|send|attach):\s*([^\]]+)\]')
     files = file_pattern.findall(text)
     clean_text = file_pattern.sub('', text).strip()
+    text_chunks = (len(clean_text) // 4000 + 1) if clean_text else 0
+    delivered_ok = True
+    files_sent = 0
 
     # Send text (if any remains after extracting file refs)
     if clean_text:
         for i in range(0, len(clean_text), 4000):
-            api("sendMessage", chat_id=chat_id, text=clean_text[i:i+4000])
+            resp = api("sendMessage", chat_id=chat_id, text=clean_text[i:i+4000])
+            if not (isinstance(resp, dict) and resp.get("ok")):
+                delivered_ok = False
         try:
             import outbox_log
             outbox_log.append(
@@ -425,8 +439,13 @@ def send_reply(chat_id, text, task_id: str | None = None, access_tier: str = "un
     for fpath in files:
         fpath = fpath.strip()
         if _is_path_sendable(fpath):
-            send_file(chat_id, fpath)
-            print(f"  Sent file: {fpath}", flush=True)
+            resp = send_file(chat_id, fpath)
+            if isinstance(resp, dict) and resp.get("ok"):
+                files_sent += 1
+                print(f"  Sent file: {fpath}", flush=True)
+            else:
+                delivered_ok = False
+                print(f"  Send file failed: {fpath}", flush=True)
         elif os.path.isfile(fpath):
             api("sendMessage", chat_id=chat_id, text=f"(file access denied: {fpath})")
             print(f"  BLOCKED file: {fpath}")
@@ -437,24 +456,7 @@ def send_reply(chat_id, text, task_id: str | None = None, access_tier: str = "un
             # rationale as discord-bridge:poll_results.
             print(f"  file marker, file not found — likely a prose quotation: {fpath}", flush=True)
 
-    # Observability: one delivered-reply event. The task-reply path strips file
-    # markers from the body and sends attachments separately (from
-    # parsed.actions), so send_reply never re-finds them — the caller passes
-    # their count via extra_files. Without this, file-only replies emit nothing
-    # and text+attachment replies report file_count=0.
-    total_files = len(files) + extra_files
-    if clean_text or total_files:
-        _emit_channel(
-            "telegram", "out",
-            user_id=str(chat_id),
-            channel_id=str(chat_id),
-            access_tier=access_tier,
-            data={
-                "task_id": task_id,
-                "text_chunks": (len(clean_text) // 4000 + 1) if clean_text else 0,
-                "file_count": total_files,
-            },
-        )
+    return {"text_chunks": text_chunks, "files_sent": files_sent, "ok": delivered_ok}
 
 def _recover_orphan_sending_files() -> int:
     """Restart-safety: rename any orphan `results/proactive-*.sending`
@@ -831,7 +833,16 @@ def main():
                             f.unlink(missing_ok=True)
                             continue
                         try:
-                            send_reply(int(owner_id), text, access_tier="owner")  # proactive → owner
+                            _s = send_reply(int(owner_id), text)
+                            if _s["text_chunks"] or _s["files_sent"]:
+                                _emit_channel(
+                                    "telegram", "out",
+                                    user_id=str(owner_id),
+                                    channel_id=str(owner_id),
+                                    access_tier="owner",  # proactive → owner
+                                    outcome="ok" if _s["ok"] else "error",
+                                    data={"text_chunks": _s["text_chunks"], "file_count": _s["files_sent"]},
+                                )
                             print(f"  [proactive] sent to {owner_id}: {text[:80]}")
                         except Exception as e:
                             print(f"  [proactive] failed: {e}")
@@ -867,20 +878,40 @@ def main():
                 try:
                     # Use parsed.body — all markers stripped — so [channel:] etc. never leak.
                     # File attachments are in parsed.actions; send_reply() won't re-find them,
-                    # so pass their count for the outbound obs event's file_count.
-                    _attach_count = sum(1 for a in parsed.actions if a.kind == "attach")
-                    send_reply(chat_id, parsed.body, task_id=task_id, access_tier=pending_task_tiers.get(task_id, "unknown"), extra_files=_attach_count)
+                    # so send them here and fold the result into ONE obs event below.
+                    _tier = pending_task_tiers.get(task_id, "unknown")
+                    _s = send_reply(chat_id, parsed.body, task_id=task_id)
+                    delivered_ok = _s["ok"]
+                    sent_files = _s["files_sent"]
                     for action in parsed.actions:
                         if action.kind == "attach":
                             fpath = action.value.strip()
                             if _is_path_sendable(fpath):
-                                send_file(chat_id, fpath)
-                                print(f"  Sent file: {fpath}", flush=True)
+                                resp = send_file(chat_id, fpath)
+                                if isinstance(resp, dict) and resp.get("ok"):
+                                    sent_files += 1
+                                    print(f"  Sent file: {fpath}", flush=True)
+                                else:
+                                    delivered_ok = False
+                                    print(f"  Send file failed: {fpath}", flush=True)
                             elif os.path.isfile(fpath):
                                 api("sendMessage", chat_id=chat_id, text=f"(file access denied: {fpath})")
                                 print(f"  BLOCKED file: {fpath}")
                             else:
                                 print(f"  file marker, file not found — likely a prose quotation: {fpath}", flush=True)
+                    # Observability: one delivered-reply event covering text +
+                    # externally-sent attachments. outcome reflects real success;
+                    # file_count is files actually delivered (api/send_file swallow
+                    # errors, so we must not assume "ok").
+                    if _s["text_chunks"] or sent_files or not delivered_ok:
+                        _emit_channel(
+                            "telegram", "out",
+                            user_id=str(chat_id),
+                            channel_id=str(chat_id),
+                            access_tier=_tier,
+                            outcome="ok" if delivered_ok else "error",
+                            data={"task_id": task_id, "text_chunks": _s["text_chunks"], "file_count": sent_files},
+                        )
                     print(f"  Replied to {chat_id}: {parsed.body[:80]}...", flush=True)
                 except Exception as e:
                     print(f"[Telegram] Reply error: {e}", flush=True)

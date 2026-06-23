@@ -71,6 +71,29 @@ class EmitChannelTest(unittest.TestCase):
         emit_channel("slack", "out", channel_id="C1")
         self.assertEqual(self.cap.events[0]["actor"]["access_tier"], "unknown")
 
+    def test_tier_normalized_to_schema(self) -> None:
+        # Bridge vocabulary (owner/team/other) → obs AccessTier
+        # (owner/team/public/unknown). "other" must map to the schema's
+        # "public"; anything unrecognized → "unknown" (never "owner").
+        cases = {
+            "owner": "owner",
+            "team": "team",
+            "other": "public",
+            "public": "public",
+            "unknown": "unknown",
+            "bogus": "unknown",
+        }
+        for raw, expected in cases.items():
+            self.cap.events.clear()
+            emit_channel("slack", "in", channel_id="C1", access_tier=raw)
+            self.assertEqual(self.cap.events[0]["actor"]["access_tier"], expected, raw)
+
+    def test_outcome_passthrough(self) -> None:
+        # A failed delivery must be emittable as outcome="error" (and obs never
+        # samples error away).
+        emit_channel("slack", "out", channel_id="C1", outcome="error")
+        self.assertEqual(self.cap.events[0]["outcome"], "error")
+
     def test_user_id_coerced_to_str(self) -> None:
         emit_channel("telegram", "in", user_id=12345, channel_id=12345)
         self.assertEqual(self.cap.events[0]["actor"]["user_id"], "12345")

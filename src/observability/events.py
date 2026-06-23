@@ -11,7 +11,9 @@ from __future__ import annotations
 from typing import Any, Literal, TypedDict
 
 Outcome = Literal["ok", "error", "denied"]
-AccessTier = Literal["owner", "team", "public"]
+# `public` = canonical non-owner-external (bridges' "other" maps onto it);
+# `unknown` = fail-safe when a tier can't be resolved (never assume "owner").
+AccessTier = Literal["owner", "team", "public", "unknown"]
 
 
 class Actor(TypedDict, total=False):

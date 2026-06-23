@@ -687,6 +687,11 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
 
     file_paths = [a.value for a in parsed.actions if a.kind == "attach"]
 
+    # Track real delivery: the Slack helpers swallow API errors, so the
+    # outbound obs event must consult these rather than assume success.
+    delivered_ok = True
+    sent_files = 0
+
     # Post the text body in 4000-char chunks (Slack's per-message limit is
     # 40k chars but readability suffers above ~4k).
     if clean_text:
@@ -701,6 +706,8 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
                 print(f"[Slack] chat_postMessage failed: {e}", flush=True)
                 all_chunks_sent = False
                 break
+        if not all_chunks_sent:
+            delivered_ok = False
         if all_chunks_sent:
             # Slack channel id starts with D (DM), C (public/private channel),
             # G (legacy group). Best-effort classification for the audit log.
@@ -720,7 +727,10 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
     for fpath in file_paths:
         if _is_path_sendable(fpath):
             if _send_file(channel, thread_ts, fpath):
+                sent_files += 1
                 print(f"  Sent file: {fpath}", flush=True)
+            else:
+                delivered_ok = False
         elif os.path.isfile(fpath):
             # Path exists but isn't allowlisted — surface a visible deny.
             try:
@@ -742,18 +752,22 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
             except Exception:
                 pass
 
-    # Observability: one delivered-reply event.
-    _emit_channel(
-        "slack", "out",
-        channel_id=str(channel),
-        access_tier=access_tier,
-        data={
-            "task_id": task_id,
-            "is_dm": str(channel).startswith("D"),
-            "is_thread": bool(thread_ts),
-            "file_count": len(file_paths),
-        },
-    )
+    # Observability: one delivered-reply event. outcome reflects whether the
+    # text chunks + file uploads actually succeeded (the helpers swallow API
+    # errors); file_count counts files actually delivered, not just intended.
+    if clean_text or file_paths:
+        _emit_channel(
+            "slack", "out",
+            channel_id=str(channel),
+            access_tier=access_tier,
+            outcome="ok" if delivered_ok else "error",
+            data={
+                "task_id": task_id,
+                "is_dm": str(channel).startswith("D"),
+                "is_thread": bool(thread_ts),
+                "file_count": sent_files,
+            },
+        )
 
 
 def _check_task_timeouts() -> None:
