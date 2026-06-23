@@ -204,6 +204,11 @@ def case_i_token_read_prefers_channel_env() -> list[str]:
     saved_home = os.environ.get("HOME")
     saved_repo = hc.REPO_DIR
     saved_env_token = os.environ.pop("SLACK_BOT_TOKEN", None)  # force the file path
+    # Unset CLAUDE_CONFIG_DIR / CLAUDE_HOME so claude_home_path() falls back to
+    # HOME/.claude (the path the test writes to). Without this, the real
+    # CLAUDE_CONFIG_DIR from the parent process overrides the temp HOME.
+    saved_ccd = os.environ.pop("CLAUDE_CONFIG_DIR", None)
+    saved_claude_home = os.environ.pop("CLAUDE_HOME", None)
     try:
         with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as repo:
             os.environ["HOME"] = home
@@ -233,6 +238,10 @@ def case_i_token_read_prefers_channel_env() -> list[str]:
             os.environ["HOME"] = saved_home
         if saved_env_token is not None:
             os.environ["SLACK_BOT_TOKEN"] = saved_env_token
+        if saved_ccd is not None:
+            os.environ["CLAUDE_CONFIG_DIR"] = saved_ccd
+        if saved_claude_home is not None:
+            os.environ["CLAUDE_HOME"] = saved_claude_home
         hc.REPO_DIR = saved_repo
     return fails
 
