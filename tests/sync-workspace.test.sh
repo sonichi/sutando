@@ -1241,6 +1241,7 @@ T27_OUT=$(env -i HOME="$HOME" PATH="$PATH" \
     SUTANDO_TEST_MODE=1 \
     SUTANDO_HOST_OVERRIDE=mighost \
     SUTANDO_WS_ID_OVERRIDE=t27mig \
+    SUTANDO_SYNC_SKIP_INIT_GUARD=1 \
     bash "$T27_REPO/scripts/sync-workspace.sh" --vault-url "$T27_VAULT" 2>&1)
 
 if echo "$T27_OUT" | grep -q "migrating local flat branch host/mighost"; then
