@@ -82,17 +82,19 @@ def _task_field_is_last_in_write_text(src: str) -> bool:
         if not in_block:
             if "task_file.write_text(" in line:
                 in_block = True
+                # Count parens on this line; the call itself opens one extra
+                # net paren that the rest of the block will close.
                 depth = line.count("(") - line.count(")")
+                # Collect keys on the trigger line itself (uncommon but possible)
+                for m in re.finditer(r'f"([a-z_]+): ', line):
+                    keys.append(m.group(1))
+                continue  # skip the double-count in the in_block branch below
         if in_block:
             for m in re.finditer(r'f"([a-z_]+): ', line):
                 keys.append(m.group(1))
-            if in_block and depth <= 0:
-                # Count depth changes after setting in_block on the trigger line
-                pass
-            if in_block:
-                depth += line.count("(") - line.count(")")
-                if depth <= 0 and "task_file.write_text(" not in line:
-                    break
+            depth += line.count("(") - line.count(")")
+            if depth <= 0:
+                break
     if "task" not in keys:
         return False
     task_pos = keys.index("task")
