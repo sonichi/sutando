@@ -365,10 +365,48 @@ for _pyf in sorted(
     )
 
 # ---------------------------------------------------------------------------
+# Exhaustive scan (TypeScript): every TS file containing "task: ${"
+# (template-literal interpolated task field) must be in the known-guarded set.
+#
+# inline-tools.ts cancel_task uses "task: CANCEL_INSTRUCTION: ... ${safeTargetId}"
+# — the pattern "task: ${" does NOT match because there is static text between
+# "task: " and "${safeTargetId}"; it is covered by the specific cancelBody
+# assertions above.
+# web-client.ts uses a hardcoded task body (no ${req.} interpolation); also
+# covered by its own assertion above.
+# ---------------------------------------------------------------------------
+
+_GUARDED_TS_WRITERS = {
+    "src/task-bridge.ts",
+    "skills/phone-conversation/scripts/conversation-server.ts",
+}
+
+_TS_TASK_FIELD_PATTERN = "task: ${"
+for _tsf in sorted(
+    list((REPO / "src").glob("*.ts")) + list((REPO / "skills").rglob("*.ts"))
+):
+    _rel = str(_tsf.relative_to(REPO))
+    if ".d.ts" in _rel or "test" in _rel:
+        continue
+    try:
+        _fc = _tsf.read_text(errors="replace")
+    except OSError:
+        continue
+    if _TS_TASK_FIELD_PATTERN not in _fc:
+        continue
+    _check(
+        f"exhaustive-scan-ts: {_rel} is a known-guarded TS task writer",
+        _rel in _GUARDED_TS_WRITERS,
+        f"{_rel} contains an interpolated task: template literal but is not in "
+        f"_GUARDED_TS_WRITERS.  Add confineUserContent() to its task body, "
+        f"then add the path to _GUARDED_TS_WRITERS so future passes catch regressions.",
+    )
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
 _total = _passed + _failed
-print(f"injection-guard-sweep: {_passed}/{_total} passed"  # expected 44/44
+print(f"injection-guard-sweep: {_passed}/{_total} passed"  # expected 46/46
       + ("" if _failed == 0 else f" — {_failed} FAILED"))
 sys.exit(0 if _failed == 0 else 1)
