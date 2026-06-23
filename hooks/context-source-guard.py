@@ -37,16 +37,26 @@ ACCESS_FILE = os.environ.get("SUTANDO_DISCORD_ACCESS_FILE",
                              os.path.join(_CFG, "channels", "discord", "access.json"))
 ENV_FILE = os.environ.get("SUTANDO_DISCORD_ENV_FILE",
                           os.path.join(_CFG, "channels", "discord", ".env"))
-WS = os.path.expanduser(
-    os.environ.get("SUTANDO_WORKSPACE", "~/.sutando/workspace").replace("~", os.path.expanduser("~"))
+# Hook state (active-serving-channel + guild cache) is session-scoped and only
+# read/written by this hook — store under CLAUDE_CONFIG_DIR/state/ rather than
+# the deprecated ~/.sutando/workspace default. SUTANDO_WORKSPACE still accepted
+# as an override for test isolation (tests seed the guild cache there).
+_ws_env = os.environ.get("SUTANDO_WORKSPACE", "")
+_STATE_DIR = (
+    os.path.join(
+        os.path.expanduser(_ws_env.replace("~", os.path.expanduser("~"))),
+        "state",
+    )
+    if _ws_env
+    else os.path.join(_CFG, "state")
 )
-STATE = os.path.join(WS, "state", "active-serving-channel.json")
+STATE = os.path.join(_STATE_DIR, "active-serving-channel.json")
 API = "https://discord.com/api/v10"
 UA = "DiscordBot (https://github.com/sonichi/sutando, 1.0)"
 _TASK_RE = re.compile(r"task-\d+\.txt$")
 _TASKPATH_RE = re.compile(r"([^\s'\"]*task-\d+\.txt)")  # a task-file path inside a Bash command
 _CH_READ_RE = re.compile(r"channels/(\d+)/messages")
-_GUILD_CACHE = os.path.join(WS, "state", ".channel-guild-cache.json")
+_GUILD_CACHE = os.path.join(_STATE_DIR, ".channel-guild-cache.json")
 
 
 def _read_channel_id_from_task(path):
