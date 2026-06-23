@@ -31,6 +31,10 @@ function runInit(repoDir: string, mode?: '--auto' | '--preflight'): RunResult {
 			SUTANDO_WORKSPACE: join(repoDir, '.workspace'),
 			SUTANDO_TEST_MODE: '1',  // v0.8: enable env-override-in-test escape hatch
 			HOME: repoDir + '/.fake-home',
+			// Override real CLAUDE_CONFIG_DIR so channel .env checks resolve to the
+			// fake-home tree instead of the live install (prevents real Discord/Telegram
+			// tokens from leaking into the optional-key count).
+			CLAUDE_CONFIG_DIR: join(repoDir, '.fake-home', '.claude'),
 		},
 		encoding: 'utf-8',
 	});
