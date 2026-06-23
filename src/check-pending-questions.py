@@ -134,9 +134,10 @@ def should_notify():
 
 def notify_macos(count, titles):
     msg = f"{count} pending question{'s' if count > 1 else ''}: {', '.join(titles[:3])}"
+    safe = msg.replace('"', '').replace('\\', '')
     subprocess.run([
         "osascript", "-e",
-        f'display notification "{msg}" with title "Sutando"'
+        f'display notification "{safe}" with title "Sutando"'
     ], capture_output=True)
 
 
