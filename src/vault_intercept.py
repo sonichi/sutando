@@ -163,10 +163,26 @@ def intercept_vault_commands(text: str) -> InterceptResult:
         # Quoted values bypass the guard (user explicitly delimited the value).
         is_quoted = m.group(2) is not None or m.group(3) is not None or m.group(4) is not None
         if not is_quoted:
-            from secret_scanner import scan_secrets
-            if not scan_secrets(value):
-                # Not a known secret pattern — assume this is prose, leave it alone.
-                return m.group(0)
+            try:
+                from secret_scanner import scan_secrets
+            except ImportError:
+                # detect-secrets (soft dep) not installed — we can't FP-filter an
+                # unquoted value. For an explicit owner `vault set`, intent is
+                # overwhelmingly "store this secret", so degrade to storing it and
+                # surface ONE actionable line the agent sees in the bridge log,
+                # rather than crashing (old behavior → caller redacts → secret lost
+                # silently). Install the dep to re-enable prose-filtering, or quote
+                # the value to bypass the guard entirely.
+                print(
+                    f"vault: detect-secrets not installed — storing {key} without "
+                    f"prose-filter (unquoted value). `pip install detect-secrets` to "
+                    f"re-enable the false-positive guard, or quote the value next time.",
+                    flush=True,
+                )
+            else:
+                if not scan_secrets(value):
+                    # Not a known secret pattern — assume this is prose, leave it alone.
+                    return m.group(0)
         try:
             _store_in_keychain(key, value)
             stored.append(key)
