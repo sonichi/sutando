@@ -78,6 +78,16 @@ CMD_PID=$!
 ) &
 WATCHER=$!
 
+# If the WRAPPER itself is interrupted/killed (SIGINT/TERM/HUP) or exits for any
+# reason, tear down BOTH the watchdog and the delegated command tree — otherwise an
+# external kill of this script orphans the codex tree and defeats the whole bounding
+# guarantee. Idempotent: on the normal path CMD_PID has already exited (no-op) and
+# WATCHER is killed below. Also sweeps the temp files.
+_cleanup() { _kill_tree "$CMD_PID" KILL 2>/dev/null; kill "$WATCHER" 2>/dev/null; rm -f "$OUTFILE" "$VERDICT"; }
+trap '_cleanup' EXIT
+trap '_cleanup; exit 130' INT
+trap '_cleanup; exit 143' TERM HUP
+
 wait "$CMD_PID" 2>/dev/null; rc=$?
 kill "$WATCHER" 2>/dev/null      # command finished first → stop the watchdog
 wait "$WATCHER" 2>/dev/null || true
