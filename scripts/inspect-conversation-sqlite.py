@@ -20,10 +20,10 @@ from typing import Iterable
 
 def default_db_path() -> Path:
     try:
-        repo = Path(__file__).resolve().parent.parent
+        _config_sh = Path(__file__).resolve().parent / "sutando-config.sh"
         ws = subprocess.check_output(
-            ["bash", "scripts/sutando-config.sh", "workspace"],
-            cwd=str(repo), text=True, stderr=subprocess.DEVNULL,
+            ["bash", str(_config_sh), "workspace"],
+            text=True, stderr=subprocess.DEVNULL,
         ).strip()
         return Path(ws) / "data" / "conversation.sqlite"
     except Exception:
