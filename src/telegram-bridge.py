@@ -400,7 +400,7 @@ def send_file(chat_id, file_path, caption=""):
         print(f"  Send file failed: {e}")
         return {"ok": False}
 
-def send_reply(chat_id, text, task_id: str | None = None, access_tier: str = "unknown"):
+def send_reply(chat_id, text, task_id: str | None = None, access_tier: str = "unknown", extra_files: int = 0):
     # Extract file paths: [file: /path/to/file] or [send: /path/to/file]
     file_pattern = re.compile(r'\[(?:file|send|attach):\s*([^\]]+)\]')
     files = file_pattern.findall(text)
@@ -437,8 +437,13 @@ def send_reply(chat_id, text, task_id: str | None = None, access_tier: str = "un
             # rationale as discord-bridge:poll_results.
             print(f"  file marker, file not found — likely a prose quotation: {fpath}", flush=True)
 
-    # Observability: one delivered-reply event.
-    if clean_text or files:
+    # Observability: one delivered-reply event. The task-reply path strips file
+    # markers from the body and sends attachments separately (from
+    # parsed.actions), so send_reply never re-finds them — the caller passes
+    # their count via extra_files. Without this, file-only replies emit nothing
+    # and text+attachment replies report file_count=0.
+    total_files = len(files) + extra_files
+    if clean_text or total_files:
         _emit_channel(
             "telegram", "out",
             user_id=str(chat_id),
@@ -447,7 +452,7 @@ def send_reply(chat_id, text, task_id: str | None = None, access_tier: str = "un
             data={
                 "task_id": task_id,
                 "text_chunks": (len(clean_text) // 4000 + 1) if clean_text else 0,
-                "file_count": len(files),
+                "file_count": total_files,
             },
         )
 
@@ -861,8 +866,10 @@ def main():
                     continue
                 try:
                     # Use parsed.body — all markers stripped — so [channel:] etc. never leak.
-                    # File attachments are in parsed.actions; send_reply() won't re-find them.
-                    send_reply(chat_id, parsed.body, task_id=task_id, access_tier=pending_task_tiers.get(task_id, "unknown"))
+                    # File attachments are in parsed.actions; send_reply() won't re-find them,
+                    # so pass their count for the outbound obs event's file_count.
+                    _attach_count = sum(1 for a in parsed.actions if a.kind == "attach")
+                    send_reply(chat_id, parsed.body, task_id=task_id, access_tier=pending_task_tiers.get(task_id, "unknown"), extra_files=_attach_count)
                     for action in parsed.actions:
                         if action.kind == "attach":
                             fpath = action.value.strip()
