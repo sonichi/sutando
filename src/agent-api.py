@@ -585,6 +585,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f"id: {task_id}\n"
             f"timestamp: {datetime.now().isoformat()}\n"
             f"source: twilio_voice\n"
+            f"access_tier: owner\n"
             f"from: {safe_caller}\n"
             f"call_sid: {call_sid}\n"
             f"task: Incoming phone call from {safe_caller}\n"
@@ -618,6 +619,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f"id: {task_id}\n"
             f"timestamp: {datetime.now().isoformat()}\n"
             f"source: twilio_sms\n"
+            f"access_tier: owner\n"
             f"from: {safe_sender}\n"
             f"task: SMS from {safe_sender}: {confine_user_content(body)}\n"
         )
@@ -642,6 +644,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 f"id: {task_id}\n"
                 f"timestamp: {datetime.now().isoformat()}\n"
                 f"source: twilio_voicemail\n"
+                f"access_tier: owner\n"
                 f"from: {safe_caller}\n"
                 f"task: Voicemail from {safe_caller}: {confine_user_content(text)}\n"
             )
