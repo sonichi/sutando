@@ -286,16 +286,23 @@ _check(
     "agent-api.py handle_twilio_transcription must also define safe_caller "
     "(two handlers use this pattern — check both voice and transcription)",
 )
-# Twilio handlers must declare access_tier: owner explicitly before task: so the
-# trust level is self-documenting and immune to a future change in the implicit default.
-for _twilio_src in ("twilio_voice", "twilio_sms", "twilio_voicemail"):
-    _tw_start = _aa.find(f"source: {_twilio_src}")
+# All four agent-api.py task writers must declare access_tier: owner explicitly
+# before task: — self-documenting and immune to a future default-tier change.
+# Anchor on the f-string source field literal so we hit the task_content block,
+# not the function-name or comment that contains the same substring.
+for _src_literal, _src_label in (
+    ('"source: twilio_voice\\n"',   "twilio_voice"),
+    ('"source: twilio_sms\\n"',     "twilio_sms"),
+    ('"source: twilio_voicemail\\n"', "twilio_voicemail"),
+    ('"source: api\\n"',            "api"),
+):
+    _tw_start = _aa.find(_src_literal)
     _tw_task  = _aa.find("task:", _tw_start) if _tw_start >= 0 else -1
     _tw_tier  = _aa.find("access_tier: owner", _tw_start) if _tw_start >= 0 else -1
     _check(
-        f"agent-api: {_twilio_src} — access_tier: owner before task:",
+        f"agent-api: {_src_label} — access_tier: owner before task:",
         _tw_start >= 0 and _tw_tier >= 0 and _tw_task >= 0 and _tw_tier < _tw_task,
-        f"agent-api.py {_twilio_src} task_content must declare access_tier: owner "
+        f"agent-api.py {_src_label} task_content must declare access_tier: owner "
         f"before task: — makes trust level self-documenting and safe if the implicit "
         f"default ever changes",
     )

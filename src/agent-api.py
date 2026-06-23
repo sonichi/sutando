@@ -846,6 +846,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f"id: {task_id}\n"
             f"timestamp: {datetime.now().isoformat()}\n"
             f"source: api\n"
+            f"access_tier: owner\n"
             f"from: {from_agent}\n"
             f"task: {confine_user_content(task)}\n"
         )
