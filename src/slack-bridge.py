@@ -552,12 +552,12 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     task_file.write_text(
         f"id: {task_id}\n"
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
-        f"task: {user_task_text}\n"
         f"source: slack\n"
         f"channel_id: {channel}\n"
         f"user_id: {user_id}\n"
         f"access_tier: {access_tier}\n"
         f"priority: {priority}\n"
+        f"task: {user_task_text}\n"
         f"{skill_hints}"
     )
     with pending_replies_lock:

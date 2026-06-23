@@ -61,6 +61,60 @@ for _f in (
     )
 
 # ---------------------------------------------------------------------------
+# Python bridges: task: field must come AFTER source/access_tier/priority
+# (belt-and-suspenders alongside the ZWSP guard — a forged field in user content
+# that slips past the guard would appear before the real fields, losing the race)
+# ---------------------------------------------------------------------------
+
+def _task_field_is_last_in_write_text(src: str) -> bool:
+    """Check that task: appears after source/access_tier/priority in write_text.
+
+    Scans the source for the write_text block by line: starts at the first
+    `task_file.write_text(` line and collects f"key: pattern lines until
+    the matching close paren, counting open parens to handle nesting.
+    """
+    import re
+    lines = src.splitlines()
+    in_block = False
+    depth = 0
+    keys: list[str] = []
+    for line in lines:
+        if not in_block:
+            if "task_file.write_text(" in line:
+                in_block = True
+                depth = line.count("(") - line.count(")")
+        if in_block:
+            for m in re.finditer(r'f"([a-z_]+): ', line):
+                keys.append(m.group(1))
+            if in_block and depth <= 0:
+                # Count depth changes after setting in_block on the trigger line
+                pass
+            if in_block:
+                depth += line.count("(") - line.count(")")
+                if depth <= 0 and "task_file.write_text(" not in line:
+                    break
+    if "task" not in keys:
+        return False
+    task_pos = keys.index("task")
+    for sentinel in ("source", "access_tier", "priority"):
+        if sentinel in keys and keys.index(sentinel) > task_pos:
+            return False
+    return True
+
+
+for _fb, _fname in (
+    ("src/discord-bridge.py", "discord-bridge"),
+    ("src/telegram-bridge.py", "telegram-bridge"),
+    ("src/slack-bridge.py", "slack-bridge"),
+):
+    _sb = _src(_fb)
+    _check(
+        f"{_fname}: task: field is after source/access_tier/priority (field-order defense)",
+        _task_field_is_last_in_write_text(_sb),
+        f"{_fb}: task: must appear after source/access_tier/priority in task_file.write_text()",
+    )
+
+# ---------------------------------------------------------------------------
 # Python ag2-relay: uses _one_line() as structural equivalent
 # (collapses newlines → prevents line-based injection; no ZWSP needed)
 # ---------------------------------------------------------------------------
