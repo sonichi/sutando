@@ -166,23 +166,29 @@ def intercept_vault_commands(text: str) -> InterceptResult:
             try:
                 from secret_scanner import scan_secrets
             except ImportError:
-                # detect-secrets (soft dep) not installed — we can't FP-filter an
-                # unquoted value. For an explicit owner `vault set`, intent is
-                # overwhelmingly "store this secret", so degrade to storing it and
-                # surface ONE actionable line the agent sees in the bridge log,
-                # rather than crashing (old behavior → caller redacts → secret lost
-                # silently). Install the dep to re-enable prose-filtering, or quote
-                # the value to bypass the guard entirely.
+                # detect-secrets (the FP backstop) isn't installed. The vault-set
+                # regex is DELIBERATELY loose — it matches `vault set K V` anywhere,
+                # including mid-prose — and delegates false-positive rejection to
+                # detect-secrets. Without it we can't tell a real secret from prose,
+                # so storing unconditionally would store every "vault set X Y" mention
+                # as junk AND redact legitimate text. Fail safe: refuse to store and
+                # mark the value with a placeholder the core agent recognizes (see
+                # CLAUDE.md "Vault" → core installs detect-secrets, then asks the owner
+                # to re-send). Quoted values never reach here — they took the is_quoted
+                # branch and store directly. No bridge-side pip-install (that would be
+                # env mutation inside a message handler) and no separate task: the
+                # refusal rides the normal task to core with channel context intact.
                 print(
-                    f"vault: detect-secrets not installed — storing {key} without "
-                    f"prose-filter (unquoted value). `pip install detect-secrets` to "
-                    f"re-enable the false-positive guard, or quote the value next time.",
+                    f"vault: detect-secrets not installed — refused unquoted "
+                    f"`vault set {key}` (can't validate). Core will install the dep; "
+                    f"quote the value to store immediately.",
                     flush=True,
                 )
-            else:
-                if not scan_secrets(value):
-                    # Not a known secret pattern — assume this is prose, leave it alone.
-                    return m.group(0)
+                failed.append(key)
+                return f"vault set {key} [VAULT-NEEDS-DETECT-SECRETS]"
+            if not scan_secrets(value):
+                # Not a known secret pattern — assume this is prose, leave it alone.
+                return m.group(0)
         try:
             _store_in_keychain(key, value)
             stored.append(key)
