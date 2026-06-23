@@ -10,7 +10,7 @@ import { claudeHomePath } from './util_paths.js';
 
 function defaultMemoryDir(): string {
     const repo = resolve(join(import.meta.dirname, '..'));
-    const slug = repo.replace(/\//g, '-');
+    const slug = repo.replace(/[^A-Za-z0-9]+/g, '-');
     return claudeHomePath('projects', slug, 'memory');
 }
 

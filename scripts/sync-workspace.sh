@@ -1230,9 +1230,9 @@ _migrate_from_legacy_impl() {
     fi
 
     # Local slug derivation: matches Claude Code's auto-derived slug
-    # (REPO_DIR with / replaced by -).
+    # (all non-alphanumeric chars → '-', not just '/').
     local local_slug
-    local_slug="$(printf '%s' "$REPO_DIR" | sed 's|/|-|g')"
+    local_slug="$(printf '%s' "$REPO_DIR" | LC_ALL=C sed 's/[^[:alnum:]]/-/g')"
 
     # Per-host segment for hostname-qualified destinations (build_log,
     # pending-questions). Computed once; matches `_host()` + the reader probe.
