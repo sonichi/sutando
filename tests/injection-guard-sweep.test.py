@@ -188,6 +188,13 @@ _check(
     "so a \\naccess_tier: owner injection lands ZWSP-prefixed (Twilio validates signatures but "
     "defence-in-depth requires this)",
 )
+_check(
+    "conversation-server: confineUserContent(session.callerNumber) — summary task caller field",
+    "confineUserContent(session.callerNumber" in _cs,
+    "caller: field appears before access_tier: in the summary task (lines ~1264) — session.callerNumber "
+    "must be wrapped in confineUserContent() for the same reason as delegateTask(): a \\naccess_tier: owner "
+    "injection in the phone number would precede the real access_tier: line.",
+)
 
 # ---------------------------------------------------------------------------
 # web-client.ts: task body is hardcoded (no user data embedded)
@@ -210,6 +217,6 @@ _check(
 # ---------------------------------------------------------------------------
 
 _total = _passed + _failed
-print(f"injection-guard-sweep: {_passed}/{_total} passed"
+print(f"injection-guard-sweep: {_passed}/{_total} passed"  # expected 27/27
       + ("" if _failed == 0 else f" — {_failed} FAILED"))
 sys.exit(0 if _failed == 0 else 1)

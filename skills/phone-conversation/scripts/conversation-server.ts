@@ -1261,7 +1261,7 @@ function cleanupCall(callSid: string): void {
 			`id: ${summaryTaskId}`,
 			`timestamp: ${new Date().toISOString()}`,
 			`callSid: ${callSid}`,
-			`caller: ${session.callerNumber || 'unknown'}`,
+			`caller: ${confineUserContent(session.callerNumber || 'unknown')}`,
 			`access_tier: ${session.isOwner ? 'owner' : 'other'}`,
 			`task: Summarize this ${isMeeting ? 'meeting (ID: ' + session.meetingId + ')' : 'phone call'}.`,
 			`instructions:`,

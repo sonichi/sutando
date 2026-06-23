@@ -43,6 +43,21 @@ describe('delegateTask() — caller field injection guard', () => {
 	});
 });
 
+describe('summary task — caller field injection guard', () => {
+	// The summary task (written at end-of-call) has the same shape as delegateTask():
+	// caller: appears before access_tier: in the task file. session.callerNumber must
+	// be wrapped in confineUserContent() for the same defence-in-depth reason.
+	it('wraps session.callerNumber in confineUserContent()', () => {
+		assert.match(
+			SRC,
+			/caller:\s*\$\{confineUserContent\(session\.callerNumber/,
+			'conversation-server.ts summary task must wrap session.callerNumber in confineUserContent(). ' +
+				'caller: appears before access_tier: in the task file — same injection shape as ' +
+				'delegateTask() (fixed in same commit). ',
+		);
+	});
+});
+
 describe('/meeting handler — task-file injection guard', () => {
 	it('strips CR/LF from `platform` before use', () => {
 		assert.match(
