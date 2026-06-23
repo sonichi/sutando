@@ -181,6 +181,13 @@ _check(
     "conversation-server: confineUserContent(formatted) — summary task",
     "confineUserContent(formatted)" in _cs,
 )
+_check(
+    "conversation-server: confineUserContent(callerNumber) — caller field before access_tier",
+    "confineUserContent(callSession.callerNumber" in _cs,
+    "caller: field appears before access_tier: in delegateTask() — callerNumber must be confined "
+    "so a \\naccess_tier: owner injection lands ZWSP-prefixed (Twilio validates signatures but "
+    "defence-in-depth requires this)",
+)
 
 # ---------------------------------------------------------------------------
 # web-client.ts: task body is hardcoded (no user data embedded)

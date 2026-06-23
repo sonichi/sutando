@@ -450,7 +450,7 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 	const skillsHint = process.env.CLAUDE_CONFIG_DIR
 		? `${process.env.CLAUDE_CONFIG_DIR}/skills/`
 		: '~/.claude/skills/';
-	const content = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ncallSid: ${callSession.callSid}\ncaller: ${callSession.callerNumber || 'unknown'}\naccess_tier: ${callSession.isOwner ? 'owner' : 'other'}\ntask: ${confineUserContent(taskDescription)}\nhint: Check ${skillsHint} for a matching skill before using raw commands.\ntranscript:\n${confineUserContent(fullTranscript)}\n`;
+	const content = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ncallSid: ${callSession.callSid}\ncaller: ${confineUserContent(callSession.callerNumber || 'unknown')}\naccess_tier: ${callSession.isOwner ? 'owner' : 'other'}\ntask: ${confineUserContent(taskDescription)}\nhint: Check ${skillsHint} for a matching skill before using raw commands.\ntranscript:\n${confineUserContent(fullTranscript)}\n`;
 	writeFileSync(taskPath, content);
 
 	// Poll for result in background, inject when ready — don't block Gemini
