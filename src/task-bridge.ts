@@ -65,6 +65,36 @@ mkdirSync(RESULT_DIR, { recursive: true });
 
 function ts(): string { return new Date().toISOString().slice(11, 23); }
 
+/** U+200B — zero-width space; not whitespace, so it survives .trimStart(). */
+const _ZWSP = '​';
+const _HEADER_KEYS = [
+	'id', 'timestamp', 'task', 'source', 'channel_id', 'channel_name',
+	'guild_name', 'source_message_id', 'parent_message_id', 'user_id',
+	'access_tier', 'priority', 'chat_id', 'thread_ts',
+];
+const _HEADER_RE = new RegExp(`^(?:${_HEADER_KEYS.join('|')})\\s*:`);
+const _FENCE_RE = /^={3,}/;
+
+/**
+ * Defang user-supplied content before embedding in a task file.
+ *
+ * Prefixes any line that looks like a task-file header field or a
+ * ===FENCE=== with U+200B so structural injection (access_tier forge,
+ * system-instruction fence) cannot succeed. Idempotent and CR/CRLF-safe.
+ * TypeScript mirror of src/task_body_guard.py:confine_user_content().
+ */
+function confineUserContent(text: string): string {
+	if (!text) return text;
+	const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+	return normalized.split('\n').map(line => {
+		const probe = line.trimStart();
+		if ((_HEADER_RE.test(probe) || _FENCE_RE.test(probe)) && !line.startsWith(_ZWSP)) {
+			return _ZWSP + line;
+		}
+		return line;
+	}).join('\n');
+}
+
 /**
  * Write a chat-path task file so the dashboard tracks chat-originated work.
  * Called by the core agent (Claude Code) when it accepts a non-trivial task from chat.
@@ -88,7 +118,7 @@ export function writeChatTask(taskDescription: string): string {
 		`user_id: ${process.env.SUTANDO_DM_OWNER_ID || 'chat-local'}`,
 		`access_tier: owner`,
 		`priority: normal`,
-		`task: ${taskDescription}`,
+		`task: ${confineUserContent(taskDescription)}`,
 		'',
 	].join('\n');
 	writeFileSync(join(TASK_DIR, `${taskId}.txt`), content);
@@ -319,7 +349,7 @@ export const workTool: ToolDefinition = {
 				contextBlock =
 					`\n\n--- recent voice transcript (may contain ASR errors; if the task above ` +
 					`seems garbled or doesn't match this, infer the true intent from it or ask to ` +
-					`confirm before acting) ---\n${recent}\n`;
+					`confirm before acting) ---\n${confineUserContent(recent)}\n`;
 			}
 		} catch { /* best effort — never block delegation on context attach */ }
 		const content =
@@ -330,7 +360,7 @@ export const workTool: ToolDefinition = {
 			`user_id: ${ownerId}\n` +
 			`access_tier: owner\n` +
 			`priority: urgent\n` +
-			`task: ${task}${contextBlock}\n`;
+			`task: ${confineUserContent(task)}${contextBlock}\n`;
 		writeFileSync(join(TASK_DIR, `${taskId}.txt`), content);
 		// Resolve per-task timeout. 0 → no timeout. Negative or NaN → default.
 		// Cap at 6 hours to prevent runaway pending-state if the voice agent
@@ -489,7 +519,7 @@ export function startContextDropWatcher(onContextDrop: (content: string) => void
 						`user_id: ${ownerId}\n` +
 						`access_tier: owner\n` +
 						`priority: normal\n` +
-						`task: User dropped context via hotkey. Process this:\n${content}\n`,
+						`task: User dropped context via hotkey. Process this:\n${confineUserContent(content)}\n`,
 					);
 					unlinkSync(CONTEXT_DROP_FILE);
 					// Also inject into Gemini if available
