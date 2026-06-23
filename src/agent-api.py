@@ -763,7 +763,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                 os.path.join(task_dir_real, f"answer-{safe_qid}-{ts}.txt")
                             )
                             if task_file_str.startswith(task_dir_real + os.sep):
-                                Path(task_file_str).write_text(f"User answered {safe_qid}: {answer}")
+                                Path(task_file_str).write_text(f"User answered {safe_qid}: {confine_user_content(answer)}")
                         self.send_json(200, {"ok": True, "id": qid, "answer": answer})
                     else:
                         self.send_json(404, {"error": f"question {qid} not found or already answered"})
