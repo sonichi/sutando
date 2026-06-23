@@ -61,5 +61,21 @@ check "--max cap returned promptly (<10s)" ok "$el"
 bash "$RUNNER" 2 -- bash -c 'sleep 30' >/dev/null 2>&1
 check "positional deadline back-compat → exit 124" 124 "$?"
 
+# --- fixes from the real codex review of this script (2026-06-23) ---
+
+# 9. --max 0 DISABLES the cap (stall-only): a long-but-progressing cmd is NOT killed
+#    prints every 1s for ~5s with --stall 30 --max 0 → must complete (exit 0), NOT insta-kill
+t0=$(date +%s)
+bash "$RUNNER" --stall 30 --max 0 -- bash -c 'for i in 1 2 3 4 5; do echo tick; sleep 1; done' >/dev/null 2>&1; rc=$?
+t1=$(date +%s)
+check "--max 0 disables cap → exit 0 (not insta-kill)" 0 "$rc"
+[ $(( t1 - t0 )) -ge 4 ] && ran=ok || ran=instakill
+check "--max 0 did NOT insta-kill (ran ≥4s)" ok "$ran"
+
+# 10. external signal (verdict empty, rc>128) forwards the real exit code, not a false 124
+#     command self-kills with SIGTERM → exit 143; runner must forward 143, not relabel 124
+bash "$RUNNER" --stall 30 --max 30 -- bash -c 'kill -TERM $$' >/dev/null 2>&1
+check "external signal forwarded (143), not false 124" 143 "$?"
+
 [ "$fail" -eq 0 ] && echo PASS || echo FAILED
 exit $fail

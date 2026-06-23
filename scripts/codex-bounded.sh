@@ -8,7 +8,8 @@
 #               silence means it's wedged, not merely slow. We do NOT want to kill
 #               a slow-but-progressing review; we DO want to kill a dead one.
 #   --max  M    ABSOLUTE BACKSTOP: hard wall-clock cap. Even a pathological
-#               steady-trickle can't run past M seconds.
+#               steady-trickle can't run past M seconds. `--max 0` DISABLES the
+#               cap (stall-only mode); default when unset is 900.
 #
 # Exit codes: forwards the command's own code on normal completion; 125 if killed
 # as STALLED (no output for --stall s); 124 if killed on the --max cap.
@@ -62,7 +63,7 @@ CMD_PID=$!
     start=$(date +%s)
     while kill -0 "$CMD_PID" 2>/dev/null; do
         now=$(date +%s)
-        if (( now - start >= MAX )); then echo MAX > "$VERDICT"; break; fi
+        if (( MAX > 0 && now - start >= MAX )); then echo MAX > "$VERDICT"; break; fi
         if (( STALL > 0 )); then
             mt=$(_mtime "$OUTFILE"); mt=${mt:-$start}
             if (( now - mt >= STALL )); then echo STALL > "$VERDICT"; break; fi
@@ -88,9 +89,12 @@ case "$verdict" in
     STALL) echo "codex-bounded: STALLED — no output for ${STALL}s, killed (not going to finish)" >&2; exit 125;;
     MAX)   echo "codex-bounded: hit ${MAX}s absolute cap, killed" >&2; exit 124;;
 esac
-# A command killed by a signal exits >128; treat that as a deadline kill.
+# verdict empty + rc>128 = the command died from an EXTERNAL signal — our watchdog
+# always writes a verdict (STALL/MAX) BEFORE it kills, so reaching here means the
+# kill wasn't ours. Forward the real signal-exit code; don't claim a deadline we
+# didn't enforce. (Non-zero still trips the bridge's Stage-2 fallback.)
 if (( rc > 128 )); then
-    echo "codex-bounded: killed on ${MAX}s deadline" >&2
-    exit 124
+    echo "codex-bounded: command killed by signal (exit $rc, not our watchdog)" >&2
+    exit "$rc"
 fi
 exit "$rc"
