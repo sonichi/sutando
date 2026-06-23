@@ -134,6 +134,15 @@ npx tsx -e "import 'dotenv/config'; import { summonTool } from './skills/zoom/to
 - Look up contacts and calendar for numbers/PINs before calling
 - The voice agent delegates "call X" and "join my meeting" requests to core via `work`
 
+**Conversation history** — search voice, phone, and Discord voice transcripts stored in `data/conversation.sqlite`:
+```bash
+bash scripts/query-conversation.sh "search term"              # search anywhere in text
+bash scripts/query-conversation.sh "term" --since "1 hour"   # time-bounded
+bash scripts/query-conversation.sh "term" --role user         # filter by role
+bash scripts/query-conversation.sh --last 20                  # latest N turns, no filter
+```
+Output: tab-separated `timestamp | role | text (truncated 200 chars)`. Searches across `voice`, `phone`, and `discord_voice` tables. DB path auto-resolved via M0 workspace helper; override with `$SUTANDO_CONVERSATION_DB`.
+
 **Local skills** — check `$CLAUDE_CONFIG_DIR/skills/` for user-installed skills (video processing, etc.). Always prefer a local skill over raw commands when one exists for the task.
 
 **App launcher** — open any macOS app:

@@ -10,8 +10,8 @@
 # Output: tab-separated ts (ISO) | role | text (truncated to 200 chars)
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-DB="${SUTANDO_CONVERSATION_DB:-$REPO_DIR/data/conversation.sqlite}"
+_WS="$(bash "$(dirname "$0")/sutando-config.sh" workspace)"
+DB="${SUTANDO_CONVERSATION_DB:-${_WS}/data/conversation.sqlite}"
 
 if [[ ! -f "$DB" ]]; then
 	echo "error: $DB does not exist yet — no conversations recorded" >&2
