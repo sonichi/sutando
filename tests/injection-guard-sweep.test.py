@@ -197,6 +197,29 @@ _check(
 )
 
 # ---------------------------------------------------------------------------
+# inline-tools.ts cancel_task: targetId newline-stripped, task: field last
+# ---------------------------------------------------------------------------
+
+_it = _src("src/inline-tools.ts")
+# Locate the cancelBody block
+_cb_start = _it.find("const cancelBody = [")
+_cb_end = _it.find("].join('\\n');", _cb_start) if _cb_start > 0 else -1
+_cb_block = _it[_cb_start:_cb_end + 20] if _cb_start > 0 and _cb_end > 0 else ""
+_check(
+    "inline-tools: cancel_task strips newlines from targetId",
+    "safeTargetId" in _it and ".replace(/[\\r\\n]/g, '')" in _it,
+    "cancel_task embeds targetId (Gemini-controlled) in the task: body — must strip newlines "
+    "before embedding so a forged \\naccess_tier: line can't precede the real one",
+)
+_check(
+    "inline-tools: cancel_task task: field is last (after access_tier:)",
+    "access_tier: owner" in _cb_block
+    and "task: CANCEL_INSTRUCTION" in _cb_block
+    and _cb_block.index("access_tier: owner") < _cb_block.index("task: CANCEL_INSTRUCTION"),
+    "cancel_task cancelBody must place task: after access_tier: (field-order defence)",
+)
+
+# ---------------------------------------------------------------------------
 # web-client.ts: task body is hardcoded (no user data embedded)
 # ---------------------------------------------------------------------------
 
@@ -217,6 +240,6 @@ _check(
 # ---------------------------------------------------------------------------
 
 _total = _passed + _failed
-print(f"injection-guard-sweep: {_passed}/{_total} passed"  # expected 27/27
+print(f"injection-guard-sweep: {_passed}/{_total} passed"  # expected 29/29
       + ("" if _failed == 0 else f" — {_failed} FAILED"))
 sys.exit(0 if _failed == 0 else 1)

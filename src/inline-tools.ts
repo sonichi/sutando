@@ -564,14 +564,18 @@ export const cancelTaskTool: ToolDefinition = {
 			// cancel signal channel instead of building a parallel one.
 			const cancelTs = Date.now();
 			const cancelFilename = `task-${cancelTs}.txt`;
+			// Strip newlines from targetId (Gemini-supplied; task IDs are alphanumeric
+			// in practice but defence-in-depth). task: field is placed LAST so a
+			// forged line in the body cannot shadow the real source/access_tier above it.
+			const safeTargetId = (targetId ?? '').replace(/[\r\n]/g, '');
 			const cancelBody = [
 				`id: task-${cancelTs}`,
 				`timestamp: ${new Date().toISOString()}`,
-				`task: CANCEL_INSTRUCTION: stop processing ${targetId} if still in flight. If already completed, no-op. Reply briefly confirming.`,
 				`source: voice`,
 				`channel_id: local-voice`,
 				`user_id: voice-local`,
 				`access_tier: owner`,
+				`task: CANCEL_INSTRUCTION: stop processing ${safeTargetId} if still in flight. If already completed, no-op. Reply briefly confirming.`,
 				``,
 			].join('\n');
 			writeFileSync(join(tasksDir, cancelFilename), cancelBody);
