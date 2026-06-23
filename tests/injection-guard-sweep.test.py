@@ -324,10 +324,51 @@ _check(
 )
 
 # ---------------------------------------------------------------------------
+# Exhaustive scan: every Python file that embeds an interpolated task: field
+# (pattern: f"task: {) must be in the known-guarded set.  This acts as a
+# trip-wire — a new task writer that forgets to call confine_user_content()
+# fails here before it ships, rather than being discovered later via manual
+# code review.
+#
+# health-check.py is deliberately absent: its task: line is a hardcoded
+# string literal with no {interpolation}, so user content never lands there
+# and the pattern does not match.
+# ag2-relay uses f"{field}: {_one_line(value)}" not f"task: {" directly, so
+# it also does not appear in this scan (it is covered by its own check above).
+# ---------------------------------------------------------------------------
+
+_GUARDED_PY_WRITERS = {
+    "src/discord-bridge.py",
+    "src/telegram-bridge.py",
+    "src/slack-bridge.py",
+    "src/github-webhook.py",
+    "src/agent-api.py",
+}
+
+_TASK_FIELD_PATTERN = 'f"task: {'
+for _pyf in sorted(
+    list((REPO / "src").glob("*.py")) + list((REPO / "skills").rglob("*.py"))
+):
+    _rel = str(_pyf.relative_to(REPO))
+    try:
+        _fc = _pyf.read_text(errors="replace")
+    except OSError:
+        continue
+    if "__pycache__" in _rel or _TASK_FIELD_PATTERN not in _fc:
+        continue
+    _check(
+        f"exhaustive-scan: {_rel} is a known-guarded task writer",
+        _rel in _GUARDED_PY_WRITERS,
+        f"{_rel} contains an interpolated task: f-string but is not in "
+        f"_GUARDED_PY_WRITERS.  Add confine_user_content() to its task body, "
+        f"then add the path to _GUARDED_PY_WRITERS so future passes catch regressions.",
+    )
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
 _total = _passed + _failed
-print(f"injection-guard-sweep: {_passed}/{_total} passed"  # expected 39/39
+print(f"injection-guard-sweep: {_passed}/{_total} passed"  # expected 44/44
       + ("" if _failed == 0 else f" — {_failed} FAILED"))
 sys.exit(0 if _failed == 0 else 1)
