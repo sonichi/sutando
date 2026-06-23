@@ -250,6 +250,31 @@ mkdirSync(TASKS_DIR, { recursive: true });
 
 const ts = () => new Date().toISOString().slice(11, 23);
 const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+/** U+200B — zero-width space; not whitespace, so it survives .trimStart(). */
+const _ZWSP = '​';
+const _CONF_HEADER_RE = new RegExp(
+	'^(?:id|timestamp|task|source|channel_id|channel_name|guild_name|' +
+	'source_message_id|parent_message_id|user_id|access_tier|priority|' +
+	'chat_id|thread_ts)\\s*:',
+);
+const _CONF_FENCE_RE = /^={3,}/;
+/**
+ * Defang caller-supplied text before embedding in a task file.
+ * Mirrors src/task_body_guard.py:confine_user_content() and
+ * src/task-bridge.ts:confineUserContent().
+ */
+function confineUserContent(text: string): string {
+	if (!text) return text;
+	const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+	return normalized.split('\n').map(line => {
+		const probe = line.trimStart();
+		if ((_CONF_HEADER_RE.test(probe) || _CONF_FENCE_RE.test(probe)) && !line.startsWith(_ZWSP)) {
+			return _ZWSP + line;
+		}
+		return line;
+	}).join('\n');
+}
 const google = createGoogleGenerativeAI({ apiKey: GEMINI_API_KEY });
 
 // --- Audio conversion (inbound + outbound audio chains) ---
@@ -425,7 +450,7 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 	const skillsHint = process.env.CLAUDE_CONFIG_DIR
 		? `${process.env.CLAUDE_CONFIG_DIR}/skills/`
 		: '~/.claude/skills/';
-	const content = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ncallSid: ${callSession.callSid}\ncaller: ${callSession.callerNumber || 'unknown'}\naccess_tier: ${callSession.isOwner ? 'owner' : 'other'}\ntask: ${taskDescription}\nhint: Check ${skillsHint} for a matching skill before using raw commands.\ntranscript:\n${fullTranscript}\n`;
+	const content = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ncallSid: ${callSession.callSid}\ncaller: ${callSession.callerNumber || 'unknown'}\naccess_tier: ${callSession.isOwner ? 'owner' : 'other'}\ntask: ${confineUserContent(taskDescription)}\nhint: Check ${skillsHint} for a matching skill before using raw commands.\ntranscript:\n${confineUserContent(fullTranscript)}\n`;
 	writeFileSync(taskPath, content);
 
 	// Poll for result in background, inject when ready — don't block Gemini
@@ -1245,7 +1270,7 @@ function cleanupCall(callSid: string): void {
 			`  3. Send a concise version (3-5 bullet points) to the owner via Discord DM.`,
 			`  4. Write result to results/${summaryTaskId}.txt so voice agent can speak it`,
 			`transcript:`,
-			formatted,
+			confineUserContent(formatted),
 		];
 		const summaryContent = taskLines.join('\n') + '\n';
 		writeFileSync(join(TASKS_DIR, `${summaryTaskId}.txt`), summaryContent);
