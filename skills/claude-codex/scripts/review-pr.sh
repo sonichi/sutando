@@ -39,6 +39,7 @@ DIFF="$(gh pr diff "$PR" 2>/dev/null)" || { echo "review-pr: \`gh pr diff $PR\` 
 [[ -n "$DIFF" ]] || { echo "review-pr: empty diff for #$PR (already merged with no changes, or not found)" >&2; exit 2; }
 
 OUT="$(mktemp -t review-pr.XXXXXX)"
+trap 'rm -f "$OUT"' EXIT   # clean up even on interrupt / non-zero exit, not just the happy path
 bash "$HERE/codex-bounded.sh" --stall "$STALL" --max "$MAX" -- \
     codex exec --sandbox read-only -o "$OUT" -- "Concisely review this PR diff. List only real bugs, correctness issues, or security problems as bullets; if there are none, say 'no blocking issues'. Be specific (file + what's wrong).
 
@@ -50,5 +51,4 @@ if [[ $rc -eq 0 && -s "$OUT" ]]; then
 else
     echo "review-pr: no verdict for #$PR (codex exit $rc — 125=stalled, 124=hit --max, other=error)" >&2
 fi
-rm -f "$OUT"
 exit "$rc"

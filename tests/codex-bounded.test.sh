@@ -21,16 +21,20 @@ check "overrun killed → exit 124" 124 "$rc"
 [ $(( t1 - t0 )) -lt 10 ] && el=ok || el=slow
 check "overrun returned promptly (<10s)" ok "$el"
 
-# 4. the whole TREE is killed — a child sleep must not survive the parent kill
-MARK="/tmp/codex-bounded-test-child.$$"; rm -f "$MARK"
-bash "$RUNNER" 2 -- bash -c "( sleep 30 && touch $MARK ) & wait" >/dev/null 2>&1
-sleep 4   # past the original child's 30s? no — just enough that a survivor would still be running
-# if any descendant survived it'd still be sleeping; assert no lingering child sleep wrote the mark
+# 4. the whole TREE is killed — a child sleep must not survive the parent kill.
+#    Tag the leaf via `exec -a $TAG` so the stray-check matches ONLY this test run's
+#    process (scoped by $$) — a bare `pgrep -f "sleep 30"` would false-match any
+#    unrelated `sleep 30` on the box.
+MARK="/tmp/codex-bounded-test-child.$$"; TAG="codexbnd_tree_$$"; rm -f "$MARK"
+bash "$RUNNER" 2 -- bash -c "( exec -a $TAG sleep 30 ) & wait; touch $MARK" >/dev/null 2>&1
+sleep 4   # enough that a survivor would still be running
+# MARK present ⟹ the parent ran to completion (tree NOT killed); absent ⟹ killed in time
 [ -f "$MARK" ] && surv=SURVIVED || surv=clean
 check "child process tree killed (no survivor)" clean "$surv"
-# also assert no stray 'sleep 30' from this test lingers
-pgrep -f "sleep 30" >/dev/null 2>&1 && stray=STRAY || stray=none
-check "no stray sleep left running" none "$stray"
+# assert the uniquely-tagged leaf isn't lingering (no false-match on unrelated sleeps)
+pgrep -f "$TAG" >/dev/null 2>&1 && stray=STRAY || stray=none
+check "no stray tagged sleep left running" none "$stray"
+pkill -f "$TAG" 2>/dev/null   # belt-and-suspenders: reap a survivor so it can't leak
 rm -f "$MARK"
 
 # --- stall watchdog (--stall) ---
