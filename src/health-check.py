@@ -61,10 +61,24 @@ def _default_memory_dir() -> str:
     syncs), which forced a SUTANDO_MEMORY_DIR override to compensate.
     claude_home_path() honors CLAUDE_CONFIG_DIR, falling back to ~/.claude
     only when it is unset (preserving the old path for ad-hoc launches).
+
+    Claude Code slugifies the repo path by replacing every non-alphanumeric
+    character with '-' (not just '/'), so a repo at /Users/foo_bar/src/x
+    becomes -Users-foo-bar-src-x. The old str.replace("/", "-") kept underscores
+    literal, producing a mismatched slug that pointed at a non-existent dir.
     """
+    import re as _re
     repo = Path(__file__).parent.parent.resolve()
-    slug = str(repo).replace("/", "-")
-    return str(Path(claude_home_path()) / "projects" / slug / "memory")
+    slug = _re.sub(r"[^A-Za-z0-9]+", "-", str(repo))
+    candidate = Path(claude_home_path()) / "projects" / slug / "memory"
+    if candidate.exists():
+        return str(candidate)
+    # Fallback: old slug (underscore-preserving) for installs from before this fix.
+    slug_legacy = str(repo).replace("/", "-")
+    legacy = Path(claude_home_path()) / "projects" / slug_legacy / "memory"
+    if legacy.exists():
+        return str(legacy)
+    return str(candidate)
 
 MEMORY_DIR = Path(os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir()))
 
