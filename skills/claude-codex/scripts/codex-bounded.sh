@@ -14,7 +14,7 @@
 # Exit codes: forwards the command's own code on normal completion; 125 if killed
 # as STALLED (no output for --stall s); 124 if killed on the --max cap.
 #
-#   bash scripts/codex-bounded.sh --stall 90 --max 900 -- <command...>
+#   bash skills/claude-codex/scripts/codex-bounded.sh --stall 90 --max 900 -- <command...>
 #
 # Back-compat: a bare leading integer is treated as --max with stall disabled,
 # so the historical `codex-bounded.sh 120 -- <cmd>` form still means "pure 120s

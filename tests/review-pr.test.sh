@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Tests for scripts/review-pr.sh — the read-only PR-review helper.
+# Tests for skills/claude-codex/scripts/review-pr.sh — the read-only PR-review helper.
 # Stubs `gh` and `codex` on PATH so the test runs offline (no network, no model).
 #   bash tests/review-pr.test.sh
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-HELPER="$ROOT/scripts/review-pr.sh"
+HELPER="$ROOT/skills/claude-codex/scripts/review-pr.sh"
 fail=0
 check(){ if [ "$2" = "$3" ]; then printf 'ok   - %s\n' "$1"; else printf 'FAIL - %s (want=%q got=%q)\n' "$1" "$2" "$3"; fail=1; fi; }
 

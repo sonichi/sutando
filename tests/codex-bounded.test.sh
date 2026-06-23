@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Tests for scripts/codex-bounded.sh — the bounded sandboxed-delegation runner.
+# Tests for skills/claude-codex/scripts/codex-bounded.sh — the bounded delegation runner.
 #   bash tests/codex-bounded.test.sh
 set -u
-RUNNER="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/codex-bounded.sh"
+RUNNER="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/skills/claude-codex/scripts/codex-bounded.sh"
 fail=0
 check(){ if [ "$2" = "$3" ]; then printf 'ok   - %s\n' "$1"; else printf 'FAIL - %s (want=%q got=%q)\n' "$1" "$2" "$3"; fail=1; fi; }
 

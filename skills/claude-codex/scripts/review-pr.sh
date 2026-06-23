@@ -8,8 +8,8 @@
 # network for the diff and can't write anything), all wrapped in codex-bounded.sh
 # (stall-watchdog + absolute cap) so a slow/wedged review can't grind unbounded.
 #
-#   bash scripts/review-pr.sh 1754
-#   bash scripts/review-pr.sh 1754 --max 300
+#   bash skills/claude-codex/scripts/review-pr.sh 1754
+#   bash skills/claude-codex/scripts/review-pr.sh 1754 --max 300
 #
 # Prints Codex's verdict to stdout. Exit 0 = verdict produced; non-zero = the
 # review failed (gh error, or codex stalled=125 / hit cap=124 / errored).
