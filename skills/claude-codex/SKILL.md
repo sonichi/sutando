@@ -70,6 +70,39 @@ bash "$SKILL_DIR/scripts/codex-run.sh" --output-last-message results/codex-revie
 bash "$SKILL_DIR/scripts/codex-run.sh" --goal -- "$(cat path/to/spec.md)"
 ```
 
+## PR review — `scripts/review-pr.sh <N>` (read-only, bounded)
+
+The safe, read-only way to get a Codex review of a GitHub PR. Fetches the diff with
+`gh pr diff <N>` (READ-ONLY — no checkout, never mutates git state or fails on a dirty
+tree), inlines it into `codex exec --sandbox read-only`, and wraps the whole thing in
+`codex-bounded.sh` so a slow/wedged review can't grind unbounded.
+
+```bash
+bash "$SKILL_DIR/scripts/review-pr.sh" 1754            # default --max 240 --stall 60
+bash "$SKILL_DIR/scripts/review-pr.sh" 1754 --max 300  # longer cap for a big diff
+```
+
+Prints Codex's verdict to stdout. Exit `0` = verdict produced; `124` = hit the `--max`
+cap; `125` = stalled (no output for `--stall` s); other non-zero = gh/codex error.
+
+**Timing:** `codex exec` is agentic — even with the diff inlined it may explore related
+code, so a real review often takes 100s+ (147s observed on #1754). Keep `--max` ≥180;
+do NOT drop it near 120 or you'll kill legitimate reviews. This is the path the team-tier
+`===SUTANDO SYSTEM INSTRUCTIONS===` block runs to auto-review a non-owner PR-review request
+(owner-ping only on failure).
+
+## Bounded runner — `scripts/codex-bounded.sh`
+
+Generic stall-watchdog + wall-clock cap for any (sandboxed) delegation. `--stall N` kills the
+process tree after N seconds of total output SILENCE (the "never going to finish" signal —
+a healthy codex streams as it works); `--max M` is the absolute backstop (`--max 0` disables
+it, stall-only). Exit `125` = stalled, `124` = max cap. Used by `review-pr.sh` and by the
+discord-bridge team/other-tier `codex exec` delegation so a sandboxed run can't grind forever.
+
+```bash
+bash "$SKILL_DIR/scripts/codex-bounded.sh" --stall 90 --max 240 -- <command...> < /dev/null
+```
+
 ## `/goal` mode (`--goal`)
 
 Wraps Codex's interactive `/goal` slash-command for non-interactive use. The flag prepends
