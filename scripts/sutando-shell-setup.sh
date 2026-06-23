@@ -596,10 +596,10 @@ EOF
 
     mkdir -p "$CLAUDE_DIR"
 
-    # Compute this checkout's project slug. Claude Code's encoding rule:
-    # replace `/` with `-` in the absolute cwd. So /Users/x/repo becomes
-    # -Users-x-repo.
-    THIS_PROJECT_SLUG="$(printf '%s' "$REPO_ROOT" | tr '/' '-')"
+    # Compute this checkout's project slug. Claude Code replaces ALL
+    # non-alphanumeric characters with '-', not just '/'. So /Users/x_y/repo
+    # becomes -Users-x-y-repo (underscore → hyphen too).
+    THIS_PROJECT_SLUG="$(printf '%s' "$REPO_ROOT" | LC_ALL=C sed 's/[^[:alnum:]]/-/g')"
 
     # Build the include set by enumerating candidate slugs in ~/.claude/projects/
     # and confirming each one against the filesystem. For a slug starting with

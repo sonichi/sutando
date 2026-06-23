@@ -166,7 +166,7 @@ fi
 # back via `find … | head -1` to whichever sibling memory dir landed first
 # (alphabetical). Bug silently skipped real memory writes for 5+ weeks
 # before being caught. See docs/workspace-contract.md.
-MEMORY_DIR="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" claude-home-path "projects/$(echo "$SCRIPT_PARENT" | sed 's|/|-|g')/memory")"
+MEMORY_DIR="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" claude-home-path "projects/$(printf '%s' "$SCRIPT_PARENT" | LC_ALL=C sed 's/[^[:alnum:]]/-/g')/memory")"
 NOTES_DIR="$REPO_DIR/notes"
 LOG="/tmp/sync-memory.log"
 LOCK_DIR="/tmp/sync-memory.lock.d"
