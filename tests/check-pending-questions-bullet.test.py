@@ -81,6 +81,18 @@ check(
 # e) empty file -> no questions
 check("empty file -> none", "", [])
 
+# f) structural: notify_macos escapes double-quotes before building the osascript literal
+SRC = (REPO / "src" / "check-pending-questions.py").read_text()
+_notify_block_start = SRC.find("def notify_macos")
+assert _notify_block_start > 0, "notify_macos not found"
+_notify_block = SRC[_notify_block_start:_notify_block_start + 300]
+_fcheck = 'replace(\'"\', \'\')' in _notify_block
+if _fcheck:
+    _passed += 1
+else:
+    _failed += 1
+    print("  FAIL: notify_macos-quote-escape — notify_macos must call .replace('\"', '') before building the osascript literal")
+
 total = _passed + _failed
 print(f"check-pending-questions-bullet: {_passed}/{total} passed"
       + ("" if _failed == 0 else f" — {_failed} FAILED"))
