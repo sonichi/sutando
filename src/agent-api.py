@@ -102,6 +102,7 @@ PORT = 7843
 # /avatar and /stand-identity endpoints prefer the per-machine private dir
 # over the public workspace.
 from util_paths import personal_path  # noqa: E402
+from task_body_guard import confine_user_content  # noqa: E402
 
 # Simple token auth — set SUTANDO_API_TOKEN in .env for remote access security
 API_TOKEN = os.environ.get("SUTANDO_API_TOKEN", "")
@@ -602,14 +603,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         sender = form_data.get("From", ["unknown"])[0]
         body = form_data.get("Body", [""])[0]
 
-        # Create a task from the SMS
+        # Create a task from the SMS. task: is last so newlines in body
+        # cannot forge the source:/from: fields that precede it. Body is
+        # also run through confine_user_content to defang any ===fence===
+        # or header-key line (the fence check is independent of field order).
         task_id = f"task-{int(datetime.now().timestamp() * 1000)}"
         task_content = (
             f"id: {task_id}\n"
             f"timestamp: {datetime.now().isoformat()}\n"
-            f"task: SMS from {sender}: {body}\n"
             f"source: twilio_sms\n"
             f"from: {sender}\n"
+            f"task: SMS from {sender}: {confine_user_content(body)}\n"
         )
         (TASK_DIR / f"{task_id}.txt").write_text(task_content)
 
@@ -630,9 +634,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             task_content = (
                 f"id: {task_id}\n"
                 f"timestamp: {datetime.now().isoformat()}\n"
-                f"task: Voicemail from {caller}: {text}\n"
                 f"source: twilio_voicemail\n"
                 f"from: {caller}\n"
+                f"task: Voicemail from {caller}: {confine_user_content(text)}\n"
             )
             (TASK_DIR / f"{task_id}.txt").write_text(task_content)
         self.send_json(200, {"ok": True})
@@ -833,7 +837,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f"timestamp: {datetime.now().isoformat()}\n"
             f"source: api\n"
             f"from: {from_agent}\n"
-            f"task: {task}\n"
+            f"task: {confine_user_content(task)}\n"
         )
         (TASK_DIR / f"{task_id}.txt").write_text(task_content)
 
