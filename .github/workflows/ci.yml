@@ -41,12 +41,14 @@ jobs:
       - name: Install dependencies (clean)
         run: npm ci
 
-      # Python test deps. Most tests are stdlib-only; secret-scanner needs
-      # detect-secrets (requirements.txt). Must run BEFORE `npm test`: the
-      # `test` script chains `npm run test:py`, so Python tests execute
-      # inside the "Run tests" step, not only in the standalone step below.
+      # Python test deps. Most tests are stdlib-only; only secret-scanner needs
+      # detect-secrets, and only as a TEST/dev dep — the runtime soft-imports it
+      # (vault degrades gracefully when it's absent). Installed inline here rather
+      # than via a requirements.txt: it's a single dev-only package, so the file
+      # was pure indirection. Must run BEFORE `npm test`: the `test` script chains
+      # `npm run test:py`, so Python tests execute inside the "Run tests" step.
       - name: Install Python test deps
-        run: python3 -m pip install -r requirements.txt
+        run: python3 -m pip install 'detect-secrets>=1.5.0'
 
       - name: Typecheck
         run: npm run typecheck
