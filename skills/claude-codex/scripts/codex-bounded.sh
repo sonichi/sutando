@@ -52,6 +52,10 @@ _kill_tree() {
 # Progress sink: tee the command's stdout AND stderr through to our own fds
 # (pass-through unchanged) while also appending to OUTFILE, whose mtime is the
 # liveness signal the watchdog samples.
+# Granularity note (Maddy review 2026-06-23): mtime advances when `tee` flushes a
+# LINE, so "stall" means "no flushed line for N s" — flush-granular, not byte-
+# granular. Fine for codex (it streams newline-terminated events); the only blind
+# spot is a process that byte-trickles with NO newline for >N s, which `--max` caps.
 OUTFILE="$(mktemp -t codex-bounded.XXXXXX)"
 VERDICT="$OUTFILE.verdict"
 : > "$OUTFILE"
