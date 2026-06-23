@@ -400,7 +400,7 @@ def send_file(chat_id, file_path, caption=""):
         print(f"  Send file failed: {e}")
         return {"ok": False}
 
-def send_reply(chat_id, text, task_id: str | None = None):
+def send_reply(chat_id, text, task_id: str | None = None, access_tier: str = "unknown"):
     # Extract file paths: [file: /path/to/file] or [send: /path/to/file]
     file_pattern = re.compile(r'\[(?:file|send|attach):\s*([^\]]+)\]')
     files = file_pattern.findall(text)
@@ -443,7 +443,7 @@ def send_reply(chat_id, text, task_id: str | None = None):
             "telegram", "out",
             user_id=str(chat_id),
             channel_id=str(chat_id),
-            access_tier="owner",  # telegram is allowlist-gated owner-only
+            access_tier=access_tier,
             data={
                 "task_id": task_id,
                 "text_chunks": (len(clean_text) // 4000 + 1) if clean_text else 0,
@@ -740,12 +740,14 @@ def main():
                 )
                 pending_replies[task_id] = chat_id
                 pending_task_tiers[task_id] = "owner"  # telegram is owner-only (allowlist-gated); enables progress streaming
-                # Observability: one inbound accepted-message event.
+                # Observability: one inbound accepted-message event. Source the
+                # tier from the bridge's own assignment above (single source of
+                # truth) rather than re-asserting a literal here.
                 _emit_channel(
                     "telegram", "in",
                     user_id=str(chat_id),
                     channel_id=str(chat_id),
-                    access_tier="owner",
+                    access_tier=pending_task_tiers[task_id],
                     data={"task_id": task_id, "has_attachment": bool(attachment_note)},
                 )
 
@@ -824,7 +826,7 @@ def main():
                             f.unlink(missing_ok=True)
                             continue
                         try:
-                            send_reply(int(owner_id), text)
+                            send_reply(int(owner_id), text, access_tier="owner")  # proactive → owner
                             print(f"  [proactive] sent to {owner_id}: {text[:80]}")
                         except Exception as e:
                             print(f"  [proactive] failed: {e}")
@@ -860,7 +862,7 @@ def main():
                 try:
                     # Use parsed.body — all markers stripped — so [channel:] etc. never leak.
                     # File attachments are in parsed.actions; send_reply() won't re-find them.
-                    send_reply(chat_id, parsed.body, task_id=task_id)
+                    send_reply(chat_id, parsed.body, task_id=task_id, access_tier=pending_task_tiers.get(task_id, "unknown"))
                     for action in parsed.actions:
                         if action.kind == "attach":
                             fpath = action.value.strip()
