@@ -574,15 +574,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         caller = form_data.get("From", ["unknown"])[0]
         call_sid = form_data.get("CallSid", [""])[0]
 
-        # Create a task from the incoming call
+        # Create a task from the incoming call.
+        # source:/from:/call_sid: precede task: so the (Twilio-supplied) caller
+        # string can't forge those fields even if it contains newlines.
+        # confine_user_content() normalises any \r\n/\r and ZWSP-prefixes
+        # header-key lookalike lines — belt-and-suspenders alongside field order.
         task_id = f"task-{int(datetime.now().timestamp() * 1000)}"
         task_content = (
             f"id: {task_id}\n"
             f"timestamp: {datetime.now().isoformat()}\n"
-            f"task: Incoming phone call from {caller}\n"
             f"source: twilio_voice\n"
             f"from: {caller}\n"
             f"call_sid: {call_sid}\n"
+            f"task: Incoming phone call from {confine_user_content(caller)}\n"
         )
         (TASK_DIR / f"{task_id}.txt").write_text(task_content)
 

@@ -212,6 +212,33 @@ def test_agent_api_imports_confine_user_content():
     )
 
 
+def test_voice_task_field_is_last():
+    """In the voice call handler, task: must be the LAST field so a caller
+    string containing \\nsource: attacker cannot forge the source:/from: fields."""
+    voice_start = SRC.find("def handle_twilio_voice")
+    assert voice_start > 0, "handle_twilio_voice not found"
+    voice_block = SRC[voice_start:voice_start + 1200]
+    src_pos = voice_block.find('"source: twilio_voice\\n"')
+    from_pos = voice_block.find('"from: {caller}\\n"')
+    task_pos = voice_block.find('"task: Incoming phone call from')
+    assert src_pos > 0 and from_pos > 0 and task_pos > 0, (
+        f"voice field templates not found: source={src_pos}, from={from_pos}, task={task_pos}"
+    )
+    assert task_pos > from_pos > src_pos, (
+        f"voice task: must be last (source={src_pos}, from={from_pos}, task={task_pos})"
+    )
+
+
+def test_voice_caller_uses_confine():
+    """Voice call caller must be wrapped in confine_user_content() for fence
+    protection — belt-and-suspenders alongside the field-order fix."""
+    voice_start = SRC.find("def handle_twilio_voice")
+    voice_block = SRC[voice_start:voice_start + 1200]
+    assert "confine_user_content(caller)" in voice_block, (
+        "Voice handler must pass caller through confine_user_content()"
+    )
+
+
 def test_sms_injection_defanged():
     """End-to-end: SMS body with \\r + fence injection does not forge fields."""
     from task_body_guard import confine_user_content
@@ -241,6 +268,8 @@ def main():
     test_voicemail_task_field_is_last()
     test_sms_body_uses_confine()
     test_voicemail_text_uses_confine()
+    test_voice_task_field_is_last()
+    test_voice_caller_uses_confine()
     test_agent_api_imports_confine_user_content()
     test_sms_injection_defanged()
     print("All task-field injection tests passed.")
