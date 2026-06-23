@@ -37,9 +37,20 @@ ACCESS_FILE = os.environ.get("SUTANDO_DISCORD_ACCESS_FILE",
                              os.path.join(_CFG, "channels", "discord", "access.json"))
 ENV_FILE = os.environ.get("SUTANDO_DISCORD_ENV_FILE",
                           os.path.join(_CFG, "channels", "discord", ".env"))
-WS = os.path.expanduser(
-    os.environ.get("SUTANDO_WORKSPACE", "~/.sutando/workspace").replace("~", os.path.expanduser("~"))
-)
+# Workspace resolution (M0/#1440 residual, #1698): SUTANDO_WORKSPACE was dropped
+# for resolution in v0.8 and its old default `~/.sutando/workspace` is the pre-M0
+# location — so this hook stranded active-serving-channel.json in the LEGACY
+# workspace, a different dir than discord-bridge.py (M0 resolve_workspace) reads,
+# and the guard then couldn't find the serving channel → silently failed open.
+# Derive the workspace from CLAUDE_CONFIG_DIR instead: the Claude Code project
+# tree lives at `<workspace>/.claude-sutando` per the workspace contract, so the
+# parent of _CFG IS the workspace (and it moves with a config-relocated
+# workspace). No subprocess — this hook fires on every Bash/Read; no __file__
+# walk — that's the bundled-symlink anti-pattern in src/workspace_default.py.
+_cfg_norm = os.path.normpath(_CFG)
+WS = (os.path.dirname(_cfg_norm)
+      if os.path.basename(_cfg_norm) == ".claude-sutando"
+      else os.path.expanduser("~/sutando-workspace"))  # post-v0.8 last-ditch, NOT ~/.sutando
 STATE = os.path.join(WS, "state", "active-serving-channel.json")
 API = "https://discord.com/api/v10"
 UA = "DiscordBot (https://github.com/sonichi/sutando, 1.0)"
