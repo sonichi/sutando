@@ -1475,18 +1475,21 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
         # Same failure set, within cooldown — skip.
         return
 
-    # Build task content.
+    # Build task content. task: is placed LAST (after trusted metadata fields)
+    # so that the multi-line bullet body cannot shadow source/access_tier/priority
+    # even in the theoretical case where check detail strings ever carry
+    # external data. Consistent with the bridge field-order convention.
     ts_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-    bullet_lines = [f"- {c['name']}: {c['status']} ({c['detail']})" for c in failures]
+    bullet_str = "\n".join(f"- {c['name']}: {c['status']} ({c['detail']})" for c in failures)
     body = (
         f"id: task-health-{now_ms}\n"
         f"timestamp: {ts_iso}\n"
-        f"task: Health check found issues. Decide whether to restart, DM owner, or treat as transient:\n"
-        + "\n".join(bullet_lines) + "\n"
         f"source: health-check\n"
         f"user_id: health-check\n"
         f"access_tier: owner\n"
         f"priority: low\n"
+        f"task: Health check found issues. Decide whether to restart, DM owner, or treat as transient:\n"
+        f"{bullet_str}\n"
     )
     task_path = tasks_dir / f"task-health-{now_ms}.txt"
     task_path.write_text(body)
