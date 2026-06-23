@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
-from util_paths import personal_path, shared_personal_path  # noqa: E402
+from util_paths import personal_path, shared_personal_path, claude_home_path  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
 WORKSPACE = resolve_workspace()
@@ -135,7 +135,7 @@ def check_overdue_reminders():
     """Check macOS Reminders for overdue items."""
     issues = []
     try:
-        script = WORKSPACE.parent.parent / ".claude" / "skills" / "macos-tools" / "scripts" / "reminders.py"
+        script = Path(claude_home_path("skills", "macos-tools", "scripts", "reminders.py"))
         if not script.exists():
             return []
         # Use sys.executable: friction-detector runs via cron (launchd-managed);

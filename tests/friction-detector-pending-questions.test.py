@@ -157,6 +157,24 @@ class TestCheckPendingQuestionsFreForm(unittest.TestCase):
         self.assertIn("d old", result[0], f"Age not in output: {result[0]}")
 
 
+class TestOverdueRemindersPath(unittest.TestCase):
+    """Structural check: check_overdue_reminders must use claude_home_path, not WORKSPACE.parent.parent."""
+
+    SRC = (Path(__file__).resolve().parent.parent / "src" / "friction-detector.py").read_text()
+
+    def test_uses_claude_home_path_not_workspace_parent(self):
+        """Reminders script path must be resolved via claude_home_path(), not WORKSPACE.parent.parent."""
+        self.assertNotIn(
+            "WORKSPACE.parent.parent",
+            self.SRC,
+            "check_overdue_reminders must not use WORKSPACE.parent.parent — resolves to parent of repo, not CLAUDE_CONFIG_DIR.",
+        )
+
+    def test_imports_claude_home_path(self):
+        """friction-detector must import claude_home_path from util_paths."""
+        self.assertIn("claude_home_path", self.SRC)
+
+
 class TestFreFormParserStructural(unittest.TestCase):
     """Structural checks on the source code to confirm the fix is in place."""
 
