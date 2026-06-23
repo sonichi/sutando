@@ -3516,9 +3516,10 @@ async def poll_results():
                 # poll_progress) so it's bounded even when the feature flag is
                 # OFF — otherwise this dict would leak one entry per task.
                 # Capture the tier BEFORE the pop so the outbound obs event
-                # below labels actor.access_tier correctly (a later .get()
-                # would always read "owner" once popped here).
-                _task_tier = pending_task_tiers.pop(task_id, None) or "owner"
+                # below labels actor.access_tier correctly. Fall back to
+                # "unknown" — never "owner" — so a lost/absent tier can't
+                # silently upgrade a non-owner reply in tier accounting.
+                _task_tier = pending_task_tiers.pop(task_id, None) or "unknown"
                 save_pending_replies()
                 # Skip sending if already replied directly (core agent used MCP).
                 # Clean up the result AND task files so the watcher doesn't

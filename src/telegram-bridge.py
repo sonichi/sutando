@@ -443,6 +443,7 @@ def send_reply(chat_id, text, task_id: str | None = None):
             "telegram", "out",
             user_id=str(chat_id),
             channel_id=str(chat_id),
+            access_tier="owner",  # telegram is allowlist-gated owner-only
             data={
                 "task_id": task_id,
                 "text_chunks": (len(clean_text) // 4000 + 1) if clean_text else 0,

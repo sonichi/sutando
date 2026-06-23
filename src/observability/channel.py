@@ -42,7 +42,7 @@ def emit_channel(
     *,
     user_id: str = "",
     channel_id: str = "",
-    access_tier: str = "owner",
+    access_tier: str = "unknown",
     outcome: str = "ok",
     trace_id: str | None = None,
     data: dict[str, Any] | None = None,

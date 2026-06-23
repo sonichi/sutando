@@ -65,6 +65,12 @@ class EmitChannelTest(unittest.TestCase):
         actor = self.cap.events[0]["actor"]
         self.assertEqual(actor, {"user_id": "U9", "channel": "slack", "access_tier": "team"})
 
+    def test_default_tier_is_unknown_not_owner(self) -> None:
+        # Fail-safe: an unspecified tier must NOT silently become "owner",
+        # which would upgrade a non-owner reply in per-tier accounting.
+        emit_channel("slack", "out", channel_id="C1")
+        self.assertEqual(self.cap.events[0]["actor"]["access_tier"], "unknown")
+
     def test_user_id_coerced_to_str(self) -> None:
         emit_channel("telegram", "in", user_id=12345, channel_id=12345)
         self.assertEqual(self.cap.events[0]["actor"]["user_id"], "12345")
