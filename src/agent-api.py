@@ -580,13 +580,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # confine_user_content() normalises any \r\n/\r and ZWSP-prefixes
         # header-key lookalike lines — belt-and-suspenders alongside field order.
         task_id = f"task-{int(datetime.now().timestamp() * 1000)}"
+        safe_caller = confine_user_content(caller)
         task_content = (
             f"id: {task_id}\n"
             f"timestamp: {datetime.now().isoformat()}\n"
             f"source: twilio_voice\n"
-            f"from: {caller}\n"
+            f"from: {safe_caller}\n"
             f"call_sid: {call_sid}\n"
-            f"task: Incoming phone call from {confine_user_content(caller)}\n"
+            f"task: Incoming phone call from {safe_caller}\n"
         )
         (TASK_DIR / f"{task_id}.txt").write_text(task_content)
 
@@ -612,12 +613,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # also run through confine_user_content to defang any ===fence===
         # or header-key line (the fence check is independent of field order).
         task_id = f"task-{int(datetime.now().timestamp() * 1000)}"
+        safe_sender = confine_user_content(sender)
         task_content = (
             f"id: {task_id}\n"
             f"timestamp: {datetime.now().isoformat()}\n"
             f"source: twilio_sms\n"
-            f"from: {sender}\n"
-            f"task: SMS from {sender}: {confine_user_content(body)}\n"
+            f"from: {safe_sender}\n"
+            f"task: SMS from {safe_sender}: {confine_user_content(body)}\n"
         )
         (TASK_DIR / f"{task_id}.txt").write_text(task_content)
 
@@ -635,12 +637,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         caller = form_data.get("From", ["unknown"])[0]
         if text:
             task_id = f"task-{int(datetime.now().timestamp() * 1000)}"
+            safe_caller = confine_user_content(caller)
             task_content = (
                 f"id: {task_id}\n"
                 f"timestamp: {datetime.now().isoformat()}\n"
                 f"source: twilio_voicemail\n"
-                f"from: {caller}\n"
-                f"task: Voicemail from {caller}: {confine_user_content(text)}\n"
+                f"from: {safe_caller}\n"
+                f"task: Voicemail from {safe_caller}: {confine_user_content(text)}\n"
             )
             (TASK_DIR / f"{task_id}.txt").write_text(task_content)
         self.send_json(200, {"ok": True})

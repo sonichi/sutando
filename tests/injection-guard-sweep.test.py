@@ -246,6 +246,36 @@ _check(
 )
 
 # ---------------------------------------------------------------------------
+# agent-api.py Twilio handlers: caller/sender must be confined in from: AND task: body
+# (SMS and transcription handlers embed caller/sender in the task body — unconfined
+# values could inject ===fence=== patterns or header-key lines into the task body)
+# ---------------------------------------------------------------------------
+
+_aa = _src("src/agent-api.py")
+_check(
+    "agent-api: twilio voice — safe_caller used in from: and task: body",
+    "safe_caller = confine_user_content(caller)" in _aa
+    and "from: {safe_caller}" in _aa,
+    "agent-api.py handle_twilio_voice must define safe_caller and use it in both "
+    "the from: field and the task: body (caller appears in both)",
+)
+_check(
+    "agent-api: twilio SMS — safe_sender used in from: and task: body",
+    "safe_sender = confine_user_content(sender)" in _aa
+    and "from: {safe_sender}" in _aa
+    and "SMS from {safe_sender}" in _aa,
+    "agent-api.py handle_twilio_sms must confine sender in both from: field and "
+    "task: body (prior code had unconfined {sender} in 'SMS from {sender}: ...')",
+)
+_check(
+    "agent-api: twilio voicemail — safe_caller used in from: and task: body",
+    # voicemail handler uses safe_caller in from: and task: body
+    _aa.count("safe_caller = confine_user_content(caller)") >= 2,
+    "agent-api.py handle_twilio_transcription must also define safe_caller "
+    "(two handlers use this pattern — check both voice and transcription)",
+)
+
+# ---------------------------------------------------------------------------
 # web-client.ts: task body is hardcoded (no user data embedded)
 # ---------------------------------------------------------------------------
 
@@ -266,6 +296,6 @@ _check(
 # ---------------------------------------------------------------------------
 
 _total = _passed + _failed
-print(f"injection-guard-sweep: {_passed}/{_total} passed"  # expected 31/31
+print(f"injection-guard-sweep: {_passed}/{_total} passed"  # expected 34/34
       + ("" if _failed == 0 else f" — {_failed} FAILED"))
 sys.exit(0 if _failed == 0 else 1)
