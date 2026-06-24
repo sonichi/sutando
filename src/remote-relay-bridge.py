@@ -67,16 +67,32 @@ ARCHIVE_RESULTS_DIR = RESULTS_DIR / "archive"
 # cross-send other channels' (Discord/Telegram) results to the relay.
 INFLIGHT_FILE = WS / "state" / "remote-task-inflight.json"
 
+# Back-compat: instances onboarded before the AG2_REMOTE_* → REMOTE_TASK_*
+# rename still export the legacy names in their .env. Honor them as DEPRECATED
+# aliases for one release (remove next), with a one-line migration nudge, so the
+# bridge keeps connecting under any launcher. New onboards use REMOTE_TASK_*.
+_warned_legacy = set()
+def _env_compat(new, old):
+    v = os.environ.get(new)
+    if v:
+        return v
+    v = os.environ.get(old)
+    if v and old not in _warned_legacy:
+        _warned_legacy.add(old)
+        print(f"[remote-relay-bridge] {old} is deprecated — rename to {new} in your .env",
+              file=sys.stderr, flush=True)
+    return v
+
 # One-token onboarding: REMOTE_TASK_TOKEN alone is enough. The onboarding
 # string may be the combined "https://<relay>|<secret>" form (the URL travels
 # inside the token — nothing service-specific lives in this repo); a bare
 # secret needs REMOTE_TASK_URL alongside it.
-_RAW = os.environ.get("REMOTE_TASK_TOKEN") or ""
+_RAW = _env_compat("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN") or ""
 if "|" in _RAW:
     _URL_FROM_TOKEN, TOKEN = _RAW.split("|", 1)
 else:
     _URL_FROM_TOKEN, TOKEN = "", _RAW
-URL = (os.environ.get("REMOTE_TASK_URL")
+URL = (_env_compat("REMOTE_TASK_URL", "AG2_REMOTE_URL")
        or _URL_FROM_TOKEN).rstrip("/")
 PROVIDER = os.environ.get("REMOTE_TASK_PROVIDER") or "remote"
 POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
@@ -93,7 +109,7 @@ _TASK_FIELDS = ("id", "timestamp", "task", "source", "channel_id",
 # tier written to every task file comes from REMOTE_TASK_TIER in .env —
 # default "team" (sandboxed processing). Operators who own their relay can
 # explicitly set REMOTE_TASK_TIER=owner.
-LOCAL_TIER = (os.environ.get("REMOTE_TASK_TIER") or "team").strip().lower()
+LOCAL_TIER = (_env_compat("REMOTE_TASK_TIER", "AG2_REMOTE_TIER") or "team").strip().lower()
 if LOCAL_TIER not in ("owner", "team", "other"):
     LOCAL_TIER = "team"
 
