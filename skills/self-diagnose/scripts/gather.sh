@@ -57,6 +57,27 @@ else
 	NOTES_DIR="$REPO/notes"
 fi
 
+# Per-host label for hosts/<host>/ paths. Lockstep with `_host()`
+# (scripts/sync-workspace.sh) and `_host_label()` (src/util_paths.py):
+# $SUTANDO_HOST_LABEL > scutil LocalHostName (stable) > short hostname (which
+# can DHCP-drift, e.g. Comcast → Chis-MBP, splitting per-host paths; #1745).
+_sd_host() {
+	local env="${SUTANDO_HOST_LABEL:-${SUTANDO_HOST_OVERRIDE:-}}"
+	if [ -n "$env" ]; then
+		printf '%s\n' "$env"
+		return
+	fi
+	local lhn=""
+	if command -v scutil >/dev/null 2>&1; then
+		lhn="$(scutil --get LocalHostName 2>/dev/null)"
+	fi
+	if [ -n "$lhn" ]; then
+		printf '%s\n' "$lhn"
+	else
+		hostname | sed 's/\..*//'
+	fi
+}
+
 # Convert window to seconds for log filtering
 case "$WINDOW" in
 	*h) SECONDS_AGO=$((${WINDOW%h} * 3600)) ;;
@@ -103,7 +124,13 @@ fi
 # 3) Build log tail + pending questions + cold-review log (small files, copy whole)
 _bl="${WS}/build_log.md"; [ -f "$_bl" ] || _bl="${REPO}/build_log.md"
 tail -150 "$_bl" > "$OUT/build_log-tail.md" 2>/dev/null || true
-_pq="${WS}/pending-questions.md"; [ -f "$_pq" ] || _pq="${REPO}/pending-questions.md"
+# pending-questions.md is per-host (hosts/<host>/, #1717 F1 convention); probe
+# there FIRST, then the flat workspace root and repo root (back-compat for
+# pre-revamp / un-migrated layouts). Mirrors personal_path()'s read-side probe
+# order (#1718) so self-diagnose reads the same file the writers target.
+_pq="${WS}/hosts/$(_sd_host)/pending-questions.md"
+[ -f "$_pq" ] || _pq="${WS}/pending-questions.md"
+[ -f "$_pq" ] || _pq="${REPO}/pending-questions.md"
 cp "$_pq" "$OUT/pending-questions.md" 2>/dev/null || true
 cp "$NOTES_DIR/cold-review-log.md" "$OUT/cold-review-log.md" 2>/dev/null || true
 
