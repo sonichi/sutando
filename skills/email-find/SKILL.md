@@ -79,7 +79,7 @@ Named-entity → partner-domain mappings live in the user's memory directory, no
 
 ### File location
 
-Resolve `SUTANDO_MEMORY_DIR` (default: `~/.claude/projects/<project-id>/memory/`). Look for `reference_partner_domains.md`, `partner_domains*.md`, or a `## Partner domains` section in `user_profile.md`. If none exist, the skill remains fully functional — Phase 2 just no-ops.
+Resolve `SUTANDO_MEMORY_DIR` (default: `$CLAUDE_CONFIG_DIR/projects/<project-id>/memory/`). Look for `reference_partner_domains.md`, `partner_domains*.md`, or a `## Partner domains` section in `user_profile.md`. If none exist, the skill remains fully functional — Phase 2 just no-ops.
 
 ### Auto-learn
 

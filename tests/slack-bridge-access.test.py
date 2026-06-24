@@ -20,8 +20,9 @@ Guards:
      world-readable via umask 644).
   3. `_write_task()` checks `user_id not in allowed` and drops with a log
      line — fail-closed for unknown senders.
-  4. ACCESS_FILE lives under ~/.claude/channels/slack/ — consistent with
-     telegram + discord (so /sutando uninstall scripts find it).
+  4. ACCESS_FILE lives under $CLAUDE_CONFIG_DIR/channels/slack/ via the
+     shared `claude_home_path()` helper — consistent with telegram + discord
+     (so /sutando uninstall scripts find it across vanilla + claude-sutando).
 """
 
 from pathlib import Path
@@ -101,13 +102,15 @@ def main() -> int:
         return fail("_write_task must drop messages from senders not in allowed "
                     "(fail-closed access gate)", write_block)
 
-    # 4. ACCESS_FILE path is ~/.claude/channels/slack/
+    # 4. ACCESS_FILE resolves via channel_access_path("slack") — the shared
+    #    helper that honors $CLAUDE_CONFIG_DIR AND implements the ~30-day
+    #    legacy ~/.claude fallback (see util_paths.channel_access_path).
     if not re.search(
-        r"ACCESS_FILE\s*=\s*Path\.home\(\)\s*/\s*['\"]\.claude['\"]\s*/\s*['\"]channels['\"]\s*/\s*['\"]slack['\"]\s*/\s*['\"]access\.json['\"]",
+        r"ACCESS_FILE\s*=\s*channel_access_path\(\s*['\"]slack['\"]\s*\)",
         src,
     ):
-        return fail("ACCESS_FILE must be ~/.claude/channels/slack/access.json "
-                    "for parity with telegram + discord bridges")
+        return fail("ACCESS_FILE must be channel_access_path('slack') "
+                    "for parity with telegram + discord bridges (CCD-aware + legacy fallback)")
 
     print("PASS: slack-bridge.py access control looks correct.")
     print("  - load_allowed returns None when ACCESS_FILE missing (TOFU-eligible)")

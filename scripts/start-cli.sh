@@ -21,6 +21,35 @@ cd "$REPO"
 TMUX_SOCKET="/tmp/sutando-tmux.sock"
 SESSION="sutando-core"
 
+# Resolve workspace-scoped CLAUDE_CONFIG_DIR. The interactive `claude-sutando`
+# shell function does the same per-invocation; this is the machine-spawn
+# equivalent so the tmux-wrapped core process writes sessions / memory / state
+# into the workspace tree rather than the global ~/.claude/.
+#
+# Defense in depth:
+#   - M0 helper missing → silent fallback (legacy install, extracted tarball).
+#   - Helper present + config valid → export env for every claude invocation
+#     below (no-tmux fallback at L~75, TTY exec at L~115, no-TTY detached at
+#     L~120 all inherit it).
+#   - Helper present + config violates the workspace-sub-folder invariant →
+#     refuse to start. Silently falling back to ~/.claude/ would hide a real
+#     config error AND scatter state into a location the M2 vault sync engine
+#     doesn't include.
+if [ -x "$REPO/scripts/sutando-config.sh" ]; then
+  _ccd_err="$(mktemp -t start-cli-ccd.XXXXXX)"
+  if _ccd="$(bash "$REPO/scripts/sutando-config.sh" claude-sutando-config-dir 2>"$_ccd_err")"; then
+    mkdir -p "$_ccd"
+    export CLAUDE_CONFIG_DIR="$_ccd"
+    echo "  ✓ CLAUDE_CONFIG_DIR=$_ccd"
+  else
+    echo "start-cli: claude_sutando_config_dir invalid — refusing to start core" >&2
+    cat "$_ccd_err" >&2
+    rm -f "$_ccd_err"
+    exit 1
+  fi
+  rm -f "$_ccd_err"
+fi
+
 # Optional context-window pin (graceful-degradation hook for the 1M
 # usage-credit-gate wedge — see src/health-check.py recover_core_if_wedged).
 # When SUTANDO_CORE_MODEL is set we pass it through as `--model`; otherwise we

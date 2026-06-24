@@ -1,7 +1,7 @@
 {
   "name": "sutando",
   "version": "0.1.0",
-  "description": "Sutando — a personal AI agent. Voice interface backed by Claude Code.",
+  "description": "Sutando \u2014 a personal AI agent. Voice interface backed by Claude Code.",
   "type": "module",
   "scripts": {
     "start": "tsx src/voice-agent.ts",
@@ -13,15 +13,11 @@
   "dependencies": {
     "@ai-sdk/google": "^1.2.0",
     "@anthropic-ai/claude-agent-sdk": "^0.1.0",
-    "@discordjs/opus": "^0.10.0",
-    "@discordjs/voice": "^0.19.2",
     "@google/genai": "^1.49.0",
     "@types/ws": "^8.18.1",
     "ai": "^6.0.149",
     "bodhi-realtime-agent": "github:sonichi/bodhi_realtime_agent#ffec0cd",
-    "discord.js": "^14.26.4",
     "dotenv": "^17.4.1",
-    "libsodium-wrappers": "^0.8.4",
     "playwright": "^1.58.2",
     "ws": "^8.20.0",
     "yaml": "^2.9.0",
@@ -37,5 +33,15 @@
   },
   "engines": {
     "node": ">=22.5.0"
+  },
+  "exports": {
+    "./conversation-store": "./src/conversation-store.ts",
+    "./workspace-default": "./src/workspace_default.ts",
+    "./result-channel-key": "./src/result-channel-key.ts",
+    "./util-paths": "./src/util_paths.ts",
+    "./voice-key": "./src/voice-key.ts",
+    "./voice-config": "./src/voice-config.ts",
+    "./inline-tools": "./src/inline-tools.ts",
+    "./vision-tools": "./src/vision-tools.ts"
   }
 }

@@ -55,6 +55,9 @@ _ARG_IN="${1:-}"; _ARG_NAME="${2:-}"; _ARG_PASS="${3:-${AG2_ONBOARD_PASSWORD:-}}
       _DS=$(curl -sf -X POST "$_AG2_BASE/connect/start" -H 'content-type: application/json' -d '{}' 2>/dev/null)
       _DC=$(printf '%s' "$_DS" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("device_code",""))' 2>/dev/null)
       _VU=$(printf '%s' "$_DS" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("verify_url",""))' 2>/dev/null)
+      if [ -z "$_DC" ] && [ -n "$_DS" ]; then
+        echo "  (device-login unavailable here — falling back to login)"
+      fi
       if [ -n "$_DC" ] && [ -n "$_VU" ]; then
         echo "  Opening your browser to log in:"
         echo "    $_VU"

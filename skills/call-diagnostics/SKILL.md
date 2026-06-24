@@ -5,11 +5,11 @@ Analyze phone call observability data, detect problems, track them across calls,
 ## Usage
 
 ```bash
-python3 ~/.claude/skills/call-diagnostics/scripts/diagnose.py              # last call
-python3 ~/.claude/skills/call-diagnostics/scripts/diagnose.py --all        # all calls + repair recommendations
-python3 ~/.claude/skills/call-diagnostics/scripts/diagnose.py -t           # show timeline
-python3 ~/.claude/skills/call-diagnostics/scripts/diagnose.py -v           # verbose (show detail)
-python3 ~/.claude/skills/call-diagnostics/scripts/diagnose.py --all --tracker  # generate HTML tracker + open
+python3 $CLAUDE_CONFIG_DIR/skills/call-diagnostics/scripts/diagnose.py              # last call
+python3 $CLAUDE_CONFIG_DIR/skills/call-diagnostics/scripts/diagnose.py --all        # all calls + repair recommendations
+python3 $CLAUDE_CONFIG_DIR/skills/call-diagnostics/scripts/diagnose.py -t           # show timeline
+python3 $CLAUDE_CONFIG_DIR/skills/call-diagnostics/scripts/diagnose.py -v           # verbose (show detail)
+python3 $CLAUDE_CONFIG_DIR/skills/call-diagnostics/scripts/diagnose.py --all --tracker  # generate HTML tracker + open
 ```
 
 ## When to use

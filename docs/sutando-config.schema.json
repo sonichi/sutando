@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/sonichi/sutando/blob/main/docs/sutando-config.schema.json",
+  "title": "Sutando config",
+  "description": "Contract for sutando.config.json and sutando.config.local.json. The loader (src/sutando_config.{py,ts}) deep-merges the two and expands ${REPO_DIR} in every string value before validating against this schema. Keys whose name starts with `_` are stripped before validation (comment convention used in the .example file).",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Workspace location config. Resolution order: $SUTANDO_WORKSPACE env (legacy escape hatch, warn) > sutando.config.local.json > sutando.config.json > baked-in default ${REPO_DIR}/workspace.",
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Absolute or ${REPO_DIR}-relative path to the workspace directory. The loader expands ${REPO_DIR} to the directory containing this file (== git toplevel for a sane checkout)."
+        }
+      }
+    },
+    "claude_sutando_config_dir": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Where the Sutando-scoped Claude Code config lives — set via the `claude-sutando` shell function as CLAUDE_CONFIG_DIR. Constrained to a workspace sub-folder so the M2 vault sync engine can include it via a single workspace-relative glob; if the path escapes the workspace, sync coherence breaks.",
+      "properties": {
+        "subdir": {
+          "type": "string",
+          "minLength": 1,
+          "default": ".claude-sutando",
+          "pattern": "^(?!.*\\.\\.)(?!/)[^/].*$",
+          "description": "Sub-folder of <workspace> for CLAUDE_CONFIG_DIR. MUST be a relative sub-path of the workspace — absolute paths (leading `/`) and `..` parent-directory escapes are rejected. The loader additionally asserts the resolved final path stays under workspace (defense in depth)."
+        }
+      }
+    },
+    "vault": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Vault (durable knowledge sync) config. Off by default; opt-in by setting enabled=true in sutando.config.local.json plus a remote_url. The sync engine (M2) reads sync.include + sync.exclude to decide what flows to the remote.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Master switch for vault sync. When false, no remote pushes regardless of other vault settings."
+        },
+        "remote_url": {
+          "type": "string",
+          "description": "URL of the remote git repo that holds the synced workspace subset. Empty string means unconfigured."
+        },
+        "sync": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "What to sync. Include is an allowlist of paths relative to the workspace root; exclude carves out machine-local noise from within included paths. Arrays REPLACE on merge (not unioned) — overriding in .local.json wipes the defaults for that array.",
+          "properties": {
+            "include": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "description": "Workspace-relative paths to sync. Trailing slash convention indicates a directory."
+            },
+            "exclude": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "description": "Workspace-relative paths to skip during sync. Glob patterns supported (e.g. '*.heartbeat')."
+            }
+          }
+        },
+        "interval_seconds": {
+          "type": "integer",
+          "minimum": 60,
+          "default": 1800,
+          "description": "Seconds between sync runs when sync is enabled. Minimum 60 to avoid hammering the remote."
+        }
+      }
+    }
+  }
+}

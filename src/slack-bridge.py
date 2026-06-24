@@ -17,7 +17,7 @@ Bot scopes (OAuth & Permissions):
     users:read
 
 Access list (TOFU onboarding, same schema as telegram):
-    ~/.claude/channels/slack/access.json
+    $CLAUDE_CONFIG_DIR/channels/slack/access.json
         {"allowFrom": ["U0123..."], "tofuOwner": "U0123...", ...}
 
 File round-trip:
@@ -47,6 +47,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from task_priority import default_priority_for_source  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
+from task_body_guard import confine_user_content  # noqa: E402
+from util_paths import channel_access_path, claude_home_path  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
@@ -170,7 +172,7 @@ def presenter_mode_active() -> bool:
         return False
 
 
-ACCESS_FILE = Path.home() / ".claude" / "channels" / "slack" / "access.json"
+ACCESS_FILE = channel_access_path("slack")
 
 # In-memory mirror of access.json. Updated on every successful read.
 # Used by tofu_onboard() to detect and recover from external deletions
@@ -468,7 +470,13 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     # Kept short here because Slack's downgrade surface today is just
     # "delegate to sandboxed read-only agent" — no Slack-state-prefetch
     # path equivalent to Discord's `_prefetch_discord_state_refs`.
-    user_task_text = f"[{prefix} @{username or user_id}] {text}{attachment_note}"
+    # Confine the user-derived portion BEFORE the bridge appends its own
+    # `===SUTANDO SYSTEM INSTRUCTIONS===` block below — so a forged field/fence
+    # in the message can't escalate tier or inject instructions, while the
+    # bridge's legitimate fence (added next) stays intact. See task_body_guard.
+    user_task_text = confine_user_content(
+        f"[{prefix} @{username or user_id}] {text}{attachment_note}"
+    )
     if access_tier != "owner":
         user_task_text = (
             f"{user_task_text}\n\n"

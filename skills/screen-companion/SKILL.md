@@ -116,7 +116,7 @@ Configs still cannot grant tools the active VoiceSession doesn't already expose 
 **By default, this skill DOES NOT take screenshots, record video, or persist frames to disk.** Frames are sent to Gemini Live for real-time understanding (the API call itself), and discarded — nothing lands on the local filesystem.
 
 What IS persisted by default:
-- **Text transcript** of the spoken conversation, in `<workspace>/data/screen-companion-<sessionId>.jsonl`. Same convention as `phone-conversation/conversation-server.ts` + `discord-voice/discord-voice-server.ts`.
+- **Text transcript** of the spoken conversation, in `<workspace>/data/screen-companion-<sessionId>.jsonl`. Same convention as `phone-conversation/conversation-server.ts` and other voice-surface servers.
 - **Notes the user explicitly asks Sutando to take** — saved to `<workspace>/notes/` via the `take_note` tool. "Remember this" / "note that" requests during a session land as `.md` files under `notes/` with a `screen-companion` tag.
 
 What is NOT persisted by default:

@@ -57,8 +57,15 @@ _MANIFEST_PATH = os.path.expanduser("~/.sutando-secret-vault/keys.json")
 # pattern-based validation, eliminating both:
 #   - FP: "the vault set command works fine" → "works" is not a secret → skip
 #   - FN: "hey vault set APOLLO_KEY sk-..." mid-prose → "sk-..." is OpenAI → store
+# Key/value separator is whitespace OR `=` (with optional surrounding spaces),
+# so `vault set KEY VALUE`, `vault set KEY=VALUE`, and `vault set KEY = VALUE`
+# all intercept. The KEY group stops at the first space or `=` (`[^\s=]+`) so
+# the `=` form isn't swallowed whole — that swallowing is what let an owner's
+# `vault set X_BEARER_TOKEN=…` slip past uncaught and land in plaintext on disk
+# (2026-06-22 incident). Group numbering preserved: key=group(1), value
+# alternatives=groups 2-5 (separator is non-capturing).
 _VAULT_SET_RE = re.compile(
-    r'\bvault\s+set\s+(\S+)\s+(?:"([^"]*)"|\'([^\']*)\'|`([^`]*)`|(\S+))(?=\s|$|[.,!?;])',
+    r'\bvault\s+set\s+([^\s=]+)(?:\s*=\s*|\s+)(?:"([^"]*)"|\'([^\']*)\'|`([^`]*)`|(\S+))(?=\s|$|[.,!?;])',
     re.IGNORECASE,
 )
 

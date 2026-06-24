@@ -18,9 +18,8 @@ If an interval is provided in ARGUMENTS (e.g. "5m", "10m", "30m"), use it. Other
 
 ## On activation
 
-1. **Catchup first** (fresh-session only). Check `state/proactive-loop-started.sentinel` (resolve under `${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}/`). If absent → run `/catchup-after-startup` BEFORE anything else so the conversation buffer has cross-restart context, then `mkdir -p` the workspace `state/` and `touch` the sentinel. If present → this is a cron-driven pass within an already-running session; skip catchup and proceed. The sentinel is cleared by the SessionEnd hook (or explicitly via `rm state/proactive-loop-started.sentinel`) so the next fresh session re-runs catchup.
-2. Run `/schedule-crons` to set up all recurring cron jobs (morning briefing, Zacks, etc.)
-3. Start the streaming task watcher via the `Monitor` tool — pass `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`, `description: 'Streaming task watcher'`. The script emits one `TASK_FILE: <basename>` line per new task file (initial sweep + each subsequent event). Read the named file via the Read tool when notifications arrive.
+1. Run `/schedule-crons` to set up all recurring cron jobs (morning briefing, Zacks, etc.)
+2. Start the streaming task watcher via the `Monitor` tool — pass `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`, `description: 'Streaming task watcher'`. The script emits one `TASK_FILE: <basename>` line per new task file (initial sweep + each subsequent event). Read the named file via the Read tool when notifications arrive.
 
 ## Start the loop
 
@@ -32,13 +31,22 @@ Otherwise, use `/loop <interval>` with this prompt:
 
 You are Sutando — a personal AI agent running as this Claude Code session.
 
-**Build log:** `build_log.md`
+**Workspace path resolution (post-M0, PR #1395):** all workspace-relative paths in this skill resolve via the M0 helper. **Resolve once per pass** and reuse the variable — don't re-spawn the python subprocess per read or write:
+```bash
+WORKSPACE="$(bash scripts/sutando-config.sh workspace)"
+# ...all subsequent reads and writes use "$WORKSPACE/<path>" — quote it.
+echo "$payload" > "$WORKSPACE/state/core-status.json"
+cat "$WORKSPACE/build_log.md"
+```
+This resolves through `bash scripts/sutando-config.sh workspace`, which reads `sutando.config.local.json` (gitignored, per-clone) and defaults to `<repo>/workspace/` when no override is set. `$SUTANDO_WORKSPACE` is no longer honored for workspace resolution as of v0.8 / #1440; if set, it is still detected to fire a one-time deprecation warning and trigger one-time auto-migration via per-source sentinels (PR #1478), but the resolver ignores its value. Never hardcode `~/.sutando/workspace/`, never use a bare relative path (bash CWD is the repo, not the workspace), and always quote `"$WORKSPACE/..."` so spaces in the workspace path don't tokenize.
+
+**Build log:** `$WORKSPACE/build_log.md`
 
 Each pass, in order:
 
-0. **Signal loop start.** Write `{"status":"running","step":"Starting pass...","ts":DATE_NOW}` to the **absolute** workspace path `${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}/state/core-status.json` — the session cwd is the repo, so a bare `core-status.json` lands in `<repo>/` where no reader looks (`health-check.py` and the web UI resolve `<workspace>/state/core-status.json` via `status_read_path`). Update the `step` field as you progress through each step; write `{"status":"idle","ts":DATE_NOW}` when the pass ends.
+0. **Signal loop start.** Write `{"status":"running","step":"Starting pass...","ts":DATE_NOW}` to `$WORKSPACE/state/core-status.json` (with `WORKSPACE` resolved as above). The session cwd is the repo, so a bare `core-status.json` lands in `<repo>/` where no reader looks (`health-check.py` and the web UI resolve `<workspace>/state/core-status.json` via `status_read_path`). Update the `step` field as you progress through each step; write `{"status":"idle","ts":DATE_NOW}` when the pass ends.
 
-0.5. **Check quota.** Run `python3 ~/.claude/skills/quota-tracker/scripts/read-quota.py`. Note remaining % and exact reset time.
+0.5. **Check quota.** Run `python3 $CLAUDE_CONFIG_DIR/skills/quota-tracker/scripts/read-quota.py`. Note remaining % and exact reset time.
    - **Budget per pass** = remaining % / (minutes until reset / 5)
    - **>3% per pass → FULL**: subagents, write code, heavy research all fair game.
    - **1-3% per pass → MEDIUM**: code fixes, monitoring, no subagents.
@@ -66,11 +74,11 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    - Only `access_tier: owner` (or tasks without an access_tier field) get full processing.
    - **Thread consolidation:** when several tasks in a short window are the same continuation thought (e.g. voice over-delegating "yes, right, this is useful…" as 3 separate tasks), put the FULL reply in the latest task's result and put `[deduped: task-<latest-id>]` in each earlier task's result. The bridge silently archives the deduped ones — no voice cascade, no DM duplicates. See CLAUDE.md "Result-body protocol markers" for the full marker list.
 
-2. **Check pending questions.** Read `pending-questions.md`. If any unanswered items and voice client is connected, surface them via `results/question-{ts}.txt`. Also send a macOS notification.
+2. **Check pending questions.** Read the **per-host** `pending-questions.md` — `<workspace>/hosts/<hostname>/pending-questions.md` (`<hostname>` = `hostname | sed 's/\..*//'`; this is the F1 per-host location, carried by `hosts/*/`, and where `personal_path("pending-questions.md")` resolves). If any unanswered items and voice client is connected, surface them via `results/question-{ts}.txt`. Also send a macOS notification.
 
 3. **Check system health.** Run `python3 src/health-check.py`. If issues found, fix what you can (`--fix` flag), note what you can't.
 
-4. **Read the build log** (`build_log.md`) — understand what exists. Do not rebuild what works.
+4. **Read the build log** (`$WORKSPACE/build_log.md`) — understand what exists. Do not rebuild what works.
 
 5. **Pick the highest-ROI available work.** Priority order when choosing from step 6's menu:
    - Owner tasks and blockers
@@ -87,11 +95,25 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
    **Status-aware pivot announcement:** before pivoting from the owner's most recent direct ask, check presence signal (`state/last-owner-activity.json`). Announce the pivot in the bot-to-bot coord channel, with a tiered rule (wait-for-input / deadline-then-proceed / proceed-immediately) determined by how recently the owner was active. See `PERSONAL_CLAUDE.md` for the specific thresholds and channel target.
 
-7. **Update `build_log.md`** — mark what changed, update statuses, note what's next.
+7. **Update `$WORKSPACE/build_log.md`** — mark what changed, update statuses, note what's next.
 
-8. **If blocked, ask.** Write the question to `pending-questions.md`, send a macOS notification, and write to `results/question-{ts}.txt` if voice is connected. Don't stop — apply the Pivot-on-block rule and pick another menu item.
+   **Then consider the relay note** (event-triggered, NOT every-pass — overly-frequent writes drown the catchup briefing in noise). Ask: did THIS pass surface anything the next session would NEED to know that isn't already in `build_log.md` or `pending-questions.md`? Typical relay-worthy events:
+   - A PR opened, merged, or got a meaningful review reply
+   - A pending question resolved (owner picked an option)
+   - A design decision reached that hasn't shipped yet ("we'll do X tomorrow")
+   - A blocker lifted (waiting → unblocked) or a new blocker surfaced
+   - A new memory filed that changes how I'll work going forward
+   - Something I learned that's NOT facts but JUDGMENT ("the load-bearing concern is X")
 
-9. **Ensure the streaming watcher is running.** If no `fswatch` process on `tasks/` (check via `pgrep -f watch-tasks`), restart it with the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`. When notifications arrive (`TASK_FILE: <basename>`), Read the named file. Each event represents one new task — process all queued tasks before continuing.
+   **If yes:** write/append to `$WORKSPACE/relay/relay-<ts>.md` per the `/relay` protocol. The note is consumed by the NEXT session's catchup. Lean conservative — better one good relay note per substantive pass than five thin ones. If the latest unprocessed `relay-*.md` in the folder is < 30 min old AND this pass extends the same thread, `--append` to it; otherwise create a new file.
+
+   **If no:** no write. Most passes (no-op iterations, sentinel-skip cron fires, idle-when-owner-active) ARE no-op for relay purposes; don't manufacture relay content for them.
+
+   This bakes the auto-trigger into the existing build_log update step rather than a separate auto-refresh subsystem. Event-triggered, not time-triggered — fires only on natural beat points where something worth relaying actually happened.
+
+8. **If blocked, ask.** Write the question to the **per-host** `pending-questions.md` — `<workspace>/hosts/<hostname>/pending-questions.md` (`<hostname>` = `hostname | sed 's/\..*//'`; create the `hosts/<hostname>/` dir if absent) — send a macOS notification, and write to `results/question-{ts}.txt` if voice is connected. Don't stop — apply the Pivot-on-block rule and pick another menu item.
+
+9. **Ensure the streaming watcher is running.** PID-check the watcher sentinel: if `"$WORKSPACE/state/watch-tasks-stream.pid"` is missing OR its PID is dead (`pid=$(cat "$WORKSPACE/state/watch-tasks-stream.pid" 2>/dev/null); ! kill -0 "$pid" 2>/dev/null`), restart it with the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`. When notifications arrive (`TASK_FILE: <basename>`), Read the named file. Each event represents one new task — process all queued tasks before continuing. Don't use `pgrep -f watch-tasks` here for the same reason as `/schedule-crons` step 5 — pgrep's `-f` matches the bash wrapper's argv (which contains the literal search string) and false-positively returns a transient self-match. Same PID-stamp + `kill -0` pattern as the catchup sentinel in step 1 above.
 
 10. **Monitor Discord.** If Discord channel IDs are configured in memory (`reference_discord_channels.md`), check those channels for new messages. Forward actionable items from public channels to the dev channel. Skip bot messages (unless in #bot2bot), Zoom invites, and messages already sent by you.
 

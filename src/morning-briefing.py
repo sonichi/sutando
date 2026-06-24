@@ -21,6 +21,7 @@ from urllib.error import URLError
 
 sys.path.insert(0, str(Path(__file__).parent))
 from workspace_default import resolve_workspace  # noqa: E402
+from util_paths import personal_path  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 RESULTS_DIR = WORKSPACE / "results"
@@ -190,9 +191,14 @@ def get_reminders() -> list[str]:
         if r.returncode != 0:
             return []
         items = []
+        # reminders.py prints the human-readable sentinel "No reminders."
+        # (exit 0) when the due-today list is empty — skip it so the empty
+        # state doesn't get counted as a single reminder and rendered as
+        # "Reminders due: No reminders.".
+        empty_sentinels = {"no reminders.", "no reminders"}
         for line in r.stdout.splitlines():
             line = line.strip()
-            if line and not line.startswith("#"):
+            if line and not line.startswith("#") and line.lower() not in empty_sentinels:
                 items.append(line)
         return items[:5]
     except (subprocess.TimeoutExpired, OSError):
@@ -223,7 +229,7 @@ def get_overnight_discord() -> list[str]:
 
 def get_pending_questions() -> list[str]:
     """Return unanswered questions from pending-questions.md."""
-    pq = WORKSPACE / "pending-questions.md"
+    pq = personal_path("pending-questions.md", WORKSPACE)
     if not pq.exists():
         return []
     content = pq.read_text()
