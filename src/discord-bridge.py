@@ -57,7 +57,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 import discord_config  # noqa: E402  — Sutando workspace-local discord config (#1147)
-from util_paths import channel_access_path, claude_home_path, shared_personal_path  # noqa: E402
+from util_paths import channel_access_path, claude_home_path, personal_path, shared_personal_path  # noqa: E402
 from task_priority import default_priority_for_source  # noqa: E402
 
 # Observability: emit channel.discord.<in|out> into the local obs spine
@@ -589,7 +589,14 @@ except Exception:
     pass
 
 try:
-    identity_file = REPO / "stand-identity.json"
+    # Resolve via the canonical per-host resolver (hosts/<host>/ → legacy
+    # machine-<host>/ → workspace root), same as agent-api/dashboard/event_log/
+    # conversation-server. Reading REPO/stand-identity.json directly only saw
+    # the workspace-root fallback, so a node whose identity lives in the per-host
+    # hosts/<host>/ location got empty LOCAL_MACHINE → with SUTANDO_TEAM_TIER_OWNER
+    # set, that silently drops ALL non-owner tasks (the failure the warning below
+    # describes).
+    identity_file = personal_path("stand-identity.json", workspace=REPO)
     if identity_file.exists():
         LOCAL_MACHINE = json.loads(identity_file.read_text()).get("machine", "")
 except Exception:
