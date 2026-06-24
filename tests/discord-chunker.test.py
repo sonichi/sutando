@@ -16,7 +16,7 @@ REPO = Path(__file__).resolve().parent.parent
 # discord-bridge.py module-load has two side effects that fail in clean CI:
 #   1. `import discord` + `discord.Intents.default()` + `discord.Client(...)`
 #      — discord.py isn't installed on Ubuntu CI runners.
-#   2. Reads DISCORD_BOT_TOKEN from ~/.claude/channels/discord/.env and
+#   2. Reads DISCORD_BOT_TOKEN from $CLAUDE_CONFIG_DIR/channels/discord/.env and
 #      `exit(1)` if missing — that path doesn't exist in CI.
 #
 # Bypass both so the test can reach `_chunk_for_discord` (pure string ops,

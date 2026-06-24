@@ -1,14 +1,30 @@
 # Known Issues
 
-## Workspace contract migration in progress
+## Workspace contract — migration from `~/.sutando/workspace/`
 
-The 3-space workspace contract (Code / Workspace / Memory — see [`docs/workspace-design.md`](docs/workspace-design.md)) is in the middle of a transition. Some existing scripts and skills still write per-user state into the repo (`<repo>/tasks/`, `<repo>/results/`, `<repo>/state/`, `<repo>/logs/`, `<repo>/data/`, etc.) instead of `$SUTANDO_WORKSPACE/`.
+The workspace defaults to `<repo>/workspace/` (in-repo). Configuration goes through [`sutando.config.local.json`](docs/workspace-config.md) — the loader resolves the path with a clear precedence order (config file > legacy env var > baked-in default).
 
-**Effect for users**: depending on how a script was invoked, runtime state may end up in either location. On a workspace-pinned install, state written to the repo path is invisible to readers that look in `$SUTANDO_WORKSPACE`. Symptoms include sentinels that never trigger, scans that miss live data, or reply-context that doesn't reach the bot.
+**For existing users** with `SUTANDO_WORKSPACE` set in `.env` or shell init: the env var is **no longer honored for workspace resolution** as of v0.8 / #1440. It is still detected on startup to fire a one-time deprecation warning and trigger one-time auto-migration via per-source sentinels (PR #1478), but the resolver itself ignores its value. Remove the export from your shell init when convenient — see step 2 of the pre-migration operator checklist below — otherwise the deprecation banner keeps firing on every shell.
 
-**Status**: A migration CLI (`scripts/sutando-migrate.sh`) is queued in PR #1271 to move existing repo-anchored state into the workspace. Per-site fixes for individual scripts are tracked in PRs #1272–#1334 (filed but held in draft until the V1 contract is finalized). The path-resolution audit (`workspace-contract-audit` skill) catches new violations at PR time.
+**For users with state in the old default location** (`~/.sutando/workspace/`): the migration script + skill is available now. Run `bash scripts/sutando-migrate.sh --dry-run` to preview, then `--commit` to relocate. Sources are preserved by default; cleanup via `--delete-source` after a 30-day grace window where readers fall back to the legacy location.
 
-If you hit a path-resolution oddity, check whether your script is reading from the repo vs `$SUTANDO_WORKSPACE` and report the file/line in an issue.
+If you hit a path-resolution oddity, check the resolved workspace via `bash scripts/sutando-config.sh workspace` and report the file/line in an issue.
+
+### Pre-migration operator checklist
+
+If you're about to migrate a host with vault sync, walk through this once per host before running `bash scripts/sync-workspace.sh --init`. Each item has shipped guardrails in v0.3.0 (see [`docs/workspace-sync.md`](docs/workspace-sync.md) for the full pre-flight checklist), but the operator-side verification still applies:
+
+1. **Set `vault.remote_url`** in `sutando.config.local.json` before first sync push. PR #1483 will refuse plain runs on an uninitialized workspace with a clear error, but the vault URL itself is config.
+2. **Remove `SUTANDO_WORKSPACE`** from `~/.zshrc` / `~/.bash_profile`. PR #1478 stops the re-migrate-every-boot loop via per-source sentinels, but the residual deprecation banner will keep firing on every shell until the export is removed.
+3. **Grep-confirm `.git/info/exclude`** blocks `.env`, `tasks/`, `results/`, and `state/cores/*.alive`. PR #1460 sets these defaults; per-host verification is still wise.
+4. **Confirm `<workspace>/.sutando-vault/ws-id`** exists before the first push. PR #1459 / #1463 handle the wsId mechanics, but the file is the proof.
+5. **Stagger host migrations serially**, not in parallel. Race condition on first-push to vault remains even with the wsId fix.
+6. **After each host:** restart bridges + voice-agent + Sutando.app, then verify `health-check.py` reports M0 paths cleanly.
+7. **Post-migration sanity check:** `cd <workspace> && git status` should be clean immediately after `core_heartbeat.py` writes a heartbeat (validates that the `.alive` excludes in `.git/info/exclude` are working).
+
+### Identity-collision rule (per-bot Discord token)
+
+Your bot's Discord token IS its identity. **Exactly one host at a time can hold a given token.** Copying `.env` to a new box while the old one still runs results in duplicate DMs; carrying it to neither leaves DMs unanswered. The same rule applies to Twilio creds and any other per-identity API key. When migrating to a new host, kill the bridges on the old host before bringing the new one up.
 
 ## Task status flickers in web UI after API restart
 

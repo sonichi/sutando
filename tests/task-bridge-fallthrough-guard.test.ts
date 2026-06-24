@@ -5,7 +5,7 @@ import { _shouldFallthrough } from '../src/task-bridge.js';
 // Regression for issue #1035 (follow-up to PR #1033, per-channel pull path).
 //
 // PR #1033 introduced a new filename namespace `<channel-key>.task-{id}.txt`
-// in results/ for the discord-voice + phone pull path. The new-namespace
+// in results/ for the phone + plugin-surface pull path. The new-namespace
 // files are NOT meant to reach task-bridge's `onResult()` — the per-channel
 // scanner inside the voice surfaces consumes them via read-and-delete.
 //
@@ -37,7 +37,7 @@ describe('_shouldFallthrough — belt-suspenders guard for result-watcher fallth
 
 	it('REJECTS the PR #1033 per-channel-pull namespace (the bug this guard closes)', () => {
 		// Discord voice channel id (17-20 digits)
-		assert.equal(_shouldFallthrough('1485653767402553457.task-1234567890.txt'), false);
+		assert.equal(_shouldFallthrough('1234567890123456789.task-1234567890.txt'), false);
 		// Twilio call SID (per-call unique)
 		assert.equal(_shouldFallthrough('CAabcdef0123456789abcdef0123456789.task-foo.txt'), false);
 		// Generic channel-key prefix

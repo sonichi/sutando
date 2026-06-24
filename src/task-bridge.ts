@@ -10,10 +10,10 @@
 
 import { writeFileSync, readFileSync, existsSync, unlinkSync, mkdirSync, readdirSync, appendFileSync, renameSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { homedir } from 'node:os';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from './workspace_default.js';
+import { claudeHomePath } from './util_paths.js';
 import { recordConversation, recordSessionBoundary } from './conversation-store.js';
 
 const REPO_DIR = resolveWorkspace();
@@ -171,7 +171,7 @@ export function _isVoiceTask(taskId: string): boolean {
  * (issue #1035, follow-up to PR #1033). Returns true iff the filename is one
  * that task-bridge legitimately delivers via `onResult()`. Rejects everything
  * else — most importantly, the new `<channel-key>.task-{id}.txt` namespace
- * PR #1033 introduced for the per-channel pull path (discord-voice / phone),
+ * PR #1033 introduced for the per-channel pull path (phone / plugin surfaces),
  * which the per-channel scanner consumes itself.
  *
  * `proactive-*` IS allowed: per the long-standing proactive-voice rule,
@@ -258,7 +258,7 @@ export const workTool: ToolDefinition = {
 				const video = execFileSync('/bin/sh', ['-c', 'ls -t /tmp/sutando-recording-*-narrated-subtitled.mov /tmp/sutando-recording-*-narrated.mov /tmp/sutando-recording-*.mov 2>/dev/null | head -1'], { timeout: 3000 }).toString().trim();
 				if (image && video) {
 					// execFileSync argv array bypasses shell — image/video paths are separate args, no interpolation (fixes #1451)
-					const scriptPath = resolve(join(homedir(), '.claude/skills/video-concat/scripts/prepend-image.sh'));
+					const scriptPath = resolve(claudeHomePath('skills', 'video-concat', 'scripts', 'prepend-image.sh'));
 					const result = execFileSync('bash', [scriptPath, image, video, '3'], { timeout: 60000 }).toString().trim();
 					const parsed = JSON.parse(result);
 					return { status: 'done', result: `Video with image prepended: ${parsed.output} (${parsed.size_mb}MB)` };
@@ -797,7 +797,7 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 				// the fallthrough below fires onResult() for any non-empty .txt
 				// when the voice client is connected. PR #1033 introduced a new
 				// filename namespace `<channel-key>.task-{id}.txt` for the
-				// per-channel pull path used by discord-voice / phone — those
+				// per-channel pull path used by phone / plugin surfaces — those
 				// files are NOT meant for task-bridge to inject into voice.
 				// PR #1033's mitigation is the per-channel scanner's
 				// read-and-delete winning the race; this guard closes the

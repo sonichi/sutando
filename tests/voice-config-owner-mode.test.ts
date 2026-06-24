@@ -1,7 +1,7 @@
 // Unit tests for resolveOwnerMode (src/voice-config.ts) — the fail-closed
-// owner-mode resolver for discord-voice (issue #1016, PR #1017 review fix).
+// owner-mode resolver for voice-surface configs (issue #1016, PR #1017 review fix).
 //
-// The discord-voice config is raw JSON spread into VoiceConfig, so a
+// The surface config is raw JSON spread into VoiceConfig, so a
 // hand-edited file can carry a non-boolean owner_mode (string "false", null,
 // a number, a typo). A loose `?? false` / truthy check would treat the STRING
 // "false" as truthy and grant owner tier to every speaker — a trust-boundary
@@ -26,7 +26,7 @@ function cfg(partial: Partial<VoiceConfig> & Record<string, unknown>): VoiceConf
 	} as VoiceConfig;
 }
 
-const CH = '1485653767402553457';
+const CH = '1234567890123456789';
 
 test('boolean true at skill level → owner', () => {
 	assert.equal(resolveOwnerMode(cfg({ owner_mode: true })), true);

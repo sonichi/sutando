@@ -9,12 +9,12 @@ Checks http://localhost:8080/sse-status for voiceConnected.
 If voice is connected, does nothing (voice agent will speak the result).
 If voice is disconnected, sends the result to the owner's Discord DM.
 
-Requires DISCORD_BOT_TOKEN in .env (or in ~/.claude/channels/discord/.env)
+Requires DISCORD_BOT_TOKEN in .env (or in $CLAUDE_CONFIG_DIR/channels/discord/.env)
 and the Discord bridge running.
 
 Owner resolution:
     1. $SUTANDO_DM_OWNER_ID env var (explicit override).
-    2. First non-bot user in ~/.claude/channels/discord/access.json → allowFrom.
+    2. First non-bot user in $CLAUDE_CONFIG_DIR/channels/discord/access.json → allowFrom.
 The bot's own user ID is discovered via Discord's GET /users/@me so that
 multi-owner allowFrom lists still resolve to the human.
 
@@ -33,10 +33,11 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from util_paths import claude_home_path  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 import discord_config  # noqa: E402  — workspace-local Sutando discord config (#1147)
 REPO = resolve_workspace()
-ACCESS_JSON = Path.home() / ".claude" / "channels" / "discord" / "access.json"
+ACCESS_JSON = claude_home_path("channels", "discord", "access.json")
 SSE_STATUS_URL = "http://localhost:8080/sse-status"
 
 # Path allowlist for `[file: ...]` markers — sourced from
@@ -183,7 +184,7 @@ def voice_connected() -> bool:
 def _load_token() -> str:
     """Read DISCORD_BOT_TOKEN from the first env file that has it."""
     for env_path in [
-        Path.home() / ".claude" / "channels" / "discord" / ".env",
+        claude_home_path("channels", "discord", ".env"),
         REPO / ".env",
     ]:
         if not env_path.exists():

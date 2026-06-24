@@ -16,9 +16,11 @@
  *                          Falls back to GEMINI_API_KEY. Useful for isolating voice
  *                          (free-tier eligible) from paid-tier spend on a single key.
  *   ANTHROPIC_API_KEY   — Optional: only needed if not using claude CLI subscription auth
- *   SUTANDO_WORKSPACE   — Per-user workspace dir (default: ~/.sutando/workspace/).
+ *   (workspace)         — Per-user workspace dir resolved via `resolveWorkspace()`
+ *                          from src/workspace_default.ts. Post-v0.8 (#1440) default is
+ *                          `<repo>/workspace/`; configurable via `sutando.config.local.json`.
+ *                          $SUTANDO_WORKSPACE is no longer honored for resolution.
  *                          Stores tasks/, results/, state/, logs/, conversation.log.
- *                          See workspace_default.ts (#821) for the canonical resolver.
  *   PORT                — WebSocket port (default: 9900)
  *   HOST                — Bind address (default: 0.0.0.0)
  */
@@ -96,12 +98,13 @@ if (process.env.GEMINI_VOICE_API_KEY) {
 
 const PORT = Number(process.env.PORT) || 9900;
 const HOST = process.env.HOST || '0.0.0.0';
-// Per-user runtime state lives under $SUTANDO_WORKSPACE (default
-// ~/.sutando/workspace/), not the repo checkout. Pre-#762 voice-agent
-// resolved its tasks/results/state against the repo path via the legacy
-// `WORKSPACE_DIR` env name + `import.meta.url`-relative fallback; post-#762
-// the canonical workspace lives elsewhere. resolveWorkspace() is the TS
-// twin of resolve_workspace() introduced in #821. Also remove the prior
+// Per-user runtime state lives under the resolved workspace (post-v0.8
+// / #1440 default: <repo>/workspace/), not the repo checkout. Pre-#762
+// voice-agent resolved its tasks/results/state against the repo path via
+// the legacy `WORKSPACE_DIR` env name + `import.meta.url`-relative
+// fallback; post-#762 the canonical workspace lives elsewhere.
+// resolveWorkspace() is the TS twin of resolve_workspace() introduced
+// in #821. Also remove the prior
 // "default to sutando/ so Claude Code subprocess picks up CLAUDE.md" comment
 // — voice-agent no longer spawns Claude Code (task-bridge handles that via
 // the file pipeline); the dual-use rationale is obsolete.
@@ -837,7 +840,7 @@ const mainAgent: MainAgent = {
 // proactively write user_profile / feedback / project / reference files
 // without first having to remember to mkdir. Honours $SUTANDO_MEMORY_DIR
 // when set; otherwise uses the Claude Code default
-// (~/.claude/projects/-{slug}/memory). Failure-silent: a missing memory
+// ($CLAUDE_CONFIG_DIR/projects/-{slug}/memory). Failure-silent: a missing memory
 // dir should never block voice startup.
 function bootstrapMemoryDir(): void {
 	const slug = '-' + WORKSPACE_DIR.replace(/\/$/, '').split('/').filter(Boolean).join('-');

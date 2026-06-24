@@ -20,7 +20,6 @@ export type Source =
 	| 'voice-agent'
 	| 'core-cli'
 	| 'phone'
-	| 'discord-voice'
 	| 'chat'
 	| 'discord-bridge'
 	| 'slack-bridge'

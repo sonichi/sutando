@@ -20,24 +20,26 @@
 
 set -u
 
-# Resolve TASKS_DIR. Priority: explicit positional arg → $SUTANDO_WORKSPACE/tasks
-# → canonical default `~/.sutando/workspace/tasks` (matching
-# `workspace_default.resolve_workspace()` — the shared contract every bridge
-# already follows). The bridges (discord-bridge.py, telegram-bridge.py,
-# dm-result.py — see PRs #708/#720/#722/#723) write to that default when env
-# is unset; if this watcher fell back to `<repo>/tasks/` instead, the bridges
-# would write to one dir and the watcher would poll another, so owner DMs land
-# silently. Diagnosed 2026-05-15 (~3 dropped DMs over 17 min) and again
-# 2026-05-16 (~45 min silent gap when the Monitor was started without
-# SUTANDO_WORKSPACE exported into its env) — second incident motivated
-# replacing the legacy `<repo>/tasks` fallback with the workspace default so
-# the divergence can't happen even when callers forget to export.
+__SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+__REPO_ROOT="$(cd "$__SCRIPT_DIR/.." && pwd)"
+
+# Resolve TASKS_DIR. Priority: explicit positional arg → canonical M0 loader.
+# Post-v0.8 (#1440 + Mini opinion-requested 2026-06-06) the legacy env-var
+# fallback and hardcoded pre-v0.8 default fallback are gone: the bridges
+# (discord-bridge.py, telegram-bridge.py, dm-result.py — see PRs
+# #708/#720/#722/#723) write to the resolved workspace, and if this watcher
+# diverged from that resolution owner DMs would land silently. Diagnosed
+# 2026-05-15 (~3 dropped DMs over 17 min) and again 2026-05-16 (~45 min
+# silent gap when the Monitor was started without the env var exported
+# into its env). Single resolution path = no divergence.
 if [ -n "${1:-}" ]; then
   TASKS_DIR="$1"
-elif [ -n "${SUTANDO_WORKSPACE:-}" ]; then
-  TASKS_DIR="$SUTANDO_WORKSPACE/tasks"
+elif [ -f "$__REPO_ROOT/scripts/sutando-config.sh" ]; then
+  __WS="$(bash "$__REPO_ROOT/scripts/sutando-config.sh" workspace)"
+  TASKS_DIR="$__WS/tasks"
 else
-  TASKS_DIR="$HOME/.sutando/workspace/tasks"
+  echo "watch-tasks-stream: cannot resolve workspace — scripts/sutando-config.sh not found at \$__REPO_ROOT. Verify the sutando checkout is intact." >&2
+  exit 1
 fi
 mkdir -p "$TASKS_DIR"
 # Canonicalize watched dir for the parent-dir filter below. fswatch always
@@ -53,21 +55,23 @@ TASKS_DIR_ABS="$(cd "$TASKS_DIR" && pwd -P)"
 # the session and turn into an orphan. The trap below removes the file on a
 # clean exit; the Stop hook removes it after the kill on dirty exits.
 #
-# Same workspace resolution as TASKS_DIR (above): explicit env override,
-# else canonical default. Living under state/ matches the workspace contract
-# in CLAUDE.md (loose status/state files belong there).
-if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
-  STATE_DIR="${SUTANDO_WORKSPACE/#\~/$HOME}/state"
-else
-  STATE_DIR="$HOME/.sutando/workspace/state"
-fi
+# Same workspace resolution as TASKS_DIR (above): M0 cutover routes through
+# the canonical loader. Living under state/ matches the workspace contract
+# in CLAUDE.md (loose status/state files belong there). Post-v0.8 the legacy
+# env-var + hardcoded fallbacks are gone — fail-loud if helper missing.
+STATE_DIR="$(bash "$__REPO_ROOT/scripts/sutando-config.sh" workspace)/state"
 mkdir -p "$STATE_DIR"
 PID_FILE="$STATE_DIR/watch-tasks-stream.pid"
 echo "$$" > "$PID_FILE"
-# Cleanup on any exit path (SIGINT, SIGTERM, normal exit) so the file
-# doesn't outlive the process on a clean shutdown. Dirty exits (SIGKILL,
-# panic) skip the trap — the Stop hook + startup reaper cover those.
-trap 'rm -f "$PID_FILE"' EXIT
+# PID-file cleanup is folded into the unified `cleanup` function below so a
+# single trap covers both responsibilities (rm + kill children). An earlier
+# version set `trap 'rm -f "$PID_FILE"' EXIT` here AND `trap cleanup EXIT...`
+# later — the second trap shadowed the first, so the PID file was never
+# removed on clean exit. Stale PID files don't break the `kill -0` gate (it
+# correctly identifies dead PIDs), but they accumulated forever, and the
+# Stop-hook path that relies on this file being current got confused by
+# leftover entries from prior sessions. Dirty exits (SIGKILL, panic) still
+# skip the trap — the Stop hook + startup reaper cover those.
 
 # tmux socket for the wakeup signal. Sutando.app creates the CLI session via
 # this socket. If the socket doesn't exist (different setup), wakeup is a
@@ -101,10 +105,14 @@ for f in "$TASKS_DIR"/*.txt; do
 done
 shopt -u nullglob
 
-# Clean up fswatch on exit (Mode B fix — #1088). Without this, when the
-# parent shell exits the watcher reparents to launchd (PPID=1) and runs
-# indefinitely with no consumer, silently dropping every event.
-cleanup() { kill 0 2>/dev/null; }
+# Clean up on exit:
+# - rm PID file (so the next session's PID-gate check sees "absent" rather
+#   than a stale entry that needs `kill -0` to disqualify).
+# - kill 0 → kill all processes in this process group, including the
+#   fswatch subprocess (Mode B fix — #1088). Without this, when the parent
+#   shell exits the watcher reparents to launchd (PPID=1) and runs
+#   indefinitely with no consumer, silently dropping every event.
+cleanup() { rm -f "$PID_FILE"; kill 0 2>/dev/null; }
 trap cleanup EXIT HUP INT TERM
 
 # Stream subsequent events. -l 0.5 = 500ms latency batch (fswatch coalesces
