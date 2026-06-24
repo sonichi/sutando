@@ -11,7 +11,7 @@ Usage:
 Kinds: claim | blocked | done | ping | opinion
 Peers (for --to): a name from ~/.claude/channels/discord/peers.json, or a raw numeric id
 
-The target channel ID is read from `~/.claude/channels/discord/access.json`:
+The target channel ID is read from `$CLAUDE_CONFIG_DIR/channels/discord/access.json`:
 entries tagged with `{"role": "bot2bot", ...}` in `groups` are candidates. We
 pick the first such channel. If none is tagged, we fall back to the first
 group whose value is just `true` (legacy convention), or error out.
@@ -25,7 +25,7 @@ ID is read from the bot2bot CHANNEL's `allowFrom`, excluding this bot
 allowlisted there. The resulting `<@id>` mention is prepended so the receiving
 bot's bridge will process it as a task (discord-bridge.py line 244 exception).
 
-Requires DISCORD_BOT_TOKEN in ~/.claude/channels/discord/.env.
+Requires DISCORD_BOT_TOKEN in $CLAUDE_CONFIG_DIR/channels/discord/.env.
 """
 import json
 import os

@@ -8,13 +8,13 @@
  *
  * NEW namespace — `results/<channel-key>.task-{id}.txt` — is used ONLY
  * when a task result needs to reach a non-delegating pull consumer (today:
- * discord-voice and phone). A `.`-prefixed filename slides past the
- * existing consumers' patterns because none of their startsWith / glob /
- * pending-id lookups match the channel-key prefix.
+ * phone, plus any pull-side plugin surface). A `.`-prefixed filename slides
+ * past the existing consumers' patterns because none of their startsWith /
+ * glob / pending-id lookups match the channel-key prefix.
  *
  * Channel keys we emit:
- *   - discord-voice → Discord voice channel id (CHANNEL_ID arg / env)
- *   - phone         → Twilio call SID (per-call unique)
+ *   - phone → Twilio call SID (per-call unique)
+ *   (pull-side plugin surfaces build their own prefixed key on their side.)
  *
  * Twin of src/result_channel_key.py — keep in sync if a Python writer is
  * added.
@@ -83,14 +83,9 @@ export function resultBelongsTo(filename: string, channelKey: string): boolean {
 // ── Typed channel-key constructors ────────────────────────────────────────
 // Per-consumer prefixes make key-namespace collisions impossible across
 // future consumer types: a hypothetical new pull surface whose ID format
-// happens to be pure digits (like a Discord VC snowflake) cannot accidentally
-// claim a `dvoice-*` filename. Writer and consumer MUST go through the same
-// constructor so the keys agree. Keep symmetric with `src/result_channel_key.py`.
-
-/** Channel key for the discord-voice consumer. Wraps a Discord voice-channel id. */
-export function discordVoiceKey(vcId: string | null | undefined): string {
-	return `dvoice-${sanitizeKey(vcId)}`;
-}
+// happens to be pure digits (like a chat snowflake) cannot accidentally claim
+// another consumer's prefixed filename. Writer and consumer MUST go through the
+// same constructor so the keys agree. Keep symmetric with `src/result_channel_key.py`.
 
 /** Channel key for the phone-conversation consumer. Wraps a Twilio call SID. */
 export function phoneCallKey(callSid: string | null | undefined): string {

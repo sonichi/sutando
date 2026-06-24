@@ -47,12 +47,36 @@ mkdir -p "$OUT"
 # #769 review obs 4. Dual-path was added so pre-#762 installs don't
 # silently lose cold-review-log access; safe to remove after every node
 # has resolved its workspace at least once.
-WS="${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}"
-if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
-	NOTES_DIR="$SUTANDO_WORKSPACE/notes"
+# Workspace resolution via the canonical M0 helper.
+WS="$(bash "$REPO/scripts/sutando-config.sh" workspace)"
+# NOTES_DIR remains a dual-path: prefer workspace/notes, fall back to repo/notes
+# for pre-#762 installs (per Lucy's #769 obs 4, drop-after 2026-08-15).
+if [ -d "$WS/notes" ]; then
+	NOTES_DIR="$WS/notes"
 else
 	NOTES_DIR="$REPO/notes"
 fi
+
+# Per-host label for hosts/<host>/ paths. Lockstep with `_host()`
+# (scripts/sync-workspace.sh) and `_host_label()` (src/util_paths.py):
+# $SUTANDO_HOST_LABEL > scutil LocalHostName (stable) > short hostname (which
+# can DHCP-drift, e.g. Comcast → Chis-MBP, splitting per-host paths; #1745).
+_sd_host() {
+	local env="${SUTANDO_HOST_LABEL:-${SUTANDO_HOST_OVERRIDE:-}}"
+	if [ -n "$env" ]; then
+		printf '%s\n' "$env"
+		return
+	fi
+	local lhn=""
+	if command -v scutil >/dev/null 2>&1; then
+		lhn="$(scutil --get LocalHostName 2>/dev/null)"
+	fi
+	if [ -n "$lhn" ]; then
+		printf '%s\n' "$lhn"
+	else
+		hostname | sed 's/\..*//'
+	fi
+}
 
 # Convert window to seconds for log filtering
 case "$WINDOW" in
@@ -100,7 +124,13 @@ fi
 # 3) Build log tail + pending questions + cold-review log (small files, copy whole)
 _bl="${WS}/build_log.md"; [ -f "$_bl" ] || _bl="${REPO}/build_log.md"
 tail -150 "$_bl" > "$OUT/build_log-tail.md" 2>/dev/null || true
-_pq="${WS}/pending-questions.md"; [ -f "$_pq" ] || _pq="${REPO}/pending-questions.md"
+# pending-questions.md is per-host (hosts/<host>/, #1717 F1 convention); probe
+# there FIRST, then the flat workspace root and repo root (back-compat for
+# pre-revamp / un-migrated layouts). Mirrors personal_path()'s read-side probe
+# order (#1718) so self-diagnose reads the same file the writers target.
+_pq="${WS}/hosts/$(_sd_host)/pending-questions.md"
+[ -f "$_pq" ] || _pq="${WS}/pending-questions.md"
+[ -f "$_pq" ] || _pq="${REPO}/pending-questions.md"
 cp "$_pq" "$OUT/pending-questions.md" 2>/dev/null || true
 cp "$NOTES_DIR/cold-review-log.md" "$OUT/cold-review-log.md" 2>/dev/null || true
 
@@ -136,8 +166,9 @@ fi
 find "$REPO/results" -maxdepth 1 -type f -name "*.txt" -mmin "-$((SECONDS_AGO/60))" 2>/dev/null | head -20 > "$OUT/results-recent-paths.txt" || true
 
 # 8) Quota state
-if [ -f "$HOME/.claude/skills/quota-tracker/scripts/read-quota.py" ]; then
-	python3 "$HOME/.claude/skills/quota-tracker/scripts/read-quota.py" 2>&1 | head -10 > "$OUT/quota.txt" || true
+_QUOTA_SCRIPT="$(bash "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/read-quota.py)"
+if [ -f "$_QUOTA_SCRIPT" ]; then
+	python3 "$_QUOTA_SCRIPT" 2>&1 | head -10 > "$OUT/quota.txt" || true
 fi
 
 # Print size summary to stderr and path to stdout

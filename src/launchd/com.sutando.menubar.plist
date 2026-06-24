@@ -62,7 +62,9 @@
     <key>EnvironmentVariables</key>
     <dict>
         <!-- Pass workspace location so the app writes tasks/results/logs
-             under ~/.sutando/workspace/ rather than the repo root. -->
+             under the M0-resolved workspace (default <repo>/workspace/ post-PR #1395)
+             rather than the repo root. Installer substitutes __WORKSPACE__ from
+             scripts/sutando-config.sh — env var here is just propagation. -->
         <key>SUTANDO_WORKSPACE</key>
         <string>__WORKSPACE__</string>
         <key>SUTANDO_REPO_DIR</key>

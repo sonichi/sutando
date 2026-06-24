@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from observability import meter, obs  # noqa: E402
 
-ENV = ("SUTANDO_WORKSPACE", "SUTANDO_TENANT_ID", "SUTANDO_TENANT_MODE", "SUTANDO_METERING_FSYNC")
+ENV = ("SUTANDO_WORKSPACE", "SUTANDO_TEST_MODE", "SUTANDO_TENANT_ID", "SUTANDO_TENANT_MODE", "SUTANDO_METERING_FSYNC")
 
 
 class Capture:
@@ -45,6 +45,11 @@ class RecordTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.ws = Path(self._tmp.name)
         os.environ["SUTANDO_WORKSPACE"] = str(self.ws)
+        # v0.8 (#1440): $SUTANDO_WORKSPACE is no longer honored for resolution by
+        # end-user code; opt into the silent test escape hatch so record()/ledger_path()
+        # resolve to this temp dir instead of the repo's default workspace. Without it
+        # the ledger write leaks to <repo>/workspace and _read_ledger() finds 0 lines.
+        os.environ["SUTANDO_TEST_MODE"] = "1"
         obs.reset_sinks()
         self.cap = Capture()
         obs.register_sink(self.cap)

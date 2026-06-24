@@ -9,7 +9,7 @@
  * Resolution order (each layer overlays the previous, field by field):
  *   1. in-code OBSERVABILITY_DEFAULTS — the floor
  *   2. environment knobs — SUTANDO_TENANT_ID / SUTANDO_TENANT_MODE /
- *      SUTANDO_METERING_ENABLED / SUTANDO_METERING_ENDPOINT
+ *      SUTANDO_METERING_ENABLED / SUTANDO_METERING_ENDPOINT / SUTANDO_METERING_HEADERS
  *   3. workspace override — `<workspace>/config/observability.json` (machine-local; wins)
  *
  * Mirrors the `loadVoiceConfig` idiom (src/voice-config.ts): overlay over
@@ -38,6 +38,10 @@ export interface MeteringSection {
 	enabled: boolean;
 	endpoint: string | null;
 	batchMax: number;
+	/** Extra HTTP headers sent on every usage-forward POST — e.g. an auth token
+	 *  (`{ "Authorization": "Bearer …" }`) or a shared secret for the receiver.
+	 *  Static; for a rotating token, inject a headersProvider on the forwarder. */
+	headers?: Record<string, string>;
 }
 
 export interface TenantSection {
@@ -79,6 +83,7 @@ function overlay(base: ObservabilityConfig, raw: Record<string, unknown>): Obser
 			enabled: meter.enabled ?? base.metering.enabled,
 			endpoint: meter.endpoint ?? base.metering.endpoint,
 			batchMax: meter.batchMax ?? base.metering.batchMax,
+			headers: meter.headers ?? base.metering.headers,
 		},
 		tenant: {
 			id: tenant.id ?? base.tenant.id,
@@ -110,6 +115,15 @@ export function loadObservabilityConfig(opts?: { workspace?: string }): Observab
 	if (metEnabled !== undefined && metEnabled !== '') cfg.metering.enabled = isTrueish(metEnabled);
 	const metEndpoint = process.env.SUTANDO_METERING_ENDPOINT?.trim();
 	if (metEndpoint) cfg.metering.endpoint = metEndpoint;
+	const metHeaders = process.env.SUTANDO_METERING_HEADERS?.trim();
+	if (metHeaders) {
+		try {
+			const parsed = JSON.parse(metHeaders) as Record<string, string>;
+			if (parsed && typeof parsed === 'object') cfg.metering.headers = parsed;
+		} catch {
+			console.warn('[observability-config] SUTANDO_METERING_HEADERS is not valid JSON, ignoring');
+		}
+	}
 
 	// 3. workspace override (machine-local; wins, per the documented order)
 	const ws = opts?.workspace ?? resolveWorkspace();

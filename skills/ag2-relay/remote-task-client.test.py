@@ -4,8 +4,9 @@
 CI-safe: spins up a localhost HTTP stub, no external network/deps. Exits 0 on
 pass, 1 on fail.
 
-Covers: task pull → local file write (correct schema + atomic), result file →
-POST back (correct payload + auth header), idempotent re-write, auth rejection.
+Covers: task pull → local file write (correct schema + atomic), task ack,
+heartbeat, result file → POST back (correct payload + auth header),
+idempotent re-write, auth rejection.
 
 Run: python3 skills/ag2-relay/remote-task-client.test.py
 """
@@ -30,7 +31,9 @@ def check(cond: bool, msg: str) -> None:
 
 
 # ── mock relay ────────────────────────────────────────────────────────────
-STATE = {"tasks_served": 0, "results": [], "auth_seen": [], "force_401": False}
+STATE = {"tasks_served": 0, "results": [], "acks": [], "heartbeats": [],
+         "auth_seen": [], "force_401": False, "force_ack_404": False,
+         "force_heartbeat_404": False}
 TASK = {"id": "task-MOCK1", "timestamp": "2026-05-23T00:00:00Z",
         "task": "hello from relay", "source": "remote-relay",
         "channel_id": "!room:example.org", "user_id": "@qingyun:example.org",
@@ -67,6 +70,21 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/results":
             n = int(self.headers.get("Content-Length") or 0)
             STATE["results"].append(json.loads(self.rfile.read(n).decode()))
+            self.send_response(200); self.end_headers()
+        elif self.path.startswith("/v1/tasks/") and self.path.endswith("/ack"):
+            if STATE["force_ack_404"]:
+                self.send_response(404); self.end_headers(); return
+            n = int(self.headers.get("Content-Length") or 0)
+            STATE["acks"].append({
+                "path": self.path,
+                "body": json.loads(self.rfile.read(n).decode()),
+            })
+            self.send_response(200); self.end_headers()
+        elif self.path == "/v1/heartbeat":
+            if STATE["force_heartbeat_404"]:
+                self.send_response(404); self.end_headers(); return
+            n = int(self.headers.get("Content-Length") or 0)
+            STATE["heartbeats"].append(json.loads(self.rfile.read(n).decode()))
             self.send_response(200); self.end_headers()
         else:
             self.send_response(404); self.end_headers()
@@ -110,6 +128,38 @@ def main() -> int:
     check("source: remote-relay" in content, "source field carried")
     check("access_tier: team" in content and "access_tier: owner" not in content,
           "access_tier CLAMPED to local default (wire said owner — never trusted)")
+    check(rtc._post_task_ack(tid), "task ack POSTed after local queue write")
+    check(len(STATE["acks"]) == 1
+          and STATE["acks"][0]["path"] == "/v1/tasks/task-MOCK1/ack"
+          and STATE["acks"][0]["body"].get("id") == "task-MOCK1",
+          "task ack payload correct")
+    check(rtc._post_heartbeat({"task-MOCK1", "task-MOCK2"}, force=True),
+          "heartbeat POSTed")
+    if STATE["heartbeats"]:
+        h = STATE["heartbeats"][0]
+        check(h.get("client") == "sutando-relay-client"
+              and h.get("protocol_version") == 1
+              and h.get("provider") == "remote-relay"
+              and h.get("tier") == "team"
+              and h.get("inflight") == 2
+              and "task-ack" in h.get("capabilities", []),
+              "heartbeat payload correct")
+        check("result-skip-markers" in h.get("capabilities", [])
+              and "result-markers" not in h.get("capabilities", []),
+              "heartbeat advertises only local skip-marker handling")
+
+    # Backwards compatibility: old relays that only implement pull/results can
+    # 404 optional protocol extensions; the client disables them and continues.
+    STATE["force_ack_404"] = True
+    rtc._ack_disabled = False
+    check(not rtc._post_task_ack("task-OLD") and rtc._ack_disabled,
+          "task ack 404 disables ack support")
+    STATE["force_ack_404"] = False
+    STATE["force_heartbeat_404"] = True
+    rtc._heartbeat_disabled = False
+    check(not rtc._post_heartbeat(set(), force=True) and rtc._heartbeat_disabled,
+          "heartbeat 404 disables heartbeat support")
+    STATE["force_heartbeat_404"] = False
 
     # SECURITY (review 2026-06-13)
     # Blocker 1 — unsafe task ids are rejected (path traversal write side)

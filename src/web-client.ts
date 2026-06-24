@@ -3105,12 +3105,12 @@ let _seeingUntil = 0;
 const CORE_STATUS_STALE_SECONDS = 60;
 function readCoreStatus(): { running: boolean; step: string; stale: boolean } {
 	try {
-		// core-status.json is per-user runtime state under $SUTANDO_WORKSPACE/state/
-		// (default ~/.sutando/workspace/state/). Pre-fix this read from REPO_ROOT
-		// via import.meta.url-relative `../core-status.json` — but Python writers
-		// migrated to WORKSPACE_DIR in #836, so the TS reader silently saw stale
-		// or missing data. statusReadPath falls back to the legacy workspace-root
-		// location for one release.
+		// core-status.json is per-user runtime state under <workspace>/state/
+		// (workspace resolves via the M0 helper; default <repo>/workspace/ post-v0.8).
+		// Pre-fix this read from REPO_ROOT via import.meta.url-relative
+		// `../core-status.json` — but Python writers migrated to WORKSPACE_DIR in
+		// #836, so the TS reader silently saw stale or missing data. statusReadPath
+		// falls back to the legacy workspace-root location for one release.
 		const statusPath = statusReadPath('core-status.json', WORKSPACE_DIR);
 		const raw = readFileSync(statusPath, 'utf-8');
 		const s = JSON.parse(raw) as { status?: string; ts?: number; step?: string };

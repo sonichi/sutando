@@ -13,7 +13,7 @@ bash skills/install.sh
 
 Or manually:
 ```bash
-ln -s /path/to/sutando/skills/image-generation ~/.claude/skills/image-generation
+ln -s /path/to/sutando/skills/image-generation "$CLAUDE_CONFIG_DIR/skills/image-generation"
 ```
 
 ## What's included

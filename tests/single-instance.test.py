@@ -24,6 +24,7 @@ sys.path.insert(0, str(ROOT / "src"))
 def _load_single_instance(workspace_dir: Path):
     """Load single_instance with SUTANDO_WORKSPACE pointing at a temp dir."""
     os.environ["SUTANDO_WORKSPACE"] = str(workspace_dir)
+    os.environ["SUTANDO_TEST_MODE"] = "1"  # v0.8: opt-in env-honor
     # Reload to pick up new env — module caches resolve_workspace() at call time.
     spec = importlib.util.spec_from_file_location(
         "single_instance", ROOT / "src" / "single_instance.py"
@@ -38,9 +39,11 @@ class TestSingleInstance(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.workspace = Path(self.tmp.name)
         os.environ["SUTANDO_WORKSPACE"] = str(self.workspace)
+        os.environ["SUTANDO_TEST_MODE"] = "1"  # v0.8: opt-in env-honor
 
     def tearDown(self):
         os.environ.pop("SUTANDO_WORKSPACE", None)
+        os.environ.pop("SUTANDO_TEST_MODE", None)
         self.tmp.cleanup()
 
     # (a) First acquire writes PID to lock file and returns normally.
@@ -62,7 +65,7 @@ class TestSingleInstance(unittest.TestCase):
             [
                 sys.executable, "-c",
                 f"import sys; sys.path.insert(0, '{ROOT}/src');"
-                f"import os; os.environ['SUTANDO_WORKSPACE']='{self.workspace}';"
+                f"import os; os.environ['SUTANDO_WORKSPACE']='{self.workspace}'; os.environ['SUTANDO_TEST_MODE']='1';"
                 f"from single_instance import acquire; acquire('test-second')",
             ],
             capture_output=True,
@@ -78,7 +81,7 @@ class TestSingleInstance(unittest.TestCase):
             [
                 sys.executable, "-c",
                 f"import sys, time; sys.path.insert(0, '{ROOT}/src');"
-                f"import os; os.environ['SUTANDO_WORKSPACE']='{self.workspace}';"
+                f"import os; os.environ['SUTANDO_WORKSPACE']='{self.workspace}'; os.environ['SUTANDO_TEST_MODE']='1';"
                 f"from single_instance import acquire; acquire('test-release');"
                 f"time.sleep(30)",  # hold forever — we'll kill it
             ],

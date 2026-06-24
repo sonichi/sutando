@@ -32,12 +32,33 @@
 #
 # Run: bash scripts/sync-memory.sh
 
+# --- PR-2 deprecation banner ---
+# As of PR-2 (issue #1445 followup, 2026-06-04), the canonical sync path is
+# `scripts/sync-workspace.sh` (workspace IS the git repo + branch-per-host
+# topology + 4-tier safety). This script's rsync-to-~/.sutando/memory-sync/
+# architecture remains supported during the transition window but will be
+# removed in PR-2.1 after observed dogfooding.
+#
+# Migration recipe:
+#   1. bash scripts/sync-workspace.sh --init   # convert workspace into a git repo
+#   2. Update your cron/launchd to call sync-workspace.sh instead of sync-memory.sh
+#   3. Move vault URL from .env (SUTANDO_MEMORY_REPO) to sutando.config.local.json
+#      under `vault.remote_url`
+#
+# Suppress this banner by setting SUTANDO_SYNC_MEMORY_SUPPRESS_DEPRECATION=1.
+if [ "${SUTANDO_SYNC_MEMORY_SUPPRESS_DEPRECATION:-0}" != "1" ]; then
+    echo "sync-memory: DEPRECATED — will be REMOVED in v0.4.0. Switch to scripts/sync-workspace.sh now (see header for migration recipe; set SUTANDO_SYNC_MEMORY_SUPPRESS_DEPRECATION=1 to silence)." >&2
+fi
+
 # If SUTANDO_MEMORY_SYNC_DIR is not set, try to auto-detect: if the script
 # lives inside an existing memory-sync clone, use that. Otherwise default
 # to ~/.sutando/memory-sync/. The auto-detect handles both the new convention
 # (~/.sutando/memory-sync/) and the legacy convention (~/.sutando-memory-sync/)
 # so a sync clone with this script copied in keeps working through the move.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+_self="${BASH_SOURCE[0]:-$0}"
+if command -v realpath >/dev/null 2>&1; then _self="$(realpath "$_self")"; fi
+SCRIPT_DIR="$(cd "$(dirname "$_self")" && pwd)"
+unset _self
 SCRIPT_PARENT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Load .env from the sutando workspace early — non-interactive shells (cron,
@@ -145,7 +166,7 @@ fi
 # back via `find … | head -1` to whichever sibling memory dir landed first
 # (alphabetical). Bug silently skipped real memory writes for 5+ weeks
 # before being caught. See docs/workspace-contract.md.
-MEMORY_DIR="$HOME/.claude/projects/$(echo "$SCRIPT_PARENT" | sed 's|/|-|g')/memory"
+MEMORY_DIR="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" claude-home-path "projects/$(echo "$SCRIPT_PARENT" | sed 's|/|-|g')/memory")"
 NOTES_DIR="$REPO_DIR/notes"
 LOG="/tmp/sync-memory.log"
 LOCK_DIR="/tmp/sync-memory.lock.d"
@@ -179,7 +200,7 @@ fi
 
 # Auto-detect memory dir (may vary by machine)
 if [ ! -d "$MEMORY_DIR" ]; then
-    MEMORY_DIR=$(find "$HOME/.claude/projects" -name "memory" -type d 2>/dev/null | head -1)
+    MEMORY_DIR=$(find "$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" claude-home-path projects)" -name "memory" -type d 2>/dev/null | head -1)
 fi
 
 if [ ! -d "$SYNC_DIR" ]; then
@@ -204,13 +225,46 @@ fi
 #
 # The same convention is documented in this script's pre-2026-05-11 history
 # ("notes/ bidirectional rsync removed: both nodes now symlink").
-WS_DIR="${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}"
-# Disambiguation guard: if a host has SUTANDO_WORKSPACE pointing at a public-repo
-# checkout (legacy semantic), the symlink-bootstrap below would point at
-# `<repo>/notes` not the workspace `notes/`. Detect via `.git` presence + skip.
+# Workspace resolution goes through the canonical loader (M0 cutover).
+#
+# Helper lookup uses SCRIPT_PARENT (this script's own repo root), NOT
+# $REPO_DIR. They're equal on healthy single-checkout hosts but differ when
+# $SUTANDO_REPO_DIR is set to point at another checkout — most commonly
+# a sutando-plus submodule pin that lags main and is missing the helper
+# entirely. In that case, conditioning the lookup on REPO_DIR false-negatives
+# (helper "not found" at the pin path even though it exists right beside
+# this script) and silently falls through to the L213 legacy default
+# (~/.sutando/workspace/), which is wrong on M0 hosts. Caught 2026-06-03
+# on MBP where SUTANDO_REPO_DIR pointed at the pre-M0 submodule pin and
+# sync-memory was reading the legacy workspace instead of the in-repo one.
+# Anchoring the lookup to SCRIPT_PARENT means it works regardless of
+# REPO_DIR drift — the helper and this script ship in the same commit.
+#
+# Fallback retains the legacy inline default for the rare case where the
+# wrapper isn't present (e.g. extracted-archive install where SCRIPT_PARENT
+# itself lost the helper).
+if [ -f "$SCRIPT_PARENT/scripts/sutando-config.sh" ]; then
+    WS_DIR="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" workspace)"
+else
+    WS_DIR="${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}"
+fi
+# Disambiguation guard: if WS_DIR points at a public-repo checkout (a
+# legacy-shaped SUTANDO_WORKSPACE value, or — on truly broken installs —
+# a SCRIPT_PARENT that's a public repo not a workspace), the symlink
+# bootstrap below would write a symlink at `<repo>/notes` not the
+# workspace `notes/`. Detect via `.git` presence at WS_DIR + skip.
 if [ -d "$WS_DIR/.git" ]; then
-    log "skipping workspace-symlink bootstrap: SUTANDO_WORKSPACE='$WS_DIR' looks like a public-repo checkout, not a workspace. Set SUTANDO_WORKSPACE=$HOME/.sutando/workspace per CLAUDE.md and re-run."
-    WS_DIR=""
+    # A vault-synced workspace (sync-workspace.sh --init) is ALSO a git repo —
+    # discriminate via the wsId marker before declaring it a repo checkout,
+    # otherwise the notes bootstrap is skipped on exactly the hosts that
+    # adopted the new sync (review #2 finding, 2026-06-11). The marker is
+    # written by _init_impl (#1459) and exists only in real workspaces.
+    if [ -f "$WS_DIR/.sutando-vault/ws-id" ]; then
+        log "workspace at '$WS_DIR' is vault-synced (ws-id marker present); proceeding with bootstrap"
+    else
+        log "skipping workspace-symlink bootstrap: '$WS_DIR' looks like a public-repo checkout (.git/ present, no ws-id marker), not a workspace. Run 'bash $SCRIPT_PARENT/scripts/sutando-config.sh workspace' to see the canonical workspace path; unset SUTANDO_WORKSPACE to use the in-repo default."
+        WS_DIR=""
+    fi
 fi
 if [ -n "$WS_DIR" ]; then
 mkdir -p "$WS_DIR"
@@ -361,10 +415,37 @@ for f in "${MACHINE_FILES[@]}"; do
     copy_if_newer "$src" "$MACHINE_DIR/$(basename "$f")"
 done
 
+# Claude Code per-host settings.json (enabled plugins, permission mode, hooks,
+# theme). Per-host + painful to recreate on a rebuild, and carries NO secrets
+# (tokens live in channels/<ch>/.env / Keychain, never here). Sibling to the
+# channel access.json backup — closes the second "unbacked per-host config"
+# gap so a rebuilt host restores its plugin/hook/permission config. Sourced
+# from the Claude Code config dir (CLAUDE_CONFIG_DIR canonical; CLAUDE_HOME
+# legacy; ~/.claude fallback) to work on both new and pre-migration hosts.
+SETTINGS_SRC="${CLAUDE_CONFIG_DIR:-${CLAUDE_HOME:-$HOME/.claude}}/settings.json"
+if [ -f "$SETTINGS_SRC" ]; then
+    copy_if_newer "$SETTINGS_SRC" "$MACHINE_DIR/settings.json"
+fi
+
 # Personal cron schedule (nested path)
 if [ -f "$REPO_DIR/skills/schedule-crons/crons.json" ]; then
     copy_if_newer "$REPO_DIR/skills/schedule-crons/crons.json" \
         "$MACHINE_DIR/crons.json"
+fi
+
+# Channel access-control allowlists (per-host, painful to recreate: the Discord
+# access.json holds the owner/team/other tierMap + allowFrom). Backed up so a
+# rebuilt host can restore its channel onboarding. SECURITY: we glob ONLY
+# `*/access.json` — never `.env`. The bot tokens in channels/<ch>/.env stay
+# local (Keychain/vault) and must NOT reach the repo. Keep this glob exact.
+CHANNELS_SRC="${CLAUDE_HOME:-$HOME/.claude}/channels"
+if [ -d "$CHANNELS_SRC" ]; then
+    for _acc in "$CHANNELS_SRC"/*/access.json; do
+        [ -f "$_acc" ] || continue
+        _ch="$(basename "$(dirname "$_acc")")"
+        mkdir -p "$MACHINE_DIR/channels/$_ch"
+        copy_if_newer "$_acc" "$MACHINE_DIR/channels/$_ch/access.json"
+    done
 fi
 
 # Personal skill dirs (gitignored `skills/personal-*/`) — one rsync PER skill

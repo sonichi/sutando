@@ -9,7 +9,7 @@ import type { ObsEvent } from '../../src/observability/events.js';
 import type { Sink } from '../../src/observability/sink.js';
 import type { UsageRecordInput } from '../../src/observability/usage.js';
 
-const ENV = ['SUTANDO_WORKSPACE', 'SUTANDO_TENANT_ID', 'SUTANDO_TENANT_MODE', 'SUTANDO_METERING_FSYNC'];
+const ENV = ['SUTANDO_WORKSPACE', 'SUTANDO_TEST_MODE', 'SUTANDO_TENANT_ID', 'SUTANDO_TENANT_MODE', 'SUTANDO_METERING_FSYNC'];
 let saved: Record<string, string | undefined>;
 let ws: string;
 let cap: { type: string; events: ObsEvent[]; write(ev: ObsEvent): void };
@@ -35,6 +35,11 @@ beforeEach(() => {
 	}
 	ws = mkdtempSync(join(tmpdir(), 'meter-'));
 	process.env.SUTANDO_WORKSPACE = ws;
+	// v0.8 (#1440): $SUTANDO_WORKSPACE is no longer honored for resolution by
+	// end-user code; tests opt into the silent escape hatch so record()/ledgerPath()
+	// resolve to this temp dir instead of the repo's default workspace. Without it
+	// the ledger write leaks to <repo>/workspace and readLedger() finds 0 lines.
+	process.env.SUTANDO_TEST_MODE = '1';
 	resetSinks();
 	cap = { type: 'capture', events: [], write(ev) { this.events.push(ev); } };
 	registerSink(cap as Sink);

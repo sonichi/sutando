@@ -12,13 +12,19 @@ exposes a tiny HTTP protocol; this client pulls *your* tasks down into the local
 Protocol (versioned, Bearer-auth):
   GET  {REMOTE_TASK_URL}/v1/tasks?wait=<sec>
        → 200 {"tasks": [ {<task fields...>}, ... ]}   (long-poll; [] on timeout)
+  POST {REMOTE_TASK_URL}/v1/tasks/<task-id>/ack
+       → body {"id": "<task-id>"}  → 200 on accepted
   POST {REMOTE_TASK_URL}/v1/results
        → body {"id": "<task-id>", "body": "<result text>"}  → 200 on accepted
+  POST {REMOTE_TASK_URL}/v1/heartbeat
+       → body {"client": "...", "inflight": N, ...}  → 200 on accepted
 
 Each task object uses the same schema Sutando's other bridges write, so this
 client just serializes it to `tasks/task-<id>.txt` and the core handles it like
 any Discord/Telegram/Slack task. When `results/task-<id>.txt` appears, its body
-is POSTed back and the result file is archived.
+is POSTed back and the result file is archived. Ack/heartbeat are best-effort:
+if an older relay returns 404/405, the client keeps working against the
+original pull/result protocol.
 
 Config (env / .env):
   AG2_REMOTE_TOKEN      the onboarding string — the ONLY required setting
@@ -39,6 +45,7 @@ import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -71,6 +78,10 @@ URL = (os.environ.get("AG2_REMOTE_URL") or os.environ.get("REMOTE_TASK_URL")
        or _URL_FROM_TOKEN).rstrip("/")
 PROVIDER = os.environ.get("REMOTE_TASK_PROVIDER") or "remote"
 POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
+HEARTBEAT_INTERVAL = 60
+_ack_disabled = False
+_heartbeat_disabled = False
+_last_heartbeat_at = 0.0
 
 _TASK_FIELDS = ("id", "timestamp", "task", "source", "channel_id",
                 "source_message_id", "user_id", "priority")
@@ -122,6 +133,62 @@ def _req(method: str, path: str, payload: dict | None = None, timeout: int = 35)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         raw = resp.read().decode().strip()
         return json.loads(raw) if raw else {}
+
+
+def _post_task_ack(tid: str) -> bool:
+    """Tell the relay a task made it safely into the local queue."""
+    global _ack_disabled
+    if _ack_disabled or not _valid_tid(tid):
+        return False
+    try:
+        safe_tid = urllib.parse.quote(tid, safe="")
+        _req("POST", f"/v1/tasks/{safe_tid}/ack", {"id": tid}, timeout=10)
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code in (404, 405):
+            _ack_disabled = True
+            _log("relay does not support task ack — continuing without")
+            return False
+        if e.code in (401, 403):
+            raise
+        _log(f"task ack failed for {tid}: HTTP {e.code} — relay may redeliver")
+        return False
+    except (urllib.error.URLError, TimeoutError) as e:
+        _log(f"task ack network error for {tid}: {e} — relay may redeliver")
+        return False
+
+
+def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
+    """Best-effort liveness ping for hosted relay dashboards."""
+    global _heartbeat_disabled, _last_heartbeat_at
+    if _heartbeat_disabled:
+        return False
+    now = time.time()
+    if not force and now - _last_heartbeat_at < HEARTBEAT_INTERVAL:
+        return False
+    _last_heartbeat_at = now
+    try:
+        _req("POST", "/v1/heartbeat", {
+            "client": "sutando-relay-client",
+            "protocol_version": 1,
+            "provider": PROVIDER,
+            "tier": LOCAL_TIER,
+            "inflight": len(inflight),
+            "capabilities": ["task-ack", "heartbeat", "result-skip-markers"],
+        }, timeout=10)
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code in (404, 405):
+            _heartbeat_disabled = True
+            _log("relay does not support heartbeat — continuing without")
+            return False
+        if e.code in (401, 403):
+            raise
+        _log(f"heartbeat failed: HTTP {e.code} — continuing")
+        return False
+    except (urllib.error.URLError, TimeoutError) as e:
+        _log(f"heartbeat network error: {e} — continuing")
+        return False
 
 
 def _write_task(task: dict) -> str | None:
@@ -233,16 +300,25 @@ def main() -> None:
     backoff = 1
     while True:
         try:
+            _post_heartbeat(inflight)
             resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}", timeout=POLL_WAIT + 10)
             added = False
+            pending_ack = []
             for task in resp.get("tasks", []):
                 tid = _write_task(task)
-                if tid and tid not in inflight:
-                    inflight.add(tid)
-                    added = True
+                if tid:
+                    if tid not in inflight:
+                        inflight.add(tid)
+                        added = True
+                    pending_ack.append(tid)
             if added:
                 _save_inflight(inflight)
+            # Ack only after both the task file and local in-flight state are
+            # durable, so a crash after ack does not strand the eventual result.
+            for tid in pending_ack:
+                _post_task_ack(tid)
             _post_ready_results(inflight)
+            _post_heartbeat(inflight)
             backoff = 1  # healthy round-trip → reset backoff
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):

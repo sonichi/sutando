@@ -10,8 +10,11 @@
 
 set -euo pipefail
 
-# Resolve the credential-proxy script path (tilde-expanded at run time).
-PROXY_SCRIPT="$HOME/.claude/skills/quota-tracker/scripts/credential-proxy.ts"
+# Resolve the credential-proxy script path. Honors $CLAUDE_CONFIG_DIR if the
+# launchd plist exports it (claude-sutando installs); otherwise falls back to
+# ~/.claude. launchd itself doesn't inherit shell env, so this fallback is the
+# vanilla-claude default unless the plist's EnvironmentVariables sets it.
+PROXY_SCRIPT="$(bash "$(cd "$(dirname "$0")/../.." && pwd)/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
 
 # Resolve npx — launchd doesn't inherit the user's shell PATH.
 resolve_npx() {

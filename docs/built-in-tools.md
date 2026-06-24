@@ -43,7 +43,7 @@ gws gmail users messages list --params 'q=keyword'  # search
 
 **Contacts** — look up people by name or email:
 ```bash
-python3 ~/.claude/skills/macos-tools/scripts/contacts.py search "Bob"   # find by name
+python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/contacts.py search "Bob"   # find by name
 ```
 Use before sending email to resolve "email Bob" → actual email address. Returns name, emails, phones.
 
@@ -78,10 +78,10 @@ Always confirm post content with user before publishing.
 
 **Reminders** — read/write macOS Reminders (to-do list):
 ```bash
-python3 ~/.claude/skills/macos-tools/scripts/reminders.py list             # incomplete reminders
-python3 ~/.claude/skills/macos-tools/scripts/reminders.py add "Call Bob"    # add reminder
-python3 ~/.claude/skills/macos-tools/scripts/reminders.py add "Fix bug" "2026-03-17"  # with due date
-python3 ~/.claude/skills/macos-tools/scripts/reminders.py complete "Call Bob"  # mark done
+python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/reminders.py list             # incomplete reminders
+python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/reminders.py add "Call Bob"    # add reminder
+python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/reminders.py add "Fix bug" "2026-03-17"  # with due date
+python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/reminders.py complete "Call Bob"  # mark done
 ```
 Use for "add a reminder", "what's on my todo list", "remind me to...", "mark X as done".
 
@@ -134,7 +134,7 @@ npx tsx -e "import 'dotenv/config'; import { summonTool } from './skills/zoom/to
 - Look up contacts and calendar for numbers/PINs before calling
 - The voice agent delegates "call X" and "join my meeting" requests to core via `work`
 
-**Local skills** — check `~/.claude/skills/` for user-installed skills (video processing, etc.). Always prefer a local skill over raw commands when one exists for the task.
+**Local skills** — check `$CLAUDE_CONFIG_DIR/skills/` for user-installed skills (video processing, etc.). Always prefer a local skill over raw commands when one exists for the task.
 
 **App launcher** — open any macOS app:
 ```bash
