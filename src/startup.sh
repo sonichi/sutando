@@ -773,24 +773,18 @@ else
   echo "  ~ telegram bridge (no token — optional)"
 fi
 
-# AG2 relay client (optional channel — same shape as the discord/telegram/slack
-# blocks below). Config + token live in the channel .env, resolved via the same
-# claude-home-path helper. The connector itself is delivered by onboarding (not
-# bundled in the repo) and installed alongside the agent's skills. Back-compat:
-# also honors a token already exported from the repo .env (legacy AG2_REMOTE_TOKEN).
+# Remote relay bridge (optional channel — generic, same shape as the discord/
+# telegram/slack blocks below). Config + token live in the channel .env, resolved
+# via the same claude-home-path helper; the bridge itself ships in src/ (provider-
+# neutral, like the others). Relay protocol: docs/remote-relay-protocol.md.
 # Deliberately silent when unconfigured — a Sutando-only user never sees it.
-if _AG2_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env)"; \
-   { [ -f "$_AG2_ENV" ] && grep -qE "^(REMOTE_TASK_TOKEN|AG2_REMOTE_TOKEN)=" "$_AG2_ENV" 2>/dev/null; } \
-   || [ -n "${REMOTE_TASK_TOKEN:-}${AG2_REMOTE_TOKEN:-}" ]; then
-  [ -f "$_AG2_ENV" ] && { set -a; . "$_AG2_ENV"; set +a; }
-  _AG2_CONN="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/ag2-relay/remote-task-client.py)"
-  if [ ! -f "$_AG2_CONN" ]; then
-    echo "  ~ ag2 relay (connector not installed — re-run onboarding)"
-  elif ! pgrep -f "remote-task-client" > /dev/null 2>&1; then
-    python3 "$_AG2_CONN" > "$LOGS_DIR/remote-task-client.log" 2>&1 &
-    echo "  ✓ ag2 relay client"
+if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env)"; [ -f "$_RELAY_ENV" ] && grep -q "REMOTE_TASK_TOKEN=" "$_RELAY_ENV" 2>/dev/null; then
+  set -a; . "$_RELAY_ENV"; set +a
+  if ! pgrep -f "remote-relay-bridge" > /dev/null 2>&1; then
+    python3 "$REPO/src/remote-relay-bridge.py" > "$LOGS_DIR/remote-relay-bridge.log" 2>&1 &
+    echo "  ✓ relay bridge"
   else
-    echo "  ✓ ag2 relay client (already running)"
+    echo "  ✓ relay bridge (already running)"
   fi
 fi
 
