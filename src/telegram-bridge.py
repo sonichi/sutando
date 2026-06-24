@@ -414,7 +414,7 @@ def send_reply(chat_id, text, task_id: str | None = None) -> dict:
     file_pattern = re.compile(r'\[(?:file|send|attach):\s*([^\]]+)\]')
     files = file_pattern.findall(text)
     clean_text = file_pattern.sub('', text).strip()
-    text_chunks = (len(clean_text) // 4000 + 1) if clean_text else 0
+    text_chunks = (len(clean_text) + 3999) // 4000 if clean_text else 0  # ceil; matches the 4000-char send loop
     delivered_ok = True
     files_sent = 0
 
