@@ -87,7 +87,11 @@ def send_discord(channel_id: str, message: str) -> bool:
     return _post(
         f"https://discord.com/api/v10/channels/{channel_id}/messages",
         {"content": message},
-        {"Authorization": f"Bot {token}"},
+        # Discord's API (behind Cloudflare) 403s the default `Python-urllib/x`
+        # User-Agent with Cloudflare error 1010. Discord requires the
+        # `DiscordBot ($url, $version)` UA format — send it or every POST fails.
+        {"Authorization": f"Bot {token}",
+         "User-Agent": "DiscordBot (https://github.com/sonichi/sutando, 1.0)"},
     )
 
 

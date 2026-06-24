@@ -195,8 +195,27 @@ die() {
 # (sutando-workspace.test.sh Test 23, Codex P1.3 reproducer). Not for
 # production use.
 _host() {
-    if [ -n "${SUTANDO_HOST_OVERRIDE:-}" ]; then
-        printf '%s\n' "$SUTANDO_HOST_OVERRIDE"
+    # Lockstep with `_host_label()` in src/util_paths.py. Precedence:
+    #   1. $SUTANDO_HOST_LABEL (or legacy $SUTANDO_HOST_OVERRIDE)
+    #   2. macOS `scutil --get LocalHostName` (stable Bonjour name)
+    #   3. short `hostname`
+    # scutil before hostname because a DHCP-assigned hostname can drift (e.g.
+    # Comcast → Chis-MBP) and split per-host paths/branches from the stable
+    # LocalHostName (Chis-MacBook-Pro). 2026-06-22 incident.
+    local env="${SUTANDO_HOST_LABEL:-${SUTANDO_HOST_OVERRIDE:-}}"
+    if [ -n "$env" ]; then
+        printf '%s\n' "$env"
+        return
+    fi
+    # Capture scutil ONCE and guard exit-0-but-empty output (parity with the
+    # py side's non-empty `.strip()` check) — an empty LocalHostName must not
+    # win over the hostname fallback.
+    local lhn=""
+    if command -v scutil >/dev/null 2>&1; then
+        lhn="$(scutil --get LocalHostName 2>/dev/null)"
+    fi
+    if [ -n "$lhn" ]; then
+        printf '%s\n' "$lhn"
     else
         hostname | sed 's/\..*//'
     fi
