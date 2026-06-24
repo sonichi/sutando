@@ -46,6 +46,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from task_priority import default_priority_for_source  # noqa: E402
+
+# Observability: emit channel.slack.<in|out> into the local obs spine
+# (src/observability). Guarded so a missing module never crashes the bridge.
+try:
+    from observability.channel import emit_channel as _emit_channel  # noqa: E402
+except Exception:  # pragma: no cover — best-effort telemetry
+    def _emit_channel(*_a, **_k):  # type: ignore
+        return None
 from result_markers import parse_markers  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path  # noqa: E402
@@ -556,6 +564,7 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         pending_replies[task_id] = {
             "channel": channel,
             "thread_ts": thread_ts,
+            "access_tier": access_tier,  # threaded to the outbound obs event
             "submitted_at": time.time(),
             "timed_out": False,
         }
@@ -565,6 +574,18 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         _event_count += 1
 
     print(f"  Wrote {task_id} from {prefix} @{username}", flush=True)
+    # Observability: one inbound accepted-message event.
+    _emit_channel(
+        "slack", "in",
+        user_id=str(user_id or ""),
+        channel_id=str(channel),
+        access_tier=access_tier,
+        data={
+            "task_id": task_id,
+            "is_dm": str(channel).startswith("D"),
+            "is_thread": bool(thread_ts),
+        },
+    )
     return task_id
 
 
@@ -648,7 +669,7 @@ def _send_file(channel: str, thread_ts: str | None, fpath: str) -> bool:
         return False
 
 
-def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | None = None) -> None:
+def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | None = None, access_tier: str = "unknown") -> None:
     """Post a reply via chat.postMessage with marker extraction.
 
     Honors the unified marker protocol from `src/result_markers.py` (#873):
@@ -679,6 +700,11 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
 
     file_paths = [a.value for a in parsed.actions if a.kind == "attach"]
 
+    # Track real delivery: the Slack helpers swallow API errors, so the
+    # outbound obs event must consult these rather than assume success.
+    delivered_ok = True
+    sent_files = 0
+
     # Post the text body in 4000-char chunks (Slack's per-message limit is
     # 40k chars but readability suffers above ~4k).
     if clean_text:
@@ -693,6 +719,8 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
                 print(f"[Slack] chat_postMessage failed: {e}", flush=True)
                 all_chunks_sent = False
                 break
+        if not all_chunks_sent:
+            delivered_ok = False
         if all_chunks_sent:
             # Slack channel id starts with D (DM), C (public/private channel),
             # G (legacy group). Best-effort classification for the audit log.
@@ -712,7 +740,10 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
     for fpath in file_paths:
         if _is_path_sendable(fpath):
             if _send_file(channel, thread_ts, fpath):
+                sent_files += 1
                 print(f"  Sent file: {fpath}", flush=True)
+            else:
+                delivered_ok = False
         elif os.path.isfile(fpath):
             # Path exists but isn't allowlisted — surface a visible deny.
             try:
@@ -733,6 +764,23 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
                 )
             except Exception:
                 pass
+
+    # Observability: one delivered-reply event. outcome reflects whether the
+    # text chunks + file uploads actually succeeded (the helpers swallow API
+    # errors); file_count counts files actually delivered, not just intended.
+    if clean_text or file_paths:
+        _emit_channel(
+            "slack", "out",
+            channel_id=str(channel),
+            access_tier=access_tier,
+            outcome="ok" if delivered_ok else "error",
+            data={
+                "task_id": task_id,
+                "is_dm": str(channel).startswith("D"),
+                "is_thread": bool(thread_ts),
+                "file_count": sent_files,
+            },
+        )
 
 
 def _check_task_timeouts() -> None:
@@ -819,7 +867,7 @@ def result_watcher():
                     print(f"  Skipped (marker): {task_id}", flush=True)
                 else:
                     try:
-                        _send_reply(target["channel"], target.get("thread_ts"), reply_text, task_id=task_id)
+                        _send_reply(target["channel"], target.get("thread_ts"), reply_text, task_id=task_id, access_tier=target.get("access_tier", "unknown"))
                         print(f"  Replied to {target['channel']}: {reply_text[:80]}...", flush=True)
                     except Exception as e:
                         print(f"[Slack] reply error: {e}", flush=True)
@@ -859,7 +907,7 @@ def result_watcher():
                         try:
                             resp = app.client.conversations_open(users=owner_id)
                             dm_channel = resp["channel"]["id"]
-                            _send_reply(dm_channel, None, text)
+                            _send_reply(dm_channel, None, text, access_tier="owner")  # proactive → owner
                             print(f"  [proactive] sent to {owner_id}: {text[:80]}", flush=True)
                         except Exception as e:
                             print(f"  [proactive] failed: {e}", flush=True)
