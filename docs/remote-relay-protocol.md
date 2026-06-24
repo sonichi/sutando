@@ -24,6 +24,10 @@ The bridge reads these from the environment (typically sourced from
 | `REMOTE_TASK_POLL_WAIT` | no | `25` | Long-poll seconds requested per `/v1/tasks` call. |
 | `REMOTE_TASK_TIER` | no | `team` | Local access tier stamped on every inbound task (see Security). |
 
+**Use the split form** (`REMOTE_TASK_URL` + `REMOTE_TASK_TOKEN`) — it's the recommended way to configure the bridge.
+
+> **Legacy / bootstrap shortcut:** the bridge also accepts a *combined* token of the form `REMOTE_TASK_TOKEN="https://relay.example.com|<secret>"` (URL and secret joined by `|`), which it splits at startup. This exists only so a one-shot onboarding string can carry both halves. If you use it, **quote it in `.env`** — an unquoted `|` is a shell pipe when the file is sourced. Prefer the split form for anything persistent.
+
 ## Transport
 
 - All requests carry `Authorization: Bearer <REMOTE_TASK_TOKEN>`.
