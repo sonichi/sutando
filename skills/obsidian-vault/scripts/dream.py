@@ -94,7 +94,7 @@ Conservative rule: prefer "none" over a wrong tier. Only emit an inline_ref when
 
 # Canonical workspace resolver (src/workspace_default.py). $SUTANDO_WORKSPACE is
 # no longer honored post-v0.8/#1440; resolving it stranded the vault under the
-# legacy ~/.sutando/workspace/. Resolve via the shared helper so dream.py and
+# legacy home-dir fallback. Resolve via the shared helper so dream.py and
 # tools.ts agree on <workspace>/obsidian-vault.
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 from workspace_default import resolve_workspace  # noqa: E402

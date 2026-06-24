@@ -27,7 +27,7 @@ const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 function vaultRoot(): string {
     // Canonical workspace (sutando.config.local.json; default <repo>/workspace).
     // $SUTANDO_WORKSPACE is no longer honored post-v0.8/#1440 — resolving it
-    // here is what stranded the vault under the legacy ~/.sutando/workspace/.
+    // here is what stranded the vault under the legacy home-dir fallback.
     return join(resolveWorkspace(), 'obsidian-vault');
 }
 
