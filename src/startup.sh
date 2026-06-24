@@ -766,9 +766,13 @@ else
   echo "  ~ telegram bridge (no token — optional)"
 fi
 
-# AG2 remote relay client (optional channel — full docs + onboarding in
-# skills/ag2-relay/). Silent unless AG2_REMOTE_TOKEN is set; to connect a new
-# instance run:  bash skills/ag2-relay/onboard.sh
+# AG2 remote relay client (optional channel — docs in skills/ag2-relay/).
+# Silent unless AG2_REMOTE_TOKEN is set. To connect a new instance, run the
+# onboarding bootstrap your relay operator provides (URL via $AG2_ONBOARD_URL):
+#   curl -fsSL "$AG2_ONBOARD_URL" | bash
+if [ -z "${AG2_REMOTE_TOKEN:-}" ] && [ -n "${AG2_ONBOARD_URL:-}" ]; then
+  echo "  ~ ag2 relay: not connected — to connect:  curl -fsSL \"\$AG2_ONBOARD_URL\" | bash"
+fi
 if [ -n "${AG2_REMOTE_TOKEN:-}" ] && [ -f skills/ag2-relay/remote-task-client.py ]; then
   if ! pgrep -f "remote-task-client" > /dev/null 2>&1; then
     python3 skills/ag2-relay/remote-task-client.py > "$LOGS_DIR/remote-task-client.log" 2>&1 &
