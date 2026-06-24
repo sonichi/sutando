@@ -75,6 +75,19 @@ INBOX_DIR.mkdir(parents=True, exist_ok=True)
 
 BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 APP_TOKEN = os.environ.get("SLACK_APP_TOKEN", "")
+# Fall back to the channel .env when the tokens aren't already in our env. The
+# Electron backend-supervisor gates the bridge on this file's presence but builds
+# the child env from process.env + workspace .env only — it relies on each bridge
+# self-loading its channel .env (discord/telegram already do). Without this, the
+# supervisor-spawned bridge crash-loops on "not set". Mirrors discord-bridge.py.
+if not BOT_TOKEN or not APP_TOKEN:
+    channels_env = claude_home_path("channels", "slack", ".env")
+    if channels_env.exists():
+        for line in channels_env.read_text().splitlines():
+            if line.startswith("SLACK_BOT_TOKEN=") and not BOT_TOKEN:
+                BOT_TOKEN = line.split("=", 1)[1].strip().strip('"').strip("'")
+            elif line.startswith("SLACK_APP_TOKEN=") and not APP_TOKEN:
+                APP_TOKEN = line.split("=", 1)[1].strip().strip('"').strip("'")
 if not BOT_TOKEN or not APP_TOKEN:
     print("SLACK_BOT_TOKEN and/or SLACK_APP_TOKEN not set", file=sys.stderr)
     sys.exit(1)
