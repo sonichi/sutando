@@ -12,6 +12,7 @@
     {"in": "../etc/passwd",       "out": "---etc-passwd"},
     {"in": "  trim-me  ",         "out": "trim-me"},
     {"in": "café",                "out": "caf-"},
+    {"in": "a😀b",                "out": "a-b"},
     {"in": "",                    "out": "unknown"},
     {"in": null,                  "out": "unknown"}
   ],
