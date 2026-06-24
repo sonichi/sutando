@@ -29,8 +29,8 @@ python3 skills/bot2bot-post/post.py opinion "is Discord-as-state better than fil
 
 ## Configuration
 
-- **Channel**: resolved from `~/.claude/channels/discord/access.json` — pick the `groups` entry tagged `{"role": "bot2bot", ...}`, fallback to any entry with value `true`.
-- **Token**: `DISCORD_BOT_TOKEN` read from `~/.claude/channels/discord/.env`.
+- **Channel**: resolved from `$CLAUDE_CONFIG_DIR/channels/discord/access.json` — pick the `groups` entry tagged `{"role": "bot2bot", ...}`, fallback to any entry with value `true`.
+- **Token**: `DISCORD_BOT_TOKEN` read from `$CLAUDE_CONFIG_DIR/channels/discord/.env`.
 - **Other bot ID**: picked from the `allowFrom` list, excluding this bot's own ID (fetched via Discord `/users/@me`).
 
 ## Why

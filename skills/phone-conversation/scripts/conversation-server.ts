@@ -84,6 +84,7 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '../../../src/inline-tools.js';
 import { recordSession, recordConversation, recordToolCall } from '../../../src/conversation-store.js';
+import { startPhoneTicker, type TickerControl } from '../../../src/observability/realtime.js';
 import { resultBelongsTo, phoneCallKey } from '../../../src/result-channel-key.js';
 // Lazy vision-session handle. Only loaded if a call ever needs it — keeps the
 // phone-agent boot path free of the vision-tools.ts side-effects on cold start.
@@ -339,6 +340,8 @@ interface CallSession {
 	// Observability: per-call metrics (startTime already on CallSession from #209)
 	toolCalls: { name: string; durationMs: number; timestamp: string }[];
 	events: { event: string; timestamp: string }[];
+	// Realtime usage ticker — emits voice+phone seconds incrementally while live.
+	usageTicker?: TickerControl;
 	// Per-call channel-scan state (results/<callSid>.task-*.txt pull path).
 	channelScanHandle?: NodeJS.Timeout;
 	// Safety-net against silent unlinkSync failures — `name -> first-seen ms`,
@@ -419,7 +422,10 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 	const fullTranscript = callSession.transcript.slice(-20)
 		.map(t => `${t.role === 'sutando' ? 'Sutando' : 'Caller'}: ${t.text}`)
 		.join('\n');
-	const content = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ncallSid: ${callSession.callSid}\ncaller: ${callSession.callerNumber || 'unknown'}\naccess_tier: ${callSession.isOwner ? 'owner' : 'other'}\ntask: ${taskDescription}\nhint: Check ~/.claude/skills/ for a matching skill before using raw commands.\ntranscript:\n${fullTranscript}\n`;
+	const skillsHint = process.env.CLAUDE_CONFIG_DIR
+		? `${process.env.CLAUDE_CONFIG_DIR}/skills/`
+		: '~/.claude/skills/';
+	const content = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ncallSid: ${callSession.callSid}\ncaller: ${callSession.callerNumber || 'unknown'}\naccess_tier: ${callSession.isOwner ? 'owner' : 'other'}\ntask: ${taskDescription}\nhint: Check ${skillsHint} for a matching skill before using raw commands.\ntranscript:\n${fullTranscript}\n`;
 	writeFileSync(taskPath, content);
 
 	// Poll for result in background, inject when ready — don't block Gemini
@@ -814,6 +820,13 @@ async function createCallSession(params: {
 		resultQueue: [],
 		toolCalls: [],
 		events: [{ event: 'call_started', timestamp: new Date().toISOString() }],
+		usageTicker: startPhoneTicker({
+			callSid: params.callSid,
+			model: VOICE_MODEL,
+			isOwner: params.isOwner,
+			isMeeting: params.isMeeting,
+			toolCallsGetter: () => callSession.toolCalls.length,
+		}),
 	};
 
 	// Start live transcript file
@@ -1052,8 +1065,8 @@ async function createCallSession(params: {
 	// when the core agent (or another tool) needs to deliver a result to THIS
 	// specific call without having delegated through the work tool. Existing
 	// consumers' patterns don't match the `<callSid>.` prefix, so a file in
-	// this namespace is invisible to them — only this scan and the matching
-	// discord-voice scan claim it.
+	// this namespace is invisible to them — only this scan and other
+	// pull-side plugin scans claim it.
 	//
 	// Scoped by callSid so different concurrent calls never cross — a
 	// parent-call result can't land in the child call's session and vice
@@ -1195,6 +1208,11 @@ function cleanupCall(callSid: string): void {
 		toolCalls: session.toolCalls,
 		events: session.events,
 	});
+
+	// Spine usage: flush the final partial bucket for both Twilio + Gemini-Live
+	// axes. The ticker has been emitting increments every USAGE_TICK_MS while the
+	// call ran; stop() emits the remainder and clears the interval.
+	try { session.usageTicker?.stop(); } catch {}
 
 	// Auto-scan the latest call for issues (async, best effort)
 	try {

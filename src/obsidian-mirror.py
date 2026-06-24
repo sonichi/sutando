@@ -33,12 +33,14 @@ from typing import Optional
 
 
 # ---- Path resolution ----
-
-def resolve_workspace() -> Path:
-    ws = os.environ.get("SUTANDO_WORKSPACE")
-    if ws:
-        return Path(ws).expanduser()
-    return Path.home() / ".sutando" / "workspace"
+# Use the shared helper (same precedence as the rest of Sutando:
+# sutando.config.local.json override, else <repo>/workspace/). This used to
+# inline the pre-v0.8 env-var-else-home-default fallback the resolver no
+# longer honors, which would mirror tasks/notes from the legacy root post-M0 — same
+# reinvented-fallback bug class as core_heartbeat.py (fixed alongside).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from workspace_default import resolve_workspace  # noqa: E402
+from util_paths import personal_path  # noqa: E402
 
 
 TASK_ID_RE = re.compile(r"^task-(.+)\.txt$")
@@ -165,7 +167,7 @@ def _write_result_mirror(vault: Path, result_path: Path) -> bool:
 
 
 def _mirror_asks(vault: Path, workspace: Path) -> bool:
-    src = workspace / "pending-questions.md"
+    src = personal_path("pending-questions.md", workspace)
     if not src.exists():
         return False
     dest = vault / "Sutando" / "Agent" / "Asks.md"
@@ -231,7 +233,7 @@ def sweep(vault: Path, workspace: Path, since_seconds: Optional[int] = None) -> 
             if _mirror_note(vault, p):
                 counts["notes"] += 1
 
-    asks_src = workspace / "pending-questions.md"
+    asks_src = personal_path("pending-questions.md", workspace)
     if asks_src.exists() and (not cutoff or _within_window(asks_src, cutoff)):
         if _mirror_asks(vault, workspace):
             counts["asks"] = 1

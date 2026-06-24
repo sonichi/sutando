@@ -10,7 +10,9 @@ set -e
 
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_SRC="$SKILL_DIR/app"
-WORKSPACE="${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}"
+REPO_ROOT="$(cd "$SKILL_DIR/../.." && pwd)"
+# Workspace resolution via the canonical M0 helper.
+WORKSPACE="$(bash "$REPO_ROOT/scripts/sutando-config.sh" workspace)"
 APP_DIR="$WORKSPACE/overlay-apps/benchmark-overlay"
 
 mkdir -p "$APP_DIR"

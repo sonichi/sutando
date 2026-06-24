@@ -19,7 +19,9 @@ The straightforward fix — sync the whole workspace — breaks the "rebuildable
 
 ## Proposal
 
-Add `$SUTANDO_WORKSPACE/state/.sync-allowlist` — a newline-delimited list of subpaths under `state/` that get synced across the fleet. Default (file missing) → nothing in State syncs. Existing single-machine installs are unaffected.
+Add `<workspace>/state/.sync-allowlist` — a newline-delimited list of subpaths under `state/` that get synced across the fleet. Default (file missing) → nothing in State syncs. Existing single-machine installs are unaffected.
+
+> `<workspace>` resolves via `bash scripts/sutando-config.sh workspace` (M0 helper, PR #1395). Defaults to `<repo>/workspace/`; honors `$SUTANDO_WORKSPACE` as a legacy escape hatch internally. Bare references to `$SUTANDO_WORKSPACE` below (as a shell variable to `rm -rf` or similar) keep the env-var form intentionally — those are commands the user would type, not path literals.
 
 Example file:
 
@@ -28,13 +30,13 @@ fleet/
 queue/
 ```
 
-The sync runs as a sibling script (`scripts/sync-fleet-state.sh`) that the existing `scripts/sync-memory.sh` cron can call after the memory sync, so the fleet picks up new claims at the same cadence Memory propagates.
+The sync runs as a sibling script (`scripts/sync-fleet-state.sh`) that the existing `scripts/sync-workspace.sh` cron can call after the workspace sync, so the fleet picks up new claims at the same cadence Memory propagates.
 
 ## Allowlist file format
 
 | Property | Value |
 |---|---|
-| **Path** | `$SUTANDO_WORKSPACE/state/.sync-allowlist` |
+| **Path** | `<workspace>/state/.sync-allowlist` |
 | **Encoding** | UTF-8, newline-delimited |
 | **Comments** | `#`-prefixed line, full-line only (no trailing comments) |
 | **Empty lines** | Ignored |
@@ -105,10 +107,10 @@ This is the rough shape for when code actually lands; not part of this PR.
 ### `scripts/sync-fleet-state.sh`
 
 ```text
-1. Read $SUTANDO_WORKSPACE/state/.sync-allowlist. If missing, exit 0 — sync is opt-out by default.
-2. For each entry, rsync (or git-add) the subpath into the same private memory-sync repo's `fleet/` subdir.
-3. Conflict policy: rsync mtime-wins for v1 (same as memory-sync). Filename collisions in claim files mean a race — let the protocol handle it on the next read.
-4. Hook into the existing scripts/sync-memory.sh cron, after the memory sync runs.
+1. Read <workspace>/state/.sync-allowlist. If missing, exit 0 — sync is opt-out by default.
+2. For each entry, rsync (or git-add) the subpath into the same private vault repo's `fleet/` subdir.
+3. Conflict policy: rsync mtime-wins for v1 (same as workspace-sync). Filename collisions in claim files mean a race — let the protocol handle it on the next read.
+4. Hook into the existing scripts/sync-workspace.sh cron, after the workspace sync runs.
 ```
 
 ### Task processor changes
@@ -166,6 +168,6 @@ This is the rough shape for when code actually lands; not part of this PR.
 
 - [`docs/workspace-design.md`](workspace-design.md) — 3-space model. This proposal sits inside the State space and tunes its sync rule from "none" to "opt-in allowlist."
 - [`docs/workspace-contract.md`](workspace-contract.md) — implementation reference. Will need a line referencing this doc once the fleet/ path is real.
-- [`docs/memory-sync.md`](memory-sync.md) — Memory sync mechanics. The fleet sync rides on the same transport in v1.
+- [`docs/workspace-sync.md`](workspace-sync.md) — Workspace sync mechanics (canonical as of v0.3.0). The fleet sync rides on the same transport in v1.
 
 Tracks #872. RFC #858 Decision 4.

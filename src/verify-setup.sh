@@ -67,12 +67,13 @@ if [ -f .env ]; then
   else
     warn "Twilio not configured (optional — phone features disabled)"
   fi
-  if [ -f "$HOME/.claude/channels/telegram/.env" ]; then
+  _CHAN_BASE="$(bash "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/sutando-config.sh" claude-home-path channels)"
+  if [ -f "$_CHAN_BASE/telegram/.env" ]; then
     pass "Telegram bot configured"
   else
     warn "Telegram not configured (optional — run /telegram:configure)"
   fi
-  if [ -f "$HOME/.claude/channels/discord/.env" ]; then
+  if [ -f "$_CHAN_BASE/discord/.env" ]; then
     if python3 -c "import discord" 2>/dev/null; then
       pass "Discord bot configured"
     else
@@ -81,7 +82,7 @@ if [ -f .env ]; then
   else
     warn "Discord not configured (optional — run /discord:configure)"
   fi
-  if [ -f "$HOME/.claude/channels/slack/.env" ]; then
+  if [ -f "$_CHAN_BASE/slack/.env" ]; then
     if python3 -c "import slack_bolt" 2>/dev/null; then
       pass "Slack bot configured"
     else
