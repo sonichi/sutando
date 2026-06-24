@@ -38,11 +38,57 @@ import json
 import os
 import re
 import subprocess
+import sys
 from datetime import datetime, timezone
 from typing import NamedTuple
 
 _ACCOUNT = "sutando"
-_MANIFEST_PATH = os.path.expanduser("~/.sutando-secret-vault/keys.json")
+
+# The manifest is the NON-SECRET index of key NAMES (values live in macOS
+# Keychain, per-host, never synced). Canonical location is
+# `<workspace>/state/secret-vault/keys.json` — under the workspace contract
+# rather than a home dotdir. It indexes the per-host Keychain, so it stays
+# PER-HOST and must NOT sync: `state/` is outside the sync carrier set
+# (whitelist mode un-ignores only notes/ + hosts/<host>/ + memory/), so this
+# path is non-synced by construction. Were it synced, every node would inherit
+# key names its local Keychain can't resolve — a lying index.
+_LEGACY_MANIFEST_PATH = os.path.expanduser("~/.sutando-secret-vault/keys.json")
+
+
+def _manifest_path() -> str:
+    """Canonical manifest path under the resolved workspace. Falls back to the
+    legacy home-dir path if the workspace can't be resolved (preserves behavior
+    in import contexts where workspace_default isn't importable)."""
+    try:
+        from workspace_default import resolve_workspace
+        return os.path.join(str(resolve_workspace()), "state", "secret-vault", "keys.json")
+    except Exception:
+        return _LEGACY_MANIFEST_PATH
+
+
+def _read_manifest() -> dict:
+    """Load the manifest, preferring the canonical path and falling back to the
+    legacy home-dir path for existing installs. The fallback makes the first
+    write self-migrate: `_register_key` reads via this helper (inheriting any
+    legacy keys), then writes the merged set to the canonical path."""
+    canonical = _manifest_path()
+    candidates = [canonical]
+    if _LEGACY_MANIFEST_PATH != canonical:
+        candidates.append(_LEGACY_MANIFEST_PATH)
+    for path in candidates:
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            if path == _LEGACY_MANIFEST_PATH and path != canonical:
+                print(
+                    "vault: read legacy manifest (~/.sutando-secret-vault/keys.json); "
+                    "migrating to <workspace>/state/secret-vault/ on next write.",
+                    file=sys.stderr, flush=True,
+                )
+            return data
+        except (FileNotFoundError, json.JSONDecodeError):
+            continue
+    return {}
 
 # Matches: vault set KEY <value>  where value is:
 #   - double-quoted string   "foo bar"
@@ -98,27 +144,22 @@ def _store_in_keychain(key: str, value: str) -> None:
 
 
 def _register_key(key: str) -> None:
-    os.makedirs(os.path.dirname(_MANIFEST_PATH), exist_ok=True)
-    try:
-        with open(_MANIFEST_PATH) as f:
-            manifest = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        manifest = {}
+    path = _manifest_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Read via _read_manifest so the first write after the move inherits any
+    # legacy keys (self-migration) rather than starting an empty index.
+    manifest = _read_manifest()
     manifest[key] = {"stored_at": datetime.now(timezone.utc).isoformat()}
     # Atomic write — concurrent bridge processes won't corrupt keys.json.
-    tmp = _MANIFEST_PATH + ".tmp"
+    tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(manifest, f, indent=2)
-    os.replace(tmp, _MANIFEST_PATH)
+    os.replace(tmp, path)
 
 
 def list_vault_keys() -> list[str]:
     """Return all key names stored in the vault manifest (no values)."""
-    try:
-        with open(_MANIFEST_PATH) as f:
-            return sorted(json.load(f).keys())
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
+    return sorted(_read_manifest().keys())
 
 
 def get_vault_key(key: str) -> str:
