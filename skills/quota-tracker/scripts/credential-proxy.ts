@@ -107,6 +107,30 @@ function writeCred(oauth: ClaudeOAuth): boolean {
 // (== current behavior, no regression). Request shape is standard OAuth2
 // public-client refresh (JSON body); response field names tolerated in both
 // snake_case (spec) and camelCase. NOT live-validated — see PR notes.
+// Pure: map an OAuth token-endpoint response into a fresh cred, or null if the
+// response isn't usable. Tolerates snake_case (spec) and camelCase, keeps the
+// existing refresh token when the response doesn't rotate it, and refuses any
+// access token that isn't a plausible non-empty string (never write garbage).
+// Exported so this — the highest-risk logic (field names + the guard) — is
+// unit-tested offline: no network, no keychain, no token rotation.
+export function parseRefreshResponse(
+	statusCode: number,
+	bodyText: string,
+	oauth: ClaudeOAuth,
+	now: number = Date.now(),
+): ClaudeOAuth | null {
+	if (statusCode >= 400) return null;
+	let j: Record<string, unknown>;
+	try { j = JSON.parse(bodyText); } catch { return null; }
+	const access = j.access_token ?? j.accessToken;
+	const refresh = (j.refresh_token ?? j.refreshToken ?? oauth.refreshToken) as string | undefined;
+	const expiresIn = j.expires_in ?? j.expiresIn;
+	const expiresAt = (j.expires_at ?? j.expiresAt ??
+		(typeof expiresIn === 'number' ? now + expiresIn * 1000 : undefined)) as number | undefined;
+	if (typeof access !== 'string' || access.length < 20) return null;
+	return { ...oauth, accessToken: access, refreshToken: refresh, expiresAt };
+}
+
 function refreshAccessToken(oauth: ClaudeOAuth): Promise<ClaudeOAuth | null> {
 	return new Promise((resolve) => {
 		if (!oauth.refreshToken) { resolve(null); return; }
@@ -131,29 +155,9 @@ function refreshAccessToken(oauth: ClaudeOAuth): Promise<ClaudeOAuth | null> {
 			const cs: Buffer[] = [];
 			resp.on('data', (c) => cs.push(c));
 			resp.on('end', () => {
-				if ((resp.statusCode ?? 0) >= 400) {
-					console.error(`${ts()} [Proxy] refresh HTTP ${resp.statusCode}`);
-					resolve(null);
-					return;
-				}
-				try {
-					const j = JSON.parse(Buffer.concat(cs).toString('utf-8'));
-					const access = j.access_token ?? j.accessToken;
-					const refresh = j.refresh_token ?? j.refreshToken ?? oauth.refreshToken;
-					const expiresIn = j.expires_in ?? j.expiresIn;
-					const expiresAt = j.expires_at ?? j.expiresAt ??
-						(typeof expiresIn === 'number' ? Date.now() + expiresIn * 1000 : undefined);
-					// Guard: only accept a plausible, non-empty access token.
-					if (typeof access !== 'string' || access.length < 20) {
-						console.error(`${ts()} [Proxy] refresh response lacked a usable access_token`);
-						resolve(null);
-						return;
-					}
-					resolve({ ...oauth, accessToken: access, refreshToken: refresh, expiresAt });
-				} catch (e) {
-					console.error(`${ts()} [Proxy] refresh parse error:`, (e as Error).message);
-					resolve(null);
-				}
+				const fresh = parseRefreshResponse(resp.statusCode ?? 0, Buffer.concat(cs).toString('utf-8'), oauth);
+				if (!fresh) console.error(`${ts()} [Proxy] refresh unusable (HTTP ${resp.statusCode} or bad/empty response)`);
+				resolve(fresh);
 			});
 		});
 		r.on('error', (e) => { console.error(`${ts()} [Proxy] refresh request error:`, e.message); resolve(null); });
@@ -229,13 +233,22 @@ function updateQuotaState(headers: Record<string, string>): void {
 	} catch { /* best effort */ }
 }
 
-// Verify token exists at startup
-const initToken = getOAuthToken();
-if (!initToken) {
-	console.error('No OAuth token found in macOS keychain. Is Claude Code logged in?');
-	process.exit(1);
+// Only start the server when run directly. Importing this module (e.g. from the
+// offline parse test) must NOT bind the port, touch the keychain, or exit.
+// Match the exact script name, NOT a substring — the offline test file is named
+// `credential-proxy-refresh.test.ts`, which contains "credential-proxy" but must
+// NOT be treated as the entry point (else importing it tries to bind the port).
+const isMain = (process.argv[1] ?? '').endsWith('credential-proxy.ts');
+
+if (isMain) {
+	// Verify token exists at startup
+	const initToken = getOAuthToken();
+	if (!initToken) {
+		console.error('No OAuth token found in macOS keychain. Is Claude Code logged in?');
+		process.exit(1);
+	}
+	console.log(`${ts()} [Proxy] OAuth token loaded from keychain (will re-read on each request)`);
 }
-console.log(`${ts()} [Proxy] OAuth token loaded from keychain (will re-read on each request)`);
 
 const upstreamUrl = new URL(UPSTREAM);
 
@@ -311,8 +324,10 @@ const server = createServer((req, res) => {
 	});
 });
 
-server.listen(PORT, '127.0.0.1', () => {
-	console.log(`${ts()} [Proxy] Credential proxy → http://localhost:${PORT}`);
-	console.log(`${ts()} [Proxy] Upstream: ${UPSTREAM}`);
-	console.log(`${ts()} [Proxy] Set ANTHROPIC_BASE_URL=http://localhost:${PORT} to route through proxy`);
-});
+if (isMain) {
+	server.listen(PORT, '127.0.0.1', () => {
+		console.log(`${ts()} [Proxy] Credential proxy → http://localhost:${PORT}`);
+		console.log(`${ts()} [Proxy] Upstream: ${UPSTREAM}`);
+		console.log(`${ts()} [Proxy] Set ANTHROPIC_BASE_URL=http://localhost:${PORT} to route through proxy`);
+	});
+}
