@@ -70,7 +70,7 @@ INFLIGHT_FILE = WS / "state" / "remote-task-inflight.json"
 # One-token onboarding: REMOTE_TASK_TOKEN alone is enough. The onboarding
 # string may be the combined "https://<relay>|<secret>" form (the URL travels
 # inside the token — nothing service-specific lives in this repo); a bare
-# secret needs REMOTE_TASK_URL/REMOTE_TASK_URL alongside it.
+# secret needs REMOTE_TASK_URL alongside it.
 _RAW = os.environ.get("REMOTE_TASK_TOKEN") or ""
 if "|" in _RAW:
     _URL_FROM_TOKEN, TOKEN = _RAW.split("|", 1)
