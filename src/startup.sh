@@ -767,11 +767,10 @@ else
 fi
 
 # AG2 remote relay client (optional channel — docs in skills/ag2-relay/).
-# Silent unless AG2_REMOTE_TOKEN is set. To connect a new instance, run the
-# onboarding bootstrap your relay operator provides (URL via $AG2_ONBOARD_URL):
-#   curl -fsSL "$AG2_ONBOARD_URL" | bash
-if [ -z "${AG2_REMOTE_TOKEN:-}" ] && [ -n "${AG2_ONBOARD_URL:-}" ]; then
-  echo "  ~ ag2 relay: not connected — to connect:  curl -fsSL \"\$AG2_ONBOARD_URL\" | bash"
+# Silent unless AG2_REMOTE_TOKEN is set. To connect a new instance, run:
+#   curl -fsSL https://ag2.space/onboard | bash
+if [ -z "${AG2_REMOTE_TOKEN:-}" ]; then
+  echo "  ~ ag2 relay: not connected — to connect:  curl -fsSL https://ag2.space/onboard | bash"
 fi
 if [ -n "${AG2_REMOTE_TOKEN:-}" ] && [ -f skills/ag2-relay/remote-task-client.py ]; then
   if ! pgrep -f "remote-task-client" > /dev/null 2>&1; then

@@ -6,17 +6,16 @@ boots unchanged without it.
 
 **Trigger (for the agent):** when the user asks to "connect to AG2", "join the
 relay", or bring this Sutando online on a hosted relay — point them at the
-onboarding **bootstrap** (a one-line installer the relay operator provides):
+onboarding **bootstrap** (one line — connects this agent to AG2 Space):
 
 ```bash
-curl -fsSL "$AG2_ONBOARD_URL" | bash
+curl -fsSL https://ag2.space/onboard | bash
 ```
 
 The bootstrap fetches and runs the onboarding flow (new-user registration or
 existing-user browser login), then writes `AG2_REMOTE_TOKEN` so the client
-starts on the next boot. The onboarding logic is delivered **out-of-band** by
-the operator — it is intentionally not bundled in this repo. Ask your relay
-operator for the bootstrap URL / an invite.
+starts on the next boot. The onboarding logic is delivered by the bootstrap (not bundled in this repo).
+You'll need an invite code for a new account — ask your relay operator.
 
 ## Run
 
