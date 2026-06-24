@@ -41,6 +41,54 @@ if [ -x "$REPO/scripts/sutando-config.sh" ]; then
     mkdir -p "$_ccd"
     export CLAUDE_CONFIG_DIR="$_ccd"
     echo "  ✓ CLAUDE_CONFIG_DIR=$_ccd"
+    # Onboarding-state seed — fixes "the core re-runs the 'let's get started'
+    # flow on every restart". Claude Code gates the welcome/theme flow on
+    # `hasCompletedOnboarding` in $CLAUDE_CONFIG_DIR/.claude.json. A
+    # workspace-scoped config dir starts without it, and the core runs
+    # detached/non-interactively (-- below) so it never *completes* onboarding
+    # to persist the flag — every launch dead-ends at the welcome flow the
+    # moment the user attaches the Core CLI. Seed only that flag (merge — never
+    # clobber oauthAccount/projects/mcpServers/credentials), carrying `theme`
+    # from the user's global ~/.claude.json when present so the theme picker is
+    # skipped too. Idempotent + atomic. We do NOT touch any permission/approval
+    # gate (e.g. bypassPermissionsModeAccepted) — that's the user's to accept.
+    # This is the single launch chokepoint (Sutando.app's launchCore, the
+    # terminal-server Core CLI pane, and src/startup.sh all exec this script),
+    # so seeding here covers every path.
+    if command -v python3 > /dev/null 2>&1; then
+      _ccd="$_ccd" python3 - <<'PY' || echo "  ⚠ onboarding-seed skipped (non-fatal)"
+import json, os
+ccd = os.environ["_ccd"]
+target = os.path.join(ccd, ".claude.json")
+try:
+    cfg = json.load(open(target)) if os.path.exists(target) else {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+except Exception:
+    cfg = {}
+glob = {}
+try:
+    with open(os.path.expanduser("~/.claude.json")) as f:
+        g = json.load(f)
+        if isinstance(g, dict):
+            glob = g
+except Exception:
+    pass
+changed = False
+if cfg.get("hasCompletedOnboarding") is not True:
+    cfg["hasCompletedOnboarding"] = True
+    changed = True
+if cfg.get("theme") is None and glob.get("theme") is not None:
+    cfg["theme"] = glob["theme"]
+    changed = True
+if changed:
+    tmp = target + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, target)
+    print("  ✓ onboarding-seed: hasCompletedOnboarding set in .claude.json")
+PY
+    fi
   else
     echo "start-cli: claude_sutando_config_dir invalid — refusing to start core" >&2
     cat "$_ccd_err" >&2
