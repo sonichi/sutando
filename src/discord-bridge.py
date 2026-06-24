@@ -2863,7 +2863,11 @@ async def _handle_discord_message(message, force=False):
         else:
             return
 
-    print(f"  @{username}: {text}{attachment_note}")
+    # Redact any `vault set KEY VALUE` secret before logging. Without this, the
+    # raw print lands the secret in discord-bridge.log even though the intercept
+    # below (L~2939) would store/redact it — a plaintext-secret leak to the log.
+    # (2026-06-23 incident: an owner's telegram bot token leaked here.)
+    print(f"  @{username}: {redact_vault_commands(text)}{attachment_note}")
 
     # Determine access tier
     access_tier = "other"
@@ -2936,12 +2940,21 @@ async def _handle_discord_message(message, force=False):
     # untrusted senders — the actual secret never reaches the task file either way.
     if text:
         if access_tier == "owner":
-            vault_result = intercept_vault_commands(text)
-            text = vault_result.text
-            if vault_result.stored:
-                print(f"  [vault] stored keys: {vault_result.stored}", flush=True)
-            if vault_result.failed:
-                print(f"  [vault] store failed (still redacted): {vault_result.failed}", flush=True)
+            # Defensive: a failure inside intercept_vault_commands (e.g. a missing
+            # optional dep like detect_secrets — 2026-06-23 incident) must NOT
+            # crash the message handler AND must NOT leak the secret. On any
+            # exception, fall back to redaction so the raw `vault set` value never
+            # reaches the task file / downstream — it just isn't stored to Keychain.
+            try:
+                vault_result = intercept_vault_commands(text)
+                text = vault_result.text
+                if vault_result.stored:
+                    print(f"  [vault] stored keys: {vault_result.stored}", flush=True)
+                if vault_result.failed:
+                    print(f"  [vault] store failed (still redacted): {vault_result.failed}", flush=True)
+            except Exception as _vault_exc:
+                text = redact_vault_commands(text)
+                print(f"  [vault] intercept errored ({type(_vault_exc).__name__}: {_vault_exc}) — redacted, NOT stored", flush=True)
         else:
             text = redact_vault_commands(text)
 

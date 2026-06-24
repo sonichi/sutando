@@ -1061,6 +1061,19 @@ def run_all_checks() -> list[dict]:
         # startup.sh's lsof guard sees the port as occupied and won't restart it.
         checks.append(c)
 
+    # Credential proxy (port 7846) — the OAuth-injection + quota-header path
+    # (skills/quota-tracker/scripts/credential-proxy.ts). It was previously
+    # unmonitored, so a dead proxy (= broken auth/quota for proxy-routed cores)
+    # never surfaced on the dashboard. Plain TCP-listening check (probe=False):
+    # it's a forwarding proxy with no liveness endpoint, so an HTTP probe would
+    # be forwarded upstream and misread as "wedged". Optional (not every node
+    # routes through it) → down is a warning, not a failure.
+    proxy_check = check_port(7846, "credential-proxy", probe=False)
+    if proxy_check["status"] == "down":
+        proxy_check["status"] = "warn"
+        proxy_check["detail"] = "not running (optional)"
+    checks.append(proxy_check)
+
     # macOS TCC — must come before critical-file checks so if TCC is blocking
     # everything, the operator sees the root cause before the downstream failures.
     checks.append(check_tcc_documents_access())
