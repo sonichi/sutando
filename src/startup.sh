@@ -160,6 +160,13 @@ fi
 git -C "$REPO" config --unset committer.name 2>/dev/null || true
 git -C "$REPO" config --unset committer.email 2>/dev/null || true
 
+# Re-apply tracked plugin-cache patches (skills/plugin-patches/). Plugin caches
+# are managed like node_modules — clobbered on update + invisible to git/sync —
+# so a kept local edit must be re-applied per host. The applier is idempotent +
+# fail-loud: it never force-applies and a stale/missing patch WARNs without
+# failing startup. See skills/plugin-patches/README.md.
+python3 "$REPO/skills/plugin-patches/apply-plugin-patches.py" || true
+
 # Fail-fast .env validation BEFORE init.sh. Two reasons must both hold:
 #  1) init.sh resolves the workspace via `${SUTANDO_WORKSPACE/#~/$HOME}` with
 #     fallback to `~/.sutando/workspace/`. If .env carries a SUTANDO_WORKSPACE=

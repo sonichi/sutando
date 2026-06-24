@@ -57,6 +57,8 @@ tests/*
 !tests/*.test.sh
 !tests/_helpers/
 !tests/_helpers/*.ts
+!tests/fixtures/
+!tests/fixtures/*.json
 skills/personal-*/
 tests/security/*.md
 !tests/security/*.md.example

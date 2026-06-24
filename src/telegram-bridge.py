@@ -580,6 +580,17 @@ def main():
             print(f"[Telegram] Poll error: {e}", flush=True)
             time.sleep(5)
             continue
+        if not result.get("ok"):
+            # api() collapses an HTTPError (429 rate-limit / 5xx / auth) into
+            # {"ok": False} with no detail. The loop used to fall straight
+            # through and re-poll getUpdates with NO delay — which hammers
+            # Telegram and, on a 429, *extends* its retry_after penalty (seen
+            # in the bridge log as repeated "429 Too Many Requests: retry
+            # after 5"). Back off the same 5s the exception path uses before
+            # the next poll. (The `if result.get("ok")` below is now always
+            # true; kept un-refactored to keep this fix a surgical diff.)
+            time.sleep(5)
+            continue
         # Heartbeat advances only on a response Telegram actually accepted.
         # A bumped heartbeat now means "the Telegram API round-trip is
         # working," not just "the asyncio loop is alive." Gated on

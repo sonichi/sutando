@@ -1,0 +1,49 @@
+{
+  "_comment": "Cross-language parity fixture for the result-channel-key helpers. ONE shared input/output table that BOTH tests/result-channel-key.test.ts and tests/result-channel-key.test.py load and assert against — so the TypeScript impl (src/result-channel-key.ts) and the Python impl (src/result_channel_key.py) can never silently drift. If you change one impl, the matching case here fails in the OTHER language's test too. Add a row here, not a per-language assertion, when extending behavior. (Lucy's flag on PR #1595.)",
+
+  "sanitizeKey": [
+    {"in": "1485653767402553457", "out": "1485653767402553457"},
+    {"in": "CA1234abcd",          "out": "CA1234abcd"},
+    {"in": "local-voice",         "out": "local-voice"},
+    {"in": "foo_bar-baz",         "out": "foo_bar-baz"},
+    {"in": "a/b",                 "out": "a-b"},
+    {"in": "a.b",                 "out": "a-b"},
+    {"in": "a b",                 "out": "a-b"},
+    {"in": "../etc/passwd",       "out": "---etc-passwd"},
+    {"in": "  trim-me  ",         "out": "trim-me"},
+    {"in": "café",                "out": "caf-"},
+    {"in": "",                    "out": "unknown"},
+    {"in": null,                  "out": "unknown"}
+  ],
+
+  "resultFilename": [
+    {"channelKey": "phone-123",           "taskId": "task-1781", "out": "phone-123.task-1781.txt"},
+    {"channelKey": "1490415515502383138", "taskId": "task-abc",  "out": "1490415515502383138.task-abc.txt"},
+    {"channelKey": "a.b",                 "taskId": "task-x",    "out": "a-b.task-x.txt"},
+    {"channelKey": "",                    "taskId": "task-y",    "out": "unknown.task-y.txt"}
+  ],
+
+  "parseResultFilename": [
+    {"in": "phone-123.task-1781.txt",  "key": "phone-123",    "taskId": "task-1781"},
+    {"in": "phone-123.task-1781",      "key": "phone-123",    "taskId": "task-1781"},
+    {"in": "phone-CAxyz.task-9.txt",   "key": "phone-CAxyz",  "taskId": "task-9"},
+    {"in": "task-1781.txt",            "key": null,           "taskId": "task-1781"},
+    {"in": "proactive-123.txt",        "key": null,           "taskId": "proactive-123"},
+    {"in": "voice-foo.bar.txt",        "key": null,           "taskId": "voice-foo.bar"}
+  ],
+
+  "resultBelongsTo": [
+    {"filename": "phone-123.task-1.txt",      "channelKey": "phone-123", "out": true},
+    {"filename": "phone-123.task-1.txt",      "channelKey": "phone-999", "out": false},
+    {"filename": "task-1.txt",                "channelKey": "phone-123", "out": false},
+    {"filename": "phone-123.task-1.txt.tmp",  "channelKey": "phone-123", "out": false},
+    {"filename": "phone-123.task-1",          "channelKey": "phone-123", "out": false},
+    {"filename": "phone-123.notatask.txt",    "channelKey": "phone-123", "out": false},
+    {"filename": "phone-CAxyz.task-9.txt",    "channelKey": "phone-CAxyz", "out": true}
+  ],
+
+  "phoneCallKey": [
+    {"in": "CA1234567890abcdef", "out": "phone-CA1234567890abcdef"},
+    {"in": null,                 "out": "phone-unknown"}
+  ]
+}
