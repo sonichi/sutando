@@ -252,10 +252,6 @@ class TestCrossLanguageParityFixture(unittest.TestCase):
                 result_belongs_to(c["filename"], c["channelKey"]), c["out"], repr(c)
             )
 
-    def test_discord_voice_key(self):
-        for c in self.fx["discordVoiceKey"]:
-            self.assertEqual(discord_voice_key(c["in"]), c["out"], repr(c))
-
     def test_phone_call_key(self):
         for c in self.fx["phoneCallKey"]:
             self.assertEqual(phone_call_key(c["in"]), c["out"], repr(c))

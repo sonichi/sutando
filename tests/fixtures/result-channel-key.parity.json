@@ -17,15 +17,15 @@
   ],
 
   "resultFilename": [
-    {"channelKey": "dvoice-123",          "taskId": "task-1781", "out": "dvoice-123.task-1781.txt"},
+    {"channelKey": "phone-123",           "taskId": "task-1781", "out": "phone-123.task-1781.txt"},
     {"channelKey": "1490415515502383138", "taskId": "task-abc",  "out": "1490415515502383138.task-abc.txt"},
     {"channelKey": "a.b",                 "taskId": "task-x",    "out": "a-b.task-x.txt"},
     {"channelKey": "",                    "taskId": "task-y",    "out": "unknown.task-y.txt"}
   ],
 
   "parseResultFilename": [
-    {"in": "dvoice-123.task-1781.txt", "key": "dvoice-123",   "taskId": "task-1781"},
-    {"in": "dvoice-123.task-1781",     "key": "dvoice-123",   "taskId": "task-1781"},
+    {"in": "phone-123.task-1781.txt",  "key": "phone-123",    "taskId": "task-1781"},
+    {"in": "phone-123.task-1781",      "key": "phone-123",    "taskId": "task-1781"},
     {"in": "phone-CAxyz.task-9.txt",   "key": "phone-CAxyz",  "taskId": "task-9"},
     {"in": "task-1781.txt",            "key": null,           "taskId": "task-1781"},
     {"in": "proactive-123.txt",        "key": null,           "taskId": "proactive-123"},
@@ -33,19 +33,13 @@
   ],
 
   "resultBelongsTo": [
-    {"filename": "dvoice-123.task-1.txt",     "channelKey": "dvoice-123", "out": true},
-    {"filename": "dvoice-123.task-1.txt",     "channelKey": "dvoice-999", "out": false},
-    {"filename": "task-1.txt",                "channelKey": "dvoice-123", "out": false},
-    {"filename": "dvoice-123.task-1.txt.tmp", "channelKey": "dvoice-123", "out": false},
-    {"filename": "dvoice-123.task-1",         "channelKey": "dvoice-123", "out": false},
-    {"filename": "dvoice-123.notatask.txt",   "channelKey": "dvoice-123", "out": false},
+    {"filename": "phone-123.task-1.txt",      "channelKey": "phone-123", "out": true},
+    {"filename": "phone-123.task-1.txt",      "channelKey": "phone-999", "out": false},
+    {"filename": "task-1.txt",                "channelKey": "phone-123", "out": false},
+    {"filename": "phone-123.task-1.txt.tmp",  "channelKey": "phone-123", "out": false},
+    {"filename": "phone-123.task-1",          "channelKey": "phone-123", "out": false},
+    {"filename": "phone-123.notatask.txt",    "channelKey": "phone-123", "out": false},
     {"filename": "phone-CAxyz.task-9.txt",    "channelKey": "phone-CAxyz", "out": true}
-  ],
-
-  "discordVoiceKey": [
-    {"in": "1490415515502383138", "out": "dvoice-1490415515502383138"},
-    {"in": "vc.weird/id",         "out": "dvoice-vc-weird-id"},
-    {"in": null,                  "out": "dvoice-unknown"}
   ],
 
   "phoneCallKey": [

@@ -271,12 +271,6 @@ describe('cross-language parity fixture', () => {
 		}
 	});
 
-	it('discordVoiceKey matches the shared fixture', () => {
-		for (const c of fixture.discordVoiceKey) {
-			assert.equal(discordVoiceKey(c.in), c.out, JSON.stringify(c));
-		}
-	});
-
 	it('phoneCallKey matches the shared fixture', () => {
 		for (const c of fixture.phoneCallKey) {
 			assert.equal(phoneCallKey(c.in), c.out, JSON.stringify(c));
