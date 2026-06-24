@@ -321,6 +321,36 @@ def fix_launchd(label: str) -> str:
     return f"failed to restart {label}: {result.stderr.strip()}"
 
 
+def fix_screen_capture() -> str:
+    """Restart the screen-capture server (:7845), guarded like startup.sh.
+
+    Order matters: reap any existing listener first (a dead-perm or wedged
+    server holds the port and would block the new bind), then re-verify
+    Screen Recording with a real capture — an all-black denial PNG
+    compresses to ~43KB at 5K resolution, so <5000 bytes means the
+    permission is missing or stale. Starting a server without the perm
+    would recreate the stale-:7845 state startup.sh's PERM_OK gate exists
+    to prevent: every /capture answered with a black-PNG denial.
+    """
+    subprocess.run("/usr/sbin/lsof -ti:7845 | xargs kill 2>/dev/null", shell=True, capture_output=True)
+    probe = Path("/tmp/sutando-healthfix-permcheck.png")
+    subprocess.run(["/usr/sbin/screencapture", "-x", str(probe)], capture_output=True)
+    size = probe.stat().st_size if probe.exists() else 0
+    probe.unlink(missing_ok=True)
+    if size < 5000:
+        return ("not restarted — Screen Recording permission missing/stale; grant it in "
+                "System Settings → Privacy & Security, fully quit the terminal app, re-run startup.sh")
+    log_path = WORKSPACE_DIR / "logs" / "screen-capture.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.Popen([sys.executable, str(REPO_DIR / "src" / "screen-capture-server.py")],
+                     stdout=open(str(log_path), "a"), stderr=subprocess.STDOUT,
+                     start_new_session=True)
+    time.sleep(1.5)
+    after = check_port(7845, "screen-capture")
+    return "restarted on :7845" if after["status"] == "ok" else (
+        f"restart attempted but port check says {after['status']} — see {log_path}")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -2252,6 +2282,17 @@ def main():
                                      stdout=open("/tmp/conversation-server.log", "a"),
                                      stderr=subprocess.STDOUT, start_new_session=True)
                     print(f"  {c['name']}: {'restarted (stale code)' if c['status'] == 'stale' else 'restarted'}")
+
+    # Screen-capture (:7845) is optional, so a down server is downgraded to
+    # warn and never enters `issues` — the fix loop above can't reach it. An
+    # owner running --fix still wants it back when the Screen Recording
+    # permission is in place, so dispatch off `checks` here. Runs even when
+    # `issues` is empty, hence outside the if/else above.
+    if do_fix:
+        sc = next((c for c in checks if c["name"] == "screen-capture" and c["status"] == "warn"
+                   and "not running" in (c.get("detail") or "")), None)
+        if sc:
+            print(f"  screen-capture: {fix_screen_capture()}")
 
     # Emit task on the RESIDUAL failure set when --fix ran (per PR #640 v2
     # review). The no-fix path emits earlier, before --quiet / --json early
