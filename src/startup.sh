@@ -773,30 +773,25 @@ else
   echo "  ~ telegram bridge (no token — optional)"
 fi
 
-# Remote relay client (optional channel — fetched on demand, NOT bundled).
-# Config + credentials live in the channel dir alongside the other channels
-# (channels/<provider>/.env with REMOTE_TASK_URL + REMOTE_TASK_TOKEN); the
-# connector is fetched next to the agent's skills. To connect a new instance,
-# run your provider's onboarding bootstrap.
-_RELAY_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
-[ -f "$_RELAY_DIR/channels/ag2space/.env" ] && { set -a; . "$_RELAY_DIR/channels/ag2space/.env"; set +a; }
-_RELAY_CONN="$_RELAY_DIR/skills/ag2-relay/remote-task-client.py"
-if [ -n "${REMOTE_TASK_TOKEN:-${AG2_REMOTE_TOKEN:-}}" ]; then
-  # Connected → self-heal: fetch the connector if it's missing, then start it.
-  _RELAY_URL="${REMOTE_TASK_URL:-${AG2_REMOTE_URL:-}}"
-  if [ ! -f "$_RELAY_CONN" ] && [ -n "$_RELAY_URL" ]; then
-    mkdir -p "$(dirname "$_RELAY_CONN")"
-    curl -fsSL "${_RELAY_URL%/}/onboard.client.py" -o "$_RELAY_CONN" 2>/dev/null || true
+# AG2 relay client (optional channel — same shape as the discord/telegram/slack
+# blocks below). Config + token live in the channel .env, resolved via the same
+# claude-home-path helper. The connector itself is delivered by onboarding (not
+# bundled in the repo) and installed alongside the agent's skills. Back-compat:
+# also honors a token already exported from the repo .env (legacy AG2_REMOTE_TOKEN).
+# Deliberately silent when unconfigured — a Sutando-only user never sees it.
+if _AG2_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env)"; \
+   { [ -f "$_AG2_ENV" ] && grep -qE "^(REMOTE_TASK_TOKEN|AG2_REMOTE_TOKEN)=" "$_AG2_ENV" 2>/dev/null; } \
+   || [ -n "${REMOTE_TASK_TOKEN:-}${AG2_REMOTE_TOKEN:-}" ]; then
+  [ -f "$_AG2_ENV" ] && { set -a; . "$_AG2_ENV"; set +a; }
+  _AG2_CONN="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/ag2-relay/remote-task-client.py)"
+  if [ ! -f "$_AG2_CONN" ]; then
+    echo "  ~ ag2 relay (connector not installed — re-run onboarding)"
+  elif ! pgrep -f "remote-task-client" > /dev/null 2>&1; then
+    python3 "$_AG2_CONN" > "$LOGS_DIR/remote-task-client.log" 2>&1 &
+    echo "  ✓ ag2 relay client"
+  else
+    echo "  ✓ ag2 relay client (already running)"
   fi
-  if [ -f "$_RELAY_CONN" ] && ! pgrep -f "remote-task-client" > /dev/null 2>&1; then
-    python3 "$_RELAY_CONN" > "$LOGS_DIR/remote-task-client.log" 2>&1 &
-    echo "  ✓ relay client"
-  elif [ -f "$_RELAY_CONN" ]; then
-    echo "  ✓ relay client (already running)"
-  fi
-elif [ -t 0 ] && [ -f "$_RELAY_DIR/channels/ag2space/.env" ]; then
-  # Configured but no token, and interactive → nudge to re-run onboarding.
-  echo "  ~ relay: configured but not connected — re-run your onboarding bootstrap"
 fi
 
 # 7. Discord bridge (optional — needs DISCORD_BOT_TOKEN + discord.py)
