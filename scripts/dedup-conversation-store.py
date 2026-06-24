@@ -47,7 +47,9 @@ TABLES: list[tuple[str, list[str]]] = [
     # Live voice-agent tables (conversation-store.ts)
     ("voice",          ["ts_unix", "kind", "COALESCE(text,'')", "COALESCE(session_id,'')"]),
     ("phone",          ["ts_unix", "kind", "COALESCE(text,'')", "COALESCE(session_id,'')"]),
-    ("discord_voice",  ["ts_unix", "kind", "COALESCE(text,'')", "COALESCE(session_id,'')"]),
+    # Plugin-registered surface tables (same per-surface schema) are discovered
+    # dynamically at runtime — see _discover_surface_tables() — so this host
+    # tool names no specific plugin.
     ("sessions",       ["ts_unix", "source", "COALESCE(session_id,'')", "COALESCE(call_sid,'')"]),
     ("session_events", ["ts_unix", "source", "COALESCE(session_id,'')", "COALESCE(call_sid,'')", "event_name"]),
     # Legacy importer table (import-conversation-log.py)
@@ -56,6 +58,36 @@ TABLES: list[tuple[str, list[str]]] = [
     # tool_call records lack a stable unique key (same tool can fire at same ms),
     # so we skip dedup for this table.
 ]
+
+
+# Standard per-surface dedup key — voice/phone and every plugin surface share it.
+_SURFACE_KEY = ["ts_unix", "kind", "COALESCE(text,'')", "COALESCE(session_id,'')"]
+# Tables that are NOT per-surface transcript tables, so discovery skips them
+# (the host surfaces are already listed statically in TABLES above).
+_NON_SURFACE = {"sessions", "session_events", "conversation", "tool_calls", "voice", "phone"}
+
+
+def _discover_surface_tables(db: sqlite3.Connection) -> list[str]:
+    """Plugin-registered surface tables: any table with the per-surface schema
+    (ts_unix / kind / text / session_id) that isn't a known host/non-surface
+    table. Keeps this tool plugin-agnostic — it dedups any surface table without
+    naming one."""
+    out: list[str] = []
+    try:
+        names = [r[0] for r in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+    except sqlite3.Error:
+        return out
+    for name in names:
+        if name in _NON_SURFACE:
+            continue
+        try:
+            cols = {r[1] for r in db.execute(f"PRAGMA table_info({name})").fetchall()}
+        except sqlite3.Error:
+            continue
+        if {"ts_unix", "kind", "text", "session_id"} <= cols:
+            out.append(name)
+    return out
 
 
 def _live_processes() -> list[str]:
@@ -128,7 +160,8 @@ def main() -> int:
     total_dupes = 0
     any_table_missing = False
 
-    for table, key_cols in TABLES:
+    all_tables = list(TABLES) + [(t, _SURFACE_KEY) for t in _discover_surface_tables(db)]
+    for table, key_cols in all_tables:
         if not _table_exists(db, table):
             print(f"  {table:<20} skipped (table absent)")
             any_table_missing = True

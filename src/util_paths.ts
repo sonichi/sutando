@@ -12,10 +12,10 @@
 //
 // Both fall back to `<workspace>/<filename>` so existing installs keep working
 // until they migrate. The `workspace` arg is optional; when omitted, the
-// helpers resolve to `$SUTANDO_WORKSPACE` (default `~/.sutando/workspace/`)
-// via resolveWorkspace() — NOT process.cwd(). Pre-#839 fixes the fallback was
-// cwd, which silently produced the wrong path on hosts where the caller's
-// cwd drifted from the workspace dir.
+// helpers resolve via `resolveWorkspace()` — post-v0.8 (#1440) the default is
+// `<repo>/workspace/` and `$SUTANDO_WORKSPACE` is no longer honored — NOT
+// process.cwd(). Pre-#839 fixes the fallback was cwd, which silently produced
+// the wrong path on hosts where the caller's cwd drifted from the workspace dir.
 //
 // Env var `SUTANDO_MEMORY_DIR` is the canonical name post-#858 / #870. The
 // legacy alias `SUTANDO_PRIVATE_DIR` is honored as a fallback for one release
@@ -62,14 +62,37 @@ export function memoryDirEnv(): string | undefined {
 	return undefined;
 }
 
+/**
+ * Per-host directory label: `$SUTANDO_HOST_LABEL` or short hostname.
+ *
+ * Single source of truth for the per-host segment so the legacy
+ * `machine-<host>/` (memory-dir) and new `hosts/<host>/` (workspace)
+ * conventions stay in lockstep. Matches `_host()` in sync-workspace.sh:
+ * an explicit label is an override and is used RAW; only the auto-detected
+ * hostname has its mDNS/domain suffix stripped. (A dotted label like
+ * "a.b" must NOT be split — splitting it would strand the reader, the very
+ * class this PR fixes. Mirrors `_host_label()` in util_paths.py.)
+ */
+function hostLabel(): string {
+	const label = process.env.SUTANDO_HOST_LABEL;
+	if (label) return label;
+	return hostname().split('.')[0];
+}
+
 /** Per-machine resolver. */
 export function personalPath(filename: string, workspace?: string): string {
 	const ws = workspace ?? resolveWorkspace();
+	// New per-host canonical home (workspace-as-git-repo, #1717). Probed first
+	// so relocated files are found; absent → falls through to the legacy order
+	// (identical to pre-#1717 behavior). Reader half of the per-host
+	// relocation — without it, moving a per-host file into `hosts/<host>/`
+	// would silently strand readers on the workspace-root fallback (H4).
+	const hostCandidate = join(ws, 'hosts', hostLabel(), filename);
+	if (existsSync(hostCandidate)) return hostCandidate;
 	const privateRoot = memoryDirEnv();
 	if (privateRoot) {
 		const root = expandHome(privateRoot);
-		const host = (process.env.SUTANDO_HOST_LABEL || hostname()).split('.')[0];
-		const candidate = join(root, `machine-${host}`, filename);
+		const candidate = join(root, `machine-${hostLabel()}`, filename);
 		if (existsSync(candidate)) return candidate;
 	}
 	// stand-avatar.png lives under assets/ in the public workspace.
@@ -83,8 +106,7 @@ export function personalPath(filename: string, workspace?: string): string {
 	// check fails gracefully.
 	if (privateRoot) {
 		const root = expandHome(privateRoot);
-		const host = (process.env.SUTANDO_HOST_LABEL || hostname()).split('.')[0];
-		return join(root, `machine-${host}`, filename);
+		return join(root, `machine-${hostLabel()}`, filename);
 	}
 	if (filename === 'stand-avatar.png') return join(ws, 'assets', filename);
 	return wsPath;
@@ -119,25 +141,49 @@ export function sharedPersonalPath(filename: string, workspace?: string): string
 // rather than a re-architecture. ANY new read/write into the Claude Code home
 // directory should go through this helper.
 //
-// Resolution: prefer $CLAUDE_HOME if set (override / testing), else
-// `~/.claude/`. Does NOT create the dir.
+// Resolution (3-tier, prefer most specific):
+//   1. $CLAUDE_CONFIG_DIR  — Claude Code's canonical env var (string present
+//      in the `claude` binary). Set by `claude-sutando` shell function +
+//      scripts/start-cli.sh + src/startup.sh so every workspace gets its own
+//      .claude-sutando/ tree instead of sharing global ~/.claude/.
+//   2. $CLAUDE_HOME        — deprecated legacy override (kept for one release
+//      so pre-M0 callers / test fixtures don't break instantly). Emits a
+//      one-shot warning to stderr on first read.
+//   3. ~/.claude/          — final fallback.
+// Does NOT create the dir.
 // ---------------------------------------------------------------------------
 
+let _claudeHomeDeprecationWarned = false;
+
 /**
- * Resolve a path under Claude Code's per-user home (`~/.claude/`).
+ * Resolve a path under Claude Code's per-user config dir.
  *
  * Pass subpath components as separate args:
  *   claudeHomePath('channels', 'discord', 'access.json')
  *   claudeHomePath('projects', projectSlug, 'memory', 'MEMORY.md')
  *   claudeHomePath('skills', skillName)
  *
- * Override the base with `$CLAUDE_HOME` for tests + alt-host installs.
+ * Prefers `$CLAUDE_CONFIG_DIR` (Claude Code canonical). Falls back to
+ * deprecated `$CLAUDE_HOME` then `~/.claude/`. See Mini PR #1415 review #5
+ * for the original-env-var-mismatch that motivated this.
  */
 export function claudeHomePath(...subpath: string[]): string {
-	const baseEnv = process.env.CLAUDE_HOME;
-	const base = baseEnv
-		? expandHome(baseEnv)
-		: join(process.env.HOME || '', '.claude');
+	const ccd = process.env.CLAUDE_CONFIG_DIR;
+	const home = process.env.CLAUDE_HOME;
+	let base: string;
+	if (ccd) {
+		base = expandHome(ccd);
+	} else if (home) {
+		if (!_claudeHomeDeprecationWarned) {
+			_claudeHomeDeprecationWarned = true;
+			console.warn(
+				'[util_paths] $CLAUDE_HOME is deprecated; set $CLAUDE_CONFIG_DIR instead (will be removed next release).',
+			);
+		}
+		base = expandHome(home);
+	} else {
+		base = join(process.env.HOME || '', '.claude');
+	}
 	if (subpath.length === 0) return base;
 	return join(base, ...subpath);
 }

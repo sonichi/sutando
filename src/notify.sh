@@ -14,8 +14,9 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 TS=$(date +%s%3N)
 
 # Load tokens from channel configs
-DISCORD_TOKEN=$(grep DISCORD_BOT_TOKEN ~/.claude/channels/discord/.env 2>/dev/null | cut -d= -f2-)
-DISCORD_USER_ID=$(python3 -c "import json; print(json.load(open('$HOME/.claude/channels/discord/access.json')).get('allowFrom',[''])[0])" 2>/dev/null)
+CLAUDE_CFG_DIR="$(bash "$REPO_DIR/scripts/sutando-config.sh" claude-home-path)"
+DISCORD_TOKEN=$(grep DISCORD_BOT_TOKEN "$CLAUDE_CFG_DIR/channels/discord/.env" 2>/dev/null | cut -d= -f2-)
+DISCORD_USER_ID=$(python3 -c "import json; print(json.load(open('$CLAUDE_CFG_DIR/channels/discord/access.json')).get('allowFrom',[''])[0])" 2>/dev/null)
 
 # 1. Voice — write proactive message if voice agent is up
 if curl -s -o /dev/null -w "%{http_code}" http://localhost:9900 2>/dev/null | grep -q "426"; then

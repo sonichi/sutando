@@ -18,13 +18,12 @@ import {
 	resultFilename,
 	parseResultFilename,
 	resultBelongsTo,
-	discordVoiceKey,
 	phoneCallKey,
 } from '../src/result-channel-key.js';
 
 describe('sanitizeKey', () => {
 	it('passes through filename-safe input', () => {
-		assert.equal(sanitizeKey('1485653767402553457'), '1485653767402553457');
+		assert.equal(sanitizeKey('1234567890123456789'), '1234567890123456789');
 		assert.equal(sanitizeKey('CA1234abcd'), 'CA1234abcd');
 		assert.equal(sanitizeKey('local-voice'), 'local-voice');
 		assert.equal(sanitizeKey('foo_bar-baz'), 'foo_bar-baz');
@@ -50,8 +49,8 @@ describe('sanitizeKey', () => {
 describe('resultFilename', () => {
 	it('builds <key>.<task-id>.txt', () => {
 		assert.equal(
-			resultFilename('1485653767402553457', 'task-discord-voice-1700000000'),
-			'1485653767402553457.task-discord-voice-1700000000.txt',
+			resultFilename('1234567890123456789', 'task-plugin-voice-1700000000'),
+			'1234567890123456789.task-plugin-voice-1700000000.txt',
 		);
 		assert.equal(
 			resultFilename('CA1234abcd', 'task-phone-1700000000'),
@@ -63,8 +62,8 @@ describe('resultFilename', () => {
 describe('parseResultFilename', () => {
 	it('splits the scoped form', () => {
 		assert.deepEqual(
-			parseResultFilename('1485653767402553457.task-discord-voice-1700000000.txt'),
-			['1485653767402553457', 'task-discord-voice-1700000000'],
+			parseResultFilename('1234567890123456789.task-plugin-voice-1700000000.txt'),
+			['1234567890123456789', 'task-plugin-voice-1700000000'],
 		);
 		assert.deepEqual(
 			parseResultFilename('CA1234abcd.task-phone-1700000000'),
@@ -74,9 +73,9 @@ describe('parseResultFilename', () => {
 
 	it('returns [null, base] for the legacy flat form', () => {
 		assert.deepEqual(parseResultFilename('task-1700000000.txt'), [null, 'task-1700000000']);
-		assert.deepEqual(parseResultFilename('task-discord-voice-1700000000.txt'), [
+		assert.deepEqual(parseResultFilename('task-plugin-voice-1700000000.txt'), [
 			null,
-			'task-discord-voice-1700000000',
+			'task-plugin-voice-1700000000',
 		]);
 	});
 
@@ -92,7 +91,7 @@ describe('parseResultFilename', () => {
 describe('resultBelongsTo', () => {
 	it('claims the scoped form for a matching key', () => {
 		assert.equal(
-			resultBelongsTo('1485653767402553457.task-foo.txt', '1485653767402553457'),
+			resultBelongsTo('1234567890123456789.task-foo.txt', '1234567890123456789'),
 			true,
 		);
 		assert.equal(resultBelongsTo('CA123.task-phone-1.txt', 'CA123'), true);
@@ -100,20 +99,20 @@ describe('resultBelongsTo', () => {
 
 	it('rejects a different channel key', () => {
 		assert.equal(
-			resultBelongsTo('1485653767402553457.task-foo.txt', '9999999999'),
+			resultBelongsTo('1234567890123456789.task-foo.txt', '9999999999'),
 			false,
 		);
 	});
 
 	it('rejects the legacy flat form (owned by delegating consumer, not by scan)', () => {
-		assert.equal(resultBelongsTo('task-1700000000.txt', '1485653767402553457'), false);
-		assert.equal(resultBelongsTo('task-discord-voice-1700000000.txt', 'local-voice'), false);
+		assert.equal(resultBelongsTo('task-1700000000.txt', '1234567890123456789'), false);
+		assert.equal(resultBelongsTo('task-plugin-voice-1700000000.txt', 'local-voice'), false);
 	});
 
 	it('rejects non-task files', () => {
 		assert.equal(resultBelongsTo('voice-1700000000.txt', 'local-voice'), false);
 		assert.equal(resultBelongsTo('proactive-1700000000.txt', 'anything'), false);
-		assert.equal(resultBelongsTo('1485653767402553457.proactive-foo.txt', '1485653767402553457'), false);
+		assert.equal(resultBelongsTo('1234567890123456789.proactive-foo.txt', '1234567890123456789'), false);
 	});
 
 	// Partial-write race: a writer's atomic-write temp file (`<key>.task-X.txt.tmp`,
@@ -121,18 +120,18 @@ describe('resultBelongsTo', () => {
 	// half-written body and orphan the rename target. The scan loops also gate on
 	// `.endsWith('.txt')`, but lock the invariant at the helper too.
 	it('rejects atomic-write temp suffixes (partial-write race)', () => {
-		const KEY = '1485653767402553457';
+		const KEY = '1234567890123456789';
 		const tempSuffixes = [
-			'1485653767402553457.task-discord-voice-1700000000.txt.tmp',
-			'1485653767402553457.task-discord-voice-1700000000.txt.partial',
-			'1485653767402553457.task-discord-voice-1700000000.txt.sending',
-			'1485653767402553457.task-discord-voice-1700000000.txt.swp',
-			'1485653767402553457.task-discord-voice-1700000000.txt.lock',
-			'1485653767402553457.task-discord-voice-1700000000.txt~',
-			'1485653767402553457.task-discord-voice-1700000000.sending',
-			'1485653767402553457.task-discord-voice-1700000000.tmp',
-			'1485653767402553457.task-discord-voice-1700000000.partial',
-			'.1485653767402553457.task-discord-voice-1700000000.txt', // dotfile prefix (vim swap, atomic-write idioms)
+			'1234567890123456789.task-plugin-voice-1700000000.txt.tmp',
+			'1234567890123456789.task-plugin-voice-1700000000.txt.partial',
+			'1234567890123456789.task-plugin-voice-1700000000.txt.sending',
+			'1234567890123456789.task-plugin-voice-1700000000.txt.swp',
+			'1234567890123456789.task-plugin-voice-1700000000.txt.lock',
+			'1234567890123456789.task-plugin-voice-1700000000.txt~',
+			'1234567890123456789.task-plugin-voice-1700000000.sending',
+			'1234567890123456789.task-plugin-voice-1700000000.tmp',
+			'1234567890123456789.task-plugin-voice-1700000000.partial',
+			'.1234567890123456789.task-plugin-voice-1700000000.txt', // dotfile prefix (vim swap, atomic-write idioms)
 		];
 		for (const f of tempSuffixes) {
 			assert.equal(
@@ -148,8 +147,8 @@ describe('resultBelongsTo', () => {
 	it('still matches the canonical .txt form', () => {
 		assert.equal(
 			resultBelongsTo(
-				'1485653767402553457.task-discord-voice-1700000000.txt',
-				'1485653767402553457',
+				'1234567890123456789.task-plugin-voice-1700000000.txt',
+				'1234567890123456789',
 			),
 			true,
 		);
@@ -162,8 +161,8 @@ describe('resultBelongsTo', () => {
 // new namespace has leaked into a consumer's path and we've broken the
 // blast-radius guarantee.
 describe('existing consumers do NOT match the scoped namespace', () => {
-	const SCOPED = '1485653767402553457.task-discord-voice-1700000000.txt';
-	const SCOPED_BASE = '1485653767402553457.task-discord-voice-1700000000';
+	const SCOPED = '1234567890123456789.task-plugin-voice-1700000000.txt';
+	const SCOPED_BASE = '1234567890123456789.task-plugin-voice-1700000000';
 
 	it('discord-bridge / telegram-bridge / slack-bridge pending_replies lookup', () => {
 		// All three bridges do: result_file = RESULTS_DIR / f"{task_id}.txt"
@@ -173,7 +172,7 @@ describe('existing consumers do NOT match the scoped namespace', () => {
 		// Equivalent to: no pending_replies key matches SCOPED.
 		const pending: Record<string, boolean> = {
 			'task-1700000001': true,
-			'task-discord-voice-1700000000': true, // a hypothetical tracked id
+			'task-plugin-voice-1700000000': true, // a hypothetical tracked id
 		};
 		// The bridge would look up `${task_id}.txt`; SCOPED doesn't equal any
 		// `${tracked}.txt`.
@@ -203,8 +202,8 @@ describe('existing consumers do NOT match the scoped namespace', () => {
 	// Note: task-bridge.ts has an UNCONDITIONAL fallthrough at line 682
 	// (`if (result) { ... onResult(result) ... }`) that fires for any
 	// non-empty .txt file when the voice client is connected. The narrow
-	// design accepts this: voice-agent and discord-voice / phone are
-	// different surfaces, and in practice the active discord-voice / phone
+	// design accepts this: voice-agent and the pull-side plugin / phone are
+	// different surfaces, and in practice the active pull-side / phone
 	// process will read-and-delete the scoped file before voice-agent's
 	// 2s poll claims it. See PR body's verification section for the full
 	// trade-off discussion.
@@ -214,38 +213,22 @@ describe('existing consumers do NOT match the scoped namespace', () => {
 // function so the keys agree. Prevents cross-consumer namespace collisions
 // when a future consumer ID format overlaps with an existing one.
 describe('typed key constructors', () => {
-	it('discordVoiceKey prefixes with `dvoice-`', () => {
-		assert.equal(discordVoiceKey('1485653767402553457'), 'dvoice-1485653767402553457');
-	});
-
 	it('phoneCallKey prefixes with `phone-`', () => {
 		assert.equal(phoneCallKey('CA1234abcd'), 'phone-CA1234abcd');
 	});
 
 	it('typed keys sanitize input', () => {
-		assert.equal(discordVoiceKey('a/b'), 'dvoice-a-b');
 		assert.equal(phoneCallKey('../etc'), 'phone----etc');
 	});
 
 	it('typed keys fall back on empty / falsy input', () => {
-		assert.equal(discordVoiceKey(null), 'dvoice-unknown');
-		assert.equal(discordVoiceKey(''), 'dvoice-unknown');
-		assert.equal(discordVoiceKey(undefined), 'dvoice-unknown');
 		assert.equal(phoneCallKey(null), 'phone-unknown');
 	});
 
 	it('typed keys round-trip through resultFilename + resultBelongsTo', () => {
-		const key = discordVoiceKey('1485653767402553457');
+		const key = phoneCallKey('CA1234abcd');
 		const fname = resultFilename(key, 'task-1700000000');
-		assert.equal(fname, 'dvoice-1485653767402553457.task-1700000000.txt');
+		assert.equal(fname, 'phone-CA1234abcd.task-1700000000.txt');
 		assert.equal(resultBelongsTo(fname, key), true);
-	});
-
-	it('typed keys cannot collide across consumers (even if IDs match)', () => {
-		// Hypothetical collision: a future consumer ID happens to look like a
-		// Discord VC snowflake. Without prefixes the keys would be equal; with
-		// prefixes they remain distinct.
-		const sameId = 'CA1234abcd';
-		assert.notEqual(discordVoiceKey(sameId), phoneCallKey(sameId));
 	});
 });

@@ -1,0 +1,37 @@
+name: lint-workspace-resolution
+
+# CI lint: refuse PRs that introduce NEW direct workspace-path resolution.
+#
+# All workspace path resolution MUST go through `src/sutando_config.{py,ts}`
+# (or `src/workspace_default.{py,ts}` once they delegate to the loader).
+# This workflow runs `scripts/lint-workspace-resolution.sh --diff`, which
+# scans only ADDED lines in the PR — existing legacy offenders are not
+# flagged here. They get migrated as part of the M0 cutover (separate
+# commit on this branch) and tracked separately.
+#
+# Together with the local pre-commit hook + the workspace-leak-check CI
+# workflow, this forms a third defense layer specifically against the
+# "code that bypasses the loader" failure mode.
+
+on:
+  pull_request:
+    branches: [main, staging-workspace-revamp]
+  push:
+    branches: [main, staging-workspace-revamp]
+
+jobs:
+  lint-workspace-resolution:
+    name: refuse new direct workspace-path resolution
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    steps:
+      - name: Checkout (with full history for base-ref diff)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run lint in --diff mode
+        env:
+          BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || 'HEAD~1' }}
+        run: bash scripts/lint-workspace-resolution.sh --diff

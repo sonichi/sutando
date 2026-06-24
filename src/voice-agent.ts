@@ -16,9 +16,11 @@
  *                          Falls back to GEMINI_API_KEY. Useful for isolating voice
  *                          (free-tier eligible) from paid-tier spend on a single key.
  *   ANTHROPIC_API_KEY   — Optional: only needed if not using claude CLI subscription auth
- *   SUTANDO_WORKSPACE   — Per-user workspace dir (default: ~/.sutando/workspace/).
+ *   (workspace)         — Per-user workspace dir resolved via `resolveWorkspace()`
+ *                          from src/workspace_default.ts. Post-v0.8 (#1440) default is
+ *                          `<repo>/workspace/`; configurable via `sutando.config.local.json`.
+ *                          $SUTANDO_WORKSPACE is no longer honored for resolution.
  *                          Stores tasks/, results/, state/, logs/, conversation.log.
- *                          See workspace_default.ts (#821) for the canonical resolver.
  *   PORT                — WebSocket port (default: 9900)
  *   HOST                — Bind address (default: 0.0.0.0)
  */
@@ -40,6 +42,7 @@ import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
 import { workTool, startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
 import { recordSession, recordToolCall } from './conversation-store.js';
+import { startVoiceTicker, type TickerControl } from './observability/realtime.js';
 import { buildSutandoSystemPrompt, buildVoiceAgentContext } from './voice-context.js';
 import { classifyTransportClose, type ClassifiedClose } from './voice-error-classifier.js';
 
@@ -95,12 +98,13 @@ if (process.env.GEMINI_VOICE_API_KEY) {
 
 const PORT = Number(process.env.PORT) || 9900;
 const HOST = process.env.HOST || '0.0.0.0';
-// Per-user runtime state lives under $SUTANDO_WORKSPACE (default
-// ~/.sutando/workspace/), not the repo checkout. Pre-#762 voice-agent
-// resolved its tasks/results/state against the repo path via the legacy
-// `WORKSPACE_DIR` env name + `import.meta.url`-relative fallback; post-#762
-// the canonical workspace lives elsewhere. resolveWorkspace() is the TS
-// twin of resolve_workspace() introduced in #821. Also remove the prior
+// Per-user runtime state lives under the resolved workspace (post-v0.8
+// / #1440 default: <repo>/workspace/), not the repo checkout. Pre-#762
+// voice-agent resolved its tasks/results/state against the repo path via
+// the legacy `WORKSPACE_DIR` env name + `import.meta.url`-relative
+// fallback; post-#762 the canonical workspace lives elsewhere.
+// resolveWorkspace() is the TS twin of resolve_workspace() introduced
+// in #821. Also remove the prior
 // "default to sutando/ so Claude Code subprocess picks up CLAUDE.md" comment
 // — voice-agent no longer spawns Claude Code (task-bridge handles that via
 // the file pipeline); the dual-use rationale is obsolete.
@@ -836,7 +840,7 @@ const mainAgent: MainAgent = {
 // proactively write user_profile / feedback / project / reference files
 // without first having to remember to mkdir. Honours $SUTANDO_MEMORY_DIR
 // when set; otherwise uses the Claude Code default
-// (~/.claude/projects/-{slug}/memory). Failure-silent: a missing memory
+// ($CLAUDE_CONFIG_DIR/projects/-{slug}/memory). Failure-silent: a missing memory
 // dir should never block voice startup.
 function bootstrapMemoryDir(): void {
 	const slug = '-' + WORKSPACE_DIR.replace(/\/$/, '').split('/').filter(Boolean).join('-');
@@ -869,6 +873,7 @@ async function main() {
 	const voiceToolIdMap = new Map<string, string>();
 	let voiceSessionStart = Date.now();
 	let metricsWritten = false;
+	let voiceTicker: TickerControl | null = null;
 
 	// Authoritative voice-connection state. web-client reads this file
 	// instead of caching the browser's one-shot POST, so a web-client
@@ -902,6 +907,12 @@ async function main() {
 	writeVoiceState(false);
 
 	function writeVoiceMetrics() {
+		// Spine usage: flush the final partial bucket and clear the interval FIRST,
+		// before the metricsWritten guard. stop() is idempotent (voiceTicker→null),
+		// so a double-flush never double-emits — but doing it before the guard means
+		// a leaked ticker can NEVER keep firing past a flush (otherwise it would emit
+		// phantom voice.seconds every USAGE_TICK_MS during the post-session idle gap).
+		try { voiceTicker?.stop(); voiceTicker = null; } catch {}
 		if (metricsWritten) return;
 		metricsWritten = true;
 		try {
@@ -918,6 +929,21 @@ async function main() {
 		} catch (err) {
 			console.log(`${ts()} [Observability] Failed to write metrics: ${err}`);
 		}
+	}
+
+	// Start (or restart) the realtime usage ticker for a fresh logical session.
+	// Called from BOTH session-reset points: bodhi's onSessionStart (first ACTIVE
+	// transition) AND handleClientConnected's reconnect-reset (bodhi's
+	// onSessionStart never re-fires — see the #1372 note below — so without this
+	// every 2nd+ session in one process would run with no ticker and emit zero
+	// usage). Stops any lingering ticker first (no-op if already flushed to null).
+	function startVoiceUsageTicker() {
+		voiceTicker?.stop();
+		voiceTicker = startVoiceTicker({
+			sessionId: SESSION_ID,
+			model: VOICE_NATIVE_AUDIO_MODEL,
+			toolCallsGetter: () => voiceToolCalls.length,
+		});
 	}
 
 	const session = new VoiceSession({
@@ -938,6 +964,7 @@ async function main() {
 				voiceSessionStart = Date.now(); metricsWritten = false;
 				voiceEvents.length = 0; voiceToolCalls.length = 0; voiceTranscript.length = 0;
 				voiceEvents.push({ event: 'session_started', timestamp: new Date().toISOString() });
+				startVoiceUsageTicker();
 				console.log(`${ts()} [Session] Started: ${e.sessionId}`);
 			},
 			onSessionEnd: (e) => {
@@ -1377,6 +1404,9 @@ async function main() {
 				voiceSessionStart = Date.now(); metricsWritten = false;
 				voiceEvents.length = 0; voiceToolCalls.length = 0; voiceTranscript.length = 0;
 				voiceEvents.push({ event: 'session_started:client_connect', timestamp: new Date().toISOString() });
+				// bodhi's onSessionStart won't re-fire (#1372 above), so start the
+				// usage ticker here too — otherwise this reconnect session emits no usage.
+				startVoiceUsageTicker();
 				console.log(`${ts()} [Session] Client connected after prior flush — reset metrics buffer`);
 			}
 			writeVoiceState(true);

@@ -69,6 +69,7 @@ describe('/sse-status + /mute-state — agent state plumbing (PR #418)', () => {
 					// so concurrent test processes can't race on the file. Same
 					// SUTANDO_WORKSPACE env override the rest of the test suite uses.
 					SUTANDO_WORKSPACE: TEMP_WORKSPACE,
+					SUTANDO_TEST_MODE: '1',  // v0.8: enable env-override-in-test escape hatch
 				},
 				// 'ignore' prevents the pipe buffer from filling in CI (stdout isn't drained),
 				// which would block the child and cause the /sse-status poll to time out.

@@ -13,7 +13,7 @@ bash skills/install.sh
 
 Or manually:
 ```bash
-ln -s /path/to/sutando/skills/proactive-loop ~/.claude/skills/proactive-loop
+ln -s /path/to/sutando/skills/proactive-loop "$CLAUDE_CONFIG_DIR/skills/proactive-loop"
 ```
 
 ## What's included

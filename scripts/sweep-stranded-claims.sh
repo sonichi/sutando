@@ -2,7 +2,8 @@
 # One-shot cleanup: move stranded .claimed-core-*.txt files from tasks/ to
 # tasks/archive/YYYY-MM/ (#933). Run once after deploying the bridge fix.
 set -e
-WORKSPACE="${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+WORKSPACE="$(bash "$REPO_ROOT/scripts/sutando-config.sh" workspace)"
 TASKS_DIR="$WORKSPACE/tasks"
 YM=$(date +%Y-%m)
 DEST="$TASKS_DIR/archive/$YM"

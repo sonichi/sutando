@@ -29,9 +29,11 @@ working starting point.
 ## Layout — workspace contract
 
 - **Source of truth:** `skills/overlay-apps/app/` (in the repo).
-- **Running instance:** `$SUTANDO_WORKSPACE/overlay-apps/benchmark-overlay/`
+- **Running instance:** `<workspace>/overlay-apps/benchmark-overlay/`
   — `node_modules` and any local state live here, not in the repo. Code in the
   repo, mutable runtime in the workspace, per the Sutando workspace contract.
+  `<workspace>` resolves via `bash scripts/sutando-config.sh workspace` (M0
+  helper, PR #1395) — defaults to `<repo>/workspace/`.
 
 `scripts/launch.sh` syncs source → workspace, installs dependencies, and
 starts the app.
@@ -67,7 +69,7 @@ up automatically.
 ## Control surface
 
 The app runs a localhost control server (port 7849+) and writes a discovery
-file to `$SUTANDO_WORKSPACE/state/overlay-control.json`. The web UI's
+file to `<workspace>/state/overlay-control.json`. The web UI's
 `/overlays` view proxies to it. Endpoints:
 
 | Method | Path                                    | Purpose                              |

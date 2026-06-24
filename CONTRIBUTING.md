@@ -26,7 +26,7 @@ bash src/startup.sh
 1. **What happened** — describe the issue clearly
 2. **Steps to reproduce** — numbered steps someone else can follow
 3. **Expected behavior** — what should have happened
-4. **Logs** — paste relevant lines from `$SUTANDO_WORKSPACE/logs/*.log` (defaults to `~/.sutando/workspace/logs/`; the old `<repo>/logs/` path was moved to the workspace per the workspace contract — `src/startup.sh` now writes to `$WORKSPACE/logs/`)
+4. **Logs** — paste relevant lines from `<repo>/workspace/logs/*.log` (the default in-repo workspace; see [`docs/workspace-config.md`](docs/workspace-config.md) for overrides)
 5. **Environment** — macOS version, Node.js version, Claude Code version
 
 **Bonus (highly valued):**
@@ -82,21 +82,21 @@ In the order a reviewer reads them. Say "N/A" if a question doesn't apply, so th
 
   Two accepted evidence forms. The strongest PRs include the transcript excerpt; a recording can stand alone for hard-to-transcribe UX changes.
 
-  **1. How to get the transcript log.** Every live voice/phone/discord-voice turn is logged to `data/conversation.sqlite` (tables `voice`, `phone`, `discord_voice`). Pull the session you just exercised:
+  **1. How to get the transcript log.** Every live voice/phone turn is logged to `data/conversation.sqlite` (per-surface tables: `voice`, `phone`, …). Pull the session you just exercised:
 
   ```bash
   DB="$(bash scripts/sutando-config.sh workspace)/data/conversation.sqlite"
   # find your most recent session id
-  sqlite3 "$DB" "SELECT DISTINCT session_id FROM discord_voice ORDER BY ts_unix DESC LIMIT 5;"
-  # dump that session's turns in order (swap discord_voice → voice / phone for other surfaces)
+  sqlite3 "$DB" "SELECT DISTINCT session_id FROM voice ORDER BY ts_unix DESC LIMIT 5;"
+  # dump that session's turns in order (swap `voice` → `phone` for other surfaces)
   sqlite3 -header -column "$DB" \
     "SELECT datetime(ts_unix,'unixepoch') ts, kind, speaker_name, text
-     FROM discord_voice WHERE session_id='<SESSION_ID>' ORDER BY ts_unix;"
+     FROM voice WHERE session_id='<SESSION_ID>' ORDER BY ts_unix;"
   ```
 
   Paste the rows that prove the change (don't fabricate — these are real captured turns). For a bug-fix, capture the **same scenario** on the unpatched build and on the patch, and show both — that's what makes it before/after.
 
-  **2. Complete example excerpt** (real `discord_voice` session, owner reading to the agent — note the `tool_call` rows interleaved with transcribed turns, which is the live `[Tool]` flow a reviewer is looking for):
+  **2. Complete example excerpt** (real voice session, owner reading to the agent — note the `tool_call` rows interleaved with transcribed turns, which is the live `[Tool]` flow a reviewer is looking for):
 
   ```
   ts                   kind       speaker_name  text

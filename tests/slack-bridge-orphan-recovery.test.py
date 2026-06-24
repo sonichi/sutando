@@ -26,6 +26,7 @@ def _load_bridge(workspace: Path):
     os.environ["SLACK_BOT_TOKEN"] = "xoxb-test-token"
     os.environ["SLACK_APP_TOKEN"] = "xapp-test-token"
     os.environ["SUTANDO_WORKSPACE"] = str(workspace)
+    os.environ["SUTANDO_TEST_MODE"] = "1"  # v0.8: opt-in env-honor
 
     # Remove any cached module so env takes effect on fresh import.
     sys.modules.pop("slack_bridge_under_test", None)
