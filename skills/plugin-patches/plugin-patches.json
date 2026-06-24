@@ -1,0 +1,11 @@
+{
+  "_comment": "Version-controlled patches re-applied to plugin CACHES at startup. A plugin cache is managed like node_modules (clobbered on every plugin update), so a useful local edit can't just be synced as a file — it must be (a) tracked here and (b) re-applied per host. The applier (apply-plugin-patches.py) is idempotent + FAIL-LOUD: it never force-applies, and emits a WARN (without failing startup) if a plugin update made a patch stale. A stale patch is a signal to re-base it — or better, upstream the change so the patch retires. See README.md.",
+  "patches": [
+    {
+      "patch": "discord-access-append.patch",
+      "target_glob": "plugins/cache/claude-plugins-official/discord/*/skills/access/SKILL.md",
+      "applied_marker": "group append",
+      "desc": "discord:access — add the safer `group append` / `group rm-allow` subcommands (append-without-replace; avoids the lock-yourself-out trap of stock `group add`, which overwrites the channel allowlist). Upstream candidate for claude-plugins-official."
+    }
+  ]
+}

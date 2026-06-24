@@ -21,6 +21,14 @@ import { statusPath } from '../../../src/workspace_default.js';
 
 const PORT = 7846;
 const UPSTREAM = 'https://api.anthropic.com';
+// Idle (inactivity) timeout in ms for the upstream connection. The socket timer
+// resets on every byte sent or received, so a healthy long stream never trips it
+// (Anthropic's SSE ping cadence is ~25s); it only fires when the connection has
+// genuinely gone dead — sleep/wake, wifi drop, gateway unreachable mid-flight.
+// Node sets no default request timeout, so without this an in-flight request
+// hangs forever and freezes the agent until a full app restart. Override via
+// SUTANDO_PROXY_TIMEOUT_MS; default 120s.
+const UPSTREAM_IDLE_TIMEOUT_MS = Number(process.env.SUTANDO_PROXY_TIMEOUT_MS) || 120_000;
 // Quota state is per-user runtime state — canonical home is <workspace>/state/.
 // Historically written into the skill dir; readers (dashboard.py, read-quota.py)
 // keep the skill-dir path as a last-resort fallback for one release.
@@ -285,6 +293,8 @@ const server = createServer((req, res) => {
 			headers['authorization'] = `Bearer ${oauthToken}`;
 		}
 
+		let timedOut = false;
+
 		const upstream = httpsRequest(
 			{
 				hostname: upstreamUrl.hostname,
@@ -292,6 +302,7 @@ const server = createServer((req, res) => {
 				path: req.url,
 				method: req.method,
 				headers,
+				timeout: UPSTREAM_IDLE_TIMEOUT_MS,
 			} as RequestOptions,
 			(upRes) => {
 				// Extract rate limit headers
@@ -311,12 +322,31 @@ const server = createServer((req, res) => {
 			},
 		);
 
+		// 'timeout' fires on socket inactivity but does NOT auto-abort — destroy the
+		// request so it surfaces through the 'error' handler below as a clean failure
+		// (and Claude Code's own retry kicks in) instead of hanging indefinitely.
+		upstream.on('timeout', () => {
+			timedOut = true;
+			console.error(`${ts()} [Proxy] Upstream idle >${UPSTREAM_IDLE_TIMEOUT_MS}ms — aborting`);
+			upstream.destroy(new Error('upstream idle timeout'));
+		});
+
 		upstream.on('error', (err) => {
 			console.error(`${ts()} [Proxy] Upstream error:`, err.message);
 			if (!res.headersSent) {
-				res.writeHead(502);
-				res.end('Bad Gateway');
+				res.writeHead(timedOut ? 504 : 502);
+				res.end(timedOut ? 'Gateway Timeout' : 'Bad Gateway');
+			} else {
+				// Headers already streamed — can't change status. Tear down the client
+				// connection so the agent sees a broken stream and retries rather than
+				// waiting forever on a dead upstream.
+				res.destroy(err);
 			}
+		});
+
+		// If the agent hangs up first, don't leak the in-flight upstream request.
+		res.on('close', () => {
+			if (!res.writableEnded) upstream.destroy();
 		});
 
 		upstream.write(body);
