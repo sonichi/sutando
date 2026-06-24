@@ -773,19 +773,30 @@ else
   echo "  ~ telegram bridge (no token — optional)"
 fi
 
-# AG2 remote relay client (optional channel — docs in skills/ag2-relay/).
-# Silent unless AG2_REMOTE_TOKEN is set. To connect a new instance, run:
-#   curl -fsSL https://ag2.space/onboard | bash
-if [ -z "${AG2_REMOTE_TOKEN:-}" ]; then
-  echo "  ~ ag2 relay: not connected — to connect:  curl -fsSL https://ag2.space/onboard | bash"
-fi
-if [ -n "${AG2_REMOTE_TOKEN:-}" ] && [ -f skills/ag2-relay/remote-task-client.py ]; then
-  if ! pgrep -f "remote-task-client" > /dev/null 2>&1; then
-    python3 skills/ag2-relay/remote-task-client.py > "$LOGS_DIR/remote-task-client.log" 2>&1 &
-    echo "  ✓ ag2 relay client"
-  else
-    echo "  ✓ ag2 relay client (already running)"
+# Remote relay client (optional channel — fetched on demand, NOT bundled).
+# Config + credentials live in the channel dir alongside the other channels
+# (channels/<provider>/.env with REMOTE_TASK_URL + REMOTE_TASK_TOKEN); the
+# connector is fetched next to the agent's skills. To connect a new instance,
+# run your provider's onboarding bootstrap.
+_RELAY_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+[ -f "$_RELAY_DIR/channels/ag2space/.env" ] && { set -a; . "$_RELAY_DIR/channels/ag2space/.env"; set +a; }
+_RELAY_CONN="$_RELAY_DIR/skills/ag2-relay/remote-task-client.py"
+if [ -n "${REMOTE_TASK_TOKEN:-${AG2_REMOTE_TOKEN:-}}" ]; then
+  # Connected → self-heal: fetch the connector if it's missing, then start it.
+  _RELAY_URL="${REMOTE_TASK_URL:-${AG2_REMOTE_URL:-}}"
+  if [ ! -f "$_RELAY_CONN" ] && [ -n "$_RELAY_URL" ]; then
+    mkdir -p "$(dirname "$_RELAY_CONN")"
+    curl -fsSL "${_RELAY_URL%/}/onboard.client.py" -o "$_RELAY_CONN" 2>/dev/null || true
   fi
+  if [ -f "$_RELAY_CONN" ] && ! pgrep -f "remote-task-client" > /dev/null 2>&1; then
+    python3 "$_RELAY_CONN" > "$LOGS_DIR/remote-task-client.log" 2>&1 &
+    echo "  ✓ relay client"
+  elif [ -f "$_RELAY_CONN" ]; then
+    echo "  ✓ relay client (already running)"
+  fi
+elif [ -t 0 ] && [ -f "$_RELAY_DIR/channels/ag2space/.env" ]; then
+  # Configured but no token, and interactive → nudge to re-run onboarding.
+  echo "  ~ relay: configured but not connected — re-run your onboarding bootstrap"
 fi
 
 # 7. Discord bridge (optional — needs DISCORD_BOT_TOKEN + discord.py)
