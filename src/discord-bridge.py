@@ -3183,6 +3183,20 @@ async def _handle_discord_message(message, force=False):
         )
         lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
         step = 1
+        # Context-first: a terse or threaded reply ("no", "continue", a pronoun)
+        # loses its referent when interpreted against a stale/compacted session
+        # context. Reconstruct from the durable channel BEFORE interpreting —
+        # keyed on the message not being self-contained (the agent's own judgment,
+        # not a parent_message_id gate), following the reply chain back, no
+        # arbitrary message count. Root-cause fix 2026-06-25.
+        lines.append(
+            f'{step}. CONTEXT-FIRST: if this message is not self-contained on its own '
+            f'(terse, a reply, or refers to something not stated here), reconstruct the '
+            f'thread BEFORE interpreting — `python3 src/discord-read.py {channel_id_str}` '
+            f'and follow the reply chain back until the message stands on its own; answer '
+            f'from that, not from memory.'
+        )
+        step += 1
         if _notify_py.exists():
             notify_cmd = (
                 f"python3 {_notify_py}"
