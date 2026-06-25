@@ -331,11 +331,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 content = f.read_text()
                 task_line = ""
                 source_line = ""
+                # Capture the first `source:` and first `task:` regardless of
+                # field order — voice/chat tasks put `source:` before `task:`,
+                # but discord/slack tasks put `task:` first. The `not …` guards
+                # keep the real header `source:` from being overridden by any
+                # `source:` line inside the task body (#1781 review, sonichi).
                 for line in content.splitlines():
-                    if line.startswith("source:"):
+                    if not source_line and line.startswith("source:"):
                         source_line = line[7:].strip()
-                    elif line.startswith("task:"):
+                    elif not task_line and line.startswith("task:"):
                         task_line = line[5:].strip()
+                    if task_line and source_line:
                         break
                 result_file = RESULT_DIR / f.name
                 existing = task_history.get(task_id, {})
