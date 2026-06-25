@@ -3194,8 +3194,8 @@ async def _handle_discord_message(message, force=False):
             f'or refers to something not stated here), reconstruct the relevant context '
             f'BEFORE interpreting — `python3 src/discord-read.py {channel_id_str}` — and '
             f'read the thread (everyone\'s messages including your own prior replies) back '
-            f'until it stands on its own. This task\'s parent_message_id is the message it '
-            f'replies to: answer THAT, from the reconstructed thread, not from memory.'
+            f'until it stands on its own, then answer from the reconstructed thread, not '
+            f'from memory.'
         )
         step += 1
         if _notify_py.exists():
