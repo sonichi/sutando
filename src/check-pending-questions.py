@@ -2,8 +2,12 @@
 """Check pending questions and notify if unanswered.
 
 Runs on cron — independent of the proactive loop.
-Sends notifications via macOS + Discord DM if questions are waiting.
-Use --force to bypass the 1-hour cooldown.
+Sends notifications via macOS notification + voice (when connected) +
+Discord DM (only when voice is offline, to avoid duplicate dashboard entries).
+
+Flags:
+  --force          bypass cooldown and snooze
+  --snooze [N]     suppress all notifications for N hours (default 24)
 """
 
 import json
@@ -22,8 +26,23 @@ WORKSPACE = resolve_workspace()
 PQ_FILE = Path(personal_path("pending-questions.md", WORKSPACE))
 RESULTS_DIR = WORKSPACE / "results"
 LAST_NOTIFY_FILE = WORKSPACE / ".last-pq-notify"
+SNOOZE_FILE = WORKSPACE / "state" / "pq-snoozed-until"
 VOICE_LOG = WORKSPACE / "logs" / "voice-agent.log"
 PRESENTER_SENTINEL = WORKSPACE / "state" / "presenter-mode.sentinel"
+
+
+def snooze_active():
+    """True if the user has snoozed pending-question notifications via --snooze."""
+    if not SNOOZE_FILE.exists():
+        return False
+    try:
+        until = float(SNOOZE_FILE.read_text().strip())
+        if time.time() < until:
+            return True
+        SNOOZE_FILE.unlink(missing_ok=True)
+        return False
+    except Exception:
+        return False
 
 
 def presenter_mode_active():
@@ -173,8 +192,26 @@ def notify_discord_dm(questions):
 
 def main():
     force = "--force" in sys.argv
+
+    # --snooze [hours]: suppress notifications for N hours (default 24).
+    # Lets the user dismiss repetitive reminders without deleting the questions.
+    if "--snooze" in sys.argv:
+        idx = sys.argv.index("--snooze")
+        try:
+            hours = float(sys.argv[idx + 1])
+        except (IndexError, ValueError):
+            hours = 24.0
+        SNOOZE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SNOOZE_FILE.write_text(str(time.time() + hours * 3600))
+        print(f"Pending questions snoozed for {hours:.0f}h")
+        return
+
     questions = get_waiting_questions()
     if not questions:
+        return
+
+    if not force and snooze_active():
+        print(f"(snoozed) {len(questions)} pending questions — suppressed")
         return
 
     if not force and presenter_mode_active():
@@ -197,8 +234,12 @@ def main():
     if voice_client_connected():
         notify_voice(questions)
 
-    # Discord DM to owner (via discord-bridge poll_proactive)
-    notify_discord_dm(questions)
+    # Discord DM only when voice is offline — when voice is connected the owner
+    # already hears the notification; sending a DM too creates a duplicate
+    # dashboard entry on every hourly fire, which is what produces the
+    # "repetitive tasks" pile-up the user sees.
+    if not voice_client_connected():
+        notify_discord_dm(questions)
 
     # Update last notify time
     LAST_NOTIFY_FILE.write_text(str(int(time.time())))
