@@ -3175,7 +3175,11 @@ async def _handle_discord_message(message, force=False):
     _notify_py = _claude_config / "skills/task-progress/scripts/notify.py"
     _transcribe_py = _claude_config / "skills/audio-transcribe/scripts/transcribe.py"
     discord_skill_hints = ""
-    if access_tier == "owner" and (_notify_py.exists() or _transcribe_py.exists()):
+    # CONTEXT-FIRST is a correctness feature (reconstruct before interpreting) and
+    # must NOT be gated on unrelated skills (task-progress / audio-transcribe) being
+    # installed — emit for every owner task. notify/transcribe steps stay conditional
+    # within. (Mirrors telegram-bridge; ungated 2026-06-25 per owner.)
+    if access_tier == "owner":
         channel_id_str = str(message.channel.id)
         has_audio = "[File attached:" in attachment_note and any(
             attachment_note.lower().find(ext) != -1
