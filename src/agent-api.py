@@ -330,8 +330,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 task_id = f.stem
                 content = f.read_text()
                 task_line = ""
+                source_line = ""
                 for line in content.splitlines():
-                    if line.startswith("task:"):
+                    if line.startswith("source:"):
+                        source_line = line[7:].strip()
+                    elif line.startswith("task:"):
                         task_line = line[5:].strip()
                         break
                 result_file = RESULT_DIR / f.name
@@ -360,7 +363,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 else:
                     status = "working"
                     result_text = ""
-                task_history[task_id] = {"status": status, "text": task_line or existing.get("text", task_id), "time": f.stat().st_mtime, "result": result_text}
+                task_history[task_id] = {"status": status, "text": task_line or existing.get("text", task_id), "time": f.stat().st_mtime, "result": result_text, "source": source_line or existing.get("source", "")}
             # Also check for result files without task files (already cleaned up)
             for f in sorted(RESULT_DIR.glob("task-*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]:
                 task_id = f.stem

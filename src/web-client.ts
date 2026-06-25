@@ -1292,9 +1292,11 @@ function renderTasks() {
       actionsHtml = '<div class="task-actions" data-replyfor="' + id + '">' + inner + '</div>';
     }
     const rawText = t.text || id;
-    // Default-tag bare tasks (no [Channel] prefix) as [Voice] — the
-    // overwhelming majority of un-prefixed tasks come from the voice agent.
-    const taggedRaw = /^\\[/.test(rawText) ? rawText : '[Voice] ' + rawText;
+    // Tag un-prefixed tasks by their source field: voice -> [Voice],
+    // anything else (cron/system reminders, etc.) -> [System]. Replaces the
+    // old "every bare task is [Voice]" default that mislabeled non-voice
+    // items (#bugs 2026-06-25).
+    const taggedRaw = /^\\[/.test(rawText) ? rawText : ((t.source === 'voice' ? '[Voice] ' : '[System] ') + rawText);
     // Prepend the 1-based index INTO the display text so it always renders
     // — earlier attempt with a separate <span class="task-num"> got
     // zero-width even with min-width set (flex layout/min-content issue).
@@ -1361,7 +1363,7 @@ function startTaskPolling() {
         if (t.status === 'done' && existing.status !== 'done' && !expandedTasks.has(t.id) && !userCollapsed) {
           expandedTasks.add(t.id);
         }
-        taskMap[t.id] = { status: t.status, text: t.text, time: new Date(t.time * 1000), result: t.result || existing.result || '' };
+        taskMap[t.id] = { status: t.status, text: t.text, time: new Date(t.time * 1000), result: t.result || existing.result || '', source: t.source || existing.source || '' };
       }
       // Remove tasks no longer in API (stale)
       for (const id of Object.keys(taskMap)) {
@@ -2744,10 +2746,11 @@ function renderTabContent() {
         var resultDisplay = isExpanded ? 'block' : 'none';
         var resultHtml = hasResult ? '<div id="result-' + id + '" style="display:' + resultDisplay + ';padding:8px 12px;color:#b8c8d8;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;background:#0d1520;border-radius:8px;margin:4px 0 6px 30px">' + esc(t.result) + '</div>' : '';
         var rawText = t.text || id;
-        // Default-tag bare tasks (no [Channel] prefix) as [Voice] — the
-        // overwhelming majority of un-prefixed tasks come from the voice agent.
-        // (Was [Sutando-core]; renamed 2026-05-03 per Chi's "rename to Voice".)
-        var taggedRaw = /^\\[/.test(rawText) ? rawText : '[Voice] ' + rawText;
+        // Tag un-prefixed tasks by their source field: voice -> [Voice],
+        // anything else (cron/system reminders, etc.) -> [System]. Replaces
+        // the old "every bare task is [Voice]" default that mislabeled
+        // non-voice items (#bugs 2026-06-25).
+        var taggedRaw = /^\\[/.test(rawText) ? rawText : ((t.source === 'voice' ? '[Voice] ' : '[System] ') + rawText);
         // Prepend 1-based index — same as the primary renderTasks path,
         // so voice can target tasks by number on this dynamic-region list too.
         var numPrefix = (i + 1) + '. ';
