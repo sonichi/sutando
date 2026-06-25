@@ -698,6 +698,33 @@ def main():
 
                 print(f"  @{username}{forward_note}: {redact_vault_commands(text)}{attachment_note}")
 
+                # Reply/parent context. Telegram embeds the full replied-to
+                # message when this is a reply — capture it (+ message ids) so a
+                # terse reply ("y", "no", a pronoun) is reconstructable. Unlike
+                # Discord, the Bot API has NO message-history fetch, so this
+                # embed-at-write quote is the ONLY reconstruct substrate for
+                # Telegram (the agent falls back to the session transcript for
+                # anything deeper than the immediate parent).
+                reply_note = ""
+                src_line = ""
+                parent_line = ""
+                _src_mid = msg.get("message_id")
+                if _src_mid is not None:
+                    src_line = f"source_message_id: {_src_mid}\n"
+                _rep = msg.get("reply_to_message")
+                if _rep:
+                    _rep_user = (
+                        _rep.get("from", {}).get("username")
+                        or _rep.get("from", {}).get("first_name", "?")
+                    )
+                    _rep_text = (
+                        _rep.get("text") or _rep.get("caption") or "[non-text message]"
+                    ).replace("\n", " ")[:300]
+                    reply_note = f"\n\n[Replying to @{_rep_user}: {_rep_text}]"
+                    _rep_mid = _rep.get("message_id")
+                    if _rep_mid is not None:
+                        parent_line = f"parent_message_id: {_rep_mid}\n"
+
                 # Write as task (same format as voice bridge)
                 ts = int(time.time() * 1000)
                 task_id = f"task-{ts}"
@@ -750,9 +777,11 @@ def main():
                 task_file.write_text(
                     f"id: {task_id}\n"
                     f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
-                    f"task: {confine_user_content(f'[Telegram @{username}{forward_note}] {text}{attachment_note}')}\n"
+                    f"task: {confine_user_content(f'[Telegram @{username}{forward_note}] {text}{attachment_note}{reply_note}')}\n"
                     f"source: telegram\n"
                     f"chat_id: {chat_id}\n"
+                    f"{src_line}"
+                    f"{parent_line}"
                     f"priority: {priority}\n"
                     f"{tg_skill_hints}"
                 )
