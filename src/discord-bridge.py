@@ -3190,11 +3190,12 @@ async def _handle_discord_message(message, force=False):
         # not a parent_message_id gate), following the reply chain back, no
         # arbitrary message count. Root-cause fix 2026-06-25.
         lines.append(
-            f'{step}. CONTEXT-FIRST: if this message is not self-contained on its own '
-            f'(terse, a reply, or refers to something not stated here), reconstruct the '
-            f'thread BEFORE interpreting — `python3 src/discord-read.py {channel_id_str}` '
-            f'and follow the reply chain back until the message stands on its own; answer '
-            f'from that, not from memory.'
+            f'{step}. CONTEXT-FIRST: if this message is not self-contained (terse, a reply, '
+            f'or refers to something not stated here), reconstruct the relevant context '
+            f'BEFORE interpreting — `python3 src/discord-read.py {channel_id_str}` — and '
+            f'read the thread (everyone\'s messages including your own prior replies) back '
+            f'until it stands on its own. This task\'s parent_message_id is the message it '
+            f'replies to: answer THAT, from the reconstructed thread, not from memory.'
         )
         step += 1
         if _notify_py.exists():
