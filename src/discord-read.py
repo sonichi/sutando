@@ -33,12 +33,15 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument("channel_id")
 parser.add_argument("--limit", type=int, default=10)
-parser.add_argument("--after", default=None, help="Snowflake ID — fetch messages after this ID")
+parser.add_argument("--after", default=None, help="Snowflake ID — fetch messages after this ID (newer)")
+parser.add_argument("--before", default=None, help="Snowflake ID — fetch messages before this ID (older). Page backward through history to reconstruct context >100 messages back.")
 args = parser.parse_args()
 
 params = {"limit": str(args.limit)}
 if args.after:
     params["after"] = args.after
+if args.before:
+    params["before"] = args.before
 url = f"https://discord.com/api/v10/channels/{args.channel_id}/messages?" + urllib.parse.urlencode(params)
 req = urllib.request.Request(url, headers={
     "Authorization": f"Bot {TOKEN}",
