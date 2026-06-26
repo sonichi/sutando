@@ -603,7 +603,7 @@ reap_wedged_listener() {
 reap_wedged_listener 9900 voice-agent
 if ! lsof -i :9900 > /dev/null 2>&1; then
   echo "  Starting voice agent (port 9900)..."
-  npx tsx src/voice-agent.ts > "$LOGS_DIR/voice-agent.log" 2>&1 &
+  NODE_OPTIONS="--experimental-sqlite" npx tsx src/voice-agent.ts > "$LOGS_DIR/voice-agent.log" 2>&1 &
   echo "  ✓ voice agent"
 else
   echo "  ✓ voice agent (already running)"
