@@ -1433,25 +1433,43 @@ async function main() {
 	(() => {
 		const transport = (session as any).transport;
 		if (!transport) return;
-		const FABRICATED_OUTPUT_RE = /^\s*(\[System:|System:|Silence\.?|\[Silence\.?\]|<ctrl\d+>)/i;
+		// Gap 1 (review 2026-06-20): dropped the bare `Silence\.?` alternative — anchored
+		// at line start it collided with natural speech ("Silence is golden.", "Silence,
+		// please …") and silently suppressed legitimate output. The #1410/#1356 fabrication
+		// signature is the *bracketed* `[Silence]`, which is kept; dropping the bare form
+		// removes the only real false-positive surface at ~no detection cost.
+		const FABRICATED_OUTPUT_RE = /^\s*(\[System:|System:|\[Silence\.?\]|<ctrl\d+>)/i;
 		const origOnOutputTranscription = transport.onOutputTranscription?.bind(transport);
+		// Gap 2 (review 2026-06-20): onOutputTranscription is fed incremental per-turn
+		// deltas, not whole-turn text, so a fabricated prefix split across chunks
+		// ("[Sys" | "tem: …") matched the ^-anchor on neither fragment and the sanitizer
+		// never fired for the streamed case. Accumulate a per-turn buffer and test the
+		// running buffer (still anchored at the turn's start), resetting on the same turn
+		// boundaries that reset _suppressAudio.
+		let outputBuffer = '';
+		let turnFabricated = false;
 		transport.onOutputTranscription = (text: string) => {
-			if (FABRICATED_OUTPUT_RE.test(text.trim())) {
-				console.error(`${ts()} [OutputSanitizer] BLOCKED fabricated directive spoken aloud: ${text.slice(0, 120)}`);
+			const chunk = text ?? ''; // guard: null/undefined delta must not throw the pipeline
+			if (turnFabricated) return; // already detected this turn — suppress the rest
+			outputBuffer += chunk;
+			if (FABRICATED_OUTPUT_RE.test(outputBuffer.trim())) {
+				console.error(`${ts()} [OutputSanitizer] BLOCKED fabricated directive spoken aloud: ${outputBuffer.slice(0, 120)}`);
+				turnFabricated = true;
 				// Best-effort: suppress remaining audio chunks in this turn.
 				if ('_suppressAudio' in transport) transport._suppressAudio = true;
 				return; // skip transcript storage for fabricated output
 			}
-			origOnOutputTranscription?.(text);
+			origOnOutputTranscription?.(chunk);
 		};
-		// Reset _suppressAudio at turn boundaries so the next turn is unaffected.
-		session.eventBus.subscribe('turn.end', () => {
+		// Reset per-turn sanitizer state at turn boundaries so the next turn is unaffected.
+		const resetTurn = () => {
+			outputBuffer = '';
+			turnFabricated = false;
 			if (transport && '_suppressAudio' in transport) transport._suppressAudio = false;
-		});
-		session.eventBus.subscribe('turn.interrupted', () => {
-			if (transport && '_suppressAudio' in transport) transport._suppressAudio = false;
-		});
-		console.log(`${ts()} [OutputSanitizer] wired into transport.onOutputTranscription`);
+		};
+		session.eventBus.subscribe('turn.end', resetTurn);
+		session.eventBus.subscribe('turn.interrupted', resetTurn);
+		console.log(`${ts()} [OutputSanitizer] wired into transport.onOutputTranscription (per-turn buffered)`);
 	})();
 
 	// Wire narration-tee: capture Gemini's outbound audio for screen recordings
