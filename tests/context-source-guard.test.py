@@ -96,6 +96,18 @@ run(read_task(PUBLIC_CH)[0], env=ENV_STALE)
 assert is_deny(run(bash_read(PRIVATE_CH), env=ENV_STALE)), \
     "#1698: SUTANDO_WORKSPACE must be ignored — resolution stays on CLAUDE_CONFIG_DIR"
 
+# 8) per-host CLAUDE_CONFIG_DIR (`<workspace>/.claude-sutando/hosts/<host>`): the hook
+# walks up to the nearest `.claude-sutando` ANCESTOR, so the leaf hostname must not
+# break resolution. Serving state must still land in <WS> (where the guild cache is),
+# so the blacklist applies → DENY. An exact-leaf-basename match would resolve a phantom
+# dir under hosts/<host> → guard fails open.
+CFG_HOST = CFG_DIR / "hosts" / "h1"
+CFG_HOST.mkdir(parents=True, exist_ok=True)
+ENV_HOST = {**ENV, "CLAUDE_CONFIG_DIR": str(CFG_HOST)}
+run(read_task(PUBLIC_CH)[0], env=ENV_HOST)
+assert is_deny(run(bash_read(PRIVATE_CH), env=ENV_HOST)), \
+    "per-host CLAUDE_CONFIG_DIR: walk up to nearest .claude-sutando ancestor, resolution stays on <WS>"
+
 print("PASS: context-source-guard — serve public-ch blocks a private-guild read (Read- and cat-paths, "
       "+ fail-closed), allows public channels, serving the private channel reads itself, plain bash untouched, "
-      "+ SUTANDO_WORKSPACE ignored (#1698)")
+      "+ SUTANDO_WORKSPACE ignored (#1698), + per-host CLAUDE_CONFIG_DIR resolves via nearest .claude-sutando ancestor)")
