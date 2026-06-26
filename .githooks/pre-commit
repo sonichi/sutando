@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Sutando pre-commit hook: refuse commits that include workspace/ contents.
+#
+# The in-repo workspace at `<repo>/workspace/` holds per-user runtime state
+# (tasks, results, notes, state, logs, etc.) that must NEVER be committed
+# to the shared repo. The .gitignore (workspace/* with !workspace/.gitkeep)
+# is the first line of defense; this hook is the second — it catches:
+#
+#   • git add -f workspace/foo.txt           (force-add bypasses .gitignore)
+#   • git add workspace/data.json            (explicit add of a "skip" path
+#                                              that gitignore would have skipped
+#                                              under `git add .` but not under
+#                                              an explicit pathspec)
+#   • IDEs / AI assistants that stage files without consulting .gitignore
+#
+# Installation (per-clone, one-time):
+#   git config core.hooksPath .githooks
+#
+# Or copy/symlink: ln -s ../../.githooks/pre-commit .git/hooks/pre-commit
+#
+# Escape hatch (for the rare case you really need to commit something under
+# workspace/ — e.g. updating .gitkeep itself, or shipping a doc):
+#   git commit --no-verify
+#
+# Whitelist (paths that ARE allowed to be committed under workspace/):
+#   • workspace/.gitkeep      — required so the directory ships on fresh clone
+#
+# Exit non-zero refuses the commit; exit 0 lets it through.
+
+set -euo pipefail
+
+# Staged paths added or modified in this commit. We check both A (added) and
+# M (modified) because a file could be added in an earlier commit and modified
+# in this one — still want to refuse if it's under workspace/.
+staged="$(git diff --cached --name-only --diff-filter=AMRC)"  # AMRC: a `git mv` into workspace/ registers as R and bypassed the AM gate
+
+# Filter to paths under workspace/, then drop the allowed whitelist entries.
+# `|| true` so grep's exit-1-on-no-match doesn't kill the script under set -e.
+offenders="$(printf '%s\n' "$staged" \
+  | grep -E '^workspace/' \
+  | grep -vxF 'workspace/.gitkeep' \
+  || true)"
+
+if [[ -n "$offenders" ]]; then
+  printf '\n\033[31m✖ pre-commit refusing: workspace/ contents must not be committed.\033[0m\n\n'
+  printf 'The following staged paths live under workspace/, which holds per-user runtime\n'
+  printf 'state (tasks, results, notes, state, logs). Move them out of workspace/ before\n'
+  printf 'committing, or unstage them with: git reset HEAD <path>\n\n'
+  printf '%s\n' "$offenders" | sed 's/^/  /'
+  printf '\nIf you really need to commit this (e.g. updating workspace/.gitkeep itself),\n'
+  printf 'pass --no-verify to git commit. Use sparingly.\n\n'
+  exit 1
+fi
+
+exit 0

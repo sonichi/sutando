@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -31,11 +32,23 @@ except Exception:  # pragma: no cover — bridge must keep running
     def _push_vision_image(path: str, source: str = "telegram") -> bool:  # type: ignore
         return False
 from task_priority import default_priority_for_source  # noqa: E402
+
+# Observability: emit channel.telegram.<in|out> into the local obs spine
+# (src/observability). Guarded so a missing module never crashes the bridge.
+try:
+    from observability.channel import emit_channel as _emit_channel  # noqa: E402
+except Exception:  # pragma: no cover — best-effort telemetry
+    def _emit_channel(*_a, **_k):  # type: ignore
+        return None
 from result_markers import parse_markers  # noqa: E402
+from task_body_guard import confine_user_content  # noqa: E402
+from util_paths import channel_access_path, claude_home_path  # noqa: E402
 
 from workspace_default import resolve_workspace  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
+import progress_stream  # noqa: E402  (opt-in owner progress streaming, SUTANDO_PROGRESS_STREAM=1)
+from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 REPO = resolve_workspace()
 TASKS_DIR = REPO / "tasks"
 RESULTS_DIR = REPO / "results"
@@ -85,7 +98,7 @@ except ImportError:
 # `setdefault` previously let a stale TELEGRAM_BOT_TOKEN from a prior shell
 # session silently override the freshly-rotated value, same bug class as
 # skills/x-twitter/x-post.py (see PR #416 commit message for full context).
-channels_env = Path.home() / ".claude" / "channels" / "telegram" / ".env"
+channels_env = claude_home_path("channels", "telegram", ".env")
 if channels_env.exists():
     for line in channels_env.read_text().splitlines():
         if "=" in line and not line.startswith("#"):
@@ -212,7 +225,7 @@ def presenter_mode_active():
         return False
 
 # Load access config
-ACCESS_FILE = Path.home() / ".claude" / "channels" / "telegram" / "access.json"
+ACCESS_FILE = channel_access_path("telegram")
 def load_allowed():
     """Return the set of allowed sender IDs, OR None if access.json doesn't exist.
 
@@ -311,6 +324,28 @@ def api(method, **params):
 INBOX_DIR = REPO / "telegram-inbox"
 INBOX_DIR.mkdir(exist_ok=True)
 
+def _transcribe_via_skill(local_path: str) -> str | None:
+    """Call skills/audio-transcribe/scripts/transcribe.py. Returns transcript or None.
+
+    Optional — if the skill is absent the caller falls back to [Voice note attached:].
+    Errors are swallowed; transcription failure must never block task delivery.
+    """
+    import subprocess
+    skill_script = Path(__file__).parent.parent / "skills" / "audio-transcribe" / "scripts" / "transcribe.py"
+    if not skill_script.exists():
+        return None
+    try:
+        result = subprocess.run(
+            [sys.executable, str(skill_script), local_path],
+            capture_output=True, text=True, timeout=25,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() or None
+    except Exception as e:
+        print(f"  [stt] skill call failed for {os.path.basename(local_path)}: {e}", flush=True)
+    return None
+
+
 def download_file(file_id, name_hint="file"):
     """Download a file from Telegram and save locally."""
     result = api("getFile", file_id=file_id)
@@ -365,17 +400,30 @@ def send_file(chat_id, file_path, caption=""):
         print(f"  Send file failed: {e}")
         return {"ok": False}
 
-def send_reply(chat_id, text, task_id: str | None = None):
-    import re
+def send_reply(chat_id, text, task_id: str | None = None) -> dict:
+    """Send a reply's text + any [file:]-marked attachments.
+
+    Returns a delivery summary ``{"text_chunks", "files_sent", "ok"}`` so the
+    caller can emit ONE accurate channel.telegram.out event. api()/send_file()
+    swallow HTTP errors (return {"ok": False} / None), so success can't be
+    assumed — we consult their return values. The task-reply path passes a
+    marker-stripped body and sends parsed.actions attachments itself, then folds
+    those into the same event (so file-only replies still report a delivery and
+    the count/outcome stay accurate)."""
     # Extract file paths: [file: /path/to/file] or [send: /path/to/file]
     file_pattern = re.compile(r'\[(?:file|send|attach):\s*([^\]]+)\]')
     files = file_pattern.findall(text)
     clean_text = file_pattern.sub('', text).strip()
+    text_chunks = (len(clean_text) + 3999) // 4000 if clean_text else 0  # ceil; matches the 4000-char send loop
+    delivered_ok = True
+    files_sent = 0
 
     # Send text (if any remains after extracting file refs)
     if clean_text:
         for i in range(0, len(clean_text), 4000):
-            api("sendMessage", chat_id=chat_id, text=clean_text[i:i+4000])
+            resp = api("sendMessage", chat_id=chat_id, text=clean_text[i:i+4000])
+            if not (isinstance(resp, dict) and resp.get("ok")):
+                delivered_ok = False
         try:
             import outbox_log
             outbox_log.append(
@@ -391,8 +439,13 @@ def send_reply(chat_id, text, task_id: str | None = None):
     for fpath in files:
         fpath = fpath.strip()
         if _is_path_sendable(fpath):
-            send_file(chat_id, fpath)
-            print(f"  Sent file: {fpath}")
+            resp = send_file(chat_id, fpath)
+            if isinstance(resp, dict) and resp.get("ok"):
+                files_sent += 1
+                print(f"  Sent file: {fpath}", flush=True)
+            else:
+                delivered_ok = False
+                print(f"  Send file failed: {fpath}", flush=True)
         elif os.path.isfile(fpath):
             api("sendMessage", chat_id=chat_id, text=f"(file access denied: {fpath})")
             print(f"  BLOCKED file: {fpath}")
@@ -402,6 +455,8 @@ def send_reply(chat_id, text, task_id: str | None = None):
             # the user; log for operator visibility on real typos. Same
             # rationale as discord-bridge:poll_results.
             print(f"  file marker, file not found — likely a prose quotation: {fpath}", flush=True)
+
+    return {"text_chunks": text_chunks, "files_sent": files_sent, "ok": delivered_ok}
 
 def _recover_orphan_sending_files() -> int:
     """Restart-safety: rename any orphan `results/proactive-*.sending`
@@ -437,6 +492,100 @@ def _recover_orphan_sending_files() -> int:
     return recovered
 
 
+# --- Opt-in owner progress streaming (Telegram parity with Discord PR #97) ---
+# While a long OWNER task runs, post a `⏳ <step> (Ns)` placeholder and edit it
+# in place from core-status.step, deleting it when the result lands. Reuses the
+# pure policy in progress_stream.py (same thresholds/gates as the Discord bridge).
+# OFF unless SUTANDO_PROGRESS_STREAM=1. Best-effort: any Telegram API error is
+# swallowed so the real result still delivers.
+_progress_msgs: dict = {}        # task_id -> {message_id, chat_id, first, last_edit, last_text} | {"expired": True}
+pending_task_tiers: dict = {}    # task_id -> access_tier; in-memory ONLY → fail-closed on restart
+
+
+def _clear_progress(task_id: str) -> None:
+    """Delete a task's progress placeholder (if any) and drop its tracking.
+    Called when the result is delivered/skipped/given-up so the placeholder
+    doesn't linger next to the real reply."""
+    pending_task_tiers.pop(task_id, None)
+    info = _progress_msgs.pop(task_id, None)
+    if info and info.get("message_id") and info.get("chat_id") is not None:
+        try:
+            api("deleteMessage", chat_id=info["chat_id"], message_id=info["message_id"])
+        except Exception:
+            pass
+
+
+def poll_progress(pending_replies: dict) -> None:
+    """One pass of the progress streamer; called once per main-loop tick.
+    No-op unless SUTANDO_PROGRESS_STREAM=1."""
+    if not progress_stream.stream_enabled():
+        return
+    now = time.time()
+    for task_id, chat_id in list(pending_replies.items()):
+        done = (RESULTS_DIR / f"{task_id}.txt").exists()
+        info = _progress_msgs.get(task_id)
+        if info is not None:
+            if info.get("expired"):
+                continue
+            if done:
+                # Result arrived → remove placeholder; real reply delivers via the loop below.
+                _clear_progress(task_id)
+                continue
+            elapsed = now - info["first"]
+            if progress_stream.placeholder_expired(elapsed):
+                try:
+                    api("deleteMessage", chat_id=chat_id, message_id=info["message_id"])
+                except Exception:
+                    pass
+                _progress_msgs[task_id] = {"expired": True}  # terminal — never re-post
+                continue
+            if progress_stream.should_edit(now, info["last_edit"]):
+                step = progress_stream.current_step(progress_stream.read_core_status(STATE_DIR))
+                text = progress_stream.format_progress(step, elapsed)
+                if text != info.get("last_text"):
+                    try:
+                        api("editMessageText", chat_id=chat_id, message_id=info["message_id"], text=text)
+                    except Exception:
+                        pass
+                    info["last_text"] = text
+                info["last_edit"] = now
+            continue
+        # No placeholder yet for this task.
+        if done:
+            continue  # finished before the threshold — stay silent
+        if task_id not in pending_task_tiers:
+            continue  # tier unknown (e.g. post-restart recovery) → fail-closed, don't stream
+        if not progress_stream.should_stream_task(pending_task_tiers.get(task_id)):
+            continue  # non-owner tier → no placeholder
+        try:
+            created = int(task_id.split("-")[1]) / 1000.0
+        except (ValueError, IndexError):
+            created = now
+        if progress_stream.should_post_placeholder(now - created):
+            step = progress_stream.current_step(progress_stream.read_core_status(STATE_DIR))
+            text = progress_stream.format_progress(step, now - created)
+            resp = api("sendMessage", chat_id=chat_id, text=text)
+            mid = (resp or {}).get("result", {}).get("message_id")
+            if mid:
+                _progress_msgs[task_id] = {
+                    "message_id": mid, "chat_id": chat_id,
+                    "first": created, "last_edit": now, "last_text": text,
+                }
+            else:
+                # Send failed (chat blocked, rate-limited, …). Mark terminal so we
+                # don't re-hammer the API every tick for the rest of the task.
+                _progress_msgs[task_id] = {"expired": True}
+    # GC: drop tracking for tasks no longer pending (delivered through another path).
+    # Sweep BOTH dicts independently — a fast task can have a tier but never a
+    # placeholder, so keying GC only off _progress_msgs would leak its tier.
+    for tid in list(_progress_msgs.keys()):
+        if tid not in pending_replies:
+            _progress_msgs.pop(tid, None)
+    for tid in list(pending_task_tiers.keys()):
+        if tid not in pending_replies:
+            pending_task_tiers.pop(tid, None)
+
+
 def main():
     _single_instance_acquire("telegram-bridge")
     print(f"Telegram bridge started. Polling for messages...", flush=True)
@@ -458,6 +607,17 @@ def main():
             result = api("getUpdates", **params)
         except Exception as e:
             print(f"[Telegram] Poll error: {e}", flush=True)
+            time.sleep(5)
+            continue
+        if not result.get("ok"):
+            # api() collapses an HTTPError (429 rate-limit / 5xx / auth) into
+            # {"ok": False} with no detail. The loop used to fall straight
+            # through and re-poll getUpdates with NO delay — which hammers
+            # Telegram and, on a 429, *extends* its retry_after penalty (seen
+            # in the bridge log as repeated "429 Too Many Requests: retry
+            # after 5"). Back off the same 5s the exception path uses before
+            # the next poll. (The `if result.get("ok")` below is now always
+            # true; kept un-refactored to keep this fix a surgical diff.)
             time.sleep(5)
             continue
         # Heartbeat advances only on a response Telegram actually accepted.
@@ -525,29 +685,89 @@ def main():
                     file_id = msg["voice"]["file_id"]
                     local_path = download_file(file_id, "voice.ogg")
                     if local_path:
-                        attachment_note = f"\n[Voice note attached: {local_path}]"
+                        transcript = _transcribe_via_skill(local_path)
+                        if transcript:
+                            attachment_note = f"\n[Voice transcript: {transcript}]"
+                        else:
+                            attachment_note = f"\n[Voice note attached: {local_path}]"
 
                 if not text and not attachment_note:
                     continue
 
                 forward_note = extract_forward_note(msg)
 
-                print(f"  @{username}{forward_note}: {text}{attachment_note}")
+                print(f"  @{username}{forward_note}: {redact_vault_commands(text)}{attachment_note}")
 
                 # Write as task (same format as voice bridge)
                 ts = int(time.time() * 1000)
                 task_id = f"task-{ts}"
                 task_file = TASKS_DIR / f"{task_id}.txt"
                 priority = default_priority_for_source("telegram", "owner")
+
+                # Intercept vault commands before disk write — Telegram treats
+                # all senders as owner-tier (allowlist-gated bot token).
+                if text:
+                    vault_result = intercept_vault_commands(text)
+                    text = vault_result.text
+                    if vault_result.stored:
+                        print(f"  [vault] stored keys: {vault_result.stored}", flush=True)
+                    if vault_result.failed:
+                        print(f"  [vault] store failed (still redacted): {vault_result.failed}", flush=True)
+
+                # Inject skill instructions so the agent follows notify-before-work
+                # and transcription protocol even after conversation compaction.
+                # Only injected when the referenced skills are installed on this node.
+                # CCD-resolved (PR #1525 pattern): never hardcode ~/.claude — nodes may relocate
+                # the config dir via $CLAUDE_CONFIG_DIR.
+                _claude_config = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
+                _notify_py = _claude_config / "skills/task-progress/scripts/notify.py"
+                _transcribe_py = _claude_config / "skills/audio-transcribe/scripts/transcribe.py"
+                has_audio_attach = attachment_note and any(
+                    attachment_note.lower().find(ext) != -1
+                    for ext in (".m4a", ".mp3", ".ogg", ".opus", ".oga", ".wav", ".webm", ".aac")
+                )
+                tg_skill_hints = ""
+                if _notify_py.exists() or _transcribe_py.exists():
+                    lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
+                    step = 1
+                    if _notify_py.exists():
+                        notify_cmd = (
+                            f"python3 {_notify_py}"
+                            f" --source telegram --chat-id {chat_id}"
+                        )
+                        if has_audio_attach:
+                            lines.append(f'{step}. NOTIFY FIRST: {notify_cmd} --message "Got your voice message, give me a moment."')
+                        else:
+                            lines.append(f'{step}. NOTIFY FIRST (if task takes >60s): {notify_cmd} --message "On it — back in a moment."')
+                        step += 1
+                    if has_audio_attach and _transcribe_py.exists():
+                        attached_path = attachment_note.split("[File attached: ")[-1].rstrip("]").split("\n")[0]
+                        lines.append(f"{step}. TRANSCRIBE: python3 {_transcribe_py} '{attached_path}'")
+                        step += 1
+                    lines.append(f"{step}. Process transcript and write result to results/{task_id}.txt")
+                    tg_skill_hints = "\n" + "\n".join(lines) + "\n"
+
                 task_file.write_text(
                     f"id: {task_id}\n"
                     f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
-                    f"task: [Telegram @{username}{forward_note}] {text}{attachment_note}\n"
+                    f"task: {confine_user_content(f'[Telegram @{username}{forward_note}] {text}{attachment_note}')}\n"
                     f"source: telegram\n"
                     f"chat_id: {chat_id}\n"
                     f"priority: {priority}\n"
+                    f"{tg_skill_hints}"
                 )
                 pending_replies[task_id] = chat_id
+                pending_task_tiers[task_id] = "owner"  # telegram is owner-only (allowlist-gated); enables progress streaming
+                # Observability: one inbound accepted-message event. Source the
+                # tier from the bridge's own assignment above (single source of
+                # truth) rather than re-asserting a literal here.
+                _emit_channel(
+                    "telegram", "in",
+                    user_id=str(chat_id),
+                    channel_id=str(chat_id),
+                    access_tier=pending_task_tiers[task_id],
+                    data={"task_id": task_id, "has_attachment": bool(attachment_note)},
+                )
 
                 # Send typing indicator
                 api("sendChatAction", chat_id=chat_id, action="typing")
@@ -577,6 +797,17 @@ def main():
                 PROACTIVE_PREFIXES = ("proactive-", "briefing-", "insight-", "friction-")
                 for f in RESULTS_DIR.iterdir():
                     if any(f.name.startswith(p) for p in PROACTIVE_PREFIXES) and f.suffix == ".txt":
+                        # Peek before claiming: skip Discord-targeted proactive files.
+                        # [channel: <17-20 digit snowflake>] is a Discord-only marker;
+                        # claiming it here sends the literal text to Telegram DM instead
+                        # of leaving it for discord-bridge. (#1401)
+                        try:
+                            peek = f.read_text(errors="ignore").lstrip()
+                        except OSError:
+                            continue
+                        if peek.startswith("[channel:") and \
+                                re.match(r'\[channel:\s*\d{17,20}\]', peek):
+                            continue
                         # Claim-by-rename: atomic move to a `.sending`
                         # suffix before reading, so a concurrent poll
                         # (same bridge, or a race with discord-bridge)
@@ -613,13 +844,28 @@ def main():
                             f.unlink(missing_ok=True)
                             continue
                         try:
-                            send_reply(int(owner_id), text)
+                            _s = send_reply(int(owner_id), text)
+                            if _s["text_chunks"] or _s["files_sent"]:
+                                _emit_channel(
+                                    "telegram", "out",
+                                    user_id=str(owner_id),
+                                    channel_id=str(owner_id),
+                                    access_tier="owner",  # proactive → owner
+                                    outcome="ok" if _s["ok"] else "error",
+                                    data={"text_chunks": _s["text_chunks"], "file_count": _s["files_sent"]},
+                                )
                             print(f"  [proactive] sent to {owner_id}: {text[:80]}")
                         except Exception as e:
                             print(f"  [proactive] failed: {e}")
                         f.unlink(missing_ok=True)
         except Exception as e:
             print(f"  [proactive] poll error: {e}")
+
+        # Opt-in: stream live progress for long owner tasks (no-op unless enabled).
+        try:
+            poll_progress(pending_replies)
+        except Exception as e:
+            print(f"[Telegram] poll_progress error: {e}", flush=True)
 
         # Check for results to send back
         for task_id in list(pending_replies.keys()):
@@ -628,25 +874,62 @@ def main():
                 reply_text = result_file.read_text().strip()
                 chat_id = pending_replies.pop(task_id)
                 # Parse markers via the unified module (#873). Telegram
-                # honors [no-send] / [REPLIED] / [deduped: <id>] as skip
-                # and strips file markers from the text it sends. It
-                # ignores [channel:] redirects (no concept in Telegram —
-                # the marker is silently dropped from body, not leaked).
+                # honors [no-send] / [REPLIED] / [deduped: <id>] as skip,
+                # sends attached files, and silently drops [channel:] redirects
+                # (no concept in Telegram). Pass parsed.body so NO marker ever
+                # leaks as literal text in the user's DM (#1381).
                 parsed = parse_markers(reply_text)
                 if any(a.kind == "skip" for a in parsed.actions):
                     print(f"  Skipped (marker): {task_id}", flush=True)
+                    _clear_progress(task_id)  # remove any progress placeholder + tier tracking
                     archive_file(result_file, "results", task_id)
                     task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
                     archive_file(task_file, "tasks", task_id)
                     continue
                 try:
-                    send_reply(chat_id, reply_text, task_id=task_id)
-                    print(f"  Replied to {chat_id}: {reply_text[:80]}...", flush=True)
+                    # Use parsed.body — all markers stripped — so [channel:] etc. never leak.
+                    # File attachments are in parsed.actions; send_reply() won't re-find them,
+                    # so send them here and fold the result into ONE obs event below.
+                    _tier = pending_task_tiers.get(task_id, "unknown")
+                    _s = send_reply(chat_id, parsed.body, task_id=task_id)
+                    delivered_ok = _s["ok"]
+                    sent_files = _s["files_sent"]
+                    for action in parsed.actions:
+                        if action.kind == "attach":
+                            fpath = action.value.strip()
+                            if _is_path_sendable(fpath):
+                                resp = send_file(chat_id, fpath)
+                                if isinstance(resp, dict) and resp.get("ok"):
+                                    sent_files += 1
+                                    print(f"  Sent file: {fpath}", flush=True)
+                                else:
+                                    delivered_ok = False
+                                    print(f"  Send file failed: {fpath}", flush=True)
+                            elif os.path.isfile(fpath):
+                                api("sendMessage", chat_id=chat_id, text=f"(file access denied: {fpath})")
+                                print(f"  BLOCKED file: {fpath}")
+                            else:
+                                print(f"  file marker, file not found — likely a prose quotation: {fpath}", flush=True)
+                    # Observability: one delivered-reply event covering text +
+                    # externally-sent attachments. outcome reflects real success;
+                    # file_count is files actually delivered (api/send_file swallow
+                    # errors, so we must not assume "ok").
+                    if _s["text_chunks"] or sent_files or not delivered_ok:
+                        _emit_channel(
+                            "telegram", "out",
+                            user_id=str(chat_id),
+                            channel_id=str(chat_id),
+                            access_tier=_tier,
+                            outcome="ok" if delivered_ok else "error",
+                            data={"task_id": task_id, "text_chunks": _s["text_chunks"], "file_count": sent_files},
+                        )
+                    print(f"  Replied to {chat_id}: {parsed.body[:80]}...", flush=True)
                 except Exception as e:
                     print(f"[Telegram] Reply error: {e}", flush=True)
+                _clear_progress(task_id)  # remove any progress placeholder + tier tracking
                 # Archive (not delete) so we can mine patterns later.
                 archive_file(result_file, "results", task_id)
-                task_file = TASKS_DIR / f"{task_id}.txt"
+                task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
                 archive_file(task_file, "tasks", task_id)
 
         time.sleep(1)

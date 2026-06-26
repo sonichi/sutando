@@ -5,6 +5,7 @@ Sutando reminders — read/write macOS Reminders via AppleScript.
 Usage:
   python3 src/reminders.py list                              # all incomplete reminders
   python3 src/reminders.py list --all                        # include completed
+  python3 src/reminders.py list --due-today                  # only today's + overdue
   python3 src/reminders.py add "Buy groceries"               # add to default list
   python3 src/reminders.py add "Call Bob" "2026-03-17"       # add with due date
   python3 src/reminders.py add "Fix bug" "" "Work"           # add to specific list
@@ -17,6 +18,7 @@ import re
 import subprocess
 import sys
 import time
+from datetime import datetime
 
 _app_launched = False
 
@@ -96,6 +98,20 @@ end tell
     return reminders
 
 
+_APPLESCRIPT_DATE_FMT = "%A, %B %d, %Y at %I:%M:%S %p"
+
+
+def _is_due_today_or_overdue(due_str: str) -> bool:
+    """Return True if due_str (AppleScript date format) is today or in the past."""
+    if not due_str:
+        return False
+    try:
+        due_date = datetime.strptime(due_str, _APPLESCRIPT_DATE_FMT).date()
+        return due_date <= datetime.now().date()
+    except ValueError:
+        return False
+
+
 def add_reminder(name: str, due_date: str = "", list_name: str = "") -> str:
     target = f'list "{list_name}"' if list_name else "default list"
     due_clause = ""
@@ -147,12 +163,18 @@ def main():
 
     elif cmd == "list":
         include_all = "--all" in sys.argv
+        due_today = "--due-today" in sys.argv
         reminders = list_reminders(include_completed=include_all)
         if not reminders:
             print("No reminders.")
             return
         if reminders and "error" in reminders[0]:
-            print(f"Error: {reminders[0]['error']}")
+            print(f"Error: {reminders[0]['error']}", file=sys.stderr)
+            sys.exit(1)
+        if due_today:
+            reminders = [r for r in reminders if _is_due_today_or_overdue(r["due"])]
+        if not reminders:
+            print("No reminders.")
             return
         for r in reminders:
             done = " [DONE]" if r["completed"] else ""

@@ -22,9 +22,13 @@ Any code that needs to read or write inside the host CLI's home directory should
 - **Python:** `claude_home_path(*subpath)` in `src/util_paths.py`.
 - **TypeScript:** `claudeHomePath(...subpath)` exported from `src/util_paths.ts`.
 
-Both honor `$CLAUDE_HOME` for tests + alt-host installs, else default to the current host CLI's known per-user home.
+Both honor `$CLAUDE_CONFIG_DIR` first (workspace-scoped path used by claude-sutando), then `$CLAUDE_HOME` (legacy alt-host override), else default to the current host CLI's known per-user home.
 
 The point of the helper is *grep-counting*: one canonical resolver means a future host-CLI swap is a 1-day grep+replace rather than a re-architecture. Don't reach for `~/.claude/`-relative paths directly — always go through `claude_home_path()` / `claudeHomePath()` so the dependency surface stays countable.
+
+### Read-side companion: `$SOURCE_CLAUDE_CONFIG_DIR`
+
+Migration code (`scripts/sutando-shell-setup.sh --migrate`, `src/migrate.sh`) reads FROM a historically-vanilla state location and writes TO `$CLAUDE_CONFIG_DIR`. To keep that direction visible, migration scripts honor `${SOURCE_CLAUDE_CONFIG_DIR:-$HOME/.claude}` for their source path. The default matches the canonical vanilla-claude location; override for CI fixtures, custom installs, or staging tests that need a different source. `claude_home_path()` does NOT consult this — it's a migration-script convention, not a runtime resolver.
 
 If you're adding code that touches a new surface (not currently in the table above), update this doc with the new surface + its re-bind cost. The taxonomy is the value here, not the row count.
 

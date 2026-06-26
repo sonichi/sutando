@@ -76,7 +76,7 @@ def case_b_on_demand_only_no_send() -> list[str]:
         state = Path(td) / "slack.json"
         hc.notify_slack_for_failures(
             make_checks(
-                ("warn", "discord-voice", "not running (on-demand)"),
+                ("warn", "plugin-server", "not running (on-demand)"),
                 ("warn", "conversation-server", "not running (on-demand)"),
             ),
             state_file=state, sender=send,
@@ -90,7 +90,7 @@ def case_c_filter_keeps_actionable() -> list[str]:
     fails = []
     checks = make_checks(
         ("warn", "core-proactive-loop", "running for 900s on 'triage' — last heartbeat > 600s ago"),
-        ("warn", "discord-voice", "not running (on-demand)"),
+        ("warn", "plugin-server", "not running (on-demand)"),
         ("warn", "task-queue", "5 tasks queued, oldest 700s — watcher or core may be stuck"),
         ("down", "voice-agent", "port 9900"),
         ("ok", "web-client", "port 3100"),
@@ -191,7 +191,7 @@ def case_h_history_pruned_after_24h() -> list[str]:
 
 def case_i_token_read_prefers_channel_env() -> list[str]:
     """Regression: the watchdog read SLACK_BOT_TOKEN from $REPO/.env only, but
-    the bridge keeps it in ~/.claude/channels/slack/.env (startup.sh sources
+    the bridge keeps it in $CLAUDE_CONFIG_DIR/channels/slack/.env (startup.sh sources
     exactly that). On a standard install $REPO/.env has no token, so creds
     resolved to None and the DM silently no-op'd — the watchdog looked
     installed but never fired. Token resolution must check the channel .env

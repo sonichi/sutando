@@ -44,6 +44,7 @@ REPO = Path(__file__).resolve().parent.parent
 # paths at module-load time.
 _WORKSPACE_TMP = tempfile.mkdtemp(prefix="sutando-dm-catchup-test-")
 os.environ["SUTANDO_WORKSPACE"] = _WORKSPACE_TMP
+os.environ["SUTANDO_TEST_MODE"] = "1"  # v0.8: opt-in env-honor
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token-not-real")
 (Path(_WORKSPACE_TMP) / "state").mkdir(parents=True, exist_ok=True)
 

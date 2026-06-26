@@ -34,8 +34,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
 
-# results/ is per-user runtime state — lives under $SUTANDO_WORKSPACE
-# (default ~/.sutando/workspace/), not the repo checkout. Pre-#762 this
+# results/ is per-user runtime state — lives under the resolved workspace
+# (post-v0.8 default `<repo>/workspace/`; configurable via
+# `sutando.config.local.json`), not the repo checkout. Pre-#762 this
 # resolved to <repo>/results/ which doesn't exist post-migration; the
 # archiver silently no-op'd because `if not RESULTS.is_dir()` short-circuits
 # the whole sweep. The DM-flood prevention this script was built for was

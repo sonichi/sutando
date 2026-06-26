@@ -13,10 +13,12 @@ Output: results/friction-{date}.txt
 
 import json
 import os
+import re
 import sys
 import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
 from util_paths import personal_path, shared_personal_path  # noqa: E402
@@ -29,15 +31,10 @@ RESULTS_DIR = WORKSPACE / "results"
 def check_pending_questions():
     """Find questions unanswered for >24h.
 
-    pending-questions.md uses sections like:
-        ## Question Title
-        - **Asked:** 2026-04-06
-        - **Question:** ...
-        - **Status:** unanswered
-
-    A previous version of this parser looked for lines starting with `- [`
-    which never matched the actual format, so it always returned an empty
-    list and friction-detector silently missed every unanswered question.
+    pending-questions.md is free-form: sections start with ## Title and
+    may or may not carry **Status:** markers. Per the #1265 / #1404
+    convention: a section is open unless it is explicitly resolved.
+    Sections above a `# Resolved` divider are ignored entirely.
     """
     pq = Path(personal_path("pending-questions.md", WORKSPACE))
     if not pq.exists():
@@ -46,26 +43,38 @@ def check_pending_questions():
     if "(No pending questions)" in content or not content.strip():
         return []
 
+    # Discard resolved section (below a `# Resolved` / `# Done` divider).
+    content = re.split(r'^#\s+(?:Resolved|Done)\b', content, maxsplit=1, flags=re.MULTILINE)[0]
+
+    _RESOLVED_STATUS = re.compile(
+        r'\*\*Status:\*\*\s*(?:resolved|answered|done|complete)',
+        re.IGNORECASE,
+    )
+
     issues = []
     today = datetime.now().date()
+    current_title: Optional[str] = None
+    current_asked: Optional[str] = None
+    current_body_lines: list = []
 
-    # Walk sections — each starts with `## Title`. Inside the section, look
-    # for `Status: unanswered` and an `Asked:` date.
-    current_title = None
-    current_asked = None
-    current_status = None
-
-    def flush():
-        if current_title and current_status == "unanswered":
-            age_str = ""
-            if current_asked:
-                try:
-                    asked_date = datetime.fromisoformat(current_asked).date()
-                    age_days = (today - asked_date).days
-                    age_str = f" ({age_days}d old)"
-                except ValueError:
-                    pass
-            issues.append(f"Pending question unanswered{age_str}: {current_title[:80]}")
+    def flush() -> None:
+        if not current_title:
+            return
+        body = "\n".join(current_body_lines)
+        # Skip explicitly resolved sections.
+        if _RESOLVED_STATUS.search(body):
+            return
+        age_str = ""
+        if current_asked:
+            try:
+                asked_date = datetime.fromisoformat(current_asked).date()
+                age_days = (today - asked_date).days
+                if age_days < 1:
+                    return  # not stale yet
+                age_str = f" ({age_days}d old)"
+            except ValueError:
+                pass
+        issues.append(f"Pending question unanswered{age_str}: {current_title[:80]}")
 
     for line in content.split("\n"):
         stripped = line.strip()
@@ -73,21 +82,16 @@ def check_pending_questions():
             flush()
             current_title = stripped[3:].strip()
             current_asked = None
-            current_status = None
+            current_body_lines = []
             continue
-        # Match `- **Asked:** 2026-04-06`
-        if "**Asked:**" in stripped:
-            try:
-                current_asked = stripped.split("**Asked:**", 1)[1].strip().split()[0]
-            except IndexError:
-                pass
-        # Match `- **Status:** unanswered`
-        if "**Status:**" in stripped:
-            try:
-                current_status = stripped.split("**Status:**", 1)[1].strip().lower().split()[0]
-            except IndexError:
-                pass
-    flush()  # don't forget the last section
+        if current_title is not None:
+            current_body_lines.append(stripped)
+            if "**Asked:**" in stripped:
+                try:
+                    current_asked = stripped.split("**Asked:**", 1)[1].strip().split()[0]
+                except IndexError:
+                    pass
+    flush()
 
     return issues
 

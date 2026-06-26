@@ -9,10 +9,11 @@
  */
 
 import { writeFileSync, readFileSync, existsSync, unlinkSync, mkdirSync, readdirSync, appendFileSync, renameSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from './workspace_default.js';
+import { claudeHomePath } from './util_paths.js';
 import { recordConversation, recordSessionBoundary } from './conversation-store.js';
 
 const REPO_DIR = resolveWorkspace();
@@ -170,7 +171,7 @@ export function _isVoiceTask(taskId: string): boolean {
  * (issue #1035, follow-up to PR #1033). Returns true iff the filename is one
  * that task-bridge legitimately delivers via `onResult()`. Rejects everything
  * else — most importantly, the new `<channel-key>.task-{id}.txt` namespace
- * PR #1033 introduced for the per-channel pull path (discord-voice / phone),
+ * PR #1033 introduced for the per-channel pull path (phone / plugin surfaces),
  * which the per-channel scanner consumes itself.
  *
  * `proactive-*` IS allowed: per the long-standing proactive-voice rule,
@@ -251,11 +252,14 @@ export const workTool: ToolDefinition = {
 		const concatMatch = /\b(prepend|concatenat|concat|image.*video|video.*image)\b/i.test(task);
 		if (concatMatch) {
 			try {
-				const { execSync } = await import('node:child_process');
-				const image = execSync('ls -t /tmp/discord-inbox/*.jpg /tmp/discord-inbox/*.png 2>/dev/null | head -1', { timeout: 3000 }).toString().trim();
-				const video = execSync('ls -t /tmp/sutando-recording-*-narrated-subtitled.mov /tmp/sutando-recording-*-narrated.mov /tmp/sutando-recording-*.mov 2>/dev/null | head -1', { timeout: 3000 }).toString().trim();
+				const { execFileSync } = await import('node:child_process');
+				// ls globs need shell for wildcard expansion — command strings are static literals (fixes #1451)
+				const image = execFileSync('/bin/sh', ['-c', 'ls -t /tmp/discord-inbox/*.jpg /tmp/discord-inbox/*.png 2>/dev/null | head -1'], { timeout: 3000 }).toString().trim();
+				const video = execFileSync('/bin/sh', ['-c', 'ls -t /tmp/sutando-recording-*-narrated-subtitled.mov /tmp/sutando-recording-*-narrated.mov /tmp/sutando-recording-*.mov 2>/dev/null | head -1'], { timeout: 3000 }).toString().trim();
 				if (image && video) {
-					const result = execSync(`bash ~/.claude/skills/video-concat/scripts/prepend-image.sh "${image}" "${video}" 3`, { timeout: 60000 }).toString().trim();
+					// execFileSync argv array bypasses shell — image/video paths are separate args, no interpolation (fixes #1451)
+					const scriptPath = resolve(claudeHomePath('skills', 'video-concat', 'scripts', 'prepend-image.sh'));
+					const result = execFileSync('bash', [scriptPath, image, video, '3'], { timeout: 60000 }).toString().trim();
 					const parsed = JSON.parse(result);
 					return { status: 'done', result: `Video with image prepended: ${parsed.output} (${parsed.size_mb}MB)` };
 				}
@@ -265,8 +269,9 @@ export const workTool: ToolDefinition = {
 		// Check if the watcher (Claude Code brain) is running
 		let watcherOnline = false;
 		try {
-			const { execSync } = await import('node:child_process');
-			const watcherRunning = execSync('pgrep -f "watch-tasks" 2>/dev/null', { encoding: 'utf-8' }).trim();
+			const { execFileSync } = await import('node:child_process');
+			// execFileSync argv array — no shell interpolation (fixes #1451)
+			const watcherRunning = execFileSync('pgrep', ['-f', 'watch-tasks'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
 			watcherOnline = !!watcherRunning;
 		} catch {
 			// pgrep returns exit code 1 if no match
@@ -702,6 +707,30 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 					}, 5_000);
 					continue;
 				}
+				// Skip markers: [no-send] / [REPLIED] — archive silently with no voice narration.
+				// These are set by the core agent when delivery already happened via another path
+				// (e.g. Discord bridge already replied) or the result should be suppressed entirely.
+				// Parity with Python bridges: discord-bridge.py and telegram-bridge.py both honor
+				// these via parse_markers(); task-bridge.ts must too (issue #1381).
+				if (file.startsWith('task-') && /^\s*\[(?:no-send|REPLIED)\]/i.test(result)) {
+					console.log(`${ts()} [TaskBridge] ${taskId} has skip marker; archiving silently`);
+					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
+					_deliveredResults.add(file);
+					_pendingTasks.delete(taskId);
+					try {
+						fetch('http://localhost:7843/task-done', {
+							method: 'POST',
+							headers: _apiHeaders(),
+							body: JSON.stringify({ taskId, result }),
+						}).catch(() => {});
+					} catch {}
+					setTimeout(() => {
+						archiveFile(path, 'results', taskId);
+						const taskFile = join(TASK_DIR, `${taskId}.txt`);
+						if (existsSync(taskFile)) archiveFile(taskFile, 'tasks', taskId);
+					}, 5_000);
+					continue;
+				}
 				// Voice client offline → forward voice-task results to Discord DM
 				// via a proactive-result-*.txt file (poll_proactive in
 				// discord-bridge.py picks it up and DMs the owner). Skips files
@@ -768,7 +797,7 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 				// the fallthrough below fires onResult() for any non-empty .txt
 				// when the voice client is connected. PR #1033 introduced a new
 				// filename namespace `<channel-key>.task-{id}.txt` for the
-				// per-channel pull path used by discord-voice / phone — those
+				// per-channel pull path used by phone / plugin surfaces — those
 				// files are NOT meant for task-bridge to inject into voice.
 				// PR #1033's mitigation is the per-channel scanner's
 				// read-and-delete winning the race; this guard closes the

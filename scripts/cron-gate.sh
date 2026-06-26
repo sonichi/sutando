@@ -8,11 +8,11 @@
 # Usage:
 #   bash scripts/cron-gate.sh <reason> <command...>
 #
-#   - <reason>: short label printed in the deferral message (e.g. "sync-memory")
+#   - <reason>: short label printed in the deferral message (e.g. "sync-workspace")
 #   - <command...>: the actual command to run if the queue is empty
 #
 # Example crons.example.json entry:
-#   "prompt": "Run: bash scripts/cron-gate.sh sync-memory bash scripts/sync-memory.sh"
+#   "prompt": "Run: bash scripts/cron-gate.sh sync-workspace bash scripts/sync-workspace.sh"
 #
 # Exit codes:
 #   0 — either deferred (queue non-empty) OR the wrapped command exited 0
@@ -27,17 +27,9 @@ if [ $# -lt 2 ]; then
   exit 2
 fi
 
-# Workspace resolution: prefer the M0 helper if present (post-PR-#1395), fall
-# back to the legacy ${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace} default so
-# this script also works on main pre-rollup. Keep both paths — the helper-check
-# is cheap and the fallback is the right default for fleet hosts pre-M0.
+# Workspace resolution via the canonical M0 helper (PR #1395).
 SCRIPT_PARENT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-if [ -f "$SCRIPT_PARENT/scripts/sutando-config.sh" ]; then
-  WORKSPACE="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" workspace 2>/dev/null || true)"
-fi
-if [ -z "${WORKSPACE:-}" ]; then
-  WORKSPACE="${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}"
-fi
+WORKSPACE="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" workspace)"
 
 reason="$1"
 shift

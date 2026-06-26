@@ -7,8 +7,8 @@ task-bridge / agent-api) all key off that name (specific task_id or
 
 NEW namespace — ``results/<channel-key>.task-{id}.txt`` — is used ONLY
 when a task result needs to reach a non-delegating pull consumer (today:
-discord-voice and phone). A ``.``-prefixed filename slides past the
-existing consumers' patterns because none of their startswith / glob /
+phone, plus any pull-side plugin surface). A ``.``-prefixed filename slides
+past the existing consumers' patterns because none of their startswith / glob /
 pending-id lookups match the channel-key prefix.
 
 Twin of ``src/result-channel-key.ts`` — keep in sync if a TS writer changes.
@@ -88,14 +88,9 @@ def result_belongs_to(filename: str, channel_key: str) -> bool:
 # ── Typed channel-key constructors ────────────────────────────────────────
 # Per-consumer prefixes make key-namespace collisions impossible across
 # future consumer types: a hypothetical new pull surface whose ID format
-# happens to be pure digits (like a Discord VC snowflake) cannot accidentally
-# claim a ``dvoice-*`` filename. Writer and consumer MUST go through the same
-# constructor so the keys agree. Keep symmetric with ``src/result-channel-key.ts``.
-
-
-def discord_voice_key(vc_id: Optional[str]) -> str:
-    """Channel key for the discord-voice consumer. Wraps a Discord voice-channel id."""
-    return f"dvoice-{sanitize_key(vc_id)}"
+# happens to be pure digits (like a chat snowflake) cannot accidentally claim
+# another consumer's prefixed filename. Writer and consumer MUST go through the
+# same constructor so the keys agree. Keep symmetric with ``src/result-channel-key.ts``.
 
 
 def phone_call_key(call_sid: Optional[str]) -> str:

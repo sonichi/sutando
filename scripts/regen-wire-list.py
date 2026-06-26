@@ -245,6 +245,15 @@ def main():
     )
     args = ap.parse_args()
 
+    if not os.environ.get("YOUTUBE_API_KEY"):
+        # Optional enrichment job: with no API key configured there is nothing
+        # to regen. Skip cleanly (exit 0) instead of hard-failing — the
+        # scheduled workflow runs on every fork, and a fork without the secret
+        # set should not email a failure notification every day. The downstream
+        # "Open PR if changed" step then sees no diff and no-ops.
+        print("YOUTUBE_API_KEY not set — skipping WIRE list regen (no-op).")
+        return
+
     uploads_playlist = resolve_uploads_playlist(PLAYLIST_ID)
     items = fetch_playlist_videos(uploads_playlist)
     if not items:

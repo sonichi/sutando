@@ -189,6 +189,93 @@ def parse_markers(text: str) -> ParseResult:
     return ParseResult(body=body, actions=actions)
 
 
+_TASK_CHANNEL_RE = re.compile(r"^channel_id:\s*(\S+)\s*$", re.MULTILINE)
+
+
+def dedup_cross_channel_target(deduped_channel_id, holder_task_text: str | None) -> str | None:
+    """Channel-aware dedup support.
+
+    A `[deduped: task-X]` result silently archives the deduped task and
+    relies on the holder task-X carrying the full reply. But the holder's
+    reply is delivered to *its own* channel — so when the deduped task and
+    the holder came from DIFFERENT channels, the channel that actually asked
+    is left silent while the answer lands elsewhere (observed 2026-06-22: an
+    owner question in #workspace-revamp folded into a #design holder).
+
+    Returns the holder's `channel_id` when it is known AND differs from the
+    deduped task's own channel — a cross-channel dedup, which is INVALID
+    (dedup is per-channel only). The bridge rejects it and re-queues the
+    original task to be re-answered in its own channel. Returns None (→ keep
+    the silent-archive behavior) when the holder text is missing, has no
+    channel_id, or is the SAME channel (the common, correct intra-channel
+    consolidation case).
+    """
+    if not holder_task_text:
+        return None
+    m = _TASK_CHANNEL_RE.search(holder_task_text)
+    if not m:
+        return None
+    holder_channel = m.group(1).strip()
+    if holder_channel and str(holder_channel) != str(deduped_channel_id):
+        return holder_channel
+    return None
+
+
+_REQUEUE_COUNT_RE = re.compile(r"^dedup_requeue_count:\s*(\d+)\s*$", re.MULTILINE)
+
+
+def dedup_requeue_count(task_text: str | None) -> int:
+    """How many times this task has already been re-queued after a rejected
+    cross-channel dedup. 0 if the field is absent. Used as the loop guard:
+    a task that comes back cross-channel-deduped with count >= 1 is NOT
+    re-queued again — the bridge notifies instead (owner-directed: "second
+    time, send a msg about this error")."""
+    if not task_text:
+        return 0
+    m = _REQUEUE_COUNT_RE.search(task_text)
+    return int(m.group(1)) if m else 0
+
+
+def build_requeued_task(
+    orig_text: str, new_task_id: str, count: int, asking_channel, holder_id: str
+) -> str:
+    """Rewrite an original task for re-processing after a REJECTED cross-channel
+    dedup. Keeps the original fields (channel_id, access_tier, source, body, …)
+    so it routes + tiers identically, but:
+      * sets `id:` to new_task_id (so the watcher re-fires),
+      * sets `dedup_requeue_count: count` (loop guard),
+      * appends a trusted `===SUTANDO SYSTEM INSTRUCTIONS===` block telling the
+        core the prior dedup was cross-channel (invalid) and to answer THIS
+        task directly in its own channel, not dedup across channels.
+
+    The appended fence is bridge-authored (trusted). Its safety relies on the
+    original user body already being confined at first-write time
+    (task_body_guard / PR #1743) so a sender can't have pre-forged their own
+    fence inside the body.
+    """
+    lines = []
+    seen_count = False
+    for ln in (orig_text or "").rstrip("\n").split("\n"):
+        if ln.startswith("id:"):
+            lines.append(f"id: {new_task_id}")
+        elif ln.startswith("dedup_requeue_count:"):
+            lines.append(f"dedup_requeue_count: {count}")
+            seen_count = True
+        else:
+            lines.append(ln)
+    if not seen_count:
+        lines.append(f"dedup_requeue_count: {count}")
+    note = (
+        "\n===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"
+        f"Your previous result used [deduped: {holder_id}], but that holder task is in a "
+        f"DIFFERENT channel. Dedup is per-channel only — a cross-channel dedup leaves this "
+        f"channel silent. Re-answer THIS task directly in its own channel (<#{asking_channel}>). "
+        "Do NOT [deduped:] across channels.\n"
+        "===END SUTANDO SYSTEM INSTRUCTIONS===\n"
+    )
+    return "\n".join(lines) + note
+
+
 def first_action(result: ParseResult, kind: ActionKind) -> Action | None:
     """Convenience: return the first action of the given kind, or None.
 

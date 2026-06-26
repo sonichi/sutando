@@ -59,16 +59,33 @@ fi
 
 limit="${last:-200}"
 
+# Per-surface transcript tables (voice/phone + any plugin-registered surface),
+# discovered dynamically so this tool names no specific plugin. A surface table
+# carries the ts_unix/kind/text/session_id schema and isn't a rollup/legacy table.
+surface_tables=$(sqlite3 "$DB" "
+  SELECT m.name FROM sqlite_master m
+  WHERE m.type='table'
+    AND m.name NOT IN ('sessions','session_events','conversation','tool_calls')
+    AND (SELECT COUNT(*) FROM pragma_table_info(m.name) ti
+         WHERE ti.name IN ('ts_unix','kind','text','session_id')) = 4;
+")
+
+union_sql=""
+for t in $surface_tables; do
+	[[ -n "$union_sql" ]] && union_sql="$union_sql UNION ALL "
+	union_sql="$union_sql SELECT ts_unix, kind, text, session_id FROM $t"
+done
+if [[ -z "$union_sql" ]]; then
+	echo "(no per-surface transcript tables found in $DB)"
+	exit 0
+fi
+
 sqlite3 -separator $'\t' "$DB" "
 SELECT datetime(ts_unix, 'unixepoch', 'localtime') AS ts,
        kind AS role,
        substr(text, 1, 200) AS text_preview
 FROM (
-  SELECT ts_unix, kind, text, session_id FROM voice
-  UNION ALL
-  SELECT ts_unix, kind, text, session_id FROM phone
-  UNION ALL
-  SELECT ts_unix, kind, text, session_id FROM discord_voice
+  $union_sql
 )
 $where_clause
 ORDER BY ts_unix DESC

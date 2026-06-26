@@ -19,14 +19,12 @@ Usage:
 """
 from __future__ import annotations
 
-import argparse, datetime, json, os, re, shutil, subprocess, sys, time
+import argparse, datetime, json, re, shutil, subprocess, sys, time
 from pathlib import Path
 
 REPO = "sonichi/sutando"
 REPO_URL = f"https://github.com/{REPO}.git"
 ISSUE_LABEL = "use-case-submission"
-CLA_EMAIL = "4250911+sonichi@users.noreply.github.com"
-CLA_NAME = "Chi Wang"
 
 # Capability-framed patterns to reject (verbatim from add-use-case).
 # Outcome-framed titles state what the USER achieves, not what the AI does.
@@ -81,21 +79,22 @@ def suggest_reframes(title: str) -> list[str]:
     ]
 
 
-# --- identity detection -----------------------------------------------------
-def is_chi_fleet() -> bool:
-    """Detect whether the runner is on Chi's Sutando fleet.
+# --- identity (read-only; never overridden) ---------------------------------
+def committer_identity(clone_dir: str | None = None) -> tuple[str, str]:
+    """Return the (name, email) git will attribute the commit to — the runner's
+    EXISTING git config, which this script never overrides.
 
-    Two signals (either suffices):
-      1. /Users/wangchi/.sutando/workspace/ exists (canonical fleet workspace)
-      2. SUTANDO_FLEET_OWNER env var equals 'chi'
-
-    Default behavior off-fleet: DON'T touch git config. OSS contributors must
-    sign the CLA under their own identity — that's the whole point of the
-    CLA-Assistant channel.
+    No owner-detection: the maintainer's own machine already has the CLA-signed
+    identity in its global git config, and OSS contributors MUST commit under
+    their own email so they sign their own CLA (the whole point of the
+    CLA-Assistant channel). The script just surfaces the identity (and fails loud
+    if it's unset) so attribution can't silently go out wrong.
     """
-    if os.environ.get("SUTANDO_FLEET_OWNER", "").lower() == "chi":
-        return True
-    return Path("/Users/wangchi/.sutando/workspace").exists()
+    base = ["git"] + (["-C", clone_dir] if clone_dir else [])
+    def _get(key: str) -> str:
+        r = subprocess.run(base + ["config", key], capture_output=True, text=True)
+        return r.stdout.strip()
+    return _get("user.name"), _get("user.email")
 
 
 # --- idempotency probes -----------------------------------------------------
@@ -305,8 +304,8 @@ def main():
         print(f"--- PR FILE (docs/community-use-cases/{slug}.md) ---")
         print(pr_file_text)
         print("--- END PR FILE ---")
-        on_fleet = is_chi_fleet()
-        print(f"identity: {'Chi-fleet override (would set CLA email)' if on_fleet else 'OSS submitter (would NOT touch git config)'}")
+        _nm, _em = committer_identity()
+        print(f"identity: would commit as {_nm or '(unset)'} <{_em or '(unset)'}> — your existing git config, never overridden. Ensure it's the identity you want on the CLA.")
         print(f"DRY RUN — staged in memory only, no clone/issue/PR")
         return
 
@@ -341,16 +340,16 @@ def main():
         print(f"cloning into {clone_dir} ...")
         run(["gh", "repo", "clone", REPO, str(clone_dir), "--", "--depth", "1"])
 
-        if is_chi_fleet():
-            # Internal demo submission: set CLA-signed identity locally so the
-            # commit is attributed to the same account that signed the CLA.
-            run(["git", "-C", str(clone_dir), "config", "user.email", CLA_EMAIL])
-            run(["git", "-C", str(clone_dir), "config", "user.name", CLA_NAME])
-            print("identity: Chi-fleet override applied")
-        else:
-            # OSS contributor: respect their own git identity so the CLA signs
-            # under THEIR email. This is the whole point of the OSS channel.
-            print("identity: OSS submitter (leaving git config alone)")
+        # Identity is NEVER overridden — the commit is attributed to the runner's
+        # existing git config. On the maintainer's machine that is already the
+        # CLA-signed identity; OSS contributors commit under their own email so
+        # they sign their own CLA. Surface it (so attribution can't silently go
+        # out wrong) and fail loud rather than letting git commit with no author.
+        _nm, _em = committer_identity(str(clone_dir))
+        if not _nm or not _em:
+            die("git user.name / user.email is not set — configure git before "
+                "submitting (the commit's author is what signs the CLA).")
+        print(f"identity: committing as {_nm} <{_em}> (your existing git config; not overridden)")
 
         run(["git", "-C", str(clone_dir), "checkout", "-b", branch])
 

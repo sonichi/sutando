@@ -34,8 +34,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from workspace_default import resolve_workspace  # noqa: E402
 
-# DB + jsonl archives live under the resolved workspace (~/.sutando/workspace),
-# the same tree the runtime writers use — not the repo root.
+# DB + jsonl archives live under the resolved workspace (post-M0 default
+# `<repo>/workspace/`; configurable via `sutando.config.local.json`), the same
+# tree the runtime writers use — not the repo root.
 WORKSPACE = resolve_workspace(migrate=False)
 DEFAULT_VOICE = WORKSPACE / "data" / "voice-metrics.jsonl"
 DEFAULT_CALL = WORKSPACE / "data" / "call-metrics.jsonl"
@@ -46,7 +47,6 @@ DEFAULT_DB = Path(os.environ.get("SUTANDO_CONVERSATION_DB", WORKSPACE / "data" /
 _LIVE_WRITER_PATTERNS = [
     ("voice-agent.ts", "voice-agent"),
     ("conversation-server.ts", "phone conversation-server"),
-    ("discord-voice-server.ts", "discord-voice"),
 ]
 
 

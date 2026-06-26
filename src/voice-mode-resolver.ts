@@ -17,7 +17,7 @@
 //   3. `voice-mode.txt` on disk — NOT READ here. It is the WRITE-ONLY
 //      output mirror of `meetingActive`, written by writeVoiceModeSentinel()
 //      whenever meetingActive changes. Downstream consumers (web-client,
-//      Sutando.app menu-bar, discord-voice-server) read it. Reading it here
+//      Sutando.app menu-bar, plugin voice servers) read it. Reading it here
 //      would re-read our own output — same source as #1, one hop later.
 //   4. `activeMode` in skills/screen-companion/tools.ts — NOT READ here.
 //      Orthogonal sub-mode that overlays the base; not a base mode itself.
@@ -28,7 +28,7 @@
 // This module is pure (no side effects on import) so it can be unit-tested
 // without booting the voice agent.
 
-import { execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 
 export type BaseMode = 'active' | 'meeting' | 'presenter';
 
@@ -53,7 +53,7 @@ export interface ModeState {
  */
 export function isPresenterActiveDefault(): boolean {
 	try {
-		const out = execSync('curl -s --max-time 1 http://localhost:7877/presenter', { timeout: 2_000 }).toString();
+		const out = execFileSync('curl', ['-s', '--max-time', '1', 'http://localhost:7877/presenter'], { timeout: 2_000 }).toString();
 		const json = JSON.parse(out);
 		return json && json.active === true;
 	} catch {

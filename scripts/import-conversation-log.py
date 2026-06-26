@@ -31,9 +31,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from workspace_default import resolve_workspace  # noqa: E402
 
-# DB + conversation.log live under the resolved workspace (~/.sutando/workspace),
-# the same tree the runtime writers use — not the repo root. conversation.log
-# is an append-only transcript, so it lives under logs/ (not state/).
+# DB + conversation.log live under the resolved workspace (post-M0 default
+# `<repo>/workspace/`; configurable via `sutando.config.local.json`), the same
+# tree the runtime writers use — not the repo root. conversation.log is an
+# append-only transcript, so it lives under logs/ (not state/).
 WORKSPACE = resolve_workspace(migrate=False)
 DEFAULT_SRC = WORKSPACE / "logs" / "conversation.log"
 DEFAULT_DB = Path(os.environ.get("SUTANDO_CONVERSATION_DB", WORKSPACE / "data" / "conversation.sqlite"))
@@ -43,7 +44,6 @@ DEFAULT_DB = Path(os.environ.get("SUTANDO_CONVERSATION_DB", WORKSPACE / "data" /
 _LIVE_WRITER_PATTERNS = [
     ("voice-agent.ts", "voice-agent"),
     ("conversation-server.ts", "phone conversation-server"),
-    ("discord-voice-server.ts", "discord-voice"),
 ]
 
 

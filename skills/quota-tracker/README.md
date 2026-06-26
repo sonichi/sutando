@@ -13,7 +13,7 @@ bash skills/install.sh
 
 Or manually:
 ```bash
-ln -s /path/to/sutando/skills/quota-tracker ~/.claude/skills/quota-tracker
+ln -s /path/to/sutando/skills/quota-tracker "$CLAUDE_CONFIG_DIR/skills/quota-tracker"
 ```
 
 ## What's included

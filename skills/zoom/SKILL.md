@@ -23,4 +23,4 @@ Manifest-loaded skill that contributes three Zoom inline tools into the agent's 
 
 - Extracted from `src/meeting-tools.ts` in issue #786.
 - Converted from a static hard-import into core to a manifest-loaded skill in issue #976, so core no longer has a compile-time dependency on `skills/zoom/tools.ts` and the skill is genuinely optional.
-- `skills/discord-voice` intentionally overrides `dismiss` with a Discord-specific implementation (SIGTERM self instead of Zoom AppleScript); its dedupe-by-name loop keeps the override and drops this skill's `dismiss`.
+- an external plugin (#1427) intentionally overrides `dismiss` with its own implementation (SIGTERM self instead of Zoom AppleScript); its dedupe-by-name loop keeps the override and drops this skill's `dismiss`.

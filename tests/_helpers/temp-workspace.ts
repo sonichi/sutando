@@ -37,6 +37,10 @@ export function setupTempWorkspace(name: string): {
 } {
 	const workspace = mkdtempSync(join(tmpdir(), `sutando-test-${name}-`));
 	process.env.SUTANDO_WORKSPACE = workspace;
+	// v0.8: env override removed for end-users. Tests get a private
+	// escape hatch via SUTANDO_TEST_MODE=1, honored silently by
+	// resolveWorkspace() in src/sutando_config.{py,ts}.
+	process.env.SUTANDO_TEST_MODE = '1';
 	return {
 		workspace,
 		cleanup: () => {
@@ -45,6 +49,10 @@ export function setupTempWorkspace(name: string): {
 			} catch {
 				/* idempotent */
 			}
+			// Clear the test-only escape hatch so subsequent tests in the
+			// same process can exercise the production v0.8 code path.
+			delete process.env.SUTANDO_WORKSPACE;
+			delete process.env.SUTANDO_TEST_MODE;
 		},
 	};
 }

@@ -44,12 +44,13 @@ def test_relative_env_path_is_anchored_to_cwd_absolute():
     """Bug fix regression guard. A relative `SUTANDO_WORKSPACE` MUST
     NOT survive resolution — anchor to CWD-at-resolve-time so two
     processes (different CWDs) don't silently split-brain on the same
-    env value."""
+    env value. v0.8: env honored only under SUTANDO_TEST_MODE=1."""
     snap = _clear_env()
     tmp = Path(tempfile.mkdtemp(prefix="sutando-ws-cwd-"))
     original_cwd = Path.cwd()
     os.chdir(tmp)
     os.environ["SUTANDO_WORKSPACE"] = "myws"  # deliberately relative
+    os.environ["SUTANDO_TEST_MODE"] = "1"
     try:
         result = ws.resolve_workspace(migrate=False)
         assert result.is_absolute(), (
@@ -61,32 +62,40 @@ def test_relative_env_path_is_anchored_to_cwd_absolute():
     finally:
         os.chdir(original_cwd)
         del os.environ["SUTANDO_WORKSPACE"]
+        os.environ.pop("SUTANDO_TEST_MODE", None)
         _restore_env(snap)
 
 
 def test_absolute_env_path_unchanged():
-    """Backwards compat: absolute `SUTANDO_WORKSPACE` returned as-is."""
+    """Backwards compat: absolute `SUTANDO_WORKSPACE` returned as-is.
+    v0.8: env honored only under SUTANDO_TEST_MODE=1."""
     snap = _clear_env()
     abs_path = Path(tempfile.mkdtemp(prefix="sutando-ws-abs-"))
     os.environ["SUTANDO_WORKSPACE"] = str(abs_path)
+    os.environ["SUTANDO_TEST_MODE"] = "1"
     try:
         result = ws.resolve_workspace(migrate=False)
-        assert result == abs_path
+        # Resolver canonicalizes /var/folders/... → /private/var/... on macOS.
+        assert result == abs_path.resolve()
     finally:
         del os.environ["SUTANDO_WORKSPACE"]
+        os.environ.pop("SUTANDO_TEST_MODE", None)
         _restore_env(snap)
 
 
 def test_tilde_in_env_path_is_expanded():
-    """`~` expansion preserved — existing contract."""
+    """`~` expansion preserved — existing contract.
+    v0.8: env honored only under SUTANDO_TEST_MODE=1."""
     snap = _clear_env()
     os.environ["SUTANDO_WORKSPACE"] = "~/sutando-tilde-test"
+    os.environ["SUTANDO_TEST_MODE"] = "1"
     try:
         result = ws.resolve_workspace(migrate=False)
         assert "~" not in str(result), f"tilde not expanded: {result}"
         assert str(result).startswith(str(Path.home()))
     finally:
         del os.environ["SUTANDO_WORKSPACE"]
+        os.environ.pop("SUTANDO_TEST_MODE", None)
         _restore_env(snap)
 
 

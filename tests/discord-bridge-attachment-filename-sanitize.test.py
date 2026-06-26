@@ -36,7 +36,8 @@ REPO = Path(__file__).resolve().parent.parent
 
 _WORKSPACE_TMP = tempfile.mkdtemp(prefix="sutando-discord-filename-test-")
 os.environ["SUTANDO_WORKSPACE"] = _WORKSPACE_TMP
-# `discord-bridge.py` reads its token from `~/.claude/channels/discord/.env`
+os.environ["SUTANDO_TEST_MODE"] = "1"  # v0.8: opt-in env-honor
+# `discord-bridge.py` reads its token from `$CLAUDE_CONFIG_DIR/channels/discord/.env`
 # (file path), not from `os.environ["DISCORD_BOT_TOKEN"]`, and `exit(1)`s
 # at module load when the file is missing. CI has no such file. Stub the
 # home dir + write a fake token so the module loads cleanly without

@@ -75,8 +75,8 @@ def test_send_and_attach_aliases():
 
 def test_home_relative_path_matches():
     """`~/...` is a deliberate allowed form."""
-    clean, files = split("body [file: ~/.claude/notes/x.md]")
-    assert files == ["~/.claude/notes/x.md"]
+    clean, files = split("body [file: ~/Downloads/report.pdf]")
+    assert files == ["~/Downloads/report.pdf"]
 
 
 def test_relative_path_does_not_match():

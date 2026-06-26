@@ -43,7 +43,14 @@ SRC  = REPO / "src"
 # ---------------------------------------------------------------------------
 
 def check_helper_correctness() -> list[str]:
-    """Verify claude_home_path() produces a ~/.claude/... Path."""
+    """Verify claude_home_path() produces a path under the resolved base.
+
+    Post-#1534, claude_home_path() resolves $CLAUDE_CONFIG_DIR → $CLAUDE_HOME →
+    the legacy default. The expected prefix mirrors that resolution order so
+    this test passes under both vanilla installs (legacy fallback) and
+    claude-sutando installs (CCD-scoped).
+    """
+    import os
     errs = []
 
     # Python helper must exist
@@ -58,7 +65,16 @@ def check_helper_correctness() -> list[str]:
         errs.append(f"import claude_home_path from util_paths failed: {exc}")
         return errs
 
-    expected_prefix = Path.home() / ".claude"
+    # Mirror claude_home_path()'s resolution order so the assertion passes under
+    # both vanilla (CCD unset → legacy default) and claude-sutando (CCD set) installs.
+    ccd_env = os.environ.get("CLAUDE_CONFIG_DIR")
+    home_env = os.environ.get("CLAUDE_HOME")
+    if ccd_env:
+        expected_prefix = Path(os.path.expanduser(ccd_env))
+    elif home_env:
+        expected_prefix = Path(os.path.expanduser(home_env))
+    else:
+        expected_prefix = Path.home() / ".claude"
     result = claude_home_path("channels", "discord", "access.json")
     if not str(result).startswith(str(expected_prefix)):
         errs.append(
@@ -124,6 +140,12 @@ def check_hardcoded_paths() -> list[str]:
     failures = []
 
     for path in sorted(SRC.rglob("*.py")):
+        # Skip symlinks — they point at code in a sibling repo (e.g.
+        # src/ag2space-bridge.py → ../ag2space-bridge/ag2space-bridge.py).
+        # That code's host-CLI dependency surface is the sibling repo's
+        # concern, not this checkout's.
+        if path.is_symlink():
+            continue
         rel = str(path.relative_to(REPO))
         if rel in KNOWN_VIOLATION_PATHS:
             continue
@@ -137,6 +159,8 @@ def check_hardcoded_paths() -> list[str]:
                 )
 
     for path in sorted(SRC.rglob("*.ts")) + sorted(SRC.rglob("*.tsx")):
+        if path.is_symlink():
+            continue
         rel = str(path.relative_to(REPO))
         if rel in KNOWN_VIOLATION_PATHS:
             continue

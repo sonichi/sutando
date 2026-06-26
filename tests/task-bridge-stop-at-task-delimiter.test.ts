@@ -15,6 +15,7 @@ import { join } from 'node:path';
 // expecting `false` passed *by accident* — file-not-found → false.)
 const TMP = mkdtempSync(join(tmpdir(), 'sutando-isvoice-test-'));
 process.env.SUTANDO_WORKSPACE = TMP;
+process.env.SUTANDO_TEST_MODE = '1';  // v0.8: opt-in env-honor
 mkdirSync(join(TMP, 'tasks'), { recursive: true });
 
 const { _isVoiceTask } = await import('../src/task-bridge.js');

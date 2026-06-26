@@ -44,7 +44,13 @@ from typing import Iterable
 
 import subprocess
 
-import anthropic
+# NOTE: `anthropic` is imported lazily inside run() (the only runtime use site),
+# not at module top. Importing it here makes `dream.py` raise ModuleNotFoundError
+# on hosts without the package whenever the script is invoked — even when the
+# SUTANDO_OBSIDIAN_MIRROR opt-in gate (checked in main()) is OFF and the script
+# should be a clean no-op. The type annotation `anthropic.Anthropic` in
+# judge_pair()'s signature stays valid without a top-level import because
+# `from __future__ import annotations` (above) defers all annotations to strings.
 
 DEFAULT_MODEL = os.environ.get("SUTANDO_DREAM_MODEL", "claude-opus-4-7")
 MAX_TOKENS = 1024
@@ -86,10 +92,16 @@ Conservative rule: prefer "none" over a wrong tier. Only emit an inline_ref when
 
 # ---- IO / paths ----
 
+# Canonical workspace resolver (src/workspace_default.py). $SUTANDO_WORKSPACE is
+# no longer honored post-v0.8/#1440; resolving it stranded the vault under the
+# legacy home-dir fallback. Resolve via the shared helper so dream.py and
+# tools.ts agree on <workspace>/obsidian-vault.
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+from workspace_default import resolve_workspace  # noqa: E402
+
+
 def resolve_vault() -> Path:
-    ws = os.environ.get("SUTANDO_WORKSPACE")
-    base = Path(ws).expanduser() if ws else Path.home() / ".sutando" / "workspace"
-    return base / "obsidian-vault"
+    return resolve_workspace() / "obsidian-vault"
 
 
 @dataclass(frozen=True)
@@ -267,6 +279,8 @@ def run(vault: Path, model: str, dry_run: bool = False) -> int:
         return 0
     pairs = candidate_pairs(notes)
     print(f"[dream] {len(notes)} eligible notes, {len(pairs)} candidate pairs, model={model}", flush=True)
+
+    import anthropic  # lazy: only needed past the opt-in gate (see top-of-file note)
 
     client = anthropic.Anthropic()
     # accumulators per-note: stem -> {tier_label: [(other_stem, rationale)]}

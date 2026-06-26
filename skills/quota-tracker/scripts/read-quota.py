@@ -15,6 +15,7 @@ Burn-rate tracking (closes #1087):
   Skips the sample if a 5h reset occurred (util dropped) or the gap is
   outside the 2min–2h window.
 """
+from __future__ import annotations
 
 # PEP 604 unions (`Path | None`) below are evaluated at import/def time, which
 # raises TypeError on Python 3.9 (the system python3 on some hosts). Defer all

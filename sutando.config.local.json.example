@@ -1,0 +1,21 @@
+{
+  "_comment": "Copy this file to sutando.config.local.json and edit. Everything is optional — omit any field to fall through to the default in sutando.config.json. The .local.json file is gitignored.",
+
+  "workspace": {
+    "_comment": "Override the workspace location. Default is ${REPO_DIR}/workspace (in-repo). Set this only if you want the workspace outside the repo (e.g. on a different volume).",
+    "path": "/absolute/path/to/your/workspace"
+  },
+
+  "vault": {
+    "_comment": "Enable + point at your private remote git repo to sync notes/memory/archives off-host.",
+    "enabled": true,
+    "remote_url": "https://vault.example.com/<your-user>/workspace.git",
+    "_comment_sync": "Override the default include/exclude lists from sutando.config.json if you want a different sync surface on this host.",
+    "sync": {
+      "include": [
+        "notes/",
+        "memory/"
+      ]
+    }
+  }
+}

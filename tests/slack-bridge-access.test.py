@@ -20,8 +20,9 @@ Guards:
      world-readable via umask 644).
   3. `_write_task()` checks `user_id not in allowed` and drops with a log
      line — fail-closed for unknown senders.
-  4. ACCESS_FILE lives under ~/.claude/channels/slack/ — consistent with
-     telegram + discord (so /sutando uninstall scripts find it).
+  4. ACCESS_FILE lives under $CLAUDE_CONFIG_DIR/channels/slack/ via the
+     shared `claude_home_path()` helper — consistent with telegram + discord
+     (so /sutando uninstall scripts find it across vanilla + claude-sutando).
 """
 
 from pathlib import Path
@@ -79,12 +80,15 @@ def main() -> int:
     # 3. _write_task fails closed on unknown sender. Budget bumped 2000 →
     # 4000 in 98e188b (file-attachment + thread_ts moved in), then →
     # 6000 in the tierMap PR (tier resolution + in-band system-instruction
-    # block for non-owner tiers added another ~1.5k chars). The check that
-    # actually matters runs against the FIRST ~200 chars of the body
-    # (the `user_id not in allowed` gate); the budget only needs to be
+    # block for non-owner tiers added another ~1.5k chars), then →
+    # 8000 in the secret-vault PR (vault interception block grew the body
+    # to ~6.3k), then → 12000 when merging feat/bridge-skill-hints-injection
+    # (skill-hints block adds ~1.4k on top of vault interception). The
+    # check that actually matters runs against the FIRST ~200 chars of the
+    # body (the `user_id not in allowed` gate); the budget only needs to be
     # large enough to terminate at the next `\ndef ` boundary.
     write_match = re.search(
-        r"def _write_task\([^)]*\)[^:]*:\s*\n([\s\S]{0,6000}?)(?=\n\ndef |\Z)",
+        r"def _write_task\([^)]*\)[^:]*:\s*\n([\s\S]{0,12000}?)(?=\n\ndef |\Z)",
         src,
     )
     if not write_match:
@@ -98,13 +102,15 @@ def main() -> int:
         return fail("_write_task must drop messages from senders not in allowed "
                     "(fail-closed access gate)", write_block)
 
-    # 4. ACCESS_FILE path is ~/.claude/channels/slack/
+    # 4. ACCESS_FILE resolves via channel_access_path("slack") — the shared
+    #    helper that honors $CLAUDE_CONFIG_DIR AND implements the ~30-day
+    #    legacy ~/.claude fallback (see util_paths.channel_access_path).
     if not re.search(
-        r"ACCESS_FILE\s*=\s*Path\.home\(\)\s*/\s*['\"]\.claude['\"]\s*/\s*['\"]channels['\"]\s*/\s*['\"]slack['\"]\s*/\s*['\"]access\.json['\"]",
+        r"ACCESS_FILE\s*=\s*channel_access_path\(\s*['\"]slack['\"]\s*\)",
         src,
     ):
-        return fail("ACCESS_FILE must be ~/.claude/channels/slack/access.json "
-                    "for parity with telegram + discord bridges")
+        return fail("ACCESS_FILE must be channel_access_path('slack') "
+                    "for parity with telegram + discord bridges (CCD-aware + legacy fallback)")
 
     print("PASS: slack-bridge.py access control looks correct.")
     print("  - load_allowed returns None when ACCESS_FILE missing (TOFU-eligible)")

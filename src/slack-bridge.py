@@ -17,7 +17,7 @@ Bot scopes (OAuth & Permissions):
     users:read
 
 Access list (TOFU onboarding, same schema as telegram):
-    ~/.claude/channels/slack/access.json
+    $CLAUDE_CONFIG_DIR/channels/slack/access.json
         {"allowFrom": ["U0123..."], "tofuOwner": "U0123...", ...}
 
 File round-trip:
@@ -46,10 +46,21 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from task_priority import default_priority_for_source  # noqa: E402
+
+# Observability: emit channel.slack.<in|out> into the local obs spine
+# (src/observability). Guarded so a missing module never crashes the bridge.
+try:
+    from observability.channel import emit_channel as _emit_channel  # noqa: E402
+except Exception:  # pragma: no cover — best-effort telemetry
+    def _emit_channel(*_a, **_k):  # type: ignore
+        return None
 from result_markers import parse_markers  # noqa: E402
+from task_body_guard import confine_user_content  # noqa: E402
+from util_paths import channel_access_path, claude_home_path  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
+from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 
 try:
     from slack_bolt import App
@@ -72,6 +83,19 @@ INBOX_DIR.mkdir(parents=True, exist_ok=True)
 
 BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 APP_TOKEN = os.environ.get("SLACK_APP_TOKEN", "")
+# Fall back to the channel .env when the tokens aren't already in our env. The
+# Electron backend-supervisor gates the bridge on this file's presence but builds
+# the child env from process.env + workspace .env only — it relies on each bridge
+# self-loading its channel .env (discord/telegram already do). Without this, the
+# supervisor-spawned bridge crash-loops on "not set". Mirrors discord-bridge.py.
+if not BOT_TOKEN or not APP_TOKEN:
+    channels_env = claude_home_path("channels", "slack", ".env")
+    if channels_env.exists():
+        for line in channels_env.read_text().splitlines():
+            if line.startswith("SLACK_BOT_TOKEN=") and not BOT_TOKEN:
+                BOT_TOKEN = line.split("=", 1)[1].strip().strip('"').strip("'")
+            elif line.startswith("SLACK_APP_TOKEN=") and not APP_TOKEN:
+                APP_TOKEN = line.split("=", 1)[1].strip().strip('"').strip("'")
 if not BOT_TOKEN or not APP_TOKEN:
     print("SLACK_BOT_TOKEN and/or SLACK_APP_TOKEN not set", file=sys.stderr)
     sys.exit(1)
@@ -169,7 +193,7 @@ def presenter_mode_active() -> bool:
         return False
 
 
-ACCESS_FILE = Path.home() / ".claude" / "channels" / "slack" / "access.json"
+ACCESS_FILE = channel_access_path("slack")
 
 # In-memory mirror of access.json. Updated on every successful read.
 # Used by tofu_onboard() to detect and recover from external deletions
@@ -341,6 +365,29 @@ def _download_slack_file(file_dict: dict) -> str | None:
         return None
 
 
+def _transcribe_via_skill(local_path: str) -> str | None:
+    """Call skills/audio-transcribe/scripts/transcribe.py. Returns transcript or None.
+
+    The skill is optional — if it is absent the bridge falls back to the plain
+    [File attached:] line unchanged. Any error from the subprocess is swallowed;
+    transcription failure must never block task delivery.
+    """
+    import subprocess
+    skill_script = Path(__file__).parent.parent / "skills" / "audio-transcribe" / "scripts" / "transcribe.py"
+    if not skill_script.exists():
+        return None
+    try:
+        result = subprocess.run(
+            [sys.executable, str(skill_script), local_path],
+            capture_output=True, text=True, timeout=25,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() or None
+    except Exception as e:
+        print(f"  [stt] skill call failed for {os.path.basename(local_path)}: {e}", flush=True)
+    return None
+
+
 def _write_task(event: dict, prefix: str, text: str, username: str | None) -> str | None:
     """Write a task file from a Slack event. Returns task_id or None if skipped."""
     user_id = event.get("user")
@@ -377,7 +424,11 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     for file_dict in event.get("files") or []:
         local_path = _download_slack_file(file_dict)
         if local_path:
-            attachment_lines.append(f"[File attached: {local_path}]")
+            transcript = _transcribe_via_skill(local_path)
+            if transcript:
+                attachment_lines.append(f"[Voice transcript: {transcript}]")
+            else:
+                attachment_lines.append(f"[File attached: {local_path}]")
     attachment_note = ("\n" + "\n".join(attachment_lines)) if attachment_lines else ""
 
     if not text and not attachment_note:
@@ -418,6 +469,21 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         # than treating as owner.
         access_tier = "other"
 
+    # Intercept vault commands before any disk write — must happen AFTER
+    # access_tier is resolved so untrusted senders cannot write to Keychain.
+    # Owner-tier: secrets go to Keychain, task file gets [STORED-IN-KEYCHAIN].
+    # Non-owner: patterns redacted, Keychain untouched.
+    if text:
+        if access_tier == "owner":
+            vault_result = intercept_vault_commands(text)
+            text = vault_result.text
+            if vault_result.stored:
+                print(f"  [vault] stored keys: {vault_result.stored}", flush=True)
+            if vault_result.failed:
+                print(f"  [vault] store failed (still redacted): {vault_result.failed}", flush=True)
+        else:
+            text = redact_vault_commands(text)
+
     # Prepend an in-band system instruction for non-owner tiers so the
     # core agent cannot accidentally process a downgraded task with full
     # capabilities. Mirrors the Discord bridge's tier-specific instruction
@@ -425,7 +491,13 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     # Kept short here because Slack's downgrade surface today is just
     # "delegate to sandboxed read-only agent" — no Slack-state-prefetch
     # path equivalent to Discord's `_prefetch_discord_state_refs`.
-    user_task_text = f"[{prefix} @{username or user_id}] {text}{attachment_note}"
+    # Confine the user-derived portion BEFORE the bridge appends its own
+    # `===SUTANDO SYSTEM INSTRUCTIONS===` block below — so a forged field/fence
+    # in the message can't escalate tier or inject instructions, while the
+    # bridge's legitimate fence (added next) stays intact. See task_body_guard.
+    user_task_text = confine_user_content(
+        f"[{prefix} @{username or user_id}] {text}{attachment_note}"
+    )
     if access_tier != "owner":
         user_task_text = (
             f"{user_task_text}\n\n"
@@ -442,6 +514,41 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     task_id = f"task-{ts}"
     task_file = TASKS_DIR / f"{task_id}.txt"
     priority = default_priority_for_source("slack", access_tier)
+
+    # Inject skill instructions so the agent follows the notify-before-work and
+    # transcription protocol even after conversation compaction wipes context.
+    # Only injected for owner tasks when the referenced skills are installed.
+    # CCD-resolved (PR #1525 pattern): never hardcode ~/.claude — nodes may relocate
+    # the config dir via $CLAUDE_CONFIG_DIR.
+    _claude_config = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
+    _notify_py = _claude_config / "skills/task-progress/scripts/notify.py"
+    _transcribe_py = _claude_config / "skills/audio-transcribe/scripts/transcribe.py"
+    skill_hints = ""
+    if access_tier == "owner" and (_notify_py.exists() or _transcribe_py.exists()):
+        hints_lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
+        step = 1
+        if _notify_py.exists():
+            notify_cmd = (
+                f"python3 {_notify_py}"
+                f" --source slack --channel-id {channel}"
+                f' --message "On it — back in a moment."'
+            )
+            hints_lines.append(f"{step}. NOTIFY FIRST: {notify_cmd}")
+            step += 1
+        if attachment_lines and _transcribe_py.exists():
+            for ap in attachment_lines:
+                attached_path = ap.replace("[File attached: ", "").rstrip("]")
+                if _notify_py.exists():
+                    hints_lines.append(
+                        f'   Update notify message to: --message "Got your voice message, give me a moment."'
+                    )
+                hints_lines.append(
+                    f"{step}. TRANSCRIBE: python3 {_transcribe_py} '{attached_path}'"
+                )
+                step += 1
+        hints_lines.append(f"{step}. Then process and write result to results/{task_id}.txt")
+        skill_hints = "\n" + "\n".join(hints_lines) + "\n"
+
     task_file.write_text(
         f"id: {task_id}\n"
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
@@ -451,11 +558,13 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         f"user_id: {user_id}\n"
         f"access_tier: {access_tier}\n"
         f"priority: {priority}\n"
+        f"{skill_hints}"
     )
     with pending_replies_lock:
         pending_replies[task_id] = {
             "channel": channel,
             "thread_ts": thread_ts,
+            "access_tier": access_tier,  # threaded to the outbound obs event
             "submitted_at": time.time(),
             "timed_out": False,
         }
@@ -465,6 +574,18 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         _event_count += 1
 
     print(f"  Wrote {task_id} from {prefix} @{username}", flush=True)
+    # Observability: one inbound accepted-message event.
+    _emit_channel(
+        "slack", "in",
+        user_id=str(user_id or ""),
+        channel_id=str(channel),
+        access_tier=access_tier,
+        data={
+            "task_id": task_id,
+            "is_dm": str(channel).startswith("D"),
+            "is_thread": bool(thread_ts),
+        },
+    )
     return task_id
 
 
@@ -548,7 +669,7 @@ def _send_file(channel: str, thread_ts: str | None, fpath: str) -> bool:
         return False
 
 
-def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | None = None) -> None:
+def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | None = None, access_tier: str = "unknown") -> None:
     """Post a reply via chat.postMessage with marker extraction.
 
     Honors the unified marker protocol from `src/result_markers.py` (#873):
@@ -579,6 +700,11 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
 
     file_paths = [a.value for a in parsed.actions if a.kind == "attach"]
 
+    # Track real delivery: the Slack helpers swallow API errors, so the
+    # outbound obs event must consult these rather than assume success.
+    delivered_ok = True
+    sent_files = 0
+
     # Post the text body in 4000-char chunks (Slack's per-message limit is
     # 40k chars but readability suffers above ~4k).
     if clean_text:
@@ -593,6 +719,8 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
                 print(f"[Slack] chat_postMessage failed: {e}", flush=True)
                 all_chunks_sent = False
                 break
+        if not all_chunks_sent:
+            delivered_ok = False
         if all_chunks_sent:
             # Slack channel id starts with D (DM), C (public/private channel),
             # G (legacy group). Best-effort classification for the audit log.
@@ -612,7 +740,10 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
     for fpath in file_paths:
         if _is_path_sendable(fpath):
             if _send_file(channel, thread_ts, fpath):
+                sent_files += 1
                 print(f"  Sent file: {fpath}", flush=True)
+            else:
+                delivered_ok = False
         elif os.path.isfile(fpath):
             # Path exists but isn't allowlisted — surface a visible deny.
             try:
@@ -633,6 +764,23 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
                 )
             except Exception:
                 pass
+
+    # Observability: one delivered-reply event. outcome reflects whether the
+    # text chunks + file uploads actually succeeded (the helpers swallow API
+    # errors); file_count counts files actually delivered, not just intended.
+    if clean_text or file_paths:
+        _emit_channel(
+            "slack", "out",
+            channel_id=str(channel),
+            access_tier=access_tier,
+            outcome="ok" if delivered_ok else "error",
+            data={
+                "task_id": task_id,
+                "is_dm": str(channel).startswith("D"),
+                "is_thread": bool(thread_ts),
+                "file_count": sent_files,
+            },
+        )
 
 
 def _check_task_timeouts() -> None:
@@ -719,7 +867,7 @@ def result_watcher():
                     print(f"  Skipped (marker): {task_id}", flush=True)
                 else:
                     try:
-                        _send_reply(target["channel"], target.get("thread_ts"), reply_text, task_id=task_id)
+                        _send_reply(target["channel"], target.get("thread_ts"), reply_text, task_id=task_id, access_tier=target.get("access_tier", "unknown"))
                         print(f"  Replied to {target['channel']}: {reply_text[:80]}...", flush=True)
                     except Exception as e:
                         print(f"[Slack] reply error: {e}", flush=True)
@@ -731,6 +879,17 @@ def result_watcher():
             if not presenter_mode_active():
                 for f in list(RESULTS_DIR.iterdir()):
                     if not (f.name.startswith("proactive-") and f.suffix == ".txt"):
+                        continue
+                    # Peek before claiming: skip Discord-targeted proactive files.
+                    # [channel: <17-20 digit snowflake>] is a Discord-only marker;
+                    # claiming it here dumps the literal text to Slack DM instead.
+                    # Leave it for discord-bridge to claim. (#1401)
+                    try:
+                        peek = f.read_text(errors="ignore").lstrip()
+                    except OSError:
+                        continue
+                    if peek.startswith("[channel:") and \
+                            re.match(r'\[channel:\s*\d{17,20}\]', peek):
                         continue
                     claim = f.with_suffix(".sending")
                     try:
@@ -748,7 +907,7 @@ def result_watcher():
                         try:
                             resp = app.client.conversations_open(users=owner_id)
                             dm_channel = resp["channel"]["id"]
-                            _send_reply(dm_channel, None, text)
+                            _send_reply(dm_channel, None, text, access_tier="owner")  # proactive → owner
                             print(f"  [proactive] sent to {owner_id}: {text[:80]}", flush=True)
                         except Exception as e:
                             print(f"  [proactive] failed: {e}", flush=True)

@@ -16,23 +16,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var lastDropTime: Date = .distantPast
     var screencaptureInFlight: Bool = false  // guards against stacked crosshair launches
     // Runtime state lives under the per-user workspace dir, not the repo
-    // checkout. Mirrors src/workspace_default.py + src/workspace_default.ts
-    // (PR #762 / #821). Resolution:
-    //   1. $SUTANDO_WORKSPACE (override; ~ expansion supported)
-    //   2. ~/.sutando/workspace/ (canonical default)
+    // checkout. **Delegates to SutandoConfig.resolveWorkspace()** as of the
+    // M0 cutover (was inline env-check + hardcoded ~/.sutando/workspace
+    // fallback). The Swift loader twin lives at
+    // src/Sutando/SutandoConfig.swift and matches src/sutando_config.{py,ts}
+    // byte-for-byte. Resolution order:
+    //   1. $SUTANDO_WORKSPACE env var (legacy escape hatch; warn once)
+    //   2. sutando.config.local.json -> workspace.path (per-clone override)
+    //   3. sutando.config.json -> workspace.path (tracked defaults)
+    //   4. ${REPO_DIR}/workspace baked-in default
     //
     // Pre-#762 main.swift wrote tasks/logs/state under the repo checkout via
     // CLAUDE.md walk-up. Post-#762 that dir no longer exists, so writeTask
-    // silently failed (try? write returns nil if parent dir missing) — the
-    // bug Chi hit 2026-05-18 where context-drop notified + logged but the
-    // bridge never saw the task.
-    let workspace: String = {
-        let env = ProcessInfo.processInfo.environment["SUTANDO_WORKSPACE"]?.trimmingCharacters(in: .whitespaces)
-        if let env = env, !env.isEmpty {
-            return (env as NSString).expandingTildeInPath
-        }
-        return NSHomeDirectory() + "/.sutando/workspace"
-    }()
+    // silently failed — the bug Chi hit 2026-05-18 where context-drop
+    // notified + logged but the bridge never saw the task.
+    let workspace: String = SutandoConfig.resolveWorkspace()
 
     // Repo checkout for skills-adjacent paths (assets, src/*.py, scripts/*.sh)
     // that ship alongside the code. Same CLAUDE.md walk-up used before #762.
@@ -546,6 +544,34 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         logToFile("watcher dead; notification fired (tmux session not found)")
     }
 
+    /// Per-host label for `hosts/<host>/` paths. Lockstep with `_host_label()`
+    /// (src/util_paths.py) and `_host()` (scripts/sync-workspace.sh):
+    /// $SUTANDO_HOST_LABEL > scutil LocalHostName (stable) > short hostname
+    /// (a raw hostname can DHCP-drift, e.g. Comcast → Chis-MBP, splitting
+    /// per-host paths from the scutil-named Chis-MacBook-Pro subtree; #1745).
+    func perHostLabel() -> String {
+        let env = ProcessInfo.processInfo.environment
+        if let v = env["SUTANDO_HOST_LABEL"] ?? env["SUTANDO_HOST_OVERRIDE"], !v.isEmpty {
+            return v
+        }
+        if let lhn = runShell("/usr/sbin/scutil", ["--get", "LocalHostName"])?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !lhn.isEmpty {
+            return lhn
+        }
+        let host = ProcessInfo.processInfo.hostName
+        return host.split(separator: ".").first.map(String.init) ?? host
+    }
+
+    /// Resolve a per-host workspace file: prefer `<workspace>/hosts/<host>/<name>`
+    /// (the #1717 per-host home the writers target), fall back to the flat
+    /// `<workspace>/<name>` for un-migrated layouts. Mirrors personal_path()'s
+    /// read-side probe order (#1718).
+    func perHostPath(_ name: String) -> String {
+        let perHost = workspace + "/hosts/" + perHostLabel() + "/" + name
+        if FileManager.default.fileExists(atPath: perHost) { return perHost }
+        return workspace + "/" + name
+    }
+
     /// Refresh `contextual-chips.json` from cheap mechanical sources. No LLM
     /// round-trip — just shell-out to `gh pr list`, read top `## Title` line
     /// of `pending-questions.md`, scan `results/` for unread items. Atomic
@@ -589,7 +615,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // 2. Top pending question (read first `## Title` line of pending-questions.md).
-        let pqPath = workspace + "/pending-questions.md"
+        // pending-questions.md is per-host (hosts/<host>/, #1717 F1) — probe there
+        // first so the chip reflects THIS host's questions, not a stale flat-root copy.
+        let pqPath = perHostPath("pending-questions.md")
         if let pq = try? String(contentsOfFile: pqPath, encoding: .utf8) {
             // Skip the leading "# Memory" or similar h1, find first h2.
             for line in pq.split(separator: "\n") {
@@ -1477,10 +1505,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     //   1. $SUTANDO_MEMORY_DIR/skills/personal-deictic/ax-read  (private, richer
     //      — includes screenshot + cursor for deictic phrases)
     //   2. $SUTANDO_PRIVATE_DIR/skills/personal-deictic/ax-read (legacy alias, PR #876)
-    //   3. ~/.sutando/memory-sync/skills/personal-deictic/ax-read (default private)
-    //   4. <repo>/skills/context-drop/ax-read                    (public fallback,
+    //   3. <repo>/skills/context-drop/ax-read                    (public fallback,
     //      text-only — ships in this repo so public-repo installs get the same
     //      ⌃C experience without needing the private personal-deictic skill)
+    //
+    // Post-v0.3.0 (#1440 + Mini opinion-requested 2026-06-06): the pre-v0.3.0
+    // `~/.sutando/memory-sync/skills/personal-deictic/ax-read` default-private
+    // path is gone — the legacy `.sutando/memory-sync/` clone is deprecated
+    // (sync-memory.sh removed in v0.4.0). $SUTANDO_MEMORY_DIR is honored
+    // explicitly via candidate 1 when set.
     //
     // Returns nil when no binary is found; callers fall back to the in-process
     // legacy AX path.
@@ -1491,7 +1524,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let candidates = [
             env["SUTANDO_MEMORY_DIR"].map { $0 + privateSuffix },
             env["SUTANDO_PRIVATE_DIR"].map { $0 + privateSuffix },
-            NSString(string: "~/.sutando/memory-sync" + privateSuffix).expandingTildeInPath,
             repoRoot + "/skills/context-drop/ax-read",
         ].compactMap { $0 }
         let fm = FileManager.default

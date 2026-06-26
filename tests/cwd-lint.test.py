@@ -91,6 +91,7 @@ def check_ts_cwd() -> list[str]:
 PY_CWD_RE = re.compile(r'\bPath\.cwd\(\)|\bos\.getcwd\(\)')
 PY_ALLOWLIST = {
     "src/workspace_default.py",  # uses Path.cwd() to anchor relative env-var paths
+    "src/sutando_config.py",     # post-M0 canonical loader (resolve_workspace lives here)
 }
 
 def check_py_cwd() -> list[str]:

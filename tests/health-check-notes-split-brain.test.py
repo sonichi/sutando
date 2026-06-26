@@ -12,6 +12,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+_MEMORY_ENV_KEYS = ("SUTANDO_MEMORY_DIR", "SUTANDO_PRIVATE_DIR")
+
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
@@ -29,10 +31,18 @@ class TestNotesSplitBrain(unittest.TestCase):
         # Stash the module-level globals so we can restore them.
         self._saved_repo = hc.REPO_DIR
         self._saved_ws = hc.WORKSPACE_DIR
+        # Clear memory-dir env vars so shared_personal_path falls back to
+        # WORKSPACE_DIR instead of the real on-disk memory dir.
+        self._saved_mem_env = {k: os.environ.pop(k, None) for k in _MEMORY_ENV_KEYS}
 
     def tearDown(self):
         hc.REPO_DIR = self._saved_repo
         hc.WORKSPACE_DIR = self._saved_ws
+        for k, v in self._saved_mem_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
 

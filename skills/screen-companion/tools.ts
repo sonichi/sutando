@@ -18,6 +18,7 @@ import { writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { loadConfig, discoverConfigs, renderGoal } from './scripts/load-config.js';
+import { readSelection as defaultReadSelection, type SelectionResult } from './scripts/read-selection.js';
 import { registerVisionOnContributor, callUpdateTools, callRestoreTools, captureSendFrame, getFullToolSurface } from '../../src/vision-tools.js';
 
 function resolveWorkspace(): string {
@@ -189,43 +190,141 @@ const deactivateScreenCompanionTool: ToolDefinition = {
 
 // --- vision_query -----------------------------------------------------------
 //
-// Pull-mode screen-frame lookup. Captures the current screen and sends it to
-// Gemini as vision input, then returns a prompt for Gemini to answer. Does NOT
-// require push-mode to be running — designed for modes where the user calls it
-// on demand rather than streaming continuously.
+// Pull-mode screen lookup with three modes:
+//   - 'selection': read the user's text selection (AX or Chrome JS). Exact
+//     word/quote questions — no frame capture.
+//   - 'frame':     capture & send the current screen to vision. Layout /
+//     visual-context questions — no selection probe.
+//   - 'both' (default): try selection first; if present, ALSO capture a frame
+//     and return a combined result. If no selection, fall through to frame.
+//
+// Selection probes live in scripts/read-selection.ts (issue #1389, PR #1409).
+// Captured frames flow through vision-tools.captureSendFrame to the active
+// Gemini Live session. Designed for pull-mode (configs that don't stream).
+
+// Injection seams for tests — production code uses the imported defaults.
+let _readSelection: () => SelectionResult | null = defaultReadSelection;
+let _captureSendFrame: typeof captureSendFrame = captureSendFrame;
+export function _setVisionQueryDeps(deps: {
+	readSelection?: () => SelectionResult | null;
+	captureSendFrame?: typeof captureSendFrame;
+}): void {
+	if (deps.readSelection) _readSelection = deps.readSelection;
+	if (deps.captureSendFrame) _captureSendFrame = deps.captureSendFrame;
+}
+export function _resetVisionQueryDeps(): void {
+	_readSelection = defaultReadSelection;
+	_captureSendFrame = captureSendFrame;
+}
 
 const visionQueryTool: ToolDefinition = {
 	name: 'vision_query',
 	description:
-		'Capture the current screen and look at it to answer a specific question. ' +
-		'Use in pull-mode screen-companion sessions when you need to check what\'s on screen without streaming continuously. ' +
-		'Pass question= to frame what you\'re looking for (e.g. "Is the bot token field visible?"). ' +
-		'The frame is sent to your vision context — answer based on what you see.',
+		'Read what\'s on screen. A mode is REQUIRED — pick based on the question: ' +
+		'mode="selection" for exact word/quote questions ("what does this sentence say?") — reads the text selection only, no frame; ' +
+		'mode="frame" for layout/visual-context questions ("is the dialog open?") — screen capture only, no selection probe; ' +
+		'mode="selection-or-frame" when you want the exact selected text if the user has highlighted something, otherwise fall back to a frame — captures a frame ONLY when there is no selection; ' +
+		'mode="both" when both might help — reads the selection AND also captures a frame (frame-only fallback if no selection). ' +
+		'Pass question= to frame what you\'re looking for. ' +
+		'Use in pull-mode screen-companion sessions when you need to check what\'s on screen without streaming continuously.',
 	parameters: z.object({
 		question: z
 			.string()
 			.optional()
 			.describe('What to look for or answer from the current screen. E.g. "Is the OAuth2 scope list visible?" or "What does the error message say?"'),
+		mode: z
+			.enum(['selection', 'frame', 'selection-or-frame', 'both'])
+			.describe('Required. What to read: "selection" (text selection only), "frame" (screen capture only), "selection-or-frame" (selection if present, else frame), or "both" (selection AND frame).'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { question } = (args ?? {}) as { question?: string };
-		const r = await captureSendFrame('screen');
-		if (!r.ok) {
+		const { question, mode } = (args ?? {}) as {
+			question?: string;
+			mode: 'selection' | 'frame' | 'selection-or-frame' | 'both';
+		};
+
+		const wantSelection = mode === 'selection' || mode === 'both' || mode === 'selection-or-frame';
+		const wantFrame = mode === 'frame' || mode === 'both' || mode === 'selection-or-frame';
+
+		const selection = wantSelection ? _readSelection() : null;
+
+		// mode='selection' — only selection, no frame fallback.
+		if (mode === 'selection') {
+			if (!selection) {
+				return {
+					status: 'no_selection',
+					question: question ?? null,
+					_note: 'No text selection found. Ask the user to select the text first, or call vision_query again with mode="frame" if you want a screen capture instead.',
+				};
+			}
 			return {
-				status: 'failed',
-				error: r.error,
-				hint: 'Screen-capture server may not be running. Start it with `bash src/startup.sh`.',
+				status: 'selection_read',
+				text: selection.text,
+				source: selection.source,
+				question: question ?? null,
+				_note: question
+					? `Selected text read via ${selection.source} (exact, not frame-eyeballing). Answer: ${question}`
+					: `Selected text read via ${selection.source}. Describe or quote the selection as relevant.`,
 			};
 		}
-		return {
-			status: 'frame_sent',
-			source: r.source,
-			question: question ?? null,
-			_note: question
-				? `Frame is in your vision context. Answer: ${question}`
-				: 'Frame is in your vision context. Describe what you see and continue the conversation.',
-		};
+
+		// mode='selection-or-frame' with selection present — return selection only,
+		// no frame (the original #1389 conditional-frame behavior: frame captured
+		// ONLY when there is no selection).
+		if (mode === 'selection-or-frame' && selection) {
+			return {
+				status: 'selection_read',
+				text: selection.text,
+				source: selection.source,
+				question: question ?? null,
+				_note: question
+					? `Selected text read via ${selection.source} (exact, not frame-eyeballing). Answer: ${question}`
+					: `Selected text read via ${selection.source}. Describe or quote the selection as relevant.`,
+			};
+		}
+
+		// mode='both' with selection present — return BOTH selection and frame.
+		if (mode === 'both' && selection) {
+			const r = await _captureSendFrame('screen');
+			return {
+				status: 'selection_and_frame',
+				selection: { text: selection.text, source: selection.source },
+				frame_status: r.ok ? 'ok' : 'failed',
+				frame_source: r.ok ? r.source : null,
+				frame_error: r.ok ? null : (r.error ?? null),
+				question: question ?? null,
+				_note: question
+					? `Selected text read via ${selection.source}; frame also in your vision context. Answer: ${question}`
+					: `Selected text read via ${selection.source}; frame also in your vision context. Quote the selection and describe the surrounding context as relevant.`,
+			};
+		}
+
+		// mode='frame', or mode='both'/'selection-or-frame' with no selection —
+		// capture a frame only.
+		if (wantFrame) {
+			const r = await _captureSendFrame('screen');
+			if (!r.ok) {
+				return {
+					status: 'failed',
+					error: r.error,
+					hint: 'Screen-capture server may not be running. Start it with `bash src/startup.sh`.',
+				};
+			}
+			const fellThrough = mode === 'both' || mode === 'selection-or-frame';
+			return {
+				status: 'frame_captured',
+				source: r.source,
+				question: question ?? null,
+				_note: question
+					? (fellThrough
+						? `No selection found; frame is in your vision context. Answer: ${question}`
+						: `Frame is in your vision context. Answer: ${question}`)
+					: 'Frame is in your vision context. Describe what you see.',
+			};
+		}
+
+		// Unreachable in practice — exhaustive guard for the mode enum.
+		return { status: 'no_op', question: question ?? null };
 	},
 };
 

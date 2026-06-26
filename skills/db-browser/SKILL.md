@@ -14,7 +14,7 @@ ARGUMENTS: $ARGUMENTS
 
 ## Steps
 
-1. Resolve the path argument. If empty, default to `$SUTANDO_WORKSPACE/data/conversation.sqlite` (falling back to `~/.sutando/workspace/data/conversation.sqlite` when the env var is unset). Bail with an error if the file doesn't exist.
+1. Resolve the path argument. If empty, default to `$(bash scripts/sutando-config.sh workspace)/data/conversation.sqlite` (the M0 helper — reads `sutando.config.local.json`, defaulting to `<repo>/workspace/data/conversation.sqlite`; `$SUTANDO_WORKSPACE` no longer honored as of v0.8 / #1440). Bail with an error if the file doesn't exist.
 2. Check whether DB Browser for SQLite is installed: `mdfind "kMDItemKind == 'Application'" 2>/dev/null | grep -qi 'DB Browser for SQLite'` (or `[ -d /Applications/DB\ Browser\ for\ SQLite.app ]`). If installed, skip step 3.
 3. Install via Homebrew: `brew install --cask db-browser-for-sqlite`. Requires brew. If brew is missing, stop and ask the user to install brew first.
 4. If DB Browser is already running on a DIFFERENT db file (its cached snapshot of THAT db won't auto-refresh when you switch files), quit it first: `osascript -e 'tell application "DB Browser for SQLite" to quit'; sleep 2`. Skip if not running.

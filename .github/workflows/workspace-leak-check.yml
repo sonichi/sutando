@@ -1,0 +1,82 @@
+name: workspace-leak-check
+
+# CI mirror of `.githooks/pre-commit`. Refuses PRs that introduce files
+# under `workspace/` (with the single exception of `workspace/.gitkeep`).
+#
+# Purpose: per Milestone 0 of the workspace-revamp work, in-repo workspace/
+# holds per-user runtime state (tasks, results, notes, state, logs, etc.)
+# that must never be committed. The local pre-commit hook is the first line
+# of defense, but it only fires for users who ran `git config core.hooksPath
+# .githooks` after cloning. This workflow catches anyone who didn't, who
+# bypassed the hook with --no-verify, or who edited the PR via the GitHub
+# web UI.
+#
+# Scope is intentionally narrow for M0 — only workspace/. Future expansion
+# could add scans for accidentally-staged .env, hardcoded credentials, or
+# the sutando.config.local.json file (already in .gitignore but force-add
+# could slip it past).
+
+on:
+  pull_request:
+    branches: [main, staging-workspace-revamp]
+  push:
+    branches: [main, staging-workspace-revamp]
+
+jobs:
+  workspace-leak-check:
+    name: refuse workspace/ contents in commits
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    steps:
+      - name: Checkout (with full history for base-ref diff)
+        uses: actions/checkout@v4
+        with:
+          # Need depth=0 (or at least enough to reach the base) so the diff
+          # below can compare HEAD against the PR base. Without this, a
+          # shallow clone makes `git diff origin/main...HEAD` fail to find
+          # a merge base on long-lived branches.
+          fetch-depth: 0
+
+      - name: Check for workspace/ leak
+        run: |
+          set -euo pipefail
+
+          # For pull_request: base is github.base_ref. For push to main:
+          # diff against the previous commit so a direct push that adds
+          # workspace/ still trips.
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            base_ref="origin/${{ github.base_ref }}"
+            diff_args="$base_ref...HEAD"
+          else
+            base_ref="${{ github.event.before }}"
+            # First push to a branch has before=0000000... — fall back to
+            # the parent of HEAD in that case.
+            if [[ "$base_ref" =~ ^0+$ ]]; then
+              diff_args="HEAD~1...HEAD"
+            else
+              diff_args="$base_ref...HEAD"
+            fi
+          fi
+
+          # Added or modified paths in the PR diff. Same filter as the local
+          # pre-commit hook: anything under workspace/, except .gitkeep.
+          changed="$(git diff --name-only --diff-filter=AMRC $diff_args)"  # AMRC: keep in lockstep with .githooks/pre-commit (rename bypass fix)
+          offenders="$(printf '%s\n' "$changed" \
+            | grep -E '^workspace/' \
+            | grep -vxF 'workspace/.gitkeep' \
+            || true)"
+
+          if [[ -n "$offenders" ]]; then
+            echo "::error::workspace/ contents detected — these files must not be committed:"
+            printf '%s\n' "$offenders" | sed 's/^/  • /'
+            echo ""
+            echo "workspace/ holds per-user runtime state (tasks, results, notes, state, logs)"
+            echo "and is gitignored. Remove these files from the PR or move them outside workspace/."
+            echo ""
+            echo "If you cloned recently, install the local pre-commit hook to catch this earlier:"
+            echo "  git config core.hooksPath .githooks"
+            exit 1
+          fi
+
+          echo "✓ No workspace/ leaks in this diff."

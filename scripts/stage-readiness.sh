@@ -142,7 +142,7 @@ else
 fi
 
 # 6) quota
-QUOTA_OUT=$(python3 "$HOME/.claude/skills/quota-tracker/scripts/read-quota.py" 2>/dev/null || echo "")
+QUOTA_OUT=$(python3 "$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/read-quota.py)" 2>/dev/null || echo "")
 REM=$(echo "$QUOTA_OUT" | grep -oE '[0-9]+% remaining' | head -1 | grep -oE '[0-9]+')
 if [ -n "${REM:-}" ]; then
     if [ "$REM" -ge 10 ]; then
@@ -167,36 +167,32 @@ if [ -n "${AVAIL_GB:-}" ]; then
     fi
 fi
 
-# 8) memory-sync age — resolve memory dir per the workspace contract:
-# $SUTANDO_MEMORY_DIR (canonical, since #870) → $SUTANDO_PRIVATE_DIR (legacy
-# alias) → default $HOME/.sutando/memory-sync. Fall back to the pre-migration
-# $HOME/.sutando-memory-sync only when no nested dir exists yet (older hosts
-# that haven't moved over).
-MEMORY_DIR="${SUTANDO_MEMORY_DIR:-${SUTANDO_PRIVATE_DIR:-}}"
-if [ -z "$MEMORY_DIR" ]; then
-    if [ -d "$HOME/.sutando/memory-sync" ]; then
-        MEMORY_DIR="$HOME/.sutando/memory-sync"
-    else
-        MEMORY_DIR="$HOME/.sutando-memory-sync"
+# 8) workspace-sync age — workspace is the sync target as of v0.3.0 (sync-workspace.sh,
+# PR #1445+). The workspace itself is a git repo; freshness = `.git/FETCH_HEAD` mtime.
+# Falls back to the legacy `~/.sutando/memory-sync/` clone during the v0.3.x
+# sync-memory.sh deprecation window (removed in v0.4.0) for hosts that haven't migrated.
+SCRIPT_PARENT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+WORKSPACE_DIR="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" workspace)"
+SYNC_HEAD="$WORKSPACE_DIR/.git/FETCH_HEAD"
+SYNC_LABEL="workspace-sync"
+SYNC_HINT="bash scripts/sync-workspace.sh"
+if [ ! -f "$SYNC_HEAD" ]; then
+    LEGACY_DIR="${SUTANDO_MEMORY_DIR:-$HOME/.sutando/memory-sync}"
+    if [ -f "$LEGACY_DIR/.git/FETCH_HEAD" ]; then
+        SYNC_HEAD="$LEGACY_DIR/.git/FETCH_HEAD"
+        SYNC_LABEL="memory-sync (legacy)"
+        SYNC_HINT="bash $LEGACY_DIR/scripts/sync-memory.sh  # deprecated; migrate to sync-workspace.sh"
     fi
 fi
-SYNC_HEAD="$MEMORY_DIR/.git/FETCH_HEAD"
 if [ -f "$SYNC_HEAD" ]; then
     age_sec=$(($(date +%s) - $(stat_mtime "$SYNC_HEAD")))
     age_h=$((age_sec / 3600))
     if [ "$age_h" -lt 6 ]; then
-        pass "memory-sync" "last sync ${age_h}h ago"
+        pass "$SYNC_LABEL" "last sync ${age_h}h ago"
     elif [ "$age_h" -lt 48 ]; then
-        # Show whichever sync-script path exists locally (new default is
-        # ~/.sutando/memory-sync/; legacy ~/.sutando-memory-sync/ still
-        # works until the next sync-memory.sh run auto-migrates).
-        if [ -d "$HOME/.sutando/memory-sync" ]; then
-            warn "memory-sync" "last sync ${age_h}h ago — run 'bash ~/.sutando/memory-sync/scripts/sync-memory.sh'"
-        else
-            warn "memory-sync" "last sync ${age_h}h ago — run 'bash ~/.sutando-memory-sync/scripts/sync-memory.sh'"
-        fi
+        warn "$SYNC_LABEL" "last sync ${age_h}h ago — run '$SYNC_HINT'"
     else
-        fail "memory-sync" "last sync ${age_h}h ago — stale, sync before talk"
+        fail "$SYNC_LABEL" "last sync ${age_h}h ago — stale, sync before talk"
     fi
 fi
 

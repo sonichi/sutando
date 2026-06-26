@@ -1,7 +1,7 @@
 """
 Workspace-local Sutando-specific Discord configuration (closes #1147).
 
-The official discord plugin owns `~/.claude/channels/discord/access.json` with
+The official discord plugin owns `$CLAUDE_CONFIG_DIR/channels/discord/access.json` with
 its documented schema (`dmPolicy`, `allowFrom`, `groups`, `pending`). Sutando
 has been squatting on that file for its own fields (`tierMap` since #846,
 proposed `owner` from the now-closed #1118). #1147 moves those Sutando

@@ -17,7 +17,7 @@ ARGUMENTS: $ARGUMENTS
 1. **Find the meeting.** If ARGUMENTS specifies a meeting name or time, find it. Otherwise, find the next meeting starting within 60 minutes.
 
 ```bash
-~/.claude/skills/google-calendar/scripts/google-calendar.py events list \
+$CLAUDE_CONFIG_DIR/skills/google-calendar/scripts/google-calendar.py events list \
   --time-min NOW --time-max NOW_PLUS_60MIN
 ```
 
@@ -27,7 +27,7 @@ ARGUMENTS: $ARGUMENTS
 
    a. **Contacts** — search by email:
    ```bash
-   python3 ~/.claude/skills/macos-tools/scripts/contacts.py search "email@example.com"
+   python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/contacts.py search "email@example.com"
    ```
 
    b. **Recent emails** — search Gmail for recent threads with this person:

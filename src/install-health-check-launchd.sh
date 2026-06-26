@@ -52,15 +52,25 @@ DEST="$HOME/Library/LaunchAgents/$LABEL.plist"
 DOMAIN="gui/$(id -u)"
 SERVICE="$DOMAIN/$LABEL"
 
-# Resolve runtime workspace — launchd job writes its log under
+# Resolve runtime workspace via the shared post-M0 helper (PR #1395, single
+# source at src/workspace_resolve.sh). Launchd job writes its log under
 # $WORKSPACE/logs/ instead of the repo-root legacy path (per PR #911's
-# workspace-vs-repo split). Same resolution shape as src/startup.sh +
-# workspace_default.py.
-if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
+# workspace-vs-repo split). Defensive fallback for non-checkout installs.
+# Helper resolution: prefer $REPO/src/, fall back to script-sibling (cross-
+# checkout safety — see init.sh comment).
+__HELPER="$REPO/src/workspace_resolve.sh"
+[ -f "$__HELPER" ] || __HELPER="$(cd "$(dirname "$0")" && pwd)/workspace_resolve.sh"
+if [ -f "$__HELPER" ]; then
+  # shellcheck source=workspace_resolve.sh
+  source "$__HELPER"
+  resolve_workspace_or_die
+elif [ -n "${SUTANDO_WORKSPACE:-}" ]; then
   WORKSPACE="${SUTANDO_WORKSPACE/#\~/$HOME}"
 else
-  WORKSPACE="$HOME/.sutando/workspace"
+  echo "${0##*/}: cannot resolve workspace — workspace_resolve.sh not found and \$SUTANDO_WORKSPACE not set." >&2
+  exit 1
 fi
+unset __HELPER
 
 cmd="${1:-install}"
 

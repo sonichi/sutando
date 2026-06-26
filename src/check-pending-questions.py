@@ -6,9 +6,11 @@ Sends notifications via macOS + Discord DM if questions are waiting.
 Use --force to bypass the 1-hour cooldown.
 """
 
+import hashlib
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -72,8 +74,9 @@ def voice_client_connected():
 
 
 def get_waiting_questions():
-    """Parse pending-questions.md — matches both legacy `## Q1 — Title` and
-    the current `## Title` / `- **Status:** unanswered` format.
+    """Parse pending-questions.md — matches the legacy `## Q1 — Title` and
+    `## Title` / `- **Status:** unanswered` section formats AND the free-form
+    `- **[label, ts]** ...` bullet format the proactive-loop writes in practice.
 
     If a section has no explicit **Status:** marker, it is treated as
     unanswered (the free-form prose format used in practice never writes
@@ -107,6 +110,19 @@ def get_waiting_questions():
                 continue  # explicitly resolved/done/answered — skip
         # No status field, or status is unanswered/waiting → notify
         questions.append({"id": title[:40], "title": title})
+
+    # Also recognize the free-form bullet format the proactive-loop and skills
+    # actually append in: `- **[label, timestamp]** ...`. The `## `-section walk
+    # above misses these entirely (real pending-questions.md carries 0 `## `
+    # headings, only bullets), which silently zeroed the count and suppressed
+    # every notification. Bullets follow the same "no Status field ⇒ unanswered"
+    # convention as prose sections (resolved items are deleted, not marked).
+    seen = {q["title"] for q in questions}
+    for m in re.finditer(r'^\s*-\s+\*\*\[(.+?)\]', content, flags=re.MULTILINE):
+        title = m.group(1).strip()
+        if title and title not in seen:
+            seen.add(title)
+            questions.append({"id": title[:40], "title": title})
     return questions
 
 
@@ -126,6 +142,12 @@ def notify_macos(count, titles):
     ], capture_output=True)
 
 
+def questions_key(questions):
+    """sha256[:16] of the sorted question titles -- a stable id for the set."""
+    key = "|".join(sorted(q["title"] for q in questions))
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
 def notify_voice(questions):
     """Write to results/ so voice agent can speak it."""
     ts = int(time.time() * 1000)
@@ -142,8 +164,7 @@ def notify_discord_dm(questions):
     """Write a proactive-*.txt file so discord-bridge DMs the owner.
     Owner asked (2026-04-09, while traveling) to receive pending-question
     pings as DMs instead of just macOS notifications."""
-    ts = int(time.time())
-    path = RESULTS_DIR / f"proactive-pending-q-{ts}.txt"
+    path = RESULTS_DIR / f"proactive-pending-q-{questions_key(questions)}.txt"
     lines = [
         f"⚠️ {len(questions)} pending question{'s' if len(questions) > 1 else ''} waiting:",
         "",
@@ -153,7 +174,9 @@ def notify_discord_dm(questions):
     if len(questions) > 5:
         lines.append(f"…and {len(questions) - 5} more")
     lines.append("")
-    lines.append("Reply here or edit pending-questions.md on the Mini to resolve.")
+    lines.append(
+        f"Reply here or edit pending-questions.md on {socket.gethostname().split('.')[0]} to resolve."
+    )
     path.write_text("\n".join(lines))
 
 

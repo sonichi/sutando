@@ -1,11 +1,22 @@
 """Canonical workspace-directory resolution for Sutando services.
 
 All runtime artifacts (tasks/, results/, state/, data/, build_log.md, ...) live
-under the workspace dir. Components MUST consult `SUTANDO_WORKSPACE` first;
-when unset, fall back to `~/.sutando/workspace/` — a hidden, OS-neutral home-
-relative path that stays out of Sutando.app's `~/Library/Application Support/
-sutando/` (which owns Chromium-style cache: Cache/, GPUCache/, Cookies/,
-blob_storage/, etc.).
+under the workspace dir. Post-v0.8 (#1440), components MUST resolve via the M0
+helper (`scripts/sutando-config.sh workspace` from shell, or
+`from src.sutando_config import resolve_workspace` from Python) which reads
+`sutando.config.local.json` (per-clone, gitignored) and defaults to
+`<repo>/workspace/`.
+
+`$SUTANDO_WORKSPACE` is no longer honored for workspace resolution as of v0.8;
+if set, it is still detected to fire a one-time deprecation warning and trigger
+one-time auto-migration via per-source sentinels (PR #1478), but the resolver
+ignores its value. The ad-hoc no-config-no-repo-root last-ditch fallback is
+`~/sutando-workspace/` (was `~/.sutando/workspace/` pre-v0.8 — namespace
+retired per Mini opinion-requested 2026-06-06).
+
+This module is the historic Python wrapper; new code should call
+`src.sutando_config.resolve_workspace` directly. The `default_workspace_dir`
+function is retained for tests only — it is no longer the production default.
 
 Historic anti-pattern: bridges fell back to `Path(__file__).resolve().parent.parent`
 which resolved to the repo root, polluting `git status` with runtime artifacts
@@ -20,7 +31,7 @@ import sys
 from pathlib import Path
 
 
-_DEFAULT_SUBPATH = (".sutando", "workspace")
+_DEFAULT_SUBPATH = ("sutando-workspace",)  # post-v0.8 fallback for tests + ad-hoc invocations
 # Loose status/state .json files that historically sat at the workspace root.
 # Per the workspace-design model they belong under `state/` alongside the other
 # machine-local status files (state/cores/, state/subscriptions.json, …). The
@@ -44,7 +55,12 @@ _LEGACY_DIRS = ("tasks", "results", "state", "notes")  # the runtime-state dirs 
 
 
 def default_workspace_dir() -> Path:
-    """Return `~/.sutando/workspace/`."""
+    """Return `~/sutando-workspace/` — the post-v0.8 last-ditch fallback for
+    ad-hoc invocations outside a checkout. NOT the production default; that
+    is `<repo>/workspace/` per #1440, resolved by
+    `src.sutando_config.resolve_workspace`. Used by tests for mocking and by
+    callers that need a deterministic path when no config + no repo root.
+    """
     return Path.home().joinpath(*_DEFAULT_SUBPATH)
 
 
@@ -222,7 +238,7 @@ def _migrate_inrepo_build_log(workspace: Path) -> bool:
     runtime artifact and belongs in the workspace, not the repo. Historic
     placement at the repo root polluted `git status` and split-brained
     dashboard.py / health-check.py (which already read from workspace) vs
-    voice-context.ts / sync-memory.sh (which still wrote to repo). This
+    voice-context.ts / sync-memory.sh (legacy; now sync-workspace.sh). This
     migration fixes the split.
 
     Non-destructive on collision (skip if workspace already has build_log.md),
@@ -410,88 +426,44 @@ def _grep_env_for_workspace() -> str | None:
 def resolve_workspace(migrate: bool = True) -> Path:
     """Resolve the workspace directory per the canonical contract.
 
-    Order:
-      1. `$SUTANDO_WORKSPACE` env var, expanded (`~` honored).
-      2. `~/.sutando/workspace/`.
+    **Delegates to `src/sutando_config.py::resolve_workspace`** as of the
+    M0 cutover. The new loader implements the resolution order:
 
-    Returns a `Path` — does NOT create the directory; the caller decides.
+      1. `$SUTANDO_WORKSPACE` env var (legacy escape hatch; warn once)
+      2. `sutando.config.local.json` → `workspace.path` (per-clone override)
+      3. `sutando.config.json` → `workspace.path` (tracked defaults)
+      4. `${REPO_DIR}/workspace` baked-in default
 
-    **Auto-migration disabled (closes #1169 option B, 2026-05-26.)**
+    This wrapper is preserved so existing callers don't need code changes —
+    the function name + signature + return type are unchanged. Behavior
+    differs in two ways from the pre-cutover version:
 
-    Previously this function auto-ran 5 destructive migrators
-    (`_migrate_from_legacy`, `_migrate_inrepo_notes`,
-    `_migrate_inrepo_build_log`, `_migrate_root_status`,
-    `_migrate_conversation_log`) on every call. The semantic was
-    "implicit one-way `shutil.move` whenever the resolver sees an
-    eligible source" — which destroyed an uncommitted file on
-    2026-05-25 when `tests/discord_config.test.py` set
-    `SUTANDO_WORKSPACE=tmpdir` and the symlinked `<repo>/notes/`
-    (memory-sync target) was relocated into the tmpdir, then deleted
-    when `tempfile.TemporaryDirectory` cleaned up. See incident
-    write-up at the top of #1169.
+      - Default location is `${REPO_DIR}/workspace` (in-repo), not
+        `~/.sutando/workspace/`. Users with `$SUTANDO_WORKSPACE` set keep
+        their old location with a one-time warning.
+      - `.env` declarations of `SUTANDO_WORKSPACE` no longer leak into
+        resolution when the env var itself is unset — only the env var
+        in the process environment matters. A separate one-time warning
+        fires if `.env` declares a value that disagrees with the resolved
+        workspace.
 
-    The five migrators remain defined in this module (their bodies
-    are untouched and their direct-call tests still pass); they are
-    no longer dispatched from `resolve_workspace()`. They will be
-    re-introduced via an explicit `sutando-migrate` CLI in a
-    follow-up — opt-in, with `--dry-run`, `--commit`, and a
-    once-per-host sentinel. Users with legacy in-repo state will see
-    a one-time stderr notice the first time this function runs
-    pointing them at the CLI.
-
-    The `migrate` keyword is kept for backwards compatibility with
-    callers that previously passed `migrate=False`. Passing
-    `migrate=False` ALSO skips the legacy-state stderr notice — the
-    function stays pure (no scan, no I/O on the legacy root, no
-    stderr output beyond the relative-path warning). Pass
-    `migrate=True` (the default) to let the one-time notice fire.
+    The legacy-state notice (pointing users at `scripts/sutando-migrate.sh`)
+    remains here — same behavior as before, gated by `migrate=True`.
     """
     global _AUTO_MIGRATE_NOTICE_PRINTED
 
-    env = os.environ.get("SUTANDO_WORKSPACE", "").strip()
-    if env:
-        target = Path(env).expanduser()
-        # A relative `SUTANDO_WORKSPACE` resolves against CWD, which
-        # differs between launchd-managed services, systemd units, and
-        # bare-shell launches. Two processes inheriting the same env
-        # var would then mkdir/read in DIFFERENT directories — silent
-        # split-brain, same anti-pattern this module already warns about
-        # for the `Path(__file__).resolve().parent.parent` fallback.
-        # Normalize to an absolute path against the current CWD and
-        # warn loudly so the misconfig surfaces. `.resolve()` collapses
-        # `..` segments too.
-        if not target.is_absolute():
-            anchored = (Path.cwd() / target).resolve()
-            print(
-                f"workspace: SUTANDO_WORKSPACE={env!r} is relative — anchored to "
-                f"{anchored} (CWD-dependent; set an absolute path to avoid "
-                f"cross-process drift)",
-                file=sys.stderr,
-            )
-            target = anchored
-    else:
-        target = default_workspace_dir()
-        # Surface the silent-fallback bug class (see PR #1367/#1368): if .env
-        # defines SUTANDO_WORKSPACE but the process never got it (e.g. a
-        # SessionStart hook, launchd service, or any process that didn't
-        # `source .env`), the caller silently lands in `~/.sutando/workspace/`
-        # while the rest of the fleet uses the override → split-brain. One
-        # stderr line per process makes the miss visible. We do NOT auto-honor
-        # the .env value here — that's a behavior change and lives in callers
-        # that opt into it (e.g. skills/agent-registry/scripts/_workspace_resolve.py).
-        global _FALLBACK_WARN_PRINTED
-        if not _FALLBACK_WARN_PRINTED:
-            _FALLBACK_WARN_PRINTED = True
-            env_file_val = _grep_env_for_workspace()
-            if env_file_val and env_file_val != str(target):
-                print(
-                    f"workspace: SUTANDO_WORKSPACE is unset in process env, "
-                    f"falling back to {target}. NOTE: .env declares "
-                    f"SUTANDO_WORKSPACE={env_file_val!r} which is NOT being "
-                    f"honored here — `source .env` or export the var before "
-                    f"this process to avoid split-brain with other services.",
-                    file=sys.stderr,
-                )
+    # Delegate the actual resolution to the new loader. Defensive sys.path
+    # extension keeps us working under tests that load this module via
+    # `importlib.util.spec_from_file_location` (see
+    # tests/workspace-default-relative-env.test.py) without first adding
+    # `src/` to sys.path — that loader bypasses the normal import machinery,
+    # so a plain `import sutando_config` would otherwise fail to find the
+    # sibling module.
+    src_dir = str(Path(__file__).resolve().parent)
+    if src_dir not in sys.path:
+        sys.path.insert(0, src_dir)
+    import sutando_config  # type: ignore[import-untyped]
+    target = sutando_config.resolve_workspace()
 
     # One-time notice if legacy-state evidence exists, pointing at the
     # explicit CLI (to land in a follow-up PR). Process-local guard so we

@@ -4,14 +4,14 @@ Voice-inline capture into a Sutando-owned Obsidian vault. The voice agent calls 
 
 ## Vault
 
-Lives at `$SUTANDO_WORKSPACE/obsidian-vault/` (default `~/.sutando/workspace/obsidian-vault`). Auto-created on first capture, with a `.obsidian/` marker dir so Obsidian recognizes the folder as a vault.
+Lives at `<workspace>/obsidian-vault/` (`<workspace>` resolved via `bash scripts/sutando-config.sh workspace` — per `sutando.config.local.json`, defaulting to `<repo>/workspace/`; `$SUTANDO_WORKSPACE` no longer honored as of v0.8 / #1440). Auto-created on first capture, with a `.obsidian/` marker dir so Obsidian recognizes the folder as a vault.
 
 ## Layout
 
 Everything Sutando writes lives under the `Sutando/` subfolder, by kind:
 
 ```
-$SUTANDO_WORKSPACE/obsidian-vault/
+<workspace>/obsidian-vault/
   .obsidian/                                 ← marker; Obsidian populates on first open
   Sutando/
     Notes/<slug>-<YYYY-MM-DDTHHMMSS>.md      kind="note"   → standalone file w/ frontmatter
@@ -30,7 +30,7 @@ This subfolder convention keeps Sutando's writes out of the way of anything else
 
 ## One-time setup in Obsidian
 
-Open Obsidian → **File → Open vault → Open folder as vault** → pick `$SUTANDO_WORKSPACE/obsidian-vault`. Obsidian will remember it. The vault appears empty until you trigger your first capture.
+Open Obsidian → **File → Open vault → Open folder as vault** → pick `<workspace>/obsidian-vault`. Obsidian will remember it. The vault appears empty until you trigger your first capture.
 
 ## Opt-in: agent-state mirror + nightly dream
 

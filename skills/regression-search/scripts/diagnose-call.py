@@ -14,6 +14,8 @@ Companion to find-regression.py — find candidates with one, drill in with the
 other. Closes the second half of #188.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -68,24 +70,57 @@ def _ts_iso(ts_unix) -> str:
     ).isoformat().replace("+00:00", "Z")
 
 
+_NON_SURFACE_TABLES = {"sessions", "session_events", "conversation", "tool_calls"}
+
+
+def _surface_tables(conn: sqlite3.Connection) -> list[str]:
+    """Per-surface transcript tables (voice/phone + any plugin-registered
+    surface), discovered from the schema so this tool names no specific plugin.
+    A surface table carries the ts_unix/kind/text/session_id shape."""
+    try:
+        names = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+    except Exception:
+        return []
+    out: list[str] = []
+    for n in names:
+        if n in _NON_SURFACE_TABLES:
+            continue
+        try:
+            cols = {r[1] for r in conn.execute(f"PRAGMA table_info({n})").fetchall()}
+        except Exception:
+            continue
+        if {"ts_unix", "kind", "text", "session_id"} <= cols:
+            out.append(n)
+    return out
+
+
+def _surface_union(conn: sqlite3.Connection, cols: str) -> str | None:
+    """UNION ALL of `SELECT <cols> FROM <t>` across every surface table, or None
+    if there are none. `cols` is a fixed literal column list (never user input)."""
+    tables = _surface_tables(conn)
+    if not tables:
+        return None
+    return " UNION ALL ".join(f"SELECT {cols} FROM {t}" for t in tables)
+
+
 def _build_transcript(conn: sqlite3.Connection, session_id: str) -> str:
     """Reconstruct a `Role: text` transcript from the per-surface tables.
 
     Post-#1051 (per-surface schema): utterances + tool calls live in the
-    voice / phone / discord_voice tables under the `kind` column. We union
-    all three so a session_id from any surface resolves. Tool-call rows
-    (kind='tool_call') are skipped — the transcript is human dialogue only.
+    per-surface tables under the `kind` column. We union every surface table
+    (discovered dynamically) so a session_id from any surface resolves.
+    Tool-call rows (kind='tool_call') are skipped — human dialogue only.
     """
     if not session_id:
         return ""
+    union = _surface_union(conn, "ts_unix, kind, text, session_id")
+    if union is None:
+        return ""
     rows = conn.execute(
-        """
+        f"""
         SELECT kind, text FROM (
-          SELECT ts_unix, kind, text, session_id FROM voice
-          UNION ALL
-          SELECT ts_unix, kind, text, session_id FROM phone
-          UNION ALL
-          SELECT ts_unix, kind, text, session_id FROM discord_voice
+          {union}
         )
         WHERE session_id = ? AND kind != 'tool_call'
         ORDER BY ts_unix
@@ -157,16 +192,12 @@ def find_metrics(call_sid: str) -> Optional[dict]:
         # (per #1052 — the redundant sessions.tool_calls JSON column is gone).
         # Rebuild the list from the matching surface table by session_id.
         sid = row["session_id"]
+        tc_union = _surface_union(conn, "ts_unix, text, duration_ms, session_id, kind")
         tool_call_rows = conn.execute(
-            "SELECT ts_unix, text AS name, duration_ms FROM ("
-            "  SELECT ts_unix, text, duration_ms, session_id, kind FROM voice"
-            "  UNION ALL"
-            "  SELECT ts_unix, text, duration_ms, session_id, kind FROM phone"
-            "  UNION ALL"
-            "  SELECT ts_unix, text, duration_ms, session_id, kind FROM discord_voice"
-            ") WHERE session_id = ? AND kind = 'tool_call' ORDER BY ts_unix",
+            f"SELECT ts_unix, text AS name, duration_ms FROM ({tc_union}) "
+            "WHERE session_id = ? AND kind = 'tool_call' ORDER BY ts_unix",
             (sid,),
-        ).fetchall()
+        ).fetchall() if tc_union else []
         tool_calls = [
             {
                 "name": r["name"],

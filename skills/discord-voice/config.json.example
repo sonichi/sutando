@@ -1,7 +1,0 @@
-{
-  "_comment": "TEMPLATE — do not edit in place. The live config is per-user data and lives at $SUTANDO_WORKSPACE/config/discord-voice.json (default ~/.sutando/workspace/config/discord-voice.json). On first run discord-voice-server copies this template there if it is missing. Edit the workspace copy, never this file. Keys: model + googleSearch are voice prefs; owner_mode + channels are the trust-boundary knobs (issue #1016) — see SKILL.md before enabling owner-mode.",
-  "model": "gemini-2.5-flash-native-audio-preview-12-2025",
-  "googleSearch": true,
-  "owner_mode": false,
-  "channels": {}
-}

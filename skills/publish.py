@@ -40,7 +40,7 @@ bash skills/install.sh
 
 Or manually:
 ```bash
-ln -s /path/to/sutando/skills/{skill_dir.name} ~/.claude/skills/{skill_dir.name}
+ln -s /path/to/sutando/skills/{skill_dir.name} "$CLAUDE_CONFIG_DIR/skills/{skill_dir.name}"
 ```
 
 ## What's included

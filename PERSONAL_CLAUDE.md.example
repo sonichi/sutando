@@ -29,12 +29,12 @@
 #
 # ### Cross-bot
 # - Examples:
-#   - Answer open `opinion-requested:` claims in `#bot2bot` (channel ID in `~/.claude/channels/discord/access.json`)
+#   - Answer open `opinion-requested:` claims in `#bot2bot` (channel ID in `$CLAUDE_CONFIG_DIR/channels/discord/access.json`)
 #   - Review the other bot's recently-opened PRs
 #
 # ### Maintenance / hygiene
 # - Examples:
-#   - Curate memory files under `~/.claude/projects/<your-project>/memory/`
+#   - Curate memory files under `$CLAUDE_CONFIG_DIR/projects/<your-project>/memory/`
 #   - Resolve any `pending-questions.md` items the bot can handle without you
 #
 # ### Outreach & content

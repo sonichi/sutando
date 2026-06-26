@@ -70,8 +70,8 @@ fi
 # "already running" — a silent no-op from the LaunchAgent's perspective.
 # Remove the file and force-kill any lingering workers before kickstart so the
 # new instance can start cleanly.
-WORKSPACE="${SUTANDO_WORKSPACE:-${HOME}/.sutando/workspace}"
-WORKSPACE="${WORKSPACE/#\~/${HOME}}"
+SCRIPT_PARENT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+WORKSPACE="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" workspace)"
 PID_FILE="${WORKSPACE}/.voice-agent.pid"
 if [ -f "${PID_FILE}" ]; then
   STALE_PID="$(cat "${PID_FILE}" 2>/dev/null || true)"

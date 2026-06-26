@@ -8,7 +8,6 @@
  *
  *   - voice-agent        → `$SUTANDO_WORKSPACE/config/voice-agent.json`
  *   - phone-conversation → `$SUTANDO_WORKSPACE/config/phone-conversation.json`
- *   - discord-voice      → `$SUTANDO_WORKSPACE/config/discord-voice.json`
  *
  * Each surface ships a committed `*.example` template (`src/voice-agent.config
  * .json.example`, `skills/<surface>/config.json.example`); on first run the
@@ -31,13 +30,7 @@
  * capability rather than picking a safe baseline). Surfaces that explicitly
  * want a different combo (e.g. voice-agent prefers 3.1 + search:false for the
  * web client's code-heavy workload) ship a `.example` template carrying that
- * override. Phone inherits the default; discord-voice's template carries it
- * too, so a fresh install behaves identically.
- *
- * `owner_mode` / `channels` are the discord-voice trust-boundary knobs
- * (issue #1016) — `owner_mode` is the skill-wide default and `channels[id]`
- * is a per-voice-channel override. They replaced the coarse global env flag
- * the skill previously used. Both default to a safe read-only posture.
+ * override. Phone inherits the default, so a fresh install behaves identically.
  */
 
 import { readFileSync, existsSync } from 'fs';
@@ -64,7 +57,7 @@ export const VOICE_CONFIG_DEFAULTS: VoiceConfig = {
 };
 
 /**
- * Resolve the effective owner-mode for a discord-voice channel — fail-closed.
+ * Resolve the effective owner-mode for a voice channel — fail-closed.
  *
  * The config is raw JSON spread into `VoiceConfig`, so a hand-edited file can
  * carry a non-boolean value (string `"false"`, `null`, a number, a typo). A

@@ -58,14 +58,13 @@ Prints the rendered issue body + the rendered
 `sonichi/sutando` has CLA-Assistant enabled. Commits must be signed under
 the contributor's own email — that's how the CLA channel works.
 
-- **OSS contributors** (default): the script does NOT touch your `git
-  config`. The CLA gets signed under your real identity. Just make sure your
-  `gh` auth and `git config user.email` match the email you want on file.
-- **Chi's fleet** (auto-detected via `/Users/wangchi/.sutando/workspace/` or
-  env `SUTANDO_FLEET_OWNER=chi`): the script sets repo-local
-  `user.email=4250911+sonichi@users.noreply.github.com` and `user.name=Chi
-  Wang` inside the fresh clone so internal demo submissions don't need an
-  extra config step.
+The script **never overrides your git identity**. The commit is attributed to
+your existing `git config user.name` / `user.email` — so the CLA signs under
+whoever you already are. Make sure your `gh` auth and `git config user.email`
+match the email you want on file. Before committing, the script prints the
+identity it will use (and aborts if it's unset), so attribution can't silently
+go out wrong. (The maintainer's own machine already has the project identity in
+its global git config, so no special-casing is needed.)
 
 ## Dependencies
 

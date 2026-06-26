@@ -21,6 +21,7 @@ from urllib.error import URLError
 
 sys.path.insert(0, str(Path(__file__).parent))
 from workspace_default import resolve_workspace  # noqa: E402
+from util_paths import personal_path  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 RESULTS_DIR = WORKSPACE / "results"
@@ -39,15 +40,22 @@ WEATHER_CODES = {
 }
 
 
-def _run_applescript(script: str, timeout: int = 8) -> str | None:
+def _run_applescript(script: str, timeout: int = 8) -> tuple[str | None, str]:
+    """Run an AppleScript and return (stdout, stderr).
+
+    Returns (output_text, "") on success, (None, error_text) on failure.
+    Callers that only need the output can ignore the second element.
+    """
     try:
         r = subprocess.run(
             ["osascript", "-e", script],
             capture_output=True, text=True, timeout=timeout
         )
-        return r.stdout.strip() if r.returncode == 0 else None
+        if r.returncode == 0:
+            return r.stdout.strip(), ""
+        return None, r.stderr.strip()
     except (subprocess.TimeoutExpired, OSError):
-        return None
+        return None, ""
 
 
 def get_weather() -> str:
@@ -55,7 +63,7 @@ def get_weather() -> str:
     try:
         # Default to SF; override via TZ if possible
         lat, lon = 37.77, -122.42
-        tz_result = _run_applescript(
+        tz_result, _ = _run_applescript(
             'do shell script "defaults read /Library/Preferences/com.apple.timezone"',
             timeout=3
         )
@@ -96,9 +104,11 @@ def get_calendar_events() -> list[dict]:
     filtering out subscribed shared calendars that clutter the briefing
     (closes #964). Case-insensitive match on calendar name.
     """
-    today = datetime.now().strftime("%Y-%m-%d")
-    script = f'''
-set theDate to date "{today}"
+    script = '''
+set theDate to (current date)
+set hours of theDate to 0
+set minutes of theDate to 0
+set seconds of theDate to 0
 set endDate to theDate + (24 * 60 * 60)
 set output to ""
 tell application "Calendar"
@@ -124,8 +134,16 @@ tell application "Calendar"
 end tell
 return output
 '''
-    result = _run_applescript(script, timeout=10)
-    if not result:
+    result, err = _run_applescript(script, timeout=10)
+    if result is None:
+        if err:
+            print(f"  calendar: AppleScript error — {err}", file=sys.stderr)
+            if "-1743" in err:
+                print(
+                    "  calendar: Automation permission needed. "
+                    "System Settings → Privacy & Security → Automation → grant Calendar access.",
+                    file=sys.stderr,
+                )
         return []
     import os as _os
     skip_cals_raw = _os.environ.get("MORNING_BRIEFING_SKIP_CALENDARS", "")
@@ -173,9 +191,14 @@ def get_reminders() -> list[str]:
         if r.returncode != 0:
             return []
         items = []
+        # reminders.py prints the human-readable sentinel "No reminders."
+        # (exit 0) when the due-today list is empty — skip it so the empty
+        # state doesn't get counted as a single reminder and rendered as
+        # "Reminders due: No reminders.".
+        empty_sentinels = {"no reminders.", "no reminders"}
         for line in r.stdout.splitlines():
             line = line.strip()
-            if line and not line.startswith("#"):
+            if line and not line.startswith("#") and line.lower() not in empty_sentinels:
                 items.append(line)
         return items[:5]
     except (subprocess.TimeoutExpired, OSError):
@@ -206,7 +229,7 @@ def get_overnight_discord() -> list[str]:
 
 def get_pending_questions() -> list[str]:
     """Return unanswered questions from pending-questions.md."""
-    pq = WORKSPACE / "pending-questions.md"
+    pq = personal_path("pending-questions.md", WORKSPACE)
     if not pq.exists():
         return []
     content = pq.read_text()

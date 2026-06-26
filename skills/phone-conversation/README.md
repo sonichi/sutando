@@ -13,7 +13,7 @@ bash skills/install.sh
 
 Or manually:
 ```bash
-ln -s /path/to/sutando/skills/phone-conversation ~/.claude/skills/phone-conversation
+ln -s /path/to/sutando/skills/phone-conversation "$CLAUDE_CONFIG_DIR/skills/phone-conversation"
 ```
 
 ## What's included

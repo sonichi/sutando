@@ -24,6 +24,27 @@ from workspace_default import (  # noqa: E402
 )
 
 
+# v0.8: the resolver ignores `$SUTANDO_WORKSPACE` for end-users (warn + ignore).
+# Tests in this file redirect workspace via env to exercise migration paths.
+# The `SUTANDO_TEST_MODE=1` escape hatch (added in PR #1440) re-enables env
+# honor silently for the test suite. Individual tests that need to exercise
+# the production code path (env-ignored) clear SUTANDO_TEST_MODE in-test.
+_SAVED_TEST_MODE = None
+
+
+def setUpModule():
+    global _SAVED_TEST_MODE
+    _SAVED_TEST_MODE = os.environ.get("SUTANDO_TEST_MODE")
+    os.environ["SUTANDO_TEST_MODE"] = "1"
+
+
+def tearDownModule():
+    if _SAVED_TEST_MODE is None:
+        os.environ.pop("SUTANDO_TEST_MODE", None)
+    else:
+        os.environ["SUTANDO_TEST_MODE"] = _SAVED_TEST_MODE
+
+
 class TestWorkspaceDefault(unittest.TestCase):
     def setUp(self):
         self._saved_env = os.environ.get("SUTANDO_WORKSPACE")
@@ -36,32 +57,66 @@ class TestWorkspaceDefault(unittest.TestCase):
         elif "SUTANDO_WORKSPACE" in os.environ:
             del os.environ["SUTANDO_WORKSPACE"]
 
-    def test_default_is_dot_sutando_workspace_under_home(self):
+    def test_default_is_sutando_workspace_under_home(self):
+        # Post-v0.8 (#1440 + Mini opinion-requested 2026-06-06): the legacy
+        # `~/.sutando/workspace/` namespace is retired; `default_workspace_dir`
+        # now returns `~/sutando-workspace/` for ad-hoc invocations outside a
+        # checkout. NOT the production default — that's `<repo>/workspace/`
+        # via `src.sutando_config.resolve_workspace`.
         d = default_workspace_dir()
-        self.assertEqual(d.name, "workspace")
-        self.assertEqual(d.parent.name, ".sutando")
-        self.assertEqual(d.parent.parent, Path.home())
-        self.assertEqual(d, Path.home() / ".sutando" / "workspace")
+        self.assertEqual(d.name, "sutando-workspace")
+        self.assertEqual(d.parent, Path.home())
+        self.assertEqual(d, Path.home() / "sutando-workspace")
 
-    def test_resolve_uses_env_when_set(self):
+    def test_resolve_uses_env_when_test_mode_set(self):
+        # v0.8: `$SUTANDO_WORKSPACE` is no longer honored in production.
+        # The test-only escape hatch `SUTANDO_TEST_MODE=1` keeps env-redirect
+        # available for the test suite without weakening the user-facing
+        # contract. Without `SUTANDO_TEST_MODE`, the env value would be
+        # warned + ignored.
+        # Note: resolver calls `.resolve()`, which canonicalizes /tmp -> /private/tmp
+        # on macOS via symlink; the expected path applies the same resolution.
         os.environ["SUTANDO_WORKSPACE"] = "/tmp/test-ws"
-        # migrate=False to keep this test purely about resolution semantics.
-        self.assertEqual(resolve_workspace(migrate=False), Path("/tmp/test-ws"))
+        os.environ["SUTANDO_TEST_MODE"] = "1"
+        try:
+            self.assertEqual(resolve_workspace(migrate=False), Path("/tmp/test-ws").resolve())
+        finally:
+            os.environ.pop("SUTANDO_TEST_MODE", None)
 
-    def test_resolve_expanduser_on_tilde(self):
+    def test_resolve_expanduser_on_tilde_with_test_mode(self):
+        # v0.8: env honored only under SUTANDO_TEST_MODE=1 (test-only).
         os.environ["SUTANDO_WORKSPACE"] = "~/custom-ws"
-        self.assertEqual(resolve_workspace(migrate=False), Path.home() / "custom-ws")
+        os.environ["SUTANDO_TEST_MODE"] = "1"
+        try:
+            self.assertEqual(
+                resolve_workspace(migrate=False),
+                (Path.home() / "custom-ws").resolve(),
+            )
+        finally:
+            os.environ.pop("SUTANDO_TEST_MODE", None)
+
+    def test_resolve_ignores_env_in_production_path(self):
+        # v0.8 contract: without SUTANDO_TEST_MODE, env is warned + ignored.
+        os.environ["SUTANDO_WORKSPACE"] = "/tmp/should-be-ignored"
+        os.environ.pop("SUTANDO_TEST_MODE", None)
+        # Falls back to the in-repo default (env ignored).
+        self.assertEqual(resolve_workspace(migrate=False), ROOT / "workspace")
 
     def test_resolve_falls_back_to_default_when_env_unset(self):
-        self.assertEqual(resolve_workspace(migrate=False), default_workspace_dir())
+        # Post-M0: fallback is the in-repo workspace path (<repo>/workspace),
+        # not the legacy ~/.sutando/workspace/. The legacy default lives on as
+        # default_workspace_dir() (a fallback for installs outside a checkout),
+        # but the canonical resolution targets the in-repo default for normal
+        # git-clone installs.
+        self.assertEqual(resolve_workspace(migrate=False), ROOT / "workspace")
 
     def test_resolve_falls_back_when_env_empty_string(self):
         os.environ["SUTANDO_WORKSPACE"] = ""
-        self.assertEqual(resolve_workspace(migrate=False), default_workspace_dir())
+        self.assertEqual(resolve_workspace(migrate=False), ROOT / "workspace")
 
     def test_resolve_falls_back_when_env_whitespace_only(self):
         os.environ["SUTANDO_WORKSPACE"] = "   "
-        self.assertEqual(resolve_workspace(migrate=False), default_workspace_dir())
+        self.assertEqual(resolve_workspace(migrate=False), ROOT / "workspace")
 
     def test_resolve_never_returns_repo_root(self):
         """Anti-regression: the historical fallback was the script's repo root
@@ -174,14 +229,16 @@ class TestMigrationFromLegacy(unittest.TestCase):
         self.assertFalse(moved_2)  # second run finds target populated, bails
 
     def test_resolve_workspace_skips_legacy_migration_when_env_set(self):
-        """When SUTANDO_WORKSPACE is set, the LEGACY migration (tasks/results/state)
-        is skipped. The notes in-repo migration runs independently — see the
-        separate test class for that."""
+        """When SUTANDO_WORKSPACE is set (with SUTANDO_TEST_MODE=1 to opt in
+        under v0.8), the LEGACY migration (tasks/results/state) is skipped.
+        The notes in-repo migration runs independently — see the separate
+        test class for that."""
         self._seed_legacy_runtime()
         os.environ["SUTANDO_WORKSPACE"] = str(self.target)
         with patch.object(workspace_default, "_legacy_repo_root", return_value=self.legacy):
             ws = resolve_workspace(migrate=True)
-        self.assertEqual(ws, self.target)
+        # Compare against resolved expected (macOS /private symlink-canonical).
+        self.assertEqual(ws, self.target.resolve())
         # Legacy state should be UNTOUCHED — env pin bypasses _migrate_from_legacy.
         self.assertTrue((self.legacy / "tasks" / "task-1.txt").exists())
 
@@ -634,7 +691,9 @@ class TestPostMigrationDisableBehavior(unittest.TestCase):
         """resolve_workspace(migrate=True) must NOT move any legacy file."""
         with patch.object(workspace_default, "_legacy_repo_root", return_value=self.legacy):
             ws = resolve_workspace(migrate=True)
-        self.assertEqual(ws, self.workspace)
+        # Resolved equality — resolver canonicalizes /var/folders/... → /private/var/...
+        # on macOS via symlink.
+        self.assertEqual(ws, self.workspace.resolve())
         # Legacy files unchanged
         self.assertTrue((self.legacy / "notes" / "x.md").is_file())
         self.assertTrue((self.legacy / "build_log.md").is_file())
@@ -668,7 +727,7 @@ class TestPostMigrationDisableBehavior(unittest.TestCase):
             buf = StringIO()
             with patch.object(sys, "stderr", buf):
                 ws = resolve_workspace(migrate=False)
-            self.assertEqual(ws, self.workspace)
+            self.assertEqual(ws, self.workspace.resolve())
             # _legacy_repo_root() must NOT be called when migrate=False
             mock_repo.assert_not_called()
             # No stderr output

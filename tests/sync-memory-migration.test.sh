@@ -120,11 +120,44 @@ case_no_legacy_no_op() {
     return 0
 }
 
+case_script_dir_resolves_through_symlink() {
+    # Regression guard for #1436: when scripts/ is a symlinked directory
+    # (e.g. workspace/scripts → repo/scripts), $0 + pwd without -P resolves
+    # to the symlink dir, breaking SCRIPT_PARENT. ${BASH_SOURCE[0]} + pwd -P
+    # follows the physical path back to the real dir.
+    local real_scripts; real_scripts="$(mktemp -d)"
+    trap 'rm -rf "$real_scripts"' RETURN
+    local link_parent; link_parent="$(mktemp -d)"
+    trap 'rm -rf "$link_parent"' RETURN
+
+    # Mini probe that uses the same ${BASH_SOURCE[0]} + pwd -P pattern.
+    cat > "$real_scripts/probe.sh" << 'PROBE'
+#!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+echo "$SCRIPT_DIR"
+PROBE
+    chmod +x "$real_scripts/probe.sh"
+
+    # Symlink the DIRECTORY (mirrors workspace/scripts → repo/scripts pattern).
+    ln -s "$real_scripts" "$link_parent/scripts"
+
+    # Invoke via the symlinked directory path.
+    local got; got="$(bash "$link_parent/scripts/probe.sh")"
+    # pwd -P on macOS may expand /var → /private/var; canonicalize both sides.
+    local want; want="$(cd "$real_scripts" && pwd -P)"
+    [ "$got" = "$want" ] || {
+        echo "  SCRIPT_DIR='$got', want '$want'"
+        echo "  (pwd -P missing — symlinked scripts/ dir not resolved to real path)"
+        return 1
+    }
+}
+
 run_case "legacy ~/.sutando-memory-sync migrates to ~/.sutando/memory-sync" case_legacy_migrates
 run_case "SUTANDO_MEMORY_SYNC_DIR env pin skips migration"               case_env_pin_skips_migration
 run_case "target already exists -> no clobber, no migration"             case_target_exists_skips_migration
 run_case "idempotent: second run is silent no-op"                        case_idempotent_second_run
 run_case "fresh install (no legacy) is silent no-op"                     case_no_legacy_no_op
+run_case "SCRIPT_DIR resolves through symlink (issue #1436)"             case_script_dir_resolves_through_symlink
 
 echo ""
 echo "$PASS passed, $FAIL failed"

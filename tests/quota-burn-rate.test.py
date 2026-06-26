@@ -25,6 +25,7 @@ _SCRIPT = REPO / "skills" / "quota-tracker" / "scripts" / "read-quota.py"
 def _load_module(workspace: Path):
     """Load read-quota.py with a controlled workspace and a dummy quota-state.json."""
     os.environ["SUTANDO_WORKSPACE"] = str(workspace)
+    os.environ["SUTANDO_TEST_MODE"] = "1"  # v0.8: opt-in env-honor
     sys.modules.pop("read_quota", None)
     sys.modules.pop("read_quota_under_test", None)
 

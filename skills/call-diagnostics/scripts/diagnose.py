@@ -35,8 +35,9 @@ METRICS_PATH = _cwd_path if _cwd_path.exists() else _script_path
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 from workspace_default import resolve_workspace  # noqa: E402
 
-# conversation.sqlite lives under the resolved workspace (~/.sutando/workspace),
-# the same tree the runtime writers use — not the repo root.
+# conversation.sqlite lives under the resolved workspace (post-v0.8 default
+# `<repo>/workspace/`; configurable via `sutando.config.local.json`), the same
+# tree the runtime writers use — not the repo root.
 SQLITE_PATH = Path(os.environ.get(
     "SUTANDO_CONVERSATION_DB",
     resolve_workspace(migrate=False) / "data" / "conversation.sqlite"))
@@ -72,7 +73,7 @@ def _load_from_sqlite(call_sid=None, last_n=1):
     `tool_calls`, `events` that don't exist on the current `sessions` schema
     (a schema rev that never landed). Events live in the `session_events`
     table joined by `session_id`; tool-call aggregation is reconstructed
-    from per-source transcript tables (`phone` / `voice` / `discord_voice`)
+    from per-surface transcript tables (e.g. `phone` / `voice`)
     where `kind='tool_call'` rows carry the tool name in `text` and the
     duration in `duration_ms`. Mini's "minimum diff" suggestion from the
     issue — keeps the downstream detector contract unchanged.
@@ -113,9 +114,9 @@ def _load_from_sqlite(call_sid=None, last_n=1):
             d["sessionId"] = d.pop("session_id") or d["callSid"]
             d["isOwner"] = bool(d.pop("is_owner")) if d.get("is_owner") is not None else None
             d["isMeeting"] = bool(d.pop("is_meeting")) if d.get("is_meeting") is not None else None
-            # Normalize source for surface-table lookup: recordSession() stores
-            # discord voice as `discord-voice` (hyphen) but the per-source table
-            # is `discord_voice` (underscore). (#1357 review — Echo)
+            # Normalize source for surface-table lookup: recordSession() may
+            # store a source with hyphens, but per-surface table names use
+            # underscores. (#1357 review — Echo)
             source = (d.get("source") or "phone").replace("-", "_")
             d["events"] = _load_session_events(db, source, d["sessionId"], d["callSid"])
             d["toolCalls"] = _load_session_tool_calls(db, source, d["sessionId"], d["callSid"])
@@ -130,13 +131,32 @@ def _load_from_sqlite(call_sid=None, last_n=1):
         return None
 
 
+_IDENT_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
+_NON_SURFACE_TABLES = {"sessions", "session_events", "conversation", "tool_calls"}
+
+
+def _surface_table(db, source):
+    """Resolve `source` to its per-surface transcript table, plugin-agnostically.
+    Returns the table name iff `source` is a safe identifier naming a real table
+    with the surface schema (ts_unix/kind/text/session_id) — else None. Both
+    guards against SQL injection on the table name AND lets the tool diagnose any
+    plugin-registered surface without hardcoding one."""
+    if not source or not _IDENT_RE.match(source) or source in _NON_SURFACE_TABLES:
+        return None
+    try:
+        cols = {r[1] for r in db.execute(f"PRAGMA table_info({source})").fetchall()}
+    except Exception:
+        return None
+    return source if {"ts_unix", "kind", "text", "session_id"} <= cols else None
+
+
 def _load_session_events(db, source, session_id, call_sid):
     """Ordered events for a session, in the legacy jsonl `events` shape
     ({timestamp, event}). Combines two sources:
 
       1. lifecycle events from `session_events` (event_name), and
       2. reconstructed turn events from the per-source surface table
-         (`phone`/`voice`/`discord_voice`): `user` -> `caller:<text>`,
+         (e.g. `phone` / `voice`): `user` -> `caller:<text>`,
          `agent` -> `sutando:<text>`, `tool_call` -> `tool_call:<name>`.
 
     (2) is required because `session_events` deliberately omits the
@@ -155,7 +175,7 @@ def _load_session_events(db, source, session_id, call_sid):
         rows.extend((r["ts_unix"], r["detail"]) for r in cur.fetchall())
     except Exception:
         pass
-    table = {"phone": "phone", "voice": "voice", "discord_voice": "discord_voice"}.get(source)
+    table = _surface_table(db, source)
     if table:
         try:
             cur = db.execute(
@@ -193,7 +213,7 @@ def _load_session_events(db, source, session_id, call_sid):
 
 def _load_session_tool_calls(db, source, session_id, call_sid):
     """Fetch ordered tool_call rows for a session from the source-specific
-    transcript table (`phone` / `voice` / `discord_voice`).
+    transcript table (e.g. `phone` / `voice`).
 
     Each row has `kind='tool_call'`, the tool name in `text`, and duration
     in `duration_ms`. Returns a list of {timestamp, name, durationMs} dicts
@@ -201,7 +221,7 @@ def _load_session_tool_calls(db, source, session_id, call_sid):
     # Only these source tables carry per-turn rows including tool_call kind.
     # If the source is unrecognized, return empty rather than risking a SQL
     # injection on the table name.
-    table = {"phone": "phone", "voice": "voice", "discord_voice": "discord_voice"}.get(source)
+    table = _surface_table(db, source)
     if table is None:
         return []
     try:

@@ -20,12 +20,14 @@ class TestOutboxAppend(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.workspace = Path(self.tmp.name)
         os.environ["SUTANDO_WORKSPACE"] = str(self.workspace)
+        os.environ["SUTANDO_TEST_MODE"] = "1"  # v0.8: opt-in env-honor
         # Some helper modules cache resolve_workspace via module-level constants;
         # outbox_log does NOT cache (calls _outbox_path() fresh on each append)
         # so we don't need to reload.
 
     def tearDown(self):
         os.environ.pop("SUTANDO_WORKSPACE", None)
+        os.environ.pop("SUTANDO_TEST_MODE", None)
         self.tmp.cleanup()
 
     def _read(self) -> list[dict]:
