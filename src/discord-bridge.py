@@ -59,6 +59,14 @@ from single_instance import acquire as _single_instance_acquire  # noqa: E402
 import discord_config  # noqa: E402  — Sutando workspace-local discord config (#1147)
 from util_paths import channel_access_path, claude_home_path, shared_personal_path  # noqa: E402
 from task_priority import default_priority_for_source  # noqa: E402
+
+# Observability: emit channel.discord.<in|out> into the local obs spine
+# (src/observability). Guarded so a missing module never crashes the bridge.
+try:
+    from observability.channel import emit_channel as _emit_channel  # noqa: E402
+except Exception:  # pragma: no cover — best-effort telemetry
+    def _emit_channel(*_a, **_k):  # type: ignore
+        return None
 from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
@@ -2863,7 +2871,11 @@ async def _handle_discord_message(message, force=False):
         else:
             return
 
-    print(f"  @{username}: {text}{attachment_note}")
+    # Redact any `vault set KEY VALUE` secret before logging. Without this, the
+    # raw print lands the secret in discord-bridge.log even though the intercept
+    # below (L~2939) would store/redact it — a plaintext-secret leak to the log.
+    # (2026-06-23 incident: an owner's telegram bot token leaked here.)
+    print(f"  @{username}: {redact_vault_commands(text)}{attachment_note}")
 
     # Determine access tier
     access_tier = "other"
@@ -2936,12 +2948,21 @@ async def _handle_discord_message(message, force=False):
     # untrusted senders — the actual secret never reaches the task file either way.
     if text:
         if access_tier == "owner":
-            vault_result = intercept_vault_commands(text)
-            text = vault_result.text
-            if vault_result.stored:
-                print(f"  [vault] stored keys: {vault_result.stored}", flush=True)
-            if vault_result.failed:
-                print(f"  [vault] store failed (still redacted): {vault_result.failed}", flush=True)
+            # Defensive: a failure inside intercept_vault_commands (e.g. a missing
+            # optional dep like detect_secrets — 2026-06-23 incident) must NOT
+            # crash the message handler AND must NOT leak the secret. On any
+            # exception, fall back to redaction so the raw `vault set` value never
+            # reaches the task file / downstream — it just isn't stored to Keychain.
+            try:
+                vault_result = intercept_vault_commands(text)
+                text = vault_result.text
+                if vault_result.stored:
+                    print(f"  [vault] stored keys: {vault_result.stored}", flush=True)
+                if vault_result.failed:
+                    print(f"  [vault] store failed (still redacted): {vault_result.failed}", flush=True)
+            except Exception as _vault_exc:
+                text = redact_vault_commands(text)
+                print(f"  [vault] intercept errored ({type(_vault_exc).__name__}: {_vault_exc}) — redacted, NOT stored", flush=True)
         else:
             text = redact_vault_commands(text)
 
@@ -3197,6 +3218,14 @@ async def _handle_discord_message(message, force=False):
     )
     pending_replies[task_id] = message.channel
     pending_task_tiers[task_id] = access_tier
+    # Observability: one inbound accepted-message event.
+    _emit_channel(
+        "discord", "in",
+        user_id=str(message.author.id),
+        channel_id=str(message.channel.id),
+        access_tier=access_tier,
+        data={"task_id": task_id, "is_dm": is_dm},
+    )
     # Track source-message-id so the result-sender can auto-attach reply_to
     # (visually thread the reply to the triggering message). Skipped when
     # the channel is already a Discord thread — thread context is enough.
@@ -3499,7 +3528,11 @@ async def poll_results():
                 # Clear the progress-streamer's tier map here (NOT only in
                 # poll_progress) so it's bounded even when the feature flag is
                 # OFF — otherwise this dict would leak one entry per task.
-                pending_task_tiers.pop(task_id, None)
+                # Capture the tier BEFORE the pop so the outbound obs event
+                # below labels actor.access_tier correctly. Fall back to
+                # "unknown" — never "owner" — so a lost/absent tier can't
+                # silently upgrade a non-owner reply in tier accounting.
+                _task_tier = pending_task_tiers.pop(task_id, None) or "unknown"
                 save_pending_replies()
                 # Skip sending if already replied directly (core agent used MCP).
                 # Clean up the result AND task files so the watcher doesn't
@@ -3771,6 +3804,16 @@ async def poll_results():
                     # would re-send on restart producing a duplicate.
                     _mark_delivered(task_id)
                     print(f"  Replied: {reply_text[:80]}...", flush=True)
+                    # Observability: one delivered-reply event.
+                    _emit_channel(
+                        "discord", "out",
+                        channel_id=str(getattr(channel, "id", "")),
+                        access_tier=_task_tier,
+                        data={
+                            "task_id": task_id,
+                            "is_dm": isinstance(channel, discord.DMChannel),
+                        },
+                    )
                 except Exception as e:
                     print(f"  Reply failed: {e}", flush=True)
                 # Archive (not delete) so we can mine patterns later.

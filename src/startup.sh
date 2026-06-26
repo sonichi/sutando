@@ -160,6 +160,13 @@ fi
 git -C "$REPO" config --unset committer.name 2>/dev/null || true
 git -C "$REPO" config --unset committer.email 2>/dev/null || true
 
+# Re-apply tracked plugin-cache patches (skills/plugin-patches/). Plugin caches
+# are managed like node_modules — clobbered on update + invisible to git/sync —
+# so a kept local edit must be re-applied per host. The applier is idempotent +
+# fail-loud: it never force-applies and a stale/missing patch WARNs without
+# failing startup. See skills/plugin-patches/README.md.
+python3 "$REPO/skills/plugin-patches/apply-plugin-patches.py" || true
+
 # Fail-fast .env validation BEFORE init.sh. Two reasons must both hold:
 #  1) init.sh resolves the workspace via `${SUTANDO_WORKSPACE/#~/$HOME}` with
 #     fallback to `~/.sutando/workspace/`. If .env carries a SUTANDO_WORKSPACE=
@@ -766,15 +773,28 @@ else
   echo "  ~ telegram bridge (no token — optional)"
 fi
 
-# AG2 remote relay client (optional channel — full docs + onboarding in
-# skills/ag2-relay/). Silent unless AG2_REMOTE_TOKEN is set; to connect a new
-# instance run:  bash skills/ag2-relay/onboard.sh
-if [ -n "${AG2_REMOTE_TOKEN:-}" ] && [ -f skills/ag2-relay/remote-task-client.py ]; then
-  if ! pgrep -f "remote-task-client" > /dev/null 2>&1; then
-    python3 skills/ag2-relay/remote-task-client.py > "$LOGS_DIR/remote-task-client.log" 2>&1 &
-    echo "  ✓ ag2 relay client"
+# Remote relay bridge (optional channel — generic, same shape as the discord/
+# telegram/slack blocks below). Config + token live in the channel .env, resolved
+# via the same claude-home-path helper; the bridge itself ships in src/ (provider-
+# neutral, like the others). Relay protocol: docs/remote-relay-protocol.md.
+# Deliberately silent when unconfigured — a Sutando-only user never sees it.
+# Back-compat: also detect/honor a legacy AG2_REMOTE_* token written to the repo
+# .env by older onboarding, so existing agents keep reconnecting after this lands
+# (until they re-onboard onto channels/ag2space/.env).
+if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env)"; \
+   { [ -f "$_RELAY_ENV" ] && grep -qE "^(REMOTE_TASK_TOKEN|AG2_REMOTE_TOKEN)=" "$_RELAY_ENV" 2>/dev/null; } \
+   || [ -n "${REMOTE_TASK_TOKEN:-}${AG2_REMOTE_TOKEN:-}" ]; then
+  [ -f "$_RELAY_ENV" ] && { set -a; . "$_RELAY_ENV"; set +a; }
+  # Map legacy AG2_REMOTE_* → REMOTE_TASK_* (the names the bridge reads). The
+  # legacy token may be the combined "url|secret" form, which the bridge splits.
+  REMOTE_TASK_TOKEN="${REMOTE_TASK_TOKEN:-${AG2_REMOTE_TOKEN:-}}"
+  REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-${AG2_REMOTE_TIER:-team}}"
+  export REMOTE_TASK_TOKEN REMOTE_TASK_TIER
+  if ! pgrep -f "remote-relay-bridge" > /dev/null 2>&1; then
+    python3 "$REPO/src/remote-relay-bridge.py" > "$LOGS_DIR/remote-relay-bridge.log" 2>&1 &
+    echo "  ✓ relay bridge"
   else
-    echo "  ✓ ag2 relay client (already running)"
+    echo "  ✓ relay bridge (already running)"
   fi
 fi
 
