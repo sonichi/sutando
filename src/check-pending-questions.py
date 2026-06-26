@@ -9,6 +9,7 @@ Use --force to bypass the 1-hour cooldown.
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -167,7 +168,9 @@ def notify_discord_dm(questions):
     if len(questions) > 5:
         lines.append(f"…and {len(questions) - 5} more")
     lines.append("")
-    lines.append("Reply here or edit pending-questions.md on the Mini to resolve.")
+    lines.append(
+        f"Reply here or edit pending-questions.md on {socket.gethostname().split('.')[0]} to resolve."
+    )
     path.write_text("\n".join(lines))
 
 

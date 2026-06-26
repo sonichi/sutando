@@ -33,19 +33,61 @@ _spec.loader.exec_module(vault_cli)
 class TestListVaultKeys(unittest.TestCase):
     def test_returns_sorted_keys(self):
         manifest = {"ZEBRA": {"stored_at": "x"}, "ALPHA": {"stored_at": "y"}}
-        with patch("builtins.open", mock_open(read_data=json.dumps(manifest))):
+        with patch.object(vault_intercept, "_read_manifest", return_value=manifest):
             result = vault_intercept.list_vault_keys()
         self.assertEqual(result, ["ALPHA", "ZEBRA"])
 
-    def test_empty_when_no_manifest(self):
-        with patch("builtins.open", side_effect=FileNotFoundError):
+    def test_empty_when_manifest_empty(self):
+        with patch.object(vault_intercept, "_read_manifest", return_value={}):
             result = vault_intercept.list_vault_keys()
         self.assertEqual(result, [])
 
-    def test_empty_on_corrupt_json(self):
-        with patch("builtins.open", mock_open(read_data="not-json")):
-            result = vault_intercept.list_vault_keys()
-        self.assertEqual(result, [])
+
+class TestReadManifest(unittest.TestCase):
+    """Read-error handling + canonical-preferred / legacy-fallback resolution."""
+
+    def _patch_paths(self, canonical, legacy):
+        return (
+            patch.object(vault_intercept, "_manifest_path", return_value=canonical),
+            patch.object(vault_intercept, "_LEGACY_MANIFEST_PATH", legacy),
+        )
+
+    def test_missing_returns_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p1, p2 = self._patch_paths(os.path.join(tmp, "c.json"), os.path.join(tmp, "l.json"))
+            with p1, p2:
+                self.assertEqual(vault_intercept._read_manifest(), {})
+
+    def test_corrupt_returns_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            canonical = os.path.join(tmp, "c.json")
+            with open(canonical, "w") as f:
+                f.write("not-json")
+            p1, p2 = self._patch_paths(canonical, os.path.join(tmp, "l.json"))
+            with p1, p2:
+                self.assertEqual(vault_intercept._read_manifest(), {})
+
+    def test_prefers_canonical_over_legacy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            canonical = os.path.join(tmp, "c.json")
+            legacy = os.path.join(tmp, "l.json")
+            with open(canonical, "w") as f:
+                json.dump({"NEW": {"stored_at": "t"}}, f)
+            with open(legacy, "w") as f:
+                json.dump({"OLD": {"stored_at": "t"}}, f)
+            p1, p2 = self._patch_paths(canonical, legacy)
+            with p1, p2:
+                self.assertEqual(sorted(vault_intercept._read_manifest()), ["NEW"])
+
+    def test_falls_back_to_legacy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            canonical = os.path.join(tmp, "c.json")  # absent
+            legacy = os.path.join(tmp, "l.json")
+            with open(legacy, "w") as f:
+                json.dump({"OLD": {"stored_at": "t"}}, f)
+            p1, p2 = self._patch_paths(canonical, legacy)
+            with p1, p2:
+                self.assertEqual(sorted(vault_intercept._read_manifest()), ["OLD"])
 
 
 class TestGetVaultKey(unittest.TestCase):
@@ -63,10 +105,17 @@ class TestGetVaultKey(unittest.TestCase):
 
 
 class TestRegisterKey(unittest.TestCase):
+    def _patch_paths(self, canonical, legacy):
+        return (
+            patch.object(vault_intercept, "_manifest_path", return_value=canonical),
+            patch.object(vault_intercept, "_LEGACY_MANIFEST_PATH", legacy),
+        )
+
     def test_new_key_written_to_manifest(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             manifest_path = os.path.join(tmpdir, "keys.json")
-            with patch.object(vault_intercept, "_MANIFEST_PATH", manifest_path):
+            p1, p2 = self._patch_paths(manifest_path, os.path.join(tmpdir, "legacy.json"))
+            with p1, p2:
                 vault_intercept._register_key("NEW_KEY")
             with open(manifest_path) as f:
                 data = json.load(f)
@@ -78,12 +127,28 @@ class TestRegisterKey(unittest.TestCase):
             manifest_path = os.path.join(tmpdir, "keys.json")
             with open(manifest_path, "w") as f:
                 json.dump({"OLD": {"stored_at": "2020"}}, f)
-            with patch.object(vault_intercept, "_MANIFEST_PATH", manifest_path):
+            p1, p2 = self._patch_paths(manifest_path, os.path.join(tmpdir, "legacy.json"))
+            with p1, p2:
                 vault_intercept._register_key("OLD")
             with open(manifest_path) as f:
                 data = json.load(f)
             self.assertIn("OLD", data)
             self.assertNotEqual(data["OLD"]["stored_at"], "2020")
+
+    def test_first_write_migrates_legacy_keys(self):
+        """Canonical absent + legacy present → first write inherits legacy keys
+        (and creates the nested canonical dir)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            canonical = os.path.join(tmpdir, "state", "secret-vault", "keys.json")  # nested, absent
+            legacy = os.path.join(tmpdir, "legacy.json")
+            with open(legacy, "w") as f:
+                json.dump({"A": {"stored_at": "t"}, "B": {"stored_at": "t"}}, f)
+            p1, p2 = self._patch_paths(canonical, legacy)
+            with p1, p2:
+                vault_intercept._register_key("C")
+            with open(canonical) as f:
+                data = json.load(f)
+            self.assertEqual(sorted(data), ["A", "B", "C"])
 
 
 class TestStoreRegistersKey(unittest.TestCase):
