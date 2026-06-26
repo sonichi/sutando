@@ -1446,25 +1446,51 @@ async function main() {
 		// never fired for the streamed case. Accumulate a per-turn buffer and test the
 		// running buffer (still anchored at the turn's start), resetting on the same turn
 		// boundaries that reset _suppressAudio.
-		let outputBuffer = '';
+		let outputBuffer = '';   // running per-turn buffer, anchored at the turn's start
+		let heldText = '';       // clean output held back until proven NOT a fabrication prefix
 		let turnFabricated = false;
+		let turnCleared = false; // once true, this turn is confirmed clean → stream directly
+		// Gap 3 (Pro re-review 2026-06-26): the gap-2 buffer still forwarded each chunk
+		// immediately, so a fabricated prefix split across chunks ("[Sys" | "tem: …") leaked
+		// its first fragment to the transcript before the buffer completed the match. Now we
+		// HOLD output until the buffer either MATCHES (suppress — nothing was forwarded) or
+		// DIVERGES from every fabricated prefix (flush + stream the rest of the turn). The
+		// anchored alternatives all begin with '[', 'S'/'s', or '<', so a normal turn clears
+		// within a couple of chars (negligible latency); only a real prefix is held.
+		const FAB_PREFIXES = ['[system:', 'system:', '[silence', '<ctrl'];
+		const couldStillBeFabrication = (raw: string): boolean => {
+			const s = raw.replace(/^\s+/, '').toLowerCase();
+			if (s.length === 0) return true;   // only whitespace so far — undecided
+			if (s.length > 24) return false;   // safety cap: far past any real fabricated prefix
+			return FAB_PREFIXES.some((p) => p.startsWith(s) || s.startsWith(p));
+		};
 		transport.onOutputTranscription = (text: string) => {
 			const chunk = text ?? ''; // guard: null/undefined delta must not throw the pipeline
-			if (turnFabricated) return; // already detected this turn — suppress the rest
+			if (turnFabricated) return;                                      // already suppressed
+			if (turnCleared) { origOnOutputTranscription?.(chunk); return; } // confirmed clean → stream
 			outputBuffer += chunk;
+			heldText += chunk;                                               // hold; do not forward yet
 			if (FABRICATED_OUTPUT_RE.test(outputBuffer.trim())) {
 				console.error(`${ts()} [OutputSanitizer] BLOCKED fabricated directive spoken aloud: ${outputBuffer.slice(0, 120)}`);
 				turnFabricated = true;
 				// Best-effort: suppress remaining audio chunks in this turn.
 				if ('_suppressAudio' in transport) transport._suppressAudio = true;
-				return; // skip transcript storage for fabricated output
+				return; // nothing held is ever forwarded — no split-chunk leak
 			}
-			origOnOutputTranscription?.(chunk);
+			if (!couldStillBeFabrication(outputBuffer)) {                     // diverged → clean
+				turnCleared = true;
+				const flush = heldText; heldText = '';
+				origOnOutputTranscription?.(flush);
+			}
 		};
-		// Reset per-turn sanitizer state at turn boundaries so the next turn is unaffected.
+		// Reset per-turn sanitizer state at turn boundaries. Flush any still-held CLEAN text so a
+		// short turn that ended mid-hold (e.g. the whole turn was just "Sure") isn't dropped.
 		const resetTurn = () => {
+			if (heldText && !turnFabricated) { try { origOnOutputTranscription?.(heldText); } catch {} }
 			outputBuffer = '';
+			heldText = '';
 			turnFabricated = false;
+			turnCleared = false;
 			if (transport && '_suppressAudio' in transport) transport._suppressAudio = false;
 		};
 		session.eventBus.subscribe('turn.end', resetTurn);
