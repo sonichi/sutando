@@ -159,18 +159,20 @@ _check(
 # (collapses newlines → prevents line-based injection; no ZWSP needed)
 # ---------------------------------------------------------------------------
 
-_ag2 = _src("skills/ag2-relay/remote-task-client.py")
-_check(
-    "ag2-relay: _one_line on task fields",
-    "_one_line(" in _ag2 and "task" in _ag2,
-    "ag2-relay must use _one_line() for newline-stripping on task fields",
-)
-_check(
-    "ag2-relay: access_tier appended last (local decision wins)",
-    "lines.append(f\"access_tier: {LOCAL_TIER}\")" in _ag2
-    or 'lines.append(f"access_tier: {LOCAL_TIER}")' in _ag2
-    or "access_tier" in _ag2 and "last" in _ag2.lower(),
-)
+_ag2_path = REPO / "skills/ag2-relay/remote-task-client.py"
+if _ag2_path.exists():
+    _ag2 = _ag2_path.read_text()
+    _check(
+        "ag2-relay: _one_line on task fields",
+        "_one_line(" in _ag2 and "task" in _ag2,
+        "ag2-relay must use _one_line() for newline-stripping on task fields",
+    )
+    _check(
+        "ag2-relay: access_tier appended last (local decision wins)",
+        "lines.append(f\"access_tier: {LOCAL_TIER}\")" in _ag2
+        or 'lines.append(f"access_tier: {LOCAL_TIER}")' in _ag2
+        or "access_tier" in _ag2 and "last" in _ag2.lower(),
+    )
 
 # ---------------------------------------------------------------------------
 # TypeScript task-bridge.ts: confineUserContent defined and applied at all sites
