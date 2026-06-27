@@ -3200,22 +3200,37 @@ async def _handle_discord_message(message, force=False):
         lines.append(f"{step}. Process transcript and write result to results/{task_id}.txt")
         discord_skill_hints = "\n" + "\n".join(lines) + "\n"
 
-    task_file.write_text(
-        f"id: {task_id}\n"
-        f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
-        f"task: {user_task_text}\n"
-        f"source: discord\n"
-        f"channel_id: {message.channel.id}\n"
-        f"channel_name: {channel_name}\n"
-        f"guild_name: {guild_name}\n"
-        f"source_message_id: {message.id}\n"
-        f"{parent_msg_line}"
-        f"user_id: {message.author.id}\n"
-        f"access_tier: {access_tier}\n"
-        f"priority: {priority}\n"
-        f"{tier_instructions.get(access_tier, tier_instructions['other'])}"
-        f"{discord_skill_hints}"
-    )
+    # Instrumentation (2026-06-23): make a silent "message received but no task
+    # written" drop diagnosable. The owner saw several messages vanish with no
+    # task file and no error; every early `return` above already logs, so the
+    # gap is here at the write (an exception in the f-string build or write_text
+    # would otherwise lose the message with no trace). Log the outcome either way
+    # — a future drop now self-diagnoses: absence of BOTH this line and an
+    # early-return log pinpoints a new path; a FAILED line pinpoints the write.
+    try:
+        task_file.write_text(
+            f"id: {task_id}\n"
+            f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
+            f"task: {user_task_text}\n"
+            f"source: discord\n"
+            f"channel_id: {message.channel.id}\n"
+            f"channel_name: {channel_name}\n"
+            f"guild_name: {guild_name}\n"
+            f"source_message_id: {message.id}\n"
+            f"{parent_msg_line}"
+            f"user_id: {message.author.id}\n"
+            f"access_tier: {access_tier}\n"
+            f"priority: {priority}\n"
+            f"{tier_instructions.get(access_tier, tier_instructions['other'])}"
+            f"{discord_skill_hints}"
+        )
+    except Exception as _tw_exc:
+        print(f"  [task-write] FAILED for @{username} in #{channel_name} "
+              f"(tier={access_tier}, msg={message.id}): "
+              f"{type(_tw_exc).__name__}: {_tw_exc}", flush=True)
+        return
+    print(f"  [task-write] wrote {task_file.name} "
+          f"(@{username}, #{channel_name}, tier={access_tier})", flush=True)
     pending_replies[task_id] = message.channel
     pending_task_tiers[task_id] = access_tier
     # Observability: one inbound accepted-message event.
