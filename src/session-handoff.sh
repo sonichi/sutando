@@ -124,6 +124,34 @@ print(f'5h: {d[\"utilization_5h\"]:.0%} (resets in {m5}min at {r5.strftime(\"%I:
   # Stars
   echo "## Repo Stats"
   gh api repos/sonichi/sutando --jq '.stargazers_count, .forks_count' 2>/dev/null | tr '\n' ' ' | awk '{print $1 " stars, " $2 " forks"}' || echo "(couldn't fetch)"
+  echo ""
+
+  # Relay notes — cross-session narrative (written by /relay + proactive-loop
+  # step 7). Drain on read: move ALL to processed/ so the next compaction
+  # doesn't re-include them. Inline the newest RELAY_INLINE_CAP (default 8)
+  # so a large first-run backlog (from the gap when catchup-after-startup was
+  # removed by #1737) doesn't flood session-state.md with stale context.
+  # Fixes #1738: restores the read-side that #1737 removed.
+  RELAY_DIR="$WORKSPACE_DIR/relay"
+  RELAY_PROCESSED="$RELAY_DIR/processed"
+  RELAY_INLINE_CAP="${SUTANDO_RELAY_INLINE_CAP:-8}"
+  # shellcheck disable=SC2012  # ls -t for mtime order; no spaces in filenames
+  RELAY_FILES=$(ls -t "$RELAY_DIR"/relay-*.md 2>/dev/null)
+  if [ -n "$RELAY_FILES" ]; then
+    mkdir -p "$RELAY_PROCESSED"
+    echo "## Relay Notes (from prior session)"
+    _n=0
+    for _rf in $RELAY_FILES; do
+      if [ "$_n" -lt "$RELAY_INLINE_CAP" ]; then
+        echo "### $(basename "$_rf")"
+        cat "$_rf"
+        echo ""
+      fi
+      _n=$((_n + 1))
+      mv "$_rf" "$RELAY_PROCESSED/" 2>/dev/null || true
+    done
+    [ "$_n" -gt "$RELAY_INLINE_CAP" ] && echo "_(+$((_n - RELAY_INLINE_CAP)) older relay notes drained to processed/, not inlined)_"
+  fi
 
 } > "$STATE_FILE" 2>/dev/null
 
