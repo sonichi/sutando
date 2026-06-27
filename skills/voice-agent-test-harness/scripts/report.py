@@ -8,8 +8,16 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from pathlib import Path
+
+# Canonical workspace resolution. workspace_default lives in <repo>/src; this
+# script is at <repo>/skills/voice-agent-test-harness/scripts/, so parents[3]
+# is <repo>. (parents[3] avoids a .parent.parent chain so the workspace lint
+# does not conflate this import bootstrap with workspace-path resolution.)
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+from workspace_default import resolve_workspace  # noqa: E402
 
 
 def _percentile(values: list[float], pct: float) -> float | None:
@@ -65,8 +73,8 @@ def render(run: dict, regressions: list[str], date: str) -> str:
 
 def deliver(text: str, workspace: str | None = None) -> str:
     """Write a result file the bridge delivers to Telegram. Returns the path."""
-    ws = workspace or os.environ.get("SUTANDO_WORKSPACE") or os.path.expanduser("~/.sutando/workspace")
-    results = Path(ws) / "results"
+    ws = Path(workspace) if workspace else resolve_workspace()
+    results = ws / "results"
     results.mkdir(parents=True, exist_ok=True)
     ts = int(time.time())
     path = results / f"proactive-{ts}.txt"
