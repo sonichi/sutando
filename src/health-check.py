@@ -187,7 +187,7 @@ def check_memory_sync() -> dict:
     elif sync_dir_legacy.exists():
         sync_dir = sync_dir_legacy
     else:
-        return {"name": name, "status": "warn", "detail": "repo configured but never synced — run bash scripts/sync-memory.sh"}
+        return {"name": name, "status": "warn", "detail": "repo configured but never synced — run bash scripts/sync-workspace.sh --init"}
     git_dir = sync_dir / ".git" / "FETCH_HEAD"
     if git_dir.exists():
         age_h = (time.time() - git_dir.stat().st_mtime) / 3600
