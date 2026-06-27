@@ -9,7 +9,10 @@
 
 export type Outcome = 'ok' | 'error' | 'denied';
 
-export type AccessTier = 'owner' | 'team' | 'public';
+// `public` is the canonical non-owner-external tier (the bridges' "other" maps
+// onto it); `unknown` is the fail-safe when a tier can't be resolved (never
+// assume `owner`). Emitters normalize their own vocabulary onto this union.
+export type AccessTier = 'owner' | 'team' | 'public' | 'unknown';
 
 /**
  * The emitting process/service — WHICH PROCESS produced the event (distinct from

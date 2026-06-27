@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit test for skills/ag2-relay/remote-task-client.py against an in-process mock relay.
+"""Unit test for src/remote-relay-bridge.py against an in-process mock relay.
 
 CI-safe: spins up a localhost HTTP stub, no external network/deps. Exits 0 on
 pass, 1 on fail.
@@ -8,7 +8,7 @@ Covers: task pull → local file write (correct schema + atomic), task ack,
 heartbeat, result file → POST back (correct payload + auth header),
 idempotent re-write, auth rejection.
 
-Run: python3 skills/ag2-relay/remote-task-client.test.py
+Run: python3 src/remote-relay-bridge.test.py
 """
 from __future__ import annotations
 
@@ -113,7 +113,7 @@ def main() -> int:
 
     # import the hyphenated module by path (env must be set first — module reads
     # config + resolves workspace at import time)
-    spec = importlib.util.spec_from_file_location("rtc", Path(__file__).resolve().parent / "remote-task-client.py")
+    spec = importlib.util.spec_from_file_location("rtc", Path(__file__).resolve().parent / "remote-relay-bridge.py")
     rtc = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(rtc)
 

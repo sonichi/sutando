@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-remote-task-client.py — generic client that bridges a REMOTE task relay to the
+remote-relay-bridge.py — generic client that bridges a REMOTE task relay to the
 local Sutando file queue, so the local core processes remote tasks unchanged.
 
 This is the OPEN, provider-agnostic half of the "agent as a service" design: a
@@ -9,7 +9,9 @@ exposes a tiny HTTP protocol; this client pulls *your* tasks down into the local
 `tasks/` queue and pushes results back up. No provider-specific logic lives here
 — that's the relay's job.
 
-Protocol (versioned, Bearer-auth):
+Full spec: docs/remote-relay-protocol.md
+
+  Protocol (versioned, Bearer-auth):
   GET  {REMOTE_TASK_URL}/v1/tasks?wait=<sec>
        → 200 {"tasks": [ {<task fields...>}, ... ]}   (long-poll; [] on timeout)
   POST {REMOTE_TASK_URL}/v1/tasks/<task-id>/ack
@@ -27,9 +29,9 @@ if an older relay returns 404/405, the client keeps working against the
 original pull/result protocol.
 
 Config (env / .env):
-  AG2_REMOTE_TOKEN      the onboarding string — the ONLY required setting
+  REMOTE_TASK_TOKEN      the onboarding string — the ONLY required setting
                         (combined "https://<relay>|<secret>" or a bare secret)
-  AG2_REMOTE_URL        relay base URL (only needed with a bare secret)
+  REMOTE_TASK_URL        relay base URL (only needed with a bare secret)
   REMOTE_TASK_URL/_TOKEN  legacy aliases
   REMOTE_TASK_PROVIDER  label used for the task `source:` field (default "remote")
   REMOTE_TASK_POLL_WAIT long-poll seconds (default 25)
@@ -65,16 +67,32 @@ ARCHIVE_RESULTS_DIR = RESULTS_DIR / "archive"
 # cross-send other channels' (Discord/Telegram) results to the relay.
 INFLIGHT_FILE = WS / "state" / "remote-task-inflight.json"
 
-# One-token onboarding: AG2_REMOTE_TOKEN alone is enough. The onboarding
+# Back-compat: instances onboarded before the AG2_REMOTE_* → REMOTE_TASK_*
+# rename still export the legacy names in their .env. Honor them as DEPRECATED
+# aliases for one release (remove next), with a one-line migration nudge, so the
+# bridge keeps connecting under any launcher. New onboards use REMOTE_TASK_*.
+_warned_legacy = set()
+def _env_compat(new, old):
+    v = os.environ.get(new)
+    if v:
+        return v
+    v = os.environ.get(old)
+    if v and old not in _warned_legacy:
+        _warned_legacy.add(old)
+        print(f"[remote-relay-bridge] {old} is deprecated — rename to {new} in your .env",
+              file=sys.stderr, flush=True)
+    return v
+
+# One-token onboarding: REMOTE_TASK_TOKEN alone is enough. The onboarding
 # string may be the combined "https://<relay>|<secret>" form (the URL travels
 # inside the token — nothing service-specific lives in this repo); a bare
-# secret needs AG2_REMOTE_URL/REMOTE_TASK_URL alongside it.
-_RAW = os.environ.get("AG2_REMOTE_TOKEN") or os.environ.get("REMOTE_TASK_TOKEN") or ""
+# secret needs REMOTE_TASK_URL alongside it.
+_RAW = _env_compat("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN") or ""
 if "|" in _RAW:
     _URL_FROM_TOKEN, TOKEN = _RAW.split("|", 1)
 else:
     _URL_FROM_TOKEN, TOKEN = "", _RAW
-URL = (os.environ.get("AG2_REMOTE_URL") or os.environ.get("REMOTE_TASK_URL")
+URL = (_env_compat("REMOTE_TASK_URL", "AG2_REMOTE_URL")
        or _URL_FROM_TOKEN).rstrip("/")
 PROVIDER = os.environ.get("REMOTE_TASK_PROVIDER") or "remote"
 POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
@@ -88,10 +106,10 @@ _TASK_FIELDS = ("id", "timestamp", "task", "source", "channel_id",
 
 # Trust tier is a LOCAL decision (review 2026-06-13): the relay is outside
 # this machine's trust boundary, so its access_tier claim is ignored. The
-# tier written to every task file comes from AG2_REMOTE_TIER in .env —
+# tier written to every task file comes from REMOTE_TASK_TIER in .env —
 # default "team" (sandboxed processing). Operators who own their relay can
-# explicitly set AG2_REMOTE_TIER=owner.
-LOCAL_TIER = (os.environ.get("AG2_REMOTE_TIER") or "team").strip().lower()
+# explicitly set REMOTE_TASK_TIER=owner.
+LOCAL_TIER = (_env_compat("REMOTE_TASK_TIER", "AG2_REMOTE_TIER") or "team").strip().lower()
 if LOCAL_TIER not in ("owner", "team", "other"):
     LOCAL_TIER = "team"
 
@@ -115,7 +133,7 @@ def _one_line(value) -> str:
 
 
 def _log(msg: str) -> None:
-    print(f"[remote-task-client] {msg}", flush=True)
+    print(f"[remote-relay-bridge] {msg}", flush=True)
 
 
 def _req(method: str, path: str, payload: dict | None = None, timeout: int = 35):
@@ -293,7 +311,7 @@ def _post_ready_results(inflight: set[str]) -> None:
 
 def main() -> None:
     if not URL or not TOKEN:
-        sys.exit("FATAL: set AG2_REMOTE_TOKEN (and AG2_REMOTE_URL if your token is a bare secret).")
+        sys.exit("FATAL: set REMOTE_TASK_TOKEN (and REMOTE_TASK_URL if your token is a bare secret).")
     inflight: set[str] = _load_inflight()
     _log(f"starting — relay={URL} provider={PROVIDER} workspace={WS} "
          f"(restored {len(inflight)} in-flight)")
@@ -322,7 +340,7 @@ def main() -> None:
             backoff = 1  # healthy round-trip → reset backoff
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
-                sys.exit(f"FATAL: relay auth rejected (HTTP {e.code}) — check AG2_REMOTE_TOKEN.")
+                sys.exit(f"FATAL: relay auth rejected (HTTP {e.code}) — check REMOTE_TASK_TOKEN.")
             _log(f"poll HTTP {e.code} — backing off {backoff}s")
             time.sleep(backoff); backoff = min(backoff * 2, 60)
         except (urllib.error.URLError, TimeoutError) as e:

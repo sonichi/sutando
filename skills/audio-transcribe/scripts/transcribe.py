@@ -18,6 +18,13 @@ import sys
 import urllib.request
 from pathlib import Path
 
+# Canonical workspace resolution. workspace_default lives in <repo>/src; this
+# script is at <repo>/skills/audio-transcribe/scripts/, so parents[3] is <repo>.
+# (parents[3] is used instead of a .parent.parent chain so the workspace lint
+# does not conflate this import bootstrap with workspace-path resolution.)
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+from workspace_default import resolve_workspace  # noqa: E402
+
 _AUDIO_MIME: dict[str, str] = {
     ".m4a": "audio/mp4",
     ".mp4": "audio/mp4",
@@ -43,11 +50,8 @@ def _api_key() -> str:
         if val:
             return val
     # Walk candidate .env files: workspace root, then common bridge credential dirs.
-    workspace = os.environ.get("SUTANDO_WORKSPACE", "")
-    if not workspace:
-        workspace = str(Path.home() / ".sutando" / "workspace")
     candidates = [
-        Path(workspace) / ".env",
+        resolve_workspace() / ".env",
         _claude_config() / "channels" / "slack" / ".env",
         _claude_config() / "channels" / "discord" / ".env",
         _claude_config() / "channels" / "telegram" / ".env",

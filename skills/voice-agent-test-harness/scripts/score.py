@@ -10,6 +10,7 @@ import base64
 import json
 import os
 import re
+import sys
 import urllib.request
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -20,7 +21,10 @@ JUDGE_MODEL = os.environ.get("VTH_JUDGE_MODEL", "gemini-2.5-flash")
 _ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
 
 _REPO = Path(__file__).resolve().parents[3]
-_WS = Path(os.environ.get("SUTANDO_WORKSPACE", Path.home() / ".sutando" / "workspace"))
+sys.path.insert(0, str(_REPO / "src"))
+from workspace_default import resolve_workspace  # noqa: E402
+
+_WS = resolve_workspace()
 
 _JUDGE_SYSTEM = """You are grading a voice assistant's spoken reply.
 You receive the prompt it was given, what a correct reply should contain, an STT
