@@ -229,10 +229,10 @@ const deactivateScreenCompanionTool: ToolDefinition = {
 // Gemini Live session. Designed for pull-mode (configs that don't stream).
 
 // Injection seams for tests — production code uses the imported defaults.
-let _readSelection: () => SelectionResult | null = defaultReadSelection;
+let _readSelection: (timeoutMs?: number) => SelectionResult | null = defaultReadSelection;
 let _captureSendFrame: typeof captureSendFrame = captureSendFrame;
 export function _setVisionQueryDeps(deps: {
-	readSelection?: () => SelectionResult | null;
+	readSelection?: (timeoutMs?: number) => SelectionResult | null;
 	captureSendFrame?: typeof captureSendFrame;
 }): void {
 	if (deps.readSelection) _readSelection = deps.readSelection;
