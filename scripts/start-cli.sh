@@ -21,6 +21,43 @@ cd "$REPO"
 TMUX_SOCKET="/tmp/sutando-tmux.sock"
 SESSION="sutando-core"
 
+# Optional working-directory override for the core `claude` process.
+#   - Unset (upstream default): no override — the core launches from $REPO (the
+#     script's cwd), exactly as before. Zero behavior change for OSS installs.
+#   - Set (e.g. Sutando.app exports SUTANDO_CLAUDE_WORKING_DIR=$HOME/.sutando/repo):
+#     anchor the core's CWD there instead. Claude Code slugs its project /
+#     auto-memory dir off the cwd, so a stable cwd (not $REPO, which moves across
+#     upgrades / app bundles) keeps that project + memory continuous.
+#     SCOPE: this sets ONLY the cwd. It does NOT relocate CLAUDE_CONFIG_DIR
+#     (sessions / memory / config) — that is resolved independently from
+#     sutando.config's `workspace.path` (read via scripts/sutando-config.sh,
+#     below). If $REPO is a moving bundle path, set `workspace.path` to a stable
+#     location too; this env var alone won't move CLAUDE_CONFIG_DIR off $REPO.
+# Applied uniformly via a tmux `-c` arg array (and a plain `cd` on the no-tmux
+# fallback) so every launch branch agrees. The ${arr[@]+...} expansions below
+# keep the empty (unset) case safe on bash 3.2 under `set -u`, same pattern as
+# MODEL_ARGS / SETTINGS_ARGS.
+#
+# CANONICALIZE ONCE, REUSE EVERYWHERE: Claude Code keys the folder-trust dialog
+# (and the project/auto-memory slug) by the process's ABSOLUTE cwd — getcwd(),
+# with symlinks resolved. So resolve the override to its physical absolute path
+# here and re-export it; the SAME value then feeds mkdir, tmux `-c` / the no-tmux
+# `cd`, AND the trust-dialog seed in the onboarding block below. A raw value with
+# a leading ~, a relative segment, or a symlinked parent would otherwise seed
+# projects[<wrong key>] in .claude.json, and the detached no-TTY core would still
+# hang at the trust prompt. Expand a leading ~, create the dir (fail loud with a
+# scoped message if we can't — better than chdir'ing into the wrong place under
+# set -e's raw error), then resolve via `cd … && pwd -P`.
+CWD_ARGS=()
+if [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ]; then
+  _cwd_exp="${SUTANDO_CLAUDE_WORKING_DIR/#\~/$HOME}"
+  mkdir -p "$_cwd_exp" || { echo "  ✗ can't create core working dir: $_cwd_exp" >&2; exit 1; }
+  SUTANDO_CLAUDE_WORKING_DIR="$(cd "$_cwd_exp" && pwd -P)"
+  export SUTANDO_CLAUDE_WORKING_DIR
+  CWD_ARGS=(-c "$SUTANDO_CLAUDE_WORKING_DIR")
+  echo "  ✓ core working dir: $SUTANDO_CLAUDE_WORKING_DIR"
+fi
+
 # Resolve workspace-scoped CLAUDE_CONFIG_DIR. The interactive `claude-sutando`
 # shell function does the same per-invocation; this is the machine-spawn
 # equivalent so the tmux-wrapped core process writes sessions / memory / state
@@ -50,13 +87,19 @@ if [ -x "$REPO/scripts/sutando-config.sh" ]; then
     # moment the user attaches the Core CLI. Seed only that flag (merge — never
     # clobber oauthAccount/projects/mcpServers/credentials), carrying `theme`
     # from the user's global ~/.claude.json when present so the theme picker is
-    # skipped too. Idempotent + atomic. We do NOT touch any permission/approval
-    # gate (e.g. bypassPermissionsModeAccepted) — that's the user's to accept.
+    # skipped too. Idempotent + atomic. When SUTANDO_CLAUDE_WORKING_DIR is set we
+    # ALSO pre-accept the folder-trust dialog for that ONE directory (trust-seed
+    # in the python below) — otherwise a fresh node's first detached launch
+    # dead-ends at "Do you trust the files in this folder?", which
+    # --dangerously-skip-permissions does NOT bypass, and the core hangs with no
+    # TTY to answer it. Gated on the opt-in env var so we only ever trust the dir
+    # the operator explicitly chose, never arbitrary paths. We still do NOT touch
+    # the global bypassPermissionsModeAccepted gate — that's the user's to accept.
     # This is the single launch chokepoint (Sutando.app's launchCore, the
     # terminal-server Core CLI pane, and src/startup.sh all exec this script),
     # so seeding here covers every path.
     if command -v python3 > /dev/null 2>&1; then
-      _ccd="$_ccd" python3 - <<'PY' || echo "  ⚠ onboarding-seed skipped (non-fatal)"
+      _ccd="$_ccd" _cwd="${SUTANDO_CLAUDE_WORKING_DIR:-}" python3 - <<'PY' || echo "  ⚠ onboarding-seed skipped (non-fatal)"
 import json, os
 ccd = os.environ["_ccd"]
 target = os.path.join(ccd, ".claude.json")
@@ -81,12 +124,31 @@ if cfg.get("hasCompletedOnboarding") is not True:
 if cfg.get("theme") is None and glob.get("theme") is not None:
     cfg["theme"] = glob["theme"]
     changed = True
+# Trust-seed for the explicitly-configured working dir. Claude Code keys the
+# folder-trust dialog on projects[<abs cwd>].hasTrustDialogAccepted; a fresh
+# scoped config lacks it for a custom cwd, so the detached core would hang on
+# the prompt. Only pre-trust the one dir the operator chose (env-gated).
+cwd = os.environ.get("_cwd") or ""
+trusted_dir = None
+if cwd:
+    projects = cfg.get("projects")
+    if not isinstance(projects, dict):
+        projects = cfg["projects"] = {}
+    entry = projects.get(cwd)
+    if not isinstance(entry, dict):
+        entry = projects[cwd] = {}
+    if entry.get("hasTrustDialogAccepted") is not True:
+        entry["hasTrustDialogAccepted"] = True
+        changed = True
+        trusted_dir = cwd
 if changed:
     tmp = target + ".tmp"
     with open(tmp, "w") as f:
         json.dump(cfg, f, indent=2)
     os.replace(tmp, target)
     print("  ✓ onboarding-seed: hasCompletedOnboarding set in .claude.json")
+    if trusted_dir:
+        print("  ✓ trust-seed: hasTrustDialogAccepted set for %s" % trusted_dir)
 PY
     fi
   else
@@ -235,6 +297,7 @@ fi
 if ! command -v tmux > /dev/null 2>&1; then
   echo "  ⚠ tmux not found — running without tmux wrapper"
   echo "    (Sutando.app's watcher-auto-restart won't work; brew install tmux to enable)"
+  [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ] && cd "$SUTANDO_CLAUDE_WORKING_DIR"
   exec claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
     -- "/schedule-crons"
@@ -258,13 +321,18 @@ apply_tmux_defaults
 #     Claude Code prompt and the script process IS the tmux client.
 #   - No TTY (Sutando.app's Restart Core or any background invocation):
 #     start detached so we don't hang, server keeps running.
+#
+# NOTE: the working dir (`-c` in CWD_ARGS) applies only when `new-session -A`
+# CREATES the session. If the session already exists, `-A` attaches and the
+# start-directory is silently dropped — so re-anchoring a running core to a new
+# working dir must go through `--restart` (kill-then-create), not a bare rerun.
 if [ -t 1 ]; then
-  exec tmux -S "$TMUX_SOCKET" new-session -A -s "$SESSION" \
+  exec tmux -S "$TMUX_SOCKET" new-session -A -s "$SESSION" ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
     claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
     -- "/schedule-crons"
 else
-  tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" \
+  tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
     claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
     -- "/schedule-crons"
