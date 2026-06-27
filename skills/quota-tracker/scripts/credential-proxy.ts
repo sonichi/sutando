@@ -17,6 +17,7 @@ import { request as httpsRequest } from 'node:https';
 import { execSync, execFileSync } from 'node:child_process';
 import { writeFileSync, readFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { createHash } from 'node:crypto';
 import { statusPath } from '../../../src/workspace_default.js';
 
 const PORT = 7846;
@@ -44,7 +45,25 @@ const QUOTA_FILE = statusPath('quota-state.json');
 // Endpoint + client_id verified from the Claude Code binary (v2.1.170 strings).
 const TOKEN_ENDPOINT = 'https://platform.claude.com/v1/oauth/token';
 const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
-const KEYCHAIN_SERVICE = 'Claude Code-credentials';
+const KEYCHAIN_SERVICE_DEFAULT = 'Claude Code-credentials';
+// Claude Code namespaces the keychain item by config dir when CLAUDE_CONFIG_DIR
+// is set: `Claude Code-credentials-<sha256(dir)[:8]>`. Try the namespaced item
+// first so nodes migrated to workspace-scoped CLAUDE_CONFIG_DIR find their token;
+// fall back to the default for unmigrated / default-config-dir nodes (fixes #1740).
+function resolveKeychainService(): string {
+	const ccd = process.env.CLAUDE_CONFIG_DIR;
+	if (!ccd) return KEYCHAIN_SERVICE_DEFAULT;
+	const hash = createHash('sha256').update(ccd).digest('hex').slice(0, 8);
+	const namespaced = `${KEYCHAIN_SERVICE_DEFAULT}-${hash}`;
+	try {
+		execFileSync('security', ['find-generic-password', '-s', namespaced],
+			{ encoding: 'utf-8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] });
+		return namespaced;
+	} catch {
+		return KEYCHAIN_SERVICE_DEFAULT;
+	}
+}
+const KEYCHAIN_SERVICE = resolveKeychainService();
 // Refresh when the token expires within this window (ms). Tokens are ~8h-lived;
 // 5 min of slack avoids racing the expiry on a long-running upstream request.
 const REFRESH_SKEW_MS = 5 * 60 * 1000;
