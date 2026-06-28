@@ -5,7 +5,7 @@
 // change instantly when the vault is open.
 //
 // Vault layout (everything under Sutando/, by kind):
-//   $SUTANDO_WORKSPACE/obsidian-vault/
+//   <workspace>/obsidian-vault/
 //     .obsidian/                          ← marker so Obsidian recognizes it
 //     Sutando/
 //       Notes/<slug>-<YYYY-MM-DDTHHMMSS>.md   (kind=note)
@@ -14,19 +14,21 @@
 //
 // First call lazily initializes the vault dir + .obsidian/ + Sutando/ tree.
 // To use the vault in Obsidian: File → Open vault → Open folder as vault →
-// pick $SUTANDO_WORKSPACE/obsidian-vault. (One-time; Obsidian remembers.)
+// pick <workspace>/obsidian-vault. (One-time; Obsidian remembers.)
 
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
+import { resolveWorkspace } from '../../src/workspace_default.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
 function vaultRoot(): string {
-    const ws = process.env.SUTANDO_WORKSPACE || join(homedir(), '.sutando', 'workspace');
-    return join(ws, 'obsidian-vault');
+    // Canonical workspace (sutando.config.local.json; default <repo>/workspace).
+    // $SUTANDO_WORKSPACE is no longer honored post-v0.8/#1440 — resolving it
+    // here is what stranded the vault under the legacy home-dir fallback.
+    return join(resolveWorkspace(), 'obsidian-vault');
 }
 
 function slugify(input: string): string {
@@ -114,7 +116,7 @@ async function appendThought(root: string, body: string): Promise<string> {
 const addToVaultTool: ToolDefinition = {
     name: 'add_to_vault',
     description:
-        'Capture a note, task, or thought into the user\'s Obsidian vault at $SUTANDO_WORKSPACE/obsidian-vault. ' +
+        'Capture a note, task, or thought into the user\'s Obsidian vault at <workspace>/obsidian-vault. ' +
         'Call when the user says "save this as a note", "remember this thought", "add to my tasks", "log this", "note that X", "todo: X", or similar capture intents. ' +
         'kind="note" writes a standalone markdown file (give it a title if obvious from the body). ' +
         'kind="task" appends a checkbox to Sutando/Tasks.md. ' +

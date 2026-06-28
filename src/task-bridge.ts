@@ -187,6 +187,25 @@ export function _shouldFallthrough(file: string): boolean {
 	return file.startsWith('task-') || file.startsWith('voice-') || file.startsWith('proactive-');
 }
 
+/**
+ * Whether a result file should REGISTER a row in the Task list — i.e. fire
+ * `_sendTaskStatus` (live web-socket task card) and POST `/task-done`
+ * (agent-api `task_history`). Only genuine `task-*.txt` results are tasks.
+ *
+ * `proactive-*` notification files also pass `_shouldFallthrough` so they get
+ * SPOKEN by the voice agent (the proactive-voice delivery path), but they are
+ * NOT tasks: registering them keys a `task_history` row by the file stem, so
+ * every re-fire of a proactive notification (e.g. the hourly pending-question
+ * reminder) lands a fresh `proactive-<ts>` id as a DUPLICATE Task row. This is
+ * the general fix for that class (#1786); the narrow #1784 only stabilized the
+ * pending-question filename so its duplicate rows collapsed to one. `voice-*`
+ * files are short-circuited earlier in the watcher and never reach this path.
+ *
+ * Exported for unit testing alongside `_shouldFallthrough`. */
+export function _shouldRegisterTaskRow(file: string): boolean {
+	return file.startsWith('task-');
+}
+
 const _apiToken = process.env.SUTANDO_API_TOKEN || '';
 function _apiHeaders(): Record<string, string> {
 	const h: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -807,19 +826,27 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 				if (!_shouldFallthrough(file)) continue;
 				if (result) {
 					console.log(`${ts()} [TaskBridge] Result ${file}: ${result.slice(0, 100)}`);
-					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
+					// proactive-* files reach this fallthrough only to be SPOKEN
+					// (onResult below). They are NOT tasks — gate the two
+					// task-registration side-effects (_sendTaskStatus + POST
+					// /task-done) to genuine task-*.txt results, else each
+					// proactive re-fire duplicates a Task row (#1786).
+					const registersTask = _shouldRegisterTaskRow(file);
+					if (registersTask) _sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
 					_deliveredResults.add(file);
 					_pendingTasks.delete(taskId);
 					logConversation('core-agent', `[task:${taskId}] ${result.slice(0, LOG_LINE_MAX_CHARS)}`);
 					onResult(result);
-					// Notify agent-api directly, then delete file
-					try {
-						fetch('http://localhost:7843/task-done', {
-							method: 'POST',
-							headers: _apiHeaders(),
-							body: JSON.stringify({ taskId, result }),
-						}).catch(() => {});
-					} catch {}
+					// Notify agent-api directly (task results only), then delete file
+					if (registersTask) {
+						try {
+							fetch('http://localhost:7843/task-done', {
+								method: 'POST',
+								headers: _apiHeaders(),
+								body: JSON.stringify({ taskId, result }),
+							}).catch(() => {});
+						} catch {}
+					}
 					setTimeout(() => {
 						const taskIdFromFile = path.split('/').pop()!.replace('.txt', '');
 						archiveFile(path, 'results', taskIdFromFile);

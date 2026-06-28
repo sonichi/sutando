@@ -37,9 +37,38 @@ ACCESS_FILE = os.environ.get("SUTANDO_DISCORD_ACCESS_FILE",
                              os.path.join(_CFG, "channels", "discord", "access.json"))
 ENV_FILE = os.environ.get("SUTANDO_DISCORD_ENV_FILE",
                           os.path.join(_CFG, "channels", "discord", ".env"))
-WS = os.path.expanduser(
-    os.environ.get("SUTANDO_WORKSPACE", "~/.sutando/workspace").replace("~", os.path.expanduser("~"))
-)
+# Workspace resolution (M0/#1440 residual, #1698): SUTANDO_WORKSPACE was dropped
+# for resolution in v0.8 and its old default was the pre-M0 legacy home-dir
+# location — so this hook stranded active-serving-channel.json in the LEGACY
+# workspace, a different dir than discord-bridge.py (M0 resolve_workspace) reads,
+# and the guard then couldn't find the serving channel → silently failed open.
+# Derive the workspace from CLAUDE_CONFIG_DIR instead: the Claude Code project
+# tree lives at `<workspace>/.claude-sutando` per the workspace contract, so the
+# parent of _CFG IS the workspace (and it moves with a config-relocated
+# workspace). No subprocess — this hook fires on every Bash/Read; no __file__
+# walk — that's the bundled-symlink anti-pattern in src/workspace_default.py.
+# Walk up to the nearest `.claude-sutando` ANCESTOR (not just an exact-leaf
+# basename match): src/startup.sh floats narrowing CLAUDE_CONFIG_DIR to a per-host
+# subdir (`<workspace>/.claude-sutando/hosts/<host>`); there the leaf is the
+# hostname and an exact match would wrongly fall through to the fallback.
+_cfg_norm = os.path.normpath(_CFG)
+WS = None
+_p = _cfg_norm
+while True:
+    if os.path.basename(_p) == ".claude-sutando":
+        WS = os.path.dirname(_p)
+        break
+    _parent = os.path.dirname(_p)
+    if _parent == _p:  # reached filesystem root, no `.claude-sutando` ancestor
+        break
+    _p = _parent
+if WS is None:
+    # CLAUDE_CONFIG_DIR unset (→ _CFG=~/.claude, no `.claude-sutando` ancestor) or
+    # otherwise unresolvable. Fail open to the SAME canonical last-ditch the rest of
+    # the system uses — workspace_default.default_workspace_dir() returns
+    # ~/sutando-workspace (_DEFAULT_SUBPATH=("sutando-workspace",)). NOT ~/.sutando
+    # (pre-v0.8). Not imported here: this hook is standalone-deployed to ~/.claude/hooks/.
+    WS = os.path.expanduser("~/sutando-workspace")
 STATE = os.path.join(WS, "state", "active-serving-channel.json")
 API = "https://discord.com/api/v10"
 UA = "DiscordBot (https://github.com/sonichi/sutando, 1.0)"
