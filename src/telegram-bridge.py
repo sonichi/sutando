@@ -698,6 +698,33 @@ def main():
 
                 print(f"  @{username}{forward_note}: {redact_vault_commands(text)}{attachment_note}")
 
+                # Reply/parent context. Telegram embeds the full replied-to
+                # message when this is a reply — capture it (+ message ids) so a
+                # terse reply ("y", "no", a pronoun) is reconstructable. Unlike
+                # Discord, the Bot API has NO message-history fetch, so this
+                # embed-at-write quote is the ONLY reconstruct substrate for
+                # Telegram (the agent falls back to the session transcript for
+                # anything deeper than the immediate parent).
+                reply_note = ""
+                src_line = ""
+                parent_line = ""
+                _src_mid = msg.get("message_id")
+                if _src_mid is not None:
+                    src_line = f"source_message_id: {_src_mid}\n"
+                _rep = msg.get("reply_to_message")
+                if _rep:
+                    _rep_user = (
+                        _rep.get("from", {}).get("username")
+                        or _rep.get("from", {}).get("first_name", "?")
+                    )
+                    _rep_text = (
+                        _rep.get("text") or _rep.get("caption") or "[non-text message]"
+                    ).replace("\n", " ")[:300]
+                    reply_note = f"\n\n[Replying to @{_rep_user}: {_rep_text}]"
+                    _rep_mid = _rep.get("message_id")
+                    if _rep_mid is not None:
+                        parent_line = f"parent_message_id: {_rep_mid}\n"
+
                 # Write as task (same format as voice bridge)
                 ts = int(time.time() * 1000)
                 task_id = f"task-{ts}"
@@ -726,33 +753,45 @@ def main():
                     attachment_note.lower().find(ext) != -1
                     for ext in (".m4a", ".mp3", ".ogg", ".opus", ".oga", ".wav", ".webm", ".aac")
                 )
-                tg_skill_hints = ""
-                if _notify_py.exists() or _transcribe_py.exists():
-                    lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
-                    step = 1
-                    if _notify_py.exists():
-                        notify_cmd = (
-                            f"python3 {_notify_py}"
-                            f" --source telegram --chat-id {chat_id}"
-                        )
-                        if has_audio_attach:
-                            lines.append(f'{step}. NOTIFY FIRST: {notify_cmd} --message "Got your voice message, give me a moment."')
-                        else:
-                            lines.append(f'{step}. NOTIFY FIRST (if task takes >60s): {notify_cmd} --message "On it — back in a moment."')
-                        step += 1
-                    if has_audio_attach and _transcribe_py.exists():
-                        attached_path = attachment_note.split("[File attached: ")[-1].rstrip("]").split("\n")[0]
-                        lines.append(f"{step}. TRANSCRIBE: python3 {_transcribe_py} '{attached_path}'")
-                        step += 1
-                    lines.append(f"{step}. Process transcript and write result to results/{task_id}.txt")
-                    tg_skill_hints = "\n" + "\n".join(lines) + "\n"
+                lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
+                step = 1
+                # CONTEXT-FIRST: reconstruct before interpreting a message that isn't
+                # self-contained. Unlike Discord, Telegram's Bot API has NO message-history
+                # fetch — so the reconstruct substrate is the embedded [Replying to …] quote
+                # (above) + the session transcript, NOT a channel pull-back. Always emitted.
+                lines.append(
+                    f'{step}. CONTEXT-FIRST: if this message is not self-contained '
+                    f'(terse — "y", "no", a pronoun — a reply, or refers to something not '
+                    f'stated here), reconstruct context BEFORE interpreting. Telegram has no '
+                    f'message-history fetch, so use the embedded [Replying to …] quote above '
+                    f'plus the session transcript, and answer from that, not from memory.'
+                )
+                step += 1
+                if _notify_py.exists():
+                    notify_cmd = (
+                        f"python3 {_notify_py}"
+                        f" --source telegram --chat-id {chat_id}"
+                    )
+                    if has_audio_attach:
+                        lines.append(f'{step}. NOTIFY FIRST: {notify_cmd} --message "Got your voice message, give me a moment."')
+                    else:
+                        lines.append(f'{step}. NOTIFY FIRST (if task takes >60s): {notify_cmd} --message "On it — back in a moment."')
+                    step += 1
+                if has_audio_attach and _transcribe_py.exists():
+                    attached_path = attachment_note.split("[File attached: ")[-1].rstrip("]").split("\n")[0]
+                    lines.append(f"{step}. TRANSCRIBE: python3 {_transcribe_py} '{attached_path}'")
+                    step += 1
+                lines.append(f"{step}. Process transcript and write result to results/{task_id}.txt")
+                tg_skill_hints = "\n" + "\n".join(lines) + "\n"
 
                 task_file.write_text(
                     f"id: {task_id}\n"
                     f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
-                    f"task: {confine_user_content(f'[Telegram @{username}{forward_note}] {text}{attachment_note}')}\n"
+                    f"task: {confine_user_content(f'[Telegram @{username}{forward_note}] {text}{attachment_note}{reply_note}')}\n"
                     f"source: telegram\n"
                     f"chat_id: {chat_id}\n"
+                    f"{src_line}"
+                    f"{parent_line}"
                     f"priority: {priority}\n"
                     f"{tg_skill_hints}"
                 )

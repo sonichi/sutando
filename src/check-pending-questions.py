@@ -6,6 +6,7 @@ Sends notifications via macOS + Discord DM if questions are waiting.
 Use --force to bypass the 1-hour cooldown.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -141,6 +142,12 @@ def notify_macos(count, titles):
     ], capture_output=True)
 
 
+def questions_key(questions):
+    """sha256[:16] of the sorted question titles -- a stable id for the set."""
+    key = "|".join(sorted(q["title"] for q in questions))
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
 def notify_voice(questions):
     """Write to results/ so voice agent can speak it."""
     ts = int(time.time() * 1000)
@@ -157,8 +164,7 @@ def notify_discord_dm(questions):
     """Write a proactive-*.txt file so discord-bridge DMs the owner.
     Owner asked (2026-04-09, while traveling) to receive pending-question
     pings as DMs instead of just macOS notifications."""
-    ts = int(time.time())
-    path = RESULTS_DIR / f"proactive-pending-q-{ts}.txt"
+    path = RESULTS_DIR / f"proactive-pending-q-{questions_key(questions)}.txt"
     lines = [
         f"⚠️ {len(questions)} pending question{'s' if len(questions) > 1 else ''} waiting:",
         "",

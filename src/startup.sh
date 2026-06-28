@@ -512,7 +512,29 @@ else
   echo "  ✓ core heartbeat (already running)"
 fi
 
-# 0. Credential proxy for quota tracking (port 7846)
+# 0. Credential proxy for quota tracking (port 7846).
+# Prefer the launchd-supervised job (KeepAlive + ThrottleInterval=10s) so the
+# proxy restarts on crash instead of leaving a proxy-routed core stranded on a
+# dead port (#1086 / #1291). The wrapper evicts any stale manual holder of 7846
+# before binding, so this composes with the legacy bare-& launch below. Falls
+# back to that legacy launch on older checkouts that lack the launchd template,
+# or if the install fails for any reason.
+_PROXY_LABEL="com.sutando.credential-proxy"
+_PROXY_INSTALLER="$REPO/src/install-credential-proxy-launchd.sh"
+if [ -f "$_PROXY_INSTALLER" ] && [ -f "$REPO/src/launchd/$_PROXY_LABEL.plist" ]; then
+  if launchctl print "gui/$(id -u)/$_PROXY_LABEL" > /dev/null 2>&1; then
+    echo "  ✓ credential proxy (launchd-supervised, already loaded)"
+  else
+    echo "  Installing launchd-supervised credential proxy..."
+    if bash "$_PROXY_INSTALLER" install > /dev/null 2>&1; then
+      # Wait for the supervised proxy to bind before the legacy-launch guard.
+      for _ in $(seq 1 10); do lsof -i :7846 > /dev/null 2>&1 && break; sleep 0.5; done
+      echo "  ✓ credential proxy (launchd-supervised)"
+    else
+      echo "  ⚠ launchd install failed — falling back to legacy launch"
+    fi
+  fi
+fi
 if ! lsof -i :7846 > /dev/null 2>&1; then
   echo "  Starting credential proxy (port 7846)..."
   npx tsx "$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)" > /tmp/credential-proxy.log 2>&1 &
