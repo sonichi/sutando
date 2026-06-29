@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { _shouldFallthrough } from '../src/task-bridge.js';
+import { _shouldFallthrough, _shouldRegisterTaskRow } from '../src/task-bridge.js';
 
 // Regression for issue #1035 (follow-up to PR #1033, per-channel pull path).
 //
@@ -69,5 +69,40 @@ describe('_shouldFallthrough — belt-suspenders guard for result-watcher fallth
 		assert.equal(_shouldFallthrough('prefix-task-1234.txt'), false);
 		assert.equal(_shouldFallthrough('prefix.voice-1234.txt'), false);
 		assert.equal(_shouldFallthrough('xtask-1234.txt'), false);
+	});
+});
+
+// Regression for issue #1786 — duplicate pending-question reminders in the
+// Task list. proactive-* notification files legitimately pass _shouldFallthrough
+// (so they get SPOKEN), but they are NOT tasks: registering them (via
+// _sendTaskStatus + POST /task-done) keys a task_history row by the file stem,
+// so every re-fire of a proactive notification with a fresh timestamp adds a
+// DUPLICATE Task row. _shouldRegisterTaskRow gates those two side-effects to
+// genuine task-*.txt results — the general fix superseding the narrow #1784.
+describe('_shouldRegisterTaskRow — only genuine task-* results register a Task row (#1786)', () => {
+	it('accepts canonical task-* result files (these ARE tasks)', () => {
+		assert.equal(_shouldRegisterTaskRow('task-1234567890.txt'), true);
+		assert.equal(_shouldRegisterTaskRow('task-chat-1234567890.txt'), true);
+		assert.equal(_shouldRegisterTaskRow('task-discord-voice-1234567890.txt'), true);
+	});
+
+	it('REJECTS proactive-* notification files (spoken, but not Task rows — the dup bug)', () => {
+		assert.equal(_shouldRegisterTaskRow('proactive-1234567890.txt'), false);
+		assert.equal(_shouldRegisterTaskRow('proactive-pending-q-1782424563.txt'), false);
+		assert.equal(_shouldRegisterTaskRow('proactive-pending-q-1782424565.txt'), false);
+		// every re-fire is a distinct stem; none should register a row
+		assert.equal(_shouldRegisterTaskRow('proactive-result-task-abc-1234.txt'), false);
+		assert.equal(_shouldRegisterTaskRow('proactive-timeout-task-abc-1234.txt'), false);
+	});
+
+	it('REJECTS voice-* push-channel files (defensive; they short-circuit earlier anyway)', () => {
+		assert.equal(_shouldRegisterTaskRow('voice-1234567890.txt'), false);
+		assert.equal(_shouldRegisterTaskRow('voice-draft-abc.txt'), false);
+	});
+
+	it('rejects question-* and other non-task prefixes', () => {
+		assert.equal(_shouldRegisterTaskRow('question-1234567890.txt'), false);
+		assert.equal(_shouldRegisterTaskRow('something-else.txt'), false);
+		assert.equal(_shouldRegisterTaskRow('prefix-task-1234.txt'), false);
 	});
 });
