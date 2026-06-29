@@ -3243,7 +3243,6 @@ async def _handle_discord_message(message, force=False):
         task_file.write_text(
             f"id: {task_id}\n"
             f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
-            f"task: {user_task_text}\n"
             f"source: discord\n"
             f"channel_id: {message.channel.id}\n"
             f"channel_name: {channel_name}\n"
@@ -3253,6 +3252,7 @@ async def _handle_discord_message(message, force=False):
             f"user_id: {message.author.id}\n"
             f"access_tier: {access_tier}\n"
             f"priority: {priority}\n"
+            f"task: {user_task_text}\n"
             f"{tier_instructions.get(access_tier, tier_instructions['other'])}"
             f"{discord_skill_hints}"
         )

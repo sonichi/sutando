@@ -787,12 +787,12 @@ def main():
                 task_file.write_text(
                     f"id: {task_id}\n"
                     f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
-                    f"task: {confine_user_content(f'[Telegram @{username}{forward_note}] {text}{attachment_note}{reply_note}')}\n"
                     f"source: telegram\n"
                     f"chat_id: {chat_id}\n"
                     f"{src_line}"
                     f"{parent_line}"
                     f"priority: {priority}\n"
+                    f"task: {confine_user_content(f'[Telegram @{username}{forward_note}] {text}{attachment_note}{reply_note}')}\n"
                     f"{tg_skill_hints}"
                 )
                 pending_replies[task_id] = chat_id
