@@ -603,45 +603,59 @@ const mainAgent: MainAgent = {
 		'Named after Stands from JoJo\'s Bizarre Adventure — a personal spirit that fights for you.',
 		'Every Sutando evolves differently based on what its user needs. You earned your name and identity.',
 		(() => { try { const si = JSON.parse(readFileSync(personalPath('stand-identity.json'), 'utf-8')); return si.name ? `Your Stand name is ${si.name}. Origin: ${si.nameOrigin || 'earned through use'}. When asked your name or who you are, say "I\'m Sutando — ${si.name}."` : ''; } catch { return ''; } })(),
-		// Optional context file — for presentations, meeting prep, etc. (gitignored)
-		// Reads $SUTANDO_MEMORY_DIR/voice-contexts/<active>.txt where <active> is
-		// the trimmed contents of $SUTANDO_MEMORY_DIR/voice-contexts/active
-		// (legacy $SUTANDO_PRIVATE_DIR honored via memoryDirEnv()).
-		// Falls back to public-repo voice-context.txt when the env var is unset
-		// or the pointer/file is missing. Switcher tool: set_voice_context(name)
-		// from skills/personal-voice-context/ writes the pointer.
+		// Optional context file — a per-talk script for presentations, meeting prep,
+		// teaching, etc. (gitignored). Voice contexts are NOT memory, so they no
+		// longer live under $SUTANDO_MEMORY_DIR — only core memory does (Chi
+		// 2026-06-29: "only memories should live there"). New canonical layout:
+		//   content (fleet-shared): <workspace>/voice-contexts/<name>.txt
+		//   active pointer (per-host): <workspace>/hosts/<host>/voice-context-active
+		// The memory-dir location ($SUTANDO_MEMORY_DIR/voice-contexts/) is kept as
+		// a READ-ONLY legacy fallback during the transition (~30 days), so existing
+		// installs keep loading until writers (set_voice_context, deep-research-qa)
+		// migrate. Public-repo voice-context.txt is the final fallback. Switcher:
+		// set_voice_context(name) from skills/personal-voice-context/.
 		(() => {
-			// Log which voice-context file was loaded so the operator can see at
-			// a glance whether the dynamic loader picked up the memory dir or
-			// fell through to the public fallback. Silent loads are hard to
-			// debug — Apr 29 spent 30+ minutes diff'ing files because the load
-			// path was opaque.
-			try {
-				const privateRoot = memoryDirEnv();
-				if (privateRoot) {
-					const root = privateRoot.replace(/^~/, process.env.HOME || '');
-					const pointerPath = join(root, 'voice-contexts', 'active');
-					const name = readFileSync(pointerPath, 'utf-8').trim();
-					// Whitelist the pointer content to a safe basename. Reject any
-					// path-like input — `../../foo` could otherwise escape the
-					// voice-contexts/ dir via join() and load arbitrary `.txt`
-					// content into the system prompt.
-					if (name && /^[A-Za-z0-9._-]+$/.test(name)) {
-						const ctxPath = join(root, 'voice-contexts', `${name}.txt`);
+			const SAFE = /^[A-Za-z0-9._-]+$/;
+			const memRoot = (() => {
+				const m = memoryDirEnv();
+				return m ? m.replace(/^~/, process.env.HOME || '') : '';
+			})();
+			// Resolve the active-context NAME: per-host workspace pointer (canonical,
+			// via personalPath which probes <ws>/hosts/<host>/ first), then the legacy
+			// SHARED memory-dir pointer as a transition fallback.
+			const pointerCandidates = [personalPath('voice-context-active')];
+			if (memRoot) pointerCandidates.push(join(memRoot, 'voice-contexts', 'active'));
+			let name = '';
+			for (const p of pointerCandidates) {
+				try {
+					const n = readFileSync(p, 'utf-8').trim();
+					if (n) { name = n; break; }
+				} catch {}
+			}
+			// Whitelist the pointer content to a safe basename. Reject any path-like
+			// input — `../../foo` could otherwise escape the voice-contexts/ dir via
+			// join() and load arbitrary `.txt` content into the system prompt.
+			if (name && SAFE.test(name)) {
+				// Resolve CONTENT: fleet-shared workspace dir (canonical), then the
+				// legacy memory-dir as a read-only fallback.
+				const contentCandidates = [join(WORKSPACE_DIR, 'voice-contexts', `${name}.txt`)];
+				if (memRoot) contentCandidates.push(join(memRoot, 'voice-contexts', `${name}.txt`));
+				for (const ctxPath of contentCandidates) {
+					try {
 						const content = readFileSync(ctxPath, 'utf-8');
 						const byteLen = Buffer.byteLength(content, 'utf-8');
 						console.log(`${ts()} [voice-context] loaded ${content.length} chars / ${byteLen} bytes from ${ctxPath}`);
 						return content;
-					}
+					} catch {}
 				}
-			} catch {}
+			}
 			try {
 				const content = readFileSync('voice-context.txt', 'utf-8');
 				const byteLen = Buffer.byteLength(content, 'utf-8');
 				console.log(`${ts()} [voice-context] loaded ${content.length} chars / ${byteLen} bytes from voice-context.txt (fallback)`);
 				return content;
 			} catch {
-				console.log(`${ts()} [voice-context] no context loaded (no env, no pointer, no fallback file)`);
+				console.log(`${ts()} [voice-context] no context loaded (no pointer, no fallback file)`);
 				return '';
 			}
 		})(),
