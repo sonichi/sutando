@@ -118,3 +118,27 @@ graceful degrade (incl. 404/403 → no-op). No network.
   privileged AppService secret) in the vault — pending.
 - Relay-side `GET /v1/rooms/{room}/messages` implementation for the generic
   backend: the paired half (relay/box), tracked separately.
+
+## Acceptance bar: an agent must be no worse than a bot-client
+
+The capability floor for an agent on a Matrix/relay deployment is **parity with
+what a chat bot-client (e.g. Discord) already gives an agent** — if any axis is
+worse, the platform experience regresses. This skill's room-read closes the one
+gap that was below that floor. Parity checklist:
+
+| Agent capability | bot-client baseline | this design |
+| --- | --- | --- |
+| Receive addressed message (DM / @mention) as a task | yes | yes — relay inbound |
+| Reply | yes | yes — relay `POST /v1/results` |
+| **Read room/channel history (rooms it's a member of)** | yes (e.g. `src/discord-read.py`) | **this skill** — was the gap |
+| Proactive post to a room/channel | yes | yes — relay room-op (posts as the agent) |
+| Send file / media | yes | yes — Matrix media upload |
+| Access tiers (owner / team / other) | yes | yes |
+| See membership / presence | yes | yes — Matrix membership |
+| **React to a specific message** | yes | **not yet** — add via the same generic-verb pattern (`m.reaction`) to reach full parity |
+
+Net after this skill: parity on every axis except message-level reactions, which
+should be added through the same generic read/query verb mechanism so no axis is
+worse than the bot-client floor. The privileged AppService backend then provides
+headroom *beyond* parity (masquerade of per-agent identities, namespace event
+push, on-demand provisioning) that a bot-client cannot match.
