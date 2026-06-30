@@ -70,13 +70,11 @@ def _result(ok, messages=None, backend=None, reason=None, room_id=None):
 # Gate (per-agent scope gating, default-deny)
 # --------------------------------------------------------------------------- #
 def _gate_path():
-    p = os.environ.get("ROOM_READ_GATE")
-    if p:
-        return p
-    ws = os.environ.get("SUTANDO_WORKSPACE_RESOLVED") or os.environ.get("ROOM_READ_WORKSPACE")
-    if ws:
-        return os.path.join(ws, "state", "room-read-gate.json")
-    return os.path.join(os.getcwd(), "room-read-gate.json")
+    # Resolving the workspace is the caller's job (it already goes through the
+    # sanctioned helper) — the skill just reads the path it is handed via
+    # ROOM_READ_GATE, falling back to a cwd-relative file. This keeps the skill
+    # free of any direct workspace-env resolution.
+    return os.environ.get("ROOM_READ_GATE") or os.path.join(os.getcwd(), "room-read-gate.json")
 
 
 def load_gate(path=None):

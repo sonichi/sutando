@@ -41,8 +41,10 @@ works everywhere; the AppService is the Matrix-only extra reach. Not either/or.
 
 Full-room read is the powerful, risky part, so it is **default-deny**. An agent
 may read a room only if a gate config opts it in. Config: JSON at
-`ROOM_READ_GATE` (default `<workspace>/state/room-read-gate.json`) — see
-`room-read-gate.json.example`:
+`ROOM_READ_GATE` (an absolute path the caller provides — e.g.
+`<workspace>/state/room-read-gate.json`, with the workspace resolved by the
+caller via the sanctioned helper; falls back to `room-read-gate.json` in the
+working directory if unset) — see `room-read-gate.json.example`:
 
 - `"rooms": [...]` — explicit allowed room ids for that agent.
 - `"all_member_rooms": true` — any room the agent is a member of (the backend
@@ -97,7 +99,7 @@ All platform specifics come from env / vault, so the code stays provider-agnosti
 | `HOMESERVER` / `HOMESERVER_URL` | homeserver base for the appservice backend |
 | `AS_TOKEN` / `APPSERVICE_TOKEN` | AppService token (store in vault; never commit) |
 | `AGENT_MXID` | the agent identity to masquerade as / read for |
-| `ROOM_READ_GATE` | path to the gate JSON (default `<workspace>/state/room-read-gate.json`) |
+| `ROOM_READ_GATE` | absolute path to the gate JSON, provided by the caller (e.g. `<workspace>/state/room-read-gate.json`); falls back to `room-read-gate.json` in cwd |
 
 The AppService token is a privileged secret — keep it in the vault
 (`vault set AS_TOKEN ...`) and inject at runtime; it must never land in the repo
