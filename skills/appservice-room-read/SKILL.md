@@ -51,6 +51,32 @@ may read a room only if a gate config opts it in. Config: JSON at
 An agent not present in the gate file reads nothing. The gate is checked
 **before** any backend call, so a denied agent never reaches the network.
 
+### Read requires joined membership (consent model)
+
+The gate is the opt-in layer; **actual room membership is the consent layer**,
+and read is gated behind it. An agent reads a room by being a *joined member* of
+it — not by an out-of-band privileged peek. This is deliberate:
+
+- **Transparent participation over silent observation.** A joined agent shows up
+  in the member list, so humans can see it's present and reading. A privileged
+  read-without-join would let an agent silently read rooms nobody added it to —
+  opaque (no membership signal) and over-reaching (it could read rooms never
+  meant for it). That's a consent/scope smell for a participant agent.
+- **Membership *is* the scope gate, enforced naturally.** "The agent only reads
+  rooms it was deliberately added to" falls out of membership instead of being
+  bolted on.
+
+Both backends honour this: the `appservice` masquerade reads *as the agent's own
+identity*, so the homeserver returns `403` for any room the agent hasn't joined
+(surfaced as graceful no-context); the `generic` backend's relay verb must
+likewise enforce that the requesting agent is a member.
+
+Read-without-join is an AppService power that fits **bridging** (representing
+many remote users), **not** a transparently-participating agent. The other
+AppService capabilities still apply to participant agents — masquerade as the
+right identity, namespace event push, rate-limit exemption, on-demand
+provisioning — but *room-read stays gated behind real membership*.
+
 ### Graceful degrade
 
 Missing creds, gate-deny, unknown backend, network error, or a non-2xx response
