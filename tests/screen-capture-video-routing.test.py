@@ -18,6 +18,7 @@ import importlib.util
 import json
 import threading
 import unittest
+from unittest import mock
 import urllib.request
 from pathlib import Path
 
@@ -48,10 +49,19 @@ def _fake_run(cmd, *args, **kwargs):
 class TestCaptureVideoRouting(unittest.TestCase):
     def setUp(self):
         self.mod = load_module()
-        # Silence the menu-bar/notify side-effects and stub the recorder.
-        self.mod.subprocess.run = _fake_run
-        self.mod._signal_seeing = lambda: None
-        self.mod._notify_capture = lambda: None
+        # Stub the recorder + silence the menu-bar/notify side-effects. Use
+        # patch.object + addCleanup so the real implementations are restored
+        # after each test — `self.mod.subprocess` is the SHARED stdlib module,
+        # so a bare assignment would leak the fake into any later test in the
+        # same process (caught in review).
+        for target, repl in (("subprocess", None), ("_signal_seeing", lambda: None),
+                             ("_notify_capture", lambda: None)):
+            if target == "subprocess":
+                p = mock.patch.object(self.mod.subprocess, "run", _fake_run)
+            else:
+                p = mock.patch.object(self.mod, target, repl)
+            p.start()
+            self.addCleanup(p.stop)
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), self.mod.Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
