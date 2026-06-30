@@ -51,6 +51,7 @@ import urllib.parse
 import urllib.request
 
 DEFAULT_LIMIT = 20
+MAX_LIMIT = 100  # clamp ceiling — context-first reads should stay bounded, not pull huge history
 HTTP_TIMEOUT = 15
 
 
@@ -176,6 +177,12 @@ def read_room(room_id, agent_mxid=None, limit=DEFAULT_LIMIT, *, gate=None, befor
     agent_mxid = agent_mxid or os.environ.get("AGENT_MXID")
     if not room_id:
         return _result(False, reason="no room_id given")
+    # Clamp limit: a context-first read should stay bounded — an unbounded
+    # caller-supplied limit can turn it into an accidental large history pull.
+    try:
+        limit = max(1, min(int(limit), MAX_LIMIT))
+    except (TypeError, ValueError):
+        limit = DEFAULT_LIMIT
     gate = load_gate() if gate is None else gate
     if not gate_allows(agent_mxid, room_id, gate):
         return _result(False, reason=f"client gate denied for {agent_mxid} (not opted in)", room_id=room_id)
@@ -192,7 +199,10 @@ def _main(argv):
     args = ap.parse_args(argv)
     res = read_room(args.room_id, args.agent_mxid, args.limit, before=args.before)
     print(json.dumps(res, indent=2))
-    return 0 if res["ok"] else 1
+    # Exit 0 for any structured result — "no context available" (ok:false from a
+    # gate-deny / 404 / 403 / network degrade) is a valid graceful outcome, not a
+    # failed task. Usage errors (argparse) exit 2; unexpected runtime bugs raise.
+    return 0
 
 
 if __name__ == "__main__":

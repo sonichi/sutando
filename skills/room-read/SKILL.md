@@ -14,7 +14,11 @@ python3 skills/room-read/room_read.py '!roomId:hs' --agent '@my.agent:hs' --limi
 
 Returns JSON: `{ok, room_id, reason, messages:[{sender, ts, body, event_id}]}`.
 `ok:false` with a `reason` on any expected failure (gate-deny, no relay, 404/403,
-network) — it never raises, so the caller degrades cleanly.
+network) — it never raises, so the caller degrades cleanly. As a shell tool the
+CLI **exits 0 for any structured result** (a graceful `ok:false` "no context" is
+not a failed task); usage errors exit 2 and unexpected bugs raise. `limit` is
+clamped to `[1, MAX_LIMIT]` so a caller can't turn a context read into a huge
+history pull.
 
 ## Design — why it's safe to add
 
@@ -87,7 +91,7 @@ this repo, a task file, or the local vault — per the architecture boundary abo
 
 ## Tests
 
-`python3 skills/room-read/test_room_read.py` — 18 unit tests covering
+`python3 skills/room-read/test_room_read.py` — 22 unit tests covering
 the client gate (defer-to-relay / default-deny / opt-in), the relay-verb read,
 normalisation, and graceful degrade (incl. 404/403 → no-op). No network.
 

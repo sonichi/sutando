@@ -141,5 +141,54 @@ class ReadTests(unittest.TestCase):
         self.assertIn("before=%24tok", captured["url"])
 
 
+class ClampAndExitTests(unittest.TestCase):
+    KEYS = ["RELAY_URL", "REMOTE_TASK_URL", "RELAY_TOKEN", "REMOTE_TASK_TOKEN"]
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in self.KEYS}
+        _clear_env(self.KEYS)
+        os.environ["RELAY_URL"] = "https://relay"
+
+    def tearDown(self):
+        _clear_env(self.KEYS)
+        for k, v in self._saved.items():
+            if v is not None:
+                os.environ[k] = v
+
+    def test_limit_clamped_to_max(self):
+        captured = {}
+
+        def fake(url, headers=None):
+            captured["url"] = url
+            return 200, {"messages": []}
+
+        with mock.patch.object(rr, "_http_get_json", side_effect=fake):
+            rr.read_room(ROOM, HS, limit=9999, gate={HS: {"rooms": [ROOM]}})
+        self.assertIn(f"limit={rr.MAX_LIMIT}", captured["url"])
+
+    def test_limit_floor_is_one(self):
+        captured = {}
+
+        def fake(url, headers=None):
+            captured["url"] = url
+            return 200, {"messages": []}
+
+        with mock.patch.object(rr, "_http_get_json", side_effect=fake):
+            rr.read_room(ROOM, HS, limit=0, gate={HS: {"rooms": [ROOM]}})
+        self.assertIn("limit=1", captured["url"])
+
+    def test_main_exits_zero_on_no_context(self):
+        # gate-deny -> ok:false, but CLI should still exit 0 (graceful, not a failed task)
+        with mock.patch.object(rr, "load_gate", return_value={}):
+            rc = rr._main([ROOM, "--agent", HS])
+        self.assertEqual(rc, 0)
+
+    def test_main_exits_zero_on_success(self):
+        with mock.patch.object(rr, "load_gate", return_value={HS: {"rooms": [ROOM]}}), \
+             mock.patch.object(rr, "_http_get_json", return_value=(200, {"messages": []})):
+            rc = rr._main([ROOM, "--agent", HS])
+        self.assertEqual(rc, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
