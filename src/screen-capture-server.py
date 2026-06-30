@@ -11,6 +11,7 @@ import http.server
 import subprocess
 import json
 import os
+import secrets
 import threading
 import urllib.request
 import os as _os
@@ -30,6 +31,34 @@ NOTIFY_ENABLED = _os.environ.get("SUTANDO_CAPTURE_NOTIFY", "1") != "0"
 # describe_screen calls every 5s). One notification per this many seconds.
 NOTIFY_DEBOUNCE_S = 5.0
 _last_notify_ts = 0.0
+
+# /capture-video is the one side-effectful endpoint that records 1-60s of screen.
+# Unlike /capture (a single still) it requires a shared token so a drive-by web
+# page can't silently start a recording: the token lives in a 0600 file only
+# local processes can read, and the native Swift hotkey caller passes it back in
+# the X-Sutando-Capture-Token header. A browser can neither read that file nor
+# set a custom header on a no-cors/<img> request, so it can't reach the endpoint.
+# (The pre-existing /capture hole is tracked for a follow-up.)
+_CAPTURE_TOKEN_PATH = _os.path.expanduser("~/.config/sutando/screen-capture-token")
+
+
+def _load_or_create_capture_token():
+    try:
+        if _os.path.exists(_CAPTURE_TOKEN_PATH):
+            existing = open(_CAPTURE_TOKEN_PATH).read().strip()
+            if existing:
+                return existing
+        _os.makedirs(_os.path.dirname(_CAPTURE_TOKEN_PATH), exist_ok=True)
+        tok = secrets.token_urlsafe(32)
+        fd = _os.open(_CAPTURE_TOKEN_PATH, _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o600)
+        _os.write(fd, tok.encode())
+        _os.close(fd)
+        return tok
+    except Exception:
+        return None
+
+
+CAPTURE_VIDEO_TOKEN = _load_or_create_capture_token()
 
 
 def _signal_seeing_blocking():
@@ -158,6 +187,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # to act on than a single still. Recording runs through THIS server
             # (not Sutando.app directly) because this process holds the Screen
             # Recording TCC grant, same reason /capture does.
+            #
+            # Token gate FIRST — before any side effect (no flash, no recording)
+            # so an unauthorized request can't even signal. See CAPTURE_VIDEO_TOKEN.
+            supplied = self.headers.get("X-Sutando-Capture-Token", "")
+            if not CAPTURE_VIDEO_TOKEN or supplied != CAPTURE_VIDEO_TOKEN:
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "error", "error": "forbidden"}).encode())
+                return
             from urllib.parse import urlparse, parse_qs
             query = parse_qs(urlparse(self.path).query)
             if query.get("silent", ["false"])[0] != "true":

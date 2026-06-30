@@ -19,6 +19,7 @@ import json
 import threading
 import unittest
 from unittest import mock
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -62,6 +63,10 @@ class TestCaptureVideoRouting(unittest.TestCase):
                 p = mock.patch.object(self.mod, target, repl)
             p.start()
             self.addCleanup(p.stop)
+        # Deterministic token so /capture-video auth is testable. Fresh module
+        # per test, so this assignment doesn't leak.
+        self.token = "test-capture-token"
+        self.mod.CAPTURE_VIDEO_TOKEN = self.token
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), self.mod.Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -72,13 +77,16 @@ class TestCaptureVideoRouting(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=2)
 
-    def _get(self, path):
-        with urllib.request.urlopen(self.base + path, timeout=5) as r:
+    def _get(self, path, token=None):
+        req = urllib.request.Request(self.base + path)
+        if token is not None:
+            req.add_header("X-Sutando-Capture-Token", token)
+        with urllib.request.urlopen(req, timeout=5) as r:
             return r.status, json.loads(r.read())
 
     def test_capture_video_returns_mov(self):
         # The whole point: /capture-video is NOT intercepted by /capture.
-        status, body = self._get("/capture-video?seconds=1&silent=true")
+        status, body = self._get("/capture-video?seconds=1&silent=true", token=self.token)
         self.assertEqual(status, 200)
         self.assertEqual(body["status"], "ok")
         self.assertTrue(body["path"].endswith(".mov"),
@@ -94,10 +102,18 @@ class TestCaptureVideoRouting(unittest.TestCase):
 
     def test_duration_is_clamped(self):
         # Out-of-range / non-numeric seconds falls back to the 5s default.
-        _, body = self._get("/capture-video?seconds=999&silent=true")
+        _, body = self._get("/capture-video?seconds=999&silent=true", token=self.token)
         self.assertEqual(body["seconds"], 5)
-        _, body = self._get("/capture-video?seconds=abc&silent=true")
+        _, body = self._get("/capture-video?seconds=abc&silent=true", token=self.token)
         self.assertEqual(body["seconds"], 5)
+
+    def test_capture_video_requires_token(self):
+        # Drive-by defense: no token / wrong token -> 403, no recording.
+        for bad in (None, "wrong-token"):
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                self._get("/capture-video?seconds=1&silent=true", token=bad)
+            self.assertEqual(ctx.exception.code, 403)
+            ctx.exception.close()
 
     def test_routing_guard_present_in_source(self):
         # Structural backstop: the /capture branch must exclude /capture-video.

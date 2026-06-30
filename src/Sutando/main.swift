@@ -1640,6 +1640,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         guard let url = URL(string: "http://localhost:7845/capture-video?seconds=\(seconds)") else { return }
         var req = URLRequest(url: url)
+        // /capture-video requires a shared token (the server writes it to a 0600
+        // file a web page can't read; a browser also can't set a custom header on
+        // a no-cors/<img> request — so this gate blocks drive-by triggering).
+        let tokenPath = NSString(string: "~/.config/sutando/screen-capture-token").expandingTildeInPath
+        if let token = try? String(contentsOfFile: tokenPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty {
+            req.setValue(token, forHTTPHeaderField: "X-Sutando-Capture-Token")
+        }
         // The server blocks for ~seconds while recording; allow generous headroom.
         req.timeoutInterval = TimeInterval(seconds + 30)
         URLSession.shared.dataTask(with: req) { [self] data, _, error in
