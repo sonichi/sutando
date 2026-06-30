@@ -204,9 +204,16 @@ def case_i_token_read_prefers_channel_env() -> list[str]:
     saved_home = os.environ.get("HOME")
     saved_repo = hc.REPO_DIR
     saved_env_token = os.environ.pop("SLACK_BOT_TOKEN", None)  # force the file path
+    # claude_home_path() checks $CLAUDE_CONFIG_DIR before $HOME/.claude, so if
+    # CLAUDE_CONFIG_DIR is set to the real install dir the real token leaks into
+    # the test. Override CLAUDE_CONFIG_DIR to match the temp home so the test
+    # controls all file reads (mirrors startup.sh: sets CLAUDE_CONFIG_DIR before
+    # launching bridges, not just HOME).
+    saved_ccd = os.environ.get("CLAUDE_CONFIG_DIR")
     try:
         with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as repo:
             os.environ["HOME"] = home
+            os.environ["CLAUDE_CONFIG_DIR"] = str(Path(home) / ".claude")
             hc.REPO_DIR = Path(repo)
             chan = Path(home) / ".claude" / "channels" / "slack"
             chan.mkdir(parents=True, exist_ok=True)
@@ -231,6 +238,10 @@ def case_i_token_read_prefers_channel_env() -> list[str]:
     finally:
         if saved_home is not None:
             os.environ["HOME"] = saved_home
+        if saved_ccd is not None:
+            os.environ["CLAUDE_CONFIG_DIR"] = saved_ccd
+        elif "CLAUDE_CONFIG_DIR" in os.environ:
+            del os.environ["CLAUDE_CONFIG_DIR"]
         if saved_env_token is not None:
             os.environ["SLACK_BOT_TOKEN"] = saved_env_token
         hc.REPO_DIR = saved_repo
