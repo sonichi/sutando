@@ -151,17 +151,25 @@ def check_directory(path: Path, name: str) -> dict:
 
 
 def check_memory_sync() -> dict:
-    """Verify memory sync is configured and has run recently."""
+    """Verify workspace sync is configured and has run recently."""
     name = "memory-sync"
-    env_path = REPO_DIR / ".env"
+    # Canonical: vault.remote_url in sutando.config.local.json (M2+ / sync-workspace.sh).
+    # Backward-compat fallback: SUTANDO_MEMORY_REPO in .env (deprecated, #1446 window).
     repo_url = ""
-    if env_path.exists():
-        for line in env_path.read_text().splitlines():
-            if line.startswith("SUTANDO_MEMORY_REPO="):
-                repo_url = line.split("=", 1)[1].strip().strip('"').strip("'")
-                break
+    try:
+        from sutando_config import resolve_vault  # noqa: PLC0415
+        repo_url = resolve_vault(repo_root=REPO_DIR)["remote_url"]
+    except Exception:
+        pass
     if not repo_url:
-        return {"name": name, "status": "warn", "detail": "SUTANDO_MEMORY_REPO not set — cross-machine sync disabled"}
+        env_path = REPO_DIR / ".env"
+        if env_path.exists():
+            for line in env_path.read_text().splitlines():
+                if line.startswith("SUTANDO_MEMORY_REPO="):
+                    repo_url = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
+    if not repo_url:
+        return {"name": name, "status": "warn", "detail": "vault.remote_url not configured — cross-machine sync disabled (set via sutando.config.local.json or run bash scripts/sync-workspace.sh --init)"}
     # Current model (sync-workspace.sh): the workspace ITSELF is a git repo with
     # the vault as a remote — sync = git fetch/merge/push on the workspace, no
     # separate clone dir. So the freshness signal is the workspace's own
@@ -187,7 +195,7 @@ def check_memory_sync() -> dict:
     elif sync_dir_legacy.exists():
         sync_dir = sync_dir_legacy
     else:
-        return {"name": name, "status": "warn", "detail": "repo configured but never synced — run bash scripts/sync-memory.sh"}
+        return {"name": name, "status": "warn", "detail": "repo configured but never synced — run bash scripts/sync-workspace.sh"}
     git_dir = sync_dir / ".git" / "FETCH_HEAD"
     if git_dir.exists():
         age_h = (time.time() - git_dir.stat().st_mtime) / 3600
