@@ -95,12 +95,26 @@ class TestWorkspaceDefault(unittest.TestCase):
         finally:
             os.environ.pop("SUTANDO_TEST_MODE", None)
 
+    def _patch_no_workspace_config(self):
+        """Return a context manager that strips workspace.path from config.
+
+        A dev checkout may carry sutando.config.local.json with workspace.path
+        set — that's a valid user override, but it breaks tests that assert the
+        "no-config fallback = <repo>/workspace" contract. We warm
+        _CACHE_REPO_ROOT first (so resolve_workspace knows the repo root) then
+        patch load_config to return an otherwise-empty config, letting the
+        default-path logic run without the override.
+        """
+        import sutando_config as sc
+        sc.load_config()  # warm _CACHE_REPO_ROOT from the real repo root
+        return patch.object(sc, "load_config", return_value={})
+
     def test_resolve_ignores_env_in_production_path(self):
         # v0.8 contract: without SUTANDO_TEST_MODE, env is warned + ignored.
         os.environ["SUTANDO_WORKSPACE"] = "/tmp/should-be-ignored"
         os.environ.pop("SUTANDO_TEST_MODE", None)
-        # Falls back to the in-repo default (env ignored).
-        self.assertEqual(resolve_workspace(migrate=False), ROOT / "workspace")
+        with self._patch_no_workspace_config():
+            self.assertEqual(resolve_workspace(migrate=False), ROOT / "workspace")
 
     def test_resolve_falls_back_to_default_when_env_unset(self):
         # Post-M0: fallback is the in-repo workspace path (<repo>/workspace),
@@ -108,15 +122,18 @@ class TestWorkspaceDefault(unittest.TestCase):
         # default_workspace_dir() (a fallback for installs outside a checkout),
         # but the canonical resolution targets the in-repo default for normal
         # git-clone installs.
-        self.assertEqual(resolve_workspace(migrate=False), ROOT / "workspace")
+        with self._patch_no_workspace_config():
+            self.assertEqual(resolve_workspace(migrate=False), ROOT / "workspace")
 
     def test_resolve_falls_back_when_env_empty_string(self):
         os.environ["SUTANDO_WORKSPACE"] = ""
-        self.assertEqual(resolve_workspace(migrate=False), ROOT / "workspace")
+        with self._patch_no_workspace_config():
+            self.assertEqual(resolve_workspace(migrate=False), ROOT / "workspace")
 
     def test_resolve_falls_back_when_env_whitespace_only(self):
         os.environ["SUTANDO_WORKSPACE"] = "   "
-        self.assertEqual(resolve_workspace(migrate=False), ROOT / "workspace")
+        with self._patch_no_workspace_config():
+            self.assertEqual(resolve_workspace(migrate=False), ROOT / "workspace")
 
     def test_resolve_never_returns_repo_root(self):
         """Anti-regression: the historical fallback was the script's repo root
