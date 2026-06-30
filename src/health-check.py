@@ -242,6 +242,36 @@ def check_host_subtrees() -> dict:
     return {"name": name, "status": "ok", "detail": f"{fresh} host subtree(s), all synced <{stale_days:.0f}d"}
 
 
+def check_migrate_reader_contract() -> dict:
+    """Verify migration CLASS_RULES are compatible with reader resolution chains (issue #1543).
+
+    Runs tests/migrate-reader-contract.test.py, which asserts that each file
+    in sutando-migrate.sh CLASS_RULES lands in a location its reader actually
+    checks.  A mismatch causes silent data loss — the reader falls back to a
+    default rather than finding the migrated file (see incident #1540).
+    """
+    name = "migrate-reader-contract"
+    test_path = REPO_DIR / "tests" / "migrate-reader-contract.test.py"
+    if not test_path.exists():
+        return {"name": name, "status": "ok", "detail": "test not found (pre-#1543 install)"}
+    try:
+        result = subprocess.run(
+            [sys.executable, str(test_path)],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0:
+            return {"name": name, "status": "ok", "detail": "all CLASS_RULES compatible with reader contracts"}
+        first_fail = next(
+            (ln.strip() for ln in (result.stdout + result.stderr).splitlines() if "FAIL" in ln or "Error" in ln),
+            "contract mismatch — run tests/migrate-reader-contract.test.py for details",
+        )
+        return {"name": name, "status": "error", "detail": first_fail}
+    except subprocess.TimeoutExpired:
+        return {"name": name, "status": "warn", "detail": "timed out after 15s"}
+    except Exception as e:
+        return {"name": name, "status": "error", "detail": str(e)}
+
+
 def check_tcc_documents_access() -> dict:
     """Detect macOS TCC denial of Documents-folder access (issue #709).
 
@@ -1109,6 +1139,9 @@ def run_all_checks() -> list[dict]:
 
     # Per-host subtree freshness (hosts/<host>/ stopped syncing?)
     checks.append(check_host_subtrees())
+
+    # Migration/reader path-contract drift (#1543)
+    checks.append(check_migrate_reader_contract())
 
     # Phone conversation server (optional — only check if Twilio configured and not skipped)
     env_path = REPO_DIR / ".env"
