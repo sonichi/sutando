@@ -1,9 +1,0 @@
-{
-  "_comment": "Per-agent scope gate for room-read. DEFAULT-DENY: an agent that is not a key here cannot read any room. Copy to <workspace>/state/room-read-gate.json (or set ROOM_READ_GATE) and add only the agents/rooms you intend to opt in. 'rooms' = explicit allowed room ids; 'all_member_rooms': true = any room the agent is a member of (the backend still enforces membership).",
-  "@example.agent:your-homeserver": {
-    "rooms": ["!exampleRoomId:your-homeserver"]
-  },
-  "@trusted.agent:your-homeserver": {
-    "all_member_rooms": true
-  }
-}
