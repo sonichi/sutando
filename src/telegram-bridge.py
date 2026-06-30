@@ -1017,6 +1017,8 @@ def main():  # pragma: no cover
             result_file = RESULTS_DIR / f"{task_id}.txt"
             if result_file.exists():
                 reply_text = result_file.read_text().strip()
+                if not reply_text:
+                    continue
                 chat_id = pending_replies.pop(task_id)
                 # Parse markers via the unified module (#873). Telegram
                 # honors [no-send] / [REPLIED] / [deduped: <id>] as skip,
