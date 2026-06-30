@@ -233,6 +233,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let actionToSelector: [String: (String, Selector)] = [
             "drop_context":    ("Drop Context",    #selector(dropContext)),
             "drop_screenshot": ("Drop Screenshot", #selector(dropScreenshot)),
+            "drop_video_clip": ("Drop Video Clip", #selector(dropVideoClip)),
             "toggle_voice":    ("Toggle Voice",    #selector(toggleVoice)),
             "toggle_mute":     ("Toggle Mute",     #selector(toggleMute)),
         ]
@@ -1089,6 +1090,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private static let defaultHotkeys: [(action: String, key: String, modifiers: [String])] = [
         ("drop_context",     "C", ["control"]),
         ("drop_screenshot",  "S", ["control"]),
+        ("drop_video_clip",  "R", ["control"]),
         ("toggle_voice",     "V", ["control"]),
         ("toggle_mute",      "M", ["control"]),
     ]
@@ -1187,6 +1189,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             switch action {
             case "drop_context":    appDelegate.dropContext()
             case "drop_screenshot": appDelegate.dropScreenshot()
+            case "drop_video_clip": appDelegate.dropVideoClip()
             case "toggle_voice":    appDelegate.toggleVoice()
             case "toggle_mute":     appDelegate.toggleMute()
             default: break
@@ -1611,6 +1614,58 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             appendLog(logFile, "[\(timestamp)] dropScreenshot: \(path)")
             writeTask(tasksDir, timestamp: timestamp, content: content)
             notify("Sutando", "Screenshot dropped (\(URL(fileURLWithPath: path).lastPathComponent))")
+        }.resume()
+    }
+
+    @objc func dropVideoClip() {
+        // Records a few seconds of screen and drops the .mov as a task — a short
+        // video repro is far easier to act on than a single still. Mirrors
+        // dropScreenshot but hits /capture-video, which runs `screencapture -v`
+        // on the capture server that holds the Screen Recording permission.
+        let now = Date()
+        if now.timeIntervalSince(lastDropTime) < 1.0 {
+            logToFile("dropVideoClip: debounced (too fast)")
+            return
+        }
+        lastDropTime = now
+
+        let seconds = 5
+        let timestamp = ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withFullDate, .withTime, .withSpaceBetweenDateAndTime, .withColonSeparatorInTime])
+        let logFile = workspace + "/logs/context-drop.log"
+        let tasksDir = workspace + "/tasks"
+
+        // Tell the user recording started — unlike a screenshot this takes a few
+        // seconds, so a silent capture would feel like nothing happened.
+        notify("Sutando", "Recording \(seconds)s screen clip…")
+
+        guard let url = URL(string: "http://localhost:7845/capture-video?seconds=\(seconds)") else { return }
+        var req = URLRequest(url: url)
+        // The server blocks for ~seconds while recording; allow generous headroom.
+        req.timeoutInterval = TimeInterval(seconds + 30)
+        URLSession.shared.dataTask(with: req) { [self] data, _, error in
+            if let error = error {
+                notify("Sutando", "Video drop failed: \(error.localizedDescription)")
+                appendLog(logFile, "[\(timestamp)] dropVideoClip: error \(error.localizedDescription)")
+                return
+            }
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let path = json["path"] as? String else {
+                notify("Sutando", "Video drop failed: bad server response")
+                appendLog(logFile, "[\(timestamp)] dropVideoClip: bad server response")
+                return
+            }
+
+            let content = """
+            timestamp: \(timestamp)
+            type: video
+            path: \(path)
+            ---
+            [Video clip dropped]
+            """
+            appendLog(logFile, "[\(timestamp)] dropVideoClip: \(path)")
+            writeTask(tasksDir, timestamp: timestamp, content: content)
+            notify("Sutando", "Video clip dropped (\(URL(fileURLWithPath: path).lastPathComponent))")
         }.resume()
     }
 

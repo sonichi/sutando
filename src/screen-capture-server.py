@@ -149,6 +149,47 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(json.dumps({"status": "error", "error": str(e)}).encode())
+        elif self.path.startswith("/capture-video"):
+            # Record a short screen video and return the .mov path. Backs the
+            # ⌃R "Drop Video Clip" hotkey — a few-second video repro is far easier
+            # to act on than a single still. Recording runs through THIS server
+            # (not Sutando.app directly) because this process holds the Screen
+            # Recording TCC grant, same reason /capture does.
+            from urllib.parse import urlparse, parse_qs
+            query = parse_qs(urlparse(self.path).query)
+            if query.get("silent", ["false"])[0] != "true":
+                _signal_seeing()
+                _notify_capture()
+            os.makedirs(DIR, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            # Coerce to int to short-circuit taint flow into the subprocess argv
+            # (mirrors /capture). Duration clamped 1..60s, display index 1..9.
+            seconds_raw = query.get("seconds", ["5"])[0]
+            seconds = int(seconds_raw) if seconds_raw.isdigit() and 1 <= int(seconds_raw) <= 60 else 5
+            display_raw = query.get("display", [None])[0]
+            display = int(display_raw) if display_raw and display_raw.isdigit() and 1 <= int(display_raw) <= 9 else None
+            suffix = f"-d{display}" if display else ""
+            path = f"{DIR}/clip-{ts}{suffix}.mov"
+            try:
+                # screencapture -v records video; -V<seconds> auto-stops after the
+                # duration; -x mutes the capture sound. The call blocks for ~seconds,
+                # so give the subprocess timeout headroom for the encoder flush.
+                cmd = ["screencapture", "-v", f"-V{seconds}", "-x"]
+                if display:
+                    cmd.append(f"-D{display}")
+                cmd.append(path)
+                subprocess.run(cmd, timeout=seconds + 30, check=True)
+                if not (os.path.exists(path) and os.path.getsize(path) > 0):
+                    raise RuntimeError("recording produced no file")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "ok", "path": path, "seconds": seconds}).encode())
+            except Exception as e:
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "error", "error": str(e)}).encode())
         elif self.path == "/ping":
             self.send_response(200)
             self.end_headers()
