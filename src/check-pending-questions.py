@@ -108,8 +108,16 @@ def get_waiting_questions():
             status = status_m.group(1).strip().lower()
             if not (status.startswith('unanswered') or status.startswith('waiting')):
                 continue  # explicitly resolved/done/answered — skip
-        # No status field, or status is unanswered/waiting → notify
-        questions.append({"id": title[:40], "title": title})
+        # No status field, or status is unanswered/waiting → notify.
+        # Capture first non-empty, non-strikethrough body line as a one-line
+        # action hint so notifications tell the user what to do, not just that
+        # something is waiting (avoids "what do I do with this?" confusion).
+        snippet_lines = [
+            l.strip() for l in body.strip().splitlines()
+            if l.strip() and not l.strip().startswith('~~')
+        ]
+        snippet = snippet_lines[0][:120] if snippet_lines else ""
+        questions.append({"id": title[:40], "title": title, "snippet": snippet})
 
     # Also recognize the free-form bullet format the proactive-loop and skills
     # actually append in: `- **[label, timestamp]** ...`. The `## `-section walk
@@ -171,6 +179,8 @@ def notify_discord_dm(questions):
     ]
     for q in questions[:5]:
         lines.append(f"• {q['title']}")
+        if q.get("snippet"):
+            lines.append(f"  ↳ {q['snippet']}")
     if len(questions) > 5:
         lines.append(f"…and {len(questions) - 5} more")
     lines.append("")
