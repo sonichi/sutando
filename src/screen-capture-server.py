@@ -83,7 +83,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
 
     def do_GET(self):
-        if self.path.startswith("/capture"):
+        # NB: "/capture-video" (handled below) also startswith("/capture"), so
+        # exclude it explicitly or this screenshot branch would intercept it and
+        # return a PNG instead of recording a clip.
+        if self.path.startswith("/capture") and not self.path.startswith("/capture-video"):
             # Parse display number from query: /capture?display=2 or /capture?all=true
             from urllib.parse import urlparse, parse_qs
             query = parse_qs(urlparse(self.path).query)
