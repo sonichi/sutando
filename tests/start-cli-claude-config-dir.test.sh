@@ -99,8 +99,9 @@ EOF
   export PATH="$BIN_STUB:$PATH"
 
   # Copy the real start-cli.sh into the fake repo (mirroring its real
-  # src/agent/claude/ location, since the script self-locates the repo root
-  # three levels up) plus the bits it needs to resolve claude_sutando_config_dir
+  # src/agent/claude/cli/ location, since the script self-locates the repo root
+  # four levels up: cli → claude → agent → src → repo) plus the bits it needs to
+  # resolve claude_sutando_config_dir
   # (sutando-config.sh stays under scripts/ — start-cli calls $REPO/scripts/...).
   cp "$REAL_REPO/src/agent/claude/cli/start-cli.sh" "$REPO_FAKE/src/agent/claude/cli/"
 
