@@ -1,6 +1,6 @@
 #!/bin/bash
-# src/agent/claude/cli/start-cli.sh — canonical launch script for the sutando-core
-# tmux session. Single source of truth for the "how to start Claude Code" command,
+# src/agent/claude/cli/start-cli.sh — canonical launch script for the sutando-core tmux
+# session. Single source of truth for the "how to start Claude Code" command,
 # so startup.sh + Sutando.app's Restart Core menu can both invoke it without
 # duplicating the launch arguments.
 #
@@ -161,6 +161,59 @@ PY
   rm -f "$_ccd_err"
 fi
 
+# ---- provider-backed core (core_config.provider) ---------------------------
+# When core_config.provider is set, boot the SAME interactive core (tmux session,
+# watcher loop, /schedule-crons — everything below is unchanged) but pointed at a
+# custom Anthropic-compatible provider + API token instead of the Claude.ai
+# subscription. A drop-in replacement: config-driven, so it persists across
+# restarts, health-check --recover-core, and Sutando.app's Restart Core (all of
+# which re-exec this one script). With no provider set, this block is skipped and
+# the core runs on the subscription exactly as before.
+#
+# We source the SHARED provider-env helper (also used by dashp.sh / session-server)
+# to export ANTHROPIC_BASE_URL / <auth_env> token / ANTHROPIC_MODEL. Those env
+# exports are inherited by the tmux-launched `claude` below the same way
+# startup.sh's ANTHROPIC_BASE_URL=<credential-proxy> already reaches it — and the
+# env token takes precedence over any OAuth .credentials.json (Claude Code: env >
+# keychain), so the subscription creds are ignored.
+#
+# Read core_config first so we only touch the provider path when one is
+# configured (otherwise a stray token in the env must NOT override subscription
+# auth). Fail loud if a provider is set but no token resolves.
+CLAUDE_AS_CORE_PROVIDER=0
+if [ -x "$REPO/scripts/sutando-config.sh" ]; then
+  _cc_provider="" _cc_core_type=""
+  while IFS='=' read -r _k _v; do
+    case "$_k" in CFG_PROVIDER) _cc_provider="$_v" ;; CFG_CORE_TYPE) _cc_core_type="$_v" ;; esac
+  done < <(bash "$REPO/scripts/sutando-config.sh" core-config 2>/dev/null) || true
+  # A provider counts as configured via config OR the env override.
+  if [ -n "$_cc_provider" ] || [ -n "${SUTANDO_PROVIDER_URL:-}" ]; then
+    CLAUDE_AS_CORE_PROVIDER=1
+    [ "$_cc_core_type" = "claude_sdk" ] && echo "  ~ note: core_config.core_type=claude_sdk — this is the CLI core; run src/agent/claude/sdk/session-server.sh for the SDK core." >&2
+    # Shed any inherited ANTHROPIC_BASE_URL before resolving the provider. When
+    # launched via src/startup.sh this is pre-set to the credential proxy
+    # (http://localhost:7846), which injects the SUBSCRIPTION token — the exact
+    # thing provider mode must NOT use. Unsetting it lets provider-env.sh set the
+    # provider endpoint from core_config.provider (or SUTANDO_PROVIDER_URL).
+    unset ANTHROPIC_BASE_URL
+    # shellcheck source=src/agent/claude/provider-env.sh
+    . "$REPO/src/agent/claude/provider-env.sh"
+    _prc=0; claude_provider_export_env || _prc=$?
+    if [ "$_prc" = "0" ]; then
+      echo "  ✓ core provider: ${ANTHROPIC_BASE_URL:-(stock Anthropic endpoint)}${ANTHROPIC_MODEL:+ · model=$ANTHROPIC_MODEL} (auth via ${CLAUDE_PROVIDER_AUTH_ENV})"
+    elif [ "$_prc" = "2" ]; then
+      # Subscription auth_env but a provider IS set — contradictory: a provider
+      # endpoint won't authenticate against the subscription OAuth.
+      echo "start-cli: core_config.provider is set but core_config.auth_env=ANTHROPIC_SUBSCRIPTION (no token) — a provider needs a token. Set auth_env to ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY, or clear core_config.provider. Refusing to start core." >&2
+      exit 1
+    else
+      echo "start-cli: core_config.provider is set but no API token resolved via ${CLAUDE_PROVIDER_AUTH_ENV:-ANTHROPIC_AUTH_TOKEN} (env or vault) — refusing to start core." >&2
+      echo "  Set the token in the env or vault, or clear core_config.provider to use the subscription core. See src/agent/claude/README.md." >&2
+      exit 1
+    fi
+  fi
+fi
+
 # Optional context-window pin (graceful-degradation hook for the 1M
 # usage-credit-gate wedge — see src/health-check.py recover_core_if_wedged).
 # When SUTANDO_CORE_MODEL is set we pass it through as `--model`; otherwise we
@@ -171,8 +224,13 @@ fi
 # 200K context (no gate) and keeps working instead of looping. The
 # ${arr[@]+...} guard keeps an empty array safe on bash 3.2 even under `set -u`
 # (mirrors the empty-array care in PR #1391).
+# In alternate-provider mode the model comes from ANTHROPIC_MODEL (exported by
+# the provider-env helper above); we do NOT translate SUTANDO_CORE_MODEL into a
+# --model flag there, because that pin (opus / 1M degradation) is a
+# subscription-specific concept and its model names don't exist on a custom
+# provider — a --model flag would also override ANTHROPIC_MODEL.
 MODEL_ARGS=()
-if [ -n "${SUTANDO_CORE_MODEL:-}" ]; then
+if [ "$CLAUDE_AS_CORE_PROVIDER" != "1" ] && [ -n "${SUTANDO_CORE_MODEL:-}" ]; then
   MODEL_ARGS=(--model "$SUTANDO_CORE_MODEL")
 fi
 

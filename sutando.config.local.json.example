@@ -6,6 +6,24 @@
     "path": "/absolute/path/to/your/workspace"
   },
 
+  "core_config": {
+    "_comment": "High-level 'which core agent + how it connects'. Consumed by src/agent/claude/. Defaults keep the Claude.ai-subscription CLI core; set a provider to run on a custom Anthropic-compatible endpoint.",
+    "_comment_core_type": "claude_cli = the interactive tmux core (cli/start-cli.sh) — subscription when `provider` is empty, or on `provider` when set. claude_sdk = the Agent-SDK session core (sdk/session-server.sh; requires provider + auth_env).",
+    "core_type": "claude_cli",
+    "_comment_provider": "Custom Anthropic-compatible endpoint URL. Empty = stock Anthropic / subscription (no provider). Required for claude_sdk and for a provider-backed claude_cli.",
+    "provider": "https://your-gateway.example.com",
+    "_comment_auth_env": "Default is the sentinel ANTHROPIC_SUBSCRIPTION = use the Claude.ai subscription OAuth (no token) — correct for a subscription claude_cli core. For a PROVIDER (as below), set a real token env var: ANTHROPIC_AUTH_TOKEN → Authorization: Bearer, or ANTHROPIC_API_KEY → x-api-key. Store the secret with `vault set <auth_env> <token>` (never put the token in this file).",
+    "auth_env": "ANTHROPIC_AUTH_TOKEN",
+    "_comment_model": "The PRIMARY session model (the core's own model) → ANTHROPIC_MODEL. Empty = provider/account default.",
+    "model": "",
+    "_comment_models": "Per-class model IDs for SUBTASKS/subagents, so lighter work can run cheaper models. Each empty value inherits. opus → ANTHROPIC_DEFAULT_OPUS_MODEL; sonnet → ANTHROPIC_DEFAULT_SONNET_MODEL (subagents default here); haiku → ANTHROPIC_DEFAULT_HAIKU_MODEL (quick/background). An already-set ANTHROPIC_DEFAULT_*_MODEL env var wins.",
+    "models": {
+      "opus": "",
+      "sonnet": "",
+      "haiku": ""
+    }
+  },
+
   "vault": {
     "_comment": "Enable + point at your private remote git repo to sync notes/memory/archives off-host.",
     "enabled": true,

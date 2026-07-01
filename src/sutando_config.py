@@ -54,6 +54,7 @@ _KNOWN_TOP_LEVEL_KEYS = {
     "workspace",
     "claude_sutando_config_dir",
     "core_config_dirs",
+    "core_config",
     "vault",
     "migrate",
 }
@@ -401,6 +402,76 @@ def resolve_vault(repo_root: Optional[Path] = None) -> Dict[str, Any]:
     vault["sync"] = sync
     vault.setdefault("interval_seconds", 1800)
     return vault
+
+
+# --------------------------------------------------------------------------- #
+#  Core agent config — `core_config` (which core, and its provider connection) #
+# --------------------------------------------------------------------------- #
+
+# Baked-in defaults for the `core_config` block — the high-level "which core
+# agent, and how does it connect" contract, consumed by src/agent/claude/.
+#   core_type — which core implementation runs:
+#                 "claude_cli" (default) — the interactive tmux core
+#                   (src/agent/claude/cli/start-cli.sh). Uses the Claude.ai
+#                   SUBSCRIPTION when `provider` is empty; runs on `provider`
+#                   when it is set. provider/auth_env are NOT required for the
+#                   subscription case.
+#                 "claude_sdk" — the Agent-SDK session core
+#                   (src/agent/claude/sdk/session-server.sh). Requires a
+#                   provider + auth_env.
+#   provider  — custom Anthropic-compatible endpoint URL (""=stock Anthropic /
+#               subscription). Required for claude_sdk and for a provider-backed
+#               claude_cli.
+#   auth_env  — env var (and vault key) holding the API token, OR the sentinel
+#               "ANTHROPIC_SUBSCRIPTION" (default) meaning "use the Claude.ai
+#               subscription OAuth — no provider token". A real token env picks
+#               the credential style: ANTHROPIC_AUTH_TOKEN (Bearer) or
+#               ANTHROPIC_API_KEY (x-api-key). A provider needs a real token env.
+#   model     — the PRIMARY session model (the core's own model, opus-class for
+#               the interactive core). ""=provider/account default. → ANTHROPIC_MODEL.
+#   models    — per-CLASS model IDs used for SUBTASKS/subagents, so a provider (or
+#               a quota-conscious subscription) can run cheaper models for lighter
+#               work. Each maps to the Claude Code alias env var (empty = inherit):
+#                 models.opus   → ANTHROPIC_DEFAULT_OPUS_MODEL
+#                 models.sonnet → ANTHROPIC_DEFAULT_SONNET_MODEL  (subagents default here)
+#                 models.haiku  → ANTHROPIC_DEFAULT_HAIKU_MODEL   (quick/background work)
+# dashp.sh's launch knobs (permission_mode / bare / output_format) are NOT config
+# — they're env/CLI overrides only, keeping this block high-level.
+_CORE_CONFIG_MODEL_TIERS = ("opus", "sonnet", "haiku")
+_CORE_CONFIG_DEFAULTS: Dict[str, Any] = {
+    "core_type": "claude_cli",
+    "provider": "",
+    "auth_env": "ANTHROPIC_SUBSCRIPTION",
+    "model": "",
+    "models": {tier: "" for tier in _CORE_CONFIG_MODEL_TIERS},
+}
+
+
+def resolve_core_config(repo_root: Optional[Path] = None) -> Dict[str, Any]:
+    """Return the resolved `core_config` subtree (defaults merged with config).
+
+    Missing/partial config falls through to `_CORE_CONFIG_DEFAULTS` per-field
+    (and per-tier for the nested `models` block), so callers always get a
+    fully-populated dict. Consumed by `scripts/sutando-config.sh core-config` →
+    src/agent/claude/ (provider-env.sh, start-cli.sh, dashp.sh, session-server.sh).
+    """
+    cfg = load_config(repo_root)
+    block = dict(cfg.get("core_config") or {})
+    out = dict(_CORE_CONFIG_DEFAULTS)
+    out["models"] = dict(_CORE_CONFIG_DEFAULTS["models"])  # copy nested defaults
+    for key in ("core_type", "provider", "auth_env", "model"):
+        if block.get(key) is not None:
+            out[key] = block[key]
+    sub = block.get("models")
+    if isinstance(sub, dict):
+        for tier in _CORE_CONFIG_MODEL_TIERS:
+            if sub.get(tier) is not None:
+                out["models"][tier] = sub[tier]
+    # Canonicalize core_type to lowercase so claude_SDK / CLAUDE_SDK all resolve
+    # the same for the routing consumers (startup.sh, start-cli.sh).
+    if isinstance(out.get("core_type"), str):
+        out["core_type"] = out["core_type"].lower()
+    return out
 
 
 _DEFAULT_CLAUDE_SUTANDO_SUBDIR = ".claude-sutando"

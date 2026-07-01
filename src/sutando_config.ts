@@ -37,7 +37,14 @@ const LOCAL_FILENAME = 'sutando.config.local.json';
  * stays lenient (warn-only) so experimental/scratch keys don't break.
  * Per Mini's review #8 on PR #1395.
  */
-const KNOWN_TOP_LEVEL_KEYS = new Set(['workspace', 'claude_sutando_config_dir', 'vault']);
+const KNOWN_TOP_LEVEL_KEYS = new Set([
+	'workspace',
+	'claude_sutando_config_dir',
+	'core_config_dirs',
+	'core_config',
+	'vault',
+	'migrate',
+]);
 
 /**
  * Walk upward from `start` until we find a directory containing
