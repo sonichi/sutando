@@ -1,12 +1,12 @@
 #!/bin/bash
-# scripts/start-cli.sh — canonical launch script for the sutando-core tmux
-# session. Single source of truth for the "how to start Claude Code" command,
+# src/agent/claude/cli/start-cli.sh — canonical launch script for the sutando-core
+# tmux session. Single source of truth for the "how to start Claude Code" command,
 # so startup.sh + Sutando.app's Restart Core menu can both invoke it without
 # duplicating the launch arguments.
 #
 # Usage:
-#   bash scripts/start-cli.sh           # start (or attach if running)
-#   bash scripts/start-cli.sh --restart # kill existing session then start fresh
+#   bash src/agent/claude/cli/start-cli.sh           # start (or attach if running)
+#   bash src/agent/claude/cli/start-cli.sh --restart # kill existing session then start fresh
 #
 # Per Chi's prompt 2026-05-05 ("shall we add core CLI-related commands in
 # sutando app"): extracting the launch command from startup.sh's inline tmux
@@ -15,7 +15,8 @@
 
 set -e
 
-REPO="$(cd "$(dirname "$0")/.." && pwd)"
+# This script lives at src/agent/claude/cli/ — four levels under the repo root.
+REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
 cd "$REPO"
 
 TMUX_SOCKET="/tmp/sutando-tmux.sock"

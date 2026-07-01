@@ -17,12 +17,12 @@
 # load-bearing for sync coherence.
 #
 # Usage:
-#   bash scripts/sutando-shell-setup.sh                # dry-run: print proposed line + target rc
-#   bash scripts/sutando-shell-setup.sh --commit       # append to rc file (idempotent)
-#   bash scripts/sutando-shell-setup.sh --auto         # one-shot prompt path used by startup.sh
-#   bash scripts/sutando-shell-setup.sh --check        # exit 0 if alias present + path matches; 1 otherwise
-#   bash scripts/sutando-shell-setup.sh --import       # rsync ~/.claude → <workspace>/.claude-sutando (idempotent, non-destructive)
-#   bash scripts/sutando-shell-setup.sh --repair-paths # re-pin hardcoded SOURCE_DIR paths in runtime files to CLAUDE_DIR (idempotent)
+#   bash src/agent/claude/cli/sutando-shell-setup.sh                # dry-run: print proposed line + target rc
+#   bash src/agent/claude/cli/sutando-shell-setup.sh --commit       # append to rc file (idempotent)
+#   bash src/agent/claude/cli/sutando-shell-setup.sh --auto         # one-shot prompt path used by startup.sh
+#   bash src/agent/claude/cli/sutando-shell-setup.sh --check        # exit 0 if alias present + path matches; 1 otherwise
+#   bash src/agent/claude/cli/sutando-shell-setup.sh --import       # rsync ~/.claude → <workspace>/.claude-sutando (idempotent, non-destructive)
+#   bash src/agent/claude/cli/sutando-shell-setup.sh --repair-paths # re-pin hardcoded SOURCE_DIR paths in runtime files to CLAUDE_DIR (idempotent)
 #
 # Deprecated aliases (kept for one release):
 #   --migrate      # alias for --import; emits a stderr deprecation warning. Per
@@ -51,7 +51,8 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# This script lives at src/agent/claude/cli/ — four levels under the repo root.
+REPO_ROOT="$(cd "$(dirname "$0")/../../../.." && pwd)"
 MODE="dry-run"
 FORCE=0
 FROM_DIR=""
