@@ -117,7 +117,16 @@ shopt -u nullglob
 #   shell exits the watcher reparents to launchd (PPID=1) and runs
 #   indefinitely with no consumer, silently dropping every event.
 cleanup() { rm -f "$PID_FILE"; kill 0 2>/dev/null; }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+# HUP/INT/TERM must explicitly exit after cleanup — a trap only overrides the
+# signal's default disposition, it doesn't terminate the process on its own.
+# Without the explicit `exit`, `kill <pid>` (plain SIGTERM) ran cleanup() and
+# then let the fswatch read-loop resume, so the process never actually died
+# (confirmed 2026-07-01: had to `kill -9` to stop stragglers that `kill`
+# alone left running). `exit 0` here also re-fires the EXIT trap above, but
+# cleanup() is idempotent (rm -f on an already-removed file, kill 0 on an
+# already-terminating group are both safe no-ops).
+trap 'cleanup; exit 0' HUP INT TERM
 
 # Stream subsequent events. -l 0.5 = 500ms latency batch (fswatch coalesces
 # burst events). --event Created --event Renamed catches new file
