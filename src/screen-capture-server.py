@@ -11,6 +11,9 @@ import http.server
 import subprocess
 import json
 import os
+import secrets
+import signal
+import stat
 import threading
 import urllib.request
 import os as _os
@@ -30,6 +33,47 @@ NOTIFY_ENABLED = _os.environ.get("SUTANDO_CAPTURE_NOTIFY", "1") != "0"
 # describe_screen calls every 5s). One notification per this many seconds.
 NOTIFY_DEBOUNCE_S = 5.0
 _last_notify_ts = 0.0
+
+# /capture-video is the one side-effectful endpoint that records 1-60s of screen.
+# Unlike /capture (a single still) it requires a shared token so a drive-by web
+# page can't silently start a recording: the token lives in a 0600 file only
+# local processes can read, and the native Swift hotkey caller passes it back in
+# the X-Sutando-Capture-Token header. A browser can neither read that file nor
+# set a custom header on a no-cors/<img> request, so it can't reach the endpoint.
+# (The pre-existing /capture hole is tracked for a follow-up.)
+_CAPTURE_TOKEN_PATH = _os.path.expanduser("~/.config/sutando/screen-capture-token")
+
+
+def _load_or_create_capture_token():
+    try:
+        if _os.path.lexists(_CAPTURE_TOKEN_PATH):
+            st = _os.lstat(_CAPTURE_TOKEN_PATH)
+            if (stat.S_ISREG(st.st_mode) and (st.st_mode & 0o777) == 0o600
+                    and st.st_uid == _os.getuid()):
+                existing = open(_CAPTURE_TOKEN_PATH).read().strip()
+                if existing:
+                    return existing
+            _os.unlink(_CAPTURE_TOKEN_PATH)
+        _os.makedirs(_os.path.dirname(_CAPTURE_TOKEN_PATH), exist_ok=True)
+        tok = secrets.token_urlsafe(32)
+        fd = _os.open(_CAPTURE_TOKEN_PATH,
+                      _os.O_WRONLY | _os.O_CREAT | _os.O_EXCL | _os.O_NOFOLLOW, 0o600)
+        _os.write(fd, tok.encode())
+        _os.close(fd)
+        return tok
+    except Exception:
+        return None
+
+
+CAPTURE_VIDEO_TOKEN = _load_or_create_capture_token()
+
+# --- ⌃R start/stop toggle state ---------------------------------------------
+# A single open-ended `screencapture -v` recording driven by two ⌃R presses
+# (start, then stop). Only one at a time; guarded by _recording_lock. The
+# watchdog auto-stops a forgotten recording so it can't run forever / fill disk.
+_active_recording = None  # {"proc": Popen, "path": str, "watchdog": threading.Timer}
+_recording_lock = threading.Lock()
+MAX_RECORDING_SECONDS = 600  # safety cap for a recording nobody stopped
 
 
 def _signal_seeing_blocking():
@@ -83,7 +127,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
 
     def do_GET(self):
-        if self.path.startswith("/capture"):
+        # NB: "/capture-video" (handled below) also startswith("/capture"), so
+        # exclude it explicitly or this screenshot branch would intercept it and
+        # return a PNG instead of recording a clip.
+        if self.path.startswith("/capture") and not self.path.startswith("/capture-video"):
             # Parse display number from query: /capture?display=2 or /capture?all=true
             from urllib.parse import urlparse, parse_qs
             query = parse_qs(urlparse(self.path).query)
@@ -149,6 +196,120 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(json.dumps({"status": "error", "error": str(e)}).encode())
+        elif self.path.startswith("/capture-video"):
+            # Record a short screen video and return the .mov path. Backs the
+            # ⌃R "Drop Video Clip" hotkey — a few-second video repro is far easier
+            # to act on than a single still. Recording runs through THIS server
+            # (not Sutando.app directly) because this process holds the Screen
+            # Recording TCC grant, same reason /capture does.
+            #
+            # Token gate FIRST — before any side effect (no flash, no recording)
+            # so an unauthorized request can't even signal. See CAPTURE_VIDEO_TOKEN.
+            supplied = self.headers.get("X-Sutando-Capture-Token", "")
+            if not CAPTURE_VIDEO_TOKEN or supplied != CAPTURE_VIDEO_TOKEN:
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "error", "error": "forbidden"}).encode())
+                return
+            from urllib.parse import urlparse, parse_qs
+            query = parse_qs(urlparse(self.path).query)
+            action = query.get("action", [""])[0]
+            global _active_recording
+
+            # ⌃R toggle — STOP: SIGINT the running recording so screencapture
+            # finalizes the .mov, then return its path. Idempotent if idle.
+            if action == "stop":
+                with _recording_lock:
+                    rec = _active_recording
+                    _active_recording = None
+                if not rec:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"status": "idle"}).encode())
+                    return
+                try:
+                    if rec.get("watchdog"):
+                        rec["watchdog"].cancel()
+                    rec["proc"].send_signal(signal.SIGINT)  # -v finalizes on SIGINT
+                    rec["proc"].wait(timeout=30)
+                    path = rec["path"]
+                    if not (os.path.exists(path) and os.path.getsize(path) > 0):
+                        raise RuntimeError("recording produced no file")
+                    if query.get("silent", ["false"])[0] != "true":
+                        _signal_seeing()
+                        _notify_capture()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"status": "ok", "path": path}).encode())
+                except Exception as e:
+                    self.send_response(500)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"status": "error", "error": str(e)}).encode())
+                return
+
+            # ⌃R toggle — START: spawn an open-ended `screencapture -v` (no -V) and
+            # return immediately; the second ⌃R (action=stop) ends it.
+            if action == "start":
+                os.makedirs(DIR, exist_ok=True)
+                ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+                display_raw = query.get("display", [None])[0]
+                display = int(display_raw) if display_raw and display_raw.isdigit() and 1 <= int(display_raw) <= 9 else None
+                suffix = f"-d{display}" if display else ""
+                path = f"{DIR}/clip-{ts}{suffix}.mov"
+                with _recording_lock:
+                    if _active_recording:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"status": "already_recording", "path": _active_recording["path"]}).encode())
+                        return
+                    if query.get("silent", ["false"])[0] != "true":
+                        _signal_seeing()
+                        _notify_capture()
+                    cmd = ["screencapture", "-v", "-x"]  # no -V → records until SIGINT
+                    if display:
+                        cmd.append(f"-D{display}")
+                    cmd.append(path)
+                    try:
+                        proc = subprocess.Popen(cmd)
+                    except Exception as e:
+                        self.send_response(500)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"status": "error", "error": str(e)}).encode())
+                        return
+
+                    def _auto_stop(p=proc):
+                        global _active_recording
+                        with _recording_lock:
+                            if _active_recording and _active_recording.get("proc") is p:
+                                _active_recording = None
+                        try:
+                            p.send_signal(signal.SIGINT)
+                            p.wait(timeout=30)
+                        except Exception:
+                            pass
+
+                    wd = threading.Timer(MAX_RECORDING_SECONDS, _auto_stop)
+                    wd.daemon = True
+                    wd.start()
+                    _active_recording = {"proc": proc, "path": path, "watchdog": wd}
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "recording", "path": path}).encode())
+                return
+
+            # Toggle-only: /capture-video needs action=start|stop. (The old
+            # fixed-duration -V path was removed — ⌃R is a start/stop toggle now.)
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "error", "error": "action must be start or stop"}).encode())
         elif self.path == "/ping":
             self.send_response(200)
             self.end_headers()
