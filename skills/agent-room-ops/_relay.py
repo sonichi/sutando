@@ -29,7 +29,12 @@ HTTP_TIMEOUT = 15
 # Optional client gate (defense-in-depth; relay enforces membership)
 # --------------------------------------------------------------------------- #
 def gate_path(env_key="ROOM_OPS_GATE", default_name="room-ops-gate.json"):
-    return os.environ.get(env_key) or os.path.join(os.getcwd(), default_name)
+    # The default resolves relative to THIS skill dir (not cwd), so a gate file
+    # placed beside the skill is found regardless of the caller's cwd — the
+    # client default-deny stays reliable instead of silently None->allow when
+    # the process runs from elsewhere. Callers should still set ROOM_OPS_GATE to
+    # the workspace-resolved path for the real gate.
+    return os.environ.get(env_key) or os.path.join(os.path.dirname(__file__), default_name)
 
 
 def load_gate(path=None, env_key="ROOM_OPS_GATE"):
@@ -70,11 +75,18 @@ def relay():
     return base, headers
 
 
-def http_request(method, url, headers=None, data=None):
-    """Raw request → (status, body_bytes, response_headers). Raises on HTTP error."""
+def http_request(method, url, headers=None, data=None, max_bytes=None):
+    """Raw request → (status, body_bytes, response_headers). Raises on HTTP error.
+
+    When `max_bytes` is set, the body read is BOUNDED to `max_bytes + 1` so a
+    hostile/buggy peer can't OOM us before a higher-layer size cap applies —
+    reading one extra byte lets the caller detect overflow without buffering the
+    whole (possibly multi-GB) response.
+    """
     req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-        return resp.status, resp.read(), dict(resp.headers)
+        body = resp.read(max_bytes + 1) if max_bytes is not None else resp.read()
+        return resp.status, body, dict(resp.headers)
 
 
 def http_json(method, url, headers=None, payload=None):

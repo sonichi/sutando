@@ -127,6 +127,32 @@ class MediaTests(EnvCase):
         self.assertTrue(res["ok"] and os.path.isfile(res["path"]))
         self.assertEqual(open(res["path"], "rb").read(), b"PNG")
 
+    def test_fetch_reads_bounded_and_rejects_oversize(self):
+        # Regression for the OOM finding: fetch must (a) bound the read to
+        # MAX_BYTES+1 and (b) reject an oversize body — never buffer the full
+        # (possibly multi-GB) payload.
+        os.environ["RELAY_URL"] = "https://r"
+        cap = {}
+
+        def fake(method, url, headers=None, data=None, max_bytes=None):
+            cap["max_bytes"] = max_bytes
+            # simulate a hostile relay: return exactly the overflow sentinel size
+            return 200, b"x" * (md.MAX_BYTES + 1), {}
+
+        with mock.patch.object(md, "http_request", side_effect=fake):
+            res = md.fetch_media("mxc://x/y", HS, ROOM, gate=None)
+        self.assertEqual(cap["max_bytes"], md.MAX_BYTES)   # read was bounded
+        self.assertFalse(res["ok"])
+        self.assertIn("exceeds", res["reason"])            # oversize rejected
+
+    def test_send_gate_denies_before_file_stat(self):
+        # Gate must run before any filesystem stat — an unauthorized agent
+        # shouldn't cause the skill to touch the path at all.
+        with mock.patch.object(md.os.path, "isfile", side_effect=AssertionError("stat before gate")):
+            res = md.send_media(ROOM, "/whatever.png", HS, gate={})  # empty gate -> deny
+        self.assertFalse(res["ok"])
+        self.assertIn("gate denied", res["reason"])
+
     def test_send_path_not_allowed(self):
         os.environ["ROOM_MEDIA_ALLOW"] = "/other"
         self.assertIn("not in ROOM_MEDIA_ALLOW", md.send_media(ROOM, self.f, HS, gate=None)["reason"])

@@ -67,7 +67,9 @@ def fetch_media(ref, agent_mxid=None, room_id=None, *, gate=None, dest_dir=None)
         q["room_id"] = room_id
     url = f"{base}/v1/media/fetch?" + urlencode(q)
     try:
-        _, body, hdrs = http_request("GET", url, headers)
+        # Bounded read: at most MAX_BYTES+1 so a hostile relay returning a huge
+        # body can't OOM the agent before the cap check below.
+        _, body, hdrs = http_request("GET", url, headers, max_bytes=MAX_BYTES)
     except HTTPError as e:
         return _result(False, ref=ref, room_id=room_id, reason=degrade_reason(e.code))
     except (URLError, TimeoutError) as e:
@@ -91,6 +93,10 @@ def send_media(room_id, path, agent_mxid=None, *, gate=None, caption=None):
     agent_mxid = agent_mxid or os.environ.get("AGENT_MXID")
     if not room_id:
         return _result(False, reason="no room_id given")
+    # Gate FIRST — cheapest deny; don't stat/read files for an unauthorized agent.
+    gate = load_gate() if gate is None else gate
+    if not gate_allows(agent_mxid, room_id, gate):
+        return _result(False, room_id=room_id, reason=f"client gate denied for {agent_mxid}")
     if not path or not os.path.isfile(path):
         return _result(False, room_id=room_id, reason="file not found")
     if not _path_allowed(path):
@@ -101,9 +107,6 @@ def send_media(room_id, path, agent_mxid=None, *, gate=None, caption=None):
         return _result(False, room_id=room_id, reason=f"stat failed: {e}")
     if size > MAX_BYTES:
         return _result(False, room_id=room_id, path=path, reason=f"file exceeds {MAX_BYTES} bytes")
-    gate = load_gate() if gate is None else gate
-    if not gate_allows(agent_mxid, room_id, gate):
-        return _result(False, room_id=room_id, reason=f"client gate denied for {agent_mxid}")
     base, headers = relay()
     if not base:
         return _result(False, room_id=room_id, reason="no RELAY_URL configured")

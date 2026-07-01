@@ -58,7 +58,7 @@ agent-room-ops/
   media.py         fetch_media() / send_media()
   react.py         react() / unreact()
   room_ops.py      unified CLI dispatcher
-  test_room_ops.py 27 tests, no network
+  test_room_ops.py 29 tests, no network
 ```
 
 ## Configuration
