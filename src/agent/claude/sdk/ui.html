@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Claude Code — live session</title>
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --line:#30363d; --fg:#e6edf3; --dim:#8b949e;
+          --user:#1f6feb; --asst:#3fb950; --tool:#d29922; --result:#a371f7; --err:#f85149; }
+  * { box-sizing:border-box; }
+  body { margin:0; height:100vh; display:flex; flex-direction:column; background:var(--bg);
+         color:var(--fg); font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  header { padding:8px 14px; border-bottom:1px solid var(--line); display:flex; gap:12px;
+           align-items:center; background:var(--panel); }
+  header .dot { width:9px; height:9px; border-radius:50%; background:var(--err); }
+  header .dot.on { background:var(--asst); }
+  header .meta { color:var(--dim); font-size:12px; }
+  #log { flex:1; overflow:auto; padding:10px 14px; }
+  .row { padding:6px 10px; margin:6px 0; border-left:3px solid var(--line);
+         background:var(--panel); border-radius:0 6px 6px 0; white-space:pre-wrap; word-break:break-word; }
+  .row .kind { font-size:11px; text-transform:uppercase; letter-spacing:.5px; color:var(--dim); margin-bottom:2px; }
+  .row.user    { border-left-color:var(--user); }
+  .row.assistant { border-left-color:var(--asst); }
+  .row.tool    { border-left-color:var(--tool); }
+  .row.result  { border-left-color:var(--result); color:var(--dim); }
+  .row.server  { border-left-color:var(--dim); color:var(--dim); font-size:12px; }
+  .row.error   { border-left-color:var(--err); color:var(--err); }
+  details { margin-top:4px; } summary { cursor:pointer; color:var(--dim); font-size:12px; }
+  pre { margin:4px 0 0; font-size:12px; color:var(--dim); overflow:auto; }
+  form { display:flex; gap:8px; padding:10px 14px; border-top:1px solid var(--line); background:var(--panel); }
+  #box { flex:1; background:var(--bg); color:var(--fg); border:1px solid var(--line);
+         border-radius:6px; padding:8px 10px; font:inherit; resize:none; }
+  button { background:var(--user); color:#fff; border:0; border-radius:6px; padding:0 16px;
+           font:inherit; cursor:pointer; } button:disabled { opacity:.5; cursor:default; }
+</style>
+</head>
+<body>
+  <header>
+    <span class="dot" id="dot"></span>
+    <strong>Claude Code — live session</strong>
+    <span class="meta" id="meta">connecting…</span>
+  </header>
+  <div id="log"></div>
+  <form id="form">
+    <textarea id="box" rows="2" placeholder="Type a turn, Enter to send (Shift+Enter = newline)…"></textarea>
+    <button id="send" type="submit">Send</button>
+  </form>
+
+<script>
+const log = document.getElementById('log');
+const dot = document.getElementById('dot');
+const meta = document.getElementById('meta');
+const box = document.getElementById('box');
+const form = document.getElementById('form');
+
+function el(cls, kind, body, raw) {
+  const row = document.createElement('div');
+  row.className = 'row ' + cls;
+  row.innerHTML = '<div class="kind"></div>';
+  row.querySelector('.kind').textContent = kind;
+  const b = document.createElement('div');
+  b.textContent = body;
+  row.appendChild(b);
+  if (raw !== undefined) {
+    const d = document.createElement('details');
+    d.innerHTML = '<summary>raw</summary>';
+    const pre = document.createElement('pre');
+    pre.textContent = typeof raw === 'string' ? raw : JSON.stringify(raw, null, 2);
+    d.appendChild(pre);
+    row.appendChild(d);
+  }
+  log.appendChild(row);
+  log.scrollTop = log.scrollHeight;
+}
+
+// Render one SDK (or server) message into a friendly row.
+function render(m) {
+  const t = m.type;
+  if (t === 'server') {
+    if (m.subtype === 'connected' || m.subtype === 'starting') {
+      dot.classList.add('on');
+      meta.textContent = (m.provider ? m.provider + '  ·  ' : '') + (m.model || '') + (m.session_id ? '  ·  ' + m.session_id : '');
+    }
+    if (m.subtype === 'user_turn') return el('user', 'you', m.text);
+    if (m.subtype === 'error' || m.subtype === 'stderr') return el('error', m.subtype, m.error || m.text, m);
+    if (m.subtype === 'task_injected') return el('tool', 'task ← ' + m.id, m.path || '', m);
+    if (m.subtype === 'task_done') return el('server', 'task ✓ ' + m.id, '', m);
+    if (m.subtype === 'cron_fired') return el('tool', 'cron ⏱ ' + m.name, m.prompt || '', m);
+    if (m.subtype === 'cron_schedule')
+      return el('server', 'crons scheduled (' + (m.crons || []).length + ')',
+        (m.crons || []).map(c => c.cron + '  ' + c.name + ' → ' + c.target).join('\n'), m);
+    return el('server', 'server', m.subtype + (m.session_id ? ' · ' + m.session_id : ''), m);
+  }
+  if (t === 'system') {
+    meta.textContent = [m.model, m.session_id].filter(Boolean).join('  ·  ');
+    return el('server', 'system/' + (m.subtype || ''), 'tools: ' + ((m.tools || []).length), m);
+  }
+  if (t === 'assistant') {
+    const blocks = (m.message && m.message.content) || [];
+    for (const b of Array.isArray(blocks) ? blocks : [{ type: 'text', text: String(blocks) }]) {
+      if (b.type === 'text') el('assistant', 'assistant', b.text);
+      else if (b.type === 'thinking') el('assistant', 'thinking', b.thinking || '', b);
+      else if (b.type === 'tool_use') el('tool', 'tool → ' + b.name, JSON.stringify(b.input), b);
+      else el('assistant', b.type || 'assistant', '', b);
+    }
+    return;
+  }
+  if (t === 'user') { // tool results coming back from tool execution
+    const blocks = (m.message && m.message.content) || [];
+    for (const b of Array.isArray(blocks) ? blocks : []) {
+      if (b.type === 'tool_result') el('tool', 'tool result', typeof b.content === 'string' ? b.content : JSON.stringify(b.content), b);
+    }
+    return;
+  }
+  if (t === 'result') {
+    const u = m.usage || {};
+    const cls = m.is_error ? 'error' : 'result';
+    el(cls, 'result/' + (m.is_error ? 'error' : (m.subtype || '')),
+       `${m.result ?? ''}  ·  in ${u.input_tokens ?? '?'} / out ${u.output_tokens ?? '?'} tok` +
+       (m.total_cost_usd != null ? `  ·  $${m.total_cost_usd}` : ''), m);
+    return;
+  }
+  el('server', t || 'event', '', m); // stream_event + anything else → raw
+}
+
+const es = new EventSource('/events');
+es.onmessage = (e) => { try { render(JSON.parse(e.data)); } catch {} };
+es.onerror = () => { dot.classList.remove('on'); meta.textContent = 'disconnected — retrying…'; };
+
+async function send(text) {
+  await fetch('/input', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text }) });
+}
+form.addEventListener('submit', (e) => { e.preventDefault(); const t = box.value.trim(); if (t) { send(t); box.value = ''; } });
+box.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); } });
+</script>
+</body>
+</html>

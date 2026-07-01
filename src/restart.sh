@@ -16,6 +16,10 @@ pkill -f "telegram-bridge" 2>/dev/null
 pkill -f "discord-bridge" 2>/dev/null
 pkill -f "watch-tasks" 2>/dev/null
 pkill -f "conversation-server" 2>/dev/null
+# SDK core (session-server.ts) — the claude_sdk core is a background node service,
+# so restart.sh owns its lifecycle (unlike the interactive tmux core). Matches the
+# node/tsx/npm variants by their shared script path.
+pkill -f "src/agent/claude/sdk/session-server" 2>/dev/null
 pkill -f "ngrok" 2>/dev/null
 # Credential proxy: handle the launchd-supervised job explicitly. pkill alone
 # only bounces the worker — launchd's KeepAlive respawns it on its own throttle,
@@ -56,7 +60,7 @@ fi
 STOP_PATTERNS=(
     "voice-agent" "web-client.ts" "dashboard.py" "agent-api.py"
     "screen-capture-server" "telegram-bridge" "discord-bridge" "watch-tasks"
-    "conversation-server" "ngrok" "src/Sutando/Sutando"
+    "conversation-server" "src/agent/claude/sdk/session-server" "ngrok" "src/Sutando/Sutando"
 )
 for _ in $(seq 1 30); do
     still=0
