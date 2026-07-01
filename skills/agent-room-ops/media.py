@@ -27,15 +27,21 @@ def _safe_name(name):
     return os.path.basename(name or "media.bin").replace("\x00", "") or "media.bin"
 
 
+def outbox_dir():
+    """The dedicated per-agent outbox the skill owns (ROOM_MEDIA_OUTBOX, else a
+    fixed subdir of the temp dir). Only files placed HERE are sendable by default."""
+    return os.environ.get("ROOM_MEDIA_OUTBOX") or os.path.join(tempfile.gettempdir(), "sutando-media-outbox")
+
+
 def _allowed_prefixes():
     env = os.environ.get("ROOM_MEDIA_ALLOW")
     if env:
         return [os.path.realpath(p) for p in env.split(os.pathsep) if p]
-    prefixes = [os.path.realpath(tempfile.gettempdir())]
-    inbox = os.environ.get("ROOM_MEDIA_INBOX")
-    if inbox:
-        prefixes.append(os.path.realpath(inbox))
-    return prefixes
+    # Fail (mostly) closed: default to ONLY a dedicated per-agent outbox — NOT
+    # the whole OS temp dir. Otherwise any file that happens to live under /tmp
+    # would be silently uploadable. Callers who need to send from elsewhere set
+    # ROOM_MEDIA_ALLOW explicitly.
+    return [os.path.realpath(outbox_dir())]
 
 
 def _path_allowed(path):
@@ -74,7 +80,9 @@ def fetch_media(ref, agent_mxid=None, room_id=None, *, gate=None, dest_dir=None)
         return _result(False, ref=ref, room_id=room_id, reason=degrade_reason(e.code))
     except (URLError, TimeoutError) as e:
         return _result(False, ref=ref, room_id=room_id, reason=f"network error: {e}")
-    if len(body) > MAX_BYTES:
+    cl = hdrs.get("Content-Length")
+    declared_over = cl is not None and cl.isdigit() and int(cl) > MAX_BYTES
+    if declared_over or len(body) > MAX_BYTES:
         return _result(False, ref=ref, room_id=room_id, reason=f"media exceeds {MAX_BYTES} bytes")
     inbox, urlparse_mod = _inbox_dir(dest_dir)
     fname = _safe_name(hdrs.get("X-Media-Filename")

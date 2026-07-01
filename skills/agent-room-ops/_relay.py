@@ -66,9 +66,27 @@ def gate_allows(agent_mxid, room_id, gate):
 # Relay coordinates + HTTP
 # --------------------------------------------------------------------------- #
 def relay():
-    """Return (base_url, headers). base is '' when no relay is configured."""
-    base = (os.environ.get("RELAY_URL") or os.environ.get("REMOTE_TASK_URL") or "").rstrip("/")
-    token = os.environ.get("RELAY_TOKEN") or os.environ.get("REMOTE_TASK_TOKEN")
+    """Return (base_url, headers). base is '' when no relay is configured.
+
+    Honors the one-token onboarding contract used by remote-relay-bridge.py:
+    `REMOTE_TASK_TOKEN` may be the COMBINED `"https://<relay>|<secret>"` form
+    (the URL travels inside the token) or a bare secret. Precedence:
+      - explicit RELAY_URL / REMOTE_TASK_URL  >  URL-from-combined-token
+      - explicit RELAY_TOKEN                  >  secret-from-combined-token
+    Without this, a standard combined-token install would get base='' (every op
+    degrades "no RELAY_URL") or send the whole `url|secret` as the bearer.
+    """
+    explicit_token = os.environ.get("RELAY_TOKEN")
+    raw = explicit_token or os.environ.get("REMOTE_TASK_TOKEN") or ""
+    url_from_token = ""
+    if explicit_token:
+        token = explicit_token  # explicit bearer — never split
+    elif "|" in raw:
+        url_from_token, token = raw.split("|", 1)  # combined onboarding string
+    else:
+        token = raw  # bare secret
+    base = (os.environ.get("RELAY_URL") or os.environ.get("REMOTE_TASK_URL")
+            or url_from_token or "").rstrip("/")
     headers = {"User-Agent": "sutando-room-ops/1"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -85,7 +103,17 @@ def http_request(method, url, headers=None, data=None, max_bytes=None):
     """
     req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-        body = resp.read(max_bytes + 1) if max_bytes is not None else resp.read()
+        if max_bytes is not None:
+            # Content-Length up-front: if the peer DECLARES an oversize body,
+            # don't allocate it at all. Otherwise read at most max_bytes+1 so an
+            # undeclared huge body still can't OOM us.
+            cl = resp.headers.get("Content-Length")
+            if cl is not None and cl.isdigit() and int(cl) > max_bytes:
+                body = b""
+            else:
+                body = resp.read(max_bytes + 1)
+        else:
+            body = resp.read()
         return resp.status, body, dict(resp.headers)
 
 

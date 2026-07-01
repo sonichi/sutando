@@ -21,7 +21,7 @@ HS = "@agent.a:hs"
 ROOM = "!roomA:hs"
 EV = "$evt1"
 ENVK = ["RELAY_URL", "REMOTE_TASK_URL", "RELAY_TOKEN", "REMOTE_TASK_TOKEN",
-        "ROOM_MEDIA_ALLOW", "ROOM_MEDIA_INBOX", "ROOM_OPS_GATE"]
+        "ROOM_MEDIA_ALLOW", "ROOM_MEDIA_INBOX", "ROOM_MEDIA_OUTBOX", "ROOM_OPS_GATE"]
 
 
 def _clear():
@@ -229,6 +229,74 @@ class CliTests(EnvCase):
 
     def test_fetch_exits_zero(self):
         self.assertEqual(room_ops._main(["fetch", "mxc://x/y", "--room", ROOM, "--agent", HS]), 0)
+
+
+class RelayTokenOnboardingTests(EnvCase):
+    """The combined one-token onboarding contract (REMOTE_TASK_TOKEN='url|secret')."""
+
+    def test_combined_token_only(self):
+        os.environ["REMOTE_TASK_TOKEN"] = "https://relay.example|s3cret"
+        base, headers = _relay.relay()
+        self.assertEqual(base, "https://relay.example")
+        self.assertEqual(headers["Authorization"], "Bearer s3cret")
+
+    def test_explicit_url_beats_token_url(self):
+        os.environ["REMOTE_TASK_TOKEN"] = "https://from-token|s3cret"
+        os.environ["RELAY_URL"] = "https://explicit"
+        base, headers = _relay.relay()
+        self.assertEqual(base, "https://explicit")
+        self.assertEqual(headers["Authorization"], "Bearer s3cret")
+
+    def test_explicit_relay_token_not_split(self):
+        # An explicit RELAY_TOKEN is a bearer, never split on '|'.
+        os.environ["RELAY_TOKEN"] = "weird|bearer|value"
+        os.environ["RELAY_URL"] = "https://r"
+        base, headers = _relay.relay()
+        self.assertEqual(headers["Authorization"], "Bearer weird|bearer|value")
+
+    def test_bare_secret_needs_url(self):
+        os.environ["REMOTE_TASK_TOKEN"] = "baresecret"
+        base, headers = _relay.relay()
+        self.assertEqual(base, "")  # no url anywhere -> empty (op will degrade)
+        self.assertEqual(headers["Authorization"], "Bearer baresecret")
+
+
+class OutboxAllowlistTests(EnvCase):
+    """Outbound allowlist must fail (mostly) closed by default."""
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.mkdtemp()
+
+    def test_random_temp_file_denied_by_default(self):
+        # ROOM_MEDIA_ALLOW unset -> a file just sitting under /tmp is NOT sendable.
+        stray = os.path.join(self.tmp, "stray.png")
+        open(stray, "wb").write(b"x")
+        self.assertFalse(md._path_allowed(stray))
+
+    def test_outbox_file_allowed_by_default(self):
+        os.environ["ROOM_MEDIA_OUTBOX"] = self.tmp  # the dedicated outbox
+        inside = os.path.join(self.tmp, "ok.png")
+        open(inside, "wb").write(b"x")
+        self.assertTrue(md._path_allowed(inside))
+
+    def test_explicit_allow_dir(self):
+        os.environ["ROOM_MEDIA_ALLOW"] = self.tmp
+        f = os.path.join(self.tmp, "f.png")
+        open(f, "wb").write(b"x")
+        self.assertTrue(md._path_allowed(f))
+        self.assertFalse(md._path_allowed("/etc/passwd"))
+
+
+class ContentLengthTests(EnvCase):
+    def test_fetch_rejects_declared_oversize_without_reading(self):
+        os.environ["RELAY_URL"] = "https://r"
+        # relay declares an oversize Content-Length; http_request returns b"" (no read).
+        with mock.patch.object(md, "http_request",
+                               return_value=(200, b"", {"Content-Length": str(md.MAX_BYTES + 1)})):
+            res = md.fetch_media("mxc://x/y", HS, ROOM, gate=None)
+        self.assertFalse(res["ok"])
+        self.assertIn("exceeds", res["reason"])
 
 
 if __name__ == "__main__":

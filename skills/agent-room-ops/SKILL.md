@@ -58,7 +58,7 @@ agent-room-ops/
   media.py         fetch_media() / send_media()
   react.py         react() / unreact()
   room_ops.py      unified CLI dispatcher
-  test_room_ops.py 29 tests, no network
+  test_room_ops.py 37 tests, no network
 ```
 
 ## Configuration
@@ -69,7 +69,9 @@ agent-room-ops/
 | `RELAY_TOKEN` / `REMOTE_TASK_TOKEN` | relay bearer (optional) |
 | `AGENT_MXID` | the agent identity (relay resolves membership) |
 | `ROOM_OPS_GATE` | optional client gate JSON (defense-in-depth) |
-| `ROOM_MEDIA_INBOX` / `ROOM_MEDIA_ALLOW` | fetched-media dir / outbound path allowlist |
+| `ROOM_MEDIA_INBOX` | where fetched media is written |
+| `ROOM_MEDIA_OUTBOX` | dedicated outbound dir; the ONLY sendable location by default (not the whole temp dir) |
+| `ROOM_MEDIA_ALLOW` | explicit outbound path allowlist (overrides the default outbox) |
 
 ## Parity epic status
 
