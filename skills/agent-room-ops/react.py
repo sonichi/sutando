@@ -3,13 +3,13 @@
 
 Native m.reaction add (`react`) + redact (`unreact`) — the Discord auto-react
 instant-ack parity (👀 on receipt, ✅/⚠️ on done/fail). The event is typically
-the task's source_message_id. Relay-only; membership enforced relay-side.
+the task's source_message_id. Gateway-only; membership enforced gateway-side.
 """
 from __future__ import annotations
 
 import os
 
-from _relay import (gate_allows, load_gate, relay, http_json, degrade_reason,
+from _gateway import (gate_allows, load_gate, gateway, http_json, degrade_reason,
                     quote, HTTPError, URLError)
 
 ACK = {"received": "👀", "working": "⏳", "done": "✅", "fail": "⚠️"}
@@ -28,10 +28,10 @@ def _op(verb, room_id, event_id, key, agent_mxid, gate):
     if not gate_allows(agent_mxid, room_id, gate):
         return _result(False, room_id=room_id, event_id=event_id, key=key,
                        reason=f"client gate denied for {agent_mxid}")
-    base, headers = relay()
+    base, headers = gateway()
     if not base:
         return _result(False, room_id=room_id, event_id=event_id, key=key,
-                       reason="no RELAY_URL configured")
+                       reason="no gateway configured")
     url = f"{base}/v1/rooms/{quote(room_id)}/{verb}"
     try:
         http_json("POST", url, headers, {"event_id": event_id, "key": key})

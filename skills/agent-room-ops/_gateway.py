@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Shared relay plumbing for the room-ops capabilities (read / media / react / …).
+"""Shared gateway plumbing for the room-ops capabilities (read / media / react / …).
 
-Every room-ops module is a thin **relay-only** client: it speaks the stable
-`/v1` relay protocol and holds NO platform/AppService token — the relay/broker
+Every room-ops module is a thin **gateway-only** client: it speaks the stable
+`/v1` gateway protocol and holds NO platform/AppService token — the gateway/broker
 (box-side) owns the platform creds and does the privileged Matrix ops +
 authoritative membership enforcement. This module centralises the pieces every
 capability shares so they aren't copy-pasted per module:
 
-  - relay coordinates (RELAY_URL / token from env/vault)
-  - the optional per-agent default-deny client gate (defense-in-depth; the relay
+  - gateway coordinates (GATEWAY_URL / token from env/vault; RELAY_* honored as aliases)
+  - the optional per-agent default-deny client gate (defense-in-depth; the gateway
     is the real membership boundary)
   - HTTP helpers (json / bytes) + a uniform degrade-reason mapping
 
@@ -26,7 +26,7 @@ HTTP_TIMEOUT = 15
 
 
 # --------------------------------------------------------------------------- #
-# Optional client gate (defense-in-depth; relay enforces membership)
+# Optional client gate (defense-in-depth; gateway enforces membership)
 # --------------------------------------------------------------------------- #
 def gate_path(env_key="ROOM_OPS_GATE", default_name="room-ops-gate.json"):
     # The default resolves relative to THIS skill dir (not cwd), so a gate file
@@ -38,7 +38,7 @@ def gate_path(env_key="ROOM_OPS_GATE", default_name="room-ops-gate.json"):
 
 
 def load_gate(path=None, env_key="ROOM_OPS_GATE"):
-    """Missing file -> None (defer to the relay). Present -> dict (default-deny)."""
+    """Missing file -> None (defer to the gateway). Present -> dict (default-deny)."""
     path = path or gate_path(env_key)
     try:
         with open(path) as f:
@@ -51,7 +51,7 @@ def load_gate(path=None, env_key="ROOM_OPS_GATE"):
 
 
 def gate_allows(agent_mxid, room_id, gate):
-    """`gate is None` -> no client pre-filter (relay enforces). Else default-deny."""
+    """`gate is None` -> no client pre-filter (gateway enforces). Else default-deny."""
     if gate is None:
         return True
     entry = gate.get(agent_mxid)
@@ -63,20 +63,22 @@ def gate_allows(agent_mxid, room_id, gate):
 
 
 # --------------------------------------------------------------------------- #
-# Relay coordinates + HTTP
+# Gateway coordinates + HTTP
 # --------------------------------------------------------------------------- #
-def relay():
-    """Return (base_url, headers). base is '' when no relay is configured.
+def gateway():
+    """Return (base_url, headers). base is '' when no gateway is configured.
 
-    Honors the one-token onboarding contract used by remote-relay-bridge.py:
-    `REMOTE_TASK_TOKEN` may be the COMBINED `"https://<relay>|<secret>"` form
+    Honors the one-token onboarding contract used by remote-gateway-bridge.py:
+    `REMOTE_TASK_TOKEN` may be the COMBINED `"https://<gateway>|<secret>"` form
     (the URL travels inside the token) or a bare secret. Precedence:
-      - explicit RELAY_URL / REMOTE_TASK_URL  >  URL-from-combined-token
-      - explicit RELAY_TOKEN                  >  secret-from-combined-token
+      - explicit GATEWAY_URL (alias RELAY_URL/REMOTE_TASK_URL) > URL-from-combined-token
+      - explicit GATEWAY_TOKEN (alias RELAY_TOKEN)     > secret-from-combined-token
     Without this, a standard combined-token install would get base='' (every op
-    degrades "no RELAY_URL") or send the whole `url|secret` as the bearer.
+    degrades "no gateway") or send the whole `url|secret` as the bearer.
     """
-    explicit_token = os.environ.get("RELAY_TOKEN")
+    # GATEWAY_* is the primary name; RELAY_* and REMOTE_TASK_* are honored as
+    # transition aliases so nothing breaks mid-migration.
+    explicit_token = os.environ.get("GATEWAY_TOKEN") or os.environ.get("RELAY_TOKEN")
     raw = explicit_token or os.environ.get("REMOTE_TASK_TOKEN") or ""
     url_from_token = ""
     if explicit_token:
@@ -85,8 +87,8 @@ def relay():
         url_from_token, token = raw.split("|", 1)  # combined onboarding string
     else:
         token = raw  # bare secret
-    base = (os.environ.get("RELAY_URL") or os.environ.get("REMOTE_TASK_URL")
-            or url_from_token or "").rstrip("/")
+    base = (os.environ.get("GATEWAY_URL") or os.environ.get("RELAY_URL")
+            or os.environ.get("REMOTE_TASK_URL") or url_from_token or "").rstrip("/")
     headers = {"User-Agent": "sutando-room-ops/1"}
     if token:
         headers["Authorization"] = f"Bearer {token}"

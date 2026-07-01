@@ -2,7 +2,7 @@
 """room-ops · media — send / fetch native media for an agent.
 
 Native uploaded media both ways (the discord-bridge att.save inbound + [file:]
-outbound parity). Relay-only; the relay does the Matrix media-repo upload/
+outbound parity). Gateway-only; the gateway does the Matrix media-repo upload/
 download + membership enforcement. Outbound is constrained by a path allowlist
 (ROOM_MEDIA_ALLOW) + a size ceiling (MAX_BYTES).
 """
@@ -12,7 +12,7 @@ import base64
 import os
 import tempfile
 
-from _relay import (gate_allows, load_gate, relay, http_request, degrade_reason,
+from _gateway import (gate_allows, load_gate, gateway, http_request, degrade_reason,
                     quote, HTTPError, URLError)
 
 MAX_BYTES = 25 * 1024 * 1024
@@ -57,23 +57,23 @@ def _inbox_dir(dest_dir=None):
 
 
 def fetch_media(ref, agent_mxid=None, room_id=None, *, gate=None, dest_dir=None):
-    """Ask the relay to fetch media `ref` and save it locally; return its path."""
+    """Ask the gateway to fetch media `ref` and save it locally; return its path."""
     agent_mxid = agent_mxid or os.environ.get("AGENT_MXID")
     if not ref:
         return _result(False, reason="no media ref given", room_id=room_id)
     gate = load_gate() if gate is None else gate
     if not gate_allows(agent_mxid, room_id, gate):
         return _result(False, ref=ref, room_id=room_id, reason=f"client gate denied for {agent_mxid}")
-    base, headers = relay()
+    base, headers = gateway()
     if not base:
-        return _result(False, ref=ref, room_id=room_id, reason="no RELAY_URL configured")
-    from _relay import urlencode
+        return _result(False, ref=ref, room_id=room_id, reason="no gateway configured")
+    from _gateway import urlencode
     q = {"ref": ref}
     if room_id:
         q["room_id"] = room_id
     url = f"{base}/v1/media/fetch?" + urlencode(q)
     try:
-        # Bounded read: at most MAX_BYTES+1 so a hostile relay returning a huge
+        # Bounded read: at most MAX_BYTES+1 so a hostile gateway returning a huge
         # body can't OOM the agent before the cap check below.
         _, body, hdrs = http_request("GET", url, headers, max_bytes=MAX_BYTES)
     except HTTPError as e:
@@ -97,7 +97,7 @@ def fetch_media(ref, agent_mxid=None, room_id=None, *, gate=None, dest_dir=None)
 
 
 def send_media(room_id, path, agent_mxid=None, *, gate=None, caption=None):
-    """Upload a local file via the relay, which posts it as the agent."""
+    """Upload a local file via the gateway, which posts it as the agent."""
     agent_mxid = agent_mxid or os.environ.get("AGENT_MXID")
     if not room_id:
         return _result(False, reason="no room_id given")
@@ -115,9 +115,9 @@ def send_media(room_id, path, agent_mxid=None, *, gate=None, caption=None):
         return _result(False, room_id=room_id, reason=f"stat failed: {e}")
     if size > MAX_BYTES:
         return _result(False, room_id=room_id, path=path, reason=f"file exceeds {MAX_BYTES} bytes")
-    base, headers = relay()
+    base, headers = gateway()
     if not base:
-        return _result(False, room_id=room_id, reason="no RELAY_URL configured")
+        return _result(False, room_id=room_id, reason="no gateway configured")
     try:
         with open(path, "rb") as f:
             content = f.read()

@@ -2,13 +2,11 @@
 
 **One skill, multiple tools.** Everything an agent does in a room beyond its task
 inbox lives here as a tool, so the parity capabilities are self-evidently *one
-collection* (not N scattered skills). Each tool is a thin **relay-only** client
-verb sharing `_relay.py`; the relay/broker (box-side) owns the platform creds and
+collection* (not N scattered skills). Each tool is a thin **gateway-only** client
+verb sharing `_gateway.py`; the gateway/broker (box-side) owns the platform creds and
 does the privileged Matrix ops + authoritative membership enforcement.
 
 > Collection name `agent-room-ops` (provider-agnostic; alts: `room-participant`, `agent-chat-io`). Platform-tied names (e.g. `matrix-agent`) are avoided.
-> `agent-room-ops`, `room-participant`). It is deliberately **provider-agnostic**,
-> so platform-tied names (e.g. `matrix-agent`) are avoided.
 
 ## Tools
 
@@ -36,38 +34,38 @@ errors exit 2.
 
 - **Orthogonal to the task file bridge** (`tasks/`→`results/`) — a separate
   synchronous call; the async loop is untouched.
-- **Relay-only client.** Speaks only the `/v1` relay protocol; holds **no
+- **Gateway-only client.** Speaks only the `/v1` gateway protocol; holds **no
   platform/AppService token**, never talks to a homeserver directly. Whether the
-  relay backs a verb with a bot-client read or an AppService masquerade is the
-  relay's (box-side) concern.
-- **Membership enforced relay-side** (a non-member op → `403`). The optional
+  gateway backs a verb with a bot-client read or an AppService masquerade is the
+  gateway's (box-side) concern.
+- **Membership enforced gateway-side** (a non-member op → `403`). The optional
   per-agent client gate (`ROOM_OPS_GATE`, default-deny when present; absent →
-  defer to the relay) is defense-in-depth, not the boundary.
-- **Graceful degrade.** Missing relay / gate-deny / `404` (verb unimplemented) /
+  defer to the gateway) is defense-in-depth, not the boundary.
+- **Graceful degrade.** Missing gateway / gate-deny / `404` (verb unimplemented) /
   `403` / network / oversize → structured `ok:false`, never raises. Additive +
-  versioned: a relay without a verb just `404`s and the tool no-ops.
-- **No platform literals** — relay coords from env/vault. Outbound media adds a
+  versioned: a gateway without a verb just `404`s and the tool no-ops.
+- **No platform literals** — gateway coords from env/vault. Outbound media adds a
   path allowlist (`ROOM_MEDIA_ALLOW`) + 25 MiB size ceiling.
 
 ## Layout
 
 ```
 agent-room-ops/
-  _relay.py        shared: relay coords + per-agent gate + http + degrade
+  _gateway.py        shared: gateway coords + per-agent gate + http + degrade
   read.py          read_room()
   media.py         fetch_media() / send_media()
   react.py         react() / unreact()
   room_ops.py      unified CLI dispatcher
-  test_room_ops.py 37 tests, no network
+  test_room_ops.py 39 tests, no network
 ```
 
 ## Configuration
 
 | env | meaning |
 | --- | --- |
-| `RELAY_URL` / `REMOTE_TASK_URL` | relay base |
-| `RELAY_TOKEN` / `REMOTE_TASK_TOKEN` | relay bearer (optional) |
-| `AGENT_MXID` | the agent identity (relay resolves membership) |
+| `GATEWAY_URL` (aliases: `RELAY_URL` / `REMOTE_TASK_URL`) | gateway base |
+| `GATEWAY_TOKEN` (aliases: `RELAY_TOKEN` / `REMOTE_TASK_TOKEN`) | gateway bearer; also accepts the combined `"https://gateway\|secret"` onboarding form |
+| `AGENT_MXID` | the agent identity (gateway resolves membership) |
 | `ROOM_OPS_GATE` | optional client gate JSON (defense-in-depth) |
 | `ROOM_MEDIA_INBOX` | where fetched media is written |
 | `ROOM_MEDIA_OUTBOX` | dedicated outbound dir; the ONLY sendable location by default (not the whole temp dir) |
@@ -86,5 +84,5 @@ This collection is how an agent reaches **≥ a chat bot-client** (e.g.
 | 4 delivery/routing markers | (`route`/marker tools) | next |
 | — Matrix-surpass | custom events / edits / receipts / Spaces / widgets | upside |
 
-Each slice's relay-side verb (membership-enforced) is the paired box-side half,
+Each slice's gateway-side verb (membership-enforced) is the paired box-side half,
 tracked in the parity epic.

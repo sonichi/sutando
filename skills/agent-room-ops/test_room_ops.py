@@ -11,7 +11,7 @@ import urllib.error
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
-import _relay  # noqa: E402
+import _gateway  # noqa: E402
 import read as rd  # noqa: E402
 import media as md  # noqa: E402
 import react as rc  # noqa: E402
@@ -20,7 +20,7 @@ import room_ops  # noqa: E402
 HS = "@agent.a:hs"
 ROOM = "!roomA:hs"
 EV = "$evt1"
-ENVK = ["RELAY_URL", "REMOTE_TASK_URL", "RELAY_TOKEN", "REMOTE_TASK_TOKEN",
+ENVK = ["GATEWAY_URL", "GATEWAY_TOKEN", "RELAY_URL", "REMOTE_TASK_URL", "RELAY_TOKEN", "REMOTE_TASK_TOKEN",
         "ROOM_MEDIA_ALLOW", "ROOM_MEDIA_INBOX", "ROOM_MEDIA_OUTBOX", "ROOM_OPS_GATE"]
 
 
@@ -41,31 +41,31 @@ class EnvCase(unittest.TestCase):
                 os.environ[k] = v
 
 
-# ----- shared gate (_relay) ----- #
+# ----- shared gate (_gateway) ----- #
 class GateTests(unittest.TestCase):
     def test_none_defers(self):
-        self.assertTrue(_relay.gate_allows(HS, ROOM, None))
+        self.assertTrue(_gateway.gate_allows(HS, ROOM, None))
 
     def test_empty_denies(self):
-        self.assertFalse(_relay.gate_allows(HS, ROOM, {}))
+        self.assertFalse(_gateway.gate_allows(HS, ROOM, {}))
 
     def test_explicit_room(self):
-        self.assertTrue(_relay.gate_allows(HS, ROOM, {HS: {"rooms": [ROOM]}}))
-        self.assertFalse(_relay.gate_allows(HS, "!x:hs", {HS: {"rooms": [ROOM]}}))
+        self.assertTrue(_gateway.gate_allows(HS, ROOM, {HS: {"rooms": [ROOM]}}))
+        self.assertFalse(_gateway.gate_allows(HS, "!x:hs", {HS: {"rooms": [ROOM]}}))
 
     def test_all_member(self):
-        self.assertTrue(_relay.gate_allows(HS, ROOM, {HS: {"all_member_rooms": True}}))
+        self.assertTrue(_gateway.gate_allows(HS, ROOM, {HS: {"all_member_rooms": True}}))
 
     def test_malformed(self):
-        self.assertFalse(_relay.gate_allows(HS, ROOM, {HS: 1}))
+        self.assertFalse(_gateway.gate_allows(HS, ROOM, {HS: 1}))
 
     def test_load_missing_none(self):
-        self.assertIsNone(_relay.load_gate("/nonexistent/g.json"))
+        self.assertIsNone(_gateway.load_gate("/nonexistent/g.json"))
 
     def test_degrade_reasons(self):
-        self.assertIn("unimplemented", _relay.degrade_reason(404))
-        self.assertIn("not a joined member", _relay.degrade_reason(403))
-        self.assertIn("HTTP 500", _relay.degrade_reason(500))
+        self.assertIn("unimplemented", _gateway.degrade_reason(404))
+        self.assertIn("not a joined member", _gateway.degrade_reason(403))
+        self.assertIn("HTTP 500", _gateway.degrade_reason(500))
 
 
 # ----- read ----- #
@@ -79,7 +79,7 @@ class ReadTests(EnvCase):
 
     def test_no_relay(self):
         self.assertEqual(rd.read_room(ROOM, HS, gate={HS: {"rooms": [ROOM]}})["reason"],
-                         "no RELAY_URL configured")
+                         "no gateway configured")
 
     def test_404_degrades(self):
         os.environ["RELAY_URL"] = "https://r"
@@ -136,7 +136,7 @@ class MediaTests(EnvCase):
 
         def fake(method, url, headers=None, data=None, max_bytes=None):
             cap["max_bytes"] = max_bytes
-            # simulate a hostile relay: return exactly the overflow sentinel size
+            # simulate a hostile gateway: return exactly the overflow sentinel size
             return 200, b"x" * (md.MAX_BYTES + 1), {}
 
         with mock.patch.object(md, "http_request", side_effect=fake):
@@ -231,19 +231,35 @@ class CliTests(EnvCase):
         self.assertEqual(room_ops._main(["fetch", "mxc://x/y", "--room", ROOM, "--agent", HS]), 0)
 
 
-class RelayTokenOnboardingTests(EnvCase):
+class GatewayTokenOnboardingTests(EnvCase):
     """The combined one-token onboarding contract (REMOTE_TASK_TOKEN='url|secret')."""
 
+    def test_gateway_env_is_primary(self):
+        # GATEWAY_* is the primary name; RELAY_* remains a transition alias.
+        os.environ["GATEWAY_URL"] = "https://gw"
+        os.environ["GATEWAY_TOKEN"] = "gwsecret"
+        os.environ["RELAY_URL"] = "https://old"  # alias must lose to GATEWAY_URL
+        base, headers = _gateway.gateway()
+        self.assertEqual(base, "https://gw")
+        self.assertEqual(headers["Authorization"], "Bearer gwsecret")
+
+    def test_relay_alias_still_honored(self):
+        os.environ["RELAY_URL"] = "https://old"
+        os.environ["RELAY_TOKEN"] = "oldsecret"
+        base, headers = _gateway.gateway()
+        self.assertEqual(base, "https://old")
+        self.assertEqual(headers["Authorization"], "Bearer oldsecret")
+
     def test_combined_token_only(self):
-        os.environ["REMOTE_TASK_TOKEN"] = "https://relay.example|s3cret"
-        base, headers = _relay.relay()
-        self.assertEqual(base, "https://relay.example")
+        os.environ["REMOTE_TASK_TOKEN"] = "https://gateway.example|s3cret"
+        base, headers = _gateway.gateway()
+        self.assertEqual(base, "https://gateway.example")
         self.assertEqual(headers["Authorization"], "Bearer s3cret")
 
     def test_explicit_url_beats_token_url(self):
         os.environ["REMOTE_TASK_TOKEN"] = "https://from-token|s3cret"
         os.environ["RELAY_URL"] = "https://explicit"
-        base, headers = _relay.relay()
+        base, headers = _gateway.gateway()
         self.assertEqual(base, "https://explicit")
         self.assertEqual(headers["Authorization"], "Bearer s3cret")
 
@@ -251,12 +267,12 @@ class RelayTokenOnboardingTests(EnvCase):
         # An explicit RELAY_TOKEN is a bearer, never split on '|'.
         os.environ["RELAY_TOKEN"] = "weird|bearer|value"
         os.environ["RELAY_URL"] = "https://r"
-        base, headers = _relay.relay()
+        base, headers = _gateway.gateway()
         self.assertEqual(headers["Authorization"], "Bearer weird|bearer|value")
 
     def test_bare_secret_needs_url(self):
         os.environ["REMOTE_TASK_TOKEN"] = "baresecret"
-        base, headers = _relay.relay()
+        base, headers = _gateway.gateway()
         self.assertEqual(base, "")  # no url anywhere -> empty (op will degrade)
         self.assertEqual(headers["Authorization"], "Bearer baresecret")
 
@@ -291,7 +307,7 @@ class OutboxAllowlistTests(EnvCase):
 class ContentLengthTests(EnvCase):
     def test_fetch_rejects_declared_oversize_without_reading(self):
         os.environ["RELAY_URL"] = "https://r"
-        # relay declares an oversize Content-Length; http_request returns b"" (no read).
+        # gateway declares an oversize Content-Length; http_request returns b"" (no read).
         with mock.patch.object(md, "http_request",
                                return_value=(200, b"", {"Content-Length": str(md.MAX_BYTES + 1)})):
             res = md.fetch_media("mxc://x/y", HS, ROOM, gate=None)

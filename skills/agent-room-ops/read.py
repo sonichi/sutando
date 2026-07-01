@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """room-ops · read — pull recent room/channel history for an agent.
 
-A synchronous pull-on-demand read, orthogonal to the task file bridge. Relay-only
-(the generic verb `GET {RELAY}/v1/rooms/{room}/messages`); membership is enforced
-relay-side. See _relay.py for the shared boundary + gate.
+A synchronous pull-on-demand read, orthogonal to the task file bridge. Gateway-only
+(the generic verb `GET {GATEWAY}/v1/rooms/{room}/messages`); membership is enforced
+gateway-side. See _gateway.py for the shared boundary + gate.
 """
 from __future__ import annotations
 
 import os
 
-from _relay import (gate_allows, load_gate, relay, http_request, degrade_reason,
+from _gateway import (gate_allows, load_gate, gateway, http_request, degrade_reason,
                     quote, urlencode, HTTPError, URLError)
 
 DEFAULT_LIMIT = 20
@@ -33,7 +33,7 @@ def _normalize(items):
 
 
 def read_room(room_id, agent_mxid=None, limit=DEFAULT_LIMIT, *, gate=None, before=None):
-    """Pull up to `limit` recent messages from `room_id` via the relay verb."""
+    """Pull up to `limit` recent messages from `room_id` via the gateway verb."""
     agent_mxid = agent_mxid or os.environ.get("AGENT_MXID")
     if not room_id:
         return _result(False, reason="no room_id given")
@@ -44,9 +44,9 @@ def read_room(room_id, agent_mxid=None, limit=DEFAULT_LIMIT, *, gate=None, befor
     gate = load_gate() if gate is None else gate
     if not gate_allows(agent_mxid, room_id, gate):
         return _result(False, reason=f"client gate denied for {agent_mxid}", room_id=room_id)
-    base, headers = relay()
+    base, headers = gateway()
     if not base:
-        return _result(False, reason="no RELAY_URL configured", room_id=room_id)
+        return _result(False, reason="no gateway configured", room_id=room_id)
     params = {"limit": limit}
     if before:
         params["before"] = before

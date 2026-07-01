@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """room-ops — an agent's room-participation capability collection (one skill).
 
-A single relay-only client surface for everything an agent does in a room beyond
+A single gateway-only client surface for everything an agent does in a room beyond
 the task inbox: read history, send/fetch native media, react to events, … Each
-capability is a module sharing `_relay.py` (relay coords + the per-agent gate +
+capability is a module sharing `_gateway.py` (gateway coords + the per-agent gate +
 graceful-degrade); this file is the unified CLI that dispatches to them.
 
     python3 room_ops.py read   <room> [--limit N] [--before tok] [--agent mxid]
@@ -30,7 +30,7 @@ import react as _react     # noqa: E402
 
 def _main(argv):
     import argparse
-    ap = argparse.ArgumentParser(prog="room_ops", description="Agent room-participation ops (relay-only, gated).")
+    ap = argparse.ArgumentParser(prog="room_ops", description="Agent room-participation ops (gateway-only, gated).")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("read", help="pull recent room history")
