@@ -182,9 +182,13 @@ fi
 # auth). Fail loud if a provider is set but no token resolves.
 CLAUDE_AS_CORE_PROVIDER=0
 if [ -x "$REPO/scripts/sutando-config.sh" ]; then
-  _cc_provider="" _cc_core_type=""
+  _cc_provider="" _cc_core_type="" _cc_auth_env=""
   while IFS='=' read -r _k _v; do
-    case "$_k" in CFG_PROVIDER) _cc_provider="$_v" ;; CFG_CORE_TYPE) _cc_core_type="$_v" ;; esac
+    case "$_k" in
+      CFG_PROVIDER)  _cc_provider="$_v" ;;
+      CFG_CORE_TYPE) _cc_core_type="$_v" ;;
+      CFG_AUTH_ENV)  _cc_auth_env="$_v" ;;
+    esac
   done < <(bash "$REPO/scripts/sutando-config.sh" core-config 2>/dev/null) || true
   # A provider counts as configured via config OR the env override.
   if [ -n "$_cc_provider" ] || [ -n "${SUTANDO_PROVIDER_URL:-}" ]; then
@@ -210,6 +214,18 @@ if [ -x "$REPO/scripts/sutando-config.sh" ]; then
       echo "start-cli: core_config.provider is set but no API token resolved via ${CLAUDE_PROVIDER_AUTH_ENV:-ANTHROPIC_AUTH_TOKEN} (env or vault) — refusing to start core." >&2
       echo "  Set the token in the env or vault, or clear core_config.provider to use the subscription core. See src/agent/claude/README.md." >&2
       exit 1
+    fi
+  elif [ "${_cc_auth_env:-ANTHROPIC_SUBSCRIPTION}" = "ANTHROPIC_SUBSCRIPTION" ]; then
+    # Subscription core (the default): clear any stray API token so a shell-set
+    # ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN (e.g. exported in ~/.zshrc) cannot
+    # override the Claude.ai subscription OAuth. Claude Code precedence is
+    # env token > keychain/.credentials.json, so a lingering key silently bills
+    # the API (or 401s on an invalid one) instead of using the subscription the
+    # operator asked for. auth_env=ANTHROPIC_SUBSCRIPTION means "subscription,
+    # period" — so we enforce it here rather than trust a clean env.
+    if [ -n "${ANTHROPIC_API_KEY:-}" ] || [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
+      unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+      echo "  ~ subscription core: cleared a stray ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN from the env (using the Claude.ai subscription)"
     fi
   fi
 fi
