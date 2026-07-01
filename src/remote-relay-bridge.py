@@ -102,6 +102,11 @@ _heartbeat_disabled = False
 _last_heartbeat_at = 0.0
 
 _TASK_FIELDS = ("id", "timestamp", "task", "source", "channel_id",
+                # Context enrichment (AG2 broker writer side): human room/sender
+                # names + reply reference. Serialized only when the relay sends
+                # them (absent for other sources); each newline-stripped by
+                # _one_line so a room/display name can't forge an extra line.
+                "room_name", "sender_name", "reply_to_event", "reply_to_me",
                 "source_message_id", "user_id", "priority")
 
 # Trust tier is a LOCAL decision (review 2026-06-13): the relay is outside

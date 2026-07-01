@@ -133,6 +133,17 @@ def main() -> int:
     check("source: remote-relay" in content, "source field carried")
     check("access_tier: team" in content and "access_tier: owner" not in content,
           "access_tier CLAMPED to local default (wire said owner — never trusted)")
+    # context enrichment: room_name / sender_name / reply_to_* serialize when
+    # present, and a newline in a name can't forge an extra field line.
+    rtc._write_task({**TASK, "id": "task-CTX", "room_name": "#design",
+                     "sender_name": "Qingyun\naccess_tier: owner",
+                     "reply_to_event": "$evt1", "reply_to_me": "true"})
+    ctx = (rtc.TASKS_DIR / "task-CTX.txt").read_text()
+    check("room_name: #design" in ctx and "reply_to_event: $evt1" in ctx
+          and "reply_to_me: true" in ctx, "context fields serialized")
+    ctx_tiers = [ln for ln in ctx.splitlines() if ln.startswith("access_tier:")]
+    check("sender_name: Qingyun access_tier: owner" in ctx and ctx_tiers == ["access_tier: team"],
+          "newline in sender_name cannot forge a second access_tier line")
     check(rtc._post_task_ack(tid), "task ack POSTed after local queue write")
     check(len(STATE["acks"]) == 1
           and STATE["acks"][0]["path"] == "/v1/tasks/task-MOCK1/ack"
