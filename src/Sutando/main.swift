@@ -14,6 +14,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var hotKeyRefs: [EventHotKeyRef?] = []  // one entry per registered hotkey
     var hotKeyActions: [UInt32: String] = [:]  // hotkey id → action name
     var lastDropTime: Date = .distantPast
+    var isRecordingVideo: Bool = false  // ⌃R start/stop toggle state
     var screencaptureInFlight: Bool = false  // guards against stacked crosshair launches
     // Runtime state lives under the per-user workspace dir, not the repo
     // checkout. **Delegates to SutandoConfig.resolveWorkspace()** as of the
@@ -1629,16 +1630,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         lastDropTime = now
 
-        let seconds = 5
         let timestamp = ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withFullDate, .withTime, .withSpaceBetweenDateAndTime, .withColonSeparatorInTime])
         let logFile = workspace + "/logs/context-drop.log"
         let tasksDir = workspace + "/tasks"
 
-        // Tell the user recording started — unlike a screenshot this takes a few
-        // seconds, so a silent capture would feel like nothing happened.
-        notify("Sutando", "Recording \(seconds)s screen clip…")
+        // Toggle: first ⌃R starts an open-ended recording, second ⌃R stops it and
+        // drops the .mov. User-controlled length beats a fixed duration.
+        let starting = !isRecordingVideo
+        let action = starting ? "start" : "stop"
+        notify("Sutando", starting ? "● Recording screen — press ⌃R again to stop" : "Stopping recording…")
 
-        guard let url = URL(string: "http://localhost:7845/capture-video?seconds=\(seconds)") else { return }
+        guard let url = URL(string: "http://localhost:7845/capture-video?action=\(action)") else { return }
         var req = URLRequest(url: url)
         // /capture-video requires a shared token (the server writes it to a 0600
         // file a web page can't read; a browser also can't set a custom header on
@@ -1647,22 +1649,40 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let token = try? String(contentsOfFile: tokenPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty {
             req.setValue(token, forHTTPHeaderField: "X-Sutando-Capture-Token")
         }
-        // The server blocks for ~seconds while recording; allow generous headroom.
-        req.timeoutInterval = TimeInterval(seconds + 30)
+        // start returns at once; stop waits for the encoder flush — allow headroom.
+        req.timeoutInterval = 60
         URLSession.shared.dataTask(with: req) { [self] data, _, error in
             if let error = error {
-                notify("Sutando", "Video drop failed: \(error.localizedDescription)")
-                appendLog(logFile, "[\(timestamp)] dropVideoClip: error \(error.localizedDescription)")
+                notify("Sutando", "Video \(action) failed: \(error.localizedDescription)")
+                appendLog(logFile, "[\(timestamp)] dropVideoClip(\(action)): error \(error.localizedDescription)")
                 return
             }
             guard let data = data,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let path = json["path"] as? String else {
-                notify("Sutando", "Video drop failed: bad server response")
-                appendLog(logFile, "[\(timestamp)] dropVideoClip: bad server response")
+                  let status = json["status"] as? String else {
+                notify("Sutando", "Video \(action) failed: bad server response")
+                appendLog(logFile, "[\(timestamp)] dropVideoClip(\(action)): bad server response")
                 return
             }
 
+            if starting {
+                // Recording began — flip state; nothing to drop until stop.
+                if status == "recording" || status == "already_recording" {
+                    isRecordingVideo = true
+                    appendLog(logFile, "[\(timestamp)] dropVideoClip: recording started")
+                } else {
+                    notify("Sutando", "Couldn't start recording (\(status))")
+                }
+                return
+            }
+
+            // Stopping — flip state and drop the produced clip.
+            isRecordingVideo = false
+            guard status == "ok", let path = json["path"] as? String else {
+                notify("Sutando", "Recording stopped, no clip (\(status))")
+                appendLog(logFile, "[\(timestamp)] dropVideoClip(stop): \(status)")
+                return
+            }
             let content = """
             timestamp: \(timestamp)
             type: video

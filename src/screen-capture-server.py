@@ -12,6 +12,7 @@ import subprocess
 import json
 import os
 import secrets
+import signal
 import stat
 import threading
 import urllib.request
@@ -65,6 +66,14 @@ def _load_or_create_capture_token():
 
 
 CAPTURE_VIDEO_TOKEN = _load_or_create_capture_token()
+
+# --- ⌃R start/stop toggle state ---------------------------------------------
+# A single open-ended `screencapture -v` recording driven by two ⌃R presses
+# (start, then stop). Only one at a time; guarded by _recording_lock. The
+# watchdog auto-stops a forgotten recording so it can't run forever / fill disk.
+_active_recording = None  # {"proc": Popen, "path": str, "watchdog": threading.Timer}
+_recording_lock = threading.Lock()
+MAX_RECORDING_SECONDS = 600  # safety cap for a recording nobody stopped
 
 
 def _signal_seeing_blocking():
@@ -205,6 +214,97 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             from urllib.parse import urlparse, parse_qs
             query = parse_qs(urlparse(self.path).query)
+            action = query.get("action", [""])[0]
+            global _active_recording
+
+            # ⌃R toggle — STOP: SIGINT the running recording so screencapture
+            # finalizes the .mov, then return its path. Idempotent if idle.
+            if action == "stop":
+                with _recording_lock:
+                    rec = _active_recording
+                    _active_recording = None
+                if not rec:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"status": "idle"}).encode())
+                    return
+                try:
+                    if rec.get("watchdog"):
+                        rec["watchdog"].cancel()
+                    rec["proc"].send_signal(signal.SIGINT)  # -v finalizes on SIGINT
+                    rec["proc"].wait(timeout=30)
+                    path = rec["path"]
+                    if not (os.path.exists(path) and os.path.getsize(path) > 0):
+                        raise RuntimeError("recording produced no file")
+                    if query.get("silent", ["false"])[0] != "true":
+                        _signal_seeing()
+                        _notify_capture()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"status": "ok", "path": path}).encode())
+                except Exception as e:
+                    self.send_response(500)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"status": "error", "error": str(e)}).encode())
+                return
+
+            # ⌃R toggle — START: spawn an open-ended `screencapture -v` (no -V) and
+            # return immediately; the second ⌃R (action=stop) ends it.
+            if action == "start":
+                os.makedirs(DIR, exist_ok=True)
+                ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+                display_raw = query.get("display", [None])[0]
+                display = int(display_raw) if display_raw and display_raw.isdigit() and 1 <= int(display_raw) <= 9 else None
+                suffix = f"-d{display}" if display else ""
+                path = f"{DIR}/clip-{ts}{suffix}.mov"
+                with _recording_lock:
+                    if _active_recording:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"status": "already_recording", "path": _active_recording["path"]}).encode())
+                        return
+                    if query.get("silent", ["false"])[0] != "true":
+                        _signal_seeing()
+                        _notify_capture()
+                    cmd = ["screencapture", "-v", "-x"]  # no -V → records until SIGINT
+                    if display:
+                        cmd.append(f"-D{display}")
+                    cmd.append(path)
+                    try:
+                        proc = subprocess.Popen(cmd)
+                    except Exception as e:
+                        self.send_response(500)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"status": "error", "error": str(e)}).encode())
+                        return
+
+                    def _auto_stop(p=proc):
+                        global _active_recording
+                        with _recording_lock:
+                            if _active_recording and _active_recording.get("proc") is p:
+                                _active_recording = None
+                        try:
+                            p.send_signal(signal.SIGINT)
+                            p.wait(timeout=30)
+                        except Exception:
+                            pass
+
+                    wd = threading.Timer(MAX_RECORDING_SECONDS, _auto_stop)
+                    wd.daemon = True
+                    wd.start()
+                    _active_recording = {"proc": proc, "path": path, "watchdog": wd}
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "recording", "path": path}).encode())
+                return
+
+            # No action param → legacy fixed-duration capture (backward compat).
             if query.get("silent", ["false"])[0] != "true":
                 _signal_seeing()
                 _notify_capture()

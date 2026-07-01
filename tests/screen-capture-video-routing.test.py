@@ -47,6 +47,21 @@ def _fake_run(cmd, *args, **kwargs):
     return FakeProc()
 
 
+class FakePopen:
+    """Emulate an open-ended `screencapture -v <path>` for the toggle path:
+    the .mov is finalized (written) when the process is SIGINT'd on stop."""
+
+    def __init__(self, cmd, *args, **kwargs):
+        self._out = Path(cmd[-1])
+
+    def send_signal(self, sig):
+        self._out.parent.mkdir(parents=True, exist_ok=True)
+        self._out.write_bytes(b"\x00fakemediabytes")
+
+    def wait(self, timeout=None):
+        return 0
+
+
 class TestCaptureVideoRouting(unittest.TestCase):
     def setUp(self):
         self.mod = load_module()
@@ -63,6 +78,11 @@ class TestCaptureVideoRouting(unittest.TestCase):
                 p = mock.patch.object(self.mod, target, repl)
             p.start()
             self.addCleanup(p.stop)
+        # Toggle path spawns via Popen (not run) — mock it too, same shared-module
+        # care (patch.object + addCleanup so it doesn't leak into other tests).
+        pp = mock.patch.object(self.mod.subprocess, "Popen", FakePopen)
+        pp.start()
+        self.addCleanup(pp.stop)
         # Deterministic token so /capture-video auth is testable. Fresh module
         # per test, so this assignment doesn't leak.
         self.token = "test-capture-token"
@@ -114,6 +134,39 @@ class TestCaptureVideoRouting(unittest.TestCase):
                 self._get("/capture-video?seconds=1&silent=true", token=bad)
             self.assertEqual(ctx.exception.code, 403)
             ctx.exception.close()
+
+    def test_toggle_start_then_stop_drops_clip(self):
+        # ⌃R press 1 → recording (non-blocking); press 2 → ok + the .mov path.
+        status, body = self._get("/capture-video?action=start&silent=true", token=self.token)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "recording")
+        self.assertTrue(body["path"].endswith(".mov"))
+        path = body["path"]
+        status, body = self._get("/capture-video?action=stop&silent=true", token=self.token)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["path"], path)
+        self.assertTrue(Path(path).exists() and Path(path).stat().st_size > 0)
+
+    def test_toggle_stop_when_idle(self):
+        # Stop with nothing recording is a harmless no-op, not an error.
+        _, body = self._get("/capture-video?action=stop&silent=true", token=self.token)
+        self.assertEqual(body["status"], "idle")
+
+    def test_toggle_double_start_is_guarded(self):
+        _, b1 = self._get("/capture-video?action=start&silent=true", token=self.token)
+        self.assertEqual(b1["status"], "recording")
+        _, b2 = self._get("/capture-video?action=start&silent=true", token=self.token)
+        self.assertEqual(b2["status"], "already_recording")
+        self.assertEqual(b2["path"], b1["path"])
+        self._get("/capture-video?action=stop&silent=true", token=self.token)  # cleanup
+
+    def test_toggle_start_requires_token(self):
+        # Token gate applies to the toggle actions too — no drive-by start.
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._get("/capture-video?action=start&silent=true", token="wrong-token")
+        self.assertEqual(ctx.exception.code, 403)
+        ctx.exception.close()
 
     def test_routing_guard_present_in_source(self):
         # Structural backstop: the /capture branch must exclude /capture-video.
