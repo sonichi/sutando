@@ -102,6 +102,11 @@ _heartbeat_disabled = False
 _last_heartbeat_at = 0.0
 
 _TASK_FIELDS = ("id", "timestamp", "task", "source", "channel_id",
+                # Context enrichment (AG2 broker writer side): human room/sender
+                # names + reply reference. Serialized only when the relay sends
+                # them (absent for other sources); each newline-stripped by
+                # _one_line so a room/display name can't forge an extra line.
+                "room_name", "sender_name", "reply_to_event", "reply_to_me",
                 "source_message_id", "user_id", "priority")
 
 # Trust tier is a LOCAL decision (review 2026-06-13): the relay is outside
@@ -176,8 +181,48 @@ def _post_task_ack(tid: str) -> bool:
         return False
 
 
+_CORE_STEP_MAX = 500
+
+
+def _core_str(v) -> str | None:
+    """A core-status field → bounded non-empty str, or None. core-status.json is
+    written by another process and may be malformed; a non-string field must not
+    be forwarded (the broker calls .lower() on it)."""
+    if not isinstance(v, str):
+        return None
+    v = v.strip()
+    return v[:_CORE_STEP_MAX] if v else None
+
+
+def _read_core_status() -> tuple[str | None, str | None]:
+    """Read this node's core-status.json → (status, step) for the presence layer.
+    core-status is written by the proactive loop / task handlers (status =
+    running|idle, step = human 'what it's doing'). The broker derives the agent's
+    presence badge from it.
+
+    MUST NOT raise: this runs in the main loop BEFORE the /v1/tasks poll, so an
+    exception here would back the loop off and stall task delivery — a malformed
+    presence side-channel must never become a delivery blocker. So we guard the
+    JSON shape (a valid-JSON non-object would AttributeError on .get) and coerce
+    every field to a bounded str-or-None; any surprise → (None, None) and the
+    heartbeat still fires as a plain liveness ping."""
+    try:
+        with open(WS / "state" / "core-status.json") as f:
+            cs = json.load(f)
+        if not isinstance(cs, dict):
+            return (None, None)
+        status = _core_str(cs.get("status"))
+        step = _core_str(cs.get("step"))
+        # An idle status carries no meaningful step — send status only so the
+        # sweep reads 'available' rather than stale 'what it was last doing'.
+        return (status, None if status == "idle" else step)
+    except Exception:  # noqa: BLE001 — best-effort; never stall the main loop
+        return (None, None)
+
+
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
-    """Best-effort liveness ping for hosted relay dashboards."""
+    """Best-effort liveness + core-status ping. Liveness feeds hosted dashboards;
+    the status/step feed the broker's presence sweep (agent working/available/…)."""
     global _heartbeat_disabled, _last_heartbeat_at
     if _heartbeat_disabled:
         return False
@@ -185,15 +230,24 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     if not force and now - _last_heartbeat_at < HEARTBEAT_INTERVAL:
         return False
     _last_heartbeat_at = now
+    _status, _step = _read_core_status()
     try:
-        _req("POST", "/v1/heartbeat", {
+        payload = {
             "client": "sutando-relay-client",
             "protocol_version": 1,
             "provider": PROVIDER,
             "tier": LOCAL_TIER,
             "inflight": len(inflight),
-            "capabilities": ["task-ack", "heartbeat", "result-skip-markers"],
-        }, timeout=10)
+            "capabilities": ["task-ack", "heartbeat", "result-skip-markers",
+                             "core-status"],
+        }
+        # Only include when present so a status-less node never clobbers the
+        # broker's last-known core-status (the broker only records on presence).
+        if _status is not None:
+            payload["status"] = _status
+        if _step is not None:
+            payload["step"] = _step
+        _req("POST", "/v1/heartbeat", payload, timeout=10)
         return True
     except urllib.error.HTTPError as e:
         if e.code in (404, 405):
