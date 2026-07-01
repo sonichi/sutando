@@ -204,12 +204,20 @@ class TestBridgeHelperTelegram(unittest.TestCase):
 
 
 class TestBridgeHelperSymlinkResolve(unittest.TestCase):
-    """Regression guard for the Path.resolve() fix (a50d9c05).
+    """Regression guard for the symlink-resolve fix (a50d9c05, f6df7eb1).
 
     When a bridge is invoked via an app-bundle src/ symlink, Path(__file__)
-    returns the symlink path, not the real file. Without .resolve(), parent.parent
-    points into the temp symlink dir — the skill is never found and the helper
-    silently returns None. This test reproduces that scenario with a real symlink.
+    returns the symlink path, not the real file. Without resolving through the
+    symlink, parent.parent points into the temp symlink dir — the skill is
+    never found and the helper silently returns None. This test reproduces
+    that scenario with a real symlink.
+
+    Uses os.path.realpath(__file__) rather than Path(__file__).resolve() —
+    the latter matches scripts/lint-workspace-resolution.sh's banned
+    `Path(__file__).resolve().parent.parent` pattern (reserved for the
+    workspace-root anti-pattern); this resolves a sibling skills/ *code*
+    path, a different concern, so realpath() sidesteps the false-positive
+    lint match while being equally symlink-safe.
     """
 
     def _build_symlink_ns(self, bridge_name: str, symlink_path: str) -> dict:
@@ -227,7 +235,7 @@ class TestBridgeHelperSymlinkResolve(unittest.TestCase):
         return ns
 
     def test_resolve_finds_skill_through_symlink(self):
-        """With .resolve(), the helper finds the skill even when invoked via symlink."""
+        """With realpath resolution, the helper finds the skill even when invoked via symlink."""
         import tempfile
         with tempfile.TemporaryDirectory() as tmpdir:
             # Create a symlink to slack-bridge.py inside a temp dir
@@ -242,10 +250,10 @@ class TestBridgeHelperSymlinkResolve(unittest.TestCase):
             with patch("subprocess.run", return_value=mock_result) as mock_run:
                 result = helper("/tmp/voice.m4a")
 
-            # If resolve() works: subprocess.run is called (skill found) → "resolved"
-            # If resolve() is absent: Path(symlink).parent.parent != REPO → skill absent → None
+            # If realpath resolution works: subprocess.run is called (skill found) → "resolved"
+            # If it's absent: Path(symlink).parent.parent != REPO → skill absent → None
             self.assertEqual(result, "resolved",
-                "Path.resolve() missing — helper returned None when invoked via symlink")
+                "symlink resolution missing — helper returned None when invoked via symlink")
             self.assertTrue(mock_run.called, "subprocess.run never called — skill path not resolved")
 
 
