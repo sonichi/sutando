@@ -1,0 +1,5 @@
+{
+  "_comment": "Optional defense-in-depth gate for all room-ops tools. DEFAULT-DENY when present; ABSENT file -> defer entirely to gateway-side membership enforcement (the authoritative boundary). Point ROOM_OPS_GATE at this file.",
+  "@example.agent:your-homeserver": { "rooms": ["!exampleRoomId:your-homeserver"] },
+  "@trusted.agent:your-homeserver": { "all_member_rooms": true }
+}
