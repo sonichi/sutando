@@ -1089,9 +1089,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Default hotkey config used when ~/.config/sutando/hotkeys.json is missing.
     /// Keys: action name → (key letter, modifier names).
     private static let defaultHotkeys: [(action: String, key: String, modifiers: [String])] = [
-        ("drop_context",     "C", ["control"]),
+        // ⌃C / ⌃R avoided: they shadow terminal SIGINT and reverse-i-search.
+        // Use ⌃⇧C / ⌃⇧R so plain ⌃C/⌃R still reach the terminal (global
+        // hotkeys match the exact modifier mask, so the shifted variants
+        // never swallow the unshifted keys).
+        ("drop_context",     "C", ["control", "shift"]),
         ("drop_screenshot",  "S", ["control"]),
-        ("drop_video_clip",  "R", ["control"]),
+        ("drop_video_clip",  "R", ["control", "shift"]),
         ("toggle_voice",     "V", ["control"]),
         ("toggle_mute",      "M", ["control"]),
     ]
