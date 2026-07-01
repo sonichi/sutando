@@ -176,8 +176,26 @@ def _post_task_ack(tid: str) -> bool:
         return False
 
 
+def _read_core_status() -> tuple[str | None, str | None]:
+    """Read this node's core-status.json → (status, step) for the presence layer.
+    core-status is written by the proactive loop / task handlers (status =
+    running|idle, step = human 'what it's doing'). The broker derives the agent's
+    presence badge from it. Best-effort: any error → (None, None) so the
+    heartbeat still fires as a plain liveness ping."""
+    try:
+        with open(WS / "state" / "core-status.json") as f:
+            cs = json.load(f)
+        step = cs.get("step")
+        # An idle status carries no meaningful step — send status only so the
+        # sweep reads 'available' rather than stale 'what it was last doing'.
+        return (cs.get("status"), step if cs.get("status") != "idle" else None)
+    except (OSError, ValueError):
+        return (None, None)
+
+
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
-    """Best-effort liveness ping for hosted relay dashboards."""
+    """Best-effort liveness + core-status ping. Liveness feeds hosted dashboards;
+    the status/step feed the broker's presence sweep (agent working/available/…)."""
     global _heartbeat_disabled, _last_heartbeat_at
     if _heartbeat_disabled:
         return False
@@ -185,15 +203,24 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     if not force and now - _last_heartbeat_at < HEARTBEAT_INTERVAL:
         return False
     _last_heartbeat_at = now
+    _status, _step = _read_core_status()
     try:
-        _req("POST", "/v1/heartbeat", {
+        payload = {
             "client": "sutando-relay-client",
             "protocol_version": 1,
             "provider": PROVIDER,
             "tier": LOCAL_TIER,
             "inflight": len(inflight),
-            "capabilities": ["task-ack", "heartbeat", "result-skip-markers"],
-        }, timeout=10)
+            "capabilities": ["task-ack", "heartbeat", "result-skip-markers",
+                             "core-status"],
+        }
+        # Only include when present so a status-less node never clobbers the
+        # broker's last-known core-status (the broker only records on presence).
+        if _status is not None:
+            payload["status"] = _status
+        if _step is not None:
+            payload["step"] = _step
+        _req("POST", "/v1/heartbeat", payload, timeout=10)
         return True
     except urllib.error.HTTPError as e:
         if e.code in (404, 405):
