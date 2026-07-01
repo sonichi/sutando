@@ -183,13 +183,24 @@ fi
 CLAUDE_AS_CORE_PROVIDER=0
 if [ -x "$REPO/scripts/sutando-config.sh" ]; then
   _cc_provider="" _cc_core_type="" _cc_auth_env=""
-  while IFS='=' read -r _k _v; do
-    case "$_k" in
-      CFG_PROVIDER)  _cc_provider="$_v" ;;
-      CFG_CORE_TYPE) _cc_core_type="$_v" ;;
-      CFG_AUTH_ENV)  _cc_auth_env="$_v" ;;
-    esac
-  done < <(bash "$REPO/scripts/sutando-config.sh" core-config 2>/dev/null) || true
+  # Read core_config LOUD: this decides provider-vs-subscription routing, so a
+  # malformed sutando.config (getter exits nonzero) must not be swallowed into a
+  # silent subscription fallback. Capture the rc and warn; `|| _cc_rc=$?` keeps
+  # this `set -euo pipefail` script alive.
+  _cc_raw="" _cc_rc=0
+  _cc_raw="$(bash "$REPO/scripts/sutando-config.sh" core-config 2>&1)" || _cc_rc=$?
+  if [ "$_cc_rc" -ne 0 ]; then
+    echo "start-cli: WARNING — reading core_config failed (rc=$_cc_rc); using defaults (subscription). Fix sutando.config, then: bash scripts/sutando-config.sh core-config" >&2
+    printf '%s\n' "$_cc_raw" | sed 's/^/  /' >&2
+  else
+    while IFS='=' read -r _k _v; do
+      case "$_k" in
+        CFG_PROVIDER)  _cc_provider="$_v" ;;
+        CFG_CORE_TYPE) _cc_core_type="$_v" ;;
+        CFG_AUTH_ENV)  _cc_auth_env="$_v" ;;
+      esac
+    done <<< "$_cc_raw"
+  fi
   # A provider counts as configured via config OR the env override.
   if [ -n "$_cc_provider" ] || [ -n "${SUTANDO_PROVIDER_URL:-}" ]; then
     CLAUDE_AS_CORE_PROVIDER=1
