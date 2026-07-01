@@ -104,14 +104,12 @@ class TestCaptureVideoRouting(unittest.TestCase):
         with urllib.request.urlopen(req, timeout=5) as r:
             return r.status, json.loads(r.read())
 
-    def test_capture_video_returns_mov(self):
-        # The whole point: /capture-video is NOT intercepted by /capture.
-        status, body = self._get("/capture-video?seconds=1&silent=true", token=self.token)
-        self.assertEqual(status, 200)
-        self.assertEqual(body["status"], "ok")
-        self.assertTrue(body["path"].endswith(".mov"),
-                        f"/capture-video must record a .mov, got {body['path']}")
-        self.assertEqual(body["seconds"], 1)
+    def test_capture_video_requires_action(self):
+        # Toggle-only: no action (the old fixed-duration path) → 400, no recording.
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._get("/capture-video?silent=true", token=self.token)
+        self.assertEqual(ctx.exception.code, 400)
+        ctx.exception.close()
 
     def test_capture_still_returns_png(self):
         # The screenshot branch still works for the plain /capture path.
@@ -120,18 +118,11 @@ class TestCaptureVideoRouting(unittest.TestCase):
         self.assertTrue(body["path"].endswith(".png"),
                         f"/capture must return a .png, got {body['path']}")
 
-    def test_duration_is_clamped(self):
-        # Out-of-range / non-numeric seconds falls back to the 5s default.
-        _, body = self._get("/capture-video?seconds=999&silent=true", token=self.token)
-        self.assertEqual(body["seconds"], 5)
-        _, body = self._get("/capture-video?seconds=abc&silent=true", token=self.token)
-        self.assertEqual(body["seconds"], 5)
-
     def test_capture_video_requires_token(self):
         # Drive-by defense: no token / wrong token -> 403, no recording.
         for bad in (None, "wrong-token"):
             with self.assertRaises(urllib.error.HTTPError) as ctx:
-                self._get("/capture-video?seconds=1&silent=true", token=bad)
+                self._get("/capture-video?action=start&silent=true", token=bad)
             self.assertEqual(ctx.exception.code, 403)
             ctx.exception.close()
 
