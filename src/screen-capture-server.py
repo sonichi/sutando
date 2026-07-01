@@ -12,6 +12,7 @@ import subprocess
 import json
 import os
 import secrets
+import stat
 import threading
 import urllib.request
 import os as _os
@@ -44,13 +45,18 @@ _CAPTURE_TOKEN_PATH = _os.path.expanduser("~/.config/sutando/screen-capture-toke
 
 def _load_or_create_capture_token():
     try:
-        if _os.path.exists(_CAPTURE_TOKEN_PATH):
-            existing = open(_CAPTURE_TOKEN_PATH).read().strip()
-            if existing:
-                return existing
+        if _os.path.lexists(_CAPTURE_TOKEN_PATH):
+            st = _os.lstat(_CAPTURE_TOKEN_PATH)
+            if (stat.S_ISREG(st.st_mode) and (st.st_mode & 0o777) == 0o600
+                    and st.st_uid == _os.getuid()):
+                existing = open(_CAPTURE_TOKEN_PATH).read().strip()
+                if existing:
+                    return existing
+            _os.unlink(_CAPTURE_TOKEN_PATH)
         _os.makedirs(_os.path.dirname(_CAPTURE_TOKEN_PATH), exist_ok=True)
         tok = secrets.token_urlsafe(32)
-        fd = _os.open(_CAPTURE_TOKEN_PATH, _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o600)
+        fd = _os.open(_CAPTURE_TOKEN_PATH,
+                      _os.O_WRONLY | _os.O_CREAT | _os.O_EXCL | _os.O_NOFOLLOW, 0o600)
         _os.write(fd, tok.encode())
         _os.close(fd)
         return tok
