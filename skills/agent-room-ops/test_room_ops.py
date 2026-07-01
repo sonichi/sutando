@@ -264,17 +264,35 @@ class GatewayTokenOnboardingTests(EnvCase):
         self.assertEqual(headers["Authorization"], "Bearer s3cret")
 
     def test_explicit_relay_token_not_split(self):
-        # An explicit RELAY_TOKEN is a bearer, never split on '|'.
+        # An explicit token whose part before '|' is NOT a URL scheme is a real
+        # bearer and kept whole (only the "https://<url>|<secret>" onboarding
+        # form is split).
         os.environ["RELAY_TOKEN"] = "weird|bearer|value"
         os.environ["RELAY_URL"] = "https://r"
         base, headers = _gateway.gateway()
         self.assertEqual(headers["Authorization"], "Bearer weird|bearer|value")
+
+    def test_explicit_combined_gateway_token_is_split(self):
+        # The combined onboarding form is split even when passed EXPLICITLY as
+        # GATEWAY_TOKEN, so `GATEWAY_TOKEN=https://g|secret` authenticates with
+        # just the secret (regression: it used to send the whole string → 401).
+        os.environ["GATEWAY_TOKEN"] = "https://chat.example/relay|s3cr3t"
+        base, headers = _gateway.gateway()
+        self.assertEqual(headers["Authorization"], "Bearer s3cr3t")
+        self.assertEqual(base, "https://chat.example/relay")
 
     def test_bare_secret_needs_url(self):
         os.environ["REMOTE_TASK_TOKEN"] = "baresecret"
         base, headers = _gateway.gateway()
         self.assertEqual(base, "")  # no url anywhere -> empty (op will degrade)
         self.assertEqual(headers["Authorization"], "Bearer baresecret")
+
+    def test_degrade_reason_distinguishes_401_from_403(self):
+        # 401 = auth failure (bad bearer), 403 = real non-member. Keeping them
+        # distinct is what stops a token bug being misread as "not a member".
+        self.assertIn("auth", _gateway.degrade_reason(401).lower())
+        self.assertNotIn("member", _gateway.degrade_reason(401).lower())
+        self.assertIn("member", _gateway.degrade_reason(403).lower())
 
 
 class OutboxAllowlistTests(EnvCase):
