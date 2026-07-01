@@ -528,7 +528,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // the watcherKeystrokesQueued() check above + the Timer interval.)
 
         // If Claude Code is running inside the `sutando-core` tmux session
-        // (launch via scripts/start-cli.sh), send the word `watcher` to
+        // (launch via src/agent/claude/cli/start-cli.sh), send the word `watcher` to
         // its pane as if Chi typed it. The CLI parses that as a restart
         // prompt and starts the watcher via its own run_in_background Bash
         // — so the watcher's stdout routes through the task-notification
@@ -542,7 +542,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Fallback: Claude Code isn't in the expected tmux session.
         // Notify so Chi can restart manually.
-        notify("Sutando", "Task watcher is down — prompt the CLI to restart it (or start CLI via scripts/start-cli.sh)")
+        notify("Sutando", "Task watcher is down — prompt the CLI to restart it (or start CLI via src/agent/claude/cli/start-cli.sh)")
         logToFile("watcher dead; notification fired (tmux session not found)")
     }
 
@@ -2334,7 +2334,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Restart the Claude Code core session (sutando-core tmux session).
-    /// Invokes scripts/start-cli.sh --restart which kills any existing
+    /// Invokes src/agent/claude/cli/start-cli.sh --restart which kills any existing
     /// session and starts fresh detached. User can re-attach via
     /// "Open Core CLI" in the menu (or `tmux -S /tmp/sutando-tmux.sock
     /// attach -t sutando-core` from a terminal).
@@ -2351,7 +2351,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// this only restarts the Claude Code CLI session.
     @objc func restartCore() {
         notify("Sutando", "Restarting Core CLI…")
-        let script = repoRoot + "/scripts/start-cli.sh"
+        let script = repoRoot + "/src/agent/claude/cli/start-cli.sh"
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
         proc.arguments = [script, "--restart"]

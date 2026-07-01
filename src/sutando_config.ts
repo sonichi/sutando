@@ -37,7 +37,14 @@ const LOCAL_FILENAME = 'sutando.config.local.json';
  * stays lenient (warn-only) so experimental/scratch keys don't break.
  * Per Mini's review #8 on PR #1395.
  */
-const KNOWN_TOP_LEVEL_KEYS = new Set(['workspace', 'claude_sutando_config_dir', 'vault']);
+const KNOWN_TOP_LEVEL_KEYS = new Set([
+	'workspace',
+	'claude_sutando_config_dir',
+	'core_config_dirs',
+	'core_config',
+	'vault',
+	'migrate',
+]);
 
 /**
  * Walk upward from `start` until we find a directory containing
@@ -373,7 +380,7 @@ const DEFAULT_CLAUDE_SUTANDO_SUBDIR = '.claude-sutando';
  * are rejected at load (schema pattern) AND asserted again here (defense in
  * depth, catches symlink escapes the regex misses).
  *
- * Does NOT create the directory — callers (e.g. `scripts/sutando-shell-setup.sh`)
+ * Does NOT create the directory — callers (e.g. `src/agent/claude/cli/sutando-shell-setup.sh`)
  * are responsible for mkdir as part of the alias-setup flow.
  *
  * @throws if the subdir violates the workspace-sub-folder invariant.

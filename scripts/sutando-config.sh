@@ -10,6 +10,7 @@
 #   bash scripts/sutando-config.sh workspace     # print resolved workspace path
 #   bash scripts/sutando-config.sh vault-enabled # print "true" or "false"
 #   bash scripts/sutando-config.sh vault-url     # print vault remote_url (may be empty)
+#   bash scripts/sutando-config.sh core-config   # print core_config as CFG_*=… lines
 #   bash scripts/sutando-config.sh dump          # print full merged config as JSON
 #   bash scripts/sutando-config.sh subdirs       # print canonical workspace subdir list (one per line)
 #   bash scripts/sutando-config.sh bootstrap     # mkdir -p the canonical subdirs in the resolved workspace
@@ -216,6 +217,30 @@ sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_core_config_dirs
 for entry in resolve_core_config_dirs():
     print(json.dumps(entry))
+"
+    ;;
+
+  core-config)
+    # Print the resolved core_config block as shell `CFG_<KEY>=<value>` lines.
+    # Safe to read via `while IFS='=' read` — values are simple scalars (type
+    # word, URL, env-var name, model id). Consumed by src/agent/claude/
+    # (provider-env.sh, start-cli.sh). Schema + defaults:
+    # src/sutando_config.py::resolve_core_config.
+    python3 -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import resolve_core_config
+d = resolve_core_config()
+def emit(name, v):
+    print(f'{name}={v}')
+emit('CFG_CORE_TYPE', d['core_type'])
+emit('CFG_PROVIDER', d['provider'])
+emit('CFG_AUTH_ENV', d['auth_env'])
+emit('CFG_MODEL', d['model'])
+m = d.get('models') or {}
+emit('CFG_MODEL_OPUS', m.get('opus', ''))
+emit('CFG_MODEL_SONNET', m.get('sonnet', ''))
+emit('CFG_MODEL_HAIKU', m.get('haiku', ''))
 "
     ;;
 

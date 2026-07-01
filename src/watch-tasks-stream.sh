@@ -63,6 +63,25 @@ STATE_DIR="$(bash "$__REPO_ROOT/scripts/sutando-config.sh" workspace)/state"
 mkdir -p "$STATE_DIR"
 PID_FILE="$STATE_DIR/watch-tasks-stream.pid"
 echo "$$" > "$PID_FILE"
+
+# Host-owned-watcher mode (SDK core). src/agent/claude/sdk/session-server.ts sets
+# SUTANDO_HOST_OWNS_WATCHER=1 and watches tasks/ itself, injecting each task into
+# the SDK session directly. When set, this script must NOT also emit TASK_FILE
+# events — that would double-process every task. We still hold the PID (so the
+# agent's /schedule-crons + /proactive-loop "ensure watcher running" PID checks
+# pass) and stay alive under the Monitor tool, but emit nothing and never fswatch.
+if [ "${SUTANDO_HOST_OWNS_WATCHER:-0}" = "1" ]; then
+  # The signal handler must EXIT (not just clean up), and the hold below must be
+  # `sleep & wait` — a bare `sleep` blocks the trap until it returns, so TERM
+  # would be ignored. `wait` is interruptible, so the trap fires immediately.
+  trap 'rm -f "$PID_FILE"; [ -n "${_sl:-}" ] && kill "$_sl" 2>/dev/null; exit 0' HUP INT TERM
+  trap 'rm -f "$PID_FILE"' EXIT
+  echo "watch-tasks-stream: SUTANDO_HOST_OWNS_WATCHER=1 — host owns task watching; this watcher is a no-op (PID held, no events)." >&2
+  while :; do
+    sleep 3600 & _sl=$!
+    wait "$_sl" 2>/dev/null || true
+  done
+fi
 # PID-file cleanup is folded into the unified `cleanup` function below so a
 # single trap covers both responsibilities (rm + kill children). An earlier
 # version set `trap 'rm -f "$PID_FILE"' EXIT` here AND `trap cleanup EXIT...`

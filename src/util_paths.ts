@@ -144,7 +144,7 @@ export function sharedPersonalPath(filename: string, workspace?: string): string
 // Resolution (3-tier, prefer most specific):
 //   1. $CLAUDE_CONFIG_DIR  — Claude Code's canonical env var (string present
 //      in the `claude` binary). Set by `claude-sutando` shell function +
-//      scripts/start-cli.sh + src/startup.sh so every workspace gets its own
+//      src/agent/claude/cli/start-cli.sh + src/startup.sh so every workspace gets its own
 //      .claude-sutando/ tree instead of sharing global ~/.claude/.
 //   2. $CLAUDE_HOME        — deprecated legacy override (kept for one release
 //      so pre-M0 callers / test fixtures don't break instantly). Emits a

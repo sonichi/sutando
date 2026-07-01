@@ -11,6 +11,17 @@
       "value": "${WORKSPACE_DIR}/.claude-sutando"
     }
   ],
+  "core_config": {
+    "core_type": "claude_cli",
+    "provider": "",
+    "auth_env": "ANTHROPIC_SUBSCRIPTION",
+    "model": "",
+    "models": {
+      "opus": "",
+      "sonnet": "",
+      "haiku": ""
+    }
+  },
   "vault": {
     "enabled": false,
     "remote_url": "",

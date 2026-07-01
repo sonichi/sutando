@@ -37,7 +37,7 @@ export SUTANDO_ROOT="$REPO"
 # L~449 discord, L~473 slack) probe `${CLAUDE_CONFIG_DIR:-$HOME/.claude}` and
 # fall back to legacy `~/.claude/` when the env var is unset — meaning bridges
 # read tokens / access lists from the pre-migration location even after a
-# successful `claude-sutando --migrate`. Mirrors scripts/start-cli.sh:38-51
+# successful `claude-sutando --migrate`. Mirrors src/agent/claude/cli/start-cli.sh
 # (Sutando.app's tmux-wrapped CLI launcher) — same machine-spawn pattern.
 #
 # Defense in depth (matches start-cli):
@@ -48,6 +48,12 @@ if [ -x "$REPO/scripts/sutando-config.sh" ]; then
   _ccd_err="$(mktemp -t startup-ccd.XXXXXX)"
   if _ccd="$(bash "$REPO/scripts/sutando-config.sh" claude-sutando-config-dir 2>"$_ccd_err")"; then
     mkdir -p "$_ccd"
+    # NOTE: the claude core-agent launcher + the `claude-sutando` config-dir
+    # onboarding alias now live under src/agent/claude/ (start-cli.sh /
+    # sutando-shell-setup.sh). This credentials seed stays INLINE here by design:
+    # it must run in the same startup env (exports CLAUDE_CONFIG_DIR for the
+    # bridges below), not in a separately-execed launcher. See
+    # src/agent/claude/README.md for the full auth/onboarding map.
     # Auth-carry (v0.8 cold-start fix). Seed credentials + onboarding state from
     # $HOME/.claude/ so a cold `claude` core doesn't dead-end at the login wall
     # (.credentials.json) or trust-folder prompt (.claude.json) before reaching
@@ -463,8 +469,8 @@ fi
 # per-host sentinel at $WORKSPACE/state/.shell-setup-prompted-<hostname> so
 # this never re-pesters after the user's initial yes/no.
 # Failures are non-fatal — startup.sh continues regardless.
-if [ -x "$REPO/scripts/sutando-shell-setup.sh" ]; then
-  bash "$REPO/scripts/sutando-shell-setup.sh" --auto || true
+if [ -x "$REPO/src/agent/claude/cli/sutando-shell-setup.sh" ]; then
+  bash "$REPO/src/agent/claude/cli/sutando-shell-setup.sh" --auto || true
 fi
 
 # Reap any stale watch-tasks-stream watcher from a prior session. The
@@ -962,9 +968,45 @@ done
 echo ""
 open "http://localhost:8080"
 
-# Delegate to scripts/start-cli.sh — canonical sutando-core launch command.
-# Single source of truth so Sutando.app's Restart Core menu can invoke the
-# same launch path without duplicating the tmux + claude flags.
+# Launch the CORE — routed by core_config.core_type:
+#   claude_sdk → the Agent-SDK session core (src/agent/claude/sdk/session-server.sh),
+#                a background HTTP server + browser UI on :${SUTANDO_SESSION_PORT:-4100}.
+#                Everything above (heartbeat, proxy, bridges, services) has already
+#                started; the SDK core owns task-watching + cron/proactive scheduling
+#                itself, and defers the heartbeat to the core_heartbeat.py started above.
+#   claude_cli → (default) the interactive tmux core via cli/start-cli.sh.
+# Lowercase-normalize so claude_SDK / CLAUDE_SDK / claude_sdk all route the same.
+_CORE_TYPE="$(bash "$REPO/scripts/sutando-config.sh" core-config 2>/dev/null | sed -n 's/^CFG_CORE_TYPE=//p' | tr '[:upper:]' '[:lower:]')"
+if [ "$_CORE_TYPE" = "claude_sdk" ]; then
+  _SDK_PORT="${SUTANDO_SESSION_PORT:-4100}"
+  if lsof -i :"$_SDK_PORT" > /dev/null 2>&1; then
+    echo "  ✓ SDK core (session-server) already running on :$_SDK_PORT"
+  else
+    echo "  Starting SDK core (session-server) on :$_SDK_PORT..."
+    # core_heartbeat.py (started above) owns this host's liveness beat → skip the
+    # session-server's own heartbeat so they don't fight over state/cores/*.alive.
+    SUTANDO_SESSION_NO_HEARTBEAT=1 nohup bash "$REPO/src/agent/claude/sdk/session-server.sh" \
+      > "$LOGS_DIR/session-server.log" 2>&1 &
+    # Wait for the HTTP server to bind (it does so before the SDK session connects),
+    # so a refusal (e.g. missing provider token) surfaces here, not as a dead URL.
+    for _ in $(seq 1 20); do lsof -i :"$_SDK_PORT" > /dev/null 2>&1 && break; sleep 0.5; done
+    if lsof -i :"$_SDK_PORT" > /dev/null 2>&1; then
+      echo "  ✓ SDK core → http://localhost:$_SDK_PORT  (logs: $LOGS_DIR/session-server.log)"
+    else
+      echo "  ✗ SDK core failed to bind :$_SDK_PORT — check $LOGS_DIR/session-server.log (often a missing provider token)" >&2
+    fi
+  fi
+  if lsof -i :"$_SDK_PORT" > /dev/null 2>&1; then
+    open "http://localhost:$_SDK_PORT" 2>/dev/null || true
+    echo ""
+    echo "Startup complete (SDK core). Open http://localhost:$_SDK_PORT for the live session UI."
+  fi
+  exit 0
+fi
+
+# Default: delegate to src/agent/claude/cli/start-cli.sh — canonical sutando-core
+# launch command. Single source of truth so Sutando.app's Restart Core menu can
+# invoke the same launch path without duplicating the tmux + claude flags.
 #
 # Restore stdout/stderr to the terminal first when the operator is
 # interactive: the tee-redirect at the top of this script makes fd 1 a PIPE,
@@ -977,4 +1019,4 @@ open "http://localhost:8080"
 if [ -t 0 ]; then
     exec >/dev/tty 2>&1
 fi
-exec bash "$REPO/scripts/start-cli.sh"
+exec bash "$REPO/src/agent/claude/cli/start-cli.sh"

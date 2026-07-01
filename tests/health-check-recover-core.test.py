@@ -7,7 +7,7 @@ Motivated by the 2026-06-02 incident: the core crossed into 1M extended
 context, hit the interactive `/usage-credits` gate (which cannot be
 pre-authorized for an unattended agent), and looped silently — alive (heartbeat
 ticking) but draining nothing. --notify-slack makes that visible; this makes it
-self-healing by restarting the core via scripts/start-cli.sh --restart, with
+self-healing by restarting the core via src/agent/claude/cli/start-cli.sh --restart, with
 1M preserved on the first attempt and a graceful 200K fallback if it recurs.
 
 Because auto-restarting a 24/7 agent is consequential, the guards are the whole
