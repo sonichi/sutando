@@ -270,7 +270,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if query.get("silent", ["false"])[0] != "true":
                         _signal_seeing()
                         _notify_capture()
+                    # Audio: -g records the *default input device*, so the clip's
+                    # sound source follows System Settings > Sound > Input:
+                    #   mic (MacBook Pro Microphone) → narration / room audio
+                    #   BlackHole 2ch (with output routed there) → system/app audio
+                    # ?audio=off disables sound; ?device=<id> pins a specific input via -G<id>.
+                    audio = query.get("audio", ["on"])[0]
+                    device = query.get("device", [None])[0]
                     cmd = ["screencapture", "-v", "-x"]  # no -V → records until SIGINT
+                    if audio != "off":
+                        cmd.append(f"-G{device}" if device else "-g")
                     if display:
                         cmd.append(f"-D{display}")
                     cmd.append(path)
