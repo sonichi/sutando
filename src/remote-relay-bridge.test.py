@@ -177,6 +177,31 @@ def main() -> int:
     check(hb2.get("status") == "idle" and "step" not in hb2,
           "idle status sends no step (avoids stale 'what it was doing')")
 
+    # SECURITY / robustness: core-status.json is written by another process and
+    # may be malformed. _read_core_status runs in the main loop BEFORE the poll,
+    # so it MUST NOT raise (else it stalls task delivery). Regression for the
+    # #1884 blocking finding.
+    csf = rtc.WS / "state" / "core-status.json"
+    csf.write_text(json.dumps(["not", "an", "object"]))   # valid JSON, not a dict
+    check(rtc._read_core_status() == (None, None),
+          "valid-JSON non-object core-status → (None, None), no crash")
+    csf.write_text(json.dumps({"status": {"x": 1}, "step": ["y"]}))  # non-string fields
+    check(rtc._read_core_status() == (None, None),
+          "non-string status/step → (None, None), never forwarded")
+    csf.write_text("{ this is not json")                   # malformed JSON
+    check(rtc._read_core_status() == (None, None), "malformed JSON → (None, None)")
+    csf.write_text(json.dumps({"status": "running", "step": "x" * 5000}))  # oversized
+    st, sp = rtc._read_core_status()
+    check(st == "running" and sp is not None and len(sp) == rtc._CORE_STEP_MAX,
+          "oversized step is bounded, not forwarded whole")
+    # a malformed file must not break the heartbeat POST either (best-effort)
+    csf.write_text(json.dumps([1, 2, 3]))
+    STATE["heartbeats"].clear(); rtc._last_heartbeat_at = 0.0
+    check(rtc._post_heartbeat(set(), force=True), "heartbeat still fires despite malformed core-status")
+    hb3 = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
+    check("status" not in hb3 and "step" not in hb3,
+          "malformed core-status → heartbeat omits status/step (liveness-only)")
+
     # Backwards compatibility: old relays that only implement pull/results can
     # 404 optional protocol extensions; the client disables them and continues.
     STATE["force_ack_404"] = True

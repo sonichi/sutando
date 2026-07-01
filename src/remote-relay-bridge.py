@@ -176,20 +176,42 @@ def _post_task_ack(tid: str) -> bool:
         return False
 
 
+_CORE_STEP_MAX = 500
+
+
+def _core_str(v) -> str | None:
+    """A core-status field → bounded non-empty str, or None. core-status.json is
+    written by another process and may be malformed; a non-string field must not
+    be forwarded (the broker calls .lower() on it)."""
+    if not isinstance(v, str):
+        return None
+    v = v.strip()
+    return v[:_CORE_STEP_MAX] if v else None
+
+
 def _read_core_status() -> tuple[str | None, str | None]:
     """Read this node's core-status.json → (status, step) for the presence layer.
     core-status is written by the proactive loop / task handlers (status =
     running|idle, step = human 'what it's doing'). The broker derives the agent's
-    presence badge from it. Best-effort: any error → (None, None) so the
+    presence badge from it.
+
+    MUST NOT raise: this runs in the main loop BEFORE the /v1/tasks poll, so an
+    exception here would back the loop off and stall task delivery — a malformed
+    presence side-channel must never become a delivery blocker. So we guard the
+    JSON shape (a valid-JSON non-object would AttributeError on .get) and coerce
+    every field to a bounded str-or-None; any surprise → (None, None) and the
     heartbeat still fires as a plain liveness ping."""
     try:
         with open(WS / "state" / "core-status.json") as f:
             cs = json.load(f)
-        step = cs.get("step")
+        if not isinstance(cs, dict):
+            return (None, None)
+        status = _core_str(cs.get("status"))
+        step = _core_str(cs.get("step"))
         # An idle status carries no meaningful step — send status only so the
         # sweep reads 'available' rather than stale 'what it was last doing'.
-        return (cs.get("status"), step if cs.get("status") != "idle" else None)
-    except (OSError, ValueError):
+        return (status, None if status == "idle" else step)
+    except Exception:  # noqa: BLE001 — best-effort; never stall the main loop
         return (None, None)
 
 
