@@ -1642,7 +1642,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // drops the .mov. User-controlled length beats a fixed duration.
         let starting = !isRecordingVideo
         let action = starting ? "start" : "stop"
-        notify("Sutando", starting ? "● Recording screen — press ⌃R again to stop" : "Stopping recording…")
+        notify("Sutando", starting ? "● Recording screen + mic — press ⌃⇧R again to stop" : "Stopping recording…")
 
         guard let url = URL(string: "http://localhost:7845/capture-video?action=\(action)") else { return }
         var req = URLRequest(url: url)
