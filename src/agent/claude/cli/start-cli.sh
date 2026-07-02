@@ -227,16 +227,18 @@ if [ -x "$REPO/scripts/sutando-config.sh" ]; then
       exit 1
     fi
   elif [ "${_cc_auth_env:-ANTHROPIC_SUBSCRIPTION}" = "ANTHROPIC_SUBSCRIPTION" ]; then
-    # Subscription core (the default): clear any stray API token so a shell-set
-    # ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN (e.g. exported in ~/.zshrc) cannot
-    # override the Claude.ai subscription OAuth. Claude Code precedence is
-    # env token > keychain/.credentials.json, so a lingering key silently bills
-    # the API (or 401s on an invalid one) instead of using the subscription the
-    # operator asked for. auth_env=ANTHROPIC_SUBSCRIPTION means "subscription,
-    # period" — so we enforce it here rather than trust a clean env.
-    if [ -n "${ANTHROPIC_API_KEY:-}" ] || [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
-      unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
-      echo "  ~ subscription core: cleared a stray ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN from the env (using the Claude.ai subscription)"
+    # Subscription core (the default): clear a stray ANTHROPIC_API_KEY so a
+    # shell-set x-api-key (e.g. exported in ~/.zshrc) can't shadow the Claude.ai
+    # subscription OAuth. Claude Code precedence is env token > keychain/
+    # .credentials.json, so a lingering key silently bills the raw API (or 401s
+    # on an invalid one) instead of using the subscription the operator asked for.
+    # Clear ONLY ANTHROPIC_API_KEY — NOT ANTHROPIC_AUTH_TOKEN, which can itself be
+    # the subscription/OAuth bearer (and may be the only credential present before
+    # .credentials.json is written); the credential-proxy rewrites the
+    # Authorization header anyway, so a stray bearer is harmless there.
+    if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+      unset ANTHROPIC_API_KEY
+      echo "  ~ subscription core: cleared a stray ANTHROPIC_API_KEY from the env (using the Claude.ai subscription)"
     fi
   fi
 fi
