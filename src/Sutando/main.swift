@@ -15,6 +15,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var hotKeyActions: [UInt32: String] = [:]  // hotkey id → action name
     var lastDropTime: Date = .distantPast
     var isRecordingVideo: Bool = false  // ⌃R start/stop toggle state
+    var videoClipMenuItem: NSMenuItem?  // menu row that shows 🔴 while recording
     var screencaptureInFlight: Bool = false  // guards against stacked crosshair launches
     // Runtime state lives under the per-user workspace dir, not the repo
     // checkout. **Delegates to SutandoConfig.resolveWorkspace()** as of the
@@ -213,6 +214,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Menu Bar
 
+    /// Recording indicator on the Drop Video Clip MENU ROW (Susan 2026-07-02
+    /// asked for the indicator on this exact row, not elsewhere): while
+    /// recording, the row reads "🔴 Drop Video Clip — recording…"; back to the
+    /// plain label once stopped. The toggle notifications alone weren't
+    /// enough — a missed notification left no way to tell whether the
+    /// recorder was still rolling.
+    func setRecordingIndicator(_ on: Bool) {
+        DispatchQueue.main.async {
+            guard let item = self.videoClipMenuItem else { return }
+            let glyph = (item.representedObject as? String) ?? ""
+            // Same leading-marker convention as the Mode rows (● = active):
+            // the Drop Video Clip row itself says whether the recorder rolls.
+            item.title = on ? "🔴 Drop Video Clip — recording… \(glyph)"
+                            : "Drop Video Clip \(glyph)"
+        }
+    }
+
     func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem.button {
@@ -241,7 +259,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         for hk in hotkeys {
             guard let (label, sel) = actionToSelector[hk.action] else { continue }
             let glyph = displayLabel(key: hk.key, modifiers: hk.modifiers)
-            menu.addItem(NSMenuItem(title: "\(label) (\(glyph))", action: sel, keyEquivalent: ""))
+            let item = NSMenuItem(title: "\(label) (\(glyph))", action: sel, keyEquivalent: "")
+            if hk.action == "drop_video_clip" {
+                // Recording indicator lives ON this row (Susan 2026-07-02
+                // on this exact row): stash the hotkey glyph so
+                // setRecordingIndicator can rebuild both title states.
+                item.representedObject = "(\(glyph))"
+                videoClipMenuItem = item
+            }
+            menu.addItem(item)
         }
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Open Web UI", action: #selector(openWebUI), keyEquivalent: ""))
@@ -1673,6 +1699,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 // Recording began — flip state; nothing to drop until stop.
                 if status == "recording" || status == "already_recording" {
                     isRecordingVideo = true
+                    setRecordingIndicator(true)
                     appendLog(logFile, "[\(timestamp)] dropVideoClip: recording started")
                 } else {
                     notify("Sutando", "Couldn't start recording (\(status))")
@@ -1682,6 +1709,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             // Stopping — flip state and drop the produced clip.
             isRecordingVideo = false
+            setRecordingIndicator(false)
             guard status == "ok", let path = json["path"] as? String else {
                 notify("Sutando", "Recording stopped, no clip (\(status))")
                 appendLog(logFile, "[\(timestamp)] dropVideoClip(stop): \(status)")
