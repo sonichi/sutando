@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Integration test for scripts/start-cli.sh's CLAUDE_CONFIG_DIR export.
+# Integration test for src/agent/claude/cli/start-cli.sh's CLAUDE_CONFIG_DIR export.
 #
 # Covers the 3 states the design doc enumerated:
 #   1. M0 helper missing                              → silent fallback, claude spawns w/o env
@@ -50,7 +50,7 @@ setup_sandbox() {
   export HOME="$SANDBOX/home"
   export SUTANDO_WORKSPACE="$SANDBOX/workspace"
 
-  mkdir -p "$REPO_FAKE/scripts" "$REPO_FAKE/src" "$BIN_STUB" \
+  mkdir -p "$REPO_FAKE/scripts" "$REPO_FAKE/src" "$REPO_FAKE/src/agent/claude/cli" "$BIN_STUB" \
            "$HOME" "$SUTANDO_WORKSPACE/state"
 
   # Stub `claude` binary — records its env to ENV_DUMP, exits 0.
@@ -98,9 +98,12 @@ EOF
 
   export PATH="$BIN_STUB:$PATH"
 
-  # Copy the real start-cli.sh into the fake repo and the bits it needs to
-  # actually resolve claude_sutando_config_dir.
-  cp "$REAL_REPO/scripts/start-cli.sh" "$REPO_FAKE/scripts/"
+  # Copy the real start-cli.sh into the fake repo (mirroring its real
+  # src/agent/claude/cli/ location, since the script self-locates the repo root
+  # four levels up: cli → claude → agent → src → repo) plus the bits it needs to
+  # resolve claude_sutando_config_dir
+  # (sutando-config.sh stays under scripts/ — start-cli calls $REPO/scripts/...).
+  cp "$REAL_REPO/src/agent/claude/cli/start-cli.sh" "$REPO_FAKE/src/agent/claude/cli/"
 
   if [ "$helper_present" = "yes" ]; then
     cp "$REAL_REPO/scripts/sutando-config.sh" "$REPO_FAKE/scripts/"
@@ -128,7 +131,7 @@ REAL_REPO="$(cd "$(dirname "$0")/.." && pwd)"
 test_helper_missing_silent_fallback() {
   setup_sandbox "no" "(unused)"
   # Run start-cli; should reach claude stub without erroring on missing helper.
-  bash "$REPO_FAKE/scripts/start-cli.sh" </dev/null >/dev/null 2>&1
+  bash "$REPO_FAKE/src/agent/claude/cli/start-cli.sh" </dev/null >/dev/null 2>&1
   rc=$?
   if [ "$rc" != "0" ]; then
     echo "  FAIL: start-cli exit $rc (expected 0 — helper-missing should be silent fallback)"
@@ -155,7 +158,7 @@ test_helper_missing_silent_fallback() {
 # ----------------------------------------------------------------------
 test_valid_config_exports_env() {
   setup_sandbox "yes" ".claude-sutando"
-  bash "$REPO_FAKE/scripts/start-cli.sh" </dev/null >/dev/null 2>&1
+  bash "$REPO_FAKE/src/agent/claude/cli/start-cli.sh" </dev/null >/dev/null 2>&1
   rc=$?
   if [ "$rc" != "0" ]; then
     echo "  FAIL: start-cli exit $rc (expected 0 for valid config)"
@@ -188,7 +191,7 @@ test_valid_config_exports_env() {
 # ----------------------------------------------------------------------
 test_invalid_config_refuses_to_start() {
   setup_sandbox "yes" "/etc/claude-state"  # absolute path, invariant violation
-  bash "$REPO_FAKE/scripts/start-cli.sh" </dev/null >/dev/null 2>&1
+  bash "$REPO_FAKE/src/agent/claude/cli/start-cli.sh" </dev/null >/dev/null 2>&1
   rc=$?
   if [ "$rc" = "0" ]; then
     echo "  FAIL: start-cli exit 0 (expected non-zero — config violates invariant)"
@@ -208,16 +211,16 @@ test_invalid_config_refuses_to_start() {
 #    tests above stay green but this one catches the regression.
 # ----------------------------------------------------------------------
 test_block_present_in_start_cli() {
-  if ! grep -qF 'CLAUDE_CONFIG_DIR' "$REAL_REPO/scripts/start-cli.sh"; then
-    echo "  FAIL: scripts/start-cli.sh no longer references CLAUDE_CONFIG_DIR"
+  if ! grep -qF 'CLAUDE_CONFIG_DIR' "$REAL_REPO/src/agent/claude/cli/start-cli.sh"; then
+    echo "  FAIL: src/agent/claude/cli/start-cli.sh no longer references CLAUDE_CONFIG_DIR"
     return 1
   fi
-  if ! grep -qF 'claude-sutando-config-dir' "$REAL_REPO/scripts/start-cli.sh"; then
-    echo "  FAIL: scripts/start-cli.sh no longer calls the M0 helper subcommand"
+  if ! grep -qF 'claude-sutando-config-dir' "$REAL_REPO/src/agent/claude/cli/start-cli.sh"; then
+    echo "  FAIL: src/agent/claude/cli/start-cli.sh no longer calls the M0 helper subcommand"
     return 1
   fi
-  if ! grep -qF 'refusing to start core' "$REAL_REPO/scripts/start-cli.sh"; then
-    echo "  FAIL: scripts/start-cli.sh dropped the fail-loud branch on invariant violation"
+  if ! grep -qF 'refusing to start core' "$REAL_REPO/src/agent/claude/cli/start-cli.sh"; then
+    echo "  FAIL: src/agent/claude/cli/start-cli.sh dropped the fail-loud branch on invariant violation"
     return 1
   fi
   return 0

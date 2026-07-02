@@ -28,7 +28,7 @@ The point of the helper is *grep-counting*: one canonical resolver means a futur
 
 ### Read-side companion: `$SOURCE_CLAUDE_CONFIG_DIR`
 
-Migration code (`scripts/sutando-shell-setup.sh --migrate`, `src/migrate.sh`) reads FROM a historically-vanilla state location and writes TO `$CLAUDE_CONFIG_DIR`. To keep that direction visible, migration scripts honor `${SOURCE_CLAUDE_CONFIG_DIR:-$HOME/.claude}` for their source path. The default matches the canonical vanilla-claude location; override for CI fixtures, custom installs, or staging tests that need a different source. `claude_home_path()` does NOT consult this — it's a migration-script convention, not a runtime resolver.
+Migration code (`src/agent/claude/cli/sutando-shell-setup.sh --migrate`, `src/migrate.sh`) reads FROM a historically-vanilla state location and writes TO `$CLAUDE_CONFIG_DIR`. To keep that direction visible, migration scripts honor `${SOURCE_CLAUDE_CONFIG_DIR:-$HOME/.claude}` for their source path. The default matches the canonical vanilla-claude location; override for CI fixtures, custom installs, or staging tests that need a different source. `claude_home_path()` does NOT consult this — it's a migration-script convention, not a runtime resolver.
 
 If you're adding code that touches a new surface (not currently in the table above), update this doc with the new surface + its re-bind cost. The taxonomy is the value here, not the row count.
 

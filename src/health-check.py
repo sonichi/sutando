@@ -1762,7 +1762,7 @@ def notify_slack_for_failures(
 # makes it SELF-HEALING.
 #
 # Recovery action is the one mechanism we already own and trust:
-# `scripts/start-cli.sh --restart`. A restarted session starts fresh under the
+# `src/agent/claude/cli/start-cli.sh --restart`. A restarted session starts fresh under the
 # standard context boundary; because the /usage-credits enable persists
 # ACCOUNT-WIDE once a human sets it (and on Max/Team plans 1M is included with
 # no gate at all), the restarted core keeps 1M and re-clears the gate by
@@ -1883,11 +1883,11 @@ def _core_started_within(seconds: float, workspace: Optional[Path] = None, now: 
 
 
 def _default_core_restart(standard_context: bool) -> bool:
-    """Run scripts/start-cli.sh --restart out-of-process. When standard_context
-    is True, pin SUTANDO_CORE_MODEL=opus so the restarted core runs in the
-    standard 200K window (graceful degradation). Returns True if the restart
-    command exited 0."""
-    script = REPO_DIR / "scripts" / "start-cli.sh"
+    """Run src/agent/claude/cli/start-cli.sh --restart out-of-process. When
+    standard_context is True, pin SUTANDO_CORE_MODEL=opus so the restarted core
+    runs in the standard 200K window (graceful degradation). Returns True if the
+    restart command exited 0."""
+    script = REPO_DIR / "src" / "agent" / "claude" / "cli" / "start-cli.sh"
     if not script.exists():
         return False
     env = dict(os.environ)
