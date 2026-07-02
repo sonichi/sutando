@@ -277,6 +277,21 @@ def _write_task(task: dict) -> str | None:
     # Idempotent: don't re-write a task already queued, claimed, or archived.
     if dest.exists() or any(TASKS_DIR.glob(f"{tid}.claimed-*")):
         return tid
+    # Relay redelivery of already-handled work: on reconnect the relay replays
+    # its unacked pool, including tasks this node long since processed (the
+    # 2026-06-30 and 2026-07-01 500-task floods). If the core already archived
+    # the task file, or the result was already delivered and archived, don't
+    # re-queue — drop a [no-send] result instead so the normal result drain
+    # re-acks it upstream and clears it from inflight.
+    if ((TASKS_DIR / "archive" / f"{tid}.txt").exists()
+            or (ARCHIVE_RESULTS_DIR / f"{tid}.txt").exists()
+            or next(ARCHIVE_RESULTS_DIR.glob(f"{tid}-[0-9]*.txt"), None)):
+        rfile = RESULTS_DIR / f"{tid}.txt"
+        if not rfile.exists():
+            RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+            rfile.write_text("[no-send] relay redelivery of already-handled task\n")
+        _log(f"dedup: {tid} already handled — not re-queued")
+        return tid
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
     lines = []
     for f in _TASK_FIELDS:
