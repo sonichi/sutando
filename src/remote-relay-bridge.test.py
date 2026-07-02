@@ -263,6 +263,17 @@ def main() -> int:
           "redelivery of core-archived task not re-queued (id returned for ack)")
     check((rtc.RESULTS_DIR / "task-DONE1.txt").read_text().startswith("[no-send]"),
           "dedup drops a [no-send] result for the drain to re-ack")
+    # month-partitioned archive (tasks/archive/YYYY-MM/<id>.txt) — the active
+    # layout per src/task-bridge.ts. A redelivery whose original was archived
+    # here must ALSO dedup, not fall through and reprocess. Regression for the
+    # flat-only archive probe (PR #1896 review).
+    (rtc.TASKS_DIR / "archive" / "2026-07").mkdir(parents=True, exist_ok=True)
+    (rtc.TASKS_DIR / "archive" / "2026-07" / "task-MONTH.txt").write_text("handled")
+    check(rtc._write_task({**TASK, "id": "task-MONTH"}) == "task-MONTH"
+          and not (rtc.TASKS_DIR / "task-MONTH.txt").exists(),
+          "redelivery of month-partitioned-archived task not re-queued")
+    check((rtc.RESULTS_DIR / "task-MONTH.txt").read_text().startswith("[no-send]"),
+          "month-archive dedup drops a [no-send] result")
     rtc.ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     (rtc.ARCHIVE_RESULTS_DIR / "task-DONE2-1750000000.txt").write_text("sent")
     check(rtc._write_task({**TASK, "id": "task-DONE2"}) == "task-DONE2"

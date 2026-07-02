@@ -283,7 +283,16 @@ def _write_task(task: dict) -> str | None:
     # the task file, or the result was already delivered and archived, don't
     # re-queue — drop a [no-send] result instead so the normal result drain
     # re-acks it upstream and clears it from inflight.
-    if ((TASKS_DIR / "archive" / f"{tid}.txt").exists()
+    _task_archive = TASKS_DIR / "archive"
+    task_archived = (
+        # legacy flat layout: tasks/archive/<taskId>.txt
+        (_task_archive / f"{tid}.txt").exists()
+        # active month-partitioned layout: tasks/archive/YYYY-MM/<taskId>.txt
+        # (see src/task-bridge.ts). Glob one level of month subdirs for this
+        # exact task id — cheap (one stat per month dir, not a full tree walk).
+        or next(_task_archive.glob(f"*/{tid}.txt"), None) is not None
+    )
+    if (task_archived
             or (ARCHIVE_RESULTS_DIR / f"{tid}.txt").exists()
             or next(ARCHIVE_RESULTS_DIR.glob(f"{tid}-[0-9]*.txt"), None)):
         rfile = RESULTS_DIR / f"{tid}.txt"
