@@ -57,7 +57,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 import discord_config  # noqa: E402  — Sutando workspace-local discord config (#1147)
-from util_paths import channel_access_path, claude_home_path, shared_personal_path  # noqa: E402
+from util_paths import channel_access_path, claude_home_path, personal_path, shared_personal_path  # noqa: E402
 from task_priority import default_priority_for_source  # noqa: E402
 
 # Observability: emit channel.discord.<in|out> into the local obs spine
@@ -589,7 +589,14 @@ except Exception:
     pass
 
 try:
-    identity_file = REPO / "stand-identity.json"
+    # Resolve via the canonical per-host resolver (hosts/<host>/ → legacy
+    # machine-<host>/ → workspace root), same as agent-api/dashboard/event_log/
+    # conversation-server. Reading REPO/stand-identity.json directly only saw
+    # the workspace-root fallback, so a node whose identity lives in the per-host
+    # hosts/<host>/ location got empty LOCAL_MACHINE → with SUTANDO_TEAM_TIER_OWNER
+    # set, that silently drops ALL non-owner tasks (the failure the warning below
+    # describes).
+    identity_file = personal_path("stand-identity.json", workspace=REPO)
     if identity_file.exists():
         LOCAL_MACHINE = json.loads(identity_file.read_text()).get("machine", "")
 except Exception:
@@ -2281,6 +2288,11 @@ def _recover_orphan_sending_files() -> int:
     return recovered
 
 
+# Guards the once-only startup of the long-lived poll loops below. `on_ready`
+# re-fires on every gateway reconnect, so without this the loops accumulate.
+_poll_loops_started = False
+
+
 @client.event
 async def on_ready():
     print(f"Discord bridge ready: {client.user}")
@@ -2305,14 +2317,25 @@ async def on_ready():
     # does NOT replay `MESSAGE_CREATE` events that arrived during the
     # gap. See `_catchup_missed_dms` for the replay flow.
     client.loop.create_task(_catchup_missed_dms())
-    # Start polling loops
-    client.loop.create_task(poll_results())
-    client.loop.create_task(poll_progress())
-    client.loop.create_task(poll_approved())
-    client.loop.create_task(poll_proactive())
-    client.loop.create_task(poll_dm_fallback())
-    # Auto-mod LLM-judge flush timer (per-guild gate enforced inside flush)
-    client.loop.create_task(_mod_flush_timer_loop())
+    # Start polling loops EXACTLY ONCE. `on_ready` fires on every gateway
+    # reconnect (RESUME-expiry, network blip, Discord-side reconnect), not
+    # just first boot — so spawning these long-lived `while True` loops here
+    # unguarded leaks a new copy of each on every reconnect. With N reconnects
+    # there are N+1 `poll_progress` loops, each independently posting its own
+    # "⏳ working…" placeholder for the same task → many duplicate placeholders,
+    # growing the longer the bridge runs. (poll_results / poll_proactive / etc.
+    # duplicate the same way — latent duplicate-delivery risk.) The catch-up
+    # above intentionally runs per-reconnect; these singletons must not.
+    global _poll_loops_started
+    if not _poll_loops_started:
+        _poll_loops_started = True
+        client.loop.create_task(poll_results())
+        client.loop.create_task(poll_progress())
+        client.loop.create_task(poll_approved())
+        client.loop.create_task(poll_proactive())
+        client.loop.create_task(poll_dm_fallback())
+        # Auto-mod LLM-judge flush timer (per-guild gate enforced inside flush)
+        client.loop.create_task(_mod_flush_timer_loop())
 
 
 def _message_mentions_bot(message):
@@ -3175,7 +3198,11 @@ async def _handle_discord_message(message, force=False):
     _notify_py = _claude_config / "skills/task-progress/scripts/notify.py"
     _transcribe_py = _claude_config / "skills/audio-transcribe/scripts/transcribe.py"
     discord_skill_hints = ""
-    if access_tier == "owner" and (_notify_py.exists() or _transcribe_py.exists()):
+    # CONTEXT-FIRST is a correctness feature (reconstruct before interpreting) and
+    # must NOT be gated on unrelated skills (task-progress / audio-transcribe) being
+    # installed — emit for every owner task. notify/transcribe steps stay conditional
+    # within. (Mirrors telegram-bridge; ungated 2026-06-25 per owner.)
+    if access_tier == "owner":
         channel_id_str = str(message.channel.id)
         has_audio = "[File attached:" in attachment_note and any(
             attachment_note.lower().find(ext) != -1
@@ -3183,6 +3210,21 @@ async def _handle_discord_message(message, force=False):
         )
         lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
         step = 1
+        # Context-first: a terse or threaded reply ("no", "continue", a pronoun)
+        # loses its referent when interpreted against a stale/compacted session
+        # context. Reconstruct from the durable channel BEFORE interpreting —
+        # keyed on the message not being self-contained (the agent's own judgment,
+        # not a parent_message_id gate), following the reply chain back, no
+        # arbitrary message count. Root-cause fix 2026-06-25.
+        lines.append(
+            f'{step}. CONTEXT-FIRST: if this message is not self-contained (terse, a reply, '
+            f'or refers to something not stated here), reconstruct the relevant context '
+            f'BEFORE interpreting — `python3 src/discord-read.py {channel_id_str}` — and '
+            f'read the thread (everyone\'s messages including your own prior replies) back '
+            f'until it stands on its own, then answer from the reconstructed thread, not '
+            f'from memory.'
+        )
+        step += 1
         if _notify_py.exists():
             notify_cmd = (
                 f"python3 {_notify_py}"
@@ -3200,22 +3242,37 @@ async def _handle_discord_message(message, force=False):
         lines.append(f"{step}. Process transcript and write result to results/{task_id}.txt")
         discord_skill_hints = "\n" + "\n".join(lines) + "\n"
 
-    task_file.write_text(
-        f"id: {task_id}\n"
-        f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
-        f"task: {user_task_text}\n"
-        f"source: discord\n"
-        f"channel_id: {message.channel.id}\n"
-        f"channel_name: {channel_name}\n"
-        f"guild_name: {guild_name}\n"
-        f"source_message_id: {message.id}\n"
-        f"{parent_msg_line}"
-        f"user_id: {message.author.id}\n"
-        f"access_tier: {access_tier}\n"
-        f"priority: {priority}\n"
-        f"{tier_instructions.get(access_tier, tier_instructions['other'])}"
-        f"{discord_skill_hints}"
-    )
+    # Instrumentation (2026-06-23): make a silent "message received but no task
+    # written" drop diagnosable. The owner saw several messages vanish with no
+    # task file and no error; every early `return` above already logs, so the
+    # gap is here at the write (an exception in the f-string build or write_text
+    # would otherwise lose the message with no trace). Log the outcome either way
+    # — a future drop now self-diagnoses: absence of BOTH this line and an
+    # early-return log pinpoints a new path; a FAILED line pinpoints the write.
+    try:
+        task_file.write_text(
+            f"id: {task_id}\n"
+            f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
+            f"task: {user_task_text}\n"
+            f"source: discord\n"
+            f"channel_id: {message.channel.id}\n"
+            f"channel_name: {channel_name}\n"
+            f"guild_name: {guild_name}\n"
+            f"source_message_id: {message.id}\n"
+            f"{parent_msg_line}"
+            f"user_id: {message.author.id}\n"
+            f"access_tier: {access_tier}\n"
+            f"priority: {priority}\n"
+            f"{tier_instructions.get(access_tier, tier_instructions['other'])}"
+            f"{discord_skill_hints}"
+        )
+    except Exception as _tw_exc:
+        print(f"  [task-write] FAILED for @{username} in #{channel_name} "
+              f"(tier={access_tier}, msg={message.id}): "
+              f"{type(_tw_exc).__name__}: {_tw_exc}", flush=True)
+        return
+    print(f"  [task-write] wrote {task_file.name} "
+          f"(@{username}, #{channel_name}, tier={access_tier})", flush=True)
     pending_replies[task_id] = message.channel
     pending_task_tiers[task_id] = access_tier
     # Observability: one inbound accepted-message event.

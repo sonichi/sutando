@@ -37,7 +37,7 @@ export SUTANDO_ROOT="$REPO"
 # L~449 discord, L~473 slack) probe `${CLAUDE_CONFIG_DIR:-$HOME/.claude}` and
 # fall back to legacy `~/.claude/` when the env var is unset — meaning bridges
 # read tokens / access lists from the pre-migration location even after a
-# successful `claude-sutando --migrate`. Mirrors scripts/start-cli.sh:38-51
+# successful `claude-sutando --migrate`. Mirrors src/agent/claude/cli/start-cli.sh
 # (Sutando.app's tmux-wrapped CLI launcher) — same machine-spawn pattern.
 #
 # Defense in depth (matches start-cli):
@@ -48,6 +48,12 @@ if [ -x "$REPO/scripts/sutando-config.sh" ]; then
   _ccd_err="$(mktemp -t startup-ccd.XXXXXX)"
   if _ccd="$(bash "$REPO/scripts/sutando-config.sh" claude-sutando-config-dir 2>"$_ccd_err")"; then
     mkdir -p "$_ccd"
+    # NOTE: the claude core-agent launcher + the `claude-sutando` config-dir
+    # onboarding alias now live under src/agent/claude/ (start-cli.sh /
+    # sutando-shell-setup.sh). This credentials seed stays INLINE here by design:
+    # it must run in the same startup env (exports CLAUDE_CONFIG_DIR for the
+    # bridges below), not in a separately-execed launcher. See
+    # src/agent/claude/README.md for the full auth/onboarding map.
     # Auth-carry (v0.8 cold-start fix). Seed credentials + onboarding state from
     # $HOME/.claude/ so a cold `claude` core doesn't dead-end at the login wall
     # (.credentials.json) or trust-folder prompt (.claude.json) before reaching
@@ -463,8 +469,8 @@ fi
 # per-host sentinel at $WORKSPACE/state/.shell-setup-prompted-<hostname> so
 # this never re-pesters after the user's initial yes/no.
 # Failures are non-fatal — startup.sh continues regardless.
-if [ -x "$REPO/scripts/sutando-shell-setup.sh" ]; then
-  bash "$REPO/scripts/sutando-shell-setup.sh" --auto || true
+if [ -x "$REPO/src/agent/claude/cli/sutando-shell-setup.sh" ]; then
+  bash "$REPO/src/agent/claude/cli/sutando-shell-setup.sh" --auto || true
 fi
 
 # Reap any stale watch-tasks-stream watcher from a prior session. The
@@ -512,7 +518,29 @@ else
   echo "  ✓ core heartbeat (already running)"
 fi
 
-# 0. Credential proxy for quota tracking (port 7846)
+# 0. Credential proxy for quota tracking (port 7846).
+# Prefer the launchd-supervised job (KeepAlive + ThrottleInterval=10s) so the
+# proxy restarts on crash instead of leaving a proxy-routed core stranded on a
+# dead port (#1086 / #1291). The wrapper evicts any stale manual holder of 7846
+# before binding, so this composes with the legacy bare-& launch below. Falls
+# back to that legacy launch on older checkouts that lack the launchd template,
+# or if the install fails for any reason.
+_PROXY_LABEL="com.sutando.credential-proxy"
+_PROXY_INSTALLER="$REPO/src/install-credential-proxy-launchd.sh"
+if [ -f "$_PROXY_INSTALLER" ] && [ -f "$REPO/src/launchd/$_PROXY_LABEL.plist" ]; then
+  if launchctl print "gui/$(id -u)/$_PROXY_LABEL" > /dev/null 2>&1; then
+    echo "  ✓ credential proxy (launchd-supervised, already loaded)"
+  else
+    echo "  Installing launchd-supervised credential proxy..."
+    if bash "$_PROXY_INSTALLER" install > /dev/null 2>&1; then
+      # Wait for the supervised proxy to bind before the legacy-launch guard.
+      for _ in $(seq 1 10); do lsof -i :7846 > /dev/null 2>&1 && break; sleep 0.5; done
+      echo "  ✓ credential proxy (launchd-supervised)"
+    else
+      echo "  ⚠ launchd install failed — falling back to legacy launch"
+    fi
+  fi
+fi
 if ! lsof -i :7846 > /dev/null 2>&1; then
   echo "  Starting credential proxy (port 7846)..."
   npx tsx "$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)" > /tmp/credential-proxy.log 2>&1 &
@@ -940,9 +968,9 @@ done
 echo ""
 open "http://localhost:8080"
 
-# Delegate to scripts/start-cli.sh — canonical sutando-core launch command.
-# Single source of truth so Sutando.app's Restart Core menu can invoke the
-# same launch path without duplicating the tmux + claude flags.
+# Delegate to src/agent/claude/cli/start-cli.sh — canonical sutando-core launch
+# command. Single source of truth so Sutando.app's Restart Core menu can invoke
+# the same launch path without duplicating the tmux + claude flags.
 #
 # Restore stdout/stderr to the terminal first when the operator is
 # interactive: the tee-redirect at the top of this script makes fd 1 a PIPE,
@@ -955,4 +983,4 @@ open "http://localhost:8080"
 if [ -t 0 ]; then
     exec >/dev/tty 2>&1
 fi
-exec bash "$REPO/scripts/start-cli.sh"
+exec bash "$REPO/src/agent/claude/cli/start-cli.sh"

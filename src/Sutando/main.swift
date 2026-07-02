@@ -14,6 +14,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var hotKeyRefs: [EventHotKeyRef?] = []  // one entry per registered hotkey
     var hotKeyActions: [UInt32: String] = [:]  // hotkey id → action name
     var lastDropTime: Date = .distantPast
+    var isRecordingVideo: Bool = false  // ⌃R start/stop toggle state
+    var videoClipMenuItem: NSMenuItem?  // menu row that shows 🔴 while recording
     var screencaptureInFlight: Bool = false  // guards against stacked crosshair launches
     // Runtime state lives under the per-user workspace dir, not the repo
     // checkout. **Delegates to SutandoConfig.resolveWorkspace()** as of the
@@ -212,6 +214,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Menu Bar
 
+    /// Recording indicator on the Drop Video Clip MENU ROW (Susan 2026-07-02
+    /// asked for the indicator on this exact row, not elsewhere): while
+    /// recording, the row reads "🔴 Drop Video Clip — recording…"; back to the
+    /// plain label once stopped. The toggle notifications alone weren't
+    /// enough — a missed notification left no way to tell whether the
+    /// recorder was still rolling.
+    func setRecordingIndicator(_ on: Bool) {
+        DispatchQueue.main.async {
+            guard let item = self.videoClipMenuItem else { return }
+            let glyph = (item.representedObject as? String) ?? ""
+            // Same leading-marker convention as the Mode rows (● = active):
+            // the Drop Video Clip row itself says whether the recorder rolls.
+            item.title = on ? "🔴 Drop Video Clip — recording… \(glyph)"
+                            : "Drop Video Clip \(glyph)"
+        }
+    }
+
     func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem.button {
@@ -233,13 +252,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let actionToSelector: [String: (String, Selector)] = [
             "drop_context":    ("Drop Context",    #selector(dropContext)),
             "drop_screenshot": ("Drop Screenshot", #selector(dropScreenshot)),
+            "drop_video_clip": ("Drop Video Clip", #selector(dropVideoClip)),
             "toggle_voice":    ("Toggle Voice",    #selector(toggleVoice)),
             "toggle_mute":     ("Toggle Mute",     #selector(toggleMute)),
         ]
         for hk in hotkeys {
             guard let (label, sel) = actionToSelector[hk.action] else { continue }
             let glyph = displayLabel(key: hk.key, modifiers: hk.modifiers)
-            menu.addItem(NSMenuItem(title: "\(label) (\(glyph))", action: sel, keyEquivalent: ""))
+            let item = NSMenuItem(title: "\(label) (\(glyph))", action: sel, keyEquivalent: "")
+            if hk.action == "drop_video_clip" {
+                // Recording indicator lives ON this row (Susan 2026-07-02
+                // on this exact row): stash the hotkey glyph so
+                // setRecordingIndicator can rebuild both title states.
+                item.representedObject = "(\(glyph))"
+                videoClipMenuItem = item
+            }
+            menu.addItem(item)
         }
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Open Web UI", action: #selector(openWebUI), keyEquivalent: ""))
@@ -526,7 +554,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // the watcherKeystrokesQueued() check above + the Timer interval.)
 
         // If Claude Code is running inside the `sutando-core` tmux session
-        // (launch via scripts/start-cli.sh), send the word `watcher` to
+        // (launch via src/agent/claude/cli/start-cli.sh), send the word `watcher` to
         // its pane as if Chi typed it. The CLI parses that as a restart
         // prompt and starts the watcher via its own run_in_background Bash
         // — so the watcher's stdout routes through the task-notification
@@ -540,7 +568,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Fallback: Claude Code isn't in the expected tmux session.
         // Notify so Chi can restart manually.
-        notify("Sutando", "Task watcher is down — prompt the CLI to restart it (or start CLI via scripts/start-cli.sh)")
+        notify("Sutando", "Task watcher is down — prompt the CLI to restart it (or start CLI via src/agent/claude/cli/start-cli.sh)")
         logToFile("watcher dead; notification fired (tmux session not found)")
     }
 
@@ -1087,8 +1115,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Default hotkey config used when ~/.config/sutando/hotkeys.json is missing.
     /// Keys: action name → (key letter, modifier names).
     private static let defaultHotkeys: [(action: String, key: String, modifiers: [String])] = [
-        ("drop_context",     "C", ["control"]),
+        // ⌃C / ⌃R avoided: they shadow terminal SIGINT and reverse-i-search.
+        // Use ⌃⇧C / ⌃⇧R so plain ⌃C/⌃R still reach the terminal (global
+        // hotkeys match the exact modifier mask, so the shifted variants
+        // never swallow the unshifted keys).
+        ("drop_context",     "C", ["control", "shift"]),
         ("drop_screenshot",  "S", ["control"]),
+        ("drop_video_clip",  "R", ["control", "shift"]),
         ("toggle_voice",     "V", ["control"]),
         ("toggle_mute",      "M", ["control"]),
     ]
@@ -1187,6 +1220,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             switch action {
             case "drop_context":    appDelegate.dropContext()
             case "drop_screenshot": appDelegate.dropScreenshot()
+            case "drop_video_clip": appDelegate.dropVideoClip()
             case "toggle_voice":    appDelegate.toggleVoice()
             case "toggle_mute":     appDelegate.toggleMute()
             default: break
@@ -1611,6 +1645,86 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             appendLog(logFile, "[\(timestamp)] dropScreenshot: \(path)")
             writeTask(tasksDir, timestamp: timestamp, content: content)
             notify("Sutando", "Screenshot dropped (\(URL(fileURLWithPath: path).lastPathComponent))")
+        }.resume()
+    }
+
+    @objc func dropVideoClip() {
+        // Records a few seconds of screen and drops the .mov as a task — a short
+        // video repro is far easier to act on than a single still. Mirrors
+        // dropScreenshot but hits /capture-video, which runs `screencapture -v`
+        // on the capture server that holds the Screen Recording permission.
+        let now = Date()
+        if now.timeIntervalSince(lastDropTime) < 1.0 {
+            logToFile("dropVideoClip: debounced (too fast)")
+            return
+        }
+        lastDropTime = now
+
+        let timestamp = ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withFullDate, .withTime, .withSpaceBetweenDateAndTime, .withColonSeparatorInTime])
+        let logFile = workspace + "/logs/context-drop.log"
+        let tasksDir = workspace + "/tasks"
+
+        // Toggle: first ⌃R starts an open-ended recording, second ⌃R stops it and
+        // drops the .mov. User-controlled length beats a fixed duration.
+        let starting = !isRecordingVideo
+        let action = starting ? "start" : "stop"
+        notify("Sutando", starting ? "● Recording screen + mic — press ⌃⇧R again to stop" : "Stopping recording…")
+
+        guard let url = URL(string: "http://localhost:7845/capture-video?action=\(action)") else { return }
+        var req = URLRequest(url: url)
+        // /capture-video requires a shared token (the server writes it to a 0600
+        // file a web page can't read; a browser also can't set a custom header on
+        // a no-cors/<img> request — so this gate blocks drive-by triggering).
+        let tokenPath = NSString(string: "~/.config/sutando/screen-capture-token").expandingTildeInPath
+        if let token = try? String(contentsOfFile: tokenPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty {
+            req.setValue(token, forHTTPHeaderField: "X-Sutando-Capture-Token")
+        }
+        // start returns at once; stop waits for the encoder flush — allow headroom.
+        req.timeoutInterval = 60
+        URLSession.shared.dataTask(with: req) { [self] data, _, error in
+            if let error = error {
+                notify("Sutando", "Video \(action) failed: \(error.localizedDescription)")
+                appendLog(logFile, "[\(timestamp)] dropVideoClip(\(action)): error \(error.localizedDescription)")
+                return
+            }
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let status = json["status"] as? String else {
+                notify("Sutando", "Video \(action) failed: bad server response")
+                appendLog(logFile, "[\(timestamp)] dropVideoClip(\(action)): bad server response")
+                return
+            }
+
+            if starting {
+                // Recording began — flip state; nothing to drop until stop.
+                if status == "recording" || status == "already_recording" {
+                    isRecordingVideo = true
+                    setRecordingIndicator(true)
+                    appendLog(logFile, "[\(timestamp)] dropVideoClip: recording started")
+                } else {
+                    notify("Sutando", "Couldn't start recording (\(status))")
+                }
+                return
+            }
+
+            // Stopping — flip state and drop the produced clip.
+            isRecordingVideo = false
+            setRecordingIndicator(false)
+            guard status == "ok", let path = json["path"] as? String else {
+                notify("Sutando", "Recording stopped, no clip (\(status))")
+                appendLog(logFile, "[\(timestamp)] dropVideoClip(stop): \(status)")
+                return
+            }
+            let content = """
+            timestamp: \(timestamp)
+            type: video
+            path: \(path)
+            ---
+            [Video clip dropped]
+            """
+            appendLog(logFile, "[\(timestamp)] dropVideoClip: \(path)")
+            writeTask(tasksDir, timestamp: timestamp, content: content)
+            notify("Sutando", "Video clip dropped (\(URL(fileURLWithPath: path).lastPathComponent))")
         }.resume()
     }
 
@@ -2248,7 +2362,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Restart the Claude Code core session (sutando-core tmux session).
-    /// Invokes scripts/start-cli.sh --restart which kills any existing
+    /// Invokes src/agent/claude/cli/start-cli.sh --restart which kills any existing
     /// session and starts fresh detached. User can re-attach via
     /// "Open Core CLI" in the menu (or `tmux -S /tmp/sutando-tmux.sock
     /// attach -t sutando-core` from a terminal).
@@ -2265,7 +2379,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// this only restarts the Claude Code CLI session.
     @objc func restartCore() {
         notify("Sutando", "Restarting Core CLI…")
-        let script = repoRoot + "/scripts/start-cli.sh"
+        let script = repoRoot + "/src/agent/claude/cli/start-cli.sh"
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
         proc.arguments = [script, "--restart"]

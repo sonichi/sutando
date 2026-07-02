@@ -633,45 +633,59 @@ const mainAgent: MainAgent = {
 		'Named after Stands from JoJo\'s Bizarre Adventure — a personal spirit that fights for you.',
 		'Every Sutando evolves differently based on what its user needs. You earned your name and identity.',
 		(() => { try { const si = JSON.parse(readFileSync(personalPath('stand-identity.json'), 'utf-8')); return si.name ? `Your Stand name is ${si.name}. Origin: ${si.nameOrigin || 'earned through use'}. When asked your name or who you are, say "I\'m Sutando — ${si.name}."` : ''; } catch { return ''; } })(),
-		// Optional context file — for presentations, meeting prep, etc. (gitignored)
-		// Reads $SUTANDO_MEMORY_DIR/voice-contexts/<active>.txt where <active> is
-		// the trimmed contents of $SUTANDO_MEMORY_DIR/voice-contexts/active
-		// (legacy $SUTANDO_PRIVATE_DIR honored via memoryDirEnv()).
-		// Falls back to public-repo voice-context.txt when the env var is unset
-		// or the pointer/file is missing. Switcher tool: set_voice_context(name)
-		// from skills/personal-voice-context/ writes the pointer.
+		// Optional context file — a per-talk script for presentations, meeting prep,
+		// teaching, etc. (gitignored). Voice contexts are NOT memory, so they no
+		// longer live under $SUTANDO_MEMORY_DIR — only core memory does (Chi
+		// 2026-06-29: "only memories should live there"). New canonical layout:
+		//   content (fleet-shared): <workspace>/voice-contexts/<name>.txt
+		//   active pointer (per-host): <workspace>/hosts/<host>/voice-context-active
+		// The memory-dir location ($SUTANDO_MEMORY_DIR/voice-contexts/) is kept as
+		// a READ-ONLY legacy fallback during the transition (~30 days), so existing
+		// installs keep loading until writers (set_voice_context, deep-research-qa)
+		// migrate. Public-repo voice-context.txt is the final fallback. Switcher:
+		// set_voice_context(name) from skills/personal-voice-context/.
 		(() => {
-			// Log which voice-context file was loaded so the operator can see at
-			// a glance whether the dynamic loader picked up the memory dir or
-			// fell through to the public fallback. Silent loads are hard to
-			// debug — Apr 29 spent 30+ minutes diff'ing files because the load
-			// path was opaque.
-			try {
-				const privateRoot = memoryDirEnv();
-				if (privateRoot) {
-					const root = privateRoot.replace(/^~/, process.env.HOME || '');
-					const pointerPath = join(root, 'voice-contexts', 'active');
-					const name = readFileSync(pointerPath, 'utf-8').trim();
-					// Whitelist the pointer content to a safe basename. Reject any
-					// path-like input — `../../foo` could otherwise escape the
-					// voice-contexts/ dir via join() and load arbitrary `.txt`
-					// content into the system prompt.
-					if (name && /^[A-Za-z0-9._-]+$/.test(name)) {
-						const ctxPath = join(root, 'voice-contexts', `${name}.txt`);
+			const SAFE = /^[A-Za-z0-9._-]+$/;
+			const memRoot = (() => {
+				const m = memoryDirEnv();
+				return m ? m.replace(/^~/, process.env.HOME || '') : '';
+			})();
+			// Resolve the active-context NAME: per-host workspace pointer (canonical,
+			// via personalPath which probes <ws>/hosts/<host>/ first), then the legacy
+			// SHARED memory-dir pointer as a transition fallback.
+			const pointerCandidates = [personalPath('voice-context-active')];
+			if (memRoot) pointerCandidates.push(join(memRoot, 'voice-contexts', 'active'));
+			let name = '';
+			for (const p of pointerCandidates) {
+				try {
+					const n = readFileSync(p, 'utf-8').trim();
+					if (n) { name = n; break; }
+				} catch {}
+			}
+			// Whitelist the pointer content to a safe basename. Reject any path-like
+			// input — `../../foo` could otherwise escape the voice-contexts/ dir via
+			// join() and load arbitrary `.txt` content into the system prompt.
+			if (name && SAFE.test(name)) {
+				// Resolve CONTENT: fleet-shared workspace dir (canonical), then the
+				// legacy memory-dir as a read-only fallback.
+				const contentCandidates = [join(WORKSPACE_DIR, 'voice-contexts', `${name}.txt`)];
+				if (memRoot) contentCandidates.push(join(memRoot, 'voice-contexts', `${name}.txt`));
+				for (const ctxPath of contentCandidates) {
+					try {
 						const content = readFileSync(ctxPath, 'utf-8');
 						const byteLen = Buffer.byteLength(content, 'utf-8');
 						console.log(`${ts()} [voice-context] loaded ${content.length} chars / ${byteLen} bytes from ${ctxPath}`);
 						return content;
-					}
+					} catch {}
 				}
-			} catch {}
+			}
 			try {
 				const content = readFileSync('voice-context.txt', 'utf-8');
 				const byteLen = Buffer.byteLength(content, 'utf-8');
 				console.log(`${ts()} [voice-context] loaded ${content.length} chars / ${byteLen} bytes from voice-context.txt (fallback)`);
 				return content;
 			} catch {
-				console.log(`${ts()} [voice-context] no context loaded (no env, no pointer, no fallback file)`);
+				console.log(`${ts()} [voice-context] no context loaded (no pointer, no fallback file)`);
 				return '';
 			}
 		})(),
@@ -739,6 +753,7 @@ const mainAgent: MainAgent = {
 		'- PRESENTER MODE: Call switch_mode("presenter") when user says "presenter mode on", "going live", "starting the talk", "the talk starts", or "I am on stage". Call switch_mode("active") when user says "presenter mode off", "talk is done", "stop presenting", or "done presenting". Do NOT route these phrases to work — they are direct tool triggers. switch_mode("presenter") returns a "say" field; speak it verbatim as your FIRST utterance.',
 		'- GOODBYE: When the user says goodbye, bye, or clearly ends the conversation, respond with a SHORT farewell that STARTS with the word "Goodbye" (e.g. "Goodbye! Talk to you later."). Keep it under one sentence. The session will close automatically. Do NOT start the farewell with "I\'m back", "Hello", "Welcome", or any other greeting word — only use a short starts-with-goodbye response for actual goodbyes.',
 		'- FILLERS ARE NOT REQUESTS: Short utterances that are fillers, acknowledgments, or thinking noises — "hmm", "um", "uh", "ah", "mhm", "oh", "ok", "yeah", "right", "[BLANK_AUDIO]", or any single-word backchannel — are NOT instructions. Do NOT call work, do NOT say "queued up" or "working on it", do NOT narrate. Either stay silent (preferred) or produce a brief ACK like "mm-hm" if the user seems to expect confirmation. Only act when the user issues a clear directive or question.',
+		'- LOW-CONFIDENCE WAKE-WORD / NO REQUEST: If you are NOT fully confident you heard your name (noisy audio, ambient speech that might just sound like "Sutando"), OR you heard your name clearly but the utterance is JUST a presence check with no actual ask ("are you there?", "hello?", standalone "Sutando", "hey Sutando"), respond with ONE short syllable — "mm?" or "yes?" — NOT a multi-sentence greeting. Do NOT say "Hey, I\'m right here. What can I do for you?" or any variation of "I\'m here, what\'s up". Save the full greeting for cases where the user clearly addressed you AND attached a real request or question. A wrong short ack is cheap; a wrong long greeting is annoying.',
 		'- NEVER pretend you called a tool. NEVER say "done" without actually calling work.',
 		'- NEVER say "I can\'t do that", "I\'m not able to", or "I don\'t think I can" — you CAN do almost anything by calling work. If you\'re unsure, call work and let the core agent handle it. The core agent has full system access. Your job is to relay requests, not gatekeep them.',
 		'- For SIMPLE actions (press enter, clear input, select all), use press_key or type_text — do NOT use work for keystrokes.',
