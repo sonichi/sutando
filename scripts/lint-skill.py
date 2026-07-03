@@ -18,10 +18,28 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
+
+def _repo_root() -> Path:
+    """Repo root — NOT the workspace. Resolves via git (the sanctioned method,
+    matching scripts/lint-workspace-resolution.sh) rather than a __file__
+    parent-walk; falls back to the script's grandparent only if git is absent."""
+    try:
+        top = subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=Path(__file__).resolve().parent,
+            text=True, stderr=subprocess.DEVNULL).strip()
+        if top:
+            return Path(top)
+    except Exception:  # noqa: BLE001 — git missing / not a repo → fall back
+        pass
+    return Path(__file__).resolve().parents[1]
+
+
+REPO = _repo_root()
 SEMVER = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 STABILITY = {"stable", "experimental", "deprecated"}
