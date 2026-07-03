@@ -1,4 +1,4 @@
-# Remote relay protocol
+# Remote gateway protocol
 
 `src/remote-gateway-bridge.py` lets a remote HTTP server dispatch tasks to a local
 Sutando instance and collect the results — turning Sutando into a remotely
@@ -84,9 +84,36 @@ body: {
   "provider": "<REMOTE_TASK_PROVIDER>",
   "tier": "<REMOTE_TASK_TIER>",
   "inflight": <int>,            // tasks currently claimed but not yet resulted
-  "capabilities": ["task-ack", "heartbeat", "result-skip-markers"]
+  "capabilities": ["task-ack", "heartbeat", "result-skip-markers", "core-status"]
 }
 ```
+
+## Media markers (optional)
+
+Instead of raw bytes, a gateway may hand the task body a media marker:
+
+    [<tag>: <url> mime=<mime> name=<filename> size=<bytes> kind=<msgtype>] <caption>
+
+The client resolves it locally: downloads the bytes (default 25 MB cap) and
+rewrites the marker to `[File attached: <local path>]` (`[Photo attached: …]`
+for `kind=m.image`) — the same inbound convention the other bridges use. Any
+failure leaves the marker untouched.
+
+Config: `REMOTE_MEDIA_MARKER` (tag, default `remote-media`),
+`REMOTE_MEDIA_HS_TOKEN` + `REMOTE_MEDIA_HS_ORIGIN` (homeserver bearer and the
+exact origin it may be sent to), `REMOTE_MEDIA_DIR`, `REMOTE_MEDIA_MAX_BYTES`.
+
+Credential routing is by parsed exact origin, never string matching:
+
+- gateway bearer → only when the URL's scheme/host/port equal the gateway's
+  AND the path sits at/under the gateway base path with a `/` boundary;
+- homeserver bearer → only for `/_matrix/` paths on exactly
+  `REMOTE_MEDIA_HS_ORIGIN` (legacy media routes are upgraded to the MSC3916
+  authenticated route first); unset origin ⇒ Matrix media is never credentialed;
+- anything else → fetched with no credentials.
+
+Authenticated fetches refuse redirects (a 3xx is a failure), so a
+gateway-controlled URL can never bounce a bearer to another host.
 
 ## Delivery + idempotency
 

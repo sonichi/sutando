@@ -34,7 +34,7 @@ def check(cond: bool, msg: str) -> None:
 # ── mock gateway ────────────────────────────────────────────────────────────
 STATE = {"tasks_served": 0, "results": [], "acks": [], "heartbeats": [],
          "auth_seen": [], "force_401": False, "force_ack_404": False,
-         "force_heartbeat_404": False}
+         "force_heartbeat_404": False, "force_media_redirect": False}
 TASK = {"id": "task-MOCK1", "timestamp": "2026-05-23T00:00:00Z",
         "task": "hello from gateway", "source": "remote-gateway",
         "channel_id": "!room:example.org", "user_id": "@qingyun:example.org",
@@ -55,6 +55,12 @@ class Handler(BaseHTTPRequestHandler):
         if not self._auth_ok():
             return
         # first poll returns the task; later polls return empty
+        if self.path.startswith("/media/redir"):
+            if STATE["force_media_redirect"]:
+                self.send_response(302)
+                self.send_header("Location", "http://evil.example/steal")
+                self.end_headers(); return
+            self.send_response(200); self.end_headers(); self.wfile.write(b"OK"); return
         if self.path.startswith("/v1/tasks"):
             tasks = [TASK] if STATE["tasks_served"] == 0 else []
             STATE["tasks_served"] += 1
@@ -353,6 +359,60 @@ def main() -> int:
     body4 = rtc._maybe_fetch_media(
         f"[{rtc.MEDIA_MARKER_TAG}: {os.environ['REMOTE_TASK_URL']}/media/dead name=d.bin]")
     check(f"[{rtc.MEDIA_MARKER_TAG}:" in body4, "failed media fetch leaves marker untouched")
+    rtc._download_bytes = real_download
+
+    # 6b. credential ROUTING is exact-origin, never prefix/substring
+    #     (review 2026-07-03: lookalike hosts must not receive bearers)
+    fetched.clear()
+    rtc._download_bytes = lambda url, headers, cap: (fetched.append((url, dict(headers))) or b"X")
+    gw = os.environ["REMOTE_TASK_URL"]  # http://127.0.0.1:<port>
+    rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: http://127.0.0.1.evil.example/media/p name=a.bin]")
+    check(bool(fetched) and "Authorization" not in fetched[-1][1],
+          "lookalike gateway host gets NO credentials")
+    rtc.URL = "http://127.0.0.1:9/relay"
+    rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: http://127.0.0.1:9/relay-evil/p name=a.bin]")
+    check("Authorization" not in fetched[-1][1],
+          "gateway base-path boundary enforced (/relay-evil gets no bearer)")
+    rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: http://127.0.0.1:9/relay/media/p name=a.bin]")
+    check(fetched[-1][1].get("Authorization") == "Bearer testtoken",
+          "true gateway-hosted path still gets the gateway bearer")
+    rtc.URL = gw
+    rtc.HS_MEDIA_TOKEN = "syt_hs"
+    rtc.HS_MEDIA_ORIGIN = "https://hs.good.example"
+    n = len(fetched)
+    b = rtc._maybe_fetch_media(
+        f"[{rtc.MEDIA_MARKER_TAG}: https://evil.example/_matrix/media/v3/download/hs/id name=a.png]")
+    check(f"[{rtc.MEDIA_MARKER_TAG}:" in b and len(fetched) == n,
+          "foreign matrix host: HS bearer NOT sent, marker untouched")
+    b = rtc._maybe_fetch_media(
+        f"[{rtc.MEDIA_MARKER_TAG}: https://hs.good.example/_matrix/media/v3/download/hs/id "
+        "mime=image/png name=ok.png]")
+    check("/_matrix/client/v1/media/download/" in fetched[-1][0]
+          and fetched[-1][1].get("Authorization") == "Bearer syt_hs"
+          and "[File attached: " in b,
+          "matrix happy path: MSC3916 upgrade + HS bearer on the exact origin")
+    rtc.HS_MEDIA_TOKEN = ""
+    rtc.HS_MEDIA_ORIGIN = ""
+    rtc._download_bytes = real_download
+
+    # 6c. authed fetch: a real HTTP 302 is refused end-to-end
+    STATE["force_media_redirect"] = True
+    try:
+        rtc._download_bytes(f"{gw}/media/redir", {"Authorization": "Bearer x",
+                                                  "User-Agent": "t"}, 100)
+        check(False, "authed fetch raises on a real 302")
+    except Exception:
+        check(True, "authed fetch raises on a real 302")
+    STATE["force_media_redirect"] = False
+
+    # 6d. same-name saves in the same instant get distinct files (mkstemp)
+    rtc._download_bytes = lambda url, headers, cap: b"A"
+    b1 = rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: {gw}/m name=dup.bin]")
+    b2 = rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: {gw}/m name=dup.bin]")
+    p1 = re.search(r"\[File attached: ([^\]]+)\]", b1).group(1)
+    p2 = re.search(r"\[File attached: ([^\]]+)\]", b2).group(1)
+    check(p1 != p2 and Path(p1).exists() and Path(p2).exists(),
+          "two same-name media saves get distinct files (no overwrite)")
     rtc._download_bytes = real_download
 
     # 7. owner-activity gate follows LOCAL_TIER, not the gateway's tier claim

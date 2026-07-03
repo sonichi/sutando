@@ -45,6 +45,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -145,6 +146,11 @@ MEDIA_MARKER_TAG = re.sub(r"[^A-Za-z0-9_-]", "",
                           os.environ.get("REMOTE_MEDIA_MARKER") or "remote-media")
 MEDIA_MARKER_RE = re.compile(r"\[" + re.escape(MEDIA_MARKER_TAG) + r":([^\]]*)\]")
 HS_MEDIA_TOKEN = os.environ.get("REMOTE_MEDIA_HS_TOKEN") or ""
+# The homeserver token is attached ONLY to media URLs on this exact origin
+# (scheme+host+port). Without it configured, Matrix media URLs are never
+# credentialed — a bare "/_matrix/" substring must not route a bearer to an
+# arbitrary host (review 2026-07-03).
+HS_MEDIA_ORIGIN = (os.environ.get("REMOTE_MEDIA_HS_ORIGIN") or "").rstrip("/")
 MEDIA_DIR = Path(os.environ.get("REMOTE_MEDIA_DIR") or str(WS / "data" / "remote-media"))
 MAX_MEDIA_BYTES = int(os.environ.get("REMOTE_MEDIA_MAX_BYTES") or str(25 * 1024 * 1024))
 _EXT_BY_MIME = {
@@ -320,11 +326,39 @@ def _to_authed_media_url(url: str) -> str:
                   "/_matrix/client/v1/media/download/", url, count=1)
 
 
+def _same_origin(url: str, base: str) -> bool:
+    """True iff `url` shares scheme+host+port with `base` (exact origin match —
+    parsed, never string-prefix: `https://relay.example.evil` must NOT match
+    a base of `https://relay.example`)."""
+    try:
+        u, b = urllib.parse.urlsplit(url), urllib.parse.urlsplit(base)
+    except ValueError:
+        return False
+    if not u.scheme or not u.hostname or u.scheme != b.scheme:
+        return False
+    default = {"https": 443, "http": 80}.get(u.scheme)
+    return (u.hostname.lower() == (b.hostname or "").lower()
+            and (u.port or default) == (b.port or default))
+
+
+def _under_gateway(url: str) -> bool:
+    """True iff `url` is genuinely gateway-hosted: exact gateway origin AND the
+    path sits at/under the gateway base path with a real `/` boundary (so a
+    base path of `/relay` doesn't match `/relay-evil/...`)."""
+    if not URL or not _same_origin(url, URL):
+        return False
+    base_path = urllib.parse.urlsplit(URL).path.rstrip("/")
+    path = urllib.parse.urlsplit(url).path
+    return path == base_path or path.startswith(base_path + "/")
+
+
 def _download_bytes(url: str, headers: dict, cap: int) -> bytes:
     """GET raw bytes with an explicit size cap (reads cap+1 then rejects if
     over, so a missing/lying Content-Length can't OOM us). When an
     Authorization header is present, redirects are NOT followed — a
-    gateway-controlled URL must not bounce our bearer to another host."""
+    gateway-controlled URL must not bounce our bearer to another host — and a
+    3xx is treated as a FAILURE (raise) so the redirect page's body is never
+    saved as if it were the media."""
     req = urllib.request.Request(url, method="GET")
     for k, v in headers.items():
         req.add_header(k, v)
@@ -337,6 +371,9 @@ def _download_bytes(url: str, headers: dict, cap: int) -> bytes:
     else:
         resp_ctx = urllib.request.urlopen(req, timeout=30)
     with resp_ctx as resp:
+        status = getattr(resp, "status", 200)
+        if 300 <= status < 400:
+            raise ValueError(f"authenticated media fetch got a redirect ({status})")
         data = resp.read(cap + 1)
     if len(data) > cap:
         raise ValueError(f"media exceeds {cap}-byte cap")
@@ -363,11 +400,16 @@ def _maybe_fetch_media(body: str) -> str:
     if not url.startswith(("https://", "http://")):
         return body
     headers = {"User-Agent": "sutando-gateway-client/1.0"}
-    if URL and url.startswith(URL):
+    # Credential routing is by PARSED exact origin, never string prefix or
+    # substring — `https://relay.example.evil/...` must not receive the
+    # gateway bearer, and a foreign host serving a `/_matrix/` path must not
+    # receive the homeserver bearer (review 2026-07-03).
+    url_path = urllib.parse.urlsplit(url).path
+    if _under_gateway(url):
         headers["Authorization"] = f"Bearer {TOKEN}"            # gateway media-proxy
-    elif "/_matrix/" in url:
-        if not HS_MEDIA_TOKEN:
-            return body                                          # can't auth — leave marker
+    elif url_path.startswith("/_matrix/"):
+        if not HS_MEDIA_TOKEN or not HS_MEDIA_ORIGIN or not _same_origin(url, HS_MEDIA_ORIGIN):
+            return body                    # can't auth safely — leave marker
         url = _to_authed_media_url(url)
         headers["Authorization"] = f"Bearer {HS_MEDIA_TOKEN}"
     # else: a plain public URL — fetched with no credentials.
@@ -385,14 +427,21 @@ def _maybe_fetch_media(body: str) -> str:
         safe = re.sub(r"[^A-Za-z0-9._-]", "_", name) or "attachment"
         if ext and safe.endswith(ext):
             safe = safe[: -len(ext)]
-        path = MEDIA_DIR / f"{int(time.time() * 1000)}-{safe}{ext}"
-        path.write_bytes(data)
+        # Exclusive create (mkstemp) — two same-name saves in the same
+        # millisecond must get distinct paths, never overwrite (review
+        # 2026-07-03).
+        fd, path_str = tempfile.mkstemp(prefix=f"{safe}-", suffix=ext, dir=MEDIA_DIR)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        path = Path(path_str)
     except Exception as e:  # noqa: BLE001
         _log(f"media save failed ({e}) — leaving marker as-is")
         return body
     _log(f"fetched media → {path} ({len(data)} bytes)")
     label = "Photo attached" if str(kind) == "m.image" else "File attached"
-    return MEDIA_MARKER_RE.sub(f"[{label}: {path}]", body, count=1)
+    # Replacement as a FUNCTION so backslashes/`\g<>` in the path can never be
+    # interpreted as re.sub group references.
+    return MEDIA_MARKER_RE.sub(lambda _m: f"[{label}: {path}]", body, count=1)
 
 
 def _write_owner_activity(task: dict) -> None:

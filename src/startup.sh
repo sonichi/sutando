@@ -801,7 +801,7 @@ else
   echo "  ~ telegram bridge (no token — optional)"
 fi
 
-# Remote relay bridge (optional channel — generic, same shape as the discord/
+# Remote gateway bridge (optional channel — generic, same shape as the discord/
 # telegram/slack blocks below). Config + token live in the channel .env, resolved
 # via the same claude-home-path helper; the bridge itself ships in src/ (provider-
 # neutral, like the others). Relay protocol: docs/remote-gateway-protocol.md.
@@ -820,9 +820,9 @@ if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channel
   export REMOTE_TASK_TOKEN REMOTE_TASK_TIER
   if ! pgrep -f "remote-gateway-bridge" > /dev/null 2>&1; then
     python3 "$REPO/src/remote-gateway-bridge.py" > "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
-    echo "  ✓ relay bridge"
+    echo "  ✓ gateway bridge"
   else
-    echo "  ✓ relay bridge (already running)"
+    echo "  ✓ gateway bridge (already running)"
   fi
 fi
 
