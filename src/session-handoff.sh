@@ -131,6 +131,18 @@ print(personal_path('pending-questions.md', Path('$WORKSPACE_DIR')))
   ls "$WORKSPACE_DIR/tasks/"*.txt 2>/dev/null | head -5 || echo "None pending"
   echo ""
 
+  # Recent conversation — the PreCompact hook hands us $TRANSCRIPT but until
+  # now nothing used it: conversation content died on every compaction and
+  # only system status survived into the next session.
+  echo "## Recent Conversation (before compaction)"
+  if [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ]; then
+    python3 "$REPO/src/context_resume.py" "$TRANSCRIPT" --turns 12 --chars 6000 2>/dev/null \
+      || echo "(extraction failed — transcript at $TRANSCRIPT)"
+  else
+    echo "(no transcript path provided)"
+  fi
+  echo ""
+
   # Quota (with reset times)
   echo "## Quota"
   # Quota state is per-user runtime state — canonical home is
