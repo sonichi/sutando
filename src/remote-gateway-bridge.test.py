@@ -395,6 +395,19 @@ def main() -> int:
     rtc.HS_MEDIA_ORIGIN = ""
     rtc._download_bytes = real_download
 
+    # 6e. malformed media URLs never crash task intake (drop-in-safe)
+    #     (re-review 2026-07-03: `.port` raises ValueError at ACCESS time)
+    rtc._download_bytes = lambda url, headers, cap: b"X"
+    for bad in (f"https://127.0.0.1:bad/media/p", "https://hs.example:bad/_matrix/media/v3/download/hs/id",
+                "https://[broken/media/p"):
+        try:
+            out = rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: {bad} name=x.bin]")
+            ok = f"[{rtc.MEDIA_MARKER_TAG}:" in out
+        except Exception:
+            ok = False
+        check(ok, f"malformed media URL left untouched, no raise: {bad[:40]}")
+    rtc._download_bytes = real_download
+
     # 6c. authed fetch: a real HTTP 302 is refused end-to-end
     STATE["force_media_redirect"] = True
     try:

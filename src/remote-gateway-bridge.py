@@ -329,26 +329,31 @@ def _to_authed_media_url(url: str) -> str:
 def _same_origin(url: str, base: str) -> bool:
     """True iff `url` shares scheme+host+port with `base` (exact origin match —
     parsed, never string-prefix: `https://relay.example.evil` must NOT match
-    a base of `https://relay.example`)."""
+    a base of `https://relay.example`). Whole body is guarded: `.port` raises
+    ValueError at ACCESS time for a malformed port (`https://h:bad/`), and a
+    gateway-controlled URL must never crash task intake — malformed ⇒ False."""
     try:
         u, b = urllib.parse.urlsplit(url), urllib.parse.urlsplit(base)
+        if not u.scheme or not u.hostname or u.scheme != b.scheme:
+            return False
+        default = {"https": 443, "http": 80}.get(u.scheme)
+        return (u.hostname.lower() == (b.hostname or "").lower()
+                and (u.port or default) == (b.port or default))
     except ValueError:
         return False
-    if not u.scheme or not u.hostname or u.scheme != b.scheme:
-        return False
-    default = {"https": 443, "http": 80}.get(u.scheme)
-    return (u.hostname.lower() == (b.hostname or "").lower()
-            and (u.port or default) == (b.port or default))
 
 
 def _under_gateway(url: str) -> bool:
     """True iff `url` is genuinely gateway-hosted: exact gateway origin AND the
     path sits at/under the gateway base path with a real `/` boundary (so a
-    base path of `/relay` doesn't match `/relay-evil/...`)."""
+    base path of `/relay` doesn't match `/relay-evil/...`). Malformed ⇒ False."""
     if not URL or not _same_origin(url, URL):
         return False
-    base_path = urllib.parse.urlsplit(URL).path.rstrip("/")
-    path = urllib.parse.urlsplit(url).path
+    try:
+        base_path = urllib.parse.urlsplit(URL).path.rstrip("/")
+        path = urllib.parse.urlsplit(url).path
+    except ValueError:
+        return False
     return path == base_path or path.startswith(base_path + "/")
 
 
@@ -404,7 +409,12 @@ def _maybe_fetch_media(body: str) -> str:
     # substring — `https://relay.example.evil/...` must not receive the
     # gateway bearer, and a foreign host serving a `/_matrix/` path must not
     # receive the homeserver bearer (review 2026-07-03).
-    url_path = urllib.parse.urlsplit(url).path
+    try:
+        _split = urllib.parse.urlsplit(url)
+        _ = _split.port                    # raises ValueError on a malformed port
+        url_path = _split.path
+    except ValueError:
+        return body                        # unparseable URL — leave marker untouched
     if _under_gateway(url):
         headers["Authorization"] = f"Bearer {TOKEN}"            # gateway media-proxy
     elif url_path.startswith("/_matrix/"):
