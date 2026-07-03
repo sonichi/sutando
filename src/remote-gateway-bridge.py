@@ -52,10 +52,10 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-# resolve_workspace lives alongside this file in src/.
-# Coupled-skill import: this skill ships in the main repo, so use the
-# canonical src/ helper rather than a vendored copy (avoids silent drift).
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
+# resolve_workspace lives alongside this file in src/ — put THIS directory on
+# the path (no repo-walking; the old triple-parent form predated the move into
+# src/ and pointed outside the repo).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
 
 WS = resolve_workspace()
