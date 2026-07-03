@@ -116,7 +116,7 @@ def extract_recent_turns(transcript: Path, max_turns: int = 12, max_chars: int =
 
 
 def _latest_transcript() -> Path:
-    repo = Path(__file__).resolve().parent.parent
+    repo = Path(__file__).parent.parent
     proj = subprocess.run(
         ["bash", str(repo / "scripts" / "sutando-config.sh"), "claude-home-path", "projects"],
         capture_output=True, text=True, timeout=15,
