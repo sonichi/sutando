@@ -4281,19 +4281,9 @@ def _task_source(task_id: str):
 
 
 def _dm_fallback_eligible(task_id: str) -> bool:
-    """True iff a `task-` result may be DMed by poll_dm_fallback.
-
-    FAIL-CLOSED (#1854 follow-up, post-merge audit): a missing/unreadable
-    task file or absent `source:` field is NOT eligible. The original
-    fail-open posture ("missing source -> DM it, never silently lose a
-    result") left a leak path: any result whose task file was already
-    swept/unreadable would DM regardless of its true origin. Every current
-    task writer sets `source:`, task files outlive results (processed/ +
-    archive/ are both searched), and a wrongly-skipped result still
-    surfaces via the retention sweep — so closed is the safe default.
-    """
-    src = _task_source(task_id)
-    return src in DM_FALLBACK_SOURCES
+    """FAIL-CLOSED (#1854 follow-up): missing/unreadable source -> NOT
+    DM-eligible; a wrongly-skipped result still surfaces via retention."""
+    return _task_source(task_id) in DM_FALLBACK_SOURCES
 
 
 async def poll_dm_fallback():
