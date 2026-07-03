@@ -6,7 +6,7 @@
   "stability": "experimental",
   "access_tier": "owner",
   "enabled": true,
-  "description": "Inline Gmail triage for voice/phone agents \u2014 wraps `gws gmail +triage` so Gemini can summarize unread inbox without going through openUrlTool + Chrome.",
+  "description": "Inline Gmail triage for voice/phone agents \u2014 wraps gws gmail +triage so Gemini can summarize unread inbox without going through openUrlTool + Chrome.",
   "permissions": {
     "network": true,
     "filesystem": "read-only",
