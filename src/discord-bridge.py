@@ -685,6 +685,32 @@ def _should_notify_owner_on_seed(sender_id, owner_ids):
     owners = {str(o) for o in (owner_ids or [])}
     return bool(owners) and str(sender_id) not in owners
 
+def _has_sibling_bots(access_data, self_id):
+    """True iff this deployment declares sibling Sutando bots — other bots of
+    the same fleet sharing this guild — via a top-level `siblingBots` id list
+    in access.json.
+
+    Drives multi-bot-safe thread auto-seeding. In a fleet deployment several
+    Sutando bots watch one guild; before this gate, a single owner @-ping in a
+    thread made EVERY bot auto-seed that thread into its own access.json, post
+    its own "🌱 Auto-seeded" notice (pinging its own owner), and thereafter
+    treat every follow-up as a task — so N bots piled onto one PR (the
+    2026-07-02 #1823 collision). Gating the seed on "this bot is addressed"
+    only fires the seed for the bot that was actually pinged.
+
+    Absent/empty `siblingBots` → single-bot deployment → seed on ANY first
+    thread message (preserves the #1498 ep013 first-message-drop fix; the
+    common OSS single-bot install is never regressed). Self is removed so the
+    identical fleet-wide id list can be dropped into every bot's access.json.
+    """
+    try:
+        sibs = access_data.get("siblingBots")
+        if not isinstance(sibs, (list, tuple, set)):
+            return False  # missing or mis-typed (e.g. a bare string) → single-bot
+        return bool({str(s) for s in sibs} - {str(self_id)})
+    except Exception:
+        return False
+
 def _format_seed_notice(owner_id, author_mention, parent_label, thread_id_str):
     """Inline notice posted to a freshly auto-seeded thread. Pure (no I/O)."""
     return (
@@ -2542,7 +2568,19 @@ async def _handle_discord_message(message, force=False):
                 access_data = json.loads(ACCESS_FILE.read_text())
                 access_groups = access_data.setdefault('groups', {})
                 thread_id_str = str(message.channel.id)
-                if thread_id_str not in access_groups:
+                # Multi-bot-safe seed gate. In a fleet deployment (siblingBots
+                # declared), seed ONLY when THIS bot is the addressed one
+                # (direct @-mention or a sutando-role @) — otherwise every
+                # sibling bot seeds the same thread, posts its own 🌱 notice
+                # pinging its own owner (the seed storm), and then grabs every
+                # unaddressed follow-up (the 2026-07-02 #1823 pile-up). In a
+                # single-bot deployment (no siblingBots) seed on any first
+                # message, preserving the #1498 ep013 first-message-drop fix.
+                _seed_ok = (
+                    bot_mentioned or role_mentioned
+                    or not _has_sibling_bots(access_data, getattr(client.user, "id", None))
+                )
+                if thread_id_str not in access_groups and _seed_ok:
                     parent_id_str = str(message.channel.parent_id) if message.channel.parent_id else None
                     parent_cfg = access_groups.get(parent_id_str) if parent_id_str else None
                     if parent_cfg is True:
