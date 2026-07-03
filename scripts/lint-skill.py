@@ -45,7 +45,11 @@ NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 SCOPE_RE = re.compile(r"^@[a-z0-9][a-z0-9-]*$")
 STABILITY = {"stable", "experimental", "deprecated"}
 FS_LEVELS = {"none", "read-only", "read-write"}
-TIERS = {"owner", "team", "other"}
+# The manifest-loader (src/inline-tools.ts) implements exactly two caller tiers:
+# `owner` and `any_caller` (anything != any_caller buckets to owner). Keep this
+# aligned with that contract — NOT the owner/team/other *task* tiers, which are a
+# different axis (who may send a task, enforced at the bridge).
+TIERS = {"owner", "any_caller"}
 INTENTS = {"candidate-contribution", "private-customization"}
 KNOWN_TOP = {
     "name", "scope", "version", "owner", "license", "description", "stability",
@@ -53,8 +57,11 @@ KNOWN_TOP = {
     "provenance", "enabled", "access_tier", "tools", "server", "startup", "config",
 }
 # Signals a skill actually touches the network (used for the permission cross-check).
+# No trailing \b: signals ending in a space/paren (`curl `, `fetch(`) are followed
+# by a non-word char, and a trailing \b there kills the match — so `curl -s …` and
+# `fetch()` (the common forms) would slip past. The leading \b still anchors word-start.
 NET_SIGNALS = re.compile(
-    r"\b(urllib\.request|requests\.|httpx|aiohttp|socket\.|websocket|fetch\(|curl\s|wget\s)\b"
+    r"\b(urllib\.request|requests\.|httpx|aiohttp|socket\.|websocket|fetch\(|curl\s|wget\s)"
 )
 
 
@@ -145,9 +152,17 @@ def _lint_manifest(skill_dir: Path) -> tuple[list[str], list[str]]:
         for req in ("enabled", "access_tier"):
             if req not in m:
                 err(f"declares 'tools' → must also set '{req}'")
-        tpath = skill_dir / str(m["tools"]).lstrip("./")
-        if not tpath.exists():
-            err(f"tools path '{m['tools']}' does not exist")
+        tools_rel = str(m["tools"])
+        # Hard-error on any '..' segment: a tool file escaping its skill dir
+        # defeats the per-skill permission model this schema builds. (The old
+        # `.lstrip('./')` also silently rewrote '../x' → 'x', linting the wrong
+        # path; match the loader's single-'./'-prefix normalization instead.)
+        if ".." in tools_rel.split("/"):
+            err(f"tools path '{tools_rel}' must not escape the skill dir (no '..')")
+        else:
+            tpath = skill_dir / re.sub(r"^\./", "", tools_rel)
+            if not tpath.exists():
+                err(f"tools path '{tools_rel}' does not exist")
 
     return (errors, warnings)
 

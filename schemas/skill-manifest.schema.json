@@ -102,8 +102,8 @@
     },
     "access_tier": {
       "type": "string",
-      "enum": ["owner", "team", "other"],
-      "description": "Manifest-loaded skills: intended caller tier (enforcement still happens at the call-site)."
+      "enum": ["owner", "any_caller"],
+      "description": "Manifest-loaded skills: caller tier the runtime loader implements (src/inline-tools.ts) — `owner` (default) or `any_caller`. Distinct from the owner/team/other *task* tiers (who may send a task), which are enforced at the bridge, not here."
     },
     "tools": {
       "type": "string",

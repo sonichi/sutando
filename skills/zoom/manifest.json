@@ -8,7 +8,7 @@
   "enabled": true,
   "description": "Zoom meeting control for the voice/phone agents \u2014 contributes the `summon` (join + screen share), `dismiss` (leave meeting), and `join_zoom` (join with computer audio, no share) inline tools. Manifest-loaded so core stays free of a compile-time dependency on this skill (#976 conformance).",
   "permissions": {
-    "network": false,
+    "network": true,
     "filesystem": "read-write",
     "secrets": "none"
   },

@@ -111,6 +111,38 @@ def main() -> int:
     }))
     check(any("scope" in x for x in e), "scope without '@' flagged")
 
+    # 12. access_tier must match the loader contract (owner|any_caller), not the
+    #     owner/team/other task tiers. any_caller accepted; other/team rejected.
+    e, _ = errs(_skill(tmp, "anycaller",
+                       {"name": "anycaller", "version": "1.0.0", "owner": "m", "stability": "stable",
+                        "access_tier": "any_caller", "enabled": True, "tools": "./tools.ts"},
+                       files={"tools.ts": "export const tools = []"}))
+    check(e == [], "access_tier 'any_caller' accepted (loader contract)")
+    e, _ = errs(_skill(tmp, "othertier",
+                       {"name": "othertier", "version": "1.0.0", "owner": "m", "stability": "stable",
+                        "access_tier": "other", "enabled": True, "tools": "./tools.ts"},
+                       files={"tools.ts": "export const tools = []"}))
+    check(any("access_tier" in x for x in e), "access_tier 'other' rejected (not a loader tier)")
+
+    # 13. permission cross-check catches the common shell forms `curl -s` and no-arg
+    #     `fetch()` — previously slipped past the trailing-\b in NET_SIGNALS.
+    _, w = errs(_skill(tmp, "curldash",
+                       {"name": "curldash", "version": "1.0.0", "owner": "m", "stability": "stable",
+                        "permissions": {"network": False}},
+                       files={"run.sh": "curl -s https://x.com/data"}))
+    check(any("network=false" in x for x in w), "`curl -s` flagged (network:false lie)")
+    _, w = errs(_skill(tmp, "bareFetch",
+                       {"name": "bareFetch", "version": "1.0.0", "owner": "m", "stability": "stable",
+                        "permissions": {"network": False}},
+                       files={"run.js": "const r = await fetch()"}))
+    check(any("network=false" in x for x in w), "no-arg `fetch()` flagged (network:false lie)")
+
+    # 14. a tools path escaping the skill dir ('..') is a hard error.
+    e, _ = errs(_skill(tmp, "escape",
+                       {"name": "escape", "version": "1.0.0", "owner": "m", "stability": "stable",
+                        "access_tier": "owner", "enabled": True, "tools": "../shared/tools.ts"}))
+    check(any("escape the skill dir" in x for x in e), "tools path with '..' rejected")
+
     print(f"\n{'PASS — all checks green' if not FAILS else f'FAIL — {len(FAILS)} failing'}")
     return 0 if not FAILS else 1
 
