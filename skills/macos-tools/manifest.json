@@ -1,8 +1,11 @@
 {
   "name": "macos-tools",
   "version": "1.0.0",
-  "owner": "sonichi/sutando",
+  "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "stable",
-  "description": "macOS native integrations: screen capture, calendar, reminders, contacts, email (Mail.app), Spotlight search. Use when the user asks about their screen, schedule, to-do list, contacts, or wants to send email on macOS."
+  "description": "macOS native integrations: screen capture, calendar, reminders, contacts, email (Mail.app), Spotlight search. Use when the user asks about their screen, schedule, to-do list, contacts, or wants to send email on macOS.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
 }

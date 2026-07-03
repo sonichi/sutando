@@ -1,8 +1,11 @@
 {
   "name": "morning-briefing",
   "version": "1.0.0",
-  "owner": "sonichi/sutando",
+  "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "stable",
-  "description": "Generate a daily morning briefing: email, calendar, Discord, and news \u2014 delivered via voice or Discord DM."
+  "description": "Generate a daily morning briefing: email, calendar, Discord, and news \u2014 delivered via voice or Discord DM.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
 }

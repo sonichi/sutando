@@ -1,7 +1,7 @@
 {
   "name": "gws-gmail-voice",
   "version": "1.0.0",
-  "owner": "sonichi/sutando",
+  "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "stable",
   "access_tier": "owner",
@@ -12,5 +12,8 @@
     "filesystem": "read-only",
     "secrets": "none"
   },
-  "tools": "./tools.ts"
+  "tools": "./tools.ts",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
 }

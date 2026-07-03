@@ -1,8 +1,11 @@
 {
   "name": "submit-use-case",
   "version": "1.0.0",
-  "owner": "sonichi/sutando",
+  "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "experimental",
-  "description": "OSS-facing channel to share a Sutando use case with the community. Opens a labeled GitHub issue on sonichi/sutando and (CLA-gated) a PR adding docs/community-use-cases/<slug>.md. Validates outcome-framed titles with the same checker as add-use-case. Default: both; flags --issue-only / --pr-only opt "
+  "description": "OSS-facing channel to share a Sutando use case with the community. Opens a labeled GitHub issue on sonichi/sutando and (CLA-gated) a PR adding docs/community-use-cases/<slug>.md. Validates outcome-framed titles with the same checker as add-use-case. Default: both; flags --issue-only / --pr-only opt ",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
 }

@@ -1,8 +1,11 @@
 {
   "name": "call-diagnostics",
   "version": "1.0.0",
-  "owner": "sonichi/sutando",
+  "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "stable",
-  "description": "Analyze phone call observability data, detect problems, track them across calls, and recommend systematic repairs."
+  "description": "Analyze phone call observability data, detect problems, track them across calls, and recommend systematic repairs.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
 }

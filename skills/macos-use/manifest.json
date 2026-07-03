@@ -1,8 +1,11 @@
 {
   "name": "macos-use",
   "version": "1.0.0",
-  "owner": "sonichi/sutando",
+  "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "stable",
-  "description": "GUI control for macOS apps via mediar-ai's mcp-server-macos-use. Click, type, scroll, key-press, open apps \u2014 driven by accessibility tree, works in non-interactive Claude Code mode. Use this for any Sutando task that needs to drive another macOS application (Safari, Zoom, Mail, Finder, etc.)."
+  "description": "GUI control for macOS apps via mediar-ai's mcp-server-macos-use. Click, type, scroll, key-press, open apps \u2014 driven by accessibility tree, works in non-interactive Claude Code mode. Use this for any Sutando task that needs to drive another macOS application (Safari, Zoom, Mail, Finder, etc.).",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
 }

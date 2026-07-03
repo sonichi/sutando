@@ -1,7 +1,7 @@
 {
   "name": "zoom",
   "version": "1.0.0",
-  "owner": "sonichi/sutando",
+  "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "stable",
   "access_tier": "owner",
@@ -15,5 +15,8 @@
   "tools": "./tools.ts",
   "config": {
     "ZOOM_DEFAULT_SHARE_SCREEN": "true"
+  },
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
   }
 }

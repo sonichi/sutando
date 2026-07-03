@@ -1,8 +1,11 @@
 {
   "name": "context-drop",
   "version": "1.0.0",
-  "owner": "sonichi/sutando",
+  "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "experimental",
-  "description": "Tiny Swift CLI that reads the focused app's text selection via the macOS Accessibility API. Sutando.app's \u2303C \"drop context\" hotkey shells out to this binary to capture what you have highlighted."
+  "description": "Tiny Swift CLI that reads the focused app's text selection via the macOS Accessibility API. Sutando.app's \u2303C \"drop context\" hotkey shells out to this binary to capture what you have highlighted.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
 }

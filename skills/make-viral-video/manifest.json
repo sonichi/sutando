@@ -1,8 +1,11 @@
 {
   "name": "make-viral-video",
   "version": "1.0.0",
-  "owner": "sonichi/sutando",
+  "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "experimental",
-  "description": "Build a short news-explainer video tuned for shareability. One striking moment per video; real fetched assets; self-heal validation; pluggable TTS (Gemini-free default, OpenAI fallback)."
+  "description": "Build a short news-explainer video tuned for shareability. One striking moment per video; real fetched assets; self-heal validation; pluggable TTS (Gemini-free default, OpenAI fallback).",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
 }

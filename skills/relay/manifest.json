@@ -1,8 +1,11 @@
 {
   "name": "relay",
   "version": "1.0.0",
-  "owner": "sonichi/sutando",
+  "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "experimental",
-  "description": "Write a handoff/continuity note for the NEXT Sutando session. Captures what was just in flight, what to check first, what might go wrong, and implicit context the structured snapshot doesn't carry. Read first by /catchup-after-startup."
+  "description": "Write a handoff/continuity note for the NEXT Sutando session. Captures what was just in flight, what to check first, what might go wrong, and implicit context the structured snapshot doesn't carry. Read first by /catchup-after-startup.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
 }

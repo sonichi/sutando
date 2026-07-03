@@ -1,8 +1,11 @@
 {
   "name": "screen-record",
   "version": "1.0.0",
-  "owner": "sonichi/sutando",
+  "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "stable",
-  "description": "Start and stop screen recording using ffmpeg."
+  "description": "Start and stop screen recording using ffmpeg.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
 }

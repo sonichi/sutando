@@ -1,8 +1,11 @@
 {
   "name": "meeting-prep",
   "version": "1.0.0",
-  "owner": "sonichi/sutando",
+  "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "stable",
-  "description": "Auto-prepare for upcoming meetings: attendee info, recent email threads, talking points, and agenda. Runs 30 min before each meeting or on demand."
+  "description": "Auto-prepare for upcoming meetings: attendee info, recent email threads, talking points, and agenda. Runs 30 min before each meeting or on demand.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
 }

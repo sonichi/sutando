@@ -1,8 +1,11 @@
 {
   "name": "x-twitter",
   "version": "1.0.0",
-  "owner": "sonichi/sutando",
+  "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "stable",
-  "description": "Post tweets, search, read mentions, and check engagement on X (Twitter) via API v2."
+  "description": "Post tweets, search, read mentions, and check engagement on X (Twitter) via API v2.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
 }

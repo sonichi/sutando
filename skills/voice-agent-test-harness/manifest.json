@@ -1,8 +1,11 @@
 {
   "name": "voice-agent-test-harness",
   "version": "1.0.0",
-  "owner": "sonichi/sutando",
+  "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "experimental",
-  "description": "Drive a fixed suite of spoken tests against a voice agent (\"subject\") from a co-located machine (\"prober\"), measure response latency / clarity / accuracy, diff against baseline, and report to the owner over Telegram."
+  "description": "Drive a fixed suite of spoken tests against a voice agent (\"subject\") from a co-located machine (\"prober\"), measure response latency / clarity / accuracy, diff against baseline, and report to the owner over Telegram.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
 }

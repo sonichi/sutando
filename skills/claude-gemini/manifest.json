@@ -1,8 +1,11 @@
 {
   "name": "claude-gemini",
   "version": "1.0.0",
-  "owner": "sonichi/sutando",
+  "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "stable",
-  "description": "Use the local Gemini CLI from Claude Code with the user's existing Gemini authentication or API configuration. Use for large-context repo scans, multimodal analysis, second-opinion planning, or structured Gemini runs in the current workspace."
+  "description": "Use the local Gemini CLI from Claude Code with the user's existing Gemini authentication or API configuration. Use for large-context repo scans, multimodal analysis, second-opinion planning, or structured Gemini runs in the current workspace.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
 }
