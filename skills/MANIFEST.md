@@ -159,6 +159,31 @@ backend swap, never a re-format.
 on a skill whose code calls `fetch`/`urllib` is flagged, because a permission that
 lies is worse than none.
 
+### Skill maturity (`stability`)
+
+`stability` is a *signal that must be earned*, not a vibe — and it's meant to be
+driven by **objective signals** so the agent can (eventually) self-maintain it:
+
+- **`stable`** — earned when a skill has (a) been in the tree a while (rule of
+  thumb: **age > ~3 months**), **and** (b) meaningful real usage with net-positive
+  feedback (positive > negative), **and** (c) a committed interface — breaking
+  changes require a MAJOR version bump.
+- **`experimental`** (default) — new or unproven: limited usage, or an interface
+  that may still shift in MINOR/PATCH. Every skill starts here.
+- **`deprecated`** — superseded; don't adopt.
+
+**Signals that drive promotion:**
+- *Age* — computable today from git history (a skill's first-added date).
+- *Usage + feedback* — net-positive real usage. Today a maintainer judgment; with
+  the hosted registry (Phase 3) it becomes measurable (download counts, ratings).
+
+**Intent — self-maintaining maturity.** As these signals accrue, a periodic job
+re-derives `stability` from them, so the registry (and the agent) maintains the
+field rather than relying on manual guesses. The initial manifest backfill seeded
+`stability` from **age alone** (added on/before 2026-04-30 → `stable`, since we
+have no usage data yet and the repo is young); the signal-driven process refines
+that seed over time.
+
 ### Lint
 
 ```bash
