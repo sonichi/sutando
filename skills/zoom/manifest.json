@@ -1,8 +1,17 @@
 {
   "name": "zoom",
-  "enabled": true,
+  "version": "1.0.0",
+  "owner": "qingyun-wu",
+  "license": "MIT",
+  "stability": "stable",
   "access_tier": "owner",
-  "description": "Zoom meeting control for the voice/phone agents — contributes the `summon` (join + screen share), `dismiss` (leave meeting), and `join_zoom` (join with computer audio, no share) inline tools. Manifest-loaded so core stays free of a compile-time dependency on this skill (#976 conformance).",
+  "enabled": true,
+  "description": "Zoom meeting control for the voice/phone agents \u2014 contributes the `summon` (join + screen share), `dismiss` (leave meeting), and `join_zoom` (join with computer audio, no share) inline tools. Manifest-loaded so core stays free of a compile-time dependency on this skill (#976 conformance).",
+  "permissions": {
+    "network": false,
+    "filesystem": "read-write",
+    "secrets": "none"
+  },
   "tools": "./tools.ts",
   "config": {
     "ZOOM_DEFAULT_SHARE_SCREEN": "true"

@@ -121,3 +121,55 @@ This implies, for the original questions:
 - **`highlight_slide`** — same; useful if Chi is on stage with a phone call routing through Sutando.
 
 Treat that as a feature, not a quirk: a call from a phone is conceptually the same agent the web client talks to, so the tools should match for the owner. Non-owners stay on the restricted surface.
+
+---
+
+## Package identity (v1) — the skill-package model, Phase 1
+
+As of the skill-package work, a `manifest.json` is a **package manifest**, not just a
+tool-loader config. It carries identity + a contract so we can build versioning,
+trust, dependency resolution, and promotion around skills. Schema:
+[`schemas/skill-manifest.schema.json`](../schemas/skill-manifest.schema.json);
+validator: [`scripts/lint-skill.py`](../scripts/lint-skill.py).
+
+**Design principle — transport-agnostic.** The manifest + a checksum + a lockfile
+are the format; where a package is *resolved from* (a git repo today, a hosted
+registry later, e.g. AG2 Space) is a separate concern. git→hosted is a resolver
+backend swap, never a re-format.
+
+### Fields (superset of the tool-loader fields above)
+
+| Field | Required | Meaning |
+|---|---|---|
+| `name` | yes | skill id / slug; must match the directory name |
+| `version` | yes | SemVer. MAJOR=breaking, MINOR=compat feature, PATCH=fix/eval |
+| `owner` | yes | who maintains it (handle / team / org) |
+| `stability` | yes | `stable` \| `experimental` \| `deprecated` |
+| `license` | rec | SPDX id (default: repo license) |
+| `description` | rec | one-line summary (code review + registry) |
+| `agent_compatibility` | opt | SemVer range of the agent runtime, e.g. `">=0.9 <2.0"` |
+| `dependencies` | opt | `{skill-id: semver-range}` |
+| `permissions` | rec | `{network, filesystem: none\|read-only\|read-write, secrets: none\|[keys]}` |
+| `contract` | opt | `{inputs, outputs, guarantees}` — what downstream depends on across versions |
+| `provenance` | opt | `{source_repo, forked_from, upstream_intent}` — keeps forks trackable |
+| `enabled`, `access_tier`, `tools`, `server`, `startup`, `config` | — | manifest-loaded skills only (see above) |
+
+`permissions` is a **declaration the linter cross-checks**: e.g. `network: false`
+on a skill whose code calls `fetch`/`urllib` is flagged, because a permission that
+lies is worse than none.
+
+### Lint
+
+```bash
+python3 scripts/lint-skill.py skills/<name>     # one skill
+python3 scripts/lint-skill.py --all             # every skills/*/manifest.json (CI)
+python3 scripts/lint-skill.py --all --strict    # warnings are errors
+```
+
+### Migration status
+
+Phase 1 migrates the manifest-loaded skills (`zoom`, `screen-companion`,
+`gws-gmail-voice`, `obsidian-vault`) to v1. Backfilling the remaining
+slash-command skills (adding a minimal `manifest.json` with `version`/`owner`/
+`stability`) is the mechanical follow-up. Later phases add the registry index,
+`skill.lock` + precedence resolution, and per-skill evals in CI.

@@ -1,7 +1,16 @@
 {
   "name": "obsidian-vault",
-  "enabled": true,
+  "version": "1.0.0",
+  "owner": "qingyun-wu",
+  "license": "MIT",
+  "stability": "stable",
   "access_tier": "owner",
-  "description": "Capture notes, tasks, and thoughts into a Sutando-owned Obsidian vault at <workspace>/obsidian-vault. Voice-inline tool writes directly to the filesystem — Obsidian picks up changes instantly. No Obsidian plugin required.",
+  "enabled": true,
+  "description": "Capture notes, tasks, and thoughts into a Sutando-owned Obsidian vault at <workspace>/obsidian-vault. Voice-inline tool writes directly to the filesystem \u2014 Obsidian picks up changes instantly. No Obsidian plugin required.",
+  "permissions": {
+    "network": false,
+    "filesystem": "read-write",
+    "secrets": "none"
+  },
   "tools": "./tools.ts"
 }
