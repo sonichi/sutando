@@ -252,6 +252,42 @@ def main() -> int:
     rtc._write_task(TASK)
     check(tfile.read_text() == before, "idempotent re-write (unchanged)")
 
+    # 2b. archive-aware dedup: a redelivered task whose task file the core
+    # already archived — or whose result was already delivered and archived —
+    # must NOT re-queue; the client drops a [no-send] result so the drain
+    # re-acks it upstream. (Regression for the reconnect redelivery floods.)
+    (rtc.TASKS_DIR / "archive").mkdir(parents=True, exist_ok=True)
+    (rtc.TASKS_DIR / "archive" / "task-DONE1.txt").write_text("handled")
+    check(rtc._write_task({**TASK, "id": "task-DONE1"}) == "task-DONE1"
+          and not (rtc.TASKS_DIR / "task-DONE1.txt").exists(),
+          "redelivery of core-archived task not re-queued (id returned for ack)")
+    check((rtc.RESULTS_DIR / "task-DONE1.txt").read_text().startswith("[no-send]"),
+          "dedup drops a [no-send] result for the drain to re-ack")
+    # month-partitioned archive (tasks/archive/YYYY-MM/<id>.txt) — the active
+    # layout per src/task-bridge.ts. A redelivery whose original was archived
+    # here must ALSO dedup, not fall through and reprocess. Regression for the
+    # flat-only archive probe (PR #1896 review).
+    (rtc.TASKS_DIR / "archive" / "2026-07").mkdir(parents=True, exist_ok=True)
+    (rtc.TASKS_DIR / "archive" / "2026-07" / "task-MONTH.txt").write_text("handled")
+    check(rtc._write_task({**TASK, "id": "task-MONTH"}) == "task-MONTH"
+          and not (rtc.TASKS_DIR / "task-MONTH.txt").exists(),
+          "redelivery of month-partitioned-archived task not re-queued")
+    check((rtc.RESULTS_DIR / "task-MONTH.txt").read_text().startswith("[no-send]"),
+          "month-archive dedup drops a [no-send] result")
+    rtc.ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    (rtc.ARCHIVE_RESULTS_DIR / "task-DONE2-1750000000.txt").write_text("sent")
+    check(rtc._write_task({**TASK, "id": "task-DONE2"}) == "task-DONE2"
+          and not (rtc.TASKS_DIR / "task-DONE2.txt").exists(),
+          "redelivery of archived-result task not re-queued")
+    (rtc.RESULTS_DIR / "task-DONE3.txt").write_text("real result pending\n")
+    (rtc.TASKS_DIR / "archive" / "task-DONE3.txt").write_text("handled")
+    rtc._write_task({**TASK, "id": "task-DONE3"})
+    check((rtc.RESULTS_DIR / "task-DONE3.txt").read_text() == "real result pending\n",
+          "dedup never clobbers an existing pending result")
+    check(rtc._write_task({**TASK, "id": "task-DONE"}) == "task-DONE"
+          and (rtc.TASKS_DIR / "task-DONE.txt").exists(),
+          "prefix id does not false-match an archived sibling (task-DONE vs task-DONE2)")
+
     # 3. result file → POST back + archive
     (rtc.RESULTS_DIR).mkdir(parents=True, exist_ok=True)
     (rtc.RESULTS_DIR / "task-MOCK1.txt").write_text("the reply\n")

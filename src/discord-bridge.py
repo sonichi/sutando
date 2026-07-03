@@ -2295,7 +2295,7 @@ _poll_loops_started = False
 
 @client.event
 async def on_ready():
-    print(f"Discord bridge ready: {client.user}")
+    print(f"Discord bridge ready: {client.user}", flush=True)
     # #1147: auto-seed workspace `state/discord-config.json` from the legacy
     # access.json heuristic on first boot. Idempotent (no-op if file
     # exists). Emits a WARN to stderr if the seed had to fall back to
@@ -4244,6 +4244,42 @@ async def poll_proactive():
         await asyncio.sleep(3)
 
 
+# Sources whose results have NO delivery channel of their own — the ONLY
+# `task-` results poll_dm_fallback may forward to the owner's Discord DM.
+# Voice (and phone) results are delivered by voice-agent's task-bridge only
+# while that client is connected; when it's offline the result would be
+# silently lost, which is the entire reason this fallback exists. Every other
+# source — api/chat (agent-api), discord (poll_results), telegram, slack —
+# owns its own delivery path and must never be echoed here. This is an
+# allowlist, not a denylist: a newly-added source is non-eligible by default
+# and can never leak into DM unless deliberately added.
+DM_FALLBACK_SOURCES = {"voice", "phone"}
+
+
+def _task_source(task_id: str):
+    """Lowercased `source:` of a task file, or None when the file is
+    missing/unreadable or declares no source. Lets poll_dm_fallback decide
+    whether a `task-` result is DM-eligible (see DM_FALLBACK_SOURCES)."""
+    tf = find_task_file(TASKS_DIR, task_id)
+    if not tf:
+        processed = TASKS_DIR / "processed" / f"{task_id}.txt"
+        if processed.exists():
+            tf = processed
+    if not tf:
+        archived = sorted((TASKS_DIR / "archive").glob(f"*/{task_id}.txt"))
+        if archived:
+            tf = archived[-1]
+    if not tf:
+        return None
+    try:
+        for ln in tf.read_text(encoding="utf-8", errors="replace").splitlines():
+            if ln.startswith("source:"):
+                return ln.split(":", 1)[1].strip().lower() or None
+    except OSError:
+        return None
+    return None
+
+
 async def poll_dm_fallback():
     """Fallback path for task/question/briefing results that no other
     consumer is going to handle.
@@ -4274,6 +4310,21 @@ async def poll_dm_fallback():
                 task_id = f.stem  # e.g. "task-1776286725412"
                 if task_id in pending_replies:
                     continue
+                # Source gate: this fallback delivers ONLY channel-less voice/
+                # phone results (see DM_FALLBACK_SOURCES). A `task-` result from
+                # a source that owns its own delivery path (api/chat, discord,
+                # telegram, slack) is none of our business — skip it and leave
+                # it for its own consumer (+ the retention sweep) to drain. The
+                # other FALLBACK_PREFIXES (question-/briefing-/insight-/friction-)
+                # are cron/proactive artifacts with no channel, so they bypass
+                # this gate and stay eligible. A missing source field is treated
+                # as eligible to preserve the original never-silently-lose-a-
+                # result posture; every current task writer sets the field, so
+                # in practice only voice/phone reach the DM path.
+                if task_id.startswith("task-"):
+                    _src = _task_source(task_id)
+                    if _src is not None and _src not in DM_FALLBACK_SOURCES:
+                        continue
                 # Grace window so voice-agent / telegram-bridge get first dibs.
                 try:
                     st = f.stat()
