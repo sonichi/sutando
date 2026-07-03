@@ -3,6 +3,6 @@
   "version": "1.0.0",
   "owner": "sonichi/sutando",
   "license": "MIT",
-  "stability": "experimental",
+  "stability": "stable",
   "description": "Post a coordination message from this bot to the shared bot2bot channel, @-mentioning the other Sutando node."
 }

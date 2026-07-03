@@ -3,6 +3,6 @@
   "version": "1.0.0",
   "owner": "sonichi/sutando",
   "license": "MIT",
-  "stability": "experimental",
+  "stability": "stable",
   "description": "Start Sutando's autonomous proactive loop. Monitors tasks, runs health checks, and builds missing capabilities on a recurring schedule."
 }

@@ -3,6 +3,6 @@
   "version": "1.0.0",
   "owner": "sonichi/sutando",
   "license": "MIT",
-  "stability": "experimental",
+  "stability": "stable",
   "description": "Use the local Gemini CLI from Claude Code with the user's existing Gemini authentication or API configuration. Use for large-context repo scans, multimodal analysis, second-opinion planning, or structured Gemini runs in the current workspace."
 }

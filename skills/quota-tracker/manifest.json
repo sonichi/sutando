@@ -3,6 +3,6 @@
   "version": "1.0.0",
   "owner": "sonichi/sutando",
   "license": "MIT",
-  "stability": "experimental",
+  "stability": "stable",
   "description": "Track Claude Code quota usage via Anthropic API rate limit headers. Shows 5h and 7d utilization, reset times, and quota status. Works with both subscription and API key auth."
 }

@@ -3,6 +3,6 @@
   "version": "1.0.0",
   "owner": "sonichi/sutando",
   "license": "MIT",
-  "stability": "experimental",
+  "stability": "stable",
   "description": "Analyze phone call observability data, detect problems, track them across calls, and recommend systematic repairs."
 }

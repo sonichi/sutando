@@ -3,6 +3,6 @@
   "version": "1.0.0",
   "owner": "sonichi/sutando",
   "license": "MIT",
-  "stability": "experimental",
+  "stability": "stable",
   "description": "Generate a daily morning briefing: email, calendar, Discord, and news \u2014 delivered via voice or Discord DM."
 }
