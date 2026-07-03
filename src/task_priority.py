@@ -10,7 +10,7 @@ Defaults by source (writers emit these; consumers can override per call):
   chat, context-drop      -> "normal"   (owner foreground)
   discord, telegram (owner-tier)        -> "normal"
   discord, telegram (team/other-tier)   -> "low"
-  health-check, sync-memory, cron       -> "low"
+  health-check, sync-memory, sync-workspace, cron -> "low"
 
 Anything not recognized parses as "normal" (fail-open). Order on disk:
 "urgent" -> "normal" -> "low" -> unknown -> oldest mtime tiebreak.
@@ -41,7 +41,7 @@ def default_priority_for_source(source: str, access_tier: str | None = None) -> 
         # Owner-tier traffic stays at normal; team/other gets demoted so a
         # public-channel ping never preempts an owner-DM follow-up.
         return "normal" if (access_tier or "owner").lower() == "owner" else "low"
-    if s in ("health-check", "sync-memory", "cron"):
+    if s in ("health-check", "sync-memory", "sync-workspace", "cron"):
         return "low"
     return _DEFAULT
 

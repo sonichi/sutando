@@ -2295,7 +2295,7 @@ _poll_loops_started = False
 
 @client.event
 async def on_ready():
-    print(f"Discord bridge ready: {client.user}")
+    print(f"Discord bridge ready: {client.user}", flush=True)
     # #1147: auto-seed workspace `state/discord-config.json` from the legacy
     # access.json heuristic on first boot. Idempotent (no-op if file
     # exists). Emits a WARN to stderr if the seed had to fall back to
