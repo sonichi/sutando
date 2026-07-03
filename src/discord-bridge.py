@@ -4280,6 +4280,22 @@ def _task_source(task_id: str):
     return None
 
 
+def _dm_fallback_eligible(task_id: str) -> bool:
+    """True iff a `task-` result may be DMed by poll_dm_fallback.
+
+    FAIL-CLOSED (#1854 follow-up, post-merge audit): a missing/unreadable
+    task file or absent `source:` field is NOT eligible. The original
+    fail-open posture ("missing source -> DM it, never silently lose a
+    result") left a leak path: any result whose task file was already
+    swept/unreadable would DM regardless of its true origin. Every current
+    task writer sets `source:`, task files outlive results (processed/ +
+    archive/ are both searched), and a wrongly-skipped result still
+    surfaces via the retention sweep — so closed is the safe default.
+    """
+    src = _task_source(task_id)
+    return src in DM_FALLBACK_SOURCES
+
+
 async def poll_dm_fallback():
     """Fallback path for task/question/briefing results that no other
     consumer is going to handle.
@@ -4317,14 +4333,10 @@ async def poll_dm_fallback():
                 # it for its own consumer (+ the retention sweep) to drain. The
                 # other FALLBACK_PREFIXES (question-/briefing-/insight-/friction-)
                 # are cron/proactive artifacts with no channel, so they bypass
-                # this gate and stay eligible. A missing source field is treated
-                # as eligible to preserve the original never-silently-lose-a-
-                # result posture; every current task writer sets the field, so
-                # in practice only voice/phone reach the DM path.
-                if task_id.startswith("task-"):
-                    _src = _task_source(task_id)
-                    if _src is not None and _src not in DM_FALLBACK_SOURCES:
-                        continue
+                # this gate and stay eligible. FAIL-CLOSED: a missing/unreadable
+                # source is NOT eligible (see _dm_fallback_eligible).
+                if task_id.startswith("task-") and not _dm_fallback_eligible(task_id):
+                    continue
                 # Grace window so voice-agent / telegram-bridge get first dibs.
                 try:
                     st = f.stat()
