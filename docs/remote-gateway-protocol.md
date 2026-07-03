@@ -1,6 +1,6 @@
 # Remote relay protocol
 
-`src/remote-relay-bridge.py` lets a remote HTTP server dispatch tasks to a local
+`src/remote-gateway-bridge.py` lets a remote HTTP server dispatch tasks to a local
 Sutando instance and collect the results — turning Sutando into a remotely
 drivable worker without exposing the host (no open port, no tunnel). The bridge
 is the **client**; you (or a service) provide the **relay server** that speaks
@@ -79,7 +79,7 @@ Periodic liveness + capability ping.
 
 ```
 body: {
-  "client": "sutando-relay-client",
+  "client": "sutando-gateway-client",
   "protocol_version": 1,
   "provider": "<REMOTE_TASK_PROVIDER>",
   "tier": "<REMOTE_TASK_TIER>",
@@ -101,7 +101,7 @@ body: {
 - Inbound tasks are **not trusted to set their own access tier.** The bridge
   stamps every task with the local `REMOTE_TASK_TIER` (default `team`) as the
   last `access_tier:` line, so a task body cannot forge a higher tier. Set
-  `REMOTE_TASK_TIER=owner` in the channel `.env` only for a relay you fully
+  `REMOTE_TASK_TIER=owner` in the channel `.env` only for a gateway you fully
   control.
 - The token is a per-host credential; keep it in the channel `.env`
   (host-local), not in the synced workspace.

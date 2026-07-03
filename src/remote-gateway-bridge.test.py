@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit test for src/remote-relay-bridge.py against an in-process mock relay.
+"""Unit test for src/remote-gateway-bridge.py against an in-process mock gateway.
 
 CI-safe: spins up a localhost HTTP stub, no external network/deps. Exits 0 on
 pass, 1 on fail.
@@ -8,7 +8,7 @@ Covers: task pull → local file write (correct schema + atomic), task ack,
 heartbeat, result file → POST back (correct payload + auth header),
 idempotent re-write, auth rejection.
 
-Run: python3 src/remote-relay-bridge.test.py
+Run: python3 src/remote-gateway-bridge.test.py
 """
 from __future__ import annotations
 
@@ -31,12 +31,12 @@ def check(cond: bool, msg: str) -> None:
         FAILS.append(msg)
 
 
-# ── mock relay ────────────────────────────────────────────────────────────
+# ── mock gateway ────────────────────────────────────────────────────────────
 STATE = {"tasks_served": 0, "results": [], "acks": [], "heartbeats": [],
          "auth_seen": [], "force_401": False, "force_ack_404": False,
          "force_heartbeat_404": False}
 TASK = {"id": "task-MOCK1", "timestamp": "2026-05-23T00:00:00Z",
-        "task": "hello from relay", "source": "remote-relay",
+        "task": "hello from gateway", "source": "remote-gateway",
         "channel_id": "!room:example.org", "user_id": "@qingyun:example.org",
         "access_tier": "owner", "priority": "normal"}
 
@@ -110,7 +110,7 @@ def main() -> int:
     Path(tmp, ".build_log-migrated").touch()
     os.environ["REMOTE_TASK_URL"] = f"http://127.0.0.1:{port}"
     os.environ["REMOTE_TASK_TOKEN"] = "testtoken"
-    os.environ["REMOTE_TASK_PROVIDER"] = "remote-relay"
+    os.environ["REMOTE_TASK_PROVIDER"] = "remote-gateway"
     # Pin the tier so LOCAL_TIER is deterministic. Without this the module reads
     # the host's ambient REMOTE_TASK_TIER (e.g. "owner" on the owner's own node),
     # and the access_tier-clamp + newline-forge assertions — which expect the
@@ -119,7 +119,7 @@ def main() -> int:
 
     # import the hyphenated module by path (env must be set first — module reads
     # config + resolves workspace at import time)
-    spec = importlib.util.spec_from_file_location("rtc", Path(__file__).resolve().parent / "remote-relay-bridge.py")
+    spec = importlib.util.spec_from_file_location("rtc", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
     rtc = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(rtc)
 
@@ -130,8 +130,8 @@ def main() -> int:
     tfile = rtc.TASKS_DIR / "task-MOCK1.txt"
     check(tfile.exists(), "task file written")
     content = tfile.read_text() if tfile.exists() else ""
-    check("task: hello from relay" in content, "task body serialized")
-    check("source: remote-relay" in content, "source field carried")
+    check("task: hello from gateway" in content, "task body serialized")
+    check("source: remote-gateway" in content, "source field carried")
     check("access_tier: team" in content and "access_tier: owner" not in content,
           "access_tier CLAMPED to local default (wire said owner — never trusted)")
     # context enrichment: room_name / sender_name / reply_to_* serialize when
@@ -154,9 +154,9 @@ def main() -> int:
           "heartbeat POSTed")
     if STATE["heartbeats"]:
         h = STATE["heartbeats"][0]
-        check(h.get("client") == "sutando-relay-client"
+        check(h.get("client") == "sutando-gateway-client"
               and h.get("protocol_version") == 1
-              and h.get("provider") == "remote-relay"
+              and h.get("provider") == "remote-gateway"
               and h.get("tier") == "team"
               and h.get("inflight") == 2
               and "task-ack" in h.get("capabilities", []),
@@ -214,7 +214,7 @@ def main() -> int:
     check("status" not in hb3 and "step" not in hb3,
           "malformed core-status → heartbeat omits status/step (liveness-only)")
 
-    # Backwards compatibility: old relays that only implement pull/results can
+    # Backwards compatibility: old gateways that only implement pull/results can
     # 404 optional protocol extensions; the client disables them and continues.
     STATE["force_ack_404"] = True
     rtc._ack_disabled = False
@@ -239,14 +239,14 @@ def main() -> int:
     tier_lines = [ln for ln in flines if ln.startswith("access_tier:")]
     check(tier_lines == ["access_tier: team"],
           "newline in field cannot forge a second access_tier line")
-    # Minor — no-send / deduped markers are archived, never POSTed to the relay
+    # Minor — no-send / deduped markers are archived, never POSTed to the gateway
     _before = len(STATE["results"])
     (rtc.RESULTS_DIR).mkdir(parents=True, exist_ok=True)
     (rtc.RESULTS_DIR / "task-MARK.txt").write_text("[no-send]\n")
     rtc._post_ready_results({"task-MARK"})
     check(len(STATE["results"]) == _before
           and not (rtc.RESULTS_DIR / "task-MARK.txt").exists(),
-          "[no-send] marker archived, not POSTed to relay")
+          "[no-send] marker archived, not POSTed to gateway")
 
     # 2. idempotent: re-writing the same task doesn't duplicate / error
     before = content
@@ -338,7 +338,7 @@ def main() -> int:
     check(bool(saved) and Path(saved.group(1)).read_bytes() == b"PNGBYTES",
           "media bytes written to the local file")
     check(bool(fetched) and fetched[0][1].get("Authorization") == "Bearer testtoken",
-          "relay-hosted media fetched with the relay bearer")
+          "gateway-hosted media fetched with the gateway bearer")
     # matrix media URL without an HS token → marker left untouched
     body2 = rtc._maybe_fetch_media(
         f"[{rtc.MEDIA_MARKER_TAG}: https://hs.example/_matrix/media/v3/download/hs/xyz mime=image/png name=a.png]")
@@ -355,17 +355,17 @@ def main() -> int:
     check(f"[{rtc.MEDIA_MARKER_TAG}:" in body4, "failed media fetch leaves marker untouched")
     rtc._download_bytes = real_download
 
-    # 7. owner-activity gate follows LOCAL_TIER, not the relay's tier claim
+    # 7. owner-activity gate follows LOCAL_TIER, not the gateway's tier claim
     act = rtc.OWNER_ACTIVITY_FILE
     act.unlink(missing_ok=True)
-    rtc._write_owner_activity({"task": "[X @u] hi there", "source": "remote-relay",
+    rtc._write_owner_activity({"task": "[X @u] hi there", "source": "remote-gateway",
                                "access_tier": "owner"})
     check(not act.exists(),
           "LOCAL_TIER=team → owner-activity NOT written even if wire claims owner")
     rtc.LOCAL_TIER = "owner"
-    rtc._write_owner_activity({"task": "[X @u] hi there", "source": "remote-relay"})
+    rtc._write_owner_activity({"task": "[X @u] hi there", "source": "remote-gateway"})
     data = json.loads(act.read_text()) if act.exists() else {}
-    check(data.get("summary") == "hi there" and data.get("channel") == "remote-relay",
+    check(data.get("summary") == "hi there" and data.get("channel") == "remote-gateway",
           "LOCAL_TIER=owner → owner-activity written with stripped summary")
     rtc.LOCAL_TIER = "team"
 
