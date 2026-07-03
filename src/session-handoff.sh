@@ -89,7 +89,7 @@ import sys; sys.path.insert(0, '$REPO/src')
 from util_paths import personal_path
 from pathlib import Path
 print(personal_path('pending-questions.md', Path('$WORKSPACE_DIR')))
-" 2>/dev/null || echo "$WORKSPACE_DIR/hosts/$(hostname | sed 's/\..*//')/pending-questions.md")
+" 2>/dev/null || echo "$WORKSPACE_DIR/hosts/${SUTANDO_HOST_LABEL:-${SUTANDO_HOST_OVERRIDE:-$(scutil --get LocalHostName 2>/dev/null | grep . || hostname | sed 's/\..*//')}}/pending-questions.md")
   echo "## Pending Questions"
   if [ -f "$PQ_PATH" ]; then
     grep -A1 "^## Q" "$PQ_PATH" | head -20
