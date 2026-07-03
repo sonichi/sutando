@@ -10,7 +10,12 @@
     "name": {
       "type": "string",
       "pattern": "^[a-z0-9][a-z0-9-]*$",
-      "description": "Skill id / slug. Lowercase, digits, dashes. Must match the skill directory name."
+      "description": "Skill id / slug. Lowercase, digits, dashes. Must match the skill directory name. Published to the SkillPack registry as `@<scope>/<name>` (see `scope`)."
+    },
+    "scope": {
+      "type": "string",
+      "pattern": "^@[a-z0-9][a-z0-9-]*$",
+      "description": "Optional publish namespace for the SkillPack registry (github.com/ag2ai/skillpack). Combined with `name` it forms the canonical `@scope/name` id (e.g. scope '@sutando' + name 'zoom' -> '@sutando/zoom'). In-repo, `name` stays a flat slug matching the directory so the loader is unaffected; the scope is applied at publish. Absent = the registry assigns a default scope."
     },
     "version": {
       "type": "string",

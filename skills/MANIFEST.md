@@ -142,6 +142,7 @@ backend swap, never a re-format.
 | Field | Required | Meaning |
 |---|---|---|
 | `name` | yes | skill id / slug; must match the directory name |
+| `scope` | opt | publish namespace for the SkillPack registry; `name` + `scope` → canonical `@scope/name` (e.g. `@sutando/zoom`). In-repo `name` stays flat, so the loader is unaffected |
 | `version` | yes | SemVer. MAJOR=breaking, MINOR=compat feature, PATCH=fix/eval |
 | `owner` | yes | who maintains it (handle / team / org) |
 | `stability` | yes | `stable` \| `experimental` \| `deprecated` |

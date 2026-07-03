@@ -97,6 +97,20 @@ def main() -> int:
     e, _ = errs(d)
     check(any("invalid JSON" in x for x in e), "invalid JSON flagged")
 
+    # 10. valid optional scope (SkillPack @scope/name mapping) → no error
+    e, w = errs(_skill(tmp, "scoped", {
+        "name": "scoped", "version": "1.0.0", "owner": "m", "stability": "stable",
+        "scope": "@sutando",
+    }))
+    check(e == [] and w == [], "valid '@scope' → no error/warning")
+
+    # 11. malformed scope (missing '@') → error
+    e, _ = errs(_skill(tmp, "badscope", {
+        "name": "badscope", "version": "1.0.0", "owner": "m", "stability": "stable",
+        "scope": "sutando",
+    }))
+    check(any("scope" in x for x in e), "scope without '@' flagged")
+
     print(f"\n{'PASS — all checks green' if not FAILS else f'FAIL — {len(FAILS)} failing'}")
     return 0 if not FAILS else 1
 

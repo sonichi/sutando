@@ -42,12 +42,13 @@ def _repo_root() -> Path:
 REPO = _repo_root()
 SEMVER = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+SCOPE_RE = re.compile(r"^@[a-z0-9][a-z0-9-]*$")
 STABILITY = {"stable", "experimental", "deprecated"}
 FS_LEVELS = {"none", "read-only", "read-write"}
 TIERS = {"owner", "team", "other"}
 INTENTS = {"candidate-contribution", "private-customization"}
 KNOWN_TOP = {
-    "name", "version", "owner", "license", "description", "stability",
+    "name", "scope", "version", "owner", "license", "description", "stability",
     "agent_compatibility", "dependencies", "permissions", "contract",
     "provenance", "enabled", "access_tier", "tools", "server", "startup", "config",
 }
@@ -93,6 +94,11 @@ def _lint_manifest(skill_dir: Path) -> tuple[list[str], list[str]]:
             err(f"name '{name}' must be lowercase-dash slug")
         if name != skill_dir.name:
             err(f"name '{name}' does not match directory '{skill_dir.name}'")
+    # scope is optional; it maps this skill to a SkillPack `@scope/name` id at
+    # publish (in-repo `name` stays flat/dir-matched — the loader is unaffected).
+    scope = m.get("scope")
+    if scope is not None and not (isinstance(scope, str) and SCOPE_RE.match(scope)):
+        err(f"scope '{scope}' must be an '@namespace' slug (e.g. '@sutando')")
     ver = m.get("version")
     if isinstance(ver, str) and not SEMVER.match(ver):
         err(f"version '{ver}' is not SemVer (X.Y.Z)")
