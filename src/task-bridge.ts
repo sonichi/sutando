@@ -72,20 +72,24 @@ const _HEADER_KEYS = [
 	'guild_name', 'source_message_id', 'parent_message_id', 'user_id',
 	'access_tier', 'priority', 'chat_id', 'thread_ts',
 ];
-const _HEADER_RE = new RegExp(`^(?:${_HEADER_KEYS.join('|')})\\s*:`);
+const _HEADER_RE = new RegExp(`^(?:${_HEADER_KEYS.join('|')})\\s*:`, 'i');
 const _FENCE_RE = /^={3,}/;
+// Every separator str.splitlines() / universal-newline readers treat as a
+// line boundary — fold ALL to '\n' so the guard's line-set matches the
+// reader's (else \v \f \x1c-\x1e \x85 \u2028 \u2029 smuggle a forged line past it).
+const _LINE_SEP_RE = /\r\n|[\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]/g;
 
 /**
  * Defang user-supplied content before embedding in a task file.
  *
  * Prefixes any line that looks like a task-file header field or a
  * ===FENCE=== with U+200B so structural injection (access_tier forge,
- * system-instruction fence) cannot succeed. Idempotent and CR/CRLF-safe.
+ * system-instruction fence) cannot succeed. Idempotent; folds every str.splitlines() separator (not just CR/CRLF).
  * TypeScript mirror of src/task_body_guard.py:confine_user_content().
  */
 function confineUserContent(text: string): string {
 	if (!text) return text;
-	const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+	const normalized = text.replace(_LINE_SEP_RE, '\n');
 	return normalized.split('\n').map(line => {
 		const probe = line.trimStart();
 		if ((_HEADER_RE.test(probe) || _FENCE_RE.test(probe)) && !line.startsWith(_ZWSP)) {

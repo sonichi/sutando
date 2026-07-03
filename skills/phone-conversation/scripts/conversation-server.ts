@@ -257,8 +257,12 @@ const _CONF_HEADER_RE = new RegExp(
 	'^(?:id|timestamp|task|source|channel_id|channel_name|guild_name|' +
 	'source_message_id|parent_message_id|user_id|access_tier|priority|' +
 	'chat_id|thread_ts)\\s*:',
+	'i',
 );
 const _CONF_FENCE_RE = /^={3,}/;
+// Fold every str.splitlines() separator to '\n' so the guard's line-set
+// matches the reader's (else \v \f \x1c-\x1e \x85 LS PS smuggle a forged line).
+const _CONF_LINE_SEP_RE = /\r\n|[\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]/g;
 /**
  * Defang caller-supplied text before embedding in a task file.
  * Mirrors src/task_body_guard.py:confine_user_content() and
@@ -266,7 +270,7 @@ const _CONF_FENCE_RE = /^={3,}/;
  */
 function confineUserContent(text: string): string {
 	if (!text) return text;
-	const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+	const normalized = text.replace(_CONF_LINE_SEP_RE, '\n');
 	return normalized.split('\n').map(line => {
 		const probe = line.trimStart();
 		if ((_CONF_HEADER_RE.test(probe) || _CONF_FENCE_RE.test(probe)) && !line.startsWith(_ZWSP)) {
