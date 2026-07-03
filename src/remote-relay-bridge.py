@@ -118,6 +118,48 @@ LOCAL_TIER = (_env_compat("REMOTE_TASK_TIER", "AG2_REMOTE_TIER") or "team").stri
 if LOCAL_TIER not in ("owner", "team", "other"):
     LOCAL_TIER = "team"
 
+# ── inbound media fetch (owner screenshots, file uploads) ────────────────────
+# A relay can hand the task body a media MARKER instead of raw bytes:
+#   [<tag>: <url> mime=<m> name=<f> size=<n> kind=<msgtype>] <caption>
+# `<url>` is typically unreachable for the core as-is (a homeserver media URL
+# behind authenticated-media, or a relay media-proxy URL). We resolve it here —
+# where the relay bearer already lives — download the bytes to a local file,
+# and rewrite the marker to `[File attached: <path>]` (the inbound convention
+# the Discord/Telegram bridges use) so the core just reads a local path with
+# zero remote creds.
+#
+# Auth is picked by the URL:
+#   • URL under REMOTE_TASK_URL → fetched with the relay bearer we already hold
+#   • a Matrix `/_matrix/media/...` URL → upgraded to the authenticated
+#     MSC3916 client route and fetched with REMOTE_MEDIA_HS_TOKEN (a homeserver
+#     access token), if configured
+#   • any other https URL → fetched with NO credentials
+# Authenticated fetches do NOT follow redirects (a relay-controlled URL must
+# not be able to bounce our bearer to a third-party host). Drop-in safe: no
+# token / fetch error / oversize → the marker is left untouched.
+#
+# The marker tag is configurable (REMOTE_MEDIA_MARKER, slug chars only) so a
+# provider-specific relay can keep its existing marker name without this repo
+# carrying provider strings.
+MEDIA_MARKER_TAG = re.sub(r"[^A-Za-z0-9_-]", "",
+                          os.environ.get("REMOTE_MEDIA_MARKER") or "remote-media")
+MEDIA_MARKER_RE = re.compile(r"\[" + re.escape(MEDIA_MARKER_TAG) + r":([^\]]*)\]")
+HS_MEDIA_TOKEN = os.environ.get("REMOTE_MEDIA_HS_TOKEN") or ""
+MEDIA_DIR = Path(os.environ.get("REMOTE_MEDIA_DIR") or str(WS / "data" / "remote-media"))
+MAX_MEDIA_BYTES = int(os.environ.get("REMOTE_MEDIA_MAX_BYTES") or str(25 * 1024 * 1024))
+_EXT_BY_MIME = {
+    "image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg",
+    "image/gif": ".gif", "image/webp": ".webp", "image/svg+xml": ".svg",
+    "application/pdf": ".pdf",
+}
+
+# Bridges-as-siblings: discord/telegram/slack bridges write
+# `state/last-owner-activity.json` whenever the owner messages them, so the
+# proactive-loop's "active engagement" gate knows a conversation is live. The
+# relay transport should feed the same gate — but only when THIS node treats
+# relay traffic as owner traffic (LOCAL_TIER, never the relay's claim).
+OWNER_ACTIVITY_FILE = WS / "state" / "last-owner-activity.json"
+
 
 # Blocker (review 2026-06-13): the relay is untrusted, so a task `id` flows
 # into filesystem paths (task write + result read-back/POST). Reject anything
@@ -263,6 +305,123 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
         return False
 
 
+def _marker_attr(attrs: str, key: str) -> str:
+    """Pull a `key=value` (value = non-space run) out of the marker attr tail."""
+    m = re.search(rf"\b{re.escape(key)}=([^\s\]]+)", attrs)
+    return m.group(1) if m else ""
+
+
+def _to_authed_media_url(url: str) -> str:
+    """Upgrade a legacy unauthenticated Matrix media route to the MSC3916
+    authenticated client route (Matrix v1.11+). Leaves other URLs untouched.
+      /_matrix/media/(r0|v3)/download/<server>/<id>
+        → /_matrix/client/v1/media/download/<server>/<id>"""
+    return re.sub(r"/_matrix/media/(?:r0|v3)/download/",
+                  "/_matrix/client/v1/media/download/", url, count=1)
+
+
+def _download_bytes(url: str, headers: dict, cap: int) -> bytes:
+    """GET raw bytes with an explicit size cap (reads cap+1 then rejects if
+    over, so a missing/lying Content-Length can't OOM us). When an
+    Authorization header is present, redirects are NOT followed — a
+    relay-controlled URL must not bounce our bearer to another host."""
+    req = urllib.request.Request(url, method="GET")
+    for k, v in headers.items():
+        req.add_header(k, v)
+    if "Authorization" in headers:
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a, **kw):  # noqa: D401
+                return None
+        opener = urllib.request.build_opener(_NoRedirect)
+        resp_ctx = opener.open(req, timeout=30)
+    else:
+        resp_ctx = urllib.request.urlopen(req, timeout=30)
+    with resp_ctx as resp:
+        data = resp.read(cap + 1)
+    if len(data) > cap:
+        raise ValueError(f"media exceeds {cap}-byte cap")
+    return data
+
+
+def _maybe_fetch_media(body: str) -> str:
+    """If `body` carries a media marker, download the attachment to a local
+    file and rewrite the marker to `[File attached: <path>]`. Returns the body
+    unchanged on any failure (drop-in safe)."""
+    m = MEDIA_MARKER_RE.search(body or "")
+    if not m:
+        return body
+    inner = m.group(1).strip()
+    if not inner:
+        return body
+    parts = inner.split(None, 1)
+    url = parts[0]
+    attrs = parts[1] if len(parts) > 1 else ""
+    mime = _marker_attr(attrs, "mime")
+    name = _marker_attr(attrs, "name")
+    kind = _marker_attr(attrs, "kind")
+
+    if not url.startswith(("https://", "http://")):
+        return body
+    headers = {"User-Agent": "sutando-relay-client/1.0"}
+    if URL and url.startswith(URL):
+        headers["Authorization"] = f"Bearer {TOKEN}"            # relay media-proxy
+    elif "/_matrix/" in url:
+        if not HS_MEDIA_TOKEN:
+            return body                                          # can't auth — leave marker
+        url = _to_authed_media_url(url)
+        headers["Authorization"] = f"Bearer {HS_MEDIA_TOKEN}"
+    # else: a plain public URL — fetched with no credentials.
+
+    try:
+        data = _download_bytes(url, headers, MAX_MEDIA_BYTES)
+    except Exception as e:  # noqa: BLE001 — drop-in safe
+        _log(f"media fetch failed ({e}) — leaving marker as-is")
+        return body
+    try:
+        MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+        ext = _EXT_BY_MIME.get(mime.lower(), "")
+        if not ext and "." in name:
+            ext = "." + re.sub(r"[^A-Za-z0-9]", "", name.rsplit(".", 1)[1])[:8]
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", name) or "attachment"
+        if ext and safe.endswith(ext):
+            safe = safe[: -len(ext)]
+        path = MEDIA_DIR / f"{int(time.time() * 1000)}-{safe}{ext}"
+        path.write_bytes(data)
+    except Exception as e:  # noqa: BLE001
+        _log(f"media save failed ({e}) — leaving marker as-is")
+        return body
+    _log(f"fetched media → {path} ({len(data)} bytes)")
+    label = "Photo attached" if str(kind) == "m.image" else "File attached"
+    return MEDIA_MARKER_RE.sub(f"[{label}: {path}]", body, count=1)
+
+
+def _write_owner_activity(task: dict) -> None:
+    """Record that the owner was active on this transport right now — but only
+    when THIS node grants relay traffic owner tier (LOCAL_TIER, never the
+    relay's own claim; the relay is outside the trust boundary). Atomic write
+    via tmp+rename; same schema (`ts`, `channel`, `summary`) as
+    discord-bridge.write_owner_activity so the proactive-loop reader is
+    transport-agnostic. Best-effort — never blocks task intake."""
+    if LOCAL_TIER != "owner":
+        return
+    try:
+        OWNER_ACTIVITY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # Strip a bracket prefix a relay may add (e.g. "[Provider @user] body").
+        body = (task.get("task") or "").lstrip()
+        if body.startswith("[") and "]" in body:
+            body = body[body.index("]") + 1:].lstrip()
+        payload = {
+            "ts": int(time.time()),
+            "channel": task.get("source") or PROVIDER,
+            "summary": body[:80],
+        }
+        tmp = OWNER_ACTIVITY_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload))
+        tmp.rename(OWNER_ACTIVITY_FILE)
+    except Exception as e:  # noqa: BLE001
+        _log(f"owner-activity write failed: {e}")
+
+
 def _write_task(task: dict) -> str | None:
     """Serialize a relay task into tasks/task-<id>.txt (same schema as bridges).
     Returns the task id, or None if it has no id / already present."""
@@ -306,6 +465,9 @@ def _write_task(task: dict) -> str | None:
     for f in _TASK_FIELDS:
         if f == "source":
             lines.append(f"source: {_one_line(task.get('source') or PROVIDER)}")
+        elif f == "task" and task.get("task") not in (None, ""):
+            # Resolve an inbound media marker to a local file the core can read.
+            lines.append(f"task: {_one_line(_maybe_fetch_media(str(task['task'])))}")
         elif f in task and task[f] not in (None, ""):
             lines.append(f"{f}: {_one_line(task[f])}")
     # access_tier is a LOCAL decision and written LAST so it wins even under a
@@ -316,6 +478,8 @@ def _write_task(task: dict) -> str | None:
     tmp.write_text("\n".join(lines) + "\n")
     tmp.rename(dest)  # atomic publish so the watcher never sees a partial file
     _log(f"queued {tid}")
+    # Bridges-as-siblings: feed the proactive-loop's active-engagement gate.
+    _write_owner_activity(task)
     return tid
 
 

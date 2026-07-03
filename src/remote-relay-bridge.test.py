@@ -15,6 +15,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -323,6 +324,50 @@ def main() -> int:
         check(False, "401 raises HTTPError")
     except urllib.error.HTTPError as e:
         check(e.code == 401, "401 raises HTTPError")
+
+    # 6. inbound media marker → local file rewrite (network mocked)
+    fetched = []
+    real_download = rtc._download_bytes
+    rtc._download_bytes = lambda url, headers, cap: (fetched.append((url, dict(headers))) or b"PNGBYTES")
+    body = rtc._maybe_fetch_media(
+        f"[{rtc.MEDIA_MARKER_TAG}: {os.environ['REMOTE_TASK_URL']}/media/abc "
+        "mime=image/png name=shot.png kind=m.image] look at this")
+    check("[Photo attached: " in body and body.endswith("look at this"),
+          "media marker rewritten to local Photo-attached path")
+    saved = re.search(r"\[Photo attached: ([^\]]+)\]", body)
+    check(bool(saved) and Path(saved.group(1)).read_bytes() == b"PNGBYTES",
+          "media bytes written to the local file")
+    check(bool(fetched) and fetched[0][1].get("Authorization") == "Bearer testtoken",
+          "relay-hosted media fetched with the relay bearer")
+    # matrix media URL without an HS token → marker left untouched
+    body2 = rtc._maybe_fetch_media(
+        f"[{rtc.MEDIA_MARKER_TAG}: https://hs.example/_matrix/media/v3/download/hs/xyz mime=image/png name=a.png]")
+    check(f"[{rtc.MEDIA_MARKER_TAG}:" in body2, "matrix media without HS token leaves marker untouched")
+    # non-http URL → untouched (no fetch attempted)
+    n_before = len(fetched)
+    body3 = rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: file:///etc/passwd name=x]")
+    check(f"[{rtc.MEDIA_MARKER_TAG}:" in body3 and len(fetched) == n_before,
+          "non-http media URL is never fetched")
+    # download failure → drop-in safe (marker untouched)
+    rtc._download_bytes = lambda *a, **kw: (_ for _ in ()).throw(ValueError("boom"))
+    body4 = rtc._maybe_fetch_media(
+        f"[{rtc.MEDIA_MARKER_TAG}: {os.environ['REMOTE_TASK_URL']}/media/dead name=d.bin]")
+    check(f"[{rtc.MEDIA_MARKER_TAG}:" in body4, "failed media fetch leaves marker untouched")
+    rtc._download_bytes = real_download
+
+    # 7. owner-activity gate follows LOCAL_TIER, not the relay's tier claim
+    act = rtc.OWNER_ACTIVITY_FILE
+    act.unlink(missing_ok=True)
+    rtc._write_owner_activity({"task": "[X @u] hi there", "source": "remote-relay",
+                               "access_tier": "owner"})
+    check(not act.exists(),
+          "LOCAL_TIER=team → owner-activity NOT written even if wire claims owner")
+    rtc.LOCAL_TIER = "owner"
+    rtc._write_owner_activity({"task": "[X @u] hi there", "source": "remote-relay"})
+    data = json.loads(act.read_text()) if act.exists() else {}
+    check(data.get("summary") == "hi there" and data.get("channel") == "remote-relay",
+          "LOCAL_TIER=owner → owner-activity written with stripped summary")
+    rtc.LOCAL_TIER = "team"
 
     srv.shutdown()
     if FAILS:
