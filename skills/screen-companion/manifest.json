@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "owner": "github:sonichi/sutando",
   "license": "MIT",
-  "stability": "stable",
+  "stability": "experimental",
   "access_tier": "owner",
   "enabled": true,
   "description": "Screen Companion mode entry \u2014 voice tool that loads a use-case config (guided-setup, etc.) and returns the prompt overlay + activation message Gemini should follow for the rest of the session.",
