@@ -93,8 +93,13 @@ def _build_helper_namespace_with_archive(tmpdir: Path, active: dict, archived: d
 def test_allowlist_is_positive_voice_phone_only():
     const_src = _extract(r"DM_FALLBACK_SOURCES = \{[^}]*\}")
     assert "voice" in const_src and "phone" in const_src, const_src
+    # sutando-meeting#54: discord-voice results' only primary consumer is the
+    # live session; when it dies first, this fallback is the ONLY delivery.
+    assert "discord-voice" in const_src, (
+        f"discord-voice must be DM-fallback eligible (sutando-meeting#54): {const_src}"
+    )
     # Must NOT be the old denylist of local sources.
-    assert "api" not in const_src and "chat" not in const_src, (
+    assert '"api"' not in const_src and '"chat"' not in const_src, (
         "DM_FALLBACK_SOURCES must be a positive allowlist of channel-less "
         f"sources, not a denylist: {const_src}"
     )

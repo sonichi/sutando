@@ -4291,7 +4291,14 @@ async def poll_proactive():
 # owns its own delivery path and must never be echoed here. This is an
 # allowlist, not a denylist: a newly-added source is non-eligible by default
 # and can never leak into DM unless deliberately added.
-DM_FALLBACK_SOURCES = {"voice", "phone"}
+#
+# "discord-voice" added 2026-07-03 (sutando-meeting#54, owner-hit): a voice-
+# delegated task's ONLY primary consumer is the live discord-voice session,
+# and when the bot leaves the VC before the result lands, nothing else ever
+# delivers it — the completed work silently rots until the retention sweep.
+# The session keeps first dibs via the 90s grace window; this fallback fires
+# only when the result is still sitting there after that.
+DM_FALLBACK_SOURCES = {"voice", "phone", "discord-voice"}
 
 
 def _task_source(task_id: str):
