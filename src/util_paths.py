@@ -86,7 +86,10 @@ def _workspace_root() -> Path:
                     return Path(result.stdout.strip())
         except Exception:
             pass
-        return Path.home() / ".sutando" / "workspace"
+        # Last-ditch default: the canonical post-v0.8 home-dir location
+        # (~/sutando-workspace, matching sutando_config.py resolve_workspace) —
+        # NOT the pre-v0.8 dotted ~/.sutando/workspace, which no longer exists.
+        return Path.home() / "sutando-workspace"
 
 
 def _host_label() -> str:
