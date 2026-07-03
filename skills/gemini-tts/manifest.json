@@ -1,0 +1,8 @@
+{
+  "name": "gemini-tts",
+  "version": "1.0.0",
+  "owner": "sonichi/sutando",
+  "license": "MIT",
+  "stability": "stable",
+  "description": "Render text to mp3 via Google Gemini Flash TTS. Free-tier eligible (1500 req/day). Use for video narration, demo voiceovers, audio notes. Parallels openai-tts; default for make-viral-video."
+}

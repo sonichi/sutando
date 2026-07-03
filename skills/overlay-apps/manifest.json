@@ -1,0 +1,8 @@
+{
+  "name": "overlay-apps",
+  "version": "1.0.0",
+  "owner": "sonichi/sutando",
+  "license": "MIT",
+  "stability": "stable",
+  "description": "Framework + minimal example for Sutando desktop overlay applications \u2014 always-on-top, frameless Electron windows that float over the desktop, controllable from the Sutando web UI's /overlays manager. Ships one example overlay (System Resources). Add new overlays by registering them in app/main.js."
+}

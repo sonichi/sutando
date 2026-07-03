@@ -1,0 +1,8 @@
+{
+  "name": "audio-transcribe",
+  "version": "1.0.0",
+  "owner": "sonichi/sutando",
+  "license": "MIT",
+  "stability": "stable",
+  "description": "Transcribes audio files (voice notes, clips) to text via Gemini 2.5-flash."
+}

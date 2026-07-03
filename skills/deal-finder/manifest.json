@@ -1,0 +1,8 @@
+{
+  "name": "deal-finder",
+  "version": "1.0.0",
+  "owner": "sonichi/sutando",
+  "license": "MIT",
+  "stability": "stable",
+  "description": "Scan configured sources (Craigslist now; eBay + Facebook Marketplace planned) for used-item listings matching the owner's criteria. Currently configured for a Mac mini search (M2+, 16GB+, 512GB+, \u2264$500, near 94566). Notify owner via SMS + Telegram on a match."
+}

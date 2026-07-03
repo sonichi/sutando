@@ -1,0 +1,8 @@
+{
+  "name": "agent-room-ops",
+  "version": "1.0.0",
+  "owner": "sonichi/sutando",
+  "license": "MIT",
+  "stability": "stable",
+  "description": "**One skill, multiple tools.** Everything an agent does in a room beyond its task"
+}

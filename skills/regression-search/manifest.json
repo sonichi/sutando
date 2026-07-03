@@ -1,0 +1,8 @@
+{
+  "name": "regression-search",
+  "version": "1.0.0",
+  "owner": "sonichi/sutando",
+  "license": "MIT",
+  "stability": "stable",
+  "description": "Search phone-call history for when a feature regressed (find-regression.py) and drill into a single call to see what went wrong (diagnose-call.py). Skips reading 100+ transcripts by hand."
+}

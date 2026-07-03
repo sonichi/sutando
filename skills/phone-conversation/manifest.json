@@ -1,0 +1,8 @@
+{
+  "name": "phone-conversation",
+  "version": "1.0.0",
+  "owner": "sonichi/sutando",
+  "license": "MIT",
+  "stability": "stable",
+  "description": "Make conversational phone calls and join Zoom meetings via Twilio + Gemini. Multi-turn AI conversations on the phone on behalf of the user."
+}

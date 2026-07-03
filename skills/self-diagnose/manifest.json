@@ -1,0 +1,8 @@
+{
+  "name": "self-diagnose",
+  "version": "1.0.0",
+  "owner": "sonichi/sutando",
+  "license": "MIT",
+  "stability": "stable",
+  "description": "Sutando introspection \u2014 read logs + git + memory + build log for a chosen time window and produce a concise narrative of what the agent has been doing, what's broken, and what to prioritize next."
+}

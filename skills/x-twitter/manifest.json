@@ -1,0 +1,8 @@
+{
+  "name": "x-twitter",
+  "version": "1.0.0",
+  "owner": "sonichi/sutando",
+  "license": "MIT",
+  "stability": "stable",
+  "description": "Post tweets, search, read mentions, and check engagement on X (Twitter) via API v2."
+}

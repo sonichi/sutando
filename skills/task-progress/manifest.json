@@ -1,0 +1,8 @@
+{
+  "name": "task-progress",
+  "version": "1.0.0",
+  "owner": "sonichi/sutando",
+  "license": "MIT",
+  "stability": "stable",
+  "description": "Sends mid-task progress updates to the channel a task came from (Slack, Discord, or Telegram)."
+}

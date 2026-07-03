@@ -1,0 +1,8 @@
+{
+  "name": "db-browser",
+  "version": "1.0.0",
+  "owner": "sonichi/sutando",
+  "license": "MIT",
+  "stability": "stable",
+  "description": "Install DB Browser for SQLite (if not already installed) and open a .sqlite file in it. macOS only."
+}
