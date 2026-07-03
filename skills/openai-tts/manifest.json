@@ -3,6 +3,6 @@
   "version": "1.0.0",
   "owner": "sonichi/sutando",
   "license": "MIT",
-  "stability": "stable",
+  "stability": "experimental",
   "description": "Render text to mp3 via OpenAI's tts-1-hd. Use for video narration, demo voiceovers, audio notes."
 }

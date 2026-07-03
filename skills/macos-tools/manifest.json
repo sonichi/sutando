@@ -3,6 +3,6 @@
   "version": "1.0.0",
   "owner": "sonichi/sutando",
   "license": "MIT",
-  "stability": "stable",
+  "stability": "experimental",
   "description": "macOS native integrations: screen capture, calendar, reminders, contacts, email (Mail.app), Spotlight search. Use when the user asks about their screen, schedule, to-do list, contacts, or wants to send email on macOS."
 }

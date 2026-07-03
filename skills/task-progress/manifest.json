@@ -3,6 +3,6 @@
   "version": "1.0.0",
   "owner": "sonichi/sutando",
   "license": "MIT",
-  "stability": "stable",
+  "stability": "experimental",
   "description": "Sends mid-task progress updates to the channel a task came from (Slack, Discord, or Telegram)."
 }

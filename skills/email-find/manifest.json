@@ -3,6 +3,6 @@
   "version": "1.0.0",
   "owner": "sonichi/sutando",
   "license": "MIT",
-  "stability": "stable",
+  "stability": "experimental",
   "description": "Locate a specific email when the obvious searches fail. Use when the user is confident an email exists but a targeted query returned nothing."
 }

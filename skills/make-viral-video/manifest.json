@@ -3,6 +3,6 @@
   "version": "1.0.0",
   "owner": "sonichi/sutando",
   "license": "MIT",
-  "stability": "stable",
+  "stability": "experimental",
   "description": "Build a short news-explainer video tuned for shareability. One striking moment per video; real fetched assets; self-heal validation; pluggable TTS (Gemini-free default, OpenAI fallback)."
 }

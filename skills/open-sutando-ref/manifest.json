@@ -3,6 +3,6 @@
   "version": "1.0.0",
   "owner": "sonichi/sutando",
   "license": "MIT",
-  "stability": "stable",
+  "stability": "experimental",
   "description": "Resolve a fuzzy GitHub reference (issue number, PR number, or text description) to a URL and optionally open it in the browser."
 }

@@ -3,6 +3,6 @@
   "version": "1.0.0",
   "owner": "sonichi/sutando",
   "license": "MIT",
-  "stability": "stable",
+  "stability": "experimental",
   "description": "Scans Gmail for active paid subscriptions and tracks them over time. Surfaces additions / cancellations between scans."
 }

@@ -3,6 +3,6 @@
   "version": "1.0.0",
   "owner": "sonichi/sutando",
   "license": "MIT",
-  "stability": "stable",
+  "stability": "experimental",
   "description": "Generate and edit images using Gemini Flash Image, and generate videos using Veo. Supports text-to-image, image editing, text-to-video, and image-to-video."
 }

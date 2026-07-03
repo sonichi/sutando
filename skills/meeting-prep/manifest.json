@@ -3,6 +3,6 @@
   "version": "1.0.0",
   "owner": "sonichi/sutando",
   "license": "MIT",
-  "stability": "stable",
+  "stability": "experimental",
   "description": "Auto-prepare for upcoming meetings: attendee info, recent email threads, talking points, and agenda. Runs 30 min before each meeting or on demand."
 }

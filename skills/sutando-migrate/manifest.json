@@ -3,6 +3,6 @@
   "version": "1.0.0",
   "owner": "sonichi/sutando",
   "license": "MIT",
-  "stability": "stable",
+  "stability": "experimental",
   "description": "M1 Part 2 workspace migration \u2014 guided walkthrough that scans legacy state across sources A (repo-root), B (~/.sutando/workspace/), C ($SUTANDO_WORKSPACE env-override), surfaces collisions, gets owner greenlight, commits, verifies, and (if sutando-plus + sync configured) re-routes the vault .git via"
 }

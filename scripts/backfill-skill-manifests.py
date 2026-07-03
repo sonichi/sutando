@@ -7,9 +7,9 @@ manifest to each (identity only — name/version/owner/license/stability +
 description), so every skill is registrable and lint-covered.
 
 Minimal by design: these skills aren't manifest-loaded, so no enabled/tools/
-access_tier — just package identity. Stability defaults to `stable` (matching the
-4 already-migrated, in-production skills); downgrade specific ones to
-`experimental` in a follow-up if their contract isn't settled.
+access_tier — just package identity. Stability defaults to `experimental` — the
+honest default for skills that have never declared a stability contract; promote
+specific mature skills to `stable` deliberately, in a follow-up.
 
 Idempotent: skips any skill that already has a manifest.json. Only touches dirs
 that look like skills (have a SKILL.md). Run from the repo root:
@@ -84,7 +84,7 @@ def _manifest(name: str, desc: str) -> dict:
         "version": "1.0.0",
         "owner": OWNER,
         "license": "MIT",
-        "stability": "stable",
+        "stability": "experimental",
         "description": desc,
     }
 
