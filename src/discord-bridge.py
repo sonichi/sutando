@@ -2496,6 +2496,18 @@ async def _handle_discord_message(message, force=False):
             print(f"  [skip] bot message without mention in requireMention=true channel", flush=True)
             return
 
+        # Progress-stream placeholder guard: a peer node with
+        # SUTANDO_PROGRESS_STREAM=1 posts "⏳ <step> (Ns)" placeholders (and edits
+        # them) while its own owner task runs. In a requireMention=false channel
+        # where that node sits in allowFrom, the bot-author filter above lets them
+        # through and we'd ingest each placeholder + edit as a fresh task — a
+        # self-inflicted flood. These carry no work for us; drop them regardless
+        # of requireMention. Tight-anchored detector (see progress_stream) so a
+        # real task containing an hourglass emoji is not misclassified.
+        if progress_stream.is_progress_placeholder(message.content):
+            print(f"  [skip] progress-stream placeholder from {message.author}", flush=True)
+            return
+
         bot_mentioned = client.user in message.mentions
         role_mentioned = any(role.name.lower() in ("sutando", "sutando bot") or str(client.user.id) in str(role.id) for role in message.role_mentions)
         # Also check if any role mention exists and the bot has that role
