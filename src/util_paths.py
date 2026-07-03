@@ -24,9 +24,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-REPO_DIR = Path(__file__).resolve().parent.parent
-
-
 def _memory_dir_env() -> str | None:
     """Return the resolved memory-dir env value, preferring the new name.
 
@@ -59,13 +56,9 @@ def _memory_dir_env() -> str | None:
 def _workspace_root() -> Path:
     """Workspace root for runtime-state paths.
 
-    Per the workspace contract (docs/workspace-contract.md): REPO_DIR is
-    SOURCE-TREE-ONLY (exec'ing source files, git cwd, reading checked-in
-    files). All user/runtime paths go through the workspace. Delegates to
-    workspace_default.resolve_workspace() so the post-v0.8 canonical
-    default (<repo>/workspace/) and PR #762's one-time legacy migration
-    are honored in one call. ($SUTANDO_WORKSPACE is no longer honored
-    for resolution per #1440; see `src/sutando_config.py`.)
+    Delegates to workspace_default.resolve_workspace() so the post-v0.8
+    canonical default (<repo>/workspace/) is honored. ($SUTANDO_WORKSPACE is
+    no longer honored for resolution per #1440; see `src/sutando_config.py`.)
 
     `migrate=False` — path resolution shouldn't trigger migrations on
     every call. Migration runs from src/startup.sh and the bridge boot
@@ -75,10 +68,24 @@ def _workspace_root() -> Path:
         from workspace_default import resolve_workspace
         return resolve_workspace(migrate=False)
     except ImportError:
-        # Inline fallback. NEVER REPO_DIR — that's source-tree, not workspace.
-        env = os.environ.get("SUTANDO_WORKSPACE")
-        if env:
-            return Path(os.path.expanduser(env))
+        # workspace_default not on sys.path (standalone invocation outside the
+        # repo). Locate the repo root via git, then call sutando-config.sh to
+        # honor sutando.config.local.json and the M0 override chain.
+        try:
+            toplevel = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if toplevel.returncode == 0 and toplevel.stdout.strip():
+                _sh = Path(toplevel.stdout.strip()) / "scripts" / "sutando-config.sh"
+                result = subprocess.run(
+                    ["bash", str(_sh), "workspace"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    return Path(result.stdout.strip())
+        except Exception:
+            pass
         return Path.home() / ".sutando" / "workspace"
 
 
