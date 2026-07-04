@@ -1174,8 +1174,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return "\(modSymbols)\(key)"
     }
 
+    /// Publish the resolved hotkeys to `<workspace>/state/hotkeys.json` so the
+    /// web UI + dashboard render the real bindings instead of hardcoding their
+    /// own copies (which drifted — this is the single source they read). Same
+    /// atomic tmp+replace as the status-file writers above.
+    private func publishHotkeys(_ hotkeys: [(action: String, key: String, modifiers: [String])]) {
+        let entries = hotkeys.map { hk in
+            ["action": hk.action,
+             "label": displayLabel(key: hk.key, modifiers: hk.modifiers),
+             "key": hk.key,
+             "modifiers": hk.modifiers] as [String: Any]
+        }
+        guard let json = try? JSONSerialization.data(withJSONObject: entries, options: [.prettyPrinted]) else { return }
+        let stateDir = workspace + "/state"
+        try? FileManager.default.createDirectory(atPath: stateDir, withIntermediateDirectories: true)
+        let dst = URL(fileURLWithPath: stateDir + "/hotkeys.json")
+        let tmp = URL(fileURLWithPath: stateDir + "/hotkeys.json.tmp")
+        do {
+            try json.write(to: tmp, options: [.atomic])
+            _ = try FileManager.default.replaceItemAt(dst, withItemAt: tmp)
+        } catch {
+            try? FileManager.default.removeItem(at: tmp)
+        }
+    }
+
     func registerHotKey() {
         let hotkeys = loadHotkeyConfig()
+        publishHotkeys(hotkeys)
         var statuses: [String] = []
         for (idx, hk) in hotkeys.enumerated() {
             guard let keyCode = AppDelegate.keyNameToCode[hk.key] else {
