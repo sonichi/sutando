@@ -289,10 +289,13 @@ The Sutando menu bar app (`src/Sutando/`) provides global keyboard shortcuts. It
 
 | Shortcut | Action |
 |----------|--------|
-| ⌃C | **Context drop** — sends selected text, clipboard image, or Finder file to Sutando |
-| ⌃S | **Screenshot drop** — sends a screenshot of the active window/screen to Sutando |
-| ⌃V | **Voice toggle** — connects/disconnects voice in the browser |
-| ⌃M | **Mute toggle** — mutes/unmutes microphone during voice |
+| ⌃V | **Toggle Voice** — connects/disconnects voice in the browser |
+| ⌃⇧C | **Drop Context** — sends selected text, clipboard image, or Finder file to Sutando |
+| ⌃M | **Toggle Mute** — mutes/unmutes microphone during voice |
+| ⌃⇧R | **Drop Video Clip** — sends a screen recording of the active window/screen to Sutando |
+| ⌃S | **Drop Screenshot** — sends a screenshot of the active window/screen to Sutando |
+
+Defaults live in `src/Sutando/main.swift` (`hotkeyDefaults`); override per-machine via `~/.config/sutando/hotkeys.json`.
 
 The menu bar also has **Open Core** (brings up the Claude Code terminal) and **Open Dashboard** (opens the status dashboard at localhost:7844).
 
