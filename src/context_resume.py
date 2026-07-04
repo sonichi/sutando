@@ -116,6 +116,12 @@ def extract_recent_turns(transcript: Path, max_turns: int = 12, max_chars: int =
 
 
 def _latest_transcript() -> Path:
+    # Slug caveat (john, #1909): the slug below derives from this file's real
+    # path, while Claude Code slugifies the session's *logical* cwd — the two
+    # diverge for symlinked checkouts (/tmp vs /private/tmp on macOS) and for
+    # sessions anchored outside the repo (e.g. a cwd-anchor dir). --latest is
+    # a best-effort fallback for standard checkouts; the exact-path arg (from
+    # hook stdin JSON) is always authoritative when present.
     repo = Path(__file__).parent.parent
     proj = subprocess.run(
         ["bash", str(repo / "scripts" / "sutando-config.sh"), "claude-home-path", "projects"],
