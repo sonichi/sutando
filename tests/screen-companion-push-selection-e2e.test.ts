@@ -1,5 +1,3 @@
-// Issue #1425 / PR #1409 gap — END-TO-END push-path wiring.
-//
 // The sibling test (screen-companion-push-selection.test.ts) exercises
 // `_frameHook` in isolation. Neither it nor anything else verifies the wiring
 // this PR actually depends on: that vision-tools' `captureAndSend()` FIRES the

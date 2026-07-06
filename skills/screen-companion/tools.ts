@@ -47,7 +47,7 @@ registerVisionOnContributor(() => {
 	);
 });
 
-// Push-path selection injection (issue #1425, PR #1409 gap).
+// Push-path selection injection.
 // Probes AX/Chrome selection every SELECTION_PROBE_INTERVAL_TICKS frames
 // (~2.1s at 1.4fps). Only injects when selection changes — avoids flooding
 // Gemini with redundant context turns. Uses the injectable _readSelection so

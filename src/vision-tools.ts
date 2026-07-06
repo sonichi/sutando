@@ -174,7 +174,7 @@ export function _getVisionOnContributorCount(): number {
 	return visionOnContributors.length;
 }
 
-// --- Per-frame post-send hook registry (issue #1425) ----------------------
+// --- Per-frame post-send hook registry ----------------------
 //
 // Skills may register a hook that fires after each push-mode frame is sent.
 // Core provides no AX or Chrome selection logic — that belongs in skills.
@@ -480,7 +480,7 @@ async function captureAndSend(source: VisionSource): Promise<{ ok: boolean; erro
 	if (!sendFile) return { ok: false, error: 'no active voice session' };
 	const frame = await source.capture();
 	sendFile(frame.data.toString('base64'), frame.mimeType);
-	// Fire post-send hooks (e.g. screen-companion injects selection text, #1425).
+	// Fire post-send hooks (e.g. screen-companion injects selection text).
 	if (visionFrameHooks.length > 0) {
 		const transport = sessionRef?.transport;
 		if (transport && typeof transport.sendContent === 'function') {
