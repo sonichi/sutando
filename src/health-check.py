@@ -1484,6 +1484,7 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
         f"task: Health check found issues. Decide whether to restart, DM owner, or treat as transient:\n"
         + "\n".join(bullet_lines) + "\n"
         f"source: health-check\n"
+        f"interaction_type: system_event\n"
         f"user_id: health-check\n"
         f"access_tier: owner\n"
         f"priority: low\n"

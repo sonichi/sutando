@@ -3293,6 +3293,7 @@ async def _handle_discord_message(message, force=False):
             f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
             f"task: {user_task_text}\n"
             f"source: discord\n"
+            f"interaction_type: message\n"
             f"channel_id: {message.channel.id}\n"
             f"channel_name: {channel_name}\n"
             f"guild_name: {guild_name}\n"

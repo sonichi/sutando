@@ -108,7 +108,7 @@ _TASK_FIELDS = ("id", "timestamp", "task", "source", "channel_id",
                 # them (absent for other sources); each newline-stripped by
                 # _one_line so a room/display name can't forge an extra line.
                 "room_name", "sender_name", "reply_to_event", "reply_to_me",
-                "source_message_id", "user_id", "priority")
+                "source_message_id", "user_id", "priority", "interaction_type")
 
 # Trust tier is a LOCAL decision (review 2026-06-13): the gateway is outside
 # this machine's trust boundary, so its access_tier claim is ignored. The
@@ -524,6 +524,11 @@ def _write_task(task: dict) -> str | None:
     for f in _TASK_FIELDS:
         if f == "source":
             lines.append(f"source: {_one_line(task.get('source') or PROVIDER)}")
+        elif f == "interaction_type":
+            # Pass through when the gateway sends it; default to "message" —
+            # all current gateway traffic is Matrix room messages.
+            lines.append(
+                f"interaction_type: {_one_line(task.get('interaction_type') or 'message')}")
         elif f == "task" and task.get("task") not in (None, ""):
             # Resolve an inbound media marker to a local file the core can read.
             lines.append(f"task: {_one_line(_maybe_fetch_media(str(task['task'])))}")

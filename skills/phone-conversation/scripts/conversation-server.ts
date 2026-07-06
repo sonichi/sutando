@@ -425,7 +425,7 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 	const skillsHint = process.env.CLAUDE_CONFIG_DIR
 		? `${process.env.CLAUDE_CONFIG_DIR}/skills/`
 		: '~/.claude/skills/';
-	const content = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ncallSid: ${callSession.callSid}\ncaller: ${callSession.callerNumber || 'unknown'}\naccess_tier: ${callSession.isOwner ? 'owner' : 'other'}\ntask: ${taskDescription}\nhint: Check ${skillsHint} for a matching skill before using raw commands.\ntranscript:\n${fullTranscript}\n`;
+	const content = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ninteraction_type: realtime_audio\ncallSid: ${callSession.callSid}\ncaller: ${callSession.callerNumber || 'unknown'}\naccess_tier: ${callSession.isOwner ? 'owner' : 'other'}\ntask: ${taskDescription}\nhint: Check ${skillsHint} for a matching skill before using raw commands.\ntranscript:\n${fullTranscript}\n`;
 	writeFileSync(taskPath, content);
 
 	// Poll for result in background, inject when ready — don't block Gemini
@@ -1235,6 +1235,9 @@ function cleanupCall(callSid: string): void {
 		const taskLines = [
 			`id: ${summaryTaskId}`,
 			`timestamp: ${new Date().toISOString()}`,
+			// system_event, not realtime_audio: written by the call-end
+			// lifecycle, not by a caller utterance during the live session.
+			`interaction_type: system_event`,
 			`callSid: ${callSid}`,
 			`caller: ${session.callerNumber || 'unknown'}`,
 			`access_tier: ${session.isOwner ? 'owner' : 'other'}`,

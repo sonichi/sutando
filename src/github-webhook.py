@@ -161,6 +161,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
                 f"task: {safe_task}\n"
                 f"source: github\n"
+                f"interaction_type: system_event\n"
                 f"access_tier: other\n"
             )
             TASKS_DIR.mkdir(exist_ok=True)
