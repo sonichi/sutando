@@ -110,6 +110,13 @@ _TASK_FIELDS = ("id", "timestamp", "task", "source", "channel_id",
                 "room_name", "sender_name", "reply_to_event", "reply_to_me",
                 "source_message_id", "user_id", "priority", "interaction_type")
 
+# Interaction-plane vocabulary (interaction-planes refactor step 1). Remote
+# values outside this set degrade to "message" rather than passing through.
+_INTERACTION_TYPES = frozenset({
+    "message", "realtime_audio", "realtime_video",
+    "tool_initiated", "system_event", "self_reflective",
+})
+
 # Trust tier is a LOCAL decision (review 2026-06-13): the gateway is outside
 # this machine's trust boundary, so its access_tier claim is ignored. The
 # tier written to every task file comes from REMOTE_TASK_TIER in .env —
@@ -526,9 +533,13 @@ def _write_task(task: dict) -> str | None:
             lines.append(f"source: {_one_line(task.get('source') or PROVIDER)}")
         elif f == "interaction_type":
             # Pass through when the gateway sends it; default to "message" —
-            # all current gateway traffic is Matrix room messages.
-            lines.append(
-                f"interaction_type: {_one_line(task.get('interaction_type') or 'message')}")
+            # all current gateway traffic is Matrix room messages. Whitelisted:
+            # the gateway is outside the trust boundary, so an unknown value
+            # degrades to the default instead of landing verbatim in the file.
+            it = str(task.get("interaction_type") or "")
+            if it not in _INTERACTION_TYPES:
+                it = "message"
+            lines.append(f"interaction_type: {it}")
         elif f == "task" and task.get("task") not in (None, ""):
             # Resolve an inbound media marker to a local file the core can read.
             lines.append(f"task: {_one_line(_maybe_fetch_media(str(task['task'])))}")

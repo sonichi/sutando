@@ -64,22 +64,38 @@ for rel, values in PRODUCERS.items():
                     f"{rel}:{ln + 1}: `source: {value}` write site has no "
                     f"interaction_type: header within 6 lines")
 
-# conversation-server.ts writes phone tasks WITHOUT a source: header (legacy
-# shape) — assert its two writers carry interaction_type directly.
+# conversation-server.ts phone writers: delegateTask carries the full
+# source+interaction_type pair (source: phone activates the dormant
+# DM-fallback + urgent-priority consumers); the call-end summary writer
+# deliberately has NO source: header (source: phone would double-DM — the
+# task instructions already have the core DM the owner, and the bridge
+# fallback would deliver the same result a second time), so it is asserted
+# on interaction_type alone.
 cs = (REPO / "skills/phone-conversation/scripts/conversation-server.ts").read_text()
-for marker, expect in (("`task-phone-${", "realtime_audio"), ("`task-summary-${", "system_event")):
+for marker, expect, want_source in (
+        ("`task-phone-${", "realtime_audio", True),
+        ("`task-summary-${", "system_event", False)):
     checked += 1
     seg_start = cs.find(marker)  # the taskId assignment at the write site
-    if seg_start == -1 or f"interaction_type: {expect}" not in cs[seg_start: seg_start + 2500]:
+    window = cs[seg_start: seg_start + 2500]
+    if seg_start == -1 or f"interaction_type: {expect}" not in window:
         failures.append(
             f"conversation-server.ts: {marker} writer missing interaction_type: {expect}")
+    # Serialized forms only (`\n`-joined template or backtick array line) —
+    # prose mentions of "source: phone" in comments must not match.
+    has_source = bool(re.search(r"source: phone(\\n|`)", window))
+    if want_source != has_source:
+        failures.append(
+            f"conversation-server.ts: {marker} writer source: phone "
+            f"{'missing' if want_source else 'present (double-DM regression — see comment at the writer)'}")
 
-# remote-gateway-bridge serializes from _TASK_FIELDS — assert pass-through +
-# default are wired.
+# remote-gateway-bridge serializes from _TASK_FIELDS — assert pass-through is
+# wired, vocabulary-whitelisted, and defaults to message.
 gw = (REPO / "src/remote-gateway-bridge.py").read_text()
 checked += 1
-if '"interaction_type"' not in gw or "or 'message'" not in gw:
-    failures.append("remote-gateway-bridge.py: interaction_type pass-through/default missing")
+if ('"interaction_type"' not in gw or "_INTERACTION_TYPES" not in gw
+        or 'it = "message"' not in gw):
+    failures.append("remote-gateway-bridge.py: interaction_type whitelist/default missing")
 
 if failures:
     for f in failures:
