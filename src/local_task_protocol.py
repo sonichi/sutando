@@ -151,6 +151,31 @@ def parse_task_headers(text: str) -> TaskHeaders:
     return TaskHeaders(headers=headers, body="\n".join(body_lines))
 
 
+def parse_task_headers_lenient(text: str) -> TaskHeaders:
+    """Parse across ALL lines, FIRST occurrence of each key wins.
+
+    The shape-union reader: producers' field order has changed across eras
+    (May-2026 voice tasks were task-mid; today's are task-last), so consumers
+    that must classify files of any age — e.g. discord-bridge's DM-fallback
+    `source:` probe — need a scan that finds headers wherever that era's
+    writer put them. First-wins resists trailing-body forgery when the real
+    header exists; it does NOT protect a file that legitimately lacks the
+    probed key (a body line can then supply it). That spoofability predates
+    this module — hardening it means changing verdicts for historical shapes
+    and is deliberately out of scope for the read-side refactor.
+    """
+    headers: dict = {}
+    body = ""
+    for line in text.split("\n"):
+        if line.startswith("task:") and not body:
+            body = line[len("task:"):].lstrip()
+            continue
+        m = _HEADER_LINE_RE.match(line)
+        if m:
+            headers.setdefault(m.group(1), m.group(2))
+    return TaskHeaders(headers=headers, body=body)
+
+
 def parse_task_headers_trusted(text: str) -> TaskHeaders:
     """Parse a **task-mid** file from a trusted writer (remote-gateway-bridge):
     scan ALL lines for `key: value`, LAST occurrence wins.

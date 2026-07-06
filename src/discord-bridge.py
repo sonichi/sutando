@@ -69,6 +69,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
         return None
 from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
+import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
@@ -4313,12 +4314,17 @@ def _task_source(task_id: str):
     if not tf:
         return None
     try:
-        for ln in tf.read_text(encoding="utf-8", errors="replace").splitlines():
-            if ln.startswith("source:"):
-                return ln.split(":", 1)[1].strip().lower() or None
+        # Lenient protocol parser (step 3b): full scan, first occurrence wins
+        # — exact legacy semantics, needed because this probe classifies files
+        # of ANY era and the voice writer was task-mid until mid-2026 (23
+        # archived voice tasks have source: after task:; the stricter
+        # stop-at-task: parser flips their DM verdict — caught by the corpus
+        # sweep in tests/discord-task-source-invariance.test.py).
+        src = local_task_protocol.parse_task_headers_lenient(
+            tf.read_text(encoding="utf-8", errors="replace")).get("source")
+        return (src or "").strip().lower() or None
     except OSError:
         return None
-    return None
 
 
 def _dm_fallback_eligible(task_id: str) -> bool:
