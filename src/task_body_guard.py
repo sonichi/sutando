@@ -40,6 +40,7 @@ _ZWSP = "​"
 _HEADER_KEYS = (
     "id", "timestamp", "task", "source", "channel_id", "channel_name",
     "guild_name", "source_message_id", "parent_message_id", "user_id",
+    "interaction_type",
     "access_tier", "priority", "chat_id", "thread_ts",
 )
 _HEADER_RE = re.compile(r"^(?:%s)\s*:" % "|".join(_HEADER_KEYS))
