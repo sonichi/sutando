@@ -2745,6 +2745,7 @@ async def _handle_discord_message(message, force=False):
         }
         access["pending"] = pending
         ACCESS_FILE.write_text(json.dumps(access, indent=2))
+        os.chmod(ACCESS_FILE, 0o600)  # don't inherit umask 644 — file holds owner's Discord user IDs
         await message.channel.send(f"Pairing required. Ask the owner to run:\n`/discord:access pair {code}`")
         print(f"  Pairing requested: @{username} ({sender_id}) code={code}")
         return
@@ -3344,6 +3345,7 @@ def save_to_allowlist(sender_id):
         data.setdefault("allowFrom", []).append(sender_id)
         ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
         ACCESS_FILE.write_text(json.dumps(data, indent=2))
+        os.chmod(ACCESS_FILE, 0o600)  # don't inherit umask 644 — file holds owner's Discord user IDs
 
 
 async def poll_approved():
