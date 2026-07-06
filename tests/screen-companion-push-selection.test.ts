@@ -1,5 +1,3 @@
-// Issue #1425 / PR #1409 gap — push-path selection injection.
-//
 // Verifies that the VisionFramePostSendHook registered by screen-companion:
 //   - fires sendUserCtx only on SELECTION_PROBE_INTERVAL_TICKS boundaries
 //   - injects "[Selected text: ...]" when selection appears
