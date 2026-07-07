@@ -589,6 +589,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f"timestamp: {datetime.now().isoformat()}\n"
             f"task: Incoming phone call from {caller}\n"
             f"source: twilio_voice\n"
+            f"interaction_type: system_event\n"
             f"from: {caller}\n"
             f"call_sid: {call_sid}\n"
         )
@@ -618,6 +619,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f"timestamp: {datetime.now().isoformat()}\n"
             f"task: SMS from {sender}: {body}\n"
             f"source: twilio_sms\n"
+            f"interaction_type: message\n"
             f"from: {sender}\n"
         )
         (TASK_DIR / f"{task_id}.txt").write_text(task_content)
@@ -641,6 +643,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 f"timestamp: {datetime.now().isoformat()}\n"
                 f"task: Voicemail from {caller}: {text}\n"
                 f"source: twilio_voicemail\n"
+                f"interaction_type: message\n"
                 f"from: {caller}\n"
             )
             (TASK_DIR / f"{task_id}.txt").write_text(task_content)
@@ -841,6 +844,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f"id: {task_id}\n"
             f"timestamp: {datetime.now().isoformat()}\n"
             f"source: api\n"
+            f"interaction_type: tool_initiated\n"
             f"from: {from_agent}\n"
             f"task: {task}\n"
         )
