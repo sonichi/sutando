@@ -51,6 +51,33 @@ def _is_fence_open_line(line: str):
     return line.strip()
 
 
+def _fence_run(fence_line: str) -> int:
+    """Length of the leading backtick/tilde run of a (stripped) fence line."""
+    c = fence_line[0]
+    n = 0
+    for ch in fence_line:
+        if ch != c:
+            break
+        n += 1
+    return n
+
+
+def _closes_fence(closer: str, opener: str) -> bool:
+    """CommonMark close rule: a fence closes only on a *bare* fence line of the
+    same char kind whose run length >= the opener's run, with no info string.
+
+    So inside a ````markdown block (run 4), an inner ```python line (info string)
+    or a ``` line (run 3 < 4) is a NESTED opener, NOT a closer — it must leave the
+    outer fence open. Both `closer` and `opener` are the stripped fence strings.
+    """
+    run = _fence_run(closer)
+    return (
+        closer[0] == opener[0]              # same fence char kind (` vs ~)
+        and run >= _fence_run(opener)       # closing run at least as long
+        and closer == closer[0] * run       # bare closer — no info/language string
+    )
+
+
 def chunk_message(text: str, max_len: int = 1900):
     """Yield chunks <= max_len chars, preserving Markdown code fences.
 
@@ -78,11 +105,11 @@ def chunk_message(text: str, max_len: int = 1900):
     buf_len = 0
 
     def fence_closer(opener):
-        # Match the fence-token kind (` or ~) and use 3 of them. Discord's
-        # parser closes on >=3 matching chars, so a 3-char closer suffices
-        # even if opener was 4+ chars (the literal opener length doesn't have
-        # to match for closure, only the char kind).
-        return opener[0] * 3 if opener else "```"
+        # Close with a run matching the opener's length. CommonMark requires the
+        # closing run >= the opening run, so a ````markdown fence (run 4) must be
+        # closed with ```` — a 3-backtick closer would NOT close it, leaving the
+        # continuation chunk still inside the outer fence.
+        return opener[0] * _fence_run(opener)
 
     def flush():
         nonlocal buf, buf_len
@@ -154,10 +181,11 @@ def chunk_message(text: str, max_len: int = 1900):
         if opener_on_line is not None:
             if fence_opener is None:
                 fence_opener = opener_on_line
-            else:
-                # Fence-line at this position closes the active fence
-                # (Discord/CommonMark allows any close-fence of the same kind to close)
+            elif _closes_fence(opener_on_line, fence_opener):
                 fence_opener = None
+            # else: a NESTED opener line — an info-string fence (```python) or a
+            # shorter run of the same char inside a longer fence. CommonMark keeps
+            # the outer fence open, so we must NOT clear fence_opener here.
 
     chunk = flush()
     if chunk is not None:

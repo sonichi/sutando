@@ -42,12 +42,22 @@ _FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})\s*([^\s`~][^`~]*)?\s*$")
 
 
 def ends_outside_fence(chunk: str) -> bool:
-    """True if walking `chunk` line-by-line leaves us outside any code fence."""
-    inside = False
+    """CommonMark-aware: True if `chunk` ends outside any code fence.
+
+    Uses the module's own close rule (`mc._closes_fence`) so a nested opener
+    (```python or a shorter run inside a ````markdown block) does NOT toggle the
+    outer fence — a naive any-fence-line toggle would falsely report balance.
+    """
+    opener = None
     for line in chunk.split("\n"):
-        if _FENCE.match(line):
-            inside = not inside
-    return not inside
+        if not _FENCE.match(line):
+            continue
+        fl = line.strip()
+        if opener is None:
+            opener = fl
+        elif mc._closes_fence(fl, opener):
+            opener = None
+    return opener is None
 
 
 # 1. Empty / falsy input yields nothing.
@@ -131,6 +141,28 @@ check("mid-fence long line: each chunk fence-balanced", all(ends_outside_fence(c
 ypayload = "".join(ch for c in mf for line in c.split("\n") if line and set(line) <= {"y"} for ch in line)
 check("mid-fence long line: y-payload preserved across splits", ypayload == "y" * 300,
       f"got {len(ypayload)}")
+
+# 11. Nested fences (CommonMark) — an inner ```python / ``` inside an outer
+# ````markdown block must NOT close the outer fence, and a boundary split must
+# close+reopen the OUTER fence with a matching run (````), not ```. (P2 fix,
+# reported by wu-air's Codex + john-the-dev.)
+nested = "````markdown\n" + "a" * 3000 + "\n```python\nx = 1\n```\n" + "b" * 3000 + "\n````"
+nc = list(chunk_message(nested, 4000))
+check("nested-fence: splits into multiple chunks", len(nc) > 1, f"got {len(nc)}")
+check("nested-fence: each chunk <= max_len", all(len(c) <= 4000 for c in nc))
+check("nested-fence: each chunk CommonMark-balanced (outer fence not broken)",
+      all(ends_outside_fence(c) for c in nc),
+      "unbalanced=" + str([c[:40] for c in nc if not ends_outside_fence(c)][:1]))
+check("nested-fence: continuation reopens the OUTER ````markdown (not ```)",
+      any(c.lstrip().startswith("````markdown") for c in nc[1:]))
+
+# Direct unit-checks of the CommonMark close rule (covers _closes_fence/_fence_run).
+check("_closes_fence: ``` does NOT close ````markdown", not mc._closes_fence("```", "````markdown"))
+check("_closes_fence: ```python does NOT close ````markdown", not mc._closes_fence("```python", "````markdown"))
+check("_closes_fence: ```` closes ````markdown", mc._closes_fence("````", "````markdown"))
+check("_closes_fence: ``` closes ```python", mc._closes_fence("```", "```python"))
+check("_closes_fence: ~~~ does NOT close ```", not mc._closes_fence("~~~", "```"))
+check("_fence_run: counts leading run", mc._fence_run("````md") == 4 and mc._fence_run("~~~") == 3)
 
 if failures:
     print(f"\nFAIL — {len(failures)} check(s) failed: {failures}")

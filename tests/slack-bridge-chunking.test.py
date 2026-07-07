@@ -79,13 +79,23 @@ def check(name, cond, detail=""):
 
 _FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})\s*([^\s`~][^`~]*)?\s*$")
 
+# CommonMark-aware balance check, using the chunker's own close rule.
+_mc_spec = importlib.util.spec_from_file_location("message_chunking", REPO / "src" / "message_chunking.py")
+_mc = importlib.util.module_from_spec(_mc_spec)
+_mc_spec.loader.exec_module(_mc)
+
 
 def ends_outside_fence(chunk: str) -> bool:
-    inside = False
+    opener = None
     for line in chunk.split("\n"):
-        if _FENCE.match(line):
-            inside = not inside
-    return not inside
+        if not _FENCE.match(line):
+            continue
+        fl = line.strip()
+        if opener is None:
+            opener = fl
+        elif _mc._closes_fence(fl, opener):
+            opener = None
+    return opener is None
 
 
 client = mod.app.client
