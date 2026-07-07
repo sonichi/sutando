@@ -40,7 +40,7 @@ api.TASK_DIR.mkdir()
 api.RESULT_DIR.mkdir()
 api.API_TOKEN = "test-token-123"
 
-server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), api.AgentAPIHandler)
+server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), api.Handler)
 port = server.server_address[1]
 threading.Thread(target=server.serve_forever, daemon=True).start()
 BASE = f"http://127.0.0.1:{port}"
