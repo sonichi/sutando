@@ -41,7 +41,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 
 def _safe_id(raw: str) -> str:
@@ -93,6 +93,7 @@ def validate_twilio_signature(handler, body: str) -> bool:
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
+import local_task_protocol  # noqa: E402
 
 WORKSPACE_DIR = resolve_workspace()
 TASK_DIR = WORKSPACE_DIR / "tasks"
@@ -170,6 +171,74 @@ def _safe_path(base_dir: Path, filename: str) -> Path:
     if not resolved.startswith(base_real + os.sep):
         return None
     return Path(resolved)
+
+
+# ── TaskDelegationService relay endpoints (#1947) — route bodies ─────────────
+# Module-level (status, payload) functions rather than inline handler code:
+# unit-testable from the main thread (the coverage gate's tracer misses
+# handler-thread execution), and the HTTP layer stays a thin dispatch.
+
+def delegation_list_results():
+    try:
+        files = sorted(f.name for f in RESULT_DIR.iterdir()
+                       if f.is_file() and f.name.endswith(".txt"))
+        return 200, {"files": files}
+    except OSError:
+        return 500, {"error": "results dir unreadable"}
+
+
+def delegation_read_result(name: str):
+    # _safe_path appends ".txt" itself — hand it the stem.
+    stem = name[:-4] if name.endswith(".txt") else name
+    target = _safe_path(RESULT_DIR, stem)
+    if target is None or not os.path.isfile(target):
+        return 404, {"error": "no such result"}
+    return 200, {"body": Path(target).read_text(errors="replace")}
+
+
+def delegation_submit_task(data: dict):
+    tid = str(data.get("id", ""))
+    content = data.get("content", "")
+    if not local_task_protocol.valid_task_id(tid) or not content:
+        return 400, {"error": "invalid task id or empty content"}
+    # Identity coherence (Codex P1 on #1956): the filename id and the body's
+    # embedded `id:` header must agree, or downstream identity splits —
+    # result polling, dedupe, archive, and history all key off one or the
+    # other. The relay backend only submits task-last bodies, so the safe
+    # parser reads the header unambiguously.
+    embedded = local_task_protocol.parse_task_headers(content).get("id")
+    if embedded != tid:
+        return 400, {"error": f"body id header ({embedded!r}) does not match request id"}
+    TASK_DIR.mkdir(parents=True, exist_ok=True)
+    (TASK_DIR / f"{tid}.txt").write_text(content)
+    return 200, {"ok": True, "task_id": tid}
+
+
+def delegation_archive_result(data: dict):
+    name = str(data.get("name", ""))
+    tid = str(data.get("task_id", ""))
+    stem = name[:-4] if name.endswith(".txt") else name
+    src = _safe_path(RESULT_DIR, stem)
+    # Identity coherence (Codex P1 on #1956): a relay client may only archive
+    # ITS OWN result — the source name must be exactly <task_id>.txt. Without
+    # this, any safe name could be filed under any valid id, hijacking other
+    # consumers' results into a foreign archive slot.
+    if src is None or not local_task_protocol.valid_task_id(tid) or stem != tid:
+        return 400, {"error": "invalid name/task id, or name does not match task id"}
+    if not os.path.exists(src):
+        return 200, {"ok": True, "note": "already gone"}
+    # Same destination scheme as task-bridge's archiveFile():
+    # results/archive/YYYY-MM/<taskId>.txt. No-clobber: an occupied slot gets
+    # the epoch-suffixed name the bridges already use for re-archived results
+    # (task-<id>-<epoch>.txt) instead of silently overwriting history.
+    dest_dir = local_task_protocol.archive_month_dir(
+        RESULT_DIR, datetime.now().isoformat())
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / f"{tid}.txt"
+    if dest.exists():
+        dest = dest_dir / f"{tid}-{int(datetime.now().timestamp())}.txt"
+    os.replace(src, dest)
+    return 200, {"ok": True}
 
 
 def get_task_result(task_id: str):
@@ -432,6 +501,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         q["options"] = [o.strip() for o in opts_match.group(1).split("|")]
                     questions.append(q)
             self.send_json(200, {"tasks": tasks, "watcher": watcher_ok, "claude": claude_ok, "questions": questions})
+        elif path == "/delegation/results":
+            # TaskDelegationService relay backend (#1947): list results/ for
+            # the split-host watcher. Read-only but bearer-gated like the
+            # write side — result bodies are owner data.
+            if not API_TOKEN:
+                self.send_json(403, {"error": "delegation requires SUTANDO_API_TOKEN on the core host"})
+            elif not self.check_auth():
+                pass
+            else:
+                self.send_json(*delegation_list_results())
+        elif path.startswith("/delegation/results/"):
+            if not API_TOKEN:
+                self.send_json(403, {"error": "delegation requires SUTANDO_API_TOKEN on the core host"})
+            elif not self.check_auth():
+                pass
+            else:
+                self.send_json(*delegation_read_result(
+                    unquote(path[len("/delegation/results/"):])))
         elif path.startswith("/result/"):
             task_id = path[len("/result/"):]
             result = get_task_result(task_id)
@@ -689,6 +776,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 data = json.loads(body)
                 voice_desired_state = data.get("state", "disconnected")
                 self.send_json(200, {"state": voice_desired_state})
+            except Exception:
+                self.send_json(400, {"error": "invalid"})
+            return
+
+        if path == "/delegation/tasks":
+            # TaskDelegationService relay backend (#1947): a split-host
+            # voice-agent submits a FULLY-SERIALIZED task file body. The
+            # writer owns header order (see local_task_protocol's shape
+            # taxonomy) — this endpoint only validates the id and stores the
+            # bytes, exactly like the local writeFileSync it replaces.
+            # Bearer-gated: remote submission is full-capability delegation,
+            # so a core with no API_TOKEN configured refuses (unlike the
+            # local-dev default elsewhere in this file).
+            if not API_TOKEN:
+                self.send_json(403, {"error": "delegation requires SUTANDO_API_TOKEN on the core host"})
+                return
+            if not self.check_auth():
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            try:
+                self.send_json(*delegation_submit_task(json.loads(body)))
+            except Exception:
+                self.send_json(400, {"error": "invalid"})
+            return
+
+        if path == "/delegation/archive":
+            if not API_TOKEN:
+                self.send_json(403, {"error": "delegation requires SUTANDO_API_TOKEN on the core host"})
+                return
+            if not self.check_auth():
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            try:
+                self.send_json(*delegation_archive_result(json.loads(body)))
             except Exception:
                 self.send_json(400, {"error": "invalid"})
             return
