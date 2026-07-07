@@ -62,10 +62,10 @@ except ImportError:
     stub.DMChannel = type("DMChannel", (), {})
     sys.modules["discord"] = stub
 
-_dc_env = Path.home() / ".claude" / "channels" / "discord" / ".env"
-if not _dc_env.exists():
-    _dc_env.parent.mkdir(parents=True, exist_ok=True)
-    _dc_env.write_text("DISCORD_BOT_TOKEN=test-token-not-real\n")
+# Hermetic: discord-bridge reads DISCORD_BOT_TOKEN from the env FIRST (line ~187),
+# only falling back to $CLAUDE_CONFIG_DIR/channels/discord/.env if unset. Set the
+# env var so module load succeeds WITHOUT writing into the real ~/.claude config.
+os.environ["DISCORD_BOT_TOKEN"] = "test-token-not-real"
 
 db = _load("dbridge_audit", REPO / "src" / "discord-bridge.py")
 
