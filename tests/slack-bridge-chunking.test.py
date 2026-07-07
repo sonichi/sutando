@@ -127,6 +127,21 @@ mod._send_reply("C0FAKECHAN", "1699999999.000100", "line\n" * 2000)  # long, for
 check("slack: threaded reply keeps thread_ts on every chunk",
       len(client.calls) > 1 and all(c.get("thread_ts") == "1699999999.000100" for c in client.calls))
 
+# S5 wiring — _send_reply records a §7 audit line to the temp workspace ledger.
+_audit = Path(os.environ["SUTANDO_WORKSPACE"]) / "state" / "result-audit.log"
+check("slack wiring: _send_reply wrote a result-audit line", _audit.exists())
+_atext = _audit.read_text() if _audit.exists() else ""
+check("slack wiring: audit line records surface=slack", "\tslack" in _atext)
+check("slack wiring: successful sends recorded 'delivered'", "\tdelivered\tslack" in _atext)
+
+# redirect disposition: a [channel:] marker routes to a target → 'redirected'.
+client.calls.clear()
+mod._send_reply("C0ORIG", None, "[channel: C0TARGET]\nrerouted body", task_id="task-r")
+check("slack wiring: [channel:] redirect records 'redirected'",
+      "\tredirected\tslack" in _audit.read_text())
+check("slack wiring: redirect actually posts to the target channel",
+      any(c["channel"] == "C0TARGET" for c in client.calls))
+
 if failures:
     print(f"\nFAIL — {len(failures)} check(s) failed: {failures}")
     raise SystemExit(1)

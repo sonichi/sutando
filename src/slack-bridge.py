@@ -694,10 +694,12 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
     # [channel:] redirect — for cross-channel posting (e.g., reply to a DM
     # task by sending into a public channel instead). Drop thread_ts since
     # we're moving to a new channel.
+    redirected = False
     for action in parsed.actions:
         if action.kind == "redirect":
             channel = action.value
             thread_ts = None
+            redirected = True
             break
 
     file_paths = [a.value for a in parsed.actions if a.kind == "attach"]
@@ -787,6 +789,20 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
                 "file_count": sent_files,
             },
         )
+
+    # §7 audit ledger (Result Router S5): one line per resolved delivery so
+    # "did the user ever see this?" is answerable without grepping bridge logs.
+    # Guarded + never-raising — auditing must not block or crash delivery.
+    if clean_text or file_paths:
+        try:
+            import result_audit
+            result_audit.record(
+                task_id or "",
+                "failed" if not delivered_ok else ("redirected" if redirected else "delivered"),
+                "slack",
+            )
+        except Exception:  # pragma: no cover  (defensive: result_audit import is safe + record() never raises)
+            pass
 
 
 def _check_task_timeouts() -> None:
