@@ -173,6 +173,57 @@ def _safe_path(base_dir: Path, filename: str) -> Path:
     return Path(resolved)
 
 
+# ── TaskDelegationService relay endpoints (#1947) — route bodies ─────────────
+# Module-level (status, payload) functions rather than inline handler code:
+# unit-testable from the main thread (the coverage gate's tracer misses
+# handler-thread execution), and the HTTP layer stays a thin dispatch.
+
+def delegation_list_results():
+    try:
+        files = sorted(f.name for f in RESULT_DIR.iterdir()
+                       if f.is_file() and f.name.endswith(".txt"))
+        return 200, {"files": files}
+    except OSError:
+        return 500, {"error": "results dir unreadable"}
+
+
+def delegation_read_result(name: str):
+    # _safe_path appends ".txt" itself — hand it the stem.
+    stem = name[:-4] if name.endswith(".txt") else name
+    target = _safe_path(RESULT_DIR, stem)
+    if target is None or not os.path.isfile(target):
+        return 404, {"error": "no such result"}
+    return 200, {"body": Path(target).read_text(errors="replace")}
+
+
+def delegation_submit_task(data: dict):
+    tid = str(data.get("id", ""))
+    content = data.get("content", "")
+    if not local_task_protocol.valid_task_id(tid) or not content:
+        return 400, {"error": "invalid task id or empty content"}
+    TASK_DIR.mkdir(parents=True, exist_ok=True)
+    (TASK_DIR / f"{tid}.txt").write_text(content)
+    return 200, {"ok": True, "task_id": tid}
+
+
+def delegation_archive_result(data: dict):
+    name = str(data.get("name", ""))
+    tid = str(data.get("task_id", ""))
+    stem = name[:-4] if name.endswith(".txt") else name
+    src = _safe_path(RESULT_DIR, stem)
+    if src is None or not local_task_protocol.valid_task_id(tid):
+        return 400, {"error": "invalid name or task id"}
+    if not os.path.exists(src):
+        return 200, {"ok": True, "note": "already gone"}
+    # Same destination scheme as task-bridge's archiveFile():
+    # results/archive/YYYY-MM/<taskId>.txt.
+    dest_dir = local_task_protocol.archive_month_dir(
+        RESULT_DIR, datetime.now().isoformat())
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    os.replace(src, dest_dir / f"{tid}.txt")
+    return 200, {"ok": True}
+
+
 def get_task_result(task_id: str):
     """Check if a task result exists."""
     result_file = _safe_path(RESULT_DIR, task_id)
@@ -442,26 +493,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif not self.check_auth():
                 pass
             else:
-                try:
-                    files = sorted(f.name for f in RESULT_DIR.iterdir()
-                                   if f.is_file() and f.name.endswith(".txt"))
-                    self.send_json(200, {"files": files})
-                except OSError:
-                    self.send_json(500, {"error": "results dir unreadable"})
+                self.send_json(*delegation_list_results())
         elif path.startswith("/delegation/results/"):
             if not API_TOKEN:
                 self.send_json(403, {"error": "delegation requires SUTANDO_API_TOKEN on the core host"})
             elif not self.check_auth():
                 pass
             else:
-                name = unquote(path[len("/delegation/results/"):])
-                # _safe_path appends ".txt" itself — hand it the stem.
-                stem = name[:-4] if name.endswith(".txt") else name
-                target = _safe_path(RESULT_DIR, stem)
-                if target is None or not os.path.isfile(target):
-                    self.send_json(404, {"error": "no such result"})
-                else:
-                    self.send_json(200, {"body": Path(target).read_text(errors="replace")})
+                self.send_json(*delegation_read_result(
+                    unquote(path[len("/delegation/results/"):])))
         elif path.startswith("/result/"):
             task_id = path[len("/result/"):]
             result = get_task_result(task_id)
@@ -740,15 +780,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
             try:
-                data = json.loads(body)
-                tid = str(data.get("id", ""))
-                content = data.get("content", "")
-                if not local_task_protocol.valid_task_id(tid) or not content:
-                    self.send_json(400, {"error": "invalid task id or empty content"})
-                    return
-                TASK_DIR.mkdir(parents=True, exist_ok=True)
-                (TASK_DIR / f"{tid}.txt").write_text(content)
-                self.send_json(200, {"ok": True, "task_id": tid})
+                self.send_json(*delegation_submit_task(json.loads(body)))
             except Exception:
                 self.send_json(400, {"error": "invalid"})
             return
@@ -762,25 +794,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
             try:
-                data = json.loads(body)
-                name = str(data.get("name", ""))
-                tid = str(data.get("task_id", ""))
-                # _safe_path appends ".txt" itself — hand it the stem.
-                stem = name[:-4] if name.endswith(".txt") else name
-                src = _safe_path(RESULT_DIR, stem)
-                if src is None or not local_task_protocol.valid_task_id(tid):
-                    self.send_json(400, {"error": "invalid name or task id"})
-                    return
-                if not os.path.exists(src):
-                    self.send_json(200, {"ok": True, "note": "already gone"})
-                    return
-                # Same destination scheme as task-bridge's archiveFile():
-                # results/archive/YYYY-MM/<taskId>.txt.
-                dest_dir = local_task_protocol.archive_month_dir(
-                    RESULT_DIR, datetime.now().isoformat())
-                dest_dir.mkdir(parents=True, exist_ok=True)
-                os.replace(src, dest_dir / f"{tid}.txt")
-                self.send_json(200, {"ok": True})
+                self.send_json(*delegation_archive_result(json.loads(body)))
             except Exception:
                 self.send_json(400, {"error": "invalid"})
             return

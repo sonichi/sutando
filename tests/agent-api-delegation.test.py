@@ -112,6 +112,29 @@ code, _ = req("GET", "/delegation/results", token=None)
 check("tokenless core refuses list (403)", code == 403)
 
 server.shutdown()
+
+# ── Direct route-body calls (main thread) ────────────────────────────────────
+# The HTTP layer above proves dispatch + auth; these direct calls prove the
+# route bodies themselves AND give the coverage gate main-thread attribution
+# (its tracer misses handler-thread execution).
+code, data = api.delegation_submit_task({"id": "task-direct-1", "content": CONTENT})
+check("direct submit", code == 200 and (api.TASK_DIR / "task-direct-1.txt").read_text() == CONTENT)
+check("direct submit rejects bad id", api.delegation_submit_task({"id": "../x", "content": "y"})[0] == 400)
+check("direct submit rejects empty content", api.delegation_submit_task({"id": "task-d2", "content": ""})[0] == 400)
+(api.RESULT_DIR / "task-direct-1.txt").write_text("direct answer\n")
+code, data = api.delegation_list_results()
+check("direct list", code == 200 and "task-direct-1.txt" in data["files"])
+code, data = api.delegation_read_result("task-direct-1.txt")
+check("direct read", code == 200 and data["body"] == "direct answer\n")
+check("direct read 404", api.delegation_read_result("nope.txt")[0] == 404)
+check("direct read traversal", api.delegation_read_result("../../etc")[0] == 404)
+code, data = api.delegation_archive_result({"name": "task-direct-1.txt", "task_id": "task-direct-1"})
+check("direct archive", code == 200 and list((api.RESULT_DIR / "archive").glob("*/task-direct-1.txt")))
+check("direct archive already-gone", api.delegation_archive_result(
+    {"name": "task-direct-1.txt", "task_id": "task-direct-1"})[1].get("note") == "already gone")
+check("direct archive bad tid", api.delegation_archive_result(
+    {"name": "x.txt", "task_id": "../evil"})[0] == 400)
+
 if failures:
     sys.exit(1)
 print("PASS — delegation endpoints E2E")
