@@ -49,7 +49,6 @@ from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 import progress_stream  # noqa: E402  (opt-in owner progress streaming, SUTANDO_PROGRESS_STREAM=1)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
-import result_audit  # noqa: E402  (Result Router S5 — §7 audit ledger sink; top-level so send_reply carries no lazy import)
 REPO = resolve_workspace()
 TASKS_DIR = REPO / "tasks"
 RESULTS_DIR = REPO / "results"
@@ -456,13 +455,6 @@ def send_reply(chat_id, text, task_id: str | None = None) -> dict:
             # the user; log for operator visibility on real typos. Same
             # rationale as discord-bridge:poll_results.
             print(f"  file marker, file not found — likely a prose quotation: {fpath}", flush=True)
-
-    # §7 audit ledger (Result Router S5): record result deliveries only
-    # (task_id present). Proactive sends pass no task_id and aren't results, so
-    # they're not audited. Telegram drops [channel:] redirects → delivered/failed
-    # only. Never blocks delivery (result_audit swallows all errors).
-    if task_id:
-        result_audit.record(task_id, "delivered" if delivered_ok else "failed", "telegram")
 
     return {"text_chunks": text_chunks, "files_sent": files_sent, "ok": delivered_ok}
 
