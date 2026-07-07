@@ -68,7 +68,16 @@ def _raw_req(method, path, body=None, token="test-token-123"):
         with urllib.request.urlopen(r, timeout=10) as resp:
             return resp.status, json.loads(resp.read().decode() or "{}")
     except urllib.error.HTTPError as e:
-        return e.code, json.loads(e.read().decode() or "{}")
+        # The server may close the socket right after an error response;
+        # reading the body can hit ECONNRESET — the status code is what
+        # the assertions need, so treat the body as best-effort.
+        try:
+            payload = json.loads(e.read().decode() or "{}")
+        except Exception:
+            payload = {}
+        return e.code, payload
+    except Exception as e:  # connection-level failure — surface it as a check failure
+        return -1, {"error": repr(e)}
 
 
 def req(method, path, body=None, token="test-token-123"):
@@ -120,12 +129,48 @@ check("archive accepted + moved", code == 200 and len(archived) == 1
 check("archive is month-partitioned", bool(archived) and
       archived[0].parent.name.count("-") == 1 and len(archived[0].parent.name) == 7)
 
-# 6. No-token-configured core refuses delegation entirely (403).
+# 5b. Wrong bearer on every route class (exercises each check_auth branch).
+code, _ = req("GET", "/delegation/results", token="wrong")
+check("wrong bearer on list (401)", code == 401)
+code, _ = req("GET", "/delegation/results/task-other.txt", token="wrong")
+check("wrong bearer on read (401)", code == 401)
+code, _ = req("POST", "/delegation/archive", {"name": "x.txt", "task_id": "task-x"}, token="wrong")
+check("wrong bearer on archive (401)", code == 401)
+
+# 5c. Malformed (non-JSON) POST bodies → 400 via the except branch.
+def raw_post(path, raw, token="test-token-123"):
+    def go():
+        r = urllib.request.Request(f"{BASE}{path}", method="POST", data=raw)
+        r.add_header("Authorization", f"Bearer {token}")
+        try:
+            with urllib.request.urlopen(r, timeout=10) as resp:
+                out["code"] = resp.status
+        except urllib.error.HTTPError as e:
+            out["code"] = e.code
+        except Exception as e:
+            out["code"] = -1
+            out["err"] = repr(e)
+    out = {}
+    t = threading.Thread(target=go, daemon=True)
+    t.start()
+    while t.is_alive():
+        server.handle_request()
+    t.join()
+    return out["code"]
+
+check("malformed JSON to submit (400)", raw_post("/delegation/tasks", b"not json{") == 400)
+check("malformed JSON to archive (400)", raw_post("/delegation/archive", b"],![") == 400)
+
+# 6. No-token-configured core refuses delegation entirely (403), every route.
 api.API_TOKEN = ""
 code, data = req("POST", "/delegation/tasks", {"id": "task-e2e-2", "content": "x"}, token=None)
 check("tokenless core refuses delegation (403)", code == 403, str(data))
 code, _ = req("GET", "/delegation/results", token=None)
 check("tokenless core refuses list (403)", code == 403)
+code, _ = req("GET", "/delegation/results/task-other.txt", token=None)
+check("tokenless core refuses read (403)", code == 403)
+code, _ = req("POST", "/delegation/archive", {"name": "x.txt", "task_id": "task-x"}, token=None)
+check("tokenless core refuses archive (403)", code == 403)
 
 server.server_close()
 
