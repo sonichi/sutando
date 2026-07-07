@@ -83,6 +83,18 @@ const OVERRIDES = {
 const instructions = cfg.buildInstructions(ctx(), OVERRIDES);
 const instructionLines = instructions.split('\n');
 
+// The prompt embeds the INSTALLED tool list (deliberately — it tells Gemini
+// what exists), so a raw hash can never be env-stable. Mask the two dynamic
+// segments before hashing: the joined inline-tool-names line, and each
+// per-tool "- name: desc. Instant." line. Everything else — the actual tuned
+// prose — is pinned exactly.
+function stableInstructions(text: string): string {
+	return text.split('\n').filter(l =>
+		!(l.startsWith('- ') && l.endsWith(' — call these directly, not through work. Instant.'))
+		&& !(l.startsWith('- ') && l.endsWith('. Instant.'))
+	).join('\n');
+}
+
 // The tuned static entries, in order (multi-line entries appear as their
 // constituent lines; conditional/dynamic segments are asserted separately).
 const va = readFileSync(join(REPO, 'src', 'voice-agent.ts'), 'utf-8');
@@ -90,7 +102,7 @@ const anchors = {
 	note: 'Step-5 behavior anchors (post-5a-1: real factory output). Deliberate prompt changes must regenerate via ANCHOR_UPDATE=1 with the diff called out in the PR.',
 	tools: importableTools.map(toolAnchor)
 		.sort((a, b) => String(a.name).localeCompare(String(b.name))),
-	instructions_hash_fixed_env: createHash('sha256').update(instructions).digest('hex'),
+	instructions_hash_fixed_env: createHash('sha256').update(stableInstructions(instructions)).digest('hex'),
 	meeting_greeting: cfg.buildGreeting(ctx({ meeting: true })),
 	regions: {
 		tool_table: createHash('sha256').update(
@@ -108,8 +120,15 @@ test('tool-table anchor matches the committed fixture', () => {
 	assert.deepStrictEqual(anchors.tools, expected.tools);
 });
 
-test('instructions anchor: fixed-env output hash matches', () => {
+test('instructions anchor: fixed-env output hash matches (dynamic tool lines masked)', () => {
 	assert.strictEqual(anchors.instructions_hash_fixed_env, expected.instructions_hash_fixed_env);
+});
+
+test('instructions: dynamic tool lines exist and are well-formed', () => {
+	assert.ok(instructionLines.some(l => l.endsWith(' — call these directly, not through work. Instant.')),
+		'joined inline-tool-names line present');
+	assert.ok(instructionLines.filter(l => /^- [a-z_]+: .+\. Instant\.$/.test(l)).length >= 15,
+		'per-tool description lines present');
 });
 
 test('instructions: injected seams land where tuned', () => {
