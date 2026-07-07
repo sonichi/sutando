@@ -150,6 +150,34 @@ check("plain task → no attachments", ltp.parse_attachments(plain.headers) == [
 check("plain task → attachment default form", ltp.parse_media_form(plain.headers) == "attachment")
 check("plain task → empty modalities", ltp.parse_content_modalities(plain.headers) == frozenset())
 
+# ── 8. shared header builders (promoted for the 3rd bridge — slack) ──
+check("modality_for_mime: image", ltp.modality_for_mime("image/png") == "image")
+check("modality_for_mime: audio", ltp.modality_for_mime("audio/ogg") == "audio")
+check("modality_for_mime: video", ltp.modality_for_mime("video/mp4") == "video")
+check("modality_for_mime: file default", ltp.modality_for_mime("application/pdf") == "file")
+check("modality_for_mime: empty → file", ltp.modality_for_mime("") == "file")
+check("modality_for_mime: case-fold", ltp.modality_for_mime("IMAGE/PNG") == "image")
+
+check("media_attachment_headers: no refs → ''", ltp.media_attachment_headers([], True) == "")
+_r = ltp.AttachmentRef(locator="/tmp/a.png", mime="image/png", size=10)
+_hdrs = ltp.media_attachment_headers([_r], True)
+check("media_attachment_headers: has_text → text modality present",
+      "content_modalities: image,text\n" in _hdrs, _hdrs)
+check("media_attachment_headers: media_form attachment", "media_form: attachment\n" in _hdrs)
+check("media_attachment_headers: attachments json", "attachments: [" in _hdrs)
+check("media_attachment_headers: no has_text → text omitted",
+      "content_modalities: image\n" in ltp.media_attachment_headers([_r], False))
+check("media_attachment_headers: locator-less ref dropped → ''",
+      ltp.media_attachment_headers([ltp.AttachmentRef(locator="")], True) == "")
+# The promoted builder round-trips through the parsers just like a bridge emits it.
+_task = ("task: hi\nsource: slack\ninteraction_type: message\n"
+         + ltp.media_attachment_headers([_r], True) + "channel_id: C1\n")
+_h = ltp.parse_task_headers_trusted(_task)
+check("promoted builder round-trips: attachments",
+      len(ltp.parse_attachments(_h.headers)) == 1)
+check("promoted builder round-trips: media_form",
+      ltp.parse_media_form(_h.headers) == "attachment")
+
 if failures:
     print(f"\nFAIL — {len(failures)} check(s) failed: {failures}")
     raise SystemExit(1)

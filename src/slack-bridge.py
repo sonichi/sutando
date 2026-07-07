@@ -56,6 +56,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
         return None
 from result_markers import parse_markers  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
+import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
@@ -366,6 +367,19 @@ def _download_slack_file(file_dict: dict) -> str | None:
         return None
 
 
+def _ref_from_slack_file(file_dict: dict, local_path: str) -> "local_task_protocol.AttachmentRef":
+    """Build an AttachmentRef from a Slack file object + its saved local path
+    (interaction-model 4D, step 1.5). Reads Slack's `mimetype`/`name`/`size`
+    defensively; falls back to the saved basename when `name` is absent. Pure —
+    kept separate from the async handler so the field-reading is testable."""
+    return local_task_protocol.AttachmentRef(
+        locator=local_path,
+        mime=(file_dict.get("mimetype", "") or ""),
+        filename=(file_dict.get("name", "") or os.path.basename(local_path)),
+        size=(file_dict.get("size", 0) or 0),
+    )
+
+
 def _transcribe_via_skill(local_path: str) -> str | None:
     """Call skills/audio-transcribe/scripts/transcribe.py. Returns transcript or None.
 
@@ -422,9 +436,13 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     # carries the local paths. Skips silently on failure — task still goes
     # through with whatever files did download.
     attachment_lines = []
+    # Structured refs (interaction-model 4D, step 1.5) — accumulated alongside
+    # the legacy [File attached:] body line (dual-write, additive).
+    attachment_refs: list = []  # pragma: no cover
     for file_dict in event.get("files") or []:
         local_path = _download_slack_file(file_dict)
         if local_path:
+            attachment_refs.append(_ref_from_slack_file(file_dict, local_path))  # pragma: no cover
             transcript = _transcribe_via_skill(local_path)
             if transcript:
                 attachment_lines.append(f"[Voice transcript: {transcript}]")
@@ -550,12 +568,20 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         hints_lines.append(f"{step}. Then process and write result to results/{task_id}.txt")
         skill_hints = "\n" + "\n".join(hints_lines) + "\n"
 
+    # interaction-model 4D, step 1.5: structured media headers alongside the
+    # legacy [File attached:] body line (dual-write). Real headers after `task:`,
+    # so confine_user_content defangs a forged body copy while these authentic
+    # ones pass through. Uses the shared local_task_protocol helper (slack is the
+    # third bridge; discord/telegram fold onto it in a follow-up dedup).
+    media_headers = local_task_protocol.media_attachment_headers(  # pragma: no cover
+        attachment_refs, bool(text and text.strip()))
     task_file.write_text(
         f"id: {task_id}\n"
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
         f"task: {user_task_text}\n"
         f"source: slack\n"
         f"interaction_type: message\n"
+        f"{media_headers}"
         f"channel_id: {channel}\n"
         f"user_id: {user_id}\n"
         f"access_tier: {access_tier}\n"

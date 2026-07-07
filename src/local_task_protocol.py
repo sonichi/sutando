@@ -398,6 +398,49 @@ def format_attachments(refs: Iterable["AttachmentRef"]) -> str:
     return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
 
 
+def modality_for_mime(mime: str) -> str:
+    """Map an attachment MIME type to a content modality (CONTENT_MODALITIES):
+    image/audio/video by top-level type, everything else (pdf, zip, docx,
+    unknown) → `file`. The shared home for the mapping each bridge needs when it
+    stamps `content_modalities` — promoted here once a third bridge required it
+    (discord/telegram carried private copies first)."""
+    m = (mime or "").lower()
+    if m.startswith("image/"):
+        return "image"
+    if m.startswith("audio/"):
+        return "audio"
+    if m.startswith("video/"):
+        return "video"
+    return "file"
+
+
+def media_attachment_headers(attachment_refs: Iterable["AttachmentRef"], has_text: bool) -> str:
+    """Build the `content_modalities`/`media_form`/`attachments` header block a
+    bridge stamps on a task file when a message carried attachments (step 1.5).
+    Returns "" when there are no refs — so a text-only task's headers are
+    unchanged.
+
+    `content_modalities` = `text` (iff `has_text`) plus one modality per ref
+    mime; `media_form` = `attachment` (these are discrete objects — a live
+    stream is never emitted through the messaging task path); `attachments` =
+    the one-line JSON from `format_attachments`. The block is newline-terminated
+    so it composes directly into a writer's header f-string. Pure — a bridge can
+    unit-test its write path without a live message object."""
+    refs = [r for r in attachment_refs if r.locator]
+    if not refs:
+        return ""
+    mods = set()
+    if has_text:
+        mods.add("text")
+    for r in refs:
+        mods.add(modality_for_mime(r.mime))
+    return (
+        f"content_modalities: {','.join(sorted(mods))}\n"
+        f"media_form: attachment\n"
+        f"attachments: {format_attachments(refs)}\n"
+    )
+
+
 # ── Archive rules ────────────────────────────────────────────────────────────
 
 _MONTH_DIR_RE = re.compile(r"^\d{4}-\d{2}$")
