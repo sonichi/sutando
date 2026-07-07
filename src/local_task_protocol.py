@@ -114,13 +114,41 @@ _HEADER_LINE_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*):[ \t]?(.*)$")
 @dataclass
 class TaskHeaders:
     """Parsed view of a task file. `headers` preserves the parser's trust
-    rule (see module docstring); `body` is the task text itself (content of
-    the `task:` line plus everything after it, for task-last files)."""
+    rule (see module docstring).
+
+    `body` semantics differ BY PARSER — this is deliberate and load-bearing:
+    - `parse_task_headers` (task-last): the full work item — the `task:`
+      line's content plus every line after it.
+    - `parse_task_headers_trusted` / `_lenient` (task-mid): the SCALAR value
+      of the first `task:` line ONLY. In task-mid files the lines after
+      `task:` are a mix of real headers and continuation content (health
+      bullets, phone `hint:`/`transcript:` sections) that a header scan
+      cannot losslessly split — so these parsers do not pretend to. A reader
+      that needs the complete work item from a file of any shape must use
+      `task_body()`, which never drops a line. (Codex review on PR #1954:
+      the earlier draft looked like it returned the work item and silently
+      lost health-check bullets.)
+    """
     headers: dict = field(default_factory=dict)
     body: str = ""
 
     def get(self, key: str, default: str | None = None) -> str | None:
         return self.headers.get(key, default)
+
+
+def task_body(text: str) -> str:
+    """The complete work item of a task file, shape-independent: everything
+    from the first `task:` line onward, verbatim, with only the `task:`
+    prefix stripped from that first line. Never drops a line — for task-mid
+    files this includes trailing headers, which is the honest trade: a reader
+    that wants clean headers uses the parsers; a reader that wants the full
+    work item (health bullets, phone transcript, meeting instructions) uses
+    this and must tolerate header lines inside it."""
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if line.startswith("task:"):
+            return "\n".join([line[len("task:"):].lstrip()] + lines[i + 1:])
+    return ""
 
 
 def parse_task_headers(text: str) -> TaskHeaders:

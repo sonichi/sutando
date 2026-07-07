@@ -177,6 +177,22 @@ check("health via safe parser: priority invisible (documented gap)",
 check("health via trusted parser: priority low",
       ltp.parse_task_headers_trusted(HEALTH).get("priority") == "low")
 
+# Body semantics per parser (Codex blocker on this PR: continuation lines
+# must never be SILENTLY lost). Trusted/lenient body is the scalar task:
+# value by contract; task_body() is the lossless work-item reader.
+check("trusted body is scalar task: value only (documented contract)",
+      ltp.parse_task_headers_trusted(HEALTH).body.startswith("Health check found issues")
+      and "- memory:" not in ltp.parse_task_headers_trusted(HEALTH).body)
+check("task_body(HEALTH) keeps the failure bullets",
+      "- memory: warn (swap high)" in ltp.task_body(HEALTH))
+check("task_body(PHONE_LEGACY) keeps hint + transcript",
+      "hint:" in ltp.task_body(PHONE_LEGACY)
+      and "Caller: find my next flight" in ltp.task_body(PHONE_LEGACY))
+check("task_body == safe-parser body on task-last shapes",
+      ltp.task_body(CHAT) == ltp.parse_task_headers(CHAT).body)
+check("task_body on file with no task: line is empty",
+      ltp.task_body("id: t\ntimestamp: ts\n") == "")
+
 # 7. Task-id validation (traversal gate).
 for good in ("task-1783377232367", "task-chat-1783379117", "task-phone-1", "task-gh-5",
              "task-health-1700", "task-summary-1"):
