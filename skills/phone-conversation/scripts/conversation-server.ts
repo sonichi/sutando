@@ -84,8 +84,9 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '../../../src/inline-tools.js';
 import { buildPhoneInstructions } from './phone-agent-config.js';
-import { recordSession, recordConversation, recordToolCall } from '../../../src/conversation-store.js';
-import { startPhoneTicker, type TickerControl } from '../../../src/observability/realtime.js';
+import { recordConversation, recordToolCall } from '../../../src/conversation-store.js';
+import { startPhoneTicker } from '../../../src/observability/realtime.js';
+import { createSessionRecorder, type SessionRecorder } from '../../../src/live-agent-runtime.js';
 import { resultBelongsTo, phoneCallKey } from '../../../src/result-channel-key.js';
 // Lazy vision-session handle. Only loaded if a call ever needs it — keeps the
 // phone-agent boot path free of the vision-tools.ts side-effects on cold start.
@@ -338,11 +339,12 @@ interface CallSession {
 	// provides toolCallId, not toolName. Without this, the play_recording context
 	// reminder (line ~621) checks e.toolName which is undefined and never matches.
 	_toolIdMap?: Map<string, string>;
-	// Observability: per-call metrics (startTime already on CallSession from #209)
-	toolCalls: { name: string; durationMs: number; timestamp: string }[];
-	events: { event: string; timestamp: string }[];
-	// Realtime usage ticker — emits voice+phone seconds incrementally while live.
-	usageTicker?: TickerControl;
+	// Observability: per-call metrics recorder (step 5b-2). Owns the events +
+	// toolCalls arrays and the realtime usage ticker (startPhoneTicker via the
+	// injected factory), and does the idempotent recordSession flush at finalize.
+	// transcript/startTime/pendingTasks stay on the CallSession — they're call
+	// artifacts/lifecycle, not recorder-owned. (startTime already here from #209.)
+	recorder: SessionRecorder;
 	// Per-call channel-scan state (results/<callSid>.task-*.txt pull path).
 	channelScanHandle?: NodeJS.Timeout;
 	// Safety-net against silent unlinkSync failures — `name -> first-seen ms`,
@@ -418,7 +420,7 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 
 	callSession.pendingTasks++;
 	console.log(`${ts()} [Task] delegated: ${taskId} — "${taskDescription}" (pending: ${callSession.pendingTasks})`);
-	callSession.events.push({ event: `task_delegated:${taskDescription.slice(0, 60)}`, timestamp: new Date().toISOString() });
+	callSession.recorder.events.push({ event: `task_delegated:${taskDescription.slice(0, 60)}`, timestamp: new Date().toISOString() });
 
 	const fullTranscript = callSession.transcript.slice(-20)
 		.map(t => `${t.role === 'sutando' ? 'Sutando' : 'Caller'}: ${t.text}`)
@@ -456,7 +458,7 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 			callSession.pendingTasks = Math.max(0, callSession.pendingTasks - 1);
 			const result = readFileSync(resultPath, 'utf-8').trim();
 			console.log(`${ts()} [Task] result for ${taskId} (${Date.now() - startTime}ms): ${result.slice(0, 200)}`);
-			callSession.events.push({ event: `task_result:${taskId}:${Date.now() - startTime}ms`, timestamp: new Date().toISOString() });
+			callSession.recorder.events.push({ event: `task_result:${taskId}:${Date.now() - startTime}ms`, timestamp: new Date().toISOString() });
 			// Archive both the result + task files so phone surfaces match the
 			// task-bridge.ts archiveFile() audit-trail pattern (#1235).
 			archivePhoneFile(resultPath, 'results', taskId);
@@ -710,6 +712,22 @@ async function createCallSession(params: {
 }): Promise<CallSession> {
 	const bodhiPort = nextBodhiPort++;
 
+	// Per-call observability recorder (step 5b-2). The injected factory keeps the
+	// phone usage kind (`phone.call`, with callSid/isOwner/isMeeting) — the
+	// recorder's default would be the voice ticker, which would mis-bill phone
+	// seconds as `voice.session`. toolCallsGetter reads recorder.toolCalls so the
+	// per-tick count matches what finalize records.
+	const recorder = createSessionRecorder('phone', params.callSid, {
+		tickerFactory: (model) => startPhoneTicker({
+			callSid: params.callSid,
+			model,
+			isOwner: params.isOwner,
+			isMeeting: params.isMeeting,
+			toolCallsGetter: () => recorder.toolCalls.length,
+		}),
+	});
+	recorder.events.push({ event: 'call_started', timestamp: new Date().toISOString() });
+
 	const callSession: CallSession = {
 		...params,
 		voiceSession: null as unknown as VoiceSession,
@@ -720,16 +738,11 @@ async function createCallSession(params: {
 		startTime: Date.now(),
 		transcript: [],
 		resultQueue: [],
-		toolCalls: [],
-		events: [{ event: 'call_started', timestamp: new Date().toISOString() }],
-		usageTicker: startPhoneTicker({
-			callSid: params.callSid,
-			model: VOICE_MODEL,
-			isOwner: params.isOwner,
-			isMeeting: params.isMeeting,
-			toolCallsGetter: () => callSession.toolCalls.length,
-		}),
+		recorder,
 	};
+	// Start the usage ticker now (call is live). Matches the pre-5b-2 inline
+	// startPhoneTicker at CallSession creation; recorder.flush() stops it.
+	recorder.startTicker(VOICE_MODEL);
 
 	// Start live transcript file
 	const liveTranscriptPath = `/tmp/sutando-live-transcript-${params.callSid}.txt`;
@@ -770,7 +783,7 @@ async function createCallSession(params: {
 				// Resolve tool name from the map since e.toolName is undefined in onToolResult
 				const toolName = callSession._toolIdMap?.get(e.toolCallId) || 'unknown';
 				console.log(`${ts()} [Tool] result: ${toolName} (${e.status}, ${e.durationMs}ms)`);
-				callSession.toolCalls.push({ name: toolName, durationMs: e.durationMs, timestamp: new Date().toISOString() });
+				callSession.recorder.toolCalls.push({ name: toolName, durationMs: e.durationMs, timestamp: new Date().toISOString() });
 				// tool_result event push removed per #1052 — recordToolCall
 				// below is the canonical write (phone table, kind='tool_call').
 				// Phone tool_call rows must key on callSid (same as recordConversation
@@ -781,7 +794,7 @@ async function createCallSession(params: {
 				// Log REC indicator status for recording tools
 				if (toolName === 'record_screen_with_narration' || toolName === 'screen_record' || toolName === 'open_file') {
 					const hasIndicator = existsSync('/tmp/sutando-rec-indicator.pid');
-					callSession.events.push({ event: `rec_indicator:${hasIndicator ? 'on' : 'off'}`, timestamp: new Date().toISOString() });
+					callSession.recorder.events.push({ event: `rec_indicator:${hasIndicator ? 'on' : 'off'}`, timestamp: new Date().toISOString() });
 				}
 				// After video play/pause, inject context reminder
 				if (['play_video', 'pause_video', 'resume_video', 'replay_video'].includes(toolName)) {
@@ -1012,7 +1025,7 @@ async function createCallSession(params: {
 				continue;
 			}
 			console.log(`${ts()} [ChannelScan] picked up ${name} for ${callSession.callSid} (${body.length}B)`);
-			callSession.events.push({ event: `channel_result:${name}`, timestamp: new Date().toISOString() });
+			callSession.recorder.events.push({ event: `channel_result:${name}`, timestamp: new Date().toISOString() });
 			try {
 				(callSession.voiceSession as any).transport.sendContent(
 					[{ role: 'user', text: `[Channel result]\n${body}\n\nReport this result to the caller now.` }],
@@ -1094,27 +1107,25 @@ function cleanupCall(callSid: string): void {
 	}
 	console.log(`${ts()} [Phone] call finalized: ${callSid}`);
 
-	// Observability: per-call metrics → sqlite (data/conversation.sqlite, #603)
-	session.events.push({ event: 'call_ended', timestamp: new Date().toISOString() });
+	// Observability: per-call metrics → sqlite (data/conversation.sqlite, #603).
+	// recorder.flush() stops the usage ticker (final Twilio+Gemini-Live bucket)
+	// FIRST, then records once (idempotent). Surface-specific columns go via the
+	// extra arg: callSid/caller/isOwner/isMeeting/pendingTasks, plus durationMs and
+	// transcriptLines (from session.startTime/transcript, which live on the
+	// CallSession, not the recorder) and sessionId:null (phone keys rows by callSid,
+	// so session_id stays null as it was pre-5b-2).
+	session.recorder.events.push({ event: 'call_ended', timestamp: new Date().toISOString() });
 	const durationMs = Date.now() - session.startTime;
-	recordSession({
-		source: 'phone',
+	session.recorder.flush({
+		sessionId: null,
 		callSid,
 		caller: session.callerNumber,
 		isOwner: session.isOwner,
 		isMeeting: session.isMeeting,
 		durationMs,
 		transcriptLines: session.transcript.length,
-		toolCount: session.toolCalls.length,
 		pendingTasks: session.pendingTasks,
-		toolCalls: session.toolCalls,
-		events: session.events,
 	});
-
-	// Spine usage: flush the final partial bucket for both Twilio + Gemini-Live
-	// axes. The ticker has been emitting increments every USAGE_TICK_MS while the
-	// call ran; stop() emits the remainder and clears the interval.
-	try { session.usageTicker?.stop(); } catch {}
 
 	// Auto-scan the latest call for issues (async, best effort)
 	try {

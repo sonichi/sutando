@@ -171,8 +171,12 @@ export interface SessionRecorder {
 	/** Reset per-logical-session state (fresh arrays + start time). */
 	reset(): void;
 	/** Flush metrics once (idempotent) and stop the usage ticker FIRST — a
-	 * leaked ticker must never fire past a flush. */
-	flush(): void;
+	 * leaked ticker must never fire past a flush. `extra` merges surface-specific
+	 * columns into the recordSession payload (phone carries callSid, caller,
+	 * isOwner, isMeeting, pendingTasks and overrides transcriptLines/durationMs/
+	 * sessionId — see conversation-server finalize). Voice calls flush() with no
+	 * args, so its payload is unchanged. */
+	flush(extra?: Record<string, unknown>): void;
 	/** Start (or restart) the realtime usage ticker for a fresh logical
 	 * session. Stops any lingering ticker first. */
 	startTicker(model: string): void;
@@ -181,13 +185,36 @@ export interface SessionRecorder {
 	readonly wasFlushed: boolean;
 }
 
-export function createSessionRecorder(source: string, sessionId: string): SessionRecorder {
+/**
+ * Options for {@link createSessionRecorder}.
+ * `tickerFactory` lets a surface inject its own usage ticker so the recorder
+ * stays surface-agnostic: voice defaults to `startVoiceTicker` (kind
+ * `voice.session`), phone injects `startPhoneTicker` (kind `phone.call`, carries
+ * callSid/isOwner/isMeeting). The recorder owns the ticker's lifecycle either
+ * way (start on startTicker, stop-before-guard on flush).
+ */
+export interface SessionRecorderOptions {
+	tickerFactory?: (model: string) => TickerControl;
+}
+
+export function createSessionRecorder(
+	source: string,
+	sessionId: string,
+	opts: SessionRecorderOptions = {},
+): SessionRecorder {
 	const events: Array<{ event: string; timestamp: string }> = [];
 	const toolCalls: Array<{ name: string; durationMs: number; timestamp: string }> = [];
 	const transcript: Array<{ role: string; text: string }> = [];
 	let sessionStart = Date.now();
 	let metricsWritten = false;
 	let ticker: TickerControl | null = null;
+	// Default (voice) ticker: verbatim to the pre-extraction startVoiceTicker
+	// call. Phone overrides this with a startPhoneTicker factory.
+	const makeTicker = opts.tickerFactory ?? ((model: string) => startVoiceTicker({
+		sessionId,
+		model,
+		toolCallsGetter: () => toolCalls.length,
+	}));
 
 	return {
 		events, toolCalls, transcript,
@@ -197,7 +224,7 @@ export function createSessionRecorder(source: string, sessionId: string): Sessio
 			sessionStart = Date.now();
 			metricsWritten = false;
 		},
-		flush() {
+		flush(extra?: Record<string, unknown>) {
 			// Spine usage: flush the final partial bucket and clear the interval FIRST,
 			// before the metricsWritten guard. stop() is idempotent (ticker→null),
 			// so a double-flush never double-emits — but doing it before the guard means
@@ -207,6 +234,10 @@ export function createSessionRecorder(source: string, sessionId: string): Sessio
 			if (metricsWritten) return;
 			metricsWritten = true;
 			try {
+				// Surface-specific columns (extra) win over the recorder's defaults:
+				// phone overrides sessionId (→null; it keys rows by callSid), plus
+				// transcriptLines/durationMs (its transcript + startTime live on the
+				// CallSession, not this recorder). Voice passes no extra → unchanged.
 				recordSession({
 					source,
 					sessionId,
@@ -215,19 +246,17 @@ export function createSessionRecorder(source: string, sessionId: string): Sessio
 					toolCount: toolCalls.length,
 					toolCalls,
 					events,
+					...extra,
 				});
-				console.log(`${ts()} [Observability] Recorded ${source} session: ${toolCalls.length} tools, ${events.length} events, ${transcript.length} transcript lines (sqlite, #603)`);
+				const loggedTranscriptLines = (extra?.transcriptLines as number | undefined) ?? transcript.length;
+				console.log(`${ts()} [Observability] Recorded ${source} session: ${toolCalls.length} tools, ${events.length} events, ${loggedTranscriptLines} transcript lines (sqlite, #603)`);
 			} catch (err) {
 				console.log(`${ts()} [Observability] Failed to write metrics: ${err}`);
 			}
 		},
 		startTicker(model: string) {
 			ticker?.stop();
-			ticker = startVoiceTicker({
-				sessionId,
-				model,
-				toolCallsGetter: () => toolCalls.length,
-			});
+			ticker = makeTicker(model);
 		},
 	};
 }
