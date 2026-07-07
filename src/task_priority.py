@@ -16,10 +16,14 @@ Anything not recognized parses as "normal" (fail-open). Order on disk:
 "urgent" -> "normal" -> "low" -> unknown -> oldest mtime tiebreak.
 """
 from __future__ import annotations
+import sys
 from pathlib import Path
 from typing import Iterable, List, Tuple
 
-import local_task_protocol as _ltp
+# Self-sufficient import: consumers load this module standalone via importlib
+# (tests, tools) where src/ isn't on sys.path — same pattern as the bridges.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import local_task_protocol as _ltp  # noqa: E402
 
 _ORDER = {"urgent": 0, "normal": 1, "low": 2}
 _VALID = frozenset(_ORDER.keys())
