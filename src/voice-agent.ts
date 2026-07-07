@@ -41,11 +41,10 @@ import { VoiceSession } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
 import { workTool, startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
-import { recordSession, recordToolCall } from './conversation-store.js';
-import { startVoiceTicker, type TickerControl } from './observability/realtime.js';
+import { recordToolCall } from './conversation-store.js';
 import { buildSutandoSystemPrompt, buildVoiceAgentContext } from './voice-context.js';
 import { buildGreeting, buildInstructions, type VoiceConfigContext } from './voice-agent-config.js';
-import { wireDurableChannels } from './live-agent-runtime.js';
+import { wireDurableChannels, createSessionRecorder } from './live-agent-runtime.js';
 import { classifyTransportClose, type ClassifiedClose } from './voice-error-classifier.js';
 
 import { personalPath, sharedPersonalPath, memoryDirEnv, claudeHomePath } from './util_paths.js';
@@ -685,14 +684,13 @@ async function main() {
 	acquirePidLock();
 
 	// --- Voice agent observability ---
-	// Same format as phone agent's call-metrics.jsonl so diagnose.py can analyze both.
-	const voiceEvents: Array<{ event: string; timestamp: string }> = [];
-	const voiceToolCalls: Array<{ name: string; durationMs: number; timestamp: string }> = [];
-	const voiceTranscript: Array<{ role: string; text: string }> = [];
+	// Same format as phone agent's call-metrics.jsonl so diagnose.py can
+	// analyze both. State + flush + usage-ticker management moved to
+	// live-agent-runtime's SessionRecorder (step 5a-3); the callbacks below
+	// push into recorder.events/toolCalls/transcript exactly as they pushed
+	// into the old module-level arrays.
+	const recorder = createSessionRecorder('voice', SESSION_ID);
 	const voiceToolIdMap = new Map<string, string>();
-	let voiceSessionStart = Date.now();
-	let metricsWritten = false;
-	let voiceTicker: TickerControl | null = null;
 
 	// Authoritative voice-connection state. web-client reads this file
 	// instead of caching the browser's one-shot POST, so a web-client
@@ -725,45 +723,6 @@ async function main() {
 	// the file is always present + always reflects the latest known state.
 	writeVoiceState(false);
 
-	function writeVoiceMetrics() {
-		// Spine usage: flush the final partial bucket and clear the interval FIRST,
-		// before the metricsWritten guard. stop() is idempotent (voiceTicker→null),
-		// so a double-flush never double-emits — but doing it before the guard means
-		// a leaked ticker can NEVER keep firing past a flush (otherwise it would emit
-		// phantom voice.seconds every USAGE_TICK_MS during the post-session idle gap).
-		try { voiceTicker?.stop(); voiceTicker = null; } catch {}
-		if (metricsWritten) return;
-		metricsWritten = true;
-		try {
-			recordSession({
-				source: 'voice',
-				sessionId: SESSION_ID,
-				durationMs: Date.now() - voiceSessionStart,
-				transcriptLines: voiceTranscript.length,
-				toolCount: voiceToolCalls.length,
-				toolCalls: voiceToolCalls,
-				events: voiceEvents,
-			});
-			console.log(`${ts()} [Observability] Recorded voice session: ${voiceToolCalls.length} tools, ${voiceEvents.length} events, ${voiceTranscript.length} transcript lines (sqlite, #603)`);
-		} catch (err) {
-			console.log(`${ts()} [Observability] Failed to write metrics: ${err}`);
-		}
-	}
-
-	// Start (or restart) the realtime usage ticker for a fresh logical session.
-	// Called from BOTH session-reset points: bodhi's onSessionStart (first ACTIVE
-	// transition) AND handleClientConnected's reconnect-reset (bodhi's
-	// onSessionStart never re-fires — see the #1372 note below — so without this
-	// every 2nd+ session in one process would run with no ticker and emit zero
-	// usage). Stops any lingering ticker first (no-op if already flushed to null).
-	function startVoiceUsageTicker() {
-		voiceTicker?.stop();
-		voiceTicker = startVoiceTicker({
-			sessionId: SESSION_ID,
-			model: VOICE_NATIVE_AUDIO_MODEL,
-			toolCallsGetter: () => voiceToolCalls.length,
-		});
-	}
 
 	const session = new VoiceSession({
 		sessionId: SESSION_ID,
@@ -780,17 +739,16 @@ async function main() {
 		hooks: {
 			onSessionStart: (e) => {
 				userTurnCount = 0; userHasInterrupted = false; sessionEnding = false;
-				voiceSessionStart = Date.now(); metricsWritten = false;
-				voiceEvents.length = 0; voiceToolCalls.length = 0; voiceTranscript.length = 0;
-				voiceEvents.push({ event: 'session_started', timestamp: new Date().toISOString() });
-				startVoiceUsageTicker();
+				recorder.reset();
+				recorder.events.push({ event: 'session_started', timestamp: new Date().toISOString() });
+				recorder.startTicker(VOICE_NATIVE_AUDIO_MODEL);
 				console.log(`${ts()} [Session] Started: ${e.sessionId}`);
 			},
 			onSessionEnd: (e) => {
-				voiceEvents.push({ event: `session_ended:${e.reason}`, timestamp: new Date().toISOString() });
+				recorder.events.push({ event: `session_ended:${e.reason}`, timestamp: new Date().toISOString() });
 				console.log(`${ts()} [Session] Ended: ${e.sessionId} (${e.reason})`);
 				clearActiveArtifact();
-				writeVoiceMetrics();
+				recorder.flush();
 			},
 			onToolCall: (e) => {
 				voiceToolIdMap.set(e.toolCallId, e.toolName);
@@ -816,7 +774,7 @@ async function main() {
 			},
 			onToolResult: (e) => {
 				const toolName = voiceToolIdMap.get(e.toolCallId) || 'unknown';
-				voiceToolCalls.push({ name: toolName, durationMs: e.durationMs, timestamp: new Date().toISOString() });
+				recorder.toolCalls.push({ name: toolName, durationMs: e.durationMs, timestamp: new Date().toISOString() });
 				// tool_result event push removed per #1052 — recordToolCall
 				// below is the canonical write (surface table, kind='tool_call',
 				// duration_ms column). Pushing here would duplicate in
@@ -828,7 +786,7 @@ async function main() {
 			},
 			onSubagentStep: (e) => console.log(`${ts()} [Subagent] ${e.subagentName} #${e.stepNumber} [${e.toolCalls.join(',')}]`),
 			onError: (e) => {
-				voiceEvents.push({ event: `error:${e.component}:${e.error.message}`, timestamp: new Date().toISOString() });
+				recorder.events.push({ event: `error:${e.component}:${e.error.message}`, timestamp: new Date().toISOString() });
 				console.error(`${ts()} [Error] ${e.component}: ${e.error.message} (${e.severity})`);
 			},
 		},
@@ -971,7 +929,7 @@ async function main() {
 				// the voice-table row written by logConversation() above
 				// (kind='user'/'agent', ts_unix). session_events keeps only
 				// lifecycle entries to stop triple-encoding the same atom.
-				voiceTranscript.push({ role: evtRole, text: item.content || '' });
+				recorder.transcript.push({ role: evtRole, text: item.content || '' });
 				const label = item.role === 'user' ? 'User' : 'Sutando';
 				try { appendFileSync(liveTranscriptPath, `[${new Date().toLocaleTimeString('en-US', {hour12:false})}] ${label}: ${item.content}\n`); } catch {}
 				// Track real user turns for the end_session gate.
@@ -1011,7 +969,7 @@ async function main() {
 
 	const shutdown = async () => {
 		console.log(`\n${ts()} Shutting down...`);
-		writeVoiceMetrics();
+		recorder.flush();
 		setVisionSession(null);
 		setSessionToolUpdater(null, []);
 		stopVisionControlServer();
@@ -1087,7 +1045,7 @@ async function main() {
 	if (origDisconnect) {
 		(session as any).handleClientDisconnected = () => {
 			origDisconnect();
-			writeVoiceMetrics();
+			recorder.flush();
 			writeVoiceState(false);
 			scheduleIdleTeardown();
 		};
@@ -1111,14 +1069,13 @@ async function main() {
 	if (origConnect) {
 		(session as any).handleClientConnected = () => {
 			cancelIdleTeardown();
-			if (metricsWritten) {
+			if (recorder.wasFlushed) {
 				userTurnCount = 0; userHasInterrupted = false; sessionEnding = false;
-				voiceSessionStart = Date.now(); metricsWritten = false;
-				voiceEvents.length = 0; voiceToolCalls.length = 0; voiceTranscript.length = 0;
-				voiceEvents.push({ event: 'session_started:client_connect', timestamp: new Date().toISOString() });
+				recorder.reset();
+				recorder.events.push({ event: 'session_started:client_connect', timestamp: new Date().toISOString() });
 				// bodhi's onSessionStart won't re-fire (#1372 above), so start the
 				// usage ticker here too — otherwise this reconnect session emits no usage.
-				startVoiceUsageTicker();
+				recorder.startTicker(VOICE_NATIVE_AUDIO_MODEL);
 				console.log(`${ts()} [Session] Client connected after prior flush — reset metrics buffer`);
 			}
 			writeVoiceState(true);

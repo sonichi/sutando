@@ -152,3 +152,82 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 		}, 1500);
 	}, () => session.clientConnected);
 }
+
+// ── Session observability recorder (step 5a-3) ───────────────────────────────
+// Moved from voice-agent main(): the per-session metrics state (events, tool
+// calls, transcript), the idempotent flush into conversation-store, and the
+// realtime usage ticker. Adapter callbacks push into the exposed arrays —
+// the same mutation pattern the inline code used, so callback bodies change
+// only in the variable prefix. Phone (5b-2) gets the same recorder with
+// source: 'phone'.
+
+import { recordSession } from './conversation-store.js';
+import { startVoiceTicker, type TickerControl } from './observability/realtime.js';
+
+export interface SessionRecorder {
+	events: Array<{ event: string; timestamp: string }>;
+	toolCalls: Array<{ name: string; durationMs: number; timestamp: string }>;
+	transcript: Array<{ role: string; text: string }>;
+	/** Reset per-logical-session state (fresh arrays + start time). */
+	reset(): void;
+	/** Flush metrics once (idempotent) and stop the usage ticker FIRST — a
+	 * leaked ticker must never fire past a flush. */
+	flush(): void;
+	/** Start (or restart) the realtime usage ticker for a fresh logical
+	 * session. Stops any lingering ticker first. */
+	startTicker(model: string): void;
+	/** True once flush() has recorded this logical session — the reconnect
+	 * path uses it to decide whether a fresh reset is needed. */
+	readonly wasFlushed: boolean;
+}
+
+export function createSessionRecorder(source: string, sessionId: string): SessionRecorder {
+	const events: Array<{ event: string; timestamp: string }> = [];
+	const toolCalls: Array<{ name: string; durationMs: number; timestamp: string }> = [];
+	const transcript: Array<{ role: string; text: string }> = [];
+	let sessionStart = Date.now();
+	let metricsWritten = false;
+	let ticker: TickerControl | null = null;
+
+	return {
+		events, toolCalls, transcript,
+		get wasFlushed() { return metricsWritten; },
+		reset() {
+			events.length = 0; toolCalls.length = 0; transcript.length = 0;
+			sessionStart = Date.now();
+			metricsWritten = false;
+		},
+		flush() {
+			// Spine usage: flush the final partial bucket and clear the interval FIRST,
+			// before the metricsWritten guard. stop() is idempotent (ticker→null),
+			// so a double-flush never double-emits — but doing it before the guard means
+			// a leaked ticker can NEVER keep firing past a flush (otherwise it would emit
+			// phantom voice.seconds every USAGE_TICK_MS during the post-session idle gap).
+			try { ticker?.stop(); ticker = null; } catch {}
+			if (metricsWritten) return;
+			metricsWritten = true;
+			try {
+				recordSession({
+					source,
+					sessionId,
+					durationMs: Date.now() - sessionStart,
+					transcriptLines: transcript.length,
+					toolCount: toolCalls.length,
+					toolCalls,
+					events,
+				});
+				console.log(`${ts()} [Observability] Recorded ${source} session: ${toolCalls.length} tools, ${events.length} events, ${transcript.length} transcript lines (sqlite, #603)`);
+			} catch (err) {
+				console.log(`${ts()} [Observability] Failed to write metrics: ${err}`);
+			}
+		},
+		startTicker(model: string) {
+			ticker?.stop();
+			ticker = startVoiceTicker({
+				sessionId,
+				model,
+				toolCallsGetter: () => toolCalls.length,
+			});
+		},
+	};
+}
