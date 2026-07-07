@@ -16,8 +16,14 @@ Anything not recognized parses as "normal" (fail-open). Order on disk:
 "urgent" -> "normal" -> "low" -> unknown -> oldest mtime tiebreak.
 """
 from __future__ import annotations
+import sys
 from pathlib import Path
 from typing import Iterable, List, Tuple
+
+# Self-sufficient import: consumers load this module standalone via importlib
+# (tests, tools) where src/ isn't on sys.path — same pattern as the bridges.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import local_task_protocol as _ltp  # noqa: E402
 
 _ORDER = {"urgent": 0, "normal": 1, "low": 2}
 _VALID = frozenset(_ORDER.keys())
@@ -48,25 +54,28 @@ def default_priority_for_source(source: str, access_tier: str | None = None) -> 
 
 def parse_priority_from_text(content: str) -> str:
     """Read the `priority:` header from a task-file body. Returns the
-    recognized enum string, or "normal" if the header is missing/malformed."""
-    for line in content.splitlines():
-        line = line.strip()
-        if line.lower().startswith("priority:"):
-            value = line.split(":", 1)[1].strip().lower()
-            if value in _VALID:
-                return value
-            return _DEFAULT  # malformed -> fail-open to normal
-        # Stop at the first `task:` delimiter — the task-file format puts
-        # `task:` last on the line preceding the user-supplied multi-line
-        # body, so any `priority:` line AFTER `task:` is body content,
-        # not a header. Without this stop, a forged body of
-        # `do thing\npriority: urgent` would escalate priority via the
-        # task-body injection vector (residual half of PR #982 that
-        # qingyun-wu flagged). `---` and blank-line stops kept for back-
-        # compat with the historical heuristic.
-        if line.startswith("task:") or line.startswith("---") or line == "":
+    recognized enum string, or "normal" if the header is missing/malformed.
+
+    Reads via local_task_protocol's safe parser (stop at the first `task:`
+    delimiter) — the PR #982 rule that keeps a forged body of
+    `do thing\\npriority: urgent` from escalating priority. Two historical
+    quirks of this reader are preserved deliberately (invariance-tested
+    against the old implementation over the live corpus):
+    - scanning also stops at a `---` or blank line (pre-#982 heuristic —
+      task-mid writers like the gateway put priority: after task:, so this
+      reader has never seen those headers; changing that is a semantics
+      decision for the write-side convergence, not this refactor)
+    - a present-but-malformed value fails open to "normal"
+    """
+    stopped = content
+    for i, line in enumerate(content.splitlines()):
+        s = line.strip()
+        if s == "" or s.startswith("---"):
+            stopped = "\n".join(content.splitlines()[:i])
             break
-    return _DEFAULT
+    headers = _ltp.parse_task_headers(stopped).headers
+    value = (headers.get("priority") or "").strip().lower()
+    return value if value in _VALID else _DEFAULT
 
 
 def parse_priority_from_file(path: Path) -> str:
