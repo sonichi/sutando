@@ -1478,16 +1478,25 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
     # Build task content.
     ts_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
     bullet_lines = [f"- {c['name']}: {c['status']} ({c['detail']})" for c in failures]
+    # task-last shape (write-side convergence, interaction-planes follow-up):
+    # every header precedes `task:`, the multi-line bullet body follows it.
+    # Under the old task-mid order, stop-at-`task:` readers never saw these
+    # headers — concretely, `parse_priority_from_text` returned "normal" for
+    # every health task, so `priority: low` was dead config. This reorder
+    # ACTIVATES it: health tasks now sort below owner traffic, which is the
+    # documented priority-table intent. Bullet lines are protocol-safe in the
+    # body: `- name:` shapes are not vocabulary keys, so parsers keep them in
+    # body (asserted in tests/health-check-task-shape.test.py).
     body = (
         f"id: task-health-{now_ms}\n"
         f"timestamp: {ts_iso}\n"
-        f"task: Health check found issues. Decide whether to restart, DM owner, or treat as transient:\n"
-        + "\n".join(bullet_lines) + "\n"
         f"source: health-check\n"
         f"interaction_type: system_event\n"
         f"user_id: health-check\n"
         f"access_tier: owner\n"
         f"priority: low\n"
+        f"task: Health check found issues. Decide whether to restart, DM owner, or treat as transient:\n"
+        + "\n".join(bullet_lines) + "\n"
     )
     task_path = tasks_dir / f"task-health-{now_ms}.txt"
     task_path.write_text(body)
