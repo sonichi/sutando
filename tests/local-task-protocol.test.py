@@ -224,6 +224,35 @@ if (corpus / "archive").is_dir():
 else:
     print("  (live corpus sweep skipped — no workspace archive)")
 
+
+# ── Archive-walk helpers (fixture-based — CI has no live workspace) ──────────
+import tempfile
+_tmp = Path(tempfile.mkdtemp(prefix="ltp-archive-"))
+_tasks = _tmp / "tasks"
+(_tasks / "processed").mkdir(parents=True)
+(_tasks / "archive" / "2026-05").mkdir(parents=True)
+(_tasks / "archive" / "2026-07").mkdir(parents=True)
+(_tasks / "archive" / "stray-dir").mkdir(parents=True)
+(_tasks / "task-live.txt").write_text("id: task-live\ntask: x\n")
+(_tasks / "processed" / "task-proc.txt").write_text("id: task-proc\ntask: x\n")
+(_tasks / "archive" / "task-flat.txt").write_text("id: task-flat\ntask: x\n")
+(_tasks / "archive" / "2026-05" / "task-old.txt").write_text("id: task-old\ntask: x\n")
+(_tasks / "archive" / "2026-07" / "task-new.txt").write_text("id: task-new\ntask: x\n")
+(_tasks / "archive" / "stray-dir" / "task-stray.txt").write_text("id: task-stray\ntask: x\n")
+
+check("find: live dir", ltp.find_archived_task(_tasks, "task-live") == _tasks / "task-live.txt")
+check("find: processed", ltp.find_archived_task(_tasks, "task-proc") == _tasks / "processed" / "task-proc.txt")
+check("find: legacy flat archive", ltp.find_archived_task(_tasks, "task-flat") == _tasks / "archive" / "task-flat.txt")
+check("find: month partition", ltp.find_archived_task(_tasks, "task-old") == _tasks / "archive" / "2026-05" / "task-old.txt")
+check("find: non-month dirs skipped", ltp.find_archived_task(_tasks, "task-stray") is None)
+check("find: missing id", ltp.find_archived_task(_tasks, "task-nope") is None)
+check("find: malformed id gated", ltp.find_archived_task(_tasks, "task-../etc") is None)
+swept = [p.name for p in ltp.iter_archived_tasks(_tasks)]
+check("iter: flat + months, stray-dir skipped, live/processed excluded",
+      swept == ["task-flat.txt", "task-old.txt", "task-new.txt"], str(swept))
+check("iter: no archive dir yields nothing",
+      list(ltp.iter_archived_tasks(_tmp / "nonexistent")) == [])
+
 if failures:
     sys.exit(1)
 print(f"PASS — local_task_protocol read-side golden tests")
