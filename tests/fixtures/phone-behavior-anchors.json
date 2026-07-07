@@ -1,0 +1,16 @@
+{
+ "note": "Step-5b phone anchors (post-extraction: real factory output across the call-variant matrix). Deliberate prompt changes regenerate via ANCHOR_UPDATE=1 with the diff called out.",
+ "variant_hashes": {
+  "meeting_verified": "1d4dc9b853f2fc183b066b5b679d266a0781984a17b358f2e054c2e74cd57816",
+  "meeting_unverified": "bab8e57c4fde14b2be1b3e5f5edd2d4156345614d67dbf102c1bf04a93aec0bd",
+  "child_call": "2e26b5279c2f6f825ea1b5975927aac1cf64a0b070734c2d68ef514ddfe5e178",
+  "inbound_owner": "ef8cb6676d193c42523ca14f7103a22484e9619b796faa4cb8846f2e4439aeee",
+  "inbound_verified": "7bbb23e75f06780ca041fe1f02ae9499ee855c3a82a74283cc3503f27de74b41",
+  "inbound_unverified": "cd350b662a13c01f80776f5f97f1b43202b416030224f0cbc21e2ffbb7b68fdf",
+  "outbound_owner": "3098814344fdb4d911dae5d7544752a87538db449921c41475a40bd567d83ccc",
+  "outbound_owner_no_search": "ea012feb6c7d9e0cf2f814424939f377e8304fe605477fc2da73461f9bd65abd"
+ },
+ "regions": {
+  "try_fast_path": "3ad11e5c56e9bdd52a771ed338e73173805196beaefb57c82e662b4ce506d0d8"
+ }
+}

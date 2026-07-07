@@ -83,6 +83,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '../../../src/inline-tools.js';
+import { buildPhoneInstructions } from './phone-agent-config.js';
 import { recordSession, recordConversation, recordToolCall } from '../../../src/conversation-store.js';
 import { startPhoneTicker, type TickerControl } from '../../../src/observability/realtime.js';
 import { resultBelongsTo, phoneCallKey } from '../../../src/result-channel-key.js';
@@ -506,124 +507,20 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 // The 'work' tool is the same as task-bridge.ts — write task file, Claude handles it.
 
 function buildAgent(callSession: CallSession): MainAgent {
-	const isChildCall = !!callSession.parentCallSid;
-
-	let instructions: string;
-	if (callSession.isMeeting) {
-		const ivrInstructions = [
-			'You are dialing into a meeting. You will first hear an automated IVR system.',
-			'CRITICAL IVR NAVIGATION: Listen carefully to the automated prompts and react to what you actually hear.',
-			callSession.meetingId ? `If the IVR asks for a meeting ID, meeting number, conference ID, or PIN, immediately call send_dtmf with digits "${callSession.meetingId}#".` : '',
-			callSession.passcode ? `If the IVR separately asks for a passcode or meeting passcode, immediately call send_dtmf with digits "${callSession.passcode}#".` : '',
-			'If the IVR asks you to record a name, announce yourself briefly as "Sutando" unless there is an option to skip.',
-			'If the IVR says "press # to skip", call send_dtmf with digits "#".',
-			'Do NOT guess or front-run the menu. Wait for the prompt, then send the matching digits.',
-			'Do NOT try to speak over DTMF-only prompts. Use send_dtmf for keypad interactions.',
-			'Once you are in the meeting (you hear people talking, hold music ending, or silence), do NOT announce that you just joined or that you were dialing in. Just listen quietly until someone speaks to you or asks you something.',
-		].filter(Boolean).join('\n');
-
-		const meetingInstructions = callSession.callerVerified
-			? 'You are Sutando, an AI assistant in a meeting. You have full capabilities — make calls, look things up, send messages, and perform tasks. Be natural, warm, and conversational. Keep responses to 1-2 sentences. Known URLs: "sutando agent repo" = https://github.com/sonichi/sutando'
-			: 'You are Sutando, an AI note-taker in a meeting. Be natural, warm, and conversational. Keep responses to 1-2 sentences. You can listen, take notes, and answer questions about the discussion. You cannot make phone calls, send messages, or look things up — if asked, just say you can only help with notes today.';
-
-		instructions = ivrInstructions + '\n\nAfter joining the meeting:\n' + meetingInstructions;
-	} else if (isChildCall) {
-		const availableTools = [
+	// Tuned per-call instruction assembly moved verbatim to
+	// phone-agent-config.ts (step 5b-1) so it is importable/testable; tool
+	// construction below stays here (it closes over live call state).
+	const instructions = buildPhoneInstructions(callSession, {
+		ownerName: OWNER_NAME,
+		ownerTz: OWNER_TZ,
+		googleSearch: PHONE_GOOGLE_SEARCH,
+		inlineToolNames: inlineTools.map(t => t.name),
+		availableToolNames: [
 			...anyCallerTools.map(t => t.name),
 			...(callSession.callerVerified ? configurableTools.map(t => t.name) : []),
 			...(callSession.isOwner ? ownerOnlyTools.map(t => t.name) : []),
-		];
-		instructions = [
-			`You are Sutando, a personal AI assistant. You are making a phone call on behalf of ${OWNER_NAME || 'your owner'}.`,
-			`You are Sutando — NOT the person you are calling. When the person picks up, introduce yourself as Sutando.`,
-			callSession.purpose ? `Purpose of this call: "${callSession.purpose}"` : '',
-			'Be natural, warm, and conversational. Have a full conversation — do NOT rush to hang up.',
-			'Ask follow-up questions to get complete information.',
-			'ONLY call hang_up when the caller says goodbye/bye/farewell/"I\'m done"/"that\'s all". Closing a video, ending a task, or saying "close it"/"stop" is NOT a goodbye — those are about the current action, not the call.',
-			'Keep responses to 1-2 sentences.',
-			availableTools.length > 0 ? `You have these tools available: ${availableTools.join(', ')}. Use them when relevant to help the caller.` : '',
-			'You can ONLY fulfill the stated purpose of this call. If the person asks you to do something outside your available tools, politely decline.',
-		].filter(Boolean).join('\n');
-	} else {
-		// Inbound calls have no purpose (Twilio webhook doesn't set one).
-		// Outbound calls (from /call or /concurrent-call) always set a purpose.
-		const isInbound = !callSession.purpose;
-		// Load Stand identity (voice-context.txt excluded — can confuse phone identity)
-		const standId = (() => { try { const si = JSON.parse(readFileSync(personalPath('stand-identity.json'), 'utf-8')); return si.name ? `Your Stand name is ${si.name}. When asked your name, say "I'm Sutando — ${si.name}."` : ''; } catch { return ''; } })();
-		const instructionParts: string[] = [
-			'You are Sutando, a personal AI assistant.',
-			standId,
-			// Identity & greeting — based on owner vs verified vs unverified
-			isInbound && callSession.isOwner
-				? `Your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''} is calling you. YOU are Sutando — the AI assistant. The person on the phone is your OWNER, a human. Do NOT confuse yourself with the caller. You have full capabilities — use the work tool for anything: check the screen, send emails, look things up, make calls, browse the web, or check results of previous tasks. Say exactly: "Hi, this is Sutando. How can I help?" then WAIT for them to speak. Do NOT say anything else before they talk. Do NOT make up tasks, scenarios, or pretend you were doing something.${(() => { const ctx = getSafeContext(); return ctx ? `\n\nRecent voice conversation (for context — do NOT repeat or bring up unless asked):\n${ctx}` : ''; })()}`
-				: isInbound && callSession.callerVerified
-				? 'A verified caller is calling you. Be helpful and conversational. You can look up meeting IDs and check the time. You CAN answer general knowledge questions, do translations, and have conversations. You cannot access files, control the screen, or delegate tasks. Say "Hello, this is Sutando. How can I help?"'
-				: isInbound
-				? 'Someone is calling you. Be helpful and conversational. You CAN answer general knowledge questions, do translations, and have conversations — but you cannot access files, control the screen, or delegate tasks. Greet them with "Hello, this is Sutando. How can I help?"'
-				: callSession.isOwner
-				? `You are calling your owner${OWNER_NAME ? ` ${OWNER_NAME}` : ''}. The person who picks up IS your owner. You have full capabilities — use the work tool for anything: check the screen, send emails, look things up, make calls, browse the web, or check results of previous tasks. After delivering your message, ask if there is anything else you can help with.${(() => { const ctx = getSafeContext(); return ctx ? `\n\nRecent voice conversation (for context — do NOT repeat or bring up unless asked):\n${ctx}` : ''; })()}`
-				: 'You initiated this call on behalf of your owner.',
-			callSession.purpose && !isInbound ? `Purpose of this call: "${callSession.purpose}"` : '',
-			'Be natural, warm, and conversational. Keep responses to 1-2 sentences.',
-			'NEVER say "I\'m back", "Welcome back", "Working on it", or "task is queued". If the conversation resumes after a pause, just continue naturally from where you left off.',
-			'ONLY call hang_up when the caller says goodbye/bye/farewell/"I\'m done"/"that\'s all". Closing a video, ending a task, or saying "close it"/"stop" is NOT a goodbye — those are about the current action, not the call.',
-		];
-
-		// Owner-only sections
-		if (callSession.isOwner) {
-			instructionParts.push(
-				'',
-				'## How to think',
-				'Before acting, gather what you need. Before delegating, give them what they need.',
-				'call_contact makes a phone call — the message you pass is ALL the other person knows. If you pass no message or a vague one, they will be confused.',
-				'If you need info from multiple tools, call them in sequence — get the results first, then act.',
-				'',
-				'## Tools',
-				`These tools are instant (use them directly, NOT through work): ${inlineTools.map(t => t.name).join(', ')}. Use work for everything else.`,
-				'TOOL EXCLUSIVITY: If an inline tool can handle the request, use ONLY the inline tool. NEVER also call work. They are mutually exclusive — calling both causes duplicate responses. Only use work when no inline tool fits.',
-				'SUMMON: Before calling summon, ALWAYS say "Summoning your screen now" FIRST — the user is on the phone and cannot see what is happening. The tool takes several seconds.',
-				'PLAYBACK RULES (CRITICAL):',
-				'0. Video tools: open_file (open), play_video (play from start), pause_video (pause), resume_video (resume/continue), replay_video (start over), close_video (close). NEVER use work for video.',
-				'1. After calling play_video or resume_video, say NOTHING. Audio streams to the phone.',
-				'2. "pause", "stop", "hold" → call pause_video, then say "Paused."',
-				'3. "play" → play_video. "resume"/"continue" → resume_video. "start over"/"replay" → replay_video.',
-				'4. Do NOT use describe_screen, scroll, or work while a recording is playing.',
-				'5. Do NOT guess or hallucinate about the video (duration, content, etc). You cannot see or hear it.',
-				'You can make concurrent calls — stay on the line while calling someone else.',
-				'',
-				'',
-				'## Known info',
-				(() => { try { const url = execSync('git remote get-url origin', { timeout: 2_000 }).toString().trim().replace(/\.git$/, ''); return `Sutando GitHub repo: ${url}`; } catch { return ''; } })(),
-				ownerLocalDateContext(),
-				// Session-level anti-hallucination backstop (cherry-picked from
-				// bassilkhilo-ag2's parallel PR #1249). Pre-warms the model
-				// with the constraint at session-open so the rule is in scope
-				// BEFORE any result-injection wrapper lands. Combined with the
-				// per-result wrapper below at conversation-server.ts:405, the
-				// model gets the rule twice: at boot and at delivery.
-				'TOOL RESULT TRUTHFULNESS: When a work task result is empty or says nothing was found, you MUST say "nothing scheduled" or "nothing found" — never invent, guess, or fill with plausible-sounding calendar events, emails, or other items. Fabricated events mislead the owner and are worse than silence.',
-				'',
-				'## Style',
-				'Be natural, warm, and conversational. Keep responses to 1-2 sentences.',
-				'ONLY call hang_up when the caller says goodbye/bye/farewell/"I\'m done"/"that\'s all". Closing a video, ending a task, or saying "close it"/"stop" is NOT a goodbye — those are about the current action, not the call.',
-			);
-		}
-
-		instructions = instructionParts.filter(Boolean).join('\n');
-	}
-
-	// Grounding. The "look it up" pointer is conditional on per-surface
-	// config: native Web search when googleSearch is enabled (~2-3s, answer
-	// in conversation), `work` tool otherwise (round-trip ~8-15s). Earlier
-	// versions had a permanent "use work" line + a soft nudge toward native
-	// search — the model read the first as imperative and the nudge as
-	// optional, so it kept delegating even with search on. One conditional
-	// line so only one path is presented per config.
-	if (callSession.isOwner) {
-		instructions += PHONE_GOOGLE_SEARCH
-			? '\n\nNEVER fabricate specific details. If you don\'t know it, use your built-in Web search to look it up — it\'s faster than delegating, and the answer stays in the conversation. If your built-in search returns nothing useful, OR the question needs deeper-than-one-lookup research (multi-step, multiple sources, file reading), call the work tool — it routes to the core agent which can do extensive research.'
-			: '\n\nNEVER fabricate specific details. If you don\'t know it, use the work tool to look it up.';
-	}
+		],
+	});
 
 	const tools: ToolDefinition[] = [];
 
