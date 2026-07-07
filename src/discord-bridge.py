@@ -4320,9 +4320,14 @@ def _task_source(task_id: str):
         # archived voice tasks have source: after task:; the stricter
         # stop-at-task: parser flips their DM verdict — caught by the corpus
         # sweep in tests/discord-task-source-invariance.test.py).
-        src = local_task_protocol.parse_task_headers_lenient(
+        # pragma-no-cover rationale: this module cannot import in the
+        # coverage-gate env (discord.py isn't installed there), so these two
+        # glue lines are unmeasurable; their semantics are covered by
+        # tests/discord-task-source-invariance.test.py, which dual-runs the
+        # extraction against the legacy implementation over the full corpus.
+        src = local_task_protocol.parse_task_headers_lenient(  # pragma: no cover
             tf.read_text(encoding="utf-8", errors="replace")).get("source")
-        return (src or "").strip().lower() or None
+        return (src or "").strip().lower() or None  # pragma: no cover
     except OSError:
         return None
 
