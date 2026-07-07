@@ -15,6 +15,7 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from './workspace_default.js';
 import { claudeHomePath } from './util_paths.js';
 import { recordConversation, recordSessionBoundary } from './conversation-store.js';
+import { selectBackend, type TaskDelegationService } from './task-delegation.js';
 
 const REPO_DIR = resolveWorkspace();
 const TASK_DIR = join(REPO_DIR, 'tasks');
@@ -59,9 +60,12 @@ function archiveFile(srcPath: string, kind: 'tasks' | 'results', taskId: string)
 	}
 }
 
-// Ensure dirs exist
-mkdirSync(TASK_DIR, { recursive: true });
-mkdirSync(RESULT_DIR, { recursive: true });
+// TaskDelegationService seam (#1947): CORE_API_URL set → relay to the core
+// host's agent-api (explicit positive config, Codex P1); otherwise local file
+// I/O, byte-identical to the pre-seam writes. Local dirs are created by the
+// LOCAL selection path only — a relay-mode voice host doesn't grow empty
+// tasks/ + results/ dirs it will never use. Failure is loud (selectBackend).
+const _delegation: TaskDelegationService = selectBackend(TASK_DIR, RESULT_DIR, archiveFile);
 
 function ts(): string { return new Date().toISOString().slice(11, 23); }
 
@@ -92,7 +96,13 @@ export function writeChatTask(taskDescription: string): string {
 		`task: ${taskDescription}`,
 		'',
 	].join('\n');
-	writeFileSync(join(TASK_DIR, `${taskId}.txt`), content);
+	// Local mode: same synchronous write as always. Relay mode: fire-and-log —
+	// this function's sync contract predates the seam, and chat-task tracking
+	// is best-effort bookkeeping, not the delegation critical path.
+	const submitted = _delegation.submitTask(taskId, content);
+	if (submitted instanceof Promise) {
+		submitted.catch(e => console.error(`${ts()} [TaskBridge] chat-task relay submit failed: ${e}`));
+	}
 	console.log(`${ts()} [TaskBridge] Chat task: ${taskId}: ${taskDescription.slice(0, 100)}`);
 	return taskId;
 }
@@ -352,7 +362,7 @@ export const workTool: ToolDefinition = {
 			`access_tier: owner\n` +
 			`priority: urgent\n` +
 			`task: ${task}${contextBlock}\n`;
-		writeFileSync(join(TASK_DIR, `${taskId}.txt`), content);
+		await _delegation.submitTask(taskId, content);
 		// Resolve per-task timeout. 0 → no timeout. Negative or NaN → default.
 		// Cap at 6 hours to prevent runaway pending-state if the voice agent
 		// hallucinates a giant value.
@@ -593,7 +603,70 @@ export function resetNoteViewingDebounce(): void {
 	lastNoteViewingLoggedTs = '';
 }
 
+/** Split-host result loop (relay mode only). Scope is deliberately the
+ * delegation-critical subset of the local watcher: timeout expiry for
+ * _pendingTasks, and delivery+archive of results for tasks THIS process
+ * submitted. Results it doesn't own are left untouched for their real
+ * consumers on the core host. Skip markers get the same silent-archive
+ * treatment as the local path. */
+function startRelayResultWatcher(onResult: (result: string) => void): void {
+	console.log(`${ts()} [TaskBridge] Relay result watcher polling core agent-api`);
+	let inFlight = false;
+	setInterval(async () => {
+		if (inFlight) return; // don't stack slow HTTP polls
+		inFlight = true;
+		try {
+			// Timeout sweep — same semantics as the local watcher, minus the
+			// core-host file ops (task archival happens core-side).
+			for (const [taskId, pending] of _pendingTasks) {
+				const { submittedAt, timeoutMs } = pending;
+				if (timeoutMs === 0) continue;
+				if (Date.now() - submittedAt > timeoutMs) {
+					_pendingTasks.delete(taskId);
+					const minutes = Math.floor(timeoutMs / 60000);
+					const snippet = pending.taskText.length > 80 ? pending.taskText.slice(0, 77) + '...' : pending.taskText;
+					_sendTaskStatus?.(taskId, 'timeout', `Task '${snippet}' timed out — core agent may be unresponsive`);
+					onResult(`[Task ${taskId} ('${snippet}') timed out after ${minutes} minutes. The core host may be unreachable or busy.]`);
+				}
+			}
+			const files = await _delegation.listResultFiles();
+			for (const file of files) {
+				if (_deliveredResults.has(file)) continue;
+				const taskId = file.replace('.txt', '');
+				if (!_pendingTasks.has(taskId)) continue; // not ours — leave it
+				const result = (await _delegation.readResultFile(file)).trim();
+				if (!result) continue;
+				_deliveredResults.add(file);
+				_pendingTasks.delete(taskId);
+				const skip = /^\s*\[(deduped:[^\]]*|no-send|REPLIED)\]/.exec(result);
+				if (!skip) {
+					_sendTaskStatus?.(taskId, 'done', 'Task complete', result);
+					onResult(`[Task result for ${taskId}]\n${result}`);
+				}
+				await _delegation.archiveResultFile(file, taskId);
+			}
+		} catch (err) {
+			// Transient network failure: keep polling — the core keeps results
+			// durable in results/ until archived, so nothing is lost.
+			console.error(`${ts()} [TaskBridge] relay result poll failed (will retry):`, err);
+		} finally {
+			inFlight = false;
+		}
+	}, 2000);
+}
+
 export function startResultWatcher(onResult: (result: string) => void, isClientConnected: () => boolean): void {
+	if (_delegation.mode === 'relay') {
+		// Split-host mode: the local watcher below reads core-host state
+		// (task files for timeout snippets, voice-/question-/proactive- flows,
+		// context consolidation) that doesn't exist on this machine. The relay
+		// watcher covers the delegation-critical subset — results for tasks
+		// THIS process submitted — and nothing else: consuming other task-*
+		// results here would steal them from their real consumers on the core
+		// host (deliver-once). Core-host-only flows stay core-host-only.
+		startRelayResultWatcher(onResult);
+		return;
+	}
 	console.log(`${ts()} [TaskBridge] Watching for results in ${RESULT_DIR}`);
 
 	// Check every 2 seconds for new result files
