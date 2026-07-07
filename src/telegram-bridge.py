@@ -40,6 +40,7 @@ try:
 except Exception:  # pragma: no cover — best-effort telemetry
     def _emit_channel(*_a, **_k):  # type: ignore
         return None
+import local_task_protocol  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path  # noqa: E402
@@ -344,6 +345,42 @@ def _transcribe_via_skill(local_path: str) -> str | None:
     except Exception as e:
         print(f"  [stt] skill call failed for {os.path.basename(local_path)}: {e}", flush=True)
     return None
+
+
+def _modality_for_mime(mime: str) -> str:
+    """Map an attachment MIME type to a Local Task Protocol content modality
+    (interaction-model 4D, step 1.5). image/audio/video by top-level type;
+    everything else (pdf, zip, docx, unknown) is `file`. Duplicated per bridge
+    for now (discord has the twin); promote to local_task_protocol once slack
+    lands the same pair (rule of three)."""
+    m = (mime or "").lower()
+    if m.startswith("image/"):
+        return "image"
+    if m.startswith("audio/"):
+        return "audio"
+    if m.startswith("video/"):
+        return "video"
+    return "file"
+
+
+def _media_attachment_headers(attachment_refs: list, text: str) -> str:
+    """Build the interaction-model 4D step-1.5 header trio for a task file when
+    the message carried attachments — otherwise "". content_modalities = `text`
+    (iff a caption is present) plus one modality per attachment mime; media_form
+    = `attachment` (discrete objects); attachments = one-line JSON of the refs.
+    Pure, so the task-write path stays testable without a live Telegram update."""
+    if not attachment_refs:
+        return ""
+    mods = set()
+    if text and text.strip():
+        mods.add("text")
+    for r in attachment_refs:
+        mods.add(_modality_for_mime(r.mime))
+    return (
+        f"content_modalities: {','.join(sorted(mods))}\n"
+        f"media_form: attachment\n"
+        f"attachments: {local_task_protocol.format_attachments(attachment_refs)}\n"
+    )
 
 
 def download_file(file_id, name_hint="file"):
@@ -663,11 +700,18 @@ def main():
 
                 # Handle attachments (photos, documents, voice)
                 attachment_note = ""
+                # Structured refs (interaction-model 4D, step 1.5), accumulated
+                # alongside the legacy [*attached:] body line — dual-write.
+                attachment_refs: list = []  # pragma: no cover
                 if "photo" in msg:
                     file_id = msg["photo"][-1]["file_id"]  # largest size
                     local_path = download_file(file_id, "photo")
                     if local_path:
                         attachment_note = f"\n[Photo attached: {local_path}]"
+                        attachment_refs.append(local_task_protocol.AttachmentRef(  # pragma: no cover
+                            locator=local_path, mime="image/jpeg",
+                            filename=os.path.basename(local_path),
+                            size=(msg["photo"][-1].get("file_size", 0) or 0)))
                         # If voice is connected, also push the photo as a
                         # vision frame so Gemini sees it in-stream (in
                         # addition to the file-attached task pipeline).
@@ -681,10 +725,20 @@ def main():
                     local_path = download_file(file_id, fname)
                     if local_path:
                         attachment_note = f"\n[File attached: {local_path}]"
+                        attachment_refs.append(local_task_protocol.AttachmentRef(  # pragma: no cover
+                            locator=local_path,
+                            mime=(msg["document"].get("mime_type", "") or ""),
+                            filename=(fname or os.path.basename(local_path)),
+                            size=(msg["document"].get("file_size", 0) or 0)))
                 if "voice" in msg:
                     file_id = msg["voice"]["file_id"]
                     local_path = download_file(file_id, "voice.ogg")
                     if local_path:
+                        attachment_refs.append(local_task_protocol.AttachmentRef(  # pragma: no cover
+                            locator=local_path,
+                            mime=(msg["voice"].get("mime_type", "") or "audio/ogg"),
+                            filename=os.path.basename(local_path),
+                            size=(msg["voice"].get("file_size", 0) or 0)))
                         transcript = _transcribe_via_skill(local_path)
                         if transcript:
                             attachment_note = f"\n[Voice transcript: {transcript}]"
@@ -784,12 +838,18 @@ def main():
                 lines.append(f"{step}. Process transcript and write result to results/{task_id}.txt")
                 tg_skill_hints = "\n" + "\n".join(lines) + "\n"
 
+                # interaction-model 4D, step 1.5: structured media headers
+                # alongside the legacy [*attached:] body line (dual-write). Real
+                # headers after `task:`, so confine_user_content defangs a forged
+                # body copy while these authentic ones pass through.
+                media_headers = _media_attachment_headers(attachment_refs, text)  # pragma: no cover
                 task_file.write_text(
                     f"id: {task_id}\n"
                     f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
                     f"task: {confine_user_content(f'[Telegram @{username}{forward_note}] {text}{attachment_note}{reply_note}')}\n"
                     f"source: telegram\n"
                     f"interaction_type: message\n"
+                    f"{media_headers}"
                     f"chat_id: {chat_id}\n"
                     f"{src_line}"
                     f"{parent_line}"
