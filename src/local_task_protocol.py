@@ -52,6 +52,7 @@ task-last; until then both parsers exist and are named for their trust model.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -66,6 +67,25 @@ INTERACTION_TYPES = frozenset({
     "message", "realtime_audio", "realtime_video",
     "tool_initiated", "system_event", "self_reflective",
 })
+
+# Content-modality vocabulary (interaction-model 4D, step 1.5). The modalities
+# a task's payload spans — orthogonal to interaction_type (which names the
+# *mode*, not the media). A text-only DM is {"text"}; a photo with a caption is
+# {"text", "image"}; a voice note is {"audio"}. Producers stamp a comma-joined
+# subset next to `interaction_type`; readers whitelist against this set
+# (unknown token dropped), the same discipline as the interaction_type gateway
+# whitelist.
+CONTENT_MODALITIES = frozenset({"text", "image", "audio", "video", "file"})
+
+# Media-form vocabulary — the load-bearing routing axis of the 4D model:
+# `attachment` = a discrete, already-bounded object delivered alongside a
+# message (a photo, a PDF, a voice note) → lands in the task file as an
+# AttachmentRef the Core fetches + analyzes. `live_stream` = a continuous
+# real-time media plane (a call's audio, a screen share) → does NOT belong in
+# a task file; it is owned by the LiveAgentRuntime. A missing header defaults
+# to `attachment`: messaging is the default plane, and `live_stream` is the
+# explicit opt-out that routes a payload away from the task-file path.
+MEDIA_FORMS = frozenset({"attachment", "live_stream"})
 
 # Task priority enum (src/task_priority.py is the behavior owner; these are
 # the schema names). Consumer semantics: highest first, mtime FIFO tiebreak.
@@ -93,6 +113,11 @@ KNOWN_HEADER_KEYS = (
     "parent_message_id", "reminder", "author_name", "author_id", "chat_id",
     "thread_ts", "reply_to_event", "reply_to_me", "callSid", "caller",
     "from", "call_sid", "hint", "instructions", "transcript",
+    # interaction-model 4D, step 1.5 — structured media metadata. Listing them
+    # here promotes them to headers AND (via the guard's shared import) defangs
+    # them in untrusted bodies, so a forged `attachments:` body line can never
+    # smuggle a fetch locator past the parser.
+    "content_modalities", "media_form", "attachments",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 
@@ -247,6 +272,126 @@ def _parse_task_mid(text: str, last_wins: bool) -> TaskHeaders:
     while body_lines and body_lines[-1] == "":
         body_lines.pop()
     return TaskHeaders(headers=headers, body="\n".join(body_lines))
+
+
+# ── Media attachments (interaction-model 4D, step 1.5) ───────────────────────
+
+
+@dataclass
+class AttachmentRef:
+    """One discrete media object carried by a task, source-independent.
+
+    The unified descriptor every bridge normalizes its native attachment into
+    (Discord CDN url, Slack file, Telegram file_id, Matrix mxc://, or an
+    already-downloaded local path) so the Core sees ONE shape regardless of
+    surface. `locator` is the source-specific pointer to the bytes; the
+    safe-fetch policy (bridge/relay side, a later slice) resolves a remote
+    locator to a local path and may rewrite `locator` in place once fetched.
+
+    Deliberately metadata-only: no bytes, no file handles (R1 stdlib-only, and
+    a task file must stay a small text record). `size`/`sha256` let a consumer
+    enforce a limit and dedupe *before* fetching. Every field but `locator` is
+    optional — a ref with nothing to point at is meaningless, so an element
+    lacking a locator is dropped on both encode and decode.
+    """
+    locator: str
+    id: str = ""
+    mime: str = ""
+    filename: str = ""
+    size: int = 0
+    sha256: str = ""
+    expiry: str = ""  # ISO-8601 UTC; "" = no expiry / already-local
+
+    def as_dict(self) -> dict:
+        """Compact dict for JSON serialization — omits empty/zero fields so the
+        header line stays small and round-trips back to an equal ref."""
+        d: dict = {"locator": self.locator}
+        for k in ("id", "mime", "filename", "sha256", "expiry"):
+            v = getattr(self, k)
+            if v:
+                d[k] = v
+        if self.size:
+            d["size"] = self.size
+        return d
+
+
+def parse_content_modalities(headers: dict) -> frozenset:
+    """The whitelisted set of content modalities from a parsed header dict.
+
+    Reads the comma-joined `content_modalities` value, lower-cases + trims each
+    token, and drops anything outside CONTENT_MODALITIES — an unknown token is
+    noise, never a new modality (same rule as the interaction_type whitelist).
+    Missing/empty → empty set; a text-only task need not stamp `{"text"}`."""
+    raw = (headers or {}).get("content_modalities") or ""
+    return frozenset(
+        t for t in (tok.strip().lower() for tok in raw.split(",")) if t in CONTENT_MODALITIES
+    )
+
+
+def parse_media_form(headers: dict) -> str:
+    """The task's media form: `attachment` (default) or `live_stream`.
+
+    Whitelists the `media_form` value; anything unknown or missing collapses to
+    `attachment`, the safe default that routes the payload through the normal
+    task-file path rather than mis-claiming a LiveAgentRuntime stream."""
+    v = ((headers or {}).get("media_form") or "").strip().lower()
+    return v if v in MEDIA_FORMS else "attachment"
+
+
+def parse_attachments(headers: dict) -> list["AttachmentRef"]:
+    """Decode the `attachments:` header — a one-line JSON array of objects —
+    into AttachmentRefs.
+
+    Tolerant by contract: a malformed value, a non-list payload, a non-object
+    element, or an element with no `locator` is skipped, never raised. A bad
+    attachments header must not block reading the rest of the task (the same
+    never-block principle as the audit sink). Missing header → []."""
+    raw = (headers or {}).get("attachments")
+    if not raw:
+        return []
+    try:
+        arr = json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(arr, list):
+        return []
+    refs: list[AttachmentRef] = []
+    for el in arr:
+        if not isinstance(el, dict):
+            continue
+        locator = el.get("locator")
+        if not locator or not isinstance(locator, str):
+            continue
+        size = el.get("size", 0)
+        if isinstance(size, bool):
+            size = 0  # a JSON bool is not a byte count (int(True) == 1 would lie)
+        elif not isinstance(size, int):
+            try:
+                size = int(size)
+            except (ValueError, TypeError):
+                size = 0
+        refs.append(AttachmentRef(
+            locator=locator,
+            id=str(el.get("id", "")),
+            mime=str(el.get("mime", "")),
+            filename=str(el.get("filename", "")),
+            size=size,
+            sha256=str(el.get("sha256", "")),
+            expiry=str(el.get("expiry", "")),
+        ))
+    return refs
+
+
+def format_attachments(refs: Iterable["AttachmentRef"]) -> str:
+    """Encode AttachmentRefs into the one-line JSON value of an `attachments:`
+    header — the write-side inverse of parse_attachments.
+
+    Guaranteed single-line (json escapes any embedded newline in a field), so
+    it is safe for both task-last single-line values and the task-mid
+    newline-stripping writers. Refs without a locator are dropped (they'd be
+    unparseable on read, so encoding them would not round-trip)."""
+    payload = [r.as_dict() for r in refs if r.locator]
+    return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
 
 
 # ── Archive rules ────────────────────────────────────────────────────────────
