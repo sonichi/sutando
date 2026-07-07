@@ -13,7 +13,7 @@ name: Coverage Gate
 
 on:
   pull_request:
-    branches: [main, staging-workspace-revamp, staging-interaction-planes]
+    branches: [main, staging-interaction-planes]
 
 jobs:
   coverage-gate:
