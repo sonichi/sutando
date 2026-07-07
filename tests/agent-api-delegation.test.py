@@ -40,9 +40,13 @@ api.TASK_DIR.mkdir()
 api.RESULT_DIR.mkdir()
 api.API_TOKEN = "test-token-123"
 
-server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), api.Handler)
+# Handler runs on the MAIN thread (plain HTTPServer + handle_request loop);
+# requests are issued from a worker thread. Inverted on purpose: the coverage
+# gate's tracer misses handler-THREAD execution, so serving on the main
+# thread is what makes the dispatch lines measurable.
+server = http.server.HTTPServer(("127.0.0.1", 0), api.Handler)
+server.timeout = 0.5
 port = server.server_address[1]
-threading.Thread(target=server.serve_forever, daemon=True).start()
 BASE = f"http://127.0.0.1:{port}"
 
 failures = []
@@ -54,7 +58,7 @@ def check(name, cond, detail=""):
         failures.append(name)
 
 
-def req(method, path, body=None, token="test-token-123"):
+def _raw_req(method, path, body=None, token="test-token-123"):
     r = urllib.request.Request(f"{BASE}{path}", method=method,
                                data=None if body is None else json.dumps(body).encode())
     if token:
@@ -65,6 +69,18 @@ def req(method, path, body=None, token="test-token-123"):
             return resp.status, json.loads(resp.read().decode() or "{}")
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read().decode() or "{}")
+
+
+def req(method, path, body=None, token="test-token-123"):
+    """Issue the request from a worker thread while the MAIN thread serves it."""
+    out = {}
+    t = threading.Thread(target=lambda: out.update(
+        zip(("code", "data"), _raw_req(method, path, body, token))), daemon=True)
+    t.start()
+    while t.is_alive():
+        server.handle_request()   # serve on the main thread (traced)
+    t.join()
+    return out["code"], out["data"]
 
 
 CONTENT = ("id: task-e2e-1\ntimestamp: 2026-07-07T00:00:00Z\nsource: voice\n"
@@ -111,7 +127,7 @@ check("tokenless core refuses delegation (403)", code == 403, str(data))
 code, _ = req("GET", "/delegation/results", token=None)
 check("tokenless core refuses list (403)", code == 403)
 
-server.shutdown()
+server.server_close()
 
 # ── Direct route-body calls (main thread) ────────────────────────────────────
 # The HTTP layer above proves dispatch + auth; these direct calls prove the
@@ -134,6 +150,13 @@ check("direct archive already-gone", api.delegation_archive_result(
     {"name": "task-direct-1.txt", "task_id": "task-direct-1"})[1].get("note") == "already gone")
 check("direct archive bad tid", api.delegation_archive_result(
     {"name": "x.txt", "task_id": "../evil"})[0] == 400)
+
+# OSError branch of delegation_list_results (unreadable results dir).
+_saved = api.RESULT_DIR
+api.RESULT_DIR = tmp / "not-a-dir-file"
+api.RESULT_DIR.write_text("plain file")
+check("direct list handles unreadable dir", api.delegation_list_results()[0] == 500)
+api.RESULT_DIR = _saved
 
 if failures:
     sys.exit(1)
