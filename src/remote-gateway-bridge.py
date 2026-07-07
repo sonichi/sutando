@@ -57,6 +57,7 @@ from pathlib import Path
 # src/ and pointed outside the repo).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
+import local_task_protocol  # noqa: E402
 
 WS = resolve_workspace()
 TASKS_DIR = WS / "tasks"
@@ -392,10 +393,15 @@ def _download_bytes(url: str, headers: dict, cap: int) -> bytes:
     return data
 
 
-def _maybe_fetch_media(body: str) -> str:
+def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
     """If `body` carries a media marker, download the attachment to a local
     file and rewrite the marker to `[File attached: <path>]`. Returns the body
-    unchanged on any failure (drop-in safe)."""
+    unchanged on any failure (drop-in safe).
+
+    When `_refs_out` is provided and a fetch succeeds, the corresponding
+    `AttachmentRef` (interaction-model 4D, step 1.5) is appended to it — so
+    _write_task can stamp structured `attachments:` headers alongside the legacy
+    body line, without disturbing any of the drop-in-safe early returns."""
     m = MEDIA_MARKER_RE.search(body or "")
     if not m:
         return body
@@ -455,6 +461,9 @@ def _maybe_fetch_media(body: str) -> str:
         _log(f"media save failed ({e}) — leaving marker as-is")
         return body
     _log(f"fetched media → {path} ({len(data)} bytes)")
+    if _refs_out is not None:
+        _refs_out.append(local_task_protocol.AttachmentRef(
+            locator=str(path), mime=mime, filename=(name or path.name), size=len(data)))
     label = "Photo attached" if str(kind) == "m.image" else "File attached"
     # Replacement as a FUNCTION so backslashes/`\g<>` in the path can never be
     # interpreted as re.sub group references.
@@ -542,7 +551,21 @@ def _write_task(task: dict) -> str | None:
             lines.append(f"interaction_type: {it}")
         elif f == "task" and task.get("task") not in (None, ""):
             # Resolve an inbound media marker to a local file the core can read.
-            lines.append(f"task: {_one_line(_maybe_fetch_media(str(task['task'])))}")
+            _media_refs: list = []
+            _fetched = _maybe_fetch_media(str(task["task"]), _media_refs)
+            lines.append(f"task: {_one_line(_fetched)}")
+            # interaction-model 4D, step 1.5: if a media marker was fetched,
+            # stamp structured attachments[]/content_modalities/media_form
+            # alongside the legacy [File attached:] body line (dual-write) via the
+            # shared local_task_protocol helper — same shape the 3 message bridges
+            # emit. has_text = caption present beyond the provider prefix + marker.
+            if _media_refs:
+                _txt = re.sub(r"\[(?:File|Photo) attached: [^\]]*\]", "", _fetched).strip()
+                if _txt.startswith("[") and "]" in _txt:
+                    _txt = _txt.split("]", 1)[1]
+                _mh = local_task_protocol.media_attachment_headers(_media_refs, bool(_txt.strip()))
+                if _mh:
+                    lines.extend(_mh.rstrip("\n").split("\n"))
         elif f in task and task[f] not in (None, ""):
             lines.append(f"{f}: {_one_line(task[f])}")
     # access_tier is a LOCAL decision and written LAST so it wins even under a
