@@ -41,7 +41,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 
 def _safe_id(raw: str) -> str:
@@ -93,6 +93,7 @@ def validate_twilio_signature(handler, body: str) -> bool:
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
+import local_task_protocol  # noqa: E402
 
 WORKSPACE_DIR = resolve_workspace()
 TASK_DIR = WORKSPACE_DIR / "tasks"
@@ -432,6 +433,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         q["options"] = [o.strip() for o in opts_match.group(1).split("|")]
                     questions.append(q)
             self.send_json(200, {"tasks": tasks, "watcher": watcher_ok, "claude": claude_ok, "questions": questions})
+        elif path == "/delegation/results":
+            # TaskDelegationService relay backend (#1947): list results/ for
+            # the split-host watcher. Read-only but bearer-gated like the
+            # write side — result bodies are owner data.
+            if not API_TOKEN:
+                self.send_json(403, {"error": "delegation requires SUTANDO_API_TOKEN on the core host"})
+            elif not self.check_auth():
+                pass
+            else:
+                try:
+                    files = sorted(f.name for f in RESULT_DIR.iterdir()
+                                   if f.is_file() and f.name.endswith(".txt"))
+                    self.send_json(200, {"files": files})
+                except OSError:
+                    self.send_json(500, {"error": "results dir unreadable"})
+        elif path.startswith("/delegation/results/"):
+            if not API_TOKEN:
+                self.send_json(403, {"error": "delegation requires SUTANDO_API_TOKEN on the core host"})
+            elif not self.check_auth():
+                pass
+            else:
+                name = unquote(path[len("/delegation/results/"):])
+                # _safe_path appends ".txt" itself — hand it the stem.
+                stem = name[:-4] if name.endswith(".txt") else name
+                target = _safe_path(RESULT_DIR, stem)
+                if target is None or not os.path.isfile(target):
+                    self.send_json(404, {"error": "no such result"})
+                else:
+                    self.send_json(200, {"body": Path(target).read_text(errors="replace")})
         elif path.startswith("/result/"):
             task_id = path[len("/result/"):]
             result = get_task_result(task_id)
@@ -689,6 +719,68 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 data = json.loads(body)
                 voice_desired_state = data.get("state", "disconnected")
                 self.send_json(200, {"state": voice_desired_state})
+            except Exception:
+                self.send_json(400, {"error": "invalid"})
+            return
+
+        if path == "/delegation/tasks":
+            # TaskDelegationService relay backend (#1947): a split-host
+            # voice-agent submits a FULLY-SERIALIZED task file body. The
+            # writer owns header order (see local_task_protocol's shape
+            # taxonomy) — this endpoint only validates the id and stores the
+            # bytes, exactly like the local writeFileSync it replaces.
+            # Bearer-gated: remote submission is full-capability delegation,
+            # so a core with no API_TOKEN configured refuses (unlike the
+            # local-dev default elsewhere in this file).
+            if not API_TOKEN:
+                self.send_json(403, {"error": "delegation requires SUTANDO_API_TOKEN on the core host"})
+                return
+            if not self.check_auth():
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            try:
+                data = json.loads(body)
+                tid = str(data.get("id", ""))
+                content = data.get("content", "")
+                if not local_task_protocol.valid_task_id(tid) or not content:
+                    self.send_json(400, {"error": "invalid task id or empty content"})
+                    return
+                TASK_DIR.mkdir(parents=True, exist_ok=True)
+                (TASK_DIR / f"{tid}.txt").write_text(content)
+                self.send_json(200, {"ok": True, "task_id": tid})
+            except Exception:
+                self.send_json(400, {"error": "invalid"})
+            return
+
+        if path == "/delegation/archive":
+            if not API_TOKEN:
+                self.send_json(403, {"error": "delegation requires SUTANDO_API_TOKEN on the core host"})
+                return
+            if not self.check_auth():
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            try:
+                data = json.loads(body)
+                name = str(data.get("name", ""))
+                tid = str(data.get("task_id", ""))
+                # _safe_path appends ".txt" itself — hand it the stem.
+                stem = name[:-4] if name.endswith(".txt") else name
+                src = _safe_path(RESULT_DIR, stem)
+                if src is None or not local_task_protocol.valid_task_id(tid):
+                    self.send_json(400, {"error": "invalid name or task id"})
+                    return
+                if not os.path.exists(src):
+                    self.send_json(200, {"ok": True, "note": "already gone"})
+                    return
+                # Same destination scheme as task-bridge's archiveFile():
+                # results/archive/YYYY-MM/<taskId>.txt.
+                dest_dir = local_task_protocol.archive_month_dir(
+                    RESULT_DIR, datetime.now().isoformat())
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                os.replace(src, dest_dir / f"{tid}.txt")
+                self.send_json(200, {"ok": True})
             except Exception:
                 self.send_json(400, {"error": "invalid"})
             return
