@@ -76,17 +76,25 @@ PRIORITIES = ("urgent", "normal", "low")
 # legacy local files — that default belongs to consumers, not this module.
 ACCESS_TIERS = ("owner", "team", "other")
 
-# Header keys observed in the real archive corpus (3,401 files, 2026-07-06),
-# most-common first. Descriptive, not enforced — producers may add keys, and
-# readers must ignore unknown ones (that additivity is what let step 1 ship).
+# The header vocabulary: every key observed in the real archive corpus
+# (3,401 files, 2026-07-06) plus the live writers' full sets. This list is
+# ENFORCED in two places that must stay in lockstep (Codex P2 on PR #1954):
+# - the parsers below promote ONLY these keys to headers (an unknown
+#   `key: value` line stays in the body — so junk like transcript dialogue
+#   `Caller: hi` never becomes metadata), and
+# - task_body_guard.confine_user_content defangs exactly these keys in
+#   untrusted bodies (it imports this list), so no key a parser would trust
+#   can survive undefanged in user-supplied content.
+# Adding a producer header = add it here; the guard follows automatically.
 KNOWN_HEADER_KEYS = (
     "id", "timestamp", "task", "source", "access_tier", "user_id",
     "channel_id", "priority", "interaction_type", "source_message_id",
     "channel_name", "guild_name", "attempts", "sender_name", "room_name",
     "parent_message_id", "reminder", "author_name", "author_id", "chat_id",
-    "reply_to_event", "reply_to_me", "callSid", "caller", "from", "call_sid",
-    "hint", "instructions", "transcript",
+    "thread_ts", "reply_to_event", "reply_to_me", "callSid", "caller",
+    "from", "call_sid", "hint", "instructions", "transcript",
 )
+_KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 
 # Task-id shape: `task-<slug>` where slug is dash-separated [a-z0-9] segments
 # (task-1783..., task-chat-1783..., task-phone-..., task-summary-...,
@@ -118,16 +126,15 @@ class TaskHeaders:
 
     `body` semantics differ BY PARSER — this is deliberate and load-bearing:
     - `parse_task_headers` (task-last): the full work item — the `task:`
-      line's content plus every line after it.
-    - `parse_task_headers_trusted` / `_lenient` (task-mid): the SCALAR value
-      of the first `task:` line ONLY. In task-mid files the lines after
-      `task:` are a mix of real headers and continuation content (health
-      bullets, phone `hint:`/`transcript:` sections) that a header scan
-      cannot losslessly split — so these parsers do not pretend to. A reader
-      that needs the complete work item from a file of any shape must use
-      `task_body()`, which never drops a line. (Codex review on PR #1954:
-      the earlier draft looked like it returned the work item and silently
-      lost health-check bullets.)
+      line's content plus every line after it, verbatim.
+    - `parse_task_headers_trusted` / `_lenient` (task-mid): the `task:`
+      line's content plus every subsequent NON-vocabulary line. Vocabulary
+      header lines (KNOWN_HEADER_KEYS) after `task:` are promoted to
+      `headers` and excluded from body; everything else — health-check
+      failure bullets, phone transcript dialogue, unknown `key:`-shaped
+      lines — stays in body. Every post-`task:` line lands in exactly one
+      of headers/body (no silent loss; Codex P2s on PR #1954). For the
+      byte-verbatim work item including trailing headers, use `task_body()`.
     """
     headers: dict = field(default_factory=dict)
     body: str = ""
@@ -172,10 +179,11 @@ def parse_task_headers(text: str) -> TaskHeaders:
             body_lines.append(line[len("task:"):].lstrip())
             continue
         m = _HEADER_LINE_RE.match(line)
-        if m:
+        if m and m.group(1) in _KNOWN_KEY_SET:
             headers.setdefault(m.group(1), m.group(2))
-        # Non-matching lines before task: are tolerated and skipped — real
-        # archive files contain blank lines and free-text hint lines.
+        # Unknown-key and non-matching lines before task: are tolerated and
+        # skipped — real archive files contain blank lines and free-text
+        # hint blocks; only vocabulary keys become metadata.
     return TaskHeaders(headers=headers, body="\n".join(body_lines))
 
 
@@ -192,16 +200,7 @@ def parse_task_headers_lenient(text: str) -> TaskHeaders:
     this module — hardening it means changing verdicts for historical shapes
     and is deliberately out of scope for the read-side refactor.
     """
-    headers: dict = {}
-    body = ""
-    for line in text.split("\n"):
-        if line.startswith("task:") and not body:
-            body = line[len("task:"):].lstrip()
-            continue
-        m = _HEADER_LINE_RE.match(line)
-        if m:
-            headers.setdefault(m.group(1), m.group(2))
-    return TaskHeaders(headers=headers, body=body)
+    return _parse_task_mid(text, last_wins=False)
 
 
 def parse_task_headers_trusted(text: str) -> TaskHeaders:
@@ -215,16 +214,39 @@ def parse_task_headers_trusted(text: str) -> TaskHeaders:
     file. Applying this parser to a task-last file would let the body forge
     headers; pick the parser by writer, not by content sniffing.
     """
+    return _parse_task_mid(text, last_wins=True)
+
+
+def _parse_task_mid(text: str, last_wins: bool) -> TaskHeaders:
+    """Shared task-mid scan. Headers = vocabulary keys only
+    (KNOWN_HEADER_KEYS); body = the `task:` line's content plus every
+    subsequent NON-vocabulary line — so continuation content (health-check
+    failure bullets, phone transcript dialogue, skill-hint blocks) is
+    preserved losslessly in body while trailing real headers are excluded.
+    Every input line after `task:` lands in exactly one of headers/body
+    (fidelity is asserted over the full archive corpus in the golden test).
+    An unknown `key: value` shape (`Caller: hi`) is body, never metadata."""
     headers: dict = {}
-    body = ""
+    body_lines: list[str] = []
+    in_body = False
     for line in text.split("\n"):
-        if line.startswith("task:") and not body:
-            body = line[len("task:"):].lstrip()
+        if not in_body and line.startswith("task:"):
+            in_body = True
+            body_lines.append(line[len("task:"):].lstrip())
             continue
         m = _HEADER_LINE_RE.match(line)
-        if m:
-            headers[m.group(1)] = m.group(2)  # last occurrence wins
-    return TaskHeaders(headers=headers, body=body)
+        if m and m.group(1) in _KNOWN_KEY_SET:
+            if last_wins:
+                headers[m.group(1)] = m.group(2)
+            else:
+                headers.setdefault(m.group(1), m.group(2))
+        elif in_body:
+            body_lines.append(line)
+    # Trailing blank lines are file-termination artifacts, not content —
+    # interior blank lines are preserved.
+    while body_lines and body_lines[-1] == "":
+        body_lines.pop()
+    return TaskHeaders(headers=headers, body="\n".join(body_lines))
 
 
 # ── Archive rules ────────────────────────────────────────────────────────────
