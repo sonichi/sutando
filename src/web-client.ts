@@ -1732,9 +1732,28 @@ function connectWs() {
       setStatus('Live — speak now', 'live');
       statsTimer = setInterval(updateStats, 500);
     } catch (err) {
-      dbg('Mic error: ' + err.message, 'err');
+      dbg('Mic error: ' + (err && err.name ? err.name + ': ' : '') + err.message, 'err');
       setStatus('Mic error', 'error');
-      addSystem('Microphone access denied. Please allow mic in browser settings and retry.');
+      // Not every failure is a permission denial — name the real cause so the user
+      // isn't sent to "browser settings" when the mic is merely busy or absent.
+      let micMsg;
+      switch (err && err.name) {
+        case 'NotAllowedError':
+        case 'SecurityError':
+          micMsg = 'Microphone access denied. Allow mic for this site in browser settings, then click Connect again.';
+          break;
+        case 'NotReadableError':
+        case 'AbortError':
+          micMsg = 'Microphone is in use by another app or tab (Zoom, Photo Booth, another tab, or a prior session). Close it, then click Connect again.';
+          break;
+        case 'NotFoundError':
+        case 'OverconstrainedError':
+          micMsg = 'No microphone found. Connect an input device and select it as the default in your OS sound settings, then Connect.';
+          break;
+        default:
+          micMsg = 'Microphone error (' + (err && err.name ? err.name : 'unknown') + '): ' + (err && err.message ? err.message : 'could not start capture') + '. Click Connect to retry.';
+      }
+      addSystem(micMsg);
       connected = false;  // prevent auto-reconnect loop
       ws.close();
     }
