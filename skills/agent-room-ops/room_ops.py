@@ -11,6 +11,7 @@ graceful-degrade); this file is the unified CLI that dispatches to them.
     python3 room_ops.py send   <room> <path> [--caption c] [--agent mxid]  # media out
     python3 room_ops.py react  <room> <event_id> (--ack received|working|done|fail | --key 🎉) [--agent mxid]
     python3 room_ops.py unreact <room> <event_id> (--ack … | --key …) [--agent mxid]
+    python3 room_ops.py join   <room> [--agent mxid]                 # accept own invite
 
 Every subcommand prints a structured JSON result and **exits 0** for any
 structured result (a graceful `ok:false` "no context / no-op" is not a failed
@@ -26,6 +27,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import read as _read       # noqa: E402
 import media as _media     # noqa: E402
 import react as _react     # noqa: E402
+import join as _join       # noqa: E402
 
 
 def _main(argv):
@@ -50,6 +52,10 @@ def _main(argv):
     p.add_argument("--caption", default=None)
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
+    p = sub.add_parser("join", help="accept this agent's own pending room invite")
+    p.add_argument("room_id")
+    p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
+
     for name in ("react", "unreact"):
         p = sub.add_parser(name, help=f"{name} on a room event")
         p.add_argument("room_id")
@@ -66,6 +72,8 @@ def _main(argv):
         res = _media.fetch_media(a.ref, a.agent_mxid, a.room_id)
     elif a.cmd == "send":
         res = _media.send_media(a.room_id, a.path, a.agent_mxid, caption=a.caption)
+    elif a.cmd == "join":
+        res = _join.join_room(a.room_id, a.agent_mxid)
     else:  # react / unreact
         key = a.key or _react.ACK[a.ack]
         fn = _react.react if a.cmd == "react" else _react.unreact
