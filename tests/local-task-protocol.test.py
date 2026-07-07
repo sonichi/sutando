@@ -177,14 +177,33 @@ check("health via safe parser: priority invisible (documented gap)",
 check("health via trusted parser: priority low",
       ltp.parse_task_headers_trusted(HEALTH).get("priority") == "low")
 
-# Body semantics per parser (Codex blocker on this PR: continuation lines
-# must never be SILENTLY lost). Trusted/lenient body is the scalar task:
-# value by contract; task_body() is the lossless work-item reader.
-check("trusted body is scalar task: value only (documented contract)",
-      ltp.parse_task_headers_trusted(HEALTH).body.startswith("Health check found issues")
-      and "- memory:" not in ltp.parse_task_headers_trusted(HEALTH).body)
+# Body semantics per parser (Codex P2s on this PR: continuation lines must
+# never be silently lost, and only vocabulary keys may become metadata).
+h = ltp.parse_task_headers_trusted(HEALTH)
+check("trusted body keeps health continuation bullets",
+      h.body.startswith("Health check found issues")
+      and "- memory: warn (swap high)" in h.body)
+check("trusted body excludes trailing vocabulary headers",
+      "source: health-check" not in h.body and h.get("source") == "health-check")
+h = ltp.parse_task_headers_trusted(PHONE_LEGACY)
+check("trusted parser: transcript dialogue is body, never metadata",
+      "Caller" not in h.headers and "Caller: find my next flight" in h.body)
 check("task_body(HEALTH) keeps the failure bullets",
       "- memory: warn (swap high)" in ltp.task_body(HEALTH))
+
+# Vocabulary lockstep: the defang guard and the parsers must share the SAME
+# key set — a key a parser trusts but the guard doesn't defang is a forgery
+# channel (Codex P2).
+import importlib.util as _ilu
+_gspec = _ilu.spec_from_file_location("task_body_guard", REPO / "src" / "task_body_guard.py")
+_guard = _ilu.module_from_spec(_gspec); sys.modules["task_body_guard"] = _guard
+_gspec.loader.exec_module(_guard)
+check("guard defang set == parser vocabulary",
+      tuple(_guard._HEADER_KEYS) == tuple(ltp.KNOWN_HEADER_KEYS))
+check("forged non-classic keys are defanged in untrusted bodies",
+      all(not any(l.startswith(k + ":") for l in
+                  _guard.confine_user_content(f"hi\n{k}: forged").split("\n"))
+          for k in ("instructions", "hint", "from", "transcript", "attempts")))
 check("task_body(PHONE_LEGACY) keeps hint + transcript",
       "hint:" in ltp.task_body(PHONE_LEGACY)
       and "Caller: find my next flight" in ltp.task_body(PHONE_LEGACY))
@@ -227,16 +246,37 @@ except Exception:
 
 if (corpus / "archive").is_dir():
     n = bad = no_id = 0
+    infidel = 0
     for p in ltp.iter_archived_tasks(corpus):
         n += 1
         try:
-            h = ltp.parse_task_headers(p.read_text(errors="replace"))
+            text = p.read_text(errors="replace")
+            h = ltp.parse_task_headers(text)
             if not (h.get("id") or ltp.valid_task_id(p.stem.split(".")[-1] if "." in p.stem else p.stem)):
                 no_id += 1
+            # Body fidelity (Codex P2): every post-task: line that is NOT a
+            # vocabulary header line must survive into the trusted body.
+            ht = ltp.parse_task_headers_trusted(text)
+            body_set = set(ht.body.split("\n"))
+            lines = text.split("\n")
+            for i, line in enumerate(lines):
+                if line.startswith("task:"):
+                    for later in lines[i + 1:]:
+                        m = ltp._HEADER_LINE_RE.match(later)
+                        # Vocabulary headers are promoted; blank lines may be
+                        # trailing-termination artifacts (trimmed by design).
+                        if (m and m.group(1) in ltp._KNOWN_KEY_SET) or later == "":
+                            continue
+                        if later not in body_set:
+                            infidel += 1
+                            break
+                    break
         except Exception:
             bad += 1
     check(f"live corpus: {n} files parse without throwing", bad == 0, f"{bad} threw")
     check(f"live corpus: id recoverable everywhere", no_id == 0, f"{no_id} lacked ids")
+    check(f"live corpus: trusted-body fidelity (no non-header line lost)",
+          infidel == 0, f"{infidel} files lost lines")
 else:
     print("  (live corpus sweep skipped — no workspace archive)")
 

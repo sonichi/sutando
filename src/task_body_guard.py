@@ -35,14 +35,16 @@ import re
 _ZWSP = "​"
 
 # Trusted task-file header keys a user line must never be able to forge.
-# Superset across bridges (discord/slack/telegram/voice) so the same guard is
-# safe to apply everywhere.
-_HEADER_KEYS = (
-    "id", "timestamp", "task", "source", "channel_id", "channel_name",
-    "guild_name", "source_message_id", "parent_message_id", "user_id",
-    "interaction_type",
-    "access_tier", "priority", "chat_id", "thread_ts",
-)
+# Single source of truth: local_task_protocol.KNOWN_HEADER_KEYS — the exact
+# set the protocol parsers promote to headers. Guard and parsers moving in
+# lockstep is the invariant (Codex P2 on PR #1954): no key a parser would
+# trust can survive undefanged in user-supplied content. Self-sufficient
+# import (this module is also loaded standalone via importlib in tests).
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from local_task_protocol import KNOWN_HEADER_KEYS as _HEADER_KEYS  # noqa: E402
+
 _HEADER_RE = re.compile(r"^(?:%s)\s*:" % "|".join(_HEADER_KEYS))
 # A run of >=3 leading '=' opens our `===SUTANDO …===` / `===SKILL …===` fences.
 _FENCE_RE = re.compile(r"^={3,}")
