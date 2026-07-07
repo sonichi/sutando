@@ -1081,6 +1081,14 @@ const personalAllTools = (() => {
 	return [...personalTools.owner, ...personalTools.anyCaller].filter(t => (seen.has(t.name) ? false : (seen.add(t.name), true)));
 })();
 
+// Names of env-dependent tools (manifest-loaded per install, plus the
+// presenter-sentinel conditionals) — exported so behavior-anchor tests can
+// pin the STATIC tool surface portably (CI has no personal skill manifests;
+// see tests/voice-behavior-anchors.test.ts).
+export const envDependentToolNames: ReadonlySet<string> = new Set([
+	...personalAllTools.map(t => t.name), 'slide_control', 'fullscreen',
+]);
+
 // Manifest-driven discovery of skills that core (not voice-inline) runs.
 // When a manifest has `documented_for_core: true` and a `core_description`,
 // the description is exposed to voice-agent's system-prompt assembly so

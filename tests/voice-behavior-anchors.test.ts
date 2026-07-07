@@ -48,11 +48,15 @@ const cfg = await import('../src/voice-agent-config.js');
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const anyInline = inlineMod as any;
+// Env-dependent tools (manifest-loaded per install + presenter conditionals)
+// are excluded: CI has no personal skill manifests, so anchoring them makes
+// the fixture machine-specific (learned from the first CI run of this test).
+const envDep: ReadonlySet<string> = anyInline.envDependentToolNames ?? new Set();
 const importableTools = [
 	bridgeMod.workTool,
 	...(anyInline.inlineTools ?? []),
 	...(anyInline.ownerOnlyTools ?? []),
-].filter(Boolean);
+].filter(Boolean).filter((t: { name: string }) => !envDep.has(t.name));
 
 const MODE = { marker: '\n\n[MODE-MARKER-FIXED]', isMeeting: false, isPresenter: false };
 const MEETING_MODE = { marker: '\n\n[MODE-MARKER-MEETING]', isMeeting: true, isPresenter: false };
