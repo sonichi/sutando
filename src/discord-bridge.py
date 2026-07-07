@@ -70,6 +70,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
 from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
 from message_chunking import chunk_message, _is_fence_open_line  # noqa: E402  (Result Router S3 — shared fence-aware chunker; _is_fence_open_line re-exported for existing tests)
+import result_audit  # noqa: E402  (Result Router S5 — §7 audit ledger sink; top-level so hooks carry no lazy import)
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
@@ -3388,12 +3389,8 @@ def _mark_delivered(task_id: str) -> None:
     # §7 audit ledger (Result Router S5): one line per delivered result, so
     # "did the user see this?" is answerable without grepping bridge logs. This
     # is the single post-successful-send choke point in the Discord result path.
-    # Never blocks delivery (result_audit swallows all errors).
-    try:
-        import result_audit
-        result_audit.record(task_id, "delivered", "discord")
-    except Exception:  # pragma: no cover  (defensive: import is safe + record() never raises)
-        pass
+    # record() never raises (result_audit swallows all errors internally).
+    result_audit.record(task_id, "delivered", "discord")
 
 
 def _is_delivered(task_id: str) -> bool:
