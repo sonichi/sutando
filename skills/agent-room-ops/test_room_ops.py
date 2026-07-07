@@ -15,6 +15,7 @@ import _gateway  # noqa: E402
 import read as rd  # noqa: E402
 import media as md  # noqa: E402
 import react as rc  # noqa: E402
+import join as jn  # noqa: E402
 import room_ops  # noqa: E402
 
 HS = "@agent.a:hs"
@@ -210,6 +211,36 @@ class ReactTests(EnvCase):
             self.assertIn("not a joined member", rc.react(ROOM, EV, "👀", HS, gate=None)["reason"])
 
 
+# ----- join ----- #
+class JoinTests(EnvCase):
+    def test_missing_room(self):
+        self.assertFalse(jn.join_room("", HS)["ok"])
+
+    def test_gate_deny(self):
+        os.environ["RELAY_URL"] = "https://r"
+        self.assertIn("gate denied", jn.join_room(ROOM, HS, gate={})["reason"])
+
+    def test_no_relay(self):
+        self.assertIn("no gateway", jn.join_room(ROOM, HS, gate=None)["reason"])
+
+    def test_join_endpoint(self):
+        os.environ["RELAY_URL"] = "https://r"
+        cap = {}
+        with mock.patch.object(jn, "http_json",
+                               side_effect=lambda m, u, h, p: (cap.update(url=u, payload=p), (200, {}))[1]):
+            res = jn.join_room(ROOM, HS, gate=None)
+        self.assertTrue(res["ok"] and cap["url"].endswith("/join"))
+        self.assertEqual(cap["payload"], {})
+
+    def test_403_degrades(self):
+        # No standing invite for an invite-only room → the gateway 403 degrades
+        # to the structured membership reason, not an exception.
+        os.environ["RELAY_URL"] = "https://r"
+        err = urllib.error.HTTPError("u", 403, "no", {}, None)
+        with mock.patch.object(jn, "http_json", side_effect=err):
+            self.assertIn("not a joined member", jn.join_room(ROOM, HS, gate=None)["reason"])
+
+
 # ----- unified CLI ----- #
 class CliTests(EnvCase):
     def test_read_exits_zero(self):
@@ -229,6 +260,9 @@ class CliTests(EnvCase):
 
     def test_fetch_exits_zero(self):
         self.assertEqual(room_ops._main(["fetch", "mxc://x/y", "--room", ROOM, "--agent", HS]), 0)
+
+    def test_join_exits_zero_on_no_gateway(self):
+        self.assertEqual(room_ops._main(["join", ROOM, "--agent", HS]), 0)
 
 
 class GatewayTokenOnboardingTests(EnvCase):
