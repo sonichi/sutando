@@ -425,22 +425,6 @@ def _safe_attachment_basename(filename: str) -> str:
     return f"{safe_base}.{safe_ext}" if safe_ext else safe_base
 
 
-def _modality_for_mime(mime: str) -> str:
-    """Map an attachment MIME type to a Local Task Protocol content modality
-    (interaction-model 4D, step 1.5). image/audio/video by top-level type;
-    everything else (pdf, zip, docx, unknown) is `file`. Kept local to the
-    bridge until all three bridges converge on an identical mapping worth
-    promoting to local_task_protocol."""
-    m = (mime or "").lower()
-    if m.startswith("image/"):
-        return "image"
-    if m.startswith("audio/"):
-        return "audio"
-    if m.startswith("video/"):
-        return "video"
-    return "file"
-
-
 def _ref_from_attachment(att, local_path) -> "local_task_protocol.AttachmentRef":
     """Build an AttachmentRef from a discord Attachment + its saved local path
     (interaction-model 4D, step 1.5). Reads the SDK's `content_type`/`size`
@@ -452,29 +436,6 @@ def _ref_from_attachment(att, local_path) -> "local_task_protocol.AttachmentRef"
         mime=(getattr(att, "content_type", "") or ""),
         filename=_safe_attachment_basename(getattr(att, "filename", "") or ""),
         size=(getattr(att, "size", 0) or 0),
-    )
-
-
-def _media_attachment_headers(attachment_refs: list, text: str) -> str:
-    """Build the interaction-model 4D step-1.5 header trio for a task file when
-    the message carried attachments — otherwise "".
-
-    `content_modalities` = `text` (iff a caption is present) plus one modality
-    per attachment mime; `media_form` = `attachment` (these are discrete objects
-    — live audio/video never arrives on this path); `attachments` = one-line
-    JSON of the refs. Pure (no I/O) so the task-write path stays testable
-    without constructing a full discord Message."""
-    if not attachment_refs:
-        return ""
-    mods = set()
-    if text and text.strip():
-        mods.add("text")
-    for r in attachment_refs:
-        mods.add(_modality_for_mime(r.mime))
-    return (
-        f"content_modalities: {','.join(sorted(mods))}\n"
-        f"media_form: attachment\n"
-        f"attachments: {local_task_protocol.format_attachments(attachment_refs)}\n"
     )
 
 
@@ -3231,7 +3192,8 @@ async def _handle_discord_message(message, force=False):
     # Additive dual-write — Core's existing path is untouched; these are real
     # headers (after `task:`), so confine_user_content defangs any forged copy a
     # user tries to smuggle in the body but leaves these authentic ones intact.
-    media_headers = _media_attachment_headers(attachment_refs, text)  # pragma: no cover
+    media_headers = local_task_protocol.media_attachment_headers(  # pragma: no cover
+        attachment_refs, bool(text and text.strip()))
 
     # Instrumentation (2026-06-23): make a silent "message received but no task
     # written" drop diagnosable. The owner saw several messages vanish with no

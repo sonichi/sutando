@@ -347,42 +347,6 @@ def _transcribe_via_skill(local_path: str) -> str | None:
     return None
 
 
-def _modality_for_mime(mime: str) -> str:
-    """Map an attachment MIME type to a Local Task Protocol content modality
-    (interaction-model 4D, step 1.5). image/audio/video by top-level type;
-    everything else (pdf, zip, docx, unknown) is `file`. Duplicated per bridge
-    for now (discord has the twin); promote to local_task_protocol once slack
-    lands the same pair (rule of three)."""
-    m = (mime or "").lower()
-    if m.startswith("image/"):
-        return "image"
-    if m.startswith("audio/"):
-        return "audio"
-    if m.startswith("video/"):
-        return "video"
-    return "file"
-
-
-def _media_attachment_headers(attachment_refs: list, text: str) -> str:
-    """Build the interaction-model 4D step-1.5 header trio for a task file when
-    the message carried attachments — otherwise "". content_modalities = `text`
-    (iff a caption is present) plus one modality per attachment mime; media_form
-    = `attachment` (discrete objects); attachments = one-line JSON of the refs.
-    Pure, so the task-write path stays testable without a live Telegram update."""
-    if not attachment_refs:
-        return ""
-    mods = set()
-    if text and text.strip():
-        mods.add("text")
-    for r in attachment_refs:
-        mods.add(_modality_for_mime(r.mime))
-    return (
-        f"content_modalities: {','.join(sorted(mods))}\n"
-        f"media_form: attachment\n"
-        f"attachments: {local_task_protocol.format_attachments(attachment_refs)}\n"
-    )
-
-
 def download_file(file_id, name_hint="file"):
     """Download a file from Telegram and save locally."""
     result = api("getFile", file_id=file_id)
@@ -842,7 +806,8 @@ def main():
                 # alongside the legacy [*attached:] body line (dual-write). Real
                 # headers after `task:`, so confine_user_content defangs a forged
                 # body copy while these authentic ones pass through.
-                media_headers = _media_attachment_headers(attachment_refs, text)  # pragma: no cover
+                media_headers = local_task_protocol.media_attachment_headers(  # pragma: no cover
+                    attachment_refs, bool(text and text.strip()))
                 task_file.write_text(
                     f"id: {task_id}\n"
                     f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
