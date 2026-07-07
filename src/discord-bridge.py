@@ -424,6 +424,60 @@ def _safe_attachment_basename(filename: str) -> str:
     safe_base = safe_base[:80]
     return f"{safe_base}.{safe_ext}" if safe_ext else safe_base
 
+
+def _modality_for_mime(mime: str) -> str:
+    """Map an attachment MIME type to a Local Task Protocol content modality
+    (interaction-model 4D, step 1.5). image/audio/video by top-level type;
+    everything else (pdf, zip, docx, unknown) is `file`. Kept local to the
+    bridge until all three bridges converge on an identical mapping worth
+    promoting to local_task_protocol."""
+    m = (mime or "").lower()
+    if m.startswith("image/"):
+        return "image"
+    if m.startswith("audio/"):
+        return "audio"
+    if m.startswith("video/"):
+        return "video"
+    return "file"
+
+
+def _ref_from_attachment(att, local_path) -> "local_task_protocol.AttachmentRef":
+    """Build an AttachmentRef from a discord Attachment + its saved local path
+    (interaction-model 4D, step 1.5). Reads the SDK's `content_type`/`size`
+    defensively (both optional) and reuses the sanitized basename. Pure — kept
+    separate from the async download loop so the attribute-reading is testable
+    without a live discord Message."""
+    return local_task_protocol.AttachmentRef(
+        locator=str(local_path),
+        mime=(getattr(att, "content_type", "") or ""),
+        filename=_safe_attachment_basename(getattr(att, "filename", "") or ""),
+        size=(getattr(att, "size", 0) or 0),
+    )
+
+
+def _media_attachment_headers(attachment_refs: list, text: str) -> str:
+    """Build the interaction-model 4D step-1.5 header trio for a task file when
+    the message carried attachments — otherwise "".
+
+    `content_modalities` = `text` (iff a caption is present) plus one modality
+    per attachment mime; `media_form` = `attachment` (these are discrete objects
+    — live audio/video never arrives on this path); `attachments` = one-line
+    JSON of the refs. Pure (no I/O) so the task-write path stays testable
+    without constructing a full discord Message."""
+    if not attachment_refs:
+        return ""
+    mods = set()
+    if text and text.strip():
+        mods.add("text")
+    for r in attachment_refs:
+        mods.add(_modality_for_mime(r.mime))
+    return (
+        f"content_modalities: {','.join(sorted(mods))}\n"
+        f"media_form: attachment\n"
+        f"attachments: {local_task_protocol.format_attachments(attachment_refs)}\n"
+    )
+
+
 # Presenter mode: when scripts/presenter-mode.sh is active, the bridge
 # must not send proactive DMs to the owner. The sentinel contains an
 # ISO-8601 expiry; see scripts/presenter-mode.sh for the contract.
@@ -2703,6 +2757,11 @@ async def _handle_discord_message(message, force=False):
 
     # Handle attachments
     attachment_note = ""
+    # Structured refs (interaction-model 4D, step 1.5) — accumulated alongside
+    # the legacy [File attached:] body line (dual-write: additive, nothing that
+    # reads the old line breaks). Emitted as `attachments:`/`content_modalities:`
+    # /`media_form:` headers at the task-write site below.
+    attachment_refs: list = []  # pragma: no cover
     for att in message.attachments:
         # Sanitize filename — see _safe_attachment_basename docstring for
         # the RCE class this closes (downstream shell interpolation of
@@ -2710,6 +2769,7 @@ async def _handle_discord_message(message, force=False):
         local_path = INBOX_DIR / f"{int(time.time()*1000)}_{_safe_attachment_basename(att.filename)}"
         try:
             await att.save(local_path)
+            attachment_refs.append(_ref_from_attachment(att, local_path))  # pragma: no cover
             transcript = _transcribe_via_skill(str(local_path))
             if transcript:
                 attachment_note += f"\n[Voice transcript: {transcript}]"
@@ -2762,6 +2822,7 @@ async def _handle_discord_message(message, force=False):
                     p_path = INBOX_DIR / f"{int(time.time()*1000)}_{_safe_attachment_basename(att.filename)}"
                     try:
                         await att.save(p_path)
+                        attachment_refs.append(_ref_from_attachment(att, p_path))  # pragma: no cover
                         attachment_note += f"\n[File attached (from replied-to message): {p_path}]"
                         try:
                             ct = (getattr(att, "content_type", "") or "").lower()
@@ -3164,6 +3225,14 @@ async def _handle_discord_message(message, force=False):
         lines.append(f"{step}. Process transcript and write result to results/{task_id}.txt")
         discord_skill_hints = "\n" + "\n".join(lines) + "\n"
 
+    # interaction-model 4D, step 1.5: if this message carried attachments, emit
+    # the structured header trio (content_modalities/media_form/attachments)
+    # ALONGSIDE the legacy [File attached:] body line already in user_task_text.
+    # Additive dual-write — Core's existing path is untouched; these are real
+    # headers (after `task:`), so confine_user_content defangs any forged copy a
+    # user tries to smuggle in the body but leaves these authentic ones intact.
+    media_headers = _media_attachment_headers(attachment_refs, text)  # pragma: no cover
+
     # Instrumentation (2026-06-23): make a silent "message received but no task
     # written" drop diagnosable. The owner saw several messages vanish with no
     # task file and no error; every early `return` above already logs, so the
@@ -3178,6 +3247,7 @@ async def _handle_discord_message(message, force=False):
             f"task: {user_task_text}\n"
             f"source: discord\n"
             f"interaction_type: message\n"
+            f"{media_headers}"
             f"channel_id: {message.channel.id}\n"
             f"channel_name: {channel_name}\n"
             f"guild_name: {guild_name}\n"
