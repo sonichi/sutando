@@ -456,6 +456,17 @@ def send_reply(chat_id, text, task_id: str | None = None) -> dict:
             # rationale as discord-bridge:poll_results.
             print(f"  file marker, file not found — likely a prose quotation: {fpath}", flush=True)
 
+    # §7 audit ledger (Result Router S5): record result deliveries only
+    # (task_id present). Proactive sends pass no task_id and aren't results, so
+    # they're not audited. Telegram drops [channel:] redirects → delivered/failed
+    # only. Never blocks delivery (result_audit swallows all errors).
+    if task_id:
+        try:
+            import result_audit
+            result_audit.record(task_id, "delivered" if delivered_ok else "failed", "telegram")
+        except Exception:  # pragma: no cover  (defensive: import is safe + record() never raises)
+            pass
+
     return {"text_chunks": text_chunks, "files_sent": files_sent, "ok": delivered_ok}
 
 def _recover_orphan_sending_files() -> int:

@@ -3385,6 +3385,15 @@ def _mark_delivered(task_id: str) -> None:
         _delivered_sentinel_path(task_id).touch()
     except Exception as e:
         print(f"  [delivered] sentinel write failed for {task_id}: {e}", flush=True)
+    # §7 audit ledger (Result Router S5): one line per delivered result, so
+    # "did the user see this?" is answerable without grepping bridge logs. This
+    # is the single post-successful-send choke point in the Discord result path.
+    # Never blocks delivery (result_audit swallows all errors).
+    try:
+        import result_audit
+        result_audit.record(task_id, "delivered", "discord")
+    except Exception:  # pragma: no cover  (defensive: import is safe + record() never raises)
+        pass
 
 
 def _is_delivered(task_id: str) -> bool:
