@@ -126,28 +126,31 @@ export function selectBackend(
 	resultDir: string,
 	archiveFile: (srcPath: string, kind: 'tasks' | 'results', taskId: string) => void,
 ): TaskDelegationService {
-	let localWritable = false;
-	try {
-		mkdirSync(taskDir, { recursive: true });
-		accessSync(taskDir, constants.W_OK);
-		localWritable = true;
-	} catch { /* fall through to relay probe */ }
-
-	if (localWritable) {
-		console.log(`${ts()} [TaskDelegation] mode=local (workspace tasks/ writable: ${taskDir})`);
-		return new LocalTaskBackend(taskDir, resultDir, archiveFile);
-	}
-
+	// Relay is a POSITIVE configuration: CORE_API_URL set → relay, period.
+	// The earlier draft probed local writability FIRST, which made relay
+	// unreachable on any normal voice-host checkout (the default workspace is
+	// <repo>/workspace — always writable), silently stranding delegated tasks
+	// on the wrong machine (Codex P1 on PR #1956). Explicit config beats
+	// probing: an operator who set CORE_API_URL said where the core lives.
 	const coreUrl = process.env.CORE_API_URL || '';
 	if (coreUrl) {
-		console.log(`${ts()} [TaskDelegation] mode=relay (workspace not writable; core at ${coreUrl})`);
+		console.log(`${ts()} [TaskDelegation] mode=relay (CORE_API_URL=${coreUrl})`);
 		return new RelayTaskBackend(coreUrl, process.env.SUTANDO_API_TOKEN);
 	}
 
-	// Fail loud: silently picking a broken backend strands owner tasks — the
-	// 2026-05-18 context-drop silent-write lesson, applied at the seam.
-	throw new Error(
-		'[TaskDelegation] no viable backend: workspace tasks/ is not writable and ' +
-		'CORE_API_URL is not set. Co-located: fix workspace permissions. ' +
-		'Split-host: set CORE_API_URL (+ SUTANDO_API_TOKEN) to the core host agent-api.');
+	try {
+		mkdirSync(taskDir, { recursive: true });
+		mkdirSync(resultDir, { recursive: true });
+		accessSync(taskDir, constants.W_OK);
+	} catch {
+		// Fail loud: silently picking a broken backend strands owner tasks —
+		// the 2026-05-18 context-drop silent-write lesson, applied at the seam.
+		throw new Error(
+			'[TaskDelegation] no viable backend: CORE_API_URL is not set and the ' +
+			`workspace tasks/ dir is not writable (${taskDir}). Co-located: fix ` +
+			'workspace permissions. Split-host: set CORE_API_URL ' +
+			'(+ SUTANDO_API_TOKEN) to the core host agent-api.');
+	}
+	console.log(`${ts()} [TaskDelegation] mode=local (workspace tasks/ writable: ${taskDir})`);
+	return new LocalTaskBackend(taskDir, resultDir, archiveFile);
 }

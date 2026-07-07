@@ -178,8 +178,12 @@ server.server_close()
 # The HTTP layer above proves dispatch + auth; these direct calls prove the
 # route bodies themselves AND give the coverage gate main-thread attribution
 # (its tracer misses handler-thread execution).
-code, data = api.delegation_submit_task({"id": "task-direct-1", "content": CONTENT})
-check("direct submit", code == 200 and (api.TASK_DIR / "task-direct-1.txt").read_text() == CONTENT)
+DIRECT_CONTENT = CONTENT.replace("id: task-e2e-1", "id: task-direct-1")
+code, data = api.delegation_submit_task({"id": "task-direct-1", "content": DIRECT_CONTENT})
+check("direct submit", code == 200 and (api.TASK_DIR / "task-direct-1.txt").read_text() == DIRECT_CONTENT)
+# Identity coherence (Codex P1): filename id must equal the body id header.
+check("submit rejects id/body divergence",
+      api.delegation_submit_task({"id": "task-direct-9", "content": DIRECT_CONTENT})[0] == 400)
 check("direct submit rejects bad id", api.delegation_submit_task({"id": "../x", "content": "y"})[0] == 400)
 check("direct submit rejects empty content", api.delegation_submit_task({"id": "task-d2", "content": ""})[0] == 400)
 (api.RESULT_DIR / "task-direct-1.txt").write_text("direct answer\n")
@@ -195,6 +199,19 @@ check("direct archive already-gone", api.delegation_archive_result(
     {"name": "task-direct-1.txt", "task_id": "task-direct-1"})[1].get("note") == "already gone")
 check("direct archive bad tid", api.delegation_archive_result(
     {"name": "x.txt", "task_id": "../evil"})[0] == 400)
+# Cross-archive hijack (Codex P1): name must be exactly <task_id>.txt.
+(api.RESULT_DIR / "task-foreign.txt").write_text("someone else's\n")
+check("archive rejects name/tid mismatch", api.delegation_archive_result(
+    {"name": "task-foreign.txt", "task_id": "task-direct-1"})[0] == 400)
+# No-clobber (Codex P1): an occupied archive slot gets an epoch-suffixed name.
+(api.RESULT_DIR / "task-direct-1.txt").write_text("second result\n")
+code, _ = api.delegation_archive_result({"name": "task-direct-1.txt", "task_id": "task-direct-1"})
+suffixed = list((api.RESULT_DIR / "archive").glob("*/task-direct-1-*.txt"))
+originals = list((api.RESULT_DIR / "archive").glob("*/task-direct-1.txt"))
+check("archive no-clobber: suffixed slot, original intact",
+      code == 200 and len(suffixed) == 1 and len(originals) == 1
+      and originals[0].read_text() == "direct answer\n"
+      and suffixed[0].read_text() == "second result\n")
 
 # OSError branch of delegation_list_results (unreadable results dir).
 _saved = api.RESULT_DIR

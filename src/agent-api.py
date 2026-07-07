@@ -201,6 +201,14 @@ def delegation_submit_task(data: dict):
     content = data.get("content", "")
     if not local_task_protocol.valid_task_id(tid) or not content:
         return 400, {"error": "invalid task id or empty content"}
+    # Identity coherence (Codex P1 on #1956): the filename id and the body's
+    # embedded `id:` header must agree, or downstream identity splits —
+    # result polling, dedupe, archive, and history all key off one or the
+    # other. The relay backend only submits task-last bodies, so the safe
+    # parser reads the header unambiguously.
+    embedded = local_task_protocol.parse_task_headers(content).get("id")
+    if embedded != tid:
+        return 400, {"error": f"body id header ({embedded!r}) does not match request id"}
     TASK_DIR.mkdir(parents=True, exist_ok=True)
     (TASK_DIR / f"{tid}.txt").write_text(content)
     return 200, {"ok": True, "task_id": tid}
@@ -211,16 +219,25 @@ def delegation_archive_result(data: dict):
     tid = str(data.get("task_id", ""))
     stem = name[:-4] if name.endswith(".txt") else name
     src = _safe_path(RESULT_DIR, stem)
-    if src is None or not local_task_protocol.valid_task_id(tid):
-        return 400, {"error": "invalid name or task id"}
+    # Identity coherence (Codex P1 on #1956): a relay client may only archive
+    # ITS OWN result — the source name must be exactly <task_id>.txt. Without
+    # this, any safe name could be filed under any valid id, hijacking other
+    # consumers' results into a foreign archive slot.
+    if src is None or not local_task_protocol.valid_task_id(tid) or stem != tid:
+        return 400, {"error": "invalid name/task id, or name does not match task id"}
     if not os.path.exists(src):
         return 200, {"ok": True, "note": "already gone"}
     # Same destination scheme as task-bridge's archiveFile():
-    # results/archive/YYYY-MM/<taskId>.txt.
+    # results/archive/YYYY-MM/<taskId>.txt. No-clobber: an occupied slot gets
+    # the epoch-suffixed name the bridges already use for re-archived results
+    # (task-<id>-<epoch>.txt) instead of silently overwriting history.
     dest_dir = local_task_protocol.archive_month_dir(
         RESULT_DIR, datetime.now().isoformat())
     dest_dir.mkdir(parents=True, exist_ok=True)
-    os.replace(src, dest_dir / f"{tid}.txt")
+    dest = dest_dir / f"{tid}.txt"
+    if dest.exists():
+        dest = dest_dir / f"{tid}-{int(datetime.now().timestamp())}.txt"
+    os.replace(src, dest)
     return 200, {"ok": True}
 
 

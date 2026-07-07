@@ -60,13 +60,11 @@ function archiveFile(srcPath: string, kind: 'tasks' | 'results', taskId: string)
 	}
 }
 
-// Ensure dirs exist
-mkdirSync(TASK_DIR, { recursive: true });
-mkdirSync(RESULT_DIR, { recursive: true });
-
-// TaskDelegationService seam (#1947): local file I/O on co-located hosts
-// (byte-identical to the pre-seam writes), agent-api HTTP on split hosts.
-// Selection is a boot-time probe; failure is loud (see selectBackend).
+// TaskDelegationService seam (#1947): CORE_API_URL set → relay to the core
+// host's agent-api (explicit positive config, Codex P1); otherwise local file
+// I/O, byte-identical to the pre-seam writes. Local dirs are created by the
+// LOCAL selection path only — a relay-mode voice host doesn't grow empty
+// tasks/ + results/ dirs it will never use. Failure is loud (selectBackend).
 const _delegation: TaskDelegationService = selectBackend(TASK_DIR, RESULT_DIR, archiveFile);
 
 function ts(): string { return new Date().toISOString().slice(11, 23); }

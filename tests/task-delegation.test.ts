@@ -52,26 +52,27 @@ test('LocalTaskBackend result primitives mirror the watcher I/O', () => {
 	assert.ok(archived[0].startsWith('results:task-a:'));
 });
 
-test('selectBackend: writable workspace → local mode', () => {
+test('selectBackend: no CORE_API_URL + writable workspace → local mode', () => {
+	delete process.env.CORE_API_URL;
 	const dir = mkdtempSync(join(tmpdir(), 'deleg-'));
 	const backend = selectBackend(join(dir, 'tasks'), join(dir, 'results'), noopArchive);
 	assert.strictEqual(backend.mode, 'local');
-	assert.ok(existsSync(join(dir, 'tasks'))); // probe mkdir -p'd it
+	assert.ok(existsSync(join(dir, 'tasks'))); // local path mkdir -p'd it
+	assert.ok(existsSync(join(dir, 'results')));
 });
 
-test('selectBackend: unwritable workspace + CORE_API_URL → relay mode', () => {
+test('selectBackend: CORE_API_URL wins even on a writable workspace (positive config)', () => {
+	// Codex P1: a normal voice-host checkout has a WRITABLE workspace — relay
+	// must be reachable by explicit configuration, not only by probe failure.
 	const dir = mkdtempSync(join(tmpdir(), 'deleg-'));
-	const roParent = join(dir, 'ro');
-	mkdirSync(roParent);
-	chmodSync(roParent, 0o500); // tasks/ can't be created under it
 	process.env.CORE_API_URL = 'http://127.0.0.1:1';
 	try {
-		const backend = selectBackend(join(roParent, 'tasks'), join(roParent, 'results'), noopArchive);
+		const backend = selectBackend(join(dir, 'tasks'), join(dir, 'results'), noopArchive);
 		assert.strictEqual(backend.mode, 'relay');
 		assert.ok(backend instanceof RelayTaskBackend);
+		assert.ok(!existsSync(join(dir, 'tasks'))); // relay mode creates no local dirs
 	} finally {
 		delete process.env.CORE_API_URL;
-		chmodSync(roParent, 0o700);
 	}
 });
 
