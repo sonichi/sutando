@@ -357,6 +357,13 @@ export const workTool: ToolDefinition = {
 			`timestamp: ${timestamp}\n` +
 			`source: voice\n` +
 			`interaction_type: realtime_audio\n` +
+			// interaction-model 4D, step 1.5 (scope A): stamp the media-form axis
+			// on live-plane tasks. Additive/observability — routing still keys on
+			// _isVoiceTask (source/channel_id); scope B makes this the canonical
+			// plane-routing signal. `live_stream` = the payload originates from a
+			// continuous real-time session (media frames stay out-of-band per the
+			// three-channel rule; this is provenance, not stream bytes).
+			`media_form: live_stream\n` +
 			`channel_id: local-voice\n` +
 			`user_id: ${ownerId}\n` +
 			`access_tier: owner\n` +

@@ -433,7 +433,10 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 	// task_priority's phone→urgent mapping, and discord-bridge's
 	// DM_FALLBACK_SOURCES — a result landing after the call ended now reaches
 	// the owner as a DM instead of rotting unclaimed in results/.
-	const content = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\nsource: phone\ninteraction_type: realtime_audio\ncallSid: ${callSession.callSid}\ncaller: ${callSession.callerNumber || 'unknown'}\naccess_tier: ${callSession.isOwner ? 'owner' : 'other'}\ntask: ${taskDescription}\nhint: Check ${skillsHint} for a matching skill before using raw commands.\ntranscript:\n${fullTranscript}\n`;
+	// `media_form: live_stream` — interaction-model 4D step 1.5 (scope A): the
+	// phone plane is a live real-time session, same as web voice. Additive
+	// provenance/observability stamp; media frames stay out-of-band.
+	const content = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\nsource: phone\ninteraction_type: realtime_audio\nmedia_form: live_stream\ncallSid: ${callSession.callSid}\ncaller: ${callSession.callerNumber || 'unknown'}\naccess_tier: ${callSession.isOwner ? 'owner' : 'other'}\ntask: ${taskDescription}\nhint: Check ${skillsHint} for a matching skill before using raw commands.\ntranscript:\n${fullTranscript}\n`;
 	writeFileSync(taskPath, content);
 
 	// Poll for result in background, inject when ready — don't block Gemini
