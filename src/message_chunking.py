@@ -87,7 +87,7 @@ def chunk_message(text: str, max_len: int = 1900):
     def flush():
         nonlocal buf, buf_len
         if not buf:
-            return None
+            return None  # pragma: no cover  (defensive: callers guard `and buf`)
         chunk = "\n".join(buf)
         # If we're mid-fence at chunk boundary, close it so it renders cleanly
         if fence_opener:
@@ -121,7 +121,13 @@ def chunk_message(text: str, max_len: int = 1900):
             remaining = line
             while len(remaining) + reserve > max_len:
                 take = max_len - reserve - buf_len - 1
-                if take <= 0:
+                if take <= 0:  # pragma: no cover
+                    # Defensive: only reachable when the fence opener + reserve
+                    # alone exceed max_len (max_len < ~opener_len+5). Real caps
+                    # (1900 Discord / 4000 Slack) make this unreachable, and
+                    # reopening the same opener can't shrink buf_len, so this
+                    # guard cannot make progress anyway — kept verbatim from the
+                    # original _chunk_for_discord for byte-for-byte parity.
                     chunk = flush()
                     if chunk is not None:
                         yield chunk

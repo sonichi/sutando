@@ -120,6 +120,18 @@ check("tilde-fence chunks balanced", all(ends_outside_fence(c) for c in tilde_ch
 check("tilde-fence closer uses ~ not backtick",
       all("`" not in c for c in tilde_chunks))
 
+# 10. Mid-fence hard-split — a single very long line INSIDE a fence forces the
+# hard-split loop to close+reopen the fence around each flushed piece (exercises
+# the fence-reopen branch inside the while-split, not just the between-line one).
+midfence = "```python\n" + ("y" * 300) + "\n```"
+mf = list(chunk_message(midfence, 40))
+check("mid-fence long line: splits into multiple chunks", len(mf) > 1)
+check("mid-fence long line: each chunk <= max_len", all(len(c) <= 40 for c in mf))
+check("mid-fence long line: each chunk fence-balanced", all(ends_outside_fence(c) for c in mf))
+ypayload = "".join(ch for c in mf for line in c.split("\n") if line and set(line) <= {"y"} for ch in line)
+check("mid-fence long line: y-payload preserved across splits", ypayload == "y" * 300,
+      f"got {len(ypayload)}")
+
 if failures:
     print(f"\nFAIL — {len(failures)} check(s) failed: {failures}")
     raise SystemExit(1)
