@@ -1,0 +1,7 @@
+{
+ "note": "Step-5b phone anchors (tripwire stage). Deliberate tuned-prompt changes must regenerate via ANCHOR_UPDATE=1 with the diff called out in the PR.",
+ "regions": {
+  "build_agent": "7f2f5bf5004bf9e8cac11b9e3f51ad2efea13e2c61a42e6a8827539b41c81101",
+  "try_fast_path": "3ad11e5c56e9bdd52a771ed338e73173805196beaefb57c82e662b4ce506d0d8"
+ }
+}
