@@ -358,14 +358,29 @@ def render_dashboard() -> str:
     # distributed .app (`/Applications/Sutando.app/Contents/MacOS/Sutando`).
     sutando_running = subprocess.run(["/usr/bin/pgrep", "-f", "(Sutando|MacOS)/Sutando"], capture_output=True).returncode == 0
     shortcut_status = '<span class="ok">✓</span> Sutando app running' if sutando_running else '<span class="bad">✗</span> Sutando app not running'
+    # Shortcuts come from <workspace>/state/hotkeys.json (published by the
+    # Sutando app from its resolved config — single source of truth). Only the
+    # human descriptions are local UI copy, keyed by the stable action name.
+    _hk_desc = {
+        "drop_context": "Context drop (text/image/file)",
+        "drop_screenshot": "Drop screenshot",
+        "drop_video_clip": "Drop video clip",
+        "toggle_voice": "Toggle voice",
+        "toggle_mute": "Toggle mute",
+    }
+    try:
+        _hk = json.loads((WORKSPACE_DIR / "state" / "hotkeys.json").read_text())
+    except (OSError, ValueError):
+        _hk = []  # app hasn't published yet — show the header only
+    _hk_rows = "".join(
+        f'<div style="margin:4px 0"><kbd style="background:#222;color:#aaa;padding:2px 6px;border-radius:3px;font-family:monospace">{e.get("label","")}</kbd> {_hk_desc.get(e.get("action"), e.get("action",""))}</div>'
+        for e in _hk
+    )
     cards.append(f"""<div class="card">
 <h2>Keyboard Shortcuts</h2>
 <div class="check">{shortcut_status}</div>
 <div style="margin-top:8px;font-size:12px;color:#555">
-<div style="margin:4px 0"><kbd style="background:#222;color:#aaa;padding:2px 6px;border-radius:3px;font-family:monospace">⌃C</kbd> Context drop (text/image/file)</div>
-<div style="margin:4px 0"><kbd style="background:#222;color:#aaa;padding:2px 6px;border-radius:3px;font-family:monospace">⌃S</kbd> Drop screenshot</div>
-<div style="margin:4px 0"><kbd style="background:#222;color:#aaa;padding:2px 6px;border-radius:3px;font-family:monospace">⌃V</kbd> Toggle voice</div>
-<div style="margin:4px 0"><kbd style="background:#222;color:#aaa;padding:2px 6px;border-radius:3px;font-family:monospace">⌃M</kbd> Toggle mute</div>
+{_hk_rows}
 </div></div>""")
 
     # Quick links

@@ -84,6 +84,7 @@ export function writeChatTask(taskDescription: string): string {
 		`id: ${taskId}`,
 		`timestamp: ${timestamp}`,
 		`source: chat`,
+		`interaction_type: tool_initiated`,
 		`channel_id: local-chat`,
 		`user_id: ${process.env.SUTANDO_DM_OWNER_ID || 'chat-local'}`,
 		`access_tier: owner`,
@@ -345,6 +346,7 @@ export const workTool: ToolDefinition = {
 			`id: ${taskId}\n` +
 			`timestamp: ${timestamp}\n` +
 			`source: voice\n` +
+			`interaction_type: realtime_audio\n` +
 			`channel_id: local-voice\n` +
 			`user_id: ${ownerId}\n` +
 			`access_tier: owner\n` +
@@ -504,6 +506,7 @@ export function startContextDropWatcher(onContextDrop: (content: string) => void
 						`id: ${taskId}\n` +
 						`timestamp: ${new Date().toISOString()}\n` +
 						`source: context-drop\n` +
+						`interaction_type: system_event\n` +
 						`channel_id: local-hotkey\n` +
 						`user_id: ${ownerId}\n` +
 						`access_tier: owner\n` +

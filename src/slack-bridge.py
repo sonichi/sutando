@@ -554,6 +554,7 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
         f"task: {user_task_text}\n"
         f"source: slack\n"
+        f"interaction_type: message\n"
         f"channel_id: {channel}\n"
         f"user_id: {user_id}\n"
         f"access_tier: {access_tier}\n"

@@ -425,7 +425,12 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 	const skillsHint = process.env.CLAUDE_CONFIG_DIR
 		? `${process.env.CLAUDE_CONFIG_DIR}/skills/`
 		: '~/.claude/skills/';
-	const content = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ncallSid: ${callSession.callSid}\ncaller: ${callSession.callerNumber || 'unknown'}\naccess_tier: ${callSession.isOwner ? 'owner' : 'other'}\ntask: ${taskDescription}\nhint: Check ${skillsHint} for a matching skill before using raw commands.\ntranscript:\n${fullTranscript}\n`;
+	// source: phone deliberately activates two consumers that always listed
+	// "phone" but never matched (these writers predate the source header):
+	// task_priority's phone→urgent mapping, and discord-bridge's
+	// DM_FALLBACK_SOURCES — a result landing after the call ended now reaches
+	// the owner as a DM instead of rotting unclaimed in results/.
+	const content = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\nsource: phone\ninteraction_type: realtime_audio\ncallSid: ${callSession.callSid}\ncaller: ${callSession.callerNumber || 'unknown'}\naccess_tier: ${callSession.isOwner ? 'owner' : 'other'}\ntask: ${taskDescription}\nhint: Check ${skillsHint} for a matching skill before using raw commands.\ntranscript:\n${fullTranscript}\n`;
 	writeFileSync(taskPath, content);
 
 	// Poll for result in background, inject when ready — don't block Gemini
@@ -1235,6 +1240,15 @@ function cleanupCall(callSid: string): void {
 		const taskLines = [
 			`id: ${summaryTaskId}`,
 			`timestamp: ${new Date().toISOString()}`,
+			// NO source: header here (unlike delegateTask above, deliberately):
+			// source: phone would make this result a discord-bridge DM-fallback
+			// candidate, and the task instructions below already have the core
+			// DM the owner — one summary would arrive twice. Centralized
+			// consolidation is Result Router v1 scope; until then the summary
+			// carries only the plane field.
+			// system_event, not realtime_audio: written by the call-end
+			// lifecycle, not by a caller utterance during the live session.
+			`interaction_type: system_event`,
 			`callSid: ${callSid}`,
 			`caller: ${session.callerNumber || 'unknown'}`,
 			`access_tier: ${session.isOwner ? 'owner' : 'other'}`,

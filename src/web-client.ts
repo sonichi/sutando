@@ -742,14 +742,9 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
 </div>
 
 <div id="status-bar" style="text-align:center;font-size:16px;color:#888;letter-spacing:0.3px;padding:12px 16px">
-  <kbd style="background:#1a1a2e;padding:3px 8px;border-radius:4px;border:1px solid #333;font-family:monospace;color:#8af;font-size:14px">⌃C</kbd> drop context
-  <span style="margin:0 8px;color:#444">|</span>
-  <kbd style="background:#1a1a2e;padding:3px 8px;border-radius:4px;border:1px solid #333;font-family:monospace;color:#8af;font-size:14px">⌃S</kbd> drop screenshot
-  <span style="margin:0 8px;color:#444">|</span>
-  <kbd style="background:#1a1a2e;padding:3px 8px;border-radius:4px;border:1px solid #333;font-family:monospace;color:#8af;font-size:14px">⌃V</kbd> voice
-  <span style="margin:0 8px;color:#444">|</span>
-  <kbd style="background:#1a1a2e;padding:3px 8px;border-radius:4px;border:1px solid #333;font-family:monospace;color:#8af;font-size:14px">⌃M</kbd> mute
-  <span style="margin:0 8px;color:#444">|</span>
+  <!-- Hotkey hints render from /hotkeys (published by the Sutando app from its
+       resolved config — single source of truth, no hardcoded keys here). -->
+  <span id="hotkey-hints"></span>
   <span id="core-status-bar" style="display:inline"></span>
   <span id="presenter-badge">🎤 PRESENTER MODE</span>
   <span id="mode-badge"></span>
@@ -807,11 +802,29 @@ function getDefaultWsUrl() {
 }
 
 // Set default WebSocket URL on page load + init Chrome STT
+// Descriptions are local UI copy keyed by the stable action name; the KEY
+// bindings come from /hotkeys (the app's published config) so they never drift.
+function renderHotkeyHints() {
+  var desc = { drop_context: 'drop context', drop_screenshot: 'drop screenshot',
+    drop_video_clip: 'drop video', toggle_voice: 'voice', toggle_mute: 'mute' };
+  var el = document.getElementById('hotkey-hints');
+  if (!el) return;
+  fetch('/hotkeys').then(function (r) { return r.json(); }).then(function (list) {
+    if (!Array.isArray(list) || !list.length) return;
+    var kbd = 'background:#1a1a2e;padding:3px 8px;border-radius:4px;border:1px solid #333;font-family:monospace;color:#8af;font-size:14px';
+    var sep = '<span style="margin:0 8px;color:#444">|</span>';
+    el.innerHTML = list.map(function (e) {
+      return '<kbd style="' + kbd + '">' + esc(e.label || '') + '</kbd> ' + (desc[e.action] || esc(e.action || ''));
+    }).join(sep) + sep;
+  }).catch(function () {});
+}
+
 window.addEventListener('DOMContentLoaded', () => {
   const wsUrlInput = $('wsUrl');
   if (wsUrlInput && !wsUrlInput.value) {
     wsUrlInput.value = getDefaultWsUrl();
   }
+  renderHotkeyHints();
   initChromeStt();
   // Auto-reconnect voice if it was connected before refresh
   try { if (sessionStorage.getItem('sutando-voice')) { setTimeout(() => toggle(), 500); } } catch {}
@@ -3611,6 +3624,16 @@ const server = createServer((req, res) => {
 		} catch {}
 		res.writeHead(200, { 'Content-Type': 'application/json' });
 		res.end(JSON.stringify({ mode }));
+		return;
+	}
+
+	// Hotkeys published by the Sutando app (state/hotkeys.json) — the single
+	// source the status-bar hints render from. Empty array if not yet written.
+	if (url.pathname === '/hotkeys') {
+		let hotkeys: unknown = [];
+		try { hotkeys = JSON.parse(readFileSync(join(STATE_DIR, 'hotkeys.json'), 'utf-8')); } catch {}
+		res.writeHead(200, { 'Content-Type': 'application/json' });
+		res.end(JSON.stringify(hotkeys));
 		return;
 	}
 

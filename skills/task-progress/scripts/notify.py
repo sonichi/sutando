@@ -40,7 +40,9 @@ def _token(source: str, var: str) -> str:
     val = os.environ.get(var, "").strip()
     if val:
         return val
-    _claude_config = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
+    # Mirrors util_paths.claude_home_path ($CLAUDE_CONFIG_DIR -> $CLAUDE_HOME -> ~/.claude).
+    _base = os.environ.get("CLAUDE_CONFIG_DIR") or os.environ.get("CLAUDE_HOME")
+    _claude_config = Path(_base) if _base else Path.home() / ".claude"
     env_path = _claude_config / "channels" / source / ".env"
     return _env_file(str(env_path)).get(var, "")
 
