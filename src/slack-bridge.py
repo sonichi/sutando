@@ -55,6 +55,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
     def _emit_channel(*_a, **_k):  # type: ignore
         return None
 from result_markers import parse_markers  # noqa: E402
+from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
@@ -706,12 +707,16 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
     delivered_ok = True
     sent_files = 0
 
-    # Post the text body in 4000-char chunks (Slack's per-message limit is
-    # 40k chars but readability suffers above ~4k).
+    # Post the text body in <=4000-char chunks (Slack's per-message limit is
+    # 40k chars but readability suffers above ~4k). Use the shared fence-aware
+    # chunker (Result Router S3) instead of a naive byte-slice: Slack posts
+    # default to mrkdwn, so slicing mid-``` split a code block across two
+    # messages and broke the rendering. chunk_message closes+reopens the fence
+    # at each boundary so every chunk renders as a well-formed block.
     if clean_text:
         all_chunks_sent = True
-        for i in range(0, len(clean_text), 4000):
-            kwargs = {"channel": channel, "text": clean_text[i:i + 4000]}
+        for chunk in chunk_message(clean_text, 4000):
+            kwargs = {"channel": channel, "text": chunk}
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
             try:
