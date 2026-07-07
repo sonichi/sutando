@@ -370,6 +370,10 @@ def parse_attachments(headers: dict) -> list["AttachmentRef"]:
                 size = int(size)
             except (ValueError, TypeError):
                 size = 0
+        if size < 0:
+            size = 0  # a negative byte count is nonsense and would slip past a
+            #            `ref.size and ref.size > max_bytes` cap check — normalize
+            #            it to 0 (unknown) so limit enforcement stays sound.
         refs.append(AttachmentRef(
             locator=locator,
             id=str(el.get("id", "")),

@@ -92,6 +92,12 @@ check("un-coercible size falls back to 0",
       ltp.parse_attachments({"attachments": '[{"locator":"/a","size":"big"}]'})[0].size == 0)
 check("bool size is not accepted as int",
       ltp.parse_attachments({"attachments": '[{"locator":"/a","size":true}]'})[0].size == 0)
+# Negative sizes are nonsense and would slip past a `size > max_bytes` cap —
+# clamp int and coerced-string negatives back to 0 (unknown).
+check("negative int size clamped to 0",
+      ltp.parse_attachments({"attachments": '[{"locator":"/a","size":-1}]'})[0].size == 0)
+check("negative numeric-string size clamped to 0",
+      ltp.parse_attachments({"attachments": '[{"locator":"/a","size":"-5"}]'})[0].size == 0)
 
 # ── 5. parse_content_modalities: whitelist + case-fold ──
 check("known modalities parsed, case-folded",
