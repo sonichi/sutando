@@ -117,6 +117,18 @@ def main() -> int:
     os.environ["REMOTE_TASK_URL"] = f"http://127.0.0.1:{port}"
     os.environ["REMOTE_TASK_TOKEN"] = "testtoken"
     os.environ["REMOTE_TASK_PROVIDER"] = "remote-gateway"
+    # Default tier (REMOTE_TASK_TIER unset) is now "owner" for the personal-agent
+    # model — the gateway authenticates with the owner's own bearer and the broker
+    # owner-scopes pulls, so its tasks are the owner's own. Verify with a fresh
+    # import BEFORE we pin "team" below.
+    os.environ.pop("REMOTE_TASK_TIER", None)
+    os.environ.pop("AG2_REMOTE_TIER", None)
+    _dspec = importlib.util.spec_from_file_location("rtc_default", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+    _drtc = importlib.util.module_from_spec(_dspec)
+    _dspec.loader.exec_module(_drtc)
+    check(_drtc.LOCAL_TIER == "owner",
+          "default LOCAL_TIER=owner when REMOTE_TASK_TIER unset (personal-agent model)")
+
     # Pin the tier so LOCAL_TIER is deterministic. Without this the module reads
     # the host's ambient REMOTE_TASK_TIER (e.g. "owner" on the owner's own node),
     # and the access_tier-clamp + newline-forge assertions — which expect the
@@ -140,6 +152,14 @@ def main() -> int:
     check("source: remote-gateway" in content, "source field carried")
     check("access_tier: team" in content and "access_tier: owner" not in content,
           "access_tier CLAMPED to local default (wire said owner — never trusted)")
+    # Gateway-written provenance line: present, and precedes the last-wins
+    # access_tier line so the clamp still wins.
+    check("provenance: authenticated AG2 Space delegation" in content,
+          "provenance line written (gateway-trusted, tells the core this is an owner delegation)")
+    _pl = content.splitlines()
+    _pi = next(i for i, l in enumerate(_pl) if l.startswith("provenance:"))
+    _ai = next(i for i, l in enumerate(_pl) if l.startswith("access_tier:"))
+    check(_pi < _ai, "provenance precedes access_tier (access_tier stays last-wins)")
     # context enrichment: room_name / sender_name / reply_to_* serialize when
     # present, and a newline in a name can't forge an extra field line.
     rtc._write_task({**TASK, "id": "task-CTX", "room_name": "#design",
