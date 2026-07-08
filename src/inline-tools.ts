@@ -630,7 +630,11 @@ export const toggleTasksTool: ToolDefinition = {
 
 export const getCurrentTimeTool: ToolDefinition = {
 	name: 'get_current_time',
-	description: 'Get the current date and time. Instant.',
+	description:
+		'Get the current date and time. Instant. Call this ONLY when the user explicitly asks for ' +
+		'the time, date, or day. NEVER call it for any other question, on filler ("hm", "okay"), or ' +
+		'as a fallback when you are unsure what the user wants — answering an unrelated question ' +
+		'(e.g. about a paper) by announcing the time is always wrong; when unsure, fire nothing.',
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
