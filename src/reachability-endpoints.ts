@@ -119,11 +119,43 @@ export function detectTailnetHost(
 	}
 }
 
-/** Tailnet webUI endpoint (e.g. `http://host.tailnet.ts.net:8080`), or null. */
+/**
+ * True when the operator has fronted the webUI with `tailscale serve` (TLS
+ * termination on the MagicDNS name, auto-provisioned cert, default :443). This
+ * is the mode that lets a BROWSER on an HTTPS page reach the core: a browser
+ * blocks insecure `ws://` to a non-localhost host as mixed content, so the
+ * tailnet voice path only works over `wss://` — which `tailscale serve` provides
+ * without any cert management here (it forwards to loopback:CLIENT_PORT, where
+ * the existing /ws proxy accepts the loopback-sourced upgrade).
+ *
+ * Set after running `scripts/tailscale-serve-voice.sh` (or `tailscale serve
+ * --bg <CLIENT_PORT>`).
+ */
+export function tailnetServeEnabled(): boolean {
+	return /^(1|true|yes|on)$/i.test(process.env.SUTANDO_TAILNET_SERVE || '');
+}
+
+/**
+ * Compose the tailnet endpoint URL for a host. Pure (serve flag injectable) so
+ * the scheme switch is unit-tested. With serve on → HTTPS on the MagicDNS name,
+ * no explicit port (`tailscale serve` fronts :443); off → plain HTTP on
+ * CLIENT_PORT.
+ */
+export function composeTailnetUrl(host: string, serve: boolean = tailnetServeEnabled()): string {
+	return serve ? `https://${host}` : `http://${host}:${CLIENT_PORT}`;
+}
+
+/**
+ * Tailnet webUI endpoint, or null. With `tailscale serve` on (SUTANDO_TAILNET_SERVE)
+ * it's HTTPS on the MagicDNS name with no explicit port (`https://host.ts.net`)
+ * — browser-ready, the client derives `wss://host.ts.net/ws`. Otherwise it's
+ * plain HTTP on CLIENT_PORT (`http://host:8080`), usable by native/non-browser
+ * clients only (a browser on an HTTPS page can't open ws:// to it).
+ */
 export function tailnetEndpointUrl(): string | null {
 	if (!lanShareEnabled()) return null;
 	const host = detectTailnetHost();
-	return host ? `http://${host}:${CLIENT_PORT}` : null;
+	return host ? composeTailnetUrl(host) : null;
 }
 
 // ---------------------------------------------------------------------------

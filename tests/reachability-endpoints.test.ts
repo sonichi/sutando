@@ -9,6 +9,8 @@ import {
 	tailnetEndpointUrl,
 	directEndpoints,
 	lanShareEnabled,
+	tailnetServeEnabled,
+	composeTailnetUrl,
 } from '../src/reachability-endpoints.js';
 
 // US-10 / Tier 2b: the core detects the direct endpoints it can advertise
@@ -18,15 +20,19 @@ import {
 
 const origShare = process.env.SUTANDO_LAN_SHARE;
 const origPort = process.env.CLIENT_PORT;
+const origServe = process.env.SUTANDO_TAILNET_SERVE;
 beforeEach(() => {
 	delete process.env.SUTANDO_LAN_SHARE;
 	delete process.env.CLIENT_PORT;
+	delete process.env.SUTANDO_TAILNET_SERVE;
 });
 afterEach(() => {
 	if (origShare === undefined) delete process.env.SUTANDO_LAN_SHARE;
 	else process.env.SUTANDO_LAN_SHARE = origShare;
 	if (origPort === undefined) delete process.env.CLIENT_PORT;
 	else process.env.CLIENT_PORT = origPort;
+	if (origServe === undefined) delete process.env.SUTANDO_TAILNET_SERVE;
+	else process.env.SUTANDO_TAILNET_SERVE = origServe;
 });
 
 describe('isPrivateLanIpv4', () => {
@@ -112,6 +118,25 @@ describe('detectTailnetHost (injected runner)', () => {
 	});
 	it('returns null on unparseable output rather than throwing', () => {
 		assert.equal(detectTailnetHost(() => 'not json'), null);
+	});
+});
+
+describe('composeTailnetUrl — TLS scheme switch (wss:// enablement)', () => {
+	const host = 'qingyuns-macbook-pro.taila1a7c4.ts.net';
+	it('serve OFF → plain http on CLIENT_PORT (native-only path)', () => {
+		assert.equal(composeTailnetUrl(host, false), `http://${host}:8080`);
+	});
+	it('serve ON → https on the MagicDNS name, no explicit port (browser wss-ready)', () => {
+		// tailscale serve fronts :443, so the client derives wss://host/ws — which
+		// a browser on an HTTPS page can open (plain ws:// would be blocked).
+		assert.equal(composeTailnetUrl(host, true), `https://${host}`);
+	});
+	it('reads the SUTANDO_TAILNET_SERVE env when serve arg omitted', () => {
+		assert.equal(tailnetServeEnabled(), false);
+		assert.equal(composeTailnetUrl(host), `http://${host}:8080`);
+		process.env.SUTANDO_TAILNET_SERVE = '1';
+		assert.equal(tailnetServeEnabled(), true);
+		assert.equal(composeTailnetUrl(host), `https://${host}`);
 	});
 });
 
