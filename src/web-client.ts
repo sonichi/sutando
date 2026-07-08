@@ -666,7 +666,7 @@ const HTML = /* html */ `<!DOCTYPE html>
   </div>
   <video id="vision-preview" autoplay muted playsinline style="display:block; width: 100%; max-height: 180px; background:#000; border-radius:6px;"></video>
 </div>
-<input type="text" id="wsUrl" value="${DEFAULT_WS_URL}" />
+<input type="text" id="wsUrl" value="" placeholder="${DEFAULT_WS_URL}" />
 <script>
 fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
   if(s.name){
@@ -3988,7 +3988,7 @@ server.on('upgrade', (req, socket, head) => {
 		try {
 			originHost = new URL(origin).host;
 		} catch {
-			originHost = ' '; // unparseable Origin → never matches
+			originHost = '\0'; // unparseable Origin → never matches
 		}
 		if (originHost !== req.headers.host) {
 			socket.destroy();
