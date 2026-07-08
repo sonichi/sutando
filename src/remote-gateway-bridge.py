@@ -119,12 +119,25 @@ _INTERACTION_TYPES = frozenset({
 })
 
 # Trust tier is a LOCAL decision (review 2026-06-13): the gateway is outside
-# this machine's trust boundary, so its access_tier claim is ignored. The
-# tier written to every task file comes from REMOTE_TASK_TIER in .env —
-# default "team" (sandboxed processing). Operators who own their gateway can
-# explicitly set REMOTE_TASK_TIER=owner.
-LOCAL_TIER = (_env_compat("REMOTE_TASK_TIER", "AG2_REMOTE_TIER") or "team").strip().lower()
+# this machine's trust boundary, so a task's SELF-CLAIMED access_tier is
+# ignored. The tier written to every task file comes from REMOTE_TASK_TIER.
+#
+# Default is "owner" for the personal-agent model (2026-07-08): a user runs
+# their OWN gateway authenticated with their OWN owner bearer, and the broker
+# OWNER-SCOPES every pull (per-agent bearer; caller-owner == target-owner), so
+# this gateway can ONLY ever receive its owner's own tasks — e.g. a voice-call
+# delegation from the user's own cloud agent. The trust therefore derives from
+# the broker's owner-scoping, NOT from trusting the gateway process or the
+# task's claim. The previous "team" default made a user's own voice
+# delegations look untrusted, so a hardened core (correctly, given the signal)
+# refused them.
+# ESCAPE HATCH: a SHARED / multi-user gateway — one that could pull tasks NOT
+# scoped to a single owner — MUST set REMOTE_TASK_TIER=team (or other).
+LOCAL_TIER = (_env_compat("REMOTE_TASK_TIER", "AG2_REMOTE_TIER") or "owner").strip().lower()
 if LOCAL_TIER not in ("owner", "team", "other"):
+    # An INVALID value (e.g. a typo "owenr") fails CLOSED to "team" — NEVER
+    # silently grant owner on a misconfiguration. Only the UNSET case defaults to
+    # "owner" (the `or "owner"` above — the explicit personal-agent model).
     LOCAL_TIER = "team"
 
 # ── inbound media fetch (owner screenshots, file uploads) ────────────────────
@@ -568,6 +581,12 @@ def _write_task(task: dict) -> str | None:
                     lines.extend(_mh.rstrip("\n").split("\n"))
         elif f in task and task[f] not in (None, ""):
             lines.append(f"{f}: {_one_line(task[f])}")
+    # (A gateway-written `provenance:` trust signal was considered here but
+    # dropped: the trusted task parser only promotes KNOWN_HEADER_KEYS, so an
+    # unknown `provenance:` field would land in the body as a no-op. Threading a
+    # real trusted-provenance signal end-to-end — header vocabulary + guard +
+    # a consumer that makes the trust decision — is a separate change. The
+    # substantive delegation-trust fix here is the owner-tier default above.)
     # access_tier is a LOCAL decision and written LAST so it wins even under a
     # last-occurrence parser; every other field is newline-stripped so none can
     # forge an earlier one either.

@@ -42,6 +42,58 @@ class TestTokenResolution(unittest.TestCase):
             self.assertIsInstance(result, str)
 
 
+class TestProgressMessageGuard(unittest.TestCase):
+    def setUp(self):
+        self.mod = _load()
+
+    def test_short_progress_message_allowed(self):
+        self.assertIsNone(
+            self.mod._progress_message_error("On it — checking the PR now.")
+        )
+
+    def test_long_final_answer_rejected(self):
+        message = (
+            "Top options for a personal landing page: Framer for speed, Carrd for "
+            "cost, Astro plus Vercel for full control, and GitHub Pages for zero "
+            "hosting cost. Recommendation: use Framer if you want polish today, "
+            "or Astro plus Vercel if you want a blog and source-controlled content. "
+            "That gives you the best tradeoff between design quality, cost, and "
+            "future flexibility."
+        )
+        error = self.mod._progress_message_error(message)
+        self.assertIsNotNone(error)
+        self.assertIn("too long", error)
+
+    def test_multiline_answer_rejected(self):
+        message = "\n".join([
+            "Options:",
+            "1. Framer",
+            "2. Carrd",
+            "3. Astro",
+            "4. GitHub Pages",
+        ])
+        error = self.mod._progress_message_error(message)
+        self.assertIsNotNone(error)
+        self.assertIn("too many lines", error)
+
+    def test_main_rejects_long_message(self):
+        with patch("sys.argv", [
+            "notify.py", "--source", "discord", "--channel-id", "C123",
+            "--message", "x" * 281,
+        ]):
+            rc = self.mod.main()
+        self.assertEqual(rc, 1)
+
+    def test_main_rejects_multiline_message(self):
+        msg = "\n".join(["line1", "line2", "line3", "line4", "line5"])
+        with patch("sys.argv", [
+            "notify.py", "--source", "discord", "--channel-id", "C123",
+            "--message", msg,
+        ]):
+            rc = self.mod.main()
+        self.assertEqual(rc, 1)
+
+
 class TestSendSlack(unittest.TestCase):
     def setUp(self):
         self.mod = _load()
@@ -152,6 +204,16 @@ class TestCLI(unittest.TestCase):
             capture_output=True, text=True,
         )
         self.assertNotEqual(r.returncode, 0)
+
+    def test_long_message_rejected_before_token_lookup(self):
+        r = subprocess.run(
+            [sys.executable, str(SCRIPT), "--source", "slack",
+             "--channel-id", "D123", "--message", "x" * 281],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("progress update is too long", r.stderr)
+        self.assertNotIn("SLACK_BOT_TOKEN", r.stderr)
 
 
 if __name__ == "__main__":

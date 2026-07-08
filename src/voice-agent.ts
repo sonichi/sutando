@@ -22,7 +22,9 @@
  *                          $SUTANDO_WORKSPACE is no longer honored for resolution.
  *                          Stores tasks/, results/, state/, logs/, conversation.log.
  *   PORT                — WebSocket port (default: 9900)
- *   HOST                — Bind address (default: 0.0.0.0)
+ *   HOST                — Bind address (default: 127.0.0.1 loopback; the voice WS
+ *                          has no auth. Set 0.0.0.0 only for a trusted deployment;
+ *                          LAN reach normally goes through the opt-in /ws proxy.)
  */
 
 import 'dotenv/config';
@@ -98,7 +100,11 @@ if (process.env.GEMINI_VOICE_API_KEY) {
 }
 
 const PORT = Number(process.env.PORT) || 9900;
-const HOST = process.env.HOST || '0.0.0.0';
+// Loopback by default: the voice WS has no auth, so it must NOT be reachable
+// from the LAN out of the box. LAN reach is an explicit opt-in via the
+// web-client /ws proxy (SUTANDO_LAN_SHARE), never a direct bind to this port.
+// Set HOST=0.0.0.0 explicitly only for a trusted deployment that needs it.
+const HOST = process.env.HOST || '127.0.0.1';
 // Per-user runtime state lives under the resolved workspace (post-v0.8
 // / #1440 default: <repo>/workspace/), not the repo checkout. Pre-#762
 // voice-agent resolved its tasks/results/state against the repo path via

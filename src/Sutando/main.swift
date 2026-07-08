@@ -647,9 +647,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // first so the chip reflects THIS host's questions, not a stale flat-root copy.
         let pqPath = perHostPath("pending-questions.md")
         if let pq = try? String(contentsOfFile: pqPath, encoding: .utf8) {
-            // Skip the leading "# Memory" or similar h1, find first h2.
+            // Skip h1 and [RESOLVED] h2s; latch onto the first open h2.
             for line in pq.split(separator: "\n") {
-                if line.hasPrefix("## ") {
+                if line.hasPrefix("## ") && !line.hasPrefix("## [RESOLVED]") {
                     let title = String(line.dropFirst(3))
                     let preview = title.count > 60 ? String(title.prefix(57)) + "..." : title
                     chips.append(["label": "Pending: \(preview)", "desc": "Resolve in pending-questions.md"])
