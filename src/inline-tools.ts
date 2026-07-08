@@ -696,9 +696,7 @@ export const slideControlTool: ToolDefinition = {
 		'so it is safe to call even when a textarea or contenteditable on the deck has focus (e.g. live-edit demos). ' +
 		'PREFER this over press_key("leftarrow"/"rightarrow"/"space") for slide navigation: arrow / space keystrokes ' +
 		'get captured by focused editables (cursor moves within the field) and may be suppressed by deck-side ' +
-		'focus-guard handlers — slide_control sidesteps both. ' +
-		'Call it ONLY on an explicit navigation request — NEVER on filler ("what what what"), garbled speech, ' +
-		'or as a guess when unsure; fire nothing instead.',
+		'focus-guard handlers — slide_control sidesteps both.',
 	parameters: z.object({
 		action: z.enum(['next', 'previous', 'goto']).describe('Navigation action'),
 		slideNumber: z.number().optional().describe('Slide number for goto action'),
@@ -826,10 +824,7 @@ const NOTES_DIR = sharedPersonalPath('notes', WORKSPACE_DIR);
 
 export const showViewTool: ToolDefinition = {
 	name: 'show_view',
-	description:
-		'Switch the web UI to a specific view. Use when user says "show notes", "show tasks", "show activity", etc. ' +
-		'Call it ONLY on an explicit view-switch request — NEVER to answer an information question ' +
-		'(answer it in speech instead), and never on filler or when unsure; fire nothing instead.',
+	description: 'Switch the web UI to a specific view. Use when user says "show notes", "show tasks", "show activity", etc.',
 	parameters: z.object({
 		view: z.enum(['starter', 'tasks', 'notes', 'questions', 'activity']).describe('Which view to show'),
 	}),
