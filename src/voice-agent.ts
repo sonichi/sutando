@@ -548,14 +548,7 @@ function resolveCurrentMode(): ModeState {
 // ground natively). The routing hint rides in the tool description, so the
 // tuned system prompt is untouched.
 const TIER05 = /^(1|true|yes|on)$/i.test(process.env.SUTANDO_TIER05 || '');
-const mainAgentTools: ToolDefinition[] = [
-	workTool,
-	getTaskStatus,
-	switchModeTool,
-	saveMeetingNoteTool,
-	...inlineTools,
-	...(TIER05 ? [researchTool] : []),
-];
+const mainAgentTools: ToolDefinition[] = [workTool, getTaskStatus, switchModeTool, saveMeetingNoteTool, ...inlineTools, ...(TIER05 ? [researchTool] : [])];
 
 // Injection seam for the tuned factories in voice-agent-config.ts: this
 // module owns the session-gate + mode state; the config module owns the
