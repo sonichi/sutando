@@ -19,6 +19,7 @@ import type { VoiceSession } from 'bodhi-realtime-agent';
 import { resolveWorkspace, statusPath } from './workspace_default.js';
 import { injectText } from './browser-tools.js';
 import { frameContextDrop, frameNoteViewMetadata, frameNoteViewFull, frameTaskResult } from './inject-framing.js';
+import { deliverWithRetry } from './inject-delivery.js';
 import { startResultWatcher, startContextDropWatcher, startNoteViewingWatcher } from './task-bridge.js';
 
 const WORKSPACE_DIR = resolveWorkspace();
@@ -116,10 +117,9 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 		// active, do one retry at 3s. After that, fall through to Cartesia
 		// — no infinite retry, since a stuck session shouldn't pin the
 		// result forever.
-		setTimeout(() => {
-			if (inject()) return;
-			setTimeout(() => {
-				if (inject()) return;
+		deliverWithRetry({
+			attempt: inject,
+			onExhausted: () => {
 				// Stuck-voice fallback. Per Susan's PR #924 review (Q3): Cartesia
 				// only reaches the user if they're watching the web client with
 				// audio playback — a user in a stuck voice session is probably
@@ -149,8 +149,8 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 						console.log(`${ts()} [CartesiaTTS] Audio generated: ${audioPath}`);
 					}).catch(err => console.error(`${ts()} [CartesiaTTS] ${err.message}`));
 				}
-			}, 1500);
-		}, 1500);
+			},
+		});
 	}, () => session.clientConnected);
 }
 
