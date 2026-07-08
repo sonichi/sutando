@@ -128,6 +128,15 @@ def main() -> int:
     _dspec.loader.exec_module(_drtc)
     check(_drtc.LOCAL_TIER == "owner",
           "default LOCAL_TIER=owner when REMOTE_TASK_TIER unset (personal-agent model)")
+    # An INVALID value must fail CLOSED to "team" — never silently grant owner on
+    # a typo; only an unset/explicit config grants owner.
+    os.environ["REMOTE_TASK_TIER"] = "owenr"  # typo
+    _ispec = importlib.util.spec_from_file_location("rtc_invalid", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+    _irtc = importlib.util.module_from_spec(_ispec)
+    _ispec.loader.exec_module(_irtc)
+    check(_irtc.LOCAL_TIER == "team",
+          "invalid REMOTE_TASK_TIER fails CLOSED to team (never silently owner)")
+    os.environ.pop("REMOTE_TASK_TIER", None)
 
     # Pin the tier so LOCAL_TIER is deterministic. Without this the module reads
     # the host's ambient REMOTE_TASK_TIER (e.g. "owner" on the owner's own node),

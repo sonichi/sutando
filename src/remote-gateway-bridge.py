@@ -135,7 +135,10 @@ _INTERACTION_TYPES = frozenset({
 # scoped to a single owner — MUST set REMOTE_TASK_TIER=team (or other).
 LOCAL_TIER = (_env_compat("REMOTE_TASK_TIER", "AG2_REMOTE_TIER") or "owner").strip().lower()
 if LOCAL_TIER not in ("owner", "team", "other"):
-    LOCAL_TIER = "owner"
+    # An INVALID value (e.g. a typo "owenr") fails CLOSED to "team" — NEVER
+    # silently grant owner on a misconfiguration. Only the UNSET case defaults to
+    # "owner" (the `or "owner"` above — the explicit personal-agent model).
+    LOCAL_TIER = "team"
 
 # ── inbound media fetch (owner screenshots, file uploads) ────────────────────
 # A gateway can hand the task body a media MARKER instead of raw bytes:
