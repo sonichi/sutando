@@ -20,6 +20,27 @@ import urllib.request
 from pathlib import Path
 
 
+MAX_PROGRESS_CHARS = 280
+MAX_PROGRESS_LINES = 4
+
+
+def _progress_message_error(message: str) -> str | None:
+    """Return a validation error when a notify body looks like a final answer."""
+    stripped = message.strip()
+    if len(stripped) > MAX_PROGRESS_CHARS:
+        return (
+            f"progress update is too long ({len(stripped)} chars; "
+            f"max {MAX_PROGRESS_CHARS})"
+        )
+    line_count = len([line for line in stripped.splitlines() if line.strip()])
+    if line_count > MAX_PROGRESS_LINES:
+        return (
+            f"progress update has too many lines ({line_count}; "
+            f"max {MAX_PROGRESS_LINES})"
+        )
+    return None
+
+
 def _env_file(path: str) -> dict[str, str]:
     """Parse key=value pairs from an .env file. Returns {} on any error."""
     result: dict[str, str] = {}
@@ -126,6 +147,16 @@ def main() -> int:
 
     if not channel:
         print("[task-progress] --channel-id (or --chat-id) is required", file=sys.stderr)
+        return 1
+
+    validation_error = _progress_message_error(message)
+    if validation_error:
+        print(
+            "[task-progress] refusing message: "
+            f"{validation_error}. notify.py is only for short progress updates; "
+            "write final answers to the task result file.",
+            file=sys.stderr,
+        )
         return 1
 
     if source == "slack":
