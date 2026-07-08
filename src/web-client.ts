@@ -9,6 +9,7 @@
  */
 
 import { createServer, request as httpRequest } from 'node:http';
+import { connect as netConnect } from 'node:net';
 import { writeFileSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,6 +22,13 @@ const HTTP_PORT = Number(process.env.CLIENT_PORT) || 8080;
 const HTTP_HOST = process.env.CLIENT_HOST || '0.0.0.0'; // '0.0.0.0' binds to all interfaces for EC2
 const WS_PORT = Number(process.env.PORT) || 9900;
 const DEFAULT_WS_URL = `ws://localhost:${WS_PORT}`;
+// Opt-in LAN sharing. The voice WS (WS_PORT) binds loopback only, so a browser
+// on another device on the same network can't reach it. When enabled, this
+// server proxies WS_PORT through its own LAN-reachable HTTP port at /ws — so a
+// LAN peer reaches the voice agent without WS_PORT itself being exposed. OFF by
+// default: enabling it lets any device on the network use this core's agent
+// (the voice WS has no auth), so it's an explicit choice per network.
+const LAN_SHARE = /^(1|true|yes|on)$/i.test(process.env.SUTANDO_LAN_SHARE || '');
 
 // Workspace-relative paths use resolveWorkspace() (closes #763). Skills paths
 // (non-runtime, code-adjacent) remain anchored to the repo root.
@@ -797,6 +805,12 @@ function getDefaultWsUrl() {
   // If HTTPS, use /ws path through nginx proxy; otherwise direct port
   if (window.location.protocol === 'https:') {
     return protocol + '//' + hostname + '/ws';
+  }
+  const isLoopback = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]';
+  if (!isLoopback) {
+    // Served to a LAN peer: the voice WS port is loopback-only on the core, so
+    // route through the /ws proxy on this same (LAN-reachable) HTTP port.
+    return protocol + '//' + window.location.host + '/ws';
   }
   return protocol + '//' + hostname + ':' + WS_PORT;
 }
@@ -3951,8 +3965,33 @@ const server = createServer((req, res) => {
 	res.end(HTML);
 });
 
+// LAN-share WS proxy: forward an upgrade on /ws to the loopback voice WS. Only
+// active when SUTANDO_LAN_SHARE is enabled; otherwise the upgrade is refused
+// (loopback clients connect to WS_PORT directly and never hit this path). The
+// handshake bytes (incl. Sec-WebSocket-Key) are replayed verbatim to WS_PORT
+// with the path rewritten to '/', then the two sockets are piped together.
+server.on('upgrade', (req, socket, head) => {
+	const path = (req.url || '').split('?')[0];
+	if (path !== '/ws' || !LAN_SHARE) {
+		socket.destroy();
+		return;
+	}
+	const upstream = netConnect(WS_PORT, '127.0.0.1', () => {
+		const lines = [`${req.method} / HTTP/1.1`];
+		for (let i = 0; i < req.rawHeaders.length; i += 2) {
+			lines.push(`${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}`);
+		}
+		upstream.write(lines.join('\r\n') + '\r\n\r\n');
+		if (head && head.length) upstream.write(head);
+		socket.pipe(upstream);
+		upstream.pipe(socket);
+	});
+	upstream.on('error', () => socket.destroy());
+	socket.on('error', () => upstream.destroy());
+});
+
 server.listen(HTTP_PORT, HTTP_HOST, () => {
-	const serverUrl = HTTP_HOST === '0.0.0.0' 
+	const serverUrl = HTTP_HOST === '0.0.0.0'
 		? `http://localhost:${HTTP_PORT} (or use your server's IP/DNS)`
 		: `http://${HTTP_HOST}:${HTTP_PORT}`;
 	console.log(`\n  Sutando — Web Client`);
