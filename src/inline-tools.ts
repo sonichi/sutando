@@ -44,6 +44,7 @@ export { setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool
 export { switchVoiceConfigTool } from './voice-config-switch.js';
 import { switchVoiceConfigTool } from './voice-config-switch.js';
 import { setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool } from './artifact-cache-tools.js';
+import { research as cloudResearch } from './cloud-brain.js';
 
 // --- File-open tool (moved out of recording-tools — generic file open, optionally fullscreen) ---
 
@@ -1140,6 +1141,37 @@ function loadCoreDocumentedSkills(): { name: string; description: string }[] {
 	return Array.from(byName.values());
 }
 export const coreDocumentedSkills = loadCoreDocumentedSkills();
+
+// Tier 0.5 — fast cloud-brain research. The local live-audio model can't do
+// Google Search grounding (the 3.1 + search combo 1011s), so a current-info
+// question otherwise falls back to opening a browser + reading the screen —
+// slow and clunky. This gives the agent a direct, spoken, ~2s answer instead.
+// NOT in the default `inlineTools` array (vanilla Tier 0 stays untouched);
+// voice-agent.ts adds it only when SUTANDO_TIER05 is enabled. The routing hint
+// lives in the description (no tuned-prompt change needed).
+export const researchTool: ToolDefinition = {
+	name: 'research',
+	description:
+		'Answer a general or current-information question — news, sports scores, weather, stocks, ' +
+		'definitions, recent events, "who/what/when is X". Returns a short spoken answer in ~2s via ' +
+		'web-search-grounded lookup. ALWAYS PREFER THIS over opening a browser or screen-searching ' +
+		'for current-info questions — do NOT open a browser for these. Only for questions that do ' +
+		"NOT need the user's own machine, files, or accounts (those go to work/delegation).",
+	parameters: z.object({
+		query: z.string().describe('The question to research, phrased naturally as the user asked it.'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { query } = args as { query: string };
+		try {
+			const answer = await cloudResearch(query);
+			console.log(`${ts()} [Research] "${query.slice(0, 50)}" -> ${answer.slice(0, 60)}`);
+			return { answer };
+		} catch (err) {
+			return { error: `research failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
 
 export const inlineTools = assertUniqueToolNames([
 	pressKeyTool, scrollTool, switchTabTool, closeTabTool, openUrlTool,

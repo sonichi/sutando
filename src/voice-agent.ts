@@ -30,7 +30,7 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { existsSync, readFileSync, readdirSync, statSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, openSync, writeSync, closeSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { inlineTools, coreDocumentedSkills } from './inline-tools.js';
+import { inlineTools, coreDocumentedSkills, researchTool } from './inline-tools.js';
 import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater } from './vision-tools.js';
 import { clearActiveArtifact } from './artifact-cache-tools.js';
 import { injectText } from './browser-tools.js';
@@ -541,7 +541,21 @@ function resolveCurrentMode(): ModeState {
 	return resolveCurrentModeImpl({ meetingActive, presenterActive });
 }
 
-const mainAgentTools: ToolDefinition[] = [workTool, getTaskStatus, switchModeTool, saveMeetingNoteTool, ...inlineTools];
+// Tier 0.5 — opt-in cloud optimizations for the local voice route. Off by
+// default: vanilla Tier 0 keeps exactly today's tool table. When enabled, add
+// the cloud-brain `research` tool so current-info questions get a fast spoken
+// answer instead of falling back to opening a browser (the live model can't
+// ground natively). The routing hint rides in the tool description, so the
+// tuned system prompt is untouched.
+const TIER05 = /^(1|true|yes|on)$/i.test(process.env.SUTANDO_TIER05 || '');
+const mainAgentTools: ToolDefinition[] = [
+	workTool,
+	getTaskStatus,
+	switchModeTool,
+	saveMeetingNoteTool,
+	...inlineTools,
+	...(TIER05 ? [researchTool] : []),
+];
 
 // Injection seam for the tuned factories in voice-agent-config.ts: this
 // module owns the session-gate + mode state; the config module owns the
