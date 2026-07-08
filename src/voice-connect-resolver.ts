@@ -9,9 +9,9 @@
  * picks a tier" behaviour: the app resolves the best available path invisibly
  * and only the latency/capability differs — never the agent's behaviour.
  *
- * Framework-agnostic (no DOM/React deps): the reachability probe is INJECTED
- * (`opts.probe`), so the SAME resolver is used by the Sutando webUI and the
- * AG2Space (Cinny) wrapper — one shared source, no drift. In the browser the
+ * Framework-agnostic (no DOM/framework deps): the reachability probe is INJECTED
+ * (`opts.probe`), so the SAME resolver can back multiple embedding surfaces
+ * (the webUI and any host-app wrapper) — one shared source, no drift. In the browser the
  * probe opens a short-lived WebSocket; opening `ws://localhost` from a public
  * HTTPS page triggers the one-time Local Network Access permission (Chrome
  * 147+), and a denied/failed probe is simply treated as "not reachable" so the
@@ -54,7 +54,14 @@ export async function resolveVoiceEndpoint(
 		} catch {
 			ok = false;
 		}
-		opts.onAttempt?.(ep, ok);
+		// onAttempt is a status-UI/telemetry hook — keep it strictly best-effort.
+		// A throwing callback must NOT abort resolution, or a harmless progress
+		// handler could prevent fall-through to relay/cloud.
+		try {
+			opts.onAttempt?.(ep, ok);
+		} catch {
+			/* telemetry failure is non-fatal — continue the ladder */
+		}
 		if (ok) return ep;
 	}
 	return null;

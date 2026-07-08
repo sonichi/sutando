@@ -61,4 +61,16 @@ describe('voice-connect-resolver', () => {
 		});
 		assert.deepEqual(attempts, [['local', false], ['cloud', true]]);
 	});
+
+	it('a throwing onAttempt is best-effort — resolution still falls through', async () => {
+		// local down, cloud reachable. A telemetry hook that throws on the first
+		// (failed) attempt must NOT abort the ladder — we still reach cloud.
+		const ep = await resolveVoiceEndpoint(defaultCandidates({ cloudUrl: 'wss://cloud/x' }), {
+			probe: async (url) => url.includes('cloud'),
+			onAttempt: () => {
+				throw new Error('telemetry failed');
+			},
+		});
+		assert.equal(ep?.tier, 'cloud', 'throwing onAttempt did not prevent fall-through');
+	});
 });
