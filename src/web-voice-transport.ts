@@ -107,8 +107,12 @@ export interface VoiceTransportEvents {
   onStatus?(status: VoiceStatus, detail?: string): void;
   /** Server transcript frame. `partial=false` means finalized. */
   onTranscript?(role: string, text: string, partial: boolean): void;
-  /** Assistant turn ended (barge-in point). Fires AFTER playback is flushed. */
+  /** Assistant turn ended normally. Playback is NOT flushed — the final audio
+   *  is allowed to drain. Surfaces use this to reset per-turn UI state. */
   onTurnEnd?(): void;
+  /** Assistant turn was interrupted (barge-in): scheduled playback has just been
+   *  flushed so the user isn't spoken over. Surfaces reset per-turn UI state. */
+  onInterrupted?(): void;
   /** Negotiated audio rates from `session.config`. */
   onSessionConfig?(inputRate: number, outputRate: number): void;
   /** Any non-audio protocol frame (image/video/chat/gui/etc). Surface renders it. */
@@ -223,16 +227,16 @@ export class VoiceTransport {
     ws.onerror = () => this.status('error', 'Connection error');
 
     ws.onclose = () => {
-      this.stopStats();
+      // A server-initiated close must tear down the whole audio graph, not just
+      // the stats timer — otherwise mic capture keeps running and stale audio
+      // state lingers. Mirrors web-client's doCleanup() on ws.onclose.
+      this.teardownAudio();
       this.status('closed', 'Disconnected');
     };
   }
 
-  /** Tear down mic + WS + playback. Idempotent. */
+  /** Tear down mic + WS + playback + audio graph. Idempotent. */
   disconnect(): void {
-    this.stopMic();
-    this.stopStats();
-    this.flushPlayback();
     if (this.ws) {
       try {
         this.ws.close();
@@ -241,13 +245,24 @@ export class VoiceTransport {
       }
       this.ws = null;
     }
-    // Leave audioCtx alive briefly so any tail playback can drain; callers that
-    // want a hard stop can call close().
+    this.teardownAudio();
   }
 
-  /** Hard stop — also closes the AudioContext. */
+  /** Alias for disconnect — teardown already closes the AudioContext. */
   close(): void {
     this.disconnect();
+  }
+
+  /**
+   * Stop capture, flush playback, and close the audio graph. Closes the
+   * AudioContext IMMEDIATELY (not on a delayed timeout): a deferred close can
+   * race a reconnect and kill the freshly-created context. Faithful to
+   * web-client's doCleanup(). Idempotent.
+   */
+  private teardownAudio(): void {
+    this.stopMic();
+    this.stopStats();
+    this.flushPlayback();
     if (this.audioCtx && this.audioCtx.state !== 'closed') {
       try {
         this.audioCtx.close();
@@ -256,6 +271,7 @@ export class VoiceTransport {
       }
     }
     this.audioCtx = null;
+    this.analyserNode = null; // recreated against the next ctx in playChunk
   }
 
   // ─── mic capture ────────────────────────────────────────────
@@ -348,10 +364,15 @@ export class VoiceTransport {
     } else if (msg?.type === 'transcript') {
       this.ev.onTranscript?.(msg.role, msg.text, msg.partial !== false);
     } else if (msg?.type === 'turn.end') {
-      // Barge-in: flush any queued assistant audio so the user's next turn
-      // isn't spoken over. Then let the surface react.
-      this.flushPlayback();
+      // Normal end of the assistant's turn — do NOT flush; the final scheduled
+      // audio must be allowed to drain, or the last words get cut off. Only the
+      // surface reacts (per-turn UI reset).
       this.ev.onTurnEnd?.();
+    } else if (msg?.type === 'turn.interrupted') {
+      // Barge-in: the user started speaking over the assistant. Stop all
+      // scheduled playback immediately so it doesn't talk over them.
+      this.flushPlayback();
+      this.ev.onInterrupted?.();
     }
 
     // Always forward the raw frame — surfaces render image/video/gui/chat/etc.

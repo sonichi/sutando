@@ -5,7 +5,15 @@ import {
 	float32ToInt16,
 	int16ToFloat32,
 	classifyMicError,
+	VoiceTransport,
 } from '../src/web-voice-transport.js';
+
+// Feed a JSON frame straight into the private router. The frame path touches no
+// browser API (flushPlayback over an empty queue is a no-op, ArrayBuffer is a
+// Node global), so the turn.end/turn.interrupted contract is Node-testable.
+function feed(t: VoiceTransport, obj: unknown): void {
+	(t as any).onMessage({ data: JSON.stringify(obj) });
+}
 
 describe('web-voice-transport DSP', () => {
 	it('downsample: identity when rates match', () => {
@@ -93,5 +101,55 @@ describe('web-voice-transport classifyMicError', () => {
 	it('unknown/undefined → generic retry with the name echoed', () => {
 		assert.match(classifyMicError('WeirdError'), /WeirdError/);
 		assert.match(classifyMicError(undefined), /unknown/);
+	});
+});
+
+describe('web-voice-transport turn lifecycle (drift guard vs web-client)', () => {
+	it('turn.end fires onTurnEnd and does NOT flush/interrupt (final audio drains)', () => {
+		let ended = 0;
+		let interrupted = 0;
+		const t = new VoiceTransport({
+			onTurnEnd: () => ended++,
+			onInterrupted: () => interrupted++,
+		});
+		feed(t, { type: 'turn.end' });
+		assert.equal(ended, 1);
+		assert.equal(interrupted, 0, 'turn.end must not trigger a barge-in flush');
+	});
+
+	it('turn.interrupted fires onInterrupted only (barge-in cut-off)', () => {
+		let ended = 0;
+		let interrupted = 0;
+		const t = new VoiceTransport({
+			onTurnEnd: () => ended++,
+			onInterrupted: () => interrupted++,
+		});
+		// Must not throw flushing an empty playback queue.
+		feed(t, { type: 'turn.interrupted' });
+		assert.equal(interrupted, 1);
+		assert.equal(ended, 0, 'turn.interrupted is distinct from turn.end');
+	});
+
+	it('session.config negotiates rates via onSessionConfig', () => {
+		let rates: [number, number] | null = null;
+		const t = new VoiceTransport({ onSessionConfig: (i, o) => (rates = [i, o]) });
+		feed(t, { type: 'session.config', audioFormat: { inputSampleRate: 8000, outputSampleRate: 48000 } });
+		assert.deepEqual(rates, [8000, 48000]);
+	});
+
+	it('every frame is also forwarded raw to onProtocolMessage', () => {
+		const seen: string[] = [];
+		const t = new VoiceTransport({ onProtocolMessage: (m) => seen.push(m.type) });
+		feed(t, { type: 'image', base64: 'x' });
+		feed(t, { type: 'turn.end' });
+		assert.deepEqual(seen, ['image', 'turn.end']);
+	});
+
+	it('disconnect()/close() are idempotent with no live session (no throw)', () => {
+		const t = new VoiceTransport();
+		assert.doesNotThrow(() => t.disconnect());
+		assert.doesNotThrow(() => t.close());
+		assert.doesNotThrow(() => t.disconnect());
+		assert.equal(t.connected, false);
 	});
 });
