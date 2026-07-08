@@ -3975,18 +3975,27 @@ const server = createServer((req, res) => {
 // with the path rewritten to '/', then the two sockets are piped together.
 server.on('upgrade', (req, socket, head) => {
 	const path = (req.url || '').split('?')[0];
-	if (path !== '/ws' || !LAN_SHARE) {
+	// Allow the /ws proxy when the upgrade arrives over LOOPBACK — i.e. from a
+	// same-host TLS-terminating reverse proxy (nginx/caddy) forwarding the
+	// pre-existing HTTPS `wss://<host>/ws` path — OR when LAN sharing is
+	// explicitly enabled. A direct remote/LAN client (non-loopback source) still
+	// needs SUTANDO_LAN_SHARE, so LAN_SHARE only gates the NEW LAN exposure and
+	// not the HTTPS reverse-proxy path. socket.remoteAddress is the real TCP
+	// source and can't be spoofed by a request header.
+	const remote = (socket as import('node:net').Socket).remoteAddress || '';
+	const fromLoopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
+	if (path !== '/ws' || !(LAN_SHARE || fromLoopback)) {
 		socket.destroy();
 		return;
 	}
-	// Same-origin guard. Browser WebSockets are NOT protected by CORS, so a page
-	// on any site a LAN device happens to visit could target ws://<core>:8080/ws
-	// and drive the agent. Require the Origin (when the client sends one — i.e. a
-	// browser) to match the host this request arrived on, so only the Sutando UI
-	// served from this host can open the socket. Non-browser clients send no
-	// Origin and are allowed under the LAN-share opt-in.
+	// Same-origin guard — applied only to DIRECT (non-loopback) clients, i.e. the
+	// LAN-share path. Browser WebSockets aren't CORS-protected, so a page on any
+	// site a LAN device visits could target ws://<core>:8080/ws; require the
+	// Origin to match the request Host so only the Sutando UI served from this
+	// host can open it. Loopback sources (a same-host reverse proxy) are trusted
+	// and skip this — Host/Origin can legitimately differ across proxying.
 	const origin = req.headers.origin;
-	if (origin) {
+	if (!fromLoopback && origin) {
 		let originHost: string;
 		try {
 			originHost = new URL(origin).host;
