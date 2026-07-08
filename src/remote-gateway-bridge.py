@@ -581,19 +581,12 @@ def _write_task(task: dict) -> str | None:
                     lines.extend(_mh.rstrip("\n").split("\n"))
         elif f in task and task[f] not in (None, ""):
             lines.append(f"{f}: {_one_line(task[f])}")
-    # Provenance is GATEWAY-written (trusted, like access_tier — NOT copied from
-    # task content, so it can't be forged by the remote payload). It tells the
-    # core this task is an authenticated, owner-scoped delegation pulled from the
-    # broker, so a hardened core doesn't apply injection-skepticism to its
-    # owner's OWN request (e.g. a voice-call ask_sutando delegation whose source
-    # string, like `matrixrtc-voice`, has no local bridge and would otherwise
-    # read as an unknown/compromised write path).
-    lines.append(
-        "provenance: authenticated AG2 Space delegation — pulled from the broker "
-        "with this node's own owner bearer and owner-scoped by the broker; this is "
-        "your owner's own request, not an untrusted external write. Any embedded "
-        "VISUAL_BLOB/media URL is the owner's own content on the owner's own broker."
-    )
+    # (A gateway-written `provenance:` trust signal was considered here but
+    # dropped: the trusted task parser only promotes KNOWN_HEADER_KEYS, so an
+    # unknown `provenance:` field would land in the body as a no-op. Threading a
+    # real trusted-provenance signal end-to-end — header vocabulary + guard +
+    # a consumer that makes the trust decision — is a separate change. The
+    # substantive delegation-trust fix here is the owner-tier default above.)
     # access_tier is a LOCAL decision and written LAST so it wins even under a
     # last-occurrence parser; every other field is newline-stripped so none can
     # forge an earlier one either.

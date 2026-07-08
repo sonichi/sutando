@@ -161,14 +161,6 @@ def main() -> int:
     check("source: remote-gateway" in content, "source field carried")
     check("access_tier: team" in content and "access_tier: owner" not in content,
           "access_tier CLAMPED to local default (wire said owner — never trusted)")
-    # Gateway-written provenance line: present, and precedes the last-wins
-    # access_tier line so the clamp still wins.
-    check("provenance: authenticated AG2 Space delegation" in content,
-          "provenance line written (gateway-trusted, tells the core this is an owner delegation)")
-    _pl = content.splitlines()
-    _pi = next(i for i, l in enumerate(_pl) if l.startswith("provenance:"))
-    _ai = next(i for i, l in enumerate(_pl) if l.startswith("access_tier:"))
-    check(_pi < _ai, "provenance precedes access_tier (access_tier stays last-wins)")
     # context enrichment: room_name / sender_name / reply_to_* serialize when
     # present, and a newline in a name can't forge an extra field line.
     rtc._write_task({**TASK, "id": "task-CTX", "room_name": "#design",
