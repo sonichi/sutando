@@ -797,6 +797,7 @@ let INPUT_RATE  = 16000;
 let OUTPUT_RATE = 24000;
 const CAPTURE_BUF = 2048;
 const WS_PORT = ${WS_PORT};
+const LAN_SHARE = ${LAN_SHARE ? 'true' : 'false'};
 
 // Auto-detect WebSocket URL from current hostname
 function getDefaultWsUrl() {
@@ -807,9 +808,11 @@ function getDefaultWsUrl() {
     return protocol + '//' + hostname + '/ws';
   }
   const isLoopback = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]';
-  if (!isLoopback) {
-    // Served to a LAN peer: the voice WS port is loopback-only on the core, so
-    // route through the /ws proxy on this same (LAN-reachable) HTTP port.
+  if (!isLoopback && LAN_SHARE) {
+    // Served to a LAN peer AND LAN sharing is on: the voice WS port is
+    // loopback-only, so route through the /ws proxy on this LAN-reachable HTTP
+    // port. (Only when the proxy actually exists — otherwise fall through to the
+    // direct port so trusted remote deployments with a reachable WS port work.)
     return protocol + '//' + window.location.host + '/ws';
   }
   return protocol + '//' + hostname + ':' + WS_PORT;
