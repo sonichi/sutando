@@ -625,6 +625,23 @@ else
   echo "  ✓ web client (already running)"
 fi
 
+# 2b. Tailnet HTTPS front for browser wss:// voice reach (opt-in).
+# When SUTANDO_TAILNET_SERVE is on, front the webUI with `tailscale serve` so a
+# browser on another device on your tailnet can open wss:// to the /ws proxy
+# (plain ws:// to a non-localhost host is blocked as mixed content from an HTTPS
+# page). Best-effort: a missing prerequisite (tailscale down, HTTPS not enabled
+# for the tailnet) must NOT fail startup — the helper prints its own diagnostics
+# to the log. `tailscale serve --bg` is idempotent, so re-running each boot is
+# safe. Pairs with SUTANDO_LAN_SHARE=1 (which the helper reminds you to set).
+if [[ "${SUTANDO_TAILNET_SERVE:-}" =~ ^(1|true|yes|on)$ ]]; then
+  echo "  Fronting webUI with tailscale serve (SUTANDO_TAILNET_SERVE on)..."
+  if bash "$REPO/scripts/tailscale-serve-voice.sh" >> "$LOGS_DIR/tailscale-serve.log" 2>&1; then
+    echo "  ✓ tailscale serve (browser wss:// tailnet reach)"
+  else
+    echo "  ⚠ tailscale serve skipped — see $LOGS_DIR/tailscale-serve.log"
+  fi
+fi
+
 # 3. Dashboard (port 7844)
 reap_wedged_listener 7844 dashboard
 if ! lsof -i :7844 > /dev/null 2>&1; then
