@@ -165,7 +165,10 @@ export const pressKeyTool: ToolDefinition = {
 	description:
 		'Press a keyboard key or shortcut in the frontmost app. Use for: "press enter", "press escape", ' +
 		'"press tab", "send the message" (Enter), "close the dialog" (Escape), "select all" (Cmd+A), ' +
-		'"clear the input" (Cmd+A then Delete). Instant — do NOT use work for simple keystrokes.',
+		'"clear the input" (Cmd+A then Delete). Instant — do NOT use work for simple keystrokes. ' +
+		'Call this ONLY on an explicit key/shortcut request. NEVER when the user is addressing another ' +
+		'assistant or device ("Hey Google", "Alexa", "Siri"), and never on filler or garbled speech — ' +
+		'a spurious keystroke acts on whatever app is frontmost. When unsure, fire nothing.',
 	parameters: z.object({
 		key: z.string().describe('Key to press: enter, escape, tab, delete, space, up, down, left, right, or a letter'),
 		modifiers: z.array(z.enum(['command', 'shift', 'control', 'option'])).optional().describe('Modifier keys'),
@@ -630,7 +633,11 @@ export const toggleTasksTool: ToolDefinition = {
 
 export const getCurrentTimeTool: ToolDefinition = {
 	name: 'get_current_time',
-	description: 'Get the current date and time. Instant.',
+	description:
+		'Get the current date and time. Instant. Call this ONLY when the user explicitly asks for ' +
+		'the time, date, or day. NEVER call it for any other question, on filler ("hm", "okay"), or ' +
+		'as a fallback when you are unsure what the user wants — answering an unrelated question ' +
+		'(e.g. about a paper) by announcing the time is always wrong; when unsure, fire nothing.',
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
@@ -646,7 +653,9 @@ export const getCoreStatusTool: ToolDefinition = {
 	description:
 		'Get what the core agent (Claude Code) is currently doing. Use when the user asks ' +
 		'"what are you working on", "what are you up to", "are you busy", "anything running", ' +
-		'or similar questions about background work. Instant file read.',
+		'or similar questions about background work. Instant file read. Call it ONLY for those ' +
+		'explicit status questions — NEVER on greetings ("hello"), filler, garbled speech, or as ' +
+		'a fallback when unsure what the user wants; fire nothing instead.',
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
