@@ -165,7 +165,10 @@ export const pressKeyTool: ToolDefinition = {
 	description:
 		'Press a keyboard key or shortcut in the frontmost app. Use for: "press enter", "press escape", ' +
 		'"press tab", "send the message" (Enter), "close the dialog" (Escape), "select all" (Cmd+A), ' +
-		'"clear the input" (Cmd+A then Delete). Instant — do NOT use work for simple keystrokes.',
+		'"clear the input" (Cmd+A then Delete). Instant — do NOT use work for simple keystrokes. ' +
+		'Call this ONLY on an explicit key/shortcut request. NEVER when the user is addressing another ' +
+		'assistant or device ("Hey Google", "Alexa", "Siri"), and never on filler or garbled speech — ' +
+		'a spurious keystroke acts on whatever app is frontmost. When unsure, fire nothing.',
 	parameters: z.object({
 		key: z.string().describe('Key to press: enter, escape, tab, delete, space, up, down, left, right, or a letter'),
 		modifiers: z.array(z.enum(['command', 'shift', 'control', 'option'])).optional().describe('Modifier keys'),
@@ -650,7 +653,9 @@ export const getCoreStatusTool: ToolDefinition = {
 	description:
 		'Get what the core agent (Claude Code) is currently doing. Use when the user asks ' +
 		'"what are you working on", "what are you up to", "are you busy", "anything running", ' +
-		'or similar questions about background work. Instant file read.',
+		'or similar questions about background work. Instant file read. Call it ONLY for those ' +
+		'explicit status questions — NEVER on greetings ("hello"), filler, garbled speech, or as ' +
+		'a fallback when unsure what the user wants; fire nothing instead.',
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
@@ -691,7 +696,9 @@ export const slideControlTool: ToolDefinition = {
 		'so it is safe to call even when a textarea or contenteditable on the deck has focus (e.g. live-edit demos). ' +
 		'PREFER this over press_key("leftarrow"/"rightarrow"/"space") for slide navigation: arrow / space keystrokes ' +
 		'get captured by focused editables (cursor moves within the field) and may be suppressed by deck-side ' +
-		'focus-guard handlers — slide_control sidesteps both.',
+		'focus-guard handlers — slide_control sidesteps both. ' +
+		'Call it ONLY on an explicit navigation request — NEVER on filler ("what what what"), garbled speech, ' +
+		'or as a guess when unsure; fire nothing instead.',
 	parameters: z.object({
 		action: z.enum(['next', 'previous', 'goto']).describe('Navigation action'),
 		slideNumber: z.number().optional().describe('Slide number for goto action'),
@@ -819,7 +826,10 @@ const NOTES_DIR = sharedPersonalPath('notes', WORKSPACE_DIR);
 
 export const showViewTool: ToolDefinition = {
 	name: 'show_view',
-	description: 'Switch the web UI to a specific view. Use when user says "show notes", "show tasks", "show activity", etc.',
+	description:
+		'Switch the web UI to a specific view. Use when user says "show notes", "show tasks", "show activity", etc. ' +
+		'Call it ONLY on an explicit view-switch request — NEVER to answer an information question ' +
+		'(answer it in speech instead), and never on filler or when unsure; fire nothing instead.',
 	parameters: z.object({
 		view: z.enum(['starter', 'tasks', 'notes', 'questions', 'activity']).describe('Which view to show'),
 	}),

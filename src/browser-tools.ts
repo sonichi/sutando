@@ -415,7 +415,10 @@ async function describeScreenshot(imagePath: string, previousDescs: string[] = [
 export const describeScreenTool: ToolDefinition = {
 	name: 'describe_screen',
 	description:
-		'Describe what is currently visible on screen WITHOUT scrolling. Captures ALL connected displays by default. Use this to introduce/narrate the current view to the caller. Pass display=2 for secondary only.',
+		'Describe what is currently visible on screen WITHOUT scrolling. Captures ALL connected displays by default. ' +
+		'Use this to introduce/narrate the current view to the caller. Pass display=2 for secondary only. ' +
+		'Call it ONLY when the user explicitly asks what is on screen — NEVER on filler ("um"), ' +
+		'garbled speech, or as a guess when unsure what they want; fire nothing instead.',
 	parameters: z.object({
 		display: z.number().optional().describe('Specific display (1=main, 2=secondary). Omit to capture all.'),
 	}),
