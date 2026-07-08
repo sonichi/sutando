@@ -3976,6 +3976,25 @@ server.on('upgrade', (req, socket, head) => {
 		socket.destroy();
 		return;
 	}
+	// Same-origin guard. Browser WebSockets are NOT protected by CORS, so a page
+	// on any site a LAN device happens to visit could target ws://<core>:8080/ws
+	// and drive the agent. Require the Origin (when the client sends one — i.e. a
+	// browser) to match the host this request arrived on, so only the Sutando UI
+	// served from this host can open the socket. Non-browser clients send no
+	// Origin and are allowed under the LAN-share opt-in.
+	const origin = req.headers.origin;
+	if (origin) {
+		let originHost: string;
+		try {
+			originHost = new URL(origin).host;
+		} catch {
+			originHost = ' '; // unparseable Origin → never matches
+		}
+		if (originHost !== req.headers.host) {
+			socket.destroy();
+			return;
+		}
+	}
 	const upstream = netConnect(WS_PORT, '127.0.0.1', () => {
 		const lines = [`${req.method} / HTTP/1.1`];
 		for (let i = 0; i < req.rawHeaders.length; i += 2) {
