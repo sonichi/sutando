@@ -1089,6 +1089,16 @@ def _filter_electron_impostor_pids(pids: list[str]) -> list[str]:
     return kept
 
 
+def _resolve_menu_bar_pgrep(pgrep_status: Optional[str], pids: list[str]) -> tuple[Optional[str], list[str]]:
+    """Post-process the sutando-app pgrep result: drop Electron impostor
+    PIDs, and demote "ok-running" to "ok-stopped" when nothing real remains."""
+    if pgrep_status == "ok-running" and pids:
+        pids = _filter_electron_impostor_pids(pids)
+        if not pids:
+            pgrep_status = "ok-stopped"
+    return pgrep_status, pids
+
+
 def run_all_checks() -> list[dict]:
     checks = []
 
@@ -1409,11 +1419,8 @@ def run_all_checks() -> list[dict]:
             pgrep_status = "error"
             pgrep_err = f"{type(e).__name__}: {e}"[:120]
 
-        # Disqualify Electron impostors (see _filter_electron_impostor_pids).
-        if pgrep_status == "ok-running" and pids:
-            pids = _filter_electron_impostor_pids(pids)
-            if not pids:
-                pgrep_status = "ok-stopped"
+        # Disqualify Electron impostors (see _resolve_menu_bar_pgrep).
+        pgrep_status, pids = _resolve_menu_bar_pgrep(pgrep_status, pids)
 
         if pgrep_status == "ok-running" and pids:
             check = {"name": "sutando-app", "status": "ok", "detail": f"running (⌃C/⌃V/⌃M)"}

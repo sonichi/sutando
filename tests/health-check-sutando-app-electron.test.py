@@ -104,6 +104,29 @@ with tempfile.TemporaryDirectory() as td:
     check("_ps_comm returns non-empty for live pid",
           bool(hc._ps_comm(str(os.getpid()))))
 
+    # g) _resolve_menu_bar_pgrep — the probe's post-processing step.
+    comm_by_pid = {"1": electron_main, "2": swift_main}
+
+    def fake_ps_comm2(pid):
+        return comm_by_pid[pid]
+
+    orig = hc._ps_comm
+    hc._ps_comm = fake_ps_comm2
+    try:
+        # All matches are impostors → demoted to ok-stopped, no pids left.
+        check("resolve: all impostors → ok-stopped",
+              hc._resolve_menu_bar_pgrep("ok-running", ["1"]) == ("ok-stopped", []))
+        # A real menu-bar PID survives → stays ok-running.
+        check("resolve: real pid survives → ok-running",
+              hc._resolve_menu_bar_pgrep("ok-running", ["1", "2"]) == ("ok-running", ["2"]))
+    finally:
+        hc._ps_comm = orig
+    # Non-running statuses pass through untouched (no ps calls at all).
+    check("resolve: ok-stopped passthrough",
+          hc._resolve_menu_bar_pgrep("ok-stopped", []) == ("ok-stopped", []))
+    check("resolve: error passthrough",
+          hc._resolve_menu_bar_pgrep("error", ["9"]) == ("error", ["9"]))
+
 if failures:
     print(f"\n{len(failures)} failure(s): {failures}")
     sys.exit(1)
