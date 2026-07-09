@@ -594,6 +594,48 @@ const HTML = /* html */ `<!DOCTYPE html>
   .t-assistant th, .t-assistant td { border: 1px solid #1e1e2a; padding: 4px 8px; }
   .t-assistant th { background: #14141e; }
   .t-assistant blockquote { border-left: 3px solid #2a4060; padding-left: 10px; margin: 0.4em 0; color: #a0a0b0; }
+
+  /* ── Call mode (?call=1): a slim call surface over the SAME page/backend ──
+     Everything except the transcript + a bottom control bar is hidden. Made
+     for embedding in the top half of a chat client and for phones: controls
+     are thumb-reach, 48px+ touch targets, Element-Call-style vocabulary. */
+  body.call-mode .hero, body.call-mode #dynamic-region, body.call-mode #tasks,
+  body.call-mode #tasks-header, body.call-mode #debug, body.call-mode #status-bar,
+  body.call-mode #wsUrl, body.call-mode .header .btn-voice,
+  body.call-mode .header .btn-mute, body.call-mode .header .btn-watch,
+  body.call-mode .caps-panel, body.call-mode .header .meta a,
+  body.call-mode #debug-header, body.call-mode .section-label {
+    display: none !important;
+  }
+  body.call-mode { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+  body.call-mode .header { padding: 8px 14px; flex: 0 0 auto; }
+  body.call-mode #main-area { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+  body.call-mode #bottom-panel { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+  body.call-mode #transcript { flex: 1 1 auto; min-height: 0; max-height: none; overflow-y: auto; }
+  body.call-mode.transcript-off #transcript { visibility: hidden; }
+  #call-bar {
+    display: none;
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 300;
+    justify-content: center; align-items: center; gap: 12px;
+    padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
+    background: #16162a; border-top: 1px solid #2a2a3e;
+  }
+  body.call-mode #bottom-panel { padding-bottom: 78px; }
+  body.call-mode #call-bar { display: flex; }
+  .call-btn {
+    min-width: 52px; height: 52px; padding: 0 16px; border: 0; border-radius: 26px;
+    background: #2a2a3e; color: #ddd; font-size: 20px; cursor: pointer;
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  }
+  .call-btn:hover { background: #3a3a4e; }
+  .call-btn.active { background: #4a1a1a; color: #e94560; }
+  .call-btn.on { background: #14401f; color: #6ee7a0; }
+  .call-btn-end { background: #c62838; color: #fff; font-weight: 700; padding: 0 22px; }
+  .call-btn-end:hover { background: #e94560; }
+  @media (max-width: 480px) {
+    #call-bar { gap: 8px; }
+    .call-btn { min-width: 48px; height: 48px; font-size: 18px; }
+  }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
 <!-- DOMPurify — agent results come from external task channels (Discord,
@@ -774,6 +816,13 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
 </div>
 </div>
 
+<div id="call-bar">
+  <button class="call-btn" id="call-mute" onclick="toggleMute()" title="Mute microphone">🎙</button>
+  <button class="call-btn" id="call-deafen" onclick="toggleDeafen()" title="Deafen (silence the agent)">🔊</button>
+  <button class="call-btn" id="call-watch" onclick="toggleWatch()" title="Share your screen">🖥</button>
+  <button class="call-btn" id="call-transcript" onclick="toggleTranscriptVisible()" title="Transcript on/off">💬</button>
+  <button class="call-btn call-btn-end" onclick="endCall()" title="End the call">End</button>
+</div>
 <div id="tasks-header" style="display:none"></div>
 <div id="tasks" style="display:none"></div>
 
@@ -845,6 +894,14 @@ window.addEventListener('DOMContentLoaded', () => {
   initChromeStt();
   // Auto-reconnect voice if it was connected before refresh
   try { if (sessionStorage.getItem('sutando-voice')) { setTimeout(() => toggle(), 500); } } catch {}
+  // Call mode (?call=1): slim surface — hide chrome, show the control bar,
+  // and start voice immediately (the whole point of opening this view).
+  try {
+    if (new URLSearchParams(location.search).get('call') === '1') {
+      document.body.classList.add('call-mode');
+      if (!sessionStorage.getItem('sutando-voice')) setTimeout(() => toggle(), 600);
+    }
+  } catch {}
 });
 
 // ─── Remote toggle via SSE ────────────────────────────────
@@ -1529,6 +1586,7 @@ function int16ToFloat32(buf) {
 
 // ─── Audio playback (gapless scheduling) ──────────────────
 function playChunk(arrayBuf) {
+  if (window.deafened) { playChunkCount++; return; }  // call-mode deafen: drop agent audio silently
   if (!audioCtx || audioCtx.state === 'closed') {
     try {
       audioCtx = new AudioContext();
@@ -2315,6 +2373,24 @@ function toggleWatch() {
 window.toggleWatch = toggleWatch;
 
 // ─── Mute toggle ──────────────────────────────────────────
+function toggleDeafen() {
+  window.deafened = !window.deafened;
+  var b = $('call-deafen');
+  if (b) { b.classList.toggle('active', !!window.deafened); b.textContent = window.deafened ? '🔇' : '🔊'; }
+}
+
+function toggleTranscriptVisible() {
+  document.body.classList.toggle('transcript-off');
+  var b = $('call-transcript');
+  if (b) b.classList.toggle('active', document.body.classList.contains('transcript-off'));
+}
+
+function endCall() {
+  // End = stop voice; in an embed the parent (chat client) owns closing the pane.
+  try { if (micStream) toggle(); } catch (e) {}
+  try { window.close(); } catch (e) {}
+}
+
 function toggleMute() {
   if (!micStream) return;
   muted = !muted;
@@ -2322,6 +2398,8 @@ function toggleMute() {
   const btn = document.getElementById('btn-mute');
   btn.textContent = muted ? 'Unmute' : 'Mute';
   btn.className = muted ? 'btn-mute muted' : 'btn-mute';
+  const callBtn = document.getElementById('call-mute');
+  if (callBtn) { callBtn.classList.toggle('active', muted); callBtn.textContent = muted ? '🔇🎙' : '🎙'; }
   addSystem(muted ? 'Microphone muted.' : 'Microphone unmuted.');
   // Report actual mute state to server for menu bar indicator
   fetch('/mute-state?muted=' + muted).catch(() => {});
