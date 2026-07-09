@@ -886,6 +886,12 @@ function initRemoteToggle() {
       });
     } catch {}
   });
+  // Short audible cue when the agent invokes a tool/core (owner ask
+  // 2026-07-09) — a subtle "the answer is grounded" signal. Distinct pitch
+  // per kind: research (cloud lookup) / work (local core) / tool (inline).
+  _sseSource.addEventListener('tool-cue', function(e) {
+    try { playToolCue(String(e.data || '').trim()); } catch {}
+  });
   _sseSource.onerror = () => setTimeout(() => initRemoteToggle(), 5000);
 }
 initRemoteToggle();
@@ -896,6 +902,41 @@ document.addEventListener('visibilitychange', () => {
 // ─── State ────────────────────────────────────────────────
 let ws = null;
 let audioCtx = null;
+// Play a short, low-volume Web Audio blip to signal a tool/core invocation
+// (owner ask 2026-07-09). Reuses the AudioContext created on the call's user
+// gesture, so it's already running during a voice session. Pitch/shape differ
+// by kind so the user can tell a cloud research lookup from a local-core
+// handoff by ear alone. Fire-and-forget: never blocks or gates the tool call.
+function playToolCue(kind) {
+  try {
+    if (!audioCtx) { try { audioCtx = new AudioContext(); } catch (e) { return; } }
+    if (audioCtx.state === 'suspended') { try { audioCtx.resume(); } catch (e) {} }
+    // [freq Hz, startOffset s, duration s] steps. Kept <120ms total, gain low
+    // so the blip sits under speech without masking it. Retune here freely.
+    var seqs = {
+      research: [[720, 0.0, 0.05], [1080, 0.06, 0.06]], // two rising notes — reaching out to the cloud
+      work:     [[500, 0.0, 0.11]],                     // one low note — handing off to local core
+      tool:     [[820, 0.0, 0.045]]                     // short mid tick — inline tool
+    };
+    var seq = seqs[kind] || seqs.tool;
+    var vol = 0.05; // "not too loud" (owner)
+    var now = audioCtx.currentTime;
+    seq.forEach(function(step) {
+      var freq = step[0], t0 = now + step[1], dur = step[2];
+      var osc = audioCtx.createOscillator();
+      var g = audioCtx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      // Fast attack, exponential decay — avoids the click of a hard on/off edge.
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.linearRampToValueAtTime(vol, t0 + 0.008);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      osc.connect(g); g.connect(audioCtx.destination);
+      osc.start(t0);
+      osc.stop(t0 + dur + 0.02);
+    });
+  } catch (e) {}
+}
 let micStream = null;
 let processor = null;
 let connected = false;
@@ -3729,6 +3770,23 @@ const server = createServer((req, res) => {
 					_preSeeingToolState = 'idle';
 					if (aState === 'working' && labelParam) _toolLabel = labelParam;
 					else if (aState !== 'working') _toolLabel = '';
+					// Sound cue (owner ask 2026-07-09): emit a short audible blip per
+					// tool/core invocation so the user hears the answer is grounded.
+					// Distinct pitch for cloud research vs local core (work) vs inline
+					// tool. Fires on the leading edge — this branch = one onToolCall's
+					// working post → one cue. A SEPARATE SSE event from agent-state so it
+					// still fires when effectiveAgentState() is unchanged (back-to-back
+					// tool calls stay 'working', which suppresses the agent-state
+					// broadcast at the prevEffective===nextEffective guard below).
+					if (aState === 'working' && labelParam) {
+						const l = labelParam.toLowerCase();
+						const cueKind = (l === 'work' || l === 'ask_sutando' || l === 'ask_core')
+							? 'work'
+							: (/search|research|ground|google/.test(l) ? 'research' : 'tool');
+						for (const client of sseClients) {
+							try { client.write(`event: tool-cue\ndata: ${cueKind}\n\n`); } catch {}
+						}
+					}
 				}
 			} else {
 				// Browser can't legitimately know working/seeing — those
