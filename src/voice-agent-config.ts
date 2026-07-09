@@ -23,6 +23,7 @@ import { join } from 'node:path';
 import { resolveWorkspace } from './workspace_default.js';
 import { personalPath, memoryDirEnv } from './util_paths.js';
 import { buildVoiceAgentContext } from './voice-context.js';
+import { roomContextBlock } from './voice-room-context.js';
 import { inlineTools, coreDocumentedSkills } from './inline-tools.js';
 import type { ModeState } from './voice-mode-resolver.js';
 
@@ -226,6 +227,11 @@ export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOve
 		'All of your code was written by your own autonomous build loop.',
 		'',
 		overrides?.voiceAgentContext !== undefined ? overrides.voiceAgentContext : buildVoiceAgentContext(),
+		'',
+		// In-room context layer (2026-07-09): when the call originates from a
+		// room, inject "you're called in room X" + (slice 2) the room's prep
+		// artifact. Empty string when no fresh room is set (safe no-op).
+		roomContextBlock(WORKSPACE_DIR),
 		'',
 		'DEFAULT BEHAVIOR: Call work for almost everything.',
 		'You are the voice interface. The Claude Code session is the brain.',

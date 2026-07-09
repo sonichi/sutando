@@ -836,11 +836,40 @@ function renderHotkeyHints() {
   }).catch(function () {});
 }
 
+// In-room context (2026-07-09, slice 1b): when this web UI is embedded in a
+// room's call iframe, the embedding client appends ?room_id=&room_name= to the
+// src. Self-report that room to the agent via /room-context so buildInstructions
+// scopes to it. No room in the URL (e.g. the plain local UI) → clear, so a stale
+// association never bleeds into a later non-room call (belt-and-suspenders over
+// the 15m TTL).
+function reportRoomFromUrl() {
+  try {
+    var q = new URLSearchParams(window.location.search);
+    var roomId = q.get('room_id');
+    if (roomId) {
+      var qs = 'room_id=' + encodeURIComponent(roomId);
+      var rn = q.get('room_name'); if (rn) qs += '&room_name=' + encodeURIComponent(rn);
+      fetch('/room-context?' + qs).catch(function () {});
+    } else {
+      fetch('/room-context?clear=true').catch(function () {});
+    }
+  } catch (e) {}
+}
+// Clear the room association when the call iframe is closed/navigated away, so
+// the next call starts clean. sendBeacon survives page teardown; fetch fallback.
+window.addEventListener('pagehide', function () {
+  try {
+    if (navigator.sendBeacon) navigator.sendBeacon('/room-context?clear=true');
+    else fetch('/room-context?clear=true', { keepalive: true }).catch(function () {});
+  } catch (e) {}
+});
+
 window.addEventListener('DOMContentLoaded', () => {
   const wsUrlInput = $('wsUrl');
   if (wsUrlInput && !wsUrlInput.value) {
     wsUrlInput.value = getDefaultWsUrl();
   }
+  reportRoomFromUrl();
   renderHotkeyHints();
   initChromeStt();
   // Auto-reconnect voice if it was connected before refresh
@@ -3670,6 +3699,31 @@ const server = createServer((req, res) => {
 		} catch {}
 		res.writeHead(200, { 'Content-Type': 'application/json' });
 		res.end(JSON.stringify({ active }));
+		return;
+	}
+
+	// In-room context layer (2026-07-09): the client reports which room a voice
+	// call originates from → state/voice-session-room.json. buildInstructions
+	// reads it so the agent knows "I'm called in room X" (search_knowledge + the
+	// prep-artifact fetch read the same state, slice 2). Mirrors /mute-state:
+	// client POSTs, agent reads a small JSON state file. `clear=true` (or empty
+	// room_id) on call end resets it so no room bleeds into a later local call.
+	if (url.pathname === '/room-context') {
+		const roomId = (url.searchParams.get('room_id') || '').trim();
+		const roomName = url.searchParams.get('room_name') || undefined;
+		const clear = url.searchParams.get('clear') === 'true';
+		try {
+			const p = join(STATE_DIR, 'voice-session-room.json');
+			const nowSec = Math.floor(Date.now() / 1000);
+			const payload = (clear || !roomId)
+				? { room_id: '', ts: nowSec }
+				: { room_id: roomId, room_name: roomName, ts: nowSec };
+			writeFileSync(p, JSON.stringify(payload));
+		} catch (e) {
+			console.error('[web-client] /room-context write failed:', e);
+		}
+		res.writeHead(200, { 'Content-Type': 'application/json' });
+		res.end(JSON.stringify({ ok: true, room_id: clear ? '' : roomId }));
 		return;
 	}
 
