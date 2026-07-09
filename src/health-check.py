@@ -1034,6 +1034,26 @@ def check_notes_split_brain() -> "dict | None":
     }
 
 
+def sutando_app_hotkey_detail(workspace_dir) -> str:
+    """Detail string for a running sutando-app check.
+
+    Hotkey labels come from <workspace>/state/hotkeys.json, published by the
+    app when it registers them (single source of truth since #1920). A running
+    process alone doesn't prove hotkeys exist — app lineages without global
+    hotkey registration (e.g. the Electron shell) match the pgrep pattern but
+    register nothing, and the pre-#1920 hardcoded "(⌃C/⌃V/⌃M)" claim here had
+    already drifted from the real defaults and read as a false positive during
+    live debugging. Missing/malformed/empty file → honest "no hotkeys
+    published" rather than a guess.
+    """
+    try:
+        entries = json.loads((Path(workspace_dir) / "state" / "hotkeys.json").read_text())
+        labels = "/".join(e["label"] for e in entries if e.get("label"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        labels = ""
+    return f"running (hotkeys: {labels})" if labels else "running (no hotkeys published)"
+
+
 def _outermost_bundle(comm: str) -> Optional[Path]:
     """Map an executable path to its OUTERMOST .app bundle, or None.
 
@@ -1423,7 +1443,11 @@ def run_all_checks() -> list[dict]:
         pgrep_status, pids = _resolve_menu_bar_pgrep(pgrep_status, pids)
 
         if pgrep_status == "ok-running" and pids:
-            check = {"name": "sutando-app", "status": "ok", "detail": f"running (⌃C/⌃V/⌃M)"}
+            # pragma: no cover — reachable only when pgrep finds the macOS
+            # menu-bar app (never on ubuntu CI); detail derivation is covered
+            # at helper level in health-check-sutando-app-hotkeys.test.py.
+            check = {"name": "sutando-app", "status": "ok",  # pragma: no cover
+                     "detail": sutando_app_hotkey_detail(WORKSPACE_DIR)}
             # Staleness check is meaningful only in the dev workflow — the
             # .app binary and bundled main.swift share a build mtime, so a
             # comparison there is always equal. Skip when dev_bin missing.
