@@ -1354,6 +1354,39 @@ def run_all_checks() -> list[dict]:
             pgrep_status = "error"
             pgrep_err = f"{type(e).__name__}: {e}"[:120]
 
+        # Disqualify Electron impostors. The desktop UI also installs as
+        # "Sutando.app", and its main binary lives at the same
+        # …/Contents/MacOS/Sutando suffix the pgrep pattern matches — so the
+        # probe reported "running" while the actual Swift menu-bar app (the
+        # contextual-chips writer + watcher-auto-restart owner) was dead
+        # (#2038, 2026-07-09). Electron bundles are distinguishable on disk:
+        # they ship Contents/Frameworks/Sutando Helper.app; the Swift app has
+        # no helper frameworks. Fail-open per PID: if the ps lookup errors,
+        # keep the PID (pre-fix behavior) rather than false-alarm "stopped".
+        if pgrep_status == "ok-running" and pids:
+            kept = []
+            for pid in pids:
+                try:
+                    comm = subprocess.run(
+                        ["/bin/ps", "-o", "comm=", "-p", pid],
+                        capture_output=True, text=True, timeout=5,
+                    ).stdout.strip()
+                    if ".app/" in comm:
+                        # Outermost bundle: Electron helper processes live at
+                        # …/Sutando.app/Contents/Frameworks/Sutando Helper*.app/…,
+                        # so split on the FIRST .app/ to map them back to the
+                        # top-level bundle before checking the marker.
+                        bundle = comm.split(".app/", 1)[0] + ".app"
+                        helper = Path(bundle) / "Contents" / "Frameworks" / "Sutando Helper.app"
+                        if helper.exists():
+                            continue  # Electron desktop app, not the menu-bar app
+                    kept.append(pid)
+                except Exception:
+                    kept.append(pid)
+            pids = kept
+            if not pids:
+                pgrep_status = "ok-stopped"
+
         if pgrep_status == "ok-running" and pids:
             check = {"name": "sutando-app", "status": "ok", "detail": f"running (⌃C/⌃V/⌃M)"}
             # Staleness check is meaningful only in the dev workflow — the
