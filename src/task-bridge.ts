@@ -909,6 +909,15 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 				if (!_shouldFallthrough(file)) continue;
 				if (result) {
 					console.log(`${ts()} [TaskBridge] Result ${file}: ${result.slice(0, 100)}`);
+					// Delivery affinity (owner-hit 2026-07-09 05:04): a task that
+					// arrived via a REMOTE bridge (gateway/discord/telegram/slack —
+					// anything not voice-origin) has its result delivered BY that
+					// bridge. Voice may narrate a copy for call continuity, but
+					// must NOT archive the files — archiving here starved the
+					// gateway and the owner's room reply silently never went out
+					// ("do we have a room event?" answered on-call only). Foreign
+					// results: narrate once (in-memory dedup), leave files alone.
+					const foreignOrigin = file.startsWith('task-') && !taskId.startsWith('task-chat-') && !_isVoiceTask(taskId);
 					// proactive-* files reach this fallthrough only to be SPOKEN
 					// (onResult below). They are NOT tasks — gate the two
 					// task-registration side-effects (_sendTaskStatus + POST
@@ -930,17 +939,21 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 							}).catch(() => {});
 						} catch {}
 					}
-					setTimeout(() => {
-						const taskIdFromFile = path.split('/').pop()!.replace('.txt', '');
-						archiveFile(path, 'results', taskIdFromFile);
-						// Also archive the originating task file so get_task_status
-						// stops counting it as "queued" — voice agent reads
-						// tasks/*.txt directly and otherwise sees stale files
-						// (Chi reported "task done in UI but queued in voice"
-						// on 2026-05-04 with 32 stale files in tasks/).
-						const taskFile = join(TASK_DIR, `${taskIdFromFile}.txt`);
-						if (existsSync(taskFile)) archiveFile(taskFile, 'tasks', taskIdFromFile);
-					}, 10_000);
+					if (!foreignOrigin) {
+						setTimeout(() => {
+							const taskIdFromFile = path.split('/').pop()!.replace('.txt', '');
+							archiveFile(path, 'results', taskIdFromFile);
+							// Also archive the originating task file so get_task_status
+							// stops counting it as "queued" — voice agent reads
+							// tasks/*.txt directly and otherwise sees stale files
+							// (Chi reported "task done in UI but queued in voice"
+							// on 2026-05-04 with 32 stale files in tasks/).
+							const taskFile = join(TASK_DIR, `${taskIdFromFile}.txt`);
+							if (existsSync(taskFile)) archiveFile(taskFile, 'tasks', taskIdFromFile);
+						}, 10_000);
+					} else {
+						console.log(`${ts()} [TaskBridge] ${taskId} is foreign-origin (remote bridge delivers); narrated only, files left for owner bridge`);
+					}
 				}
 			}
 		} catch (err) {
