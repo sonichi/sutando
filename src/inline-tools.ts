@@ -907,6 +907,58 @@ export const deleteNoteTool: ToolDefinition = {
 	},
 };
 
+// search_knowledge — on-demand keyword search over the user's own notes/ +
+// build_log.md, so the voice agent can answer questions GROUNDED in the user's
+// notes/decisions/project history WITHOUT delegating to work (fits the
+// answer-first routing). v0 is a fast in-process keyword scan (no embeddings):
+// instant, zero deps, enough to validate the UX. If keyword proves too blunt,
+// swap the internals for semantic search later — call sites don't change.
+// Owner ask 2026-07-09 ("simple test: use notes + build log as context").
+export const searchKnowledgeTool: ToolDefinition = {
+	name: 'search_knowledge',
+	description: 'Search the user\'s OWN notes and project build log for a topic and return the top matching snippets. Use this to answer questions grounded in the user\'s notes, decisions, or project history ("what did we decide about X", "find my note on Y", "what\'s in the build log about Z", "pull my notes on Z") — answer from the hits directly instead of delegating to work.',
+	parameters: z.object({
+		query: z.string().describe('What to search for — keywords or a short phrase'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { query } = args as { query: string };
+		const terms = String(query || '').toLowerCase().split(/\s+/).filter(t => t.length >= 2);
+		if (terms.length === 0) return { error: 'Empty query — give at least one keyword.' };
+		const buildLog = join(WORKSPACE_DIR, 'build_log.md');
+		const candidates: string[] = [];
+		try {
+			for (const f of readdirSync(NOTES_DIR)) if (f.endsWith('.md')) candidates.push(join(NOTES_DIR, f));
+		} catch { /* notes/ may not exist yet on a fresh install */ }
+		if (existsSync(buildLog)) candidates.push(buildLog);
+		const hits: { source: string; score: number; mtime: number; snippets: string[] }[] = [];
+		for (const path of candidates) {
+			let text: string;
+			try { text = readFileSync(path, 'utf-8'); } catch { continue; }
+			let score = 0;
+			const matched: { line: string; hits: number }[] = [];
+			for (const raw of text.split('\n')) {
+				const low = raw.toLowerCase();
+				let lineHits = 0;
+				for (const t of terms) if (low.includes(t)) lineHits++;
+				if (lineHits > 0) { score += lineHits; matched.push({ line: raw.trim(), hits: lineHits }); }
+			}
+			if (score === 0) continue;
+			let mtime = 0; try { mtime = statSync(path).mtimeMs; } catch { /* ignore */ }
+			const snippets = matched
+				.sort((a, b) => b.hits - a.hits)
+				.slice(0, 2)
+				.map(m => m.line.slice(0, 180))
+				.filter(Boolean);
+			const source = path === buildLog ? 'build_log.md' : 'notes/' + path.slice(NOTES_DIR.length + 1);
+			hits.push({ source, score, mtime, snippets });
+		}
+		if (hits.length === 0) return { query, matchCount: 0, message: `No notes or build-log entries matched "${query}".` };
+		hits.sort((a, b) => (b.score - a.score) || (b.mtime - a.mtime));
+		return { query, matchCount: hits.length, top: hits.slice(0, 5).map(({ source, snippets }) => ({ source, snippets })) };
+	},
+};
+
 // --- Voice session context (Chi 2026-05-13: voice agent loses context across turns) ---
 //
 // Background: voice-agent's Gemini context window is independent from core's. After
@@ -1157,7 +1209,7 @@ export const inlineTools = assertUniqueToolNames([
 	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, getCoreStatusTool,
 	joinGmeetTool, lookupMeetingIdTool, callContactTool,
 	describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, ...(_presenterActive ? [slideControlTool, fullscreenTool] : []),
-	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
+	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool, searchKnowledgeTool,
 	recentContextTool,
 	sendVisionFrameTool, startVisionTool, stopVisionTool,
 	setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool,
@@ -1178,7 +1230,7 @@ export const ownerOnlyTools = [
 	switchAppTool, captureScreenTool, typeTextTool,
 	clipboardTool, cancelTaskTool, toggleTasksTool,
 	joinGmeetTool, callContactTool, ...(_presenterActive ? [slideControlTool, fullscreenTool] : []),
-	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
+	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool, searchKnowledgeTool,
 	recentContextTool,
 	describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool,
 	sendVisionFrameTool, startVisionTool, stopVisionTool,
