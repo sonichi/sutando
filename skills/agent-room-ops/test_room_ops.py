@@ -16,6 +16,7 @@ import read as rd  # noqa: E402
 import media as md  # noqa: E402
 import react as rc  # noqa: E402
 import join as jn  # noqa: E402
+import doc as dc  # noqa: E402
 import room_ops  # noqa: E402
 
 HS = "@agent.a:hs"
@@ -239,6 +240,68 @@ class JoinTests(EnvCase):
         err = urllib.error.HTTPError("u", 403, "no", {}, None)
         with mock.patch.object(jn, "http_json", side_effect=err):
             self.assertIn("not a joined member", jn.join_room(ROOM, HS, gate=None)["reason"])
+
+
+class DocTests(EnvCase):
+    def test_missing_room(self):
+        self.assertFalse(dc.doc_get("", HS)["ok"])
+
+    def test_gate_deny(self):
+        os.environ["RELAY_URL"] = "https://r"
+        self.assertIn("gate denied", dc.doc_put(ROOM, "x", agent_mxid=HS, gate={})["reason"])
+
+    def test_no_relay(self):
+        self.assertIn("no gateway", dc.doc_get(ROOM, agent_mxid=HS, gate=None)["reason"])
+
+    def test_get_envelope(self):
+        os.environ["RELAY_URL"] = "https://r"
+        cap = {}
+        fake = {"ok": True, "file": "TODO.md", "folder": "room-todo", "content": "# T"}
+        with mock.patch.object(dc, "http_json",
+                               side_effect=lambda m, u, h, p: (cap.update(url=u, payload=p), (200, fake))[1]):
+            res = dc.doc_get(ROOM, folder="room-todo", name="TODO.md", agent_mxid=HS, gate=None)
+        self.assertTrue(res["ok"])
+        self.assertTrue(cap["url"].endswith("/v1/room"))
+        self.assertEqual(cap["payload"]["op"], "prep_get")
+        self.assertEqual(cap["payload"]["folder"], "room-todo")
+        self.assertEqual(res["content"], "# T")
+
+    def test_put_envelope_b64(self):
+        os.environ["RELAY_URL"] = "https://r"
+        cap = {}
+        fake = {"ok": True, "file": "notes.md", "sha": "abc123"}
+        with mock.patch.object(dc, "http_json",
+                               side_effect=lambda m, u, h, p: (cap.update(payload=p), (200, fake))[1]):
+            res = dc.doc_put(ROOM, "hello", folder="scratch", name="notes.md",
+                             message="m", agent_mxid=HS, gate=None)
+        self.assertTrue(res["ok"] and res["sha"] == "abc123")
+        self.assertEqual(cap["payload"]["op"], "prep_put")
+        self.assertEqual(base64.b64decode(cap["payload"]["content_b64"]).decode(), "hello")
+        self.assertEqual(cap["payload"]["message"], "m")
+
+    def test_rm_envelope(self):
+        os.environ["RELAY_URL"] = "https://r"
+        cap = {}
+        with mock.patch.object(dc, "http_json",
+                               side_effect=lambda m, u, h, p: (cap.update(payload=p), (200, {"ok": True}))[1]):
+            res = dc.doc_rm(ROOM, "old.md", folder="room-memo", agent_mxid=HS, gate=None)
+        self.assertTrue(res["ok"])
+        self.assertEqual(cap["payload"]["op"], "prep_delete")
+        self.assertEqual(cap["payload"]["filename"], "old.md")
+
+    def test_gateway_error_degrades(self):
+        os.environ["RELAY_URL"] = "https://r"
+        with mock.patch.object(dc, "http_json",
+                               return_value=(200, {"error": "bad folder (1-3 safe path segments, no leading dots)"})):
+            res = dc.doc_put(ROOM, "x", folder="../etc", agent_mxid=HS, gate=None)
+        self.assertFalse(res["ok"])
+        self.assertIn("bad folder", res["reason"])
+
+    def test_403_degrades(self):
+        os.environ["RELAY_URL"] = "https://r"
+        err = urllib.error.HTTPError("u", 403, "no", {}, None)
+        with mock.patch.object(dc, "http_json", side_effect=err):
+            self.assertIn("not a joined member", dc.doc_get(ROOM, agent_mxid=HS, gate=None)["reason"])
 
 
 # ----- unified CLI ----- #
