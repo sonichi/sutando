@@ -463,6 +463,53 @@ def main() -> int:
           "LOCAL_TIER=owner → owner-activity written with stripped summary")
     rtc.LOCAL_TIER = "team"
 
+    # 8. _reconcile_abandoned — two-sighting drop of stranded in-flight ids
+    rtc.TASKS_DIR.mkdir(parents=True, exist_ok=True)
+    rtc.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    (rtc.TASKS_DIR / "task-PEND.txt").write_text("still pending")
+    (rtc.RESULTS_DIR / "task-RDY.txt").write_text("result waiting")
+    inflight = {"task-GONE", "task-PEND", "task-RDY", "not!a!tid"}
+    s1 = rtc._reconcile_abandoned(inflight, set())
+    check(s1 == {"task-GONE"} and "task-GONE" in inflight,
+          "reconcile: first sighting only suspects (no drop yet)")
+    check("task-PEND" not in s1 and "task-RDY" not in s1,
+          "reconcile: pending task file / waiting result exempt from suspicion")
+    s2 = rtc._reconcile_abandoned(inflight, s1)
+    check("task-GONE" not in inflight and s2 == set(),
+          "reconcile: second sighting drops the id and clears suspects")
+    saved = set(json.loads(rtc.INFLIGHT_FILE.read_text()))
+    check("task-GONE" not in saved and "task-PEND" in saved,
+          "reconcile: ledger persisted on drop")
+    # a result landing between sightings rescues the id
+    inflight2 = {"task-LATE"}
+    s = rtc._reconcile_abandoned(inflight2, set())
+    (rtc.RESULTS_DIR / "task-LATE.txt").write_text("landed late")
+    s = rtc._reconcile_abandoned(inflight2, s)
+    check("task-LATE" in inflight2, "reconcile: late-landing result rescues the id")
+    (rtc.RESULTS_DIR / "task-LATE.txt").unlink()
+
+    # 9. main() one-iteration smoke — exercises the reconcile wiring in the
+    # poll loop (heartbeat → poll → results → reconcile → heartbeat), bounded
+    # by raising KeyboardInterrupt on the 3rd heartbeat (= start of round 2).
+    STATE["force_401"] = False
+    STATE["force_ack_404"] = False
+    STATE["force_heartbeat_404"] = False
+    real_hb = rtc._post_heartbeat
+    hb_calls = {"n": 0}
+    def _hb_bounded(inflight_arg):
+        hb_calls["n"] += 1
+        if hb_calls["n"] >= 3:
+            raise KeyboardInterrupt
+        return real_hb(inflight_arg)
+    rtc._post_heartbeat = _hb_bounded
+    try:
+        rtc.main()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        rtc._post_heartbeat = real_hb
+    check(hb_calls["n"] == 3, "main: one full loop iteration ran (reconcile wired)")
+
     srv.shutdown()
     if FAILS:
         print(f"\nFAILED ({len(FAILS)})"); return 1
