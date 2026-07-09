@@ -63,7 +63,8 @@ CLAUDE_CODE_OAUTH_TOKEN="test-token-001" run_persist_block "$T" >/dev/null 2>&1
 report "$?" "persist fires + writes correct token from CLAUDE_CODE_OAUTH_TOKEN"
 
 # Test 2: mode 600 enforced
-[ "$(stat -f '%Lp' "$T/.credentials.json")" = "600" ]
+# Use Python for portable mode check (stat -f '%Lp' is BSD-only; GNU stat uses -c '%a').
+[ "$(python3 -c "import stat,os; print('%o' % stat.S_IMODE(os.stat('$T/.credentials.json').st_mode))")" = "600" ]
 report "$?" "persisted .credentials.json is mode 600"
 
 # Test 3: schema is the expected claudeAiOauth shape
@@ -71,10 +72,11 @@ jq -e '.claudeAiOauth.accessToken' "$T/.credentials.json" >/dev/null 2>&1
 report "$?" "persisted file has claudeAiOauth.accessToken structure"
 
 # Test 4: idempotent — re-run with file present should NOT overwrite
-old_mtime="$(stat -f '%m' "$T/.credentials.json")"
+# Use Python for portable mtime (stat -f '%m' is BSD-only; GNU stat uses -c '%Y').
+old_mtime="$(python3 -c "import os; print(int(os.stat('$T/.credentials.json').st_mtime))")"
 sleep 1
 CLAUDE_CODE_OAUTH_TOKEN="test-token-002" run_persist_block "$T" >/dev/null 2>&1
-new_mtime="$(stat -f '%m' "$T/.credentials.json")"
+new_mtime="$(python3 -c "import os; print(int(os.stat('$T/.credentials.json').st_mtime))")"
 [ "$old_mtime" = "$new_mtime" ] && [ "$(jq -r .claudeAiOauth.accessToken "$T/.credentials.json")" = "test-token-001" ]
 report "$?" "idempotent — re-run preserves original token, no overwrite"
 
