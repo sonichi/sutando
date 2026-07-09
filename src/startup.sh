@@ -625,6 +625,23 @@ else
   echo "  ✓ web client (already running)"
 fi
 
+# 2b. Tailnet HTTPS front for browser wss:// voice reach (opt-in).
+# When SUTANDO_TAILNET_SERVE is on, front the webUI with `tailscale serve` so a
+# browser on another device on your tailnet can open wss:// to the /ws proxy
+# (plain ws:// to a non-localhost host is blocked as mixed content from an HTTPS
+# page). Best-effort: a missing prerequisite (tailscale down, HTTPS not enabled
+# for the tailnet) must NOT fail startup — the helper prints its own diagnostics
+# to the log. `tailscale serve --bg` is idempotent, so re-running each boot is
+# safe. Pairs with SUTANDO_LAN_SHARE=1 (which the helper reminds you to set).
+if [[ "${SUTANDO_TAILNET_SERVE:-}" =~ ^(1|true|yes|on)$ ]]; then
+  echo "  Fronting webUI with tailscale serve (SUTANDO_TAILNET_SERVE on)..."
+  if bash "$REPO/scripts/tailscale-serve-voice.sh" >> "$LOGS_DIR/tailscale-serve.log" 2>&1; then
+    echo "  ✓ tailscale serve (browser wss:// tailnet reach)"
+  else
+    echo "  ⚠ tailscale serve skipped — see $LOGS_DIR/tailscale-serve.log"
+  fi
+fi
+
 # 3. Dashboard (port 7844)
 reap_wedged_listener 7844 dashboard
 if ! lsof -i :7844 > /dev/null 2>&1; then
@@ -816,7 +833,13 @@ if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channel
   # Map legacy AG2_REMOTE_* → REMOTE_TASK_* (the names the bridge reads). The
   # legacy token may be the combined "url|secret" form, which the bridge splits.
   REMOTE_TASK_TOKEN="${REMOTE_TASK_TOKEN:-${AG2_REMOTE_TOKEN:-}}"
-  REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-${AG2_REMOTE_TIER:-team}}"
+  # Default tier is "owner" for the personal-agent model (2026-07-08): a user's
+  # own gateway authenticates with their own owner bearer and the broker
+  # owner-scopes every pull, so its tasks are the owner's own (e.g. voice
+  # delegations). Must match the bridge's own default — otherwise startup.sh
+  # would export a value and the bridge's default never fires. A shared /
+  # multi-user gateway sets REMOTE_TASK_TIER=team explicitly.
+  REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-${AG2_REMOTE_TIER:-owner}}"
   export REMOTE_TASK_TOKEN REMOTE_TASK_TIER
   if ! pgrep -f "remote-gateway-bridge" > /dev/null 2>&1; then
     python3 "$REPO/src/remote-gateway-bridge.py" > "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &

@@ -17,6 +17,8 @@ does the privileged Matrix ops + authoritative membership enforcement.
 | `send <room> <path>` | outbound file/image upload | discord outbound `[file:]` |
 | `react <room> <event>` | add an `m.reaction` (ack) | discord `add_reaction` (👀/✅) |
 | `unreact <room> <event>` | remove the agent's reaction | discord remove-on-reply |
+| `join <room>` | accept the agent's own pending invite | discord guild-join on invite |
+| `doc get\|put\|rm <room>` | read/write/delete the room's shared vault docs (context, todo, memos — or any agent-defined folder) | the durable-state half: like a pinned channel wiki the bot can edit |
 
 ```bash
 python3 skills/agent-room-ops/room_ops.py read   '!room:hs' --limit 20 --agent '@a:hs'
@@ -24,7 +26,17 @@ python3 skills/agent-room-ops/room_ops.py fetch  'mxc://hs/abc' --room '!room:hs
 python3 skills/agent-room-ops/room_ops.py send   '!room:hs' /tmp/pic.png --caption 'fig 1' --agent '@a:hs'
 python3 skills/agent-room-ops/room_ops.py react  '!room:hs' '$evt' --ack received --agent '@a:hs'
 python3 skills/agent-room-ops/room_ops.py unreact '!room:hs' '$evt' --ack received --agent '@a:hs'
+python3 skills/agent-room-ops/room_ops.py join   '!room:hs' --agent '@a:hs'
+python3 skills/agent-room-ops/room_ops.py doc get '!room:hs' --folder room-todo --name TODO.md --agent '@a:hs'
+python3 skills/agent-room-ops/room_ops.py doc put '!room:hs' --folder room-memo --name note.md --file /tmp/note.md --agent '@a:hs'
+python3 skills/agent-room-ops/room_ops.py doc rm  '!room:hs' --folder room-memo --name note.md --agent '@a:hs'
 ```
+
+`join` accepts the agent's **own** pending invite (owner-directed self-accept —
+the counterpart to the box-side invite-supervision auto-join, which only fires
+when the owner joins). Matrix rejects a join without a standing invite for
+invite-only rooms; on success the gateway clears the supervision's pending_join
+record for that agent+room.
 
 Every tool prints a structured JSON result and **exits 0** for any structured
 result (a graceful `ok:false` "no context / no-op" is not a failed task); usage

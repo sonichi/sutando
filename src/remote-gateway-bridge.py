@@ -57,6 +57,7 @@ from pathlib import Path
 # src/ and pointed outside the repo).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
+import local_task_protocol  # noqa: E402
 
 WS = resolve_workspace()
 TASKS_DIR = WS / "tasks"
@@ -108,15 +109,35 @@ _TASK_FIELDS = ("id", "timestamp", "task", "source", "channel_id",
                 # them (absent for other sources); each newline-stripped by
                 # _one_line so a room/display name can't forge an extra line.
                 "room_name", "sender_name", "reply_to_event", "reply_to_me",
-                "source_message_id", "user_id", "priority")
+                "source_message_id", "user_id", "priority", "interaction_type")
+
+# Interaction-plane vocabulary (interaction-planes refactor step 1). Remote
+# values outside this set degrade to "message" rather than passing through.
+_INTERACTION_TYPES = frozenset({
+    "message", "realtime_audio", "realtime_video",
+    "tool_initiated", "system_event", "self_reflective",
+})
 
 # Trust tier is a LOCAL decision (review 2026-06-13): the gateway is outside
-# this machine's trust boundary, so its access_tier claim is ignored. The
-# tier written to every task file comes from REMOTE_TASK_TIER in .env —
-# default "team" (sandboxed processing). Operators who own their gateway can
-# explicitly set REMOTE_TASK_TIER=owner.
-LOCAL_TIER = (_env_compat("REMOTE_TASK_TIER", "AG2_REMOTE_TIER") or "team").strip().lower()
+# this machine's trust boundary, so a task's SELF-CLAIMED access_tier is
+# ignored. The tier written to every task file comes from REMOTE_TASK_TIER.
+#
+# Default is "owner" for the personal-agent model (2026-07-08): a user runs
+# their OWN gateway authenticated with their OWN owner bearer, and the broker
+# OWNER-SCOPES every pull (per-agent bearer; caller-owner == target-owner), so
+# this gateway can ONLY ever receive its owner's own tasks — e.g. a voice-call
+# delegation from the user's own cloud agent. The trust therefore derives from
+# the broker's owner-scoping, NOT from trusting the gateway process or the
+# task's claim. The previous "team" default made a user's own voice
+# delegations look untrusted, so a hardened core (correctly, given the signal)
+# refused them.
+# ESCAPE HATCH: a SHARED / multi-user gateway — one that could pull tasks NOT
+# scoped to a single owner — MUST set REMOTE_TASK_TIER=team (or other).
+LOCAL_TIER = (_env_compat("REMOTE_TASK_TIER", "AG2_REMOTE_TIER") or "owner").strip().lower()
 if LOCAL_TIER not in ("owner", "team", "other"):
+    # An INVALID value (e.g. a typo "owenr") fails CLOSED to "team" — NEVER
+    # silently grant owner on a misconfiguration. Only the UNSET case defaults to
+    # "owner" (the `or "owner"` above — the explicit personal-agent model).
     LOCAL_TIER = "team"
 
 # ── inbound media fetch (owner screenshots, file uploads) ────────────────────
@@ -385,10 +406,15 @@ def _download_bytes(url: str, headers: dict, cap: int) -> bytes:
     return data
 
 
-def _maybe_fetch_media(body: str) -> str:
+def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
     """If `body` carries a media marker, download the attachment to a local
     file and rewrite the marker to `[File attached: <path>]`. Returns the body
-    unchanged on any failure (drop-in safe)."""
+    unchanged on any failure (drop-in safe).
+
+    When `_refs_out` is provided and a fetch succeeds, the corresponding
+    `AttachmentRef` (interaction-model 4D, step 1.5) is appended to it — so
+    _write_task can stamp structured `attachments:` headers alongside the legacy
+    body line, without disturbing any of the drop-in-safe early returns."""
     m = MEDIA_MARKER_RE.search(body or "")
     if not m:
         return body
@@ -448,6 +474,9 @@ def _maybe_fetch_media(body: str) -> str:
         _log(f"media save failed ({e}) — leaving marker as-is")
         return body
     _log(f"fetched media → {path} ({len(data)} bytes)")
+    if _refs_out is not None:
+        _refs_out.append(local_task_protocol.AttachmentRef(
+            locator=str(path), mime=mime, filename=(name or path.name), size=len(data)))
     label = "Photo attached" if str(kind) == "m.image" else "File attached"
     # Replacement as a FUNCTION so backslashes/`\g<>` in the path can never be
     # interpreted as re.sub group references.
@@ -524,11 +553,40 @@ def _write_task(task: dict) -> str | None:
     for f in _TASK_FIELDS:
         if f == "source":
             lines.append(f"source: {_one_line(task.get('source') or PROVIDER)}")
+        elif f == "interaction_type":
+            # Pass through when the gateway sends it; default to "message" —
+            # all current gateway traffic is Matrix room messages. Whitelisted:
+            # the gateway is outside the trust boundary, so an unknown value
+            # degrades to the default instead of landing verbatim in the file.
+            it = str(task.get("interaction_type") or "")
+            if it not in _INTERACTION_TYPES:
+                it = "message"
+            lines.append(f"interaction_type: {it}")
         elif f == "task" and task.get("task") not in (None, ""):
             # Resolve an inbound media marker to a local file the core can read.
-            lines.append(f"task: {_one_line(_maybe_fetch_media(str(task['task'])))}")
+            _media_refs: list = []
+            _fetched = _maybe_fetch_media(str(task["task"]), _media_refs)
+            lines.append(f"task: {_one_line(_fetched)}")
+            # interaction-model 4D, step 1.5: if a media marker was fetched,
+            # stamp structured attachments[]/content_modalities/media_form
+            # alongside the legacy [File attached:] body line (dual-write) via the
+            # shared local_task_protocol helper — same shape the 3 message bridges
+            # emit. has_text = caption present beyond the provider prefix + marker.
+            if _media_refs:
+                _txt = re.sub(r"\[(?:File|Photo) attached: [^\]]*\]", "", _fetched).strip()
+                if _txt.startswith("[") and "]" in _txt:
+                    _txt = _txt.split("]", 1)[1]
+                _mh = local_task_protocol.media_attachment_headers(_media_refs, bool(_txt.strip()))
+                if _mh:
+                    lines.extend(_mh.rstrip("\n").split("\n"))
         elif f in task and task[f] not in (None, ""):
             lines.append(f"{f}: {_one_line(task[f])}")
+    # (A gateway-written `provenance:` trust signal was considered here but
+    # dropped: the trusted task parser only promotes KNOWN_HEADER_KEYS, so an
+    # unknown `provenance:` field would land in the body as a no-op. Threading a
+    # real trusted-provenance signal end-to-end — header vocabulary + guard +
+    # a consumer that makes the trust decision — is a separate change. The
+    # substantive delegation-trust fix here is the owner-tier default above.)
     # access_tier is a LOCAL decision and written LAST so it wins even under a
     # last-occurrence parser; every other field is newline-stripped so none can
     # forge an earlier one either.

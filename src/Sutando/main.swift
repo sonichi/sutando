@@ -234,7 +234,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem.button {
-            let avatarPath = repoRoot + "/assets/stand-avatar.png"
+            let avatarPath = workspace + "/assets/stand-avatar.png"
             if let image = NSImage(contentsOfFile: avatarPath) {
                 image.size = NSSize(width: 18, height: 18)
                 image.isTemplate = false
@@ -647,9 +647,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // first so the chip reflects THIS host's questions, not a stale flat-root copy.
         let pqPath = perHostPath("pending-questions.md")
         if let pq = try? String(contentsOfFile: pqPath, encoding: .utf8) {
-            // Skip the leading "# Memory" or similar h1, find first h2.
+            // Skip h1 and [RESOLVED] h2s; latch onto the first open h2.
             for line in pq.split(separator: "\n") {
-                if line.hasPrefix("## ") {
+                if line.hasPrefix("## ") && !line.hasPrefix("## [RESOLVED]") {
                     let title = String(line.dropFirst(3))
                     let preview = title.count > 60 ? String(title.prefix(57)) + "..." : title
                     chips.append(["label": "Pending: \(preview)", "desc": "Resolve in pending-questions.md"])
@@ -915,7 +915,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Composited onto the top-right corner of the 18×18 avatar so the
     /// menu bar continuously signals mode without taking an extra slot.
     func avatarImage(presenterActive: Bool, meetingActive: Bool = false) -> NSImage? {
-        let avatarPath = repoRoot + "/assets/stand-avatar.png"
+        let avatarPath = workspace + "/assets/stand-avatar.png"
         guard let base = NSImage(contentsOfFile: avatarPath) else { return nil }
         base.size = NSSize(width: 18, height: 18)
         base.isTemplate = false
@@ -1946,6 +1946,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         id: task-\(ts)
         timestamp: \(ISO8601DateFormatter().string(from: Date()))
         source: context-drop
+        interaction_type: system_event
         task: User dropped context via hotkey. Process this:
         \(content)
         """

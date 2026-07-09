@@ -117,6 +117,27 @@ def main() -> int:
     os.environ["REMOTE_TASK_URL"] = f"http://127.0.0.1:{port}"
     os.environ["REMOTE_TASK_TOKEN"] = "testtoken"
     os.environ["REMOTE_TASK_PROVIDER"] = "remote-gateway"
+    # Default tier (REMOTE_TASK_TIER unset) is now "owner" for the personal-agent
+    # model — the gateway authenticates with the owner's own bearer and the broker
+    # owner-scopes pulls, so its tasks are the owner's own. Verify with a fresh
+    # import BEFORE we pin "team" below.
+    os.environ.pop("REMOTE_TASK_TIER", None)
+    os.environ.pop("AG2_REMOTE_TIER", None)
+    _dspec = importlib.util.spec_from_file_location("rtc_default", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+    _drtc = importlib.util.module_from_spec(_dspec)
+    _dspec.loader.exec_module(_drtc)
+    check(_drtc.LOCAL_TIER == "owner",
+          "default LOCAL_TIER=owner when REMOTE_TASK_TIER unset (personal-agent model)")
+    # An INVALID value must fail CLOSED to "team" — never silently grant owner on
+    # a typo; only an unset/explicit config grants owner.
+    os.environ["REMOTE_TASK_TIER"] = "owenr"  # typo
+    _ispec = importlib.util.spec_from_file_location("rtc_invalid", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+    _irtc = importlib.util.module_from_spec(_ispec)
+    _ispec.loader.exec_module(_irtc)
+    check(_irtc.LOCAL_TIER == "team",
+          "invalid REMOTE_TASK_TIER fails CLOSED to team (never silently owner)")
+    os.environ.pop("REMOTE_TASK_TIER", None)
+
     # Pin the tier so LOCAL_TIER is deterministic. Without this the module reads
     # the host's ambient REMOTE_TASK_TIER (e.g. "owner" on the owner's own node),
     # and the access_tier-clamp + newline-forge assertions — which expect the

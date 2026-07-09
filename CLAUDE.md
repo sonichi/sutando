@@ -101,6 +101,7 @@ id: task-chat-${_ts}
 timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 task: <concise description of what you're doing>
 source: chat
+interaction_type: message
 channel_id: local-chat
 user_id: ${SUTANDO_DM_OWNER_ID:-chat-local}
 access_tier: owner
