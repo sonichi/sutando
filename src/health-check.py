@@ -1443,7 +1443,10 @@ def run_all_checks() -> list[dict]:
         pgrep_status, pids = _resolve_menu_bar_pgrep(pgrep_status, pids)
 
         if pgrep_status == "ok-running" and pids:
-            check = {"name": "sutando-app", "status": "ok",
+            # pragma: no cover — reachable only when pgrep finds the macOS
+            # menu-bar app (never on ubuntu CI); detail derivation is covered
+            # at helper level in health-check-sutando-app-hotkeys.test.py.
+            check = {"name": "sutando-app", "status": "ok",  # pragma: no cover
                      "detail": sutando_app_hotkey_detail(WORKSPACE_DIR)}
             # Staleness check is meaningful only in the dev workflow — the
             # .app binary and bundled main.swift share a build mtime, so a
