@@ -474,6 +474,15 @@ def main() -> int:
           "reconcile: first sighting only suspects (no drop yet)")
     check("task-PEND" not in s1 and "task-RDY" not in s1,
           "reconcile: pending task file / waiting result exempt from suspicion")
+    # a task claimed by a core (multi-core rename, claim_task.py #884) is
+    # ACTIVE, not abandoned — must never be suspected while the claim exists
+    (rtc.TASKS_DIR / "task-CLAIMED.claimed-core-2.txt").write_text("being worked")
+    inflight.add("task-CLAIMED")
+    s_c = rtc._reconcile_abandoned(inflight, {"task-CLAIMED"})
+    check("task-CLAIMED" in inflight and "task-CLAIMED" not in s_c,
+          "reconcile: claimed task exempt (long-running work not dropped)")
+    (rtc.TASKS_DIR / "task-CLAIMED.claimed-core-2.txt").unlink()
+    inflight.discard("task-CLAIMED")
     s2 = rtc._reconcile_abandoned(inflight, s1)
     check("task-GONE" not in inflight and s2 == set(),
           "reconcile: second sighting drops the id and clears suspects")
