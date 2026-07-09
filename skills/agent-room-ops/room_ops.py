@@ -87,10 +87,15 @@ def _main(argv):
             res = _doc.doc_get(a.room, folder=a.folder, name=a.name, agent_mxid=a.agent)
         elif a.action == "put":
             import sys as _sys
-            content = open(a.file).read() if a.file else _sys.stdin.read()
-            res = _doc.doc_put(a.room, content, folder=a.folder,
-                               name=a.name or "CONTEXT.md", message=a.message,
-                               agent_mxid=a.agent)
+            try:
+                content = open(a.file).read() if a.file else _sys.stdin.read()
+            except (OSError, UnicodeDecodeError) as e:
+                content = None
+                res = {"ok": False, "reason": f"cannot read --file {a.file}: {e}"}
+            if content is not None:
+                res = _doc.doc_put(a.room, content, folder=a.folder,
+                                   name=a.name or "CONTEXT.md", message=a.message,
+                                   agent_mxid=a.agent)
         else:
             if not a.name:
                 res = {"ok": False, "reason": "--name is required for rm"}

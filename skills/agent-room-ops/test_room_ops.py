@@ -2,6 +2,8 @@
 """Tests for the room-ops collection — shared gate, the read/media/react modules,
 and the unified room_ops CLI dispatcher. No network."""
 import base64
+import contextlib
+import io
 import json
 import os
 import sys
@@ -326,6 +328,17 @@ class CliTests(EnvCase):
 
     def test_join_exits_zero_on_no_gateway(self):
         self.assertEqual(room_ops._main(["join", ROOM, "--agent", HS]), 0)
+
+    def test_doc_put_missing_file_structured_error(self):
+        # P2 (PR #2050 review): --file read failure must yield the structured
+        # ok:false envelope, not a traceback.
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc_ = room_ops._main(["doc", "put", ROOM, "--file", "/nope/missing.md", "--agent", HS])
+        self.assertEqual(rc_, 0)
+        res = json.loads(buf.getvalue())
+        self.assertFalse(res["ok"])
+        self.assertIn("cannot read --file", res["reason"])
 
 
 class GatewayTokenOnboardingTests(EnvCase):
