@@ -1,9 +1,9 @@
 {
   "name": "obsidian-vault",
   "version": "1.0.0",
-  "owner": "sonichi/sutando",
+  "owner": "github:sonichi/sutando",
   "license": "MIT",
-  "stability": "stable",
+  "stability": "experimental",
   "access_tier": "owner",
   "enabled": true,
   "description": "Capture notes, tasks, and thoughts into a Sutando-owned Obsidian vault at <workspace>/obsidian-vault. Voice-inline tool writes directly to the filesystem \u2014 Obsidian picks up changes instantly. No Obsidian plugin required.",
@@ -12,5 +12,8 @@
     "filesystem": "read-write",
     "secrets": "none"
   },
-  "tools": "./tools.ts"
+  "tools": "./tools.ts",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
 }

@@ -1,12 +1,12 @@
 {
   "name": "zoom",
   "version": "1.0.0",
-  "owner": "sonichi/sutando",
+  "owner": "github:sonichi/sutando",
   "license": "MIT",
-  "stability": "stable",
+  "stability": "experimental",
   "access_tier": "owner",
   "enabled": true,
-  "description": "Zoom meeting control for the voice/phone agents \u2014 contributes the `summon` (join + screen share), `dismiss` (leave meeting), and `join_zoom` (join with computer audio, no share) inline tools. Manifest-loaded so core stays free of a compile-time dependency on this skill (#976 conformance).",
+  "description": "Zoom meeting control for the voice/phone agents \u2014 contributes the summon (join + screen share), dismiss (leave meeting), and join_zoom (join with computer audio, no share) inline tools. Manifest-loaded so core stays free of a compile-time dependency on this skill (#976 conformance).",
   "permissions": {
     "network": true,
     "filesystem": "read-write",
@@ -15,5 +15,8 @@
   "tools": "./tools.ts",
   "config": {
     "ZOOM_DEFAULT_SHARE_SCREEN": "true"
+  },
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
   }
 }

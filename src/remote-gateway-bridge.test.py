@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit test for src/remote-relay-bridge.py against an in-process mock relay.
+"""Unit test for src/remote-gateway-bridge.py against an in-process mock gateway.
 
 CI-safe: spins up a localhost HTTP stub, no external network/deps. Exits 0 on
 pass, 1 on fail.
@@ -8,13 +8,14 @@ Covers: task pull → local file write (correct schema + atomic), task ack,
 heartbeat, result file → POST back (correct payload + auth header),
 idempotent re-write, auth rejection.
 
-Run: python3 src/remote-relay-bridge.test.py
+Run: python3 src/remote-gateway-bridge.test.py
 """
 from __future__ import annotations
 
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -30,12 +31,12 @@ def check(cond: bool, msg: str) -> None:
         FAILS.append(msg)
 
 
-# ── mock relay ────────────────────────────────────────────────────────────
+# ── mock gateway ────────────────────────────────────────────────────────────
 STATE = {"tasks_served": 0, "results": [], "acks": [], "heartbeats": [],
          "auth_seen": [], "force_401": False, "force_ack_404": False,
-         "force_heartbeat_404": False}
+         "force_heartbeat_404": False, "force_media_redirect": False}
 TASK = {"id": "task-MOCK1", "timestamp": "2026-05-23T00:00:00Z",
-        "task": "hello from relay", "source": "remote-relay",
+        "task": "hello from gateway", "source": "remote-gateway",
         "channel_id": "!room:example.org", "user_id": "@qingyun:example.org",
         "access_tier": "owner", "priority": "normal"}
 
@@ -54,6 +55,12 @@ class Handler(BaseHTTPRequestHandler):
         if not self._auth_ok():
             return
         # first poll returns the task; later polls return empty
+        if self.path.startswith("/media/redir"):
+            if STATE["force_media_redirect"]:
+                self.send_response(302)
+                self.send_header("Location", "http://evil.example/steal")
+                self.end_headers(); return
+            self.send_response(200); self.end_headers(); self.wfile.write(b"OK"); return
         if self.path.startswith("/v1/tasks"):
             tasks = [TASK] if STATE["tasks_served"] == 0 else []
             STATE["tasks_served"] += 1
@@ -109,7 +116,28 @@ def main() -> int:
     Path(tmp, ".build_log-migrated").touch()
     os.environ["REMOTE_TASK_URL"] = f"http://127.0.0.1:{port}"
     os.environ["REMOTE_TASK_TOKEN"] = "testtoken"
-    os.environ["REMOTE_TASK_PROVIDER"] = "remote-relay"
+    os.environ["REMOTE_TASK_PROVIDER"] = "remote-gateway"
+    # Default tier (REMOTE_TASK_TIER unset) is now "owner" for the personal-agent
+    # model — the gateway authenticates with the owner's own bearer and the broker
+    # owner-scopes pulls, so its tasks are the owner's own. Verify with a fresh
+    # import BEFORE we pin "team" below.
+    os.environ.pop("REMOTE_TASK_TIER", None)
+    os.environ.pop("AG2_REMOTE_TIER", None)
+    _dspec = importlib.util.spec_from_file_location("rtc_default", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+    _drtc = importlib.util.module_from_spec(_dspec)
+    _dspec.loader.exec_module(_drtc)
+    check(_drtc.LOCAL_TIER == "owner",
+          "default LOCAL_TIER=owner when REMOTE_TASK_TIER unset (personal-agent model)")
+    # An INVALID value must fail CLOSED to "team" — never silently grant owner on
+    # a typo; only an unset/explicit config grants owner.
+    os.environ["REMOTE_TASK_TIER"] = "owenr"  # typo
+    _ispec = importlib.util.spec_from_file_location("rtc_invalid", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+    _irtc = importlib.util.module_from_spec(_ispec)
+    _ispec.loader.exec_module(_irtc)
+    check(_irtc.LOCAL_TIER == "team",
+          "invalid REMOTE_TASK_TIER fails CLOSED to team (never silently owner)")
+    os.environ.pop("REMOTE_TASK_TIER", None)
+
     # Pin the tier so LOCAL_TIER is deterministic. Without this the module reads
     # the host's ambient REMOTE_TASK_TIER (e.g. "owner" on the owner's own node),
     # and the access_tier-clamp + newline-forge assertions — which expect the
@@ -118,7 +146,7 @@ def main() -> int:
 
     # import the hyphenated module by path (env must be set first — module reads
     # config + resolves workspace at import time)
-    spec = importlib.util.spec_from_file_location("rtc", Path(__file__).resolve().parent / "remote-relay-bridge.py")
+    spec = importlib.util.spec_from_file_location("rtc", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
     rtc = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(rtc)
 
@@ -129,8 +157,8 @@ def main() -> int:
     tfile = rtc.TASKS_DIR / "task-MOCK1.txt"
     check(tfile.exists(), "task file written")
     content = tfile.read_text() if tfile.exists() else ""
-    check("task: hello from relay" in content, "task body serialized")
-    check("source: remote-relay" in content, "source field carried")
+    check("task: hello from gateway" in content, "task body serialized")
+    check("source: remote-gateway" in content, "source field carried")
     check("access_tier: team" in content and "access_tier: owner" not in content,
           "access_tier CLAMPED to local default (wire said owner — never trusted)")
     # context enrichment: room_name / sender_name / reply_to_* serialize when
@@ -153,9 +181,9 @@ def main() -> int:
           "heartbeat POSTed")
     if STATE["heartbeats"]:
         h = STATE["heartbeats"][0]
-        check(h.get("client") == "sutando-relay-client"
+        check(h.get("client") == "sutando-gateway-client"
               and h.get("protocol_version") == 1
-              and h.get("provider") == "remote-relay"
+              and h.get("provider") == "remote-gateway"
               and h.get("tier") == "team"
               and h.get("inflight") == 2
               and "task-ack" in h.get("capabilities", []),
@@ -213,7 +241,7 @@ def main() -> int:
     check("status" not in hb3 and "step" not in hb3,
           "malformed core-status → heartbeat omits status/step (liveness-only)")
 
-    # Backwards compatibility: old relays that only implement pull/results can
+    # Backwards compatibility: old gateways that only implement pull/results can
     # 404 optional protocol extensions; the client disables them and continues.
     STATE["force_ack_404"] = True
     rtc._ack_disabled = False
@@ -238,14 +266,14 @@ def main() -> int:
     tier_lines = [ln for ln in flines if ln.startswith("access_tier:")]
     check(tier_lines == ["access_tier: team"],
           "newline in field cannot forge a second access_tier line")
-    # Minor — no-send / deduped markers are archived, never POSTed to the relay
+    # Minor — no-send / deduped markers are archived, never POSTed to the gateway
     _before = len(STATE["results"])
     (rtc.RESULTS_DIR).mkdir(parents=True, exist_ok=True)
     (rtc.RESULTS_DIR / "task-MARK.txt").write_text("[no-send]\n")
     rtc._post_ready_results({"task-MARK"})
     check(len(STATE["results"]) == _before
           and not (rtc.RESULTS_DIR / "task-MARK.txt").exists(),
-          "[no-send] marker archived, not POSTed to relay")
+          "[no-send] marker archived, not POSTed to gateway")
 
     # 2. idempotent: re-writing the same task doesn't duplicate / error
     before = content
@@ -298,6 +326,27 @@ def main() -> int:
         check(r.get("id") == "task-MOCK1" and r.get("body") == "the reply",
               "result payload correct (id + body)")
     check(not (rtc.RESULTS_DIR / "task-MOCK1.txt").exists(), "result file archived after POST")
+    check(not (rtc.TASKS_DIR / "task-MOCK1.txt").exists()
+          and (rtc.TASKS_DIR / "archive" / "task-MOCK1.txt").exists(),
+          "task file archived alongside the delivered result (no tasks/ pile-up)")
+    # archive collision is best-effort: rename onto an occupied path (a dir
+    # squatting on the destination) must not raise or block delivery
+    (rtc.RESULTS_DIR / "task-COLL.txt").write_text("reply\n")
+    (rtc.TASKS_DIR / "task-COLL.txt").write_text("task body\n")
+    (rtc.TASKS_DIR / "archive" / "task-COLL.txt").mkdir(parents=True)
+    rtc._post_ready_results({"task-COLL"})
+    check(not (rtc.RESULTS_DIR / "task-COLL.txt").exists()
+          and (rtc.TASKS_DIR / "task-COLL.txt").exists(),
+          "archive rename failure is swallowed (result still delivered, task file left in place)")
+    # claimed-task shape (review repro): the core renames a queued task to
+    # task-<id>.claimed-core-N.txt while processing — delivery must archive
+    # THAT file, not just the bare name, or health-check keeps counting it
+    (rtc.RESULTS_DIR / "task-CLAIMED.txt").write_text("reply\n")
+    (rtc.TASKS_DIR / "task-CLAIMED.claimed-core-1.txt").write_text("task body\n")
+    rtc._post_ready_results({"task-CLAIMED"})
+    check(not (rtc.TASKS_DIR / "task-CLAIMED.claimed-core-1.txt").exists()
+          and (rtc.TASKS_DIR / "archive" / "task-CLAIMED.txt").exists(),
+          "claimed-shape task file archived under the bare name after delivery")
 
     # 3b. inflight persistence (restart-safety): a pulled task's id survives a
     # restart so its result still gets POSTed, and is cleared after delivery.
@@ -323,6 +372,173 @@ def main() -> int:
         check(False, "401 raises HTTPError")
     except urllib.error.HTTPError as e:
         check(e.code == 401, "401 raises HTTPError")
+
+    # 6. inbound media marker → local file rewrite (network mocked)
+    fetched = []
+    real_download = rtc._download_bytes
+    rtc._download_bytes = lambda url, headers, cap: (fetched.append((url, dict(headers))) or b"PNGBYTES")
+    body = rtc._maybe_fetch_media(
+        f"[{rtc.MEDIA_MARKER_TAG}: {os.environ['REMOTE_TASK_URL']}/media/abc "
+        "mime=image/png name=shot.png kind=m.image] look at this")
+    check("[Photo attached: " in body and body.endswith("look at this"),
+          "media marker rewritten to local Photo-attached path")
+    saved = re.search(r"\[Photo attached: ([^\]]+)\]", body)
+    check(bool(saved) and Path(saved.group(1)).read_bytes() == b"PNGBYTES",
+          "media bytes written to the local file")
+    check(bool(fetched) and fetched[0][1].get("Authorization") == "Bearer testtoken",
+          "gateway-hosted media fetched with the gateway bearer")
+    # matrix media URL without an HS token → marker left untouched
+    body2 = rtc._maybe_fetch_media(
+        f"[{rtc.MEDIA_MARKER_TAG}: https://hs.example/_matrix/media/v3/download/hs/xyz mime=image/png name=a.png]")
+    check(f"[{rtc.MEDIA_MARKER_TAG}:" in body2, "matrix media without HS token leaves marker untouched")
+    # non-http URL → untouched (no fetch attempted)
+    n_before = len(fetched)
+    body3 = rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: file:///etc/passwd name=x]")
+    check(f"[{rtc.MEDIA_MARKER_TAG}:" in body3 and len(fetched) == n_before,
+          "non-http media URL is never fetched")
+    # download failure → drop-in safe (marker untouched)
+    rtc._download_bytes = lambda *a, **kw: (_ for _ in ()).throw(ValueError("boom"))
+    body4 = rtc._maybe_fetch_media(
+        f"[{rtc.MEDIA_MARKER_TAG}: {os.environ['REMOTE_TASK_URL']}/media/dead name=d.bin]")
+    check(f"[{rtc.MEDIA_MARKER_TAG}:" in body4, "failed media fetch leaves marker untouched")
+    rtc._download_bytes = real_download
+
+    # 6b. credential ROUTING is exact-origin, never prefix/substring
+    #     (review 2026-07-03: lookalike hosts must not receive bearers)
+    fetched.clear()
+    rtc._download_bytes = lambda url, headers, cap: (fetched.append((url, dict(headers))) or b"X")
+    gw = os.environ["REMOTE_TASK_URL"]  # http://127.0.0.1:<port>
+    rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: http://127.0.0.1.evil.example/media/p name=a.bin]")
+    check(bool(fetched) and "Authorization" not in fetched[-1][1],
+          "lookalike gateway host gets NO credentials")
+    rtc.URL = "http://127.0.0.1:9/relay"
+    rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: http://127.0.0.1:9/relay-evil/p name=a.bin]")
+    check("Authorization" not in fetched[-1][1],
+          "gateway base-path boundary enforced (/relay-evil gets no bearer)")
+    rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: http://127.0.0.1:9/relay/media/p name=a.bin]")
+    check(fetched[-1][1].get("Authorization") == "Bearer testtoken",
+          "true gateway-hosted path still gets the gateway bearer")
+    rtc.URL = gw
+    rtc.HS_MEDIA_TOKEN = "syt_hs"
+    rtc.HS_MEDIA_ORIGIN = "https://hs.good.example"
+    n = len(fetched)
+    b = rtc._maybe_fetch_media(
+        f"[{rtc.MEDIA_MARKER_TAG}: https://evil.example/_matrix/media/v3/download/hs/id name=a.png]")
+    check(f"[{rtc.MEDIA_MARKER_TAG}:" in b and len(fetched) == n,
+          "foreign matrix host: HS bearer NOT sent, marker untouched")
+    b = rtc._maybe_fetch_media(
+        f"[{rtc.MEDIA_MARKER_TAG}: https://hs.good.example/_matrix/media/v3/download/hs/id "
+        "mime=image/png name=ok.png]")
+    check("/_matrix/client/v1/media/download/" in fetched[-1][0]
+          and fetched[-1][1].get("Authorization") == "Bearer syt_hs"
+          and "[File attached: " in b,
+          "matrix happy path: MSC3916 upgrade + HS bearer on the exact origin")
+    rtc.HS_MEDIA_TOKEN = ""
+    rtc.HS_MEDIA_ORIGIN = ""
+    rtc._download_bytes = real_download
+
+    # 6e. malformed media URLs never crash task intake (drop-in-safe)
+    #     (re-review 2026-07-03: `.port` raises ValueError at ACCESS time)
+    rtc._download_bytes = lambda url, headers, cap: b"X"
+    for bad in (f"https://127.0.0.1:bad/media/p", "https://hs.example:bad/_matrix/media/v3/download/hs/id",
+                "https://[broken/media/p"):
+        try:
+            out = rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: {bad} name=x.bin]")
+            ok = f"[{rtc.MEDIA_MARKER_TAG}:" in out
+        except Exception:
+            ok = False
+        check(ok, f"malformed media URL left untouched, no raise: {bad[:40]}")
+    rtc._download_bytes = real_download
+
+    # 6c. authed fetch: a real HTTP 302 is refused end-to-end
+    STATE["force_media_redirect"] = True
+    try:
+        rtc._download_bytes(f"{gw}/media/redir", {"Authorization": "Bearer x",
+                                                  "User-Agent": "t"}, 100)
+        check(False, "authed fetch raises on a real 302")
+    except Exception:
+        check(True, "authed fetch raises on a real 302")
+    STATE["force_media_redirect"] = False
+
+    # 6d. same-name saves in the same instant get distinct files (mkstemp)
+    rtc._download_bytes = lambda url, headers, cap: b"A"
+    b1 = rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: {gw}/m name=dup.bin]")
+    b2 = rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: {gw}/m name=dup.bin]")
+    p1 = re.search(r"\[File attached: ([^\]]+)\]", b1).group(1)
+    p2 = re.search(r"\[File attached: ([^\]]+)\]", b2).group(1)
+    check(p1 != p2 and Path(p1).exists() and Path(p2).exists(),
+          "two same-name media saves get distinct files (no overwrite)")
+    rtc._download_bytes = real_download
+
+    # 7. owner-activity gate follows LOCAL_TIER, not the gateway's tier claim
+    act = rtc.OWNER_ACTIVITY_FILE
+    act.unlink(missing_ok=True)
+    rtc._write_owner_activity({"task": "[X @u] hi there", "source": "remote-gateway",
+                               "access_tier": "owner"})
+    check(not act.exists(),
+          "LOCAL_TIER=team → owner-activity NOT written even if wire claims owner")
+    rtc.LOCAL_TIER = "owner"
+    rtc._write_owner_activity({"task": "[X @u] hi there", "source": "remote-gateway"})
+    data = json.loads(act.read_text()) if act.exists() else {}
+    check(data.get("summary") == "hi there" and data.get("channel") == "remote-gateway",
+          "LOCAL_TIER=owner → owner-activity written with stripped summary")
+    rtc.LOCAL_TIER = "team"
+
+    # 8. _reconcile_abandoned — two-sighting drop of stranded in-flight ids
+    rtc.TASKS_DIR.mkdir(parents=True, exist_ok=True)
+    rtc.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    (rtc.TASKS_DIR / "task-PEND.txt").write_text("still pending")
+    (rtc.RESULTS_DIR / "task-RDY.txt").write_text("result waiting")
+    inflight = {"task-GONE", "task-PEND", "task-RDY", "not!a!tid"}
+    s1 = rtc._reconcile_abandoned(inflight, set())
+    check(s1 == {"task-GONE"} and "task-GONE" in inflight,
+          "reconcile: first sighting only suspects (no drop yet)")
+    check("task-PEND" not in s1 and "task-RDY" not in s1,
+          "reconcile: pending task file / waiting result exempt from suspicion")
+    # a task claimed by a core (multi-core rename, claim_task.py #884) is
+    # ACTIVE, not abandoned — must never be suspected while the claim exists
+    (rtc.TASKS_DIR / "task-CLAIMED.claimed-core-2.txt").write_text("being worked")
+    inflight.add("task-CLAIMED")
+    s_c = rtc._reconcile_abandoned(inflight, {"task-CLAIMED"})
+    check("task-CLAIMED" in inflight and "task-CLAIMED" not in s_c,
+          "reconcile: claimed task exempt (long-running work not dropped)")
+    (rtc.TASKS_DIR / "task-CLAIMED.claimed-core-2.txt").unlink()
+    inflight.discard("task-CLAIMED")
+    s2 = rtc._reconcile_abandoned(inflight, s1)
+    check("task-GONE" not in inflight and s2 == set(),
+          "reconcile: second sighting drops the id and clears suspects")
+    saved = set(json.loads(rtc.INFLIGHT_FILE.read_text()))
+    check("task-GONE" not in saved and "task-PEND" in saved,
+          "reconcile: ledger persisted on drop")
+    # a result landing between sightings rescues the id
+    inflight2 = {"task-LATE"}
+    s = rtc._reconcile_abandoned(inflight2, set())
+    (rtc.RESULTS_DIR / "task-LATE.txt").write_text("landed late")
+    s = rtc._reconcile_abandoned(inflight2, s)
+    check("task-LATE" in inflight2, "reconcile: late-landing result rescues the id")
+    (rtc.RESULTS_DIR / "task-LATE.txt").unlink()
+
+    # 9. main() one-iteration smoke — exercises the reconcile wiring in the
+    # poll loop (heartbeat → poll → results → reconcile → heartbeat), bounded
+    # by raising KeyboardInterrupt on the 3rd heartbeat (= start of round 2).
+    STATE["force_401"] = False
+    STATE["force_ack_404"] = False
+    STATE["force_heartbeat_404"] = False
+    real_hb = rtc._post_heartbeat
+    hb_calls = {"n": 0}
+    def _hb_bounded(inflight_arg):
+        hb_calls["n"] += 1
+        if hb_calls["n"] >= 3:
+            raise KeyboardInterrupt
+        return real_hb(inflight_arg)
+    rtc._post_heartbeat = _hb_bounded
+    try:
+        rtc.main()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        rtc._post_heartbeat = real_hb
+    check(hb_calls["n"] == 3, "main: one full loop iteration ran (reconcile wired)")
 
     srv.shutdown()
     if FAILS:

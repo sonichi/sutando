@@ -41,7 +41,10 @@ _AUDIO_MIME: dict[str, str] = {
 
 def _claude_config() -> Path:
     """CCD-resolved config dir (PR #1525 pattern) — never hardcode ~/.claude."""
-    return Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
+    # Mirrors util_paths.claude_home_path resolution ($CLAUDE_CONFIG_DIR ->
+    # $CLAUDE_HOME -> ~/.claude); standalone skill script, can't import src/.
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.environ.get("CLAUDE_HOME")
+    return Path(base) if base else Path.home() / ".claude"
 
 def _api_key() -> str:
     """Resolve GEMINI_API_KEY from env, then workspace .env, then bridge .envs."""

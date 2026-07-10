@@ -326,6 +326,12 @@ fi
 # still there as a fallback (mentioned in README).
 bash "$REPO/scripts/install-git-hooks.sh" >/dev/null 2>&1 || true
 
+# Wire the SessionStart hook that reminds the core agent to run /schedule-crons
+# on every session start (including post-compaction). Idempotent — safe to run
+# on every start. Crons are session-only, so without this, recurring jobs go
+# dark whenever a session restarts without an explicit /schedule-crons invocation.
+bash "$REPO/scripts/install-session-start-hook.sh" 2>&1 || true
+
 # Auto-bootstrap: create-if-missing files and dirs that the agent + skills
 # expect to exist (logs, state, tasks, results, notes, contextual-chips.json,
 # pending-questions.md, build_log.md, crons.json, …). Idempotent — safe to
@@ -625,6 +631,23 @@ else
   echo "  ✓ web client (already running)"
 fi
 
+# 2b. Tailnet HTTPS front for browser wss:// voice reach (opt-in).
+# When SUTANDO_TAILNET_SERVE is on, front the webUI with `tailscale serve` so a
+# browser on another device on your tailnet can open wss:// to the /ws proxy
+# (plain ws:// to a non-localhost host is blocked as mixed content from an HTTPS
+# page). Best-effort: a missing prerequisite (tailscale down, HTTPS not enabled
+# for the tailnet) must NOT fail startup — the helper prints its own diagnostics
+# to the log. `tailscale serve --bg` is idempotent, so re-running each boot is
+# safe. Pairs with SUTANDO_LAN_SHARE=1 (which the helper reminds you to set).
+if [[ "${SUTANDO_TAILNET_SERVE:-}" =~ ^(1|true|yes|on)$ ]]; then
+  echo "  Fronting webUI with tailscale serve (SUTANDO_TAILNET_SERVE on)..."
+  if bash "$REPO/scripts/tailscale-serve-voice.sh" >> "$LOGS_DIR/tailscale-serve.log" 2>&1; then
+    echo "  ✓ tailscale serve (browser wss:// tailnet reach)"
+  else
+    echo "  ⚠ tailscale serve skipped — see $LOGS_DIR/tailscale-serve.log"
+  fi
+fi
+
 # 3. Dashboard (port 7844)
 reap_wedged_listener 7844 dashboard
 if ! lsof -i :7844 > /dev/null 2>&1; then
@@ -666,7 +689,7 @@ fi
 # Serves the research webapp with the live (read-only) portfolio panel and keeps
 # its snapshot fresh via a background refresher daemon. No-op if not initialised.
 if [ -d "$REPO/skills/portfolio-research" ]; then
-  if [ ! -d "${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}/research/portfolio/webapp" ]; then
+  if [ ! -d "$WORKSPACE/research/portfolio/webapp" ]; then
     bash "$REPO/skills/portfolio-research/scripts/init-evergreen-webapp.sh" \
       > "$LOGS_DIR/portfolio-dashboard.log" 2>&1 || true
   fi
@@ -801,10 +824,10 @@ else
   echo "  ~ telegram bridge (no token — optional)"
 fi
 
-# Remote relay bridge (optional channel — generic, same shape as the discord/
+# Remote gateway bridge (optional channel — generic, same shape as the discord/
 # telegram/slack blocks below). Config + token live in the channel .env, resolved
 # via the same claude-home-path helper; the bridge itself ships in src/ (provider-
-# neutral, like the others). Relay protocol: docs/remote-relay-protocol.md.
+# neutral, like the others). Relay protocol: docs/remote-gateway-protocol.md.
 # Deliberately silent when unconfigured — a Sutando-only user never sees it.
 # Back-compat: also detect/honor a legacy AG2_REMOTE_* token written to the repo
 # .env by older onboarding, so existing agents keep reconnecting after this lands
@@ -816,13 +839,19 @@ if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channel
   # Map legacy AG2_REMOTE_* → REMOTE_TASK_* (the names the bridge reads). The
   # legacy token may be the combined "url|secret" form, which the bridge splits.
   REMOTE_TASK_TOKEN="${REMOTE_TASK_TOKEN:-${AG2_REMOTE_TOKEN:-}}"
-  REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-${AG2_REMOTE_TIER:-team}}"
+  # Default tier is "owner" for the personal-agent model (2026-07-08): a user's
+  # own gateway authenticates with their own owner bearer and the broker
+  # owner-scopes every pull, so its tasks are the owner's own (e.g. voice
+  # delegations). Must match the bridge's own default — otherwise startup.sh
+  # would export a value and the bridge's default never fires. A shared /
+  # multi-user gateway sets REMOTE_TASK_TIER=team explicitly.
+  REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-${AG2_REMOTE_TIER:-owner}}"
   export REMOTE_TASK_TOKEN REMOTE_TASK_TIER
-  if ! pgrep -f "remote-relay-bridge" > /dev/null 2>&1; then
-    python3 "$REPO/src/remote-relay-bridge.py" > "$LOGS_DIR/remote-relay-bridge.log" 2>&1 &
-    echo "  ✓ relay bridge"
+  if ! pgrep -f "remote-gateway-bridge" > /dev/null 2>&1; then
+    python3 "$REPO/src/remote-gateway-bridge.py" > "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
+    echo "  ✓ gateway bridge"
   else
-    echo "  ✓ relay bridge (already running)"
+    echo "  ✓ gateway bridge (already running)"
   fi
 fi
 

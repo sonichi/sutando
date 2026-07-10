@@ -31,6 +31,7 @@ function runInit(repoDir: string, mode?: '--auto' | '--preflight'): RunResult {
 			SUTANDO_WORKSPACE: join(repoDir, '.workspace'),
 			SUTANDO_TEST_MODE: '1',  // v0.8: enable env-override-in-test escape hatch
 			HOME: repoDir + '/.fake-home',
+			CLAUDE_CONFIG_DIR: join(repoDir, '.fake-home', '.claude'),
 		},
 		encoding: 'utf-8',
 	});

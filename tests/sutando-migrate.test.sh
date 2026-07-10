@@ -59,8 +59,10 @@ RUN_MIGRATE() {
     SUTANDO_MIGRATE_SRC_A="$A" \
     SUTANDO_MIGRATE_SRC_B="$B" \
     SUTANDO_MIGRATE_SRC_C="$C" \
-    SUTANDO_WORKSPACE="$DEST" \
-        bash "$MIGRATE" --respect-env "$@"
+    SUTANDO_MIGRATE_DEST="$DEST" \
+        bash "$MIGRATE" "$@"
+    # Note: SUTANDO_MIGRATE_DEST is the proper test hook (workspace resolver
+    # ignores $SUTANDO_WORKSPACE since #1440). --respect-env is not needed.
 }
 
 # Also add a stale task to source B for archive-routing assertion
@@ -87,7 +89,7 @@ echo
 echo "==== TEST: commit ===="
 COMMIT_OUT="$(RUN_MIGRATE commit --source A,B,C 2>&1)"
 echo "$COMMIT_OUT" | grep -E "Committing source|copied:|identical:|kept-dest:|sidecar:|skipped:|sentinel:|backup|COMMIT" | head -40
-INITIAL_BACKUP_ID="$(echo "$COMMIT_OUT" | grep -E "^sutando-migrate: backup" | head -1 | sed -E 's@.*migration-backup-(.+)\.tar\.gz.*@\1@')"
+INITIAL_BACKUP_ID="$(echo "$COMMIT_OUT" | grep -E "migration-backup-.*\.tar\.gz" | head -1 | sed -E 's@.*migration-backup-(.+)\.tar\.gz.*@\1@' || true)"
 
 echo
 echo "==== ASSERTIONS ===="
@@ -106,9 +108,9 @@ done
 if [ ! -f "$DEST/notes/shared.md" ]; then
     echo "  FAIL: $DEST/notes/shared.md missing"; fail=1
 else
-    # mtime should match source
-    src_mt="$(stat -f %m "$C/notes/shared.md")"
-    dst_mt="$(stat -f %m "$DEST/notes/shared.md")"
+    # mtime should match source (Python for portability — stat -f %m is BSD-only)
+    src_mt="$(python3 -c "import os; print(int(os.stat('$C/notes/shared.md').st_mtime))")"
+    dst_mt="$(python3 -c "import os; print(int(os.stat('$DEST/notes/shared.md').st_mtime))")"
     if [ "$src_mt" != "$dst_mt" ]; then
         echo "  FAIL: shared.md mtime not preserved (src=$src_mt dst=$dst_mt)"; fail=1
     else

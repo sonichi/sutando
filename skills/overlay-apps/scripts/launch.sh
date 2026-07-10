@@ -3,7 +3,7 @@
 #
 # Workspace contract: the app *source of truth* is skills/overlay-apps/app/ in
 # the repo; the *running instance* (with node_modules + any local state) lives
-# under the Sutando workspace at $SUTANDO_WORKSPACE/overlay-apps/. This script
+# under the Sutando workspace at <workspace>/overlay-apps/. This script
 # syncs source → workspace, installs deps, and starts the app.
 
 set -e
@@ -32,4 +32,8 @@ if [ ! -d node_modules ] || [ package-lock.json -nt node_modules ]; then
 fi
 
 echo "overlay-apps: launching from $APP_DIR"
+# Export the resolved workspace so the Electron process can read it without
+# re-running the config helper (the app runs from $APP_DIR, not the repo root,
+# so scripts/sutando-config.sh is not on its PATH).
+export SUTANDO_RESOLVED_WORKSPACE="$WORKSPACE"
 exec npm start
