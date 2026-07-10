@@ -6,6 +6,13 @@ Usage:
     python3 notify.py --source slack --channel-id D0B5L7X2TK2 --thread-ts 1780586204.198 --message "Still working..."
     python3 notify.py --source discord --channel-id 1234567890 --message "Working on it..."
     python3 notify.py --source telegram --chat-id 123456789 --message "On it..."
+    python3 notify.py --source <provider> --channel-id '!roomid:server' --message "On it..."
+
+Any --source other than slack/discord/telegram is treated as a remote-gateway
+channel: the sender reads channels/<source>/.env (under $CLAUDE_CONFIG_DIR) for
+REMOTE_TASK_URL + REMOTE_TASK_TOKEN and posts the message through the gateway's
+POST /v1/room {op: "message"} endpoint — the same transport the task bridge for
+that provider uses, so progress updates land in the originating room.
 
 Exits 0 on success, 1 on failure. Fail-open by design — a failed send must never
 block the task itself. The caller should always continue working regardless of exit code.
@@ -130,10 +137,34 @@ def send_telegram(chat_id: str, message: str) -> bool:
     )
 
 
+def send_remote_gateway(source: str, channel_id: str, message: str) -> bool:
+    """Generic sender for gateway-bridged channels (any --source with a
+    channels/<source>/.env carrying REMOTE_TASK_URL + REMOTE_TASK_TOKEN)."""
+    # Mirrors util_paths.claude_home_path ($CLAUDE_CONFIG_DIR -> $CLAUDE_HOME -> ~/.claude).
+    _base = os.environ.get("CLAUDE_CONFIG_DIR") or os.environ.get("CLAUDE_HOME")
+    _claude_config = Path(_base) if _base else Path.home() / ".claude"
+    env_path = _claude_config / "channels" / source / ".env"
+    env = _env_file(str(env_path))
+    url = (os.environ.get("REMOTE_TASK_URL") or env.get("REMOTE_TASK_URL", "")).rstrip("/")
+    token = _token(source, "REMOTE_TASK_TOKEN")
+    if not url or not token:
+        print(f"[task-progress] no REMOTE_TASK_URL/REMOTE_TASK_TOKEN for source '{source}' "
+              f"(looked in {env_path})", file=sys.stderr)
+        return False
+    return _post(
+        f"{url}/v1/room",
+        {"op": "message", "room_id": channel_id, "body": message},
+        {"Authorization": f"Bearer {token}",
+         # some gateway edges (CDN/WAF) reject the default Python-urllib UA
+         "User-Agent": "sutando-task-progress/1.0"},
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Send a task-progress update to a channel.")
-    parser.add_argument("--source", required=True, choices=["slack", "discord", "telegram"],
-                        help="Channel source (slack / discord / telegram)")
+    parser.add_argument("--source", required=True,
+                        help="Channel source: slack / discord / telegram, or any "
+                             "gateway-bridged provider with a channels/<source>/.env")
     parser.add_argument("--channel-id", help="Slack / Discord channel ID")
     parser.add_argument("--chat-id", help="Telegram chat ID (alias for --channel-id on telegram)")
     parser.add_argument("--thread-ts", default=None,
@@ -166,8 +197,7 @@ def main() -> int:
     elif source == "telegram":
         ok = send_telegram(channel, message)
     else:
-        print(f"[task-progress] unknown source: {source}", file=sys.stderr)
-        return 1
+        ok = send_remote_gateway(source, channel, message)
 
     return 0 if ok else 1
 

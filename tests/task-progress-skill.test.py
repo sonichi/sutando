@@ -182,6 +182,39 @@ class TestSendTelegram(unittest.TestCase):
         self.assertFalse(result)
 
 
+class TestSendRemoteGateway(unittest.TestCase):
+    def setUp(self):
+        self.mod = _load()
+
+    def test_success_posts_room_message_op(self):
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = b'{"ok": true}'
+        captured = {}
+
+        def fake_urlopen(req, timeout=10):
+            captured["url"] = req.full_url
+            captured["payload"] = json.loads(req.data)
+            return mock_resp
+
+        with patch.object(self.mod, "_token", return_value="bearer-fake"), \
+             patch.object(self.mod, "_env_file",
+                          return_value={"REMOTE_TASK_URL": "https://gw.example/relay"}), \
+             patch("urllib.request.urlopen", fake_urlopen):
+            result = self.mod.send_remote_gateway("someprovider", "!room:server", "hello")
+        self.assertTrue(result)
+        self.assertEqual(captured["url"], "https://gw.example/relay/v1/room")
+        self.assertEqual(captured["payload"],
+                         {"op": "message", "room_id": "!room:server", "body": "hello"})
+
+    def test_missing_env_returns_false(self):
+        with patch.object(self.mod, "_token", return_value=""), \
+             patch.object(self.mod, "_env_file", return_value={}):
+            result = self.mod.send_remote_gateway("someprovider", "!room:server", "hello")
+        self.assertFalse(result)
+
+
 class TestCLI(unittest.TestCase):
     def test_missing_channel_id_exits_1(self):
         r = subprocess.run(
@@ -197,13 +230,18 @@ class TestCLI(unittest.TestCase):
         )
         self.assertNotEqual(r.returncode, 0)
 
-    def test_unknown_source_rejected_by_argparse(self):
+    def test_unconfigured_gateway_source_fails_open(self):
+        # A source outside the built-ins routes to the remote-gateway sender;
+        # with no channels/<source>/.env it must fail (exit 1) with a hint —
+        # never traceback, never block.
         r = subprocess.run(
             [sys.executable, str(SCRIPT), "--source", "whatsapp",
              "--channel-id", "D123", "--message", "hi"],
             capture_output=True, text=True,
+            env={"PATH": "/usr/bin:/bin", "CLAUDE_CONFIG_DIR": "/nonexistent"},
         )
-        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("REMOTE_TASK_URL", r.stderr)
 
     def test_long_message_rejected_before_token_lookup(self):
         r = subprocess.run(
