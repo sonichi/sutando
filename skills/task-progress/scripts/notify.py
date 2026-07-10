@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.request
 from pathlib import Path
@@ -137,16 +138,38 @@ def send_telegram(chat_id: str, message: str) -> bool:
     )
 
 
+# Gateway provider names come from task files, i.e. from OUTSIDE the trust
+# boundary — a `source` like `../evil` must never become a path segment
+# (traversal reads an arbitrary .env-shaped file and posts its bearer to the
+# URL named in that same file). Safe slug only.
+_SOURCE_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
 def send_remote_gateway(source: str, channel_id: str, message: str) -> bool:
     """Generic sender for gateway-bridged channels (any --source with a
     channels/<source>/.env carrying REMOTE_TASK_URL + REMOTE_TASK_TOKEN)."""
+    if not _SOURCE_SLUG_RE.match(source or ""):
+        print(f"[task-progress] invalid gateway source {source!r} — "
+              "provider names must match ^[a-z0-9][a-z0-9_-]*$", file=sys.stderr)
+        return False
     # Mirrors util_paths.claude_home_path ($CLAUDE_CONFIG_DIR -> $CLAUDE_HOME -> ~/.claude).
     _base = os.environ.get("CLAUDE_CONFIG_DIR") or os.environ.get("CLAUDE_HOME")
     _claude_config = Path(_base) if _base else Path.home() / ".claude"
-    env_path = _claude_config / "channels" / source / ".env"
-    env = _env_file(str(env_path))
+    channels_dir = _claude_config / "channels"
+    env_path = channels_dir / source / ".env"
+    # Belt and suspenders: even a slug-valid name must RESOLVE inside the
+    # channels directory. The containment root is the realpath of channels/
+    # itself (so a symlinked channels dir works), but a channel entry that
+    # symlinks OUT of the directory is refused by design.
+    real_env = os.path.realpath(env_path)
+    real_root = os.path.realpath(channels_dir)
+    if not real_env.startswith(real_root + os.sep):
+        print(f"[task-progress] refusing env path outside channels dir: {env_path}",
+              file=sys.stderr)
+        return False
+    env = _env_file(real_env)
     url = (os.environ.get("REMOTE_TASK_URL") or env.get("REMOTE_TASK_URL", "")).rstrip("/")
-    token = _token(source, "REMOTE_TASK_TOKEN")
+    token = os.environ.get("REMOTE_TASK_TOKEN", "").strip() or env.get("REMOTE_TASK_TOKEN", "")
     if not url or not token:
         print(f"[task-progress] no REMOTE_TASK_URL/REMOTE_TASK_TOKEN for source '{source}' "
               f"(looked in {env_path})", file=sys.stderr)
