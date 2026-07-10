@@ -118,6 +118,13 @@ KNOWN_HEADER_KEYS = (
     # them in untrusted bodies, so a forged `attachments:` body line can never
     # smuggle a fetch locator past the parser.
     "content_modalities", "media_form", "attachments",
+    # Platform-signed metadata pointer (one-line JSON object): a signed
+    # reference to the delivering platform's canonical agent operating card,
+    # verifiable offline-of-the-task against the platform's well-known key
+    # (skills/agent-room-ops/verify_platform_card.py). Header status means a
+    # trusted bridge wrote it; the guard defangs a forged `platform_card:`
+    # body line the same as `attachments:`.
+    "platform_card",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 
