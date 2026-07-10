@@ -238,13 +238,25 @@ def get_pending_questions() -> list[str]:
     # this cut the briefing speaks every resolved entry as still-pending.
     # No-op when there is no such divider.
     content = re.split(r'^#\s+Resolved\b', content, maxsplit=1, flags=re.MULTILINE)[0]
+    # Organizer/section-shell headers (e.g. "## FRESH — 2026-07-05 [wu-air]",
+    # "## ACTIVE — ...", "## SURFACED — ...") group questions but are not
+    # themselves questions — skip them so the briefing's "top item" is a real
+    # question, not a date-label. Also skip anything already marked resolved
+    # inline (the "# Resolved" divider above is a no-op for files that use
+    # per-item "[RESOLVED]" markers instead).
+    org_header = re.compile(
+        r'^(FRESH|ACTIVE|HELD|TRIAGE|SURFACED|RESOLVED|ANSWERED)\b', re.IGNORECASE
+    )
     questions = []
     for section in re.split(r'^## ', content, flags=re.MULTILINE)[1:]:
         title = section.partition('\n')[0].strip()
         # Strip leading date prefix like "[2026-05-27] "
         title = re.sub(r'^\[\d{4}-\d{2}-\d{2}\]\s*', '', title)
-        if title:
-            questions.append(title[:60])
+        if not title:
+            continue
+        if 'RESOLVED' in title.upper() or org_header.match(title):
+            continue
+        questions.append(title[:60])
     return questions
 
 
