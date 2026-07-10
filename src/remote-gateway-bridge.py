@@ -119,7 +119,17 @@ _TASK_FIELDS = ("id", "timestamp", "task", "source", "channel_id",
                 # them (absent for other sources); each newline-stripped by
                 # _one_line so a room/display name can't forge an extra line.
                 "room_name", "sender_name", "reply_to_event", "reply_to_me",
-                "source_message_id", "user_id", "priority", "interaction_type")
+                "source_message_id", "user_id", "priority", "interaction_type",
+                # Platform-signed metadata pointer — serialized as a one-line
+                # JSON header by a dedicated branch below (dict, not scalar).
+                "platform_card")
+
+# platform_card passes through with exactly these subkeys — a signed pointer
+# {card_url, card_sha256, sig, key_id, alg} to the platform's canonical agent
+# operating card. The bridge does NOT verify the signature (consumers do, per
+# origin, via skills/agent-room-ops/verify_platform_card.py — fail-closed);
+# it only constrains the shape so the field can't smuggle arbitrary payload.
+_PLATFORM_CARD_KEYS = ("card_url", "card_sha256", "sig", "key_id", "alg")
 
 # Interaction-plane vocabulary (interaction-planes refactor step 1). Remote
 # values outside this set degrade to "message" rather than passing through.
@@ -589,14 +599,21 @@ def _write_task(task: dict) -> str | None:
                 _mh = local_task_protocol.media_attachment_headers(_media_refs, bool(_txt.strip()))
                 if _mh:
                     lines.extend(_mh.rstrip("\n").split("\n"))
+        elif f == "platform_card":
+            # Signed platform-metadata pointer: re-serialize only the expected
+            # subkeys as one compact JSON line (dict repr or extra keys never
+            # reach the file). json.dumps escapes newlines, so the value can't
+            # forge a header line even without _one_line.
+            pc = task.get("platform_card")
+            if isinstance(pc, dict) and all(k in pc for k in _PLATFORM_CARD_KEYS):
+                card = {k: str(pc[k]) for k in _PLATFORM_CARD_KEYS}
+                lines.append(f"platform_card: {json.dumps(card, separators=(',', ':'))}")
         elif f in task and task[f] not in (None, ""):
             lines.append(f"{f}: {_one_line(task[f])}")
-    # (A gateway-written `provenance:` trust signal was considered here but
-    # dropped: the trusted task parser only promotes KNOWN_HEADER_KEYS, so an
-    # unknown `provenance:` field would land in the body as a no-op. Threading a
-    # real trusted-provenance signal end-to-end — header vocabulary + guard +
-    # a consumer that makes the trust decision — is a separate change. The
-    # substantive delegation-trust fix here is the owner-tier default above.)
+    # (This used to note that a gateway-written trust signal was dropped for
+    # lack of end-to-end support. platform_card above is that signal, done
+    # properly: KNOWN_HEADER_KEYS vocabulary + guard defang + a verifying
+    # consumer in skills/agent-room-ops/verify_platform_card.py.)
     # access_tier is a LOCAL decision and written LAST so it wins even under a
     # last-occurrence parser; every other field is newline-stripped so none can
     # forge an earlier one either.
