@@ -84,6 +84,16 @@ class TestGetPendingQuestions(unittest.TestCase):
         qs = self._run(text)
         self.assertEqual(qs, ["1. Open question?"])
 
+    def test_skips_empty_title_header(self):
+        # A header that is only a date prefix strips to an empty title and
+        # must be skipped (not emitted as a blank question).
+        text = (
+            "## [2026-07-10]\n"
+            "## 1. Real question?\n"
+        )
+        qs = self._run(text)
+        self.assertEqual(qs, ["1. Real question?"])
+
     def test_missing_file_returns_empty(self):
         with patch.object(
             self.mod, "personal_path", return_value=Path("/nonexistent/pq.md")
