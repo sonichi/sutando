@@ -326,6 +326,9 @@ def main() -> int:
         check(r.get("id") == "task-MOCK1" and r.get("body") == "the reply",
               "result payload correct (id + body)")
     check(not (rtc.RESULTS_DIR / "task-MOCK1.txt").exists(), "result file archived after POST")
+    check(not (rtc.TASKS_DIR / "task-MOCK1.txt").exists()
+          and (rtc.TASKS_DIR / "archive" / "task-MOCK1.txt").exists(),
+          "task file archived alongside the delivered result (no tasks/ pile-up)")
 
     # 3b. inflight persistence (restart-safety): a pulled task's id survives a
     # restart so its result still gets POSTed, and is cleared after delivery.

@@ -606,6 +606,18 @@ def _archive_result(path: Path, tid: str) -> None:
         path.rename(ARCHIVE_RESULTS_DIR / f"{tid}-{int(time.time())}.txt")
     except OSError:
         path.unlink(missing_ok=True)
+    # The delivered task's queue file comes along too — otherwise served tasks
+    # sit in tasks/ forever and the health-check counts them as a stuck queue.
+    # Same flat tasks/archive/ layout the core uses when it archives manually
+    # (and that _write_task's already-archived dedup check looks for).
+    tfile = TASKS_DIR / f"{tid}.txt"
+    if tfile.exists():
+        archive_dir = TASKS_DIR / "archive"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            tfile.rename(archive_dir / f"{tid}.txt")
+        except OSError:
+            pass  # best-effort; core may have archived it concurrently
 
 
 def _load_inflight() -> set[str]:
