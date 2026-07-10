@@ -329,6 +329,15 @@ def main() -> int:
     check(not (rtc.TASKS_DIR / "task-MOCK1.txt").exists()
           and (rtc.TASKS_DIR / "archive" / "task-MOCK1.txt").exists(),
           "task file archived alongside the delivered result (no tasks/ pile-up)")
+    # archive collision is best-effort: rename onto an occupied path (a dir
+    # squatting on the destination) must not raise or block delivery
+    (rtc.RESULTS_DIR / "task-COLL.txt").write_text("reply\n")
+    (rtc.TASKS_DIR / "task-COLL.txt").write_text("task body\n")
+    (rtc.TASKS_DIR / "archive" / "task-COLL.txt").mkdir(parents=True)
+    rtc._post_ready_results({"task-COLL"})
+    check(not (rtc.RESULTS_DIR / "task-COLL.txt").exists()
+          and (rtc.TASKS_DIR / "task-COLL.txt").exists(),
+          "archive rename failure is swallowed (result still delivered, task file left in place)")
 
     # 3b. inflight persistence (restart-safety): a pulled task's id survives a
     # restart so its result still gets POSTed, and is cleared after delivery.
