@@ -1034,6 +1034,91 @@ def check_notes_split_brain() -> "dict | None":
     }
 
 
+def sutando_app_hotkey_detail(workspace_dir) -> str:
+    """Detail string for a running sutando-app check.
+
+    Hotkey labels come from <workspace>/state/hotkeys.json, published by the
+    app when it registers them (single source of truth since #1920). A running
+    process alone doesn't prove hotkeys exist — app lineages without global
+    hotkey registration (e.g. the Electron shell) match the pgrep pattern but
+    register nothing, and the pre-#1920 hardcoded "(⌃C/⌃V/⌃M)" claim here had
+    already drifted from the real defaults and read as a false positive during
+    live debugging. Missing/malformed/empty file → honest "no hotkeys
+    published" rather than a guess.
+    """
+    try:
+        entries = json.loads((Path(workspace_dir) / "state" / "hotkeys.json").read_text())
+        labels = "/".join(e["label"] for e in entries if e.get("label"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        labels = ""
+    return f"running (hotkeys: {labels})" if labels else "running (no hotkeys published)"
+
+
+def _outermost_bundle(comm: str) -> Optional[Path]:
+    """Map an executable path to its OUTERMOST .app bundle, or None.
+
+    Electron helper processes live at
+    …/Sutando.app/Contents/Frameworks/Sutando Helper*.app/Contents/MacOS/…,
+    so split on the FIRST `.app/` to resolve them to the top-level bundle
+    rather than the nested helper bundle.
+    """
+    if ".app/" not in comm:
+        return None
+    return Path(comm.split(".app/", 1)[0] + ".app")
+
+
+def _is_electron_impostor(comm: str) -> bool:
+    """True if `comm` belongs to an Electron bundle squatting the Sutando name.
+
+    The desktop UI also installs as "Sutando.app", and its main binary lives
+    at the same …/Contents/MacOS/Sutando suffix the sutando-app pgrep pattern
+    matches — so the probe reported "running" while the actual Swift menu-bar
+    app (the contextual-chips writer + watcher-auto-restart owner) was dead
+    (#2038, 2026-07-09). Electron bundles are distinguishable on disk: they
+    ship Contents/Frameworks/Sutando Helper.app; the Swift app has no helper
+    frameworks.
+    """
+    bundle = _outermost_bundle(comm)
+    if bundle is None:
+        return False  # bare dev binary (src/Sutando/Sutando) — not a bundle
+    return (bundle / "Contents" / "Frameworks" / "Sutando Helper.app").exists()
+
+
+def _ps_comm(pid: str) -> str:
+    """Executable path (macOS) / name (linux) for a PID via ps; "" on error."""
+    return subprocess.run(
+        ["/bin/ps", "-o", "comm=", "-p", pid],
+        capture_output=True, text=True, timeout=5,
+    ).stdout.strip()
+
+
+def _filter_electron_impostor_pids(pids: list[str]) -> list[str]:
+    """Drop PIDs that belong to the Electron desktop app, keep the rest.
+
+    Fail-open per PID: if the ps lookup errors, keep the PID (pre-fix
+    behavior) rather than false-alarm "stopped".
+    """
+    kept = []
+    for pid in pids:
+        try:
+            if _is_electron_impostor(_ps_comm(pid)):
+                continue
+        except Exception:
+            pass
+        kept.append(pid)
+    return kept
+
+
+def _resolve_menu_bar_pgrep(pgrep_status: Optional[str], pids: list[str]) -> tuple[Optional[str], list[str]]:
+    """Post-process the sutando-app pgrep result: drop Electron impostor
+    PIDs, and demote "ok-running" to "ok-stopped" when nothing real remains."""
+    if pgrep_status == "ok-running" and pids:
+        pids = _filter_electron_impostor_pids(pids)
+        if not pids:
+            pgrep_status = "ok-stopped"
+    return pgrep_status, pids
+
+
 def run_all_checks() -> list[dict]:
     checks = []
 
@@ -1354,8 +1439,15 @@ def run_all_checks() -> list[dict]:
             pgrep_status = "error"
             pgrep_err = f"{type(e).__name__}: {e}"[:120]
 
+        # Disqualify Electron impostors (see _resolve_menu_bar_pgrep).
+        pgrep_status, pids = _resolve_menu_bar_pgrep(pgrep_status, pids)
+
         if pgrep_status == "ok-running" and pids:
-            check = {"name": "sutando-app", "status": "ok", "detail": f"running (⌃C/⌃V/⌃M)"}
+            # pragma: no cover — reachable only when pgrep finds the macOS
+            # menu-bar app (never on ubuntu CI); detail derivation is covered
+            # at helper level in health-check-sutando-app-hotkeys.test.py.
+            check = {"name": "sutando-app", "status": "ok",  # pragma: no cover
+                     "detail": sutando_app_hotkey_detail(WORKSPACE_DIR)}
             # Staleness check is meaningful only in the dev workflow — the
             # .app binary and bundled main.swift share a build mtime, so a
             # comparison there is always equal. Skip when dev_bin missing.

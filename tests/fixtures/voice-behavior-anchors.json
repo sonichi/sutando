@@ -179,13 +179,13 @@
   },
   {
    "name": "get_core_status",
-   "description": "Get what the core agent (Claude Code) is currently doing. Use when the user asks \"what are you working on\", \"what are you up to\", \"are you busy\", \"anything running\", or similar questions about background work. Instant file read.",
+   "description": "Get what the core agent (Claude Code) is currently doing. Use when the user asks \"what are you working on\", \"what are you up to\", \"are you busy\", \"anything running\", or similar questions about background work. Instant file read. Call it ONLY for those explicit status questions — NEVER on greetings (\"hello\"), filler, garbled speech, or as a fallback when unsure what the user wants; fire nothing instead.",
    "execution": "inline",
    "params": {}
   },
   {
    "name": "get_current_time",
-   "description": "Get the current date and time. Instant.",
+   "description": "Get the current date and time. Instant. Call this ONLY when the user explicitly asks for the time, date, or day. NEVER call it for any other question, on filler (\"hm\", \"okay\"), or as a fallback when you are unsure what the user wants — answering an unrelated question (e.g. about a paper) by announcing the time is always wrong; when unsure, fire nothing.",
    "execution": "inline",
    "params": {}
   },
@@ -289,7 +289,7 @@
   },
   {
    "name": "press_key",
-   "description": "Press a keyboard key or shortcut in the frontmost app. Use for: \"press enter\", \"press escape\", \"press tab\", \"send the message\" (Enter), \"close the dialog\" (Escape), \"select all\" (Cmd+A), \"clear the input\" (Cmd+A then Delete). Instant — do NOT use work for simple keystrokes.",
+   "description": "Press a keyboard key or shortcut in the frontmost app. Use for: \"press enter\", \"press escape\", \"press tab\", \"send the message\" (Enter), \"close the dialog\" (Escape), \"select all\" (Cmd+A), \"clear the input\" (Cmd+A then Delete). Instant — do NOT use work for simple keystrokes. Call this ONLY on an explicit key/shortcut request. NEVER when the user is addressing another assistant or device (\"Hey Google\", \"Alexa\", \"Siri\"), and never on filler or garbled speech — a spurious keystroke acts on whatever app is frontmost. When unsure, fire nothing.",
    "execution": "inline",
    "params": {
     "app": "Target app name (e.g. \"QuickTime Player\"). If set, activates it first.",
@@ -299,7 +299,7 @@
   },
   {
    "name": "press_key",
-   "description": "Press a keyboard key or shortcut in the frontmost app. Use for: \"press enter\", \"press escape\", \"press tab\", \"send the message\" (Enter), \"close the dialog\" (Escape), \"select all\" (Cmd+A), \"clear the input\" (Cmd+A then Delete). Instant — do NOT use work for simple keystrokes.",
+   "description": "Press a keyboard key or shortcut in the frontmost app. Use for: \"press enter\", \"press escape\", \"press tab\", \"send the message\" (Enter), \"close the dialog\" (Escape), \"select all\" (Cmd+A), \"clear the input\" (Cmd+A then Delete). Instant — do NOT use work for simple keystrokes. Call this ONLY on an explicit key/shortcut request. NEVER when the user is addressing another assistant or device (\"Hey Google\", \"Alexa\", \"Siri\"), and never on filler or garbled speech — a spurious keystroke acts on whatever app is frontmost. When unsure, fire nothing.",
    "execution": "inline",
    "params": {
     "app": "Target app name (e.g. \"QuickTime Player\"). If set, activates it first.",
@@ -563,7 +563,7 @@
   },
   {
    "name": "switch_voice_config",
-   "description": "Switch voice-agent to a different model + googleSearch preset and restart. Use when the user explicitly asks to switch — e.g. \"switch to search mode\", \"switch to no-search mode\", \"use 2.5\", \"use 3.1\", \"turn search on\", \"turn search off\". Presets: \"search\" = gemini-2.5-flash-native-audio + googleSearch:true (best for Q&A with Web grounding); \"no-search\" = gemini-3.1-flash-live-preview + googleSearch:false (newer model, no Web grounding). Restart takes ~2-3 seconds during which voice will be silent; the web client auto-reconnects.",
+   "description": "Switch voice-agent to a different model + googleSearch preset and restart. Use when the user explicitly asks to switch — e.g. \"switch to search mode\", \"switch to no-search mode\", \"use 2.5\", \"use 3.1\", \"turn search on\", \"turn search off\". Presets: \"search\" = gemini-2.5-flash-native-audio + googleSearch:true (best for Q&A with Web grounding); \"no-search\" = gemini-3.1-flash-live-preview + googleSearch:false (newer model, no Web grounding). Restart takes ~2-3 seconds during which voice will be silent; the web client auto-reconnects. HIGH-IMPACT: this restarts the whole voice session. Call it ONLY on one of those explicit switch requests — NEVER because the conversation merely mentions search/searching, and never on filler or garbled speech; when unsure, fire nothing.",
    "execution": "inline",
    "params": {
     "preset": "Which preset to switch to. \"search\" = 2.5+Web grounding. \"no-search\" = 3.1+no-Web."
@@ -571,7 +571,7 @@
   },
   {
    "name": "switch_voice_config",
-   "description": "Switch voice-agent to a different model + googleSearch preset and restart. Use when the user explicitly asks to switch — e.g. \"switch to search mode\", \"switch to no-search mode\", \"use 2.5\", \"use 3.1\", \"turn search on\", \"turn search off\". Presets: \"search\" = gemini-2.5-flash-native-audio + googleSearch:true (best for Q&A with Web grounding); \"no-search\" = gemini-3.1-flash-live-preview + googleSearch:false (newer model, no Web grounding). Restart takes ~2-3 seconds during which voice will be silent; the web client auto-reconnects.",
+   "description": "Switch voice-agent to a different model + googleSearch preset and restart. Use when the user explicitly asks to switch — e.g. \"switch to search mode\", \"switch to no-search mode\", \"use 2.5\", \"use 3.1\", \"turn search on\", \"turn search off\". Presets: \"search\" = gemini-2.5-flash-native-audio + googleSearch:true (best for Q&A with Web grounding); \"no-search\" = gemini-3.1-flash-live-preview + googleSearch:false (newer model, no Web grounding). Restart takes ~2-3 seconds during which voice will be silent; the web client auto-reconnects. HIGH-IMPACT: this restarts the whole voice session. Call it ONLY on one of those explicit switch requests — NEVER because the conversation merely mentions search/searching, and never on filler or garbled speech; when unsure, fire nothing.",
    "execution": "inline",
    "params": {
     "preset": "Which preset to switch to. \"search\" = 2.5+Web grounding. \"no-search\" = 3.1+no-Web."
@@ -644,7 +644,7 @@
    }
   }
  ],
- "instructions_hash_fixed_env": "4bfd0db86de348a3cd2be8b1acf85952a50d63f1a06c157f001ddc6cb83eb7f5",
+ "instructions_hash_fixed_env": "c75044993561fe13bf95f8d8d0bc9b1269074b7260abf797dc67ca1dcc5c7cd4",
  "meeting_greeting": "[System: MEETING MODE — LISTEN AND TAKE NOTES. A Zoom meeting is active. Listen to everything and mentally track the discussion: who said what, key decisions, action items, topics covered. But do NOT produce any audio output UNLESS someone says \"Sutando\" or \"hey Sutando\" — then respond to their request using your accumulated notes and context. When not addressed, produce absolutely zero words — no acknowledgments, no \"silent\", no sounds. You are an invisible note-taker until called upon.]\n\n[MODE-MARKER-MEETING]",
  "regions": {
   "tool_table": "e6d53e7a98b6c0f052148b6bae6096eab4e5768fb8187be8d03deee179023e78"

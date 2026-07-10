@@ -146,6 +146,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.once:
         write_beat(status=args.status)
         return 0
+    # Anonymous, opt-out product telemetry: one event per real core boot so
+    # maintainers can count active installs (OSS + desktop). No-op when opted
+    # out or no key is configured. Never blocks; see src/telemetry.py + TELEMETRY.md.
+    try:  # pragma: no cover — fire-and-forget glue; telemetry logic tested in tests/telemetry.test.py
+        from telemetry import capture  # sibling module (src/ already on sys.path)
+
+        capture("core_started", {"interval_s": args.interval})
+    except Exception:  # pragma: no cover — telemetry must never break the core
+        pass
     return run_forever(interval=args.interval, status=args.status)
 
 

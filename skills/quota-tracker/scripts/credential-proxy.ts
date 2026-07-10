@@ -14,9 +14,10 @@
 
 import { createServer, request as httpRequest, type RequestOptions } from 'node:http';
 import { request as httpsRequest } from 'node:https';
-import { execSync, execFileSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { writeFileSync, readFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { createHash } from 'node:crypto';
 import { statusPath } from '../../../src/workspace_default.js';
 
 const PORT = 7846;
@@ -34,17 +35,17 @@ const UPSTREAM_IDLE_TIMEOUT_MS = Number(process.env.SUTANDO_PROXY_TIMEOUT_MS) ||
 // keep the skill-dir path as a last-resort fallback for one release.
 const QUOTA_FILE = statusPath('quota-state.json');
 
-// OAuth self-refresh. The proxy reads the DEFAULT `Claude Code-credentials`
-// keychain item, but nothing refreshes that item's accessToken on a headless
-// node (interactive `/login` refreshes it; a namespaced-CLAUDE_CONFIG_DIR core
-// refreshes its OWN `Claude Code-credentials-<hash>` item). So once `expiresAt`
-// passes the proxy injects an EXPIRED token → upstream 401 ("401 after a while").
-// Fix: when the stored token is at/near expiry, use the stored refreshToken to
-// mint a fresh one and write it back — making every proxy-routed node self-heal.
-// Endpoint + client_id verified from the Claude Code binary (v2.1.170 strings).
+// OAuth self-refresh. A namespaced CLAUDE_CONFIG_DIR uses a namespaced keychain
+// item (`Claude Code-credentials-<sha256(config-dir)[0..8]>`), while vanilla
+// Claude Code uses `Claude Code-credentials`. Prefer the scoped item so an
+// interactive `/login` in the Sutando core is the token the proxy injects, then
+// fall back to the vanilla item for older/global installs. When the chosen token
+// is at/near expiry, use its refreshToken to mint a fresh one and write it back
+// to the SAME keychain item. Endpoint + client_id verified from the Claude Code
+// binary (v2.1.170 strings).
 const TOKEN_ENDPOINT = 'https://platform.claude.com/v1/oauth/token';
 const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
-const KEYCHAIN_SERVICE = 'Claude Code-credentials';
+const DEFAULT_KEYCHAIN_SERVICE = 'Claude Code-credentials';
 // Refresh when the token expires within this window (ms). Tokens are ~8h-lived;
 // 5 min of slack avoids racing the expiry on a long-running upstream request.
 const REFRESH_SKEW_MS = 5 * 60 * 1000;
@@ -56,30 +57,54 @@ interface ClaudeOAuth {
 	[k: string]: unknown;
 }
 
+interface StoredClaudeOAuth {
+	service: string;
+	oauth: ClaudeOAuth;
+}
+
 function ts(): string { return new Date().toISOString().slice(11, 23); }
 
-// Read the full cred object from the keychain (not just the accessToken).
-function readCred(): ClaudeOAuth | null {
+export function scopedKeychainService(configDir?: string): string | null {
+	const dir = (configDir ?? '').trim();
+	if (!dir) return null;
+	return `${DEFAULT_KEYCHAIN_SERVICE}-${createHash('sha256').update(dir).digest('hex').slice(0, 8)}`;
+}
+
+export function keychainServiceCandidates(configDir = process.env.CLAUDE_CONFIG_DIR): string[] {
+	const services = [scopedKeychainService(configDir), DEFAULT_KEYCHAIN_SERVICE].filter(Boolean) as string[];
+	return [...new Set(services)];
+}
+
+// Read the full cred object from one keychain service (not just accessToken).
+function readCredFromService(service: string): StoredClaudeOAuth | null {
 	try {
-		const raw = execSync(`security find-generic-password -s "${KEYCHAIN_SERVICE}" -w`, {
+		const raw = execFileSync('security', ['find-generic-password', '-s', service, '-w'], {
 			encoding: 'utf-8',
 			timeout: 5000,
 		}).trim();
 		const parsed = JSON.parse(raw);
 		const oauth = parsed?.claudeAiOauth;
-		return oauth && typeof oauth.accessToken === 'string' ? (oauth as ClaudeOAuth) : null;
+		return oauth && typeof oauth.accessToken === 'string' ? { service, oauth: oauth as ClaudeOAuth } : null;
 	} catch {
 		return null;
 	}
+}
+
+function readCred(): StoredClaudeOAuth | null {
+	for (const service of keychainServiceCandidates()) {
+		const stored = readCredFromService(service);
+		if (stored) return stored;
+	}
+	return null;
 }
 
 // Atomically write the cred back to the keychain. Returns true ONLY after a
 // read-back confirms the new accessToken landed — the rotation-lockout guard:
 // if we consumed a (rotating) refresh token we MUST be sure its replacement
 // persisted, else the node can never refresh again.
-function keychainAccount(): string | null {
+function keychainAccount(service: string): string | null {
 	try {
-		const meta = execFileSync('security', ['find-generic-password', '-s', KEYCHAIN_SERVICE], {
+		const meta = execFileSync('security', ['find-generic-password', '-s', service], {
 			encoding: 'utf-8', timeout: 5000,
 		});
 		const m = meta.match(/"acct"<blob>="([^"]*)"/);
@@ -89,9 +114,9 @@ function keychainAccount(): string | null {
 	}
 }
 
-function writeCred(oauth: ClaudeOAuth): boolean {
+function writeCred(service: string, oauth: ClaudeOAuth): boolean {
 	try {
-		const acct = keychainAccount();
+		const acct = keychainAccount(service);
 		if (!acct) { console.error(`${ts()} [Proxy] keychain write: account not found`); return false; }
 		const payload = JSON.stringify({ claudeAiOauth: oauth });
 		// execFileSync (args array, no shell) — value passed as a single argv
@@ -100,10 +125,10 @@ function writeCred(oauth: ClaudeOAuth): boolean {
 		// single-user Mac, same as the rest of the vault path.)
 		execFileSync('security', [
 			'add-generic-password', '-U',
-			'-s', KEYCHAIN_SERVICE, '-a', acct, '-w', payload,
+			'-s', service, '-a', acct, '-w', payload,
 		], { timeout: 5000 });
-		const back = readCred();
-		return back?.accessToken === oauth.accessToken; // rotation-lockout read-back guard
+		const back = readCredFromService(service);
+		return back?.oauth.accessToken === oauth.accessToken; // rotation-lockout read-back guard
 	} catch (e) {
 		console.error(`${ts()} [Proxy] keychain write FAILED:`, (e as Error).message);
 		return false;
@@ -182,8 +207,9 @@ let refreshInFlight: Promise<void> | null = null;
 // Return a usable accessToken, refreshing first if the stored one is at/near
 // expiry. Fail-safe at every step: any problem → return the existing token.
 async function getFreshOAuthToken(): Promise<string | null> {
-	const cred = readCred();
-	if (!cred) return null;
+	const stored = readCred();
+	if (!stored) return null;
+	const { service, oauth: cred } = stored;
 	const needsRefresh =
 		typeof cred.expiresAt === 'number' &&
 		cred.expiresAt - Date.now() <= REFRESH_SKEW_MS &&
@@ -192,7 +218,7 @@ async function getFreshOAuthToken(): Promise<string | null> {
 		if (!refreshInFlight) {
 			refreshInFlight = (async () => {
 				const fresh = await refreshAccessToken(cred);
-				if (fresh && writeCred(fresh)) {
+				if (fresh && writeCred(service, fresh)) {
 					console.log(`${ts()} [Proxy] OAuth token refreshed (new expiry ${new Date(fresh.expiresAt ?? 0).toISOString()})`);
 				} else {
 					console.error(`${ts()} [Proxy] refresh did not persist — keeping existing token`);
@@ -200,14 +226,14 @@ async function getFreshOAuthToken(): Promise<string | null> {
 			})().finally(() => { refreshInFlight = null; });
 		}
 		await refreshInFlight;
-		return readCred()?.accessToken ?? cred.accessToken;
+		return readCredFromService(service)?.oauth.accessToken ?? cred.accessToken;
 	}
 	return cred.accessToken;
 }
 
 // Back-compat sync reader (startup probe only — does not refresh).
 function getOAuthToken(): string | null {
-	return readCred()?.accessToken ?? null;
+	return readCred()?.oauth.accessToken ?? null;
 }
 
 function updateQuotaState(headers: Record<string, string>): void {

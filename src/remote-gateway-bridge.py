@@ -684,10 +684,40 @@ def _post_ready_results(inflight: set[str]) -> None:
         _save_inflight(inflight)
 
 
+def _reconcile_abandoned(inflight: set[str], suspects: set[str]) -> set[str]:
+    """Drop in-flight ids that can never complete through this loop: the task
+    file is no longer pending in tasks/ AND no result file is waiting. That
+    combination means the task was completed elsewhere (a concurrent core
+    racing the same workspace, a manual sweep to tasks/processed/, or history
+    from before a restart) — this client will never see a result to POST, so
+    the id would otherwise strand in the ledger forever. Stranded ids inflate
+    the heartbeat's `inflight` count monotonically until the broker's presence
+    sweep marks the agent unassignable (observed 2026-07-09: 175 stranded ids,
+    0 with any pending work).
+
+    Two consecutive sightings are required before dropping (`suspects` carries
+    the previous pass's candidates): a result landing between the task-file
+    check and the discard is then picked up by the next `_post_ready_results`
+    instead of being raced. Returns the new suspects set for the next pass."""
+    gone = {tid for tid in inflight
+            if _valid_tid(tid)
+            and not (TASKS_DIR / f"{tid}.txt").exists()
+            and not any(TASKS_DIR.glob(f"{tid}.claimed-*"))
+            and not (RESULTS_DIR / f"{tid}.txt").exists()}
+    confirmed = gone & suspects
+    if confirmed:
+        for tid in sorted(confirmed):
+            inflight.discard(tid)
+            _log(f"dropped abandoned in-flight id {tid} (no task/result file — completed elsewhere)")
+        _save_inflight(inflight)
+    return gone - confirmed
+
+
 def main() -> None:
     if not URL or not TOKEN:
         sys.exit("FATAL: set REMOTE_TASK_TOKEN (and REMOTE_TASK_URL if your token is a bare secret).")
     inflight: set[str] = _load_inflight()
+    abandoned_suspects: set[str] = set()
     _log(f"starting — gateway={URL} provider={PROVIDER} workspace={WS} "
          f"(restored {len(inflight)} in-flight)")
     backoff = 1
@@ -711,6 +741,7 @@ def main() -> None:
             for tid in pending_ack:
                 _post_task_ack(tid)
             _post_ready_results(inflight)
+            abandoned_suspects = _reconcile_abandoned(inflight, abandoned_suspects)
             _post_heartbeat(inflight)
             backoff = 1  # healthy round-trip → reset backoff
         except urllib.error.HTTPError as e:
