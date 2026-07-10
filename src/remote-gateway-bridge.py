@@ -57,6 +57,7 @@ from pathlib import Path
 # src/ and pointed outside the repo).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
+from task_archive import find_task_file  # noqa: E402
 import local_task_protocol  # noqa: E402
 
 WS = resolve_workspace()
@@ -608,10 +609,13 @@ def _archive_result(path: Path, tid: str) -> None:
         path.unlink(missing_ok=True)
     # The delivered task's queue file comes along too — otherwise served tasks
     # sit in tasks/ forever and the health-check counts them as a stuck queue.
-    # Same flat tasks/archive/ layout the core uses when it archives manually
-    # (and that _write_task's already-archived dedup check looks for).
-    tfile = TASKS_DIR / f"{tid}.txt"
-    if tfile.exists():
+    # find_task_file resolves the ACTUAL filename: bare `<tid>.txt` or the
+    # claimed variant `<tid>.claimed-core-N.txt` the core renames to while
+    # processing (review catch: probing only the bare name left claimed files
+    # behind, and health-check counts every top-level tasks/*.txt). Archived
+    # under the bare name — the shape _write_task's redelivery dedup checks.
+    tfile = find_task_file(TASKS_DIR, tid)
+    if tfile is not None:
         archive_dir = TASKS_DIR / "archive"
         archive_dir.mkdir(parents=True, exist_ok=True)
         try:

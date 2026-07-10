@@ -338,6 +338,15 @@ def main() -> int:
     check(not (rtc.RESULTS_DIR / "task-COLL.txt").exists()
           and (rtc.TASKS_DIR / "task-COLL.txt").exists(),
           "archive rename failure is swallowed (result still delivered, task file left in place)")
+    # claimed-task shape (review repro): the core renames a queued task to
+    # task-<id>.claimed-core-N.txt while processing — delivery must archive
+    # THAT file, not just the bare name, or health-check keeps counting it
+    (rtc.RESULTS_DIR / "task-CLAIMED.txt").write_text("reply\n")
+    (rtc.TASKS_DIR / "task-CLAIMED.claimed-core-1.txt").write_text("task body\n")
+    rtc._post_ready_results({"task-CLAIMED"})
+    check(not (rtc.TASKS_DIR / "task-CLAIMED.claimed-core-1.txt").exists()
+          and (rtc.TASKS_DIR / "archive" / "task-CLAIMED.txt").exists(),
+          "claimed-shape task file archived under the bare name after delivery")
 
     # 3b. inflight persistence (restart-safety): a pulled task's id survives a
     # restart so its result still gets POSTed, and is cleared after delivery.
