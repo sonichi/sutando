@@ -53,7 +53,7 @@ Repo (shared, git-tracked):
     SKILL.md
 
 Workspace (per-user, NOT git-tracked):
-  $SUTANDO_WORKSPACE/skills/proactive-notify/
+  <workspace>/skills/proactive-notify/
     pings.yaml             ← edit your pings here
     channel-policy.yaml    ← edit your escalation policy here
     state/fired.json       ← runtime dedup state
@@ -63,7 +63,7 @@ The runner bootstraps the workspace copy from `.example` template on first run, 
 
 ## Adding a ping
 
-Edit `$SUTANDO_WORKSPACE/skills/proactive-notify/pings.yaml`. Each entry needs: `name`, `source`, `match`, `urgency`, `body_template`. Optional: `voice_natural`, `prefer_channel`, `quiet_hours_override`.
+Edit `<workspace>/skills/proactive-notify/pings.yaml`. Each entry needs: `name`, `source`, `match`, `urgency`, `body_template`. Optional: `voice_natural`, `prefer_channel`, `quiet_hours_override`.
 
 ## Adding a source / action
 
