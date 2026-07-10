@@ -41,6 +41,7 @@ Stdlib only (urllib) — no new dependencies.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -58,6 +59,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
 import local_task_protocol  # noqa: E402
+from result_markers import parse_markers  # noqa: E402
+from send_allowlist import is_path_sendable  # noqa: E402
 
 WS = resolve_workspace()
 TASKS_DIR = WS / "tasks"
@@ -68,6 +71,12 @@ ARCHIVE_RESULTS_DIR = RESULTS_DIR / "archive"
 # gateway-pulled tasks only — we must NOT blindly POST every results/ file, or we'd
 # cross-send other channels' (Discord/Telegram) results to the gateway.
 INFLIGHT_FILE = WS / "state" / "remote-task-inflight.json"
+# Sidecar map {task id → origin room id}, recorded at queue time. Outbound
+# file-attach needs the room because media uploads go to the room-scoped
+# endpoint (POST /v1/rooms/{room}/media) while text results go to /v1/results
+# (which resolves the room server-side). Separate file — the inflight ledger's
+# list-of-ids format stays untouched for compat.
+TASK_ROOMS_FILE = WS / "state" / "remote-task-rooms.json"
 
 # Back-compat: instances onboarded before the AG2_REMOTE_* → REMOTE_TASK_*
 # rename still export the legacy names in their .env. Honor them as DEPRECATED
@@ -595,9 +604,78 @@ def _write_task(task: dict) -> str | None:
     tmp.write_text("\n".join(lines) + "\n")
     tmp.rename(dest)  # atomic publish so the watcher never sees a partial file
     _log(f"queued {tid}")
+    _record_task_room(tid, str(task.get("channel_id") or ""))
     # Bridges-as-siblings: feed the proactive-loop's active-engagement gate.
     _write_owner_activity(task)
     return tid
+
+
+def _load_task_rooms() -> dict[str, str]:
+    """Restore the {task id → room id} sidecar map (fail-open to empty)."""
+    try:
+        data = json.loads(TASK_ROOMS_FILE.read_text())
+        return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:  # noqa: BLE001
+        _log(f"task-rooms file unreadable ({e}) — starting empty")
+        return {}
+
+
+def _save_task_rooms(rooms: dict[str, str]) -> None:
+    """Atomically persist the task→room map. Best-effort (never blocks the loop)."""
+    try:
+        TASK_ROOMS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = TASK_ROOMS_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(rooms, sort_keys=True))
+        tmp.rename(TASK_ROOMS_FILE)
+    except Exception as e:  # noqa: BLE001
+        _log(f"task-rooms persist failed ({e}) — continuing")
+
+
+def _record_task_room(tid: str, room: str) -> None:
+    if not room:
+        return
+    rooms = _load_task_rooms()
+    if rooms.get(tid) != room:
+        rooms[tid] = room
+        _save_task_rooms(rooms)
+
+
+def _forget_task_room(tid: str) -> None:
+    rooms = _load_task_rooms()
+    if tid in rooms:
+        rooms.pop(tid)
+        _save_task_rooms(rooms)
+
+
+def _upload_attachment(room: str, path_str: str) -> tuple[bool, str]:
+    """Upload one allowlisted local file to the task's room via the gateway
+    media endpoint. Returns (ok, reason)."""
+    fpath = os.path.realpath(os.path.expanduser(path_str.strip()))
+    if not is_path_sendable(fpath):
+        return False, "path not allowlisted"
+    try:
+        size = os.path.getsize(fpath)
+    except OSError as e:
+        return False, f"stat failed: {e}"
+    if size > MAX_MEDIA_BYTES:
+        return False, f"file exceeds {MAX_MEDIA_BYTES} bytes"
+    try:
+        with open(fpath, "rb") as f:
+            content_b64 = base64.b64encode(f.read()).decode("ascii")
+    except OSError as e:
+        return False, f"read failed: {e}"
+    safe_room = urllib.parse.quote(room, safe="")
+    try:
+        _req("POST", f"/v1/rooms/{safe_room}/media",
+             {"filename": os.path.basename(fpath), "content_b64": content_b64},
+             timeout=60)
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}"
+    except (urllib.error.URLError, TimeoutError) as e:
+        return False, f"network error: {e}"
+    return True, ""
 
 
 def _archive_result(path: Path, tid: str) -> None:
@@ -631,6 +709,10 @@ def _save_inflight(inflight: set[str]) -> None:
         _log(f"inflight persist failed ({e}) — continuing")
 
 
+# (tid, path) pairs already uploaded this process — result-POST retry guard.
+_uploaded_attachments: set[tuple[str, str]] = set()
+
+
 def _post_ready_results(inflight: set[str]) -> None:
     """For each in-flight task, if its result file exists, POST it + archive."""
     changed = False
@@ -642,18 +724,52 @@ def _post_ready_results(inflight: set[str]) -> None:
         if not rfile.exists():
             continue
         body = rfile.read_text().strip()
-        # Result-body protocol markers are a local bridge concern — never ship
-        # them to the gateway. [no-send]/[deduped:] mean "no user-facing reply":
-        # archive without POSTing (match the other bridges' semantics).
-        low = body.lower()
-        if low.startswith("[no-send]") or low.startswith("[deduped:"):
+        # Route marker decisions through the unified parser (#873) like the
+        # other bridges — no hand-rolled startswith checks.
+        parsed = parse_markers(body)
+        skip = next((a for a in parsed.actions if a.kind == "skip"), None)
+        if skip:
+            # [no-send]/[REPLIED]/[deduped:] mean "no user-facing reply":
+            # archive without POSTing (match the other bridges' semantics).
             _archive_result(rfile, tid)
             inflight.discard(tid)
+            _forget_task_room(tid)
             changed = True
-            _log(f"archived {tid} (marker, not sent)")
+            _log(f"archived {tid} (marker {skip.value}, not sent)")
             continue
+        out_body = parsed.body
+        redirect = next((a for a in parsed.actions if a.kind == "redirect"), None)
+        if redirect:
+            # Cross-room redirect is handled GATEWAY-side for this transport —
+            # re-stitch the marker the parser stripped so the server still
+            # sees it as the first line.
+            out_body = f"[channel: {redirect.value}]\n{out_body}"
+        attaches = [a.value for a in parsed.actions if a.kind == "attach"]
+        if attaches:
+            room = _load_task_rooms().get(tid, "")
+            sent = 0
+            for fp in attaches:
+                # Uploads happen before the result POST (so failures can be
+                # annotated in-band); if that POST then fails and this loop
+                # retries, don't re-upload the same file into the room.
+                if (tid, fp) in _uploaded_attachments:
+                    sent += 1
+                    continue
+                ok, reason = (_upload_attachment(room, fp) if room
+                              else (False, "origin room unknown"))
+                if ok:
+                    sent += 1
+                    _uploaded_attachments.add((tid, fp))
+                    _log(f"attached {fp} to {room} for {tid}")
+                else:
+                    # Keep the information in-band rather than dropping the
+                    # file silently — mirrors the other bridges' rejection UX.
+                    out_body += f"\n[attachment not sent: {fp} ({reason})]"
+                    _log(f"attachment skipped for {tid}: {fp} ({reason})")
+            if not out_body.strip() and sent:
+                out_body = "(file attached)"
         try:
-            _req("POST", "/v1/results", {"id": tid, "body": body})
+            _req("POST", "/v1/results", {"id": tid, "body": out_body})
         except urllib.error.HTTPError as e:
             _log(f"result POST failed for {tid}: HTTP {e.code} — will retry")
             continue
@@ -662,6 +778,7 @@ def _post_ready_results(inflight: set[str]) -> None:
             continue
         _archive_result(rfile, tid)
         inflight.discard(tid)
+        _forget_task_room(tid)
         changed = True
         _log(f"delivered result for {tid}")
     if changed:
