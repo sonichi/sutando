@@ -47,10 +47,15 @@ cd "$REPO_ROOT"
 
 mode="${1:-all}"
 
-# Match the inline install-path literal in shell + python:
-#   shell    : $HOME/.sutando/…   or   ~/.sutando/…   (also covers os.path.expanduser("~/.sutando/…"))
-#   python   : Path.home() / ".sutando"   (home() followed by a ".sutando" string)
-PATTERN='(\$HOME|~)/\.sutando/|home\(\)[[:space:]]*/[[:space:]]*["'\'']\.sutando'
+# Match the inline install-path literal in shell + python + TS/JS:
+#   shell/env : $HOME/.sutando/…   or   ~/.sutando/…   (also os.path.expanduser("~/.sutando/…"))
+#   ABSOLUTE  : /Users/<name>/.sutando/…  or  /home/<name>/.sutando/…  — the form
+#               that caused #2048 (an absolute home path, no $HOME/~ prefix). This
+#               is the one the first cut MISSED; it's the whole point of the guard.
+#   python    : Path.home() / ".sutando"   (home() followed by a ".sutando" string)
+# Applies to any scanned language — a quoted TS/JS literal like "~/.sutando/x" or
+# "/Users/x/.sutando/y" contains one of these substrings and is caught.
+PATTERN='(\$HOME|~|/Users/[^/]+|/home/[^/]+)/\.sutando/|home\(\)[[:space:]]*/[[:space:]]*["'\'']\.sutando'
 
 # Allowed files — may legitimately reference the install-home literal because
 # they OWN the resolution/install-location, or are migration/legacy scripts
@@ -61,7 +66,7 @@ PATTERN='(\$HOME|~)/\.sutando/|home\(\)[[:space:]]*/[[:space:]]*["'\'']\.sutando
 # fallback after resolve_workspace() / a doc comment). They're allowed because
 # the reference is intentional and reviewed; a brand-new file copying the
 # literal is what this lint is for.
-ALLOWED='^(scripts/sutando-config\.sh|src/util_paths\.py|src/workspace_default\.(py|ts)|src/startup\.sh|scripts/install-git-hooks\.sh|scripts/install-session-start-hook\.sh|src/agent/claude/cli/start-cli\.sh|src/health-check\.py|scripts/sync-memory\.sh|scripts/sync-workspace\.sh|scripts/sutando-migrate\.sh|src/migrate\.sh|src/migration_safety_helpers\.sh|scripts/lint-workspace-resolution\.sh|scripts/lint-sutando-home-path\.sh|scripts/probe-team-sandbox\.sh|skills/report-feedback/report-feedback\.py|src/telemetry\.py|src/inline-tools\.ts|tests/[^/]+\.(test\.)?(py|ts|sh))$'
+ALLOWED='^(scripts/sutando-config\.sh|src/util_paths\.py|src/workspace_default\.(py|ts)|src/startup\.sh|scripts/install-git-hooks\.sh|scripts/install-session-start-hook\.sh|src/agent/claude/cli/start-cli\.sh|src/health-check\.py|scripts/sync-memory\.sh|scripts/sync-workspace\.sh|scripts/sutando-migrate\.sh|src/migrate\.sh|src/migration_safety_helpers\.sh|scripts/lint-workspace-resolution\.sh|scripts/lint-sutando-home-path\.sh|scripts/probe-team-sandbox\.sh|skills/report-feedback/report-feedback\.py|src/telemetry\.py|src/inline-tools\.ts|tests/lint-sutando-home-path\.test\.sh|tests/credential-proxy-refresh\.test\.ts|tests/migration-safety-helpers\.test\.sh|tests/state-paths-adoption\.test\.py|tests/sync-memory-migration\.test\.sh|tests/sync-workspace\.test\.sh|tests/workspace-default\.test\.py)$'
 
 if [[ "$mode" == "--diff" ]]; then
   base="${BASE_REF:-origin/main}"
