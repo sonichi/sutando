@@ -133,6 +133,65 @@ class FileAttachTests(unittest.TestCase):
         self.assertTrue(results[0][2]["body"].startswith("[channel: !dev:server]"))
         self.assertIn("the reply", results[0][2]["body"])
 
+    # failure branches (coverage bar: every degrade path observable)
+    def test_upload_stat_and_read_failures_noted(self):
+        fd, fpath = tempfile.mkstemp(prefix="sutando-attach-test-", suffix=".txt", dir="/tmp")
+        os.write(fd, b"x"); os.close(fd)
+        self.addCleanup(lambda: os.path.exists(fpath) and os.unlink(fpath))
+        with patch.object(self.mod.os.path, "getsize", side_effect=OSError("boom")):
+            ok, reason = self.mod._upload_attachment("!r:s", fpath)
+        self.assertFalse(ok); self.assertIn("stat failed", reason)
+        with patch("builtins.open", side_effect=OSError("denied")):
+            ok, reason = self.mod._upload_attachment("!r:s", fpath)
+        self.assertFalse(ok); self.assertIn("read failed", reason)
+
+    def test_upload_oversize_refused(self):
+        fd, fpath = tempfile.mkstemp(prefix="sutando-attach-test-", suffix=".bin", dir="/tmp")
+        os.write(fd, b"x"); os.close(fd)
+        self.addCleanup(lambda: os.path.exists(fpath) and os.unlink(fpath))
+        with patch.object(self.mod, "MAX_MEDIA_BYTES", 0):
+            ok, reason = self.mod._upload_attachment("!r:s", fpath)
+        self.assertFalse(ok); self.assertIn("exceeds", reason)
+
+    def test_upload_http_and_network_errors(self):
+        import urllib.error
+        fd, fpath = tempfile.mkstemp(prefix="sutando-attach-test-", suffix=".txt", dir="/tmp")
+        os.write(fd, b"x"); os.close(fd)
+        self.addCleanup(lambda: os.path.exists(fpath) and os.unlink(fpath))
+        self._req_patch.stop()
+        try:
+            with patch.object(self.mod, "_req",
+                              side_effect=urllib.error.HTTPError("u", 500, "boom", {}, None)):
+                ok, reason = self.mod._upload_attachment("!r:s", fpath)
+            self.assertFalse(ok); self.assertIn("HTTP 500", reason)
+            with patch.object(self.mod, "_req",
+                              side_effect=urllib.error.URLError("down")):
+                ok, reason = self.mod._upload_attachment("!r:s", fpath)
+            self.assertFalse(ok); self.assertIn("network error", reason)
+        finally:
+            self._req_patch.start()
+
+    def test_result_post_errors_leave_result_for_retry(self):
+        import urllib.error
+        self._req_patch.stop()
+        try:
+            for exc in (urllib.error.HTTPError("u", 502, "bad", {}, None),
+                        urllib.error.URLError("down")):
+                self._result("t9", "plain reply")
+                with patch.object(self.mod, "_req", side_effect=exc):
+                    inflight = {"t9"}
+                    self.mod._post_ready_results(inflight)
+                # not archived, still inflight — the next loop retries
+                self.assertIn("t9", inflight)
+                self.assertTrue((self.mod.RESULTS_DIR / "t9.txt").exists())
+                (self.mod.RESULTS_DIR / "t9.txt").unlink()
+        finally:
+            self._req_patch.start()
+
+    def test_save_rooms_persist_failure_never_raises(self):
+        with patch.object(self.mod.json, "dumps", side_effect=RuntimeError("boom")):
+            self.mod._save_task_rooms({"a": "!x:s"})  # must not raise
+
     # 5 — sidecar map round-trip
     def test_rooms_map_roundtrip(self):
         self.mod._record_task_room("a", "!x:s")
