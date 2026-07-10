@@ -194,6 +194,36 @@ class PureEd25519Test(unittest.TestCase):
         with self.assertRaises(ValueError):
             v._ed_verify(cand + self.SIG[32:], self.MSG, self.PUB)
 
+    def test_identity_key_forgery_rejected(self):
+        # Codex repro: pub = R = the identity point, s = 0 → [0]B == R + [h]A
+        # holds for ANY message. Must reject, on both backends.
+        identity = bytes([1]) + bytes(31)
+        sig = identity + bytes(32)
+        with self.assertRaises(ValueError):
+            v._ed_verify(sig, b"arbitrary message", identity)
+        with self.assertRaises(ValueError):
+            v._verify_signature(sig, b"arbitrary message", identity)
+
+    def test_small_order_point_rejected(self):
+        # (I, 0) has order 4: y=0, sign bit = parity of I = sqrt(-1).
+        enc = ((v._ED_I & 1) << 255).to_bytes(32, "little")
+        v._ed_decode(enc)  # decodes fine — the ORDER check must reject it
+        with self.assertRaises(ValueError):
+            v._ed_check_order(v._ed_decode(enc), "public key")
+        sig_ok_shape = enc + (1).to_bytes(32, "little")
+        with self.assertRaises(ValueError):
+            v._ed_verify(sig_ok_shape, self.MSG, enc)
+
+    def test_non_canonical_encoding_rejected(self):
+        # y >= p after masking the sign bit must not decode.
+        with self.assertRaises(ValueError):
+            v._ed_decode((v._ED_Q).to_bytes(32, "little"))
+
+    def test_valid_key_passes_order_check(self):
+        pub, sig = _ed_sign(b"\x11" * 32, b"m")
+        v._ed_check_order(v._ed_decode(pub), "public key")  # must not raise
+        v._ed_verify(sig, b"m", pub)
+
     def test_signer_verifier_roundtrip(self):
         pub, sig = _ed_sign(b"\x07" * 32, b"roundtrip message")
         v._ed_verify(sig, b"roundtrip message", pub)

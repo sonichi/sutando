@@ -116,6 +116,8 @@ def _ed_decode(s: bytes):
     if len(s) != 32:
         raise ValueError("bad point length")
     y = int.from_bytes(s, "little") & ((1 << 255) - 1)
+    if y >= _ED_Q:
+        raise ValueError("non-canonical point encoding")
     x = _ed_xrecover(y)
     if x & 1 != s[31] >> 7:
         x = _ED_Q - x
@@ -133,6 +135,19 @@ def _ed_encode(p) -> bytes:
     return (y | ((x & 1) << 255)).to_bytes(32, "little")
 
 
+_ED_IDENT_ENC = (1).to_bytes(32, "little")  # the identity point (0, 1)
+
+
+def _ed_check_order(p, what: str) -> None:
+    """Reject the identity and every small/mixed-order point: accept only
+    points of exact prime order L. Honest keys and R values are always
+    order-L; anything else enables forgeries like pub=R=identity, s=0,
+    which verifies for ANY message (Codex finding, 2026-07-10)."""
+    enc = _ed_encode(p)
+    if enc == _ED_IDENT_ENC or _ed_encode(_ed_mul(p, _ED_L)) != _ED_IDENT_ENC:
+        raise ValueError(f"{what} not in the prime-order subgroup")
+
+
 def _ed_verify(sig: bytes, msg: bytes, pub: bytes) -> None:
     """RFC 8032 verification; raises ValueError on any invalid input."""
     if len(sig) != 64:
@@ -140,6 +155,8 @@ def _ed_verify(sig: bytes, msg: bytes, pub: bytes) -> None:
     r_enc = sig[:32]
     r = _ed_decode(r_enc)
     a = _ed_decode(pub)
+    _ed_check_order(a, "public key")
+    _ed_check_order(r, "signature R")
     s = int.from_bytes(sig[32:], "little")
     if s >= _ED_L:
         raise ValueError("s out of range")
@@ -152,6 +169,13 @@ def _ed_verify(sig: bytes, msg: bytes, pub: bytes) -> None:
 def _verify_signature(sig: bytes, msg: bytes, pub: bytes) -> None:
     """Backend dispatch: `cryptography` when importable, pure fallback else.
     Both raise on an invalid signature."""
+    # Canonicity + prime-order checks run for BOTH backends: OpenSSL's RFC
+    # 8032 verify does not reject small-order keys either, and the checks are
+    # one decode + two scalar mults (~12 ms) on a per-task, key-cached path.
+    if len(sig) != 64:
+        raise ValueError("bad signature length")
+    _ed_check_order(_ed_decode(pub), "public key")
+    _ed_check_order(_ed_decode(sig[:32]), "signature R")
     if _HAVE_CRYPTO:  # pragma: no cover — exercised only where cryptography exists
         Ed25519PublicKey.from_public_bytes(pub).verify(sig, msg)
     else:
