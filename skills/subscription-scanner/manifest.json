@@ -1,0 +1,11 @@
+{
+  "name": "subscription-scanner",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "Scans Gmail for active paid subscriptions and tracks them over time. Surfaces additions / cancellations between scans.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}

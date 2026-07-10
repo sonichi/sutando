@@ -152,6 +152,11 @@ ALLOWLIST = {
     # flagged token appears only in the module docstring (example usage),
     # not in runnable code.
     "src/task_archive.py",
+    # task-delegation.ts never resolves workspace paths itself — dirs are
+    # injected by task-bridge (which resolves via workspace_default). The
+    # flagged token is the `kind: 'tasks' | 'results'` TYPE UNION on the
+    # injected archive callback, mirroring archiveFile's own signature.
+    "src/task-delegation.ts",
 }
 
 

@@ -1,0 +1,11 @@
+{
+  "name": "task-progress",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "Sends mid-task progress updates to the channel a task came from (Slack, Discord, or Telegram).",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}

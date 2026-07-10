@@ -1,0 +1,11 @@
+{
+  "name": "agent-room-ops",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "One skill, multiple tools. Everything an agent does in a room beyond its task",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}

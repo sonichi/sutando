@@ -3,9 +3,10 @@
 # Addresses Lucy's Maddy v0.8 migration report (2026-06-06 #design):
 # sutando-migrate previously set up M2 directories but did NOT copy Claude
 # memory from `~/.claude/projects/<slug>/*` to `<workspace>/.claude-sutando/
-# projects/<slug>/*`. Owner's workaround was to run `bash scripts/
-# sutando-shell-setup.sh --import` manually; now `commit_main` wires that
-# automatically as the final step.
+# projects/<slug>/*`. Owner's workaround was to run the shell-setup script's
+# `--import` manually (now at src/agent/claude/cli/sutando-shell-setup.sh — moved
+# from scripts/ in PR #1891); now `commit_main` wires that automatically as the
+# final step.
 #
 # This test verifies the wiring (flag parsing + call site shape) without
 # requiring a full live --import run (which depends on rsync + actual

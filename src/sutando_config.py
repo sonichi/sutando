@@ -426,7 +426,7 @@ def resolve_claude_sutando_config_dir(repo_root: Optional[Path] = None) -> Path:
     `/tmp/...` doesn't become `/private/tmp/...` from a stray `.resolve()`).
 
     Does NOT create the directory; callers (e.g.
-    `scripts/sutando-shell-setup.sh`) are responsible for mkdir as part of the
+    `src/agent/claude/cli/sutando-shell-setup.sh`) are responsible for mkdir as part of the
     alias-setup flow.
     """
     global _LEGACY_CLAUDE_SUBDIR_WARN_PRINTED

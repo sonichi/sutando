@@ -9,7 +9,11 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { parseRefreshResponse } from '../skills/quota-tracker/scripts/credential-proxy.ts';
+import {
+	keychainServiceCandidates,
+	parseRefreshResponse,
+	scopedKeychainService,
+} from '../skills/quota-tracker/scripts/credential-proxy.ts';
 
 const base = { accessToken: 'old-access', refreshToken: 'old-refresh', expiresAt: 1000 };
 const A = 'a'.repeat(40); // a plausible (>=20 char) access token
@@ -60,4 +64,18 @@ test('preserves unrelated existing fields (scopes etc.)', () => {
 	const r = parseRefreshResponse(200, JSON.stringify({ access_token: A, expires_in: 10 }), withScopes, 0);
 	assert.deepEqual(r?.scopes, ['a', 'b']);
 	assert.equal(r?.subscriptionType, 'max');
+});
+
+test('CLAUDE_CONFIG_DIR maps to Claude Code scoped keychain service', () => {
+	const ccd = '/Users/ruiwang/.sutando/repo/workspace/.claude-sutando';
+	assert.equal(scopedKeychainService(ccd), 'Claude Code-credentials-c365fc51');
+	assert.deepEqual(keychainServiceCandidates(ccd), [
+		'Claude Code-credentials-c365fc51',
+		'Claude Code-credentials',
+	]);
+});
+
+test('keychain candidates fall back to the default service when no config dir is set', () => {
+	assert.equal(scopedKeychainService(''), null);
+	assert.deepEqual(keychainServiceCandidates(''), ['Claude Code-credentials']);
 });

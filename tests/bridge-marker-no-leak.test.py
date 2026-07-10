@@ -17,6 +17,7 @@ Guards:
   1. src/slack-bridge.py imports parse_markers from result_markers
   2. src/telegram-bridge.py imports parse_markers from result_markers
   3. src/discord-bridge.py imports parse_markers from result_markers (#896)
+  3c. src/remote-gateway-bridge.py imports parse_markers (file-attach change)
   4. Each bridge's marker-handling block calls parse_markers(...)
   5. result_markers.py exposes the public surface parse_markers + Action
 
@@ -92,6 +93,20 @@ def main() -> int:
             return fail(
                 f"src/discord-bridge.py still has hand-rolled skip check {hand_rolled!r} — "
                 "must route through parse_markers() per #896"
+            )
+
+    # 3c. Remote-gateway bridge wires the parser (outbound file-attach change)
+    gb = REPO / "src" / "remote-gateway-bridge.py"
+    gb_src = gb.read_text()
+    if "from result_markers import parse_markers" not in gb_src:
+        return fail("src/remote-gateway-bridge.py must import parse_markers from result_markers")
+    if "parse_markers(" not in gb_src:
+        return fail("src/remote-gateway-bridge.py must call parse_markers(...) somewhere")
+    for hand_rolled in ('startswith("[no-send]")', 'startswith("[deduped:")'):
+        if hand_rolled in gb_src:
+            return fail(
+                f"src/remote-gateway-bridge.py still has hand-rolled skip check {hand_rolled!r} — "
+                "must route through parse_markers() per #873"
             )
 
     # 4. Behavior smoke test of the parser itself

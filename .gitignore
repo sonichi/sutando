@@ -118,3 +118,9 @@ ag2-onboarding.txt
 
 # IDE / editor workspace state — per-user, never shared.
 .vscode/
+# coverage-gate artifacts (scripts/coverage-gate.sh)
+.coverage
+.coverage.*
+coverage.xml
+diff-cover.md
+coverage-summary.md
