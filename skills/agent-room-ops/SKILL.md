@@ -18,7 +18,7 @@ does the privileged Matrix ops + authoritative membership enforcement.
 | `react <room> <event>` | add an `m.reaction` (ack) | discord `add_reaction` (👀/✅) |
 | `unreact <room> <event>` | remove the agent's reaction | discord remove-on-reply |
 | `join <room>` | accept the agent's own pending invite | discord guild-join on invite |
-| `doc get\|put\|rm <room>` | read/write/delete the room's shared vault docs (context, todo, memos — or any agent-defined folder) | the durable-state half: like a pinned channel wiki the bot can edit |
+| `doc get\|put\|rm <room>` | read/write/delete the room's shared **Room Context** docs (context, todo, memos — or any agent-defined folder) | the durable-state half: like a pinned channel wiki the bot can edit |
 
 ```bash
 python3 skills/agent-room-ops/room_ops.py read   '!room:hs' --limit 20 --agent '@a:hs'
