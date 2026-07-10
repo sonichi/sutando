@@ -58,6 +58,7 @@ from pathlib import Path
 # src/ and pointed outside the repo).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
+from task_archive import find_task_file  # noqa: E402
 import local_task_protocol  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
 from send_allowlist import is_path_sendable  # noqa: E402
@@ -684,6 +685,21 @@ def _archive_result(path: Path, tid: str) -> None:
         path.rename(ARCHIVE_RESULTS_DIR / f"{tid}-{int(time.time())}.txt")
     except OSError:
         path.unlink(missing_ok=True)
+    # The delivered task's queue file comes along too — otherwise served tasks
+    # sit in tasks/ forever and the health-check counts them as a stuck queue.
+    # find_task_file resolves the ACTUAL filename: bare `<tid>.txt` or the
+    # claimed variant `<tid>.claimed-core-N.txt` the core renames to while
+    # processing (review catch: probing only the bare name left claimed files
+    # behind, and health-check counts every top-level tasks/*.txt). Archived
+    # under the bare name — the shape _write_task's redelivery dedup checks.
+    tfile = find_task_file(TASKS_DIR, tid)
+    if tfile is not None:
+        archive_dir = TASKS_DIR / "archive"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            tfile.rename(archive_dir / f"{tid}.txt")
+        except OSError:
+            pass  # best-effort; core may have archived it concurrently
 
 
 def _load_inflight() -> set[str]:

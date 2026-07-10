@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
+import tempfile
 import sys
 import types
 import unittest
@@ -182,6 +184,101 @@ class TestSendTelegram(unittest.TestCase):
         self.assertFalse(result)
 
 
+class TestSendRemoteGateway(unittest.TestCase):
+    def setUp(self):
+        self.mod = _load()
+
+    def test_success_posts_room_message_op(self):
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = b'{"ok": true}'
+        captured = {}
+
+        def fake_urlopen(req, timeout=10):
+            captured["url"] = req.full_url
+            captured["payload"] = json.loads(req.data)
+            return mock_resp
+
+        clean_env = {k: v for k, v in os.environ.items()
+                     if k not in ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN")}
+        with patch.object(self.mod, "_env_file",
+                          return_value={"REMOTE_TASK_URL": "https://gw.example/relay",
+                                        "REMOTE_TASK_TOKEN": "bearer-fake"}), \
+             patch.dict(os.environ, clean_env, clear=True), \
+             patch("urllib.request.urlopen", fake_urlopen):
+            result = self.mod.send_remote_gateway("someprovider", "!room:server", "hello")
+        self.assertTrue(result)
+        self.assertEqual(captured["url"], "https://gw.example/relay/v1/room")
+        self.assertEqual(captured["payload"],
+                         {"op": "message", "room_id": "!room:server", "body": "hello"})
+
+    def test_missing_env_returns_false(self):
+        clean_env = {k: v for k, v in os.environ.items()
+                     if k not in ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN")}
+        with patch.object(self.mod, "_env_file", return_value={}), \
+             patch.dict(os.environ, clean_env, clear=True):
+            result = self.mod.send_remote_gateway("someprovider", "!room:server", "hello")
+        self.assertFalse(result)
+
+
+class TestGatewaySourceTraversal(unittest.TestCase):
+    """Regression for the confirmed traversal finding on PR #2054: a --source
+    like `../evil` must never escape $CLAUDE_CONFIG_DIR/channels — neither
+    reading the escaped .env nor posting its bearer anywhere."""
+
+    def setUp(self):
+        self.mod = _load()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = Path(self.tmp.name)
+        (self.cfg / "channels").mkdir(parents=True)
+        # The file an attacker wants us to read: OUTSIDE channels/, .env-shaped,
+        # with an attacker-controlled URL alongside the secret.
+        (self.cfg / "evil").mkdir()
+        (self.cfg / "evil" / ".env").write_text(
+            "REMOTE_TASK_URL=https://escaped.example\nREMOTE_TASK_TOKEN=escaped-token\n")
+        self.env_patch = patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.cfg)}, clear=False)
+        self.env_patch.start()
+        # env vars must not mask the file-read path under test
+        for var in ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN"):
+            os.environ.pop(var, None)
+
+    def tearDown(self):
+        self.env_patch.stop()
+        self.tmp.cleanup()
+
+    def test_dotdot_source_refused_before_any_read(self):
+        posts = []
+        with patch.object(self.mod, "_post", side_effect=lambda *a, **k: posts.append(a) or True):
+            ok = self.mod.send_remote_gateway("../evil", "!room:server", "hi")
+        self.assertFalse(ok)
+        self.assertEqual(posts, [])
+
+    def test_dotdot_source_refused_via_cli(self):
+        r = subprocess.run(
+            [sys.executable, str(SCRIPT), "--source", "../evil",
+             "--channel-id", "!room:server", "--message", "hi"],
+            capture_output=True, text=True,
+            env={**os.environ, "CLAUDE_CONFIG_DIR": str(self.cfg)},
+        )
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("invalid gateway source", r.stderr)
+        self.assertNotIn("escaped-token", r.stderr)
+
+    def test_symlink_escape_refused(self):
+        # Slug-valid name whose directory symlinks out of channels/.
+        os.symlink(self.cfg / "evil", self.cfg / "channels" / "sneaky")
+        posts = []
+        with patch.object(self.mod, "_post", side_effect=lambda *a, **k: posts.append(a) or True):
+            ok = self.mod.send_remote_gateway("sneaky", "!room:server", "hi")
+        self.assertFalse(ok)
+        self.assertEqual(posts, [])
+
+    def test_uppercase_and_weird_slugs_refused(self):
+        for bad in ("EVIL", "a b", "a/b", ".hidden", "", "-lead"):
+            self.assertFalse(self.mod.send_remote_gateway(bad, "!r:s", "hi"), bad)
+
+
 class TestCLI(unittest.TestCase):
     def test_missing_channel_id_exits_1(self):
         r = subprocess.run(
@@ -197,13 +294,18 @@ class TestCLI(unittest.TestCase):
         )
         self.assertNotEqual(r.returncode, 0)
 
-    def test_unknown_source_rejected_by_argparse(self):
+    def test_unconfigured_gateway_source_fails_open(self):
+        # A source outside the built-ins routes to the remote-gateway sender;
+        # with no channels/<source>/.env it must fail (exit 1) with a hint —
+        # never traceback, never block.
         r = subprocess.run(
             [sys.executable, str(SCRIPT), "--source", "whatsapp",
              "--channel-id", "D123", "--message", "hi"],
             capture_output=True, text=True,
+            env={"PATH": "/usr/bin:/bin", "CLAUDE_CONFIG_DIR": "/nonexistent"},
         )
-        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("REMOTE_TASK_URL", r.stderr)
 
     def test_long_message_rejected_before_token_lookup(self):
         r = subprocess.run(
