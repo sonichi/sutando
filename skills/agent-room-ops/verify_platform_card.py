@@ -46,7 +46,7 @@ import urllib.request
 try:  # pragma: no cover — which branch runs depends on the environment
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
     _HAVE_CRYPTO = True
-except ImportError:  # stock environment — pure fallback below
+except ImportError:  # pragma: no cover — stock environment, pure fallback below
     _HAVE_CRYPTO = False
 
 _UA = "ag2-room-ops-verify/1.0"
@@ -56,7 +56,7 @@ _TIMEOUT = 15
 _key_cache: dict = {}
 
 
-def _fetch(url: str) -> bytes:
+def _fetch(url: str) -> bytes:  # pragma: no cover — network boundary, tests monkeypatch it
     req = urllib.request.Request(url, headers={"User-Agent": _UA})
     with urllib.request.urlopen(req, timeout=_TIMEOUT) as r:
         return r.read()
@@ -119,7 +119,9 @@ def _ed_decode(s: bytes):
     x = _ed_xrecover(y)
     if x & 1 != s[31] >> 7:
         x = _ED_Q - x
-    if (-x * x + y * y - 1 - _ED_D * x * x * y * y) % _ED_Q:
+    if (-x * x + y * y - 1 - _ED_D * x * x * y * y) % _ED_Q:  # pragma: no cover
+        # Unreachable via decode inputs (x is derived from y to satisfy the
+        # curve equation) — belt-and-braces in case _ed_xrecover changes.
         raise ValueError("point not on curve")
     return (x, y, 1, x * y % _ED_Q)
 
