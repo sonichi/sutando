@@ -46,11 +46,20 @@ def resolve_token(repo):
                     break
     if not raw:
         return None, None
+    # Combined onboarding form "https://<gateway>|<secret>" carries the URL in
+    # the token; otherwise it's a bare secret and the URL comes from env.
     if "|" in raw and raw.split("|", 1)[0].startswith(("http://", "https://")):
-        url, secret = raw.split("|", 1)
+        url_from_token, secret = raw.split("|", 1)
     else:
-        url, secret = os.environ.get("GATEWAY_URL", ""), raw
-    url = (os.environ.get("GATEWAY_URL") or url).rstrip("/")
+        url_from_token, secret = "", raw
+    # URL precedence must match the existing gateway clients
+    # (src/remote-gateway-bridge.py, skills/agent-room-ops/_gateway.py): explicit
+    # GATEWAY_URL/RELAY_URL/REMOTE_TASK_URL/AG2_REMOTE_URL win, else url-from-token.
+    # Honoring only GATEWAY_URL left a valid bare-secret + REMOTE_TASK_URL install
+    # mis-detected as "not connected" (review #2079).
+    url = (os.environ.get("GATEWAY_URL") or os.environ.get("RELAY_URL")
+           or os.environ.get("REMOTE_TASK_URL") or os.environ.get("AG2_REMOTE_URL")
+           or url_from_token or "").rstrip("/")
     return (url or None), (secret or None)
 
 
