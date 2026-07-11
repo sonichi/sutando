@@ -50,25 +50,41 @@ echo "disk-hygiene $(date -u +%Y-%m-%dT%H:%M:%SZ)  repo=$REPO_ROOT"
 echo "workspace=$WORKSPACE  (dry-run=$DRY_RUN)"
 
 # ── Step 1: reclaim git bloat in the workspace vault repo ────────────────────
-# The workspace often has its own .git (the synced vault). Remove stale interrupted-repack
-# temp packs first, then gc --prune=now to drop unreferenced objects.
+# The workspace often has its own .git (the synced vault). Remove stale
+# interrupted-repack temp packs, then run a plain `git gc` to pack loose objects.
+# IMPORTANT: sync-workspace.sh mutates the vault .git on a schedule and
+# serializes on a mkdir mutex at SUTANDO_SYNC_LOCK_DIR. We must coordinate with
+# it — an unlocked prune racing an in-flight sync/push can prune newly written
+# but not-yet-referenced objects and corrupt the vault. So we (a) take the SAME
+# lock and skip cleanly if a sync holds it, and (b) never use `--prune=now`:
+# plain `git gc` keeps git's default 2-week prune grace, which is safe even if
+# the lock were somehow bypassed. The orphaned-temp-pack cleanup stays (it only
+# removes tmp_* older than 24h — no live repack runs that long). (review #2078)
+SYNC_LOCK_DIR="${SUTANDO_SYNC_LOCK_DIR:-/tmp/sync-workspace.lock.d}"
 VAULT_GIT="$WORKSPACE/.git"
 if [ -d "$VAULT_GIT" ]; then
-  echo "[1/4] workspace vault git:"
+  echo "[1/4] workspace vault git (lock-coordinated with sync-workspace.sh):"
   pack_dir="$VAULT_GIT/objects/pack"
-  if [ -d "$pack_dir" ]; then
-    # tmp_pack_* / tmp_*.pack older than N hours = orphaned interrupted repack
-    while IFS= read -r -d '' tp; do
-      sz="$(du -h "$tp" 2>/dev/null | cut -f1)"
-      _action "remove orphaned temp pack $tp ($sz)"
-      [ "$DRY_RUN" = "1" ] || rm -f "$tp"
-    done < <(find "$pack_dir" -maxdepth 1 -type f -name 'tmp_*' -mmin +$((TMPPACK_AGE_HOURS*60)) -print0 2>/dev/null)
+  # Stale-lock reap — mirror sync-workspace.sh's 10-min crash policy so a dead
+  # sync can't block hygiene forever.
+  if [ -d "$SYNC_LOCK_DIR" ] && find "$SYNC_LOCK_DIR" -maxdepth 0 -mmin +10 2>/dev/null | grep -q .; then
+    echo "  reaping stale sync lock (>10m old)"; [ "$DRY_RUN" = "1" ] || rm -rf "$SYNC_LOCK_DIR"
   fi
   if [ "$DRY_RUN" = "1" ]; then
-    garbage="$(git -C "$WORKSPACE" count-objects -vH 2>/dev/null | awk '/size-garbage/{print $2, $3}')"
-    echo "  [dry-run] would git gc --prune=now (current reclaimable garbage: ${garbage:-unknown})"
+    tp_n="$(find "$pack_dir" -maxdepth 1 -type f -name 'tmp_*' -mmin +$((TMPPACK_AGE_HOURS*60)) 2>/dev/null | wc -l | tr -d ' ')"
+    echo "  [dry-run] would take $SYNC_LOCK_DIR (skip if a sync holds it), remove $tp_n orphaned temp pack(s) >${TMPPACK_AGE_HOURS}h, then git gc (default 2-week prune grace — no --prune=now)"
+  elif mkdir "$SYNC_LOCK_DIR" 2>/dev/null; then
+    trap 'rm -rf "$SYNC_LOCK_DIR"' EXIT INT TERM
+    if [ -d "$pack_dir" ]; then
+      while IFS= read -r -d '' tp; do
+        sz="$(du -h "$tp" 2>/dev/null | cut -f1)"
+        echo "  remove orphaned temp pack $tp ($sz)"; rm -f "$tp"
+      done < <(find "$pack_dir" -maxdepth 1 -type f -name 'tmp_*' -mmin +$((TMPPACK_AGE_HOURS*60)) -print0 2>/dev/null)
+    fi
+    git -C "$WORKSPACE" gc --quiet 2>/dev/null && echo "  git gc done (default prune grace; concurrent-safe)" || echo "  git gc skipped/failed (non-fatal)"
+    rm -rf "$SYNC_LOCK_DIR"; trap - EXIT INT TERM
   else
-    git -C "$WORKSPACE" gc --prune=now --quiet 2>/dev/null && echo "  git gc --prune=now done" || echo "  git gc skipped/failed (non-fatal)"
+    echo "  a workspace sync holds $SYNC_LOCK_DIR — skipping vault git this run (retries next week)"
   fi
 else
   echo "[1/4] no workspace vault git — skip"
