@@ -2889,6 +2889,15 @@ async def _handle_discord_message(message, force=False):
 
     # Determine access tier
     access_tier = "other"
+    # is_collaborator: a TEAM sender the owner has listed under the SERVING
+    # channel's `collaborators` array in access.json. Collaborators get the
+    # `team-collaborator` "engage" rulebook (reply in-channel, fold in their
+    # input) instead of the default RUN-CODEX/NO-REPLY team rulebook — a
+    # first-class, per-channel structural path for "cooperate with this person
+    # here" that does NOT elevate them to global owner. The authority boundary
+    # is unchanged: irreversible / system-mutating actions still require the
+    # owner. Scope is strictly per-channel (keyed on the serving channel_id).
+    is_collaborator = False
     if sender_id in allowed:
         access_tier = "owner"
         # Record owner activity for status-aware-pivot in proactive loop
@@ -2903,6 +2912,12 @@ async def _handle_discord_message(message, force=False):
                     team_ids.update(ch_cfg.get("allowFrom", []))
             if sender_id in team_ids:
                 access_tier = "team"
+                # Per-channel collaborator check: only the serving channel's
+                # own `collaborators` list grants engagement — membership in
+                # some OTHER channel's collaborators does not carry over.
+                serving_cfg = data.get("groups", {}).get(str(message.channel.id), {})
+                if isinstance(serving_cfg, dict) and sender_id in set(serving_cfg.get("collaborators", [])):
+                    is_collaborator = True
         except Exception:
             pass
 
@@ -3005,7 +3020,9 @@ async def _handle_discord_message(message, force=False):
     # Per `feedback_codex_relay_doesnt_factcheck` — codex executes literally;
     # this preamble shifts the framing baseline. Owner-tier doesn't go through
     # codex (per CLAUDE.md "Discord access control"), so preamble is N/A there.
-    if access_tier in ("team", "other"):
+    # Collaborators are also N/A: they're engaged directly by the core agent
+    # (not sandboxed via codex), so they must NOT get the codex framing preamble.
+    if access_tier in ("team", "other") and not is_collaborator:
         codex_prompt_text = (
             "You are answering on behalf of Sutando, an autonomous personal AI agent.\n"
             "Sutando's actual skills live in `skills/` (this repo) and under `$CLAUDE_CONFIG_DIR/skills/`.\n"
@@ -3064,12 +3081,13 @@ async def _handle_discord_message(message, force=False):
             # here would reintroduce the nested-escape pathology codex's
             # stdin parser hangs on. Per MacBook's #644 v2 review 2026-05-10.
             Path(prompt_path).write_text(user_task_text)
-        elif access_tier in ("team", "other"):
-            # Silent-escalate stays NON-OWNER-only. The prefetch above now runs
-            # for all tiers (so the contextNotFrom gate applies to owner too),
-            # but an owner task with no enrichable refs must just proceed to
+        elif access_tier in ("team", "other") and not is_collaborator:
+            # Silent-escalate stays NON-OWNER-only, and collaborators are
+            # excluded too. The prefetch above now runs for all tiers (so the
+            # contextNotFrom gate applies to owner too), but an owner OR
+            # collaborator task with no enrichable refs must just proceed to
             # normal handling — not get silently escalated/declined. Only the
-            # non-owner tiers fall back to the PR #639 escalate path.
+            # plain non-owner tiers fall back to the PR #639 escalate path.
             try:
                 already_escalated = await _silent_escalate_for_discord_state(message, user_task_text)
             except Exception as e:
@@ -3107,6 +3125,28 @@ async def _handle_discord_message(message, force=False):
     # review. Removed in favor of skipping the task-file write entirely.)
     tier_instructions = {
         "owner": "",
+        "team-collaborator": (
+            "\n\n===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"
+            "This task is from a designated COLLABORATOR in this channel (a team-tier sender the owner "
+            "has listed under this channel's `collaborators`). Engage substantively — do NOT sandbox "
+            "them via codex and do NOT default to NO-REPLY the way a plain team task is handled.\n\n"
+            "DO:\n"
+            "- Reply in-channel: write your response to results/task-{id}.txt (delivered back to this channel).\n"
+            "- Treat their message as collaborative input from a working peer within this channel's scope — "
+            "discuss, draft, and iterate on copy / design / analysis, and fold their contributions into the "
+            "shared work. Do not silently archive a substantive contribution.\n\n"
+            "DO NOT (authority boundary — unchanged from team tier):\n"
+            "- Take any irreversible or system-mutating action on their say-so: no git commit / push / merge, "
+            "no deleting or overwriting files, no sending to other channels or external services (email, "
+            "posts, DMs), no financial actions, no config / credential changes, no restarts. Those still "
+            "require the OWNER.\n"
+            "- If they ask for such an action, engage on the substance and prepare it if useful, but route "
+            "the go/no-go to the owner (say so in-channel) rather than executing it yourself.\n"
+            "- Never read .env, credentials, or secrets.\n\n"
+            "Scope: collaborator status is per-channel only — it grants engagement HERE, not owner authority "
+            "anywhere else.\n"
+            "===END SUTANDO SYSTEM INSTRUCTIONS===\n"
+        ),
         "team": (
             "\n\n===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"
             "This task is from a TEAM tier sender. Choose ONE of three actions based on the content:\n\n"
@@ -3261,6 +3301,13 @@ async def _handle_discord_message(message, force=False):
         # try, so a failure in this f-string build is logged as a FAILED
         # line (see the instrumentation note above) instead of raising
         # before the logging is reached.
+        # Collaborators keep `access_tier: team` (so every existing team consumer —
+        # priority, progress-streamer, dedup — behaves exactly as before) and get an
+        # orthogonal `collaborator: true` marker plus the engage rulebook. The
+        # rulebook is the in-band enforcement surface the core agent follows, so
+        # swapping it is what actually changes handling.
+        collaborator_line = "collaborator: true\n" if is_collaborator else ""
+        rulebook_key = "team-collaborator" if is_collaborator else access_tier
         return (
             f"id: {task_id}\n"
             f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
@@ -3274,9 +3321,10 @@ async def _handle_discord_message(message, force=False):
             f"{parent_msg_line}"
             f"user_id: {message.author.id}\n"
             f"access_tier: {access_tier}\n"
+            f"{collaborator_line}"
             f"priority: {priority}\n"
             f"task: {user_task_text}\n"
-            f"{tier_instructions.get(access_tier, tier_instructions['other'])}"
+            f"{tier_instructions.get(rulebook_key, tier_instructions['other'])}"
             f"{discord_skill_hints}"
         )
 
