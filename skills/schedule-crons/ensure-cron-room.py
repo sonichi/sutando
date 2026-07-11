@@ -34,23 +34,37 @@ import argparse, json, os, sys, time, urllib.request, urllib.error
 
 
 def resolve_token(repo):
-    raw = (os.environ.get("GATEWAY_TOKEN") or os.environ.get("REMOTE_TASK_TOKEN")
-           or os.environ.get("AG2_REMOTE_TOKEN") or "")
-    if not raw:
-        envp = os.path.join(repo, ".env")
-        if os.path.isfile(envp):
-            for line in open(envp):
-                line = line.strip()
-                if line.startswith("AG2_REMOTE_TOKEN="):
-                    raw = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    break
+    # Resolve gateway creds from the SAME alias set the existing clients use
+    # (src/remote-gateway-bridge.py, skills/agent-room-ops/_gateway.py) — read
+    # from BOTH process env and <repo>/.env (the persistent bridge/startup
+    # setup), process env winning. Parsing only AG2_REMOTE_TOKEN from .env
+    # mis-detected a split-token install (e.g. REMOTE_TASK_URL + REMOTE_TASK_TOKEN)
+    # as "not connected" (review #2079).
+    TOKEN_KEYS = ("GATEWAY_TOKEN", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")
+    URL_KEYS = ("GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL", "AG2_REMOTE_URL")
+    vals = {k: os.environ.get(k) for k in TOKEN_KEYS + URL_KEYS}
+    envp = os.path.join(repo, ".env")
+    if os.path.isfile(envp):
+        for line in open(envp):
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            if k in vals and not vals.get(k):  # process env wins over .env
+                vals[k] = v.strip().strip('"').strip("'")
+    raw = next((vals[k] for k in TOKEN_KEYS if vals.get(k)), "")
     if not raw:
         return None, None
+    # Combined onboarding form "https://<gateway>|<secret>" carries the URL in
+    # the token; otherwise it's a bare secret and the URL comes from env.
     if "|" in raw and raw.split("|", 1)[0].startswith(("http://", "https://")):
-        url, secret = raw.split("|", 1)
+        url_from_token, secret = raw.split("|", 1)
     else:
-        url, secret = os.environ.get("GATEWAY_URL", ""), raw
-    url = (os.environ.get("GATEWAY_URL") or url).rstrip("/")
+        url_from_token, secret = "", raw
+    # URL precedence (same as the existing clients): explicit
+    # GATEWAY_URL > RELAY_URL > REMOTE_TASK_URL > AG2_REMOTE_URL > url-from-token.
+    url = next((vals[k] for k in URL_KEYS if vals.get(k)), url_from_token or "").rstrip("/")
     return (url or None), (secret or None)
 
 
