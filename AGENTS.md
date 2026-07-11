@@ -74,6 +74,8 @@ If `PERSONAL_AGENTS.md` exists, read and follow it. It contains user-specific ru
 
 ## Work Status
 
+> **Core-only — guests skip this (full rationale in [Chat-path task tracking](#chat-path-task-tracking-issue-585) below).** If you are a scheduled/one-shot/review automation that merely opened this repo (a `codex exec`/headless run, a PR-review or branch-hygiene cron, or any agent that auto-loaded this file by virtue of the repo being your cwd), you are a **guest in this checkout, not the live core**: do NOT write `core-status.json` or any `state/` liveness. Status/heartbeat/liveness writes belong to the single live Sutando core. The "applies to all work" note below scopes the core's *own* activities — it does not enlist guests.
+
 Signal your work status to the workspace `core-status.json` so the web UI and `health-check.py` can display it. Write the **absolute** workspace path: the session cwd is the repo, so a bare `state/core-status.json` lands in `<repo>/state/` — where no reader looks. Readers resolve `<workspace>/state/core-status.json` via `status_read_path` (`src/workspace_default.py`), where `<workspace>` = the M0 canonical (`<repo>/workspace/` by default; env-overridable as the legacy escape).
 
 ```bash
