@@ -34,38 +34,23 @@ import argparse, json, os, sys, time, urllib.request, urllib.error
 
 
 def resolve_token(repo):
-    # Resolve gateway creds from the SAME alias set the existing clients use
-    # (src/remote-gateway-bridge.py, skills/agent-room-ops/_gateway.py) — read
-    # from BOTH process env and <repo>/.env (the persistent bridge/startup
-    # setup), process env winning. Parsing only AG2_REMOTE_TOKEN from .env
-    # mis-detected a split-token install (e.g. REMOTE_TASK_URL + REMOTE_TASK_TOKEN)
-    # as "not connected" (review #2079).
-    TOKEN_KEYS = ("GATEWAY_TOKEN", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")
-    URL_KEYS = ("GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL", "AG2_REMOTE_URL")
-    vals = {k: os.environ.get(k) for k in TOKEN_KEYS + URL_KEYS}
-    envp = os.path.join(repo, ".env")
-    if os.path.isfile(envp):
-        for line in open(envp):
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            k = k.strip()
-            if k in vals and not vals.get(k):  # process env wins over .env
-                vals[k] = v.strip().strip('"').strip("'")
-    raw = next((vals[k] for k in TOKEN_KEYS if vals.get(k)), "")
+    raw = (os.environ.get("GATEWAY_TOKEN") or os.environ.get("REMOTE_TASK_TOKEN")
+           or os.environ.get("AG2_REMOTE_TOKEN") or "")
+    if not raw:
+        envp = os.path.join(repo, ".env")
+        if os.path.isfile(envp):
+            for line in open(envp):
+                line = line.strip()
+                if line.startswith("AG2_REMOTE_TOKEN="):
+                    raw = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
     if not raw:
         return None, None
-    # Combined onboarding form "https://<gateway>|<secret>" carries the URL in
-    # the token; otherwise it's a bare secret and the URL comes from env.
     if "|" in raw and raw.split("|", 1)[0].startswith(("http://", "https://")):
-        url_from_token, secret = raw.split("|", 1)
+        url, secret = raw.split("|", 1)
     else:
-        url_from_token, secret = "", raw
-    # URL precedence (same as the existing clients): explicit
-    # GATEWAY_URL > RELAY_URL > REMOTE_TASK_URL > AG2_REMOTE_URL > url-from-token,
-    # each resolved from process-env-or-.env via `vals`.
-    url = next((vals[k] for k in URL_KEYS if vals.get(k)), url_from_token or "").rstrip("/")
+        url, secret = os.environ.get("GATEWAY_URL", ""), raw
+    url = (os.environ.get("GATEWAY_URL") or url).rstrip("/")
     return (url or None), (secret or None)
 
 
@@ -92,21 +77,27 @@ def ensure_one(url, secret, owner, entry, dry_run):
         return "no-room-opt-in", ""
     if isinstance(room, str) and room.startswith("!"):
         return "exists", room  # already ensured — idempotent skip
-    # room == "auto" (or truthy sentinel) → create
+    # room == "auto" (or truthy sentinel) → create a dedicated sub-room.
     if dry_run:
         return "would-create", f"Sutando · {name}"
-    s, res = call(url, secret, {"op": "create", "name": f"Sutando · {name}"})
+    # CREATE-WITH-INVITE: op:create accepts an `invite:[mxid]` list and invites
+    # at creation (owner E2E-confirmed 2026-07-11). This bypasses the separate
+    # op:invite op, which is broker-broken (hangs ~30s → 502). Never call
+    # op:invite here — it's unreliable and can queue duplicate invites.
+    payload = {"op": "create", "name": f"Sutando · {name}"}
+    if owner:
+        payload["invite"] = [owner]
+    s, res = call(url, secret, payload)
     rid = res.get("room_id") if isinstance(res, dict) else None
     if not rid:
         return "CREATE_FAIL", f"{s} {res}"
-    inv_s, _ = call(url, secret, {"op": "invite", "room_id": rid, "user_id": owner})
     body = (f"**[Sutando cron room: {name}]**\n"
             f"Schedule: `{entry.get('cron', 'dynamic')}`\n"
             f"This room receives the output of the **{name}** cron. "
-            f"Created by ensure-cron-room (schedule-crons).")
+            f"Created by ensure-cron-room (schedule-crons), invited at creation.")
     call(url, secret, {"op": "message", "room_id": rid, "body": body})
     entry["room"] = rid
-    return "created", f"{rid} (invite={inv_s})"
+    return "created", rid
 
 
 def main():
