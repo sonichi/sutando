@@ -42,9 +42,16 @@ const OVERLAYS = {
 // --- Multi-display support ----------------------------------------------
 
 function resolveWorkspace() {
-  const env = process.env.SUTANDO_WORKSPACE;
-  if (env) return path.resolve(env.replace(/^~(?=$|\/)/, os.homedir()));
-  return path.join(os.homedir(), '.sutando', 'workspace');
+  // launch.sh exports SUTANDO_RESOLVED_WORKSPACE (M0 canonical, from
+  // sutando-config.sh). $SUTANDO_WORKSPACE is no longer honored since v0.8/#1440.
+  // Last resort: ~/sutando-workspace — the post-v0.8 last-ditch fallback for
+  // ad-hoc invocations outside a checkout (mirrors src/workspace_default.py
+  // default_workspace_dir); the workspace is never under ~/.sutando post-M0.
+  const resolved = process.env.SUTANDO_RESOLVED_WORKSPACE;
+  if (resolved) return resolved;
+  const legacy = process.env.SUTANDO_WORKSPACE;
+  if (legacy) return path.resolve(legacy.replace(/^~(?=$|\/)/, os.homedir()));
+  return path.join(os.homedir(), 'sutando-workspace');
 }
 
 const DISPLAY_PREF_PATH = path.join(

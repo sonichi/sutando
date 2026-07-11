@@ -1,0 +1,11 @@
+{
+  "name": "image-generation",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "stable",
+  "description": "Generate and edit images using Gemini Flash Image, and generate videos using Veo. Supports text-to-image, image editing, text-to-video, and image-to-video.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}

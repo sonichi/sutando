@@ -11,6 +11,10 @@ TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 mkdir -p "$TMPDIR/tasks"
 
+# SUTANDO_TEST_MODE=1 lets resolve_workspace() honor SUTANDO_WORKSPACE silently
+# (without emitting the v0.8 deprecation warning that contaminates captured output).
+export SUTANDO_TEST_MODE=1
+
 fail() { echo "FAIL: $1" >&2; exit 1; }
 ok()   { echo "  ok  $1"; }
 

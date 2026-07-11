@@ -2,9 +2,9 @@ name: CI
 
 on:
   pull_request:
-    branches: [main, staging-workspace-revamp]
+    branches: [main, staging-interaction-planes]
   push:
-    branches: [main, staging-workspace-revamp]
+    branches: [main, staging-interaction-planes]
 
 jobs:
   typecheck-and-test:
@@ -58,6 +58,16 @@ jobs:
       # configs and broken imports slipped through to runtime. Issue #1586.
       - name: Typecheck skills
         run: npm run typecheck:skills
+
+      # Skill-manifest validator + its own test. The test lives next to the code
+      # in scripts/ (not tests/), so the standalone-Python-test step below won't
+      # discover it — wire both explicitly here. `--all --strict` validates every
+      # skills/*/manifest.json (the path skills/MANIFEST.md documents) and fails on
+      # warnings (e.g. a network permission that doesn't match the code).
+      - name: Lint skill manifests
+        run: |
+          python3 scripts/lint-skill.test.py
+          python3 scripts/lint-skill.py --all --strict
 
       - name: Run tests
         run: npm test

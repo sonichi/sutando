@@ -25,8 +25,12 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-SENTINEL="$REPO/state/presenter-mode.sentinel"
-mkdir -p "$REPO/state"
+# state/ lives under the workspace, NOT the repo — every reader (bridges,
+# inline-tools, the talk-highlight deck) resolves it via the workspace helper.
+# Writing to <repo>/state/ silently failed to reach them (presenter-mode bug).
+WORKSPACE="$(bash "$REPO/scripts/sutando-config.sh" workspace)"
+SENTINEL="$WORKSPACE/state/presenter-mode.sentinel"
+mkdir -p "$WORKSPACE/state"
 
 cmd="${1:-status}"
 

@@ -279,7 +279,7 @@ _host_ws_segment() {
 # Section 3 — Lock (atomic mkdir, POSIX, no flock dependency)                  #
 # --------------------------------------------------------------------------- #
 
-LOCK_DIR="/tmp/sync-workspace.lock.d"
+LOCK_DIR="${SUTANDO_SYNC_LOCK_DIR:-/tmp/sync-workspace.lock.d}"
 
 acquire_lock() {
     # Stale lock cleanup: lock dir older than 10 min = assume crash, remove.

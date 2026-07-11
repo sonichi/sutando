@@ -373,7 +373,7 @@ const DEFAULT_CLAUDE_SUTANDO_SUBDIR = '.claude-sutando';
  * are rejected at load (schema pattern) AND asserted again here (defense in
  * depth, catches symlink escapes the regex misses).
  *
- * Does NOT create the directory — callers (e.g. `scripts/sutando-shell-setup.sh`)
+ * Does NOT create the directory — callers (e.g. `src/agent/claude/cli/sutando-shell-setup.sh`)
  * are responsible for mkdir as part of the alias-setup flow.
  *
  * @throws if the subdir violates the workspace-sub-folder invariant.
