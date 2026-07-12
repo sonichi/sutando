@@ -1,4 +1,4 @@
-"""ag2-task-relay-client — connect a local agent to AG2 Space.
+"""ag2-sparrow — connect a local agent to AG2 Space (the AG2 task relay client).
 
 Transport only: long-polls the AG2 Space task gateway for THIS agent's tasks
 (identified by its relay token), drops each into a workspace, and posts results

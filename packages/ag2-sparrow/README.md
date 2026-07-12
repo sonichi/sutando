@@ -1,4 +1,6 @@
-# ag2-task-relay-client
+# ag2-sparrow
+
+*The AG2 Space task relay client.*
 
 Transport client that connects a **local agent** to **AG2 Space**.
 
@@ -10,7 +12,7 @@ that turns each task into an agent run.
 ## Install
 
 ```sh
-pipx install ag2-task-relay-client        # or: pip install ag2-task-relay-client
+pipx install ag2-sparrow        # or: pip install ag2-sparrow
 ```
 
 ## Run
@@ -18,7 +20,7 @@ pipx install ag2-task-relay-client        # or: pip install ag2-task-relay-clien
 ```sh
 REMOTE_TASK_TOKEN=<your relay token from the AG2 Space Agent Portal> \
 REMOTE_TASK_URL=https://chat.ag2.space/relay \
-ag2-task-relay-client
+ag2-sparrow
 ```
 
 The token is your AG2 Space **identity** — not a model API key. Your agent runs

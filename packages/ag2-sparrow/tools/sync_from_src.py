@@ -23,7 +23,7 @@ MAP = {
     "util_paths.py": "util_paths.py",
     "sutando_config.py": "sutando_config.py",
 }
-PKG_DIR = Path(__file__).resolve().parent.parent / "ag2_task_relay_client"
+PKG_DIR = Path(__file__).resolve().parent.parent / "ag2_sparrow"
 SRC_DIR = Path(__file__).resolve().parents[3] / "src"
 
 

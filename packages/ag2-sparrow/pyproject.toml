@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ag2-task-relay-client"
+name = "ag2-sparrow"
 version = "0.1.0"
 description = "Transport client that connects a local agent to AG2 Space: long-polls the task gateway for your agent's tasks and posts results back."
 readme = "README.md"
@@ -25,7 +25,7 @@ Homepage = "https://ag2.space"
 Source = "https://github.com/sonichi/sutando"
 
 [project.scripts]
-ag2-task-relay-client = "ag2_task_relay_client.remote_gateway_bridge:main"
+ag2-sparrow = "ag2_sparrow.remote_gateway_bridge:main"
 
 [tool.setuptools]
-packages = ["ag2_task_relay_client"]
+packages = ["ag2_sparrow"]
