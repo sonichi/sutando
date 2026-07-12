@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ag2-task-relay-client"
+version = "0.1.0"
+description = "Transport client that connects a local agent to AG2 Space: long-polls the task gateway for your agent's tasks and posts results back."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "AG2 Space" }]
+keywords = ["ag2", "agent", "relay", "gateway", "matrix"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Intended Audience :: Developers",
+]
+# Zero third-party runtime deps — the client is stdlib-only (urllib/json/...).
+dependencies = []
+
+[project.urls]
+Homepage = "https://ag2.space"
+Source = "https://github.com/sonichi/sutando"
+
+[project.scripts]
+ag2-task-relay-client = "ag2_task_relay_client.remote_gateway_bridge:main"
+
+[tool.setuptools]
+packages = ["ag2_task_relay_client"]
