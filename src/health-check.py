@@ -891,6 +891,8 @@ def check_memory() -> dict:
     name = "memory"
     swap_warn_mb = int(os.environ.get("SUTANDO_MEMORY_SWAP_WARN_MB", "512"))
     swap_fail_mb = int(os.environ.get("SUTANDO_MEMORY_SWAP_FAIL_MB", "2048"))
+    free_fail_pct = int(os.environ.get("SUTANDO_MEMORY_FREE_FAIL_PCT", "15"))
+    free_warn_pct = int(os.environ.get("SUTANDO_MEMORY_FREE_WARN_PCT", "25"))
     import re as _re
 
     try:
@@ -912,11 +914,48 @@ def check_memory() -> dict:
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         pass
 
-    # Swap-in-use is sticky on macOS: pages swapped out during a past pressure
-    # event stay counted until touched again, so high swap with a *normal*
-    # kernel pressure level is residue, not active thrash. Fail only when the
-    # kernel itself signals pressure; swap corroborates, it doesn't convict.
-    if level >= 4 or (level >= 2 and swap_used_mb >= swap_fail_mb):
+    # System-wide free memory % is the honest OOM-proximity signal — the one
+    # this check's own history keeps pointing at. Kernel pressure level is a
+    # transient sample that can read 2 ("warning") for a single tick while free
+    # memory is abundant, and swap-in-use is sticky (pages swapped out during a
+    # *past* event stay counted until touched again). Convicting on those two
+    # alone produced recurring false FAILs — e.g. "level 2, swap 5655M" while
+    # `memory_pressure` reported 47% free. So free% gets the deciding vote: a
+    # transient level-2 or sticky swap only convicts when free memory is
+    # actually low. A kernel-declared level-4 (critical) still fails outright.
+    # Issue #1485 follow-up.
+    free_pct = None
+    try:
+        mp = subprocess.run(
+            ["memory_pressure"], capture_output=True, text=True, timeout=5).stdout
+        fm = _re.search(r'free percentage:\s*(\d+)%', mp)
+        if fm:
+            free_pct = int(fm.group(1))
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+    # Kernel-declared critical — trust it regardless of free%.
+    if level >= 4:
+        return {"name": name, "status": "fail",
+                "detail": f"critical memory pressure (level {level}, swap {swap_used_mb:.0f}M in use)"}
+
+    if free_pct is not None:
+        # free% available → it is the deciding vote.
+        if free_pct < free_fail_pct and (level >= 2 or swap_used_mb >= swap_fail_mb):
+            return {"name": name, "status": "fail",
+                    "detail": f"critical memory pressure ({free_pct}% free, level {level}, swap {swap_used_mb:.0f}M in use)"}
+        if free_pct < free_warn_pct and (level >= 2 or swap_used_mb >= swap_warn_mb):
+            return {"name": name, "status": "warn",
+                    "detail": f"memory pressure elevated ({free_pct}% free, level {level}, swap {swap_used_mb:.0f}M in use)"}
+        if swap_used_mb >= swap_warn_mb:
+            return {"name": name, "status": "ok",
+                    "detail": f"{free_pct}% free (healthy); swap {swap_used_mb:.0f}M is residue from a past pressure event, not active pressure (level {level})"}
+        return {"name": name, "status": "ok",
+                "detail": f"pressure normal ({free_pct}% free, level {level}, swap {swap_used_mb:.0f}M)"}
+
+    # free% unavailable (non-macOS, tool missing, or parse failure) → fall back
+    # to the level+swap heuristic (prior behavior; never blind the check).
+    if level >= 2 and swap_used_mb >= swap_fail_mb:
         return {"name": name, "status": "fail",
                 "detail": f"critical memory pressure (level {level}, swap {swap_used_mb:.0f}M in use)"}
     if level >= 2:
