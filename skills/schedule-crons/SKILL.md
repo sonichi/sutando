@@ -6,9 +6,9 @@ Re-create all session cron jobs for Sutando. Run this on startup or after a sess
 
 ## How It Works
 
-Jobs are defined per host in `<workspace>/hosts/<hostname>/crons.json` — **per-host, synced + backed up via the vault** (carried as part of the `hosts/*/` per-host subtree (#1717), which is hostname-qualified so it never collapses across hosts; see [`docs/workspace-hosts-convention.md`](../../docs/workspace-hosts-convention.md) and [`docs/workspace-per-host-paths.md`](../../docs/workspace-per-host-paths.md)). `<hostname>` is `hostname | sed 's/\..*//'`, matching the sync layer's host slug. A template is in `crons.example.json` (in this skill dir, version-controlled). Copy it on first setup:
+Jobs are defined per host in `<workspace>/hosts/<hostname>/crons.json` — **per-host, synced + backed up via the vault** (carried as part of the `hosts/*/` per-host subtree (#1717), which is hostname-qualified so it never collapses across hosts; see [`docs/workspace-hosts-convention.md`](../../docs/workspace-hosts-convention.md) and [`docs/workspace-per-host-paths.md`](../../docs/workspace-per-host-paths.md)). `<hostname>` is `bash scripts/sutando-config.sh host-label` — the canonical per-host label (`$SUTANDO_HOST_LABEL` > scutil `LocalHostName` > short `hostname`), matching the sync layer's host slug. (Do NOT use a bare `hostname | sed 's/\..*//'`: a DHCP lease can drift the hostname (e.g. Comcast → `Chis-MBP`) and split per-host paths from the stable label; #1745.) A template is in `crons.example.json` (in this skill dir, version-controlled). Copy it on first setup:
 ```bash
-WS="$(bash scripts/sutando-config.sh workspace)"; H="$(hostname | sed 's/\..*//')"; mkdir -p "$WS/hosts/$H"
+WS="$(bash scripts/sutando-config.sh workspace)"; H="$(bash scripts/sutando-config.sh host-label)"; mkdir -p "$WS/hosts/$H"
 cp skills/schedule-crons/crons.example.json "$WS/hosts/$H/crons.json"
 ```
 (Migrated from the old `skills/schedule-crons/crons.json`, which lived in the code checkout — misfiled per the workspace contract, and per-host-but-unsynced. The new path is proper per-user state: backed up + visible across hosts, each host keeping its own cron set.)
@@ -22,7 +22,7 @@ Each entry has:
 
 ## On Activation
 
-1. Read `<workspace>/hosts/<hostname>/crons.json` (resolve `<workspace>` via `bash scripts/sutando-config.sh workspace`; `<hostname>` = `hostname | sed 's/\..*//'`). **Transition / self-heal:** if that file is missing, seed it once — from the interim `<workspace>/crons/<hostname>.json` if it still exists (folded-in from the pre-#1717 layout), else the legacy `skills/schedule-crons/crons.json` (one-time migration), else `skills/schedule-crons/crons.example.json` — then read it: `WS="$(bash scripts/sutando-config.sh workspace)"; H="$(hostname | sed 's/\..*//')"; CF="$WS/hosts/$H/crons.json"; if [ ! -f "$CF" ]; then mkdir -p "$WS/hosts/$H"; SRC="$(ls "$WS/crons/$H.json" 2>/dev/null || ls skills/schedule-crons/crons.json 2>/dev/null || echo skills/schedule-crons/crons.example.json)"; cp "$SRC" "$CF"; fi`
+1. Read `<workspace>/hosts/<hostname>/crons.json` (resolve `<workspace>` via `bash scripts/sutando-config.sh workspace`; `<hostname>` = `bash scripts/sutando-config.sh host-label`). **Transition / self-heal:** if that file is missing, seed it once — from the interim `<workspace>/crons/<hostname>.json` if it still exists (folded-in from the pre-#1717 layout), else the legacy `skills/schedule-crons/crons.json` (one-time migration), else `skills/schedule-crons/crons.example.json` — then read it: `WS="$(bash scripts/sutando-config.sh workspace)"; H="$(bash scripts/sutando-config.sh host-label)"; CF="$WS/hosts/$H/crons.json"; if [ ! -f "$CF" ]; then mkdir -p "$WS/hosts/$H"; SRC="$(ls "$WS/crons/$H.json" 2>/dev/null || ls skills/schedule-crons/crons.json 2>/dev/null || echo skills/schedule-crons/crons.example.json)"; cp "$SRC" "$CF"; fi`
 2. Check existing cron jobs with CronList
 3. For each job in the config:
    - Skip if a job with matching prompt/name already exists
