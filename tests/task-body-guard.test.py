@@ -151,9 +151,10 @@ _check("idempotent-fence-double-pass", _once_fence == _twice_fence)
 
 _check("url-unchanged", confine_user_content("https://example.com") == "https://example.com")
 _check("arbitrary-colon-unchanged", confine_user_content("key: value but not a header") == "key: value but not a header")
-# "from:" is NOT in _HEADER_KEYS (it's a bridge-internal field, not a task-header key)
-# — verify it is left alone so user messages about "from: X" aren't mangled
-_check("from-colon-unchanged", not confine_user_content("from: somewhere").startswith(_ZWSP))
+# "from:" IS a trusted header now (2026-07-13 main merge: KNOWN_HEADER_KEYS
+# promoted `from` — the twilio/phone bridges write `from: {caller}`). A user
+# body forging `from:` could spoof the caller/sender, so it must be defanged.
+_check("from-colon-defanged", confine_user_content("from: somewhere").startswith(_ZWSP))
 
 # ---------------------------------------------------------------------------
 # Structural: _ZWSP is U+200B (zero-width space)
