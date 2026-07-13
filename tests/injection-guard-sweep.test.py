@@ -420,6 +420,21 @@ if _py_keys_m:
         for k in _py_keys_m.group(1).split(",")
         if k.strip().strip("\"' ")
     }
+else:
+    # The guard imports its keys from local_task_protocol.KNOWN_HEADER_KEYS
+    # (single source of truth — no hardcoded literal to scrape). Read that
+    # tuple directly so the parity check still has the authoritative py set.
+    _ltp = _src("src/local_task_protocol.py")
+    # Close-paren is anchored to line start (\n)) so a ')' inside an inline
+    # comment can't truncate the tuple early.
+    _ltp_m = re.search(r"KNOWN_HEADER_KEYS\s*=\s*\((.*?)\n\)", _ltp, re.DOTALL)
+    if _ltp_m:
+        # Drop comment lines before scraping quoted tokens.
+        _body = "\n".join(
+            ln for ln in _ltp_m.group(1).splitlines()
+            if not ln.lstrip().startswith("#")
+        )
+        _py_header_keys = set(re.findall(r"[\"']([^\"']+)[\"']", _body))
 
 _tb2 = _src("src/task-bridge.ts")
 _ts_keys_m = re.search(r"const _HEADER_KEYS\s*=\s*\[([^\]]+)\]", _tb2, re.DOTALL)

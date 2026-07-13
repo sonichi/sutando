@@ -166,6 +166,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 f"id: {task_id}\n"
                 f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
                 f"source: github\n"
+                f"interaction_type: system_event\n"
                 f"access_tier: other\n"
                 f"task: {safe_task}\n"
             )

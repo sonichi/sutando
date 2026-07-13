@@ -2,11 +2,26 @@
 
 Sends mid-task progress updates to the channel a task came from (Slack, Discord, or Telegram).
 
-## Critical rule — notify BEFORE any work begins
+## Critical rule — if you notify, notify BEFORE any work begins
 
-**Call notify.py as the FIRST action after reading a task — before transcription, web searches,
-code reads, or any other tool call.** The user's first signal that you received their message
-must be the notification, not silence followed by a result minutes later.
+For tasks that need a progress update, **call notify.py as the FIRST action after reading
+the task — before transcription, web searches, code reads, or any other tool call.**
+The user's first signal that you received a long-running task must be the notification,
+not silence followed by a result minutes later.
+
+## Critical rule — progress only, never final answers
+
+`notify.py` is only for short progress/status updates. Do **not** use it to send the
+answer, findings, recommendations, completed list, PR summary, or any other final result.
+Final task delivery must go through the authoritative task result file
+(`results/task-<id>.txt`, or the channel-specific result path named in the task).
+
+Keep notify bodies short: at most 280 characters and 4 non-empty lines. The script
+rejects longer messages so a final answer cannot accidentally be sent directly and
+then duplicated by the bridge when it delivers the result file.
+
+If you already sent the final answer through another approved path, write `[REPLIED]`
+to the task result file so the bridge archives the task without sending a duplicate.
 
 ### Voice message tasks (most common failure case)
 
@@ -26,7 +41,7 @@ Correct order:
 4. Process — if research needed, notify again before starting
 5. Return result
 
-### All other tasks
+### All other long-running tasks
 
 Wrong order:
 1. Read task

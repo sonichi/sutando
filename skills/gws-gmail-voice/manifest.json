@@ -1,7 +1,19 @@
 {
   "name": "gws-gmail-voice",
-  "enabled": true,
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
   "access_tier": "owner",
-  "description": "Inline Gmail triage for voice/phone agents — wraps `gws gmail +triage` so Gemini can summarize unread inbox without going through openUrlTool + Chrome.",
-  "tools": "./tools.ts"
+  "enabled": true,
+  "description": "Inline Gmail triage for voice/phone agents \u2014 wraps gws gmail +triage so Gemini can summarize unread inbox without going through openUrlTool + Chrome.",
+  "permissions": {
+    "network": true,
+    "filesystem": "read-only",
+    "secrets": "none"
+  },
+  "tools": "./tools.ts",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
 }

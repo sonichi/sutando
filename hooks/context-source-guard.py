@@ -32,7 +32,8 @@ import sys, json, os, re, time, urllib.request
 # stale access.json than the bridge writes, so a configured contextNotFrom was
 # invisible to the hook → it silently failed OPEN (the one component you least
 # want failing open). Flagged by Sutando-Pro on PR #1698, 2026-06-18.
-_CFG = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+# Mirrors util_paths.claude_home_path ($CLAUDE_CONFIG_DIR -> $CLAUDE_HOME -> ~/.claude); standalone hook.
+_CFG = os.environ.get("CLAUDE_CONFIG_DIR") or os.environ.get("CLAUDE_HOME") or os.path.expanduser("~/.claude")
 ACCESS_FILE = os.environ.get("SUTANDO_DISCORD_ACCESS_FILE",
                              os.path.join(_CFG, "channels", "discord", "access.json"))
 ENV_FILE = os.environ.get("SUTANDO_DISCORD_ENV_FILE",
