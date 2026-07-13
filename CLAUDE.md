@@ -374,7 +374,7 @@ Examples:
 
 ## Session Continuity
 
-On each context compaction, `src/session-handoff.sh` saves a snapshot to `session-state.md` (system status, recent commits, open PRs, quota, tasks). Read this file at session start to understand what the previous session was doing. The file is gitignored.
+On each context compaction, `src/session-handoff.sh` saves a snapshot to `<workspace>/session-state.md` (system status, recent commits, open PRs, quota, tasks). Read this file at session start to understand what the previous session was doing. It lives under the workspace (per the workspace contract), not the repo root.
 
 ## Startup
 
