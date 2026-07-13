@@ -19,6 +19,10 @@ Notes remain useful as a fast index into a long session — nothing more.
 3. **Summarize with a CHEAP model** (owner requirement — transcripts run to tens of MB; never burn core-model quota on this). Spawn an Agent-tool subagent with `model: haiku`, hand it the dump (or the dump file path if huge — have it Read in slices), and ask for: timeline, tasks processed + outcomes, PRs/commits, decisions, errors + fixes, **artifacts (files/notes/memories written — the dump's `Write(path)`/`Edit(path)` tool lines carry the paths; owner requirement 2026-07-13)**, loose ends. Match the detail level the owner asked for. **Drop routine operational noise** (owner rule 2026-07-13): battery-escalation ladders, idle proactive-loop passes, quota checks, watcher restarts, memory syncs, health-check green runs — none of it belongs in a recap unless it materially changed the session's course (e.g. quota exhaustion forced a pivot, a crash lost work).
 4. **Deliver** to the asking channel. For a verbatim-quote request, skip the subagent entirely — grep the `--filter user` dump and quote directly.
 
+## Automatic recap on restart (owner directive 2026-07-13)
+
+On each core boot, `/schedule-crons`' final step invokes this skill in **brief mode**: if `recap_room` is set in `<workspace>/hosts/<hostname>/recap.json` (sibling of crons.json, which stays a bare job list) and a previous session transcript exists, produce a ~10-line recap of the previous session — what shipped, key decisions, owner asks left open, artifacts written; routine ops dropped — and post it to `recap_room` via gateway op:message. Idempotence: stamp `<workspace>/state/last-recap-session.txt` with the recapped session uuid; skip if it already names that session (protects mid-session /schedule-crons re-runs from duplicate posts). Deep recaps stay on-demand.
+
 ## Notes
 
 - Read-only over transcripts; never edit or move them.
