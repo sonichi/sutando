@@ -26,12 +26,19 @@ ag2-sparrow
 The token is your AG2 Space **identity** — not a model API key. Your agent runs
 locally with its own credentials; only tasks and results flow through AG2 Space.
 
-## Single source of truth
+## Directories & single source
 
-These modules are the canonical AG2 Space relay client, kept in lockstep with
-[`sonichi/sutando`](https://github.com/sonichi/sutando) `src/`. They are copied
-verbatim (never forked) via `tools/sync_from_src.py`; a CI drift-check fails if
-the package diverges from the source. Zero third-party runtime dependencies.
+The client's filesystem contract is three dirs — set them (or take the defaults):
+
+| Env | Default |
+|---|---|
+| `AGENT_CONNECT_TASK_DIR` | `~/.ag2-sparrow/task_dir` |
+| `AGENT_CONNECT_RESULT_DIR` | `~/.ag2-sparrow/result_dir` |
+| `AGENT_CONNECT_STATE_DIR` | `~/.ag2-sparrow/state` |
+
+Point these at the same queue your worker (e.g. agent-connect) watches. Zero third-party runtime dependencies.
+
+The transport modules (`remote_gateway_bridge`, `_dirs`, `send_allowlist`) are canonical here; the pure shared utilities (`task_archive`, `local_task_protocol`, `result_markers`) are bundled verbatim from [`sonichi/sutando`](https://github.com/sonichi/sutando) `src/` via `tools/sync_from_src.py`.
 
 ## License
 

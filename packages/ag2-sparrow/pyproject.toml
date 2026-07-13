@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ag2-sparrow"
-version = "0.1.0"
+version = "0.2.0"
 description = "Transport client that connects a local agent to AG2 Space: long-polls the task gateway for your agent's tasks and posts results back."
 readme = "README.md"
 requires-python = ">=3.9"

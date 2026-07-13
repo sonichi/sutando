@@ -57,27 +57,27 @@ from pathlib import Path
 # the path (no repo-walking; the old triple-parent form predated the move into
 # src/ and pointed outside the repo).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from workspace_default import resolve_workspace  # noqa: E402
+from _dirs import task_dir as _task_dir, result_dir as _result_dir, state_dir as _state_dir  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 import local_task_protocol  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
 from send_allowlist import is_path_sendable  # noqa: E402
 
-WS = resolve_workspace()
-TASKS_DIR = WS / "tasks"
-RESULTS_DIR = WS / "results"
+TASKS_DIR = _task_dir()
+RESULTS_DIR = _result_dir()
+_STATE = _state_dir()
 ARCHIVE_RESULTS_DIR = RESULTS_DIR / "archive"
 # Persist the in-flight set (tasks pulled from the gateway, awaiting result-POST)
 # so a client restart between pull and POST doesn't strand the result. Scoped to
 # gateway-pulled tasks only — we must NOT blindly POST every results/ file, or we'd
 # cross-send other channels' (Discord/Telegram) results to the gateway.
-INFLIGHT_FILE = WS / "state" / "remote-task-inflight.json"
+INFLIGHT_FILE = _STATE / "remote-task-inflight.json"
 # Sidecar map {task id → origin room id}, recorded at queue time. Outbound
 # file-attach needs the room because media uploads go to the room-scoped
 # endpoint (POST /v1/rooms/{room}/media) while text results go to /v1/results
 # (which resolves the room server-side). Separate file — the inflight ledger's
 # list-of-ids format stays untouched for compat.
-TASK_ROOMS_FILE = WS / "state" / "remote-task-rooms.json"
+TASK_ROOMS_FILE = _STATE / "remote-task-rooms.json"
 
 # Back-compat: instances onboarded before the AG2_REMOTE_* → REMOTE_TASK_*
 # rename still export the legacy names in their .env. Honor them as DEPRECATED
@@ -192,7 +192,7 @@ HS_MEDIA_TOKEN = os.environ.get("REMOTE_MEDIA_HS_TOKEN") or ""
 # credentialed — a bare "/_matrix/" substring must not route a bearer to an
 # arbitrary host (review 2026-07-03).
 HS_MEDIA_ORIGIN = (os.environ.get("REMOTE_MEDIA_HS_ORIGIN") or "").rstrip("/")
-MEDIA_DIR = Path(os.environ.get("REMOTE_MEDIA_DIR") or str(WS / "data" / "remote-media"))
+MEDIA_DIR = Path(os.environ.get("REMOTE_MEDIA_DIR") or str(_STATE / "remote-media"))
 MAX_MEDIA_BYTES = int(os.environ.get("REMOTE_MEDIA_MAX_BYTES") or str(25 * 1024 * 1024))
 _EXT_BY_MIME = {
     "image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg",
@@ -205,7 +205,7 @@ _EXT_BY_MIME = {
 # proactive-loop's "active engagement" gate knows a conversation is live. The
 # gateway transport should feed the same gate — but only when THIS node treats
 # gateway traffic as owner traffic (LOCAL_TIER, never the gateway's claim).
-OWNER_ACTIVITY_FILE = WS / "state" / "last-owner-activity.json"
+OWNER_ACTIVITY_FILE = _STATE / "last-owner-activity.json"  # sutando-only; harmless if unused
 
 
 # Blocker (review 2026-06-13): the gateway is untrusted, so a task `id` flows
@@ -296,7 +296,7 @@ def _read_core_status() -> tuple[str | None, str | None]:
     every field to a bounded str-or-None; any surprise → (None, None) and the
     heartbeat still fires as a plain liveness ping."""
     try:
-        with open(WS / "state" / "core-status.json") as f:
+        with open(_STATE / "core-status.json") as f:
             cs = json.load(f)
         if not isinstance(cs, dict):
             return (None, None)
@@ -852,7 +852,7 @@ def main() -> None:
         sys.exit("FATAL: set REMOTE_TASK_TOKEN (and REMOTE_TASK_URL if your token is a bare secret).")
     inflight: set[str] = _load_inflight()
     abandoned_suspects: set[str] = set()
-    _log(f"starting — gateway={URL} provider={PROVIDER} workspace={WS} "
+    _log(f"starting — gateway={URL} provider={PROVIDER} tasks={TASKS_DIR} "
          f"(restored {len(inflight)} in-flight)")
     backoff = 1
     while True:

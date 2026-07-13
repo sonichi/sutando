@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """Regenerate the package modules from the canonical sutando src/ (single source).
 
-The AG2 Space relay client lives canonically in sonichi/sutando `src/` (the core
+Only the PURE shared utilities (task_archive/local_task_protocol/result_markers) are
+bundled verbatim from sonichi/sutando `src/` (option A). The transport-specific
+modules (remote_gateway_bridge, _dirs, send_allowlist) are package-canonical and
+intentionally diverge from src (dir-interface, no workspace-resolution).
+
+The relay client lives canonically in sonichi/sutando `src/` (the core
 runs it directly). This package is a *distribution* of those exact files — never
 a hand-edited fork. Run this to refresh the copies; `--check` (used in CI/tests)
 fails if the package has drifted from src/.
@@ -14,14 +19,9 @@ from pathlib import Path
 
 # src file  ->  package module (hyphen→underscore for the bridge)
 MAP = {
-    "remote-gateway-bridge.py": "remote_gateway_bridge.py",
-    "workspace_default.py": "workspace_default.py",
     "task_archive.py": "task_archive.py",
     "local_task_protocol.py": "local_task_protocol.py",
     "result_markers.py": "result_markers.py",
-    "send_allowlist.py": "send_allowlist.py",
-    "util_paths.py": "util_paths.py",
-    "sutando_config.py": "sutando_config.py",
 }
 PKG_DIR = Path(__file__).resolve().parent.parent / "ag2_sparrow"
 SRC_DIR = Path(__file__).resolve().parents[3] / "src"

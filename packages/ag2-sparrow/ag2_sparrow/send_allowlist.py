@@ -45,24 +45,24 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from workspace_default import resolve_workspace  # noqa: E402
-from util_paths import shared_personal_path  # noqa: E402
+from _dirs import result_dir as _result_dir  # noqa: E402
 
-_REPO = resolve_workspace()
 
-# Owner-relative + machine-local roots. Files under these roots are
-# delivered to Discord as attachments without further checks.
-SEND_ALLOWED_ROOTS: tuple[str, ...] = (
-    str(_REPO / "results"),
-    str(_REPO / "notes"),
-    # Notes canonical home (private dir) — once saved by save_note,
-    # paths reference the private location. Both old and new paths
-    # allowed during the transition; resolver picks whichever exists.
-    str(shared_personal_path("notes", _REPO)),
-    str(_REPO / "docs"),
-    str(Path.home() / "Desktop" / "iclr-backups"),
-    str(Path.home() / "Documents" / "sutando-launch-assets"),
-)
+# Transport default: only the RESULT_DIR is sendable (where the agent writes
+# files to return). Any richer policy (sutando's notes/docs/etc.) is INJECTED by
+# the embedding app via register_extra_roots() — the package ships no app-specific
+# paths.
+_BASE_ROOTS: tuple[str, ...] = (str(_result_dir()),)
+_EXTRA_ROOTS: list[str] = []
+
+
+def register_extra_roots(*roots) -> None:
+    """Embedding apps (e.g. sutando) add extra send-allowed roots."""
+    _EXTRA_ROOTS.extend(str(r) for r in roots)
+
+
+def _allowed_roots() -> tuple[str, ...]:
+    return _BASE_ROOTS + tuple(_EXTRA_ROOTS)
 
 # Prefix forms — files whose realpath starts with any of these strings
 # are deliverable. Covers temp-file artifacts the agent generates
@@ -96,7 +96,7 @@ def is_path_sendable(fpath: str) -> bool:
         real = os.path.realpath(fpath)
     except OSError:
         return False
-    for root in SEND_ALLOWED_ROOTS:
+    for root in _allowed_roots():
         root_real = os.path.realpath(root)
         if real == root_real or real.startswith(root_real + os.sep):
             return True
