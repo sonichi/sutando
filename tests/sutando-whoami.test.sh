@@ -52,5 +52,28 @@ PY
 then ok "unprovisioned fallback when device.json absent"; else bad "unprovisioned fallback"; fi
 rm -rf "$T"
 
+# 4) agent_id is actually READ from <config_dir>/channels/ag2space/.env AGENT_ID.
+#    Guards the identity path the desktop Connect UI depends on: a schema-only
+#    check would stay green even if the parser silently stopped reading the file
+#    (always emitting null). Write a real device-env fixture and assert the value.
+T2="$(mktemp -d)"
+mkdir -p "$T2/ws"
+ccd="$(SUTANDO_TEST_MODE=1 SUTANDO_WORKSPACE="$T2/ws" bash "$REPO/scripts/sutando-config.sh" claude-sutando-config-dir 2>/dev/null || true)"
+if [ -n "$ccd" ]; then
+  mkdir -p "$ccd/channels/ag2space"
+  printf 'AGENT_ID="@agent:ag2.space"\nREMOTE_TASK_TOKEN=x\n' > "$ccd/channels/ag2space/.env"
+  out3="$(SUTANDO_TEST_MODE=1 SUTANDO_WORKSPACE="$T2/ws" bash "$REPO/scripts/sutando-whoami.sh")"
+  if WHOAMI_OUT="$out3" python3 - <<'PY'
+import json, os
+d = json.loads(os.environ["WHOAMI_OUT"])
+assert d["agent_id"] == "@agent:ag2.space", d["agent_id"]
+assert d["config_dir"] and d["config_dir"].endswith(".claude-sutando"), d["config_dir"]
+PY
+  then ok "agent_id read from device-auth env"; else bad "agent_id extraction (parser did not read AGENT_ID)"; fi
+else
+  bad "config-dir resolver returned empty under test mode"
+fi
+rm -rf "$T2"
+
 printf '\n%s\n' "$([ "$fails" -eq 0 ] && echo 'PASS — sutando-whoami green' || echo "FAIL — $fails failing")"
 exit "$fails"
