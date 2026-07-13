@@ -55,8 +55,11 @@ tests/*
 !tests/*.test.ts
 !tests/*.test.py
 !tests/*.test.sh
+!tests/*.txt
 !tests/_helpers/
 !tests/_helpers/*.ts
+!tests/fixtures/
+!tests/fixtures/*.json
 skills/personal-*/
 tests/security/*.md
 !tests/security/*.md.example
@@ -113,3 +116,10 @@ workspace/*
 !workspace/.gitkeep
 # AG2 onboarding summary — private (invite codes + ids)
 ag2-onboarding.txt
+
+# coverage-gate artifacts (scripts/coverage-gate.sh)
+.coverage
+.coverage.*
+coverage.xml
+diff-cover.md
+coverage-summary.md

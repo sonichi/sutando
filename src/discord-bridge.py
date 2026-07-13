@@ -18,6 +18,16 @@ import sys
 import time
 from pathlib import Path
 
+# startup.sh redirects stdout to a log file, which makes CPython block-buffer
+# it — diagnostic prints without flush=True (e.g. the tier-ownership warnings
+# below) sit invisible in the buffer, and SIGTERM kills the process without
+# flushing, losing them entirely. startup.sh launches this bridge with
+# PYTHONUNBUFFERED=1, but other launchers (health-check --fix restarts, ad-hoc
+# respawns) don't — line-buffer structurally so every print lands in the log
+# as it happens, regardless of launcher. Same fix as telegram-bridge (#1926).
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 # Self-rescue: this bridge HAS to keep running — Discord is the primary channel
 # the owner uses to reach Sutando. If `python3` on $PATH happens to resolve to
 # an interpreter that lacks `discord.py` (e.g. miniconda's python on a Mac that
@@ -57,10 +67,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 import discord_config  # noqa: E402  — Sutando workspace-local discord config (#1147)
-from util_paths import channel_access_path, claude_home_path, shared_personal_path  # noqa: E402
+from util_paths import channel_access_path, claude_home_path, personal_path, shared_personal_path  # noqa: E402
 from task_priority import default_priority_for_source  # noqa: E402
+
+# Observability: emit channel.discord.<in|out> into the local obs spine
+# (src/observability). Guarded so a missing module never crashes the bridge.
+try:
+    from observability.channel import emit_channel as _emit_channel  # noqa: E402
+except Exception:  # pragma: no cover — best-effort telemetry
+    def _emit_channel(*_a, **_k):  # type: ignore
+        return None
 from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
+from message_chunking import chunk_message, _is_fence_open_line  # noqa: E402  (Result Router S3 — shared fence-aware chunker; _is_fence_open_line re-exported for existing tests)
+import result_audit  # noqa: E402  (Result Router S5 — §7 audit ledger sink; top-level so hooks carry no lazy import)
+import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
@@ -204,8 +225,6 @@ from send_allowlist import (  # noqa: E402
 )
 
 
-_FENCE_LINE = re.compile(r"^\s{0,3}(`{3,}|~{3,})\s*([^\s`~][^`~]*)?\s*$")
-
 # Discord-state references in task bodies that codex sandbox cannot resolve.
 # When a team/other-tier task asks the agent to look at a specific channel
 # or DM context, the codex sandbox path can't fulfill it (no Discord token,
@@ -238,132 +257,14 @@ def _extract_user_id_mentions(mention_strs):
     return out
 
 
-def _is_fence_open_line(line: str):
-    """Return the fence opener string if `line` is a real Markdown block-fence line.
-
-    A fence line is one whose stripped content is just a backtick/tilde run of >=3
-    optionally followed by a language/info string. Lines like `print("```")`,
-    shell heredocs, or `use ```js inline` do NOT match — they have non-fence
-    content before the fence chars on the same line.
-
-    Returns the full fence opener (e.g. "```python", "~~~", "````markdown")
-    so the chunker can reopen the SAME opener after a chunk boundary, preserving
-    the language tag and the fence-token kind/length.
-
-    Returns None if the line is not a fence line.
-    """
-    m = _FENCE_LINE.match(line)
-    if not m:
-        return None
-    return line.strip()
-
-
 def _chunk_for_discord(text: str, max_len: int = 1900):
-    """Yield Discord-safe chunks <= max_len chars, preserving Markdown code fences.
+    """Discord-facing alias for the shared fence-aware chunker (Result Router S3).
 
-    The naive `range(0, len, max_len)` chunker breaks code blocks: if a fence
-    opens before the chunk boundary and closes after, the first chunk renders as
-    a half-open code block on Discord and the second chunk leaks the literal
-    trailing backticks as plain text.
-
-    This chunker walks line-by-line, tracks fence state (the exact opener string
-    when inside a fence; None when outside). When a new line would push the
-    buffer past max_len, it closes the current fence (if open) with a matching
-    closer, yields the buffer, and reopens the SAME opener in the next chunk —
-    preserving language tags and fence-token length.
-
-    Fence detection only matches real block-fence lines (regex-anchored). Inline
-    backticks in code or prose (`print("```")`, `use ```js`) do NOT toggle state.
-
-    Single-line content longer than max_len is hard-split mid-line; fence state
-    is preserved across the split.
+    Behaviour and the default (max_len=1900) are unchanged; the implementation
+    now lives in src/message_chunking.py:chunk_message so Slack (and any future
+    surface) share the exact same fence-preservation logic.
     """
-    if not text:
-        return
-    fence_opener = None  # full opener string when inside a fence; None when outside
-    buf = []
-    buf_len = 0
-
-    def fence_closer(opener):
-        # Match the fence-token kind (` or ~) and use 3 of them. Discord's
-        # parser closes on >=3 matching chars, so a 3-char closer suffices
-        # even if opener was 4+ chars (the literal opener length doesn't have
-        # to match for closure, only the char kind).
-        return opener[0] * 3 if opener else "```"
-
-    def flush():
-        nonlocal buf, buf_len
-        if not buf:
-            return None
-        chunk = "\n".join(buf)
-        # If we're mid-fence at chunk boundary, close it so Discord renders cleanly
-        if fence_opener:
-            chunk = chunk + "\n" + fence_closer(fence_opener)
-        buf = []
-        buf_len = 0
-        return chunk
-
-    for line in text.split("\n"):
-        # Real fence-line detection (only at start of stripped line, not anywhere)
-        opener_on_line = _is_fence_open_line(line)
-        # If we're outside a fence and this line is a fence-open, treat as opening.
-        # If we're inside a fence and this line matches the fence-token kind,
-        # treat as closing (we don't require exact length match for close).
-
-        line_overhead = len(line) + 1  # +1 for newline
-        # Reserve space for closing fence if we'd cut mid-fence
-        reserve = (len(fence_closer(fence_opener)) + 1) if fence_opener else 0
-
-        if buf_len + line_overhead + reserve > max_len and buf:
-            chunk = flush()
-            if chunk is not None:
-                yield chunk
-            # Reopen fence in next chunk if we were inside one
-            if fence_opener:
-                buf.append(fence_opener)
-                buf_len = len(fence_opener) + 1
-
-        # Single line longer than max_len → hard-split
-        if line_overhead + reserve > max_len:
-            remaining = line
-            while len(remaining) + reserve > max_len:
-                take = max_len - reserve - buf_len - 1
-                if take <= 0:
-                    chunk = flush()
-                    if chunk is not None:
-                        yield chunk
-                    if fence_opener:
-                        buf.append(fence_opener)
-                        buf_len = len(fence_opener) + 1
-                    take = max_len - reserve - buf_len - 1
-                buf.append(remaining[:take])
-                buf_len += take + 1
-                remaining = remaining[take:]
-                chunk = flush()
-                if chunk is not None:
-                    yield chunk
-                if fence_opener:
-                    buf.append(fence_opener)
-                    buf_len = len(fence_opener) + 1
-            buf.append(remaining)
-            buf_len += len(remaining) + 1
-        else:
-            buf.append(line)
-            buf_len += line_overhead
-
-        # Update fence state AFTER placing the line (the line itself is intact)
-        if opener_on_line is not None:
-            if fence_opener is None:
-                fence_opener = opener_on_line
-            else:
-                # Fence-line at this position closes the active fence
-                # (Discord/CommonMark allows any close-fence of the same kind to close)
-                fence_opener = None
-
-    chunk = flush()
-    if chunk is not None:
-        yield chunk
-
+    yield from chunk_message(text, max_len)
 
 # Marker regex for inline file references in result bodies. The pattern
 # requires absolute paths (`/...` or `~/...`) — the earlier relative-
@@ -533,6 +434,21 @@ def _safe_attachment_basename(filename: str) -> str:
     safe_base = safe_base[:80]
     return f"{safe_base}.{safe_ext}" if safe_ext else safe_base
 
+
+def _ref_from_attachment(att, local_path) -> "local_task_protocol.AttachmentRef":
+    """Build an AttachmentRef from a discord Attachment + its saved local path
+    (interaction-model 4D, step 1.5). Reads the SDK's `content_type`/`size`
+    defensively (both optional) and reuses the sanitized basename. Pure — kept
+    separate from the async download loop so the attribute-reading is testable
+    without a live discord Message."""
+    return local_task_protocol.AttachmentRef(
+        locator=str(local_path),
+        mime=(getattr(att, "content_type", "") or ""),
+        filename=_safe_attachment_basename(getattr(att, "filename", "") or ""),
+        size=(getattr(att, "size", 0) or 0),
+    )
+
+
 # Presenter mode: when scripts/presenter-mode.sh is active, the bridge
 # must not send proactive DMs to the owner. The sentinel contains an
 # ISO-8601 expiry; see scripts/presenter-mode.sh for the contract.
@@ -581,7 +497,14 @@ except Exception:
     pass
 
 try:
-    identity_file = REPO / "stand-identity.json"
+    # Resolve via the canonical per-host resolver (hosts/<host>/ → legacy
+    # machine-<host>/ → workspace root), same as agent-api/dashboard/event_log/
+    # conversation-server. Reading REPO/stand-identity.json directly only saw
+    # the workspace-root fallback, so a node whose identity lives in the per-host
+    # hosts/<host>/ location got empty LOCAL_MACHINE → with SUTANDO_TEAM_TIER_OWNER
+    # set, that silently drops ALL non-owner tasks (the failure the warning below
+    # describes).
+    identity_file = personal_path("stand-identity.json", workspace=REPO)
     if identity_file.exists():
         LOCAL_MACHINE = json.loads(identity_file.read_text()).get("machine", "")
 except Exception:
@@ -669,6 +592,32 @@ def _should_notify_owner_on_seed(sender_id, owner_ids):
     """
     owners = {str(o) for o in (owner_ids or [])}
     return bool(owners) and str(sender_id) not in owners
+
+def _has_sibling_bots(access_data, self_id):
+    """True iff this deployment declares sibling Sutando bots — other bots of
+    the same fleet sharing this guild — via a top-level `siblingBots` id list
+    in access.json.
+
+    Drives multi-bot-safe thread auto-seeding. In a fleet deployment several
+    Sutando bots watch one guild; before this gate, a single owner @-ping in a
+    thread made EVERY bot auto-seed that thread into its own access.json, post
+    its own "🌱 Auto-seeded" notice (pinging its own owner), and thereafter
+    treat every follow-up as a task — so N bots piled onto one PR (the
+    2026-07-02 #1823 collision). Gating the seed on "this bot is addressed"
+    only fires the seed for the bot that was actually pinged.
+
+    Absent/empty `siblingBots` → single-bot deployment → seed on ANY first
+    thread message (preserves the #1498 ep013 first-message-drop fix; the
+    common OSS single-bot install is never regressed). Self is removed so the
+    identical fleet-wide id list can be dropped into every bot's access.json.
+    """
+    try:
+        sibs = access_data.get("siblingBots")
+        if not isinstance(sibs, (list, tuple, set)):
+            return False  # missing or mis-typed (e.g. a bare string) → single-bot
+        return bool({str(s) for s in sibs} - {str(self_id)})
+    except Exception:
+        return False
 
 def _format_seed_notice(owner_id, author_mention, parent_label, thread_id_str):
     """Inline notice posted to a freshly auto-seeded thread. Pure (no I/O)."""
@@ -2273,9 +2222,14 @@ def _recover_orphan_sending_files() -> int:
     return recovered
 
 
+# Guards the once-only startup of the long-lived poll loops below. `on_ready`
+# re-fires on every gateway reconnect, so without this the loops accumulate.
+_poll_loops_started = False
+
+
 @client.event
 async def on_ready():
-    print(f"Discord bridge ready: {client.user}")
+    print(f"Discord bridge ready: {client.user}", flush=True)
     # #1147: auto-seed workspace `state/discord-config.json` from the legacy
     # access.json heuristic on first boot. Idempotent (no-op if file
     # exists). Emits a WARN to stderr if the seed had to fall back to
@@ -2297,14 +2251,25 @@ async def on_ready():
     # does NOT replay `MESSAGE_CREATE` events that arrived during the
     # gap. See `_catchup_missed_dms` for the replay flow.
     client.loop.create_task(_catchup_missed_dms())
-    # Start polling loops
-    client.loop.create_task(poll_results())
-    client.loop.create_task(poll_progress())
-    client.loop.create_task(poll_approved())
-    client.loop.create_task(poll_proactive())
-    client.loop.create_task(poll_dm_fallback())
-    # Auto-mod LLM-judge flush timer (per-guild gate enforced inside flush)
-    client.loop.create_task(_mod_flush_timer_loop())
+    # Start polling loops EXACTLY ONCE. `on_ready` fires on every gateway
+    # reconnect (RESUME-expiry, network blip, Discord-side reconnect), not
+    # just first boot — so spawning these long-lived `while True` loops here
+    # unguarded leaks a new copy of each on every reconnect. With N reconnects
+    # there are N+1 `poll_progress` loops, each independently posting its own
+    # "⏳ working…" placeholder for the same task → many duplicate placeholders,
+    # growing the longer the bridge runs. (poll_results / poll_proactive / etc.
+    # duplicate the same way — latent duplicate-delivery risk.) The catch-up
+    # above intentionally runs per-reconnect; these singletons must not.
+    global _poll_loops_started
+    if not _poll_loops_started:
+        _poll_loops_started = True
+        client.loop.create_task(poll_results())
+        client.loop.create_task(poll_progress())
+        client.loop.create_task(poll_approved())
+        client.loop.create_task(poll_proactive())
+        client.loop.create_task(poll_dm_fallback())
+        # Auto-mod LLM-judge flush timer (per-guild gate enforced inside flush)
+        client.loop.create_task(_mod_flush_timer_loop())
 
 
 def _message_mentions_bot(message):
@@ -2511,7 +2476,19 @@ async def _handle_discord_message(message, force=False):
                 access_data = json.loads(ACCESS_FILE.read_text())
                 access_groups = access_data.setdefault('groups', {})
                 thread_id_str = str(message.channel.id)
-                if thread_id_str not in access_groups:
+                # Multi-bot-safe seed gate. In a fleet deployment (siblingBots
+                # declared), seed ONLY when THIS bot is the addressed one
+                # (direct @-mention or a sutando-role @) — otherwise every
+                # sibling bot seeds the same thread, posts its own 🌱 notice
+                # pinging its own owner (the seed storm), and then grabs every
+                # unaddressed follow-up (the 2026-07-02 #1823 pile-up). In a
+                # single-bot deployment (no siblingBots) seed on any first
+                # message, preserving the #1498 ep013 first-message-drop fix.
+                _seed_ok = (
+                    bot_mentioned or role_mentioned
+                    or not _has_sibling_bots(access_data, getattr(client.user, "id", None))
+                )
+                if thread_id_str not in access_groups and _seed_ok:
                     parent_id_str = str(message.channel.parent_id) if message.channel.parent_id else None
                     parent_cfg = access_groups.get(parent_id_str) if parent_id_str else None
                     if parent_cfg is True:
@@ -2676,6 +2653,7 @@ async def _handle_discord_message(message, force=False):
         }
         access["pending"] = pending
         ACCESS_FILE.write_text(json.dumps(access, indent=2))
+        os.chmod(ACCESS_FILE, 0o600)  # don't inherit umask 644 — file holds owner's Discord user IDs
         await message.channel.send(f"Pairing required. Ask the owner to run:\n`/discord:access pair {code}`")
         print(f"  Pairing requested: @{username} ({sender_id}) code={code}")
         return
@@ -2750,6 +2728,11 @@ async def _handle_discord_message(message, force=False):
 
     # Handle attachments
     attachment_note = ""
+    # Structured refs (interaction-model 4D, step 1.5) — accumulated alongside
+    # the legacy [File attached:] body line (dual-write: additive, nothing that
+    # reads the old line breaks). Emitted as `attachments:`/`content_modalities:`
+    # /`media_form:` headers at the task-write site below.
+    attachment_refs: list = []  # pragma: no cover
     for att in message.attachments:
         # Sanitize filename — see _safe_attachment_basename docstring for
         # the RCE class this closes (downstream shell interpolation of
@@ -2757,6 +2740,7 @@ async def _handle_discord_message(message, force=False):
         local_path = INBOX_DIR / f"{int(time.time()*1000)}_{_safe_attachment_basename(att.filename)}"
         try:
             await att.save(local_path)
+            attachment_refs.append(_ref_from_attachment(att, local_path))  # pragma: no cover
             transcript = _transcribe_via_skill(str(local_path))
             if transcript:
                 attachment_note += f"\n[Voice transcript: {transcript}]"
@@ -2809,6 +2793,7 @@ async def _handle_discord_message(message, force=False):
                     p_path = INBOX_DIR / f"{int(time.time()*1000)}_{_safe_attachment_basename(att.filename)}"
                     try:
                         await att.save(p_path)
+                        attachment_refs.append(_ref_from_attachment(att, p_path))  # pragma: no cover
                         attachment_note += f"\n[File attached (from replied-to message): {p_path}]"
                         try:
                             ct = (getattr(att, "content_type", "") or "").lower()
@@ -2863,7 +2848,11 @@ async def _handle_discord_message(message, force=False):
         else:
             return
 
-    print(f"  @{username}: {text}{attachment_note}")
+    # Redact any `vault set KEY VALUE` secret before logging. Without this, the
+    # raw print lands the secret in discord-bridge.log even though the intercept
+    # below (L~2939) would store/redact it — a plaintext-secret leak to the log.
+    # (2026-06-23 incident: an owner's telegram bot token leaked here.)
+    print(f"  @{username}: {redact_vault_commands(text)}{attachment_note}")
 
     # Determine access tier
     access_tier = "other"
@@ -2936,12 +2925,21 @@ async def _handle_discord_message(message, force=False):
     # untrusted senders — the actual secret never reaches the task file either way.
     if text:
         if access_tier == "owner":
-            vault_result = intercept_vault_commands(text)
-            text = vault_result.text
-            if vault_result.stored:
-                print(f"  [vault] stored keys: {vault_result.stored}", flush=True)
-            if vault_result.failed:
-                print(f"  [vault] store failed (still redacted): {vault_result.failed}", flush=True)
+            # Defensive: a failure inside intercept_vault_commands (e.g. a missing
+            # optional dep like detect_secrets — 2026-06-23 incident) must NOT
+            # crash the message handler AND must NOT leak the secret. On any
+            # exception, fall back to redaction so the raw `vault set` value never
+            # reaches the task file / downstream — it just isn't stored to Keychain.
+            try:
+                vault_result = intercept_vault_commands(text)
+                text = vault_result.text
+                if vault_result.stored:
+                    print(f"  [vault] stored keys: {vault_result.stored}", flush=True)
+                if vault_result.failed:
+                    print(f"  [vault] store failed (still redacted): {vault_result.failed}", flush=True)
+            except Exception as _vault_exc:
+                text = redact_vault_commands(text)
+                print(f"  [vault] intercept errored ({type(_vault_exc).__name__}: {_vault_exc}) — redacted, NOT stored", flush=True)
         else:
             text = redact_vault_commands(text)
 
@@ -3154,7 +3152,11 @@ async def _handle_discord_message(message, force=False):
     _notify_py = _claude_config / "skills/task-progress/scripts/notify.py"
     _transcribe_py = _claude_config / "skills/audio-transcribe/scripts/transcribe.py"
     discord_skill_hints = ""
-    if access_tier == "owner" and (_notify_py.exists() or _transcribe_py.exists()):
+    # CONTEXT-FIRST is a correctness feature (reconstruct before interpreting) and
+    # must NOT be gated on unrelated skills (task-progress / audio-transcribe) being
+    # installed — emit for every owner task. notify/transcribe steps stay conditional
+    # within. (Mirrors telegram-bridge; ungated 2026-06-25 per owner.)
+    if access_tier == "owner":
         channel_id_str = str(message.channel.id)
         has_audio = "[File attached:" in attachment_note and any(
             attachment_note.lower().find(ext) != -1
@@ -3162,6 +3164,21 @@ async def _handle_discord_message(message, force=False):
         )
         lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
         step = 1
+        # Context-first: a terse or threaded reply ("no", "continue", a pronoun)
+        # loses its referent when interpreted against a stale/compacted session
+        # context. Reconstruct from the durable channel BEFORE interpreting —
+        # keyed on the message not being self-contained (the agent's own judgment,
+        # not a parent_message_id gate), following the reply chain back, no
+        # arbitrary message count. Root-cause fix 2026-06-25.
+        lines.append(
+            f'{step}. CONTEXT-FIRST: if this message is not self-contained (terse, a reply, '
+            f'or refers to something not stated here), reconstruct the relevant context '
+            f'BEFORE interpreting — `python3 src/discord-read.py {channel_id_str}` — and '
+            f'read the thread (everyone\'s messages including your own prior replies) back '
+            f'until it stands on its own, then answer from the reconstructed thread, not '
+            f'from memory.'
+        )
+        step += 1
         if _notify_py.exists():
             notify_cmd = (
                 f"python3 {_notify_py}"
@@ -3179,24 +3196,58 @@ async def _handle_discord_message(message, force=False):
         lines.append(f"{step}. Process transcript and write result to results/{task_id}.txt")
         discord_skill_hints = "\n" + "\n".join(lines) + "\n"
 
-    task_file.write_text(
-        f"id: {task_id}\n"
-        f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
-        f"task: {user_task_text}\n"
-        f"source: discord\n"
-        f"channel_id: {message.channel.id}\n"
-        f"channel_name: {channel_name}\n"
-        f"guild_name: {guild_name}\n"
-        f"source_message_id: {message.id}\n"
-        f"{parent_msg_line}"
-        f"user_id: {message.author.id}\n"
-        f"access_tier: {access_tier}\n"
-        f"priority: {priority}\n"
-        f"{tier_instructions.get(access_tier, tier_instructions['other'])}"
-        f"{discord_skill_hints}"
-    )
+    # interaction-model 4D, step 1.5: if this message carried attachments, emit
+    # the structured header trio (content_modalities/media_form/attachments)
+    # ALONGSIDE the legacy [File attached:] body line already in user_task_text.
+    # Additive dual-write — Core's existing path is untouched; these are real
+    # headers (after `task:`), so confine_user_content defangs any forged copy a
+    # user tries to smuggle in the body but leaves these authentic ones intact.
+    media_headers = local_task_protocol.media_attachment_headers(  # pragma: no cover
+        attachment_refs, bool(text and text.strip()))
+
+    # Instrumentation (2026-06-23): make a silent "message received but no task
+    # written" drop diagnosable. The owner saw several messages vanish with no
+    # task file and no error; every early `return` above already logs, so the
+    # gap is here at the write (an exception in the f-string build or write_text
+    # would otherwise lose the message with no trace). Log the outcome either way
+    # — a future drop now self-diagnoses: absence of BOTH this line and an
+    # early-return log pinpoints a new path; a FAILED line pinpoints the write.
+    try:
+        task_file.write_text(
+            f"id: {task_id}\n"
+            f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
+            f"task: {user_task_text}\n"
+            f"source: discord\n"
+            f"interaction_type: message\n"
+            f"{media_headers}"
+            f"channel_id: {message.channel.id}\n"
+            f"channel_name: {channel_name}\n"
+            f"guild_name: {guild_name}\n"
+            f"source_message_id: {message.id}\n"
+            f"{parent_msg_line}"
+            f"user_id: {message.author.id}\n"
+            f"access_tier: {access_tier}\n"
+            f"priority: {priority}\n"
+            f"{tier_instructions.get(access_tier, tier_instructions['other'])}"
+            f"{discord_skill_hints}"
+        )
+    except Exception as _tw_exc:
+        print(f"  [task-write] FAILED for @{username} in #{channel_name} "
+              f"(tier={access_tier}, msg={message.id}): "
+              f"{type(_tw_exc).__name__}: {_tw_exc}", flush=True)
+        return
+    print(f"  [task-write] wrote {task_file.name} "
+          f"(@{username}, #{channel_name}, tier={access_tier})", flush=True)
     pending_replies[task_id] = message.channel
     pending_task_tiers[task_id] = access_tier
+    # Observability: one inbound accepted-message event.
+    _emit_channel(
+        "discord", "in",
+        user_id=str(message.author.id),
+        channel_id=str(message.channel.id),
+        access_tier=access_tier,
+        data={"task_id": task_id, "is_dm": is_dm},
+    )
     # Track source-message-id so the result-sender can auto-attach reply_to
     # (visually thread the reply to the triggering message). Skipped when
     # the channel is already a Discord thread — thread context is enough.
@@ -3219,6 +3270,7 @@ def save_to_allowlist(sender_id):
         data.setdefault("allowFrom", []).append(sender_id)
         ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
         ACCESS_FILE.write_text(json.dumps(data, indent=2))
+        os.chmod(ACCESS_FILE, 0o600)  # don't inherit umask 644 — file holds owner's Discord user IDs
 
 
 async def poll_approved():
@@ -3376,6 +3428,11 @@ def _mark_delivered(task_id: str) -> None:
         _delivered_sentinel_path(task_id).touch()
     except Exception as e:
         print(f"  [delivered] sentinel write failed for {task_id}: {e}", flush=True)
+    # §7 audit ledger (Result Router S5): one line per delivered result, so
+    # "did the user see this?" is answerable without grepping bridge logs. This
+    # is the single post-successful-send choke point in the Discord result path.
+    # record() never raises (result_audit swallows all errors internally).
+    result_audit.record(task_id, "delivered", "discord")
 
 
 def _is_delivered(task_id: str) -> bool:
@@ -3499,7 +3556,11 @@ async def poll_results():
                 # Clear the progress-streamer's tier map here (NOT only in
                 # poll_progress) so it's bounded even when the feature flag is
                 # OFF — otherwise this dict would leak one entry per task.
-                pending_task_tiers.pop(task_id, None)
+                # Capture the tier BEFORE the pop so the outbound obs event
+                # below labels actor.access_tier correctly. Fall back to
+                # "unknown" — never "owner" — so a lost/absent tier can't
+                # silently upgrade a non-owner reply in tier accounting.
+                _task_tier = pending_task_tiers.pop(task_id, None) or "unknown"
                 save_pending_replies()
                 # Skip sending if already replied directly (core agent used MCP).
                 # Clean up the result AND task files so the watcher doesn't
@@ -3771,6 +3832,16 @@ async def poll_results():
                     # would re-send on restart producing a duplicate.
                     _mark_delivered(task_id)
                     print(f"  Replied: {reply_text[:80]}...", flush=True)
+                    # Observability: one delivered-reply event.
+                    _emit_channel(
+                        "discord", "out",
+                        channel_id=str(getattr(channel, "id", "")),
+                        access_tier=_task_tier,
+                        data={
+                            "task_id": task_id,
+                            "is_dm": isinstance(channel, discord.DMChannel),
+                        },
+                    )
                 except Exception as e:
                     print(f"  Reply failed: {e}", flush=True)
                 # Archive (not delete) so we can mine patterns later.
@@ -4144,6 +4215,58 @@ async def poll_proactive():
         await asyncio.sleep(3)
 
 
+# Sources whose results have NO delivery channel of their own — the ONLY
+# `task-` results poll_dm_fallback may forward to the owner's Discord DM.
+# Voice (and phone) results are delivered by voice-agent's task-bridge only
+# while that client is connected; when it's offline the result would be
+# silently lost, which is the entire reason this fallback exists. Every other
+# source — api/chat (agent-api), discord (poll_results), telegram, slack —
+# owns its own delivery path and must never be echoed here. This is an
+# allowlist, not a denylist: a newly-added source is non-eligible by default
+# and can never leak into DM unless deliberately added.
+DM_FALLBACK_SOURCES = {"voice", "phone"}
+
+
+def _task_source(task_id: str):
+    """Lowercased `source:` of a task file, or None when the file is
+    missing/unreadable or declares no source. Lets poll_dm_fallback decide
+    whether a `task-` result is DM-eligible (see DM_FALLBACK_SOURCES)."""
+    tf = find_task_file(TASKS_DIR, task_id)
+    if not tf:
+        processed = TASKS_DIR / "processed" / f"{task_id}.txt"
+        if processed.exists():
+            tf = processed
+    if not tf:
+        archived = sorted((TASKS_DIR / "archive").glob(f"*/{task_id}.txt"))
+        if archived:
+            tf = archived[-1]
+    if not tf:
+        return None
+    try:
+        # Lenient protocol parser (step 3b): full scan, first occurrence wins
+        # — exact legacy semantics, needed because this probe classifies files
+        # of ANY era and the voice writer was task-mid until mid-2026 (23
+        # archived voice tasks have source: after task:; the stricter
+        # stop-at-task: parser flips their DM verdict — caught by the corpus
+        # sweep in tests/discord-task-source-invariance.test.py).
+        # pragma-no-cover rationale: this module cannot import in the
+        # coverage-gate env (discord.py isn't installed there), so these two
+        # glue lines are unmeasurable; their semantics are covered by
+        # tests/discord-task-source-invariance.test.py, which dual-runs the
+        # extraction against the legacy implementation over the full corpus.
+        src = local_task_protocol.parse_task_headers_lenient(  # pragma: no cover
+            tf.read_text(encoding="utf-8", errors="replace")).get("source")
+        return (src or "").strip().lower() or None  # pragma: no cover
+    except OSError:
+        return None
+
+
+def _dm_fallback_eligible(task_id: str) -> bool:
+    """FAIL-CLOSED (#1854 follow-up): missing/unreadable source -> NOT
+    DM-eligible; a wrongly-skipped result still surfaces via retention."""
+    return _task_source(task_id) in DM_FALLBACK_SOURCES
+
+
 async def poll_dm_fallback():
     """Fallback path for task/question/briefing results that no other
     consumer is going to handle.
@@ -4173,6 +4296,17 @@ async def poll_dm_fallback():
                 # Skip anything Discord is already tracking for reply.
                 task_id = f.stem  # e.g. "task-1776286725412"
                 if task_id in pending_replies:
+                    continue
+                # Source gate: this fallback delivers ONLY channel-less voice/
+                # phone results (see DM_FALLBACK_SOURCES). A `task-` result from
+                # a source that owns its own delivery path (api/chat, discord,
+                # telegram, slack) is none of our business — skip it and leave
+                # it for its own consumer (+ the retention sweep) to drain. The
+                # other FALLBACK_PREFIXES (question-/briefing-/insight-/friction-)
+                # are cron/proactive artifacts with no channel, so they bypass
+                # this gate and stay eligible. FAIL-CLOSED: a missing/unreadable
+                # source is NOT eligible (see _dm_fallback_eligible).
+                if task_id.startswith("task-") and not _dm_fallback_eligible(task_id):
                     continue
                 # Grace window so voice-agent / telegram-bridge get first dibs.
                 try:

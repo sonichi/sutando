@@ -10,6 +10,30 @@
 
 set -euo pipefail
 
+# Ensure `node` is on PATH. npx/tsx are launched by absolute path below, but
+# they re-exec `node` via `#!/usr/bin/env node`, so the node install dir must be
+# on PATH or the job dies with exit 127 ("env: node: No such file or directory").
+# launchd's plist PATH is a fixed guess (often /opt/homebrew/bin on Apple Silicon)
+# and won't match an Intel-Homebrew (/usr/local/bin) or version-manager install —
+# so heal it here rather than depend on the plist being right for every machine.
+#
+# Resolve exactly ONE node dir, first match wins, in the same priority order (and
+# with the same NEWEST-nvm selection) as resolve_npx/resolve_tsx below. The nvm
+# candidate MUST use `sort -V | tail -1`, NOT a `*/bin` glob: glob order is
+# lexicographic, so with prepend-then-continue a box with v9 + v10 would pick v9
+# (`'1' < '9'` sorts v10 first, v9 last-wins) — an older node, not the latest.
+for _node_cand in \
+    /opt/homebrew/bin/node \
+    /usr/local/bin/node \
+    "$HOME/.nvm/versions/node/$(ls "$HOME/.nvm/versions/node/" 2>/dev/null | sort -V | tail -1)/bin/node" \
+    "$HOME/.volta/bin/node"
+do
+    [ -x "$_node_cand" ] || continue
+    _node_dir="$(dirname "$_node_cand")"
+    case ":$PATH:" in *":$_node_dir:"*) ;; *) PATH="$_node_dir:$PATH"; export PATH ;; esac
+    break   # first (highest-priority) node wins — don't stack multiple node dirs
+done
+
 # Resolve the credential-proxy script path. Honors $CLAUDE_CONFIG_DIR if the
 # launchd plist exports it (claude-sutando installs); otherwise falls back to
 # ~/.claude. launchd itself doesn't inherit shell env, so this fallback is the

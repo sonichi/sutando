@@ -37,7 +37,7 @@ export SUTANDO_ROOT="$REPO"
 # L~449 discord, L~473 slack) probe `${CLAUDE_CONFIG_DIR:-$HOME/.claude}` and
 # fall back to legacy `~/.claude/` when the env var is unset — meaning bridges
 # read tokens / access lists from the pre-migration location even after a
-# successful `claude-sutando --migrate`. Mirrors scripts/start-cli.sh:38-51
+# successful `claude-sutando --migrate`. Mirrors src/agent/claude/cli/start-cli.sh
 # (Sutando.app's tmux-wrapped CLI launcher) — same machine-spawn pattern.
 #
 # Defense in depth (matches start-cli):
@@ -48,6 +48,12 @@ if [ -x "$REPO/scripts/sutando-config.sh" ]; then
   _ccd_err="$(mktemp -t startup-ccd.XXXXXX)"
   if _ccd="$(bash "$REPO/scripts/sutando-config.sh" claude-sutando-config-dir 2>"$_ccd_err")"; then
     mkdir -p "$_ccd"
+    # NOTE: the claude core-agent launcher + the `claude-sutando` config-dir
+    # onboarding alias now live under src/agent/claude/ (start-cli.sh /
+    # sutando-shell-setup.sh). This credentials seed stays INLINE here by design:
+    # it must run in the same startup env (exports CLAUDE_CONFIG_DIR for the
+    # bridges below), not in a separately-execed launcher. See
+    # src/agent/claude/README.md for the full auth/onboarding map.
     # Auth-carry (v0.8 cold-start fix). Seed credentials + onboarding state from
     # $HOME/.claude/ so a cold `claude` core doesn't dead-end at the login wall
     # (.credentials.json) or trust-folder prompt (.claude.json) before reaching
@@ -159,6 +165,13 @@ fi
 # fleet host self-heals on its next boot.
 git -C "$REPO" config --unset committer.name 2>/dev/null || true
 git -C "$REPO" config --unset committer.email 2>/dev/null || true
+
+# Re-apply tracked plugin-cache patches (skills/plugin-patches/). Plugin caches
+# are managed like node_modules — clobbered on update + invisible to git/sync —
+# so a kept local edit must be re-applied per host. The applier is idempotent +
+# fail-loud: it never force-applies and a stale/missing patch WARNs without
+# failing startup. See skills/plugin-patches/README.md.
+python3 "$REPO/skills/plugin-patches/apply-plugin-patches.py" || true
 
 # Fail-fast .env validation BEFORE init.sh. Two reasons must both hold:
 #  1) init.sh resolves the workspace via `${SUTANDO_WORKSPACE/#~/$HOME}` with
@@ -313,6 +326,12 @@ fi
 # still there as a fallback (mentioned in README).
 bash "$REPO/scripts/install-git-hooks.sh" >/dev/null 2>&1 || true
 
+# Wire the SessionStart hook that reminds the core agent to run /schedule-crons
+# on every session start (including post-compaction). Idempotent — safe to run
+# on every start. Crons are session-only, so without this, recurring jobs go
+# dark whenever a session restarts without an explicit /schedule-crons invocation.
+bash "$REPO/scripts/install-session-start-hook.sh" 2>&1 || true
+
 # Auto-bootstrap: create-if-missing files and dirs that the agent + skills
 # expect to exist (logs, state, tasks, results, notes, contextual-chips.json,
 # pending-questions.md, build_log.md, crons.json, …). Idempotent — safe to
@@ -456,8 +475,8 @@ fi
 # per-host sentinel at $WORKSPACE/state/.shell-setup-prompted-<hostname> so
 # this never re-pesters after the user's initial yes/no.
 # Failures are non-fatal — startup.sh continues regardless.
-if [ -x "$REPO/scripts/sutando-shell-setup.sh" ]; then
-  bash "$REPO/scripts/sutando-shell-setup.sh" --auto || true
+if [ -x "$REPO/src/agent/claude/cli/sutando-shell-setup.sh" ]; then
+  bash "$REPO/src/agent/claude/cli/sutando-shell-setup.sh" --auto || true
 fi
 
 # Reap any stale watch-tasks-stream watcher from a prior session. The
@@ -505,7 +524,29 @@ else
   echo "  ✓ core heartbeat (already running)"
 fi
 
-# 0. Credential proxy for quota tracking (port 7846)
+# 0. Credential proxy for quota tracking (port 7846).
+# Prefer the launchd-supervised job (KeepAlive + ThrottleInterval=10s) so the
+# proxy restarts on crash instead of leaving a proxy-routed core stranded on a
+# dead port (#1086 / #1291). The wrapper evicts any stale manual holder of 7846
+# before binding, so this composes with the legacy bare-& launch below. Falls
+# back to that legacy launch on older checkouts that lack the launchd template,
+# or if the install fails for any reason.
+_PROXY_LABEL="com.sutando.credential-proxy"
+_PROXY_INSTALLER="$REPO/src/install-credential-proxy-launchd.sh"
+if [ -f "$_PROXY_INSTALLER" ] && [ -f "$REPO/src/launchd/$_PROXY_LABEL.plist" ]; then
+  if launchctl print "gui/$(id -u)/$_PROXY_LABEL" > /dev/null 2>&1; then
+    echo "  ✓ credential proxy (launchd-supervised, already loaded)"
+  else
+    echo "  Installing launchd-supervised credential proxy..."
+    if bash "$_PROXY_INSTALLER" install > /dev/null 2>&1; then
+      # Wait for the supervised proxy to bind before the legacy-launch guard.
+      for _ in $(seq 1 10); do lsof -i :7846 > /dev/null 2>&1 && break; sleep 0.5; done
+      echo "  ✓ credential proxy (launchd-supervised)"
+    else
+      echo "  ⚠ launchd install failed — falling back to legacy launch"
+    fi
+  fi
+fi
 if ! lsof -i :7846 > /dev/null 2>&1; then
   echo "  Starting credential proxy (port 7846)..."
   npx tsx "$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)" > /tmp/credential-proxy.log 2>&1 &
@@ -590,6 +631,23 @@ else
   echo "  ✓ web client (already running)"
 fi
 
+# 2b. Tailnet HTTPS front for browser wss:// voice reach (opt-in).
+# When SUTANDO_TAILNET_SERVE is on, front the webUI with `tailscale serve` so a
+# browser on another device on your tailnet can open wss:// to the /ws proxy
+# (plain ws:// to a non-localhost host is blocked as mixed content from an HTTPS
+# page). Best-effort: a missing prerequisite (tailscale down, HTTPS not enabled
+# for the tailnet) must NOT fail startup — the helper prints its own diagnostics
+# to the log. `tailscale serve --bg` is idempotent, so re-running each boot is
+# safe. Pairs with SUTANDO_LAN_SHARE=1 (which the helper reminds you to set).
+if [[ "${SUTANDO_TAILNET_SERVE:-}" =~ ^(1|true|yes|on)$ ]]; then
+  echo "  Fronting webUI with tailscale serve (SUTANDO_TAILNET_SERVE on)..."
+  if bash "$REPO/scripts/tailscale-serve-voice.sh" >> "$LOGS_DIR/tailscale-serve.log" 2>&1; then
+    echo "  ✓ tailscale serve (browser wss:// tailnet reach)"
+  else
+    echo "  ⚠ tailscale serve skipped — see $LOGS_DIR/tailscale-serve.log"
+  fi
+fi
+
 # 3. Dashboard (port 7844)
 reap_wedged_listener 7844 dashboard
 if ! lsof -i :7844 > /dev/null 2>&1; then
@@ -631,7 +689,7 @@ fi
 # Serves the research webapp with the live (read-only) portfolio panel and keeps
 # its snapshot fresh via a background refresher daemon. No-op if not initialised.
 if [ -d "$REPO/skills/portfolio-research" ]; then
-  if [ ! -d "${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}/research/portfolio/webapp" ]; then
+  if [ ! -d "$WORKSPACE/research/portfolio/webapp" ]; then
     bash "$REPO/skills/portfolio-research/scripts/init-evergreen-webapp.sh" \
       > "$LOGS_DIR/portfolio-dashboard.log" 2>&1 || true
   fi
@@ -766,15 +824,34 @@ else
   echo "  ~ telegram bridge (no token — optional)"
 fi
 
-# AG2 remote relay client (optional channel — full docs + onboarding in
-# skills/ag2-relay/). Silent unless AG2_REMOTE_TOKEN is set; to connect a new
-# instance run:  bash skills/ag2-relay/onboard.sh
-if [ -n "${AG2_REMOTE_TOKEN:-}" ] && [ -f skills/ag2-relay/remote-task-client.py ]; then
-  if ! pgrep -f "remote-task-client" > /dev/null 2>&1; then
-    python3 skills/ag2-relay/remote-task-client.py > "$LOGS_DIR/remote-task-client.log" 2>&1 &
-    echo "  ✓ ag2 relay client"
+# Remote gateway bridge (optional channel — generic, same shape as the discord/
+# telegram/slack blocks below). Config + token live in the channel .env, resolved
+# via the same claude-home-path helper; the bridge itself ships in src/ (provider-
+# neutral, like the others). Relay protocol: docs/remote-gateway-protocol.md.
+# Deliberately silent when unconfigured — a Sutando-only user never sees it.
+# Back-compat: also detect/honor a legacy AG2_REMOTE_* token written to the repo
+# .env by older onboarding, so existing agents keep reconnecting after this lands
+# (until they re-onboard onto channels/ag2space/.env).
+if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env)"; \
+   { [ -f "$_RELAY_ENV" ] && grep -qE "^(REMOTE_TASK_TOKEN|AG2_REMOTE_TOKEN)=" "$_RELAY_ENV" 2>/dev/null; } \
+   || [ -n "${REMOTE_TASK_TOKEN:-}${AG2_REMOTE_TOKEN:-}" ]; then
+  [ -f "$_RELAY_ENV" ] && { set -a; . "$_RELAY_ENV"; set +a; }
+  # Map legacy AG2_REMOTE_* → REMOTE_TASK_* (the names the bridge reads). The
+  # legacy token may be the combined "url|secret" form, which the bridge splits.
+  REMOTE_TASK_TOKEN="${REMOTE_TASK_TOKEN:-${AG2_REMOTE_TOKEN:-}}"
+  # Default tier is "owner" for the personal-agent model (2026-07-08): a user's
+  # own gateway authenticates with their own owner bearer and the broker
+  # owner-scopes every pull, so its tasks are the owner's own (e.g. voice
+  # delegations). Must match the bridge's own default — otherwise startup.sh
+  # would export a value and the bridge's default never fires. A shared /
+  # multi-user gateway sets REMOTE_TASK_TIER=team explicitly.
+  REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-${AG2_REMOTE_TIER:-owner}}"
+  export REMOTE_TASK_TOKEN REMOTE_TASK_TIER
+  if ! pgrep -f "remote-gateway-bridge" > /dev/null 2>&1; then
+    python3 "$REPO/src/remote-gateway-bridge.py" > "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
+    echo "  ✓ gateway bridge"
   else
-    echo "  ✓ ag2 relay client (already running)"
+    echo "  ✓ gateway bridge (already running)"
   fi
 fi
 
@@ -810,7 +887,7 @@ if _DC_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/d
     echo "  ~ discord bridge (no python with discord.py — run: /opt/homebrew/bin/pip3 install discord.py)"
   elif ! pgrep -f "discord-bridge" > /dev/null 2>&1; then
     echo "  Starting Discord bridge with $PYTHON_WITH_DISCORD..."
-    "$PYTHON_WITH_DISCORD" src/discord-bridge.py > "$LOGS_DIR/discord-bridge.log" 2>&1 &
+    PYTHONUNBUFFERED=1 "$PYTHON_WITH_DISCORD" src/discord-bridge.py > "$LOGS_DIR/discord-bridge.log" 2>&1 &
     echo "  ✓ discord bridge"
   else
     echo "  ✓ discord bridge (already running)"
@@ -920,9 +997,9 @@ done
 echo ""
 open "http://localhost:8080"
 
-# Delegate to scripts/start-cli.sh — canonical sutando-core launch command.
-# Single source of truth so Sutando.app's Restart Core menu can invoke the
-# same launch path without duplicating the tmux + claude flags.
+# Delegate to src/agent/claude/cli/start-cli.sh — canonical sutando-core launch
+# command. Single source of truth so Sutando.app's Restart Core menu can invoke
+# the same launch path without duplicating the tmux + claude flags.
 #
 # Restore stdout/stderr to the terminal first when the operator is
 # interactive: the tee-redirect at the top of this script makes fd 1 a PIPE,
@@ -935,4 +1012,4 @@ open "http://localhost:8080"
 if [ -t 0 ]; then
     exec >/dev/tty 2>&1
 fi
-exec bash "$REPO/scripts/start-cli.sh"
+exec bash "$REPO/src/agent/claude/cli/start-cli.sh"

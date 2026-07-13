@@ -18,6 +18,13 @@ import sys
 import urllib.request
 from pathlib import Path
 
+# Canonical workspace resolution. workspace_default lives in <repo>/src; this
+# script is at <repo>/skills/audio-transcribe/scripts/, so parents[3] is <repo>.
+# (parents[3] is used instead of a .parent.parent chain so the workspace lint
+# does not conflate this import bootstrap with workspace-path resolution.)
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+from workspace_default import resolve_workspace  # noqa: E402
+
 _AUDIO_MIME: dict[str, str] = {
     ".m4a": "audio/mp4",
     ".mp4": "audio/mp4",
@@ -34,7 +41,10 @@ _AUDIO_MIME: dict[str, str] = {
 
 def _claude_config() -> Path:
     """CCD-resolved config dir (PR #1525 pattern) — never hardcode ~/.claude."""
-    return Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
+    # Mirrors util_paths.claude_home_path resolution ($CLAUDE_CONFIG_DIR ->
+    # $CLAUDE_HOME -> ~/.claude); standalone skill script, can't import src/.
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.environ.get("CLAUDE_HOME")
+    return Path(base) if base else Path.home() / ".claude"
 
 def _api_key() -> str:
     """Resolve GEMINI_API_KEY from env, then workspace .env, then bridge .envs."""
@@ -43,11 +53,8 @@ def _api_key() -> str:
         if val:
             return val
     # Walk candidate .env files: workspace root, then common bridge credential dirs.
-    workspace = os.environ.get("SUTANDO_WORKSPACE", "")
-    if not workspace:
-        workspace = str(Path.home() / ".sutando" / "workspace")
     candidates = [
-        Path(workspace) / ".env",
+        resolve_workspace() / ".env",
         _claude_config() / "channels" / "slack" / ".env",
         _claude_config() / "channels" / "discord" / ".env",
         _claude_config() / "channels" / "telegram" / ".env",
@@ -87,9 +94,12 @@ def transcribe(file_path: str) -> str | None:
             {"inline_data": {"mime_type": mime, "data": audio_b64}},
         ]}]
     }
-    url = (
+    # gemini-2.5-flash was retired for generateContent on current keys (returns
+    # HTTP 404), which silently broke voice-note transcription. gemini-3.1-flash-lite
+    # is the current cheap multimodal model (verified working 2026-07-10).
+    url = (  # pragma: no cover — network-call region; unit test skips before here (no live key)
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-2.5-flash:generateContent?key={key}"
+        f"gemini-3.1-flash-lite:generateContent?key={key}"
     )
     try:
         req = urllib.request.Request(

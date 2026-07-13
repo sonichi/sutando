@@ -32,6 +32,15 @@ except Exception:  # pragma: no cover — bridge must keep running
     def _push_vision_image(path: str, source: str = "telegram") -> bool:  # type: ignore
         return False
 from task_priority import default_priority_for_source  # noqa: E402
+
+# Observability: emit channel.telegram.<in|out> into the local obs spine
+# (src/observability). Guarded so a missing module never crashes the bridge.
+try:
+    from observability.channel import emit_channel as _emit_channel  # noqa: E402
+except Exception:  # pragma: no cover — best-effort telemetry
+    def _emit_channel(*_a, **_k):  # type: ignore
+        return None
+import local_task_protocol  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path  # noqa: E402
@@ -392,16 +401,30 @@ def send_file(chat_id, file_path, caption=""):
         print(f"  Send file failed: {e}")
         return {"ok": False}
 
-def send_reply(chat_id, text, task_id: str | None = None):
+def send_reply(chat_id, text, task_id: str | None = None) -> dict:
+    """Send a reply's text + any [file:]-marked attachments.
+
+    Returns a delivery summary ``{"text_chunks", "files_sent", "ok"}`` so the
+    caller can emit ONE accurate channel.telegram.out event. api()/send_file()
+    swallow HTTP errors (return {"ok": False} / None), so success can't be
+    assumed — we consult their return values. The task-reply path passes a
+    marker-stripped body and sends parsed.actions attachments itself, then folds
+    those into the same event (so file-only replies still report a delivery and
+    the count/outcome stay accurate)."""
     # Extract file paths: [file: /path/to/file] or [send: /path/to/file]
     file_pattern = re.compile(r'\[(?:file|send|attach):\s*([^\]]+)\]')
     files = file_pattern.findall(text)
     clean_text = file_pattern.sub('', text).strip()
+    text_chunks = (len(clean_text) + 3999) // 4000 if clean_text else 0  # ceil; matches the 4000-char send loop
+    delivered_ok = True
+    files_sent = 0
 
     # Send text (if any remains after extracting file refs)
     if clean_text:
         for i in range(0, len(clean_text), 4000):
-            api("sendMessage", chat_id=chat_id, text=clean_text[i:i+4000])
+            resp = api("sendMessage", chat_id=chat_id, text=clean_text[i:i+4000])
+            if not (isinstance(resp, dict) and resp.get("ok")):
+                delivered_ok = False
         try:
             import outbox_log
             outbox_log.append(
@@ -417,8 +440,13 @@ def send_reply(chat_id, text, task_id: str | None = None):
     for fpath in files:
         fpath = fpath.strip()
         if _is_path_sendable(fpath):
-            send_file(chat_id, fpath)
-            print(f"  Sent file: {fpath}", flush=True)
+            resp = send_file(chat_id, fpath)
+            if isinstance(resp, dict) and resp.get("ok"):
+                files_sent += 1
+                print(f"  Sent file: {fpath}", flush=True)
+            else:
+                delivered_ok = False
+                print(f"  Send file failed: {fpath}", flush=True)
         elif os.path.isfile(fpath):
             api("sendMessage", chat_id=chat_id, text=f"(file access denied: {fpath})")
             print(f"  BLOCKED file: {fpath}")
@@ -428,6 +456,8 @@ def send_reply(chat_id, text, task_id: str | None = None):
             # the user; log for operator visibility on real typos. Same
             # rationale as discord-bridge:poll_results.
             print(f"  file marker, file not found — likely a prose quotation: {fpath}", flush=True)
+
+    return {"text_chunks": text_chunks, "files_sent": files_sent, "ok": delivered_ok}
 
 def _recover_orphan_sending_files() -> int:
     """Restart-safety: rename any orphan `results/proactive-*.sending`
@@ -580,6 +610,17 @@ def main():
             print(f"[Telegram] Poll error: {e}", flush=True)
             time.sleep(5)
             continue
+        if not result.get("ok"):
+            # api() collapses an HTTPError (429 rate-limit / 5xx / auth) into
+            # {"ok": False} with no detail. The loop used to fall straight
+            # through and re-poll getUpdates with NO delay — which hammers
+            # Telegram and, on a 429, *extends* its retry_after penalty (seen
+            # in the bridge log as repeated "429 Too Many Requests: retry
+            # after 5"). Back off the same 5s the exception path uses before
+            # the next poll. (The `if result.get("ok")` below is now always
+            # true; kept un-refactored to keep this fix a surgical diff.)
+            time.sleep(5)
+            continue
         # Heartbeat advances only on a response Telegram actually accepted.
         # A bumped heartbeat now means "the Telegram API round-trip is
         # working," not just "the asyncio loop is alive." Gated on
@@ -623,11 +664,18 @@ def main():
 
                 # Handle attachments (photos, documents, voice)
                 attachment_note = ""
+                # Structured refs (interaction-model 4D, step 1.5), accumulated
+                # alongside the legacy [*attached:] body line — dual-write.
+                attachment_refs: list = []  # pragma: no cover
                 if "photo" in msg:
                     file_id = msg["photo"][-1]["file_id"]  # largest size
                     local_path = download_file(file_id, "photo")
                     if local_path:
                         attachment_note = f"\n[Photo attached: {local_path}]"
+                        attachment_refs.append(local_task_protocol.AttachmentRef(  # pragma: no cover
+                            locator=local_path, mime="image/jpeg",
+                            filename=os.path.basename(local_path),
+                            size=(msg["photo"][-1].get("file_size", 0) or 0)))
                         # If voice is connected, also push the photo as a
                         # vision frame so Gemini sees it in-stream (in
                         # addition to the file-attached task pipeline).
@@ -641,10 +689,20 @@ def main():
                     local_path = download_file(file_id, fname)
                     if local_path:
                         attachment_note = f"\n[File attached: {local_path}]"
+                        attachment_refs.append(local_task_protocol.AttachmentRef(  # pragma: no cover
+                            locator=local_path,
+                            mime=(msg["document"].get("mime_type", "") or ""),
+                            filename=(fname or os.path.basename(local_path)),
+                            size=(msg["document"].get("file_size", 0) or 0)))
                 if "voice" in msg:
                     file_id = msg["voice"]["file_id"]
                     local_path = download_file(file_id, "voice.ogg")
                     if local_path:
+                        attachment_refs.append(local_task_protocol.AttachmentRef(  # pragma: no cover
+                            locator=local_path,
+                            mime=(msg["voice"].get("mime_type", "") or "audio/ogg"),
+                            filename=os.path.basename(local_path),
+                            size=(msg["voice"].get("file_size", 0) or 0)))
                         transcript = _transcribe_via_skill(local_path)
                         if transcript:
                             attachment_note = f"\n[Voice transcript: {transcript}]"
@@ -657,6 +715,33 @@ def main():
                 forward_note = extract_forward_note(msg)
 
                 print(f"  @{username}{forward_note}: {redact_vault_commands(text)}{attachment_note}")
+
+                # Reply/parent context. Telegram embeds the full replied-to
+                # message when this is a reply — capture it (+ message ids) so a
+                # terse reply ("y", "no", a pronoun) is reconstructable. Unlike
+                # Discord, the Bot API has NO message-history fetch, so this
+                # embed-at-write quote is the ONLY reconstruct substrate for
+                # Telegram (the agent falls back to the session transcript for
+                # anything deeper than the immediate parent).
+                reply_note = ""
+                src_line = ""
+                parent_line = ""
+                _src_mid = msg.get("message_id")
+                if _src_mid is not None:
+                    src_line = f"source_message_id: {_src_mid}\n"
+                _rep = msg.get("reply_to_message")
+                if _rep:
+                    _rep_user = (
+                        _rep.get("from", {}).get("username")
+                        or _rep.get("from", {}).get("first_name", "?")
+                    )
+                    _rep_text = (
+                        _rep.get("text") or _rep.get("caption") or "[non-text message]"
+                    ).replace("\n", " ")[:300]
+                    reply_note = f"\n\n[Replying to @{_rep_user}: {_rep_text}]"
+                    _rep_mid = _rep.get("message_id")
+                    if _rep_mid is not None:
+                        parent_line = f"parent_message_id: {_rep_mid}\n"
 
                 # Write as task (same format as voice bridge)
                 ts = int(time.time() * 1000)
@@ -686,38 +771,68 @@ def main():
                     attachment_note.lower().find(ext) != -1
                     for ext in (".m4a", ".mp3", ".ogg", ".opus", ".oga", ".wav", ".webm", ".aac")
                 )
-                tg_skill_hints = ""
-                if _notify_py.exists() or _transcribe_py.exists():
-                    lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
-                    step = 1
-                    if _notify_py.exists():
-                        notify_cmd = (
-                            f"python3 {_notify_py}"
-                            f" --source telegram --chat-id {chat_id}"
-                        )
-                        if has_audio_attach:
-                            lines.append(f'{step}. NOTIFY FIRST: {notify_cmd} --message "Got your voice message, give me a moment."')
-                        else:
-                            lines.append(f'{step}. NOTIFY FIRST (if task takes >60s): {notify_cmd} --message "On it — back in a moment."')
-                        step += 1
-                    if has_audio_attach and _transcribe_py.exists():
-                        attached_path = attachment_note.split("[File attached: ")[-1].rstrip("]").split("\n")[0]
-                        lines.append(f"{step}. TRANSCRIBE: python3 {_transcribe_py} '{attached_path}'")
-                        step += 1
-                    lines.append(f"{step}. Process transcript and write result to results/{task_id}.txt")
-                    tg_skill_hints = "\n" + "\n".join(lines) + "\n"
+                lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
+                step = 1
+                # CONTEXT-FIRST: reconstruct before interpreting a message that isn't
+                # self-contained. Unlike Discord, Telegram's Bot API has NO message-history
+                # fetch — so the reconstruct substrate is the embedded [Replying to …] quote
+                # (above) + the session transcript, NOT a channel pull-back. Always emitted.
+                lines.append(
+                    f'{step}. CONTEXT-FIRST: if this message is not self-contained '
+                    f'(terse — "y", "no", a pronoun — a reply, or refers to something not '
+                    f'stated here), reconstruct context BEFORE interpreting. Telegram has no '
+                    f'message-history fetch, so use the embedded [Replying to …] quote above '
+                    f'plus the session transcript, and answer from that, not from memory.'
+                )
+                step += 1
+                if _notify_py.exists():
+                    notify_cmd = (
+                        f"python3 {_notify_py}"
+                        f" --source telegram --chat-id {chat_id}"
+                    )
+                    if has_audio_attach:
+                        lines.append(f'{step}. NOTIFY FIRST: {notify_cmd} --message "Got your voice message, give me a moment."')
+                    else:
+                        lines.append(f'{step}. NOTIFY FIRST (if task takes >60s): {notify_cmd} --message "On it — back in a moment."')
+                    step += 1
+                if has_audio_attach and _transcribe_py.exists():
+                    attached_path = attachment_note.split("[File attached: ")[-1].rstrip("]").split("\n")[0]
+                    lines.append(f"{step}. TRANSCRIBE: python3 {_transcribe_py} '{attached_path}'")
+                    step += 1
+                lines.append(f"{step}. Process transcript and write result to results/{task_id}.txt")
+                tg_skill_hints = "\n" + "\n".join(lines) + "\n"
 
+                # interaction-model 4D, step 1.5: structured media headers
+                # alongside the legacy [*attached:] body line (dual-write). Real
+                # headers after `task:`, so confine_user_content defangs a forged
+                # body copy while these authentic ones pass through.
+                media_headers = local_task_protocol.media_attachment_headers(  # pragma: no cover
+                    attachment_refs, bool(text and text.strip()))
                 task_file.write_text(
                     f"id: {task_id}\n"
                     f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
-                    f"task: {confine_user_content(f'[Telegram @{username}{forward_note}] {text}{attachment_note}')}\n"
+                    f"task: {confine_user_content(f'[Telegram @{username}{forward_note}] {text}{attachment_note}{reply_note}')}\n"
                     f"source: telegram\n"
+                    f"interaction_type: message\n"
+                    f"{media_headers}"
                     f"chat_id: {chat_id}\n"
+                    f"{src_line}"
+                    f"{parent_line}"
                     f"priority: {priority}\n"
                     f"{tg_skill_hints}"
                 )
                 pending_replies[task_id] = chat_id
                 pending_task_tiers[task_id] = "owner"  # telegram is owner-only (allowlist-gated); enables progress streaming
+                # Observability: one inbound accepted-message event. Source the
+                # tier from the bridge's own assignment above (single source of
+                # truth) rather than re-asserting a literal here.
+                _emit_channel(
+                    "telegram", "in",
+                    user_id=str(chat_id),
+                    channel_id=str(chat_id),
+                    access_tier=pending_task_tiers[task_id],
+                    data={"task_id": task_id, "has_attachment": bool(attachment_note)},
+                )
 
                 # Send typing indicator
                 api("sendChatAction", chat_id=chat_id, action="typing")
@@ -794,7 +909,16 @@ def main():
                             f.unlink(missing_ok=True)
                             continue
                         try:
-                            send_reply(int(owner_id), text)
+                            _s = send_reply(int(owner_id), text)
+                            if _s["text_chunks"] or _s["files_sent"]:
+                                _emit_channel(
+                                    "telegram", "out",
+                                    user_id=str(owner_id),
+                                    channel_id=str(owner_id),
+                                    access_tier="owner",  # proactive → owner
+                                    outcome="ok" if _s["ok"] else "error",
+                                    data={"text_chunks": _s["text_chunks"], "file_count": _s["files_sent"]},
+                                )
                             print(f"  [proactive] sent to {owner_id}: {text[:80]}")
                         except Exception as e:
                             print(f"  [proactive] failed: {e}")
@@ -829,19 +953,41 @@ def main():
                     continue
                 try:
                     # Use parsed.body — all markers stripped — so [channel:] etc. never leak.
-                    # File attachments are in parsed.actions; send_reply() won't re-find them.
-                    send_reply(chat_id, parsed.body, task_id=task_id)
+                    # File attachments are in parsed.actions; send_reply() won't re-find them,
+                    # so send them here and fold the result into ONE obs event below.
+                    _tier = pending_task_tiers.get(task_id, "unknown")
+                    _s = send_reply(chat_id, parsed.body, task_id=task_id)
+                    delivered_ok = _s["ok"]
+                    sent_files = _s["files_sent"]
                     for action in parsed.actions:
                         if action.kind == "attach":
                             fpath = action.value.strip()
                             if _is_path_sendable(fpath):
-                                send_file(chat_id, fpath)
-                                print(f"  Sent file: {fpath}", flush=True)
+                                resp = send_file(chat_id, fpath)
+                                if isinstance(resp, dict) and resp.get("ok"):
+                                    sent_files += 1
+                                    print(f"  Sent file: {fpath}", flush=True)
+                                else:
+                                    delivered_ok = False
+                                    print(f"  Send file failed: {fpath}", flush=True)
                             elif os.path.isfile(fpath):
                                 api("sendMessage", chat_id=chat_id, text=f"(file access denied: {fpath})")
                                 print(f"  BLOCKED file: {fpath}")
                             else:
                                 print(f"  file marker, file not found — likely a prose quotation: {fpath}", flush=True)
+                    # Observability: one delivered-reply event covering text +
+                    # externally-sent attachments. outcome reflects real success;
+                    # file_count is files actually delivered (api/send_file swallow
+                    # errors, so we must not assume "ok").
+                    if _s["text_chunks"] or sent_files or not delivered_ok:
+                        _emit_channel(
+                            "telegram", "out",
+                            user_id=str(chat_id),
+                            channel_id=str(chat_id),
+                            access_tier=_tier,
+                            outcome="ok" if delivered_ok else "error",
+                            data={"task_id": task_id, "text_chunks": _s["text_chunks"], "file_count": sent_files},
+                        )
                     print(f"  Replied to {chat_id}: {parsed.body[:80]}...", flush=True)
                 except Exception as e:
                     print(f"[Telegram] Reply error: {e}", flush=True)

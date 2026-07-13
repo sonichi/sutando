@@ -56,6 +56,7 @@ class TestEnumAndDefaults(unittest.TestCase):
     def test_health_check_and_cron_default_low(self):
         self.assertEqual(default_priority_for_source("health-check"), "low")
         self.assertEqual(default_priority_for_source("sync-memory"), "low")
+        self.assertEqual(default_priority_for_source("sync-workspace"), "low")
         self.assertEqual(default_priority_for_source("cron"), "low")
 
     def test_unknown_source_falls_back_to_normal(self):

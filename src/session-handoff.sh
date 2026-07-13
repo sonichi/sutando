@@ -2,8 +2,9 @@
 # Session handoff — writes a summary for the next session to pick up.
 # Called by PreCompact hook so context survives session restarts.
 #
-# Reads the transcript, extracts key signals, and writes to session-state.md.
-# The incoming session reads this in CLAUDE.md or as part of the proactive loop.
+# Reads the transcript, extracts key signals, and writes to
+# <workspace>/session-state.md. The incoming session reads this in CLAUDE.md
+# or as part of the proactive loop.
 
 # REPO resolves to: (1) $SUTANDO_REPO_DIR if set, (2) auto-detect from the
 # script's parent dir using a sutando-checkout signature, (3) ~/Desktop/sutando
@@ -19,7 +20,6 @@ else
     REPO="$HOME/Desktop/sutando"
 fi
 export PATH="/opt/homebrew/bin:$HOME/.nvm/versions/node/v24.14.1/bin:$PATH"
-STATE_FILE="$REPO/session-state.md"
 TRANSCRIPT="$1"  # Passed by PreCompact hook as $TRANSCRIPT_PATH
 
 # Workspace resolves via the shared post-M0 helper (src/workspace_resolve.sh).
@@ -55,6 +55,12 @@ if [ -z "${WORKSPACE:-}" ]; then
 fi
 WORKSPACE_DIR="$WORKSPACE"  # historical local name retained for the rest of this file
 
+# session-state.md is per-user mutable state — workspace contract says it
+# lives under <workspace>/, not the repo root. Writing to $REPO/ left the
+# workspace copy permanently stale and re-tripped the legacy-state detector
+# after every compaction (sutando-migrate classifies it newest-mtime).
+STATE_FILE="$WORKSPACE_DIR/session-state.md"
+
 # Build state from available signals
 {
   echo "---"
@@ -78,17 +84,18 @@ WORKSPACE_DIR="$WORKSPACE"  # historical local name retained for the rest of thi
   gh pr list --repo sonichi/sutando --state open --limit 5 2>/dev/null || echo "(couldn't fetch)"
   echo ""
 
-  # Pending questions — canonical home is memory-dir machine-<host>/ post-migration.
-  # Resolves via util_paths.personal_path() with cwd fallback. Pass through both
-  # the canonical SUTANDO_MEMORY_DIR and the legacy SUTANDO_PRIVATE_DIR; the
-  # helper prefers the new name and honors the legacy one with a deprecation
-  # warning for one release (#870).
+  # Pending questions — per-host canonical home is <workspace>/hosts/<hostname>/
+  # (post-#1717). personal_path() must receive the workspace root (WORKSPACE_DIR),
+  # not REPO — passing REPO caused it to probe <repo>/hosts/<host>/ which doesn't
+  # exist and fall back to the non-existent <repo>/pending-questions.md, silently
+  # dropping the section from every session-state.md. Fallback echo uses
+  # WORKSPACE_DIR for the same reason.
   PQ_PATH=$(SUTANDO_MEMORY_DIR="${SUTANDO_MEMORY_DIR:-}" SUTANDO_PRIVATE_DIR="${SUTANDO_PRIVATE_DIR:-}" python3 -c "
 import sys; sys.path.insert(0, '$REPO/src')
 from util_paths import personal_path
 from pathlib import Path
-print(personal_path('pending-questions.md', Path('$REPO')))
-" 2>/dev/null || echo "$REPO/pending-questions.md")
+print(personal_path('pending-questions.md', Path('$WORKSPACE_DIR')))
+" 2>/dev/null || echo "$WORKSPACE_DIR/hosts/${SUTANDO_HOST_LABEL:-${SUTANDO_HOST_OVERRIDE:-$(scutil --get LocalHostName 2>/dev/null | grep . || hostname | sed 's/\..*//')}}/pending-questions.md")
   echo "## Pending Questions"
   if [ -f "$PQ_PATH" ]; then
     grep -A1 "^## Q" "$PQ_PATH" | head -20

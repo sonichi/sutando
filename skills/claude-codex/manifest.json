@@ -1,0 +1,11 @@
+{
+  "name": "claude-codex",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "stable",
+  "description": "Bash wrapper around the local Codex CLI for non-interactive runs from inside Sutando (bridges, cron, scripts). For interactive code review or task hand-off from this Claude Code session, prefer the official /codex:* plugin commands; this skill is the file-bridge-compatible path that\u2026",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}

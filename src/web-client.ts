@@ -9,6 +9,7 @@
  */
 
 import { createServer, request as httpRequest } from 'node:http';
+import { connect as netConnect } from 'node:net';
 import { writeFileSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,6 +22,13 @@ const HTTP_PORT = Number(process.env.CLIENT_PORT) || 8080;
 const HTTP_HOST = process.env.CLIENT_HOST || '0.0.0.0'; // '0.0.0.0' binds to all interfaces for EC2
 const WS_PORT = Number(process.env.PORT) || 9900;
 const DEFAULT_WS_URL = `ws://localhost:${WS_PORT}`;
+// Opt-in LAN sharing. The voice WS (WS_PORT) binds loopback only, so a browser
+// on another device on the same network can't reach it. When enabled, this
+// server proxies WS_PORT through its own LAN-reachable HTTP port at /ws — so a
+// LAN peer reaches the voice agent without WS_PORT itself being exposed. OFF by
+// default: enabling it lets any device on the network use this core's agent
+// (the voice WS has no auth), so it's an explicit choice per network.
+const LAN_SHARE = /^(1|true|yes|on)$/i.test(process.env.SUTANDO_LAN_SHARE || '');
 
 // Workspace-relative paths use resolveWorkspace() (closes #763). Skills paths
 // (non-runtime, code-adjacent) remain anchored to the repo root.
@@ -658,7 +666,7 @@ const HTML = /* html */ `<!DOCTYPE html>
   </div>
   <video id="vision-preview" autoplay muted playsinline style="display:block; width: 100%; max-height: 180px; background:#000; border-radius:6px;"></video>
 </div>
-<input type="text" id="wsUrl" value="${DEFAULT_WS_URL}" />
+<input type="text" id="wsUrl" value="" placeholder="${DEFAULT_WS_URL}" />
 <script>
 fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
   if(s.name){
@@ -742,14 +750,9 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
 </div>
 
 <div id="status-bar" style="text-align:center;font-size:16px;color:#888;letter-spacing:0.3px;padding:12px 16px">
-  <kbd style="background:#1a1a2e;padding:3px 8px;border-radius:4px;border:1px solid #333;font-family:monospace;color:#8af;font-size:14px">⌃C</kbd> drop context
-  <span style="margin:0 8px;color:#444">|</span>
-  <kbd style="background:#1a1a2e;padding:3px 8px;border-radius:4px;border:1px solid #333;font-family:monospace;color:#8af;font-size:14px">⌃S</kbd> drop screenshot
-  <span style="margin:0 8px;color:#444">|</span>
-  <kbd style="background:#1a1a2e;padding:3px 8px;border-radius:4px;border:1px solid #333;font-family:monospace;color:#8af;font-size:14px">⌃V</kbd> voice
-  <span style="margin:0 8px;color:#444">|</span>
-  <kbd style="background:#1a1a2e;padding:3px 8px;border-radius:4px;border:1px solid #333;font-family:monospace;color:#8af;font-size:14px">⌃M</kbd> mute
-  <span style="margin:0 8px;color:#444">|</span>
+  <!-- Hotkey hints render from /hotkeys (published by the Sutando app from its
+       resolved config — single source of truth, no hardcoded keys here). -->
+  <span id="hotkey-hints"></span>
   <span id="core-status-bar" style="display:inline"></span>
   <span id="presenter-badge">🎤 PRESENTER MODE</span>
   <span id="mode-badge"></span>
@@ -794,6 +797,7 @@ let INPUT_RATE  = 16000;
 let OUTPUT_RATE = 24000;
 const CAPTURE_BUF = 2048;
 const WS_PORT = ${WS_PORT};
+const LAN_SHARE = ${LAN_SHARE ? 'true' : 'false'};
 
 // Auto-detect WebSocket URL from current hostname
 function getDefaultWsUrl() {
@@ -803,15 +807,41 @@ function getDefaultWsUrl() {
   if (window.location.protocol === 'https:') {
     return protocol + '//' + hostname + '/ws';
   }
+  const isLoopback = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]';
+  if (!isLoopback && LAN_SHARE) {
+    // Served to a LAN peer AND LAN sharing is on: the voice WS port is
+    // loopback-only, so route through the /ws proxy on this LAN-reachable HTTP
+    // port. (Only when the proxy actually exists — otherwise fall through to the
+    // direct port so trusted remote deployments with a reachable WS port work.)
+    return protocol + '//' + window.location.host + '/ws';
+  }
   return protocol + '//' + hostname + ':' + WS_PORT;
 }
 
 // Set default WebSocket URL on page load + init Chrome STT
+// Descriptions are local UI copy keyed by the stable action name; the KEY
+// bindings come from /hotkeys (the app's published config) so they never drift.
+function renderHotkeyHints() {
+  var desc = { drop_context: 'drop context', drop_screenshot: 'drop screenshot',
+    drop_video_clip: 'drop video', toggle_voice: 'voice', toggle_mute: 'mute' };
+  var el = document.getElementById('hotkey-hints');
+  if (!el) return;
+  fetch('/hotkeys').then(function (r) { return r.json(); }).then(function (list) {
+    if (!Array.isArray(list) || !list.length) return;
+    var kbd = 'background:#1a1a2e;padding:3px 8px;border-radius:4px;border:1px solid #333;font-family:monospace;color:#8af;font-size:14px';
+    var sep = '<span style="margin:0 8px;color:#444">|</span>';
+    el.innerHTML = list.map(function (e) {
+      return '<kbd style="' + kbd + '">' + esc(e.label || '') + '</kbd> ' + (desc[e.action] || esc(e.action || ''));
+    }).join(sep) + sep;
+  }).catch(function () {});
+}
+
 window.addEventListener('DOMContentLoaded', () => {
   const wsUrlInput = $('wsUrl');
   if (wsUrlInput && !wsUrlInput.value) {
     wsUrlInput.value = getDefaultWsUrl();
   }
+  renderHotkeyHints();
   initChromeStt();
   // Auto-reconnect voice if it was connected before refresh
   try { if (sessionStorage.getItem('sutando-voice')) { setTimeout(() => toggle(), 500); } } catch {}
@@ -856,6 +886,12 @@ function initRemoteToggle() {
       });
     } catch {}
   });
+  // Short audible cue when the agent invokes a tool/core (owner ask
+  // 2026-07-09) — a subtle "the answer is grounded" signal. Distinct pitch
+  // per kind: research (cloud lookup) / work (local core) / tool (inline).
+  _sseSource.addEventListener('tool-cue', function(e) {
+    try { playToolCue(String(e.data || '').trim()); } catch {}
+  });
   _sseSource.onerror = () => setTimeout(() => initRemoteToggle(), 5000);
 }
 initRemoteToggle();
@@ -866,6 +902,41 @@ document.addEventListener('visibilitychange', () => {
 // ─── State ────────────────────────────────────────────────
 let ws = null;
 let audioCtx = null;
+// Play a short, low-volume Web Audio blip to signal a tool/core invocation
+// (owner ask 2026-07-09). Reuses the AudioContext created on the call's user
+// gesture, so it's already running during a voice session. Pitch/shape differ
+// by kind so the user can tell a cloud research lookup from a local-core
+// handoff by ear alone. Fire-and-forget: never blocks or gates the tool call.
+function playToolCue(kind) {
+  try {
+    if (!audioCtx) { try { audioCtx = new AudioContext(); } catch (e) { return; } }
+    if (audioCtx.state === 'suspended') { try { audioCtx.resume(); } catch (e) {} }
+    // [freq Hz, startOffset s, duration s] steps. Kept <120ms total, gain low
+    // so the blip sits under speech without masking it. Retune here freely.
+    var seqs = {
+      research: [[720, 0.0, 0.05], [1080, 0.06, 0.06]], // two rising notes — reaching out to the cloud
+      work:     [[500, 0.0, 0.11]],                     // one low note — handing off to local core
+      tool:     [[820, 0.0, 0.045]]                     // short mid tick — inline tool
+    };
+    var seq = seqs[kind] || seqs.tool;
+    var vol = 0.05; // "not too loud" (owner)
+    var now = audioCtx.currentTime;
+    seq.forEach(function(step) {
+      var freq = step[0], t0 = now + step[1], dur = step[2];
+      var osc = audioCtx.createOscillator();
+      var g = audioCtx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      // Fast attack, exponential decay — avoids the click of a hard on/off edge.
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.linearRampToValueAtTime(vol, t0 + 0.008);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      osc.connect(g); g.connect(audioCtx.destination);
+      osc.start(t0);
+      osc.stop(t0 + dur + 0.02);
+    });
+  } catch (e) {}
+}
 let micStream = null;
 let processor = null;
 let connected = false;
@@ -928,7 +999,7 @@ function showChromeSttInterim(text) {
     $('transcript').appendChild(currentUserEl);
   }
   currentUserEl.textContent = text;
-  $('transcript').scrollTop = $('transcript').scrollHeight;
+  scrollTranscript();
 }
 
 function startChromeStt() {
@@ -944,6 +1015,22 @@ function stopChromeStt() {
 let currentUserEl = null;
 let currentAssistantEl = null;
 let serverUserTextReceived = false;  // blocks Chrome STT overwrites after server sends
+
+// Stick-to-bottom autoscroll: follow new content only while the user is at the
+// bottom. A manual scroll-up to read history must not be yanked back down by
+// streaming updates. force=true (the user's own typed message) always jumps.
+let transcriptPinned = true;
+let transcriptScrollHooked = false;
+function scrollTranscript(force) {
+  const t = $('transcript');
+  if (!transcriptScrollHooked) {
+    transcriptScrollHooked = true;
+    t.addEventListener('scroll', () => {
+      transcriptPinned = t.scrollHeight - t.scrollTop - t.clientHeight < 40;
+    });
+  }
+  if (force || transcriptPinned) t.scrollTop = t.scrollHeight;
+}
 
 function addCopyBtn(el) {
   const btn = document.createElement('span');
@@ -989,7 +1076,7 @@ function handleTranscript(role, text, partial) {
     currentAssistantEl.textContent = text;
     if (!partial) { addCopyBtn(currentAssistantEl); currentAssistantEl = null; }
   }
-  $('transcript').scrollTop = $('transcript').scrollHeight;
+  scrollTranscript();
 }
 
 function addSystem(text, isHtml) {
@@ -998,7 +1085,7 @@ function addSystem(text, isHtml) {
   if (isHtml) { el.innerHTML = text; } else { el.textContent = text; }
   addCopyBtn(el);
   $('transcript').appendChild(el);
-  $('transcript').scrollTop = $('transcript').scrollHeight;
+  scrollTranscript();
 }
 
 // ─── Debug log ────────────────────────────────────────────
@@ -1276,9 +1363,11 @@ function renderTasks() {
       actionsHtml = '<div class="task-actions" data-replyfor="' + id + '">' + inner + '</div>';
     }
     const rawText = t.text || id;
-    // Default-tag bare tasks (no [Channel] prefix) as [Voice] — the
-    // overwhelming majority of un-prefixed tasks come from the voice agent.
-    const taggedRaw = /^\\[/.test(rawText) ? rawText : '[Voice] ' + rawText;
+    // Tag un-prefixed tasks by their source field: voice -> [Voice],
+    // anything else (cron/system reminders, etc.) -> [System]. Replaces the
+    // old "every bare task is [Voice]" default that mislabeled non-voice
+    // items (#bugs 2026-06-25).
+    const taggedRaw = /^\\[/.test(rawText) ? rawText : ((t.source === 'voice' ? '[Voice] ' : '[System] ') + rawText);
     // Prepend the 1-based index INTO the display text so it always renders
     // — earlier attempt with a separate <span class="task-num"> got
     // zero-width even with min-width set (flex layout/min-content issue).
@@ -1345,7 +1434,7 @@ function startTaskPolling() {
         if (t.status === 'done' && existing.status !== 'done' && !expandedTasks.has(t.id) && !userCollapsed) {
           expandedTasks.add(t.id);
         }
-        taskMap[t.id] = { status: t.status, text: t.text, time: new Date(t.time * 1000), result: t.result || existing.result || '' };
+        taskMap[t.id] = { status: t.status, text: t.text, time: new Date(t.time * 1000), result: t.result || existing.result || '', source: t.source || existing.source || '' };
       }
       // Remove tasks no longer in API (stale)
       for (const id of Object.keys(taskMap)) {
@@ -1701,9 +1790,28 @@ function connectWs() {
       setStatus('Live — speak now', 'live');
       statsTimer = setInterval(updateStats, 500);
     } catch (err) {
-      dbg('Mic error: ' + err.message, 'err');
+      dbg('Mic error: ' + (err && err.name ? err.name + ': ' : '') + err.message, 'err');
       setStatus('Mic error', 'error');
-      addSystem('Microphone access denied. Please allow mic in browser settings and retry.');
+      // Not every failure is a permission denial — name the real cause so the user
+      // isn't sent to "browser settings" when the mic is merely busy or absent.
+      let micMsg;
+      switch (err && err.name) {
+        case 'NotAllowedError':
+        case 'SecurityError':
+          micMsg = 'Microphone access denied. Allow mic for this site in browser settings, then click Connect again.';
+          break;
+        case 'NotReadableError':
+        case 'AbortError':
+          micMsg = 'Microphone is in use by another app or tab (Zoom, Photo Booth, another tab, or a prior session). Close it, then click Connect again.';
+          break;
+        case 'NotFoundError':
+        case 'OverconstrainedError':
+          micMsg = 'No microphone found. Connect an input device and select it as the default in your OS sound settings, then Connect.';
+          break;
+        default:
+          micMsg = 'Microphone error (' + (err && err.name ? err.name : 'unknown') + '): ' + (err && err.message ? err.message : 'could not start capture') + '. Click Connect to retry.';
+      }
+      addSystem(micMsg);
       connected = false;  // prevent auto-reconnect loop
       ws.close();
     }
@@ -1772,7 +1880,7 @@ function connectWs() {
             dlLink.textContent = 'Download image';
             imgEl.appendChild(dlLink);
             $('transcript').appendChild(imgEl);
-            $('transcript').scrollTop = $('transcript').scrollHeight;
+            scrollTranscript();
             dbg('Image received via gui.update: ' + (guiData.description || '').slice(0, 50), 'event');
           } else if (guiData?.type === 'video' && guiData.base64) {
             const vidEl = document.createElement('div');
@@ -1803,7 +1911,7 @@ function connectWs() {
             dlLink.textContent = 'Download video';
             vidEl.appendChild(dlLink);
             $('transcript').appendChild(vidEl);
-            $('transcript').scrollTop = $('transcript').scrollHeight;
+            scrollTranscript();
             dbg('Video received via gui.update: ' + (guiData.description || '').slice(0, 50), 'event');
           } else {
             addSystem('[gui] ' + JSON.stringify(guiData));
@@ -1832,7 +1940,7 @@ function connectWs() {
           dlLink2.textContent = 'Download image';
           imgEl.appendChild(dlLink2);
           $('transcript').appendChild(imgEl);
-          $('transcript').scrollTop = $('transcript').scrollHeight;
+          scrollTranscript();
           dbg('Image received: ' + (msg.data.description || '').slice(0, 50), 'event');
         } else if (msg.type === 'speech_speed') {
           const speeds = { slow: 0.85, normal: 1.0, fast: 1.2 };
@@ -2484,7 +2592,7 @@ function sendText() {
   el.className = 't-entry t-user';
   el.textContent = text;
   $('transcript').appendChild(el);
-  $('transcript').scrollTop = $('transcript').scrollHeight;
+  scrollTranscript(true);
   input.value = '';
 
   if (ws && ws.readyState === WebSocket.OPEN) {
@@ -2525,7 +2633,7 @@ function sendText() {
                 }
                 addCopyBtn(re);
                 $('transcript').appendChild(re);
-                $('transcript').scrollTop = $('transcript').scrollHeight;
+                scrollTranscript();
               }
             }).catch(() => {});
           }, 2000);
@@ -2728,10 +2836,11 @@ function renderTabContent() {
         var resultDisplay = isExpanded ? 'block' : 'none';
         var resultHtml = hasResult ? '<div id="result-' + id + '" style="display:' + resultDisplay + ';padding:8px 12px;color:#b8c8d8;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;background:#0d1520;border-radius:8px;margin:4px 0 6px 30px">' + esc(t.result) + '</div>' : '';
         var rawText = t.text || id;
-        // Default-tag bare tasks (no [Channel] prefix) as [Voice] — the
-        // overwhelming majority of un-prefixed tasks come from the voice agent.
-        // (Was [Sutando-core]; renamed 2026-05-03 per Chi's "rename to Voice".)
-        var taggedRaw = /^\\[/.test(rawText) ? rawText : '[Voice] ' + rawText;
+        // Tag un-prefixed tasks by their source field: voice -> [Voice],
+        // anything else (cron/system reminders, etc.) -> [System]. Replaces
+        // the old "every bare task is [Voice]" default that mislabeled
+        // non-voice items (#bugs 2026-06-25).
+        var taggedRaw = /^\\[/.test(rawText) ? rawText : ((t.source === 'voice' ? '[Voice] ' : '[System] ') + rawText);
         // Prepend 1-based index — same as the primary renderTasks path,
         // so voice can target tasks by number on this dynamic-region list too.
         var numPrefix = (i + 1) + '. ';
@@ -3576,6 +3685,16 @@ const server = createServer((req, res) => {
 		return;
 	}
 
+	// Hotkeys published by the Sutando app (state/hotkeys.json) — the single
+	// source the status-bar hints render from. Empty array if not yet written.
+	if (url.pathname === '/hotkeys') {
+		let hotkeys: unknown = [];
+		try { hotkeys = JSON.parse(readFileSync(join(STATE_DIR, 'hotkeys.json'), 'utf-8')); } catch {}
+		res.writeHead(200, { 'Content-Type': 'application/json' });
+		res.end(JSON.stringify(hotkeys));
+		return;
+	}
+
 	// Presenter-mode sentinel (state/presenter-mode.sentinel written by
 	// scripts/presenter-mode.sh). Replaces the old localhost:7877 poll that
 	// required the iclr-highlight skill server. Uses the same malformed-
@@ -3651,6 +3770,23 @@ const server = createServer((req, res) => {
 					_preSeeingToolState = 'idle';
 					if (aState === 'working' && labelParam) _toolLabel = labelParam;
 					else if (aState !== 'working') _toolLabel = '';
+					// Sound cue (owner ask 2026-07-09): emit a short audible blip per
+					// tool/core invocation so the user hears the answer is grounded.
+					// Distinct pitch for cloud research vs local core (work) vs inline
+					// tool. Fires on the leading edge — this branch = one onToolCall's
+					// working post → one cue. A SEPARATE SSE event from agent-state so it
+					// still fires when effectiveAgentState() is unchanged (back-to-back
+					// tool calls stay 'working', which suppresses the agent-state
+					// broadcast at the prevEffective===nextEffective guard below).
+					if (aState === 'working' && labelParam) {
+						const l = labelParam.toLowerCase();
+						const cueKind = (l === 'work' || l === 'ask_sutando' || l === 'ask_core')
+							? 'work'
+							: (/search|research|ground|google/.test(l) ? 'research' : 'tool');
+						for (const client of sseClients) {
+							try { client.write(`event: tool-cue\ndata: ${cueKind}\n\n`); } catch {}
+						}
+					}
 				}
 			} else {
 				// Browser can't legitimately know working/seeing — those
@@ -3890,8 +4026,61 @@ const server = createServer((req, res) => {
 	res.end(HTML);
 });
 
+// LAN-share WS proxy: forward an upgrade on /ws to the loopback voice WS. Only
+// active when SUTANDO_LAN_SHARE is enabled; otherwise the upgrade is refused
+// (loopback clients connect to WS_PORT directly and never hit this path). The
+// handshake bytes (incl. Sec-WebSocket-Key) are replayed verbatim to WS_PORT
+// with the path rewritten to '/', then the two sockets are piped together.
+server.on('upgrade', (req, socket, head) => {
+	const path = (req.url || '').split('?')[0];
+	// Allow the /ws proxy when the upgrade arrives over LOOPBACK — i.e. from a
+	// same-host TLS-terminating reverse proxy (nginx/caddy) forwarding the
+	// pre-existing HTTPS `wss://<host>/ws` path — OR when LAN sharing is
+	// explicitly enabled. A direct remote/LAN client (non-loopback source) still
+	// needs SUTANDO_LAN_SHARE, so LAN_SHARE only gates the NEW LAN exposure and
+	// not the HTTPS reverse-proxy path. socket.remoteAddress is the real TCP
+	// source and can't be spoofed by a request header.
+	const remote = (socket as import('node:net').Socket).remoteAddress || '';
+	const fromLoopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
+	if (path !== '/ws' || !(LAN_SHARE || fromLoopback)) {
+		socket.destroy();
+		return;
+	}
+	// Same-origin guard — applied only to DIRECT (non-loopback) clients, i.e. the
+	// LAN-share path. Browser WebSockets aren't CORS-protected, so a page on any
+	// site a LAN device visits could target ws://<core>:8080/ws; require the
+	// Origin to match the request Host so only the Sutando UI served from this
+	// host can open it. Loopback sources (a same-host reverse proxy) are trusted
+	// and skip this — Host/Origin can legitimately differ across proxying.
+	const origin = req.headers.origin;
+	if (!fromLoopback && origin) {
+		let originHost: string;
+		try {
+			originHost = new URL(origin).host;
+		} catch {
+			originHost = '\0'; // unparseable Origin → never matches
+		}
+		if (originHost !== req.headers.host) {
+			socket.destroy();
+			return;
+		}
+	}
+	const upstream = netConnect(WS_PORT, '127.0.0.1', () => {
+		const lines = [`${req.method} / HTTP/1.1`];
+		for (let i = 0; i < req.rawHeaders.length; i += 2) {
+			lines.push(`${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}`);
+		}
+		upstream.write(lines.join('\r\n') + '\r\n\r\n');
+		if (head && head.length) upstream.write(head);
+		socket.pipe(upstream);
+		upstream.pipe(socket);
+	});
+	upstream.on('error', () => socket.destroy());
+	socket.on('error', () => upstream.destroy());
+});
+
 server.listen(HTTP_PORT, HTTP_HOST, () => {
-	const serverUrl = HTTP_HOST === '0.0.0.0' 
+	const serverUrl = HTTP_HOST === '0.0.0.0'
 		? `http://localhost:${HTTP_PORT} (or use your server's IP/DNS)`
 		: `http://${HTTP_HOST}:${HTTP_PORT}`;
 	console.log(`\n  Sutando — Web Client`);

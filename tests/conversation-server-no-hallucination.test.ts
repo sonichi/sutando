@@ -14,8 +14,14 @@ import { join } from 'node:path';
 //   (1) RESULT_EMPTY sentinel on truly-empty results
 //   (2) "only items present verbatim" guardrail on every result
 
+// Step 5b-1 moved the tuned per-call instruction assembly into
+// phone-agent-config.ts; the invariants below span both files, so SRC is
+// their concatenation (server wiring + config prompts).
 const SRC = readFileSync(
 	join(import.meta.dirname ?? '.', '..', 'skills/phone-conversation/scripts/conversation-server.ts'),
+	'utf-8',
+) + readFileSync(
+	join(import.meta.dirname ?? '.', '..', 'skills/phone-conversation/scripts/phone-agent-config.ts'),
 	'utf-8',
 );
 

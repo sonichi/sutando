@@ -38,11 +38,57 @@ import json
 import os
 import re
 import subprocess
+import sys
 from datetime import datetime, timezone
 from typing import NamedTuple
 
 _ACCOUNT = "sutando"
-_MANIFEST_PATH = os.path.expanduser("~/.sutando-secret-vault/keys.json")
+
+# The manifest is the NON-SECRET index of key NAMES (values live in macOS
+# Keychain, per-host, never synced). Canonical location is
+# `<workspace>/state/secret-vault/keys.json` — under the workspace contract
+# rather than a home dotdir. It indexes the per-host Keychain, so it stays
+# PER-HOST and must NOT sync: `state/` is outside the sync carrier set
+# (whitelist mode un-ignores only notes/ + hosts/<host>/ + memory/), so this
+# path is non-synced by construction. Were it synced, every node would inherit
+# key names its local Keychain can't resolve — a lying index.
+_LEGACY_MANIFEST_PATH = os.path.expanduser("~/.sutando-secret-vault/keys.json")
+
+
+def _manifest_path() -> str:
+    """Canonical manifest path under the resolved workspace. Falls back to the
+    legacy home-dir path if the workspace can't be resolved (preserves behavior
+    in import contexts where workspace_default isn't importable)."""
+    try:
+        from workspace_default import resolve_workspace
+        return os.path.join(str(resolve_workspace()), "state", "secret-vault", "keys.json")
+    except Exception:
+        return _LEGACY_MANIFEST_PATH
+
+
+def _read_manifest() -> dict:
+    """Load the manifest, preferring the canonical path and falling back to the
+    legacy home-dir path for existing installs. The fallback makes the first
+    write self-migrate: `_register_key` reads via this helper (inheriting any
+    legacy keys), then writes the merged set to the canonical path."""
+    canonical = _manifest_path()
+    candidates = [canonical]
+    if _LEGACY_MANIFEST_PATH != canonical:
+        candidates.append(_LEGACY_MANIFEST_PATH)
+    for path in candidates:
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            if path == _LEGACY_MANIFEST_PATH and path != canonical:
+                print(
+                    "vault: read legacy manifest (~/.sutando-secret-vault/keys.json); "
+                    "migrating to <workspace>/state/secret-vault/ on next write.",
+                    file=sys.stderr, flush=True,
+                )
+            return data
+        except (FileNotFoundError, json.JSONDecodeError):
+            continue
+    return {}
 
 # Matches: vault set KEY <value>  where value is:
 #   - double-quoted string   "foo bar"
@@ -53,9 +99,11 @@ _MANIFEST_PATH = os.path.expanduser("~/.sutando-secret-vault/keys.json")
 # Loose regex — finds candidate `vault set KEY VALUE` matches anywhere in
 # the text (including mid-prose). FP prevention is delegated to detect-secrets
 # (see _replacer): a candidate is only acted on if the VALUE is recognized as
-# a known secret pattern. This trades the regex line-anchor approach for
-# pattern-based validation, eliminating both:
-#   - FP: "the vault set command works fine" → "works" is not a secret → skip
+# a known secret pattern, OR the KEY isn't a single plain lowercase word
+# (see _LOOKS_LIKE_PLAIN_LOWERCASE_WORD below — added for #2074). This trades the regex
+# line-anchor approach for pattern-based validation, eliminating both:
+#   - FP: "the vault set command works fine" → key="command" (not env-shaped),
+#     value="works" (not a secret) → skip, left as prose
 #   - FN: "hey vault set APOLLO_KEY sk-..." mid-prose → "sk-..." is OpenAI → store
 # Key/value separator is whitespace OR `=` (with optional surrounding spaces),
 # so `vault set KEY VALUE`, `vault set KEY=VALUE`, and `vault set KEY = VALUE`
@@ -68,6 +116,39 @@ _VAULT_SET_RE = re.compile(
     r'\bvault\s+set\s+([^\s=]+)(?:\s*=\s*|\s+)(?:"([^"]*)"|\'([^\']*)\'|`([^`]*)`|(\S+))(?=\s|$|[.,!?;])',
     re.IGNORECASE,
 )
+
+# #2074: an unquoted value the FP guard doesn't recognize isn't proof of
+# prose — it can be a real secret the classifier missed (a 32-char Discord
+# client secret, a pa-/al-prefixed API key, ...). Used as a second signal
+# alongside scan_secrets(): only treat the match as prose (leave it alone)
+# when the key is a single plain lowercase-ASCII word; fail closed (redact +
+# report failed) for every other key shape, so ordinary sentences that
+# happen to match the loose regex still pass through untouched while any
+# deliberately-named key gets the fail-closed treatment.
+#
+# This is an EXCLUSION test, not an inclusion list: "prose" = the key
+# fullmatches `[a-z]+` and nothing else. Anything that isn't a single plain
+# lowercase word — digits, underscores, dashes, uppercase letters, or ANY
+# other punctuation (periods, slashes, colons, plus signs, @-signs, ...) —
+# counts as a deliberate key. Enumerating "deliberate" characters instead
+# (as the first version of this fix did) is an allowlist that will always
+# miss some real-world key shape; enumerating "prose" is a much smaller,
+# closed set (english words are just letters) so the exclusion is exhaustive
+# by construction.
+#
+# PR #2052 review history:
+# - qingyun-wu (2026-07-12, round 1): the original version only matched
+#   SCREAMING_SNAKE_CASE (`^[A-Z][A-Z0-9_]{1,}$`), so `pr_triage_activity_secret`,
+#   `PrTriageActivitySecret`, and `SOME-KEY` all still leaked.
+# - qingyun-wu (2026-07-12, round 2): the round-1 fix's own docstring said
+#   "deliberate = anything that isn't a single all-lowercase word," but the
+#   regex (`[A-Z0-9_-]`, an inclusion list) didn't actually implement that —
+#   lowercase keys with OTHER punctuation (`apikey.vault`, `apikey/vault`,
+#   `user:id`, `token+name`, `@token`) still slipped through as "prose" and
+#   leaked. This version finally matches the documented rule exactly: prose
+#   is defined as the narrow case (plain lowercase word), everything else
+#   fails closed.
+_LOOKS_LIKE_PLAIN_LOWERCASE_WORD = re.compile(r"[a-z]+")
 
 
 class InterceptResult(NamedTuple):
@@ -98,27 +179,22 @@ def _store_in_keychain(key: str, value: str) -> None:
 
 
 def _register_key(key: str) -> None:
-    os.makedirs(os.path.dirname(_MANIFEST_PATH), exist_ok=True)
-    try:
-        with open(_MANIFEST_PATH) as f:
-            manifest = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        manifest = {}
+    path = _manifest_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Read via _read_manifest so the first write after the move inherits any
+    # legacy keys (self-migration) rather than starting an empty index.
+    manifest = _read_manifest()
     manifest[key] = {"stored_at": datetime.now(timezone.utc).isoformat()}
     # Atomic write — concurrent bridge processes won't corrupt keys.json.
-    tmp = _MANIFEST_PATH + ".tmp"
+    tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(manifest, f, indent=2)
-    os.replace(tmp, _MANIFEST_PATH)
+    os.replace(tmp, path)
 
 
 def list_vault_keys() -> list[str]:
     """Return all key names stored in the vault manifest (no values)."""
-    try:
-        with open(_MANIFEST_PATH) as f:
-            return sorted(json.load(f).keys())
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
+    return sorted(_read_manifest().keys())
 
 
 def get_vault_key(key: str) -> str:
@@ -157,16 +233,75 @@ def intercept_vault_commands(text: str) -> InterceptResult:
             failed.append(key)
             return f"vault set {key} [VAULT-EMPTY-VALUE]"
         # FP guard: validate the VALUE field is actually a known secret pattern
-        # via detect-secrets. This filters out prose matches like
-        # "the vault set command works fine" where regex would otherwise capture
-        # key="command", value="works" — "works" is not a known secret → skip.
-        # Quoted values bypass the guard (user explicitly delimited the value).
+        # via detect-secrets. Genuine prose matches like "the vault set command
+        # works fine" (key="command", value="works") are left alone — see the
+        # _LOOKS_LIKE_PLAIN_LOWERCASE_WORD check below for why "not a known
+        # secret" alone no longer means "assume prose" (#2074). Quoted values bypass the guard
+        # entirely (user explicitly delimited the value).
         is_quoted = m.group(2) is not None or m.group(3) is not None or m.group(4) is not None
         if not is_quoted:
-            from secret_scanner import scan_secrets
+            try:
+                from secret_scanner import scan_secrets
+            except ImportError:
+                # detect-secrets (the FP backstop) isn't installed. The vault-set
+                # regex is DELIBERATELY loose — it matches `vault set K V` anywhere,
+                # including mid-prose — and delegates false-positive rejection to
+                # detect-secrets. Without it we can't tell a real secret from prose,
+                # so storing unconditionally would store every "vault set X Y" mention
+                # as junk AND redact legitimate text. Fail safe: refuse to store and
+                # leave a SELF-DOCUMENTING placeholder in the task. The instruction
+                # lives in the placeholder itself (co-located with the event) rather
+                # than in always-loaded CLAUDE.md — zero permanent context cost, and
+                # the agent reading the task sees exactly what to do. Quoted values
+                # never reach here (is_quoted branch stores directly). No bridge-side
+                # pip-install (env mutation in a message handler) and no separate task:
+                # the refusal rides the normal task to core, channel context intact.
+                print(
+                    f"vault: detect-secrets not installed — refused unquoted "
+                    f"`vault set {key}` (can't validate). Core will install the dep; "
+                    f"quote the value to store immediately.",
+                    flush=True,
+                )
+                failed.append(key)
+                return (
+                    f"vault set {key} [vault: REFUSED — detect-secrets not installed, "
+                    f"can't validate an unquoted value. AGENT: run "
+                    f"'python3 -m pip install detect-secrets', then tell the owner to "
+                    f"re-send this vault set (or quote the value next time). Never echo "
+                    f"or ask for the value.]"
+                )
             if not scan_secrets(value):
-                # Not a known secret pattern — assume this is prose, leave it alone.
-                return m.group(0)
+                if _LOOKS_LIKE_PLAIN_LOWERCASE_WORD.fullmatch(key):
+                    # Key is nothing but a plain lowercase word (no digits,
+                    # underscores, dashes, uppercase, or other punctuation) —
+                    # this is almost certainly prose ("the vault set command
+                    # works fine" → key="command"), not a real command. Leave
+                    # it alone; redacting it would mangle ordinary sentences.
+                    # NOTE: this is a .fullmatch() exclusion test ("is the
+                    # WHOLE key just a lowercase word?"), not a .search() for
+                    # qualifying characters — the earlier version enumerated
+                    # "deliberate" characters (digit/underscore/dash/upper)
+                    # and missed lowercase-with-other-punctuation keys like
+                    # "apikey.vault" or "user:id", which still leaked.
+                    return m.group(0)
+                # Key is NOT a plain lowercase word (SCREAMING_SNAKE_CASE,
+                # lowercase snake_case, camelCase, PascalCase, dash-separated,
+                # or any other punctuation-containing shape) but the value
+                # wasn't recognized as a known secret shape. That's a classifier
+                # miss, not proof of prose — issue #2074: a real Discord
+                # client secret and pa-/al-prefixed API keys both slipped
+                # through here as unrecognized-therefore-untouched, leaking
+                # plaintext to disk (same root cause #2052 hit for bare
+                # UUIDs, fixed by widening recognition — but recognition can
+                # never be exhaustive, so THIS branch must fail closed too).
+                # Never store an unvalidated value; redact and surface it so
+                # the owner can resend quoted (which bypasses the guard
+                # entirely) to store it for real.
+                failed.append(key)
+                return (
+                    f"vault set {key} [vault: unrecognized value — NOT stored. "
+                    f"Resend quoted (e.g. vault set {key} \"value\") to store it.]"
+                )
         try:
             _store_in_keychain(key, value)
             stored.append(key)

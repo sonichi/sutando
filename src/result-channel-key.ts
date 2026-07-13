@@ -22,7 +22,11 @@
 
 // Filename-safe alphabet. Any char outside it is collapsed to `-` so a
 // stray channel id can never inject a path separator or a regex special.
-const KEY_SAFE_RE = /[^A-Za-z0-9_-]/g;
+// The `u` flag makes the class match by code point, not UTF-16 code unit —
+// so an astral char (e.g. an emoji, a surrogate pair) collapses to a SINGLE
+// `-`, matching the Python twin's code-point `re.sub` (src/result_channel_key.py).
+// Without it, JS matched each surrogate half → two dashes → silent TS/PY drift.
+const KEY_SAFE_RE = /[^A-Za-z0-9_-]/gu;
 
 // Scoped filename shape: `<channel-key>.task-{id}` (with or without .txt).
 // The key must NOT contain `.` (so `task-foo.txt` itself never matches).
