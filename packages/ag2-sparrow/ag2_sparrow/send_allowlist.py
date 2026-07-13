@@ -44,8 +44,7 @@ import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _dirs import result_dir as _result_dir  # noqa: E402
+from ._dirs import result_dir as _result_dir
 
 
 # Transport default: only the RESULT_DIR is sendable (where the agent writes

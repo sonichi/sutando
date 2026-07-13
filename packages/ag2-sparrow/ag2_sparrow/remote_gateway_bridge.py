@@ -56,12 +56,11 @@ from pathlib import Path
 # resolve_workspace lives alongside this file in src/ — put THIS directory on
 # the path (no repo-walking; the old triple-parent form predated the move into
 # src/ and pointed outside the repo).
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _dirs import task_dir as _task_dir, result_dir as _result_dir, state_dir as _state_dir  # noqa: E402
-from task_archive import find_task_file  # noqa: E402
-import local_task_protocol  # noqa: E402
-from result_markers import parse_markers  # noqa: E402
-from send_allowlist import is_path_sendable  # noqa: E402
+from ._dirs import task_dir as _task_dir, result_dir as _result_dir, state_dir as _state_dir
+from .task_archive import find_task_file
+from . import local_task_protocol
+from .result_markers import parse_markers
+from .send_allowlist import is_path_sendable
 
 TASKS_DIR = _task_dir()
 RESULTS_DIR = _result_dir()
