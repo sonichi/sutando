@@ -19,7 +19,10 @@ set -e
 REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
 cd "$REPO"
 
-TMUX_SOCKET="/tmp/sutando-tmux.sock"
+# Honor a caller-provided socket (e.g. a desktop app that runs a user-private tmux
+# runtime under its app-support dir); default to the shared /tmp socket for dev/CLI.
+# Backward-compatible: unset → identical to the previous hardcoded value.
+TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 SESSION="sutando-core"
 
 # Marker identifying THIS process as the long-lived sutando-core session (as
