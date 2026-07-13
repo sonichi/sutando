@@ -95,17 +95,21 @@ def main() -> int:
                 "must route through parse_markers() per #896"
             )
 
-    # 3c. Remote-gateway bridge wires the parser (outbound file-attach change)
-    gb = REPO / "src" / "remote-gateway-bridge.py"
+    # 3c. Remote-gateway bridge wires the parser (outbound file-attach change).
+    # The implementation is canonical in the ag2-sparrow package
+    # (src/remote-gateway-bridge.py is a thin loader shim post-#2082), so the
+    # guard reads the package source; the package imports its bundled copy
+    # relatively ("from .result_markers import ...").
+    gb = REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py"
     gb_src = gb.read_text()
-    if "from result_markers import parse_markers" not in gb_src:
-        return fail("src/remote-gateway-bridge.py must import parse_markers from result_markers")
+    if "from .result_markers import parse_markers" not in gb_src:
+        return fail("ag2_sparrow/remote_gateway_bridge.py must import parse_markers from .result_markers")
     if "parse_markers(" not in gb_src:
-        return fail("src/remote-gateway-bridge.py must call parse_markers(...) somewhere")
+        return fail("ag2_sparrow/remote_gateway_bridge.py must call parse_markers(...) somewhere")
     for hand_rolled in ('startswith("[no-send]")', 'startswith("[deduped:")'):
         if hand_rolled in gb_src:
             return fail(
-                f"src/remote-gateway-bridge.py still has hand-rolled skip check {hand_rolled!r} — "
+                f"ag2_sparrow/remote_gateway_bridge.py still has hand-rolled skip check {hand_rolled!r} — "
                 "must route through parse_markers() per #873"
             )
 

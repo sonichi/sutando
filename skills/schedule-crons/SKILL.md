@@ -53,6 +53,27 @@ Wrap **sub-daily** non-`main-loop` cron `prompt` bodies (e.g. `*/N`, `*/30`, hou
 
 `cron-gate.sh <reason> <command...>` either `exec`s the command (queue empty) or prints `cron-gate: owner tasks queued — deferring <reason>` and exits 0. See `crons.example.json` for canonical wrapped forms.
 
+## Attaching cron output to an AG2 Space room (if connected)
+
+When the agent is connected to AG2 Space, an output-producing cron can post its results into its **own dedicated room** instead of a shared channel — one room per cron, so the owner can monitor each stream separately. This is **opt-in and connectivity-gated**: a cron with no `room` field, or an agent with no gateway token, is unaffected.
+
+**Opt in** by adding `"room": "auto"` to a cron entry in `crons.json`. On `/schedule-crons` activation (after step 3), run the helper once:
+
+```bash
+WS="$(bash scripts/sutando-config.sh workspace)"; H="$(hostname | sed 's/\..*//')"
+python3 skills/schedule-crons/ensure-cron-room.py \
+  --crons-file "$WS/hosts/$H/crons.json" --owner "@<owner>:ag2.space" --repo .
+```
+
+`ensure-cron-room.py` is **idempotent**: for each `"room": "auto"` entry it creates one room (`Sutando · <cron>`), invites the owner, posts a self-identifying first message, and **rewrites `room` to the concrete `!id:ag2.space`**. Entries that already hold a `!id` are skipped — re-running never makes duplicate rooms (the failure mode of ad-hoc creation). If no gateway token resolves, it exits 0 having done nothing. The cron's own prompt then posts output to its `room` id via the gateway op:message path ([[reference_gateway_op_message_room_post]]).
+
+**Which crons opt in:** only *output-producing* crons (pr-shepherd, roadmap-driver, friction-room-sweep, disk-hygiene, ai-frontline-today, morning-briefing). Silent/internal crons (main-loop, sync-memory, briefing-fallback, daily-insight) stay room-less — a room each would be clutter.
+
+**Known gateway constraints (2026-07-11), baked into the helper's design:**
+- **No room-list API** (`GET /v1/rooms` 404; `op:list` unknown) → the `room` id recorded in `crons.json` is the *only* handle on a created room. Never create without writing the id back (the helper writes after each create so a mid-batch hang can't orphan a room).
+- **`op:state` 502s** → a room's display name can't be set or read after creation. Identity rides on the create-time `name` **and** the identifying first message, never a post-hoc state write.
+- **`op:invite` is slow/flaky** — it can take >15s or time out client-side while the invite still lands server-side. So (a) treat invite as best-effort (the helper tolerates a `None` result), and (b) do NOT retry-loop it — repeat calls may queue duplicate invites the owner has to dismiss. These are roadmap track-8 (error-legibility) / broker-reliability items.
+
 **When to gate (decision rule):**
 
 | Cron cadence | Gate? | Why |
