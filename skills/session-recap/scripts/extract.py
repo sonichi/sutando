@@ -124,8 +124,20 @@ def main() -> None:
                 if txt:
                     piece = f"[{ts}] ASSISTANT: {txt}"
                 elif args.filter == "all":
-                    tools = [b.get("name") for b in msg.get("content", [])
-                             if isinstance(b, dict) and b.get("type") == "tool_use"]
+                    tools = []
+                    for b in msg.get("content", []):
+                        if not (isinstance(b, dict) and b.get("type") == "tool_use"):
+                            continue
+                        name = b.get("name", "?")
+                        inp = b.get("input") or {}
+                        # Surface file artifacts so recaps can list what was
+                        # written (owner ask 2026-07-13: notes/files written
+                        # belong in the recap, not just conversation).
+                        target = inp.get("file_path") or inp.get("notebook_path")
+                        if name in ("Write", "Edit", "NotebookEdit") and target:
+                            tools.append(f"{name}({target})")
+                        else:
+                            tools.append(name)
                     if tools:
                         piece = f"[{ts}] TOOLS: {', '.join(tools)}"
             elif t == "system" and args.filter == "all":
