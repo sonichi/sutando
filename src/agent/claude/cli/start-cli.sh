@@ -265,13 +265,13 @@ fi
 # emit-task. Unsafe: a future agent processing a "restart core" task by
 # exec'ing this script from within sutando-core. Per Mini's #608 review.
 if [ "$1" = "--restart" ]; then
-  if pgrep -f "claude.*--name.*$SESSION" > /dev/null 2>&1; then
+  if tmux -S "$TMUX_SOCKET" has-session -t "$SESSION" 2>/dev/null; then
     echo "Killing existing $SESSION session..."
     tmux -S "$TMUX_SOCKET" kill-session -t "$SESSION" 2>/dev/null || true
     # Poll for actual shutdown — robust on slow machines, faster on fast
     # ones (~1s ceiling) than a fixed sleep.
     for _ in 1 2 3 4 5; do
-      pgrep -f "claude.*--name.*$SESSION" > /dev/null 2>&1 || break
+      tmux -S "$TMUX_SOCKET" has-session -t "$SESSION" 2>/dev/null || break
       sleep 0.2
     done
   fi
@@ -304,7 +304,7 @@ apply_tmux_defaults() {
 
 # Already running — attach if interactive, else exit cleanly. This branch
 # also catches the !--restart path so re-running the script is idempotent.
-if pgrep -f "claude.*--name.*$SESSION" > /dev/null 2>&1; then
+if tmux -S "$TMUX_SOCKET" has-session -t "$SESSION" 2>/dev/null; then
   apply_tmux_defaults
   if [ -t 1 ] && command -v tmux > /dev/null 2>&1; then
     echo "Attaching to existing $SESSION (Ctrl-b d to detach)..."
