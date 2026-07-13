@@ -86,12 +86,19 @@ def needs_login(pane_text):
 
 
 def _core_status(workspace):
-    """Read the agent's own status ('running'|'idle') from core-status.json."""
+    """Read the agent's own status ('running'|'idle') from core-status.json.
+
+    This is a shared state file written by other processes, so treat it as
+    untrusted: a missing/corrupt file (OSError/ValueError) OR a valid-but-non-object
+    JSON value (e.g. a stray `[]` — `.get` would AttributeError) degrades to None,
+    never a crash — keeping the script's "unknown, not exception" contract.
+    """
     try:
         with open(os.path.join(workspace, "state", "core-status.json")) as f:
-            return json.load(f).get("status")
+            data = json.load(f)
     except (OSError, ValueError):
         return None
+    return data.get("status") if isinstance(data, dict) else None
 
 
 def _resolve_workspace(repo):

@@ -114,6 +114,16 @@ with open(os.path.join(T, "state", "core-status.json"), "w") as f:
 check("_core_status: reads status from file", rh._core_status(T) == "running")
 check("_core_status: missing file -> None", rh._core_status(tempfile.mkdtemp()) is None)
 
+# core-status.json written by another process could be corrupt OR a valid but
+# non-object JSON value (e.g. a stray '[]'); must degrade to None, not crash.
+for bad in ("[]", '"idle"', "42", "not json {"):
+    Tb = tempfile.mkdtemp()
+    os.makedirs(os.path.join(Tb, "state"))
+    with open(os.path.join(Tb, "state", "core-status.json"), "w") as f:
+        f.write(bad)
+    ok_ = rh._core_status(Tb) is None
+    check("_core_status: non-object/corrupt JSON %r -> None (no crash)" % bad, ok_)
+
 # 6) Exercise the REAL probe implementations in-process (offline path) so the
 #    subprocess-only e2e above doesn't leave _run/_core_running/_gateway_running/
 #    _pane_text/main uncovered. Point at a socket with no session → offline, and
