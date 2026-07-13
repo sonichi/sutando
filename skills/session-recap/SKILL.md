@@ -19,6 +19,17 @@ Notes remain useful as a fast index into a long session — nothing more.
 3. **Summarize with a CHEAP model** (owner requirement — transcripts run to tens of MB; never burn core-model quota on this). Spawn an Agent-tool subagent with `model: haiku`, hand it the dump (or the dump file path if huge — have it Read in slices), and ask for: timeline, tasks processed + outcomes, PRs/commits, decisions, errors + fixes, **artifacts (files/notes/memories written — the dump's `Write(path)`/`Edit(path)` tool lines carry the paths; owner requirement 2026-07-13)**, loose ends. Match the detail level the owner asked for. **Drop routine operational noise** (owner rule 2026-07-13): battery-escalation ladders, idle proactive-loop passes, quota checks, watcher restarts, memory syncs, health-check green runs — none of it belongs in a recap unless it materially changed the session's course (e.g. quota exhaustion forced a pivot, a crash lost work).
 4. **Deliver** to the asking channel. For a verbatim-quote request, skip the subagent entirely — grep the `--filter user` dump and quote directly.
 
+## Required summary structure (owner requirement 2026-07-13)
+
+Any work-summary the recap produces — boot catchup, human brief, or an on-demand "summarize what I did" — MUST cover these sections (scale depth to the request, but never drop a section that applies):
+
+1. **Executive summary** (lead with it): the **main initiative(s)**, the **high-level goal**, and the **important decisions — especially architecture/design decisions** (the *why*, not just the *what*). One-line status at the end.
+2. **Detailed body**: per-item technical detail — PRs with what each did + why + hazards hit, decisions + rationale, errors + their fixes, **artifacts written** (files/notes/memories — from the transcript's `Write`/`Edit` tool lines), loose ends. When the owner asks for "more detail," expand this — specific findings, exact fixes, reproductions, CI/tooling mechanics — not just more headlines.
+3. **Roadmap relationship** (when the work maps to `roadmap/ROADMAP.md`): which track/lane it advances and how (e.g. "closes Track-14 gap (a)"), plus a pointer to the relevant plan doc.
+4. **Recommended next actions**: prioritized, naming the **owner-gated blockers with exact commands** (what unblocks the biggest thing first), then the follow-on work.
+
+Save durable work-summaries under `<workspace>/notes/work-summaries/YYYY-MM-DD.md` (owner-created folder 2026-07-13), one file per summary, each opening with a `*[workflow, summary] — author | window | requested-by*` line.
+
 ## Automatic recap on restart (owner directive 2026-07-13)
 
 **Primary consumer: the next session's agent** (owner 2026-07-13). The boot recap is how the fresh core catches up properly — deeper and less biased than relay notes (which are short, curated, and lost on crash-exits). The human-facing room post is the secondary product.
