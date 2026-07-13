@@ -14,10 +14,21 @@ out="$(bash "$REPO/scripts/sutando-whoami.sh")"
 if WHOAMI_OUT="$out" REPO_EXPECT="$REPO" python3 - <<'PY'
 import json, os
 d = json.loads(os.environ["WHOAMI_OUT"])
-assert set(d) == {"instance_id", "host", "workspace", "repo"}, d.keys()
+assert set(d) == {
+    "instance_id", "host", "agent_id", "workspace", "repo", "config_dir", "runtime"
+}, d.keys()
 assert d["repo"] == os.environ["REPO_EXPECT"], d["repo"]
 assert d["workspace"].startswith("/"), d["workspace"]
 assert d["instance_id"] and d["host"]
+# agent_id / config_dir are optional (null before a device is connected / an
+# unresolvable config), but must be str-or-None when present.
+assert d["agent_id"] is None or isinstance(d["agent_id"], str), d["agent_id"]
+assert d["config_dir"] is None or isinstance(d["config_dir"], str), d["config_dir"]
+# runtime is always an object with the four liveness fields.
+rt = d["runtime"]
+assert set(rt) == {"core_running", "gateway_running", "tmux_socket", "session"}, rt.keys()
+assert isinstance(rt["core_running"], bool) and isinstance(rt["gateway_running"], bool)
+assert rt["tmux_socket"].startswith("/") and rt["session"]
 PY
 then ok "valid JSON with contract fields"; else bad "JSON contract"; fi
 
