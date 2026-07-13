@@ -28,7 +28,7 @@ def _check(label: str, cond: bool, detail: str = "") -> None:
     global _passed, _failed
     if cond:
         _passed += 1
-    else:
+    else:  # pragma: no cover — failure path only runs when a test regresses
         _failed += 1
         print(f"FAIL [{label}]{': ' + detail if detail else ''}", file=sys.stderr)
 
@@ -354,7 +354,7 @@ for _pyf in sorted(
     _rel = str(_pyf.relative_to(REPO))
     try:
         _fc = _pyf.read_text(errors="replace")
-    except OSError:
+    except OSError:  # pragma: no cover — error handler
         continue
     if "__pycache__" in _rel or _TASK_FIELD_PATTERN not in _fc:
         continue
@@ -392,7 +392,7 @@ for _tsf in sorted(
         continue
     try:
         _fc = _tsf.read_text(errors="replace")
-    except OSError:
+    except OSError:  # pragma: no cover — error handler
         continue
     if _TS_TASK_FIELD_PATTERN not in _fc:
         continue

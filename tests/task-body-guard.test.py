@@ -29,7 +29,7 @@ def _check(label: str, condition: bool, detail: str = "") -> None:
     global _passed, _failed
     if condition:
         _passed += 1
-    else:
+    else:  # pragma: no cover — failure path only runs when a test regresses
         _failed += 1
         print(f"FAIL [{label}]{': ' + detail if detail else ''}", file=sys.stderr)
 
