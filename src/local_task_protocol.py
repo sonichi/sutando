@@ -128,22 +128,34 @@ KNOWN_HEADER_KEYS = (
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 
-# Task-id shape: `task-<slug>` where slug is dash-separated [a-z0-9] segments
-# (task-1783..., task-chat-1783..., task-phone-..., task-summary-...,
-# task-gh-..., task-health-...). Mirrors the gateway bridge's `_valid_tid`
-# defense: ids become filenames, so the charset is the path-traversal guard.
+# Canonical live task-id shape: `task-<slug>` where slug is dash-separated
+# [a-z0-9] segments (task-1783..., task-chat-1783..., task-phone-...,
+# task-summary-..., task-gh-..., task-health-...). This stays narrower than
+# the archive lookup gate below: live API/task-result routes still key off
+# the canonical `task-*` namespace even though historic archives contain
+# additional gateway-safe producer ids like `ask-*`.
 TASK_ID_RE = re.compile(r"^task-[A-Za-z0-9][A-Za-z0-9-]{0,120}$")
+ARCHIVE_LOOKUP_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
 def valid_task_id(tid: str) -> bool:
-    """True iff `tid` is a well-formed task id, safe to embed in a filename.
+    """True iff `tid` is a canonical live task id.
 
-    Rejects path separators, dots, whitespace, and empty/oversized ids — the
-    id is used as `tasks/<tid>.txt` and `results/<tid>.txt`, so this is the
-    single traversal gate for readers that accept ids from message content
-    (e.g. `[deduped: <tid>]` holders).
+    Live task/result routes still expect the `task-*` namespace, so this is
+    intentionally stricter than the archive lookup gate.
     """
     return bool(TASK_ID_RE.match(tid or ""))
+
+
+def valid_archive_lookup_id(tid: str) -> bool:
+    """True iff `tid` is safe to look up as an archived filename stem.
+
+    Archive corpora include historic non-`task-*` producer ids (`ask-*`,
+    `sc-ask-*`, `reco-skill-*`). The lookup gate therefore mirrors the
+    gateway bridge's filename-safe charset while still rejecting traversal
+    sentinels and path separators.
+    """
+    return bool(ARCHIVE_LOOKUP_ID_RE.match(tid or "")) and tid not in (".", "..")
 
 
 # ── Header parsing ───────────────────────────────────────────────────────────
@@ -466,7 +478,7 @@ def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:
     the month-partitioned archive — the same candidate set task-bridge's
     `_isVoiceTask` walks. Returns the first existing path or None. Rejects
     malformed ids rather than globbing with them (traversal gate)."""
-    if not valid_task_id(task_id):
+    if not valid_archive_lookup_id(task_id):
         return None
     fname = f"{task_id}.txt"
     candidates = [tasks_dir / fname, tasks_dir / "processed" / fname,
