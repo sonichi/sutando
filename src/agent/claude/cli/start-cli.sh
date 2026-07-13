@@ -319,6 +319,17 @@ if ! command -v tmux > /dev/null 2>&1 && command -v brew > /dev/null 2>&1; then
   brew install tmux 2>&1 | tail -3
 fi
 
+# Stamp the core session start into an append-only per-boot log. One JSONL
+# line per launch; consecutive entries bound each session's lifetime, which
+# is what session-recap tooling needs to pick the right transcript (owner
+# ask 2026-07-13). Best-effort: never block the launch on it.
+if _ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n "$_ws" ]; then
+  mkdir -p "$_ws/state" 2>/dev/null || true
+  printf '{"host":"%s","session_started_at":%s,"iso":"%s","source":"start-cli"}\n' \
+    "$(hostname | sed 's/\..*//')" "$(date +%s)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    >> "$_ws/state/session-starts.log" 2>/dev/null || true
+fi
+
 # Fall back to a bare `exec claude` if tmux is still missing.
 if ! command -v tmux > /dev/null 2>&1; then
   echo "  ⚠ tmux not found — running without tmux wrapper"
