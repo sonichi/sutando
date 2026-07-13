@@ -28,6 +28,10 @@ deliberately added to the allowlist.
 """
 
 import re
+import sys as _sys
+from pathlib import Path as _P
+_sys.path.insert(0, str(_P(__file__).resolve().parent.parent / "src"))
+import local_task_protocol as _ltp
 import sys
 import tempfile
 from pathlib import Path
@@ -60,7 +64,8 @@ def _build_helper_namespace(tmpdir: Path, task_files: dict):
     const_src = _extract(r"DM_FALLBACK_SOURCES = \{[^}]*\}")
     func_src = _extract(r"def _task_source\(task_id: str\):.*?(?=^\n\n|\Z)")
     elig_src = _extract(r"def _dm_fallback_eligible\(task_id: str\).*?(?=^\n\n|\Z)")
-    ns = {"find_task_file": stub_find_task_file, "TASKS_DIR": tmpdir, "Path": Path}
+    ns = {"find_task_file": stub_find_task_file, "TASKS_DIR": tmpdir, "Path": Path,
+          "local_task_protocol": _ltp}
     exec(const_src + "\n\n" + func_src + "\n\n" + elig_src, ns)
     return ns
 
@@ -82,7 +87,8 @@ def _build_helper_namespace_with_archive(tmpdir: Path, active: dict, archived: d
     const_src = _extract(r"DM_FALLBACK_SOURCES = \{[^}]*\}")
     func_src = _extract(r"def _task_source\(task_id: str\):.*?(?=^\n\n|\Z)")
     elig_src = _extract(r"def _dm_fallback_eligible\(task_id: str\).*?(?=^\n\n|\Z)")
-    ns = {"find_task_file": stub_find_task_file, "TASKS_DIR": tmpdir, "Path": Path, "sorted": sorted}
+    ns = {"find_task_file": stub_find_task_file, "TASKS_DIR": tmpdir, "Path": Path, "sorted": sorted,
+          "local_task_protocol": _ltp}
     exec(const_src + "\n\n" + func_src + "\n\n" + elig_src, ns)
     return ns
 

@@ -891,6 +891,8 @@ def check_memory() -> dict:
     name = "memory"
     swap_warn_mb = int(os.environ.get("SUTANDO_MEMORY_SWAP_WARN_MB", "512"))
     swap_fail_mb = int(os.environ.get("SUTANDO_MEMORY_SWAP_FAIL_MB", "2048"))
+    free_fail_pct = int(os.environ.get("SUTANDO_MEMORY_FREE_FAIL_PCT", "15"))
+    free_warn_pct = int(os.environ.get("SUTANDO_MEMORY_FREE_WARN_PCT", "25"))
     import re as _re
 
     try:
@@ -912,11 +914,48 @@ def check_memory() -> dict:
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         pass
 
-    # Swap-in-use is sticky on macOS: pages swapped out during a past pressure
-    # event stay counted until touched again, so high swap with a *normal*
-    # kernel pressure level is residue, not active thrash. Fail only when the
-    # kernel itself signals pressure; swap corroborates, it doesn't convict.
-    if level >= 4 or (level >= 2 and swap_used_mb >= swap_fail_mb):
+    # System-wide free memory % is the honest OOM-proximity signal — the one
+    # this check's own history keeps pointing at. Kernel pressure level is a
+    # transient sample that can read 2 ("warning") for a single tick while free
+    # memory is abundant, and swap-in-use is sticky (pages swapped out during a
+    # *past* event stay counted until touched again). Convicting on those two
+    # alone produced recurring false FAILs — e.g. "level 2, swap 5655M" while
+    # `memory_pressure` reported 47% free. So free% gets the deciding vote: a
+    # transient level-2 or sticky swap only convicts when free memory is
+    # actually low. A kernel-declared level-4 (critical) still fails outright.
+    # Issue #1485 follow-up.
+    free_pct = None
+    try:
+        mp = subprocess.run(
+            ["memory_pressure"], capture_output=True, text=True, timeout=5).stdout
+        fm = _re.search(r'free percentage:\s*(\d+)%', mp)
+        if fm:
+            free_pct = int(fm.group(1))
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+    # Kernel-declared critical — trust it regardless of free%.
+    if level >= 4:
+        return {"name": name, "status": "fail",
+                "detail": f"critical memory pressure (level {level}, swap {swap_used_mb:.0f}M in use)"}
+
+    if free_pct is not None:
+        # free% available → it is the deciding vote.
+        if free_pct < free_fail_pct and (level >= 2 or swap_used_mb >= swap_fail_mb):
+            return {"name": name, "status": "fail",
+                    "detail": f"critical memory pressure ({free_pct}% free, level {level}, swap {swap_used_mb:.0f}M in use)"}
+        if free_pct < free_warn_pct and (level >= 2 or swap_used_mb >= swap_warn_mb):
+            return {"name": name, "status": "warn",
+                    "detail": f"memory pressure elevated ({free_pct}% free, level {level}, swap {swap_used_mb:.0f}M in use)"}
+        if swap_used_mb >= swap_warn_mb:
+            return {"name": name, "status": "ok",
+                    "detail": f"{free_pct}% free (healthy); swap {swap_used_mb:.0f}M is residue from a past pressure event, not active pressure (level {level})"}
+        return {"name": name, "status": "ok",
+                "detail": f"pressure normal ({free_pct}% free, level {level}, swap {swap_used_mb:.0f}M)"}
+
+    # free% unavailable (non-macOS, tool missing, or parse failure) → fall back
+    # to the level+swap heuristic (prior behavior; never blind the check).
+    if level >= 2 and swap_used_mb >= swap_fail_mb:
         return {"name": name, "status": "fail",
                 "detail": f"critical memory pressure (level {level}, swap {swap_used_mb:.0f}M in use)"}
     if level >= 2:
@@ -1032,6 +1071,116 @@ def check_notes_split_brain() -> "dict | None":
             f"Overlap: {examples}{tail}"
         ),
     }
+
+
+def _should_skip_bridge(channel_name: str, env_path: Path) -> bool:
+    """True if SKIP_<CHANNEL>=1 is set in the main .env or as an env var.
+
+    Lets operators silence a bridge on a specific host without removing its
+    token from the shared config (issue #1916). The flag is per-host: set it
+    in the main .env on the host where the bridge should NOT run. Both the
+    health-check (no warn) and --fix (no restart) honor it.
+    """
+    var = f"SKIP_{channel_name.upper()}"
+    if os.environ.get(var) == "1":
+        return True
+    if env_path.exists():
+        try:
+            for line in env_path.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                key, sep, val = line.partition("=")
+                if sep and key.strip() == var and val.strip().strip('"').strip("'") == "1":
+                    return True
+        except Exception:
+            pass
+    return False
+
+
+def sutando_app_hotkey_detail(workspace_dir) -> str:
+    """Detail string for a running sutando-app check.
+
+    Hotkey labels come from <workspace>/state/hotkeys.json, published by the
+    app when it registers them (single source of truth since #1920). A running
+    process alone doesn't prove hotkeys exist — app lineages without global
+    hotkey registration (e.g. the Electron shell) match the pgrep pattern but
+    register nothing, and the pre-#1920 hardcoded "(⌃C/⌃V/⌃M)" claim here had
+    already drifted from the real defaults and read as a false positive during
+    live debugging. Missing/malformed/empty file → honest "no hotkeys
+    published" rather than a guess.
+    """
+    try:
+        entries = json.loads((Path(workspace_dir) / "state" / "hotkeys.json").read_text())
+        labels = "/".join(e["label"] for e in entries if e.get("label"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        labels = ""
+    return f"running (hotkeys: {labels})" if labels else "running (no hotkeys published)"
+
+
+def _outermost_bundle(comm: str) -> Optional[Path]:
+    """Map an executable path to its OUTERMOST .app bundle, or None.
+
+    Electron helper processes live at
+    …/Sutando.app/Contents/Frameworks/Sutando Helper*.app/Contents/MacOS/…,
+    so split on the FIRST `.app/` to resolve them to the top-level bundle
+    rather than the nested helper bundle.
+    """
+    if ".app/" not in comm:
+        return None
+    return Path(comm.split(".app/", 1)[0] + ".app")
+
+
+def _is_electron_impostor(comm: str) -> bool:
+    """True if `comm` belongs to an Electron bundle squatting the Sutando name.
+
+    The desktop UI also installs as "Sutando.app", and its main binary lives
+    at the same …/Contents/MacOS/Sutando suffix the sutando-app pgrep pattern
+    matches — so the probe reported "running" while the actual Swift menu-bar
+    app (the contextual-chips writer + watcher-auto-restart owner) was dead
+    (#2038, 2026-07-09). Electron bundles are distinguishable on disk: they
+    ship Contents/Frameworks/Sutando Helper.app; the Swift app has no helper
+    frameworks.
+    """
+    bundle = _outermost_bundle(comm)
+    if bundle is None:
+        return False  # bare dev binary (src/Sutando/Sutando) — not a bundle
+    return (bundle / "Contents" / "Frameworks" / "Sutando Helper.app").exists()
+
+
+def _ps_comm(pid: str) -> str:
+    """Executable path (macOS) / name (linux) for a PID via ps; "" on error."""
+    return subprocess.run(
+        ["/bin/ps", "-o", "comm=", "-p", pid],
+        capture_output=True, text=True, timeout=5,
+    ).stdout.strip()
+
+
+def _filter_electron_impostor_pids(pids: list[str]) -> list[str]:
+    """Drop PIDs that belong to the Electron desktop app, keep the rest.
+
+    Fail-open per PID: if the ps lookup errors, keep the PID (pre-fix
+    behavior) rather than false-alarm "stopped".
+    """
+    kept = []
+    for pid in pids:
+        try:
+            if _is_electron_impostor(_ps_comm(pid)):
+                continue
+        except Exception:
+            pass
+        kept.append(pid)
+    return kept
+
+
+def _resolve_menu_bar_pgrep(pgrep_status: Optional[str], pids: list[str]) -> tuple[Optional[str], list[str]]:
+    """Post-process the sutando-app pgrep result: drop Electron impostor
+    PIDs, and demote "ok-running" to "ok-stopped" when nothing real remains."""
+    if pgrep_status == "ok-running" and pids:
+        pids = _filter_electron_impostor_pids(pids)
+        if not pids:
+            pgrep_status = "ok-stopped"
+    return pgrep_status, pids
 
 
 def run_all_checks() -> list[dict]:
@@ -1169,11 +1318,11 @@ def run_all_checks() -> list[dict]:
                         checks.append(ngrok_c)
 
     # Messaging bridges (optional — only check if configured and not skipped)
-    skip_telegram = (env_path.exists() and "SKIP_TELEGRAM=1" in env_path.read_text()) or os.environ.get("SKIP_TELEGRAM") == "1"
     channels_dir = claude_home_path("channels")
-    for name, proc_name in [("telegram-bridge", "telegram-bridge"), ("discord-bridge", "discord-bridge")]:
+    for name, proc_name in [("telegram-bridge", "telegram-bridge"), ("discord-bridge", "discord-bridge"),
+                            ("slack-bridge", "slack-bridge")]:
         channel_name = name.replace("-bridge", "")
-        if channel_name == "telegram" and skip_telegram:
+        if _should_skip_bridge(channel_name, env_path):
             continue
         env_file = channels_dir / channel_name / ".env"
         access_file = channels_dir / channel_name / "access.json"
@@ -1354,8 +1503,15 @@ def run_all_checks() -> list[dict]:
             pgrep_status = "error"
             pgrep_err = f"{type(e).__name__}: {e}"[:120]
 
+        # Disqualify Electron impostors (see _resolve_menu_bar_pgrep).
+        pgrep_status, pids = _resolve_menu_bar_pgrep(pgrep_status, pids)
+
         if pgrep_status == "ok-running" and pids:
-            check = {"name": "sutando-app", "status": "ok", "detail": f"running (⌃C/⌃V/⌃M)"}
+            # pragma: no cover — reachable only when pgrep finds the macOS
+            # menu-bar app (never on ubuntu CI); detail derivation is covered
+            # at helper level in health-check-sutando-app-hotkeys.test.py.
+            check = {"name": "sutando-app", "status": "ok",  # pragma: no cover
+                     "detail": sutando_app_hotkey_detail(WORKSPACE_DIR)}
             # Staleness check is meaningful only in the dev workflow — the
             # .app binary and bundled main.swift share a build mtime, so a
             # comparison there is always equal. Skip when dev_bin missing.
@@ -1475,18 +1631,22 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
         # Same failure set, within cooldown — skip.
         return
 
-    # Build task content.
+    # Build task content. task: is placed LAST (after trusted metadata fields)
+    # so that the multi-line bullet body cannot shadow source/access_tier/priority
+    # even in the theoretical case where check detail strings ever carry
+    # external data. Consistent with the bridge field-order convention.
     ts_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-    bullet_lines = [f"- {c['name']}: {c['status']} ({c['detail']})" for c in failures]
+    bullet_str = "\n".join(f"- {c['name']}: {c['status']} ({c['detail']})" for c in failures)
     body = (
         f"id: task-health-{now_ms}\n"
         f"timestamp: {ts_iso}\n"
-        f"task: Health check found issues. Decide whether to restart, DM owner, or treat as transient:\n"
-        + "\n".join(bullet_lines) + "\n"
         f"source: health-check\n"
+        f"interaction_type: system_event\n"
         f"user_id: health-check\n"
         f"access_tier: owner\n"
         f"priority: low\n"
+        f"task: Health check found issues. Decide whether to restart, DM owner, or treat as transient:\n"
+        f"{bullet_str}\n"
     )
     task_path = tasks_dir / f"task-health-{now_ms}.txt"
     task_path.write_text(body)
@@ -1882,6 +2042,35 @@ def _core_started_within(seconds: float, workspace: Optional[Path] = None, now: 
     return (now - youngest_start) < seconds
 
 
+def _resolve_launch_env() -> dict:
+    """Environment for out-of-process core restarts (start-cli.sh --restart).
+
+    launchd's minimal PATH (``/usr/bin:/bin:/usr/sbin:/sbin``) cannot find the
+    tools start-cli.sh needs — homebrew ``tmux``, ``claude`` in ``~/.local/bin``,
+    or the Sutando.app-bundled ``node`` runtime — so the restart exits rc=127
+    (``node unavailable`` / ``exec: claude: not found``) and silently falls
+    through to the legacy fallback. Prepend all of them.
+
+    Extends the existing tmux-only PATH fix to node + claude. Incident
+    2026-07-10: the watchdog restart path was broken under launchd for ~70 min
+    (queue backlog) because every canonical restart hit rc=127. Same PATH-
+    narrowing class as _resolve_tmux_bin (2026-06-09), applied here.
+    """
+    env = dict(os.environ)
+    extra = [
+        "/opt/homebrew/bin",                        # homebrew (Apple Silicon) — tmux
+        "/usr/local/bin",                           # homebrew (Intel) / misc
+        str(Path.home() / ".local" / "bin"),        # `claude` install location
+    ]
+    # Sutando.app-bundled node runtime: sibling of the repo inside the app bundle
+    # (Contents/Resources/{repo,runtime}). Absent in a plain dev checkout → skipped.
+    bundled_bin = REPO_DIR.parent / "runtime" / "bin"
+    if bundled_bin.is_dir():  # pragma: no cover — only present inside the app bundle
+        extra.append(str(bundled_bin))
+    env["PATH"] = ":".join(extra) + ":" + env.get("PATH", "/usr/bin:/bin")
+    return env
+
+
 def _default_core_restart(standard_context: bool) -> bool:
     """Run src/agent/claude/cli/start-cli.sh --restart out-of-process. When
     standard_context is True, pin SUTANDO_CORE_MODEL=opus so the restarted core
@@ -1890,9 +2079,7 @@ def _default_core_restart(standard_context: bool) -> bool:
     script = REPO_DIR / "src" / "agent" / "claude" / "cli" / "start-cli.sh"
     if not script.exists():
         return False
-    env = dict(os.environ)
-    # launchd's minimal PATH won't find homebrew tmux; start-cli.sh needs it.
-    env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + env.get("PATH", "/usr/bin:/bin")
+    env = _resolve_launch_env()  # pragma: no cover — real-subprocess restart path (integration, not unit)
     if standard_context:
         env["SUTANDO_CORE_MODEL"] = "opus"
     try:
@@ -2185,7 +2372,7 @@ def main():
                 if c["name"].startswith("com.sutando."):
                     result = fix_launchd(c["name"])
                     print(f"  {c['name']}: {result}")
-                elif c["name"] in ("telegram-bridge", "discord-bridge"):
+                elif c["name"] in ("telegram-bridge", "discord-bridge", "slack-bridge"):  # pragma: no cover - --fix restart path spawns real subprocesses; not unit-tested
                     # LoginFailure means the token is bad — restarting won't help
                     # and would create a duplicate alongside the launchd-managed one.
                     if "LoginFailure" in c.get("detail", "") or "token invalid" in c.get("detail", ""):

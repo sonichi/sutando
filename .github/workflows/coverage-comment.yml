@@ -1,0 +1,65 @@
+name: Coverage Comment
+
+# Posts the Coverage Gate result as a sticky PR comment (created once,
+# updated on every subsequent run — no comment spam).
+#
+# Two-stage pattern: the gate itself runs on `pull_request`, where fork PRs
+# get a read-only GITHUB_TOKEN that cannot comment. This workflow fires on
+# workflow_run in the BASE-repo context with write permission, downloads the
+# summary artifact the gate uploaded, and posts it. It never checks out or
+# executes PR code — it only reads two small artifact files — which is what
+# keeps the write token safe (the reason pull_request_target is avoided).
+#
+# NOTE: workflow_run workflows execute from the default branch's copy of
+# this file, so the comment step activates once this file lands on main.
+
+on:
+  workflow_run:
+    workflows: ["Coverage Gate"]
+    types: [completed]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  comment:
+    if: github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Download summary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-summary
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Post / update sticky PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- coverage-gate-comment -->';
+            if (!fs.existsSync('coverage-summary.md') || !fs.existsSync('pr-number.txt')) {
+              core.info('No summary artifact content — nothing to post.');
+              return;
+            }
+            const prNumber = parseInt(fs.readFileSync('pr-number.txt', 'utf8').trim(), 10);
+            if (!Number.isInteger(prNumber)) {
+              core.setFailed(`pr-number.txt did not contain a PR number`);
+              return;
+            }
+            const body = marker + '\n' + fs.readFileSync('coverage-summary.md', 'utf8');
+            const { owner, repo } = context.repo;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: prNumber, per_page: 100,
+            });
+            const existing = comments.find(c => c.body && c.body.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+              core.info(`Updated comment ${existing.id} on #${prNumber}`);
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
+              core.info(`Created comment on #${prNumber}`);
+            }

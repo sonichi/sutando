@@ -19,8 +19,22 @@ set -e
 REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
 cd "$REPO"
 
-TMUX_SOCKET="/tmp/sutando-tmux.sock"
+# Honor a caller-provided socket (e.g. a desktop app that runs a user-private tmux
+# runtime under its app-support dir); default to the shared /tmp socket for dev/CLI.
+# Backward-compatible: unset → identical to the previous hardcoded value.
+TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 SESSION="sutando-core"
+
+# Marker identifying THIS process as the long-lived sutando-core session (as
+# opposed to an ad-hoc `claude` in the same checkout — PR review, codex, etc.).
+# The SessionStart hook (src/schedule-crons-session-hint.sh) gates its
+# /startup bootstrap reminder on this so only the core triggers cron
+# registration, never every session in the checkout. Exported so the no-tmux
+# `exec claude` fallback inherits it directly; injected into the tmux launch
+# branches via `new-session -e` (below) since tmux runs the command under the
+# server's environment, not necessarily this shell's.
+export SUTANDO_CORE_SESSION=1
+CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1)
 
 # Optional working-directory override for the core `claude` process.
 #   - Unset (upstream default): no override — the core launches from $REPO (the
@@ -176,36 +190,50 @@ if [ -n "${SUTANDO_CORE_MODEL:-}" ]; then
   MODEL_ARGS=(--model "$SUTANDO_CORE_MODEL")
 fi
 
-# ---- obs hooks (registered ONLY when an export endpoint is set) -------------
-# Register Claude Code hooks via `--settings` (merges with the user's settings
-# at highest precedence, per-session — no persistent file edit) ONLY when an
-# endpoint is configured. With no endpoint we inject no --settings at all, so
-# PreToolUse/PostToolUse never fork obs-hook.sh on the tool-call hot path —
-# capture is truly zero-cost (not just a no-op fork) when off. The endpoint comes
-# from $SUTANDO_OBS_ENDPOINT (exported so the hook — which runs in the session's
-# inherited env — resolves it at hook-time).
+# ---- core --settings hooks (AskUserQuestion guard always; obs when enabled) --
+# One `--settings` flag carries every hook the core needs (multiple --settings
+# flags are undocumented / last-wins, so we compose into a single JSON):
+#
+#   * AskUserQuestion guard — ALWAYS registered. The core runs headless (no
+#     interactive user), so an AskUserQuestion tool call would block the session
+#     forever; a PreToolUse `deny` short-circuits it (hooks/skip-ask-user-question.py).
+#   * obs collector hooks — added to the SAME JSON only when an export endpoint
+#     is set, so PreToolUse/PostToolUse only fork obs-hook.sh on the tool-call
+#     hot path when capture is actually on. Endpoint comes from
+#     $SUTANDO_OBS_ENDPOINT (exported so the hook resolves it at hook-time).
+#
+# The JSON is built by node helpers, NOT shell string interpolation: hand-rolled
+# interpolation broke when $REPO held a space (split the command) or a `"` (broke
+# the JSON). The helpers POSIX single-quote the path inside the command and
+# JSON-escape the payload. The ${arr[@]+...} guard keeps the empty array safe on
+# bash 3.2 under `set -u` (same pattern as MODEL_ARGS above).
 OBS_ENDPOINT="${SUTANDO_OBS_ENDPOINT:-}"
 export SUTANDO_OBS_ENDPOINT="$OBS_ENDPOINT"
 
-# Inject --settings (and thus the per-event hooks) only when an endpoint exists.
-# The ${arr[@]+...} guard keeps the empty array safe on bash 3.2 under `set -u`
-# (same pattern as MODEL_ARGS above). The settings JSON is built by a node helper,
-# NOT shell string interpolation: hand-rolled interpolation broke when $REPO held
-# a space (split the command) or a `"` (broke the JSON). The helper POSIX
-# single-quotes the path inside the command and JSON-escapes the payload. Its 10
-# event keys are all valid CC hook events (code.claude.com/docs/en/hooks.md).
 SETTINGS_ARGS=()
-if [ -z "$OBS_ENDPOINT" ]; then
-  echo "obs hooks: not registered (no export endpoint — set SUTANDO_OBS_ENDPOINT to enable capture)"
-elif ! command -v node > /dev/null 2>&1; then
-  echo "obs hooks: node unavailable — cannot safely build --settings JSON; capture disabled this session" >&2
+if ! command -v node > /dev/null 2>&1; then
+  echo "core hooks: node unavailable — cannot safely build --settings JSON; AskUserQuestion guard + obs disabled this session" >&2
 else
-  HOOKS_JSON="$(node "$REPO/src/observability/claude/hooks/build-hook-settings.mjs" "$REPO/src/observability/claude/hooks/obs-hook.sh")"
-  if [ -n "$HOOKS_JSON" ]; then
-    SETTINGS_ARGS=(--settings "$HOOKS_JSON")
-    echo "obs hooks: → $OBS_ENDPOINT/ingest/claude-code-hooks (collector)"
+  # Obs hooks are optional; the guard is not. Build the obs blob first (empty
+  # string when capture is off) and let the composer array-concat it with the
+  # always-on guard.
+  OBS_JSON=""
+  if [ -z "$OBS_ENDPOINT" ]; then
+    echo "obs hooks: not registered (no export endpoint — set SUTANDO_OBS_ENDPOINT to enable capture)"
   else
-    echo "obs hooks: settings build failed — capture disabled this session" >&2
+    OBS_JSON="$(node "$REPO/src/observability/claude/hooks/build-hook-settings.mjs" "$REPO/src/observability/claude/hooks/obs-hook.sh")"
+    if [ -n "$OBS_JSON" ]; then
+      echo "obs hooks: → $OBS_ENDPOINT/ingest/claude-code-hooks (collector)"
+    else
+      echo "obs hooks: settings build failed — capture disabled this session" >&2
+    fi
+  fi
+  CORE_SETTINGS_JSON="$(node "$REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO/hooks/skip-ask-user-question.py" "$OBS_JSON")"
+  if [ -n "$CORE_SETTINGS_JSON" ]; then
+    SETTINGS_ARGS=(--settings "$CORE_SETTINGS_JSON")
+    echo "core hooks: AskUserQuestion guard registered (PreToolUse deny — headless core can't answer it)"
+  else
+    echo "core hooks: settings build failed — AskUserQuestion guard NOT registered this session" >&2
   fi
 fi
 
@@ -237,13 +265,13 @@ fi
 # emit-task. Unsafe: a future agent processing a "restart core" task by
 # exec'ing this script from within sutando-core. Per Mini's #608 review.
 if [ "$1" = "--restart" ]; then
-  if pgrep -f "claude.*--name.*$SESSION" > /dev/null 2>&1; then
+  if tmux -S "$TMUX_SOCKET" has-session -t "$SESSION" 2>/dev/null; then
     echo "Killing existing $SESSION session..."
     tmux -S "$TMUX_SOCKET" kill-session -t "$SESSION" 2>/dev/null || true
     # Poll for actual shutdown — robust on slow machines, faster on fast
     # ones (~1s ceiling) than a fixed sleep.
     for _ in 1 2 3 4 5; do
-      pgrep -f "claude.*--name.*$SESSION" > /dev/null 2>&1 || break
+      tmux -S "$TMUX_SOCKET" has-session -t "$SESSION" 2>/dev/null || break
       sleep 0.2
     done
   fi
@@ -276,7 +304,7 @@ apply_tmux_defaults() {
 
 # Already running — attach if interactive, else exit cleanly. This branch
 # also catches the !--restart path so re-running the script is idempotent.
-if pgrep -f "claude.*--name.*$SESSION" > /dev/null 2>&1; then
+if tmux -S "$TMUX_SOCKET" has-session -t "$SESSION" 2>/dev/null; then
   apply_tmux_defaults
   if [ -t 1 ] && command -v tmux > /dev/null 2>&1; then
     echo "Attaching to existing $SESSION (Ctrl-b d to detach)..."
@@ -292,6 +320,17 @@ fi
 if ! command -v tmux > /dev/null 2>&1 && command -v brew > /dev/null 2>&1; then
   echo "tmux not found — installing via Homebrew (~30s, required for Sutando.app watcher-auto-restart)..."
   brew install tmux 2>&1 | tail -3
+fi
+
+# Stamp the core session start into an append-only per-boot log. One JSONL
+# line per launch; consecutive entries bound each session's lifetime, which
+# is what session-recap tooling needs to pick the right transcript (owner
+# ask 2026-07-13). Best-effort: never block the launch on it.
+if _ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n "$_ws" ]; then
+  mkdir -p "$_ws/state" 2>/dev/null || true
+  printf '{"host":"%s","session_started_at":%s,"iso":"%s","source":"start-cli"}\n' \
+    "$(hostname | sed 's/\..*//')" "$(date +%s)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    >> "$_ws/state/session-starts.log" 2>/dev/null || true
 fi
 
 # Fall back to a bare `exec claude` if tmux is still missing.
@@ -328,12 +367,12 @@ apply_tmux_defaults
 # start-directory is silently dropped — so re-anchoring a running core to a new
 # working dir must go through `--restart` (kill-then-create), not a bare rerun.
 if [ -t 1 ]; then
-  exec tmux -S "$TMUX_SOCKET" new-session -A -s "$SESSION" ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
+  exec tmux -S "$TMUX_SOCKET" new-session -A -s "$SESSION" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
     claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
     -- "/schedule-crons"
 else
-  tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
+  tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
     claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
     -- "/schedule-crons"
