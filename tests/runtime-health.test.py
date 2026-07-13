@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _spec = importlib.util.spec_from_file_location(
@@ -74,12 +75,17 @@ check(
 # 4) derive() maps every state correctly — drive it by patching the probes so we
 #    exercise the working/idle/needs_login/offline/unknown branches without a live
 #    tmux (the branches a schema-only test would leave uncovered).
-def _derive_with(core, pane, status, gateway=False):
+def _derive_with(core, pane, status, gateway=False, ts="fresh"):
+    # ts: "fresh" -> now; "stale" -> older than the gate; or an explicit epoch/None.
+    if ts == "fresh":
+        ts = time.time()
+    elif ts == "stale":
+        ts = time.time() - (rh.STALE_STATUS_SECONDS + 60)
     orig = (rh._core_running, rh._pane_text, rh._core_status,
             rh._gateway_running, rh._resolve_workspace)
     rh._core_running = lambda: core
     rh._pane_text = lambda: pane
-    rh._core_status = lambda ws: status
+    rh._core_status = lambda ws: (status, ts)
     rh._gateway_running = lambda: gateway
     rh._resolve_workspace = lambda repo: "/tmp/ignored-ws"
     try:
@@ -89,9 +95,15 @@ def _derive_with(core, pane, status, gateway=False):
          rh._gateway_running, rh._resolve_workspace) = orig
 
 
-d = _derive_with(core=True, pane="", status="running", gateway=True)
-check("derive: running status -> working", d["health"] == "working" and d["authenticated"] is True)
+d = _derive_with(core=True, pane="", status="running", gateway=True, ts="fresh")
+check("derive: fresh running -> working", d["health"] == "working" and d["authenticated"] is True)
 check("derive: gateway_running surfaced", d["gateway_running"] is True)
+
+d = _derive_with(core=True, pane="", status="running", ts="stale")
+check("derive: STALE running -> unknown (not working)", d["health"] == "unknown")
+
+d = _derive_with(core=True, pane="", status="running", ts=None)
+check("derive: running with no ts -> working (can't prove stale)", d["health"] == "working")
 
 d = _derive_with(core=True, pane="", status="idle")
 check("derive: idle status -> idle", d["health"] == "idle" and d["authenticated"] is True)
@@ -111,18 +123,25 @@ T = tempfile.mkdtemp()
 os.makedirs(os.path.join(T, "state"))
 with open(os.path.join(T, "state", "core-status.json"), "w") as f:
     f.write('{"status":"running","ts":1}')
-check("_core_status: reads status from file", rh._core_status(T) == "running")
-check("_core_status: missing file -> None", rh._core_status(tempfile.mkdtemp()) is None)
+check("_core_status: reads (status, ts) from file", rh._core_status(T) == ("running", 1.0))
+check("_core_status: missing file -> (None, None)", rh._core_status(tempfile.mkdtemp()) == (None, None))
 
 # core-status.json written by another process could be corrupt OR a valid but
-# non-object JSON value (e.g. a stray '[]'); must degrade to None, not crash.
+# non-object JSON value (e.g. a stray '[]'); must degrade to (None, None), not crash.
 for bad in ("[]", '"idle"', "42", "not json {"):
     Tb = tempfile.mkdtemp()
     os.makedirs(os.path.join(Tb, "state"))
     with open(os.path.join(Tb, "state", "core-status.json"), "w") as f:
         f.write(bad)
-    ok_ = rh._core_status(Tb) is None
-    check("_core_status: non-object/corrupt JSON %r -> None (no crash)" % bad, ok_)
+    ok_ = rh._core_status(Tb) == (None, None)
+    check("_core_status: non-object/corrupt JSON %r -> (None, None) (no crash)" % bad, ok_)
+
+# A non-numeric ts must not crash the float() coercion -> ts None.
+Tt = tempfile.mkdtemp()
+os.makedirs(os.path.join(Tt, "state"))
+with open(os.path.join(Tt, "state", "core-status.json"), "w") as f:
+    f.write('{"status":"running","ts":"garbage"}')
+check("_core_status: non-numeric ts -> (status, None)", rh._core_status(Tt) == ("running", None))
 
 # 6) Exercise the REAL probe implementations in-process (offline path) so the
 #    subprocess-only e2e above doesn't leave _run/_core_running/_gateway_running/

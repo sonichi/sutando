@@ -26,12 +26,21 @@ observer; it starts nothing and kills nothing.
 """
 import json
 import os
-import re
 import subprocess
 import sys
+import time
 
 SESSION = "sutando-core"
 TMUX_SOCKET = os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock")
+
+# A `core-status.json` claiming "running" is only trustworthy if its `ts` is
+# recent — a crashed/wedged loop can leave it stuck on "running" indefinitely.
+# Beyond this window a "running" record degrades to "unknown" rather than
+# falsely reporting "working" (the exact incident this signal exists to catch).
+# Aligned with the freshness gates other readers already apply (web-client 60s,
+# core-heartbeat ~90s); 90s tolerates a normal long step between status writes
+# while still catching a genuinely wedged loop (stale for far longer).
+STALE_STATUS_SECONDS = 90
 
 # Markers that mean the bundled claude CLI is sitting at its auth prompt and the
 # core therefore cannot act. Kept broad on purpose — the failure mode is a user
@@ -97,8 +106,15 @@ def _core_status(workspace):
         with open(os.path.join(workspace, "state", "core-status.json")) as f:
             data = json.load(f)
     except (OSError, ValueError):
-        return None
-    return data.get("status") if isinstance(data, dict) else None
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    ts = data.get("ts")
+    try:
+        ts = float(ts) if ts is not None else None
+    except (TypeError, ValueError):
+        ts = None
+    return data.get("status"), ts
 
 
 def _resolve_workspace(repo):
@@ -119,10 +135,15 @@ def derive():
         if needs_login(_pane_text()):
             health, authed, detail = "needs_login", False, "Agent needs to sign in"
         else:
-            status = _core_status(workspace)
+            status, ts = _core_status(workspace)
             authed = True
-            if status == "running":
+            stale = ts is not None and (time.time() - ts) > STALE_STATUS_SECONDS
+            if status == "running" and not stale:
                 health, detail = "working", "Agent is working"
+            elif status == "running" and stale:
+                # Session alive but status hasn't advanced — likely a wedged/
+                # crashed loop; don't claim "working" off a stale record.
+                health, detail = "unknown", "Status stale (still 'running', not updated recently) — possibly wedged"
             elif status == "idle":
                 health, detail = "idle", "Agent is online and idle"
             else:
