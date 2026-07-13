@@ -40,7 +40,7 @@ def resolve_token(repo):
     # setup), process env winning. Parsing only AG2_REMOTE_TOKEN from .env
     # mis-detected a split-token install (e.g. REMOTE_TASK_URL + REMOTE_TASK_TOKEN)
     # as "not connected" (review #2079).
-    TOKEN_KEYS = ("GATEWAY_TOKEN", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")
+    TOKEN_KEYS = ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")
     URL_KEYS = ("GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL", "AG2_REMOTE_URL")
     vals = {k: os.environ.get(k) for k in TOKEN_KEYS + URL_KEYS}
     envp = os.path.join(repo, ".env")
