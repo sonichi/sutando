@@ -773,16 +773,26 @@ def main():
                 )
                 lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
                 step = 1
-                # CONTEXT-FIRST: reconstruct before interpreting a message that isn't
-                # self-contained. Unlike Discord, Telegram's Bot API has NO message-history
-                # fetch — so the reconstruct substrate is the embedded [Replying to …] quote
-                # (above) + the session transcript, NOT a channel pull-back. Always emitted.
+                # CONTEXT-FIRST: reconstruct before interpreting. UNCONDITIONAL as of
+                # 2026-07-13 (owner-approved): the prior form gated reconstruction on the
+                # agent judging the message "not self-contained" — but that judgment ("I
+                # already understand this") is the exact signal that fails, so the agent
+                # kept walking past the read on questions it only *felt* confident about.
+                # Removing the gate trades a little cheap re-reading for never skipping it;
+                # only a pure greeting/ack is exempt. Unlike Discord, Telegram's Bot API has
+                # NO message-history fetch — so the reconstruct substrate is the embedded
+                # [Replying to …] quote (above) + the session transcript, NOT a channel
+                # pull-back. Supersedes the self-contained-judgment form.
                 lines.append(
-                    f'{step}. CONTEXT-FIRST: if this message is not self-contained '
-                    f'(terse — "y", "no", a pronoun — a reply, or refers to something not '
-                    f'stated here), reconstruct context BEFORE interpreting. Telegram has no '
-                    f'message-history fetch, so use the embedded [Replying to …] quote above '
-                    f'plus the session transcript, and answer from that, not from memory.'
+                    f'{step}. CONTEXT-FIRST (unconditional): before interpreting this '
+                    f'message, reconstruct context and answer from it, NOT from memory. '
+                    f'Telegram has no message-history fetch, so the substrate is the '
+                    f'embedded [Replying to …] quote above plus the session transcript — '
+                    f'read them back until this message stands on its own. Do this every '
+                    f'time; do NOT skip it because the message looks self-contained or you '
+                    f'feel you already understand it — felt confidence is exactly the '
+                    f'signal that fails. The only exception is a pure greeting or '
+                    f'acknowledgement with no referent (e.g. "hi", "thanks").'
                 )
                 step += 1
                 if _notify_py.exists():

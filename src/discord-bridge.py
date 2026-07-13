@@ -3166,17 +3166,22 @@ async def _handle_discord_message(message, force=False):
         step = 1
         # Context-first: a terse or threaded reply ("no", "continue", a pronoun)
         # loses its referent when interpreted against a stale/compacted session
-        # context. Reconstruct from the durable channel BEFORE interpreting —
-        # keyed on the message not being self-contained (the agent's own judgment,
-        # not a parent_message_id gate), following the reply chain back, no
-        # arbitrary message count. Root-cause fix 2026-06-25.
+        # context. UNCONDITIONAL as of 2026-07-13 (owner-approved): the prior form
+        # gated reconstruction on the agent judging the message "not self-contained"
+        # — but that judgment ("I already understand this") is the exact signal that
+        # fails, so the agent kept walking past the read on questions it only *felt*
+        # confident about. Removing the gate trades a few cheap reads for never
+        # skipping it; only a pure greeting/ack is exempt. Supersedes the
+        # self-contained-judgment form (root-cause 2026-06-25).
         lines.append(
-            f'{step}. CONTEXT-FIRST: if this message is not self-contained (terse, a reply, '
-            f'or refers to something not stated here), reconstruct the relevant context '
-            f'BEFORE interpreting — `python3 src/discord-read.py {channel_id_str}` — and '
-            f'read the thread (everyone\'s messages including your own prior replies) back '
-            f'until it stands on its own, then answer from the reconstructed thread, not '
-            f'from memory.'
+            f'{step}. CONTEXT-FIRST (unconditional): before interpreting this message, '
+            f'reconstruct the thread — `python3 src/discord-read.py {channel_id_str}` — '
+            f'and read it back (everyone\'s messages including your own prior replies) '
+            f'until this message stands on its own, then answer from the reconstructed '
+            f'thread, NOT from memory. Do this every time; do NOT skip it because the '
+            f'message looks self-contained or you feel you already understand it — felt '
+            f'confidence is exactly the signal that fails. The only exception is a pure '
+            f'greeting or acknowledgement with no referent (e.g. "hi", "thanks").'
         )
         step += 1
         if _notify_py.exists():
