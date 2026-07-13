@@ -90,7 +90,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// different TMPDIR due to sandboxing) must target the same socket
     /// to find the same server. Without this, tmux has-session fails
     /// app-side even when the session is alive shell-side.
-    let sutandoTmuxSocket = "/tmp/sutando-tmux.sock"
+    /// Honors SUTANDO_TMUX_SOCKET (the env var start-cli.sh + the desktop
+    /// private-socket runtime set) so the app's state-detection / wakeup /
+    /// pane-capture target the SAME tmux server as a private-socket core;
+    /// falls back to the /tmp default when unset. Without this, a private-
+    /// socket core is invisible to all four control paths below.
+    let sutandoTmuxSocket = ProcessInfo.processInfo.environment["SUTANDO_TMUX_SOCKET"] ?? "/tmp/sutando-tmux.sock"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Self-preventive single-instance: if another Sutando.app is already
