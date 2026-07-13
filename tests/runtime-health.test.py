@@ -71,5 +71,95 @@ check(
                  "tmux_socket", "session", "detail"},
 )
 
+# 4) derive() maps every state correctly — drive it by patching the probes so we
+#    exercise the working/idle/needs_login/offline/unknown branches without a live
+#    tmux (the branches a schema-only test would leave uncovered).
+def _derive_with(core, pane, status, gateway=False):
+    orig = (rh._core_running, rh._pane_text, rh._core_status,
+            rh._gateway_running, rh._resolve_workspace)
+    rh._core_running = lambda: core
+    rh._pane_text = lambda: pane
+    rh._core_status = lambda ws: status
+    rh._gateway_running = lambda: gateway
+    rh._resolve_workspace = lambda repo: "/tmp/ignored-ws"
+    try:
+        return rh.derive()
+    finally:
+        (rh._core_running, rh._pane_text, rh._core_status,
+         rh._gateway_running, rh._resolve_workspace) = orig
+
+
+d = _derive_with(core=True, pane="", status="running", gateway=True)
+check("derive: running status -> working", d["health"] == "working" and d["authenticated"] is True)
+check("derive: gateway_running surfaced", d["gateway_running"] is True)
+
+d = _derive_with(core=True, pane="", status="idle")
+check("derive: idle status -> idle", d["health"] == "idle" and d["authenticated"] is True)
+
+d = _derive_with(core=True, pane=STUCK_PANE, status="running")
+check("derive: login pane wins over status -> needs_login", d["health"] == "needs_login" and d["authenticated"] is False)
+
+d = _derive_with(core=True, pane="", status=None)
+check("derive: running but no status -> unknown", d["health"] == "unknown")
+
+d = _derive_with(core=False, pane="", status="running")
+check("derive: no core -> offline", d["health"] == "offline" and d["authenticated"] is None)
+
+# 5) _core_status reads the status field from a fixture core-status.json.
+import tempfile
+T = tempfile.mkdtemp()
+os.makedirs(os.path.join(T, "state"))
+with open(os.path.join(T, "state", "core-status.json"), "w") as f:
+    f.write('{"status":"running","ts":1}')
+check("_core_status: reads status from file", rh._core_status(T) == "running")
+check("_core_status: missing file -> None", rh._core_status(tempfile.mkdtemp()) is None)
+
+# 6) Exercise the REAL probe implementations in-process (offline path) so the
+#    subprocess-only e2e above doesn't leave _run/_core_running/_gateway_running/
+#    _pane_text/main uncovered. Point at a socket with no session → offline, and
+#    call each real helper directly (they degrade to empty/false, never crash).
+_orig_socket = rh.TMUX_SOCKET
+rh.TMUX_SOCKET = "/tmp/rh-inproc-nonexistent-%d.sock" % os.getpid()
+try:
+    check("real _core_running: false on bogus socket", rh._core_running() is False)
+    check("real _gateway_running returns a bool", isinstance(rh._gateway_running(), bool))
+    check("real _pane_text returns a str", isinstance(rh._pane_text(), str))
+    check("real _resolve_workspace returns a path", rh._resolve_workspace(REPO).startswith("/"))
+    d = rh.derive()
+    check("real derive: offline on bogus socket", d["health"] == "offline")
+    # main() derives + best-effort persists + prints; must not raise.
+    rh.main()
+    check("real main() ran without error", True)
+finally:
+    rh.TMUX_SOCKET = _orig_socket
+
+# 7) Defensive branches (the degrade-not-crash paths).
+rc, out = rh._run(["/nonexistent-rh-binary-xyz"])
+check("_run: missing binary -> (127, '')", rc == 127 and out == "")
+
+
+def _fake_run_gw(cmd):
+    if cmd[:1] == ["pgrep"]:
+        return 1, ""                      # no gateway process
+    if "list-windows" in cmd:
+        return 0, "core\ngateway\n"       # ...but a 'gateway' window exists
+    return 1, ""
+
+
+_o = rh._run
+rh._run = _fake_run_gw
+try:
+    check("_gateway_running: window-scan fallback", rh._gateway_running() is True)
+finally:
+    rh._run = _o
+
+_ow = rh._resolve_workspace
+rh._resolve_workspace = lambda repo: "/dev/null/cannot-mkdir-here"
+try:
+    rh.main()  # unwritable state dir -> write swallowed, still prints
+    check("main(): survives an unwritable state dir", True)
+finally:
+    rh._resolve_workspace = _ow
+
 print("\n" + ("PASS — runtime-health green" if fails == 0 else "FAIL — %d failing" % fails))
 sys.exit(fails)
