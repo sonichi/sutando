@@ -73,41 +73,52 @@ class TestClassify(unittest.TestCase):
 
 
 class TestComposeState(unittest.TestCase):
-    def test_crashed_when_core_dead(self):
-        # core_alive=False dominates everything.
-        st, *_ = compose_state(_WORKING, core_alive=False, gateway_alive=True, progressing=True)
+    """compose_state REFINES runtime-health's coarse `base_health` (one shared
+    derivation, #2092) into the 8 supervisor states — signature is
+    (pane, base_health, gateway_alive). base_health ∈
+    {offline, needs_login, working, idle, unknown}."""
+
+    def test_crashed_when_base_offline(self):
+        # runtime-health "offline" (no session) dominates everything.
+        st, *_ = compose_state(_WORKING, "offline", gateway_alive=True)
         self.assertEqual(st, "crashed")
 
     def test_blocked_human_on_login(self):
-        st, detail, prompt, kind = compose_state(_LOGIN_MENU, True, True, False)
+        # An ACTIVE /login menu is finer than the coarse health → carry the prompt.
+        st, detail, prompt, kind = compose_state(_LOGIN_MENU, "working", True)
         self.assertEqual(st, "blocked-human")
         self.assertEqual(kind, "login")
         self.assertIsNotNone(prompt)
 
     def test_blocked_known_on_bypass(self):
-        st, _d, _p, kind = compose_state(_BYPASS, True, True, False)
+        st, _d, _p, kind = compose_state(_BYPASS, "working", True)
         self.assertEqual(st, "blocked-known")
         self.assertEqual(kind, "bypass-permissions")
 
-    def test_logged_out_when_idle_but_not_authed(self):
-        st, *_ = compose_state(_IDLE_LOGGEDOUT, True, True, False)
+    def test_logged_out_when_base_needs_login_no_active_gate(self):
+        # Passive "Not logged in · Run /login" banner (no active menu) → the
+        # base needs_login maps straight to logged-out.
+        st, *_ = compose_state(_IDLE_LOGGEDOUT, "needs_login", True)
         self.assertEqual(st, "logged-out")
 
-    def test_gateway_down_when_core_ok_gateway_dead(self):
-        st, *_ = compose_state(_IDLE, True, gateway_alive=False, progressing=False)
+    def test_gateway_down_when_base_ok_gateway_dead(self):
+        st, *_ = compose_state(_IDLE, "idle", gateway_alive=False)
         self.assertEqual(st, "gateway-down")
 
-    def test_idle_ready_when_healthy(self):
-        st, *_ = compose_state(_IDLE, True, True, False)
+    def test_idle_ready_when_base_idle(self):
+        st, *_ = compose_state(_IDLE, "idle", True)
         self.assertEqual(st, "idle-ready")
 
-    def test_running_when_progressing(self):
-        st, *_ = compose_state(_WORKING, True, True, progressing=True)
+    def test_running_when_base_working(self):
+        st, *_ = compose_state(_WORKING, "working", True)
         self.assertEqual(st, "running")
 
-    def test_hung_when_stalled_not_prompt_not_idle(self):
-        st, *_ = compose_state(_WORKING, True, True, progressing=False)
+    def test_hung_when_base_unknown(self):
+        # runtime-health "unknown" = live session but stale/absent core-status
+        # (wedged loop) → the supervisor's hung, carrying the pane tail.
+        st, _d, prompt, _k = compose_state(_WORKING, "unknown", True)
         self.assertEqual(st, "hung")
+        self.assertIsNotNone(prompt)
 
 
 class TestAutoAnswer(unittest.TestCase):
