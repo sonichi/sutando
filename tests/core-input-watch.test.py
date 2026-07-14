@@ -14,6 +14,7 @@ Run: python3 tests/core-input-watch.test.py
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import unittest
 
@@ -25,6 +26,7 @@ _spec.loader.exec_module(_mod)
 classify = _mod.classify
 compose_state = _mod.compose_state
 auto_answer = _mod.auto_answer
+main = _mod.main
 
 _BYPASS = ("  in Bypass Permissions mode.\n  https://code.claude.com/docs/en/security\n"
            "  ❯ 1. No, exit\n    2. Yes, I accept\n  Enter to confirm · Esc to cancel")
@@ -143,6 +145,31 @@ class TestAutoAnswer(unittest.TestCase):
         # auto-accept a trust / dangerous-mode prompt without explicit opt-in.
         self.assertIsNone(auto_answer("folder-trust"))
         self.assertIsNone(auto_answer("bypass-permissions"))
+
+
+class TestMainOnce(unittest.TestCase):
+    """End-to-end --once through the SHARED runtime-health derivation: with no
+    live sutando-core, runtime_health.derive() → 'offline' → the supervisor
+    writes state 'crashed'. Exercises main()/_load_runtime_health()/capture()/
+    gateway_alive()/_atomic_write() in-process (not just classify/compose)."""
+
+    def test_once_writes_crashed_with_no_core(self):
+        import sys
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "state", "core-supervisor.json")
+            argv = ["core-input-watch.py", "--socket",
+                    os.path.join(td, "nope.sock"), "--out", out, "--once"]
+            old = sys.argv
+            sys.argv = argv
+            try:
+                main()
+            finally:
+                sys.argv = old
+            with open(out) as f:
+                sig = json.load(f)
+        self.assertEqual(sig["state"], "crashed")
+        self.assertEqual(sig["session"], "sutando-core")
 
 
 if __name__ == "__main__":
