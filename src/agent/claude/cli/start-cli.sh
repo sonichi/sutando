@@ -117,7 +117,11 @@ if [ -x "$REPO/scripts/sutando-config.sh" ]; then
     # --dangerously-skip-permissions does NOT bypass, and the core hangs with no
     # TTY to answer it. Gated on the opt-in env var so we only ever trust the dir
     # the operator explicitly chose, never arbitrary paths. We still do NOT touch
-    # the global bypassPermissionsModeAccepted gate — that's the user's to accept.
+    # the dangerous-mode acknowledgement gate for INTERACTIVE callers — that's the
+# user's to accept. But when SUTANDO_CLAUDE_WORKING_DIR IS set (a deliberately
+# detached, no-TTY core — the bundled desktop app), we ALSO seed
+# skipDangerousModePermissionPrompt below, because there is no TTY to answer that
+# prompt and the core would otherwise hang forever (owner-hit 2026-07-14).
     # This is the single launch chokepoint (Sutando.app's launchCore, the
     # terminal-server Core CLI pane, and src/startup.sh all exec this script),
     # so seeding here covers every path.
@@ -164,6 +168,33 @@ if cwd:
         entry["hasTrustDialogAccepted"] = True
         changed = True
         trusted_dir = cwd
+# Dangerous-mode seed (env-gated, detached-core only). The core launches with
+# --dangerously-skip-permissions; on first run in a fresh scoped config Claude
+# Code shows a "Bypass Permissions mode / Yes, I accept" acknowledgement prompt.
+# --dangerously-skip-permissions does NOT bypass THAT prompt, so a detached
+# no-TTY core (the bundled desktop app) hangs on it forever — process alive but
+# never reaching /schedule-crons (owner-hit 2026-07-14 on the mini; distinct from
+# the folder-trust dialog above). Pre-accept it by seeding
+# skipDangerousModePermissionPrompt in <ccd>/settings.json. Gated on the SAME
+# opt-in env (SUTANDO_CLAUDE_WORKING_DIR / cwd) as the trust-seed: only the
+# operator's explicitly-chosen detached core is affected; interactive callers
+# still get the prompt and accept it themselves. Merge — never clobber existing
+# settings. Idempotent + atomic.
+if cwd:
+    settings_path = os.path.join(ccd, "settings.json")
+    try:
+        st = json.load(open(settings_path)) if os.path.exists(settings_path) else {}
+        if not isinstance(st, dict):
+            st = {}
+    except Exception:
+        st = {}
+    if st.get("skipDangerousModePermissionPrompt") is not True:
+        st["skipDangerousModePermissionPrompt"] = True
+        s_tmp = settings_path + ".tmp"
+        with open(s_tmp, "w") as f:
+            json.dump(st, f, indent=2)
+        os.replace(s_tmp, settings_path)
+        print("  ✓ dangerous-mode-seed: skipDangerousModePermissionPrompt set in settings.json")
 if changed:
     tmp = target + ".tmp"
     with open(tmp, "w") as f:
