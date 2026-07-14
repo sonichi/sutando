@@ -170,8 +170,15 @@ def get_system_stats() -> dict:
 
     result = subprocess.run(["/usr/bin/pmset", "-g", "batt"], capture_output=True, text=True, timeout=5)
     battery_m = re.search(r'(\d+)%', result.stdout)
-    battery = f"{battery_m.group(1)}%" if battery_m else "?"
-    charging = "charging" in result.stdout.lower() or "ac power" in result.stdout.lower()
+    if battery_m:
+        battery = f"{battery_m.group(1)}%"
+        # \b keeps "discharging" (battery power) from substring-matching "charging".
+        charging = bool(re.search(r'\bcharging\b', result.stdout.lower())) or "ac power" in result.stdout.lower()
+    else:
+        # Battery-less Mac (mini / Studio / Pro): pmset reports "AC Power" with no
+        # percentage line. The old "?" + charging=True combo rendered as "? ⚡".
+        battery = "—"
+        charging = False
 
     return {
         "disk_free": f"{free_gb:.0f}GB",

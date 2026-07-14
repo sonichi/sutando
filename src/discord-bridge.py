@@ -2323,6 +2323,30 @@ async def on_message_edit(before, after):
     await _handle_discord_message(after, force=True)
 
 
+def _write_task_file(task_file: Path, content, username: str,
+                     channel_name: str, access_tier: str, message_id: int) -> bool:
+    """Write a task file with diagnostic instrumentation. Returns True on success.
+
+    ``content`` may be a ready string or a zero-arg callable returning the
+    string. Callers pass a callable so the f-string CONSTRUCTION runs inside
+    this try — a build failure (bad attribute access, encoding error) is then
+    logged as a FAILED line instead of silently losing the message before the
+    instrumentation is reached.
+    """
+    try:
+        if callable(content):
+            content = content()
+        task_file.write_text(content)
+    except Exception as _tw_exc:
+        print(f"  [task-write] FAILED for @{username} in #{channel_name} "
+              f"(tier={access_tier}, msg={message_id}): "
+              f"{type(_tw_exc).__name__}: {_tw_exc}", flush=True)
+        return False
+    print(f"  [task-write] wrote {task_file.name} "
+          f"(@{username}, #{channel_name}, tier={access_tier})", flush=True)
+    return True
+
+
 async def _handle_discord_message(message, force=False):
     if message.author == client.user:
         return
@@ -3018,7 +3042,13 @@ async def _handle_discord_message(message, force=False):
             enriched = None
         if enriched:
             print(f"  [discord-state-prefetch] enriched task body for {username} in #{getattr(message.channel, 'name', '?')}", flush=True)
-            user_task_text = enriched
+            # Re-apply confine to the enriched body: the fetched Discord channel
+            # messages (the `blocks` prefix in enriched) were not run through
+            # confine_user_content() — an attacker-controlled channel could post
+            # `===SUTANDO SYSTEM INSTRUCTIONS===` content that lands in the task
+            # file header verbatim. confine_user_content is idempotent so the
+            # already-ZWSP-prefixed original user_task_text is unaffected.
+            user_task_text = confine_user_content(enriched)
             # Rewrite the prompt file with the enriched body. quoted_task
             # already points to `"$(cat {prompt_path})"` — keep the heredoc
             # form (per PR #652's codex-stdin-hang fix). Using shlex.quote
@@ -3166,17 +3196,22 @@ async def _handle_discord_message(message, force=False):
         step = 1
         # Context-first: a terse or threaded reply ("no", "continue", a pronoun)
         # loses its referent when interpreted against a stale/compacted session
-        # context. Reconstruct from the durable channel BEFORE interpreting —
-        # keyed on the message not being self-contained (the agent's own judgment,
-        # not a parent_message_id gate), following the reply chain back, no
-        # arbitrary message count. Root-cause fix 2026-06-25.
+        # context. UNCONDITIONAL as of 2026-07-13 (owner-approved): the prior form
+        # gated reconstruction on the agent judging the message "not self-contained"
+        # — but that judgment ("I already understand this") is the exact signal that
+        # fails, so the agent kept walking past the read on questions it only *felt*
+        # confident about. Removing the gate trades a few cheap reads for never
+        # skipping it; only a pure greeting/ack is exempt. Supersedes the
+        # self-contained-judgment form (root-cause 2026-06-25).
         lines.append(
-            f'{step}. CONTEXT-FIRST: if this message is not self-contained (terse, a reply, '
-            f'or refers to something not stated here), reconstruct the relevant context '
-            f'BEFORE interpreting — `python3 src/discord-read.py {channel_id_str}` — and '
-            f'read the thread (everyone\'s messages including your own prior replies) back '
-            f'until it stands on its own, then answer from the reconstructed thread, not '
-            f'from memory.'
+            f'{step}. CONTEXT-FIRST (unconditional): before interpreting this message, '
+            f'reconstruct the thread — `python3 src/discord-read.py {channel_id_str}` — '
+            f'and read it back (everyone\'s messages including your own prior replies) '
+            f'until this message stands on its own, then answer from the reconstructed '
+            f'thread, NOT from memory. Do this every time; do NOT skip it because the '
+            f'message looks self-contained or you feel you already understand it — felt '
+            f'confidence is exactly the signal that fails. The only exception is a pure '
+            f'greeting or acknowledgement with no referent (e.g. "hi", "thanks").'
         )
         step += 1
         if _notify_py.exists():
@@ -3212,11 +3247,14 @@ async def _handle_discord_message(message, force=False):
     # would otherwise lose the message with no trace). Log the outcome either way
     # — a future drop now self-diagnoses: absence of BOTH this line and an
     # early-return log pinpoints a new path; a FAILED line pinpoints the write.
-    try:
-        task_file.write_text(
+    def _build_task_content() -> str:
+        # Deliberately a callable: _write_task_file() invokes it INSIDE its
+        # try, so a failure in this f-string build is logged as a FAILED
+        # line (see the instrumentation note above) instead of raising
+        # before the logging is reached.
+        return (
             f"id: {task_id}\n"
             f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
-            f"task: {user_task_text}\n"
             f"source: discord\n"
             f"interaction_type: message\n"
             f"{media_headers}"
@@ -3228,16 +3266,14 @@ async def _handle_discord_message(message, force=False):
             f"user_id: {message.author.id}\n"
             f"access_tier: {access_tier}\n"
             f"priority: {priority}\n"
+            f"task: {user_task_text}\n"
             f"{tier_instructions.get(access_tier, tier_instructions['other'])}"
             f"{discord_skill_hints}"
         )
-    except Exception as _tw_exc:
-        print(f"  [task-write] FAILED for @{username} in #{channel_name} "
-              f"(tier={access_tier}, msg={message.id}): "
-              f"{type(_tw_exc).__name__}: {_tw_exc}", flush=True)
+
+    if not _write_task_file(task_file, _build_task_content, username, channel_name,
+                            access_tier, message.id):
         return
-    print(f"  [task-write] wrote {task_file.name} "
-          f"(@{username}, #{channel_name}, tier={access_tier})", flush=True)
     pending_replies[task_id] = message.channel
     pending_task_tiers[task_id] = access_tier
     # Observability: one inbound accepted-message event.

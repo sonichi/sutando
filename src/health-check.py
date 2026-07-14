@@ -891,6 +891,8 @@ def check_memory() -> dict:
     name = "memory"
     swap_warn_mb = int(os.environ.get("SUTANDO_MEMORY_SWAP_WARN_MB", "512"))
     swap_fail_mb = int(os.environ.get("SUTANDO_MEMORY_SWAP_FAIL_MB", "2048"))
+    free_fail_pct = int(os.environ.get("SUTANDO_MEMORY_FREE_FAIL_PCT", "15"))
+    free_warn_pct = int(os.environ.get("SUTANDO_MEMORY_FREE_WARN_PCT", "25"))
     import re as _re
 
     try:
@@ -912,11 +914,48 @@ def check_memory() -> dict:
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         pass
 
-    # Swap-in-use is sticky on macOS: pages swapped out during a past pressure
-    # event stay counted until touched again, so high swap with a *normal*
-    # kernel pressure level is residue, not active thrash. Fail only when the
-    # kernel itself signals pressure; swap corroborates, it doesn't convict.
-    if level >= 4 or (level >= 2 and swap_used_mb >= swap_fail_mb):
+    # System-wide free memory % is the honest OOM-proximity signal — the one
+    # this check's own history keeps pointing at. Kernel pressure level is a
+    # transient sample that can read 2 ("warning") for a single tick while free
+    # memory is abundant, and swap-in-use is sticky (pages swapped out during a
+    # *past* event stay counted until touched again). Convicting on those two
+    # alone produced recurring false FAILs — e.g. "level 2, swap 5655M" while
+    # `memory_pressure` reported 47% free. So free% gets the deciding vote: a
+    # transient level-2 or sticky swap only convicts when free memory is
+    # actually low. A kernel-declared level-4 (critical) still fails outright.
+    # Issue #1485 follow-up.
+    free_pct = None
+    try:
+        mp = subprocess.run(
+            ["memory_pressure"], capture_output=True, text=True, timeout=5).stdout
+        fm = _re.search(r'free percentage:\s*(\d+)%', mp)
+        if fm:
+            free_pct = int(fm.group(1))
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+    # Kernel-declared critical — trust it regardless of free%.
+    if level >= 4:
+        return {"name": name, "status": "fail",
+                "detail": f"critical memory pressure (level {level}, swap {swap_used_mb:.0f}M in use)"}
+
+    if free_pct is not None:
+        # free% available → it is the deciding vote.
+        if free_pct < free_fail_pct and (level >= 2 or swap_used_mb >= swap_fail_mb):
+            return {"name": name, "status": "fail",
+                    "detail": f"critical memory pressure ({free_pct}% free, level {level}, swap {swap_used_mb:.0f}M in use)"}
+        if free_pct < free_warn_pct and (level >= 2 or swap_used_mb >= swap_warn_mb):
+            return {"name": name, "status": "warn",
+                    "detail": f"memory pressure elevated ({free_pct}% free, level {level}, swap {swap_used_mb:.0f}M in use)"}
+        if swap_used_mb >= swap_warn_mb:
+            return {"name": name, "status": "ok",
+                    "detail": f"{free_pct}% free (healthy); swap {swap_used_mb:.0f}M is residue from a past pressure event, not active pressure (level {level})"}
+        return {"name": name, "status": "ok",
+                "detail": f"pressure normal ({free_pct}% free, level {level}, swap {swap_used_mb:.0f}M)"}
+
+    # free% unavailable (non-macOS, tool missing, or parse failure) → fall back
+    # to the level+swap heuristic (prior behavior; never blind the check).
+    if level >= 2 and swap_used_mb >= swap_fail_mb:
         return {"name": name, "status": "fail",
                 "detail": f"critical memory pressure (level {level}, swap {swap_used_mb:.0f}M in use)"}
     if level >= 2:
@@ -978,6 +1017,56 @@ def check_core_proactive_loop(threshold_sec: int = 600) -> dict:
     return {"name": name, "status": "ok", "detail": f"running ({age}s ago)"}
 
 
+def check_gateway_bridge() -> "dict | None":
+    """Health of the ag2.space gateway bridge (remote-gateway-bridge.py) — the
+    process that carries MOBILE-app messages from the cloud gateway down to the
+    local core (and results back up).
+
+    Returns None when the mobile gateway is NOT configured (no REMOTE_TASK_TOKEN /
+    AG2_REMOTE_TOKEN in env or channels/ag2space/.env) — a Sutando-only user
+    without the mobile gateway never sees this check. Otherwise: ``warn`` when
+    configured-but-not-running (with the delivery impact spelled out) or on a
+    duplicate-process pileup, ``ok`` when a single instance is running.
+
+    Added after a 3-day SILENT outage (2026-07-10): the bridge died on Jul 7 and
+    nothing reported it, so mobile messages stranded in the cloud invisibly. This
+    check makes that state visible on the dashboard.
+    """
+    try:
+        gw_env = claude_home_path("channels", "ag2space", ".env")
+        configured = bool(os.environ.get("REMOTE_TASK_TOKEN") or os.environ.get("AG2_REMOTE_TOKEN"))
+        if not configured and gw_env.exists():
+            configured = any(
+                ln.startswith(("REMOTE_TASK_TOKEN=", "AG2_REMOTE_TOKEN="))
+                for ln in gw_env.read_text(errors="replace").splitlines()
+            )
+    except OSError:
+        configured = False
+    if not configured:
+        return None
+    try:
+        gw = subprocess.run(
+            ["/usr/bin/pgrep", "-f", r"remote-gateway-bridge\.py$"],
+            capture_output=True, text=True,
+        )
+        pids = [p for p in gw.stdout.strip().split("\n") if p] if gw.returncode == 0 else []
+    except Exception:
+        pids = []
+    if not pids:
+        return {
+            "name": "gateway-bridge",
+            "status": "warn",
+            "detail": "configured but NOT running — ag2.space mobile messages will not be delivered",
+        }
+    if len(pids) > 1:
+        return {
+            "name": "gateway-bridge",
+            "status": "warn",
+            "detail": f"multiple processes ({len(pids)} PIDs: {','.join(pids)})",
+        }
+    return {"name": "gateway-bridge", "status": "ok", "detail": "running"}
+
+
 def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> dict:
     """Detect a task-queue pileup — tasks/ directory growing without
     being drained. Independent of which watcher / loop is dying: the queue
@@ -1032,6 +1121,31 @@ def check_notes_split_brain() -> "dict | None":
             f"Overlap: {examples}{tail}"
         ),
     }
+
+
+def _should_skip_bridge(channel_name: str, env_path: Path) -> bool:
+    """True if SKIP_<CHANNEL>=1 is set in the main .env or as an env var.
+
+    Lets operators silence a bridge on a specific host without removing its
+    token from the shared config (issue #1916). The flag is per-host: set it
+    in the main .env on the host where the bridge should NOT run. Both the
+    health-check (no warn) and --fix (no restart) honor it.
+    """
+    var = f"SKIP_{channel_name.upper()}"
+    if os.environ.get(var) == "1":
+        return True
+    if env_path.exists():
+        try:
+            for line in env_path.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                key, sep, val = line.partition("=")
+                if sep and key.strip() == var and val.strip().strip('"').strip("'") == "1":
+                    return True
+        except Exception:
+            pass
+    return False
 
 
 def sutando_app_hotkey_detail(workspace_dir) -> str:
@@ -1254,11 +1368,11 @@ def run_all_checks() -> list[dict]:
                         checks.append(ngrok_c)
 
     # Messaging bridges (optional — only check if configured and not skipped)
-    skip_telegram = (env_path.exists() and "SKIP_TELEGRAM=1" in env_path.read_text()) or os.environ.get("SKIP_TELEGRAM") == "1"
     channels_dir = claude_home_path("channels")
-    for name, proc_name in [("telegram-bridge", "telegram-bridge"), ("discord-bridge", "discord-bridge")]:
+    for name, proc_name in [("telegram-bridge", "telegram-bridge"), ("discord-bridge", "discord-bridge"),
+                            ("slack-bridge", "slack-bridge")]:
         channel_name = name.replace("-bridge", "")
-        if channel_name == "telegram" and skip_telegram:
+        if _should_skip_bridge(channel_name, env_path):
             continue
         env_file = channels_dir / channel_name / ".env"
         access_file = channels_dir / channel_name / "access.json"
@@ -1400,6 +1514,12 @@ def run_all_checks() -> list[dict]:
                 pass
 
         checks.append({"name": name, "status": status, "detail": detail})
+
+    # ag2.space gateway bridge (mobile path); check_gateway_bridge() returns
+    # None when the gateway isn't configured, so filter it out. (The function's
+    # branches are unit-tested in tests/health-check-gateway-bridge.test.py; this
+    # call site is exercised by the running health check, not that unit test.)
+    checks += [c for c in (check_gateway_bridge(),) if c is not None]  # pragma: no cover
 
     # (External plugin probes moved out with their plugins in #1427 round ④ —
     # a plugin manifest declares its own health_probe; the host checks host
@@ -1567,19 +1687,22 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
         # Same failure set, within cooldown — skip.
         return
 
-    # Build task content.
+    # Build task content. task: is placed LAST (after trusted metadata fields)
+    # so that the multi-line bullet body cannot shadow source/access_tier/priority
+    # even in the theoretical case where check detail strings ever carry
+    # external data. Consistent with the bridge field-order convention.
     ts_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-    bullet_lines = [f"- {c['name']}: {c['status']} ({c['detail']})" for c in failures]
+    bullet_str = "\n".join(f"- {c['name']}: {c['status']} ({c['detail']})" for c in failures)
     body = (
         f"id: task-health-{now_ms}\n"
         f"timestamp: {ts_iso}\n"
-        f"task: Health check found issues. Decide whether to restart, DM owner, or treat as transient:\n"
-        + "\n".join(bullet_lines) + "\n"
         f"source: health-check\n"
         f"interaction_type: system_event\n"
         f"user_id: health-check\n"
         f"access_tier: owner\n"
         f"priority: low\n"
+        f"task: Health check found issues. Decide whether to restart, DM owner, or treat as transient:\n"
+        f"{bullet_str}\n"
     )
     task_path = tasks_dir / f"task-health-{now_ms}.txt"
     task_path.write_text(body)
@@ -2305,7 +2428,7 @@ def main():
                 if c["name"].startswith("com.sutando."):
                     result = fix_launchd(c["name"])
                     print(f"  {c['name']}: {result}")
-                elif c["name"] in ("telegram-bridge", "discord-bridge"):
+                elif c["name"] in ("telegram-bridge", "discord-bridge", "slack-bridge"):  # pragma: no cover - --fix restart path spawns real subprocesses; not unit-tested
                     # LoginFailure means the token is bad — restarting won't help
                     # and would create a duplicate alongside the launchd-managed one.
                     if "LoginFailure" in c.get("detail", "") or "token invalid" in c.get("detail", ""):

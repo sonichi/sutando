@@ -103,6 +103,7 @@ PORT = 7843
 # /avatar and /stand-identity endpoints prefer the per-machine private dir
 # over the public workspace.
 from util_paths import personal_path  # noqa: E402
+from task_body_guard import confine_user_content  # noqa: E402
 
 # Simple token auth — set SUTANDO_API_TOKEN in .env for remote access security
 API_TOKEN = os.environ.get("SUTANDO_API_TOKEN", "")
@@ -353,6 +354,11 @@ def fire_webhook(task_id: str, result: str) -> None:
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
+    # Drop connections that go silent (e.g. a client that opens TCP and never
+    # sends a request line). Without this, readline() in handle_one_request
+    # blocks forever holding a server thread. Same guard as dashboard (#1709).
+    timeout = 30
+
     def log_message(self, format, *args):
         pass
 
@@ -669,16 +675,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         caller = form_data.get("From", ["unknown"])[0]
         call_sid = form_data.get("CallSid", [""])[0]
 
-        # Create a task from the incoming call
+        # Create a task from the incoming call.
+        # source:/from:/call_sid: precede task: so the (Twilio-supplied) caller
+        # string can't forge those fields even if it contains newlines.
+        # confine_user_content() normalises any \r\n/\r and ZWSP-prefixes
+        # header-key lookalike lines — belt-and-suspenders alongside field order.
         task_id = f"task-{int(datetime.now().timestamp() * 1000)}"
+        safe_caller = confine_user_content(caller)
         task_content = (
             f"id: {task_id}\n"
             f"timestamp: {datetime.now().isoformat()}\n"
-            f"task: Incoming phone call from {caller}\n"
             f"source: twilio_voice\n"
             f"interaction_type: system_event\n"
-            f"from: {caller}\n"
+            f"access_tier: owner\n"
+            f"from: {safe_caller}\n"
             f"call_sid: {call_sid}\n"
+            f"task: Incoming phone call from {safe_caller}\n"
         )
         (TASK_DIR / f"{task_id}.txt").write_text(task_content)
 
@@ -699,15 +711,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         sender = form_data.get("From", ["unknown"])[0]
         body = form_data.get("Body", [""])[0]
 
-        # Create a task from the SMS
+        # Create a task from the SMS. task: is last so newlines in body
+        # cannot forge the source:/from: fields that precede it. Body is
+        # also run through confine_user_content to defang any ===fence===
+        # or header-key line (the fence check is independent of field order).
         task_id = f"task-{int(datetime.now().timestamp() * 1000)}"
+        safe_sender = confine_user_content(sender)
         task_content = (
             f"id: {task_id}\n"
             f"timestamp: {datetime.now().isoformat()}\n"
-            f"task: SMS from {sender}: {body}\n"
             f"source: twilio_sms\n"
             f"interaction_type: message\n"
-            f"from: {sender}\n"
+            f"access_tier: owner\n"
+            f"from: {safe_sender}\n"
+            f"task: SMS from {safe_sender}: {confine_user_content(body)}\n"
         )
         (TASK_DIR / f"{task_id}.txt").write_text(task_content)
 
@@ -725,13 +742,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         caller = form_data.get("From", ["unknown"])[0]
         if text:
             task_id = f"task-{int(datetime.now().timestamp() * 1000)}"
+            safe_caller = confine_user_content(caller)
             task_content = (
                 f"id: {task_id}\n"
                 f"timestamp: {datetime.now().isoformat()}\n"
-                f"task: Voicemail from {caller}: {text}\n"
                 f"source: twilio_voicemail\n"
                 f"interaction_type: message\n"
-                f"from: {caller}\n"
+                f"access_tier: owner\n"
+                f"from: {safe_caller}\n"
+                f"task: Voicemail from {safe_caller}: {confine_user_content(text)}\n"
             )
             (TASK_DIR / f"{task_id}.txt").write_text(task_content)
         self.send_json(200, {"ok": True})
@@ -894,7 +913,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                 os.path.join(task_dir_real, f"answer-{safe_qid}-{ts}.txt")
                             )
                             if task_file_str.startswith(task_dir_real + os.sep):
-                                Path(task_file_str).write_text(f"User answered {safe_qid}: {answer}")
+                                Path(task_file_str).write_text(f"User answered {safe_qid}: {confine_user_content(answer)}")
                         self.send_json(200, {"ok": True, "id": qid, "answer": answer})
                     else:
                         self.send_json(404, {"error": f"question {qid} not found or already answered"})
@@ -968,8 +987,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f"timestamp: {datetime.now().isoformat()}\n"
             f"source: api\n"
             f"interaction_type: tool_initiated\n"
+            f"access_tier: owner\n"
             f"from: {from_agent}\n"
-            f"task: {task}\n"
+            f"task: {confine_user_content(task)}\n"
         )
         (TASK_DIR / f"{task_id}.txt").write_text(task_content)
 
@@ -1044,7 +1064,12 @@ def _resolve_local_ip() -> str:
 
 if __name__ == "__main__":
     bind = os.environ.get("AGENT_API_BIND", "127.0.0.1")
-    server = http.server.HTTPServer((bind, PORT), Handler)
+    # ThreadingHTTPServer: the single-threaded HTTPServer wedged whenever one
+    # client stalled mid-request or a handler ran a slow subprocess/urlopen —
+    # every later request hung on a port that still looked open to startup.sh's
+    # lsof guard, so nothing restarted it (2026-07-04 incident; same fix as
+    # dashboard, #1709).
+    server = http.server.ThreadingHTTPServer((bind, PORT), Handler)
     local_ip = _resolve_local_ip()
     print(f"Sutando Agent API → http://{bind}:{PORT}")
     print(f"  POST /task  — submit a task")

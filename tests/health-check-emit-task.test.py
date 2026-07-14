@@ -290,6 +290,46 @@ def case_k_emit_proceeds_when_core_dead() -> list[str]:
     return fails
 
 
+def case_l_task_field_is_last() -> list[str]:
+    """task: must appear AFTER source/user_id/access_tier/priority in the
+    task file so that the multi-line bullet body can't shadow trusted fields
+    above it. Defense-in-depth consistent with the bridge field-order
+    convention (health-check content is trusted, but external data such as
+    hostnames or service error messages could flow through check details)."""
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        state_file = td / "state" / "hla.json"
+        tasks_dir = td / "tasks"
+        hc.emit_task_for_failures(
+            [{"name": "voice-agent", "status": "stale", "detail": "process old"},
+             {"name": "memory", "status": "fail", "detail": "swap 8G"}],
+            state_file=state_file, tasks_dir=tasks_dir,
+        )
+        files = list(tasks_dir.glob("task-health-*.txt"))
+        if not files:
+            fails.append("l) no task file written — cannot check field order")
+            return fails
+        body = files[0].read_text()
+        keys = []
+        for line in body.splitlines():
+            colon = line.find(":")
+            if colon > 0 and " " not in line[:colon]:
+                keys.append(line[:colon])
+        for sentinel in ("source", "user_id", "access_tier", "priority"):
+            if sentinel not in keys:
+                continue
+            if "task" not in keys:
+                fails.append(f"l) task: key missing from task file")
+                break
+            if keys.index(sentinel) > keys.index("task"):
+                fails.append(
+                    f"l) field-order broken: {sentinel} (pos {keys.index(sentinel)}) "
+                    f"comes AFTER task: (pos {keys.index('task')})"
+                )
+    return fails
+
+
 def main() -> int:
     cases = [
         ("a", case_a_empty_failures_no_file),
@@ -303,6 +343,7 @@ def main() -> int:
         ("i", case_i_any_core_alive_returns_false_for_stale_file),
         ("j", lambda: case_j_emit_skipped_when_core_alive(None)),
         ("k", case_k_emit_proceeds_when_core_dead),
+        ("l", case_l_task_field_is_last),
     ]
     all_failures = []
     for label, fn in cases:
