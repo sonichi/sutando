@@ -155,15 +155,52 @@ def run_cycle(signal, state_file, *, macos=True, source="", channel="", dry_run=
     return msg
 
 
+# Surfaces task-progress notify.py can actually DELIVER to. Other values that
+# land in last-owner-activity.json ("voice", "github-commits", …) are activity
+# signals, not deliverable channels — never route an escalation to them.
+_DELIVERABLE_SURFACES = {"discord", "slack", "telegram", "ag2space"}
+
+
+def resolve_active_target(activity_path):
+    """Read state/last-owner-activity.json → (source, channel_id) for the owner's
+    MOST-RECENTLY-ACTIVE channel, so a hard blocker reaches them where they are.
+
+    Returns ("", "") — meaning "no channel target, macOS-only" — when the file is
+    missing/malformed, the active surface isn't a deliverable channel, or no
+    routable `channel_id` was recorded (older activity writers, or a non-message
+    surface). Degrading to macOS-only is always safe; we never guess a channel.
+    """
+    try:
+        with open(activity_path) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return "", ""
+    except (OSError, ValueError):
+        return "", ""
+    source = str(data.get("channel", "")).strip()
+    channel = str(data.get("channel_id", "")).strip()
+    if source in _DELIVERABLE_SURFACES and channel:
+        return source, channel
+    return "", ""
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Escalate a hard-blocked core to the owner.")
     ap.add_argument("--signal", required=True, help="path to core-supervisor.json")
     ap.add_argument("--state-file", default="", help="debounce state (last escalated hash)")
     ap.add_argument("--notify-source", default="", help="task-progress source (discord/slack/telegram)")
     ap.add_argument("--notify-channel", default="", help="channel/chat id for --notify-source")
+    ap.add_argument("--active-from", default="",
+                    help="path to state/last-owner-activity.json — auto-target the owner's "
+                         "active channel when --notify-source/--notify-channel aren't given")
     ap.add_argument("--no-macos", action="store_true", help="suppress the macOS notification")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args(argv)
+
+    # Explicit --notify-* wins; else auto-resolve the owner's active channel.
+    source, channel = a.notify_source, a.notify_channel
+    if not (source and channel) and a.active_from:
+        source, channel = resolve_active_target(a.active_from)
 
     try:
         with open(a.signal) as f:
@@ -174,7 +211,7 @@ def main(argv=None):
         return 0  # no signal yet → nothing to escalate (degrade quietly)
 
     msg = run_cycle(signal, a.state_file, macos=not a.no_macos,
-                    source=a.notify_source, channel=a.notify_channel, dry_run=a.dry_run)
+                    source=source, channel=channel, dry_run=a.dry_run)
     if msg:
         print(("DRY-RUN " if a.dry_run else "escalated: ") + msg)
         return 0

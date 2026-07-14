@@ -151,7 +151,7 @@ def _is_path_sendable(fpath: str) -> bool:
     return False
 
 
-def write_owner_activity(channel: str, summary: str) -> None:
+def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
     """Record owner activity — same schema as src/discord-bridge.py."""
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -160,6 +160,8 @@ def write_owner_activity(channel: str, summary: str) -> None:
             "channel": channel,
             "summary": summary[:80],
         }
+        if channel_id:
+            payload["channel_id"] = str(channel_id)
         tmp = OWNER_ACTIVITY_FILE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload))
         tmp.rename(OWNER_ACTIVITY_FILE)
@@ -462,7 +464,7 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     if not text and not attachment_note:
         return None
 
-    write_owner_activity("slack", text or attachment_note)
+    write_owner_activity("slack", text or attachment_note, channel_id=event.get("channel"))
 
     channel = event.get("channel", "")
     # Reply in-thread for channel @mentions, top-level for DMs. parens for

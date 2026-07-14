@@ -25,6 +25,7 @@ should_escalate = _mod.should_escalate
 compose_message = _mod.compose_message
 run_cycle = _mod.run_cycle
 main = _mod.main
+resolve_active_target = _mod.resolve_active_target
 
 _LOGIN = {"state": "blocked-human", "detail": "awaiting user: login",
           "prompt": "Login\nSelect login method:\n  1. Claude account", "kind": "login"}
@@ -167,6 +168,46 @@ class TestRunCycleAndCli(unittest.TestCase):
         kinds = [c[0] for c in calls]
         self.assertIn("macos", kinds)
         self.assertIn("chan", kinds)
+
+
+class TestResolveActiveTarget(unittest.TestCase):
+    """--active-from: auto-route to the owner's most-recently-active channel,
+    degrading to macOS-only ("", "") whenever we can't route confidently."""
+
+    def _write(self, td, obj):
+        p = os.path.join(td, "last-owner-activity.json")
+        with open(p, "w") as f:
+            f.write(obj if isinstance(obj, str) else json.dumps(obj))
+        return p
+
+    def test_deliverable_surface_with_channel_id_routes(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = self._write(td, {"channel": "discord", "channel_id": "12345", "summary": "hi"})
+            self.assertEqual(resolve_active_target(p), ("discord", "12345"))
+
+    def test_ag2space_room_routes(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = self._write(td, {"channel": "ag2space", "channel_id": "!room:ag2.space"})
+            self.assertEqual(resolve_active_target(p), ("ag2space", "!room:ag2.space"))
+
+    def test_deliverable_but_no_channel_id_is_macos_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = self._write(td, {"channel": "slack", "summary": "no id recorded"})
+            self.assertEqual(resolve_active_target(p), ("", ""))
+
+    def test_non_deliverable_surface_is_macos_only(self):
+        # "voice"/"github-commits" are activity signals, not deliverable channels.
+        with tempfile.TemporaryDirectory() as td:
+            p = self._write(td, {"channel": "voice", "channel_id": "x"})
+            self.assertEqual(resolve_active_target(p), ("", ""))
+
+    def test_missing_file_is_macos_only(self):
+        self.assertEqual(resolve_active_target("/no/such/activity.json"), ("", ""))
+
+    def test_malformed_and_nondict_are_macos_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(resolve_active_target(self._write(td, "{bad json")), ("", ""))
+            self.assertEqual(resolve_active_target(self._write(td, [1, 2, 3])), ("", ""))
 
 
 if __name__ == "__main__":

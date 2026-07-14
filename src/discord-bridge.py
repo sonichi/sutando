@@ -298,13 +298,15 @@ def _split_file_markers(text: str) -> tuple[str, list[str]]:
 _is_path_sendable = _is_path_sendable_shared
 
 
-def write_owner_activity(channel: str, summary: str) -> None:
+def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
     """Record that the owner was active on <channel> right now.
 
     Writes atomically via tmp-then-rename so a concurrent reader never sees
-    a partial file. Schema: {"ts": EPOCH, "channel": str, "summary": str}.
-    Read by the proactive-loop status-aware-pivot rule — see
-    `notes/team-proposal-coord-loop-2026-04-20.md`.
+    a partial file. Schema: {"ts": EPOCH, "channel": str, "summary": str,
+    "channel_id"?: str}. `channel_id` (the routable id of the exact channel/
+    chat the owner messaged from) lets the core-supervisor relay escalate a
+    hard-blocked core back to where the owner actually is. Read by the
+    proactive-loop status-aware-pivot rule + core-supervisor-relay --active-from.
     """
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -313,6 +315,8 @@ def write_owner_activity(channel: str, summary: str) -> None:
             "channel": channel,
             "summary": summary[:80],
         }
+        if channel_id:
+            payload["channel_id"] = str(channel_id)
         tmp = OWNER_ACTIVITY_FILE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload))
         tmp.rename(OWNER_ACTIVITY_FILE)
@@ -2883,7 +2887,7 @@ async def _handle_discord_message(message, force=False):
     if sender_id in allowed:
         access_tier = "owner"
         # Record owner activity for status-aware-pivot in proactive loop
-        write_owner_activity("discord", text)
+        write_owner_activity("discord", text, channel_id=getattr(message.channel, "id", None))
     else:
         # Check if team member (from channel allowlists)
         try:

@@ -166,7 +166,7 @@ def extract_forward_note(msg: dict) -> str:
     return ""
 
 
-def write_owner_activity(channel: str, summary: str) -> None:
+def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
     """Record owner activity — see src/discord-bridge.py for schema."""
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -175,6 +175,8 @@ def write_owner_activity(channel: str, summary: str) -> None:
             "channel": channel,
             "summary": summary[:80],
         }
+        if channel_id:
+            payload["channel_id"] = str(channel_id)
         tmp = OWNER_ACTIVITY_FILE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload))
         tmp.rename(OWNER_ACTIVITY_FILE)
@@ -660,7 +662,7 @@ def main():
                     continue
 
                 # Record owner activity for status-aware-pivot
-                write_owner_activity("telegram", text)
+                write_owner_activity("telegram", text, channel_id=chat_id)
 
                 # Handle attachments (photos, documents, voice)
                 attachment_note = ""
