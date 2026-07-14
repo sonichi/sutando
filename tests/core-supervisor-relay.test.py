@@ -169,6 +169,28 @@ class TestRunCycleAndCli(unittest.TestCase):
         self.assertIn("macos", kinds)
         self.assertIn("chan", kinds)
 
+    def test_cli_active_from_routes_to_owner_channel(self):
+        # Covers main()'s --active-from branch: with no explicit --notify-*, the
+        # owner's active channel is resolved from last-owner-activity.json and the
+        # escalation routes there.
+        calls = []
+        orig_c = _mod._channel_notify
+        _mod._channel_notify = lambda m, s, c: calls.append((s, c))
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                sig = os.path.join(td, "core-supervisor.json")
+                with open(sig, "w") as f:
+                    json.dump(_LOGIN, f)
+                act = os.path.join(td, "last-owner-activity.json")
+                with open(act, "w") as f:
+                    json.dump({"channel": "discord", "channel_id": "42"}, f)
+                rc = main(["--signal", sig, "--active-from", act, "--no-macos",
+                           "--state-file", os.path.join(td, "s.state")])
+                self.assertEqual(rc, 0)
+        finally:
+            _mod._channel_notify = orig_c
+        self.assertEqual(calls, [("discord", "42")])
+
 
 class TestResolveActiveTarget(unittest.TestCase):
     """--active-from: auto-route to the owner's most-recently-active channel,
