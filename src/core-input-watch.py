@@ -276,7 +276,7 @@ def main():
             last_sig = sig
         if a.once:
             return
-        time.sleep(a.interval)
+        time.sleep(a.interval)  # pragma: no cover - daemon heartbeat (tests use --once)
 
 
 if __name__ == "__main__":

@@ -64,6 +64,14 @@ class TestClassify(unittest.TestCase):
     def test_empty_does_not_flag(self):
         self.assertIsNone(classify(""))
 
+    def test_idle_with_await_token_still_does_not_flag(self):
+        # The idle prompt can carry an await-hint-like token ("to accept") without
+        # being a real gate — the _IDLE guard must still suppress it (never nag the
+        # user on the ready-for-a-task prompt).
+        idle_hint = ("  ⏵⏵ bypass permissions on (shift+tab to cycle) · "
+                     "press tab to accept · ← for agents")
+        self.assertIsNone(classify(idle_hint))
+
     def test_unforeseen_prompt_surfaces_as_unknown(self):
         # No matching signature, but an input affordance is present and it is NOT
         # the idle prompt → must surface as "unknown" (owner's no-dead-end rule),
@@ -170,6 +178,41 @@ class TestMainOnce(unittest.TestCase):
                 sig = json.load(f)
         self.assertEqual(sig["state"], "crashed")
         self.assertEqual(sig["session"], "sutando-core")
+
+    def test_once_blocked_prompt_debounces_on_first_tick(self):
+        """A fresh gate with --stable 2 must NOT escalate on the first tick — the
+        debounce holds it as 'running (settling)' until the prompt persists. Drives
+        the settling branch + the --app-data gateway probe in-process."""
+        import sys
+        import tempfile
+
+        class _FakeRH:  # stand in for runtime-health: session alive + working
+            TMUX_SOCKET = None
+            SESSION = None
+
+            def derive(self):
+                return {"health": "working"}
+
+        orig_cap, orig_load = _mod.capture, _mod._load_runtime_health
+        _mod.capture = lambda sock, sess: _BYPASS          # a recognized gate
+        _mod._load_runtime_health = lambda: _FakeRH()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                out = os.path.join(td, "state", "core-supervisor.json")
+                argv = ["core-input-watch.py", "--socket", "/x", "--out", out,
+                        "--app-data", td, "--stable", "2", "--once"]
+                old = sys.argv
+                sys.argv = argv
+                try:
+                    main()
+                finally:
+                    sys.argv = old
+                with open(out) as f:
+                    sig = json.load(f)
+        finally:
+            _mod.capture, _mod._load_runtime_health = orig_cap, orig_load
+        # stable=2, first tick → prompt seen once (< 2) → debounced to running.
+        self.assertEqual(sig["state"], "running")
 
 
 if __name__ == "__main__":
