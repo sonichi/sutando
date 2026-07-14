@@ -56,7 +56,7 @@ _LOGGED_OUT = re.compile(r"Not logged in|Please run /login|Invalid API key", re.
 
 # Gates that need a human (can't be auto-answered): login + any unrecognized
 # selection/permission. The rest (trust/bypass/press-enter) are known-safe.
-_HUMAN_GATES = {"login", "selection", "permission"}
+_HUMAN_GATES = {"login", "selection", "permission", "unknown"}
 
 
 def classify(pane: str):
@@ -69,7 +69,12 @@ def classify(pane: str):
     for kind, rx in _SIGNATURES:
         if rx.search(tail):
             return kind, tail
-    return None
+    # No specific signature — but an input affordance IS present and this is NOT
+    # the idle prompt. That means an UNFORESEEN prompt. Surface it rather than
+    # leave a silent dead-end (owner's no-dead-end requirement 2026-07-14): we
+    # cannot enumerate every possible TUI question, so ANY await-affordance that
+    # isn't the known idle-ready state is treated as needing the user.
+    return "unknown", tail
 
 
 def compose_state(pane, core_alive, gateway_alive, progressing):
@@ -95,7 +100,11 @@ def compose_state(pane, core_alive, gateway_alive, progressing):
         return "idle-ready", "ready for a task", None, None
     if progressing:
         return "running", "actively processing", None, None
-    return "hung", "core alive but not progressing and not at a known prompt", None, None
+    # Stalled: alive, not idle, no recognized affordance, not progressing. Could be
+    # an unforeseen prompt with no await-hint we matched. Carry the pane so the UI
+    # shows WHAT it's stuck on — never a silent dead-end.
+    tail = "\n".join([ln for ln in (pane or "").splitlines() if ln.strip()][-14:])
+    return "hung", "core alive but stalled (no progress, no recognized prompt)", tail or None, "unknown"
 
 
 # ---- Liveness signals (cheap, pgrep/tmux-based). --------------------------- #

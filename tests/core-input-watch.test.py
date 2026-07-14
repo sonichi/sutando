@@ -61,6 +61,15 @@ class TestClassify(unittest.TestCase):
     def test_empty_does_not_flag(self):
         self.assertIsNone(classify(""))
 
+    def test_unforeseen_prompt_surfaces_as_unknown(self):
+        # No matching signature, but an input affordance is present and it is NOT
+        # the idle prompt → must surface as "unknown" (owner's no-dead-end rule),
+        # never fall through silently.
+        novel = "  Overwrite the existing config file?\n  (Enter to confirm · Esc to cancel)"
+        hit = classify(novel)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[0], "unknown")
+
 
 class TestComposeState(unittest.TestCase):
     def test_crashed_when_core_dead(self):
