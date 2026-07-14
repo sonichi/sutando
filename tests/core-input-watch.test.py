@@ -24,6 +24,7 @@ _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 classify = _mod.classify
 compose_state = _mod.compose_state
+auto_answer = _mod.auto_answer
 
 _BYPASS = ("  in Bypass Permissions mode.\n  https://code.claude.com/docs/en/security\n"
            "  ❯ 1. No, exit\n    2. Yes, I accept\n  Enter to confirm · Esc to cancel")
@@ -107,6 +108,30 @@ class TestComposeState(unittest.TestCase):
     def test_hung_when_stalled_not_prompt_not_idle(self):
         st, *_ = compose_state(_WORKING, True, True, progressing=False)
         self.assertEqual(st, "hung")
+
+
+class TestAutoAnswer(unittest.TestCase):
+    """M4 decision safety: only strictly-safe gates auto-answer; all else escalates."""
+
+    def test_press_enter_is_the_only_auto_answer(self):
+        self.assertEqual(auto_answer("press-enter"), "Enter")
+
+    def test_login_never_auto_answered(self):
+        self.assertIsNone(auto_answer("login"))
+
+    def test_unknown_never_auto_answered(self):
+        # The no-dead-end catch-all must escalate, never guess a keystroke.
+        self.assertIsNone(auto_answer("unknown"))
+
+    def test_selection_and_permission_never_auto_answered(self):
+        self.assertIsNone(auto_answer("selection"))
+        self.assertIsNone(auto_answer("permission"))
+
+    def test_trust_and_bypass_escalate_not_auto_accepted(self):
+        # Handled by PREVENT seeds; if they surface at runtime we ESCALATE — never
+        # auto-accept a trust / dangerous-mode prompt without explicit opt-in.
+        self.assertIsNone(auto_answer("folder-trust"))
+        self.assertIsNone(auto_answer("bypass-permissions"))
 
 
 if __name__ == "__main__":

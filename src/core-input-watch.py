@@ -58,6 +58,35 @@ _LOGGED_OUT = re.compile(r"Not logged in|Please run /login|Invalid API key", re.
 # selection/permission. The rest (trust/bypass/press-enter) are known-safe.
 _HUMAN_GATES = {"login", "selection", "permission", "unknown"}
 
+# --- M4 AUTO-ANSWER decision (Layer 2), PURE + report-only. -----------------
+# This returns WHICH keystroke would safely dismiss a gate; it does NOT send it —
+# a separate, opt-in supervisor actor does that (kept OUT of the report-only
+# monitor loop). The allowlist is deliberately TINY and strictly non-destructive:
+# EVERYTHING not explicitly listed (every _HUMAN_GATE, every unknown/ambiguous
+# state) returns None → ESCALATE. Expanding it is an owner-reviewed change.
+_AUTO_ANSWER = {
+    # "Press Enter to continue…" — purely informational (e.g. the post-login
+    # confirmation). Pressing Enter only proceeds; it grants nothing and is not
+    # destructive. The one gate safe to auto-dismiss.
+    "press-enter": "Enter",
+}
+
+
+def auto_answer(kind):
+    """M4 decision: the safe keystroke to auto-dismiss `kind`, or None → ESCALATE.
+
+    SAFETY INVARIANT: only strictly non-destructive, capability-granting-nothing
+    gates are answerable. A human gate (login/selection/permission/unknown) or any
+    kind not in the allowlist ALWAYS returns None — the supervisor escalates,
+    never guesses. Notably folder-trust + bypass-permissions are handled by the
+    PREVENT seeds; if they ever surface at runtime they ESCALATE — we never
+    auto-accept a trust / dangerous-mode prompt without the operator's explicit
+    per-install opt-in.
+    """
+    if kind in _HUMAN_GATES:
+        return None
+    return _AUTO_ANSWER.get(kind)
+
 
 def classify(pane: str):
     """Return (kind, excerpt) if the pane is awaiting user input, else None."""
