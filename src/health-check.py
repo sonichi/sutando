@@ -1017,6 +1017,43 @@ def check_core_proactive_loop(threshold_sec: int = 600) -> dict:
     return {"name": name, "status": "ok", "detail": f"running ({age}s ago)"}
 
 
+def check_core_supervisor() -> dict:
+    """Surface the core-supervisor (Agent Shepherd M1) state for OSS users.
+
+    The monitor (core-input-watch.py) writes state/core-supervisor.json with
+    the core's supervised state. The desktop app renders this as an "Action
+    needed" banner, but OSS users running bare Sutando have no such UI — so
+    surface it here, in the canonical OSS status tool, as the simple in-repo
+    consumer of the signal.
+
+    States needing the user (login / an unrecognized prompt) → warn with a
+    "needs you" line + the prompt excerpt; degraded states (crashed / hung /
+    gateway-down) → warn; healthy (running / idle-ready / blocked-known, the
+    last being pre-seeded/auto-answered) → ok. File missing → ok (monitor not
+    running, or a pre-supervisor install).
+    """
+    name = "core-supervisor"
+    sig_path = status_read_path("core-supervisor.json", WORKSPACE_DIR)
+    if not sig_path.exists():
+        return {"name": name, "status": "ok", "detail": "core-supervisor.json not yet written"}
+    try:
+        data = json.loads(sig_path.read_text())
+    except Exception as e:
+        return {"name": name, "status": "ok", "detail": f"core-supervisor.json unreadable: {str(e)[:60]}"}
+    state = data.get("state", "unknown")
+    detail = state
+    prompt = data.get("prompt")
+    if prompt:
+        detail = f"{state} — {str(prompt).splitlines()[0][:60]}"
+    needs_user = {"blocked-human", "logged-out"}
+    degraded = {"crashed", "hung", "gateway-down"}
+    if state in needs_user:
+        return {"name": name, "status": "warn", "detail": f"core needs you: {detail}"}
+    if state in degraded:
+        return {"name": name, "status": "warn", "detail": f"core degraded: {detail}"}
+    return {"name": name, "status": "ok", "detail": detail}
+
+
 def check_gateway_bridge() -> "dict | None":
     """Health of the ag2.space gateway bridge (remote-gateway-bridge.py) — the
     process that carries MOBILE-app messages from the cloud gateway down to the
@@ -1598,6 +1635,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_battery())
     checks.append(check_memory())
     checks.append(check_core_proactive_loop(threshold_sec=loop_stale_sec))
+    checks.append(check_core_supervisor())
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
 
     return checks
