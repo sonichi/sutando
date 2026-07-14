@@ -13,11 +13,29 @@ import json
 import os
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO / "src"))
+
+# discord-bridge does `discord.Client(...)` at module load — stub `discord` (and
+# seed its .env token) so the bridge imports for coverage even where discord.py
+# isn't installed. Mirrors tests/discord-bridge-file-markers.test.py.
+try:
+    import discord  # noqa: F401
+except ImportError:
+    _stub = types.ModuleType("discord")
+    _stub.Intents = type("Intents", (), {"default": staticmethod(lambda: type("I", (), {"message_content": False})())})
+    _stub.Client = type("Client", (), {"__init__": lambda self, **kw: None, "event": staticmethod(lambda fn: fn)})
+    _stub.File = type("File", (), {})
+    _stub.Message = type("Message", (), {})
+    sys.modules["discord"] = _stub
+_ch_env = Path.home() / ".claude" / "channels" / "discord" / ".env"
+if not _ch_env.exists():
+    _ch_env.parent.mkdir(parents=True, exist_ok=True)
+    _ch_env.write_text("DISCORD_BOT_TOKEN=test-token-not-real\n")
 
 # (module-name, filename, module-load env so the bridge doesn't exit on a
 # missing token). Tokens are placeholders — no API call fires; only
