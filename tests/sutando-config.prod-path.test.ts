@@ -17,7 +17,7 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 import { resetCacheForTests, resolveWorkspace } from '../src/sutando_config.js';
 
@@ -46,15 +46,18 @@ describe('sutando_config — production path (env-set, no TEST_MODE)', () => {
 	let savedEnv: string | undefined;
 	let savedNoColor: string | undefined;
 	let savedTestMode: string | undefined;
+	let savedEmbedderWs: string | undefined;
 	let repo: string;
 
 	beforeEach(() => {
 		savedEnv = process.env.SUTANDO_WORKSPACE;
 		savedNoColor = process.env.NO_COLOR;
 		savedTestMode = process.env.SUTANDO_TEST_MODE;
+		savedEmbedderWs = process.env.SUTANDO_DEFAULT_WORKSPACE;
 		delete process.env.SUTANDO_WORKSPACE;
 		delete process.env.NO_COLOR;
 		delete process.env.SUTANDO_TEST_MODE;
+		delete process.env.SUTANDO_DEFAULT_WORKSPACE;
 		resetCacheForTests();
 		repo = mkdtempSync(join(tmpdir(), 'sutando-prod-path-'));
 	});
@@ -67,7 +70,37 @@ describe('sutando_config — production path (env-set, no TEST_MODE)', () => {
 		else process.env.NO_COLOR = savedNoColor;
 		if (savedTestMode === undefined) delete process.env.SUTANDO_TEST_MODE;
 		else process.env.SUTANDO_TEST_MODE = savedTestMode;
+		if (savedEmbedderWs === undefined) delete process.env.SUTANDO_DEFAULT_WORKSPACE;
+		else process.env.SUTANDO_DEFAULT_WORKSPACE = savedEmbedderWs;
 		if (repo) rmSync(repo, { recursive: true, force: true });
+	});
+
+	// --- Embedder default workspace: $SUTANDO_DEFAULT_WORKSPACE ------------ //
+	// Parity with the Python twin (tests/sutando-config.prod-path.test.py).
+
+	it('$SUTANDO_DEFAULT_WORKSPACE set + no config → resolves to that FULL path', () => {
+		const ws = mkdtempSync(join(tmpdir(), 'sutando-embedder-ws-'));
+		try {
+			process.env.SUTANDO_DEFAULT_WORKSPACE = ws;
+			resetCacheForTests();
+			assert.equal(resolveWorkspace(repo), resolve(ws));
+		} finally {
+			rmSync(ws, { recursive: true, force: true });
+		}
+	});
+
+	it('explicit workspace.path config wins over $SUTANDO_DEFAULT_WORKSPACE', () => {
+		const emb = mkdtempSync(join(tmpdir(), 'sutando-embedder-ws-'));
+		const cfgWs = mkdtempSync(join(tmpdir(), 'sutando-cfgws-'));
+		try {
+			process.env.SUTANDO_DEFAULT_WORKSPACE = emb;
+			writeFileSync(join(repo, 'sutando.config.local.json'), JSON.stringify({ workspace: { path: cfgWs } }));
+			resetCacheForTests();
+			assert.equal(resolveWorkspace(repo), resolve(cfgWs));
+		} finally {
+			rmSync(emb, { recursive: true, force: true });
+			rmSync(cfgWs, { recursive: true, force: true });
+		}
 	});
 
 	// --- B4: NO_COLOR honored --------------------------------------------- //

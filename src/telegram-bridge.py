@@ -49,6 +49,7 @@ try:
 except Exception:  # pragma: no cover — best-effort telemetry
     def _emit_channel(*_a, **_k):  # type: ignore
         return None
+import local_task_protocol  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path  # noqa: E402
@@ -672,11 +673,18 @@ def main():
 
                 # Handle attachments (photos, documents, voice)
                 attachment_note = ""
+                # Structured refs (interaction-model 4D, step 1.5), accumulated
+                # alongside the legacy [*attached:] body line — dual-write.
+                attachment_refs: list = []  # pragma: no cover
                 if "photo" in msg:
                     file_id = msg["photo"][-1]["file_id"]  # largest size
                     local_path = download_file(file_id, "photo")
                     if local_path:
                         attachment_note = f"\n[Photo attached: {local_path}]"
+                        attachment_refs.append(local_task_protocol.AttachmentRef(  # pragma: no cover
+                            locator=local_path, mime="image/jpeg",
+                            filename=os.path.basename(local_path),
+                            size=(msg["photo"][-1].get("file_size", 0) or 0)))
                         # If voice is connected, also push the photo as a
                         # vision frame so Gemini sees it in-stream (in
                         # addition to the file-attached task pipeline).
@@ -690,10 +698,20 @@ def main():
                     local_path = download_file(file_id, fname)
                     if local_path:
                         attachment_note = f"\n[File attached: {local_path}]"
+                        attachment_refs.append(local_task_protocol.AttachmentRef(  # pragma: no cover
+                            locator=local_path,
+                            mime=(msg["document"].get("mime_type", "") or ""),
+                            filename=(fname or os.path.basename(local_path)),
+                            size=(msg["document"].get("file_size", 0) or 0)))
                 if "voice" in msg:
                     file_id = msg["voice"]["file_id"]
                     local_path = download_file(file_id, "voice.ogg")
                     if local_path:
+                        attachment_refs.append(local_task_protocol.AttachmentRef(  # pragma: no cover
+                            locator=local_path,
+                            mime=(msg["voice"].get("mime_type", "") or "audio/ogg"),
+                            filename=os.path.basename(local_path),
+                            size=(msg["voice"].get("file_size", 0) or 0)))
                         transcript = _transcribe_via_skill(local_path)
                         if transcript:
                             attachment_note = f"\n[Voice transcript: {transcript}]"
@@ -764,16 +782,26 @@ def main():
                 )
                 lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
                 step = 1
-                # CONTEXT-FIRST: reconstruct before interpreting a message that isn't
-                # self-contained. Unlike Discord, Telegram's Bot API has NO message-history
-                # fetch — so the reconstruct substrate is the embedded [Replying to …] quote
-                # (above) + the session transcript, NOT a channel pull-back. Always emitted.
+                # CONTEXT-FIRST: reconstruct before interpreting. UNCONDITIONAL as of
+                # 2026-07-13 (owner-approved): the prior form gated reconstruction on the
+                # agent judging the message "not self-contained" — but that judgment ("I
+                # already understand this") is the exact signal that fails, so the agent
+                # kept walking past the read on questions it only *felt* confident about.
+                # Removing the gate trades a little cheap re-reading for never skipping it;
+                # only a pure greeting/ack is exempt. Unlike Discord, Telegram's Bot API has
+                # NO message-history fetch — so the reconstruct substrate is the embedded
+                # [Replying to …] quote (above) + the session transcript, NOT a channel
+                # pull-back. Supersedes the self-contained-judgment form.
                 lines.append(
-                    f'{step}. CONTEXT-FIRST: if this message is not self-contained '
-                    f'(terse — "y", "no", a pronoun — a reply, or refers to something not '
-                    f'stated here), reconstruct context BEFORE interpreting. Telegram has no '
-                    f'message-history fetch, so use the embedded [Replying to …] quote above '
-                    f'plus the session transcript, and answer from that, not from memory.'
+                    f'{step}. CONTEXT-FIRST (unconditional): before interpreting this '
+                    f'message, reconstruct context and answer from it, NOT from memory. '
+                    f'Telegram has no message-history fetch, so the substrate is the '
+                    f'embedded [Replying to …] quote above plus the session transcript — '
+                    f'read them back until this message stands on its own. Do this every '
+                    f'time; do NOT skip it because the message looks self-contained or you '
+                    f'feel you already understand it — felt confidence is exactly the '
+                    f'signal that fails. The only exception is a pure greeting or '
+                    f'acknowledgement with no referent (e.g. "hi", "thanks").'
                 )
                 step += 1
                 if _notify_py.exists():
@@ -793,15 +821,23 @@ def main():
                 lines.append(f"{step}. Process transcript and write result to results/{task_id}.txt")
                 tg_skill_hints = "\n" + "\n".join(lines) + "\n"
 
+                # interaction-model 4D, step 1.5: structured media headers
+                # alongside the legacy [*attached:] body line (dual-write). Real
+                # headers after `task:`, so confine_user_content defangs a forged
+                # body copy while these authentic ones pass through.
+                media_headers = local_task_protocol.media_attachment_headers(  # pragma: no cover
+                    attachment_refs, bool(text and text.strip()))
                 task_file.write_text(
                     f"id: {task_id}\n"
                     f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
-                    f"task: {confine_user_content(f'[Telegram @{username}{forward_note}] {text}{attachment_note}{reply_note}')}\n"
                     f"source: telegram\n"
+                    f"interaction_type: message\n"
+                    f"{media_headers}"
                     f"chat_id: {chat_id}\n"
                     f"{src_line}"
                     f"{parent_line}"
                     f"priority: {priority}\n"
+                    f"task: {confine_user_content(f'[Telegram @{username}{forward_note}] {text}{attachment_note}{reply_note}')}\n"
                     f"{tg_skill_hints}"
                 )
                 pending_replies[task_id] = chat_id

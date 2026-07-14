@@ -90,7 +90,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// different TMPDIR due to sandboxing) must target the same socket
     /// to find the same server. Without this, tmux has-session fails
     /// app-side even when the session is alive shell-side.
-    let sutandoTmuxSocket = "/tmp/sutando-tmux.sock"
+    /// Honors SUTANDO_TMUX_SOCKET (the env var start-cli.sh + the desktop
+    /// private-socket runtime set) so the app's state-detection / wakeup /
+    /// pane-capture target the SAME tmux server as a private-socket core;
+    /// falls back to the /tmp default when unset. Without this, a private-
+    /// socket core is invisible to all four control paths below.
+    let sutandoTmuxSocket = ProcessInfo.processInfo.environment["SUTANDO_TMUX_SOCKET"] ?? "/tmp/sutando-tmux.sock"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Self-preventive single-instance: if another Sutando.app is already
@@ -234,7 +239,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem.button {
-            let avatarPath = repoRoot + "/assets/stand-avatar.png"
+            let avatarPath = workspace + "/assets/stand-avatar.png"
             if let image = NSImage(contentsOfFile: avatarPath) {
                 image.size = NSSize(width: 18, height: 18)
                 image.isTemplate = false
@@ -647,9 +652,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // first so the chip reflects THIS host's questions, not a stale flat-root copy.
         let pqPath = perHostPath("pending-questions.md")
         if let pq = try? String(contentsOfFile: pqPath, encoding: .utf8) {
-            // Skip the leading "# Memory" or similar h1, find first h2.
+            // Skip h1 and [RESOLVED] h2s; latch onto the first open h2.
             for line in pq.split(separator: "\n") {
-                if line.hasPrefix("## ") {
+                if line.hasPrefix("## ") && !line.hasPrefix("## [RESOLVED]") {
                     let title = String(line.dropFirst(3))
                     let preview = title.count > 60 ? String(title.prefix(57)) + "..." : title
                     chips.append(["label": "Pending: \(preview)", "desc": "Resolve in pending-questions.md"])
@@ -915,7 +920,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Composited onto the top-right corner of the 18×18 avatar so the
     /// menu bar continuously signals mode without taking an extra slot.
     func avatarImage(presenterActive: Bool, meetingActive: Bool = false) -> NSImage? {
-        let avatarPath = repoRoot + "/assets/stand-avatar.png"
+        let avatarPath = workspace + "/assets/stand-avatar.png"
         guard let base = NSImage(contentsOfFile: avatarPath) else { return nil }
         base.size = NSSize(width: 18, height: 18)
         base.isTemplate = false
@@ -1946,6 +1951,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         id: task-\(ts)
         timestamp: \(ISO8601DateFormatter().string(from: Date()))
         source: context-drop
+        interaction_type: system_event
         task: User dropped context via hotkey. Process this:
         \(content)
         """
