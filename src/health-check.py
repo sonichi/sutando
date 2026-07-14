@@ -1017,6 +1017,56 @@ def check_core_proactive_loop(threshold_sec: int = 600) -> dict:
     return {"name": name, "status": "ok", "detail": f"running ({age}s ago)"}
 
 
+def check_gateway_bridge() -> "dict | None":
+    """Health of the ag2.space gateway bridge (remote-gateway-bridge.py) — the
+    process that carries MOBILE-app messages from the cloud gateway down to the
+    local core (and results back up).
+
+    Returns None when the mobile gateway is NOT configured (no REMOTE_TASK_TOKEN /
+    AG2_REMOTE_TOKEN in env or channels/ag2space/.env) — a Sutando-only user
+    without the mobile gateway never sees this check. Otherwise: ``warn`` when
+    configured-but-not-running (with the delivery impact spelled out) or on a
+    duplicate-process pileup, ``ok`` when a single instance is running.
+
+    Added after a 3-day SILENT outage (2026-07-10): the bridge died on Jul 7 and
+    nothing reported it, so mobile messages stranded in the cloud invisibly. This
+    check makes that state visible on the dashboard.
+    """
+    try:
+        gw_env = claude_home_path("channels", "ag2space", ".env")
+        configured = bool(os.environ.get("REMOTE_TASK_TOKEN") or os.environ.get("AG2_REMOTE_TOKEN"))
+        if not configured and gw_env.exists():
+            configured = any(
+                ln.startswith(("REMOTE_TASK_TOKEN=", "AG2_REMOTE_TOKEN="))
+                for ln in gw_env.read_text(errors="replace").splitlines()
+            )
+    except OSError:
+        configured = False
+    if not configured:
+        return None
+    try:
+        gw = subprocess.run(
+            ["/usr/bin/pgrep", "-f", r"remote-gateway-bridge\.py$"],
+            capture_output=True, text=True,
+        )
+        pids = [p for p in gw.stdout.strip().split("\n") if p] if gw.returncode == 0 else []
+    except Exception:
+        pids = []
+    if not pids:
+        return {
+            "name": "gateway-bridge",
+            "status": "warn",
+            "detail": "configured but NOT running — ag2.space mobile messages will not be delivered",
+        }
+    if len(pids) > 1:
+        return {
+            "name": "gateway-bridge",
+            "status": "warn",
+            "detail": f"multiple processes ({len(pids)} PIDs: {','.join(pids)})",
+        }
+    return {"name": "gateway-bridge", "status": "ok", "detail": "running"}
+
+
 def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> dict:
     """Detect a task-queue pileup — tasks/ directory growing without
     being drained. Independent of which watcher / loop is dying: the queue
@@ -1464,6 +1514,12 @@ def run_all_checks() -> list[dict]:
                 pass
 
         checks.append({"name": name, "status": status, "detail": detail})
+
+    # ag2.space gateway bridge (mobile path); check_gateway_bridge() returns
+    # None when the gateway isn't configured, so filter it out. (The function's
+    # branches are unit-tested in tests/health-check-gateway-bridge.test.py; this
+    # call site is exercised by the running health check, not that unit test.)
+    checks += [c for c in (check_gateway_bridge(),) if c is not None]  # pragma: no cover
 
     # (External plugin probes moved out with their plugins in #1427 round ④ —
     # a plugin manifest declares its own health_probe; the host checks host
