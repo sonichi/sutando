@@ -117,12 +117,18 @@ if [ -x "$REPO/scripts/sutando-config.sh" ]; then
     # --dangerously-skip-permissions does NOT bypass, and the core hangs with no
     # TTY to answer it. Gated on the opt-in env var so we only ever trust the dir
     # the operator explicitly chose, never arbitrary paths. We still do NOT touch
-    # the global bypassPermissionsModeAccepted gate — that's the user's to accept.
+    # the global bypassPermissionsModeAccepted gate on a normal interactive
+    # start — that's the user's to accept. EXCEPTION: a BUNDLED detached core
+    # (desktop app) has NO TTY to answer the "Yes, I accept" prompt for
+    # --dangerously-skip-permissions and hangs there forever, alive-but-stuck,
+    # never reaching /schedule-crons (found on the mini 2026-07-14, #60 follow-on).
+    # So we ALSO pre-accept it, but ONLY when the launcher explicitly opts in via
+    # SUTANDO_ACCEPT_BYPASS_PERMISSIONS=1 (set by the desktop launch-sutando.sh).
     # This is the single launch chokepoint (Sutando.app's launchCore, the
     # terminal-server Core CLI pane, and src/startup.sh all exec this script),
     # so seeding here covers every path.
     if command -v python3 > /dev/null 2>&1; then
-      _ccd="$_ccd" _cwd="${SUTANDO_CLAUDE_WORKING_DIR:-}" python3 - <<'PY' || echo "  ⚠ onboarding-seed skipped (non-fatal)"
+      _ccd="$_ccd" _cwd="${SUTANDO_CLAUDE_WORKING_DIR:-}" _accept_bypass="${SUTANDO_ACCEPT_BYPASS_PERMISSIONS:-}" python3 - <<'PY' || echo "  ⚠ onboarding-seed skipped (non-fatal)"
 import json, os
 ccd = os.environ["_ccd"]
 target = os.path.join(ccd, ".claude.json")
@@ -153,6 +159,7 @@ if cfg.get("theme") is None and glob.get("theme") is not None:
 # the prompt. Only pre-trust the one dir the operator chose (env-gated).
 cwd = os.environ.get("_cwd") or ""
 trusted_dir = None
+accepted_bypass = False
 if cwd:
     projects = cfg.get("projects")
     if not isinstance(projects, dict):
@@ -164,6 +171,15 @@ if cwd:
         entry["hasTrustDialogAccepted"] = True
         changed = True
         trusted_dir = cwd
+# Bypass-permissions acceptance seed — bundled detached core ONLY (env-gated).
+# Claude Code's --dangerously-skip-permissions shows a one-time "Yes, I accept"
+# gate recorded as top-level bypassPermissionsModeAccepted in .claude.json; a
+# detached no-TTY core hangs on it forever. Pre-accept ONLY when the launcher
+# explicitly opted in (SUTANDO_ACCEPT_BYPASS_PERMISSIONS), never otherwise.
+if os.environ.get("_accept_bypass") and cfg.get("bypassPermissionsModeAccepted") is not True:
+    cfg["bypassPermissionsModeAccepted"] = True
+    changed = True
+    accepted_bypass = True
 if changed:
     tmp = target + ".tmp"
     with open(tmp, "w") as f:
@@ -172,6 +188,8 @@ if changed:
     print("  ✓ onboarding-seed: hasCompletedOnboarding set in .claude.json")
     if trusted_dir:
         print("  ✓ trust-seed: hasTrustDialogAccepted set for %s" % trusted_dir)
+    if accepted_bypass:
+        print("  ✓ bypass-seed: bypassPermissionsModeAccepted set (bundled detached core)")
 PY
     fi
   else
