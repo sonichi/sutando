@@ -127,6 +127,32 @@ class TestProdPath(unittest.TestCase):
             shutil.rmtree(emb, ignore_errors=True)
             shutil.rmtree(cfg_ws, ignore_errors=True)
 
+    def test_shipped_config_does_not_override_embedder_default(self) -> None:
+        """Regression guard (read-only-bundle root cause, 2026-07-14): the
+        SHIPPED `sutando.config.json` must NOT set `workspace.path`. If it does,
+        it OUTRANKS $SUTANDO_DEFAULT_WORKSPACE (config > embedder) and pins the
+        workspace to {repoRoot}/workspace — which, for the AG2 Space desktop,
+        traps it inside the read-only .app bundle and silently defeats the
+        embedder hook. With the REAL repo config loaded + the env set,
+        resolve_workspace must honor the env, not a shipped workspace.path."""
+        emb = tempfile.mkdtemp(prefix="sutando-shipped-cfg-")
+        try:
+            os.environ["SUTANDO_DEFAULT_WORKSPACE"] = emb
+            _reset_cache_for_tests()
+            # ROOT = the real repo root, holding the shipped sutando.config.json.
+            got = resolve_workspace(ROOT)
+            self.assertEqual(
+                got,
+                Path(emb).resolve(),
+                "shipped sutando.config.json sets workspace.path — it overrides "
+                "$SUTANDO_DEFAULT_WORKSPACE and breaks embedders (read-only-bundle "
+                "bug). Remove workspace.path from sutando.config.json.",
+            )
+        finally:
+            import shutil
+
+            shutil.rmtree(emb, ignore_errors=True)
+
     # --- B4: NO_COLOR honored --------------------------------------------- #
 
     def test_no_color_one_strips_ansi(self) -> None:

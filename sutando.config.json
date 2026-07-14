@@ -1,7 +1,5 @@
 {
-  "workspace": {
-    "path": "${REPO_DIR}/workspace"
-  },
+  "_workspace_note": "workspace.path is INTENTIONALLY not set here. Setting it would OUTRANK the $SUTANDO_DEFAULT_WORKSPACE embedder hook (precedence: config.workspace.path > embedder env > baked default) and pin the workspace to {repoRoot}/workspace. For a normal checkout that equals the baked-in default anyway (no change); but for an embedder (the AG2 Space desktop) it would trap the workspace inside the read-only .app bundle and silently defeat $SUTANDO_DEFAULT_WORKSPACE. Leave unset: resolve_workspace() uses the env hook when set, else {repoRoot}/workspace. (Regression guard: tests/sutando-config.prod-path.test.py::test_shipped_config_does_not_override_embedder_default.)",
   "core_config_dirs": [
     {
       "id": "claude-default",
