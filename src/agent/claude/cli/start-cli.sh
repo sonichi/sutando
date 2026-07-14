@@ -35,6 +35,14 @@ SESSION="sutando-core"
 # server's environment, not necessarily this shell's.
 export SUTANDO_CORE_SESSION=1
 CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1)
+# Forward the embedder-provided default workspace into the core session for the
+# SAME reason as above (tmux takes the server env, not this shell's). Without
+# this the core's own resolve_workspace() (proactive-loop, task scripts) misses
+# $SUTANDO_DEFAULT_WORKSPACE and falls back to {repo}/workspace — while the
+# gateway window (which gets it explicitly) resolves to that path: a split-brain
+# where the two watch different tasks/ dirs. Companion to the resolver change
+# (#2094); conditional so non-bundled/OSS installs are untouched.
+[ -n "${SUTANDO_DEFAULT_WORKSPACE:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_DEFAULT_WORKSPACE=$SUTANDO_DEFAULT_WORKSPACE")
 
 # Optional working-directory override for the core `claude` process.
 #   - Unset (upstream default): no override — the core launches from $REPO (the

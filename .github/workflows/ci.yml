@@ -27,6 +27,12 @@ jobs:
       - name: Per-host carried-path lint
         run: bash scripts/lint-vault-sync-paths.sh
 
+      # Layer 3 (#1543): verifies that personal_path() call sites in source are
+      # not classified into state/ by CLASS_RULES in sutando-migrate.sh.
+      # No-op on branches where sutando-migrate.sh is absent.
+      - name: CLASS_RULES vs reader-chain symmetry lint
+        run: python3 scripts/lint-class-rules.py
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
