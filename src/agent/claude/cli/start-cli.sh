@@ -117,16 +117,20 @@ if [ -x "$REPO/scripts/sutando-config.sh" ]; then
     # --dangerously-skip-permissions does NOT bypass, and the core hangs with no
     # TTY to answer it. Gated on the opt-in env var so we only ever trust the dir
     # the operator explicitly chose, never arbitrary paths. We still do NOT touch
-    # the dangerous-mode acknowledgement gate for INTERACTIVE callers — that's the
-# user's to accept. But when SUTANDO_CLAUDE_WORKING_DIR IS set (a deliberately
-# detached, no-TTY core — the bundled desktop app), we ALSO seed
-# skipDangerousModePermissionPrompt below, because there is no TTY to answer that
-# prompt and the core would otherwise hang forever (owner-hit 2026-07-14).
+    # the dangerous-mode acknowledgement gate on a normal start — that's the
+    # user's to accept. EXCEPTION: when SUTANDO_ACCEPT_BYPASS_PERMISSIONS=1 is set
+    # (a deliberately detached, no-TTY core that explicitly opted in — the bundled
+    # desktop's launch-sutando.sh sets it), we ALSO seed
+    # skipDangerousModePermissionPrompt below, because there is no TTY to answer
+    # that prompt and the core hangs forever otherwise (owner-hit 2026-07-14).
+    # Dedicated opt-in (NOT the broader SUTANDO_CLAUDE_WORKING_DIR trust gate) so
+    # only the truly-headless bundled core auto-accepts — the interactive
+    # terminal-server pane still prompts the user to accept it themselves.
     # This is the single launch chokepoint (Sutando.app's launchCore, the
     # terminal-server Core CLI pane, and src/startup.sh all exec this script),
     # so seeding here covers every path.
     if command -v python3 > /dev/null 2>&1; then
-      _ccd="$_ccd" _cwd="${SUTANDO_CLAUDE_WORKING_DIR:-}" python3 - <<'PY' || echo "  ⚠ onboarding-seed skipped (non-fatal)"
+      _ccd="$_ccd" _cwd="${SUTANDO_CLAUDE_WORKING_DIR:-}" _accept_bypass="${SUTANDO_ACCEPT_BYPASS_PERMISSIONS:-}" python3 - <<'PY' || echo "  ⚠ onboarding-seed skipped (non-fatal)"
 import json, os
 ccd = os.environ["_ccd"]
 target = os.path.join(ccd, ".claude.json")
@@ -175,12 +179,14 @@ if cwd:
 # no-TTY core (the bundled desktop app) hangs on it forever — process alive but
 # never reaching /schedule-crons (owner-hit 2026-07-14 on the mini; distinct from
 # the folder-trust dialog above). Pre-accept it by seeding
-# skipDangerousModePermissionPrompt in <ccd>/settings.json. Gated on the SAME
-# opt-in env (SUTANDO_CLAUDE_WORKING_DIR / cwd) as the trust-seed: only the
-# operator's explicitly-chosen detached core is affected; interactive callers
-# still get the prompt and accept it themselves. Merge — never clobber existing
-# settings. Idempotent + atomic.
-if cwd:
+# skipDangerousModePermissionPrompt in <ccd>/settings.json. Gated on the DEDICATED
+# SUTANDO_ACCEPT_BYPASS_PERMISSIONS opt-in (set only by the bundled desktop's
+# launch-sutando.sh) — NOT the broader SUTANDO_CLAUDE_WORKING_DIR trust gate — so
+# only the truly-headless bundled core auto-accepts; the interactive terminal-server
+# pane (also a working-dir launch) still prompts the user. Merge — never clobber
+# existing settings. Idempotent + atomic. Empirically verified on claude v2.1.209
+# (the bundled version): accepting the prompt writes exactly this settings.json key.
+if os.environ.get("_accept_bypass"):
     settings_path = os.path.join(ccd, "settings.json")
     try:
         st = json.load(open(settings_path)) if os.path.exists(settings_path) else {}
