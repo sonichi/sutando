@@ -310,10 +310,33 @@ apply_tmux_defaults() {
   tmux -S "$TMUX_SOCKET" bind -n WheelDownPane send-keys -M 2>/dev/null || true
 }
 
+# Agent Shepherd M1 monitor (PR #2100). Watch the CANONICAL sutando-core session
+# for blocked-on-input gates the no-TTY core can't answer (/login, a mid-session
+# permission prompt, an unknown dialog) and write state/core-supervisor.json —
+# consumed by the desktop "Action needed" banner and the communicator relay.
+# Launched HERE, the one place that knows the canonical TMUX_SOCKET + SESSION —
+# NOT from startup.sh, whose $TMUX is empty in the Sutando.app/background path
+# (so a $TMUX-derived wiring would never start the monitor for the real core).
+# The guard is scoped to THIS socket + out path so a monitor for a different
+# core/socket can never suppress this one.
+ensure_core_monitor() {
+  local ws mon_out
+  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
+  [ -n "$ws" ] || return 0
+  mon_out="$ws/state/core-supervisor.json"
+  if pgrep -f "core-input-watch\.py .*--socket ${TMUX_SOCKET} .*--out ${mon_out}" > /dev/null 2>&1; then
+    return 0   # a monitor for this exact core is already running
+  fi
+  python3 "$REPO/src/core-input-watch.py" \
+    --socket "$TMUX_SOCKET" --session "$SESSION" --out "$mon_out" \
+    > /tmp/core-input-watch.log 2>&1 &
+}
+
 # Already running — attach if interactive, else exit cleanly. This branch
 # also catches the !--restart path so re-running the script is idempotent.
 if tmux -S "$TMUX_SOCKET" has-session -t "$SESSION" 2>/dev/null; then
   apply_tmux_defaults
+  ensure_core_monitor   # re-ensure the supervisor monitor on every attach/re-run
   if [ -t 1 ] && command -v tmux > /dev/null 2>&1; then
     echo "Attaching to existing $SESSION (Ctrl-b d to detach)..."
     exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
@@ -375,6 +398,7 @@ apply_tmux_defaults
 # start-directory is silently dropped — so re-anchoring a running core to a new
 # working dir must go through `--restart` (kill-then-create), not a bare rerun.
 if [ -t 1 ]; then
+  ensure_core_monitor   # backgrounded child survives the exec below
   exec tmux -S "$TMUX_SOCKET" new-session -A -s "$SESSION" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
     claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
@@ -384,6 +408,7 @@ else
     claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
     -- "/schedule-crons"
+  ensure_core_monitor   # canonical session now exists — start the supervisor monitor
   echo "Started $SESSION detached. Attach via Open Core CLI in menu bar, or:"
   echo "  tmux -S $TMUX_SOCKET attach -t $SESSION"
 fi

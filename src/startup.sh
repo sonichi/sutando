@@ -524,25 +524,6 @@ else
   echo "  ✓ core heartbeat (already running)"
 fi
 
-# Core input monitor (Agent Shepherd M1) — watches THIS core's tmux pane for
-# blocked-on-input gates the no-TTY core can't answer (/login, a mid-session
-# permission prompt, an unknown dialog) and writes state/core-supervisor.json,
-# which the desktop app's "Action needed" banner and the communicator relay
-# (core-supervisor-relay.py) consume. Self-wires to the current tmux socket +
-# session ($TMUX is "socket,pid,session" inside tmux); no-op when not in tmux.
-if [ -n "${TMUX:-}" ] && ! pgrep -f "src/core-input-watch.py" > /dev/null 2>&1; then
-  echo "  Starting core input monitor..."
-  MON_SOCK="${TMUX%%,*}"
-  MON_SESS="$(tmux display-message -p '#S' 2>/dev/null || echo sutando-core)"
-  MON_OUT="$(bash "$REPO/scripts/sutando-config.sh" workspace)/state/core-supervisor.json"
-  python3 "$REPO/src/core-input-watch.py" \
-    --socket "$MON_SOCK" --session "$MON_SESS" --out "$MON_OUT" \
-    > /tmp/core-input-watch.log 2>&1 &
-  echo "  ✓ core input monitor ($MON_SESS)"
-elif [ -n "${TMUX:-}" ]; then
-  echo "  ✓ core input monitor (already running)"
-fi
-
 # 0. Credential proxy for quota tracking (port 7846).
 # Prefer the launchd-supervised job (KeepAlive + ThrottleInterval=10s) so the
 # proxy restarts on crash instead of leaving a proxy-routed core stranded on a
