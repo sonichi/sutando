@@ -163,6 +163,39 @@ check("unknown/stale positional id → 404", code == 404, f"got {code}")
 code, data = req("POST", "/answer", {"id": target["id"]})
 check("missing answer → 400", code == 400, f"got {code}")
 
+# 5. Duplicate-title stale id must never migrate to a neighbour (#2103 review).
+#    Three open sections share a title; the UI is handed an id for the SECOND.
+#    The agent answers the FIRST (rewriting the file). The id the UI still holds
+#    must still resolve the SECOND section over HTTP — not the third.
+PQ_FILE.write_text(
+    "# Pending Questions\n\n"
+    "## Same title\nFirst — ALPHA.\n\n"
+    "## Same title\nSecond — BRAVO.\n\n"
+    "## Same title\nThird — CHARLIE.\n"
+)
+code, data = req("GET", "/tasks/active")
+dupes = data.get("questions", [])
+check("three duplicate-title questions listed", len(dupes) == 3, f"got {len(dupes)}")
+id_second = dupes[1]["id"] if len(dupes) > 1 else None
+id_third = dupes[2]["id"] if len(dupes) > 2 else None
+check("duplicate ids are distinct", len({q["id"] for q in dupes}) == 3)
+
+# Answer the FIRST duplicate, then reuse the stale id for the SECOND.
+req("POST", "/answer", {"id": dupes[0]["id"], "answer": "resolved first"})
+code, data = req("POST", "/answer", {"id": id_second, "answer": "picked BRAVO"})
+check("stale duplicate id still answers → 200", code == 200, f"got {code} {data}")
+
+# The answer must sit in the BRAVO section, never in CHARLIE's.
+sections = [s for s in PQ_FILE.read_text().split("## Same title\n") if s.strip()]
+answered = [s for s in sections if "picked BRAVO" in s]
+check("the owner's answer landed on exactly one section", len(answered) == 1)
+check("...and it was BRAVO, not the neighbour",
+      bool(answered) and "BRAVO" in answered[0] and "CHARLIE" not in answered[0],
+      f"landed on: {answered}")
+code, data = req("GET", "/tasks/active")
+left = [q["id"] for q in data.get("questions", [])]
+check("the third (CHARLIE) question is still open", id_third in left, f"got {left}")
+
 server.server_close()
 print(f"\nagent-api-answer-e2e: {ran - len(failures)}/{ran} passed")
 if failures:

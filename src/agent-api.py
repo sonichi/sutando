@@ -141,11 +141,22 @@ PQ_OPTIONS_RE = re.compile(r'\*\*Options:\*\*\s*(.+)')
 def parse_pending_questions(content: str) -> list[dict]:
     """Open questions in pending-questions.md, in file order.
 
-    Ids are derived from the title, not the section's position. The agent
-    rewrites this file continuously, so a positional id minted by one GET
-    points at a different — or already-archived — section by the time the owner
-    clicks answer on it. Each dict carries the section's `start`/`end` offsets
-    into `content` so the writer can splice it back in place.
+    Ids are derived from the section's own content, not its title or its
+    position. The agent rewrites this file continuously, so a positional id
+    minted by one GET points at a different — or already-archived — section by
+    the time the owner clicks answer on it. Each dict carries the section's
+    `start`/`end` offsets into `content` so the writer can splice it in place.
+
+    Hashing the *whole section* (not just the title) is what makes an id stable
+    when two open sections share a title. A title-hash plus an occurrence-count
+    suffix (`-2`, `-3`) renumbers the survivors as soon as an earlier duplicate
+    is answered or reordered, so a stale id the UI still holds would silently
+    resolve to a *neighbour* (#2103 review). A content hash is tied to that one
+    section: siblings appearing, being answered, or moving around it don't
+    change it, so a stale id resolves to its original section — or, if that
+    section's own text has since changed, cleanly 404s — but never a neighbour.
+    Two sections with an identical title *and* body are the same question and
+    share an id by design.
 
     Sections below the `# Resolved` divider are the audit trail, not open
     questions (same cut as check-pending-questions.py:95).
@@ -154,19 +165,17 @@ def parse_pending_questions(content: str) -> list[dict]:
     active = content[:archive.start()] if archive else content
     starts = [m.start() for m in PQ_SECTION_RE.finditer(active)]
     questions: list[dict] = []
-    seen: dict[str, int] = {}
     for n, start in enumerate(starts):
         end = starts[n + 1] if n + 1 < len(starts) else len(active)
-        head, _, body = active[start:end].partition('\n')
+        section = active[start:end]
+        head, _, body = section.partition('\n')
         title = head[3:].strip()  # drop the '## '
         if not title or title.startswith('RESOLVED') or title.startswith('[RESOLVED'):
             continue
         if PQ_ANSWERED_RE.search(body):
             continue
-        qid = "Q" + hashlib.sha1(" ".join(title.split()).encode()).hexdigest()[:8]
-        seen[qid] = seen.get(qid, 0) + 1
-        if seen[qid] > 1:  # two sections sharing a title — keep the ids distinct
-            qid = f"{qid}-{seen[qid]}"
+        # Whitespace-normalised so a reflow of the same prose keeps the id.
+        qid = "Q" + hashlib.sha1(" ".join(section.split()).encode()).hexdigest()[:12]
         q = {
             "id": qid,
             "text": title,

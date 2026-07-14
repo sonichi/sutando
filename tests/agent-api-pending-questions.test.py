@@ -109,6 +109,67 @@ class TestParse(unittest.TestCase):
         ids = [q["id"] for q in api.parse_pending_questions(dupes)]
         self.assertEqual(len(set(ids)), 2, f"ids collided: {ids}")
 
+    def test_duplicate_id_survives_resolving_an_earlier_duplicate(self):
+        """The #2103 review's blocking case: a stale duplicate-title id must
+        never migrate to a neighbour.
+
+        Three open sections share a title. The UI is handed an id for the
+        *second* section; the agent then answers the *first*, rewriting the
+        file. The id the UI still holds must resolve the same (second) section
+        — never the third — or, at worst, 404. It must not silently record the
+        owner's answer against a different question.
+
+        This is the guarantee an occurrence-count suffix (`-2`/`-3`) breaks:
+        answering the first section renumbers the survivors, so `...-2` slides
+        from the second section onto the third.
+        """
+        dupes = (
+            "# Pending Questions\n\n"
+            "## Same title\nFirst — ALPHA.\n\n"
+            "## Same title\nSecond — BRAVO.\n\n"
+            "## Same title\nThird — CHARLIE.\n"
+        )
+        before = api.parse_pending_questions(dupes)
+        self.assertEqual(len(before), 3)
+        id_for_second = before[1]["id"]
+        id_for_third = before[2]["id"]
+
+        # The agent resolves the first duplicate and rewrites the file.
+        rewritten = api.answer_pending_question(dupes, before[0], "done with the first")
+        after = api.parse_pending_questions(rewritten)
+
+        # The originally-issued ids still name their own sections, unchanged.
+        second = next((q for q in after if q["id"] == id_for_second), None)
+        self.assertIsNotNone(second, "the second section's id stopped resolving")
+        self.assertIn("BRAVO", second["detail"])
+        self.assertNotIn("CHARLIE", second["detail"])  # never the neighbour
+
+        third = next((q for q in after if q["id"] == id_for_third), None)
+        self.assertIsNotNone(third)
+        self.assertIn("CHARLIE", third["detail"])
+
+        # And answering through the stale id lands on BRAVO, leaving CHARLIE open.
+        final = api.answer_pending_question(rewritten, second, "picked BRAVO")
+        still_open = api.parse_pending_questions(final)
+        self.assertEqual([q["detail"] for q in still_open], ["Third — CHARLIE."])
+
+    def test_ids_are_independent_of_sibling_count(self):
+        """A section's id must not depend on how many same-title siblings are
+        currently open. Removing an earlier duplicate must leave every survivor's
+        id byte-for-byte identical (no renumbering)."""
+        dupes = (
+            "# Q\n\n"
+            "## Same title\nAlpha body.\n\n"
+            "## Same title\nBravo body.\n\n"
+            "## Same title\nCharlie body.\n"
+        )
+        by_detail = {q["detail"]: q["id"] for q in api.parse_pending_questions(dupes)}
+        # Drop the first duplicate entirely (not just answer it).
+        pruned = dupes.replace("## Same title\nAlpha body.\n\n", "", 1)
+        after = {q["detail"]: q["id"] for q in api.parse_pending_questions(pruned)}
+        self.assertEqual(after["Bravo body."], by_detail["Bravo body."])
+        self.assertEqual(after["Charlie body."], by_detail["Charlie body."])
+
     def test_structured_format_still_parses(self):
         qs = api.parse_pending_questions(STRUCTURED)
         self.assertEqual(len(qs), 1)
