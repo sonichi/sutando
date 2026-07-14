@@ -63,7 +63,7 @@ class TestProdPath(unittest.TestCase):
         self._saved_env = os.environ.pop("SUTANDO_WORKSPACE", None)
         self._saved_no_color = os.environ.pop("NO_COLOR", None)
         self._saved_test_mode = os.environ.pop("SUTANDO_TEST_MODE", None)
-        self._saved_app_support = os.environ.pop("SUTANDO_APP_SUPPORT", None)
+        self._saved_embedder_ws = os.environ.pop("SUTANDO_DEFAULT_WORKSPACE", None)
         _reset_cache_for_tests()
         self._tmpdir = tempfile.mkdtemp(prefix="sutando-prod-path-")
         self.repo = Path(self._tmpdir)
@@ -82,38 +82,39 @@ class TestProdPath(unittest.TestCase):
             os.environ.pop("SUTANDO_TEST_MODE", None)
         else:
             os.environ["SUTANDO_TEST_MODE"] = self._saved_test_mode
-        if self._saved_app_support is None:
-            os.environ.pop("SUTANDO_APP_SUPPORT", None)
+        if self._saved_embedder_ws is None:
+            os.environ.pop("SUTANDO_DEFAULT_WORKSPACE", None)
         else:
-            os.environ["SUTANDO_APP_SUPPORT"] = self._saved_app_support
+            os.environ["SUTANDO_DEFAULT_WORKSPACE"] = self._saved_embedder_ws
         # Clean up tmp dir
         import shutil
 
         shutil.rmtree(self._tmpdir, ignore_errors=True)
 
-    # --- Bundled-app override: $SUTANDO_APP_SUPPORT (test-5 2026-07-14) ---- #
+    # --- Embedder default workspace: $SUTANDO_DEFAULT_WORKSPACE (2026-07-14) - #
 
-    def test_app_support_fills_default_slot(self) -> None:
-        """$SUTANDO_APP_SUPPORT set + no config → workspace = $APP_SUPPORT/workspace
-        (instead of the {repo_root}/workspace baked-in default that would land
-        inside a read-only .app bundle)."""
-        app = tempfile.mkdtemp(prefix="sutando-appsupport-")
+    def test_embedder_default_fills_default_slot(self) -> None:
+        """$SUTANDO_DEFAULT_WORKSPACE set + no config → workspace = that FULL path
+        verbatim (the embedder — e.g. the desktop app — passes the complete path;
+        OSS does no derivation). Replaces the {repo_root}/workspace baked-in
+        default that would land inside a read-only .app bundle."""
+        ws = tempfile.mkdtemp(prefix="sutando-embedder-ws-")
         try:
-            os.environ["SUTANDO_APP_SUPPORT"] = app
+            os.environ["SUTANDO_DEFAULT_WORKSPACE"] = ws
             got = resolve_workspace(self.repo)
-            self.assertEqual(got, (Path(app) / "workspace").resolve())
+            self.assertEqual(got, Path(ws).resolve())
         finally:
             import shutil
 
-            shutil.rmtree(app, ignore_errors=True)
+            shutil.rmtree(ws, ignore_errors=True)
 
-    def test_explicit_config_wins_over_app_support(self) -> None:
+    def test_explicit_config_wins_over_embedder_default(self) -> None:
         """An explicit workspace.path in sutando.config.local.json outranks
-        $SUTANDO_APP_SUPPORT (the env override only fills the default slot)."""
-        app = tempfile.mkdtemp(prefix="sutando-appsupport-")
+        $SUTANDO_DEFAULT_WORKSPACE (the env only fills the default slot)."""
+        emb = tempfile.mkdtemp(prefix="sutando-embedder-ws-")
         cfg_ws = tempfile.mkdtemp(prefix="sutando-cfgws-")
         try:
-            os.environ["SUTANDO_APP_SUPPORT"] = app
+            os.environ["SUTANDO_DEFAULT_WORKSPACE"] = emb
             (self.repo / "sutando.config.local.json").write_text(
                 '{"workspace": {"path": "' + cfg_ws + '"}}'
             )
@@ -123,7 +124,7 @@ class TestProdPath(unittest.TestCase):
         finally:
             import shutil
 
-            shutil.rmtree(app, ignore_errors=True)
+            shutil.rmtree(emb, ignore_errors=True)
             shutil.rmtree(cfg_ws, ignore_errors=True)
 
     # --- B4: NO_COLOR honored --------------------------------------------- #
