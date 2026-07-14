@@ -157,7 +157,15 @@ def classify(pane: str):
     tail = "\n".join([ln for ln in pane.splitlines() if ln.strip()][-14:])
     if not _AWAIT_HINT.search(tail):
         return None
-    if _IDLE.search(tail) and not any(rx.search(tail) for _, rx in _SIGNATURES[:5]):
+    # Idle-footer suppression: the normal footer ("⏵⏵ bypass permissions on … ←
+    # for agents") also carries an await-affordance, so a genuinely idle pane would
+    # otherwise fall through to "unknown". Suppress it ONLY when NO real gate
+    # signature matches — check ALL of _SIGNATURES, not a prefix. (Bug caught in
+    # review 2026-07-14: slicing [:5] excluded `permission` (index 5), so a real
+    # mid-session "Do you want to proceed? / Allow this action" prompt rendered
+    # above the footer was hidden — a false negative on a MAIN escalation case. The
+    # footer itself matches none of the signatures, so idle still suppresses.)
+    if _IDLE.search(tail) and not any(rx.search(tail) for _, rx in _SIGNATURES):
         return None
     for kind, rx in _SIGNATURES:
         if rx.search(tail):

@@ -40,6 +40,11 @@ _IDLE = ("──────── sutando-core ──\n❯ \n──────
          "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
 _IDLE_LOGGEDOUT = _IDLE + "\n     Not logged in · Run /login"
 _WORKING = ("⏺ Bash(WS=... echo WORKSPACE=...)\n  ⎿  WORKSPACE=/Users/x\n     HOST=mini\n     … +39 lines")
+# A real mid-session permission prompt rendered ABOVE the persistent idle footer
+# (review repro 2026-07-14). The footer's await-affordance must NOT suppress it.
+_PERMISSION_WITH_FOOTER = (
+    "  Do you want to proceed?\n  Allow this action\n  Esc to cancel\n"
+    "  ────────\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
 
 
 class TestClassify(unittest.TestCase):
@@ -63,6 +68,19 @@ class TestClassify(unittest.TestCase):
 
     def test_empty_does_not_flag(self):
         self.assertIsNone(classify(""))
+
+    def test_permission_prompt_above_footer_is_not_suppressed(self):
+        # Regression (review 2026-07-14): the idle-footer suppression must not hide a
+        # real permission prompt just because the persistent footer is also present.
+        hit = classify(_PERMISSION_WITH_FOOTER)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[0], "permission")
+
+    def test_permission_with_footer_composes_blocked_human(self):
+        st, _d, prompt, kind = compose_state(_PERMISSION_WITH_FOOTER, "working", True)
+        self.assertEqual(st, "blocked-human")
+        self.assertEqual(kind, "permission")
+        self.assertIsNotNone(prompt)
 
     def test_idle_with_await_token_still_does_not_flag(self):
         # The idle prompt can carry an await-hint-like token ("to accept") without
