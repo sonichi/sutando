@@ -155,6 +155,39 @@ class TestAutoAnswer(unittest.TestCase):
         self.assertIsNone(auto_answer("bypass-permissions"))
 
 
+class TestEnsureTmuxOnPath(unittest.TestCase):
+    """Mini-verified 2026-07-14: a detached spawn without Homebrew on PATH made bare
+    `tmux` fail → healthy core mis-read as crashed. The monitor must self-heal PATH."""
+
+    def test_prepends_tmux_dir_when_not_on_path(self):
+        import sys
+        orig_path = os.environ.get("PATH", "")
+        orig_which = _mod.shutil.which
+        orig_exists = _mod.os.path.exists
+        try:
+            _mod.shutil.which = lambda _n: None            # tmux not on PATH
+            _mod.os.path.exists = lambda p: p == "/opt/homebrew/bin/tmux"
+            os.environ["PATH"] = "/usr/bin"
+            _mod._ensure_tmux_on_path()
+            self.assertIn("/opt/homebrew/bin", os.environ["PATH"].split(os.pathsep))
+        finally:
+            _mod.shutil.which = orig_which
+            _mod.os.path.exists = orig_exists
+            os.environ["PATH"] = orig_path
+
+    def test_noop_when_tmux_already_resolvable(self):
+        orig_path = os.environ.get("PATH", "")
+        orig_which = _mod.shutil.which
+        try:
+            _mod.shutil.which = lambda _n: "/usr/bin/tmux"  # already found
+            os.environ["PATH"] = "/usr/bin"
+            _mod._ensure_tmux_on_path()
+            self.assertEqual(os.environ["PATH"], "/usr/bin")  # untouched
+        finally:
+            _mod.shutil.which = orig_which
+            os.environ["PATH"] = orig_path
+
+
 class TestMainOnce(unittest.TestCase):
     """End-to-end --once through the SHARED runtime-health derivation: with no
     live sutando-core, runtime_health.derive() → 'offline' → the supervisor

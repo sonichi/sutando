@@ -65,8 +65,28 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
+
+
+def _ensure_tmux_on_path():
+    """Both this monitor (capture) and runtime-health (its liveness probes) call
+    bare `tmux`. In a bundled/detached spawn the ambient PATH may lack Homebrew
+    (/opt/homebrew/bin on Apple Silicon, /usr/local/bin on Intel) — where tmux
+    actually lives — so bare `tmux` fails and a perfectly HEALTHY core reads as
+    offline → 'crashed', which would trigger a false RECOVER restart. Mini-verified
+    2026-07-14: over a non-Homebrew PATH the live idle core mis-reported 'crashed';
+    prepending the tmux dir fixed it. Resolve tmux once and prepend its dir so the
+    bare calls succeed regardless of how the app spawned us. Mutating PATH (vs.
+    threading a tmux path everywhere) also transparently fixes the imported
+    runtime-health probes, which share this process env."""
+    if shutil.which("tmux"):
+        return
+    for cand in ("/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"):
+        if os.path.exists(cand):
+            os.environ["PATH"] = os.path.dirname(cand) + os.pathsep + os.environ.get("PATH", "")
+            return
 
 
 # ---- Shared derivation core: runtime-health.py (#2092). -------------------- #
@@ -241,6 +261,10 @@ def main():
                     help="consecutive identical prompt polls before escalating (debounce)")
     ap.add_argument("--once", action="store_true", help="one tick then exit (for tests/probes)")
     a = ap.parse_args()
+
+    # Make bare `tmux` resolvable before ANY probe (ours or runtime-health's) —
+    # else a detached spawn without Homebrew on PATH reads a healthy core as crashed.
+    _ensure_tmux_on_path()
 
     # Point the SHARED runtime-health derivation at THIS core's socket/session so
     # the supervisor and the Console's status strip read the same liveness core.
