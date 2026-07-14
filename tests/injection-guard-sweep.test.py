@@ -80,33 +80,40 @@ _check(
 # ---------------------------------------------------------------------------
 
 def _task_field_is_last_in_write_text(src: str) -> bool:
-    """Check that task: appears after source/access_tier/priority in write_text.
+    """Check that task: appears after source/access_tier/priority in the
+    task-file field template.
 
-    Scans the source for the write_text block by line: starts at the first
-    `task_file.write_text(` line and collects f"key: pattern lines until
-    the matching close paren, counting open parens to handle nesting.
+    The template is a contiguous run of f-string literal lines — either the
+    inline `task_file.write_text(f"...\\n" ...)` block OR a builder function
+    (e.g. discord-bridge's `_build_task_content()`, which returns the same
+    concatenated f-strings so a build failure is logged instead of raising).
+    We locate the run that contains an `f"task: "` line and check the field
+    order within it, so the field-order defense is verified wherever the
+    template lives — not only when it's inline at the write_text() call.
+
+    (Anchoring solely on `task_file.write_text(` false-negatived after the
+    discord-bridge callable refactor: the write_text arg became a bare
+    variable, so zero inline keys were collected — 2026-07-14.)
     """
-    lines = src.splitlines()
-    in_block = False
-    depth = 0
+    fstr_line = re.compile(r'^\s*f"')          # an f-string literal template line
+    key_pat = re.compile(r'f"([a-z_]+): ')     # a `key: ...` field line
+    run: list[str] = []                        # keys in the current contiguous run
     keys: list[str] = []
-    for line in lines:
-        if not in_block:
-            if "task_file.write_text(" in line:
-                in_block = True
-                # Count parens on this line; the call itself opens one extra
-                # net paren that the rest of the block will close.
-                depth = line.count("(") - line.count(")")
-                # Collect keys on the trigger line itself (uncommon but possible)
-                for m in re.finditer(r'f"([a-z_]+): ', line):
-                    keys.append(m.group(1))
-                continue  # skip the double-count in the in_block branch below
-        if in_block:
-            for m in re.finditer(r'f"([a-z_]+): ', line):
-                keys.append(m.group(1))
-            depth += line.count("(") - line.count(")")
-            if depth <= 0:
+    for line in src.splitlines():
+        if fstr_line.match(line):
+            m = key_pat.search(line)
+            if m:
+                run.append(m.group(1))
+        else:
+            # A non-f-string line ends the run. Keep it iff it's the run that
+            # holds the task template; otherwise it wasn't the template — reset.
+            if "task" in run:
+                keys = run
                 break
+            run = []
+    else:  # file ended mid/at a template run (no trailing non-f-string line)
+        if "task" in run:
+            keys = run
     if "task" not in keys:
         return False
     task_pos = keys.index("task")
