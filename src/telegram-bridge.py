@@ -16,11 +16,21 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import sys
 import time
 import urllib.request
 import urllib.error
 from pathlib import Path
+
+# startup.sh redirects stdout to a log file, which makes CPython block-buffer
+# it — diagnostic prints (e.g. api()'s "API error ..." lines) sit invisible in
+# the buffer for hours, and SIGTERM kills the process without flushing, losing
+# them entirely. Both silent-wedge incidents (2026-06-15 TLS, 2026-07-05 stale
+# heartbeat) had empty logs for exactly this reason. Line-buffer so every
+# print lands in the log as it happens.
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
 
 # Vision-frame helper — pushes the latest photo into the active voice session
 # so Gemini can react in-stream. No-op when voice isn't connected. Import is
@@ -100,7 +110,14 @@ except ImportError:
 # session silently override the freshly-rotated value, same bug class as
 # skills/x-twitter/x-post.py (see PR #416 commit message for full context).
 channels_env = claude_home_path("channels", "telegram", ".env")
-if channels_env.exists():
+if channels_env.exists():  # pragma: no cover — telegram import path not driven by the perms test
+    try:
+        os.chmod(channels_env, 0o600)  # token file — enforce owner-only, mirrors access.json treatment
+    except OSError as e:
+        # Best-effort hardening: a read-only volume, wrong ownership after a
+        # restore/sync, or an ACL-restricted file must NOT crash the bridge at
+        # startup — the file may still be perfectly readable. Warn and continue.
+        print(f"  [startup] warning: could not chmod 0600 {channels_env}: {e}", flush=True)
     for line in channels_env.read_text().splitlines():
         if "=" in line and not line.startswith("#"):
             k, v = line.split("=", 1)
@@ -227,6 +244,14 @@ def presenter_mode_active():
 
 # Load access config
 ACCESS_FILE = channel_access_path("telegram")
+
+# TOFU enrollment code — set at startup when access.json doesn't exist.
+# The first DM must include this code to become owner. RETAINED for the
+# whole process lifetime (never cleared) so the gate stays armed if
+# access.json is deleted externally later (#899). None only when
+# access.json already existed at startup (bridge already enrolled).
+_TOFU_ENROLLMENT_CODE: str | None = None
+
 def load_allowed():
     """Return the set of allowed sender IDs, OR None if access.json doesn't exist.
 
@@ -587,12 +612,30 @@ def poll_progress(pending_replies: dict) -> None:
             pending_task_tiers.pop(tid, None)
 
 
-def main():
+def main():  # pragma: no cover
+    global _TOFU_ENROLLMENT_CODE
     _single_instance_acquire("telegram-bridge")
     print(f"Telegram bridge started. Polling for messages...", flush=True)
     # Restart-safety: sweep orphan `.sending` files before the poll
     # loop starts. See _recover_orphan_sending_files for rationale.
     _recover_orphan_sending_files()
+
+    # TOFU enrollment code: generated when access.json doesn't exist so
+    # the first DM must present it before being auto-enrolled as owner.
+    # Prevents an attacker who can DM the bot from grabbing ownership before
+    # the legitimate owner does. Stays valid for the whole process lifetime
+    # (never cleared after enrollment) so the gate remains armed if access.json
+    # is deleted externally later (#899); only a restart with access.json
+    # present leaves it None (TOFU branch is then unreachable anyway).
+    if not ACCESS_FILE.exists():
+        _TOFU_ENROLLMENT_CODE = secrets.token_hex(3)  # 6-char hex, 16M combinations
+        print("", flush=True)
+        print(f"  *** TOFU enrollment required ***", flush=True)
+        print(f"  Enrollment code: {_TOFU_ENROLLMENT_CODE}", flush=True)
+        print(f"  Send this code in your first DM to register as owner.", flush=True)
+        print(f"  Anyone who sends this code first becomes owner — keep it private.", flush=True)
+        print("", flush=True)
+
     offset = None
     allowed = load_allowed()
     pending_replies = {}  # task_id -> chat_id
@@ -653,8 +696,23 @@ def main():
                 allowed = load_allowed()
                 if allowed is None:
                     # First-ever DM after install — access.json doesn't exist.
-                    # Auto-onboard this sender as the owner (TOFU).
+                    # Require the enrollment code before auto-onboarding as owner.
+                    # This prevents an attacker who can DM the bot from claiming
+                    # ownership before the legitimate owner does.
+                    if _TOFU_ENROLLMENT_CODE and _TOFU_ENROLLMENT_CODE not in (text or ""):
+                        api("sendMessage", chat_id=chat_id, text=(
+                            "Enrollment code required.\n"
+                            "Check the bridge startup log for your code and send it here."
+                        ))
+                        print(f"  TOFU: rejected enrollment from @{username} — code not presented", flush=True)
+                        continue
                     allowed = tofu_onboard(sender_id, username)
+                    # Do NOT clear _TOFU_ENROLLMENT_CODE after enrollment. If
+                    # access.json is later deleted while the bridge keeps running
+                    # (#899), load_allowed() returns None again; keeping the code
+                    # valid for the process lifetime keeps the gate armed so the
+                    # next DM must still present it, instead of falling through to
+                    # an unguarded tofu_onboard(). Single secret, single owner.
                 if sender_id not in allowed:
                     print(f"  Dropped message from non-allowed @{username}")
                     continue

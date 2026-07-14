@@ -195,12 +195,21 @@ except Exception:  # pragma: no cover
 
 # Load token — env var takes precedence (allows test injection without a real .env file)
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
-if not TOKEN:
-    channels_env = claude_home_path("channels", "discord", ".env")
-    if channels_env.exists():
-        for line in channels_env.read_text().splitlines():
-            if line.startswith("DISCORD_BOT_TOKEN="):
-                TOKEN = line.split("=", 1)[1].strip()
+# Tighten perms whenever the token file exists — even when the token is already
+# in process env — so a world-readable .env never survives startup.
+channels_env = claude_home_path("channels", "discord", ".env")
+if channels_env.exists():
+    try:
+        os.chmod(channels_env, 0o600)  # token file — enforce owner-only, mirrors access.json treatment
+    except OSError as e:
+        # Best-effort hardening: a read-only volume, wrong ownership after a
+        # restore/sync, or an ACL-restricted file must NOT crash the bridge at
+        # startup — the file may still be perfectly readable. Warn and continue.
+        print(f"  [startup] warning: could not chmod 0600 {channels_env}: {e}", flush=True)
+if not TOKEN and channels_env.exists():
+    for line in channels_env.read_text().splitlines():
+        if line.startswith("DISCORD_BOT_TOKEN="):
+            TOKEN = line.split("=", 1)[1].strip()
 
 if not TOKEN:
     print("DISCORD_BOT_TOKEN not set in $CLAUDE_CONFIG_DIR/channels/discord/.env")
