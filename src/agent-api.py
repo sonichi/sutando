@@ -31,6 +31,7 @@ Security: Set SUTANDO_API_TOKEN in .env for token auth (Authorization: Bearer <t
 For remote access: use ngrok or SSH tunnel.
 """
 
+import hashlib
 import http.server
 import ipaddress
 import json
@@ -120,6 +121,82 @@ task_history = {}
 # Web client polls /voice/state and connects/disconnects accordingly.
 voice_desired_state = "disconnected"
 
+
+
+# --- pending-questions.md ---------------------------------------------------
+# ONE parser, shared by GET /status (lists the questions, mints their ids) and
+# POST /answer (resolves an id back to a section). They used to walk the file
+# separately, and drifted: the reader took the free-form format (post-#1265, no
+# **Status:** markers) while the writer still required a **Status:**/**Options:**
+# line, so every free-form question was listed but unanswerable — POST /answer
+# 404'd on every id. Both paths stay on this function.
+PQ_ARCHIVE_RE = re.compile(r'^#\s+Resolved\b', re.MULTILINE)
+PQ_SECTION_RE = re.compile(r'^## ', re.MULTILINE)
+PQ_ANSWERED_RE = re.compile(r'\*\*Status:\*\*\s*(resolved|answered|done|complete)', re.IGNORECASE)
+PQ_STATUS_RE = re.compile(r'\*\*Status:\*\*.*')
+PQ_FIELD_RE = re.compile(r'\*\*(?:Status|Options|Asked|Question):\*\*')
+PQ_OPTIONS_RE = re.compile(r'\*\*Options:\*\*\s*(.+)')
+
+
+def parse_pending_questions(content: str) -> list[dict]:
+    """Open questions in pending-questions.md, in file order.
+
+    Ids are derived from the title, not the section's position. The agent
+    rewrites this file continuously, so a positional id minted by one GET
+    points at a different — or already-archived — section by the time the owner
+    clicks answer on it. Each dict carries the section's `start`/`end` offsets
+    into `content` so the writer can splice it back in place.
+
+    Sections below the `# Resolved` divider are the audit trail, not open
+    questions (same cut as check-pending-questions.py:95).
+    """
+    archive = PQ_ARCHIVE_RE.search(content)
+    active = content[:archive.start()] if archive else content
+    starts = [m.start() for m in PQ_SECTION_RE.finditer(active)]
+    questions: list[dict] = []
+    seen: dict[str, int] = {}
+    for n, start in enumerate(starts):
+        end = starts[n + 1] if n + 1 < len(starts) else len(active)
+        head, _, body = active[start:end].partition('\n')
+        title = head[3:].strip()  # drop the '## '
+        if not title or title.startswith('RESOLVED') or title.startswith('[RESOLVED'):
+            continue
+        if PQ_ANSWERED_RE.search(body):
+            continue
+        qid = "Q" + hashlib.sha1(" ".join(title.split()).encode()).hexdigest()[:8]
+        seen[qid] = seen.get(qid, 0) + 1
+        if seen[qid] > 1:  # two sections sharing a title — keep the ids distinct
+            qid = f"{qid}-{seen[qid]}"
+        q = {
+            "id": qid,
+            "text": title,
+            "detail": PQ_FIELD_RE.split(body)[0].strip() or title,
+            "start": start,
+            "end": end,
+        }
+        opts = PQ_OPTIONS_RE.search(body)
+        if opts:
+            q["options"] = [o.strip() for o in opts.group(1).split("|")]
+        questions.append(q)
+    return questions
+
+
+def answer_pending_question(content: str, question: dict, answer: str) -> str:
+    """Return `content` with `question`'s section marked answered.
+
+    The resolution has to land on a **Status:** line: check-pending-questions.py
+    treats a status-less section as unanswered (its free-form convention), so a
+    [RESOLVED] title prefix alone would silence this API's own reader while the
+    notifier kept re-asking the owner hourly.
+    """
+    section = content[question["start"]:question["end"]]
+    status = f"**Status:** Answered {datetime.now().strftime('%Y-%m-%d')} — {' '.join(answer.split())}"
+    if PQ_STATUS_RE.search(section):
+        # A function repl, not a string: a raw answer may contain \1-style escapes.
+        new_section = PQ_STATUS_RE.sub(lambda _m: status, section, count=1)
+    else:
+        new_section = section.rstrip("\n") + f"\n{status}\n\n"
+    return content[:question["start"]] + new_section + content[question["end"]:]
 
 
 def get_status() -> dict:
@@ -473,39 +550,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Return most recent 10 from history
             sorted_tasks = sorted(task_history.items(), key=lambda x: x[1].get("time", 0), reverse=True)[:10]
             tasks = [{"id": tid, **tdata} for tid, tdata in sorted_tasks]
-            # Parse pending questions
+            # Parse pending questions. `start`/`end` are the writer's splice
+            # offsets — internal, not part of the wire format.
             questions = []
             pq_file = Path(personal_path("pending-questions.md", WORKSPACE_DIR))
             if pq_file.exists():
-                import re
-                content = pq_file.read_text()
-                # Split into sections by ## headers
-                sections = re.split(r'^## ', content, flags=re.MULTILINE)
-                for i, section in enumerate(sections):
-                    if not section.strip():
-                        continue
-                    lines = section.strip().split('\n')
-                    title = lines[0].strip()
-                    body = '\n'.join(lines[1:])
-                    # Skip preamble before first ## header (contains the file title).
-                    if i == 0 or title.startswith('#'):
-                        continue
-                    # Skip sections already marked resolved in title — free-form format
-                    # (post-#1265: no **Status:** markers; [RESOLVED ...] prefix instead).
-                    if title.startswith('[RESOLVED') or title.startswith('RESOLVED'):
-                        continue
-                    # Skip resolved/answered questions (structured format — optional marker)
-                    if re.search(r'\*\*Status:\*\*\s*(resolved|answered|done|complete)', body, re.IGNORECASE):
-                        continue
-                    # Extract question text — use body before first metadata field (if any)
-                    q_text = re.split(r'\*\*(?:Status|Options|Asked|Question):\*\*', body)[0].strip()
-                    q_text = q_text if q_text else title
-                    q = {"id": f"Q{i}", "text": title, "detail": q_text}
-                    # Parse custom options if present
-                    opts_match = re.search(r'\*\*Options:\*\*\s*(.+)', body)
-                    if opts_match:
-                        q["options"] = [o.strip() for o in opts_match.group(1).split("|")]
-                    questions.append(q)
+                questions = [
+                    {k: v for k, v in q.items() if k not in ("start", "end")}
+                    for q in parse_pending_questions(pq_file.read_text())
+                ]
             self.send_json(200, {"tasks": tasks, "watcher": watcher_ok, "claude": claude_ok, "questions": questions})
         elif path == "/delegation/results":
             # TaskDelegationService relay backend (#1947): list results/ for
@@ -869,39 +922,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pq_file = Path(personal_path("pending-questions.md", WORKSPACE_DIR))
                 if pq_file.exists():
                     content = pq_file.read_text()
-                    # Update status from unanswered to answered
-                    import re
-                    safe_answer = answer.replace('\n', ' ')
-                    # Try new format: - **Status:** unanswered
-                    pattern = rf'(## [^\n]*\n(?:.*?\n)*?- \*\*Status:\*\* )unanswered'
-                    # Find the right section by matching the question ID
-                    sections = re.split(r'(^## )', content, flags=re.MULTILINE)
-                    new_content = content
-                    # Reconstruct and find the section matching this qid
-                    idx = 0
-                    for si, section in enumerate(re.split(r'^## ', content, flags=re.MULTILINE)):
-                        if not section.strip():
-                            continue
-                        lines = section.strip().split('\n')
-                        title = lines[0].strip()
-                        body = '\n'.join(lines[1:])
-                        if '**Status:**' not in body and '**Options:**' not in body:
-                            continue
-                        if re.search(r'\*\*Status:\*\*\s*(resolved|answered|done|complete)', body, re.IGNORECASE):
-                            continue
-                        idx += 1
-                        if f"Q{si}" == qid:
-                            # Match any waiting/unanswered status line
-                            new_body = re.sub(
-                                r'\*\*Status:\*\*\s*(?:Waiting|unanswered).*',
-                                f'**Status:** Answered — {safe_answer}',
-                                body
-                            )
-                            if new_body != body:
-                                new_content = content.replace(body, new_body)
-                            break
-                    if new_content != content:
-                        pq_file.write_text(new_content)
+                    # Same parser the ids were minted by — see parse_pending_questions.
+                    match = next(
+                        (q for q in parse_pending_questions(content) if q["id"] == qid),
+                        None,
+                    )
+                    if match:
+                        pq_file.write_text(answer_pending_question(content, match, answer))
                         ts = int(datetime.now().timestamp() * 1000)
                         safe_qid = re.sub(r'[^a-zA-Z0-9_\-.]', '', qid)
                         if safe_qid:
