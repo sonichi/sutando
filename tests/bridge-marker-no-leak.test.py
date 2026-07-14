@@ -17,6 +17,7 @@ Guards:
   1. src/slack-bridge.py imports parse_markers from result_markers
   2. src/telegram-bridge.py imports parse_markers from result_markers
   3. src/discord-bridge.py imports parse_markers from result_markers (#896)
+  3c. src/remote-gateway-bridge.py imports parse_markers (file-attach change)
   4. Each bridge's marker-handling block calls parse_markers(...)
   5. result_markers.py exposes the public surface parse_markers + Action
 
@@ -92,6 +93,24 @@ def main() -> int:
             return fail(
                 f"src/discord-bridge.py still has hand-rolled skip check {hand_rolled!r} — "
                 "must route through parse_markers() per #896"
+            )
+
+    # 3c. Remote-gateway bridge wires the parser (outbound file-attach change).
+    # The implementation is canonical in the ag2-sparrow package
+    # (src/remote-gateway-bridge.py is a thin loader shim post-#2082), so the
+    # guard reads the package source; the package imports its bundled copy
+    # relatively ("from .result_markers import ...").
+    gb = REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py"
+    gb_src = gb.read_text()
+    if "from .result_markers import parse_markers" not in gb_src:
+        return fail("ag2_sparrow/remote_gateway_bridge.py must import parse_markers from .result_markers")
+    if "parse_markers(" not in gb_src:
+        return fail("ag2_sparrow/remote_gateway_bridge.py must call parse_markers(...) somewhere")
+    for hand_rolled in ('startswith("[no-send]")', 'startswith("[deduped:")'):
+        if hand_rolled in gb_src:
+            return fail(
+                f"ag2_sparrow/remote_gateway_bridge.py still has hand-rolled skip check {hand_rolled!r} — "
+                "must route through parse_markers() per #873"
             )
 
     # 4. Behavior smoke test of the parser itself

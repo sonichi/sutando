@@ -2,8 +2,9 @@
 # Session handoff — writes a summary for the next session to pick up.
 # Called by PreCompact hook so context survives session restarts.
 #
-# Reads the transcript, extracts key signals, and writes to session-state.md.
-# The incoming session reads this in CLAUDE.md or as part of the proactive loop.
+# Reads the transcript, extracts key signals, and writes to
+# <workspace>/session-state.md. The incoming session reads this in CLAUDE.md
+# or as part of the proactive loop.
 
 # REPO resolves to: (1) $SUTANDO_REPO_DIR if set, (2) auto-detect from the
 # script's parent dir using a sutando-checkout signature, (3) ~/Desktop/sutando
@@ -19,7 +20,6 @@ else
     REPO="$HOME/Desktop/sutando"
 fi
 export PATH="/opt/homebrew/bin:$HOME/.nvm/versions/node/v24.14.1/bin:$PATH"
-STATE_FILE="$REPO/session-state.md"
 TRANSCRIPT="$1"  # Passed by PreCompact hook as $TRANSCRIPT_PATH
 
 # Workspace resolves via the shared post-M0 helper (src/workspace_resolve.sh).
@@ -54,6 +54,12 @@ if [ -z "${WORKSPACE:-}" ]; then
   exit 1
 fi
 WORKSPACE_DIR="$WORKSPACE"  # historical local name retained for the rest of this file
+
+# session-state.md is per-user mutable state — workspace contract says it
+# lives under <workspace>/, not the repo root. Writing to $REPO/ left the
+# workspace copy permanently stale and re-tripped the legacy-state detector
+# after every compaction (sutando-migrate classifies it newest-mtime).
+STATE_FILE="$WORKSPACE_DIR/session-state.md"
 
 # Build state from available signals
 {
