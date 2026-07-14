@@ -44,6 +44,39 @@ CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1)
 # (#2094); conditional so non-bundled/OSS installs are untouched.
 [ -n "${SUTANDO_DEFAULT_WORKSPACE:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_DEFAULT_WORKSPACE=$SUTANDO_DEFAULT_WORKSPACE")
 
+tmux_available() {
+  command -v tmux > /dev/null 2>&1
+}
+
+tmux_session_exists() {
+  tmux_available || return 1
+  tmux -S "$TMUX_SOCKET" has-session -t "$SESSION" 2>/dev/null
+}
+
+# A managed core is alive when the tmux session EXISTS and a `claude --name
+# sutando-core` process is running under it. Do NOT gate on the pane's current
+# foreground command: a healthy core that is mid-tool shows the pane cmd as
+# bash/python3/node/etc, so a pane-command match would falsely report it dead
+# and (on --restart) tear down a live core mid-task. Existence + the core claude
+# process is the correct liveness signal.
+tmux_core_session_running() {
+  tmux_session_exists || return 1
+  core_claude_running
+}
+
+core_claude_pids() {
+  pgrep -x claude 2>/dev/null | while read -r pid; do
+    args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+    case "$args" in
+      *"--name $SESSION"*|*"--name=$SESSION"*) echo "$pid" ;;
+    esac
+  done
+}
+
+core_claude_running() {
+  [ -n "$(core_claude_pids)" ]
+}
+
 # Optional working-directory override for the core `claude` process.
 #   - Unset (upstream default): no override — the core launches from $REPO (the
 #     script's cwd), exactly as before. Zero behavior change for OSS installs.
@@ -309,14 +342,17 @@ fi
 # Safe callers: Sutando.app menu, terminal one-off, future health-check
 # emit-task. Unsafe: a future agent processing a "restart core" task by
 # exec'ing this script from within sutando-core. Per Mini's #608 review.
-if [ "$1" = "--restart" ]; then
-  if tmux -S "$TMUX_SOCKET" has-session -t "$SESSION" 2>/dev/null; then
+if [ "${1:-}" = "--restart" ]; then
+  if tmux_session_exists || core_claude_running; then
     echo "Killing existing $SESSION session..."
     tmux -S "$TMUX_SOCKET" kill-session -t "$SESSION" 2>/dev/null || true
+    core_claude_pids | while read -r pid; do
+      [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+    done
     # Poll for actual shutdown — robust on slow machines, faster on fast
     # ones (~1s ceiling) than a fixed sleep.
     for _ in 1 2 3 4 5; do
-      tmux -S "$TMUX_SOCKET" has-session -t "$SESSION" 2>/dev/null || break
+      tmux_session_exists || core_claude_running || break
       sleep 0.2
     done
   fi
@@ -369,9 +405,11 @@ ensure_core_monitor() {
     > /tmp/core-input-watch.log 2>&1 &
 }
 
-# Already running — attach if interactive, else exit cleanly. This branch
-# also catches the !--restart path so re-running the script is idempotent.
-if tmux -S "$TMUX_SOCKET" has-session -t "$SESSION" 2>/dev/null; then
+# Already running — attach if interactive, else exit cleanly. A managed core is
+# live when the tmux session exists AND a `claude --name sutando-core` process
+# runs under it (tmux_core_session_running). Re-running the script is idempotent:
+# we attach/no-op instead of spawning a second core (→ duplicate task consumers).
+if tmux_core_session_running; then
   apply_tmux_defaults
   ensure_core_monitor   # re-ensure the supervisor monitor on every attach/re-run
   if [ -t 1 ] && command -v tmux > /dev/null 2>&1; then
@@ -381,6 +419,22 @@ if tmux -S "$TMUX_SOCKET" has-session -t "$SESSION" 2>/dev/null; then
   echo "$SESSION already running."
   echo "To attach: tmux -S $TMUX_SOCKET attach -t $SESSION"
   exit 0
+fi
+
+# Orphaned core process, no tmux session — a `claude --name sutando-core` is
+# running detached from any managed session (e.g. its tmux server died but the
+# child claude survived). Adopt it: do NOT start a second core, which would
+# double the task-consumer count. On a non-restart start we reuse the existing
+# process; the operator can `--restart` to cleanly recycle it.
+if core_claude_running; then
+  echo "$SESSION claude process already running (no tmux session) — reusing it." >&2
+  echo "To recycle it cleanly: bash $0 --restart"
+  exit 0
+fi
+
+if tmux_session_exists; then
+  echo "  ⚠ $SESSION tmux session exists but no core Claude process — restarting it" >&2
+  tmux -S "$TMUX_SOCKET" kill-session -t "$SESSION" 2>/dev/null || true
 fi
 
 # Auto-install tmux via Homebrew if missing. Sutando.app's
