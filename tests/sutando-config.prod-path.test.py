@@ -63,6 +63,7 @@ class TestProdPath(unittest.TestCase):
         self._saved_env = os.environ.pop("SUTANDO_WORKSPACE", None)
         self._saved_no_color = os.environ.pop("NO_COLOR", None)
         self._saved_test_mode = os.environ.pop("SUTANDO_TEST_MODE", None)
+        self._saved_app_support = os.environ.pop("SUTANDO_APP_SUPPORT", None)
         _reset_cache_for_tests()
         self._tmpdir = tempfile.mkdtemp(prefix="sutando-prod-path-")
         self.repo = Path(self._tmpdir)
@@ -81,10 +82,49 @@ class TestProdPath(unittest.TestCase):
             os.environ.pop("SUTANDO_TEST_MODE", None)
         else:
             os.environ["SUTANDO_TEST_MODE"] = self._saved_test_mode
+        if self._saved_app_support is None:
+            os.environ.pop("SUTANDO_APP_SUPPORT", None)
+        else:
+            os.environ["SUTANDO_APP_SUPPORT"] = self._saved_app_support
         # Clean up tmp dir
         import shutil
 
         shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    # --- Bundled-app override: $SUTANDO_APP_SUPPORT (test-5 2026-07-14) ---- #
+
+    def test_app_support_fills_default_slot(self) -> None:
+        """$SUTANDO_APP_SUPPORT set + no config → workspace = $APP_SUPPORT/workspace
+        (instead of the {repo_root}/workspace baked-in default that would land
+        inside a read-only .app bundle)."""
+        app = tempfile.mkdtemp(prefix="sutando-appsupport-")
+        try:
+            os.environ["SUTANDO_APP_SUPPORT"] = app
+            got = resolve_workspace(self.repo)
+            self.assertEqual(got, (Path(app) / "workspace").resolve())
+        finally:
+            import shutil
+
+            shutil.rmtree(app, ignore_errors=True)
+
+    def test_explicit_config_wins_over_app_support(self) -> None:
+        """An explicit workspace.path in sutando.config.local.json outranks
+        $SUTANDO_APP_SUPPORT (the env override only fills the default slot)."""
+        app = tempfile.mkdtemp(prefix="sutando-appsupport-")
+        cfg_ws = tempfile.mkdtemp(prefix="sutando-cfgws-")
+        try:
+            os.environ["SUTANDO_APP_SUPPORT"] = app
+            (self.repo / "sutando.config.local.json").write_text(
+                '{"workspace": {"path": "' + cfg_ws + '"}}'
+            )
+            _reset_cache_for_tests()
+            got = resolve_workspace(self.repo)
+            self.assertEqual(got, Path(cfg_ws).resolve())
+        finally:
+            import shutil
+
+            shutil.rmtree(app, ignore_errors=True)
+            shutil.rmtree(cfg_ws, ignore_errors=True)
 
     # --- B4: NO_COLOR honored --------------------------------------------- #
 

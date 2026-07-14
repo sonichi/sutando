@@ -292,7 +292,10 @@ def resolve_workspace(repo_root: Optional[Path] = None) -> Path:
 
     Order (v0.8 — `$SUTANDO_WORKSPACE` env override removed):
       1. `sutando.config.{json,local.json}` → `workspace.path` (deep-merged).
-      2. `{repo_root}/workspace` baked-in default.
+      2. `$SUTANDO_APP_SUPPORT/workspace` — bundled-app override (host-set by the
+         Tauri app to its writable app_data_dir; fills only the default slot,
+         below explicit config. See the branch comment for the full rationale).
+      3. `{repo_root}/workspace` baked-in default.
 
     Does NOT create the directory; the caller decides. Returns an absolute
     `Path`.
@@ -340,8 +343,24 @@ def resolve_workspace(repo_root: Optional[Path] = None) -> Path:
     cfg = load_config(repo_root)
     root = repo_root or _CACHE_REPO_ROOT
     cfg_path = (cfg.get("workspace") or {}).get("path")
+    # Bundled-app override (added 2026-07-14, test-5): `$SUTANDO_APP_SUPPORT`,
+    # when set AND no explicit `workspace.path` config, defaults the workspace
+    # to `$SUTANDO_APP_SUPPORT/workspace` — ranked BELOW an explicit config but
+    # ABOVE the `{repo_root}/workspace` baked-in default. Why env, not config:
+    # a static bundle `sutando.config.json` can only expand `${REPO_DIR}`, not
+    # `$HOME`, and for the Tauri app `{repo_root}` is the engine dir INSIDE the
+    # read-only `.app` bundle — so the baked-in default lands in a read-only
+    # location and the bundled core's tasks/state/CLAUDE_CONFIG_DIR (all derived
+    # from the workspace) can't be written → gateway can't ingest tasks. The
+    # Tauri host sets `SUTANDO_APP_SUPPORT` to its writable app_data_dir
+    # (`~/Library/Application Support/space.ag2.app`). This is NOT the removed
+    # `$SUTANDO_WORKSPACE` escape hatch: it is scoped to the bundled-runtime
+    # case (host-set, no user shell involvement) and only fills the default slot.
+    app_support = os.environ.get("SUTANDO_APP_SUPPORT", "").strip()
     if cfg_path:
         resolved = Path(cfg_path).expanduser().resolve()
+    elif app_support:
+        resolved = (Path(app_support).expanduser() / "workspace").resolve()
     elif root is None:
         # No config and no repo root — last-ditch fallback for ad-hoc invocations
         # outside a checkout. Post-v0.8 (#1440 + Mini opinion-requested 2026-06-06),
