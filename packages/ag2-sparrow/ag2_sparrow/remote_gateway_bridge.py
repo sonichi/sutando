@@ -558,21 +558,25 @@ def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
     return MEDIA_MARKER_RE.sub(lambda _m: f"[{label}: {path}]", body, count=1)
 
 
-def _write_owner_activity(task: dict) -> None:
+def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
     """Record that the owner was active on this transport right now — but only
-    when THIS node resolves the SENDER to owner tier. Gated on
-    `_tier_for(user_id)`, NOT the gateway-wide LOCAL_TIER: in a shared room a
+    when THIS node resolves the SENDER to owner tier. Gated on the sender's
+    resolved tier, NOT the gateway-wide LOCAL_TIER: in a shared room a
     down-tiered teammate (tierMap[...] = "team"/"other") must not overwrite
     `state/last-owner-activity.json`, or their message would poison owner-presence
     routing (the proactive-loop's "owner active N min ago" signal + the core-
-    supervisor escalation target). For an unlisted sender `_tier_for` returns
-    LOCAL_TIER, so the single-owner case is unchanged. Never trusts the gateway's
-    own claim (it is outside the trust boundary) — only the broker-attested
-    user_id keyed against the owner's LOCAL tierMap. Atomic write via tmp+rename;
-    same schema (`ts`, `channel`, `summary`) as discord-bridge.write_owner_activity
-    so the proactive-loop reader is transport-agnostic. Best-effort — never blocks
-    task intake."""
-    if _tier_for(task.get("user_id")) != "owner":
+    supervisor escalation target). `sender_tier` is passed in by `_write_task` so
+    the task tier and this gate share a SINGLE resolution (no divergence, no
+    double tierMap read); a direct caller can omit it and we resolve here. For an
+    unlisted sender `_tier_for` returns LOCAL_TIER, so the single-owner case is
+    unchanged. Never trusts the gateway's own claim (it is outside the trust
+    boundary) — only the broker-attested user_id keyed against the owner's LOCAL
+    tierMap. Atomic write via tmp+rename; same schema (`ts`, `channel`, `summary`)
+    as discord-bridge.write_owner_activity so the proactive-loop reader is
+    transport-agnostic. Best-effort — never blocks task intake."""
+    if sender_tier is None:
+        sender_tier = _tier_for(task.get("user_id"))
+    if sender_tier != "owner":
         return
     try:
         OWNER_ACTIVITY_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -689,14 +693,19 @@ def _write_task(task: dict) -> str | None:
     # forge an earlier one either. Resolved per broker-attested sender via the
     # owner's tierMap (LOCAL file), falling back to LOCAL_TIER for unlisted
     # senders — so a named teammate can be down-tiered without trusting the task.
-    lines.append(f"access_tier: {_tier_for(task.get('user_id'))}")
+    # Resolve ONCE and reuse for both the task tier AND the owner-activity gate
+    # below, so the two decisions can never diverge (a single source of truth,
+    # no double read of the tierMap).
+    sender_tier = _tier_for(task.get("user_id"))
+    lines.append(f"access_tier: {sender_tier}")
     tmp = dest.with_suffix(".txt.tmp")
     tmp.write_text("\n".join(lines) + "\n")
     tmp.rename(dest)  # atomic publish so the watcher never sees a partial file
     _log(f"queued {tid}")
     _record_task_room(tid, str(task.get("channel_id") or ""))
-    # Bridges-as-siblings: feed the proactive-loop's active-engagement gate.
-    _write_owner_activity(task)
+    # Bridges-as-siblings: feed the proactive-loop's active-engagement gate — but
+    # only for owner-tier senders (same resolved tier as the task above).
+    _write_owner_activity(task, sender_tier)
     return tid
 
 
