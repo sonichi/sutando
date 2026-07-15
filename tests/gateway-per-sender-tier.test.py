@@ -6,7 +6,6 @@ self-claim). This test covers the owner-controlled per-sender tierMap layered on
 top of LOCAL_TIER: a named teammate is down-tiered by user_id, everyone else
 keeps LOCAL_TIER, and a malformed/missing map never re-tiers (fail-soft).
 """
-import importlib.util
 import json
 import sys
 import tempfile
@@ -14,16 +13,14 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
-
-def _load(name, path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    m = importlib.util.module_from_spec(spec)
-    sys.modules[name] = m
-    spec.loader.exec_module(m)
-    return m
-
-
-rgb = _load("remote_gateway_bridge", REPO / "src" / "remote-gateway-bridge.py")
+# Load the EXACT module this PR modifies — packages/ag2-sparrow/ag2_sparrow/
+# remote_gateway_bridge.py — as a proper package import so its relative imports
+# resolve. (An earlier version loaded src/remote-gateway-bridge.py, a shim that
+# EXECS this file; that shim contains none of these functions textually, so the
+# indirection made it non-obvious the test exercised the new code — review catch.
+# Importing the packages module directly removes all doubt.)
+sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
+import ag2_sparrow.remote_gateway_bridge as rgb  # noqa: E402
 
 failures = []
 
@@ -104,6 +101,27 @@ before = OWNER_ACT.read_text()
 rgb._write_owner_activity({"task": "rick here", "source": "ag2space", "user_id": "@rick:ag2.space", "channel_id": "!r:hs"})
 check("teammate does not clobber owner's activity record", OWNER_ACT.read_text() == before)
 
-_total = 11
+# --- clamp: the map can only DOWN-tier, never escalate above LOCAL_TIER ---
+# 12. on a LOCAL_TIER=team node, a map entry of "owner" is clamped to team, while
+# a "other" entry still down-tiers. Guards against a misconfigured/compromised
+# access.json escalating a sender above the node's own default.
+_prev_local = rgb.LOCAL_TIER
+rgb.LOCAL_TIER = "team"
+_write_map({"@rick:ag2.space": "owner", "@stranger:ag2.space": "other"})
+check("map cannot escalate above LOCAL_TIER (owner clamped to team)", rgb._tier_for("@rick:ag2.space") == "team")
+check("map still down-tiers below LOCAL_TIER (team node, 'other' honored)", rgb._tier_for("@stranger:ag2.space") == "other")
+rgb.LOCAL_TIER = _prev_local
+
+# --- fail-safe: a transient read error preserves the last-known-good map ---
+# 13. once a teammate is down-tiered, a malformed/mid-write access.json must NOT
+# silently fail-open them back to LOCAL_TIER (owner). Preserve last-known-good.
+_write_map({"@rick:ag2.space": "team"})
+assert rgb._tier_for("@rick:ag2.space") == "team"  # prime the cache with a good read
+ACCESS.write_text("{ corrupt not json ]")           # file now unparseable
+rgb._TIER_MAP_CACHE["mtime"] = -1                    # force a re-read attempt (hits except)
+check("malformed re-read keeps the down-tier (fail-safe, not fail-open to owner)",
+      rgb._tier_for("@rick:ag2.space") == "team")
+
+_total = 13
 print(f"\nResults: {_total - len(failures)}/{_total} passed" if not failures else f"\nResults: FAILED {failures}")
 sys.exit(1 if failures else 0)

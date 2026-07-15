@@ -181,37 +181,61 @@ _TIER_MAP_CACHE = {"mtime": None, "map": {}}
 
 
 def _load_tier_map():
-    """Return the owner's {sender_mxid: tier} map, mtime-cached. Fail-soft to {}."""
+    """Return the owner's {sender_mxid: tier} map, mtime-cached.
+
+    Preserves the last-known-good map on a READ error (stat/open/parse failure)
+    rather than clearing to {}. Clearing would silently up-tier every previously
+    down-tiered sender back to LOCAL_TIER the moment access.json is mid-write,
+    corrupt, or transiently unreadable — a fail-OPEN that is especially bad on a
+    LOCAL_TIER=owner node (a teammate momentarily regains owner). Only a
+    SUCCESSFUL read of a changed file replaces the cache; a fixed file (new mtime)
+    is picked up on the next call. A genuine deletion keeps the last map until the
+    owner writes an empty tierMap or the process restarts (the safe, non-surprising
+    tradeoff — the map floor never drops on a transient fault)."""
     path = _ag2space_access_path()
     try:
         mt = os.path.getmtime(path)
     except OSError:
-        _TIER_MAP_CACHE["mtime"], _TIER_MAP_CACHE["map"] = None, {}
-        return {}
+        # Absent/unstattable → keep last-known-good (initially {} before any load).
+        return _TIER_MAP_CACHE["map"]
     if mt == _TIER_MAP_CACHE["mtime"]:
         return _TIER_MAP_CACHE["map"]
-    tm = {}
     try:
         with open(path) as f:
             raw = (json.load(f) or {}).get("tierMap") or {}
+        tm = {}
         for who, tier in raw.items():
             t = str(tier).strip().lower()
             if isinstance(who, str) and t in ("owner", "team", "other"):
                 tm[who.strip()] = t
     except Exception:
-        tm = {}  # malformed file → no re-tiering, keep LOCAL_TIER for everyone
+        # Malformed / mid-write → keep last-known-good; don't advance mtime so a
+        # later successful read of the fixed file is still picked up.
+        return _TIER_MAP_CACHE["map"]
     _TIER_MAP_CACHE["mtime"], _TIER_MAP_CACHE["map"] = mt, tm
     return tm
 
 
+# Privilege ordering — a higher rank is MORE privileged. Used to clamp a mapped
+# tier so the owner file can only ever DOWN-tier (never escalate above the node's
+# own default), keeping the "map only down-tiers named senders" safety invariant
+# true in code rather than only in the comment.
+_TIER_RANK = {"other": 0, "team": 1, "owner": 2}
+
+
 def _tier_for(user_id):
     """Resolve the access_tier for a task's broker-attested sender.
-    Listed senders get their mapped tier; everyone else gets LOCAL_TIER."""
+
+    A listed sender gets their mapped tier, CLAMPED to <= LOCAL_TIER: the map can
+    down-tier a sender below this node's default but never raise them above it, so
+    a compromised/misconfigured access.json can never ESCALATE. Everyone else
+    (unlisted / no user_id) gets LOCAL_TIER."""
     uid = (user_id or "").strip()
     if uid:
         mapped = _load_tier_map().get(uid)
-        if mapped in ("owner", "team", "other"):
-            return mapped
+        if mapped in _TIER_RANK:
+            local_rank = _TIER_RANK.get(LOCAL_TIER, _TIER_RANK["owner"])
+            return mapped if _TIER_RANK[mapped] <= local_rank else LOCAL_TIER
     return LOCAL_TIER
 
 
