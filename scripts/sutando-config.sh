@@ -264,8 +264,66 @@ print(_host_label(), end='')
     echo "workspace bootstrapped: $ws" >&2
     ;;
 
+  tmux-socket)
+    # Print the tmux socket the sutando-core session runs on. Mirrors the
+    # resolution in src/agent/claude/cli/start-cli.sh (`${SUTANDO_TMUX_SOCKET:-
+    # /tmp/sutando-tmux.sock}`) so a caller resolves the same socket the core
+    # actually launched on. Contract sibling of `workspace` — resolve via helper,
+    # never hardcode /tmp/sutando-tmux.sock. NOTE: for a FOREIGN caller (e.g. the
+    # desktop app, whose own env may point SUTANDO_TMUX_SOCKET at a private
+    # bundled socket) prefer the env-independent `runtime` subcommand below,
+    # which pins to the default OSS socket. This getter honors the ambient env
+    # and is meant for same-runtime callers.
+    printf '%s' "${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
+    ;;
+
+  runtime)
+    # Emit this install's AgentRuntime descriptor as one JSON object — the single
+    # OSS-side contract the desktop app reads to resolve which runtime to attach
+    # its Terminal to, route task-drops/gateway to, and decide port-vs-new
+    # (issue ag2-space/ag2space-cinny-desktop#98). Keyed on the repo; everything
+    # else derives:
+    #   {alive, repo, workspace, brain, socket, session, health, authenticated}
+    # FOREIGN-CALLER-SAFE: the liveness probe is pinned to the default OSS socket
+    # (/tmp/sutando-tmux.sock) so a caller whose OWN env points SUTANDO_TMUX_SOCKET
+    # at a different (e.g. bundled) socket still gets THIS OSS runtime's status,
+    # never the caller's socket (the re-split trap). Non-default OSS sockets are a
+    # documented fast-follow (record the real socket in the .alive heartbeat).
+    # Reuses src/runtime-health.py for alive/health/authenticated (single liveness
+    # source of truth) and adds the resolved repo / workspace / brain paths.
+    python3 -c "
+import sys, os, json, subprocess
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import resolve_workspace
+repo = '$REPO_ROOT'
+ws = str(resolve_workspace())
+brain = os.path.join(ws, '.claude-sutando')
+# Pin the probe to the default OSS socket — env-independent, so a foreign
+# caller's SUTANDO_TMUX_SOCKET (bundled) can't misdirect it.
+env = dict(os.environ, SUTANDO_TMUX_SOCKET='/tmp/sutando-tmux.sock')
+h = {}
+try:
+    out = subprocess.run([sys.executable, os.path.join(repo, 'src', 'runtime-health.py')],
+                         capture_output=True, text=True, timeout=15, env=env, cwd=repo)
+    if out.stdout.strip():
+        h = json.loads(out.stdout)
+except Exception:
+    pass
+print(json.dumps({
+    'alive': bool(h.get('core_running', False)),
+    'repo': repo,
+    'workspace': ws,
+    'brain': brain,
+    'socket': h.get('tmux_socket') or '/tmp/sutando-tmux.sock',
+    'session': h.get('session', 'sutando-core'),
+    'health': h.get('health', 'unknown'),
+    'authenticated': h.get('authenticated'),
+}))
+"
+    ;;
+
   *)
-    echo "usage: $0 {workspace|vault-enabled|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|claude-home-path <subpath>|core-config-dir-env-name [type|id]|core-config-dir-value [type|id]|core-config-dirs|host-label|dump|subdirs|bootstrap}" >&2
+    echo "usage: $0 {workspace|vault-enabled|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|claude-home-path <subpath>|core-config-dir-env-name [type|id]|core-config-dir-value [type|id]|core-config-dirs|host-label|tmux-socket|runtime|dump|subdirs|bootstrap}" >&2
     exit 2
     ;;
 esac
