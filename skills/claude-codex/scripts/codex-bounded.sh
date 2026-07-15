@@ -39,8 +39,13 @@ done
 [[ -n "$MAX" ]] || MAX=900
 [[ $# -ge 1 ]] || { echo "codex-bounded: no command given" >&2; exit 2; }
 
-# Portable mtime (BSD/macOS `stat -f`, GNU/Linux `stat -c`).
-_mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null; }
+# Portable mtime: GNU/Linux `stat -c %Y` first, fall back to BSD/macOS
+# `stat -f %m`. On GNU stat, -f means --file-system (a boolean flag, not a
+# format prefix), so `stat -f %m file` treats `%m` as a filename arg — it
+# exits 1 (fallback triggers) but also writes filesystem info for `file` to
+# stdout, contaminating the output with a multiline string that breaks the
+# arithmetic watchdog check. Trying -c first avoids that pollution entirely.
+_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null; }
 
 # Recursively kill a process and all its descendants (macOS-safe: pgrep -P).
 _kill_tree() {
