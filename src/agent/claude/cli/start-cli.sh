@@ -393,16 +393,36 @@ apply_tmux_defaults() {
 # The guard is scoped to THIS socket + out path so a monitor for a different
 # core/socket can never suppress this one.
 ensure_core_monitor() {
-  local ws mon_out
+  local ws mon_out relay_pid_file relay_state
   ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
   [ -n "$ws" ] || return 0
   mon_out="$ws/state/core-supervisor.json"
-  if pgrep -f "core-input-watch\.py .*--socket ${TMUX_SOCKET} .*--out ${mon_out}" > /dev/null 2>&1; then
-    return 0   # a monitor for this exact core is already running
+  # Monitor (PR #2100): launch unless one for this exact socket+out is running.
+  if ! pgrep -f "core-input-watch\.py .*--socket ${TMUX_SOCKET} .*--out ${mon_out}" > /dev/null 2>&1; then
+    python3 "$REPO/src/core-input-watch.py" \
+      --socket "$TMUX_SOCKET" --session "$SESSION" --out "$mon_out" \
+      > /tmp/core-input-watch.log 2>&1 &
   fi
-  python3 "$REPO/src/core-input-watch.py" \
-    --socket "$TMUX_SOCKET" --session "$SESSION" --out "$mon_out" \
-    > /tmp/core-input-watch.log 2>&1 &
+  # Communicator relay (PR #2101): the monitor only WRITES core-supervisor.json;
+  # nothing escalated it, so a hard-blocker (blocked-human / logged-out) on a
+  # no-TTY core never reached an away owner. Run the one-shot relay on a cadence
+  # so those states escalate to the owner's most-recently-active channel
+  # (--active-from). The relay debounces internally (--state-file), so re-running
+  # every 30s escalates a given stuck episode exactly once. Pidfile + kill -0
+  # guard so an attach/re-run never double-starts the loop. Only blocked-human /
+  # logged-out escalate (relay's HARD_ESCALATE); hung/crashed are RECOVER's job.
+  relay_pid_file="$ws/state/core-supervisor-relay-loop.pid"
+  relay_state="$ws/state/core-supervisor-relay.state"
+  if ! { [ -f "$relay_pid_file" ] && kill -0 "$(cat "$relay_pid_file" 2>/dev/null)" 2>/dev/null; }; then
+    ( while true; do
+        python3 "$REPO/src/core-supervisor-relay.py" \
+          --signal "$mon_out" --state-file "$relay_state" \
+          --active-from "$ws/state/last-owner-activity.json" \
+          >> /tmp/core-supervisor-relay.log 2>&1
+        sleep 30
+      done ) &
+    echo $! > "$relay_pid_file"
+  fi
 }
 
 # Already running — attach if interactive, else exit cleanly. A managed core is
