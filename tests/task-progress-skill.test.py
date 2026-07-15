@@ -254,6 +254,33 @@ class TestSendRemoteGateway(unittest.TestCase):
                          {"op": "message", "room_id": "!room:ag2.space", "body": "hi"})
         self.assertEqual(captured["auth"], "Bearer sekret")
 
+    def test_remote_task_token_combined_form_delivers(self):
+        """Regression for #2101 review round 2 (P1): the compact combined form in
+        REMOTE_TASK_TOKEN itself (REMOTE_TASK_TOKEN=url|secret, no separate
+        REMOTE_TASK_URL) — the documented bootstrap shortcut — must deliver, not
+        fail with url empty."""
+        captured = {}
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = b'{"ok": true}'
+
+        def fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            captured["auth"] = req.get_header("Authorization")
+            return mock_resp
+
+        _drop = ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "AG2_REMOTE_URL")
+        clean_env = {k: v for k, v in os.environ.items() if k not in _drop}
+        with patch.object(self.mod, "_env_file",
+                          return_value={"REMOTE_TASK_TOKEN": "https://gw.example/relay|sekret"}), \
+             patch.dict(os.environ, clean_env, clear=True), \
+             patch("urllib.request.urlopen", fake_urlopen):
+            result = self.mod.send_remote_gateway("ag2space", "!room:ag2.space", "hi")
+        self.assertTrue(result)
+        self.assertEqual(captured["url"], "https://gw.example/relay/v1/room")
+        self.assertEqual(captured["auth"], "Bearer sekret")
+
 
 class TestGatewaySourceTraversal(unittest.TestCase):
     """Regression for the confirmed traversal finding on PR #2054: a --source

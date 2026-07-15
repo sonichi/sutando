@@ -170,22 +170,23 @@ def send_remote_gateway(source: str, channel_id: str, message: str) -> bool:
     env = _env_file(real_env)
     url = (os.environ.get("REMOTE_TASK_URL") or env.get("REMOTE_TASK_URL", "")).rstrip("/")
     token = os.environ.get("REMOTE_TASK_TOKEN", "").strip() or env.get("REMOTE_TASK_TOKEN", "")
-    # AG2-compatible onboarding: a single AG2_REMOTE_TOKEN carries the combined
-    # "https://<gateway>|<secret>" form (the URL travels inside the token) — the
-    # same contract ag2-sparrow's remote_gateway_bridge and startup.sh already
-    # accept. Fall back to it so an ag2space channel provisioned with ONLY
-    # AG2_REMOTE_TOKEN can deliver (without this, ag2space escalations from the
-    # core-supervisor relay fail while the debounce still marks them notified).
+    # One-token onboarding: REMOTE_TASK_TOKEN (or the legacy AG2_REMOTE_TOKEN
+    # alias) may carry the combined "https://<gateway>|<secret>" form — the URL
+    # travels inside the token. This is the same contract ag2-sparrow's
+    # remote_gateway_bridge accepts and the documented bootstrap shortcut
+    # (docs/remote-gateway-protocol.md). Fall back to the alias when no
+    # REMOTE_TASK_TOKEN is set, then split the "|" form for EITHER var so a
+    # channel provisioned with only a compact token (in either name) still
+    # delivers — without this, ag2space escalations fail while the relay's
+    # debounce would otherwise mark them notified.
     if not token:
-        _raw = (os.environ.get("AG2_REMOTE_TOKEN") or env.get("AG2_REMOTE_TOKEN", "")).strip()
-        if "|" in _raw:
-            _u, token = _raw.split("|", 1)
-            if not url:
-                url = _u.rstrip("/")
-        elif _raw:
-            token = _raw
+        token = (os.environ.get("AG2_REMOTE_TOKEN") or env.get("AG2_REMOTE_TOKEN", "")).strip()
+    if "|" in token:
+        _u, token = token.split("|", 1)
         if not url:
-            url = (os.environ.get("AG2_REMOTE_URL") or env.get("AG2_REMOTE_URL", "")).rstrip("/")
+            url = _u.rstrip("/")
+    if not url:
+        url = (os.environ.get("AG2_REMOTE_URL") or env.get("AG2_REMOTE_URL", "")).rstrip("/")
     if not url or not token:
         print(f"[task-progress] no REMOTE_TASK_URL/REMOTE_TASK_TOKEN (or AG2_REMOTE_TOKEN) "
               f"for source '{source}' (looked in {env_path})", file=sys.stderr)
