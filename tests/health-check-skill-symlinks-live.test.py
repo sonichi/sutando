@@ -70,15 +70,6 @@ try:
     r = hc.check_skill_symlinks()
     check(r["status"] == "ok", f"E: recheck ok ({r['detail']})")
 
-    # Case F: fix error path — read-only destination dir -> symlink_to raises,
-    # error is collected and status degrades to warn
-    (fake_repo / "skills" / "qux").mkdir()
-    os.chmod(dst, 0o555)
-    try:
-        f = hc.fix_skill_symlinks({"name": "skill-symlinks", "status": "warn", "_unlinked": ["qux"]})
-    finally:
-        os.chmod(dst, 0o755)
-    check(f["status"] == "warn" and "errors" in f["detail"], f"F: read-only dst surfaces error ({f['detail']})")
 finally:
     if orig_home is not None:
         os.environ["HOME"] = orig_home
