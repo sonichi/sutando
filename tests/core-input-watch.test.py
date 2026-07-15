@@ -143,10 +143,26 @@ class TestComposeState(unittest.TestCase):
 
     def test_hung_when_base_unknown(self):
         # runtime-health "unknown" = live session but stale/absent core-status
-        # (wedged loop) → the supervisor's hung, carrying the pane tail.
+        # (wedged loop) → the supervisor's hung, carrying the pane tail. Uses a
+        # WORKING (no-affordance) pane: no idle footer → genuinely wedged.
         st, _d, prompt, _k = compose_state(_WORKING, "unknown", True)
         self.assertEqual(st, "hung")
         self.assertIsNotNone(prompt)
+
+    def test_idle_ready_overrides_stale_status_when_pane_is_idle(self):
+        # #2112: a healthy core sitting at its idle prompt writes core-status
+        # rarely, so runtime-health goes "unknown" (stale status) and WOULD be
+        # falsely flagged hung (→ spurious ESCALATE / RECOVER). When the pane
+        # POSITIVELY shows the idle-ready footer, trust it: idle, not wedged.
+        idle_footer = ("prior output\n\n"
+                       "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
+        st, _d, _p, _k = compose_state(idle_footer, "unknown", True)
+        self.assertEqual(st, "idle-ready")
+        # A no-affordance pane (mid-work / frozen) with the same stale status must
+        # STILL read hung — the override is positive-idle-only, so genuine wedge
+        # detection is preserved.
+        st2, *_ = compose_state("Running step 3...\n(no prompt, no footer)", "unknown", True)
+        self.assertEqual(st2, "hung")
 
 
 class TestAutoAnswer(unittest.TestCase):
