@@ -24,7 +24,7 @@ SRC = Path(__file__).resolve().parent.parent / "src"
 
 def _load(state_dir: Path, key: str = "", env: dict | None = None):
     """Import a fresh telemetry module with a temp state dir + clean env."""
-    for k in ("DO_NOT_TRACK", "SUTANDO_TELEMETRY", "POSTHOG_API_KEY", "SUTANDO_DEBUG_TELEMETRY"):
+    for k in ("DO_NOT_TRACK", "SUTANDO_TELEMETRY", "POSTHOG_API_KEY", "SUTANDO_DEBUG_TELEMETRY", "SUTANDO_SURFACE"):
         os.environ.pop(k, None)
     os.environ["SUTANDO_STATE_DIR"] = str(state_dir)
     # Force the module's state dir to the temp path even if workspace_default
@@ -139,6 +139,42 @@ def run():
         assert (sd / "telemetry-id").read_text().strip() == d1
         passed += 1
         print("ok   distinct_id persists across calls")
+
+    # 5) Surface (desktop vs OSS) — explicit env, pgrep probe, and payload wiring.
+    import unittest.mock as _um
+    with tempfile.TemporaryDirectory() as td:
+        mod = _load(Path(td), key="phc_live", env={"SUTANDO_SURFACE": "desktop"})
+        assert mod._install_surface() == "desktop", "SUTANDO_SURFACE=desktop → desktop"
+        passed += 1
+        print("ok   surface: SUTANDO_SURFACE=desktop honored")
+    with tempfile.TemporaryDirectory() as td:
+        mod = _load(Path(td), key="phc_live", env={"SUTANDO_SURFACE": "oss"})
+        assert mod._install_surface() == "oss", "SUTANDO_SURFACE=oss → oss"
+        passed += 1
+        print("ok   surface: SUTANDO_SURFACE=oss honored")
+    with tempfile.TemporaryDirectory() as td:
+        mod = _load(Path(td), key="phc_live")  # no env override → pgrep decides
+        with _um.patch.object(mod.subprocess, "run",
+                              return_value=_um.Mock(returncode=0, stdout="4321\n")):
+            assert mod._install_surface() == "desktop", "pgrep hit → desktop"
+        with _um.patch.object(mod.subprocess, "run",
+                              return_value=_um.Mock(returncode=1, stdout="")):
+            assert mod._install_surface() == "oss", "pgrep miss → oss"
+        with _um.patch.object(mod.subprocess, "run", side_effect=OSError("boom")):
+            assert mod._install_surface() == "oss", "pgrep error → oss (fail-safe)"
+        passed += 1
+        print("ok   surface: pgrep probe (hit/miss/error) resolves correctly")
+    with tempfile.TemporaryDirectory() as td:
+        mod = _load(Path(td), key="phc_live", env={"SUTANDO_SURFACE": "desktop"})
+        calls = []
+        mod._post = lambda payload: calls.append(payload)  # type: ignore
+        _capture_sync(mod, "feature_used", {"feature": "x"})
+        assert len(calls) == 1
+        pr = calls[0]["properties"]
+        assert pr["surface"] == "desktop", f"event-prop surface wrong: {pr.get('surface')}"
+        assert pr["$set"]["surface"] == "desktop", f"$set person-prop surface wrong: {pr.get('$set')}"
+        passed += 1
+        print("ok   surface: attached to payload (event property + $set person property)")
 
     print(f"\nALL PASS ({passed} checks)")
     return 0
