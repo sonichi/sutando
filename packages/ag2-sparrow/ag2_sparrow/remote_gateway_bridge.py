@@ -560,12 +560,19 @@ def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
 
 def _write_owner_activity(task: dict) -> None:
     """Record that the owner was active on this transport right now — but only
-    when THIS node grants gateway traffic owner tier (LOCAL_TIER, never the
-    gateway's own claim; the gateway is outside the trust boundary). Atomic write
-    via tmp+rename; same schema (`ts`, `channel`, `summary`) as
-    discord-bridge.write_owner_activity so the proactive-loop reader is
-    transport-agnostic. Best-effort — never blocks task intake."""
-    if LOCAL_TIER != "owner":
+    when THIS node resolves the SENDER to owner tier. Gated on
+    `_tier_for(user_id)`, NOT the gateway-wide LOCAL_TIER: in a shared room a
+    down-tiered teammate (tierMap[...] = "team"/"other") must not overwrite
+    `state/last-owner-activity.json`, or their message would poison owner-presence
+    routing (the proactive-loop's "owner active N min ago" signal + the core-
+    supervisor escalation target). For an unlisted sender `_tier_for` returns
+    LOCAL_TIER, so the single-owner case is unchanged. Never trusts the gateway's
+    own claim (it is outside the trust boundary) — only the broker-attested
+    user_id keyed against the owner's LOCAL tierMap. Atomic write via tmp+rename;
+    same schema (`ts`, `channel`, `summary`) as discord-bridge.write_owner_activity
+    so the proactive-loop reader is transport-agnostic. Best-effort — never blocks
+    task intake."""
+    if _tier_for(task.get("user_id")) != "owner":
         return
     try:
         OWNER_ACTIVITY_FILE.parent.mkdir(parents=True, exist_ok=True)

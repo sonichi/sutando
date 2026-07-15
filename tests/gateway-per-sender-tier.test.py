@@ -79,5 +79,31 @@ check("malformed access.json → LOCAL_TIER", rgb._tier_for("@rick:ag2.space") =
 _write_map({"@rick:ag2.space": "team", "@sam:ag2.space": "team"})
 check("live-added teammate → team", rgb._tier_for("@sam:ag2.space") == "team")
 
-print(f"\nResults: {8 - len(failures)}/8 passed" if not failures else f"\nResults: FAILED {failures}")
+# --- owner-activity gate (same tier map must gate presence, not just task tier) ---
+# Regression for the blocking finding on a3e24dd: _write_owner_activity() gated on
+# the blanket LOCAL_TIER, so a down-tiered teammate still overwrote
+# state/last-owner-activity.json and poisoned owner-presence routing. It must gate
+# on the SENDER's resolved tier, exactly like the task access_tier write.
+OWNER_ACT = tmp / "last-owner-activity.json"
+rgb.OWNER_ACTIVITY_FILE = OWNER_ACT
+_write_map({"@rick:ag2.space": "team"})
+
+# 9. owner sender → owner-activity IS written
+OWNER_ACT.unlink(missing_ok=True)
+rgb._write_owner_activity({"task": "hi", "source": "ag2space", "user_id": "@qingyun:ag2.space", "channel_id": "!r:hs"})
+check("owner sender writes owner-activity", OWNER_ACT.exists())
+
+# 10. team-tier teammate → owner-activity NOT written (the fix)
+OWNER_ACT.unlink(missing_ok=True)
+rgb._write_owner_activity({"task": "hi", "source": "ag2space", "user_id": "@rick:ag2.space", "channel_id": "!r:hs"})
+check("team teammate does NOT write owner-activity", not OWNER_ACT.exists())
+
+# 11. team teammate cannot OVERWRITE a prior genuine owner-activity record
+rgb._write_owner_activity({"task": "owner here", "source": "ag2space", "user_id": "@qingyun:ag2.space", "channel_id": "!r:hs"})
+before = OWNER_ACT.read_text()
+rgb._write_owner_activity({"task": "rick here", "source": "ag2space", "user_id": "@rick:ag2.space", "channel_id": "!r:hs"})
+check("teammate does not clobber owner's activity record", OWNER_ACT.read_text() == before)
+
+_total = 11
+print(f"\nResults: {_total - len(failures)}/{_total} passed" if not failures else f"\nResults: FAILED {failures}")
 sys.exit(1 if failures else 0)
