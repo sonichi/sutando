@@ -496,12 +496,28 @@ def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:
 
 def iter_archived_tasks(tasks_dir: Path) -> Iterable[Path]:
     """Yield every archived task file (flat legacy + month-partitioned),
-    for corpus sweeps and golden tests."""
+    for corpus sweeps and golden tests. Skips non-task artefacts (files
+    without a `task:` line) that may accumulate in the archive directory
+    (e.g. `answer-Q*` files from the pending-questions flow)."""
     archive_root = tasks_dir / "archive"
     if not archive_root.is_dir():
         return
     for p in sorted(archive_root.glob("*.txt")):
-        yield p
+        if _has_task_line(p):
+            yield p
     for entry in sorted(archive_root.iterdir()):
         if entry.is_dir() and _MONTH_DIR_RE.match(entry.name):
-            yield from sorted(entry.glob("*.txt"))
+            for p in sorted(entry.glob("*.txt")):
+                if _has_task_line(p):
+                    yield p
+
+
+def _has_task_line(path: Path) -> bool:
+    """True iff `path` contains a `task:` header line — the structural marker
+    that distinguishes a real task file from a non-task artefact that has
+    accumulated in the archive directory."""
+    try:
+        return any(line.startswith("task:") for line in
+                   path.read_text(errors="replace").split("\n"))
+    except OSError:
+        return False
