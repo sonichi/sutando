@@ -306,8 +306,14 @@ brain = str(resolve_claude_sutando_config_dir())
 # FRESH heartbeat (<90s, matching core-heartbeat's liveness window) is trusted;
 # stale/absent -> default OSS socket.
 def _host_label():
+    # Must match the WRITER's resolution exactly (core_heartbeat.py names the
+    # .alive file via util_paths._host_label, honoring \$SUTANDO_HOST_LABEL /
+    # \$SUTANDO_HOST_OVERRIDE). REPO_ROOT (not REPO_ROOT/src) is on sys.path here,
+    # so the import is 'src.util_paths' — matching 'from src.sutando_config'
+    # above; a bare 'from util_paths' silently fails to sys.path and would fall
+    # back to gethostname(), losing the label (review catch on c91a68c).
     try:
-        from util_paths import _host_label as hl
+        from src.util_paths import _host_label as hl
         return hl()
     except Exception:
         import socket as _s

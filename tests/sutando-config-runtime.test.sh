@@ -72,22 +72,22 @@ sock="$(SUTANDO_TMUX_SOCKET=/tmp/bundled-fake.sock bash "$SCRIPT" runtime \
 # .alive heartbeat (runtime-authored), so we plant a fresh heartbeat recording a
 # custom socket + a live sutando-core session there, point the resolver at that
 # workspace, and assert `runtime` reports it.
-echo "[5] runtime → honors a custom socket recorded in the .alive heartbeat"
+echo "[5] runtime → honors a custom socket via heartbeat, resolving the host label like the writer (SUTANDO_HOST_LABEL)"
 if command -v tmux >/dev/null 2>&1; then
   CFG="$REPO_DIR/sutando.config.local.json"; CFG_BAK=""
   [ -f "$CFG" ] && { CFG_BAK="$(mktemp)"; cp "$CFG" "$CFG_BAK"; }
-  T5WS="$(mktemp -d)"; CUSTOM="/tmp/pr2113-runtime-test-$$.sock"
-  HOST="$(python3 -c "import sys;sys.path.insert(0,'$REPO_DIR');
-try:
-    from util_paths import _host_label; print(_host_label())
-except Exception:
-    import socket; print(socket.gethostname().split('.')[0])")"
+  T5WS="$(mktemp -d)"; CUSTOM="/tmp/pr2113-runtime-test-$$.sock"; LBL="pr2113-review-host"
   mkdir -p "$T5WS/state/cores"
   tmux -S "$CUSTOM" new-session -d -s sutando-core 'sleep 120' 2>/dev/null
-  python3 -c "import json,time;json.dump({'host':'$HOST','last_beat_at':time.time(),'socket':'$CUSTOM','schema_version':1},open('$T5WS/state/cores/$HOST.alive','w'))"
+  # Heartbeat written under the LABEL — as core_heartbeat.py would when
+  # SUTANDO_HOST_LABEL is set (it names the file via util_paths._host_label).
+  python3 -c "import json,time;json.dump({'host':'$LBL','last_beat_at':time.time(),'socket':'$CUSTOM','schema_version':1},open('$T5WS/state/cores/$LBL.alive','w'))"
   printf '{\"workspace\":{\"path\":\"%s\"}}' "$T5WS" > "$CFG"
-  sock5="$(bash "$SCRIPT" runtime | python3 -c 'import json,sys;print(json.load(sys.stdin)["socket"])')"
-  [ "$sock5" = "$CUSTOM" ]; report "$?" "socket=$sock5 == custom $CUSTOM (heartbeat-authored, not default)"
+  # The reader must resolve the SAME label to find the heartbeat. Regression for
+  # the c91a68c review: a bare `from util_paths` fell back to gethostname(),
+  # missed the labelled file, and returned the default socket.
+  sock5="$(SUTANDO_HOST_LABEL="$LBL" bash "$SCRIPT" runtime | python3 -c 'import json,sys;print(json.load(sys.stdin)["socket"])')"
+  [ "$sock5" = "$CUSTOM" ]; report "$?" "socket=$sock5 == custom $CUSTOM (heartbeat found via SUTANDO_HOST_LABEL, not default)"
   tmux -S "$CUSTOM" kill-server 2>/dev/null
   rm -rf "$T5WS"; rm -f "$CFG"; [ -n "$CFG_BAK" ] && mv "$CFG_BAK" "$CFG"
 else
