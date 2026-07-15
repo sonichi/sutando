@@ -729,6 +729,23 @@ async function main() {
 	// the file is always present + always reflects the latest known state.
 	writeVoiceState(false);
 
+	// voice-agent.json is runtime-authored state recording the ACTUAL bound WS
+	// endpoint. `sutando-config.sh runtime` reads it (validated by pid liveness)
+	// so the AgentRuntime descriptor's `voice_ws` reports the port this process
+	// really bound — correct for installs on a non-default PORT, not a hardcoded
+	// default. Same "the running process is the authority on its own resource"
+	// principle by which the tmux socket is sourced from the core's heartbeat.
+	function writeVoiceRuntimeState() {
+		try {
+			writeFileSync(
+				statusPath('voice-agent.json', WORKSPACE_DIR),
+				JSON.stringify({ voice_ws: `ws://127.0.0.1:${PORT}`, port: PORT, pid: process.pid, ts: Math.floor(Date.now() / 1000) })
+			);
+		} catch (err) {
+			console.error(`${ts()} [VoiceRuntime] state write failed:`, err);
+		}
+	}
+
 
 	const session = new VoiceSession({
 		sessionId: SESSION_ID,
@@ -1187,6 +1204,10 @@ async function main() {
 			}
 		}
 	}, 30_000);
+
+	// The server bound successfully (EADDRINUSE would have exited via main().catch
+	// before here) — record the actual bound endpoint for the runtime descriptor.
+	writeVoiceRuntimeState();
 
 	console.log('============================================================');
 	console.log('Sutando — Voice Interface');

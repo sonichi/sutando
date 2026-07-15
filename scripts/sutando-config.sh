@@ -264,8 +264,147 @@ print(_host_label(), end='')
     echo "workspace bootstrapped: $ws" >&2
     ;;
 
+  tmux-socket)
+    # Print the tmux socket the sutando-core session runs on. Mirrors the
+    # resolution in src/agent/claude/cli/start-cli.sh (`${SUTANDO_TMUX_SOCKET:-
+    # /tmp/sutando-tmux.sock}`) so a caller resolves the same socket the core
+    # actually launched on. Contract sibling of `workspace` — resolve via helper,
+    # never hardcode /tmp/sutando-tmux.sock. NOTE: for a FOREIGN caller (e.g. the
+    # desktop app, whose own env may point SUTANDO_TMUX_SOCKET at a private
+    # bundled socket) prefer the env-independent `runtime` subcommand below,
+    # which pins to the default OSS socket. This getter honors the ambient env
+    # and is meant for same-runtime callers.
+    printf '%s' "${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
+    ;;
+
+  runtime)
+    # Emit this install's AgentRuntime descriptor as one JSON object — the single
+    # OSS-side contract the desktop app reads to resolve which runtime to attach
+    # its Terminal to, route task-drops/gateway to, and decide port-vs-new
+    # (issue ag2-space/ag2space-cinny-desktop#98). Keyed on the repo; everything
+    # else derives:
+    #   {alive, repo, workspace, brain, socket, session, health, authenticated}
+    # FOREIGN-CALLER-SAFE *and* honors custom sockets: the tmux socket is read
+    # from a RUNTIME-AUTHORED source (the core's .alive heartbeat, which records
+    # the socket the core actually launched on — see core_heartbeat.py), NOT the
+    # caller's ambient SUTANDO_TMUX_SOCKET. So a foreign caller (the desktop app,
+    # whose env points at its bundled socket) still gets THIS OSS core's real
+    # socket, AND an install running on a custom socket is reported correctly
+    # (start-cli.sh honors SUTANDO_TMUX_SOCKET). No fresh heartbeat -> default OSS
+    # socket. Reuses src/runtime-health.py for alive/health/authenticated (single
+    # liveness source of truth) and the canonical resolve_claude_sutando_config_dir()
+    # for brain (honors core_config_dirs[type=claude] customization).
+    python3 -c "
+import sys, os, json, time, subprocess
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import resolve_workspace, resolve_claude_sutando_config_dir
+repo = '$REPO_ROOT'
+ws = str(resolve_workspace())
+brain = str(resolve_claude_sutando_config_dir())
+# The socket this core runs on, from its own heartbeat: runtime-authored, so it
+# is correct for custom sockets AND immune to the caller's ambient env. Only a
+# FRESH heartbeat (<90s, matching core-heartbeat's liveness window) is trusted;
+# stale/absent -> default OSS socket.
+def _host_label():
+    # Must match the WRITER's resolution exactly (core_heartbeat.py names the
+    # .alive file via util_paths._host_label, honoring \$SUTANDO_HOST_LABEL /
+    # \$SUTANDO_HOST_OVERRIDE). REPO_ROOT (not REPO_ROOT/src) is on sys.path here,
+    # so the import is 'src.util_paths' — matching 'from src.sutando_config'
+    # above; a bare 'from util_paths' silently fails to sys.path and would fall
+    # back to gethostname(), losing the label (review catch on c91a68c).
+    try:
+        from src.util_paths import _host_label as hl
+        return hl()
+    except Exception:
+        import socket as _s
+        return _s.gethostname().split('.')[0]
+probe_socket = '/tmp/sutando-tmux.sock'
+try:
+    with open(os.path.join(ws, 'state', 'cores', _host_label() + '.alive')) as f:
+        rec = json.load(f)
+    if time.time() - float(rec.get('last_beat_at', 0)) < 90 and rec.get('socket'):
+        probe_socket = rec['socket']
+except Exception:
+    pass
+# voice_ws: the WS the running voice-agent actually bound. Runtime-authored —
+# voice-agent.ts writes state/voice-agent.json at listen with its real PORT — so
+# a non-default PORT is reported correctly instead of a hardcoded default (same
+# 'running process is the authority' principle as the socket above). Liveness is
+# validated by the recorded pid, NOT a time window: the file is written once at
+# startup (not refreshed like the heartbeat), so a window would wrongly expire a
+# long-running agent. Absent / dead-pid / unreadable -> default OSS endpoint.
+probe_voice_ws = 'ws://127.0.0.1:9900'
+try:
+    with open(os.path.join(ws, 'state', 'voice-agent.json')) as f:
+        vrec = json.load(f)
+    vpid = int(vrec.get('pid', 0) or 0)
+    alive = False
+    if vpid > 0:
+        try:
+            os.kill(vpid, 0)
+            alive = True
+        except ProcessLookupError:
+            alive = False
+        except PermissionError:
+            alive = True  # exists but not ours — still a live process
+        except Exception:
+            alive = False
+    if alive and vrec.get('voice_ws'):
+        probe_voice_ws = vrec['voice_ws']
+except Exception:
+    pass
+env = dict(os.environ, SUTANDO_TMUX_SOCKET=probe_socket)
+h = {}
+try:
+    out = subprocess.run([sys.executable, os.path.join(repo, 'src', 'runtime-health.py')],
+                         capture_output=True, text=True, timeout=15, env=env, cwd=repo)
+    if out.stdout.strip():
+        h = json.loads(out.stdout)
+except Exception:
+    pass
+# code: the source-version identity of the runtime — 'which Sutando is this,
+# behaviorally?' Prompts + skills + scripts in the repo determine behavior, so
+# the desktop app (and fleet tooling) wants this to reason about version-compat
+# and to spot a locally-modified core. All git-native + best-effort (None when
+# not a git checkout). tree_sha is the content hash of TRACKED files (version-
+# independent); dirty flags uncommitted edits. A stronger working-tree
+# 'source_sha' (hashes uncommitted + untracked behavior files) is a documented
+# follow-up alongside the identity block.
+def _git(*a):
+    try:
+        r = subprocess.run(['git', '-C', repo, *a], capture_output=True, text=True, timeout=5)
+        return (r.stdout.strip() or None) if r.returncode == 0 else None
+    except Exception:
+        return None
+code = {
+    'commit': _git('rev-parse', '--short', 'HEAD'),
+    'branch': _git('rev-parse', '--abbrev-ref', 'HEAD'),
+    'describe': _git('describe', '--tags', '--always', '--dirty'),
+    'tree_sha': _git('rev-parse', 'HEAD^{tree}'),
+    'dirty': bool(_git('status', '--porcelain')),
+}
+print(json.dumps({
+    'alive': bool(h.get('core_running', False)),
+    'repo': repo,
+    'code': code,
+    'workspace': ws,
+    'brain': brain,
+    'socket': h.get('tmux_socket') or probe_socket,
+    'session': h.get('session', 'sutando-core'),
+    # voice_ws: the WebSocket the runtime's voice-agent listens on — the endpoint
+    # the desktop 'Live' page's browser VoiceTransport.connect(url) opens
+    # (ag2-space/ag2space-cinny-desktop v0.3.0). Sourced from runtime-authored
+    # state (probe_voice_ws above): voice-agent.ts records its actual bound PORT,
+    # so a non-default-PORT install is reported correctly, not a hardcoded default.
+    'voice_ws': probe_voice_ws,
+    'health': h.get('health', 'unknown'),
+    'authenticated': h.get('authenticated'),
+}))
+"
+    ;;
+
   *)
-    echo "usage: $0 {workspace|vault-enabled|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|claude-home-path <subpath>|core-config-dir-env-name [type|id]|core-config-dir-value [type|id]|core-config-dirs|host-label|dump|subdirs|bootstrap}" >&2
+    echo "usage: $0 {workspace|vault-enabled|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|claude-home-path <subpath>|core-config-dir-env-name [type|id]|core-config-dir-value [type|id]|core-config-dirs|host-label|tmux-socket|runtime|dump|subdirs|bootstrap}" >&2
     exit 2
     ;;
 esac
