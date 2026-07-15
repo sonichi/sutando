@@ -66,7 +66,71 @@ def _default_memory_dir() -> str:
     slug = str(repo).replace("/", "-")
     return str(Path(claude_home_path()) / "projects" / slug / "memory")
 
+# SUTANDO_MEMORY_DIR stays authoritative here, same as everywhere else that
+# resolves core memory (src/voice-agent.ts, src/voice-context.ts, and
+# CLAUDE.md/AGENTS.md all honor it). An earlier version of this fix made
+# ONLY this check ignore the override, on the theory that it was purely a
+# stale pre-#1454 workaround (see _default_memory_dir()'s docstring) — but
+# that broke the invariant that this check reports on the SAME directory the
+# rest of the runtime actually reads/writes, which is a worse failure mode
+# than the one being fixed (a health check silently diverging from ground
+# truth). If SUTANDO_MEMORY_DIR is a genuine leftover from that era, the
+# memory-dir-override check below flags the divergence instead of silently
+# redirecting.
 MEMORY_DIR = Path(os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir()))
+
+
+def _resolve_dotenv() -> Path:
+    """Return the resolved `.env` path, routed through a single resolver so
+    every caller sees the same file.
+
+    Resolution order:
+      1. `REPO_DIR/.env` — the startup.sh default (source-code root).
+      2. `WORKSPACE_DIR/.env` — the workspace contract fallback (#1871).
+      3. `~/.sutando/repo/.env` — the durable user-clone, for the Sutando.app
+         bundle invocation whose REPO_DIR points at the bundle tree that gets
+         wiped on updates (#1973 / #1951).
+
+    Always returns a Path — callers use `.exists()` to determine presence.
+    When none exist, the primary (REPO_DIR/.env) is returned so error messages
+    show the expected primary location, not a fallback.
+    """
+    primary = REPO_DIR / ".env"
+    if primary.exists():
+        return primary
+    workspace_env = WORKSPACE_DIR / ".env"
+    if workspace_env.exists():
+        return workspace_env
+    bundle_env = Path.home() / ".sutando" / "repo" / ".env"
+    if bundle_env.exists():
+        return bundle_env
+    return primary
+
+
+def _resolved_vault() -> dict:
+    """Return the resolved vault config subtree via the canonical resolver
+    (`sutando_config.resolve_vault`) — the SINGLE source of truth for
+    `vault.enabled` and `vault.remote_url`.
+
+    Augments the resolver's dict with `_explicit_disable`: True only when the
+    config file actually carries `vault.enabled=false` (a deliberate opt-out),
+    as opposed to the resolver's default-False for a host with no vault block
+    at all. This lets check_memory_sync distinguish "opted out on purpose" from
+    "never configured" without re-reading config.
+
+    Best-effort: on any error (resolver import failure, malformed config) return
+    safe defaults ({"enabled": False, "remote_url": ""}) so a config-helper
+    hiccup never masks a real check. Mirrors resolve_vault's own defaults.
+    """
+    try:
+        from sutando_config import resolve_vault, load_config  # noqa: PLC0415
+        vault = dict(resolve_vault(repo_root=REPO_DIR))
+        raw_vault = load_config(repo_root=REPO_DIR).get("vault") or {}
+        vault["_explicit_disable"] = raw_vault.get("enabled") is False
+        return vault
+    except Exception:
+        return {"enabled": False, "remote_url": "", "_explicit_disable": False}
+
 
 # ---------------------------------------------------------------------------
 # Checks
@@ -167,18 +231,66 @@ def check_directory(path: Path, name: str) -> dict:
     return {"name": name, "status": "ok", "detail": f"{count} .md files"}
 
 
+def check_memory_dir_override() -> "dict | None":
+    """Flag a SUTANDO_MEMORY_DIR that diverges from the computed default.
+
+    The var is authoritative for MEMORY_DIR (matching src/voice-agent.ts and
+    src/voice-context.ts, which also honor it) — so a genuine current use
+    keeps working consistently everywhere. But a leftover pre-#1454 value
+    would silently point every consumer at a stale directory instead of the
+    actively-synced one. Warn on divergence rather than silently redirecting
+    just this check, so the user can judge whether the override is still
+    intentional. Returns None when the var is unset or matches the default.
+    """
+    override = os.environ.get("SUTANDO_MEMORY_DIR")
+    if not override:
+        return None
+    default = Path(_default_memory_dir())
+    if Path(override).resolve() == default.resolve():
+        return None
+    return {
+        "name": "memory-dir-override",
+        "status": "warn",
+        "detail": (
+            f"SUTANDO_MEMORY_DIR={override} differs from the computed "
+            f"default ({default}) — verify this is still intentional, not "
+            "a stale pre-#1454 leftover"
+        ),
+    }
+
+
 def check_memory_sync() -> dict:
-    """Verify memory sync is configured and has run recently."""
+    """Verify memory sync is configured and has run recently.
+
+    Cross-machine sync is OPT-IN. When it's deliberately disabled
+    (vault.enabled=false) or simply not configured, that's a valid
+    single-machine choice — report it as informational (ok), NOT a recurring
+    warn (owner ask 2026-07-10 — the confusing memory-var nag). A
+    configured-but-stale sync still warns; that's a real problem.
+
+    The vault remote is read from the CANONICAL config (vault.remote_url via
+    sutando_config.resolve_vault) with the deprecated SUTANDO_MEMORY_REPO in
+    .env kept as a backward-compat fallback (#1446 window).
+    """
     name = "memory-sync"
-    env_path = REPO_DIR / ".env"
-    repo_url = ""
-    if env_path.exists():
-        for line in env_path.read_text().splitlines():
-            if line.startswith("SUTANDO_MEMORY_REPO="):
-                repo_url = line.split("=", 1)[1].strip().strip('"').strip("'")
-                break
+    vault = _resolved_vault()
+    # Deliberate config opt-out (vault.enabled=false) → informational, never a
+    # nag (#2069).
+    if vault.get("_explicit_disable"):
+        return {"name": name, "status": "ok", "detail": "cross-machine sync disabled (config opt-out)"}
+    # Canonical config first (vault.remote_url), then the deprecated .env alias.
+    repo_url = vault.get("remote_url") or ""
     if not repo_url:
-        return {"name": name, "status": "warn", "detail": "SUTANDO_MEMORY_REPO not set — cross-machine sync disabled"}
+        env_path = _resolve_dotenv()
+        if env_path.exists():
+            for line in env_path.read_text().splitlines():
+                if line.startswith("SUTANDO_MEMORY_REPO="):
+                    repo_url = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
+    if not repo_url:
+        # Not configured anywhere → single-machine mode is a valid choice, not
+        # a warn (#2069).
+        return {"name": name, "status": "ok", "detail": "cross-machine sync not configured (single-machine mode)"}
     # Current model (sync-workspace.sh): the workspace ITSELF is a git repo with
     # the vault as a remote — sync = git fetch/merge/push on the workspace, no
     # separate clone dir. So the freshness signal is the workspace's own
@@ -204,7 +316,7 @@ def check_memory_sync() -> dict:
     elif sync_dir_legacy.exists():
         sync_dir = sync_dir_legacy
     else:
-        return {"name": name, "status": "warn", "detail": "repo configured but never synced — run bash scripts/sync-memory.sh"}
+        return {"name": name, "status": "warn", "detail": "repo configured but never synced — run bash scripts/sync-workspace.sh"}
     git_dir = sync_dir / ".git" / "FETCH_HEAD"
     if git_dir.exists():
         age_h = (time.time() - git_dir.stat().st_mtime) / 3600
@@ -1335,7 +1447,7 @@ def run_all_checks() -> list[dict]:
     for name, path in [
         ("CLAUDE.md", REPO_DIR / "CLAUDE.md"),
         ("build_log.md", WORKSPACE_DIR / "build_log.md"),
-        (".env", REPO_DIR / ".env"),
+        (".env", _resolve_dotenv()),
     ]:
         checks.append(check_file(path, name))
 
@@ -1344,6 +1456,10 @@ def run_all_checks() -> list[dict]:
         checks.append(check_directory(MEMORY_DIR, "memory-dir"))
     else:
         checks.append({"name": "memory-dir", "status": "ok", "detail": "not yet created (normal for new installs)"})
+
+    _mem_override = check_memory_dir_override()
+    if _mem_override:
+        checks.append(_mem_override)
 
     # Notes — canonical home is the resolved workspace post-migration.
     # Pass WORKSPACE_DIR (not REPO_DIR) so the check resolves to
@@ -1364,7 +1480,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_host_subtrees())
 
     # Phone conversation server (optional — only check if Twilio configured and not skipped)
-    env_path = REPO_DIR / ".env"
+    env_path = _resolve_dotenv()  # pragma: no cover — call-site in untested mega-function
     if env_path.exists():
         env_content = env_path.read_text()
         has_twilio = twilio_configured(env_content)  # pragma: no cover — call-site in untested mega-function
@@ -2551,7 +2667,7 @@ def main():
                         print(f"  {c['name']}: not auto-fixed — needs manual rebuild + relaunch (see memory feedback_sutando_app_launch_method.md)")
                 elif c["name"] == "ngrok":
                     # Read ngrok domain from .env if set, otherwise use default
-                    env_path = REPO_DIR / ".env"
+                    env_path = _resolve_dotenv()  # pragma: no cover
                     domain_arg = []
                     if env_path.exists():
                         for line in env_path.read_text().splitlines():
