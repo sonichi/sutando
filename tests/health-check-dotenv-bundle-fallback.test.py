@@ -4,9 +4,9 @@ Tests for the _resolve_dotenv() helper and its consumers in health-check.py
 (PR #1973 / issue #1951).
 
 When REPO_DIR/.env is absent (e.g. Sutando.app bundle path wiped on update),
-_resolve_dotenv() falls back to ~/.sutando/repo/.env.  This ensures all
-callers — check_memory_sync(), the critical-file probe, and env_path reading
-in run_all_checks() — see the durable user-clone .env automatically.
+_resolve_dotenv() falls back to the durable user-clone .env under the install
+home.  This ensures all callers — check_memory_sync(), the critical-file probe,
+and env_path reading in run_all_checks() — see that .env automatically.
 
 Run: python3 tests/health-check-dotenv-bundle-fallback.test.py
 Exit: 0 on pass, 1 on fail.
@@ -62,7 +62,7 @@ def test_resolve_returns_primary_when_exists() -> None:
 
 
 def test_resolve_returns_fallback_when_primary_absent() -> None:
-    """_resolve_dotenv() falls back to ~/.sutando/repo/.env when primary is absent."""
+    """_resolve_dotenv() falls back to the durable user-clone .env when primary is absent."""
     with tempfile.TemporaryDirectory() as td:
         fake_repo = Path(td) / "bundle" / "repo"
         fake_repo.mkdir(parents=True)

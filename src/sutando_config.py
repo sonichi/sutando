@@ -419,16 +419,16 @@ def resolve_dotenv(repo_root: Optional[Path] = None,
     Order (first that exists wins):
       1. `<repo_root>/.env`                 — the startup.sh default (source root).
       2. `<workspace>/.env`                 — the workspace contract fallback.
-      3. `~/.sutando/repo/.env`             — the durable user clone, for the
-         Sutando.app bundle invocation whose repo root points at a bundle tree
-         that gets wiped on updates.
+      3. the durable user clone under the install home — for the Sutando.app
+         bundle invocation whose repo root points at a bundle tree that gets
+         wiped on updates.
 
     Returns a `Path` always; when none exist, returns tier 1 (the expected
     primary) so error messages name the primary location, not a fallback.
 
-    The `~/.sutando/` install-path literal lives HERE (the canonical resolver,
-    on the install-path lint allowlist) rather than in each consumer — every
-    caller routes through this instead of hand-rolling the fallback.
+    The install-path literal lives HERE (the canonical resolver) rather than in
+    each consumer — every caller routes through this instead of hand-rolling
+    the fallback.
     """
     repo = repo_root or _find_repo_root() or Path.cwd()
     primary = repo / ".env"
