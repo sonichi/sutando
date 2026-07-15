@@ -20,7 +20,12 @@ import os as _os
 from datetime import datetime
 
 PORT = 7845
-DIR = "/tmp/sutando-screenshots"
+# Per-user temp dir — same treatment as browser.mjs in this PR: a shared
+# /tmp/sutando-screenshots is owned by whichever account wrote it first and
+# EACCES-fails the second account. SUTANDO_SCREENSHOT_DIR overrides.
+import tempfile as _tempfile
+DIR = _os.environ.get("SUTANDO_SCREENSHOT_DIR") or _os.path.join(
+    _tempfile.gettempdir(), "sutando-screenshots")
 # Web-client endpoint for agent-state reporting. When a /capture happens we
 # flash state=seeing on the menu-bar avatar for ~1.5s — makes screen-capture
 # visible to the user without them needing to watch the web UI.
