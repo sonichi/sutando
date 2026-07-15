@@ -66,14 +66,44 @@ def session_meta(path: Path) -> dict:
             "size_kb": path.stat().st_size // 1024, "first_user": first_user}
 
 
+def is_sidechain_transcript(path: Path) -> bool:
+    """True if this transcript is a subagent/sidechain run, not a main session.
+
+    Claude Code writes subagent (Task/Agent) conversations as their own *.jsonl
+    in the same project dir; their message events carry ``isSidechain: true``.
+    A main session's first user/assistant event is not a sidechain event, so we
+    judge by the first *message* event — meta lines (custom-title, last-prompt)
+    carry no isSidechain and are skipped. Cheap (stops at the first message) and
+    decisive: a sidechain transcript is sidechain from its first message on.
+    """
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if d.get("type") in ("user", "assistant"):
+                    return bool(d.get("isSidechain"))
+    except OSError:
+        return False
+    return False  # no message events → treat as a (harmless) empty main session
+
+
 def pick(sessions: list, which: str) -> Path:
-    # newest-mtime = the currently-active session
-    if which == "current":
-        return sessions[0]
-    if which == "last":
-        if len(sessions) < 2:
+    # "current"/"last" must resolve against MAIN sessions only. Subagent/
+    # sidechain transcripts share the project dir and can sort newer (by mtime)
+    # than the previous main session, so a naive sessions[1] for "last" could
+    # return a subagent transcript instead of the prior real session.
+    if which in ("current", "last"):
+        mains = [s for s in sessions if not is_sidechain_transcript(s)]
+        if which == "current":
+            if not mains:
+                sys.exit("no main session transcript found")
+            return mains[0]  # newest-mtime main = the currently-active session
+        if len(mains) < 2:
             sys.exit("only one session transcript exists")
-        return sessions[1]
+        return mains[1]  # second-newest main = the previous session
     for p in sessions:
         if p.name.startswith(which):
             return p
