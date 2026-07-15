@@ -81,30 +81,14 @@ MEMORY_DIR = Path(os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir()))
 
 
 def _resolve_dotenv() -> Path:
-    """Return the resolved `.env` path, routed through a single resolver so
-    every caller sees the same file.
+    """Resolve the `.env` path via the canonical resolver.
 
-    Resolution order:
-      1. `REPO_DIR/.env` — the startup.sh default (source-code root).
-      2. `WORKSPACE_DIR/.env` — the workspace contract fallback (#1871).
-      3. `~/.sutando/repo/.env` — the durable user-clone, for the Sutando.app
-         bundle invocation whose REPO_DIR points at the bundle tree that gets
-         wiped on updates (#1973 / #1951).
-
-    Always returns a Path — callers use `.exists()` to determine presence.
-    When none exist, the primary (REPO_DIR/.env) is returned so error messages
-    show the expected primary location, not a fallback.
+    The 3-tier fallback (repo root -> workspace -> durable user clone, #1871/#1973)
+    and the install-path literal live in `sutando_config.py` — the allowlisted
+    canonical resolver — so this consumer never inlines the path.
     """
-    primary = REPO_DIR / ".env"
-    if primary.exists():
-        return primary
-    workspace_env = WORKSPACE_DIR / ".env"
-    if workspace_env.exists():
-        return workspace_env
-    bundle_env = Path.home() / ".sutando" / "repo" / ".env"
-    if bundle_env.exists():
-        return bundle_env
-    return primary
+    from sutando_config import resolve_dotenv  # noqa: PLC0415
+    return resolve_dotenv(REPO_DIR, WORKSPACE_DIR)
 
 
 def _resolved_vault() -> dict:

@@ -412,6 +412,38 @@ def resolve_vault(repo_root: Optional[Path] = None) -> Dict[str, Any]:
     return vault
 
 
+def resolve_dotenv(repo_root: Optional[Path] = None,
+                   workspace: Optional[Path] = None) -> Path:
+    """Resolve the `.env` path through the canonical 3-tier fallback.
+
+    Order (first that exists wins):
+      1. `<repo_root>/.env`                 — the startup.sh default (source root).
+      2. `<workspace>/.env`                 — the workspace contract fallback.
+      3. `~/.sutando/repo/.env`             — the durable user clone, for the
+         Sutando.app bundle invocation whose repo root points at a bundle tree
+         that gets wiped on updates.
+
+    Returns a `Path` always; when none exist, returns tier 1 (the expected
+    primary) so error messages name the primary location, not a fallback.
+
+    The `~/.sutando/` install-path literal lives HERE (the canonical resolver,
+    on the install-path lint allowlist) rather than in each consumer — every
+    caller routes through this instead of hand-rolling the fallback.
+    """
+    repo = repo_root or _find_repo_root() or Path.cwd()
+    primary = repo / ".env"
+    if primary.exists():
+        return primary
+    ws = workspace or resolve_workspace(repo_root)
+    ws_env = ws / ".env"
+    if ws_env.exists():
+        return ws_env
+    bundle = Path.home() / ".sutando" / "repo" / ".env"
+    if bundle.exists():
+        return bundle
+    return primary
+
+
 _DEFAULT_CLAUDE_SUTANDO_SUBDIR = ".claude-sutando"
 
 
