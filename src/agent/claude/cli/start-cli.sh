@@ -414,13 +414,17 @@ ensure_core_monitor() {
   relay_pid_file="$ws/state/core-supervisor-relay-loop.pid"
   relay_state="$ws/state/core-supervisor-relay.state"
   if ! { [ -f "$relay_pid_file" ] && kill -0 "$(cat "$relay_pid_file" 2>/dev/null)" 2>/dev/null; }; then
+    # Redirect the WHOLE subshell (not just the inner python) to the log, so the
+    # backgrounded loop does not inherit/hold this script's stdout/stderr — else a
+    # caller that captures start-cli.sh's output (e.g. tests/start-cli-*.test.py)
+    # blocks on the pipe until this infinite loop closes it (never) and times out.
+    # Mirrors the monitor launch above, which redirects to /tmp/core-input-watch.log.
     ( while true; do
         python3 "$REPO/src/core-supervisor-relay.py" \
           --signal "$mon_out" --state-file "$relay_state" \
-          --active-from "$ws/state/last-owner-activity.json" \
-          >> /tmp/core-supervisor-relay.log 2>&1
+          --active-from "$ws/state/last-owner-activity.json"
         sleep 30
-      done ) &
+      done ) >> /tmp/core-supervisor-relay.log 2>&1 &
     echo $! > "$relay_pid_file"
   fi
 }
