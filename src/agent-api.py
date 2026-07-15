@@ -285,6 +285,11 @@ def delegation_list_results():
 def delegation_read_result(name: str):
     # _safe_path appends ".txt" itself — hand it the stem.
     stem = name[:-4] if name.endswith(".txt") else name
+    # Defense-in-depth: apply the same id-shape gate as the submit side so
+    # both paths enforce the same invariant (#1959). _safe_path handles
+    # traversal, but valid_task_id additionally rejects unsupported charsets.
+    if not local_task_protocol.valid_task_id(stem):
+        return 400, {"error": "invalid result name"}
     target = _safe_path(RESULT_DIR, stem)
     if target is None or not os.path.isfile(target):
         return 404, {"error": "no such result"}
