@@ -40,6 +40,7 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse, unquote
@@ -121,7 +122,12 @@ task_history = {}
 
 # Voice state: "connected" or "disconnected". Toggled via /voice/toggle.
 # Web client polls /voice/state and connects/disconnects accordingly.
+# The lock serializes /voice/toggle's read-modify-write against concurrent
+# /voice/toggle and /voice/set requests — under a threaded server two
+# simultaneous toggles can otherwise interleave and land on the wrong state
+# (issue #1922). Bare reads of the string stay lock-free.
 voice_desired_state = "disconnected"
+voice_state_lock = threading.Lock()
 
 
 
@@ -846,8 +852,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/voice/toggle":
             if not self.check_auth():
                 return
-            voice_desired_state = "connected" if voice_desired_state == "disconnected" else "disconnected"
-            self.send_json(200, {"state": voice_desired_state})
+            with voice_state_lock:
+                voice_desired_state = "connected" if voice_desired_state == "disconnected" else "disconnected"
+                new_state = voice_desired_state
+            self.send_json(200, {"state": new_state})
             return
 
         if path == "/voice/set":
@@ -857,8 +865,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = self.rfile.read(length)
             try:
                 data = json.loads(body)
-                voice_desired_state = data.get("state", "disconnected")
-                self.send_json(200, {"state": voice_desired_state})
+                with voice_state_lock:
+                    voice_desired_state = data.get("state", "disconnected")
+                    new_state = voice_desired_state
+                self.send_json(200, {"state": new_state})
             except Exception:
                 self.send_json(400, {"error": "invalid"})
             return
