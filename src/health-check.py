@@ -72,6 +72,23 @@ MEMORY_DIR = Path(os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir()))
 # Checks
 # ---------------------------------------------------------------------------
 
+def twilio_configured(env_content: str) -> bool:
+    """True only when .env has an ACTIVE TWILIO_ACCOUNT_SID with a value.
+
+    A plain substring test also matched the commented placeholder shipped in
+    the .env template (`# TWILIO_ACCOUNT_SID=ACxxxxxxxxx`), so hosts that
+    never configured Twilio still ran the conversation-server + tunnel
+    checks — and startup.sh's matching gate kept a public ngrok tunnel open
+    to a port with nothing behind it (caught 2026-07-02). startup.sh's
+    phone block carries the anchored-grep equivalent of this test.
+    """
+    for line in env_content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("TWILIO_ACCOUNT_SID=") and stripped.split("=", 1)[1].strip():
+            return True
+    return False
+
+
 def check_port(port: int, name: str, probe: bool = False) -> dict:
     """Check if a port is listening, optionally probing for a live response.
 
@@ -1017,6 +1034,93 @@ def check_core_proactive_loop(threshold_sec: int = 600) -> dict:
     return {"name": name, "status": "ok", "detail": f"running ({age}s ago)"}
 
 
+def check_core_supervisor() -> dict:
+    """Surface the core-supervisor (Agent Shepherd M1) state for OSS users.
+
+    The monitor (core-input-watch.py) writes state/core-supervisor.json with
+    the core's supervised state. The desktop app renders this as an "Action
+    needed" banner, but OSS users running bare Sutando have no such UI — so
+    surface it here, in the canonical OSS status tool, as the simple in-repo
+    consumer of the signal.
+
+    States needing the user (login / an unrecognized prompt) → warn with a
+    "needs you" line + the prompt excerpt; degraded states (crashed / hung /
+    gateway-down) → warn; healthy (running / idle-ready / blocked-known, the
+    last being pre-seeded/auto-answered) → ok. File missing → ok (monitor not
+    running, or a pre-supervisor install).
+    """
+    name = "core-supervisor"
+    sig_path = status_read_path("core-supervisor.json", WORKSPACE_DIR)
+    if not sig_path.exists():
+        return {"name": name, "status": "ok", "detail": "core-supervisor.json not yet written"}
+    try:
+        data = json.loads(sig_path.read_text())
+    except Exception as e:
+        return {"name": name, "status": "ok", "detail": f"core-supervisor.json unreadable: {str(e)[:60]}"}
+    state = data.get("state", "unknown")
+    detail = state
+    prompt = data.get("prompt")
+    if prompt:
+        detail = f"{state} — {str(prompt).splitlines()[0][:60]}"
+    needs_user = {"blocked-human", "logged-out"}
+    degraded = {"crashed", "hung", "gateway-down"}
+    if state in needs_user:
+        return {"name": name, "status": "warn", "detail": f"core needs you: {detail}"}
+    if state in degraded:
+        return {"name": name, "status": "warn", "detail": f"core degraded: {detail}"}
+    return {"name": name, "status": "ok", "detail": detail}
+
+
+def check_gateway_bridge() -> "dict | None":
+    """Health of the ag2.space gateway bridge (remote-gateway-bridge.py) — the
+    process that carries MOBILE-app messages from the cloud gateway down to the
+    local core (and results back up).
+
+    Returns None when the mobile gateway is NOT configured (no REMOTE_TASK_TOKEN /
+    AG2_REMOTE_TOKEN in env or channels/ag2space/.env) — a Sutando-only user
+    without the mobile gateway never sees this check. Otherwise: ``warn`` when
+    configured-but-not-running (with the delivery impact spelled out) or on a
+    duplicate-process pileup, ``ok`` when a single instance is running.
+
+    Added after a 3-day SILENT outage (2026-07-10): the bridge died on Jul 7 and
+    nothing reported it, so mobile messages stranded in the cloud invisibly. This
+    check makes that state visible on the dashboard.
+    """
+    try:
+        gw_env = claude_home_path("channels", "ag2space", ".env")
+        configured = bool(os.environ.get("REMOTE_TASK_TOKEN") or os.environ.get("AG2_REMOTE_TOKEN"))
+        if not configured and gw_env.exists():
+            configured = any(
+                ln.startswith(("REMOTE_TASK_TOKEN=", "AG2_REMOTE_TOKEN="))
+                for ln in gw_env.read_text(errors="replace").splitlines()
+            )
+    except OSError:
+        configured = False
+    if not configured:
+        return None
+    try:
+        gw = subprocess.run(
+            ["/usr/bin/pgrep", "-f", r"remote-gateway-bridge\.py$"],
+            capture_output=True, text=True,
+        )
+        pids = [p for p in gw.stdout.strip().split("\n") if p] if gw.returncode == 0 else []
+    except Exception:
+        pids = []
+    if not pids:
+        return {
+            "name": "gateway-bridge",
+            "status": "warn",
+            "detail": "configured but NOT running — ag2.space mobile messages will not be delivered",
+        }
+    if len(pids) > 1:
+        return {
+            "name": "gateway-bridge",
+            "status": "warn",
+            "detail": f"multiple processes ({len(pids)} PIDs: {','.join(pids)})",
+        }
+    return {"name": "gateway-bridge", "status": "ok", "detail": "running"}
+
+
 def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> dict:
     """Detect a task-queue pileup — tasks/ directory growing without
     being drained. Independent of which watcher / loop is dying: the queue
@@ -1263,7 +1367,7 @@ def run_all_checks() -> list[dict]:
     env_path = REPO_DIR / ".env"
     if env_path.exists():
         env_content = env_path.read_text()
-        has_twilio = "TWILIO_ACCOUNT_SID=" in env_content and not env_content.split("TWILIO_ACCOUNT_SID=")[1].startswith("\n")
+        has_twilio = twilio_configured(env_content)  # pragma: no cover — call-site in untested mega-function
         skip_phone = "SKIP_PHONE=1" in env_content or os.environ.get("SKIP_PHONE") == "1"
         if has_twilio and not skip_phone:
             c = check_port(3100, "conversation-server")
@@ -1465,6 +1569,12 @@ def run_all_checks() -> list[dict]:
 
         checks.append({"name": name, "status": status, "detail": detail})
 
+    # ag2.space gateway bridge (mobile path); check_gateway_bridge() returns
+    # None when the gateway isn't configured, so filter it out. (The function's
+    # branches are unit-tested in tests/health-check-gateway-bridge.test.py; this
+    # call site is exercised by the running health check, not that unit test.)
+    checks += [c for c in (check_gateway_bridge(),) if c is not None]  # pragma: no cover
+
     # (External plugin probes moved out with their plugins in #1427 round ④ —
     # a plugin manifest declares its own health_probe; the host checks host
     # services only.)
@@ -1542,6 +1652,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_battery())
     checks.append(check_memory())
     checks.append(check_core_proactive_loop(threshold_sec=loop_stale_sec))
+    checks.append(check_core_supervisor())
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
 
     return checks
