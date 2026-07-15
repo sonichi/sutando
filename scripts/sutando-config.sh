@@ -219,6 +219,25 @@ for entry in resolve_core_config_dirs():
 "
     ;;
 
+  host-label)
+    # Per-host directory label for hosts/<host>/ paths, mirroring
+    # src/util_paths.py:_host_label() for shell callers. Use this instead of the
+    # inline `hostname | sed 's/\..*//'` anti-pattern: that resolves the
+    # DHCP-assigned hostname, which can drift (e.g. a Comcast lease →
+    # Chis-MBP) and split per-host paths from the stable Bonjour LocalHostName
+    # (Chis-MacBook-Pro), spawning a second hosts/<label>/ dir. Precedence
+    # (single source of truth lives in Python; #1745):
+    #   1. $SUTANDO_HOST_LABEL (or legacy $SUTANDO_HOST_OVERRIDE)
+    #   2. macOS `scutil --get LocalHostName` (stable Bonjour name)
+    #   3. short `hostname`
+    python3 -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.util_paths import _host_label
+print(_host_label(), end='')
+"
+    ;;
+
   dump)
     python3 -m src.sutando_config
     ;;
@@ -246,7 +265,7 @@ for entry in resolve_core_config_dirs():
     ;;
 
   *)
-    echo "usage: $0 {workspace|vault-enabled|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|core-config-dir-env-name [type|id]|core-config-dir-value [type|id]|core-config-dirs|dump|subdirs|bootstrap}" >&2
+    echo "usage: $0 {workspace|vault-enabled|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|claude-home-path <subpath>|core-config-dir-env-name [type|id]|core-config-dir-value [type|id]|core-config-dirs|host-label|dump|subdirs|bootstrap}" >&2
     exit 2
     ;;
 esac

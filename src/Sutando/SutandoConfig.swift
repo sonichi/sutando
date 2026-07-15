@@ -191,7 +191,9 @@ enum SutandoConfig {
     ///
     /// Order:
     ///   1. config workspace.path (deep-merged)
-    ///   2. {repoRoot}/workspace baked-in default
+    ///   2. $SUTANDO_DEFAULT_WORKSPACE — optional full workspace path an embedder
+    ///      may set (fills the default slot). Mirrors sutando_config.py.
+    ///   3. {repoRoot}/workspace baked-in default
     ///
     /// $SUTANDO_WORKSPACE is ignored in production as of v0.8 (warn once).
     /// SUTANDO_TEST_MODE=1 keeps the env override for tests only.
@@ -218,10 +220,20 @@ enum SutandoConfig {
 
         let cfg = (try? loadConfig(repoRoot: explicitRoot)) ?? [:]
         let root = explicitRoot ?? cacheRepoRoot
+        // Optional embedder-provided default workspace (mirrors sutando_config.py):
+        // an embedder (e.g. the AG2 Space desktop app) passes the FULL workspace
+        // path via $SUTANDO_DEFAULT_WORKSPACE. Fills the default slot only —
+        // explicit workspace.path config wins. Parity keeps the native app side in
+        // the same workspace as the Python core + TS services.
+        let embedderDefault = ProcessInfo.processInfo
+            .environment["SUTANDO_DEFAULT_WORKSPACE"]?
+            .trimmingCharacters(in: .whitespaces)
         let resolved: String
         if let ws = cfg["workspace"] as? [String: Any],
            let path = ws["path"] as? String, !path.isEmpty {
             resolved = (path as NSString).expandingTildeInPath
+        } else if let emb = embedderDefault, !emb.isEmpty {
+            resolved = (emb as NSString).expandingTildeInPath
         } else if let r = root {
             resolved = (r as NSString).appendingPathComponent(hardcodedWorkspaceDefaultRel)
         } else {

@@ -1,0 +1,11 @@
+{
+  "name": "quota-tracker",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "stable",
+  "description": "Track Claude Code quota usage via Anthropic API rate limit headers. Shows 5h and 7d utilization, reset times, and quota status. Works with both subscription and API key auth.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}

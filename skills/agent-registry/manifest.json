@@ -1,0 +1,11 @@
+{
+  "name": "agent-registry",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "Local Agent Registry \u2014 a standalone, dependency-free service that tracks running Claude Code (and other) agent instances. Agents self-register on startup and heartbeat while alive; the Electron overlay and Sutando dashboard read the live list.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}

@@ -76,7 +76,11 @@ echo "$$" > "$PID_FILE"
 # tmux socket for the wakeup signal. Sutando.app creates the CLI session via
 # this socket. If the socket doesn't exist (different setup), wakeup is a
 # silent no-op thanks to 2>/dev/null || true.
-TMUX_SOCK="${SUTANDO_TMUX_SOCK:-/tmp/sutando-tmux.sock}"
+# Honors SUTANDO_TMUX_SOCKET (the name start-cli.sh + the desktop private-socket
+# runtime use) so the wakeup ping targets the SAME tmux server as the core when
+# a caller overrides the default socket; the legacy SUTANDO_TMUX_SOCK is kept as
+# a one-release fallback so any straggler setter still works.
+TMUX_SOCK="${SUTANDO_TMUX_SOCKET:-${SUTANDO_TMUX_SOCK:-/tmp/sutando-tmux.sock}}"
 TMUX_SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 
 # Wake helper, kept but NOT called on the task paths below. Under the only

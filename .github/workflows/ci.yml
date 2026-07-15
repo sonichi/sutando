@@ -2,9 +2,9 @@ name: CI
 
 on:
   pull_request:
-    branches: [main, staging-workspace-revamp]
+    branches: [main, staging-interaction-planes]
   push:
-    branches: [main, staging-workspace-revamp]
+    branches: [main, staging-interaction-planes]
 
 jobs:
   typecheck-and-test:
@@ -26,6 +26,12 @@ jobs:
       # See docs/workspace-per-host-paths.md.
       - name: Per-host carried-path lint
         run: bash scripts/lint-vault-sync-paths.sh
+
+      # Layer 3 (#1543): verifies that personal_path() call sites in source are
+      # not classified into state/ by CLASS_RULES in sutando-migrate.sh.
+      # No-op on branches where sutando-migrate.sh is absent.
+      - name: CLASS_RULES vs reader-chain symmetry lint
+        run: python3 scripts/lint-class-rules.py
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -59,6 +65,16 @@ jobs:
       - name: Typecheck skills
         run: npm run typecheck:skills
 
+      # Skill-manifest validator + its own test. The test lives next to the code
+      # in scripts/ (not tests/), so the standalone-Python-test step below won't
+      # discover it — wire both explicitly here. `--all --strict` validates every
+      # skills/*/manifest.json (the path skills/MANIFEST.md documents) and fails on
+      # warnings (e.g. a network permission that doesn't match the code).
+      - name: Lint skill manifests
+        run: |
+          python3 scripts/lint-skill.test.py
+          python3 scripts/lint-skill.py --all --strict
+
       - name: Run tests
         run: npm test
         if: hashFiles('tests/**/*.test.ts') != ''
@@ -85,4 +101,46 @@ jobs:
               failed=1
             fi
           done < <(find tests -name '*.test.py' -not -path '*/node_modules/*' | sort)
+          exit "$failed"
+
+      # Run standalone shell tests (*.test.sh). Fixes issue #1934: these suites
+      # existed but were never wired into CI (the discovery glob only covered
+      # *.test.py and *.test.ts). Mirrors the Python step above — emit full
+      # output on failure so debugging info isn't lost.
+      - name: Run shell standalone tests
+        run: |
+          failed=0
+          # Load the known-failures allowlist (suites that fail on ubuntu-latest
+          # due to macOS-specific tooling or timing). Allowlisted suites still run
+          # and their output is printed, but a failure does NOT set failed=1.
+          # New regressions in the other suites still fail CI immediately.
+          # Burn this list to zero: https://github.com/sonichi/sutando/issues/1934
+          known_failures_file="tests/shell-ci-known-failures.txt"
+          while IFS= read -r f; do
+            echo "→ $f"
+            # `if ! assignment=$(...)` exempts the command from `bash -e` (GitHub's
+            # default for run: steps) while still capturing output + status. A bare
+            # `output=$(bash "$f")` would abort the whole step on the first failing
+            # suite — losing this step's diagnostics and masking every later suite.
+            #
+            # `timeout -k 5 120` bounds each suite: a hanging suite (e.g. a bounded-
+            # runner test whose --max backstop misfires under CI) would otherwise
+            # burn the whole job's timeout-minutes budget and get the job *canceled*
+            # mid-suite — masking every later suite AND this step's own diagnostics,
+            # the very failure this loop was written to avoid. On overrun timeout
+            # SIGTERMs (then SIGKILLs after 5s) and returns 124, so the suite fails
+            # loudly and in isolation instead of hanging CI.
+            if ! output=$(timeout -k 5 120 bash "$f" 2>&1); then
+              echo "✖ shell test failed: $f"
+              echo "$output"
+              # Only gate CI if this suite is not in the known-failures allowlist.
+              if ! grep -qxF "$f" "$known_failures_file" 2>/dev/null; then
+                failed=1
+              else
+                echo "  (known failure — not gating CI; see $known_failures_file)"
+              fi
+            else
+              echo "$output" | grep -E 'FAIL|^Summary' || true
+            fi
+          done < <(find tests -name '*.test.sh' -not -path '*/node_modules/*' | sort)
           exit "$failed"

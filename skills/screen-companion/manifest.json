@@ -1,7 +1,19 @@
 {
   "name": "screen-companion",
-  "enabled": true,
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
   "access_tier": "owner",
-  "description": "Screen Companion mode entry — voice tool that loads a use-case config (guided-setup, etc.) and returns the prompt overlay + activation message Gemini should follow for the rest of the session.",
-  "tools": "./tools.ts"
+  "enabled": true,
+  "description": "Screen Companion mode entry \u2014 voice tool that loads a use-case config (guided-setup, etc.) and returns the prompt overlay + activation message Gemini should follow for the rest of the session.",
+  "permissions": {
+    "network": true,
+    "filesystem": "read-only",
+    "secrets": "none"
+  },
+  "tools": "./tools.ts",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
 }

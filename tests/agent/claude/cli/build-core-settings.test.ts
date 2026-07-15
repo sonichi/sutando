@@ -1,0 +1,91 @@
+import { describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+// Builders are plain .mjs (run by start-cli.sh via `node <builder> <args>`), so
+// we exercise them exactly as the shell does: exec and parse stdout.
+const CORE_BUILDER = fileURLToPath(
+	new URL('../../../../src/agent/claude/cli/build-core-settings.mjs', import.meta.url),
+);
+const OBS_BUILDER = fileURLToPath(
+	new URL('../../../../src/observability/claude/hooks/build-hook-settings.mjs', import.meta.url),
+);
+
+function buildCore(guardPath: string, obsJson?: string): any {
+	const args = obsJson === undefined ? [CORE_BUILDER, guardPath] : [CORE_BUILDER, guardPath, obsJson];
+	return JSON.parse(execFileSync('node', args, { encoding: 'utf8' }));
+}
+
+function buildObs(hookPath: string): string {
+	return execFileSync('node', [OBS_BUILDER, hookPath], { encoding: 'utf8' });
+}
+
+/** Strip a `python3 `/`bash ` prefix and let a real shell re-parse the quoted
+ *  remainder — i.e. the path the shell would actually pass to the interpreter. */
+function shellParsedPath(command: string): string {
+	const arg = command.replace(/^(python3|bash) /, '');
+	return execFileSync('/bin/bash', ['-c', `printf %s ${arg}`], { encoding: 'utf8' });
+}
+
+const GUARD = '/x/hooks/skip-ask-user-question.py';
+
+describe('build-core-settings.mjs', () => {
+	it('always registers the AskUserQuestion guard (guard-only, obs off)', () => {
+		const o = buildCore(GUARD, ''); // empty obs blob == capture off
+		assert.deepEqual(Object.keys(o.hooks), ['PreToolUse']);
+		const pre = o.hooks.PreToolUse;
+		assert.equal(pre.length, 1);
+		assert.equal(pre[0].matcher, 'AskUserQuestion');
+		assert.match(pre[0].hooks[0].command as string, /^python3 '/);
+		assert.equal(shellParsedPath(pre[0].hooks[0].command), GUARD);
+	});
+
+	it('omitting the obs arg entirely is equivalent to obs off', () => {
+		const o = buildCore(GUARD);
+		assert.deepEqual(Object.keys(o.hooks), ['PreToolUse']);
+		assert.equal(o.hooks.PreToolUse.length, 1);
+		assert.equal(o.hooks.PreToolUse[0].matcher, 'AskUserQuestion');
+	});
+
+	it('merges the guard with obs hooks (concat, guard first) when obs is on', () => {
+		const obs = JSON.parse(buildObs('/x/obs-hook.sh'));
+		const o = buildCore(GUARD, buildObs('/x/obs-hook.sh'));
+		// Guard survives, obs survives: PreToolUse holds BOTH matchers, guard first.
+		const pre = o.hooks.PreToolUse;
+		assert.equal(pre.length, 2, 'guard entry must not replace the obs entry (or vice-versa)');
+		assert.equal(pre[0].matcher, 'AskUserQuestion');
+		assert.equal(pre[1].matcher, '*');
+		// Every obs event key is preserved.
+		for (const ev of Object.keys(obs.hooks)) {
+			assert.ok(o.hooks[ev], `merged settings dropped obs event ${ev}`);
+		}
+		// obs-only lifecycle events pass through untouched.
+		assert.deepEqual(o.hooks.SessionStart, obs.hooks.SessionStart);
+	});
+
+	const ADVERSARIAL = [
+		'/Users/o brien/hooks/skip-ask-user-question.py', // spaces
+		'/Users/o"brien/hooks/skip-ask-user-question.py', // double quote
+		"/Users/o'brien/hooks/skip-ask-user-question.py", // single quote (POSIX '\'' escape)
+		'/path/with$dollar/and`tick`/skip-ask-user-question.py', // $ + backtick must not expand
+	];
+	for (const p of ADVERSARIAL) {
+		it(`round-trips a guard path through valid JSON + shell quoting: ${p}`, () => {
+			const o = buildCore(p, '');
+			const cmd = o.hooks.PreToolUse[0].hooks[0].command as string;
+			assert.match(cmd, /^python3 '/); // POSIX single-quoted
+			assert.equal(shellParsedPath(cmd), p); // shell sees the EXACT original path
+		});
+	}
+
+	it('exits non-zero when no guard path is given', () => {
+		assert.throws(() => execFileSync('node', [CORE_BUILDER], { encoding: 'utf8', stdio: 'pipe' }));
+	});
+
+	it('exits non-zero on an unparseable obs-settings blob', () => {
+		assert.throws(() =>
+			execFileSync('node', [CORE_BUILDER, GUARD, '{not json'], { encoding: 'utf8', stdio: 'pipe' }),
+		);
+	});
+});

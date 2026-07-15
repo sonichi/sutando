@@ -16,12 +16,12 @@ import os
 import re
 import sys
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
-from util_paths import personal_path, shared_personal_path  # noqa: E402
+from util_paths import claude_home_path, personal_path, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
 WORKSPACE = resolve_workspace()
@@ -120,9 +120,9 @@ def check_github_issues():
         )
         if result.returncode == 0:
             items = json.loads(result.stdout)
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             for item in items:
-                updated = datetime.fromisoformat(item["updatedAt"].replace("Z", "+00:00")).replace(tzinfo=None)
+                updated = datetime.fromisoformat(item["updatedAt"].replace("Z", "+00:00"))
                 age_days = (now - updated).days
                 if age_days > 7:
                     issues.append(f"GitHub issue #{item['number']} stale ({age_days}d): {item['title'][:60]}")
@@ -135,7 +135,7 @@ def check_overdue_reminders():
     """Check macOS Reminders for overdue items."""
     issues = []
     try:
-        script = WORKSPACE.parent.parent / ".claude" / "skills" / "macos-tools" / "scripts" / "reminders.py"
+        script = claude_home_path("skills", "macos-tools", "scripts", "reminders.py")
         if not script.exists():
             return []
         # Use sys.executable: friction-detector runs via cron (launchd-managed);

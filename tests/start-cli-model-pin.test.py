@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests that scripts/start-cli.sh honors $SUTANDO_CORE_MODEL (PR #1428).
+"""Tests that src/agent/claude/cli/start-cli.sh honors $SUTANDO_CORE_MODEL (PR #1428).
 
 The recovery escalation in src/health-check.py restarts a re-wedging core with
 SUTANDO_CORE_MODEL=opus so it falls back to standard 200K context. This verifies
@@ -22,7 +22,7 @@ import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-SCRIPT = REPO / "scripts" / "start-cli.sh"
+SCRIPT = REPO / "src" / "agent" / "claude" / "cli" / "start-cli.sh"
 
 
 def _launch_argv(model_env: "str | None") -> list[str]:

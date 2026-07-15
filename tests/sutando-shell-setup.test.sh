@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tests for scripts/sutando-shell-setup.sh
+# Tests for src/agent/claude/cli/sutando-shell-setup.sh
 #
 # Covers: --check (4 states), --commit (4 states), --migrate (2 states),
 # dry-run (default mode). Isolation strategy: each test runs with a fresh
@@ -18,7 +18,7 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-HELPER="$REPO/scripts/sutando-shell-setup.sh"
+HELPER="$REPO/src/agent/claude/cli/sutando-shell-setup.sh"
 
 if [ ! -x "$HELPER" ]; then
   echo "FATAL: $HELPER not found or not executable" >&2
