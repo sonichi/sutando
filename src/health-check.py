@@ -50,6 +50,13 @@ from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 # pre-#736 and skills/self-diagnose pre-#769.
 WORKSPACE_DIR = resolve_workspace()
 
+# Sentinel key in the failure-alert dedup state files (health-last-alerted /
+# -notified / -slacked .json) that stores the most-recently-alerted
+# failure-set hash, distinct from the per-hash timestamp entries used for
+# 24h pruning. sha256 hex digests are [0-9a-f]-only, so this can never
+# collide with a real hash_key.
+_LAST_HASH_KEY = "_last_hash"
+
 def _default_memory_dir() -> str:
     """Claude Code memory dir under the workspace claude-home.
 
@@ -1828,11 +1835,17 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
     Now health-check at any cron tick can produce a task file → watcher fires
     → CLI processes as owner-tier task → LLM judgment at the act step.
 
-    Dedup via failure-SET hash to avoid spamming a task every tick when a
-    failure persists. The hash covers the full active set (sorted member
-    names) — if the set changes (one service recovers, another fails), the
-    hash changes and a new task fires. Cooldown is 1h per hash so a
-    persistent failure re-alerts after a reasonable window.
+    Dedup via failure-SET hash, alerting only on a TRANSITION — the set
+    changing from what was last alerted (one service recovers, another
+    fails, or a wholly new failure appears). A persistent, unchanged
+    failure set does NOT re-fire on a timer; per-hash timestamps used to
+    expire after a 1h cooldown and then re-alert the identical set forever,
+    which is exactly the "spams me hourly about the same known issue" bug
+    (owner complaint 2026-07-01) — a set that never resolves (e.g. an
+    intentionally-unconfigured optional feature) alerted once per hour,
+    indefinitely. Fixed by tracking only the MOST RECENTLY alerted hash
+    (`_LAST_HASH_KEY`) and suppressing whenever the current hash matches it,
+    regardless of elapsed time.
 
     `state_file` and `tasks_dir` default to the workspace paths used in
     production. Tests inject temp paths.
@@ -1861,7 +1874,6 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
     set_key = "|".join(sorted(c["name"] for c in failures))
     hash_key = hashlib.sha256(set_key.encode()).hexdigest()[:16]
     now_ms = int(time.time() * 1000)
-    cooldown_ms = 3600 * 1000  # 1h
 
     # Read prior alert state.
     history: dict = {}
@@ -1871,9 +1883,9 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
     except Exception:
         history = {}
 
-    last_alerted = history.get(hash_key, 0)
-    if now_ms - last_alerted < cooldown_ms:
-        # Same failure set, within cooldown — skip.
+    if history.get(_LAST_HASH_KEY) == hash_key:
+        # Unchanged failure set since the last alert — no re-fire, no matter
+        # how much time has passed. Only a transition re-alerts.
         return
 
     # Build task content. task: is placed LAST (after trusted metadata fields)
@@ -1896,10 +1908,13 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
     task_path = tasks_dir / f"task-health-{now_ms}.txt"
     task_path.write_text(body)
 
-    # Update history. Prune entries older than 24h to bound file size.
+    # Update history. Prune timestamp entries older than 24h to bound file
+    # size — `_LAST_HASH_KEY` is a hash string, not a timestamp, so it's
+    # excluded from the age comparison and re-added after pruning.
     history[hash_key] = now_ms
+    history[_LAST_HASH_KEY] = hash_key
     cutoff = now_ms - (24 * 3600 * 1000)
-    history = {k: v for k, v in history.items() if v >= cutoff}
+    history = {k: v for k, v in history.items() if k == _LAST_HASH_KEY or v >= cutoff}
     try:
         state_file.write_text(json.dumps(history))
     except Exception:
@@ -1913,11 +1928,12 @@ def notify_for_failures(
 ) -> None:
     """Surface health-check failures via macOS notification.
 
-    Companion to `emit_task_for_failures` — same dedup contract (per-failure-
-    set hash, 1h cooldown, separate state file). Two surfaces are needed for
-    robustness: emit-task only delivers if the agent is alive to read tasks/,
-    osascript runs at OS level and surfaces even when every Sutando service
-    is dead. The launchd-supervised fallback health-check
+    Companion to `emit_task_for_failures` — same dedup contract: alert only
+    on a TRANSITION of the failure-set hash (not a timed re-fire of an
+    unchanged set — see `_LAST_HASH_KEY`), separate state file. Two surfaces
+    are needed for robustness: emit-task only delivers if the agent is alive
+    to read tasks/, osascript runs at OS level and surfaces even when every
+    Sutando service is dead. The launchd-supervised fallback health-check
     (com.sutando.health-check-fallback) relies on this property — it's the
     alert path that survives "all of Sutando is down."
 
@@ -1936,7 +1952,6 @@ def notify_for_failures(
     set_key = "|".join(sorted(c["name"] for c in failures))
     hash_key = hashlib.sha256(set_key.encode()).hexdigest()[:16]
     now_ms = int(time.time() * 1000)
-    cooldown_ms = 3600 * 1000  # 1h — matches emit_task
 
     history: dict = {}
     try:
@@ -1945,8 +1960,8 @@ def notify_for_failures(
     except Exception:
         history = {}
 
-    last_notified = history.get(hash_key, 0)
-    if now_ms - last_notified < cooldown_ms:
+    if history.get(_LAST_HASH_KEY) == hash_key:
+        # Unchanged failure set since the last alert — no re-fire.
         return
 
     # Build a short notification body — macOS truncates aggressively. Lead
@@ -1969,8 +1984,9 @@ def notify_for_failures(
         pass
 
     history[hash_key] = now_ms
+    history[_LAST_HASH_KEY] = hash_key
     cutoff = now_ms - (24 * 3600 * 1000)
-    history = {k: v for k, v in history.items() if v >= cutoff}
+    history = {k: v for k, v in history.items() if k == _LAST_HASH_KEY or v >= cutoff}
     try:
         state_file.write_text(json.dumps(history))
     except Exception:
@@ -2103,11 +2119,12 @@ def notify_slack_for_failures(
     `core-proactive-loop` check flips to `warn` and this DMs Slack anyway.
     Deliberately NOT gated on core liveness, for exactly that reason.
 
-    Same dedup contract as notify_for_failures (per-failure-set hash, 1h
-    cooldown) but a separate state file so the Slack and macOS surfaces never
-    suppress each other. The dedup hash is recorded only on a SUCCESSFUL send,
-    so a transient Slack/API outage doesn't silence the alert for an hour.
-    `sender` is injected by tests to avoid real API calls.
+    Same dedup contract as notify_for_failures — alert only on a TRANSITION
+    of the failure-set hash, no timed re-fire of an unchanged set (see
+    `_LAST_HASH_KEY`) — but a separate state file so the Slack and macOS
+    surfaces never suppress each other. The dedup hash is recorded only on a
+    SUCCESSFUL send, so a transient Slack/API outage doesn't silence the
+    alert. `sender` is injected by tests to avoid real API calls.
     """
     failures = _slack_failures(checks)
     if not failures:
@@ -2120,7 +2137,6 @@ def notify_slack_for_failures(
     set_key = "|".join(sorted(c["name"] for c in failures))
     hash_key = hashlib.sha256(set_key.encode()).hexdigest()[:16]
     now_ms = int(time.time() * 1000)
-    cooldown_ms = 3600 * 1000  # 1h — matches the macOS + emit-task surfaces
 
     history: dict = {}
     try:
@@ -2129,7 +2145,8 @@ def notify_slack_for_failures(
     except Exception:
         history = {}
 
-    if now_ms - history.get(hash_key, 0) < cooldown_ms:
+    if history.get(_LAST_HASH_KEY) == hash_key:
+        # Unchanged failure set since the last successful send — no re-fire.
         return
 
     lines = [f"• {c['name']}: {c['status']} ({c['detail']})" for c in failures[:5]]
@@ -2146,8 +2163,9 @@ def notify_slack_for_failures(
         return
 
     history[hash_key] = now_ms
+    history[_LAST_HASH_KEY] = hash_key
     cutoff = now_ms - (24 * 3600 * 1000)
-    history = {k: v for k, v in history.items() if v >= cutoff}
+    history = {k: v for k, v in history.items() if k == _LAST_HASH_KEY or v >= cutoff}
     try:
         state_file.write_text(json.dumps(history))
     except Exception:
