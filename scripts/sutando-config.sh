@@ -353,6 +353,26 @@ try:
         probe_voice_ws = vrec['voice_ws']
 except Exception:
     pass
+# call_tiers: the DIRECT call endpoints this core can advertise right now, the
+# runtime-authored half of the availability-driven call-tier menu (Track 9). The
+# emitter (src/emit-call-tiers.ts, from reachability-endpoints.ts) writes
+# state/call-tiers.json at startup; the client renders the tier picker from this
+# instead of the old static 'force tier' stub (greyed Direct even when live,
+# offered Local on a remote core). Only direct tiers are advertised — 'local' is
+# client-relative and cloud/relay are always-available + composed client-side.
+# The advertisement is a HINT: the client verifies reachability (first-reachable-
+# wins), so a stale entry degrades gracefully. Absent/malformed -> [] (client
+# falls back to cloud). A freshness window / re-emit-on-network-change is a
+# documented follow-up.
+probe_call_tiers = []
+try:
+    with open(os.path.join(ws, 'state', 'call-tiers.json')) as f:
+        crec = json.load(f)
+    ct = crec.get('call_tiers')
+    if isinstance(ct, list):
+        probe_call_tiers = ct
+except Exception:
+    pass
 env = dict(os.environ, SUTANDO_TMUX_SOCKET=probe_socket)
 h = {}
 try:
@@ -397,6 +417,11 @@ print(json.dumps({
     # state (probe_voice_ws above): voice-agent.ts records its actual bound PORT,
     # so a non-default-PORT install is reported correctly, not a hardcoded default.
     'voice_ws': probe_voice_ws,
+    # call_tiers: the direct call endpoints this core advertises (Track 9). The
+    # desktop 'Start Call' picker renders the tier menu from this — showing only
+    # reachable rows, un-greying Direct(Tailscale)/Direct(LAN) when their url is
+    # advertised. Runtime-authored via probe_call_tiers above (emit-call-tiers.ts).
+    'call_tiers': probe_call_tiers,
     'health': h.get('health', 'unknown'),
     'authenticated': h.get('authenticated'),
 }))
