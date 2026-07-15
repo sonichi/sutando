@@ -50,6 +50,13 @@ from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 # pre-#736 and skills/self-diagnose pre-#769.
 WORKSPACE_DIR = resolve_workspace()
 
+# Sentinel key in the failure-alert dedup state files (health-last-alerted /
+# -notified / -slacked .json) that stores the most-recently-alerted
+# failure-set hash, distinct from the per-hash timestamp entries used for
+# 24h pruning. sha256 hex digests are [0-9a-f]-only, so this can never
+# collide with a real hash_key.
+_LAST_HASH_KEY = "_last_hash"
+
 def _default_memory_dir() -> str:
     """Claude Code memory dir under the workspace claude-home.
 
@@ -66,7 +73,56 @@ def _default_memory_dir() -> str:
     slug = str(repo).replace("/", "-")
     return str(Path(claude_home_path()) / "projects" / slug / "memory")
 
+# SUTANDO_MEMORY_DIR stays authoritative here, same as everywhere else that
+# resolves core memory (src/voice-agent.ts, src/voice-context.ts, and
+# CLAUDE.md/AGENTS.md all honor it). An earlier version of this fix made
+# ONLY this check ignore the override, on the theory that it was purely a
+# stale pre-#1454 workaround (see _default_memory_dir()'s docstring) — but
+# that broke the invariant that this check reports on the SAME directory the
+# rest of the runtime actually reads/writes, which is a worse failure mode
+# than the one being fixed (a health check silently diverging from ground
+# truth). If SUTANDO_MEMORY_DIR is a genuine leftover from that era, the
+# memory-dir-override check below flags the divergence instead of silently
+# redirecting.
 MEMORY_DIR = Path(os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir()))
+
+
+def _resolve_dotenv() -> Path:
+    """Resolve the `.env` path via the canonical resolver.
+
+    The 2-tier fallback (repo root -> workspace, #1871) lives in
+    `sutando_config.py` — the canonical resolver — so this consumer never
+    inlines the path. (The #1973 Sutando.app bundle tier is deferred pending the
+    app-bundle install-location decision — see sutando_config.resolve_dotenv.)
+    """
+    from sutando_config import resolve_dotenv  # noqa: PLC0415
+    return resolve_dotenv(REPO_DIR, WORKSPACE_DIR)
+
+
+def _resolved_vault() -> dict:
+    """Return the resolved vault config subtree via the canonical resolver
+    (`sutando_config.resolve_vault`) — the SINGLE source of truth for
+    `vault.enabled` and `vault.remote_url`.
+
+    Augments the resolver's dict with `_explicit_disable`: True only when the
+    config file actually carries `vault.enabled=false` (a deliberate opt-out),
+    as opposed to the resolver's default-False for a host with no vault block
+    at all. This lets check_memory_sync distinguish "opted out on purpose" from
+    "never configured" without re-reading config.
+
+    Best-effort: on any error (resolver import failure, malformed config) return
+    safe defaults ({"enabled": False, "remote_url": ""}) so a config-helper
+    hiccup never masks a real check. Mirrors resolve_vault's own defaults.
+    """
+    try:
+        from sutando_config import resolve_vault, load_config  # noqa: PLC0415
+        vault = dict(resolve_vault(repo_root=REPO_DIR))
+        raw_vault = load_config(repo_root=REPO_DIR).get("vault") or {}
+        vault["_explicit_disable"] = raw_vault.get("enabled") is False
+        return vault
+    except Exception:
+        return {"enabled": False, "remote_url": "", "_explicit_disable": False}
+
 
 # ---------------------------------------------------------------------------
 # Checks
@@ -118,6 +174,24 @@ def check_port(port: int, name: str, probe: bool = False) -> dict:
                     s.sendall(f"GET /__liveness_probe__ HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n".encode())
                     if not s.recv(1):
                         raise TimeoutError("no response bytes")
+                    # Drain the rest of the response before close. Closing
+                    # with unread bytes sends RST, so the probed server's
+                    # response write fails mid-flight — one BrokenPipeError
+                    # traceback in ITS log per health run. Connection: close
+                    # means a healthy server EOFs right after the response;
+                    # cap time and bytes so a misbehaving one can't stall us.
+                    # The verdict is already decided by the first byte, so
+                    # drain failures are ignored rather than marked wedged.
+                    s.settimeout(2)
+                    drained = 0
+                    try:
+                        while drained < 65536:  # pragma: no cover — socket recv timing makes this hard to instrument in CI
+                            chunk = s.recv(4096)
+                            if not chunk:
+                                break
+                            drained += len(chunk)
+                    except OSError:  # pragma: no cover — only fires on recv error mid-drain; not triggered in tests
+                        pass
                 except Exception:
                     return {
                         "name": name,
@@ -167,18 +241,66 @@ def check_directory(path: Path, name: str) -> dict:
     return {"name": name, "status": "ok", "detail": f"{count} .md files"}
 
 
+def check_memory_dir_override() -> "dict | None":
+    """Flag a SUTANDO_MEMORY_DIR that diverges from the computed default.
+
+    The var is authoritative for MEMORY_DIR (matching src/voice-agent.ts and
+    src/voice-context.ts, which also honor it) — so a genuine current use
+    keeps working consistently everywhere. But a leftover pre-#1454 value
+    would silently point every consumer at a stale directory instead of the
+    actively-synced one. Warn on divergence rather than silently redirecting
+    just this check, so the user can judge whether the override is still
+    intentional. Returns None when the var is unset or matches the default.
+    """
+    override = os.environ.get("SUTANDO_MEMORY_DIR")
+    if not override:
+        return None
+    default = Path(_default_memory_dir())
+    if Path(override).resolve() == default.resolve():
+        return None
+    return {
+        "name": "memory-dir-override",
+        "status": "warn",
+        "detail": (
+            f"SUTANDO_MEMORY_DIR={override} differs from the computed "
+            f"default ({default}) — verify this is still intentional, not "
+            "a stale pre-#1454 leftover"
+        ),
+    }
+
+
 def check_memory_sync() -> dict:
-    """Verify memory sync is configured and has run recently."""
+    """Verify memory sync is configured and has run recently.
+
+    Cross-machine sync is OPT-IN. When it's deliberately disabled
+    (vault.enabled=false) or simply not configured, that's a valid
+    single-machine choice — report it as informational (ok), NOT a recurring
+    warn (owner ask 2026-07-10 — the confusing memory-var nag). A
+    configured-but-stale sync still warns; that's a real problem.
+
+    The vault remote is read from the CANONICAL config (vault.remote_url via
+    sutando_config.resolve_vault) with the deprecated SUTANDO_MEMORY_REPO in
+    .env kept as a backward-compat fallback (#1446 window).
+    """
     name = "memory-sync"
-    env_path = REPO_DIR / ".env"
-    repo_url = ""
-    if env_path.exists():
-        for line in env_path.read_text().splitlines():
-            if line.startswith("SUTANDO_MEMORY_REPO="):
-                repo_url = line.split("=", 1)[1].strip().strip('"').strip("'")
-                break
+    vault = _resolved_vault()
+    # Deliberate config opt-out (vault.enabled=false) → informational, never a
+    # nag (#2069).
+    if vault.get("_explicit_disable"):
+        return {"name": name, "status": "ok", "detail": "cross-machine sync disabled (config opt-out)"}
+    # Canonical config first (vault.remote_url), then the deprecated .env alias.
+    repo_url = vault.get("remote_url") or ""
     if not repo_url:
-        return {"name": name, "status": "warn", "detail": "SUTANDO_MEMORY_REPO not set — cross-machine sync disabled"}
+        env_path = _resolve_dotenv()
+        if env_path.exists():
+            for line in env_path.read_text().splitlines():
+                if line.startswith("SUTANDO_MEMORY_REPO="):
+                    repo_url = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
+    if not repo_url:
+        # Not configured anywhere → single-machine mode is a valid choice, not
+        # a warn (#2069).
+        return {"name": name, "status": "ok", "detail": "cross-machine sync not configured (single-machine mode)"}
     # Current model (sync-workspace.sh): the workspace ITSELF is a git repo with
     # the vault as a remote — sync = git fetch/merge/push on the workspace, no
     # separate clone dir. So the freshness signal is the workspace's own
@@ -204,7 +326,7 @@ def check_memory_sync() -> dict:
     elif sync_dir_legacy.exists():
         sync_dir = sync_dir_legacy
     else:
-        return {"name": name, "status": "warn", "detail": "repo configured but never synced — run bash scripts/sync-memory.sh"}
+        return {"name": name, "status": "warn", "detail": "repo configured but never synced — run bash scripts/sync-workspace.sh"}
     git_dir = sync_dir / ".git" / "FETCH_HEAD"
     if git_dir.exists():
         age_h = (time.time() - git_dir.stat().st_mtime) / 3600
@@ -257,6 +379,36 @@ def check_host_subtrees() -> dict:
                 "detail": f"{len(stale)} host subtree(s) stale (>{stale_days:.0f}d): "
                           f"{', '.join(stale)} — host stopped syncing?"}
     return {"name": name, "status": "ok", "detail": f"{fresh} host subtree(s), all synced <{stale_days:.0f}d"}
+
+
+def check_migrate_reader_contract() -> dict:
+    """Verify migration CLASS_RULES are compatible with reader resolution chains (issue #1543).
+
+    Runs tests/migrate-reader-contract.test.py, which asserts that each file
+    in sutando-migrate.sh CLASS_RULES lands in a location its reader actually
+    checks.  A mismatch causes silent data loss — the reader falls back to a
+    default rather than finding the migrated file (see incident #1540).
+    """
+    name = "migrate-reader-contract"
+    test_path = REPO_DIR / "tests" / "migrate-reader-contract.test.py"
+    if not test_path.exists():
+        return {"name": name, "status": "ok", "detail": "test not found (pre-#1543 install)"}
+    try:
+        result = subprocess.run(
+            [sys.executable, str(test_path)],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0:
+            return {"name": name, "status": "ok", "detail": "all CLASS_RULES compatible with reader contracts"}
+        first_fail = next(
+            (ln.strip() for ln in (result.stdout + result.stderr).splitlines() if "FAIL" in ln or "Error" in ln),
+            "contract mismatch — run tests/migrate-reader-contract.test.py for details",
+        )
+        return {"name": name, "status": "error", "detail": first_fail}
+    except subprocess.TimeoutExpired:
+        return {"name": name, "status": "warn", "detail": "timed out after 15s"}
+    except Exception as e:
+        return {"name": name, "status": "error", "detail": str(e)}
 
 
 def check_tcc_documents_access() -> dict:
@@ -1121,6 +1273,78 @@ def check_gateway_bridge() -> "dict | None":
     return {"name": "gateway-bridge", "status": "ok", "detail": "running"}
 
 
+def check_skill_symlinks() -> dict:
+    """Detect skills in the OSS repo checkout that are not symlinked into
+    ~/.claude/skills/. A missing symlink means Claude Code never loads the
+    skill — it's silently invisible until manually linked (bug d920b18b).
+
+    Scans REPO_DIR/skills/ for directories and checks for a matching entry
+    in ~/.claude/skills/. Reports unlinked skills as 'warn'; in --fix mode,
+    creates the missing symlinks automatically.
+    """
+    name = "skill-symlinks"
+    skills_src = REPO_DIR / "skills"
+    skills_dst = Path.home() / ".claude" / "skills"
+
+    if not skills_src.exists():
+        return {"name": name, "status": "ok", "detail": "skills/ dir not found — skipped"}
+    if not skills_dst.exists():
+        return {"name": name, "status": "ok", "detail": "~/.claude/skills/ not found — skipped"}
+
+    unlinked: list[str] = []
+    for skill_dir in sorted(skills_src.iterdir()):
+        if not skill_dir.is_dir():
+            continue
+        skill_name = skill_dir.name
+        dst = skills_dst / skill_name
+        if not dst.exists() and not dst.is_symlink():
+            unlinked.append(skill_name)
+
+    if not unlinked:
+        return {"name": name, "status": "ok", "detail": f"all {sum(1 for d in skills_src.iterdir() if d.is_dir())} skills linked"}
+
+    return {
+        "name": name,
+        "status": "warn",
+        "detail": f"{len(unlinked)} unlinked skill(s): {', '.join(unlinked[:5])}{'...' if len(unlinked) > 5 else ''}",
+        "_unlinked": unlinked,
+        "_skills_src": str(skills_src),
+        "_skills_dst": str(skills_dst),
+    }
+
+
+def fix_skill_symlinks(check: dict) -> dict:
+    """Create missing symlinks for unlinked skills (--fix handler)."""
+    unlinked = check.get("_unlinked", [])
+    skills_src = Path(check.get("_skills_src", ""))
+    skills_dst = Path(check.get("_skills_dst", ""))
+    created: list[str] = []
+    errors: list[str] = []
+    for skill_name in unlinked:
+        src = skills_src / skill_name
+        dst = skills_dst / skill_name
+        try:
+            dst.symlink_to(src)
+            created.append(skill_name)
+        except Exception as e:
+            errors.append(f"{skill_name}: {e}")
+    result = f"linked {len(created)}"
+    if created:
+        result += f" ({', '.join(created)})"
+    if errors:
+        result += f"; errors: {'; '.join(errors)}"
+    return {"name": "skill-symlinks", "status": "ok" if not errors else "warn", "detail": result}
+
+
+def apply_skill_symlink_fixes(checks: list) -> None:
+    """--fix dispatch for skill-symlinks: warn-level (excluded from the issues
+    loop) but auto-fixable, so it is handled by its own pass over checks."""
+    for c in checks:
+        if c["name"] == "skill-symlinks" and c.get("_unlinked"):
+            result = fix_skill_symlinks(c)
+            print(f"  {c['name']}: {result['detail']}")
+
+
 def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> dict:
     """Detect a task-queue pileup — tasks/ directory growing without
     being drained. Independent of which watcher / loop is dying: the queue
@@ -1335,7 +1559,7 @@ def run_all_checks() -> list[dict]:
     for name, path in [
         ("CLAUDE.md", REPO_DIR / "CLAUDE.md"),
         ("build_log.md", WORKSPACE_DIR / "build_log.md"),
-        (".env", REPO_DIR / ".env"),
+        (".env", _resolve_dotenv()),
     ]:
         checks.append(check_file(path, name))
 
@@ -1344,6 +1568,10 @@ def run_all_checks() -> list[dict]:
         checks.append(check_directory(MEMORY_DIR, "memory-dir"))
     else:
         checks.append({"name": "memory-dir", "status": "ok", "detail": "not yet created (normal for new installs)"})
+
+    _mem_override = check_memory_dir_override()
+    if _mem_override:
+        checks.append(_mem_override)
 
     # Notes — canonical home is the resolved workspace post-migration.
     # Pass WORKSPACE_DIR (not REPO_DIR) so the check resolves to
@@ -1363,8 +1591,11 @@ def run_all_checks() -> list[dict]:
     # Per-host subtree freshness (hosts/<host>/ stopped syncing?)
     checks.append(check_host_subtrees())
 
+    # Migration/reader path-contract drift (#1543)
+    checks.append(check_migrate_reader_contract())
+
     # Phone conversation server (optional — only check if Twilio configured and not skipped)
-    env_path = REPO_DIR / ".env"
+    env_path = _resolve_dotenv()  # pragma: no cover — call-site in untested mega-function
     if env_path.exists():
         env_content = env_path.read_text()
         has_twilio = twilio_configured(env_content)  # pragma: no cover — call-site in untested mega-function
@@ -1654,6 +1885,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_core_proactive_loop(threshold_sec=loop_stale_sec))
     checks.append(check_core_supervisor())
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
+    checks.append(check_skill_symlinks())
 
     return checks
 
@@ -1694,11 +1926,17 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
     Now health-check at any cron tick can produce a task file → watcher fires
     → CLI processes as owner-tier task → LLM judgment at the act step.
 
-    Dedup via failure-SET hash to avoid spamming a task every tick when a
-    failure persists. The hash covers the full active set (sorted member
-    names) — if the set changes (one service recovers, another fails), the
-    hash changes and a new task fires. Cooldown is 1h per hash so a
-    persistent failure re-alerts after a reasonable window.
+    Dedup via failure-SET hash, alerting only on a TRANSITION — the set
+    changing from what was last alerted (one service recovers, another
+    fails, or a wholly new failure appears). A persistent, unchanged
+    failure set does NOT re-fire on a timer; per-hash timestamps used to
+    expire after a 1h cooldown and then re-alert the identical set forever,
+    which is exactly the "spams me hourly about the same known issue" bug
+    (owner complaint 2026-07-01) — a set that never resolves (e.g. an
+    intentionally-unconfigured optional feature) alerted once per hour,
+    indefinitely. Fixed by tracking only the MOST RECENTLY alerted hash
+    (`_LAST_HASH_KEY`) and suppressing whenever the current hash matches it,
+    regardless of elapsed time.
 
     `state_file` and `tasks_dir` default to the workspace paths used in
     production. Tests inject temp paths.
@@ -1727,7 +1965,6 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
     set_key = "|".join(sorted(c["name"] for c in failures))
     hash_key = hashlib.sha256(set_key.encode()).hexdigest()[:16]
     now_ms = int(time.time() * 1000)
-    cooldown_ms = 3600 * 1000  # 1h
 
     # Read prior alert state.
     history: dict = {}
@@ -1737,9 +1974,9 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
     except Exception:
         history = {}
 
-    last_alerted = history.get(hash_key, 0)
-    if now_ms - last_alerted < cooldown_ms:
-        # Same failure set, within cooldown — skip.
+    if history.get(_LAST_HASH_KEY) == hash_key:
+        # Unchanged failure set since the last alert — no re-fire, no matter
+        # how much time has passed. Only a transition re-alerts.
         return
 
     # Build task content. task: is placed LAST (after trusted metadata fields)
@@ -1762,10 +1999,13 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
     task_path = tasks_dir / f"task-health-{now_ms}.txt"
     task_path.write_text(body)
 
-    # Update history. Prune entries older than 24h to bound file size.
+    # Update history. Prune timestamp entries older than 24h to bound file
+    # size — `_LAST_HASH_KEY` is a hash string, not a timestamp, so it's
+    # excluded from the age comparison and re-added after pruning.
     history[hash_key] = now_ms
+    history[_LAST_HASH_KEY] = hash_key
     cutoff = now_ms - (24 * 3600 * 1000)
-    history = {k: v for k, v in history.items() if v >= cutoff}
+    history = {k: v for k, v in history.items() if k == _LAST_HASH_KEY or v >= cutoff}
     try:
         state_file.write_text(json.dumps(history))
     except Exception:
@@ -1779,11 +2019,12 @@ def notify_for_failures(
 ) -> None:
     """Surface health-check failures via macOS notification.
 
-    Companion to `emit_task_for_failures` — same dedup contract (per-failure-
-    set hash, 1h cooldown, separate state file). Two surfaces are needed for
-    robustness: emit-task only delivers if the agent is alive to read tasks/,
-    osascript runs at OS level and surfaces even when every Sutando service
-    is dead. The launchd-supervised fallback health-check
+    Companion to `emit_task_for_failures` — same dedup contract: alert only
+    on a TRANSITION of the failure-set hash (not a timed re-fire of an
+    unchanged set — see `_LAST_HASH_KEY`), separate state file. Two surfaces
+    are needed for robustness: emit-task only delivers if the agent is alive
+    to read tasks/, osascript runs at OS level and surfaces even when every
+    Sutando service is dead. The launchd-supervised fallback health-check
     (com.sutando.health-check-fallback) relies on this property — it's the
     alert path that survives "all of Sutando is down."
 
@@ -1802,7 +2043,6 @@ def notify_for_failures(
     set_key = "|".join(sorted(c["name"] for c in failures))
     hash_key = hashlib.sha256(set_key.encode()).hexdigest()[:16]
     now_ms = int(time.time() * 1000)
-    cooldown_ms = 3600 * 1000  # 1h — matches emit_task
 
     history: dict = {}
     try:
@@ -1811,8 +2051,8 @@ def notify_for_failures(
     except Exception:
         history = {}
 
-    last_notified = history.get(hash_key, 0)
-    if now_ms - last_notified < cooldown_ms:
+    if history.get(_LAST_HASH_KEY) == hash_key:
+        # Unchanged failure set since the last alert — no re-fire.
         return
 
     # Build a short notification body — macOS truncates aggressively. Lead
@@ -1835,8 +2075,9 @@ def notify_for_failures(
         pass
 
     history[hash_key] = now_ms
+    history[_LAST_HASH_KEY] = hash_key
     cutoff = now_ms - (24 * 3600 * 1000)
-    history = {k: v for k, v in history.items() if v >= cutoff}
+    history = {k: v for k, v in history.items() if k == _LAST_HASH_KEY or v >= cutoff}
     try:
         state_file.write_text(json.dumps(history))
     except Exception:
@@ -1969,11 +2210,12 @@ def notify_slack_for_failures(
     `core-proactive-loop` check flips to `warn` and this DMs Slack anyway.
     Deliberately NOT gated on core liveness, for exactly that reason.
 
-    Same dedup contract as notify_for_failures (per-failure-set hash, 1h
-    cooldown) but a separate state file so the Slack and macOS surfaces never
-    suppress each other. The dedup hash is recorded only on a SUCCESSFUL send,
-    so a transient Slack/API outage doesn't silence the alert for an hour.
-    `sender` is injected by tests to avoid real API calls.
+    Same dedup contract as notify_for_failures — alert only on a TRANSITION
+    of the failure-set hash, no timed re-fire of an unchanged set (see
+    `_LAST_HASH_KEY`) — but a separate state file so the Slack and macOS
+    surfaces never suppress each other. The dedup hash is recorded only on a
+    SUCCESSFUL send, so a transient Slack/API outage doesn't silence the
+    alert. `sender` is injected by tests to avoid real API calls.
     """
     failures = _slack_failures(checks)
     if not failures:
@@ -1986,7 +2228,6 @@ def notify_slack_for_failures(
     set_key = "|".join(sorted(c["name"] for c in failures))
     hash_key = hashlib.sha256(set_key.encode()).hexdigest()[:16]
     now_ms = int(time.time() * 1000)
-    cooldown_ms = 3600 * 1000  # 1h — matches the macOS + emit-task surfaces
 
     history: dict = {}
     try:
@@ -1995,7 +2236,8 @@ def notify_slack_for_failures(
     except Exception:
         history = {}
 
-    if now_ms - history.get(hash_key, 0) < cooldown_ms:
+    if history.get(_LAST_HASH_KEY) == hash_key:
+        # Unchanged failure set since the last successful send — no re-fire.
         return
 
     lines = [f"• {c['name']}: {c['status']} ({c['detail']})" for c in failures[:5]]
@@ -2012,8 +2254,9 @@ def notify_slack_for_failures(
         return
 
     history[hash_key] = now_ms
+    history[_LAST_HASH_KEY] = hash_key
     cutoff = now_ms - (24 * 3600 * 1000)
-    history = {k: v for k, v in history.items() if v >= cutoff}
+    history = {k: v for k, v in history.items() if k == _LAST_HASH_KEY or v >= cutoff}
     try:
         state_file.write_text(json.dumps(history))
     except Exception:
@@ -2479,6 +2722,9 @@ def main():
         if do_fix:
             print()
             print("Attempting fixes...")
+            # skill-symlinks is "warn" (excluded from issues) but auto-fixable —
+            # handle it separately from the issues loop.
+            apply_skill_symlink_fixes(checks)
             for c in issues:
                 if c["name"].startswith("com.sutando."):
                     result = fix_launchd(c["name"])
@@ -2551,7 +2797,7 @@ def main():
                         print(f"  {c['name']}: not auto-fixed — needs manual rebuild + relaunch (see memory feedback_sutando_app_launch_method.md)")
                 elif c["name"] == "ngrok":
                     # Read ngrok domain from .env if set, otherwise use default
-                    env_path = REPO_DIR / ".env"
+                    env_path = _resolve_dotenv()  # pragma: no cover
                     domain_arg = []
                     if env_path.exists():
                         for line in env_path.read_text().splitlines():
