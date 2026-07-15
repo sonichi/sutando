@@ -72,6 +72,23 @@ MEMORY_DIR = Path(os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir()))
 # Checks
 # ---------------------------------------------------------------------------
 
+def twilio_configured(env_content: str) -> bool:
+    """True only when .env has an ACTIVE TWILIO_ACCOUNT_SID with a value.
+
+    A plain substring test also matched the commented placeholder shipped in
+    the .env template (`# TWILIO_ACCOUNT_SID=ACxxxxxxxxx`), so hosts that
+    never configured Twilio still ran the conversation-server + tunnel
+    checks — and startup.sh's matching gate kept a public ngrok tunnel open
+    to a port with nothing behind it (caught 2026-07-02). startup.sh's
+    phone block carries the anchored-grep equivalent of this test.
+    """
+    for line in env_content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("TWILIO_ACCOUNT_SID=") and stripped.split("=", 1)[1].strip():
+            return True
+    return False
+
+
 def check_port(port: int, name: str, probe: bool = False) -> dict:
     """Check if a port is listening, optionally probing for a live response.
 
@@ -1350,7 +1367,7 @@ def run_all_checks() -> list[dict]:
     env_path = REPO_DIR / ".env"
     if env_path.exists():
         env_content = env_path.read_text()
-        has_twilio = "TWILIO_ACCOUNT_SID=" in env_content and not env_content.split("TWILIO_ACCOUNT_SID=")[1].startswith("\n")
+        has_twilio = twilio_configured(env_content)  # pragma: no cover — call-site in untested mega-function
         skip_phone = "SKIP_PHONE=1" in env_content or os.environ.get("SKIP_PHONE") == "1"
         if has_twilio and not skip_phone:
             c = check_port(3100, "conversation-server")
