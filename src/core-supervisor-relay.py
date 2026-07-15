@@ -130,7 +130,13 @@ def _save_last_hash(state_file, h):
     if not state_file:
         return
     try:
-        os.makedirs(os.path.dirname(state_file), exist_ok=True)
+        # A cwd-relative --state-file (e.g. "relay.state") has an empty dirname;
+        # os.makedirs("") raises FileNotFoundError (an OSError), which the except
+        # below would swallow — silently disabling debounce persistence so the
+        # relay re-escalates every cycle. Only create the dir when there is one.
+        d = os.path.dirname(state_file)
+        if d:
+            os.makedirs(d, exist_ok=True)
         tmp = state_file + ".tmp"
         with open(tmp, "w") as f:
             json.dump({"last_hash": h}, f)

@@ -121,6 +121,23 @@ class TestRunCycleAndCli(unittest.TestCase):
             second = run_cycle(_LOGIN, sf, macos=False)  # same prompt → suppressed
             self.assertIsNone(second)
 
+    def test_relative_state_file_still_debounces(self):
+        # Regression: a cwd-relative --state-file (e.g. "relay.state") has an empty
+        # dirname. Previously os.makedirs("") raised FileNotFoundError, swallowed by
+        # the best-effort except → state never persisted → the relay re-escalated
+        # every cycle. The dir-create must be skipped when there is no dirname.
+        with tempfile.TemporaryDirectory() as td:
+            cwd = os.getcwd()
+            os.chdir(td)
+            try:
+                first = run_cycle(_LOGIN, "relay.state", macos=False)
+                self.assertIsNotNone(first)
+                self.assertTrue(os.path.exists("relay.state"))  # persisted, not swallowed
+                second = run_cycle(_LOGIN, "relay.state", macos=False)  # same prompt → suppressed
+                self.assertIsNone(second)
+            finally:
+                os.chdir(cwd)
+
     def test_cli_dry_run_on_signal_file(self):
         with tempfile.TemporaryDirectory() as td:
             sig = os.path.join(td, "core-supervisor.json")
