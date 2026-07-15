@@ -163,6 +163,15 @@ os.waitpid(p,0);print(p)")
 python3 -c "import json;json.dump({'vision_control':'http://127.0.0.1:17847','port':17847,'pid':$DEADPID2,'ts':0},open('$T9WS/state/vision-control.json','w'))"
 vc10="$(bash "$SCRIPT" runtime | python3 -c 'import json,sys;print(json.load(sys.stdin)["vision_control"])')"
 [ "$vc10" = "http://127.0.0.1:7847" ]; report "$?" "vision_control=$vc10 == default (dead pid $DEADPID2 ignored)"
+
+# -- Test 11: vision_control rejects a non-loopback URL even with a live pid ------
+# Hardening (#2118 review): the control server binds 127.0.0.1, so a state file
+# recording a non-loopback host is stale/crafted — must fall back to the default,
+# never hand the desktop client a URL it should not call.
+echo "[11] runtime.vision_control → rejects a non-loopback recorded URL (live pid)"
+python3 -c "import json;json.dump({'vision_control':'http://10.0.0.5:7847','port':7847,'pid':$$,'ts':0},open('$T9WS/state/vision-control.json','w'))"
+vc11="$(bash "$SCRIPT" runtime | python3 -c 'import json,sys;print(json.load(sys.stdin)["vision_control"])')"
+[ "$vc11" = "http://127.0.0.1:7847" ]; report "$?" "vision_control=$vc11 == default (non-loopback 10.0.0.5 rejected)"
 rm -rf "$T9WS"; rm -f "$CFG"; [ -n "$CFG_BAK" ] && mv "$CFG_BAK" "$CFG"
 
 echo

@@ -709,7 +709,13 @@ export function startVisionControlServer(port: number = DEFAULT_CONTROL_PORT): S
 		console.error(`${ts()} [Vision] control server error: ${err.message}`);
 	});
 	srv.listen(port, '127.0.0.1', () => {
-		console.log(`${ts()} [Vision] control server listening on 127.0.0.1:${port}`);
+		// Record the port the OS ACTUALLY bound, read from srv.address() — not the
+		// `port` parameter, which would echo `0` when the caller requested an
+		// ephemeral port instead of the real assigned one (the whole point of the
+		// runtime-authored state is correctness under a non-default port).
+		const addr = srv.address();
+		const boundPort = (addr && typeof addr === 'object') ? addr.port : port;
+		console.log(`${ts()} [Vision] control server listening on 127.0.0.1:${boundPort}`);
 		// vision-control.json is runtime-authored state recording the ACTUAL bound
 		// control port. `sutando-config.sh runtime` reads it (validated by pid
 		// liveness) so the AgentRuntime descriptor's `vision_control` reports the
@@ -720,7 +726,7 @@ export function startVisionControlServer(port: number = DEFAULT_CONTROL_PORT): S
 		try {
 			writeFileSync(
 				statusPath('vision-control.json', resolveWorkspace()),
-				JSON.stringify({ vision_control: `http://127.0.0.1:${port}`, port, pid: process.pid, ts: Math.floor(Date.now() / 1000) })
+				JSON.stringify({ vision_control: `http://127.0.0.1:${boundPort}`, port: boundPort, pid: process.pid, ts: Math.floor(Date.now() / 1000) })
 			);
 		} catch (err) {
 			console.error(`${ts()} [Vision] runtime state write failed:`, err);

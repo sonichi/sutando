@@ -376,8 +376,12 @@ try:
             calive = True  # exists but not ours — still a live process
         except Exception:
             calive = False
-    if calive and crec.get('vision_control'):
-        probe_vision_control = crec['vision_control']
+    # Only trust a loopback endpoint — the control server binds 127.0.0.1, so a
+    # non-loopback scheme/host in the state file is stale or crafted; fall back to
+    # the default rather than hand the desktop client a URL it should never call.
+    _cv = crec.get('vision_control')
+    if calive and isinstance(_cv, str) and _cv.startswith('http://127.0.0.1:'):
+        probe_vision_control = _cv
 except Exception:
     pass
 env = dict(os.environ, SUTANDO_TMUX_SOCKET=probe_socket)
