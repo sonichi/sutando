@@ -249,12 +249,21 @@ def get_pending_questions() -> list[str]:
     )
     questions = []
     for section in re.split(r'^## ', content, flags=re.MULTILINE)[1:]:
-        title = section.partition('\n')[0].strip()
+        title_line, _, body = section.partition('\n')
+        title = title_line.strip()
         # Strip leading date prefix like "[2026-05-27] "
         title = re.sub(r'^\[\d{4}-\d{2}-\d{2}\]\s*', '', title)
         if not title:
             continue
         if 'RESOLVED' in title.upper() or org_header.match(title):
+            continue
+        # Also respect an explicit **Status:** field in the body: a section
+        # marked resolved/done/answered is not pending even when its title still
+        # reads "[OPEN …]" (mirrors check-pending-questions.py). Without this the
+        # briefing miscounts entries kept above the divider whose title wasn't
+        # updated but whose body carries "**Status:** resolved".
+        status_m = re.search(r'\*\*Status:\*\*\s*(.+)', body)
+        if status_m and not status_m.group(1).strip().lower().startswith(('unanswered', 'waiting')):
             continue
         questions.append(title[:60])
     return questions
