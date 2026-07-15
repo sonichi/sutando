@@ -219,6 +219,11 @@ for good in ("task-1783377232367", "task-chat-1783379117", "task-phone-1", "task
 for bad in ("", "task-", "task-../../etc", "task-a b", "task-a/b", "result-1",
             "task-" + "x" * 200, "task-.hidden"):
     check(f"id rejected: {bad[:24]!r}", not ltp.valid_task_id(bad))
+for good in ("task-1783377232367", "ask-1783379117", "sc-ask-1234",
+             "reco-skill-9999", "result-1"):
+    check(f"archive id ok: {good}", ltp.valid_archive_lookup_id(good))
+for bad in ("", ".", "..", "task-../../etc", "task-a b", "task-a/b", "x" * 65):
+    check(f"archive id rejected: {bad[:24]!r}", not ltp.valid_archive_lookup_id(bad))
 
 # 8. Archive rules.
 base = Path("/tmp/x")
@@ -252,7 +257,8 @@ if (corpus / "archive").is_dir():
         try:
             text = p.read_text(errors="replace")
             h = ltp.parse_task_headers(text)
-            if not (h.get("id") or ltp.valid_task_id(p.stem.split(".")[-1] if "." in p.stem else p.stem)):
+            stem = p.stem.split(".")[-1] if "." in p.stem else p.stem
+            if not (h.get("id") or ltp.valid_archive_lookup_id(stem)):
                 no_id += 1
             # Body fidelity (Codex P2): every post-task: line that is NOT a
             # vocabulary header line must survive into the trusted body.
@@ -294,18 +300,22 @@ _tasks = _tmp / "tasks"
 (_tasks / "archive" / "task-flat.txt").write_text("id: task-flat\ntask: x\n")
 (_tasks / "archive" / "2026-05" / "task-old.txt").write_text("id: task-old\ntask: x\n")
 (_tasks / "archive" / "2026-07" / "task-new.txt").write_text("id: task-new\ntask: x\n")
+(_tasks / "archive" / "2026-07" / "ask-123.txt").write_text("id: ask-123\ntask: x\n")
+(_tasks / "archive" / "2026-07" / "sc-ask-456.txt").write_text("id: sc-ask-456\ntask: x\n")
 (_tasks / "archive" / "stray-dir" / "task-stray.txt").write_text("id: task-stray\ntask: x\n")
 
 check("find: live dir", ltp.find_archived_task(_tasks, "task-live") == _tasks / "task-live.txt")
 check("find: processed", ltp.find_archived_task(_tasks, "task-proc") == _tasks / "processed" / "task-proc.txt")
 check("find: legacy flat archive", ltp.find_archived_task(_tasks, "task-flat") == _tasks / "archive" / "task-flat.txt")
 check("find: month partition", ltp.find_archived_task(_tasks, "task-old") == _tasks / "archive" / "2026-05" / "task-old.txt")
+check("find: ask-* archive id", ltp.find_archived_task(_tasks, "ask-123") == _tasks / "archive" / "2026-07" / "ask-123.txt")
+check("find: sc-ask-* archive id", ltp.find_archived_task(_tasks, "sc-ask-456") == _tasks / "archive" / "2026-07" / "sc-ask-456.txt")
 check("find: non-month dirs skipped", ltp.find_archived_task(_tasks, "task-stray") is None)
 check("find: missing id", ltp.find_archived_task(_tasks, "task-nope") is None)
 check("find: malformed id gated", ltp.find_archived_task(_tasks, "task-../etc") is None)
 swept = [p.name for p in ltp.iter_archived_tasks(_tasks)]
 check("iter: flat + months, stray-dir skipped, live/processed excluded",
-      swept == ["task-flat.txt", "task-old.txt", "task-new.txt"], str(swept))
+      swept == ["task-flat.txt", "task-old.txt", "ask-123.txt", "sc-ask-456.txt", "task-new.txt"], str(swept))
 check("iter: no archive dir yields nothing",
       list(ltp.iter_archived_tasks(_tmp / "nonexistent")) == [])
 
