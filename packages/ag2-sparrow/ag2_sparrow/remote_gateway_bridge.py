@@ -159,6 +159,62 @@ if LOCAL_TIER not in ("owner", "team", "other"):
     # "owner" (the `or "owner"` above — the explicit personal-agent model).
     LOCAL_TIER = "team"
 
+
+# ── per-sender tier map (owner-controlled, LOCAL) ────────────────────────────
+# LOCAL_TIER above is the gateway-wide default. A SHARED room can carry messages
+# from senders who are NOT the owner (e.g. a teammate invited into a project
+# room). To tier those correctly WITHOUT trusting the task's self-claimed tier,
+# the OWNER declares a per-sender map in a LOCAL, owner-owned file:
+#   $CLAUDE_CONFIG_DIR/channels/ag2space/access.json → {"tierMap": {"@user:hs": "team"}}
+# We key the lookup on the BROKER-attested `user_id` (Matrix sender the broker
+# writes into the task, not a task-body self-claim), so this stays a LOCAL trust
+# decision — same principle as LOCAL_TIER. Only listed senders are re-tiered;
+# everyone else keeps LOCAL_TIER, so an unknown sender can never ESCALATE (the
+# map only DOWN-tiers named senders; owner stays owner by being absent from it).
+# Hot: re-read on mtime change so the owner can add teammates without a restart.
+def _ag2space_access_path():
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+    return os.path.join(base, "channels", "ag2space", "access.json")
+
+
+_TIER_MAP_CACHE = {"mtime": None, "map": {}}
+
+
+def _load_tier_map():
+    """Return the owner's {sender_mxid: tier} map, mtime-cached. Fail-soft to {}."""
+    path = _ag2space_access_path()
+    try:
+        mt = os.path.getmtime(path)
+    except OSError:
+        _TIER_MAP_CACHE["mtime"], _TIER_MAP_CACHE["map"] = None, {}
+        return {}
+    if mt == _TIER_MAP_CACHE["mtime"]:
+        return _TIER_MAP_CACHE["map"]
+    tm = {}
+    try:
+        with open(path) as f:
+            raw = (json.load(f) or {}).get("tierMap") or {}
+        for who, tier in raw.items():
+            t = str(tier).strip().lower()
+            if isinstance(who, str) and t in ("owner", "team", "other"):
+                tm[who.strip()] = t
+    except Exception:
+        tm = {}  # malformed file → no re-tiering, keep LOCAL_TIER for everyone
+    _TIER_MAP_CACHE["mtime"], _TIER_MAP_CACHE["map"] = mt, tm
+    return tm
+
+
+def _tier_for(user_id):
+    """Resolve the access_tier for a task's broker-attested sender.
+    Listed senders get their mapped tier; everyone else gets LOCAL_TIER."""
+    uid = (user_id or "").strip()
+    if uid:
+        mapped = _load_tier_map().get(uid)
+        if mapped in ("owner", "team", "other"):
+            return mapped
+    return LOCAL_TIER
+
+
 # ── inbound media fetch (owner screenshots, file uploads) ────────────────────
 # A gateway can hand the task body a media MARKER instead of raw bytes:
 #   [<tag>: <url> mime=<m> name=<f> size=<n> kind=<msgtype>] <caption>
@@ -623,8 +679,10 @@ def _write_task(task: dict) -> str | None:
     # consumer in skills/agent-room-ops/verify_platform_card.py.)
     # access_tier is a LOCAL decision and written LAST so it wins even under a
     # last-occurrence parser; every other field is newline-stripped so none can
-    # forge an earlier one either.
-    lines.append(f"access_tier: {LOCAL_TIER}")
+    # forge an earlier one either. Resolved per broker-attested sender via the
+    # owner's tierMap (LOCAL file), falling back to LOCAL_TIER for unlisted
+    # senders — so a named teammate can be down-tiered without trusting the task.
+    lines.append(f"access_tier: {_tier_for(task.get('user_id'))}")
     tmp = dest.with_suffix(".txt.tmp")
     tmp.write_text("\n".join(lines) + "\n")
     tmp.rename(dest)  # atomic publish so the watcher never sees a partial file
