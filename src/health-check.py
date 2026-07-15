@@ -83,9 +83,10 @@ MEMORY_DIR = Path(os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir()))
 def _resolve_dotenv() -> Path:
     """Resolve the `.env` path via the canonical resolver.
 
-    The 3-tier fallback (repo root -> workspace -> durable user clone, #1871/#1973)
-    and the install-path literal live in `sutando_config.py` — the allowlisted
-    canonical resolver — so this consumer never inlines the path.
+    The 2-tier fallback (repo root -> workspace, #1871) lives in
+    `sutando_config.py` — the canonical resolver — so this consumer never
+    inlines the path. (The #1973 Sutando.app bundle tier is deferred pending the
+    app-bundle install-location decision — see sutando_config.resolve_dotenv.)
     """
     from sutando_config import resolve_dotenv  # noqa: PLC0415
     return resolve_dotenv(REPO_DIR, WORKSPACE_DIR)

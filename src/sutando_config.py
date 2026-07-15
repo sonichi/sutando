@@ -414,21 +414,19 @@ def resolve_vault(repo_root: Optional[Path] = None) -> Dict[str, Any]:
 
 def resolve_dotenv(repo_root: Optional[Path] = None,
                    workspace: Optional[Path] = None) -> Path:
-    """Resolve the `.env` path through the canonical 3-tier fallback.
+    """Resolve the `.env` path through the canonical 2-tier fallback.
 
     Order (first that exists wins):
-      1. `<repo_root>/.env`                 — the startup.sh default (source root).
-      2. `<workspace>/.env`                 — the workspace contract fallback.
-      3. the durable user clone under the install home — for the Sutando.app
-         bundle invocation whose repo root points at a bundle tree that gets
-         wiped on updates.
+      1. `<repo_root>/.env`   — the startup.sh default (source root).
+      2. `<workspace>/.env`   — the workspace contract fallback (#1871).
 
-    Returns a `Path` always; when none exist, returns tier 1 (the expected
+    Returns a `Path` always; when neither exists, returns tier 1 (the expected
     primary) so error messages name the primary location, not a fallback.
 
-    The install-path literal lives HERE (the canonical resolver) rather than in
-    each consumer — every caller routes through this instead of hand-rolling
-    the fallback.
+    NOTE: a third tier (the Sutando.app bundle's durable user-clone .env, #1973)
+    is deliberately NOT here — that path depends on the unresolved question of
+    whether the app-bundle install location is supported (owner-gated,
+    2026-07-15). It's tracked separately in #1973; add it here once decided.
     """
     repo = repo_root or _find_repo_root() or Path.cwd()
     primary = repo / ".env"
@@ -438,9 +436,6 @@ def resolve_dotenv(repo_root: Optional[Path] = None,
     ws_env = ws / ".env"
     if ws_env.exists():
         return ws_env
-    bundle = Path.home() / ".sutando" / "repo" / ".env"
-    if bundle.exists():
-        return bundle
     return primary
 
 
