@@ -178,6 +178,16 @@ def classify(pane: str):
     return "unknown", tail
 
 
+def _is_idle_ready(pane: str) -> bool:
+    """True when the pane POSITIVELY shows the idle-ready prompt (the bypass /
+    for-agents footer) and no gate signature — the core is sitting ready for a
+    task. Distinct from `classify(pane) is None`, which is ALSO None for a
+    no-affordance pane (mid-processing / blank / frozen); that must NOT be read as
+    idle. Mirrors classify()'s idle-footer suppression."""
+    tail = "\n".join([ln for ln in pane.splitlines() if ln.strip()][-14:])
+    return bool(_IDLE.search(tail)) and not any(rx.search(tail) for _, rx in _SIGNATURES)
+
+
 # runtime-health health string → supervisor state, for the non-gate branches.
 _BASE_TO_STATE = {
     "offline": ("crashed", "core process/session not found"),
@@ -216,6 +226,16 @@ def compose_state(pane, base_health, gateway_alive):
         return "gateway-down", "core up but relay gateway not running", None, None
     state, detail = _BASE_TO_STATE.get(base_health, _BASE_TO_STATE["unknown"])
     if state == "hung":
+        # #2112: base_health "unknown" (live session, stale/absent core-status)
+        # maps to "hung" — but an idle core writes core-status rarely, so a
+        # perfectly healthy core sitting at its idle prompt routinely goes
+        # "unknown" and would be FALSELY flagged hung (→ spurious ESCALATE /
+        # RECOVER). If the pane POSITIVELY shows the idle-ready prompt, trust that
+        # direct evidence over the stale status file: it's idle, not wedged. Only
+        # a positive idle match overrides — a no-affordance pane (mid-work or truly
+        # frozen) still reads hung, preserving genuine wedge detection.
+        if pane and _is_idle_ready(pane):
+            return "idle-ready", _BASE_TO_STATE["idle"][1], None, None
         tail = "\n".join([ln for ln in (pane or "").splitlines() if ln.strip()][-14:])
         return "hung", detail, tail or None, "unknown"
     return state, detail, None, None

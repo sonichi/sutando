@@ -68,6 +68,13 @@ def _load_module():
     sys.path.insert(0, str(repo / "src"))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    # Isolate ACCESS_FILE from the REAL slack access.json — this test writes to
+    # it (invalid-JSON case) and unlinks it. ACCESS_FILE resolves via
+    # CLAUDE_CONFIG_DIR (the SUTANDO_WORKSPACE temp above does NOT cover it), so
+    # without this a local run with CLAUDE_CONFIG_DIR set would clobber + DELETE
+    # the owner's real allowlist. Same guard the tofu-enroll / mod-judge-buffer
+    # tests already use.
+    mod.ACCESS_FILE = Path(tempfile.mkdtemp(prefix="sutando-tier-access-")) / "access.json"
     return mod
 
 

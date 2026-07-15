@@ -183,7 +183,7 @@ def extract_forward_note(msg: dict) -> str:
     return ""
 
 
-def write_owner_activity(channel: str, summary: str) -> None:
+def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
     """Record owner activity — see src/discord-bridge.py for schema."""
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -192,6 +192,8 @@ def write_owner_activity(channel: str, summary: str) -> None:
             "channel": channel,
             "summary": summary[:80],
         }
+        if channel_id:
+            payload["channel_id"] = str(channel_id)
         tmp = OWNER_ACTIVITY_FILE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload))
         tmp.rename(OWNER_ACTIVITY_FILE)
@@ -718,7 +720,7 @@ def main():  # pragma: no cover
                     continue
 
                 # Record owner activity for status-aware-pivot
-                write_owner_activity("telegram", text)
+                write_owner_activity("telegram", text, channel_id=chat_id)
 
                 # Handle attachments (photos, documents, voice)
                 attachment_note = ""
@@ -901,6 +903,16 @@ def main():  # pragma: no cover
                     access_tier=pending_task_tiers[task_id],
                     data={"task_id": task_id, "has_attachment": bool(attachment_note)},
                 )
+                # Anonymous, opt-out product telemetry: one bucketed event per
+                # accepted task, tagged only with the inbound surface. No-op when
+                # opted out / no key; never task content or ids. See
+                # src/telemetry.py + TELEMETRY.md.
+                try:  # pragma: no cover — fire-and-forget; logic tested in tests/telemetry.test.py
+                    from telemetry import task_processed  # sibling module (src/ on sys.path)
+
+                    task_processed("telegram")
+                except Exception:  # pragma: no cover — telemetry must never break the bridge
+                    pass
 
                 # Send typing indicator
                 api("sendChatAction", chat_id=chat_id, action="typing")

@@ -132,13 +132,19 @@ unlinked so peers see a graceful shutdown immediately.
 
 Payload schema:
 ```json
-{"host": "...", "pid": ..., "started_at": ..., "last_beat_at": ..., "status": "...", "schema_version": 1}
+{"host": "...", "pid": ..., "started_at": ..., "last_beat_at": ..., "status": "...", "socket": "...", "schema_version": 1}
 ```
 
 This is foundation for the lease-based multi-core scheduler — workers consult
 the alive directory to know who's available before assigning a claim. For
 single-machine use today it also gives `health-check.py` and the dashboard a
 cleaner liveness probe than scanning `pgrep -f claude`.
+
+`socket` records the tmux socket the core launched on (its own
+`${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}`). It's the **runtime-authored**
+answer to "which socket?" — read by `sutando-config.sh runtime` so the
+AgentRuntime descriptor reports the real socket (custom sockets included)
+without trusting a foreign caller's ambient env.
 
 ## Durable per-host install state: `state/auth/`
 

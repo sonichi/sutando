@@ -330,6 +330,33 @@ def case_l_task_field_is_last() -> list[str]:
     return fails
 
 
+def case_m_same_set_past_cooldown_does_not_refire() -> list[str]:
+    """Regression (owner complaint 2026-07-01): an unchanged, persistent
+    failure set must NOT re-alert just because an hour (or any amount of
+    time) has passed. Only a change in the failure set should re-fire.
+    Seeds state as if the set was last alerted 25h ago (well past the old
+    1h cooldown) and confirms a second call with the SAME set stays silent.
+    """
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        state_file = td / "state" / "health-last-alerted.json"
+        tasks_dir = td / "tasks"
+        checks = make_checks(("warn", "memory-sync"))
+        set_key = "|".join(sorted(c["name"] for c in checks))
+        hash_key = hc.hashlib.sha256(set_key.encode()).hexdigest()[:16]
+        now_ms = int(time.time() * 1000)
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(json.dumps({
+            hash_key: now_ms - (25 * 3600 * 1000),  # 25h ago — past old 1h cooldown
+            "_last_hash": hash_key,
+        }))
+        hc.emit_task_for_failures(checks, state_file=state_file, tasks_dir=tasks_dir)
+        if list_task_files(tasks_dir):
+            fails.append("m) unchanged failure set re-fired after 25h — spam bug regressed")
+    return fails
+
+
 def main() -> int:
     cases = [
         ("a", case_a_empty_failures_no_file),
@@ -344,6 +371,7 @@ def main() -> int:
         ("j", lambda: case_j_emit_skipped_when_core_alive(None)),
         ("k", case_k_emit_proceeds_when_core_dead),
         ("l", case_l_task_field_is_last),
+        ("m", case_m_same_set_past_cooldown_does_not_refire),
     ]
     all_failures = []
     for label, fn in cases:

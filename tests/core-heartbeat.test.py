@@ -55,6 +55,13 @@ class TestHeartbeatWrite(unittest.TestCase):
         self.assertEqual(data["pid"], os.getpid())
         self.assertEqual(data["status"], "custom-status")
         self.assertEqual(data["schema_version"], 1)
+        # socket: the runtime-authored tmux socket the core runs on. Consumed by
+        # `sutando-config.sh runtime` so the AgentRuntime descriptor reports the
+        # real socket (incl. custom sockets) independent of a caller's env.
+        self.assertEqual(
+            data["socket"],
+            os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock"),
+        )
         self.assertIsInstance(data["started_at"], float)
         self.assertIsInstance(data["last_beat_at"], float)
         # last_beat_at advances after a sleep; just sanity-check it's recent.
