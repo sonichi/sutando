@@ -1318,6 +1318,15 @@ def fix_skill_symlinks(check: dict) -> dict:
     return {"name": "skill-symlinks", "status": "ok" if not errors else "warn", "detail": result}
 
 
+def apply_skill_symlink_fixes(checks: list) -> None:
+    """--fix dispatch for skill-symlinks: warn-level (excluded from the issues
+    loop) but auto-fixable, so it is handled by its own pass over checks."""
+    for c in checks:
+        if c["name"] == "skill-symlinks" and c.get("_unlinked"):
+            result = fix_skill_symlinks(c)
+            print(f"  {c['name']}: {result['detail']}")
+
+
 def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> dict:
     """Detect a task-queue pileup — tasks/ directory growing without
     being drained. Independent of which watcher / loop is dying: the queue
@@ -2697,10 +2706,7 @@ def main():
             print("Attempting fixes...")
             # skill-symlinks is "warn" (excluded from issues) but auto-fixable —
             # handle it separately from the issues loop.
-            for c in checks:
-                if c["name"] == "skill-symlinks" and c.get("_unlinked"):
-                    result = fix_skill_symlinks(c)
-                    print(f"  {c['name']}: {result['detail']}")
+            apply_skill_symlink_fixes(checks)
             for c in issues:
                 if c["name"].startswith("com.sutando."):
                     result = fix_launchd(c["name"])

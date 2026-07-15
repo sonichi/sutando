@@ -70,6 +70,22 @@ try:
     r = hc.check_skill_symlinks()
     check(r["status"] == "ok", f"E: recheck ok ({r['detail']})")
 
+    # Case F: non-directory entries in skills/ are skipped (continue branch)
+    (fake_repo / "skills" / "README.md").write_text("not a skill")
+    r = hc.check_skill_symlinks()
+    check(r["status"] == "ok" and "README" not in r["detail"], f"F: plain file skipped ({r['detail']})")
+
+    # Case G: fix error branch — dst parent missing forces symlink_to to raise
+    f = hc.fix_skill_symlinks({"name": "skill-symlinks", "status": "warn",
+                               "_unlinked": ["nested/never-exists"]})
+    check(f["status"] == "warn" and "errors" in f["detail"], f"G: raise collected as error ({f['detail']})")
+
+    # Case H: the --fix dispatch helper routes only _unlinked skill-symlinks rows
+    (fake_repo / "skills" / "zap").mkdir()
+    r = hc.check_skill_symlinks()
+    hc.apply_skill_symlink_fixes([{"name": "other", "status": "ok"}, r])
+    check((dst / "zap").is_symlink(), "H: dispatch helper linked zap")
+
 finally:
     if orig_home is not None:
         os.environ["HOME"] = orig_home
