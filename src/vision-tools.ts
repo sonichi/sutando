@@ -16,7 +16,7 @@
  * realtime_input.video slot accepts single-frame images.
  */
 
-import { readFileSync, unlinkSync, mkdtempSync } from 'node:fs';
+import { readFileSync, writeFileSync, unlinkSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFile } from 'node:child_process';
@@ -24,6 +24,7 @@ import { promisify } from 'node:util';
 import { createServer, type Server } from 'node:http';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
+import { resolveWorkspace, statusPath } from './workspace_default.js';
 
 const execFileAsync = promisify(execFile);
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
@@ -708,7 +709,28 @@ export function startVisionControlServer(port: number = DEFAULT_CONTROL_PORT): S
 		console.error(`${ts()} [Vision] control server error: ${err.message}`);
 	});
 	srv.listen(port, '127.0.0.1', () => {
-		console.log(`${ts()} [Vision] control server listening on 127.0.0.1:${port}`);
+		// Record the port the OS ACTUALLY bound, read from srv.address() — not the
+		// `port` parameter, which would echo `0` when the caller requested an
+		// ephemeral port instead of the real assigned one (the whole point of the
+		// runtime-authored state is correctness under a non-default port).
+		const addr = srv.address();
+		const boundPort = (addr && typeof addr === 'object') ? addr.port : port;
+		console.log(`${ts()} [Vision] control server listening on 127.0.0.1:${boundPort}`);
+		// vision-control.json is runtime-authored state recording the ACTUAL bound
+		// control port. `sutando-config.sh runtime` reads it (validated by pid
+		// liveness) so the AgentRuntime descriptor's `vision_control` reports the
+		// port this process really bound — correct for a VISION_CONTROL_PORT
+		// override, not a hardcoded default. Same pattern as voice-agent.ts's
+		// writeVoiceRuntimeState() for voice_ws (#2115); consumed by the desktop
+		// 'Watch' toggle (ag2-space/ag2space-cinny-desktop v0.3.0 Slice-2).
+		try {
+			writeFileSync(
+				statusPath('vision-control.json', resolveWorkspace()),
+				JSON.stringify({ vision_control: `http://127.0.0.1:${boundPort}`, port: boundPort, pid: process.pid, ts: Math.floor(Date.now() / 1000) })
+			);
+		} catch (err) {
+			console.error(`${ts()} [Vision] runtime state write failed:`, err);
+		}
 	});
 	controlServer = srv;
 	return srv;
