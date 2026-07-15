@@ -117,8 +117,56 @@ if [ "$?" != "0" ]; then
     echo "  FAIL: T11 — SUTANDO_SYNC_SKIP_INIT_GUARD=1 did NOT bypass guard"; fail=1
 fi
 
+# ── Disabled-sync skip (tests 12-14) — BEHAVIORAL. The DEFAULT (cron) path must
+# skip cleanly when no vault URL is configured, instead of falling into
+# _pull_only_impl → die "…is not a git repo; run --init first" and painting a
+# red error on every 30-min tick. Reported by an external tester whose cron
+# logged a loud failure every fire because sync is intentionally disabled.
+#
+# We run the REAL script verbatim inside an isolated skeleton: a temp
+# scripts/sync-workspace.sh (copied) + a stub sutando-config.sh that resolves a
+# throwaway workspace and reports NO vault URL. This forces VAULT_URL empty and
+# guarantees no real vault / workspace / global lock is ever touched, regardless
+# of the machine's own sutando.config — so we assert on observable behavior
+# (exit code + stderr) rather than on the script's source text.
+TMP_SKEL="$(mktemp -d -t sutando-sync-default-skip.XXXXXX)"
+mkdir -p "$TMP_SKEL/scripts" "$TMP_SKEL/workspace"
+cp "$SYNC" "$TMP_SKEL/scripts/sync-workspace.sh"
+cat > "$TMP_SKEL/scripts/sutando-config.sh" << 'STUB'
+#!/usr/bin/env bash
+# Test stub: resolve the temp workspace; report an EMPTY vault URL so the
+# default path takes its "sync disabled — skip" branch.
+case "${1:-}" in
+    workspace) echo "$(cd "$(dirname "$0")/.." && pwd)/workspace" ;;
+    vault-url) : ;;   # intentionally empty
+    *) : ;;
+esac
+STUB
+chmod +x "$TMP_SKEL/scripts/sutando-config.sh"
+
+# Invoke the default subcommand (no args) with a clean env — no --vault-url
+# flag, no legacy SUTANDO_MEMORY_REPO. Capture exit code + stderr.
+default_err="$(env -u SUTANDO_MEMORY_REPO SUTANDO_REPO_DIR="$TMP_SKEL" \
+    bash "$TMP_SKEL/scripts/sync-workspace.sh" 2>&1 >/dev/null)"
+default_rc=$?
+
+# Test 12: BEHAVIOR — the default path exits 0 (clean skip, not a red error exit)
+if [ "$default_rc" != "0" ]; then
+    echo "  FAIL: T12 — default path with no vault URL exited $default_rc (expected 0 clean skip)"; fail=1
+fi
+
+# Test 13: BEHAVIOR — it announces the intentional skip on stderr
+echo "$default_err" | grep -q 'cross-machine sync disabled' \
+    || { echo "  FAIL: T13 — default path did not print the 'sync disabled — skipping' notice (got: [$default_err])"; fail=1; }
+
+# Test 14: BEHAVIOR — it skipped BEFORE the git/init path, so no loud
+# "run --init first" / "is not a git repo" error surfaces (the bug this fixes).
+if echo "$default_err" | grep -qE 'run --init first|is not a git repo'; then
+    echo "  FAIL: T14 — default path fell into the uninit-git error instead of skipping cleanly (got: [$default_err])"; fail=1
+fi
+
 # Cleanup
-rm -rf "$TMP_E2E"
+rm -rf "$TMP_E2E" "$TMP_SKEL"
 
 # Report
 if [ "$fail" = "0" ]; then

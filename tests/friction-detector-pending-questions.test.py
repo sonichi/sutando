@@ -157,6 +157,48 @@ class TestCheckPendingQuestionsFreForm(unittest.TestCase):
         self.assertIn("d old", result[0], f"Age not in output: {result[0]}")
 
 
+class TestCheckGithubIssues(unittest.TestCase):
+    """Tests for check_github_issues() stale-issue detection.
+
+    Mocks subprocess.run to exercise the timezone-aware comparison path
+    without requiring a live GitHub token.
+    """
+
+    def _call_with_mock_gh(self, updated_at: str):
+        import json as _json
+        import unittest.mock as _mock
+
+        mock_items = [{"number": 99, "title": "test issue", "updatedAt": updated_at}]
+        fake_result = _mock.MagicMock()
+        fake_result.returncode = 0
+        fake_result.stdout = _json.dumps(mock_items)
+
+        with _mock.patch.object(_fd_mod.subprocess, "run", return_value=fake_result):
+            return _fd_mod.check_github_issues()
+
+    def test_stale_issue_reported(self):
+        """Issues older than 7 days are reported as stale."""
+        old_ts = (datetime.now(tz=__import__("datetime").timezone.utc) - timedelta(days=10)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        issues = self._call_with_mock_gh(old_ts)
+        self.assertTrue(
+            any("#99" in i for i in issues),
+            f"Stale issue should be reported; got: {issues}",
+        )
+
+    def test_fresh_issue_not_reported(self):
+        """Issues updated within 7 days are not reported."""
+        fresh_ts = (datetime.now(tz=__import__("datetime").timezone.utc) - timedelta(days=3)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        issues = self._call_with_mock_gh(fresh_ts)
+        self.assertFalse(
+            any("#99" in i for i in issues),
+            f"Fresh issue should not be reported; got: {issues}",
+        )
+
+
 class TestFreFormParserStructural(unittest.TestCase):
     """Structural checks on the source code to confirm the fix is in place."""
 

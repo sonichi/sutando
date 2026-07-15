@@ -1,0 +1,11 @@
+{
+  "name": "electron-overlay-dimming",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "Reusable pattern for focus-based auto-dimming of Electron overlay windows \u2014 when the app loses focus, all overlay windows fade to a low opacity; when an overlay regains focus, they return to their configured opacity.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}

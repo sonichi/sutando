@@ -41,6 +41,20 @@ def fail(msg: str, context: str = "") -> int:
     return 1
 
 
+def func_block(src: str, name: str):
+    """Extract a top-level function body: everything from the def line to the
+    next top-level `def` (or EOF). Size-independent — the lazy quantifier
+    terminates at the FIRST boundary, so growing a function body can never
+    break extraction. Replaces the old per-function char budgets, which had
+    to be hand-bumped every time a merge grew a body past the cap
+    (2000 → 4000 → 6000 → 8000 → 12000 for _write_task alone)."""
+    m = re.search(
+        r"def " + re.escape(name) + r"\([^)]*\)[^:]*:\s*\n([\s\S]*?)(?=\n\ndef |\Z)",
+        src,
+    )
+    return m.group(1) if m else None
+
+
 def main() -> int:
     if not BRIDGE.exists():
         return fail(f"{BRIDGE} not found")
@@ -48,28 +62,17 @@ def main() -> int:
     src = BRIDGE.read_text()
 
     # 1. load_allowed returns None on FileNotFoundError
-    load_match = re.search(
-        r"def load_allowed\(\):\s*\n([\s\S]{0,1500}?)(?=\n\ndef |\Z)",
-        src,
-    )
-    if not load_match:
+    block = func_block(src, "load_allowed")
+    if block is None:
         return fail("`load_allowed` function not found")
-    block = load_match.group(1)
     if not re.search(r"except\s+FileNotFoundError:\s*\n\s+return\s+None", block):
         return fail("load_allowed must `return None` on FileNotFoundError "
                     "(TOFU relies on None vs empty-set distinction)", block)
 
     # 2. tofu_onboard exists with race-guard + 0o600 chmod
-    # Budget bumped 2000 → 4000: cache-restore block added in #899 fix
-    # (PR #1292) pushes tofu_onboard + surrounding module-level code past
-    # the 2000-char \ndef boundary.
-    tofu_match = re.search(
-        r"def tofu_onboard\([^)]*\)[^:]*:\s*\n([\s\S]{0,4000}?)(?=\n\ndef |\Z)",
-        src,
-    )
-    if not tofu_match:
+    tofu_block = func_block(src, "tofu_onboard")
+    if tofu_block is None:
         return fail("`tofu_onboard` function not found")
-    tofu_block = tofu_match.group(1)
     if not re.search(r"if\s+ACCESS_FILE\.exists\(\)", tofu_block):
         return fail("tofu_onboard must race-guard with ACCESS_FILE.exists()", tofu_block)
     if not re.search(r"os\.chmod\s*\(\s*ACCESS_FILE\s*,\s*0o600\s*\)", tofu_block):
@@ -77,23 +80,13 @@ def main() -> int:
                     "owner's Slack user ID, must not inherit umask 644",
                     tofu_block)
 
-    # 3. _write_task fails closed on unknown sender. Budget bumped 2000 →
-    # 4000 in 98e188b (file-attachment + thread_ts moved in), then →
-    # 6000 in the tierMap PR (tier resolution + in-band system-instruction
-    # block for non-owner tiers added another ~1.5k chars), then →
-    # 8000 in the secret-vault PR (vault interception block grew the body
-    # to ~6.3k), then → 12000 when merging feat/bridge-skill-hints-injection
-    # (skill-hints block adds ~1.4k on top of vault interception). The
-    # check that actually matters runs against the FIRST ~200 chars of the
-    # body (the `user_id not in allowed` gate); the budget only needs to be
-    # large enough to terminate at the next `\ndef ` boundary.
-    write_match = re.search(
-        r"def _write_task\([^)]*\)[^:]*:\s*\n([\s\S]{0,12000}?)(?=\n\ndef |\Z)",
-        src,
-    )
-    if not write_match:
+    # 3. _write_task fails closed on unknown sender. Extraction is
+    # size-independent (see func_block) — the old 12,000-char budget broke
+    # every time a merge grew the body (last: the Slack TOFU enrollment-code
+    # block pushed it to ~12,080 on the merge ref, PR #1989 review).
+    write_block = func_block(src, "_write_task")
+    if write_block is None:
         return fail("`_write_task` function not found")
-    write_block = write_match.group(1)
     # Must check `user_id not in allowed` (or equivalent) and return None
     if not re.search(
         r"if\s+user_id\s+not\s+in\s+allowed\s*:\s*\n[\s\S]{0,200}?return\s+None",

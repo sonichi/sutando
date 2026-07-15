@@ -81,12 +81,16 @@ def gateway():
     explicit_token = os.environ.get("GATEWAY_TOKEN") or os.environ.get("RELAY_TOKEN")
     raw = explicit_token or os.environ.get("REMOTE_TASK_TOKEN") or ""
     url_from_token = ""
-    if explicit_token:
-        token = explicit_token  # explicit bearer — never split
-    elif "|" in raw:
-        url_from_token, token = raw.split("|", 1)  # combined onboarding string
+    # The combined onboarding string is "https://<gateway>|<secret>" — the URL
+    # travels inside the token. Detect it by the leading URL scheme (NOT a bare
+    # "|"), so this splits even an EXPLICIT combined token while leaving an
+    # explicit bearer that merely contains "|" intact. Without the split, a
+    # `GATEWAY_TOKEN=https://…|secret` was sent whole as the bearer → auth
+    # failure → a 401 the client used to mis-report as "not a joined member".
+    if "|" in raw and raw.split("|", 1)[0].startswith(("http://", "https://")):
+        url_from_token, token = raw.split("|", 1)
     else:
-        token = raw  # bare secret
+        token = raw  # bare secret, or an explicit bearer that isn't combined
     base = (os.environ.get("GATEWAY_URL") or os.environ.get("RELAY_URL")
             or os.environ.get("REMOTE_TASK_URL") or url_from_token or "").rstrip("/")
     headers = {"User-Agent": "sutando-room-ops/1"}
@@ -133,8 +137,13 @@ def degrade_reason(code):
     """Uniform reason for a non-2xx the caller should degrade on (never raise)."""
     if code == 404:
         return "verb unimplemented (404)"
-    if code in (401, 403):
-        return f"denied — agent not a joined member ({code})"
+    if code == 401:
+        # 401 = the gateway could not authenticate the bearer at all (missing /
+        # wrong / un-split combined token) — NOT a membership verdict. Keep this
+        # distinct from 403 so a token problem isn't misread as "not a member".
+        return "auth failed — check the gateway bearer token (401)"
+    if code == 403:
+        return "denied — agent not a joined member (403)"
     return f"HTTP {code}"
 
 
