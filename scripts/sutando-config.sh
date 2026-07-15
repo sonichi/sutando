@@ -326,6 +326,33 @@ try:
         probe_socket = rec['socket']
 except Exception:
     pass
+# voice_ws: the WS the running voice-agent actually bound. Runtime-authored —
+# voice-agent.ts writes state/voice-agent.json at listen with its real PORT — so
+# a non-default PORT is reported correctly instead of a hardcoded default (same
+# 'running process is the authority' principle as the socket above). Liveness is
+# validated by the recorded pid, NOT a time window: the file is written once at
+# startup (not refreshed like the heartbeat), so a window would wrongly expire a
+# long-running agent. Absent / dead-pid / unreadable -> default OSS endpoint.
+probe_voice_ws = 'ws://127.0.0.1:9900'
+try:
+    with open(os.path.join(ws, 'state', 'voice-agent.json')) as f:
+        vrec = json.load(f)
+    vpid = int(vrec.get('pid', 0) or 0)
+    alive = False
+    if vpid > 0:
+        try:
+            os.kill(vpid, 0)
+            alive = True
+        except ProcessLookupError:
+            alive = False
+        except PermissionError:
+            alive = True  # exists but not ours — still a live process
+        except Exception:
+            alive = False
+    if alive and vrec.get('voice_ws'):
+        probe_voice_ws = vrec['voice_ws']
+except Exception:
+    pass
 env = dict(os.environ, SUTANDO_TMUX_SOCKET=probe_socket)
 h = {}
 try:
@@ -366,12 +393,10 @@ print(json.dumps({
     'session': h.get('session', 'sutando-core'),
     # voice_ws: the WebSocket the runtime's voice-agent listens on — the endpoint
     # the desktop 'Live' page's browser VoiceTransport.connect(url) opens
-    # (ag2-space/ag2space-cinny-desktop v0.3.0). voice-agent.ts binds
-    # 'process.env.PORT || 9900'; the default is by far the common case (a custom
-    # PORT is rare, like a custom tmux socket) so we report the default here.
-    # Reporting a PORT-custom voice-agent authoritatively (record it in the
-    # .alive heartbeat, same pattern as socket) is a documented follow-up.
-    'voice_ws': 'ws://127.0.0.1:9900',
+    # (ag2-space/ag2space-cinny-desktop v0.3.0). Sourced from runtime-authored
+    # state (probe_voice_ws above): voice-agent.ts records its actual bound PORT,
+    # so a non-default-PORT install is reported correctly, not a hardcoded default.
+    'voice_ws': probe_voice_ws,
     'health': h.get('health', 'unknown'),
     'authenticated': h.get('authenticated'),
 }))
