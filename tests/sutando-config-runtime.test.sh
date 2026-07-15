@@ -44,9 +44,11 @@ json="$(bash "$SCRIPT" runtime)"
 echo "$json" | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
-need={'alive','repo','code','workspace','brain','socket','session','health','authenticated'}
+need={'alive','repo','code','workspace','brain','socket','session','voice_ws','health','authenticated'}
 missing=need - set(d)
 assert not missing, f'missing keys: {missing}'
+# voice_ws = the runtime's voice-agent WS endpoint (v0.3.0 Live page consumes it)
+assert d['voice_ws'].startswith('ws://'), f\"voice_ws {d['voice_ws']!r} not a ws:// url\"
 assert d['repo']=='$REPO_DIR', f\"repo {d['repo']} != $REPO_DIR\"
 assert d['brain']==d['workspace']+'/.claude-sutando', f\"brain {d['brain']}\"
 assert d['session']=='sutando-core', d['session']

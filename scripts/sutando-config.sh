@@ -364,6 +364,14 @@ print(json.dumps({
     'brain': brain,
     'socket': h.get('tmux_socket') or probe_socket,
     'session': h.get('session', 'sutando-core'),
+    # voice_ws: the WebSocket the runtime's voice-agent listens on — the endpoint
+    # the desktop 'Live' page's browser VoiceTransport.connect(url) opens
+    # (ag2-space/ag2space-cinny-desktop v0.3.0). voice-agent.ts binds
+    # 'process.env.PORT || 9900'; the default is by far the common case (a custom
+    # PORT is rare, like a custom tmux socket) so we report the default here.
+    # Reporting a PORT-custom voice-agent authoritatively (record it in the
+    # .alive heartbeat, same pattern as socket) is a documented follow-up.
+    'voice_ws': 'ws://127.0.0.1:9900',
     'health': h.get('health', 'unknown'),
     'authenticated': h.get('authenticated'),
 }))
