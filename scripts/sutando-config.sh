@@ -284,23 +284,43 @@ print(_host_label(), end='')
     # (issue ag2-space/ag2space-cinny-desktop#98). Keyed on the repo; everything
     # else derives:
     #   {alive, repo, workspace, brain, socket, session, health, authenticated}
-    # FOREIGN-CALLER-SAFE: the liveness probe is pinned to the default OSS socket
-    # (/tmp/sutando-tmux.sock) so a caller whose OWN env points SUTANDO_TMUX_SOCKET
-    # at a different (e.g. bundled) socket still gets THIS OSS runtime's status,
-    # never the caller's socket (the re-split trap). Non-default OSS sockets are a
-    # documented fast-follow (record the real socket in the .alive heartbeat).
-    # Reuses src/runtime-health.py for alive/health/authenticated (single liveness
-    # source of truth) and adds the resolved repo / workspace / brain paths.
+    # FOREIGN-CALLER-SAFE *and* honors custom sockets: the tmux socket is read
+    # from a RUNTIME-AUTHORED source (the core's .alive heartbeat, which records
+    # the socket the core actually launched on — see core_heartbeat.py), NOT the
+    # caller's ambient SUTANDO_TMUX_SOCKET. So a foreign caller (the desktop app,
+    # whose env points at its bundled socket) still gets THIS OSS core's real
+    # socket, AND an install running on a custom socket is reported correctly
+    # (start-cli.sh honors SUTANDO_TMUX_SOCKET). No fresh heartbeat -> default OSS
+    # socket. Reuses src/runtime-health.py for alive/health/authenticated (single
+    # liveness source of truth) and the canonical resolve_claude_sutando_config_dir()
+    # for brain (honors core_config_dirs[type=claude] customization).
     python3 -c "
-import sys, os, json, subprocess
+import sys, os, json, time, subprocess
 sys.path.insert(0, '$REPO_ROOT')
-from src.sutando_config import resolve_workspace
+from src.sutando_config import resolve_workspace, resolve_claude_sutando_config_dir
 repo = '$REPO_ROOT'
 ws = str(resolve_workspace())
-brain = os.path.join(ws, '.claude-sutando')
-# Pin the probe to the default OSS socket — env-independent, so a foreign
-# caller's SUTANDO_TMUX_SOCKET (bundled) can't misdirect it.
-env = dict(os.environ, SUTANDO_TMUX_SOCKET='/tmp/sutando-tmux.sock')
+brain = str(resolve_claude_sutando_config_dir())
+# The socket this core runs on, from its own heartbeat: runtime-authored, so it
+# is correct for custom sockets AND immune to the caller's ambient env. Only a
+# FRESH heartbeat (<90s, matching core-heartbeat's liveness window) is trusted;
+# stale/absent -> default OSS socket.
+def _host_label():
+    try:
+        from util_paths import _host_label as hl
+        return hl()
+    except Exception:
+        import socket as _s
+        return _s.gethostname().split('.')[0]
+probe_socket = '/tmp/sutando-tmux.sock'
+try:
+    with open(os.path.join(ws, 'state', 'cores', _host_label() + '.alive')) as f:
+        rec = json.load(f)
+    if time.time() - float(rec.get('last_beat_at', 0)) < 90 and rec.get('socket'):
+        probe_socket = rec['socket']
+except Exception:
+    pass
+env = dict(os.environ, SUTANDO_TMUX_SOCKET=probe_socket)
 h = {}
 try:
     out = subprocess.run([sys.executable, os.path.join(repo, 'src', 'runtime-health.py')],
@@ -336,7 +356,7 @@ print(json.dumps({
     'code': code,
     'workspace': ws,
     'brain': brain,
-    'socket': h.get('tmux_socket') or '/tmp/sutando-tmux.sock',
+    'socket': h.get('tmux_socket') or probe_socket,
     'session': h.get('session', 'sutando-core'),
     'health': h.get('health', 'unknown'),
     'authenticated': h.get('authenticated'),
