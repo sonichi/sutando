@@ -33,6 +33,7 @@ Exit code: 0 on pass, 1 on fail.
 """
 
 import importlib.util
+import os
 import re
 import sys
 import types
@@ -85,7 +86,7 @@ def _install_discord_stub():
 def load_bridge():
     _install_discord_stub()
     # The bridge reads a DISCORD_BOT_TOKEN .env at import — seed a stub if absent.
-    env_dir = Path.home() / ".claude" / "channels" / "discord"
+    env_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")) / "channels" / "discord"
     env = env_dir / ".env"
     if not env.exists():
         env_dir.mkdir(parents=True, exist_ok=True)
