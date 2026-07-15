@@ -961,6 +961,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 data = json.loads(body)
                 tid = data.get("taskId", "")
                 result = data.get("result", "")
+                # Only genuine task-* ids belong in the Task list. voice-* and
+                # proactive-* files are notification channels, not tasks (#1786).
+                if not tid.startswith("task-"):
+                    self.send_json(200, {"ok": True})
+                    return
                 if tid in task_history:
                     task_history[tid]["status"] = "done"
                     task_history[tid]["result"] = result
