@@ -113,6 +113,21 @@ class TestCheckMigrateReaderContract(unittest.TestCase):
         self.assertIn("timed out", result["detail"])
 
     # ------------------------------------------------------------------
+    # Case D2: unexpected exception from the subprocess layer -> error
+    # ------------------------------------------------------------------
+    def test_unexpected_exception_reports_error(self):
+        fake_repo = Path(self.tmp.name) / "repo_exc"
+        tests_dir = fake_repo / "tests"
+        tests_dir.mkdir(parents=True)
+        (tests_dir / "migrate-reader-contract.test.py").write_text("print('never runs')")
+        self._set_repo(fake_repo)
+
+        with patch.object(hc.subprocess, "run", side_effect=OSError("spawn failed")):
+            result = hc.check_migrate_reader_contract()
+        self.assertEqual(result["status"], "error")
+        self.assertIn("spawn failed", result["detail"])
+
+    # ------------------------------------------------------------------
     # Case E: live run against actual test suite must pass
     # ------------------------------------------------------------------
     def test_live_repo_passes(self):
