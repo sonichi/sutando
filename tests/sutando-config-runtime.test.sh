@@ -44,15 +44,20 @@ json="$(bash "$SCRIPT" runtime)"
 echo "$json" | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
-need={'alive','repo','workspace','brain','socket','session','health','authenticated'}
+need={'alive','repo','code','workspace','brain','socket','session','health','authenticated'}
 missing=need - set(d)
 assert not missing, f'missing keys: {missing}'
 assert d['repo']=='$REPO_DIR', f\"repo {d['repo']} != $REPO_DIR\"
 assert d['brain']==d['workspace']+'/.claude-sutando', f\"brain {d['brain']}\"
 assert d['session']=='sutando-core', d['session']
 assert isinstance(d['alive'], bool), d['alive']
+# code = source-version identity block (git-derived; keys always present, values may be null off-git)
+c=d['code']
+for k in ('commit','branch','describe','tree_sha','dirty'):
+    assert k in c, f'code missing {k}'
+assert isinstance(c['dirty'], bool), c['dirty']
 "
-report "$?" "JSON valid; repo/brain/session/alive correct"
+report "$?" "JSON valid; repo/brain/session/alive + code block correct"
 
 # -- Test 4: FOREIGN-CALLER SAFETY (the anti-split guarantee) ---------------
 # A caller whose env points at a bundled socket must NOT leak into runtime.socket.

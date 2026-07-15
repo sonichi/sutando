@@ -309,9 +309,31 @@ try:
         h = json.loads(out.stdout)
 except Exception:
     pass
+# code: the source-version identity of the runtime — 'which Sutando is this,
+# behaviorally?' Prompts + skills + scripts in the repo determine behavior, so
+# the desktop app (and fleet tooling) wants this to reason about version-compat
+# and to spot a locally-modified core. All git-native + best-effort (None when
+# not a git checkout). tree_sha is the content hash of TRACKED files (version-
+# independent); dirty flags uncommitted edits. A stronger working-tree
+# 'source_sha' (hashes uncommitted + untracked behavior files) is a documented
+# follow-up alongside the identity block.
+def _git(*a):
+    try:
+        r = subprocess.run(['git', '-C', repo, *a], capture_output=True, text=True, timeout=5)
+        return (r.stdout.strip() or None) if r.returncode == 0 else None
+    except Exception:
+        return None
+code = {
+    'commit': _git('rev-parse', '--short', 'HEAD'),
+    'branch': _git('rev-parse', '--abbrev-ref', 'HEAD'),
+    'describe': _git('describe', '--tags', '--always', '--dirty'),
+    'tree_sha': _git('rev-parse', 'HEAD^{tree}'),
+    'dirty': bool(_git('status', '--porcelain')),
+}
 print(json.dumps({
     'alive': bool(h.get('core_running', False)),
     'repo': repo,
+    'code': code,
     'workspace': ws,
     'brain': brain,
     'socket': h.get('tmux_socket') or '/tmp/sutando-tmux.sock',
