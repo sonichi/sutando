@@ -353,6 +353,33 @@ try:
         probe_voice_ws = vrec['voice_ws']
 except Exception:
     pass
+# vision_control: the HTTP control endpoint the running vision-control server
+# actually bound (:7847 default, or VISION_CONTROL_PORT). Runtime-authored the
+# same way as voice_ws — vision-tools.ts writes state/vision-control.json at
+# listen with its real port, pid-validated (written once at startup, so liveness
+# is the pid not a time window). Consumed by the desktop 'Watch' toggle (v0.3.0
+# Slice-2) to drive /vision/start|stop|state. Absent / dead-pid / unreadable ->
+# default OSS endpoint.
+probe_vision_control = 'http://127.0.0.1:7847'
+try:
+    with open(os.path.join(ws, 'state', 'vision-control.json')) as f:
+        crec = json.load(f)
+    cpid = int(crec.get('pid', 0) or 0)
+    calive = False
+    if cpid > 0:
+        try:
+            os.kill(cpid, 0)
+            calive = True
+        except ProcessLookupError:
+            calive = False
+        except PermissionError:
+            calive = True  # exists but not ours — still a live process
+        except Exception:
+            calive = False
+    if calive and crec.get('vision_control'):
+        probe_vision_control = crec['vision_control']
+except Exception:
+    pass
 env = dict(os.environ, SUTANDO_TMUX_SOCKET=probe_socket)
 h = {}
 try:
@@ -397,6 +424,12 @@ print(json.dumps({
     # state (probe_voice_ws above): voice-agent.ts records its actual bound PORT,
     # so a non-default-PORT install is reported correctly, not a hardcoded default.
     'voice_ws': probe_voice_ws,
+    # vision_control: the HTTP control endpoint the runtime's vision-control server
+    # listens on — where the desktop 'Watch' toggle POSTs /vision/start|stop and
+    # polls /vision/state (ag2-space/ag2space-cinny-desktop v0.3.0 Slice-2).
+    # Sourced from runtime-authored state (probe_vision_control above), so a
+    # VISION_CONTROL_PORT override is reported correctly, not a hardcoded default.
+    'vision_control': probe_vision_control,
     'health': h.get('health', 'unknown'),
     'authenticated': h.get('authenticated'),
 }))

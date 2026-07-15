@@ -44,11 +44,13 @@ json="$(bash "$SCRIPT" runtime)"
 echo "$json" | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
-need={'alive','repo','code','workspace','brain','socket','session','voice_ws','health','authenticated'}
+need={'alive','repo','code','workspace','brain','socket','session','voice_ws','vision_control','health','authenticated'}
 missing=need - set(d)
 assert not missing, f'missing keys: {missing}'
 # voice_ws = the runtime's voice-agent WS endpoint (v0.3.0 Live page consumes it)
 assert d['voice_ws'].startswith('ws://'), f\"voice_ws {d['voice_ws']!r} not a ws:// url\"
+# vision_control = the runtime's vision-control HTTP endpoint (v0.3.0 Watch consumes it)
+assert d['vision_control'].startswith('http://'), f\"vision_control {d['vision_control']!r} not an http:// url\"
 assert d['repo']=='$REPO_DIR', f\"repo {d['repo']} != $REPO_DIR\"
 assert d['brain']==d['workspace']+'/.claude-sutando', f\"brain {d['brain']}\"
 assert d['session']=='sutando-core', d['session']
@@ -139,6 +141,29 @@ python3 -c "import json;json.dump({'voice_ws':'ws://127.0.0.1:19900','port':1990
 vws8="$(bash "$SCRIPT" runtime | python3 -c 'import json,sys;print(json.load(sys.stdin)["voice_ws"])')"
 [ "$vws8" = "ws://127.0.0.1:9900" ]; report "$?" "voice_ws=$vws8 == default (dead pid $DEADPID ignored)"
 rm -rf "$T7WS"; rm -f "$CFG"; [ -n "$CFG_BAK" ] && mv "$CFG_BAK" "$CFG"
+
+# -- Test 9: vision_control honors a custom PORT via runtime-authored state -------
+# Same guarantee as voice_ws (#2115) for the Watch endpoint: vision-tools.ts writes
+# state/vision-control.json at listen with its real port (:7847 or VISION_CONTROL_PORT);
+# the descriptor must report that, pid-validated, not a hardcoded default.
+echo "[9] runtime.vision_control → reports a custom vision port from runtime-authored state (pid-validated)"
+CFG="$REPO_DIR/sutando.config.local.json"; CFG_BAK=""
+[ -f "$CFG" ] && { CFG_BAK="$(mktemp)"; cp "$CFG" "$CFG_BAK"; }
+T9WS="$(mktemp -d)"; mkdir -p "$T9WS/state"
+python3 -c "import json;json.dump({'vision_control':'http://127.0.0.1:17847','port':17847,'pid':$$,'ts':0},open('$T9WS/state/vision-control.json','w'))"
+printf '{"workspace":{"path":"%s"}}' "$T9WS" > "$CFG"
+vc="$(bash "$SCRIPT" runtime | python3 -c 'import json,sys;print(json.load(sys.stdin)["vision_control"])')"
+[ "$vc" = "http://127.0.0.1:17847" ]; report "$?" "vision_control=$vc == custom :17847 (from state, pid alive)"
+
+# -- Test 10: vision_control falls back to default when the recorded pid is dead --
+echo "[10] runtime.vision_control → falls back to default when the state pid is dead"
+DEADPID2=$(python3 -c "import os;p=os.fork()
+if p==0: os._exit(0)
+os.waitpid(p,0);print(p)")
+python3 -c "import json;json.dump({'vision_control':'http://127.0.0.1:17847','port':17847,'pid':$DEADPID2,'ts':0},open('$T9WS/state/vision-control.json','w'))"
+vc10="$(bash "$SCRIPT" runtime | python3 -c 'import json,sys;print(json.load(sys.stdin)["vision_control"])')"
+[ "$vc10" = "http://127.0.0.1:7847" ]; report "$?" "vision_control=$vc10 == default (dead pid $DEADPID2 ignored)"
+rm -rf "$T9WS"; rm -f "$CFG"; [ -n "$CFG_BAK" ] && mv "$CFG_BAK" "$CFG"
 
 echo
 echo "sutando-config-runtime: $pass passed, $fail failed"
