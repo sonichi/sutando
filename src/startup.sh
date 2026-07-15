@@ -621,6 +621,14 @@ else
   echo "  ✓ voice agent (already running)"
 fi
 
+# 1b. Call-tier advertisement (one-shot): write state/call-tiers.json so the
+# runtime descriptor advertises which DIRECT call endpoints are reachable now
+# (Track 9 availability-driven call-tier menu). Backgrounded — it probes tailscale
+# with its own short timeout and never blocks the rest of startup; absent file
+# just means the descriptor advertises no direct tiers (client falls back to cloud).
+npx tsx src/emit-call-tiers.ts > "$LOGS_DIR/emit-call-tiers.log" 2>&1 &
+echo "  ✓ call-tiers advertisement"
+
 # 2. Web client (port 8080)
 reap_wedged_listener 8080 web-client
 if ! lsof -i :8080 > /dev/null 2>&1; then
