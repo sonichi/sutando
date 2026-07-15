@@ -186,6 +186,45 @@ class TestRunCycleAndCli(unittest.TestCase):
         self.assertIn("macos", kinds)
         self.assertIn("chan", kinds)
 
+    def test_failed_channel_send_does_not_debounce(self):
+        # #2101 review (High): when a channel is selected but its send FAILS, the
+        # debounce hash must NOT persist — the blocker re-escalates next cycle
+        # instead of being silently marked as already-notified.
+        orig_m, orig_c = _mod._macos_notify, _mod._channel_notify
+        _mod._macos_notify = lambda m: None
+        _mod._channel_notify = lambda m, s, c: False   # selected channel send fails
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                sf = os.path.join(td, "s.state")
+                first = run_cycle(_LOGIN, sf, macos=True, source="ag2space",
+                                  channel="!room:ag2.space")
+                self.assertIsNotNone(first)
+                self.assertFalse(os.path.exists(sf), "hash must not persist on failed send")
+                # Same blocker, next cycle → re-escalates (not suppressed).
+                second = run_cycle(_LOGIN, sf, macos=True, source="ag2space",
+                                   channel="!room:ag2.space")
+                self.assertIsNotNone(second)
+        finally:
+            _mod._macos_notify, _mod._channel_notify = orig_m, orig_c
+
+    def test_successful_channel_send_debounces(self):
+        # Complement: a channel send that LANDS persists the hash → suppressed next cycle.
+        orig_m, orig_c = _mod._macos_notify, _mod._channel_notify
+        _mod._macos_notify = lambda m: None
+        _mod._channel_notify = lambda m, s, c: True    # selected channel send lands
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                sf = os.path.join(td, "s.state")
+                first = run_cycle(_LOGIN, sf, macos=False, source="ag2space",
+                                  channel="!room:ag2.space")
+                self.assertIsNotNone(first)
+                self.assertTrue(os.path.exists(sf), "hash must persist on successful send")
+                second = run_cycle(_LOGIN, sf, macos=False, source="ag2space",
+                                   channel="!room:ag2.space")
+                self.assertIsNone(second, "same blocker suppressed after a landed send")
+        finally:
+            _mod._macos_notify, _mod._channel_notify = orig_m, orig_c
+
     def test_cli_active_from_routes_to_owner_channel(self):
         # Covers main()'s --active-from branch: with no explicit --notify-*, the
         # owner's active channel is resolved from last-owner-activity.json and the

@@ -214,12 +214,45 @@ class TestSendRemoteGateway(unittest.TestCase):
                          {"op": "message", "room_id": "!room:server", "body": "hello"})
 
     def test_missing_env_returns_false(self):
-        clean_env = {k: v for k, v in os.environ.items()
-                     if k not in ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN")}
+        # Also strip the AG2 combined-token vars: send_remote_gateway falls back to
+        # AG2_REMOTE_TOKEN=url|secret, so a genuine "no creds anywhere" case must
+        # clear them too (else an ambient AG2_REMOTE_TOKEN resolves and this passes).
+        _drop = ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "AG2_REMOTE_URL")
+        clean_env = {k: v for k, v in os.environ.items() if k not in _drop}
         with patch.object(self.mod, "_env_file", return_value={}), \
              patch.dict(os.environ, clean_env, clear=True):
             result = self.mod.send_remote_gateway("someprovider", "!room:server", "hello")
         self.assertFalse(result)
+
+    def test_ag2_combined_token_only_delivers(self):
+        """Regression for #2101 review (High): a channel provisioned with ONLY
+        AG2_REMOTE_TOKEN=url|secret (the AG2-compatible onboarding form the rest
+        of the gateway stack accepts) must deliver — not fail with 'no
+        REMOTE_TASK_URL/REMOTE_TASK_TOKEN'."""
+        captured = {}
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = b'{"ok": true}'
+
+        def fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            captured["payload"] = json.loads(req.data)
+            captured["auth"] = req.get_header("Authorization")
+            return mock_resp
+
+        _drop = ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "AG2_REMOTE_URL")
+        clean_env = {k: v for k, v in os.environ.items() if k not in _drop}
+        with patch.object(self.mod, "_env_file",
+                          return_value={"AG2_REMOTE_TOKEN": "https://gw.example/relay|sekret"}), \
+             patch.dict(os.environ, clean_env, clear=True), \
+             patch("urllib.request.urlopen", fake_urlopen):
+            result = self.mod.send_remote_gateway("ag2space", "!room:ag2.space", "hi")
+        self.assertTrue(result)
+        self.assertEqual(captured["url"], "https://gw.example/relay/v1/room")
+        self.assertEqual(captured["payload"],
+                         {"op": "message", "room_id": "!room:ag2.space", "body": "hi"})
+        self.assertEqual(captured["auth"], "Bearer sekret")
 
 
 class TestGatewaySourceTraversal(unittest.TestCase):

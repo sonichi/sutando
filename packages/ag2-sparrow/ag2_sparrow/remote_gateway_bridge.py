@@ -522,6 +522,14 @@ def _write_owner_activity(task: dict) -> None:
             "channel": task.get("source") or PROVIDER,
             "summary": body[:80],
         }
+        # Propagate the routable room id so the core-supervisor relay can escalate
+        # BACK into the AG2Space room the owner was last active in (resolve_active_
+        # target requires both `channel` and `channel_id`; without this it degrades
+        # to macOS-only for the gateway surface). Only when present — keeps the
+        # discord-bridge schema compatible for non-message activity.
+        _cid = str(task.get("channel_id") or "").strip()
+        if _cid:
+            payload["channel_id"] = _cid
         tmp = OWNER_ACTIVITY_FILE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload))
         tmp.rename(OWNER_ACTIVITY_FILE)

@@ -170,9 +170,25 @@ def send_remote_gateway(source: str, channel_id: str, message: str) -> bool:
     env = _env_file(real_env)
     url = (os.environ.get("REMOTE_TASK_URL") or env.get("REMOTE_TASK_URL", "")).rstrip("/")
     token = os.environ.get("REMOTE_TASK_TOKEN", "").strip() or env.get("REMOTE_TASK_TOKEN", "")
+    # AG2-compatible onboarding: a single AG2_REMOTE_TOKEN carries the combined
+    # "https://<gateway>|<secret>" form (the URL travels inside the token) — the
+    # same contract ag2-sparrow's remote_gateway_bridge and startup.sh already
+    # accept. Fall back to it so an ag2space channel provisioned with ONLY
+    # AG2_REMOTE_TOKEN can deliver (without this, ag2space escalations from the
+    # core-supervisor relay fail while the debounce still marks them notified).
+    if not token:
+        _raw = (os.environ.get("AG2_REMOTE_TOKEN") or env.get("AG2_REMOTE_TOKEN", "")).strip()
+        if "|" in _raw:
+            _u, token = _raw.split("|", 1)
+            if not url:
+                url = _u.rstrip("/")
+        elif _raw:
+            token = _raw
+        if not url:
+            url = (os.environ.get("AG2_REMOTE_URL") or env.get("AG2_REMOTE_URL", "")).rstrip("/")
     if not url or not token:
-        print(f"[task-progress] no REMOTE_TASK_URL/REMOTE_TASK_TOKEN for source '{source}' "
-              f"(looked in {env_path})", file=sys.stderr)
+        print(f"[task-progress] no REMOTE_TASK_URL/REMOTE_TASK_TOKEN (or AG2_REMOTE_TOKEN) "
+              f"for source '{source}' (looked in {env_path})", file=sys.stderr)
         return False
     return _post(
         f"{url}/v1/room",

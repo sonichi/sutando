@@ -101,18 +101,21 @@ def _macos_notify(message: str) -> None:  # pragma: no cover - external I/O (osa
         pass
 
 
-def _channel_notify(message: str, source: str, channel: str) -> None:  # pragma: no cover - external I/O (notify.py subprocess)
-    """Route through the existing task-progress relay (notify.py). Best-effort."""
+def _channel_notify(message: str, source: str, channel: str) -> bool:  # pragma: no cover - external I/O (notify.py subprocess)
+    """Route through the existing task-progress relay (notify.py). Returns True
+    only when the send actually landed (notify.py exit 0), so the caller can
+    decide whether to debounce — a failed channel send must NOT suppress a retry."""
     notify = os.path.join(os.environ.get("CLAUDE_CONFIG_DIR", ""),
                           "skills", "task-progress", "scripts", "notify.py")
     if not os.path.isfile(notify):
-        return
+        return False
     try:
-        subprocess.run([sys.executable, notify, "--source", source,
-                        "--channel-id", channel, "--message", message],
-                       capture_output=True, timeout=20)
+        r = subprocess.run([sys.executable, notify, "--source", source,
+                            "--channel-id", channel, "--message", message],
+                           capture_output=True, timeout=20)
+        return r.returncode == 0
     except Exception:
-        pass
+        return False
 
 
 def _load_last_hash(state_file):
@@ -155,9 +158,16 @@ def run_cycle(signal, state_file, *, macos=True, source="", channel="", dry_run=
         return msg
     if macos:
         _macos_notify(msg)
+    # Debounce only when delivery actually landed. If a channel was selected but
+    # its send failed, do NOT persist the hash — re-escalate next cycle so a
+    # transient/misconfigured channel can't permanently swallow the alert (macOS
+    # alone must not suppress the real channel). macOS-only (no channel selected)
+    # still debounces — the local notification IS the delivery there.
+    channel_ok = True
     if source and channel:
-        _channel_notify(msg, source, channel)
-    _save_last_hash(state_file, new_hash)
+        channel_ok = _channel_notify(msg, source, channel)
+    if channel_ok:
+        _save_last_hash(state_file, new_hash)
     return msg
 
 
