@@ -326,6 +326,53 @@ try:
         probe_socket = rec['socket']
 except Exception:
     pass
+# voice_ws: the WS the running voice-agent actually bound. Runtime-authored —
+# voice-agent.ts writes state/voice-agent.json at listen with its real PORT — so
+# a non-default PORT is reported correctly instead of a hardcoded default (same
+# 'running process is the authority' principle as the socket above). Liveness is
+# validated by the recorded pid, NOT a time window: the file is written once at
+# startup (not refreshed like the heartbeat), so a window would wrongly expire a
+# long-running agent. Absent / dead-pid / unreadable -> default OSS endpoint.
+probe_voice_ws = 'ws://127.0.0.1:9900'
+try:
+    with open(os.path.join(ws, 'state', 'voice-agent.json')) as f:
+        vrec = json.load(f)
+    vpid = int(vrec.get('pid', 0) or 0)
+    alive = False
+    if vpid > 0:
+        try:
+            os.kill(vpid, 0)
+            alive = True
+        except ProcessLookupError:
+            alive = False
+        except PermissionError:
+            alive = True  # exists but not ours — still a live process
+        except Exception:
+            alive = False
+    if alive and vrec.get('voice_ws'):
+        probe_voice_ws = vrec['voice_ws']
+except Exception:
+    pass
+# call_tiers: the DIRECT call endpoints this core can advertise right now, the
+# runtime-authored half of the availability-driven call-tier menu (Track 9). The
+# emitter (src/emit-call-tiers.ts, from reachability-endpoints.ts) writes
+# state/call-tiers.json at startup; the client renders the tier picker from this
+# instead of the old static 'force tier' stub (greyed Direct even when live,
+# offered Local on a remote core). Only direct tiers are advertised — 'local' is
+# client-relative and cloud/relay are always-available + composed client-side.
+# The advertisement is a HINT: the client verifies reachability (first-reachable-
+# wins), so a stale entry degrades gracefully. Absent/malformed -> [] (client
+# falls back to cloud). A freshness window / re-emit-on-network-change is a
+# documented follow-up.
+probe_call_tiers = []
+try:
+    with open(os.path.join(ws, 'state', 'call-tiers.json')) as f:
+        crec = json.load(f)
+    ct = crec.get('call_tiers')
+    if isinstance(ct, list):
+        probe_call_tiers = ct
+except Exception:
+    pass
 env = dict(os.environ, SUTANDO_TMUX_SOCKET=probe_socket)
 h = {}
 try:
@@ -364,6 +411,17 @@ print(json.dumps({
     'brain': brain,
     'socket': h.get('tmux_socket') or probe_socket,
     'session': h.get('session', 'sutando-core'),
+    # voice_ws: the WebSocket the runtime's voice-agent listens on — the endpoint
+    # the desktop 'Live' page's browser VoiceTransport.connect(url) opens
+    # (ag2-space/ag2space-cinny-desktop v0.3.0). Sourced from runtime-authored
+    # state (probe_voice_ws above): voice-agent.ts records its actual bound PORT,
+    # so a non-default-PORT install is reported correctly, not a hardcoded default.
+    'voice_ws': probe_voice_ws,
+    # call_tiers: the direct call endpoints this core advertises (Track 9). The
+    # desktop 'Start Call' picker renders the tier menu from this — showing only
+    # reachable rows, un-greying Direct(Tailscale)/Direct(LAN) when their url is
+    # advertised. Runtime-authored via probe_call_tiers above (emit-call-tiers.ts).
+    'call_tiers': probe_call_tiers,
     'health': h.get('health', 'unknown'),
     'authenticated': h.get('authenticated'),
 }))

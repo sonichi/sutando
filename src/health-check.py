@@ -269,6 +269,64 @@ def check_memory_dir_override() -> "dict | None":
     }
 
 
+def check_memory_index_integrity() -> "dict | None":
+    """Catch memories that exist on disk but will never load into a session.
+
+    A memory only loads if it is (a) present in the LIVE memory dir and (b)
+    referenced in that dir's MEMORY.md index. Two silent-loss modes have bitten
+    us (recurring field report 64340119): a memory file written to the live dir
+    but never added to MEMORY.md, and a hard-won capability memory stranded in a
+    ``*-BACKUP`` tree (created by scripts/sutando-migrate.sh) that never made it
+    into the live index — so the rule it carried was written yet never recalled.
+
+    Warn (never fail) listing the orphaned/stranded files so the divergence is
+    visible instead of silently dropping the memory. Returns None on a clean
+    index or when the memory dir does not exist yet.
+    """
+    if not MEMORY_DIR.exists():
+        return None
+    index = MEMORY_DIR / "MEMORY.md"
+    index_text = index.read_text(errors="ignore") if index.exists() else ""
+
+    # (a) live memory files not referenced anywhere in MEMORY.md → won't load.
+    unindexed = [
+        p.name for p in sorted(MEMORY_DIR.glob("*.md"))
+        if p.name != "MEMORY.md"
+        and p.name not in index_text and p.name[:-3] not in index_text
+    ]
+
+    # (b) memories stranded in a sibling *-BACKUP tree, absent from the live dir.
+    stranded: list[str] = []
+    try:
+        claude_home = MEMORY_DIR.parent.parent.parent  # memory -> <slug> -> projects -> claude-home
+        slug = MEMORY_DIR.parent.name
+        for backup in claude_home.parent.glob(claude_home.name + "*BACKUP*"):
+            bmem = backup / "projects" / slug / "memory"
+            if bmem.is_dir():
+                stranded += [
+                    mp.name for mp in bmem.glob("*.md")
+                    if mp.name != "MEMORY.md" and not (MEMORY_DIR / mp.name).exists()
+                ]
+    except Exception:  # pragma: no cover — best-effort backup scan; never break the health check
+        pass
+
+    if not unindexed and not stranded:
+        return {"name": "memory-index", "status": "ok",
+                "detail": "all memory files present in the MEMORY.md index"}
+    parts = []
+    if unindexed:
+        parts.append(
+            f"{len(unindexed)} memory file(s) not in MEMORY.md (won't load): "
+            + ", ".join(unindexed[:6]) + ("…" if len(unindexed) > 6 else "")
+        )
+    if stranded:
+        parts.append(
+            f"{len(stranded)} memory file(s) stranded in a *-BACKUP tree, absent from the live dir: "
+            + ", ".join(sorted(set(stranded))[:6]) + ("…" if len(set(stranded)) > 6 else "")
+        )
+    return {"name": "memory-index", "status": "warn", "detail": "; ".join(parts)}
+
+
 def check_memory_sync() -> dict:
     """Verify memory sync is configured and has run recently.
 
@@ -1572,6 +1630,10 @@ def run_all_checks() -> list[dict]:
     _mem_override = check_memory_dir_override()
     if _mem_override:
         checks.append(_mem_override)
+
+    _mem_index = check_memory_index_integrity()
+    if _mem_index:
+        checks.append(_mem_index)
 
     # Notes — canonical home is the resolved workspace post-migration.
     # Pass WORKSPACE_DIR (not REPO_DIR) so the check resolves to

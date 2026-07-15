@@ -175,6 +175,29 @@ def capture(event: str, properties: dict | None = None) -> None:
         )
     if not enabled():
         return
+    _dispatch(event, properties)
+
+
+def task_processed(source: str) -> None:
+    """One anonymous event per task the core accepts, tagged only with the
+    inbound surface (``discord`` / ``slack`` / ``telegram`` / ``voice`` / …).
+
+    This is the activation signal that ``core_started`` alone can't give:
+    whether an install does anything after launching. It carries ONLY the
+    coarse source bucket — never the task text, ids, user, or channel.
+    """
+    capture("task_processed", {"source": str(source)})
+
+
+def feature_used(feature: str) -> None:
+    """One anonymous event when a named product feature runs, tagged only with
+    the feature's short categorical name (e.g. ``morning_briefing``). Never any
+    task content, arguments, or PII.
+    """
+    capture("feature_used", {"feature": str(feature)})
+
+
+def _dispatch(event: str, properties: dict | None) -> None:
     props = {
         "$ip": "",
         "$geoip_disable": True,

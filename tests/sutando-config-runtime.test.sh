@@ -44,9 +44,11 @@ json="$(bash "$SCRIPT" runtime)"
 echo "$json" | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
-need={'alive','repo','code','workspace','brain','socket','session','health','authenticated'}
+need={'alive','repo','code','workspace','brain','socket','session','voice_ws','health','authenticated'}
 missing=need - set(d)
 assert not missing, f'missing keys: {missing}'
+# voice_ws = the runtime's voice-agent WS endpoint (v0.3.0 Live page consumes it)
+assert d['voice_ws'].startswith('ws://'), f\"voice_ws {d['voice_ws']!r} not a ws:// url\"
 assert d['repo']=='$REPO_DIR', f\"repo {d['repo']} != $REPO_DIR\"
 assert d['brain']==d['workspace']+'/.claude-sutando', f\"brain {d['brain']}\"
 assert d['session']=='sutando-core', d['session']
@@ -111,6 +113,32 @@ canon="$(bash "$SCRIPT" claude-sutando-config-dir)"
 brain6="$(bash "$SCRIPT" runtime | python3 -c 'import json,sys;print(json.load(sys.stdin)["brain"])')"
 [ "$brain6" = "$canon" ]; report "$?" "brain=$brain6 == canonical $canon (not hardcoded .claude-sutando)"
 rm -rf "$T6WS"; rm -f "$CFG"; [ -n "$CFG_BAK" ] && mv "$CFG_BAK" "$CFG"
+
+# -- Test 7: voice_ws honors a custom PORT via runtime-authored state ------------
+# Regression for the #2115 review (Medium): voice_ws hardcoded ws://127.0.0.1:9900
+# is wrong for a voice-agent on a non-default PORT. It must be sourced from the
+# runtime-authored state voice-agent.ts writes (state/voice-agent.json), validated
+# by the recorded pid. Plant a state file recording a NON-default port + THIS
+# shell's pid (alive), point the resolver at that workspace, assert it's reported.
+echo "[7] runtime.voice_ws → reports a custom voice port from runtime-authored state (pid-validated)"
+CFG="$REPO_DIR/sutando.config.local.json"; CFG_BAK=""
+[ -f "$CFG" ] && { CFG_BAK="$(mktemp)"; cp "$CFG" "$CFG_BAK"; }
+T7WS="$(mktemp -d)"; mkdir -p "$T7WS/state"
+python3 -c "import json;json.dump({'voice_ws':'ws://127.0.0.1:19900','port':19900,'pid':$$,'ts':0},open('$T7WS/state/voice-agent.json','w'))"
+printf '{"workspace":{"path":"%s"}}' "$T7WS" > "$CFG"
+vws="$(bash "$SCRIPT" runtime | python3 -c 'import json,sys;print(json.load(sys.stdin)["voice_ws"])')"
+[ "$vws" = "ws://127.0.0.1:19900" ]; report "$?" "voice_ws=$vws == custom :19900 (from state, pid alive)"
+
+# -- Test 8: voice_ws falls back to default when the recorded pid is dead --------
+# A stale state file (voice-agent exited) must NOT report a port nothing is on.
+echo "[8] runtime.voice_ws → falls back to default when the state pid is dead"
+DEADPID=$(python3 -c "import os;p=os.fork()
+if p==0: os._exit(0)
+os.waitpid(p,0);print(p)")
+python3 -c "import json;json.dump({'voice_ws':'ws://127.0.0.1:19900','port':19900,'pid':$DEADPID,'ts':0},open('$T7WS/state/voice-agent.json','w'))"
+vws8="$(bash "$SCRIPT" runtime | python3 -c 'import json,sys;print(json.load(sys.stdin)["voice_ws"])')"
+[ "$vws8" = "ws://127.0.0.1:9900" ]; report "$?" "voice_ws=$vws8 == default (dead pid $DEADPID ignored)"
+rm -rf "$T7WS"; rm -f "$CFG"; [ -n "$CFG_BAK" ] && mv "$CFG_BAK" "$CFG"
 
 echo
 echo "sutando-config-runtime: $pass passed, $fail failed"

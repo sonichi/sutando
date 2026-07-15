@@ -431,6 +431,15 @@ def main():
 
     print(f"\nBriefing delivered:\n{narrative}")
 
+    # Anonymous, opt-out product telemetry: one bucketed event when this feature
+    # actually runs (not on the already-delivered early return). No content/PII.
+    try:  # pragma: no cover — fire-and-forget; logic tested in tests/telemetry.test.py
+        from telemetry import feature_used  # sibling module (src/ on sys.path)
+
+        feature_used("morning_briefing")
+    except Exception:  # pragma: no cover — telemetry must never break the feature
+        pass
+
 
 if __name__ == "__main__":
     main()

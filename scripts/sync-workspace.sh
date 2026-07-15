@@ -172,7 +172,11 @@ fi
 # Section 2 — Logging + UI                                                     #
 # --------------------------------------------------------------------------- #
 
-LOG="/tmp/sync-workspace.log"
+# Per-user log path: on multi-user machines a shared /tmp/sync-workspace.log is
+# owned by whichever account wrote it first; the sticky bit blocks every other
+# account from appending or replacing it. $TMPDIR is per-user on macOS.
+LOG="${SYNC_WORKSPACE_LOG:-${TMPDIR:-/tmp}/sync-workspace.log}"
+
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"; }
 
