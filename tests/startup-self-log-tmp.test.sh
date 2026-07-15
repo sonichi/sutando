@@ -88,7 +88,12 @@ fi
 # NOT have fired, so no /tmp/sutando-startup-* file should be created during
 # this test window.
 # Snapshot existing matches first; new ones (post-snapshot) are what we check.
-PRE_LIST="$(ls /tmp/sutando-startup-* 2>/dev/null || true)"
+# NOTE: match *.log only — on Linux (Ubuntu CI) mktemp -d creates TMP_E2E in
+# /tmp/ with a sutando-startup- prefix, so a bare glob /tmp/sutando-startup-*
+# expands to that directory and ls lists its CONTENTS, which change between
+# PRE and POST as test 7 writes files into it (false positive fail).
+# Actual startup log files always end in .log (startup.sh: -$$.log suffix).
+PRE_LIST="$(ls /tmp/sutando-startup-*.log 2>/dev/null | sort || true)"
 SUTANDO_STARTUP_NO_LOG=1 bash -c '
     set -e
     if [ "${SUTANDO_STARTUP_NO_LOG:-0}" != "1" ]; then
@@ -98,7 +103,7 @@ SUTANDO_STARTUP_NO_LOG=1 bash -c '
     fi
     echo "running with no-log"
 ' > "$TMP_E2E/nolog_stdout" 2> "$TMP_E2E/nolog_stderr"
-POST_LIST="$(ls /tmp/sutando-startup-* 2>/dev/null || true)"
+POST_LIST="$(ls /tmp/sutando-startup-*.log 2>/dev/null | sort || true)"
 if [ "$PRE_LIST" != "$POST_LIST" ]; then
     echo "  FAIL: T8 — SUTANDO_STARTUP_NO_LOG=1 still created /tmp log file"; fail=1
 fi

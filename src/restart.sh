@@ -14,6 +14,9 @@ pkill -f "agent-api.py" 2>/dev/null
 pkill -f "screen-capture-server" 2>/dev/null
 pkill -f "telegram-bridge" 2>/dev/null
 pkill -f "discord-bridge" 2>/dev/null
+pkill -f "slack-bridge" 2>/dev/null
+pkill -f "remote-gateway-bridge" 2>/dev/null
+pkill -f "observability/boot" 2>/dev/null
 pkill -f "watch-tasks" 2>/dev/null
 pkill -f "conversation-server" 2>/dev/null
 pkill -f "ngrok" 2>/dev/null
@@ -55,7 +58,8 @@ fi
 # startup.sh's recompile-replace path.
 STOP_PATTERNS=(
     "voice-agent" "web-client.ts" "dashboard.py" "agent-api.py"
-    "screen-capture-server" "telegram-bridge" "discord-bridge" "watch-tasks"
+    "screen-capture-server" "telegram-bridge" "discord-bridge" "slack-bridge"
+    "remote-gateway-bridge" "observability/boot" "watch-tasks"
     "conversation-server" "ngrok" "src/Sutando/Sutando"
 )
 for _ in $(seq 1 30); do

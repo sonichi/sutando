@@ -1,6 +1,6 @@
-# Remote relay protocol
+# Remote gateway protocol
 
-`src/remote-relay-bridge.py` lets a remote HTTP server dispatch tasks to a local
+`src/remote-gateway-bridge.py` lets a remote HTTP server dispatch tasks to a local
 Sutando instance and collect the results — turning Sutando into a remotely
 drivable worker without exposing the host (no open port, no tunnel). The bridge
 is the **client**; you (or a service) provide the **relay server** that speaks
@@ -22,7 +22,7 @@ The bridge reads these from the environment (typically sourced from
 | `REMOTE_TASK_TOKEN` | yes | — | Bearer token sent on every request. |
 | `REMOTE_TASK_PROVIDER` | no | `remote` | Label written as a task's `source:` when the task omits one. |
 | `REMOTE_TASK_POLL_WAIT` | no | `25` | Long-poll seconds requested per `/v1/tasks` call. |
-| `REMOTE_TASK_TIER` | no | `team` | Local access tier stamped on every inbound task (see Security). |
+| `REMOTE_TASK_TIER` | no | `owner` | Local access tier stamped on every inbound task; `owner` for the personal-agent model, set `team`/`other` for a shared gateway (see Security). |
 
 **Use the split form** (`REMOTE_TASK_URL` + `REMOTE_TASK_TOKEN`) — it's the recommended way to configure the bridge.
 
@@ -79,14 +79,41 @@ Periodic liveness + capability ping.
 
 ```
 body: {
-  "client": "sutando-relay-client",
+  "client": "sutando-gateway-client",
   "protocol_version": 1,
   "provider": "<REMOTE_TASK_PROVIDER>",
   "tier": "<REMOTE_TASK_TIER>",
   "inflight": <int>,            // tasks currently claimed but not yet resulted
-  "capabilities": ["task-ack", "heartbeat", "result-skip-markers"]
+  "capabilities": ["task-ack", "heartbeat", "result-skip-markers", "core-status"]
 }
 ```
+
+## Media markers (optional)
+
+Instead of raw bytes, a gateway may hand the task body a media marker:
+
+    [<tag>: <url> mime=<mime> name=<filename> size=<bytes> kind=<msgtype>] <caption>
+
+The client resolves it locally: downloads the bytes (default 25 MB cap) and
+rewrites the marker to `[File attached: <local path>]` (`[Photo attached: …]`
+for `kind=m.image`) — the same inbound convention the other bridges use. Any
+failure leaves the marker untouched.
+
+Config: `REMOTE_MEDIA_MARKER` (tag, default `remote-media`),
+`REMOTE_MEDIA_HS_TOKEN` + `REMOTE_MEDIA_HS_ORIGIN` (homeserver bearer and the
+exact origin it may be sent to), `REMOTE_MEDIA_DIR`, `REMOTE_MEDIA_MAX_BYTES`.
+
+Credential routing is by parsed exact origin, never string matching:
+
+- gateway bearer → only when the URL's scheme/host/port equal the gateway's
+  AND the path sits at/under the gateway base path with a `/` boundary;
+- homeserver bearer → only for `/_matrix/` paths on exactly
+  `REMOTE_MEDIA_HS_ORIGIN` (legacy media routes are upgraded to the MSC3916
+  authenticated route first); unset origin ⇒ Matrix media is never credentialed;
+- anything else → fetched with no credentials.
+
+Authenticated fetches refuse redirects (a 3xx is a failure), so a
+gateway-controlled URL can never bounce a bearer to another host.
 
 ## Delivery + idempotency
 
@@ -99,10 +126,15 @@ body: {
 ## Security
 
 - Inbound tasks are **not trusted to set their own access tier.** The bridge
-  stamps every task with the local `REMOTE_TASK_TIER` (default `team`) as the
-  last `access_tier:` line, so a task body cannot forge a higher tier. Set
-  `REMOTE_TASK_TIER=owner` in the channel `.env` only for a relay you fully
-  control.
+  stamps every task with the local `REMOTE_TASK_TIER` as the last `access_tier:`
+  line, so a task body cannot forge a higher tier. **Default is `owner`** for the
+  personal-agent model (2026-07-08): the gateway authenticates with its owner's
+  own bearer and the broker owner-scopes every pull, so its tasks are the
+  owner's own (e.g. voice delegations); trust derives from the broker's
+  owner-scoping, not from the gateway process or the task's claim. A **shared /
+  multi-user gateway** (one that could pull tasks not scoped to a single owner)
+  MUST set `REMOTE_TASK_TIER=team` (or `other`) explicitly. An invalid value
+  fails **closed** to `team`.
 - The token is a per-host credential; keep it in the channel `.env`
   (host-local), not in the synced workspace.
 

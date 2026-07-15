@@ -39,7 +39,9 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 MANIFEST = SCRIPT_DIR / "plugin-patches.json"
-CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude"))
+# Mirrors util_paths.claude_home_path resolution ($CLAUDE_CONFIG_DIR ->
+# $CLAUDE_HOME -> ~/.claude); standalone skill script, can't import src/.
+CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR") or os.environ.get("CLAUDE_HOME") or (Path.home() / ".claude"))
 TAG = "[plugin-patches]"
 
 

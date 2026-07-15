@@ -1,0 +1,902 @@
+#!/usr/bin/env python3
+"""
+remote-gateway-bridge.py — generic client that bridges a REMOTE task gateway to the
+local Sutando file queue, so the local core processes remote tasks unchanged.
+
+This is the OPEN, provider-agnostic half of the "agent as a service" design: a
+gateway service holds the platform connection and
+exposes a tiny HTTP protocol; this client pulls *your* tasks down into the local
+`tasks/` queue and pushes results back up. No provider-specific logic lives here
+— that's the gateway's job.
+
+Full spec: docs/remote-gateway-protocol.md
+
+  Protocol (versioned, Bearer-auth):
+  GET  {REMOTE_TASK_URL}/v1/tasks?wait=<sec>
+       → 200 {"tasks": [ {<task fields...>}, ... ]}   (long-poll; [] on timeout)
+  POST {REMOTE_TASK_URL}/v1/tasks/<task-id>/ack
+       → body {"id": "<task-id>"}  → 200 on accepted
+  POST {REMOTE_TASK_URL}/v1/results
+       → body {"id": "<task-id>", "body": "<result text>"}  → 200 on accepted
+  POST {REMOTE_TASK_URL}/v1/heartbeat
+       → body {"client": "...", "inflight": N, ...}  → 200 on accepted
+
+Each task object uses the same schema Sutando's other bridges write, so this
+client just serializes it to `tasks/task-<id>.txt` and the core handles it like
+any Discord/Telegram/Slack task. When `results/task-<id>.txt` appears, its body
+is POSTed back and the result file is archived. Ack/heartbeat are best-effort:
+if an older gateway returns 404/405, the client keeps working against the
+original pull/result protocol.
+
+Config (env / .env):
+  REMOTE_TASK_TOKEN      the onboarding string — the ONLY required setting
+                        (combined "https://<gateway>|<secret>" or a bare secret)
+  REMOTE_TASK_URL        gateway base URL (only needed with a bare secret)
+  REMOTE_TASK_URL/_TOKEN  legacy aliases
+  REMOTE_TASK_PROVIDER  label used for the task `source:` field (default "remote")
+  REMOTE_TASK_POLL_WAIT long-poll seconds (default 25)
+
+Stdlib only (urllib) — no new dependencies.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+# resolve_workspace lives alongside this file in src/ — put THIS directory on
+# the path (no repo-walking; the old triple-parent form predated the move into
+# src/ and pointed outside the repo).
+from ._dirs import task_dir as _task_dir, result_dir as _result_dir, state_dir as _state_dir
+from .task_archive import find_task_file
+from . import local_task_protocol
+from .result_markers import parse_markers
+from .send_allowlist import is_path_sendable
+
+TASKS_DIR = _task_dir()
+RESULTS_DIR = _result_dir()
+_STATE = _state_dir()
+ARCHIVE_RESULTS_DIR = RESULTS_DIR / "archive"
+# Persist the in-flight set (tasks pulled from the gateway, awaiting result-POST)
+# so a client restart between pull and POST doesn't strand the result. Scoped to
+# gateway-pulled tasks only — we must NOT blindly POST every results/ file, or we'd
+# cross-send other channels' (Discord/Telegram) results to the gateway.
+INFLIGHT_FILE = _STATE / "remote-task-inflight.json"
+# Sidecar map {task id → origin room id}, recorded at queue time. Outbound
+# file-attach needs the room because media uploads go to the room-scoped
+# endpoint (POST /v1/rooms/{room}/media) while text results go to /v1/results
+# (which resolves the room server-side). Separate file — the inflight ledger's
+# list-of-ids format stays untouched for compat.
+TASK_ROOMS_FILE = _STATE / "remote-task-rooms.json"
+
+# Back-compat: instances onboarded before the AG2_REMOTE_* → REMOTE_TASK_*
+# rename still export the legacy names in their .env. Honor them as DEPRECATED
+# aliases for one release (remove next), with a one-line migration nudge, so the
+# bridge keeps connecting under any launcher. New onboards use REMOTE_TASK_*.
+_warned_legacy = set()
+def _env_compat(new, old):
+    v = os.environ.get(new)
+    if v:
+        return v
+    v = os.environ.get(old)
+    if v and old not in _warned_legacy:
+        _warned_legacy.add(old)
+        print(f"[remote-gateway-bridge] {old} is deprecated — rename to {new} in your .env",
+              file=sys.stderr, flush=True)
+    return v
+
+# One-token onboarding: REMOTE_TASK_TOKEN alone is enough. The onboarding
+# string may be the combined "https://<gateway>|<secret>" form (the URL travels
+# inside the token — nothing service-specific lives in this repo); a bare
+# secret needs REMOTE_TASK_URL alongside it.
+_RAW = _env_compat("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN") or ""
+if "|" in _RAW:
+    _URL_FROM_TOKEN, TOKEN = _RAW.split("|", 1)
+else:
+    _URL_FROM_TOKEN, TOKEN = "", _RAW
+URL = (_env_compat("REMOTE_TASK_URL", "AG2_REMOTE_URL")
+       or _URL_FROM_TOKEN).rstrip("/")
+PROVIDER = os.environ.get("REMOTE_TASK_PROVIDER") or "remote"
+POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
+HEARTBEAT_INTERVAL = 60
+_ack_disabled = False
+_heartbeat_disabled = False
+_last_heartbeat_at = 0.0
+
+_TASK_FIELDS = ("id", "timestamp", "task", "source", "channel_id",
+                # Context enrichment (AG2 broker writer side): human room/sender
+                # names + reply reference. Serialized only when the gateway sends
+                # them (absent for other sources); each newline-stripped by
+                # _one_line so a room/display name can't forge an extra line.
+                "room_name", "sender_name", "reply_to_event", "reply_to_me",
+                "source_message_id", "user_id", "priority", "interaction_type",
+                # Platform-signed metadata pointer — serialized as a one-line
+                # JSON header by a dedicated branch below (dict, not scalar).
+                "platform_card")
+
+# platform_card passes through with exactly these subkeys — a signed pointer
+# {card_url, card_sha256, sig, key_id, alg} to the platform's canonical agent
+# operating card. The bridge does NOT verify the signature (consumers do, per
+# origin, via skills/agent-room-ops/verify_platform_card.py — fail-closed);
+# it only constrains the shape so the field can't smuggle arbitrary payload.
+_PLATFORM_CARD_KEYS = ("card_url", "card_sha256", "sig", "key_id", "alg")
+
+# Interaction-plane vocabulary (interaction-planes refactor step 1). Remote
+# values outside this set degrade to "message" rather than passing through.
+_INTERACTION_TYPES = frozenset({
+    "message", "realtime_audio", "realtime_video",
+    "tool_initiated", "system_event", "self_reflective",
+})
+
+# Trust tier is a LOCAL decision (review 2026-06-13): the gateway is outside
+# this machine's trust boundary, so a task's SELF-CLAIMED access_tier is
+# ignored. The tier written to every task file comes from REMOTE_TASK_TIER.
+#
+# Default is "owner" for the personal-agent model (2026-07-08): a user runs
+# their OWN gateway authenticated with their OWN owner bearer, and the broker
+# OWNER-SCOPES every pull (per-agent bearer; caller-owner == target-owner), so
+# this gateway can ONLY ever receive its owner's own tasks — e.g. a voice-call
+# delegation from the user's own cloud agent. The trust therefore derives from
+# the broker's owner-scoping, NOT from trusting the gateway process or the
+# task's claim. The previous "team" default made a user's own voice
+# delegations look untrusted, so a hardened core (correctly, given the signal)
+# refused them.
+# ESCAPE HATCH: a SHARED / multi-user gateway — one that could pull tasks NOT
+# scoped to a single owner — MUST set REMOTE_TASK_TIER=team (or other).
+LOCAL_TIER = (_env_compat("REMOTE_TASK_TIER", "AG2_REMOTE_TIER") or "owner").strip().lower()
+if LOCAL_TIER not in ("owner", "team", "other"):
+    # An INVALID value (e.g. a typo "owenr") fails CLOSED to "team" — NEVER
+    # silently grant owner on a misconfiguration. Only the UNSET case defaults to
+    # "owner" (the `or "owner"` above — the explicit personal-agent model).
+    LOCAL_TIER = "team"
+
+# ── inbound media fetch (owner screenshots, file uploads) ────────────────────
+# A gateway can hand the task body a media MARKER instead of raw bytes:
+#   [<tag>: <url> mime=<m> name=<f> size=<n> kind=<msgtype>] <caption>
+# `<url>` is typically unreachable for the core as-is (a homeserver media URL
+# behind authenticated-media, or a gateway media-proxy URL). We resolve it here —
+# where the gateway bearer already lives — download the bytes to a local file,
+# and rewrite the marker to `[File attached: <path>]` (the inbound convention
+# the Discord/Telegram bridges use) so the core just reads a local path with
+# zero remote creds.
+#
+# Auth is picked by the URL:
+#   • URL under REMOTE_TASK_URL → fetched with the gateway bearer we already hold
+#   • a Matrix `/_matrix/media/...` URL → upgraded to the authenticated
+#     MSC3916 client route and fetched with REMOTE_MEDIA_HS_TOKEN (a homeserver
+#     access token), if configured
+#   • any other https URL → fetched with NO credentials
+# Authenticated fetches do NOT follow redirects (a gateway-controlled URL must
+# not be able to bounce our bearer to a third-party host). Drop-in safe: no
+# token / fetch error / oversize → the marker is left untouched.
+#
+# The marker tag is configurable (REMOTE_MEDIA_MARKER, slug chars only) so a
+# provider-specific gateway can keep its existing marker name without this repo
+# carrying provider strings.
+MEDIA_MARKER_TAG = re.sub(r"[^A-Za-z0-9_-]", "",
+                          os.environ.get("REMOTE_MEDIA_MARKER") or "remote-media")
+MEDIA_MARKER_RE = re.compile(r"\[" + re.escape(MEDIA_MARKER_TAG) + r":([^\]]*)\]")
+HS_MEDIA_TOKEN = os.environ.get("REMOTE_MEDIA_HS_TOKEN") or ""
+# The homeserver token is attached ONLY to media URLs on this exact origin
+# (scheme+host+port). Without it configured, Matrix media URLs are never
+# credentialed — a bare "/_matrix/" substring must not route a bearer to an
+# arbitrary host (review 2026-07-03).
+HS_MEDIA_ORIGIN = (os.environ.get("REMOTE_MEDIA_HS_ORIGIN") or "").rstrip("/")
+MEDIA_DIR = Path(os.environ.get("REMOTE_MEDIA_DIR") or str(_STATE / "remote-media"))
+MAX_MEDIA_BYTES = int(os.environ.get("REMOTE_MEDIA_MAX_BYTES") or str(25 * 1024 * 1024))
+_EXT_BY_MIME = {
+    "image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg",
+    "image/gif": ".gif", "image/webp": ".webp", "image/svg+xml": ".svg",
+    "application/pdf": ".pdf",
+}
+
+# Bridges-as-siblings: discord/telegram/slack bridges write
+# `state/last-owner-activity.json` whenever the owner messages them, so the
+# proactive-loop's "active engagement" gate knows a conversation is live. The
+# gateway transport should feed the same gate — but only when THIS node treats
+# gateway traffic as owner traffic (LOCAL_TIER, never the gateway's claim).
+OWNER_ACTIVITY_FILE = _STATE / "last-owner-activity.json"  # sutando-only; harmless if unused
+
+
+# Blocker (review 2026-06-13): the gateway is untrusted, so a task `id` flows
+# into filesystem paths (task write + result read-back/POST). Reject anything
+# that isn't a plain slug — kills path traversal in both directions.
+_TID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+def _valid_tid(tid: str) -> bool:
+    return bool(_TID_RE.fullmatch(tid)) and tid not in (".", "..")
+
+
+def _one_line(value) -> str:
+    """Header-safe single-line value: CR/LF stripped so a gateway-controlled
+    field can't inject extra `key: value` lines (e.g. forge a second
+    access_tier). Applied to every field — task content is single-line in
+    practice and a stray newline only ever indicates an injection attempt."""
+    return str(value).replace("\r", " ").replace("\n", " ")
+
+
+def _log(msg: str) -> None:
+    print(f"[remote-gateway-bridge] {msg}", flush=True)
+
+
+def _req(method: str, path: str, payload: dict | None = None, timeout: int = 35):
+    """One authenticated HTTP request. Returns parsed JSON (or {} for empty)."""
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(f"{URL}{path}", data=data, method=method)
+    req.add_header("Authorization", f"Bearer {TOKEN}")
+    req.add_header("Accept", "application/json")
+    # CloudFlare bot-fight (error 1010) rejects python-urllib's default
+    # User-Agent with a 403; send an explicit client UA so the gateway's edge
+    # lets the long-poll through. (Same fix the other gateway callers carry.)
+    req.add_header("User-Agent", "sutando-gateway-client/1.0")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode().strip()
+        return json.loads(raw) if raw else {}
+
+
+def _post_task_ack(tid: str) -> bool:
+    """Tell the gateway a task made it safely into the local queue."""
+    global _ack_disabled
+    if _ack_disabled or not _valid_tid(tid):
+        return False
+    try:
+        safe_tid = urllib.parse.quote(tid, safe="")
+        _req("POST", f"/v1/tasks/{safe_tid}/ack", {"id": tid}, timeout=10)
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code in (404, 405):
+            _ack_disabled = True
+            _log("gateway does not support task ack — continuing without")
+            return False
+        if e.code in (401, 403):
+            raise
+        _log(f"task ack failed for {tid}: HTTP {e.code} — gateway may redeliver")
+        return False
+    except (urllib.error.URLError, TimeoutError) as e:
+        _log(f"task ack network error for {tid}: {e} — gateway may redeliver")
+        return False
+
+
+_CORE_STEP_MAX = 500
+
+
+def _core_str(v) -> str | None:
+    """A core-status field → bounded non-empty str, or None. core-status.json is
+    written by another process and may be malformed; a non-string field must not
+    be forwarded (the broker calls .lower() on it)."""
+    if not isinstance(v, str):
+        return None
+    v = v.strip()
+    return v[:_CORE_STEP_MAX] if v else None
+
+
+def _read_core_status() -> tuple[str | None, str | None]:
+    """Read this node's core-status.json → (status, step) for the presence layer.
+    core-status is written by the proactive loop / task handlers (status =
+    running|idle, step = human 'what it's doing'). The broker derives the agent's
+    presence badge from it.
+
+    MUST NOT raise: this runs in the main loop BEFORE the /v1/tasks poll, so an
+    exception here would back the loop off and stall task delivery — a malformed
+    presence side-channel must never become a delivery blocker. So we guard the
+    JSON shape (a valid-JSON non-object would AttributeError on .get) and coerce
+    every field to a bounded str-or-None; any surprise → (None, None) and the
+    heartbeat still fires as a plain liveness ping."""
+    try:
+        with open(_STATE / "core-status.json") as f:
+            cs = json.load(f)
+        if not isinstance(cs, dict):
+            return (None, None)
+        status = _core_str(cs.get("status"))
+        step = _core_str(cs.get("step"))
+        # An idle status carries no meaningful step — send status only so the
+        # sweep reads 'available' rather than stale 'what it was last doing'.
+        return (status, None if status == "idle" else step)
+    except Exception:  # noqa: BLE001 — best-effort; never stall the main loop
+        return (None, None)
+
+
+def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
+    """Best-effort liveness + core-status ping. Liveness feeds hosted dashboards;
+    the status/step feed the broker's presence sweep (agent working/available/…)."""
+    global _heartbeat_disabled, _last_heartbeat_at
+    if _heartbeat_disabled:
+        return False
+    now = time.time()
+    if not force and now - _last_heartbeat_at < HEARTBEAT_INTERVAL:
+        return False
+    _last_heartbeat_at = now
+    _status, _step = _read_core_status()
+    try:
+        payload = {
+            "client": "sutando-gateway-client",
+            "protocol_version": 1,
+            "provider": PROVIDER,
+            "tier": LOCAL_TIER,
+            "inflight": len(inflight),
+            "capabilities": ["task-ack", "heartbeat", "result-skip-markers",
+                             "core-status"],
+        }
+        # Only include when present so a status-less node never clobbers the
+        # broker's last-known core-status (the broker only records on presence).
+        if _status is not None:
+            payload["status"] = _status
+        if _step is not None:
+            payload["step"] = _step
+        _req("POST", "/v1/heartbeat", payload, timeout=10)
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code in (404, 405):
+            _heartbeat_disabled = True
+            _log("gateway does not support heartbeat — continuing without")
+            return False
+        if e.code in (401, 403):
+            raise
+        _log(f"heartbeat failed: HTTP {e.code} — continuing")
+        return False
+    except (urllib.error.URLError, TimeoutError) as e:
+        _log(f"heartbeat network error: {e} — continuing")
+        return False
+
+
+def _marker_attr(attrs: str, key: str) -> str:
+    """Pull a `key=value` (value = non-space run) out of the marker attr tail."""
+    m = re.search(rf"\b{re.escape(key)}=([^\s\]]+)", attrs)
+    return m.group(1) if m else ""
+
+
+def _to_authed_media_url(url: str) -> str:
+    """Upgrade a legacy unauthenticated Matrix media route to the MSC3916
+    authenticated client route (Matrix v1.11+). Leaves other URLs untouched.
+      /_matrix/media/(r0|v3)/download/<server>/<id>
+        → /_matrix/client/v1/media/download/<server>/<id>"""
+    return re.sub(r"/_matrix/media/(?:r0|v3)/download/",
+                  "/_matrix/client/v1/media/download/", url, count=1)
+
+
+def _same_origin(url: str, base: str) -> bool:
+    """True iff `url` shares scheme+host+port with `base` (exact origin match —
+    parsed, never string-prefix: `https://relay.example.evil` must NOT match
+    a base of `https://relay.example`). Whole body is guarded: `.port` raises
+    ValueError at ACCESS time for a malformed port (`https://h:bad/`), and a
+    gateway-controlled URL must never crash task intake — malformed ⇒ False."""
+    try:
+        u, b = urllib.parse.urlsplit(url), urllib.parse.urlsplit(base)
+        if not u.scheme or not u.hostname or u.scheme != b.scheme:
+            return False
+        default = {"https": 443, "http": 80}.get(u.scheme)
+        return (u.hostname.lower() == (b.hostname or "").lower()
+                and (u.port or default) == (b.port or default))
+    except ValueError:
+        return False
+
+
+def _under_gateway(url: str) -> bool:
+    """True iff `url` is genuinely gateway-hosted: exact gateway origin AND the
+    path sits at/under the gateway base path with a real `/` boundary (so a
+    base path of `/relay` doesn't match `/relay-evil/...`). Malformed ⇒ False."""
+    if not URL or not _same_origin(url, URL):
+        return False
+    try:
+        base_path = urllib.parse.urlsplit(URL).path.rstrip("/")
+        path = urllib.parse.urlsplit(url).path
+    except ValueError:
+        return False
+    return path == base_path or path.startswith(base_path + "/")
+
+
+def _download_bytes(url: str, headers: dict, cap: int) -> bytes:
+    """GET raw bytes with an explicit size cap (reads cap+1 then rejects if
+    over, so a missing/lying Content-Length can't OOM us). When an
+    Authorization header is present, redirects are NOT followed — a
+    gateway-controlled URL must not bounce our bearer to another host — and a
+    3xx is treated as a FAILURE (raise) so the redirect page's body is never
+    saved as if it were the media."""
+    req = urllib.request.Request(url, method="GET")
+    for k, v in headers.items():
+        req.add_header(k, v)
+    if "Authorization" in headers:
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a, **kw):  # noqa: D401
+                return None
+        opener = urllib.request.build_opener(_NoRedirect)
+        resp_ctx = opener.open(req, timeout=30)
+    else:
+        resp_ctx = urllib.request.urlopen(req, timeout=30)
+    with resp_ctx as resp:
+        status = getattr(resp, "status", 200)
+        if 300 <= status < 400:
+            raise ValueError(f"authenticated media fetch got a redirect ({status})")
+        data = resp.read(cap + 1)
+    if len(data) > cap:
+        raise ValueError(f"media exceeds {cap}-byte cap")
+    return data
+
+
+def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
+    """If `body` carries a media marker, download the attachment to a local
+    file and rewrite the marker to `[File attached: <path>]`. Returns the body
+    unchanged on any failure (drop-in safe).
+
+    When `_refs_out` is provided and a fetch succeeds, the corresponding
+    `AttachmentRef` (interaction-model 4D, step 1.5) is appended to it — so
+    _write_task can stamp structured `attachments:` headers alongside the legacy
+    body line, without disturbing any of the drop-in-safe early returns."""
+    m = MEDIA_MARKER_RE.search(body or "")
+    if not m:
+        return body
+    inner = m.group(1).strip()
+    if not inner:
+        return body
+    parts = inner.split(None, 1)
+    url = parts[0]
+    attrs = parts[1] if len(parts) > 1 else ""
+    mime = _marker_attr(attrs, "mime")
+    name = _marker_attr(attrs, "name")
+    kind = _marker_attr(attrs, "kind")
+
+    if not url.startswith(("https://", "http://")):
+        return body
+    headers = {"User-Agent": "sutando-gateway-client/1.0"}
+    # Credential routing is by PARSED exact origin, never string prefix or
+    # substring — `https://relay.example.evil/...` must not receive the
+    # gateway bearer, and a foreign host serving a `/_matrix/` path must not
+    # receive the homeserver bearer (review 2026-07-03).
+    try:
+        _split = urllib.parse.urlsplit(url)
+        _ = _split.port                    # raises ValueError on a malformed port
+        url_path = _split.path
+    except ValueError:
+        return body                        # unparseable URL — leave marker untouched
+    if _under_gateway(url):
+        headers["Authorization"] = f"Bearer {TOKEN}"            # gateway media-proxy
+    elif url_path.startswith("/_matrix/"):
+        if not HS_MEDIA_TOKEN or not HS_MEDIA_ORIGIN or not _same_origin(url, HS_MEDIA_ORIGIN):
+            return body                    # can't auth safely — leave marker
+        url = _to_authed_media_url(url)
+        headers["Authorization"] = f"Bearer {HS_MEDIA_TOKEN}"
+    # else: a plain public URL — fetched with no credentials.
+
+    try:
+        data = _download_bytes(url, headers, MAX_MEDIA_BYTES)
+    except Exception as e:  # noqa: BLE001 — drop-in safe
+        _log(f"media fetch failed ({e}) — leaving marker as-is")
+        return body
+    try:
+        MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+        ext = _EXT_BY_MIME.get(mime.lower(), "")
+        if not ext and "." in name:
+            ext = "." + re.sub(r"[^A-Za-z0-9]", "", name.rsplit(".", 1)[1])[:8]
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", name) or "attachment"
+        if ext and safe.endswith(ext):
+            safe = safe[: -len(ext)]
+        # Exclusive create (mkstemp) — two same-name saves in the same
+        # millisecond must get distinct paths, never overwrite (review
+        # 2026-07-03).
+        fd, path_str = tempfile.mkstemp(prefix=f"{safe}-", suffix=ext, dir=MEDIA_DIR)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        path = Path(path_str)
+    except Exception as e:  # noqa: BLE001
+        _log(f"media save failed ({e}) — leaving marker as-is")
+        return body
+    _log(f"fetched media → {path} ({len(data)} bytes)")
+    if _refs_out is not None:
+        _refs_out.append(local_task_protocol.AttachmentRef(
+            locator=str(path), mime=mime, filename=(name or path.name), size=len(data)))
+    label = "Photo attached" if str(kind) == "m.image" else "File attached"
+    # Replacement as a FUNCTION so backslashes/`\g<>` in the path can never be
+    # interpreted as re.sub group references.
+    return MEDIA_MARKER_RE.sub(lambda _m: f"[{label}: {path}]", body, count=1)
+
+
+def _write_owner_activity(task: dict) -> None:
+    """Record that the owner was active on this transport right now — but only
+    when THIS node grants gateway traffic owner tier (LOCAL_TIER, never the
+    gateway's own claim; the gateway is outside the trust boundary). Atomic write
+    via tmp+rename; same schema (`ts`, `channel`, `summary`) as
+    discord-bridge.write_owner_activity so the proactive-loop reader is
+    transport-agnostic. Best-effort — never blocks task intake."""
+    if LOCAL_TIER != "owner":
+        return
+    try:
+        OWNER_ACTIVITY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # Strip a bracket prefix a gateway may add (e.g. "[Provider @user] body").
+        body = (task.get("task") or "").lstrip()
+        if body.startswith("[") and "]" in body:
+            body = body[body.index("]") + 1:].lstrip()
+        payload = {
+            "ts": int(time.time()),
+            "channel": task.get("source") or PROVIDER,
+            "summary": body[:80],
+        }
+        # Propagate the routable room id so the core-supervisor relay can escalate
+        # BACK into the AG2Space room the owner was last active in (resolve_active_
+        # target requires both `channel` and `channel_id`; without this it degrades
+        # to macOS-only for the gateway surface). Only when present — keeps the
+        # discord-bridge schema compatible for non-message activity.
+        _cid = str(task.get("channel_id") or "").strip()
+        if _cid:
+            payload["channel_id"] = _cid
+        tmp = OWNER_ACTIVITY_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload))
+        tmp.rename(OWNER_ACTIVITY_FILE)
+    except Exception as e:  # noqa: BLE001
+        _log(f"owner-activity write failed: {e}")
+
+
+def _write_task(task: dict) -> str | None:
+    """Serialize a gateway task into tasks/task-<id>.txt (same schema as bridges).
+    Returns the task id, or None if it has no id / already present."""
+    tid = str(task.get("id") or "").strip()
+    if not tid:
+        _log("dropping task with no id")
+        return None
+    if not _valid_tid(tid):
+        _log(f"dropping task with unsafe id {tid!r}")
+        return None
+    dest = TASKS_DIR / f"{tid}.txt"
+    # Idempotent: don't re-write a task already queued, claimed, or archived.
+    if dest.exists() or any(TASKS_DIR.glob(f"{tid}.claimed-*")):
+        return tid
+    # Relay redelivery of already-handled work: on reconnect the gateway replays
+    # its unacked pool, including tasks this node long since processed (the
+    # 2026-06-30 and 2026-07-01 500-task floods). If the core already archived
+    # the task file, or the result was already delivered and archived, don't
+    # re-queue — drop a [no-send] result instead so the normal result drain
+    # re-acks it upstream and clears it from inflight.
+    _task_archive = TASKS_DIR / "archive"
+    task_archived = (
+        # legacy flat layout: tasks/archive/<taskId>.txt
+        (_task_archive / f"{tid}.txt").exists()
+        # active month-partitioned layout: tasks/archive/YYYY-MM/<taskId>.txt
+        # (see src/task-bridge.ts). Glob one level of month subdirs for this
+        # exact task id — cheap (one stat per month dir, not a full tree walk).
+        or next(_task_archive.glob(f"*/{tid}.txt"), None) is not None
+    )
+    if (task_archived
+            or (ARCHIVE_RESULTS_DIR / f"{tid}.txt").exists()
+            or next(ARCHIVE_RESULTS_DIR.glob(f"{tid}-[0-9]*.txt"), None)):
+        rfile = RESULTS_DIR / f"{tid}.txt"
+        if not rfile.exists():
+            RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+            rfile.write_text("[no-send] gateway redelivery of already-handled task\n")
+        _log(f"dedup: {tid} already handled — not re-queued")
+        return tid
+    TASKS_DIR.mkdir(parents=True, exist_ok=True)
+    lines = []
+    for f in _TASK_FIELDS:
+        if f == "source":
+            lines.append(f"source: {_one_line(task.get('source') or PROVIDER)}")
+        elif f == "interaction_type":
+            # Pass through when the gateway sends it; default to "message" —
+            # all current gateway traffic is Matrix room messages. Whitelisted:
+            # the gateway is outside the trust boundary, so an unknown value
+            # degrades to the default instead of landing verbatim in the file.
+            it = str(task.get("interaction_type") or "")
+            if it not in _INTERACTION_TYPES:
+                it = "message"
+            lines.append(f"interaction_type: {it}")
+        elif f == "task" and task.get("task") not in (None, ""):
+            # Resolve an inbound media marker to a local file the core can read.
+            _media_refs: list = []
+            _fetched = _maybe_fetch_media(str(task["task"]), _media_refs)
+            lines.append(f"task: {_one_line(_fetched)}")
+            # interaction-model 4D, step 1.5: if a media marker was fetched,
+            # stamp structured attachments[]/content_modalities/media_form
+            # alongside the legacy [File attached:] body line (dual-write) via the
+            # shared local_task_protocol helper — same shape the 3 message bridges
+            # emit. has_text = caption present beyond the provider prefix + marker.
+            if _media_refs:
+                _txt = re.sub(r"\[(?:File|Photo) attached: [^\]]*\]", "", _fetched).strip()
+                if _txt.startswith("[") and "]" in _txt:
+                    _txt = _txt.split("]", 1)[1]
+                _mh = local_task_protocol.media_attachment_headers(_media_refs, bool(_txt.strip()))
+                if _mh:
+                    lines.extend(_mh.rstrip("\n").split("\n"))
+        elif f == "platform_card":
+            # Signed platform-metadata pointer: re-serialize only the expected
+            # subkeys as one compact JSON line (dict repr or extra keys never
+            # reach the file). json.dumps escapes newlines, so the value can't
+            # forge a header line even without _one_line.
+            pc = task.get("platform_card")
+            if isinstance(pc, dict) and all(k in pc for k in _PLATFORM_CARD_KEYS):
+                card = {k: str(pc[k]) for k in _PLATFORM_CARD_KEYS}
+                lines.append(f"platform_card: {json.dumps(card, separators=(',', ':'))}")
+        elif f in task and task[f] not in (None, ""):
+            lines.append(f"{f}: {_one_line(task[f])}")
+    # (This used to note that a gateway-written trust signal was dropped for
+    # lack of end-to-end support. platform_card above is that signal, done
+    # properly: KNOWN_HEADER_KEYS vocabulary + guard defang + a verifying
+    # consumer in skills/agent-room-ops/verify_platform_card.py.)
+    # access_tier is a LOCAL decision and written LAST so it wins even under a
+    # last-occurrence parser; every other field is newline-stripped so none can
+    # forge an earlier one either.
+    lines.append(f"access_tier: {LOCAL_TIER}")
+    tmp = dest.with_suffix(".txt.tmp")
+    tmp.write_text("\n".join(lines) + "\n")
+    tmp.rename(dest)  # atomic publish so the watcher never sees a partial file
+    _log(f"queued {tid}")
+    _record_task_room(tid, str(task.get("channel_id") or ""))
+    # Bridges-as-siblings: feed the proactive-loop's active-engagement gate.
+    _write_owner_activity(task)
+    return tid
+
+
+def _load_task_rooms() -> dict[str, str]:
+    """Restore the {task id → room id} sidecar map (fail-open to empty)."""
+    try:
+        data = json.loads(TASK_ROOMS_FILE.read_text())
+        return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:  # noqa: BLE001
+        _log(f"task-rooms file unreadable ({e}) — starting empty")
+        return {}
+
+
+def _save_task_rooms(rooms: dict[str, str]) -> None:
+    """Atomically persist the task→room map. Best-effort (never blocks the loop)."""
+    try:
+        TASK_ROOMS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = TASK_ROOMS_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(rooms, sort_keys=True))
+        tmp.rename(TASK_ROOMS_FILE)
+    except Exception as e:  # noqa: BLE001
+        _log(f"task-rooms persist failed ({e}) — continuing")
+
+
+def _record_task_room(tid: str, room: str) -> None:
+    if not room:
+        return
+    rooms = _load_task_rooms()
+    if rooms.get(tid) != room:
+        rooms[tid] = room
+        _save_task_rooms(rooms)
+
+
+def _forget_task_room(tid: str) -> None:
+    rooms = _load_task_rooms()
+    if tid in rooms:
+        rooms.pop(tid)
+        _save_task_rooms(rooms)
+
+
+def _upload_attachment(room: str, path_str: str) -> tuple[bool, str]:
+    """Upload one allowlisted local file to the task's room via the gateway
+    media endpoint. Returns (ok, reason)."""
+    fpath = os.path.realpath(os.path.expanduser(path_str.strip()))
+    if not is_path_sendable(fpath):
+        return False, "path not allowlisted"
+    try:
+        size = os.path.getsize(fpath)
+    except OSError as e:
+        return False, f"stat failed: {e}"
+    if size > MAX_MEDIA_BYTES:
+        return False, f"file exceeds {MAX_MEDIA_BYTES} bytes"
+    try:
+        with open(fpath, "rb") as f:
+            content_b64 = base64.b64encode(f.read()).decode("ascii")
+    except OSError as e:
+        return False, f"read failed: {e}"
+    safe_room = urllib.parse.quote(room, safe="")
+    try:
+        _req("POST", f"/v1/rooms/{safe_room}/media",
+             {"filename": os.path.basename(fpath), "content_b64": content_b64},
+             timeout=60)
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}"
+    except (urllib.error.URLError, TimeoutError) as e:
+        return False, f"network error: {e}"
+    return True, ""
+
+
+def _archive_result(path: Path, tid: str) -> None:
+    ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        path.rename(ARCHIVE_RESULTS_DIR / f"{tid}-{int(time.time())}.txt")
+    except OSError:
+        path.unlink(missing_ok=True)
+    # The delivered task's queue file comes along too — otherwise served tasks
+    # sit in tasks/ forever and the health-check counts them as a stuck queue.
+    # find_task_file resolves the ACTUAL filename: bare `<tid>.txt` or the
+    # claimed variant `<tid>.claimed-core-N.txt` the core renames to while
+    # processing (review catch: probing only the bare name left claimed files
+    # behind, and health-check counts every top-level tasks/*.txt). Archived
+    # under the bare name — the shape _write_task's redelivery dedup checks.
+    tfile = find_task_file(TASKS_DIR, tid)
+    if tfile is not None:
+        archive_dir = TASKS_DIR / "archive"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            tfile.rename(archive_dir / f"{tid}.txt")
+        except OSError:
+            pass  # best-effort; core may have archived it concurrently
+
+
+def _load_inflight() -> set[str]:
+    """Restore the in-flight set from disk (fail-open to empty)."""
+    try:
+        data = json.loads(INFLIGHT_FILE.read_text())
+        return {str(t) for t in data} if isinstance(data, list) else set()
+    except FileNotFoundError:
+        return set()
+    except Exception as e:  # noqa: BLE001
+        _log(f"inflight file unreadable ({e}) — starting empty")
+        return set()
+
+
+def _save_inflight(inflight: set[str]) -> None:
+    """Atomically persist the in-flight set. Best-effort (never blocks the loop)."""
+    try:
+        INFLIGHT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = INFLIGHT_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(sorted(inflight)))
+        tmp.rename(INFLIGHT_FILE)
+    except Exception as e:  # noqa: BLE001
+        _log(f"inflight persist failed ({e}) — continuing")
+
+
+# (tid, path) pairs already uploaded this process — result-POST retry guard.
+_uploaded_attachments: set[tuple[str, str]] = set()
+
+
+def _post_ready_results(inflight: set[str]) -> None:
+    """For each in-flight task, if its result file exists, POST it + archive."""
+    changed = False
+    for tid in list(inflight):
+        if not _valid_tid(tid):  # defense-in-depth: never read an unsafe path
+            inflight.discard(tid); changed = True
+            continue
+        rfile = RESULTS_DIR / f"{tid}.txt"
+        if not rfile.exists():
+            continue
+        body = rfile.read_text().strip()
+        # Route marker decisions through the unified parser (#873) like the
+        # other bridges — no hand-rolled startswith checks.
+        parsed = parse_markers(body)
+        skip = next((a for a in parsed.actions if a.kind == "skip"), None)
+        if skip:
+            # [no-send]/[REPLIED]/[deduped:] mean "no user-facing reply":
+            # archive without POSTing (match the other bridges' semantics).
+            _archive_result(rfile, tid)
+            inflight.discard(tid)
+            _forget_task_room(tid)
+            changed = True
+            _log(f"archived {tid} (marker {skip.value}, not sent)")
+            continue
+        out_body = parsed.body
+        redirect = next((a for a in parsed.actions if a.kind == "redirect"), None)
+        if redirect:
+            # Cross-room redirect is handled GATEWAY-side for this transport —
+            # re-stitch the marker the parser stripped so the server still
+            # sees it as the first line.
+            out_body = f"[channel: {redirect.value}]\n{out_body}"
+        attaches = [a.value for a in parsed.actions if a.kind == "attach"]
+        if attaches:
+            room = _load_task_rooms().get(tid, "")
+            sent = 0
+            for fp in attaches:
+                # Uploads happen before the result POST (so failures can be
+                # annotated in-band); if that POST then fails and this loop
+                # retries, don't re-upload the same file into the room.
+                if (tid, fp) in _uploaded_attachments:
+                    sent += 1
+                    continue
+                ok, reason = (_upload_attachment(room, fp) if room
+                              else (False, "origin room unknown"))
+                if ok:
+                    sent += 1
+                    _uploaded_attachments.add((tid, fp))
+                    _log(f"attached {fp} to {room} for {tid}")
+                else:
+                    # Keep the information in-band rather than dropping the
+                    # file silently — mirrors the other bridges' rejection UX.
+                    out_body += f"\n[attachment not sent: {fp} ({reason})]"
+                    _log(f"attachment skipped for {tid}: {fp} ({reason})")
+            if not out_body.strip() and sent:
+                out_body = "(file attached)"
+        try:
+            _req("POST", "/v1/results", {"id": tid, "body": out_body})
+        except urllib.error.HTTPError as e:
+            _log(f"result POST failed for {tid}: HTTP {e.code} — will retry")
+            continue
+        except (urllib.error.URLError, TimeoutError) as e:
+            _log(f"result POST network error for {tid}: {e} — will retry")
+            continue
+        _archive_result(rfile, tid)
+        inflight.discard(tid)
+        _forget_task_room(tid)
+        changed = True
+        _log(f"delivered result for {tid}")
+    if changed:
+        _save_inflight(inflight)
+
+
+def _reconcile_abandoned(inflight: set[str], suspects: set[str]) -> set[str]:
+    """Drop in-flight ids that can never complete through this loop: the task
+    file is no longer pending in tasks/ AND no result file is waiting. That
+    combination means the task was completed elsewhere (a concurrent core
+    racing the same workspace, a manual sweep to tasks/processed/, or history
+    from before a restart) — this client will never see a result to POST, so
+    the id would otherwise strand in the ledger forever. Stranded ids inflate
+    the heartbeat's `inflight` count monotonically until the broker's presence
+    sweep marks the agent unassignable (observed 2026-07-09: 175 stranded ids,
+    0 with any pending work).
+
+    Two consecutive sightings are required before dropping (`suspects` carries
+    the previous pass's candidates): a result landing between the task-file
+    check and the discard is then picked up by the next `_post_ready_results`
+    instead of being raced. Returns the new suspects set for the next pass."""
+    gone = {tid for tid in inflight
+            if _valid_tid(tid)
+            and not (TASKS_DIR / f"{tid}.txt").exists()
+            and not any(TASKS_DIR.glob(f"{tid}.claimed-*"))
+            and not (RESULTS_DIR / f"{tid}.txt").exists()}
+    confirmed = gone & suspects
+    if confirmed:
+        for tid in sorted(confirmed):
+            inflight.discard(tid)
+            _log(f"dropped abandoned in-flight id {tid} (no task/result file — completed elsewhere)")
+        _save_inflight(inflight)
+    return gone - confirmed
+
+
+def main() -> None:
+    if not URL or not TOKEN:
+        sys.exit("FATAL: set REMOTE_TASK_TOKEN (and REMOTE_TASK_URL if your token is a bare secret).")
+    inflight: set[str] = _load_inflight()
+    abandoned_suspects: set[str] = set()
+    _log(f"starting — gateway={URL} provider={PROVIDER} tasks={TASKS_DIR} "
+         f"(restored {len(inflight)} in-flight)")
+    backoff = 1
+    while True:
+        try:
+            _post_heartbeat(inflight)
+            resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}", timeout=POLL_WAIT + 10)
+            added = False
+            pending_ack = []
+            for task in resp.get("tasks", []):
+                tid = _write_task(task)
+                if tid:
+                    if tid not in inflight:
+                        inflight.add(tid)
+                        added = True
+                    pending_ack.append(tid)
+            if added:
+                _save_inflight(inflight)
+            # Ack only after both the task file and local in-flight state are
+            # durable, so a crash after ack does not strand the eventual result.
+            for tid in pending_ack:
+                _post_task_ack(tid)
+            _post_ready_results(inflight)
+            abandoned_suspects = _reconcile_abandoned(inflight, abandoned_suspects)
+            _post_heartbeat(inflight)
+            backoff = 1  # healthy round-trip → reset backoff
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                sys.exit(f"FATAL: gateway auth rejected (HTTP {e.code}) — check REMOTE_TASK_TOKEN.")
+            _log(f"poll HTTP {e.code} — backing off {backoff}s")
+            time.sleep(backoff); backoff = min(backoff * 2, 60)
+        except (urllib.error.URLError, TimeoutError) as e:
+            _log(f"poll network error: {e} — backing off {backoff}s")
+            time.sleep(backoff); backoff = min(backoff * 2, 60)
+        except Exception as e:  # noqa: BLE001 — keep the loop alive
+            _log(f"unexpected: {e} — backing off {backoff}s")
+            time.sleep(backoff); backoff = min(backoff * 2, 60)
+
+
+if __name__ == "__main__":
+    main()

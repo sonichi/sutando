@@ -89,6 +89,13 @@ def write_beat(status: str = "running") -> None:
         "started_at": _STARTED_AT,
         "last_beat_at": time.time(),
         "status": status,
+        # The tmux socket THIS core actually runs on. Recorded here — in the
+        # core's own environment — so it is the authoritative, runtime-authored
+        # answer to "which socket?" for readers that cannot reconstruct the
+        # launch env (e.g. `sutando-config.sh runtime` invoked by the desktop
+        # app, whose ambient SUTANDO_TMUX_SOCKET points at a *different* bundled
+        # socket). Mirrors start-cli.sh's resolution exactly.
+        "socket": os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock"),
         "schema_version": 1,
     }
     tmp = target.with_suffix(".alive.tmp")
@@ -146,6 +153,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.once:
         write_beat(status=args.status)
         return 0
+    # Anonymous, opt-out product telemetry: one event per real core boot so
+    # maintainers can count active installs (OSS + desktop). No-op when opted
+    # out or no key is configured. Never blocks; see src/telemetry.py + TELEMETRY.md.
+    try:  # pragma: no cover — fire-and-forget glue; telemetry logic tested in tests/telemetry.test.py
+        from telemetry import capture  # sibling module (src/ already on sys.path)
+
+        capture("core_started", {"interval_s": args.interval})
+    except Exception:  # pragma: no cover — telemetry must never break the core
+        pass
     return run_forever(interval=args.interval, status=args.status)
 
 

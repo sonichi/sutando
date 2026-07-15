@@ -4,6 +4,16 @@ below mirror the "Before opening any PR" section there. If you haven't run
 them, please do — it saves a lot of round-trips.
 -->
 
+## Priority
+
+<!-- Add one of the labels below to this PR (Labels → gear icon in the sidebar). -->
+<!-- priority: high — blocks a release, security fix, or another PR's merge -->
+<!-- priority: medium — meaningful improvement, should land this week -->
+<!-- priority: low — nice-to-have, no deadline pressure -->
+
+**Level:** <!-- high / medium / low -->
+**Reason:** <!-- one line — why this urgency? e.g. "blocks v2 cutover", "requested by external contributor", "cleanup with no urgency" -->
+
 ## Closes
 
 <!-- e.g. closes #123. Leave empty if this isn't tied to an issue. -->

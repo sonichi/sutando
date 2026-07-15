@@ -28,6 +28,10 @@ deliberately added to the allowlist.
 """
 
 import re
+import sys as _sys
+from pathlib import Path as _P
+_sys.path.insert(0, str(_P(__file__).resolve().parent.parent / "src"))
+import local_task_protocol as _ltp
 import sys
 import tempfile
 from pathlib import Path
@@ -59,8 +63,10 @@ def _build_helper_namespace(tmpdir: Path, task_files: dict):
 
     const_src = _extract(r"DM_FALLBACK_SOURCES = \{[^}]*\}")
     func_src = _extract(r"def _task_source\(task_id: str\):.*?(?=^\n\n|\Z)")
-    ns = {"find_task_file": stub_find_task_file, "TASKS_DIR": tmpdir, "Path": Path}
-    exec(const_src + "\n\n" + func_src, ns)
+    elig_src = _extract(r"def _dm_fallback_eligible\(task_id: str\).*?(?=^\n\n|\Z)")
+    ns = {"find_task_file": stub_find_task_file, "TASKS_DIR": tmpdir, "Path": Path,
+          "local_task_protocol": _ltp}
+    exec(const_src + "\n\n" + func_src + "\n\n" + elig_src, ns)
     return ns
 
 
@@ -80,8 +86,10 @@ def _build_helper_namespace_with_archive(tmpdir: Path, active: dict, archived: d
 
     const_src = _extract(r"DM_FALLBACK_SOURCES = \{[^}]*\}")
     func_src = _extract(r"def _task_source\(task_id: str\):.*?(?=^\n\n|\Z)")
-    ns = {"find_task_file": stub_find_task_file, "TASKS_DIR": tmpdir, "Path": Path, "sorted": sorted}
-    exec(const_src + "\n\n" + func_src, ns)
+    elig_src = _extract(r"def _dm_fallback_eligible\(task_id: str\).*?(?=^\n\n|\Z)")
+    ns = {"find_task_file": stub_find_task_file, "TASKS_DIR": tmpdir, "Path": Path, "sorted": sorted,
+          "local_task_protocol": _ltp}
+    exec(const_src + "\n\n" + func_src + "\n\n" + elig_src, ns)
     return ns
 
 
@@ -102,8 +110,9 @@ def test_allowlist_is_positive_voice_phone_only():
 
 def test_gate_is_wired_into_poll_dm_fallback():
     body = _poll_dm_fallback_body()
-    assert "DM_FALLBACK_SOURCES" in body, "fallback must consult the allowlist"
-    assert "_task_source" in body, "fallback must look up the task source"
+    assert "_dm_fallback_eligible" in body, (
+        "fallback must consult the shared eligibility decision"
+    )
     assert 'task_id.startswith("task-")' in body, (
         "gate must scope to task- results so question-/briefing-/insight-/"
         "friction- cron artifacts stay eligible"
@@ -122,10 +131,10 @@ def test_gate_precedes_grace_window():
 # ---------------------------------------------------------------------------
 
 def _eligible(ns, task_id) -> bool:
-    """Replicate the fallback's decision: a task- result is DM-eligible iff
-    its source is None (missing) or in the allowlist."""
-    src = ns["_task_source"](task_id)
-    return src is None or src in ns["DM_FALLBACK_SOURCES"]
+    """Execute the REAL production decision (_dm_fallback_eligible, extracted
+    and exec'd from discord-bridge.py in the namespace) — not a replica, so a
+    regression in the production function fails this test."""
+    return ns["_dm_fallback_eligible"](task_id)
 
 
 def test_voice_result_is_eligible():
@@ -171,18 +180,20 @@ def test_discord_and_telegram_results_are_not_eligible():
         assert _eligible(ns, "task-t") is False
 
 
-def test_missing_source_fails_open_to_eligible():
-    """No source field, or no task file at all → eligible, preserving the
-    original never-silently-lose-a-result posture."""
+def test_missing_source_fails_closed_to_not_eligible():
+    """FAIL-CLOSED (#1854 follow-up): no source field, or no task file at
+    all → NOT eligible. The earlier fail-open posture let a result whose
+    task file was swept/unreadable DM regardless of its true origin —
+    that's the residual leak path the post-merge audit flagged."""
     with tempfile.TemporaryDirectory() as d:
         ns = _build_helper_namespace(Path(d), {
             "task-nosrc": "id: task-nosrc\ntask: legacy\n",
         })
         assert ns["_task_source"]("task-nosrc") is None
-        assert _eligible(ns, "task-nosrc") is True
+        assert _eligible(ns, "task-nosrc") is False
         # missing file entirely
         assert ns["_task_source"]("task-ghost") is None
-        assert _eligible(ns, "task-ghost") is True
+        assert _eligible(ns, "task-ghost") is False
 
 
 def test_source_match_is_case_insensitive():
