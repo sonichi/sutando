@@ -91,6 +91,7 @@ For research tasks, be specific about what you're doing:
 ```
 
 For a Slack @mention (threaded reply), add `--thread-ts <ts>` to keep the update in-thread.
+For a Telegram message from a forum topic, add `--thread-id <id>` to keep the update in-topic.
 
 Mid-task checkpoint update:
 ```bash
@@ -109,6 +110,7 @@ python3 $CLAUDE_CONFIG_DIR/skills/task-progress/scripts/notify.py \
 | telegram  | `chat_id:`          | `--chat-id`     |
 
 Optional for Slack @mentions: `reply_thread_ts:` → `--thread-ts`
+Optional for Telegram forum topics: `message_thread_id:` → `--thread-id`
 
 ## Supported channels
 

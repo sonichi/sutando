@@ -391,7 +391,7 @@ def download_file(file_id, name_hint="file"):
         print(f"  Download failed: {e}")
         return None
 
-def send_file(chat_id, file_path, caption=""):
+def send_file(chat_id, file_path, caption="", message_thread_id=None):
     """Send a file via Telegram multipart upload."""
     import mimetypes
     mime = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
@@ -414,6 +414,9 @@ def send_file(chat_id, file_path, caption=""):
     body += b"\r\n"
     # chat_id part
     body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n".encode()
+    # message_thread_id part — keeps file deliveries inside the originating forum topic
+    if message_thread_id:
+        body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"message_thread_id\"\r\n\r\n{message_thread_id}\r\n".encode()
     # caption part
     if caption:
         body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n{caption}\r\n".encode()
@@ -428,8 +431,12 @@ def send_file(chat_id, file_path, caption=""):
         print(f"  Send file failed: {e}")
         return {"ok": False}
 
-def send_reply(chat_id, text, task_id: str | None = None) -> dict:
+def send_reply(chat_id, text, task_id: str | None = None, message_thread_id=None) -> dict:
     """Send a reply's text + any [file:]-marked attachments.
+
+    ``message_thread_id``, when set, keeps the reply inside the forum topic
+    the originating task arrived from (Telegram parity with Slack's
+    thread_ts routing — see pending_replies in main()).
 
     Returns a delivery summary ``{"text_chunks", "files_sent", "ok"}`` so the
     caller can emit ONE accurate channel.telegram.out event. api()/send_file()
@@ -449,7 +456,10 @@ def send_reply(chat_id, text, task_id: str | None = None) -> dict:
     # Send text (if any remains after extracting file refs)
     if clean_text:
         for i in range(0, len(clean_text), 4000):
-            resp = api("sendMessage", chat_id=chat_id, text=clean_text[i:i+4000])
+            kwargs = {"chat_id": chat_id, "text": clean_text[i:i+4000]}
+            if message_thread_id:
+                kwargs["message_thread_id"] = message_thread_id
+            resp = api("sendMessage", **kwargs)
             if not (isinstance(resp, dict) and resp.get("ok")):
                 delivered_ok = False
         try:
@@ -467,7 +477,7 @@ def send_reply(chat_id, text, task_id: str | None = None) -> dict:
     for fpath in files:
         fpath = fpath.strip()
         if _is_path_sendable(fpath):
-            resp = send_file(chat_id, fpath)
+            resp = send_file(chat_id, fpath, message_thread_id=message_thread_id)
             if isinstance(resp, dict) and resp.get("ok"):
                 files_sent += 1
                 print(f"  Sent file: {fpath}", flush=True)
@@ -475,7 +485,10 @@ def send_reply(chat_id, text, task_id: str | None = None) -> dict:
                 delivered_ok = False
                 print(f"  Send file failed: {fpath}", flush=True)
         elif os.path.isfile(fpath):
-            api("sendMessage", chat_id=chat_id, text=f"(file access denied: {fpath})")
+            _blocked_kwargs = {"chat_id": chat_id, "text": f"(file access denied: {fpath})"}
+            if message_thread_id:
+                _blocked_kwargs["message_thread_id"] = message_thread_id
+            api("sendMessage", **_blocked_kwargs)
             print(f"  BLOCKED file: {fpath}")
         else:
             # Prose-quoted `[file:/path]` substrings extract as markers
@@ -549,7 +562,8 @@ def poll_progress(pending_replies: dict) -> None:
     if not progress_stream.stream_enabled():
         return
     now = time.time()
-    for task_id, chat_id in list(pending_replies.items()):
+    for task_id, _dest in list(pending_replies.items()):
+        chat_id, message_thread_id = _dest if isinstance(_dest, tuple) else (_dest, None)
         done = (RESULTS_DIR / f"{task_id}.txt").exists()
         info = _progress_msgs.get(task_id)
         if info is not None:
@@ -592,7 +606,10 @@ def poll_progress(pending_replies: dict) -> None:
         if progress_stream.should_post_placeholder(now - created):
             step = progress_stream.current_step(progress_stream.read_core_status(STATE_DIR))
             text = progress_stream.format_progress(step, now - created)
-            resp = api("sendMessage", chat_id=chat_id, text=text)
+            _ph_kwargs = {"chat_id": chat_id, "text": text}
+            if message_thread_id:
+                _ph_kwargs["message_thread_id"] = message_thread_id
+            resp = api("sendMessage", **_ph_kwargs)
             mid = (resp or {}).get("result", {}).get("message_id")
             if mid:
                 _progress_msgs[task_id] = {
@@ -640,7 +657,7 @@ def main():  # pragma: no cover
 
     offset = None
     allowed = load_allowed()
-    pending_replies = {}  # task_id -> chat_id
+    pending_replies = {}  # task_id -> (chat_id, message_thread_id | None)
 
     heartbeat_file = REPO / "state" / "telegram-bridge.heartbeat"
     last_heartbeat = 0
@@ -692,6 +709,10 @@ def main():  # pragma: no cover
                 sender_id = str(msg["from"]["id"])
                 username = msg["from"].get("username", sender_id)
                 chat_id = msg["chat"]["id"]
+                # Forum-topic messages carry message_thread_id on the message
+                # itself (Bot API). Absent for normal chats/DMs and for the
+                # "General" topic in a forum (Telegram omits it there).
+                message_thread_id = msg.get("message_thread_id")
                 text = msg.get("text", "")
 
                 # Reload access list periodically
@@ -859,6 +880,7 @@ def main():  # pragma: no cover
                     notify_cmd = (
                         f"python3 {_notify_py}"
                         f" --source telegram --chat-id {chat_id}"
+                        + (f" --thread-id {message_thread_id}" if message_thread_id else "")
                     )
                     if has_audio_attach:
                         lines.append(f'{step}. NOTIFY FIRST: {notify_cmd} --message "Got your voice message, give me a moment."')
@@ -885,13 +907,14 @@ def main():  # pragma: no cover
                     f"interaction_type: message\n"
                     f"{media_headers}"
                     f"chat_id: {chat_id}\n"
-                    f"{src_line}"
+                    + (f"message_thread_id: {message_thread_id}\n" if message_thread_id else "")
+                    + f"{src_line}"
                     f"{parent_line}"
                     f"priority: {priority}\n"
                     f"task: {confine_user_content(f'[Telegram @{username}{forward_note}] {text}{attachment_note}{reply_note}')}\n"
                     f"{tg_skill_hints}"
                 )
-                pending_replies[task_id] = chat_id
+                pending_replies[task_id] = (chat_id, message_thread_id)
                 pending_task_tiers[task_id] = "owner"  # telegram is owner-only (allowlist-gated); enables progress streaming
                 # Observability: one inbound accepted-message event. Source the
                 # tier from the bridge's own assignment above (single source of
@@ -1017,7 +1040,8 @@ def main():  # pragma: no cover
             result_file = RESULTS_DIR / f"{task_id}.txt"
             if result_file.exists():
                 reply_text = result_file.read_text().strip()
-                chat_id = pending_replies.pop(task_id)
+                _dest = pending_replies.pop(task_id)
+                chat_id, message_thread_id = _dest if isinstance(_dest, tuple) else (_dest, None)
                 # Parse markers via the unified module (#873). Telegram
                 # honors [no-send] / [REPLIED] / [deduped: <id>] as skip,
                 # sends attached files, and silently drops [channel:] redirects
@@ -1036,14 +1060,14 @@ def main():  # pragma: no cover
                     # File attachments are in parsed.actions; send_reply() won't re-find them,
                     # so send them here and fold the result into ONE obs event below.
                     _tier = pending_task_tiers.get(task_id, "unknown")
-                    _s = send_reply(chat_id, parsed.body, task_id=task_id)
+                    _s = send_reply(chat_id, parsed.body, task_id=task_id, message_thread_id=message_thread_id)
                     delivered_ok = _s["ok"]
                     sent_files = _s["files_sent"]
                     for action in parsed.actions:
                         if action.kind == "attach":
                             fpath = action.value.strip()
                             if _is_path_sendable(fpath):
-                                resp = send_file(chat_id, fpath)
+                                resp = send_file(chat_id, fpath, message_thread_id=message_thread_id)
                                 if isinstance(resp, dict) and resp.get("ok"):
                                     sent_files += 1
                                     print(f"  Sent file: {fpath}", flush=True)
@@ -1051,7 +1075,10 @@ def main():  # pragma: no cover
                                     delivered_ok = False
                                     print(f"  Send file failed: {fpath}", flush=True)
                             elif os.path.isfile(fpath):
-                                api("sendMessage", chat_id=chat_id, text=f"(file access denied: {fpath})")
+                                _blocked_kwargs = {"chat_id": chat_id, "text": f"(file access denied: {fpath})"}
+                                if message_thread_id:
+                                    _blocked_kwargs["message_thread_id"] = message_thread_id
+                                api("sendMessage", **_blocked_kwargs)
                                 print(f"  BLOCKED file: {fpath}")
                             else:
                                 print(f"  file marker, file not found — likely a prose quotation: {fpath}", flush=True)

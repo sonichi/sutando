@@ -76,9 +76,9 @@ class TestTelegramBridgeReplyParsedBody(unittest.TestCase):
             "pending_replies block must check action.kind == 'attach' after send_reply()",
         )
         self.assertIn(
-            "send_file(chat_id, fpath)",
+            "send_file(chat_id, fpath",
             block,
-            "pending_replies block must call send_file(chat_id, fpath) for attach actions",
+            "pending_replies block must call send_file(chat_id, fpath, ...) for attach actions",
         )
 
     def test_attach_action_loop_follows_send_reply(self):

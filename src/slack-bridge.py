@@ -605,7 +605,8 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
             notify_cmd = (
                 f"python3 {_notify_py}"
                 f" --source slack --channel-id {channel}"
-                f' --message "On it — back in a moment."'
+                + (f" --thread-ts {thread_ts}" if thread_ts else "")
+                + f' --message "On it — back in a moment."'
             )
             hints_lines.append(f"{step}. NOTIFY FIRST: {notify_cmd}")
             step += 1
@@ -637,7 +638,8 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         f"interaction_type: message\n"
         f"{media_headers}"
         f"channel_id: {channel}\n"
-        f"user_id: {user_id}\n"
+        + (f"thread_ts: {thread_ts}\n" if thread_ts else "")
+        + f"user_id: {user_id}\n"
         f"access_tier: {access_tier}\n"
         f"priority: {priority}\n"
         f"task: {user_task_text}\n"

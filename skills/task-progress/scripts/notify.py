@@ -6,6 +6,7 @@ Usage:
     python3 notify.py --source slack --channel-id D0B5L7X2TK2 --thread-ts 1780586204.198 --message "Still working..."
     python3 notify.py --source discord --channel-id 1234567890 --message "Working on it..."
     python3 notify.py --source telegram --chat-id 123456789 --message "On it..."
+    python3 notify.py --source telegram --chat-id 123456789 --thread-id 42 --message "Still working..."
     python3 notify.py --source <provider> --channel-id '!roomid:server' --message "On it..."
 
 Any --source other than slack/discord/telegram is treated as a remote-gateway
@@ -126,14 +127,17 @@ def send_discord(channel_id: str, message: str) -> bool:
     )
 
 
-def send_telegram(chat_id: str, message: str) -> bool:
+def send_telegram(chat_id: str, message: str, message_thread_id: str | None = None) -> bool:
     token = _token("telegram", "TELEGRAM_BOT_TOKEN")
     if not token:
         print("[task-progress] TELEGRAM_BOT_TOKEN not found", file=sys.stderr)
         return False
+    payload = {"chat_id": chat_id, "text": message}
+    if message_thread_id:
+        payload["message_thread_id"] = message_thread_id
     return _post(
         f"https://api.telegram.org/bot{token}/sendMessage",
-        {"chat_id": chat_id, "text": message},
+        payload,
         {},
     )
 
@@ -209,6 +213,8 @@ def main() -> int:
     parser.add_argument("--chat-id", help="Telegram chat ID (alias for --channel-id on telegram)")
     parser.add_argument("--thread-ts", default=None,
                         help="Slack thread timestamp for threaded replies")
+    parser.add_argument("--thread-id", default=None,
+                        help="Telegram forum message_thread_id for threaded replies")
     parser.add_argument("--message", required=True, help="Text to send")
     args = parser.parse_args()
 
@@ -235,7 +241,7 @@ def main() -> int:
     elif source == "discord":
         ok = send_discord(channel, message)
     elif source == "telegram":
-        ok = send_telegram(channel, message)
+        ok = send_telegram(channel, message, message_thread_id=args.thread_id)
     else:
         ok = send_remote_gateway(source, channel, message)
 
