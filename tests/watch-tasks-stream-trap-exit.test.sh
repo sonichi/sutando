@@ -10,9 +10,8 @@
 # alive; only `kill -9` actually stopped it. Fix: HUP/INT/TERM now explicitly
 # `exit 0` after cleanup.
 #
-# Not run under CI yet (`.test.sh` isn't currently wired into
-# .github/workflows/ci.yml — a pre-existing gap, out of scope here); run
-# manually via `bash tests/watch-tasks-stream-trap-exit.test.sh`.
+# Runs under CI (the shell-standalone-tests step) and manually via
+# `bash tests/watch-tasks-stream-trap-exit.test.sh`.
 
 set -u -m
 # `-m` (job control) gives the backgrounded harness its own process group, so
@@ -57,23 +56,28 @@ if [ ! -f "$PID_FILE" ]; then
   echo "  FAIL: harness never wrote its PID file — setup broken"
   fail=1
 else
-  # Bounded wait, not a bare blocking `wait` — if the fix regresses, the
-  # harness never exits on its own and `wait` would hang the test forever.
-  # A watchdog force-kills it after 3s so `wait` always returns; elapsed
-  # time then tells us whether the PLAIN kill (not the watchdog's SIGKILL)
-  # is what actually stopped it. `wait` (true reap) also avoids the
-  # zombie false negative a bare `kill -0` would give immediately after
-  # a successful plain kill.
-  ( sleep 3; kill -9 "$HARNESS_PID" 2>/dev/null ) &
+  # Poll for death rather than inferring it from a single elapsed-time
+  # window: $SECONDS has 1s granularity and a scheduler-contended CI
+  # runner can legitimately take longer than a quiet local box to reap a
+  # process, so a fixed "elapsed < Ns" check risked a false FAIL under
+  # load without indicating the fix itself is broken. Track explicitly
+  # whether SIGKILL was needed via a sentinel the watchdog writes right
+  # before firing — that's the actual thing under test, not a timing proxy
+  # for it. Generous 8s poll window before the watchdog's SIGKILL; still
+  # correctly fails if the plain SIGTERM is truly never honored.
+  NEEDED_SIGKILL="$TMPDIR_T/needed-sigkill"
+  ( sleep 8; touch "$NEEDED_SIGKILL"; kill -9 "$HARNESS_PID" 2>/dev/null ) &
   WATCHDOG_PID=$!
-  start_ts=$SECONDS
   kill "$HARNESS_PID" 2>/dev/null
+  for _ in $(seq 1 80); do  # 8s @ 100ms
+    kill -0 "$HARNESS_PID" 2>/dev/null || break
+    sleep 0.1
+  done
   wait "$HARNESS_PID" 2>/dev/null
-  elapsed=$((SECONDS - start_ts))
   kill "$WATCHDOG_PID" 2>/dev/null
   wait "$WATCHDOG_PID" 2>/dev/null
 
-  if [ "$elapsed" -lt 3 ]; then
+  if [ ! -f "$NEEDED_SIGKILL" ]; then
     echo "  PASS: watcher terminated on plain SIGTERM"
   else
     echo "  FAIL: watcher still alive after plain SIGTERM — needed SIGKILL (pid $HARNESS_PID)"
