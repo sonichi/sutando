@@ -109,12 +109,17 @@ def get_waiting_questions():
             if not (status.startswith('unanswered') or status.startswith('waiting')):
                 continue  # explicitly resolved/done/answered — skip
         # No status field, or status is unanswered/waiting → notify.
-        # Capture first non-empty, non-strikethrough body line as a one-line
-        # action hint so notifications tell the user what to do, not just that
-        # something is waiting (avoids "what do I do with this?" confusion).
+        # Capture first non-empty, non-strikethrough, non-status-metadata body
+        # line as a one-line action hint so notifications tell the user what
+        # to do, not just that something is waiting (avoids "what do I do
+        # with this?" confusion). Status metadata is skipped too — a section
+        # whose **Status:** line comes before the narrative text would
+        # otherwise DM "**Status:** unanswered" as the "action hint", which
+        # tells the user nothing they don't already know from the ping itself.
         snippet_lines = [
             l.strip() for l in body.strip().splitlines()
             if l.strip() and not l.strip().startswith('~~')
+            and not re.match(r'^(\*\*)?Status:(\*\*)?', l.strip(), re.IGNORECASE)
         ]
         snippet = snippet_lines[0][:120] if snippet_lines else ""
         questions.append({"id": title[:40], "title": title, "snippet": snippet})

@@ -66,6 +66,21 @@ ok("strikethrough skipped → first real line is snippet",
    len(qs) == 1 and "Actual action" in qs[0].get("snippet", ""),
    f"got snippet: {qs[0].get('snippet') if qs else 'N/A'}")
 
+# 2b. Regression for reviewer finding (liususan091219, 2026-07-12): a section
+# whose **Status:** line comes before the narrative text must not DM the
+# status marker itself as the "action hint" — that tells the user nothing.
+qs = questions_for(
+    "## needs a decision\n"
+    "**Status:** unanswered\n"
+    "Pick option A or B before Thursday.\n"
+)
+ok("status line skipped → first real line is snippet",
+   len(qs) == 1 and qs[0].get("snippet", "") == "Pick option A or B before Thursday.",
+   f"got snippet: {qs[0].get('snippet') if qs else 'N/A'}")
+ok("status line never appears as the snippet",
+   len(qs) == 1 and "Status" not in qs[0].get("snippet", ""),
+   f"got snippet: {qs[0].get('snippet') if qs else 'N/A'}")
+
 # 3. Section with no body → snippet is empty string, not missing
 qs = questions_for("## [no-body] empty section\n\n")
 ok("empty body → snippet is empty string",
