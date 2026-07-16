@@ -621,13 +621,16 @@ else
   echo "  ✓ voice agent (already running)"
 fi
 
-# 1b. Call-tier advertisement (one-shot): write state/call-tiers.json so the
-# runtime descriptor advertises which DIRECT call endpoints are reachable now
-# (Track 9 availability-driven call-tier menu). Backgrounded — it probes tailscale
-# with its own short timeout and never blocks the rest of startup; absent file
-# just means the descriptor advertises no direct tiers (client falls back to cloud).
-npx tsx src/emit-call-tiers.ts > "$LOGS_DIR/emit-call-tiers.log" 2>&1 &
-echo "  ✓ call-tiers advertisement"
+# 1b. Call-tier advertisement (resident, re-emitting): write state/call-tiers.json
+# so the runtime descriptor advertises which DIRECT call endpoints are reachable
+# now (Track 9 availability-driven call-tier menu). Backgrounded — it probes
+# tailscale with its own short timeout and never blocks the rest of startup;
+# absent file just means the descriptor advertises no direct tiers (client falls
+# back to cloud). `--interval 60` keeps it resident and re-emits every 60s so the
+# advertisement tracks reachability changes AFTER boot (tailnet/VPN coming up
+# post-startup would otherwise leave Direct(Tailscale) greyed until a restart).
+npx tsx src/emit-call-tiers.ts --interval 60 > "$LOGS_DIR/emit-call-tiers.log" 2>&1 &
+echo "  ✓ call-tiers advertisement (re-emit 60s)"
 
 # 2. Web client (port 8080)
 reap_wedged_listener 8080 web-client
