@@ -75,6 +75,30 @@ for f in dist/*.js; do
                   || echo "  ✓ start $name (reached a startup/config gate; rc=$rc)"
 done
 
+# Positive bind assertion for web-client (design: wu-air's verify-services exit
+# test). web-client is the one service that binds a fixed port (:8080) with ZERO
+# env/secrets — so CI can confirm it doesn't just "stay alive" but actually
+# SERVES. Stronger than the generic still-running check for this entrypoint.
+if [ -f dist/web-client.js ]; then
+  echo "── web-client positive bind (:8080, zero-env) ──"
+  node dist/web-client.js >/tmp/wc-smoke.log 2>&1 &
+  wc_pid=$!
+  bound=0
+  for _ in $(seq 1 20); do
+    if curl -sf -o /dev/null http://localhost:8080/ 2>/dev/null; then bound=1; break; fi
+    kill -0 "$wc_pid" 2>/dev/null || break   # process died — stop polling
+    sleep 0.5
+  done
+  kill "$wc_pid" 2>/dev/null || true; wait "$wc_pid" 2>/dev/null || true
+  if [ "$bound" = 1 ]; then
+    echo "  ✓ web-client served :8080 under plain node (no env)"
+  else
+    echo "  ✗ SMOKE FAIL: web-client did not serve :8080 within 10s"
+    tail -8 /tmp/wc-smoke.log | sed 's/^/    /'
+    fail=1
+  fi
+fi
+
 if [ "$fail" -ne 0 ]; then
   echo "bundle smoke FAILED — an artifact breaks at load. A dependency or dynamic import likely can't be bundled."
   exit 1
