@@ -257,5 +257,78 @@ class TestBridgeHelperSymlinkResolve(unittest.TestCase):
             self.assertTrue(mock_run.called, "subprocess.run never called — skill path not resolved")
 
 
+class TestRealModuleResolveLineCoverage(unittest.TestCase):
+    """Exercises the ACTUAL `_transcribe_via_skill` line in the real modules
+    (not the extracted-and-exec'd copy `_load_bridge_helper`/
+    `_build_symlink_ns` use above) — those helpers deliberately avoid
+    importing the full bridge module (heavy top-level deps), which means
+    coverage.py never sees the real file's `Path(os.path.realpath(__file__))`
+    line execute. This class imports the real modules directly so that line
+    gets real coverage credit, same call as the tests above."""
+
+    def test_telegram_bridge_real_module(self):
+        """telegram-bridge.py has no hard import-time dependency on a live
+        token (see tests/telegram-writeside-attachments.test.py), so it can
+        be imported directly."""
+        os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token-not-real")
+        spec = importlib.util.spec_from_file_location(
+            "telegrambridge_realcov", REPO / "src" / "telegram-bridge.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        mock_result = MagicMock(returncode=0, stdout="resolved via real module\n")
+        with patch("subprocess.run", return_value=mock_result):
+            result = mod._transcribe_via_skill("/tmp/voice.ogg")
+        self.assertEqual(result, "resolved via real module")
+
+    def test_slack_bridge_real_module(self):
+        """slack-bridge.py's module-level `App(token=BOT_TOKEN)` hits the
+        real Slack API at import time and raises without a valid token —
+        stub slack_bolt the same way tests/slack-bridge-chunking.test.py
+        does so the import is hermetic."""
+
+        class _RecordingClient:
+            def chat_postMessage(self, **kwargs):
+                return {"ok": True}
+
+            def files_upload_v2(self, **kwargs):
+                return {"ok": True}
+
+        class _FakeApp:
+            def __init__(self, token=None):
+                self.client = _RecordingClient()
+
+            def _decorator(self, *a, **k):
+                return lambda fn: fn
+
+            event = message = command = action = shortcut = view = _decorator
+
+        _bolt = types.ModuleType("slack_bolt")
+        _bolt.App = _FakeApp
+        _adapter = types.ModuleType("slack_bolt.adapter")
+        _socket = types.ModuleType("slack_bolt.adapter.socket_mode")
+        _socket.SocketModeHandler = type(
+            "SocketModeHandler", (), {"__init__": lambda self, *a, **k: None})
+        with patch.dict(sys.modules, {
+            "slack_bolt": _bolt,
+            "slack_bolt.adapter": _adapter,
+            "slack_bolt.adapter.socket_mode": _socket,
+        }), tempfile.TemporaryDirectory() as tmp_ws, patch.dict(os.environ, {
+            "SUTANDO_WORKSPACE": tmp_ws,
+            "SUTANDO_TEST_MODE": "1",
+            "SLACK_BOT_TOKEN": "xoxb-test-not-real",
+            "SLACK_APP_TOKEN": "xapp-test-not-real",
+        }):
+            spec = importlib.util.spec_from_file_location(
+                "slackbridge_realcov", REPO / "src" / "slack-bridge.py")
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+
+            mock_result = MagicMock(returncode=0, stdout="resolved via real module\n")
+            with patch("subprocess.run", return_value=mock_result):
+                result = mod._transcribe_via_skill("/tmp/voice.m4a")
+            self.assertEqual(result, "resolved via real module")
+
+
 if __name__ == "__main__":
     unittest.main()
