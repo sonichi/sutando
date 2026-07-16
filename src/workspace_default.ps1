@@ -16,7 +16,7 @@
 #
 # NOTE: $SUTANDO_WORKSPACE is intentionally NOT honored. It was dropped as a
 # workspace override in v0.8 / #1440; the resolver ignores its value (it only
-# fires a one-time deprecation warning when set). The pre-M0 ~/.sutando/workspace
+# fires a one-time deprecation warning when set). The pre-M0 home-directory
 # default is gone for the same reason — readers/writers that still target it land
 # in a directory no service watches.
 
