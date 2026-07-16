@@ -155,8 +155,16 @@ class TestHeartbeatCli(unittest.TestCase):
         # SUTANDO_TEST_MODE: post-v0.8 the resolver ignores $SUTANDO_WORKSPACE
         # unless this test-only escape hatch is set (mirrors line 30 in the
         # in-process fixture above — the subprocess env doesn't inherit it).
+        # Pin SUTANDO_HOST_LABEL into the SUBPROCESS env for the same reason as
+        # the in-process fixture (line 36): the child's _host_label() prefers
+        # scutil LocalHostName on macOS, so without this the child writes
+        # `<scutil-label>.alive` while these tests assert `<short-host>.alive`
+        # — the #1745 drift, and both CLI cases fail locally. CI/Linux (no
+        # scutil) matched already; this makes the subprocess path deterministic
+        # on drifting hosts too.
         self.env = {**os.environ, "SUTANDO_WORKSPACE": str(self.tmp),
-                    "SUTANDO_TEST_MODE": "1"}
+                    "SUTANDO_TEST_MODE": "1",
+                    "SUTANDO_HOST_LABEL": _short_host()}
 
     def tearDown(self):
         import shutil
