@@ -18,10 +18,12 @@
 
 import { readFileSync, writeFileSync, unlinkSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { execFile } from 'node:child_process';
+import { join, dirname } from 'node:path';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createServer, type Server } from 'node:http';
+import { connect } from 'node:net';
+import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace, statusPath } from './workspace_default.js';
@@ -51,9 +53,62 @@ export interface VisionSource {
 	capture(): Promise<VisionFrame>;
 }
 
+// --- screen-capture-server (:7845) lazy start ----------------------------
+// The screen source grabs frames from the screen-capture-server on :7845. That
+// server is launched by startup.sh (the OSS menu-bar path) — but NOT by
+// start-cli.sh, which is how the bundled desktop app (ag2-space/ag2space-cinny-
+// desktop) launches the core. So in the bundled app the Watch toggle hit a dead
+// :7845 (connection refused) and silently did nothing, even with Screen Recording
+// granted. Rather than depend on every launch path remembering to start :7845,
+// the vision pipeline starts it ON DEMAND here: self-healing, works identically
+// in the OSS app and the bundled Tauri app. (First-run macOS Screen Recording
+// prompting via CGRequestScreenCaptureAccess is a documented follow-up — this
+// change unblocks the already-granted case and stops the silent failure.)
+const SCREEN_CAPTURE_PORT = 7845;
+let _screenCaptureStarting: Promise<void> | null = null;
+
+function _portListening(port: number): Promise<boolean> {
+	return new Promise((resolve) => {
+		const sock = connect({ host: '127.0.0.1', port });
+		const done = (up: boolean) => {
+			sock.destroy();
+			resolve(up);
+		};
+		sock.once('connect', () => done(true));
+		sock.once('error', () => done(false));
+		sock.setTimeout(600, () => done(false));
+	});
+}
+
+/** Ensure the screen-capture-server is up on :7845, spawning it if absent.
+ *  Reuses a running server (startup.sh's, or a prior lazy spawn); memoizes the
+ *  in-flight spawn so concurrent captures don't double-start it. */
+export async function ensureScreenCaptureServer(): Promise<void> {
+	if (await _portListening(SCREEN_CAPTURE_PORT)) return;
+	if (_screenCaptureStarting) return _screenCaptureStarting;
+	_screenCaptureStarting = (async () => {
+		// screen-capture-server.py sits next to this module in src/.
+		const script = join(dirname(fileURLToPath(import.meta.url)), 'screen-capture-server.py');
+		const child = spawn('python3', [script], { detached: true, stdio: 'ignore' });
+		child.unref();
+		for (let i = 0; i < 40; i++) {
+			if (await _portListening(SCREEN_CAPTURE_PORT)) return;
+			await new Promise((r) => setTimeout(r, 200));
+		}
+		throw new Error('screen-capture-server did not come up on :7845 within 8s');
+	})().catch((err) => {
+		_screenCaptureStarting = null; // reset so a later capture retries the spawn
+		throw err;
+	});
+	return _screenCaptureStarting;
+}
+
 const screenSource: VisionSource = {
 	name: 'screen',
 	async capture() {
+		// Self-healing: bring up the screen-capture-server if the current launch
+		// path (e.g. the bundled desktop app's start-cli.sh) didn't start it.
+		await ensureScreenCaptureServer();
 		// silent=true skips the menu-bar flash + macOS notification, which would
 		// otherwise fire on every frame during a stream. format=jpeg keeps
 		// frames small (~50–150KB).
