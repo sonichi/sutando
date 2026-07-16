@@ -127,13 +127,19 @@ class StructuralGuardTest(unittest.TestCase):
 # Layer 2: behavioral — extract the real lines, run them against a real file
 # ---------------------------------------------------------------------------
 
-def _extract_race_guard_snippet(src: str) -> str:
+def _extract_race_guard_snippet(src: str) -> tuple[str, int]:
     """Pull `reply_text = result_file.read_text().strip()` through the end of
     the `if not reply_text: continue` block, out of the REAL source — not a
-    hand-copied reimplementation, so this breaks if the fix regresses."""
+    hand-copied reimplementation, so this breaks if the fix regresses.
+
+    Returns (snippet, start_line) — start_line (1-indexed) lets the caller
+    compile the snippet with its TRUE line numbers in the source file, so
+    coverage.py attributes execution back to the real file/lines instead of
+    an anonymous exec namespace."""
     read_pat = re.compile(r"^(\s*)reply_text\s*=\s*result_file\.read_text\(\)\.strip\(\)\s*$", re.MULTILINE)
     m = read_pat.search(src)
     assert m, "reply_text = result_file.read_text().strip() not found in source"
+    start_line = src.count("\n", 0, m.start()) + 1
     indent = m.group(1)
     lines = src[m.start():].splitlines()
     # First line is the read; keep consuming until we've captured the
@@ -161,7 +167,8 @@ def _extract_race_guard_snippet(src: str) -> str:
             break
         out.append(line)
         i += 1
-    return "\n".join(out) + "\n" + f"{indent}_REACHED_PAST_GUARD.append(True)\n"
+    snippet = "\n".join(out) + "\n" + f"{indent}_REACHED_PAST_GUARD.append(True)\n"
+    return snippet, start_line
 
 
 class BehavioralRaceGuardTest(unittest.TestCase):
@@ -172,28 +179,43 @@ class BehavioralRaceGuardTest(unittest.TestCase):
 
     def _run_harness(self, name: str, path: Path, file_content: str) -> bool:
         """Returns True iff the extracted guard let execution reach past it
-        (i.e. reply_text was truthy and no `continue` fired)."""
+        (i.e. reply_text was truthy and no `continue` fired).
+
+        Compiles the snippet with the REAL bridge file as its `filename` and
+        padded so its lines land at their TRUE line numbers in that file —
+        not an anonymous exec namespace — so coverage.py credits this run
+        against the actual source lines (needed for the diff-coverage gate;
+        an anonymous exec namespace is invisible to it)."""
         src = path.read_text()
-        snippet = _extract_race_guard_snippet(src)
+        snippet, start_line = _extract_race_guard_snippet(src)
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
             f.write(file_content)
             result_path = f.name
         try:
-            harness = (
-                "class _ResultFile:\n"
-                "    def __init__(self, p):\n"
-                "        self._p = p\n"
-                "    def read_text(self):\n"
-                "        with open(self._p) as fh:\n"
-                "            return fh.read()\n"
-                f"result_file = _ResultFile({result_path!r})\n"
-                "_REACHED_PAST_GUARD = []\n"
-                "for _tick in [0]:\n"
+            class _ResultFile:
+                def __init__(self, p):
+                    self._p = p
+
+                def read_text(self):
+                    with open(self._p) as fh:
+                        return fh.read()
+
+            ns: dict = {
+                "_ResultFile": _ResultFile,
+                "result_file": _ResultFile(result_path),
+                "_REACHED_PAST_GUARD": [],
+            }
+            # `for _tick in [0]:` sits on the line immediately before the
+            # snippet's true start; blank-line padding before it keeps the
+            # snippet's own lines aligned to their real file line numbers.
+            wrapped = (
+                "\n" * (start_line - 2)
+                + "for _tick in [0]:\n"
                 + "\n".join("    " + l for l in snippet.splitlines())
                 + "\n"
             )
-            ns: dict = {}
-            exec(harness, ns)  # noqa: S102 — trusted, in-repo source only
+            code = compile(wrapped, str(path), "exec")
+            exec(code, ns)  # noqa: S102 — trusted, in-repo source only
             return bool(ns["_REACHED_PAST_GUARD"])
         finally:
             Path(result_path).unlink(missing_ok=True)
