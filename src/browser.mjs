@@ -25,11 +25,15 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
-const workspace = execFileSync('bash', [join(REPO, 'scripts/sutando-config.sh'), 'workspace'], {
-  encoding: 'utf8',
-}).trim();
-const PROFILE_DIR = (process.env.SUTANDO_BROWSER_PROFILE || join(workspace, 'data/browser-profile'))
-  .replace(/^~(?=\/)/, process.env.HOME || '');
+const PROFILE_DIR = (
+  process.env.SUTANDO_BROWSER_PROFILE
+  || join(
+    execFileSync('bash', [join(REPO, 'scripts/sutando-config.sh'), 'workspace'], {
+      encoding: 'utf8',
+    }).trim(),
+    'data/browser-profile',
+  )
+).replace(/^~(?=\/)/, process.env.HOME || '');
 const command = process.argv[2];
 
 if (!command) {
