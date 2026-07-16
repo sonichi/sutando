@@ -20,6 +20,7 @@ class PersistentBrowserTests(unittest.TestCase):
             )
             self.assertEqual(result.stdout.strip(), tmp)
 
+    @unittest.skipUnless((REPO / "node_modules" / "playwright").exists(), "playwright dependency not installed")
     def test_headless_action_uses_persistent_profile(self):
         with tempfile.TemporaryDirectory() as tmp:
             profile = Path(tmp) / "profile"

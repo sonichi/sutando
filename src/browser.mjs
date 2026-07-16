@@ -17,7 +17,6 @@
  * Output goes to stdout; errors to stderr.
  */
 
-import { chromium } from 'playwright';
 import { mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
@@ -57,6 +56,7 @@ const SCREENSHOT_DIR = process.env.SUTANDO_SCREENSHOT_DIR || join(tmpdir(), 'sut
 mkdirSync(SCREENSHOT_DIR, { recursive: true });
 mkdirSync(PROFILE_DIR, { recursive: true });
 
+const { chromium } = await import('playwright');
 const context = await chromium.launchPersistentContext(PROFILE_DIR, {
   channel: 'chrome',
   headless: !headed,
