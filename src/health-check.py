@@ -521,6 +521,16 @@ def check_tcc_documents_access() -> dict:
 # Fix attempts
 # ---------------------------------------------------------------------------
 
+# Checks that are named by service but recovered via their launchd job:
+# the --fix dispatch matches names starting with "com.sutando." OR names in
+# this map (issue #1888 bug 1 — the bare names never matched the prefix
+# branch, so --fix silently skipped voice-agent/web-client).
+LAUNCHD_BACKED_CHECKS = {
+    "voice-agent": "com.sutando.voice-agent",
+    "web-client": "com.sutando.web-client",
+}
+
+
 def fix_launchd(label: str) -> str:
     """Try to reload a launchd job."""
     plist_map = {
@@ -2922,6 +2932,17 @@ def main():
                 if c["name"].startswith("com.sutando."):
                     result = fix_launchd(c["name"])
                     print(f"  {c['name']}: {result}")
+                elif c["name"] in LAUNCHD_BACKED_CHECKS:  # pragma: no cover — dispatch in untested main()
+                    # Named by service, recovered via launchd (issue #1888
+                    # bug 1: the com.sutando.* branch above never matches the
+                    # bare names, so --fix silently skipped the two most
+                    # user-visible services). fix_launchd() kickstarts (or
+                    # bootstraps) the job, which also replaces a wedged
+                    # launchd-owned listener. A rogue non-launchd port-holder
+                    # (issue #1888 bug 2, double-management) is out of scope
+                    # here — the result string will say the restart failed.
+                    result = fix_launchd(LAUNCHD_BACKED_CHECKS[c["name"]])  # pragma: no cover
+                    print(f"  {c['name']}: {result}")  # pragma: no cover
                 elif c["name"] in ("telegram-bridge", "discord-bridge", "slack-bridge"):  # pragma: no cover - --fix restart path spawns real subprocesses; not unit-tested
                     # LoginFailure means the token is bad — restarting won't help
                     # and would create a duplicate alongside the launchd-managed one.
