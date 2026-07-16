@@ -628,13 +628,16 @@ else
   echo "  ✓ voice agent (already running)"
 fi
 
-# 1b. Call-tier advertisement (one-shot): write state/call-tiers.json so the
-# runtime descriptor advertises which DIRECT call endpoints are reachable now
-# (Track 9 availability-driven call-tier menu). Backgrounded — it probes tailscale
-# with its own short timeout and never blocks the rest of startup; absent file
-# just means the descriptor advertises no direct tiers (client falls back to cloud).
-npx tsx src/emit-call-tiers.ts > "$LOGS_DIR/emit-call-tiers.log" 2>&1 &
-echo "  ✓ call-tiers advertisement"
+# 1b. Call-tier advertisement (resident, re-emitting): write state/call-tiers.json
+# so the runtime descriptor advertises which DIRECT call endpoints are reachable
+# now (Track 9 availability-driven call-tier menu). Backgrounded — it probes
+# tailscale with its own short timeout and never blocks the rest of startup;
+# absent file just means the descriptor advertises no direct tiers (client falls
+# back to cloud). `--interval 60` keeps it resident and re-emits every 60s so the
+# advertisement tracks reachability changes AFTER boot (tailnet/VPN coming up
+# post-startup would otherwise leave Direct(Tailscale) greyed until a restart).
+npx tsx src/emit-call-tiers.ts --interval 60 > "$LOGS_DIR/emit-call-tiers.log" 2>&1 &
+echo "  ✓ call-tiers advertisement (re-emit 60s)"
 
 # 2. Web client (port 8080)
 reap_wedged_listener 8080 web-client
@@ -713,14 +716,14 @@ if [ -d "$REPO/skills/portfolio-research" ]; then
   echo "  ✓ portfolio dashboard (port 8899)"
 fi
 
-# 5b. Sutando context drop app (global hotkey ⌃C)
+# 5b. Sutando context drop app (hotkey configurable via state/hotkeys.json)
 SUT_SRC="$REPO/src/Sutando/main.swift"
 SUT_BIN="$REPO/src/Sutando/Sutando"
 
 # Build the public ax-read CLI if missing or older than any of its source
 # files. Sutando.app's resolveAxReadPath() prefers private personal-deictic
 # when installed; this public binary is the text-only fallback so public-repo
-# users still get the ⌃C selection-drop experience.
+# users still get the context-drop experience.
 #
 # Staleness widened (per Mini's PR #907 review): trigger a rebuild when
 # Package.swift / build.sh / any *.swift under Sources/ is newer than the
@@ -734,7 +737,7 @@ if [ -n "$AXR_NEWEST_SRC" ] && { [ ! -f "$AXR_BIN" ] || [ "$AXR_NEWEST_SRC" -nt 
   echo "  Compiling public ax-read (skills/context-drop)..."
   if ! command -v swift >/dev/null 2>&1; then
     echo "  ⚠ ax-read build skipped: 'swift' not in PATH"
-    echo "    → install Xcode Command Line Tools (xcode-select --install) for ⌃C selection drops on public-repo installs"
+    echo "    → install Xcode Command Line Tools (xcode-select --install) for context drops on public-repo installs"
   elif (cd "$AXR_DIR" && bash build.sh); then
     echo "  ✓ ax-read built at $AXR_BIN"
   else
@@ -753,7 +756,7 @@ if [ -f "$SUT_SRC" ] && { [ ! -f "$SUT_BIN" ] || [ "$SUT_SRC" -nt "$SUT_BIN" ]; 
     # Sync the fresh binary into the .app bundle if one exists, ensure the
     # AppleEvents usage-description key is present, and re-sign so the
     # cdhash matches. Without NSAppleEventsUsageDescription macOS silently
-    # denies AppleEvents — getFinderSelection() returns [] and the ⌃C
+    # denies AppleEvents — getFinderSelection() returns [] and the context
     # drop handler logs "Nothing selected" with no permission prompt.
     SUT_APP="$REPO/src/Sutando/Sutando.app"
     if [ -d "$SUT_APP" ]; then
@@ -802,7 +805,7 @@ if ! pgrep -f "src/Sutando/Sutando" > /dev/null 2>&1; then
   if [ -f "$SUT_BIN" ]; then
     echo "  Starting Sutando..."
     "$SUT_BIN" > /dev/null 2>&1 &
-    echo "  ✓ Sutando (⌃C/⌃V/⌃M)"
+    echo "  ✓ Sutando (hotkeys via state/hotkeys.json)"
   else
     echo "  ⚠ Sutando binary missing — hotkeys disabled"
   fi
