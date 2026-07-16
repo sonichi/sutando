@@ -565,6 +565,22 @@ report_foreign_holder() {
   echo "    Free the port (kill the holder / stop the container), then re-run startup.sh."
 }
 
+# argv pattern per managed service — shared by the already-running guards, the
+# wedged-listener reaper, and the final verify loop, so all three agree on
+# what counts as "our service".
+verify_pattern_for() {
+  case "$1" in
+    voice-agent)         echo "voice-agent.ts" ;;
+    web-client)          echo "web-client.ts" ;;
+    dashboard)           echo "dashboard.py" ;;
+    agent-api)           echo "agent-api.py" ;;
+    screen-capture)      echo "screen-capture-server.py" ;;
+    conversation-server) echo "conversation-server.ts" ;;
+    collector)           echo "observability/boot.ts" ;;
+    *)                   echo "" ;;
+  esac
+}
+
 if ! lsof -i :7846 > /dev/null 2>&1; then
   echo "  Starting credential proxy (port 7846)..."
   npx tsx "$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)" > /tmp/credential-proxy.log 2>&1 &
@@ -621,10 +637,19 @@ fi
 # health-check.py's check_port: a cheap unknown path, NOT "/" (dashboard's "/"
 # runs health-check.py as a subprocess — probing it from here would recurse).
 reap_wedged_listener() {
-  local port="$1" name="$2" rc=0
+  local port="$1" name="$2" rc=0 pattern
   lsof -i :"$port" -sTCP:LISTEN > /dev/null 2>&1 || return 0
   curl -s -o /dev/null -m 10 "http://127.0.0.1:$port/__liveness_probe__" || rc=$?
   if [ "$rc" -eq 28 ]; then
+    # Only reap OUR wedged service. A foreign process that accepts but never
+    # answers HTTP (raw TCP, WS-only, or a hung user process) must survive —
+    # the identity-checked service branch below reports it instead of killing
+    # it (qingyun review on the port-identity PR).
+    pattern="$(verify_pattern_for "$name")"
+    if [ -n "$pattern" ] && ! port_held_by "$port" "$pattern"; then
+      echo "  ⚠ $name (port $port) unresponsive but held by another process — leaving it alone"
+      return 0
+    fi
     echo "  ⚠ $name (port $port) listening but unresponsive — killing wedged listener"
     lsof -ti :"$port" -sTCP:LISTEN | xargs kill 2>/dev/null || true
     sleep 1
@@ -1016,20 +1041,6 @@ fi
 if [ "${SUTANDO_OBS_COLLECTOR:-}" = "1" ]; then
   VERIFY_PORTS="$VERIFY_PORTS ${SUTANDO_OBS_PORT:-4000}:collector"
 fi
-# argv pattern per service — same identity check as the start guards above,
-# so a foreign port-holder fails verification instead of masquerading as ✓.
-verify_pattern_for() {
-  case "$1" in
-    voice-agent)         echo "voice-agent.ts" ;;
-    web-client)          echo "web-client.ts" ;;
-    dashboard)           echo "dashboard.py" ;;
-    agent-api)           echo "agent-api.py" ;;
-    screen-capture)      echo "screen-capture-server.py" ;;
-    conversation-server) echo "conversation-server.ts" ;;
-    collector)           echo "observability/boot.ts" ;;
-    *)                   echo "" ;;
-  esac
-}
 for port_name in $VERIFY_PORTS; do
   port="${port_name%%:*}"
   name="${port_name##*:}"
