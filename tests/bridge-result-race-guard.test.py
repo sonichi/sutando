@@ -47,8 +47,8 @@ from workspace_default import resolve_workspace  # noqa: E402
 # Prefer a live workspace copy so CI on a running instance sees the live fix;
 # fall back to the OSS repo path for upstream portability checks. Workspace
 # location is resolved through the canonical loader (never a hardcoded
-# `~/.sutando/workspace` literal — that's the pre-M0 legacy default and is
-# banned tree-wide by scripts/lint-workspace-resolution.sh).
+# legacy install-path literal — see scripts/lint-workspace-resolution.sh and
+# scripts/lint-sutando-home-path.sh for why that's banned tree-wide).
 try:
     _WORKSPACE_SRC = resolve_workspace(migrate=False) / "src"
 except Exception:
