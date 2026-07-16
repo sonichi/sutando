@@ -336,7 +336,13 @@ function updateQuotaState(headers: Record<string, string>): void {
 // Match the exact script name, NOT a substring — the offline test file is named
 // `credential-proxy-refresh.test.ts`, which contains "credential-proxy" but must
 // NOT be treated as the entry point (else importing it tries to bind the port).
-const isMain = (process.argv[1] ?? '').endsWith('credential-proxy.ts');
+// Match the exact basename — works for BOTH the dev entry (`credential-proxy.ts`
+// run via tsx) AND the bundled artifact (`dist/credential-proxy.js`), while still
+// excluding `credential-proxy-refresh.test.{ts,js}` (different basename). Using
+// endsWith('.ts') alone silently no-ops the bundle: argv[1] ends in `.js` there,
+// isMain is false, and the proxy never binds the port.
+const _entryName = (process.argv[1] ?? '').split(/[\\/]/).pop() ?? '';
+const isMain = _entryName === 'credential-proxy.ts' || _entryName === 'credential-proxy.js';
 
 if (isMain) {
 	// Verify token exists at startup
