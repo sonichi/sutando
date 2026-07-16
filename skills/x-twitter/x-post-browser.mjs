@@ -108,10 +108,17 @@ function releaseProfileLock() {
 }
 
 /** Read the on-disk cookie DB READ-ONLY (copy first to dodge the WAL/lock) and
- *  count the signed-in markers. Non-disruptive — never opens the profile, so it
- *  can run WHILE the login window is up. Cookie NAMES are cleartext even though
- *  values are keychain-encrypted, so this needs no decryption. */
-function authMarkersOnDisk() {
+ *  report whether the *authenticated* session cookie is present. Non-disruptive
+ *  — never opens the profile, so it can run WHILE the login window is up. Cookie
+ *  NAMES are cleartext even though values are keychain-encrypted, so this needs
+ *  no decryption.
+ *
+ *  Sentinel is `auth_token` ONLY — the cookie X sets exclusively after a
+ *  successful sign-in. NOT `ct0` (a CSRF token X flushes for guest/pre-auth
+ *  sessions) nor `twid` alone: keying login-completion on those false-positives
+ *  before the owner finishes the flow, killing the window early so the next
+ *  `check`/`post` sees an unsigned-in profile and exits 2 (flaky login). */
+function authTokenOnDisk() {
   const src = join(PROFILE_DIR, 'Default', 'Cookies');
   if (!existsSync(src)) return 0;
   const tmp = join(tmpdir(), `x-cookies-peek-${process.pid}.db`);
@@ -119,7 +126,7 @@ function authMarkersOnDisk() {
     copyFileSync(src, tmp);
     const n = execFileSync('sqlite3', [
       tmp,
-      "SELECT COUNT(*) FROM cookies WHERE name IN ('auth_token','ct0','twid') AND (host_key='.x.com' OR host_key='x.com');",
+      "SELECT COUNT(*) FROM cookies WHERE name = 'auth_token' AND (host_key='.x.com' OR host_key='x.com');",
     ], { encoding: 'utf8' }).trim();
     return parseInt(n, 10) || 0;
   } catch {
@@ -157,7 +164,7 @@ if (cmd === 'login') {
   const iters = parseInt(process.env.X_LOGIN_TIMEOUT_ITERS || '120', 10) || 120; // ~10min
   for (let i = 0; i < iters; i++) {
     execSync('sleep 5');
-    if (authMarkersOnDisk() >= 1 || existsSync(SENTINEL)) {
+    if (authTokenOnDisk() >= 1 || existsSync(SENTINEL)) {
       // Cookies are already flushed to disk (that's what we detected). Close the
       // GUI window so `check`/`post` can open the profile without a lock clash.
       // Killing after the on-disk flush is safe — the real-keychain cookies
