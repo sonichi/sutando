@@ -860,6 +860,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     task_history[tid]["result"] = result
                 else:
                     task_history[tid] = {"status": "done", "text": result[:80], "time": datetime.now().timestamp(), "result": result}
+                # Flush write-path mutations immediately — waiting for the next
+                # /tasks/active scan leaves a restart window that drops this
+                # completion (qingyun review on the PR).
+                save_task_history()
                 self.send_json(200, {"ok": True})
             except Exception:
                 self.send_json(400, {"error": "invalid"})
