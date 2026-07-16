@@ -116,7 +116,15 @@ shopt -u nullglob
 #   fswatch subprocess (Mode B fix — #1088). Without this, when the parent
 #   shell exits the watcher reparents to launchd (PPID=1) and runs
 #   indefinitely with no consumer, silently dropping every event.
-cleanup() { rm -f "$PID_FILE"; kill 0 2>/dev/null; }
+# - `trap '' TERM HUP INT` right before kill 0: this process IS a member of
+#   its own process group, so `kill 0` re-delivers TERM/HUP/INT to itself —
+#   while already inside a trap handler for one of those same signals. On
+#   some bash/kernel combinations that self-delivery re-enters the trap
+#   before `exit 0` runs, so the process never actually terminates on a
+#   plain signal (only `kill -9` stops it). Ignoring the signals we're about
+#   to re-send to ourselves closes that window; the process is exiting
+#   either way so nothing downstream needs to observe them again.
+cleanup() { rm -f "$PID_FILE"; trap '' TERM HUP INT; kill 0 2>/dev/null; }
 trap cleanup EXIT
 # HUP/INT/TERM must explicitly exit after cleanup — a trap only overrides the
 # signal's default disposition, it doesn't terminate the process on its own.
