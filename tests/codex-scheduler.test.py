@@ -4,6 +4,8 @@
 import importlib.util
 import json
 import plistlib
+import subprocess
+import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -43,7 +45,63 @@ def test_cron_parser():
     local = datetime(2026, 7, 15, 6, 10, tzinfo=timezone.utc)
     assert scheduler.cron_matches("*/5 6 15 7 *", local)
     assert scheduler.cron_matches("10 6 * * 3", local)
+    assert scheduler.cron_matches("10 6 16 7 3", local)
     assert not scheduler.cron_matches("11 6 * * *", local)
+
+
+def test_helpers_and_config_validation():
+    assert scheduler.repo_root() == REPO
+    assert scheduler.utc_now().tzinfo == timezone.utc
+    assert scheduler.parse_iso(None) is None
+    assert scheduler.parse_iso("not-a-date") is None
+
+    completed = subprocess.CompletedProcess([], 0, stdout="/tmp/workspace\n")
+    with mock.patch.object(scheduler.subprocess, "run", return_value=completed) as run:
+        assert scheduler.resolve_workspace(REPO) == Path("/tmp/workspace").resolve()
+        assert scheduler.resolve_host_label(REPO) == "/tmp/workspace"
+        assert run.call_count == 2
+
+    invalid_fields = [
+        ("", 0, 59),
+        ("*/0", 0, 59),
+        ("9-3", 0, 59),
+        ("60", 0, 59),
+    ]
+    for spec, minimum, maximum in invalid_fields:
+        try:
+            scheduler._field_values(spec, minimum, maximum)
+            raise AssertionError(f"expected invalid cron field: {spec!r}")
+        except ValueError:
+            pass
+    try:
+        scheduler.cron_matches("* * * *", at(6, 0))
+        raise AssertionError("expected five-field validation")
+    except ValueError:
+        pass
+
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "crons.json"
+
+        def rejects(value, message):
+            path.write_text(json.dumps(value))
+            try:
+                scheduler.load_jobs(path)
+                raise AssertionError(f"expected rejection containing {message!r}")
+            except ValueError as exc:
+                assert message in str(exc)
+
+        rejects({}, "JSON array")
+        rejects([{"execution": "codex-task", "cron": "* * * * *", "prompt": "x"}], "non-empty name")
+        rejects([
+            {"execution": "codex-task", "name": "same", "cron": "* * * * *", "prompt": "x"},
+            {"execution": "codex-task", "name": "same", "cron": "* * * * *", "prompt": "x"},
+        ], "duplicate")
+        rejects([{"execution": "codex-task", "name": "missing-cron", "prompt": "x"}], "cron is required")
+        rejects([{
+            "execution": "codex-task", "name": "bad-zone", "cron": "* * * * *",
+            "timezone": "Not/AZone", "prompt": "x",
+        }], "unknown timezone")
+        rejects([{"execution": "codex-task", "name": "missing-prompt", "cron": "* * * * *"}], "prompt or prompt_skill")
 
 
 def test_enqueue_retry_complete_and_no_duplicate():
@@ -122,14 +180,79 @@ def test_install_plist():
         assert str(ws) in plist["ProgramArguments"]
 
 
+def test_minute_slots_health_and_install_edges():
+    assert scheduler._minute_slots(at(6, 5), at(6, 0)) == [at(6, 0)]
+    capped = scheduler._minute_slots(at(0, 0) - timedelta(days=30), at(0, 0))
+    assert len(capped) == scheduler.MAX_CATCHUP_MINUTES
+    assert capped[-1] == at(0, 0)
+
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        code, report = scheduler.health(ws, "test-host", at(6, 0))
+        assert code == 1 and "no readable state" in report["problems"][0]
+
+        state_path = ws / "state" / "schedules" / "codex-scheduler.json"
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text(json.dumps({
+            "last_tick_at": scheduler.iso(at(5, 0)),
+            "jobs": {
+                "removed": {"configured": False, "last_failure_at": scheduler.iso(at(5, 1))},
+            },
+        }))
+        code, report = scheduler.health(ws, "test-host", at(6, 0))
+        assert code == 1 and report["problems"] == ["scheduler heartbeat is older than 3 minutes"]
+
+        config(ws)
+        with mock.patch.object(Path, "home", return_value=Path(td) / "home"), \
+             mock.patch.object(scheduler.subprocess, "run") as run:
+            scheduler.install(ws, "test-host", REPO)
+        assert [call.args[0][1] for call in run.call_args_list] == ["bootout", "enable", "bootstrap"]
+
+        (ws / "hosts" / "test-host" / "crons.json").write_text("[]")
+        try:
+            scheduler.install(ws, "test-host", REPO, write_only=True)
+            raise AssertionError("expected install to require an opted-in job")
+        except ValueError as exc:
+            assert "no crons.json entries" in str(exc)
+
+
+def test_main_dispatch_and_error_handling():
+    workspace = Path("/tmp/scheduler-workspace").resolve()
+    common = ["codex-scheduler.py", "--workspace", str(workspace), "--host-label", "test-host"]
+
+    with mock.patch.object(sys, "argv", [common[0], "tick", *common[1:]]), \
+         mock.patch.object(scheduler, "tick", return_value={"events": []}) as tick:
+        assert scheduler.main() == 0
+        tick.assert_called_once_with(workspace, "test-host")
+
+    with mock.patch.object(sys, "argv", [common[0], "health", *common[1:]]), \
+         mock.patch.object(scheduler, "health", return_value=(1, {"ok": False})) as health:
+        assert scheduler.main() == 1
+        health.assert_called_once_with(workspace, "test-host")
+
+    with mock.patch.object(sys, "argv", [common[0], "install", *common[1:], "--write-only"]), \
+         mock.patch.object(scheduler, "install", return_value=Path("/tmp/scheduler.plist")) as install:
+        assert scheduler.main() == 0
+        install.assert_called_once_with(workspace, "test-host", REPO, write_only=True)
+
+    with mock.patch.object(sys, "argv", ["codex-scheduler.py", "tick"]), \
+         mock.patch.object(scheduler, "resolve_workspace", return_value=workspace), \
+         mock.patch.object(scheduler, "resolve_host_label", return_value="auto-host"), \
+         mock.patch.object(scheduler, "tick", side_effect=RuntimeError("busy")):
+        assert scheduler.main() == 1
+
+
 def main():
     tests = [
         test_cron_parser,
+        test_helpers_and_config_validation,
         test_enqueue_retry_complete_and_no_duplicate,
         test_failure_alert_and_health,
         test_wake_catchup_and_timezone,
         test_prompt_cannot_forge_task_headers,
         test_install_plist,
+        test_minute_slots_health_and_install_edges,
+        test_main_dispatch_and_error_handling,
     ]
     for test in tests:
         test()
