@@ -1491,10 +1491,11 @@ def sutando_app_hotkey_detail(workspace_dir) -> str:
     app when it registers them (single source of truth since #1920). A running
     process alone doesn't prove hotkeys exist — app lineages without global
     hotkey registration (e.g. the Electron shell) match the pgrep pattern but
-    register nothing, and the pre-#1920 hardcoded "(⌃C/⌃V/⌃M)" claim here had
-    already drifted from the real defaults and read as a false positive during
-    live debugging. Missing/malformed/empty file → honest "no hotkeys
-    published" rather than a guess.
+    register nothing, and the "(⌃C/⌃V/⌃M)" default asserted here pre-#1920 had
+    already drifted from the real state/hotkeys.json values and read as a false
+    positive during live debugging (that binding is configurable, not fixed).
+    Missing/malformed/empty file → honest "no hotkeys published" rather than a
+    guess.
     """
     try:
         entries = json.loads((Path(workspace_dir) / "state" / "hotkeys.json").read_text())
