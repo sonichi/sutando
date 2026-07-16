@@ -541,6 +541,30 @@ if [ -f "$_PROXY_INSTALLER" ] && [ -f "$REPO/src/launchd/$_PROXY_LABEL.plist" ];
     fi
   fi
 fi
+# The lsof port guards in this script treat ANY listener as "our service
+# already running" — but the port can be held by an unrelated process entirely
+# (a stray `python -m http.server`, a Docker container's port-forward).
+# 2026-07-16: a deck server squatting :8080 became "✓ web client (already
+# running)", the real web client never started, and the browser got a file
+# listing instead of the voice UI. Verify the holder's argv matches the
+# expected service before claiming ✓. Deliberately no auto-kill: an
+# unrecognized holder may be the user's own process (or a Docker proxy that a
+# kill wouldn't free) — report it and let them decide.
+port_held_by() {
+  local port="$1" pattern="$2" pids
+  pids="$(lsof -ti :"$port" -sTCP:LISTEN 2>/dev/null | tr '\n' ' ')"
+  [ -n "${pids// /}" ] || return 1
+  # shellcheck disable=SC2086
+  ps -o command= -p $pids 2>/dev/null | grep -q -- "$pattern"
+}
+
+report_foreign_holder() {
+  local port="$1" name="$2"
+  echo "  ✗ $name: port $port is held by another process (not $name):"
+  lsof -i :"$port" -sTCP:LISTEN 2>/dev/null | tail -n +2 | head -3 | sed 's/^/      /'
+  echo "    Free the port (kill the holder / stop the container), then re-run startup.sh."
+}
+
 if ! lsof -i :7846 > /dev/null 2>&1; then
   echo "  Starting credential proxy (port 7846)..."
   npx tsx "$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)" > /tmp/credential-proxy.log 2>&1 &
@@ -551,9 +575,12 @@ if ! lsof -i :7846 > /dev/null 2>&1; then
   else
     echo "  ⚠ credential proxy failed — Claude will connect directly (check /tmp/credential-proxy.log)"
   fi
-else
+elif port_held_by 7846 "credential-proxy.ts"; then
   echo "  ✓ credential proxy (already running)"
   export ANTHROPIC_BASE_URL=http://localhost:7846
+else
+  report_foreign_holder 7846 "credential proxy"
+  echo "    NOT routing Claude through the unknown listener — ANTHROPIC_BASE_URL left unset."
 fi
 
 # 0b. Obs collector (OPTIONAL — opt-in via SUTANDO_OBS_COLLECTOR=1).
@@ -611,8 +638,10 @@ if ! lsof -i :9900 > /dev/null 2>&1; then
   echo "  Starting voice agent (port 9900)..."
   npx tsx src/voice-agent.ts > "$LOGS_DIR/voice-agent.log" 2>&1 &
   echo "  ✓ voice agent"
-else
+elif port_held_by 9900 "voice-agent.ts"; then
   echo "  ✓ voice agent (already running)"
+else
+  report_foreign_holder 9900 "voice agent"
 fi
 
 # 2. Web client (port 8080)
@@ -621,8 +650,10 @@ if ! lsof -i :8080 > /dev/null 2>&1; then
   echo "  Starting web client (port 8080)..."
   npx tsx src/web-client.ts > "$LOGS_DIR/web-client.log" 2>&1 &
   echo "  ✓ web client"
-else
+elif port_held_by 8080 "web-client.ts"; then
   echo "  ✓ web client (already running)"
+else
+  report_foreign_holder 8080 "web client"
 fi
 
 # 2b. Tailnet HTTPS front for browser wss:// voice reach (opt-in).
@@ -648,8 +679,10 @@ if ! lsof -i :7844 > /dev/null 2>&1; then
   echo "  Starting dashboard (port 7844)..."
   python3 src/dashboard.py > "$LOGS_DIR/dashboard.log" 2>&1 &
   echo "  ✓ dashboard"
-else
+elif port_held_by 7844 "dashboard.py"; then
   echo "  ✓ dashboard (already running)"
+else
+  report_foreign_holder 7844 "dashboard"
 fi
 
 # 4. Agent API (port 7843)
@@ -658,8 +691,10 @@ if ! lsof -i :7843 > /dev/null 2>&1; then
   echo "  Starting agent API (port 7843)..."
   python3 src/agent-api.py > "$LOGS_DIR/agent-api.log" 2>&1 &
   echo "  ✓ agent API"
-else
+elif port_held_by 7843 "agent-api.py"; then
   echo "  ✓ agent API (already running)"
+else
+  report_foreign_holder 7843 "agent API"
 fi
 
 # 5. Screen capture server (port 7845)
@@ -675,8 +710,10 @@ if ! lsof -i :7845 > /dev/null 2>&1; then
   else
     echo "  ⊘ screen capture skipped — grant Screen Recording perm first, then re-run startup.sh"
   fi
-else
+elif port_held_by 7845 "screen-capture-server.py"; then
   echo "  ✓ screen capture (already running)"
+else
+  report_foreign_holder 7845 "screen capture"
 fi
 
 # 5a-bis. Portfolio + research dashboard (port 8899) — idempotent self-guard.
@@ -979,11 +1016,30 @@ fi
 if [ "${SUTANDO_OBS_COLLECTOR:-}" = "1" ]; then
   VERIFY_PORTS="$VERIFY_PORTS ${SUTANDO_OBS_PORT:-4000}:collector"
 fi
+# argv pattern per service — same identity check as the start guards above,
+# so a foreign port-holder fails verification instead of masquerading as ✓.
+verify_pattern_for() {
+  case "$1" in
+    voice-agent)         echo "voice-agent.ts" ;;
+    web-client)          echo "web-client.ts" ;;
+    dashboard)           echo "dashboard.py" ;;
+    agent-api)           echo "agent-api.py" ;;
+    screen-capture)      echo "screen-capture-server.py" ;;
+    conversation-server) echo "conversation-server.ts" ;;
+    collector)           echo "observability/boot.ts" ;;
+    *)                   echo "" ;;
+  esac
+}
 for port_name in $VERIFY_PORTS; do
   port="${port_name%%:*}"
   name="${port_name##*:}"
   if lsof -i :"$port" > /dev/null 2>&1; then
-    echo "  ✓ $name (port $port)"
+    pattern="$(verify_pattern_for "$name")"
+    if [ -z "$pattern" ] || port_held_by "$port" "$pattern"; then
+      echo "  ✓ $name (port $port)"
+    else
+      echo "  ✗ $name (port $port) — port held by another process, not $name"
+    fi
   else
     echo "  ✗ $name (port $port) — check $LOGS_DIR/${name}.log"
   fi
