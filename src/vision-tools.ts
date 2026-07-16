@@ -89,7 +89,21 @@ export async function ensureScreenCaptureServer(): Promise<void> {
 	const start = (async () => {
 		// screen-capture-server.py sits next to this module in src/.
 		const script = join(dirname(fileURLToPath(import.meta.url)), 'screen-capture-server.py');
-		const child = spawn('python3', [script], { detached: true, stdio: 'ignore' });
+		// The bundled .app's voice-agent runs under a MINIMAL launchd PATH (no
+		// /opt/homebrew/bin etc. — same class as the claude-on-PATH gotcha, desktop
+		// PR #50). A bare `python3` would ENOENT there — Watch would still silently
+		// fail, one layer deeper. And screen-capture-server.py itself shells out to
+		// `screencapture` (/usr/sbin). Prepend the standard macOS bin dirs so BOTH
+		// the interpreter and the server's own subprocess resolve regardless of how
+		// the app launched the runtime. (Review: air, bundled-spawn-PATH risk.)
+		const augmentedPath = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/usr/sbin', '/bin', process.env.PATH]
+			.filter(Boolean)
+			.join(':');
+		const child = spawn('python3', [script], {
+			detached: true,
+			stdio: 'ignore',
+			env: { ...process.env, PATH: augmentedPath },
+		});
 		child.unref();
 		for (let i = 0; i < 40; i++) {
 			if (await _portListening(SCREEN_CAPTURE_PORT)) return;
