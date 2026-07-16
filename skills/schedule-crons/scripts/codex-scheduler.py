@@ -23,6 +23,9 @@ from pathlib import Path
 from typing import Any, Iterator
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+from task_body_guard import confine_user_content  # noqa: E402
+
 
 LABEL = "com.sutando.codex-schedules"
 STATE_VERSION = 1
@@ -195,7 +198,7 @@ def _task_paths(workspace: Path, job: dict[str, Any], slot: datetime) -> tuple[s
 
 def _task_body(workspace: Path, job: dict[str, Any], slot: datetime, now: datetime) -> tuple[str, str]:
     task_id, _, result_path, proactive_path = _task_paths(workspace, job, slot)
-    prompt = job.get("prompt") or f"/{job['prompt_skill']}"
+    prompt = confine_user_content(job.get("prompt") or f"/{job['prompt_skill']}")
     if job.get("delivery") == "proactive":
         prompt += (
             f" Write the concise owner-facing result to {proactive_path}, then write "
