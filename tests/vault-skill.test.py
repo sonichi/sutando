@@ -104,6 +104,26 @@ class TestGetVaultKey(unittest.TestCase):
                 vault_intercept.get_vault_key("MISSING")
 
 
+class TestSetVaultKey(unittest.TestCase):
+    def test_delegates_to_store(self):
+        with patch.object(vault_intercept, "_store_in_keychain") as mock_store:
+            vault_intercept.set_vault_key("MY_KEY", "supersecret")
+        mock_store.assert_called_once_with("MY_KEY", "supersecret")
+
+    def test_rejects_invalid_key_names(self):
+        for bad in ("", "9LEADING", "has space", "has-dash", "a=b", "k\nnewline"):
+            with patch.object(vault_intercept, "_store_in_keychain") as mock_store:
+                with self.assertRaises(ValueError):
+                    vault_intercept.set_vault_key(bad, "value")
+            mock_store.assert_not_called()
+
+    def test_rejects_empty_value(self):
+        with patch.object(vault_intercept, "_store_in_keychain") as mock_store:
+            with self.assertRaises(ValueError):
+                vault_intercept.set_vault_key("MY_KEY", "")
+        mock_store.assert_not_called()
+
+
 class TestRegisterKey(unittest.TestCase):
     def _patch_paths(self, canonical, legacy):
         return (
@@ -206,6 +226,32 @@ class TestVaultCliGet(unittest.TestCase):
         with patch("vault.get_vault_key", side_effect=KeyError("not found")):
             with self.assertRaises(SystemExit) as cm:
                 vault_cli.cmd_get("MISSING")
+        self.assertEqual(cm.exception.code, 1)
+
+
+class TestVaultCliSet(unittest.TestCase):
+    def test_reads_stdin_and_strips_one_trailing_newline(self):
+        with patch("vault.set_vault_key") as mock_set, \
+             patch("vault.sys.stdin", io.StringIO("secret123\n")):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                vault_cli.cmd_set("MY_KEY")
+        mock_set.assert_called_once_with("MY_KEY", "secret123")
+        self.assertIn("stored 'MY_KEY'", buf.getvalue())
+
+    def test_preserves_inner_whitespace_and_extra_newlines(self):
+        # Only the single trailing newline is stripped; everything else is data.
+        with patch("vault.set_vault_key") as mock_set, \
+             patch("vault.sys.stdin", io.StringIO("line1\nline2\n\n")):
+            with redirect_stdout(io.StringIO()):
+                vault_cli.cmd_set("MY_KEY")
+        mock_set.assert_called_once_with("MY_KEY", "line1\nline2\n")
+
+    def test_exits_1_on_setter_error(self):
+        with patch("vault.set_vault_key", side_effect=ValueError("bad key")), \
+             patch("vault.sys.stdin", io.StringIO("v\n")):
+            with self.assertRaises(SystemExit) as cm:
+                vault_cli.cmd_set("bad key")
         self.assertEqual(cm.exception.code, 1)
 
 
