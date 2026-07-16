@@ -183,6 +183,39 @@ class TestSendTelegram(unittest.TestCase):
             result = self.mod.send_telegram("123456", "hello")
         self.assertFalse(result)
 
+    def test_thread_id_included_in_payload(self):
+        captured = {}
+
+        def fake_post(url, payload, headers):
+            captured.update(payload)
+            return True
+
+        with patch.object(self.mod, "_token", return_value="9999:fake"), \
+             patch.object(self.mod, "_post", side_effect=fake_post):
+            self.mod.send_telegram("123456", "update", message_thread_id="42")
+        self.assertEqual(captured.get("message_thread_id"), "42")
+
+    def test_no_thread_id_key_when_unset(self):
+        captured = {}
+
+        def fake_post(url, payload, headers):
+            captured.update(payload)
+            return True
+
+        with patch.object(self.mod, "_token", return_value="9999:fake"), \
+             patch.object(self.mod, "_post", side_effect=fake_post):
+            self.mod.send_telegram("123456", "update")
+        self.assertNotIn("message_thread_id", captured)
+
+    def test_main_dispatches_telegram_with_thread_id(self):
+        with patch("sys.argv", [
+            "notify.py", "--source", "telegram", "--chat-id", "123456",
+            "--thread-id", "42", "--message", "On it",
+        ]), patch.object(self.mod, "send_telegram", return_value=True) as mock_send:
+            rc = self.mod.main()
+        self.assertEqual(rc, 0)
+        mock_send.assert_called_once_with("123456", "On it", message_thread_id="42")
+
 
 class TestSendRemoteGateway(unittest.TestCase):
     def setUp(self):
