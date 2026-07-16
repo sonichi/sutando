@@ -157,6 +157,17 @@ ALLOWLIST = {
     # flagged token is the `kind: 'tasks' | 'results'` TYPE UNION on the
     # injected archive callback, mirroring archiveFile's own signature.
     "src/task-delegation.ts",
+    # core-input-watch.py (the core-supervisor monitor) never resolves the
+    # workspace itself — the output path is passed explicitly via --out (the
+    # launcher resolves it env-independently). The flagged tokens appear only
+    # in the module docstring (the core-supervisor.json signal schema + usage
+    # example), not in runnable code. Same rationale as task_archive.py.
+    "src/core-input-watch.py",
+    # core-supervisor-relay.py (the ESCALATE communicator) reads the signal file
+    # path passed explicitly via --signal and never resolves the workspace itself.
+    # The flagged tokens are the state/prompt field names of the core-supervisor.json
+    # schema (the hash key + docstring), not a workspace-path composition.
+    "src/core-supervisor-relay.py",
 }
 
 

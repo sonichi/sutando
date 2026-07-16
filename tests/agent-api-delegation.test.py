@@ -119,7 +119,7 @@ check("list results", code == 200 and set(data.get("files", [])) == {"task-e2e-1
 code, data = req("GET", "/delegation/results/task-e2e-1.txt")
 check("read result body", code == 200 and data.get("body") == "the answer\n", str(data))
 code, _ = req("GET", "/delegation/results/..%2F..%2Fetc")
-check("traversal name 404s", code == 404)
+check("traversal name rejected", code == 400)  # valid_task_id gate fires before file lookup
 
 # 5. Archive moves to the month-partitioned layout.
 code, data = req("POST", "/delegation/archive", {"name": "task-e2e-1.txt", "task_id": "task-e2e-1"})
@@ -191,8 +191,17 @@ code, data = api.delegation_list_results()
 check("direct list", code == 200 and "task-direct-1.txt" in data["files"])
 code, data = api.delegation_read_result("task-direct-1.txt")
 check("direct read", code == 200 and data["body"] == "direct answer\n")
-check("direct read 404", api.delegation_read_result("nope.txt")[0] == 404)
-check("direct read traversal", api.delegation_read_result("../../etc")[0] == 404)
+check("direct read 404", api.delegation_read_result("task-nonexistent-99999.txt")[0] == 404)
+check("direct read traversal rejected", api.delegation_read_result("../../etc")[0] == 400)
+# Defense-in-depth: read side applies valid_task_id gate symmetrically with
+# submit side (#1959). Malformed ids that pass _safe_path (e.g. "../x" gets
+# None from _safe_path, but "task-../x" could differ) are rejected before it.
+check("direct read rejects malformed id (has space)",
+      api.delegation_read_result("task-a b.txt")[0] == 400)
+check("direct read rejects path-separator id",
+      api.delegation_read_result("task-a/b.txt")[0] == 400)
+check("direct read rejects path-traversal id",
+      api.delegation_read_result("task-../x.txt")[0] == 400)
 code, data = api.delegation_archive_result({"name": "task-direct-1.txt", "task_id": "task-direct-1"})
 check("direct archive", code == 200 and list((api.RESULT_DIR / "archive").glob("*/task-direct-1.txt")))
 check("direct archive already-gone", api.delegation_archive_result(

@@ -17,7 +17,6 @@ import secrets
 import signal
 import stat
 import sys
-import tempfile
 import threading
 import urllib.request
 import os as _os
@@ -30,8 +29,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sutando_platform import capture_screen as _platform_capture_screen, notify as _platform_notify, is_macos, is_windows  # noqa: E402
 
 PORT = 7845
-# Screenshot scratch dir under the OS temp dir so Windows works without /tmp.
-DIR = os.path.join(tempfile.gettempdir(), "sutando-screenshots")
+# Per-user temp dir — same treatment as browser.mjs in this PR: a shared
+# /tmp/sutando-screenshots is owned by whichever account wrote it first and
+# EACCES-fails the second account. SUTANDO_SCREENSHOT_DIR overrides.
+import tempfile as _tempfile
+DIR = _os.environ.get("SUTANDO_SCREENSHOT_DIR") or _os.path.join(
+    _tempfile.gettempdir(), "sutando-screenshots")
 # Web-client endpoint for agent-state reporting. When a /capture happens we
 # flash state=seeing on the menu-bar avatar for ~1.5s — makes screen-capture
 # visible to the user without them needing to watch the web UI.

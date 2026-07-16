@@ -621,6 +621,14 @@ else
   echo "  ✓ voice agent (already running)"
 fi
 
+# 1b. Call-tier advertisement (one-shot): write state/call-tiers.json so the
+# runtime descriptor advertises which DIRECT call endpoints are reachable now
+# (Track 9 availability-driven call-tier menu). Backgrounded — it probes tailscale
+# with its own short timeout and never blocks the rest of startup; absent file
+# just means the descriptor advertises no direct tiers (client falls back to cloud).
+npx tsx src/emit-call-tiers.ts > "$LOGS_DIR/emit-call-tiers.log" 2>&1 &
+echo "  ✓ call-tiers advertisement"
+
 # 2. Web client (port 8080)
 reap_wedged_listener 8080 web-client
 if ! lsof -i :8080 > /dev/null 2>&1; then
@@ -863,7 +871,9 @@ fi
 # right one in the first place avoids the wasted process + traceback noise.
 # Probe a fixed list of candidates in priority order; first one with discord.py
 # wins. Same probe is also what's used in the bridge's rescue fallback.
-if _DC_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/discord/.env)"; [ -f "$_DC_ENV" ] && grep -q "DISCORD_BOT_TOKEN=" "$_DC_ENV" 2>/dev/null; then
+if [ "${SKIP_DISCORD:-}" = "1" ]; then
+  echo "  ~ discord bridge (skipped via SKIP_DISCORD)"
+elif _DC_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/discord/.env)"; [ -f "$_DC_ENV" ] && grep -q "DISCORD_BOT_TOKEN=" "$_DC_ENV" 2>/dev/null; then
   PYTHON_WITH_DISCORD=""
   for _p in /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
     if command -v "$_p" >/dev/null 2>&1 && "$_p" -c "import discord" 2>/dev/null; then
@@ -899,7 +909,9 @@ fi
 # 7b. Slack bridge (optional — needs SLACK_BOT_TOKEN + SLACK_APP_TOKEN + slack_bolt)
 # Probes the same Python-interpreter candidates as the discord bridge so a
 # fresh-install miniconda env doesn't silently miss slack_bolt.
-if _SL_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/slack/.env)"; [ -f "$_SL_ENV" ] && grep -q "SLACK_BOT_TOKEN=" "$_SL_ENV" 2>/dev/null; then
+if [ "${SKIP_SLACK:-}" = "1" ]; then
+  echo "  ~ slack bridge (skipped via SKIP_SLACK)"
+elif _SL_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/slack/.env)"; [ -f "$_SL_ENV" ] && grep -q "SLACK_BOT_TOKEN=" "$_SL_ENV" 2>/dev/null; then
   PYTHON_WITH_SLACK=""
   for _p in /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
     if command -v "$_p" >/dev/null 2>&1 && "$_p" -c "import slack_bolt" 2>/dev/null; then
@@ -925,7 +937,11 @@ fi
 # 8. Phone conversation server + ngrok (optional — needs Twilio creds, skip with SKIP_PHONE=1)
 if [ "${SKIP_PHONE:-}" = "1" ]; then
   echo "  ~ conversation server (skipped via SKIP_PHONE)"
-elif grep -q "TWILIO_ACCOUNT_SID=" .env 2>/dev/null; then
+# Anchored + non-empty value: the unanchored substring form also matched the
+# commented template placeholder (`# TWILIO_ACCOUNT_SID=ACxxxxxxxxx`), starting
+# conversation-server and a PUBLIC ngrok tunnel on hosts with no Twilio at all.
+# Mirrors twilio_configured() in src/health-check.py — keep the two in sync.
+elif grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; then
   if ! pgrep -f "conversation-server" > /dev/null 2>&1; then
     echo "  Starting conversation server..."
     npx tsx skills/phone-conversation/scripts/conversation-server.ts > /tmp/conversation-server.log 2>&1 &

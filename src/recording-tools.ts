@@ -8,6 +8,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync, readFileSync, readlinkSync, existsSync, statSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { z } from 'zod';
 import { PLAYBACK_PATH, VOICE_TRANSCRIPT_PATH } from './tmp-paths.js';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
@@ -19,14 +20,39 @@ const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 /**
  * Auto-detect an ffmpeg binary that has the `subtitles` filter (requires libass).
  * Cached after first call so the probe only runs once per process lifetime.
- * Probe order: $FFMPEG_SUBTITLE_BIN env → system ffmpeg → homebrew narrow → homebrew full.
+ * Probe order: $FFMPEG_SUBTITLE_BIN env → system ffmpeg → homebrew narrow →
+ * homebrew full → bundled runtime.
+ *
+ * The bundled-runtime candidate is the fix for a real failure mode: when the
+ * voice-agent runs inside Sutando.app it executes under the bundled node at
+ * `…/Contents/Resources/runtime/bin/node`, and a libass-capable ffmpeg ships
+ * as its sibling (`…/runtime/bin/ffmpeg`). On an install with no ffmpeg on PATH
+ * and no Homebrew, all the earlier candidates miss and subtitles silently fail
+ * even though a perfectly capable ffmpeg sits right next to the running node.
+ * Deriving the path from `process.execPath` means we find it without any env
+ * wiring; in dev (system node) the sibling simply doesn't exist and the probe
+ * falls through harmlessly. Kept LAST so working installs are unaffected.
  */
+/**
+ * Ordered ffmpeg probe candidates for a given node exec path. Exported for
+ * testing. The final entry is the bundled runtime ffmpeg (sibling of the
+ * running node) — see findFfmpegWithSubtitles for why it's last.
+ */
+export function ffmpegSubtitleCandidates(execPath: string): string[] {
+	return [
+		'ffmpeg',
+		'/opt/homebrew/bin/ffmpeg',
+		'/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg',
+		join(dirname(execPath), 'ffmpeg'),
+	];
+}
+
 let _cachedSubtitleFfmpeg: string | null | undefined;
 function findFfmpegWithSubtitles(): string | null {
 	if (_cachedSubtitleFfmpeg !== undefined) return _cachedSubtitleFfmpeg;
 	const envBin = process.env.FFMPEG_SUBTITLE_BIN?.trim();
 	if (envBin) { _cachedSubtitleFfmpeg = envBin; console.log(`${ts()} [ffmpeg] using $FFMPEG_SUBTITLE_BIN: ${envBin}`); return envBin; }
-	const candidates = ['ffmpeg', '/opt/homebrew/bin/ffmpeg', '/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg'];
+	const candidates = ffmpegSubtitleCandidates(process.execPath);
 	for (const bin of candidates) {
 		try {
 			// execFileSync argv array — bin is from env or hardcoded candidates, not user input (fixes #1451)
