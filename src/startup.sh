@@ -381,6 +381,39 @@ fi
 
 if [ $missing -eq 1 ]; then echo ""; echo "Fix the above and try again."; exit 1; fi
 
+# Node ↔ esbuild architecture guard (macOS dual-node footgun, 2026-07-16).
+# On a Mac with both an Intel node (/usr/local/bin, Rosetta) and an arm64 node
+# (/opt/homebrew/bin), whichever is first in PATH may not match the arch that
+# node_modules was installed for. esbuild ships a per-arch native binary, so a
+# mismatched node makes every tsx service either wedge silently (process alive,
+# no port bound, empty log) or crash with esbuild's "installed for another
+# platform" TransformError — voice-agent, web-client, and conversation-server
+# all went down this way. If the archs disagree, prefer relaunching with the
+# node that matches node_modules over asking the user to reinstall deps.
+if [ "$(uname -s)" = "Darwin" ] && [ -d "$REPO/node_modules/@esbuild" ]; then
+  _esb_pkg="$(ls "$REPO/node_modules/@esbuild" 2>/dev/null | grep -m1 '^darwin-' || true)"
+  _node_arch="$(node -p process.arch 2>/dev/null || true)"
+  if [ -n "$_esb_pkg" ] && [ -n "$_node_arch" ] && [ "darwin-$_node_arch" != "$_esb_pkg" ]; then
+    _want_arch="${_esb_pkg#darwin-}"
+    _alt_bin=""
+    if [ "$_want_arch" = "arm64" ] && [ -x /opt/homebrew/bin/node ]; then
+      _alt_bin="/opt/homebrew/bin"
+    elif [ "$_want_arch" = "x64" ] && [ -x /usr/local/bin/node ]; then
+      _alt_bin="/usr/local/bin"
+    fi
+    if [ -n "$_alt_bin" ] && [ "$("$_alt_bin/node" -p process.arch 2>/dev/null)" = "$_want_arch" ]; then
+      export PATH="$_alt_bin:$PATH"
+      echo "  ⚠ node is $_node_arch but node_modules is $_want_arch — using $_alt_bin/node for this run"
+      echo "    (durable fix: put $_alt_bin first in PATH, or remove the other node install)"
+    else
+      echo "  ✗ node is $_node_arch but node_modules was installed for $_want_arch, and no $_want_arch node was found."
+      echo "    tsx services would wedge or crash (esbuild is a per-arch native binary)."
+      echo "    Fix: rm -rf node_modules && npm install   (reinstalls for this node)"
+      exit 1
+    fi
+  fi
+fi
+
 # Check macOS permissions (can't grant programmatically, just warn)
 # Prevent display sleep (important for always-on Mac Mini — Zoom/summon fails on lock screen)
 if ! pgrep -q caffeinate; then
