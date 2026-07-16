@@ -111,9 +111,36 @@ RESULT_DIR = WORKSPACE_DIR / "results"
 TASK_DIR.mkdir(exist_ok=True)
 RESULT_DIR.mkdir(exist_ok=True)
 
-# In-memory task history (survives file cleanup, lost on restart)
-# {task_id: {status, text, time, result}}
-task_history = {}
+# Task history: {task_id: {status, text, time, result}}. Kept in memory and
+# persisted to <workspace>/data/task-history.json so a restart doesn't lose it
+# (previously the web UI showed every prior task as "working" with no body
+# until the archive scan backfilled — the launch-todo "flicker" issue).
+# Loaded once at startup; saved after any /tasks/active scan that changed it,
+# pruned to the newest HISTORY_MAX entries.
+HISTORY_FILE = WORKSPACE_DIR / "data" / "task-history.json"
+HISTORY_MAX = 200
+
+
+def load_task_history() -> dict:
+    try:
+        data = json.loads(HISTORY_FILE.read_text())
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_task_history() -> None:
+    pruned = dict(sorted(task_history.items(), key=lambda x: x[1].get("time", 0), reverse=True)[:HISTORY_MAX])
+    tmp = HISTORY_FILE.with_suffix(".json.tmp")
+    try:
+        HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(pruned))
+        tmp.replace(HISTORY_FILE)
+    except OSError:
+        pass  # best-effort: in-memory history still serves the UI
+
+
+task_history = load_task_history()
 
 # Voice state: "connected" or "disconnected". Toggled via /voice/toggle.
 # Web client polls /voice/state and connects/disconnects accordingly.
@@ -395,6 +422,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             watcher_ok = subprocess.run(["/usr/bin/pgrep", "-f", "watch-tasks"], capture_output=True).returncode == 0
             claude_ok = subprocess.run(["/usr/bin/pgrep", "-f", "claude.*sutando-core"], capture_output=True).returncode == 0
             # Scan disk for active tasks, update history (preserve existing text)
+            _hist_before = json.dumps(task_history, sort_keys=True)
             for f in sorted(TASK_DIR.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]:
                 task_id = f.stem
                 content = f.read_text()
@@ -464,6 +492,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         stale_ids.append(tid)
             for tid in stale_ids:
                 del task_history[tid]
+            if json.dumps(task_history, sort_keys=True) != _hist_before:
+                save_task_history()
             # Return most recent 10 from history
             sorted_tasks = sorted(task_history.items(), key=lambda x: x[1].get("time", 0), reverse=True)[:10]
             tasks = [{"id": tid, **tdata} for tid, tdata in sorted_tasks]
