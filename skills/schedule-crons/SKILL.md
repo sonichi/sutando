@@ -19,12 +19,25 @@ Each entry has:
 - `prompt` — the prompt to run (direct text)
 - `prompt_skill` — OR a skill to invoke (e.g. "morning-briefing" → `/morning-briefing`)
 - `loop` (optional, value `"dynamic"`) — declares a **dynamic (self-pacing) loop** using the built-in `/loop` primitive. An entry with **no interval** (no `cron` field) + `loop: "dynamic"` is run by schedule-crons as `/loop` *without an interval* (see step 3) — which is exactly the built-in adaptive mode: the loop self-paces via ScheduleWakeup, deciding each next delay by its own judgment. Optional `loop_hint` (free text) guides that pacing (e.g. "~10 min when owner active, ~40 min quiet"). **Durable** because schedule-crons re-launches it every boot; **adaptive** because that's what `/loop`-no-interval already is. No min/max/signal schema and no custom gate — the built-in does the pacing. Example: `{name:"inbox-score", prompt_skill:"inbox-score", loop:"dynamic", loop_hint:"…"}`.
+- `execution` (optional, value `"codex-task"`) — opt this entry into the durable OS-backed Codex runner instead of session cron registration. Codex entries may also set `timezone` (IANA name, default `America/Los_Angeles`), `delivery: "proactive"`, `retry_minutes` (default 15), and `max_attempts` (default 3). Only explicitly opted-in entries are handled, so Claude session crons are never duplicated.
+
+### Durable Codex schedules
+
+Install or reconcile the per-minute launchd runner after adding an `execution: "codex-task"` entry:
+
+```bash
+python3 skills/schedule-crons/scripts/codex-scheduler.py install
+python3 skills/schedule-crons/scripts/codex-scheduler.py health
+```
+
+The runner calculates cron slots in each job's declared timezone, catches up the newest missed slot after sleep, atomically enqueues a deterministic task ID, retries that same task ID when its result is overdue, and writes durable run state to `<workspace>/state/schedules/codex-scheduler.json`. Exhausted retries produce a `proactive-schedule-alert-*.txt` result. `health` exits non-zero for a stale scheduler heartbeat or a latest-run failure.
 
 ## On Activation
 
 1. Read `<workspace>/hosts/<hostname>/crons.json` (resolve `<workspace>` via `bash scripts/sutando-config.sh workspace`; `<hostname>` = `bash scripts/sutando-config.sh host-label`). **Transition / self-heal:** if that file is missing, seed it once — from the interim `<workspace>/crons/<hostname>.json` if it still exists (folded-in from the pre-#1717 layout), else the legacy `skills/schedule-crons/crons.json` (one-time migration), else `skills/schedule-crons/crons.example.json` — then read it: `WS="$(bash scripts/sutando-config.sh workspace)"; H="$(bash scripts/sutando-config.sh host-label)"; CF="$WS/hosts/$H/crons.json"; if [ ! -f "$CF" ]; then mkdir -p "$WS/hosts/$H"; SRC="$(ls "$WS/crons/$H.json" 2>/dev/null || ls skills/schedule-crons/crons.json 2>/dev/null || echo skills/schedule-crons/crons.example.json)"; cp "$SRC" "$CF"; fi`
 2. Check existing cron jobs with CronList
 3. For each job in the config:
+   - Skip entries with `execution: "codex-task"`; the OS-backed runner owns them.
    - Skip if a job with matching prompt/name already exists
    - Call `CronCreate` with the cron expression and prompt:
      - If `prompt_skill` is set, pass `prompt: "/skill-name"` (the leading slash makes the scheduled cron fire the skill as a slash command at its scheduled time).

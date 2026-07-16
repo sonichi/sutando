@@ -51,12 +51,15 @@ _LOCAL_FILENAME = "sutando.config.local.json"
 # lenient (warn-only) so users with experimental or scratch keys don't
 # break. Per Mini's review #8 on PR #1395.
 _KNOWN_TOP_LEVEL_KEYS = {
+    "core",
     "workspace",
     "claude_sutando_config_dir",
     "core_config_dirs",
     "vault",
     "migrate",
 }
+
+_SUPPORTED_CORE_RUNTIMES = {"claude", "codex"}
 
 
 def _find_repo_root(start: Optional[Path] = None) -> Optional[Path]:
@@ -437,6 +440,24 @@ def resolve_dotenv(repo_root: Optional[Path] = None,
     if ws_env.exists():
         return ws_env
     return primary
+
+
+def resolve_core_runtime(repo_root: Optional[Path] = None) -> str:
+    """Return the selected persistent core CLI runtime.
+
+    ``SUTANDO_CORE_RUNTIME`` is an invocation-scoped launcher override.
+    Otherwise ``core.runtime`` is read from merged config. Claude remains the
+    default so upgrading does not change existing installations.
+    """
+    core = load_config(repo_root).get("core") or {}
+    configured = str(core.get("runtime") or "claude").strip()
+    runtime = os.environ.get("SUTANDO_CORE_RUNTIME", "").strip() or configured
+    if runtime not in _SUPPORTED_CORE_RUNTIMES:
+        supported = ", ".join(sorted(_SUPPORTED_CORE_RUNTIMES))
+        raise ValueError(
+            f"sutando config: unsupported core.runtime={runtime!r}; expected one of: {supported}"
+        )
+    return runtime
 
 
 _DEFAULT_CLAUDE_SUTANDO_SUBDIR = ".claude-sutando"

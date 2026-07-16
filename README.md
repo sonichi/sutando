@@ -125,10 +125,10 @@ Voice agent and conversation server handle conversation-scope actions with **inl
 
 **Prerequisites:**
 - macOS 15+
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code/getting-started) (run `claude` once to complete login)
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code/getting-started) or [Codex CLI](https://developers.openai.com/codex/cli/) (sign in to the CLI you select)
 - Node.js 22+ (`brew install node`)
 - fswatch (`brew install fswatch`)
-- [Gemini API key](https://ai.google.dev) (click "Get API key")
+- [Gemini API key](https://ai.google.dev) for voice (optional for text/core-only use)
 - *(optional, for phone calls)* [Twilio account](https://www.twilio.com/) + [ngrok](https://ngrok.com/) — Sutando can answer inbound calls and make outbound calls; you can run the browser + Telegram + Discord paths without them.
 - *(optional, for video/audio)* ffmpeg (`brew install ffmpeg`) — used by subtitle-burn, video-concat, and recording handoff.
 
@@ -145,16 +145,16 @@ cp .env.example .env
 bash src/startup.sh
 ```
 
-This starts all services (voice agent, phone conversation server, web client, dashboard, API, Sutando menu bar app) and opens http://localhost:8080 in your browser. The autonomous loop starts automatically — click **Connect** and start talking. Look for **S** in your menu bar — it provides global hotkeys (see [Keyboard shortcuts](#keyboard-shortcuts)) plus **Open Core** (Claude Code terminal) and **Open Dashboard** (status page).
+This starts all services (voice agent, phone conversation server, web client, dashboard, API, Sutando menu bar app) and opens http://localhost:8080 in your browser. The autonomous loop starts automatically — click **Connect** and start talking. Look for **S** in your menu bar — it provides global hotkeys (see [Keyboard shortcuts](#keyboard-shortcuts)) plus **Open Core** (selected CLI terminal) and **Open Dashboard** (status page).
 
-> **Why Sutando runs with elevated permissions.** Autonomous voice-driven work means `startup.sh` launches Claude Code with `--dangerously-skip-permissions` — the prompts that would otherwise fire on every tool call would break the voice-in / answer-out flow. In exchange:
+> **Why Sutando runs with elevated permissions.** Autonomous voice-driven work means `startup.sh` launches the selected core CLI with unattended approvals and full local access — permission prompts would otherwise break the voice-in / answer-out flow. In exchange:
 >
 > - **It's local.** Sutando runs entirely on your Mac. No remote control plane, no third party with write access.
 > - **You control the audience.** 3-tier access gating means owner / verified / unverified callers get different capability bands on phone, Discord, and Telegram. Set `VERIFIED_CALLERS` in `.env` before going live.
-> - **Actions are auditable.** Every Claude Code invocation lands in `build_log.md`, every task in `tasks/` + `results/`, every shell call in the service logs (`logs/*.log`). Use `tail -f build_log.md` while it works to watch in real time.
+> - **Actions are auditable.** Every task lands in `tasks/` + `results/`, and service activity is written to `logs/*.log`. Use the Core CLI terminal while it works to watch in real time.
 > - **Hooks are your brake pedal.** `git-rules-guard.sh` (see `$CLAUDE_CONFIG_DIR/hooks`) pops a Discord approval DM for any public write (push / PR / issue comment) regardless of transport. Reject with 👎 to block.
 >
-> Keep the Claude Code terminal window reachable — quota-exhaustion or an unrecognized CLI prompt can leave the core agent waiting for you to respond.
+> Keep the Core CLI terminal reachable — quota exhaustion or an unrecognized CLI prompt can leave the core agent waiting for you to respond. See [Codex core setup](docs/codex-core.md) to select or roll back the Codex runtime.
 
 **Why macOS 15+?** The setup scripts assume the Sequoia System Settings layout for granting TCC permissions (Screen Recording, Accessibility, Input Monitoring). Earlier macOS versions may work for the headless parts (proactive loop, Discord/Telegram bridges) but aren't tested.
 
