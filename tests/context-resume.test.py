@@ -13,6 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
+import context_resume  # noqa: E402
 from context_resume import extract_recent_turns  # noqa: E402
 
 
@@ -103,6 +104,111 @@ class ExtractTests(unittest.TestCase):
         f.close()
         out = extract_recent_turns(Path(f.name))
         self.assertEqual(out, "**User:** survives")
+
+
+class MessageTextEdgeTests(unittest.TestCase):
+    def test_non_dict_blocks_skipped(self):
+        # line 69: non-dict entries in a content list are skipped, not fatal
+        p = _write([
+            _assistant(["bare string block", 42, {"type": "text", "text": "kept"}]),
+        ])
+        out = extract_recent_turns(p)
+        self.assertIn("kept", out)
+        self.assertNotIn("bare string block", out)
+
+    def test_blank_and_malformed_lines_skipped(self):
+        f = tempfile.NamedTemporaryFile(
+            "w", suffix=".jsonl", delete=False, encoding="utf-8")
+        f.write("\n")                      # blank line
+        f.write("{not json}\n")            # JSONDecodeError path
+        f.write(json.dumps(_user("survives")) + "\n")
+        f.close()
+        out = extract_recent_turns(Path(f.name))
+        self.assertIn("survives", out)
+
+
+class LatestTranscriptTests(unittest.TestCase):
+    """Cover _latest_transcript(): happy path + no-candidates failure."""
+
+    def _fake_projects(self, with_files):
+        import re as _re
+        tmp = Path(tempfile.mkdtemp())
+        repo = Path(context_resume.__file__).parent.parent
+        slug = _re.sub(r"[^a-zA-Z0-9]", "-", str(repo))
+        d = tmp / slug
+        d.mkdir()
+        if with_files:
+            old = d / "old.jsonl"
+            old.write_text(json.dumps(_user("old")) + "\n")
+            new = d / "new.jsonl"
+            new.write_text(json.dumps(_user("new")) + "\n")
+            import os, time
+            past = time.time() - 1000
+            os.utime(old, (past, past))
+        return tmp
+
+    def test_latest_picks_newest_mtime(self):
+        from unittest import mock
+        proj = self._fake_projects(with_files=True)
+        fake = mock.Mock()
+        fake.stdout = str(proj) + "\n"
+        with mock.patch.object(context_resume.subprocess, "run", return_value=fake):
+            got = context_resume._latest_transcript()
+        self.assertEqual(got.name, "new.jsonl")
+
+    def test_latest_raises_when_empty(self):
+        from unittest import mock
+        proj = self._fake_projects(with_files=False)
+        fake = mock.Mock()
+        fake.stdout = str(proj) + "\n"
+        with mock.patch.object(context_resume.subprocess, "run", return_value=fake):
+            with self.assertRaises(FileNotFoundError):
+                context_resume._latest_transcript()
+
+
+class MainCliTests(unittest.TestCase):
+    """Cover main(): explicit-path happy, missing file, --latest, empty output."""
+
+    def _run_main(self, argv):
+        from unittest import mock
+        with mock.patch.object(sys, "argv", ["context_resume.py"] + argv):
+            return context_resume.main()
+
+    def test_main_explicit_path_ok(self):
+        p = _write([_user("cli happy path")])
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = self._run_main([str(p)])
+        self.assertEqual(rc, 0)
+        self.assertIn("cli happy path", buf.getvalue())
+
+    def test_main_missing_file_is_rc1(self):
+        rc = self._run_main(["/nonexistent/never.jsonl"])
+        self.assertEqual(rc, 1)
+
+    def test_main_no_arg_is_rc1(self):
+        # Path("") → not a file → one-line loud failure
+        rc = self._run_main([])
+        self.assertEqual(rc, 1)
+
+    def test_main_empty_transcript_is_rc1(self):
+        p = _write([])  # zero turns → "no conversation turns found"
+        rc = self._run_main([str(p)])
+        self.assertEqual(rc, 1)
+
+    def test_main_latest_flag_uses_fallback(self):
+        from unittest import mock
+        p = _write([_user("via latest")])
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with mock.patch.object(context_resume, "_latest_transcript", return_value=p):
+            with redirect_stdout(buf):
+                rc = self._run_main(["--latest"])
+        self.assertEqual(rc, 0)
+        self.assertIn("via latest", buf.getvalue())
 
 
 if __name__ == "__main__":
