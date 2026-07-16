@@ -84,9 +84,9 @@ function _portListening(port: number): Promise<boolean> {
  *  Reuses a running server (startup.sh's, or a prior lazy spawn); memoizes the
  *  in-flight spawn so concurrent captures don't double-start it. */
 export async function ensureScreenCaptureServer(): Promise<void> {
-	if (await _portListening(SCREEN_CAPTURE_PORT)) return;
-	if (_screenCaptureStarting) return _screenCaptureStarting;
-	_screenCaptureStarting = (async () => {
+	if (await _portListening(SCREEN_CAPTURE_PORT)) return; // reuse a running server
+	if (_screenCaptureStarting) return _screenCaptureStarting; // join an in-flight spawn
+	const start = (async () => {
 		// screen-capture-server.py sits next to this module in src/.
 		const script = join(dirname(fileURLToPath(import.meta.url)), 'screen-capture-server.py');
 		const child = spawn('python3', [script], { detached: true, stdio: 'ignore' });
@@ -96,11 +96,21 @@ export async function ensureScreenCaptureServer(): Promise<void> {
 			await new Promise((r) => setTimeout(r, 200));
 		}
 		throw new Error('screen-capture-server did not come up on :7845 within 8s');
-	})().catch((err) => {
-		_screenCaptureStarting = null; // reset so a later capture retries the spawn
-		throw err;
-	});
-	return _screenCaptureStarting;
+	})();
+	_screenCaptureStarting = start;
+	try {
+		await start;
+	} finally {
+		// Clear on BOTH success and failure: _screenCaptureStarting exists only to
+		// dedupe a CONCURRENT spawn, not to cache a completed one. Memoizing the
+		// resolved promise would make a later call short-circuit past the spawn even
+		// after the detached server has died/crashed — the port check above would
+		// see :7845 down but this guard would return the stale "up" promise, leaving
+		// Watch connection-refused until the whole voice-agent restarts (review P1 on
+		// 0589a18). Clearing here means the next capture re-checks the port and
+		// re-spawns if the server is gone — true self-healing.
+		_screenCaptureStarting = null;
+	}
 }
 
 const screenSource: VisionSource = {
