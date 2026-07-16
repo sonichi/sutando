@@ -10,7 +10,7 @@ import ApplicationServices
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     // Hotkeys are configurable via ~/.config/sutando/hotkeys.json.
-    // Defaults: drop_context=⌃C, drop_screenshot=⌃S, toggle_voice=⌃V, toggle_mute=⌃M
+    // Hotkey defaults are published in state/hotkeys.json (see PR #1920/#1924).
     var hotKeyRefs: [EventHotKeyRef?] = []  // one entry per registered hotkey
     var hotKeyActions: [UInt32: String] = [:]  // hotkey id → action name
     var lastDropTime: Date = .distantPast

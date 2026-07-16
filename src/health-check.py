@@ -22,6 +22,7 @@ Checks:
 import hashlib
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -520,6 +521,16 @@ def check_tcc_documents_access() -> dict:
 # Fix attempts
 # ---------------------------------------------------------------------------
 
+# Checks that are named by service but recovered via their launchd job:
+# the --fix dispatch matches names starting with "com.sutando." OR names in
+# this map (issue #1888 bug 1 — the bare names never matched the prefix
+# branch, so --fix silently skipped voice-agent/web-client).
+LAUNCHD_BACKED_CHECKS = {
+    "voice-agent": "com.sutando.voice-agent",
+    "web-client": "com.sutando.web-client",
+}
+
+
 def fix_launchd(label: str) -> str:
     """Try to reload a launchd job."""
     plist_map = {
@@ -576,6 +587,131 @@ def fix_screen_capture() -> str:
     after = check_port(7845, "screen-capture")
     return "restarted on :7845" if after["status"] == "ok" else (
         f"restart attempted but port check says {after['status']} — see {log_path}")
+
+
+def fix_down_bridges(checks: list) -> list:
+    """Restart configured-but-not-running channel bridges.
+
+    A dead bridge reports status "warn" (optional channels don't page), which
+    keeps it out of `issues` — so main()'s fix loop never reaches it, and
+    owner DMs silently queue channel-side until someone notices (2026-07-02:
+    discord-bridge died at boot with nothing logged; --fix left it down and 8
+    DMs sat undelivered). The exact-detail match excludes every other bridge
+    warn (multiple PIDs, token invalid, stale log), each of which needs
+    different handling than a plain start.
+
+    Returns the list of bridge names restarted.
+
+    Launch parity with startup.sh (per PR #1898 review): a naive
+    `sys.executable src/<bridge>.py` skips the bootstrapping startup.sh does and
+    crash-loops for two bridges:
+      - discord-bridge needs an interpreter that can `import discord`;
+        sys.executable (whatever launched health-check) frequently can't.
+      - slack-bridge needs SLACK_BOT_TOKEN/SLACK_APP_TOKEN, which startup.sh
+        sources from channels/slack/.env before launch — without them the
+        bridge exits immediately.
+    So mirror startup.sh: probe the same interpreter candidates for the
+    bridge's import, and inject the slack channel .env into the child's env.
+    Fail-safe: if no capable interpreter is found (or the required env is
+    missing), skip that bridge rather than spawn a guaranteed crash-loop.
+    """
+    restarted = []
+    for c in checks:
+        if (
+            c["name"] in ("telegram-bridge", "discord-bridge", "slack-bridge")
+            and c["status"] == "warn"
+            and c.get("detail") == "configured but not running"
+        ):
+            name = c["name"]
+            interp = _bridge_interpreter(name)
+            if interp is None:
+                # No interpreter that can import the bridge's dependency —
+                # spawning would just crash-loop (startup.sh skips it too).
+                continue
+            child_env = os.environ.copy()
+            if name == "slack-bridge":
+                # startup.sh sources channels/slack/.env so SLACK_BOT_TOKEN /
+                # SLACK_APP_TOKEN reach the child. Mirror that here; skip the
+                # restart if the env file / tokens are missing (fail-safe).
+                slack_env = _load_channel_env("slack")
+                if "SLACK_BOT_TOKEN" not in {**os.environ, **slack_env}:
+                    continue
+                child_env.update(slack_env)
+            log_path = WORKSPACE_DIR / "logs" / f"{name}.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            # `with` closes the parent's handle after Popen; the child holds
+            # its own dup of the fd, so the log stays writable.
+            with open(str(log_path), "a") as log_f:
+                subprocess.Popen([interp, str(REPO_DIR / "src" / f"{name}.py")],
+                                 stdout=log_f, stderr=subprocess.STDOUT,
+                                 env=child_env, start_new_session=True)
+            restarted.append(name)
+    return restarted
+
+
+# Interpreter candidates, in the same priority order startup.sh probes. First
+# candidate that can import the bridge's required module wins. Keep this list in
+# sync with src/startup.sh's discord/slack blocks.
+_BRIDGE_INTERP_CANDIDATES = ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "python3"]
+
+# Import each bridge needs to boot. telegram-bridge has no special hard import
+# probe here (its startup.sh block probes TLS, not a module) — sys.executable is
+# a safe default for it, matching the pre-#1898 behavior.
+_BRIDGE_REQUIRED_IMPORT = {"discord-bridge": "discord", "slack-bridge": "slack_bolt"}
+
+
+def _bridge_interpreter(name: str) -> "str | None":
+    """Pick an interpreter that can launch `name`, mirroring startup.sh.
+
+    For discord/slack, probe the candidate list for the bridge's required
+    import (discord / slack_bolt) — the interpreter that launched health-check
+    (sys.executable) often lacks these, so launching with it crash-loops. For
+    bridges with no hard import gate (telegram), return sys.executable.
+    Returns None when no candidate can import the required module (caller then
+    skips the restart, matching startup.sh's labeled-skip behavior).
+    """
+    required = _BRIDGE_REQUIRED_IMPORT.get(name)
+    if required is None:
+        return sys.executable
+    for cand in _BRIDGE_INTERP_CANDIDATES:
+        try:
+            if shutil.which(cand) is None and not Path(cand).exists():
+                continue
+            probe = subprocess.run([cand, "-c", f"import {required}"],
+                                   capture_output=True, timeout=10)
+            if probe.returncode == 0:
+                return cand
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+    return None
+
+
+def _load_channel_env(channel: str) -> dict:
+    """Parse channels/<channel>/.env into a dict (KEY=VALUE lines).
+
+    Mirrors startup.sh's `set -a; . "$_SL_ENV"; set +a` so the bridge child
+    gets SLACK_BOT_TOKEN / SLACK_APP_TOKEN. Returns {} if the file is absent or
+    unreadable — the caller treats missing tokens as a reason to skip.
+    """
+    env: dict = {}
+    try:
+        env_file = Path(claude_home_path("channels", channel, ".env"))
+        if not env_file.exists():
+            return env
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            if key.startswith("export "):
+                key = key[len("export "):].strip()
+            val = val.strip().strip('"').strip("'")
+            if key:
+                env[key] = val
+    except OSError:
+        pass
+    return env
 
 
 # ---------------------------------------------------------------------------
@@ -1491,10 +1627,11 @@ def sutando_app_hotkey_detail(workspace_dir) -> str:
     app when it registers them (single source of truth since #1920). A running
     process alone doesn't prove hotkeys exist — app lineages without global
     hotkey registration (e.g. the Electron shell) match the pgrep pattern but
-    register nothing, and the pre-#1920 hardcoded "(⌃C/⌃V/⌃M)" claim here had
-    already drifted from the real defaults and read as a false positive during
-    live debugging. Missing/malformed/empty file → honest "no hotkeys
-    published" rather than a guess.
+    register nothing, and the "(⌃C/⌃V/⌃M)" default asserted here pre-#1920 had
+    already drifted from the real state/hotkeys.json values and read as a false
+    positive during live debugging (that binding is configurable, not fixed).
+    Missing/malformed/empty file → honest "no hotkeys published" rather than a
+    guess.
     """
     try:
         entries = json.loads((Path(workspace_dir) / "state" / "hotkeys.json").read_text())
@@ -1739,6 +1876,10 @@ def run_all_checks() -> list[dict]:
             pids = []
 
         if not pids:
+            # This exact detail string is a contract: fix_down_bridges()
+            # matches it verbatim to pick restart candidates (and the
+            # health-check-fix-down-bridges test locks it). Change both
+            # together or --fix goes blind to dead bridges again.
             checks.append({"name": name, "status": "warn", "detail": "configured but not running"})
             continue
 
@@ -2791,6 +2932,17 @@ def main():
                 if c["name"].startswith("com.sutando."):
                     result = fix_launchd(c["name"])
                     print(f"  {c['name']}: {result}")
+                elif c["name"] in LAUNCHD_BACKED_CHECKS:  # pragma: no cover — dispatch in untested main()
+                    # Named by service, recovered via launchd (issue #1888
+                    # bug 1: the com.sutando.* branch above never matches the
+                    # bare names, so --fix silently skipped the two most
+                    # user-visible services). fix_launchd() kickstarts (or
+                    # bootstraps) the job, which also replaces a wedged
+                    # launchd-owned listener. A rogue non-launchd port-holder
+                    # (issue #1888 bug 2, double-management) is out of scope
+                    # here — the result string will say the restart failed.
+                    result = fix_launchd(LAUNCHD_BACKED_CHECKS[c["name"]])  # pragma: no cover
+                    print(f"  {c['name']}: {result}")  # pragma: no cover
                 elif c["name"] in ("telegram-bridge", "discord-bridge", "slack-bridge"):  # pragma: no cover - --fix restart path spawns real subprocesses; not unit-tested
                     # LoginFailure means the token is bad — restarting won't help
                     # and would create a duplicate alongside the launchd-managed one.
@@ -2912,6 +3064,16 @@ def main():
                    and "not running" in (c.get("detail") or "")), None)
         if sc:
             print(f"  screen-capture: {fix_screen_capture()}")
+
+    # Channel bridges have the same optional-component shape: "configured but
+    # not running" is warn-only, so the fix loop above can't reach a dead
+    # bridge (see fix_down_bridges for the incident that motivated this).
+    if do_fix:
+        for name in fix_down_bridges(checks):
+            # "attempted", not "restarted": bridges boot slowly, so an in-run
+            # liveness recheck is unreliable — the next health run's verdict
+            # is the source of truth.
+            print(f"  {name}: restart attempted (was not running)")
 
     # Emit task on the RESIDUAL failure set when --fix ran (per PR #640 v2
     # review). The no-fix path emits earlier, before --quiet / --json early
