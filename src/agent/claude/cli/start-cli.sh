@@ -457,8 +457,31 @@ if core_claude_running; then
 fi
 
 if tmux_session_exists; then
-  echo "  ⚠ $SESSION tmux session exists but no core Claude process — restarting it" >&2
-  tmux -S "$TMUX_SOCKET" kill-session -t "$SESSION" 2>/dev/null || true
+  # Session alive but the core claude is gone. The old behavior here was
+  # kill-session — but the desktop runtime keeps SIBLING windows in this
+  # session (gateway, monitor; launch-sutando.sh), so nuking the session tore
+  # those down with the dead core: the G10 all-or-nothing gap. Heal WINDOW-
+  # SCOPED instead: recreate the core as a new window in the surviving session,
+  # with the same env/cwd/flags as the create path below. Target index 0 (the
+  # core's conventional home, freed when its process died); fall back to any
+  # free index if 0 is somehow occupied. This also makes sutando-ctl.sh's
+  # restart-core (kill core window → rerun this script) truly window-scoped.
+  echo "  ⚠ $SESSION exists but core Claude is gone — healing core window (sibling windows preserved)" >&2
+  apply_tmux_defaults
+  CORE_CMD=(claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
+    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} -- "/schedule-crons")
+  tmux -S "$TMUX_SOCKET" new-window -d -t "$SESSION:0" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} "${CORE_CMD[@]}" 2>/dev/null \
+    || tmux -S "$TMUX_SOCKET" new-window -d -t "$SESSION" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} "${CORE_CMD[@]}"
+  # Make the healed core the active window so attach/Console show it, not the
+  # quiet gateway (same reason launch-sutando.sh creates siblings with -d).
+  tmux -S "$TMUX_SOCKET" select-window -t "$SESSION:0" 2>/dev/null || true
+  ensure_core_monitor
+  if [ -t 1 ]; then
+    echo "Attaching to healed $SESSION (Ctrl-b d to detach)..."
+    exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
+  fi
+  echo "Healed core window in $SESSION (session + sibling windows preserved)."
+  exit 0
 fi
 
 # Auto-install tmux via Homebrew if missing. Sutando.app's
