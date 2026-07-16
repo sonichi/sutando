@@ -219,6 +219,11 @@ for good in ("task-1783377232367", "task-chat-1783379117", "task-phone-1", "task
 for bad in ("", "task-", "task-../../etc", "task-a b", "task-a/b", "result-1",
             "task-" + "x" * 200, "task-.hidden"):
     check(f"id rejected: {bad[:24]!r}", not ltp.valid_task_id(bad))
+for good in ("task-1783377232367", "ask-1783379117", "sc-ask-1234",
+             "reco-skill-9999", "result-1"):
+    check(f"archive id ok: {good}", ltp.valid_archive_lookup_id(good))
+for bad in ("", ".", "..", "task-../../etc", "task-a b", "task-a/b", "x" * 65):
+    check(f"archive id rejected: {bad[:24]!r}", not ltp.valid_archive_lookup_id(bad))
 
 # 8. Archive rules.
 base = Path("/tmp/x")
@@ -252,7 +257,8 @@ if (corpus / "archive").is_dir():
         try:
             text = p.read_text(errors="replace")
             h = ltp.parse_task_headers(text)
-            if not (h.get("id") or ltp.valid_task_id(p.stem.split(".")[-1] if "." in p.stem else p.stem)):
+            stem = p.stem.split(".")[-1] if "." in p.stem else p.stem
+            if not (h.get("id") or ltp.valid_archive_lookup_id(stem)):
                 no_id += 1
             # Body fidelity (Codex P2): every post-task: line that is NOT a
             # vocabulary header line must survive into the trusted body.
@@ -294,20 +300,44 @@ _tasks = _tmp / "tasks"
 (_tasks / "archive" / "task-flat.txt").write_text("id: task-flat\ntask: x\n")
 (_tasks / "archive" / "2026-05" / "task-old.txt").write_text("id: task-old\ntask: x\n")
 (_tasks / "archive" / "2026-07" / "task-new.txt").write_text("id: task-new\ntask: x\n")
+(_tasks / "archive" / "2026-07" / "ask-123.txt").write_text("id: ask-123\ntask: x\n")
+(_tasks / "archive" / "2026-07" / "sc-ask-456.txt").write_text("id: sc-ask-456\ntask: x\n")
 (_tasks / "archive" / "stray-dir" / "task-stray.txt").write_text("id: task-stray\ntask: x\n")
+# Non-task artefact: no `task:` line — iter should skip it.
+(_tasks / "archive" / "answer-Q1-1783000000.txt").write_text("User answered Q1: Yes\n")
+(_tasks / "archive" / "2026-07" / "answer-Q2-1783000001.txt").write_text("User answered Q2: No\n")
+# Non-task-prefixed id but with proper task structure (ask-*, sc-ask-*) — iter must include it.
+(_tasks / "archive" / "ask-1783000002.txt").write_text("id: ask-1783000002\ntask: y\n")
 
 check("find: live dir", ltp.find_archived_task(_tasks, "task-live") == _tasks / "task-live.txt")
 check("find: processed", ltp.find_archived_task(_tasks, "task-proc") == _tasks / "processed" / "task-proc.txt")
 check("find: legacy flat archive", ltp.find_archived_task(_tasks, "task-flat") == _tasks / "archive" / "task-flat.txt")
 check("find: month partition", ltp.find_archived_task(_tasks, "task-old") == _tasks / "archive" / "2026-05" / "task-old.txt")
+check("find: ask-* archive id", ltp.find_archived_task(_tasks, "ask-123") == _tasks / "archive" / "2026-07" / "ask-123.txt")
+check("find: sc-ask-* archive id", ltp.find_archived_task(_tasks, "sc-ask-456") == _tasks / "archive" / "2026-07" / "sc-ask-456.txt")
 check("find: non-month dirs skipped", ltp.find_archived_task(_tasks, "task-stray") is None)
 check("find: missing id", ltp.find_archived_task(_tasks, "task-nope") is None)
 check("find: malformed id gated", ltp.find_archived_task(_tasks, "task-../etc") is None)
 swept = [p.name for p in ltp.iter_archived_tasks(_tasks)]
-check("iter: flat + months, stray-dir skipped, live/processed excluded",
-      swept == ["task-flat.txt", "task-old.txt", "task-new.txt"], str(swept))
+check("iter: flat + months, stray-dir skipped, live/processed excluded, artefacts skipped",
+      swept == ["ask-1783000002.txt", "task-flat.txt", "task-old.txt", "ask-123.txt", "sc-ask-456.txt", "task-new.txt"], str(swept))
+check("iter: non-task artefacts without task: line are excluded",
+      "answer-Q1-1783000000.txt" not in swept and "answer-Q2-1783000001.txt" not in swept)
+check("iter: non-task-prefixed files WITH task: line are included",
+      "ask-1783000002.txt" in swept and "ask-123.txt" in swept and "sc-ask-456.txt" in swept)
 check("iter: no archive dir yields nothing",
       list(ltp.iter_archived_tasks(_tmp / "nonexistent")) == [])
+
+# _has_task_line: OSError branch (unreadable file returns False, not an exception).
+# Skip when running as root — root can read 0o000 files.
+import os as _os
+if _os.getuid() != 0:
+    _unreadable = _tasks / "archive" / "unreadable.txt"
+    _unreadable.write_text("task: unreachable\n")
+    _unreadable.chmod(0o000)
+    check("_has_task_line: OSError returns False (not an exception)",
+          not ltp._has_task_line(_unreadable))
+    _unreadable.chmod(0o644)  # restore for tempdir cleanup
 
 if failures:
     sys.exit(1)

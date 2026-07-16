@@ -159,6 +159,86 @@ if LOCAL_TIER not in ("owner", "team", "other"):
     # "owner" (the `or "owner"` above — the explicit personal-agent model).
     LOCAL_TIER = "team"
 
+
+# ── per-sender tier map (owner-controlled, LOCAL) ────────────────────────────
+# LOCAL_TIER above is the gateway-wide default. A SHARED room can carry messages
+# from senders who are NOT the owner (e.g. a teammate invited into a project
+# room). To tier those correctly WITHOUT trusting the task's self-claimed tier,
+# the OWNER declares a per-sender map in a LOCAL, owner-owned file:
+#   $CLAUDE_CONFIG_DIR/channels/ag2space/access.json → {"tierMap": {"@user:hs": "team"}}
+# We key the lookup on the BROKER-attested `user_id` (Matrix sender the broker
+# writes into the task, not a task-body self-claim), so this stays a LOCAL trust
+# decision — same principle as LOCAL_TIER. Only listed senders are re-tiered;
+# everyone else keeps LOCAL_TIER, so an unknown sender can never ESCALATE (the
+# map only DOWN-tiers named senders; owner stays owner by being absent from it).
+# Hot: re-read on mtime change so the owner can add teammates without a restart.
+def _ag2space_access_path():
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+    return os.path.join(base, "channels", "ag2space", "access.json")
+
+
+_TIER_MAP_CACHE = {"mtime": None, "map": {}}
+
+
+def _load_tier_map():
+    """Return the owner's {sender_mxid: tier} map, mtime-cached.
+
+    Preserves the last-known-good map on a READ error (stat/open/parse failure)
+    rather than clearing to {}. Clearing would silently up-tier every previously
+    down-tiered sender back to LOCAL_TIER the moment access.json is mid-write,
+    corrupt, or transiently unreadable — a fail-OPEN that is especially bad on a
+    LOCAL_TIER=owner node (a teammate momentarily regains owner). Only a
+    SUCCESSFUL read of a changed file replaces the cache; a fixed file (new mtime)
+    is picked up on the next call. A genuine deletion keeps the last map until the
+    owner writes an empty tierMap or the process restarts (the safe, non-surprising
+    tradeoff — the map floor never drops on a transient fault)."""
+    path = _ag2space_access_path()
+    try:
+        mt = os.path.getmtime(path)
+    except OSError:
+        # Absent/unstattable → keep last-known-good (initially {} before any load).
+        return _TIER_MAP_CACHE["map"]
+    if mt == _TIER_MAP_CACHE["mtime"]:
+        return _TIER_MAP_CACHE["map"]
+    try:
+        with open(path) as f:
+            raw = (json.load(f) or {}).get("tierMap") or {}
+        tm = {}
+        for who, tier in raw.items():
+            t = str(tier).strip().lower()
+            if isinstance(who, str) and t in ("owner", "team", "other"):
+                tm[who.strip()] = t
+    except Exception:
+        # Malformed / mid-write → keep last-known-good; don't advance mtime so a
+        # later successful read of the fixed file is still picked up.
+        return _TIER_MAP_CACHE["map"]
+    _TIER_MAP_CACHE["mtime"], _TIER_MAP_CACHE["map"] = mt, tm
+    return tm
+
+
+# Privilege ordering — a higher rank is MORE privileged. Used to clamp a mapped
+# tier so the owner file can only ever DOWN-tier (never escalate above the node's
+# own default), keeping the "map only down-tiers named senders" safety invariant
+# true in code rather than only in the comment.
+_TIER_RANK = {"other": 0, "team": 1, "owner": 2}
+
+
+def _tier_for(user_id):
+    """Resolve the access_tier for a task's broker-attested sender.
+
+    A listed sender gets their mapped tier, CLAMPED to <= LOCAL_TIER: the map can
+    down-tier a sender below this node's default but never raise them above it, so
+    a compromised/misconfigured access.json can never ESCALATE. Everyone else
+    (unlisted / no user_id) gets LOCAL_TIER."""
+    uid = (user_id or "").strip()
+    if uid:
+        mapped = _load_tier_map().get(uid)
+        if mapped in _TIER_RANK:
+            local_rank = _TIER_RANK.get(LOCAL_TIER, _TIER_RANK["owner"])
+            return mapped if _TIER_RANK[mapped] <= local_rank else LOCAL_TIER
+    return LOCAL_TIER
+
+
 # ── inbound media fetch (owner screenshots, file uploads) ────────────────────
 # A gateway can hand the task body a media MARKER instead of raw bytes:
 #   [<tag>: <url> mime=<m> name=<f> size=<n> kind=<msgtype>] <caption>
@@ -502,14 +582,25 @@ def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
     return MEDIA_MARKER_RE.sub(lambda _m: f"[{label}: {path}]", body, count=1)
 
 
-def _write_owner_activity(task: dict) -> None:
+def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
     """Record that the owner was active on this transport right now — but only
-    when THIS node grants gateway traffic owner tier (LOCAL_TIER, never the
-    gateway's own claim; the gateway is outside the trust boundary). Atomic write
-    via tmp+rename; same schema (`ts`, `channel`, `summary`) as
-    discord-bridge.write_owner_activity so the proactive-loop reader is
+    when THIS node resolves the SENDER to owner tier. Gated on the sender's
+    resolved tier, NOT the gateway-wide LOCAL_TIER: in a shared room a
+    down-tiered teammate (tierMap[...] = "team"/"other") must not overwrite
+    `state/last-owner-activity.json`, or their message would poison owner-presence
+    routing (the proactive-loop's "owner active N min ago" signal + the core-
+    supervisor escalation target). `sender_tier` is passed in by `_write_task` so
+    the task tier and this gate share a SINGLE resolution (no divergence, no
+    double tierMap read); a direct caller can omit it and we resolve here. For an
+    unlisted sender `_tier_for` returns LOCAL_TIER, so the single-owner case is
+    unchanged. Never trusts the gateway's own claim (it is outside the trust
+    boundary) — only the broker-attested user_id keyed against the owner's LOCAL
+    tierMap. Atomic write via tmp+rename; same schema (`ts`, `channel`, `summary`)
+    as discord-bridge.write_owner_activity so the proactive-loop reader is
     transport-agnostic. Best-effort — never blocks task intake."""
-    if LOCAL_TIER != "owner":
+    if sender_tier is None:
+        sender_tier = _tier_for(task.get("user_id"))
+    if sender_tier != "owner":
         return
     try:
         OWNER_ACTIVITY_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -522,6 +613,14 @@ def _write_owner_activity(task: dict) -> None:
             "channel": task.get("source") or PROVIDER,
             "summary": body[:80],
         }
+        # Propagate the routable room id so the core-supervisor relay can escalate
+        # BACK into the AG2Space room the owner was last active in (resolve_active_
+        # target requires both `channel` and `channel_id`; without this it degrades
+        # to macOS-only for the gateway surface). Only when present — keeps the
+        # discord-bridge schema compatible for non-message activity.
+        _cid = str(task.get("channel_id") or "").strip()
+        if _cid:
+            payload["channel_id"] = _cid
         tmp = OWNER_ACTIVITY_FILE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload))
         tmp.rename(OWNER_ACTIVITY_FILE)
@@ -615,15 +714,22 @@ def _write_task(task: dict) -> str | None:
     # consumer in skills/agent-room-ops/verify_platform_card.py.)
     # access_tier is a LOCAL decision and written LAST so it wins even under a
     # last-occurrence parser; every other field is newline-stripped so none can
-    # forge an earlier one either.
-    lines.append(f"access_tier: {LOCAL_TIER}")
+    # forge an earlier one either. Resolved per broker-attested sender via the
+    # owner's tierMap (LOCAL file), falling back to LOCAL_TIER for unlisted
+    # senders — so a named teammate can be down-tiered without trusting the task.
+    # Resolve ONCE and reuse for both the task tier AND the owner-activity gate
+    # below, so the two decisions can never diverge (a single source of truth,
+    # no double read of the tierMap).
+    sender_tier = _tier_for(task.get("user_id"))
+    lines.append(f"access_tier: {sender_tier}")
     tmp = dest.with_suffix(".txt.tmp")
     tmp.write_text("\n".join(lines) + "\n")
     tmp.rename(dest)  # atomic publish so the watcher never sees a partial file
     _log(f"queued {tid}")
     _record_task_room(tid, str(task.get("channel_id") or ""))
-    # Bridges-as-siblings: feed the proactive-loop's active-engagement gate.
-    _write_owner_activity(task)
+    # Bridges-as-siblings: feed the proactive-loop's active-engagement gate — but
+    # only for owner-tier senders (same resolved tier as the task above).
+    _write_owner_activity(task, sender_tier)
     return tid
 
 

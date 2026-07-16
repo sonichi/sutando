@@ -621,6 +621,14 @@ else
   echo "  ✓ voice agent (already running)"
 fi
 
+# 1b. Call-tier advertisement (one-shot): write state/call-tiers.json so the
+# runtime descriptor advertises which DIRECT call endpoints are reachable now
+# (Track 9 availability-driven call-tier menu). Backgrounded — it probes tailscale
+# with its own short timeout and never blocks the rest of startup; absent file
+# just means the descriptor advertises no direct tiers (client falls back to cloud).
+npx tsx src/emit-call-tiers.ts > "$LOGS_DIR/emit-call-tiers.log" 2>&1 &
+echo "  ✓ call-tiers advertisement"
+
 # 2. Web client (port 8080)
 reap_wedged_listener 8080 web-client
 if ! lsof -i :8080 > /dev/null 2>&1; then
@@ -929,7 +937,11 @@ fi
 # 8. Phone conversation server + ngrok (optional — needs Twilio creds, skip with SKIP_PHONE=1)
 if [ "${SKIP_PHONE:-}" = "1" ]; then
   echo "  ~ conversation server (skipped via SKIP_PHONE)"
-elif grep -q "TWILIO_ACCOUNT_SID=" .env 2>/dev/null; then
+# Anchored + non-empty value: the unanchored substring form also matched the
+# commented template placeholder (`# TWILIO_ACCOUNT_SID=ACxxxxxxxxx`), starting
+# conversation-server and a PUBLIC ngrok tunnel on hosts with no Twilio at all.
+# Mirrors twilio_configured() in src/health-check.py — keep the two in sync.
+elif grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; then
   if ! pgrep -f "conversation-server" > /dev/null 2>&1; then
     echo "  Starting conversation server..."
     npx tsx skills/phone-conversation/scripts/conversation-server.ts > /tmp/conversation-server.log 2>&1 &

@@ -133,8 +133,13 @@ with tempfile.TemporaryDirectory() as _home:
     (_ch / ".env").write_text("SLACK_BOT_TOKEN=xoxb-test\n")
     _orig_chp = hc.claude_home_path
 
-    def _fake_chp(sub):
-        return Path(_home) / sub if sub == "channels" else _orig_chp(sub)
+    def _fake_chp(*sub):
+        # mirror claude_home_path(*subpath): redirect the whole channels/ tree
+        # (any depth, e.g. channels/ag2space/.env) into the temp home; delegate
+        # everything else to the real resolver.
+        if sub and sub[0] == "channels":
+            return Path(_home).joinpath(*sub)
+        return _orig_chp(*sub)
 
     with patch.object(hc, "check_port", side_effect=_stub_port), \
          patch.object(hc, "claude_home_path", side_effect=_fake_chp), \

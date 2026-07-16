@@ -237,6 +237,32 @@ def case_i_token_read_prefers_channel_env() -> list[str]:
     return fails
 
 
+def case_j_same_set_past_cooldown_does_not_resend() -> list[str]:
+    """Regression (owner complaint 2026-07-01): a persistent, unchanged
+    failure set must not re-DM the owner just because time has passed —
+    the old 1h-cooldown design re-sent the identical DM every hour
+    indefinitely for a never-resolving issue. Seeds state as if the set
+    was last (successfully) sent 25h ago and confirms a second call with
+    the SAME set sends nothing."""
+    fails = []
+    sent, send = recording_sender()
+    with tempfile.TemporaryDirectory() as td:
+        state = Path(td) / "slack.json"
+        checks = make_checks(("down", "voice-agent", "port 9900"))
+        set_key = "|".join(sorted(c["name"] for c in checks))
+        hash_key = hc.hashlib.sha256(set_key.encode()).hexdigest()[:16]
+        now_ms = int(time.time() * 1000)
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(json.dumps({
+            hash_key: now_ms - (25 * 3600 * 1000),  # 25h ago — past old 1h cooldown
+            "_last_hash": hash_key,
+        }))
+        hc.notify_slack_for_failures(checks, state_file=state, sender=send)
+        if sent:
+            fails.append("j) unchanged failure set re-sent after 25h — spam bug regressed")
+    return fails
+
+
 def main() -> int:
     cases = [
         ("a", case_a_all_ok_no_send),
@@ -248,6 +274,7 @@ def main() -> int:
         ("g", case_g_failed_send_not_recorded),
         ("h", case_h_history_pruned_after_24h),
         ("i", case_i_token_read_prefers_channel_env),
+        ("j", case_j_same_set_past_cooldown_does_not_resend),
     ]
     all_failures = []
     for label, fn in cases:
