@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Structural regression test: all three bridges guard against the empty-file
-race condition in their result_watcher loops.
+Regression test: all three bridges guard against the empty-file race
+condition in their result_watcher loops.
 
 Root cause (2026-06-04): when a result file is written via shell redirect
 `> file`, the OS creates the file empty before the process writes to it.
@@ -15,34 +15,52 @@ check `if not reply_text: continue` BEFORE popping from pending_replies.
 Popping is irreversible; archiving is irreversible. The guard ensures we
 only advance past the read if the file actually has content.
 
-Guards (each bridge):
-  1. `read_text().strip()` call exists (the file read).
-  2. `if not reply_text` guard exists immediately after.
-  3. The guard uses `continue` (skip this cycle, retry next poll).
-  4. The guard appears BEFORE `pop(` — confirms pending_replies is NOT
-     consumed on an empty read.
+Two layers, per bridge:
+  1. Structural: the four source-shape checks below (cheap smoke check,
+     catches an accidental revert or reordering at a glance).
+  2. Behavioral: extracts the ACTUAL `reply_text = ...` through `continue`
+     lines out of the real source (not a hand-copied reimplementation —
+     same technique as tests/watch-tasks-stream-trap-exit.test.sh), wraps
+     them in a one-iteration-loop harness, and exercises them against a
+     real empty-then-filled result file on disk. Asserts the guard actually
+     fires (pending_replies untouched, doesn't fall through) on the empty
+     read, and actually clears (falls through) once the file has content.
 
 Run manually:
     python3 tests/bridge-result-race-guard.test.py
 """
 
-from pathlib import Path
+from __future__ import annotations
+
 import re
 import sys
+import tempfile
+import unittest
+from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "src"))
+
+from workspace_default import resolve_workspace  # noqa: E402
 
 # The fix was applied to the runtime source (app bundle / workspace symlink).
-# Prefer the workspace path so CI on the running instance sees the live fix;
-# fall back to the OSS repo path for upstream portability checks.
-_WORKSPACE_SRC = Path.home() / ".sutando" / "workspace" / "src"
+# Prefer a live workspace copy so CI on a running instance sees the live fix;
+# fall back to the OSS repo path for upstream portability checks. Workspace
+# location is resolved through the canonical loader (never a hardcoded
+# `~/.sutando/workspace` literal — that's the pre-M0 legacy default and is
+# banned tree-wide by scripts/lint-workspace-resolution.sh).
+try:
+    _WORKSPACE_SRC = resolve_workspace(migrate=False) / "src"
+except Exception:
+    _WORKSPACE_SRC = None
 _REPO_SRC = REPO / "src"
 
 
 def _bridge_path(name: str) -> Path:
-    ws = _WORKSPACE_SRC / f"{name}.py"
-    if ws.exists():
-        return ws.resolve()  # follow symlink to actual file
+    if _WORKSPACE_SRC is not None:
+        ws = _WORKSPACE_SRC / f"{name}.py"
+        if ws.exists():
+            return ws.resolve()  # follow symlink to actual file
     return _REPO_SRC / f"{name}.py"
 
 
@@ -52,80 +70,168 @@ BRIDGES = {
     "telegram-bridge": _bridge_path("telegram-bridge"),
 }
 
-errors = 0
 
+# ---------------------------------------------------------------------------
+# Layer 1: structural checks (source-shape smoke check)
+# ---------------------------------------------------------------------------
 
-def fail(msg: str, context: str = "") -> None:
-    global errors
-    print(f"FAIL: {msg}", file=sys.stderr)
-    if context:
-        print("  context:", context[:300], file=sys.stderr)
-    errors += 1
+class StructuralGuardTest(unittest.TestCase):
+    def _check(self, name: str, path: Path) -> None:
+        self.assertTrue(path.exists(), f"{name}: file not found at {path}")
+        src = path.read_text()
 
-
-def check_bridge(name: str, path: Path) -> None:
-    if not path.exists():
-        fail(f"{name}: file not found at {path}")
-        return
-
-    src = path.read_text()
-
-    # 1. read_text().strip() call exists
-    if "read_text().strip()" not in src:
-        fail(f"{name}: missing `read_text().strip()` — race guard has no effect without the read")
-        return
-
-    # Locate the result_watcher / poll section that reads result files.
-    # Find the first occurrence of read_text().strip() assigned to reply_text.
-    read_pat = re.compile(r"reply_text\s*=\s*result_file\.read_text\(\)\.strip\(\)")
-    read_match = read_pat.search(src)
-    if not read_match:
-        fail(f"{name}: `reply_text = result_file.read_text().strip()` not found")
-        return
-
-    # 2. `if not reply_text` guard exists after the read
-    after_read = src[read_match.end():]
-    guard_pat = re.compile(r"if\s+not\s+reply_text\s*:")
-    guard_match = guard_pat.search(after_read)
-    if not guard_match:
-        fail(
-            f"{name}: missing `if not reply_text:` guard after read_text().strip()",
-            after_read[:400],
+        self.assertIn(
+            "read_text().strip()", src,
+            f"{name}: missing `read_text().strip()` — race guard has no effect without the read",
         )
-        return
 
-    # 3. `continue` follows the guard (within the next 120 chars)
-    guard_block = after_read[guard_match.end(): guard_match.end() + 120]
-    if "continue" not in guard_block:
-        fail(
+        read_pat = re.compile(r"reply_text\s*=\s*result_file\.read_text\(\)\.strip\(\)")
+        read_match = read_pat.search(src)
+        self.assertIsNotNone(
+            read_match, f"{name}: `reply_text = result_file.read_text().strip()` not found",
+        )
+
+        after_read = src[read_match.end():]
+        guard_pat = re.compile(r"if\s+not\s+reply_text\s*:")
+        guard_match = guard_pat.search(after_read)
+        self.assertIsNotNone(
+            guard_match, f"{name}: missing `if not reply_text:` guard after read_text().strip()",
+        )
+
+        guard_block = after_read[guard_match.end(): guard_match.end() + 120]
+        self.assertIn(
+            "continue", guard_block,
             f"{name}: `if not reply_text:` guard exists but does not `continue` — fix has no effect",
-            guard_block,
         )
-        return
 
-    # 4. guard appears BEFORE `.pop(` — pending_replies not consumed on empty read
-    pop_pat = re.compile(r"\.pop\(")
-    pop_match = pop_pat.search(after_read)
-    if not pop_match:
-        # No pop at all after read — unusual, but not the bug we're guarding.
-        pass
-    elif guard_match.start() > pop_match.start():
-        fail(
-            f"{name}: `if not reply_text:` guard appears AFTER `.pop(` — pending_replies "
-            f"is consumed before the guard fires; race condition is NOT fixed",
-            after_read[:500],
+        pop_pat = re.compile(r"\.pop\(")
+        pop_match = pop_pat.search(after_read)
+        if pop_match is not None:
+            self.assertLessEqual(
+                guard_match.start(), pop_match.start(),
+                f"{name}: `if not reply_text:` guard appears AFTER `.pop(` — pending_replies "
+                f"is consumed before the guard fires; race condition is NOT fixed",
+            )
+
+    def test_slack_bridge_structural(self):
+        self._check("slack-bridge", BRIDGES["slack-bridge"])
+
+    def test_discord_bridge_structural(self):
+        self._check("discord-bridge", BRIDGES["discord-bridge"])
+
+    def test_telegram_bridge_structural(self):
+        self._check("telegram-bridge", BRIDGES["telegram-bridge"])
+
+
+# ---------------------------------------------------------------------------
+# Layer 2: behavioral — extract the real lines, run them against a real file
+# ---------------------------------------------------------------------------
+
+def _extract_race_guard_snippet(src: str) -> str:
+    """Pull `reply_text = result_file.read_text().strip()` through the end of
+    the `if not reply_text: continue` block, out of the REAL source — not a
+    hand-copied reimplementation, so this breaks if the fix regresses."""
+    read_pat = re.compile(r"^(\s*)reply_text\s*=\s*result_file\.read_text\(\)\.strip\(\)\s*$", re.MULTILINE)
+    m = read_pat.search(src)
+    assert m, "reply_text = result_file.read_text().strip() not found in source"
+    indent = m.group(1)
+    lines = src[m.start():].splitlines()
+    # First line is the read; keep consuming until we've captured the
+    # `if not reply_text:` + its `continue` body (next differently- or
+    # equally-indented line after the guard's own indented body).
+    out = [lines[0]]
+    i = 1
+    guard_seen = False
+    guard_indent = None
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if not guard_seen:
+            out.append(line)
+            if re.match(r"if\s+not\s+reply_text\s*:", stripped):
+                guard_seen = True
+                guard_indent = len(line) - len(line.lstrip())
+            i += 1
+            continue
+        # Inside/after the guard: keep lines that are part of its indented
+        # body (deeper than guard_indent); stop at the first line back at
+        # guard_indent or shallower (that's code AFTER the guard block).
+        this_indent = len(line) - len(line.lstrip()) if stripped else guard_indent + 4
+        if stripped and this_indent <= guard_indent:
+            break
+        out.append(line)
+        i += 1
+    return "\n".join(out) + "\n" + f"{indent}_REACHED_PAST_GUARD.append(True)\n"
+
+
+class BehavioralRaceGuardTest(unittest.TestCase):
+    """Executes the ACTUAL extracted guard lines from each bridge against a
+    real empty-then-filled result file, asserting the guard fires (skips)
+    on empty and clears (proceeds) once content lands — the literal race
+    this PR fixes, not a proxy for it."""
+
+    def _run_harness(self, name: str, path: Path, file_content: str) -> bool:
+        """Returns True iff the extracted guard let execution reach past it
+        (i.e. reply_text was truthy and no `continue` fired)."""
+        src = path.read_text()
+        snippet = _extract_race_guard_snippet(src)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write(file_content)
+            result_path = f.name
+        try:
+            harness = (
+                "class _ResultFile:\n"
+                "    def __init__(self, p):\n"
+                "        self._p = p\n"
+                "    def read_text(self):\n"
+                "        with open(self._p) as fh:\n"
+                "            return fh.read()\n"
+                f"result_file = _ResultFile({result_path!r})\n"
+                "_REACHED_PAST_GUARD = []\n"
+                "for _tick in [0]:\n"
+                + "\n".join("    " + l for l in snippet.splitlines())
+                + "\n"
+            )
+            ns: dict = {}
+            exec(harness, ns)  # noqa: S102 — trusted, in-repo source only
+            return bool(ns["_REACHED_PAST_GUARD"])
+        finally:
+            Path(result_path).unlink(missing_ok=True)
+
+    def _assert_race_guard_behavior(self, name: str) -> None:
+        path = BRIDGES[name]
+        # Empty file (the race window): guard must fire — must NOT reach
+        # past it (no pop, no archive — retry next poll instead).
+        reached_on_empty = self._run_harness(name, path, "")
+        self.assertFalse(
+            reached_on_empty,
+            f"{name}: guard did NOT fire on an empty result file — the race is NOT fixed "
+            f"(this would pop + archive the task with the reply permanently lost)",
         )
-        return
+        # Whitespace-only file: same as empty after .strip() — must also guard.
+        reached_on_whitespace = self._run_harness(name, path, "   \n\n")
+        self.assertFalse(
+            reached_on_whitespace,
+            f"{name}: guard did NOT fire on a whitespace-only result file",
+        )
+        # Real content: guard must NOT fire — execution must reach past it
+        # so the reply actually gets delivered.
+        reached_on_content = self._run_harness(name, path, "Here's your answer.")
+        self.assertTrue(
+            reached_on_content,
+            f"{name}: guard fired on a NON-empty result file — this would silently "
+            f"drop every real reply, not just the race window",
+        )
 
-    print(f"  ok  {name}: empty-file race guard present and correctly ordered")
+    def test_slack_bridge_behavioral(self):
+        self._assert_race_guard_behavior("slack-bridge")
+
+    def test_discord_bridge_behavioral(self):
+        self._assert_race_guard_behavior("discord-bridge")
+
+    def test_telegram_bridge_behavioral(self):
+        self._assert_race_guard_behavior("telegram-bridge")
 
 
-print("bridge-result-race-guard — checking all 3 bridges:")
-for bridge_name, bridge_path in BRIDGES.items():
-    check_bridge(bridge_name, bridge_path)
-
-if errors:
-    print(f"\nFAILED: {errors} check(s) failed", file=sys.stderr)
-    sys.exit(1)
-else:
-    print(f"\nPASSED: all {len(BRIDGES)} bridges have the race guard")
+if __name__ == "__main__":
+    unittest.main()
