@@ -45,7 +45,16 @@ HARNESS="$TMPDIR_T/harness.sh"
   # Pull the exact cleanup()/trap lines out of the real script so this test
   # breaks if the fix is ever reverted or edited incompatibly.
   sed -n '/^cleanup()/,/^trap .*HUP INT TERM$/p' "$WATCHER"
-  echo 'while true; do sleep 1; done'
+  # `read` (a bash builtin) blocks until input/EOF/signal and is interrupted
+  # IMMEDIATELY on a trapped signal per bash's documented behavior. A `sleep`
+  # loop instead waits on an EXTERNAL process each iteration — some
+  # bash/coreutils combinations defer running a pending trap until that
+  # foreground child exits, which is the likely source of this test's CI
+  # flake (needed the watchdog's SIGKILL there, passed instantly locally).
+  # The real watch-tasks-stream.sh blocks on fswatch, not a sleep loop
+  # anyway — this placeholder only needs to keep the harness alive, so its
+  # exact mechanism doesn't need to mirror production.
+  echo 'while true; do read -r -t 3600 _ 2>/dev/null || true; done'
 } > "$HARNESS"
 
 bash "$HARNESS" &
