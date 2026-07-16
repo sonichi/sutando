@@ -194,7 +194,7 @@ class TestStoreRegistersKey(unittest.TestCase):
 
 
 import io
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 
 
 class TestVaultCliList(unittest.TestCase):
@@ -253,6 +253,39 @@ class TestVaultCliSet(unittest.TestCase):
             with self.assertRaises(SystemExit) as cm:
                 vault_cli.cmd_set("bad key")
         self.assertEqual(cm.exception.code, 1)
+
+
+class TestVaultCliMainDispatch(unittest.TestCase):
+    """main()'s set-dispatch branches (argv guards live here, not in cmd_set)."""
+
+    def _main(self, argv):
+        with patch("vault.sys.argv", ["secret-vault.py", *argv]):
+            vault_cli.main()
+
+    def test_set_dispatches_to_cmd_set(self):
+        with patch("vault.cmd_set") as mock_cmd:
+            self._main(["set", "MY_KEY"])
+        mock_cmd.assert_called_once_with("MY_KEY")
+
+    def test_set_missing_key_exits_1(self):
+        with self.assertRaises(SystemExit) as cm:
+            self._main(["set"])
+        self.assertEqual(cm.exception.code, 1)
+
+    def test_set_refuses_value_on_argv(self):
+        # The whole point of the stdin design — a value on argv is refused, not stored.
+        with patch("vault.cmd_set") as mock_cmd:
+            with self.assertRaises(SystemExit) as cm:
+                self._main(["set", "MY_KEY", "leaky-value"])
+        self.assertEqual(cm.exception.code, 1)
+        mock_cmd.assert_not_called()
+
+    def test_unknown_subcommand_usage_mentions_set(self):
+        buf = io.StringIO()
+        with self.assertRaises(SystemExit) as cm, redirect_stderr(buf):
+            self._main(["frobnicate"])
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("set KEY", buf.getvalue())
 
 
 class TestVaultCliEnv(unittest.TestCase):
