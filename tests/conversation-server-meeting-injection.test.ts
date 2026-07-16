@@ -25,6 +25,39 @@ const SRC = readFileSync(
 	'utf-8',
 );
 
+describe('delegateTask() — caller field injection guard', () => {
+	// The caller: field is written before access_tier: in the task file.
+	// If callerNumber contains \naccess_tier: owner, it lands before the real
+	// access_tier: line — parsers that take the first occurrence would be fooled.
+	// Twilio signature validation limits practical risk but defence-in-depth
+	// says callerNumber must also go through confineUserContent().
+	it('wraps callerNumber in confineUserContent()', () => {
+		assert.match(
+			SRC,
+			/caller:\s*\$\{confineUserContent\(callSession\.callerNumber/,
+			'conversation-server.ts delegateTask() must wrap callerNumber in confineUserContent(). ' +
+				'callerNumber appears before access_tier: in the task file — a newline-containing ' +
+				'value (forged From header bypassing Twilio validation) could inject a ZWSP-free ' +
+				'access_tier: owner line above the real one.',
+		);
+	});
+});
+
+describe('summary task — caller field injection guard', () => {
+	// The summary task (written at end-of-call) has the same shape as delegateTask():
+	// caller: appears before access_tier: in the task file. session.callerNumber must
+	// be wrapped in confineUserContent() for the same defence-in-depth reason.
+	it('wraps session.callerNumber in confineUserContent()', () => {
+		assert.match(
+			SRC,
+			/caller:\s*\$\{confineUserContent\(session\.callerNumber/,
+			'conversation-server.ts summary task must wrap session.callerNumber in confineUserContent(). ' +
+				'caller: appears before access_tier: in the task file — same injection shape as ' +
+				'delegateTask() (fixed in same commit). ',
+		);
+	});
+});
+
 describe('/meeting handler — task-file injection guard', () => {
 	it('strips CR/LF from `platform` before use', () => {
 		assert.match(

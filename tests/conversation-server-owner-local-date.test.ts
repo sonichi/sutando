@@ -13,8 +13,14 @@ import { join } from 'node:path';
 // session-open, naming the owner-local today/tomorrow/yesterday so the model
 // has explicit absolute YYYY-MM-DD values to pass to tools.
 
+// Step 5b-1 moved the tuned per-call instruction assembly into
+// phone-agent-config.ts; the invariants below span both files, so SRC is
+// their concatenation (server wiring + config prompts).
 const SRC = readFileSync(
 	join(import.meta.dirname ?? '.', '..', 'skills/phone-conversation/scripts/conversation-server.ts'),
+	'utf-8',
+) + readFileSync(
+	join(import.meta.dirname ?? '.', '..', 'skills/phone-conversation/scripts/phone-agent-config.ts'),
 	'utf-8',
 );
 
@@ -67,7 +73,9 @@ describe('conversation-server — owner-local date context (sonichi#1243)', () =
 	});
 
 	it('injects ownerLocalDateContext() into the "## Known info" block', () => {
-		const re = /## Known info[\s\S]{0,400}?ownerLocalDateContext\(\)/;
+		// Post-5b-1 the call site passes the tz + clock explicitly
+		// (ownerLocalDateContext(deps.ownerTz, ...)) — accept both forms.
+		const re = /## Known info[\s\S]{0,400}?ownerLocalDateContext\((\)|deps\.ownerTz)/;
 		assert.match(
 			SRC,
 			re,

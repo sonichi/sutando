@@ -326,6 +326,12 @@ fi
 # still there as a fallback (mentioned in README).
 bash "$REPO/scripts/install-git-hooks.sh" >/dev/null 2>&1 || true
 
+# Wire the SessionStart hook that reminds the core agent to run /schedule-crons
+# on every session start (including post-compaction). Idempotent — safe to run
+# on every start. Crons are session-only, so without this, recurring jobs go
+# dark whenever a session restarts without an explicit /schedule-crons invocation.
+bash "$REPO/scripts/install-session-start-hook.sh" 2>&1 || true
+
 # Auto-bootstrap: create-if-missing files and dirs that the agent + skills
 # expect to exist (logs, state, tasks, results, notes, contextual-chips.json,
 # pending-questions.md, build_log.md, crons.json, …). Idempotent — safe to
@@ -615,6 +621,14 @@ else
   echo "  ✓ voice agent (already running)"
 fi
 
+# 1b. Call-tier advertisement (one-shot): write state/call-tiers.json so the
+# runtime descriptor advertises which DIRECT call endpoints are reachable now
+# (Track 9 availability-driven call-tier menu). Backgrounded — it probes tailscale
+# with its own short timeout and never blocks the rest of startup; absent file
+# just means the descriptor advertises no direct tiers (client falls back to cloud).
+npx tsx src/emit-call-tiers.ts > "$LOGS_DIR/emit-call-tiers.log" 2>&1 &
+echo "  ✓ call-tiers advertisement"
+
 # 2. Web client (port 8080)
 reap_wedged_listener 8080 web-client
 if ! lsof -i :8080 > /dev/null 2>&1; then
@@ -623,6 +637,23 @@ if ! lsof -i :8080 > /dev/null 2>&1; then
   echo "  ✓ web client"
 else
   echo "  ✓ web client (already running)"
+fi
+
+# 2b. Tailnet HTTPS front for browser wss:// voice reach (opt-in).
+# When SUTANDO_TAILNET_SERVE is on, front the webUI with `tailscale serve` so a
+# browser on another device on your tailnet can open wss:// to the /ws proxy
+# (plain ws:// to a non-localhost host is blocked as mixed content from an HTTPS
+# page). Best-effort: a missing prerequisite (tailscale down, HTTPS not enabled
+# for the tailnet) must NOT fail startup — the helper prints its own diagnostics
+# to the log. `tailscale serve --bg` is idempotent, so re-running each boot is
+# safe. Pairs with SUTANDO_LAN_SHARE=1 (which the helper reminds you to set).
+if [[ "${SUTANDO_TAILNET_SERVE:-}" =~ ^(1|true|yes|on)$ ]]; then
+  echo "  Fronting webUI with tailscale serve (SUTANDO_TAILNET_SERVE on)..."
+  if bash "$REPO/scripts/tailscale-serve-voice.sh" >> "$LOGS_DIR/tailscale-serve.log" 2>&1; then
+    echo "  ✓ tailscale serve (browser wss:// tailnet reach)"
+  else
+    echo "  ⚠ tailscale serve skipped — see $LOGS_DIR/tailscale-serve.log"
+  fi
 fi
 
 # 3. Dashboard (port 7844)
@@ -816,7 +847,13 @@ if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channel
   # Map legacy AG2_REMOTE_* → REMOTE_TASK_* (the names the bridge reads). The
   # legacy token may be the combined "url|secret" form, which the bridge splits.
   REMOTE_TASK_TOKEN="${REMOTE_TASK_TOKEN:-${AG2_REMOTE_TOKEN:-}}"
-  REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-${AG2_REMOTE_TIER:-team}}"
+  # Default tier is "owner" for the personal-agent model (2026-07-08): a user's
+  # own gateway authenticates with their own owner bearer and the broker
+  # owner-scopes every pull, so its tasks are the owner's own (e.g. voice
+  # delegations). Must match the bridge's own default — otherwise startup.sh
+  # would export a value and the bridge's default never fires. A shared /
+  # multi-user gateway sets REMOTE_TASK_TIER=team explicitly.
+  REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-${AG2_REMOTE_TIER:-owner}}"
   export REMOTE_TASK_TOKEN REMOTE_TASK_TIER
   if ! pgrep -f "remote-gateway-bridge" > /dev/null 2>&1; then
     python3 "$REPO/src/remote-gateway-bridge.py" > "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
@@ -834,7 +871,9 @@ fi
 # right one in the first place avoids the wasted process + traceback noise.
 # Probe a fixed list of candidates in priority order; first one with discord.py
 # wins. Same probe is also what's used in the bridge's rescue fallback.
-if _DC_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/discord/.env)"; [ -f "$_DC_ENV" ] && grep -q "DISCORD_BOT_TOKEN=" "$_DC_ENV" 2>/dev/null; then
+if [ "${SKIP_DISCORD:-}" = "1" ]; then
+  echo "  ~ discord bridge (skipped via SKIP_DISCORD)"
+elif _DC_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/discord/.env)"; [ -f "$_DC_ENV" ] && grep -q "DISCORD_BOT_TOKEN=" "$_DC_ENV" 2>/dev/null; then
   PYTHON_WITH_DISCORD=""
   for _p in /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
     if command -v "$_p" >/dev/null 2>&1 && "$_p" -c "import discord" 2>/dev/null; then
@@ -870,7 +909,9 @@ fi
 # 7b. Slack bridge (optional — needs SLACK_BOT_TOKEN + SLACK_APP_TOKEN + slack_bolt)
 # Probes the same Python-interpreter candidates as the discord bridge so a
 # fresh-install miniconda env doesn't silently miss slack_bolt.
-if _SL_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/slack/.env)"; [ -f "$_SL_ENV" ] && grep -q "SLACK_BOT_TOKEN=" "$_SL_ENV" 2>/dev/null; then
+if [ "${SKIP_SLACK:-}" = "1" ]; then
+  echo "  ~ slack bridge (skipped via SKIP_SLACK)"
+elif _SL_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/slack/.env)"; [ -f "$_SL_ENV" ] && grep -q "SLACK_BOT_TOKEN=" "$_SL_ENV" 2>/dev/null; then
   PYTHON_WITH_SLACK=""
   for _p in /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
     if command -v "$_p" >/dev/null 2>&1 && "$_p" -c "import slack_bolt" 2>/dev/null; then
@@ -896,7 +937,11 @@ fi
 # 8. Phone conversation server + ngrok (optional — needs Twilio creds, skip with SKIP_PHONE=1)
 if [ "${SKIP_PHONE:-}" = "1" ]; then
   echo "  ~ conversation server (skipped via SKIP_PHONE)"
-elif grep -q "TWILIO_ACCOUNT_SID=" .env 2>/dev/null; then
+# Anchored + non-empty value: the unanchored substring form also matched the
+# commented template placeholder (`# TWILIO_ACCOUNT_SID=ACxxxxxxxxx`), starting
+# conversation-server and a PUBLIC ngrok tunnel on hosts with no Twilio at all.
+# Mirrors twilio_configured() in src/health-check.py — keep the two in sync.
+elif grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; then
   if ! pgrep -f "conversation-server" > /dev/null 2>&1; then
     echo "  Starting conversation server..."
     npx tsx skills/phone-conversation/scripts/conversation-server.ts > /tmp/conversation-server.log 2>&1 &

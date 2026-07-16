@@ -259,7 +259,9 @@ const HARDCODED_WORKSPACE_DEFAULT_REL = 'workspace';
  *
  * Order (v0.8 — `$SUTANDO_WORKSPACE` no longer honored):
  *   1. `sutando.config.{json,local.json}` → `workspace.path` (deep-merged).
- *   2. `{repoRoot}/workspace` baked-in default.
+ *   2. `$SUTANDO_DEFAULT_WORKSPACE` — optional full workspace path an embedder
+ *      may set (fills the default slot). Mirrors `sutando_config.py`.
+ *   3. `{repoRoot}/workspace` baked-in default.
  *
  * If `$SUTANDO_WORKSPACE` is set in the environment, prints a one-time
  * migration-nag warning pointing at `scripts/sutando-migrate.sh` but does
@@ -301,9 +303,17 @@ export function resolveWorkspace(repoRoot?: string): string {
 	const cfg = loadConfig(repoRoot);
 	const root = repoRoot ?? _cacheRepoRoot;
 	const ws = (cfg.workspace as { [k: string]: Json } | undefined)?.path;
+	// Optional embedder-provided default workspace (mirrors sutando_config.py):
+	// an embedder (e.g. the AG2 Space desktop app) passes the FULL workspace path
+	// via $SUTANDO_DEFAULT_WORKSPACE. Fills the default slot only — explicit
+	// workspace.path config wins. Parity here keeps TS services (task-bridge,
+	// voice-agent, web-client) in the same workspace as the Python core.
+	const embedderDefault = process.env.SUTANDO_DEFAULT_WORKSPACE?.trim();
 	let resolved: string;
 	if (typeof ws === 'string' && ws) {
 		resolved = resolve(ws.replace(/^~/, homedir()));
+	} else if (embedderDefault) {
+		resolved = resolve(embedderDefault.replace(/^~/, homedir()));
 	} else if (root === undefined) {
 		resolved = resolve(join(homedir(), '.sutando', 'workspace'));
 	} else {

@@ -290,6 +290,73 @@ def case_k_emit_proceeds_when_core_dead() -> list[str]:
     return fails
 
 
+def case_l_task_field_is_last() -> list[str]:
+    """task: must appear AFTER source/user_id/access_tier/priority in the
+    task file so that the multi-line bullet body can't shadow trusted fields
+    above it. Defense-in-depth consistent with the bridge field-order
+    convention (health-check content is trusted, but external data such as
+    hostnames or service error messages could flow through check details)."""
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        state_file = td / "state" / "hla.json"
+        tasks_dir = td / "tasks"
+        hc.emit_task_for_failures(
+            [{"name": "voice-agent", "status": "stale", "detail": "process old"},
+             {"name": "memory", "status": "fail", "detail": "swap 8G"}],
+            state_file=state_file, tasks_dir=tasks_dir,
+        )
+        files = list(tasks_dir.glob("task-health-*.txt"))
+        if not files:
+            fails.append("l) no task file written — cannot check field order")
+            return fails
+        body = files[0].read_text()
+        keys = []
+        for line in body.splitlines():
+            colon = line.find(":")
+            if colon > 0 and " " not in line[:colon]:
+                keys.append(line[:colon])
+        for sentinel in ("source", "user_id", "access_tier", "priority"):
+            if sentinel not in keys:
+                continue
+            if "task" not in keys:
+                fails.append(f"l) task: key missing from task file")
+                break
+            if keys.index(sentinel) > keys.index("task"):
+                fails.append(
+                    f"l) field-order broken: {sentinel} (pos {keys.index(sentinel)}) "
+                    f"comes AFTER task: (pos {keys.index('task')})"
+                )
+    return fails
+
+
+def case_m_same_set_past_cooldown_does_not_refire() -> list[str]:
+    """Regression (owner complaint 2026-07-01): an unchanged, persistent
+    failure set must NOT re-alert just because an hour (or any amount of
+    time) has passed. Only a change in the failure set should re-fire.
+    Seeds state as if the set was last alerted 25h ago (well past the old
+    1h cooldown) and confirms a second call with the SAME set stays silent.
+    """
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        state_file = td / "state" / "health-last-alerted.json"
+        tasks_dir = td / "tasks"
+        checks = make_checks(("warn", "memory-sync"))
+        set_key = "|".join(sorted(c["name"] for c in checks))
+        hash_key = hc.hashlib.sha256(set_key.encode()).hexdigest()[:16]
+        now_ms = int(time.time() * 1000)
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(json.dumps({
+            hash_key: now_ms - (25 * 3600 * 1000),  # 25h ago — past old 1h cooldown
+            "_last_hash": hash_key,
+        }))
+        hc.emit_task_for_failures(checks, state_file=state_file, tasks_dir=tasks_dir)
+        if list_task_files(tasks_dir):
+            fails.append("m) unchanged failure set re-fired after 25h — spam bug regressed")
+    return fails
+
+
 def main() -> int:
     cases = [
         ("a", case_a_empty_failures_no_file),
@@ -303,6 +370,8 @@ def main() -> int:
         ("i", case_i_any_core_alive_returns_false_for_stale_file),
         ("j", lambda: case_j_emit_skipped_when_core_alive(None)),
         ("k", case_k_emit_proceeds_when_core_dead),
+        ("l", case_l_task_field_is_last),
+        ("m", case_m_same_set_past_cooldown_does_not_refire),
     ]
     all_failures = []
     for label, fn in cases:

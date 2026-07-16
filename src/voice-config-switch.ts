@@ -47,7 +47,10 @@ export const switchVoiceConfigTool: ToolDefinition = {
 		'Presets: ' +
 		'"search" = gemini-2.5-flash-native-audio + googleSearch:true (best for Q&A with Web grounding); ' +
 		'"no-search" = gemini-3.1-flash-live-preview + googleSearch:false (newer model, no Web grounding). ' +
-		'Restart takes ~2-3 seconds during which voice will be silent; the web client auto-reconnects.',
+		'Restart takes ~2-3 seconds during which voice will be silent; the web client auto-reconnects. ' +
+		'HIGH-IMPACT: this restarts the whole voice session. Call it ONLY on one of those explicit switch ' +
+		'requests — NEVER because the conversation merely mentions search/searching, and never on filler ' +
+		'or garbled speech; when unsure, fire nothing.',
 	parameters: z.object({
 		preset: z.enum(['search', 'no-search']).describe('Which preset to switch to. "search" = 2.5+Web grounding. "no-search" = 3.1+no-Web.'),
 	}),

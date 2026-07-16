@@ -44,11 +44,17 @@ setup_sandbox() {
   local helper_subdir="$2"    # subdir to put in fake config; e.g. ".claude-sutando" (valid) or "/etc/claude" (invalid)
 
   SANDBOX="$(mktemp -d -t start-cli-test.XXXXXX)"
+  # Resolve symlinks so path comparisons match the helper's resolved output
+  # (macOS mktemp returns /var/folders/... which is a symlink to /private/var/...).
+  SANDBOX="$(cd "$SANDBOX" && pwd -P)"
   REPO_FAKE="$SANDBOX/repo"
   ENV_DUMP="$SANDBOX/env-dump"
   BIN_STUB="$SANDBOX/bin"
   export HOME="$SANDBOX/home"
   export SUTANDO_WORKSPACE="$SANDBOX/workspace"
+  # Prevent ambient CLAUDE_CONFIG_DIR (from the test runner's own session) from
+  # leaking into the spawned process and breaking the "not set" assertion.
+  unset CLAUDE_CONFIG_DIR
 
   mkdir -p "$REPO_FAKE/scripts" "$REPO_FAKE/src" "$REPO_FAKE/src/agent/claude/cli" "$BIN_STUB" \
            "$HOME" "$SUTANDO_WORKSPACE/state"
@@ -108,9 +114,11 @@ EOF
   if [ "$helper_present" = "yes" ]; then
     cp "$REAL_REPO/scripts/sutando-config.sh" "$REPO_FAKE/scripts/"
     cp "$REAL_REPO/src/sutando_config.py" "$REPO_FAKE/src/"
+    # Use absolute path so workspace resolves to $SANDBOX/workspace (the same
+    # dir the mkdir above created), avoiding a mismatch with ${REPO_DIR}/workspace.
     cat > "$REPO_FAKE/sutando.config.json" << EOF
 {
-  "workspace": {"path": "\${REPO_DIR}/workspace"},
+  "workspace": {"path": "$SANDBOX/workspace"},
   "claude_sutando_config_dir": {"subdir": "$helper_subdir"}
 }
 EOF
@@ -173,8 +181,11 @@ test_valid_config_exports_env() {
     echo "  FAIL: CLAUDE_CONFIG_DIR not in claude's env"
     cleanup_sandbox; return 1
   fi
-  # Must point at SUTANDO_WORKSPACE/.claude-sutando.
-  expected="CLAUDE_CONFIG_DIR=$SUTANDO_WORKSPACE/.claude-sutando"
+  # Must point at <workspace>/.claude-sutando where <workspace> is resolved
+  # from sutando.config.json (= "${REPO_DIR}/workspace" = $REPO_FAKE/workspace).
+  # $SUTANDO_WORKSPACE is the deprecated v0.8 env-var and is no longer read by
+  # the resolver — using it here would give a stale path on a clean CI runner.
+  expected="CLAUDE_CONFIG_DIR=$REPO_FAKE/workspace/.claude-sutando"
   if [ "$ccd_in_env" != "$expected" ]; then
     echo "  FAIL: CLAUDE_CONFIG_DIR mismatch"
     echo "    expected : $expected"

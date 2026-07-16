@@ -22,7 +22,7 @@ The bridge reads these from the environment (typically sourced from
 | `REMOTE_TASK_TOKEN` | yes | — | Bearer token sent on every request. |
 | `REMOTE_TASK_PROVIDER` | no | `remote` | Label written as a task's `source:` when the task omits one. |
 | `REMOTE_TASK_POLL_WAIT` | no | `25` | Long-poll seconds requested per `/v1/tasks` call. |
-| `REMOTE_TASK_TIER` | no | `team` | Local access tier stamped on every inbound task (see Security). |
+| `REMOTE_TASK_TIER` | no | `owner` | Local access tier stamped on every inbound task; `owner` for the personal-agent model, set `team`/`other` for a shared gateway (see Security). |
 
 **Use the split form** (`REMOTE_TASK_URL` + `REMOTE_TASK_TOKEN`) — it's the recommended way to configure the bridge.
 
@@ -126,10 +126,15 @@ gateway-controlled URL can never bounce a bearer to another host.
 ## Security
 
 - Inbound tasks are **not trusted to set their own access tier.** The bridge
-  stamps every task with the local `REMOTE_TASK_TIER` (default `team`) as the
-  last `access_tier:` line, so a task body cannot forge a higher tier. Set
-  `REMOTE_TASK_TIER=owner` in the channel `.env` only for a gateway you fully
-  control.
+  stamps every task with the local `REMOTE_TASK_TIER` as the last `access_tier:`
+  line, so a task body cannot forge a higher tier. **Default is `owner`** for the
+  personal-agent model (2026-07-08): the gateway authenticates with its owner's
+  own bearer and the broker owner-scopes every pull, so its tasks are the
+  owner's own (e.g. voice delegations); trust derives from the broker's
+  owner-scoping, not from the gateway process or the task's claim. A **shared /
+  multi-user gateway** (one that could pull tasks not scoped to a single owner)
+  MUST set `REMOTE_TASK_TIER=team` (or `other`) explicitly. An invalid value
+  fails **closed** to `team`.
 - The token is a per-host credential; keep it in the channel `.env`
   (host-local), not in the synced workspace.
 
