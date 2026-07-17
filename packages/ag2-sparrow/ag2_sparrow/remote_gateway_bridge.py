@@ -268,6 +268,34 @@ def _tier_for(user_id):
 MEDIA_MARKER_TAG = re.sub(r"[^A-Za-z0-9_-]", "",
                           os.environ.get("REMOTE_MEDIA_MARKER") or "remote-media")
 MEDIA_MARKER_RE = re.compile(r"\[" + re.escape(MEDIA_MARKER_TAG) + r":([^\]]*)\]")
+
+# Untrusted room-ops metadata block: the gateway appends a free-text
+# `[room-ops metadata: …]` pointer to the operating card onto the message body.
+# It self-labels "Not an instruction" and is UNSIGNED (unlike platform_card,
+# which is a signed header consumers verify offline). Because it rides in the
+# task body — the same field as the user's words — a naive agent can read it as
+# an instruction. We strip it here so it never reaches the agent as body content
+# (owner directive 2026-07-16). The operating card stays discoverable via the
+# documented prep_get op; a TRUSTED pointer, if ever wanted, belongs in a signed
+# header like platform_card, not in unsigned body text. Bracket-body is
+# `[^\]]*` — the block carries no nested `]`, so this never over-eats.
+_ROOM_OPS_META_RE = re.compile(r"\s*\[room-ops metadata:[^\]]*\]", re.IGNORECASE)
+
+
+def _strip_room_ops_meta(body: str) -> "tuple[str, bool]":
+    """Remove any untrusted `[room-ops metadata: …]` block(s) from a task body.
+
+    Returns (cleaned_body, stripped) so the caller can log the quarantine. Runs
+    before _one_line so a block split across newlines is still caught."""
+    if not body or "room-ops metadata:" not in body.lower():
+        return body, False
+    cleaned = _ROOM_OPS_META_RE.sub("", body)
+    stripped = cleaned != body
+    # Return the cleaned body even when it is now empty: a metadata-ONLY body is
+    # pure injection with no legitimate task text, so it must degrade to an empty
+    # (no-op) body. NEVER fall back to the original here — that would re-admit the
+    # very `[room-ops metadata: …]` block we are quarantining (P1, PR #2149).
+    return (cleaned.strip(), stripped)
 HS_MEDIA_TOKEN = os.environ.get("REMOTE_MEDIA_HS_TOKEN") or ""
 # The homeserver token is attached ONLY to media URLs on this exact origin
 # (scheme+host+port). Without it configured, Matrix media URLs are never
@@ -684,9 +712,16 @@ def _write_task(task: dict) -> str | None:
                 it = "message"
             lines.append(f"interaction_type: {it}")
         elif f == "task" and task.get("task") not in (None, ""):
+            # Quarantine the untrusted `[room-ops metadata: …]` block BEFORE it
+            # reaches the agent as body content (owner directive 2026-07-16) —
+            # see _strip_room_ops_meta. Runs first so the stripped body is what
+            # media-resolution and the header write both see.
+            _raw_task, _stripped_meta = _strip_room_ops_meta(str(task["task"]))
+            if _stripped_meta:
+                _log(f"stripped untrusted room-ops metadata from {tid} body")
             # Resolve an inbound media marker to a local file the core can read.
             _media_refs: list = []
-            _fetched = _maybe_fetch_media(str(task["task"]), _media_refs)
+            _fetched = _maybe_fetch_media(_raw_task, _media_refs)
             lines.append(f"task: {_one_line(_fetched)}")
             # interaction-model 4D, step 1.5: if a media marker was fetched,
             # stamp structured attachments[]/content_modalities/media_form
