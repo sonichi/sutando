@@ -578,18 +578,28 @@ report_foreign_holder() {
   echo "    Free the port (kill the holder / stop the container), then re-run startup.sh."
 }
 
-# argv pattern per managed service — shared by the already-running guards, the
-# wedged-listener reaper, and the final verify loop, so all three agree on
-# what counts as "our service".
+# argv pattern per managed service — the SINGLE source of truth, shared by the
+# already-running guards, the wedged-listener reaper, and the final verify loop,
+# so all three agree on what counts as "our service". Every guard MUST route
+# through this (never an inline literal) or the pattern drifts across call sites
+# and a future argv change reintroduces the silent-misboot class this fixes.
+#
+# Match on the extension-less basename (voice-agent, not voice-agent.ts): #2128
+# added a build:bundle path that emits self-contained .js artifacts, so the day
+# a service launches voice-agent.js instead of .ts a ".ts"-anchored pattern would
+# stop matching our OWN process and report it as a foreign holder — and for the
+# credential-proxy branch that silently leaves ANTHROPIC_BASE_URL unset. The
+# basename is immune to the .ts→.js switch and costs nothing.
 verify_pattern_for() {
   case "$1" in
-    voice-agent)         echo "voice-agent.ts" ;;
-    web-client)          echo "web-client.ts" ;;
+    credential-proxy)    echo "credential-proxy" ;;
+    voice-agent)         echo "voice-agent" ;;
+    web-client)          echo "web-client" ;;
     dashboard)           echo "dashboard.py" ;;
     agent-api)           echo "agent-api.py" ;;
     screen-capture)      echo "screen-capture-server.py" ;;
-    conversation-server) echo "conversation-server.ts" ;;
-    collector)           echo "observability/boot.ts" ;;
+    conversation-server) echo "conversation-server" ;;
+    collector)           echo "observability/boot" ;;
     *)                   echo "" ;;
   esac
 }
@@ -604,7 +614,7 @@ if ! lsof -i :7846 > /dev/null 2>&1; then
   else
     echo "  ⚠ credential proxy failed — Claude will connect directly (check /tmp/credential-proxy.log)"
   fi
-elif port_held_by 7846 "credential-proxy.ts"; then
+elif port_held_by 7846 "$(verify_pattern_for credential-proxy)"; then
   echo "  ✓ credential proxy (already running)"
   export ANTHROPIC_BASE_URL=http://localhost:7846
 else
@@ -676,7 +686,7 @@ if ! lsof -i :9900 > /dev/null 2>&1; then
   echo "  Starting voice agent (port 9900)..."
   npx tsx src/voice-agent.ts > "$LOGS_DIR/voice-agent.log" 2>&1 &
   echo "  ✓ voice agent"
-elif port_held_by 9900 "voice-agent.ts"; then
+elif port_held_by 9900 "$(verify_pattern_for voice-agent)"; then
   echo "  ✓ voice agent (already running)"
 else
   report_foreign_holder 9900 "voice agent"
@@ -699,7 +709,7 @@ if ! lsof -i :8080 > /dev/null 2>&1; then
   echo "  Starting web client (port 8080)..."
   npx tsx src/web-client.ts > "$LOGS_DIR/web-client.log" 2>&1 &
   echo "  ✓ web client"
-elif port_held_by 8080 "web-client.ts"; then
+elif port_held_by 8080 "$(verify_pattern_for web-client)"; then
   echo "  ✓ web client (already running)"
 else
   report_foreign_holder 8080 "web client"
@@ -728,7 +738,7 @@ if ! lsof -i :7844 > /dev/null 2>&1; then
   echo "  Starting dashboard (port 7844)..."
   python3 src/dashboard.py > "$LOGS_DIR/dashboard.log" 2>&1 &
   echo "  ✓ dashboard"
-elif port_held_by 7844 "dashboard.py"; then
+elif port_held_by 7844 "$(verify_pattern_for dashboard)"; then
   echo "  ✓ dashboard (already running)"
 else
   report_foreign_holder 7844 "dashboard"
@@ -740,7 +750,7 @@ if ! lsof -i :7843 > /dev/null 2>&1; then
   echo "  Starting agent API (port 7843)..."
   python3 src/agent-api.py > "$LOGS_DIR/agent-api.log" 2>&1 &
   echo "  ✓ agent API"
-elif port_held_by 7843 "agent-api.py"; then
+elif port_held_by 7843 "$(verify_pattern_for agent-api)"; then
   echo "  ✓ agent API (already running)"
 else
   report_foreign_holder 7843 "agent API"
@@ -759,7 +769,7 @@ if ! lsof -i :7845 > /dev/null 2>&1; then
   else
     echo "  ⊘ screen capture skipped — grant Screen Recording perm first, then re-run startup.sh"
   fi
-elif port_held_by 7845 "screen-capture-server.py"; then
+elif port_held_by 7845 "$(verify_pattern_for screen-capture)"; then
   echo "  ✓ screen capture (already running)"
 else
   report_foreign_holder 7845 "screen capture"
