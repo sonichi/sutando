@@ -32,6 +32,24 @@ fi
 # $SUTANDO_ROOT.
 export SUTANDO_ROOT="$REPO"
 
+# tsx runner for every TS service start below — resolution is config-resolved
+# via sutando-config.sh (`tsx-bin` / `app-node-dir` are the single source of
+# truth, shared with the launchd wrapper); `npx tsx` only as a last resort. A
+# host may have no homebrew/nvm node/npx at all (the app-bundle runtime ships
+# bare `node` only, no npx — the PATH prepend covers tsx's `#!/usr/bin/env node`
+# re-exec). A raw `npx tsx` call site silently fails to start its service on
+# such hosts (web-client outage 2026-07-17).
+_APP_NODE_DIR="$(bash "$REPO/scripts/sutando-config.sh" app-node-dir)"
+[ -d "$_APP_NODE_DIR" ] && case ":$PATH:" in *":$_APP_NODE_DIR:"*) ;; *) PATH="$_APP_NODE_DIR:$PATH"; export PATH ;; esac
+_TSX_BIN="$(bash "$REPO/scripts/sutando-config.sh" tsx-bin)"
+run_tsx() {
+  if [ -n "$_TSX_BIN" ]; then
+    "$_TSX_BIN" "$@"
+  else
+    npx tsx "$@"
+  fi
+}
+
 # Export workspace-scoped CLAUDE_CONFIG_DIR before services launch. Without it,
 # init.sh + the bridge-launcher blocks below (L~262 proxy, L~429 telegram,
 # L~449 discord, L~473 slack) probe `${CLAUDE_CONFIG_DIR:-$HOME/.claude}` and
@@ -556,7 +574,8 @@ if [ -f "$_PROXY_INSTALLER" ] && [ -f "$REPO/src/launchd/$_PROXY_LABEL.plist" ];
 fi
 if ! lsof -i :7846 > /dev/null 2>&1; then
   echo "  Starting credential proxy (port 7846)..."
-  npx tsx "$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)" > /tmp/credential-proxy.log 2>&1 &
+  _PROXY_SCRIPT="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
+  run_tsx "$_PROXY_SCRIPT" > /tmp/credential-proxy.log 2>&1 &
   sleep 1
   if lsof -i :7846 > /dev/null 2>&1; then
     echo "  ✓ credential proxy"
@@ -584,7 +603,7 @@ if [ "${SUTANDO_OBS_COLLECTOR:-}" = "1" ]; then
   if ! lsof -i :"$OBS_PORT" > /dev/null 2>&1; then
     echo "  Starting obs collector (port $OBS_PORT)..."
     SUTANDO_WORKSPACE="$WORKSPACE" SUTANDO_OBS_PORT="$OBS_PORT" \
-      npx tsx "$REPO/src/observability/boot.ts" > "$LOGS_DIR/collector.log" 2>&1 &
+      run_tsx "$REPO/src/observability/boot.ts" > "$LOGS_DIR/collector.log" 2>&1 &
     echo "  ✓ obs collector"
   else
     echo "  ✓ obs collector (already running on $OBS_PORT)"
@@ -622,7 +641,7 @@ reap_wedged_listener() {
 reap_wedged_listener 9900 voice-agent
 if ! lsof -i :9900 > /dev/null 2>&1; then
   echo "  Starting voice agent (port 9900)..."
-  npx tsx src/voice-agent.ts > "$LOGS_DIR/voice-agent.log" 2>&1 &
+  run_tsx src/voice-agent.ts > "$LOGS_DIR/voice-agent.log" 2>&1 &
   echo "  ✓ voice agent"
 else
   echo "  ✓ voice agent (already running)"
@@ -636,14 +655,14 @@ fi
 # back to cloud). `--interval 60` keeps it resident and re-emits every 60s so the
 # advertisement tracks reachability changes AFTER boot (tailnet/VPN coming up
 # post-startup would otherwise leave Direct(Tailscale) greyed until a restart).
-npx tsx src/emit-call-tiers.ts --interval 60 > "$LOGS_DIR/emit-call-tiers.log" 2>&1 &
+run_tsx src/emit-call-tiers.ts --interval 60 > "$LOGS_DIR/emit-call-tiers.log" 2>&1 &
 echo "  ✓ call-tiers advertisement (re-emit 60s)"
 
 # 2. Web client (port 8080)
 reap_wedged_listener 8080 web-client
 if ! lsof -i :8080 > /dev/null 2>&1; then
   echo "  Starting web client (port 8080)..."
-  npx tsx src/web-client.ts > "$LOGS_DIR/web-client.log" 2>&1 &
+  run_tsx src/web-client.ts > "$LOGS_DIR/web-client.log" 2>&1 &
   echo "  ✓ web client"
 else
   echo "  ✓ web client (already running)"
@@ -954,7 +973,7 @@ if [ "${SKIP_PHONE:-}" = "1" ]; then
 elif grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; then
   if ! pgrep -f "conversation-server" > /dev/null 2>&1; then
     echo "  Starting conversation server..."
-    npx tsx skills/phone-conversation/scripts/conversation-server.ts > /tmp/conversation-server.log 2>&1 &
+    run_tsx skills/phone-conversation/scripts/conversation-server.ts > /tmp/conversation-server.log 2>&1 &
     echo "  ✓ conversation server (port 3100)"
   else
     echo "  ✓ conversation server (already running)"

@@ -238,6 +238,31 @@ print(_host_label(), end='')
 "
     ;;
 
+  app-node-dir)
+    # The bundled app runtime's node bin dir (Sutando.app ships a private node
+    # for hosts with no homebrew/nvm/volta). CONFIG-RESOLVED, not hardcoded:
+    # override via $SUTANDO_APP_NODE_DIR; default = the app-support engine path.
+    printf '%s' "${SUTANDO_APP_NODE_DIR:-$HOME/Library/Application Support/space.ag2.app/engine/runtime/node/bin}"
+    ;;
+
+  tsx-bin)
+    # SINGLE SOURCE OF TRUTH for tsx resolution — the launchd wrapper and
+    # src/startup.sh both call this instead of each duplicating the candidate
+    # list. Prefers the repo-pinned node_modules/.bin/tsx (the version the repo
+    # pins, and the ONLY tsx on a host with no homebrew/nvm/volta node at all),
+    # then the usual global locations. Prints the resolved path, or nothing —
+    # the caller falls back to `npx tsx` on empty output.
+    _nvm_tsx="$HOME/.nvm/versions/node/$(ls "$HOME/.nvm/versions/node/" 2>/dev/null | sort -V | tail -1)/bin/tsx"
+    for _p in \
+      "$REPO_ROOT/node_modules/.bin/tsx" \
+      /opt/homebrew/bin/tsx \
+      /usr/local/bin/tsx \
+      "$_nvm_tsx" \
+      "$HOME/.volta/bin/tsx"; do
+      [ -x "$_p" ] && { printf '%s' "$_p"; break; }
+    done
+    ;;
+
   dump)
     python3 -m src.sutando_config
     ;;
