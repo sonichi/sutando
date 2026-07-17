@@ -346,6 +346,32 @@ def case_n_failed_dm_still_restarts_and_records() -> list[str]:
     return fails
 
 
+def case_o_launch_env_path() -> list[str]:
+    """Regression for the 2026-07-10 launchd restart bug: under launchd's minimal
+    PATH, start-cli.sh --restart failed rc=127 (node/claude not found).
+    _resolve_launch_env must PREPEND homebrew, ~/.local/bin, and (when present)
+    the bundled runtime so the tools resolve."""
+    import os
+    fails = []
+    saved = os.environ.get("PATH")
+    try:
+        os.environ["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"  # launchd minimal
+        env = hc._resolve_launch_env()
+        parts = env["PATH"].split(":")
+        for needed in ("/opt/homebrew/bin", "/usr/local/bin", str(Path.home() / ".local" / "bin")):
+            if needed not in parts:
+                fails.append(f"o) resolved PATH missing {needed}")
+        if "/opt/homebrew/bin" in parts and "/usr/bin" in parts:
+            if parts.index("/opt/homebrew/bin") > parts.index("/usr/bin"):
+                fails.append("o) healed dirs must be PREPENDED (before the minimal PATH)")
+    finally:
+        if saved is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = saved
+    return fails
+
+
 def main() -> int:
     cases = [
         ("a", case_a_healthy_no_action),
@@ -362,6 +388,7 @@ def main() -> int:
         ("l", case_l_progress_resets_long_task),
         ("m", case_m_lock_prevents_concurrent_restart),
         ("n", case_n_failed_dm_still_restarts_and_records),
+        ("o", case_o_launch_env_path),
     ]
     all_failures = []
     for label, fn in cases:

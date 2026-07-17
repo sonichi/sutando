@@ -44,9 +44,13 @@ python3 skills/x-twitter/x-post.py engagement 2040817066199195818
 
 ## Setup
 
-1. Go to https://developer.x.com and sign in
-2. Create a Project + App
-3. Generate keys and add to `.env`:
+1. Install Python dependencies (one-time):
+   ```
+   pip3 install requests requests-oauthlib
+   ```
+2. Go to https://developer.x.com and sign in
+3. Create a Project + App
+4. Generate keys and add to `.env`:
    ```
    X_API_KEY=...
    X_API_SECRET=...

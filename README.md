@@ -285,20 +285,23 @@ When running, Sutando exposes these local ports:
 
 ## Keyboard shortcuts
 
-The Sutando menu bar app (`src/Sutando/`) provides global keyboard shortcuts. It launches automatically via `startup.sh`.
+The Sutando menu bar app (`src/Sutando/`) provides global keyboard shortcuts. It launches automatically via `startup.sh`. **All shortcuts are configurable** — the bindings below are the shipped *defaults*, published in [`state/hotkeys.json`](state/hotkeys.json) (the source of truth); override any of them per-machine in `~/.config/sutando/hotkeys.json`.
 
-| Shortcut | Action |
-|----------|--------|
-| ⌃C | **Context drop** — sends selected text, clipboard image, or Finder file to Sutando |
-| ⌃S | **Screenshot drop** — sends a screenshot of the active window/screen to Sutando |
-| ⌃V | **Voice toggle** — connects/disconnects voice in the browser |
-| ⌃M | **Mute toggle** — mutes/unmutes microphone during voice |
+| Action | Default binding |
+|--------|-----------------|
+| **Toggle Voice** — connects/disconnects voice in the browser | `toggle_voice` (default ⌃V) |
+| **Drop Context** — sends selected text, clipboard image, or Finder file to Sutando | `drop_context` (default ⌃⇧C) |
+| **Toggle Mute** — mutes/unmutes microphone during voice | `toggle_mute` (default ⌃M) |
+| **Drop Video Clip** — sends a screen recording of the active window/screen to Sutando | `drop_video_clip` (default ⌃⇧R) |
+| **Drop Screenshot** — sends a screenshot of the active window/screen to Sutando | `drop_screenshot` (default ⌃S) |
+
+The `action` names above are the stable keys in `state/hotkeys.json`; the ⌃-combos are only the current defaults and may be remapped, so treat the `action` — not the keystroke — as the contract.
 
 The menu bar also has **Open Core** (brings up the Claude Code terminal) and **Open Dashboard** (opens the status dashboard at localhost:7844).
 
 On first run:
 1. Grant **Accessibility** permission to the Sutando app in System Settings → Privacy & Security
-2. Enable **Allow JavaScript from Apple Events** in Chrome: View → Developer → Allow JavaScript from Apple Events (required for ⌃V voice toggle)
+2. Enable **Allow JavaScript from Apple Events** in Chrome: View → Developer → Allow JavaScript from Apple Events (required for the **Toggle Voice** hotkey — default ⌃V, see [Keyboard shortcuts](#keyboard-shortcuts))
 
 The binary auto-compiles on `startup.sh` if missing. To compile manually: `cd src/Sutando && swiftc -O -o Sutando main.swift -framework Cocoa -framework Carbon -framework ApplicationServices`
 

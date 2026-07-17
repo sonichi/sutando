@@ -10,7 +10,7 @@ import ApplicationServices
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     // Hotkeys are configurable via ~/.config/sutando/hotkeys.json.
-    // Defaults: drop_context=⌃C, drop_screenshot=⌃S, toggle_voice=⌃V, toggle_mute=⌃M
+    // Hotkey defaults are published in state/hotkeys.json (see PR #1920/#1924).
     var hotKeyRefs: [EventHotKeyRef?] = []  // one entry per registered hotkey
     var hotKeyActions: [UInt32: String] = [:]  // hotkey id → action name
     var lastDropTime: Date = .distantPast
@@ -90,7 +90,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// different TMPDIR due to sandboxing) must target the same socket
     /// to find the same server. Without this, tmux has-session fails
     /// app-side even when the session is alive shell-side.
-    let sutandoTmuxSocket = "/tmp/sutando-tmux.sock"
+    /// Honors SUTANDO_TMUX_SOCKET (the env var start-cli.sh + the desktop
+    /// private-socket runtime set) so the app's state-detection / wakeup /
+    /// pane-capture target the SAME tmux server as a private-socket core;
+    /// falls back to the /tmp default when unset. Without this, a private-
+    /// socket core is invisible to all four control paths below.
+    let sutandoTmuxSocket = ProcessInfo.processInfo.environment["SUTANDO_TMUX_SOCKET"] ?? "/tmp/sutando-tmux.sock"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Self-preventive single-instance: if another Sutando.app is already
@@ -234,7 +239,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem.button {
-            let avatarPath = repoRoot + "/assets/stand-avatar.png"
+            let avatarPath = workspace + "/assets/stand-avatar.png"
             if let image = NSImage(contentsOfFile: avatarPath) {
                 image.size = NSSize(width: 18, height: 18)
                 image.isTemplate = false
@@ -647,9 +652,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // first so the chip reflects THIS host's questions, not a stale flat-root copy.
         let pqPath = perHostPath("pending-questions.md")
         if let pq = try? String(contentsOfFile: pqPath, encoding: .utf8) {
-            // Skip the leading "# Memory" or similar h1, find first h2.
+            // Skip h1 and [RESOLVED] h2s; latch onto the first open h2.
             for line in pq.split(separator: "\n") {
-                if line.hasPrefix("## ") {
+                if line.hasPrefix("## ") && !line.hasPrefix("## [RESOLVED]") {
                     let title = String(line.dropFirst(3))
                     let preview = title.count > 60 ? String(title.prefix(57)) + "..." : title
                     chips.append(["label": "Pending: \(preview)", "desc": "Resolve in pending-questions.md"])
@@ -915,7 +920,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Composited onto the top-right corner of the 18×18 avatar so the
     /// menu bar continuously signals mode without taking an extra slot.
     func avatarImage(presenterActive: Bool, meetingActive: Bool = false) -> NSImage? {
-        let avatarPath = repoRoot + "/assets/stand-avatar.png"
+        let avatarPath = workspace + "/assets/stand-avatar.png"
         guard let base = NSImage(contentsOfFile: avatarPath) else { return nil }
         base.size = NSSize(width: 18, height: 18)
         base.isTemplate = false
@@ -1174,8 +1179,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return "\(modSymbols)\(key)"
     }
 
+    /// Publish the resolved hotkeys to `<workspace>/state/hotkeys.json` so the
+    /// web UI + dashboard render the real bindings instead of hardcoding their
+    /// own copies (which drifted — this is the single source they read). Same
+    /// atomic tmp+replace as the status-file writers above.
+    private func publishHotkeys(_ hotkeys: [(action: String, key: String, modifiers: [String])]) {
+        let entries = hotkeys.map { hk in
+            ["action": hk.action,
+             "label": displayLabel(key: hk.key, modifiers: hk.modifiers),
+             "key": hk.key,
+             "modifiers": hk.modifiers] as [String: Any]
+        }
+        guard let json = try? JSONSerialization.data(withJSONObject: entries, options: [.prettyPrinted]) else { return }
+        let stateDir = workspace + "/state"
+        try? FileManager.default.createDirectory(atPath: stateDir, withIntermediateDirectories: true)
+        let dst = URL(fileURLWithPath: stateDir + "/hotkeys.json")
+        let tmp = URL(fileURLWithPath: stateDir + "/hotkeys.json.tmp")
+        do {
+            try json.write(to: tmp, options: [.atomic])
+            _ = try FileManager.default.replaceItemAt(dst, withItemAt: tmp)
+        } catch {
+            try? FileManager.default.removeItem(at: tmp)
+        }
+    }
+
     func registerHotKey() {
         let hotkeys = loadHotkeyConfig()
+        publishHotkeys(hotkeys)
         var statuses: [String] = []
         for (idx, hk) in hotkeys.enumerated() {
             guard let keyCode = AppDelegate.keyNameToCode[hk.key] else {
@@ -1621,6 +1651,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard let url = URL(string: "http://localhost:7845/capture") else { return }
         var req = URLRequest(url: url)
         req.timeoutInterval = 5
+        // /capture requires a shared token (same gate as /capture-video).
+        let tokenPath = NSString(string: "~/.config/sutando/screen-capture-token").expandingTildeInPath
+        if let token = try? String(contentsOfFile: tokenPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty {
+            req.setValue(token, forHTTPHeaderField: "X-Sutando-Capture-Token")
+        }
         URLSession.shared.dataTask(with: req) { [self] data, _, error in
             if let error = error {
                 notify("Sutando", "Screenshot drop failed: \(error.localizedDescription)")
@@ -1921,6 +1956,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         id: task-\(ts)
         timestamp: \(ISO8601DateFormatter().string(from: Date()))
         source: context-drop
+        interaction_type: system_event
         task: User dropped context via hotkey. Process this:
         \(content)
         """
