@@ -18,10 +18,13 @@ Run: python3 tests/telemetry.test.py
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 SRC = Path(__file__).resolve().parent.parent / "src"
@@ -206,7 +209,21 @@ def run():
         passed += 1
         print("ok   task_processed/feature_used send correct bucketed events")
 
-    # 7) The typed helpers ALSO honor opt-out (no path around capture()).
+    # 7) Short-lived callers can select the bounded synchronous path.
+    with tempfile.TemporaryDirectory() as td:
+        mod = _load(Path(td), key="phc_live")
+        calls = []
+        mod._post = lambda payload, timeout=5: calls.append((payload, timeout))  # type: ignore
+        mod.feature_used("morning_briefing", flush=True)
+        assert len(calls) == 1, f"flush path must send exactly once, got {len(calls)}"
+        payload, timeout = calls[0]
+        assert payload["event"] == "feature_used"
+        assert payload["properties"]["feature"] == "morning_briefing"
+        assert timeout == 1, f"flush path must stay bounded to 1s, got {timeout}"
+        passed += 1
+        print("ok   feature_used flush path sends synchronously with 1s bound")
+
+    # 8) The typed helpers ALSO honor opt-out (no path around capture()).
     with tempfile.TemporaryDirectory() as td:
         mod = _load(Path(td), key="phc_live", env={"DO_NOT_TRACK": "1"})
         calls = []
@@ -219,6 +236,62 @@ def run():
         assert calls == [], f"opt-out MUST silence phase-2 helpers too, got {calls}"
         passed += 1
         print("ok   phase-2 helpers honor opt-out (zero sends)")
+
+    # 9) A short-lived subprocess can flush feature telemetry before exit.
+    # This is the production lifecycle of morning-briefing.py/daily-insight.py;
+    # their old daemon sender was terminated with the interpreter.
+    with tempfile.TemporaryDirectory() as td:
+        received = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                received.append(json.loads(self.rfile.read(length)))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *_args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        server_thread = threading.Thread(target=server.serve_forever)
+        server_thread.start()
+        try:
+            env = {
+                **os.environ,
+                "POSTHOG_API_KEY": "phc_subprocess_test",
+                "POSTHOG_HOST": f"http://127.0.0.1:{server.server_port}",
+                "SUTANDO_STATE_DIR": td,
+                "SUTANDO_SURFACE": "oss",
+                "PYTHONPATH": str(SRC),
+            }
+            env.pop("DO_NOT_TRACK", None)
+            env.pop("SUTANDO_TELEMETRY", None)
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "from telemetry import feature_used; "
+                    "feature_used('subprocess_probe', flush=True)",
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+
+        assert proc.returncode == 0, proc.stderr
+        assert len(received) == 1, \
+            f"short-lived process must deliver before exit, got {len(received)}"
+        assert received[0]["event"] == "feature_used"
+        assert received[0]["properties"]["feature"] == "subprocess_probe"
+        passed += 1
+        print("ok   short-lived subprocess flushes feature_used before exit")
 
     print(f"\nALL PASS ({passed} checks)")
     return 0
