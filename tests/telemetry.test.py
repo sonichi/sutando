@@ -12,11 +12,19 @@ and that a normal capture DOES reach the sink when enabled.
 
 Run: python3 tests/telemetry.test.py
 """
+# PEP 604 (`X | None`) in annotations is evaluated at def-time on Python < 3.10;
+# defer all annotation evaluation so this file runs on the 3.9 baseline (CR #2088,
+# @qingyun-wu). No runtime annotation introspection here, so this is semantics-safe.
+from __future__ import annotations
+
 import importlib.util
+import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 SRC = Path(__file__).resolve().parent.parent / "src"
@@ -24,7 +32,7 @@ SRC = Path(__file__).resolve().parent.parent / "src"
 
 def _load(state_dir: Path, key: str = "", env: dict | None = None):
     """Import a fresh telemetry module with a temp state dir + clean env."""
-    for k in ("DO_NOT_TRACK", "SUTANDO_TELEMETRY", "POSTHOG_API_KEY", "SUTANDO_DEBUG_TELEMETRY"):
+    for k in ("DO_NOT_TRACK", "SUTANDO_TELEMETRY", "POSTHOG_API_KEY", "SUTANDO_DEBUG_TELEMETRY", "SUTANDO_SURFACE"):
         os.environ.pop(k, None)
     os.environ["SUTANDO_STATE_DIR"] = str(state_dir)
     # Force the module's state dir to the temp path even if workspace_default
@@ -139,6 +147,151 @@ def run():
         assert (sd / "telemetry-id").read_text().strip() == d1
         passed += 1
         print("ok   distinct_id persists across calls")
+
+    # 5) Surface (desktop vs OSS) — explicit env, pgrep probe, and payload wiring.
+    import unittest.mock as _um
+    with tempfile.TemporaryDirectory() as td:
+        mod = _load(Path(td), key="phc_live", env={"SUTANDO_SURFACE": "desktop"})
+        assert mod._install_surface() == "desktop", "SUTANDO_SURFACE=desktop → desktop"
+        passed += 1
+        print("ok   surface: SUTANDO_SURFACE=desktop honored")
+    with tempfile.TemporaryDirectory() as td:
+        mod = _load(Path(td), key="phc_live", env={"SUTANDO_SURFACE": "oss"})
+        assert mod._install_surface() == "oss", "SUTANDO_SURFACE=oss → oss"
+        passed += 1
+        print("ok   surface: SUTANDO_SURFACE=oss honored")
+    with tempfile.TemporaryDirectory() as td:
+        mod = _load(Path(td), key="phc_live")  # no env override → pgrep decides
+        with _um.patch.object(mod.subprocess, "run",
+                              return_value=_um.Mock(returncode=0, stdout="4321\n")):
+            assert mod._install_surface() == "desktop", "pgrep hit → desktop"
+        with _um.patch.object(mod.subprocess, "run",
+                              return_value=_um.Mock(returncode=1, stdout="")):
+            assert mod._install_surface() == "oss", "pgrep miss → oss"
+        with _um.patch.object(mod.subprocess, "run", side_effect=OSError("boom")):
+            assert mod._install_surface() == "oss", "pgrep error → oss (fail-safe)"
+        passed += 1
+        print("ok   surface: pgrep probe (hit/miss/error) resolves correctly")
+    with tempfile.TemporaryDirectory() as td:
+        mod = _load(Path(td), key="phc_live", env={"SUTANDO_SURFACE": "desktop"})
+        calls = []
+        mod._post = lambda payload: calls.append(payload)  # type: ignore
+        _capture_sync(mod, "feature_used", {"feature": "x"})
+        assert len(calls) == 1
+        pr = calls[0]["properties"]
+        assert pr["surface"] == "desktop", f"event-prop surface wrong: {pr.get('surface')}"
+        assert pr["$set"]["surface"] == "desktop", f"$set person-prop surface wrong: {pr.get('$set')}"
+        passed += 1
+        print("ok   surface: attached to payload (event property + $set person property)")
+
+    # 6) Phase-2 typed helpers send the right bucketed event + property.
+    with tempfile.TemporaryDirectory() as td:
+        mod = _load(Path(td), key="phc_live")
+        calls = []
+        mod._post = lambda payload: calls.append(payload)  # type: ignore
+        before = set(threading.enumerate())
+        mod.task_processed("discord")
+        mod.feature_used("morning_briefing")
+        for t in set(threading.enumerate()) - before:
+            t.join(timeout=2)
+        assert len(calls) == 2, f"two helper events expected, got {len(calls)}"
+        tp = next(c for c in calls if c["event"] == "task_processed")
+        fu = next(c for c in calls if c["event"] == "feature_used")
+        assert tp["properties"]["source"] == "discord", tp
+        assert fu["properties"]["feature"] == "morning_briefing", fu
+        # Anonymity posture carries through the helpers; only the bucket ships.
+        assert tp["properties"]["$ip"] == "" and tp["properties"]["$geoip_disable"] is True
+        # Beyond the source bucket, the only extra keys are the standard anonymity
+        # + surface envelope every event carries (#2071): surface + $set. Still no
+        # task content, ids, user, or channel — that's the invariant under test.
+        assert set(tp["properties"]) == {"$ip", "$geoip_disable", "source", "surface", "$set"}, \
+            f"task_processed must ship ONLY the source bucket + surface envelope, got {tp['properties']}"
+        passed += 1
+        print("ok   task_processed/feature_used send correct bucketed events")
+
+    # 7) Short-lived callers can select the bounded synchronous path.
+    with tempfile.TemporaryDirectory() as td:
+        mod = _load(Path(td), key="phc_live")
+        calls = []
+        mod._post = lambda payload, timeout=5: calls.append((payload, timeout))  # type: ignore
+        mod.feature_used("morning_briefing", flush=True)
+        assert len(calls) == 1, f"flush path must send exactly once, got {len(calls)}"
+        payload, timeout = calls[0]
+        assert payload["event"] == "feature_used"
+        assert payload["properties"]["feature"] == "morning_briefing"
+        assert timeout == 1, f"flush path must stay bounded to 1s, got {timeout}"
+        passed += 1
+        print("ok   feature_used flush path sends synchronously with 1s bound")
+
+    # 8) The typed helpers ALSO honor opt-out (no path around capture()).
+    with tempfile.TemporaryDirectory() as td:
+        mod = _load(Path(td), key="phc_live", env={"DO_NOT_TRACK": "1"})
+        calls = []
+        mod._post = lambda payload: calls.append(payload)  # type: ignore
+        before = set(threading.enumerate())
+        mod.task_processed("slack")
+        mod.feature_used("daily_insight")
+        for t in set(threading.enumerate()) - before:
+            t.join(timeout=2)
+        assert calls == [], f"opt-out MUST silence phase-2 helpers too, got {calls}"
+        passed += 1
+        print("ok   phase-2 helpers honor opt-out (zero sends)")
+
+    # 9) A short-lived subprocess can flush feature telemetry before exit.
+    # This is the production lifecycle of morning-briefing.py/daily-insight.py;
+    # their old daemon sender was terminated with the interpreter.
+    with tempfile.TemporaryDirectory() as td:
+        received = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                received.append(json.loads(self.rfile.read(length)))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *_args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        server_thread = threading.Thread(target=server.serve_forever)
+        server_thread.start()
+        try:
+            env = {
+                **os.environ,
+                "POSTHOG_API_KEY": "phc_subprocess_test",
+                "POSTHOG_HOST": f"http://127.0.0.1:{server.server_port}",
+                "SUTANDO_STATE_DIR": td,
+                "SUTANDO_SURFACE": "oss",
+                "PYTHONPATH": str(SRC),
+            }
+            env.pop("DO_NOT_TRACK", None)
+            env.pop("SUTANDO_TELEMETRY", None)
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "from telemetry import feature_used; "
+                    "feature_used('subprocess_probe', flush=True)",
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+
+        assert proc.returncode == 0, proc.stderr
+        assert len(received) == 1, \
+            f"short-lived process must deliver before exit, got {len(received)}"
+        assert received[0]["event"] == "feature_used"
+        assert received[0]["properties"]["feature"] == "subprocess_probe"
+        passed += 1
+        print("ok   short-lived subprocess flushes feature_used before exit")
 
     print(f"\nALL PASS ({passed} checks)")
     return 0

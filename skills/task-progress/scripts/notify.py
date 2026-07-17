@@ -170,9 +170,26 @@ def send_remote_gateway(source: str, channel_id: str, message: str) -> bool:
     env = _env_file(real_env)
     url = (os.environ.get("REMOTE_TASK_URL") or env.get("REMOTE_TASK_URL", "")).rstrip("/")
     token = os.environ.get("REMOTE_TASK_TOKEN", "").strip() or env.get("REMOTE_TASK_TOKEN", "")
+    # One-token onboarding: REMOTE_TASK_TOKEN (or the legacy AG2_REMOTE_TOKEN
+    # alias) may carry the combined "https://<gateway>|<secret>" form — the URL
+    # travels inside the token. This is the same contract ag2-sparrow's
+    # remote_gateway_bridge accepts and the documented bootstrap shortcut
+    # (docs/remote-gateway-protocol.md). Fall back to the alias when no
+    # REMOTE_TASK_TOKEN is set, then split the "|" form for EITHER var so a
+    # channel provisioned with only a compact token (in either name) still
+    # delivers — without this, ag2space escalations fail while the relay's
+    # debounce would otherwise mark them notified.
+    if not token:
+        token = (os.environ.get("AG2_REMOTE_TOKEN") or env.get("AG2_REMOTE_TOKEN", "")).strip()
+    if "|" in token:
+        _u, token = token.split("|", 1)
+        if not url:
+            url = _u.rstrip("/")
+    if not url:
+        url = (os.environ.get("AG2_REMOTE_URL") or env.get("AG2_REMOTE_URL", "")).rstrip("/")
     if not url or not token:
-        print(f"[task-progress] no REMOTE_TASK_URL/REMOTE_TASK_TOKEN for source '{source}' "
-              f"(looked in {env_path})", file=sys.stderr)
+        print(f"[task-progress] no REMOTE_TASK_URL/REMOTE_TASK_TOKEN (or AG2_REMOTE_TOKEN) "
+              f"for source '{source}' (looked in {env_path})", file=sys.stderr)
         return False
     return _post(
         f"{url}/v1/room",

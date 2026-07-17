@@ -75,6 +75,36 @@ _FULL_PATTERNS: dict[str, re.Pattern] = {
         r"[MNO][A-Za-z\d_-]{23,}\.[A-Za-z\d_-]{6,}\.[A-Za-z\d_-]{27,}"
     ),
     "Telegram Bot Token": re.compile(r"\d{8,10}:[A-Za-z0-9_-]{35}"),
+    "Bare UUID Token": re.compile(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+    ),
+    "Bare Hex Token": re.compile(r"[0-9a-fA-F]{32,}"),
+}
+
+
+# Whole-line-only patterns: detect-secrets has no plugin for these because the
+# shape (e.g. a bare UUID) has no vendor-specific prefix to key a plugin on —
+# a UUID appearing inside ordinary prose is not evidence of anything. The only
+# caller of scan_secrets() that matters today is vault_intercept.py, which
+# calls it on the already-isolated VALUE token of `vault set KEY <token>` (see
+# _VAULT_SET_RE's bare-token capture group) — never on freeform text — so
+# requiring a FULL-line match here (anchored, not `search`) keeps this from
+# ever firing on a UUID that's merely mentioned inside a longer message.
+# Found 2026-07-09: Bright Data's API tokens are bare UUIDv4, which fell
+# through the FP guard undetected and landed in plaintext on disk.
+# Generalized 2026-07-12 (reviewer sweep, #2052): the UUID-with-dashes shape
+# was only one instance of the broader "bare opaque token, no vendor prefix"
+# problem — a dash-less 32-hex token (some vendors ship UUIDs without
+# hyphens) or a raw hex digest (SHA-1/SHA-256-length API keys) is exactly as
+# opaque to detect-secrets and would fall through the same gap. "Bare Hex
+# Token" covers any 32+-char pure-hex whole-line value; it can't collide with
+# "Bare UUID Token" since the UUID shape contains dashes, which aren't in the
+# hex character class.
+_WHOLE_LINE_PATTERNS: dict[str, re.Pattern] = {
+    "Bare UUID Token": re.compile(
+        r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    ),
+    "Bare Hex Token": re.compile(r"^[0-9a-fA-F]{32,}$"),
 }
 
 
@@ -100,13 +130,19 @@ def scan_secrets(text: str) -> list[SecretHit]:
             fname = f.name
         try:
             sc.scan_file(fname)
-            return [
+            hits = [
                 SecretHit(secret_type=s.type, line_number=s.line_number)
                 for fileset in sc.data.values()
                 for s in fileset
             ]
         finally:
             os.unlink(fname)
+
+    for stype, pattern in _WHOLE_LINE_PATTERNS.items():
+        for i, line in enumerate(text.split("\n"), start=1):
+            if pattern.match(line.strip()):
+                hits.append(SecretHit(secret_type=stype, line_number=i))
+    return hits
 
 
 def redact_secrets(text: str, hits: Iterable[SecretHit]) -> str:
