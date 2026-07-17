@@ -70,7 +70,7 @@ For full details on resolution order, overrides, and the protection layers (pre-
 
 ## Personal overrides
 
-If `PERSONAL_CLAUDE.md` exists, read and follow it. It contains user-specific rules, preferences, and configuration that override or extend these shared instructions. Resolve it **per-host first**: prefer `<workspace>/hosts/<hostname>/PERSONAL_CLAUDE.md` (where `<hostname>` = `hostname | sed 's/\..*//'`, matching the `hosts/<hostname>/` per-host convention), and fall back to the workspace root if the per-host file does not exist. The per-host location is the canonical home (it's carried + backed up under the `hosts/*/` vault glob); the workspace-root fallback preserves pre-`hosts/` behavior.
+If `PERSONAL_CLAUDE.md` exists, read and follow it. It contains user-specific rules, preferences, and configuration that override or extend these shared instructions. Resolve it **per-host first**: prefer `<workspace>/hosts/<hostname>/PERSONAL_CLAUDE.md` (where `<hostname>` = `bash scripts/sutando-config.sh host-label`, matching the `hosts/<hostname>/` per-host convention), and fall back to the workspace root if the per-host file does not exist. The per-host location is the canonical home (it's carried + backed up under the `hosts/*/` vault glob); the workspace-root fallback preserves pre-`hosts/` behavior.
 
 ## Work Status
 
@@ -238,7 +238,7 @@ Slack uses TOFU onboarding for owner enrollment: the first DM to the bot auto-en
 When you need user input on a decision or are blocked:
 1. If the voice client is connected — ask via voice (write to `results/question-{ts}.txt`)
 2. Send a macOS notification: `osascript -e 'display notification "message" with title "Sutando"'`
-3. Save the question to the **per-host** `pending-questions.md` — `<workspace>/hosts/<hostname>/pending-questions.md` (`<hostname>` = `hostname | sed 's/\..*//'`). It's per-host (F1): each host owns its own file, carried by the `hosts/*/` vault glob, and `personal_path("pending-questions.md")` resolves there (so the code readers — check-pending-questions, dashboard, agent-api, friction-detector, session-handoff — agree with this write location).
+3. Save the question to the **per-host** `pending-questions.md` — `<workspace>/hosts/<hostname>/pending-questions.md` (`<hostname>` = `bash scripts/sutando-config.sh host-label`). It's per-host (F1): each host owns its own file, carried by the `hosts/*/` vault glob, and `personal_path("pending-questions.md")` resolves there (so the code readers — check-pending-questions, dashboard, agent-api, friction-detector, session-handoff — agree with this write location).
 4. Continue working on other things — don't block
 
 On each proactive loop pass, check the per-host `pending-questions.md` (`<workspace>/hosts/<hostname>/pending-questions.md`) for unanswered items and surface them when the user is available.
