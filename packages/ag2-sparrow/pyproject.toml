@@ -4,7 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ag2-sparrow"
-version = "0.2.0"
+# Single-sourced from ag2_sparrow.__version__ (see [tool.setuptools.dynamic]) so the
+# packaged dist version and the importable __version__ can never drift.
+dynamic = ["version"]
 description = "Transport client that connects a local agent to AG2 Space: long-polls the task gateway for your agent's tasks and posts results back."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -29,3 +31,6 @@ ag2-sparrow = "ag2_sparrow.remote_gateway_bridge:main"
 
 [tool.setuptools]
 packages = ["ag2_sparrow"]
+
+[tool.setuptools.dynamic]
+version = { attr = "ag2_sparrow.__version__" }

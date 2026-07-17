@@ -42,7 +42,18 @@ else
     fi
 fi
 export PATH="/opt/homebrew/bin:$HOME/.nvm/versions/node/v24.14.1/bin:$PATH"
-TRANSCRIPT="$1"  # Passed by PreCompact hook as $TRANSCRIPT_PATH
+TRANSCRIPT="$1"  # Optional explicit path (manual invocations)
+# Claude Code hooks pass transcript_path via stdin JSON ONLY — there is no
+# $TRANSCRIPT_PATH env var, so on a stock hook config $1 expands empty and the
+# conversation section silently degraded (john's #1909 review). Parse stdin
+# when it's piped ([ ! -t 0 ]); interactive/manual runs skip this and either
+# pass $1 or fall through to --latest at the extraction site below.
+# NOTE (rebase over #2077): the pre-rebase branch also set
+# STATE_FILE="$REPO/session-state.md" here — dropped; STATE_FILE is now
+# derived from the resolved workspace below, per the workspace contract.
+if [ -z "$TRANSCRIPT" ] && [ ! -t 0 ]; then
+  TRANSCRIPT="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("transcript_path") or "")' 2>/dev/null || true)"
+fi
 
 # Workspace resolves via the shared post-M0 helper (src/workspace_resolve.sh).
 # Exports $WORKSPACE on success; exits non-zero with a diagnostic on failure
@@ -129,6 +140,22 @@ print(personal_path('pending-questions.md', Path('$WORKSPACE_DIR')))
   # Tasks in flight
   echo "## Tasks"
   ls "$WORKSPACE_DIR/tasks/"*.txt 2>/dev/null | head -5 || echo "None pending"
+  echo ""
+
+  # Recent conversation — the PreCompact hook hands us $TRANSCRIPT but until
+  # now nothing used it: conversation content died on every compaction and
+  # only system status survived into the next session.
+  echo "## Recent Conversation (before compaction)"
+  if [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ]; then
+    python3 "$REPO/src/context_resume.py" "$TRANSCRIPT" --turns 12 --chars 6000 2>/dev/null \
+      || echo "(extraction failed — transcript at $TRANSCRIPT)"
+  else
+    # No exact path (manual run, or stdin JSON unavailable) — fall back to the
+    # newest transcript for this project; context_resume ships --latest for
+    # exactly this shape. Still fail-open: a one-line note, never a hard stop.
+    python3 "$REPO/src/context_resume.py" --latest --turns 12 --chars 6000 2>/dev/null \
+      || echo "(no transcript available — hook stdin empty and --latest found none)"
+  fi
   echo ""
 
   # Quota (with reset times)

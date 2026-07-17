@@ -23,7 +23,8 @@
 // environments miss startup-only warnings, so logging at every resolution is
 // intentional).
 
-import { existsSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { resolveWorkspace } from './workspace_default.js';
@@ -63,20 +64,57 @@ export function memoryDirEnv(): string | undefined {
 }
 
 /**
- * Per-host directory label: `$SUTANDO_HOST_LABEL` or short hostname.
- *
- * Single source of truth for the per-host segment so the legacy
- * `machine-<host>/` (memory-dir) and new `hosts/<host>/` (workspace)
- * conventions stay in lockstep. Matches `_host()` in sync-workspace.sh:
- * an explicit label is an override and is used RAW; only the auto-detected
- * hostname has its mDNS/domain suffix stripped. (A dotted label like
- * "a.b" must NOT be split — splitting it would strand the reader, the very
- * class this PR fixes. Mirrors `_host_label()` in util_paths.py.)
+ * Read macOS Bonjour `LocalHostName` via scutil. Returns '' when unavailable
+ * (non-macOS, scutil missing/errored, or an empty result) so the caller falls
+ * through to the next precedence step. Never throws.
  */
-function hostLabel(): string {
-	const label = process.env.SUTANDO_HOST_LABEL;
+function scutilLocalHostName(): string {
+	try {
+		return execFileSync('scutil', ['--get', 'LocalHostName'], {
+			timeout: 2000,
+			stdio: ['ignore', 'pipe', 'ignore'],
+		})
+			.toString()
+			.trim();
+	} catch {
+		return '';
+	}
+}
+
+/**
+ * Per-host directory label. Precedence (mirrors `_host_label()` in
+ * util_paths.py and `_host()` in sync-workspace.sh — the single source of
+ * truth for the per-host segment):
+ *   1. `$SUTANDO_HOST_LABEL` (or legacy `$SUTANDO_HOST_OVERRIDE`) — used RAW.
+ *   2. macOS `scutil --get LocalHostName` — the STABLE Bonjour name.
+ *   3. short `hostname` (mDNS/domain suffix stripped) — last resort.
+ *
+ * Step 2 is load-bearing: on DHCP networks `hostname` can drift (e.g. an
+ * AT&T/Comcast lease → `QingyunsMBP2200` / `Chis-MBP`) while the Bonjour
+ * `LocalHostName` (`Qingyuns-MacBook-Pro-2200` / `Chis-MacBook-Pro`) is stable.
+ * Without it, TS-side per-host resolution diverges from the py/bash side —
+ * two `hosts/<label>/` dirs, and `personalPath()` reading a ghost dir the
+ * writers never populate (silent per-host data loss, #1745). An explicit
+ * label is used RAW (a dotted label like "a.b" must NOT be split — that would
+ * strand the reader); only the auto-detected hostname has its suffix stripped.
+ *
+ * `scutil`/`rawHostname` are injectable so tests exercise every branch without
+ * a real macOS.
+ */
+export function resolveHostLabel(
+	env: NodeJS.ProcessEnv = process.env,
+	scutil: () => string = scutilLocalHostName,
+	rawHostname: string = hostname(),
+): string {
+	const label = env.SUTANDO_HOST_LABEL || env.SUTANDO_HOST_OVERRIDE;
 	if (label) return label;
-	return hostname().split('.')[0];
+	const bonjour = scutil();
+	if (bonjour) return bonjour;
+	return rawHostname.split('.')[0];
+}
+
+function hostLabel(): string {
+	return resolveHostLabel();
 }
 
 /** Per-machine resolver. */
@@ -186,4 +224,28 @@ export function claudeHomePath(...subpath: string[]): string {
 	}
 	if (subpath.length === 0) return base;
 	return join(base, ...subpath);
+}
+
+// ---------------------------------------------------------------------------
+// Screen-capture token — issued once at screen-capture-server startup,
+// stored 0600 at ~/.config/sutando/screen-capture-token.  Callers include
+// it in the X-Sutando-Capture-Token header so a browser page on loopback
+// cannot reach the /capture endpoint (browsers cannot set custom headers on
+// no-cors requests or read local files).
+// ---------------------------------------------------------------------------
+
+const _CAPTURE_TOKEN_PATH = join(process.env.HOME || '', '.config', 'sutando', 'screen-capture-token');
+
+/**
+ * Read the screen-capture server token from disk.  Returns the token string
+ * or undefined if the file is absent (server not running or not yet started).
+ * Result is NOT cached — the server may rotate the token on restart.
+ */
+export function readCaptureToken(): string | undefined {
+	try {
+		const tok = readFileSync(_CAPTURE_TOKEN_PATH, 'utf8').trim();
+		return tok || undefined;
+	} catch {
+		return undefined;
+	}
 }
