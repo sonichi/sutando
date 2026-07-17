@@ -614,6 +614,61 @@ def poll_progress(pending_replies: dict) -> None:
             pending_task_tiers.pop(tid, None)
 
 
+def seed_pending_replies_from_disk(tasks_dir: Path) -> dict:
+    """Rebuild task_id -> chat_id for telegram tasks still awaiting results.
+
+    Restart-safety (2026-07-17 incident): `pending_replies` was in-memory only.
+    If the bridge restarted while the core was still processing a task, the new
+    process had an empty dict and the result written later was NEVER delivered —
+    the task/result pair sat in tasks//results/ forever and had to be
+    hand-delivered via the raw Telegram API.
+
+    No ledger file is needed (unlike discord-bridge's
+    state/discord-pending-replies.json): every telegram task file already
+    carries `source: telegram`, `chat_id:` and `id:` in its trusted header zone
+    (the lines BEFORE `task:` — forged copies in the user-supplied body are
+    defanged by confine_user_content). A task file still living in tasks/
+    (bare or `.claimed-core-N` variant) is by definition undelivered — the
+    result-poll loop archives it only after delivery — so scanning tasks/ at
+    startup reconstructs exactly the pending set. Rebuilt entries feed the
+    identical delivery code (parse_markers and all).
+
+    `pending_task_tiers` is deliberately NOT seeded: the progress streamer
+    fail-closes on an unknown tier by design (see poll_progress), and the
+    delivery path safely defaults the obs-event tier to "unknown".
+
+    Best-effort: malformed files are skipped, never fatal to startup.
+    """
+    seeded: dict = {}
+    try:
+        candidates = sorted(tasks_dir.glob("task-*.txt"))
+    except OSError:
+        return seeded
+    for f in candidates:
+        try:
+            text = f.read_text(errors="ignore")
+        except OSError:
+            continue
+        headers = {}
+        for line in text.splitlines():
+            if line.startswith("task:"):
+                break  # end of trusted header zone — user content below
+            key, sep, value = line.partition(":")
+            if sep:
+                headers[key.strip()] = value.strip()
+        if headers.get("source") != "telegram":
+            continue
+        task_id = headers.get("id")
+        chat_raw = headers.get("chat_id", "")
+        if not task_id or not chat_raw:
+            continue
+        try:
+            seeded[task_id] = int(chat_raw)
+        except ValueError:
+            continue  # malformed chat_id — skip, don't crash startup
+    return seeded
+
+
 def main():  # pragma: no cover
     global _TOFU_ENROLLMENT_CODE
     _single_instance_acquire("telegram-bridge")
@@ -640,7 +695,11 @@ def main():  # pragma: no cover
 
     offset = None
     allowed = load_allowed()
-    pending_replies = {}  # task_id -> chat_id
+    # task_id -> chat_id. Seeded from tasks/ so a bridge restart doesn't
+    # orphan results for tasks the core is still processing (2026-07-17).
+    pending_replies = seed_pending_replies_from_disk(TASKS_DIR)
+    if pending_replies:
+        print(f"[Telegram] recovered {len(pending_replies)} pending task(s) from tasks/ after restart", flush=True)
 
     heartbeat_file = REPO / "state" / "telegram-bridge.heartbeat"
     last_heartbeat = 0
