@@ -2896,31 +2896,44 @@ def _live_core_socket(workspace: Optional[Path] = None) -> str:
     return best_socket or default
 
 
-def _default_cron_nudge() -> bool:
+def _resolve_tmux_bin(candidates: "tuple[str, ...]" = ("/opt/homebrew/bin/tmux", "/usr/local/bin/tmux")) -> str:
+    """Absolute tmux path when a known install location exists, else a bare
+    PATH lookup (run with _resolve_launch_env's healed PATH). Same
+    PATH-narrowing class as _resolve_launch_env: under launchd's minimal PATH,
+    homebrew tmux doesn't resolve. Candidates injectable for tests."""
+    for cand in candidates:
+        if os.path.exists(cand):
+            return cand
+    return "tmux"
+
+
+def _default_cron_nudge(
+    tmux_bin: Optional[str] = None,
+    sock: Optional[str] = None,
+    session: Optional[str] = None,
+) -> bool:
     """Re-arm the live core's in-session crons by typing `/schedule-crons`
     into its tmux pane — the same keystroke channel Sutando.app's checkWatcher
     uses for a dead task watcher (main.swift tmuxSendKeys). Returns True only
-    when the session exists and send-keys succeeded."""
-    sock = _live_core_socket()
-    session = os.environ.get("SUTANDO_TMUX_SESSION", "sutando-core")
-    # Same PATH-narrowing class as _resolve_launch_env: under launchd, tmux
-    # (homebrew) is not on the minimal PATH. Prefer the known locations,
-    # falling back to a PATH lookup with the healed env.
-    tmux = "tmux"
-    for cand in ("/opt/homebrew/bin/tmux", "/usr/local/bin/tmux"):
-        if os.path.exists(cand):
-            tmux = cand
-            break
+    when the session exists and send-keys succeeded. tmux_bin/sock/session are
+    injectable so tests can drive the real subprocess path against a fake
+    tmux binary."""
+    if sock is None:
+        sock = _live_core_socket()
+    if session is None:
+        session = os.environ.get("SUTANDO_TMUX_SESSION", "sutando-core")
+    if tmux_bin is None:
+        tmux_bin = _resolve_tmux_bin()
     env = _resolve_launch_env()
-    try:  # pragma: no cover — real-subprocess nudge path (integration, not unit)
+    try:
         has = subprocess.run(
-            [tmux, "-S", sock, "has-session", "-t", session],
+            [tmux_bin, "-S", sock, "has-session", "-t", session],
             env=env, capture_output=True, timeout=15,
         )
         if has.returncode != 0:
             return False
         send = subprocess.run(
-            [tmux, "-S", sock, "send-keys", "-t", session, "/schedule-crons", "Enter"],
+            [tmux_bin, "-S", sock, "send-keys", "-t", session, "/schedule-crons", "Enter"],
             env=env, capture_output=True, timeout=15,
         )
         return send.returncode == 0
