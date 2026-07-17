@@ -286,7 +286,8 @@ export const captureScreenTool: ToolDefinition = {
 			const { display } = args as { display?: number };
 			// If no display specified, capture all displays
 			const query = display ? `?display=${display}` : '?all=true';
-			const res = await fetch(`http://localhost:7845/capture${query}`);
+			const _capTok = readCaptureToken();
+			const res = await fetch(`http://localhost:7845/capture${query}`, _capTok ? { headers: { 'X-Sutando-Capture-Token': _capTok } } : {});
 			const data = await res.json() as { status: string; path?: string; all_paths?: string[]; displays?: number; error?: string };
 			if (data.status === 'ok' && data.path) {
 				const label = data.displays && data.displays > 1
@@ -823,7 +824,7 @@ export const createChatTaskTool: ToolDefinition = {
 // (legacy $SUTANDO_PRIVATE_DIR honored via sharedPersonalPath()), else
 // <workspace>/notes fallback. Notes are SHARED across the fleet so they live
 // at the top-level memory dir, not under machine-<host>/.
-import { sharedPersonalPath, memoryDirEnv } from './util_paths.js';
+import { sharedPersonalPath, memoryDirEnv, readCaptureToken } from './util_paths.js';
 const NOTES_DIR = sharedPersonalPath('notes', WORKSPACE_DIR);
 
 export const showViewTool: ToolDefinition = {

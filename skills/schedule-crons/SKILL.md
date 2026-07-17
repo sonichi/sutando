@@ -65,7 +65,7 @@ When the agent is connected to AG2 Space, an output-producing cron can post its 
 **Opt in** by adding `"room": "auto"` to a cron entry in `crons.json`. On `/schedule-crons` activation (after step 3), run the helper once:
 
 ```bash
-WS="$(bash scripts/sutando-config.sh workspace)"; H="$(hostname | sed 's/\..*//')"
+WS="$(bash scripts/sutando-config.sh workspace)"; H="$(bash scripts/sutando-config.sh host-label)"
 python3 skills/schedule-crons/ensure-cron-room.py \
   --crons-file "$WS/hosts/$H/crons.json" --owner "@<owner>:ag2.space" --repo .
 ```

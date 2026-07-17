@@ -19,6 +19,7 @@
 import { readFileSync, writeFileSync, unlinkSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
+import { readCaptureToken } from './util_paths.js';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createServer, type Server } from 'node:http';
@@ -136,7 +137,8 @@ const screenSource: VisionSource = {
 		// silent=true skips the menu-bar flash + macOS notification, which would
 		// otherwise fire on every frame during a stream. format=jpeg keeps
 		// frames small (~50–150KB).
-		const res = await fetch('http://localhost:7845/capture?format=jpeg&silent=true');
+		const _capTok = readCaptureToken();
+		const res = await fetch('http://localhost:7845/capture?format=jpeg&silent=true', _capTok ? { headers: { 'X-Sutando-Capture-Token': _capTok } } : {});
 		const data = (await res.json()) as { status: string; path?: string; error?: string };
 		if (data.status !== 'ok' || !data.path) {
 			throw new Error(`screen-capture-server: ${data.error || 'no path'}`);
