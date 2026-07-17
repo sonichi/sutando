@@ -326,6 +326,19 @@ fi
 # still there as a fallback (mentioned in README).
 bash "$REPO/scripts/install-git-hooks.sh" >/dev/null 2>&1 || true
 
+# Wire the SessionStart hook that reminds the core agent to run /schedule-crons
+# on every session start (including post-compaction). Idempotent — safe to run
+# on every start. Crons are session-only, so without this, recurring jobs go
+# dark whenever a session restarts without an explicit /schedule-crons invocation.
+bash "$REPO/scripts/install-session-start-hook.sh" 2>&1 || true
+
+# Re-inject PERSONAL_CLAUDE.md after context compaction (SessionStart
+# "compact" matcher). CLAUDE.md + the memory index survive compaction via the
+# system prompt; PERSONAL_CLAUDE.md only enters context via an explicit Read,
+# which compaction summarizes away — so long sessions silently lose per-user
+# rules. Idempotent — safe to run on every start.
+bash "$REPO/scripts/install-personal-claude-hook.sh" 2>&1 || true
+
 # Auto-bootstrap: create-if-missing files and dirs that the agent + skills
 # expect to exist (logs, state, tasks, results, notes, contextual-chips.json,
 # pending-questions.md, build_log.md, crons.json, …). Idempotent — safe to
@@ -648,6 +661,17 @@ else
   echo "  ✓ voice agent (already running)"
 fi
 
+# 1b. Call-tier advertisement (resident, re-emitting): write state/call-tiers.json
+# so the runtime descriptor advertises which DIRECT call endpoints are reachable
+# now (Track 9 availability-driven call-tier menu). Backgrounded — it probes
+# tailscale with its own short timeout and never blocks the rest of startup;
+# absent file just means the descriptor advertises no direct tiers (client falls
+# back to cloud). `--interval 60` keeps it resident and re-emits every 60s so the
+# advertisement tracks reachability changes AFTER boot (tailnet/VPN coming up
+# post-startup would otherwise leave Direct(Tailscale) greyed until a restart).
+npx tsx src/emit-call-tiers.ts --interval 60 > "$LOGS_DIR/emit-call-tiers.log" 2>&1 &
+echo "  ✓ call-tiers advertisement (re-emit 60s)"
+
 # 2. Web client (port 8080)
 reap_wedged_listener 8080 web-client
 if ! lsof -i :8080 > /dev/null 2>&1; then
@@ -725,14 +749,14 @@ if [ -d "$REPO/skills/portfolio-research" ]; then
   echo "  ✓ portfolio dashboard (port 8899)"
 fi
 
-# 5b. Sutando context drop app (global hotkey ⌃C)
+# 5b. Sutando context drop app (hotkey configurable via state/hotkeys.json)
 SUT_SRC="$REPO/src/Sutando/main.swift"
 SUT_BIN="$REPO/src/Sutando/Sutando"
 
 # Build the public ax-read CLI if missing or older than any of its source
 # files. Sutando.app's resolveAxReadPath() prefers private personal-deictic
 # when installed; this public binary is the text-only fallback so public-repo
-# users still get the ⌃C selection-drop experience.
+# users still get the context-drop experience.
 #
 # Staleness widened (per Mini's PR #907 review): trigger a rebuild when
 # Package.swift / build.sh / any *.swift under Sources/ is newer than the
@@ -746,7 +770,7 @@ if [ -n "$AXR_NEWEST_SRC" ] && { [ ! -f "$AXR_BIN" ] || [ "$AXR_NEWEST_SRC" -nt 
   echo "  Compiling public ax-read (skills/context-drop)..."
   if ! command -v swift >/dev/null 2>&1; then
     echo "  ⚠ ax-read build skipped: 'swift' not in PATH"
-    echo "    → install Xcode Command Line Tools (xcode-select --install) for ⌃C selection drops on public-repo installs"
+    echo "    → install Xcode Command Line Tools (xcode-select --install) for context drops on public-repo installs"
   elif (cd "$AXR_DIR" && bash build.sh); then
     echo "  ✓ ax-read built at $AXR_BIN"
   else
@@ -765,7 +789,7 @@ if [ -f "$SUT_SRC" ] && { [ ! -f "$SUT_BIN" ] || [ "$SUT_SRC" -nt "$SUT_BIN" ]; 
     # Sync the fresh binary into the .app bundle if one exists, ensure the
     # AppleEvents usage-description key is present, and re-sign so the
     # cdhash matches. Without NSAppleEventsUsageDescription macOS silently
-    # denies AppleEvents — getFinderSelection() returns [] and the ⌃C
+    # denies AppleEvents — getFinderSelection() returns [] and the context
     # drop handler logs "Nothing selected" with no permission prompt.
     SUT_APP="$REPO/src/Sutando/Sutando.app"
     if [ -d "$SUT_APP" ]; then
@@ -814,7 +838,7 @@ if ! pgrep -f "src/Sutando/Sutando" > /dev/null 2>&1; then
   if [ -f "$SUT_BIN" ]; then
     echo "  Starting Sutando..."
     "$SUT_BIN" > /dev/null 2>&1 &
-    echo "  ✓ Sutando (⌃C/⌃V/⌃M)"
+    echo "  ✓ Sutando (hotkeys via state/hotkeys.json)"
   else
     echo "  ⚠ Sutando binary missing — hotkeys disabled"
   fi
@@ -890,7 +914,9 @@ fi
 # right one in the first place avoids the wasted process + traceback noise.
 # Probe a fixed list of candidates in priority order; first one with discord.py
 # wins. Same probe is also what's used in the bridge's rescue fallback.
-if _DC_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/discord/.env)"; [ -f "$_DC_ENV" ] && grep -q "DISCORD_BOT_TOKEN=" "$_DC_ENV" 2>/dev/null; then
+if [ "${SKIP_DISCORD:-}" = "1" ]; then
+  echo "  ~ discord bridge (skipped via SKIP_DISCORD)"
+elif _DC_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/discord/.env)"; [ -f "$_DC_ENV" ] && grep -q "DISCORD_BOT_TOKEN=" "$_DC_ENV" 2>/dev/null; then
   PYTHON_WITH_DISCORD=""
   for _p in /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
     if command -v "$_p" >/dev/null 2>&1 && "$_p" -c "import discord" 2>/dev/null; then
@@ -926,7 +952,9 @@ fi
 # 7b. Slack bridge (optional — needs SLACK_BOT_TOKEN + SLACK_APP_TOKEN + slack_bolt)
 # Probes the same Python-interpreter candidates as the discord bridge so a
 # fresh-install miniconda env doesn't silently miss slack_bolt.
-if _SL_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/slack/.env)"; [ -f "$_SL_ENV" ] && grep -q "SLACK_BOT_TOKEN=" "$_SL_ENV" 2>/dev/null; then
+if [ "${SKIP_SLACK:-}" = "1" ]; then
+  echo "  ~ slack bridge (skipped via SKIP_SLACK)"
+elif _SL_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/slack/.env)"; [ -f "$_SL_ENV" ] && grep -q "SLACK_BOT_TOKEN=" "$_SL_ENV" 2>/dev/null; then
   PYTHON_WITH_SLACK=""
   for _p in /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
     if command -v "$_p" >/dev/null 2>&1 && "$_p" -c "import slack_bolt" 2>/dev/null; then
@@ -952,7 +980,11 @@ fi
 # 8. Phone conversation server + ngrok (optional — needs Twilio creds, skip with SKIP_PHONE=1)
 if [ "${SKIP_PHONE:-}" = "1" ]; then
   echo "  ~ conversation server (skipped via SKIP_PHONE)"
-elif grep -q "TWILIO_ACCOUNT_SID=" .env 2>/dev/null; then
+# Anchored + non-empty value: the unanchored substring form also matched the
+# commented template placeholder (`# TWILIO_ACCOUNT_SID=ACxxxxxxxxx`), starting
+# conversation-server and a PUBLIC ngrok tunnel on hosts with no Twilio at all.
+# Mirrors twilio_configured() in src/health-check.py — keep the two in sync.
+elif grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; then
   if ! pgrep -f "conversation-server" > /dev/null 2>&1; then
     echo "  Starting conversation server..."
     npx tsx skills/phone-conversation/scripts/conversation-server.ts > /tmp/conversation-server.log 2>&1 &

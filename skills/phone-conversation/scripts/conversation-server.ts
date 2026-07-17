@@ -252,6 +252,40 @@ mkdirSync(TASKS_DIR, { recursive: true });
 
 const ts = () => new Date().toISOString().slice(11, 23);
 const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+/** U+200B — zero-width space; not whitespace, so it survives .trimStart(). */
+const _ZWSP = '​';
+// Mirrors local_task_protocol.KNOWN_HEADER_KEYS (34 keys) — injection-guard-sweep
+// asserts this regex covers every py key. Synced on the 2026-07-13 main merge.
+const _CONF_HEADER_RE = new RegExp(
+	'^(?:id|timestamp|task|source|access_tier|user_id|channel_id|priority|' +
+	'interaction_type|source_message_id|channel_name|guild_name|attempts|' +
+	'sender_name|room_name|parent_message_id|reminder|author_name|author_id|' +
+	'chat_id|thread_ts|reply_to_event|reply_to_me|callSid|caller|from|' +
+	'call_sid|hint|instructions|transcript|content_modalities|media_form|' +
+	'attachments|platform_card)\\s*:',
+	'i',
+);
+const _CONF_FENCE_RE = /^={3,}/;
+// Fold every str.splitlines() separator to '\n' so the guard's line-set
+// matches the reader's (else \v \f \x1c-\x1e \x85 LS PS smuggle a forged line).
+const _CONF_LINE_SEP_RE = /\r\n|[\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]/g;
+/**
+ * Defang caller-supplied text before embedding in a task file.
+ * Mirrors src/task_body_guard.py:confine_user_content() and
+ * src/task-bridge.ts:confineUserContent().
+ */
+function confineUserContent(text: string): string {
+	if (!text) return text;
+	const normalized = text.replace(_CONF_LINE_SEP_RE, '\n');
+	return normalized.split('\n').map(line => {
+		const probe = line.trimStart();
+		if ((_CONF_HEADER_RE.test(probe) || _CONF_FENCE_RE.test(probe)) && !line.startsWith(_ZWSP)) {
+			return _ZWSP + line;
+		}
+		return line;
+	}).join('\n');
+}
 const google = createGoogleGenerativeAI({ apiKey: GEMINI_API_KEY });
 
 // --- Audio conversion (inbound + outbound audio chains) ---
@@ -436,7 +470,9 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 	// `media_form: live_stream` — interaction-model 4D step 1.5 (scope A): the
 	// phone plane is a live real-time session, same as web voice. Additive
 	// provenance/observability stamp; media frames stay out-of-band.
-	const content = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\nsource: phone\ninteraction_type: realtime_audio\nmedia_form: live_stream\ncallSid: ${callSession.callSid}\ncaller: ${callSession.callerNumber || 'unknown'}\naccess_tier: ${callSession.isOwner ? 'owner' : 'other'}\ntask: ${taskDescription}\nhint: Check ${skillsHint} for a matching skill before using raw commands.\ntranscript:\n${fullTranscript}\n`;
+	// User-controlled fields (caller, task, transcript) stay wrapped in
+	// confineUserContent() from #1806 — main's version dropped the wrapping.
+	const content = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\nsource: phone\ninteraction_type: realtime_audio\nmedia_form: live_stream\ncallSid: ${callSession.callSid}\ncaller: ${confineUserContent(callSession.callerNumber || 'unknown')}\naccess_tier: ${callSession.isOwner ? 'owner' : 'other'}\ntask: ${confineUserContent(taskDescription)}\nhint: Check ${skillsHint} for a matching skill before using raw commands.\ntranscript:\n${confineUserContent(fullTranscript)}\n`;
 	writeFileSync(taskPath, content);
 
 	// Poll for result in background, inject when ready — don't block Gemini
@@ -1161,7 +1197,7 @@ function cleanupCall(callSid: string): void {
 			// lifecycle, not by a caller utterance during the live session.
 			`interaction_type: system_event`,
 			`callSid: ${callSid}`,
-			`caller: ${session.callerNumber || 'unknown'}`,
+			`caller: ${confineUserContent(session.callerNumber || 'unknown')}`,
 			`access_tier: ${session.isOwner ? 'owner' : 'other'}`,
 			`task: Summarize this ${isMeeting ? 'meeting (ID: ' + session.meetingId + ')' : 'phone call'}.`,
 			`instructions:`,
@@ -1170,7 +1206,7 @@ function cleanupCall(callSid: string): void {
 			`  3. Send a concise version (3-5 bullet points) to the owner via Discord DM.`,
 			`  4. Write result to results/${summaryTaskId}.txt so voice agent can speak it`,
 			`transcript:`,
-			formatted,
+			confineUserContent(formatted),
 		];
 		const summaryContent = taskLines.join('\n') + '\n';
 		writeFileSync(join(TASKS_DIR, `${summaryTaskId}.txt`), summaryContent);

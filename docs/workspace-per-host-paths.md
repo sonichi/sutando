@@ -45,7 +45,7 @@ include them.
    qualified pattern works (`build_log/<hostname>.md`). Each host owns its file;
    pulls bring peers' files in side-by-side, never merging.
 
-Use the host slug the sync layer uses: `hostname | sed 's/\..*//'`.
+Use the host slug the sync layer uses: `bash scripts/sutando-config.sh host-label`.
 
 ## Enforcement
 

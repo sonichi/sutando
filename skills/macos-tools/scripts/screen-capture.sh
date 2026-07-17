@@ -6,7 +6,9 @@
 #
 # Output: path to the captured PNG file
 
-DIR="/tmp/sutando-screenshots"
+# Per-user temp dir (same shape as browser.mjs / screen-capture-server.py):
+# shared /tmp dir EACCES-fails the second account on multi-user Macs.
+DIR="${SUTANDO_SCREENSHOT_DIR:-${TMPDIR:-/tmp}/sutando-screenshots}"
 mkdir -p "$DIR"
 
 TIMESTAMP=$(date '+%Y%m%d-%H%M%S')

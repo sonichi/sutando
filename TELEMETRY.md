@@ -11,8 +11,8 @@ Only bucketed / categorical **product events**:
 | Event | Properties | Why |
 |-------|-----------|-----|
 | `core_started` | `interval_s` | Count active installs (OSS + desktop) |
-| `feature_used` | `feature` (e.g. `report-feedback`, `morning-briefing`) | Which features matter |
-| `task_processed` | `source` (voice/discord/telegram/web/chat), `access_tier` | How people interact |
+| `feature_used` | `feature` (snake_case, e.g. `morning_briefing`, `daily_insight`) | Which features matter |
+| `task_processed` | `source` (`discord`/`telegram`/`slack`; more surfaces as wired) | Activation — whether installs process any tasks after launch, and via which surface |
 | `skill_invoked` | `skill` | Skill adoption |
 | `voice_session` | `duration_bucket` (`<30s` / `30-120s` / `>120s`) | Voice usage |
 | `error` | `type` | Reliability (type only) |

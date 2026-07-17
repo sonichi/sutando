@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""room-ops · doc — read/write/delete a room's shared vault documents.
+"""room-ops · doc — read/write/delete a room's shared Room Context documents.
 
 The missing half of room participation: `read`/`send`/`react` cover the room
-TIMELINE; `doc` covers the room's durable SHARED STATE — the per-room vault
+TIMELINE; `doc` covers the room's durable SHARED STATE — the per-room Room Context store
 folders (`room-live-context/`, `room-todo/`, `room-memo/`,
 `room-live-transcript/` by convention, or any agent-defined folder the gateway
 accepts). With these three verbs an agent can maintain a room's context,
@@ -56,7 +56,7 @@ def _call(op, room_id, agent_mxid, gate, extra):
 
 
 def doc_get(room_id, folder=DEFAULT_FOLDER, name=None, agent_mxid=None, *, gate=None):
-    """Fetch one vault doc (or the folder's default doc when `name` is None)."""
+    """Fetch one Room Context doc (or the folder's default doc when `name` is None)."""
     extra = {"folder": folder}
     if name:
         extra["filename"] = name
@@ -70,7 +70,7 @@ def doc_get(room_id, folder=DEFAULT_FOLDER, name=None, agent_mxid=None, *, gate=
 
 def doc_put(room_id, content, folder=DEFAULT_FOLDER, name="CONTEXT.md",
             message=None, agent_mxid=None, *, gate=None):
-    """Create or update one vault doc (full-content write, gateway commits)."""
+    """Create or update one Room Context doc (full-content write, gateway commits)."""
     extra = {
         "folder": folder, "filename": name,
         "content_b64": base64.b64encode((content or "").encode()).decode(),
@@ -85,7 +85,7 @@ def doc_put(room_id, content, folder=DEFAULT_FOLDER, name="CONTEXT.md",
 
 
 def doc_rm(room_id, name, folder=DEFAULT_FOLDER, agent_mxid=None, *, gate=None):
-    """Delete one vault doc (404 at the gateway degrades to a graceful ok:false)."""
+    """Delete one Room Context doc (404 at the gateway degrades to a graceful ok:false)."""
     res = _call("prep_delete", room_id, agent_mxid, gate,
                 {"folder": folder, "filename": name})
     if not isinstance(res, dict) or res.get("ok") is False:

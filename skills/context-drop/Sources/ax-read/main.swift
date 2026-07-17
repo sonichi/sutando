@@ -1,6 +1,6 @@
 // ax-read — read the focused app's text selection via the macOS Accessibility API.
 //
-// Used by Sutando.app's dropContext (the ⌃C "drop context" hotkey). Runs as
+// Used by Sutando.app's dropContext action (hotkey configurable via state/hotkeys.json). Runs as
 // a subprocess so the AX queries get a stable TCC attribution chain rooted
 // at this binary's signed identity rather than at every caller's. Sutando.app
 // spawns this via Process() in invokeAxRead() and parses the JSON below.
@@ -29,7 +29,7 @@
 // Private "personal-deictic" skill ships a richer version that also captures
 // the focused-window screenshot and cursor location for deictic phrases like
 // "this" and "here." This public version drops those — Sutando.app only
-// needs the text-selection bits for ⌃C drops.
+// needs the text-selection bits for context drops.
 
 import Cocoa
 import ApplicationServices

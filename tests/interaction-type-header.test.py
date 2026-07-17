@@ -90,8 +90,10 @@ for marker, expect, want_source in (
             f"{'missing' if want_source else 'present (double-DM regression — see comment at the writer)'}")
 
 # remote-gateway-bridge serializes from _TASK_FIELDS — assert pass-through is
-# wired, vocabulary-whitelisted, and defaults to message.
-gw = (REPO / "src/remote-gateway-bridge.py").read_text()
+# wired, vocabulary-whitelisted, and defaults to message. The implementation is
+# canonical in the ag2-sparrow package (src/remote-gateway-bridge.py is a thin
+# loader shim post-#2082), so the guard reads the package source.
+gw = (REPO / "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py").read_text()
 checked += 1
 if ('"interaction_type"' not in gw or "_INTERACTION_TYPES" not in gw
         or 'it = "message"' not in gw):

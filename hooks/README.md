@@ -60,3 +60,37 @@ Test: `python3 tests/skip-ask-user-question.test.py` (hook) and
 
 Config paths are env-overridable for testing: `SUTANDO_DISCORD_ACCESS_FILE`,
 `SUTANDO_DISCORD_ENV_FILE`, `SUTANDO_WORKSPACE`. Test: `python3 tests/context-source-guard.test.py`.
+
+## `gmail-write-guard.py`
+
+Denies the **claude.ai Gmail MCP connector's WRITE-scoped tools** (create_draft,
+label_thread, unlabel_thread, create_label, apply_sensitive_*_label, archive,
+trash, send, …) and routes the model to the app-password IMAP/SMTP path
+(docs/built-in-tools.md → Email). Field report 05cb849a: the connector's OAuth
+flow doesn't actually grant Gmail write scopes (label/archive fail with a raw
+"insufficient authentication scopes" error) and `create_draft` caused 7
+documented incidents incl. a wrong-recipient send — while READ tools work fine
+and remain allowed. The guard matches only `mcp__…` tools whose name mentions
+gmail AND carries a write verb (`list_labels` stays allowed; `label_thread` is
+denied); non-Gmail tools are a no-op, so it is safe under a broad matcher.
+
+Escape hatch: `SUTANDO_ALLOW_GMAIL_CONNECTOR_WRITES=1` lifts the guard (for
+if/when the connector's scopes are fixed upstream). Fail-OPEN on hook errors.
+
+### Deploy (per node)
+
+```bash
+cp hooks/gmail-write-guard.py ~/.claude/hooks/
+python3 - <<'PY'
+import json, os
+sp = os.path.expanduser("~/.claude/settings.json"); s = json.load(open(sp))
+cmd = "python3 ~/.claude/hooks/gmail-write-guard.py"
+pre = s.setdefault("hooks", {}).setdefault("PreToolUse", [])
+blk = next((b for b in pre if b.get("matcher") == "mcp__.*[Gg][Mm][Aa][Ii][Ll].*"), None)
+if blk is None: pre.append({"matcher": "mcp__.*[Gg][Mm][Aa][Ii][Ll].*", "hooks": [{"type": "command", "command": cmd}]})
+elif cmd not in [h.get("command") for h in blk["hooks"]]: blk["hooks"].append({"type": "command", "command": cmd})
+json.dump(s, open(sp, "w"), indent=2)
+PY
+```
+
+Test: `python3 tests/gmail-write-guard.test.py`.
