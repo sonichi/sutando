@@ -982,13 +982,19 @@ def _release_singleton() -> None:
         pass
 
 
-def _heartbeat_singleton() -> None:
+def _heartbeat_singleton() -> bool:
+    """Refresh the poller lock. Returns False ONLY when we have definitively LOST
+    ownership — a replacement reaped our lock after we were deemed stale (the
+    stale-takeover race). The caller MUST stop polling on False, or the reaped
+    process and the new owner both pull the same relay bearer (the dual-poll this
+    slice closes). Fail-open on everything else (lock disabled / heartbeat error
+    → True) so a lock bug never wedges task delivery."""
     if not _lock_on():
-        return
+        return True
     try:
-        _ws_heartbeat(_LOCK_ROLE, _LOCK_WS)
+        return bool(_ws_heartbeat(_LOCK_ROLE, _LOCK_WS))
     except Exception:
-        pass
+        return True
 
 
 def _acquire_singleton() -> bool:
@@ -1028,7 +1034,13 @@ def main() -> None:
     backoff = 1
     while True:
         try:
-            _heartbeat_singleton()  # keep our workspace poller lock fresh (fail-open)
+            if not _heartbeat_singleton():
+                # Lost the poller lock (reaped after being deemed stale). Stop
+                # polling immediately so we don't dual-poll the relay bearer with
+                # the process that took over. atexit release is a no-op (not ours).
+                _log("singleton: lost workspace poller lock (reaped after stale takeover) "
+                     "— exiting to avoid dual-poll")
+                return
             _post_heartbeat(inflight)
             resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}", timeout=POLL_WAIT + 10)
             added = False

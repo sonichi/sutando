@@ -54,7 +54,39 @@ class SingletonGlueTest(unittest.TestCase):
         os.environ["SUTANDO_BRIDGE_LOCK"] = "0"
         self.assertTrue(rgb._acquire_singleton())        # proceeds
         self.assertFalse(self._lockfile().exists())      # but never touches the lock
-        rgb._heartbeat_singleton()                       # no-op, must not raise
+        self.assertTrue(rgb._heartbeat_singleton())      # lock disabled → fail-open True
+        rgb._release_singleton()
+
+    def test_heartbeat_lost_ownership_stops_poll(self):
+        # Regression (Codex review on #2153): after a stale takeover a replacement
+        # reaps our lock, so workspace_lock.heartbeat() returns False. The bridge
+        # MUST treat that as lost ownership and stop polling — else the reaped
+        # process and the new owner dual-poll the relay bearer. Force the False
+        # and prove _heartbeat_singleton propagates it (the main loop's
+        # `if not _heartbeat_singleton(): return` then exits before the next poll).
+        self.assertTrue(rgb._acquire_singleton())        # we hold it
+        orig = rgb._ws_heartbeat
+        rgb._ws_heartbeat = lambda *a, **k: False        # reaped by a replacement
+        try:
+            self.assertFalse(rgb._heartbeat_singleton(), "lost lock must signal stop-poll")
+        finally:
+            rgb._ws_heartbeat = orig
+        self.assertTrue(rgb._heartbeat_singleton())      # still-held → keep polling
+        rgb._release_singleton()
+
+    def test_heartbeat_fail_open_on_error(self):
+        # A heartbeat backend error must NOT be read as lost ownership (fail-open):
+        # a lock bug can't be allowed to wedge task delivery.
+        self.assertTrue(rgb._acquire_singleton())
+        orig = rgb._ws_heartbeat
+
+        def boom(*a, **k):
+            raise RuntimeError("heartbeat backend exploded")
+        rgb._ws_heartbeat = boom
+        try:
+            self.assertTrue(rgb._heartbeat_singleton())  # error → keep polling
+        finally:
+            rgb._ws_heartbeat = orig
         rgb._release_singleton()
 
     def test_deferred_when_live_holder(self):
