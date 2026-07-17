@@ -218,16 +218,26 @@ class CliTest(unittest.TestCase):
                                  "schema_version": 1}))   # no heartbeat_at
         self.assertEqual(self.mod.acquire("r", self.ws).status, "reaped")
 
-    def test_deferred_after_exhausted_contention(self):
-        # never win the create, always see a stale holder → loop exhausts → defer
-        orig_create = self.mod._try_create
-        self.mod._try_create = lambda *a, **k: False
-        self.mod._read = lambda path: {"role": "r", "pid": 999999, "host": HOST,
-                                       "heartbeat_at": 0, "schema_version": 1}
-        try:
-            self.assertEqual(self.mod.acquire("r", self.ws).status, "deferred")
-        finally:
-            self.mod._try_create = orig_create
+    def test_heartbeat_does_not_clobber_a_reaped_owner(self):
+        """P1 regression: a stale holder that resumes into heartbeat() must NOT
+        overwrite the owner that reaped it. We acquire as ourselves, then
+        simulate another process taking over (different pid, fresh), then
+        heartbeat() — it must return False and leave the new owner intact."""
+        self.assertEqual(self.mod.acquire("r", self.ws).status, "acquired")
+        p = self._lock_path()
+        taken = json.loads(p.read_text())
+        taken["pid"] = 999999                      # a different process now owns it
+        taken["heartbeat_at"] = int(time.time())   # freshly
+        p.write_text(json.dumps(taken))
+        self.assertFalse(self.mod.heartbeat("r", self.ws))     # we no longer hold it
+        self.assertEqual(json.loads(p.read_text())["pid"], 999999)  # owner untouched
+
+    def test_idempotent_reacquire_preserves_generation(self):
+        r1 = self.mod.acquire("r", self.ws)
+        gen1 = json.loads(self._lock_path().read_text())["acquired_at"]
+        r2 = self.mod.acquire("r", self.ws)
+        self.assertEqual(r2.status, "acquired")
+        self.assertEqual(json.loads(self._lock_path().read_text())["acquired_at"], gen1)
 
 
 if __name__ == "__main__":

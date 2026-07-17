@@ -54,6 +54,8 @@ CLI (bash consumers, e.g. supervisor):
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import socket
@@ -65,7 +67,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 SCHEMA_VERSION = 1
 DEFAULT_STALE_SECONDS = 90  # same freshness window as state/cores/<host>.alive
-_ACQUIRE_RETRIES = 5
 
 
 def _resolve_workspace(override: str | None) -> Path:
@@ -93,6 +94,28 @@ def _locks_dir(workspace: Path) -> Path:
 
 def _lock_path(workspace: Path, role: str) -> Path:
     return _locks_dir(workspace) / f"{role}.lock"
+
+
+@contextlib.contextmanager
+def _guard(workspace: Path, role: str):
+    """Serialize a lock's read-decide-write critical section with an exclusive
+    `fcntl.flock` on a persistent sidecar guard file (never unlinked). This is
+    what makes reap+acquire and heartbeat mutually exclusive, closing the
+    heartbeat-overwrites-a-freshly-reaped-owner race: a slow holder that resumes
+    into heartbeat() cannot interleave between another process's reap and
+    _try_create, because both must first hold this flock. Same-host by design
+    (the lock is per-host), so flock's local-FS semantics are reliable here."""
+    _locks_dir(workspace).mkdir(parents=True, exist_ok=True)
+    gp = _locks_dir(workspace) / f"{role}.lock.guard"
+    fd = os.open(str(gp), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 class LockResult:
@@ -136,90 +159,63 @@ def _is_fresh(holder: dict, stale_seconds: int) -> bool:
     return (_now() - hb) < stale_seconds
 
 
-def _try_create(path: Path, data: dict) -> bool:
-    """Atomic exclusive create. True iff WE created it (won the race)."""
-    try:
-        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-    except FileExistsError:
-        return False
-    try:
-        os.write(fd, json.dumps(data).encode())
-    finally:
-        os.close(fd)
-    return True
-
-
-def acquire(role: str, workspace: Path | str | None = None,
-            stale_seconds: int = DEFAULT_STALE_SECONDS) -> LockResult:
-    ws = workspace if isinstance(workspace, Path) else _resolve_workspace(workspace)
-    _locks_dir(ws).mkdir(parents=True, exist_ok=True)
-    path = _lock_path(ws, role)
-    data = _payload(role, ws)
-
-    for _ in range(_ACQUIRE_RETRIES):
-        if _try_create(path, data):
-            return LockResult("acquired")
-        holder = _read(path)
-        if holder is None:
-            # Either the holder released between create-fail and read (file
-            # gone → retry) or the file is corrupt/empty/unreadable (still
-            # present → reap it, then retry the create).
-            if path.exists():
-                try:
-                    os.unlink(path)
-                except FileNotFoundError:  # pragma: no cover - unlink race
-                    pass
-            continue
-        if holder.get("pid") == os.getpid() and holder.get("host") == data["host"]:
-            # already ours (idempotent re-acquire) — refresh + report acquired
-            _write_atomic(path, data)
-            return LockResult("acquired")
-        if _is_fresh(holder, stale_seconds):
-            return LockResult("deferred", holder=holder)
-        # stale / orphaned holder → reap and take it
-        try:
-            os.unlink(path)
-        except FileNotFoundError:  # pragma: no cover - unlink race
-            pass  # another reaper won; loop retries the create
-        if _try_create(path, data):
-            return LockResult("reaped")
-        # lost the reap race — loop; next iter sees the new (fresh) holder
-    # Exhausted retries under contention: treat as deferred (safer than a
-    # second poller); report whatever holder we last saw.
-    return LockResult("deferred", holder=_read(path))
-
-
 def _write_atomic(path: Path, data: dict) -> None:
     tmp = path.with_suffix(f".lock.tmp.{os.getpid()}")
     tmp.write_text(json.dumps(data))
     os.replace(tmp, path)
 
 
-def heartbeat(role: str, workspace: Path | str | None = None) -> bool:
-    """Refresh heartbeat_at iff we are the current holder. True if still held."""
+def acquire(role: str, workspace: Path | str | None = None,
+            stale_seconds: int = DEFAULT_STALE_SECONDS) -> LockResult:
     ws = workspace if isinstance(workspace, Path) else _resolve_workspace(workspace)
     path = _lock_path(ws, role)
-    holder = _read(path)
-    if not holder or holder.get("pid") != os.getpid() or holder.get("host") != _host_label():
-        return False
-    holder["heartbeat_at"] = _now()
-    try:
+    data = _payload(role, ws)
+    # The whole read-decide-write runs under the guard flock, so no other
+    # acquire/heartbeat/release can interleave — the reap→take is atomic.
+    with _guard(ws, role):
+        holder = _read(path)
+        if holder is None:
+            # absent, or corrupt/unreadable → treat as free and take it
+            _write_atomic(path, data)
+            return LockResult("acquired")
+        if holder.get("pid") == os.getpid() and holder.get("host") == data["host"]:
+            # idempotent re-acquire — refresh, preserving the original generation
+            data["acquired_at"] = holder.get("acquired_at", data["acquired_at"])
+            _write_atomic(path, data)
+            return LockResult("acquired")
+        if _is_fresh(holder, stale_seconds):
+            return LockResult("deferred", holder=holder)
+        # stale / orphaned holder → reap and take it (atomically, under guard)
+        _write_atomic(path, data)
+        return LockResult("reaped")
+
+
+def heartbeat(role: str, workspace: Path | str | None = None) -> bool:
+    """Refresh heartbeat_at iff we are STILL the current holder. Returns False
+    (without writing) if we've been reaped — under the guard flock, so it cannot
+    clobber a holder that took over between our read and write (the P1 race)."""
+    ws = workspace if isinstance(workspace, Path) else _resolve_workspace(workspace)
+    path = _lock_path(ws, role)
+    with _guard(ws, role):
+        holder = _read(path)
+        if not holder or holder.get("pid") != os.getpid() or holder.get("host") != _host_label():
+            return False
+        holder["heartbeat_at"] = _now()
         _write_atomic(path, holder)
         return True
-    except Exception:  # pragma: no cover - defensive fail-safe
-        return False
 
 
 def release(role: str, workspace: Path | str | None = None) -> None:
-    """Remove the lock iff we hold it (pid+host match)."""
+    """Remove the lock iff we still hold it (pid+host match), under the guard."""
     ws = workspace if isinstance(workspace, Path) else _resolve_workspace(workspace)
     path = _lock_path(ws, role)
-    holder = _read(path)
-    if holder and holder.get("pid") == os.getpid() and holder.get("host") == _host_label():
-        try:
-            os.unlink(path)
-        except FileNotFoundError:  # pragma: no cover - unlink race
-            pass
+    with _guard(ws, role):
+        holder = _read(path)
+        if holder and holder.get("pid") == os.getpid() and holder.get("host") == _host_label():
+            try:
+                os.unlink(path)
+            except FileNotFoundError:  # pragma: no cover - unlink race
+                pass
 
 
 def read_holder(role: str, workspace: Path | str | None = None) -> dict | None:
