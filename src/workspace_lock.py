@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""Atomic per-workspace role lock for sutando singleton enforcement (MC1).
+
+Closes the real dual-poller bug class (confirmed by air, 2026-07-16): NOT a
+second `claude --name sutando-core` (start-cli.sh's `core_claude_running` pgrep
+already guards that), but **two gateway bridges / supervisors polling one
+relay** → duplicate task delivery. Two observed incidents:
+  1. An orphaned bridge from a PRIOR install (ppid 1, outlived its parent by
+     days) still polling alongside the live app bridge → owner message
+     delivered twice.
+  2. A replacement bridge + Electron respawn starting simultaneously → two
+     pollers on one bearer (a TOCTOU race).
+
+This primitive gives the bridge/supervisor a role lock that closes both:
+  • **Atomic acquire** (`O_CREAT|O_EXCL`) → the simultaneous-start race can only
+    produce one winner (incident #2).
+  • **Held + heartbeated** (mtime-style freshness in the payload, like
+    `state/cores/<host>.alive`) → a would-be second poller distinguishes a
+    LIVE holder (defer) from a STALE/orphaned holder (reap + take), so a
+    crashed or hung holder cannot wedge the role forever (incident #1's
+    ungraceful/orphan case).
+
+Liveness = **heartbeat freshness**, deliberately NOT pid-alive: the 83188 ghost
+was alive-but-stale, and a hung-but-running holder that stopped heartbeating
+should lose the lock. pid recycling would also make kill(0) unreliable.
+
+Lock file: `<workspace>/state/locks/<role>.lock`
+  {"role","pid","host","workspace","acquired_at","heartbeat_at","schema_version":1}
+
+The lock is per-`(workspace, role)`: the file lives under the workspace (so it
+is inherently workspace-scoped — the contended resource is the relay/task bus
+of THAT workspace) and `role` separates `gateway-bridge` from `supervisor`.
+
+TRANSITION CAVEAT: a pre-lock orphan (old code with no lock support) won't
+respect this — during an upgrade the installer/supervisor must still kill old
+pollers. The lock makes the steady state (both sides lock-aware) correct.
+
+Python API (bridge/supervisor import this directly):
+    r = acquire("gateway-bridge")        # LockResult(status=..., holder=...)
+    if r.status == "deferred": ...defer/exit...
+    heartbeat("gateway-bridge")          # call ~every 30s while holding
+    release("gateway-bridge")            # on shutdown
+
+CLI (bash consumers, e.g. supervisor):
+    workspace_lock.py acquire   --role R [--workspace W] [--stale-seconds N]
+       exit 0 acquired/reaped (holder line on stdout) | exit 3 deferred (holder
+       json on stdout) | exit 0 also on unexpected error (fail-open — never
+       wedge startup on a lock bug; a dropped guard only risks the pre-existing
+       dual-poller, never a false refuse of the only poller).
+    workspace_lock.py heartbeat --role R [--workspace W]   exit 0 held / 1 lost
+    workspace_lock.py release   --role R [--workspace W]
+    workspace_lock.py status    --role R [--workspace W]   holder json / empty
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+SCHEMA_VERSION = 1
+DEFAULT_STALE_SECONDS = 90  # same freshness window as state/cores/<host>.alive
+_ACQUIRE_RETRIES = 5
+
+
+def _resolve_workspace(override: str | None) -> Path:
+    if override:
+        return Path(override)
+    from workspace_default import resolve_workspace  # noqa: E402
+    return resolve_workspace()
+
+
+def _host_label() -> str:
+    try:
+        from util_paths import _host_label as hl  # noqa: E402
+        return hl()
+    except Exception:
+        return socket.gethostname().split(".")[0]
+
+
+def _now() -> int:
+    return int(time.time())
+
+
+def _locks_dir(workspace: Path) -> Path:
+    return workspace / "state" / "locks"
+
+
+def _lock_path(workspace: Path, role: str) -> Path:
+    return _locks_dir(workspace) / f"{role}.lock"
+
+
+class LockResult:
+    """Result of acquire(): status is 'acquired' | 'reaped' | 'deferred';
+    holder is the LIVE holder's payload when deferred (else None)."""
+    def __init__(self, status, holder=None):
+        self.status = status
+        self.holder = holder
+
+    def __repr__(self):
+        return f"LockResult(status={self.status!r}, holder={self.holder!r})"
+
+
+def _read(path: Path) -> dict | None:
+    try:
+        d = json.loads(path.read_text())
+        return d if isinstance(d, dict) else None
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None  # corrupt → treat as absent/reapable
+
+
+def _payload(role: str, workspace: Path) -> dict:
+    now = _now()
+    return {
+        "role": role,
+        "pid": os.getpid(),
+        "host": _host_label(),
+        "workspace": str(workspace),
+        "acquired_at": now,
+        "heartbeat_at": now,
+        "schema_version": SCHEMA_VERSION,
+    }
+
+
+def _is_fresh(holder: dict, stale_seconds: int) -> bool:
+    hb = holder.get("heartbeat_at")
+    if not isinstance(hb, (int, float)):
+        return False  # no/invalid heartbeat → stale
+    return (_now() - hb) < stale_seconds
+
+
+def _try_create(path: Path, data: dict) -> bool:
+    """Atomic exclusive create. True iff WE created it (won the race)."""
+    try:
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        return False
+    try:
+        os.write(fd, json.dumps(data).encode())
+    finally:
+        os.close(fd)
+    return True
+
+
+def acquire(role: str, workspace: Path | str | None = None,
+            stale_seconds: int = DEFAULT_STALE_SECONDS) -> LockResult:
+    ws = workspace if isinstance(workspace, Path) else _resolve_workspace(workspace)
+    _locks_dir(ws).mkdir(parents=True, exist_ok=True)
+    path = _lock_path(ws, role)
+    data = _payload(role, ws)
+
+    for _ in range(_ACQUIRE_RETRIES):
+        if _try_create(path, data):
+            return LockResult("acquired")
+        holder = _read(path)
+        if holder is None:
+            # Either the holder released between create-fail and read (file
+            # gone → retry) or the file is corrupt/empty/unreadable (still
+            # present → reap it, then retry the create).
+            if path.exists():
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+            continue
+        if holder.get("pid") == os.getpid() and holder.get("host") == data["host"]:
+            # already ours (idempotent re-acquire) — refresh + report acquired
+            _write_atomic(path, data)
+            return LockResult("acquired")
+        if _is_fresh(holder, stale_seconds):
+            return LockResult("deferred", holder=holder)
+        # stale / orphaned holder → reap and take it
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass  # another reaper won; loop retries the create
+        if _try_create(path, data):
+            return LockResult("reaped")
+        # lost the reap race — loop; next iter sees the new (fresh) holder
+    # Exhausted retries under contention: treat as deferred (safer than a
+    # second poller); report whatever holder we last saw.
+    return LockResult("deferred", holder=_read(path))
+
+
+def _write_atomic(path: Path, data: dict) -> None:
+    tmp = path.with_suffix(f".lock.tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(data))
+    os.replace(tmp, path)
+
+
+def heartbeat(role: str, workspace: Path | str | None = None) -> bool:
+    """Refresh heartbeat_at iff we are the current holder. True if still held."""
+    ws = workspace if isinstance(workspace, Path) else _resolve_workspace(workspace)
+    path = _lock_path(ws, role)
+    holder = _read(path)
+    if not holder or holder.get("pid") != os.getpid() or holder.get("host") != _host_label():
+        return False
+    holder["heartbeat_at"] = _now()
+    try:
+        _write_atomic(path, holder)
+        return True
+    except Exception:
+        return False
+
+
+def release(role: str, workspace: Path | str | None = None) -> None:
+    """Remove the lock iff we hold it (pid+host match)."""
+    ws = workspace if isinstance(workspace, Path) else _resolve_workspace(workspace)
+    path = _lock_path(ws, role)
+    holder = _read(path)
+    if holder and holder.get("pid") == os.getpid() and holder.get("host") == _host_label():
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
+def read_holder(role: str, workspace: Path | str | None = None) -> dict | None:
+    ws = workspace if isinstance(workspace, Path) else _resolve_workspace(workspace)
+    return _read(_lock_path(ws, role))
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="workspace_lock")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("acquire", "heartbeat", "release", "status"):
+        p = sub.add_parser(name)
+        p.add_argument("--role", required=True)
+        p.add_argument("--workspace", default=None)
+        if name == "acquire":
+            p.add_argument("--stale-seconds", type=int, default=DEFAULT_STALE_SECONDS)
+    args = ap.parse_args(argv)
+    try:
+        ws = _resolve_workspace(args.workspace)
+        if args.cmd == "acquire":
+            r = acquire(args.role, ws, args.stale_seconds)
+            if r.status == "deferred":
+                json.dump({"deferred": True, "holder": r.holder}, sys.stdout)
+                sys.stdout.write("\n")
+                return 3
+            sys.stdout.write(r.status + "\n")
+            return 0
+        if args.cmd == "heartbeat":
+            return 0 if heartbeat(args.role, ws) else 1
+        if args.cmd == "release":
+            release(args.role, ws)
+            return 0
+        if args.cmd == "status":
+            h = read_holder(args.role, ws)
+            if h:
+                json.dump(h, sys.stdout)
+                sys.stdout.write("\n")
+            return 0
+    except Exception as e:  # fail-open on the CLI path
+        sys.stderr.write(f"workspace_lock: {args.cmd} error ({e}) — proceeding\n")
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
