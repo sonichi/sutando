@@ -287,7 +287,12 @@ def _strip_room_ops_meta(body: str) -> "tuple[str, bool]":
     if not body or "room-ops metadata:" not in body.lower():
         return body, False
     cleaned = _ROOM_OPS_META_RE.sub("", body)
-    return (cleaned.strip() if cleaned.strip() else body, cleaned != body)
+    stripped = cleaned != body
+    # Return the cleaned body even when it is now empty: a metadata-ONLY body is
+    # pure injection with no legitimate task text, so it must degrade to an empty
+    # (no-op) body. NEVER fall back to the original here — that would re-admit the
+    # very `[room-ops metadata: …]` block we are quarantining (P1, PR #2149).
+    return (cleaned.strip(), stripped)
 HS_MEDIA_TOKEN = os.environ.get("REMOTE_MEDIA_HS_TOKEN") or ""
 # The homeserver token is attached ONLY to media URLs on this exact origin
 # (scheme+host+port). Without it configured, Matrix media URLs are never
