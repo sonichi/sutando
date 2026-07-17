@@ -208,6 +208,15 @@ def main():
     print(f"Daily insight → {output_path}")
     print(insight)
 
+    # Anonymous, opt-out product telemetry: one bucketed event when this feature
+    # actually runs (not on the cached early return). Never content/PII.
+    try:  # pragma: no cover — bounded flush; logic tested in tests/telemetry.test.py
+        from telemetry import feature_used  # sibling module (src/ on sys.path)
+
+        feature_used("daily_insight", flush=True)
+    except Exception:  # pragma: no cover — telemetry must never break the feature
+        pass
+
 
 if __name__ == "__main__":
     main()

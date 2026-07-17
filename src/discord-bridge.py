@@ -195,12 +195,21 @@ except Exception:  # pragma: no cover
 
 # Load token — env var takes precedence (allows test injection without a real .env file)
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
-if not TOKEN:
-    channels_env = claude_home_path("channels", "discord", ".env")
-    if channels_env.exists():
-        for line in channels_env.read_text().splitlines():
-            if line.startswith("DISCORD_BOT_TOKEN="):
-                TOKEN = line.split("=", 1)[1].strip()
+# Tighten perms whenever the token file exists — even when the token is already
+# in process env — so a world-readable .env never survives startup.
+channels_env = claude_home_path("channels", "discord", ".env")
+if channels_env.exists():
+    try:
+        os.chmod(channels_env, 0o600)  # token file — enforce owner-only, mirrors access.json treatment
+    except OSError as e:
+        # Best-effort hardening: a read-only volume, wrong ownership after a
+        # restore/sync, or an ACL-restricted file must NOT crash the bridge at
+        # startup — the file may still be perfectly readable. Warn and continue.
+        print(f"  [startup] warning: could not chmod 0600 {channels_env}: {e}", flush=True)
+if not TOKEN and channels_env.exists():
+    for line in channels_env.read_text().splitlines():
+        if line.startswith("DISCORD_BOT_TOKEN="):
+            TOKEN = line.split("=", 1)[1].strip()
 
 if not TOKEN:
     print("DISCORD_BOT_TOKEN not set in $CLAUDE_CONFIG_DIR/channels/discord/.env")
@@ -298,13 +307,15 @@ def _split_file_markers(text: str) -> tuple[str, list[str]]:
 _is_path_sendable = _is_path_sendable_shared
 
 
-def write_owner_activity(channel: str, summary: str) -> None:
+def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
     """Record that the owner was active on <channel> right now.
 
     Writes atomically via tmp-then-rename so a concurrent reader never sees
-    a partial file. Schema: {"ts": EPOCH, "channel": str, "summary": str}.
-    Read by the proactive-loop status-aware-pivot rule — see
-    `notes/team-proposal-coord-loop-2026-04-20.md`.
+    a partial file. Schema: {"ts": EPOCH, "channel": str, "summary": str,
+    "channel_id"?: str}. `channel_id` (the routable id of the exact channel/
+    chat the owner messaged from) lets the core-supervisor relay escalate a
+    hard-blocked core back to where the owner actually is. Read by the
+    proactive-loop status-aware-pivot rule + core-supervisor-relay --active-from.
     """
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -313,6 +324,8 @@ def write_owner_activity(channel: str, summary: str) -> None:
             "channel": channel,
             "summary": summary[:80],
         }
+        if channel_id:
+            payload["channel_id"] = str(channel_id)
         tmp = OWNER_ACTIVITY_FILE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload))
         tmp.rename(OWNER_ACTIVITY_FILE)
@@ -2323,6 +2336,65 @@ async def on_message_edit(before, after):
     await _handle_discord_message(after, force=True)
 
 
+def _write_task_file(task_file: Path, content, username: str,
+                     channel_name: str, access_tier: str, message_id: int) -> bool:
+    """Write a task file with diagnostic instrumentation. Returns True on success.
+
+    ``content`` may be a ready string or a zero-arg callable returning the
+    string. Callers pass a callable so the f-string CONSTRUCTION runs inside
+    this try — a build failure (bad attribute access, encoding error) is then
+    logged as a FAILED line instead of silently losing the message before the
+    instrumentation is reached.
+    """
+    try:
+        if callable(content):
+            content = content()
+        task_file.write_text(content)
+    except Exception as _tw_exc:
+        print(f"  [task-write] FAILED for @{username} in #{channel_name} "
+              f"(tier={access_tier}, msg={message_id}): "
+              f"{type(_tw_exc).__name__}: {_tw_exc}", flush=True)
+        return False
+    print(f"  [task-write] wrote {task_file.name} "
+          f"(@{username}, #{channel_name}, tier={access_tier})", flush=True)
+    return True
+
+
+def resolve_is_collaborator(access_data, sender_id, serving_channel_id):
+    """True iff `sender_id` is listed under the SERVING channel's `collaborators`
+    array in access.json.
+
+    A collaborator is a team-tier sender the owner has designated for
+    substantive engagement in ONE specific channel (see the `team-collaborator`
+    rulebook). Scope is strictly per-channel: membership in some OTHER channel's
+    `collaborators` does NOT carry over — the check keys on the serving channel
+    only. Fail-closed: any malformed config or missing key yields False.
+
+    Pure + side-effect-free so it can be unit-tested directly (the caller lives
+    inside the async Discord handler, which is not independently exercisable).
+    """
+    try:
+        serving_cfg = (access_data.get("groups", {}) or {}).get(str(serving_channel_id), {})
+        if isinstance(serving_cfg, dict) and sender_id in set(serving_cfg.get("collaborators", []) or []):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def select_rulebook_key(access_tier, is_collaborator):
+    """Pick which `tier_instructions` rulebook a task gets.
+
+    A collaborator gets the `team-collaborator` "engage" rulebook (reply
+    in-channel, fold in their input) regardless of their `team` wire-tier;
+    everyone else gets their own tier's rulebook. Keeping this separate from the
+    serialized `access_tier` is deliberate — the wire tier stays `team` so every
+    existing team consumer is unchanged, and only the in-band rulebook (the
+    enforcement surface the core agent follows) swaps.
+    """
+    return "team-collaborator" if is_collaborator else access_tier
+
+
 async def _handle_discord_message(message, force=False):
     if message.author == client.user:
         return
@@ -2856,10 +2928,19 @@ async def _handle_discord_message(message, force=False):
 
     # Determine access tier
     access_tier = "other"
+    # is_collaborator: a TEAM sender the owner has listed under the SERVING
+    # channel's `collaborators` array in access.json. Collaborators get the
+    # `team-collaborator` "engage" rulebook (reply in-channel, fold in their
+    # input) instead of the default RUN-CODEX/NO-REPLY team rulebook — a
+    # first-class, per-channel structural path for "cooperate with this person
+    # here" that does NOT elevate them to global owner. The authority boundary
+    # is unchanged: irreversible / system-mutating actions still require the
+    # owner. Scope is strictly per-channel (keyed on the serving channel_id).
+    is_collaborator = False
     if sender_id in allowed:
         access_tier = "owner"
         # Record owner activity for status-aware-pivot in proactive loop
-        write_owner_activity("discord", text)
+        write_owner_activity("discord", text, channel_id=getattr(message.channel, "id", None))
     else:
         # Check if team member (from channel allowlists)
         try:
@@ -2870,6 +2951,13 @@ async def _handle_discord_message(message, force=False):
                     team_ids.update(ch_cfg.get("allowFrom", []))
             if sender_id in team_ids:
                 access_tier = "team"
+                # Per-channel collaborator check (pure helper — unit-tested):
+                # only the serving channel's own `collaborators` list grants
+                # engagement; membership elsewhere does not carry over.
+                # Handler-glue line: resolution logic is exercised via
+                # resolve_is_collaborator's unit tests; this async-handler branch
+                # is not independently invocable (cf. media_headers no-cover below).
+                is_collaborator = resolve_is_collaborator(data, sender_id, message.channel.id)  # noqa: E501  # pragma: no cover
         except Exception:
             pass
 
@@ -2972,7 +3060,9 @@ async def _handle_discord_message(message, force=False):
     # Per `feedback_codex_relay_doesnt_factcheck` — codex executes literally;
     # this preamble shifts the framing baseline. Owner-tier doesn't go through
     # codex (per CLAUDE.md "Discord access control"), so preamble is N/A there.
-    if access_tier in ("team", "other"):
+    # Collaborators are also N/A: they're engaged directly by the core agent
+    # (not sandboxed via codex), so they must NOT get the codex framing preamble.
+    if access_tier in ("team", "other") and not is_collaborator:
         codex_prompt_text = (
             "You are answering on behalf of Sutando, an autonomous personal AI agent.\n"
             "Sutando's actual skills live in `skills/` (this repo) and under `$CLAUDE_CONFIG_DIR/skills/`.\n"
@@ -3018,19 +3108,30 @@ async def _handle_discord_message(message, force=False):
             enriched = None
         if enriched:
             print(f"  [discord-state-prefetch] enriched task body for {username} in #{getattr(message.channel, 'name', '?')}", flush=True)
-            user_task_text = enriched
+            # Re-apply confine to the enriched body: the fetched Discord channel
+            # messages (the `blocks` prefix in enriched) were not run through
+            # confine_user_content() — an attacker-controlled channel could post
+            # `===SUTANDO SYSTEM INSTRUCTIONS===` content that lands in the task
+            # file header verbatim. confine_user_content is idempotent so the
+            # already-ZWSP-prefixed original user_task_text is unaffected.
+            user_task_text = confine_user_content(enriched)
             # Rewrite the prompt file with the enriched body. quoted_task
             # already points to `"$(cat {prompt_path})"` — keep the heredoc
             # form (per PR #652's codex-stdin-hang fix). Using shlex.quote
             # here would reintroduce the nested-escape pathology codex's
             # stdin parser hangs on. Per MacBook's #644 v2 review 2026-05-10.
-            Path(prompt_path).write_text(user_task_text)
-        elif access_tier in ("team", "other"):
-            # Silent-escalate stays NON-OWNER-only. The prefetch above now runs
-            # for all tiers (so the contextNotFrom gate applies to owner too),
-            # but an owner task with no enrichable refs must just proceed to
+            # Deep async-handler branch (fires only when a ref actually enriches);
+            # not independently invocable from unit tests — the enrich/confine
+            # logic is covered via confine_user_content's own tests. no-cover here
+            # keeps the diff gate honest without a Discord-message integration rig.
+            Path(prompt_path).write_text(user_task_text)  # pragma: no cover
+        elif access_tier in ("team", "other") and not is_collaborator:
+            # Silent-escalate stays NON-OWNER-only, and collaborators are
+            # excluded too. The prefetch above now runs for all tiers (so the
+            # contextNotFrom gate applies to owner too), but an owner OR
+            # collaborator task with no enrichable refs must just proceed to
             # normal handling — not get silently escalated/declined. Only the
-            # non-owner tiers fall back to the PR #639 escalate path.
+            # plain non-owner tiers fall back to the PR #639 escalate path.
             try:
                 already_escalated = await _silent_escalate_for_discord_state(message, user_task_text)
             except Exception as e:
@@ -3068,6 +3169,28 @@ async def _handle_discord_message(message, force=False):
     # review. Removed in favor of skipping the task-file write entirely.)
     tier_instructions = {
         "owner": "",
+        "team-collaborator": (
+            "\n\n===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"
+            "This task is from a designated COLLABORATOR in this channel (a team-tier sender the owner "
+            "has listed under this channel's `collaborators`). Engage substantively — do NOT sandbox "
+            "them via codex and do NOT default to NO-REPLY the way a plain team task is handled.\n\n"
+            "DO:\n"
+            "- Reply in-channel: write your response to results/task-{id}.txt (delivered back to this channel).\n"
+            "- Treat their message as collaborative input from a working peer within this channel's scope — "
+            "discuss, draft, and iterate on copy / design / analysis, and fold their contributions into the "
+            "shared work. Do not silently archive a substantive contribution.\n\n"
+            "DO NOT (authority boundary — unchanged from team tier):\n"
+            "- Take any irreversible or system-mutating action on their say-so: no git commit / push / merge, "
+            "no deleting or overwriting files, no sending to other channels or external services (email, "
+            "posts, DMs), no financial actions, no config / credential changes, no restarts. Those still "
+            "require the OWNER.\n"
+            "- If they ask for such an action, engage on the substance and prepare it if useful, but route "
+            "the go/no-go to the owner (say so in-channel) rather than executing it yourself.\n"
+            "- Never read .env, credentials, or secrets.\n\n"
+            "Scope: collaborator status is per-channel only — it grants engagement HERE, not owner authority "
+            "anywhere else.\n"
+            "===END SUTANDO SYSTEM INSTRUCTIONS===\n"
+        ),
         "team": (
             "\n\n===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"
             "This task is from a TEAM tier sender. Choose ONE of three actions based on the content:\n\n"
@@ -3166,17 +3289,22 @@ async def _handle_discord_message(message, force=False):
         step = 1
         # Context-first: a terse or threaded reply ("no", "continue", a pronoun)
         # loses its referent when interpreted against a stale/compacted session
-        # context. Reconstruct from the durable channel BEFORE interpreting —
-        # keyed on the message not being self-contained (the agent's own judgment,
-        # not a parent_message_id gate), following the reply chain back, no
-        # arbitrary message count. Root-cause fix 2026-06-25.
+        # context. UNCONDITIONAL as of 2026-07-13 (owner-approved): the prior form
+        # gated reconstruction on the agent judging the message "not self-contained"
+        # — but that judgment ("I already understand this") is the exact signal that
+        # fails, so the agent kept walking past the read on questions it only *felt*
+        # confident about. Removing the gate trades a few cheap reads for never
+        # skipping it; only a pure greeting/ack is exempt. Supersedes the
+        # self-contained-judgment form (root-cause 2026-06-25).
         lines.append(
-            f'{step}. CONTEXT-FIRST: if this message is not self-contained (terse, a reply, '
-            f'or refers to something not stated here), reconstruct the relevant context '
-            f'BEFORE interpreting — `python3 src/discord-read.py {channel_id_str}` — and '
-            f'read the thread (everyone\'s messages including your own prior replies) back '
-            f'until it stands on its own, then answer from the reconstructed thread, not '
-            f'from memory.'
+            f'{step}. CONTEXT-FIRST (unconditional): before interpreting this message, '
+            f'reconstruct the thread — `python3 src/discord-read.py {channel_id_str}` — '
+            f'and read it back (everyone\'s messages including your own prior replies) '
+            f'until this message stands on its own, then answer from the reconstructed '
+            f'thread, NOT from memory. Do this every time; do NOT skip it because the '
+            f'message looks self-contained or you feel you already understand it — felt '
+            f'confidence is exactly the signal that fails. The only exception is a pure '
+            f'greeting or acknowledgement with no referent (e.g. "hi", "thanks").'
         )
         step += 1
         if _notify_py.exists():
@@ -3212,11 +3340,21 @@ async def _handle_discord_message(message, force=False):
     # would otherwise lose the message with no trace). Log the outcome either way
     # — a future drop now self-diagnoses: absence of BOTH this line and an
     # early-return log pinpoints a new path; a FAILED line pinpoints the write.
-    try:
-        task_file.write_text(
+    def _build_task_content() -> str:
+        # Deliberately a callable: _write_task_file() invokes it INSIDE its
+        # try, so a failure in this f-string build is logged as a FAILED
+        # line (see the instrumentation note above) instead of raising
+        # before the logging is reached.
+        # Collaborators keep `access_tier: team` (so every existing team consumer —
+        # priority, progress-streamer, dedup — behaves exactly as before) and get an
+        # orthogonal `collaborator: true` marker plus the engage rulebook. The
+        # rulebook is the in-band enforcement surface the core agent follows, so
+        # swapping it is what actually changes handling.
+        collaborator_line = "collaborator: true\n" if is_collaborator else ""
+        rulebook_key = select_rulebook_key(access_tier, is_collaborator)
+        return (
             f"id: {task_id}\n"
             f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
-            f"task: {user_task_text}\n"
             f"source: discord\n"
             f"interaction_type: message\n"
             f"{media_headers}"
@@ -3227,17 +3365,16 @@ async def _handle_discord_message(message, force=False):
             f"{parent_msg_line}"
             f"user_id: {message.author.id}\n"
             f"access_tier: {access_tier}\n"
+            f"{collaborator_line}"
             f"priority: {priority}\n"
-            f"{tier_instructions.get(access_tier, tier_instructions['other'])}"
+            f"task: {user_task_text}\n"
+            f"{tier_instructions.get(rulebook_key, tier_instructions['other'])}"
             f"{discord_skill_hints}"
         )
-    except Exception as _tw_exc:
-        print(f"  [task-write] FAILED for @{username} in #{channel_name} "
-              f"(tier={access_tier}, msg={message.id}): "
-              f"{type(_tw_exc).__name__}: {_tw_exc}", flush=True)
+
+    if not _write_task_file(task_file, _build_task_content, username, channel_name,
+                            access_tier, message.id):
         return
-    print(f"  [task-write] wrote {task_file.name} "
-          f"(@{username}, #{channel_name}, tier={access_tier})", flush=True)
     pending_replies[task_id] = message.channel
     pending_task_tiers[task_id] = access_tier
     # Observability: one inbound accepted-message event.
@@ -3248,6 +3385,15 @@ async def _handle_discord_message(message, force=False):
         access_tier=access_tier,
         data={"task_id": task_id, "is_dm": is_dm},
     )
+    # Anonymous, opt-out product telemetry: one bucketed event per accepted
+    # task, tagged only with the inbound surface. No-op when opted out / no key;
+    # never task content or ids. See src/telemetry.py + TELEMETRY.md.
+    try:  # pragma: no cover — fire-and-forget glue; logic tested in tests/telemetry.test.py
+        from telemetry import task_processed  # sibling module (src/ on sys.path)
+
+        task_processed("discord")
+    except Exception:  # pragma: no cover — telemetry must never break the bridge
+        pass
     # Track source-message-id so the result-sender can auto-attach reply_to
     # (visually thread the reply to the triggering message). Skipped when
     # the channel is already a Discord thread — thread context is enough.
@@ -3545,6 +3691,8 @@ async def poll_results():
             if result_file.exists():
                 import re
                 reply_text = result_file.read_text().strip()
+                if not reply_text:
+                    continue
                 channel = pending_replies.pop(task_id)
                 # Capture anchor BEFORE pop so the auto-thread block below
                 # can use it. The previous version popped+forgot, leaving

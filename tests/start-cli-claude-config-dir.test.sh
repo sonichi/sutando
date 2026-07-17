@@ -114,9 +114,11 @@ EOF
   if [ "$helper_present" = "yes" ]; then
     cp "$REAL_REPO/scripts/sutando-config.sh" "$REPO_FAKE/scripts/"
     cp "$REAL_REPO/src/sutando_config.py" "$REPO_FAKE/src/"
+    # Use absolute path so workspace resolves to $SANDBOX/workspace (the same
+    # dir the mkdir above created), avoiding a mismatch with ${REPO_DIR}/workspace.
     cat > "$REPO_FAKE/sutando.config.json" << EOF
 {
-  "workspace": {"path": "\${REPO_DIR}/workspace"},
+  "workspace": {"path": "$SANDBOX/workspace"},
   "claude_sutando_config_dir": {"subdir": "$helper_subdir"}
 }
 EOF

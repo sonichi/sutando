@@ -94,9 +94,12 @@ def transcribe(file_path: str) -> str | None:
             {"inline_data": {"mime_type": mime, "data": audio_b64}},
         ]}]
     }
-    url = (
+    # gemini-2.5-flash was retired for generateContent on current keys (returns
+    # HTTP 404), which silently broke voice-note transcription. gemini-3.1-flash-lite
+    # is the current cheap multimodal model (verified working 2026-07-10).
+    url = (  # pragma: no cover — network-call region; unit test skips before here (no live key)
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-2.5-flash:generateContent?key={key}"
+        f"gemini-3.1-flash-lite:generateContent?key={key}"
     )
     try:
         req = urllib.request.Request(

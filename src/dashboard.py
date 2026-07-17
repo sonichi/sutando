@@ -170,8 +170,15 @@ def get_system_stats() -> dict:
 
     result = subprocess.run(["/usr/bin/pmset", "-g", "batt"], capture_output=True, text=True, timeout=5)
     battery_m = re.search(r'(\d+)%', result.stdout)
-    battery = f"{battery_m.group(1)}%" if battery_m else "?"
-    charging = "charging" in result.stdout.lower() or "ac power" in result.stdout.lower()
+    if battery_m:
+        battery = f"{battery_m.group(1)}%"
+        # \b keeps "discharging" (battery power) from substring-matching "charging".
+        charging = bool(re.search(r'\bcharging\b', result.stdout.lower())) or "ac power" in result.stdout.lower()
+    else:
+        # Battery-less Mac (mini / Studio / Pro): pmset reports "AC Power" with no
+        # percentage line. The old "?" + charging=True combo rendered as "? ⚡".
+        battery = "—"
+        charging = False
 
     return {
         "disk_free": f"{free_gb:.0f}GB",
@@ -210,7 +217,16 @@ h2{font-size:12px;color:#555;text-transform:uppercase;letter-spacing:0.5px;margi
 .pending-badge.done{background:#1a2a1a;color:#5a9a6a}
 .refresh{font-size:10px;color:#333;text-align:center;margin-top:12px}
 .intro{max-width:900px;margin:12px auto 0;color:#7b7b90;font-size:12px;line-height:1.45}
-</style></head><body>
+.quick-links{display:flex;gap:12px;flex-wrap:wrap;font-size:12px}
+.quick-links a{color:#4a8aaa;text-decoration:none}
+</style>
+<script>
+function openQuickLink(event, link){
+  event.preventDefault();
+  window.open(link.href,'_blank','noopener,noreferrer');
+}
+</script>
+</head><body>
 <div style="max-width:900px;margin:0 auto">
 <div style="display:flex;align-items:center;gap:14px">
 <img id="stand-avatar" src="/avatar" style="width:56px;height:56px;border-radius:50%;border:2px solid #4ecca3;display:none;object-fit:cover">
@@ -376,10 +392,19 @@ def render_dashboard() -> str:
     ok_count = sum(1 for c in services_only if c.get("status") in ("ok", "warn"))
     total_count = len(services_only)
 
-    # Score card
+    # Score card. A missing/unparseable score used to render as a bare "?" —
+    # glyph soup for new installs whose build_log.md has no **Score:** marker
+    # yet. Show a real empty state instead of pretending "?" is a value.
+    if score == "?":
+        score_html = ('<p style="font-size:12px;color:#667;line-height:1.5;margin-top:4px">'
+                      'Nothing scored yet. Use cases appear here once the build log '
+                      'records one (a <code style="color:#889">**Score: …**</code> line in '
+                      '<code style="color:#889">build_log.md</code>).</p>')
+    else:
+        score_html = f'<div class="score">{score}</div>'
     cards = [f"""<div class="card">
 <h2>Use Cases</h2>
-<div class="score">{score}</div>
+{score_html}
 </div>"""]
 
     # System stats
@@ -505,15 +530,15 @@ def render_dashboard() -> str:
     # Quick links
     cards.append(f"""<div class="card full">
 <h2>Quick Links</h2>
-<div style="display:flex;gap:12px;flex-wrap:wrap;font-size:12px">
-<a href="http://localhost:8080" style="color:#4a8aaa;text-decoration:none">Voice UI :8080</a>
-<a href="http://localhost:7843" style="color:#4a8aaa;text-decoration:none">Task API :7843</a>
-<a href="http://localhost:7844" style="color:#4a8aaa;text-decoration:none">Dashboard :7844</a>
-<a href="http://localhost:7845" style="color:#4a8aaa;text-decoration:none">Screen Capture :7845</a>
-<a href="/notes-ui" style="color:#4a8aaa;text-decoration:none">Notes Browser</a>
-<a href="https://github.com/sonichi/sutando" style="color:#4a8aaa;text-decoration:none">GitHub</a>
-<a href="https://sutando.ai" style="color:#4a8aaa;text-decoration:none">Website</a>
-<a href="https://discord.gg/uZHWXXmrCS" style="color:#4a8aaa;text-decoration:none">Discord</a>
+<div class="quick-links">
+<a href="http://localhost:8080" target="_blank" rel="noopener noreferrer" onclick="openQuickLink(event,this)">Voice UI :8080</a>
+<a href="http://localhost:7843" target="_blank" rel="noopener noreferrer" onclick="openQuickLink(event,this)">Task API :7843</a>
+<a href="http://localhost:7844" target="_blank" rel="noopener noreferrer" onclick="openQuickLink(event,this)">Dashboard :7844</a>
+<a href="http://localhost:7845" target="_blank" rel="noopener noreferrer" onclick="openQuickLink(event,this)">Screen Capture :7845</a>
+<a href="/notes-ui" target="_blank" rel="noopener noreferrer" onclick="openQuickLink(event,this)">Notes Browser</a>
+<a href="https://github.com/sonichi/sutando" target="_blank" rel="noopener noreferrer" onclick="openQuickLink(event,this)">GitHub</a>
+<a href="https://sutando.ai" target="_blank" rel="noopener noreferrer" onclick="openQuickLink(event,this)">Website</a>
+<a href="https://discord.gg/uZHWXXmrCS" target="_blank" rel="noopener noreferrer" onclick="openQuickLink(event,this)">Discord</a>
 </div></div>""")
 
     return HTML.replace("__CONTENT__", "\n".join(cards))

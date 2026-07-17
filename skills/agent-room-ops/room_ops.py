@@ -52,7 +52,7 @@ def _main(argv):
     p.add_argument("--caption", default=None)
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
-    p = sub.add_parser("doc", help="read/write/delete a room vault document")
+    p = sub.add_parser("doc", help="read/write/delete a room Context document")
     p.add_argument("action", choices=["get", "put", "rm"])
     p.add_argument("room")
     p.add_argument("--folder", default="room-live-context")
