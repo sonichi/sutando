@@ -27,4 +27,15 @@ else
   say "SKIP tsx-bin empty (no tsx installed) — caller falls back to npx tsx"
 fi
 
-[ "$fail" -eq 0 ] && echo "PASS — tsx/app-node resolution centralized + config-resolved" || { echo "FAIL"; exit 1; }
+# --- wrapper (supervised launchd path) also config-resolves the app node dir ---
+# Codex #2154: the launchd wrapper is the preferred proxy path on installed
+# systems; it must honor app-node-dir too, not hardcode the bundle path.
+WRAP="src/launchd/credential-proxy-wrapper.sh"
+if grep -q 'space.ag2.app/engine/runtime/node/bin/node' "$WRAP"; then
+  say "FAIL wrapper still hardcodes the app-bundle node path"; fail=1
+else
+  say "PASS wrapper does not hardcode the app-bundle node path"
+fi
+grep -q 'sutando-config.sh" app-node-dir' "$WRAP" && say "PASS wrapper config-resolves app-node-dir" || { say "FAIL wrapper missing app-node-dir call"; fail=1; }
+
+[ "$fail" -eq 0 ] && echo "PASS — tsx/app-node resolution centralized + config-resolved (startup + launchd)" || { echo "FAIL"; exit 1; }

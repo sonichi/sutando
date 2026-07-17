@@ -22,12 +22,16 @@ set -euo pipefail
 # candidate MUST use `sort -V | tail -1`, NOT a `*/bin` glob: glob order is
 # lexicographic, so with prepend-then-continue a box with v9 + v10 would pick v9
 # (`'1' < '9'` sorts v10 first, v9 last-wins) — an older node, not the latest.
+# REPO_ROOT is resolved HERE (before the loop) so the app-bundle node dir is
+# CONFIG-RESOLVED via sutando-config.sh app-node-dir (honors $SUTANDO_APP_NODE_DIR)
+# on the supervised launchd path too — not just src/startup.sh (Codex #2154).
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 for _node_cand in \
     /opt/homebrew/bin/node \
     /usr/local/bin/node \
     "$HOME/.nvm/versions/node/$(ls "$HOME/.nvm/versions/node/" 2>/dev/null | sort -V | tail -1)/bin/node" \
     "$HOME/.volta/bin/node" \
-    "$HOME/Library/Application Support/space.ag2.app/engine/runtime/node/bin/node"
+    "$(bash "$REPO_ROOT/scripts/sutando-config.sh" app-node-dir)/node"
 do
     [ -x "$_node_cand" ] || continue
     _node_dir="$(dirname "$_node_cand")"
@@ -39,7 +43,7 @@ done
 # launchd plist exports it (claude-sutando installs); otherwise falls back to
 # ~/.claude. launchd itself doesn't inherit shell env, so this fallback is the
 # vanilla-claude default unless the plist's EnvironmentVariables sets it.
-REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+# (REPO_ROOT is resolved above, before the node-candidate loop.)
 PROXY_SCRIPT="$(bash "$REPO_ROOT/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
 
 # Resolve npx — launchd doesn't inherit the user's shell PATH.
