@@ -200,15 +200,9 @@ python3 "$REPO/skills/plugin-patches/apply-plugin-patches.py" || true
 #  2) Voice needs a Gemini key, but the Codex core, text web UI, dashboard,
 #     API, and configured message bridges do not. Missing voice credentials
 #     disable only the voice service instead of blocking the whole product.
-if [ -f .env ]; then
-  set -a; source .env; set +a
-else
-  echo "  ~ .env not found — continuing with credential-free services"
-fi
-if [ -z "${GEMINI_VOICE_API_KEY:-${GEMINI_API_KEY:-}}" ]; then
-  export SKIP_VOICE=1
-  echo "  ~ voice agent disabled (set GEMINI_VOICE_API_KEY or GEMINI_API_KEY to enable)"
-fi
+# shellcheck source=startup-runtime.sh
+source "$REPO/src/startup-runtime.sh"
+configure_startup_runtime
 
 # v0.8 auto-migration helpers (PR #1440 safety hardening — Mini review).
 # Sourced from a sibling file so the four guard functions (_realpath,

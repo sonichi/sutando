@@ -12,7 +12,7 @@ It belongs entirely to you.
 > 🛠 **Open source:** this repo — clone, build, run locally on your own Mac.
 > 🍎 **Native app preview:** [sutando.ai](https://sutando.ai) — packaged Mac app, request access.
 
-> **No *Claude Extra usage* required.** Sutando runs on your existing Claude Code subscription ($20, $100, or $200/month) with minimal extra costs — no separate Anthropic API key to top up — unlike agents that route every action through pay-per-token APIs and hosted services.
+> **No pay-per-token core API key required.** Sutando runs through the Claude Code or Codex CLI session you select, with optional service credentials only for the capabilities you enable.
 
 > *Named after [Stands](https://jojo.fandom.com/wiki/Stand) from JoJo's Bizarre Adventure — a personal spirit that fights on your behalf. Like a Stand, Sutando starts unnamed. As it learns your style and earns real capabilities, it names itself and generates its own avatar — your Stand, unique to you.*
 
@@ -115,7 +115,7 @@ Four processes work together:
 - **Voice agent** (Gemini Live, WebSocket on :9900) — listens and talks in real time for browser voice.
 - **Web client** (`com.sutando.web-client.plist`, HTTP on :8080) — separate launchd service that serves the browser UI. The browser then connects directly to the voice agent's WebSocket on :9900 — the web client is not in the WebSocket data path.
 - **Conversation server** (Gemini Live, Twilio WebSocket on :3100) — same role as the voice agent for inbound and outbound phone calls.
-- **Core agent** (Claude Code CLI) — executes tasks with full system access. We use the CLI because it provides cron scheduling, plugins, and an interactive terminal that the SDK doesn't offer out of the box.
+- **Core agent** (Claude Code or Codex CLI) — executes tasks with full system access. The persistent CLI session provides an interactive terminal and runs Sutando's task watcher and scheduled work.
 
 Voice agent and conversation server handle conversation-scope actions with **inline tools** — in-process calls that round-trip instantly (describe the screen, hang up, send DTMF, read the clipboard/current time, capture a screenshot). For anything outside that scope they write to `tasks/`; core reads them, executes, and writes to `results/`, which each channel speaks or messages back. Telegram and Discord bridges only use the `tasks/` path.
 
@@ -137,9 +137,9 @@ Voice agent and conversation server handle conversation-scope actions with **inl
 git clone https://github.com/sonichi/sutando.git
 cd sutando
 
-# Configure (minimum: GEMINI_API_KEY is required)
+# Configure optional integrations (skip for text/core-only use)
 cp .env.example .env
-# Edit .env — add your GEMINI_API_KEY (from Google AI Studio)
+# Add GEMINI_API_KEY only if you want voice
 
 # Start everything
 bash src/startup.sh
@@ -182,7 +182,7 @@ bash src/verify-setup.sh
 - Gemini 429 errors? Your shell may have a stale `GEMINI_API_KEY` overriding `.env` — run `unset GEMINI_API_KEY` then restart
 - Screen recording produces 0-second files? `screencapture -v` needs a TTY. Sutando uses `ffmpeg` instead — make sure it's installed: `brew install ffmpeg`
 - Something broke? Run `bash src/restart.sh` — this kills all services and restarts fresh
-- Sutando acting confused, contradicting itself, or giving stale answers after a long session? Claude hallucinates more as the context window fills up — restart the Claude Code session every now and then to reset.
+- Sutando acting confused, contradicting itself, or giving stale answers after a long session? Restart the selected core CLI session to reset its context.
 - Phone call answers with "We are sorry, an error has occurred"? The conversation server (`skills/phone-conversation/scripts/conversation-server.ts`, port 3100) isn't running. Run `bash src/startup.sh` or `bash src/restart.sh` to relaunch all services.
 
 **Shutting down:**
@@ -221,17 +221,17 @@ These unlock more capabilities. Add to `.env` when ready:
 
 ## Running costs
 
-One table, organized by capability. The only required paid piece is your Claude Code subscription — everything else is optional and mostly free-tier-sufficient.
+One table, organized by capability. Core access comes from the Claude Code or Codex CLI account you select; the remaining services are optional and mostly free-tier-sufficient.
 
 | Capability | When you need it | Service required | Cost |
 |---|---|---|---|
-| **Basic** (core agent + screen / notes / calendar / email / reminders / contacts / browser / iMessage) | Always — this is Sutando's baseline | [Claude Code](https://www.anthropic.com/pricing) + [Gemini API key](https://ai.google.dev) + Google OAuth + macOS | Claude Code $20/mon (Pro), $100/mon (Max 5×), or $200/mon (Max 20×). Gemini + OAuth + macOS all free. |
-| **Voice agent** (real-time conversation in browser or on phone) | If you want to talk to Sutando | [Gemini voice API](https://ai.google.dev) (same key as Basic) | Free tier covers normal use (~15 req/min). Heavy use: [Gemini paid](https://ai.google.dev/pricing) ~$0.30–$1.30/hr. |
+| **Basic** (core agent + screen / notes / calendar / reminders / contacts / browser / iMessage) | Always — this is Sutando's baseline | [Claude Code](https://www.anthropic.com/pricing) or [Codex CLI](https://developers.openai.com/codex/cli/) access + macOS | Depends on the selected CLI account. No Gemini key or Google OAuth is required for core operation. |
+| **Voice agent** (real-time conversation in browser or on phone) | If you want to talk to Sutando | [Gemini voice API](https://ai.google.dev) | Free tier covers normal use (~15 req/min). Heavy use: [Gemini paid](https://ai.google.dev/pricing) ~$0.30–$1.30/hr. |
 | **Telegram / Discord / WhatsApp** (message Sutando from any of these) | If you want non-voice chat from your phone or desktop | [Telegram BotFather](https://t.me/BotFather), [Discord developer portal](https://discord.com/developers/applications), `wacli` (bundled) | All free for personal use. |
 | **Phone calls / summon (remote control)** | If you want Sutando to make inbound/outbound calls, or to share its computer screen via Zoom/Google Meet and be controlled by voice from your phone | [Twilio](https://www.twilio.com/pricing) phone number + [ngrok](https://ngrok.com/download) webhook | Twilio ~$1/mon number + ~$0.0085/min inbound + ~$0.015/min outbound + [Media Streams](https://www.twilio.com/en-us/pricing) ~$0.004/min. ngrok and Zoom free tiers both work for the summon flow. |
 | **Agent joining meetings via dial-in** (PSTN join into Zoom / Google Meet) | If you want the phone agent to dial into a meeting as a participant | [Zoom Pro](https://zoom.us/pricing) OR [Google Workspace Business](https://workspace.google.com/pricing.html) *on the host side* (the meeting organizer's account needs toll dial-in enabled) | Zoom Pro ~$15/mon, Google Workspace Business Starter ~$7/mon. Sutando's side is already covered by the Phone row above. |
 
-**Minimal-cost path** (what most users want): Claude Code subscription + free Gemini + free OAuth. Everything voice + browser + messaging works at $0 beyond the Claude Code sub. Phone and meeting dial-in are opt-in.
+**Minimal-cost path:** use your selected core CLI account for text, browser, and messaging. Add Gemini for voice, Google OAuth for Google services, and Twilio for phone or meeting dial-in only when needed.
 
 ---
 
@@ -240,7 +240,7 @@ One table, organized by capability. The only required paid piece is your Claude 
 | Capability | Script | Status |
 |-----------|--------|--------|
 | Voice conversation | `voice-agent.ts` | Verified |
-| Task delegation (voice → Claude) | `task-bridge.ts` + `watch-tasks-stream.sh` + `tasks/` dir | Verified |
+| Task delegation (voice → core) | `task-bridge.ts` + `watch-tasks-stream.sh` + `tasks/` dir | Verified |
 | Screen capture + analysis | `macos-tools` skill | Verified |
 | Notes / second brain | `notes/` directory (YAML-frontmatter markdown) | Verified |
 | Context drop + shortcuts | `src/Sutando/` menu bar app | Verified |
@@ -260,7 +260,7 @@ One table, organized by capability. The only required paid piece is your Claude 
 | Discord messaging | `discord-bridge.py` | Verified (DMs + channel @mentions + files) |
 | Cross-device task submission | `agent-api.py` | Verified |
 | Health monitoring | `health-check.py` | Verified |
-| Pattern detection + user modeling | Built into Claude Code memory system | Verified |
+| Pattern detection + user modeling | Core memory files + selected CLI | Verified |
 | System dashboard | `dashboard.py` | Verified |
 | Info-radar (arXiv / GitHub / HN / news monitoring) | `info-radar` skill + daily digest | Verified |
 | Menu-bar avatar states (idle/listening/speaking/working) | `src/Sutando/main.swift` + `/sse-status` | Verified |
@@ -297,7 +297,7 @@ The Sutando menu bar app (`src/Sutando/`) provides global keyboard shortcuts. It
 
 The `action` names above are the stable keys in `state/hotkeys.json`; the ⌃-combos are only the current defaults and may be remapped, so treat the `action` — not the keystroke — as the contract.
 
-The menu bar also has **Open Core** (brings up the Claude Code terminal) and **Open Dashboard** (opens the status dashboard at localhost:7844).
+The menu bar also has **Open Core** (brings up the selected core CLI terminal) and **Open Dashboard** (opens the status dashboard at localhost:7844).
 
 On first run:
 1. Grant **Accessibility** permission to the Sutando app in System Settings → Privacy & Security

@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -27,6 +28,12 @@ class CodexCoreLauncherTests(unittest.TestCase):
             target = self.root / rel
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(REAL_REPO / rel, target)
+        monitor = self.root / "src/core-input-watch.py"
+        monitor.write_text(
+            "import os, sys\n"
+            "with open(os.environ['MONITOR_LOG'], 'w') as f:\n"
+            "    f.write(' '.join(sys.argv[1:]))\n"
+        )
         (self.root / "src" / "__init__.py").touch()
         workspace = self.root / "workspace"
         (workspace / "state").mkdir(parents=True)
@@ -74,6 +81,7 @@ exit 0
             "TMUX_STATE": str(Path(self.tmp.name) / "tmux-killed"),
             "HOME": str(Path(self.tmp.name) / "home"),
             "SUTANDO_CORE_RUNTIME": "codex",
+            "MONITOR_LOG": str(Path(self.tmp.name) / "monitor.log"),
         })
         env.update(env_extra or {})
         return subprocess.run(
@@ -94,9 +102,16 @@ exit 0
         self.assertIn("new-session -d -s sutando-core-watcher", calls)
         self.assertIn("task-notifier.sh", calls)
         self.assertIn("CODEX_HOME=", calls)
-        launcher = (self.root / "src/agent/codex/cli/start-cli.sh").read_text()
-        self.assertIn("core-input-watch.py", launcher)
-        self.assertIn('has-session -t "=$1"', launcher)
+        self.assertIn("has-session -t =sutando-core", calls)
+        self.assertIn("has-session -t =sutando-core-watcher", calls)
+
+        monitor_log = Path(self.tmp.name) / "monitor.log"
+        for _ in range(50):
+            if monitor_log.exists():
+                break
+            time.sleep(0.01)
+        self.assertTrue(monitor_log.exists(), "managed core-input monitor did not start")
+        self.assertIn("--session sutando-core", monitor_log.read_text())
 
     def test_restart_kills_core_and_notifier_before_launch(self):
         result = self.run_launcher("--restart")
