@@ -31,6 +31,11 @@ const ENTRYPOINTS = [
   'skills/phone-conversation/scripts/conversation-server.ts',
   'skills/quota-tracker/scripts/credential-proxy.ts',
   'src/observability/boot.ts',
+  // Track 9: the call-tiers emitter must run on desktop installs too, where
+  // launch-sutando.sh skips startup.sh and there is no tsx — the launcher
+  // spawns this dist with the bundled node instead (one emitter impl, no
+  // second-language rewrite; the #2129 single-instance PID guard carries over).
+  'src/emit-call-tiers.ts',
 ];
 
 // ESM output + some CJS deps (e.g. dotenv) that call require() / use __dirname.

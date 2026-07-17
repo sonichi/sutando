@@ -1,0 +1,444 @@
+#!/usr/bin/env python3
+"""
+Regression tests for fix_down_bridges(): `--fix` restarting bridges that are
+"configured but not running".
+
+Incident (2026-07-02): discord-bridge died at boot with nothing logged. Its
+check status is "warn" (optional channels don't page), which excludes it from
+`issues` — so main()'s fix loop never reached the bridge-restart branch and
+`--fix` left it down while owner DMs queued channel-side. fix_down_bridges()
+dispatches off the full `checks` list instead, mirroring the screen-capture
+warn-fix pattern.
+
+Guards:
+
+  a) "configured but not running" warn → bridge restarted (all 3 bridges)
+  b) other bridge warns (multiple PIDs, token invalid, stale log) → untouched
+  c) non-bridge checks with the same detail → untouched
+  d) ok/fail bridge statuses → untouched (fail belongs to the main fix loop)
+
+Run: python3 tests/health-check-fix-down-bridges.test.py
+Exit code: 0 on pass, 1 on fail.
+"""
+
+from __future__ import annotations
+import importlib.util
+import io
+import os
+import subprocess
+import sys
+import tempfile
+from contextlib import redirect_stdout
+from pathlib import Path
+from unittest import mock
+
+REPO = Path(__file__).resolve().parent.parent
+
+# Load src/health-check.py as `health_check` (filename has a hyphen, can't
+# import directly).
+spec = importlib.util.spec_from_file_location("health_check", REPO / "src" / "health-check.py")
+hc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(hc)
+
+
+def check(name: str, status: str, detail: str) -> dict:
+    return {"name": name, "status": status, "detail": detail}
+
+
+def run_with_popen_stub(checks: list) -> tuple[list, list]:
+    """Call fix_down_bridges with Popen stubbed; return (restarted, spawn argvs).
+
+    Also stubs the interpreter probe and slack-env load so the test is
+    hermetic: without these, fix_down_bridges would probe the host for
+    discord.py / slack_bolt (flaky across machines) and skip the restart when
+    absent. Here every bridge gets a known-good interpreter and slack gets a
+    token, so the restart path is exercised deterministically.
+    """
+    spawned = []
+
+    def fake_popen(argv, **kwargs):
+        spawned.append(argv)
+        return mock.MagicMock()
+
+    with tempfile.TemporaryDirectory() as td:
+        with mock.patch.object(hc, "WORKSPACE_DIR", Path(td)), \
+             mock.patch.object(hc, "_bridge_interpreter", return_value="python3"), \
+             mock.patch.object(hc, "_load_channel_env", return_value={"SLACK_BOT_TOKEN": "xoxb-test"}), \
+             mock.patch.object(hc.subprocess, "Popen", side_effect=fake_popen):
+            restarted = hc.fix_down_bridges(checks)
+    return restarted, spawned
+
+
+def case_a_down_bridges_restarted() -> list[str]:
+    fails = []
+    checks = [
+        check("discord-bridge", "warn", "configured but not running"),
+        check("telegram-bridge", "warn", "configured but not running"),
+        check("slack-bridge", "warn", "configured but not running"),
+    ]
+    restarted, spawned = run_with_popen_stub(checks)
+    if restarted != ["discord-bridge", "telegram-bridge", "slack-bridge"]:
+        fails.append(f"a) expected all 3 bridges restarted, got {restarted}")
+    if len(spawned) != 3:
+        fails.append(f"a) expected 3 spawns, got {len(spawned)}")
+    for argv in spawned:
+        if not str(argv[1]).endswith("-bridge.py"):
+            fails.append(f"a) spawn argv doesn't target a bridge script: {argv}")
+    return fails
+
+
+def case_b_other_bridge_warns_untouched() -> list[str]:
+    fails = []
+    checks = [
+        check("discord-bridge", "warn", "multiple processes (2 PIDs: 1,2)"),
+        check("discord-bridge", "warn", "token invalid (LoginFailure) — regenerate at discord.com/developers/applications"),
+        check("telegram-bridge", "warn", "log stale (36.0h) — process may be wedged"),
+    ]
+    restarted, spawned = run_with_popen_stub(checks)
+    if restarted or spawned:
+        fails.append(f"b) non-down bridge warns triggered restart: {restarted}")
+    return fails
+
+
+def case_c_non_bridge_checks_untouched() -> list[str]:
+    fails = []
+    checks = [
+        check("conversation-server", "warn", "configured but not running"),
+        check("credential-proxy", "warn", "configured but not running"),
+    ]
+    restarted, spawned = run_with_popen_stub(checks)
+    if restarted or spawned:
+        fails.append(f"c) non-covered checks triggered restart: {restarted}")
+    return fails
+
+
+def case_d_other_statuses_untouched() -> list[str]:
+    fails = []
+    checks = [
+        check("discord-bridge", "ok", "running"),
+        check("telegram-bridge", "down", "configured but not running"),
+    ]
+    restarted, spawned = run_with_popen_stub(checks)
+    if restarted or spawned:
+        fails.append(f"d) ok/down statuses triggered restart: {restarted}")
+    return fails
+
+
+def case_e_main_fix_prints_bridge_names() -> list[str]:
+    """main() --fix exercises lines 2349-2354: prints '{name}: restart attempted'."""
+    fails = []
+    fake_checks = [
+        check("discord-bridge", "warn", "configured but not running"),
+        check("slack-bridge",   "warn", "configured but not running"),
+    ]
+    captured = io.StringIO()
+    with mock.patch.object(sys, "argv", ["health-check.py", "--fix"]), \
+         mock.patch.object(hc, "run_all_checks", return_value=fake_checks), \
+         mock.patch.object(hc, "fix_down_bridges", return_value=["discord-bridge", "slack-bridge"]):
+        try:
+            with redirect_stdout(captured):
+                hc.main()
+        except SystemExit:
+            pass
+    out = captured.getvalue()
+    for name in ("discord-bridge", "slack-bridge"):
+        expected = f"  {name}: restart attempted (was not running)"
+        if expected not in out:
+            fails.append(f"e) missing expected line '{expected}' in main() --fix output")
+    return fails
+
+
+def case_f_run_all_checks_emits_slack_configured_not_running() -> list[str]:
+    """Reachability guard (PR #1898): run_all_checks() must emit the
+    'configured but not running' warn for slack-bridge — otherwise
+    fix_down_bridges()'s slack branch is dead code and case_a is a false
+    positive. Slack is made to look configured (access.json present) and not
+    running (pgrep for slack-bridge.py returns nothing); every OTHER pgrep/
+    subprocess call is delegated to the real implementation so the rest of the
+    health check runs normally.
+    """
+    fails = []
+    real_run = hc.subprocess.run
+
+    def fake_run(argv, *args, **kwargs):
+        # Intercept ONLY the slack-bridge pgrep so it reports "not running".
+        if (isinstance(argv, list) and len(argv) >= 3
+                and argv[0] == "/usr/bin/pgrep" and "slack-bridge" in argv[2]):
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+        return real_run(argv, *args, **kwargs)
+
+    with tempfile.TemporaryDirectory() as home_td:
+        home = Path(home_td)
+        # Make slack look configured: create channels/slack/access.json under a
+        # fake claude-home. Point claude_home_path() at it for ALL lookups
+        # (real one just joins subpaths onto the home root, which is what we
+        # emulate here).
+        (home / "channels" / "slack").mkdir(parents=True, exist_ok=True)
+        (home / "channels" / "slack" / "access.json").write_text('{"allowFrom": []}')
+
+        def fake_home(*subpath):
+            return home.joinpath(*subpath)
+
+        with mock.patch.object(hc.subprocess, "run", side_effect=fake_run), \
+             mock.patch.object(hc, "claude_home_path", side_effect=fake_home):
+            try:
+                checks = hc.run_all_checks()
+            except Exception as e:  # pragma: no cover - defensive
+                return [f"f) run_all_checks raised: {e!r}"]
+
+    slack = [c for c in checks if c.get("name") == "slack-bridge"]
+    if not slack:
+        fails.append("f) run_all_checks emitted NO slack-bridge check (branch unreachable)")
+    elif not any(c.get("detail") == "configured but not running" for c in slack):
+        fails.append(f"f) slack-bridge check(s) present but none 'configured but not running': {slack}")
+    return fails
+
+
+def case_g_launch_parity_interpreter_and_env() -> list[str]:
+    """Launch parity (PR #1898): fix_down_bridges must (1) launch discord/slack
+    with an interpreter probed for the bridge's import — NOT bare
+    sys.executable — and (2) inject the slack channel .env into the child.
+    """
+    fails = []
+    spawned = []  # (argv, env)
+
+    def fake_popen(argv, **kwargs):
+        spawned.append((argv, kwargs.get("env")))
+        return mock.MagicMock()
+
+    checks = [
+        check("discord-bridge", "warn", "configured but not running"),
+        check("slack-bridge", "warn", "configured but not running"),
+    ]
+    with tempfile.TemporaryDirectory() as td:
+        with mock.patch.object(hc, "WORKSPACE_DIR", Path(td)), \
+             mock.patch.object(hc, "_bridge_interpreter", return_value="/opt/homebrew/bin/python3"), \
+             mock.patch.object(hc, "_load_channel_env", return_value={"SLACK_BOT_TOKEN": "xoxb-abc", "SLACK_APP_TOKEN": "xapp-xyz"}), \
+             mock.patch.object(hc.subprocess, "Popen", side_effect=fake_popen):
+            restarted = hc.fix_down_bridges(checks)
+
+    if restarted != ["discord-bridge", "slack-bridge"]:
+        fails.append(f"g) expected both restarted, got {restarted}")
+    for argv, env in spawned:
+        if argv[0] != "/opt/homebrew/bin/python3":
+            fails.append(f"g) bridge not launched with probed interpreter: {argv[0]}")
+        if str(argv[1]).endswith("slack-bridge.py"):
+            if not env or env.get("SLACK_BOT_TOKEN") != "xoxb-abc":
+                fails.append("g) slack child env missing SLACK_BOT_TOKEN from channel .env")
+    return fails
+
+
+def case_h_launch_parity_failsafe_skips() -> list[str]:
+    """Fail-safe (PR #1898): if no interpreter can import the bridge dep, OR the
+    slack tokens are unavailable, fix_down_bridges must SKIP that bridge (no
+    crash-loop spawn) rather than launch it.
+    """
+    fails = []
+    spawned = []
+
+    def fake_popen(argv, **kwargs):
+        spawned.append(argv)
+        return mock.MagicMock()
+
+    checks = [
+        check("discord-bridge", "warn", "configured but not running"),
+        check("slack-bridge", "warn", "configured but not running"),
+    ]
+    # discord: no capable interpreter (None). slack: interpreter fine but env
+    # has no token — and ensure the ambient env doesn't carry one either.
+    clean_env = {k: v for k, v in os.environ.items() if k != "SLACK_BOT_TOKEN"}
+    with tempfile.TemporaryDirectory() as td:
+        with mock.patch.object(hc, "WORKSPACE_DIR", Path(td)), \
+             mock.patch.object(hc, "_bridge_interpreter", side_effect=lambda n: None if n == "discord-bridge" else "python3"), \
+             mock.patch.object(hc, "_load_channel_env", return_value={}), \
+             mock.patch.dict(hc.os.environ, clean_env, clear=True), \
+             mock.patch.object(hc.subprocess, "Popen", side_effect=fake_popen):
+            restarted = hc.fix_down_bridges(checks)
+
+    if restarted:
+        fails.append(f"h) expected no restarts (fail-safe), got {restarted}")
+    if spawned:
+        fails.append(f"h) fail-safe still spawned a process: {spawned}")
+    return fails
+
+
+def case_i_bridge_interpreter_no_import_gate() -> list[str]:
+    """_bridge_interpreter (PR #1898): a bridge with no required import
+    (telegram — absent from _BRIDGE_REQUIRED_IMPORT) short-circuits to
+    sys.executable without probing any candidate. Covers the `required is None`
+    branch.
+    """
+    fails = []
+    got = hc._bridge_interpreter("telegram-bridge")
+    if got != sys.executable:
+        fails.append(f"i) no-import-gate bridge should return sys.executable, got {got!r}")
+    return fails
+
+
+def case_j_bridge_interpreter_probes_and_picks() -> list[str]:
+    """_bridge_interpreter (PR #1898): for a bridge WITH a required import,
+    walk the candidate list, skip candidates that don't exist on disk, and
+    return the first whose probe imports the module cleanly (returncode 0).
+    Covers the which/exists skip + the successful-probe return.
+    """
+    fails = []
+    # Two candidates: the first is not installed anywhere (skipped by the
+    # which/exists guard), the second exists and probes clean.
+    good = "/opt/homebrew/bin/python3-good"
+    cands = ["/nonexistent/python3-missing", good]
+
+    def fake_which(cand):
+        return good if cand == good else None
+
+    def fake_run(argv, **kwargs):
+        # Only the "good" candidate is ever probed (the missing one is skipped
+        # before any subprocess runs).
+        rc = 0 if argv[0] == good else 1
+        return subprocess.CompletedProcess(argv, rc, stdout=b"", stderr=b"")
+
+    with mock.patch.object(hc, "_BRIDGE_INTERP_CANDIDATES", cands), \
+         mock.patch.object(hc.shutil, "which", side_effect=fake_which), \
+         mock.patch.object(hc.subprocess, "run", side_effect=fake_run):
+        got = hc._bridge_interpreter("slack-bridge")
+    if got != good:
+        fails.append(f"j) expected first importing candidate {good!r}, got {got!r}")
+    return fails
+
+
+def case_k_bridge_interpreter_none_when_no_capable() -> list[str]:
+    """_bridge_interpreter (PR #1898): when no candidate can import the required
+    module — a failed probe (rc != 0) plus a probe that raises (OSError /
+    TimeoutExpired) — the function returns None so the caller skips the restart.
+    Covers the timeout/OSError `continue` and the terminal `return None`.
+    """
+    fails = []
+    cands = ["/opt/homebrew/bin/python3-a", "/opt/homebrew/bin/python3-b"]
+
+    def fake_run(argv, **kwargs):
+        if argv[0].endswith("python3-a"):
+            # Import fails cleanly (module absent) → rc != 0.
+            return subprocess.CompletedProcess(argv, 1, stdout=b"", stderr=b"ImportError")
+        # The other candidate blows up mid-probe → caught, continue.
+        raise subprocess.TimeoutExpired(argv, 10)
+
+    with mock.patch.object(hc, "_BRIDGE_INTERP_CANDIDATES", cands), \
+         mock.patch.object(hc.shutil, "which", side_effect=lambda c: c), \
+         mock.patch.object(hc.subprocess, "run", side_effect=fake_run):
+        got = hc._bridge_interpreter("discord-bridge")
+    if got is not None:
+        fails.append(f"k) expected None when no capable interpreter, got {got!r}")
+    return fails
+
+
+def case_l_load_channel_env_parses_file() -> list[str]:
+    """_load_channel_env (PR #1898): parse channels/<channel>/.env into a dict,
+    honoring `export ` prefixes, quote-stripping, and skipping blank/comment/
+    non-KEY=VALUE lines. Covers the file-present parse branch.
+    """
+    fails = []
+    with tempfile.TemporaryDirectory() as home_td:
+        home = Path(home_td)
+        chan = home / "channels" / "slack"
+        chan.mkdir(parents=True, exist_ok=True)
+        (chan / ".env").write_text(
+            "# a comment\n"
+            "\n"
+            "SLACK_BOT_TOKEN=\"xoxb-quoted\"\n"
+            "export SLACK_APP_TOKEN='xapp-exported'\n"
+            "MALFORMED_NO_EQUALS_SIGN\n"
+        )
+
+        def fake_home(*subpath):
+            return home.joinpath(*subpath)
+
+        with mock.patch.object(hc, "claude_home_path", side_effect=fake_home):
+            env = hc._load_channel_env("slack")
+
+    if env.get("SLACK_BOT_TOKEN") != "xoxb-quoted":
+        fails.append(f"l) SLACK_BOT_TOKEN quote-strip failed: {env!r}")
+    if env.get("SLACK_APP_TOKEN") != "xapp-exported":
+        fails.append(f"l) `export ` prefix strip failed: {env!r}")
+    if "MALFORMED_NO_EQUALS_SIGN" in env or "# a comment" in env:
+        fails.append(f"l) skipped-line leaked into env: {env!r}")
+    return fails
+
+
+def case_m_load_channel_env_absent_file() -> list[str]:
+    """_load_channel_env (PR #1898): an absent .env returns {} (the caller
+    treats missing tokens as a reason to skip the restart). Covers the
+    not-exists early return.
+    """
+    fails = []
+    with tempfile.TemporaryDirectory() as home_td:
+        home = Path(home_td)  # no channels/<channel>/.env created
+
+        def fake_home(*subpath):
+            return home.joinpath(*subpath)
+
+        with mock.patch.object(hc, "claude_home_path", side_effect=fake_home):
+            env = hc._load_channel_env("slack")
+    if env != {}:
+        fails.append(f"m) absent .env should yield {{}}, got {env!r}")
+    return fails
+
+
+def case_n_load_channel_env_unreadable_file() -> list[str]:
+    """_load_channel_env (PR #1898): a present-but-unreadable .env (read raises
+    OSError) is swallowed and yields {} — the watchdog never crashes on a
+    permission-denied env file. Covers the `except OSError` branch.
+    """
+    fails = []
+    with tempfile.TemporaryDirectory() as home_td:
+        home = Path(home_td)
+        chan = home / "channels" / "slack"
+        chan.mkdir(parents=True, exist_ok=True)
+        env_file = chan / ".env"
+        env_file.write_text("SLACK_BOT_TOKEN=xoxb-present\n")
+
+        def fake_home(*subpath):
+            return home.joinpath(*subpath)
+
+        real_read_text = Path.read_text
+
+        def boom(self, *args, **kwargs):
+            if self == env_file:
+                raise OSError("permission denied")
+            return real_read_text(self, *args, **kwargs)
+
+        with mock.patch.object(hc, "claude_home_path", side_effect=fake_home), \
+             mock.patch.object(Path, "read_text", boom):
+            env = hc._load_channel_env("slack")
+    if env != {}:
+        fails.append(f"n) unreadable .env should yield {{}}, got {env!r}")
+    return fails
+
+
+def main() -> int:
+    all_fails = []
+    for case in (case_a_down_bridges_restarted, case_b_other_bridge_warns_untouched,
+                 case_c_non_bridge_checks_untouched, case_d_other_statuses_untouched,
+                 case_e_main_fix_prints_bridge_names,
+                 case_f_run_all_checks_emits_slack_configured_not_running,
+                 case_g_launch_parity_interpreter_and_env,
+                 case_h_launch_parity_failsafe_skips,
+                 case_i_bridge_interpreter_no_import_gate,
+                 case_j_bridge_interpreter_probes_and_picks,
+                 case_k_bridge_interpreter_none_when_no_capable,
+                 case_l_load_channel_env_parses_file,
+                 case_m_load_channel_env_absent_file,
+                 case_n_load_channel_env_unreadable_file):
+        fails = case()
+        status = "PASS" if not fails else "FAIL"
+        print(f"  {status} {case.__name__}")
+        all_fails.extend(fails)
+    if all_fails:
+        print()
+        for f in all_fails:
+            print(f"  ✗ {f}")
+        return 1
+    print("All fix_down_bridges tests passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
