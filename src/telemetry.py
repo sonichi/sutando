@@ -149,24 +149,28 @@ def enabled() -> bool:
     return bool(_KEY) and not opted_out()
 
 
-def _post(payload: dict) -> None:  # pragma: no cover — real network I/O; mocked in tests
+def _post(payload: dict, timeout: float = 5) -> None:  # pragma: no cover — real network I/O; mocked in tests
     try:
         req = urllib.request.Request(
             f"{_HOST}/capture/",
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
         )
-        urllib.request.urlopen(req, timeout=5).read()
+        urllib.request.urlopen(req, timeout=timeout).read()
     except Exception:
         pass  # best-effort: telemetry must never affect the app
 
 
-def capture(event: str, properties: dict | None = None) -> None:
+def capture(event: str, properties: dict | None = None, *, flush: bool = False) -> None:
     """Record one anonymous product event. No-op if opted out or no key.
 
     ``properties`` must be bucketed/categorical only — never task content,
     message text, paths, or PII. The caller owns that discipline; this module
     does not inspect payloads beyond attaching the anonymous distinct id.
+
+    ``flush=True`` uses a bounded synchronous send for short-lived commands
+    that are about to exit. Long-running services should keep the default
+    daemon-thread path so telemetry never delays their work.
     """
     if os.environ.get("SUTANDO_DEBUG_TELEMETRY", "").strip().lower() in _TRUTHY:
         sys.stderr.write(
@@ -175,7 +179,7 @@ def capture(event: str, properties: dict | None = None) -> None:
         )
     if not enabled():
         return
-    _dispatch(event, properties)
+    _dispatch(event, properties, flush=flush)
 
 
 def task_processed(source: str) -> None:
@@ -189,15 +193,15 @@ def task_processed(source: str) -> None:
     capture("task_processed", {"source": str(source)})
 
 
-def feature_used(feature: str) -> None:
+def feature_used(feature: str, *, flush: bool = False) -> None:
     """One anonymous event when a named product feature runs, tagged only with
     the feature's short categorical name (e.g. ``morning_briefing``). Never any
     task content, arguments, or PII.
     """
-    capture("feature_used", {"feature": str(feature)})
+    capture("feature_used", {"feature": str(feature)}, flush=flush)
 
 
-def _dispatch(event: str, properties: dict | None) -> None:
+def _dispatch(event: str, properties: dict | None, *, flush: bool = False) -> None:
     props = {
         "$ip": "",
         "$geoip_disable": True,
@@ -221,4 +225,10 @@ def _dispatch(event: str, properties: dict | None) -> None:
         # inherent to any HTTPS request; the vendor is told not to keep it).
         "properties": props,
     }
-    threading.Thread(target=_post, args=(payload,), daemon=True).start()
+    if flush:
+        # One-shot feature scripts exit immediately after this call. A daemon
+        # sender is terminated with the interpreter, so give the request a
+        # short bounded window to complete before returning.
+        _post(payload, timeout=1)
+    else:
+        threading.Thread(target=_post, args=(payload,), daemon=True).start()

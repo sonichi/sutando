@@ -104,6 +104,26 @@ class TestGetVaultKey(unittest.TestCase):
                 vault_intercept.get_vault_key("MISSING")
 
 
+class TestSetVaultKey(unittest.TestCase):
+    def test_delegates_to_store(self):
+        with patch.object(vault_intercept, "_store_in_keychain") as mock_store:
+            vault_intercept.set_vault_key("MY_KEY", "supersecret")
+        mock_store.assert_called_once_with("MY_KEY", "supersecret")
+
+    def test_rejects_invalid_key_names(self):
+        for bad in ("", "9LEADING", "has space", "has-dash", "a=b", "k\nnewline"):
+            with patch.object(vault_intercept, "_store_in_keychain") as mock_store:
+                with self.assertRaises(ValueError):
+                    vault_intercept.set_vault_key(bad, "value")
+            mock_store.assert_not_called()
+
+    def test_rejects_empty_value(self):
+        with patch.object(vault_intercept, "_store_in_keychain") as mock_store:
+            with self.assertRaises(ValueError):
+                vault_intercept.set_vault_key("MY_KEY", "")
+        mock_store.assert_not_called()
+
+
 class TestRegisterKey(unittest.TestCase):
     def _patch_paths(self, canonical, legacy):
         return (
@@ -174,7 +194,7 @@ class TestStoreRegistersKey(unittest.TestCase):
 
 
 import io
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 
 
 class TestVaultCliList(unittest.TestCase):
@@ -207,6 +227,65 @@ class TestVaultCliGet(unittest.TestCase):
             with self.assertRaises(SystemExit) as cm:
                 vault_cli.cmd_get("MISSING")
         self.assertEqual(cm.exception.code, 1)
+
+
+class TestVaultCliSet(unittest.TestCase):
+    def test_reads_stdin_and_strips_one_trailing_newline(self):
+        with patch("vault.set_vault_key") as mock_set, \
+             patch("vault.sys.stdin", io.StringIO("secret123\n")):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                vault_cli.cmd_set("MY_KEY")
+        mock_set.assert_called_once_with("MY_KEY", "secret123")
+        self.assertIn("stored 'MY_KEY'", buf.getvalue())
+
+    def test_preserves_inner_whitespace_and_extra_newlines(self):
+        # Only the single trailing newline is stripped; everything else is data.
+        with patch("vault.set_vault_key") as mock_set, \
+             patch("vault.sys.stdin", io.StringIO("line1\nline2\n\n")):
+            with redirect_stdout(io.StringIO()):
+                vault_cli.cmd_set("MY_KEY")
+        mock_set.assert_called_once_with("MY_KEY", "line1\nline2\n")
+
+    def test_exits_1_on_setter_error(self):
+        with patch("vault.set_vault_key", side_effect=ValueError("bad key")), \
+             patch("vault.sys.stdin", io.StringIO("v\n")):
+            with self.assertRaises(SystemExit) as cm:
+                vault_cli.cmd_set("bad key")
+        self.assertEqual(cm.exception.code, 1)
+
+
+class TestVaultCliMainDispatch(unittest.TestCase):
+    """main()'s set-dispatch branches (argv guards live here, not in cmd_set)."""
+
+    def _main(self, argv):
+        with patch("vault.sys.argv", ["secret-vault.py", *argv]):
+            vault_cli.main()
+
+    def test_set_dispatches_to_cmd_set(self):
+        with patch("vault.cmd_set") as mock_cmd:
+            self._main(["set", "MY_KEY"])
+        mock_cmd.assert_called_once_with("MY_KEY")
+
+    def test_set_missing_key_exits_1(self):
+        with self.assertRaises(SystemExit) as cm:
+            self._main(["set"])
+        self.assertEqual(cm.exception.code, 1)
+
+    def test_set_refuses_value_on_argv(self):
+        # The whole point of the stdin design — a value on argv is refused, not stored.
+        with patch("vault.cmd_set") as mock_cmd:
+            with self.assertRaises(SystemExit) as cm:
+                self._main(["set", "MY_KEY", "leaky-value"])
+        self.assertEqual(cm.exception.code, 1)
+        mock_cmd.assert_not_called()
+
+    def test_unknown_subcommand_usage_mentions_set(self):
+        buf = io.StringIO()
+        with self.assertRaises(SystemExit) as cm, redirect_stderr(buf):
+            self._main(["frobnicate"])
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("set KEY", buf.getvalue())
 
 
 class TestVaultCliEnv(unittest.TestCase):

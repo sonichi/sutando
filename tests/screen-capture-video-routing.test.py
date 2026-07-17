@@ -83,10 +83,10 @@ class TestCaptureVideoRouting(unittest.TestCase):
         pp = mock.patch.object(self.mod.subprocess, "Popen", FakePopen)
         pp.start()
         self.addCleanup(pp.stop)
-        # Deterministic token so /capture-video auth is testable. Fresh module
-        # per test, so this assignment doesn't leak.
+        # Deterministic token so /capture and /capture-video auth is testable.
+        # Fresh module per test, so this assignment doesn't leak.
         self.token = "test-capture-token"
-        self.mod.CAPTURE_VIDEO_TOKEN = self.token
+        self.mod.CAPTURE_TOKEN = self.token
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), self.mod.Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -113,7 +113,7 @@ class TestCaptureVideoRouting(unittest.TestCase):
 
     def test_capture_still_returns_png(self):
         # The screenshot branch still works for the plain /capture path.
-        status, body = self._get("/capture?silent=true")
+        status, body = self._get("/capture?silent=true", token=self.token)
         self.assertEqual(status, 200)
         self.assertTrue(body["path"].endswith(".png"),
                         f"/capture must return a .png, got {body['path']}")

@@ -78,6 +78,28 @@ def _alive_path() -> Path:
     return CORES_DIR / f"{_hostname()}.alive"
 
 
+def _locality() -> dict[str, str]:
+    """The core's locality — self-reported (Track 10, owner 2026-07-10).
+
+    `kind`: ``local`` when this core runs on one of the owner's own machines
+    (a normal ``startup.sh`` launch), ``cloud`` when spawned by the hosted
+    spawn-user-core template. The template sets ``$SUTANDO_CORE_LOCALITY=cloud``;
+    an absent or unrecognized value defaults to ``local`` (a hand-started core
+    is local by construction — fail toward the safe, common case). ``host`` is
+    the per-host label, so a client can render WHICH machine ("MacBook Pro
+    (yours)" vs "mac-mini (yours, remote)").
+
+    Consumed downstream by the broker presence sweep → ``space.ag2.presence`` →
+    a client locality badge (the remaining two Track-10 slices). Self-reported
+    v1; attestation is a Track 2/4 tie-in. Same runtime-authored-state pattern
+    as ``socket`` above — the answer lives in the core's own environment.
+    """
+    kind = os.environ.get("SUTANDO_CORE_LOCALITY", "local").strip().lower()
+    if kind not in ("local", "cloud"):
+        kind = "local"
+    return {"kind": kind, "host": _hostname()}
+
+
 def write_beat(status: str = "running") -> None:
     """Write one heartbeat record. Atomic-via-tmp-then-rename so a concurrent
     reader never sees a partial file."""
@@ -96,7 +118,11 @@ def write_beat(status: str = "running") -> None:
         # app, whose ambient SUTANDO_TMUX_SOCKET points at a *different* bundled
         # socket). Mirrors start-cli.sh's resolution exactly.
         "socket": os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock"),
-        "schema_version": 1,
+        # Self-reported locality (Track 10): {kind: local|cloud, host}. Additive
+        # and informational — mtime remains the liveness signal — so readers
+        # that don't know the field are unaffected.
+        "locality": _locality(),
+        "schema_version": 2,
     }
     tmp = target.with_suffix(".alive.tmp")
     tmp.write_text(json.dumps(payload, indent=2))
