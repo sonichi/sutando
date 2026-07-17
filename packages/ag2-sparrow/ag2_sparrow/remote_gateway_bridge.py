@@ -41,10 +41,12 @@ Stdlib only (urllib) — no new dependencies.
 
 from __future__ import annotations
 
+import atexit
 import base64
 import json
 import os
 import re
+import signal
 import sys
 import tempfile
 import time
@@ -61,6 +63,7 @@ from .task_archive import find_task_file
 from . import local_task_protocol
 from .result_markers import parse_markers
 from .send_allowlist import is_path_sendable
+from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
 
 TASKS_DIR = _task_dir()
 RESULTS_DIR = _result_dir()
@@ -987,9 +990,78 @@ def _reconcile_abandoned(inflight: set[str], suspects: set[str]) -> set[str]:
     return gone - confirmed
 
 
+# ── MC1 per-workspace singleton (dual-poller guard) ─────────────────────────
+# Exactly one gateway-bridge may poll a given workspace's relay bearer. A second
+# one — an orphaned bridge from a prior install (ppid 1, outlived its parent), or
+# a simultaneous respawn — would double-deliver every task. Acquire a per-
+# (workspace, role) lock before polling; if a LIVE bridge already holds it, exit
+# without polling. The lock is held + heartbeated so a crashed/stale holder is
+# reaped (freshness like state/cores/<host>.alive). FAIL-OPEN by design: any
+# lock-layer error → poll anyway (a lock bug must never silence task delivery;
+# the only risk of a dropped guard is the pre-existing dual-poller). Kill-switch:
+# SUTANDO_BRIDGE_LOCK=0 lets the owner disable it in prod without a redeploy.
+_LOCK_ROLE = "gateway-bridge"
+_LOCK_WS = _STATE.parent  # _STATE = <workspace>/state (injected) or ~/.ag2-sparrow/state
+
+
+def _lock_on() -> bool:
+    return os.environ.get("SUTANDO_BRIDGE_LOCK", "1") != "0"
+
+
+def _release_singleton() -> None:
+    if not _lock_on():
+        return
+    try:
+        _ws_release(_LOCK_ROLE, _LOCK_WS)
+    except Exception:
+        pass
+
+
+def _heartbeat_singleton() -> bool:
+    """Refresh the poller lock. Returns False ONLY when we have definitively LOST
+    ownership — a replacement reaped our lock after we were deemed stale (the
+    stale-takeover race). The caller MUST stop polling on False, or the reaped
+    process and the new owner both pull the same relay bearer (the dual-poll this
+    slice closes). Fail-open on everything else (lock disabled / heartbeat error
+    → True) so a lock bug never wedges task delivery."""
+    if not _lock_on():
+        return True
+    try:
+        return bool(_ws_heartbeat(_LOCK_ROLE, _LOCK_WS))
+    except Exception:
+        return True
+
+
+def _acquire_singleton() -> bool:
+    """True → we hold the poller lock (or it is disabled / errored → fail-open).
+    False → a live bridge already owns this workspace and the caller must NOT poll."""
+    if not _lock_on():
+        return True
+    try:
+        r = _ws_acquire(_LOCK_ROLE, _LOCK_WS)
+    except Exception as e:  # fail-open — never wedge task delivery on a lock bug
+        _log(f"singleton: acquire error ({e}) — proceeding without lock")
+        return True
+    if r.status == "deferred":
+        h = r.holder or {}
+        _log(f"singleton: another live gateway-bridge owns this workspace "
+             f"(host={h.get('host')} pid={h.get('pid')}) — exiting to avoid dual-poll")
+        return False
+    atexit.register(_release_singleton)
+    for _sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(_sig, lambda *_a: sys.exit(0))
+        except Exception:
+            pass  # non-main-thread or platform without the signal — atexit still covers exit
+    _log(f"singleton: acquired workspace poller lock ({r.status})")
+    return True
+
+
 def main() -> None:
     if not URL or not TOKEN:
         sys.exit("FATAL: set REMOTE_TASK_TOKEN (and REMOTE_TASK_URL if your token is a bare secret).")
+    if not _acquire_singleton():
+        return  # a live bridge already polls this workspace — exit cleanly (no dual-poll)
     inflight: set[str] = _load_inflight()
     abandoned_suspects: set[str] = set()
     _log(f"starting — gateway={URL} provider={PROVIDER} tasks={TASKS_DIR} "
@@ -997,6 +1069,13 @@ def main() -> None:
     backoff = 1
     while True:
         try:
+            if not _heartbeat_singleton():
+                # Lost the poller lock (reaped after being deemed stale). Stop
+                # polling immediately so we don't dual-poll the relay bearer with
+                # the process that took over. atexit release is a no-op (not ours).
+                _log("singleton: lost workspace poller lock (reaped after stale takeover) "
+                     "— exiting to avoid dual-poll")
+                return
             _post_heartbeat(inflight)
             resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}", timeout=POLL_WAIT + 10)
             added = False
