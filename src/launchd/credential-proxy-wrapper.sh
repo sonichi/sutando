@@ -26,7 +26,8 @@ for _node_cand in \
     /opt/homebrew/bin/node \
     /usr/local/bin/node \
     "$HOME/.nvm/versions/node/$(ls "$HOME/.nvm/versions/node/" 2>/dev/null | sort -V | tail -1)/bin/node" \
-    "$HOME/.volta/bin/node"
+    "$HOME/.volta/bin/node" \
+    "$HOME/Library/Application Support/space.ag2.app/engine/runtime/node/bin/node"
 do
     [ -x "$_node_cand" ] || continue
     _node_dir="$(dirname "$_node_cand")"
@@ -38,7 +39,8 @@ done
 # launchd plist exports it (claude-sutando installs); otherwise falls back to
 # ~/.claude. launchd itself doesn't inherit shell env, so this fallback is the
 # vanilla-claude default unless the plist's EnvironmentVariables sets it.
-PROXY_SCRIPT="$(bash "$(cd "$(dirname "$0")/../.." && pwd)/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+PROXY_SCRIPT="$(bash "$REPO_ROOT/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
 
 # Resolve npx — launchd doesn't inherit the user's shell PATH.
 resolve_npx() {
@@ -54,8 +56,13 @@ resolve_npx() {
 }
 
 # Resolve tsx — prefer direct binary to avoid npx overhead on restart paths.
+# The repo's own node_modules/.bin/tsx comes FIRST: it's the version the repo
+# pins, and it's the only tsx on a host with no homebrew/nvm/volta node at all
+# (the app-bundle runtime ships bare `node` — the PATH heal above covers the
+# `#!/usr/bin/env node` re-exec).
 resolve_tsx() {
     for p in \
+        "$REPO_ROOT/node_modules/.bin/tsx" \
         /opt/homebrew/bin/tsx \
         /usr/local/bin/tsx \
         "$HOME/.nvm/versions/node/$(ls "$HOME/.nvm/versions/node/" 2>/dev/null | sort -V | tail -1)/bin/tsx" \

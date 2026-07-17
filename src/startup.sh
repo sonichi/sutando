@@ -556,7 +556,17 @@ if [ -f "$_PROXY_INSTALLER" ] && [ -f "$REPO/src/launchd/$_PROXY_LABEL.plist" ];
 fi
 if ! lsof -i :7846 > /dev/null 2>&1; then
   echo "  Starting credential proxy (port 7846)..."
-  npx tsx "$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)" > /tmp/credential-proxy.log 2>&1 &
+  # Repo-pinned tsx first; `npx tsx` only as a last resort (a host may have no
+  # homebrew/nvm node at all — the app-bundle runtime ships bare `node`, which
+  # the PATH prepend covers for tsx's `#!/usr/bin/env node` re-exec).
+  _APP_NODE_DIR="$HOME/Library/Application Support/space.ag2.app/engine/runtime/node/bin"
+  [ -d "$_APP_NODE_DIR" ] && case ":$PATH:" in *":$_APP_NODE_DIR:"*) ;; *) PATH="$_APP_NODE_DIR:$PATH"; export PATH ;; esac
+  _PROXY_SCRIPT="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
+  if [ -x "$REPO/node_modules/.bin/tsx" ]; then
+    "$REPO/node_modules/.bin/tsx" "$_PROXY_SCRIPT" > /tmp/credential-proxy.log 2>&1 &
+  else
+    npx tsx "$_PROXY_SCRIPT" > /tmp/credential-proxy.log 2>&1 &
+  fi
   sleep 1
   if lsof -i :7846 > /dev/null 2>&1; then
     echo "  ✓ credential proxy"

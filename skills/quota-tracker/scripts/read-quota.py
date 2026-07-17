@@ -137,6 +137,13 @@ def main():
     data = json.loads(QUOTA_FILE.read_text())
     headers = data.get("headers", {})
 
+    # Staleness guard: the proxy rewrites this file on every API response, so
+    # an old mtime means quota data is NOT current (proxy dead, or the session
+    # isn't routed through it). Report it loudly — a confident 4-day-old
+    # reading once drove a full day of budget decisions (2026-07-17).
+    age_s = time.time() - QUOTA_FILE.stat().st_mtime
+    stale = age_s > 30 * 60
+
     status = headers.get("anthropic-ratelimit-unified-status", "unknown")
     util_5h = float(headers.get("anthropic-ratelimit-unified-5h-utilization", 0))
     util_7d = float(headers.get("anthropic-ratelimit-unified-7d-utilization", 0))
@@ -150,6 +157,8 @@ def main():
         "utilization_7d": util_7d,
         "remaining_5h_pct": round((1 - util_5h) * 100),
         "remaining_7d_pct": round((1 - util_7d) * 100),
+        "state_age_seconds": int(age_s),
+        "stale": stale,
     }
 
     if reset_5h:
@@ -170,6 +179,9 @@ def main():
         sys.exit(0 if result["available"] else 1)
 
     # Human readable
+    if stale:
+        hrs = age_s / 3600
+        print(f"⚠ STALE: quota state is {hrs:.1f}h old — proxy not feeding it; numbers below are historical, not current")
     print(f"Status: {status}")
     print(f"5h window: {int(util_5h * 100)}% used, {result['remaining_5h_pct']}% remaining")
     if reset_5h:
