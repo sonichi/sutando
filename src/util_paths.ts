@@ -24,7 +24,7 @@
 // intentional).
 
 import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { resolveWorkspace } from './workspace_default.js';
@@ -224,4 +224,28 @@ export function claudeHomePath(...subpath: string[]): string {
 	}
 	if (subpath.length === 0) return base;
 	return join(base, ...subpath);
+}
+
+// ---------------------------------------------------------------------------
+// Screen-capture token — issued once at screen-capture-server startup,
+// stored 0600 at ~/.config/sutando/screen-capture-token.  Callers include
+// it in the X-Sutando-Capture-Token header so a browser page on loopback
+// cannot reach the /capture endpoint (browsers cannot set custom headers on
+// no-cors requests or read local files).
+// ---------------------------------------------------------------------------
+
+const _CAPTURE_TOKEN_PATH = join(process.env.HOME || '', '.config', 'sutando', 'screen-capture-token');
+
+/**
+ * Read the screen-capture server token from disk.  Returns the token string
+ * or undefined if the file is absent (server not running or not yet started).
+ * Result is NOT cached — the server may rotate the token on restart.
+ */
+export function readCaptureToken(): string | undefined {
+	try {
+		const tok = readFileSync(_CAPTURE_TOKEN_PATH, 'utf8').trim();
+		return tok || undefined;
+	} catch {
+		return undefined;
+	}
 }

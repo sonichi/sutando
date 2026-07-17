@@ -1651,6 +1651,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard let url = URL(string: "http://localhost:7845/capture") else { return }
         var req = URLRequest(url: url)
         req.timeoutInterval = 5
+        // /capture requires a shared token (same gate as /capture-video).
+        let tokenPath = NSString(string: "~/.config/sutando/screen-capture-token").expandingTildeInPath
+        if let token = try? String(contentsOfFile: tokenPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty {
+            req.setValue(token, forHTTPHeaderField: "X-Sutando-Capture-Token")
+        }
         URLSession.shared.dataTask(with: req) { [self] data, _, error in
             if let error = error {
                 notify("Sutando", "Screenshot drop failed: \(error.localizedDescription)")

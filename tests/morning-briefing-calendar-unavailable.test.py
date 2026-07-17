@@ -194,4 +194,9 @@ class TestMainCalendarStatusLine(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    # Hard-exit after the suite to sidestep a Python interpreter-teardown SIGSEGV
+    # on ubuntu-latest runners: the 9 tests pass, then the process segfaults during
+    # interpreter shutdown (not the test logic - subprocess calls are mocked).
+    import os
+    _r = unittest.main(exit=False)
+    os._exit(0 if _r.result.wasSuccessful() else 1)
