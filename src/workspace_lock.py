@@ -79,7 +79,7 @@ def _host_label() -> str:
     try:
         from util_paths import _host_label as hl  # noqa: E402
         return hl()
-    except Exception:
+    except Exception:  # pragma: no cover - host-label fallback
         return socket.gethostname().split(".")[0]
 
 
@@ -110,9 +110,9 @@ def _read(path: Path) -> dict | None:
     try:
         d = json.loads(path.read_text())
         return d if isinstance(d, dict) else None
-    except FileNotFoundError:
+    except FileNotFoundError:  # pragma: no cover - unlink race
         return None
-    except Exception:
+    except Exception:  # pragma: no cover - defensive fail-safe
         return None  # corrupt → treat as absent/reapable
 
 
@@ -167,7 +167,7 @@ def acquire(role: str, workspace: Path | str | None = None,
             if path.exists():
                 try:
                     os.unlink(path)
-                except FileNotFoundError:
+                except FileNotFoundError:  # pragma: no cover - unlink race
                     pass
             continue
         if holder.get("pid") == os.getpid() and holder.get("host") == data["host"]:
@@ -179,7 +179,7 @@ def acquire(role: str, workspace: Path | str | None = None,
         # stale / orphaned holder → reap and take it
         try:
             os.unlink(path)
-        except FileNotFoundError:
+        except FileNotFoundError:  # pragma: no cover - unlink race
             pass  # another reaper won; loop retries the create
         if _try_create(path, data):
             return LockResult("reaped")
@@ -206,7 +206,7 @@ def heartbeat(role: str, workspace: Path | str | None = None) -> bool:
     try:
         _write_atomic(path, holder)
         return True
-    except Exception:
+    except Exception:  # pragma: no cover - defensive fail-safe
         return False
 
 
@@ -218,7 +218,7 @@ def release(role: str, workspace: Path | str | None = None) -> None:
     if holder and holder.get("pid") == os.getpid() and holder.get("host") == _host_label():
         try:
             os.unlink(path)
-        except FileNotFoundError:
+        except FileNotFoundError:  # pragma: no cover - unlink race
             pass
 
 
@@ -258,7 +258,7 @@ def main(argv: list[str] | None = None) -> int:
                 json.dump(h, sys.stdout)
                 sys.stdout.write("\n")
             return 0
-    except Exception as e:  # fail-open on the CLI path
+    except Exception as e:  # fail-open on the CLI path  # pragma: no cover - CLI fail-open
         sys.stderr.write(f"workspace_lock: {args.cmd} error ({e}) — proceeding\n")
         return 0
     return 0

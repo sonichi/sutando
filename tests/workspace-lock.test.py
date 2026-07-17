@@ -133,5 +133,102 @@ class LockTest(unittest.TestCase):
         self.assertEqual(len(deferred), 7, results)
 
 
+class CliTest(unittest.TestCase):
+    """Exercise the CLI main() dispatch in-process (the subprocess concurrency
+    test runs in child processes that don't count toward coverage)."""
+
+    def setUp(self):
+        self.mod = _load()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _run(self, *argv):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = self.mod.main([*argv, "--workspace", str(self.ws)])
+        return rc, out.getvalue()
+
+    def _lock_path(self, role="r"):
+        return self.ws / "state" / "locks" / f"{role}.lock"
+
+    def test_cli_acquire_then_status_release(self):
+        rc, out = self._run("acquire", "--role", "r")
+        self.assertEqual(rc, 0)
+        self.assertIn("acquired", out)
+        rc, out = self._run("status", "--role", "r")
+        self.assertEqual(rc, 0)
+        self.assertIn("\"role\": \"r\"", out)
+        rc, _ = self._run("heartbeat", "--role", "r")
+        self.assertEqual(rc, 0)                 # we hold it
+        rc, _ = self._run("release", "--role", "r")
+        self.assertEqual(rc, 0)
+        self.assertFalse(self._lock_path().exists())
+
+    def test_cli_acquire_deferred_exit3(self):
+        p = self._lock_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"role": "r", "pid": 999999, "host": HOST,
+                                 "heartbeat_at": int(time.time()), "schema_version": 1}))
+        rc, out = self._run("acquire", "--role", "r")
+        self.assertEqual(rc, 3)
+        self.assertIn("deferred", out)
+
+    def test_cli_acquire_reap_via_stale_seconds(self):
+        p = self._lock_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"role": "r", "pid": 999999, "host": HOST,
+                                 "heartbeat_at": int(time.time()) - 10, "schema_version": 1}))
+        rc, out = self._run("acquire", "--role", "r", "--stale-seconds", "1")
+        self.assertEqual(rc, 0)                 # 10s old > 1s window → reaped
+        self.assertIn("reaped", out)
+
+    def test_cli_heartbeat_not_holder_exit1(self):
+        p = self._lock_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"role": "r", "pid": 999999, "host": HOST,
+                                 "heartbeat_at": int(time.time()), "schema_version": 1}))
+        rc, _ = self._run("heartbeat", "--role", "r")
+        self.assertEqual(rc, 1)
+
+    def test_cli_status_absent_is_empty(self):
+        rc, out = self._run("status", "--role", "nope")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), "")
+
+    def test_read_holder_and_resolve_workspace(self):
+        self.mod.acquire("r", self.ws)
+        self.assertEqual(self.mod.read_holder("r", self.ws)["role"], "r")
+        self.assertIsNone(self.mod.read_holder("absent", self.ws))
+        # non-override branch resolves the real workspace to a Path
+        self.assertIsInstance(self.mod._resolve_workspace(None), Path)
+
+    def test_repr(self):
+        self.assertIn("LockResult", repr(self.mod.LockResult("acquired")))
+
+    def test_missing_heartbeat_is_stale(self):
+        # a holder with NO heartbeat_at field is treated as stale → reaped
+        p = self._lock_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"role": "r", "pid": 999999, "host": HOST,
+                                 "schema_version": 1}))   # no heartbeat_at
+        self.assertEqual(self.mod.acquire("r", self.ws).status, "reaped")
+
+    def test_deferred_after_exhausted_contention(self):
+        # never win the create, always see a stale holder → loop exhausts → defer
+        orig_create = self.mod._try_create
+        self.mod._try_create = lambda *a, **k: False
+        self.mod._read = lambda path: {"role": "r", "pid": 999999, "host": HOST,
+                                       "heartbeat_at": 0, "schema_version": 1}
+        try:
+            self.assertEqual(self.mod.acquire("r", self.ws).status, "deferred")
+        finally:
+            self.mod._try_create = orig_create
+
+
 if __name__ == "__main__":
     unittest.main()
