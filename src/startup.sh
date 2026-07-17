@@ -559,11 +559,15 @@ if ! lsof -i :7846 > /dev/null 2>&1; then
   # Repo-pinned tsx first; `npx tsx` only as a last resort (a host may have no
   # homebrew/nvm node at all — the app-bundle runtime ships bare `node`, which
   # the PATH prepend covers for tsx's `#!/usr/bin/env node` re-exec).
-  _APP_NODE_DIR="$HOME/Library/Application Support/space.ag2.app/engine/runtime/node/bin"
+  # App-bundle node dir + tsx resolution are BOTH resolved via sutando-config.sh
+  # (single source of truth — the launchd wrapper uses the same tsx-bin resolver;
+  # the path is config-resolved, not hardcoded here).
+  _APP_NODE_DIR="$(bash "$REPO/scripts/sutando-config.sh" app-node-dir)"
   [ -d "$_APP_NODE_DIR" ] && case ":$PATH:" in *":$_APP_NODE_DIR:"*) ;; *) PATH="$_APP_NODE_DIR:$PATH"; export PATH ;; esac
   _PROXY_SCRIPT="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
-  if [ -x "$REPO/node_modules/.bin/tsx" ]; then
-    "$REPO/node_modules/.bin/tsx" "$_PROXY_SCRIPT" > /tmp/credential-proxy.log 2>&1 &
+  _TSX="$(bash "$REPO/scripts/sutando-config.sh" tsx-bin)"
+  if [ -n "$_TSX" ]; then
+    "$_TSX" "$_PROXY_SCRIPT" > /tmp/credential-proxy.log 2>&1 &
   else
     npx tsx "$_PROXY_SCRIPT" > /tmp/credential-proxy.log 2>&1 &
   fi

@@ -61,15 +61,11 @@ resolve_npx() {
 # (the app-bundle runtime ships bare `node` — the PATH heal above covers the
 # `#!/usr/bin/env node` re-exec).
 resolve_tsx() {
-    for p in \
-        "$REPO_ROOT/node_modules/.bin/tsx" \
-        /opt/homebrew/bin/tsx \
-        /usr/local/bin/tsx \
-        "$HOME/.nvm/versions/node/$(ls "$HOME/.nvm/versions/node/" 2>/dev/null | sort -V | tail -1)/bin/tsx" \
-        "$HOME/.volta/bin/tsx"
-    do
-        [ -x "$p" ] && { echo "$p"; return; }
-    done
+    # Single source of truth: scripts/sutando-config.sh tsx-bin (repo-pinned
+    # node_modules/.bin/tsx first, then global locations). Prints the path or
+    # nothing; return 1 on empty lets the caller fall through to `npx tsx`.
+    _tsx="$(bash "$REPO_ROOT/scripts/sutando-config.sh" tsx-bin 2>/dev/null)"
+    [ -n "$_tsx" ] && { echo "$_tsx"; return 0; }
     return 1  # fall through to npx tsx
 }
 
