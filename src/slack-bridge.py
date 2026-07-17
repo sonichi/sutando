@@ -965,6 +965,8 @@ def result_watcher():
                 if not result_file.exists():
                     continue
                 reply_text = result_file.read_text().strip()
+                if not reply_text:
+                    continue
                 with pending_replies_lock:
                     target = pending_replies.pop(task_id, None)
                 if not target:
