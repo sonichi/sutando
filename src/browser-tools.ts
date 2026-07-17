@@ -10,6 +10,7 @@ import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { demoStateRef } from './recording-state.js';
 import { resolveWorkspace } from './workspace_default.js';
+import { readCaptureToken } from './util_paths.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -425,7 +426,8 @@ export const describeScreenTool: ToolDefinition = {
 		try {
 			const { display } = (args || {}) as { display?: number };
 			const query = display ? `?display=${display}` : '?all=true';
-			const captureRes = await fetch(`http://localhost:7845/capture${query}`);
+			const _capTok = readCaptureToken();
+			const captureRes = await fetch(`http://localhost:7845/capture${query}`, _capTok ? { headers: { 'X-Sutando-Capture-Token': _capTok } } : {});
 			const captureData = await captureRes.json() as { status: string; path?: string; all_paths?: string[]; error?: string };
 			if (captureData.status !== 'ok' || !captureData.path) {
 				return { error: `Could not capture screen: ${captureData.error || 'unknown'}` };
@@ -552,7 +554,8 @@ export const pointAtTool: ToolDefinition = {
 			// 1. capture the main display (single-display scope guard) via :7845.
 			// Timeout-bounded — point_at is on the sub-second inline lane and must
 			// never hang it if the capture server is wedged.
-			const capRes = await fetch('http://localhost:7845/capture?display=1', { signal: AbortSignal.timeout(8_000) });
+			const _capTok2 = readCaptureToken();
+			const capRes = await fetch('http://localhost:7845/capture?display=1', { signal: AbortSignal.timeout(8_000), headers: _capTok2 ? { 'X-Sutando-Capture-Token': _capTok2 } : {} });
 			if (!capRes.ok) return { error: `point_at capture HTTP ${capRes.status}` };
 			const cap = await capRes.json() as { status: string; path?: string; error?: string };
 			if (cap.status !== 'ok' || !cap.path) return { error: `point_at capture failed: ${cap.error || 'unknown'}` };

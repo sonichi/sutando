@@ -292,7 +292,9 @@ def resolve_workspace(repo_root: Optional[Path] = None) -> Path:
 
     Order (v0.8 — `$SUTANDO_WORKSPACE` env override removed):
       1. `sutando.config.{json,local.json}` → `workspace.path` (deep-merged).
-      2. `{repo_root}/workspace` baked-in default.
+      2. `$SUTANDO_DEFAULT_WORKSPACE` — an optional full workspace path an
+         embedder may set (fills the default slot, below explicit config).
+      3. `{repo_root}/workspace` baked-in default.
 
     Does NOT create the directory; the caller decides. Returns an absolute
     `Path`.
@@ -340,8 +342,15 @@ def resolve_workspace(repo_root: Optional[Path] = None) -> Path:
     cfg = load_config(repo_root)
     root = repo_root or _CACHE_REPO_ROOT
     cfg_path = (cfg.get("workspace") or {}).get("path")
+    # Optional embedder-provided default workspace. An embedder (e.g. the AG2
+    # Space desktop app, whose `{repo_root}` is a read-only .app bundle) passes
+    # the FULL workspace path it wants; OSS stays agnostic to how it was derived.
+    # Fills the default slot only — an explicit `workspace.path` config wins.
+    embedder_default = os.environ.get("SUTANDO_DEFAULT_WORKSPACE", "").strip()
     if cfg_path:
         resolved = Path(cfg_path).expanduser().resolve()
+    elif embedder_default:
+        resolved = Path(embedder_default).expanduser().resolve()
     elif root is None:
         # No config and no repo root — last-ditch fallback for ad-hoc invocations
         # outside a checkout. Post-v0.8 (#1440 + Mini opinion-requested 2026-06-06),
@@ -401,6 +410,33 @@ def resolve_vault(repo_root: Optional[Path] = None) -> Dict[str, Any]:
     vault["sync"] = sync
     vault.setdefault("interval_seconds", 1800)
     return vault
+
+
+def resolve_dotenv(repo_root: Optional[Path] = None,
+                   workspace: Optional[Path] = None) -> Path:
+    """Resolve the `.env` path through the canonical 2-tier fallback.
+
+    Order (first that exists wins):
+      1. `<repo_root>/.env`   — the startup.sh default (source root).
+      2. `<workspace>/.env`   — the workspace contract fallback (#1871).
+
+    Returns a `Path` always; when neither exists, returns tier 1 (the expected
+    primary) so error messages name the primary location, not a fallback.
+
+    NOTE: a third tier (the Sutando.app bundle's durable user-clone .env, #1973)
+    is deliberately NOT here — that path depends on the unresolved question of
+    whether the app-bundle install location is supported (owner-gated,
+    2026-07-15). It's tracked separately in #1973; add it here once decided.
+    """
+    repo = repo_root or _find_repo_root() or Path.cwd()
+    primary = repo / ".env"
+    if primary.exists():
+        return primary
+    ws = workspace or resolve_workspace(repo_root)
+    ws_env = ws / ".env"
+    if ws_env.exists():
+        return ws_env
+    return primary
 
 
 _DEFAULT_CLAUDE_SUTANDO_SUBDIR = ".claude-sutando"

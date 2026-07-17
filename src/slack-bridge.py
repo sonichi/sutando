@@ -38,6 +38,7 @@ import json
 import mimetypes
 import os
 import re
+import secrets
 import sys
 import threading
 import time
@@ -99,14 +100,23 @@ APP_TOKEN = os.environ.get("SLACK_APP_TOKEN", "")
 # the child env from process.env + workspace .env only — it relies on each bridge
 # self-loading its channel .env (discord/telegram already do). Without this, the
 # supervisor-spawned bridge crash-loops on "not set". Mirrors discord-bridge.py.
-if not BOT_TOKEN or not APP_TOKEN:
-    channels_env = claude_home_path("channels", "slack", ".env")
-    if channels_env.exists():
-        for line in channels_env.read_text().splitlines():
-            if line.startswith("SLACK_BOT_TOKEN=") and not BOT_TOKEN:
-                BOT_TOKEN = line.split("=", 1)[1].strip().strip('"').strip("'")
-            elif line.startswith("SLACK_APP_TOKEN=") and not APP_TOKEN:
-                APP_TOKEN = line.split("=", 1)[1].strip().strip('"').strip("'")
+# Tighten perms whenever the token file exists — even when the tokens are already
+# in process env — so a world-readable .env never survives startup.
+channels_env = claude_home_path("channels", "slack", ".env")
+if channels_env.exists():
+    try:
+        os.chmod(channels_env, 0o600)  # token file — enforce owner-only, mirrors access.json treatment
+    except OSError as e:
+        # Best-effort hardening: a read-only volume, wrong ownership after a
+        # restore/sync, or an ACL-restricted file must NOT crash the bridge at
+        # startup — the file may still be perfectly readable. Warn and continue.
+        print(f"  [startup] warning: could not chmod 0600 {channels_env}: {e}", flush=True)
+if (not BOT_TOKEN or not APP_TOKEN) and channels_env.exists():
+    for line in channels_env.read_text().splitlines():
+        if line.startswith("SLACK_BOT_TOKEN=") and not BOT_TOKEN:
+            BOT_TOKEN = line.split("=", 1)[1].strip().strip('"').strip("'")
+        elif line.startswith("SLACK_APP_TOKEN=") and not APP_TOKEN:
+            APP_TOKEN = line.split("=", 1)[1].strip().strip('"').strip("'")
 if not BOT_TOKEN or not APP_TOKEN:
     print("SLACK_BOT_TOKEN and/or SLACK_APP_TOKEN not set", file=sys.stderr)
     sys.exit(1)
@@ -151,7 +161,7 @@ def _is_path_sendable(fpath: str) -> bool:
     return False
 
 
-def write_owner_activity(channel: str, summary: str) -> None:
+def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
     """Record owner activity — same schema as src/discord-bridge.py."""
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -160,6 +170,8 @@ def write_owner_activity(channel: str, summary: str) -> None:
             "channel": channel,
             "summary": summary[:80],
         }
+        if channel_id:
+            payload["channel_id"] = str(channel_id)
         tmp = OWNER_ACTIVITY_FILE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload))
         tmp.rename(OWNER_ACTIVITY_FILE)
@@ -205,6 +217,14 @@ def presenter_mode_active() -> bool:
 
 
 ACCESS_FILE = channel_access_path("slack")
+
+# TOFU enrollment code — set at startup when access.json doesn't exist.
+# The first DM must include this code to become owner. RETAINED for the whole
+# process lifetime (never cleared) so the gate stays armed if access.json is
+# deleted externally later (#899). None only when access.json already existed
+# at startup (bridge already enrolled). See telegram-bridge.py for the same
+# mechanism.
+_TOFU_ENROLLMENT_CODE: str | None = None
 
 # In-memory mirror of access.json. Updated on every successful read.
 # Used by tofu_onboard() to detect and recover from external deletions
@@ -434,9 +454,35 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         pass
 
     # Access control via TOFU
+    global _TOFU_ENROLLMENT_CODE
     allowed = load_allowed()
     if allowed is None:
+        # TOFU state — require enrollment code before auto-onboarding as owner,
+        # so an attacker who can DM the bot can't claim ownership first.
+        # Enrollment is DM-only: channel @mentions also route here but carry no
+        # channel_type=="im", so drop them — a leaked code must not be claimable
+        # from a shared channel.
+        if event.get("channel_type") != "im":
+            print(f"  TOFU: ignored non-DM event from {user_id} — enrollment is DM-only", flush=True)
+            return None
+        channel = event.get("channel") or user_id
+        if _TOFU_ENROLLMENT_CODE and _TOFU_ENROLLMENT_CODE not in (text or ""):
+            try:
+                app.client.chat_postMessage(
+                    channel=channel,
+                    text=(
+                        "Enrollment code required.\n"
+                        "Check the bridge startup log for your code and send it here."
+                    ),
+                )
+            except Exception:
+                pass
+            print(f"  TOFU: rejected enrollment from {user_id} — code not presented", flush=True)
+            return None
         allowed = tofu_onboard(user_id, username)
+        # Keep _TOFU_ENROLLMENT_CODE valid for the process lifetime (do NOT clear
+        # it) so the gate stays armed if access.json is deleted externally later
+        # (#899), instead of falling through to an unguarded tofu_onboard().
     if user_id not in allowed:
         print(f"  Dropped message from non-allowed user {user_id}", flush=True)
         return None
@@ -462,7 +508,7 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     if not text and not attachment_note:
         return None
 
-    write_owner_activity("slack", text or attachment_note)
+    write_owner_activity("slack", text or attachment_note, channel_id=event.get("channel"))
 
     channel = event.get("channel", "")
     # Reply in-thread for channel @mentions, top-level for DMs. parens for
@@ -587,7 +633,6 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     task_file.write_text(
         f"id: {task_id}\n"
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
-        f"task: {user_task_text}\n"
         f"source: slack\n"
         f"interaction_type: message\n"
         f"{media_headers}"
@@ -595,6 +640,7 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         f"user_id: {user_id}\n"
         f"access_tier: {access_tier}\n"
         f"priority: {priority}\n"
+        f"task: {user_task_text}\n"
         f"{skill_hints}"
     )
     with pending_replies_lock:
@@ -623,6 +669,15 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
             "is_thread": bool(thread_ts),
         },
     )
+    # Anonymous, opt-out product telemetry: one bucketed event per accepted
+    # task, tagged only with the inbound surface. No-op when opted out / no key;
+    # never task content or ids. See src/telemetry.py + TELEMETRY.md.
+    try:  # pragma: no cover — fire-and-forget glue; logic tested in tests/telemetry.test.py
+        from telemetry import task_processed  # sibling module (src/ on sys.path)
+
+        task_processed("slack")
+    except Exception:  # pragma: no cover — telemetry must never break the bridge
+        pass
     return task_id
 
 
@@ -1058,13 +1113,26 @@ def _recover_orphan_sending_files() -> int:
         print(f"  [startup] recovered {recovered} orphan .sending file(s)", flush=True)
     return recovered
 
-def main():
+def main():  # pragma: no cover
+    global _TOFU_ENROLLMENT_CODE
     _single_instance_acquire("slack-bridge")
     print("Slack bridge started. Socket Mode connecting...", flush=True)
     _recover_orphan_sending_files()
     # Prime the in-memory access cache so tofu_onboard() can detect external
     # deletions even on the very first inbound message after a restart (#899).
     load_allowed()
+
+    # TOFU enrollment code: generated when access.json doesn't exist so
+    # the first DM must present it before being auto-enrolled as owner.
+    if not ACCESS_FILE.exists():
+        _TOFU_ENROLLMENT_CODE = secrets.token_hex(3)  # 6-char hex, 16M combinations
+        print("", flush=True)
+        print(f"  *** TOFU enrollment required ***", flush=True)
+        print(f"  Enrollment code: {_TOFU_ENROLLMENT_CODE}", flush=True)
+        print(f"  Send this code in your first DM to register as owner.", flush=True)
+        print(f"  Anyone who sends this code first becomes owner — keep it private.", flush=True)
+        print("", flush=True)
+
     threading.Thread(target=result_watcher, name="slack-result-watcher", daemon=True).start()
     threading.Thread(target=_no_events_hint_thread, name="slack-no-events-hint", daemon=True).start()
     handler = SocketModeHandler(app, APP_TOKEN)

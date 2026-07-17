@@ -1,6 +1,6 @@
 # Context-Drop AX-Read
 
-Tiny Swift CLI that reads the focused app's text selection via the macOS Accessibility API. Sutando.app's ⌃C "drop context" hotkey shells out to this binary to capture what you have highlighted.
+Tiny Swift CLI that reads the focused app's text selection via the macOS Accessibility API. Sutando.app's "drop context" action (hotkey configurable via `state/hotkeys.json`) shells out to this binary to capture what you have highlighted.
 
 ## What it does
 
