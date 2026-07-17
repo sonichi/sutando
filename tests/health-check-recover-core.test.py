@@ -21,7 +21,7 @@ point. These cover:
   g) recurs after cooldown           → escalates to standard 200K context
   h) give-up cap (3/hr)              → DMs "gave up", stops restarting
   i) restart launch fails            → no cooldown/history burned, retries
-  j) core down (not alive)           → no action even with an old task
+  j) dead core (no heartbeat, not booted) → relaunched (session-died gap)
   k) draining backlog (oldest task   → never restarts (queue is healthy, just
      differs each pass)                 busy) — review blocker 3
   l) core makes progress             → resets, never restarts a long live task;
@@ -244,13 +244,27 @@ def case_i_failed_restart_does_not_burn_state() -> list[str]:
     return fails
 
 
-def case_j_core_down_no_action() -> list[str]:
+def case_j_dead_core_relaunches() -> list[str]:
+    """A fully-dead core (no heartbeat, not just-booted) IS relaunched — the
+    'session died and took its in-session crons/dailies' case (owner-requested
+    2026-07-17). Observed on the first pass, restarted after the confirm window.
+    A dead core that JUST booted is NOT touched (coming up, not gone)."""
     fails = []
     with tempfile.TemporaryDirectory() as td:
         h = Harness(Path(td) / "rec.json")
-        r = h.run(now=1_000_000, alive=False, age=5000)
+        r0 = h.run(now=1_000_000, alive=False, age=5000)     # dead → observe
+        if not r0 or r0.get("action") != "observed":
+            fails.append(f"j) first pass on a dead core should observe, got {r0}")
+        r1 = h.run(now=1_000_200, alive=False, age=5000)     # +200s > CONFIRM → relaunch
+        if not r1 or r1.get("action") != "restarted":
+            fails.append(f"j) confirmed-dead core should relaunch, got {r1}")
+        if h.restart_calls != [False]:
+            fails.append(f"j) dead relaunch should call restart once (1M), got {h.restart_calls}")
+    with tempfile.TemporaryDirectory() as td:
+        h = Harness(Path(td) / "rec.json")
+        r = h.run(now=1_000_000, alive=False, age=5000, booted=True)  # dead but just booted
         if r is not None or h.restart_calls:
-            fails.append(f"j) acted on a dead core: {r}, restarts={h.restart_calls}")
+            fails.append(f"j) a just-booted core must NOT be relaunched: {r}, {h.restart_calls}")
     return fails
 
 
@@ -383,7 +397,7 @@ def main() -> int:
         ("g", case_g_recurrence_escalates_to_standard),
         ("h", case_h_give_up_cap),
         ("i", case_i_failed_restart_does_not_burn_state),
-        ("j", case_j_core_down_no_action),
+        ("j", case_j_dead_core_relaunches),
         ("k", case_k_draining_backlog_never_restarts),
         ("l", case_l_progress_resets_long_task),
         ("m", case_m_lock_prevents_concurrent_restart),

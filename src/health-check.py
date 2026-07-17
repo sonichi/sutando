@@ -2487,9 +2487,15 @@ def notify_slack_for_failures(
 # no work is lost. 1M therefore stays the DEFAULT — we never disable it.
 #
 # Heavily guarded, because auto-restarting a 24/7 agent is consequential:
-#   - Fires only on a CONFIRMED, SUSTAINED wedge: core process alive AND the
-#     oldest queued task older than RECOVER_WEDGE_SEC AND the core didn't just
-#     boot — observed on two passes ≥ RECOVER_CONFIRM_SEC apart. Never a blip.
+#   - Fires on either (a) a CONFIRMED, SUSTAINED wedge: core process alive AND
+#     the oldest queued task older than RECOVER_WEDGE_SEC AND the core didn't
+#     just boot; or (b) a DEAD core: no fresh heartbeat AND not just-booted —
+#     the "session died and took its in-session crons/dailies" case (owner-
+#     requested 2026-07-17). Both are observed on two passes ≥ RECOVER_CONFIRM_SEC
+#     apart (never a blip) and share the cooldown + give-up cap below, so a
+#     crash-looping core can't restart-storm. (Design note: this DOES relaunch a
+#     deliberately-stopped core; the give-up cap bounds that, and an explicit
+#     "intended-down" sentinel is a possible future refinement.)
 #   - Identity + progress gating (so a legitimately long-running single task is
 #     not killed mid-work): the SAME oldest task must persist across the window
 #     (a draining queue surfaces a different oldest each pass → resets) AND
@@ -2722,17 +2728,27 @@ def recover_core_if_wedged(
         cur_key = oldest[0] if oldest else None
         oldest_age = oldest[1] if oldest else None
         status_ts = status_ts_fn()
+        alive = alive_fn()
         wedged = (
-            alive_fn()
+            alive
             and oldest is not None
             and oldest_age > RECOVER_WEDGE_SEC
             and not just_booted_fn()
         )
+        # Dead-core relaunch: a fully-dead core (no fresh heartbeat) is a
+        # DISTINCT gap from a wedge — the session exited, taking its in-session
+        # crons/dailies with it. A wedge requires the core ALIVE; a dead core
+        # just needs relaunching. It flows through the SAME confirm→cooldown→
+        # give-up→restart path below (so a crash-looping core can't storm —
+        # bounded by RECOVER_COOLDOWN_SEC + RECOVER_MAX_PER_HOUR), and the
+        # confirm window means the death must persist across a pass (not a
+        # brief mid-restart blip; `just_booted_fn()` also excludes a fresh core).
+        dead = (not alive) and (not just_booted_fn())
 
-        if not wedged:
-            # Healthy / no queued work / core down / just booted. Clear any
-            # in-progress observation so a future wedge starts fresh.
-            # last_restart / history are preserved (cooldown + give-up survive).
+        if not wedged and not dead:
+            # Healthy / just booted. Clear any in-progress observation so a
+            # future wedge/death starts fresh. last_restart / history are
+            # preserved (cooldown + give-up survive).
             if state.get("wedge_first_seen") or state.get("wedge_task") is not None:
                 _reset_observation()
                 _save()
@@ -2773,10 +2789,12 @@ def recover_core_if_wedged(
             # DM once per give-up episode. Record gave_up_at only on a SUCCESSFUL
             # send so a Slack outage doesn't silence the give-up alert for an hour.
             if not state.get("gave_up_at") or now - state["gave_up_at"] > 3600:
+                _stuck = f" (oldest task stuck {oldest_age // 60} min)" if oldest_age is not None else ""
+                _what = "still wedged" if alive else "still down"
                 if send(
                     ":octagonal_sign: *Sutando core auto-recovery gave up* — restarted "
-                    f"{len(history)}× in the last hour and the core is still wedged "
-                    f"(oldest task stuck {oldest_age // 60} min). Needs manual attention: "
+                    f"{len(history)}× in the last hour and the core is {_what}"
+                    f"{_stuck}. Needs manual attention: "
                     "check the CLI / `/usage-credits`."
                 ):
                     state["gave_up_at"] = now
@@ -2798,11 +2816,18 @@ def recover_core_if_wedged(
         # DM fails we still restart (recovery > notification — don't leave the
         # core wedged because Slack is down), but we record dm_sent=False and log
         # to stderr/launchd so the restart is never invisible.
-        dm_ok = send(
-            f":hourglass: *Sutando core wedged* — oldest task stuck {oldest_age // 60} min "
-            f"while the core process is alive (likely the 1M usage-credit gate or a "
-            f"stalled turn). Auto-restarting {ctx_note}. Queued tasks are preserved."
-        )
+        if dead:
+            dm_ok = send(
+                ":skull: *Sutando core is down* — no heartbeat (the session exited, "
+                "taking its in-session crons/dailies). Auto-relaunching "
+                f"{ctx_note}. Queued tasks are preserved."
+            )
+        else:
+            dm_ok = send(
+                f":hourglass: *Sutando core wedged* — oldest task stuck {oldest_age // 60} min "
+                f"while the core process is alive (likely the 1M usage-credit gate or a "
+                f"stalled turn). Auto-restarting {ctx_note}. Queued tasks are preserved."
+            )
         if not dm_ok:
             print(f"[recover-core] WARNING: wedge-restart DM failed; restarting anyway (mode={mode})", flush=True)
 
