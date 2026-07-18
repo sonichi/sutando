@@ -1,0 +1,11 @@
+{
+  "name": "email-find",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "Locate a specific email when the obvious searches fail. Use when the user is confident an email exists but a targeted query returned nothing.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}

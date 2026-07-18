@@ -10,6 +10,35 @@
 
 set -euo pipefail
 
+# Ensure `node` is on PATH. npx/tsx are launched by absolute path below, but
+# they re-exec `node` via `#!/usr/bin/env node`, so the node install dir must be
+# on PATH or the job dies with exit 127 ("env: node: No such file or directory").
+# launchd's plist PATH is a fixed guess (often /opt/homebrew/bin on Apple Silicon)
+# and won't match an Intel-Homebrew (/usr/local/bin) or version-manager install —
+# so heal it here rather than depend on the plist being right for every machine.
+#
+# Resolve exactly ONE node dir, first match wins, in the same priority order (and
+# with the same NEWEST-nvm selection) as resolve_npx/resolve_tsx below. The nvm
+# candidate MUST use `sort -V | tail -1`, NOT a `*/bin` glob: glob order is
+# lexicographic, so with prepend-then-continue a box with v9 + v10 would pick v9
+# (`'1' < '9'` sorts v10 first, v9 last-wins) — an older node, not the latest.
+# REPO_ROOT is resolved HERE (before the loop) so the app-bundle node dir is
+# CONFIG-RESOLVED via sutando-config.sh app-node-dir (honors $SUTANDO_APP_NODE_DIR)
+# on the supervised launchd path too — not just src/startup.sh (Codex #2154).
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+for _node_cand in \
+    /opt/homebrew/bin/node \
+    /usr/local/bin/node \
+    "$HOME/.nvm/versions/node/$(ls "$HOME/.nvm/versions/node/" 2>/dev/null | sort -V | tail -1)/bin/node" \
+    "$HOME/.volta/bin/node" \
+    "$(bash "$REPO_ROOT/scripts/sutando-config.sh" app-node-dir)/node"
+do
+    [ -x "$_node_cand" ] || continue
+    _node_dir="$(dirname "$_node_cand")"
+    case ":$PATH:" in *":$_node_dir:"*) ;; *) PATH="$_node_dir:$PATH"; export PATH ;; esac
+    break   # first (highest-priority) node wins — don't stack multiple node dirs
+done
+
 # Resolve the credential-proxy script path. Prefer THIS checkout's copy (the
 # repo the plist points at, i.e. the same clone as the core/dashboard) so the
 # proxy resolves the same workspace and quota-state.json isn't written to a
@@ -17,10 +46,10 @@ set -euo pipefail
 # Fall back to the claude-home copy for setups where this checkout lacks the
 # skill. launchd doesn't inherit shell env, so claude-home defaults to ~/.claude
 # unless the plist's EnvironmentVariables sets $CLAUDE_CONFIG_DIR.
-_REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-PROXY_SCRIPT="$_REPO_ROOT/skills/quota-tracker/scripts/credential-proxy.ts"
+# (REPO_ROOT is resolved above, before the node-candidate loop.)
+PROXY_SCRIPT="$REPO_ROOT/skills/quota-tracker/scripts/credential-proxy.ts"
 if [ ! -f "$PROXY_SCRIPT" ]; then
-    PROXY_SCRIPT="$(bash "$_REPO_ROOT/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
+    PROXY_SCRIPT="$(bash "$REPO_ROOT/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
 fi
 
 # Resolve npx — launchd doesn't inherit the user's shell PATH.
@@ -37,15 +66,16 @@ resolve_npx() {
 }
 
 # Resolve tsx — prefer direct binary to avoid npx overhead on restart paths.
+# The repo's own node_modules/.bin/tsx comes FIRST: it's the version the repo
+# pins, and it's the only tsx on a host with no homebrew/nvm/volta node at all
+# (the app-bundle runtime ships bare `node` — the PATH heal above covers the
+# `#!/usr/bin/env node` re-exec).
 resolve_tsx() {
-    for p in \
-        /opt/homebrew/bin/tsx \
-        /usr/local/bin/tsx \
-        "$HOME/.nvm/versions/node/$(ls "$HOME/.nvm/versions/node/" 2>/dev/null | sort -V | tail -1)/bin/tsx" \
-        "$HOME/.volta/bin/tsx"
-    do
-        [ -x "$p" ] && { echo "$p"; return; }
-    done
+    # Single source of truth: scripts/sutando-config.sh tsx-bin (repo-pinned
+    # node_modules/.bin/tsx first, then global locations). Prints the path or
+    # nothing; return 1 on empty lets the caller fall through to `npx tsx`.
+    _tsx="$(bash "$REPO_ROOT/scripts/sutando-config.sh" tsx-bin 2>/dev/null)"
+    [ -n "$_tsx" ] && { echo "$_tsx"; return 0; }
     return 1  # fall through to npx tsx
 }
 

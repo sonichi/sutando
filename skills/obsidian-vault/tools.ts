@@ -121,7 +121,8 @@ const addToVaultTool: ToolDefinition = {
         'kind="note" writes a standalone markdown file (give it a title if obvious from the body). ' +
         'kind="task" appends a checkbox to Sutando/Tasks.md. ' +
         'kind="thought" appends a timestamped block to today\'s thoughts file (Sutando/Thoughts/YYYY-MM-DD.md) — use when the user wants to record an idea or reflection rather than a deliverable. ' +
-        'If the user does not specify, prefer "thought" for stream-of-consciousness, "task" if action-shaped (verb-leading or contains "I need to" / "remind me to"), "note" for everything else.',
+        'If the user does not specify, prefer "thought" for stream-of-consciousness, "task" if action-shaped (verb-leading or contains "I need to" / "remind me to"), "note" for everything else. ' +
+        'Call this ONLY on an explicit capture request. A request to summarize, explain, or answer something is NOT a capture — do that instead. NEVER call it on filler, garbled speech, or as a guess when unsure; fire nothing instead.',
     execution: 'inline',
     parameters: z.object({
         kind: z

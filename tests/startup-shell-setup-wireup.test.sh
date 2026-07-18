@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Tests for the src/startup.sh wire-up of scripts/sutando-shell-setup.sh
+# Tests for the src/startup.sh wire-up of src/agent/claude/cli/sutando-shell-setup.sh
 #
-# The wire-up is intentionally minimal (3 lines, src/startup.sh:210-212):
+# The wire-up is intentionally minimal (3 lines in src/startup.sh):
 #
-#   if [ -x "$REPO/scripts/sutando-shell-setup.sh" ]; then
-#     bash "$REPO/scripts/sutando-shell-setup.sh" --auto || true
+#   if [ -x "$REPO/src/agent/claude/cli/sutando-shell-setup.sh" ]; then
+#     bash "$REPO/src/agent/claude/cli/sutando-shell-setup.sh" --auto || true
 #   fi
 #
 # These tests cover three branches:
@@ -43,25 +43,25 @@ run_test() {
 make_driver_with_stub_helper() {
   local exit_code="$1"      # exit code the stub helper should return ('absent' to skip creating it)
   TEST_TMP="$(mktemp -d -t startup-shell-setup-wireup.XXXXXX)"
-  mkdir -p "$TEST_TMP/scripts"
+  mkdir -p "$TEST_TMP/src/agent/claude/cli"
 
   if [ "$exit_code" != "absent" ]; then
-    cat > "$TEST_TMP/scripts/sutando-shell-setup.sh" << EOF
+    cat > "$TEST_TMP/src/agent/claude/cli/sutando-shell-setup.sh" << EOF
 #!/usr/bin/env bash
 exit $exit_code
 EOF
-    chmod +x "$TEST_TMP/scripts/sutando-shell-setup.sh"
+    chmod +x "$TEST_TMP/src/agent/claude/cli/sutando-shell-setup.sh"
   fi
 
   cat > "$TEST_TMP/driver.sh" << 'EOF'
 #!/usr/bin/env bash
-# Mirror of src/startup.sh:210-212 wire-up block.
+# Mirror of src/startup.sh's sutando-shell-setup wire-up block.
 REPO="$1"
 SENTINEL="$2"
 
 # This is the exact block from startup.sh — keep these 3 lines in sync.
-if [ -x "$REPO/scripts/sutando-shell-setup.sh" ]; then
-  bash "$REPO/scripts/sutando-shell-setup.sh" --auto || true
+if [ -x "$REPO/src/agent/claude/cli/sutando-shell-setup.sh" ]; then
+  bash "$REPO/src/agent/claude/cli/sutando-shell-setup.sh" --auto || true
 fi
 
 # If startup.sh continues past the wire-up, we'd reach here.

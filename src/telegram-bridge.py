@@ -16,11 +16,21 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import sys
 import time
 import urllib.request
 import urllib.error
 from pathlib import Path
+
+# startup.sh redirects stdout to a log file, which makes CPython block-buffer
+# it — diagnostic prints (e.g. api()'s "API error ..." lines) sit invisible in
+# the buffer for hours, and SIGTERM kills the process without flushing, losing
+# them entirely. Both silent-wedge incidents (2026-06-15 TLS, 2026-07-05 stale
+# heartbeat) had empty logs for exactly this reason. Line-buffer so every
+# print lands in the log as it happens.
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
 
 # Vision-frame helper — pushes the latest photo into the active voice session
 # so Gemini can react in-stream. No-op when voice isn't connected. Import is
@@ -40,6 +50,7 @@ try:
 except Exception:  # pragma: no cover — best-effort telemetry
     def _emit_channel(*_a, **_k):  # type: ignore
         return None
+import local_task_protocol  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path  # noqa: E402
@@ -99,7 +110,14 @@ except ImportError:
 # session silently override the freshly-rotated value, same bug class as
 # skills/x-twitter/x-post.py (see PR #416 commit message for full context).
 channels_env = claude_home_path("channels", "telegram", ".env")
-if channels_env.exists():
+if channels_env.exists():  # pragma: no cover — telegram import path not driven by the perms test
+    try:
+        os.chmod(channels_env, 0o600)  # token file — enforce owner-only, mirrors access.json treatment
+    except OSError as e:
+        # Best-effort hardening: a read-only volume, wrong ownership after a
+        # restore/sync, or an ACL-restricted file must NOT crash the bridge at
+        # startup — the file may still be perfectly readable. Warn and continue.
+        print(f"  [startup] warning: could not chmod 0600 {channels_env}: {e}", flush=True)
     for line in channels_env.read_text().splitlines():
         if "=" in line and not line.startswith("#"):
             k, v = line.split("=", 1)
@@ -165,7 +183,7 @@ def extract_forward_note(msg: dict) -> str:
     return ""
 
 
-def write_owner_activity(channel: str, summary: str) -> None:
+def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
     """Record owner activity — see src/discord-bridge.py for schema."""
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -174,6 +192,8 @@ def write_owner_activity(channel: str, summary: str) -> None:
             "channel": channel,
             "summary": summary[:80],
         }
+        if channel_id:
+            payload["channel_id"] = str(channel_id)
         tmp = OWNER_ACTIVITY_FILE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload))
         tmp.rename(OWNER_ACTIVITY_FILE)
@@ -226,6 +246,14 @@ def presenter_mode_active():
 
 # Load access config
 ACCESS_FILE = channel_access_path("telegram")
+
+# TOFU enrollment code — set at startup when access.json doesn't exist.
+# The first DM must include this code to become owner. RETAINED for the
+# whole process lifetime (never cleared) so the gate stays armed if
+# access.json is deleted externally later (#899). None only when
+# access.json already existed at startup (bridge already enrolled).
+_TOFU_ENROLLMENT_CODE: str | None = None
+
 def load_allowed():
     """Return the set of allowed sender IDs, OR None if access.json doesn't exist.
 
@@ -331,7 +359,7 @@ def _transcribe_via_skill(local_path: str) -> str | None:
     Errors are swallowed; transcription failure must never block task delivery.
     """
     import subprocess
-    skill_script = Path(__file__).parent.parent / "skills" / "audio-transcribe" / "scripts" / "transcribe.py"
+    skill_script = Path(os.path.realpath(__file__)).parent.parent / "skills" / "audio-transcribe" / "scripts" / "transcribe.py"
     if not skill_script.exists():
         return None
     try:
@@ -586,12 +614,30 @@ def poll_progress(pending_replies: dict) -> None:
             pending_task_tiers.pop(tid, None)
 
 
-def main():
+def main():  # pragma: no cover
+    global _TOFU_ENROLLMENT_CODE
     _single_instance_acquire("telegram-bridge")
     print(f"Telegram bridge started. Polling for messages...", flush=True)
     # Restart-safety: sweep orphan `.sending` files before the poll
     # loop starts. See _recover_orphan_sending_files for rationale.
     _recover_orphan_sending_files()
+
+    # TOFU enrollment code: generated when access.json doesn't exist so
+    # the first DM must present it before being auto-enrolled as owner.
+    # Prevents an attacker who can DM the bot from grabbing ownership before
+    # the legitimate owner does. Stays valid for the whole process lifetime
+    # (never cleared after enrollment) so the gate remains armed if access.json
+    # is deleted externally later (#899); only a restart with access.json
+    # present leaves it None (TOFU branch is then unreachable anyway).
+    if not ACCESS_FILE.exists():
+        _TOFU_ENROLLMENT_CODE = secrets.token_hex(3)  # 6-char hex, 16M combinations
+        print("", flush=True)
+        print(f"  *** TOFU enrollment required ***", flush=True)
+        print(f"  Enrollment code: {_TOFU_ENROLLMENT_CODE}", flush=True)
+        print(f"  Send this code in your first DM to register as owner.", flush=True)
+        print(f"  Anyone who sends this code first becomes owner — keep it private.", flush=True)
+        print("", flush=True)
+
     offset = None
     allowed = load_allowed()
     pending_replies = {}  # task_id -> chat_id
@@ -652,22 +698,44 @@ def main():
                 allowed = load_allowed()
                 if allowed is None:
                     # First-ever DM after install — access.json doesn't exist.
-                    # Auto-onboard this sender as the owner (TOFU).
+                    # Require the enrollment code before auto-onboarding as owner.
+                    # This prevents an attacker who can DM the bot from claiming
+                    # ownership before the legitimate owner does.
+                    if _TOFU_ENROLLMENT_CODE and _TOFU_ENROLLMENT_CODE not in (text or ""):
+                        api("sendMessage", chat_id=chat_id, text=(
+                            "Enrollment code required.\n"
+                            "Check the bridge startup log for your code and send it here."
+                        ))
+                        print(f"  TOFU: rejected enrollment from @{username} — code not presented", flush=True)
+                        continue
                     allowed = tofu_onboard(sender_id, username)
+                    # Do NOT clear _TOFU_ENROLLMENT_CODE after enrollment. If
+                    # access.json is later deleted while the bridge keeps running
+                    # (#899), load_allowed() returns None again; keeping the code
+                    # valid for the process lifetime keeps the gate armed so the
+                    # next DM must still present it, instead of falling through to
+                    # an unguarded tofu_onboard(). Single secret, single owner.
                 if sender_id not in allowed:
                     print(f"  Dropped message from non-allowed @{username}")
                     continue
 
                 # Record owner activity for status-aware-pivot
-                write_owner_activity("telegram", text)
+                write_owner_activity("telegram", text, channel_id=chat_id)
 
                 # Handle attachments (photos, documents, voice)
                 attachment_note = ""
+                # Structured refs (interaction-model 4D, step 1.5), accumulated
+                # alongside the legacy [*attached:] body line — dual-write.
+                attachment_refs: list = []  # pragma: no cover
                 if "photo" in msg:
                     file_id = msg["photo"][-1]["file_id"]  # largest size
                     local_path = download_file(file_id, "photo")
                     if local_path:
                         attachment_note = f"\n[Photo attached: {local_path}]"
+                        attachment_refs.append(local_task_protocol.AttachmentRef(  # pragma: no cover
+                            locator=local_path, mime="image/jpeg",
+                            filename=os.path.basename(local_path),
+                            size=(msg["photo"][-1].get("file_size", 0) or 0)))
                         # If voice is connected, also push the photo as a
                         # vision frame so Gemini sees it in-stream (in
                         # addition to the file-attached task pipeline).
@@ -681,10 +749,20 @@ def main():
                     local_path = download_file(file_id, fname)
                     if local_path:
                         attachment_note = f"\n[File attached: {local_path}]"
+                        attachment_refs.append(local_task_protocol.AttachmentRef(  # pragma: no cover
+                            locator=local_path,
+                            mime=(msg["document"].get("mime_type", "") or ""),
+                            filename=(fname or os.path.basename(local_path)),
+                            size=(msg["document"].get("file_size", 0) or 0)))
                 if "voice" in msg:
                     file_id = msg["voice"]["file_id"]
                     local_path = download_file(file_id, "voice.ogg")
                     if local_path:
+                        attachment_refs.append(local_task_protocol.AttachmentRef(  # pragma: no cover
+                            locator=local_path,
+                            mime=(msg["voice"].get("mime_type", "") or "audio/ogg"),
+                            filename=os.path.basename(local_path),
+                            size=(msg["voice"].get("file_size", 0) or 0)))
                         transcript = _transcribe_via_skill(local_path)
                         if transcript:
                             attachment_note = f"\n[Voice transcript: {transcript}]"
@@ -755,16 +833,26 @@ def main():
                 )
                 lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
                 step = 1
-                # CONTEXT-FIRST: reconstruct before interpreting a message that isn't
-                # self-contained. Unlike Discord, Telegram's Bot API has NO message-history
-                # fetch — so the reconstruct substrate is the embedded [Replying to …] quote
-                # (above) + the session transcript, NOT a channel pull-back. Always emitted.
+                # CONTEXT-FIRST: reconstruct before interpreting. UNCONDITIONAL as of
+                # 2026-07-13 (owner-approved): the prior form gated reconstruction on the
+                # agent judging the message "not self-contained" — but that judgment ("I
+                # already understand this") is the exact signal that fails, so the agent
+                # kept walking past the read on questions it only *felt* confident about.
+                # Removing the gate trades a little cheap re-reading for never skipping it;
+                # only a pure greeting/ack is exempt. Unlike Discord, Telegram's Bot API has
+                # NO message-history fetch — so the reconstruct substrate is the embedded
+                # [Replying to …] quote (above) + the session transcript, NOT a channel
+                # pull-back. Supersedes the self-contained-judgment form.
                 lines.append(
-                    f'{step}. CONTEXT-FIRST: if this message is not self-contained '
-                    f'(terse — "y", "no", a pronoun — a reply, or refers to something not '
-                    f'stated here), reconstruct context BEFORE interpreting. Telegram has no '
-                    f'message-history fetch, so use the embedded [Replying to …] quote above '
-                    f'plus the session transcript, and answer from that, not from memory.'
+                    f'{step}. CONTEXT-FIRST (unconditional): before interpreting this '
+                    f'message, reconstruct context and answer from it, NOT from memory. '
+                    f'Telegram has no message-history fetch, so the substrate is the '
+                    f'embedded [Replying to …] quote above plus the session transcript — '
+                    f'read them back until this message stands on its own. Do this every '
+                    f'time; do NOT skip it because the message looks self-contained or you '
+                    f'feel you already understand it — felt confidence is exactly the '
+                    f'signal that fails. The only exception is a pure greeting or '
+                    f'acknowledgement with no referent (e.g. "hi", "thanks").'
                 )
                 step += 1
                 if _notify_py.exists():
@@ -784,15 +872,23 @@ def main():
                 lines.append(f"{step}. Process transcript and write result to results/{task_id}.txt")
                 tg_skill_hints = "\n" + "\n".join(lines) + "\n"
 
+                # interaction-model 4D, step 1.5: structured media headers
+                # alongside the legacy [*attached:] body line (dual-write). Real
+                # headers after `task:`, so confine_user_content defangs a forged
+                # body copy while these authentic ones pass through.
+                media_headers = local_task_protocol.media_attachment_headers(  # pragma: no cover
+                    attachment_refs, bool(text and text.strip()))
                 task_file.write_text(
                     f"id: {task_id}\n"
                     f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
-                    f"task: {confine_user_content(f'[Telegram @{username}{forward_note}] {text}{attachment_note}{reply_note}')}\n"
                     f"source: telegram\n"
+                    f"interaction_type: message\n"
+                    f"{media_headers}"
                     f"chat_id: {chat_id}\n"
                     f"{src_line}"
                     f"{parent_line}"
                     f"priority: {priority}\n"
+                    f"task: {confine_user_content(f'[Telegram @{username}{forward_note}] {text}{attachment_note}{reply_note}')}\n"
                     f"{tg_skill_hints}"
                 )
                 pending_replies[task_id] = chat_id
@@ -807,6 +903,16 @@ def main():
                     access_tier=pending_task_tiers[task_id],
                     data={"task_id": task_id, "has_attachment": bool(attachment_note)},
                 )
+                # Anonymous, opt-out product telemetry: one bucketed event per
+                # accepted task, tagged only with the inbound surface. No-op when
+                # opted out / no key; never task content or ids. See
+                # src/telemetry.py + TELEMETRY.md.
+                try:  # pragma: no cover — fire-and-forget; logic tested in tests/telemetry.test.py
+                    from telemetry import task_processed  # sibling module (src/ on sys.path)
+
+                    task_processed("telegram")
+                except Exception:  # pragma: no cover — telemetry must never break the bridge
+                    pass
 
                 # Send typing indicator
                 api("sendChatAction", chat_id=chat_id, action="typing")
@@ -911,6 +1017,8 @@ def main():
             result_file = RESULTS_DIR / f"{task_id}.txt"
             if result_file.exists():
                 reply_text = result_file.read_text().strip()
+                if not reply_text:
+                    continue
                 chat_id = pending_replies.pop(task_id)
                 # Parse markers via the unified module (#873). Telegram
                 # honors [no-send] / [REPLIED] / [deduped: <id>] as skip,

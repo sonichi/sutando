@@ -14,46 +14,44 @@ ARGUMENTS: $ARGUMENTS
 
 ## What to gather
 
-Collect from each source (skip any that aren't configured):
+**Step 0 — Base data (canonical, always run first):**
+
+```bash
+WORKSPACE="$(bash scripts/sutando-config.sh workspace)"
+python3 src/morning-briefing.py
+```
+
+`src/morning-briefing.py` is the single source of truth for core briefing data: weather (Open-Meteo), macOS Calendar, macOS Reminders, overnight Discord DMs, pending questions, and system health. It writes output to `results/proactive-<ts>.txt` and sends a Discord DM directly. Review its output before composing the full briefing — do NOT re-fetch those sources manually.
+
+**Then augment with the following if configured (skip if not available):**
 
 1. **Email** — Run `gws gmail +triage` to get unread inbox. Summarize top 5 by priority. Flag anything urgent.
 
-2. **Calendar** — Run `gws calendar +agenda --today` (table output). If you need JSON for parsing, use `gws calendar +agenda --today --format json`. List meetings with times. For each: who's attending, what it's about. Flag any travel (flights, OOO).
+2. **GWS Calendar** — If the user uses Google Calendar (not just macOS Calendar), run `gws calendar +agenda --today`. List any meetings not already covered by the macOS Calendar output above.
 
-3. **Discord** — Read recent messages from `logs/discord-bridge.log` (tail ~100 lines). Summarize anything actionable from overnight. Reference channel ID mapping at `$SUTANDO_MEMORY_DIR/reference_discord_channels.md`. Only surface messages NOT already replied to by the bridge.
+3. **Daily insight** — Run `python3 src/daily-insight.py`. If it produces an insight, include it at the end of the briefing as "💡 Insight: ..."
 
-4. **Pending tasks** — Check `pending-questions.md` for unanswered items. Check `tasks/` for queued tasks.
-
-5. **System status** — Run `python3 src/health-check.py`. Report any issues.
-
-6. **Daily insight** — Run `python3 src/daily-insight.py`. If it produces an insight, include it at the end of the briefing as "💡 Insight: ..."
-
-7. **Friction check** — Run `python3 src/friction-detector.py`. If friction items found, include as "⚠️ Friction: [count] items need attention" with the top 3.
+4. **Friction check** — Run `python3 src/friction-detector.py`. If friction items found, include as "⚠️ Friction: [count] items need attention" with the top 3.
 
 ## How to deliver
 
-Format as a concise briefing:
+`src/morning-briefing.py` already writes `results/proactive-<ts>.txt` (spoken by voice) and sends a Discord DM for the base data. If you gathered email or insight in steps 1–4, append them as a follow-up proactive file:
 
+```bash
+echo "📧 Email: [count] unread. [summary]
+💡 Insight: [insight text]" > "$WORKSPACE/results/proactive-$(date +%s).txt"
 ```
-Good morning. Here's your briefing:
-
-📧 Email: [count] unread. [urgent summary]
-📅 Calendar: [count] meetings today. [next meeting info]
-💬 Discord: [summary of overnight activity]
-📋 Tasks: [pending items]
-🖥️ System: [health status]
-💡 Insight: [behavioral pattern from daily-insight.py, if available]
-```
-
-Deliver via:
-- Write to `results/briefing-{date}.txt` so the voice agent can speak it
-- Send via Discord DM if configured
 
 ## Scheduling
 
-To run daily, add to the proactive loop or use `/loop`:
-```
-/loop 24h /morning-briefing
+The canonical daily schedule calls the script directly (same code path):
+
+```json
+{
+  "name": "morning-briefing",
+  "cron": "57 6 * * *",
+  "prompt": "Run python3 src/morning-briefing.py to deliver the daily morning briefing (weather, calendar, reminders, overnight Discord, pending questions, health). Speak the result if voice is connected, send as Discord DM otherwise."
+}
 ```
 
-Or schedule at a specific time via cron.
+Calling `/morning-briefing` manually runs the same script plus GWS/insight augmentation.

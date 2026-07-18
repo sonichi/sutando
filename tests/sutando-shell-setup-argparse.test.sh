@@ -21,7 +21,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
-SETUP="$REPO/scripts/sutando-shell-setup.sh"
+SETUP="$REPO/src/agent/claude/cli/sutando-shell-setup.sh"
 
 pass=0
 fail=0
@@ -274,7 +274,7 @@ for excl in "shell-snapshots/" "history.jsonl" "file-history/"; do
   if printf '%s' "$filters_block" | grep -qF -- "--exclude='$excl'"; then
     assert_pass "exclude '$excl' present in RSYNC_FILTERS"
   else
-    assert_fail "exclude '$excl' missing from RSYNC_FILTERS" "see scripts/sutando-shell-setup.sh"
+    assert_fail "exclude '$excl' missing from RSYNC_FILTERS" "see src/agent/claude/cli/sutando-shell-setup.sh"
   fi
 done
 
