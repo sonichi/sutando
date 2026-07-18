@@ -39,6 +39,7 @@ import mimetypes
 import os
 import re
 import secrets
+import shutil
 import sys
 import threading
 import time
@@ -389,7 +390,7 @@ def _download_slack_file(file_dict: dict) -> str | None:
             url, headers={"Authorization": f"Bearer {BOT_TOKEN}"}
         )
         with urllib.request.urlopen(req, timeout=30) as resp, open(local_path, "wb") as f:
-            f.write(resp.read())
+            shutil.copyfileobj(resp, f)
         return str(local_path)
     except Exception as e:
         print(f"  [file] download failed for {name_hint}: {e}", flush=True)
