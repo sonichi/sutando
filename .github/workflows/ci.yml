@@ -54,7 +54,7 @@ jobs:
       # was pure indirection. Must run BEFORE `npm test`: the `test` script chains
       # `npm run test:py`, so Python tests execute inside the "Run tests" step.
       - name: Install Python test deps
-        run: python3 -m pip install 'detect-secrets>=1.5.0'
+        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3'
 
       - name: Typecheck
         run: npm run typecheck
