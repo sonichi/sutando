@@ -635,8 +635,32 @@ reap_wedged_listener() {
 if [ "${SKIP_VOICE:-}" = "1" ]; then
   echo "  ~ voice agent (disabled — no Gemini voice key)"
 else
+  # If a launchd job owns this service, delegate to launchd so the two managers
+  # don't fight over port 9900 (issue #1888 bug 2 — duplicate listeners when
+  # launchd respawns while startup.sh's direct process still holds the port).
+  #
+  # reap_wedged_listener runs BEFORE the launchd ownership check intentionally:
+  # KeepAlive only triggers on process exit, not on hang. A hung process can hold
+  # the port indefinitely — reaping it first frees the port so the subsequent
+  # kickstart (or launchd's own respawn on exit) gets a clean bind.
   reap_wedged_listener 9900 voice-agent
-  if ! lsof -i :9900 > /dev/null 2>&1; then
+  if launchctl print "gui/$(id -u)/com.sutando.voice-agent" > /dev/null 2>&1; then
+    if ! lsof -i :9900 > /dev/null 2>&1; then
+      launchctl kickstart "gui/$(id -u)/com.sutando.voice-agent" > /dev/null 2>&1 || true
+      # Poll up to 5s — kickstart is known to silently no-op (restart-voice-agent.sh §4)
+      _va_waited=0
+      while [ "$_va_waited" -lt 5 ] && ! lsof -i :9900 > /dev/null 2>&1; do
+        sleep 1; _va_waited=$(( _va_waited + 1 ))
+      done
+      if lsof -i :9900 > /dev/null 2>&1; then
+        echo "  ✓ voice agent (launchd-supervised)"
+      else
+        echo "  ⚠ voice agent (launchd kickstart issued — port 9900 not yet bound)"
+      fi
+    else
+      echo "  ✓ voice agent (launchd-supervised)"
+    fi
+  elif ! lsof -i :9900 > /dev/null 2>&1; then
     echo "  Starting voice agent (port 9900)..."
     run_tsx src/voice-agent.ts > "$LOGS_DIR/voice-agent.log" 2>&1 &
     echo "  ✓ voice agent"
@@ -659,7 +683,24 @@ echo "  ✓ call-tiers advertisement (re-emit 60s)"
 # 2. Web client (port 8080 by default; CLIENT_PORT may avoid a local conflict)
 WEB_CLIENT_PORT="${CLIENT_PORT:-8080}"
 reap_wedged_listener "$WEB_CLIENT_PORT" web-client
-if ! lsof -i :"$WEB_CLIENT_PORT" > /dev/null 2>&1; then
+# Same launchd-deconflict guard as voice-agent above for the launchd-owned
+# default port. A custom CLIENT_PORT remains a directly managed opt-in.
+if [ "$WEB_CLIENT_PORT" = "8080" ] && launchctl print "gui/$(id -u)/com.sutando.web-client" > /dev/null 2>&1; then
+  if ! lsof -i :"$WEB_CLIENT_PORT" > /dev/null 2>&1; then
+    launchctl kickstart "gui/$(id -u)/com.sutando.web-client" > /dev/null 2>&1 || true
+    _wc_waited=0
+    while [ "$_wc_waited" -lt 5 ] && ! lsof -i :"$WEB_CLIENT_PORT" > /dev/null 2>&1; do
+      sleep 1; _wc_waited=$(( _wc_waited + 1 ))
+    done
+    if lsof -i :"$WEB_CLIENT_PORT" > /dev/null 2>&1; then
+      echo "  ✓ web client (launchd-supervised)"
+    else
+      echo "  ⚠ web client (launchd kickstart issued — port $WEB_CLIENT_PORT not yet bound)"
+    fi
+  else
+    echo "  ✓ web client (launchd-supervised)"
+  fi
+elif ! lsof -i :"$WEB_CLIENT_PORT" > /dev/null 2>&1; then
   echo "  Starting web client (port $WEB_CLIENT_PORT)..."
   run_tsx src/web-client.ts > "$LOGS_DIR/web-client.log" 2>&1 &
   echo "  ✓ web client"
