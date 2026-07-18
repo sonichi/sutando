@@ -19,7 +19,7 @@ Each entry has:
 - `prompt` — the prompt to run (direct text)
 - `prompt_skill` — OR a skill to invoke (e.g. "morning-briefing" → `/morning-briefing`)
 - `loop` (optional, value `"dynamic"`) — declares a **dynamic (self-pacing) loop** using the built-in `/loop` primitive. An entry with **no interval** (no `cron` field) + `loop: "dynamic"` is run by schedule-crons as `/loop` *without an interval* (see step 3) — which is exactly the built-in adaptive mode: the loop self-paces via ScheduleWakeup, deciding each next delay by its own judgment. Optional `loop_hint` (free text) guides that pacing (e.g. "~10 min when owner active, ~40 min quiet"). **Durable** because schedule-crons re-launches it every boot; **adaptive** because that's what `/loop`-no-interval already is. No min/max/signal schema and no custom gate — the built-in does the pacing. Example: `{name:"inbox-score", prompt_skill:"inbox-score", loop:"dynamic", loop_hint:"…"}`.
-- `execution` (optional, value `"codex-task"`) — opt this entry into the durable OS-backed Codex runner instead of session cron registration. Codex entries may also set `timezone` (IANA name, default `America/Los_Angeles`), `delivery: "proactive"`, `retry_minutes` (default 15), and `max_attempts` (default 3). Only explicitly opted-in entries are handled, so Claude session crons are never duplicated.
+- `execution` (optional, value `"codex-task"`) — opt this entry into the durable OS-backed Codex runner instead of session cron registration. Codex entries may also set `timezone` (IANA name, default `America/Los_Angeles`), `delivery: "proactive"`, `retry_minutes` (default 15), `max_attempts` (default 3), and `active_stale_minutes` (default 60). Only explicitly opted-in entries are handled, so Claude session crons are never duplicated.
 
 ### Durable Codex schedules
 
@@ -30,7 +30,7 @@ python3 skills/schedule-crons/scripts/codex-scheduler.py install
 python3 skills/schedule-crons/scripts/codex-scheduler.py health
 ```
 
-The runner calculates cron slots in each job's declared timezone, catches up the newest missed slot after sleep, atomically enqueues a deterministic task ID, retries that same task ID when its result is overdue, and writes durable run state to `<workspace>/state/schedules/codex-scheduler.json`. Exhausted retries produce a `proactive-schedule-alert-*.txt` result. `health` exits non-zero for a stale scheduler heartbeat or a latest-run failure.
+The runner calculates cron slots in each job's declared timezone, catches up the newest missed slot after sleep, atomically enqueues a deterministic task ID, and uses distinct attempt IDs when an inactive task needs retrying. A queued, claimed, or processed attempt is never duplicated; if it remains active past `active_stale_minutes`, the run fails with a proactive alert so the schedule cannot stall forever. Durable run state lives at `<workspace>/state/schedules/codex-scheduler.json`. Exhausted retries produce a `proactive-schedule-alert-*.txt` result. `health` exits non-zero for a stale scheduler heartbeat or a latest-run failure.
 
 ## On Activation
 

@@ -165,6 +165,26 @@ def test_failure_alert_and_health():
         assert code == 1 and "latest run failed" in report["problems"][0]
 
 
+def test_stale_active_task_fails_instead_of_stalling_or_duplicating():
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        config(ws, active_stale_minutes=10)
+        scheduler.tick(ws, "test-host", at(6, 0))
+        task = next((ws / "tasks").glob("*.txt"))
+        claimed = task.with_name(f"{task.stem}.claimed-core-1.txt")
+        task.rename(claimed)
+
+        assert scheduler.tick(ws, "test-host", at(6, 9))["events"] == []
+        failed = scheduler.tick(ws, "test-host", at(6, 10))
+        assert failed["events"] == [{"job": "daily-news", "event": "failed"}]
+        assert list((ws / "tasks").glob("*.txt")) == [claimed]
+        alerts = list((ws / "results").glob("proactive-schedule-alert-*.txt"))
+        assert len(alerts) == 1
+        assert "refusing duplicate retry" in alerts[0].read_text()
+        state = json.loads((ws / "state" / "schedules" / "codex-scheduler.json").read_text())
+        assert state["jobs"]["daily-news"]["current"] is None
+
+
 def test_wake_catchup_and_timezone():
     with tempfile.TemporaryDirectory() as td:
         ws = Path(td)
@@ -268,6 +288,7 @@ def main():
         test_helpers_and_config_validation,
         test_enqueue_retry_complete_and_no_duplicate,
         test_failure_alert_and_health,
+        test_stale_active_task_fails_instead_of_stalling_or_duplicating,
         test_wake_catchup_and_timezone,
         test_prompt_cannot_forge_task_headers,
         test_install_plist,

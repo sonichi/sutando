@@ -15,3 +15,7 @@ configure_startup_runtime() {
     unset SKIP_VOICE
   fi
 }
+
+phone_stack_enabled() {
+  [ "${SKIP_PHONE:-}" != "1" ] && [ "${SKIP_VOICE:-}" != "1" ]
+}

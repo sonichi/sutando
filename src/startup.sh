@@ -962,9 +962,11 @@ else
   echo "  ~ slack bridge (no token — optional)"
 fi
 
-# 8. Phone conversation server + ngrok (optional — needs Twilio creds, skip with SKIP_PHONE=1)
+# 8. Phone conversation server + ngrok (optional — needs Twilio + Gemini credentials)
 if [ "${SKIP_PHONE:-}" = "1" ]; then
   echo "  ~ conversation server (skipped via SKIP_PHONE)"
+elif ! phone_stack_enabled; then
+  echo "  ~ conversation server (disabled — no Gemini voice key)"
 # Anchored + non-empty value: the unanchored substring form also matched the
 # commented template placeholder (`# TWILIO_ACCOUNT_SID=ACxxxxxxxxx`), starting
 # conversation-server and a PUBLIC ngrok tunnel on hosts with no Twilio at all.
@@ -1026,7 +1028,7 @@ VERIFY_PORTS="$WEB_CLIENT_PORT:web-client 7844:dashboard 7843:agent-api 7845:scr
 if [ "${SKIP_VOICE:-}" != "1" ]; then
   VERIFY_PORTS="9900:voice-agent $VERIFY_PORTS"
 fi
-if [ "${SKIP_PHONE:-}" != "1" ] && grep -q "TWILIO_ACCOUNT_SID=" .env 2>/dev/null; then
+if phone_stack_enabled && grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; then
   VERIFY_PORTS="$VERIFY_PORTS 3100:conversation-server"
 fi
 if [ "${SUTANDO_OBS_COLLECTOR:-}" = "1" ]; then

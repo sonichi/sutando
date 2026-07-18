@@ -32,6 +32,7 @@ STATE_VERSION = 1
 DEFAULT_TIMEZONE = "America/Los_Angeles"
 DEFAULT_RETRY_MINUTES = 15
 DEFAULT_MAX_ATTEMPTS = 3
+DEFAULT_ACTIVE_STALE_MINUTES = 60
 MAX_CATCHUP_MINUTES = 7 * 24 * 60
 
 
@@ -317,6 +318,10 @@ def tick(workspace: Path, host_label: str, now: datetime | None = None) -> dict[
             current = job_state.get("current")
             retry_minutes = max(1, int(job.get("retry_minutes", DEFAULT_RETRY_MINUTES)))
             max_attempts = max(1, int(job.get("max_attempts", DEFAULT_MAX_ATTEMPTS)))
+            active_stale_minutes = max(
+                retry_minutes,
+                int(job.get("active_stale_minutes", DEFAULT_ACTIVE_STALE_MINUTES)),
+            )
 
             if current:
                 task_ids = _current_task_ids(current)
@@ -331,10 +336,26 @@ def tick(workspace: Path, host_label: str, now: datetime | None = None) -> dict[
                 else:
                     last_enqueue = parse_iso(current.get("last_enqueue_at")) or now
                     age = (now - last_enqueue).total_seconds()
+                    active = _task_is_active(workspace, task_ids)
+                    active_stale = active and age >= active_stale_minutes * 60
                     # Never create a second watcher event while any prior attempt
                     # remains queued, claimed, or processed. Retrying a live task
-                    # can duplicate irreversible side effects.
-                    if age >= retry_minutes * 60 and not _task_is_active(workspace, task_ids):
+                    # can duplicate irreversible side effects. An attempt cannot
+                    # block its schedule forever, though: after the active ceiling,
+                    # fail and alert instead of launching an ambiguous duplicate.
+                    if active_stale:
+                        message = (
+                            f"task still active after {active_stale_minutes} minutes; "
+                            f"refusing duplicate retry for {current['task_id']}"
+                        )
+                        alert_path = _alert(workspace, name, message, now)
+                        job_state["last_failure_at"] = iso(now)
+                        job_state["last_failure"] = message
+                        job_state["last_alert"] = str(alert_path)
+                        job_state["current"] = None
+                        current = None
+                        events.append({"job": name, "event": "failed"})
+                    elif age >= retry_minutes * 60 and not active:
                         if int(current.get("attempts", 1)) < max_attempts:
                             slot = parse_iso(current["slot"])
                             assert slot is not None

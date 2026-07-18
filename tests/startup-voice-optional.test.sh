@@ -32,6 +32,19 @@ if grep -q 'voice agent disabled' <<<"$with_voice_key"; then
   exit 1
 fi
 
+# The phone stack shares the Gemini voice session and must stay down when
+# credential-free startup sets SKIP_VOICE, even if Twilio is configured.
+phone_gate="$(env -i PATH="/usr/bin:/bin" bash -c '
+  source "$1/src/startup-runtime.sh"
+  SKIP_PHONE=0 SKIP_VOICE=1
+  if phone_stack_enabled; then echo enabled; else echo disabled; fi
+  SKIP_VOICE=0
+  if phone_stack_enabled; then echo enabled; else echo disabled; fi
+' _ "$REPO")"
+grep -qx $'disabled\nenabled' <<<"$phone_gate"
+grep -q '^elif ! phone_stack_enabled; then$' "$REPO/src/startup.sh"
+grep -q '^if phone_stack_enabled && grep -qE ' "$REPO/src/startup.sh"
+
 # Exercise verify-setup rather than inspecting its source. Stub only external
 # prerequisites; the actual verifier resolves the selected runtime and auth.
 BIN="$TMP/bin"
