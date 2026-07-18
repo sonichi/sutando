@@ -51,12 +51,15 @@ _LOCAL_FILENAME = "sutando.config.local.json"
 # lenient (warn-only) so users with experimental or scratch keys don't
 # break. Per Mini's review #8 on PR #1395.
 _KNOWN_TOP_LEVEL_KEYS = {
+    "core",
     "workspace",
     "claude_sutando_config_dir",
     "core_config_dirs",
     "vault",
     "migrate",
 }
+
+_SUPPORTED_CORE_RUNTIMES = {"claude", "codex"}
 
 
 def _find_repo_root(start: Optional[Path] = None) -> Optional[Path]:
@@ -292,7 +295,9 @@ def resolve_workspace(repo_root: Optional[Path] = None) -> Path:
 
     Order (v0.8 — `$SUTANDO_WORKSPACE` env override removed):
       1. `sutando.config.{json,local.json}` → `workspace.path` (deep-merged).
-      2. `{repo_root}/workspace` baked-in default.
+      2. `$SUTANDO_DEFAULT_WORKSPACE` — an optional full workspace path an
+         embedder may set (fills the default slot, below explicit config).
+      3. `{repo_root}/workspace` baked-in default.
 
     Does NOT create the directory; the caller decides. Returns an absolute
     `Path`.
@@ -340,8 +345,15 @@ def resolve_workspace(repo_root: Optional[Path] = None) -> Path:
     cfg = load_config(repo_root)
     root = repo_root or _CACHE_REPO_ROOT
     cfg_path = (cfg.get("workspace") or {}).get("path")
+    # Optional embedder-provided default workspace. An embedder (e.g. the AG2
+    # Space desktop app, whose `{repo_root}` is a read-only .app bundle) passes
+    # the FULL workspace path it wants; OSS stays agnostic to how it was derived.
+    # Fills the default slot only — an explicit `workspace.path` config wins.
+    embedder_default = os.environ.get("SUTANDO_DEFAULT_WORKSPACE", "").strip()
     if cfg_path:
         resolved = Path(cfg_path).expanduser().resolve()
+    elif embedder_default:
+        resolved = Path(embedder_default).expanduser().resolve()
     elif root is None:
         # No config and no repo root — last-ditch fallback for ad-hoc invocations
         # outside a checkout. Post-v0.8 (#1440 + Mini opinion-requested 2026-06-06),
@@ -403,6 +415,51 @@ def resolve_vault(repo_root: Optional[Path] = None) -> Dict[str, Any]:
     return vault
 
 
+def resolve_dotenv(repo_root: Optional[Path] = None,
+                   workspace: Optional[Path] = None) -> Path:
+    """Resolve the `.env` path through the canonical 2-tier fallback.
+
+    Order (first that exists wins):
+      1. `<repo_root>/.env`   — the startup.sh default (source root).
+      2. `<workspace>/.env`   — the workspace contract fallback (#1871).
+
+    Returns a `Path` always; when neither exists, returns tier 1 (the expected
+    primary) so error messages name the primary location, not a fallback.
+
+    NOTE: a third tier (the Sutando.app bundle's durable user-clone .env, #1973)
+    is deliberately NOT here — that path depends on the unresolved question of
+    whether the app-bundle install location is supported (owner-gated,
+    2026-07-15). It's tracked separately in #1973; add it here once decided.
+    """
+    repo = repo_root or _find_repo_root() or Path.cwd()
+    primary = repo / ".env"
+    if primary.exists():
+        return primary
+    ws = workspace or resolve_workspace(repo_root)
+    ws_env = ws / ".env"
+    if ws_env.exists():
+        return ws_env
+    return primary
+
+
+def resolve_core_runtime(repo_root: Optional[Path] = None) -> str:
+    """Return the selected persistent core CLI runtime.
+
+    ``SUTANDO_CORE_RUNTIME`` is an invocation-scoped launcher override.
+    Otherwise ``core.runtime`` is read from merged config. Claude remains the
+    default so upgrading does not change existing installations.
+    """
+    core = load_config(repo_root).get("core") or {}
+    configured = str(core.get("runtime") or "claude").strip()
+    runtime = os.environ.get("SUTANDO_CORE_RUNTIME", "").strip() or configured
+    if runtime not in _SUPPORTED_CORE_RUNTIMES:
+        supported = ", ".join(sorted(_SUPPORTED_CORE_RUNTIMES))
+        raise ValueError(
+            f"sutando config: unsupported core.runtime={runtime!r}; expected one of: {supported}"
+        )
+    return runtime
+
+
 _DEFAULT_CLAUDE_SUTANDO_SUBDIR = ".claude-sutando"
 
 
@@ -426,7 +483,7 @@ def resolve_claude_sutando_config_dir(repo_root: Optional[Path] = None) -> Path:
     `/tmp/...` doesn't become `/private/tmp/...` from a stray `.resolve()`).
 
     Does NOT create the directory; callers (e.g.
-    `scripts/sutando-shell-setup.sh`) are responsible for mkdir as part of the
+    `src/agent/claude/cli/sutando-shell-setup.sh`) are responsible for mkdir as part of the
     alias-setup flow.
     """
     global _LEGACY_CLAUDE_SUBDIR_WARN_PRINTED

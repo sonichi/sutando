@@ -1641,7 +1641,9 @@ commit_main() {
     # Skipped on phase-2 delete-only runs (DELETE_SOURCE=1 with $ROLLBACK_ID
     # set means the copy walk was already done in an earlier pass).
     if [ "$NO_CLAUDE_IMPORT" = "0" ] && [ "$DELETE_SOURCE" = "0" ]; then
-        local _import_script="$(dirname "$0")/sutando-shell-setup.sh"
+        # sutando-shell-setup.sh moved to src/agent/claude/ — anchor off
+        # SCRIPT_DIR (= scripts/) rather than as a sibling of this migrate script.
+        local _import_script="$SCRIPT_DIR/../src/agent/claude/cli/sutando-shell-setup.sh"
         if [ -x "$_import_script" ] || [ -f "$_import_script" ]; then
             echo
             echo "sutando-migrate: invoking sutando-shell-setup.sh --import to copy Claude memory ..."
@@ -1653,10 +1655,10 @@ commit_main() {
                 # workspace migration completed successfully; the user can
                 # re-run `--import` manually. Surface the failure so they know
                 # to address it.
-                echo "  Claude memory import: FAILED (rc=$_rc) — re-run manually: bash scripts/sutando-shell-setup.sh --import" >&2
+                echo "  Claude memory import: FAILED (rc=$_rc) — re-run manually: bash src/agent/claude/cli/sutando-shell-setup.sh --import" >&2
             fi
         else
-            echo "  Claude memory import: skipped (scripts/sutando-shell-setup.sh not found at expected path; run --import manually after migrate)"
+            echo "  Claude memory import: skipped (src/agent/claude/cli/sutando-shell-setup.sh not found at expected path; run --import manually after migrate)"
         fi
     fi
 

@@ -1,0 +1,16 @@
+# Shell suites that fail on ubuntu-latest CI runners due to macOS-specific
+# tooling (launchctl, BSD stat/readlink, TMPDIR shape) or timing sensitivity.
+# Listed suites still run in CI and their output is printed, but a failure
+# does NOT set the overall exit code — so new regressions in the other suites
+# still fail CI immediately.
+#
+# Burn this list to zero: https://github.com/sonichi/sutando/issues/1934
+# qingyun-wu volunteered to fix cron-gate.test.sh and track the portability work.
+tests/codex-bounded.test.sh
+tests/cron-gate.test.sh
+tests/migration-safety-helpers.test.sh
+tests/start-cli-claude-config-dir.test.sh
+tests/startup-env-token-persist.test.sh
+tests/startup-self-log-tmp.test.sh
+tests/sutando-migrate.test.sh
+tests/sync-workspace.test.sh

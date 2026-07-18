@@ -1,0 +1,37 @@
+name: lint-sutando-home-path
+
+# CI lint: refuse PRs that introduce NEW inline `~/.sutando/<...>` install-path
+# literals. Hardcoded `~/.sutando/*` paths copied into new call sites have
+# stranded config across packaging/rename changes before (#762 workspace,
+# #1785 repo). New code must resolve through the helper / import the constant
+# from the one file that owns the install location.
+#
+# Runs `scripts/lint-sutando-home-path.sh --diff`, which scans only ADDED lines
+# in the PR — existing offenders are left for deliberate migration, not flagged.
+#
+# Companion to `lint-workspace-resolution.yml` (workspace resolver) and
+# `lint-claude-home-path.yml` (~/.claude home). Together they keep all
+# per-user path resolution behind the documented helpers.
+
+on:
+  pull_request:
+    branches: [main, staging-workspace-revamp]
+  push:
+    branches: [main, staging-workspace-revamp]
+
+jobs:
+  lint-sutando-home-path:
+    name: refuse new inline ~/.sutando/ install-path literal
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    steps:
+      - name: Checkout (with full history for base-ref diff)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run lint in --diff mode
+        env:
+          BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || 'HEAD~1' }}
+        run: bash scripts/lint-sutando-home-path.sh --diff

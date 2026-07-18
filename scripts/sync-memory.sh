@@ -393,7 +393,25 @@ fi
 # `git clone sutando-memory && cp -r machine-<hostname>/* ~/Desktop/sutando/`.
 # Other machines' machine-<other>/ dirs are read-only from this machine's
 # POV — NO pull-back in the sync → local section below.
-HOST="$(hostname | sed 's/\..*//')"
+# Per-host label MUST match the reader — src/util_paths.py `_private_machine_dir()`
+# → `_host_label()` resolves `machine-<host>/` scutil-LocalHostName-FIRST. A bare
+# `hostname` can drift under DHCP (e.g. a Comcast lease → `Chis-MBP` while the
+# stable Bonjour name is `Chis-MacBook-Pro`), which would back up the WRONG
+# `machine-<host>/` dir — split from where personal_path() actually reads it
+# (#1745). Use the canonical `sutando-config.sh host-label` shim (#1771; single
+# source of truth, precedence $SUTANDO_HOST_LABEL > scutil > short hostname);
+# fall back to that same precedence inline if the shim is unavailable so backup
+# never hard-depends on python being importable.
+HOST="$(bash "$SCRIPT_DIR/sutando-config.sh" host-label 2>/dev/null || true)"
+if [ -z "$HOST" ]; then
+    HOST="${SUTANDO_HOST_LABEL:-${SUTANDO_HOST_OVERRIDE:-}}"
+    if [ -z "$HOST" ]; then
+        if command -v scutil >/dev/null 2>&1; then
+            HOST="$(scutil --get LocalHostName 2>/dev/null)"
+        fi
+        [ -z "$HOST" ] && HOST="$(hostname | sed 's/\..*//')"
+    fi
+fi
 MACHINE_DIR="machine-$HOST"
 mkdir -p "$MACHINE_DIR/skills" "$MACHINE_DIR/data"
 

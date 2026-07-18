@@ -57,11 +57,20 @@ else
 	NOTES_DIR="$REPO/notes"
 fi
 
-# Per-host label for hosts/<host>/ paths. Lockstep with `_host()`
-# (scripts/sync-workspace.sh) and `_host_label()` (src/util_paths.py):
-# $SUTANDO_HOST_LABEL > scutil LocalHostName (stable) > short hostname (which
-# can DHCP-drift, e.g. Comcast → Chis-MBP, splitting per-host paths; #1745).
+# Per-host label for hosts/<host>/ paths. Canonical resolver is
+# src/util_paths.py:_host_label() via the `sutando-config.sh host-label` shim
+# (single source of truth; precedence $SUTANDO_HOST_LABEL > scutil LocalHostName
+# > short hostname — scutil before hostname because a DHCP lease can drift,
+# e.g. Comcast → Chis-MBP, splitting per-host paths; #1745). Falls back to the
+# inline precedence if the shim is unavailable, so this diagnostic never
+# hard-depends on python being importable.
 _sd_host() {
+	local h=""
+	h="$(bash "$REPO/scripts/sutando-config.sh" host-label 2>/dev/null)" || true
+	if [ -n "$h" ]; then
+		printf '%s\n' "$h"
+		return
+	fi
 	local env="${SUTANDO_HOST_LABEL:-${SUTANDO_HOST_OVERRIDE:-}}"
 	if [ -n "$env" ]; then
 		printf '%s\n' "$env"

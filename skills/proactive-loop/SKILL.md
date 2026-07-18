@@ -55,6 +55,8 @@ Each pass, in order:
 
    Budget informs the **depth** of step 6 — not whether to do it. "Ran out of ideas" is never a valid skip; the work menu is infinite by design. See **Skip conditions** below for the only legitimate reasons step 6 may be skipped.
 
+0.7. **Reconstruct context (every pass — don't recall, read).** Before interpreting the queue or acting on anything that depends on earlier context, **invoke the `context-reconstruct` skill** (an actual Skill-tool invocation — a "see X" reference does not load it). It reads `state/current-track.md` first (the pinned main-track goal + active sub-task + open decisions), then — as the situation needs — the live owner thread (`src/discord-read.py <channel_id>`), per-host `pending-questions.md`, the latest `relay/relay-*.md`, and the `build_log.md` tail. Where the record differs from what you *think* is true, **trust the record**. Then **maintain** `state/current-track.md`: create it if absent, rewrite it when the track moves (owner redirected / thing shipped / decision resolved). This step is the load-bearing anti-erosion hook — over long/compacted sessions, felt confidence is confidently wrong; the fix is reading the durable record, not remembering it. (Restored 2026-07-13 after being dropped in the ~Jun 30 workspace-revamp SKILL.md rewrite; originally added 2026-06-25 — see the context-reconstruct skill's Practice log.)
+
 ## Skip conditions for step 6 (the ONLY legitimate reasons)
 
 Skip step 6 (end the pass early after step 3) if and only if one of these applies:
@@ -74,7 +76,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    - Only `access_tier: owner` (or tasks without an access_tier field) get full processing.
    - **Thread consolidation:** when several tasks in a short window are the same continuation thought (e.g. voice over-delegating "yes, right, this is useful…" as 3 separate tasks), put the FULL reply in the latest task's result and put `[deduped: task-<latest-id>]` in each earlier task's result. The bridge silently archives the deduped ones — no voice cascade, no DM duplicates. See CLAUDE.md "Result-body protocol markers" for the full marker list.
 
-2. **Check pending questions.** Read the **per-host** `pending-questions.md` — `<workspace>/hosts/<hostname>/pending-questions.md` (`<hostname>` = `hostname | sed 's/\..*//'`; this is the F1 per-host location, carried by `hosts/*/`, and where `personal_path("pending-questions.md")` resolves). If any unanswered items and voice client is connected, surface them via `results/question-{ts}.txt`. Also send a macOS notification.
+2. **Check pending questions.** Read the **per-host** `pending-questions.md` — `<workspace>/hosts/<hostname>/pending-questions.md` (`<hostname>` = `bash scripts/sutando-config.sh host-label`; this is the F1 per-host location, carried by `hosts/*/`, and where `personal_path("pending-questions.md")` resolves). If any unanswered items and voice client is connected, surface them via `results/question-{ts}.txt`. Also send a macOS notification.
 
 3. **Check system health.** Run `python3 src/health-check.py`. If issues found, fix what you can (`--fix` flag), note what you can't.
 
@@ -95,6 +97,16 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
    **Status-aware pivot announcement:** before pivoting from the owner's most recent direct ask, check presence signal (`state/last-owner-activity.json`). Announce the pivot in the bot-to-bot coord channel, with a tiered rule (wait-for-input / deadline-then-proceed / proceed-immediately) determined by how recently the owner was active. See `PERSONAL_CLAUDE.md` for the specific thresholds and channel target.
 
+6.5. **Proactive-comm / idle-surface (do NOT skip — this is the anti-going-dark hook).** Restored 2026-07-13; originally built 2026-06-26 as a working-tree SKILL.md step (it ran — idle-streak.json proves it) that was never committed to the repo file and was lost in the ~Jun-30 workspace-revamp rewrite (same rewrite that dropped 0.7). Its absence is exactly why the owner kept flagging "proactive comm handling is still missing" — with no step here, the loop silently idle-closes to the terminal and the owner sees nothing.
+
+   Classify this pass: **substantive** (processed a task, shipped a fix/PR, filed a memory, posted to owner) or **no-op** (nothing owner-visible happened). Maintain `state/idle-streak.json` `{streak, last_surfaced_hash, updated}`: substantive → `streak=0`; no-op → `streak++`.
+
+   On the **first no-op** of a run (`streak >= 1`):
+   1. **Generate, don't idle** — first widen the menu and actually try to produce a tangible artifact (peer-PR review, regression grep, parity verify, research, memory curation, own-PR CI). Gated ≠ nothing-to-do. Only if genuinely all-gated go to step 2.
+   2. **Surface once per changed set** — build the held-list (each item + who it's gated on), `sha1` it. If `hash != last_surfaced_hash`: post ONE concise "here's what's held / needs you (FYI, not a block)" line to the **owner's primary channel** (see `PERSONAL_CLAUDE.md` channel routing — NOT the `#bot2bot` coord channel), then set `last_surfaced_hash`. If `hash == last_surfaced_hash`: stay quiet **only if the owner is away/asleep** (`last-owner-activity.json` older than ~30 min); if he's been active in the last ~30 min, never go dark — drop a one-line progress/activity signal to his channel anyway.
+
+   **Guardrails (all owner-corrected):** the surface is a non-blocking FYI footnote — NEVER a new wait-state ("awaiting your go" is not a reason to pause; keep doing the next unblocked thing). Don't spam: one signal per changed set / per work-shift, not per file. Presence is the discriminator: recently-active → never silent; genuinely-away → dedup-quiet is fine.
+
 7. **Update `$WORKSPACE/build_log.md`** — mark what changed, update statuses, note what's next.
 
    **Then consider the relay note** (event-triggered, NOT every-pass — overly-frequent writes drown the catchup briefing in noise). Ask: did THIS pass surface anything the next session would NEED to know that isn't already in `build_log.md` or `pending-questions.md`? Typical relay-worthy events:
@@ -111,7 +123,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
    This bakes the auto-trigger into the existing build_log update step rather than a separate auto-refresh subsystem. Event-triggered, not time-triggered — fires only on natural beat points where something worth relaying actually happened.
 
-8. **If blocked, ask.** Write the question to the **per-host** `pending-questions.md` — `<workspace>/hosts/<hostname>/pending-questions.md` (`<hostname>` = `hostname | sed 's/\..*//'`; create the `hosts/<hostname>/` dir if absent) — send a macOS notification, and write to `results/question-{ts}.txt` if voice is connected. Don't stop — apply the Pivot-on-block rule and pick another menu item.
+8. **If blocked, ask.** Write the question to the **per-host** `pending-questions.md` — `<workspace>/hosts/<hostname>/pending-questions.md` (`<hostname>` = `bash scripts/sutando-config.sh host-label`; create the `hosts/<hostname>/` dir if absent) — send a macOS notification, and write to `results/question-{ts}.txt` if voice is connected. Don't stop — apply the Pivot-on-block rule and pick another menu item.
 
 9. **Ensure the streaming watcher is running.** PID-check the watcher sentinel: if `"$WORKSPACE/state/watch-tasks-stream.pid"` is missing OR its PID is dead (`pid=$(cat "$WORKSPACE/state/watch-tasks-stream.pid" 2>/dev/null); ! kill -0 "$pid" 2>/dev/null`), restart it with the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`. When notifications arrive (`TASK_FILE: <basename>`), Read the named file. Each event represents one new task — process all queued tasks before continuing. Don't use `pgrep -f watch-tasks` here for the same reason as `/schedule-crons` step 5 — pgrep's `-f` matches the bash wrapper's argv (which contains the literal search string) and false-positively returns a transient self-match. Same PID-stamp + `kill -0` pattern as the catchup sentinel in step 1 above.
 

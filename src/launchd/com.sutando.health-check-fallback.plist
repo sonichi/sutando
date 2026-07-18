@@ -30,7 +30,7 @@
       owner id in ~/.claude/channels/slack/access.json is missing.
     - --recover-core: when the core is alive-but-wedged (heartbeat ticking but
       the task queue isn't draining — the 2026-06-02 1M usage-credit-gate loop
-      signature), auto-restarts it via scripts/start-cli.sh --restart. Heavily
+      signature), auto-restarts it via src/agent/start-cli.sh --restart. Heavily
       guarded (sustained-wedge confirm window, 30min cooldown, 3/hr give-up cap)
       and a clean no-op when the core is healthy. Keeps 1M on the first restart;
       degrades to standard 200K only if the wedge recurs. Runs here, in launchd's

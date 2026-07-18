@@ -1,0 +1,11 @@
+{
+  "name": "openai-tts",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "Render text to mp3 via OpenAI's tts-1-hd. Use for video narration, demo voiceovers, audio notes.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}

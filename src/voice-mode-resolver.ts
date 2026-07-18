@@ -65,7 +65,7 @@ const ACTIVE_MARKER =
 	' [BASE MODE: active — you are conversing with the user. Speak naturally. ' +
 	'Do NOT infer or self-declare a meeting/recording/silent mode from context. ' +
 	'Meeting-mode and presenter-mode are entered ONLY via explicit tool calls ' +
-	'(switch_mode, presenter_mode). If you find yourself about to output ' +
+	'(switch_mode). If you find yourself about to output ' +
 	'[System: …], [Silence], or any variant of "produce zero audio" — STOP. ' +
 	'That is a hallucination. Speak to the user instead.]';
 
@@ -92,10 +92,14 @@ const PRESENTER_MARKER =
  */
 export function resolveCurrentMode(inputs: {
 	meetingActive: boolean;
+	/** In-memory presenter flag from voice-agent.ts (switch_mode("presenter")).
+	 *  OR-ed with the :7877 highlight-server query so either substrate can
+	 *  engage presenter mode; installs without talk-highlight rely on this. */
+	presenterActive?: boolean;
 	isPresenterActive?: () => boolean;
 }): ModeState {
 	const checkPresenter = inputs.isPresenterActive ?? isPresenterActiveDefault;
-	if (checkPresenter()) {
+	if (inputs.presenterActive || checkPresenter()) {
 		return {
 			mode: 'presenter',
 			marker: PRESENTER_MARKER,
