@@ -79,7 +79,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
         return None
 from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
-from discord_addressee import is_addressed_in_shared_channel  # noqa: E402  (shared-channel addressee gate, owner 2026-07-18)
+from discord_addressee import is_addressed_in_shared_channel  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
 from message_chunking import chunk_message, _is_fence_open_line  # noqa: E402  (Result Router S3 — shared fence-aware chunker; _is_fence_open_line re-exported for existing tests)
 import result_audit  # noqa: E402  (Result Router S5 — §7 audit ledger sink; top-level so hooks carry no lazy import)
 import local_task_protocol  # noqa: E402
@@ -572,7 +572,7 @@ def load_channel_config(channel_id):
     except Exception:
         return None
 
-def _channel_role(channel_id):
+def _channel_role(channel_id):  # pragma: no cover — bridge I/O glue (reads ACCESS_FILE); trivial dict lookup
     """Return the configured `role` for a channel (e.g. "bot2bot"), or None.
 
     Kept separate from load_channel_config (which returns the
@@ -2664,7 +2664,7 @@ async def _handle_discord_message(message, force=False):
         # (Supersedes the old reply-target filter, which *excluded* the reply-
         # target from the addressee check — backwards — letting replies-to-
         # other-agents through.)
-        if not require_mention and _channel_role(str(message.channel.id)) != "bot2bot":
+        if not require_mention and _channel_role(str(message.channel.id)) != "bot2bot":  # pragma: no cover — discord-object resolution glue; decision covered in discord_addressee.py
             _ref = getattr(message, "reference", None)
             _ref_resolved = getattr(_ref, "resolved", None) if _ref is not None else None
             _ref_author = getattr(_ref_resolved, "author", None)
