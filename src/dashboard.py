@@ -18,7 +18,6 @@ import http.server
 import json
 import os
 import re
-import socket
 import subprocess
 import sys
 from datetime import datetime
@@ -32,7 +31,7 @@ from urllib.parse import urlparse
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
-from util_paths import personal_path, shared_personal_path  # noqa: E402
+from util_paths import personal_path, shared_personal_path, _host_label  # noqa: E402
 WORKSPACE_DIR = resolve_workspace()
 PORT = 7844
 
@@ -343,7 +342,12 @@ def get_schedules() -> list[dict]:
     Source: <workspace>/hosts/<hostname>/crons.json (see skills/schedule-crons).
     Status is 'active' + next run; last-run history isn't tracked on disk.
     """
-    host = socket.gethostname().split(".")[0]
+    # scutil-first canonical label (NOT bare hostname) — must match the WRITER,
+    # schedule-crons, which keys hosts/<host>/crons.json off
+    # `sutando-config.sh host-label` (= util_paths._host_label()). A bare
+    # `hostname` can drift under DHCP and read the wrong hosts/<host>/ dir, so
+    # this panel would show no schedules on a drift machine (#1745).
+    host = _host_label()
     cfg = WORKSPACE_DIR / "hosts" / host / "crons.json"
     if not cfg.exists():
         return []
