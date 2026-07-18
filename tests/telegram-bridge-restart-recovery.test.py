@@ -86,6 +86,28 @@ class SeedPendingRepliesTest(unittest.TestCase):
         )
         self.assertEqual(tg.seed_pending_replies_from_disk(self.tasks), {"task-3": 777001})
 
+    def test_glob_oserror_returns_empty(self):
+        """tasks_dir.glob raising OSError -> best-effort empty seed, no raise."""
+        from unittest.mock import patch
+        with patch.object(Path, "glob", side_effect=OSError("boom")):
+            self.assertEqual(tg.seed_pending_replies_from_disk(self.tasks), {})
+
+    def test_unreadable_file_skipped(self):
+        """One file raising OSError on read_text is skipped; others still seed."""
+        from unittest.mock import patch
+        good = self.tasks / "task-good-1.txt"
+        good.write_text("id: task-good-1\nsource: telegram\nchat_id: 42\ntask: hi\n")
+        bad = self.tasks / "task-bad-1.txt"
+        bad.write_text("id: task-bad-1\nsource: telegram\nchat_id: 43\ntask: hi\n")
+        real_read = Path.read_text
+        def flaky(self_path, *a, **k):
+            if self_path.name == "task-bad-1.txt":
+                raise OSError("unreadable")
+            return real_read(self_path, *a, **k)
+        with patch.object(Path, "read_text", flaky):
+            seeded = tg.seed_pending_replies_from_disk(self.tasks)
+        self.assertEqual(seeded, {"task-good-1": 42})
+
     def test_non_telegram_sources_not_seeded(self):
         for src in ("chat", "discord", "slack", "voice"):
             (self.tasks / f"task-{src}-1.txt").write_text(
