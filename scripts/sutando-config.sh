@@ -238,6 +238,31 @@ print(_host_label(), end='')
 "
     ;;
 
+  app-node-dir)
+    # The bundled app runtime's node bin dir (Sutando.app ships a private node
+    # for hosts with no homebrew/nvm/volta). CONFIG-RESOLVED, not hardcoded:
+    # override via $SUTANDO_APP_NODE_DIR; default = the app-support engine path.
+    printf '%s' "${SUTANDO_APP_NODE_DIR:-$HOME/Library/Application Support/space.ag2.app/engine/runtime/node/bin}"
+    ;;
+
+  tsx-bin)
+    # SINGLE SOURCE OF TRUTH for tsx resolution — the launchd wrapper and
+    # src/startup.sh both call this instead of each duplicating the candidate
+    # list. Prefers the repo-pinned node_modules/.bin/tsx (the version the repo
+    # pins, and the ONLY tsx on a host with no homebrew/nvm/volta node at all),
+    # then the usual global locations. Prints the resolved path, or nothing —
+    # the caller falls back to `npx tsx` on empty output.
+    _nvm_tsx="$HOME/.nvm/versions/node/$(ls "$HOME/.nvm/versions/node/" 2>/dev/null | sort -V | tail -1)/bin/tsx"
+    for _p in \
+      "$REPO_ROOT/node_modules/.bin/tsx" \
+      /opt/homebrew/bin/tsx \
+      /usr/local/bin/tsx \
+      "$_nvm_tsx" \
+      "$HOME/.volta/bin/tsx"; do
+      [ -x "$_p" ] && { printf '%s' "$_p"; break; }
+    done
+    ;;
+
   dump)
     python3 -m src.sutando_config
     ;;
@@ -353,6 +378,57 @@ try:
         probe_voice_ws = vrec['voice_ws']
 except Exception:
     pass
+# vision_control: the HTTP control endpoint the running vision-control server
+# actually bound (:7847 default, or VISION_CONTROL_PORT). Runtime-authored the
+# same way as voice_ws — vision-tools.ts writes state/vision-control.json at
+# listen with its real port, pid-validated (written once at startup, so liveness
+# is the pid not a time window). Consumed by the desktop 'Watch' toggle (v0.3.0
+# Slice-2) to drive /vision/start|stop|state. Absent / dead-pid / unreadable ->
+# default OSS endpoint.
+probe_vision_control = 'http://127.0.0.1:7847'
+try:
+    with open(os.path.join(ws, 'state', 'vision-control.json')) as f:
+        crec = json.load(f)
+    cpid = int(crec.get('pid', 0) or 0)
+    calive = False
+    if cpid > 0:
+        try:
+            os.kill(cpid, 0)
+            calive = True
+        except ProcessLookupError:
+            calive = False
+        except PermissionError:
+            calive = True  # exists but not ours — still a live process
+        except Exception:
+            calive = False
+    # Only trust a loopback endpoint — the control server binds 127.0.0.1, so a
+    # non-loopback scheme/host in the state file is stale or crafted; fall back to
+    # the default rather than hand the desktop client a URL it should never call.
+    _cv = crec.get('vision_control')
+    if calive and isinstance(_cv, str) and _cv.startswith('http://127.0.0.1:'):
+        probe_vision_control = _cv
+except Exception:
+    pass
+# call_tiers: the DIRECT call endpoints this core can advertise right now, the
+# runtime-authored half of the availability-driven call-tier menu (Track 9). The
+# emitter (src/emit-call-tiers.ts, from reachability-endpoints.ts) writes
+# state/call-tiers.json at startup; the client renders the tier picker from this
+# instead of the old static 'force tier' stub (greyed Direct even when live,
+# offered Local on a remote core). Only direct tiers are advertised — 'local' is
+# client-relative and cloud/relay are always-available + composed client-side.
+# The advertisement is a HINT: the client verifies reachability (first-reachable-
+# wins), so a stale entry degrades gracefully. Absent/malformed -> [] (client
+# falls back to cloud). A freshness window / re-emit-on-network-change is a
+# documented follow-up.
+probe_call_tiers = []
+try:
+    with open(os.path.join(ws, 'state', 'call-tiers.json')) as f:
+        crec = json.load(f)
+    ct = crec.get('call_tiers')
+    if isinstance(ct, list):
+        probe_call_tiers = ct
+except Exception:
+    pass
 env = dict(os.environ, SUTANDO_TMUX_SOCKET=probe_socket)
 h = {}
 try:
@@ -397,6 +473,17 @@ print(json.dumps({
     # state (probe_voice_ws above): voice-agent.ts records its actual bound PORT,
     # so a non-default-PORT install is reported correctly, not a hardcoded default.
     'voice_ws': probe_voice_ws,
+    # vision_control: the HTTP control endpoint the runtime's vision-control server
+    # listens on — where the desktop 'Watch' toggle POSTs /vision/start|stop and
+    # polls /vision/state (ag2-space/ag2space-cinny-desktop v0.3.0 Slice-2).
+    # Sourced from runtime-authored state (probe_vision_control above), so a
+    # VISION_CONTROL_PORT override is reported correctly, not a hardcoded default.
+    'vision_control': probe_vision_control,
+    # call_tiers: the direct call endpoints this core advertises (Track 9). The
+    # desktop 'Start Call' picker renders the tier menu from this — showing only
+    # reachable rows, un-greying Direct(Tailscale)/Direct(LAN) when their url is
+    # advertised. Runtime-authored via probe_call_tiers above (emit-call-tiers.ts).
+    'call_tiers': probe_call_tiers,
     'health': h.get('health', 'unknown'),
     'authenticated': h.get('authenticated'),
 }))

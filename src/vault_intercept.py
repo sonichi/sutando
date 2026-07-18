@@ -208,6 +208,28 @@ def get_vault_key(key: str) -> str:
     return result.stdout.decode().strip()
 
 
+# Keys double as env-var names via the `env` verb / get_vault_key consumers, so
+# the public setter holds them to env-var-safe naming (the chat-interception
+# path has its own, looser matching + FP guards above).
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def set_vault_key(key: str, value: str) -> None:
+    """Store a secret in Keychain + manifest — the public, non-chat write path.
+
+    Same storage as the `vault set` chat interception (`security
+    add-generic-password -a sutando -s KEY -U` + manifest registration), for
+    callers that already hold the value programmatically (CLI `set` verb,
+    desktop Settings' BYO-key entry). Raises ValueError on an invalid key or
+    empty value; RuntimeError when the Keychain write fails.
+    """
+    if not _ENV_KEY_RE.match(key or ""):
+        raise ValueError(f"vault: invalid key name '{key}' (want [A-Za-z_][A-Za-z0-9_]*)")
+    if not value:
+        raise ValueError("vault: refusing to store an empty value")
+    _store_in_keychain(key, value)
+
+
 def intercept_vault_commands(text: str) -> InterceptResult:
     """Detect vault-set commands in `text`, store secrets, return sanitized text.
 

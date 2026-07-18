@@ -393,16 +393,40 @@ apply_tmux_defaults() {
 # The guard is scoped to THIS socket + out path so a monitor for a different
 # core/socket can never suppress this one.
 ensure_core_monitor() {
-  local ws mon_out
+  local ws mon_out relay_pid_file relay_state
   ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
   [ -n "$ws" ] || return 0
   mon_out="$ws/state/core-supervisor.json"
-  if pgrep -f "core-input-watch\.py .*--socket ${TMUX_SOCKET} .*--out ${mon_out}" > /dev/null 2>&1; then
-    return 0   # a monitor for this exact core is already running
+  # Monitor (PR #2100): launch unless one for this exact socket+out is running.
+  if ! pgrep -f "core-input-watch\.py .*--socket ${TMUX_SOCKET} .*--out ${mon_out}" > /dev/null 2>&1; then
+    python3 "$REPO/src/core-input-watch.py" \
+      --socket "$TMUX_SOCKET" --session "$SESSION" --out "$mon_out" \
+      > /tmp/core-input-watch.log 2>&1 &
   fi
-  python3 "$REPO/src/core-input-watch.py" \
-    --socket "$TMUX_SOCKET" --session "$SESSION" --out "$mon_out" \
-    > /tmp/core-input-watch.log 2>&1 &
+  # Communicator relay (PR #2101): the monitor only WRITES core-supervisor.json;
+  # nothing escalated it, so a hard-blocker (blocked-human / logged-out) on a
+  # no-TTY core never reached an away owner. Run the one-shot relay on a cadence
+  # so those states escalate to the owner's most-recently-active channel
+  # (--active-from). The relay debounces internally (--state-file), so re-running
+  # every 30s escalates a given stuck episode exactly once. Pidfile + kill -0
+  # guard so an attach/re-run never double-starts the loop. Only blocked-human /
+  # logged-out escalate (relay's HARD_ESCALATE); hung/crashed are RECOVER's job.
+  relay_pid_file="$ws/state/core-supervisor-relay-loop.pid"
+  relay_state="$ws/state/core-supervisor-relay.state"
+  if ! { [ -f "$relay_pid_file" ] && kill -0 "$(cat "$relay_pid_file" 2>/dev/null)" 2>/dev/null; }; then
+    # Redirect the WHOLE subshell (not just the inner python) to the log, so the
+    # backgrounded loop does not inherit/hold this script's stdout/stderr — else a
+    # caller that captures start-cli.sh's output (e.g. tests/start-cli-*.test.py)
+    # blocks on the pipe until this infinite loop closes it (never) and times out.
+    # Mirrors the monitor launch above, which redirects to /tmp/core-input-watch.log.
+    ( while true; do
+        python3 "$REPO/src/core-supervisor-relay.py" \
+          --signal "$mon_out" --state-file "$relay_state" \
+          --active-from "$ws/state/last-owner-activity.json"
+        sleep 30
+      done ) >> /tmp/core-supervisor-relay.log 2>&1 &
+    echo $! > "$relay_pid_file"
+  fi
 }
 
 # Already running — attach if interactive, else exit cleanly. A managed core is
@@ -433,8 +457,35 @@ if core_claude_running; then
 fi
 
 if tmux_session_exists; then
-  echo "  ⚠ $SESSION tmux session exists but no core Claude process — restarting it" >&2
-  tmux -S "$TMUX_SOCKET" kill-session -t "$SESSION" 2>/dev/null || true
+  # Session alive but the core claude is gone. The old behavior here was
+  # kill-session — but the desktop runtime keeps SIBLING windows in this
+  # session (gateway, monitor; launch-sutando.sh), so nuking the session tore
+  # those down with the dead core: the G10 all-or-nothing gap. Heal WINDOW-
+  # SCOPED instead: recreate the core as a new window in the surviving session,
+  # with the same env/cwd/flags as the create path below. Target index 0 (the
+  # core's conventional home, freed when its process died); fall back to any
+  # free index if 0 is somehow occupied. This also makes sutando-ctl.sh's
+  # restart-core (kill core window → rerun this script) truly window-scoped.
+  echo "  ⚠ $SESSION exists but core Claude is gone — healing core window (sibling windows preserved)" >&2
+  apply_tmux_defaults
+  CORE_CMD=(claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
+    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} -- "/schedule-crons")
+  # -P -F prints the index the window ACTUALLY landed on: when index 0 is
+  # occupied (e.g. a sibling drifted there) the fallback creates the core at a
+  # nonzero index, and selecting a hardcoded :0 would activate the WRONG window
+  # (review-caught: attach/Console then shows the gateway, not the healed core).
+  healed_idx="$(tmux -S "$TMUX_SOCKET" new-window -dP -F '#{window_index}' -t "$SESSION:0" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} "${CORE_CMD[@]}" 2>/dev/null \
+    || tmux -S "$TMUX_SOCKET" new-window -dP -F '#{window_index}' -t "$SESSION" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} "${CORE_CMD[@]}")"
+  # Make the healed core the active window so attach/Console show it, not the
+  # quiet gateway (same reason launch-sutando.sh creates siblings with -d).
+  tmux -S "$TMUX_SOCKET" select-window -t "$SESSION:${healed_idx:-0}" 2>/dev/null || true
+  ensure_core_monitor
+  if [ -t 1 ]; then
+    echo "Attaching to healed $SESSION (Ctrl-b d to detach)..."
+    exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
+  fi
+  echo "Healed core window in $SESSION (session + sibling windows preserved)."
+  exit 0
 fi
 
 # Auto-install tmux via Homebrew if missing. Sutando.app's

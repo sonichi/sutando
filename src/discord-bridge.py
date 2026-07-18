@@ -3691,6 +3691,8 @@ async def poll_results():
             if result_file.exists():
                 import re
                 reply_text = result_file.read_text().strip()
+                if not reply_text:
+                    continue
                 channel = pending_replies.pop(task_id)
                 # Capture anchor BEFORE pop so the auto-thread block below
                 # can use it. The previous version popped+forgot, leaving

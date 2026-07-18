@@ -32,6 +32,24 @@ fi
 # $SUTANDO_ROOT.
 export SUTANDO_ROOT="$REPO"
 
+# tsx runner for every TS service start below — resolution is config-resolved
+# via sutando-config.sh (`tsx-bin` / `app-node-dir` are the single source of
+# truth, shared with the launchd wrapper); `npx tsx` only as a last resort. A
+# host may have no homebrew/nvm node/npx at all (the app-bundle runtime ships
+# bare `node` only, no npx — the PATH prepend covers tsx's `#!/usr/bin/env node`
+# re-exec). A raw `npx tsx` call site silently fails to start its service on
+# such hosts (web-client outage 2026-07-17).
+_APP_NODE_DIR="$(bash "$REPO/scripts/sutando-config.sh" app-node-dir)"
+[ -d "$_APP_NODE_DIR" ] && case ":$PATH:" in *":$_APP_NODE_DIR:"*) ;; *) PATH="$_APP_NODE_DIR:$PATH"; export PATH ;; esac
+_TSX_BIN="$(bash "$REPO/scripts/sutando-config.sh" tsx-bin)"
+run_tsx() {
+  if [ -n "$_TSX_BIN" ]; then
+    "$_TSX_BIN" "$@"
+  else
+    npx tsx "$@"
+  fi
+}
+
 # Export workspace-scoped CLAUDE_CONFIG_DIR before services launch. Without it,
 # init.sh + the bridge-launcher blocks below (L~262 proxy, L~429 telegram,
 # L~449 discord, L~473 slack) probe `${CLAUDE_CONFIG_DIR:-$HOME/.claude}` and
@@ -332,6 +350,13 @@ bash "$REPO/scripts/install-git-hooks.sh" >/dev/null 2>&1 || true
 # dark whenever a session restarts without an explicit /schedule-crons invocation.
 bash "$REPO/scripts/install-session-start-hook.sh" 2>&1 || true
 
+# Re-inject PERSONAL_CLAUDE.md after context compaction (SessionStart
+# "compact" matcher). CLAUDE.md + the memory index survive compaction via the
+# system prompt; PERSONAL_CLAUDE.md only enters context via an explicit Read,
+# which compaction summarizes away — so long sessions silently lose per-user
+# rules. Idempotent — safe to run on every start.
+bash "$REPO/scripts/install-personal-claude-hook.sh" 2>&1 || true
+
 # Auto-bootstrap: create-if-missing files and dirs that the agent + skills
 # expect to exist (logs, state, tasks, results, notes, contextual-chips.json,
 # pending-questions.md, build_log.md, crons.json, …). Idempotent — safe to
@@ -549,7 +574,8 @@ if [ -f "$_PROXY_INSTALLER" ] && [ -f "$REPO/src/launchd/$_PROXY_LABEL.plist" ];
 fi
 if ! lsof -i :7846 > /dev/null 2>&1; then
   echo "  Starting credential proxy (port 7846)..."
-  npx tsx "$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)" > /tmp/credential-proxy.log 2>&1 &
+  _PROXY_SCRIPT="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
+  run_tsx "$_PROXY_SCRIPT" > /tmp/credential-proxy.log 2>&1 &
   sleep 1
   if lsof -i :7846 > /dev/null 2>&1; then
     echo "  ✓ credential proxy"
@@ -577,7 +603,7 @@ if [ "${SUTANDO_OBS_COLLECTOR:-}" = "1" ]; then
   if ! lsof -i :"$OBS_PORT" > /dev/null 2>&1; then
     echo "  Starting obs collector (port $OBS_PORT)..."
     SUTANDO_WORKSPACE="$WORKSPACE" SUTANDO_OBS_PORT="$OBS_PORT" \
-      npx tsx "$REPO/src/observability/boot.ts" > "$LOGS_DIR/collector.log" 2>&1 &
+      run_tsx "$REPO/src/observability/boot.ts" > "$LOGS_DIR/collector.log" 2>&1 &
     echo "  ✓ obs collector"
   else
     echo "  ✓ obs collector (already running on $OBS_PORT)"
@@ -615,17 +641,28 @@ reap_wedged_listener() {
 reap_wedged_listener 9900 voice-agent
 if ! lsof -i :9900 > /dev/null 2>&1; then
   echo "  Starting voice agent (port 9900)..."
-  npx tsx src/voice-agent.ts > "$LOGS_DIR/voice-agent.log" 2>&1 &
+  run_tsx src/voice-agent.ts > "$LOGS_DIR/voice-agent.log" 2>&1 &
   echo "  ✓ voice agent"
 else
   echo "  ✓ voice agent (already running)"
 fi
 
+# 1b. Call-tier advertisement (resident, re-emitting): write state/call-tiers.json
+# so the runtime descriptor advertises which DIRECT call endpoints are reachable
+# now (Track 9 availability-driven call-tier menu). Backgrounded — it probes
+# tailscale with its own short timeout and never blocks the rest of startup;
+# absent file just means the descriptor advertises no direct tiers (client falls
+# back to cloud). `--interval 60` keeps it resident and re-emits every 60s so the
+# advertisement tracks reachability changes AFTER boot (tailnet/VPN coming up
+# post-startup would otherwise leave Direct(Tailscale) greyed until a restart).
+run_tsx src/emit-call-tiers.ts --interval 60 > "$LOGS_DIR/emit-call-tiers.log" 2>&1 &
+echo "  ✓ call-tiers advertisement (re-emit 60s)"
+
 # 2. Web client (port 8080)
 reap_wedged_listener 8080 web-client
 if ! lsof -i :8080 > /dev/null 2>&1; then
   echo "  Starting web client (port 8080)..."
-  npx tsx src/web-client.ts > "$LOGS_DIR/web-client.log" 2>&1 &
+  run_tsx src/web-client.ts > "$LOGS_DIR/web-client.log" 2>&1 &
   echo "  ✓ web client"
 else
   echo "  ✓ web client (already running)"
@@ -698,14 +735,14 @@ if [ -d "$REPO/skills/portfolio-research" ]; then
   echo "  ✓ portfolio dashboard (port 8899)"
 fi
 
-# 5b. Sutando context drop app (global hotkey ⌃C)
+# 5b. Sutando context drop app (hotkey configurable via state/hotkeys.json)
 SUT_SRC="$REPO/src/Sutando/main.swift"
 SUT_BIN="$REPO/src/Sutando/Sutando"
 
 # Build the public ax-read CLI if missing or older than any of its source
 # files. Sutando.app's resolveAxReadPath() prefers private personal-deictic
 # when installed; this public binary is the text-only fallback so public-repo
-# users still get the ⌃C selection-drop experience.
+# users still get the context-drop experience.
 #
 # Staleness widened (per Mini's PR #907 review): trigger a rebuild when
 # Package.swift / build.sh / any *.swift under Sources/ is newer than the
@@ -719,7 +756,7 @@ if [ -n "$AXR_NEWEST_SRC" ] && { [ ! -f "$AXR_BIN" ] || [ "$AXR_NEWEST_SRC" -nt 
   echo "  Compiling public ax-read (skills/context-drop)..."
   if ! command -v swift >/dev/null 2>&1; then
     echo "  ⚠ ax-read build skipped: 'swift' not in PATH"
-    echo "    → install Xcode Command Line Tools (xcode-select --install) for ⌃C selection drops on public-repo installs"
+    echo "    → install Xcode Command Line Tools (xcode-select --install) for context drops on public-repo installs"
   elif (cd "$AXR_DIR" && bash build.sh); then
     echo "  ✓ ax-read built at $AXR_BIN"
   else
@@ -738,7 +775,7 @@ if [ -f "$SUT_SRC" ] && { [ ! -f "$SUT_BIN" ] || [ "$SUT_SRC" -nt "$SUT_BIN" ]; 
     # Sync the fresh binary into the .app bundle if one exists, ensure the
     # AppleEvents usage-description key is present, and re-sign so the
     # cdhash matches. Without NSAppleEventsUsageDescription macOS silently
-    # denies AppleEvents — getFinderSelection() returns [] and the ⌃C
+    # denies AppleEvents — getFinderSelection() returns [] and the context
     # drop handler logs "Nothing selected" with no permission prompt.
     SUT_APP="$REPO/src/Sutando/Sutando.app"
     if [ -d "$SUT_APP" ]; then
@@ -787,7 +824,7 @@ if ! pgrep -f "src/Sutando/Sutando" > /dev/null 2>&1; then
   if [ -f "$SUT_BIN" ]; then
     echo "  Starting Sutando..."
     "$SUT_BIN" > /dev/null 2>&1 &
-    echo "  ✓ Sutando (⌃C/⌃V/⌃M)"
+    echo "  ✓ Sutando (hotkeys via state/hotkeys.json)"
   else
     echo "  ⚠ Sutando binary missing — hotkeys disabled"
   fi
@@ -936,7 +973,7 @@ if [ "${SKIP_PHONE:-}" = "1" ]; then
 elif grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; then
   if ! pgrep -f "conversation-server" > /dev/null 2>&1; then
     echo "  Starting conversation server..."
-    npx tsx skills/phone-conversation/scripts/conversation-server.ts > /tmp/conversation-server.log 2>&1 &
+    run_tsx skills/phone-conversation/scripts/conversation-server.ts > /tmp/conversation-server.log 2>&1 &
     echo "  ✓ conversation server (port 3100)"
   else
     echo "  ✓ conversation server (already running)"
