@@ -1553,6 +1553,21 @@ def _pending_task_files(tasks_dir: Path, results_dir: Optional[Path] = None) -> 
         return []
 
 
+def _bridge_log_belongs_to_process(log_file: Path, process_started_at: "float | None") -> bool:
+    """Whether log content can describe the currently running bridge.
+
+    A bridge restarted under tmux may write to its pane while the prior
+    startup-managed log remains on disk. Old LoginFailure text must not
+    override a live, newly authenticated process.
+    """
+    if process_started_at is None:
+        return True
+    try:
+        return log_file.stat().st_mtime >= process_started_at - 1
+    except OSError:
+        return True
+
+
 def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> dict:
     """Detect a task-queue pileup — tasks/ directory growing without
     being drained. Independent of which watcher / loop is dying: the queue
@@ -1934,6 +1949,7 @@ def run_all_checks() -> list[dict]:
         # modification. This catches the case where a fix is on disk but the
         # running process is from a previous version (e.g., PR #203 silently
         # not in effect because nobody restarted the bridge after merge).
+        proc_start = None
         try:
             src_file = REPO_DIR / "src" / f"{name}.py"
             if src_file.exists() and pids:
@@ -2001,7 +2017,8 @@ def run_all_checks() -> list[dict]:
         # slack-bridge: "60s elapsed" hint means Socket Mode connected but
         #   events aren't routing (Slack app Event Subscriptions disabled).
         #   Only overrides "ok" — stale/dead-inode are higher priority.
-        if log_file.exists() and name in ("discord-bridge", "slack-bridge"):
+        if (log_file.exists() and name in ("discord-bridge", "slack-bridge")
+                and _bridge_log_belongs_to_process(log_file, proc_start)):
             try:
                 tail = log_file.read_text(errors="replace").splitlines()[-60:]
                 if name == "discord-bridge":
