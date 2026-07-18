@@ -543,6 +543,17 @@ else
   echo "  ✓ core heartbeat (already running)"
 fi
 
+# Services-status emitter — aggregates sidecar liveness into
+# state/services-status.json for the desktop Settings → Services surface.
+# Single instance per host; ~30s cadence; SIGTERM-clean like the heartbeat.
+if ! pgrep -f "src/services_status.py" > /dev/null 2>&1; then
+  echo "  Starting services-status emitter..."
+  python3 "$REPO/src/services_status.py" > /tmp/services-status.log 2>&1 &
+  echo "  ✓ services-status emitter"
+else
+  echo "  ✓ services-status emitter (already running)"
+fi
+
 # 0. Credential proxy for quota tracking (port 7846).
 # Prefer the launchd-supervised job (KeepAlive + ThrottleInterval=10s) so the
 # proxy restarts on crash instead of leaving a proxy-routed core stranded on a
