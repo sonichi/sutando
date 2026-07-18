@@ -342,6 +342,24 @@ def _one_line(value) -> str:
     return str(value).replace("\r", " ").replace("\n", " ")
 
 
+def _redact_url(value: str) -> str:
+    """Scheme+host+path only — drop userinfo, query, and fragment before a URL
+    is persisted. `gateway-status.json` lives under `state/` (which vault-syncs),
+    so a gateway configured with `user:pass@` userinfo or a `?token=` query param
+    must not land there in plaintext. Falls back to the bare string on any parse
+    failure (never raise from a best-effort status write)."""
+    try:
+        p = urllib.parse.urlsplit(str(value))
+        if not p.scheme and not p.netloc:
+            return str(value)
+        host = p.hostname or ""
+        if p.port:
+            host = f"{host}:{p.port}"
+        return urllib.parse.urlunsplit((p.scheme, host, p.path, "", ""))
+    except Exception:  # noqa: BLE001 — redaction must never break status I/O
+        return str(value)
+
+
 def _log(msg: str) -> None:
     print(f"[remote-gateway-bridge] {msg}", flush=True)
 
@@ -494,7 +512,7 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             "last_ok_ts": last_ok,
             "backoff_s": int(backoff_s),
             "error": _one_line(error) if error else None,
-            "gateway": URL,
+            "gateway": _redact_url(URL),
             "schema_version": 1,
         }
         GATEWAY_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)

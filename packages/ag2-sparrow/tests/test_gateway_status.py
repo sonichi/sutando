@@ -43,7 +43,34 @@ def test_status_write_never_raises(monkeypatch=None):
         m._emit_gateway_status(True)  # should not raise
         print("PASS test_status_write_never_raises")
 
+def test_redact_url_strips_userinfo_and_query():
+    with tempfile.TemporaryDirectory() as d:
+        m = _load(pathlib.Path(d))
+        # userinfo + secret query + fragment all dropped; scheme/host/path kept
+        assert m._redact_url("https://user:pass@gw.example:8443/relay?token=SEKRIT#frag") \
+            == "https://gw.example:8443/relay"
+        # clean URL is unchanged
+        assert m._redact_url("https://gw.example/relay") == "https://gw.example/relay"
+        # a bare non-URL string falls through untouched (never raises)
+        assert m._redact_url("not-a-url") == "not-a-url"
+        print("PASS test_redact_url_strips_userinfo_and_query")
+
+def test_emitted_gateway_field_carries_no_secret():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = pathlib.Path(d)
+        # a gateway configured with userinfo + ?token= must NOT persist to state/
+        os.environ["REMOTE_TASK_URL"] = "https://u:p@gw.example/relay?token=SEKRIT"
+        m = _load(tmp)
+        m._emit_gateway_status(True)
+        rec = json.loads(m.GATEWAY_STATUS_FILE.read_text())
+        assert rec["gateway"] == "https://gw.example/relay"
+        assert "SEKRIT" not in rec["gateway"] and "u:p@" not in rec["gateway"]
+        os.environ.pop("REMOTE_TASK_URL", None)
+        print("PASS test_emitted_gateway_field_carries_no_secret")
+
 if __name__ == "__main__":
     test_connected_then_reconnecting_preserves_last_ok()
     test_status_write_never_raises()
+    test_redact_url_strips_userinfo_and_query()
+    test_emitted_gateway_field_carries_no_secret()
     print("ALL PASS")
