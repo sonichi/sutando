@@ -1,25 +1,21 @@
 #!/bin/bash
-# Smoke test for the one-release compat shims added when the Claude core-agent
-# launchers moved to src/agent/claude/cli/ (PR #1891).
+# Smoke test for the one-release compat shim added when the Claude-specific
+# shell setup moved to src/agent/claude/cli/ (PR #1891).
 #
 # Guards against the "moved with no shim" regression: an already-installed /
 # not-yet-rebuilt Sutando.app (and health-check --recover-core) still invoke the
-# OLD scripts/{start-cli,sutando-shell-setup}.sh paths, and would hard-fail after
-# a `git pull` if those paths vanished. This asserts the shims exist, are
-# executable, parse, and exec-forward to their canonical homes. start-cli now
-# targets the runtime dispatcher; sutando-shell-setup remains Claude-specific.
-# It does NOT run the shims (that would launch the live core) — structural only.
+# OLD scripts/sutando-shell-setup.sh path, and would hard-fail after a `git pull`
+# if that path vanished. This asserts the remaining shim exists, is executable,
+# parses, and exec-forwards to its canonical home. The generic core launcher has
+# no old-path shim: all callers use src/agent/start-cli.sh directly.
+# It does NOT run the shim — structural only.
 set -u
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 fail=0
 
-for name in start-cli sutando-shell-setup; do
+for name in sutando-shell-setup; do
     shim="$REPO/scripts/$name.sh"
-    if [ "$name" = "start-cli" ]; then
-        target="src/agent/start-cli.sh"
-    else
-        target="src/agent/claude/cli/$name.sh"
-    fi
+    target="src/agent/claude/cli/$name.sh"
 
     [ -f "$shim" ] || { echo "  FAIL: compat shim $shim is missing"; fail=1; continue; }
     [ -x "$shim" ] || { echo "  FAIL: compat shim $shim is not executable"; fail=1; }
@@ -30,7 +26,7 @@ for name in start-cli sutando-shell-setup; do
 done
 
 if [ "$fail" -eq 0 ]; then
-    echo "PASS: launcher compat shims forward to their canonical targets"
+    echo "PASS: shell-setup compat shim forwards to its canonical target"
 else
     echo "compat-shim test FAILED"
     exit 1
