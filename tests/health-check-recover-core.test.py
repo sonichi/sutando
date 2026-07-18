@@ -268,6 +268,38 @@ def case_j_dead_core_relaunches() -> list[str]:
     return fails
 
 
+def case_j2_dead_core_before_after_output() -> list[str]:
+    """BEFORE/AFTER health-check output for the dead-core relaunch (CR #2160):
+    run the SAME recover-core check in two states and capture the action + the
+    DM the owner would see.
+      BEFORE (healthy, non-wedged core): no action, no restart, no DM.
+      AFTER  (a confirmed-dead core):    'restarted' + the skull 'core is down /
+                                          Auto-relaunching' DM, restart called once.
+    """
+    fails = []
+    # BEFORE — a healthy core with only fresh work: nothing happens (no output).
+    with tempfile.TemporaryDirectory() as td:
+        hb = Harness(Path(td) / "rec.json")
+        rb = hb.run(now=1_000_000, alive=True, age=10)      # alive + fresh task → healthy
+        print("  BEFORE (healthy core): action=%r restart_calls=%r DM=%r"
+              % ((rb or {}).get("action"), hb.restart_calls, hb.sent))
+        if hb.restart_calls or hb.sent:
+            fails.append(f"j2) healthy core should produce no restart/DM, got {hb.restart_calls}/{hb.sent}")
+    # AFTER — a confirmed-dead core: relaunch once + the skull DM.
+    with tempfile.TemporaryDirectory() as td:
+        ha = Harness(Path(td) / "rec.json")
+        ha.run(now=1_000_000, alive=False, age=5000)         # first pass → observe
+        ra = ha.run(now=1_000_200, alive=False, age=5000)    # +200s > CONFIRM → relaunch
+        print("  AFTER  (dead core):    action=%r restart_calls=%r DM=%r"
+              % ((ra or {}).get("action"), ha.restart_calls, ha.sent))
+        if (ra or {}).get("action") != "restarted" or ha.restart_calls != [False]:
+            fails.append(f"j2) dead core should relaunch once, got {ra}/{ha.restart_calls}")
+        dm = " ".join(ha.sent).lower()
+        if not ("down" in dm and "relaunch" in dm):
+            fails.append(f"j2) dead relaunch should DM 'core is down / relaunching', got {ha.sent}")
+    return fails
+
+
 def case_k_draining_backlog_never_restarts() -> list[str]:
     """A busy-but-healthy core surfaces a DIFFERENT oldest task each pass as it
     drains the queue. The identity check must reset the window every time, so
@@ -398,6 +430,7 @@ def main() -> int:
         ("h", case_h_give_up_cap),
         ("i", case_i_failed_restart_does_not_burn_state),
         ("j", case_j_dead_core_relaunches),
+        ("j2", case_j2_dead_core_before_after_output),
         ("k", case_k_draining_backlog_never_restarts),
         ("l", case_l_progress_resets_long_task),
         ("m", case_m_lock_prevents_concurrent_restart),
