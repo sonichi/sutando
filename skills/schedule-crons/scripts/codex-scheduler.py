@@ -163,6 +163,7 @@ def load_jobs(config_path: Path) -> list[dict[str, Any]]:
         raise ValueError("crons.json must contain a JSON array")
     jobs: list[dict[str, Any]] = []
     names: set[str] = set()
+    slugs: dict[str, str] = {}
     for entry in raw:
         if not isinstance(entry, dict) or entry.get("execution") != "codex-task":
             continue
@@ -172,6 +173,12 @@ def load_jobs(config_path: Path) -> list[dict[str, Any]]:
         if name in names:
             raise ValueError(f"duplicate codex-task job name: {name}")
         names.add(name)
+        slug = safe_name(name)
+        if slug in slugs:
+            raise ValueError(
+                f"codex-task job names collide after normalization: {slugs[slug]!r} and {name!r}"
+            )
+        slugs[slug] = name
         if not isinstance(entry.get("cron"), str):
             raise ValueError(f"{name}: cron is required")
         # Validate cron and timezone up front rather than silently missing runs.
@@ -186,18 +193,23 @@ def load_jobs(config_path: Path) -> list[dict[str, Any]]:
     return jobs
 
 
-def _task_paths(workspace: Path, job: dict[str, Any], slot: datetime) -> tuple[str, Path, Path, Path]:
+def _task_paths(
+    workspace: Path, job: dict[str, Any], slot: datetime, attempt: int = 1
+) -> tuple[str, Path, Path, Path]:
     stamp = int(slot.timestamp())
     slug = safe_name(job["name"])
-    task_id = f"task-cron-{slug}-{stamp}"
+    attempt_suffix = "" if attempt == 1 else f"-a{attempt}"
+    task_id = f"task-cron-{slug}-{stamp}{attempt_suffix}"
     task_path = workspace / "tasks" / f"{task_id}.txt"
     result_path = workspace / "results" / f"{task_id}.txt"
     proactive_path = workspace / "results" / f"proactive-{slug}-{stamp}.txt"
     return task_id, task_path, result_path, proactive_path
 
 
-def _task_body(workspace: Path, job: dict[str, Any], slot: datetime, now: datetime) -> tuple[str, str]:
-    task_id, _, result_path, proactive_path = _task_paths(workspace, job, slot)
+def _task_body(
+    workspace: Path, job: dict[str, Any], slot: datetime, now: datetime, attempt: int = 1
+) -> tuple[str, str]:
+    task_id, _, result_path, proactive_path = _task_paths(workspace, job, slot, attempt)
     prompt = confine_user_content(job.get("prompt") or f"/{job['prompt_skill']}")
     if job.get("delivery") == "proactive":
         prompt += (
@@ -218,11 +230,50 @@ def _task_body(workspace: Path, job: dict[str, Any], slot: datetime, now: dateti
     return task_id, body
 
 
-def _enqueue(workspace: Path, job: dict[str, Any], slot: datetime, now: datetime) -> str:
-    task_id, body = _task_body(workspace, job, slot, now)
+def _enqueue(
+    workspace: Path, job: dict[str, Any], slot: datetime, now: datetime, attempt: int = 1
+) -> str:
+    task_id, body = _task_body(workspace, job, slot, now, attempt)
     task_path = workspace / "tasks" / f"{task_id}.txt"
     atomic_text(task_path, body)
     return task_id
+
+
+def _current_task_ids(current: dict[str, Any]) -> list[str]:
+    values = current.get("task_ids")
+    if isinstance(values, list):
+        task_ids = [value for value in values if isinstance(value, str) and value]
+        if task_ids:
+            return task_ids
+    task_id = current.get("task_id")
+    return [task_id] if isinstance(task_id, str) and task_id else []
+
+
+def _find_result(workspace: Path, task_ids: list[str]) -> Path | None:
+    archive = workspace / "results" / "archive"
+    for task_id in task_ids:
+        live = workspace / "results" / f"{task_id}.txt"
+        if live.exists():
+            return live
+        legacy = archive / f"{task_id}.txt"
+        if legacy.exists():
+            return legacy
+        archived = sorted(archive.glob(f"*/{task_id}.txt"))
+        if archived:
+            return archived[-1]
+    return None
+
+
+def _task_is_active(workspace: Path, task_ids: list[str]) -> bool:
+    tasks = workspace / "tasks"
+    for task_id in task_ids:
+        if (tasks / f"{task_id}.txt").exists():
+            return True
+        if (tasks / "processed" / f"{task_id}.txt").exists():
+            return True
+        if next(tasks.glob(f"{task_id}.claimed-core-*.txt"), None) is not None:
+            return True
+    return False
 
 
 def _alert(workspace: Path, job_name: str, message: str, now: datetime) -> Path:
@@ -268,8 +319,9 @@ def tick(workspace: Path, host_label: str, now: datetime | None = None) -> dict[
             max_attempts = max(1, int(job.get("max_attempts", DEFAULT_MAX_ATTEMPTS)))
 
             if current:
-                result_path = workspace / "results" / f"{current['task_id']}.txt"
-                if result_path.exists():
+                task_ids = _current_task_ids(current)
+                result_path = _find_result(workspace, task_ids)
+                if result_path is not None:
                     job_state["last_success_at"] = iso(now)
                     job_state["last_success_slot"] = current["slot"]
                     job_state["last_result"] = str(result_path)
@@ -279,12 +331,18 @@ def tick(workspace: Path, host_label: str, now: datetime | None = None) -> dict[
                 else:
                     last_enqueue = parse_iso(current.get("last_enqueue_at")) or now
                     age = (now - last_enqueue).total_seconds()
-                    if age >= retry_minutes * 60:
+                    # Never create a second watcher event while any prior attempt
+                    # remains queued, claimed, or processed. Retrying a live task
+                    # can duplicate irreversible side effects.
+                    if age >= retry_minutes * 60 and not _task_is_active(workspace, task_ids):
                         if int(current.get("attempts", 1)) < max_attempts:
                             slot = parse_iso(current["slot"])
                             assert slot is not None
-                            _enqueue(workspace, job, slot, now)
-                            current["attempts"] = int(current.get("attempts", 1)) + 1
+                            attempt = int(current.get("attempts", 1)) + 1
+                            task_id = _enqueue(workspace, job, slot, now, attempt)
+                            current["attempts"] = attempt
+                            current["task_id"] = task_id
+                            current["task_ids"] = [*task_ids, task_id]
                             current["last_enqueue_at"] = iso(now)
                             events.append({"job": name, "event": "retried", "attempt": current["attempts"]})
                         else:
@@ -309,6 +367,7 @@ def tick(workspace: Path, host_label: str, now: datetime | None = None) -> dict[
                     job_state["current"] = {
                         "slot": iso(slot),
                         "task_id": task_id,
+                        "task_ids": [task_id],
                         "attempts": 1,
                         "first_enqueue_at": iso(now),
                         "last_enqueue_at": iso(now),

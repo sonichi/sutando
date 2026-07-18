@@ -7,7 +7,8 @@ trap 'rm -rf "$TMP"' EXIT
 
 run_runtime_config() {
   local gemini_key="${1:-}"
-  env -i PATH="/usr/bin:/bin" GEMINI_API_KEY="$gemini_key" \
+  local voice_key="${2:-}"
+  env -i PATH="/usr/bin:/bin" GEMINI_API_KEY="$gemini_key" GEMINI_VOICE_API_KEY="$voice_key" \
     bash -c 'cd "$1"; source "$2/src/startup-runtime.sh"; configure_startup_runtime; printf "SKIP_VOICE=%s\n" "${SKIP_VOICE:-0}"' \
     _ "$TMP" "$REPO"
 }
@@ -21,6 +22,13 @@ with_key="$(run_runtime_config test-key)"
 grep -q 'SKIP_VOICE=0' <<<"$with_key"
 if grep -q 'voice agent disabled' <<<"$with_key"; then
   echo "voice was disabled despite configured credentials" >&2
+  exit 1
+fi
+
+with_voice_key="$(run_runtime_config '' voice-test-key)"
+grep -q 'SKIP_VOICE=0' <<<"$with_voice_key"
+if grep -q 'voice agent disabled' <<<"$with_voice_key"; then
+  echo "voice was disabled despite a dedicated voice credential" >&2
   exit 1
 fi
 

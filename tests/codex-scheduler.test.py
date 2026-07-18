@@ -96,6 +96,10 @@ def test_helpers_and_config_validation():
             {"execution": "codex-task", "name": "same", "cron": "* * * * *", "prompt": "x"},
             {"execution": "codex-task", "name": "same", "cron": "* * * * *", "prompt": "x"},
         ], "duplicate")
+        rejects([
+            {"execution": "codex-task", "name": "daily news", "cron": "* * * * *", "prompt": "x"},
+            {"execution": "codex-task", "name": "daily-news", "cron": "* * * * *", "prompt": "x"},
+        ], "collide after normalization")
         rejects([{"execution": "codex-task", "name": "missing-cron", "prompt": "x"}], "cron is required")
         rejects([{
             "execution": "codex-task", "name": "bad-zone", "cron": "* * * * *",
@@ -118,15 +122,30 @@ def test_enqueue_retry_complete_and_no_duplicate():
         assert "proactive-daily-news" in body and "[no-send]" in body
 
         assert scheduler.tick(ws, "test-host", at(6, 1))["events"] == []
-        retry = scheduler.tick(ws, "test-host", at(6, 5))
+
+        # A queued or claimed original attempt must never be rewritten/re-fired.
+        assert scheduler.tick(ws, "test-host", at(6, 5))["events"] == []
+        claimed = tasks[0].with_name(f"{tasks[0].stem}.claimed-core-1.txt")
+        tasks[0].rename(claimed)
+        assert scheduler.tick(ws, "test-host", at(6, 6))["events"] == []
+
+        # Once no attempt is active, retry with a distinct ID rather than
+        # overwriting the original task path and generating a duplicate event.
+        claimed.unlink()
+        retry = scheduler.tick(ws, "test-host", at(6, 7))
         assert retry["events"] == [{"job": "daily-news", "event": "retried", "attempt": 2}]
         assert len(list((ws / "tasks").glob("*.txt"))) == 1
+        retry_task = next((ws / "tasks").glob("*.txt"))
+        assert retry_task.stem != tasks[0].stem
+        assert retry_task.stem.endswith("-a2")
 
+        # task-bridge archives [no-send] results after five seconds. Completion
+        # must recognize that archive, including a late result from attempt 1.
         task_id = tasks[0].stem
-        result = ws / "results" / f"{task_id}.txt"
+        result = ws / "results" / "archive" / "2026-07" / f"{task_id}.txt"
         result.parent.mkdir(parents=True, exist_ok=True)
         result.write_text("[no-send]\n")
-        done = scheduler.tick(ws, "test-host", at(6, 6))
+        done = scheduler.tick(ws, "test-host", at(6, 8))
         assert done["events"] == [{"job": "daily-news", "event": "completed"}]
         state = json.loads((ws / "state" / "schedules" / "codex-scheduler.json").read_text())
         assert state["jobs"]["daily-news"]["last_success_at"]
@@ -138,6 +157,7 @@ def test_failure_alert_and_health():
         ws = Path(td)
         config(ws, max_attempts=1)
         scheduler.tick(ws, "test-host", at(6, 0))
+        next((ws / "tasks").glob("*.txt")).unlink()
         failed = scheduler.tick(ws, "test-host", at(6, 5))
         assert failed["events"] == [{"job": "daily-news", "event": "failed"}]
         assert len(list((ws / "results").glob("proactive-schedule-alert-*.txt"))) == 1
