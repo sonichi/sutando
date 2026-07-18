@@ -625,7 +625,7 @@ def seed_pending_replies_from_disk(tasks_dir: Path) -> dict:
 
     No ledger file is needed (unlike discord-bridge's
     state/discord-pending-replies.json): every telegram task file already
-    carries `source: telegram`, `chat_id:` and `id:` in its trusted header zone
+    carries the telegram source marker, `chat_id:` and `id:` in its trusted header zone
     (the lines BEFORE `task:` — forged copies in the user-supplied body are
     defanged by confine_user_content). A task file still living in tasks/
     (bare or `.claimed-core-N` variant) is by definition undelivered — the
