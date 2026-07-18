@@ -1540,6 +1540,19 @@ def apply_skill_symlink_fixes(checks: list) -> None:
             print(f"  {c['name']}: {result['detail']}")
 
 
+def _pending_task_files(tasks_dir: Path, results_dir: Optional[Path] = None) -> list[Path]:
+    """Top-level task files that have not produced their canonical result."""
+    if results_dir is None:
+        results_dir = tasks_dir.parent / "results"
+    try:
+        return [
+            path for path in tasks_dir.glob("*.txt")
+            if path.is_file() and not (results_dir / path.name).is_file()
+        ]
+    except OSError:
+        return []
+
+
 def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> dict:
     """Detect a task-queue pileup — tasks/ directory growing without
     being drained. Independent of which watcher / loop is dying: the queue
@@ -1553,7 +1566,7 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> 
         return {"name": name, "status": "ok", "detail": "tasks/ not yet created"}
     # *.txt at the top level only — archive lives in tasks/archive/<YYYY-MM>/
     # (PR #591) and shouldn't count toward the queue.
-    files = [p for p in tasks_dir.glob("*.txt") if p.is_file()]
+    files = _pending_task_files(tasks_dir)
     if not files:
         return {"name": name, "status": "ok", "detail": "queue empty"}
     now = time.time()
@@ -2540,10 +2553,7 @@ def _oldest_pending_task(now: float, tasks_dir: Optional[Path] = None) -> "tuple
     backlog never triggers a restart."""
     if tasks_dir is None:
         tasks_dir = WORKSPACE_DIR / "tasks"
-    try:
-        files = [p for p in tasks_dir.glob("*.txt") if p.is_file()]
-    except OSError:
-        return None
+    files = _pending_task_files(tasks_dir)
     if not files:
         return None
     try:

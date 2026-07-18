@@ -11,12 +11,18 @@ else
   TASKS_DIR="$(bash "$REPO/scripts/sutando-config.sh" workspace)/tasks"
 fi
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$(dirname "$TASKS_DIR")/results}"
+POLL_INTERVAL="${SUTANDO_NOTIFIER_POLL_INTERVAL:-0.5}"
+COMPLETION_TIMEOUT="${SUTANDO_NOTIFIER_COMPLETION_TIMEOUT:-3600}"
 
 submit_task() {
-  local filename="$1" prompt
+  local filename="$1" wait_for_result="${2:-0}" prompt started
   case "$filename" in
     ""|*/*|*..*) return 0 ;;
   esac
+  # The stream watcher deliberately sweeps pre-existing task files after a
+  # restart. Completed tasks remain in tasks/ for dashboard history, so do not
+  # replay any task whose bridge result already exists.
+  [ -f "$RESULTS_DIR/$filename" ] && return 0
   prompt="Sutando task ready: $filename. Read $TASKS_DIR/$filename, follow AGENTS.md, complete the task, and write the result to $RESULTS_DIR/$filename."
   if ! tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
     exit 0
@@ -30,6 +36,25 @@ submit_task() {
   # `Enter` can be rendered as an input newline without dispatching the turn on
   # current Codex builds; C-m is the reliable terminal submit sequence.
   tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION:0" C-m
+
+  # Codex's interactive input is not a durable multi-message queue: sending a
+  # second prompt while the first turn is starting can replace or interleave
+  # input. The managed watcher therefore releases one task at a time and uses
+  # the bridge result as the completion acknowledgement. `--event` remains a
+  # fire-and-forget diagnostic hook.
+  if [ "$wait_for_result" = "1" ]; then
+    started="$(date +%s)"
+    while [ ! -f "$RESULTS_DIR/$filename" ]; do
+      session_exists=0
+      tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null && session_exists=1
+      [ "$session_exists" = "1" ] || return 0
+      if [ $(( $(date +%s) - started )) -ge "$COMPLETION_TIMEOUT" ]; then
+        echo "task-notifier: timed out waiting for result: $filename" >&2
+        return 0
+      fi
+      sleep "$POLL_INTERVAL"
+    done
+  fi
 }
 
 if [ "${1:-}" = "--event" ]; then
@@ -40,6 +65,6 @@ fi
 
 bash "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" | while IFS= read -r event; do
   case "$event" in
-    "TASK_FILE: "*) submit_task "${event#TASK_FILE: }" ;;
+    "TASK_FILE: "*) submit_task "${event#TASK_FILE: }" 1 ;;
   esac
 done

@@ -24,6 +24,7 @@ Covers:
     k) small queue, all old → ok (age alone shouldn't alarm)
     l) large queue with old oldest → warn
     m) archive subdir is excluded from the count
+    m2) completed tasks with canonical results are excluded from the count
 
   Notification dedup — `notify_for_failures`
     n) empty failures → no notification
@@ -264,6 +265,20 @@ def case_m_archive_excluded() -> list[str]:
     return fails
 
 
+def case_m2_completed_tasks_excluded() -> list[str]:
+    fails = []
+    def setup(d):
+        results = d.parent / "results"
+        results.mkdir()
+        for i in range(8):
+            task = write_task(d, f"task-{i}.txt", age_sec=600)
+            (results / task.name).write_text("complete")
+    r = with_tasks_override(setup)
+    if r["status"] != "ok" or "empty" not in r["detail"]:
+        fails.append(f"m2) completed tasks counted as pending: {r['detail']}")
+    return fails
+
+
 # ---------------------------------------------------------------------------
 # Notify-on-fail dedup — notify_for_failures
 # ---------------------------------------------------------------------------
@@ -397,6 +412,7 @@ def main() -> int:
         ("k", case_k_small_old_queue),
         ("l", case_l_pileup),
         ("m", case_m_archive_excluded),
+        ("m2", case_m2_completed_tasks_excluded),
         ("n", case_n_notify_empty_no_call),
         ("o", case_o_dedup_within_cooldown),
         ("p", case_p_different_sets_both_fire),
