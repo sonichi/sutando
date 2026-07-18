@@ -29,7 +29,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install coverage tooling + test deps
-        run: python3 -m pip install coverage diff-cover 'detect-secrets>=1.5.0'
+        run: python3 -m pip install coverage diff-cover 'detect-secrets>=1.5.0' 'discord.py>=2.3'
 
       - name: Run coverage gate
         env:
