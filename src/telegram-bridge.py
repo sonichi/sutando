@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import urllib.request
@@ -359,7 +360,7 @@ def download_file(file_id, name_hint="file"):
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Sutando"})
         with urllib.request.urlopen(req, timeout=30) as resp, open(local_path, "wb") as f:
-            f.write(resp.read())
+            shutil.copyfileobj(resp, f)
         return str(local_path)
     except Exception as e:
         print(f"  Download failed: {e}")
