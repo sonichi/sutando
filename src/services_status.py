@@ -128,6 +128,20 @@ def probe_port(port: int, connect) -> tuple[str, str, float | None]:
         return ("unknown", f"probe error: {e}", None)
 
 
+def probe_process(pattern: str, pgrep) -> tuple[str, str, float | None]:
+    """A process matched by a `pgrep -f <pattern>`: running if `pgrep(pattern)`
+    returns a truthy pid list. For services with no port/pidfile (the bridges,
+    the gateway) — the same detection health-check.py uses. `pgrep` is injected
+    (real: /usr/bin/pgrep -f) so the branch logic is testable without a process."""
+    try:
+        pids = pgrep(pattern)
+        if pids:
+            return ("running", f"pid {pids[0]}", None)
+        return ("offline", "no process", None)
+    except Exception as e:  # pragma: no cover — pgrep callable is defensive
+        return ("unknown", f"probe error: {e}", None)
+
+
 def _real_pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -147,24 +161,51 @@ def _real_connect(port: int, timeout: float = 0.25) -> bool:
         return False
 
 
+def _real_pgrep(pattern: str) -> list[str]:
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["/usr/bin/pgrep", "-f", pattern],
+            capture_output=True, text=True, timeout=3,
+        )
+        return [p for p in out.stdout.split() if p]
+    except Exception:  # pragma: no cover — pgrep missing/timeout → treat as none
+        return []
+
+
 def service_registry() -> list[dict]:
-    """The seed set of services to report. Deliberately conservative — only the
-    services with an unambiguous existing liveness signal are listed, so the
-    emit is correct today. Network services the desktop supervises (gateway,
-    voice) are one-line additions here once the G9 "which services" design call
-    lands; the schema + UI already carry any number of entries."""
+    """The full supervised-service set the desktop Settings → Services surface
+    shows — matched to sutando-desktop's dashboard (owner G9, 2026-07-18: "all
+    the services shown in the dashboard of Sutando-desktop"). Ports + pgrep
+    patterns mirror `src/health-check.py` (the detection source of truth):
+    voice-agent :9900, web-client :8080, conversation-server :3100,
+    screen-capture :7845, credential-proxy :7846; gateway + bridges are pgrep'd
+    (no fixed port). A service not running reports `offline` (correct — the UI
+    shows it greyed), so listing all is safe on hosts that run only some."""
     host = _host_label()
     return [
-        {
-            "id": "core",
-            "name": "Sutando Core",
-            "probe": ("alive_file", CORES_DIR / f"{host}.alive"),
-        },
-        {
-            "id": "task-watcher",
-            "name": "Task Watcher",
-            "probe": ("pidfile", STATE_DIR / "watch-tasks-stream.pid"),
-        },
+        {"id": "core", "name": "Sutando Core",
+         "probe": ("alive_file", CORES_DIR / f"{host}.alive")},
+        {"id": "gateway", "name": "AG2 Gateway",
+         "probe": ("process", r"remote-gateway-bridge\.py$")},
+        {"id": "task-watcher", "name": "Task Watcher",
+         "probe": ("pidfile", STATE_DIR / "watch-tasks-stream.pid")},
+        {"id": "voice-agent", "name": "Voice Agent",
+         "probe": ("port", 9900)},
+        {"id": "web-client", "name": "Web Client",
+         "probe": ("port", 8080)},
+        {"id": "conversation-server", "name": "Phone",
+         "probe": ("port", 3100)},
+        {"id": "screen-capture", "name": "Screen Capture",
+         "probe": ("port", 7845)},
+        {"id": "credential-proxy", "name": "Credential Proxy",
+         "probe": ("port", 7846)},
+        {"id": "discord-bridge", "name": "Discord",
+         "probe": ("process", r"discord-bridge\.py")},
+        {"id": "slack-bridge", "name": "Slack",
+         "probe": ("process", r"slack-bridge\.py")},
+        {"id": "telegram-bridge", "name": "Telegram",
+         "probe": ("process", r"telegram-bridge\.py")},
     ]
 
 
@@ -174,9 +215,10 @@ def build_payload(
     *,
     pid_alive=_real_pid_alive,
     connect=_real_connect,
+    pgrep=_real_pgrep,
 ) -> dict:
     """Assemble the full services-status payload from the registry. Pure given
-    the injected `pid_alive`/`connect` callables and `now`."""
+    the injected `pid_alive`/`connect`/`pgrep` callables and `now`."""
     services = []
     for spec in registry:
         kind, arg = spec["probe"]
@@ -186,6 +228,8 @@ def build_payload(
             status, detail, since = probe_pidfile(arg, pid_alive)
         elif kind == "port":
             status, detail, since = probe_port(arg, connect)
+        elif kind == "process":
+            status, detail, since = probe_process(arg, pgrep)
         else:  # pragma: no cover — registry is code-owned; guards a typo
             status, detail, since = ("unknown", f"bad probe kind: {kind}", None)
         services.append({
@@ -243,8 +287,8 @@ def run_forever(interval: float = 30.0) -> int:
             print(f"services_status: write failed: {e}", file=sys.stderr, flush=True)
         slept = 0.0
         slice_s = min(1.0, interval)
-        while slept < interval and not _SHUTDOWN_REQUESTED:
-            time.sleep(slice_s)  # pragma: no cover — timing glue; loop body tested via injected emit
+        while slept < interval and not _SHUTDOWN_REQUESTED:  # pragma: no cover — timing glue; loop body tested via injected emit
+            time.sleep(slice_s)
             slept += slice_s
     return 0
 

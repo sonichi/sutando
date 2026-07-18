@@ -100,6 +100,26 @@ def test_port_offline():
     assert "not listening" in detail
 
 
+def test_process_running():
+    status, detail, _ = ss.probe_process("discord-bridge.py", pgrep=lambda pat: ["4242"])
+    assert status == "running"
+    assert "4242" in detail
+
+
+def test_process_offline():
+    status, detail, _ = ss.probe_process("discord-bridge.py", pgrep=lambda pat: [])
+    assert status == "offline"
+    assert "no process" in detail
+
+
+def test_real_pgrep_returns_list():
+    # pgrep -f for a pattern that matches this very python process (its argv
+    # contains the test file path) → non-empty; a nonsense pattern → empty.
+    import os
+    assert isinstance(ss._real_pgrep("services-status"), list)
+    assert ss._real_pgrep("zzz-no-such-process-zzz-9999") == []
+
+
 def test_build_payload_shape_and_status():
     now = 2_000_000.0
     alive = _tmp("beat", mtime=now - 5)
@@ -108,11 +128,13 @@ def test_build_payload_shape_and_status():
         {"id": "core", "name": "Sutando Core", "probe": ("alive_file", alive)},
         {"id": "task-watcher", "name": "Task Watcher", "probe": ("pidfile", pidf)},
         {"id": "gw", "name": "Gateway", "probe": ("port", 8080)},
+        {"id": "discord-bridge", "name": "Discord", "probe": ("process", r"discord-bridge\.py")},
     ]
     payload = ss.build_payload(
         registry, now,
         pid_alive=lambda pid: True,
         connect=lambda port: False,
+        pgrep=lambda pat: ["777"],
     )
     assert payload["schema_version"] == ss.SCHEMA_VERSION
     assert payload["emitted_at"] == now
@@ -121,6 +143,7 @@ def test_build_payload_shape_and_status():
     assert by_id["core"]["status"] == "running"
     assert by_id["task-watcher"]["status"] == "running"
     assert by_id["gw"]["status"] == "offline"
+    assert by_id["discord-bridge"]["status"] == "running"
     # every service carries the full field set
     for s in payload["services"]:
         assert set(s) == {"id", "name", "status", "pid", "since", "detail", "last_check_at"}
@@ -150,12 +173,20 @@ def test_write_payload_atomic_and_valid_json():
     assert not out.with_suffix(".json.tmp").exists()
 
 
-def test_service_registry_is_conservative():
+def test_service_registry_full_desktop_set():
+    # G9: the registry covers the sutando-desktop dashboard service set.
     reg = ss.service_registry()
     ids = {s["id"] for s in reg}
-    assert "core" in ids and "task-watcher" in ids
+    for expected in ("core", "gateway", "task-watcher", "voice-agent", "web-client",
+                     "conversation-server", "screen-capture", "credential-proxy",
+                     "discord-bridge", "slack-bridge", "telegram-bridge"):
+        assert expected in ids, expected
     for s in reg:
-        assert s["probe"][0] in ("alive_file", "pidfile", "port")
+        assert s["probe"][0] in ("alive_file", "pidfile", "port", "process")
+    # a full build over the real registry must not raise and covers every kind
+    payload = ss.build_payload(reg, 1.0, pid_alive=lambda p: False,
+                               connect=lambda p: False, pgrep=lambda pat: [])
+    assert len(payload["services"]) == len(reg)
 
 
 def test_emit_once_returns_payload():
