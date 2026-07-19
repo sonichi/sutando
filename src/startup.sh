@@ -67,9 +67,21 @@ _NODE_BIN="$(bash "$REPO/scripts/sutando-config.sh" node-bin)" || {
   echo "✗ SUTANDO_NODE is set but invalid — desktop packaging error; refusing PATH fallback (G1.5 fail-closed)"
   exit 1
 }
+# At-rest discovery is scoped to the PACKAGED ENGINE COPY ONLY: the checkout
+# must itself live inside the engine root that owns the runtime
+# (<engine-root>/runtime/node/bin + <engine-root>/.../this repo). A dev
+# checkout on a machine that merely HAS the app installed must stay dev even
+# after `npm run build:bundle` — stale dist can never shadow live src
+# (Codex finding #3).
+_APP_ENGINE_ROOT="${_APP_NODE_DIR%/node/bin}"
+_APP_ENGINE_ROOT="${_APP_ENGINE_ROOT%/runtime}"
 BUNDLED_MODE=0
-if { [ -n "${SUTANDO_NODE:-}" ] || [ -x "$_APP_NODE_DIR/node" ]; } && [ -f "$REPO/dist/web-client.js" ]; then
-  BUNDLED_MODE=1
+if [ -f "$REPO/dist/web-client.js" ]; then
+  if [ -n "${SUTANDO_NODE:-}" ]; then
+    BUNDLED_MODE=1
+  elif [ -x "$_APP_NODE_DIR/node" ] && [ "${REPO#"$_APP_ENGINE_ROOT"/}" != "$REPO" ]; then
+    BUNDLED_MODE=1
+  fi
 fi
 if [ -n "${SUTANDO_NODE:-}" ]; then
   _SUTANDO_NODE_DIR="$(dirname "$SUTANDO_NODE")"
