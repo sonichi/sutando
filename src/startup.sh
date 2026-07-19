@@ -387,8 +387,22 @@ echo ""
 # things piece by piece.
 bash "$REPO/src/init.sh" --preflight | tail -1
 
-# Install dependencies if needed
-if [ ! -d node_modules ]; then
+# Bundled mode (G1.5 node-bundle, Codex review finding on #2182): when the
+# desktop app manages the launch it exports SUTANDO_NODE and ships pre-built
+# dist artifacts — there is deliberately NO npm/npx/node_modules in that
+# runtime, so the dependency bootstrap and the npx prerequisite below would
+# kill startup before run_node_service ever runs. Gate them off. Sentinel =
+# a valid SUTANDO_NODE plus the web-client dist artifact (built by
+# build:bundle; the one service every install runs).
+BUNDLED_MODE=0
+if [ -n "${SUTANDO_NODE:-}" ] && [ -x "${SUTANDO_NODE}" ] && [ -f "$REPO/dist/web-client.js" ]; then
+  BUNDLED_MODE=1
+  echo "  ✓ bundled mode (SUTANDO_NODE + dist artifacts) — skipping dependency bootstrap"
+fi
+
+# Install dependencies if needed (dev/source mode only — bundled installs
+# run dist artifacts under the pinned node and need no node_modules).
+if [ "$BUNDLED_MODE" != "1" ] && [ ! -d node_modules ]; then
   if command -v npm > /dev/null 2>&1 && npm install 2>/dev/null; then
     echo "  ✓ Dependencies installed (npm)"
   elif command -v pnpm > /dev/null 2>&1 && pnpm install 2>/dev/null; then
@@ -405,9 +419,13 @@ fi
 
 # Check CLI prerequisites. node/npx/python3, the selected core runtime, and
 # fswatch are checked here because they are not needed for init.sh bootstrap.
+# Bundled mode: node is $SUTANDO_NODE (its dir already heads PATH) and npx is
+# intentionally absent (bare-node runtime, dist-first services) — skip both.
 missing=0
-if ! command -v node > /dev/null 2>&1; then echo "  ✗ node not found — brew install node"; missing=1; fi
-if ! command -v npx > /dev/null 2>&1; then echo "  ✗ npx not found — comes with node"; missing=1; fi
+if [ "$BUNDLED_MODE" != "1" ]; then
+  if ! command -v node > /dev/null 2>&1; then echo "  ✗ node not found — brew install node"; missing=1; fi
+  if ! command -v npx > /dev/null 2>&1; then echo "  ✗ npx not found — comes with node"; missing=1; fi
+fi
 if ! command -v python3 > /dev/null 2>&1; then echo "  ✗ python3 not found"; missing=1; fi
 core_runtime="$(bash "$REPO/scripts/sutando-config.sh" core-runtime)"
 if ! command -v "$core_runtime" > /dev/null 2>&1; then
