@@ -363,4 +363,16 @@ if __name__ == "__main__":
     # the finalization that crashes; the test result (_rc) is unaffected.
     sys.stdout.flush()
     sys.stderr.flush()
+    # os._exit() below skips atexit handlers — including coverage.py's data
+    # writer — so under `coverage run` this file would record 0% and its
+    # exercised src/slack-bridge.py lines show as uncovered in the diff gate
+    # (spurious failures on any slack-bridge PR). Flush the active coverage
+    # session explicitly before the hard exit.
+    try:
+        import coverage
+        _cov = coverage.Coverage.current()
+        if _cov is not None:
+            _cov.save()
+    except Exception:
+        pass
     os._exit(_rc)

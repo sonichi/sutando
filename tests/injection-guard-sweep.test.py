@@ -347,6 +347,7 @@ _check(
 # ---------------------------------------------------------------------------
 
 _GUARDED_PY_WRITERS = {
+    "skills/schedule-crons/scripts/codex-scheduler.py",
     "src/discord-bridge.py",
     "src/telegram-bridge.py",
     "src/slack-bridge.py",

@@ -359,7 +359,7 @@ def _transcribe_via_skill(local_path: str) -> str | None:
     Errors are swallowed; transcription failure must never block task delivery.
     """
     import subprocess
-    skill_script = Path(__file__).parent.parent / "skills" / "audio-transcribe" / "scripts" / "transcribe.py"
+    skill_script = Path(os.path.realpath(__file__)).parent.parent / "skills" / "audio-transcribe" / "scripts" / "transcribe.py"
     if not skill_script.exists():
         return None
     try:
@@ -1017,6 +1017,8 @@ def main():  # pragma: no cover
             result_file = RESULTS_DIR / f"{task_id}.txt"
             if result_file.exists():
                 reply_text = result_file.read_text().strip()
+                if not reply_text:
+                    continue
                 chat_id = pending_replies.pop(task_id)
                 # Parse markers via the unified module (#873). Telegram
                 # honors [no-send] / [REPLIED] / [deduped: <id>] as skip,

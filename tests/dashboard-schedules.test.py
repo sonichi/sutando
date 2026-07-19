@@ -81,7 +81,7 @@ def test_cron_next_run_no_match_in_horizon():
 # --------------------------------------------------------------------------- #
 def _with_crons(tmp: Path, jobs):
     host = "test-host"
-    dashboard.socket.gethostname = lambda: f"{host}.local"  # → split(".")[0]
+    dashboard._host_label = lambda: host  # production keys hosts/<host>/ off _host_label()
     dashboard.WORKSPACE_DIR = tmp
     d = tmp / "hosts" / host
     d.mkdir(parents=True, exist_ok=True)
@@ -91,7 +91,7 @@ def _with_crons(tmp: Path, jobs):
 
 def test_get_schedules_missing_file_returns_empty():
     with tempfile.TemporaryDirectory() as td:
-        dashboard.socket.gethostname = lambda: "nohost"
+        dashboard._host_label = lambda: "nohost"
         dashboard.WORKSPACE_DIR = Path(td)
         assert dashboard.get_schedules() == []
 
@@ -100,7 +100,7 @@ def test_get_schedules_bad_json_returns_empty():
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         host = "test-host"
-        dashboard.socket.gethostname = lambda: host
+        dashboard._host_label = lambda: host
         dashboard.WORKSPACE_DIR = tmp
         d = tmp / "hosts" / host
         d.mkdir(parents=True)

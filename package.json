@@ -1,7 +1,7 @@
 {
   "name": "sutando",
   "version": "0.1.0",
-  "description": "Sutando \u2014 a personal AI agent. Voice interface backed by Claude Code.",
+  "description": "Sutando \u2014 a personal AI agent with a voice interface and selectable Claude Code or Codex CLI core.",
   "type": "module",
   "scripts": {
     "start": "tsx src/voice-agent.ts",

@@ -914,7 +914,7 @@ async def _run_codex_subprocess(prompt, model, timeout_s):
     except Exception:
         return ""
     try:
-        argv = ["codex", "exec", "--sandbox", "read-only", "-o", out_path]
+        argv = ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "-o", out_path]
         if model:
             argv.extend(["-m", model])
         argv.extend(["--", prompt])
@@ -3196,7 +3196,7 @@ async def _handle_discord_message(message, force=False):
             "This task is from a TEAM tier sender. Choose ONE of three actions based on the content:\n\n"
             "1. RUN CODEX — for genuine requests (code review, bug report, technical question, analysis).\n"
             "   Two-stage execution to avoid racing the bridge's results-dir poller:\n"
-            f"   - Stage 1: bash skills/claude-codex/scripts/codex-bounded.sh --stall 45 --max 240 -- codex exec --sandbox read-only -o {RESULTS_DIR}/.codex-staging-{{id}}.txt -- {quoted_task} < /dev/null   (the bounded runner kills the codex tree if it goes SILENT for 45s — the 'never going to finish' signal, since a working codex streams output — with a hard 240s backstop; a slow-but-progressing run is NOT killed. `< /dev/null` avoids the stdin hang. Exit 125 = stalled, 124 = hit the max cap; EITHER → fire the Stage-2 fallback.)\n"
+            f"   - Stage 1: bash skills/claude-codex/scripts/codex-bounded.sh --stall 45 --max 240 -- codex exec --sandbox read-only --skip-git-repo-check -o {RESULTS_DIR}/.codex-staging-{{id}}.txt -- {quoted_task} < /dev/null   (the bounded runner kills the codex tree if it goes SILENT for 45s — the 'never going to finish' signal, since a working codex streams output — with a hard 240s backstop; a slow-but-progressing run is NOT killed. `< /dev/null` avoids the stdin hang. Exit 125 = stalled, 124 = hit the max cap; EITHER → fire the Stage-2 fallback.)\n"
             f"   - Stage 2: if codex exits 0 AND {RESULTS_DIR}/.codex-staging-{{id}}.txt is non-empty: mv {RESULTS_DIR}/.codex-staging-{{id}}.txt {RESULTS_DIR}/task-{{id}}.txt (atomic single move; bridge only ever sees a complete file).\n"
             f"   - Stage 2 fallback: if codex exits non-zero OR staging file is empty/missing: write 'Sandbox unavailable; refusing non-owner task.' directly to {RESULTS_DIR}/task-{{id}}.txt.\n"
             "   - The `-o` flag writes ONLY the agent's final message to the file (no exec sub-command dumps, no setup banner). Do NOT redirect stdout — codex's stdout includes verbose exec output from internal tool calls (e.g. github plugin reading PR diffs), which floods Discord. Do NOT add commentary.\n\n"
@@ -3691,6 +3691,8 @@ async def poll_results():
             if result_file.exists():
                 import re
                 reply_text = result_file.read_text().strip()
+                if not reply_text:
+                    continue
                 channel = pending_replies.pop(task_id)
                 # Capture anchor BEFORE pop so the auto-thread block below
                 # can use it. The previous version popped+forgot, leaving

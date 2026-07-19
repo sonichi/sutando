@@ -190,6 +190,15 @@ print(entry['env_name'], end='')
 "
     ;;
 
+  core-runtime)
+    python3 -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import resolve_core_runtime
+print(resolve_core_runtime(), end='')
+"
+    ;;
+
   core-config-dir-value)
     # v0.9 — print the resolved value (absolute path) of the matching
     # core_config_dirs entry. Selector semantics identical to
@@ -236,6 +245,31 @@ sys.path.insert(0, '$REPO_ROOT')
 from src.util_paths import _host_label
 print(_host_label(), end='')
 "
+    ;;
+
+  app-node-dir)
+    # The bundled app runtime's node bin dir (Sutando.app ships a private node
+    # for hosts with no homebrew/nvm/volta). CONFIG-RESOLVED, not hardcoded:
+    # override via $SUTANDO_APP_NODE_DIR; default = the app-support engine path.
+    printf '%s' "${SUTANDO_APP_NODE_DIR:-$HOME/Library/Application Support/space.ag2.app/engine/runtime/node/bin}"
+    ;;
+
+  tsx-bin)
+    # SINGLE SOURCE OF TRUTH for tsx resolution — the launchd wrapper and
+    # src/startup.sh both call this instead of each duplicating the candidate
+    # list. Prefers the repo-pinned node_modules/.bin/tsx (the version the repo
+    # pins, and the ONLY tsx on a host with no homebrew/nvm/volta node at all),
+    # then the usual global locations. Prints the resolved path, or nothing —
+    # the caller falls back to `npx tsx` on empty output.
+    _nvm_tsx="$HOME/.nvm/versions/node/$(ls "$HOME/.nvm/versions/node/" 2>/dev/null | sort -V | tail -1)/bin/tsx"
+    for _p in \
+      "$REPO_ROOT/node_modules/.bin/tsx" \
+      /opt/homebrew/bin/tsx \
+      /usr/local/bin/tsx \
+      "$_nvm_tsx" \
+      "$HOME/.volta/bin/tsx"; do
+      [ -x "$_p" ] && { printf '%s' "$_p"; break; }
+    done
     ;;
 
   dump)
@@ -466,7 +500,7 @@ print(json.dumps({
     ;;
 
   *)
-    echo "usage: $0 {workspace|vault-enabled|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|claude-home-path <subpath>|core-config-dir-env-name [type|id]|core-config-dir-value [type|id]|core-config-dirs|host-label|tmux-socket|runtime|dump|subdirs|bootstrap}" >&2
+    echo "usage: $0 {workspace|core-runtime|vault-enabled|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|claude-home-path <subpath>|core-config-dir-env-name [type|id]|core-config-dir-value [type|id]|core-config-dirs|host-label|tmux-socket|runtime|dump|subdirs|bootstrap}" >&2
     exit 2
     ;;
 esac
