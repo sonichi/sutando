@@ -40,7 +40,7 @@ Never commit directly to main. Always work on a feature branch.
 
 ### Before opening any PR or issue
 
-Read `CONTRIBUTING.md` and follow its "Before opening any PR or issue" section. The short checklist:
+Read `CONTRIBUTING.md` and follow its "Before starting a PR" and "After opening the PR" sections. The short checklist:
 
 - Search existing open + recently-closed PRs/issues for duplicates (`gh pr list --search "closes #N"`)
 - Confirm your git author email is GH-mapped — not `*.local` (macOS hostname auto-fill) or `noreply@anthropic.com` (Claude Code default). CLA-Assistant silently leaves the check PENDING on unmappable emails.
@@ -132,13 +132,17 @@ unlinked so peers see a graceful shutdown immediately.
 
 Payload schema:
 ```json
-{"host": "...", "pid": ..., "started_at": ..., "last_beat_at": ..., "status": "...", "socket": "...", "schema_version": 1}
+{"host": "...", "pid": ..., "started_at": ..., "last_beat_at": ..., "status": "...", "socket": "...", "locality": {"kind": "local|cloud", "host": "..."}, "schema_version": 2}
 ```
 
 This is foundation for the lease-based multi-core scheduler — workers consult
 the alive directory to know who's available before assigning a claim. For
 single-machine use today it also gives `health-check.py` and the dashboard a
 cleaner liveness probe than scanning `pgrep -f claude`.
+
+`locality` is the core's self-reported {kind: local|cloud, host} (Track 10) —
+additive and informational; mtime remains the liveness signal, so readers that
+don't know the field are unaffected.
 
 `socket` records the tmux socket the core launched on (its own
 `${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}`). It's the **runtime-authored**
